@@ -28,7 +28,7 @@ use super::{
     },
 };
 #[cfg(feature = "internal-checker")]
-use super::checker_flow::{observe_arbitrary_integer_returns, observe_unused_module_proof_returns, ImmutableEntryRange, IntegerShowOutput};
+use super::checker_flow::{observe_arbitrary_integer_returns, observe_unused_module_proof_returns, GuardedOutputClaims, ImmutableEntryRange, IntegerShowOutput};
 use crate::Diagnostic;
 use wosy_syntax::SourceIdentity;
 use wosy_syntax::{CanonicalCstRoot, CstNode, CstToken, SyntaxKind};
@@ -4273,14 +4273,20 @@ fn proof_show_plan<'a, const VERIFY_ENTRY_WRITES: bool, const ALLOW_NAMED_STEPS:
                         return None;
                     };
                     let claim = proof_show_expression(item, *terminated).ok()?;
-                    let ScalarExpression::Binary { operator, .. } = claim else { return None; };
+                    let ScalarExpression::Binary { operator, right, .. } = claim else { return None; };
                     IntegerRelation::from_operator(operator)?;
-                    Some((claim, operator))
+                    let old = matches!(right.as_ref(), ScalarExpression::Call {
+                        receiver: Some(core), name, ..
+                    } if core == "core" && name == "old");
+                    Some((claim, operator, old))
                 };
-                if let (Some((yes, yes_operator)), Some((no, no_operator))) =
+                if let (Some((yes, yes_operator, yes_old)), Some((no, no_operator, no_old))) =
                     (comparison_claim(then_branch), comparison_claim(else_branch))
                 {
-                    if *yes_operator != BinaryOperator::Equal || *no_operator != BinaryOperator::Equal {
+                    let entry_claims = yes_old && no_old;
+                    let literal_claims = !yes_old && !no_old
+                        && (*yes_operator != BinaryOperator::Equal || *no_operator != BinaryOperator::Equal);
+                    if entry_claims || literal_claims {
                         if let CheckerPredicate::Integer(guard) = guard {
                             if is_null_literal_name(output) || inputs.iter().any(|name| is_null_literal_name(name)) {
                                 return Err(ProjectCheck::InvalidProof);
@@ -4288,9 +4294,23 @@ fn proof_show_plan<'a, const VERIFY_ENTRY_WRITES: bool, const ALLOW_NAMED_STEPS:
                             if guard.ty != *ty {
                                 return Err(ProjectCheck::Unsupported);
                             }
-                            let yes = typed_output_atom(yes, output, inputs, ty)?;
-                            let no = typed_output_atom(no, output, inputs, ty)?;
-                            return Ok(IntegerShowProof::GuardedOutput { guard, yes, no });
+                            let claims = if entry_claims {
+                                let validate = |claim| {
+                                    let (slot, relation) = checked_old_output_relation(claim, output, inputs, body, ty)
+                                        .ok_or(ProjectCheck::Unsupported)??;
+                                    if bindings.get(slot) != Some(&guard.binding) {
+                                        return Err(ProjectCheck::Unsupported);
+                                    }
+                                    Ok(relation)
+                                };
+                                GuardedOutputClaims::ImmutableEntry { yes: validate(yes)?, no: validate(no)? }
+                            } else {
+                                GuardedOutputClaims::Literal {
+                                    yes: typed_output_atom(yes, output, inputs, ty)?,
+                                    no: typed_output_atom(no, output, inputs, ty)?,
+                                }
+                            };
+                            return Ok(IntegerShowProof::GuardedOutput { guard, claims });
                         }
                     }
                 }

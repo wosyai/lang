@@ -448,14 +448,19 @@ pub(super) enum IntegerShowProof<'a> {
     #[cfg(feature = "internal-checker")]
     GuardedOutput {
         guard: IntegerPredicate,
-        yes: (IntegerRelation, BigInt),
-        no: (IntegerRelation, BigInt),
+        claims: GuardedOutputClaims,
     },
     Conditional {
         guard: CheckerPredicate,
         then_claim: IntegerReturn<'a>,
         else_claim: IntegerReturn<'a>,
     },
+}
+
+#[cfg(feature = "internal-checker")]
+pub(super) enum GuardedOutputClaims {
+    Literal { yes: (IntegerRelation, BigInt), no: (IntegerRelation, BigInt) },
+    ImmutableEntry { yes: IntegerRelation, no: IntegerRelation },
 }
 
 #[cfg(feature = "internal-checker")]
@@ -527,6 +532,17 @@ impl<'a> ForbiddenCutPair<'a> {
             || (self.mask[3] && contains(self.upper))
             || (self.mask[4] && last > self.upper)
     }
+}
+
+#[cfg(feature = "internal-checker")]
+fn forbidden_guarded_cuts<'a>(
+    guard: (IntegerRelation, &'a BigInt), otherwise: (IntegerRelation, &'a BigInt),
+    yes: (IntegerRelation, &'a BigInt), no: (IntegerRelation, &'a BigInt),
+) -> (ForbiddenCutPair<'a>, ForbiddenCutPair<'a>) {
+    (
+        ForbiddenCutPair::new(guard, (yes.0.complement(), yes.1)),
+        ForbiddenCutPair::new(otherwise, (no.0.complement(), no.1)),
+    )
 }
 
 #[cfg(feature = "internal-checker")]
@@ -1137,9 +1153,11 @@ fn check_integer_return_bound_in_scope<'a>(
         return Some(Ok(ProofCoverage::Applicable(proved)));
     }
     #[cfg(feature = "internal-checker")]
-    if let Some(IntegerShowProof::GuardedOutput { guard, yes, no }) = proof {
+    if let Some(IntegerShowProof::GuardedOutput { guard, claims }) = proof {
         let guard_relation = IntegerRelation::from_operator(&guard.operator)?;
-        let mut forbidden_cuts = None;
+        let guard_cut = (guard_relation, &guard.bound);
+        let else_cut = (guard_relation.complement(), &guard.bound);
+        let mut literal_cuts = None;
         let mut proved = true;
         for path in &paths {
             if matches!(path.value, IntegerReturn::Alias(alias) if *alias != guard.binding) {
@@ -1149,29 +1167,58 @@ fn check_integer_return_bound_in_scope<'a>(
                 continue; // Still inspect later return identities for unsupported aliases.
             }
             let axis = path.axes.iter().position(|binding| **binding == guard.binding)?;
-            proved = match path.value {
-                IntegerReturn::Alias(_) => path.state.0.iter().all(|row| row[axis].intervals().all(|(first, last)| {
-                    relation.accepts_closed(first, last, bound) && {
-                        let (yes_cut, no_cut) = forbidden_cuts.get_or_insert_with(|| (
-                            ForbiddenCutPair::new((guard_relation, &guard.bound), (yes.0.complement(), &yes.1)),
-                            ForbiddenCutPair::new((guard_relation.complement(), &guard.bound), (no.0.complement(), &no.1)),
-                        ));
-                        !yes_cut.hits(first, last) && !no_cut.hits(first, last)
-                    }
-                })),
-                IntegerReturn::Const(value) if relation.accepts(value.cmp(bound)) => {
-                    let yes_ok = yes.0.accepts(value.cmp(&yes.1));
-                    let no_ok = no.0.accepts(value.cmp(&no.1));
-                    match (yes_ok, no_ok) {
-                        (true, true) => true,
-                        (false, false) => false,
-                        _ => {
-                            let allowed = if yes_ok { guard_relation } else { guard_relation.complement() };
-                            path.state.0.iter().all(|row| row[axis].every_at_extremes(allowed, &guard.bound))
+            let rows = &path.state.0;
+            let arms_hold = |yes_ok, no_ok| match (yes_ok, no_ok) {
+                (true, true) => true,
+                (false, false) => false,
+                _ => {
+                    let allowed = if yes_ok { guard_cut.0 } else { else_cut.0 };
+                    rows.iter().all(|row| row[axis].every_at_extremes(allowed, guard_cut.1))
+                }
+            };
+            proved = match (path.value, claims) {
+                (IntegerReturn::Alias(_), GuardedOutputClaims::Literal { yes, no }) =>
+                    rows.iter().all(|row| row[axis].intervals().all(|(first, last)| {
+                        relation.accepts_closed(first, last, bound) && {
+                            let (yes_cut, no_cut) = literal_cuts.get_or_insert_with(||
+                                forbidden_guarded_cuts(guard_cut, else_cut, (yes.0, &yes.1), (no.0, &no.1)));
+                            !yes_cut.hits(first, last) && !no_cut.hits(first, last)
                         }
+                    })),
+                (IntegerReturn::Const(value), GuardedOutputClaims::Literal { yes, no }) =>
+                    relation.accepts(value.cmp(bound))
+                        && arms_hold(yes.0.accepts(value.cmp(&yes.1)), no.0.accepts(value.cmp(&no.1))),
+                (IntegerReturn::Alias(_), GuardedOutputClaims::ImmutableEntry { yes, no }) => {
+                    use std::cmp::Ordering::Equal;
+                    let branch = match (yes.accepts(Equal), no.accepts(Equal)) {
+                        (true, true) => None,
+                        (true, false) => Some(guard_relation),
+                        (false, true) => Some(else_cut.0),
+                        (false, false) => {
+                            proved = false;
+                            continue;
+                        }
+                    };
+                    let joint = (guard_cut.1 == bound).then(|| branch.map_or(relation, |arm| relation.intersection(arm)));
+                    rows.iter().all(|row| row[axis].intervals().all(|(first, last)| {
+                        if let Some(joint) = joint {
+                            joint.accepts_closed(first, last, bound)
+                        } else {
+                            relation.accepts_closed(first, last, bound)
+                                && branch.is_none_or(|allowed| allowed.accepts_closed(first, last, guard_cut.1))
+                        }
+                    }))
+                }
+                (IntegerReturn::Const(value), GuardedOutputClaims::ImmutableEntry { yes, no }) => {
+                    if !relation.accepts(value.cmp(bound)) {
+                        false
+                    } else {
+                        // out rel old(input) translates to input rel.reversed() out.
+                        let (yes_cut, no_cut) = forbidden_guarded_cuts(guard_cut, else_cut, (yes.reversed(), value), (no.reversed(), value));
+                        rows.iter().all(|row| row[axis].intervals().all(|(first, last)|
+                            !yes_cut.hits(first, last) && !no_cut.hits(first, last)))
                     }
                 }
-                IntegerReturn::Const(_) => false,
             };
         }
         return Some(Ok(ProofCoverage::Applicable(proved)));
