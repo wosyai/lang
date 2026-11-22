@@ -7,7 +7,7 @@ use std::hash::{Hash, Hasher};
 use super::{
     checker_directive::{CheckedLiteralOutput, CheckerOperation, InitializerIntegerOperand, InitializerPredicate, PreparedCheckerDirective},
     checker_flow::{
-        check_integer_requirement_activity, check_integer_requirements_with_calls, collect_integer_requirement_failures, check_integer_return_bound_with_shows, collect_integer_requirement_failures_with_calls, concrete_integer_literal, exact_integer_call_argument, exact_integer_call_argument_at,
+        check_integer_requirement_activity, check_integer_requirements_with_calls, check_integer_return_bound_with_shows, collect_integer_requirement_failures_with_calls, concrete_integer_literal, exact_integer_call_argument, exact_integer_call_argument_at,
         exact_integer_return_at_entry, ActualCallResult, CheckerPredicate, ExactIntegerArgument, IntegerRequirementContinuation, IntegerRequirementEntry, NestedIntegerArgument, ProjectedIntegerArgument,
         proves_requirement_with_imported_root_local, ImportedEntryGuard, ImportedIntegerValues, ImportedLocal, IntegerShowProof, IntegerCheckFailure, IntegerComparison, IntegerInputs, IntegerReturn, ProofCoverage,
     },
@@ -29,6 +29,8 @@ use super::{
 };
 #[cfg(feature = "internal-checker")]
 use super::{checker_flow::{holds_actual_mixed_entry, evaluate_borrowed_return_proof, evaluate_mixed_entry_output, observe_authored_show_returns, integer_predicate_implies, observe_arbitrary_integer_returns, observe_unused_module_proof_returns, ActualFlatShow, GuardedOutputClaims, ImmutableEntryRange, ImmutableProofOutputComparison, IntegerShowOutput}, symbolic_integer::{IntegerShowConstraints, OwnedIntegerUnion}, typecheck::integer_bounds};
+#[cfg(not(feature = "internal-checker"))]
+use super::checker_flow::collect_integer_requirement_failures;
 use crate::Diagnostic;
 use wosy_syntax::SourceIdentity;
 use wosy_syntax::{CanonicalCstRoot, CstNode, CstToken, SyntaxKind};
@@ -625,7 +627,11 @@ fn check_unused_module<const COLLECT: bool>(
         }
         if body.structure.checker_direct_targets.is_empty() {
             if COLLECT {
-                let (observed, selected) = collect_integer_requirement_failures(body).ok_or(ProjectCheck::Unsupported)?;
+                #[cfg(feature = "internal-checker")]
+                let collected = super::checker_flow::collect_ordered_root_requirement_failures(body, &function.body);
+                #[cfg(not(feature = "internal-checker"))]
+                let collected = collect_integer_requirement_failures(body);
+                let (observed, selected) = collected.ok_or(ProjectCheck::Unsupported)?;
                 active |= observed;
                 let failures = failures.as_deref_mut().ok_or(ProjectCheck::Unsupported)?;
                 for failure in selected {
@@ -6031,6 +6037,61 @@ mod tests {
         assert_eq!(collect_ordered_package_failures(&project, ScalarCheckerScope::MainFlowOnly, 1),
             Err(ProjectCheck::Unsupported));
         assert_eq!(normalizations(), 0);
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordered_package_symbolic_root_disjunctive_branch_keeps_exact_holes_and_dead_lanes() {
+        let app = source("src/main.w", "root-branch-disjunction");
+        let prepare = |condition: &str, actual: &str| {
+            let text = format!(r#"%%start
+                unit(u8, u8) checked = fn(x, y) {{
+                    if (y == 1) {{}};
+                    core.narrow(x != 4, {OUTPUT});
+                    if ({condition}) {{
+                        core.require(x != 7, {OUTPUT});
+                        core.narrow(false, {OUTPUT});
+                        core.require(false, {OUTPUT});
+                    }} else {{
+                        core.require(x != 3, {OUTPUT});
+                    }};
+                    core.require(x >= 2, {OUTPUT});
+                    core.require(x <= 6, {OUTPUT});
+                    core.require(x != 4, {OUTPUT});
+                    core.require(x != 5, {OUTPUT});
+                }};
+                {actual}
+            %%end"#);
+            let project = prepare_checker_project(
+                vec![(declarations(&app, &text), Vec::new())], vec![app.clone()], inputs(),
+            ).unwrap();
+            (text, project)
+        };
+        let guard = "x < 2 || x > 6";
+        let (text, prepared) = prepare(guard, "");
+        let (active, failures) = collect_ordered_package_failures(&prepared, ScalarCheckerScope::CurrentPackage, 1).unwrap();
+        assert!(active);
+        let records = failures.into_iter().map(|failure| {
+            let ProjectCheck::Failed { condition, state, .. } = failure else { panic!("expected callable failure"); };
+            let intervals = |axis| state.intervals_at(0, axis).unwrap()
+                .map(|(first, last)| (first.clone(), last.clone())).collect::<Vec<_>>();
+            assert_eq!(intervals(1), [(BigInt::from(0), BigInt::from(255))]);
+            (text[condition.start as usize..condition.end as usize].to_owned(), intervals(0))
+        }).collect::<Vec<_>>();
+        let expected = |condition: &str, ranges: &[(u8, u8)]| (condition.to_owned(), ranges.iter()
+            .map(|&(first, last)| (BigInt::from(first), BigInt::from(last))).collect::<Vec<_>>());
+        assert_eq!(records, [
+            expected("x != 7", &[(7, 7)]),
+            expected("false", &[(0, 1), (7, 255)]),
+            expected("x != 3", &[(3, 3)]),
+            expected("x != 5", &[(5, 5)]),
+        ]);
+        assert_eq!(check_package_roots(&prepared), Err(ProjectCheck::Unsupported));
+        assert_eq!(collect_ordered_package_failures(&prepared, ScalarCheckerScope::MainFlowOnly, 1), Ok((false, Vec::new())));
+        let (_, actual) = prepare(guard, "checked(7, 1);");
+        assert_eq!(collect_ordered_package_failures(&actual, ScalarCheckerScope::MainFlowOnly, 1), Err(ProjectCheck::Unsupported));
+        let (_, different_axis) = prepare("x < 2 || y > 6", "");
+        assert_eq!(collect_ordered_package_failures(&different_axis, ScalarCheckerScope::CurrentPackage, 1), Err(ProjectCheck::Unsupported));
     }
 
     #[cfg(feature = "internal-checker")]

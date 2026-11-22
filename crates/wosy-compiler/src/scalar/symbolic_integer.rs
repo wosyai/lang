@@ -18,6 +18,111 @@ fn overlapping_or_adjacent(first: &BigInt, last: &BigInt) -> bool {
 pub(super) struct IntegerSet(Vec<Interval>);
 
 #[cfg(feature = "internal-checker")]
+pub(super) enum IntegerSetPartition {
+    True,
+    False,
+    Mixed(IntegerSet, IntegerSet),
+}
+
+#[cfg(feature = "internal-checker")]
+pub(super) fn consecutive_integer_cuts(lower: &BigInt, upper: &BigInt) -> bool {
+    use num_bigint::Sign::Minus;
+    let (smaller, larger) = match (lower.sign() == Minus, upper.sign() == Minus) {
+        (true, false) => return upper.bits() == 0 && lower.bits() == 1,
+        (true, true) => (upper, lower),
+        _ => (lower, upper),
+    };
+    let mut left = smaller.iter_u64_digits();
+    let mut right = larger.iter_u64_digits();
+    let mut carry = true;
+    loop {
+        match (left.next(), right.next()) {
+            (None, None) => return !carry,
+            (Some(a), Some(b)) => {
+                let (sum, next) = a.overflowing_add(u64::from(carry));
+                if sum != b { return false; }
+                carry = next;
+            }
+            (None, Some(1)) if carry => return right.next().is_none(),
+            _ => return false,
+        }
+    }
+}
+
+#[cfg(feature = "internal-checker")]
+#[derive(Clone, Copy)]
+struct CutCell<'a> {
+    lower: (&'a BigInt, bool),
+    upper: (&'a BigInt, bool),
+    accepts: bool,
+}
+
+#[cfg(feature = "internal-checker")]
+impl CutCell<'_> {
+    fn nonempty(self) -> bool {
+        match self.lower.0.cmp(self.upper.0) {
+            Ordering::Less => self.lower.1 || self.upper.1 || !consecutive_integer_cuts(self.lower.0, self.upper.0),
+            Ordering::Equal => self.lower.1 && self.upper.1,
+            Ordering::Greater => false,
+        }
+    }
+
+    fn materialize(self) -> Interval {
+        Interval {
+            first: if self.lower.1 { self.lower.0.clone() } else { self.lower.0 + 1 },
+            last: if self.upper.1 { self.upper.0.clone() } else { self.upper.0 - 1 },
+        }
+    }
+}
+
+#[cfg(feature = "internal-checker")]
+pub(super) struct IntegerCutUnion<'a> {
+    cells: [Option<CutCell<'a>>; 5],
+    len: usize,
+}
+
+#[cfg(feature = "internal-checker")]
+impl<'a> IntegerCutUnion<'a> {
+    pub(super) fn new(
+        first: (IntegerRelation, &'a BigInt), second: (IntegerRelation, &'a BigInt),
+        (minimum, maximum): (&'a BigInt, &'a BigInt),
+    ) -> Self {
+        use Ordering::{Equal, Greater, Less};
+        let ((lo_rel, lo), (hi_rel, hi)) = if first.1 <= second.1 { (first, second) } else { (second, first) };
+        let at = |lower, upper, a, b| CutCell { lower, upper, accepts: lo_rel.accepts(a) || hi_rel.accepts(b) };
+        let mut union = Self { cells: [None; 5], len: 0 };
+        union.push(at((minimum, true), (lo, false), Less, Less));
+        if lo == hi {
+            union.push(at((lo, true), (lo, true), Equal, Equal));
+        } else {
+            union.push(at((lo, true), (lo, true), Equal, Less));
+            union.push(at((lo, false), (hi, false), Greater, Less));
+            union.push(at((hi, true), (hi, true), Greater, Equal));
+        }
+        union.push(at((hi, false), (maximum, true), Greater, Greater));
+        union
+    }
+
+    fn push(&mut self, cell: CutCell<'a>) {
+        if !cell.nonempty() {
+            return;
+        }
+        if let Some(previous) = self.len.checked_sub(1).and_then(|index| self.cells[index].as_mut()) {
+            if previous.accepts == cell.accepts {
+                previous.upper = cell.upper;
+                return;
+            }
+        }
+        self.cells[self.len] = Some(cell);
+        self.len += 1;
+    }
+
+    pub(super) fn uniform(&self) -> Option<bool> {
+        if self.len == 1 { self.cells[0].map(|cell| cell.accepts) } else { None }
+    }
+}
+
+#[cfg(feature = "internal-checker")]
 pub(super) fn integer_predicate_pair_implies(
     first: (IntegerRelation, &BigInt), second: (IntegerRelation, &BigInt),
     conclusion: (IntegerRelation, &BigInt), (minimum, maximum): (&BigInt, &BigInt),
@@ -575,6 +680,63 @@ impl IntegerSet {
         }
     }
 
+    #[cfg(feature = "internal-checker")]
+    pub(super) fn partition_by(&self, accepted: &IntegerCutUnion<'_>) -> IntegerSetPartition {
+        if let Some(side) = accepted.uniform() {
+            return if side { IntegerSetPartition::True } else { IntegerSetPartition::False };
+        }
+        let mut uniform = None;
+        let mut outputs: Option<[Vec<Interval>; 2]> = None;
+        let mut cursor = 0;
+        for (index, active) in self.0.iter().enumerate() {
+            while accepted.cells.get(cursor).copied().flatten().is_some_and(|cell|
+                cell.upper.0 < &active.first || (cell.upper.0 == &active.first && !cell.upper.1))
+            {
+                cursor += 1;
+            }
+            let mut parts = [None; 5];
+            let mut len = 0;
+            while let Some(cell) = accepted.cells.get(cursor).copied().flatten() {
+                if cell.lower.0 > &active.last || (cell.lower.0 == &active.last && !cell.lower.1) {
+                    break;
+                }
+                let lower = if &active.first > cell.lower.0 { (&active.first, true) } else { cell.lower };
+                let upper = if &active.last < cell.upper.0 { (&active.last, true) } else { cell.upper };
+                let clipped = CutCell { lower, upper, accepts: cell.accepts };
+                if clipped.nonempty() {
+                    parts[len] = Some(clipped);
+                    len += 1;
+                }
+                if cell.upper.0 > &active.last {
+                    break;
+                }
+                cursor += 1;
+            }
+            if len == 1 {
+                let side = parts[0].expect("single partition segment").accepts as usize;
+                if outputs.is_none() && uniform.is_none_or(|prior| prior == side) {
+                    uniform = Some(side);
+                    continue;
+                }
+            }
+            let ranges = outputs.get_or_insert_with(|| {
+                let mut ranges = [Vec::new(), Vec::new()];
+                if let Some(side) = uniform {
+                    ranges[side].extend_from_slice(&self.0[..index]);
+                }
+                ranges
+            });
+            for part in parts[..len].iter().flatten() {
+                ranges[part.accepts as usize].push(part.materialize());
+            }
+        }
+        match outputs {
+            Some([no, yes]) => IntegerSetPartition::Mixed(Self(yes), Self(no)),
+            None if uniform == Some(1) => IntegerSetPartition::True,
+            None => IntegerSetPartition::False,
+        }
+    }
+
     fn append(&mut self, interval: Interval) {
         if let Some(previous) = self
             .0
@@ -593,6 +755,55 @@ impl IntegerSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn normalized_partition_matches_every_passing_and_failing_point_of_disconnected_inputs() {
+        let domain = |bits: u8| {
+            let mut result = IntegerSet::default();
+            for point in 0_i32..6 {
+                if bits & (1 << point) != 0 {
+                    let point = BigInt::from(point - 3);
+                    result.append(Interval { first: point.clone(), last: point });
+                }
+            }
+            result
+        };
+        let points = [-3, -2, -1, 0, 1, 2].map(BigInt::from);
+        let relations = [
+            BinaryOperator::Equal, BinaryOperator::NotEqual, BinaryOperator::Less,
+            BinaryOperator::LessEqual, BinaryOperator::Greater, BinaryOperator::GreaterEqual,
+        ].map(|operator| IntegerRelation::from_operator(&operator).unwrap());
+        for left in relations {
+            for right in relations {
+                for left_bound in &points {
+                    for right_bound in &points {
+                        let accepted = IntegerCutUnion::new((left, left_bound), (right, right_bound), (&points[0], &points[5]));
+                        let mask = points.iter().enumerate().fold(0_u8, |bits, (at, point)| {
+                            if left.accepts(point.cmp(left_bound)) || right.accepts(point.cmp(right_bound)) {
+                                bits | (1 << at)
+                            } else {
+                                bits
+                            }
+                        });
+                        for input in 1_u8..64 {
+                            let yes = input & mask;
+                            let no = input & !mask;
+                            match domain(input).partition_by(&accepted) {
+                                IntegerSetPartition::True => assert_eq!((yes, no), (input, 0)),
+                                IntegerSetPartition::False => assert_eq!((yes, no), (0, input)),
+                                IntegerSetPartition::Mixed(yes_set, no_set) => {
+                                    assert!(yes != 0 && no != 0);
+                                    assert_eq!(yes_set, domain(yes));
+                                    assert_eq!(no_set, domain(no));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     #[cfg(feature = "internal-checker")]
     #[test]

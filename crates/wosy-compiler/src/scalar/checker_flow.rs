@@ -13,7 +13,7 @@ use super::{
 use super::{symbolic_integer::IntegerRelation, reference::CheckerIntegerCallArgument};
 
 #[cfg(feature = "internal-checker")]
-use super::symbolic_integer::IntegerShowConstraints;
+use super::symbolic_integer::{consecutive_integer_cuts, IntegerCutUnion, IntegerShowConstraints};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum CheckerPredicate {
@@ -119,12 +119,28 @@ pub(super) struct ImportedEntryGuard<'a> {
     pub(super) bound: &'a BigInt,
 }
 
+#[cfg(feature = "internal-checker")]
+struct RootBranchSlot {
+    block: BlockOrdinal,
+    item: usize,
+    parent: OccurrenceOrdinal,
+    condition: OccurrenceOrdinal,
+    output: Option<usize>,
+}
+
 trait ScopedAuthoredReturn<'a>: Copy {
     const ENABLED: bool;
     fn at(
         self, calls: &FunctionCallSites, block: BlockOrdinal, slot: FinalOutputSlot, ty: &ScalarType,
         roots: &IntegerRoots<'_>, path: &IntegerInputs,
     ) -> Option<&'a BigInt>;
+
+    #[cfg(feature = "internal-checker")]
+    fn split_unprepared(
+        self, _: &FunctionCallSites, _: RootBranchSlot, _: &IntegerRoots<'_>, _: IntegerInputs,
+    ) -> Option<(IntegerInputs, IntegerInputs, Option<usize>)> {
+        None
+    }
 
     fn branch(
         self, _: &OccurrenceStructure, _: BlockOrdinal, _: FinalOutputSlot, _: usize, _: BlockOrdinal,
@@ -141,6 +157,91 @@ impl<'a> ScopedAuthoredReturn<'a> for () {
         _: &IntegerRoots<'_>, _: &IntegerInputs,
     ) -> Option<&'a BigInt> {
         None
+    }
+}
+
+#[cfg(feature = "internal-checker")]
+#[derive(Clone, Copy)]
+struct OrderedRootConditions<'a>(&'a super::ScalarBlock);
+
+#[cfg(feature = "internal-checker")]
+impl<'a> ScopedAuthoredReturn<'a> for OrderedRootConditions<'a> {
+    const ENABLED: bool = false;
+
+    fn at(
+        self, _: &FunctionCallSites, _: BlockOrdinal, _: FinalOutputSlot, _: &ScalarType,
+        _: &IntegerRoots<'_>, _: &IntegerInputs,
+    ) -> Option<&'a BigInt> {
+        None
+    }
+
+    fn split_unprepared(
+        self, calls: &FunctionCallSites, slot: RootBranchSlot, roots: &IntegerRoots<'_>, path: IntegerInputs,
+    ) -> Option<(IntegerInputs, IntegerInputs, Option<usize>)> {
+        let structure = &calls.structure;
+        if slot.block != structure.root || structure.blocks.get(slot.block.0)?.span != self.0.span
+            || !calls.assignments.is_empty()
+        {
+            return None;
+        }
+        let super::ScalarBlockItem::Expression(branch) = self.0.items.get(slot.item)? else { return None; };
+        let edge = match slot.output {
+            Some(output) => OccurrenceEdge::FinalOutput { item: slot.item, output },
+            None => OccurrenceEdge::ExpressionItem { item: slot.item },
+        };
+        if structure.edges.get(&(OccurrenceParent::Block(slot.block), edge))
+            != Some(&OccurrenceNode::Expression(slot.parent))
+        {
+            return None;
+        }
+        let child = |parent, edge| match structure.edges.get(&(OccurrenceParent::Expression(parent), edge)) {
+            Some(OccurrenceNode::Expression(ordinal)) => Some(*ordinal),
+            _ => None,
+        };
+        let condition = match branch {
+            ScalarExpression::If { condition, .. } | ScalarExpression::UnitIf { condition, .. } => condition,
+            _ => return None,
+        };
+        let ScalarExpression::Binary { operator: BinaryOperator::Or, left, right, .. } = condition.as_ref() else {
+            return None;
+        };
+        if child(slot.parent, OccurrenceEdge::Condition) != Some(slot.condition)
+            || structure.checked_types.expressions.get(&slot.condition) != Some(&ScalarType::Bool)
+        {
+            return None;
+        }
+        let atom = |expression, edge| {
+            let ordinal = child(slot.condition, edge)?;
+            if structure.checked_types.expressions.get(&ordinal) != Some(&ScalarType::Bool) {
+                return None;
+            }
+            let comparison = IntegerComparison::from_expression(expression)?;
+            let left = child(ordinal, OccurrenceEdge::BinaryLeft)?;
+            let right = child(ordinal, OccurrenceEdge::BinaryRight)?;
+            let PlainNameIdentity::Lexical(binding) = calls.prepared_plain_name(left)? else { return None; };
+            let (axis, ty) = roots.lookup(binding)?;
+            if calls.boundary.checker_parameter_bindings.as_deref()?.get(axis) != Some(binding)
+                || !is_integer_type(ty)
+                || structure.checked_types.expressions.get(&left) != Some(ty)
+                || structure.checked_types.expressions.get(&right) != Some(ty)
+            {
+                return None;
+            }
+            Some((axis, ty, IntegerRelation::from_operator(comparison.operator)?, comparison.bound))
+        };
+        let (axis, ty, left_relation, left_bound) = atom(left.as_ref(), OccurrenceEdge::BinaryLeft)?;
+        let (other_axis, _, right_relation, right_bound) = atom(right.as_ref(), OccurrenceEdge::BinaryRight)?;
+        if axis != other_axis {
+            return None;
+        }
+        let (min, max) = super::typecheck::integer_bounds(ty)?;
+        let fits = |bound: &BigInt| &min <= bound && bound <= &max;
+        if !fits(&left_bound) || !fits(&right_bound) {
+            return None;
+        }
+        let accepted = IntegerCutUnion::new((left_relation, &left_bound), (right_relation, &right_bound), (&min, &max));
+        let (yes, no) = path.split_partition(axis, &accepted);
+        Some((yes, no, Some(axis)))
     }
 }
 
@@ -601,6 +702,39 @@ impl IntegerInputs {
             }
         }
         Some((passing, failing))
+    }
+
+    #[cfg(feature = "internal-checker")]
+    fn split_partition(mut self, index: usize, accepted: &IntegerCutUnion<'_>) -> (Self, Self) {
+        use super::symbolic_integer::IntegerSetPartition;
+        match accepted.uniform() {
+            Some(true) => return (self, Self::default()),
+            Some(false) => return (Self::default(), self),
+            None => {}
+        }
+        let mut retained_side = None;
+        let mut other = Self::default();
+        self.0.retain_mut(|row| {
+            let passing = match row[index].partition_by(accepted) {
+                IntegerSetPartition::True => true,
+                IntegerSetPartition::False => false,
+                IntegerSetPartition::Mixed(yes, no) => {
+                    let (retained, moved) = if *retained_side.get_or_insert(true) { (yes, no) } else { (no, yes) };
+                    let mut alternate = row.clone();
+                    row[index] = Rc::new(retained);
+                    alternate[index] = Rc::new(moved);
+                    other.0.push(alternate);
+                    return true;
+                }
+            };
+            if passing == *retained_side.get_or_insert(passing) {
+                true
+            } else {
+                other.0.push(std::mem::take(row));
+                false
+            }
+        });
+        if retained_side == Some(false) { (other, self) } else { (self, other) }
     }
 
     fn failing_witness(&self, roots: &IntegerRoots<'_>, predicate: &CheckerPredicate) -> Option<Self> {
@@ -1081,30 +1215,6 @@ fn forbidden_guarded_cuts<'a>(
     )
 }
 
-#[cfg(feature = "internal-checker")]
-fn consecutive_integer_cuts(lower: &BigInt, upper: &BigInt) -> bool {
-    use num_bigint::Sign::Minus;
-    let (smaller, larger) = match (lower.sign() == Minus, upper.sign() == Minus) {
-        (true, false) => return upper.bits() == 0 && lower.bits() == 1,
-        (true, true) => (upper, lower),
-        _ => (lower, upper),
-    };
-    let mut left = smaller.iter_u64_digits();
-    let mut right = larger.iter_u64_digits();
-    let mut carry = true;
-    loop {
-        match (left.next(), right.next()) {
-            (None, None) => return !carry,
-            (Some(a), Some(b)) => {
-                let (sum, next) = a.overflowing_add(u64::from(carry));
-                if sum != b { return false; }
-                carry = next;
-            }
-            (None, Some(1)) if carry => return right.next().is_none(),
-            _ => return false,
-        }
-    }
-}
 
 fn binding_satisfies(
     state: &IntegerInputs,
@@ -1535,6 +1645,29 @@ pub(super) fn collect_integer_requirement_failures_with_calls<'a>(
     allow_projected_calls: bool,
     sink: &mut dyn FnMut(IntegerCheckFailure<'a>),
 ) -> Option<(bool, IntegerRequirementContinuation)> {
+    collect_integer_requirement_failures_in_scope(calls, entry, handle_call, allow_projected_calls, sink, ())
+}
+
+#[cfg(feature = "internal-checker")]
+pub(super) fn collect_ordered_root_requirement_failures<'a>(
+    calls: &'a FunctionCallSites, body: &'a super::ScalarBlock,
+) -> Option<(bool, Vec<IntegerCheckFailure<'a>>)> {
+    let mut failures = Vec::new();
+    let mut sink = |failure| failures.push(failure);
+    let (active, _) = collect_integer_requirement_failures_in_scope(
+        calls, IntegerRequirementEntry::Arbitrary, None, false, &mut sink, OrderedRootConditions(body),
+    )?;
+    Some((active, failures))
+}
+
+fn collect_integer_requirement_failures_in_scope<'a, Scoped: ScopedAuthoredReturn<'a>>(
+    calls: &'a FunctionCallSites,
+    entry: IntegerRequirementEntry<'_>,
+    handle_call: Option<&mut ActualCallHandler<'a, '_>>,
+    allow_projected_calls: bool,
+    sink: &mut dyn FnMut(IntegerCheckFailure<'a>),
+    scope: Scoped,
+) -> Option<(bool, IntegerRequirementContinuation)> {
     let (tail, exact, projected) = match entry {
         IntegerRequirementEntry::Arbitrary => (integer_tail_type(calls), None, None),
         IntegerRequirementEntry::Exact(arguments) => (None, Some(arguments), None),
@@ -1552,7 +1685,7 @@ pub(super) fn collect_integer_requirement_failures_with_calls<'a>(
         continuation: IntegerRequirementContinuation::Empty, projected, allow_projected_calls, sink,
     };
     let ProofCoverage::Applicable(active) = run_integer_callable::<false, true, _>(
-        calls, tail, None, None, None, exact, handle_call, Some(&mut collected), false, (),
+        calls, tail, None, None, None, exact, handle_call, Some(&mut collected), false, scope,
     )?.ok()? else { return None; };
     Some((active, collected.continuation))
 }
@@ -2291,8 +2424,18 @@ fn walk_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, A
                             (condition, *then_block, Some(*else_block)),
                         _ => return None,
                     };
-                    let predicate = structure.checker_branches.get(condition)?;
-                    let (yes, no, axis) = path.split(roots, predicate)?;
+                    let (yes, no, axis) = if let Some(predicate) = structure.checker_branches.get(condition) {
+                        path.split(roots, predicate)?
+                    } else {
+                        #[cfg(feature = "internal-checker")]
+                        {
+                            authored_return.split_unprepared(calls, RootBranchSlot {
+                                block, item: item.position, parent: expression, condition: *condition, output: None,
+                            }, roots, path)?
+                        }
+                        #[cfg(not(feature = "internal-checker"))]
+                        return None;
+                    };
                     let mut continuation: Option<IntegerInputs> = None;
                     for (arm, incoming) in [(Some(then_block), yes), (else_block, no)] {
                         if incoming.is_unreachable() {
@@ -2330,8 +2473,18 @@ fn walk_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, A
                     calls.conditionals.get(&slot.expression)
                 {
                     let expected = tail?;
-                    let predicate = structure.checker_branches.get(condition)?;
-                    let (yes, no, _) = path.split(roots, predicate)?;
+                    let (yes, no, _) = if let Some(predicate) = structure.checker_branches.get(condition) {
+                        path.split(roots, predicate)?
+                    } else {
+                        #[cfg(feature = "internal-checker")]
+                        {
+                            authored_return.split_unprepared(calls, RootBranchSlot {
+                                block, item: slot.item, parent: slot.expression, condition: *condition, output: Some(slot.output),
+                            }, roots, path)?
+                        }
+                        #[cfg(not(feature = "internal-checker"))]
+                        return None;
+                    };
                     for (index, (arm, incoming)) in [(*then_block, yes), (*else_block, no)].into_iter().enumerate() {
                         if incoming.is_unreachable() {
                             continue;
@@ -2517,6 +2670,40 @@ fn integer_local<'a>(
 }
 
 
+#[cfg(feature = "internal-checker")]
+#[test]
+fn ordered_root_partition_reuses_original_one_sided_rows_and_axes() {
+    let [zero, one, two, three, nine] = [0, 1, 2, 3, 9].map(BigInt::from);
+    let less = IntegerRelation::from_operator(&BinaryOperator::Less).unwrap();
+    let greater = IntegerRelation::from_operator(&BinaryOperator::Greater).unwrap();
+    let accepted = IntegerCutUnion::new((less, &one), (greater, &three), (&zero, &nine));
+    let at = |point| Rc::new(IntegerSet::singleton(point));
+    let outer = at(&zero);
+    let other_outer = at(&nine);
+    let middle = at(&two);
+    let other_middle = at(&three);
+    let untouched = at(&nine);
+    let passing = IntegerInputs(vec![vec![outer.clone(), untouched.clone()], vec![other_outer.clone(), untouched.clone()]]);
+    let before = passing.0.as_ptr();
+    let (passing, failing) = passing.split_partition(0, &accepted);
+    assert!(failing.is_unreachable());
+    assert_eq!(passing.0.as_ptr(), before);
+    assert!(Rc::ptr_eq(&passing.0[0][0], &outer) && Rc::ptr_eq(&passing.0[1][0], &other_outer));
+    let failing = IntegerInputs(vec![vec![middle.clone(), untouched.clone()], vec![other_middle, untouched.clone()]]);
+    let before = failing.0.as_ptr();
+    let (passing, failing) = failing.split_partition(0, &accepted);
+    assert!(passing.is_unreachable());
+    assert_eq!(failing.0.as_ptr(), before);
+    assert!(Rc::ptr_eq(&failing.0[0][0], &middle) && Rc::ptr_eq(&failing.0[1][1], &untouched));
+    let mixed = IntegerInputs(vec![vec![outer.clone(), untouched.clone()], vec![middle.clone(), untouched.clone()]]);
+    let before = mixed.0.as_ptr();
+    let (passing, failing) = mixed.split_partition(0, &accepted);
+    assert_eq!(passing.0.as_ptr(), before);
+    assert!(Rc::ptr_eq(&passing.0[0][0], &outer) && Rc::ptr_eq(&failing.0[0][0], &middle));
+    assert!(Rc::ptr_eq(&passing.0[0][1], &untouched) && Rc::ptr_eq(&failing.0[0][1], &untouched));
+}
+
+#[cfg(test)]
 #[test]
 fn actual_call_projection_accepts_only_the_same_singleton_in_every_row() {
     let one = BigInt::from(1);
