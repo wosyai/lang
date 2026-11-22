@@ -1313,3 +1313,35 @@ fn proved_named_induction_is_not_a_reusable_module_bound() {
         vec![identity.clone()], ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
     ), ScalarProofCallOutcome::Unavailable);
 }
+
+#[test]
+fn named_lexicographic_induction_checks_both_typed_axes_and_exact_recursive_arguments() {
+    let identity = source();
+    let check = |later: &str, limit: &str, filter: &str, rank: &str, actual_first: &str, proof_first: &str| {
+        check_scalar_module_proof(
+            identity.clone(),
+            "rank",
+            vec![ScalarProofModuleInput {
+                source: identity.clone(),
+                text: format!(r#"%%start
+                    {later}(u16, {later}) descend = fn(prefix, value) {{
+                        if (value == {limit}) {{ 0 }} else {{ descend({actual_first}, value - 1) }}
+                    }};
+                    proof rank for descend(offset, entry) -> (out) where ({filter}) ensures (out == 0) decreases ({rank}) {{
+                        if (entry == {limit}) {{ core.show(out == 0); }} else {{ core.use(rank({proof_first}, entry - 1)); }}
+                    }}
+                %%end"#),
+                namespaces: Vec::new(),
+            }],
+            vec![identity.clone()],
+            ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
+        )
+    };
+    assert_eq!(check("u8", "0", "offset >= 500 && entry <= 7", "offset, entry", "prefix", "offset"), ScalarModuleProofOutcome::Proved);
+    assert_eq!(check("i8", "-128", "offset >= 500 && entry < 0", "offset, entry", "prefix", "offset"), ScalarModuleProofOutcome::Proved);
+    assert_eq!(check("u8", "0", "offset < 0 && entry <= 7", "offset, entry", "prefix", "offset"), ScalarModuleProofOutcome::NoApplicableInputs);
+    assert_eq!(check("u8", "0", "offset >= 500 && entry > 0", "offset, entry", "prefix", "offset"), ScalarModuleProofOutcome::Unsupported);
+    assert_eq!(check("u8", "0", "true", "offset, entry", "prefix + 1", "offset"), ScalarModuleProofOutcome::Unsupported);
+    assert_eq!(check("u8", "0", "true", "offset, entry", "prefix", "offset + 1"), ScalarModuleProofOutcome::Unsupported);
+    assert_eq!(check("u8", "0", "true", "entry, offset", "prefix", "offset"), ScalarModuleProofOutcome::Unsupported);
+}
