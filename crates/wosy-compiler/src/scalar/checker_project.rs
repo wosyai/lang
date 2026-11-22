@@ -2757,7 +2757,7 @@ impl PreparedProofModule {
                 if let Some(observer) = observer {
                     outcomes[*index] = module_proof_outcome(observer.outcome());
                 }
-            } else if !matches!(plan.typed.goal, TypedProofGoal::Literal { .. } | TypedProofGoal::Conjunction(_) | TypedProofGoal::Disjunction(_) | TypedProofGoal::Universal { .. } | TypedProofGoal::UniversalNotEqual(_) | TypedProofGoal::UniversalConjunction(_) | TypedProofGoal::Existential { .. } | TypedProofGoal::EntryWitness { .. } | TypedProofGoal::EntryComparison { .. } | TypedProofGoal::MixedEntryConjunction { .. } | TypedProofGoal::ConjunctiveExistential(_)) {
+            } else if !matches!(plan.typed.goal, TypedProofGoal::Literal { .. } | TypedProofGoal::Conjunction(_) | TypedProofGoal::Disjunction(_) | TypedProofGoal::Universal { .. } | TypedProofGoal::UniversalNotEqual(_) | TypedProofGoal::UniversalConjunction(_) | TypedProofGoal::Existential { .. } | TypedProofGoal::EntryWitness { .. } | TypedProofGoal::EntryComparison { .. } | TypedProofGoal::MixedEntryConjunction { .. } | TypedProofGoal::ConjunctiveExistential(_) | TypedProofGoal::DependentWitness(_)) {
                 continue;
             } else if plan.uses_direct_goal() {
                 let key = (plan.target, ExactGuardGroup(plan.filter.as_deref()));
@@ -3035,7 +3035,7 @@ impl PlannedModuleProof<'_> {
 
 
     fn uses_direct_goal(&self) -> bool {
-        self.steps.items.is_empty() || matches!(self.typed.goal, TypedProofGoal::Existential { .. } | TypedProofGoal::EntryWitness { .. } | TypedProofGoal::ConjunctiveExistential(_))
+        self.steps.items.is_empty() || matches!(self.typed.goal, TypedProofGoal::Existential { .. } | TypedProofGoal::EntryWitness { .. } | TypedProofGoal::ConjunctiveExistential(_) | TypedProofGoal::DependentWitness(_))
     }
 
     fn observer(&self) -> SelectedProofObserver<'_> {
@@ -3366,6 +3366,11 @@ impl SelectedProofObserver<'_> {
                         UniversalConjunction::OutputAvoiding(bounds) =>
                             bounds.0.holds_value(value) && !bounds.1.covers_closed(value, value),
                     }),
+                    TypedProofGoal::DependentWitness(witness) => match witness {
+                        DependentWitness::Unavailable => None,
+                        DependentWitness::Comparison(relation, bound) => relation.accepts(value.cmp(bound)).then_some(true),
+                        DependentWitness::Avoiding(domain) => (!domain.covers_closed(value, value)).then_some(true),
+                    },
                     TypedProofGoal::ConjunctiveExistential(goal) => goal.holds_at(value, arguments),
                     TypedProofGoal::Disjunction(allowed) => Some(allowed.contains(value)),
                     TypedProofGoal::DeferredDisjunction(_) => None,
@@ -3569,6 +3574,13 @@ enum UniversalConjunction {
     OutputAvoiding(Box<(IntegerShowConstraints<'static>, IntegerSet)>),
 }
 
+#[cfg(feature = "internal-checker")]
+enum DependentWitness {
+    Unavailable,
+    Comparison(IntegerRelation, BigInt),
+    Avoiding(IntegerSet),
+}
+
 enum TypedProofGoal {
     Literal {
         operator: BinaryOperator,
@@ -3589,6 +3601,8 @@ enum TypedProofGoal {
     EntryWitness { slot: usize, relation: IntegerRelation, domain: IntegerSet },
     #[cfg(feature = "internal-checker")]
     ConjunctiveExistential(Box<ConjunctiveExistential>),
+    #[cfg(feature = "internal-checker")]
+    DependentWitness(DependentWitness),
     EntryComparison { slot: usize, relation: IntegerRelation },
     #[cfg(feature = "internal-checker")]
     MixedEntryConjunction { output: IntegerShowConstraints<'static>, entry: [Option<IntegerRelation>; 2] },
@@ -3605,6 +3619,11 @@ impl TypedProofGoal {
             }
             Self::Disjunction(allowed) => path.output_within(allowed),
             Self::UniversalNotEqual(domain) => path.output_disjoint_from(domain),
+            Self::DependentWitness(witness) => match witness {
+                DependentWitness::Unavailable => None,
+                DependentWitness::Comparison(relation, bound) => path.output_satisfies(*relation, bound)?.then_some(true),
+                DependentWitness::Avoiding(domain) => path.output_disjoint_from(domain)?.then_some(true),
+            },
             Self::UniversalConjunction(goal) => match goal {
                 UniversalConjunction::Vacuous => Some(true),
                 UniversalConjunction::Impossible => Some(false),
@@ -3869,6 +3888,68 @@ fn typed_quantifier_domain(
     Ok(domain)
 }
 
+fn authored_witness_argument(steps: &ScalarBlock) -> Result<&ScalarExpression, ProjectCheck> {
+    let [ScalarBlockItem::Expression(ScalarExpression::Call {
+        receiver, name, arguments, type_arguments, ..
+    })] = steps.items.as_slice() else {
+        return Err(ProjectCheck::Unsupported);
+    };
+    if receiver.as_deref() != Some("core") || name != "witness"
+        || !type_arguments.is_empty() || steps.terminated_items.as_slice() != [true]
+    {
+        return Err(ProjectCheck::Unsupported);
+    }
+    let [argument] = arguments.as_slice() else {
+        return Err(ProjectCheck::Unsupported);
+    };
+    Ok(argument)
+}
+
+#[cfg(feature = "internal-checker")]
+fn typed_named_dependent_witness(
+    forall: &CstNode, exists: &CstNode, steps: &ScalarBlock, output: &str, inputs: &[String], ty: &ScalarType,
+) -> Result<TypedProofGoal, ProjectCheck> {
+    let (_, universal) = typed_quantifier_binder(forall, output, inputs, ty)?;
+    let (_, existential) = typed_quantifier_binder(exists, output, inputs, ty)?;
+    if universal == existential {
+        return Err(ProjectCheck::InvalidProof);
+    }
+    let predicate = derive_expression(&child(exists, SyntaxKind::Expression)?);
+    let ScalarExpression::Binary { operator, left, right, .. } = predicate else {
+        return Err(ProjectCheck::Unsupported);
+    };
+    if !matches!(left.as_ref(), ScalarExpression::Name { name, .. } if name == output)
+        || !matches!(right.as_ref(), ScalarExpression::Name { name, .. } if name == &existential)
+        || !matches!(authored_witness_argument(steps)?, ScalarExpression::Name { name, .. } if name == &universal)
+    {
+        return Err(ProjectCheck::Unsupported);
+    }
+    let relation = IntegerRelation::from_operator(&operator).ok_or(ProjectCheck::Unsupported)?;
+    let universal_domain = typed_quantifier_domain(forall, &universal, inputs, ty)?;
+    let existential_domain = typed_quantifier_domain(exists, &existential, inputs, ty)?;
+    if universal_domain.is_empty() {
+        return Err(ProjectCheck::Unsupported);
+    }
+    let witness = if (operator == BinaryOperator::Equal && universal_domain.singleton_value().is_none())
+        || !universal_domain.is_subset_of(&existential_domain)
+    {
+        DependentWitness::Unavailable
+    } else {
+        match operator {
+            BinaryOperator::Equal => universal_domain.into_singleton()
+                .map_or(DependentWitness::Unavailable, |bound| DependentWitness::Comparison(relation, bound)),
+            BinaryOperator::NotEqual => DependentWitness::Avoiding(universal_domain),
+            BinaryOperator::Less | BinaryOperator::LessEqual | BinaryOperator::Greater | BinaryOperator::GreaterEqual => {
+                let lower = matches!(operator, BinaryOperator::Less | BinaryOperator::LessEqual);
+                let bound = universal_domain.into_extremum(lower).ok_or(ProjectCheck::Unsupported)?;
+                DependentWitness::Comparison(relation, bound)
+            }
+            _ => return Err(ProjectCheck::Unsupported),
+        }
+    };
+    Ok(TypedProofGoal::DependentWitness(witness))
+}
+
 fn typed_existential_output_goal(
     exists: &CstNode, steps: &ScalarBlock, output: &str, inputs: &[String], ty: &ScalarType,
     #[cfg_attr(not(feature = "internal-checker"), allow(unused_variables))] body: &FunctionCallSites,
@@ -3891,19 +3972,7 @@ fn typed_existential_output_goal(
         }
         Ok(relation)
     };
-    let [ScalarBlockItem::Expression(ScalarExpression::Call {
-        receiver, name, arguments, type_arguments, ..
-    })] = steps.items.as_slice() else {
-        return Err(ProjectCheck::Unsupported);
-    };
-    if receiver.as_deref() != Some("core") || name != "witness"
-        || !type_arguments.is_empty() || steps.terminated_items.as_slice() != [true]
-    {
-        return Err(ProjectCheck::Unsupported);
-    }
-    let [argument] = arguments.as_slice() else {
-        return Err(ProjectCheck::Unsupported);
-    };
+    let argument = authored_witness_argument(steps)?;
     #[cfg(feature = "internal-checker")]
     if allow_named_entry_facts && matches!(&predicate, ScalarExpression::Binary { operator: BinaryOperator::And, .. }) {
         let mut relation: Option<IntegerRelation> = None;
@@ -4541,10 +4610,25 @@ fn typed_proof_postcondition<'a, const AUDIT_INDUCTION: bool, const DEFER_OUTPUT
     }
     let mut foralls = declaration.children().filter(|node| node.kind() == SyntaxKind::ProofForall);
     let goal = if let Some(exists) = exists {
-        if foralls.next().is_some() || measure.is_some() {
+        if measure.is_some() {
             return Err(ProjectCheck::Unsupported);
         }
-        typed_existential_output_goal(&exists, steps, output, &input_names, &result.ty, body, allow_named_entry_facts)?
+        if let Some(forall) = foralls.next() {
+            #[cfg(feature = "internal-checker")]
+            {
+                if !allow_named_entry_facts || foralls.next().is_some() {
+                    return Err(ProjectCheck::Unsupported);
+                }
+                typed_named_dependent_witness(&forall, &exists, steps, output, &input_names, &result.ty)?
+            }
+            #[cfg(not(feature = "internal-checker"))]
+            {
+                let _ = forall;
+                return Err(ProjectCheck::Unsupported);
+            }
+        } else {
+            typed_existential_output_goal(&exists, steps, output, &input_names, &result.ty, body, allow_named_entry_facts)?
+        }
     } else {
         let ensures = derive_expression(&child(&ensures_node, SyntaxKind::Expression)?);
         if let Some(forall) = foralls.next() {

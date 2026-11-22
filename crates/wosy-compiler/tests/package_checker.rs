@@ -3108,6 +3108,48 @@ fn named_universal_goal_cannot_issue_a_reusable_literal_bound() {
 }
 
 #[test]
+fn named_dependent_existential_witness_checks_each_universal_candidate_exactly() {
+    let identity = source();
+    let check = |header: &str, binder: &str, predicate: &str, candidate: &str, guard: &str, actual: &str| {
+        check_scalar_module_proof(
+            identity.clone(), "prove",
+            vec![ScalarProofModuleInput {
+                source: identity.clone(),
+                text: format!(r#"%%start
+                    i16(i16) echo = fn(value) {{ value }};
+                    {actual}
+                    proof prove for echo(input) -> (out) where ({guard}) {header}
+                        ensures (exists ({binder}) {{ {predicate} }}) {{ core.witness({candidate}); }}
+                %%end"#),
+                namespaces: Vec::new(),
+            }],
+            vec![identity.clone()], ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
+        )
+    };
+    use ScalarModuleProofOutcome::{Invalid, NoApplicableInputs, Proved, Unsupported};
+    let domain = "forall (i16 i where i >= -8 && i <= -6 && i != -7)";
+    let matching = "i16 k where k >= -8 && k != -7";
+    let too_small = "i16 k where k >= -8 && k != -6";
+    assert_eq!(check(domain, matching, "out < k", "i", "input <= -9", ""), Proved);
+    assert_eq!(check(domain, matching, "out <= k", "i", "input == -8", ""), Proved);
+    assert_eq!(check(domain, matching, "out < k", "i", "input == -8", ""), Unsupported);
+    assert_eq!(check(domain, matching, "out != k", "i", "input == -7", ""), Proved);
+    assert_eq!(check(domain, matching, "out != k", "i", "input >= -7 && input <= -6", ""), Unsupported);
+    assert_eq!(check(domain, matching, "out >= k", "i", "true", "i16 a = echo(-6); i16 b = echo(-5);"), Proved);
+    assert_eq!(check(domain, matching, "out >= k", "i", "true", "i16 a = echo(-6); i16 b = echo(-7);"), Unsupported);
+    assert_eq!(check(domain, matching, "out == k", "i", "input == -8", ""), Unsupported);
+    assert_eq!(check("forall (i16 i where i == -8)", matching, "out == k", "i", "input == -8", ""), Proved);
+    assert_eq!(check(domain, too_small, "out < k", "i", "input <= -9", ""), Unsupported);
+    assert_eq!(check(domain, too_small, "out < k", "i", "false", "i16 a = echo(-9);"), NoApplicableInputs);
+    assert_eq!(check(domain, matching, "out < k", "input", "input <= -9", ""), Unsupported);
+    assert_eq!(check("forall (i16 i where false)", matching, "out < k", "i", "true", ""), Unsupported);
+    assert!(matches!(check("forall (i16 i where false)", "i16 k where k <= 32768", "out < k", "i", "true", ""), Invalid(_)));
+    assert!(matches!(check(domain, "i16 i", "out < i", "i", "true", ""), Invalid(_)));
+    assert_eq!(check(domain, "u16 k", "out < k", "i", "true", ""), Unsupported);
+    assert_eq!(check(&format!("{domain} forall (i16 j)"), matching, "out < k", "i", "true", ""), Unsupported);
+}
+
+#[test]
 fn named_existential_proof_verifies_all_exact_integer_predicates_for_chosen_witness() {
     let identity = source();
     let check = |signature: &str, body: &str, candidate: &str, operator: &str, where_guard: &str, startup: &str| {
