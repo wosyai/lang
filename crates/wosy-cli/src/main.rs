@@ -177,9 +177,9 @@ fn build_command(target: Option<&str>, profile: &str) -> Result<(), String> {
     let executable = output_dir.join("main");
     let pending_manifest = output_dir.join("artifact-manifest.pending.json");
     let pending = wosy_project::ArtifactManifest {
-        identity: identity.clone(),
-        executable: executable.clone(),
-        source_observations: source_observations.clone(),
+        identity,
+        executable,
+        source_observations,
     };
     let pending_bytes = serde_json::to_vec_pretty(&pending).map_err(|error| error.to_string())?;
     fs::write(&pending_manifest, pending_bytes).map_err(|error| error.to_string())?;
@@ -198,6 +198,11 @@ fn build_command(target: Option<&str>, profile: &str) -> Result<(), String> {
             runtime_path.to_string_lossy().as_ref(),
         ],
     )?;
+    let wosy_project::ArtifactManifest {
+        identity,
+        executable,
+        source_observations,
+    } = pending;
     publish_artifact(&output_dir, executable, identity, source_observations)?;
     fs::remove_file(pending_manifest).map_err(|error| error.to_string())?;
     Ok(())
