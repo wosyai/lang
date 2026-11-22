@@ -8968,7 +8968,23 @@ shapes.Bundle() second = fn {
             .replace("shapes.Bundle snapshot = { .unit_item = blue; .guard = 19; };
     snapshot",
                 "{ .unit_item = blue; .guard = 19; }");
-        for (root_variant, seeds_variant) in [(extra_use.as_str(), seeds), (root, no_candidate.as_str())] {
+        let local_only = seeds.replace("%%end", "shapes.Bundle stored = first();
+u64(bool) choose = fn(flag) {
+    u64 prior = stored.unit_item.total;
+    stored = if (flag) { first() } else { second() };
+    prior * 100 + stored.unit_item.total
+};
+%%end");
+        let scalar_caller = "%%start
+shapes = namespace package \"shapes.w\";
+seeds = namespace package \"seeds.w\";
+u64(bool) choose_local = fn(flag) { seeds.choose(flag) };
+%%end";
+        for (root_variant, seeds_variant) in [
+            (extra_use.as_str(), seeds),
+            (root, no_candidate.as_str()),
+            (scalar_caller, local_only.as_str()),
+        ] {
             let prepared = prepare(target_layout, root_variant, seeds_variant);
             let build = analyze_scalar_build(&prepared);
             assert!(build.diagnostics().is_empty(), "{:?}", build.diagnostics());

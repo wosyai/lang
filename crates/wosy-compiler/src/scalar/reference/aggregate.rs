@@ -2207,24 +2207,24 @@ impl OrdinaryCohorts {
         }
         let mut dependent = HashMap::<BodyKey, Vec<BodyKey>>::new();
         for (&producer, uses) in &self.namespace {
-            if result.bodies.contains_key(&producer) || !uses.iter().any(|site| match site {
-                SnapshotUse::Startup { module, .. } => *module != producer.0,
-                SnapshotUse::Arm { caller, .. } => caller.0 != producer.0,
-            }) {
-                self.refused.insert(producer);
-            }
+            let mut crosses_module = false;
             for site in uses {
                 match site {
                     SnapshotUse::Startup { module, .. } => {
+                        crosses_module |= *module != producer.0;
                         if module_at(*module).is_none_or(|input| result.initializers.contains_key(input.source)) {
                             self.refused.insert(producer);
                         }
                     }
                     SnapshotUse::Arm { caller, peer, .. } => {
+                        crosses_module |= caller.0 != producer.0;
                         if result.bodies.contains_key(caller) { self.refused.insert(producer); }
                         dependent.entry(*peer).or_default().push(producer);
                     }
                 }
+            }
+            if !crosses_module || result.bodies.contains_key(&producer) {
+                self.refused.insert(producer);
             }
         }
         let mut pending = self.refused.iter().copied().collect::<Vec<_>>();
