@@ -6925,17 +6925,30 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
         let initializer_literal_argument = matches!(edge, OccurrenceEdge::CallArgument(0 | 1))
             && matches!(self.mode, WalkMode::ModuleInitialization { .. });
         #[cfg(any(test, feature = "internal-checker"))]
-        if self.occurrence_typing.checker_directives_enabled()
+        let checker_enabled = self.occurrence_typing.checker_directives_enabled();
+        #[cfg(any(test, feature = "internal-checker"))]
+        let checked_unit_pair_argument = checker_enabled
+            && matches!(self.mode, WalkMode::Callable(_))
+            && (matches!(edge, OccurrenceEdge::CallArgument(1))
+                || (matches!(edge, OccurrenceEdge::CallArgument(0))
+                    && matches!(expression, ScalarExpression::Unary { operator: super::UnaryOperator::Negate, .. })))
+            && matches!(parent, OccurrenceParent::Expression(call)
+                if self.checked_call_signatures.get(&call).is_some_and(|signature| {
+                    signature.parameters.len() == 2 && signature.parameters.iter().all(is_integer_type)
+                        && matches!(signature.outputs.outputs.as_slice(), [output] if output.ty == ScalarType::Unit)
+                }));
+        #[cfg(any(test, feature = "internal-checker"))]
+        if checker_enabled
             && (matches!(
                 edge,
                 OccurrenceEdge::AssignmentRhs { .. }
                     | OccurrenceEdge::BindingRoot { .. }
                     | OccurrenceEdge::FinalOutput { .. }
-            ) || initializer_literal_argument
+            ) || initializer_literal_argument || checked_unit_pair_argument
                 || (matches!(edge, OccurrenceEdge::CallArgument(0)) && matches!(self.mode, WalkMode::Callable(_))))
             && self.structure.checked_types.expressions.get(&ordinal).is_some_and(is_integer_type)
         {
-            let value = if initializer_literal_argument {
+            let value = if initializer_literal_argument || checked_unit_pair_argument {
                 super::checker_flow::concrete_integer_literal(expression).map(std::borrow::Cow::into_owned)
             } else if let ScalarExpression::Integer { value, .. } = expression {
                 Some(value.clone())

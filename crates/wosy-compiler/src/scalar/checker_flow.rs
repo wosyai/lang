@@ -4,7 +4,7 @@ use num_bigint::BigInt;
 
 use super::{
     checker_directive::CheckerOperation,
-    control::{AssignmentReplacement, BindingInitialization, BindingRegion, BlockItemKind, BlockPosition, ConditionalRegion},
+    control::{AssignmentReplacement, BindingInitialization, BindingRegion, BlockItemKind, BlockPosition, CheckedCallSignature, ConditionalRegion},
     reference::{BlockOrdinal, DirectDestinationIdentity, FunctionCallSites, OccurrenceEdge, OccurrenceNode, OccurrenceOrdinal, OccurrenceParent, OccurrenceStructure, PlainNameIdentity},
     symbolic_integer::{IntegerIntersection, IntegerSet},
     typecheck::is_integer_type,
@@ -565,7 +565,25 @@ pub(super) enum ActualCallResult {
 
 pub(super) enum NestedIntegerArgument<'a> {
     Single(Option<ExactIntegerArgument<'a>>),
+    Pair(ExactIntegerArgument<'a>, ExactIntegerArgument<'a>),
     Projected { ty: &'a ScalarType, axis: usize, values: Rc<IntegerSet> },
+}
+
+fn nested_integer_axis(
+    calls: &FunctionCallSites, roots: &IntegerRoots<'_>, argument: OccurrenceOrdinal, ty: &ScalarType,
+) -> Option<usize> {
+    let PlainNameIdentity::Lexical(binding) = calls.prepared_plain_name(argument)? else { return None; };
+    let (axis, binding_type) = roots.lookup(binding)?;
+    (binding_type == ty).then_some(axis)
+}
+
+fn exact_nested_pair<'a>(
+    calls: &'a FunctionCallSites, expression: OccurrenceOrdinal, roots: &IntegerRoots<'_>, path: &'a IntegerInputs,
+) -> Option<NestedIntegerArgument<'a>> {
+    let lexical = |argument, ty: &ScalarType| path.singleton_at(nested_integer_axis(calls, roots, argument, ty)?);
+    let first = exact_integer_call_argument_at(&calls.structure, expression, 0, lexical)?;
+    let second = exact_integer_call_argument_at(&calls.structure, expression, 1, lexical)?;
+    Some(NestedIntegerArgument::Pair(first, second))
 }
 
 fn actual_nested_argument<'a>(
@@ -581,15 +599,9 @@ fn actual_nested_argument<'a>(
     if let Some(value) = calls.structure.checker_integer_literals.get(&argument) {
         return NestedIntegerArgument::Single(Some((ty, value)));
     }
-    let Some((axis, binding_type)) = calls.prepared_plain_name(argument).and_then(|name| match name {
-        PlainNameIdentity::Lexical(binding) => roots.lookup(binding),
-        _ => None,
-    }) else {
+    let Some(axis) = nested_integer_axis(calls, roots, argument, ty) else {
         return NestedIntegerArgument::Single(None);
     };
-    if binding_type != ty {
-        return NestedIntegerArgument::Single(None);
-    }
     if let Some(value) = path.singleton_at(axis) {
         return NestedIntegerArgument::Single(Some((ty, value)));
     }
@@ -603,7 +615,7 @@ fn actual_nested_argument<'a>(
 
 pub(super) type ActualCallHandler<'a, 'handler> =
     dyn FnMut(
-        &'a FunctionCallSites, OccurrenceOrdinal, NestedIntegerArgument<'_>, &ScalarType,
+        &'a FunctionCallSites, OccurrenceOrdinal, &CheckedCallSignature, NestedIntegerArgument<'_>, &ScalarType,
     ) -> Option<ActualCallResult> + 'handler;
 
 pub(super) fn check_integer_requirements_with_calls<'a>(
@@ -897,13 +909,18 @@ fn walk_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool>(
                     path = passing;
                 } else if structure.checker_direct_targets.contains_key(&expression) {
                     let handle = handle_call.as_mut()?;
-                    let project = COLLECT && failures.as_ref().is_some_and(|collection| collection.allow_projected_calls);
-                    let argument = actual_nested_argument(calls, expression, roots, &path, project);
+                    let signature = calls.checked_call_signatures.get(&expression)?;
+                    let argument = if COLLECT && signature.parameters.len() == 2 {
+                        exact_nested_pair(calls, expression, roots, &path)?
+                    } else {
+                        let project = COLLECT && failures.as_ref().is_some_and(|collection| collection.allow_projected_calls);
+                        actual_nested_argument(calls, expression, roots, &path, project)
+                    };
                     let projected = match &argument {
                         NestedIntegerArgument::Projected { axis, values, .. } => Some((*axis, Rc::clone(values))),
                         _ => None,
                     };
-                    match handle(calls, expression, argument, &ScalarType::Unit)? {
+                    match handle(calls, expression, signature, argument, &ScalarType::Unit)? {
                         ActualCallResult::Unit => {}
                         ActualCallResult::EmptyUnit if COLLECT => path = IntegerInputs::default(),
                         ActualCallResult::ProjectedUnit(survivors) if COLLECT => {
@@ -1055,8 +1072,9 @@ fn walk_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool>(
                     let [receiver] = binding.receivers() else {
                         return None;
                     };
+                    let signature = calls.checked_call_signatures.get(&origin.call)?;
                     let argument = actual_nested_argument(calls, origin.call, roots, &path, false);
-                    let ActualCallResult::Integer(value) = handle(calls, origin.call, argument, &receiver.ty)? else {
+                    let ActualCallResult::Integer(value) = handle(calls, origin.call, signature, argument, &receiver.ty)? else {
                         return None;
                     };
                     roots.add(&origin.binding, &receiver.ty);

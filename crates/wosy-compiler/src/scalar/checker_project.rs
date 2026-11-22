@@ -893,7 +893,9 @@ fn check_initializer_expression<const COLLECT: bool>(
         sink = RefCell::new(failures.as_deref_mut().ok_or(ProjectCheck::Unsupported)?);
         Some((source, OrderedCallCollection { failures: &sink, visits: Some(visits) }))
     } else { None };
-    match run_initializer_call(topology, actual, expression, &ScalarType::Unit, |_, _| None, collection)? {
+    match run_initializer_call(topology, actual, expression, &ScalarType::Unit, |argument, ty| {
+        if COLLECT { initialized_integer_argument(topology, storage, argument, ty) } else { None }
+    }, collection)? {
         ActualCallResult::Unit => Ok(StartupLane::Feasible),
         ActualCallResult::EmptyUnit if COLLECT => Ok(StartupLane::Empty),
         _ => Err(ProjectCheck::Unsupported),
@@ -915,12 +917,14 @@ fn run_initializer_call<'a>(
         return Err(ProjectCheck::Unsupported);
     };
     let signature = topology.checked_call_signatures.get(&occurrence).ok_or(ProjectCheck::MissingRootOccurrences)?;
-    let arguments = if is_integer_type(expected) && signature.parameters.len() == 2 {
+    let arguments = if signature.parameters.len() == 2
+        && (is_integer_type(expected) || (*expected == ScalarType::Unit && collection.is_some()))
+    {
         let first = exact_integer_call_argument_at(&topology.structure, occurrence, 0, &initialized_argument)
             .ok_or(ProjectCheck::Unsupported)?;
         let second = exact_integer_call_argument_at(&topology.structure, occurrence, 1, &initialized_argument)
             .ok_or(ProjectCheck::Unsupported)?;
-        ActualProjectedArguments::InitializerPair(first, second)
+        ActualProjectedArguments::ExactPair(first, second)
     } else {
         let argument = exact_integer_call_argument(&topology.structure, occurrence, initialized_argument);
         if *expected != ScalarType::Unit && argument.is_none() {
@@ -991,7 +995,7 @@ struct OrderedCallCollection<'a, 'visits> {
 
 enum ActualProjectedArguments<'a> {
     Single(Option<ExactIntegerArgument<'a>>),
-    InitializerPair(ExactIntegerArgument<'a>, ExactIntegerArgument<'a>),
+    ExactPair(ExactIntegerArgument<'a>, ExactIntegerArgument<'a>),
     SymbolicAxis(&'a ScalarType, Rc<IntegerSet>),
 }
 
@@ -1032,6 +1036,7 @@ impl<Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> CheckedCalls<'
         &mut self,
         caller: &FunctionCallSites,
         call: OccurrenceOrdinal,
+        signature: &CheckedCallSignature,
         argument: NestedIntegerArgument<'_>,
         expected: &ScalarType,
         collection: Option<(&SourceIdentity, OrderedCallCollection<'_, '_>)>,
@@ -1047,9 +1052,9 @@ impl<Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> CheckedCalls<'
         if collection.is_some() && *expected != ScalarType::Unit {
             return Err(ProjectCheck::Unsupported);
         }
-        let signature = caller.checked_call_signatures.get(&call).ok_or(ProjectCheck::MissingRootOccurrences)?;
         let projected = match argument {
             NestedIntegerArgument::Single(exact) => ActualProjectedArguments::Single(exact),
+            NestedIntegerArgument::Pair(first, second) => ActualProjectedArguments::ExactPair(first, second),
             NestedIntegerArgument::Projected { ty, values, .. } => ActualProjectedArguments::SymbolicAxis(ty, values),
         };
         self.run(&caller.structure, call, signature, projected, source, *declaration_span, expected, collection)
@@ -1062,8 +1067,8 @@ impl<Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> CheckedCalls<'
         exact: Option<&[&BigInt]>,
     ) -> Result<bool, ProjectCheck> {
         let mut nested_error = None;
-        let checked = check_integer_requirements_with_calls(body, exact, &mut |caller, occurrence, argument, expected| {
-            match self.nested(caller, occurrence, argument, expected, None) {
+        let checked = check_integer_requirements_with_calls(body, exact, &mut |caller, occurrence, signature, argument, expected| {
+            match self.nested(caller, occurrence, signature, argument, expected, None) {
                 Ok(result) => Some(result),
                 Err(error) => {
                     nested_error = Some(error);
@@ -1088,8 +1093,8 @@ impl<Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> CheckedCalls<'
         let terminal_projection = matches!(&entry, IntegerRequirementEntry::Projected(_));
         let mut sink = |failure| collection.failures.borrow_mut().push_callable(body, source, failure);
         let mut nested_error = None;
-        let mut nested = |caller: &FunctionCallSites, occurrence, argument: NestedIntegerArgument<'_>, expected: &ScalarType| {
-            match self.nested(caller, occurrence, argument, expected, Some((source, collection))) {
+        let mut nested = |caller: &FunctionCallSites, occurrence, signature: &CheckedCallSignature, argument: NestedIntegerArgument<'_>, expected: &ScalarType| {
+            match self.nested(caller, occurrence, signature, argument, expected, Some((source, collection))) {
                 Ok(result) => Some(result),
                 Err(error) => {
                     nested_error = Some(error);
@@ -1186,8 +1191,8 @@ impl<Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> CheckedCalls<'
                 &argument
             }
             ([first, second], [first_slot, second_slot],
-                ActualProjectedArguments::InitializerPair((first_ty, first_value), (second_ty, second_value)))
-                if is_integer_type(expected)
+                ActualProjectedArguments::ExactPair((first_ty, first_value), (second_ty, second_value)))
+                if (is_integer_type(expected) || (*expected == ScalarType::Unit && collection.is_some()))
                     && *first == first_slot.ty && first == first_ty
                     && *second == second_slot.ty && second == second_ty =>
             {
@@ -4129,6 +4134,94 @@ mod tests {
         let cycle = format!("unit() recurse = fn {{ core.require(false, {OUTPUT}); recurse(); }};");
         let (_, prepared) = prepare(&cycle, "recurse();");
         assert_eq!(collect_package_startup_failures(&prepared), Err(ProjectCheck::Unsupported));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn startup_failure_collection_preserves_two_checked_axes_across_exact_unit_calls() {
+        let app = source("src/main.w", "collect-pair-root");
+        let child = source("src/child.w", "collect-pair-child");
+        let prepare = |startup: &str| {
+            let app_text = format!(r#"%%start
+                lib = namespace demo "src/child.w";
+                unit(u8, i8) bridge = fn(x, y) {{
+                    core.require(x < 3, {OUTPUT});
+                    lib.leaf(x, y);
+                    core.require(y > -8, {OUTPUT});
+                }};
+                unit(u8) literal = fn(x) {{ lib.leaf(x, -8); }};
+                {startup}
+            %%end"#);
+            let child_text = format!(r#"%%start
+                unit(u8, i8) leaf = fn(left, right) {{
+                    core.require(left < 2, {OUTPUT});
+                    core.require(right > -7, {OUTPUT});
+                    core.narrow(right > -10, {OUTPUT});
+                }};
+            %%end"#);
+            let start = app_text.find("lib =").unwrap();
+            let end = start + app_text[start..].find(';').unwrap() + 1;
+            let prepared = prepare_checker_project(
+                vec![
+                    (declarations(&app, &app_text), vec![ScalarNamespaceBinding {
+                        binding: "lib".into(), target: child.clone(), span: ByteSpan::new(start as u32, end as u32),
+                    }]),
+                    (declarations(&child, &child_text), Vec::new()),
+                ],
+                vec![app.clone(), child.clone()],
+                inputs(),
+            ).unwrap();
+            (prepared, app_text, child_text)
+        };
+        let (prepared, app_text, child_text) = prepare(&format!(r#"
+            lib.leaf(4, -5);
+            bridge(3, -8);
+            literal(3);
+            bridge(5, -10);
+            core.require(false, {OUTPUT});
+        "#));
+        let reports = collect_package_startup_failures(&prepared).unwrap();
+        let shape = reports.iter().map(|failure| {
+            let ProjectCheck::Failed { source, operation, condition, axes, state, .. } = failure else { panic!("expected report"); };
+            assert_eq!(state.row_count(), 1);
+            assert_eq!(axes.len(), 2);
+            assert_eq!((&axes[0].1, &axes[1].1), (&ScalarType::U8, &ScalarType::I8));
+            assert!(axes.iter().all(|(binding, _)| &binding.source == source));
+            let values = [0, 1].map(|axis| {
+                let mut values = state.intervals_at(0, axis).unwrap();
+                let (lo, hi) = values.next().unwrap();
+                assert_eq!(lo, hi);
+                assert!(values.next().is_none());
+                lo.clone()
+            });
+            let text = if source == &app { &app_text } else {
+                assert_eq!(source, &child);
+                &child_text
+            };
+            (source, *operation, &text[condition.start as usize..condition.end as usize], values)
+        }).collect::<Vec<_>>();
+        let row = |x: i32, y: i32| [BigInt::from(x), BigInt::from(y)];
+        use CheckerOperation::{Narrow, Require};
+        assert_eq!(shape, [
+            (&child, Require, "left < 2", row(4, -5)),
+            (&app, Require, "x < 3", row(3, -8)),
+            (&child, Require, "left < 2", row(3, -8)),
+            (&child, Require, "right > -7", row(3, -8)),
+            (&app, Require, "y > -8", row(3, -8)),
+            (&child, Require, "left < 2", row(3, -8)),
+            (&child, Require, "right > -7", row(3, -8)),
+            (&app, Require, "x < 3", row(5, -10)),
+            (&child, Require, "left < 2", row(5, -10)),
+            (&child, Require, "right > -7", row(5, -10)),
+            (&child, Narrow, "right > -10", row(5, -10)),
+        ]);
+        assert_eq!(check_package_initialization(&prepared), Err(ProjectCheck::Unsupported));
+
+        let (nonuniform, _, _) = prepare("lib.leaf(1, -1);");
+        assert_eq!(collect_ordered_package_failures(&nonuniform, ScalarCheckerScope::CurrentPackage, 2),
+            Err(ProjectCheck::Unsupported));
+        assert_eq!(collect_ordered_package_failures(&nonuniform, ScalarCheckerScope::MainFlowOnly, 2),
+            Ok((true, Vec::new())));
     }
 
     #[cfg(feature = "internal-checker")]
