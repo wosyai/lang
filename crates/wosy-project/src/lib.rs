@@ -398,17 +398,14 @@ pub struct TargetLayout {
 
 impl ArtifactProfile {
     pub fn target_layout(&self) -> Result<TargetLayout, String> {
-        let backend_output = (self.backend.as_str(), self.output.as_str());
-        if self.exports.is_some()
-            && !matches!(backend_output, ("llvm", "wasm-wasip1" | "wasm-wasip2"))
-        {
-            return Err("root exports require a selected LLVM Wasm artifact profile".to_owned());
-        }
-        match backend_output {
-            ("llvm", "wasm-wasip1" | "wasm-wasip2") => Ok(TargetLayout {
+        match (self.backend.as_str(), self.output.as_str()) {
+            ("llvm", "wasm-wasip1" | "wasm-wasip2" | "wasm-web") => Ok(TargetLayout {
                 pointer_size: 4,
                 pointer_alignment: 4,
             }),
+            _ if self.exports.is_some() => {
+                Err("root exports require a selected LLVM Wasm artifact profile".to_owned())
+            }
             ("llvm", "native") => Ok(TargetLayout {
                 pointer_size: 8,
                 pointer_alignment: 8,
@@ -1267,10 +1264,12 @@ mod tests {
             let doc = source.parse::<DocumentMut>().expect("fixture TOML");
             parse_artifacts(doc.get("artifacts"))
         };
-        let artifacts = parse(document).expect("root exports");
-        let profile = &artifacts["main"].profiles["dev"];
-        assert_eq!(profile.exports.as_ref().unwrap()["demo_score"], "score");
-        assert!(profile.target_layout().is_ok());
+        for output in ["wasm-wasip1", "wasm-wasip2", "wasm-web"] {
+            let artifacts = parse(&document.replace("wasm-wasip1", output)).expect("root exports");
+            let profile = &artifacts["main"].profiles["dev"];
+            assert_eq!(profile.exports.as_ref().unwrap()["demo_score"], "score");
+            assert_eq!(profile.target_layout(), Ok(TargetLayout { pointer_size: 4, pointer_alignment: 4 }));
+        }
         let native = parse(&document.replace("wasm-wasip1", "native")).expect("parse native profile");
         assert!(native["main"].profiles["dev"].target_layout().is_err());
         let empty = document.replace("demo_score = \"score\"", "").replace("tick = \"step\"", "");
@@ -1284,7 +1283,7 @@ mod tests {
 
     #[test]
     fn artifact_profile_derives_documented_llvm_target_layouts() {
-        for output in ["wasm-wasip1", "wasm-wasip2"] {
+        for output in ["wasm-wasip1", "wasm-wasip2", "wasm-web"] {
             let profile = ArtifactProfile {
                 backend: "llvm".to_owned(),
                 output: output.to_owned(),

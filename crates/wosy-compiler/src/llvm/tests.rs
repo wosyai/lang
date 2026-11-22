@@ -713,6 +713,7 @@ fn emit_initializer_test_input(
             &|reservations| build.aggregate(reservations),
             &|item, arm, _| build.reference_cfg(0, item, arm),
             super::PartitionMetadata::Full,
+            &[],
         ),
         super::emit_project_llvm(
             project,
@@ -722,6 +723,7 @@ fn emit_initializer_test_input(
             &|module, item, arm, _| build.reference_cfg(module, item, arm),
             None,
             super::PartitionMetadata::Full,
+            &[],
         ),
     ]
 }
@@ -1134,6 +1136,7 @@ fn prepared_initializer_namespace_member_uses_selected_storage_on_both_layouts()
                 &|module, item, arm, _| build.reference_cfg(module, item, arm),
                 None,
                 super::PartitionMetadata::Full,
+                &[],
             )
         };
         let region = prepared.initialization_region(0).unwrap();
@@ -1220,6 +1223,7 @@ i32 nested = unsafe { echo(33) };
                 &|reservations| build.aggregate(reservations),
                 &|item, arm, _| build.reference_cfg(0, item, arm),
                 super::PartitionMetadata::Full,
+                &[],
             )
             .unwrap()
             .to_text(),
@@ -1231,6 +1235,7 @@ i32 nested = unsafe { echo(33) };
                 &|module, item, arm, _| build.reference_cfg(module, item, arm),
                 None,
                 super::PartitionMetadata::Full,
+                &[],
             )
             .unwrap()
             .to_text(),
@@ -2969,6 +2974,7 @@ select = overload {
             },
             None,
             super::PartitionMetadata::Full,
+            &[],
         )
         .unwrap_err();
         assert!(
@@ -6983,6 +6989,7 @@ fn detached_project_llvm_initializes_interleaved_namespace_diamond_once() {
             &|module, item, arm, _| build.reference_cfg(module, item, arm),
             None,
             super::PartitionMetadata::Full,
+            &[],
         )
         .unwrap_err();
         assert_eq!(

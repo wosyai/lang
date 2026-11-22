@@ -47,7 +47,8 @@ Rules:
 - `[comments] categories` lists the `# CATEGORY:` comment categories accepted by `wosy parse` and `wosy build`.
 - Each builder needs `command` (argv, first element is the executable), optional `args`, and `toolchain_identity`. The same applies to runners.
 - Each target needs `root` (entry file relative to the project root), at least one artifact, one artifact profile, and one target profile naming its `main_artifact`.
-- Supported backend/output pairs are `llvm/native` and `llvm/wasm-wasip1` or `llvm/wasm-wasip2`.
+- Supported backend/output pairs are `llvm/native`, `llvm/wasm-wasip1`, `llvm/wasm-wasip2`, and `llvm/wasm-web`.
+- Select `output = "wasm-web"` for a browser-hosted artifact. Its builder should compile for `wasm32-unknown-unknown`. The runtime terminates on system panic with a Wasm trap and adds no WASI imports. The application can still declare host imports explicitly.
 
 An LLVM Wasm artifact profile can opt into stable root-function labels for its builder:
 

@@ -36,7 +36,26 @@ pub const COMPILER_IDENTITY: &str = concat!("wosy-compiler-", env!("CARGO_PKG_VE
 pub fn core_runtime(backend: &str, output: &str) -> Result<&'static str, String> {
     match (backend, output) {
         ("llvm", "native") => Ok(include_str!("../runtime/native64.ll")),
-        ("llvm", "wasm-wasip1" | "wasm-wasip2") => Ok(include_str!("../runtime/wasm32.ll")),
+        ("llvm", "wasm-wasip1" | "wasm-wasip2") => Ok(concat!(
+            "target triple = \"wasm32-wasi\"\n",
+            include_str!("../runtime/wasm32-layout.ll"),
+            include_str!("../runtime/wasm32-wasi-imports.ll"),
+            "\n",
+            include_str!("../runtime/wasm32-common.ll"),
+            "\n",
+            include_str!("../runtime/wasm32-wasi-panic.ll"),
+            "\n",
+            include_str!("../runtime/wasm32-wide-int.ll"),
+        )),
+        ("llvm", "wasm-web") => Ok(concat!(
+            "target triple = \"wasm32-unknown-unknown\"\n",
+            include_str!("../runtime/wasm32-layout.ll"),
+            include_str!("../runtime/wasm32-common.ll"),
+            "\n",
+            include_str!("../runtime/wasm32-web-panic.ll"),
+            "\n",
+            include_str!("../runtime/wasm32-wide-int.ll"),
+        )),
         (backend, output) => Err(format!(
             "unsupported core runtime target backend {backend} with output {output}"
         )),
@@ -97,6 +116,27 @@ mod tests {
         assert!(preview1.lines().any(|line| {
             line.contains("icmp ult i64") && line.ends_with(", 4294967296")
         }));
+    }
+
+    #[test]
+    fn web_runtime_shares_the_allocator_and_traps_without_wasi() {
+        let web = core_runtime("llvm", "wasm-web").expect("web runtime");
+        let wasi = core_runtime("llvm", "wasm-wasip1").expect("WASI runtime");
+        for shared in [
+            include_str!("../runtime/wasm32-layout.ll"),
+            include_str!("../runtime/wasm32-common.ll"),
+            include_str!("../runtime/wasm32-wide-int.ll"),
+        ] {
+            assert_eq!(web.matches(shared).count(), 1);
+            assert_eq!(wasi.matches(shared).count(), 1);
+        }
+        assert!(web.starts_with("target triple = \"wasm32-unknown-unknown\"\n"));
+        assert!(web.contains("define void @__wosy_core_system_panic() {\nentry:\n  call void @llvm.trap()\n  unreachable"));
+        assert!(!web.contains("proc_exit"));
+        assert!(!web.contains("wasm-import-module"));
+        assert!(wasi.starts_with("target triple = \"wasm32-wasi\"\n"));
+        assert!(wasi.contains("call void @proc_exit(i32 1)\n  unreachable"));
+        assert!(!wasi.contains("@llvm.trap()"));
     }
 
     #[test]
