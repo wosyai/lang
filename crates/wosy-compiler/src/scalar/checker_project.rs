@@ -2808,6 +2808,20 @@ impl<'a> MainFlowProofObserver<'a> {
         }
     }
 
+    fn from_first_plan(
+        scope: ScalarCheckerScope, root_source: &SourceIdentity, plan: &'a PlannedModuleProof<'a>,
+    ) -> Result<Self, ProjectCheck> {
+        let proof = MainFlowProofCase::prepare(plan, plan.proof_source)?;
+        let issuer = if plan.proof_source == root_source {
+            SymbolicEqualityIssuer::for_symbolic_case(scope, plan, &proof)
+        } else {
+            None
+        };
+        let mut observer = Self::new(plan.target, proof);
+        observer.first.1.issuer = issuer;
+        Ok(observer)
+    }
+
     fn insert(&mut self, scope: ScalarCheckerScope, allow_issuer: bool, plan: &PlannedModuleProof<'a>, proof: MainFlowProofPlan<'a>) {
         let target = plan.target;
         if self.first.0 == target {
@@ -3245,8 +3259,7 @@ fn run_closed_ranked_checks<'a, 'proof, const LOCAL_CATALOGS: bool>(
         {
             return Err(ProjectCheck::Unsupported);
         }
-        let first_case = MainFlowProofCase::prepare(bare, bare.proof_source)?;
-        let observed = MainFlowProofObserver::new(bare.target, first_case);
+        let observed = MainFlowProofObserver::from_first_plan(scope, &prepared.source, bare)?;
         let run = run_prepared_ordered_check(
             &prepared.prepared, scope, startup_count, OrderedReachPolicy::Closed,
             MixedOrderedEvidence { ranked, bare: NamedOrderedEvidence { observed } },
@@ -3388,14 +3401,7 @@ fn check_loaded_ordered_proof_diagnostics_in_scope<const LOCAL_CATALOGS: bool>(
             return run_closed_ranked_checks::<LOCAL_CATALOGS>(&prepared, scope, startup_count, plan, rank, Some(&first_plan));
         }
     }
-    let first_case = MainFlowProofCase::prepare(&first_plan, first_plan.proof_source)?;
-    let issuer = if first_plan.proof_source == &prepared.source {
-        SymbolicEqualityIssuer::for_symbolic_case(scope, &first_plan, &first_case)
-    } else {
-        None
-    };
-    let mut observer = MainFlowProofObserver::new(first_plan.target, first_case);
-    observer.first.1.issuer = issuer;
+    let mut observer = MainFlowProofObserver::from_first_plan(scope, &prepared.source, &first_plan)?;
     for plan in &plans {
         observer.insert(scope, plan.proof_source == &prepared.source, plan, MainFlowProofCase::prepare(plan, plan.proof_source)?);
     }
@@ -9127,6 +9133,63 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
         for proofs in [[ranked, duplicate.as_str()], [duplicate.as_str(), ranked], [ranked, duplicate_ranked.as_str()]] {
             assert!(matches!(run(proofs, actual, ScalarCheckerScope::CurrentPackage),
                 Err(ScalarOrderedCheckerOutcome::Unsupported)));
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordered_mixed_ranked_and_bare_reuses_only_verified_bare_equality() {
+        let app = source("src/main.w", "ordered-mixed-summary");
+        let ranked = r#"proof rank for descend(entry) -> (out) where (entry <= 8) ensures (out == 4) decreases (entry) {
+            if (entry < 3) { core.show(out == 4); } else { core.use(rank(entry - 3)); }
+        }"#;
+        let bare = "proof bound for producer(entry) -> (out) where (entry >= 0) ensures (out == 7) {}";
+        let run = |text: String, scope| {
+            let (_, proof) = crate::parse_proof_source(app.clone(), text, &[])
+                .unwrap_or_else(|_| panic!("valid mixed summary source"));
+            check_loaded_scalar_ordered_local_proof_contexts(
+                Vec::new(), [(proof, Vec::new())], vec![app.clone()], inputs(), scope, Vec::new(),
+            )
+        };
+        for (first, second) in [(ranked, bare), (bare, ranked)] {
+            let text = format!(r#"%%start
+                u8(u8) descend = fn(value) {{ if (value < 3) {{ 4 }} else {{ descend(value - 3) }} }};
+                i16(i16) producer = fn(input) {{ if (input < 0) {{ input + 1 }} else {{ 7 }} }};
+                unit(i16) client = fn(input) {{
+                    core.narrow(input >= 0, {OUTPUT});
+                    i16 result = producer(input);
+                    core.require(result == 7, {OUTPUT});
+                    core.require(result == 8, {OUTPUT});
+                }};
+                {first}
+                {second}
+                u8 recursed = descend(8);
+                core.require(recursed == 4, {OUTPUT});
+                core.require(false, {OUTPUT});
+            %%end"#);
+            let receipt = run(text.clone(), ScalarCheckerScope::CurrentPackage).unwrap();
+            assert!(receipt.active && receipt.diagnostics.is_empty());
+            assert!(receipt.symbolic_diagnostic.is_none() && receipt.additional_symbolic_diagnostics.is_empty());
+            let [actual, symbolic] = receipt.directives.as_slice() else {
+                panic!("one actual directive and one failed symbolic requirement");
+            };
+            let snippet = |span: ByteSpan| &text[span.start as usize..span.end as usize];
+            assert_eq!(snippet(actual.condition), "false");
+            assert_eq!(snippet(symbolic.condition), "result == 8");
+            let seven = BigInt::from(7);
+            assert!(symbolic.witness.intervals_at(0, 1).unwrap().eq([(&seven, &seven)]));
+
+            let main = run(text.clone(), ScalarCheckerScope::MainFlowOnly).unwrap();
+            let [actual] = main.directives.as_slice() else { panic!("only reached directive"); };
+            assert_eq!(snippet(actual.condition), "false");
+            for invalid in [
+                text.replace("else { 7 }", "else { 8 }"),
+                text.replace("core.narrow(input >= 0", "core.narrow(input >= -1"),
+                text.replace("u8 recursed = descend(8);", "i16 used = producer(1); u8 recursed = descend(8);"),
+            ] {
+                assert!(matches!(run(invalid, ScalarCheckerScope::CurrentPackage),
+                    Err(ScalarOrderedCheckerOutcome::Unsupported)));
+            }
         }
     }
 
