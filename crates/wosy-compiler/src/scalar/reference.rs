@@ -881,7 +881,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
         scope: ReferenceScopeId,
         region: &ConditionalRegion,
         projected_origins: bool,
-    ) -> Result<([ReferenceConditionalArm; 2], Option<CfgPointId>), ReferenceAnalysisError> {
+    ) -> Result<([ReferenceConditionalArm; 2], Option<CfgPointId>, CfgPointId), ReferenceAnalysisError> {
         let (condition_ordinal, then_block, else_block) = match region {
             ConditionalRegion::Value {
                 condition,
@@ -932,7 +932,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
         self.checked.extend(then_checked);
         self.origins.clear();
         self.cursor = None;
-        Ok(([then_arm, else_arm], condition_point))
+        Ok(([then_arm, else_arm], condition_point, branch))
     }
 
     fn conditional(
@@ -948,7 +948,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
         array_return: bool,
         literal_unit: Option<OccurrenceOrdinal>,
     ) -> Result<ReferenceValue, ReferenceAnalysisError> {
-        let ([then_arm, else_arm], condition_point) = self.conditional_branches(
+        let ([then_arm, else_arm], condition_point, branch) = self.conditional_branches(
             condition,
             then_branch,
             else_branch,
@@ -1009,18 +1009,26 @@ impl<'a> ReferenceFlowBuilder<'a> {
         }
         self.cfg.points[then_arm.end.0].successors.push(join);
         self.cfg.points[else_arm.end.0].successors.push(join);
-        if let (Some(expression), Some(condition), ConditionalRegion::Unit { then_block, .. }) =
-            (literal_unit, condition_point, region)
+        if let (Some(expression), Some(condition), [entry, retained_entry]) =
+            (literal_unit, condition_point, self.cfg.points[branch.0].successors.as_slice())
         {
-            let branch = else_arm.end;
-            if let [entry, fallthrough] = self.cfg.points[branch.0].successors.as_slice() {
-                if *fallthrough == join {
-                    self.aggregate_facts.literal_array_unit = Some(aggregate::LiteralArrayUnit {
-                        expression, condition, branch, then_entry: *entry,
-                        then_exit: then_arm.end, then_block: *then_block,
-                        then_scope: self.cfg.points[entry.0].scope, join,
-                    });
-                }
+            let edges = match region {
+                ConditionalRegion::Unit { then_block, .. } if *retained_entry == join =>
+                    Some((*then_block, None)),
+                ConditionalRegion::Value { then_block, else_block, .. }
+                    if *retained_entry != join && *retained_entry != *entry =>
+                    Some((*then_block, Some(aggregate::LiteralArrayRetained {
+                        entry: *retained_entry, exit: else_arm.end, block: *else_block,
+                        scope: self.cfg.points[retained_entry.0].scope,
+                    }))),
+                _ => None,
+            };
+            if let Some((then_block, retained)) = edges {
+                self.aggregate_facts.literal_array_unit = Some(aggregate::LiteralArrayUnit {
+                    expression, condition, branch, then_entry: *entry,
+                    then_exit: then_arm.end, then_block, retained,
+                    then_scope: self.cfg.points[entry.0].scope, join,
+                });
             }
         }
         if array_return {
@@ -1097,7 +1105,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
             unreachable!("checked output projection requires a value conditional")
         };
         let region = &self.call_sites.conditionals[&primary.expression];
-        let ([then_arm, else_arm], _) = self.conditional_branches(
+        let ([then_arm, else_arm], _, _) = self.conditional_branches(
             condition,
             then_branch,
             Some(else_branch),
@@ -1260,6 +1268,39 @@ impl<'a> ReferenceFlowBuilder<'a> {
         Ok(value)
     }
 
+    fn checked_array_unit_candidate(
+        &mut self,
+        scope: ReferenceScopeId,
+        ordinal: OccurrenceOrdinal,
+        condition: &ScalarExpression,
+        then_branch: &ScalarBlock,
+        else_branch: Option<&ScalarBlock>,
+        region: &ConditionalRegion,
+    ) -> Option<OccurrenceOrdinal> {
+        let calls = self.call_sites;
+        if scope != ReferenceScopeId(0) || self.aggregate_facts.literal_array_bind.is_none()
+            || !calls.boundary.root_outputs.is_empty() || then_branch.items.len() != 1
+            || else_branch.is_some_and(|block| !block.items.is_empty()
+                || !matches!(calls.structure.checked_types.expressions.get(&ordinal), Some(ScalarType::Unit)))
+            || !matches!(calls.structure.blocks[calls.structure.root.0].items.get(1)
+                .map(|item| &item.kind), Some(BlockItemKind::Evaluation { expression }) if *expression == ordinal)
+        {
+            return None;
+        }
+        let (condition_ordinal, then_block) = match region {
+            ConditionalRegion::Unit { condition, then_block, .. }
+            | ConditionalRegion::Value { condition, then_block, .. } => (*condition, *then_block),
+        };
+        if !matches!(calls.structure.checked_types.expressions.get(&condition_ordinal), Some(ScalarType::Bool))
+            || !(matches!(condition, ScalarExpression::Boolean { .. })
+                || self.literal_array_formal_binding(condition_ordinal, &ScalarType::Bool).is_some())
+        {
+            return None;
+        }
+        self.aggregate_facts.literal_array_then = Some(then_block);
+        Some(ordinal)
+    }
+
     fn evaluate_expression(
         &mut self,
         expression: &ScalarExpression,
@@ -1283,6 +1324,9 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     "expected value conditional at {ordinal:?} in {:?}",
                     self.source
                 );
+                let literal_unit = self.checked_array_unit_candidate(
+                    scope, ordinal, condition, then_branch, Some(else_branch), region,
+                );
                 self.conditional(
                     condition,
                     then_branch,
@@ -1300,7 +1344,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             [output] if matches!(output.ty, ScalarType::RuntimeArray { .. }))
                         && calls.structure.blocks[calls.structure.root.0].final_outputs()
                             .next().is_some_and(|slot| slot.output == 0 && slot.expression == ordinal),
-                    None,
+                    literal_unit,
                 )
             }
             ScalarExpression::UnitIf {
@@ -1314,27 +1358,9 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     "expected unit conditional at {ordinal:?} in {:?}",
                     self.source
                 );
-                let literal_unit = if scope == ReferenceScopeId(0)
-                    && self.aggregate_facts.literal_array_bind.is_some()
-                    && calls.boundary.root_outputs.is_empty()
-                    && then_branch.items.len() == 1
-                    && matches!(calls.structure.blocks[calls.structure.root.0].items.get(1)
-                        .map(|item| &item.kind), Some(BlockItemKind::Evaluation { expression }) if *expression == ordinal)
-                {
-                    let ConditionalRegion::Unit { condition: condition_ordinal, then_block, .. } = region
-                    else { unreachable!("unit conditional region") };
-                    if matches!(calls.structure.checked_types.expressions.get(condition_ordinal), Some(ScalarType::Bool))
-                        && (matches!(condition.as_ref(), ScalarExpression::Boolean { .. })
-                            || self.literal_array_formal_binding(*condition_ordinal, &ScalarType::Bool).is_some())
-                    {
-                        self.aggregate_facts.literal_array_then = Some(*then_block);
-                        Some(ordinal)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
+                let literal_unit = self.checked_array_unit_candidate(
+                    scope, ordinal, condition, then_branch, None, region,
+                );
                 self.conditional(condition, then_branch, None, span, scope, region,
                     false, false, false, literal_unit)
             }

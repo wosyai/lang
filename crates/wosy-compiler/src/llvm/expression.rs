@@ -298,7 +298,7 @@ pub(super) fn emit_expression<'ctx, 'module>(
             then_branch,
             else_branch,
             ..
-        } => emit_if(context, state, condition, then_branch, else_branch),
+        } => emit_if(context, state, expression, condition, then_branch, else_branch),
         ScalarExpression::UnitIf {
             condition,
             then_branch,
@@ -678,6 +678,7 @@ pub(super) fn emit_project_expression<'ctx, 'module>(
             emit_project_if(
                 context,
                 state,
+                expression,
                 condition,
                 then_branch,
                 else_branch,
@@ -2855,23 +2856,26 @@ pub(super) fn emit_unary_value<'ctx, 'module>(
 fn emit_if<'ctx, 'module>(
     context: &'ctx Context,
     state: &mut EmitState<'ctx, 'module>,
+    expression: &ScalarExpression,
     condition: &ScalarExpression,
     then_branch: &ScalarBlock,
     else_branch: &ScalarBlock,
 ) -> Result<EmitValue<'ctx>, String> {
     let condition = take_basic(emit_expression(context, state, condition)?)?.into_int_value();
-    emit_if_value(
+    emit_if_value_with_route(
         context,
         state,
         condition,
         then_branch,
         else_branch,
+        Some(expression),
         |state, block| emit_block(context, state, block),
     )
 }
 fn emit_project_if<'ctx, 'module>(
     context: &'ctx Context,
     state: &mut EmitState<'ctx, 'module>,
+    expression: &ScalarExpression,
     condition: EmitValue<'ctx>,
     then_branch: &ScalarBlock,
     else_branch: &ScalarBlock,
@@ -2879,12 +2883,13 @@ fn emit_project_if<'ctx, 'module>(
     modules: &[&ScalarModule],
 ) -> Result<EmitValue<'ctx>, String> {
     let condition = take_basic(condition)?.into_int_value();
-    emit_if_value(
+    emit_if_value_with_route(
         context,
         state,
         condition,
         then_branch,
         else_branch,
+        Some(expression),
         |state, block| emit_project_block(context, state, block, module, modules),
     )
 }
@@ -2910,7 +2915,7 @@ fn emit_unit_if<'ctx, 'module>(
         .build_conditional_branch(condition, then_block, merge)
         .map_err(builder_error)?;
     state.builder.position_at_end(then_block);
-    let enrolled = aggregate_transfer::begin_literal_array_unit(state, expression, then_branch)?;
+    let enrolled = aggregate_transfer::begin_literal_array_unit(state, expression, then_branch, None)?;
     emit_block(context, state, then_branch)?;
     state
         .builder
@@ -2944,7 +2949,7 @@ fn emit_project_unit_if<'ctx, 'module>(
         .build_conditional_branch(condition, then_block, merge)
         .map_err(builder_error)?;
     state.builder.position_at_end(then_block);
-    let enrolled = aggregate_transfer::begin_literal_array_unit(state, expression, then_branch)?;
+    let enrolled = aggregate_transfer::begin_literal_array_unit(state, expression, then_branch, None)?;
     emit_project_block(context, state, then_branch, module, modules)?;
     state
         .builder
@@ -2966,6 +2971,21 @@ pub(super) fn emit_if_value<'ctx, 'module, F>(
 where
     F: Fn(&mut EmitState<'ctx, 'module>, &ScalarBlock) -> Result<EmitValue<'ctx>, String>,
 {
+    emit_if_value_with_route(context, state, condition, then_branch, else_branch, None, emit)
+}
+
+fn emit_if_value_with_route<'ctx, 'module, F>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, 'module>,
+    condition: inkwell::values::IntValue<'ctx>,
+    then_branch: &ScalarBlock,
+    else_branch: &ScalarBlock,
+    expression: Option<&ScalarExpression>,
+    emit: F,
+) -> Result<EmitValue<'ctx>, String>
+where
+    F: Fn(&mut EmitState<'ctx, 'module>, &ScalarBlock) -> Result<EmitValue<'ctx>, String>,
+{
     let function = state
         .builder
         .get_insert_block()
@@ -2980,6 +3000,12 @@ where
         .build_conditional_branch(condition, then_block, else_block)
         .map_err(builder_error)?;
     state.builder.position_at_end(then_block);
+    let enrolled = match expression {
+        Some(expression) => aggregate_transfer::begin_literal_array_unit(
+            state, expression, then_branch, Some(else_branch),
+        )?,
+        None => false,
+    };
     let incoming_owners = state.return_owner_flags.clone();
     state.return_owner_flags = incoming_owners.clone();
     let then_value = emit(state, then_branch)?;
@@ -2999,6 +3025,10 @@ where
         .map_err(builder_error)?;
     let else_end = state.builder.get_insert_block().expect("else block");
     state.builder.position_at_end(merge);
+    if enrolled && !matches!((&then_value, &else_value), (EmitValue::Unit, EmitValue::Unit)) {
+        return Err("checked array conditional did not have two Unit arms".into());
+    }
+    aggregate_transfer::finish_literal_array_unit(state, enrolled)?;
     state.return_owner_flags = incoming_owners;
     for output in state.return_owner_slots.keys().copied().collect::<Vec<_>>() {
         match (then_owners.get(&output), else_owners.get(&output)) {

@@ -358,6 +358,7 @@ pub(super) fn begin_literal_array_unit(
     state: &mut EmitState<'_, '_>,
     expression: &ScalarExpression,
     then_block: &ScalarBlock,
+    retained_block: Option<&ScalarBlock>,
 ) -> Result<bool, String> {
     let Some(aggregate) = state.aggregate.as_mut() else { return Ok(false) };
     let Some(ClosedLiteralArray::Replacement { unit: Some(unit), .. }) = aggregate.plan.literal_array
@@ -365,6 +366,9 @@ pub(super) fn begin_literal_array_unit(
     let Some(nodes) = state.body_call_nodes else { return Err("missing checked array branch context".into()) };
     if nodes.expression_ordinal(expression) != Some(unit.expression)
         || nodes.block_ordinal(then_block) != Some(unit.then_block)
+        || retained_block.is_some() != unit.retained_block.is_some()
+        || retained_block.and_then(|block| nodes.block_ordinal(block)) != unit.retained_block
+        || retained_block.is_some_and(|block| !block.items.is_empty())
     {
         return Err("checked array branch does not match its route".into());
     }
