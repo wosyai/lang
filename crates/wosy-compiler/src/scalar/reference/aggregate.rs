@@ -669,8 +669,8 @@ impl AggregateFlowResult {
         }
     }
 
-    fn proved_literal_array_route(&self) -> Option<LiteralArrayRoute> {
-        let route = self.literal_array_route?;
+    fn proved_literal_array_route_ref(&self) -> Option<&LiteralArrayRoute> {
+        let route = self.literal_array_route.as_ref()?;
         let complete = match route {
             LiteralArrayRoute::Replacement { unit: Some(unit), .. } =>
                 self.literal_array_join.complete(unit.other_write.is_some()),
@@ -679,8 +679,19 @@ impl AggregateFlowResult {
         (!self.literal_array_unknown && complete).then_some(route)
     }
 
+    fn proved_literal_array_route(&self) -> Option<LiteralArrayRoute> {
+        self.proved_literal_array_route_ref().copied()
+    }
+
+    fn proved_literal_array_caller(&self, key: BodyKey, is_monomorphic: bool) -> Option<&LiteralArrayRoute> {
+        if !is_monomorphic || key.2.is_some() {
+            return None;
+        }
+        self.proved_literal_array_route_ref().filter(|route| matches!(route, LiteralArrayRoute::Replacement { .. }))
+    }
+
     pub(super) fn has_observations(&self) -> bool {
-        self.proved_literal_array_route().is_some()
+        self.proved_literal_array_route_ref().is_some()
             || (self.checked_producer_authoritative && !self.checked_producer_backing.is_empty())
             || self.checked_backing_assignment.is_some() || self.checked_backing_forward.is_some()
             || self.scalar_descriptor_assignment.is_some() || !self.array_returns.is_empty() || !self.array_rebinds.is_empty()
@@ -2443,16 +2454,13 @@ fn enroll_literal_array_pair(
 }
 
 fn install_literal_array_plans(
+    callers: &[(BodyKey, &Body<'_>, &LiteralArrayRoute)],
     bodies: &BTreeMap<BodyKey, Body<'_>>,
     declarations: &HashMap<(&SourceIdentity, ByteSpan), (usize, usize)>,
     result: &mut ClosedAggregates,
 ) {
-    for (&caller, body) in bodies {
-        if !body.is_monomorphic || caller.2.is_some() {
-            continue;
-        }
-        let Some(LiteralArrayRoute::Replacement { original, write, exit, block, unit }) =
-            body.facts.and_then(AggregateFlowResult::proved_literal_array_route) else { continue };
+    for &(caller, body, route) in callers {
+        let LiteralArrayRoute::Replacement { original, write, exit, block, unit } = *route else { continue };
         let Some(callee) = target_body(declarations, body.cfg, write.rhs) else { continue };
         let Some(leaf) = bodies.get(&callee) else { continue };
         if !leaf.is_monomorphic || callee.2.is_some() {
@@ -2548,11 +2556,18 @@ fn closed_aggregates<'a>(
     let mut seed_targets = BTreeMap::<BodyKey, BTreeSet<(BodyKey, usize)>>::new();
     let mut input_users = BTreeMap::<(BodyKey, usize), Vec<(BodyKey, usize, ArgumentProvenance, &BTreeSet<Option<InputOrigin>>) >>::new();
     let mut array_callsites = Vec::new();
+    let mut literal_array_callers = Vec::new();
     let mut array_leaves = BTreeSet::new();
     let mut array_neighbors = BTreeMap::<BodyKey, BTreeSet<BodyKey>>::new();
     let mut result = ClosedAggregates::default();
     for (&key, body) in &bodies {
         if let Some(facts) = body.facts {
+            // Borrow only completed caller proofs during this existing pass.
+            // BTreeMap order preserves enrollment precedence at finalization.
+            if let Some(route) = facts.proved_literal_array_caller(key, body.is_monomorphic) {
+                literal_array_callers.push((key, body, route));
+            }
+
             if body.is_monomorphic {
                 if let Some(proof) = facts.scalar_descriptor_assignment {
                     result.bodies.entry(key).or_default().scalar_descriptor_assignment = Some(proof);
@@ -2675,7 +2690,7 @@ fn closed_aggregates<'a>(
     }
     let finalize_cohorts = |mut result: ClosedAggregates| {
         install_ordinary(&mut result);
-        install_literal_array_plans(&bodies, &declarations, &mut result);
+        install_literal_array_plans(&literal_array_callers, &bodies, &declarations, &mut result);
         result
     };
     if outgoing.is_empty() {
@@ -3262,6 +3277,29 @@ mod tests {
             block: BlockOrdinal(0),
             unit: None,
         }
+    }
+
+    #[test]
+    fn literal_array_finalizer_selects_only_proved_monomorphic_callers() {
+        let pair = synthetic_literal_array_pair();
+        let mut facts = AggregateFlowResult { returning_leaf: true, ..AggregateFlowResult::default() };
+        assert!(facts.has_observations());
+        assert!(facts.proved_literal_array_caller(pair.caller, true).is_none());
+
+        facts.literal_array_route = Some(LiteralArrayRoute::FreshLeaf {
+            allocation: pair.fresh, output: pair.final_output,
+        });
+        assert!(facts.proved_literal_array_caller(pair.callee, true).is_none());
+
+        facts.literal_array_route = Some(LiteralArrayRoute::Replacement {
+            original: pair.original, write: pair.write, exit: pair.exit, block: pair.block, unit: None,
+        });
+        let route = facts.proved_literal_array_caller(pair.caller, true).expect("proved caller");
+        assert!(std::ptr::eq(route, facts.literal_array_route.as_ref().unwrap()));
+        assert!(facts.proved_literal_array_caller(pair.caller, false).is_none());
+        assert!(facts.proved_literal_array_caller((pair.caller.0, pair.caller.1, Some(0)), true).is_none());
+        facts.literal_array_unknown = true;
+        assert!(facts.proved_literal_array_caller(pair.caller, true).is_none());
     }
 
     #[test]
