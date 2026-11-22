@@ -6304,6 +6304,42 @@ fn assignment_destinations_are_retained_before_any_write_on_both_targets() {
 }
 
 #[test]
+fn fixed_bool_array_places_use_target_width_addresses() {
+    let text = "%%start\nbool[2] ready = [false, false];\nu64(u64) select_index = fn(index) { index };\nbool(u64) set_ready = fn(index) { ready[select_index(index)] = true; ready[index] };\n%%end";
+    for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let source = SourceIdentity::new(
+            "project".into(), "package".into(), "src/main.w".into(), "r1".into(),
+        );
+        let parsed = parse_source(source.clone(), text.into(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let prepared = prepare_scalar_project(
+            vec![(derive_scalar_declarations_from_cst(parsed.result.canonical_cst()), Vec::new())],
+            vec![source],
+            ScalarPreparationInputs { target_layout },
+        ).unwrap_or_else(|invalid| panic!("{:?}", invalid.diagnostics));
+        let build = analyze_scalar_build(&prepared);
+        assert!(build.diagnostics().is_empty(), "{:?}", build.diagnostics());
+        let llvm = emit_scalar_build_single_module_llvm(&build).expect("fixed bool array LLVM").to_text();
+        let body = llvm.split_once("define i1 @set_ready(").expect("bool function").1
+            .split_once("\n}").expect("bool body").0;
+        assert_eq!(body.matches("call i64 @select_index(").count(), 1, "{body}");
+        let addresses = body.lines().filter(|line| {
+            line.contains("getelementptr inbounds [2 x i1]")
+        }).collect::<Vec<_>>();
+        assert_eq!(addresses.len(), 2, "{body}");
+        if target_layout == ScalarTargetLayout::WASM32 {
+            assert_eq!(body.lines().filter(|line| {
+                line.contains("trunc i64") && line.contains(" to i32")
+            }).count(), 2, "{body}");
+            assert!(addresses.iter().all(|line| line.contains(", i32 %array_address_index")), "{body}");
+        } else {
+            assert!(!body.contains("trunc i64"), "{body}");
+            assert!(addresses.iter().all(|line| line.contains(", i64 %")), "{body}");
+        }
+    }
+}
+
+#[test]
 fn indexed_copy_aggregate_assignment_guards_the_single_saved_selector() {
     let text = "%%start\nstruct copy Entry { u8 value; }\nEntry[2] entries = [{ .value = 1; }, { .value = 2; }];\nu64(u64) select_index = fn(index) { index };\nu8(u8) replacement = fn(value) { value };\nunit(u64, u8) update = fn(index, value) { entries[select_index(index)] = { .value = replacement(value); }; };\n%%end";
     for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {

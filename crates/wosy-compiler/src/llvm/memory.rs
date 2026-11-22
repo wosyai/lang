@@ -445,6 +445,20 @@ fn fixed_array_element_pointer<'ctx>(
     index: inkwell::values::IntValue<'ctx>,
 ) -> Result<PointerValue<'ctx>, String> {
     let array = storage_type(context, ty, state.layouts, state.target_layout)?;
+    let index = if state.target_layout == ScalarTargetLayout::WASM32
+        && index.get_type().get_bit_width() > 32
+    {
+        state
+            .builder
+            .build_int_truncate(
+                index,
+                pointer_integer_type(context, state.target_layout),
+                "array_address_index",
+            )
+            .map_err(builder_error)?
+    } else {
+        index
+    };
     unsafe {
         state.builder.build_in_bounds_gep(
             array, base, &[context.i32_type().const_zero(), index], "array_element",
