@@ -5731,8 +5731,9 @@ fn check_canonical_induction_returns(
     let (parameter, binding) = rank.descending;
     let body = typed.body;
     let structure = &body.structure;
-    let TypedProofGoal::Literal { relation, bound, .. } = &typed.goal else {
-        return Err(ProjectCheck::Unsupported);
+    let (relation, bound) = match &typed.goal {
+        TypedProofGoal::Literal { relation, bound, .. } | TypedProofGoal::Universal { relation, bound } => (relation, bound),
+        _ => return Err(ProjectCheck::Unsupported),
     };
     let IntegerReturn::Const(claimed_base) = &proof.base_claim else {
         return Err(ProjectCheck::Unsupported);
@@ -6179,9 +6180,11 @@ fn typed_proof_postcondition<'a, const AUDIT_INDUCTION: bool, const DEFER_OUTPUT
         let ensures = derive_expression(&child(&ensures_node, SyntaxKind::Expression)?);
         if let Some(forall) = foralls.next() {
             if measure.is_some() {
-                return Err(ProjectCheck::Unsupported);
-            }
-            if let Some(second) = foralls.next() {
+                if foralls.next().is_some() {
+                    return Err(ProjectCheck::Unsupported);
+                }
+                typed_universal_output_goal(&forall, &ensures, output, &input_names, &result.ty, false)?
+            } else if let Some(second) = foralls.next() {
                 #[cfg(feature = "internal-checker")]
                 {
                     if !allow_named_entry_facts || !steps.items.is_empty() {

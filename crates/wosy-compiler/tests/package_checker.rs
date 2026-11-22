@@ -2791,6 +2791,42 @@ fn independently_verified_induction_uses_the_exact_positive_decrement() {
 }
 
 #[test]
+fn named_induction_proves_a_typed_universal_output_bound_from_the_recursive_base() {
+    use ScalarModuleProofOutcome::{NoApplicableInputs, Proved, Refuted, Unsupported};
+    let identity = source();
+    let check = |base: u8, guard: &str, quantifiers: &str, goal: &str, actual: &str| {
+        check_scalar_module_proof(
+            identity.clone(),
+            "rank",
+            vec![ScalarProofModuleInput {
+                source: identity.clone(),
+                text: format!(r#"%%start
+                    u8(u8) descend = fn(value) {{ if (value < 3) {{ {base} }} else {{ descend(value - 3) }} }};
+                    proof rank for descend(entry) -> (out) where ({guard}) {quantifiers}
+                        ensures ({goal}) decreases (entry) {{
+                        if (entry < 3) {{ core.show(out == {base}); }} else {{ core.use(rank(entry - 3)); }}
+                    }}
+                    {actual}
+                %%end"#),
+                namespaces: Vec::new(),
+            }],
+            vec![identity.clone()], ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
+        )
+    };
+    let lower = "forall (u8 k where k >= 7 && k != 7)";
+    let upper = "forall (u8 k where k <= 7 && k != 7)";
+    assert_eq!(check(8, "entry <= 8", lower, "out <= k", ""), Proved);
+    assert_eq!(check(8, "entry <= 8", lower, "out < k", ""), Refuted);
+    assert_eq!(check(6, "entry <= 8", upper, "out >= k", ""), Proved);
+    assert_eq!(check(5, "entry <= 8", upper, "out >= k", ""), Refuted);
+    assert_eq!(check(8, "false", lower, "out < k", ""), NoApplicableInputs);
+    assert_eq!(check(8, "entry >= 1 && entry <= 8", lower, "out <= k", ""), Unsupported);
+    assert_eq!(check(8, "entry <= 8", "forall (u8 k where k == 7 && k != 7)", "out <= k", ""), Unsupported);
+    assert_eq!(check(8, "entry <= 8", &format!("{lower} forall (u8 unused)"), "out <= k", ""), Unsupported);
+    assert_eq!(check(8, "entry <= 8", lower, "out <= k", "u8 actual = descend(8);"), Unsupported);
+}
+
+#[test]
 fn named_proof_output_conjunction_checks_every_atom_on_shared_return_paths() {
     let identity = source();
     let check = |goal: &str, guard: &str, actual: &str, steps: &str| {
