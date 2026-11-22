@@ -6988,6 +6988,35 @@ mod tests {
         let negated_arm = "if (value == 0) { -(3 + 4) } else { 0 - 7 }";
         assert_eq!(check_i32(negated_arm, "true", "out == -7", "", &["leaf"]), [Proved]);
         assert_eq!(count(), 2);
+        for body in ["value + 1", "1 + value", "value - -1"] {
+            assert_eq!(check(body, "arg == 6", "out == 7", "", &["another", "leaf", "cite", "plain"]),
+                [Proved, Proved, Proved, Unsupported]);
+            assert_eq!(count(), 1);
+        }
+        assert_eq!(check("value - 1", "arg == 6", "out == 5", "", &["leaf"]), [Proved]);
+        assert_eq!(count(), 1);
+        assert_eq!(check("value + 1", "arg >= 5 && arg <= 6", "out <= 7", "", &["leaf"]), [Unsupported]);
+        assert_eq!(count(), 0);
+        assert_eq!(check("if (value == 0) {} else {}; value + 1", "arg >= 0 && arg <= 1", "out <= 7", "", &["leaf"]),
+            [Unsupported]);
+        assert_eq!(count(), 0);
+        assert_eq!(check("value + 1", "arg == 127", "out <= 7", "", &["leaf"]), [Unsupported]);
+        assert_eq!(count(), 1);
+        assert_eq!(check_typed("u8", "value - 1", "arg == 0", "out == 0", "", &["leaf"]), [Unsupported]);
+        assert_eq!(count(), 1);
+        assert_eq!(check("1 - value", "arg == 6", "out == -5", "", &["leaf"]), [Unsupported]);
+        assert_eq!(count(), 0);
+        assert_eq!(check("i8 local = 6; local + 1", "arg == 6", "out == 7", "", &["leaf"]), [Unsupported]);
+        assert_eq!(count(), 0);
+        let exact_arm = "if (value == 6) { value + 1 } else { 6 }";
+        assert_eq!(check(exact_arm, "true", "out <= 7", "", &["leaf", "another"]), [Proved, Refuted]);
+        assert_eq!(count(), 1);
+        assert_eq!(check(exact_arm, "arg == 5", "out == 6", "", &["leaf"]), [Proved]);
+        assert_eq!(count(), 0);
+        assert_eq!(check("value + 1", "false", "out == 7", "", &["leaf"]), [NoApplicableInputs]);
+        assert_eq!(count(), 0);
+        assert_eq!(check("value + 1", "arg == 6", "out == 7", "i8 live = number(6);", &["leaf"]), [Unsupported]);
+        assert_eq!(count(), 0);
         let deep = format!("7{}", " + 0".repeat(32));
         assert_eq!(check(&deep, "true", "out <= 7", "", &["another", "leaf"]), [Proved, Proved]);
         assert_eq!(count(), 1);

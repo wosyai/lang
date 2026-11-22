@@ -122,7 +122,8 @@ pub(super) struct ImportedEntryGuard<'a> {
 trait ScopedAuthoredReturn<'a>: Copy {
     const ENABLED: bool;
     fn at(
-        self, structure: &OccurrenceStructure, block: BlockOrdinal, slot: FinalOutputSlot, ty: &ScalarType,
+        self, calls: &FunctionCallSites, block: BlockOrdinal, slot: FinalOutputSlot, ty: &ScalarType,
+        roots: &IntegerRoots<'_>, path: &IntegerInputs,
     ) -> Option<&'a BigInt>;
 
     fn branch(
@@ -135,7 +136,10 @@ trait ScopedAuthoredReturn<'a>: Copy {
 impl<'a> ScopedAuthoredReturn<'a> for () {
     const ENABLED: bool = false;
 
-    fn at(self, _: &OccurrenceStructure, _: BlockOrdinal, _: FinalOutputSlot, _: &ScalarType) -> Option<&'a BigInt> {
+    fn at(
+        self, _: &FunctionCallSites, _: BlockOrdinal, _: FinalOutputSlot, _: &ScalarType,
+        _: &IntegerRoots<'_>, _: &IntegerInputs,
+    ) -> Option<&'a BigInt> {
         None
     }
 }
@@ -205,9 +209,10 @@ impl<'a> ScopedAuthoredReturn<'a> for NamedAuthoredReturn<'a> {
     }
 
     fn at(
-        self, structure: &OccurrenceStructure, block: BlockOrdinal, slot: FinalOutputSlot,
-        ty: &ScalarType,
+        self, calls: &FunctionCallSites, block: BlockOrdinal, slot: FinalOutputSlot, ty: &ScalarType,
+        roots: &IntegerRoots<'_>, path: &IntegerInputs,
     ) -> Option<&'a BigInt> {
+        let structure = &calls.structure;
         let output = self.output(structure, block, slot)?;
         self.value.get_or_init(|| {
             if let ScalarExpression::Unary { operator: UnaryOperator::Negate, operand, .. } = output {
@@ -241,16 +246,39 @@ impl<'a> ScopedAuthoredReturn<'a> for NamedAuthoredReturn<'a> {
             }
             let parent = OccurrenceParent::Expression(slot.expression);
             let typed_operand = |edge| {
-                let Some(OccurrenceNode::Expression(ordinal)) = structure.edges.get(&(parent, edge)) else { return false; };
-                structure.checked_types.expressions.get(ordinal) == Some(ty)
+                let Some(OccurrenceNode::Expression(ordinal)) = structure.edges.get(&(parent, edge)) else { return None; };
+                (structure.checked_types.expressions.get(ordinal) == Some(ty)).then_some(*ordinal)
             };
-            if structure.checked_types.expressions.get(&slot.expression) != Some(ty)
-                || !typed_operand(OccurrenceEdge::BinaryLeft) || !typed_operand(OccurrenceEdge::BinaryRight)
-            {
+            if structure.checked_types.expressions.get(&slot.expression) != Some(ty) {
                 return None;
             }
-            let left = concrete_integer_literal(left)?;
-            let right = concrete_integer_literal(right)?;
+            let left_ordinal = typed_operand(OccurrenceEdge::BinaryLeft)?;
+            let right_ordinal = typed_operand(OccurrenceEdge::BinaryRight)?;
+            let exact_formal = |ordinal, literal: &ScalarExpression| {
+                if !matches!(literal, ScalarExpression::Integer { .. })
+                    && !matches!(literal, ScalarExpression::Unary { operator: UnaryOperator::Negate, operand, .. }
+                        if matches!(operand.as_ref(), ScalarExpression::Integer { .. }))
+                {
+                    return None;
+                }
+                let Some(PlainNameIdentity::Lexical(binding)) = calls.prepared_plain_name(ordinal) else {
+                    return None;
+                };
+                let (axis, axis_type) = roots.lookup(binding)?;
+                if axis_type != ty || calls.boundary.checker_parameter_bindings.as_deref()?.get(axis) != Some(binding) {
+                    return None;
+                }
+                path.singleton_at(axis).map(Cow::Borrowed)
+            };
+            let (left, right) = match (left.as_ref(), right.as_ref(), operator) {
+                (ScalarExpression::Name { .. }, literal, BinaryOperator::Add | BinaryOperator::Subtract) =>
+                    (exact_formal(left_ordinal, literal)?, concrete_integer_literal(literal)?),
+                (literal, ScalarExpression::Name { .. }, BinaryOperator::Add) => {
+                    let value = exact_formal(right_ordinal, literal)?;
+                    (concrete_integer_literal(literal)?, value)
+                }
+                (left, right, _) => (concrete_integer_literal(left)?, concrete_integer_literal(right)?),
+            };
             let (min, max) = super::typecheck::integer_bounds(ty)?;
             let fits = |value: &BigInt| value >= &min && value <= &max;
             if !fits(&left) || !fits(&right) {
@@ -2307,7 +2335,7 @@ fn walk_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, A
                     }
                     IntegerReturn::Alias(binding)
                 } else if Authored::ENABLED && tail.is_some() {
-                    IntegerReturn::Const(authored_return.at(structure, block, slot, ty)?)
+                    IntegerReturn::Const(authored_return.at(calls, block, slot, ty, roots, &path)?)
                 } else {
                     return None;
                 };
