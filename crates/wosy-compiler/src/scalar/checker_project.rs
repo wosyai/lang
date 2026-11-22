@@ -2183,7 +2183,7 @@ impl SelectedSymbolicProof<'_, '_> {
             return Ok(None);
         }
         let candidate = match calls.structure.checker_directives.len() {
-            1 => root_local_import_requirement(calls),
+            1 => root_local_import_requirement_in::<true>(calls),
             2 => summary.guard.as_ref().and_then(|guard| root_local_import_requirement_after_narrow(calls, guard.slot)),
             _ => None,
         };
@@ -6368,6 +6368,12 @@ fn apply_verified_return_bound(
 }
 
 fn root_local_import_requirement(body: &FunctionCallSites) -> Option<(usize, &CheckerIntegerCallOrigin)> {
+    root_local_import_requirement_in::<false>(body)
+}
+
+fn root_local_import_requirement_in<const ALLOW_DISJUNCTION: bool>(
+    body: &FunctionCallSites,
+) -> Option<(usize, &CheckerIntegerCallOrigin)> {
     let structure = &body.structure;
     let root = structure.root;
     let items = &structure.blocks.get(root.0)?.items;
@@ -6375,7 +6381,7 @@ fn root_local_import_requirement(body: &FunctionCallSites) -> Option<(usize, &Ch
         !matches!(item.kind, BlockItemKind::Binding(_))
             || !structure.checker_integer_locals.contains_key(&(root, item.position))
     })?;
-    root_local_import_requirement_at(body, &items[first_nonliteral..])
+    root_local_import_requirement_at::<ALLOW_DISJUNCTION>(body, &items[first_nonliteral..])
 }
 
 #[cfg(feature = "internal-checker")]
@@ -6391,7 +6397,7 @@ fn root_local_import_requirement_after_narrow(
     if directive.operation != CheckerOperation::Narrow {
         return None;
     }
-    let (position, origin) = root_local_import_requirement_at(body, rest)?;
+    let (position, origin) = root_local_import_requirement_at::<true>(body, rest)?;
     let (argument, CheckerIntegerCallArgument::PlainName) = origin.arguments.as_slice().get(guarded_slot)? else { return None; };
     let super::reference::PlainNameIdentity::Lexical(binding) = body.prepared_plain_name(*argument)? else { return None; };
     if binding != &narrow.binding || structure.checked_types.expressions.get(argument)? != &narrow.ty {
@@ -6400,7 +6406,7 @@ fn root_local_import_requirement_after_narrow(
     Some((position, origin))
 }
 
-fn root_local_import_requirement_at<'a>(
+fn root_local_import_requirement_at<'a, const ALLOW_DISJUNCTION: bool>(
     body: &'a FunctionCallSites, items: &[super::control::BlockItem],
 ) -> Option<(usize, &'a CheckerIntegerCallOrigin)> {
     let structure = &body.structure;
@@ -6417,11 +6423,13 @@ fn root_local_import_requirement_at<'a>(
         return None;
     };
     let directive = structure.checker_directives.get(&expression)?;
-    let CheckerPredicate::Integer(predicate) = directive.predicate.as_ref()? else {
-        return None;
+    let binding = match directive.predicate.as_ref()? {
+        CheckerPredicate::Integer(predicate) => &predicate.binding,
+        CheckerPredicate::DirectiveDisjunction { binding, .. } if ALLOW_DISJUNCTION => binding,
+        _ => return None,
     };
     let origin = structure.checker_integer_call_locals.get(&(root, binding_item.position))?;
-    if directive.operation != CheckerOperation::Require || predicate.binding != origin.binding {
+    if directive.operation != CheckerOperation::Require || binding != &origin.binding {
         return None;
     }
     Some((binding_item.position, origin))
@@ -8054,8 +8062,28 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
         let narrowed = overlap.replace("i16 result = producer(input);", &format!("core.narrow(input >= 0, {OUTPUT}); i16 result = producer(input);"));
         let used = run(&module(producer, &narrowed, "entry >= 0")).unwrap();
         assert!(used.active && used.directives.is_empty() && used.symbolic_diagnostic.is_none());
+        let covered = narrowed.replace("result == 7", "result < 6 || result > 6");
+        let covered = run(&module(producer, &covered, "entry >= 0")).unwrap();
+        assert!(covered.active && covered.directives.is_empty() && covered.symbolic_diagnostic.is_none());
+        let hole = narrowed.replace("result == 7", "result < 7 || result > 7");
+        let hole_source = module(producer, &hole, "entry >= 0");
+        let failed = run(&hole_source).unwrap();
+        let [failure] = failed.directives.as_slice() else { panic!("only the disjunctive Require fails"); };
+        assert_eq!(failure.operation, ScalarCheckerOperation::Require);
+        assert_eq!(failure.condition.start as usize, hole_source.find("result < 7").unwrap());
+        let seven = BigInt::from(7);
+        assert!(failure.witness.intervals_at(0, 1).unwrap().eq([(&seven, &seven)]));
+        assert!(failed.symbolic_diagnostic.is_none());
+        let wrong_axis = hole.replace("result < 7 || result > 7", "input < 7 || input > 7");
+        assert!(matches!(run(&module(producer, &wrong_axis, "entry >= 0")),
+            Err(ProjectCheck::Invalid(diagnostics)) if diagnostics.iter().any(|diagnostic| diagnostic.code == "B0009")));
+        let mixed_axes = hole.replace("result < 7 || result > 7", "input < 7 || result > 7");
+        assert!(matches!(run(&module(producer, &mixed_axes, "entry >= 0")), Err(ProjectCheck::Unsupported)));
+
         let partial = narrowed.replace("input >= 0", "input >= -1");
         assert!(matches!(run(&module(producer, &partial, "entry >= 0")), Err(ProjectCheck::Unsupported)));
+        let late = partial.replace("client", "late");
+        assert!(matches!(run(&module(producer, &format!("{hole} {late}"), "entry >= 0")), Err(ProjectCheck::Unsupported)));
         let empty_caller = narrowed.replace("input >= 0", "input < -32768");
         let dead = run(&module(producer, &empty_caller, "entry >= 0")).unwrap();
         assert!(dead.active && dead.symbolic_diagnostic.is_none());

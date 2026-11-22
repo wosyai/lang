@@ -113,6 +113,15 @@ def main():
             b"actual proof failures: 0 (0 nested)\nunused proof failures: 0\n"
         ), admitted
         assert admitted.stderr == b"", admitted
+        disjunction = GUARDED.replace("result == 7", "result < 6 || result > 6")
+        source.write_text(disjunction, encoding="utf-8")
+        union_pass = subprocess.run(command, cwd=root, capture_output=True, timeout=15)
+        assert (union_pass.returncode, union_pass.stdout, union_pass.stderr) == (0, admitted.stdout, b""), union_pass
+        source.write_text(disjunction.replace("result < 6 || result > 6", "result < 7 || result > 7"), encoding="utf-8")
+        union_hole = subprocess.run(command, cwd=root, capture_output=True, timeout=15)
+        assert union_hole.returncode == 1 and union_hole.stderr == b"", union_hole
+        assert union_hole.stdout == admitted.stdout.replace(b"directive failures: 0", b"directive failures: 1"), union_hole
+
         source.write_text(GUARDED.replace("core.narrow(value >= 0", "core.narrow(value >= -1"), encoding="utf-8")
         partial = subprocess.run(command, cwd=root, capture_output=True, timeout=15)
         assert partial.returncode == 2 and partial.stdout == b"", partial
