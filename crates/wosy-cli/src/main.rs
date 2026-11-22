@@ -180,7 +180,7 @@ fn build_command(target: Option<&str>, profile: &str) -> Result<(), String> {
         profile,
         artifact,
         artifact_profile,
-        &source_identity,
+        source_identity,
         llvm_input_identity,
     )?;
     let executable = output_dir.join("main");
@@ -263,11 +263,9 @@ fn run_command(target: Option<&str>, profile: &str, arguments: &[String]) -> Res
         .iter()
         .map(|observation| {
             let path = source_observation_path(observation);
-            let bytes = fs::read(&path)
-                .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
             Ok(SourceObservation {
                 source: observation.source.clone(),
-                content_revision: ContentRevision(blake3::hash(&bytes).to_hex().to_string()),
+                content_revision: observe_source_revision(&path)?,
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
@@ -312,6 +310,14 @@ fn run_command(target: Option<&str>, profile: &str, arguments: &[String]) -> Res
 
 fn source_observation_path(observation: &SourceObservation) -> std::path::PathBuf {
     std::path::Path::new(&observation.source.project).join(observation.source.path.as_path())
+}
+
+fn observe_source_revision(path: &std::path::Path) -> Result<ContentRevision, String> {
+    let read_error = |error| format!("failed to read {}: {error}", path.display());
+    let file = fs::File::open(path).map_err(read_error)?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update_reader(file).map_err(read_error)?;
+    Ok(ContentRevision(hasher.finalize().to_hex().to_string()))
 }
 
 fn compile_project(
@@ -747,7 +753,7 @@ fn artifact_identity(
     profile: &str,
     artifact: &wosy_project::ArtifactConfig,
     artifact_profile: &wosy_project::ArtifactProfile,
-    source_identity: &str,
+    source_identity: String,
     llvm_input_identity: String,
 ) -> Result<ArtifactIdentity, String> {
     let builder = configuration
@@ -759,7 +765,7 @@ fn artifact_identity(
         .get(&artifact_profile.run_runner)
         .ok_or_else(|| format!("runner {} is missing", artifact_profile.run_runner))?;
     Ok(ArtifactIdentity {
-        source_identity: source_identity.to_owned(),
+        source_identity,
         configuration_identity,
         artifact_identity: format!("{target}:{profile}:{}", artifact.artifact),
         backend: artifact_profile.backend.clone(),
@@ -1351,6 +1357,27 @@ mod tests {
         assert_eq!(target.package, "std");
         assert_eq!(target.path, "src/math.w");
         assert_eq!(target.revision, "rev");
+    }
+
+    #[test]
+    fn streamed_source_revision_preserves_raw_bytes_and_read_errors() {
+        let path = snapshot_test_path("streamed-source-revision");
+        let bytes: Vec<u8> = (0..=u8::MAX).cycle().take(147_459).collect();
+        fs::write(&path, &bytes).expect("write multichunk non-UTF-8 source");
+        assert_eq!(
+            observe_source_revision(&path).expect("read source revision"),
+            ContentRevision(blake3::hash(&bytes).to_hex().to_string()),
+        );
+
+        fs::write(&path, []).expect("empty source");
+        assert_eq!(
+            observe_source_revision(&path).expect("read empty source revision"),
+            ContentRevision(blake3::hash(&[]).to_hex().to_string()),
+        );
+
+        fs::remove_file(&path).expect("remove fixture");
+        let error = observe_source_revision(&path).expect_err("report missing file");
+        assert!(error.starts_with(&format!("failed to read {}: ", path.display())));
     }
 
     #[test]
