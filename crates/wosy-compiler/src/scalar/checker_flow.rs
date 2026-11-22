@@ -444,7 +444,11 @@ pub(super) enum IntegerShowProof<'a> {
     #[cfg(feature = "internal-checker")]
     Output(IntegerShowOutput),
     #[cfg(feature = "internal-checker")]
-    EntryComparison { binding: &'a ReferenceBindingId, relation: IntegerRelation },
+    EntryComparison {
+        binding: &'a ReferenceBindingId,
+        relation: IntegerRelation,
+        other: Option<&'a ReferenceBindingId>,
+    },
     #[cfg(feature = "internal-checker")]
     GuardedOutput {
         guard: IntegerPredicate,
@@ -714,11 +718,38 @@ impl IntegerReturningPath<'_> {
 
     #[cfg(feature = "internal-checker")]
     fn entry_show_with_output_bound(
-        &self, binding: &ReferenceBindingId, entry_relation: IntegerRelation, relation: IntegerRelation,
-        bound: &BigInt, still_provable: bool,
+        &self, binding: &ReferenceBindingId, other: Option<&ReferenceBindingId>,
+        entry_relation: IntegerRelation, relation: IntegerRelation, bound: &BigInt, still_provable: bool,
     ) -> Option<bool> {
         match self.value {
-            IntegerReturn::Alias(alias) if alias != binding => None,
+            IntegerReturn::Alias(alias) if alias != binding => {
+                if Some(alias) != other {
+                    return None;
+                }
+                if !still_provable {
+                    return Some(false);
+                }
+                let returned = self.axes.iter().position(|known| *known == alias)?;
+                let old = self.axes.iter().position(|known| *known == binding)?;
+                let upper_against_lower = entry_relation.accepts(std::cmp::Ordering::Less);
+                // A row is a Cartesian product of its component sets: this pure
+                // observer starts with independent entry axes, splits one axis at
+                // a time, and coalesces only rows identical on all other axes.
+                // Never compare extrema drawn from different rows.
+                for row in &self.state.0 {
+                    let result = &row[returned];
+                    if !result.every_at_extremes(relation, bound) {
+                        return Some(false);
+                    }
+                    let (result_min, result_max) = result.extremes()?;
+                    let (old_min, old_max) = row[old].extremes()?;
+                    let worst = if upper_against_lower { result_max.cmp(old_min) } else { result_min.cmp(old_max) };
+                    if !entry_relation.accepts(worst) {
+                        return Some(false);
+                    }
+                }
+                Some(true)
+            }
             _ if !still_provable => Some(false),
             IntegerReturn::Alias(_) => Some(entry_relation.accepts(std::cmp::Ordering::Equal)
                 && self.output_satisfies(relation, bound)?),
@@ -1145,10 +1176,10 @@ fn check_integer_return_bound_in_scope<'a>(
         return Some(Ok(ProofCoverage::Applicable(proved)));
     }
     #[cfg(feature = "internal-checker")]
-    if let Some(IntegerShowProof::EntryComparison { binding, relation: entry_relation }) = proof {
+    if let Some(IntegerShowProof::EntryComparison { binding, relation: entry_relation, other }) = proof {
         let mut proved = true;
         for path in &paths {
-            proved = path.entry_show_with_output_bound(binding, *entry_relation, relation, bound, proved)?;
+            proved = path.entry_show_with_output_bound(binding, *other, *entry_relation, relation, bound, proved)?;
         }
         return Some(Ok(ProofCoverage::Applicable(proved)));
     }

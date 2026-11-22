@@ -1055,12 +1055,53 @@ fn named_proof_show_old_checks_immutable_entry_and_independent_output_bound() {
     assert_eq!(check("fixed", "original <= 6", "out < 7", strict, ""), ScalarModuleProofOutcome::Refuted);
     assert_eq!(check("fixed", "false", "out <= 7", strict, ""), ScalarModuleProofOutcome::NoApplicableInputs);
     for target in ["literal_then_alias", "alias_then_literal"] {
-        assert_eq!(check(target, "original == 7", "out <= 7", strict, ""), ScalarModuleProofOutcome::Unsupported);
+        assert_eq!(check(target, "original == 7", "out < 7", "out != core.old(original)", ""), ScalarModuleProofOutcome::Unsupported);
     }
     assert_eq!(check("changed", "original <= 7", "out <= 7", compare, ""), ScalarModuleProofOutcome::Unsupported);
     assert_eq!(check("width", "original <= 7", "out <= 7", "out >= core.old(tag)", ""), ScalarModuleProofOutcome::Unsupported);
     assert!(matches!(check("echo", "true", "out <= 7", "out >= core.old(null)", ""), ScalarModuleProofOutcome::Invalid(_)));
     assert_eq!(check("echo", "original <= 7", "out <= 7", compare, "i16 live = echo(0, 7);"), ScalarModuleProofOutcome::Unsupported);
+}
+
+#[test]
+fn named_proof_show_old_orders_same_width_formals_without_crossing_return_rows() {
+    let identity = source();
+    let check = |target: &str, where_guard: &str, ensures: &str, claim: &str| {
+        check_scalar_module_proof(
+            identity.clone(), "demonstrate",
+            vec![ScalarProofModuleInput {
+                source: identity.clone(),
+                text: format!(r#"%%start
+                    i16(i16, i16) echo = fn(value, limit) {{ if (limit == 0) {{}}; value }};
+                    i16(i16, i16) correlated = fn(value, limit) {{
+                        if (limit < 20) {{
+                            if (value < 10) {{ value }} else {{ 0 }}
+                        }} else {{
+                            if (value < 20) {{ value }} else {{ 0 }}
+                        }}
+                    }};
+                    proof demonstrate for {target}(value, limit) -> (out) where ({where_guard}) ensures ({ensures}) {{
+                        core.show({claim});
+                    }}
+                %%end"#),
+                namespaces: Vec::new(),
+            }],
+            vec![identity.clone()], ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
+        )
+    };
+    let disconnected = "value >= -2 && value <= 0 && value != -1";
+    let strict = "out < core.old(limit)";
+    assert_eq!(check("echo", &format!("{disconnected} && limit >= 1"), "out <= 0", strict), ScalarModuleProofOutcome::Proved);
+    assert_eq!(check("echo", &format!("{disconnected} && limit >= 0"), "out <= 0", strict), ScalarModuleProofOutcome::Refuted);
+    assert_eq!(check("echo", &format!("{disconnected} && limit >= 0"), "out <= 0", "out <= core.old(limit)"), ScalarModuleProofOutcome::Proved);
+    assert_eq!(check("echo", &format!("{disconnected} && limit <= -2"), "out <= 0", "out >= core.old(limit)"), ScalarModuleProofOutcome::Proved);
+    assert_eq!(check("echo", &format!("{disconnected} && limit >= 1"), "out < 0", strict), ScalarModuleProofOutcome::Refuted);
+    // Marginal extrema (output 19 and limit 10) would refute, but they never
+    // co-occur: alias rows pair output <= 9 with limit >= 10, or output <= 19
+    // with limit >= 20. The remaining feasible rows return 0.
+    assert_eq!(check("correlated", "limit >= 10 && limit <= 30", "out < 20", strict), ScalarModuleProofOutcome::Proved);
+    assert_eq!(check("echo", "false", "out < 0", strict), ScalarModuleProofOutcome::NoApplicableInputs);
+    assert_eq!(check("echo", "value == 0 && limit == 0", "out <= 0", "out == core.old(limit)"), ScalarModuleProofOutcome::Unsupported);
 }
 
 #[test]
