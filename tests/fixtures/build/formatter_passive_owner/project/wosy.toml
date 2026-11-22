@@ -205,3 +205,33 @@ run_runner = "wasm"
 
 [targets.forwarded-wasm.profiles.dev]
 main_artifact = "main"
+
+[targets.parameter-native]
+root = "src/parameter.w"
+
+[targets.parameter-native.artifacts.main]
+artifact = "Main"
+
+[targets.parameter-native.artifacts.main.profiles.dev]
+backend = "llvm"
+output = "native"
+builder = "native"
+run_runner = "native"
+
+[targets.parameter-native.profiles.dev]
+main_artifact = "main"
+
+[targets.parameter-wasm]
+root = "src/parameter.w"
+
+[targets.parameter-wasm.artifacts.main]
+artifact = "Main"
+
+[targets.parameter-wasm.artifacts.main.profiles.dev]
+backend = "llvm"
+output = "wasm-wasip1"
+builder = "wasm"
+run_runner = "wasm"
+
+[targets.parameter-wasm.profiles.dev]
+main_artifact = "main"

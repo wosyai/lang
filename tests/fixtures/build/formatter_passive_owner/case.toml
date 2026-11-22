@@ -48,6 +48,14 @@ exit = 0
 command = ["wosy", "build", "forwarded-wasm"]
 exit = 0
 
+[[steps]]
+command = ["wosy", "build", "parameter-native"]
+exit = 0
+
+[[steps]]
+command = ["wosy", "build", "parameter-wasm"]
+exit = 0
+
 [[assert]]
 command = ["wosy", "run", "nested-native"]
 exit = 0
@@ -129,5 +137,19 @@ exact = true
 command = ["wosy", "run", "forwarded-wasm"]
 exit = 0
 stdout = "expected/nested.stdout"
+stderr = "expected/verified.stderr"
+exact = true
+
+[[assert]]
+command = ["wosy", "run", "parameter-native"]
+exit = 0
+stdout = "expected/named.stdout"
+stderr = "expected/verified.stderr"
+exact = true
+
+[[assert]]
+command = ["wosy", "run", "parameter-wasm"]
+exit = 0
+stdout = "expected/named.stdout"
 stderr = "expected/verified.stderr"
 exact = true

@@ -36,3 +36,9 @@ The user-defined forwarding control returns ordinary format from a
 direct wrapper and binds its result by name before printing it. It
 checks the original allocation is still live after the wrapper returns,
 is used for the real output, and is released once by the consumer.
+
+The by-value parameter control moves a named formatter result into a
+user function that reads through the descriptor and returns unit.
+The original backing must remain live through that read and be released
+once in the callee. This does not test forwarding into a multi-output
+consumer.
