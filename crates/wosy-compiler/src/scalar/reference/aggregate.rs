@@ -33,7 +33,8 @@ pub(super) struct AggregateFlowFacts {
     pub(super) formal_forward_shape: Option<(CfgPointId, CfgPointId)>,
     pub(super) array_formal: Option<ReferenceBindingId>,
     pub(super) array_calls: BTreeMap<CfgPointId, (OccurrenceOrdinal, CfgPointId, ReferenceBindingId)>,
-    pub(super) array_return_move: Option<CfgPointId>,
+    // Primary return value and the whole-place move that follows its evaluation.
+    pub(super) array_return: Option<(CfgPointId, CfgPointId)>,
     pub(super) array_installs: BTreeSet<CfgPointId>,
     pub(super) neutral_array_calls: BTreeSet<CfgPointId>,
     pub(super) neutral_array_projections: BTreeMap<CfgPointId, CfgPointId>,
@@ -255,6 +256,7 @@ pub(super) struct AggregateEdgeState {
     pending_temporaries: BTreeMap<CfgPointId, ReferenceScopeId>,
     array_formal_live: bool,
     array_formal_pending: Option<CfgPointId>,
+    array_return_forwarded: bool,
     array_dependencies: BTreeSet<CfgPointId>,
     local_array: Option<LocalArrayLife>,
 }
@@ -737,11 +739,15 @@ impl AggregateFlowFacts {
                         result.array_invalid = true;
                     }
                 }
-                CfgPointKind::ReturnOutput { output: 0, .. } => {
+                CfgPointKind::ReturnOutput { output: 0, value_point, .. } => {
+                    state.array_return_forwarded = self.array_return.is_some_and(|(value, moved)|
+                        value == *value_point && Some(moved) == state.array_formal_pending);
+                }
+                CfgPointKind::Return => {
+                    // Every normal return must have carried the checked formal to lane zero.
+                    // The pending formal move alone says nothing about a different output.
                     result.array_returns.insert(
-                        (state.array_formal_pending.is_some()
-                            && state.array_formal_pending == self.array_return_move)
-                            .then(|| state.array_dependencies.clone())
+                        state.array_return_forwarded.then(|| state.array_dependencies.clone())
                     );
                 }
                 _ => {}

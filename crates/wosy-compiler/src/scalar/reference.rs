@@ -3510,7 +3510,9 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         if scope == ReferenceScopeId(0) && slot.output == 0
                             && self.aggregate_facts.array_formal.is_some()
                         {
-                            self.aggregate_facts.array_return_move = self.cursor.filter(|moved| *moved != value_point);
+                            self.aggregate_facts.array_return = self.cursor
+                                .filter(|moved| *moved != value_point)
+                                .map(|moved| (value_point, moved));
                         }
                         let ty = if scope == ReferenceScopeId(0) {
                             &calls.boundary.root_outputs[slot.output].ty
@@ -3569,8 +3571,12 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         None
                     };
                     let mut array_rebind = None;
-                    let mut simple_destinations = assignment.values.len() == 1
-                        && values.first().is_some_and(|(_, rhs)| self.aggregate_facts.array_calls.contains_key(rhs));
+                    let primary_array_producer = group
+                        .rhs_evaluations()
+                        .next()
+                        .filter(|evaluation| assignment.values.len() == 1 && evaluation.position == 0)
+                        .map(|evaluation| evaluation.expression);
+                    let mut simple_destinations = primary_array_producer.is_some();
                     for ((slot, (value, rhs_point)), destination) in
                         group.installs().zip(values).zip(destinations)
                     {
@@ -3781,10 +3787,16 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             }
                         }
                         let install = self.cursor.expect("assignment install point");
-                        if simple_destinations && position == 0 && self.aggregate_facts.array_calls.get(&rhs_point)
-                            .is_some_and(|(_, _, binding)| matches!(&self.cfg.points[install.0].kind,
-                                CfgPointKind::Assign { target, rhs_point: actual, .. }
-                                    if *actual == rhs_point && target.projections.is_empty() && target.binding == *binding))
+                        // Only the checked primary output can start same-array retention.
+                        // Projected outputs have distinct points and do not inherit this proof.
+                        if simple_destinations && position == 0
+                            && self.aggregate_facts.array_calls.get(&rhs_point).is_some_and(|(producer, _, binding)| {
+                                Some(*producer) == primary_array_producer
+                                    && matches!(&self.cfg.points[rhs_point.0].kind, CfgPointKind::Call { output: 0, .. })
+                                    && matches!(&self.cfg.points[install.0].kind,
+                                        CfgPointKind::Assign { target, rhs_point: actual, .. }
+                                            if *actual == rhs_point && target.projections.is_empty() && target.binding == *binding)
+                            })
                         {
                             array_rebind = Some(install);
                         }
