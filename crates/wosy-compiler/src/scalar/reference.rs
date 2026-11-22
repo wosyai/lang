@@ -5568,6 +5568,48 @@ fn exact_named_scalar_store_pointer<'a>(
         .then_some((*pointer_point, binding, field))
 }
 
+fn point_last_use_dependencies<'a>(
+    kind: &'a CfgPointKind,
+    pair: &'a mut [CfgPointId; 2],
+) -> &'a [CfgPointId] {
+    match kind {
+        CfgPointKind::Invalidate { address_point, .. }
+        | CfgPointKind::Release { target: ReleaseTarget::Checked { address_point, .. } } =>
+            std::slice::from_ref(address_point),
+        CfgPointKind::MoveThrough { pointer_point, .. }
+        | CfgPointKind::DeferredMoveThrough { pointer_point, .. } => std::slice::from_ref(pointer_point),
+        CfgPointKind::Assign { rhs_point, .. } => std::slice::from_ref(rhs_point),
+        CfgPointKind::ReturnOutput { value_point, .. } => std::slice::from_ref(value_point),
+        CfgPointKind::ConditionalOutput { then_point, else_point } => {
+            *pair = [*then_point, *else_point];
+            pair
+        }
+        CfgPointKind::Call { argument_points, .. } => argument_points,
+        CfgPointKind::AssignThrough { rhs_point, pointer_point, .. } => {
+            *pair = [*rhs_point, *pointer_point];
+            pair
+        }
+        CfgPointKind::ReadPlace { pointer_point, .. } => pointer_point.as_slice(),
+        _ => &[],
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn point_last_use_dependencies_keep_canonical_order_and_storage() {
+    let mut pair = [CfgPointId(0); 2];
+    let conditional = CfgPointKind::ConditionalOutput {
+        then_point: CfgPointId(2), else_point: CfgPointId(5),
+    };
+    assert_eq!(point_last_use_dependencies(&conditional, &mut pair), &[CfgPointId(2), CfgPointId(5)]);
+    let returned = CfgPointKind::ReturnOutput { output: 0, value_point: CfgPointId(7), checked: true };
+    let CfgPointKind::ReturnOutput { value_point, .. } = &returned else { unreachable!() };
+    let dependencies = point_last_use_dependencies(&returned, &mut pair);
+    assert_eq!(dependencies, &[CfgPointId(7)]);
+    assert!(std::ptr::eq(&dependencies[0], value_point));
+    assert!(point_last_use_dependencies(&CfgPointKind::ScopeExit, &mut pair).is_empty());
+}
+
 fn transfer_reference_facts(
     cfg: ReferenceTransferCfg<'_>,
     deferred_policies: &BTreeMap<usize, CopyPolicy>,
@@ -5654,6 +5696,7 @@ fn transfer_reference_facts(
         )? else { return None };
         child_holders.get(binding).copied()
     };
+    let mut dependency_pair = [CfgPointId(0); 2];
     for (index, point) in original_points.iter().enumerate() {
         strictly_forward = strictly_forward && point.id.0 == index
             && point.successors.iter().all(|successor| successor.0 > index && successor.0 < original_points.len());
@@ -5842,34 +5885,7 @@ fn transfer_reference_facts(
                 _ => false,
             };
         }
-        let dependencies = match &point.kind {
-            CfgPointKind::Invalidate { address_point, .. }
-            | CfgPointKind::Release {
-                target: ReleaseTarget::Checked { address_point, .. },
-            } => vec![*address_point],
-            CfgPointKind::MoveThrough { pointer_point, .. }
-            | CfgPointKind::DeferredMoveThrough { pointer_point, .. } => vec![*pointer_point],
-            CfgPointKind::Assign { rhs_point, .. } => vec![*rhs_point],
-            CfgPointKind::ReturnOutput { value_point, .. } => vec![*value_point],
-            CfgPointKind::ConditionalOutput {
-                then_point,
-                else_point,
-            } => vec![*then_point, *else_point],
-            CfgPointKind::Call {
-                argument_points, ..
-            } => argument_points.clone(),
-            CfgPointKind::AssignThrough {
-                rhs_point,
-                pointer_point,
-                ..
-            } => {
-                vec![*rhs_point, *pointer_point]
-            }
-            CfgPointKind::ReadPlace { pointer_point, .. } => {
-                pointer_point.iter().copied().collect()
-            }
-            _ => Vec::new(),
-        };
+        let dependencies = point_last_use_dependencies(&point.kind, &mut dependency_pair);
         for dependency in dependencies {
             last_use[dependency.0] = point.id.0;
         }
