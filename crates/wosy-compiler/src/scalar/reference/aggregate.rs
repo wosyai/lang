@@ -1571,6 +1571,76 @@ fn live_ordinary_result_storage(block: &ScalarBlock, ty: &ScalarType, root: bool
     }
 }
 
+fn nested_copy_local_result(
+    block: &ScalarBlock,
+    ty: &ScalarType,
+    structs: &[ScalarStruct],
+) -> bool {
+    fn literal(expression: &ScalarExpression) -> bool {
+        match expression {
+            ScalarExpression::StructLiteral { fields, .. } =>
+                fields.iter().all(|field| literal(&field.value)),
+            ScalarExpression::Integer { .. } | ScalarExpression::Float { .. }
+            | ScalarExpression::Boolean { .. } | ScalarExpression::Char { .. } => true,
+            _ => false,
+        }
+    }
+
+    fn data(
+        ty: &ScalarType,
+        structs: &[ScalarStruct],
+        seen: &mut HashMap<ScalarStructId, bool>,
+    ) -> bool {
+        if ordinary_value(ty) {
+            return true;
+        }
+        let ScalarType::Struct(id) = ty else { return false };
+        if let Some(&accepted) = seen.get(id) {
+            return accepted;
+        }
+        let Some(structure) = structs.iter().find(|structure| &structure.id == id) else {
+            return false;
+        };
+        if structure.copy_policy != CopyPolicy::Copy {
+            return false;
+        }
+        seen.insert(id.clone(), false);
+        let accepted = structure.fields.iter().all(|field| data(&field.ty, structs, seen));
+        seen.insert(id.clone(), accepted);
+        accepted
+    }
+
+    if block.unsafe_context || block.final_output_values.len() != 1 {
+        return false;
+    }
+    let [ScalarBlockItem::LocalBinding(binding), ScalarBlockItem::Expression(ScalarExpression::Name { name, .. })] =
+        block.items.as_slice() else { return false };
+    !binding.is_allocation
+        && matches!(binding.receivers.as_slice(), [receiver] if receiver.name == *name && receiver.ty == *ty)
+        && matches!(&binding.value, ScalarExpression::StructLiteral { .. })
+        && literal(&binding.value)
+        && data(ty, structs, &mut HashMap::new())
+}
+
+fn ordinary_result_read_root(expression: &ScalarExpression) -> Option<&str> {
+    match expression {
+        ScalarExpression::Member { receiver, .. } => Some(receiver),
+        ScalarExpression::IndexedRead { place, .. } => {
+            let mut base = place;
+            let mut projections = 0;
+            while let ScalarPlace::Field { base: parent, field: ScalarFieldReference::Resolved(_), .. } = base {
+                projections += 1;
+                base = parent;
+            }
+            match base {
+                ScalarPlace::Name { name, .. } if projections >= 2 => Some(name),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 fn scalar_only_ordinary_result_use(
     function: &ScalarFunction,
     sites: &FunctionCallSites,
@@ -1584,10 +1654,11 @@ fn scalar_only_ordinary_result_use(
     {
         return false;
     }
-    let [ScalarBlockItem::LocalBinding(binding), ScalarBlockItem::Expression(ScalarExpression::Member { receiver, .. })] =
+    let [ScalarBlockItem::LocalBinding(binding), ScalarBlockItem::Expression(expression)] =
         function.body.items.as_slice() else { return false };
+    let Some(receiver) = ordinary_result_read_root(expression) else { return false };
     !binding.is_allocation
-        && matches!(binding.receivers.as_slice(), [value] if &value.name == receiver && matches!(value.ty, ScalarType::Struct(_)))
+        && matches!(binding.receivers.as_slice(), [value] if value.name == receiver && matches!(value.ty, ScalarType::Struct(_)))
         && matches!(binding.value, ScalarExpression::Call { .. })
         && sites.structure.edges.get(&(
             OccurrenceParent::Block(sites.structure.root),
@@ -1619,13 +1690,13 @@ pub(super) fn ordinary_result_cohort<'a>(
         }
         let [ScalarOutput { ty, .. }] = outputs.outputs.as_slice() else { continue };
         let ScalarType::Struct(id) = ty else { continue };
-        if !matches!(function.body.final_output_values.as_slice(), [output] if output.ty == *ty)
-            || !live_ordinary_result_storage(&function.body, ty, true)
-        {
+        if !matches!(function.body.final_output_values.as_slice(), [output] if output.ty == *ty) {
             continue;
         }
         let Some(structure) = structs.iter().find(|structure| &structure.id == id) else { continue };
-        if !structure.fields.iter().all(|field| ordinary_value(&field.ty)) {
+        let existing = structure.fields.iter().all(|field| ordinary_value(&field.ty))
+            && live_ordinary_result_storage(&function.body, ty, true);
+        if !existing && !nested_copy_local_result(&function.body, ty, structs) {
             continue;
         }
         if definitions.insert((source, function.name_span), key).is_some() {

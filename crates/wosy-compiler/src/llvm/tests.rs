@@ -8647,6 +8647,49 @@ u64(bool) verify = fn(flag) { Pair value = _make(flag); value.total };
 }
 
 #[test]
+fn closed_nested_copy_local_result_uses_caller_storage_for_scalar_projection() {
+    let text = "%%start
+struct copy Part { u8 tag; u64 score; }
+struct copy Bundle { Part selected; u64 other; }
+Bundle() _make_bundle = fn {
+    Bundle prepared_value = { .selected = { .tag = 7; .score = 41; }; .other = 17; };
+    prepared_value
+};
+u64() observe = fn { Bundle received = _make_bundle(); received.selected.score };
+%%end";
+    for layout in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
+        let checked_project = prepare_initializer_test(text, layout);
+        let checked = analyze_scalar_build(&checked_project);
+        assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+        let source = &checked_project.project().modules[0].source;
+        for (producer, caller, partition) in [
+            ("_make_bundle".to_owned(), "observe".to_owned(),
+                emit_scalar_build_single_module_llvm(&checked).unwrap().to_text()),
+            (project_function_name(source, "_make_bundle"), project_function_name(source, "observe"),
+                emit_scalar_build_project_llvm(&checked).unwrap().to_text()),
+        ] {
+            let producer_body = partition.split_once(&format!("define internal void @{producer}("))
+                .expect("producer caller-owned boundary").1.split_once("\n}").unwrap().0;
+            let (producer_args, producer_ir) = producer_body.split_once(')').unwrap();
+            let destination = producer_args.strip_prefix("ptr ").expect("caller storage parameter");
+            let transfer = producer_ir.lines().find(|line| {
+                line.contains("@llvm.memmove.")
+                    && line.contains(&format!("ptr align 1 {destination},"))
+                    && (line.contains("i32 24, i1 false") || line.contains("i64 24, i1 false"))
+            }).expect("layout-sized pre-return transfer");
+            assert!(producer_ir.find(transfer).unwrap() < producer_ir.find("ret void").unwrap());
+            assert!(!producer_ir.contains("ret ptr"), "{producer_ir}");
+            let caller_ir = partition.split_once(&format!("define i64 @{caller}("))
+                .expect("ordinary scalar caller").1.split_once("\n}").unwrap().0;
+            assert_eq!(caller_ir.matches(&format!("call void @{producer}(")).count(), 1);
+            assert!(caller_ir.contains("alloca [24 x i8], align 8"), "{caller_ir}");
+            assert!(caller_ir.contains("ordinary_result_destination"), "{caller_ir}");
+            assert!(caller_ir.contains("ret i64"), "{caller_ir}");
+        }
+    }
+}
+
+#[test]
 fn ordinary_result_transport_declines_legacy_source_and_aggregate_forwarding() {
     let pair = "struct Pair { u8 tag; u64 total; }";
     for body in [
