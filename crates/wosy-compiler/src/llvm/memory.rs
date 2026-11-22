@@ -481,18 +481,32 @@ pub(super) fn checked_fixed_assignment_element_pointer<'ctx>(
         return Err("checked fixed assignment requires a fixed array extent".to_owned());
     };
     let pointer = place_pointer(context, state, base, project)?;
+    checked_fixed_element_pointer(
+        context, state, &ty, pointer, length, index, project,
+        ("assignment_index_out_of_bounds", "assignment_index_panic", "assignment_index_continue"),
+    )
+}
+
+pub(super) fn checked_fixed_element_pointer<'ctx>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, '_>,
+    ty: &ScalarType,
+    pointer: PointerValue<'ctx>,
+    length: u64,
+    index: &ScalarExpression,
+    project: Option<ProjectCallScope<'_>>,
+    labels: (&str, &str, &str),
+) -> Result<PointerValue<'ctx>, String> {
     let index = emit_place_index(context, state, index, project)?;
     if !index.get_zero_extended_constant().is_some_and(|index| index < length) {
         let invalid = state.builder.build_int_compare(
-            IntPredicate::UGE, index, context.i64_type().const_int(length, false),
-            "assignment_index_out_of_bounds",
+            IntPredicate::UGE, index, context.i64_type().const_int(length, false), labels.0,
         ).map_err(builder_error)?;
-        emit_checked_place_guard(
-            context, state, invalid, "assignment_index_panic", "assignment_index_continue",
-        )?;
+        emit_checked_place_guard(context, state, invalid, labels.1, labels.2)?;
     }
-    fixed_array_element_pointer(context, state, &ty, pointer, index)
+    fixed_array_element_pointer(context, state, ty, pointer, index)
 }
+
 
 fn byte_layout_field_pointer<'ctx>(
     context: &'ctx Context,
