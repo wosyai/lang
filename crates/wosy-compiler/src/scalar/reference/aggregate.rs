@@ -2411,12 +2411,12 @@ fn preflight_literal_array_pair(
         return None;
     }
     let FreshArrayExtent::Literal(original_elements) = original.extent else { return None };
-    let extent_for = |write: LiteralArrayWrite| match fresh.extent {
+    let extent_for = |extent: FreshArrayExtent, write: LiteralArrayWrite| match extent {
         FreshArrayExtent::Literal(elements) => Some(ReplacementArrayExtent::Literal(elements)),
         FreshArrayExtent::Formal => write.argument.map(|argument|
             ReplacementArrayExtent::Argument { occurrence: argument.occurrence.0 }),
     };
-    let replacement_extent = extent_for(write)?;
+    let replacement_extent = extent_for(fresh.extent, write)?;
     let other_writer = if let Some(other) = unit.and_then(|unit| unit.other_write) {
         if other.rhs == other.writer || other.rhs == write.rhs || other.writer == write.writer
             || other.producer == write.producer || other.destination == write.destination
@@ -2427,7 +2427,8 @@ fn preflight_literal_array_pair(
         {
             return None;
         }
-        let extent = extent_for(other)?;
+        let extent = established_alternate.map_or(fresh.extent, |(_, allocation, _)| allocation.extent);
+        let extent = extent_for(extent, other)?;
         Some(ClosedLiteralArrayWrite { call: other.producer.0, destination: other.destination.0, extent })
     } else {
         None
@@ -2445,7 +2446,7 @@ fn preflight_literal_array_pair(
     let new_leaf = if let Some((alternate, allocation, output)) = established_alternate {
         if caller == alternate || callee == alternate || other_writer.is_none()
             || !matches!(fresh.extent, FreshArrayExtent::Literal(_))
-            || fresh.extent != allocation.extent
+            || !matches!(allocation.extent, FreshArrayExtent::Literal(_))
             || existing_primary.and_then(|plan| plan.literal_array) != Some(producer)
             || result.bodies.get(&alternate).and_then(|plan| plan.literal_array) != Some(leaf_plan(allocation, output))
         {
@@ -2539,7 +2540,7 @@ fn install_literal_array_plans(
                     || !other_formals.iter().map(|slot| (slot.ordinal, &slot.ty))
                         .eq(formals.iter().map(|slot| (slot.ordinal, &slot.ty)))
                     || !matches!(fresh.extent, FreshArrayExtent::Literal(_))
-                    || fresh.extent != allocation.extent
+                    || !matches!(allocation.extent, FreshArrayExtent::Literal(_))
                 {
                     continue;
                 }
@@ -3474,6 +3475,7 @@ mod tests {
         let alternate = (0, 2, None);
         let mut alternate_allocation = pair.fresh;
         alternate_allocation.bind = CfgPointId(4);
+        alternate_allocation.extent = FreshArrayExtent::Literal(13);
         let alternate_output = OccurrenceOrdinal(12);
         pair.established_alternate = Some((alternate, alternate_allocation, alternate_output));
         pair.unit = Some(LiteralArrayUnit {
@@ -3521,6 +3523,16 @@ mod tests {
         let alternate_plan = result.bodies[&alternate].literal_array;
         let prepared = preflight_literal_array_pair(&result, pair, parameters).expect("both exact leaves");
         assert!(prepared.new_leaf.is_none());
+        assert!(matches!(prepared.replacement, ClosedLiteralArray::Replacement {
+            extent: ReplacementArrayExtent::Literal(11),
+            unit: Some(ClosedLiteralArrayUnit {
+                other_writer: Some(ClosedLiteralArrayWrite {
+                    call: 7, destination: 8, extent: ReplacementArrayExtent::Literal(13),
+                }),
+                ..
+            }),
+            ..
+        }));
         enroll_literal_array_pair(&mut result, pair, parameters);
         assert_eq!(result.bodies.len(), 5);
         assert_eq!(result.bodies[&pair.callee].literal_array, primary_plan);
