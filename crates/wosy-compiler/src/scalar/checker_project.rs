@@ -4006,7 +4006,11 @@ impl PreparedProofModule {
     ) -> Result<InductionPremise, ProjectCheck> {
         let plan = self.plan_module_proof_in_scope::<true, false, false>(proof_source, proof_name)?;
         let measure = plan.typed.measure.ok_or(ProjectCheck::Unsupported)?;
-        Ok(plan.verify_induction_return_witness(measure)?.unwrap_or(InductionPremise::Unreachable))
+        match plan.verify_induction_return_witness(measure)? {
+            RankedInductionOutcome::NoApplicable => Ok(InductionPremise::Unreachable),
+            RankedInductionOutcome::Premise(premise) => Ok(premise),
+            RankedInductionOutcome::Refuted(_) => Err(ProjectCheck::Refuted),
+        }
     }
 
     fn check_module_proofs(&self, proof_names: &[&str]) -> Vec<ScalarModuleProofOutcome> {
@@ -4465,32 +4469,56 @@ impl PreparedProofModule {
 impl PlannedModuleProof<'_> {
     fn verify_induction_return_witness(
         &self, measure: TypedInductionRank<'_>,
-    ) -> Result<Option<InductionPremise>, ProjectCheck> {
+    ) -> Result<RankedInductionOutcome<'_>, ProjectCheck> {
         let proof_case = prepare_decrement_proof_steps(self.name, &self.steps, &self.typed, measure)?;
-        let base_matches = check_canonical_induction_returns(
+        let failure = check_canonical_induction_returns(
             self.function, self.canonical_target, &self.typed, measure, &proof_case,
         )?;
         let filter = self.filter.as_deref().unwrap_or_default();
         let (entries, minimum) = induction_entry_domain(measure, filter)?;
         if entries.is_empty() {
-            return Ok(None);
+            return Ok(RankedInductionOutcome::NoApplicable);
         }
-        if !base_matches && induction_base_reachable(&entries, &proof_case.base_guard)? {
-            return Err(ProjectCheck::Refuted);
+        if let Some(failure) = failure {
+            if measure.earlier.is_none() {
+                let entry = match &proof_case.base_guard {
+                    CheckerPredicate::Boolean(true) => entries.extremes().map(|(first, _)| first.clone()),
+                    CheckerPredicate::Boolean(false) => None,
+                    CheckerPredicate::Integer(predicate) => entries.keep(&predicate.operator, &predicate.bound)
+                        .ok_or(ProjectCheck::Unsupported)?.extremes().map(|(first, _)| first.clone()),
+                    _ => return Err(ProjectCheck::Unsupported),
+                };
+                if let Some(entry) = entry {
+                    let rejected = if failure.show_failed {
+                        RankedBaseRejection::AuthoredShow(proof_case.base_show)
+                    } else {
+                        let goal = child(&child(self.proof, SyntaxKind::ProofEnsures)?, SyntaxKind::Expression)?;
+                        RankedBaseRejection::Goal(wosy_syntax::byte_span(&goal))
+                    };
+                    return Ok(RankedInductionOutcome::Refuted(Some(RankedBaseWitness {
+                        proof_source: self.proof_source, return_source: &self.typed.target.source,
+                        entry_type: measure.descending.0.ty.clone(), entry, returned: failure.returned,
+                        return_span: failure.return_span, rejected,
+                    })));
+                }
+            } else if induction_base_reachable(&entries, &proof_case.base_guard)? {
+                return Ok(RankedInductionOutcome::Refuted(None));
+            }
         }
-        check_induction_entry_domain(entries, &minimum, &proof_case, filter, measure.descending.1).map(Some)
+        check_induction_entry_domain(entries, &minimum, &proof_case, filter, measure.descending.1)
+            .map(RankedInductionOutcome::Premise)
     }
 
     fn verify_unused_induction(&self, measure: TypedInductionRank<'_>) -> Result<ProjectCheck, ProjectCheck> {
-        match self.verify_induction_return_witness(measure) {
-            Ok(None) => Ok(ProjectCheck::NoApplicableInputs),
-            Ok(Some(InductionPremise::Established | InductionPremise::Unreachable)) => Ok(ProjectCheck::Proved),
-            Ok(Some(InductionPremise::NotStrict | InductionPremise::CalleeWhereUnproved)) => Err(ProjectCheck::Unsupported),
-            Err(ProjectCheck::Refuted) => Ok(ProjectCheck::Refuted),
-            Err(error) => Err(error),
+        match self.verify_induction_return_witness(measure)? {
+            RankedInductionOutcome::NoApplicable => Ok(ProjectCheck::NoApplicableInputs),
+            RankedInductionOutcome::Premise(InductionPremise::Established | InductionPremise::Unreachable) =>
+                Ok(ProjectCheck::Proved),
+            RankedInductionOutcome::Premise(InductionPremise::NotStrict | InductionPremise::CalleeWhereUnproved) =>
+                Err(ProjectCheck::Unsupported),
+            RankedInductionOutcome::Refuted(_) => Ok(ProjectCheck::Refuted),
         }
     }
-
 
     fn uses_direct_goal(&self) -> bool {
         self.steps.items.is_empty() || matches!(self.typed.goal, TypedProofGoal::Existential { .. } | TypedProofGoal::EntryWitness { .. } | TypedProofGoal::ConjunctiveExistential(_) | TypedProofGoal::DependentWitness(_))
@@ -5740,9 +5768,44 @@ enum InductionPremise {
 }
 
 #[cfg(feature = "internal-checker")]
+#[cfg_attr(not(test), allow(dead_code))]
+enum RankedInductionOutcome<'a> {
+    NoApplicable,
+    Premise(InductionPremise),
+    Refuted(Option<RankedBaseWitness<'a>>),
+}
+
+#[cfg(feature = "internal-checker")]
+#[cfg_attr(not(test), allow(dead_code))]
+struct RankedBaseWitness<'a> {
+    proof_source: &'a SourceIdentity,
+    return_source: &'a SourceIdentity,
+    entry_type: ScalarType,
+    entry: BigInt,
+    returned: &'a BigInt,
+    return_span: ByteSpan,
+    rejected: RankedBaseRejection,
+}
+
+#[cfg(feature = "internal-checker")]
+#[derive(Debug, Eq, PartialEq)]
+enum RankedBaseRejection {
+    AuthoredShow(ByteSpan),
+    Goal(ByteSpan),
+}
+
+#[cfg(feature = "internal-checker")]
+struct CheckedRankedBaseFailure<'a> {
+    returned: &'a BigInt,
+    return_span: ByteSpan,
+    show_failed: bool,
+}
+
+#[cfg(feature = "internal-checker")]
 struct TypedInductionProofSteps<'a> {
     base_guard: CheckerPredicate,
     base_claim: IntegerReturn<'a>,
+    base_show: ByteSpan,
     decrement: &'a BigInt,
 }
 
@@ -5799,22 +5862,30 @@ fn prepare_decrement_proof_steps<'a>(
         return Err(ProjectCheck::Unsupported);
     }
     let base_bindings = typed.body.boundary.checker_parameter_bindings.as_deref().ok_or(ProjectCheck::Unsupported)?;
-    let base_claim = proof_show_claim(then_branch, &typed.input_names, &typed.output, typed.result_type, typed.body, base_bindings)?;
+    let ([show_item @ ScalarBlockItem::Expression(show)], [terminated]) =
+        (then_branch.items.as_slice(), then_branch.terminated_items.as_slice())
+    else {
+        return Err(ProjectCheck::Unsupported);
+    };
+    let base_claim = proof_show_item_claim(
+        show_item, *terminated, &typed.input_names, &typed.output, typed.result_type, typed.body, base_bindings,
+    )?;
+    let base_show = super::typecheck::expression_span(show);
     let base_guard = proof_input_condition::<true>(condition, &typed.input_names, typed.body, false)?;
     if matches!(&base_guard, CheckerPredicate::Integer(predicate) if &predicate.binding != rank.descending.1) {
         return Err(ProjectCheck::Unsupported);
     }
-    Ok(TypedInductionProofSteps { base_guard, base_claim, decrement })
+    Ok(TypedInductionProofSteps { base_guard, base_claim, base_show, decrement })
 }
 
 #[cfg(feature = "internal-checker")]
-fn check_canonical_induction_returns(
+fn check_canonical_induction_returns<'a>(
     function: &ScalarFunction,
     target: &ResolvedCallTarget,
-    typed: &TypedProofPostcondition<'_>,
+    typed: &TypedProofPostcondition<'a>,
     rank: TypedInductionRank<'_>,
     proof: &TypedInductionProofSteps<'_>,
-) -> Result<bool, ProjectCheck> {
+) -> Result<Option<CheckedRankedBaseFailure<'a>>, ProjectCheck> {
     use super::reference::{OccurrenceEdge, OccurrenceNode, OccurrenceParent, PlainNameIdentity};
     use super::typecheck::expression_span;
 
@@ -5849,9 +5920,8 @@ fn check_canonical_induction_returns(
         return Err(ProjectCheck::Unsupported);
     }
 
-    let base = output_at(*then_block)
-        .and_then(|occurrence| structure.checker_integer_literals.get(&occurrence))
-        .ok_or(ProjectCheck::Unsupported)?;
+    let base_occurrence = output_at(*then_block).ok_or(ProjectCheck::Unsupported)?;
+    let base = structure.checker_integer_literals.get(&base_occurrence).ok_or(ProjectCheck::Unsupported)?;
 
     let recursive = output_at(*else_block).ok_or(ProjectCheck::Unsupported)?;
     let [site] = body.call_occurrences.as_slice() else {
@@ -5911,7 +5981,12 @@ fn check_canonical_induction_returns(
     if !matches!(body.prepared_plain_name(left), Some(PlainNameIdentity::Lexical(entry)) if entry == binding) {
         return Err(ProjectCheck::Unsupported);
     }
-    Ok(base == *claimed_base && relation.accepts(base.cmp(bound)))
+    let show_failed = base != *claimed_base;
+    if !show_failed && relation.accepts(base.cmp(bound)) {
+        return Ok(None);
+    }
+    let return_span = body.occurrences.get(base_occurrence.0).ok_or(ProjectCheck::Unsupported)?.span;
+    Ok(Some(CheckedRankedBaseFailure { returned: base, return_span, show_failed }))
 }
 
 #[cfg(feature = "internal-checker")]
@@ -9502,6 +9577,48 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
         assert_eq!(check("if (value == 0) { 0 } else { descend(value - 1) + 1 }", 0, 0, "entry == 0", "true"), Err(ProjectCheck::Unsupported));
         assert_eq!(check(canonical, 1, 0, "entry == 0", "false"), Ok(InductionPremise::Unreachable));
         assert_eq!(check("if (value == 0) { 0 } else { other(value - 1) }", 1, 0, "entry == 0", "true"), Err(ProjectCheck::Unsupported));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ranked_induction_refutation_keeps_exact_guarded_base_and_failed_source_step() {
+        let file = source("src/main.w", "checked-induction-refutation");
+        let check = |show, goal, filter: &str, expected_step: Option<&str>| {
+            let text = format!(r#"%%start
+                u8(u8) descend = fn(value) {{ if (value < 3) {{ 4 }} else {{ descend(value - 3) }} }};
+                proof rank for descend(entry) -> (out) where ({filter}) ensures (out == {goal}) decreases (entry) {{
+                    if (entry < 3) {{ core.show(out == {show}); }} else {{ core.use(rank(entry - 3)); }}
+                }}
+            %%end"#);
+            let prepared = PreparedProofModule::prepare(file.clone(), text.clone(), inputs()).unwrap();
+            let plan = prepared.plan_module_proof_in_scope::<true, false, false>(&prepared.source, "rank").unwrap();
+            let rank = plan.typed.measure.unwrap();
+            let outcome = plan.verify_induction_return_witness(rank).unwrap();
+            let Some(expected_step) = expected_step else {
+                assert!(matches!(outcome, RankedInductionOutcome::NoApplicable));
+                return;
+            };
+            let RankedInductionOutcome::Refuted(Some(witness)) = outcome else {
+                panic!("one-axis admitted base refutation");
+            };
+            assert_eq!(witness.entry_type, ScalarType::U8);
+            assert_eq!(witness.entry, BigInt::from(2));
+            assert_eq!(witness.returned, &BigInt::from(4));
+            assert_eq!(witness.proof_source, &file);
+            assert_eq!(witness.return_source, &file);
+            let snippet = |span: ByteSpan| &text[span.start as usize..span.end as usize];
+            assert_eq!(snippet(witness.return_span), "4");
+            let actual_step = match witness.rejected {
+                RankedBaseRejection::AuthoredShow(span) if show != 4 => snippet(span),
+                RankedBaseRejection::Goal(span) if show == 4 => snippet(span),
+                _ => panic!("wrong refutation source step"),
+            };
+            assert_eq!(actual_step, expected_step);
+        };
+        check(5, 4, "entry == 2", Some("core.show(out == 5)"));
+        check(4, 5, "entry == 2", Some("out == 5"));
+        check(5, 5, "entry == 2", Some("core.show(out == 5)"));
+        check(5, 5, "false", None);
     }
 
     #[test]
