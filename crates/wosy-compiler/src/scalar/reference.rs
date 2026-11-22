@@ -5741,15 +5741,23 @@ fn deferred_local_owner_store(
         && pending.sites.last().is_some_and(|site| site.point < point.id)
 }
 
+fn exact_reborrow_read_edge<'a>(
+    read: &'a ReferenceFlowPoint,
+    borrow: &ReferenceFlowPoint,
+) -> Option<&'a ReferenceBindingId> {
+    if read.id >= borrow.id || read.scope != borrow.scope || read.successors.as_slice() != [borrow.id] {
+        return None;
+    }
+    let CfgPointKind::Read { binding } = &read.kind else { return None };
+    Some(binding)
+}
+
 fn exact_pending_reborrow_read(
     read: &ReferenceFlowPoint,
     borrow: &ReferenceFlowPoint,
     binding: &ReferenceBindingId,
 ) -> bool {
-    read.id < borrow.id
-        && read.scope == borrow.scope
-        && read.successors.as_slice() == [borrow.id]
-        && matches!(&read.kind, CfgPointKind::Read { binding: actual } if actual == binding)
+    exact_reborrow_read_edge(read, borrow) == Some(binding)
 }
 
 #[cfg(test)]
@@ -5839,10 +5847,11 @@ fn exact_projected_reborrow_parent_on_edge(
     else { return false };
     let Some(ReferenceOrigin::Fresh { loan: parent, .. }) = facts.get(authority.origin.0)
     else { return false };
-    let Some(read) = points.get(authority.pointer.0) else { return false };
-    let CfgPointKind::Read { binding } = &read.kind else { return false };
+    let (Some(read), Some(borrow)) = (points.get(authority.pointer.0), points.get(authority.borrow.0))
+    else { return false };
+    let Some(binding) = exact_reborrow_read_edge(read, borrow) else { return false };
     let owner = &parent.origin_place;
-    if authority.pointer >= authority.borrow || &read.source_span.range != span
+    if &read.source_span.range != span
         || parent.parent.is_some() || !owner.projections.is_empty()
         || !matches!(owner.place, ScalarPlace::Name { .. })
         || owner.binding == *binding || owner.binding != loan.origin_place.binding
