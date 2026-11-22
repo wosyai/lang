@@ -2107,13 +2107,15 @@ struct UnusedPeerUse<'plan, 'project> {
     index: usize,
     consumer: &'plan PlannedModuleProof<'project>,
     name: &'plan str,
-    selected_leaf: Option<&'plan PlannedModuleProof<'project>>,
+    relation: IntegerRelation,
+    bound: &'plan BigInt,
     strict_entry: Option<(&'plan ReferenceBindingId, &'plan BigInt)>,
 }
 
 #[cfg(all(test, feature = "internal-checker"))]
 thread_local! {
     static STRICT_PEER_ENTRY_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static UNSELECTED_PEER_PLANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(feature = "internal-checker")]
@@ -2247,6 +2249,8 @@ impl PreparedProofModule {
         let Ok((initialization, observers)) =
             check_package_initialization_observing(&self.prepared, root, ordinals, observers)
         else { return; };
+        let mut unselected_peers = HashMap::new();
+        let mut pending_peers = Vec::new();
         let mut arbitrary_groups = HashMap::<_, UnusedModuleProofGroup<'_, '_>>::new();
         for ((index, plan), observer) in plans.iter().zip(observers.proofs) {
             let Some(&proof_module) = initialization.ordinals.get(plan.proof_source) else { continue; };
@@ -2275,28 +2279,47 @@ impl PreparedProofModule {
                 let key = (plan.target, ExactGuardGroup(plan.filter.as_deref()));
                 arbitrary_groups.entry(key).or_default().direct.push((*index, plan));
             } else if let Some(peer) = plan.direct_peer_use() {
-                let selected_leaf = if let Some(request) = selected.get(&(plan.proof_source, peer)) {
-                    let Ok(at) = plans.binary_search_by_key(request, |(index, _)| *index) else { continue; };
-                    Some(&plans[at].1)
-                } else {
-                    None
-                };
-                let mut group_filter = plan.filter.as_deref();
-                let mut strict_entry = None;
-                if let Some(leaf) = selected_leaf {
-                    if ExactGuardGroup(leaf.filter.as_deref()) != ExactGuardGroup(group_filter) {
-                        let Some(entry) = plan.singleton_admitted_by_peer(leaf) else { continue; };
-                        group_filter = leaf.filter.as_deref();
-                        strict_entry = Some(entry);
-                    }
+                let identity = (plan.proof_source, peer);
+                if !selected.contains_key(&identity) {
+                    unselected_peers.entry(identity).or_insert_with(|| {
+                        #[cfg(test)]
+                        UNSELECTED_PEER_PLANS.with(|count| count.set(count.get() + 1));
+                        self.plan_module_proof_in_scope::<false, true, false>(plan.proof_source, peer).ok()
+                    });
                 }
-                let key = (plan.target, ExactGuardGroup(group_filter));
-                arbitrary_groups.entry(key).or_default().peer_uses.push(UnusedPeerUse {
-                    index: *index, consumer: plan, name: peer, selected_leaf, strict_entry,
-                });
+                pending_peers.push((*index, plan, peer));
             } else {
                 outcomes[*index] = module_proof_outcome(plan.verify_arbitrary_with_steps());
             }
+        }
+        for (index, plan, peer) in pending_peers {
+            let identity = (plan.proof_source, peer);
+            let leaf = if let Some(request) = selected.get(&identity) {
+                let Ok(at) = plans.binary_search_by_key(request, |(index, _)| *index) else { continue; };
+                &plans[at].1
+            } else {
+                let Some(Some(leaf)) = unselected_peers.get(&identity) else { continue; };
+                leaf
+            };
+            if leaf.typed.measure.is_some() || !leaf.steps.items.is_empty()
+                || leaf.target != plan.target || leaf.canonical_target != plan.canonical_target
+                || is_null_literal_name(&leaf.typed.output)
+                || leaf.typed.input_names.iter().any(|name| is_null_literal_name(name))
+            {
+                continue;
+            }
+            let TypedProofGoal::Literal { operator: BinaryOperator::Equal, relation, bound } = &leaf.typed.goal
+                else { continue; };
+            let leaf_guard = ExactGuardGroup(leaf.filter.as_deref());
+            let strict_entry = if leaf_guard == ExactGuardGroup(plan.filter.as_deref()) {
+                None
+            } else {
+                let Some(entry) = plan.singleton_admitted_by_peer(leaf) else { continue; };
+                Some(entry)
+            };
+            arbitrary_groups.entry((plan.target, leaf_guard)).or_default().peer_uses.push(UnusedPeerUse {
+                index, consumer: plan, name: peer, relation: *relation, bound, strict_entry,
+            });
         }
         for ((_, guard), group) in arbitrary_groups {
             let body = group.direct.first().map(|entry| entry.1)
@@ -2306,49 +2329,19 @@ impl PreparedProofModule {
                 continue;
             }
             let mut peers = HashMap::new();
-            for peer_use in group.peer_uses {
-                let UnusedPeerUse { index, consumer: plan, name: peer, selected_leaf, strict_entry } = peer_use;
-                let identity = (plan.proof_source, peer);
-                let admitted = peers.entry(identity).or_insert_with(|| {
-                    let compatible = |leaf: &PlannedModuleProof<'_>| {
-                        leaf.typed.measure.is_none() && leaf.steps.items.is_empty()
-                            && leaf.target == plan.target && leaf.canonical_target == plan.canonical_target
-                            && !is_null_literal_name(&leaf.typed.output)
-                            && !leaf.typed.input_names.iter().any(|name| is_null_literal_name(name))
-                    };
-                    let (relation, bound) = if let Some(leaf) = selected_leaf {
-                        if !compatible(leaf) {
-                            return None;
-                        }
-                        let TypedProofGoal::Literal { operator: BinaryOperator::Equal, relation, bound } = &leaf.typed.goal
-                            else { return None; };
-                        (*relation, Cow::Borrowed(bound))
-                    } else {
-                        let leaf = self.plan_module_proof_in_scope::<false, true, false>(plan.proof_source, peer).ok()?;
-                        if !compatible(&leaf) || ExactGuardGroup(leaf.filter.as_deref()) != guard {
-                            return None;
-                        }
-                        let TypedProofGoal::Literal { operator: BinaryOperator::Equal, relation, bound } = leaf.typed.goal
-                            else { return None; };
-                        (relation, Cow::Owned(bound))
-                    };
-                    Some((relation, bound, Vec::new()))
-                });
-                if let Some((_, _, uses)) = admitted {
-                    uses.push((index, plan, strict_entry));
-                }
-            }
-            if group.direct.is_empty() && peers.values().all(Option::is_none) {
-                continue;
+            for UnusedPeerUse { index, consumer, name, relation, bound, strict_entry } in group.peer_uses {
+                let identity = (consumer.proof_source, name);
+                let (_, _, uses): &mut (_, _, Vec<_>) = peers.entry(identity)
+                    .or_insert_with(|| (relation, bound, Vec::new()));
+                uses.push((index, consumer, strict_entry));
             }
             match observe_unused_module_proof_returns(body, guard.0) {
                 Some(Ok(ProofCoverage::Applicable(paths))) => {
                     let mut checked_peers = HashMap::new();
                     let mut first_strict_entry = None;
                     let mut other_strict_entries = HashMap::new();
-                    for (identity, admitted) in peers {
-                        let Some((relation, bound, consumers)) = admitted else { continue; };
-                        let proof = paths.iter().map(|path| path.output_satisfies(relation, &bound))
+                    for (identity, (relation, bound, consumers)) in peers {
+                        let proof = paths.iter().map(|path| path.output_satisfies(relation, bound))
                             .find(|holds| *holds != Some(true)).unwrap_or(Some(true));
                         let checked = if proof == Some(true) {
                             for (index, consumer, strict_entry) in consumers {
@@ -2370,7 +2363,7 @@ impl PreparedProofModule {
                                     }
                                 }
                                 let TypedProofGoal::Literal { relation, bound: requested, .. } = &consumer.typed.goal else { continue; };
-                                outcomes[index] = if relation.accepts(bound.as_ref().cmp(requested)) {
+                                outcomes[index] = if relation.accepts(bound.cmp(requested)) {
                                     ScalarModuleProofOutcome::Proved
                                 } else {
                                     ScalarModuleProofOutcome::Refuted
@@ -2433,7 +2426,7 @@ impl PreparedProofModule {
                     for (index, _) in group.direct {
                         outcomes[index] = ScalarModuleProofOutcome::NoApplicableInputs;
                     }
-                    for (_, _, consumers) in peers.into_values().flatten() {
+                    for (_, _, consumers) in peers.into_values() {
                         for (index, _, strict_entry) in consumers {
                             if strict_entry.is_none() {
                                 outcomes[index] = ScalarModuleProofOutcome::NoApplicableInputs;
@@ -5100,18 +5093,31 @@ mod tests {
             proof first for fixed(entry) -> (out) where (entry == 6) ensures (out <= 7) { core.use(leaf(entry)); }
             proof again for fixed(entry) -> (out) where (entry == 6) ensures (out >= 7) { core.use(leaf(entry)); }
             proof distinct for fixed(entry) -> (out) where (entry == 5) ensures (out == 7) { core.use(leaf(entry)); }
+            proof unrelated for fixed(input) -> (out) ensures (out == 256) {}
             proof distinct_again for fixed(entry) -> (out) where (entry == 5) ensures (out == 7) { core.use(leaf(entry)); }
         %%end"#;
         let _ = take_integer_observations();
-        STRICT_PEER_ENTRY_CHECKS.with(|count| count.set(0));
-        let outcomes = check_scalar_module_proofs(
-            file.clone(), &["first", "leaf", "again", "distinct", "distinct_again"],
-            vec![ScalarProofModuleInput { source: file.clone(), text: text.into(), namespaces: Vec::new() }],
-            vec![file], inputs(),
-        ).unwrap();
-        assert_eq!(outcomes, vec![ScalarModuleProofOutcome::Proved; 5]);
+        let _ = STRICT_PEER_ENTRY_CHECKS.with(|count| count.replace(0));
+        let _ = UNSELECTED_PEER_PLANS.with(|count| count.replace(0));
+        let run = |names: &[&str]| {
+            check_scalar_module_proofs(
+                file.clone(), names,
+                vec![ScalarProofModuleInput { source: file.clone(), text: text.into(), namespaces: Vec::new() }],
+                vec![file.clone()], inputs(),
+            ).unwrap()
+        };
+        let selected = ["first", "leaf", "again", "distinct", "distinct_again"];
+        let cited = ["first", "again", "distinct", "distinct_again"];
+        for (names, plans) in [(selected.as_slice(), 0), (cited.as_slice(), 1)] {
+            assert_eq!(run(names), vec![ScalarModuleProofOutcome::Proved; names.len()]);
+            assert_eq!(take_integer_observations(), (1, 0));
+            assert_eq!(STRICT_PEER_ENTRY_CHECKS.with(|count| count.replace(0)), 2);
+            assert_eq!(UNSELECTED_PEER_PLANS.with(|count| count.replace(0)), plans);
+        }
+        assert_eq!(run(&["leaf"]), [ScalarModuleProofOutcome::Proved]);
         assert_eq!(take_integer_observations(), (1, 0));
-        assert_eq!(STRICT_PEER_ENTRY_CHECKS.with(|count| count.get()), 2);
+        assert_eq!(STRICT_PEER_ENTRY_CHECKS.with(|count| count.replace(0)), 0);
+        assert_eq!(UNSELECTED_PEER_PLANS.with(|count| count.replace(0)), 0);
     }
 
     #[cfg(feature = "internal-checker")]

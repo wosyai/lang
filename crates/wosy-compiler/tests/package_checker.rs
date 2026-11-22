@@ -1071,6 +1071,8 @@ fn named_proof_peer_use_checks_exact_singleton_where_subsets_without_filling_hol
         ScalarModuleProofOutcome::Refuted, ScalarModuleProofOutcome::Proved,
     ]);
     assert_eq!(check("input <= 7", "entry == 6", "out <= 7", &["consumer"]),
+        [ScalarModuleProofOutcome::Proved]);
+    assert_eq!(check("input < 3 || input > 5", "entry == 4", "out <= 7", &["consumer"]),
         [ScalarModuleProofOutcome::Unsupported]);
     assert_eq!(check("input <= 7", "entry <= 6", "out <= 7", &selections), [
         ScalarModuleProofOutcome::Unsupported, ScalarModuleProofOutcome::Proved,
