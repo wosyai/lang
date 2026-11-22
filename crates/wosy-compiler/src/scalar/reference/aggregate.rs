@@ -2365,6 +2365,7 @@ fn closed_checked_backing_consumer<'a>(
 struct LiteralArrayPair {
     caller: BodyKey,
     callee: BodyKey,
+    established_alternate: Option<(BodyKey, LiteralArrayBind, OccurrenceOrdinal)>,
     original: LiteralArrayBind,
     fresh: LiteralArrayBind,
     final_output: OccurrenceOrdinal,
@@ -2394,7 +2395,7 @@ fn preflight_literal_array_pair(
     pair: LiteralArrayPair,
     parameters: LiteralArrayParameters<'_>,
 ) -> Option<LiteralArrayEnrollment> {
-    let LiteralArrayPair { caller, callee, original, fresh, final_output, write, exit, block, unit } = pair;
+    let LiteralArrayPair { caller, callee, established_alternate, original, fresh, final_output, write, exit, block, unit } = pair;
     if caller == callee || result.bodies.contains_key(&caller) || write.rhs == write.writer {
         return None;
     }
@@ -2435,14 +2436,28 @@ fn preflight_literal_array_pair(
         origin: allocation.bind,
         allocation: (allocation.position.block.0, allocation.position.item),
     };
-    let producer = ClosedLiteralArray::FreshLeaf {
-        receipt: to_receipt(fresh), length_occurrence: fresh.length_occurrence.0,
-        extent: fresh.extent, output: final_output.0,
+    let leaf_plan = |allocation: LiteralArrayBind, output: OccurrenceOrdinal| ClosedLiteralArray::FreshLeaf {
+        receipt: to_receipt(allocation), length_occurrence: allocation.length_occurrence.0,
+        extent: allocation.extent, output: output.0,
     };
-    let new_leaf = match result.bodies.get(&callee) {
-        Some(existing) if existing.literal_array == Some(producer) => None,
-        Some(_) => return None,
-        None => Some((callee, producer)),
+    let producer = leaf_plan(fresh, final_output);
+    let existing_primary = result.bodies.get(&callee);
+    let new_leaf = if let Some((alternate, allocation, output)) = established_alternate {
+        if caller == alternate || callee == alternate || other_writer.is_none()
+            || !matches!(fresh.extent, FreshArrayExtent::Literal(_))
+            || fresh.extent != allocation.extent
+            || existing_primary.and_then(|plan| plan.literal_array) != Some(producer)
+            || result.bodies.get(&alternate).and_then(|plan| plan.literal_array) != Some(leaf_plan(allocation, output))
+        {
+            return None;
+        }
+        None
+    } else {
+        match existing_primary {
+            Some(existing) if existing.literal_array == Some(producer) => None,
+            Some(_) => return None,
+            None => Some((callee, producer)),
+        }
     };
     let replacement = ClosedLiteralArray::Replacement {
         original: to_receipt(original), original_length_occurrence: original.length_occurrence.0,
@@ -2482,38 +2497,63 @@ fn install_literal_array_plans(
     declarations: &HashMap<(&SourceIdentity, ByteSpan), (usize, usize)>,
     result: &mut ClosedAggregates,
 ) {
+    let resolve = |callee: BodyKey| {
+        let leaf = bodies.get(&callee)?;
+        if !leaf.is_monomorphic || callee.2.is_some() {
+            return None;
+        }
+        let LiteralArrayRoute::FreshLeaf { allocation, output } =
+            leaf.facts?.proved_literal_array_route()? else { return None };
+        let [returned] = leaf.sites.boundary.results.as_slice() else { return None };
+        Some((allocation, output, &returned.ty, leaf.sites.boundary.parameters.as_slice()))
+    };
+    let mut distinct = Vec::new();
     for &(caller, body, route) in callers {
         let LiteralArrayRoute::Replacement { original, write, exit, block, unit } = *route else { continue };
         let Some(callee) = target_body(declarations, body.cfg, write.rhs) else { continue };
-        let Some(leaf) = bodies.get(&callee) else { continue };
-        if !leaf.is_monomorphic || callee.2.is_some() {
-            continue;
-        }
-        let Some(LiteralArrayRoute::FreshLeaf { allocation: fresh, output: final_output }) =
-            leaf.facts.and_then(AggregateFlowResult::proved_literal_array_route) else { continue };
-        let [returned] = leaf.sites.boundary.results.as_slice() else { continue };
+        let Some((fresh, final_output, returned, formals)) = resolve(callee) else { continue };
         let Some(signature) = body.sites.checked_call_signatures.get(&write.producer) else { continue };
         let [output] = signature.outputs.outputs.as_slice() else { continue };
-        if !same_runtime_array_type(&output.ty, &returned.ty) {
+        if !same_runtime_array_type(&output.ty, returned) {
             continue;
         }
+        let mut pair = LiteralArrayPair {
+            caller, callee, established_alternate: None, original, fresh, final_output, write, exit, block, unit,
+        };
+        let parameters = LiteralArrayParameters {
+            caller: &body.sites.boundary.parameters, callee: formals, signature: &signature.parameters,
+        };
         if let Some(other) = unit.and_then(|unit| unit.other_write) {
             let Some(other_signature) = body.sites.checked_call_signatures.get(&other.producer) else { continue };
             let [other_output] = other_signature.outputs.outputs.as_slice() else { continue };
-            if target_body(declarations, body.cfg, other.rhs) != Some(callee)
-                || other_signature.parameters != signature.parameters
+            if other_signature.parameters != signature.parameters
                 || !same_runtime_array_type(&other_output.ty, &output.ty)
             {
                 continue;
             }
+            let Some(other_callee) = target_body(declarations, body.cfg, other.rhs) else { continue };
+            if other_callee != callee {
+                let Some((allocation, output, other_returned, other_formals)) =
+                    resolve(other_callee) else { continue };
+                if !same_runtime_array_type(&other_output.ty, other_returned)
+                    || !other_formals.iter().map(|slot| (slot.ordinal, &slot.ty))
+                        .eq(formals.iter().map(|slot| (slot.ordinal, &slot.ty)))
+                    || !matches!(fresh.extent, FreshArrayExtent::Literal(_))
+                    || fresh.extent != allocation.extent
+                {
+                    continue;
+                }
+                pair.established_alternate = Some((other_callee, allocation, output));
+                distinct.push((pair, parameters));
+                continue;
+            }
         }
-        enroll_literal_array_pair(result, LiteralArrayPair {
-            caller, callee, original, fresh, final_output, write, exit, block, unit,
-        }, LiteralArrayParameters {
-            caller: &body.sites.boundary.parameters,
-            callee: &leaf.sites.boundary.parameters,
-            signature: &signature.parameters,
-        });
+        enroll_literal_array_pair(result, pair, parameters);
+    }
+    // Existing candidates have first claim; distinct routes may reuse only
+    // their exact established producer plans and never write producer plans.
+    for (pair, parameters) in distinct {
+        enroll_literal_array_pair(result, pair, parameters);
     }
 }
 
@@ -3286,6 +3326,7 @@ mod tests {
         LiteralArrayPair {
             caller: (0, 0, None),
             callee: (0, 1, None),
+            established_alternate: None,
             original: allocation(2, 1, 3),
             fresh: allocation(3, 2, 11),
             final_output: OccurrenceOrdinal(3),
@@ -3424,6 +3465,69 @@ mod tests {
         assert_eq!(result.bodies.len(), 3);
         assert_eq!(result.bodies[&next.caller].scope_exits, BTreeMap::from([(next.block.0, next.exit)]));
         assert_eq!(result.bodies[&pair.callee].literal_array, leaf);
+    }
+
+    #[test]
+    fn distinct_literal_array_preflight_reuses_both_established_leaves() {
+        let mut pair = synthetic_literal_array_pair();
+        let parameters = LiteralArrayParameters::default();
+        let alternate = (0, 2, None);
+        let mut alternate_allocation = pair.fresh;
+        alternate_allocation.bind = CfgPointId(4);
+        let alternate_output = OccurrenceOrdinal(12);
+        pair.established_alternate = Some((alternate, alternate_allocation, alternate_output));
+        pair.unit = Some(LiteralArrayUnit {
+            expression: OccurrenceOrdinal(4), condition: CfgPointId(4), operands: None, branch: CfgPointId(5),
+            writer_side: ArrayWriterSide::Then, writer_entry: CfgPointId(6), writer_exit: CfgPointId(9),
+            writer_block: BlockOrdinal(1), writer_scope: ReferenceScopeId(1),
+            retained: Some(LiteralArrayRetained {
+                entry: CfgPointId(10), exit: CfgPointId(13), block: BlockOrdinal(2), scope: ReferenceScopeId(2),
+            }),
+            other_write: Some(LiteralArrayWrite {
+                rhs: CfgPointId(11), writer: CfgPointId(12), producer: OccurrenceOrdinal(7),
+                destination: OccurrenceOrdinal(8), argument: None,
+            }),
+            join: CfgPointId(14),
+        });
+        pair.write.rhs = CfgPointId(7);
+        pair.write.writer = CfgPointId(8);
+        pair.exit = CfgPointId(15);
+
+        let mut result = ClosedAggregates::default();
+        enroll_literal_array_pair(&mut result, pair, parameters);
+        assert!(result.bodies.is_empty());
+        let primary_seed = LiteralArrayPair { caller: (0, 3, None), established_alternate: None, unit: None, ..pair };
+        enroll_literal_array_pair(&mut result, primary_seed, parameters);
+        enroll_literal_array_pair(&mut result, pair, parameters);
+        assert_eq!(result.bodies.len(), 2);
+        assert!(!result.bodies.contains_key(&pair.caller) && !result.bodies.contains_key(&alternate));
+
+        let mut alternate_seed = LiteralArrayPair {
+            caller: (0, 4, None), callee: alternate, fresh: alternate_allocation, final_output: alternate_output,
+            ..primary_seed
+        };
+        alternate_seed.fresh.extent = FreshArrayExtent::Literal(12);
+        let incompatible = preflight_literal_array_pair(&result, alternate_seed, parameters).unwrap().new_leaf.unwrap().1;
+        result.bodies.entry(alternate).or_default().literal_array = Some(incompatible);
+        enroll_literal_array_pair(&mut result, pair, parameters);
+        assert_eq!(result.bodies.len(), 3);
+        assert!(!result.bodies.contains_key(&pair.caller));
+        assert_eq!(result.bodies[&alternate].literal_array, Some(incompatible));
+
+        result.bodies.remove(&alternate);
+        alternate_seed.fresh = alternate_allocation;
+        enroll_literal_array_pair(&mut result, alternate_seed, parameters);
+        let primary_plan = result.bodies[&pair.callee].literal_array;
+        let alternate_plan = result.bodies[&alternate].literal_array;
+        let prepared = preflight_literal_array_pair(&result, pair, parameters).expect("both exact leaves");
+        assert!(prepared.new_leaf.is_none());
+        enroll_literal_array_pair(&mut result, pair, parameters);
+        assert_eq!(result.bodies.len(), 5);
+        assert_eq!(result.bodies[&pair.callee].literal_array, primary_plan);
+        assert_eq!(result.bodies[&alternate].literal_array, alternate_plan);
+        let caller = &result.bodies[&pair.caller];
+        assert_eq!(caller.scope_exits, BTreeMap::from([(pair.block.0, pair.exit)]));
+        assert!(caller.releases.is_empty() && caller.input_release.is_none());
     }
 
     #[test]
