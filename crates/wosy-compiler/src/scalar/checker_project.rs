@@ -28,7 +28,7 @@ use super::{
     },
 };
 #[cfg(feature = "internal-checker")]
-use super::{checker_flow::{holds_actual_mixed_entry, evaluate_borrowed_return_proof, evaluate_mixed_entry_output, observe_authored_show_returns, integer_predicate_implies, observe_arbitrary_integer_returns, observe_unused_module_proof_returns, ActualFlatShow, GuardedOutputClaims, ImmutableEntryRange, ImmutableProofOutputComparison, IntegerShowOutput}, symbolic_integer::IntegerShowConstraints, typecheck::integer_bounds};
+use super::{checker_flow::{holds_actual_mixed_entry, evaluate_borrowed_return_proof, evaluate_mixed_entry_output, observe_authored_show_returns, integer_predicate_implies, observe_arbitrary_integer_returns, observe_unused_module_proof_returns, ActualFlatShow, GuardedOutputClaims, ImmutableEntryRange, ImmutableProofOutputComparison, IntegerShowOutput}, symbolic_integer::{IntegerShowConstraints, OwnedIntegerUnion}, typecheck::integer_bounds};
 use crate::Diagnostic;
 use wosy_syntax::SourceIdentity;
 use wosy_syntax::{CanonicalCstRoot, CstNode, CstToken, SyntaxKind};
@@ -3764,13 +3764,12 @@ fn typed_named_repeated_universal(
     }
     let mut relations = vec![None::<IntegerRelation>; declarations.len()];
     let mut output_bounds = IntegerShowConstraints::default();
+    let mut has_output_bounds = false;
     visit_output_conjuncts(ensures, |atom| {
         if let ScalarExpression::Binary { operator, left, right, .. } = atom {
             if let ScalarExpression::Name { name, .. } = right.as_ref() {
                 let slot = *names.get(name.as_str()).ok_or(ProjectCheck::Unsupported)?;
-                if !matches!(left.as_ref(), ScalarExpression::Name { name, .. } if name == output)
-                    || !matches!(operator, BinaryOperator::Less | BinaryOperator::LessEqual | BinaryOperator::Greater | BinaryOperator::GreaterEqual)
-                {
+                if !matches!(left.as_ref(), ScalarExpression::Name { name, .. } if name == output) {
                     return Err(ProjectCheck::Unsupported);
                 }
                 let relation = IntegerRelation::from_operator(operator).ok_or(ProjectCheck::Unsupported)?;
@@ -3780,31 +3779,48 @@ fn typed_named_repeated_universal(
         }
         let (relation, bound) = typed_output_atom(atom, output, inputs, ty)?;
         output_bounds.add(relation, Cow::Owned(bound));
+        has_output_bounds = true;
         Ok(())
     })?;
     let mut unavailable = false;
     let mut impossible = false;
+    let mut forbidden = OwnedIntegerUnion::default();
     for ((forall, binder), relation) in declarations.into_iter().zip(relations) {
         let domain = typed_quantifier_domain(&forall, &binder, inputs, ty)?;
         let (Some((minimum, maximum)), Some(relation)) = (domain.extremes(), relation) else {
             unavailable = true;
             continue;
         };
+        if unavailable || impossible {
+            continue;
+        }
         let lower = match (relation.accepts(Less), relation.accepts(Greater), relation.accepts(Equal)) {
             (true, false, _) => true,
             (false, true, _) => false,
             (false, false, true) if minimum == maximum => true,
             (false, false, _) => { impossible = true; continue; }
+            (true, true, false) => {
+                forbidden.push(domain);
+                continue;
+            }
             _ => return Err(ProjectCheck::Unsupported),
         };
         let bound = domain.into_extremum(lower).ok_or(ProjectCheck::Unsupported)?;
         output_bounds.add(relation, Cow::Owned(bound));
+        has_output_bounds = true;
     }
     if unavailable {
         return Err(ProjectCheck::Unsupported);
     }
     if impossible {
         return Ok(TypedProofGoal::UniversalConjunction(UniversalConjunction::Impossible));
+    }
+    if let Some(forbidden) = forbidden.finish() {
+        if !has_output_bounds {
+            return Ok(TypedProofGoal::UniversalNotEqual(forbidden));
+        }
+        output_bounds.normalize();
+        return Ok(TypedProofGoal::UniversalConjunction(UniversalConjunction::OutputAvoiding(Box::new((output_bounds, forbidden)))));
     }
     output_bounds.normalize();
     Ok(TypedProofGoal::UniversalConjunction(UniversalConjunction::Output(Box::new(output_bounds))))

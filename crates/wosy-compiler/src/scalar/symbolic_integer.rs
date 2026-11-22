@@ -17,6 +17,33 @@ fn overlapping_or_adjacent(first: &BigInt, last: &BigInt) -> bool {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub(super) struct IntegerSet(Vec<Interval>);
 
+#[cfg(feature = "internal-checker")]
+#[derive(Default)]
+pub(super) struct OwnedIntegerUnion {
+    intervals: Option<IntegerSet>,
+    needs_normalization: bool,
+}
+
+#[cfg(feature = "internal-checker")]
+impl OwnedIntegerUnion {
+    pub(super) fn push(&mut self, mut domain: IntegerSet) {
+        if let Some(current) = self.intervals.as_mut() {
+            current.0.append(&mut domain.0);
+            self.needs_normalization = true;
+        } else {
+            self.intervals = Some(domain);
+        }
+    }
+
+    pub(super) fn finish(self) -> Option<IntegerSet> {
+        let mut intervals = self.intervals?;
+        if self.needs_normalization {
+            IntegerSet::normalize_owned_intervals(&mut intervals.0);
+        }
+        Some(intervals)
+    }
+}
+
 #[derive(Debug, Eq, PartialEq)]
 pub(super) enum IntegerIntersection {
     Unchanged,
@@ -297,6 +324,12 @@ impl IntegerSet {
         for clause in clauses {
             Self::append_comparison_conjunction(&mut intervals, &minimum, &maximum, clause);
         }
+        Self::normalize_owned_intervals(&mut intervals);
+        Some(Self(intervals))
+    }
+
+    #[cfg(feature = "internal-checker")]
+    fn normalize_owned_intervals(intervals: &mut Vec<Interval>) {
         intervals.sort_unstable_by(|left, right| left.first.cmp(&right.first));
         intervals.dedup_by(|following, prior| {
             if following.last <= prior.last {
@@ -309,7 +342,6 @@ impl IntegerSet {
                 false
             }
         });
-        Some(Self(intervals))
     }
 
     #[cfg(feature = "internal-checker")]

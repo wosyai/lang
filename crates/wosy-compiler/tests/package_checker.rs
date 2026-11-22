@@ -2988,6 +2988,48 @@ fn named_repeated_forall_combines_independent_exact_domains_without_cross_binder
 }
 
 #[test]
+fn named_repeated_forall_folds_exact_equality_and_multiple_forbidden_domains() {
+    let identity = source();
+    let check = |foralls: &str, goal: &str, guard: &str, actual: &str| {
+        check_scalar_module_proof(
+            identity.clone(), "bounded",
+            vec![ScalarProofModuleInput {
+                source: identity.clone(),
+                text: format!(r#"%%start
+                    i16(i16) echo = fn(value) {{ value }};
+                    proof bounded for echo(input) -> (out) where ({guard}) {foralls}
+                        ensures ({goal}) {{}}
+                    {actual}
+                %%end"#),
+                namespaces: Vec::new(),
+            }],
+            vec![identity.clone()], ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
+        )
+    };
+    use ScalarModuleProofOutcome::{Invalid, NoApplicableInputs, Proved, Refuted, Unsupported};
+    let union = "forall (i16 a where a >= -8 && a <= -6 && a != -7) forall (i16 b where b >= -6 && b <= -4 && b != -5)";
+    let goal = "out != a && out != b && out >= -9 && out != -9";
+    assert_eq!(check(union, goal, "input >= -7 && input <= -5 && input != -6", ""), Proved);
+    assert_eq!(check(union, goal, "input >= -7 && input <= -5", ""), Refuted);
+    assert_eq!(check(union, goal, "true", "i16 a = echo(-7); i16 b = echo(-5);"), Proved);
+    assert_eq!(check(union, goal, "true", "i16 a = echo(-7); i16 b = echo(-4);"), Refuted);
+    assert_eq!(check(union, goal, "true", "i16 a = echo(-7); i16 b = echo(-9);"), Refuted);
+    assert_eq!(check(union, "out != a && out != b", "input == -9", ""), Proved);
+    assert_eq!(check(union, "out == a && out != b", "input == -8", ""), Refuted);
+    assert_eq!(check("forall (i16 a where a == -7) forall (i16 b where b == -5)",
+        "out == a && out != b", "input == -7", ""), Proved);
+    assert_eq!(check("forall (i16 a where a == -7) forall (i16 b where b == -7)",
+        "out == a && out != b", "input == -7", ""), Refuted);
+    assert_eq!(check(union, "out <= a && out != a && out != b", "input == -9", ""), Proved);
+    assert_eq!(check(union, "out <= a && out != a && out != b", "input == -8", ""), Refuted);
+    assert_eq!(check(union, "out == a && out != b", "false", ""), NoApplicableInputs);
+    assert_eq!(check("forall (i16 a where a >= -8) forall (i16 b where false)",
+        "out == a && out != b", "true", ""), Unsupported);
+    assert!(matches!(check("forall (i16 a where a >= -8) forall (i16 b where b <= 32768)",
+        "out == a && out != b", "true", ""), Invalid(_)));
+}
+
+#[test]
 fn named_universal_proof_reduces_exact_typed_domains_on_shared_actual_and_unused_returns() {
     let identity = source();
     let check = |quantifiers: &str, goal: &str, guard: &str, actual: &str| {
