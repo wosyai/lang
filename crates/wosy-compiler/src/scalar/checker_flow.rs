@@ -264,6 +264,119 @@ pub(super) struct SymbolicLiteralFailure<'a> {
 }
 
 #[cfg(feature = "internal-checker")]
+impl<'a> SymbolicLiteralFailure<'a> {
+    fn from_row(
+        slot: FinalOutputSlot, roots: &IntegerRoots<'a>, row: &IntegerRow, axis: Option<usize>,
+        returned: Cow<'_, BigInt>, entry: Option<(usize, &BigInt)>,
+    ) -> Self {
+        let mut state = row[..roots.parameters].to_vec();
+        if let Some((axis, value)) = entry {
+            state[axis] = Rc::new(IntegerSet::singleton(value));
+        }
+        if let Some(axis) = axis {
+            state[axis] = Rc::new(IntegerSet::singleton(returned.as_ref()));
+        }
+        Self { output: slot.span, returned: returned.into_owned(), state: IntegerInputs(vec![state]),
+            axes: roots.axes[..roots.parameters].to_vec() }
+    }
+}
+
+#[cfg(feature = "internal-checker")]
+fn symbolic_return_axis(value: IntegerReturn<'_>, roots: &IntegerRoots<'_>) -> Option<Option<usize>> {
+    match value {
+        IntegerReturn::Const(_) => Some(None),
+        IntegerReturn::Alias(binding) => {
+            let (axis, _) = roots.lookup(binding)?;
+            (axis < roots.parameters).then_some(Some(axis))
+        }
+    }
+}
+
+#[cfg(feature = "internal-checker")]
+pub(super) struct SymbolicLiteralCheck<'a, 'body> {
+    pub(super) relation: IntegerRelation,
+    pub(super) bound: &'a BigInt,
+    pub(super) failure: Option<SymbolicLiteralFailure<'body>>,
+}
+
+#[cfg(feature = "internal-checker")]
+struct BatchedLiteralEvidence<'a, 'body, 'observation> {
+    returned: bool,
+    pending: usize,
+    checks: &'observation mut [SymbolicLiteralCheck<'a, 'body>],
+}
+
+#[cfg(feature = "internal-checker")]
+#[derive(Clone, Copy)]
+struct OrderedRootLiteralProofs<'a, 'bound, 'checks, 'observation> {
+    conditions: OrderedRootConditions<'a>,
+    observed: &'observation std::cell::RefCell<BatchedLiteralEvidence<'bound, 'a, 'checks>>,
+}
+
+#[cfg(feature = "internal-checker")]
+impl<'a> ScopedAuthoredReturn<'a> for OrderedRootLiteralProofs<'a, '_, '_, '_> {
+    const ENABLED: bool = false;
+    const OBSERVE_RETURN: bool = true;
+
+    fn at(
+        self, _: &FunctionCallSites, _: BlockOrdinal, _: FinalOutputSlot, _: &ScalarType,
+        _: &IntegerRoots<'_>, _: &IntegerInputs,
+    ) -> Option<&'a BigInt> {
+        None
+    }
+
+    fn split_unprepared(
+        self, calls: &FunctionCallSites, slot: RootBranchSlot, roots: &IntegerRoots<'_>, path: IntegerInputs,
+    ) -> Option<(IntegerInputs, IntegerInputs, Option<usize>)> {
+        self.conditions.split_unprepared(calls, slot, roots, path)
+    }
+
+    fn observe_return(
+        self, slot: FinalOutputSlot, value: IntegerReturn<'a>, roots: &IntegerRoots<'a>, path: &IntegerInputs,
+    ) -> Option<()> {
+        let axis = symbolic_return_axis(value, roots)?;
+        let mut observed = self.observed.borrow_mut();
+        observed.returned = true;
+        let BatchedLiteralEvidence { pending, checks, .. } = &mut *observed;
+        if *pending == 0 {
+            return Some(());
+        }
+        for row in &path.0 {
+            let (domain, low, high) = match value {
+                IntegerReturn::Const(value) => (None, value, value),
+                IntegerReturn::Alias(_) => {
+                    let domain = row.get(axis?)?;
+                    let (low, high) = domain.extremes()?;
+                    (Some(domain), low, high)
+                }
+            };
+            for check in checks.iter_mut().filter(|check| check.failure.is_none()) {
+                let rejected = check.relation.complement();
+                let witness = if rejected.accepts(low.cmp(check.bound)) {
+                    Some(low)
+                } else if rejected.accepts(high.cmp(check.bound)) {
+                    Some(high)
+                } else if rejected.accepts(std::cmp::Ordering::Equal) && domain.is_some_and(|domain|
+                    low < check.bound && check.bound < high && domain.covers_closed(check.bound, check.bound))
+                {
+                    Some(check.bound)
+                } else {
+                    None
+                };
+                if let Some(witness) = witness {
+                    check.failure = Some(SymbolicLiteralFailure::from_row(slot, roots, row, axis, Cow::Borrowed(witness), None));
+                    *pending -= 1;
+                }
+            }
+            if *pending == 0 || axis.is_none() {
+                break;
+            }
+        }
+        Some(())
+    }
+}
+
+#[cfg(feature = "internal-checker")]
 struct LiteralGuardAtReturn<'a> {
     axis: usize,
     relation: IntegerRelation,
@@ -302,16 +415,7 @@ impl<'a> ScopedAuthoredReturn<'a> for OrderedRootLiteralProof<'a, '_> {
     fn observe_return(
         self, slot: FinalOutputSlot, value: IntegerReturn<'a>, roots: &IntegerRoots<'a>, path: &IntegerInputs,
     ) -> Option<()> {
-        let axis = match value {
-            IntegerReturn::Const(_) => None,
-            IntegerReturn::Alias(binding) => {
-                let (axis, _) = roots.lookup(binding)?;
-                if axis >= roots.parameters {
-                    return None;
-                }
-                Some(axis)
-            }
-        };
+        let axis = symbolic_return_axis(value, roots)?;
         let mut observed = self.observed.borrow_mut();
         if observed.1.is_some() {
             return Some(());
@@ -354,17 +458,7 @@ impl<'a> ScopedAuthoredReturn<'a> for OrderedRootLiteralProof<'a, '_> {
         }
         observed.0 |= applicable;
         if let Some((row, returned, entry)) = failing {
-            let mut state = row[..roots.parameters].to_vec();
-            if let Some((axis, value)) = entry {
-                state[axis] = Rc::new(IntegerSet::singleton(value));
-            }
-            if let Some(axis) = axis {
-                state[axis] = Rc::new(IntegerSet::singleton(returned.as_ref()));
-            }
-            observed.1 = Some(SymbolicLiteralFailure {
-                output: slot.span, returned: returned.into_owned(), state: IntegerInputs(vec![state]),
-                axes: roots.axes[..roots.parameters].to_vec(),
-            });
+            observed.1 = Some(SymbolicLiteralFailure::from_row(slot, roots, row, axis, returned, entry));
         }
         Some(())
     }
@@ -1831,6 +1925,21 @@ pub(super) fn collect_ordered_root_literal_proof<'a>(
     )?;
     let (returned, failure) = observed.into_inner();
     Some((active, failures, returned, failure))
+}
+
+#[cfg(feature = "internal-checker")]
+pub(super) fn collect_ordered_root_literal_proofs<'a>(
+    calls: &'a FunctionCallSites, body: &'a super::ScalarBlock,
+    checks: &mut [SymbolicLiteralCheck<'_, 'a>],
+) -> Option<(bool, Vec<IntegerCheckFailure<'a>>, bool)> {
+    let observed = std::cell::RefCell::new(BatchedLiteralEvidence { returned: false, pending: checks.len(), checks });
+    let mut failures = Vec::new();
+    let mut sink = |failure| failures.push(failure);
+    let (active, _) = collect_integer_requirement_failures_in_scope(
+        calls, IntegerRequirementEntry::Arbitrary, None, false, &mut sink,
+        OrderedRootLiteralProofs { conditions: OrderedRootConditions(body), observed: &observed },
+    )?;
+    Some((active, failures, observed.into_inner().returned))
 }
 
 fn collect_integer_requirement_failures_in_scope<'a, Scoped: ScopedAuthoredReturn<'a>>(

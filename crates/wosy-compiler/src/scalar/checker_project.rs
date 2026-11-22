@@ -1952,6 +1952,7 @@ struct MainFlowProofReceipt {
     directives: Vec<ScalarOrderedCheckerFailure>,
     diagnostics: Vec<MainFlowProofDiagnostic>,
     symbolic_diagnostic: Option<SymbolicProofDiagnostic>,
+    additional_symbolic_diagnostics: Vec<SymbolicProofDiagnostic>,
 }
 
 #[cfg(feature = "internal-checker")]
@@ -1984,19 +1985,43 @@ struct SymbolicProofDiagnostic {
 }
 
 #[cfg(feature = "internal-checker")]
-struct SelectedSymbolicProof<'a> {
+struct SelectedSymbolicProof<'a, 'case> {
     target: PreparedCallable,
-    source: &'a SourceIdentity,
-    proof: ByteSpan,
-    goal: ByteSpan,
-    relation: IntegerRelation,
-    bound: &'a BigInt,
+    first: &'case MainFlowProofCase<'a>,
+    rest: &'case [MainFlowProofCase<'a>],
     failure: Option<SymbolicProofDiagnostic>,
+    additional_failures: Vec<SymbolicProofDiagnostic>,
     predicate: Option<&'a super::checker_flow::IntegerPredicate>,
 }
 
 #[cfg(feature = "internal-checker")]
-impl SymbolicRootProof for SelectedSymbolicProof<'_> {
+impl SelectedSymbolicProof<'_, '_> {
+    fn record(
+        &mut self, proof: &MainFlowProofCase<'_>, function: &ScalarFunction, source: &SourceIdentity,
+        position: usize, failure: super::checker_flow::SymbolicLiteralFailure<'_>,
+    ) {
+        let proof_span = |range| wosy_syntax::SourceSpan { source: proof.proof_source.clone(), range };
+        let callable_span = |range| wosy_syntax::SourceSpan { source: source.clone(), range };
+        let diagnostic = SymbolicProofDiagnostic {
+            proof: proof_span(proof.proof), goal: proof_span(proof.goal),
+            callable: callable_span(function.name_span), output: callable_span(failure.output),
+            directive_position: position,
+            witness: ScalarCheckerIntegerWitness {
+                axes: failure.axes.into_iter().map(|(binding, ty)| (binding.clone(), ty.clone())).collect(),
+                state: failure.state,
+            },
+            returned: failure.returned,
+        };
+        if self.failure.is_none() {
+            self.failure = Some(diagnostic);
+        } else {
+            self.additional_failures.push(diagnostic);
+        }
+    }
+}
+
+#[cfg(feature = "internal-checker")]
+impl SymbolicRootProof for SelectedSymbolicProof<'_, '_> {
     const ENABLED: bool = true;
 
     fn target(&self) -> Option<PreparedCallable> {
@@ -2012,25 +2037,34 @@ impl SymbolicRootProof for SelectedSymbolicProof<'_> {
         {
             return Err(ProjectCheck::Unsupported);
         }
-        let (active, directives, returned, failure) = super::checker_flow::collect_ordered_root_literal_proof(
-            calls, &function.body, self.relation, self.bound, self.predicate,
+        let first = self.first;
+        if self.rest.is_empty() {
+            let (active, directives, returned, failure) = super::checker_flow::collect_ordered_root_literal_proof(
+                calls, &function.body, first.relation, first.bound, self.predicate,
+            ).ok_or(ProjectCheck::Unsupported)?;
+            for directive in directives {
+                effects.push_callable(calls, source, directive);
+            }
+            if let Some(failure) = failure {
+                self.record(first, function, source, effects.records.len(), failure);
+            }
+            return Ok(active || returned);
+        }
+        let proofs = std::iter::once(first).chain(self.rest);
+        let mut checks = proofs.clone().map(|proof| super::checker_flow::SymbolicLiteralCheck {
+            relation: proof.relation, bound: proof.bound, failure: None,
+        }).collect::<Vec<_>>();
+        let (active, directives, returned) = super::checker_flow::collect_ordered_root_literal_proofs(
+            calls, &function.body, &mut checks,
         ).ok_or(ProjectCheck::Unsupported)?;
         for directive in directives {
             effects.push_callable(calls, source, directive);
         }
-        if let Some(failure) = failure {
-            let proof_span = |range| wosy_syntax::SourceSpan { source: self.source.clone(), range };
-            let callable_span = |range| wosy_syntax::SourceSpan { source: source.clone(), range };
-            self.failure = Some(SymbolicProofDiagnostic {
-                proof: proof_span(self.proof), goal: proof_span(self.goal),
-                callable: callable_span(function.name_span), output: callable_span(failure.output),
-                directive_position: effects.records.len(),
-                witness: ScalarCheckerIntegerWitness {
-                    axes: failure.axes.into_iter().map(|(binding, ty)| (binding.clone(), ty.clone())).collect(),
-                    state: failure.state,
-                },
-                returned: failure.returned,
-            });
+        let position = effects.records.len();
+        for (proof, check) in proofs.zip(checks) {
+            if let Some(failure) = check.failure {
+                self.record(proof, function, source, position, failure);
+            }
         }
         Ok(active || returned)
     }
@@ -2200,7 +2234,7 @@ fn check_loaded_ordered_proof_diagnostics(
             declarations, initialization_order, Vec::new(), inputs, scope,
         )?;
         let (active, directives) = collect_ordered_checker_records(&prepared, scope, startup_count)?;
-        return Ok(MainFlowProofReceipt { active, directives, diagnostics: Vec::new(), symbolic_diagnostic: None });
+        return Ok(MainFlowProofReceipt { active, directives, diagnostics: Vec::new(), symbolic_diagnostic: None, additional_symbolic_diagnostics: Vec::new() });
     }
     let prepared = prepare_loaded_proof_project(declarations, proofs, initialization_order, inputs)?;
     if prepared.proofs.iter().any(|(source, catalog)| source != &prepared.source && !catalog.definitions.is_empty()) {
@@ -2213,7 +2247,7 @@ fn check_loaded_ordered_proof_diagnostics(
         let (active, directives) = collect_ordered_checker_records(
             &prepared.prepared, scope, startup_count,
         )?;
-        return Ok(MainFlowProofReceipt { active, directives, diagnostics: Vec::new(), symbolic_diagnostic: None });
+        return Ok(MainFlowProofReceipt { active, directives, diagnostics: Vec::new(), symbolic_diagnostic: None, additional_symbolic_diagnostics: Vec::new() });
     };
     let first_name = module_proof_name(first).ok_or(ProjectCheck::InvalidProof)?;
     let rest_names = rest.iter().map(|definition| module_proof_name(definition).ok_or(ProjectCheck::InvalidProof))
@@ -2232,20 +2266,17 @@ fn check_loaded_ordered_proof_diagnostics(
         prepared.plan_resolved_module_proof::<false, false, false>(proof_source, name.text(), selected)
     }).collect::<Result<Vec<_>, _>>()?;
     let first_case = MainFlowProofCase::prepare(&first_plan, &prepared.source)?;
-    let mut symbolic = if scope == ScalarCheckerScope::CurrentPackage {
-        if !others.is_empty() {
-            return Err(ProjectCheck::Unsupported);
-        }
+    let symbolic_predicate = if scope == ScalarCheckerScope::CurrentPackage {
+        let tautological = |predicates: &[CheckerPredicate]| predicates.iter()
+            .all(|predicate| matches!(predicate, CheckerPredicate::Boolean(true)));
         let predicate = match first_plan.filter.as_deref().unwrap_or_default() {
-            [CheckerPredicate::Integer(predicate)] => Some(predicate),
-            predicates if predicates.iter().all(|predicate| matches!(predicate, CheckerPredicate::Boolean(true))) => None,
+            [CheckerPredicate::Integer(predicate)] if others.is_empty() => Some(predicate),
+            predicates if tautological(predicates) && others.iter().all(|plan| {
+                plan.target == first_plan.target && tautological(plan.filter.as_deref().unwrap_or_default())
+            }) => None,
             _ => return Err(ProjectCheck::Unsupported),
         };
-        Some(SelectedSymbolicProof {
-            target: first_plan.target, source: first_case.proof_source,
-            proof: first_case.proof, goal: first_case.goal, relation: first_case.relation,
-            bound: first_case.bound, failure: None, predicate,
-        })
+        Some(predicate)
     } else {
         None
     };
@@ -2262,18 +2293,22 @@ fn check_loaded_ordered_proof_diagnostics(
         return Err(ProjectCheck::Unsupported);
     }
     let mut active = initialization.had_obligations || observer.active;
-    let symbolic_diagnostic = if let Some(proof) = symbolic.as_mut() {
+    let (symbolic_diagnostic, additional_symbolic_diagnostics) = if let Some(predicate) = symbolic_predicate {
+        let mut proof = SelectedSymbolicProof {
+            target: first_plan.target, first: &observer.first.1.first, rest: &observer.first.1.rest,
+            failure: None, additional_failures: Vec::new(), predicate,
+        };
         let startup_count = prepared.prepared.parts().0.modules.len();
         let (_, authored_roots) = package_obligation_roots(&prepared.prepared, scope, startup_count, root)?;
         active |= check_package_symbolic_roots::<true, _>(
-            &prepared.prepared, startup_count, root, initialization, authored_roots, Some(&mut effects), proof,
+            &prepared.prepared, startup_count, root, initialization, authored_roots, Some(&mut effects), &mut proof,
         )?;
-        proof.failure.take()
+        (proof.failure, proof.additional_failures)
     } else {
-        None
+        (None, Vec::new())
     };
     Ok(MainFlowProofReceipt {
-        active, directives: effects.records, diagnostics: observer.diagnostics, symbolic_diagnostic,
+        active, directives: effects.records, diagnostics: observer.diagnostics, symbolic_diagnostic, additional_symbolic_diagnostics,
     })
 }
 
@@ -6797,6 +6832,52 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
         assert_eq!(exact.returned, BigInt::from(1000));
         assert_eq!(intervals(&exact.witness, 0), [(BigInt::from(1), BigInt::from(1))]);
         assert_eq!(intervals(&exact.witness, 1), [(BigInt::from(1000), BigInt::from(1000))]);
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordered_current_package_auto_proofs_share_unused_returns_in_declaration_order() {
+        let app = source("src/main.w", "ordered-automatic-proof-unused-group");
+        let run = |text: &str, scope| {
+            let (_, proof) = crate::parse_proof_source(app.clone(), text.to_owned(), &[])
+                .unwrap_or_else(|_| panic!("valid proof source"));
+            check_loaded_ordered_proof_diagnostics(
+                Vec::new(), vec![(proof, Vec::new())], vec![app.clone()], inputs(), scope,
+            )
+        };
+        let text = format!(r#"%%start
+            u8(u8) checked = fn(value) {{
+                core.narrow(value != 2, {OUTPUT});
+                core.require(value < 2, {OUTPUT});
+                value
+            }};
+            proof zeta for checked(entry) -> (out) ensures (out != 1) {{}}
+            proof gap for checked(entry) -> (out) where (true) ensures (out != 2) {{}}
+            proof alpha for checked(entry) -> (out) where (true && true) ensures (out != 3) {{}}
+        %%end"#);
+        let report = run(&text, ScalarCheckerScope::CurrentPackage).unwrap();
+        assert!(report.active && report.directives.len() == 1 && report.diagnostics.is_empty());
+        let first = report.symbolic_diagnostic.unwrap();
+        let [second] = report.additional_symbolic_diagnostics.as_slice() else { panic!("second failed goal"); };
+        let snippet = |span: ByteSpan| &text[span.start as usize..span.end as usize];
+        for (diagnostic, name, point) in [(&first, "proof zeta", 1), (second, "proof alpha", 3)] {
+            assert!(snippet(diagnostic.proof.range).starts_with(name));
+            assert_eq!(diagnostic.directive_position, 1);
+            assert_eq!(diagnostic.returned, BigInt::from(point));
+            let intervals = diagnostic.witness.intervals_at(0, 0).unwrap()
+                .map(|(first, last)| (first.clone(), last.clone())).collect::<Vec<_>>();
+            assert_eq!(intervals, [(BigInt::from(point), BigInt::from(point))]);
+        }
+        let actual_only = run(&text, ScalarCheckerScope::MainFlowOnly).unwrap();
+        assert!(!actual_only.active && actual_only.directives.is_empty() && actual_only.diagnostics.is_empty());
+        assert!(actual_only.symbolic_diagnostic.is_none() && actual_only.additional_symbolic_diagnostics.is_empty());
+        let mismatched = text.replace("where (true && true)", "where (entry != 0)");
+        assert!(matches!(run(&mismatched, ScalarCheckerScope::CurrentPackage), Err(ProjectCheck::Unsupported)));
+        let no_returns = text.replace("core.narrow(value != 2,", "core.narrow(false,");
+        let no_returns = run(&no_returns, ScalarCheckerScope::CurrentPackage).unwrap();
+        assert_eq!(no_returns.directives.len(), 1);
+        assert_eq!(no_returns.directives[0].operation, ScalarCheckerOperation::Narrow);
+        assert!(no_returns.symbolic_diagnostic.is_none() && no_returns.additional_symbolic_diagnostics.is_empty());
     }
 
     #[cfg(feature = "internal-checker")]
