@@ -145,3 +145,33 @@ run_runner = "wasm"
 
 [targets.initializer-wasm.profiles.dev]
 main_artifact = "main"
+
+[targets.checked-parse-native]
+root = "src/checked_parse.w"
+
+[targets.checked-parse-native.artifacts.main]
+artifact = "Main"
+
+[targets.checked-parse-native.artifacts.main.profiles.dev]
+backend = "llvm"
+output = "native"
+builder = "native"
+run_runner = "native"
+
+[targets.checked-parse-native.profiles.dev]
+main_artifact = "main"
+
+[targets.checked-parse-wasm]
+root = "src/checked_parse.w"
+
+[targets.checked-parse-wasm.artifacts.main]
+artifact = "Main"
+
+[targets.checked-parse-wasm.artifacts.main.profiles.dev]
+backend = "llvm"
+output = "wasm-wasip1"
+builder = "wasm"
+run_runner = "wasm"
+
+[targets.checked-parse-wasm.profiles.dev]
+main_artifact = "main"

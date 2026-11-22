@@ -32,6 +32,14 @@ exit = 0
 command = ["wosy", "build", "initializer-wasm"]
 exit = 0
 
+[[steps]]
+command = ["wosy", "build", "checked-parse-native"]
+exit = 0
+
+[[steps]]
+command = ["wosy", "build", "checked-parse-wasm"]
+exit = 0
+
 [[assert]]
 command = ["wosy", "run", "nested-native"]
 exit = 0
@@ -85,5 +93,19 @@ exact = true
 command = ["wosy", "run", "initializer-wasm"]
 exit = 0
 stdout = "expected/initializer.stdout"
+stderr = "expected/verified.stderr"
+exact = true
+
+[[assert]]
+command = ["wosy", "run", "checked-parse-native"]
+exit = 0
+stdout = "expected/named.stdout"
+stderr = "expected/verified.stderr"
+exact = true
+
+[[assert]]
+command = ["wosy", "run", "checked-parse-wasm"]
+exit = 0
+stdout = "expected/named.stdout"
 stderr = "expected/verified.stderr"
 exact = true

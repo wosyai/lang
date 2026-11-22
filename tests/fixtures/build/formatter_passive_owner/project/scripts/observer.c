@@ -60,11 +60,18 @@ static void announce_complete(void) {
 }
 
 void *__wrap___wosy_core_alloc(u64 size, u64 alignment) {
-    require(size == (stage == 30 ? 39u : 3u) && alignment == 1);
-    require(((stage == 0 || stage == 10 || stage == 22 || stage == 30) && allocations == 0 && live == 0)
-            || (stage == 11 && allocations == 1 && live == 1));
+    if (stage == 40) {
+        require(size == 24 && alignment == 1 && !allocations && !releases && !live);
+    } else if (stage == 41) {
+        require(size == 8 && alignment == 8 && allocations == 1);
+        require((releases == 0 && live == 1) || (releases == 1 && live == 0));
+    } else {
+        require(size == (stage == 30 ? 39u : 3u) && alignment == 1);
+        require(((stage == 0 || stage == 10 || stage == 22 || stage == 30) && allocations == 0 && live == 0)
+                || (stage == 11 && allocations == 1 && live == 1));
+    }
     word address = (word)__real___wosy_core_alloc(size, alignment);
-    require(address && (allocations == 0 || address != bases[0]));
+    require(address && (!(live & 1u) || address != bases[0]));
     bases[allocations] = address;
     live |= 1u << allocations;
     ++allocations;
@@ -78,6 +85,12 @@ void __wrap___wosy_core_free(void *address) {
         slot = 0;
     } else if (stage == 13) {
         require(allocations == 2 && releases == 0 && live == 3);
+        slot = 1;
+    } else if (stage == 41) {
+        require(releases == 0 && ((allocations == 1 && live == 1) || (allocations == 2 && live == 3)));
+        slot = 0;
+    } else if (stage == 43) {
+        require(allocations == 2 && releases == 1 && live == 2);
         slot = 1;
     } else if (stage == 23) {
         require(allocations == 1 && releases == 0 && live == 1);
@@ -118,7 +131,7 @@ int FD_WRITE(int fd, word iovec, int vectors, word count) {
 
 void CHECKPOINT(int mark) {
     switch (mark) {
-    case 0: case 10: case 20: case 30:
+    case 0: case 10: case 20: case 30: case 40:
         require(stage == -1 && !live && !allocations && !releases && !wrote && !wrote_static);
         break;
     case 1: case 2: case 3:
@@ -160,6 +173,20 @@ void CHECKPOINT(int mark) {
         break;
     case 31:
         require(stage == 30 && wrote && allocations == 1 && releases == 1 && !live);
+        break;
+    case 41: {
+        static const char formatted[] = "1.5000000000000000e0";
+        require(stage == 40 && allocations == 1 && releases == 0 && live == 1);
+        check_bytes(0, bases[0], sizeof(formatted) - 1, formatted, sizeof(formatted) - 1);
+        break;
+    }
+    case 42: case 43:
+        require(stage == mark - 1 && allocations == 2 && releases == 1 && live == 2);
+        require(*(const double *)bases[1] == 1.5);
+        break;
+    case 44: case 45:
+        require(stage == mark - 1 && allocations == 2 && releases == 2 && !live && !wrote);
+        if (mark == 45) announce_complete();
         break;
     default:
         require(0);

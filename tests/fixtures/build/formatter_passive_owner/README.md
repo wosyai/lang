@@ -22,3 +22,11 @@ The module initializer control binds the formatted `u128` at module
 scope, moves it into ordinary print, and then exits through the real host.
 It observes one 39-byte allocation, the seven output bytes at its original
 base, and one release before the explicit exit.
+
+The checked-consumer control passes the 20-byte rendering of `1.5`
+from its 24-byte buffer into ordinary parse, then reads the checked
+`f64` result. The original text allocation is released before parse
+returns to its caller. The separate checked value remains live through
+the read and is released at the caller's scope exit. The observer does
+not impose an order between the parser's allocation and text release
+inside parse, and distinguishes allocations even if an address is reused.
