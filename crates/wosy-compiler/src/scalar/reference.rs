@@ -6007,7 +6007,7 @@ fn keep_forward_point_in_place(
     incoming_states: usize,
 ) -> bool {
     ordinary_forward && incoming_states == 1
-        && matches!(kind, CfgPointKind::Call { .. } | CfgPointKind::Branch { .. })
+        && !matches!(kind, CfgPointKind::MoveThrough { .. } | CfgPointKind::DeferredMoveThrough { .. })
 }
 
 fn grouped_assignment_installs(
@@ -6349,7 +6349,8 @@ fn transfer_reference_facts(
     let aggregate_deadlines = aggregate.as_ref()
         .filter(|_| aggregate_expiry_allowed)
         .map(|(facts, _, _, _)| facts.value_deadlines(&last_use));
-    let mut observed = vec![None::<ReferenceFlowPoint>; cfg.points.len()];
+    let point_count = cfg.points.len();
+    let mut observed = None;
     let mut incoming = vec![Vec::<ReferenceEdgeState>::new(); cfg.points.len()];
     incoming[0].push(ReferenceEdgeState {
         aggregate: aggregate.as_ref().map(|(facts, _, _, _)| facts.entry_state()),
@@ -6386,6 +6387,11 @@ fn transfer_reference_facts(
             .and_then(|_| original_points[id.0].successors.iter().copied().min());
         let states = std::mem::take(&mut incoming[id.0]);
         let keep_in_place = keep_forward_point_in_place(&original_points[id.0].kind, ordinary_forward, states.len());
+        let mut snapshot = if keep_in_place {
+            None
+        } else {
+            Some(&mut observed.get_or_insert_with(|| vec![None::<ReferenceFlowPoint>; point_count])[id.0])
+        };
         if strictly_forward && states.len() == 1
             && matches!(&original_points[id.0].kind, CfgPointKind::MoveThrough { place, .. }
                 if !matches!(place, ScalarPlace::Dereference { .. }))
@@ -7696,7 +7702,7 @@ fn transfer_reference_facts(
             state
                 .point_values
                 .record(id, &point.possible_origins, &last_use);
-            if let Some(previous) = &mut observed[id.0] {
+            if let Some(previous) = snapshot.as_deref_mut().and_then(Option::as_mut) {
                 if let Some(origins) = &point.possible_origins {
                     previous
                         .possible_origins
@@ -7798,10 +7804,8 @@ fn transfer_reference_facts(
                         }
                     }
                 }
-            } else if !keep_in_place {
-                // One forward observation is already in cfg.points. Only
-                // mutable kinds can require rewriting in the final drain.
-                observed[id.0] = Some(point.clone());
+            } else if let Some(snapshot) = snapshot.as_deref_mut() {
+                *snapshot = Some(point.clone());
             }
             if let (Some(cutoff), Some(last_use), Some(flow)) =
                 (common_aggregate_cutoff, &aggregate_deadlines, &mut state.aggregate)
@@ -7868,7 +7872,7 @@ fn transfer_reference_facts(
             }
         }
     }
-    for (point, observed) in cfg.points.iter_mut().zip(observed) {
+    for (point, observed) in cfg.points.iter_mut().zip(observed.into_iter().flatten()) {
         let Some(mut observed) = observed else { continue };
         observed.kind = match observed.kind {
             CfgPointKind::MoveThrough { place, ty, mut candidates, .. }
@@ -11010,7 +11014,11 @@ fn contract_replay_reset_borrows_only_immutable_point_structure() {
     assert_eq!(live[0].successors.as_ptr(), allocation);
     assert!(live[0].possible_origins.is_none());
     live[0].kind = CfgPointKind::Evaluate(ScalarExpression::Boolean { value: false, span });
-    assert!(!keep_forward_point_in_place(&live[0].kind, true, 1));
+    assert!(keep_forward_point_in_place(&live[0].kind, true, 1));
+    assert!(!keep_forward_point_in_place(&CfgPointKind::MoveThrough {
+        place: ScalarPlace::Name { name: String::new(), span },
+        ty: ScalarType::U64, pointer_point: CfgPointId(0), candidates: Vec::new(),
+    }, true, 1));
     reset_contract_replay_points(&mut live, &pristine, true);
     assert!(matches!(&live[0].kind, CfgPointKind::Branch { condition: ScalarExpression::Boolean { value: true, .. } }));
     live.push(point(CfgPointKind::ScopeExit));
