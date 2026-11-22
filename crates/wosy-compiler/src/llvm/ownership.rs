@@ -809,6 +809,9 @@ pub(super) fn transfer_runtime_array_return(
         }
         return;
     }
+    if super::aggregate_transfer::literal_array_leaf_return(state) {
+        return;
+    }
     if let ScalarExpression::Name { name, .. } = expression {
         state.runtime_array_owners.insert(name.clone(), false);
     }

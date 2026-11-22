@@ -3260,6 +3260,47 @@ impl<'a> ReferenceFlowBuilder<'a> {
         }
     }
 
+    fn observe_literal_array_bind(
+        &mut self,
+        position: BlockPosition,
+        scope: ReferenceScopeId,
+        binding: &ScalarBinding,
+        initialization: &BindingInitialization,
+        initializer: Option<CfgPointId>,
+    ) {
+        if scope != ReferenceScopeId(0) || position.item != 0
+            || !self.call_sites.boundary.parameters.is_empty()
+            || !matches!(self.call_sites.named_place_roots, NamedPlaceRootFacts::Prepared(_))
+        {
+            return;
+        }
+        let BindingInitialization::Allocation { lengths } = initialization else { return };
+        let [length] = lengths.as_slice() else { return };
+        let [receiver] = binding.receivers.as_slice() else { return };
+        if length.position != 0
+            || !matches!(receiver.ty, ScalarType::RuntimeArray { .. })
+            || !matches!(self.call_sites.structure.checked_types.expressions.get(&length.expression),
+                Some(ScalarType::U64))
+        {
+            return;
+        }
+        let Some(ScalarExpression::Integer { value, .. }) = receiver.allocation_length.as_ref() else {
+            return;
+        };
+        let Ok(elements) = u64::try_from(value.clone()) else { return };
+        let (Some(bind), Some(placeholder)) = (self.cursor, initializer) else { return };
+        if !self.aggregate_facts.allocation_slots.contains_key(&bind) {
+            return;
+        }
+        self.aggregate_facts.literal_array_bind = Some(aggregate::LiteralArrayBind {
+            bind,
+            placeholder,
+            position,
+            length_occurrence: length.expression,
+            elements,
+        });
+    }
+
     fn record_frozen_install(&mut self, destination: OccurrenceOrdinal, rhs: CfgPointId) {
         if self.capture_call_points {
             let install = self.cursor.expect("existing assignment install point");
@@ -3532,6 +3573,14 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         );
                     }
                     self.record_binding_definition(position, 0, binding.is_allocation, initializer);
+                    if binding.is_allocation && region.items.len() == 2
+                        && matches!(calls.boundary.root_outputs.as_slice(),
+                            [] | [RootOutputType { output: 0, ty: ScalarType::RuntimeArray { .. } }])
+                    {
+                        self.observe_literal_array_bind(
+                            position, scope, binding, &binding_region.initialization, initializer,
+                        );
+                    }
                     declared.push((receiver.name.clone(), id, old));
                     self.additional_receivers(
                         binding,
@@ -3574,6 +3623,11 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     let value_point = self.cursor.expect("evaluated output expression");
                     self.move_value(expression, scope, ordinal)?;
                     if let BlockItemKind::FinalOutput(slot) = kind {
+                        if scope == ReferenceScopeId(0) && slot.output == 0
+                            && self.aggregate_facts.literal_array_bind.is_some()
+                        {
+                            self.aggregate_facts.literal_array_value = Some((value_point, slot.expression));
+                        }
                         if scope == ReferenceScopeId(0) && slot.output == 0
                             && self.aggregate_facts.array_formal.is_some()
                         {
@@ -3647,7 +3701,8 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     for ((slot, (value, rhs_point)), destination) in
                         group.installs().zip(values).zip(destinations)
                     {
-                        simple_destinations &= matches!(&destination, ReferenceAssignmentDestination::PreparedName(DirectDestinationIdentity::Existing(_)));
+                        let existing_prepared = matches!(&destination, ReferenceAssignmentDestination::PreparedName(DirectDestinationIdentity::Existing(_)));
+                        simple_destinations &= existing_prepared;
                         let position = slot.position;
                         let target = &assignment.targets[position];
                         if matches!(&destination,
@@ -3868,6 +3923,20 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             array_rebind = Some((install, slot.destination));
                         }
                         self.record_frozen_install(slot.destination, rhs_point);
+                        if scope == ReferenceScopeId(0) && item_index == 1 && existing_prepared
+                            && position == 0 && assignment.targets.len() == 1 && assignment.values.len() == 1
+                            && self.aggregate_facts.literal_array_bind.is_some()
+                            && matches!(output_types[position], ScalarType::RuntimeArray { .. })
+                        {
+                            if let Some(evaluation) = group.rhs_evaluations().next() {
+                                self.aggregate_facts.literal_array_write = Some(aggregate::LiteralArrayWrite {
+                                    rhs: rhs_point,
+                                    writer: install,
+                                    producer: evaluation.expression,
+                                    destination: slot.destination,
+                                });
+                            }
+                        }
                         if let Some(capture) = capture.filter(|_| {
                             self.capture_call_points && scope == ReferenceScopeId(0)
                                 && assignment.values.len() == 1

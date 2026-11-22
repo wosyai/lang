@@ -1,5 +1,5 @@
 use super::*;
-use crate::scalar::{ClosedBody, ClosedCall, ClosedInitializer, ClosedInitializerInput, ClosedInput, ClosedLocalArrayRelease, ClosedReturn, ConcreteCallSelection, ScalarBinding};
+use crate::scalar::{ClosedBody, ClosedCall, ClosedInitializer, ClosedInitializerInput, ClosedInput, ClosedLiteralArray, ClosedLocalArrayRelease, ClosedReturn, ConcreteCallSelection, ScalarBinding};
 use inkwell::types::AnyType;
 
 pub(super) struct InitializerEmitter<'ctx, 'plan> {
@@ -60,12 +60,23 @@ struct PendingLocalArrayRelease<'ctx> {
     owner: String,
 }
 
+enum LiteralArrayReceipt<'ctx> {
+    Awaiting,
+    Original {
+        base: PointerValue<'ctx>,
+        storage: Option<(PointerValue<'ctx>, PointerValue<'ctx>)>,
+    },
+    Fresh(PointerValue<'ctx>),
+    Finished,
+}
+
 pub(super) struct AggregateEmitter<'ctx, 'plan> {
     plan: &'plan ClosedBody,
     destination: Option<PointerValue<'ctx>>,
     ordinary_destination: Option<PointerValue<'ctx>>,
     ordinary_committed: bool,
     ordinary_called: bool,
+    literal_array_receipt: LiteralArrayReceipt<'ctx>,
     base: Option<PointerValue<'ctx>>,
     registered_allocation: Option<String>,
     failure_site: Option<ClosedLocalArrayRelease>,
@@ -85,6 +96,13 @@ pub(super) struct AggregateEmitter<'ctx, 'plan> {
 }
 
 impl<'ctx, 'plan> AggregateEmitter<'ctx, 'plan> {
+    pub(super) fn literal_array_replacement(&self, ordinal: usize) -> Option<usize> {
+        match self.plan.literal_array? {
+            ClosedLiteralArray::Replacement { call, destination, .. } if call == ordinal => Some(destination),
+            _ => None,
+        }
+    }
+
     pub(super) fn same_array_rebind_destination(&self, ordinal: usize) -> Option<usize> {
         self.plan.same_array_rebinds.get(&ordinal).copied()
     }
@@ -148,6 +166,7 @@ impl<'ctx, 'plan> AggregateEmitter<'ctx, 'plan> {
             ordinary_destination,
             ordinary_committed: false,
             ordinary_called: false,
+            literal_array_receipt: LiteralArrayReceipt::Awaiting,
             base: None,
             registered_allocation: None,
             failure_site,
@@ -243,6 +262,79 @@ pub(super) fn definition_type<'ctx>(
         .collect::<Result<Vec<BasicMetadataTypeEnum<'ctx>>, _>>()?;
     arguments.push(pointer.into());
     Ok(pointer.fn_type(&arguments, false))
+}
+
+pub(super) fn has_literal_array_plan(state: &EmitState<'_, '_>) -> bool {
+    state.aggregate.as_ref().is_some_and(|aggregate| aggregate.plan.literal_array.is_some())
+}
+
+pub(super) fn enroll_literal_array_allocation<'ctx>(
+    state: &mut EmitState<'ctx, '_>,
+    binding: &ScalarBinding,
+    base: PointerValue<'ctx>,
+    length: inkwell::values::IntValue<'ctx>,
+    storage: Option<(PointerValue<'ctx>, PointerValue<'ctx>)>,
+) -> Result<(), String> {
+    let Some(aggregate) = &mut state.aggregate else { return Err("missing checked literal array allocation plan".into()) };
+    let Some(plan) = aggregate.plan.literal_array else { return Err("missing checked literal array allocation".into()) };
+    let (receipt, extent, elements) = match plan {
+        ClosedLiteralArray::FreshLeaf { receipt, length_occurrence, elements, .. } =>
+            (receipt, length_occurrence, elements),
+        ClosedLiteralArray::Replacement { original, original_length_occurrence, original_elements, .. } =>
+            (original, original_length_occurrence, original_elements),
+    };
+    let actual_extent = binding.receivers.first().and_then(|receiver| receiver.allocation_length.as_ref())
+        .and_then(|expression| state.body_call_nodes.and_then(|nodes| nodes.expression_ordinal(expression)));
+    if state.body_call_nodes.and_then(|nodes| nodes.binding_position(binding)) != Some(receipt.allocation)
+        || actual_extent != Some(extent)
+        || length.get_zero_extended_constant() != Some(elements)
+        || storage.is_some() != matches!(plan, ClosedLiteralArray::Replacement { .. })
+        || !matches!(aggregate.literal_array_receipt, LiteralArrayReceipt::Awaiting)
+    {
+        return Err("checked literal array allocation does not match its receipt".into());
+    }
+    aggregate.literal_array_receipt = LiteralArrayReceipt::Original { base, storage };
+    Ok(())
+}
+
+pub(super) fn literal_array_leaf_return(state: &EmitState<'_, '_>) -> bool {
+    state.aggregate.as_ref().is_some_and(|aggregate|
+        matches!(aggregate.plan.literal_array, Some(ClosedLiteralArray::FreshLeaf { .. })))
+}
+
+fn release_literal_array_base<'ctx>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, '_>,
+    base: PointerValue<'ctx>,
+) -> Result<(), String> {
+    super::ownership::consume_runtime_array_release(context, state,
+        super::ownership::RuntimeArrayRelease { pointer: base.into(), live: None })
+}
+
+pub(super) fn install_literal_array_replacement<'ctx>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, '_>,
+    call: usize,
+    value: &EmitValue<'ctx>,
+) -> Result<(), String> {
+    let Some(aggregate) = state.aggregate.as_mut() else { return Err("missing checked literal array plan".into()) };
+    let Some(ClosedLiteralArray::Replacement { call: planned, elements, .. }) = aggregate.plan.literal_array
+        else { return Err("missing checked literal array replacement".into()) };
+    if call != planned {
+        return Err("checked literal array replacement has a different call occurrence".into());
+    }
+    let EmitValue::Basic(BasicValueEnum::PointerValue(fresh)) = value else {
+        return Err("checked literal array replacement has no backing".into());
+    };
+    let LiteralArrayReceipt::Original { base: original, storage: Some((destination, length_slot)) } =
+        std::mem::replace(&mut aggregate.literal_array_receipt, LiteralArrayReceipt::Finished)
+    else { return Err("checked literal array replacement has no original receipt".into()) };
+    release_literal_array_base(context, state, original)?;
+    state.builder.build_store(destination, *fresh).map_err(builder_error)?;
+    state.builder.build_store(length_slot, context.i64_type().const_int(elements, false)).map_err(builder_error)?;
+    state.aggregate.as_mut().expect("checked literal array replacement").literal_array_receipt =
+        LiteralArrayReceipt::Fresh(*fresh);
+    Ok(())
 }
 
 pub(super) fn record_allocation<'ctx>(
@@ -809,11 +901,20 @@ pub(super) fn release_scope<'ctx>(
     }
     let ordinal = state.body_call_nodes.and_then(|nodes| nodes.block_ordinal(block))
         .ok_or_else(|| "missing bound block for aggregate scope exit".to_owned())?;
-    let Some(exit) = aggregate.plan.scope_exits.get(&ordinal) else {
+    let Some(exit) = aggregate.plan.scope_exits.get(&ordinal).copied() else {
         return Ok(());
     };
-    let releases = aggregate.plan.releases.get(exit);
-    let release_input = aggregate.plan.input_release.as_ref() == Some(exit);
+    if let Some(ClosedLiteralArray::Replacement { exit: planned, block, .. }) = aggregate.plan.literal_array {
+        if (planned, block) != (exit, ordinal) {
+            return Err("checked literal array release does not match its exit".into());
+        }
+        let LiteralArrayReceipt::Fresh(fresh) =
+            std::mem::replace(&mut aggregate.literal_array_receipt, LiteralArrayReceipt::Finished)
+        else { return Err("checked literal array exit has no fresh receipt".into()) };
+        return release_literal_array_base(context, state, fresh);
+    }
+    let releases = aggregate.plan.releases.get(&exit);
+    let release_input = aggregate.plan.input_release == Some(exit);
     if releases.is_none() && !release_input {
         return Ok(());
     }
@@ -862,12 +963,31 @@ pub(super) fn holds_registered_return(state: &EmitState<'_, '_>) -> bool {
 pub(super) fn commit_return<'ctx>(
     context: &'ctx Context,
     state: &mut EmitState<'ctx, '_>,
+    block: &ScalarBlock,
     result: &EmitValue<'ctx>,
     outputs: &crate::ScalarOutputSequence,
 ) -> Result<(), String> {
     let Some(aggregate) = &mut state.aggregate else {
         return Ok(());
     };
+    if let Some(ClosedLiteralArray::FreshLeaf { output, .. }) = aggregate.plan.literal_array {
+        let bound = block.final_expressions().next()
+            .and_then(|(expression, _)| state.body_call_nodes.and_then(|nodes| nodes.expression_ordinal(expression)));
+        if bound != Some(output)
+            || !matches!(outputs.outputs.as_slice(), [output] if matches!(output.ty, ScalarType::RuntimeArray { .. }))
+        {
+            return Err("checked fresh literal array return does not match its output occurrence".into());
+        }
+        let LiteralArrayReceipt::Original { base, storage: None } =
+            std::mem::replace(&mut aggregate.literal_array_receipt, LiteralArrayReceipt::Finished)
+        else { return Err("checked fresh literal array return has no original receipt".into()) };
+        // The admitted immutable direct binding returns the recorded LLVM SSA
+        // value itself, not a slot load. This compares IR identity, not runtime addresses.
+        if !matches!(result, EmitValue::Basic(BasicValueEnum::PointerValue(returned)) if *returned == base) {
+            return Err("checked fresh literal array return did not carry its allocation".into());
+        }
+        return Ok(());
+    }
     if let Some(destination) = aggregate.ordinary_destination {
         let [output] = outputs.outputs.as_slice() else {
             return Err("invalid ordinary aggregate returned value".into());
@@ -906,6 +1026,11 @@ pub(super) fn finish_return<'ctx>(
     let Some(aggregate) = &mut state.aggregate else {
         return Ok(None);
     };
+    if aggregate.plan.literal_array.is_some()
+        && !matches!(aggregate.literal_array_receipt, LiteralArrayReceipt::Finished)
+    {
+        return Err("unfinished checked literal array receipt".into());
+    }
     if aggregate.failure_site.is_some()
         && (!aggregate.failure_arm_visited || aggregate.failure_allocation.is_some())
     {

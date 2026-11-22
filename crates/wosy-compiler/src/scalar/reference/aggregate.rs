@@ -4,6 +4,9 @@ use super::*;
 pub(super) struct AggregateFlowFacts {
     pub(super) allocations: BTreeMap<ReferenceBindingId, CfgPointId>,
     pub(super) allocation_slots: BTreeMap<CfgPointId, (usize, usize)>,
+    pub(super) literal_array_bind: Option<LiteralArrayBind>,
+    pub(super) literal_array_write: Option<LiteralArrayWrite>,
+    pub(super) literal_array_value: Option<(CfgPointId, OccurrenceOrdinal)>,
     pub(super) views: BTreeMap<CfgPointId, CfgPointId>,
     pub(super) plain_literals: BTreeSet<CfgPointId>,
     pub(super) carrier_literals: BTreeSet<CfgPointId>,
@@ -95,6 +98,53 @@ impl AggregateFlowFacts {
             _ => {}
         }
     }
+}
+
+/// Exact validated extent at an ordinary root allocation, not a type extent.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct LiteralArrayBind {
+    pub(super) bind: CfgPointId,
+    pub(super) placeholder: CfgPointId,
+    pub(super) position: BlockPosition,
+    pub(super) length_occurrence: OccurrenceOrdinal,
+    pub(super) elements: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct LiteralArrayWrite {
+    pub(super) rhs: CfgPointId,
+    pub(super) writer: CfgPointId,
+    pub(super) producer: OccurrenceOrdinal,
+    pub(super) destination: OccurrenceOrdinal,
+}
+
+#[derive(Clone, Copy, Default, PartialEq)]
+enum LiteralArrayPhase {
+    #[default]
+    BeforeBind,
+    Original,
+    Read(CfgPointId),
+    Moved(CfgPointId),
+    Output(OccurrenceOrdinal),
+    ProducerExit(OccurrenceOrdinal),
+    Call,
+    Replaced,
+    Finished,
+    Unknown,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum LiteralArrayRoute {
+    FreshLeaf {
+        allocation: LiteralArrayBind,
+        output: OccurrenceOrdinal,
+    },
+    Replacement {
+        original: LiteralArrayBind,
+        write: LiteralArrayWrite,
+        exit: CfgPointId,
+        block: BlockOrdinal,
+    },
 }
 
 pub(super) struct ConditionalArrayReturn {
@@ -273,6 +323,7 @@ pub(super) struct AggregateEdgeState {
     array_tail_dependency: Option<CfgPointId>,
     array_dependencies: BTreeSet<CfgPointId>,
     local_array: Option<LocalArrayLife>,
+    literal_array_phase: LiteralArrayPhase,
 }
 
 #[derive(Clone, Default, PartialEq)]
@@ -396,6 +447,8 @@ fn grounded_array_return_dependencies(
 
 #[derive(Default)]
 pub(super) struct AggregateFlowResult {
+    literal_array_route: Option<LiteralArrayRoute>,
+    literal_array_unknown: bool,
     pub(super) checked_backing_forward_candidate: Option<(OccurrenceOrdinal, CfgPointId, CfgPointId)>,
     pub(super) checked_backing_forward: Option<(OccurrenceOrdinal, CfgPointId)>,
     pub(super) checked_backing_assignment: Option<(usize, usize, CfgPointId)>,
@@ -482,7 +535,8 @@ impl AggregateFlowResult {
     }
 
     pub(super) fn has_observations(&self) -> bool {
-        (self.checked_producer_authoritative && !self.checked_producer_backing.is_empty())
+        (self.literal_array_route.is_some() && !self.literal_array_unknown)
+            || (self.checked_producer_authoritative && !self.checked_producer_backing.is_empty())
             || self.checked_backing_assignment.is_some() || self.checked_backing_forward.is_some()
             || self.scalar_descriptor_assignment.is_some() || !self.array_returns.is_empty() || !self.array_rebinds.is_empty()
             || self.returning_leaf || !self.calls.is_empty() || !self.returns.is_empty() || !self.formals.is_empty() || !self.inputs.is_empty() || !self.raw_terminals.is_empty() || !self.read_formals.is_empty()
@@ -564,8 +618,86 @@ impl AggregateFlowFacts {
     }
 
     pub(super) fn observes_values(&self) -> bool {
+        self.literal_array_bind.is_some() || self.observes_legacy_values()
+    }
+
+    fn observes_legacy_values(&self) -> bool {
         self.array_formal.is_some() || !self.array_calls.is_empty()
             || !self.checked_producer_arms.is_empty() || !self.views.is_empty() || !self.calls.is_empty() || !self.formals.is_empty() || !self.input_moves.is_empty() || !self.raw_formals.is_empty()
+    }
+
+    fn visit_literal_array(
+        &self,
+        point: &ReferenceFlowPoint,
+        state: &mut AggregateEdgeState,
+        result: &mut AggregateFlowResult,
+    ) {
+        let Some(allocation) = self.literal_array_bind else { return };
+        let Some((binding, &bind)) = self.allocations.first_key_value() else { return };
+        if self.allocations.len() != 1 || bind != allocation.bind {
+            result.literal_array_unknown = true;
+            return;
+        }
+        let mut completed = None;
+        use LiteralArrayPhase::*;
+        let next = if point.scope != ReferenceScopeId(0) || point.successors.len() > 1 {
+            Unknown
+        } else {
+            match (state.literal_array_phase, &point.kind) {
+                (BeforeBind, CfgPointKind::Entry | CfgPointKind::ScopeEnter) => BeforeBind,
+                (BeforeBind, CfgPointKind::Evaluate(_)) if point.id == allocation.placeholder => BeforeBind,
+                (BeforeBind, CfgPointKind::Bind { binding: actual })
+                    if point.id == allocation.bind && actual == binding => Original,
+                (Original, CfgPointKind::Read { binding: actual }) if actual == binding
+                    && self.literal_array_write.is_none() => Read(point.id),
+                (Read(value), CfgPointKind::Move { place, owner, ty: ScalarType::RuntimeArray { .. } })
+                    if owner == binding && &place.binding == binding && place.projections.is_empty() => Moved(value),
+                (Moved(value), CfgPointKind::ReturnOutput { output: 0, value_point, checked: false })
+                    if value == *value_point =>
+                {
+                    match self.literal_array_value {
+                        Some((recorded, output)) if recorded == value => Output(output),
+                        _ => Unknown,
+                    }
+                }
+                (Output(output), CfgPointKind::ScopeExit) => ProducerExit(output),
+                (ProducerExit(output), CfgPointKind::Return) if point.successors.is_empty() => {
+                    completed = Some(LiteralArrayRoute::FreshLeaf { allocation, output });
+                    Finished
+                }
+                (Original, CfgPointKind::Call { output: 0,
+                    target: ResolvedCallTarget::ModuleCallable {
+                        concrete: ConcreteCallSelection::Declaration, ..
+                    }, argument_points, .. })
+                    if argument_points.is_empty()
+                        && self.literal_array_write.is_some_and(|write| write.rhs == point.id) => Call,
+                (Call, CfgPointKind::Assign { target, rhs_point, .. })
+                    if &target.binding == binding && target.projections.is_empty()
+                        && self.literal_array_write.is_some_and(|write|
+                            write.rhs == *rhs_point && write.writer == point.id) => Replaced,
+                (Replaced, CfgPointKind::ScopeExit) if point.successors.is_empty() => {
+                    if let (Some(write), Some(&block)) =
+                        (self.literal_array_write, self.scope_exits.get(&point.id))
+                    {
+                        completed = Some(LiteralArrayRoute::Replacement { original: allocation,
+                            write, exit: point.id, block });
+                        Finished
+                    } else {
+                        Unknown
+                    }
+                }
+                _ => Unknown,
+            }
+        };
+        if next == Unknown || point.successors.is_empty() && next != Finished {
+            result.literal_array_unknown = true;
+        }
+        if let Some(completed) = completed {
+            if result.literal_array_route.replace(completed).is_some_and(|old| old != completed) {
+                result.literal_array_unknown = true;
+            }
+        }
+        state.literal_array_phase = next;
     }
 
     pub(super) fn visit(
@@ -576,6 +708,10 @@ impl AggregateFlowFacts {
         sites: &FunctionCallSites,
         value_deadlines: Option<&[usize]>,
     ) {
+        self.visit_literal_array(point, state, result);
+        if !self.observes_legacy_values() {
+            return;
+        }
         let id = point.id;
         if let Some(local) = &mut state.local_array {
             let (binding, &allocation) = self.allocations.first_key_value().expect("local array demand");
@@ -1398,6 +1534,26 @@ pub(crate) struct ClosedCheckedBacking {
     pub(crate) failure: Option<usize>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ClosedLiteralArray {
+    FreshLeaf {
+        receipt: OriginalArrayReceipt,
+        length_occurrence: usize,
+        elements: u64,
+        output: usize,
+    },
+    Replacement {
+        original: OriginalArrayReceipt,
+        original_length_occurrence: usize,
+        original_elements: u64,
+        call: usize,
+        destination: usize,
+        exit: CfgPointId,
+        block: usize,
+        elements: u64,
+    },
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct ClosedBody {
     pub(crate) scalar_descriptor_assignment: Option<(usize, usize, usize)>,
@@ -1416,6 +1572,7 @@ pub(crate) struct ClosedBody {
     // Checked primary call occurrence -> exact destination place occurrence.
     pub(crate) same_array_rebinds: BTreeMap<usize, usize>,
     pub(crate) local_array_failure: Option<ClosedLocalArrayRelease>,
+    pub(crate) literal_array: Option<ClosedLiteralArray>,
     pub(crate) input_release: Option<CfgPointId>,
     pub(crate) input_calls: BTreeMap<usize, (usize, ClosedInput)>,
 }
@@ -1928,6 +2085,80 @@ fn closed_checked_backing_consumer<'a>(
     Ok(consumer)
 }
 
+#[derive(Clone, Copy)]
+struct LiteralArrayPair {
+    caller: BodyKey,
+    callee: BodyKey,
+    original: LiteralArrayBind,
+    fresh: LiteralArrayBind,
+    final_output: OccurrenceOrdinal,
+    write: LiteralArrayWrite,
+    exit: CfgPointId,
+    block: BlockOrdinal,
+}
+
+fn enroll_literal_array_pair(result: &mut ClosedAggregates, pair: LiteralArrayPair) {
+    let LiteralArrayPair { caller, callee, original, fresh, final_output, write, exit, block } = pair;
+    if caller == callee || result.bodies.contains_key(&caller) || write.rhs == write.writer {
+        return;
+    }
+    let to_receipt = |allocation: LiteralArrayBind| OriginalArrayReceipt {
+        origin: allocation.bind,
+        allocation: (allocation.position.block.0, allocation.position.item),
+    };
+    let producer = ClosedLiteralArray::FreshLeaf {
+        receipt: to_receipt(fresh), length_occurrence: fresh.length_occurrence.0,
+        elements: fresh.elements, output: final_output.0,
+    };
+    if let Some(existing) = result.bodies.get(&callee) {
+        if existing.literal_array != Some(producer) {
+            return;
+        }
+    } else {
+        result.bodies.entry(callee).or_default().literal_array = Some(producer);
+    }
+    let plan = result.bodies.entry(caller).or_default();
+    plan.scope_exits.insert(block.0, exit);
+    plan.literal_array = Some(ClosedLiteralArray::Replacement {
+        original: to_receipt(original), original_length_occurrence: original.length_occurrence.0,
+        original_elements: original.elements,
+        call: write.producer.0, destination: write.destination.0, exit, block: block.0,
+        elements: fresh.elements,
+    });
+}
+
+fn install_literal_array_plans(
+    bodies: &BTreeMap<BodyKey, Body<'_>>,
+    declarations: &HashMap<(&SourceIdentity, ByteSpan), (usize, usize)>,
+    result: &mut ClosedAggregates,
+) {
+    for (&caller, body) in bodies {
+        if !body.is_monomorphic || caller.2.is_some() {
+            continue;
+        }
+        let Some(facts) = body.facts.filter(|facts| !facts.literal_array_unknown) else { continue };
+        let Some(LiteralArrayRoute::Replacement { original, write, exit, block }) =
+            facts.literal_array_route else { continue };
+        let Some(callee) = target_body(declarations, body.cfg, write.rhs) else { continue };
+        let Some(leaf) = bodies.get(&callee) else { continue };
+        if !leaf.is_monomorphic || callee.2.is_some() {
+            continue;
+        }
+        let Some(facts) = leaf.facts.filter(|facts| !facts.literal_array_unknown) else { continue };
+        let Some(LiteralArrayRoute::FreshLeaf { allocation: fresh, output: final_output }) =
+            facts.literal_array_route else { continue };
+        let [returned] = leaf.sites.boundary.results.as_slice() else { continue };
+        let Some(signature) = body.sites.checked_call_signatures.get(&write.producer) else { continue };
+        let [output] = signature.outputs.outputs.as_slice() else { continue };
+        if !signature.parameters.is_empty() || !same_runtime_array_type(&output.ty, &returned.ty) {
+            continue;
+        }
+        enroll_literal_array_pair(result, LiteralArrayPair {
+            caller, callee, original, fresh, final_output, write, exit, block,
+        });
+    }
+}
+
 fn closed_aggregates<'a>(
     reservations: &AggregateReservations,
     module_at: impl Fn(usize) -> Option<ModuleInput<'a>>,
@@ -2115,6 +2346,11 @@ fn closed_aggregates<'a>(
             arm: *arm,
         });
     }
+    let finalize_cohorts = |mut result: ClosedAggregates| {
+        install_ordinary(&mut result);
+        install_literal_array_plans(&bodies, &declarations, &mut result);
+        result
+    };
     if outgoing.is_empty() {
         let mut producers = bodies.iter().filter_map(|(&key, body)| {
             if !body.is_monomorphic || key.2.is_some() {
@@ -2194,8 +2430,7 @@ fn closed_aggregates<'a>(
                 }
             }
         }
-        install_ordinary(&mut result);
-        return Ok(result);
+        return Ok(finalize_cohorts(result));
     }
     let mut initializer_uses = Vec::new();
     let mut initializer_escapes = Vec::new();
@@ -2633,8 +2868,7 @@ fn closed_aggregates<'a>(
         }
         result.initializers = initializer_plans;
     }
-    install_ordinary(&mut result);
-    Ok(result)
+    Ok(finalize_cohorts(result))
 }
 
 pub(in crate::scalar) fn close_installed(
@@ -2675,6 +2909,67 @@ impl ProjectReferenceResults {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn checked_literal_array_pair_enrolls_distinct_receipts_at_the_exact_exit() {
+        let allocation = |bind, length, elements| LiteralArrayBind {
+            bind: CfgPointId(bind),
+            placeholder: CfgPointId(bind - 1),
+            position: BlockPosition { block: BlockOrdinal(0), item: 0 },
+            length_occurrence: OccurrenceOrdinal(length),
+            elements,
+        };
+        let pair = LiteralArrayPair {
+            caller: (0, 0, None),
+            callee: (0, 1, None),
+            original: allocation(2, 1, 3),
+            fresh: allocation(3, 2, 11),
+            final_output: OccurrenceOrdinal(3),
+            write: LiteralArrayWrite {
+                rhs: CfgPointId(3),
+                writer: CfgPointId(4),
+                producer: OccurrenceOrdinal(2),
+                destination: OccurrenceOrdinal(3),
+            },
+            exit: CfgPointId(5),
+            block: BlockOrdinal(0),
+        };
+        let mut plans = ClosedAggregates::default();
+        enroll_literal_array_pair(&mut plans, pair);
+        assert_eq!(plans.bodies.len(), 2);
+        assert_eq!(plans.bodies[&pair.callee].literal_array, Some(ClosedLiteralArray::FreshLeaf {
+            receipt: OriginalArrayReceipt { origin: CfgPointId(3), allocation: (0, 0) },
+            length_occurrence: 2,
+            elements: 11,
+            output: 3,
+        }));
+        let caller = &plans.bodies[&pair.caller];
+        assert_eq!(caller.literal_array, Some(ClosedLiteralArray::Replacement {
+            original: OriginalArrayReceipt { origin: CfgPointId(2), allocation: (0, 0) },
+            original_length_occurrence: 1,
+            original_elements: 3,
+            call: 2,
+            destination: 3,
+            exit: CfgPointId(5),
+            block: 0,
+            elements: 11,
+        }));
+        assert_eq!(caller.scope_exits, BTreeMap::from([(0, CfgPointId(5))]));
+        assert!(caller.releases.is_empty());
+
+        let mut self_pair = ClosedAggregates::default();
+        enroll_literal_array_pair(&mut self_pair, LiteralArrayPair { callee: pair.caller, ..pair });
+        assert!(self_pair.bodies.is_empty());
+
+        for occupied in [pair.caller, pair.callee] {
+            let mut overlapping = ClosedAggregates::default();
+            overlapping.bodies.entry(occupied).or_default().ordinary_result = true;
+            enroll_literal_array_pair(&mut overlapping, pair);
+            assert_eq!(overlapping.bodies.len(), 1);
+            assert!(overlapping.bodies[&occupied].ordinary_result);
+            assert!(overlapping.bodies[&occupied].literal_array.is_none());
+        }
+    }
 
     #[test]
     fn recursive_array_tail_needs_a_grounded_formal_path() {
