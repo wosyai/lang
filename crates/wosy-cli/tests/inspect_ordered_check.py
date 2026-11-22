@@ -323,5 +323,28 @@ def main():
         assert (tight_bands.returncode, tight_bands.stdout, tight_bands.stderr) == (1, expected_main, b""), tight_bands
 
 
+        source.write_text("%%start u8 startup = 1; %%end", encoding="utf-8")
+        recursive = """%%start
+            u8(u8) descend = fn(value) { if (value < 3) { 4 } else { descend(value - 3) } };
+            proof rank for descend(entry) -> (out) where (entry <= 8) ensures (out <= 3) decreases (entry) {
+                if (entry < 3) { core.show(out == 4); } else { core.use(rank(entry - 3)); }
+            }
+        %%end"""
+        module.write_text(recursive, encoding="utf-8")
+        recursive_failure = subprocess.run(dormant_command, cwd=root, capture_output=True, timeout=15)
+        assert (recursive_failure.returncode, recursive_failure.stdout, recursive_failure.stderr) == (
+            1, expected_dormant, b""
+        ), recursive_failure
+        recursive_excluded = subprocess.run([*dormant_command, "--main-flow-only"], cwd=root, capture_output=True, timeout=15)
+        assert (recursive_excluded.returncode, recursive_excluded.stdout, recursive_excluded.stderr) == (
+            0, expected_pass, b""
+        ), recursive_excluded
+        module.write_text(recursive.replace("out <= 3", "out <= 4"), encoding="utf-8")
+        recursive_success = subprocess.run(dormant_command, cwd=root, capture_output=True, timeout=15)
+        assert (recursive_success.returncode, recursive_success.stdout, recursive_success.stderr) == (
+            0, expected_pass, b""
+        ), recursive_success
+
+
 if __name__ == "__main__":
     main()

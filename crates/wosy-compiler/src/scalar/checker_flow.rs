@@ -894,6 +894,11 @@ impl IntegerInputs {
         Self(vec![Vec::new()])
     }
 
+    #[cfg(feature = "internal-checker")]
+    pub(super) fn single_axis_point(value: &BigInt) -> Self {
+        Self(vec![vec![Rc::new(IntegerSet::singleton(value))]])
+    }
+
     fn singleton_at(&self, axis: usize) -> Option<&BigInt> {
         let (first, rest) = self.0.split_first()?;
         let value = first[axis].singleton_value()?;

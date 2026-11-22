@@ -3032,6 +3032,97 @@ impl<'a> OrderedRunEvidence for NamedOrderedEvidence<'a> {
 }
 
 #[cfg(feature = "internal-checker")]
+struct RankedOrderedEvidence<'a, 'proof> {
+    plan: &'proof PlannedModuleProof<'a>,
+    rank: TypedInductionRank<'a>,
+}
+
+#[cfg(feature = "internal-checker")]
+impl ActualIntegerObserver for RankedOrderedEvidence<'_, '_> {
+    const ENABLED: bool = false;
+    const CONTEXTUAL: bool = true;
+
+    fn observe(&mut self, _: PreparedCallable, _: &[&BigInt], _: &BigInt) {}
+}
+
+#[cfg(feature = "internal-checker")]
+struct RankedOrderedSymbolic<'a, 'proof> {
+    plan: &'proof PlannedModuleProof<'a>,
+    rank: TypedInductionRank<'a>,
+    failure: Option<SymbolicProofDiagnostic>,
+}
+
+#[cfg(feature = "internal-checker")]
+impl<'a, 'proof> OrderedRunEvidence for RankedOrderedEvidence<'a, 'proof> {
+    type Symbolic<'run> = RankedOrderedSymbolic<'a, 'proof> where Self: 'run;
+    type SymbolicReport = Option<SymbolicProofDiagnostic>;
+
+    fn complete_startup(&self, reached: &HashSet<PreparedCallable>) -> Result<bool, ProjectCheck> {
+        if reached.contains(&self.plan.target) {
+            return Err(ProjectCheck::Unsupported);
+        }
+        Ok(false)
+    }
+
+    fn symbolic(&self) -> Self::Symbolic<'_> {
+        RankedOrderedSymbolic { plan: self.plan, rank: self.rank, failure: None }
+    }
+
+    fn finish_symbolic<'run>(proof: Self::Symbolic<'run>) -> Self::SymbolicReport where Self: 'run {
+        proof.failure
+    }
+}
+
+#[cfg(feature = "internal-checker")]
+impl SymbolicRootProof for RankedOrderedSymbolic<'_, '_> {
+    const ENABLED: bool = true;
+
+    fn seed(&self, roots: &mut HashMap<usize, HashSet<usize>>, _: &HashSet<PreparedCallable>) {
+        let (module, item) = self.plan.target;
+        roots.entry(module).or_default().insert(item);
+    }
+
+    fn try_collect(
+        &mut self, target: PreparedCallable, _: &FunctionCallSites, function: &ScalarFunction,
+        source: &SourceIdentity, effects: &mut OrderedFailures,
+    ) -> Result<Option<bool>, ProjectCheck> {
+        if target != self.plan.target {
+            return Ok(None);
+        }
+        match self.plan.verify_induction_return_witness(self.rank)? {
+            RankedInductionOutcome::NoApplicable => Ok(Some(false)),
+            RankedInductionOutcome::Premise(InductionPremise::Established | InductionPremise::Unreachable) =>
+                Ok(Some(true)),
+            RankedInductionOutcome::Refuted(Some(base)) => {
+                let proof_span = |range| wosy_syntax::SourceSpan { source: base.proof_source.clone(), range };
+                let callable_span = |range| wosy_syntax::SourceSpan { source: source.clone(), range };
+                let (goal, failed_step) = match base.rejected {
+                    RankedBaseRejection::Goal(range) => (range, None),
+                    RankedBaseRejection::AuthoredShow(range) => {
+                        let goal = child(&child(self.plan.proof, SyntaxKind::ProofEnsures)?, SyntaxKind::Expression)?;
+                        (wosy_syntax::byte_span(&goal), Some(proof_span(range)))
+                    }
+                };
+                self.failure = Some(SymbolicProofDiagnostic {
+                    proof: proof_span(wosy_syntax::byte_span(self.plan.proof)),
+                    goal: proof_span(goal), failed_step,
+                    callable: callable_span(function.name_span),
+                    output: wosy_syntax::SourceSpan { source: base.return_source.clone(), range: base.return_span },
+                    directive_position: effects.records.len(),
+                    witness: ScalarCheckerIntegerWitness {
+                        axes: vec![(self.rank.descending.1.clone(), base.entry_type)],
+                        state: IntegerInputs::single_axis_point(&base.entry),
+                    },
+                    returned: base.returned.clone(),
+                });
+                Ok(Some(true))
+            }
+            _ => Err(ProjectCheck::Unsupported),
+        }
+    }
+}
+
+#[cfg(feature = "internal-checker")]
 fn run_closed_without_named_proofs(
     prepared: &PreparedCheckerProject, scope: ScalarCheckerScope, startup_count: usize,
 ) -> Result<MainFlowProofReceipt, ProjectCheck> {
@@ -3129,9 +3220,25 @@ fn check_loaded_ordered_proof_diagnostics_in_scope<const LOCAL_CATALOGS: bool>(
     let Some((source, name, definition, query)) = first.as_ref() else {
         return run_closed_without_named_proofs(&prepared.prepared, scope, startup_count);
     };
-    let first_plan = prepared.plan_resolved_module_proof::<false, false, false>(
+    let first_plan = prepared.plan_resolved_module_proof::<true, false, false>(
         source, name.text(), prepared.resolve_selected_proof(definition, *query)?,
     )?;
+    if let Some(rank) = first_plan.typed.measure {
+        if !others.is_empty() || rank.earlier.is_some()
+            || first_plan.proof_source != &first_plan.typed.target.source
+        {
+            return Err(ProjectCheck::Unsupported);
+        }
+        let run = run_prepared_ordered_check(
+            &prepared.prepared, scope, startup_count, OrderedReachPolicy::Closed,
+            RankedOrderedEvidence { plan: &first_plan, rank },
+        )?;
+        return Ok(MainFlowProofReceipt {
+            active: run.active, directives: run.directives, diagnostics: Vec::new(),
+            symbolic_diagnostic: run.symbolic, additional_symbolic_diagnostics: Vec::new(),
+            entry_evidence: run.entry_evidence,
+        });
+    }
     let plans = others.iter().map(|(source, name, definition, query)| {
         let selected = prepared.resolve_selected_proof(definition, *query)?;
         prepared.plan_resolved_module_proof::<false, false, false>(source, name.text(), selected)
@@ -8678,6 +8785,58 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
         assert_eq!(exact.returned, BigInt::from(1000));
         assert_eq!(intervals(&exact.witness, 0), [(BigInt::from(1), BigInt::from(1))]);
         assert_eq!(intervals(&exact.witness, 1), [(BigInt::from(1000), BigInt::from(1000))]);
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordered_unused_ranked_proof_preserves_dormant_source_and_directive_order() {
+        let app = source("src/main.w", "ordered-ranked-app");
+        let dormant = source("src/routes.w", "ordered-ranked-routes");
+        let main = format!("%%start core.require(false, {OUTPUT}); %%end");
+        let routes = r#"%%start
+            u8(u8) descend = fn(value) { if (value < 3) { 4 } else { descend(value - 3) } };
+            proof rank for descend(entry) -> (out) where (entry <= 8) ensures (out <= 3) decreases (entry) {
+                if (entry < 3) { core.show(out == 4); } else { core.use(rank(entry - 3)); }
+            }
+        %%end"#;
+        let catalog = |identity: &SourceIdentity, text: &str| crate::parse_proof_source(
+            identity.clone(), text.to_owned(), &[],
+        ).unwrap_or_else(|_| panic!("valid ranked proof source")).1;
+        let run = |text: &str, scope| check_loaded_scalar_ordered_local_proof_contexts(
+            vec![(declarations(&app, &main), Vec::new())], [], vec![app.clone()], inputs(), scope,
+            vec![catalog(&dormant, text)],
+        ).unwrap();
+        let failed = run(routes, ScalarCheckerScope::CurrentPackage);
+        let passed = run(&routes.replace("out <= 3", "out <= 4"), ScalarCheckerScope::CurrentPackage);
+        let excluded = run(routes, ScalarCheckerScope::MainFlowOnly);
+        assert_eq!(failed.directives.len(), 1);
+        assert_eq!(failed.directives, passed.directives);
+        assert_eq!(failed.directives, excluded.directives);
+        assert!(passed.symbolic_diagnostic.is_none() && excluded.symbolic_diagnostic.is_none());
+        let symbolic = failed.symbolic_diagnostic.unwrap();
+        let snippet = |span: &wosy_syntax::SourceSpan| {
+            assert_eq!(span.source, dormant);
+            &routes[span.range.start as usize..span.range.end as usize]
+        };
+        assert_eq!(snippet(&symbolic.goal), "out <= 3");
+        assert_eq!(snippet(&symbolic.callable), "descend");
+        assert_eq!(snippet(&symbolic.output), "4");
+        assert!(symbolic.failed_step.is_none());
+        assert_eq!(symbolic.returned, BigInt::from(4));
+        assert_eq!(symbolic.directive_position, 1);
+        let zero = BigInt::from(0);
+        assert_eq!(symbolic.witness.intervals_at(0, 0).unwrap().collect::<Vec<_>>(), [(&zero, &zero)]);
+
+        let reached = routes.replace("%%end", "u8 reached = descend(0); %%end");
+        let mixed = routes.replace("%%end", "proof bare for descend(entry) -> (out) ensures (out == 4) {} %%end");
+        for source in [&reached, &mixed] {
+            for scope in [ScalarCheckerScope::MainFlowOnly, ScalarCheckerScope::CurrentPackage] {
+                let receipt = check_loaded_scalar_ordered_local_proof_contexts(
+                    Vec::new(), [(catalog(&app, source), Vec::new())], vec![app.clone()], inputs(), scope, Vec::new(),
+                );
+                assert!(matches!(receipt, Err(ScalarOrderedCheckerOutcome::Unsupported)));
+            }
+        }
     }
 
     #[cfg(feature = "internal-checker")]
