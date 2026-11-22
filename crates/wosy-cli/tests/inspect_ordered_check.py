@@ -346,5 +346,30 @@ def main():
         ), recursive_success
 
 
+        reached_recursion = recursive.replace("out <= 3", "out == 4").replace("%%end", """
+            core.require(false, { .stdout = "before"; .stderr = ""; .code = 17; .files = []; });
+            u8 base = descend(2);
+            u8 recursed = descend(8);
+            core.require(base == 4, { .stdout = "bad base"; .stderr = ""; .code = 18; .files = []; });
+            core.require(recursed == 4, { .stdout = "bad recurrence"; .stderr = ""; .code = 19; .files = []; });
+            core.require(false, { .stdout = "after"; .stderr = ""; .code = 20; .files = []; });
+        %%end""")
+        source.write_text(reached_recursion, encoding="utf-8")
+        recursive_effects_command = [*main_command, "--inspect-effects"]
+        reached_proof = subprocess.run(recursive_effects_command, cwd=root, capture_output=True, timeout=15)
+        reached_output = expected_pass.replace(b"directive failures: 0", b"directive failures: 2") + (
+            b"source texts: 1\nauthored status: 17\nstdout: 6265666f7265\nstdout: 6166746572\n"
+        )
+        assert (reached_proof.returncode, reached_proof.stdout, reached_proof.stderr) == (
+            1, reached_output, b""
+        ), reached_proof
+
+        source.write_text(reached_recursion.replace("descend(8);", "descend(9);"), encoding="utf-8")
+        wrong_guard = subprocess.run(recursive_effects_command, cwd=root, capture_output=True, timeout=15)
+        assert (wrong_guard.returncode, wrong_guard.stdout, wrong_guard.stderr) == (
+            2, b"", b"ordered check: incomplete: checker did not complete analysis\n"
+        ), wrong_guard
+
+
 if __name__ == "__main__":
     main()
