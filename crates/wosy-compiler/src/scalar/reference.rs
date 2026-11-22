@@ -983,11 +983,11 @@ impl<'a> ReferenceFlowBuilder<'a> {
             result: self.block_result(then_branch, then_block, projected_origins)?,
             end: self.cursor.expect("then branch terminal"),
         };
-        let then_checked = self.checked.clone();
-
+        // The saved entry maps have no further consumers. Keep the then
+        // arm's checked set for the join by moving it out, not cloning it.
+        let then_checked = std::mem::replace(&mut self.checked, incoming_checked);
         self.names = incoming_names;
-        self.origins = incoming_origins.clone();
-        self.checked = incoming_checked.clone();
+        self.origins = incoming_origins;
         self.cursor = Some(branch);
         let else_arm = match (else_branch, else_block) {
             (Some(else_branch), Some(else_block)) => ReferenceConditionalArm {
