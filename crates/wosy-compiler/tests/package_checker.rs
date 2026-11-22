@@ -2833,6 +2833,47 @@ fn verified_output_conjunction_does_not_issue_a_reusable_bound() {
 }
 
 #[test]
+fn named_universal_conjunction_checks_exact_order_and_empty_inner_vacuity() {
+    let identity = source();
+    let check = |body: &str, domain: &str, goal: &str, guard: &str, actual: &str| {
+        check_scalar_module_proof(
+            identity.clone(), "bounded",
+            vec![ScalarProofModuleInput {
+                source: identity.clone(),
+                text: format!(r#"%%start
+                    i16(i16) echo = fn(value) {{ {body} }};
+                    proof bounded for echo(input) -> (out) where ({guard}) forall (i16 k where {domain})
+                        ensures ({goal}) {{}}
+                    {actual}
+                %%end"#),
+                namespaces: Vec::new(),
+            }],
+            vec![identity.clone()], ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
+        )
+    };
+    use ScalarModuleProofOutcome::{Invalid, NoApplicableInputs, Proved, Refuted, Unsupported};
+    let lower = "k >= -7 && k != -7";
+    let holes = "out <= k && (out >= -9 && out != -7)";
+    assert_eq!(check("value", lower, holes, "input >= -9 && input <= -6 && input != -7", ""), Proved);
+    assert_eq!(check("value", lower, holes, "input >= -9 && input <= -6", ""), Refuted);
+    assert_eq!(check("value", lower, holes, "true", "i16 a = echo(-9); i16 b = echo(-6);"), Proved);
+    assert_eq!(check("value", lower, holes, "true", "i16 a = echo(-9); i16 b = echo(-5);"), Refuted);
+    assert_eq!(check("value", "k <= 7 && k != 7", "out >= k && out <= 8", "input >= 6 && input <= 8", ""), Proved);
+    let same = "out >= k && out <= k && out != 0";
+    assert_eq!(check("value", "k == 7", same, "input == 7", ""), Proved);
+    assert_eq!(check("value", "k >= 6 && k <= 7", same, "input == 7", ""), Refuted);
+    assert_eq!(check("value", "k == 7", "out < k && out >= k", "input == 7", ""), Refuted);
+    assert_eq!(check("value", "false", "out < k && out >= k && out < -1 && out > 1", "true", ""), Proved);
+    assert_eq!(check("value", "false", same, "true", "i16 a = echo(0);"), Proved);
+    assert_eq!(check("value", "false", same, "false", ""), NoApplicableInputs);
+    assert_eq!(check("value", "false", same, "false", "i16 a = echo(0);"), NoApplicableInputs);
+    assert_eq!(check("if (value == 0) {}; 3 + 4", "false", same, "true", "i16 a = echo(0);"), Unsupported);
+    assert_eq!(check("value", "false", "out <= k", "true", ""), Unsupported);
+    assert_eq!(check("value", "false", "out <= k && out == k", "true", ""), Unsupported);
+    assert!(matches!(check("value", "false", "out <= k && out < 32768", "true", ""), Invalid(_)));
+}
+
+#[test]
 fn named_universal_proof_reduces_exact_typed_domains_on_shared_actual_and_unused_returns() {
     let identity = source();
     let check = |quantifiers: &str, goal: &str, guard: &str, actual: &str| {
