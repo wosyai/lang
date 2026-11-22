@@ -7,7 +7,7 @@ use std::hash::{Hash, Hasher};
 use super::{
     checker_directive::{CheckedLiteralOutput, CheckerOperation, InitializerIntegerOperand, InitializerPredicate, PreparedCheckerDirective},
     checker_flow::{
-        check_integer_requirement_activity, check_integer_requirements_at_entry, check_integer_return_bound_with_shows, concrete_integer_literal, exact_integer_call_argument,
+        check_integer_requirement_activity, check_integer_requirements_at_entry, check_integer_return_bound_with_shows, concrete_integer_literal, exact_integer_call_argument, exact_integer_call_argument_at,
         exact_integer_return_at_entry, ActualCallResult, CheckerPredicate, ExactIntegerArgument,
         proves_requirement_with_imported_root_local, ImportedEntryGuard, ImportedLocal, IntegerShowProof, IntegerCheckFailure, IntegerComparison, IntegerInputs, IntegerReturn, ProofCoverage,
     },
@@ -473,7 +473,7 @@ fn run_initializer_call<'a>(
     actual: &mut ActualCalls<'_, impl ActualIntegerObserver>,
     occurrence: OccurrenceOrdinal,
     expected: &ScalarType,
-    initialized_argument: impl FnOnce(OccurrenceOrdinal, &ScalarType) -> Option<&'a BigInt>,
+    initialized_argument: impl Fn(OccurrenceOrdinal, &ScalarType) -> Option<&'a BigInt>,
 ) -> Result<ActualCallResult, ProjectCheck> {
     let Some(ModuleInitializationCallTarget::Direct {
         declaration,
@@ -482,11 +482,20 @@ fn run_initializer_call<'a>(
         return Err(ProjectCheck::Unsupported);
     };
     let signature = topology.checked_call_signatures.get(&occurrence).ok_or(ProjectCheck::MissingRootOccurrences)?;
-    let argument = exact_integer_call_argument(&topology.structure, occurrence, initialized_argument);
-    if *expected != ScalarType::Unit && argument.is_none() {
-        return Err(ProjectCheck::Unsupported);
-    }
-    actual.run(&topology.structure, occurrence, signature, argument, &declaration.source, declaration.range, expected)
+    let arguments = if is_integer_type(expected) && signature.parameters.len() == 2 {
+        let first = exact_integer_call_argument_at(&topology.structure, occurrence, 0, &initialized_argument)
+            .ok_or(ProjectCheck::Unsupported)?;
+        let second = exact_integer_call_argument_at(&topology.structure, occurrence, 1, &initialized_argument)
+            .ok_or(ProjectCheck::Unsupported)?;
+        ActualProjectedArguments::InitializerPair(first, second)
+    } else {
+        let argument = exact_integer_call_argument(&topology.structure, occurrence, initialized_argument);
+        if *expected != ScalarType::Unit && argument.is_none() {
+            return Err(ProjectCheck::Unsupported);
+        }
+        ActualProjectedArguments::Single(argument)
+    };
+    actual.run(&topology.structure, occurrence, signature, arguments, &declaration.source, declaration.range, expected)
 }
 
 enum InitializerValue<'a> {
@@ -541,6 +550,11 @@ fn evaluate_initializer_predicate(
 
 const MAX_INITIALIZER_BRANCH_DEPTH: usize = 64;
 
+enum ActualProjectedArguments<'a> {
+    Single(Option<ExactIntegerArgument<'a>>),
+    InitializerPair(ExactIntegerArgument<'a>, ExactIntegerArgument<'a>),
+}
+
 struct ActualCalls<'a, Observer> {
     project: &'a ScalarProject,
     calls: &'a ProjectCallSiteResults,
@@ -582,7 +596,7 @@ impl<Observer: ActualIntegerObserver> ActualCalls<'_, Observer> {
             return Err(ProjectCheck::Unsupported);
         };
         let signature = caller.checked_call_signatures.get(&call).ok_or(ProjectCheck::MissingRootOccurrences)?;
-        self.run(&caller.structure, call, signature, argument, source, *declaration_span, expected)
+        self.run(&caller.structure, call, signature, ActualProjectedArguments::Single(argument), source, *declaration_span, expected)
     }
 
     fn run(
@@ -590,7 +604,7 @@ impl<Observer: ActualIntegerObserver> ActualCalls<'_, Observer> {
         structure: &OccurrenceStructure,
         call: OccurrenceOrdinal,
         signature: &CheckedCallSignature,
-        projected: Option<ExactIntegerArgument<'_>>,
+        projected: ActualProjectedArguments<'_>,
         target_source: &SourceIdentity,
         target_span: ByteSpan,
         expected: &ScalarType,
@@ -609,11 +623,23 @@ impl<Observer: ActualIntegerObserver> ActualCalls<'_, Observer> {
         }
         let body = self.calls.function_body(target_module, target_item, None).ok_or(ProjectCheck::MissingRootOccurrences)?;
         let argument;
+        let pair;
         let exact: &[&BigInt] = match (signature.parameters.as_slice(), body.boundary.parameters.as_slice(), projected) {
-            ([], [], None) => &[],
-            ([parameter], [slot], Some((ty, value))) if *parameter == slot.ty && parameter == ty => {
+            ([], [], ActualProjectedArguments::Single(None)) => &[],
+            ([parameter], [slot], ActualProjectedArguments::Single(Some((ty, value))))
+                if *parameter == slot.ty && parameter == ty =>
+            {
                 argument = [value];
                 &argument
+            }
+            ([first, second], [first_slot, second_slot],
+                ActualProjectedArguments::InitializerPair((first_ty, first_value), (second_ty, second_value)))
+                if is_integer_type(expected)
+                    && *first == first_slot.ty && first == first_ty
+                    && *second == second_slot.ty && second == second_ty =>
+            {
+                pair = [first_value, second_value];
+                &pair
             }
             _ => return Err(ProjectCheck::Unsupported),
         };
@@ -1245,29 +1271,6 @@ mod production_bound_reuse {
         verified.consume(project, identity, scalar.modules[caller.0].target_layout, body, position, origin, &site.target, signature)
     }
 
-    fn verified_entry_guards<'a>(
-        body: &FunctionCallSites,
-        filter: &'a [CheckerPredicate],
-    ) -> Option<Vec<ImportedEntryGuard<'a>>> {
-        let bindings = body.boundary.checker_parameter_bindings.as_deref()?;
-        let mut guards = Vec::new();
-        for predicate in filter {
-            match predicate {
-                CheckerPredicate::Boolean(true) => (),
-                CheckerPredicate::Boolean(false) => return None,
-                CheckerPredicate::Integer(predicate) => {
-                    let slot = bindings.iter().position(|binding| binding == &predicate.binding)?;
-                    guards.push(ImportedEntryGuard {
-                        slot,
-                        relation: IntegerRelation::from_operator(&predicate.operator)?,
-                        bound: &predicate.bound,
-                    });
-                }
-            }
-        }
-        Some(guards)
-    }
-
     impl<'a> VerifiedModuleBound<'a> {
         fn establish(
             issuer: &'a PreparedProofModule,
@@ -1286,7 +1289,10 @@ mod production_bound_reuse {
             if output.ordinal != 0 {
                 return None;
             }
-            let guards = verified_entry_guards(body, plan.filter.as_deref().unwrap_or_default())?;
+            let guard = checked_integer_guard_slots(body, plan.filter.as_deref().unwrap_or_default())?;
+            if guard.always_rejects {
+                return None;
+            }
             let ProofCoverage::Applicable(paths) = observe_arbitrary_integer_returns(body, plan.filter.as_deref())?.ok()? else {
                 return None;
             };
@@ -1297,7 +1303,7 @@ mod production_bound_reuse {
             Some(Self {
                 issuer, proof_identity, canonical_target: plan.canonical_target,
                 target_layout: plan.typed.target.target_layout,
-                parameters, output: &output.ty, guards, values,
+                parameters, output: &output.ty, guards: guard.comparisons, values,
             })
         }
 
@@ -1496,7 +1502,7 @@ impl PlannedModuleProof<'_> {
     fn observer(&self) -> SelectedProofObserver<'_> {
         SelectedProofObserver {
             guard: if self.steps.items.is_empty() {
-                actual_single_integer_guard(self.typed.body, self.filter.as_deref().unwrap_or_default())
+                checked_integer_guard_slots(self.typed.body, self.filter.as_deref().unwrap_or_default())
             } else {
                 None
             },
@@ -1530,30 +1536,36 @@ fn valid_arbitrary_proof_body(body: &FunctionCallSites) -> bool {
 }
 
 #[cfg(feature = "internal-checker")]
-struct ActualSingleIntegerGuard<'a> {
+struct CheckedIntegerGuardSlots<'a> {
+    arity: usize,
     always_rejects: bool,
-    comparisons: Vec<(IntegerRelation, &'a BigInt)>,
+    comparisons: Vec<ImportedEntryGuard<'a>>,
 }
 
 #[cfg(feature = "internal-checker")]
-fn actual_single_integer_guard<'a>(
+fn checked_integer_guard_slots<'a>(
     body: &FunctionCallSites,
     filter: &'a [CheckerPredicate],
-) -> Option<ActualSingleIntegerGuard<'a>> {
-    let ([parameter], Some([binding])) = (body.boundary.parameters.as_slice(), body.boundary.checker_parameter_bindings.as_deref()) else {
-        return None;
-    };
-    if !is_integer_type(&parameter.ty) {
+) -> Option<CheckedIntegerGuardSlots<'a>> {
+    let parameters = body.boundary.parameters.as_slice();
+    let bindings = body.boundary.checker_parameter_bindings.as_deref()?;
+    if !matches!(parameters.len(), 1 | 2) || parameters.len() != bindings.len()
+        || !parameters.iter().all(|parameter| is_integer_type(&parameter.ty))
+    {
         return None;
     }
-    let mut guard = ActualSingleIntegerGuard { always_rejects: false, comparisons: Vec::new() };
+    let mut guard = CheckedIntegerGuardSlots { arity: parameters.len(), always_rejects: false, comparisons: Vec::new() };
     for predicate in filter {
         match predicate {
             CheckerPredicate::Boolean(value) => guard.always_rejects |= !value,
-            CheckerPredicate::Integer(condition) if &condition.binding == binding => {
-                guard.comparisons.push((IntegerRelation::from_operator(&condition.operator)?, &condition.bound));
+            CheckerPredicate::Integer(predicate) => {
+                let slot = bindings.iter().position(|binding| binding == &predicate.binding)?;
+                guard.comparisons.push(ImportedEntryGuard {
+                    slot,
+                    relation: IntegerRelation::from_operator(&predicate.operator)?,
+                    bound: &predicate.bound,
+                });
             }
-            CheckerPredicate::Integer(_) => return None,
         }
     }
     Some(guard)
@@ -1561,7 +1573,7 @@ fn actual_single_integer_guard<'a>(
 
 #[cfg(feature = "internal-checker")]
 struct SelectedProofObserver<'a> {
-    guard: Option<ActualSingleIntegerGuard<'a>>,
+    guard: Option<CheckedIntegerGuardSlots<'a>>,
     relation: IntegerRelation,
     bound: &'a BigInt,
     coverage: ActualProofCoverage,
@@ -1588,7 +1600,7 @@ impl SelectedProofObserver<'_> {
     }
 
     fn record(&mut self, arguments: &[&BigInt], value: &BigInt) {
-        let (Some(guard), [argument]) = (&self.guard, arguments) else {
+        let Some(guard) = self.guard.as_ref().filter(|guard| guard.arity == arguments.len()) else {
             self.coverage = ActualProofCoverage::Unsupported;
             return;
         };
@@ -1596,7 +1608,9 @@ impl SelectedProofObserver<'_> {
             return;
         }
         if !guard.always_rejects
-            && guard.comparisons.iter().all(|(relation, bound)| relation.accepts(argument.cmp(bound)))
+            && guard.comparisons.iter().all(|comparison| {
+                arguments.get(comparison.slot).is_some_and(|argument| comparison.relation.accepts((*argument).cmp(comparison.bound)))
+            })
         {
             self.coverage = if self.relation.accepts(value.cmp(self.bound)) {
                 ActualProofCoverage::Proved

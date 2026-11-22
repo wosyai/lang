@@ -885,3 +885,49 @@ fn verified_bound_checks_both_ordered_typed_call_arguments_and_repeated_aliases(
     );
     assert_eq!(use_bound("bounds", "wrong_width", &wrong_width), ScalarProofCallOutcome::Unavailable);
 }
+
+#[test]
+fn paired_actual_proofs_observe_only_exact_initialized_tuples_in_slot_order() {
+    let identity = source();
+    let proof = |target: &str, initializers: &str, guard: &str, goal: &str| {
+        check_scalar_module_proof(
+            identity.clone(),
+            "observed",
+            vec![ScalarProofModuleInput {
+                source: identity.clone(),
+                text: format!(r#"%%start
+                    i16(u8, i16) pair = fn(low, high) {{ if (low == 0) {{}}; high }};
+                    i16(i16, i16) aliases = fn(low, high) {{ if (low == 0) {{}}; high }};
+                    unit(u8, i16) unit_pair = fn(low, high) {{
+                        if (low == 0) {{}};
+                        core.require(high <= 0, {OUTPUT});
+                    }};
+                    unit() nested = fn {{
+                        i16 out = pair(7, 3);
+                        core.require(out <= 3, {OUTPUT});
+                    }};
+                    {initializers}
+                    proof observed for {target}(first, second) -> (out) where ({guard}) ensures ({goal}) {{}}
+                %%end"#),
+                namespaces: Vec::new(),
+            }],
+            vec![identity.clone()],
+            ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
+        )
+    };
+
+    let exact = "i16 early = pair(7, -128); i16 late = pair(8, -4);";
+    assert_eq!(proof("pair", exact, "first >= 7 && second < 0", "out <= -4"), ScalarModuleProofOutcome::Proved);
+    assert_eq!(proof("pair", exact, "first >= 9 && second < 0", "out <= -4"), ScalarModuleProofOutcome::NoApplicableInputs);
+    assert_eq!(proof("pair", exact, "first <= 7 && second < 0", "out <= -128"), ScalarModuleProofOutcome::Proved);
+    let bad_then_good = "i16 early = pair(7, -2); i16 late = pair(8, -4);";
+    assert_eq!(proof("pair", bad_then_good, "first >= 7 && second < 0", "out <= -4"), ScalarModuleProofOutcome::Refuted);
+    let named = "u8 low_seed = 7; i16 high_seed = -128; i16 selected = pair(low_seed, high_seed);";
+    assert_eq!(proof("pair", named, "first >= 7 && second < 0", "out == -128"), ScalarModuleProofOutcome::Proved);
+    let repeated = "i16 known = -4; i16 selected = aliases(known, known);";
+    assert_eq!(proof("aliases", repeated, "first >= -4 && second <= -4", "out == -4"), ScalarModuleProofOutcome::Proved);
+    for extra in ["bool state = true; state = false;", "nested();", "unit_pair(7, -128);"] {
+        let incomplete = format!("{exact} {extra}");
+        assert_eq!(proof("pair", &incomplete, "first >= 7", "out <= -4"), ScalarModuleProofOutcome::Unsupported, "{extra}");
+    }
+}

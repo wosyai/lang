@@ -6921,19 +6921,20 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
             }
         }
         #[cfg(any(test, feature = "internal-checker"))]
+        let initializer_literal_argument = matches!(edge, OccurrenceEdge::CallArgument(0 | 1))
+            && matches!(self.mode, WalkMode::ModuleInitialization { .. });
+        #[cfg(any(test, feature = "internal-checker"))]
         if self.occurrence_typing.checker_directives_enabled()
             && (matches!(
                 edge,
                 OccurrenceEdge::AssignmentRhs { .. }
                     | OccurrenceEdge::BindingRoot { .. }
                     | OccurrenceEdge::FinalOutput { .. }
-            ) || (matches!(edge, OccurrenceEdge::CallArgument(0))
-                && matches!(self.mode, WalkMode::Callable(_) | WalkMode::ModuleInitialization { .. })))
+            ) || initializer_literal_argument
+                || (matches!(edge, OccurrenceEdge::CallArgument(0)) && matches!(self.mode, WalkMode::Callable(_))))
             && self.structure.checked_types.expressions.get(&ordinal).is_some_and(is_integer_type)
         {
-            let value = if matches!(edge, OccurrenceEdge::CallArgument(0))
-                && matches!(self.mode, WalkMode::ModuleInitialization { .. })
-            {
+            let value = if initializer_literal_argument {
                 super::checker_flow::concrete_integer_literal(expression).map(std::borrow::Cow::into_owned)
             } else if let ScalarExpression::Integer { value, .. } = expression {
                 Some(value.clone())

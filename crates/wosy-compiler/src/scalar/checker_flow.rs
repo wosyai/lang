@@ -421,8 +421,17 @@ pub(super) fn exact_integer_call_argument<'a>(
     call: OccurrenceOrdinal,
     lexical: impl FnOnce(OccurrenceOrdinal, &ScalarType) -> Option<&'a BigInt>,
 ) -> Option<ExactIntegerArgument<'a>> {
+    exact_integer_call_argument_at(structure, call, 0, lexical)
+}
+
+pub(super) fn exact_integer_call_argument_at<'a>(
+    structure: &'a OccurrenceStructure,
+    call: OccurrenceOrdinal,
+    slot: usize,
+    lexical: impl FnOnce(OccurrenceOrdinal, &ScalarType) -> Option<&'a BigInt>,
+) -> Option<ExactIntegerArgument<'a>> {
     let OccurrenceNode::Expression(argument) = structure.edges.get(&(
-        OccurrenceParent::Expression(call), OccurrenceEdge::CallArgument(0),
+        OccurrenceParent::Expression(call), OccurrenceEdge::CallArgument(slot),
     ))? else {
         return None;
     };
