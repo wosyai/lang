@@ -4608,19 +4608,20 @@ fn prepared_loan_read_reachability_stops_only_at_the_exact_binding_exit() {
     let mut cohort = super::control::ScopeExitBindings::default();
     cohort.insert(inner);
     let mut exact = HashMap::from([(CfgPointId(1), cohort)]);
-    assert!(reference_read_reachable(&points, Some(&exact), CfgPointId(0), &outer));
+    assert!(reference_read_reachable(&points, Some(&exact), true, CfgPointId(0), &outer));
     exact.get_mut(&CfgPointId(1)).unwrap().insert(outer.clone());
-    assert!(!reference_read_reachable(&points, Some(&exact), CfgPointId(0), &outer));
-    assert!(!reference_read_reachable(&points, None, CfgPointId(0), &outer));
+    assert!(!reference_read_reachable(&points, Some(&exact), true, CfgPointId(0), &outer));
+    assert!(!reference_read_reachable(&points, None, false, CfgPointId(0), &outer));
 
     // A cut or backedge on the first inspected successor must not lose a
     // deferred sibling. Its traversal reaches the outer read.
     let mut branched = points.to_vec();
     branched[0].successors = vec![CfgPointId(2), CfgPointId(1)];
+    assert!(reference_read_reachable(&branched, Some(&exact), true, CfgPointId(0), &outer));
     branched[1].successors = vec![CfgPointId(1)];
-    assert!(reference_read_reachable(&branched, Some(&exact), CfgPointId(0), &outer));
+    assert!(reference_read_reachable(&branched, Some(&exact), false, CfgPointId(0), &outer));
     branched[1].kind = CfgPointKind::Join;
-    assert!(reference_read_reachable(&branched, Some(&exact), CfgPointId(0), &outer));
+    assert!(reference_read_reachable(&branched, Some(&exact), false, CfgPointId(0), &outer));
     let mut pending = Vec::new();
     assert_eq!(defer_read_search_siblings(&[CfgPointId(2)], &mut pending), Some(CfgPointId(2)));
     assert_eq!(pending.capacity(), 0);
@@ -4756,6 +4757,7 @@ fn defer_read_search_siblings(successors: &[CfgPointId], pending: &mut Vec<CfgPo
 fn reference_read_reachable(
     points: &[ReferenceFlowPoint],
     scope_exits: Option<&HashMap<CfgPointId, super::control::ScopeExitBindings>>,
+    strictly_forward: bool,
     from: CfgPointId,
     binding: &ReferenceBindingId,
 ) -> bool {
@@ -4763,10 +4765,12 @@ fn reference_read_reachable(
     // This is the same DFS order as extending the stack then popping it,
     // without allocating a worklist on an ordinary straight-line path.
     let mut pending = Vec::new();
-    let mut next = defer_read_search_siblings(&points[from.0].successors, &mut pending);
+    let successors = &points[from.0].successors;
+    let mut track_visited = !strictly_forward || successors.len() > 1;
+    let mut next = defer_read_search_siblings(successors, &mut pending);
     let mut visited = BTreeSet::new();
     while let Some(id) = next.take().or_else(|| pending.pop()) {
-        if !visited.insert(id.0) {
+        if track_visited && !visited.insert(id.0) {
             continue;
         }
         if matches!(&points[id.0].kind, CfgPointKind::Read { binding: read } if read == binding) {
@@ -4781,7 +4785,11 @@ fn reference_read_reachable(
         {
             continue;
         }
-        next = defer_read_search_siblings(&points[id.0].successors, &mut pending);
+        let successors = &points[id.0].successors;
+        // Before the first fork a forward chain cannot revisit a node;
+        // after it, all reachable ids are beyond that chain's prefix.
+        track_visited |= successors.len() > 1;
+        next = defer_read_search_siblings(successors, &mut pending);
     }
     false
 }
@@ -4860,6 +4868,7 @@ enum LoanAccess<'a> {
 fn conflicting_live_loan(
     points: &[ReferenceFlowPoint],
     scope_exits: Option<&HashMap<CfgPointId, super::control::ScopeExitBindings>>,
+    strictly_forward: bool,
     facts: &[ReferenceOrigin],
     state: &ReferenceEdgeState,
     point: CfgPointId,
@@ -4906,7 +4915,7 @@ fn conflicting_live_loan(
                 continue;
             }
             if !reachable {
-                if !reference_read_reachable(points, scope_exits, point, binding) {
+                if !reference_read_reachable(points, scope_exits, strictly_forward, point, binding) {
                     break;
                 }
                 reachable = true;
@@ -6398,6 +6407,7 @@ fn transfer_reference_facts(
                                         let origins = conflicting_live_loan(
                                             original_points,
                                             cfg.scope_exit_bindings,
+                                            strictly_forward,
                                             &cfg.facts,
                                             &state,
                                             id,
@@ -6572,6 +6582,7 @@ fn transfer_reference_facts(
                     let origins = conflicting_live_loan(
                         original_points,
                         cfg.scope_exit_bindings,
+                        strictly_forward,
                         &cfg.facts,
                         &state,
                         id,
@@ -6805,7 +6816,7 @@ fn transfer_reference_facts(
                     {
                         continue;
                     }
-                    let origins = conflicting_live_loan(original_points, cfg.scope_exit_bindings, &cfg.facts, &state, id, place, LoanAccess::DirectShared);
+                    let origins = conflicting_live_loan(original_points, cfg.scope_exit_bindings, strictly_forward, &cfg.facts, &state, id, place, LoanAccess::DirectShared);
                     if !origins.is_empty() {
                         errors.push(ReferenceAnalysisError::ConflictingPlace { source_span: point.source_span.clone(), origins });
                     }
@@ -6877,6 +6888,7 @@ fn transfer_reference_facts(
                     origins.extend(conflicting_live_loan(
                         original_points,
                         cfg.scope_exit_bindings,
+                        strictly_forward,
                         &cfg.facts,
                         &state,
                         id,
@@ -6905,6 +6917,7 @@ fn transfer_reference_facts(
                         origins.extend(conflicting_live_loan(
                             original_points,
                             cfg.scope_exit_bindings,
+                            strictly_forward,
                             &cfg.facts,
                             &state,
                             id,
@@ -6944,6 +6957,7 @@ fn transfer_reference_facts(
                         let origins = conflicting_live_loan(
                             original_points,
                             cfg.scope_exit_bindings,
+                            strictly_forward,
                             &cfg.facts,
                             &state,
                             id,
@@ -6978,6 +6992,7 @@ fn transfer_reference_facts(
                         let origins = conflicting_live_loan(
                             original_points,
                             cfg.scope_exit_bindings,
+                            strictly_forward,
                             &cfg.facts,
                             &state,
                             id,
@@ -7267,6 +7282,7 @@ fn transfer_reference_facts(
                             let origins = conflicting_live_loan(
                                 original_points,
                                 cfg.scope_exit_bindings,
+                                strictly_forward,
                                 &cfg.facts,
                                 &state,
                                 id,
