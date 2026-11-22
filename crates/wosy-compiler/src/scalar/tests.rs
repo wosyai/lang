@@ -12963,3 +12963,102 @@ unit(Pair) inspect = fn(owner) {
     }
 
 }
+
+#[test]
+fn known_projected_mutable_leaf_uses_exact_checked_scalar_store_and_last_use() {
+    for (body, conflict) in [
+        ("u8 sibling = (*parent).right; *leaf = 7; u8 value = *leaf; sibling; value;", None),
+        ("*leaf = 7; (*parent).left = 8; u8 value = owner.left; value;", None),
+        ("u8 value = (*parent).left; *leaf = 7; value;", Some("(*parent).left;")),
+        ("(*parent).left = 3; *leaf = 7;", Some("(*parent).left =")),
+        ("u8 value = owner.right; *leaf = 7; value;", Some("owner.right;")),
+        ("owner.left = 3; *leaf = 7;", Some("owner.left =")),
+        ("*u8 next = &owner.right; *leaf = 7; *next;", Some("&owner.right")),
+        ("*!u8 next = &!owner.right; *leaf = 7; *next;", Some("&!owner.right")),
+    ] {
+        let text = format!(r#"%%start
+struct copy Pair {{ u8 left; u8 right; }}
+unit(Pair) inspect = fn(owner) {{
+    *!Pair parent = &!owner;
+    *!u8 leaf = &!(*parent).left;
+    {body}
+}};
+%%end"#);
+        let root = text.find("&!owner").unwrap() as u32;
+        let projected = text.find("&!(*parent).left").unwrap() as u32;
+        let holder = text.find("leaf =").unwrap() as u32;
+        let (single, project) = both_reference_functions(&text);
+        for (items, diagnostics) in [
+            (&single.program.items, &single.diagnostics),
+            (&project.project.modules[0].items, &project.diagnostics),
+        ] {
+            let ScalarItem::Function(function) = &items[0] else { panic!("typed callable") };
+            let cfg = &function.reference_cfg;
+            let (borrow, loan) = cfg.initial_points.iter().find_map(|point| match &point.kind {
+                CfgPointKind::Borrow { place, loan }
+                    if point.source_span.range.start == projected && loan.mode == ScalarReferenceMutability::Mutable
+                        && loan.parent.as_ref().is_some_and(|parent| parent.creation_span.start == root
+                            && parent.mode == ScalarReferenceMutability::Mutable && parent.origin_place.binding == place.binding)
+                        && matches!(place.projections.as_slice(),
+                            [ReferencePlaceProjection::Dereference(_), ReferencePlaceProjection::Field(ScalarFieldReference::Resolved(field))]
+                                if field.index == 0) => Some((point, loan)),
+                _ => None,
+            }).unwrap_or_else(|| panic!("typed scoped mutable projected loan: {body}: {diagnostics:?}"));
+            if let Some(conflict) = conflict {
+                let start = text.rfind(conflict).unwrap() as u32;
+                let access = start..start + conflict.len() as u32;
+                assert!(diagnostics.iter().any(|diagnostic| diagnostic.code == "B0003"
+                    && diagnostic.message == "read or move of unavailable place"
+                    && diagnostic.labels.first().is_some_and(|label| access.contains(&label.span.range.start))
+                    && diagnostic.labels.iter().skip(1).any(|label| label.span.range == borrow.source_span.range)),
+                    "{body}: {diagnostics:?}");
+            } else {
+                assert!(diagnostics.is_empty(), "{body}: {diagnostics:?}");
+                let child = cfg.points[borrow.id.0].possible_origins.as_ref().expect("child origins");
+                let origin = *child.first().expect("sole projected child");
+                assert_eq!(child.len(), 1);
+                let write = cfg.points.iter().find(|point| matches!(&point.kind,
+                    CfgPointKind::AssignThrough { pointer_point, .. }
+                        if matches!(&cfg.points[pointer_point.0].kind, CfgPointKind::Read { binding }
+                            if binding.declaration_span.start == holder))).expect("actual checked scalar store for the child holder");
+                let CfgPointKind::AssignThrough { pointer_point, rhs_point, candidates, .. } = &write.kind
+                    else { unreachable!() };
+                assert!(rhs_point < pointer_point);
+                let [candidate] = candidates.as_slice() else { panic!("exact store candidate: {write:?}") };
+                assert_eq!(candidate.origin, origin);
+                assert_eq!(&candidate.loan, loan);
+                let pointer = &cfg.points[pointer_point.0];
+                assert!(matches!(&pointer.kind, CfgPointKind::Read { binding } if binding.declaration_span.start == holder));
+                assert_eq!(pointer.possible_origins.as_ref(), Some(child));
+            }
+        }
+    }
+}
+
+#[test]
+fn known_projected_mutable_leaf_refuses_transport_and_nonscalar_store_shapes() {
+    let specimen = |body: &str| format!(r#"%%start
+struct copy Pair {{ u8 left; u8 right; }}
+(u8, bool)(bool) values = fn(flag) {{ u8 value = 7; value, flag }};
+unit(Pair) inspect = fn(owner) {{
+    *!Pair parent = &!owner;
+    *!u8 leaf = &!(*parent).left;
+    {body}
+}};
+%%end"#);
+    for body in [
+        "*!u8 alias = leaf; *alias = 7;",
+        "unsafe { &?owner; }; *leaf = 7;",
+        "bool other = false; *leaf, other = values(true); other;",
+        "if (true) { *leaf = 7; };",
+    ] {
+        let text = specimen(body);
+        let projected = text.find("&!(*parent).left").unwrap() as u32;
+        let (single, project) = both_reference_functions(&text);
+        for diagnostics in [&single.diagnostics, &project.diagnostics] {
+            assert!(diagnostics.iter().any(|diagnostic| diagnostic.code == "B0003"
+                && diagnostic.labels.first().is_some_and(|label| label.span.range.start == projected)),
+                "{body}: {diagnostics:?}");
+        }
+    }
+}

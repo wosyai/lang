@@ -280,6 +280,7 @@ pub(super) struct ReferenceFlowBuilder<'a> {
     checked_scalar_storage: BTreeSet<ReferenceBindingId>,
     checked_result_origins: BTreeSet<ReferenceOriginId>,
     proof_points: CallablePointFacts,
+    has_projected_mutable_child: bool,
     deferred_reborrow_roots: Vec<(ReferenceBindingId, super::control::DeferredReborrowRoot, CfgPointId, ReferenceOriginId)>,
     deferred_local_reborrow: bool,
     pub(super) source: SourceIdentity,
@@ -365,6 +366,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
             checked_scalar_storage: BTreeSet::new(),
             checked_result_origins: BTreeSet::new(),
             proof_points: CallablePointFacts::default(),
+            has_projected_mutable_child: false,
             deferred_reborrow_roots: Vec::new(),
             deferred_local_reborrow: deferred_named_reborrow_allowed(function, call_sites)
                 && call_sites.call_occurrences.is_empty()
@@ -2152,6 +2154,8 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         BTreeSet::from([id]),
                     );
                     if let (Some(pointer), Some(origin)) = (named_parent_point, parent_id) {
+                        self.has_projected_mutable_child |= *mutability == ScalarReferenceMutability::Mutable
+                            && direct_checked_field_base(place).is_some();
                         self.proof_points.named_reborrow_parents.push(super::control::NamedReborrowParent {
                             borrow,
                             pointer,
@@ -3720,7 +3724,8 @@ impl<'a> ReferenceFlowBuilder<'a> {
                                         );
                                     }
                                 }
-                                if capture.is_none() && self.proof_points.pending_named_reborrow.is_some()
+                                if capture.is_none()
+                                    && (self.proof_points.pending_named_reborrow.is_some() || self.has_projected_mutable_child)
                                     && matches!(target.place, ScalarPlace::Dereference { ref pointer, .. }
                                         if matches!(pointer.as_ref(), ScalarExpression::Name { .. }))
                                     && matches!(&self.cfg.points[pointer_point.0].kind,
@@ -3728,7 +3733,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                                             Some(ScalarType::CheckedReference { mutability: ScalarReferenceMutability::Mutable, inner })
                                                 if aggregate::ordinary_value(inner) && **inner == output_types[position]))
                                 {
-                                    self.proof_points.deferred_child_scalar_stores
+                                    self.proof_points.checked_named_scalar_stores
                                         .push(self.cursor.expect("typed scalar store"));
                                 }
                             } else {
@@ -4699,7 +4704,7 @@ struct ReferenceTransferCfg<'a> {
     checked_binding_initializers: &'a [(CfgPointId, CfgPointId)],
     resolved_checked_call_outputs: &'a [CfgPointId],
     checked_pointee_reads: &'a [CfgPointId],
-    deferred_child_scalar_stores: &'a [CfgPointId],
+    checked_named_scalar_stores: &'a [CfgPointId],
     named_reborrow_parents: &'a [super::control::NamedReborrowParent],
 }
 
@@ -4718,7 +4723,7 @@ impl<'a> ReferenceTransferCfg<'a> {
             checked_binding_initializers: proof.map_or(&[], |proof| &proof.checked_binding_initializers),
             resolved_checked_call_outputs: proof.map_or(&[], |proof| &proof.resolved_checked_call_outputs),
             checked_pointee_reads: proof.map_or(&[], |proof| &proof.checked_pointee_reads),
-            deferred_child_scalar_stores: proof.map_or(&[], |proof| &proof.deferred_child_scalar_stores),
+            checked_named_scalar_stores: proof.map_or(&[], |proof| &proof.checked_named_scalar_stores),
             named_reborrow_parents: proof.map_or(&[], |proof| &proof.named_reborrow_parents),
         }
     }
@@ -4857,7 +4862,7 @@ fn exact_projected_reborrow_parent_on_edge(
         || owner.binding == *binding || owner.binding != loan.origin_place.binding
         || loan.parent.as_deref() != Some(parent) || projected_parent.as_ref() != parent
         || field != projected_field
-        || loan.mode != ScalarReferenceMutability::Shared
+        || (loan.mode == ScalarReferenceMutability::Mutable && parent.mode != ScalarReferenceMutability::Mutable)
     {
         return false;
     }
@@ -4866,6 +4871,29 @@ fn exact_projected_reborrow_parent_on_edge(
         && exact_live_reborrow_holder(state, binding, authority.origin)
         && !state.released.contains(&owner.binding) && !state.invalidated.contains(&owner.binding)
         && !state.uninitialized.contains(&owner.binding) && !unavailable_place(state, owner)
+}
+
+fn exact_named_scalar_store_pointer<'a>(
+    write: &ReferenceFlowPoint,
+    points: &'a [ReferenceFlowPoint],
+    typed_stores: &[CfgPointId],
+    grouped_installs: &BTreeSet<CfgPointId>,
+) -> Option<(CfgPointId, &'a ReferenceBindingId)> {
+    let CfgPointKind::AssignThrough {
+        place: ScalarPlace::Dereference { pointer, .. }, pointer_point, rhs_point, ..
+    } = &write.kind else { return None };
+    if !matches!(pointer.as_ref(), ScalarExpression::Name { .. })
+        || typed_stores.binary_search(&write.id).is_err()
+        || grouped_installs.contains(&write.id)
+        || !write.possible_origins.as_ref().is_some_and(BTreeSet::is_empty)
+        || rhs_point >= pointer_point || pointer_point.0 + 1 != write.id.0
+    {
+        return None;
+    }
+    let read = points.get(pointer_point.0)?;
+    let CfgPointKind::Read { binding } = &read.kind else { return None };
+    (read.successors.as_slice() == [write.id] && read.scope == write.scope)
+        .then_some((*pointer_point, binding))
 }
 
 fn transfer_reference_facts(
@@ -4891,8 +4919,8 @@ fn transfer_reference_facts(
         .collect::<BTreeSet<_>>();
     let mut last_use = (0..cfg.points.len()).collect::<Vec<_>>();
     let mut strictly_forward = true;
-    let mut projected_readonly_sites = HashMap::new();
-    let mut projected_readonly_holders = HashMap::new();
+    let mut projected_leaf_sites = HashMap::new();
+    let mut projected_leaf_holders = HashMap::new();
     let mut projected_exposures = None;
     let mut known_lexical_owners = None::<HashMap<&ReferenceBindingId, Option<ReferencePlaceId>>>;
     let mut aggregate_expiry_allowed = aggregate.is_some();
@@ -4944,22 +4972,12 @@ fn transfer_reference_facts(
             *root == pending.handle || root == deferred_reborrow_owner(pending) || child_holders.contains_key(root)))
     });
     let exact_child_store = |write: &ReferenceFlowPoint| {
-        let CfgPointKind::AssignThrough {
-            place: ScalarPlace::Dereference { pointer, .. }, pointer_point, rhs_point, ..
-        } = &write.kind else { return None };
-        if child_holders.is_empty() || !matches!(pointer.as_ref(), ScalarExpression::Name { .. })
-            || cfg.deferred_child_scalar_stores.binary_search(&write.id).is_err()
-            || grouped_installs.contains(&write.id)
-            || !write.possible_origins.as_ref().is_some_and(BTreeSet::is_empty)
-            || rhs_point >= pointer_point || pointer_point.0 + 1 != write.id.0
-        {
+        if child_holders.is_empty() {
             return None;
         }
-        let read = &original_points[pointer_point.0];
-        let CfgPointKind::Read { binding } = &read.kind else { return None };
-        if read.successors.as_slice() != [write.id] || read.scope != write.scope {
-            return None;
-        }
+        let (_, binding) = exact_named_scalar_store_pointer(
+            write, original_points, cfg.checked_named_scalar_stores, &grouped_installs,
+        )?;
         child_holders.get(binding).copied()
     };
     for (index, point) in original_points.iter().enumerate() {
@@ -4998,8 +5016,7 @@ fn transfer_reference_facts(
         }
         match &point.kind {
             CfgPointKind::Borrow { loan, .. }
-                if loan.mode == ScalarReferenceMutability::Shared
-                    && direct_checked_field_base(&loan.origin_place.place).is_some() =>
+                if direct_checked_field_base(&loan.origin_place.place).is_some() =>
             {
                 let authority = cfg.named_reborrow_parents
                     .binary_search_by_key(&point.id, |parent| parent.borrow)
@@ -5024,36 +5041,44 @@ fn transfer_reference_facts(
                             && parent != binding && !cfg.allocations.contains(binding)
                             && !*unknown && !exposed.contains(owner) && !exposed.contains(parent)
                             && !exposed.contains(binding)
-                            && !projected_readonly_holders.contains_key(binding)
+                            && !projected_leaf_holders.contains_key(binding)
                         {
-                            projected_readonly_holders.insert(binding, (point.id, point.scope));
-                            projected_readonly_sites.insert(point.id, authority);
+                            projected_leaf_holders.insert(binding, (point.id, point.scope, loan.mode));
+                            projected_leaf_sites.insert(point.id, authority);
                         }
                     }
                 }
             }
             CfgPointKind::Read { binding } => {
-                if let Some(&(borrow, scope)) = projected_readonly_holders.get(binding) {
-                    let is_direct_read = match point.successors.as_slice() {
+                if let Some(&(borrow, scope, mode)) = projected_leaf_holders.get(binding) {
+                    let authorized = match point.successors.as_slice() {
                         [next] => original_points.get(next.0).is_some_and(|next| {
-                            point.scope == scope && next.scope == scope
-                                && cfg.checked_pointee_reads.binary_search(&next.id).is_ok()
-                                && matches!(&next.kind, CfgPointKind::ReadPlace {
+                            if point.scope != scope || next.scope != scope {
+                                return false;
+                            }
+                            match &next.kind {
+                                CfgPointKind::ReadPlace {
                                     place: ScalarPlace::Dereference { pointer, .. },
                                     pointer_point: Some(pointer_id), reads_origin: false, ..
-                                } if *pointer_id == point.id && matches!(pointer.as_ref(), ScalarExpression::Name { .. }))
+                                } => *pointer_id == point.id && matches!(pointer.as_ref(), ScalarExpression::Name { .. })
+                                    && cfg.checked_pointee_reads.binary_search(&next.id).is_ok(),
+                                CfgPointKind::AssignThrough { .. } if mode == ScalarReferenceMutability::Mutable =>
+                                    exact_named_scalar_store_pointer(next, original_points, cfg.checked_named_scalar_stores, &grouped_installs)
+                                        == Some((point.id, binding)),
+                                _ => false,
+                            }
                         }),
                         _ => false,
                     };
-                    if !is_direct_read {
-                        projected_readonly_sites.remove(&borrow);
+                    if !authorized {
+                        projected_leaf_sites.remove(&borrow);
                     }
                 }
             }
             CfgPointKind::Assign { target, .. } | CfgPointKind::Move { place: target, .. }
             | CfgPointKind::DeferredMove { place: target, .. } | CfgPointKind::Borrow { place: target, .. } => {
-                if let Some(&(borrow, _)) = projected_readonly_holders.get(&target.binding) {
-                    projected_readonly_sites.remove(&borrow);
+                if let Some(&(borrow, _, _)) = projected_leaf_holders.get(&target.binding) {
+                    projected_leaf_sites.remove(&borrow);
                 }
             }
             _ => {}
@@ -5361,7 +5386,7 @@ fn transfer_reference_facts(
             CfgPointKind::Borrow { place, loan } if direct_checked_field_base(&place.place).is_some() => Some(loan),
             _ => None,
         };
-        let projected_authority = projected_loan.and_then(|_| projected_readonly_sites.get(&id).copied());
+        let projected_authority = projected_loan.and_then(|_| projected_leaf_sites.get(&id).copied());
         if effective_point.is_some() {
             cfg.points[id.0] = initial_point.clone();
         }
@@ -10155,7 +10180,7 @@ fn derive_function_specialized_copy_policies(
                     checked_binding_initializers: &template_result.proof_points.checked_binding_initializers,
                     resolved_checked_call_outputs: &template_result.proof_points.resolved_checked_call_outputs,
                     checked_pointee_reads: &template_result.proof_points.checked_pointee_reads,
-                    deferred_child_scalar_stores: &template_result.proof_points.deferred_child_scalar_stores,
+                    checked_named_scalar_stores: &template_result.proof_points.checked_named_scalar_stores,
                     named_reborrow_parents: &template_result.proof_points.named_reborrow_parents,
                 },
                 &deferred,
@@ -10523,7 +10548,7 @@ fn build_function_reference_cfg(
                                 || ((site.parent.is_some() || loan.mode == ScalarReferenceMutability::Shared || differs_in_scope(solved))
                                         && origins.contains(&solved.source_span)
                                             && builder.proof_points.checked_pointee_reads.iter()
-                                                .chain(&builder.proof_points.deferred_child_scalar_stores)
+                                                .chain(&builder.proof_points.checked_named_scalar_stores)
                                                 .any(|access| {
                                                     let point = &builder.cfg.points[access.0];
                                                     let pointer = match &point.kind {

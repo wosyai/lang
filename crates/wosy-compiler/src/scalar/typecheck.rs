@@ -5017,7 +5017,7 @@ fn is_supported_checked_address_place(place: &ScalarPlace) -> bool {
     }
 }
 
-fn permits_readonly_named_checked_field(
+fn permits_named_checked_field_borrow(
     place: &ScalarPlace,
     mode: ScalarReferenceMutability,
     scope: &BTreeMap<String, ScalarType>,
@@ -5027,10 +5027,10 @@ fn permits_readonly_named_checked_field(
     };
     let ScalarPlace::Dereference { pointer, .. } = base.as_ref() else { return false };
     let ScalarExpression::Name { name, .. } = pointer.as_ref() else { return false };
-    mode == ScalarReferenceMutability::Shared
-        && matches!(scope.get(name), Some(ScalarType::CheckedReference {
-            inner, ..
-        }) if matches!(inner.as_ref(), ScalarType::Struct(_)))
+    matches!(scope.get(name), Some(ScalarType::CheckedReference {
+        mutability, inner,
+    }) if (mode == ScalarReferenceMutability::Shared || *mutability == ScalarReferenceMutability::Mutable)
+        && matches!(inner.as_ref(), ScalarType::Struct(_)))
 }
 
 fn is_addressable_checked_reference_type(ty: &ScalarType) -> bool {
@@ -5050,7 +5050,7 @@ fn checked_address_type(
     overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
-    if permits_readonly_named_checked_field(place, mutability, scope) {
+    if permits_named_checked_field_borrow(place, mutability, scope) {
         let inner = checked_dereference_type(place, span, scope, program, diagnostics, false, overloads, inference);
         if super::reference::aggregate::ordinary_value(&inner) {
             return ScalarType::CheckedReference { mutability, inner: Box::new(inner) };
@@ -5141,7 +5141,7 @@ fn checked_address_type_in_module(
     overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
-    if permits_readonly_named_checked_field(place, mutability, scope) {
+    if permits_named_checked_field_borrow(place, mutability, scope) {
         let inner = checked_dereference_type_in_module(place, span, scope, module, modules, diagnostics, false, overloads, inference);
         if super::reference::aggregate::ordinary_value(&inner) {
             return ScalarType::CheckedReference { mutability, inner: Box::new(inner) };

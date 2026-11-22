@@ -28,7 +28,7 @@ pub(crate) struct CallablePointFacts {
     pub(super) checked_block_values: Vec<(super::CfgPointId, super::CfgPointId)>,
     pub(super) checked_binding_initializers: Vec<(super::CfgPointId, super::CfgPointId)>,
     pub(super) resolved_checked_call_outputs: Vec<super::CfgPointId>,
-    pub(super) deferred_child_scalar_stores: Vec<super::CfgPointId>,
+    pub(super) checked_named_scalar_stores: Vec<super::CfgPointId>,
     pub(super) checked_pointee_reads: Vec<super::CfgPointId>,
     pub(super) named_reborrow_parents: Vec<NamedReborrowParent>,
     pub(super) formals: HashMap<usize, super::ReferenceBindingId>,

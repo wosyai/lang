@@ -494,11 +494,11 @@ unit(Pair) inspect = fn(owner) {
 }
 
 #[test]
-fn projected_reborrow_authority_does_not_enable_mutable_source_syntax() {
+fn projected_reborrow_authority_does_not_enable_mutability_from_a_shared_parent() {
     let text = r#"%%start
 struct copy Pair { u8 left; u8 right; }
 u8(Pair) inspect = fn(owner) {
-    *!Pair parent = &!owner;
+    *Pair parent = &owner;
     *!u8 child = &!(*parent).left;
     *child
 };
