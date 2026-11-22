@@ -1431,6 +1431,62 @@ mod tests {
 
     #[cfg(feature = "internal-checker")]
     #[test]
+    fn internal_proof_adapter_verifies_two_local_citations_without_expanding_source_scope() {
+        use wosy_compiler::ScalarModuleProofOutcome::{Proved, Unsupported};
+        let sources = [
+            ("main.w", r#"%%start
+                lib = namespace app "lib.w";
+                other = namespace app "other.w";
+            %%end"#),
+            ("lib.w", r#"%%start
+                i8(i8) echo = fn(value) { value };
+                proof nonnegative for echo(entry) -> (out) where (entry >= 0 && entry != 0) ensures (out >= 0) {}
+                proof nonzero for echo(entry) -> (out) where (entry >= 0 && entry != 0) ensures (out != 0) {}
+                proof joint for echo(entry) -> (out) where (entry >= 0 && entry != 0) ensures (out > 0) {
+                    core.use(nonnegative(entry));
+                    core.use(nonzero(entry));
+                }
+                proof wrong_source for echo(entry) -> (out) where (entry >= 0 && entry != 0) ensures (out > 0) {
+                    core.use(nonnegative(entry));
+                    core.use(foreign(entry));
+                }
+            %%end"#),
+            ("other.w", r#"%%start
+                i8(i8) echo = fn(value) { value };
+                proof foreign for echo(entry) -> (out) where (entry >= 0 && entry != 0) ensures (out != 0) {}
+            %%end"#),
+            ("unreachable.w", "this file is not in the target graph"),
+        ];
+        let (project, configuration) = routing_test_project("internal-proof-two-local-citations", &sources);
+        let lib = PackageRelativePath::new("lib.w".into()).unwrap();
+        let outside = PackageRelativePath::new("unreachable.w".into()).unwrap();
+        let check = |selections: &[(&PackageRelativePath, &str)]| check_loaded_proof_selections(
+            &project.root, &project, &configuration, ScalarTargetLayout::NATIVE64, selections,
+        );
+        let (result, counts) = routing_observations::observe(|| check(
+            &[(&lib, "joint"), (&lib, "wrong_source"), (&lib, "joint")],
+        ));
+        let (outcomes, texts) = result.expect("canonical selected proof input");
+        assert_eq!(outcomes.unwrap(), [Proved, Unsupported, Proved]);
+        assert_eq!(texts.len(), 3);
+        assert!(texts.values().any(|text| text == sources[2].1));
+        assert!(!texts.values().any(|text| text == sources[3].1));
+        assert_eq!(counts, routing_observations::Counts { extractions: 3, checks: 1, ..Default::default() });
+        let (result, counts) = routing_observations::observe(|| check(&[(&lib, "joint"), (&outside, "foreign")]));
+        assert!(matches!(result, Err(CanonicalLoadFailure::Input(error)) if error.contains("unreachable.w")));
+        assert_eq!(counts, routing_observations::Counts { extractions: 3, ..Default::default() });
+        let mut remaining = fs::read_dir(&project.root).unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap()).collect::<Vec<_>>();
+        remaining.sort_unstable();
+        assert_eq!(remaining, ["lib.w", "main.w", "other.w", "unreachable.w"]);
+        for (name, text) in sources {
+            assert_eq!(fs::read_to_string(project.root.join(name)).unwrap(), text);
+        }
+        fs::remove_dir_all(&project.root).unwrap();
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
     fn internal_proof_adapter_reuses_only_the_selected_producer_and_caller_from_one_graph() {
         use wosy_compiler::ScalarProofCallOutcome;
         let sources = [
