@@ -6096,6 +6096,54 @@ mod tests {
 
     #[cfg(feature = "internal-checker")]
     #[test]
+    fn ordered_package_symbolic_terminal_disjunction_keeps_the_surviving_return_arm() {
+        let app = source("src/main.w", "terminal-branch-disjunction");
+        let prepare = |actual: &str| {
+            let text = format!(r#"%%start
+                u8(u8) checked = fn(x) {{
+                    core.narrow(x != 4, {OUTPUT});
+                    if (x < 2 || x > 6) {{
+                        core.require(x != 7, {OUTPUT});
+                        core.narrow(false, {OUTPUT});
+                        core.require(false, {OUTPUT});
+                        0
+                    }} else {{
+                        core.require(x != 3, {OUTPUT});
+                        core.require(x != 4, {OUTPUT});
+                        x
+                    }}
+                }};
+                {actual}
+            %%end"#);
+            let project = prepare_checker_project(
+                vec![(declarations(&app, &text), Vec::new())], vec![app.clone()], inputs(),
+            ).unwrap();
+            (text, project)
+        };
+        let (text, prepared) = prepare("");
+        let (active, failures) = collect_ordered_package_failures(&prepared, ScalarCheckerScope::CurrentPackage, 1).unwrap();
+        assert!(active);
+        let records = failures.into_iter().map(|failure| {
+            let ProjectCheck::Failed { operation, condition, state, .. } = failure else { panic!("expected callable failure"); };
+            let intervals = state.intervals_at(0, 0).unwrap()
+                .map(|(first, last)| (first.clone(), last.clone())).collect::<Vec<_>>();
+            (operation, text[condition.start as usize..condition.end as usize].to_owned(), intervals)
+        }).collect::<Vec<_>>();
+        let expected = |operation, condition: &str, ranges: &[(u8, u8)]| (operation, condition.to_owned(), ranges.iter()
+            .map(|&(first, last)| (BigInt::from(first), BigInt::from(last))).collect::<Vec<_>>());
+        assert_eq!(records, [
+            expected(CheckerOperation::Require, "x != 7", &[(7, 7)]),
+            expected(CheckerOperation::Narrow, "false", &[(0, 1), (7, 255)]),
+            expected(CheckerOperation::Require, "x != 3", &[(3, 3)]),
+        ]);
+        assert_eq!(check_package_roots(&prepared), Err(ProjectCheck::Unsupported));
+        assert_eq!(collect_ordered_package_failures(&prepared, ScalarCheckerScope::MainFlowOnly, 1), Ok((false, Vec::new())));
+        let (_, actual) = prepare("u8 used = checked(7);");
+        assert_eq!(collect_ordered_package_failures(&actual, ScalarCheckerScope::MainFlowOnly, 1), Err(ProjectCheck::Unsupported));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
     fn ordered_package_symbolic_projection_preserves_disjoint_axis_and_caller_correlations() {
         let app = source("src/main.w", "collect-projected-symbolic-roots");
         let prepare = |leaf_body: &str, caller_prune: &str| {
