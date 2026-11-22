@@ -2319,7 +2319,7 @@ struct UnusedModuleProofGroup<'plan, 'project> {
 struct PairedPeerUse<'plan, 'project> {
     index: usize,
     consumer: &'plan PlannedModuleProof<'project>,
-    leaves: [(&'plan str, (IntegerRelation, &'plan BigInt)); 2],
+    leaves: [usize; 2],
     entails: bool,
 }
 
@@ -2845,7 +2845,6 @@ impl PreparedProofModule {
                 graph.activate(requested);
                 admitted_roots.push((index, plan, requested, strict_entry, claim));
             }
-            let mut admitted_pairs = Vec::new();
             for (index, plan, [first, second]) in pending_pairs {
                 let Some(catalog) = selected.catalog(plan.proof_source) else { continue; };
                 let (Ok(first), Ok(second)) = (catalog.declaration(first), catalog.declaration(second))
@@ -2855,28 +2854,25 @@ impl PreparedProofModule {
                 if first == second {
                     continue;
                 }
-                admitted_pairs.push((index, plan, first, second));
-            }
-            graph.resolve_edges(self, selected, plans);
-            graph.resolve_terminals();
-            for (index, plan, first, second) in admitted_pairs {
                 let direct = |index: usize| {
                     let peer = graph.nodes[index].plan()?;
                     if !peer.steps.items.is_empty() || !plan.same_peer_context(peer) {
                         return None;
                     }
-                    Some((peer.name, peer.peer_literal_goal()?))
+                    peer.peer_literal_goal()
                 };
-                let (Some(first), Some(second)) = (direct(first), direct(second)) else { continue; };
+                let (Some(first_goal), Some(second_goal)) = (direct(first), direct(second)) else { continue; };
                 let Some(goal) = plan.peer_literal_goal() else { continue; };
                 let entails = cited_bounds.bounds_for(plan.typed.result_type).is_some_and(|(min, max)| {
-                    super::symbolic_integer::integer_predicate_pair_implies(first.1, second.1, goal, (min, max))
+                    super::symbolic_integer::integer_predicate_pair_implies(first_goal, second_goal, goal, (min, max))
                 });
                 let key = (plan.target, ExactGuardGroup(plan.filter.as_deref()));
                 arbitrary_groups.entry(key).or_default().paired_uses.push(PairedPeerUse {
                     index, consumer: plan, leaves: [first, second], entails,
                 });
             }
+            graph.resolve_edges(self, selected, plans);
+            graph.resolve_terminals();
             let integer_equality = IntegerRelation::from_operator(&BinaryOperator::Equal).expect("checked integer equality");
             for (index, plan, requested, strict_entry, claim) in admitted_roots {
                 let Some(leaf) = graph.terminal(requested) else { continue; };
@@ -2982,8 +2978,12 @@ impl PreparedProofModule {
             }
             for pair in &group.paired_uses {
                 if pair.entails {
-                    for (name, (relation, bound)) in pair.leaves {
-                        peers.entry((pair.consumer.proof_source, name)).or_insert_with(|| (relation, bound, Vec::new()));
+                    for leaf in pair.leaves {
+                        let peer = graph.nodes[leaf].plan().expect("admitted direct paired proof");
+                        let TypedProofGoal::Literal { relation, bound, .. } = &peer.typed.goal else {
+                            unreachable!("admitted direct paired literal goal");
+                        };
+                        peers.entry((peer.proof_source, peer.name)).or_insert_with(|| (*relation, bound, Vec::new()));
                     }
                 }
             }
@@ -3047,8 +3047,10 @@ impl PreparedProofModule {
                         checked_peers.insert(identity, checked);
                     }
                     for pair in group.paired_uses {
-                        if pair.entails && pair.leaves.iter().all(|(name, _)|
-                            matches!(checked_peers.get(&(pair.consumer.proof_source, *name)), Some(CheckedPeerLeaf::Proven)))
+                        if pair.entails && pair.leaves.iter().all(|&leaf| {
+                            let peer = graph.nodes[leaf].plan().expect("admitted direct paired proof");
+                            matches!(checked_peers.get(&(peer.proof_source, peer.name)), Some(CheckedPeerLeaf::Proven))
+                        })
                         {
                             outcomes[pair.index] = ScalarModuleProofOutcome::Proved;
                         }
