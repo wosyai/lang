@@ -1108,3 +1108,67 @@ fn dormant_symbolic_roots_can_check_a_nested_exact_unit_call_without_initializat
     assert_eq!(failure.operation, ScalarCheckerOperation::Require);
     assert_eq!(failure.witness.intervals_at(0, 0).unwrap().next(), Some((&2.into(), &2.into())));
 }
+
+#[test]
+fn callable_unit_if_else_preserves_structural_failure_and_selected_actual_paths() {
+    let callable = |start: &str| format!(r#"
+        unit(u8) select = fn(value) {{
+            if (value < 8) {{
+                core.require(value <= 6, {OUTPUT});
+            }} else {{
+                core.require(value >= 9, {OUTPUT});
+            }};
+            core.require(false, {OUTPUT});
+        }};
+        {start}
+    "#);
+    let unused = callable("");
+    let ScalarCheckerOutcome::Failed(failure) = check(&unused) else {
+        panic!("expected the first failing symbolic arm");
+    };
+    let authored = format!("%%start\n{unused}\n%%end");
+    assert_eq!(&authored[failure.condition.start as usize..failure.condition.end as usize], "value <= 6");
+    assert_eq!(failure.witness.intervals_at(0, 0).unwrap().next(), Some((&7.into(), &7.into())));
+
+    let actual = callable("select(8);");
+    let ScalarCheckerOutcome::Failed(failure) = check_scoped(&actual, ScalarCheckerScope::MainFlowOnly) else {
+        panic!("expected first failure in the selected actual else arm");
+    };
+    let authored = format!("%%start\n{actual}\n%%end");
+    assert_eq!(&authored[failure.condition.start as usize..failure.condition.end as usize], "value >= 9");
+    assert_eq!(failure.witness.intervals_at(0, 0).unwrap().next(), Some((&8.into(), &8.into())));
+}
+
+#[test]
+fn callable_unit_if_else_joins_only_the_remaining_feasible_rows() {
+    let joined = format!(r#"
+        unit(u8) retained = fn(value) {{
+            if (value < 8) {{
+                core.narrow(value == 7, {OUTPUT});
+            }} else {{
+                core.narrow(value == 9, {OUTPUT});
+            }};
+            core.require(value < 10, {OUTPUT});
+            core.require(value != 7, {OUTPUT});
+        }};
+    "#);
+    let ScalarCheckerOutcome::Failed(failure) = check(&joined) else {
+        panic!("expected only the final failing joined state");
+    };
+    let authored = format!("%%start\n{joined}\n%%end");
+    assert_eq!(&authored[failure.condition.start as usize..failure.condition.end as usize], "value != 7");
+    assert_eq!(failure.witness.intervals_at(0, 0).unwrap().next(), Some((&7.into(), &7.into())));
+
+    let selected = format!(r#"
+        unit(u8) retained = fn(value) {{
+            if (value < 8) {{
+                core.require(!(value <= 100), {OUTPUT});
+            }} else {{
+                core.require(value >= 8, {OUTPUT});
+            }};
+        }};
+        retained(9);
+    "#);
+    assert_eq!(check_scoped(&selected, ScalarCheckerScope::MainFlowOnly), ScalarCheckerOutcome::Passed);
+    assert_eq!(check(&selected.replace("retained(9);", "retained(7);")), ScalarCheckerOutcome::Unsupported);
+}

@@ -747,18 +747,38 @@ fn walk_integer_block<'a, const USE_IMPORTED_BOUND: bool>(
                         return None;
                     };
                 } else {
-                    let ConditionalRegion::Unit { condition, then_block, .. } =
-                        calls.conditionals.get(&expression)?
-                    else {
-                        return None;
+                    let (condition, then_block, else_block) = match calls.conditionals.get(&expression)? {
+                        ConditionalRegion::Unit { condition, then_block, .. } =>
+                            (condition, *then_block, None),
+                        ConditionalRegion::Value { condition, then_block, else_block, .. }
+                            if structure.checked_types.expressions.get(&expression) == Some(&ScalarType::Unit) =>
+                            (condition, *then_block, Some(*else_block)),
+                        _ => return None,
                     };
                     let predicate = structure.checker_branches.get(condition)?;
                     let (yes, no, axis) = path.split(roots, predicate)?;
-                    match walk_integer_block::<USE_IMPORTED_BOUND>(calls, roots, *then_block, yes, None, None, handle_call)? {
-                        IntegerControl::Continue(then_path) => path = then_path.join(no, axis),
-                        failure @ IntegerControl::Fail(_) => return Some(failure),
-                        IntegerControl::Returned => return None,
+                    let mut continuation: Option<IntegerInputs> = None;
+                    for (arm, incoming) in [(Some(then_block), yes), (else_block, no)] {
+                        if incoming.is_unreachable() {
+                            continue;
+                        }
+                        let control = if let Some(arm) = arm {
+                            walk_integer_block::<USE_IMPORTED_BOUND>(calls, roots, arm, incoming, None, None, handle_call)?
+                        } else {
+                            IntegerControl::Continue(incoming)
+                        };
+                        match control {
+                            IntegerControl::Continue(outgoing) => {
+                                continuation = Some(match continuation {
+                                    Some(previous) => previous.join(outgoing, axis),
+                                    None => outgoing,
+                                });
+                            }
+                            failure @ IntegerControl::Fail(_) => return Some(failure),
+                            IntegerControl::Returned => return None,
+                        }
                     }
+                    path = continuation.unwrap_or_default();
                 }
             }
             BlockItemKind::FinalOutput(slot) => {
