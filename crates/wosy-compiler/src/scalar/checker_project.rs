@@ -1553,6 +1553,11 @@ struct VerifiedModuleReturnBound<'a> {
     bound: VerifiedReturnBound,
 }
 
+fn module_proof_name(proof: &CstNode) -> Option<CstToken> {
+    proof.children_with_tokens().filter_map(|element| element.into_token())
+        .find(|token| token.kind() == SyntaxKind::Identifier)
+}
+
 impl PreparedProofModule {
     #[cfg(test)]
     fn prepare(source: SourceIdentity, text: String, inputs: ScalarPreparationInputs) -> Result<Self, ProjectCheck> {
@@ -1642,10 +1647,7 @@ impl PreparedProofModule {
     fn select(&self, source: &SourceIdentity, proof_name: &str) -> Result<(&CstNode, usize), ProjectCheck> {
         let proofs = self.proofs.get(source).ok_or(ProjectCheck::MissingRoot)?;
         let mut selected = proofs.definitions.iter().enumerate().filter(|(_, proof)| {
-            proof.children_with_tokens()
-                .filter_map(|element| element.into_token())
-                .find(|token| token.kind() == SyntaxKind::Identifier)
-                .is_some_and(|token| token.text() == proof_name)
+            module_proof_name(proof).is_some_and(|token| token.text() == proof_name)
         });
         let (index, proof) = selected.next().ok_or(ProjectCheck::MissingRoot)?;
         if selected.next().is_some() {
@@ -1706,6 +1708,12 @@ impl PreparedProofModule {
         proof_name: &str,
     ) -> Result<SelectedModuleProof<'_>, ProjectCheck> {
         let (node, query) = self.select(proof_source, proof_name)?;
+        self.resolve_selected_proof(node, query)
+    }
+
+    fn resolve_selected_proof<'a>(
+        &'a self, node: &'a CstNode, query: usize,
+    ) -> Result<SelectedModuleProof<'a>, ProjectCheck> {
         let (project, calls) = self.prepared.parts();
         let ResolvedCheckerTarget { target, declaration: (module, item) } =
             calls.checker_targets.get(query).and_then(Option::as_ref).ok_or(ProjectCheck::MissingRoot)?;
@@ -2096,6 +2104,176 @@ struct PlannedModuleProof<'a> {
 }
 
 #[cfg(feature = "internal-checker")]
+struct LocalPeerCatalog<'a> {
+    source: &'a SourceIdentity,
+    proofs: &'a ModuleProofs,
+    names: HashMap<String, Option<usize>>,
+}
+
+#[cfg(feature = "internal-checker")]
+impl<'a> LocalPeerCatalog<'a> {
+    fn new(source: &'a SourceIdentity, proofs: &'a ModuleProofs) -> Self {
+        let mut names = HashMap::new();
+        for (index, definition) in proofs.definitions.iter().enumerate() {
+            if let Some(name) = module_proof_name(definition) {
+                names.entry(name.text().to_owned()).and_modify(|entry| *entry = None).or_insert(Some(index));
+            }
+        }
+        Self { source, proofs, names }
+    }
+
+    fn declaration(&'a self, name: &str) -> Option<(&'a str, &'a CstNode, usize)> {
+        let (name, slot) = self.names.get_key_value(name)?;
+        let index = (*slot)?;
+        Some((name.as_str(), &self.proofs.definitions[index], self.proofs.first_query + index))
+    }
+}
+
+#[cfg(feature = "internal-checker")]
+enum LocalPeerPlan<'a> {
+    Selected(&'a PlannedModuleProof<'a>),
+    Cited(Box<PlannedModuleProof<'a>>),
+}
+
+#[cfg(feature = "internal-checker")]
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum LocalPeerState {
+    Dormant,
+    Pending,
+    Visiting,
+    Rejected,
+    Terminal(usize),
+}
+
+#[cfg(feature = "internal-checker")]
+struct LocalPeerNode<'a> {
+    plan: Option<LocalPeerPlan<'a>>,
+    next: Option<usize>,
+    state: LocalPeerState,
+}
+
+#[cfg(feature = "internal-checker")]
+impl<'a> LocalPeerNode<'a> {
+    fn plan(&self) -> Option<&PlannedModuleProof<'a>> {
+        match self.plan.as_ref()? {
+            LocalPeerPlan::Selected(plan) => Some(plan),
+            LocalPeerPlan::Cited(plan) => Some(plan),
+        }
+    }
+}
+
+#[cfg(feature = "internal-checker")]
+#[derive(Default)]
+struct LocalPeerGraph<'a> {
+    by_declaration: HashMap<usize, usize>,
+    nodes: Vec<LocalPeerNode<'a>>,
+    active: Vec<usize>,
+}
+
+#[cfg(feature = "internal-checker")]
+impl<'a> LocalPeerGraph<'a> {
+    fn enroll(
+        &mut self, project: &'a PreparedProofModule,
+        selected: &HashMap<(&SourceIdentity, &str), usize>,
+        plans: &'a [(usize, PlannedModuleProof<'a>)],
+        source: &'a SourceIdentity, (name, node, declaration): (&'a str, &'a CstNode, usize),
+    ) -> usize {
+        *self.by_declaration.entry(declaration).or_insert_with(|| {
+            let plan = if let Some(request) = selected.get(&(source, name)) {
+                plans.binary_search_by_key(request, |(index, _)| *index).ok()
+                    .map(|at| LocalPeerPlan::Selected(&plans[at].1))
+            } else {
+                #[cfg(test)]
+                UNSELECTED_PEER_PLANS.with(|count| count.set(count.get() + 1));
+                project.resolve_selected_proof(node, declaration)
+                    .and_then(|proof| project.plan_resolved_module_proof::<false, true, false>(source, name, proof))
+                    .ok().map(|plan| LocalPeerPlan::Cited(Box::new(plan)))
+            };
+            let index = self.nodes.len();
+            self.nodes.push(LocalPeerNode { plan, next: None, state: LocalPeerState::Dormant });
+            index
+        })
+    }
+
+    fn activate(&mut self, index: usize) {
+        if self.nodes[index].state == LocalPeerState::Dormant {
+            self.nodes[index].state = LocalPeerState::Pending;
+            self.active.push(index);
+        }
+    }
+
+    fn resolve_edges(
+        &mut self, project: &'a PreparedProofModule,
+        selected: &HashMap<(&SourceIdentity, &str), usize>,
+        plans: &'a [(usize, PlannedModuleProof<'a>)],
+        catalogs: &'a HashMap<&'a SourceIdentity, LocalPeerCatalog<'a>>,
+    ) {
+        let mut ordinal = 0;
+        while let Some(&index) = self.active.get(ordinal) {
+            let request = (|| {
+                let plan = self.nodes[index].plan()?;
+                plan.peer_exact_equality()?;
+                if plan.steps.items.is_empty() {
+                    return None;
+                }
+                let catalog = catalogs.get(plan.proof_source)?;
+                Some((catalog.source, catalog.declaration(plan.direct_peer_use()?)?))
+            })();
+            if let Some((source, declaration)) = request {
+                let next = self.enroll(project, selected, plans, source, declaration);
+                let from = self.nodes[index].plan().expect("planned peer request");
+                if self.nodes[next].plan().is_some_and(|to| from.same_peer_context(to) && to.peer_exact_equality().is_some()) {
+                    self.nodes[index].next = Some(next);
+                    self.activate(next);
+                }
+            } else if self.nodes[index].plan().is_some_and(|plan| plan.steps.items.is_empty() && plan.peer_exact_equality().is_some()) {
+                self.nodes[index].state = LocalPeerState::Terminal(index);
+            } else {
+                self.nodes[index].state = LocalPeerState::Rejected;
+            }
+            ordinal += 1;
+        }
+    }
+
+    fn resolve_terminals(&mut self) {
+        let mut path = Vec::new();
+        for first in 0..self.nodes.len() {
+            if self.nodes[first].state != LocalPeerState::Pending {
+                continue;
+            }
+            let mut node = first;
+            let mut resolved = loop {
+                match self.nodes[node].state {
+                    LocalPeerState::Pending => {
+                        self.nodes[node].state = LocalPeerState::Visiting;
+                        path.push(node);
+                        let Some(next) = self.nodes[node].next else { break LocalPeerState::Rejected; };
+                        node = next;
+                    }
+                    LocalPeerState::Visiting | LocalPeerState::Dormant => break LocalPeerState::Rejected,
+                    state => break state,
+                }
+            };
+            while let Some(node) = path.pop() {
+                if let LocalPeerState::Terminal(terminal) = resolved {
+                    let value = |index: usize| self.nodes[index].plan().and_then(PlannedModuleProof::peer_exact_equality)
+                        .map(|(_, bound)| bound);
+                    if value(node) != value(terminal) {
+                        resolved = LocalPeerState::Rejected;
+                    }
+                }
+                self.nodes[node].state = resolved;
+            }
+        }
+    }
+
+    fn terminal(&self, index: usize) -> Option<&PlannedModuleProof<'a>> {
+        let LocalPeerState::Terminal(terminal) = self.nodes[index].state else { return None; };
+        self.nodes[terminal].plan()
+    }
+}
+
+#[cfg(feature = "internal-checker")]
 #[derive(Default)]
 struct UnusedModuleProofGroup<'plan, 'project> {
     direct: Vec<(usize, &'plan PlannedModuleProof<'project>)>,
@@ -2154,6 +2332,12 @@ impl PreparedProofModule {
     ) -> Result<PlannedModuleProof<'a>, ProjectCheck> {
         let (proof_source, _) = self.proofs.get_key_value(proof_source).ok_or(ProjectCheck::MissingRoot)?;
         let proof = self.select_resolved(proof_source, proof_name)?;
+        self.plan_resolved_module_proof::<ALLOW_INDUCTION, ALLOW_DOMAIN, DEFER_OUTPUT_UNION>(proof_source, proof_name, proof)
+    }
+
+    fn plan_resolved_module_proof<'a, const ALLOW_INDUCTION: bool, const ALLOW_DOMAIN: bool, const DEFER_OUTPUT_UNION: bool>(
+        &'a self, proof_source: &'a SourceIdentity, proof_name: &'a str, proof: SelectedModuleProof<'a>,
+    ) -> Result<PlannedModuleProof<'a>, ProjectCheck> {
         let (module, item, function) = proof.function;
         let steps = derive_block(&child(proof.node, SyntaxKind::Block)?);
         let typed = typed_proof_postcondition::<ALLOW_INDUCTION, DEFER_OUTPUT_UNION>(&self.prepared, proof.function, proof.node, &steps)?;
@@ -2257,7 +2441,8 @@ impl PreparedProofModule {
         let Ok((initialization, observers)) =
             check_package_initialization_observing(&self.prepared, root, ordinals, observers)
         else { return; };
-        let mut unselected_peers = HashMap::new();
+        let mut catalogs = HashMap::new();
+        let mut graph = LocalPeerGraph::default();
         let mut pending_peers = Vec::new();
         let mut arbitrary_groups = HashMap::<_, UnusedModuleProofGroup<'_, '_>>::new();
         for ((index, plan), observer) in plans.iter().zip(observers.proofs) {
@@ -2287,47 +2472,47 @@ impl PreparedProofModule {
                 let key = (plan.target, ExactGuardGroup(plan.filter.as_deref()));
                 arbitrary_groups.entry(key).or_default().direct.push((*index, plan));
             } else if let Some(peer) = plan.direct_peer_use() {
-                let identity = (plan.proof_source, peer);
-                if !selected.contains_key(&identity) {
-                    unselected_peers.entry(identity).or_insert_with(|| {
-                        #[cfg(test)]
-                        UNSELECTED_PEER_PLANS.with(|count| count.set(count.get() + 1));
-                        self.plan_module_proof_in_scope::<false, true, false>(plan.proof_source, peer).ok()
-                    });
-                }
                 pending_peers.push((*index, plan, peer));
             } else {
                 outcomes[*index] = module_proof_outcome(plan.verify_arbitrary_with_steps());
             }
         }
-        for (index, plan, peer) in pending_peers {
-            let identity = (plan.proof_source, peer);
-            let leaf = if let Some(request) = selected.get(&identity) {
-                let Ok(at) = plans.binary_search_by_key(request, |(index, _)| *index) else { continue; };
-                &plans[at].1
-            } else {
-                let Some(Some(leaf)) = unselected_peers.get(&identity) else { continue; };
-                leaf
-            };
-            if leaf.typed.measure.is_some() || !leaf.steps.items.is_empty()
-                || leaf.target != plan.target || leaf.canonical_target != plan.canonical_target
-                || is_null_literal_name(&leaf.typed.output)
-                || leaf.typed.input_names.iter().any(|name| is_null_literal_name(name))
-            {
-                continue;
+        if !pending_peers.is_empty() {
+            for (_, plan, _) in &pending_peers {
+                catalogs.entry(plan.proof_source).or_insert_with(|| {
+                    LocalPeerCatalog::new(plan.proof_source, &self.proofs[plan.proof_source])
+                });
             }
-            let TypedProofGoal::Literal { operator: BinaryOperator::Equal, relation, bound } = &leaf.typed.goal
-                else { continue; };
-            let leaf_guard = ExactGuardGroup(leaf.filter.as_deref());
-            let strict_entry = if leaf_guard == ExactGuardGroup(plan.filter.as_deref()) {
-                None
-            } else {
-                let Some(entry) = plan.closed_entry_admitted_by_peer(leaf) else { continue; };
-                Some(entry)
-            };
-            arbitrary_groups.entry((plan.target, leaf_guard)).or_default().peer_uses.push(UnusedPeerUse {
-                index, consumer: plan, name: peer, relation: *relation, bound, strict_entry,
-            });
+            let mut admitted_roots = Vec::new();
+            for (index, plan, peer) in pending_peers {
+                let Some(catalog) = catalogs.get(plan.proof_source) else { continue; };
+                let Some(declaration) = catalog.declaration(peer) else { continue; };
+                let requested = graph.enroll(self, selected, plans, catalog.source, declaration);
+                let Some(immediate) = graph.nodes[requested].plan() else { continue; };
+                if !plan.same_peer_target(immediate) || immediate.peer_exact_equality().is_none() {
+                    continue;
+                }
+                let strict_entry = if ExactGuardGroup(plan.filter.as_deref()) == ExactGuardGroup(immediate.filter.as_deref()) {
+                    None
+                } else if immediate.steps.items.is_empty() {
+                    let Some(entry) = plan.closed_entry_admitted_by_peer(immediate) else { continue; };
+                    Some(entry)
+                } else {
+                    continue;
+                };
+                graph.activate(requested);
+                admitted_roots.push((index, plan, requested, strict_entry));
+            }
+            graph.resolve_edges(self, selected, plans, &catalogs);
+            graph.resolve_terminals();
+            for (index, plan, requested, strict_entry) in admitted_roots {
+                let Some(leaf) = graph.terminal(requested) else { continue; };
+                let Some((relation, bound)) = leaf.peer_exact_equality() else { continue; };
+                let leaf_guard = ExactGuardGroup(leaf.filter.as_deref());
+                arbitrary_groups.entry((plan.target, leaf_guard)).or_default().peer_uses.push(UnusedPeerUse {
+                    index, consumer: plan, name: leaf.name, relation, bound, strict_entry,
+                });
+            }
         }
         for ((_, guard), group) in arbitrary_groups {
             let body = group.direct.first().map(|entry| entry.1)
@@ -2492,6 +2677,25 @@ impl PlannedModuleProof<'_> {
             goal: &self.typed.goal,
             coverage: ActualProofCoverage::Unseen,
         }
+    }
+
+    fn same_peer_target(&self, peer: &PlannedModuleProof<'_>) -> bool {
+        self.proof_source == peer.proof_source && self.target == peer.target && self.canonical_target == peer.canonical_target
+    }
+
+    fn same_peer_context(&self, peer: &PlannedModuleProof<'_>) -> bool {
+        self.same_peer_target(peer) && ExactGuardGroup(self.filter.as_deref()) == ExactGuardGroup(peer.filter.as_deref())
+    }
+
+    fn peer_exact_equality(&self) -> Option<(IntegerRelation, &BigInt)> {
+        if self.typed.measure.is_some() || is_null_literal_name(&self.typed.output)
+            || self.typed.input_names.iter().any(|name| is_null_literal_name(name))
+        {
+            return None;
+        }
+        let TypedProofGoal::Literal { operator: BinaryOperator::Equal, relation, bound } = &self.typed.goal
+            else { return None; };
+        Some((*relation, bound))
     }
 
     fn closed_entry_admitted_by_peer<'a>(&'a self, leaf: &PlannedModuleProof<'_>) -> Option<StrictPeerEntry<'a>> {
@@ -5097,6 +5301,34 @@ mod tests {
         assert_eq!(take_integer_observations(), (0, 0));
         assert_eq!(run("literal"), ScalarProofCallOutcome::Established);
         assert_eq!(take_integer_observations(), (1, 1));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn local_peer_graph_plans_transitive_citations_once_and_walks_one_leaf_domain() {
+        use super::super::checker_flow::take_integer_observations;
+        let file = source("src/main.w", "local-peer-graph");
+        let mut text = String::from(r#"%%start
+            u8(u8) fixed = fn(value) { if (value == 0) {}; 7 };
+            proof p0 for fixed(input) -> (out) where (input <= 7) ensures (out == 7) {}
+            proof unrelated for fixed(input) -> (out) ensures (out == 256) {}
+        "#);
+        for index in 1..=32 {
+            text.push_str(&format!(
+                "proof p{index} for fixed(arg) -> (out) where (arg <= 7) ensures (out == 7) {{ core.use(p{}(arg)); }}\n",
+                index - 1,
+            ));
+        }
+        text.push_str("%%end");
+        let _ = take_integer_observations();
+        let _ = UNSELECTED_PEER_PLANS.with(|count| count.replace(0));
+        assert_eq!(check_scalar_module_proofs(
+            file.clone(), &["p0", "p16", "p32"],
+            vec![ScalarProofModuleInput { source: file.clone(), text, namespaces: Vec::new() }],
+            vec![file], inputs(),
+        ).unwrap(), [ScalarModuleProofOutcome::Proved, ScalarModuleProofOutcome::Proved, ScalarModuleProofOutcome::Proved]);
+        assert_eq!(UNSELECTED_PEER_PLANS.with(|count| count.replace(0)), 30);
+        assert_eq!(take_integer_observations(), (1, 0));
     }
 
     #[cfg(feature = "internal-checker")]

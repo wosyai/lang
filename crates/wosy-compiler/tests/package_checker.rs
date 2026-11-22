@@ -1110,6 +1110,82 @@ fn named_proof_peer_use_checks_a_closed_interval_in_one_returned_entry_row() {
 }
 
 #[test]
+fn named_proof_peer_chain_is_iterative_and_shares_explicit_and_implicit_dependencies() {
+    let identity = source();
+    let check = |text: &str, names: &[&str]| {
+        check_scalar_module_proofs(
+            identity.clone(), names,
+            vec![ScalarProofModuleInput {
+                source: identity.clone(), text: format!("%%start\n{text}\n%%end"), namespaces: Vec::new(),
+            }],
+            vec![identity.clone()], ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
+        ).unwrap()
+    };
+    let mut chain = String::from(
+        "u8(u8) fixed = fn(value) { if (value == 0) {}; 7 };
+         proof stage0 for fixed(alias) -> (out) where (alias <= 7) ensures (out == 7) {}
+"
+    );
+    for i in 1..=80 {
+        chain.push_str(&format!(
+            "proof stage{i} for fixed(input) -> (answer) where (input <= 7) ensures (answer == 7) {{ core.use(stage{}(input)); }}\n",
+            i - 1,
+        ));
+    }
+    assert_eq!(check(&chain, &["stage80"]), [ScalarModuleProofOutcome::Proved]);
+    assert_eq!(check(&chain, &["stage80", "stage0", "stage40"]), [
+        ScalarModuleProofOutcome::Proved, ScalarModuleProofOutcome::Proved, ScalarModuleProofOutcome::Proved,
+    ]);
+    let actual = format!("{chain} u8 live = fixed(7);");
+    assert_eq!(check(&actual, &["stage80", "stage0", "stage40"]), [
+        ScalarModuleProofOutcome::Unsupported, ScalarModuleProofOutcome::Proved, ScalarModuleProofOutcome::Unsupported,
+    ]);
+}
+
+#[test]
+fn named_proof_peer_chain_rejects_cyclic_invalid_and_unproved_intermediates() {
+    let identity = source();
+    let check = |proofs: &str, requested: &[&str]| {
+        check_scalar_module_proofs(
+            identity.clone(), requested,
+            vec![ScalarProofModuleInput {
+                source: identity.clone(),
+                text: format!(r#"%%start
+                    u8(u8) fixed = fn(value) {{ if (value == 0) {{}}; 7 }};
+                    proof leaf for fixed(input) -> (out) where (input <= 7) ensures (out == 7) {{}}
+                    {proofs}
+                    proof outer for fixed(entry) -> (out) where (entry <= 7) ensures (out <= 7) {{
+                        core.use(middle(entry));
+                    }}
+                %%end"#),
+                namespaces: Vec::new(),
+            }],
+            vec![identity.clone()], ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
+        ).unwrap()
+    };
+    let invalid = "proof middle for fixed(x) -> (result) where (x <= 7) ensures (result == 256) { core.use(leaf(x)); }";
+    assert!(matches!(check(invalid, &["outer", "middle"]).as_slice(),
+        [ScalarModuleProofOutcome::Unsupported, ScalarModuleProofOutcome::Invalid(_)]));
+    let false_middle = invalid.replace("result == 256", "result == 8");
+    assert_eq!(check(&false_middle, &["outer", "middle", "leaf"]), [
+        ScalarModuleProofOutcome::Unsupported, ScalarModuleProofOutcome::Refuted, ScalarModuleProofOutcome::Proved,
+    ]);
+    let cycle = r#"
+        proof middle for fixed(x) -> (result) where (x <= 7) ensures (result == 7) { core.use(looped(x)); }
+        proof looped for fixed(y) -> (answer) where (y <= 7) ensures (answer == 7) { core.use(middle(y)); }
+    "#;
+    assert_eq!(check(cycle, &["outer", "middle", "looped", "leaf"]), [
+        ScalarModuleProofOutcome::Unsupported, ScalarModuleProofOutcome::Unsupported,
+        ScalarModuleProofOutcome::Unsupported, ScalarModuleProofOutcome::Proved,
+    ]);
+    let unique = invalid.replace("result == 256", "result == 7");
+    let duplicate = format!("{unique} {unique}");
+    assert_eq!(check(&duplicate, &["outer"]), [ScalarModuleProofOutcome::Unsupported]);
+    let mismatched = unique.replace("x <= 7", "x <= 6");
+    assert_eq!(check(&mismatched, &["outer"]), [ScalarModuleProofOutcome::Unsupported]);
+}
+
+#[test]
 fn verified_bound_checks_both_ordered_typed_call_arguments_and_repeated_aliases() {
     let identity = source();
     let use_bound = |proof: &str, caller: &str, extra: &str| {
