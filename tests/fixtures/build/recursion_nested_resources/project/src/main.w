@@ -7,8 +7,7 @@ u64(*u8, u64) descend = fn(backing, depth) {
     probe.checkpoint(0, depth, null);
     u64 length = 4;
     u8[length] scratch;
-    u8 stamp_base = 16;
-    scratch[0] = stamp_base + core.int_trunc<u8>(depth);
+    scratch[0] = 16 + core.int_trunc<u8>(depth);
     scratch[3] = 173;
     unsafe { probe.checkpoint(1, depth, &?scratch[0]); };
     u64 subtotal = if (depth == 0) { 0 } else { descend(backing, depth - 1) };

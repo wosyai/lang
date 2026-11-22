@@ -9268,13 +9268,15 @@ fn known_instruction_precedes_on_all_paths<'ctx>(
 
 #[test]
 fn emits_known_projected_leaf_from_the_original_owner_through_the_ordinary_driver() {
-    for (layout, parent_mode, child_mode, left_holder_mode) in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64]
+    for (layout, parent_mode, child_mode, left_holder_mode, parent_store) in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64]
         .into_iter().flat_map(|layout| [
-            (layout, "", "", None),
-            (layout, "!", "", None),
-            (layout, "!", "!", None),
-            (layout, "!", "!", Some("!")),
-            (layout, "!", "!", Some("")),
+            (layout, "", "", None, false),
+            (layout, "!", "", None, false),
+            (layout, "!", "", None, true),
+            (layout, "!", "!", None, false),
+            (layout, "!", "!", None, true),
+            (layout, "!", "!", Some("!"), false),
+            (layout, "!", "!", Some(""), false),
         ])
     {
         let left_declaration = left_holder_mode.map(|mode| {
@@ -9287,7 +9289,9 @@ fn emits_known_projected_leaf_from_the_original_owner_through_the_ordinary_drive
         } else {
             "owner.left"
         };
-        let stores = if left_holder_mode == Some("!") {
+        let stores = if parent_store {
+            "(*parent).left = 7;"
+        } else if left_holder_mode == Some("!") {
             "*left_leaf = 7; *leaf = 9;"
         } else if child_mode == "!" {
             "*leaf = 9;"
@@ -9352,18 +9356,21 @@ u8(Pair) inspect = fn(owner) {{
             let loan_owner = known_checked_address(&instructions, through_parent).expect("whole checked parent");
             assert_eq!((direct_offset, leaf_offset), (0, 1));
             assert_eq!(direct_owner, loan_owner, "both returned reads derive from the actual owner");
-            if !child_mode.is_empty() {
+            if parent_store || !child_mode.is_empty() {
                 let writes = instructions.iter().copied().filter_map(|instruction| {
                     if instruction.get_opcode() != InstructionOpcode::Store { return None; }
-                    let (parent, offset) = known_checked_field_path(
-                        &instructions, known_field_operand(instruction, 1)?,
-                    )?;
+                    let address = known_field_operand(instruction, 1)?;
+                    let (parent, offset) = if parent_store {
+                        known_direct_field_path(address)?
+                    } else {
+                        known_checked_field_path(&instructions, address)?
+                    };
                     let owner = known_checked_address(&instructions, parent)?;
                     (owner == loan_owner).then(|| (offset, instruction, known_stored_byte(&instructions, instruction)))
                 }).collect::<Vec<_>>();
                 let expected = [
-                    Some((leaf_offset, 9, returned_leaf_load)),
-                    (left_holder_mode == Some("!")).then_some((direct_offset, 7, returned_left_load)),
+                    (!parent_store && !child_mode.is_empty()).then_some((leaf_offset, 9, returned_leaf_load)),
+                    (parent_store || left_holder_mode == Some("!")).then_some((direct_offset, 7, returned_left_load)),
                 ];
                 assert_eq!(writes.len(), expected.iter().flatten().count(), "{ir}");
                 let entry = routine.get_first_basic_block().expect("entry block");
@@ -9375,6 +9382,10 @@ u8(Pair) inspect = fn(owner) {{
                     assert_eq!(*actual, byte, "{ir}");
                     assert!(known_instruction_precedes_on_all_paths(*write, read, entry),
                         "each exact store precedes its returned field load: {ir}");
+                    if parent_store {
+                        assert!(known_instruction_precedes_on_all_paths(*write, returned_leaf_load, entry),
+                            "the right child remains usable after the parent's left store: {ir}");
+                    }
                 }
             }
         }
