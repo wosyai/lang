@@ -9040,14 +9040,25 @@ fn known_direct_field_path(address: BasicValueEnum<'_>) -> Option<(BasicValueEnu
     Some((known_field_operand(field, 0)?, offset.get_zero_extended_constant()?))
 }
 
-#[test]
-fn emits_known_disjoint_checked_field_writes_through_the_ordinary_driver() {
+fn known_stored_byte<'ctx>(
+    instructions: &[InstructionValue<'ctx>], store: InstructionValue<'ctx>,
+) -> Option<u64> {
     fn constant_byte(value: BasicValueEnum<'_>) -> Option<u64> {
         let BasicValueEnum::IntValue(value) = value else { return None };
         if value.get_type().get_bit_width() != 8 { return None; }
         value.get_zero_extended_constant()
     }
 
+    let value = known_field_operand(store, 0)?;
+    constant_byte(value).or_else(|| {
+        let reload = value.as_instruction_value()?;
+        if reload.get_opcode() != InstructionOpcode::Load { return None; }
+        constant_byte(known_field_stored_value(instructions, known_field_operand(reload, 0)?)?)
+    })
+}
+
+#[test]
+fn emits_known_disjoint_checked_field_writes_through_the_ordinary_driver() {
     let source = r#"%%start
 struct copy Pair { u8 left; u8 right; }
 u8(Pair) update = fn(owner) {
@@ -9086,12 +9097,7 @@ u8(Pair) update = fn(owner) {
             let mut writes = instructions.iter().copied().filter_map(|instruction| {
                 if instruction.get_opcode() != InstructionOpcode::Store { return None; }
                 let path = known_checked_field_path(&instructions, known_field_operand(instruction, 1)?)?;
-                let value = known_field_operand(instruction, 0)?;
-                let literal = constant_byte(value).or_else(|| {
-                    let reload = value.as_instruction_value()?;
-                    if reload.get_opcode() != InstructionOpcode::Load { return None; }
-                    constant_byte(known_field_stored_value(&instructions, known_field_operand(reload, 0)?)?)
-                })?;
+                let literal = known_stored_byte(&instructions, instruction)?;
                 Some((path, literal))
             }).collect::<Vec<_>>();
             writes.sort_by_key(|((_, offset), _)| *offset);
@@ -9188,15 +9194,20 @@ u8(Pair) inspect = fn(owner) {
 }
 
 #[test]
-fn emits_known_shared_projected_leaf_from_the_original_owner_through_the_ordinary_driver() {
-    for (layout, mode, left) in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64]
-        .into_iter().flat_map(|layout| [(layout, "", "owner.left"), (layout, "!", "(*parent).left")])
+fn emits_known_projected_leaf_from_the_original_owner_through_the_ordinary_driver() {
+    for (layout, parent_mode, child_mode, left, store) in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64]
+        .into_iter().flat_map(|layout| [
+            (layout, "", "", "owner.left", ""),
+            (layout, "!", "", "(*parent).left", ""),
+            (layout, "!", "!", "(*parent).left", "*leaf = 9;"),
+        ])
     {
         let source = format!(r#"%%start
 struct copy Pair {{ u8 left; u8 right; }}
 u8(Pair) inspect = fn(owner) {{
-    *{mode}Pair parent = &{mode}owner;
-    *u8 leaf = &(*parent).right;
+    *{parent_mode}Pair parent = &{parent_mode}owner;
+    *{child_mode}u8 leaf = &{child_mode}(*parent).right;
+    {store}
     {left} + *leaf
 }};
 %%end"#);
@@ -9207,13 +9218,13 @@ u8(Pair) inspect = fn(owner) {{
             emit_scalar_build_single_module_llvm(&build),
             emit_scalar_build_project_llvm(&build),
         ] {
-            let ir = partition.expect("ordinary shared projected leaf LLVM").to_text();
+            let ir = partition.expect("ordinary projected leaf LLVM").to_text();
             let context = Context::create();
             let buffer = inkwell::memory_buffer::MemoryBuffer::create_from_memory_range_copy(
-                ir.as_bytes(), "known-shared-projected-leaf",
+                ir.as_bytes(), "known-projected-leaf",
             );
-            let module = context.create_module_from_ir(buffer).expect("parse shared projected leaf LLVM");
-            module.verify().expect("verify shared projected leaf LLVM");
+            let module = context.create_module_from_ir(buffer).expect("parse projected leaf LLVM");
+            module.verify().expect("verify projected leaf LLVM");
             let routine = module.get_functions().find(|routine| {
                 matches!(routine.get_type().get_return_type(), Some(inkwell::types::BasicTypeEnum::IntType(ty))
                     if ty.get_bit_width() == 8)
@@ -9227,14 +9238,14 @@ u8(Pair) inspect = fn(owner) {{
             let result = known_field_operand(result, 0).and_then(|value| value.as_instruction_value())
                 .expect("returned add value");
             assert_eq!(result.get_opcode(), InstructionOpcode::Add);
-            let [direct, checked] = [0, 1].map(|index| {
+            let [(direct, _), (checked, returned_leaf_load)] = [0, 1].map(|index| {
                 let read = known_field_operand(result, index).and_then(|value| value.as_instruction_value())
                     .expect("add consumes field read");
                 assert_eq!(read.get_opcode(), InstructionOpcode::Load);
-                known_field_operand(read, 0).expect("actual field address")
+                (known_field_operand(read, 0).expect("actual field address"), read)
             });
             let (direct_base, direct_offset) = known_direct_field_path(direct).expect("left owner field");
-            let direct_owner = if mode.is_empty() {
+            let direct_owner = if parent_mode.is_empty() {
                 direct_base
             } else {
                 known_checked_address(&instructions, direct_base).expect("mutable checked parent owner")
@@ -9244,6 +9255,47 @@ u8(Pair) inspect = fn(owner) {{
             let loan_owner = known_checked_address(&instructions, through_parent).expect("whole checked parent");
             assert_eq!((direct_offset, leaf_offset), (0, 1));
             assert_eq!(direct_owner, loan_owner, "both returned reads derive from the actual owner");
+            if !child_mode.is_empty() {
+                let writes = instructions.iter().copied().filter_map(|instruction| {
+                    if instruction.get_opcode() != InstructionOpcode::Store { return None; }
+                    let (parent, offset) = known_checked_field_path(
+                        &instructions, known_field_operand(instruction, 1)?,
+                    )?;
+                    let owner = known_checked_address(&instructions, parent)?;
+                    (owner == loan_owner && offset == leaf_offset)
+                        .then(|| (instruction, known_stored_byte(&instructions, instruction)))
+                }).collect::<Vec<_>>();
+                let [(write, Some(9))] = writes.as_slice() else {
+                    panic!("the checked child must store exactly one byte 9 for the returned field: {ir}");
+                };
+                let store_block = write.get_parent().expect("checked store block");
+                let read_block = returned_leaf_load.get_parent().expect("checked return load block");
+                let proven_before = if store_block == read_block {
+                    std::iter::successors(write.get_next_instruction(), |instruction| instruction.get_next_instruction())
+                        .any(|instruction| instruction == returned_leaf_load)
+                } else {
+                    let reaches = |start: inkwell::basic_block::BasicBlock<'_>, end, excluded| {
+                        let mut pending = vec![start];
+                        let mut seen = std::collections::HashSet::new();
+                        while let Some(block) = pending.pop() {
+                            if excluded == Some(block) || !seen.insert(block) {
+                                continue;
+                            }
+                            if block == end {
+                                return true;
+                            }
+                            if let Some(terminal) = block.get_terminator() {
+                                pending.extend(terminal.get_operands().filter_map(|operand| operand?.block()));
+                            }
+                        }
+                        false
+                    };
+                    let entry = routine.get_first_basic_block().expect("entry block");
+                    reaches(entry, read_block, None) && !reaches(entry, read_block, Some(store_block))
+                };
+                assert!(proven_before, "the exact store must precede the returned field load: {ir}");
+            }
+
         }
     }
 }
