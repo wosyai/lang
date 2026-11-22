@@ -865,7 +865,6 @@ struct IntegerRoots<'a> {
     parameters: usize,
     reached_obligation: bool,
     proof_reflexive_branches: bool,
-    imported_local: Option<ImportedLocal<'a>>,
 }
 
 impl<'a> IntegerRoots<'a> {
@@ -1927,7 +1926,7 @@ pub(super) fn check_integer_requirements(
 pub(super) fn check_integer_requirement_activity(
     calls: &FunctionCallSites,
 ) -> Option<Result<bool, IntegerCheckFailure<'_>>> {
-    run_integer_callable::<false, false, _>(calls, integer_tail_type(calls), None, None, None, None, None, None, false, ())
+    run_integer_callable::<false, false, _>(calls, integer_tail_type(calls), None, None, &mut [], None, None, None, false, ())
         .map(|result| result.map(|coverage| matches!(coverage, ProofCoverage::Applicable(true))))
 }
 
@@ -2023,7 +2022,7 @@ pub(super) fn collect_ordered_root_literal_proof<'a, const TOTAL: bool>(
             continuation: IntegerRequirementContinuation::Empty, projected: None, allow_projected_calls: false, sink: &mut sink,
         };
         match run_integer_callable::<false, true, _>(
-            calls, integer_tail_type(calls), entry_filter, None, None, None, None, Some(&mut collected), false, scope,
+            calls, integer_tail_type(calls), entry_filter, None, &mut [], None, None, Some(&mut collected), false, scope,
         )?.ok()? {
             ProofCoverage::Applicable(active) => active,
             ProofCoverage::NoApplicableInputs => false,
@@ -2092,7 +2091,7 @@ fn collect_integer_requirement_failures_in_scope<'a, Scoped: ScopedAuthoredRetur
         continuation: IntegerRequirementContinuation::Empty, projected, allow_projected_calls, sink,
     };
     let ProofCoverage::Applicable(active) = run_integer_callable::<false, true, _>(
-        calls, tail, None, None, None, exact, handle_call, Some(&mut collected), false, scope,
+        calls, tail, None, None, &mut [], exact, handle_call, Some(&mut collected), false, scope,
     )?.ok()? else { return None; };
     Some((active, collected.continuation))
 }
@@ -2239,7 +2238,7 @@ pub(super) fn check_integer_requirements_with_calls<'a>(
     handle_call: &mut ActualCallHandler<'a, '_>,
 ) -> Option<Result<bool, IntegerCheckFailure<'a>>> {
     let tail = if exact_arguments.is_none() { integer_tail_type(calls) } else { None };
-    run_integer_callable::<false, false, _>(calls, tail, None, None, None, exact_arguments, Some(handle_call), None, false, ())
+    run_integer_callable::<false, false, _>(calls, tail, None, None, &mut [], exact_arguments, Some(handle_call), None, false, ())
         .map(|result| result.map(|coverage| matches!(coverage, ProofCoverage::Applicable(true))))
 }
 
@@ -2250,7 +2249,7 @@ pub(super) fn proves_requirement_with_imported_root_local<'a>(
     if matches!(&local.values, ImportedIntegerValues::Ready(values, _) if values.is_empty()) {
         return None;
     }
-    match run_integer_callable::<true, false, _>(calls, integer_tail_type(calls), None, None, Some(local), None, None, None, false, ())? {
+    match run_integer_callable::<true, false, _>(calls, integer_tail_type(calls), None, None, &mut [Some(local)], None, None, None, false, ())? {
         Ok(ProofCoverage::Applicable(true)) => Some(true),
         Ok(ProofCoverage::Applicable(false)) => None,
         Ok(ProofCoverage::NoApplicableInputs) => None,
@@ -2259,14 +2258,14 @@ pub(super) fn proves_requirement_with_imported_root_local<'a>(
 }
 
 #[cfg(feature = "internal-checker")]
-pub(super) fn collect_ordered_imported_root_local<'a>(
-    calls: &'a FunctionCallSites, local: ImportedLocal<'a>, sink: &mut dyn FnMut(IntegerCheckFailure<'a>),
+pub(super) fn collect_ordered_imported_root_locals<'a>(
+    calls: &'a FunctionCallSites, imports: &mut [Option<ImportedLocal<'a>>], sink: &mut dyn FnMut(IntegerCheckFailure<'a>),
 ) -> Option<bool> {
     let mut failures = IntegerFailureCollection {
         continuation: IntegerRequirementContinuation::Empty, projected: None, allow_projected_calls: false, sink,
     };
     let ProofCoverage::Applicable(active) = run_integer_callable::<true, true, _>(
-        calls, integer_tail_type(calls), None, None, Some(local), None, None, Some(&mut failures), false, (),
+        calls, integer_tail_type(calls), None, None, imports, None, None, Some(&mut failures), false, (),
     )?.ok()? else { return None; };
     Some(active)
 }
@@ -2322,7 +2321,7 @@ fn observe_integer_returns_in_scope<'a, Authored: ScopedAuthoredReturn<'a>>(
         observations.set(if exact_arguments.is_some() { (arbitrary, actual + 1) } else { (arbitrary + 1, actual) });
     });
     let mut paths = Vec::new();
-    match run_integer_callable::<false, false, _>(calls, Some(tail), entry_filter, Some(&mut paths), None, exact_arguments, None, None, proof_reflexive_branches, authored_return)? {
+    match run_integer_callable::<false, false, _>(calls, Some(tail), entry_filter, Some(&mut paths), &mut [], exact_arguments, None, None, proof_reflexive_branches, authored_return)? {
         Ok(ProofCoverage::Applicable(_)) if !paths.is_empty() => {
             Some(Ok(ProofCoverage::Applicable(paths)))
         }
@@ -2652,7 +2651,7 @@ fn run_integer_callable<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool,
     tail: Option<&'a ScalarType>,
     entry_filter: Option<&[CheckerPredicate]>,
     returns: Option<&mut Vec<IntegerReturningPath<'a>>>,
-    imported_local: Option<ImportedLocal<'a>>,
+    mut imports: &mut [Option<ImportedLocal<'a>>],
     exact_arguments: Option<&[&BigInt]>,
     mut handle_call: Option<&mut ActualCallHandler<'a, '_>>,
     mut failures: Option<&mut IntegerFailureCollection<'a, '_>>,
@@ -2664,7 +2663,6 @@ fn run_integer_callable<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool,
     debug_assert_eq!(boundary.parameters.len(), checker_parameters.len());
     let mut roots = IntegerRoots {
         parameters: boundary.parameters.len(),
-        imported_local,
         proof_reflexive_branches,
         ..IntegerRoots::default()
     };
@@ -2714,16 +2712,16 @@ fn run_integer_callable<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool,
             }
         }
     }
-    let result = walk_integer_block::<USE_IMPORTED_BOUND, COLLECT, _>(calls, &mut roots, calls.structure.root, IntegerInputs(vec![row]), tail, returns, &mut handle_call, &mut failures, authored_return)?;
+    let result = walk_integer_block::<USE_IMPORTED_BOUND, COLLECT, _>(calls, &mut roots, calls.structure.root, IntegerInputs(vec![row]), tail, returns, &mut handle_call, &mut failures, &mut imports, authored_return)?;
     #[cfg(feature = "internal-checker")]
     if Authored::REQUIRE_TOTAL_RETURN && !matches!(result, IntegerControl::Returned) {
         return None;
     }
-    if USE_IMPORTED_BOUND && roots.imported_local.is_some() {
+    if USE_IMPORTED_BOUND && !imports.is_empty() {
         #[cfg(feature = "internal-checker")]
         let skipped_shared = COLLECT
             && matches!(&result, IntegerControl::Continue(path) if path.is_unreachable())
-            && matches!(&roots.imported_local, Some(ImportedLocal { values: ImportedIntegerValues::Shared { .. }, .. }));
+            && imports.iter().all(|import| matches!(import, Some(ImportedLocal { values: ImportedIntegerValues::Shared { .. }, .. })));
         #[cfg(not(feature = "internal-checker"))]
         let skipped_shared = false;
         if !skipped_shared {
@@ -2777,6 +2775,7 @@ fn walk_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, A
     mut returns: Option<&mut Vec<IntegerReturningPath<'a>>>,
     handle_call: &mut Option<&mut ActualCallHandler<'a, '_>>,
     failures: &mut Option<&mut IntegerFailureCollection<'a, '_>>,
+    imports: &mut &mut [Option<ImportedLocal<'a>>],
     authored_return: Authored,
 ) -> Option<IntegerControl<'a>> {
     let depth = roots.axes.len();
@@ -2877,7 +2876,7 @@ fn walk_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, A
                             continue;
                         }
                         let control = if let Some(arm) = arm {
-                            walk_integer_block::<USE_IMPORTED_BOUND, COLLECT, _>(calls, roots, arm, incoming, None, None, handle_call, failures, authored_return)?
+                            walk_integer_block::<USE_IMPORTED_BOUND, COLLECT, _>(calls, roots, arm, incoming, None, None, handle_call, failures, imports, authored_return)?
                         } else {
                             IntegerControl::Continue(incoming)
                         };
@@ -2929,7 +2928,7 @@ fn walk_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, A
                         } else {
                             authored_return
                         };
-                        match walk_integer_block::<USE_IMPORTED_BOUND, COLLECT, _>(calls, roots, arm, incoming, Some(expected), returns.as_deref_mut(), handle_call, failures, branch_return)? {
+                        match walk_integer_block::<USE_IMPORTED_BOUND, COLLECT, _>(calls, roots, arm, incoming, Some(expected), returns.as_deref_mut(), handle_call, failures, imports, branch_return)? {
                             IntegerControl::Returned => {}
                             failure @ IntegerControl::Fail(_) => return Some(failure),
                             IntegerControl::Continue(outgoing) if COLLECT && outgoing.is_unreachable() => {
@@ -2980,9 +2979,11 @@ fn walk_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, A
             }
             BlockItemKind::Binding(ref binding) => {
                 if USE_IMPORTED_BOUND && block == structure.root
-                    && roots.imported_local.as_ref().is_some_and(|local| local.position == item.position)
+                    && imports.first().and_then(Option::as_ref).is_some_and(|local| local.position == item.position)
                 {
-                    let local = roots.imported_local.take()?;
+                    let (local, rest) = std::mem::take(imports).split_first_mut()?;
+                    *imports = rest;
+                    let local = local.take()?;
                     let origin = structure.checker_integer_call_locals.get(&(block, item.position))?;
                     let [receiver] = binding.receivers() else {
                         return None;

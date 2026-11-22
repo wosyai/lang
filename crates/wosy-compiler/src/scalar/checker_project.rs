@@ -2182,40 +2182,59 @@ impl SelectedSymbolicProof<'_, '_> {
         {
             return Ok(None);
         }
-        let [call] = calls.call_occurrences.as_slice() else { return Ok(None); };
+        let occurrences = calls.call_occurrences.as_slice();
         let locals = &calls.structure.checker_integer_call_locals;
-        if locals.len() != 1 || calls.structure.checker_directives.is_empty() {
+        if !(1..=2).contains(&occurrences.len()) || locals.len() != occurrences.len()
+            || calls.structure.checker_directives.is_empty()
+        {
             return Ok(None);
         }
-        let Some((&(block, position), origin)) = locals.iter().next() else { return Ok(None); };
-        if block != calls.structure.root || call.ordinal != origin.call {
-            return Ok(None);
-        }
-        let Some(callee) = calls.structure.checker_direct_targets.get(&origin.call) else { return Ok(None); };
-        let summary = if *callee == first.target {
-            first
-        } else if let Some(summary) = self.additional_verified.get(callee) {
-            summary
-        } else {
-            return Ok(None);
+        let import = |&(block, position), origin: &CheckerIntegerCallOrigin| {
+            if block != calls.structure.root {
+                return Ok(None);
+            }
+            let Some(occurrence) = occurrences.iter().find(|site| site.ordinal == origin.call) else { return Ok(None); };
+            let Some(callee) = calls.structure.checker_direct_targets.get(&origin.call) else { return Ok(None); };
+            let summary = if *callee == first.target {
+                first
+            } else if let Some(summary) = self.additional_verified.get(callee) {
+                summary
+            } else {
+                return Ok(None);
+            };
+            if target.0 != summary.target.0 || target.1 <= summary.target.1 {
+                return Ok(None);
+            }
+            let site = calls.sites.get(occurrence.site).ok_or(ProjectCheck::MissingRootOccurrences)?;
+            let signature = calls.checked_call_signatures.get(&origin.call).ok_or(ProjectCheck::MissingRootOccurrences)?;
+            let [output] = summary.body.boundary.results.as_slice() else { return Err(ProjectCheck::Unsupported); };
+            if output.ordinal != 0 || !production_bound_reuse::matching_call(
+                summary.canonical_target, summary.layout, &summary.body.boundary.parameters, &output.ty,
+                summary.layout, calls, origin, &site.target, signature,
+            ) {
+                return Ok(None);
+            }
+            let values = ImportedIntegerValues::Shared { values: &summary.shared, bound: summary.bound, guard: summary.guard.as_ref() };
+            Ok(Some(ImportedLocal { position, values, guards: Vec::new() }))
         };
-        if target.0 != summary.target.0 || target.1 <= summary.target.1 {
-            return Ok(None);
-        }
-        let site = calls.resolved_call_site(origin.call).ok_or(ProjectCheck::MissingRootOccurrences)?;
-        let signature = calls.checked_call_signatures.get(&origin.call).ok_or(ProjectCheck::MissingRootOccurrences)?;
-        let [output] = summary.body.boundary.results.as_slice() else { return Err(ProjectCheck::Unsupported); };
-        if output.ordinal != 0 || !production_bound_reuse::matching_call(
-            summary.canonical_target, summary.layout, &summary.body.boundary.parameters, &output.ty,
-            summary.layout, calls, origin, &site.target, signature,
-        ) {
-            return Ok(None);
-        }
-        let values = ImportedIntegerValues::Shared { values: &summary.shared, bound: summary.bound, guard: summary.guard.as_ref() };
+        let mut locals = locals.iter();
+        let Some((position, first_origin)) = locals.next() else { return Ok(None); };
+        let Some(first_import) = import(position, first_origin)? else { return Ok(None); };
         let mut emit = |failure| effects.push_callable(calls, source, failure);
-        let active = super::checker_flow::collect_ordered_imported_root_local(
-            calls, ImportedLocal { position, values, guards: Vec::new() }, &mut emit,
-        ).ok_or(ProjectCheck::Unsupported)?;
+        let active = if let Some((position, second_origin)) = locals.next() {
+            if first_origin.call == second_origin.call {
+                return Ok(None);
+            }
+            let Some(second_import) = import(position, second_origin)? else { return Ok(None); };
+            let mut imports = if first_import.position < second_import.position {
+                [Some(first_import), Some(second_import)]
+            } else {
+                [Some(second_import), Some(first_import)]
+            };
+            super::checker_flow::collect_ordered_imported_root_locals(calls, &mut imports, &mut emit)
+        } else {
+            super::checker_flow::collect_ordered_imported_root_locals(calls, &mut [Some(first_import)], &mut emit)
+        }.ok_or(ProjectCheck::Unsupported)?;
         Ok(Some(active))
     }
 
@@ -8127,6 +8146,58 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
         assert_eq!(failure.operation, ScalarCheckerOperation::Narrow);
         let overlap = text.replace("input >= 0", "input >= -1");
         assert!(matches!(run(&overlap), Err(ProjectCheck::Unsupported)));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordered_current_package_reuses_two_verified_bindings_in_one_caller() {
+        let app = source("src/main.w", "ordered-automatic-proof-two-bindings");
+        let run = |text: &str| {
+            let (_, proof) = crate::parse_proof_source(app.clone(), text.to_owned(), &[])
+                .unwrap_or_else(|_| panic!("valid proof source"));
+            check_loaded_ordered_proof_diagnostics(
+                Vec::new(), vec![(proof, Vec::new())], vec![app.clone()], inputs(), ScalarCheckerScope::CurrentPackage,
+            )
+        };
+        let text = format!(r#"%%start
+            i16(i16) low = fn(input) {{ if (input < 0) {{ 7 }} else {{ 7 }} }};
+            i16(i16) high = fn(input) {{ if (input < 5) {{ input + 1 }} else {{ 11 }} }};
+            unit(i16) client = fn(input) {{
+                i16 first = low(input);
+                core.require(first == 8, {OUTPUT});
+                i16 second = high(first);
+                core.require(second == 12, {OUTPUT});
+            }};
+            proof upper for high(entry) -> (out) where (entry >= 5) ensures (out == 11) {{}}
+            proof lower for low(entry) -> (out) ensures (out == 7) {{}}
+        %%end"#);
+        let report = run(&text).unwrap();
+        assert!(report.active && report.diagnostics.is_empty() && report.symbolic_diagnostic.is_none());
+        let [first, second] = report.directives.as_slice() else { panic!("two ordered requirements"); };
+        let span_text = |span: ByteSpan| &text[span.start as usize..span.end as usize];
+        assert_eq!(span_text(first.condition), "first == 8");
+        assert_eq!(span_text(second.condition), "second == 12");
+        let seven = BigInt::from(7);
+        let eleven = BigInt::from(11);
+        assert!(first.witness.intervals_at(0, 1).unwrap().eq([(&seven, &seven)]));
+        assert!(first.witness.intervals_at(0, 2).is_none());
+        assert!(second.witness.intervals_at(0, 1).unwrap().eq([(&seven, &seven)]));
+        assert!(second.witness.intervals_at(0, 2).unwrap().eq([(&eleven, &eleven)]));
+
+        let valid = text.replace("first == 8", "first == 7").replace("second == 12", "second == 11");
+        let all_pass = run(&valid).unwrap();
+        assert!(all_pass.active && all_pass.directives.is_empty()
+            && all_pass.diagnostics.is_empty() && all_pass.symbolic_diagnostic.is_none());
+
+        let outside = text.replace("high(first)", "high(4)");
+        assert!(matches!(run(&outside), Err(ProjectCheck::Unsupported)));
+        let fatal = outside.replace("i16 second = high(4);", &format!("core.narrow(false, {OUTPUT}); i16 second = high(4);"));
+        let stopped = run(&fatal).unwrap();
+        let [before, narrow] = stopped.directives.as_slice() else { panic!("only checks before the unreachable binding"); };
+        assert_eq!(before.operation, ScalarCheckerOperation::Require);
+        assert_eq!(narrow.operation, ScalarCheckerOperation::Narrow);
+        assert!(narrow.witness.intervals_at(0, 1).unwrap().eq([(&seven, &seven)]));
+        assert!(narrow.witness.intervals_at(0, 2).is_none());
     }
 
     #[cfg(feature = "internal-checker")]
