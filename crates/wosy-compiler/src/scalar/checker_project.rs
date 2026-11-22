@@ -2184,16 +2184,15 @@ impl SelectedSymbolicProof<'_, '_> {
         }
         let occurrences = calls.call_occurrences.as_slice();
         let locals = &calls.structure.checker_integer_call_locals;
-        if !(1..=2).contains(&occurrences.len()) || locals.len() != occurrences.len()
+        if occurrences.is_empty() || locals.len() != occurrences.len()
             || calls.structure.checker_directives.is_empty()
         {
             return Ok(None);
         }
-        let import = |&(block, position), origin: &CheckerIntegerCallOrigin| {
+        let import = |&(block, position), origin: &CheckerIntegerCallOrigin, occurrence: &super::reference::CallOccurrence| {
             if block != calls.structure.root {
                 return Ok(None);
             }
-            let Some(occurrence) = occurrences.iter().find(|site| site.ordinal == origin.call) else { return Ok(None); };
             let Some(callee) = calls.structure.checker_direct_targets.get(&origin.call) else { return Ok(None); };
             let summary = if *callee == first.target {
                 first
@@ -2217,15 +2216,37 @@ impl SelectedSymbolicProof<'_, '_> {
             let values = ImportedIntegerValues::Shared { values: &summary.shared, bound: summary.bound, guard: summary.guard.as_ref() };
             Ok(Some(ImportedLocal { position, values, guards: Vec::new() }))
         };
+        let mut emit = |failure| effects.push_callable(calls, source, failure);
+        if occurrences.len() > 2 {
+            let mut imports = Vec::with_capacity(occurrences.len());
+            imports.resize_with(occurrences.len(), || None);
+            for (position, origin) in locals {
+                let Ok(index) = occurrences.binary_search_by_key(&origin.call.0, |site| site.ordinal.0) else {
+                    return Ok(None);
+                };
+                if imports[index].is_some() {
+                    return Ok(None);
+                }
+                let Some(local) = import(position, origin, &occurrences[index])? else { return Ok(None); };
+                imports[index] = Some(local);
+            }
+            debug_assert!(imports.windows(2).all(|adjacent|
+                adjacent[0].as_ref().map(|local| local.position) < adjacent[1].as_ref().map(|local| local.position)
+            ));
+            let active = super::checker_flow::collect_ordered_imported_root_locals(calls, &mut imports, &mut emit)
+                .ok_or(ProjectCheck::Unsupported)?;
+            return Ok(Some(active));
+        }
         let mut locals = locals.iter();
         let Some((position, first_origin)) = locals.next() else { return Ok(None); };
-        let Some(first_import) = import(position, first_origin)? else { return Ok(None); };
-        let mut emit = |failure| effects.push_callable(calls, source, failure);
+        let Some(first_site) = occurrences.iter().find(|site| site.ordinal == first_origin.call) else { return Ok(None); };
+        let Some(first_import) = import(position, first_origin, first_site)? else { return Ok(None); };
         let active = if let Some((position, second_origin)) = locals.next() {
             if first_origin.call == second_origin.call {
                 return Ok(None);
             }
-            let Some(second_import) = import(position, second_origin)? else { return Ok(None); };
+            let Some(second_site) = occurrences.iter().find(|site| site.ordinal == second_origin.call) else { return Ok(None); };
+            let Some(second_import) = import(position, second_origin, second_site)? else { return Ok(None); };
             let mut imports = if first_import.position < second_import.position {
                 [Some(first_import), Some(second_import)]
             } else {
@@ -8198,6 +8219,64 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
         assert_eq!(narrow.operation, ScalarCheckerOperation::Narrow);
         assert!(narrow.witness.intervals_at(0, 1).unwrap().eq([(&seven, &seven)]));
         assert!(narrow.witness.intervals_at(0, 2).is_none());
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordered_current_package_reuses_the_full_sequence_of_verified_root_bindings() {
+        let app = source("src/main.w", "ordered-automatic-proof-complete-bindings");
+        let run = |text: &str| {
+            let (_, proof) = crate::parse_proof_source(app.clone(), text.to_owned(), &[])
+                .unwrap_or_else(|_| panic!("valid proof source"));
+            check_loaded_ordered_proof_diagnostics(
+                Vec::new(), vec![(proof, Vec::new())], vec![app.clone()], inputs(), ScalarCheckerScope::CurrentPackage,
+            )
+        };
+        let text = format!(r#"%%start
+            i16(i16) low = fn(input) {{ if (input < 0) {{ 7 }} else {{ 7 }} }};
+            i16(i16) high = fn(input) {{ if (input < 5) {{ input + 1 }} else {{ 11 }} }};
+            unit(i16) client = fn(input) {{
+                i16 first = low(input);
+                core.require(first == 8, {OUTPUT});
+                i16 second = high(first);
+                i16 third = low(second);
+                core.require(third == 8, {OUTPUT});
+                i16 fourth = high(third);
+                core.require(fourth == 12, {OUTPUT});
+            }};
+            proof upper for high(entry) -> (out) where (entry >= 5) ensures (out == 11) {{}}
+            proof lower for low(entry) -> (out) ensures (out == 7) {{}}
+        %%end"#);
+        let report = run(&text).unwrap();
+        assert!(report.active && report.diagnostics.is_empty() && report.symbolic_diagnostic.is_none());
+        let [first, third, fourth] = report.directives.as_slice() else { panic!("three ordered requirements"); };
+        let span_text = |span: ByteSpan| &text[span.start as usize..span.end as usize];
+        assert_eq!(span_text(first.condition), "first == 8");
+        assert_eq!(span_text(third.condition), "third == 8");
+        assert_eq!(span_text(fourth.condition), "fourth == 12");
+        let seven = BigInt::from(7);
+        let eleven = BigInt::from(11);
+        assert!(first.witness.intervals_at(0, 2).is_none());
+        assert!(third.witness.intervals_at(0, 2).unwrap().eq([(&eleven, &eleven)]));
+        assert!(third.witness.intervals_at(0, 3).unwrap().eq([(&seven, &seven)]));
+        assert!(third.witness.intervals_at(0, 4).is_none());
+        assert!(fourth.witness.intervals_at(0, 4).unwrap().eq([(&eleven, &eleven)]));
+
+        let valid = text.replace("first == 8", "first == 7")
+            .replace("third == 8", "third == 7").replace("fourth == 12", "fourth == 11");
+        let valid = run(&valid).unwrap();
+        assert!(valid.active && valid.directives.is_empty() && valid.diagnostics.is_empty());
+
+        let outside = text.replace("high(third)", "high(4)");
+        assert!(matches!(run(&outside), Err(ProjectCheck::Unsupported)));
+        let fatal = outside.replace("i16 fourth = high(4);", &format!("core.narrow(false, {OUTPUT}); i16 fourth = high(4);"));
+        let stopped = run(&fatal).unwrap();
+        let [before, later, narrow] = stopped.directives.as_slice() else { panic!("only checks before the unreachable binding"); };
+        assert_eq!(before.operation, ScalarCheckerOperation::Require);
+        assert_eq!(later.operation, ScalarCheckerOperation::Require);
+        assert_eq!(narrow.operation, ScalarCheckerOperation::Narrow);
+        assert!(narrow.witness.intervals_at(0, 3).unwrap().eq([(&seven, &seven)]));
+        assert!(narrow.witness.intervals_at(0, 4).is_none());
     }
 
     #[cfg(feature = "internal-checker")]
