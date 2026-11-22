@@ -390,5 +390,18 @@ def main():
             assert (qualified.returncode, qualified.stdout, qualified.stderr) == (1, qualified_output, b""), qualified
 
 
+        bare = """
+            u8(u8) leaf = fn(value) { value };
+            proof leaf_cap for leaf(entry) -> (out) ensures (out != 7) {}
+            u8 actual_leaf = leaf(7);
+        """
+        mixed_recursion = reached_recursion.replace("%%end", bare + "%%end")
+        mixed_output = reached_output.replace(b"actual proof failures: 0", b"actual proof failures: 1")
+        for selected in (mixed_recursion, reached_recursion.replace("%%start", "%%start" + bare)):
+            source.write_text(selected, encoding="utf-8")
+            mixed = subprocess.run(recursive_effects_command, cwd=root, capture_output=True, timeout=15)
+            assert (mixed.returncode, mixed.stdout, mixed.stderr) == (1, mixed_output, b""), mixed
+
+
 if __name__ == "__main__":
     main()
