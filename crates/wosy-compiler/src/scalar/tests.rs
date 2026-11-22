@@ -5089,6 +5089,122 @@ fn validates_runtime_array_callable_transport() {
 }
 
 #[test]
+fn recursive_runtime_array_transfer_requires_the_correct_live_owner_at_the_join() {
+    for (prefix, install, suffix, expected_conflict) in [
+        ("", "bytes", "u8 observed = bytes[0]; observed", None),
+        ("*u8 view = &bytes[0]; u8 prior = *view; prior;", "bytes",
+            "u8 observed = bytes[0]; observed", None),
+        ("u8[length] next;", "next", "u8 observed = next[0]; observed", None),
+        ("u8[length] next;", "next", "u8 observed = next[0]; observed; bytes[0]", Some("old")),
+        ("*u8 view = &bytes[0];", "bytes", "u8 observed = *view; observed", Some("loan")),
+    ] {
+        let text = format!(r#"%%start
+(u8[], u64)(u8[], u64, u64) carry = fn(values, depth, count) {{
+    if (depth != 0) {{
+        u64 one = 1;
+        values, count = carry(values, depth - one, count);
+    }};
+    values, count
+}};
+u8(u64, bool) drive = fn(length, choose) {{
+    u8[length] bytes;
+    bytes[0] = 17;
+    u64 stamp = 1;
+    {prefix}
+    if (choose) {{
+        {install}, stamp = carry(bytes, length, stamp);
+    }};
+    {suffix}
+}};
+%%end"#);
+        let transfer = text.find("carry(bytes, length, stamp)").unwrap() as u32 + "carry(".len() as u32;
+        let owner_declaration = text.find("bytes;").unwrap() as u32;
+        let installed_declaration = if install == "bytes" {
+            owner_declaration
+        } else {
+            text.find("next;").unwrap() as u32
+        };
+        let (single, project) = both_reference_functions(&text);
+        for (items, diagnostics) in [
+            (&single.program.items, &single.diagnostics),
+            (&project.project.modules[0].items, &project.diagnostics),
+        ] {
+            let find_cfg = |name| items.iter().find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == name => Some(&function.reference_cfg),
+                _ => None,
+            }).unwrap_or_else(|| panic!("typed {name}: {diagnostics:?}"));
+            let check_move_and_reinstall = |cfg: &ScalarReferenceCfg, declaration, move_span, install_declaration| {
+                let moved = cfg.points.iter().find(|point| point.source_span.range.start == move_span
+                    && matches!(&point.kind, CfgPointKind::Move { place, owner, ty: ScalarType::RuntimeArray { .. }, .. }
+                        if place.binding == *owner && owner.declaration_span.start == declaration
+                            && place.projections.is_empty())
+                ).unwrap_or_else(|| panic!("actual owning argument move for {install}: {diagnostics:?}"));
+                let call = cfg.points.iter().find(|point| matches!(&point.kind,
+                    CfgPointKind::Call { expression: ScalarExpression::Call { receiver: None, name, .. },
+                        output: 0, .. } if name == "carry")
+                ).expect("canonical call result");
+                let write = cfg.points.iter().find(|point| matches!(&point.kind,
+                    CfgPointKind::Assign { target, rhs_point, .. } if *rhs_point == call.id
+                        && target.binding.declaration_span.start == install_declaration
+                        && target.projections.is_empty())
+                ).unwrap_or_else(|| panic!("ownership result installed into {install}: {diagnostics:?}"));
+                let join = cfg.points.iter().find(|point| matches!(&point.kind, CfgPointKind::Join)
+                    && point.id > write.id).expect("post-reinstall branch join");
+                assert!(moved.id < call.id && call.id < write.id && write.id < join.id);
+                let branch = cfg.points.iter().find(|point| matches!(&point.kind, CfgPointKind::Branch { .. })
+                    && point.id < moved.id).expect("conditional transfer");
+                assert_eq!(branch.successors.len(), 2);
+                assert!(branch.successors.contains(&join.id), "untaken edge bypasses transfer");
+                assert_eq!(cfg.points.iter().filter(|point| point.successors.contains(&join.id)).count(), 2);
+                (moved.id, join.id)
+            };
+            let recursive = text.find("carry(values, depth - one, count)").unwrap() as u32 + "carry(".len() as u32;
+            let parameter = text.find("fn(values,").unwrap() as u32 + "fn(".len() as u32;
+            check_move_and_reinstall(find_cfg("carry"), parameter, recursive, parameter);
+            let drive = find_cfg("drive");
+            let (moved, joined) = check_move_and_reinstall(drive, owner_declaration, transfer, installed_declaration);
+            let read = |target: &str, declaration| {
+                let start = text.rfind(target).unwrap() as u32;
+                let out = start..start + target.len() as u32;
+                drive.points.iter().find(|point| point.id > joined
+                    && out.contains(&point.source_span.range.start)
+                    && matches!(&point.kind, CfgPointKind::ReadPlace { candidates, .. }
+                        if candidates.iter().any(|place| place.binding.declaration_span.start == declaration)))
+                    .unwrap_or_else(|| panic!("actual post-join read of {target}: {diagnostics:?}"))
+            };
+            match expected_conflict {
+                Some("old") => {
+                    read("next[0]", installed_declaration);
+                    let old = read("bytes[0]", owner_declaration);
+                    assert!(diagnostics.iter().any(|diagnostic| diagnostic.code == "B0003"
+                        && diagnostic.message == "read or move of unavailable place"
+                        && diagnostic.labels.first().is_some_and(|label| label.span == old.source_span)
+                        && diagnostic.labels.iter().skip(1).any(|label| label.span == drive.points[moved.0].source_span)
+                    ), "{diagnostics:?}");
+                }
+                Some("loan") => {
+                    let borrow = text.find("&bytes[0]").unwrap() as u32;
+                    let future_use = text.rfind("*view").unwrap() as u32 + 1;
+                    assert!(drive.points.iter().any(|point| point.id > joined
+                        && point.source_span.range.start == future_use
+                        && matches!(&point.kind, CfgPointKind::Read { .. })));
+                    assert!(diagnostics.iter().any(|diagnostic| diagnostic.code == "B0003"
+                        && diagnostic.message == "read or move of unavailable place"
+                        && diagnostic.labels.first().is_some_and(|label| label.span.range.start == transfer)
+                        && diagnostic.labels.iter().skip(1).any(|label| label.span.range.start == borrow)
+                    ), "{diagnostics:?}");
+                }
+                None => {
+                    read(if install == "bytes" { "bytes[0]" } else { "next[0]" }, installed_declaration);
+                    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+}
+
+#[test]
 fn validates_runtime_array_binding_move_and_top_level_materialization() {
     let validation = validate_text(
             "%%start\nu64 length = 1;\nu8[length] first;\nu8[] second = first;\nsecond[0] = 7;\nu8 value = second[0];\n%%end",
