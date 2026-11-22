@@ -1786,6 +1786,54 @@ fn named_proof_citation_then_show_checks_both_claims_against_verified_evidence()
 }
 
 #[test]
+fn named_proof_two_citations_intersect_independently_verified_same_context_predicates() {
+    let identity = source();
+    let check = |guard: &str, second_guard: &str, second_goal: &str, goal: &str, steps: &str, names: &[&str]| {
+        check_scalar_module_proofs(
+            identity.clone(), names,
+            vec![ScalarProofModuleInput {
+                source: identity.clone(),
+                text: format!(r#"%%start
+                    i8(i8) echo = fn(value) {{ value }};
+                    proof nonnegative for echo(entry) -> (out) where ({guard}) ensures (out >= 0) {{}}
+                    proof nonzero for echo(entry) -> (out) where ({second_guard}) ensures ({second_goal}) {{}}
+                    proof chain for echo(entry) -> (out) where ({guard}) ensures (out >= 0) {{
+                        core.use(nonnegative(entry));
+                    }}
+                    proof cycle for echo(entry) -> (out) where ({guard}) ensures (out >= 0) {{
+                        core.use(consumer(entry));
+                    }}
+                    proof consumer for echo(entry) -> (out) where ({guard}) ensures ({goal}) {{
+                        {steps}
+                    }}
+                %%end"#),
+                namespaces: Vec::new(),
+            }],
+            vec![identity.clone()],
+            ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
+        ).unwrap()
+    };
+    use ScalarModuleProofOutcome::{NoApplicableInputs, Proved, Refuted, Unsupported};
+    let guard = "entry >= 0 && entry != 0";
+    let both = "core.use(nonnegative(entry)); core.use(nonzero(entry));";
+    let all = ["consumer", "nonnegative", "nonzero"];
+    let run = |goal: &str, steps: &str| check(guard, guard, "out != 0", goal, steps, &all);
+    assert_eq!(run("out > 0", both), [Proved, Proved, Proved]);
+    assert_eq!(check(guard, guard, "out != 0", "out > 0", both, &["consumer"]), [Proved]);
+    assert_eq!(run("out > 0", "core.use(nonzero(entry)); core.use(nonnegative(entry));"), [Proved, Proved, Proved]);
+    assert_eq!(run("out > 0", "core.use(nonnegative(entry));"), [Unsupported, Proved, Proved]);
+    assert_eq!(run("out > 0", "core.use(nonzero(entry));"), [Unsupported, Proved, Proved]);
+    assert_eq!(run("out > 1", both), [Unsupported, Proved, Proved]);
+    assert_eq!(run("out > 0", "core.use(nonnegative(entry)); core.use(nonnegative(entry));"), [Unsupported, Proved, Proved]);
+    assert_eq!(run("out > 0", "core.use(nonnegative(entry)); core.use(nonzero(1));"), [Unsupported, Proved, Proved]);
+    assert_eq!(run("out > 0", "core.use(chain(entry)); core.use(nonzero(entry));"), [Unsupported, Proved, Proved]);
+    assert_eq!(run("out > 0", "core.use(cycle(entry)); core.use(nonzero(entry));"), [Unsupported, Proved, Proved]);
+    assert_eq!(check(guard, "entry > 0", "out != 0", "out > 0", both, &all), [Unsupported, Proved, Proved]);
+    assert_eq!(check(guard, guard, "out < 0", "out > 0", both, &all), [Unsupported, Proved, Refuted]);
+    assert_eq!(check("false", "false", "out != 0", "out > 0", both, &all), [NoApplicableInputs, NoApplicableInputs, NoApplicableInputs]);
+}
+
+#[test]
 fn named_proof_peer_use_applies_a_direct_non_equality_leaf_to_a_strict_subset() {
     let identity = source();
     let check = |leaf_guard: &str, caller_guard: &str, premise: &str, goal: &str| {

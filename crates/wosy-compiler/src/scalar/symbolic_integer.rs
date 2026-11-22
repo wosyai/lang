@@ -18,6 +18,60 @@ fn overlapping_or_adjacent(first: &BigInt, last: &BigInt) -> bool {
 pub(super) struct IntegerSet(Vec<Interval>);
 
 #[cfg(feature = "internal-checker")]
+pub(super) fn integer_predicate_pair_implies(
+    first: (IntegerRelation, &BigInt), second: (IntegerRelation, &BigInt),
+    conclusion: (IntegerRelation, &BigInt), (minimum, maximum): (&BigInt, &BigInt),
+) -> bool {
+    use std::borrow::Cow;
+
+    #[derive(Clone, Copy)]
+    struct Cuts<'a> {
+        lower: (&'a BigInt, bool),
+        upper: (&'a BigInt, bool),
+        excluded: [Option<&'a BigInt>; 3],
+    }
+
+    impl<'a> Cuts<'a> {
+        fn add(&mut self, (relation, value): (IntegerRelation, &'a BigInt), slot: usize) {
+            if !relation.less && (value > self.lower.0 || (value == self.lower.0 && !relation.equal)) {
+                self.lower = (value, relation.equal);
+            }
+            if !relation.greater && (value < self.upper.0 || (value == self.upper.0 && !relation.equal)) {
+                self.upper = (value, relation.equal);
+            }
+            if relation.less && relation.greater && !relation.equal {
+                self.excluded[slot] = Some(value);
+            }
+        }
+
+        fn nonempty(self) -> bool {
+            let (lower, lower_inclusive) = self.lower;
+            let (upper, upper_inclusive) = self.upper;
+            if lower > upper || (lower == upper && (!lower_inclusive || !upper_inclusive)) {
+                return false;
+            }
+            let mut candidate = if lower_inclusive { Cow::Borrowed(lower) } else { Cow::Owned(lower + 1) };
+            while self.excluded.contains(&Some(candidate.as_ref())) {
+                if candidate.as_ref() >= upper {
+                    return false;
+                }
+                candidate = Cow::Owned(candidate.as_ref() + 1);
+            }
+            candidate.as_ref() < upper || (upper_inclusive && candidate.as_ref() == upper)
+        }
+    }
+
+    let mut premise = Cuts { lower: (minimum, true), upper: (maximum, true), excluded: [None; 3] };
+    premise.add(first, 0);
+    premise.add(second, 1);
+    if !premise.nonempty() {
+        return false;
+    }
+    premise.add((conclusion.0.complement(), conclusion.1), 2);
+    !premise.nonempty()
+}
+
+#[cfg(feature = "internal-checker")]
 #[derive(Default)]
 pub(super) struct OwnedIntegerUnion {
     intervals: Option<IntegerSet>,
@@ -539,6 +593,35 @@ impl IntegerSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn paired_literal_entailment_matches_all_predicates_on_a_closed_integer_domain() {
+        let values = [-2, -1, 0, 1, 2].map(BigInt::from);
+        let atoms: Vec<_> = [
+            BinaryOperator::Equal, BinaryOperator::NotEqual, BinaryOperator::Less,
+            BinaryOperator::LessEqual, BinaryOperator::Greater, BinaryOperator::GreaterEqual,
+        ].iter().flat_map(|operator| {
+            let relation = IntegerRelation::from_operator(operator).unwrap();
+            values.iter().map(move |bound| (relation, bound))
+        }).collect();
+        for &first in &atoms {
+            for &second in &atoms {
+                for &goal in &atoms {
+                    let mut admitted = false;
+                    let mut valid = true;
+                    for value in &values {
+                        if first.0.accepts(value.cmp(first.1)) && second.0.accepts(value.cmp(second.1)) {
+                            admitted = true;
+                            valid &= goal.0.accepts(value.cmp(goal.1));
+                        }
+                    }
+                    assert_eq!(integer_predicate_pair_implies(first, second, goal, (&values[0], &values[4])),
+                        admitted && valid);
+                }
+            }
+        }
+    }
 
     #[cfg(feature = "internal-checker")]
     #[test]

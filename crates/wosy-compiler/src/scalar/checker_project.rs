@@ -2312,6 +2312,15 @@ impl<'a> LocalPeerGraph<'a> {
 struct UnusedModuleProofGroup<'plan, 'project> {
     direct: Vec<(usize, &'plan PlannedModuleProof<'project>)>,
     peer_uses: Vec<UnusedPeerUse<'plan, 'project>>,
+    paired_uses: Vec<PairedPeerUse<'plan, 'project>>,
+}
+
+#[cfg(feature = "internal-checker")]
+struct PairedPeerUse<'plan, 'project> {
+    index: usize,
+    consumer: &'plan PlannedModuleProof<'project>,
+    leaves: [(&'plan str, (IntegerRelation, &'plan BigInt)); 2],
+    entails: bool,
 }
 
 #[cfg(feature = "internal-checker")]
@@ -2739,6 +2748,7 @@ impl PreparedProofModule {
         else { return; };
         let mut graph = LocalPeerGraph::default();
         let mut pending_peers = Vec::new();
+        let mut pending_pairs = Vec::new();
         let mut authored = AuthoredShowSchedule::default();
         let mut first_authored_citation = None;
         let mut additional_authored_citations = Vec::new();
@@ -2773,6 +2783,10 @@ impl PreparedProofModule {
             } else if let Some(peer) = plan.direct_peer_use() {
                 pending_peers.push((*index, plan, peer, None));
             } else {
+                if let Some(peers) = plan.two_peer_uses() {
+                    pending_pairs.push((*index, plan, peers));
+                    continue;
+                }
                 match plan.citation_then_show() {
                     Ok(Some((peer, claim))) => {
                         pending_peers.push((*index, plan, peer, Some(claim)));
@@ -2802,8 +2816,10 @@ impl PreparedProofModule {
             }
         }
         let mut cited_bounds = PeerPredicateBounds::default();
-        if !pending_peers.is_empty() {
-            for (_, plan, _, _) in &pending_peers {
+        if !pending_peers.is_empty() || !pending_pairs.is_empty() {
+            for plan in pending_peers.iter().map(|(_, plan, _, _)| *plan)
+                .chain(pending_pairs.iter().map(|(_, plan, _)| *plan))
+            {
                 selected.sources.get_mut(plan.proof_source).expect("requested peer consumer source")
                     .catalog.get_or_insert_with(|| {
                         Box::new(LocalPeerCatalog::new(plan.proof_source, &self.proofs[plan.proof_source]))
@@ -2829,8 +2845,38 @@ impl PreparedProofModule {
                 graph.activate(requested);
                 admitted_roots.push((index, plan, requested, strict_entry, claim));
             }
+            let mut admitted_pairs = Vec::new();
+            for (index, plan, [first, second]) in pending_pairs {
+                let Some(catalog) = selected.catalog(plan.proof_source) else { continue; };
+                let (Ok(first), Ok(second)) = (catalog.declaration(first), catalog.declaration(second))
+                    else { continue; };
+                let first = graph.enroll(self, selected, plans, catalog.source, first);
+                let second = graph.enroll(self, selected, plans, catalog.source, second);
+                if first == second {
+                    continue;
+                }
+                admitted_pairs.push((index, plan, first, second));
+            }
             graph.resolve_edges(self, selected, plans);
             graph.resolve_terminals();
+            for (index, plan, first, second) in admitted_pairs {
+                let direct = |index: usize| {
+                    let peer = graph.nodes[index].plan()?;
+                    if !peer.steps.items.is_empty() || !plan.same_peer_context(peer) {
+                        return None;
+                    }
+                    Some((peer.name, peer.peer_literal_goal()?))
+                };
+                let (Some(first), Some(second)) = (direct(first), direct(second)) else { continue; };
+                let Some(goal) = plan.peer_literal_goal() else { continue; };
+                let entails = cited_bounds.bounds_for(plan.typed.result_type).is_some_and(|(min, max)| {
+                    super::symbolic_integer::integer_predicate_pair_implies(first.1, second.1, goal, (min, max))
+                });
+                let key = (plan.target, ExactGuardGroup(plan.filter.as_deref()));
+                arbitrary_groups.entry(key).or_default().paired_uses.push(PairedPeerUse {
+                    index, consumer: plan, leaves: [first, second], entails,
+                });
+            }
             let integer_equality = IntegerRelation::from_operator(&BinaryOperator::Equal).expect("checked integer equality");
             for (index, plan, requested, strict_entry, claim) in admitted_roots {
                 let Some(leaf) = graph.terminal(requested) else { continue; };
@@ -2922,6 +2968,7 @@ impl PreparedProofModule {
         for ((_, guard), group) in arbitrary_groups {
             let body = group.direct.first().map(|entry| entry.1)
                 .or_else(|| group.peer_uses.first().map(|entry| entry.consumer))
+                .or_else(|| group.paired_uses.first().map(|entry| entry.consumer))
                 .expect("nonempty unused proof group").typed.body;
             if !valid_arbitrary_proof_body(body) {
                 continue;
@@ -2932,6 +2979,13 @@ impl PreparedProofModule {
                 let (_, _, uses): &mut (_, _, Vec<_>) = peers.entry(identity)
                     .or_insert_with(|| (relation, bound, Vec::new()));
                 uses.push((index, consumer, strict_entry, implication_checked, mixed_implies_claims));
+            }
+            for pair in &group.paired_uses {
+                if pair.entails {
+                    for (name, (relation, bound)) in pair.leaves {
+                        peers.entry((pair.consumer.proof_source, name)).or_insert_with(|| (relation, bound, Vec::new()));
+                    }
+                }
             }
             match observe_unused_module_proof_returns(body, guard.0) {
                 Some(Ok(ProofCoverage::Applicable(paths))) => {
@@ -2992,6 +3046,13 @@ impl PreparedProofModule {
                         };
                         checked_peers.insert(identity, checked);
                     }
+                    for pair in group.paired_uses {
+                        if pair.entails && pair.leaves.iter().all(|(name, _)|
+                            matches!(checked_peers.get(&(pair.consumer.proof_source, *name)), Some(CheckedPeerLeaf::Proven)))
+                        {
+                            outcomes[pair.index] = ScalarModuleProofOutcome::Proved;
+                        }
+                    }
                     for (index, plan) in group.direct {
                         if let Some(peer) = checked_peers.get(&(plan.proof_source, plan.name)) {
                             outcomes[index] = match peer {
@@ -3032,6 +3093,9 @@ impl PreparedProofModule {
                     }
                 }
                 Some(Ok(ProofCoverage::NoApplicableInputs)) if guard.0.is_some() => {
+                    for pair in group.paired_uses {
+                        outcomes[pair.index] = ScalarModuleProofOutcome::NoApplicableInputs;
+                    }
                     for (index, _) in group.direct {
                         outcomes[index] = ScalarModuleProofOutcome::NoApplicableInputs;
                     }
@@ -3180,6 +3244,16 @@ impl PlannedModuleProof<'_> {
             return None;
         }
         self.peer_use_step(item)
+    }
+
+    fn two_peer_uses(&self) -> Option<[&str; 2]> {
+        let [first, second] = self.steps.items.as_slice() else { return None; };
+        if self.steps.terminated_items.as_slice() != [true, true] {
+            return None;
+        }
+        let second = self.peer_use_step(second)?;
+        let first = self.peer_use_step(first)?;
+        (first != second).then_some([first, second])
     }
 
     fn citation_then_show(&self) -> Result<Option<(&str, PeerShowClaims<'_>)>, ProjectCheck> {
