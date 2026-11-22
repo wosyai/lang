@@ -2915,7 +2915,9 @@ fn emit_unit_if<'ctx, 'module>(
         .build_conditional_branch(condition, then_block, merge)
         .map_err(builder_error)?;
     state.builder.position_at_end(then_block);
-    let enrolled = aggregate_transfer::begin_literal_array_unit(state, expression, then_branch, None)?;
+    let enrolled = aggregate_transfer::begin_literal_array_unit(
+        state, expression, then_branch, None, crate::scalar::ArrayWriterSide::Then,
+    )?;
     emit_block(context, state, then_branch)?;
     state
         .builder
@@ -2949,7 +2951,9 @@ fn emit_project_unit_if<'ctx, 'module>(
         .build_conditional_branch(condition, then_block, merge)
         .map_err(builder_error)?;
     state.builder.position_at_end(then_block);
-    let enrolled = aggregate_transfer::begin_literal_array_unit(state, expression, then_branch, None)?;
+    let enrolled = aggregate_transfer::begin_literal_array_unit(
+        state, expression, then_branch, None, crate::scalar::ArrayWriterSide::Then,
+    )?;
     emit_project_block(context, state, then_branch, module, modules)?;
     state
         .builder
@@ -3000,9 +3004,9 @@ where
         .build_conditional_branch(condition, then_block, else_block)
         .map_err(builder_error)?;
     state.builder.position_at_end(then_block);
-    let enrolled = match expression {
+    let then_writer = match expression {
         Some(expression) => aggregate_transfer::begin_literal_array_unit(
-            state, expression, then_branch, Some(else_branch),
+            state, expression, then_branch, Some(else_branch), crate::scalar::ArrayWriterSide::Then,
         )?,
         None => false,
     };
@@ -3016,6 +3020,12 @@ where
         .map_err(builder_error)?;
     let then_end = state.builder.get_insert_block().expect("then block");
     state.builder.position_at_end(else_block);
+    let else_writer = match expression {
+        Some(expression) => aggregate_transfer::begin_literal_array_unit(
+            state, expression, then_branch, Some(else_branch), crate::scalar::ArrayWriterSide::Else,
+        )?,
+        None => false,
+    };
     state.return_owner_flags = incoming_owners.clone();
     let else_value = emit(state, else_branch)?;
     let else_owners = state.return_owner_flags.clone();
@@ -3025,6 +3035,7 @@ where
         .map_err(builder_error)?;
     let else_end = state.builder.get_insert_block().expect("else block");
     state.builder.position_at_end(merge);
+    let enrolled = then_writer || else_writer;
     if enrolled && !matches!((&then_value, &else_value), (EmitValue::Unit, EmitValue::Unit)) {
         return Err("checked array conditional did not have two Unit arms".into());
     }

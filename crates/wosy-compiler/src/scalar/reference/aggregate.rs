@@ -6,7 +6,7 @@ pub(super) struct AggregateFlowFacts {
     pub(super) allocation_slots: BTreeMap<CfgPointId, (usize, usize)>,
     pub(super) literal_array_bind: Option<LiteralArrayBind>,
     pub(super) literal_array_write: Option<LiteralArrayWrite>,
-    pub(super) literal_array_then: Option<BlockOrdinal>,
+    pub(super) literal_array_writer: Option<BlockOrdinal>,
     pub(super) literal_array_unit: Option<LiteralArrayUnit>,
     pub(super) literal_array_value: Option<(CfgPointId, OccurrenceOrdinal)>,
     pub(super) views: BTreeMap<CfgPointId, CfgPointId>,
@@ -148,14 +148,30 @@ pub(super) struct LiteralArrayRetained {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ArrayWriterSide {
+    Then,
+    Else,
+}
+
+impl ArrayWriterSide {
+    pub(crate) fn split<T>(self, then: T, otherwise: T) -> (T, T) {
+        match self {
+            Self::Then => (then, otherwise),
+            Self::Else => (otherwise, then),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct LiteralArrayUnit {
     pub(super) expression: OccurrenceOrdinal,
     pub(super) condition: CfgPointId,
     pub(super) branch: CfgPointId,
-    pub(super) then_entry: CfgPointId,
-    pub(super) then_exit: CfgPointId,
-    pub(super) then_block: BlockOrdinal,
-    pub(super) then_scope: ReferenceScopeId,
+    pub(super) writer_side: ArrayWriterSide,
+    pub(super) writer_entry: CfgPointId,
+    pub(super) writer_exit: CfgPointId,
+    pub(super) writer_block: BlockOrdinal,
+    pub(super) writer_scope: ReferenceScopeId,
     pub(super) retained: Option<LiteralArrayRetained>,
     pub(super) join: CfgPointId,
 }
@@ -171,8 +187,8 @@ enum LiteralArrayPhase {
     ProducerExit(OccurrenceOrdinal),
     Condition,
     Forked(CfgPointId),
-    ThenOriginal,
-    ThenExit(CfgPointId),
+    WriterOriginal,
+    WriterExit(CfgPointId),
     RetainedOriginal,
     RetainedExit(CfgPointId),
     JoinedOriginal,
@@ -185,16 +201,23 @@ enum LiteralArrayPhase {
 }
 
 impl LiteralArrayUnit {
+    fn branch_successors(&self) -> [CfgPointId; 2] {
+        let retained = self.retained.map_or(self.join, |edge| edge.entry);
+        let (then, otherwise) = self.writer_side.split(self.writer_entry, retained);
+        [then, otherwise]
+    }
+
     fn arrive_at_join(&self, point: CfgPointId, source: LiteralArrayPhase) -> LiteralArrayPhase {
         if point != self.join {
             return LiteralArrayPhase::Unknown;
         }
         match source {
-            LiteralArrayPhase::Forked(branch) if branch == self.branch && self.retained.is_none() =>
+            LiteralArrayPhase::Forked(branch) if branch == self.branch
+                && self.writer_side == ArrayWriterSide::Then && self.retained.is_none() =>
                 LiteralArrayPhase::JoinedOriginal,
             LiteralArrayPhase::RetainedExit(exit) if self.retained.is_some_and(|retained| retained.exit == exit) =>
                 LiteralArrayPhase::JoinedOriginal,
-            LiteralArrayPhase::ThenExit(exit) if exit == self.then_exit => LiteralArrayPhase::JoinedFresh,
+            LiteralArrayPhase::WriterExit(exit) if exit == self.writer_exit => LiteralArrayPhase::JoinedFresh,
             _ => LiteralArrayPhase::Unknown,
         }
     }
@@ -738,7 +761,7 @@ impl AggregateFlowFacts {
         let mut completed = None;
         let unit = self.literal_array_unit;
         let root = point.scope == ReferenceScopeId(0);
-        let writer_scope = unit.map_or(root, |unit| point.scope == unit.then_scope);
+        let writer_scope = unit.map_or(root, |unit| point.scope == unit.writer_scope);
         use LiteralArrayPhase::*;
         let retained = unit.and_then(|unit| unit.retained);
         let retained_scope = retained.is_some_and(|retained| point.scope == retained.scope);
@@ -753,15 +776,15 @@ impl AggregateFlowFacts {
                 (BeforeBind, CfgPointKind::Bind { binding: actual })
                     if point.id == allocation.bind && actual == binding => Original,
                 (Original, CfgPointKind::Evaluate(_) | CfgPointKind::Read { .. })
-                    if unit.is_some_and(|unit| unit.condition == point.id
+                    if root && unit.is_some_and(|unit| unit.condition == point.id
                         && point.successors.as_slice() == [unit.branch]) => Condition,
                 (Condition, CfgPointKind::Branch { .. })
-                    if unit.is_some_and(|unit| unit.branch == point.id
-                        && point.successors.as_slice() == [unit.then_entry, retained.map_or(unit.join, |retained| retained.entry)]) =>
+                    if root && unit.is_some_and(|unit| unit.branch == point.id
+                        && point.successors.as_slice() == unit.branch_successors()) =>
                     Forked(point.id),
                 (Forked(branch), CfgPointKind::ScopeEnter)
-                    if unit.is_some_and(|unit| unit.branch == branch && unit.then_entry == point.id
-                        && point.scope == unit.then_scope) => ThenOriginal,
+                    if unit.is_some_and(|unit| unit.branch == branch && unit.writer_entry == point.id
+                        && point.scope == unit.writer_scope) => WriterOriginal,
                 (Forked(branch), CfgPointKind::ScopeEnter)
                     if unit.is_some_and(|unit| unit.branch == branch)
                         && retained.is_some_and(|retained| retained.entry == point.id
@@ -772,9 +795,9 @@ impl AggregateFlowFacts {
                         && unit.is_some_and(|unit| point.successors.as_slice() == [unit.join]) =>
                     RetainedExit(point.id),
                 (Replaced, CfgPointKind::ScopeExit)
-                    if unit.is_some_and(|unit| unit.then_exit == point.id
-                        && point.successors.as_slice() == [unit.join]) => ThenExit(point.id),
-                (source @ (Forked(_) | ThenExit(_) | RetainedExit(_)), CfgPointKind::Join) if root =>
+                    if writer_scope && unit.is_some_and(|unit| unit.writer_exit == point.id
+                        && point.successors.as_slice() == [unit.join]) => WriterExit(point.id),
+                (source @ (Forked(_) | WriterExit(_) | RetainedExit(_)), CfgPointKind::Join) if root =>
                     unit.map_or(Unknown, |unit| unit.arrive_at_join(point.id, source)),
                 (Original, CfgPointKind::Read { binding: actual }) if actual == binding
                     && unit.is_none() && self.literal_array_write.is_none() => Read(point.id),
@@ -793,16 +816,16 @@ impl AggregateFlowFacts {
                     completed = Some(LiteralArrayRoute::FreshLeaf { allocation, output });
                     Finished
                 }
-                (Original | ThenOriginal, CfgPointKind::Read { .. })
+                (Original | WriterOriginal, CfgPointKind::Read { .. })
                     if writer_scope && self.literal_array_write.is_some_and(|write| write.argument.is_some_and(|argument| argument.read == point.id)) =>
                     ArgumentRead(point.id),
-                (phase @ (Original | ThenOriginal | ArgumentRead(_)), CfgPointKind::Call { output: 0,
+                (phase @ (Original | WriterOriginal | ArgumentRead(_)), CfgPointKind::Call { output: 0,
                     target: ResolvedCallTarget::ModuleCallable {
                         concrete: ConcreteCallSelection::Declaration, ..
                     }, argument_points, .. })
                     if writer_scope && self.literal_array_write.is_some_and(|write| write.rhs == point.id
                         && match (phase, write.argument.map(|argument| argument.read), argument_points.as_slice()) {
-                            (Original | ThenOriginal, None, []) => true,
+                            (Original | WriterOriginal, None, []) => true,
                             (ArgumentRead(seen), Some(expected), [actual]) => seen == expected && seen == *actual,
                             _ => false,
                         }) => Call,
@@ -1676,7 +1699,8 @@ pub(crate) struct ClosedCheckedBacking {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ClosedLiteralArrayUnit {
     pub(crate) expression: usize,
-    pub(crate) then_block: usize,
+    pub(crate) writer_block: usize,
+    pub(crate) writer_side: ArrayWriterSide,
     pub(crate) retained_block: Option<usize>,
 }
 
@@ -2303,7 +2327,7 @@ fn enroll_literal_array_pair(
         call: write.producer.0, destination: write.destination.0, exit, block: block.0,
         extent: replacement_extent,
         unit: unit.map(|unit| ClosedLiteralArrayUnit {
-            expression: unit.expression.0, then_block: unit.then_block.0,
+            expression: unit.expression.0, writer_block: unit.writer_block.0, writer_side: unit.writer_side,
             retained_block: unit.retained.map(|retained| retained.block.0),
         }),
     });
@@ -3237,8 +3261,8 @@ mod tests {
         };
         let unit = LiteralArrayUnit {
             expression: OccurrenceOrdinal(4), condition: CfgPointId(4), branch: CfgPointId(5),
-            then_entry: CfgPointId(6), then_exit: CfgPointId(9), then_block: BlockOrdinal(1),
-            then_scope: ReferenceScopeId(1), retained: None, join: CfgPointId(10),
+            writer_side: ArrayWriterSide::Then, writer_entry: CfgPointId(6), writer_exit: CfgPointId(9), writer_block: BlockOrdinal(1),
+            writer_scope: ReferenceScopeId(1), retained: None, join: CfgPointId(10),
         };
         let mut pair = synthetic_literal_array_pair();
         pair.original.placeholder = CfgPointId(2);
@@ -3312,7 +3336,7 @@ mod tests {
             LiteralArrayParameters::default());
         let caller = &plans.bodies[&pair.caller];
         assert!(matches!(caller.literal_array, Some(ClosedLiteralArray::Replacement {
-            unit: Some(ClosedLiteralArrayUnit { expression: 4, then_block: 1, retained_block: None }), ..
+            unit: Some(ClosedLiteralArrayUnit { expression: 4, writer_block: 1, writer_side: ArrayWriterSide::Then, retained_block: None }), ..
         })));
         assert_eq!(caller.scope_exits, BTreeMap::from([(0, CfgPointId(11))]));
         assert!(caller.releases.is_empty() && caller.input_release.is_none());
@@ -3382,6 +3406,74 @@ mod tests {
         observe(&facts, &explicit, &retained, &mut observed);
         assert!(observed.literal_array_unknown);
         assert!(observed.proved_literal_array_route().is_none());
+
+        // Mirror the compiler's then-before-else construction order.
+        let call = explicit[7].kind.clone();
+        let mut assign = explicit[8].kind.clone();
+        let CfgPointKind::Assign { rhs_point, .. } = &mut assign else { unreachable!() };
+        *rhs_point = CfgPointId(9);
+        explicit[5].successors = vec![CfgPointId(6), CfgPointId(8)];
+        explicit[6] = point(6, 1, CfgPointKind::ScopeEnter, &[7]);
+        explicit[7] = point(7, 1, CfgPointKind::ScopeExit, &[12]);
+        explicit[8] = point(8, 2, CfgPointKind::ScopeEnter, &[9]);
+        explicit[9] = point(9, 2, call, &[10]);
+        explicit[10] = point(10, 2, assign, &[11]);
+        explicit[11] = point(11, 2, CfgPointKind::ScopeExit, &[12]);
+        facts.literal_array_write = Some(LiteralArrayWrite {
+            rhs: CfgPointId(9), writer: CfgPointId(10), ..pair.write
+        });
+        let mirrored = LiteralArrayUnit {
+            writer_side: ArrayWriterSide::Else,
+            writer_entry: CfgPointId(8), writer_exit: CfgPointId(11),
+            writer_block: BlockOrdinal(2), writer_scope: ReferenceScopeId(2),
+            retained: Some(LiteralArrayRetained {
+                entry: CfgPointId(6), exit: CfgPointId(7), block: BlockOrdinal(1), scope: ReferenceScopeId(1),
+            }),
+            join: CfgPointId(12),
+            ..unit.expect("observed explicit conditional")
+        };
+        facts.literal_array_unit = Some(mirrored);
+        let retained_then = [0, 1, 2, 3, 4, 5, 6, 7, 12, 13];
+        let writer_else = [0, 1, 2, 3, 4, 5, 8, 9, 10, 11, 12, 13];
+        let mut observed = AggregateFlowResult::default();
+        observe(&facts, &explicit, &retained_then, &mut observed);
+        assert!(observed.proved_literal_array_route().is_none());
+        observe(&facts, &explicit, &writer_else, &mut observed);
+        let Some(LiteralArrayRoute::Replacement { original, write, exit, block, unit }) =
+            observed.proved_literal_array_route() else { panic!("missing mirrored ownership proof") };
+        assert_eq!(unit, Some(mirrored));
+        let mut plans = ClosedAggregates::default();
+        enroll_literal_array_pair(&mut plans, LiteralArrayPair { original, write, exit, block, unit, ..pair },
+            LiteralArrayParameters::default());
+        let caller = &plans.bodies[&pair.caller];
+        assert!(matches!(caller.literal_array, Some(ClosedLiteralArray::Replacement {
+            unit: Some(ClosedLiteralArrayUnit {
+                writer_side: ArrayWriterSide::Else, writer_block: 2, retained_block: Some(1), ..
+            }), ..
+        })));
+        assert_eq!(caller.scope_exits, BTreeMap::from([(0, CfgPointId(13))]));
+        assert!(caller.releases.is_empty() && caller.input_release.is_none());
+
+        for (id, other_scope) in [
+            (4, ReferenceScopeId(1)),
+            (5, ReferenceScopeId(2)),
+            (11, ReferenceScopeId(0)),
+        ] {
+            let mut wrong_scope = explicit.clone();
+            wrong_scope[id].scope = other_scope;
+            let mut observed = AggregateFlowResult::default();
+            observe(&facts, &wrong_scope, &retained_then, &mut observed);
+            observe(&facts, &wrong_scope, &writer_else, &mut observed);
+            assert!(observed.literal_array_unknown);
+            assert!(observed.proved_literal_array_route().is_none());
+        }
+
+        facts.literal_array_unit = Some(LiteralArrayUnit { writer_side: ArrayWriterSide::Then, ..mirrored });
+        let mut observed = AggregateFlowResult::default();
+        observe(&facts, &explicit, &retained_then, &mut observed);
+        observe(&facts, &explicit, &writer_else, &mut observed);
+        assert!(observed.literal_array_unknown);
+        assert!(observed.proved_literal_array_route().is_none());
     }
 
     #[test]
@@ -3391,10 +3483,11 @@ mod tests {
             expression: OccurrenceOrdinal(4),
             condition: CfgPointId(3),
             branch: CfgPointId(4),
-            then_entry: CfgPointId(5),
-            then_exit: CfgPointId(8),
-            then_block: BlockOrdinal(1),
-            then_scope: ReferenceScopeId(1),
+            writer_side: ArrayWriterSide::Then,
+            writer_entry: CfgPointId(5),
+            writer_exit: CfgPointId(8),
+            writer_block: BlockOrdinal(1),
+            writer_scope: ReferenceScopeId(1),
             retained: None,
             join: CfgPointId(9),
         };
@@ -3405,9 +3498,9 @@ mod tests {
         assert!(!observed.complete());
 
         for other in [
-            unit.arrive_at_join(unit.join, ThenExit(unit.branch)),
-            unit.arrive_at_join(unit.join, Forked(unit.then_exit)),
-            unit.arrive_at_join(unit.then_exit, ThenExit(unit.then_exit)),
+            unit.arrive_at_join(unit.join, WriterExit(unit.branch)),
+            unit.arrive_at_join(unit.join, Forked(unit.writer_exit)),
+            unit.arrive_at_join(unit.writer_exit, WriterExit(unit.writer_exit)),
             unit.arrive_at_join(unit.join, Replaced),
         ] {
             assert!(other == Unknown);
@@ -3415,7 +3508,7 @@ mod tests {
             assert!(!observed.complete());
         }
 
-        let replaced = unit.arrive_at_join(unit.join, ThenExit(unit.then_exit));
+        let replaced = unit.arrive_at_join(unit.join, WriterExit(unit.writer_exit));
         assert!(replaced == JoinedFresh);
         observed.observe_exit(replaced);
         assert!(observed.complete());

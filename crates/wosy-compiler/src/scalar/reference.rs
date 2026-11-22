@@ -946,7 +946,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
         projected_origins: bool,
         checked_result: bool,
         array_return: bool,
-        literal_unit: Option<OccurrenceOrdinal>,
+        literal_unit: Option<(OccurrenceOrdinal, aggregate::ArrayWriterSide)>,
     ) -> Result<ReferenceValue, ReferenceAnalysisError> {
         let ([then_arm, else_arm], condition_point, branch) = self.conditional_branches(
             condition,
@@ -1009,25 +1009,30 @@ impl<'a> ReferenceFlowBuilder<'a> {
         }
         self.cfg.points[then_arm.end.0].successors.push(join);
         self.cfg.points[else_arm.end.0].successors.push(join);
-        if let (Some(expression), Some(condition), [entry, retained_entry]) =
+        if let (Some((expression, writer_side)), Some(condition), [then_entry, else_entry]) =
             (literal_unit, condition_point, self.cfg.points[branch.0].successors.as_slice())
         {
+            let (writer_entry, retained_entry) = writer_side.split(*then_entry, *else_entry);
+            let (writer_exit, retained_exit) = writer_side.split(then_arm.end, else_arm.end);
             let edges = match region {
-                ConditionalRegion::Unit { then_block, .. } if *retained_entry == join =>
+                ConditionalRegion::Unit { then_block, .. }
+                    if writer_side == aggregate::ArrayWriterSide::Then && retained_entry == join =>
                     Some((*then_block, None)),
                 ConditionalRegion::Value { then_block, else_block, .. }
-                    if *retained_entry != join && *retained_entry != *entry =>
-                    Some((*then_block, Some(aggregate::LiteralArrayRetained {
-                        entry: *retained_entry, exit: else_arm.end, block: *else_block,
+                    if retained_entry != join && retained_entry != writer_entry =>
+                {
+                    let (writer_block, retained_block) = writer_side.split(*then_block, *else_block);
+                    Some((writer_block, Some(aggregate::LiteralArrayRetained {
+                        entry: retained_entry, exit: retained_exit, block: retained_block,
                         scope: self.cfg.points[retained_entry.0].scope,
-                    }))),
+                    })))
+                }
                 _ => None,
             };
-            if let Some((then_block, retained)) = edges {
+            if let Some((writer_block, retained)) = edges {
                 self.aggregate_facts.literal_array_unit = Some(aggregate::LiteralArrayUnit {
-                    expression, condition, branch, then_entry: *entry,
-                    then_exit: then_arm.end, then_block, retained,
-                    then_scope: self.cfg.points[entry.0].scope, join,
+                    expression, condition, branch, writer_side, writer_entry, writer_exit,
+                    writer_block, retained, writer_scope: self.cfg.points[writer_entry.0].scope, join,
                 });
             }
         }
@@ -1276,20 +1281,25 @@ impl<'a> ReferenceFlowBuilder<'a> {
         then_branch: &ScalarBlock,
         else_branch: Option<&ScalarBlock>,
         region: &ConditionalRegion,
-    ) -> Option<OccurrenceOrdinal> {
+    ) -> Option<(OccurrenceOrdinal, aggregate::ArrayWriterSide)> {
         let calls = self.call_sites;
         if scope != ReferenceScopeId(0) || self.aggregate_facts.literal_array_bind.is_none()
-            || !calls.boundary.root_outputs.is_empty() || then_branch.items.len() != 1
-            || else_branch.is_some_and(|block| !block.items.is_empty()
-                || !matches!(calls.structure.checked_types.expressions.get(&ordinal), Some(ScalarType::Unit)))
+            || !calls.boundary.root_outputs.is_empty()
+            || (else_branch.is_some()
+                && !matches!(calls.structure.checked_types.expressions.get(&ordinal), Some(ScalarType::Unit)))
             || !matches!(calls.structure.blocks[calls.structure.root.0].items.get(1)
                 .map(|item| &item.kind), Some(BlockItemKind::Evaluation { expression }) if *expression == ordinal)
         {
             return None;
         }
-        let (condition_ordinal, then_block) = match region {
-            ConditionalRegion::Unit { condition, then_block, .. }
-            | ConditionalRegion::Value { condition, then_block, .. } => (*condition, *then_block),
+        use aggregate::ArrayWriterSide::{Else, Then};
+        let (condition_ordinal, writer, side) = match (region, then_branch.items.len(), else_branch.map(|block| block.items.len())) {
+            (ConditionalRegion::Unit { condition, then_block, .. }, 1, None)
+            | (ConditionalRegion::Value { condition, then_block, .. }, 1, Some(0)) =>
+                (*condition, *then_block, Then),
+            (ConditionalRegion::Value { condition, else_block, .. }, 0, Some(1)) =>
+                (*condition, *else_block, Else),
+            _ => return None,
         };
         if !matches!(calls.structure.checked_types.expressions.get(&condition_ordinal), Some(ScalarType::Bool))
             || !(matches!(condition, ScalarExpression::Boolean { .. })
@@ -1297,8 +1307,8 @@ impl<'a> ReferenceFlowBuilder<'a> {
         {
             return None;
         }
-        self.aggregate_facts.literal_array_then = Some(then_block);
-        Some(ordinal)
+        self.aggregate_facts.literal_array_writer = Some(writer);
+        Some((ordinal, side))
     }
 
     fn evaluate_expression(
@@ -4052,7 +4062,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         }
                         self.record_frozen_install(slot.destination, rhs_point);
                         let literal_writer = (scope == ReferenceScopeId(0) && item_index == 1)
-                            || (item_index == 0 && self.aggregate_facts.literal_array_then == Some(ordinal));
+                            || (item_index == 0 && self.aggregate_facts.literal_array_writer == Some(ordinal));
                         if literal_writer && existing_prepared
                             && position == 0 && assignment.targets.len() == 1 && assignment.values.len() == 1
                             && self.aggregate_facts.literal_array_bind.is_some()
