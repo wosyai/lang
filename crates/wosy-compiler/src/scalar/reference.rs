@@ -4496,6 +4496,35 @@ fn prepared_scope_expiry_uses_exact_declared_and_introduced_bindings() {
     assert!(state == ReferenceEdgeState::default());
 }
 
+#[cfg(test)]
+#[test]
+fn prepared_loan_read_reachability_stops_only_at_the_exact_binding_exit() {
+    let source = SourceIdentity::new("project".into(), "package".into(), "metadata".into(), "r1".into());
+    let span = ByteSpan::new(0, 10);
+    let binding = |start| ReferenceBindingId {
+        source: source.clone(), function_span: span, block_span: span,
+        declaration_span: ByteSpan::new(start, start + 1), kind: ReferenceBindingKind::Declared,
+    };
+    let outer = binding(1);
+    let inner = binding(2);
+    let point = |id, scope, kind, successors| ReferenceFlowPoint {
+        id: CfgPointId(id), kind, source_span: SourceSpan::new(source.clone(), span),
+        scope: ReferenceScopeId(scope), possible_origins: None, successors,
+    };
+    let points = [
+        point(0, 1, CfgPointKind::ScopeEnter, vec![CfgPointId(1)]),
+        point(1, 1, CfgPointKind::ScopeExit, vec![CfgPointId(2)]),
+        point(2, 0, CfgPointKind::Read { binding: outer.clone() }, vec![]),
+    ];
+    let mut cohort = super::control::ScopeExitBindings::default();
+    cohort.insert(inner);
+    let mut exact = HashMap::from([(CfgPointId(1), cohort)]);
+    assert!(reference_read_reachable(&points, Some(&exact), CfgPointId(0), &outer));
+    exact.get_mut(&CfgPointId(1)).unwrap().insert(outer.clone());
+    assert!(!reference_read_reachable(&points, Some(&exact), CfgPointId(0), &outer));
+    assert!(!reference_read_reachable(&points, None, CfgPointId(0), &outer));
+}
+
 #[derive(Clone, PartialEq)]
 struct ReferenceProjectedState {
     place: ReferencePlaceId,
@@ -4619,6 +4648,7 @@ fn reinitialize_checked_handles(
 
 fn reference_read_reachable(
     points: &[ReferenceFlowPoint],
+    scope_exits: Option<&HashMap<CfgPointId, super::control::ScopeExitBindings>>,
     from: CfgPointId,
     binding: &ReferenceBindingId,
 ) -> bool {
@@ -4633,7 +4663,10 @@ fn reference_read_reachable(
         }
         if matches!(&points[id.0].kind, CfgPointKind::Assign { target, .. } if target.binding == *binding && target.projections.is_empty())
             || matches!(&points[id.0].kind, CfgPointKind::Bind { binding: bound } if bound == binding)
-            || matches!(&points[id.0].kind, CfgPointKind::ScopeExit if points[id.0].source_span.range == binding.block_span)
+            || (matches!(&points[id.0].kind, CfgPointKind::ScopeExit) && match scope_exits {
+                Some(exits) => exits.get(&id).is_some_and(|cohort| cohort.contains(binding)),
+                None => points[id.0].source_span.range == binding.block_span,
+            })
         {
             continue;
         }
@@ -4715,6 +4748,7 @@ enum LoanAccess<'a> {
 
 fn conflicting_live_loan(
     points: &[ReferenceFlowPoint],
+    scope_exits: Option<&HashMap<CfgPointId, super::control::ScopeExitBindings>>,
     facts: &[ReferenceOrigin],
     state: &ReferenceEdgeState,
     point: CfgPointId,
@@ -4761,7 +4795,7 @@ fn conflicting_live_loan(
                 continue;
             }
             if !reachable {
-                if !reference_read_reachable(points, point, binding) {
+                if !reference_read_reachable(points, scope_exits, point, binding) {
                     break;
                 }
                 reachable = true;
@@ -6109,6 +6143,7 @@ fn transfer_reference_facts(
                                     if checked_pointee {
                                         let origins = conflicting_live_loan(
                                             original_points,
+                                            cfg.scope_exit_bindings,
                                             &cfg.facts,
                                             &state,
                                             id,
@@ -6282,6 +6317,7 @@ fn transfer_reference_facts(
                 for candidate in candidates {
                     let origins = conflicting_live_loan(
                         original_points,
+                        cfg.scope_exit_bindings,
                         &cfg.facts,
                         &state,
                         id,
@@ -6515,7 +6551,7 @@ fn transfer_reference_facts(
                     {
                         continue;
                     }
-                    let origins = conflicting_live_loan(original_points, &cfg.facts, &state, id, place, LoanAccess::DirectShared);
+                    let origins = conflicting_live_loan(original_points, cfg.scope_exit_bindings, &cfg.facts, &state, id, place, LoanAccess::DirectShared);
                     if !origins.is_empty() {
                         errors.push(ReferenceAnalysisError::ConflictingPlace { source_span: point.source_span.clone(), origins });
                     }
@@ -6586,6 +6622,7 @@ fn transfer_reference_facts(
                     let mut origins = unavailable_origins(&state, &place);
                     origins.extend(conflicting_live_loan(
                         original_points,
+                        cfg.scope_exit_bindings,
                         &cfg.facts,
                         &state,
                         id,
@@ -6613,6 +6650,7 @@ fn transfer_reference_facts(
                         let mut origins = unavailable_origins(&state, &place);
                         origins.extend(conflicting_live_loan(
                             original_points,
+                            cfg.scope_exit_bindings,
                             &cfg.facts,
                             &state,
                             id,
@@ -6651,6 +6689,7 @@ fn transfer_reference_facts(
                     {
                         let origins = conflicting_live_loan(
                             original_points,
+                            cfg.scope_exit_bindings,
                             &cfg.facts,
                             &state,
                             id,
@@ -6684,6 +6723,7 @@ fn transfer_reference_facts(
                         let target = available_place(&candidate.place);
                         let origins = conflicting_live_loan(
                             original_points,
+                            cfg.scope_exit_bindings,
                             &cfg.facts,
                             &state,
                             id,
@@ -6972,6 +7012,7 @@ fn transfer_reference_facts(
                             };
                             let origins = conflicting_live_loan(
                                 original_points,
+                                cfg.scope_exit_bindings,
                                 &cfg.facts,
                                 &state,
                                 id,
