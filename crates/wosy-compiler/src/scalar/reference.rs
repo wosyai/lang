@@ -3798,7 +3798,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                                             if *actual == rhs_point && target.projections.is_empty() && target.binding == *binding)
                             })
                         {
-                            array_rebind = Some(install);
+                            array_rebind = Some((install, slot.destination));
                         }
                         self.record_frozen_install(slot.destination, rhs_point);
                         if let Some(capture) = capture.filter(|_| {
@@ -3888,8 +3888,8 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             writes.push(install);
                         }
                     }
-                    if let Some(install) = array_rebind.filter(|_| simple_destinations) {
-                        self.aggregate_facts.array_installs.insert(install);
+                    if let Some((install, destination)) = array_rebind.filter(|_| simple_destinations) {
+                        self.aggregate_facts.array_installs.insert(install, destination);
                     }
                     let continuation = group.continuation();
                     assert_eq!(

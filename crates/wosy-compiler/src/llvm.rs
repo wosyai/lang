@@ -258,6 +258,7 @@ enum RuntimeArrayResultProvenance {
     ParameterAlias,
     FixedWidening,
     FreshCall,
+    SameBacking,
 }
 
 impl RuntimeArrayResultProvenance {
@@ -3339,7 +3340,7 @@ struct AssignmentValue<'ctx> {
     call_flag: Option<inkwell::values::IntValue<'ctx>>,
     joined_source: Option<JoinedAssignmentSource<'ctx>>,
     runtime_array_source: Option<PointerValue<'ctx>>,
-    same_array_rebind: bool,
+    checked_rebind_destination: Option<usize>,
 }
 
 struct RuntimeArrayAssignment<'ctx> {
@@ -3406,15 +3407,15 @@ fn stage_runtime_array_assignments<'ctx>(
         .zip(destinations)
         .enumerate()
     {
-        let crate::ScalarPlace::Name { name, .. } = &target.place else {
-            staged.push(None);
-            continue;
-        };
-        if !matches!(value.ty, ScalarType::RuntimeArray { .. }) {
-            staged.push(None);
-            continue;
-        }
-        if value.same_array_rebind {
+        if let Some(expected) = value.checked_rebind_destination {
+            if state.body_call_nodes.and_then(|nodes| nodes.place_ordinal(&target.place)) != Some(expected)
+                || !matches!(value.ty, ScalarType::RuntimeArray { .. })
+            {
+                return Err("proved runtime-array rebind does not match the assignment destination".into());
+            }
+            let crate::ScalarPlace::Name { name, .. } = &target.place else {
+                return Err("proved runtime-array rebind has no lexical destination".into());
+            };
             if !matches!(destination, AssignmentDestination::Existing(_))
                 || state.runtime_array_allocations.get(name) != Some(&false)
             {
@@ -3425,6 +3426,14 @@ fn stage_runtime_array_assignments<'ctx>(
                 previous: None,
                 same_array_rebind: true,
             }));
+            continue;
+        }
+        let crate::ScalarPlace::Name { name, .. } = &target.place else {
+            staged.push(None);
+            continue;
+        };
+        if !matches!(value.ty, ScalarType::RuntimeArray { .. }) {
+            staged.push(None);
             continue;
         }
         let protected = retains_storage[position]
@@ -3635,7 +3644,7 @@ fn emit_assignment<'ctx, 'module>(
             call_flag,
             joined_source: _,
             runtime_array_source: _,
-            same_array_rebind: _,
+            checked_rebind_destination: _,
         } = staged;
         let Some(destination) = install_assignment_destination(state, target, &ty, destination)
         else {
@@ -3750,7 +3759,7 @@ fn emit_project_assignment<'ctx, 'module>(
             call_flag,
             joined_source: _,
             runtime_array_source: _,
-            same_array_rebind: _,
+            checked_rebind_destination: _,
         } = staged;
         let Some(destination) = install_assignment_destination(state, target, &ty, destination)
         else {
@@ -4231,11 +4240,19 @@ fn materialize_assignment_values<'ctx, 'module, 'expected>(
     let mut position = 0;
     let mut values = Vec::new();
     for expression in expressions {
-        let same_array_rebind = state.aggregate.as_ref().is_some_and(|aggregate| {
+        let checked_rebind_destination = state.aggregate.as_ref().and_then(|aggregate| {
             state.body_call_nodes.and_then(|nodes| nodes.expression_ordinal(expression))
-                .is_some_and(|ordinal| aggregate.same_array_rebind(ordinal))
+                .and_then(|ordinal| aggregate.same_array_rebind_destination(ordinal))
         });
-        let provenance = runtime_array_assignment_provenance(state, expression)?;
+        let provenance = if checked_rebind_destination.is_some() {
+            // This call's only runtime-array output is the retained backing, not a fresh owner.
+            RuntimeArrayAssignmentProvenance {
+                result: RuntimeArrayResultProvenance::SameBacking,
+                source_name: None,
+            }
+        } else {
+            runtime_array_assignment_provenance(state, expression)?
+        };
         let runtime_array_source = if provenance.result.owns() {
             provenance.source_name.as_ref().map(|name| {
                 state
@@ -4280,6 +4297,11 @@ fn materialize_assignment_values<'ctx, 'module, 'expected>(
                 .unwrap_or_else(|| basic_value_type(*value))],
         };
         for (output_position, ty) in output_types.into_iter().enumerate() {
+            let checked_rebind_destination = if output_position == 0 {
+                checked_rebind_destination
+            } else {
+                None
+            };
             let value = extract_output(state, &value, output_position)?;
             if ty == ScalarType::Unit {
                 values.push(AssignmentValue {
@@ -4289,7 +4311,7 @@ fn materialize_assignment_values<'ctx, 'module, 'expected>(
                     call_flag: None,
                     joined_source: None,
                     runtime_array_source: None,
-                    same_array_rebind: false,
+                    checked_rebind_destination,
                 });
                 position += 1;
                 continue;
@@ -4317,7 +4339,7 @@ fn materialize_assignment_values<'ctx, 'module, 'expected>(
                 call_flag: state.call_owner_flags.get(&output_position).copied(),
                 joined_source,
                 runtime_array_source,
-                same_array_rebind: same_array_rebind && output_position == 0,
+                checked_rebind_destination,
             });
             position += 1;
         }

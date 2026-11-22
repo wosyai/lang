@@ -35,7 +35,7 @@ pub(super) struct AggregateFlowFacts {
     pub(super) array_calls: BTreeMap<CfgPointId, (OccurrenceOrdinal, CfgPointId, ReferenceBindingId)>,
     // Primary return value and the whole-place move that follows its evaluation.
     pub(super) array_return: Option<(CfgPointId, CfgPointId)>,
-    pub(super) array_installs: BTreeSet<CfgPointId>,
+    pub(super) array_installs: BTreeMap<CfgPointId, OccurrenceOrdinal>,
     pub(super) neutral_array_calls: BTreeSet<CfgPointId>,
     pub(super) neutral_array_projections: BTreeMap<CfgPointId, CfgPointId>,
     pub(super) neutral_array_scalars: BTreeSet<ReferenceBindingId>,
@@ -363,7 +363,7 @@ pub(super) struct AggregateFlowResult {
     pub(super) array_neutral: bool,
     pub(super) array_calls: BTreeMap<CfgPointId, (OccurrenceOrdinal, CfgPointId, ReferenceBindingId)>,
     pub(super) array_returns: BTreeSet<Option<BTreeSet<CfgPointId>>>,
-    pub(super) array_rebinds: BTreeMap<CfgPointId, (CfgPointId, ReferenceBindingId)>,
+    pub(super) array_rebinds: BTreeMap<CfgPointId, (CfgPointId, ReferenceBindingId, OccurrenceOrdinal)>,
     pub(super) local_array_failure_arms: BTreeMap<usize, Option<CfgPointId>>,
     pub(super) allocation_slots: BTreeMap<CfgPointId, (usize, usize)>,
     pub(super) calls: BTreeMap<CfgPointId, OccurrenceOrdinal>,
@@ -564,7 +564,7 @@ impl AggregateFlowFacts {
                     CfgPointKind::Assign { target, rhs_point, .. } => {
                         !target.projections.is_empty()
                             || if &target.binding == binding {
-                                !self.array_installs.contains(&id) || !selected_recommit(*rhs_point)
+                                !self.array_installs.contains_key(&id) || !selected_recommit(*rhs_point)
                             } else if self.neutral_array_scalars.contains(&target.binding) {
                                 false
                             } else {
@@ -604,7 +604,7 @@ impl AggregateFlowFacts {
                     }
                 }
                 CfgPointKind::Assign { target, rhs_point, .. } if &target.binding == binding && target.projections.is_empty() => {
-                    if self.array_installs.contains(&id) && self.array_calls.get(rhs_point)
+                    if self.array_installs.contains_key(&id) && self.array_calls.get(rhs_point)
                         .is_some_and(|(_, moved, actual)| actual == binding && Some(*moved) == local.pending)
                     {
                         local.pending = None;
@@ -676,11 +676,13 @@ impl AggregateFlowFacts {
                     .or_insert(backing);
             }
         }
-        if let CfgPointKind::Assign { target, rhs_point, .. } = &point.kind {
-            if self.array_installs.contains(&id) && target.projections.is_empty() && self.array_calls.get(rhs_point)
+        if let (CfgPointKind::Assign { target, rhs_point, .. }, Some(&destination)) =
+            (&point.kind, self.array_installs.get(&id))
+        {
+            if target.projections.is_empty() && self.array_calls.get(rhs_point)
                 .is_some_and(|(_, _, binding)| *binding == target.binding)
             {
-                result.array_rebinds.insert(id, (*rhs_point, target.binding.clone()));
+                result.array_rebinds.insert(id, (*rhs_point, target.binding.clone(), destination));
             }
         }
         if let Some(formal) = &self.array_formal {
@@ -697,7 +699,7 @@ impl AggregateFlowFacts {
                             if &place.binding == formal && matches!(place.projections.as_slice(), [ReferencePlaceProjection::Index(_)])),
                     CfgPointKind::Assign { target, rhs_point, .. } => target.projections.is_empty()
                         && (self.neutral_array_scalars.contains(&target.binding)
-                            || (&target.binding == formal && self.array_installs.contains(&id)
+                            || (&target.binding == formal && self.array_installs.contains_key(&id)
                                 && self.neutral_array_calls.contains(rhs_point))),
                     CfgPointKind::Call { output: 0, target: ResolvedCallTarget::Core(CoreOperationId::IntExtend), .. } => true,
                     CfgPointKind::Call { output: 0, .. } => self.neutral_array_calls.contains(&id)
@@ -729,7 +731,7 @@ impl AggregateFlowFacts {
                 CfgPointKind::Assign { target, rhs_point, .. }
                     if &target.binding == formal && target.projections.is_empty() =>
                 {
-                    if self.array_installs.contains(&id) && self.array_calls.get(rhs_point)
+                    if self.array_installs.contains_key(&id) && self.array_calls.get(rhs_point)
                         .is_some_and(|(_, moved, binding)| binding == formal && Some(*moved) == state.array_formal_pending)
                     {
                         state.array_formal_pending = None;
@@ -1336,7 +1338,8 @@ pub(crate) struct ClosedBody {
     pub(crate) releases: BTreeMap<CfgPointId, Vec<usize>>,
     pub(crate) input: Option<usize>,
     pub(crate) input_mixed: bool,
-    pub(crate) same_array_rebinds: BTreeSet<usize>,
+    // Checked primary call occurrence -> exact destination place occurrence.
+    pub(crate) same_array_rebinds: BTreeMap<usize, usize>,
     pub(crate) local_array_failure: Option<ClosedLocalArrayRelease>,
     pub(crate) input_release: Option<CfgPointId>,
     pub(crate) input_calls: BTreeMap<usize, (usize, ClosedInput)>,
@@ -1999,13 +2002,17 @@ fn closed_aggregates<'a>(
     }
 
     for (key, cfg, facts) in array_callsites {
-        for &(call, _) in facts.array_rebinds.values() {
+        for &(call, _, destination) in facts.array_rebinds.values() {
             let Some((ordinal, _, _)) = facts.array_calls.get(&call) else { continue };
             let Some(callee) = target_body(&declarations, cfg, call) else { continue };
             if array_leaves.contains(&callee)
                 || array_neighbors.get(&callee).is_some_and(|deps| deps.is_subset(&array_leaves))
             {
-                result.bodies.entry(key).or_default().same_array_rebinds.insert(ordinal.0);
+                let previous = result.bodies.entry(key).or_default()
+                    .same_array_rebinds.insert(ordinal.0, destination.0);
+                if previous.is_some_and(|previous| previous != destination.0) {
+                    return Err(format!("ambiguous checked array rebind destination in {key:?}"));
+                }
             }
         }
         if facts.local_array_failure_arms.is_empty() {
@@ -2020,9 +2027,10 @@ fn closed_aggregates<'a>(
             continue;
         }
         let CfgPointKind::Bind { binding } = &cfg.points[allocation.0].kind else { continue };
-        let mut matching = facts.array_rebinds.values().filter(|(_, target)| target == binding);
-        if !matching.all(|(point, _)| {
-            facts.array_calls.get(point).is_some_and(|(ordinal, _, _)| plan.same_array_rebinds.contains(&ordinal.0))
+        let mut matching = facts.array_rebinds.values().filter(|(_, target, _)| target == binding);
+        if !matching.all(|(point, _, destination)| {
+            facts.array_calls.get(point).is_some_and(|(ordinal, _, _)|
+                plan.same_array_rebinds.get(&ordinal.0) == Some(&destination.0))
         }) {
             continue;
         }
@@ -2051,7 +2059,7 @@ fn closed_aggregates<'a>(
                 _ => return None,
             };
             let CfgPointKind::Bind { binding } = &body.cfg.points.get(base.0)?.kind else { return None };
-            for &(call, ref destination) in facts.array_rebinds.values() {
+            for &(call, ref destination, install) in facts.array_rebinds.values() {
                 if destination != binding { continue }
                 let (ordinal, _, _) = facts.array_calls.get(&call)?;
                 let callee = target_body(&declarations, body.cfg, call)?;
@@ -2061,7 +2069,7 @@ fn closed_aggregates<'a>(
                         leaf.2.is_none() && array_leaves.contains(leaf)
                             && bodies.get(leaf).and_then(|body| body.facts).is_some_and(|facts| facts.array_neutral)));
                 if callee.2.is_some() || !callee_facts.array_neutral || !neutral
-                    || !result.bodies.get(&key)?.same_array_rebinds.contains(&ordinal.0)
+                    || result.bodies.get(&key)?.same_array_rebinds.get(&ordinal.0) != Some(&install.0)
                     || !matches!(&body.cfg.points.get(call.0)?.kind, CfgPointKind::Call {
                         output: 0,
                         target: ResolvedCallTarget::ModuleCallable {
