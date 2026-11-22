@@ -19,8 +19,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use wosy_compiler::{
     analyze_scalar_build, derive_scalar_declarations_from_cst, emit_scalar_build_project_llvm_text,
     emit_scalar_build_single_module_llvm_text, emit_scalar_build_wasm_root_exports_llvm_text,
-    parse_source, prepare_scalar_project, publication,
-    serialize_publication, ScalarNamespaceBinding, ScalarPreparationInputs, ScalarTargetLayout,
+    parse_source_with_snapshot, prepare_scalar_project, publication, serialize_publication,
+    ParseOutput, ScalarNamespaceBinding, ScalarPreparationInputs, ScalarTargetLayout,
 };
 use wosy_project::{
     artifact_manifest_path, discover_root, load_artifact_manifest, load_reachable_source_graph,
@@ -28,6 +28,8 @@ use wosy_project::{
     ProjectConfiguration, ProjectContext, SourceIdentity as ProjectSourceIdentity, SourceNodeInput,
     SourceObservation, SourceSpan as ProjectSourceSpan,
 };
+#[cfg(test)]
+use wosy_compiler::parse_source;
 use wosy_syntax::SourceIdentity;
 
 #[derive(Parser)]
@@ -115,8 +117,16 @@ fn parse_command(target: Option<&str>) -> Result<bool, String> {
         relative,
         revision,
     );
-    let output = parse_source(source, text, &project.comment_categories);
-    persist_cst(&root, &output)?;
+    let (fresh, diagnostics) = parse_source_with_snapshot(source, text, &project.comment_categories);
+    persist_cst(
+        &root,
+        &fresh.result().source.revision,
+        &fresh.snapshot_json_serializable(),
+    )?;
+    let output = ParseOutput {
+        result: fresh.into_result(),
+        diagnostics,
+    };
     let view = publication(&output);
     let json = serialize_publication(&view).map_err(|error| error.to_string())?;
     let output_path = root.join(".wosy/cst/current.json");
@@ -319,16 +329,18 @@ fn compile_project(
             path.as_path().to_string_lossy().replace('\\', "/"),
             revision.clone(),
         );
-        let output = parse_source(source, text, &project.comment_categories);
-        let source = &output.result.source;
-        render_diagnostics(&output.result.text, &output.diagnostics, source);
-        if !output.diagnostics.is_empty() {
+        let (fresh, diagnostics) =
+            parse_source_with_snapshot(source, text, &project.comment_categories);
+        let result = fresh.result();
+        let source = &result.source;
+        render_diagnostics(&result.text, &diagnostics, source);
+        if !diagnostics.is_empty() {
             return Err("build rejected by syntax diagnostics".to_owned());
         }
-        persist_cst(root, &output)?;
+        persist_cst(root, &source.revision, &fresh.snapshot_json_serializable())?;
         #[cfg(test)]
         routing_observations::record(|counts| counts.extractions += 1);
-        let declarations = derive_scalar_declarations_from_cst(output.result.canonical_cst());
+        let declarations = derive_scalar_declarations_from_cst(result.canonical_cst());
         let mut namespace_edges = Vec::new();
         for namespace in declarations.namespaces() {
             let module_path = serde_json::from_str::<String>(&namespace.path)
@@ -391,7 +403,7 @@ fn compile_project(
             nodes.push(node);
         }
         declarations_by_path.insert((package, path), declarations);
-        texts.insert(graph_source, output.result.text);
+        texts.insert(graph_source, fresh.into_result().text);
     }
     drop((discovered, pending));
 
@@ -495,24 +507,25 @@ fn scalar_target_layout(layout: wosy_project::TargetLayout) -> ScalarTargetLayou
     }
 }
 
-fn persist_cst(root: &std::path::Path, output: &wosy_compiler::ParseOutput) -> Result<(), String> {
-    let path = root
-        .join(".wosy/cst")
-        .join(format!("{}.json", output.result.source.revision));
+fn persist_cst(
+    root: &std::path::Path,
+    revision: &str,
+    snapshot: &impl serde::Serialize,
+) -> Result<(), String> {
+    let path = root.join(".wosy/cst").join(format!("{revision}.json"));
     let create_parent = || {
         path.parent().map_or(Ok(()), |parent| {
             fs::create_dir_all(parent).map_err(|error| error.to_string())
         })
     };
-    let snapshot = output.result.canonical_cst().snapshot_json_serializable();
     #[cfg(target_os = "linux")]
     {
         create_parent()?;
-        publish_cst_snapshot(&path, &snapshot)
+        publish_cst_snapshot(&path, snapshot)
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let bytes = serde_json::to_vec_pretty(&snapshot).map_err(|error| error.to_string())?;
+        let bytes = serde_json::to_vec_pretty(snapshot).map_err(|error| error.to_string())?;
         create_parent()?;
         fs::write(&path, bytes).map_err(|error| error.to_string())
     }
@@ -1138,21 +1151,26 @@ mod tests {
             "src/bootstrap.w".into(),
             "r1".into(),
         );
-        let output = parse_source(
+        let (fresh, diagnostics) = parse_source_with_snapshot(
             source,
             include_str!("../../../stdlib/src/bootstrap.w").into(),
             &[],
         );
-        assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
         let root = snapshot_test_path("deep").with_extension("");
         let path = root.join(".wosy/cst/r1.json");
-        let tree = output.result.canonical_cst();
+        let tree = fresh.result().canonical_cst();
         let borrowed = serde_json::to_vec_pretty(&tree.snapshot_json_serializable())
             .expect("serialize borrowed CST snapshot");
         let owned = serde_json::to_vec_pretty(&tree.snapshot())
             .expect("serialize owned CST snapshot");
         assert!(borrowed == owned, "borrowed CST snapshot changed bytes");
-        persist_cst(&root, &output).expect("publish archived snapshot");
+        persist_cst(
+            &root,
+            &fresh.result().source.revision,
+            &fresh.snapshot_json_serializable(),
+        )
+        .expect("publish archived snapshot");
         assert!(fs::read(&path).unwrap() == borrowed, "streamed CST snapshot changed bytes");
 
         let canonical = load_canonical_cst(&path).expect("load deep canonical CST snapshot");

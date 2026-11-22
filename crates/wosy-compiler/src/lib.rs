@@ -385,7 +385,25 @@ pub fn parse_source(
     configured_comments: &[String],
 ) -> ParseOutput {
     let result = wosy_syntax::parse(source, text, configured_comments);
-    let diagnostics = result
+    let diagnostics = parse_diagnostics(&result);
+    ParseOutput {
+        result,
+        diagnostics,
+    }
+}
+
+pub fn parse_source_with_snapshot(
+    source: SourceIdentity,
+    text: String,
+    configured_comments: &[String],
+) -> (wosy_syntax::FreshParseResult, Vec<Diagnostic>) {
+    let fresh = wosy_syntax::parse_with_snapshot(source, text, configured_comments);
+    let diagnostics = parse_diagnostics(fresh.result());
+    (fresh, diagnostics)
+}
+
+fn parse_diagnostics(result: &ParseResult) -> Vec<Diagnostic> {
+    result
         .errors
         .iter()
         .map(|error| Diagnostic {
@@ -399,11 +417,7 @@ pub fn parse_source(
             }],
             notes: vec!["parse the selected source with the configured project rules".to_owned()],
         })
-        .collect();
-    ParseOutput {
-        result,
-        diagnostics,
-    }
+        .collect()
 }
 
 pub fn publication(output: &ParseOutput) -> CstPublication {

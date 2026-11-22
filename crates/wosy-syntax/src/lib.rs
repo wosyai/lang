@@ -250,15 +250,32 @@ struct SerializableCstSnapshot<'a>(&'a CanonicalCstRoot);
 impl Serialize for SerializableCstSnapshot<'_> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let text = self.0.root.text().to_string();
-        let root = SerializableCstNode {
-            node: &self.0.root,
-            text: &text,
-            offset: self.0.root.text_range().start().into(),
-        };
-        let mut snapshot = serializer.serialize_struct("CanonicalCstSnapshot", 2)?;
-        snapshot.serialize_field("source", &self.0.source)?;
-        snapshot.serialize_field("root", &root)?;
-        snapshot.end()
+        serialize_cst_snapshot(self.0, &text, serializer)
+    }
+}
+
+fn serialize_cst_snapshot<S: Serializer>(
+    tree: &CanonicalCstRoot,
+    text: &str,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    let root = SerializableCstNode {
+        node: &tree.root,
+        text,
+        offset: tree.root.text_range().start().into(),
+    };
+    let mut snapshot = serializer.serialize_struct("CanonicalCstSnapshot", 2)?;
+    snapshot.serialize_field("source", &tree.source)?;
+    snapshot.serialize_field("root", &root)?;
+    snapshot.end()
+}
+
+struct SerializableParsedCstSnapshot<'a>(&'a FreshParseResult);
+
+impl Serialize for SerializableParsedCstSnapshot<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let result = self.0.result();
+        serialize_cst_snapshot(result.canonical_cst(), &result.text, serializer)
     }
 }
 
@@ -433,6 +450,30 @@ impl ParseResult {
     pub fn canonical_cst(&self) -> &CanonicalCstRoot {
         &self.canonical_root
     }
+}
+
+pub struct FreshParseResult(ParseResult);
+
+impl FreshParseResult {
+    pub fn result(&self) -> &ParseResult {
+        &self.0
+    }
+
+    pub fn into_result(self) -> ParseResult {
+        self.0
+    }
+
+    pub fn snapshot_json_serializable(&self) -> impl Serialize + '_ {
+        SerializableParsedCstSnapshot(self)
+    }
+}
+
+pub fn parse_with_snapshot(
+    source: SourceIdentity,
+    text: String,
+    configured_comments: &[String],
+) -> FreshParseResult {
+    FreshParseResult(parse(source, text, configured_comments))
 }
 
 pub fn parse(source: SourceIdentity, text: String, configured_comments: &[String]) -> ParseResult {
@@ -819,9 +860,14 @@ mod tests {
             ("%%start\r\nstr label = \"Olá\\t日本語\";\r\n%%end", true),
             ("%%start\nsomething ?????;\ni32 value = 4;\n%%end", false),
         ] {
-            let result = parse(identity(), text.into(), &[]);
+            let fresh = parse_with_snapshot(identity(), text.into(), &[]);
+            let result = fresh.result();
             assert_eq!(result.is_valid(), valid, "{:?}", result.errors);
             let root = result.canonical_cst();
+            assert_eq!(
+                serde_json::to_vec_pretty(&fresh.snapshot_json_serializable()).unwrap(),
+                serde_json::to_vec_pretty(&root.snapshot()).unwrap(),
+            );
             let tail = root
                 .root
                 .descendants()
