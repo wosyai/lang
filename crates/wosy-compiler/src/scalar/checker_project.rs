@@ -7,7 +7,7 @@ use std::hash::{Hash, Hasher};
 use super::{
     checker_directive::{CheckedLiteralOutput, CheckerOperation, InitializerIntegerOperand, InitializerPredicate, PreparedCheckerDirective},
     checker_flow::{
-        check_integer_requirement_activity, check_integer_requirements_at_entry, check_integer_return_bound_with_shows, concrete_integer_literal, exact_integer_call_argument, exact_integer_call_argument_at,
+        check_integer_requirement_activity, check_integer_requirements_with_calls, check_integer_return_bound_with_shows, concrete_integer_literal, exact_integer_call_argument, exact_integer_call_argument_at,
         exact_integer_return_at_entry, ActualCallResult, CheckerPredicate, ExactIntegerArgument,
         proves_requirement_with_imported_root_local, ImportedEntryGuard, ImportedLocal, IntegerShowProof, IntegerCheckFailure, IntegerComparison, IntegerInputs, IntegerReturn, ProofCoverage,
     },
@@ -325,32 +325,76 @@ fn check_package_roots_with_activity(
         if visits[ordinal] != InitializationVisit::Completed {
             continue;
         }
-        had_obligations |= check_unused_module(calls, &project.modules[ordinal], ordinal, &reached)?;
+        had_obligations |= check_unused_module(project, calls, &project.modules[ordinal], ordinal, &reached)?;
     }
     for (index, module) in dormant.iter().enumerate() {
-        had_obligations |= check_unused_module(calls, module, startup_count + index, &reached)?;
+        had_obligations |= check_unused_module(project, calls, module, startup_count + index, &reached)?;
     }
     Ok(had_obligations)
 }
 
+fn record_symbolic_callable_edges(
+    body: &FunctionCallSites,
+    ordinal: usize,
+    caller: usize,
+    callers: &mut HashMap<usize, Vec<usize>>,
+) -> bool {
+    for &(target_module, target_item) in body.structure.checker_direct_targets.values() {
+        if target_module == ordinal {
+            callers.entry(target_item).or_default().push(caller);
+        }
+    }
+    let mut authored = !body.structure.checker_directives.is_empty();
+    for arm in &body.arms {
+        authored |= record_symbolic_callable_edges(arm, ordinal, caller, callers);
+    }
+    authored
+}
+
+fn symbolic_obligation_roots(
+    calls: &ProjectCallSiteResults,
+    module: &ScalarModule,
+    ordinal: usize,
+) -> Result<HashSet<usize>, ProjectCheck> {
+    let mut callers = HashMap::new();
+    let mut roots = HashSet::new();
+    for (item, declaration) in module.items.iter().enumerate() {
+        if !matches!(declaration, ScalarItem::Function(_)) {
+            continue;
+        }
+        let body = calls.function_body(ordinal, item, None).ok_or(ProjectCheck::MissingRootOccurrences)?;
+        if record_symbolic_callable_edges(body, ordinal, item, &mut callers) {
+            roots.insert(item);
+        }
+    }
+    if !callers.is_empty() {
+        let mut pending: Vec<_> = roots.iter().copied().collect();
+        while let Some(target) = pending.pop() {
+            if let Some(edges) = callers.remove(&target) {
+                pending.extend(edges.into_iter().filter(|caller| roots.insert(*caller)));
+            }
+        }
+    }
+    Ok(roots)
+}
+
 fn check_unused_module(
+    project: &ScalarProject,
     calls: &ProjectCallSiteResults,
     module: &ScalarModule,
     ordinal: usize,
     reached: &HashSet<(usize, usize)>,
 ) -> Result<bool, ProjectCheck> {
+    let symbolic_roots = symbolic_obligation_roots(calls, module, ordinal)?;
     let mut active = false;
     for (item, declaration) in module.items.iter().enumerate() {
         let ScalarItem::Function(function) = declaration else {
             continue;
         };
-        if reached.contains(&(ordinal, item)) {
+        if reached.contains(&(ordinal, item)) || !symbolic_roots.contains(&item) {
             continue;
         }
         let body = calls.function_body(ordinal, item, None).ok_or(ProjectCheck::MissingRootOccurrences)?;
-        if !has_callable_obligations(body) {
-            continue;
-        }
         if !function.generic_parameters.is_empty() || !function.overload_arms.is_empty() {
             return Err(ProjectCheck::Unsupported);
         }
@@ -359,10 +403,19 @@ fn check_unused_module(
         {
             return Err(ProjectCheck::Unsupported);
         }
-        match check_integer_requirement_activity(body) {
-            Some(Ok(observed)) => active |= observed,
-            Some(Err(failure)) => return Err(project_failure(body, &module.source, failure)),
-            None => return Err(ProjectCheck::Unsupported),
+        if body.structure.checker_direct_targets.is_empty() {
+            match check_integer_requirement_activity(body) {
+                Some(Ok(observed)) => active |= observed,
+                Some(Err(failure)) => return Err(project_failure(body, &module.source, failure)),
+                None => return Err(ProjectCheck::Unsupported),
+            }
+        } else {
+            let mut symbolic = CheckedCalls::<(), false> {
+                project, calls, active: HashSet::from([(ordinal, item)]), reached: HashSet::new(),
+                had_obligations: false, observer: (), symbolic_module: ordinal,
+            };
+            let observed = symbolic.requirements(body, &module.source, None)?;
+            active |= observed || symbolic.had_obligations;
         }
     }
     Ok(active)
@@ -419,7 +472,10 @@ fn check_package_initialization_observing<'a, Observer: ActualIntegerObserver>(
 ) -> Result<(CheckedInitialization<'a>, Observer), ProjectCheck> {
     let (project, calls) = prepared.parts();
     let mut visits = vec![InitializationVisit::Unseen; project.modules.len()];
-    let mut actual = ActualCalls { project, calls, active: HashSet::new(), reached: HashSet::new(), had_obligations: false, observer };
+    let mut actual = CheckedCalls {
+        project, calls, active: HashSet::new(), reached: HashSet::new(),
+        had_obligations: false, observer, symbolic_module: 0,
+    };
     walk_package_initialization(project, calls, &ordinals, &mut visits, &mut actual, root)?;
     Ok((CheckedInitialization { visits, reached: actual.reached, ordinals, had_obligations: actual.had_obligations }, actual.observer))
 }
@@ -429,7 +485,7 @@ fn walk_package_initialization(
     calls: &ProjectCallSiteResults,
     ordinals: &HashMap<&SourceIdentity, usize>,
     visits: &mut [InitializationVisit],
-    actual: &mut ActualCalls<'_, impl ActualIntegerObserver>,
+    actual: &mut CheckedCalls<'_, impl ActualIntegerObserver>,
     source: &SourceIdentity,
 ) -> Result<(), ProjectCheck> {
     let ordinal = *ordinals.get(source).ok_or(ProjectCheck::RootSourceOutsideInitOrder)?;
@@ -504,7 +560,7 @@ fn walk_package_initialization(
 
 fn check_initializer_expression(
     topology: &ModuleInitializationTopology,
-    actual: &mut ActualCalls<'_, impl ActualIntegerObserver>,
+    actual: &mut CheckedCalls<'_, impl ActualIntegerObserver>,
     source: &SourceIdentity,
     storage: &HashMap<ByteSpan, InitializerValue<'_>>,
     expression: OccurrenceOrdinal,
@@ -554,7 +610,7 @@ fn check_initializer_expression(
 
 fn run_initializer_call<'a>(
     topology: &'a ModuleInitializationTopology,
-    actual: &mut ActualCalls<'_, impl ActualIntegerObserver>,
+    actual: &mut CheckedCalls<'_, impl ActualIntegerObserver>,
     occurrence: OccurrenceOrdinal,
     expected: &ScalarType,
     initialized_argument: impl Fn(OccurrenceOrdinal, &ScalarType) -> Option<&'a BigInt>,
@@ -639,13 +695,14 @@ enum ActualProjectedArguments<'a> {
     InitializerPair(ExactIntegerArgument<'a>, ExactIntegerArgument<'a>),
 }
 
-struct ActualCalls<'a, Observer> {
+struct CheckedCalls<'a, Observer, const ACTUAL_STARTUP: bool = true> {
     project: &'a ScalarProject,
     calls: &'a ProjectCallSiteResults,
     active: HashSet<(usize, usize)>,
     reached: HashSet<(usize, usize)>,
     had_obligations: bool,
     observer: Observer,
+    symbolic_module: usize,
 }
 
 trait ActualIntegerObserver {
@@ -663,7 +720,7 @@ impl ActualIntegerObserver for () {
 
 const MAX_ACTUAL_CALL_DEPTH: usize = 64;
 
-impl<Observer: ActualIntegerObserver> ActualCalls<'_, Observer> {
+impl<Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> CheckedCalls<'_, Observer, ACTUAL_STARTUP> {
     fn nested(
         &mut self,
         caller: &FunctionCallSites,
@@ -683,6 +740,29 @@ impl<Observer: ActualIntegerObserver> ActualCalls<'_, Observer> {
         self.run(&caller.structure, call, signature, ActualProjectedArguments::Single(argument), source, *declaration_span, expected)
     }
 
+    fn requirements(
+        &mut self,
+        body: &FunctionCallSites,
+        source: &SourceIdentity,
+        exact: Option<&[&BigInt]>,
+    ) -> Result<bool, ProjectCheck> {
+        let mut nested_error = None;
+        let checked = check_integer_requirements_with_calls(body, exact, &mut |caller, occurrence, argument, expected| {
+            match self.nested(caller, occurrence, argument, expected) {
+                Ok(result) => Some(result),
+                Err(error) => {
+                    nested_error = Some(error);
+                    None
+                }
+            }
+        });
+        match checked {
+            Some(Ok(active)) => Ok(active),
+            Some(Err(failure)) => Err(project_failure(body, source, failure)),
+            None => Err(nested_error.unwrap_or(ProjectCheck::Unsupported)),
+        }
+    }
+
     fn run(
         &mut self,
         structure: &OccurrenceStructure,
@@ -695,6 +775,9 @@ impl<Observer: ActualIntegerObserver> ActualCalls<'_, Observer> {
     ) -> Result<ActualCallResult, ProjectCheck> {
         let &(target_module, target_item) = structure.checker_direct_targets.get(&call)
             .ok_or(ProjectCheck::MissingRootOccurrences)?;
+        if !ACTUAL_STARTUP && (*expected != ScalarType::Unit || target_module != self.symbolic_module) {
+            return Err(ProjectCheck::Unsupported);
+        }
         let owner = self.project.modules.get(target_module).ok_or(ProjectCheck::MissingRoot)?;
         let Some(ScalarItem::Function(function)) = owner.items.get(target_item) else {
             return Err(ProjectCheck::MissingRoot);
@@ -735,24 +818,10 @@ impl<Observer: ActualIntegerObserver> ActualCalls<'_, Observer> {
             return Err(ProjectCheck::Unsupported);
         }
         let result = if *expected == ScalarType::Unit {
-            let mut nested_error = None;
-            let checked = check_integer_requirements_at_entry(body, exact, &mut |caller, occurrence, argument, expected| {
-                match self.nested(caller, occurrence, argument, expected) {
-                    Ok(result) => Some(result),
-                    Err(error) => {
-                        nested_error = Some(error);
-                        None
-                    }
-                }
-            });
-            match checked {
-                Some(Ok(active)) => {
-                    self.had_obligations |= active;
-                    Ok(ActualCallResult::Unit)
-                }
-                Some(Err(failure)) => Err(project_failure(body, &owner.source, failure)),
-                None => Err(nested_error.unwrap_or(ProjectCheck::Unsupported)),
-            }
+            self.requirements(body, &owner.source, Some(exact)).map(|active| {
+                self.had_obligations |= active;
+                ActualCallResult::Unit
+            })
         } else if is_integer_type(expected)
             && body.structure.checker_directives.is_empty()
             && body.call_occurrences.is_empty()
@@ -765,12 +834,12 @@ impl<Observer: ActualIntegerObserver> ActualCalls<'_, Observer> {
             Err(ProjectCheck::Unsupported)
         };
         self.active.remove(&target);
-        if Observer::ENABLED {
+        if ACTUAL_STARTUP && Observer::ENABLED {
             if let Ok(ActualCallResult::Integer(value)) = &result {
                 self.observer.observe(target, exact, value);
             }
         }
-        if result.is_ok() {
+        if ACTUAL_STARTUP && result.is_ok() {
             self.reached.insert(target);
         }
         result

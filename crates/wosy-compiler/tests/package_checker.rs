@@ -1036,3 +1036,75 @@ fn explicit_dormant_selection_cannot_alias_startup_or_import_a_namespace_graph()
         ScalarCheckerScope::MainFlowOnly,
     ), ScalarCheckerOutcome::NoChecks);
 }
+
+#[test]
+fn unused_symbolic_roots_forward_only_exact_nested_inputs_and_keep_actual_scope_separate() {
+    let body = |guard: &str, called: &str, actual: &str| format!(r#"
+        unit(u8) symbolic = fn(value) {{
+            {guard}
+            {called}
+            core.require(true, {OUTPUT});
+        }};
+        unit(u8) leaf = fn(value) {{ core.require(value < 2, {OUTPUT}); }};
+        {actual}
+    "#);
+    let known = body(&format!("core.narrow(value == 2, {OUTPUT});"), "leaf(value);", "leaf(1);");
+    let ScalarCheckerOutcome::Failed(failure) = check(&known) else {
+        panic!("expected nested failure at exact symbolic input");
+    };
+    let at = format!("%%start\n{known}\n%%end");
+    assert_eq!(&at[failure.condition.start as usize..failure.condition.end as usize], "value < 2");
+    assert_eq!(failure.witness.intervals_at(0, 0).unwrap().next(), Some((&2.into(), &2.into())));
+    assert_eq!(check_scoped(&known, ScalarCheckerScope::MainFlowOnly), ScalarCheckerOutcome::Passed);
+
+    let unknown = body("", "leaf(value);", "leaf(1);");
+    assert_eq!(check(&unknown), ScalarCheckerOutcome::Unsupported);
+    let not_visited = body("", "if (false) { leaf(value); };", "leaf(1);");
+    assert_eq!(check(&not_visited), ScalarCheckerOutcome::Passed);
+
+    let still_unused = body("if (value == 0) {};", "leaf(1);", "");
+    let result = check(&still_unused);
+    let ScalarCheckerOutcome::Failed(failure) = result else {
+        panic!("a symbolic-only callee still needs its own arbitrary unused-root check, got {result:?}");
+    };
+    assert_eq!(failure.witness.intervals_at(0, 0).unwrap().next(), Some((&2.into(), &255.into())));
+
+    let transitively_reaches = format!(r#"
+        unit() outer = fn {{ wrapper(); }};
+        unit() wrapper = fn {{ leaf(2); }};
+        unit(u8) leaf = fn(value) {{ core.require(value < 2, {OUTPUT}); }};
+        leaf(1);
+    "#);
+    let ScalarCheckerOutcome::Failed(failure) = check(&transitively_reaches) else {
+        panic!("transitive unused roots reach authored obligations without dummy directives");
+    };
+    assert_eq!(failure.witness.intervals_at(0, 0).unwrap().next(), Some((&2.into(), &2.into())));
+    assert_eq!(check_scoped(&transitively_reaches, ScalarCheckerScope::MainFlowOnly), ScalarCheckerOutcome::Passed);
+
+    let recursive = body("if (value == 0) {};", "symbolic(1);", "leaf(1);");
+    assert_eq!(check(&recursive), ScalarCheckerOutcome::Unsupported);
+}
+
+#[test]
+fn dormant_symbolic_roots_can_check_a_nested_exact_unit_call_without_initialization() {
+    let main = source();
+    let dormant = SourceIdentity::new("local".into(), "demo".into(), "src/extra.w".into(), "phase4".into());
+    let extra = format!(r#"
+        core.narrow(false, {OUTPUT});
+        unit() caller = fn {{ leaf(2); }};
+        unit(u8) leaf = fn(input) {{ core.require(input < 2, {OUTPUT}); }};
+    "#);
+    let result = check_scalar_package_with_dormant_sources(
+        vec![(dormant_source(main.clone(), ""), Vec::new())],
+        vec![main],
+        vec![dormant_source(dormant.clone(), &extra)],
+        ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
+        ScalarCheckerScope::CurrentPackage,
+    );
+    let ScalarCheckerOutcome::Failed(failure) = result else {
+        panic!("expected same-source dormant nested obligation");
+    };
+    assert_eq!(failure.source, dormant);
+    assert_eq!(failure.operation, ScalarCheckerOperation::Require);
+    assert_eq!(failure.witness.intervals_at(0, 0).unwrap().next(), Some((&2.into(), &2.into())));
+}

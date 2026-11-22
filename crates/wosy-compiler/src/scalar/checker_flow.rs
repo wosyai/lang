@@ -483,12 +483,13 @@ type ActualCallHandler<'a, 'handler> =
         &'a FunctionCallSites, OccurrenceOrdinal, Option<ExactIntegerArgument<'_>>, &ScalarType,
     ) -> Option<ActualCallResult> + 'handler;
 
-pub(super) fn check_integer_requirements_at_entry<'a>(
+pub(super) fn check_integer_requirements_with_calls<'a>(
     calls: &'a FunctionCallSites,
-    arguments: &[&BigInt],
+    exact_arguments: Option<&[&BigInt]>,
     handle_call: &mut ActualCallHandler<'a, '_>,
 ) -> Option<Result<bool, IntegerCheckFailure<'a>>> {
-    run_integer_callable::<false>(calls, None, None, None, None, Some(arguments), Some(handle_call))
+    let tail = if exact_arguments.is_none() { integer_tail_type(calls) } else { None };
+    run_integer_callable::<false>(calls, tail, None, None, None, exact_arguments, Some(handle_call))
         .map(|result| result.map(|coverage| matches!(coverage, ProofCoverage::Applicable(true))))
 }
 
