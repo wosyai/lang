@@ -218,10 +218,15 @@ fn replay_observes_only_consumed_first_output_contract_origins() {
 
         let mut replays = Vec::new();
         let mut pointers = Vec::new();
-        for (from, to) in [
-            (&previous, &previous),
-            (&previous, &current),
-            (&current, &current),
+        let has_null_at_call = |cfg: &ScalarReferenceCfg, call: CfgPointId| {
+            cfg.points[call.0].possible_origins.as_ref().is_some_and(|origins| {
+                origins.iter().any(|id| matches!(cfg.facts[id.0], ReferenceOrigin::Null { .. }))
+            })
+        };
+        for (from, to, transfers, has_null) in [
+            (&previous, &previous, [1, 1, 1, 1], false),
+            (&previous, &current, [1, 1, 2, 1], true),
+            (&current, &current, [1, 1, 2, 1], true),
         ] {
             let mut cursor = 0;
             let mut inputs = HashMap::new();
@@ -231,12 +236,11 @@ fn replay_observes_only_consumed_first_output_contract_origins() {
                 );
             }
             assert_eq!(cursor, replays.len());
+            assert!(replays.iter().map(|replay| replay.transfers).eq(transfers));
+            assert_eq!(has_null_at_call(&updates[2].1.cfg, replays[2].module_calls[0]), has_null);
             pointers.push(updates.iter().map(|(_, result)| result.cfg.points.as_ptr()).collect::<Vec<_>>());
         }
-        assert_ne!(pointers[0][2], pointers[1][2]);
-        for index in [0, 1, 3] {
-            assert_eq!(pointers[0][index], pointers[1][index]);
-        }
+        assert_eq!(pointers[0], pointers[1]);
         assert_eq!(pointers[1], pointers[2]);
         assert!(replays.iter().all(|replay| replay.errors.is_empty()));
 
@@ -255,10 +259,10 @@ fn replay_observes_only_consumed_first_output_contract_origins() {
             row(span(1), 0, origins.clone()),
             row(span(1), 1, Vec::new()),
         ]);
-        for (from, to, successor) in [
-            (&current, &current, true),
-            (&current, &metadata_only, false),
-            (&metadata_only, &removed, true),
+        for (from, to, successor, left_transfers, has_null) in [
+            (&current, &current, true, 2, true),
+            (&current, &metadata_only, false, 2, true),
+            (&metadata_only, &removed, true, 3, false),
         ] {
             let mut cursor = 0;
             let mut inputs = HashMap::new();
@@ -272,10 +276,9 @@ fn replay_observes_only_consumed_first_output_contract_origins() {
             assert_eq!(cursor, replays.len());
             assert_eq!(updates[3].1.cfg.points.as_ptr(), right_before);
             assert_eq!(updates[3].1.aggregate.checked_successor_contract, successor);
-            assert_eq!(
-                updates[2].1.cfg.points.as_ptr() != left_before,
-                std::ptr::eq(to, &removed),
-            );
+            assert_eq!(updates[2].1.cfg.points.as_ptr(), left_before);
+            assert!(replays.iter().map(|replay| replay.transfers).eq([1, 1, left_transfers, 1]));
+            assert_eq!(has_null_at_call(&updates[2].1.cfg, replays[2].module_calls[0]), has_null);
         }
     }
 }

@@ -8638,6 +8638,8 @@ impl<'a> ReferenceOutputContracts<'a> {
 struct ReferenceContractReplay {
     module_calls: Vec<CfgPointId>,
     errors: Vec<ReferenceAnalysisError>,
+    #[cfg(test)]
+    transfers: usize,
 }
 
 fn collect_function_output_contracts<'a>(
@@ -8759,7 +8761,20 @@ fn transfer_function_output_contracts<'a>(
         }
     }
     if !result.cfg.initial_points.is_empty() && changed {
-        result.cfg.points = result.cfg.initial_points.clone();
+        let cfg = &mut result.cfg;
+        if cfg.points.len() == cfg.initial_points.len() {
+            for (live, pristine) in cfg.points.iter_mut().zip(&cfg.initial_points) {
+                if matches!(&pristine.kind,
+                    CfgPointKind::Evaluate(_) | CfgPointKind::Call { .. } | CfgPointKind::Branch { .. })
+                {
+                    live.possible_origins.clone_from(&pristine.possible_origins);
+                } else {
+                    live.clone_from(pristine);
+                }
+            }
+        } else {
+            cfg.points.clone_from(&cfg.initial_points);
+        }
         let candidate = match (&result.proof_points.scalar_descriptor_install, &result.proof_points.backing_descriptor_install) {
             (ScalarDescriptorCandidates::One(destination, marker), _) => Some((destination, marker)),
             (ScalarDescriptorCandidates::None, ScalarDescriptorCandidates::One(destination, marker))
@@ -8781,6 +8796,10 @@ fn transfer_function_output_contracts<'a>(
             None,
             descriptor.as_mut(),
         );
+        #[cfg(test)]
+        {
+            replay.transfers += 1;
+        }
         result.aggregate.checked_producer_authoritative = transferred.is_empty()
             && !result.aggregate.checked_producer_sources.is_empty()
             && result.aggregate.checked_producer_sources.iter().all(|(_, terminal)| {
