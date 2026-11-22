@@ -805,7 +805,7 @@ fn walk_package_initialization<const COLLECT: bool>(
                         value
                     } else if matches!(expression, ScalarExpression::Call { .. }) {
                         #[cfg(feature = "internal-checker")]
-                        let proof_site = actual.initializer_proof_site(topology, source, outputs.primary, failures.as_deref())?;
+                        let proof_site = actual.initializer_proof_site(topology, source, outputs.primary, failures.as_deref());
                         let ActualCallResult::Integer(value) = run_initializer_call(
                             topology, actual, outputs.primary, ty,
                             |argument, argument_type| initialized_integer_argument(topology, &storage, argument, argument_type),
@@ -1026,8 +1026,9 @@ struct CheckedCalls<'a, Observer, const ACTUAL_STARTUP: bool = true> {
 #[cfg(feature = "internal-checker")]
 struct InitializerProofSite<'a> {
     source: &'a SourceIdentity,
-    span: ByteSpan,
-    directive_position: usize,
+    topology: &'a ModuleInitializationTopology,
+    occurrence: OccurrenceOrdinal,
+    effects: &'a OrderedFailures,
 }
 
 trait ActualIntegerObserver {
@@ -1064,15 +1065,13 @@ const MAX_ACTUAL_CALL_DEPTH: usize = 64;
 impl<Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> CheckedCalls<'_, Observer, ACTUAL_STARTUP> {
     #[cfg(feature = "internal-checker")]
     fn initializer_proof_site<'a>(
-        &self, topology: &ModuleInitializationTopology, source: &'a SourceIdentity,
-        occurrence: OccurrenceOrdinal, failures: Option<&OrderedFailures>,
-    ) -> Result<Option<InitializerProofSite<'a>>, ProjectCheck> {
+        &self, topology: &'a ModuleInitializationTopology, source: &'a SourceIdentity,
+        occurrence: OccurrenceOrdinal, failures: Option<&'a OrderedFailures>,
+    ) -> Option<InitializerProofSite<'a>> {
         if !ACTUAL_STARTUP || !Observer::CONTEXTUAL {
-            return Ok(None);
+            return None;
         }
-        let span = topology.occurrences.get(occurrence.0).ok_or(ProjectCheck::MissingRootOccurrences)?.span;
-        let directive_position = failures.ok_or(ProjectCheck::Unsupported)?.records.len();
-        Ok(Some(InitializerProofSite { source, span, directive_position }))
+        Some(InitializerProofSite { source, topology, occurrence, effects: failures? })
     }
 
     fn nested(
@@ -1912,6 +1911,12 @@ struct MainFlowProofReceipt {
 struct MainFlowProofDiagnostic {
     proof: wosy_syntax::SourceSpan,
     goal: wosy_syntax::SourceSpan,
+    invocation: Rc<MainFlowProofInvocation>,
+}
+
+#[cfg(feature = "internal-checker")]
+#[cfg_attr(not(test), allow(dead_code))]
+struct MainFlowProofInvocation {
     call: wosy_syntax::SourceSpan,
     directive_position: usize,
     arguments: Vec<(ScalarType, BigInt)>,
@@ -1919,18 +1924,82 @@ struct MainFlowProofDiagnostic {
 }
 
 #[cfg(feature = "internal-checker")]
-struct MainFlowProofObserver<'a> {
-    target: (usize, usize),
+struct MainFlowProofCase<'a> {
     proof_source: &'a SourceIdentity,
     proof: ByteSpan,
     goal: ByteSpan,
     guard: CheckedIntegerGuardSlots<'a>,
     relation: IntegerRelation,
     bound: &'a BigInt,
+}
+
+#[cfg(feature = "internal-checker")]
+impl<'a> MainFlowProofCase<'a> {
+    fn prepare(plan: &'a PlannedModuleProof<'a>, root: &SourceIdentity) -> Result<Self, ProjectCheck> {
+        let TypedProofGoal::Literal { relation, bound, .. } = &plan.typed.goal else {
+            return Err(ProjectCheck::Unsupported);
+        };
+        if !plan.steps.items.is_empty() || &plan.typed.target.source != root {
+            return Err(ProjectCheck::Unsupported);
+        }
+        let guard = checked_integer_guard_slots::<false>(plan.typed.body, plan.filter.as_deref().unwrap_or_default())
+            .ok_or(ProjectCheck::Unsupported)?;
+        let goal = child(&child(plan.proof, SyntaxKind::ProofEnsures)?, SyntaxKind::Expression)?;
+        Ok(Self {
+            proof_source: plan.proof_source, proof: wosy_syntax::byte_span(plan.proof),
+            goal: wosy_syntax::byte_span(&goal), guard, relation: *relation, bound,
+        })
+    }
+}
+
+#[cfg(feature = "internal-checker")]
+struct MainFlowProofTarget<'a> {
+    first: MainFlowProofCase<'a>,
+    rest: Vec<MainFlowProofCase<'a>>,
     seen: bool,
+}
+
+#[cfg(feature = "internal-checker")]
+impl<'a> MainFlowProofTarget<'a> {
+    fn new(first: MainFlowProofCase<'a>) -> Self {
+        Self { first, rest: Vec::new(), seen: false }
+    }
+}
+
+#[cfg(feature = "internal-checker")]
+struct MainFlowProofObserver<'a> {
+    first: ((usize, usize), MainFlowProofTarget<'a>),
+    other: HashMap<(usize, usize), MainFlowProofTarget<'a>>,
     active: bool,
     incomplete: bool,
     diagnostics: Vec<MainFlowProofDiagnostic>,
+}
+
+#[cfg(feature = "internal-checker")]
+impl<'a> MainFlowProofObserver<'a> {
+    fn new(target: (usize, usize), first: MainFlowProofCase<'a>) -> Self {
+        Self {
+            first: (target, MainFlowProofTarget::new(first)), other: HashMap::new(),
+            active: false, incomplete: false, diagnostics: Vec::new(),
+        }
+    }
+
+    fn insert(&mut self, target: (usize, usize), proof: MainFlowProofCase<'a>) {
+        if self.first.0 == target {
+            self.first.1.rest.push(proof);
+            return;
+        }
+        match self.other.entry(target) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => entry.get_mut().rest.push(proof),
+            std::collections::hash_map::Entry::Vacant(entry) => { entry.insert(MainFlowProofTarget::new(proof)); }
+        }
+    }
+
+    fn complete(&self, reached: &HashSet<(usize, usize)>) -> bool {
+        !self.incomplete
+            && (self.first.1.seen || !reached.contains(&self.first.0))
+            && self.other.iter().all(|(target, proofs)| proofs.seen || !reached.contains(target))
+    }
 }
 
 #[cfg(feature = "internal-checker")]
@@ -1944,33 +2013,53 @@ impl ActualIntegerObserver for MainFlowProofObserver<'_> {
         &mut self, target: (usize, usize), site: Option<InitializerProofSite<'_>>,
         parameters: &[ScalarType], arguments: &[&BigInt], value: &BigInt,
     ) {
-        if target != self.target {
+        let proofs = if self.first.0 == target {
+            &mut self.first.1
+        } else if let Some(proofs) = self.other.get_mut(&target) {
+            proofs
+        } else {
             return;
-        }
+        };
         let Some(site) = site else {
             self.incomplete = true;
             return;
         };
-        if arguments.len() != self.guard.arity || arguments.len() != parameters.len() {
+        if arguments.len() != proofs.first.guard.arity || arguments.len() != parameters.len() {
             self.incomplete = true;
             return;
         }
-        self.seen = true;
-        if !self.guard.accepts(arguments) {
-            return;
+        proofs.seen = true;
+        let mut invocation: Option<Rc<MainFlowProofInvocation>> = None;
+        for proof in std::iter::once(&proofs.first).chain(&proofs.rest) {
+            if !proof.guard.accepts(arguments) {
+                continue;
+            }
+            self.active = true;
+            if proof.relation.accepts(value.cmp(proof.bound)) {
+                continue;
+            }
+            let invoked = if let Some(invoked) = &invocation {
+                Rc::clone(invoked)
+            } else {
+                let Some(occurrence) = site.topology.occurrences.get(site.occurrence.0) else {
+                    self.incomplete = true;
+                    return;
+                };
+                let invoked = Rc::new(MainFlowProofInvocation {
+                    call: wosy_syntax::SourceSpan { source: site.source.clone(), range: occurrence.span },
+                    directive_position: site.effects.records.len(),
+                    arguments: parameters.iter().cloned().zip(arguments.iter().map(|value| (**value).clone())).collect(),
+                    returned: value.clone(),
+                });
+                invocation = Some(Rc::clone(&invoked));
+                invoked
+            };
+            self.diagnostics.push(MainFlowProofDiagnostic {
+                proof: wosy_syntax::SourceSpan { source: proof.proof_source.clone(), range: proof.proof },
+                goal: wosy_syntax::SourceSpan { source: proof.proof_source.clone(), range: proof.goal },
+                invocation: invoked,
+            });
         }
-        self.active = true;
-        if self.relation.accepts(value.cmp(self.bound)) {
-            return;
-        }
-        self.diagnostics.push(MainFlowProofDiagnostic {
-            proof: wosy_syntax::SourceSpan { source: self.proof_source.clone(), range: self.proof },
-            goal: wosy_syntax::SourceSpan { source: self.proof_source.clone(), range: self.goal },
-            call: wosy_syntax::SourceSpan { source: site.source.clone(), range: site.span },
-            directive_position: site.directive_position,
-            arguments: parameters.iter().cloned().zip(arguments.iter().map(|value| (**value).clone())).collect(),
-            returned: value.clone(),
-        });
     }
 }
 
@@ -1990,42 +2079,44 @@ fn check_loaded_main_flow_proof_diagnostics(
         return Ok(MainFlowProofReceipt { active, directives, diagnostics: Vec::new() });
     }
     let prepared = prepare_loaded_proof_project(declarations, proofs, initialization_order, inputs)?;
-    let mut definitions = prepared.proofs.iter().flat_map(|(source, catalog)| {
-        catalog.definitions.iter().enumerate().map(move |(index, node)| (source, catalog.first_query + index, node))
-    });
-    let Some((proof_source, query, definition)) = definitions.next() else {
+    if prepared.proofs.iter().any(|(source, catalog)| source != &prepared.source && !catalog.definitions.is_empty()) {
+        return Err(ProjectCheck::Unsupported);
+    }
+    let Some((proof_source, catalog, first, rest)) = prepared.proofs.get_key_value(&prepared.source)
+        .and_then(|(source, catalog)| catalog.definitions.split_first().map(|(first, rest)| (source, catalog, first, rest)))
+    else {
         let startup_count = prepared.prepared.parts().0.modules.len();
         let (active, directives) = collect_ordered_checker_records(
             &prepared.prepared, ScalarCheckerScope::MainFlowOnly, startup_count,
         )?;
         return Ok(MainFlowProofReceipt { active, directives, diagnostics: Vec::new() });
     };
-    if definitions.next().is_some() || proof_source != &prepared.source {
-        return Err(ProjectCheck::Unsupported);
+    let first_name = module_proof_name(first).ok_or(ProjectCheck::InvalidProof)?;
+    let rest_names = rest.iter().map(|definition| module_proof_name(definition).ok_or(ProjectCheck::InvalidProof))
+        .collect::<Result<Vec<_>, _>>()?;
+    if !rest_names.is_empty() {
+        let mut names = HashSet::with_capacity(catalog.definitions.len());
+        if !std::iter::once(&first_name).chain(&rest_names).all(|name| names.insert(name.text())) {
+            return Err(ProjectCheck::AmbiguousRoot);
+        }
     }
-    let selected = prepared.resolve_selected_proof(definition, query)?;
-    let name = module_proof_name(definition).ok_or(ProjectCheck::InvalidProof)?;
-    let plan = prepared.plan_resolved_module_proof::<false, false, false>(proof_source, name.text(), selected)?;
-    let TypedProofGoal::Literal { relation, bound, .. } = &plan.typed.goal else {
-        return Err(ProjectCheck::Unsupported);
-    };
-    if !plan.steps.items.is_empty() || plan.typed.target.source != prepared.source {
-        return Err(ProjectCheck::Unsupported);
+    let first_plan = prepared.plan_resolved_module_proof::<false, false, false>(
+        proof_source, first_name.text(), prepared.resolve_selected_proof(first, catalog.first_query)?,
+    )?;
+    let others = rest.iter().zip(&rest_names).enumerate().map(|(index, (definition, name))| {
+        let selected = prepared.resolve_selected_proof(definition, catalog.first_query + 1 + index)?;
+        prepared.plan_resolved_module_proof::<false, false, false>(proof_source, name.text(), selected)
+    }).collect::<Result<Vec<_>, _>>()?;
+    let mut observer = MainFlowProofObserver::new(first_plan.target, MainFlowProofCase::prepare(&first_plan, &prepared.source)?);
+    for plan in &others {
+        observer.insert(plan.target, MainFlowProofCase::prepare(plan, &prepared.source)?);
     }
-    let guard = checked_integer_guard_slots::<false>(plan.typed.body, plan.filter.as_deref().unwrap_or_default())
-        .ok_or(ProjectCheck::Unsupported)?;
-    let goal = child(&child(definition, SyntaxKind::ProofEnsures)?, SyntaxKind::Expression)?;
-    let observer = MainFlowProofObserver {
-        target: plan.target, proof_source, proof: wosy_syntax::byte_span(definition),
-        goal: wosy_syntax::byte_span(&goal), guard, relation: *relation, bound,
-        seen: false, active: false, incomplete: false, diagnostics: Vec::new(),
-    };
     let (root, ordinals) = package_initialization_order(prepared.prepared.parts().0)?;
     let mut effects = OrderedFailures::default();
     let (initialization, observer) = check_package_initialization_observing_with_policy::<_, true>(
         &prepared.prepared, root, ordinals, observer, Some(&mut effects),
     )?;
-    if observer.incomplete || (initialization.reached.contains(&plan.target) && !observer.seen) {
+    if !observer.complete(&initialization.reached) {
         return Err(ProjectCheck::Unsupported);
     }
     Ok(MainFlowProofReceipt {
@@ -6306,17 +6397,17 @@ mod tests {
         for diagnostic in [first, second] {
             assert_eq!(diagnostic.proof.source, app);
             assert_eq!(diagnostic.goal.source, app);
-            assert_eq!(diagnostic.call.source, app);
+            assert_eq!(diagnostic.invocation.call.source, app);
             assert!(snippet(diagnostic.proof.range).starts_with("proof bound"));
             assert_eq!(snippet(diagnostic.goal.range), "out <= 7");
-            assert_eq!(snippet(diagnostic.call.range), "identity(8)");
-            assert_eq!(diagnostic.directive_position, 1);
-            assert_eq!(diagnostic.arguments, [(ScalarType::I8, BigInt::from(8))]);
-            assert_eq!(diagnostic.returned, BigInt::from(8));
+            assert_eq!(snippet(diagnostic.invocation.call.range), "identity(8)");
+            assert_eq!(diagnostic.invocation.directive_position, 1);
+            assert_eq!(diagnostic.invocation.arguments, [(ScalarType::I8, BigInt::from(8))]);
+            assert_eq!(diagnostic.invocation.returned, BigInt::from(8));
         }
-        assert!(receipt.directives[0].directive.start < first.call.range.start);
-        assert!(first.call.range.start < second.call.range.start);
-        assert!(second.call.range.start < receipt.directives[1].directive.start);
+        assert!(receipt.directives[0].directive.start < first.invocation.call.range.start);
+        assert!(first.invocation.call.range.start < second.invocation.call.range.start);
+        assert!(second.invocation.call.range.start < receipt.directives[1].directive.start);
         let ordinary = prepare_checker_project(
             vec![(declarations(&app, &authored), Vec::new())], vec![app.clone()], inputs(),
         ).unwrap();
@@ -6346,26 +6437,83 @@ mod tests {
 
     #[cfg(feature = "internal-checker")]
     #[test]
+    fn ordered_main_flow_auto_proofs_follow_call_then_declaration_order() {
+        let app = source("src/main.w", "ordered-automatic-proof-multiple");
+        let run = |text: &str| {
+            let (_, proof) = crate::parse_proof_source(app.clone(), text.to_owned(), &[])
+                .unwrap_or_else(|_| panic!("valid proof source"));
+            check_loaded_main_flow_proof_diagnostics(
+                Vec::new(), vec![(proof, Vec::new())], vec![app.clone()], inputs(),
+            )
+        };
+        let text = format!(r#"%%start
+            i8(i8) primary = fn(value) {{ value }};
+            i8(i8) secondary = fn(value) {{ value }};
+            i8(i8) unrelated = fn(value) {{ value }};
+            proof zeta for primary(entry) -> (out) ensures (out < 8) {{}}
+            proof beta for secondary(entry) -> (out) ensures (out < 4) {{}}
+            proof alpha for primary(entry) -> (out) ensures (out < 7) {{}}
+            proof ignored for primary(entry) -> (out) where (entry < 0) ensures (out == 0) {{}}
+            i8 noise = unrelated(9);
+            i8 before = secondary(4);
+            core.require(false, {OUTPUT});
+            i8 first = primary(8);
+            i8 second = primary(8);
+        %%end"#);
+        let receipt = run(&text).unwrap();
+        assert!(receipt.active && receipt.directives.len() == 1);
+        let [beta, first_zeta, first_alpha, second_zeta, second_alpha] = receipt.diagnostics.as_slice()
+            else { panic!("expected five failing proof declarations"); };
+        let snippet = |span: ByteSpan| &text[span.start as usize..span.end as usize];
+        for (diagnostic, name, call, prior) in [
+            (beta, "proof beta", "secondary(4)", 0),
+            (first_zeta, "proof zeta", "primary(8)", 1),
+            (first_alpha, "proof alpha", "primary(8)", 1),
+            (second_zeta, "proof zeta", "primary(8)", 1),
+            (second_alpha, "proof alpha", "primary(8)", 1),
+        ] {
+            assert!(snippet(diagnostic.proof.range).starts_with(name));
+            assert_eq!(snippet(diagnostic.invocation.call.range), call);
+            assert_eq!(diagnostic.invocation.directive_position, prior);
+        }
+        assert!(Rc::ptr_eq(&first_zeta.invocation, &first_alpha.invocation));
+        assert!(Rc::ptr_eq(&second_zeta.invocation, &second_alpha.invocation));
+        assert!(!Rc::ptr_eq(&first_zeta.invocation, &second_zeta.invocation));
+        assert!(first_zeta.invocation.call.range.start < second_zeta.invocation.call.range.start);
+        assert!(matches!(run(&text.replace("proof alpha", "proof zeta")), Err(ProjectCheck::AmbiguousRoot)));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
     fn ordered_main_flow_auto_proof_does_not_cover_an_unlocated_nested_call_with_a_direct_call() {
         let app = source("src/main.w", "ordered-automatic-proof-mixed-context");
         let span = ByteSpan::new(1, 2);
         let bound = BigInt::from(7);
         let value = BigInt::from(8);
-        let mut observer = MainFlowProofObserver {
-            target: (0, 0), proof_source: &app, proof: span, goal: span,
+        let prepared = prepare_checker_project(
+            vec![(declarations(&app, "%%start
+i8(i8) identity = fn(value) { value }; i8 out = identity(8);
+%%end"), Vec::new())],
+            vec![app.clone()], inputs(),
+        ).unwrap();
+        let region = prepared.parts().1.initialization_region(0).unwrap();
+        let ModuleInitializationDetail::Occurrences(topology) = &region.detail else { unreachable!(); };
+        let occurrence = *topology.call_targets.keys().next().unwrap();
+        let mut observer = MainFlowProofObserver::new((0, 0), MainFlowProofCase {
+            proof_source: &app, proof: span, goal: span,
             guard: CheckedIntegerGuardSlots { arity: 1, always_rejects: false, comparisons: Vec::new(), domain: None },
             relation: IntegerRelation::from_operator(&BinaryOperator::LessEqual).unwrap(), bound: &bound,
-            seen: false, active: false, incomplete: false, diagnostics: Vec::new(),
-        };
+        });
+        let effects = OrderedFailures::default();
         observer.observe_initializer(
-            (0, 0), Some(InitializerProofSite { source: &app, span, directive_position: 0 }),
+            (0, 0), Some(InitializerProofSite { source: &app, topology, occurrence, effects: &effects }),
             &[ScalarType::I8], &[&value], &value,
         );
-        assert!(observer.seen && !observer.incomplete && observer.diagnostics.len() == 1);
+        assert!(observer.first.1.seen && !observer.incomplete && observer.diagnostics.len() == 1);
         observer.observe_initializer((0, 1), None, &[ScalarType::I8], &[&value], &value);
         assert!(!observer.incomplete);
         observer.observe_initializer((0, 0), None, &[ScalarType::I8], &[&value], &value);
-        assert!(observer.seen && observer.incomplete && observer.diagnostics.len() == 1);
+        assert!(observer.first.1.seen && observer.incomplete && observer.diagnostics.len() == 1);
     }
 
     #[cfg(feature = "internal-checker")]
