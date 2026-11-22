@@ -9224,22 +9224,31 @@ fn known_store_precedes_load<'ctx>(
 
 #[test]
 fn emits_known_projected_leaf_from_the_original_owner_through_the_ordinary_driver() {
-    for (layout, parent_mode, child_mode, siblings) in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64]
+    for (layout, parent_mode, child_mode, left_holder_mode) in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64]
         .into_iter().flat_map(|layout| [
-            (layout, "", "", false),
-            (layout, "!", "", false),
-            (layout, "!", "!", false),
-            (layout, "!", "!", true),
+            (layout, "", "", None),
+            (layout, "!", "", None),
+            (layout, "!", "!", None),
+            (layout, "!", "!", Some("!")),
+            (layout, "!", "!", Some("")),
         ])
     {
-        let (left, left_declaration, stores) = if siblings {
-            ("*left_leaf", "*!u8 left_leaf = &!(*parent).left;", "*left_leaf = 7; *leaf = 9;")
-        } else if child_mode == "!" {
-            ("(*parent).left", "", "*leaf = 9;")
+        let left_declaration = left_holder_mode.map(|mode| {
+            format!("*{mode}u8 left_leaf = &{mode}(*parent).left;")
+        }).unwrap_or_default();
+        let left = if left_holder_mode.is_some() {
+            "*left_leaf"
         } else if parent_mode == "!" {
-            ("(*parent).left", "", "")
+            "(*parent).left"
         } else {
-            ("owner.left", "", "")
+            "owner.left"
+        };
+        let stores = if left_holder_mode == Some("!") {
+            "*left_leaf = 7; *leaf = 9;"
+        } else if child_mode == "!" {
+            "*leaf = 9;"
+        } else {
+            ""
         };
         let source = format!(r#"%%start
 struct copy Pair {{ u8 left; u8 right; }}
@@ -9284,7 +9293,7 @@ u8(Pair) inspect = fn(owner) {{
                 assert_eq!(read.get_opcode(), InstructionOpcode::Load);
                 (known_field_operand(read, 0).expect("actual field address"), read)
             });
-            let (direct_base, direct_offset) = if siblings {
+            let (direct_base, direct_offset) = if left_holder_mode.is_some() {
                 known_checked_field_path(&instructions, direct).expect("left checked sibling field")
             } else {
                 known_direct_field_path(direct).expect("left owner field")
@@ -9310,7 +9319,7 @@ u8(Pair) inspect = fn(owner) {{
                 }).collect::<Vec<_>>();
                 let expected = [
                     Some((leaf_offset, 9, returned_leaf_load)),
-                    siblings.then_some((direct_offset, 7, returned_left_load)),
+                    (left_holder_mode == Some("!")).then_some((direct_offset, 7, returned_left_load)),
                 ];
                 assert_eq!(writes.len(), expected.iter().flatten().count(), "{ir}");
                 let entry = routine.get_first_basic_block().expect("entry block");
