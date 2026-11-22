@@ -11,3 +11,9 @@ the inner scope ends. The observer checks full contents directly at the
 bases returned by the real allocator, and verifies that those same bases
 are freed once each in inner-then-outer order. The named observer does
 not receive or compare descriptor pointers at the ABI boundary.
+
+The separate controls executable prints a static literal through real
+host output, then prints an empty descriptor (no host write). Neither may
+allocate or release. An independent scoped runtime array then verifies
+one real allocation and release at the original base without relying on
+formatter behavior.

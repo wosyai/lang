@@ -16,6 +16,14 @@ exit = 0
 command = ["wosy", "build", "named-wasm"]
 exit = 0
 
+[[steps]]
+command = ["wosy", "build", "controls-native"]
+exit = 0
+
+[[steps]]
+command = ["wosy", "build", "controls-wasm"]
+exit = 0
+
 [[assert]]
 command = ["wosy", "run", "nested-native"]
 exit = 0
@@ -41,5 +49,19 @@ exact = true
 command = ["wosy", "run", "named-wasm"]
 exit = 0
 stdout = "expected/named.stdout"
+stderr = "expected/verified.stderr"
+exact = true
+
+[[assert]]
+command = ["wosy", "run", "controls-native"]
+exit = 0
+stdout = "expected/controls.stdout"
+stderr = "expected/verified.stderr"
+exact = true
+
+[[assert]]
+command = ["wosy", "run", "controls-wasm"]
+exit = 0
+stdout = "expected/controls.stdout"
 stderr = "expected/verified.stderr"
 exact = true

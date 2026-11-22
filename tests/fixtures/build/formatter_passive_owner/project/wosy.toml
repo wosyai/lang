@@ -85,3 +85,33 @@ run_runner = "wasm"
 
 [targets.named-wasm.profiles.dev]
 main_artifact = "main"
+
+[targets.controls-native]
+root = "src/controls.w"
+
+[targets.controls-native.artifacts.main]
+artifact = "Main"
+
+[targets.controls-native.artifacts.main.profiles.dev]
+backend = "llvm"
+output = "native"
+builder = "native"
+run_runner = "native"
+
+[targets.controls-native.profiles.dev]
+main_artifact = "main"
+
+[targets.controls-wasm]
+root = "src/controls.w"
+
+[targets.controls-wasm.artifacts.main]
+artifact = "Main"
+
+[targets.controls-wasm.artifacts.main.profiles.dev]
+backend = "llvm"
+output = "wasm-wasip1"
+builder = "wasm"
+run_runner = "wasm"
+
+[targets.controls-wasm.profiles.dev]
+main_artifact = "main"

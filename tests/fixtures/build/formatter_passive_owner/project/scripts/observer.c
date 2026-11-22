@@ -29,6 +29,7 @@ static u32 allocations, releases;
 static word bases[2];
 static unsigned live;
 static int wrote;
+static int wrote_static;
 
 static void check_bytes(int slot, word address, u64 length, const char *expected, u32 size) {
     require((live & (1u << slot)) && address == bases[slot] && length == size);
@@ -60,7 +61,7 @@ static void announce_complete(void) {
 
 void *__wrap___wosy_core_alloc(u64 size, u64 alignment) {
     require(size == 3 && alignment == 1);
-    require(((stage == 0 || stage == 10) && allocations == 0 && live == 0)
+    require(((stage == 0 || stage == 10 || stage == 22) && allocations == 0 && live == 0)
             || (stage == 11 && allocations == 1 && live == 1));
     word address = (word)__real___wosy_core_alloc(size, alignment);
     require(address && (allocations == 0 || address != bases[0]));
@@ -78,6 +79,9 @@ void __wrap___wosy_core_free(void *address) {
     } else if (stage == 13) {
         require(allocations == 2 && releases == 0 && live == 3);
         slot = 1;
+    } else if (stage == 23) {
+        require(allocations == 1 && releases == 0 && live == 1);
+        slot = 0;
     } else {
         require(stage == 15 && allocations == 2 && releases == 1 && live == 1);
         slot = 0;
@@ -89,19 +93,29 @@ void __wrap___wosy_core_free(void *address) {
 }
 
 int FD_WRITE(int fd, word iovec, int vectors, word count) {
-    require(stage == 0 && !wrote && allocations == 1 && releases == 0 && live == 1);
     require(fd == 1 && iovec && vectors == 1 && count && *(u32 *)count == 0);
     const struct iovec *vector = (const struct iovec *)iovec;
-    check_bytes(0, vector->data, vector->length, "203", 3);
-    forward(fd, vector, (u32 *)count);
-    wrote = 1;
+    if (stage == 20) {
+        static const char expected[] = "static";
+        require(!wrote_static && !allocations && !releases && !live);
+        require(vector->data && vector->length == sizeof(expected) - 1);
+        const byte *data = (const byte *)vector->data;
+        for (u32 i = 0; i != vector->length; ++i) require(data[i] == (byte)expected[i]);
+        forward(fd, vector, (u32 *)count);
+        wrote_static = 1;
+    } else {
+        require(stage == 0 && !wrote && allocations == 1 && releases == 0 && live == 1);
+        check_bytes(0, vector->data, vector->length, "203", 3);
+        forward(fd, vector, (u32 *)count);
+        wrote = 1;
+    }
     return 0;
 }
 
 void CHECKPOINT(int mark) {
     switch (mark) {
-    case 0: case 10:
-        require(stage == -1 && !live && !allocations && !releases && !wrote);
+    case 0: case 10: case 20:
+        require(stage == -1 && !live && !allocations && !releases && !wrote && !wrote_static);
         break;
     case 1: case 2: case 3:
         require(stage == mark - 1 && wrote && allocations == 1 && releases == 1 && !live);
@@ -128,6 +142,17 @@ void CHECKPOINT(int mark) {
     case 16: case 17:
         require(stage == mark - 1 && allocations == 2 && releases == 2 && !live && !wrote);
         if (mark == 17) announce_complete();
+        break;
+    case 21: case 22:
+        require(stage == mark - 1 && wrote_static && !allocations && !releases && !live);
+        break;
+    case 23:
+        require(stage == 22 && allocations == 1 && releases == 0 && live == 1);
+        check_bytes(0, bases[0], 1, "K", 1);
+        break;
+    case 24: case 25:
+        require(stage == mark - 1 && allocations == 1 && releases == 1 && !live);
+        if (mark == 25) announce_complete();
         break;
     default:
         require(0);
