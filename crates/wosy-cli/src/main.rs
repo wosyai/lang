@@ -290,7 +290,7 @@ fn compile_project(
         project.package.as_str(),
         HashSet::from([root_path.clone()]),
     )]);
-    let mut pending = VecDeque::from([(project.package.clone(), root_path)]);
+    let mut pending = VecDeque::from([(project.package.as_str(), root_path)]);
     let mut root_node = None;
     let mut nodes = Vec::new();
     let mut declarations_by_path = BTreeMap::new();
@@ -298,14 +298,14 @@ fn compile_project(
 
     while let Some((package, path)) = pending.pop_front() {
         let (package_root, project_identity) = if package == project.package {
-            (root.to_path_buf(), root_project.clone())
+            (root, root_project.clone())
         } else {
             let resolved = configuration
                 .resolved_packages
-                .get(&package)
+                .get(package)
                 .ok_or_else(|| format!("dependency package {package} is missing"))?;
             (
-                resolved.project_root.clone(),
+                resolved.project_root.as_path(),
                 resolved.identity.project.clone(),
             )
         };
@@ -315,7 +315,7 @@ fn compile_project(
         let revision = blake3::hash(text.as_bytes()).to_hex().to_string();
         let source = SourceIdentity::new(
             project_identity,
-            package.clone(),
+            package.to_owned(),
             path.as_path().to_string_lossy().replace('\\', "/"),
             revision.clone(),
         );
@@ -359,7 +359,7 @@ fn compile_project(
                     .entry(target_package)
                     .or_default()
                     .insert(target_path.clone());
-                pending.push_back((target_package.to_owned(), target_path));
+                pending.push_back((target_package, target_path));
             }
             namespace_edges.push(NamespaceEdgeInput {
                 origin: namespace.package.clone(),
@@ -416,7 +416,7 @@ fn compile_project(
     let mut derivation_diagnostics = Vec::new();
     for node in &graph.nodes {
         let declarations = declarations_by_path
-            .remove(&(node.source.package.clone(), node.source.path.clone()))
+            .remove(&(node.source.package.as_str(), node.source.path.clone()))
             .ok_or_else(|| {
                 format!(
                     "missing canonical CST for {}",
