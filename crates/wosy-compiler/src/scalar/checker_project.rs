@@ -2626,8 +2626,10 @@ struct MainFlowProofCase<'a> {
 #[cfg(feature = "internal-checker")]
 impl<'a> MainFlowProofCase<'a> {
     fn prepare(plan: &'a PlannedModuleProof<'a>, root: &SourceIdentity) -> Result<MainFlowProofPlan<'a>, ProjectCheck> {
-        let TypedProofGoal::Literal { relation, bound, .. } = &plan.typed.goal else {
-            return Err(ProjectCheck::Unsupported);
+        let (relation, bound) = match &plan.typed.goal {
+            TypedProofGoal::Literal { relation, bound, .. } => (relation, bound),
+            TypedProofGoal::Universal { relation, bound } if plan.steps.items.is_empty() => (relation, bound),
+            _ => return Err(ProjectCheck::Unsupported),
         };
         if &plan.typed.target.source != root {
             return Err(ProjectCheck::Unsupported);

@@ -279,5 +279,27 @@ def main():
         assert sorted(entry.name for entry in root.iterdir()) == ["lib.w", "main.w", "wosy.toml"]
 
 
+        bands = """%%start
+            u8(u8) route_band = fn(distance) { if (distance == 0) { 1 } else { 3 } };
+            proof bounded_band for route_band(entry) -> (out)
+                forall (u8 ceiling where ceiling >= 2 && ceiling != 2) ensures (out <= ceiling) {}
+            u8 arrived = route_band(0);
+            u8 approaching = route_band(8);
+        %%end"""
+        source.write_text(bands, encoding="utf-8")
+        bounded = subprocess.run(main_command, cwd=root, capture_output=True, timeout=15)
+        assert (bounded.returncode, bounded.stdout, bounded.stderr) == (0, expected_pass, b""), bounded
+
+        source.write_text(bands.replace("out <= ceiling", "out < ceiling"), encoding="utf-8")
+        strict = subprocess.run(main_command, cwd=root, capture_output=True, timeout=15)
+        assert (strict.returncode, strict.stdout, strict.stderr) == (1, expected_main, b""), strict
+
+        source.write_text(bands.replace("ceiling >= 2", "ceiling == 2"), encoding="utf-8")
+        empty = subprocess.run(main_command, cwd=root, capture_output=True, timeout=15)
+        assert (empty.returncode, empty.stdout, empty.stderr) == (
+            2, b"", b"ordered check: incomplete: checker did not complete analysis\n"
+        ), empty
+
+
 if __name__ == "__main__":
     main()
