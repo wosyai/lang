@@ -291,6 +291,7 @@ fn compile_project(
         HashSet::from([root_path.clone()]),
     )]);
     let mut pending = VecDeque::from([(project.package.clone(), root_path)]);
+    let mut root_node = None;
     let mut nodes = Vec::new();
     let mut declarations_by_path = BTreeMap::new();
     let mut texts = BTreeMap::new();
@@ -379,20 +380,22 @@ fn compile_project(
             source.package.clone(),
             path.clone(),
         );
-        nodes.push(SourceNodeInput {
+        let node = SourceNodeInput {
             source: graph_source.clone(),
             content_revision: ContentRevision(revision),
             namespace_edges,
-        });
+        };
+        if root_node.is_none() {
+            root_node = Some(node);
+        } else {
+            nodes.push(node);
+        }
         declarations_by_path.insert((package, path), declarations);
         texts.insert(graph_source, output.result.text);
     }
     drop((discovered, pending));
 
-    let root_node = nodes
-        .first()
-        .cloned()
-        .ok_or_else(|| "project root source is missing".to_owned())?;
+    let root_node = root_node.ok_or_else(|| "project root source is missing".to_owned())?;
     let graph = load_reachable_source_graph(
         &project.package,
         root_node,

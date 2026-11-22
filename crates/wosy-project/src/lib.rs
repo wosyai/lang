@@ -227,8 +227,13 @@ pub fn load_reachable_source_graph(
     available: Vec<SourceNodeInput>,
     resolved_packages: &BTreeMap<String, ResolvedPackage>,
 ) -> Result<SourceGraph, GraphLoadError> {
+    let root_key = source_key(&root.source);
+    let root_span = SourceSpan {
+        source: root.source.clone(),
+        range: ByteSpan::new(0, 0),
+    };
     let mut sources = BTreeMap::new();
-    sources.insert(source_key(&root.source), root.clone());
+    sources.insert(root_key.clone(), root);
     for source in available {
         sources.insert(source_key(&source.source), source);
     }
@@ -241,17 +246,14 @@ pub fn load_reachable_source_graph(
     let mut stack = Vec::new();
     visit_source(
         package,
-        &source_key(&root.source),
+        &root_key,
         &sources,
         resolved_packages,
         &mut graph,
         &mut node_by_path,
         &mut stack,
-        &SourceSpan {
-            source: root.source.clone(),
-            range: ByteSpan::new(0, 0),
-        },
-        root.source.path.clone(),
+        &root_span,
+        root_key.2.clone(),
     )?;
     Ok(graph)
 }
@@ -1397,6 +1399,32 @@ mod tests {
             .nodes
             .iter()
             .all(|node| node.dfs_state == DfsState::Complete));
+    }
+
+    #[test]
+    fn later_available_root_replaces_supplied_root() {
+        let root = source("src/main.w", vec![edge("src/main.w", "src/missing.w", "old")]);
+        let mut first = source(
+            "src/main.w",
+            vec![edge("src/main.w", "src/missing.w", "first")],
+        );
+        first.content_revision = ContentRevision("first".to_owned());
+        let mut last = source("src/main.w", vec![edge("src/main.w", "src/math.w", "last")]);
+        last.content_revision = ContentRevision("last".to_owned());
+        let graph = load_reachable_source_graph(
+            "app",
+            root,
+            vec![first, source("src/math.w", Vec::new()), last],
+            &BTreeMap::new(),
+        )
+        .expect("later root supplies reachable edges");
+
+        assert_eq!(
+            graph.nodes[0].content_revision,
+            ContentRevision("last".to_owned())
+        );
+        assert_eq!(graph.nodes[0].namespace_edges[0].binding, "last");
+        assert_eq!(graph.nodes[0].namespace_edges[0].target, SourceNodeId(1));
     }
 
     #[test]
