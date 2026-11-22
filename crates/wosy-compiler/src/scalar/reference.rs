@@ -280,7 +280,7 @@ pub(super) struct ReferenceFlowBuilder<'a> {
     checked_scalar_storage: BTreeSet<ReferenceBindingId>,
     checked_result_origins: BTreeSet<ReferenceOriginId>,
     proof_points: CallablePointFacts,
-    has_projected_mutable_child: bool,
+    has_projected_child: bool,
     deferred_reborrow_roots: Vec<(ReferenceBindingId, super::control::DeferredReborrowRoot, CfgPointId, ReferenceOriginId)>,
     deferred_local_reborrow: bool,
     pub(super) source: SourceIdentity,
@@ -366,7 +366,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
             checked_scalar_storage: BTreeSet::new(),
             checked_result_origins: BTreeSet::new(),
             proof_points: CallablePointFacts::default(),
-            has_projected_mutable_child: false,
+            has_projected_child: false,
             deferred_reborrow_roots: Vec::new(),
             deferred_local_reborrow: deferred_named_reborrow_allowed(function, call_sites)
                 && call_sites.call_occurrences.is_empty()
@@ -2154,8 +2154,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         BTreeSet::from([id]),
                     );
                     if let (Some(pointer), Some(origin)) = (named_parent_point, parent_id) {
-                        self.has_projected_mutable_child |= *mutability == ScalarReferenceMutability::Mutable
-                            && direct_checked_field_base(place).is_some();
+                        self.has_projected_child |= direct_checked_field_base(place).is_some();
                         self.proof_points.named_reborrow_parents.push(super::control::NamedReborrowParent {
                             borrow,
                             pointer,
@@ -3725,13 +3724,19 @@ impl<'a> ReferenceFlowBuilder<'a> {
                                     }
                                 }
                                 if capture.is_none()
-                                    && (self.proof_points.pending_named_reborrow.is_some() || self.has_projected_mutable_child)
-                                    && matches!(target.place, ScalarPlace::Dereference { ref pointer, .. }
-                                        if matches!(pointer.as_ref(), ScalarExpression::Name { .. }))
+                                    && (self.proof_points.pending_named_reborrow.is_some() || self.has_projected_child)
                                     && matches!(&self.cfg.points[pointer_point.0].kind,
                                         CfgPointKind::Read { binding } if matches!(self.binding_types.get(binding),
                                             Some(ScalarType::CheckedReference { mutability: ScalarReferenceMutability::Mutable, inner })
-                                                if aggregate::ordinary_value(inner) && **inner == output_types[position]))
+                                                if match &target.place {
+                                                    ScalarPlace::Dereference { pointer, .. } => matches!(pointer.as_ref(),
+                                                        ScalarExpression::Name { .. })
+                                                        && aggregate::ordinary_value(inner) && **inner == output_types[position],
+                                                    place => self.has_projected_child && aggregate::ordinary_value(&output_types[position])
+                                                        && matches!(direct_checked_field_base(place),
+                                                            Some((ScalarExpression::Name { .. }, ScalarFieldReference::Resolved(field)))
+                                                                if matches!(inner.as_ref(), ScalarType::Struct(id) if id == &field.structure)),
+                                                }))
                                 {
                                     self.proof_points.checked_named_scalar_stores
                                         .push(self.cursor.expect("typed scalar store"));
@@ -4227,11 +4232,26 @@ fn exact_projected_field_of_mutable_parent(loan: &ReferenceLoanId) -> Option<(&R
     (projected_parent.as_ref() == parent && projected_field == field).then_some((parent, field))
 }
 
+#[derive(Clone, Copy)]
+struct DisjointProjectedWrite<'a> {
+    admitted: &'a BTreeSet<ReferenceOriginId>,
+    parent: &'a ReferenceLoanId,
+    field: &'a ScalarStructFieldId,
+}
+
+impl DisjointProjectedWrite<'_> {
+    fn excludes(self, origin: ReferenceOriginId, loan: &ReferenceLoanId) -> bool {
+        self.admitted.contains(&origin)
+            && exact_projected_field_of_mutable_parent(loan).is_some_and(|(parent, field)|
+                parent == self.parent && field.structure == self.field.structure && field.index != self.field.index)
+    }
+}
+
 enum LoanAccess<'a> {
     Direct,
     DirectShared,
     Through(ReferenceOriginId),
-    WriteThrough(&'a InvalidationCandidate, Option<&'a BTreeSet<ReferenceOriginId>>),
+    WriteThrough(&'a InvalidationCandidate, Option<DisjointProjectedWrite<'a>>),
     ReadThrough(&'a ReferenceLoanId),
     Borrow(&'a ReferenceLoanId),
 }
@@ -4245,15 +4265,6 @@ fn conflicting_live_loan(
     access: LoanAccess<'_>,
 ) -> Vec<SourceSpan> {
     let place = available_place(place);
-    let projected_write = match access {
-        LoanAccess::WriteThrough(selected, Some(admitted)) if selected.loan.mode == ScalarReferenceMutability::Mutable =>
-            exact_projected_field_of_mutable_parent(&selected.loan)
-            .filter(|(parent, field)| place.binding == parent.origin_place.binding
-                && matches!(place.projections.as_slice(),
-                    [ReferencePlaceProjection::Field(ScalarFieldReference::Resolved(actual))] if actual == *field))
-            .map(|(parent, field)| (admitted, parent, field)),
-        _ => None,
-    };
     let mut conflicts = Vec::new();
     for (binding, origins) in &state.bindings {
         let mut reachable = false;
@@ -4275,12 +4286,9 @@ fn conflicting_live_loan(
                         && loan_has_ancestor(loan, selected)
                         && reference_places_overlap(&available_place(&loan.origin_place), &place)
                 }
-                LoanAccess::WriteThrough(selected, _) => {
-                    let disjoint_sibling = projected_write.is_some_and(|(admitted, parent, field)| {
-                        admitted.contains(origin) && exact_projected_field_of_mutable_parent(loan).is_some_and(|(peer_parent, peer_field)|
-                            peer_parent == parent && peer_field.structure == field.structure && peer_field.index != field.index)
-                    });
-                    !disjoint_sibling && loan_borrows_place(loan, &place, None)
+                LoanAccess::WriteThrough(selected, projected) => {
+                    !projected.is_some_and(|projected| projected.excludes(*origin, loan))
+                        && loan_borrows_place(loan, &place, None)
                         && !loan_has_ancestor(&selected.loan, loan)
                 }
                 LoanAccess::Borrow(new) => {
@@ -4381,6 +4389,7 @@ fn previous_candidate_origins(
     state: &ReferenceEdgeState,
     facts: &[ReferenceOrigin],
     candidates: &[InvalidationCandidate],
+    projected: Option<DisjointProjectedWrite<'_>>,
 ) -> BTreeSet<ReferenceOriginId> {
     state
         .bindings
@@ -4388,7 +4397,8 @@ fn previous_candidate_origins(
         .flat_map(|origins| origins.iter().copied())
         .filter(|origin| match &facts[origin.0] {
             ReferenceOrigin::Fresh { loan, .. } | ReferenceOrigin::BorrowedFrom { loan, .. } => {
-                !candidates
+                !projected.is_some_and(|projected| projected.excludes(*origin, loan))
+                    && !candidates
                     .iter()
                     .any(|candidate| candidate.origin == *origin)
                     && candidates.iter().any(|candidate| {
@@ -4907,16 +4917,22 @@ fn exact_projected_reborrow_parent_on_edge(
 }
 
 fn exact_named_scalar_store_pointer<'a>(
-    write: &ReferenceFlowPoint,
+    write: &'a ReferenceFlowPoint,
     points: &'a [ReferenceFlowPoint],
     typed_stores: &[CfgPointId],
     grouped_installs: &BTreeSet<CfgPointId>,
-) -> Option<(CfgPointId, &'a ReferenceBindingId)> {
-    let CfgPointKind::AssignThrough {
-        place: ScalarPlace::Dereference { pointer, .. }, pointer_point, rhs_point, ..
-    } = &write.kind else { return None };
-    if !matches!(pointer.as_ref(), ScalarExpression::Name { .. })
-        || typed_stores.binary_search(&write.id).is_err()
+) -> Option<(CfgPointId, &'a ReferenceBindingId, Option<&'a ScalarStructFieldId>)> {
+    let CfgPointKind::AssignThrough { place, pointer_point, rhs_point, .. } = &write.kind
+    else { return None };
+    let (pointer, field) = match place {
+        ScalarPlace::Dereference { pointer, .. } => (pointer.as_ref(), None),
+        place => match direct_checked_field_base(place)? {
+            (pointer, ScalarFieldReference::Resolved(field)) => (pointer, Some(field)),
+            _ => return None,
+        },
+    };
+    let ScalarExpression::Name { span, .. } = pointer else { return None };
+    if typed_stores.binary_search(&write.id).is_err()
         || grouped_installs.contains(&write.id)
         || !write.possible_origins.as_ref().is_some_and(BTreeSet::is_empty)
         || rhs_point >= pointer_point || pointer_point.0 + 1 != write.id.0
@@ -4925,8 +4941,8 @@ fn exact_named_scalar_store_pointer<'a>(
     }
     let read = points.get(pointer_point.0)?;
     let CfgPointKind::Read { binding } = &read.kind else { return None };
-    (read.successors.as_slice() == [write.id] && read.scope == write.scope)
-        .then_some((*pointer_point, binding))
+    (read.successors.as_slice() == [write.id] && read.scope == write.scope && &read.source_span.range == span)
+        .then_some((*pointer_point, binding, field))
 }
 
 fn transfer_reference_facts(
@@ -5009,9 +5025,9 @@ fn transfer_reference_facts(
         if child_holders.is_empty() {
             return None;
         }
-        let (_, binding) = exact_named_scalar_store_pointer(
+        let (_, binding, None) = exact_named_scalar_store_pointer(
             write, original_points, cfg.checked_named_scalar_stores, &grouped_installs,
-        )?;
+        )? else { return None };
         child_holders.get(binding).copied()
     };
     for (index, point) in original_points.iter().enumerate() {
@@ -5107,7 +5123,7 @@ fn transfer_reference_facts(
                                 CfgPointKind::AssignThrough { .. } if mode == ScalarReferenceMutability::Mutable => {
                                     let exact = exact_named_scalar_store_pointer(
                                         next, original_points, cfg.checked_named_scalar_stores, &grouped_installs,
-                                    ) == Some((point.id, binding));
+                                    ) == Some((point.id, binding, None));
                                     if exact {
                                         if let (Some(origin), Some((_, stores))) =
                                             (admitted_origin, &mut projected_store_facts)
@@ -5916,13 +5932,48 @@ fn transfer_reference_facts(
                                 }
                                 None => Vec::new(),
                             };
-                            previous_candidate_origins(&state, &cfg.facts, &candidates)
+                            previous_candidate_origins(&state, &cfg.facts, &candidates, None)
                         }
                         _ => unreachable!("captured operation is an assignment install"),
                     };
                     state.assignment_previous.insert(*write, origins);
                 }
             }
+            let projected_write = (|| {
+                let (admitted, stores) = projected_store_facts.as_ref()?;
+                let CfgPointKind::AssignThrough { candidates, .. } = &point.kind else { return None };
+                let [candidate] = candidates.as_slice() else { return None };
+                if candidate.loan.mode != ScalarReferenceMutability::Mutable {
+                    return None;
+                }
+                if stores.get(&id) == Some(&candidate.origin) && admitted.contains(&candidate.origin) {
+                    let (ReferenceOrigin::Fresh { loan, .. } | ReferenceOrigin::BorrowedFrom { loan, .. }) =
+                        cfg.facts.get(candidate.origin.0)? else { return None };
+                    let (parent, field) = exact_projected_field_of_mutable_parent(loan)?;
+                    let place = available_place(&candidate.place);
+                    return (place.binding == parent.origin_place.binding
+                        && matches!(place.projections.as_slice(),
+                            [ReferencePlaceProjection::Field(ScalarFieldReference::Resolved(actual))] if actual == field))
+                        .then_some(DisjointProjectedWrite { admitted, parent, field });
+                }
+                let (read, binding, Some(field)) = exact_named_scalar_store_pointer(
+                    initial_point, original_points, cfg.checked_named_scalar_stores, &grouped_installs,
+                )? else { return None };
+                let ReferenceOrigin::Fresh { loan: parent, .. } = cfg.facts.get(candidate.origin.0)?
+                else { return None };
+                let owner = &parent.origin_place;
+                (parent == &candidate.loan && parent.parent.is_none() && owner.projections.is_empty()
+                    && matches!(owner.place, ScalarPlace::Name { .. })
+                    && owner.binding != *binding && candidate.place.binding == owner.binding
+                    && matches!(candidate.place.projections.as_slice(),
+                        [ReferencePlaceProjection::Field(ScalarFieldReference::Resolved(actual))] if actual == field)
+                    && state.point_values.get(read).is_some_and(|origins|
+                        origins.len() == 1 && origins.contains(&candidate.origin))
+                    && exact_live_reborrow_holder(&state, binding, candidate.origin)
+                    && !state.released.contains(&owner.binding) && !state.invalidated.contains(&owner.binding)
+                    && !state.uninitialized.contains(&owner.binding) && !unavailable_place(&state, owner))
+                    .then_some(DisjointProjectedWrite { admitted, parent, field })
+            })();
             let previous = match &point.kind {
                 CfgPointKind::Assign { target, .. } => Some(if grouped_installs.contains(&id) {
                     state
@@ -5939,7 +5990,7 @@ fn transfer_reference_facts(
                             .remove(&id)
                             .expect("grouped assignment previous origins")
                     } else {
-                        previous_candidate_origins(&state, &cfg.facts, candidates)
+                        previous_candidate_origins(&state, &cfg.facts, candidates, projected_write)
                     })
                 }
                 _ => None,
@@ -6169,11 +6220,6 @@ fn transfer_reference_facts(
                             }
                         }
                     }
-                    let exact_projected_store = match (&projected_store_facts, candidates.as_slice()) {
-                        (Some((admitted, stores)), [candidate]) if stores.get(&id) == Some(&candidate.origin)
-                            && admitted.contains(&candidate.origin) => Some(admitted),
-                        _ => None,
-                    };
                     for candidate in candidates {
                         let target = available_place(&candidate.place);
                         let origins = conflicting_live_loan(
@@ -6182,7 +6228,7 @@ fn transfer_reference_facts(
                             &state,
                             id,
                             &target,
-                            LoanAccess::WriteThrough(candidate, exact_projected_store),
+                            LoanAccess::WriteThrough(candidate, projected_write),
                         );
                         if !origins.is_empty() {
                             errors.push(ReferenceAnalysisError::ConflictingPlace {

@@ -13192,3 +13192,106 @@ unit(Pair) inspect = fn(owner) {{
     }
     assert!(mismatches.is_empty(), "{mismatches:?}");
 }
+
+#[test]
+fn known_checked_parent_field_store_respects_live_projected_child_extent() {
+    let mut mismatches = Vec::new();
+    for (mode, body, through, field_index, conflict) in [
+        ("!", "(*parent).right = 7; u8 value = *child; value;", true, 1, None),
+        ("", "(*parent).right = 7; u8 value = *child; value;", true, 1, None),
+        ("!", "u8 value = *child; (*parent).left = 7; u8 after = owner.right; value; after;", true, 0, None),
+        ("!", "(*parent).left = 7; u8 value = *child; value;", true, 0, Some("(*parent).left =")),
+        ("", "(*parent).left = 7; u8 value = *child; value;", true, 0, Some("(*parent).left =")),
+        ("!", "owner.right = 7; u8 value = *child; value;", false, 1, Some("owner.right =")),
+    ] {
+        let text = format!(r#"%%start
+struct copy Pair {{ u8 left; u8 right; }}
+unit(Pair) inspect = fn(owner) {{
+    *!Pair parent = &!owner;
+    *{mode}u8 child = &{mode}(*parent).left;
+    {body}
+}};
+%%end"#);
+        let parent = text.find("&!owner").unwrap() as u32;
+        let holder = text.find("parent =").unwrap() as u32;
+        let borrowed = text.find(&format!("&{mode}(*parent).left")).unwrap() as u32;
+        let (single, project) = both_reference_functions(&text);
+        for (validator, items, diagnostics) in [
+            ("single", &single.program.items, &single.diagnostics),
+            ("project", &project.project.modules[0].items, &project.diagnostics),
+        ] {
+            let ScalarItem::Function(function) = &items[0] else { panic!("typed callable") };
+            let cfg = &function.reference_cfg;
+            let (loan_point, loan) = cfg.initial_points.iter().find_map(|point| match &point.kind {
+                CfgPointKind::Borrow { loan, .. } if point.source_span.range.start == borrowed
+                    && loan.mode == if mode.is_empty() { ScalarReferenceMutability::Shared } else { ScalarReferenceMutability::Mutable }
+                    && loan.parent.as_ref().is_some_and(|root| root.creation_span.start == parent
+                        && root.mode == ScalarReferenceMutability::Mutable && root.origin_place.binding == loan.origin_place.binding
+                        && root.origin_place.projections.is_empty())
+                    && matches!(loan.origin_place.projections.as_slice(),
+                        [ReferencePlaceProjection::Dereference(_), ReferencePlaceProjection::Field(ScalarFieldReference::Resolved(field))]
+                            if field.index == 0) => Some((point, loan)),
+                _ => None,
+            }).unwrap_or_else(|| panic!("{validator} actual projected child: {body}: {diagnostics:?}"));
+            assert!(cfg.initial_points.iter().any(|point| point.scope == loan_point.scope && match &point.kind {
+                CfgPointKind::AssignThrough { place: ScalarPlace::Field { base, field: ScalarFieldReference::Resolved(field), .. },
+                    pointer_point, .. } if through =>
+                    field.index == field_index && matches!(base.as_ref(), ScalarPlace::Dereference { .. })
+                        && matches!(&cfg.initial_points[pointer_point.0].kind, CfgPointKind::Read { binding }
+                            if binding.declaration_span.start == holder),
+                CfgPointKind::Assign { target, .. } if !through => {
+                    target.binding == loan.origin_place.binding && matches!(target.projections.as_slice(),
+                        [ReferencePlaceProjection::Field(ScalarFieldReference::Resolved(field))] if field.index == field_index)
+                }
+                _ => false,
+            }), "{validator} actual parent or owner field store: {body}: {diagnostics:?}");
+            if let Some(conflict) = conflict {
+                let start = text.rfind(conflict).unwrap() as u32;
+                let access = start..start + conflict.len() as u32;
+                if !diagnostics.iter().any(|diagnostic| diagnostic.code == "B0003"
+                    && diagnostic.message == "read or move of unavailable place"
+                    && diagnostic.labels.first().is_some_and(|label| access.contains(&label.span.range.start))
+                    && diagnostic.labels.iter().skip(1).any(|label| label.span.range.start == borrowed))
+                {
+                    mismatches.push((validator, mode, body, diagnostics.clone()));
+                }
+            } else if !diagnostics.is_empty() {
+                mismatches.push((validator, mode, body, diagnostics.clone()));
+            }
+        }
+    }
+    assert!(mismatches.is_empty(), "{mismatches:?}");
+}
+
+#[test]
+fn known_checked_parent_field_store_does_not_infer_projected_loans_from_unknown_authority() {
+    for text in [
+        r#"%%start
+struct copy Pair { u8 left; u8 right; }
+unit(*!Pair) inspect = fn(parent) {
+    *!u8 child = &!(*parent).left;
+    (*parent).right = 7;
+    u8 value = *child;
+    value;
+};
+%%end"#,
+        r#"%%start
+struct copy Pair { u8 left; u8 right; }
+*!Pair(*!Pair) identity = fn(value) { value };
+unit(Pair) inspect = fn(owner) {
+    *!Pair parent = &!owner;
+    *!u8 child = &!(*identity(parent)).left;
+    u8 value = *child;
+    value;
+};
+%%end"#,
+    ] {
+        let borrowed = text.find("&!(*").unwrap() as u32;
+        let (single, project) = both_reference_functions(text);
+        for diagnostics in [&single.diagnostics, &project.diagnostics] {
+            assert!(diagnostics.iter().any(|diagnostic| diagnostic.code == "B0003"
+                && diagnostic.labels.first().is_some_and(|label| label.span.range.start == borrowed)),
+                "{diagnostics:?}");
+        }
+    }
+}
