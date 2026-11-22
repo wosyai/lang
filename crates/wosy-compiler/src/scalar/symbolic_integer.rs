@@ -10,6 +10,10 @@ struct Interval {
     last: BigInt,
 }
 
+fn overlapping_or_adjacent(first: &BigInt, last: &BigInt) -> bool {
+    first <= last || *first == last + 1
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub(super) struct IntegerSet(Vec<Interval>);
 
@@ -148,6 +152,74 @@ impl IntegerSet {
         Some(domain.keep_relation(left.0, left.1).join(domain.keep_relation(right.0, right.1)))
     }
 
+    #[cfg(feature = "internal-checker")]
+    pub(super) fn comparison_alternatives<'a>(
+        ty: &ScalarType, clauses: impl IntoIterator<Item = &'a [(IntegerRelation, BigInt)]>,
+    ) -> Option<Self> {
+        let (minimum, maximum) = integer_bounds(ty)?;
+        let mut intervals = Vec::new();
+        for clause in clauses {
+            Self::append_comparison_conjunction(&mut intervals, &minimum, &maximum, clause);
+        }
+        intervals.sort_unstable_by(|left, right| left.first.cmp(&right.first));
+        intervals.dedup_by(|following, prior| {
+            if following.last <= prior.last {
+                return true;
+            }
+            if overlapping_or_adjacent(&following.first, &prior.last) {
+                std::mem::swap(&mut prior.last, &mut following.last);
+                true
+            } else {
+                false
+            }
+        });
+        Some(Self(intervals))
+    }
+
+    #[cfg(feature = "internal-checker")]
+    fn append_comparison_conjunction(
+        intervals: &mut Vec<Interval>, minimum: &BigInt, maximum: &BigInt,
+        atoms: &[(IntegerRelation, BigInt)],
+    ) {
+        let mut lower = (minimum, true);
+        let mut upper = (maximum, true);
+        let mut has_holes = false;
+        for (relation, bound) in atoms {
+            if !relation.less && !relation.equal && !relation.greater {
+                return;
+            }
+            if !relation.less && (bound > lower.0 || (bound == lower.0 && !relation.equal)) {
+                lower = (bound, relation.equal);
+            }
+            if !relation.greater && (bound < upper.0 || (bound == upper.0 && !relation.equal)) {
+                upper = (bound, relation.equal);
+            }
+            has_holes |= relation.less && relation.greater && !relation.equal;
+        }
+        let mut start = if lower.1 { lower.0.clone() } else { lower.0 + 1 };
+        let end = if upper.1 { upper.0.clone() } else { upper.0 - 1 };
+        if start > end {
+            return;
+        }
+        if has_holes {
+            for (relation, hole) in atoms {
+                if !relation.less || !relation.greater || relation.equal || hole < &start {
+                    continue;
+                }
+                if hole > &end {
+                    break;
+                }
+                if hole > &start {
+                    intervals.push(Interval { first: start, last: hole - 1 });
+                }
+                start = hole + 1;
+            }
+        }
+        if start <= end {
+            intervals.push(Interval { first: start, last: end });
+        }
+    }
+
     pub(super) fn keep_relation(&self, relation: IntegerRelation, bound: &BigInt) -> Self {
         self.partition::<false>(relation, bound).0
     }
@@ -223,7 +295,7 @@ impl IntegerSet {
             if &interval.last <= last_bound {
                 continue;
             }
-            if &interval.first <= last_bound || interval.first == last_bound + 1 {
+            if overlapping_or_adjacent(&interval.first, last_bound) {
                 last_bound = &interval.last;
             } else {
                 union.0.push(Interval { first: first_bound.clone(), last: last_bound.clone() });
@@ -288,6 +360,30 @@ impl IntegerSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn comparison_alternatives_materializes_exact_normalized_clause_domains() {
+        let atom = |operator, value| (IntegerRelation::from_operator(&operator).unwrap(), BigInt::from(value));
+        let clauses = vec![
+            vec![atom(BinaryOperator::GreaterEqual, -8), atom(BinaryOperator::NotEqual, -4), atom(BinaryOperator::Less, 0)],
+            vec![atom(BinaryOperator::Greater, 1), atom(BinaryOperator::LessEqual, 4)],
+            vec![atom(BinaryOperator::GreaterEqual, 4), atom(BinaryOperator::LessEqual, 8)],
+            vec![atom(BinaryOperator::Greater, 127)],
+            vec![atom(BinaryOperator::Less, -128)],
+            vec![atom(BinaryOperator::Equal, 1), atom(BinaryOperator::Greater, 1)],
+        ];
+        let expected = clauses.iter().fold(IntegerSet::default(), |prior, atoms| {
+            prior.join(atoms.iter().fold(IntegerSet::from_type(&ScalarType::I8).unwrap(), |domain, (relation, bound)| {
+                domain.keep_relation(*relation, bound)
+            }))
+        });
+        let exact = IntegerSet::comparison_alternatives(&ScalarType::I8, clauses.iter().map(Vec::as_slice)).unwrap();
+        assert_eq!(exact, expected);
+        assert_eq!(exact.0.len(), 3);
+        assert!(!exact.contains(&BigInt::from(-4)));
+        assert!(!exact.contains(&BigInt::from(1)));
+    }
 
     #[test]
     fn union_materializes_only_normalized_disjoint_ranges() {

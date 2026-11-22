@@ -1064,6 +1064,42 @@ fn named_proof_show_old_checks_immutable_entry_and_independent_output_bound() {
 }
 
 #[test]
+fn named_proof_show_mixed_alternatives_preserve_clause_precedence_and_holes() {
+    let identity = source();
+    let check = |guard: &str, ensures: &str, claim: &str| {
+        check_scalar_module_proof(
+            identity.clone(), "demonstrate",
+            vec![ScalarProofModuleInput {
+                source: identity.clone(),
+                text: format!(r#"%%start
+                    i16(i16) echo = fn(value) {{ value }};
+                    proof demonstrate for echo(input) -> (out) where ({guard}) ensures ({ensures}) {{
+                        core.show({claim});
+                    }}
+                %%end"#),
+                namespaces: Vec::new(),
+            }],
+            vec![identity.clone()], ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
+        )
+    };
+    let split = "input >= 1 && input <= 7 && input != 4";
+    let unparenthesized = "out >= 1 && out <= 3 || out >= 5 && out <= 7";
+    let parenthesized = "(out >= 1 && out <= 3) || (out >= 5 && out <= 7)";
+    for predicate in [unparenthesized, parenthesized] {
+        assert_eq!(check(split, "out <= 7", predicate), ScalarModuleProofOutcome::Proved);
+        assert_eq!(check("input >= 1 && input <= 7", "out <= 7", predicate), ScalarModuleProofOutcome::Refuted);
+        assert_eq!(check(split, "out < 7", predicate), ScalarModuleProofOutcome::Refuted);
+        assert_eq!(check("false", "out <= 7", predicate), ScalarModuleProofOutcome::NoApplicableInputs);
+    }
+    let with_hole = "(out >= 1 && out <= 7 && out != 4) || (out >= 4 && out < 4) || out == -8";
+    assert_eq!(check(split, "out <= 7", with_hole), ScalarModuleProofOutcome::Proved);
+    assert_eq!(check("input == 4", "out <= 7", with_hole), ScalarModuleProofOutcome::Refuted);
+    assert_eq!(check("input == -8", "out <= 7", with_hole), ScalarModuleProofOutcome::Proved);
+    assert_eq!(check(split, "out <= 7", "out >= 1 && (out <= 3 || out >= 5)"), ScalarModuleProofOutcome::Unsupported);
+    assert!(matches!(check(split, "out <= 7", "(out >= 1 && out <= 32768) || out == -8"), ScalarModuleProofOutcome::Invalid(_)));
+}
+
+#[test]
 fn sequential_named_proof_shows_verify_each_claim_without_replacing_ensures() {
     let identity = source();
     let check = |target: &str, guard: &str, goal: &str, steps: &str, startup: &str| {

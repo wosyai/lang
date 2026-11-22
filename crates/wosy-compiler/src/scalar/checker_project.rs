@@ -3624,6 +3624,14 @@ thread_local! {
     static OUTPUT_UNION_NORMALIZATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+fn typed_output_atom(
+    expression: &ScalarExpression, output: &str, inputs: &[String], ty: &ScalarType,
+) -> Result<(IntegerRelation, BigInt), ProjectCheck> {
+    let comparison = IntegerComparison::from_expression(expression).ok_or(ProjectCheck::Unsupported)?;
+    let (_, relation, bound) = checked_literal_output_goal(comparison, output, inputs, ty)?;
+    Ok((relation, bound))
+}
+
 fn typed_output_conjunction(
     expression: &ScalarExpression, output: &str, inputs: &[String], ty: &ScalarType,
 ) -> Result<Vec<(IntegerRelation, BigInt)>, ProjectCheck> {
@@ -3635,23 +3643,66 @@ fn typed_output_conjunction(
             pending.push(left);
             continue;
         }
-        let comparison = IntegerComparison::from_expression(expression).ok_or(ProjectCheck::Unsupported)?;
-        let (_, relation, bound) = checked_literal_output_goal(comparison, output, inputs, ty)?;
-        atoms.push((relation, bound));
+        atoms.push(typed_output_atom(expression, output, inputs, ty)?);
     }
     Ok(atoms)
 }
 
 #[cfg(feature = "internal-checker")]
-fn normalize_show_conjunction(atoms: &mut Vec<(IntegerRelation, BigInt)>) {
-    atoms.sort_unstable_by(|(_, left), (_, right)| left.cmp(right));
-    atoms.dedup_by(|(following, right), (prior, left)| {
-        if left != right {
-            return false;
+fn normalize_show_conjunction(atoms: &mut Vec<(IntegerRelation, BigInt)>, start: usize) {
+    atoms[start..].sort_unstable_by(|(_, left), (_, right)| left.cmp(right));
+    let mut kept = start;
+    for index in start..atoms.len() {
+        if kept > start && atoms[kept - 1].1 == atoms[index].1 {
+            atoms[kept - 1].0 = atoms[kept - 1].0.intersection(atoms[index].0);
+        } else {
+            if kept != index {
+                atoms.swap(kept, index);
+            }
+            kept += 1;
         }
-        *prior = prior.intersection(*following);
-        true
-    });
+    }
+    atoms.truncate(kept);
+}
+
+#[cfg(feature = "internal-checker")]
+fn typed_show_alternatives(
+    expression: &ScalarExpression, output: &str, inputs: &[String], ty: &ScalarType,
+) -> Result<IntegerShowOutput, ProjectCheck> {
+    enum Work<'a> {
+        Alternative(&'a ScalarExpression),
+        Conjunct(&'a ScalarExpression),
+        EndClause(usize),
+    }
+    let mut pending = vec![Work::Alternative(expression)];
+    let mut atoms = Vec::new();
+    let mut clause_ends = Vec::new();
+    while let Some(item) = pending.pop() {
+        match item {
+            Work::Alternative(ScalarExpression::Binary { operator: BinaryOperator::Or, left, right, .. }) => {
+                pending.push(Work::Alternative(right));
+                pending.push(Work::Alternative(left));
+            }
+            Work::Alternative(term @ ScalarExpression::Binary { operator: BinaryOperator::And, .. }) => {
+                pending.push(Work::EndClause(atoms.len()));
+                pending.push(Work::Conjunct(term));
+            }
+            Work::Alternative(atom) => {
+                atoms.push(typed_output_atom(atom, output, inputs, ty)?);
+                clause_ends.push(atoms.len());
+            }
+            Work::Conjunct(ScalarExpression::Binary { operator: BinaryOperator::And, left, right, .. }) => {
+                pending.push(Work::Conjunct(right));
+                pending.push(Work::Conjunct(left));
+            }
+            Work::Conjunct(atom) => atoms.push(typed_output_atom(atom, output, inputs, ty)?),
+            Work::EndClause(start) => {
+                normalize_show_conjunction(&mut atoms, start);
+                clause_ends.push(atoms.len());
+            }
+        }
+    }
+    Ok(IntegerShowOutput::Alternatives { atoms, clause_ends })
 }
 
 fn typed_output_disjunction(
@@ -3660,12 +3711,7 @@ fn typed_output_disjunction(
     if is_null_literal_name(output) {
         return Err(ProjectCheck::InvalidProof);
     }
-    let atom = |expression: &ScalarExpression| {
-        let comparison = IntegerComparison::from_expression(expression).ok_or(ProjectCheck::Unsupported)?;
-        let (_, relation, bound) = checked_literal_output_goal(comparison, output, inputs, ty)?;
-        Ok::<_, ProjectCheck>((relation, bound))
-    };
-    Ok([atom(left)?, atom(right)?])
+    Ok([typed_output_atom(left, output, inputs, ty)?, typed_output_atom(right, output, inputs, ty)?])
 }
 
 fn normalize_output_disjunction(
@@ -4186,16 +4232,24 @@ fn proof_show_plan<'a, const VERIFY_ENTRY_WRITES: bool, const ALLOW_NAMED_STEPS:
                     if inputs.iter().any(|name| is_null_literal_name(name)) {
                         return Err(ProjectCheck::InvalidProof);
                     }
-                    return Ok(IntegerShowProof::Output(IntegerShowOutput::Disjunction(
-                        typed_output_disjunction(left, right, output, inputs, ty)?,
-                    )));
+                    let composite = |term: &ScalarExpression| matches!(term,
+                        ScalarExpression::Binary { operator: BinaryOperator::And | BinaryOperator::Or, .. });
+                    let show = if composite(left) || composite(right) {
+                        if is_null_literal_name(output) {
+                            return Err(ProjectCheck::InvalidProof);
+                        }
+                        typed_show_alternatives(claim, output, inputs, ty)?
+                    } else {
+                        IntegerShowOutput::Disjunction(typed_output_disjunction(left, right, output, inputs, ty)?)
+                    };
+                    return Ok(IntegerShowProof::Output(show));
                 }
                 if matches!(claim, ScalarExpression::Binary { operator: BinaryOperator::And, .. }) {
                     if is_null_literal_name(output) || inputs.iter().any(|name| is_null_literal_name(name)) {
                         return Err(ProjectCheck::InvalidProof);
                     }
                     let mut atoms = typed_output_conjunction(claim, output, inputs, ty)?;
-                    normalize_show_conjunction(&mut atoms);
+                    normalize_show_conjunction(&mut atoms, 0);
                     return Ok(IntegerShowProof::Output(IntegerShowOutput::Conjunction(atoms)));
                 }
                 if matches!(claim, ScalarExpression::Binary { operator, .. } if *operator != BinaryOperator::Equal) {
@@ -5462,6 +5516,27 @@ mod tests {
 
     #[cfg(feature = "internal-checker")]
     #[test]
+    fn proof_show_alternatives_keep_flat_clause_offsets_after_normalization() {
+        let file = source("src/main.w", "flat-show-alternatives");
+        let text = r#"%%start
+            i16(i16) echo = fn(value) { value };
+            proof composed for echo(input) -> (out) ensures (out <= 8) {
+                core.show((out <= 7 && out <= 7 && out >= 5) || out == -8 || (out < 3 && out >= 1));
+            }
+        %%end"#;
+        let project = PreparedProofModule::prepare(file.clone(), text.into(), inputs()).unwrap();
+        let plan = project.plan_module_proof(&file, "composed").unwrap();
+        let recipe = proof_show_plan::<false, true>(
+            &plan.steps, &plan.typed.input_names, &plan.typed.output, plan.typed.result_type, plan.typed.body, None,
+        ).unwrap_or_else(|outcome| panic!("expected exact show recipe: {outcome:?}"));
+        let IntegerShowProof::Output(IntegerShowOutput::Alternatives { atoms, clause_ends }) = recipe
+            else { panic!("expected flat alternatives"); };
+        assert_eq!(clause_ends, [2, 3, 5]);
+        assert_eq!(atoms.into_iter().map(|(_, bound)| bound).collect::<Vec<_>>(), [5, 7, -8, 1, 3].map(BigInt::from));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
     fn proof_show_conjunction_normalizes_same_bound_once_in_owned_plan() {
         let relation = |operator| IntegerRelation::from_operator(&operator).unwrap();
         let lower = BigInt::from(-8);
@@ -5472,7 +5547,7 @@ mod tests {
             (relation(BinaryOperator::LessEqual), upper.clone()),
             (relation(BinaryOperator::Less), lower.clone()),
         ];
-        normalize_show_conjunction(&mut atoms);
+        normalize_show_conjunction(&mut atoms, 0);
         assert_eq!(atoms.len(), 2);
         assert_eq!(&atoms[0].1, &lower);
         assert!(!atoms[0].0.accepts(std::cmp::Ordering::Less));

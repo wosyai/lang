@@ -457,6 +457,34 @@ pub(super) enum IntegerShowOutput {
     Relation { relation: IntegerRelation, bound: BigInt },
     Disjunction([(IntegerRelation, BigInt); 2]),
     Conjunction(Vec<(IntegerRelation, BigInt)>),
+    Alternatives {
+        atoms: Vec<(IntegerRelation, BigInt)>,
+        clause_ends: Vec<usize>,
+    },
+}
+
+#[cfg(feature = "internal-checker")]
+impl IntegerShowOutput {
+    fn clauses<'a>(
+        atoms: &'a [(IntegerRelation, BigInt)], clause_ends: &'a [usize],
+    ) -> impl Iterator<Item = &'a [(IntegerRelation, BigInt)]> {
+        let mut start = 0;
+        clause_ends.iter().map(move |&end| {
+            let clause = &atoms[start..end];
+            start = end;
+            clause
+        })
+    }
+
+    fn normalize_union(&self, ty: &ScalarType) -> Option<IntegerSet> {
+        match self {
+            Self::Disjunction([(left_relation, left), (right_relation, right)]) =>
+                IntegerSet::comparison_union(ty, (*left_relation, left), (*right_relation, right)),
+            Self::Alternatives { atoms, clause_ends } =>
+                IntegerSet::comparison_alternatives(ty, Self::clauses(atoms, clause_ends)),
+            _ => None,
+        }
+    }
 }
 
 fn binding_satisfies(
@@ -564,6 +592,10 @@ impl IntegerReturningPath<'_> {
                 }),
                 Some(IntegerShowOutput::Disjunction([(left_relation, left), (right_relation, right)])) =>
                     left_relation.accepts(value.cmp(left)) || right_relation.accepts(value.cmp(right)),
+                Some(IntegerShowOutput::Alternatives { atoms, clause_ends }) =>
+                    IntegerShowOutput::clauses(atoms, clause_ends).any(|clause| {
+                        clause.iter().all(|(relation, bound)| relation.accepts(value.cmp(bound)))
+                    }),
             }),
             IntegerReturn::Alias(binding) => {
                 let axis = self.axes.iter().position(|known| *known == binding)?;
@@ -578,10 +610,10 @@ impl IntegerReturningPath<'_> {
                         Some(IntegerShowOutput::Conjunction(atoms)) => atoms.iter().enumerate().all(|(index, (relation, bound))| {
                             skip_conjunct == Some(index) || values.every_at_extremes(*relation, bound)
                         }),
-                        Some(IntegerShowOutput::Disjunction([(left_relation, left), (right_relation, right)])) => {
+                        Some(show @ (IntegerShowOutput::Disjunction(_) | IntegerShowOutput::Alternatives { .. })) => {
                             let domain = match allowed {
                                 Some(domain) => domain,
-                                None => allowed.insert(IntegerSet::comparison_union(self.ty, (*left_relation, left), (*right_relation, right))?),
+                                None => allowed.insert(show.normalize_union(self.ty)?),
                             };
                             values.is_subset_of(domain)
                         }
