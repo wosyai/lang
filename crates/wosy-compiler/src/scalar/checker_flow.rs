@@ -1339,6 +1339,80 @@ pub(super) fn observe_authored_show_returns<'a>(
     observe_integer_returns_in_scope(calls, entry_filter, None, false, NamedAuthoredReturn { body, value })
 }
 
+#[cfg(feature = "internal-checker")]
+pub(super) fn evaluate_mixed_entry_output(
+    paths: &[IntegerReturningPath<'_>], formals: &[ReferenceBindingId],
+    output: &IntegerShowConstraints<'_>, entry: &[Option<IntegerRelation>; 2],
+) -> Option<bool> {
+    let mut proved = true;
+    // At most two checked formal slots. Densify and precompute per-relation
+    // facts once; every row only visits present authored old constraints.
+    let inactive = IntegerRelation::from_operator(&BinaryOperator::Equal)?;
+    let mut typed_entry = [(0, inactive, false, CartesianRelation::Never); 2];
+    let mut active = 0;
+    for (axis, condition) in entry.iter().enumerate() {
+        let Some(condition) = condition else { continue; };
+        typed_entry[active] = (axis, condition.reversed(), condition.accepts(std::cmp::Ordering::Equal),
+            CartesianRelation::prepare(*condition));
+        active += 1;
+    }
+    let typed_entry = &typed_entry[..active];
+    let uses_entry = !typed_entry.is_empty();
+    for path in paths {
+        let returned = match path.value {
+            IntegerReturn::Alias(alias) => {
+                if uses_entry && !formals.contains(alias) {
+                    return None; // Unadmitted alias overrides an earlier refutation.
+                }
+                if !proved { continue; }
+                Some(path.axes.iter().position(|known| *known == alias)?)
+            }
+            IntegerReturn::Const(value) => {
+                if !proved { continue; }
+                if !output.holds_value(value) {
+                    proved = false;
+                    continue;
+                }
+                if !uses_entry {
+                    continue;
+                }
+                None
+            }
+        };
+        // IntegerRoots installs the immutable formals in the canonical
+        // boundary order; local introductions only append axes.
+        if uses_entry && !path.axes.get(..formals.len())?.iter().copied().eq(formals.iter()) {
+            return None;
+        }
+        for row in &path.state.0 {
+            if returned.is_some_and(|axis| !output.holds_set(&row[axis])) {
+                proved = false;
+                break;
+            }
+            if !uses_entry {
+                continue;
+            }
+            for &(axis, reversed, reflexive, comparison) in typed_entry {
+                let old = row.get(axis)?;
+                let holds = match (path.value, returned) {
+                    (IntegerReturn::Const(value), _) => old.every_at_extremes(reversed, value),
+                    (_, Some(returned)) if returned == axis => reflexive,
+                    (_, Some(returned)) => comparison.holds(&row[returned], old)?,
+                    _ => return None,
+                };
+                if !holds {
+                    proved = false;
+                    break;
+                }
+            }
+            if !proved {
+                break;
+            }
+        }
+    }
+    Some(proved)
+}
+
 pub(super) fn evaluate_borrowed_return_proof(
     paths: &[IntegerReturningPath<'_>], relation: IntegerRelation, bound: &BigInt, proof: Option<&IntegerShowProof<'_>>,
 ) -> Option<bool> {
@@ -1362,72 +1436,7 @@ pub(super) fn evaluate_borrowed_return_proof(
     }
     #[cfg(feature = "internal-checker")]
     if let Some(IntegerShowProof::MixedSequence { formals, output, entry }) = proof {
-        let mut proved = true;
-        // At most two checked formal slots. Densify and precompute per-relation
-        // facts once; every row only visits present authored old constraints.
-        let mut typed_entry = [(0, relation, false, CartesianRelation::Never); 2];
-        let mut active = 0;
-        for (axis, condition) in entry.iter().enumerate() {
-            let Some(condition) = condition else { continue; };
-            typed_entry[active] = (axis, condition.reversed(), condition.accepts(std::cmp::Ordering::Equal),
-                CartesianRelation::prepare(*condition));
-            active += 1;
-        }
-        let typed_entry = &typed_entry[..active];
-        let uses_entry = !typed_entry.is_empty();
-        for path in paths {
-            let returned = match path.value {
-                IntegerReturn::Alias(alias) => {
-                    if uses_entry && !formals.contains(alias) {
-                        return None; // Unadmitted alias overrides an earlier refutation.
-                    }
-                    if !proved { continue; }
-                    Some(path.axes.iter().position(|known| *known == alias)?)
-                }
-                IntegerReturn::Const(value) => {
-                    if !proved { continue; }
-                    if !output.holds_value(value) {
-                        proved = false;
-                        continue;
-                    }
-                    if !uses_entry {
-                        continue;
-                    }
-                    None
-                }
-            };
-            // IntegerRoots installs the immutable formals in the canonical
-            // boundary order; local introductions only append axes.
-            if uses_entry && !path.axes.get(..formals.len())?.iter().copied().eq(formals.iter()) {
-                return None;
-            }
-            for row in &path.state.0 {
-                if returned.is_some_and(|axis| !output.holds_set(&row[axis])) {
-                    proved = false;
-                    break;
-                }
-                if !uses_entry {
-                    continue;
-                }
-                for &(axis, reversed, reflexive, comparison) in typed_entry {
-                    let old = row.get(axis)?;
-                    let holds = match (path.value, returned) {
-                        (IntegerReturn::Const(value), _) => old.every_at_extremes(reversed, value),
-                        (_, Some(returned)) if returned == axis => reflexive,
-                        (_, Some(returned)) => comparison.holds(&row[returned], old)?,
-                        _ => return None,
-                    };
-                    if !holds {
-                        proved = false;
-                        break;
-                    }
-                }
-                if !proved {
-                    break;
-                }
-            }
-        }
-        return Some(proved);
+        return evaluate_mixed_entry_output(paths, formals, output, entry);
     }
     #[cfg(feature = "internal-checker")]
     if let Some(IntegerShowProof::EntryComparison(entry)) = proof {

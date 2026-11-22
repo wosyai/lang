@@ -1165,6 +1165,48 @@ fn named_proof_ensures_compares_exact_immutable_formals_in_same_row() {
 }
 
 #[test]
+fn named_proof_ensures_mixes_exact_literal_and_immutable_entry_conjuncts() {
+    let identity = source();
+    let check = |target: &str, guard: &str, ensures: &str, startup: &str| {
+        check_scalar_module_proof(
+            identity.clone(), "verify",
+            vec![ScalarProofModuleInput {
+                source: identity.clone(),
+                text: format!(r#"%%start
+                    i16(i16, i16) echo = fn(value, limit) {{ if (limit == 0) {{}}; value }};
+                    i16(i16, i16) const_first = fn(value, limit) {{
+                        if (value == 0) {{}}; if (limit == 0) {{ 7 }} else {{ i16 local = 3; local }}
+                    }};
+                    i16(i16, i16) local_first = fn(value, limit) {{
+                        if (value == 0) {{}}; if (limit == 0) {{ i16 local = 3; local }} else {{ 7 }}
+                    }};
+                    {startup}
+                    proof verify for {target}(value, limit) -> (out) where ({guard}) ensures ({ensures}) {{}}
+                %%end"#),
+                namespaces: Vec::new(),
+            }],
+            vec![identity.clone()], ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
+        )
+    };
+    use ScalarModuleProofOutcome::{Invalid, NoApplicableInputs, Proved, Refuted, Unsupported};
+    let scoped = "value >= -2 && value <= 0 && value != -1 && limit >= 1";
+    let valid = "out >= -2 && out <= core.old(limit) && out != -1 && out != core.old(limit) && out == core.old(value)";
+    assert_eq!(check("echo", scoped, valid, ""), Proved);
+    assert_eq!(check("echo", scoped, "out >= -2 && out < 0 && out != core.old(limit)", ""), Refuted);
+    assert_eq!(check("echo", scoped, "out >= -2 && out > core.old(limit) && out <= core.old(limit)", ""), Refuted);
+    let contradiction = "out < 0 && out >= 0 && out != core.old(limit)";
+    assert_eq!(check("echo", "false", contradiction, ""), NoApplicableInputs);
+    assert_eq!(check("echo", scoped, contradiction, ""), Refuted);
+    assert!(matches!(check("echo", scoped, &format!("{contradiction} && out < 32768"), ""), Invalid(_)));
+    for target in ["const_first", "local_first"] {
+        assert_eq!(check(target, "limit >= 0 && limit <= 1", contradiction, ""), Unsupported);
+    }
+    assert_eq!(check("echo", scoped, valid, "i16 seen = echo(0, 1);"), Unsupported);
+    assert_eq!(check("echo", scoped, "out >= -2 && out <= 0 && out != -1", ""), Proved);
+    assert_eq!(check("echo", scoped, "out <= 0 && out >= 0", ""), Refuted);
+}
+
+#[test]
 fn named_proof_show_mixed_sequence_holds_all_exact_obligations() {
     let identity = source();
     let check = |target: &str, where_guard: &str, ensures: &str, steps: &str| {

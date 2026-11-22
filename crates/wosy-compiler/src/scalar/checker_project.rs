@@ -28,7 +28,7 @@ use super::{
     },
 };
 #[cfg(feature = "internal-checker")]
-use super::{checker_flow::{evaluate_borrowed_return_proof, observe_authored_show_returns, integer_predicate_implies, observe_arbitrary_integer_returns, observe_unused_module_proof_returns, GuardedOutputClaims, ImmutableEntryRange, ImmutableProofOutputComparison, IntegerShowOutput}, symbolic_integer::IntegerShowConstraints, typecheck::integer_bounds};
+use super::{checker_flow::{evaluate_borrowed_return_proof, evaluate_mixed_entry_output, observe_authored_show_returns, integer_predicate_implies, observe_arbitrary_integer_returns, observe_unused_module_proof_returns, GuardedOutputClaims, ImmutableEntryRange, ImmutableProofOutputComparison, IntegerShowOutput}, symbolic_integer::IntegerShowConstraints, typecheck::integer_bounds};
 use crate::Diagnostic;
 use wosy_syntax::SourceIdentity;
 use wosy_syntax::{CanonicalCstRoot, CstNode, CstToken, SyntaxKind};
@@ -2612,7 +2612,7 @@ impl PreparedProofModule {
     ) -> Result<PlannedModuleProof<'a>, ProjectCheck> {
         let (module, item, function) = proof.function;
         let steps = derive_block(&child(proof.node, SyntaxKind::Block)?);
-        let typed = typed_proof_postcondition::<ALLOW_INDUCTION, DEFER_OUTPUT_UNION>(&self.prepared, proof.function, proof.node, &steps)?;
+        let typed = typed_proof_postcondition::<ALLOW_INDUCTION, DEFER_OUTPUT_UNION>(&self.prepared, proof.function, proof.node, &steps, !DEFER_OUTPUT_UNION)?;
         let filter = prepare_proof_entry_filter_in_scope(
             proof.node, proof_source, typed.target.target_layout, &typed.input_names, typed.body,
             ALLOW_DOMAIN && steps.items.is_empty() && typed.measure.is_none(),
@@ -2629,7 +2629,7 @@ impl PreparedProofModule {
     ) -> Result<InductionPremise, ProjectCheck> {
         let proof = self.select_resolved(proof_source, proof_name)?;
         let steps = derive_block(&child(proof.node, SyntaxKind::Block)?);
-        let typed = typed_proof_postcondition::<true, false>(&self.prepared, proof.function, proof.node, &steps)?;
+        let typed = typed_proof_postcondition::<true, false>(&self.prepared, proof.function, proof.node, &steps, false)?;
         let measure = typed.measure.ok_or(ProjectCheck::Unsupported)?;
         let filter = prepare_proof_entry_filter(
             proof.node, proof_source, typed.target.target_layout, &typed.input_names, typed.body,
@@ -2720,7 +2720,7 @@ impl PreparedProofModule {
             targets: HashMap::new(), proofs: Vec::with_capacity(plans.len()), induction,
         };
         for (plan_index, (_, plan)) in plans.iter().enumerate() {
-            if plan.typed.measure.is_none() {
+            if plan.typed.measure.is_none() && !matches!(plan.typed.goal, TypedProofGoal::MixedEntryConjunction { .. }) {
                 observers.targets.entry(plan.target).or_default().push(plan_index);
                 observers.proofs.push(Some(plan.observer()));
             } else {
@@ -2758,7 +2758,7 @@ impl PreparedProofModule {
                 if let Some(observer) = observer {
                     outcomes[*index] = module_proof_outcome(observer.outcome());
                 }
-            } else if !matches!(plan.typed.goal, TypedProofGoal::Literal { .. } | TypedProofGoal::Conjunction(_) | TypedProofGoal::Disjunction(_) | TypedProofGoal::Universal { .. } | TypedProofGoal::Existential { .. } | TypedProofGoal::EntryComparison { .. }) {
+            } else if !matches!(plan.typed.goal, TypedProofGoal::Literal { .. } | TypedProofGoal::Conjunction(_) | TypedProofGoal::Disjunction(_) | TypedProofGoal::Universal { .. } | TypedProofGoal::Existential { .. } | TypedProofGoal::EntryComparison { .. } | TypedProofGoal::MixedEntryConjunction { .. }) {
                 continue;
             } else if plan.uses_direct_goal() {
                 let key = (plan.target, ExactGuardGroup(plan.filter.as_deref()));
@@ -2969,6 +2969,9 @@ impl PreparedProofModule {
                         let holds = if let TypedProofGoal::EntryComparison { slot, relation } = goal {
                             ImmutableProofOutputComparison::prepare(body, *slot, plan.typed.result_type, *relation)
                                 .and_then(|entry| entry.holds(&paths, None))
+                        } else if let TypedProofGoal::MixedEntryConjunction { output, entry } = goal {
+                            body.boundary.checker_parameter_bindings.as_deref()
+                                .and_then(|formals| evaluate_mixed_entry_output(&paths, formals, output, entry))
                         } else {
                             let mut holds = Some(true);
                             for path in &paths {
@@ -3303,7 +3306,7 @@ impl SelectedProofObserver<'_> {
                 TypedProofGoal::Existential { relation, witness, witness_in_domain } =>
                     (*witness_in_domain && relation.accepts(value.cmp(witness))).then_some(true),
                 TypedProofGoal::Disjunction(allowed) => Some(allowed.contains(value)),
-                TypedProofGoal::DeferredDisjunction(_) => None,
+                TypedProofGoal::DeferredDisjunction(_) | TypedProofGoal::MixedEntryConjunction { .. } => None,
                 TypedProofGoal::Conjunction(atoms) => Some(atoms.iter().all(|(relation, bound)| relation.accepts(value.cmp(bound)))),
                 TypedProofGoal::EntryComparison { slot, relation } =>
                     arguments.get(*slot).map(|entry| relation.accepts(value.cmp(entry))),
@@ -3459,6 +3462,8 @@ enum TypedProofGoal {
     Universal { relation: IntegerRelation, bound: BigInt },
     Existential { relation: IntegerRelation, witness: BigInt, witness_in_domain: bool },
     EntryComparison { slot: usize, relation: IntegerRelation },
+    #[cfg(feature = "internal-checker")]
+    MixedEntryConjunction { output: IntegerShowConstraints<'static>, entry: [Option<IntegerRelation>; 2] },
 }
 
 #[cfg(feature = "internal-checker")]
@@ -3479,7 +3484,7 @@ impl TypedProofGoal {
                 }
                 Some(true)
             }
-            Self::EntryComparison { .. } | Self::DeferredDisjunction(_) => None,
+            Self::EntryComparison { .. } | Self::DeferredDisjunction(_) | Self::MixedEntryConjunction { .. } => None,
         }
     }
 }
@@ -3977,17 +3982,66 @@ fn typed_output_atom(
 fn typed_output_conjunction(
     expression: &ScalarExpression, output: &str, inputs: &[String], ty: &ScalarType,
 ) -> Result<Vec<(IntegerRelation, BigInt)>, ProjectCheck> {
-    let mut pending = vec![expression];
     let mut atoms = Vec::new();
+    visit_output_conjuncts(expression, |atom| {
+        atoms.push(typed_output_atom(atom, output, inputs, ty)?);
+        Ok(())
+    })?;
+    Ok(atoms)
+}
+
+fn visit_output_conjuncts(
+    expression: &ScalarExpression,
+    mut visit: impl FnMut(&ScalarExpression) -> Result<(), ProjectCheck>,
+) -> Result<(), ProjectCheck> {
+    let mut pending = vec![expression];
     while let Some(expression) = pending.pop() {
         if let ScalarExpression::Binary { operator: BinaryOperator::And, left, right, .. } = expression {
             pending.push(right);
             pending.push(left);
-            continue;
+        } else {
+            visit(expression)?;
         }
-        atoms.push(typed_output_atom(expression, output, inputs, ty)?);
     }
-    Ok(atoms)
+    Ok(())
+}
+
+#[cfg(feature = "internal-checker")]
+fn typed_unused_named_conjunction(
+    expression: &ScalarExpression, output: &str, inputs: &[String], body: &FunctionCallSites, ty: &ScalarType,
+) -> Result<TypedProofGoal, ProjectCheck> {
+    let mut literals = Vec::new();
+    let mut normalized = None;
+    let mut entry: [Option<IntegerRelation>; 2] = [None; 2];
+    visit_output_conjuncts(expression, |atom| {
+        if let Some(old) = checked_old_output_relation(atom, output, inputs, body, ty) {
+            let (slot, relation) = old?;
+            let condition = entry.get_mut(slot).ok_or(ProjectCheck::Unsupported)?;
+            *condition = Some(condition.map_or(relation, |prior| prior.intersection(relation)));
+            if normalized.is_none() {
+                let mut constraints = IntegerShowConstraints::default();
+                for (relation, bound) in std::mem::take(&mut literals) {
+                    constraints.add(relation, Cow::Owned(bound));
+                }
+                normalized = Some(constraints);
+            }
+        } else {
+            let (relation, bound) = typed_output_atom(atom, output, inputs, ty)?;
+            if let Some(constraints) = normalized.as_mut() {
+                constraints.add(relation, Cow::Owned(bound));
+            } else {
+                literals.push((relation, bound));
+            }
+        }
+        Ok(())
+    })?;
+    match normalized {
+        Some(mut output) => {
+            output.normalize();
+            Ok(TypedProofGoal::MixedEntryConjunction { output, entry })
+        }
+        None => Ok(TypedProofGoal::Conjunction(literals)),
+    }
 }
 
 #[cfg(feature = "internal-checker")]
@@ -4097,6 +4151,7 @@ fn typed_proof_postcondition<'a, const AUDIT_INDUCTION: bool, const DEFER_OUTPUT
     (module, item, function): (usize, usize, &'a ScalarFunction),
     declaration: &CstNode,
     steps: &ScalarBlock,
+    #[cfg_attr(not(feature = "internal-checker"), allow(unused_variables))] allow_mixed_ensures: bool,
 ) -> Result<TypedProofPostcondition<'a>, ProjectCheck> {
     let target = child(declaration, SyntaxKind::ProofTarget)?;
     let input_names = identifiers(&child(&target, SyntaxKind::Parameters)?).collect::<Vec<_>>();
@@ -4150,7 +4205,18 @@ fn typed_proof_postcondition<'a, const AUDIT_INDUCTION: bool, const DEFER_OUTPUT
                 TypedProofGoal::Disjunction(normalize_output_disjunction(&result.ty, &atoms).ok_or(ProjectCheck::Unsupported)?)
             }
         } else if matches!(&ensures, ScalarExpression::Binary { operator: BinaryOperator::And, .. }) {
-            TypedProofGoal::Conjunction(typed_output_conjunction(&ensures, output, &input_names, &result.ty)?)
+            #[cfg(feature = "internal-checker")]
+            let mixed = if allow_mixed_ensures && steps.items.is_empty() && measure.is_none() {
+                Some(typed_unused_named_conjunction(&ensures, output, &input_names, body, &result.ty)?)
+            } else {
+                None
+            };
+            #[cfg(not(feature = "internal-checker"))]
+            let mixed = None;
+            match mixed {
+                Some(goal) => goal,
+                None => TypedProofGoal::Conjunction(typed_output_conjunction(&ensures, output, &input_names, &result.ty)?),
+            }
         } else if let Some(ensures) = IntegerComparison::from_expression(&ensures) {
             let (operator, relation, bound) = checked_literal_output_goal(ensures, output, &input_names, &result.ty)?;
             TypedProofGoal::Literal { operator, relation, bound }
@@ -4182,7 +4248,7 @@ fn check_selected_proof(
 ) -> Result<(ProjectCheck, Option<VerifiedReturnBound>), ProjectCheck> {
     let steps = derive_block(&child(declaration, SyntaxKind::Block)?);
     let TypedProofPostcondition { target, body, result_type, input_names, output, goal, .. } =
-        typed_proof_postcondition::<false, false>(prepared, (module, item, function), declaration, &steps)?;
+        typed_proof_postcondition::<false, false>(prepared, (module, item, function), declaration, &steps, false)?;
     let TypedProofGoal::Literal { operator, bound, .. } = goal else {
         return Err(ProjectCheck::Unsupported);
     };
