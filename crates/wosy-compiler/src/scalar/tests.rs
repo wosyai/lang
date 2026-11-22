@@ -12786,7 +12786,7 @@ fn known_projected_shared_leaf_keeps_noncanonical_transports_closed() {
         ("*Pair parent = &owner;", "&(*parent).left;", "&(*parent).left"),
         ("*Pair parent = &owner;", "*u8 leaf = &(*parent).left; if (true) { *u8 alias = leaf; u8 read = *alias; read; };", "&(*parent).left"),
         ("*!Pair parent = &!owner;", "*u8 leaf = &(*parent).left; *u8 alias = leaf; u8 read = *alias; read;", "&(*parent).left"),
-        ("*!Pair parent = &!owner;", "*!u8 leaf = &!(*parent).left; if (true) { *leaf = 9; };", "&!(*parent).left"),
+        ("*!Pair parent = &!owner;", "*!u8 leaf = &!(*parent).left; if (true) { *!u8 alias = leaf; *alias = 9; };", "&!(*parent).left"),
     ] {
         let text = format!(r#"%%start
 struct copy Pair {{ u8 left; u8 right; }}
@@ -13303,7 +13303,7 @@ unit(Pair) inspect = fn(owner) {{
         "*!u8 alias = leaf; *alias = 7;",
         "unsafe { &?owner; }; *leaf = 7;",
         "bool other = false; *leaf, other = values(true); other;",
-        "if (true) { *leaf = 7; };",
+        "bool other = false; if (true) { *leaf, other = values(true); other; };",
     ] {
         let text = specimen(body);
         let projected = text.find("&!(*parent).left").unwrap() as u32;
@@ -13313,6 +13313,79 @@ unit(Pair) inspect = fn(owner) {{
                 && diagnostic.labels.first().is_some_and(|label| label.span.range.start == projected)),
                 "{body}: {diagnostics:?}");
         }
+    }
+}
+
+#[test]
+fn root_projected_mutable_children_store_disjoint_fields_in_contained_conditional() {
+    let text = r#"%%start
+struct copy Pair { u8 left; u8 right; }
+unit(Pair, bool) inspect = fn(owner, choose) {
+	*!Pair parent = &!owner;
+	*!u8 left = &!(*parent).left;
+	*!u8 right = &!(*parent).right;
+	if (choose) { *left = 3; *right = 5; } else { *right = 11; *left = 7; };
+	u8 a = *left;
+	u8 b = *right;
+	if (choose) { if (a != 3 || b != 5) { core.system_panic(); }; } else { if (a != 7 || b != 11) { core.system_panic(); }; };
+};
+Pair initial = { .left = 1; .right = 2; };
+inspect(initial, true);
+inspect(initial, false);
+%%end"#;
+    let (single, project) = both_reference_functions(text);
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        let ScalarItem::Function(function) = &items[0] else { panic!("typed callable") };
+        for (holder, ordinal, spans) in [
+            ("left", 0, ["*left = 3", "*left = 7"]),
+            ("right", 1, ["*right = 5", "*right = 11"]),
+        ] {
+            let owner = text.find(&format!("{holder} = &!")).unwrap() as u32;
+            for source in spans {
+                let start = text.find(source).unwrap() as u32 + 1;
+                let target = ByteSpan::new(start, start + holder.len() as u32);
+                let points = &function.reference_cfg.points;
+                let pointer = points.iter().find(|point| point.source_span.range == target
+                    && matches!(&point.kind, CfgPointKind::Read { binding } if binding.declaration_span.start == owner)).unwrap();
+                let store = points.get(pointer.id.0 + 1).unwrap();
+                let CfgPointKind::AssignThrough { pointer_point, candidates, .. } = &store.kind else { unreachable!() };
+                let span = store.source_span.range;
+                assert!(span.start < target.end && target.start < span.end, "{span:?} {target:?}");
+                assert_eq!(pointer.successors.as_slice(), [store.id]);
+                assert_eq!(*pointer_point, pointer.id);
+                assert_ne!(store.scope, ReferenceScopeId(0));
+                assert_eq!(pointer.scope, store.scope);
+                let [candidate] = candidates.as_slice() else { panic!("exact candidate: {candidates:#?}") };
+                let child = text.find(&format!("&!(*parent).{holder}")).unwrap() as u32;
+                assert_eq!(candidate.loan.creation_span.start, child);
+                assert_eq!(candidate.loan.mode, ScalarReferenceMutability::Mutable);
+                let [ReferencePlaceProjection::Dereference(parent),
+                    ReferencePlaceProjection::Field(ScalarFieldReference::Resolved(field))] =
+                    candidate.place.projections.as_slice() else { panic!("exact field reborrow: {candidate:#?}") };
+                assert_eq!(field.index, ordinal);
+                assert_eq!(candidate.loan.parent.as_deref(), Some(parent.as_ref()));
+                assert_eq!(candidate.place.binding, parent.origin_place.binding);
+                assert_eq!(candidate.place.projections, candidate.loan.origin_place.projections);
+                assert_eq!(pointer.possible_origins.as_ref(), Some(&BTreeSet::from([candidate.origin])));
+                assert!(matches!(sole_fact(function, pointer),
+                    ReferenceOrigin::Fresh { loan, .. } if *loan == candidate.loan));
+            }
+        }
+    }
+
+    let targeted = text.replace("if (choose) { *left = 3; *right = 5; }",
+        "if (choose) { (*parent).left = 9; *left = 3; *right = 5; }");
+    let (single, project) = both_reference_functions(&targeted);
+    let access = targeted.find("(*parent).left = 9").unwrap() as u32;
+    let child = targeted.find("&!(*parent).left").unwrap() as u32;
+    for diagnostics in [&single.diagnostics, &project.diagnostics] {
+        assert!(diagnostics.iter().any(|diagnostic| diagnostic.code == "B0003" && diagnostic.labels.first()
+            .is_some_and(|label| (access..access + 17).contains(&label.span.range.start))
+            && diagnostic.labels.iter().skip(1).any(|label| label.span.range.start == child)), "{diagnostics:#?}");
     }
 }
 

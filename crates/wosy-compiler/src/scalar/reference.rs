@@ -6530,7 +6530,8 @@ fn transfer_reference_facts(
                                     && *pointer_id == point.id && matches!(pointer.as_ref(), ScalarExpression::Name { .. })
                                     && cfg.checked_pointee_reads.binary_search(&next.id).is_ok(),
                                 CfgPointKind::AssignThrough { .. }
-                                    if point.scope == scope && mode == ScalarReferenceMutability::Mutable => {
+                                    if mode == ScalarReferenceMutability::Mutable
+                                        && (point.scope == scope || (scope == ReferenceScopeId(0) && admitted_origin.is_some())) => {
                                     let exact = exact_named_scalar_store_pointer(
                                         next, original_points, cfg.checked_named_scalar_stores, &grouped_installs,
                                     ) == Some((point.id, binding, None));
