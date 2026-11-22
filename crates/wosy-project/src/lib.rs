@@ -440,6 +440,14 @@ pub struct ProjectConfiguration {
     pub resolved_packages: BTreeMap<String, ResolvedPackage>,
 }
 
+#[cfg(feature = "internal-checker")]
+#[doc(hidden)]
+pub struct DirectDependencyCheckTarget {
+    pub project: ProjectContext,
+    pub configuration: ProjectConfiguration,
+    pub layout: TargetLayout,
+}
+
 impl ProjectConfiguration {
     pub fn load(root: &Path) -> Result<Self, String> {
         Self::load_with_manifest(root).map(|(configuration, _)| configuration)
@@ -450,6 +458,38 @@ impl ProjectConfiguration {
         let content = fs::read_to_string(&path).map_err(|error| error.to_string())?;
         let document =
             toml_edit::ImDocument::parse(content).map_err(|error| error.to_string())?;
+        let configuration = Self::from_document::<false>(root, &document, "", |_, _| Ok(()))?;
+        Ok((configuration, document))
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[doc(hidden)]
+    pub fn load_with_direct_dependency_check_target(
+        root: &Path, dependency: &str, target: &str, profile: &str,
+    ) -> Result<(Self, toml_edit::ImDocument<String>, DirectDependencyCheckTarget), String> {
+        let document = toml_edit::ImDocument::parse(
+            fs::read_to_string(root.join("wosy.toml")).map_err(|error| error.to_string())?,
+        ).map_err(|error| error.to_string())?;
+        let mut selection = None;
+        let configuration = Self::from_document::<true>(root, &document, dependency, |resolved, child| {
+            let child_configuration = Self::from_document::<false>(&resolved.project_root, child, "", |_, _| Ok(()))?;
+            let project = ProjectContext::from_manifest(&resolved.project_root, target, child.as_table())?;
+            if project.package != resolved.name {
+                return Err(format!("dependency {dependency} identity mismatch"));
+            }
+            let (_, _, artifact, _) = child_configuration.artifact_profile(target, profile)?;
+            let layout = artifact.target_layout()?;
+            selection = Some(DirectDependencyCheckTarget { project, configuration: child_configuration, layout });
+            Ok(())
+        })?;
+        let selection = selection.ok_or_else(|| format!("direct dependency {dependency} is missing"))?;
+        Ok((configuration, document, selection))
+    }
+
+    fn from_document<const OBSERVE: bool>(
+        root: &Path, document: &toml_edit::ImDocument<String>, selected: &str,
+        observe: impl FnMut(&ResolvedPackage, &toml_edit::ImDocument<String>) -> Result<(), String>,
+    ) -> Result<Self, String> {
         let package = document
             .get("package")
             .and_then(Item::as_table)
@@ -465,7 +505,7 @@ impl ProjectConfiguration {
                     )
                 },
             )?;
-        let resolved_packages = resolve_local_packages(root, &package_name, &dependencies)
+        let resolved_packages = resolve_local_packages_observing::<OBSERVE>(root, &dependencies, selected, observe)
             .map_err(|error| error.diagnostics[0].message.clone())?;
         let default_target = scalar_string(package, "default_target")?;
         let builders = named_commands(document.get("builders"), "builder")?;
@@ -495,17 +535,9 @@ impl ProjectConfiguration {
                 },
             );
         }
-        Ok((
-            Self {
-                default_target,
-                builders,
-                runners,
-                targets,
-                dependencies,
-                resolved_packages,
-            },
-            document,
-        ))
+        Ok(Self {
+            default_target, builders, runners, targets, dependencies, resolved_packages,
+        })
     }
 
     pub fn resolve_target(&self, target: Option<&str>) -> Result<String, String> {
@@ -652,6 +684,13 @@ pub fn resolve_local_packages(
     _package: &str,
     dependencies: &BTreeMap<String, DependencyDeclaration>,
 ) -> Result<BTreeMap<String, ResolvedPackage>, DependencyResolutionError> {
+    resolve_local_packages_observing::<false>(root, dependencies, "", |_, _| Ok(()))
+}
+
+fn resolve_local_packages_observing<const OBSERVE: bool>(
+    root: &Path, dependencies: &BTreeMap<String, DependencyDeclaration>, selected: &str,
+    mut observe: impl FnMut(&ResolvedPackage, &toml_edit::ImDocument<String>) -> Result<(), String>,
+) -> Result<BTreeMap<String, ResolvedPackage>, DependencyResolutionError> {
     let mut resolved = BTreeMap::new();
     for (name, declaration) in dependencies {
         let package_root = root.join(&declaration.path);
@@ -730,19 +769,24 @@ pub fn resolve_local_packages(
                 }],
             });
         }
-        resolved.insert(
-            name.to_owned(),
-            ResolvedPackage {
-                name: resolved_name.clone(),
-                project_root: package_root.clone(),
-                source_root: package_root.join(&source_root),
-                identity: SourceIdentity::new(
-                    package_root.to_string_lossy().into_owned(),
-                    resolved_name,
-                    source_path,
-                ),
-            },
-        );
+        let package = ResolvedPackage {
+            name: resolved_name.clone(),
+            project_root: package_root.clone(),
+            source_root: package_root.join(&source_root),
+            identity: SourceIdentity::new(
+                package_root.to_string_lossy().into_owned(),
+                resolved_name,
+                source_path,
+            ),
+        };
+        if OBSERVE && name == selected {
+            observe(&package, &document).map_err(|message| DependencyResolutionError {
+                diagnostics: vec![DependencyDiagnostic {
+                    code: "P0002".to_owned(), message, span: declaration.span.clone(),
+                }],
+            })?;
+        }
+        resolved.insert(name.to_owned(), package);
     }
     Ok(resolved)
 }

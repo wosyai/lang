@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [features]
-internal-checker = ["wosy-compiler/internal-checker"]
+internal-checker = ["wosy-compiler/internal-checker", "wosy-project/internal-checker"]
 
 [dependencies]
 blake3.workspace = true

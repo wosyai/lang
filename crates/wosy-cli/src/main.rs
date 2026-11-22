@@ -733,6 +733,17 @@ fn check_loaded_ordered_project(
 }
 
 #[cfg(feature = "internal-checker")]
+#[cfg_attr(not(test), allow(dead_code))]
+fn check_loaded_ordered_dependency(
+    selection: &wosy_project::DirectDependencyCheckTarget,
+) -> Result<InternalOrderedCheckReceipt, CanonicalLoadFailure> {
+    check_loaded_ordered_project(
+        &selection.project.root, &selection.project, &selection.configuration,
+        scalar_target_layout(selection.layout), wosy_compiler::ScalarCheckerScope::CurrentPackage, Vec::new(),
+    )
+}
+
+#[cfg(feature = "internal-checker")]
 fn check_loaded_project_with<Outcome>(
     root: &std::path::Path,
     project: &ProjectContext,
@@ -1704,6 +1715,93 @@ mod tests {
             let receipt = InternalCheckReceipt { outcome, texts: BTreeMap::new() };
             receipt.visit_authored_effects::<()>(|_| panic!("no authored effects")).unwrap();
         }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn internal_ordered_dependency_uses_its_own_declared_target_and_layout_once() {
+        use wosy_compiler::{ScalarCheckerScope, ScalarOrderedCheckerOutcome};
+        let (scratch, _) = routing_test_project("ordered-own-dependency", &[]);
+        let root = &scratch.root;
+        let dep = root.join("dep");
+        fs::create_dir_all(dep.join("src")).unwrap();
+        let manifest = |package, source_root, target, path, profile, output| format!(r#"
+[package]
+name = "{package}"
+default_target = "{target}"
+source_root = "{source_root}"
+
+[comments]
+categories = []
+
+[builders]
+
+[runners]
+
+[targets.{target}]
+root = "{path}"
+
+[targets.{target}.artifacts.main]
+artifact = "RuntimeStdio"
+
+[targets.{target}.artifacts.main.profiles.{profile}]
+backend = "llvm"
+output = "{output}"
+builder = "never"
+run_runner = "never"
+
+[targets.{target}.profiles.{profile}]
+main_artifact = "main"
+"#);
+        let parent_manifest = manifest("app", ".", "main", "main.w", "dev", "native");
+        fs::write(root.join("wosy.toml"), format!("{parent_manifest}
+[dependencies.dep]
+path = \"dep\"
+")).unwrap();
+        fs::write(dep.join("wosy.toml"), manifest("dep", "src", "own", "src/own.w", "checked", "wasm-wasip1")).unwrap();
+        let emit = |text, code| format!(
+            "core.require(false, {{ .stdout = \"{text}\"; .stderr = \"\"; .code = {code}; .files = []; }});",
+        );
+        fs::write(root.join("main.w"), format!("%%start
+vendor = namespace dep \"borrowed.w\";
+{}
+%%end", emit("parent", 3))).unwrap();
+        fs::write(dep.join("src/borrowed.w"), format!("%%start
+{}
+%%end", emit("parent import", 5))).unwrap();
+        fs::write(dep.join("src/own.w"), format!(
+            "%%start
+{}
+unit(u8) unused = fn(value) {{ core.require(value < 1, {{ .stdout = \"unused dep\"; .stderr = \"\"; .code = 9; .files = []; }}); }};
+%%end",
+            emit("own dep", 7),
+        )).unwrap();
+
+        let (parent, document, selection) = ProjectConfiguration::load_with_direct_dependency_check_target(root, "dep", "own", "checked").unwrap();
+        let parent_project = ProjectContext::from_manifest(root, "main", document.as_table()).unwrap();
+        let parent_layout = parent.artifact_profile("main", "dev").unwrap().2.target_layout().unwrap();
+        assert_eq!(parent_layout.pointer_size, 8);
+        assert_eq!(selection.layout.pointer_size, 4);
+        assert_eq!(selection.project.root, dep);
+        assert_eq!(selection.project.source_root, std::path::PathBuf::from("src/own.w"));
+        let (child, counts) = routing_observations::observe(|| check_loaded_ordered_dependency(&selection));
+        assert_eq!(counts.checks, 1);
+        assert_eq!(counts.extractions, 1);
+        assert_eq!(counts.builds, 0);
+        let child = child.unwrap();
+        let ScalarOrderedCheckerOutcome::Failed(failures) = child.outcome else { panic!("own target and unused root failures"); };
+        assert_eq!(failures.iter().map(|failure| failure.stdout()).collect::<Vec<_>>(), [b"own dep".as_slice(), b"unused dep".as_slice()]);
+        assert_eq!(child.texts.len(), 1);
+        let parent = check_loaded_ordered_project(root, &parent_project, &parent, scalar_target_layout(parent_layout), ScalarCheckerScope::CurrentPackage, Vec::new()).unwrap();
+        let ScalarOrderedCheckerOutcome::Failed(failures) = parent.outcome else { panic!("parent and imported startup failures"); };
+        assert_eq!(failures.iter().map(|failure| failure.stdout()).collect::<Vec<_>>(), [b"parent import".as_slice(), b"parent".as_slice()]);
+        assert_eq!(parent.texts.len(), 2);
+        assert_eq!(
+            ProjectConfiguration::load_with_direct_dependency_check_target(root, "dep", "own", "dev").err().as_deref(),
+            Some("target own profile dev is missing"),
+        );
+        assert!(!root.join(".wosy").exists() && !dep.join(".wosy").exists());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(feature = "internal-checker")]
