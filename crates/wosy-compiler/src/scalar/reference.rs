@@ -6046,6 +6046,64 @@ fn grouped_install_inventory_preserves_detached_and_canonical_capture() {
     assert_eq!(grouped_assignment_installs(&points, None), expected);
 }
 
+enum ReferenceIncomingStates {
+    Linear { destination: CfgPointId, states: Vec<ReferenceEdgeState> },
+    Indexed(Vec<Vec<ReferenceEdgeState>>),
+}
+
+impl ReferenceIncomingStates {
+    fn new(point_count: usize, linear: bool) -> Self {
+        if linear {
+            Self::Linear { destination: CfgPointId(0), states: Vec::new() }
+        } else {
+            Self::Indexed(vec![Vec::new(); point_count])
+        }
+    }
+
+    fn next_forward(&self, cursor: usize) -> Option<CfgPointId> {
+        match self {
+            Self::Linear { destination, states } => {
+                debug_assert!(states.is_empty() || destination.0 >= cursor);
+                (!states.is_empty()).then_some(*destination)
+            }
+            Self::Indexed(slots) => slots[cursor..].iter().position(|slot| !slot.is_empty())
+                .map(|offset| CfgPointId(cursor + offset)),
+        }
+    }
+
+    fn slot(&mut self, id: CfgPointId) -> &mut Vec<ReferenceEdgeState> {
+        match self {
+            Self::Linear { destination, states } => {
+                debug_assert!(states.is_empty() || *destination == id);
+                *destination = id;
+                states
+            }
+            Self::Indexed(slots) => &mut slots[id.0],
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn linear_incoming_slot_preserves_gaps_and_distinct_ordered_states() {
+    let mut incoming = ReferenceIncomingStates::new(8, true);
+    incoming.slot(CfgPointId(0)).push(ReferenceEdgeState::default());
+    assert_eq!(incoming.next_forward(0), Some(CfgPointId(0)));
+    let mut first = std::mem::take(incoming.slot(CfgPointId(0))).pop().unwrap();
+    assert_eq!(incoming.next_forward(1), None);
+
+    first.value = Some(BTreeSet::from([ReferenceOriginId(0)]));
+    let mut second = ReferenceEdgeState::default();
+    second.value = Some(BTreeSet::from([ReferenceOriginId(1)]));
+    incoming.slot(CfgPointId(4)).push(first.clone());
+    incoming.slot(CfgPointId(4)).push(second.clone());
+    assert_eq!(incoming.next_forward(1), Some(CfgPointId(4)));
+    assert!(std::mem::take(incoming.slot(CfgPointId(4))) == vec![first, second]);
+    assert_eq!(incoming.next_forward(5), None);
+    incoming.slot(CfgPointId(7)).push(ReferenceEdgeState::default());
+    assert_eq!(incoming.next_forward(5), Some(CfgPointId(7)));
+}
+
 fn transfer_reference_facts(
     mut cfg: ReferenceTransferCfg<'_>,
     deferred_policies: &BTreeMap<usize, CopyPolicy>,
@@ -6062,6 +6120,7 @@ fn transfer_reference_facts(
     let grouped_installs = grouped_assignment_installs(original_points, cfg.has_grouped_assignment_capture);
     let mut last_use = (0..cfg.points.len()).collect::<Vec<_>>();
     let mut strictly_forward = true;
+    let mut unbranched = true;
     let mut projected_leaf_sites = HashMap::new();
     let mut projected_leaf_holders = HashMap::new();
     let mut projected_store_facts = None::<(BTreeSet<ReferenceOriginId>, HashMap<CfgPointId, ReferenceOriginId>)>;
@@ -6128,6 +6187,7 @@ fn transfer_reference_facts(
     for (index, point) in original_points.iter().enumerate() {
         strictly_forward = strictly_forward && point.id.0 == index
             && point.successors.iter().all(|successor| successor.0 > index && successor.0 < original_points.len());
+        unbranched = unbranched && point.successors.len() <= 1;
         aggregate_expiry_allowed = aggregate_expiry_allowed && strictly_forward
             && !matches!(&point.kind, CfgPointKind::MoveThrough { place, .. }
                 if !matches!(place, ScalarPlace::Dereference { .. }));
@@ -6351,8 +6411,8 @@ fn transfer_reference_facts(
         .map(|(facts, _, _, _)| facts.value_deadlines(&last_use));
     let point_count = cfg.points.len();
     let mut observed = None;
-    let mut incoming = vec![Vec::<ReferenceEdgeState>::new(); cfg.points.len()];
-    incoming[0].push(ReferenceEdgeState {
+    let mut incoming = ReferenceIncomingStates::new(point_count, strictly_forward && unbranched);
+    incoming.slot(CfgPointId(0)).push(ReferenceEdgeState {
         aggregate: aggregate.as_ref().map(|(facts, _, _, _)| facts.entry_state()),
         ..ReferenceEdgeState::default()
     });
@@ -6376,16 +6436,13 @@ fn transfer_reference_facts(
             queued[id.0] = false;
             id
         } else {
-            let Some(offset) = incoming[forward_cursor..].iter().position(|slot| !slot.is_empty()) else {
-                break;
-            };
-            let id = CfgPointId(forward_cursor + offset);
+            let Some(id) = incoming.next_forward(forward_cursor) else { break };
             forward_cursor = id.0 + 1;
             id
         };
         let common_aggregate_cutoff = aggregate_deadlines.as_ref()
             .and_then(|_| original_points[id.0].successors.iter().copied().min());
-        let states = std::mem::take(&mut incoming[id.0]);
+        let states = std::mem::take(incoming.slot(id));
         let keep_in_place = keep_forward_point_in_place(&original_points[id.0].kind, ordinary_forward, states.len());
         let mut snapshot = if keep_in_place {
             None
@@ -7823,7 +7880,7 @@ fn transfer_reference_facts(
             let mut state = Some(state);
             let mut successors = point.successors.iter().peekable();
             while let Some(successor) = successors.next() {
-                let slot = &mut incoming[successor.0];
+                let slot = incoming.slot(*successor);
                 let final_successor = successors.peek().is_none();
                 if move_alternatives.is_empty() {
                     let mut next = forwarded_edge_seed(&mut state, final_successor);
