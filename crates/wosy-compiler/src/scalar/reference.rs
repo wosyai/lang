@@ -6519,16 +6519,19 @@ fn transfer_reference_facts(
                 if let Some(&(borrow, scope, mode, admitted_origin)) = projected_leaf_holders.get(binding) {
                     let authorized = match point.successors.as_slice() {
                         [next] => original_points.get(next.0).is_some_and(|next| {
-                            if point.scope != scope || next.scope != scope {
+                            if point.scope != next.scope {
                                 return false;
                             }
                             match &next.kind {
                                 CfgPointKind::ReadPlace {
                                     place: ScalarPlace::Dereference { pointer, .. },
                                     pointer_point: Some(pointer_id), reads_origin: false, ..
-                                } => *pointer_id == point.id && matches!(pointer.as_ref(), ScalarExpression::Name { .. })
+                                } => (point.scope == scope || (scope == ReferenceScopeId(0)
+                                        && mode == ScalarReferenceMutability::Shared))
+                                    && *pointer_id == point.id && matches!(pointer.as_ref(), ScalarExpression::Name { .. })
                                     && cfg.checked_pointee_reads.binary_search(&next.id).is_ok(),
-                                CfgPointKind::AssignThrough { .. } if mode == ScalarReferenceMutability::Mutable => {
+                                CfgPointKind::AssignThrough { .. }
+                                    if point.scope == scope && mode == ScalarReferenceMutability::Mutable => {
                                     let exact = exact_named_scalar_store_pointer(
                                         next, original_points, cfg.checked_named_scalar_stores, &grouped_installs,
                                     ) == Some((point.id, binding, None));
