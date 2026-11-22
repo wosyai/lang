@@ -4266,6 +4266,35 @@ fn proof_show_plan<'a, const VERIFY_ENTRY_WRITES: bool, const ALLOW_NAMED_STEPS:
         }
         [ScalarBlockItem::Expression(ScalarExpression::If { condition, then_branch, else_branch, .. })] => {
             let guard = proof_input_condition::<true>(condition, inputs, body, false)?;
+            #[cfg(feature = "internal-checker")]
+            if ALLOW_NAMED_STEPS && matches!(&guard, CheckerPredicate::Integer(_)) {
+                let comparison_claim = |arm: &'a ScalarBlock| {
+                    let ([item], [terminated]) = (arm.items.as_slice(), arm.terminated_items.as_slice()) else {
+                        return None;
+                    };
+                    let claim = proof_show_expression(item, *terminated).ok()?;
+                    let ScalarExpression::Binary { operator, .. } = claim else { return None; };
+                    IntegerRelation::from_operator(operator)?;
+                    Some((claim, operator))
+                };
+                if let (Some((yes, yes_operator)), Some((no, no_operator))) =
+                    (comparison_claim(then_branch), comparison_claim(else_branch))
+                {
+                    if *yes_operator != BinaryOperator::Equal || *no_operator != BinaryOperator::Equal {
+                        if let CheckerPredicate::Integer(guard) = guard {
+                            if is_null_literal_name(output) || inputs.iter().any(|name| is_null_literal_name(name)) {
+                                return Err(ProjectCheck::InvalidProof);
+                            }
+                            if guard.ty != *ty {
+                                return Err(ProjectCheck::Unsupported);
+                            }
+                            let yes = typed_output_atom(yes, output, inputs, ty)?;
+                            let no = typed_output_atom(no, output, inputs, ty)?;
+                            return Ok(IntegerShowProof::GuardedOutput { guard, yes, no });
+                        }
+                    }
+                }
+            }
             Ok(IntegerShowProof::Conditional {
                 guard,
                 then_claim: proof_show_claim(then_branch, inputs, output, ty, body, bindings)?,

@@ -1064,6 +1064,46 @@ fn named_proof_show_old_checks_immutable_entry_and_independent_output_bound() {
 }
 
 #[test]
+fn named_proof_show_guarded_implications_preserve_exact_integer_paths() {
+    let identity = source();
+    let check = |target: &str, where_guard: &str, ensures: &str, guard: &str, yes: &str, no: &str| {
+        check_scalar_module_proof(
+            identity.clone(), "demonstrate",
+            vec![ScalarProofModuleInput {
+                source: identity.clone(),
+                text: format!(r#"%%start
+                    i16(i16) echo = fn(value) {{ value }};
+                    i16(i16) fixed = fn(value) {{ if (value == 0) {{}}; 7 }};
+                    i16(i16, i16) const_first = fn(tag, original) {{
+                        if (original == 0) {{}}; if (tag == 0) {{ 7 }} else {{ tag }}
+                    }};
+                    i16(i16, i16) alias_first = fn(tag, original) {{
+                        if (original == 0) {{}}; if (tag == 0) {{ tag }} else {{ 7 }}
+                    }};
+                    proof demonstrate for {target} -> (out) where ({where_guard}) ensures ({ensures}) {{
+                        if ({guard}) {{ core.show({yes}); }} else {{ core.show({no}); }}
+                    }}
+                %%end"#),
+                namespaces: Vec::new(),
+            }],
+            vec![identity.clone()], ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
+        )
+    };
+    let scope = "value >= -8 && value <= 7";
+    assert_eq!(check("echo(value)", scope, "out <= 7", "value > -1", "out >= 0", "out < 0"), ScalarModuleProofOutcome::Proved);
+    assert_eq!(check("echo(value)", scope, "out <= 7", "value > -2", "out >= 0", "out < 0"), ScalarModuleProofOutcome::Refuted);
+    assert_eq!(check("echo(value)", "value != -1", "out <= 32767",
+        "value > -2", "out >= 0", "out < 0"), ScalarModuleProofOutcome::Proved);
+    assert_eq!(check("echo(value)", scope, "out < 7", "value > -1", "out >= 0", "out < 0"), ScalarModuleProofOutcome::Refuted);
+    assert_eq!(check("fixed(value)", "value <= -1", "out <= 7", "value > -1", "out < 0", "out <= 7"), ScalarModuleProofOutcome::Proved);
+    assert_eq!(check("fixed(value)", "false", "out <= 7", "value > -1", "out < 0", "out <= 7"), ScalarModuleProofOutcome::NoApplicableInputs);
+    for target in ["const_first(tag, value)", "alias_first(tag, value)"] {
+        assert_eq!(check(target, "value == 0", "out <= 6", "value > -1", "out < 0", "out <= 7"), ScalarModuleProofOutcome::Unsupported);
+    }
+    assert!(matches!(check("echo(value)", scope, "out <= 7", "value > -1", "out >= 32768", "out < 0"), ScalarModuleProofOutcome::Invalid(_)));
+}
+
+#[test]
 fn named_proof_show_mixed_alternatives_preserve_clause_precedence_and_holes() {
     let identity = source();
     let check = |guard: &str, ensures: &str, claim: &str| {

@@ -445,6 +445,12 @@ pub(super) enum IntegerShowProof<'a> {
     Output(IntegerShowOutput),
     #[cfg(feature = "internal-checker")]
     EntryComparison { binding: &'a ReferenceBindingId, relation: IntegerRelation },
+    #[cfg(feature = "internal-checker")]
+    GuardedOutput {
+        guard: IntegerPredicate,
+        yes: (IntegerRelation, BigInt),
+        no: (IntegerRelation, BigInt),
+    },
     Conditional {
         guard: CheckerPredicate,
         then_claim: IntegerReturn<'a>,
@@ -483,6 +489,69 @@ impl IntegerShowOutput {
             Self::Alternatives { atoms, clause_ends } =>
                 IntegerSet::comparison_alternatives(ty, Self::clauses(atoms, clause_ends)),
             _ => None,
+        }
+    }
+}
+
+// Regions induced by two checked integer cuts. The middle region exists only
+// when the two distinct cuts are not consecutive. No interval endpoints or
+// caller rows are manufactured to test these proof-only implications.
+#[cfg(feature = "internal-checker")]
+struct ForbiddenCutPair<'a> {
+    lower: &'a BigInt,
+    upper: &'a BigInt,
+    mask: [bool; 5],
+}
+
+#[cfg(feature = "internal-checker")]
+impl<'a> ForbiddenCutPair<'a> {
+    fn new(first: (IntegerRelation, &'a BigInt), second: (IntegerRelation, &'a BigInt)) -> Self {
+        use std::cmp::Ordering::{Equal, Greater, Less};
+        let ((low, lower), (high, upper)) = if first.1 <= second.1 { (first, second) } else { (second, first) };
+        let accepts = |a, b| low.accepts(a) && high.accepts(b);
+        let mask = if lower == upper {
+            [accepts(Less, Less), accepts(Equal, Equal), false, false, accepts(Greater, Greater)]
+        } else {
+            [accepts(Less, Less), accepts(Equal, Less),
+             accepts(Greater, Less) && !consecutive_integer_cuts(lower, upper),
+             accepts(Greater, Equal), accepts(Greater, Greater)]
+        };
+        Self { lower, upper, mask }
+    }
+
+    fn hits(&self, first: &BigInt, last: &BigInt) -> bool {
+        let contains = |cut| first <= cut && cut <= last;
+        (self.mask[0] && first < self.lower)
+            || (self.mask[1] && contains(self.lower))
+            || (self.mask[2] && first < self.upper && last > self.lower)
+            || (self.mask[3] && contains(self.upper))
+            || (self.mask[4] && last > self.upper)
+    }
+}
+
+#[cfg(feature = "internal-checker")]
+fn consecutive_integer_cuts(lower: &BigInt, upper: &BigInt) -> bool {
+    use num_bigint::Sign::Minus;
+    // An ordered pair crossing from negative to nonnegative is consecutive
+    // only at -1 and 0. Within one sign, advance the smaller magnitude.
+    let (smaller, larger) = match (lower.sign() == Minus, upper.sign() == Minus) {
+        (true, false) => return upper.bits() == 0 && lower.bits() == 1,
+        (true, true) => (upper, lower),
+        _ => (lower, upper),
+    };
+    let mut left = smaller.iter_u64_digits();
+    let mut right = larger.iter_u64_digits();
+    let mut carry = true;
+    loop {
+        match (left.next(), right.next()) {
+            (None, None) => return !carry,
+            (Some(a), Some(b)) => {
+                let (sum, next) = a.overflowing_add(u64::from(carry));
+                if sum != b { return false; }
+                carry = next;
+            }
+            (None, Some(1)) if carry => return right.next().is_none(),
+            _ => return false,
         }
     }
 }
@@ -647,7 +716,8 @@ impl IntegerReturningPath<'_> {
             IntegerShowProof::Equality(claim) => return shows_return_equality(&self.state, &self.axes, &self.value, claim),
             IntegerShowProof::Sequence(_) => return None,
             #[cfg(feature = "internal-checker")]
-            IntegerShowProof::Output(_) | IntegerShowProof::EntryComparison { .. } => return None,
+            IntegerShowProof::Output(_) | IntegerShowProof::EntryComparison { .. }
+            | IntegerShowProof::GuardedOutput { .. } => return None,
             IntegerShowProof::Conditional { guard, then_claim, else_claim } => (guard, then_claim, else_claim),
         };
         let (yes, no) = match guard {
@@ -1063,6 +1133,46 @@ fn check_integer_return_bound_in_scope<'a>(
         let mut proved = true;
         for path in &paths {
             proved = path.entry_show_with_output_bound(binding, *entry_relation, relation, bound, proved)?;
+        }
+        return Some(Ok(ProofCoverage::Applicable(proved)));
+    }
+    #[cfg(feature = "internal-checker")]
+    if let Some(IntegerShowProof::GuardedOutput { guard, yes, no }) = proof {
+        let guard_relation = IntegerRelation::from_operator(&guard.operator)?;
+        let mut forbidden_cuts = None;
+        let mut proved = true;
+        for path in &paths {
+            if matches!(path.value, IntegerReturn::Alias(alias) if *alias != guard.binding) {
+                return None;
+            }
+            if !proved {
+                continue; // Still inspect later return identities for unsupported aliases.
+            }
+            let axis = path.axes.iter().position(|binding| **binding == guard.binding)?;
+            proved = match path.value {
+                IntegerReturn::Alias(_) => path.state.0.iter().all(|row| row[axis].intervals().all(|(first, last)| {
+                    relation.accepts_closed(first, last, bound) && {
+                        let (yes_cut, no_cut) = forbidden_cuts.get_or_insert_with(|| (
+                            ForbiddenCutPair::new((guard_relation, &guard.bound), (yes.0.complement(), &yes.1)),
+                            ForbiddenCutPair::new((guard_relation.complement(), &guard.bound), (no.0.complement(), &no.1)),
+                        ));
+                        !yes_cut.hits(first, last) && !no_cut.hits(first, last)
+                    }
+                })),
+                IntegerReturn::Const(value) if relation.accepts(value.cmp(bound)) => {
+                    let yes_ok = yes.0.accepts(value.cmp(&yes.1));
+                    let no_ok = no.0.accepts(value.cmp(&no.1));
+                    match (yes_ok, no_ok) {
+                        (true, true) => true,
+                        (false, false) => false,
+                        _ => {
+                            let allowed = if yes_ok { guard_relation } else { guard_relation.complement() };
+                            path.state.0.iter().all(|row| row[axis].every_at_extremes(allowed, &guard.bound))
+                        }
+                    }
+                }
+                IntegerReturn::Const(_) => false,
+            };
         }
         return Some(Ok(ProofCoverage::Applicable(proved)));
     }
@@ -1568,6 +1678,36 @@ fn projected_axis_restriction_reuses_unchanged_rc_and_preserves_correlated_rows(
     assert!(!Rc::ptr_eq(&second[0], &to_change));
     assert_eq!(*second[0], range(5, 5).join(range(7, 8)));
     assert!(Rc::ptr_eq(&second[1], &changed_other));
+}
+
+#[cfg(all(test, feature = "internal-checker"))]
+#[test]
+fn guarded_output_cut_pairs_match_small_closed_integer_ranges() {
+    use BinaryOperator::{Equal, Greater, GreaterEqual, Less, LessEqual, NotEqual};
+    let relations = [Equal, Greater, GreaterEqual, Less, LessEqual, NotEqual]
+        .map(|op| IntegerRelation::from_operator(&op).unwrap());
+    let points: Vec<_> = (-3..=3).map(BigInt::from).collect();
+    for left in &points {
+        for right in &points {
+            for a in relations {
+                for b in relations {
+                    let query = ForbiddenCutPair::new((a, left), (b, right));
+                    for lo in 0..points.len() {
+                        for hi in lo..points.len() {
+                            let expected = points[lo..=hi].iter().any(|n|
+                                a.accepts(n.cmp(left)) && b.accepts(n.cmp(right)));
+                            assert_eq!(query.hits(&points[lo], &points[hi]), expected);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let wide = BigInt::from(1u128 << 64);
+    let previous = &wide - 1u8;
+    assert!(consecutive_integer_cuts(&previous, &wide));
+    assert!(consecutive_integer_cuts(&(-&wide), &(-&previous)));
+    assert!(!consecutive_integer_cuts(&(&previous - 1u8), &wide));
 }
 
 #[cfg(all(test, feature = "internal-checker"))]
