@@ -1,5 +1,6 @@
 use super::*;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct Loan {
     owner: usize,
     issued: CfgPointId,
@@ -15,6 +16,35 @@ struct Install {
 struct Holder {
     writes: Vec<Install>,
     reads: Vec<CfgPointId>,
+    arms: Option<Box<ArmRuns>>,
+}
+
+struct ArmRun {
+    start: usize,
+    end: usize,
+    fork: usize,
+}
+
+#[derive(Default)]
+struct ArmRuns {
+    reads: Vec<ArmRun>,
+    writes: Vec<ArmRun>,
+}
+
+fn record_arm(runs: &mut Vec<ArmRun>, index: usize, fork: usize) {
+    if let Some(run) = runs.last_mut().filter(|run| run.end == index && run.fork == fork) {
+        run.end += 1;
+    } else {
+        runs.push(ArmRun { start: index, end: index + 1, fork });
+    }
+}
+
+fn next_arm(runs: &mut &[ArmRun], index: usize) -> Option<usize> {
+    while let Some((run, remaining)) = runs.split_first() {
+        if index < run.end { return (index >= run.start).then_some(run.fork); }
+        *runs = remaining;
+    }
+    None
 }
 
 struct Fork {
@@ -29,6 +59,8 @@ struct Forks {
 }
 
 impl Forks {
+    fn len(&self) -> usize { usize::from(self.first.is_some()) + self.later.len() }
+
     fn last(&self) -> Option<&Fork> {
         self.later.last().or(self.first.as_ref())
     }
@@ -49,7 +81,6 @@ pub(crate) struct Author {
     holders: BTreeMap<ReferenceBindingId, Holder>,
     owners: HashMap<ReferenceBindingId, usize>,
     forks: Forks,
-    arm_install: bool,
     branch: Option<CfgPointId>,
     join: Option<CfgPointId>,
     root_exit: Option<CfgPointId>,
@@ -91,7 +122,7 @@ impl Author {
             CfgPointKind::Read { binding } => match types.get(binding) {
                 Some(ScalarType::CheckedReference { .. }) => {
                     let Some(holder) = self.holders.get_mut(binding) else { return false };
-                    holder.reads.push(id);
+                    holder.record_read(id, self.branch.map(|_| self.forks.len()));
                     true
                 }
                 Some(ty) => aggregate::ordinary_value(ty),
@@ -132,7 +163,7 @@ impl Author {
             return false;
         }
         self.holders.insert(binding.clone(), Holder {
-            writes: vec![Install { version, loan }], reads: Vec::new(),
+            writes: vec![Install { version, loan }], ..Holder::default()
         });
         true
     }
@@ -143,8 +174,7 @@ impl Author {
         if rhs != loan.issued || loan.issued.0 + 1 != version.0 {
             return false;
         }
-        self.arm_install |= self.branch.is_some();
-        holder.writes.push(Install { version, loan });
+        holder.record_install(Install { version, loan }, self.branch.map(|_| self.forks.len()));
         true
     }
 
@@ -169,7 +199,7 @@ impl Author {
     pub(super) fn fork(&mut self, edges: &ReferenceConditionalEdges, points: &[ReferenceFlowPoint]) -> bool {
         if edges.terminals[1] != edges.branch
             || self.branch != Some(edges.branch) || self.join != Some(edges.join)
-            || self.forks.last().is_some_and(|prior| prior.join >= edges.branch || self.arm_install)
+            || self.forks.last().is_some_and(|prior| prior.join >= edges.branch)
         {
             return false;
         }
@@ -189,12 +219,9 @@ impl Author {
     }
 
     pub(super) fn seal(self, points: &[ReferenceFlowPoint]) -> Option<Box<Sealed>> {
-        if self.branch.is_some() || self.join.is_some() || (self.arm_install && !self.forks.later.is_empty()) {
+        if self.branch.is_some() || self.join.is_some() {
             return None;
         }
-        // With no arm installs, every holder version dominates all paths until
-        // its next install. Later reads can be reached by taking each unit arm.
-        let alternate = self.forks.first.as_ref().filter(|_| self.arm_install);
         let exit = self.root_exit?;
         if self.pending_loan.is_some() || self.pending_exit.is_some() || exit != points.last()?.id {
             return None;
@@ -202,15 +229,33 @@ impl Author {
         let mut owners = (0..self.owners.len()).map(|_| Owner::default()).collect::<Vec<_>>();
         let mut holders = Vec::with_capacity(self.holders.len());
         for (_, holder) in self.holders {
-            // Both passes visit the authored holder events, never the complete CFG.
-            // An install generates its owner on its actual arm; the next
-            // reachable install or the root exit retires that holder's version.
             let mut live = Vec::new();
-            for &route in Route::feasible(alternate) {
-                holder.leases(alternate, route, exit, |install, end, last_read| {
+            let (_, mut write_arms) = holder.arm_runs();
+            if !write_arms.is_empty() {
+                let mut retirement = exit;
+                for (index, install) in holder.writes.iter().enumerate().rev() {
+                    while write_arms.last().is_some_and(|run| run.start > index) {
+                        write_arms = &write_arms[..write_arms.len() - 1];
+                    }
+                    let start = CfgPointId(install.version.0 + 1);
+                    if start < retirement {
+                        owners[install.loan.owner].active[usize::from(install.loan.mutable)]
+                            .push(Interval { start, end: retirement });
+                    }
+                    if write_arms.last().is_none_or(|run| !(run.start..run.end).contains(&index)) {
+                        retirement = install.version;
+                    }
+                }
+                if let Some(&end) = holder.reads.last() {
+                    let start = CfgPointId(holder.writes[0].version.0 + 1);
+                    if start < end { live.push(Interval { start, end }); }
+                }
+            } else {
+                holder.linear_leases(exit, |install, end, last_read| {
                     let start = CfgPointId(install.version.0 + 1);
                     if start < end {
-                        owners[install.loan.owner].active[usize::from(install.loan.mutable)].push(Interval { start, end });
+                        owners[install.loan.owner].active[usize::from(install.loan.mutable)]
+                            .push(Interval { start, end });
                     }
                     if let Some(end) = last_read.filter(|last| start < *last) {
                         live.push(Interval { start, end });
@@ -238,46 +283,42 @@ impl Author {
         for owner in &mut owners {
             for active in &mut owner.active { compact(active); }
         }
-        Some(Box::new(Sealed { exit, forks: self.forks, arm_install: self.arm_install, holders, owner_index: self.owners, owners }))
-    }
-}
-
-#[derive(Clone, Copy)]
-enum Route {
-    Then,
-    Bypass,
-}
-
-impl Fork {
-    fn takes_then_at(&self, point: CfgPointId) -> bool {
-        self.branch < point && point < self.join
-    }
-}
-
-impl Route {
-    fn feasible(fork: Option<&Fork>) -> &'static [Self] {
-        if fork.is_some() { &[Self::Then, Self::Bypass] } else { &[Self::Then] }
-    }
-
-    fn reaches(self, fork: Option<&Fork>, point: CfgPointId) -> bool {
-        matches!(self, Self::Then) || fork.is_none_or(|fork| !fork.takes_then_at(point))
+        Some(Box::new(Sealed { exit, forks: self.forks, holders, owner_index: self.owners, owners }))
     }
 }
 
 impl Holder {
-    fn leases(
-        &self, fork: Option<&Fork>, route: Route, exit: CfgPointId,
-        mut visit: impl FnMut(&Install, CfgPointId, Option<CfgPointId>),
+    fn record_read(&mut self, point: CfgPointId, arm: Option<usize>) {
+        if let Some(fork) = arm {
+            record_arm(&mut self.arms.get_or_insert_with(Box::default).reads, self.reads.len(), fork);
+        }
+        self.reads.push(point);
+    }
+
+    fn record_install(&mut self, install: Install, arm: Option<usize>) {
+        if let Some(fork) = arm {
+            record_arm(&mut self.arms.get_or_insert_with(Box::default).writes, self.writes.len(), fork);
+        }
+        self.writes.push(install);
+    }
+
+    fn arm_runs(&self) -> (&[ArmRun], &[ArmRun]) {
+        match self.arms.as_deref() {
+            Some(arms) => (&arms.reads, &arms.writes),
+            None => (&[], &[]),
+        }
+    }
+
+    fn linear_leases(
+        &self, exit: CfgPointId, mut visit: impl FnMut(&Install, CfgPointId, Option<CfgPointId>),
     ) {
-        let mut writes = self.writes.iter().filter(|write| route.reaches(fork, write.version)).peekable();
-        let mut reads = self.reads.iter().copied().filter(|&read| route.reaches(fork, read)).peekable();
+        let mut writes = self.writes.iter().peekable();
+        let mut reads = self.reads.iter().copied().peekable();
         while let Some(write) = writes.next() {
             let end = writes.peek().map_or(exit, |next| next.version);
             let mut last = None;
             while let Some(read) = reads.next_if(|read| *read < end) {
-                if write.version < read {
-                    last = Some(read);
-                }
+                if write.version < read { last = Some(read); }
             }
             visit(write, end, last);
         }
@@ -313,41 +354,174 @@ fn contains(intervals: &[Interval], point: CfgPointId) -> bool {
 struct LiveHolder {
     holder: Holder,
     live: Vec<Interval>,
-    refined: std::sync::OnceLock<BTreeMap<usize, CarrierRefinement>>,
+    refined: std::sync::OnceLock<Option<Refinement>>,
 }
 
-struct ReachingLoan {
+struct LinearLease {
     interval: Interval,
-    issue: CfgPointId,
-    mutable: bool,
+    loan: Loan,
 }
 
-#[derive(Default)]
-struct CarrierRefinement {
-    then: Vec<ReachingLoan>,
-    bypass: Vec<ReachingLoan>,
+enum Refinement {
+    Linear(Vec<LinearLease>),
+    Branching(Vec<Boundary>),
 }
 
-impl CarrierRefinement {
-    fn at(&self, point: CfgPointId, sole_route: bool, post_join: bool, mode: AccessMode) -> Option<Option<CfgPointId>> {
-        fn at_path(facts: &[ReachingLoan], point: CfgPointId, mode: AccessMode) -> Option<CfgPointId> {
-            let end = facts.partition_point(|fact| fact.interval.start <= point);
-            let fact = end.checked_sub(1).and_then(|index| facts.get(index))?;
-            (point < fact.interval.end && mode.accepts(fact.mutable)).then_some(fact.issue)
-        }
-        let then = at_path(&self.then, point, mode);
-        if sole_route {
-            return Some(then);
-        }
-        let bypass = at_path(&self.bypass, point, mode);
-        if post_join {
-            // Independent of route, including when the incumbent deduplicates states.
-            (then == bypass).then_some(then)
-        } else {
-            // Before the fork, a single version can have a future use on either route.
-            Some(then.or(bypass))
+impl Refinement {
+    fn facts_at(&self, point: CfgPointId) -> (Reaching, bool) {
+        match self {
+            Self::Linear(facts) => {
+                let end = facts.partition_point(|fact| fact.interval.start <= point);
+                match end.checked_sub(1).and_then(|index| facts.get(index)) {
+                    Some(fact) if point < fact.interval.end => (Reaching::One(fact.loan), true),
+                    _ => (Reaching::Absent, false),
+                }
+            }
+            Self::Branching(events) => access_facts(events, point),
         }
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Reaching {
+    Absent,
+    One(Loan),
+    Diverse,
+}
+
+#[derive(Clone, Copy)]
+enum Event {
+    Read,
+    Install(Loan),
+    Branch,
+    Join,
+}
+
+struct Boundary {
+    point: CfgPointId,
+    event: Event,
+    reaching_before: Reaching,
+    reaching_after: Reaching,
+    live_before: bool,
+    live_after: bool,
+}
+
+impl Boundary {
+    fn new(point: CfgPointId, event: Event) -> Self {
+        Self {
+            point, event, reaching_before: Reaching::Absent, reaching_after: Reaching::Absent,
+            live_before: false, live_after: false,
+        }
+    }
+}
+
+impl Holder {
+    fn refine(&self, forks: &Forks, exit: CfgPointId) -> Option<Refinement> {
+        if self.arm_runs().1.is_empty() {
+            let mut leases = Vec::new();
+            self.linear_leases(exit, |install, _, last_read| {
+                let start = CfgPointId(install.version.0 + 1);
+                if let Some(end) = last_read.filter(|&last| start < last) {
+                    leases.push(LinearLease { interval: Interval { start, end }, loan: install.loan });
+                }
+            });
+            return Some(Refinement::Linear(leases));
+        }
+        self.branch_boundaries(forks).map(Refinement::Branching)
+    }
+
+    fn branch_boundaries(&self, forks: &Forks) -> Option<Vec<Boundary>> {
+        let mut writes = self.writes.iter().enumerate().peekable();
+        let mut reads = self.reads.iter().copied().enumerate().peekable();
+        let (mut read_arms, mut write_arms) = self.arm_runs();
+        let mut events = Vec::new();
+        let mut current_arm: Option<usize> = None;
+        while writes.peek().is_some() || reads.peek().is_some() {
+            let (point, arm, event) = if reads.peek().is_some_and(|read|
+                writes.peek().is_none_or(|write| read.1 < write.1.version))
+            {
+                let (index, point) = reads.next()?;
+                (point, next_arm(&mut read_arms, index), Event::Read)
+            } else {
+                let (index, write) = writes.next()?;
+                (write.version, next_arm(&mut write_arms, index), Event::Install(write.loan))
+            };
+            if arm != current_arm {
+                if let Some(previous) = current_arm {
+                    let join = forks.get(previous)?.join;
+                    if join > point { return None; }
+                    events.push(Boundary::new(join, Event::Join));
+                }
+                if let Some(new) = arm {
+                    let fork = forks.get(new)?;
+                    if events.last().is_some_and(|boundary| boundary.point >= fork.branch) {
+                        return None;
+                    }
+                    events.push(Boundary::new(fork.branch, Event::Branch));
+                }
+                current_arm = arm;
+            }
+            if let Some(arm) = arm {
+                let fork = forks.get(arm)?;
+                if point <= fork.branch || point >= fork.join { return None; }
+            }
+            if events.last().is_some_and(|boundary| boundary.point >= point) { return None; }
+            events.push(Boundary::new(point, event));
+        }
+        if let Some(last) = current_arm {
+            events.push(Boundary::new(forks.get(last)?.join, Event::Join));
+        }
+
+        let mut reaching = Reaching::Absent;
+        let mut bypass = None;
+        for boundary in &mut events {
+            match boundary.event {
+                Event::Join => {
+                    if bypass.take()? != reaching { reaching = Reaching::Diverse; }
+                }
+                Event::Branch => {
+                    if bypass.replace(reaching).is_some() { return None; }
+                }
+                Event::Read | Event::Install(_) => {}
+            }
+            boundary.reaching_before = reaching;
+            if let Event::Install(loan) = boundary.event { reaching = Reaching::One(loan); }
+            boundary.reaching_after = reaching;
+        }
+        if bypass.is_some() { return None; }
+
+        let mut live = false;
+        let mut bypass = None;
+        for boundary in events.iter_mut().rev() {
+            match boundary.event {
+                Event::Branch => live |= bypass.take()?,
+                Event::Join => {
+                    if bypass.replace(live).is_some() { return None; }
+                }
+                Event::Read | Event::Install(_) => {}
+            }
+            boundary.live_after = live;
+            match boundary.event {
+                Event::Read => live = true,
+                Event::Install(_) => live = false,
+                Event::Branch | Event::Join => {}
+            }
+            boundary.live_before = live;
+        }
+        if bypass.is_some() { return None; }
+        Some(events)
+    }
+}
+
+fn access_facts(boundaries: &[Boundary], point: CfgPointId) -> (Reaching, bool) {
+    let after = boundaries.partition_point(|boundary| boundary.point < point);
+    if let Some(boundary) = boundaries.get(after).filter(|boundary| boundary.point == point) {
+        return (boundary.reaching_before, boundary.live_after);
+    }
+    let reaching = after.checked_sub(1).and_then(|index| boundaries.get(index))
+        .map_or(Reaching::Absent, |boundary| boundary.reaching_after);
+    let live = boundaries.get(after).is_some_and(|boundary| boundary.live_before);
+    (reaching, live)
 }
 
 #[derive(Default)]
@@ -371,7 +545,6 @@ impl AccessMode {
 pub(crate) struct Sealed {
     exit: CfgPointId,
     forks: Forks,
-    arm_install: bool,
     holders: Vec<LiveHolder>,
     owner_index: HashMap<ReferenceBindingId, usize>,
     owners: Vec<Owner>,
@@ -399,17 +572,10 @@ impl Sealed {
     }
 
     pub(super) fn conflicts(
-        &self, owner: &ReferenceBindingId, access: CfgPointId, incoming_count: usize,
+        &self, owner: &ReferenceBindingId, access: CfgPointId, _incoming_count: usize,
         points: &[ReferenceFlowPoint],
         mode: AccessMode,
     ) -> Option<Vec<SourceSpan>> {
-        let alternate = self.forks.first.as_ref().filter(|_| self.arm_install);
-        let post_join = alternate.is_some_and(|fork| access > fork.join);
-        if incoming_count != 1 && alternate.is_some() && !post_join {
-            #[cfg(test)]
-            tests::observe(3);
-            return None;
-        }
         let Some(&owner_index) = self.owner_index.get(owner) else { return Some(Vec::new()) };
         let summary = &self.owners[owner_index];
         // Function-wide subset forgets versions. Edge generation/retirement and
@@ -429,38 +595,26 @@ impl Sealed {
         }
         #[cfg(test)]
         tests::observe(if borrow { 6 } else { 1 });
-        let sole_route = alternate.is_none_or(|fork| fork.takes_then_at(access));
         let mut conflicts = Vec::new();
         // Carrier indices were assigned by the authored BTreeMap in binding order.
         for holder in carriers {
             let entry = &self.holders[holder];
-            let precise = entry.refined.get_or_init(|| {
+            let Some(precise) = entry.refined.get_or_init(|| {
                 #[cfg(test)]
                 tests::observe(2);
-                let mut by_owner = BTreeMap::<usize, CarrierRefinement>::new();
-                for &route in Route::feasible(alternate) {
-                    entry.holder.leases(alternate, route, self.exit, |install, _, last_read| {
-                        let start = CfgPointId(install.version.0 + 1);
-                        let Some(end) = last_read.filter(|&last| start < last) else { return };
-                        let carrier = by_owner.entry(install.loan.owner).or_default();
-                        let facts = match route {
-                            Route::Then => &mut carrier.then,
-                            Route::Bypass => &mut carrier.bypass,
-                        };
-                        facts.push(ReachingLoan {
-                            interval: Interval { start, end }, issue: install.loan.issued, mutable: install.loan.mutable,
-                        });
-                    });
+                entry.holder.refine(&self.forks, self.exit)
+            }) else { return None };
+            let (reaching, live) = precise.facts_at(access);
+            if !live { continue; }
+            let issue = match reaching {
+                Reaching::One(loan) if loan.owner == owner_index && mode.accepts(loan.mutable) => loan.issued,
+                Reaching::Diverse => {
+                    #[cfg(test)]
+                    tests::observe(3);
+                    return None;
                 }
-                by_owner
-            });
-            let Some(carrier) = precise.get(&owner_index) else { continue };
-            let Some(issue) = carrier.at(access, sole_route, post_join, mode) else {
-                #[cfg(test)]
-                tests::observe(3);
-                return None;
+                Reaching::Absent | Reaching::One(_) => continue,
             };
-            let Some(issue) = issue else { continue };
             let CfgPointKind::Borrow { place, loan } = &points.get(issue.0)?.kind else {
                 return None;
             };
@@ -546,7 +700,8 @@ pub(super) mod tests {
             loan: loan.clone(),
         });
         let origins = BTreeSet::from([id]);
-        let point = builder.point(CfgPointKind::Borrow { place, loan }, span, ReferenceScopeId(0), origins.clone());
+        let scope = builder.cursor.map_or(ReferenceScopeId(0), |id| builder.cfg.points[id.0].scope);
+        let point = builder.point(CfgPointKind::Borrow { place, loan }, span, scope, origins.clone());
         (point, origins)
     }
 
@@ -583,6 +738,7 @@ pub(super) mod tests {
             for (occurrence, owner) in [(1, &x), (3, &y), (5, &x), (15, &y), (34, &z), (76, &z)] {
                 roots.insert(OccurrenceOrdinal(occurrence), NamedPlaceRootIdentity::Lexical(owner.clone()));
             }
+            if sequential && divergent { roots.insert(OccurrenceOrdinal(80), NamedPlaceRootIdentity::Lexical(z.clone())); }
             if borrow_matrix {
                 for occurrence in 40..=44 {
                     roots.insert(OccurrenceOrdinal(occurrence), NamedPlaceRootIdentity::Lexical(z.clone()));
@@ -708,6 +864,16 @@ pub(super) mod tests {
             builder.point(CfgPointKind::Bind { binding: local.clone() }, at(79), second_arm, BTreeSet::new());
             builder.point(CfgPointKind::Read { binding: h2.clone() }, at(14), second_arm, origins);
             builder.point(CfgPointKind::Read { binding: h3.clone() }, at(16), second_arm, third_origins);
+            if divergent {
+                let (rhs, origins) = loan(&mut builder, &z, at(76));
+                let target = builder.reference_place(&ScalarPlace::Name { name: "h1".into(), span: at(77) }, h1.clone(), None);
+                let emitted = builder.emit_direct_assignment(h1.clone(), CfgPointKind::Assign {
+                    target, rhs_point: rhs, previous_origins: BTreeSet::new(), previous_loans: vec![],
+                }, rhs, ReferenceValue::Checked(origins.clone()), at(77), second_arm).expect("typed second-arm assignment");
+                builder.author_direct_assignment(emitted, prepared_existing);
+                builder.point(CfgPointKind::Read { binding: z.clone() }, at(74), second_arm, BTreeSet::new());
+                builder.point(CfgPointKind::Read { binding: h1.clone() }, at(78), second_arm, origins);
+            }
             if let Some(origins) = between {
                 builder.point(CfgPointKind::Read { binding: h1.clone() }, at(78), second_arm, origins);
             }
@@ -722,6 +888,16 @@ pub(super) mod tests {
                 &ReferenceConditionalEdges { branch, terminals: [then_end, branch], join },
                 &calls.conditionals[&OccurrenceOrdinal(8)],
             );
+            if divergent {
+                let (rhs, origins) = loan(&mut builder, &z, at(80));
+                let target = builder.reference_place(&ScalarPlace::Name { name: "h1".into(), span: at(81) }, h1.clone(), None);
+                let emitted = builder.emit_direct_assignment(h1.clone(), CfgPointKind::Assign {
+                    target, rhs_point: rhs, previous_origins: BTreeSet::new(), previous_loans: vec![],
+                }, rhs, ReferenceValue::Checked(origins.clone()), at(81), root).expect("typed join-restoring assignment");
+                builder.author_direct_assignment(emitted, prepared_existing);
+                builder.point(CfgPointKind::Read { binding: z.clone() }, at(82), root, BTreeSet::new());
+                builder.point(CfgPointKind::Read { binding: h1.clone() }, at(83), root, origins);
+            }
         } else {
             builder.point(CfgPointKind::Read { binding: h2.clone() }, at(14), root, origins);
             builder.point(CfgPointKind::Read { binding: h3.clone() }, at(16), root, third_origins);
@@ -883,15 +1059,26 @@ pub(super) mod tests {
         let mut branch_store_incumbent = inert_result(false, true, false, false, true);
         let sealed = admitted.proof_points.local_borrow.as_ref().expect("complete fork sequence");
         assert_eq!(sealed.forks.later.len(), 1);
-        assert!(!sealed.arm_install);
-        assert_eq!(Route::feasible(sealed.forks.first.as_ref().filter(|_| sealed.arm_install)).len(), 1);
+        assert!(sealed.holders.iter().all(|holder| holder.holder.arm_runs().1.is_empty()));
         assert!(incumbent.proof_points.local_borrow.is_none());
-        assert!(branch_store.proof_points.local_borrow.is_none());
+        assert!(branch_store.proof_points.local_borrow.is_some());
         COUNTS.with(|counts| counts.set([0; 7]));
         let staged = definitive(&mut admitted);
         let counts = COUNTS.with(|counts| counts.get());
         assert_eq!(staged, definitive(&mut incumbent));
-        assert_eq!(definitive(&mut branch_store), definitive(&mut branch_store_incumbent));
+        COUNTS.with(|counts| counts.set([0; 7]));
+        let overwritten = definitive(&mut branch_store);
+        let overwrite_counts = COUNTS.with(|counts| counts.get());
+        assert_eq!(overwritten, definitive(&mut branch_store_incumbent));
+        assert!(overwrite_counts[3] > 0);
+        let spans_at = |start| overwritten.iter().find_map(|error| match error {
+            ReferenceAnalysisError::ConflictingPlace { source_span, origins }
+                if source_span.range == ByteSpan::new(start, start + 1) =>
+                Some(origins.iter().map(|span| span.range).collect::<Vec<_>>()),
+            _ => None,
+        });
+        assert_eq!(spans_at(74), Some(vec![ByteSpan::new(76, 77)]));
+        assert_eq!(spans_at(82), Some(vec![ByteSpan::new(80, 81)]));
         assert_eq!(counts[3], 0);
         assert!(counts[0] > 0 && counts[1] > 0);
         assert!(staged.iter().any(|error| matches!(error,
@@ -900,6 +1087,57 @@ pub(super) mod tests {
         assert!(!staged.iter().any(|error| matches!(error,
             ReferenceAnalysisError::ConflictingPlace { source_span, .. }
                 if source_span.range == ByteSpan::new(8, 9))));
+    }
+
+    #[test]
+    fn sparse_holder_boundaries_distinguish_entry_outgoing_and_bypass() {
+        let at = CfgPointId;
+        let old = Loan { owner: 0, issued: at(0), mutable: true };
+        let taken = Loan { owner: 1, issued: at(6), mutable: false };
+        let later = Loan { owner: 0, issued: at(15), mutable: true };
+        let mut holder = Holder::default();
+        holder.record_install(Install { version: at(1), loan: old }, None);
+        holder.record_install(Install { version: at(7), loan: taken }, Some(0));
+        holder.record_install(Install { version: at(16), loan: later }, None);
+        holder.record_read(at(8), Some(0));
+        holder.record_read(at(9), Some(0));
+        holder.record_read(at(12), None);
+        holder.record_read(at(18), None);
+        assert_eq!(holder.arm_runs().0.len(), 1);
+        let mut forks = Forks::default();
+        forks.push(Fork { branch: at(4), join: at(10) });
+        let facts = holder.refine(&forks, at(20)).expect("one authored fork");
+        assert!(matches!(&facts, Refinement::Branching(_)));
+        let cases = [
+            (3, Reaching::One(old), true), // Bypass can reach the post-join read.
+            (4, Reaching::One(old), true), // Branch query sees both successors.
+            (5, Reaching::One(old), false), // Taken lane on its way to retirement.
+            (7, Reaching::One(old), true), // Incoming version; future read starts after install.
+            (8, Reaching::One(taken), true),
+            (9, Reaching::One(taken), true), // Independent post-join read; not the read at 9.
+            (10, Reaching::Diverse, true), // Bypass retains old issue.
+            (11, Reaching::Diverse, true),
+            (12, Reaching::Diverse, false), // This read does not count itself.
+            (13, Reaching::Diverse, false),
+            (16, Reaching::Diverse, true), // Root install still sees incoming alternatives.
+            (17, Reaching::One(later), true),
+            (18, Reaching::One(later), false),
+            (19, Reaching::One(later), false),
+        ];
+        for (point, reaching, live) in cases {
+            let actual = facts.facts_at(at(point));
+            assert!(actual == (reaching, live), "point {point}");
+        }
+        assert!(!AccessMode::Shared.accepts(taken.mutable));
+        assert!(AccessMode::Exclusive.accepts(taken.mutable));
+        let mut linear = Holder::default();
+        linear.record_install(Install { version: at(1), loan: old }, None);
+        for point in 3..18 { linear.record_read(at(point), None); }
+        assert!(linear.arms.is_none());
+        let facts = linear.refine(&forks, at(20)).expect("linear compact lane");
+        assert!(matches!(&facts, Refinement::Linear(leases) if leases.len() == 1));
+        assert!(facts.facts_at(at(16)) == (Reaching::One(old), true));
+        assert!(facts.facts_at(at(17)) == (Reaching::Absent, false));
     }
 
 }
