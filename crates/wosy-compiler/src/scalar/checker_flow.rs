@@ -167,6 +167,15 @@ impl<'a> ScopedAuthoredReturn<'a> for NamedAuthoredReturn<'a> {
             if !matches!(operator, BinaryOperator::Add | BinaryOperator::Subtract) {
                 return None;
             }
+            if matches!(left.as_ref(), ScalarExpression::Binary { .. })
+                || matches!(right.as_ref(), ScalarExpression::Binary { .. })
+            {
+                let (min, max) = super::typecheck::integer_bounds(ty)?;
+                #[cfg(test)]
+                AUTHORED_RETURN_CALCULATIONS.with(|count| count.set(count.get() + 1));
+                return nested_authored_integer_return(&output.value, slot.expression, structure, ty,
+                    |value| value >= &min && value <= &max);
+            }
             let parent = OccurrenceParent::Expression(slot.expression);
             let typed_operand = |edge| {
                 let Some(OccurrenceNode::Expression(ordinal)) = structure.edges.get(&(parent, edge)) else { return false; };
@@ -190,6 +199,70 @@ impl<'a> ScopedAuthoredReturn<'a> for NamedAuthoredReturn<'a> {
                 else { left.as_ref() - right.as_ref() };
             fits(&value).then_some(value)
         }).as_ref()
+    }
+}
+
+#[cfg(feature = "internal-checker")]
+fn nested_authored_integer_return<'a>(
+    root: &'a ScalarExpression, root_ordinal: OccurrenceOrdinal, structure: &OccurrenceStructure,
+    ty: &ScalarType, fits: impl Fn(&BigInt) -> bool,
+) -> Option<BigInt> {
+    type Node<'a> = (&'a ScalarExpression, OccurrenceOrdinal);
+    enum Frame<'a> {
+        Left { right: Node<'a>, add: bool },
+        Right { left: Cow<'a, BigInt>, add: bool },
+    }
+    let mut stack = Vec::new();
+    let mut next = (root, root_ordinal);
+    loop {
+        let (expression, ordinal) = next;
+        if structure.checked_types.expressions.get(&ordinal) != Some(ty) {
+            return None;
+        }
+        if let ScalarExpression::Binary { operator, left, right, .. } = expression {
+            let add = match operator {
+                BinaryOperator::Add => true,
+                BinaryOperator::Subtract => false,
+                _ => return None,
+            };
+            let child = |edge| match structure.edges.get(&(OccurrenceParent::Expression(ordinal), edge)) {
+                Some(OccurrenceNode::Expression(ordinal)) => Some(*ordinal),
+                _ => None,
+            };
+            stack.push(Frame::Left { right: (right, child(OccurrenceEdge::BinaryRight)?), add });
+            next = (left, child(OccurrenceEdge::BinaryLeft)?);
+            continue;
+        }
+        let mut value = concrete_integer_literal(expression)?;
+        if !fits(&value) {
+            return None;
+        }
+        loop {
+            match stack.pop() {
+                Some(Frame::Left { right, add }) => {
+                    stack.push(Frame::Right { left: value, add });
+                    next = right;
+                    break;
+                }
+                Some(Frame::Right { left, add }) => {
+                    let computed = match (left, value, add) {
+                        (Cow::Owned(left), Cow::Owned(right), true) => left + right,
+                        (Cow::Owned(left), right, true) => left + right.as_ref(),
+                        (left, Cow::Owned(right), true) => right + left.as_ref(),
+                        (left, right, true) => left.as_ref() + right.as_ref(),
+                        (Cow::Owned(left), Cow::Owned(right), false) => left - right,
+                        (Cow::Owned(left), right, false) => left - right.as_ref(),
+                        (left, Cow::Owned(right), false) => left.as_ref() - right,
+                        (left, right, false) => left.as_ref() - right.as_ref(),
+                    };
+                    if !fits(&computed) {
+                        return None;
+                    }
+                    value = Cow::Owned(computed);
+                }
+                None => return Some(value.into_owned()),
+            }
+        }
     }
 }
 
