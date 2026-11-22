@@ -4,7 +4,7 @@ use std::process::ExitCode;
 
 use wosy_compiler::{
     check_loaded_scalar_ordered_local_proof_contexts, MainFlowProofReceipt, ScalarOrderedCheckerOutcome,
-    ScalarPreparationInputs, ScalarTargetLayout,
+    ScalarCheckerScope, ScalarPreparationInputs, ScalarTargetLayout,
 };
 use wosy_project::{ProjectConfiguration, ProjectContext};
 
@@ -30,6 +30,7 @@ fn inspect(root: &Path, target: &str, profile: &str) -> Result<MainFlowProofRece
     ).map_err(|_| "canonical source load failed")?;
     check_loaded_scalar_ordered_local_proof_contexts(
         loaded.declarations, loaded.proofs.into_values(), loaded.initialization_order, ScalarPreparationInputs { target_layout },
+        ScalarCheckerScope::CurrentPackage,
     ).map_err(|outcome| match outcome {
         ScalarOrderedCheckerOutcome::Invalid(_) => "checker rejected invalid input",
         _ => "checker did not complete analysis",

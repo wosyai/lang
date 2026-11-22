@@ -3152,9 +3152,10 @@ pub fn check_loaded_scalar_ordered_local_proof_contexts(
     local_catalogs: impl IntoIterator<Item = (ScalarProofDeclarations, Vec<ScalarNamespaceBinding>)>,
     initialization_order: Vec<SourceIdentity>,
     inputs: ScalarPreparationInputs,
+    scope: ScalarCheckerScope,
 ) -> Result<MainFlowProofReceipt, ScalarOrderedCheckerOutcome> {
     check_loaded_ordered_proof_diagnostics_in_scope::<true>(
-        declarations, local_catalogs.into_iter().collect(), initialization_order, inputs, ScalarCheckerScope::CurrentPackage,
+        declarations, local_catalogs.into_iter().collect(), initialization_order, inputs, scope,
     ).map_err(|error| match error {
         ProjectCheck::Invalid(diagnostics) => ScalarOrderedCheckerOutcome::Invalid(diagnostics),
         _ => ScalarOrderedCheckerOutcome::Unsupported,
@@ -7437,7 +7438,7 @@ mod tests {
             proof shared for echo(entry) -> (out) ensures (out < 5) {}
             proof uncovered for unused(entry) -> (out) ensures (out != 7) {}
         %%end"#;
-        let run = |lib: &SourceIdentity, lib_text: &str| {
+        let run = |lib: &SourceIdentity, lib_text: &str, scope| {
             let (_, root_catalog) = crate::parse_proof_source(app.clone(), app_text.into(), &[]).unwrap_or_else(|_| panic!("valid root proof source"));
             let (_, lib_catalog) = crate::parse_proof_source(lib.clone(), lib_text.into(), &[]).unwrap_or_else(|_| panic!("valid local proof source"));
             let binding = ScalarNamespaceBinding {
@@ -7445,10 +7446,10 @@ mod tests {
             };
             check_loaded_scalar_ordered_local_proof_contexts(
                 Vec::new(), [(lib_catalog, Vec::new()), (root_catalog, vec![binding])],
-                vec![app.clone(), lib.clone()], inputs(),
+                vec![app.clone(), lib.clone()], inputs(), scope,
             )
         };
-        let report = run(&lib, lib_text).unwrap();
+        let report = run(&lib, lib_text, ScalarCheckerScope::CurrentPackage).unwrap();
         assert!(report.active && report.directives.is_empty());
         let [first, second] = report.diagnostics.as_slice() else { panic!("both actual proof failures"); };
         assert_eq!(first.proof.source, app);
@@ -7456,14 +7457,26 @@ mod tests {
         assert_eq!(second.invocation.call.source, app);
         let range = second.invocation.call.range;
         assert_eq!(&app_text[range.start as usize..range.end as usize], "lib.echo(8)");
+        let main_flow = run(&lib, lib_text, ScalarCheckerScope::MainFlowOnly).unwrap();
+        assert!(main_flow.active && main_flow.directives.is_empty());
+        assert_eq!(main_flow.diagnostics.len(), report.diagnostics.len());
+        for (main, package) in main_flow.diagnostics.iter().zip(&report.diagnostics) {
+            assert_eq!(main.proof, package.proof);
+            assert_eq!(main.goal, package.goal);
+            assert_eq!(main.invocation.call, package.invocation.call);
+            assert_eq!(main.invocation.arguments, package.invocation.arguments);
+            assert_eq!(main.invocation.returned, package.invocation.returned);
+        }
+        assert!(main_flow.symbolic_diagnostic.is_none());
+        assert!(main_flow.additional_symbolic_diagnostics.is_empty());
         let symbolic = report.symbolic_diagnostic.unwrap();
         assert_eq!(symbolic.callable.source, lib);
         assert_eq!(symbolic.proof.source, lib);
         assert!(report.additional_symbolic_diagnostics.is_empty());
-        assert!(matches!(run(&lib, &lib_text.replace("proof uncovered", "proof shared")),
+        assert!(matches!(run(&lib, &lib_text.replace("proof uncovered", "proof shared"), ScalarCheckerScope::CurrentPackage),
             Err(ScalarOrderedCheckerOutcome::Unsupported)));
         let foreign = SourceIdentity { project: "foreign-project".into(), ..lib.clone() };
-        assert!(matches!(run(&foreign, lib_text), Err(ScalarOrderedCheckerOutcome::Unsupported)));
+        assert!(matches!(run(&foreign, lib_text, ScalarCheckerScope::CurrentPackage), Err(ScalarOrderedCheckerOutcome::Unsupported)));
     }
 
     #[cfg(feature = "internal-checker")]
