@@ -74,6 +74,73 @@ impl IntegerRelation {
     }
 }
 
+#[cfg(feature = "internal-checker")]
+#[derive(Default)]
+pub(super) struct IntegerShowConstraints<'a> {
+    lower: Option<(std::borrow::Cow<'a, BigInt>, bool)>,
+    upper: Option<(std::borrow::Cow<'a, BigInt>, bool)>,
+    excluded: Vec<std::borrow::Cow<'a, BigInt>>,
+}
+
+#[cfg(feature = "internal-checker")]
+impl<'a> IntegerShowConstraints<'a> {
+    pub(super) fn add(&mut self, relation: IntegerRelation, bound: std::borrow::Cow<'a, BigInt>) {
+        let stricter = |candidate: &BigInt, current: &BigInt, open: bool, current_open: bool, lower| {
+            let order = candidate.cmp(current);
+            order == (if lower { Ordering::Greater } else { Ordering::Less })
+                || (order == Ordering::Equal && open && !current_open)
+        };
+        let open = !relation.equal;
+        let lower = !relation.less && self.lower.as_ref().is_none_or(|(current, was_open)|
+            stricter(&bound, current, open, *was_open, true));
+        let upper = !relation.greater && self.upper.as_ref().is_none_or(|(current, was_open)|
+            stricter(&bound, current, open, *was_open, false));
+        match (lower, upper) {
+            (true, true) => {
+                self.lower = Some((bound.clone(), open));
+                self.upper = Some((bound, open));
+            }
+            (true, false) => self.lower = Some((bound, open)),
+            (false, true) => self.upper = Some((bound, open)),
+            (false, false) if relation.less && relation.greater && open => self.excluded.push(bound),
+            (false, false) => {}
+        }
+    }
+
+    pub(super) fn normalize(&mut self) {
+        self.excluded.sort_unstable();
+        self.excluded.dedup();
+    }
+
+    fn endpoints_hold(&self, first: &BigInt, last: &BigInt) -> bool {
+        self.lower.as_ref().is_none_or(|(bound, open)| first > bound.as_ref() || (!open && first == bound.as_ref()))
+            && self.upper.as_ref().is_none_or(|(bound, open)| last < bound.as_ref() || (!open && last == bound.as_ref()))
+    }
+
+    pub(super) fn holds_value(&self, value: &BigInt) -> bool {
+        self.endpoints_hold(value, value) && self.excluded.binary_search_by(|hole| hole.as_ref().cmp(value)).is_err()
+    }
+
+    pub(super) fn holds_set(&self, values: &IntegerSet) -> bool {
+        let Some((first, last)) = values.extremes() else { return true; };
+        if !self.endpoints_hold(first, last) {
+            return false;
+        }
+        let mut holes = self.excluded[self.excluded.partition_point(|hole| hole.as_ref() < first)..].iter().peekable();
+        for interval in &values.0 {
+            while holes.peek().is_some_and(|hole| hole.as_ref() < &interval.first) {
+                holes.next();
+            }
+            match holes.peek() {
+                None => break,
+                Some(hole) if hole.as_ref() <= &interval.last => return false,
+                _ => {}
+            }
+        }
+        true
+    }
+}
+
 impl IntegerSet {
     pub(super) fn from_type(ty: &ScalarType) -> Option<Self> {
         let (first, last) = integer_bounds(ty)?;

@@ -1116,6 +1116,58 @@ fn named_proof_show_old_orders_same_width_formals_without_crossing_return_rows()
 }
 
 #[test]
+fn named_proof_show_mixed_sequence_holds_all_exact_obligations() {
+    let identity = source();
+    let check = |target: &str, where_guard: &str, ensures: &str, steps: &str| {
+        check_scalar_module_proof(
+            identity.clone(), "demonstrate",
+            vec![ScalarProofModuleInput {
+                source: identity.clone(),
+                text: format!(r#"%%start
+                    i16(i16, i16) echo = fn(value, limit) {{ if (limit == 0) {{}}; value }};
+                    i16(i16, i16) fixed = fn(value, limit) {{ if (value == 0) {{}}; if (limit == 0) {{}}; 7 }};
+                    i16(i16, i16) const_first = fn(value, limit) {{
+                        if (value == 0) {{}}; if (limit == 0) {{ 7 }} else {{ i16 local = 3; local }}
+                    }};
+                    i16(i16, i16) local_first = fn(value, limit) {{
+                        if (value == 0) {{}}; if (limit == 0) {{ i16 local = 3; local }} else {{ 7 }}
+                    }};
+                    proof demonstrate for {target}(value, limit) -> (out) where ({where_guard}) ensures ({ensures}) {{
+                        {steps}
+                    }}
+                %%end"#),
+                namespaces: Vec::new(),
+            }],
+            vec![identity.clone()], ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
+        )
+    };
+    let scope = "value >= -2 && value <= 0 && value != -1 && limit >= 1";
+    let steps = "core.show(out >= -2); core.show(out != -1); core.show(out != -1);
+        core.show(out <= core.old(limit)); core.show(out != core.old(limit)); core.show(out == core.old(value));";
+    assert_eq!(check("echo", scope, "out <= 0", steps), ScalarModuleProofOutcome::Proved);
+    assert_eq!(check("echo", scope, "out < 0", steps), ScalarModuleProofOutcome::Refuted);
+    assert_eq!(check("echo", "value >= -2 && value <= 0 && limit >= 1", "out <= 0", steps), ScalarModuleProofOutcome::Refuted);
+    assert_eq!(check("echo", "value >= -2 && value <= 0 && value != -1 && limit >= 0", "out <= 0", steps),
+        ScalarModuleProofOutcome::Refuted);
+    let literal_only = "core.show(out == 7); core.show(out >= 7); core.show(out != 6);";
+    assert_eq!(check("fixed", "true", "out <= 7", literal_only), ScalarModuleProofOutcome::Proved);
+    assert_eq!(check("fixed", "true", "out < 7", literal_only), ScalarModuleProofOutcome::Refuted);
+    let low = "core.show(out == 7); core.show(out >= 7); core.show(out <= core.old(limit)); core.show(out >= core.old(value));";
+    assert_eq!(check("fixed", "value <= 7 && limit >= 7", "out <= 7", low), ScalarModuleProofOutcome::Proved);
+    assert_eq!(check("fixed", "value <= 7 && limit >= 6", "out <= 7", low), ScalarModuleProofOutcome::Refuted);
+    let impossible_old = "core.show(out < core.old(limit)); core.show(out >= core.old(limit));";
+    assert_eq!(check("echo", scope, "out <= 0", impossible_old), ScalarModuleProofOutcome::Refuted);
+    let impossible = "core.show(out < 0); core.show(out >= 0); core.show(out > core.old(limit));";
+    assert_eq!(check("echo", "false", "out <= 0", impossible), ScalarModuleProofOutcome::NoApplicableInputs);
+    assert_eq!(check("echo", scope, "out <= 0", impossible), ScalarModuleProofOutcome::Refuted);
+    assert!(matches!(check("echo", scope, "out <= 0", &format!("{impossible} core.show(out > 32768);")),
+        ScalarModuleProofOutcome::Invalid(_)));
+    for target in ["const_first", "local_first"] {
+        assert_eq!(check(target, "limit >= 0", "out < 6", impossible), ScalarModuleProofOutcome::Unsupported);
+    }
+}
+
+#[test]
 fn named_proof_show_guarded_implications_preserve_exact_integer_paths() {
     let identity = source();
     let check = |target: &str, where_guard: &str, ensures: &str, guard: &str, yes: &str, no: &str| {

@@ -28,7 +28,7 @@ use super::{
     },
 };
 #[cfg(feature = "internal-checker")]
-use super::checker_flow::{observe_arbitrary_integer_returns, observe_unused_module_proof_returns, GuardedOutputClaims, ImmutableEntryRange, IntegerShowOutput};
+use super::{checker_flow::{observe_arbitrary_integer_returns, observe_unused_module_proof_returns, GuardedOutputClaims, ImmutableEntryRange, IntegerShowOutput}, symbolic_integer::IntegerShowConstraints};
 use crate::Diagnostic;
 use wosy_syntax::SourceIdentity;
 use wosy_syntax::{CanonicalCstRoot, CstNode, CstToken, SyntaxKind};
@@ -2851,7 +2851,7 @@ impl PlannedModuleProof<'_> {
         }
         let proof = proof_show_plan::<false, true>(
             &self.steps, input_names, output, result_type, body,
-            (operator == &BinaryOperator::Equal).then_some(bound),
+            Some((operator, bound)),
         )?;
         let checked = check_integer_return_bound_with_shows(body, operator, bound, self.filter.as_deref(), &proof);
         match checked {
@@ -3152,6 +3152,13 @@ impl TypedProofGoal {
 fn checked_literal_output_goal(
     comparison: IntegerComparison<'_>, output: &str, inputs: &[String], ty: &ScalarType,
 ) -> Result<(BinaryOperator, IntegerRelation, BigInt), ProjectCheck> {
+    let (operator, relation, bound) = checked_literal_output_goal_borrowed(comparison, output, inputs, ty)?;
+    Ok((operator.clone(), relation, bound.into_owned()))
+}
+
+fn checked_literal_output_goal_borrowed<'a>(
+    comparison: IntegerComparison<'a>, output: &str, inputs: &[String], ty: &ScalarType,
+) -> Result<(&'a BinaryOperator, IntegerRelation, std::borrow::Cow<'a, BigInt>), ProjectCheck> {
     if comparison.name != output {
         return Err(if inputs.iter().any(|input| input == comparison.name) {
             ProjectCheck::Unsupported
@@ -3163,7 +3170,7 @@ fn checked_literal_output_goal(
         return Err(ProjectCheck::InvalidProof);
     }
     let relation = IntegerRelation::from_operator(comparison.operator).ok_or(ProjectCheck::Unsupported)?;
-    Ok((comparison.operator.clone(), relation, comparison.bound.into_owned()))
+    Ok((comparison.operator, relation, comparison.bound))
 }
 
 fn typed_universal_output_goal(
@@ -4205,7 +4212,7 @@ fn proof_show_plan<'a, const VERIFY_ENTRY_WRITES: bool, const ALLOW_NAMED_STEPS:
     output: &str,
     ty: &ScalarType,
     body: &'a FunctionCallSites,
-    ensures_equality: Option<&BigInt>,
+    ensures: Option<(&BinaryOperator, &'a BigInt)>,
 ) -> Result<IntegerShowProof<'a>, ProjectCheck> {
     let bindings = body.boundary.checker_parameter_bindings.as_deref().ok_or(ProjectCheck::Unsupported)?;
     if VERIFY_ENTRY_WRITES && body.assignments.values().flat_map(|group| group.destinations()).any(|destination| {
@@ -4332,16 +4339,63 @@ fn proof_show_plan<'a, const VERIFY_ENTRY_WRITES: bool, const ALLOW_NAMED_STEPS:
             if is_null_literal_name(output) || inputs.iter().any(|name| is_null_literal_name(name)) {
                 return Err(ProjectCheck::InvalidProof);
             }
+            let ensures_equality = ensures.and_then(|(operator, bound)| (*operator == BinaryOperator::Equal).then_some(bound));
             let mut seen = HashSet::new();
             let mut claims = Vec::new();
+            #[cfg(feature = "internal-checker")]
+            let mut mixed: Option<(IntegerShowConstraints<'a>, [Option<IntegerRelation>; 2])> = None;
             for (item, &terminated) in steps.items.iter().zip(&steps.terminated_items) {
-                let claim = proof_show_item_claim(item, terminated, inputs, output, ty, body, bindings)?;
+                let expression = proof_show_expression(item, terminated)?;
+                #[cfg(feature = "internal-checker")]
+                {
+                    let old = checked_old_output_relation(expression, output, inputs, body, ty);
+                    let non_equality = matches!(expression, ScalarExpression::Binary { operator, .. }
+                        if *operator != BinaryOperator::Equal && IntegerRelation::from_operator(operator).is_some());
+                    if mixed.is_some() || old.is_some() || non_equality {
+                        if mixed.is_none() {
+                            let mut normalized = IntegerShowConstraints::default();
+                            let (operator, bound) = ensures.ok_or(ProjectCheck::Unsupported)?;
+                            normalized.add(IntegerRelation::from_operator(operator).ok_or(ProjectCheck::Unsupported)?,
+                                std::borrow::Cow::Borrowed(bound));
+                            let equality = IntegerRelation::from_operator(&BinaryOperator::Equal).ok_or(ProjectCheck::Unsupported)?;
+                            for claim in claims.drain(..) {
+                                let IntegerReturn::Const(value) = claim else { return Err(ProjectCheck::Unsupported); };
+                                normalized.add(equality, std::borrow::Cow::Borrowed(value));
+                            }
+                            drop(std::mem::take(&mut seen));
+                            mixed = Some((normalized, [None; 2]));
+                        }
+                        let (constraints, entry) = mixed.as_mut().ok_or(ProjectCheck::Unsupported)?;
+                        if let Some(old) = old {
+                            let (slot, relation) = old?;
+                            let known = entry.get_mut(slot).ok_or(ProjectCheck::Unsupported)?;
+                            *known = Some(known.map_or(relation, |current| current.intersection(relation)));
+                        } else {
+                            // Keep equality admission consistent with legacy prefixes.
+                            if matches!(expression, ScalarExpression::Binary {
+                                operator: BinaryOperator::Equal, right, ..
+                            } if !matches!(right.as_ref(), ScalarExpression::Integer { .. })) {
+                                return Err(ProjectCheck::Unsupported);
+                            }
+                            let comparison = IntegerComparison::from_expression(expression).ok_or(ProjectCheck::Unsupported)?;
+                            let (_, relation, value) = checked_literal_output_goal_borrowed(comparison, output, inputs, ty)?;
+                            constraints.add(relation, value);
+                        }
+                        continue;
+                    }
+                }
+                let claim = proof_show_equality(expression, inputs, output, ty, body, bindings)?;
                 if matches!(claim, IntegerReturn::Const(value) if ensures_equality == Some(value)) {
                     continue;
                 }
                 if seen.insert(claim) {
                     claims.push(claim);
                 }
+            }
+            #[cfg(feature = "internal-checker")]
+            if let Some((mut output, entry)) = mixed {
+                output.normalize();
+                return Ok(IntegerShowProof::MixedSequence { formals: bindings, output, entry });
             }
             Ok(IntegerShowProof::Sequence(claims))
         }

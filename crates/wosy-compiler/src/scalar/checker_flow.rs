@@ -12,6 +12,9 @@ use super::{
 };
 use super::{symbolic_integer::IntegerRelation, reference::CheckerIntegerCallArgument};
 
+#[cfg(feature = "internal-checker")]
+use super::symbolic_integer::IntegerShowConstraints;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum CheckerPredicate {
     Boolean(bool),
@@ -442,6 +445,12 @@ pub(super) enum IntegerShowProof<'a> {
     Equality(IntegerReturn<'a>),
     Sequence(Vec<IntegerReturn<'a>>),
     #[cfg(feature = "internal-checker")]
+    MixedSequence {
+        formals: &'a [ReferenceBindingId],
+        output: IntegerShowConstraints<'a>,
+        entry: [Option<IntegerRelation>; 2],
+    },
+    #[cfg(feature = "internal-checker")]
     Output(IntegerShowOutput),
     #[cfg(feature = "internal-checker")]
     EntryComparison {
@@ -585,6 +594,47 @@ fn binding_satisfies(
 ) -> Option<bool> {
     let index = axes.iter().position(|known| *known == binding)?;
     Some(state.0.iter().all(|row| row[index].every(relation, bound)))
+}
+
+#[cfg(feature = "internal-checker")]
+#[derive(Clone, Copy)]
+enum CartesianRelation {
+    Never,
+    Equal,
+    Disjoint,
+    Always,
+    Order { upper_against_lower: bool, relation: IntegerRelation },
+}
+
+#[cfg(feature = "internal-checker")]
+impl CartesianRelation {
+    fn prepare(relation: IntegerRelation) -> Self {
+        use std::cmp::Ordering::{Equal, Greater, Less};
+        match (relation.accepts(Less), relation.accepts(Greater), relation.accepts(Equal)) {
+            (false, false, false) => Self::Never,
+            (false, false, true) => Self::Equal,
+            (true, true, false) => Self::Disjoint,
+            (true, true, true) => Self::Always,
+            (upper_against_lower, _, _) => Self::Order { upper_against_lower, relation },
+        }
+    }
+
+    fn holds(self, result: &IntegerSet, old: &IntegerSet) -> Option<bool> {
+        // Entry rows are exact Cartesian products. Combine independently attained
+        // extrema only within the SAME row, never over the marginal unions.
+        Some(match self {
+            Self::Never => false,
+            Self::Equal => result.singleton_value().is_some_and(|value| Some(value) == old.singleton_value()),
+            Self::Disjoint => result.is_disjoint(old),
+            Self::Always => true,
+            Self::Order { upper_against_lower, relation } => {
+                let (result_min, result_max) = result.extremes()?;
+                let (old_min, old_max) = old.extremes()?;
+                let worst = if upper_against_lower { result_max.cmp(old_min) } else { result_min.cmp(old_max) };
+                relation.accepts(worst)
+            }
+        })
+    }
 }
 
 fn shows_return_equality(
@@ -731,33 +781,12 @@ impl IntegerReturningPath<'_> {
                 }
                 let returned = self.axes.iter().position(|known| *known == alias)?;
                 let old = self.axes.iter().position(|known| *known == binding)?;
-                use std::cmp::Ordering::{Greater, Less};
-                let comparison = (entry_relation.accepts(Less), entry_relation.accepts(Greater));
-                // A row is a Cartesian product of its component sets: this pure
-                // observer starts with independent entry axes, splits one axis at
-                // a time, and coalesces only rows identical on all other axes.
-                // Never compare extrema drawn from different rows.
+                let comparison = CartesianRelation::prepare(entry_relation);
                 for row in &self.state.0 {
                     let result = &row[returned];
-                    if !result.every_at_extremes(relation, bound) {
-                        return Some(false);
-                    }
-                    let old = &row[old];
-                    let holds = match comparison {
-                        (false, false) => {
-                            // Across independent axes, even identical multi-value
-                            // sets permit choosing two unequal values.
-                            result.singleton_value().is_some_and(|value| Some(value) == old.singleton_value())
-                        }
-                        (true, true) => result.is_disjoint(old),
-                        (upper_against_lower, _) => {
-                            let (result_min, result_max) = result.extremes()?;
-                            let (old_min, old_max) = old.extremes()?;
-                            let worst = if upper_against_lower { result_max.cmp(old_min) } else { result_min.cmp(old_max) };
-                            entry_relation.accepts(worst)
-                        }
-                    };
-                    if !holds {
+                    if !result.every_at_extremes(relation, bound)
+                        || !comparison.holds(result, &row[old])?
+                    {
                         return Some(false);
                     }
                 }
@@ -777,7 +806,7 @@ impl IntegerReturningPath<'_> {
             IntegerShowProof::Sequence(_) => return None,
             #[cfg(feature = "internal-checker")]
             IntegerShowProof::Output(_) | IntegerShowProof::EntryComparison { .. }
-            | IntegerShowProof::GuardedOutput { .. } => return None,
+            | IntegerShowProof::GuardedOutput { .. } | IntegerShowProof::MixedSequence { .. } => return None,
             IntegerShowProof::Conditional { guard, then_claim, else_claim } => (guard, then_claim, else_claim),
         };
         let (yes, no) = match guard {
@@ -1183,6 +1212,75 @@ fn check_integer_return_bound_in_scope<'a>(
                     (IntegerReturn::Alias(actual), IntegerReturn::Alias(expected)) if actual != expected)
                 {
                     return None;
+                }
+            }
+        }
+        return Some(Ok(ProofCoverage::Applicable(proved)));
+    }
+    #[cfg(feature = "internal-checker")]
+    if let Some(IntegerShowProof::MixedSequence { formals, output, entry }) = proof {
+        let mut proved = true;
+        // At most two checked formal slots. Densify and precompute per-relation
+        // facts once; every row only visits present authored old constraints.
+        let mut typed_entry = [(0, relation, false, CartesianRelation::Never); 2];
+        let mut active = 0;
+        for (axis, condition) in entry.iter().enumerate() {
+            let Some(condition) = condition else { continue; };
+            typed_entry[active] = (axis, condition.reversed(), condition.accepts(std::cmp::Ordering::Equal),
+                CartesianRelation::prepare(*condition));
+            active += 1;
+        }
+        let typed_entry = &typed_entry[..active];
+        let uses_entry = !typed_entry.is_empty();
+        for path in &paths {
+            let returned = match path.value {
+                IntegerReturn::Alias(alias) => {
+                    if uses_entry && !formals.contains(alias) {
+                        return None; // Unadmitted alias overrides an earlier refutation.
+                    }
+                    if !proved { continue; }
+                    Some(path.axes.iter().position(|known| *known == alias)?)
+                }
+                IntegerReturn::Const(value) => {
+                    if !proved { continue; }
+                    if !output.holds_value(value) {
+                        proved = false;
+                        continue;
+                    }
+                    if !uses_entry {
+                        continue;
+                    }
+                    None
+                }
+            };
+            // IntegerRoots installs the immutable formals in the canonical
+            // boundary order; local introductions only append axes.
+            if uses_entry && !path.axes.get(..formals.len())?.iter().copied().eq(formals.iter()) {
+                return None;
+            }
+            for row in &path.state.0 {
+                if returned.is_some_and(|axis| !output.holds_set(&row[axis])) {
+                    proved = false;
+                    break;
+                }
+                if !uses_entry {
+                    continue;
+                }
+                for &(axis, reversed, reflexive, comparison) in typed_entry {
+                    let old = row.get(axis)?;
+                    let holds = match (path.value, returned) {
+                        (IntegerReturn::Const(value), _) => old.every_at_extremes(reversed, value),
+                        (_, Some(returned)) if returned == axis => reflexive,
+                        (_, Some(returned)) => comparison.holds(&row[returned], old)?,
+                        _ => return None,
+                    };
+                    if !holds {
+                        proved = false;
+                        break;
+                    }
+                }
+                if !proved {
+                    break;
                 }
             }
         }
