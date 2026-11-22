@@ -4857,7 +4857,7 @@ fn exact_projected_reborrow_parent_on_edge(
         || owner.binding == *binding || owner.binding != loan.origin_place.binding
         || loan.parent.as_deref() != Some(parent) || projected_parent.as_ref() != parent
         || field != projected_field
-        || loan.mode != ScalarReferenceMutability::Shared || parent.mode != ScalarReferenceMutability::Shared
+        || loan.mode != ScalarReferenceMutability::Shared
     {
         return false;
     }

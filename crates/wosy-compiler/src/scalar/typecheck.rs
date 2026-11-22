@@ -5029,7 +5029,7 @@ fn permits_readonly_named_checked_field(
     let ScalarExpression::Name { name, .. } = pointer.as_ref() else { return false };
     mode == ScalarReferenceMutability::Shared
         && matches!(scope.get(name), Some(ScalarType::CheckedReference {
-            mutability: ScalarReferenceMutability::Shared, inner,
+            inner, ..
         }) if matches!(inner.as_ref(), ScalarType::Struct(_)))
 }
 

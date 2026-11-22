@@ -12533,7 +12533,7 @@ fn known_projected_shared_leaf_keeps_noncanonical_transports_closed() {
         ("*Pair parent = &owner;", "*u8 leaf = &(*parent).left; leaf = null;"),
         ("*Pair parent = &owner;", "&(*parent).left;"),
         ("*Pair parent = &owner;", "*u8 leaf = &(*parent).left; if (true) { u8 read = *leaf; read; };"),
-        ("*!Pair parent = &!owner;", "*u8 leaf = &(*parent).left; u8 read = *leaf; read;"),
+        ("*!Pair parent = &!owner;", "*u8 leaf = &(*parent).left; *u8 alias = leaf; u8 read = *alias; read;"),
     ] {
         let text = format!(r#"%%start
 struct copy Pair {{ u8 left; u8 right; }}
@@ -12876,4 +12876,90 @@ unit(Pair) inspect = fn(owner) {{
         }
     }
     assert!(missed.is_empty(), "{missed:?}");
+}
+
+#[test]
+fn known_projected_shared_leaf_retains_mutable_whole_parent_until_its_last_use() {
+    for (body, conflict) in [
+        ("u8 next = (*parent).right; u8 value = *leaf; next; value;", None),
+        ("u8 value = *leaf; (*parent).left = 3; u8 next = owner.right; value; next;", None),
+        ("u8 value = *leaf; (*parent).left = 3; *!u8 next = &!owner.right; *next; value;", None),
+        ("u8 next = owner.right; u8 value = *leaf; next; value;", Some("owner.right")),
+        ("*u8 next = &owner.right; u8 value = *leaf; *next; value;", Some("&owner.right")),
+        ("*!u8 next = &!owner.right; u8 value = *leaf; *next; value;", Some("&!owner.right")),
+        ("owner.left = 3; u8 value = *leaf; value;", Some("owner.left")),
+        ("(*parent).left = 3; u8 value = *leaf; value;", Some("(*parent).left")),
+        ("*!Pair next = &!(*parent); u8 value = *leaf; u8 other = (*next).right; value; other;", Some("&!(*parent)")),
+    ] {
+        let text = format!(r#"%%start
+struct copy Pair {{ u8 left; u8 right; }}
+unit(Pair) inspect = fn(owner) {{
+    *!Pair parent = &!owner;
+    *u8 leaf = &(*parent).left;
+    {body}
+}};
+%%end"#);
+        let parent = text.find("&!owner").unwrap() as u32;
+        let projected = text.find("&(*parent).left").unwrap() as u32;
+        let holder = text.find("leaf =").unwrap() as u32;
+        let (single, project) = both_reference_functions(&text);
+        for (items, diagnostics) in [
+            (&single.program.items, &single.diagnostics),
+            (&project.project.modules[0].items, &project.diagnostics),
+        ] {
+            let ScalarItem::Function(function) = &items[0] else { panic!("typed callable") };
+            let cfg = &function.reference_cfg;
+            let borrow = cfg.initial_points.iter().find(|point| point.source_span.range.start == projected
+                && matches!(&point.kind, CfgPointKind::Borrow { place, loan }
+                    if loan.mode == ScalarReferenceMutability::Shared
+                        && loan.parent.as_deref().is_some_and(|root| {
+                            root.creation_span.start == parent
+                                && root.mode == ScalarReferenceMutability::Mutable
+                                && root.origin_place.binding == place.binding
+                                && root.origin_place.projections.is_empty()
+                        })
+                        && matches!(place.projections.as_slice(),
+                            [ReferencePlaceProjection::Dereference(_), ReferencePlaceProjection::Field(ScalarFieldReference::Resolved(field))]
+                            if field.index == 0)))
+                .unwrap_or_else(|| panic!("actual Mutable→Shared projected borrow: {body}: {diagnostics:?}"));
+            if let Some(conflict) = conflict {
+                let start = text.rfind(conflict).unwrap() as u32;
+                let access = start..start + conflict.len() as u32;
+                assert!(diagnostics.iter().any(|diagnostic| diagnostic.code == "B0003"
+                    && diagnostic.message == "read or move of unavailable place"
+                    && diagnostic.labels.first().is_some_and(|label| access.contains(&label.span.range.start))
+                    && diagnostic.labels.iter().skip(1).any(|label| label.span.range == borrow.source_span.range)),
+                    "{body}: {diagnostics:?}");
+            } else {
+                assert!(diagnostics.is_empty(), "{body}: {diagnostics:?}");
+                let child = &cfg.points[borrow.id.0].possible_origins;
+                assert!(child.as_ref().is_some_and(|origins| origins.len() == 1));
+                for operation in [
+                    cfg.points.iter().find(|point| matches!(&point.kind, CfgPointKind::Bind { binding } if binding.declaration_span.start == holder)),
+                    cfg.points.iter().find(|point| matches!(&point.kind, CfgPointKind::Read { binding } if binding.declaration_span.start == holder)),
+                ] {
+                    assert_eq!(&operation.expect("projected child used through its typed holder").possible_origins, child);
+                }
+            }
+        }
+    }
+    let unsupported = r#"%%start
+struct copy Pair { u8 left; u8 right; }
+unit(Pair) inspect = fn(owner) {
+    *!Pair parent = &!owner;
+    *u8 leaf = &(*parent).left;
+    *parent = { .left = 3; .right = 4; };
+    u8 value = *leaf;
+    value;
+};
+%%end"#;
+    let assignment = unsupported.find("*parent =").unwrap() as u32;
+    let (single, project) = both_reference_functions(unsupported);
+    for diagnostics in [&single.diagnostics, &project.diagnostics] {
+        assert!(diagnostics.iter().any(|diagnostic| diagnostic.code == "B0003"
+            && diagnostic.message == "assignment place requires a scalar leaf type"
+            && diagnostic.labels.first().is_some_and(|label| label.span.range.start == assignment)),
+            "{diagnostics:?}");
+    }
+
 }
