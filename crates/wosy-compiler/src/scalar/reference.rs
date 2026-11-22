@@ -978,16 +978,12 @@ impl<'a> ReferenceFlowBuilder<'a> {
             BTreeSet::new(),
         );
         let incoming_names = self.names.clone();
-        // An implicit else has no evaluation and the join clears origins.
-        // Only an actual alternate body consumes a saved entry origin map.
         let incoming_origins = else_branch.map(|_| self.origins.clone());
         let incoming_checked = self.checked.clone();
         let then_arm = ReferenceConditionalArm {
             result: self.block_result(then_branch, then_block, projected_origins)?,
             end: self.cursor.expect("then branch terminal"),
         };
-        // The saved entry maps have no further consumers. Keep the then
-        // arm's checked set for the join by moving it out, not cloning it.
         let then_checked = std::mem::replace(&mut self.checked, incoming_checked);
         self.names = incoming_names;
         self.cursor = Some(branch);
@@ -4619,8 +4615,6 @@ fn prepared_loan_read_reachability_stops_only_at_the_exact_binding_exit() {
     assert!(!reference_read_reachable(&points, Some(&exact), true, CfgPointId(0), &outer));
     assert!(!reference_read_reachable(&points, None, false, CfgPointId(0), &outer));
 
-    // A cut or backedge on the first inspected successor must not lose a
-    // deferred sibling. Its traversal reaches the outer read.
     let mut branched = points.to_vec();
     branched[0].successors = vec![CfgPointId(2), CfgPointId(1)];
     assert!(reference_read_reachable(&branched, Some(&exact), true, CfgPointId(0), &outer));
@@ -4837,9 +4831,6 @@ fn reference_read_reachable(
     from: CfgPointId,
     binding: &ReferenceBindingId,
 ) -> bool {
-    // Follow the last successor directly, pushing only deferred siblings.
-    // This is the same DFS order as extending the stack then popping it,
-    // without allocating a worklist on an ordinary straight-line path.
     let mut pending = Vec::new();
     let successors = &points[from.0].successors;
     let mut track_visited = !strictly_forward || successors.len() > 1;
@@ -4862,8 +4853,6 @@ fn reference_read_reachable(
             continue;
         }
         let successors = &points[id.0].successors;
-        // Before the first fork a forward chain cannot revisit a node;
-        // after it, all reachable ids are beyond that chain's prefix.
         track_visited |= successors.len() > 1;
         next = defer_read_search_siblings(successors, &mut pending);
     }
@@ -7994,8 +7983,6 @@ fn transfer_reference_facts(
                     let mut seen_unchanged = false;
                     let mut alternatives = move_alternatives.iter().peekable();
                     while let Some((place, origin)) = alternatives.next() {
-                        // Same exact seed and successor, hence all no-op
-                        // alternatives remain equal after identical pruning.
                         let effect = forwarded_move(
                             &state.as_ref().expect("seed for successor alternatives").moved,
                             place, &mut seen_unchanged, single_successor,
@@ -11190,8 +11177,6 @@ fn reset_contract_replay_points(
         return;
     }
     for (live, pristine) in live.iter_mut().zip(pristine) {
-        // Outer contract transfer never rewrites these two canonical kinds.
-        // All mutable node kinds, including Evaluate→Borrow, reset fully.
         if live.id == pristine.id && matches!((&live.kind, &pristine.kind),
             (CfgPointKind::Call { .. }, CfgPointKind::Call { .. })
             | (CfgPointKind::Branch { .. }, CfgPointKind::Branch { .. }))

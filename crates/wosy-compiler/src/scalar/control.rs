@@ -30,7 +30,6 @@ pub(crate) struct CallablePointFacts {
     pub(super) definitions: HashMap<(BlockOrdinal, usize, usize), BindingDefinition>,
     // None is the explicit detached/unprepared transfer mode.
     pub(super) scope_exit_bindings: Option<HashMap<super::CfgPointId, ScopeExitBindings>>,
-    // Set only by provisional transfer on the canonical initial graph.
     pub(super) forward_initial_graph: Option<ForwardInitialGraph>,
     pub(super) has_grouped_assignment_capture: Option<bool>,
     pub(super) pending_named_reborrow: Option<PendingNamedReborrow>,
