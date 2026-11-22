@@ -11125,6 +11125,61 @@ fn collect_function_output_contracts<'a>(
     }
 }
 
+fn contract_replay_reuse(
+    proof: &CallablePointFacts,
+    same_length: bool,
+) -> (bool, Option<super::control::ForwardInitialGraph>) {
+    let reuse_structure = proof.forward_initial_graph.is_some()
+        && proof.pending_named_reborrow.is_none()
+        && matches!(proof.scalar_descriptor_install, ScalarDescriptorCandidates::None)
+        && matches!(proof.backing_descriptor_install, ScalarDescriptorCandidates::None);
+    let topology = if reuse_structure && proof.scope_exit_bindings.is_some() && same_length {
+        proof.forward_initial_graph
+    } else {
+        None
+    };
+    (reuse_structure, topology)
+}
+
+#[cfg(test)]
+#[test]
+fn prepared_contract_replay_reuses_only_eligible_topology() {
+    use super::control::{DeferredReborrowRoot, ForwardInitialGraph, PendingNamedReborrow};
+
+    let mut proof = CallablePointFacts::default();
+    assert!(matches!(contract_replay_reuse(&proof, true), (false, None)));
+    proof.scope_exit_bindings = Some(HashMap::new());
+    assert!(matches!(contract_replay_reuse(&proof, true), (false, None)));
+    proof.forward_initial_graph = Some(ForwardInitialGraph::Linear);
+    assert!(matches!(contract_replay_reuse(&proof, true), (true, Some(ForwardInitialGraph::Linear))));
+    assert!(matches!(contract_replay_reuse(&proof, false), (true, None)));
+    proof.forward_initial_graph = Some(ForwardInitialGraph::Branched);
+    assert!(matches!(contract_replay_reuse(&proof, true), (true, Some(ForwardInitialGraph::Branched))));
+    proof.scope_exit_bindings = None;
+    assert!(matches!(contract_replay_reuse(&proof, true), (true, None)));
+    proof.scope_exit_bindings = Some(HashMap::new());
+    proof.scalar_descriptor_install = ScalarDescriptorCandidates::Multiple;
+    assert!(matches!(contract_replay_reuse(&proof, true), (false, None)));
+    proof.scalar_descriptor_install = ScalarDescriptorCandidates::None;
+    proof.backing_descriptor_install = ScalarDescriptorCandidates::Multiple;
+    assert!(matches!(contract_replay_reuse(&proof, true), (false, None)));
+    proof.backing_descriptor_install = ScalarDescriptorCandidates::None;
+    proof.pending_named_reborrow = Some(PendingNamedReborrow {
+        sites: Vec::new(),
+        entry: CfgPointId(0),
+        handle: ReferenceBindingId {
+            source: SourceIdentity::new("project".into(), "package".into(), "metadata".into(), "r1".into()),
+            function_span: ByteSpan::new(0, 2),
+            declaration_span: ByteSpan::new(0, 1),
+            block_span: ByteSpan::new(0, 2),
+            kind: ReferenceBindingKind::Declared,
+        },
+        root: DeferredReborrowRoot::Formal { parameter: 0 },
+        origin: ReferenceOriginId(0),
+    });
+    assert!(matches!(contract_replay_reuse(&proof, true), (false, None)));
+}
+
 fn reset_contract_replay_points(
     live: &mut Vec<ReferenceFlowPoint>,
     pristine: &[ReferenceFlowPoint],
@@ -11257,13 +11312,10 @@ fn transfer_function_output_contracts<'a>(
         }
     }
     if !result.cfg.initial_points.is_empty() && changed {
-        let reuse_structure = result.proof_points.forward_initial_graph.is_some()
-            && result.proof_points.pending_named_reborrow.is_none()
-            && matches!(result.proof_points.scalar_descriptor_install, ScalarDescriptorCandidates::None)
-            && matches!(result.proof_points.backing_descriptor_install, ScalarDescriptorCandidates::None);
-        let reuse_topology = reuse_structure
-            && result.proof_points.scope_exit_bindings.is_some()
-            && result.cfg.points.len() == result.cfg.initial_points.len();
+        let (reuse_structure, topology) = contract_replay_reuse(
+            &result.proof_points,
+            result.cfg.points.len() == result.cfg.initial_points.len(),
+        );
         reset_contract_replay_points(&mut result.cfg.points, &result.cfg.initial_points, reuse_structure);
         let candidate = match (&result.proof_points.scalar_descriptor_install, &result.proof_points.backing_descriptor_install) {
             (ScalarDescriptorCandidates::One(destination, marker), _) => Some((destination, marker)),
@@ -11280,9 +11332,7 @@ fn transfer_function_output_contracts<'a>(
                     invalid: false, exited: false })
         });
         let mut transfer = ReferenceTransferCfg::new(&mut result.cfg, Some(&result.proof_points));
-        if reuse_topology {
-            transfer.forward_initial_graph = result.proof_points.forward_initial_graph;
-        }
+        transfer.forward_initial_graph = topology;
         let transferred = transfer_reference_facts(
             transfer,
             &BTreeMap::new(),
