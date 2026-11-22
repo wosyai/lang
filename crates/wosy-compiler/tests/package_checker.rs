@@ -1018,6 +1018,52 @@ fn named_proof_show_conjunction_normalizes_exact_bounds_and_preserves_holes() {
 }
 
 #[test]
+fn named_proof_show_old_checks_immutable_entry_and_independent_output_bound() {
+    let identity = source();
+    let check = |target: &str, guard: &str, ensures: &str, claim: &str, actual: &str| {
+        check_scalar_module_proof(
+            identity.clone(), "demonstrate",
+            vec![ScalarProofModuleInput {
+                source: identity.clone(),
+                text: format!(r#"%%start
+                    i16(i16, i16) echo = fn(tag, value) {{ if (tag == 0) {{}}; value }};
+                    i16(i16, i16) fixed = fn(tag, value) {{ if (tag == 0) {{}}; if (value == 0) {{}}; 7 }};
+                    i16(u8, i16) width = fn(tag, value) {{ if (tag == 0) {{}}; value }};
+                    i16(i16, i16) literal_then_alias = fn(tag, value) {{
+                        if (value == 0) {{}}; if (tag == 0) {{ 7 }} else {{ tag }}
+                    }};
+                    i16(i16, i16) alias_then_literal = fn(tag, value) {{
+                        if (value == 0) {{}}; if (tag == 0) {{ tag }} else {{ 7 }}
+                    }};
+                    i16(i16, i16) changed = fn(tag, value) {{ if (tag == 0) {{}}; if (value == 0) {{}}; value = 7; value }};
+                    {actual}
+                    proof demonstrate for {target}(tag, original) -> (out) where ({guard}) ensures ({ensures}) {{
+                        core.show({claim});
+                    }}
+                %%end"#),
+                namespaces: Vec::new(),
+            }],
+            vec![identity.clone()], ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
+        )
+    };
+    let compare = "out >= core.old(original)";
+    let strict = "out > core.old(original)";
+    assert_eq!(check("echo", "original <= 7", "out <= 7", compare, ""), ScalarModuleProofOutcome::Proved);
+    assert_eq!(check("echo", "original <= 7", "out <= 7", strict, ""), ScalarModuleProofOutcome::Refuted);
+    assert_eq!(check("fixed", "original <= 6", "out <= 7", strict, ""), ScalarModuleProofOutcome::Proved);
+    assert_eq!(check("fixed", "original <= 7", "out <= 7", strict, ""), ScalarModuleProofOutcome::Refuted);
+    assert_eq!(check("fixed", "original <= 6", "out < 7", strict, ""), ScalarModuleProofOutcome::Refuted);
+    assert_eq!(check("fixed", "false", "out <= 7", strict, ""), ScalarModuleProofOutcome::NoApplicableInputs);
+    for target in ["literal_then_alias", "alias_then_literal"] {
+        assert_eq!(check(target, "original == 7", "out <= 7", strict, ""), ScalarModuleProofOutcome::Unsupported);
+    }
+    assert_eq!(check("changed", "original <= 7", "out <= 7", compare, ""), ScalarModuleProofOutcome::Unsupported);
+    assert_eq!(check("width", "original <= 7", "out <= 7", "out >= core.old(tag)", ""), ScalarModuleProofOutcome::Unsupported);
+    assert!(matches!(check("echo", "true", "out <= 7", "out >= core.old(null)", ""), ScalarModuleProofOutcome::Invalid(_)));
+    assert_eq!(check("echo", "original <= 7", "out <= 7", compare, "i16 live = echo(0, 7);"), ScalarModuleProofOutcome::Unsupported);
+}
+
+#[test]
 fn sequential_named_proof_shows_verify_each_claim_without_replacing_ensures() {
     let identity = source();
     let check = |target: &str, guard: &str, goal: &str, steps: &str, startup: &str| {

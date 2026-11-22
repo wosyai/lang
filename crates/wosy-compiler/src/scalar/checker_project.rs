@@ -3676,6 +3676,34 @@ fn normalize_output_disjunction(
     IntegerSet::comparison_union(output, (*left_relation, left_bound), (*right_relation, right_bound))
 }
 
+fn checked_old_output_relation(
+    expression: &ScalarExpression, output: &str, inputs: &[String], body: &FunctionCallSites, result: &ScalarType,
+) -> Option<Result<(usize, IntegerRelation), ProjectCheck>> {
+    let ScalarExpression::Binary { operator, left, right, .. } = expression else { return None; };
+    let ScalarExpression::Call { receiver: Some(core), name: old, type_arguments, arguments, .. } = right.as_ref()
+        else { return None; };
+    if core != "core" || old != "old" {
+        return None;
+    }
+    Some((|| {
+        let relation = IntegerRelation::from_operator(operator).ok_or(ProjectCheck::Unsupported)?;
+        let ScalarExpression::Name { name: out, .. } = left.as_ref() else { return Err(ProjectCheck::Unsupported); };
+        let [ScalarExpression::Name { name: input, .. }] = arguments.as_slice() else { return Err(ProjectCheck::Unsupported); };
+        if !type_arguments.is_empty() {
+            return Err(ProjectCheck::Unsupported);
+        }
+        if out != output || is_null_literal_name(out) || is_null_literal_name(input) {
+            return Err(ProjectCheck::InvalidProof);
+        }
+        let slot = inputs.iter().position(|name| name == input).ok_or(ProjectCheck::InvalidProof)?;
+        let parameters = &body.boundary.parameters;
+        if !matches!(parameters.len(), 1 | 2) || parameters.get(slot).is_none_or(|parameter| &parameter.ty != result) {
+            return Err(ProjectCheck::Unsupported);
+        }
+        Ok((slot, relation))
+    })())
+}
+
 fn typed_proof_postcondition<'a, const AUDIT_INDUCTION: bool, const DEFER_OUTPUT_UNION: bool>(
     prepared: &'a PreparedCheckerProject,
     (module, item, function): (usize, usize, &'a ScalarFunction),
@@ -3739,28 +3767,8 @@ fn typed_proof_postcondition<'a, const AUDIT_INDUCTION: bool, const DEFER_OUTPUT
             let (operator, relation, bound) = checked_literal_output_goal(ensures, output, &input_names, &result.ty)?;
             TypedProofGoal::Literal { operator, relation, bound }
         } else {
-            let ScalarExpression::Binary { operator, left, right, .. } = &ensures else {
-                return Err(ProjectCheck::Unsupported);
-            };
-            let relation = IntegerRelation::from_operator(operator).ok_or(ProjectCheck::Unsupported)?;
-            let (ScalarExpression::Name { name: out, .. }, ScalarExpression::Call {
-                receiver: Some(core), name: old, type_arguments, arguments, ..
-            }) = (left.as_ref(), right.as_ref()) else {
-                return Err(ProjectCheck::Unsupported);
-            };
-            if core != "core" || old != "old" || !type_arguments.is_empty() {
-                return Err(ProjectCheck::Unsupported);
-            }
-            let [ScalarExpression::Name { name: input, .. }] = arguments.as_slice() else {
-                return Err(ProjectCheck::Unsupported);
-            };
-            if out != output || is_null_literal_name(out) || is_null_literal_name(input) {
-                return Err(ProjectCheck::InvalidProof);
-            }
-            let slot = input_names.iter().position(|name| name == input).ok_or(ProjectCheck::InvalidProof)?;
-            if !matches!(boundary.parameters.len(), 1 | 2) || boundary.parameters[slot].ty != result.ty {
-                return Err(ProjectCheck::Unsupported);
-            }
+            let (slot, relation) = checked_old_output_relation(&ensures, output, &input_names, body, &result.ty)
+                .ok_or(ProjectCheck::Unsupported)??;
             TypedProofGoal::EntryComparison { slot, relation }
         }
     };
@@ -4169,6 +4177,11 @@ fn proof_show_plan<'a, const VERIFY_ENTRY_WRITES: bool, const ALLOW_NAMED_STEPS:
             let claim = proof_show_expression(item, *terminated)?;
             #[cfg(feature = "internal-checker")]
             if ALLOW_NAMED_STEPS {
+                if let Some(entry) = checked_old_output_relation(claim, output, inputs, body, ty) {
+                    let (slot, relation) = entry?;
+                    let binding = bindings.get(slot).ok_or(ProjectCheck::Unsupported)?;
+                    return Ok(IntegerShowProof::EntryComparison { binding, relation });
+                }
                 if let ScalarExpression::Binary { operator: BinaryOperator::Or, left, right, .. } = claim {
                     if inputs.iter().any(|name| is_null_literal_name(name)) {
                         return Err(ProjectCheck::InvalidProof);

@@ -443,6 +443,8 @@ pub(super) enum IntegerShowProof<'a> {
     Sequence(Vec<IntegerReturn<'a>>),
     #[cfg(feature = "internal-checker")]
     Output(IntegerShowOutput),
+    #[cfg(feature = "internal-checker")]
+    EntryComparison { binding: &'a ReferenceBindingId, relation: IntegerRelation },
     Conditional {
         guard: CheckerPredicate,
         then_claim: IntegerReturn<'a>,
@@ -593,12 +595,27 @@ impl IntegerReturningPath<'_> {
         }
     }
 
+    #[cfg(feature = "internal-checker")]
+    fn entry_show_with_output_bound(
+        &self, binding: &ReferenceBindingId, entry_relation: IntegerRelation, relation: IntegerRelation,
+        bound: &BigInt, still_provable: bool,
+    ) -> Option<bool> {
+        match self.value {
+            IntegerReturn::Alias(alias) if alias != binding => None,
+            _ if !still_provable => Some(false),
+            IntegerReturn::Alias(_) => Some(entry_relation.accepts(std::cmp::Ordering::Equal)
+                && self.output_satisfies(relation, bound)?),
+            IntegerReturn::Const(value) => Some(relation.accepts(value.cmp(bound))
+                && self.output_satisfies_immutable_entry(binding, entry_relation)?),
+        }
+    }
+
     fn shows(self, proof: &IntegerShowProof<'_>) -> Option<bool> {
         let (guard, then_claim, else_claim) = match proof {
             IntegerShowProof::Equality(claim) => return shows_return_equality(&self.state, &self.axes, &self.value, claim),
             IntegerShowProof::Sequence(_) => return None,
             #[cfg(feature = "internal-checker")]
-            IntegerShowProof::Output(_) => return None,
+            IntegerShowProof::Output(_) | IntegerShowProof::EntryComparison { .. } => return None,
             IntegerShowProof::Conditional { guard, then_claim, else_claim } => (guard, then_claim, else_claim),
         };
         let (yes, no) = match guard {
@@ -1006,6 +1023,14 @@ fn check_integer_return_bound_in_scope<'a>(
                     return None;
                 }
             }
+        }
+        return Some(Ok(ProofCoverage::Applicable(proved)));
+    }
+    #[cfg(feature = "internal-checker")]
+    if let Some(IntegerShowProof::EntryComparison { binding, relation: entry_relation }) = proof {
+        let mut proved = true;
+        for path in &paths {
+            proved = path.entry_show_with_output_bound(binding, *entry_relation, relation, bound, proved)?;
         }
         return Some(Ok(ProofCoverage::Applicable(proved)));
     }
