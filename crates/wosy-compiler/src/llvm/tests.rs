@@ -9189,16 +9189,18 @@ u8(Pair) inspect = fn(owner) {
 
 #[test]
 fn emits_known_shared_projected_leaf_from_the_original_owner_through_the_ordinary_driver() {
-    let source = r#"%%start
-struct copy Pair { u8 left; u8 right; }
-u8(Pair) inspect = fn(owner) {
-    *Pair parent = &owner;
+    for (layout, mode, left) in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64]
+        .into_iter().flat_map(|layout| [(layout, "", "owner.left"), (layout, "!", "(*parent).left")])
+    {
+        let source = format!(r#"%%start
+struct copy Pair {{ u8 left; u8 right; }}
+u8(Pair) inspect = fn(owner) {{
+    *{mode}Pair parent = &{mode}owner;
     *u8 leaf = &(*parent).right;
-    owner.left + *leaf
-};
-%%end"#;
-    for layout in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
-        let prepared = prepare_initializer_test(source, layout);
+    {left} + *leaf
+}};
+%%end"#);
+        let prepared = prepare_initializer_test(&source, layout);
         let build = analyze_scalar_build(&prepared);
         assert!(build.diagnostics().is_empty(), "{:?}", build.diagnostics());
         for partition in [
@@ -9231,7 +9233,12 @@ u8(Pair) inspect = fn(owner) {
                 assert_eq!(read.get_opcode(), InstructionOpcode::Load);
                 known_field_operand(read, 0).expect("actual field address")
             });
-            let (direct_owner, direct_offset) = known_direct_field_path(direct).expect("direct owner field");
+            let (direct_base, direct_offset) = known_direct_field_path(direct).expect("left owner field");
+            let direct_owner = if mode.is_empty() {
+                direct_base
+            } else {
+                known_checked_address(&instructions, direct_base).expect("mutable checked parent owner")
+            };
             let (through_parent, leaf_offset) = known_checked_field_path(&instructions, checked)
                 .expect("read through the projected checked leaf");
             let loan_owner = known_checked_address(&instructions, through_parent).expect("whole checked parent");
