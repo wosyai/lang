@@ -101,6 +101,7 @@ pub enum SyntaxKind {
     ProofQuantifierGuard = 88,
     ProofExists = 89,
     IndexFieldSuffix = 90,
+    DirectFieldChainTail = 91,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -201,6 +202,7 @@ impl Language for WosyLanguage {
             88 => SyntaxKind::ProofQuantifierGuard,
             89 => SyntaxKind::ProofExists,
             90 => SyntaxKind::IndexFieldSuffix,
+            91 => SyntaxKind::DirectFieldChainTail,
             _ => panic!("invalid syntax kind: {}", raw.0),
         }
     }
@@ -850,6 +852,7 @@ fn kind(rule: Rule) -> SyntaxKind {
         Rule::indexed_place | Rule::indexed_value_place => SyntaxKind::IndexedPlace,
         Rule::index_suffix => SyntaxKind::IndexSuffix,
         Rule::index_field_suffix => SyntaxKind::IndexFieldSuffix,
+        Rule::direct_field_chain_tail => SyntaxKind::DirectFieldChainTail,
         Rule::place_target => SyntaxKind::PlaceTarget,
         Rule::primary => SyntaxKind::Primary,
         Rule::error_item => SyntaxKind::Error,
@@ -974,6 +977,25 @@ mod tests {
                 .count(),
             8
         );
+    }
+
+    #[test]
+    fn named_field_chains_keep_lossless_suffixes_and_legacy_members() {
+        let text = "%%start\nu8 x = map.finish # note: field\n .center.x;\nmap.home.x = x;\n*u8 v = &map.home.x;\nu8 y = map.home.x[0];\nu8 z = map.home;\nTag t = defs.Tag::up;\n%%end";
+        let parsed = parse(identity(), text.into(), &["note".to_owned()]);
+        assert!(parsed.is_valid(), "{:?}", parsed.errors);
+        assert_eq!(parsed.reconstruct(), text);
+        let tails: Vec<_> = parsed.root.descendants()
+            .filter(|node| node.kind() == SyntaxKind::DirectFieldChainTail)
+            .map(|node| node.text().to_string())
+            .collect();
+        assert_eq!(tails, [".center.x", ".x ", ".x", ".x"]);
+        let members: Vec<_> = parsed.root.descendants()
+            .filter(|node| node.kind() == SyntaxKind::QualifiedMember)
+            .filter(|node| node.children().next().is_none())
+            .map(|node| node.text().to_string())
+            .collect();
+        assert_eq!(members, ["map.home", "defs.Tag::up"]);
     }
 
     #[test]
