@@ -2959,9 +2959,8 @@ impl PreparedProofModule {
                         let holds = if let TypedProofGoal::EntryComparison { slot, relation } = goal {
                             ImmutableProofOutputComparison::prepare(body, *slot, plan.typed.result_type, *relation)
                                 .and_then(|entry| entry.holds(&paths, None))
-                        } else if let TypedProofGoal::EntryWitness { slot, domain } = goal {
-                            IntegerRelation::from_operator(&BinaryOperator::Equal)
-                                .and_then(|relation| ImmutableProofOutputComparison::prepare(body, *slot, plan.typed.result_type, relation))
+                        } else if let TypedProofGoal::EntryWitness { slot, relation, domain } = goal {
+                            ImmutableProofOutputComparison::prepare(body, *slot, plan.typed.result_type, *relation)
                                 .and_then(|entry| entry.holds_existential_witness(&paths, domain))
                                 .and_then(|verified| verified.then_some(true))
                         } else if let TypedProofGoal::MixedEntryConjunction { output, entry } = goal {
@@ -3350,12 +3349,12 @@ impl SelectedProofObserver<'_> {
                         Some(relation.accepts(value.cmp(bound))),
                     TypedProofGoal::Existential { relation, witness, witness_in_domain } =>
                         (*witness_in_domain && relation.accepts(value.cmp(witness))).then_some(true),
-                    TypedProofGoal::EntryWitness { slot, domain } => {
+                    TypedProofGoal::EntryWitness { slot, relation, domain } => {
                         let Some(candidate) = arguments.get(*slot) else {
                             self.coverage = ActualProofCoverage::Unsupported;
                             return;
                         };
-                        (value == *candidate && domain.contains(candidate)).then_some(true)
+                        (relation.accepts(value.cmp(candidate)) && domain.contains(candidate)).then_some(true)
                     },
                     TypedProofGoal::Disjunction(allowed) => Some(allowed.contains(value)),
                     TypedProofGoal::DeferredDisjunction(_) => None,
@@ -3517,7 +3516,7 @@ enum TypedProofGoal {
     Universal { relation: IntegerRelation, bound: BigInt },
     Existential { relation: IntegerRelation, witness: BigInt, witness_in_domain: bool },
     #[cfg(feature = "internal-checker")]
-    EntryWitness { slot: usize, domain: IntegerSet },
+    EntryWitness { slot: usize, relation: IntegerRelation, domain: IntegerSet },
     EntryComparison { slot: usize, relation: IntegerRelation },
     #[cfg(feature = "internal-checker")]
     MixedEntryConjunction { output: IntegerShowConstraints<'static>, entry: [Option<IntegerRelation>; 2] },
@@ -3648,9 +3647,13 @@ fn typed_existential_output_goal(
 ) -> Result<TypedProofGoal, ProjectCheck> {
     let (ty, binder) = typed_quantifier_binder(exists, output, inputs, ty)?;
     let predicate = derive_expression(&child(exists, SyntaxKind::Expression)?);
-    let ScalarExpression::Binary { operator: BinaryOperator::Equal, left, right, .. } = predicate else {
+    let ScalarExpression::Binary { operator, left, right, .. } = predicate else {
         return Err(ProjectCheck::Unsupported);
     };
+    if operator != BinaryOperator::Equal && (!cfg!(feature = "internal-checker") || !allow_named_entry_facts) {
+        return Err(ProjectCheck::Unsupported);
+    }
+    let relation = IntegerRelation::from_operator(&operator).ok_or(ProjectCheck::Unsupported)?;
     if !matches!(left.as_ref(), ScalarExpression::Name { name, .. } if name == output)
         || !matches!(right.as_ref(), ScalarExpression::Name { name, .. } if name == &binder)
     {
@@ -3682,7 +3685,7 @@ fn typed_existential_output_goal(
                 return Err(ProjectCheck::Unsupported);
             }
             let domain = typed_quantifier_domain(exists, &binder, inputs, &ty)?;
-            return Ok(TypedProofGoal::EntryWitness { slot, domain });
+            return Ok(TypedProofGoal::EntryWitness { slot, relation, domain });
         }
     }
     let witness = concrete_integer_literal(argument).ok_or(ProjectCheck::Unsupported)?;
@@ -3690,7 +3693,6 @@ fn typed_existential_output_goal(
         return Err(ProjectCheck::InvalidProof);
     }
     let domain = typed_quantifier_domain(exists, &binder, inputs, &ty)?;
-    let relation = IntegerRelation::from_operator(&BinaryOperator::Equal).expect("integer equality");
     let witness_in_domain = domain.contains(witness.as_ref());
     Ok(TypedProofGoal::Existential { relation, witness: witness.into_owned(), witness_in_domain })
 }

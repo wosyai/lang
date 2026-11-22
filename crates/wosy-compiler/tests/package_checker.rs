@@ -2911,6 +2911,55 @@ fn named_universal_goal_cannot_issue_a_reusable_literal_bound() {
 }
 
 #[test]
+fn named_existential_proof_verifies_all_exact_integer_predicates_for_chosen_witness() {
+    let identity = source();
+    let check = |signature: &str, body: &str, candidate: &str, operator: &str, where_guard: &str, startup: &str| {
+        check_scalar_module_proof(
+            identity.clone(), "prove",
+            vec![ScalarProofModuleInput {
+                source: identity.clone(),
+                text: format!(r#"%%start
+                    i16({signature}) choose = fn(left, right) {{ {body} }};
+                    {startup}
+                    proof prove for choose(first, second) -> (out) where ({where_guard})
+                        ensures (exists (i16 k where k >= -8 && k != -7) {{ out {operator} k }}) {{
+                            core.witness({candidate});
+                        }}
+                %%end"#),
+                namespaces: Vec::new(),
+            }],
+            vec![identity.clone()], ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
+        )
+    };
+    use ScalarModuleProofOutcome::{Invalid, NoApplicableInputs, Proved, Unsupported};
+    let left = "if (right == 0) {}; left";
+    let right = "if (left == 0) {}; right";
+    let before = "first <= -9 && second >= -8 && second <= -6 && second != -7";
+    for operator in ["<", "<=", "!="] {
+        assert_eq!(check("i16, i16", left, "second", operator, before, ""), Proved);
+    }
+    for operator in [">", ">=", "=="] {
+        assert_eq!(check("i16, i16", left, "second", operator, before, ""), Unsupported);
+    }
+    let after = "first >= -5 && second >= -8 && second <= -6 && second != -7";
+    for operator in [">", ">="] {
+        assert_eq!(check("i16, i16", left, "second", operator, after, ""), Proved);
+    }
+    assert_eq!(check("i16, i16", right, "second", "!=", "second == -8", ""), Unsupported);
+    assert_eq!(check("i16, i16", left, "second", "!=", "first == -7 && second >= -8 && second <= -6 && second != -7", ""), Proved);
+    assert_eq!(check("i16, i16", left, "second", "!=", "first == -6 && second >= -8 && second <= -6 && second != -7", ""), Unsupported);
+    assert_eq!(check("i16, i16", left, "-8", "<", "first <= -9", ""), Proved);
+    assert_eq!(check("i16, i16", left, "-7", "<", "first <= -9", ""), Unsupported);
+    assert_eq!(check("i16, i16", left, "second", "<", "true",
+        "i16 a = choose(-9, -8); i16 b = choose(-8, -6);"), Proved);
+    assert_eq!(check("i16, i16", left, "second", "<", "true",
+        "i16 a = choose(-9, -8); i16 wrong = choose(-6, -6); i16 b = choose(-8, -6);"), Unsupported);
+    assert_eq!(check("i16, i16", left, "second", "<", "false", "i16 a = choose(-9, -8);"), NoApplicableInputs);
+    assert_eq!(check("u8, i16", right, "first", "<", "true", ""), Unsupported);
+    assert!(matches!(check("u8, i16", right, "out", ">", "true", ""), Invalid(_)));
+}
+
+#[test]
 fn named_proof_entry_witness_checks_domain_and_output_in_same_context() {
     let identity = source();
     let check = |signature: &str, body: &str, candidate: &str, where_guard: &str, startup: &str| {

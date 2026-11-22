@@ -929,24 +929,29 @@ impl<'a> ImmutableProofOutputComparison<'a> {
     pub(super) fn holds_existential_witness(
         &self, paths: &[IntegerReturningPath<'_>], domain: &IntegerSet,
     ) -> Option<bool> {
+        let equal = IntegerRelation::from_operator(&BinaryOperator::Equal)?;
+        let reversed = self.relation.reversed();
+        let reflexive = self.relation.accepts(std::cmp::Ordering::Equal);
         for path in paths {
             let witness = path.axes.iter().position(|known| *known == self.binding)?;
             let other = match path.value {
                 IntegerReturn::Alias(binding) if binding != self.binding => {
-                    let (other, _) = self.other?;
+                    let (other, comparison) = self.other?;
                     if binding != other {
                         return None;
                     }
-                    Some(path.axes.iter().position(|known| *known == other)?)
+                    Some((path.axes.iter().position(|known| *known == other)?, comparison))
                 }
                 _ => None,
             };
             for row in &path.state.0 {
                 let candidate = &row[witness];
                 let matches = match (path.value, other) {
-                    (IntegerReturn::Const(value), _) => candidate.singleton_value() == Some(value),
-                    (IntegerReturn::Alias(_), Some(other)) => CartesianRelation::Equal.holds(&row[other], candidate)?,
-                    (IntegerReturn::Alias(_), None) => true,
+                    (IntegerReturn::Const(value), _) if self.relation == equal =>
+                        candidate.singleton_value() == Some(value),
+                    (IntegerReturn::Const(value), _) => candidate.every_at_extremes(reversed, value),
+                    (IntegerReturn::Alias(_), Some((other, comparison))) => comparison.holds(&row[other], candidate)?,
+                    (IntegerReturn::Alias(_), None) => reflexive,
                 };
                 if !matches || !candidate.is_subset_of(domain) {
                     return Some(false);
