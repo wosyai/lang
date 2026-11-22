@@ -130,6 +130,31 @@ mod tests {
     }
 
     #[test]
+    fn fallible_local_assignment_is_rejected_before_build_lowering() {
+        let source = SourceIdentity::new(
+            "project".into(), "package".into(), "src/main.w".into(), "r1".into(),
+        );
+        let text = "%%start\ni32() example = fn {\n\ti32 result =? 3;\n\tresult\n};\n%%end";
+        let output = parse_source(source.clone(), text.into(), &[]);
+        assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
+        let scalar = derive_scalar_program(&output.result);
+        let [diagnostic] = scalar.diagnostics.as_slice() else {
+            panic!("{:?}", scalar.diagnostics);
+        };
+        assert_eq!(diagnostic.code, "B0003");
+        assert_eq!(diagnostic.message, "fallible allocation assignment is not supported by build yet");
+        let range = diagnostic.labels[0].span.range;
+        assert_eq!(&text[range.start as usize..range.end as usize], "=?");
+        assert!(emit_scalar_llvm(&scalar).is_err());
+
+        let ordinary = parse_source(source, text.replace("=?", "="), &[]);
+        assert!(ordinary.diagnostics.is_empty(), "{:?}", ordinary.diagnostics);
+        let scalar = derive_scalar_program(&ordinary.result);
+        assert!(scalar.diagnostics.is_empty(), "{:?}", scalar.diagnostics);
+        emit_scalar_llvm(&scalar).expect("ordinary assignment LLVM");
+    }
+
+    #[test]
     fn validates_an_ordinary_function_named_while() {
         let text = "%%start\ni32(i32) while = fn(value) { value };\ni32 result = while(2);\n%%end";
         let output = parse_source(

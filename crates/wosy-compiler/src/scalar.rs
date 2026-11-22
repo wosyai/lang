@@ -2504,8 +2504,10 @@ pub fn derive_scalar_diagnostics_from_cst(canonical: &CanonicalCstRoot) -> Vec<s
     let mut diagnostics = string_diagnostics(canonical);
     diagnostics.extend(char_diagnostics(canonical));
     diagnostics.extend(integer_diagnostics(canonical));
-    diagnostics.extend(float_diagnostics(canonical));
+    let mut fallible_assignments = Vec::new();
+    diagnostics.extend(float_and_fallible_assignment_diagnostics(canonical, &mut fallible_assignments));
     diagnostics.extend(fixed_array_length_diagnostics(canonical));
+    diagnostics.extend(fallible_assignments);
     diagnostics
 }
 
@@ -4095,7 +4097,10 @@ fn parse_float(text: &str) -> Option<f64> {
     value.is_finite().then_some(value)
 }
 
-fn float_diagnostics(canonical: &CanonicalCstRoot) -> Vec<super::Diagnostic> {
+fn float_and_fallible_assignment_diagnostics(
+    canonical: &CanonicalCstRoot,
+    fallible_assignments: &mut Vec<super::Diagnostic>,
+) -> Vec<super::Diagnostic> {
     canonical
         .root
         .descendants_with_tokens()
@@ -4114,6 +4119,20 @@ fn float_diagnostics(canonical: &CanonicalCstRoot) -> Vec<super::Diagnostic> {
                         }],
                         notes: Vec::new(),
                     })
+            }
+            NodeOrToken::Token(token) if token.kind() == SyntaxKind::FallibleAssignmentOperator => {
+                fallible_assignments.push(super::Diagnostic {
+                    code: "B0003".to_owned(),
+                    severity: super::DiagnosticSeverity::Error,
+                    message: "fallible allocation assignment is not supported by build yet".to_owned(),
+                    labels: vec![super::DiagnosticLabel {
+                        kind: super::DiagnosticLabelKind::Primary,
+                        span: SourceSpan::new(canonical.source.clone(), token_span(&token)),
+                        message: "managed allocation failure is not lowered for this operator".to_owned(),
+                    }],
+                    notes: Vec::new(),
+                });
+                None
             }
             _ => None,
         })

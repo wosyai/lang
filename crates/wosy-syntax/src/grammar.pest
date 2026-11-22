@@ -50,7 +50,10 @@ block_item = { local_binding | if_block_item | unsafe_block_item ~ !";" | expres
 unsafe_block_item = { unsafe_expr }
 if_block_item = { conditional_expr ~ !";" ~ !"}" }
 final_output_list = { output_list }
-local_binding = { allocation_binding | receiver_list ~ "=" ~ output_list ~ ";" }
+local_binding = { allocation_binding | fallible_receiver_list ~ fallible_assignment_operator ~ single_output_list ~ ";" | receiver_list ~ "=" ~ output_list ~ ";" }
+fallible_receiver_list = { receiver }
+fallible_assignment_operator = @{ "=?" }
+single_output_list = { expression }
 allocation_binding = { runtime_receiver ~ ";" }
 runtime_receiver = { type_name ~ "[" ~ expression ~ "]" ~ identifier }
 expression = { conditional_expr | unsafe_expr | assignment | logical_or }
