@@ -11179,8 +11179,14 @@ fn reset_contract_replay_points(
     pristine: &[ReferenceFlowPoint],
     reuse_structure: bool,
 ) {
-    if !reuse_structure || live.len() != pristine.len() {
+    if live.len() != pristine.len() {
         *live = pristine.to_vec();
+        return;
+    }
+    if !reuse_structure {
+        for (live, pristine) in live.iter_mut().zip(pristine) {
+            *live = pristine.clone();
+        }
         return;
     }
     for (live, pristine) in live.iter_mut().zip(pristine) {
@@ -11239,10 +11245,12 @@ fn contract_replay_reset_borrows_only_immutable_point_structure() {
     assert!(keep_forward_point_in_place(&call.kind, true, 1));
     let pristine = [call.clone()];
     let mut live = vec![call];
+    let outer_allocation = live.as_ptr();
     let allocation = live[0].successors.as_ptr();
     reset_contract_replay_points(&mut live, &pristine, true);
     assert_eq!(live[0].successors.as_ptr(), allocation);
     reset_contract_replay_points(&mut live, &pristine, false);
+    assert_eq!(live.as_ptr(), outer_allocation);
     assert_ne!(live[0].successors.as_ptr(), allocation);
 }
 
