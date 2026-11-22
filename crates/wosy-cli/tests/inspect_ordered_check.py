@@ -55,6 +55,17 @@ PREIMAGE = """
     };
 """
 
+GUARDED = """%%start
+    i16(i16) producer = fn(value) { if (value >= 0) { 7 } else { value + 1 } };
+    unit(i16) caller = fn(value) {
+        core.narrow(value >= 0, { .stdout = ""; .stderr = ""; .code = 11; .files = []; });
+        i16 result = producer(value);
+        core.require(result == 7, { .stdout = ""; .stderr = ""; .code = 71; .files = []; });
+    };
+    proof bounded for producer(entry) -> (out) where (entry >= 0) ensures (out == 7) {}
+%%end
+"""
+
 EXPECTED = (
     b"ordered check: complete\n"
     b"directive failures: 1\n"
@@ -93,6 +104,19 @@ def main():
         assert wrong_axis.returncode == 1, wrong_axis
         assert wrong_axis.stdout == preimage.stdout.split(b"directive 1 entry:", 1)[0], wrong_axis
         assert wrong_axis.stderr == b"", wrong_axis
+
+        source.write_text(GUARDED, encoding="utf-8")
+        admitted = subprocess.run(command, cwd=root, capture_output=True, timeout=15)
+        assert admitted.returncode == 0, admitted
+        assert admitted.stdout == (
+            b"ordered check: complete\ndirective failures: 0\n"
+            b"actual proof failures: 0 (0 nested)\nunused proof failures: 0\n"
+        ), admitted
+        assert admitted.stderr == b"", admitted
+        source.write_text(GUARDED.replace("core.narrow(value >= 0", "core.narrow(value >= -1"), encoding="utf-8")
+        partial = subprocess.run(command, cwd=root, capture_output=True, timeout=15)
+        assert partial.returncode == 2 and partial.stdout == b"", partial
+        assert partial.stderr == b"ordered check: incomplete: checker did not complete analysis\n", partial
 
         incomplete_program = PROGRAM.replace("unused = fn(value) { value }", "unused = fn(value) { value + 1 }")
         assert incomplete_program != PROGRAM

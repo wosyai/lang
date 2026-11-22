@@ -2179,11 +2179,15 @@ impl SelectedSymbolicProof<'_, '_> {
         if target.0 != summary.target.0 || target.1 <= summary.target.1
             || !calls.assignments.is_empty() || !calls.allocation_length_calls.is_empty()
             || !matches!(calls.boundary.results.as_slice(), [result] if result.ty == ScalarType::Unit)
-            || calls.structure.checker_directives.len() != 1
         {
             return Ok(None);
         }
-        let Some((position, origin)) = root_local_import_requirement(calls) else { return Ok(None); };
+        let candidate = match calls.structure.checker_directives.len() {
+            1 => root_local_import_requirement(calls),
+            2 => summary.guard.as_ref().and_then(|guard| root_local_import_requirement_after_narrow(calls, guard.slot)),
+            _ => None,
+        };
+        let Some((position, origin)) = candidate else { return Ok(None); };
         if !matches!(calls.call_occurrences.as_slice(), [call] if call.ordinal == origin.call) {
             return Ok(None);
         }
@@ -6371,7 +6375,37 @@ fn root_local_import_requirement(body: &FunctionCallSites) -> Option<(usize, &Ch
         !matches!(item.kind, BlockItemKind::Binding(_))
             || !structure.checker_integer_locals.contains_key(&(root, item.position))
     })?;
-    let [binding_item, requirement_item, tail @ ..] = &items[first_nonliteral..] else {
+    root_local_import_requirement_at(body, &items[first_nonliteral..])
+}
+
+#[cfg(feature = "internal-checker")]
+fn root_local_import_requirement_after_narrow(
+    body: &FunctionCallSites, guarded_slot: usize,
+) -> Option<(usize, &CheckerIntegerCallOrigin)> {
+    use super::reference::CheckerIntegerCallArgument;
+    let structure = &body.structure;
+    let [first, rest @ ..] = structure.blocks.get(structure.root.0)?.items.as_slice() else { return None; };
+    let BlockItemKind::Evaluation { expression } = first.kind else { return None; };
+    let directive = structure.checker_directives.get(&expression)?;
+    let CheckerPredicate::Integer(narrow) = directive.predicate.as_ref()? else { return None; };
+    if directive.operation != CheckerOperation::Narrow {
+        return None;
+    }
+    let (position, origin) = root_local_import_requirement_at(body, rest)?;
+    let (argument, CheckerIntegerCallArgument::PlainName) = origin.arguments.as_slice().get(guarded_slot)? else { return None; };
+    let super::reference::PlainNameIdentity::Lexical(binding) = body.prepared_plain_name(*argument)? else { return None; };
+    if binding != &narrow.binding || structure.checked_types.expressions.get(argument)? != &narrow.ty {
+        return None;
+    }
+    Some((position, origin))
+}
+
+fn root_local_import_requirement_at<'a>(
+    body: &'a FunctionCallSites, items: &[super::control::BlockItem],
+) -> Option<(usize, &'a CheckerIntegerCallOrigin)> {
+    let structure = &body.structure;
+    let root = structure.root;
+    let [binding_item, requirement_item, tail @ ..] = items else {
         return None;
     };
     if !matches!(binding_item.kind, BlockItemKind::Binding(_))
@@ -8016,6 +8050,17 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
         let overlap = caller.replace("unit() client = fn()", "unit(i16) client = fn(input)")
             .replace("producer(0)", "producer(input)");
         assert!(matches!(run(&module(producer, &overlap, "entry >= 0")), Err(ProjectCheck::Unsupported)));
+
+        let narrowed = overlap.replace("i16 result = producer(input);", &format!("core.narrow(input >= 0, {OUTPUT}); i16 result = producer(input);"));
+        let used = run(&module(producer, &narrowed, "entry >= 0")).unwrap();
+        assert!(used.active && used.directives.is_empty() && used.symbolic_diagnostic.is_none());
+        let partial = narrowed.replace("input >= 0", "input >= -1");
+        assert!(matches!(run(&module(producer, &partial, "entry >= 0")), Err(ProjectCheck::Unsupported)));
+        let empty_caller = narrowed.replace("input >= 0", "input < -32768");
+        let dead = run(&module(producer, &empty_caller, "entry >= 0")).unwrap();
+        assert!(dead.active && dead.symbolic_diagnostic.is_none());
+        let [failure] = dead.directives.as_slice() else { panic!("only the fatal Narrow is reached"); };
+        assert_eq!(failure.operation, ScalarCheckerOperation::Narrow);
 
         let inside = producer.replace("{ input + 1 } else { 7 }", "{ 7 } else { input + 1 }");
         assert!(matches!(run(&module(&inside, &caller, "entry >= 0")), Err(ProjectCheck::Unsupported)));

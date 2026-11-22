@@ -2720,7 +2720,15 @@ fn run_integer_callable<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool,
         return None;
     }
     if USE_IMPORTED_BOUND && roots.imported_local.is_some() {
-        return None;
+        #[cfg(feature = "internal-checker")]
+        let skipped_shared = COLLECT
+            && matches!(&result, IntegerControl::Continue(path) if path.is_unreachable())
+            && matches!(&roots.imported_local, Some(ImportedLocal { values: ImportedIntegerValues::Shared { .. }, .. }));
+        #[cfg(not(feature = "internal-checker"))]
+        let skipped_shared = false;
+        if !skipped_shared {
+            return None;
+        }
     }
     if COLLECT {
         failures.as_deref_mut()?.continuation = match &result {
