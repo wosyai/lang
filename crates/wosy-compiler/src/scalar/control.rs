@@ -17,6 +17,12 @@ pub(crate) use initializer_call_nodes::{
     InitializerFactsError,
 };
 
+#[derive(Clone, Copy)]
+pub(super) enum ForwardInitialGraph {
+    Branched,
+    Linear,
+}
+
 #[derive(Default)]
 pub(crate) struct CallablePointFacts {
     pub(super) evaluations: HashMap<OccurrenceOrdinal, super::CfgPointId>,
@@ -25,7 +31,7 @@ pub(crate) struct CallablePointFacts {
     // None is the explicit detached/unprepared transfer mode.
     pub(super) scope_exit_bindings: Option<HashMap<super::CfgPointId, ScopeExitBindings>>,
     // Set only by provisional transfer on the canonical initial graph.
-    pub(super) strictly_forward_initial_graph: bool,
+    pub(super) forward_initial_graph: Option<ForwardInitialGraph>,
     pub(super) has_grouped_assignment_capture: Option<bool>,
     pub(super) pending_named_reborrow: Option<PendingNamedReborrow>,
     pub(super) raw_address_exposures: Vec<(super::CfgPointId, Option<super::ReferenceBindingId>)>,

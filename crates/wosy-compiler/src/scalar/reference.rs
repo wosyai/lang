@@ -5631,7 +5631,8 @@ impl ScalarDescriptorReplay<'_> {
 struct ReferenceTransferCfg<'a> {
     initial_points: &'a [ReferenceFlowPoint],
     has_grouped_assignment_capture: Option<bool>,
-    strictly_forward_out: Option<&'a mut bool>,
+    forward_initial_graph: Option<super::control::ForwardInitialGraph>,
+    forward_graph_out: Option<&'a mut Option<super::control::ForwardInitialGraph>>,
     scope_exit_bindings: Option<&'a HashMap<CfgPointId, super::control::ScopeExitBindings>>,
     pending_named_reborrow: Option<&'a super::control::PendingNamedReborrow>,
     resolve_pending_named_reborrow: bool,
@@ -5654,7 +5655,8 @@ impl<'a> ReferenceTransferCfg<'a> {
         Self {
             initial_points: &cfg.initial_points,
             has_grouped_assignment_capture: proof.and_then(|proof| proof.has_grouped_assignment_capture),
-            strictly_forward_out: None,
+            forward_initial_graph: None,
+            forward_graph_out: None,
             scope_exit_bindings: proof.and_then(|proof| proof.scope_exit_bindings.as_ref()),
             pending_named_reborrow: proof.and_then(|proof| proof.pending_named_reborrow.as_ref()),
             resolve_pending_named_reborrow: false,
@@ -6208,7 +6210,8 @@ fn transfer_reference_facts(
     let grouped_installs = grouped_assignment_installs(original_points, cfg.has_grouped_assignment_capture);
     let mut last_use = (0..cfg.points.len()).collect::<Vec<_>>();
     let mut strictly_forward = true;
-    let mut unbranched = true;
+    let mut unbranched = !matches!(cfg.forward_initial_graph, Some(super::control::ForwardInitialGraph::Branched));
+    let validate_topology = cfg.forward_initial_graph.is_none();
     let mut projected_leaf_sites = HashMap::new();
     let mut projected_leaf_holders = HashMap::new();
     let mut projected_store_facts = None::<(BTreeSet<ReferenceOriginId>, HashMap<CfgPointId, ReferenceOriginId>)>;
@@ -6273,9 +6276,11 @@ fn transfer_reference_facts(
     };
     let mut dependency_pair = [CfgPointId(0); 2];
     for (index, point) in original_points.iter().enumerate() {
-        strictly_forward = strictly_forward && point.id.0 == index
-            && point.successors.iter().all(|successor| successor.0 > index && successor.0 < original_points.len());
-        unbranched = unbranched && point.successors.len() <= 1;
+        if validate_topology {
+            strictly_forward = strictly_forward && point.id.0 == index
+                && point.successors.iter().all(|successor| successor.0 > index && successor.0 < original_points.len());
+            unbranched = unbranched && point.successors.len() <= 1;
+        }
         aggregate_expiry_allowed = aggregate_expiry_allowed && strictly_forward
             && !matches!(&point.kind, CfgPointKind::MoveThrough { place, .. }
                 if !matches!(place, ScalarPlace::Dereference { .. }));
@@ -6466,8 +6471,12 @@ fn transfer_reference_facts(
             last_use[dependency.0] = point.id.0;
         }
     }
-    if let Some(out) = cfg.strictly_forward_out.as_deref_mut() {
-        *out = strictly_forward;
+    if let Some(out) = cfg.forward_graph_out.as_deref_mut() {
+        *out = strictly_forward.then_some(if unbranched {
+            super::control::ForwardInitialGraph::Linear
+        } else {
+            super::control::ForwardInitialGraph::Branched
+        });
     }
     if !strictly_forward {
         if let Some(descriptor) = descriptor.as_deref_mut() {
@@ -11248,10 +11257,13 @@ fn transfer_function_output_contracts<'a>(
         }
     }
     if !result.cfg.initial_points.is_empty() && changed {
-        let reuse_structure = result.proof_points.strictly_forward_initial_graph
+        let reuse_structure = result.proof_points.forward_initial_graph.is_some()
             && result.proof_points.pending_named_reborrow.is_none()
             && matches!(result.proof_points.scalar_descriptor_install, ScalarDescriptorCandidates::None)
             && matches!(result.proof_points.backing_descriptor_install, ScalarDescriptorCandidates::None);
+        let reuse_topology = reuse_structure
+            && result.proof_points.scope_exit_bindings.is_some()
+            && result.cfg.points.len() == result.cfg.initial_points.len();
         reset_contract_replay_points(&mut result.cfg.points, &result.cfg.initial_points, reuse_structure);
         let candidate = match (&result.proof_points.scalar_descriptor_install, &result.proof_points.backing_descriptor_install) {
             (ScalarDescriptorCandidates::One(destination, marker), _) => Some((destination, marker)),
@@ -11267,8 +11279,12 @@ fn transfer_function_output_contracts<'a>(
                 .then_some(ScalarDescriptorReplay { candidate: marker.as_ref(), passive: result.aggregate.passive_descriptor_read.as_deref().filter(|_| marker.validate_backing),
                     invalid: false, exited: false })
         });
+        let mut transfer = ReferenceTransferCfg::new(&mut result.cfg, Some(&result.proof_points));
+        if reuse_topology {
+            transfer.forward_initial_graph = result.proof_points.forward_initial_graph;
+        }
         let transferred = transfer_reference_facts(
-            ReferenceTransferCfg::new(&mut result.cfg, Some(&result.proof_points)),
+            transfer,
             &BTreeMap::new(),
             inputs,
             None,
@@ -11560,7 +11576,8 @@ fn derive_function_specialized_copy_policies(
                 ReferenceTransferCfg {
                     initial_points: &template_cfg.initial_points,
                     has_grouped_assignment_capture: template_result.proof_points.has_grouped_assignment_capture,
-                    strictly_forward_out: None,
+                    forward_initial_graph: None,
+                    forward_graph_out: None,
                     scope_exit_bindings: template_result.proof_points.scope_exit_bindings.as_ref(),
                     pending_named_reborrow: template_result.proof_points.pending_named_reborrow.as_ref(),
                     resolve_pending_named_reborrow: false,
@@ -11913,9 +11930,9 @@ fn build_function_reference_cfg(
             call_sites,
             &mut aggregate,
         ));
-        let mut strictly_forward_initial_graph = false;
+        let mut forward_initial_graph = None;
         let mut provisional_cfg = ReferenceTransferCfg::new(&mut builder.cfg, Some(&builder.proof_points));
-        provisional_cfg.strictly_forward_out = Some(&mut strictly_forward_initial_graph);
+        provisional_cfg.forward_graph_out = Some(&mut forward_initial_graph);
         provisional_cfg.provisional_origin_index = provisional_origin_index.as_mut();
         provisional_cfg.resolve_pending_named_reborrow = true;
         let provisional = transfer_reference_facts(
@@ -11926,7 +11943,7 @@ fn build_function_reference_cfg(
             None,
         );
         drop(provisional_origin_index);
-        builder.proof_points.strictly_forward_initial_graph = strictly_forward_initial_graph;
+        builder.proof_points.forward_initial_graph = forward_initial_graph;
         if let Some(pending) = &builder.proof_points.pending_named_reborrow {
             let first_unproved = pending.sites.iter().find(|site|
                 !matches!(builder.cfg.points[site.point.0].kind, CfgPointKind::Borrow { .. }));
