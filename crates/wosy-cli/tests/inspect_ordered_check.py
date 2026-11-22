@@ -371,5 +371,24 @@ def main():
         ), wrong_guard
 
 
+        source.write_text("""%%start
+            lib = namespace app "lib.w";
+            u8 base = lib.descend(2);
+            u8 recursed = lib.descend(8);
+            core.require(base == 4, { .stdout = "wrong base"; .stderr = ""; .code = 20; .files = []; });
+            core.require(recursed == 4, { .stdout = "wrong recurrence"; .stderr = ""; .code = 21; .files = []; });
+            core.require(false, { .stdout = "root only"; .stderr = ""; .code = 22; .files = []; });
+        %%end""", encoding="utf-8")
+        module.write_text(recursive.replace("out <= 3", "out == 4").replace("%%end", """
+            core.require(false, { .stdout = "lib once"; .stderr = ""; .code = 17; .files = []; });
+        %%end"""), encoding="utf-8")
+        qualified_output = expected_pass.replace(b"directive failures: 0", b"directive failures: 2") + (
+            b"source texts: 2\nauthored status: 17\nstdout: 6c6962206f6e6365\nstdout: 726f6f74206f6e6c79\n"
+        )
+        for selected_command in (command, main_command):
+            qualified = subprocess.run([*selected_command, "--inspect-effects"], cwd=root, capture_output=True, timeout=15)
+            assert (qualified.returncode, qualified.stdout, qualified.stderr) == (1, qualified_output, b""), qualified
+
+
 if __name__ == "__main__":
     main()

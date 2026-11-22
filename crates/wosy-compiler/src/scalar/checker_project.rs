@@ -3252,7 +3252,10 @@ fn check_loaded_ordered_proof_diagnostics_in_scope<const LOCAL_CATALOGS: bool>(
         let run = run_prepared_ordered_check(
             &prepared.prepared, scope, startup_count, OrderedReachPolicy::Closed,
             RankedOrderedEvidence {
-                plan: &first_plan, rank, allow_reached: first_plan.proof_source == &prepared.source, reached_return: None,
+                plan: &first_plan, rank,
+                allow_reached: first_plan.proof_source == &prepared.source
+                    || (LOCAL_CATALOGS && first_plan.target.0 < startup_count),
+                reached_return: None,
             },
         )?;
         return Ok(MainFlowProofReceipt {
@@ -8901,6 +8904,51 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
             ] {
                 assert!(matches!(run(&rejected, scope), Err(ScalarOrderedCheckerOutcome::Unsupported)));
             }
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordered_qualified_ranked_equality_uses_only_owning_reachable_local_catalog() {
+        let app = source("src/main.w", "ordered-qualified-rank-app");
+        let local = source("src/lib.w", "ordered-qualified-rank-library");
+        let main = r#"%%start
+            lib = namespace demo "src/lib.w";
+            u8 base = lib.descend(2);
+            u8 recursed = lib.descend(8);
+            core.require(base == 4, { .stdout = "wrong base"; .stderr = ""; .code = 20; .files = []; });
+            core.require(recursed == 4, { .stdout = "wrong recurrence"; .stderr = ""; .code = 21; .files = []; });
+            core.require(false, { .stdout = "root only"; .stderr = ""; .code = 22; .files = []; });
+        %%end"#;
+        let library = r#"%%start
+            u8(u8) descend = fn(value) { if (value < 3) { 4 } else { descend(value - 3) } };
+            proof rank for descend(entry) -> (out) where (entry <= 8) ensures (out == 4) decreases (entry) {
+                if (entry < 3) { core.show(out == 4); } else { core.use(rank(entry - 3)); }
+            }
+            core.require(false, { .stdout = "lib once"; .stderr = ""; .code = 17; .files = []; });
+        %%end"#;
+        let run = |main: &str, library: &str, owner: &SourceIdentity, scope| {
+            let (_, catalog) = crate::parse_proof_source(owner.clone(), library.to_owned(), &[])
+                .unwrap_or_else(|_| panic!("valid qualified ranked proof"));
+            let import = ScalarNamespaceBinding {
+                binding: "lib".into(), target: owner.clone(), span: ByteSpan::new(0, 0),
+            };
+            check_loaded_scalar_ordered_local_proof_contexts(
+                vec![(declarations(&app, main), vec![import])], [(catalog, Vec::new())],
+                vec![app.clone(), owner.clone()], inputs(), scope, Vec::new(),
+            )
+        };
+        for scope in [ScalarCheckerScope::CurrentPackage, ScalarCheckerScope::MainFlowOnly] {
+            let receipt = run(main, library, &local, scope).unwrap();
+            assert!(receipt.active && receipt.diagnostics.is_empty() && receipt.symbolic_diagnostic.is_none());
+            assert!(receipt.additional_symbolic_diagnostics.is_empty());
+            let [first, second] = receipt.directives.as_slice() else { panic!("exactly one each in initialization order"); };
+            assert_eq!((&first.source, first.stdout()), (&local, b"lib once".as_slice()));
+            assert_eq!((&second.source, second.stdout()), (&app, b"root only".as_slice()));
+            assert!(matches!(run(&main.replace("descend(8)", "descend(9)"), library, &local, scope),
+                Err(ScalarOrderedCheckerOutcome::Unsupported)));
+            let foreign = SourceIdentity { project: "other-project".into(), ..local.clone() };
+            assert!(matches!(run(main, library, &foreign, scope), Err(ScalarOrderedCheckerOutcome::Unsupported)));
         }
     }
 
