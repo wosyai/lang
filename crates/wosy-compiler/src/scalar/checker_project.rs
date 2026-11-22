@@ -2153,8 +2153,8 @@ pub struct SymbolicProofDiagnostic {
 #[cfg(feature = "internal-checker")]
 struct SelectedSymbolicProof<'a, 'case> {
     watched: &'case MainFlowProofObserver<'a>,
-    candidate: Option<&'case PlannedModuleProof<'a>>,
     verified: Option<VerifiedSymbolicEquality<'a>>,
+    additional_verified: HashMap<PreparedCallable, VerifiedSymbolicEquality<'a>>,
     failure: Option<SymbolicProofDiagnostic>,
     additional_failures: Vec<SymbolicProofDiagnostic>,
 }
@@ -2175,20 +2175,35 @@ impl SelectedSymbolicProof<'_, '_> {
     fn try_consume_equality(
         &mut self, target: PreparedCallable, calls: &FunctionCallSites, source: &SourceIdentity, effects: &mut OrderedFailures,
     ) -> Result<Option<bool>, ProjectCheck> {
-        let Some(summary) = &self.verified else { return Ok(None); };
-        if target.0 != summary.target.0 || target.1 <= summary.target.1
+        let Some(first) = &self.verified else { return Ok(None); };
+        if target.0 != first.target.0 || target.1 <= first.target.1
             || !calls.assignments.is_empty() || !calls.allocation_length_calls.is_empty()
             || !matches!(calls.boundary.results.as_slice(), [result] if result.ty == ScalarType::Unit)
         {
             return Ok(None);
         }
         let candidate = match calls.structure.checker_directives.len() {
-            1 => root_local_import_requirement_in::<true>(calls),
-            2 => summary.guard.as_ref().and_then(|guard| root_local_import_requirement_after_narrow(calls, guard.slot)),
+            1 => root_local_import_requirement_in::<true>(calls).map(|(position, origin)| (position, origin, None)),
+            2 => root_local_import_requirement_after_narrow(calls)
+                .map(|(position, origin, narrow)| (position, origin, Some(narrow))),
             _ => None,
         };
-        let Some((position, origin)) = candidate else { return Ok(None); };
+        let Some((position, origin, narrow)) = candidate else { return Ok(None); };
         if !matches!(calls.call_occurrences.as_slice(), [call] if call.ordinal == origin.call) {
+            return Ok(None);
+        }
+        let Some(callee) = calls.structure.checker_direct_targets.get(&origin.call) else { return Ok(None); };
+        let summary = if *callee == first.target {
+            first
+        } else if let Some(summary) = self.additional_verified.get(callee) {
+            summary
+        } else {
+            return Ok(None);
+        };
+        if target.0 != summary.target.0 || target.1 <= summary.target.1
+            || narrow.is_some_and(|narrow| summary.guard.as_ref().is_none_or(|guard|
+                !narrow_matches_import_argument(calls, origin, narrow, guard.slot)))
+        {
             return Ok(None);
         }
         let site = calls.resolved_call_site(origin.call).ok_or(ProjectCheck::MissingRootOccurrences)?;
@@ -2373,11 +2388,7 @@ impl SymbolicRootProof for SelectedSymbolicProof<'_, '_> {
             _ => return Err(ProjectCheck::Unsupported),
         };
         if rest.is_empty() {
-            let candidate = self.candidate.filter(|plan| plan.target == target
-                && (tautological(first) || (predicate.is_some() && !first.guard.always_rejects
-                    && first.guard.domain.is_none() && first.guard.comparisons.len() == 1))
-                && plan.proof_source == source && valid_arbitrary_proof_body(calls)
-                && matches!(&plan.typed.goal, TypedProofGoal::Literal { operator: BinaryOperator::Equal, .. }));
+            let candidate = group.issuer.as_ref().filter(|_| first.proof_source == source);
             let (active, directives, returned, failure) = if candidate.is_some() {
                 super::checker_flow::collect_ordered_root_literal_proof::<true>(
                     calls, &function.body, first.relation, first.bound, None, Some(first.filter),
@@ -2389,13 +2400,18 @@ impl SymbolicRootProof for SelectedSymbolicProof<'_, '_> {
             }.ok_or(ProjectCheck::Unsupported)?;
             if returned && failure.is_none() {
                 if let Some(plan) = candidate {
-                    self.verified = Some(VerifiedSymbolicEquality {
-                        target, canonical_target: plan.canonical_target, layout: plan.typed.target.target_layout,
-                        body: plan.typed.body, bound: first.bound, shared: std::cell::OnceCell::new(),
+                    let summary = VerifiedSymbolicEquality {
+                        target, canonical_target: plan.canonical_target, layout: plan.layout,
+                        body: plan.body, bound: first.bound, shared: std::cell::OnceCell::new(),
                         guard: first.guard.comparisons.first().map(|guard| ImportedEntryGuard {
                             slot: guard.slot, relation: guard.relation, bound: guard.bound,
                         }),
-                    });
+                    };
+                    if self.verified.is_none() {
+                        self.verified = Some(summary);
+                    } else {
+                        self.additional_verified.insert(target, summary);
+                    }
                 }
             }
             for directive in directives {
@@ -2664,8 +2680,38 @@ impl<'a> MainFlowProofCases<'a> {
 }
 
 #[cfg(feature = "internal-checker")]
+struct SymbolicEqualityIssuer<'a> {
+    canonical_target: &'a ResolvedCallTarget,
+    layout: ScalarTargetLayout,
+    body: &'a FunctionCallSites,
+}
+
+#[cfg(feature = "internal-checker")]
+impl<'a> SymbolicEqualityIssuer<'a> {
+    fn for_symbolic_case(
+        scope: ScalarCheckerScope, plan: &PlannedModuleProof<'a>,
+        (proof, authored): &MainFlowProofPlan<'a>,
+    ) -> Option<Self> {
+        if scope == ScalarCheckerScope::MainFlowOnly || authored.is_some() || proof.guard.always_rejects
+            || proof.guard.domain.is_some()
+            || !matches!(&plan.typed.goal, TypedProofGoal::Literal { operator: BinaryOperator::Equal, .. })
+        {
+            return None;
+        }
+        if !(proof.guard.comparisons.is_empty()
+            || proof.guard.comparisons.len() == 1 && matches!(proof.filter, [CheckerPredicate::Integer(_)]))
+            || !valid_arbitrary_proof_body(plan.typed.body)
+        {
+            return None;
+        }
+        Some(Self { canonical_target: plan.canonical_target, layout: plan.typed.target.target_layout, body: plan.typed.body })
+    }
+}
+
+#[cfg(feature = "internal-checker")]
 struct MainFlowProofTarget<'a> {
     cases: MainFlowProofCases<'a>,
+    issuer: Option<SymbolicEqualityIssuer<'a>>,
     seen: bool,
 }
 
@@ -2677,7 +2723,7 @@ impl<'a> MainFlowProofTarget<'a> {
         } else {
             MainFlowProofCases::Bare { first, rest: Vec::new() }
         };
-        Self { cases, seen: false }
+        Self { cases, issuer: None, seen: false }
     }
 }
 
@@ -2699,14 +2745,23 @@ impl<'a> MainFlowProofObserver<'a> {
         }
     }
 
-    fn insert(&mut self, target: (usize, usize), proof: MainFlowProofPlan<'a>) {
+    fn insert(&mut self, scope: ScalarCheckerScope, plan: &PlannedModuleProof<'a>, proof: MainFlowProofPlan<'a>) {
+        let target = plan.target;
         if self.first.0 == target {
+            self.first.1.issuer = None;
             self.first.1.cases.push(proof);
             return;
         }
         match self.other.entry(target) {
-            std::collections::hash_map::Entry::Occupied(mut entry) => entry.get_mut().cases.push(proof),
-            std::collections::hash_map::Entry::Vacant(entry) => { entry.insert(MainFlowProofTarget::new(proof)); }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                let group = entry.get_mut();
+                group.issuer = None;
+                group.cases.push(proof);
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let issuer = SymbolicEqualityIssuer::for_symbolic_case(scope, plan, &proof);
+                entry.insert(MainFlowProofTarget { issuer, ..MainFlowProofTarget::new(proof) });
+            }
         }
     }
 
@@ -2869,13 +2924,12 @@ impl ActualIntegerObserver for MainFlowProofObserver<'_> {
 }
 
 #[cfg(feature = "internal-checker")]
-struct NamedOrderedEvidence<'a, 'case> {
+struct NamedOrderedEvidence<'a> {
     observed: MainFlowProofObserver<'a>,
-    candidate: Option<&'case PlannedModuleProof<'a>>,
 }
 
 #[cfg(feature = "internal-checker")]
-impl ActualIntegerObserver for NamedOrderedEvidence<'_, '_> {
+impl ActualIntegerObserver for NamedOrderedEvidence<'_> {
     const ENABLED: bool = false;
     const CONTEXTUAL: bool = true;
 
@@ -2890,7 +2944,7 @@ impl ActualIntegerObserver for NamedOrderedEvidence<'_, '_> {
 }
 
 #[cfg(feature = "internal-checker")]
-impl<'a, 'case> OrderedRunEvidence for NamedOrderedEvidence<'a, 'case> {
+impl<'a> OrderedRunEvidence for NamedOrderedEvidence<'a> {
     type Symbolic<'run> = SelectedSymbolicProof<'a, 'run> where Self: 'run;
     type SymbolicReport = (Option<SymbolicProofDiagnostic>, Vec<SymbolicProofDiagnostic>);
 
@@ -2903,7 +2957,8 @@ impl<'a, 'case> OrderedRunEvidence for NamedOrderedEvidence<'a, 'case> {
 
     fn symbolic(&self) -> Self::Symbolic<'_> {
         SelectedSymbolicProof {
-            watched: &self.observed, candidate: self.candidate, verified: None,
+            watched: &self.observed,
+            verified: None, additional_verified: HashMap::new(),
             failure: None, additional_failures: Vec::new(),
         }
     }
@@ -2977,14 +3032,16 @@ fn check_loaded_ordered_proof_diagnostics(
         prepared.plan_resolved_module_proof::<false, false, false>(proof_source, name.text(), selected)
     }).collect::<Result<Vec<_>, _>>()?;
     let first_case = MainFlowProofCase::prepare(&first_plan, &prepared.source)?;
+    let issuer = SymbolicEqualityIssuer::for_symbolic_case(scope, &first_plan, &first_case);
     let mut observer = MainFlowProofObserver::new(first_plan.target, first_case);
+    observer.first.1.issuer = issuer;
     for plan in &others {
-        observer.insert(plan.target, MainFlowProofCase::prepare(plan, &prepared.source)?);
+        observer.insert(scope, plan, MainFlowProofCase::prepare(plan, &prepared.source)?);
     }
     let startup_count = prepared.prepared.parts().0.modules.len();
     let run = run_prepared_ordered_check(
         &prepared.prepared, scope, startup_count, OrderedReachPolicy::Closed,
-        NamedOrderedEvidence { observed: observer, candidate: others.is_empty().then_some(&first_plan) },
+        NamedOrderedEvidence { observed: observer },
     )?;
     let (symbolic_diagnostic, additional_symbolic_diagnostics) = run.symbolic;
     Ok(MainFlowProofReceipt {
@@ -6386,9 +6443,8 @@ fn root_local_import_requirement_in<const ALLOW_DISJUNCTION: bool>(
 
 #[cfg(feature = "internal-checker")]
 fn root_local_import_requirement_after_narrow(
-    body: &FunctionCallSites, guarded_slot: usize,
-) -> Option<(usize, &CheckerIntegerCallOrigin)> {
-    use super::reference::CheckerIntegerCallArgument;
+    body: &FunctionCallSites,
+) -> Option<(usize, &CheckerIntegerCallOrigin, &super::checker_flow::IntegerPredicate)> {
     let structure = &body.structure;
     let [first, rest @ ..] = structure.blocks.get(structure.root.0)?.items.as_slice() else { return None; };
     let BlockItemKind::Evaluation { expression } = first.kind else { return None; };
@@ -6398,12 +6454,20 @@ fn root_local_import_requirement_after_narrow(
         return None;
     }
     let (position, origin) = root_local_import_requirement_at::<true>(body, rest)?;
-    let (argument, CheckerIntegerCallArgument::PlainName) = origin.arguments.as_slice().get(guarded_slot)? else { return None; };
-    let super::reference::PlainNameIdentity::Lexical(binding) = body.prepared_plain_name(*argument)? else { return None; };
-    if binding != &narrow.binding || structure.checked_types.expressions.get(argument)? != &narrow.ty {
-        return None;
-    }
-    Some((position, origin))
+    Some((position, origin, narrow))
+}
+
+#[cfg(feature = "internal-checker")]
+fn narrow_matches_import_argument(
+    body: &FunctionCallSites, origin: &CheckerIntegerCallOrigin, narrow: &super::checker_flow::IntegerPredicate,
+    guarded_slot: usize,
+) -> bool {
+    use super::reference::{CheckerIntegerCallArgument, PlainNameIdentity};
+    let Some((argument, CheckerIntegerCallArgument::PlainName)) = origin.arguments.as_slice().get(guarded_slot) else {
+        return false;
+    };
+    matches!(body.prepared_plain_name(*argument), Some(PlainNameIdentity::Lexical(binding)) if binding == &narrow.binding)
+        && body.structure.checked_types.expressions.get(argument) == Some(&narrow.ty)
 }
 
 fn root_local_import_requirement_at<'a, const ALLOW_DISJUNCTION: bool>(
@@ -8029,6 +8093,41 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
         let both = format!("{producer}{sibling}");
         let redirected = caller.replace("producer(input)", "sibling(input)");
         assert!(matches!(run(&module(&both, &redirected, "out == 7")), Err(ProjectCheck::Unsupported)));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordered_current_package_reuses_distinct_earlier_total_summaries() {
+        let app = source("src/main.w", "ordered-automatic-proof-distinct-summaries");
+        let run = |text: &str| {
+            let (_, proof) = crate::parse_proof_source(app.clone(), text.to_owned(), &[])
+                .unwrap_or_else(|_| panic!("valid proof source"));
+            check_loaded_ordered_proof_diagnostics(
+                Vec::new(), vec![(proof, Vec::new())], vec![app.clone()], inputs(), ScalarCheckerScope::CurrentPackage,
+            )
+        };
+        let text = format!(r#"%%start
+            i16(i16) low = fn(input) {{ if (input < 0) {{ 7 }} else {{ 7 }} }};
+            i16(i16) high = fn(input) {{ if (input < 0) {{ 11 }} else {{ 11 }} }};
+            unit(i16) first = fn(input) {{ i16 result = low(input); core.require(result == 11, {OUTPUT}); }};
+            unit(i16) second = fn(input) {{ i16 result = high(input); core.require(result == 7, {OUTPUT}); }};
+            proof upper for high(entry) -> (out) ensures (out == 11) {{}}
+            proof lower for low(entry) -> (out) ensures (out == 7) {{}}
+        %%end"#);
+        let report = run(&text).unwrap();
+        assert!(report.active && report.diagnostics.is_empty() && report.symbolic_diagnostic.is_none());
+        let [first, second] = report.directives.as_slice() else { panic!("two false requirements"); };
+        assert!(first.directive.start < second.directive.start);
+        let seven = BigInt::from(7);
+        let eleven = BigInt::from(11);
+        assert!(first.witness.intervals_at(0, 1).unwrap().eq([(&seven, &seven)]));
+        assert!(second.witness.intervals_at(0, 1).unwrap().eq([(&eleven, &eleven)]));
+
+        let refuted = text.replace("else { 11 }", "else { 12 }");
+        assert!(matches!(run(&refuted), Err(ProjectCheck::Unsupported)));
+        let second_caller = text.lines().find(|line| line.contains("unit(i16) second")).unwrap();
+        let early = text.replace(second_caller, "").replace("i16(i16) high", &format!("{second_caller}\n            i16(i16) high"));
+        assert!(matches!(run(&early), Err(ProjectCheck::Unsupported)));
     }
 
     #[cfg(feature = "internal-checker")]
