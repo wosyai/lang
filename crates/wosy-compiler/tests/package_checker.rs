@@ -1445,6 +1445,43 @@ fn named_proof_peer_use_consumes_independently_verified_typed_predicates() {
 }
 
 #[test]
+fn named_proof_peer_use_requires_each_authored_show_and_independent_ensures() {
+    let identity = source();
+    let check = |leaf_guard: &str, consumer_guard: &str, ensures: &str, steps: &str, names: &[&str]| {
+        check_scalar_module_proofs(
+            identity.clone(), names,
+            vec![ScalarProofModuleInput {
+                source: identity.clone(),
+                text: format!(r#"%%start
+                    i8(i8) echo = fn(value) {{ value }};
+                    proof leaf for echo(entry) -> (out) where ({leaf_guard}) ensures ({ensures}) {{
+                        {steps}
+                    }}
+                    proof consumer for echo(arg) -> (out) where ({consumer_guard}) ensures (out <= 7) {{
+                        core.use(leaf(arg));
+                    }}
+                %%end"#),
+                namespaces: Vec::new(),
+            }],
+            vec![identity.clone()],
+            ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
+        ).unwrap()
+    };
+    use ScalarModuleProofOutcome::{NoApplicableInputs, Proved, Refuted, Unsupported};
+    let both = ["consumer", "leaf"];
+    let good = "core.show(out <= 7); core.show(out == core.old(entry));";
+    assert_eq!(check("entry < 8", "arg < 8", "out < 8", good, &both), [Proved, Proved]);
+    assert_eq!(check("entry < 8", "arg < 8", "out < 8", good, &["consumer"]), [Proved]);
+    assert_eq!(check("entry < 8", "arg < 8", "out < 8", "core.show(out <= 6); core.show(out <= 7);", &both),
+        [Unsupported, Refuted]);
+    assert_eq!(check("entry < 8", "arg < 8", "out < 7", good, &both), [Unsupported, Refuted]);
+    assert_eq!(check("entry < 8", "arg < 8", "out < 8", "core.show(out + 1 <= 8);", &both),
+        [Unsupported, Unsupported]);
+    assert_eq!(check("false", "false", "out < 8", good, &both), [Unsupported, NoApplicableInputs]);
+    assert_eq!(check("entry < 8", "arg == 6", "out < 8", good, &both), [Unsupported, Proved]);
+}
+
+#[test]
 fn named_proof_peer_use_applies_a_direct_non_equality_leaf_to_a_strict_subset() {
     let identity = source();
     let check = |leaf_guard: &str, caller_guard: &str, premise: &str, goal: &str| {

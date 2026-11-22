@@ -2259,7 +2259,9 @@ impl<'a> LocalPeerGraph<'a> {
                     self.nodes[index].next = Some(next);
                     self.activate(next);
                 }
-            } else if self.nodes[index].plan().is_some_and(|plan| plan.steps.items.is_empty() && plan.peer_literal_goal().is_some()) {
+            } else if self.nodes[index].plan().is_some_and(|plan|
+                plan.peer_literal_goal().is_some() && (plan.steps.items.is_empty() || plan.has_flat_show_steps()))
+            {
                 self.nodes[index].state = LocalPeerState::Terminal(index);
             } else {
                 self.nodes[index].state = LocalPeerState::Rejected;
@@ -2556,9 +2558,59 @@ impl PreparedProofModule {
             }
             graph.resolve_edges(self, selected, plans);
             graph.resolve_terminals();
+            // The graph may be cited by several selected roots. Reuse the
+            // selected leaf's own independently checked outcome, or verify an
+            // implicit leaf once in the same authored-step observer mode.
+            let mut implicit_show_results = HashMap::new();
+            let mut show_bounds = Vec::<(&ScalarType, (BigInt, BigInt))>::new();
             for (index, plan, requested, strict_entry) in admitted_roots {
                 let Some(leaf) = graph.terminal(requested) else { continue; };
                 let Some((relation, bound)) = leaf.peer_literal_goal() else { continue; };
+                if !leaf.steps.items.is_empty() {
+                    if strict_entry.is_some() {
+                        continue;
+                    }
+                    let TypedProofGoal::Literal { relation: requested_relation, bound: requested, .. } =
+                        &plan.typed.goal else { continue; };
+                    let equality = Some(relation) == IntegerRelation::from_operator(&BinaryOperator::Equal);
+                    if !equality {
+                        let premise = (relation, bound);
+                        let conclusion = (*requested_relation, requested);
+                        // A failed implication is a negative admission filter.
+                        // A successful one is not authority until the leaf
+                        // independently proves every show and its ensures.
+                        let implies = premise == conclusion || {
+                            let ty = plan.typed.result_type;
+                            let slot = if let Some(slot) = show_bounds.iter().position(|(known, _)| *known == ty) {
+                                slot
+                            } else {
+                                let Some(bounds) = integer_bounds(ty) else { continue; };
+                                show_bounds.push((ty, bounds));
+                                show_bounds.len() - 1
+                            };
+                            let (low, high) = &show_bounds[slot].1;
+                            integer_predicate_implies(premise, conclusion, (low, high))
+                        };
+                        if !implies {
+                            continue;
+                        }
+                    }
+                    let verified = if let Some(selected_leaf) = selected.request(leaf.proof_source, leaf.name) {
+                        matches!(outcomes[*selected_leaf], ScalarModuleProofOutcome::Proved)
+                    } else {
+                        *implicit_show_results.entry((leaf.proof_source, leaf.name)).or_insert_with(|| {
+                            matches!(leaf.verify_arbitrary_with_steps(), Ok(ProjectCheck::Proved))
+                        })
+                    };
+                    if verified {
+                        outcomes[index] = if equality && !requested_relation.accepts(bound.cmp(requested)) {
+                            ScalarModuleProofOutcome::Refuted
+                        } else {
+                            ScalarModuleProofOutcome::Proved
+                        };
+                    }
+                    continue;
+                }
                 let leaf_guard = ExactGuardGroup(leaf.filter.as_deref());
                 arbitrary_groups.entry((plan.target, leaf_guard)).or_default().peer_uses.push(UnusedPeerUse {
                     index, consumer: plan, name: leaf.name, relation, bound, strict_entry,
@@ -2854,6 +2906,12 @@ impl PlannedModuleProof<'_> {
             return None;
         }
         Some(peer)
+    }
+
+    fn has_flat_show_steps(&self) -> bool {
+        self.steps.items.len() == self.steps.terminated_items.len()
+            && self.steps.items.iter().zip(&self.steps.terminated_items).all(|(item, &terminated)|
+                proof_show_expression(item, terminated).is_ok())
     }
 
     fn verify_arbitrary_with_steps(&self) -> Result<ProjectCheck, ProjectCheck> {
@@ -5761,6 +5819,50 @@ mod tests {
             assert_eq!(UNSELECTED_PEER_PLANS.with(|count| count.replace(0)), 30);
             assert_eq!(PROOF_CATALOG_INDEX_BUILDS.with(|count| count.replace(0)), 1);
             assert_eq!(take_integer_observations(), (1, 0));
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn authored_show_peer_shares_verification_between_selected_and_cited() {
+        use super::super::checker_flow::take_integer_observations;
+        let file = source("src/main.w", "authored-show-peer");
+        let text = r#"%%start
+            u8(u8) echo = fn(value) { value };
+            proof leaf for echo(input) -> (out) where (input < 8) ensures (out < 8) {
+                core.show(out <= 7); core.show(out == core.old(input));
+            }
+            proof first for echo(entry) -> (out) where (entry < 8) ensures (out <= 7) { core.use(leaf(entry)); }
+            proof second for echo(entry) -> (out) where (entry < 8) ensures (out < 8) { core.use(leaf(entry)); }
+            proof stronger for echo(entry) -> (out) where (entry < 8) ensures (out <= 6) { core.use(leaf(entry)); }
+            proof unrelated for echo(input) -> (out) where (input < 8) ensures (out < 8) {
+                core.show(out <= 6);
+            }
+        %%end"#;
+        let _ = take_integer_observations();
+        let _ = UNSELECTED_PEER_PLANS.with(|count| count.replace(0));
+        for (names, implicit) in [
+            (&["first", "leaf", "second"][..], 0),
+            (&["first", "second"][..], 1),
+        ] {
+            assert_eq!(check_scalar_module_proofs(
+                file.clone(), names,
+                vec![ScalarProofModuleInput { source: file.clone(), text: text.into(), namespaces: Vec::new() }],
+                vec![file.clone()], inputs(),
+            ).unwrap(), vec![ScalarModuleProofOutcome::Proved; names.len()]);
+            assert_eq!(take_integer_observations(), (1, 0));
+            assert_eq!(UNSELECTED_PEER_PLANS.with(|count| count.replace(0)), implicit);
+        }
+        for (names, selected) in [(&["stronger"][..], false), (&["stronger", "leaf"][..], true)] {
+            let mut expected = vec![ScalarModuleProofOutcome::Unsupported];
+            if selected { expected.push(ScalarModuleProofOutcome::Proved); }
+            assert_eq!(check_scalar_module_proofs(
+                file.clone(), names,
+                vec![ScalarProofModuleInput { source: file.clone(), text: text.into(), namespaces: Vec::new() }],
+                vec![file.clone()], inputs(),
+            ).unwrap(), expected);
+            assert_eq!(take_integer_observations(), (usize::from(selected), 0));
+            assert_eq!(UNSELECTED_PEER_PLANS.with(|count| count.replace(0)), usize::from(!selected));
         }
     }
 
