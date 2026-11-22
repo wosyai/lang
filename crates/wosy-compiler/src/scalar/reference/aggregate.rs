@@ -35,6 +35,7 @@ pub(super) struct AggregateFlowFacts {
     pub(super) array_calls: BTreeMap<CfgPointId, (OccurrenceOrdinal, CfgPointId, ReferenceBindingId)>,
     // Primary return value and the whole-place move that follows its evaluation.
     pub(super) array_return: Option<(CfgPointId, CfgPointId)>,
+    pub(super) conditional_array_return: Option<ConditionalArrayReturn>,
     pub(super) array_installs: BTreeMap<CfgPointId, OccurrenceOrdinal>,
     pub(super) neutral_array_calls: BTreeSet<CfgPointId>,
     pub(super) neutral_array_projections: BTreeMap<CfgPointId, CfgPointId>,
@@ -94,6 +95,12 @@ impl AggregateFlowFacts {
             _ => {}
         }
     }
+}
+
+pub(super) struct ConditionalArrayReturn {
+    pub(super) join: CfgPointId,
+    // Each exact arm exit paired with the final output's checked formal move.
+    pub(super) arms: [(CfgPointId, CfgPointId); 2],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -257,6 +264,7 @@ pub(super) struct AggregateEdgeState {
     array_formal_live: bool,
     array_formal_pending: Option<CfgPointId>,
     array_return_forwarded: bool,
+    array_conditional_output: Option<CfgPointId>,
     array_dependencies: BTreeSet<CfgPointId>,
     local_array: Option<LocalArrayLife>,
 }
@@ -361,6 +369,7 @@ pub(super) struct AggregateFlowResult {
     pub(super) checked_producer_authoritative: bool,
     pub(super) array_invalid: bool,
     pub(super) array_neutral: bool,
+    array_conditional_forwarded: bool,
     pub(super) array_calls: BTreeMap<CfgPointId, (OccurrenceOrdinal, CfgPointId, ReferenceBindingId)>,
     pub(super) array_returns: BTreeSet<Option<BTreeSet<CfgPointId>>>,
     pub(super) array_rebinds: BTreeMap<CfgPointId, (CfgPointId, ReferenceBindingId, OccurrenceOrdinal)>,
@@ -686,6 +695,17 @@ impl AggregateFlowFacts {
             }
         }
         if let Some(formal) = &self.array_formal {
+            if let Some(conditional) = &self.conditional_array_return {
+                if let Some((_, moved)) = conditional.arms.iter().find(|(end, _)| *end == id) {
+                    state.array_conditional_output = (state.array_formal_pending == Some(*moved))
+                        .then_some(id);
+                } else if id == conditional.join {
+                    state.array_conditional_output = conditional.arms.iter()
+                        .any(|(end, moved)| state.array_conditional_output == Some(*end)
+                            && state.array_formal_pending == Some(*moved))
+                        .then_some(id);
+                }
+            }
             if result.array_neutral {
                 result.array_neutral = match &point.kind {
                     CfgPointKind::Entry | CfgPointKind::ScopeEnter | CfgPointKind::ScopeExit
@@ -716,6 +736,11 @@ impl AggregateFlowFacts {
                     _ => false,
                 };
             }
+            // Conditional authority is limited to the existing effect-neutral
+            // fragment; an unresolved alias, release or backing effect is unknown.
+            if self.conditional_array_return.is_some() && !result.array_neutral {
+                result.array_invalid = true;
+            }
             match &point.kind {
                 CfgPointKind::Borrow { place, .. } if &place.binding == formal => {
                     result.array_invalid = true;
@@ -742,8 +767,11 @@ impl AggregateFlowFacts {
                     }
                 }
                 CfgPointKind::ReturnOutput { output: 0, value_point, .. } => {
-                    state.array_return_forwarded = self.array_return.is_some_and(|(value, moved)|
-                        value == *value_point && Some(moved) == state.array_formal_pending);
+                    let conditional = state.array_conditional_output == Some(*value_point);
+                    result.array_conditional_forwarded |= conditional;
+                    state.array_return_forwarded = conditional
+                        || self.array_return.is_some_and(|(value, moved)|
+                            value == *value_point && Some(moved) == state.array_formal_pending);
                 }
                 CfgPointKind::Return => {
                     // Every normal return must have carried the checked formal to lane zero.
@@ -1936,6 +1964,12 @@ fn closed_aggregates<'a>(
                     let mut self_call = false;
                     for &point in path {
                         let Some(target) = target_body(&declarations, body.cfg, point) else { return false };
+                        if facts.array_conditional_forwarded && target != key
+                            && !bodies.get(&target).and_then(|callee| callee.facts)
+                                .is_some_and(|callee| callee.array_neutral)
+                        {
+                            return false;
+                        }
                         self_call |= target == key;
                         dependencies.insert(target);
                     }
