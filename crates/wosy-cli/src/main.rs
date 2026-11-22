@@ -555,10 +555,12 @@ fn load_canonical_project_inputs(
 }
 
 #[cfg(feature = "internal-checker")]
-type InternalCheckResult = Result<
-    (wosy_compiler::ScalarCheckerOutcome, BTreeMap<ProjectSourceIdentity, String>),
-    CanonicalLoadFailure,
->;
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug)]
+struct InternalCheckReceipt {
+    outcome: wosy_compiler::ScalarCheckerOutcome,
+    texts: BTreeMap<ProjectSourceIdentity, String>,
+}
 
 #[cfg(feature = "internal-checker")]
 #[cfg_attr(not(test), allow(dead_code))]
@@ -568,7 +570,7 @@ fn check_loaded_project(
     configuration: &ProjectConfiguration,
     target_layout: ScalarTargetLayout,
     scope: wosy_compiler::ScalarCheckerScope,
-) -> InternalCheckResult {
+) -> Result<InternalCheckReceipt, CanonicalLoadFailure> {
     let CanonicalProjectInputs { declarations, initialization_order, texts, .. } =
         load_canonical_project_inputs(root, project, configuration, CanonicalLoadPurpose::Check)?;
     #[cfg(test)]
@@ -576,7 +578,7 @@ fn check_loaded_project(
     let outcome = wosy_compiler::check_scalar_package(
         declarations, initialization_order, ScalarPreparationInputs { target_layout }, scope,
     );
-    Ok((outcome, texts))
+    Ok(InternalCheckReceipt { outcome, texts })
 }
 
 #[cfg(feature = "internal-checker")]
@@ -1286,7 +1288,7 @@ mod tests {
                 wosy_compiler::ScalarCheckerScope::default(),
             )
         });
-        let (outcome, texts) = result.expect("canonical checker input");
+        let InternalCheckReceipt { outcome, texts } = result.expect("canonical checker input");
         let ScalarCheckerOutcome::Failed(failure) = outcome else { panic!("expected authored dependency failure"); };
         assert_eq!(failure.operation, ScalarCheckerOperation::Require);
         assert_eq!(failure.source.path, "lib.w");
@@ -1294,9 +1296,61 @@ mod tests {
         assert_eq!(&*failure.stdout, b"out");
         assert_eq!(&*failure.stderr, b"bad");
         assert_eq!(failure.code, 17.into());
+        let (binding, ty) = failure.witness.axes().next().expect("canonical call input with inclusive singleton");
+        assert_eq!(failure.witness.axes().len(), 1);
+        assert_eq!(binding.source, failure.source);
+        let at = |span: wosy_syntax::ByteSpan| &sources[1].1[span.start as usize..span.end as usize];
+        assert_eq!(at(binding.declaration_span), "value");
+        assert_eq!(at(failure.condition), "value <= 7");
+        assert_eq!(ty, &wosy_compiler::ScalarType::U8);
+        assert_eq!(failure.witness.row_count(), 1);
+        let mut singleton = failure.witness.intervals_at(0, 0).expect("existing axis and row");
+        assert_eq!(singleton.next(), Some((&8.into(), &8.into())));
+        assert_eq!(singleton.next(), None);
+        assert!(failure.witness.intervals_at(1, 0).is_none());
+        assert!(failure.witness.intervals_at(0, 1).is_none());
         assert_eq!(texts.len(), 2);
         assert!(texts.values().any(|text| text == sources[1].1));
         assert_eq!(counts, routing_observations::Counts { extractions: 2, checks: 1, ..Default::default() });
+        assert!(!project.root.join(".wosy").exists());
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn internal_checker_adapter_retains_exact_signed_intervals_without_writing() {
+        use wosy_compiler::{ScalarCheckerOutcome, ScalarCheckerScope, ScalarType};
+        let (project, configuration) = routing_test_project("internal-signed-receipt", &[(
+            "main.w", r#"%%start
+                unit(i128) unused = fn(value) {
+                    core.require(value == 0, { .stdout = "saída"; .stderr = "☕"; .code = 340282366920938463463374607431768211456; .files = [{ .path = "report.txt"; .text = "α"; }]; });
+                };
+            %%end"#,
+        )]);
+        let (result, counts) = routing_observations::observe(|| {
+            check_loaded_project(
+                &project.root, &project, &configuration, ScalarTargetLayout::WASM32,
+                ScalarCheckerScope::CurrentPackage,
+            )
+        });
+        let InternalCheckReceipt { outcome, texts } = result.expect("canonical symbolic receipt");
+        let ScalarCheckerOutcome::Failed(failure) = outcome else { panic!("expected authored symbolic failure"); };
+        let mut axes = failure.witness.axes();
+        let (binding, ty) = axes.next().expect("canonical symbolic input");
+        assert_eq!(binding.source, failure.source);
+        assert_eq!(ty, &ScalarType::I128);
+        assert_eq!(axes.next(), None);
+        assert_eq!(failure.witness.row_count(), 1);
+        let mut intervals = failure.witness.intervals_at(0, 0).expect("exact failing intervals");
+        assert_eq!(intervals.next(), Some((&i128::MIN.into(), &(-1).into())));
+        assert_eq!(intervals.next(), Some((&1.into(), &i128::MAX.into())));
+        assert_eq!(intervals.next(), None);
+        assert_eq!(failure.stdout.as_ref(), "saída".as_bytes());
+        assert_eq!(failure.stderr.as_ref(), "☕".as_bytes());
+        assert_eq!(failure.code.to_string(), "340282366920938463463374607431768211456");
+        assert_eq!(failure.files.len(), 1);
+        assert_eq!(texts.len(), 1);
+        assert_eq!(counts, routing_observations::Counts { extractions: 1, checks: 1, ..Default::default() });
+        assert!(!project.root.join("report.txt").exists());
         assert!(!project.root.join(".wosy").exists());
     }
 
@@ -1353,7 +1407,7 @@ mod tests {
                 )
             });
             assert_eq!(counts, routing_observations::Counts { extractions: 1, checks: 1, ..Default::default() });
-            result.expect("valid source").0
+            result.expect("valid source").outcome
         };
         assert!(matches!(observed(ScalarCheckerScope::default()), ScalarCheckerOutcome::Failed(_)));
         assert_eq!(observed(ScalarCheckerScope::MainFlowOnly), ScalarCheckerOutcome::NoChecks);

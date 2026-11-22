@@ -60,6 +60,11 @@ impl IntegerSet {
         }
     }
 
+    #[cfg(feature = "internal-checker")]
+    pub(super) fn intervals(&self) -> impl ExactSizeIterator<Item = (&BigInt, &BigInt)> {
+        self.0.iter().map(|interval| (&interval.first, &interval.last))
+    }
+
     pub(super) fn is_empty(&self) -> bool {
         self.0.is_empty()
     }

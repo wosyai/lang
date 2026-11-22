@@ -339,7 +339,7 @@ fn error(span: ByteSpan, kind: CheckerDirectiveShapeErrorKind) -> CheckerDirecti
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scalar::{derive_scalar_declarations_from_cst, ScalarBlockItem, ScalarItem};
+    use crate::scalar::{derive_scalar_declarations_from_cst, ScalarBlockItem, ScalarItem, ScalarType};
     use crate::parse_source;
     use wosy_syntax::SourceIdentity;
 
@@ -832,7 +832,7 @@ mod tests {
                 assert_ne!(locals[0], locals[1]);
 
                 let failure = check_integer_requirements(body).unwrap().unwrap_err();
-                assert_eq!(failure.axes, body.boundary.checker_parameter_bindings.as_deref().unwrap().iter().collect::<Vec<_>>());
+                assert_eq!(failure.axes, body.boundary.checker_parameter_bindings.as_deref().unwrap().iter().map(|binding| (binding, &ScalarType::U8)).collect::<Vec<_>>());
                 assert!(failure.state.includes(&[0, 0]));
                 assert!(!failure.state.includes(&[1, 0]));
             },
@@ -855,7 +855,7 @@ mod tests {
             |body| {
                 let failure = check_integer_requirements(body).unwrap().unwrap_err();
                 let local = body.structure.checker_integer_locals.values().next().unwrap();
-                assert_eq!(failure.axes, [&body.boundary.checker_parameter_bindings.as_deref().unwrap()[0], local]);
+                assert_eq!(failure.axes, [(&body.boundary.checker_parameter_bindings.as_deref().unwrap()[0], &ScalarType::U8), (local, &ScalarType::U8)]);
                 assert!(failure.state.includes(&[1, 7]));
                 assert!(!failure.state.includes(&[0, 7]));
                 assert!(!failure.state.includes(&[1, 6]));
@@ -916,7 +916,7 @@ mod tests {
                 } else {
                     let failure = result.unwrap_err();
                     let local = body.structure.checker_integer_locals.values().next().unwrap();
-                    assert_eq!(failure.axes, [local]);
+                    assert_eq!(failure.axes, [(local, &ScalarType::U8)]);
                     assert_eq!(failure.state.row_count(), 1);
                     assert!(failure.state.includes(&[7]));
                     assert!(!failure.state.includes(&[0]));

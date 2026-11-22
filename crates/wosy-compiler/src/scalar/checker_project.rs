@@ -64,6 +64,33 @@ pub struct ScalarCheckerFailure {
     pub stdout: Box<[u8]>,
     pub stderr: Box<[u8]>,
     pub code: BigInt,
+    pub witness: ScalarCheckerIntegerWitness,
+}
+
+#[cfg(feature = "internal-checker")]
+#[derive(Debug, PartialEq, Eq)]
+pub struct ScalarCheckerIntegerWitness {
+    axes: Vec<(ReferenceBindingId, ScalarType)>,
+    state: IntegerInputs,
+}
+
+#[cfg(feature = "internal-checker")]
+impl ScalarCheckerIntegerWitness {
+    pub fn axes(&self) -> impl ExactSizeIterator<Item = (&ReferenceBindingId, &ScalarType)> {
+        self.axes.iter().map(|(binding, ty)| (binding, ty))
+    }
+
+    pub fn row_count(&self) -> usize {
+        self.state.row_count()
+    }
+
+    pub fn intervals_at(
+        &self,
+        row: usize,
+        axis: usize,
+    ) -> Option<impl ExactSizeIterator<Item = (&BigInt, &BigInt)>> {
+        self.state.intervals_at(row, axis)
+    }
 }
 
 #[cfg(feature = "internal-checker")]
@@ -96,7 +123,7 @@ pub fn check_scalar_package(
         Ok(true) => ScalarCheckerOutcome::Passed,
         Ok(false) => ScalarCheckerOutcome::NoChecks,
         Err(ProjectCheck::Invalid(diagnostics)) => ScalarCheckerOutcome::Invalid(diagnostics),
-        Err(ProjectCheck::Failed { source, operation, directive, condition, output, .. }) =>
+        Err(ProjectCheck::Failed { source, operation, directive, condition, output, axes, state }) =>
             ScalarCheckerOutcome::Failed(ScalarCheckerFailure {
                 source,
                 operation: match operation {
@@ -113,6 +140,7 @@ pub fn check_scalar_package(
                 stdout: output.stdout_bytes,
                 stderr: output.stderr_bytes,
                 code: output.code_value,
+                witness: ScalarCheckerIntegerWitness { axes, state },
             }),
         Err(_) => ScalarCheckerOutcome::Unsupported,
     }
@@ -138,7 +166,7 @@ enum ProjectCheck {
         directive: ByteSpan,
         condition: ByteSpan,
         state: IntegerInputs,
-        axes: Vec<ReferenceBindingId>,
+        axes: Vec<(ReferenceBindingId, ScalarType)>,
         output: CheckedLiteralOutput,
     },
 }
@@ -809,7 +837,7 @@ fn project_failure(
         &body.structure.checker_directives[&failure.directive],
         body.occurrences[failure.directive.0].span,
         failure.state,
-        failure.axes.into_iter().cloned().collect(),
+        failure.axes.into_iter().map(|(binding, ty)| (binding.clone(), ty.clone())).collect(),
     )
 }
 
@@ -818,7 +846,7 @@ fn selected_failure(
     directive: &PreparedCheckerDirective,
     span: ByteSpan,
     state: IntegerInputs,
-    axes: Vec<ReferenceBindingId>,
+    axes: Vec<(ReferenceBindingId, ScalarType)>,
 ) -> ProjectCheck {
     ProjectCheck::Failed {
         source: source.clone(),

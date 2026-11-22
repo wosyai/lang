@@ -247,9 +247,18 @@ impl IntegerInputs {
         self.0.is_empty()
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "internal-checker"))]
     pub(super) fn row_count(&self) -> usize {
         self.0.len()
+    }
+
+    #[cfg(feature = "internal-checker")]
+    pub(super) fn intervals_at(
+        &self,
+        row: usize,
+        axis: usize,
+    ) -> Option<impl ExactSizeIterator<Item = (&BigInt, &BigInt)>> {
+        Some(self.0.get(row)?.get(axis)?.intervals())
     }
 
     #[cfg(test)]
@@ -288,7 +297,7 @@ fn merge_axis(representative: &mut IntegerRow, row: IntegerRow, axis: usize) {
 pub(super) struct IntegerCheckFailure<'a> {
     pub(super) directive: OccurrenceOrdinal,
     pub(super) state: IntegerInputs,
-    pub(super) axes: Vec<&'a ReferenceBindingId>,
+    pub(super) axes: Vec<(&'a ReferenceBindingId, &'a ScalarType)>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -726,7 +735,7 @@ fn walk_integer_block<'a, const USE_IMPORTED_BOUND: bool>(
                         return Some(IntegerControl::Fail(IntegerCheckFailure {
                             directive: expression,
                             state: failing,
-                            axes: roots.axes.iter().map(|(binding, _)| *binding).collect(),
+                            axes: roots.axes.clone(),
                         }));
                     }
                     path = passing;
