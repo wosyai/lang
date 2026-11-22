@@ -116,6 +116,14 @@ impl IntegerSet {
         })
     }
 
+    #[cfg(feature = "internal-checker")]
+    pub(super) fn every_at_extremes(&self, relation: IntegerRelation, bound: &BigInt) -> bool {
+        let Some((lower, upper)) = self.extremes() else { return true; };
+        (relation.less || lower >= bound)
+            && (relation.greater || upper <= bound)
+            && (relation.equal || bound < lower || bound > upper || !self.covers_closed(bound, bound))
+    }
+
     pub(super) fn every(&self, relation: IntegerRelation, bound: &BigInt) -> bool {
         self.0.iter().all(|interval| relation.accepts_closed(&interval.first, &interval.last, bound))
     }

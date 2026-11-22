@@ -3624,6 +3624,20 @@ thread_local! {
     static OUTPUT_UNION_NORMALIZATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+fn typed_output_disjunction(
+    left: &ScalarExpression, right: &ScalarExpression, output: &str, inputs: &[String], ty: &ScalarType,
+) -> Result<[(IntegerRelation, BigInt); 2], ProjectCheck> {
+    if is_null_literal_name(output) {
+        return Err(ProjectCheck::InvalidProof);
+    }
+    let atom = |expression: &ScalarExpression| {
+        let comparison = IntegerComparison::from_expression(expression).ok_or(ProjectCheck::Unsupported)?;
+        let (_, relation, bound) = checked_literal_output_goal(comparison, output, inputs, ty)?;
+        Ok::<_, ProjectCheck>((relation, bound))
+    };
+    Ok([atom(left)?, atom(right)?])
+}
+
 fn normalize_output_disjunction(
     output: &ScalarType, [(left_relation, left_bound), (right_relation, right_bound)]: &[(IntegerRelation, BigInt); 2],
 ) -> Option<IntegerSet> {
@@ -3683,15 +3697,7 @@ fn typed_proof_postcondition<'a, const AUDIT_INDUCTION: bool, const DEFER_OUTPUT
             }
             typed_universal_output_goal(&forall, &ensures, output, &input_names, &result.ty)?
         } else if let ScalarExpression::Binary { operator: BinaryOperator::Or, left, right, .. } = &ensures {
-            if is_null_literal_name(output) {
-                return Err(ProjectCheck::InvalidProof);
-            }
-            let normalized = |expression: &ScalarExpression| {
-                let comparison = IntegerComparison::from_expression(expression).ok_or(ProjectCheck::Unsupported)?;
-                let (_, relation, bound) = checked_literal_output_goal(comparison, output, &input_names, &result.ty)?;
-                Ok::<_, ProjectCheck>((relation, bound))
-            };
-            let atoms = [normalized(left.as_ref())?, normalized(right.as_ref())?];
+            let atoms = typed_output_disjunction(left, right, output, &input_names, &result.ty)?;
             if DEFER_OUTPUT_UNION {
                 TypedProofGoal::DeferredDisjunction(atoms)
             } else {
@@ -4121,7 +4127,7 @@ fn proof_input_condition<const VERIFY_LITERAL_FIT: bool>(
     Ok(CheckerPredicate::Integer(predicate))
 }
 
-fn proof_show_plan<'a, const VERIFY_ENTRY_WRITES: bool, const ALLOW_SEQUENCE: bool>(
+fn proof_show_plan<'a, const VERIFY_ENTRY_WRITES: bool, const ALLOW_NAMED_STEPS: bool>(
     steps: &'a ScalarBlock,
     inputs: &[String],
     output: &str,
@@ -4140,9 +4146,20 @@ fn proof_show_plan<'a, const VERIFY_ENTRY_WRITES: bool, const ALLOW_SEQUENCE: bo
         return Err(ProjectCheck::Unsupported);
     }
     match steps.items.as_slice() {
-        [ScalarBlockItem::Expression(ScalarExpression::Call { .. })] => Ok(IntegerShowProof::Equality(
-            proof_show_claim(steps, inputs, output, ty, body, bindings)?,
-        )),
+        [item @ ScalarBlockItem::Expression(ScalarExpression::Call { .. })] => {
+            let [terminated] = steps.terminated_items.as_slice() else { return Err(ProjectCheck::Unsupported); };
+            let claim = proof_show_expression(item, *terminated)?;
+            #[cfg(feature = "internal-checker")]
+            if ALLOW_NAMED_STEPS {
+                if let ScalarExpression::Binary { operator: BinaryOperator::Or, left, right, .. } = claim {
+                    if inputs.iter().any(|name| is_null_literal_name(name)) {
+                        return Err(ProjectCheck::InvalidProof);
+                    }
+                    return Ok(IntegerShowProof::OutputDisjunction(typed_output_disjunction(left, right, output, inputs, ty)?));
+                }
+            }
+            Ok(IntegerShowProof::Equality(proof_show_equality(claim, inputs, output, ty, body, bindings)?))
+        }
         [ScalarBlockItem::Expression(ScalarExpression::If { condition, then_branch, else_branch, .. })] => {
             let guard = proof_input_condition::<true>(condition, inputs, body, false)?;
             Ok(IntegerShowProof::Conditional {
@@ -4151,7 +4168,7 @@ fn proof_show_plan<'a, const VERIFY_ENTRY_WRITES: bool, const ALLOW_SEQUENCE: bo
                 else_claim: proof_show_claim(else_branch, inputs, output, ty, body, bindings)?,
             })
         }
-        [_, _, ..] if ALLOW_SEQUENCE && steps.terminated_items.len() == steps.items.len() => {
+        [_, _, ..] if ALLOW_NAMED_STEPS && steps.terminated_items.len() == steps.items.len() => {
             if is_null_literal_name(output) || inputs.iter().any(|name| is_null_literal_name(name)) {
                 return Err(ProjectCheck::InvalidProof);
             }
@@ -4195,6 +4212,10 @@ fn proof_show_item_claim<'a>(
     body: &FunctionCallSites,
     bindings: &'a [ReferenceBindingId],
 ) -> Result<IntegerReturn<'a>, ProjectCheck> {
+    proof_show_equality(proof_show_expression(item, terminated)?, inputs, output, ty, body, bindings)
+}
+
+fn proof_show_expression(item: &ScalarBlockItem, terminated: bool) -> Result<&ScalarExpression, ProjectCheck> {
     let ScalarBlockItem::Expression(ScalarExpression::Call {
         receiver, name, arguments, type_arguments, ..
     }) = item else {
@@ -4203,9 +4224,19 @@ fn proof_show_item_claim<'a>(
     if receiver.as_deref() != Some("core") || name != "show" || !type_arguments.is_empty() || !terminated {
         return Err(ProjectCheck::Unsupported);
     }
-    let [ScalarExpression::Binary {
-        operator: BinaryOperator::Equal, left, right, ..
-    }] = arguments.as_slice() else {
+    let [claim] = arguments.as_slice() else { return Err(ProjectCheck::Unsupported); };
+    Ok(claim)
+}
+
+fn proof_show_equality<'a>(
+    claim: &'a ScalarExpression,
+    inputs: &[String],
+    output: &str,
+    ty: &ScalarType,
+    body: &FunctionCallSites,
+    bindings: &'a [ReferenceBindingId],
+) -> Result<IntegerReturn<'a>, ProjectCheck> {
+    let ScalarExpression::Binary { operator: BinaryOperator::Equal, left, right, .. } = claim else {
         return Err(ProjectCheck::Unsupported);
     };
     let ScalarExpression::Name { name, .. } = left.as_ref() else {

@@ -918,6 +918,41 @@ fn standalone_show_is_a_verified_equality_in_the_selected_unused_entry_domain() 
 }
 
 #[test]
+fn named_proof_show_disjunction_checks_the_entire_return_domain() {
+    let identity = source();
+    let check = |target: &str, guard: &str, ensures: &str, show: &str, startup: &str| {
+        check_scalar_module_proof(
+            identity.clone(), "demonstrate",
+            vec![ScalarProofModuleInput {
+                source: identity.clone(),
+                text: format!(r#"%%start
+                    i16(i16) echo = fn(value) {{ value }};
+                    i16(i16) branches = fn(value) {{ if (value < 0) {{ value }} else {{ value }} }};
+                    {startup}
+                    proof demonstrate for {target}(input) -> (out) where ({guard}) ensures ({ensures}) {{
+                        core.show({show});
+                    }}
+                %%end"#),
+                namespaces: Vec::new(),
+            }],
+            vec![identity.clone()], ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
+        )
+    };
+    let nonzero = "out < 0 || out > 0";
+    for target in ["echo", "branches"] {
+        assert_eq!(check(target, "input != 0", "out <= 32767", nonzero, ""), ScalarModuleProofOutcome::Proved);
+        assert_eq!(check(target, "input >= -8 && input <= 8", "out <= 32767", nonzero, ""), ScalarModuleProofOutcome::Refuted);
+    }
+    assert_eq!(check("echo", "input != 0", "out < 0", nonzero, ""), ScalarModuleProofOutcome::Refuted);
+    assert_eq!(check("echo", "false", "out <= 32767", nonzero, ""), ScalarModuleProofOutcome::NoApplicableInputs);
+    assert_eq!(check("echo", "input != 0", "out <= 32767", "input < 0 || out > 0", ""), ScalarModuleProofOutcome::Unsupported);
+    assert!(matches!(check("echo", "input != 0", "out <= 32767", "out < 0 || out > 32768", ""),
+        ScalarModuleProofOutcome::Invalid(_)));
+    assert_eq!(check("echo", "input != 0", "out <= 32767", nonzero, "i16 live = echo(7);"),
+        ScalarModuleProofOutcome::Unsupported);
+}
+
+#[test]
 fn sequential_named_proof_shows_verify_each_claim_without_replacing_ensures() {
     let identity = source();
     let check = |target: &str, guard: &str, goal: &str, steps: &str, startup: &str| {
