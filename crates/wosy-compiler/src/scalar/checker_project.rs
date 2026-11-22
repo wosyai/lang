@@ -2447,7 +2447,8 @@ impl SelectedProofObserver<'_> {
                 TypedProofGoal::Disjunction(allowed) => Some(allowed.contains(value)),
                 TypedProofGoal::DeferredDisjunction(_) => None,
                 TypedProofGoal::Conjunction(atoms) => Some(atoms.iter().all(|(relation, bound)| relation.accepts(value.cmp(bound)))),
-                TypedProofGoal::EntryEqual { slot } => arguments.get(*slot).map(|entry| *entry == value),
+                TypedProofGoal::EntryComparison { slot, relation } =>
+                    arguments.get(*slot).map(|entry| relation.accepts(value.cmp(entry))),
             };
             self.coverage = match holds {
                 Some(true) => ActualProofCoverage::Proved,
@@ -2599,7 +2600,7 @@ enum TypedProofGoal {
     DeferredDisjunction([(IntegerRelation, BigInt); 2]),
     Universal { relation: IntegerRelation, bound: BigInt },
     Existential { relation: IntegerRelation, witness: BigInt, witness_in_domain: bool },
-    EntryEqual { slot: usize },
+    EntryComparison { slot: usize, relation: IntegerRelation },
 }
 
 #[cfg(feature = "internal-checker")]
@@ -2620,7 +2621,7 @@ impl TypedProofGoal {
                 }
                 Some(true)
             }
-            Self::EntryEqual { .. } | Self::DeferredDisjunction(_) => None,
+            Self::EntryComparison { .. } | Self::DeferredDisjunction(_) => None,
         }
     }
 }
@@ -3191,9 +3192,10 @@ fn typed_proof_postcondition<'a, const AUDIT_INDUCTION: bool, const DEFER_OUTPUT
             let (operator, relation, bound) = checked_literal_output_goal(ensures, output, &input_names, &result.ty)?;
             TypedProofGoal::Literal { operator, relation, bound }
         } else {
-            let ScalarExpression::Binary { operator: BinaryOperator::Equal, left, right, .. } = &ensures else {
+            let ScalarExpression::Binary { operator, left, right, .. } = &ensures else {
                 return Err(ProjectCheck::Unsupported);
             };
+            let relation = IntegerRelation::from_operator(operator).ok_or(ProjectCheck::Unsupported)?;
             let (ScalarExpression::Name { name: out, .. }, ScalarExpression::Call {
                 receiver: Some(core), name: old, type_arguments, arguments, ..
             }) = (left.as_ref(), right.as_ref()) else {
@@ -3205,14 +3207,14 @@ fn typed_proof_postcondition<'a, const AUDIT_INDUCTION: bool, const DEFER_OUTPUT
             let [ScalarExpression::Name { name: input, .. }] = arguments.as_slice() else {
                 return Err(ProjectCheck::Unsupported);
             };
-            if out != output {
+            if out != output || is_null_literal_name(out) || is_null_literal_name(input) {
                 return Err(ProjectCheck::InvalidProof);
             }
             let slot = input_names.iter().position(|name| name == input).ok_or(ProjectCheck::InvalidProof)?;
-            if boundary.parameters.len() != 1 || boundary.parameters[slot].ty != result.ty {
+            if !matches!(boundary.parameters.len(), 1 | 2) || boundary.parameters[slot].ty != result.ty {
                 return Err(ProjectCheck::Unsupported);
             }
-            TypedProofGoal::EntryEqual { slot }
+            TypedProofGoal::EntryComparison { slot, relation }
         }
     };
 

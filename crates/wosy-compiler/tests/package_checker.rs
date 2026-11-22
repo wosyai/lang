@@ -1290,6 +1290,36 @@ fn observed_module_proof_old_compares_the_exact_original_entry_of_each_call() {
 }
 
 #[test]
+fn observed_module_proof_old_selects_exact_typed_entry_slot_for_relations() {
+    let identity = source();
+    let check = |goal: &str, guard: &str, actual: &str| {
+        check_scalar_module_proof(
+            identity.clone(),
+            "snapshot",
+            vec![ScalarProofModuleInput {
+                source: identity.clone(),
+                text: format!(r#"%%start
+                    i16(u8, i16) echo = fn(tag, value) {{ if (tag == 0) {{}}; value }};
+                    {actual}
+                    proof snapshot for echo(tag, original) -> (out) where ({guard}) ensures ({goal}) {{}}
+                %%end"#),
+                namespaces: Vec::new(),
+            }],
+            vec![identity.clone()],
+            ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
+        )
+    };
+    let two = "i16 a = echo(7, -128); i16 b = echo(0, 7);";
+    assert_eq!(check("out >= core.old(original)", "true", two), ScalarModuleProofOutcome::Proved);
+    assert_eq!(check("out == core.old(original)", "tag == 0", two), ScalarModuleProofOutcome::Proved);
+    assert_eq!(check("out < core.old(original)", "true", two), ScalarModuleProofOutcome::Refuted);
+    assert_eq!(check("out != core.old(original)", "tag == 1", two), ScalarModuleProofOutcome::NoApplicableInputs);
+    assert_eq!(check("out >= core.old(original)", "true", ""), ScalarModuleProofOutcome::Unsupported);
+    assert_eq!(check("out >= core.old(tag)", "true", two), ScalarModuleProofOutcome::Unsupported);
+    assert!(matches!(check("out >= core.old(out)", "true", two), ScalarModuleProofOutcome::Invalid(_)));
+}
+
+#[test]
 fn observed_entry_comparison_does_not_supply_a_reusable_module_bound() {
     let identity = source();
     let text = format!(r#"%%start
