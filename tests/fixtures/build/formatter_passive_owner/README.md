@@ -31,3 +31,8 @@ returns to its caller. The separate checked value remains live through
 the read and is released at the caller's scope exit. The observer does
 not impose an order between the parser's allocation and text release
 inside parse, and distinguishes allocations even if an address is reused.
+
+The user-defined forwarding control returns ordinary format from a
+direct wrapper and binds its result by name before printing it. It
+checks the original allocation is still live after the wrapper returns,
+is used for the real output, and is released once by the consumer.
