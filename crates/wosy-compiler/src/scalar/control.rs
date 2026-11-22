@@ -68,6 +68,10 @@ impl ScopeExitBindings {
         self.bindings.is_empty()
     }
 
+    pub(super) fn iter(&self) -> impl Iterator<Item = &super::ReferenceBindingId> {
+        self.bindings.iter()
+    }
+
     pub(super) fn singleton(&self) -> Option<&super::ReferenceBindingId> {
         if self.bindings.len() != 1 {
             return None;

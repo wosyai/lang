@@ -472,10 +472,9 @@ impl<'a> ReferenceFlowBuilder<'a> {
         Self {
             capture_call_points: false,
             local_borrow: (matches!(&call_sites.named_place_roots, NamedPlaceRootFacts::Prepared(roots)
-                if if call_sites.conditionals.is_empty() { !roots.is_empty() } else {
-                    call_sites.conditionals.len() == 1
-                        && matches!(call_sites.conditionals.values().next(), Some(ConditionalRegion::Unit { .. }))
-                })
+                if if call_sites.conditionals.len() == 1 {
+                    matches!(call_sites.conditionals.values().next(), Some(ConditionalRegion::Unit { .. }))
+                } else { !roots.is_empty() })
                 && call_sites.boundary.root_outputs.is_empty()
                 && call_sites.boundary.parameters.iter().all(|parameter| aggregate::ordinary_value(&parameter.ty))
                 && function.generic_parameters.is_empty() && call_sites.call_occurrences.is_empty()
@@ -6393,8 +6392,9 @@ fn transfer_reference_facts(
         child_holders.get(binding).copied()
     };
     let mut dependency_pair = [CfgPointId(0); 2];
+    let mut local_fork_index = 0;
     for (index, point) in original_points.iter().enumerate() {
-        if cfg.local_borrow.is_some_and(|sealed| !sealed.matches_edge_shape(index, point)) {
+        if cfg.local_borrow.is_some_and(|sealed| !sealed.matches_edge_shape(index, point, &mut local_fork_index)) {
             cfg.local_borrow = None;
         }
         if validate_topology {
