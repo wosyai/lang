@@ -1239,18 +1239,7 @@ fn emit_core_alloc_values<'ctx, 'module>(
     size: BasicValueEnum<'ctx>,
     alignment: BasicValueEnum<'ctx>,
 ) -> Result<EmitValue<'ctx>, String> {
-    let allocator = state
-        .module
-        .get_function(CORE_ALLOC_SYMBOL)
-        .ok_or_else(|| "core allocation runtime declaration is missing".to_owned())?;
-    let pointer = state
-        .builder
-        .build_call(allocator, &[size.into(), alignment.into()], "allocation")
-        .map_err(builder_error)?
-        .try_as_basic_value()
-        .basic()
-        .ok_or_else(|| "core allocation runtime returned no pointer".to_owned())?
-        .into_pointer_value();
+    let pointer = super::ownership::emit_standard_allocation_call(state, size, alignment)?;
     let address = state
         .builder
         .build_ptr_to_int(

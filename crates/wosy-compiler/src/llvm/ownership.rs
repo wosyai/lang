@@ -1004,6 +1004,25 @@ fn escaped_runtime_array_owners_in_block(
         })
 }
 
+pub(super) fn emit_standard_allocation_call<'ctx>(
+    state: &EmitState<'ctx, '_>,
+    size: BasicValueEnum<'ctx>,
+    alignment: BasicValueEnum<'ctx>,
+) -> Result<PointerValue<'ctx>, String> {
+    let allocator = state
+        .module
+        .get_function(CORE_ALLOC_SYMBOL)
+        .ok_or_else(|| "core allocation runtime declaration is missing".to_owned())?;
+    state
+        .builder
+        .build_call(allocator, &[size.into(), alignment.into()], "allocation")
+        .map_err(builder_error)?
+        .try_as_basic_value()
+        .basic()
+        .map(BasicValueEnum::into_pointer_value)
+        .ok_or_else(|| "core allocation runtime returned no pointer".to_owned())
+}
+
 pub(super) fn emit_runtime_array_allocation<'ctx, 'module>(
     context: &'ctx Context,
     state: &mut EmitState<'ctx, 'module>,
@@ -1054,25 +1073,11 @@ pub(super) fn emit_runtime_array_allocation<'ctx, 'module>(
                 .map_err(builder_error)?
         }
     };
-    let allocator = state
-        .module
-        .get_function(CORE_ALLOC_SYMBOL)
-        .ok_or_else(|| "core allocation runtime declaration is missing".to_owned())?;
-    let allocation = state
-        .builder
-        .build_call(
-            allocator,
-            &[
-                size.into(),
-                context.i64_type().const_int(alignment, false).into(),
-            ],
-            "allocation",
-        )
-        .map_err(builder_error)?
-        .try_as_basic_value()
-        .basic()
-        .ok_or_else(|| "core allocation runtime returned no pointer".to_owned())?
-        .into_pointer_value();
+    let allocation = emit_standard_allocation_call(
+        state,
+        size.into(),
+        context.i64_type().const_int(alignment, false).into(),
+    )?;
     let failed = state
         .builder
         .build_is_null(allocation, "allocation_failed")
