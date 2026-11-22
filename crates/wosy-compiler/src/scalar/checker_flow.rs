@@ -100,7 +100,7 @@ pub(super) struct ImportedLocal<'a> {
 pub(super) enum ImportedIntegerValues<'a> {
     Ready(IntegerSet, std::marker::PhantomData<&'a ()>),
     #[cfg(feature = "internal-checker")]
-    Shared(&'a Rc<IntegerSet>),
+    Shared { values: &'a std::cell::OnceCell<Rc<IntegerSet>>, bound: &'a BigInt, guard: Option<&'a ImportedEntryGuard<'a>> },
     #[cfg(feature = "internal-checker")]
     Deferred {
         slot: usize,
@@ -1984,7 +1984,7 @@ pub(super) fn collect_ordered_root_requirement_failures<'a>(
 #[cfg(feature = "internal-checker")]
 pub(super) fn collect_ordered_root_literal_proof<'a, const TOTAL: bool>(
     calls: &'a FunctionCallSites, body: &'a super::ScalarBlock, relation: IntegerRelation, bound: &BigInt,
-    predicate: Option<&IntegerPredicate>,
+    predicate: Option<&IntegerPredicate>, entry_filter: Option<&[CheckerPredicate]>,
 ) -> Option<(bool, Vec<IntegerCheckFailure<'a>>, bool, Option<SymbolicLiteralFailure<'a>>)> {
     let bounds;
     let guard = if let Some(predicate) = predicate {
@@ -2015,10 +2015,24 @@ pub(super) fn collect_ordered_root_literal_proof<'a, const TOTAL: bool>(
     let observed = std::cell::RefCell::new((false, None));
     let mut failures = Vec::new();
     let mut sink = |failure| failures.push(failure);
-    let (active, _) = collect_integer_requirement_failures_in_scope(
-        calls, IntegerRequirementEntry::Arbitrary, None, false, &mut sink,
-        OrderedRootLiteralProof::<TOTAL> { conditions: OrderedRootConditions(body), relation, bound, guard: guard.as_ref(), observed: &observed },
-    )?;
+    let scope = OrderedRootLiteralProof::<TOTAL> {
+        conditions: OrderedRootConditions(body), relation, bound, guard: guard.as_ref(), observed: &observed,
+    };
+    let active = if TOTAL {
+        let mut collected = IntegerFailureCollection {
+            continuation: IntegerRequirementContinuation::Empty, projected: None, allow_projected_calls: false, sink: &mut sink,
+        };
+        match run_integer_callable::<false, true, _>(
+            calls, integer_tail_type(calls), entry_filter, None, None, None, None, Some(&mut collected), false, scope,
+        )?.ok()? {
+            ProofCoverage::Applicable(active) => active,
+            ProofCoverage::NoApplicableInputs => false,
+        }
+    } else {
+        collect_integer_requirement_failures_in_scope(
+            calls, IntegerRequirementEntry::Arbitrary, None, false, &mut sink, scope,
+        )?.0
+    };
     let (returned, failure) = observed.into_inner();
     Some((active, failures, returned, failure))
 }
@@ -2246,9 +2260,6 @@ pub(super) fn proves_requirement_with_imported_root_local<'a>(
 pub(super) fn collect_ordered_imported_root_local<'a>(
     calls: &'a FunctionCallSites, local: ImportedLocal<'a>, sink: &mut dyn FnMut(IntegerCheckFailure<'a>),
 ) -> Option<bool> {
-    if matches!(&local.values, ImportedIntegerValues::Shared(values) if values.is_empty()) {
-        return None;
-    }
     let mut failures = IntegerFailureCollection {
         continuation: IntegerRequirementContinuation::Empty, projected: None, allow_projected_calls: false, sink,
     };
@@ -2987,19 +2998,23 @@ fn walk_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, A
                             }
                         });
                     }
-                    let applies = local.guards.iter().all(|guard| match arguments.get(guard.slot).copied().flatten() {
+                    let applies = |guard: &ImportedEntryGuard<'_>| match arguments.get(guard.slot).copied().flatten() {
                         Some(Argument::Literal(value)) => guard.relation.accepts(value.cmp(guard.bound)),
                         Some(Argument::Axis(axis)) => path.0.iter().all(|row| row[axis].every(guard.relation, guard.bound)),
                         None => false,
-                    });
-                    if !applies {
+                    };
+                    if !local.guards.iter().all(&applies) {
                         return None;
                     }
                     let values = match local.values {
                         ImportedIntegerValues::Ready(values, _) => values,
                         #[cfg(feature = "internal-checker")]
-                        ImportedIntegerValues::Shared(values) => {
+                        ImportedIntegerValues::Shared { values, bound, guard } => {
+                            if guard.is_some_and(|guard| !applies(guard)) {
+                                return None;
+                            }
                             roots.add(&origin.binding, &receiver.ty);
+                            let values = values.get_or_init(|| Rc::new(IntegerSet::singleton(bound)));
                             path.append_shared_local(values);
                             continue;
                         }

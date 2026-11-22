@@ -2003,7 +2003,8 @@ struct VerifiedSymbolicEquality<'a> {
     layout: ScalarTargetLayout,
     body: &'a FunctionCallSites,
     bound: &'a BigInt,
-    shared: Option<Rc<IntegerSet>>,
+    shared: std::cell::OnceCell<Rc<IntegerSet>>,
+    guard: Option<ImportedEntryGuard<'a>>,
 }
 
 #[cfg(feature = "internal-checker")]
@@ -2011,7 +2012,7 @@ impl SelectedSymbolicProof<'_, '_> {
     fn try_consume_equality(
         &mut self, target: PreparedCallable, calls: &FunctionCallSites, source: &SourceIdentity, effects: &mut OrderedFailures,
     ) -> Result<Option<bool>, ProjectCheck> {
-        let Some(summary) = &mut self.verified else { return Ok(None); };
+        let Some(summary) = &self.verified else { return Ok(None); };
         if target.0 != summary.target.0 || target.1 <= summary.target.1
             || !calls.assignments.is_empty() || !calls.allocation_length_calls.is_empty()
             || !matches!(calls.boundary.results.as_slice(), [result] if result.ty == ScalarType::Unit)
@@ -2032,9 +2033,7 @@ impl SelectedSymbolicProof<'_, '_> {
         ) {
             return Ok(None);
         }
-        let bound = summary.bound;
-        let shared = summary.shared.get_or_insert_with(|| Rc::new(IntegerSet::singleton(bound)));
-        let values = ImportedIntegerValues::Shared(shared);
+        let values = ImportedIntegerValues::Shared { values: &summary.shared, bound: summary.bound, guard: summary.guard.as_ref() };
         let mut emit = |failure| effects.push_callable(calls, source, failure);
         let active = super::checker_flow::collect_ordered_imported_root_local(
             calls, ImportedLocal { position, values, guards: Vec::new() }, &mut emit,
@@ -2207,23 +2206,28 @@ impl SymbolicRootProof for SelectedSymbolicProof<'_, '_> {
             _ => return Err(ProjectCheck::Unsupported),
         };
         if rest.is_empty() {
-            let candidate = self.candidate.filter(|plan| plan.target == target && predicate.is_none() && tautological(first)
+            let candidate = self.candidate.filter(|plan| plan.target == target
+                && (tautological(first) || (predicate.is_some() && !first.guard.always_rejects
+                    && first.guard.domain.is_none() && first.guard.comparisons.len() == 1))
                 && plan.proof_source == source && valid_arbitrary_proof_body(calls)
                 && matches!(&plan.typed.goal, TypedProofGoal::Literal { operator: BinaryOperator::Equal, .. }));
             let (active, directives, returned, failure) = if candidate.is_some() {
                 super::checker_flow::collect_ordered_root_literal_proof::<true>(
-                    calls, &function.body, first.relation, first.bound, None,
+                    calls, &function.body, first.relation, first.bound, None, Some(first.filter),
                 )
             } else {
                 super::checker_flow::collect_ordered_root_literal_proof::<false>(
-                    calls, &function.body, first.relation, first.bound, predicate,
+                    calls, &function.body, first.relation, first.bound, predicate, None,
                 )
             }.ok_or(ProjectCheck::Unsupported)?;
             if returned && failure.is_none() {
                 if let Some(plan) = candidate {
                     self.verified = Some(VerifiedSymbolicEquality {
                         target, canonical_target: plan.canonical_target, layout: plan.typed.target.target_layout,
-                        body: plan.typed.body, bound: first.bound, shared: None,
+                        body: plan.typed.body, bound: first.bound, shared: std::cell::OnceCell::new(),
+                        guard: first.guard.comparisons.first().map(|guard| ImportedEntryGuard {
+                            slot: guard.slot, relation: guard.relation, bound: guard.bound,
+                        }),
                     });
                 }
             }
@@ -7645,6 +7649,43 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
         let both = format!("{producer}{sibling}");
         let redirected = caller.replace("producer(input)", "sibling(input)");
         assert!(matches!(run(&module(&both, &redirected, "out == 7")), Err(ProjectCheck::Unsupported)));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordered_current_package_guarded_equality_requires_total_admitted_producer_and_contained_caller() {
+        let app = source("src/main.w", "ordered-automatic-proof-guarded-summary");
+        let run = |text: &str| {
+            let (_, proof) = crate::parse_proof_source(app.clone(), text.to_owned(), &[])
+                .unwrap_or_else(|_| panic!("valid proof source"));
+            check_loaded_ordered_proof_diagnostics(
+                Vec::new(), vec![(proof, Vec::new())], vec![app.clone()], inputs(), ScalarCheckerScope::CurrentPackage,
+            )
+        };
+        let producer = "i16(i16) producer = fn(input) { if (input < 0) { input + 1 } else { 7 } };";
+        let caller = format!("unit() client = fn() {{ i16 result = producer(0); core.require(result == 7, {OUTPUT}); }};");
+        let module = |producer: &str, caller: &str, guard: &str| format!(r#"%%start
+            {producer}
+            {caller}
+            proof bound for producer(entry) -> (out) where ({guard}) ensures (out == 7) {{}}
+        %%end"#);
+        let exact = module(producer, &caller, "entry >= 0");
+        let report = run(&exact).unwrap();
+        assert!(report.active && report.directives.is_empty() && report.symbolic_diagnostic.is_none());
+
+        let outside = caller.replace("producer(0)", "producer(-1)");
+        assert!(matches!(run(&module(producer, &outside, "entry >= 0")), Err(ProjectCheck::Unsupported)));
+        let overlap = caller.replace("unit() client = fn()", "unit(i16) client = fn(input)")
+            .replace("producer(0)", "producer(input)");
+        assert!(matches!(run(&module(producer, &overlap, "entry >= 0")), Err(ProjectCheck::Unsupported)));
+
+        let inside = producer.replace("{ input + 1 } else { 7 }", "{ 7 } else { input + 1 }");
+        assert!(matches!(run(&module(&inside, &caller, "entry >= 0")), Err(ProjectCheck::Unsupported)));
+        let empty = run(&module(producer, "", "entry < -32768")).unwrap();
+        assert!(!empty.active && empty.directives.is_empty() && empty.symbolic_diagnostic.is_none());
+        assert!(matches!(run(&module(producer, &caller, "entry < -32768")), Err(ProjectCheck::Unsupported)));
+        let effectful = producer.replace("if (input < 0)", &format!("core.require(true, {OUTPUT}); if (input < 0)"));
+        assert!(matches!(run(&module(&effectful, &caller, "entry >= 0")), Err(ProjectCheck::Unsupported)));
     }
 
     #[cfg(feature = "internal-checker")]
