@@ -124,6 +124,12 @@ trait ScopedAuthoredReturn<'a>: Copy {
     fn at(
         self, structure: &OccurrenceStructure, block: BlockOrdinal, slot: FinalOutputSlot, ty: &ScalarType,
     ) -> Option<&'a BigInt>;
+
+    fn branch(
+        self, _: &OccurrenceStructure, _: BlockOrdinal, _: FinalOutputSlot, _: usize, _: BlockOrdinal,
+    ) -> Self {
+        self
+    }
 }
 
 impl<'a> ScopedAuthoredReturn<'a> for () {
@@ -137,19 +143,18 @@ impl<'a> ScopedAuthoredReturn<'a> for () {
 #[cfg(feature = "internal-checker")]
 #[derive(Clone, Copy)]
 struct NamedAuthoredReturn<'a> {
+    block: BlockOrdinal,
     body: &'a super::ScalarBlock,
     value: &'a std::cell::OnceCell<Option<BigInt>>,
+    branches: Option<&'a [std::cell::OnceCell<Option<BigInt>>; 2]>,
 }
 
 #[cfg(feature = "internal-checker")]
-impl<'a> ScopedAuthoredReturn<'a> for NamedAuthoredReturn<'a> {
-    const ENABLED: bool = true;
-
-    fn at(
+impl<'a> NamedAuthoredReturn<'a> {
+    fn output(
         self, structure: &OccurrenceStructure, block: BlockOrdinal, slot: FinalOutputSlot,
-        ty: &ScalarType,
-    ) -> Option<&'a BigInt> {
-        if block != structure.root || slot.output != 0 || structure.blocks.get(block.0)?.span != self.body.span
+    ) -> Option<&'a ScalarExpression> {
+        if block != self.block || slot.output != 0 || structure.blocks.get(block.0)?.span != self.body.span
             || self.body.items.len().checked_sub(1)? != slot.item
         {
             return None;
@@ -162,8 +167,50 @@ impl<'a> ScopedAuthoredReturn<'a> for NamedAuthoredReturn<'a> {
         {
             return None;
         }
+        Some(&output.value)
+    }
+
+    fn checked_branch(
+        self, structure: &OccurrenceStructure, block: BlockOrdinal, slot: FinalOutputSlot,
+        index: usize, child: BlockOrdinal,
+    ) -> Option<Self> {
+        let value = self.branches?.get(index)?;
+        let ScalarExpression::If { then_branch, else_branch, .. } = self.output(structure, block, slot)? else {
+            return None;
+        };
+        let (edge, body) = if index == 0 {
+            (OccurrenceEdge::ThenBranch, then_branch)
+        } else {
+            (OccurrenceEdge::ElseBranch, else_branch)
+        };
+        if structure.edges.get(&(OccurrenceParent::Expression(slot.expression), edge))
+            != Some(&OccurrenceNode::Block(child))
+            || structure.blocks.get(child.0)?.span != body.span
+        {
+            return None;
+        }
+        Some(Self { block: child, body, value, branches: None })
+    }
+}
+
+#[cfg(feature = "internal-checker")]
+impl<'a> ScopedAuthoredReturn<'a> for NamedAuthoredReturn<'a> {
+    const ENABLED: bool = true;
+
+    fn branch(
+        self, structure: &OccurrenceStructure, block: BlockOrdinal, slot: FinalOutputSlot,
+        index: usize, child: BlockOrdinal,
+    ) -> Self {
+        self.checked_branch(structure, block, slot, index, child).unwrap_or(self)
+    }
+
+    fn at(
+        self, structure: &OccurrenceStructure, block: BlockOrdinal, slot: FinalOutputSlot,
+        ty: &ScalarType,
+    ) -> Option<&'a BigInt> {
+        let output = self.output(structure, block, slot)?;
         self.value.get_or_init(|| {
-            let ScalarExpression::Binary { operator, left, right, .. } = &output.value else { return None; };
+            let ScalarExpression::Binary { operator, left, right, .. } = output else { return None; };
             let operation = AuthoredIntegerOperation::checked(operator)?;
             if matches!(left.as_ref(), ScalarExpression::Binary { .. })
                 || matches!(right.as_ref(), ScalarExpression::Binary { .. })
@@ -171,7 +218,7 @@ impl<'a> ScopedAuthoredReturn<'a> for NamedAuthoredReturn<'a> {
                 let (min, max) = super::typecheck::integer_bounds(ty)?;
                 #[cfg(test)]
                 AUTHORED_RETURN_CALCULATIONS.with(|count| count.set(count.get() + 1));
-                return nested_authored_integer_return(&output.value, slot.expression, structure, ty, &min, &max);
+                return nested_authored_integer_return(output, slot.expression, structure, ty, &min, &max);
             }
             let parent = OccurrenceParent::Expression(slot.expression);
             let typed_operand = |edge| {
@@ -1721,8 +1768,9 @@ pub(super) fn evaluate_owning_show_conditional(
 pub(super) fn observe_authored_show_returns<'a>(
     calls: &'a FunctionCallSites, entry_filter: Option<&[CheckerPredicate]>,
     body: &'a super::ScalarBlock, value: &'a std::cell::OnceCell<Option<BigInt>>,
+    branches: &'a [std::cell::OnceCell<Option<BigInt>>; 2],
 ) -> Option<Result<ProofCoverage<Vec<IntegerReturningPath<'a>>>, IntegerCheckFailure<'a>>> {
-    observe_integer_returns_in_scope(calls, entry_filter, None, false, NamedAuthoredReturn { body, value })
+    observe_integer_returns_in_scope(calls, entry_filter, None, false, NamedAuthoredReturn { block: calls.structure.root, body, value, branches: Some(branches) })
 }
 
 #[cfg(feature = "internal-checker")]
@@ -2181,11 +2229,16 @@ fn walk_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, A
                     let expected = tail?;
                     let predicate = structure.checker_branches.get(condition)?;
                     let (yes, no, _) = path.split(roots, predicate)?;
-                    for (arm, incoming) in [(*then_block, yes), (*else_block, no)] {
+                    for (index, (arm, incoming)) in [(*then_block, yes), (*else_block, no)].into_iter().enumerate() {
                         if incoming.is_unreachable() {
                             continue;
                         }
-                        match walk_integer_block::<USE_IMPORTED_BOUND, COLLECT, _>(calls, roots, arm, incoming, Some(expected), returns.as_deref_mut(), handle_call, failures, authored_return)? {
+                        let branch_return = if Authored::ENABLED {
+                            authored_return.branch(structure, block, slot, index, arm)
+                        } else {
+                            authored_return
+                        };
+                        match walk_integer_block::<USE_IMPORTED_BOUND, COLLECT, _>(calls, roots, arm, incoming, Some(expected), returns.as_deref_mut(), handle_call, failures, branch_return)? {
                             IntegerControl::Returned => {}
                             failure @ IntegerControl::Fail(_) => return Some(failure),
                             IntegerControl::Continue(outgoing) if COLLECT && outgoing.is_unreachable() => {}

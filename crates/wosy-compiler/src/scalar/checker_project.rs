@@ -2474,7 +2474,8 @@ fn verify_authored_show_group<'step, 'project: 'step>(
     let plan = first.plan;
     let body = plan.typed.body;
     let authored_value = std::cell::OnceCell::new();
-    let rows = observe_authored_show_returns(body, plan.filter.as_deref(), &plan.function.body, &authored_value);
+    let branch_values = std::array::from_fn(|_| std::cell::OnceCell::new());
+    let rows = observe_authored_show_returns(body, plan.filter.as_deref(), &plan.function.body, &authored_value, &branch_values);
     let checks = std::iter::once(first).chain(checks);
     match rows {
         Some(Ok(ProofCoverage::Applicable(paths))) => {
@@ -6847,7 +6848,23 @@ mod tests {
             [Unsupported, Unsupported]);
         assert_eq!(count(), 0);
         assert_eq!(check("if (value == 0) { 3 + 4 } else { 7 }", "true", "out <= 7", "", &["leaf"]),
-            [Unsupported]);
+            [Proved]);
+        assert_eq!(count(), 1);
+        let branches = "if (value == 0) { 3 + 4 } else { 9 - (4 - 1) }";
+        assert_eq!(check(branches, "true", "out <= 7", "", &["leaf", "another", "cite", "plain"]),
+            [Proved, Refuted, Proved, Unsupported]);
+        assert_eq!(count(), 2);
+        let bad = "if (value == 0) { 3 + 4 } else { (127 + 1) * 0 }";
+        assert_eq!(check(bad, "arg == 0", "out == 7", "", &["leaf"]), [Proved]);
+        assert_eq!(count(), 1);
+        assert_eq!(check(bad, "true", "out <= 7", "", &["leaf", "cite"]), [Unsupported, Unsupported]);
+        assert_eq!(count(), 2);
+        assert_eq!(check(bad, "false", "out <= 7", "", &["leaf"]), [NoApplicableInputs]);
+        assert_eq!(count(), 0);
+        assert_eq!(check(branches, "true", "out <= 7", "i8 live = number(0);", &["leaf"]), [Unsupported]);
+        assert_eq!(count(), 0);
+        let nested = "if (value == 0) { if (value == 0) { 3 + 4 } else { 7 } } else { 7 }";
+        assert_eq!(check(nested, "true", "out <= 7", "", &["leaf"]), [Unsupported]);
         assert_eq!(count(), 0);
     }
 
