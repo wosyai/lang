@@ -152,7 +152,7 @@ impl<'a> DormantSourceBoundaries<'a> {
 #[allow(dead_code)]
 pub(crate) fn load_explicit_dormant_proof_sources(
     root: &std::path::Path, project: &ProjectContext, configuration: &ProjectConfiguration,
-    paths: Vec<PackageRelativePath>, texts: &BTreeMap<ProjectSourceIdentity, String>,
+    paths: Vec<PackageRelativePath>, texts: &mut BTreeMap<ProjectSourceIdentity, String>,
 ) -> Result<Vec<wosy_compiler::ScalarProofDeclarations>, CanonicalLoadFailure> {
     if paths.is_empty() {
         return Ok(Vec::new());
@@ -179,9 +179,11 @@ pub(crate) fn load_explicit_dormant_proof_sources(
         let text = fs::read_to_string(&resolved).map_err(|error|
             format!("failed to read dormant source {}: {error}", identity.path.as_path().display())
         )?;
-        let source = canonical_source_identity(identity.project, &identity.package, &identity.path, &text);
-        wosy_compiler::parse_proof_source(source, text, &project.comment_categories)
-            .map(|(_, proof)| proof).map_err(canonical_syntax_failure)
+        let source = canonical_source_identity(identity.project.clone(), &identity.package, &identity.path, &text);
+        let (text, proof) = wosy_compiler::parse_proof_source(source, text, &project.comment_categories)
+            .map_err(canonical_syntax_failure)?;
+        texts.insert(identity, text);
+        Ok(proof)
     }).collect()
 }
 

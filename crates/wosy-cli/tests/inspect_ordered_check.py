@@ -211,5 +211,37 @@ def main():
         assert sorted(entry.name for entry in root.iterdir()) == ["lib.w", "main.w", "wosy.toml"]
 
 
+        source.write_text("""%%start
+            i8(i8) echo = fn(value) { value };
+            proof reached for echo(entry) -> (out) ensures (out < 5) {}
+            i8 result = echo(8);
+            core.require(false, { .stdout = "ação"; .stderr = ""; .code = 0;
+                .files = [{ .path = "preview.txt"; .text = "β"; }]; });
+            core.require(false, { .stdout = ""; .stderr = "second"; .code = 340282366920938463463374607431768211456;
+                .files = []; });
+            core.require(false, { .stdout = "third"; .stderr = ""; .code = 33; .files = []; });
+        %%end""", encoding="utf-8")
+        module.write_text("""%%start
+            i8(i8) unused = fn(value) { value };
+            proof uncovered for unused(entry) -> (out) ensures (out != 7) {}
+        %%end""", encoding="utf-8")
+        effects_command = [*dormant_command, "--inspect-effects"]
+        effects = subprocess.run(effects_command, cwd=root, capture_output=True, timeout=15)
+        expected_effects = (
+            'ordered check: complete\ndirective failures: 3\n'
+            'actual proof failures: 1 (0 nested)\nunused proof failures: 1\n'
+            'source texts: 2\nauthored status: 340282366920938463463374607431768211456\n'
+            f'stdout: {"ação".encode().hex()}\nfile "preview.txt": {"β".encode().hex()}\n'
+            f'stderr: {b"second".hex()}\nstdout: {b"third".hex()}\n'
+        ).encode()
+        assert (effects.returncode, effects.stdout, effects.stderr) == (1, expected_effects, b""), effects
+        module.write_text(module.read_text(encoding="utf-8").replace("{ value }", "{ value + 1 }"), encoding="utf-8")
+        incomplete = subprocess.run(effects_command, cwd=root, capture_output=True, timeout=15)
+        assert (incomplete.returncode, incomplete.stdout, incomplete.stderr) == (
+            2, b"", b"ordered check: incomplete: checker did not complete analysis\n"
+        ), incomplete
+        assert sorted(entry.name for entry in root.iterdir()) == ["lib.w", "main.w", "wosy.toml"]
+
+
 if __name__ == "__main__":
     main()

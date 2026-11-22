@@ -1,51 +1,30 @@
-use std::ffi::OsStr;
 use std::io::{self, Write};
 use std::path::Path;
 use std::process::ExitCode;
 
-use wosy_compiler::{
-    check_loaded_scalar_ordered_local_proof_contexts, MainFlowProofReceipt, ScalarOrderedCheckerOutcome,
-    ScalarCheckerScope, ScalarPreparationInputs, ScalarTargetLayout,
-};
-use wosy_project::{PackageRelativePath, ProjectConfiguration, ProjectContext};
+use wosy_compiler::{MainFlowProofReceipt, ScalarCheckerScope, ScalarOrderedCheckerOutcome};
 
 #[allow(dead_code)]
 #[path = "../src/canonical_loader.rs"]
 mod canonical_loader;
-use canonical_loader::{load_canonical_project_inputs, load_explicit_dormant_proof_sources, CanonicalLoadPurpose};
+#[allow(dead_code)]
+#[path = "../src/configured_check.rs"]
+mod configured_check;
+use configured_check::{
+    check_target, ConfiguredCheckLoadError, InternalCheckEffect, InternalCheckStatus, OrderedCheckEffects,
+};
 
-fn inspect(
-    root: &Path, target: &str, profile: &str, scope: ScalarCheckerScope, dormant_paths: Vec<&OsStr>,
-) -> Result<MainFlowProofReceipt, &'static str> {
-    let root = root.canonicalize().map_err(|_| "invalid project root")?;
-    let (configuration, manifest) =
-        ProjectConfiguration::load_with_manifest(&root).map_err(|_| "invalid manifest")?;
-    let project = ProjectContext::from_manifest(&root, target, manifest.as_table())
-        .map_err(|_| "invalid target")?;
-    let (_, _, artifact, _) = configuration.artifact_profile(target, profile)
-        .map_err(|_| "invalid target profile")?;
-    let layout = artifact.target_layout().map_err(|_| "unsupported target layout")?;
-    let target_layout = ScalarTargetLayout {
-        pointer_size: layout.pointer_size, pointer_alignment: layout.pointer_alignment,
-    };
-    let loaded = load_canonical_project_inputs(
-        &root, &project, &configuration, CanonicalLoadPurpose::LocalProofs, || {},
-    ).map_err(|_| "canonical source load failed")?;
-    let dormant = if scope == ScalarCheckerScope::CurrentPackage {
-        let paths = dormant_paths.into_iter().map(|path| PackageRelativePath::new(path.into()))
-            .collect::<Result<Vec<_>, _>>().map_err(|_| "invalid dormant source path")?;
-        load_explicit_dormant_proof_sources(&root, &project, &configuration, paths, &loaded.texts)
-            .map_err(|_| "explicit dormant source load failed")?
-    } else {
-        Vec::new()
-    };
-    check_loaded_scalar_ordered_local_proof_contexts(
-        loaded.declarations, loaded.proofs.into_values(), loaded.initialization_order, ScalarPreparationInputs { target_layout },
-        scope, dormant,
-    ).map_err(|outcome| match outcome {
-        ScalarOrderedCheckerOutcome::Invalid(_) => "checker rejected invalid input",
-        _ => "checker did not complete analysis",
-    })
+fn load_error(error: ConfiguredCheckLoadError) -> &'static str {
+    match error {
+        ConfiguredCheckLoadError::Root => "invalid project root",
+        ConfiguredCheckLoadError::Manifest => "invalid manifest",
+        ConfiguredCheckLoadError::Target => "invalid target",
+        ConfiguredCheckLoadError::Profile => "invalid target profile",
+        ConfiguredCheckLoadError::Layout => "unsupported target layout",
+        ConfiguredCheckLoadError::Canonical(_) => "canonical source load failed",
+        ConfiguredCheckLoadError::DormantPath => "invalid dormant source path",
+        ConfiguredCheckLoadError::Dormant(_) => "explicit dormant source load failed",
+    }
 }
 
 fn render(report: &MainFlowProofReceipt) -> String {
@@ -64,10 +43,44 @@ fn render(report: &MainFlowProofReceipt) -> String {
     text
 }
 
+fn inspect_effects(text: &mut String, report: &MainFlowProofReceipt, sources: usize) {
+    use std::fmt::Write as _;
+    let effects = OrderedCheckEffects::new(&report.directives);
+    let _ = writeln!(text, "source texts: {sources}");
+    match effects.selected_status() {
+        InternalCheckStatus::Zero => { let _ = writeln!(text, "authored status: 0"); }
+        InternalCheckStatus::FirstNonzero(report) => {
+            let _ = writeln!(text, "authored status: {}", report.code());
+        }
+    }
+    let result = OrderedCheckEffects::new(&report.directives).visit_authored_effects(|effect| {
+        let bytes = match effect {
+            InternalCheckEffect::Stdout(bytes) => {
+                text.push_str("stdout: ");
+                bytes
+            }
+            InternalCheckEffect::Stderr(bytes) => {
+                text.push_str("stderr: ");
+                bytes
+            }
+            InternalCheckEffect::DeferredFile(file) => {
+                write!(text, "file {:?}: ", file.path)?;
+                &file.text
+            }
+        };
+        for byte in bytes {
+            write!(text, "{byte:02x}")?;
+        }
+        text.push('\n');
+        Ok::<(), std::fmt::Error>(())
+    });
+    debug_assert!(result.is_ok());
+}
+
 fn main() -> ExitCode {
     let args = std::env::args_os().skip(1).collect::<Vec<_>>();
     let [root, target, profile, options @ ..] = args.as_slice() else {
-        eprintln!("expected explicit PROJECT_ROOT TARGET PROFILE [--main-flow-only] [--dormant PATH]...");
+        eprintln!("expected explicit PROJECT_ROOT TARGET PROFILE [--main-flow-only] [--dormant PATH]... [--inspect-effects]");
         return ExitCode::from(2);
     };
     let (Some(target), Some(profile)) = (target.to_str(), profile.to_str()) else {
@@ -76,10 +89,13 @@ fn main() -> ExitCode {
     };
     let mut scope = ScalarCheckerScope::CurrentPackage;
     let mut dormant_paths = Vec::new();
+    let mut show_effects = false;
     let mut options = options.iter();
     while let Some(option) = options.next() {
         if option == "--main-flow-only" && scope == ScalarCheckerScope::CurrentPackage {
             scope = ScalarCheckerScope::MainFlowOnly;
+        } else if option == "--inspect-effects" && !show_effects {
+            show_effects = true;
         } else if option == "--dormant" {
             let Some(path) = options.next() else {
                 eprintln!("expected path after --dormant");
@@ -91,14 +107,29 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     }
-    let report = match inspect(Path::new(root), target, profile, scope, dormant_paths) {
-        Ok(report) => report,
-        Err(reason) => {
-            eprintln!("ordered check: incomplete: {reason}");
+    let receipt = match check_target(Path::new(root), Some(target), profile, scope, dormant_paths) {
+        Ok(receipt) => receipt,
+        Err(error) => {
+            eprintln!("ordered check: incomplete: {}", load_error(error));
             return ExitCode::from(2);
         }
     };
-    if io::stdout().lock().write_all(render(&report).as_bytes()).is_err() {
+    let report = match receipt.outcome {
+        Ok(report) => report,
+        Err(ScalarOrderedCheckerOutcome::Invalid(_)) => {
+            eprintln!("ordered check: incomplete: checker rejected invalid input");
+            return ExitCode::from(2);
+        }
+        Err(_) => {
+            eprintln!("ordered check: incomplete: checker did not complete analysis");
+            return ExitCode::from(2);
+        }
+    };
+    let mut output = render(&report);
+    if show_effects {
+        inspect_effects(&mut output, &report, receipt.texts.len());
+    }
+    if io::stdout().lock().write_all(output.as_bytes()).is_err() {
         return ExitCode::from(2);
     }
     if !report.directives.is_empty() || !report.diagnostics.is_empty() || report.symbolic_diagnostic.is_some()

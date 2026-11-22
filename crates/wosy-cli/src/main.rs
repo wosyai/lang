@@ -270,6 +270,12 @@ fn source_observation_path(observation: &SourceObservation) -> std::path::PathBu
 }
 
 mod canonical_loader;
+#[cfg(feature = "internal-checker")]
+#[allow(dead_code)]
+mod configured_check;
+#[cfg(feature = "internal-checker")]
+use configured_check::{InternalCheckEffect, InternalCheckStatus, OrderedCheckEffects};
+
 use canonical_loader::{
     CanonicalLoadFailure, CanonicalLoadPurpose, CanonicalProjectInputs,
 };
@@ -323,54 +329,29 @@ type InternalOrderedCheckReceipt = InternalCheckReceipt<wosy_compiler::ScalarOrd
 
 #[cfg(feature = "internal-checker")]
 #[cfg_attr(not(test), allow(dead_code))]
-#[derive(Debug, PartialEq)]
-enum InternalCheckStatus<'a> {
-    Zero,
-    FirstNonzero(&'a wosy_compiler::ScalarOrderedCheckerFailure),
-}
-
-#[cfg(feature = "internal-checker")]
-#[cfg_attr(not(test), allow(dead_code))]
-#[derive(Debug, PartialEq)]
-enum InternalCheckEffect<'a> {
-    Stdout(&'a [u8]),
-    Stderr(&'a [u8]),
-    DeferredFile(&'a wosy_compiler::ScalarCheckerTextFile),
-}
-
-#[cfg(feature = "internal-checker")]
-#[cfg_attr(not(test), allow(dead_code))]
 impl InternalCheckReceipt<wosy_compiler::ScalarOrderedCheckerOutcome> {
-    fn selected_status(&self) -> Option<InternalCheckStatus<'_>> {
+    fn effects(&self) -> Option<OrderedCheckEffects<'_>> {
         use wosy_compiler::ScalarOrderedCheckerOutcome;
         match &self.outcome {
             ScalarOrderedCheckerOutcome::Passed | ScalarOrderedCheckerOutcome::NoChecks =>
-                Some(InternalCheckStatus::Zero),
-            ScalarOrderedCheckerOutcome::Failed(reports) => Some(reports.iter().find(|report| report.code().bits() != 0)
-                .map_or(InternalCheckStatus::Zero, InternalCheckStatus::FirstNonzero)),
+                Some(OrderedCheckEffects::new(&[])),
+            ScalarOrderedCheckerOutcome::Failed(reports) => Some(OrderedCheckEffects::new(reports)),
             ScalarOrderedCheckerOutcome::Unsupported | ScalarOrderedCheckerOutcome::Invalid(_) => None,
         }
     }
 
+    fn selected_status(&self) -> Option<InternalCheckStatus<'_>> {
+        self.effects().map(OrderedCheckEffects::selected_status)
+    }
+
     fn visit_authored_effects<E>(
         &self,
-        mut sink: impl FnMut(InternalCheckEffect<'_>) -> Result<(), E>,
+        sink: impl FnMut(InternalCheckEffect<'_>) -> Result<(), E>,
     ) -> Result<(), E> {
-        let wosy_compiler::ScalarOrderedCheckerOutcome::Failed(reports) = &self.outcome else {
-            return Ok(());
-        };
-        for report in reports {
-            if !report.stdout().is_empty() {
-                sink(InternalCheckEffect::Stdout(report.stdout()))?;
-            }
-            if !report.stderr().is_empty() {
-                sink(InternalCheckEffect::Stderr(report.stderr()))?;
-            }
-            for file in report.files() {
-                sink(InternalCheckEffect::DeferredFile(file))?;
-            }
+        match self.effects() {
+            Some(effects) => effects.visit_authored_effects(sink),
+            None => Ok(()),
         }
-        Ok(())
     }
 }
 
