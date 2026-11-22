@@ -4745,6 +4745,13 @@ fn read_only_place_normalization_borrows_only_unchanged_places() {
         block_span: through.block_span,
         place: through.place.clone(),
     });
+    let first = SourceSpan::new(through.source.clone(), ByteSpan::new(1, 2));
+    let second = SourceSpan::new(through.source.clone(), ByteSpan::new(2, 3));
+    let mut state = ReferenceEdgeState::default();
+    state.moved.push((resolved.as_ref().clone(), first.clone()));
+    state.moved.push((place(99), SourceSpan::new(through.source.clone(), span)));
+    state.moved.push((resolved.as_ref().clone(), second.clone()));
+    assert_eq!(unavailable_origins_for_normalized_place(&state, &resolved), vec![first, second]);
 }
 
 fn unavailable_place(state: &ReferenceEdgeState, place: &ReferencePlaceId) -> bool {
@@ -4755,12 +4762,11 @@ fn unavailable_place(state: &ReferenceEdgeState, place: &ReferencePlaceId) -> bo
         .any(|(moved, _)| reference_places_overlap(moved, &place))
 }
 
-fn unavailable_origins(state: &ReferenceEdgeState, place: &ReferencePlaceId) -> Vec<SourceSpan> {
-    let place = available_place_for_check(place);
+fn unavailable_origins_for_normalized_place(state: &ReferenceEdgeState, place: &ReferencePlaceId) -> Vec<SourceSpan> {
     state
         .moved
         .iter()
-        .filter(|(moved, _)| reference_places_overlap(moved, &place))
+        .filter(|(moved, _)| reference_places_overlap(moved, place))
         .map(|(_, origin)| origin.clone())
         .collect()
 }
@@ -6891,11 +6897,10 @@ fn transfer_reference_facts(
                 }
             }
             for place in read_places {
+                let normalized = available_place_for_check(place);
                 if let Some(storage) = handle_storage {
-                    let normalized;
                     let storage_place = if matches!(storage, CheckedHandleStorage::Pointee) {
-                        normalized = available_place(place);
-                        &normalized
+                        normalized.as_ref()
                     } else {
                         place
                     };
@@ -6911,13 +6916,14 @@ fn transfer_reference_facts(
                         }
                     }
                 }
-                if unavailable_place(&state, place)
+                let origins = unavailable_origins_for_normalized_place(&state, &normalized);
+                if !origins.is_empty()
                     || state.released.contains(&place.binding)
                     || state.invalidated.contains(&place.binding)
                 {
                     errors.push(ReferenceAnalysisError::ConflictingPlace {
                         source_span: point.source_span.clone(),
-                        origins: unavailable_origins(&state, place),
+                        origins,
                     });
                 }
             }
@@ -6952,7 +6958,7 @@ fn transfer_reference_facts(
                         || deferred_policies.get(&id.0) == Some(&CopyPolicy::Move) =>
                 {
                     let place = available_place(place);
-                    let mut origins = unavailable_origins(&state, &place);
+                    let mut origins = unavailable_origins_for_normalized_place(&state, &place);
                     origins.extend(conflicting_live_loan(
                         original_points,
                         cfg.scope_exit_bindings,
@@ -6981,7 +6987,7 @@ fn transfer_reference_facts(
                     let singleton = candidates.len() == 1;
                     for candidate in candidates {
                         let place = available_place(&candidate.place);
-                        let mut origins = unavailable_origins(&state, &place);
+                        let mut origins = unavailable_origins_for_normalized_place(&state, &place);
                         origins.extend(conflicting_live_loan(
                             original_points,
                             cfg.scope_exit_bindings,
