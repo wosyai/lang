@@ -67,13 +67,13 @@ fn ordered_checker_facade_keeps_authored_reports_codes_bytes_and_typed_witnesses
         ) else { panic!("expected complete reports even when every code is zero"); };
         let [root, actual, unused] = reports.as_slice() else { panic!("expected exactly three reports"); };
         assert!(reports.iter().all(|report| report.source == identity && report.operation == ScalarCheckerOperation::Require));
-        assert_eq!(reports.iter().map(|report| report.code.clone()).collect::<Vec<_>>(), codes.map(num_bigint::BigInt::from));
-        assert_eq!((&*root.stdout, &*actual.stderr, &*unused.stdout), (&b"first"[..], &b"second"[..], &b"third"[..]));
+        assert_eq!(reports.iter().map(|report| report.code().clone()).collect::<Vec<_>>(), codes.map(num_bigint::BigInt::from));
+        assert_eq!((root.stdout(), actual.stderr(), unused.stdout()), (&b"first"[..], &b"second"[..], &b"third"[..]));
         let at = |span: wosy_syntax::ByteSpan| &text[span.start as usize..span.end as usize];
         assert_eq!((at(root.condition), at(actual.condition), at(unused.condition)), ("false", "value < 2", "value < 4"));
-        assert_eq!(at(actual.code_span), second.to_string());
-        assert_eq!(at(actual.stderr_span), r#""second""#);
-        let [file] = root.files.as_ref() else { panic!("expected only the authored file"); };
+        assert_eq!(at(actual.code_span()), second.to_string());
+        assert_eq!(at(actual.stderr_span()), r#""second""#);
+        let [file] = root.files() else { panic!("expected only the authored file"); };
         assert_eq!(&*file.path, "out.txt");
         assert_eq!(&*file.text, "ação\n".as_bytes());
         assert_eq!(at(file.path_span), r#""out.txt""#);

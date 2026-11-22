@@ -42,7 +42,6 @@ pub enum ScalarCheckerScope {
     MainFlowOnly,
 }
 
-#[cfg(feature = "internal-checker")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ScalarCheckerOperation {
     Require,
@@ -67,7 +66,6 @@ pub struct ScalarCheckerFailure {
     pub witness: ScalarCheckerIntegerWitness,
 }
 
-#[cfg(feature = "internal-checker")]
 #[derive(Debug, PartialEq, Eq)]
 pub struct ScalarCheckerIntegerWitness {
     axes: Vec<(ReferenceBindingId, ScalarType)>,
@@ -103,6 +101,38 @@ pub enum ScalarCheckerOutcome {
     Failed(ScalarCheckerFailure),
 }
 
+#[doc(hidden)]
+#[derive(Debug, PartialEq)]
+pub struct ScalarOrderedCheckerFailure {
+    pub source: SourceIdentity,
+    pub operation: ScalarCheckerOperation,
+    pub directive: ByteSpan,
+    pub condition: ByteSpan,
+    pub witness: ScalarCheckerIntegerWitness,
+    output: Rc<CheckedLiteralOutput>,
+}
+
+#[cfg(feature = "internal-checker")]
+impl ScalarOrderedCheckerFailure {
+    pub fn stdout(&self) -> &[u8] { &self.output.stdout_bytes }
+    pub fn stderr(&self) -> &[u8] { &self.output.stderr_bytes }
+    pub fn code(&self) -> &BigInt { &self.output.code_value }
+    pub fn files(&self) -> &[super::checker_directive::ScalarCheckerTextFile] { &self.output.text_files }
+    pub fn stdout_span(&self) -> ByteSpan { self.output.stdout }
+    pub fn stderr_span(&self) -> ByteSpan { self.output.stderr }
+    pub fn code_span(&self) -> ByteSpan { self.output.code }
+    pub fn files_span(&self) -> ByteSpan { self.output.files }
+}
+
+impl From<CheckerOperation> for ScalarCheckerOperation {
+    fn from(operation: CheckerOperation) -> Self {
+        match operation {
+            CheckerOperation::Require => Self::Require,
+            CheckerOperation::Narrow => Self::Narrow,
+        }
+    }
+}
+
 #[cfg(feature = "internal-checker")]
 #[doc(hidden)]
 #[derive(Debug, PartialEq)]
@@ -111,7 +141,7 @@ pub enum ScalarOrderedCheckerOutcome {
     NoChecks,
     Unsupported,
     Invalid(Vec<Diagnostic>),
-    Failed(Vec<ScalarCheckerFailure>),
+    Failed(Vec<ScalarOrderedCheckerFailure>),
 }
 
 #[cfg(feature = "internal-checker")]
@@ -153,13 +183,12 @@ pub fn check_scalar_package_ordered_with_dormant_sources(
     scope: ScalarCheckerScope,
 ) -> ScalarOrderedCheckerOutcome {
     let result = prepare_checked_package_scope(declarations, initialization_order, dormant, inputs, scope)
-        .and_then(|(prepared, startup_count)| collect_ordered_package_failures(&prepared, scope, startup_count));
+        .and_then(|(prepared, startup_count)| collect_ordered_checker_records(&prepared, scope, startup_count));
     match result {
         Ok((active, failures)) if failures.is_empty() => {
             if active { ScalarOrderedCheckerOutcome::Passed } else { ScalarOrderedCheckerOutcome::NoChecks }
         }
-        Ok((_, failures)) => failures.into_iter().map(materialize_checker_failure).collect::<Option<Vec<_>>>()
-            .map_or(ScalarOrderedCheckerOutcome::Unsupported, ScalarOrderedCheckerOutcome::Failed),
+        Ok((_, failures)) => ScalarOrderedCheckerOutcome::Failed(failures),
         Err(ProjectCheck::Invalid(diagnostics)) => ScalarOrderedCheckerOutcome::Invalid(diagnostics),
         Err(_) => ScalarOrderedCheckerOutcome::Unsupported,
     }
@@ -221,10 +250,7 @@ fn materialize_checker_failure(error: ProjectCheck) -> Option<ScalarCheckerFailu
     };
     Some(ScalarCheckerFailure {
         source,
-        operation: match operation {
-            CheckerOperation::Require => ScalarCheckerOperation::Require,
-            CheckerOperation::Narrow => ScalarCheckerOperation::Narrow,
-        },
+        operation: operation.into(),
         directive,
         condition,
         stdout_span: output.stdout,
@@ -345,17 +371,25 @@ fn check_package_roots_with_activity(
 }
 
 #[cfg(feature = "internal-checker")]
+fn collect_ordered_checker_records(
+    prepared: &PreparedCheckerProject, scope: ScalarCheckerScope, startup_count: usize,
+) -> Result<(bool, Vec<ScalarOrderedCheckerFailure>), ProjectCheck> {
+    let mut failures = OrderedFailures::default();
+    let active = check_package_roots_with_policy::<true>(prepared, scope, startup_count, Some(&mut failures))?;
+    Ok((active, failures.records))
+}
+
+#[cfg(all(test, feature = "internal-checker"))]
 fn collect_ordered_package_failures(
     prepared: &PreparedCheckerProject, scope: ScalarCheckerScope, startup_count: usize,
 ) -> Result<(bool, Vec<ProjectCheck>), ProjectCheck> {
-    let mut failures = Vec::new();
-    let active = check_package_roots_with_policy::<true>(prepared, scope, startup_count, Some(&mut failures))?;
-    Ok((active, failures))
+    let (active, failures) = collect_ordered_checker_records(prepared, scope, startup_count)?;
+    Ok((active, failures.into_iter().map(ordered_failure_as_legacy).collect()))
 }
 
 fn check_package_roots_with_policy<const COLLECT: bool>(
     prepared: &PreparedCheckerProject, scope: ScalarCheckerScope, startup_count: usize,
-    mut failures: Option<&mut Vec<ProjectCheck>>,
+    mut failures: Option<&mut OrderedFailures>,
 ) -> Result<bool, ProjectCheck> {
     let (project, calls) = prepared.parts();
     let (startup, dormant) = project.modules.split_at(startup_count);
@@ -569,7 +603,7 @@ fn check_unused_module<const COLLECT: bool>(
     ordinal: usize,
     reached: &HashSet<(usize, usize)>,
     symbolic_roots: HashSet<usize>,
-    mut failures: Option<&mut Vec<ProjectCheck>>,
+    mut failures: Option<&mut OrderedFailures>,
     completed_visits: Option<&[InitializationVisit]>,
 ) -> Result<bool, ProjectCheck> {
     let mut active = false;
@@ -593,9 +627,10 @@ fn check_unused_module<const COLLECT: bool>(
             if COLLECT {
                 let (observed, selected) = collect_integer_requirement_failures(body).ok_or(ProjectCheck::Unsupported)?;
                 active |= observed;
-                failures.as_deref_mut().ok_or(ProjectCheck::Unsupported)?.extend(
-                    selected.into_iter().map(|failure| project_failure(body, &module.source, failure)),
-                );
+                let failures = failures.as_deref_mut().ok_or(ProjectCheck::Unsupported)?;
+                for failure in selected {
+                    failures.push_callable(body, &module.source, failure);
+                }
             } else {
                 match check_integer_requirement_activity(body) {
                     Some(Ok(observed)) => active |= observed,
@@ -665,17 +700,16 @@ fn check_package_initialization_with_order<'a>(
     check_package_initialization_observing(prepared, root, ordinals, ()).map(|(initialization, ())| initialization)
 }
 
-#[cfg(feature = "internal-checker")]
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(all(test, feature = "internal-checker"))]
 fn collect_package_startup_failures(
     prepared: &PreparedCheckerProject,
 ) -> Result<Vec<ProjectCheck>, ProjectCheck> {
     let (root, ordinals) = package_initialization_order(prepared.parts().0)?;
-    let mut failures = Vec::new();
+    let mut failures = OrderedFailures::default();
     check_package_initialization_observing_with_policy::<(), true>(
         prepared, root, ordinals, (), Some(&mut failures),
     )?;
-    Ok(failures)
+    Ok(failures.records.into_iter().map(ordered_failure_as_legacy).collect())
 }
 
 fn check_package_initialization_observing<'a, Observer: ActualIntegerObserver>(
@@ -698,7 +732,7 @@ fn check_package_initialization_observing_with_policy<'a, Observer: ActualIntege
     root: &'a SourceIdentity,
     ordinals: HashMap<&'a SourceIdentity, usize>,
     observer: Observer,
-    mut failures: Option<&mut Vec<ProjectCheck>>,
+    mut failures: Option<&mut OrderedFailures>,
 ) -> Result<(CheckedInitialization<'a>, Observer), ProjectCheck> {
     let (project, calls) = prepared.parts();
     let mut visits = vec![InitializationVisit::Unseen; project.modules.len()];
@@ -717,7 +751,7 @@ fn walk_package_initialization<const COLLECT: bool>(
     visits: &mut [InitializationVisit],
     actual: &mut CheckedCalls<'_, impl ActualIntegerObserver>,
     source: &SourceIdentity,
-    failures: &mut Option<&mut Vec<ProjectCheck>>,
+    failures: &mut Option<&mut OrderedFailures>,
 ) -> Result<StartupLane, ProjectCheck> {
     let ordinal = *ordinals.get(source).ok_or(ProjectCheck::RootSourceOutsideInitOrder)?;
     match visits[ordinal] {
@@ -801,7 +835,7 @@ fn check_initializer_expression<const COLLECT: bool>(
     storage: &HashMap<ByteSpan, InitializerValue<'_>>,
     expression: OccurrenceOrdinal,
     depth: usize,
-    failures: &mut Option<&mut Vec<ProjectCheck>>,
+    failures: &mut Option<&mut OrderedFailures>,
     visits: &[InitializationVisit],
 ) -> Result<StartupLane, ProjectCheck> {
     let structure = &topology.structure;
@@ -811,11 +845,11 @@ fn check_initializer_expression<const COLLECT: bool>(
         actual.had_obligations = true;
         if directive.operation.rejects(value, !value) {
             let span = topology.occurrences.get(expression.0).ok_or(ProjectCheck::MissingRootOccurrences)?.span;
-            let failure = selected_failure(source, directive, span, IntegerInputs::closed(), Vec::new());
             if !COLLECT {
-                return Err(failure);
+                return Err(selected_failure(source, directive, span, IntegerInputs::closed(), Vec::new()));
             }
-            failures.as_deref_mut().ok_or(ProjectCheck::Unsupported)?.push(failure);
+            failures.as_deref_mut().ok_or(ProjectCheck::Unsupported)?
+                .push(source, directive, span, IntegerInputs::closed(), Vec::new());
             if directive.operation == CheckerOperation::Narrow {
                 return Ok(StartupLane::Empty);
             }
@@ -951,7 +985,7 @@ const MAX_INITIALIZER_BRANCH_DEPTH: usize = 64;
 
 #[derive(Clone, Copy)]
 struct OrderedCallCollection<'a, 'visits> {
-    failures: &'a RefCell<&'a mut Vec<ProjectCheck>>,
+    failures: &'a RefCell<&'a mut OrderedFailures>,
     visits: Option<&'visits [InitializationVisit]>,
 }
 
@@ -1052,7 +1086,7 @@ impl<Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> CheckedCalls<'
         collection: OrderedCallCollection<'_, '_>,
     ) -> Result<ActualCallResult, ProjectCheck> {
         let terminal_projection = matches!(&entry, IntegerRequirementEntry::Projected(_));
-        let mut sink = |failure| collection.failures.borrow_mut().push(project_failure(body, source, failure));
+        let mut sink = |failure| collection.failures.borrow_mut().push_callable(body, source, failure);
         let mut nested_error = None;
         let mut nested = |caller: &FunctionCallSites, occurrence, argument: NestedIntegerArgument<'_>, expected: &ScalarType| {
             match self.nested(caller, occurrence, argument, expected, Some((source, collection))) {
@@ -1324,6 +1358,82 @@ fn select_checked_root<'a>(
         return Err(ProjectCheck::RootSourceOutsideInitOrder);
     }
     Ok(root)
+}
+
+#[derive(Default)]
+struct OrderedFailures {
+    records: Vec<ScalarOrderedCheckerFailure>,
+    payloads: OrderedFailurePayloads,
+}
+
+#[derive(Default)]
+enum OrderedFailurePayloads {
+    #[default]
+    Empty,
+    One(*const PreparedCheckerDirective, Rc<CheckedLiteralOutput>),
+    Many(HashMap<*const PreparedCheckerDirective, Rc<CheckedLiteralOutput>>),
+}
+
+impl OrderedFailurePayloads {
+    fn shared(&mut self, directive: &PreparedCheckerDirective) -> Rc<CheckedLiteralOutput> {
+        let origin = std::ptr::from_ref(directive);
+        match self {
+            Self::Empty => {
+                let output = Rc::new(directive.output.clone());
+                *self = Self::One(origin, Rc::clone(&output));
+                output
+            }
+            Self::One(prior, output) if *prior == origin => Rc::clone(output),
+            Self::One(prior, previous) => {
+                let next = Rc::new(directive.output.clone());
+                *self = Self::Many(HashMap::from([(*prior, Rc::clone(previous)), (origin, Rc::clone(&next))]));
+                next
+            }
+            Self::Many(payloads) => Rc::clone(payloads.entry(origin).or_insert_with(|| Rc::new(directive.output.clone()))),
+        }
+    }
+}
+
+impl OrderedFailures {
+    fn push(
+        &mut self,
+        source: &SourceIdentity,
+        directive: &PreparedCheckerDirective,
+        span: ByteSpan,
+        state: IntegerInputs,
+        axes: Vec<(ReferenceBindingId, ScalarType)>,
+    ) {
+        self.records.push(ScalarOrderedCheckerFailure {
+            source: source.clone(),
+            operation: directive.operation.into(),
+            directive: span,
+            condition: directive.condition,
+            witness: ScalarCheckerIntegerWitness { axes, state },
+            output: self.payloads.shared(directive),
+        });
+    }
+
+    fn push_callable(&mut self, body: &FunctionCallSites, source: &SourceIdentity, failure: IntegerCheckFailure<'_>) {
+        self.push(
+            source,
+            &body.structure.checker_directives[&failure.directive],
+            body.occurrences[failure.directive.0].span,
+            failure.state,
+            failure.axes.into_iter().map(|(binding, ty)| (binding.clone(), ty.clone())).collect(),
+        );
+    }
+}
+
+#[cfg(all(test, feature = "internal-checker"))]
+fn ordered_failure_as_legacy(failure: ScalarOrderedCheckerFailure) -> ProjectCheck {
+    let ScalarOrderedCheckerFailure {
+        source, operation, directive, condition, witness: ScalarCheckerIntegerWitness { axes, state }, output,
+    } = failure;
+    let operation = match operation {
+        ScalarCheckerOperation::Require => CheckerOperation::Require,
+        ScalarCheckerOperation::Narrow => CheckerOperation::Narrow,
+    };
+    ProjectCheck::Failed { source, operation, directive, condition, axes, state, output: Rc::unwrap_or_clone(output) }
 }
 
 fn project_failure(
@@ -4099,12 +4209,12 @@ mod tests {
                 project, calls, active: HashSet::new(), reached: HashSet::new(),
                 had_obligations: false, observer: (), symbolic_module: 0,
             };
-            let mut output = Vec::new();
+            let mut output = OrderedFailures::default();
             let result = check_initializer_expression::<true>(
                 topology, &mut actual, &app, &HashMap::new(), outer_call, 0, &mut Some(&mut output), &visits,
             );
             assert!(matches!(result, Err(ProjectCheck::Unsupported)));
-            assert!(output.is_empty());
+            assert!(output.records.is_empty());
             assert!(actual.active.is_empty());
         }
     }

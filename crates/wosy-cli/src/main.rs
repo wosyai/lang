@@ -591,7 +591,7 @@ type InternalOrderedCheckReceipt = InternalCheckReceipt<wosy_compiler::ScalarOrd
 #[derive(Debug, PartialEq)]
 enum InternalCheckStatus<'a> {
     Zero,
-    FirstNonzero(&'a wosy_compiler::ScalarCheckerFailure),
+    FirstNonzero(&'a wosy_compiler::ScalarOrderedCheckerFailure),
 }
 
 #[cfg(feature = "internal-checker")]
@@ -611,7 +611,7 @@ impl InternalCheckReceipt<wosy_compiler::ScalarOrderedCheckerOutcome> {
         match &self.outcome {
             ScalarOrderedCheckerOutcome::Passed | ScalarOrderedCheckerOutcome::NoChecks =>
                 Some(InternalCheckStatus::Zero),
-            ScalarOrderedCheckerOutcome::Failed(reports) => Some(reports.iter().find(|report| report.code.bits() != 0)
+            ScalarOrderedCheckerOutcome::Failed(reports) => Some(reports.iter().find(|report| report.code().bits() != 0)
                 .map_or(InternalCheckStatus::Zero, InternalCheckStatus::FirstNonzero)),
             ScalarOrderedCheckerOutcome::Unsupported | ScalarOrderedCheckerOutcome::Invalid(_) => None,
         }
@@ -625,13 +625,13 @@ impl InternalCheckReceipt<wosy_compiler::ScalarOrderedCheckerOutcome> {
             return Ok(());
         };
         for report in reports {
-            if !report.stdout.is_empty() {
-                sink(InternalCheckEffect::Stdout(&report.stdout))?;
+            if !report.stdout().is_empty() {
+                sink(InternalCheckEffect::Stdout(report.stdout()))?;
             }
-            if !report.stderr.is_empty() {
-                sink(InternalCheckEffect::Stderr(&report.stderr))?;
+            if !report.stderr().is_empty() {
+                sink(InternalCheckEffect::Stderr(report.stderr()))?;
             }
-            for file in &report.files {
+            for file in report.files() {
                 sink(InternalCheckEffect::DeferredFile(file))?;
             }
         }
@@ -1483,7 +1483,7 @@ mod tests {
         let refused = receipt.visit_authored_effects(|effect| {
             calls += 1;
             if let InternalCheckEffect::DeferredFile(file) = effect {
-                assert!(std::ptr::eq(file, &reports[0].files[0]));
+                assert!(std::ptr::eq(file, &reports[0].files()[0]));
                 return Err("sink refused");
             }
             Ok(())
@@ -1493,6 +1493,68 @@ mod tests {
         assert!(!project.root.join("logs").exists());
         assert!(!project.root.join("empty.txt").exists());
         assert!(!project.root.join(".wosy").exists());
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn internal_ordered_effects_share_payload_by_origin_without_merging_reports() {
+        use wosy_compiler::{ScalarCheckerScope, ScalarOrderedCheckerOutcome};
+        let output = r#"{ .stdout = "same out"; .stderr = "same err"; .code = 23;
+            .files = [{ .path = "report.txt"; .text = "same bytes"; }]; }"#;
+        let text = format!(r#"%%start
+            unit(u8) leaf = fn(value) {{ core.require(value < 2, {output}); }};
+            leaf(3);
+            core.require(false, {output});
+            leaf(4);
+        %%end"#);
+        let (project, configuration) = routing_test_project("ordered-effects-shared-origin", &[("main.w", &text)]);
+        let receipt = check_loaded_ordered_project(
+            &project.root, &project, &configuration, ScalarTargetLayout::WASM32,
+            ScalarCheckerScope::MainFlowOnly, Vec::new(),
+        ).expect("completed ordered receipt");
+        let ScalarOrderedCheckerOutcome::Failed(reports) = &receipt.outcome else { panic!("expected reports"); };
+        let [first, separate, repeated] = reports.as_slice() else { panic!("three authored reports"); };
+        assert_eq!(first.directive, repeated.directive);
+        assert_ne!(first.directive, separate.directive);
+        assert_eq!(first.stdout(), separate.stdout());
+        assert_eq!(first.stderr(), separate.stderr());
+        assert_eq!(first.files()[0].text, separate.files()[0].text);
+        assert!(std::ptr::eq(first.stdout(), repeated.stdout()));
+        assert!(std::ptr::eq(first.stderr(), repeated.stderr()));
+        assert!(std::ptr::eq(&first.files()[0], &repeated.files()[0]));
+        assert!(std::ptr::eq(first.code(), repeated.code()));
+        assert!(!std::ptr::eq(first.stdout(), separate.stdout()));
+        assert!(!std::ptr::eq(&first.files()[0], &separate.files()[0]));
+        assert_eq!(first.witness.intervals_at(0, 0).unwrap().next(), Some((&3.into(), &3.into())));
+        assert_eq!(repeated.witness.intervals_at(0, 0).unwrap().next(), Some((&4.into(), &4.into())));
+        let Some(InternalCheckStatus::FirstNonzero(selected)) = receipt.selected_status() else {
+            panic!("expected first authored nonzero");
+        };
+        assert!(std::ptr::eq(first, selected));
+        let mut visited = Vec::new();
+        receipt.visit_authored_effects(|effect| {
+            match effect {
+                InternalCheckEffect::Stdout(bytes) => {
+                    assert_eq!(bytes, b"same out");
+                    visited.push(("stdout", bytes.as_ptr()));
+                }
+                InternalCheckEffect::Stderr(bytes) => {
+                    assert_eq!(bytes, b"same err");
+                    visited.push(("stderr", bytes.as_ptr()));
+                }
+                InternalCheckEffect::DeferredFile(file) => {
+                    assert_eq!(&*file.text, b"same bytes");
+                    visited.push(("file", file.text.as_ptr()));
+                }
+            }
+            Ok::<(), ()>(())
+        }).unwrap();
+        assert_eq!(visited, [
+            ("stdout", first.stdout().as_ptr()), ("stderr", first.stderr().as_ptr()), ("file", first.files()[0].text.as_ptr()),
+            ("stdout", separate.stdout().as_ptr()), ("stderr", separate.stderr().as_ptr()), ("file", separate.files()[0].text.as_ptr()),
+            ("stdout", repeated.stdout().as_ptr()), ("stderr", repeated.stderr().as_ptr()), ("file", repeated.files()[0].text.as_ptr()),
+        ]);
+        assert!(!project.root.join("report.txt").exists());
     }
 
     #[cfg(feature = "internal-checker")]
@@ -1561,13 +1623,13 @@ mod tests {
             let receipt = receipt.expect("ordered canonical receipt");
             let ScalarOrderedCheckerOutcome::Failed(reports) = &receipt.outcome else { panic!("expected authored reports"); };
             let [first, next, last] = reports.as_slice() else { panic!("expected all three reports"); };
-            assert_eq!(reports.iter().map(|report| report.code.to_string()).collect::<Vec<_>>(), ["0", second, third]);
+            assert_eq!(reports.iter().map(|report| report.code().to_string()).collect::<Vec<_>>(), ["0", second, third]);
             assert_eq!((first.source.path.as_str(), next.source.path.as_str(), last.source.path.as_str()),
                 ("main.w", "lib.w", "extra.w"));
-            assert_eq!(&*first.stdout, b"primeiro");
-            assert_eq!(&*next.stderr, "second☕".as_bytes());
-            assert_eq!(&*last.stdout, b"third");
-            assert_eq!(&*first.files[0].text, "α".as_bytes());
+            assert_eq!(first.stdout(), b"primeiro");
+            assert_eq!(next.stderr(), "second☕".as_bytes());
+            assert_eq!(last.stdout(), b"third");
+            assert_eq!(&*first.files()[0].text, "α".as_bytes());
             if second == "0" {
                 assert_eq!(receipt.selected_status(), Some(InternalCheckStatus::Zero));
             } else {
@@ -1575,7 +1637,7 @@ mod tests {
                     panic!("expected exact first nonzero candidate");
                 };
                 assert!(std::ptr::eq(selected, next));
-                assert_eq!(selected.code.to_string(), second);
+                assert_eq!(selected.code().to_string(), second);
             }
             assert_eq!(receipt.texts.len(), 3);
             assert!(receipt.texts.values().any(|text| text == &dormant));
