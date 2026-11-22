@@ -6441,8 +6441,22 @@ fn assignment_selector_effects_execute_once_after_rhs_on_both_targets() {
             .strip_suffix(')')
             .unwrap();
         let (index_read, _) = once(&format!("{selector_input} = load i64, ptr %index,"));
-        let (element, element_address) = once(&format!("i32 0, i64 {}", value(selector_call)));
+        let selector_value = value(selector_call);
+        let narrowing = format!("trunc i64 {selector_value} to i32");
+        let (address_index, narrowed_at) = if target_layout == ScalarTargetLayout::WASM32 {
+            let (index, instruction) = once(&narrowing);
+            (value(instruction), Some(index))
+        } else {
+            assert!(!body.contains(&narrowing), "{body}");
+            (selector_value, None)
+        };
+        let gep_operand = format!("i32 0, {pointer_type} {address_index}");
+        let (element, element_address) = once(&gep_operand);
         assert!(element_address.contains("getelementptr inbounds [2 x i8]"), "{body}");
+        assert!(element_address.trim_end().ends_with(&gep_operand), "{body}");
+        if let Some(narrowed) = narrowed_at {
+            assert!(selector < narrowed && narrowed < element, "{body}");
+        }
         let (address, checked_address) = once(&format!(
             "ptrtoint ptr {} to {pointer_type}",
             value(element_address)
