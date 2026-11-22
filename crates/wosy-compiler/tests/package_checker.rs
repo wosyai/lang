@@ -1251,6 +1251,8 @@ fn proof_decreases_is_typed_but_does_not_admit_unchecked_induction() {
     };
     assert_eq!(check_rank("", ""), ScalarModuleProofOutcome::Proved);
     assert_eq!(check_rank("decreases (entry)", "core.use(ranked(entry - 1));"), ScalarModuleProofOutcome::Unsupported);
+    let guarded = "if (entry == 0) { core.show(out == 0); } else { core.use(ranked(entry - 1)); }";
+    assert_eq!(check_rank("decreases (entry)", guarded), ScalarModuleProofOutcome::Unsupported);
     assert_eq!(check_rank("decreases (entry, entry)", ""), ScalarModuleProofOutcome::Unsupported);
     assert!(matches!(check_rank("decreases (out)", ""), ScalarModuleProofOutcome::Invalid(_)));
     assert!(matches!(check_rank("decreases (missing)", ""), ScalarModuleProofOutcome::Invalid(_)));
