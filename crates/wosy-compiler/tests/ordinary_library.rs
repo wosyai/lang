@@ -902,7 +902,7 @@ i32(u64, bool) inspect_checked = fn(count, flag) {
 fn ordinary_build_erases_named_proofs_before_runtime_diagnostics_and_emits_the_same_llvm() {
     use wosy_compiler::emit_scalar_build_single_module_llvm_text;
     let source = SourceIdentity::new("local".into(), "app".into(), "main.w".into(), "pinned-source".into());
-    let compile = |proofs: &str| {
+    let compile = |proofs: &str, target_layout| {
         let text = format!("%%start\nu8(u8) identity = fn(value) {{ value }};\n{proofs}\n%%end");
         let parsed = parse_source(source.clone(), text, &[]);
         assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
@@ -911,7 +911,7 @@ fn ordinary_build_erases_named_proofs_before_runtime_diagnostics_and_emits_the_s
         let prepared = prepare_scalar_project(
             vec![(declarations, Vec::new())],
             vec![source.clone()],
-            ScalarPreparationInputs { target_layout: ScalarTargetLayout::NATIVE64 },
+            ScalarPreparationInputs { target_layout },
         ).expect("ordinary source preparation");
         let validated = analyze_scalar_build(&prepared);
         assert!(validated.diagnostics().is_empty(), "{:?}", validated.diagnostics());
@@ -925,7 +925,9 @@ fn ordinary_build_erases_named_proofs_before_runtime_diagnostics_and_emits_the_s
             core.show(out == 1__0);
         }
     "#;
-    assert_eq!(compile(proofs), compile(""));
+    for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        assert_eq!(compile(proofs, target_layout), compile("", target_layout));
+    }
     let bad_runtime = parse_source(
         source.clone(),
         format!("%%start\nu8() value = fn {{ 1__0 }};\n{proofs}\n%%end"),
