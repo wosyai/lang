@@ -714,6 +714,9 @@ fn verified_module_bound_is_used_only_for_the_selected_canonical_call_and_all_gu
         proof steps for producer(input) -> (out) where (input <= 10) ensures (out <= 10) {{
             if (input > 10) {{ core.show(out == 10); }} else {{ core.show(out == input); }}
         }}
+        proof standalone for producer(input) -> (out) where (input <= 10) ensures (out <= 10) {{
+            core.show(out == input);
+        }}
         {initialization}
     %%end"#);
     let use_bound = |proof: &str, caller: &str, initialization: &str| {
@@ -736,6 +739,7 @@ fn verified_module_bound_is_used_only_for_the_selected_canonical_call_and_all_gu
         ("false_claim", "accepted", ""),
         ("empty", "accepted", ""),
         ("steps", "accepted", ""),
+        ("standalone", "accepted", ""),
         ("cap", "accepted", "u8 reached = producer(7);"),
         ("cap", "accepted", "accepted();"),
     ] {
@@ -795,4 +799,41 @@ fn main_initializer_follows_only_the_selected_unit_if_else_arm() {
         "if (true) {{ 1 }} else {{ 2 }}; core.require(true, {OUTPUT});",
     );
     assert!(matches!(check(&text), ScalarCheckerOutcome::Unsupported | ScalarCheckerOutcome::Invalid(_)));
+}
+
+#[test]
+fn standalone_show_is_a_verified_equality_in_the_selected_unused_entry_domain() {
+    let identity = source();
+    let proof = |target: &str, guard: &str, goal: &str, show: &str, invocation: &str| {
+        check_scalar_module_proof(
+            identity.clone(),
+            "standalone",
+            vec![ScalarProofModuleInput {
+                source: identity.clone(),
+                text: format!(r#"%%start
+                    u8(u8) clamp = fn(value) {{ if (value > 10) {{ 10 }} else {{ value }} }};
+                    u8(u8) fixed = fn(value) {{ if (value == 0) {{}}; 7 }};
+                    proof standalone for {target}(input) -> (out) where ({guard}) ensures ({goal}) {{
+                        core.show(out == {show});
+                    }}
+                    {invocation}
+                %%end"#),
+                namespaces: Vec::new(),
+            }],
+            vec![identity.clone()],
+            ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
+        )
+    };
+    assert_eq!(proof("clamp", "input <= 10", "out <= 10", "input", ""), ScalarModuleProofOutcome::Proved);
+    assert_eq!(proof("clamp", "input <= 11", "out <= 10", "input", ""), ScalarModuleProofOutcome::Refuted);
+    assert_eq!(proof("clamp", "false", "out <= 10", "input", ""), ScalarModuleProofOutcome::NoApplicableInputs);
+    assert_eq!(proof("fixed", "input >= 0", "out <= 7", "7", ""), ScalarModuleProofOutcome::Proved);
+    assert_eq!(proof("fixed", "input >= 0", "out <= 7", "8", ""), ScalarModuleProofOutcome::Refuted);
+    assert_eq!(proof("fixed", "input >= 0", "out <= 6", "7", ""), ScalarModuleProofOutcome::Refuted);
+    assert!(matches!(proof("fixed", "input >= 0", "out <= 7", "256", ""), ScalarModuleProofOutcome::Invalid(_)));
+    assert_eq!(proof("clamp", "input <= 10", "out <= 10", "input + 0", ""), ScalarModuleProofOutcome::Unsupported);
+    assert_eq!(
+        proof("clamp", "input <= 10", "out <= 10", "input", "u8 started = clamp(7);"),
+        ScalarModuleProofOutcome::Unsupported,
+    );
 }

@@ -299,10 +299,13 @@ pub(super) struct IntegerReturningPath<'a> {
     pub(super) axes: Vec<&'a ReferenceBindingId>,
 }
 
-pub(super) struct IntegerBranchProof<'a> {
-    pub(super) guard: CheckerPredicate,
-    pub(super) then_claim: IntegerReturn<'a>,
-    pub(super) else_claim: IntegerReturn<'a>,
+pub(super) enum IntegerShowProof<'a> {
+    Equality(IntegerReturn<'a>),
+    Conditional {
+        guard: CheckerPredicate,
+        then_claim: IntegerReturn<'a>,
+        else_claim: IntegerReturn<'a>,
+    },
 }
 
 fn binding_satisfies(
@@ -358,8 +361,12 @@ impl IntegerReturningPath<'_> {
         }
     }
 
-    fn shows_branch(self, proof: &IntegerBranchProof<'_>) -> Option<bool> {
-        let (yes, no) = match &proof.guard {
+    fn shows(self, proof: &IntegerShowProof<'_>) -> Option<bool> {
+        let (guard, then_claim, else_claim) = match proof {
+            IntegerShowProof::Equality(claim) => return shows_return_equality(&self.state, &self.axes, &self.value, claim),
+            IntegerShowProof::Conditional { guard, then_claim, else_claim } => (guard, then_claim, else_claim),
+        };
+        let (yes, no) = match guard {
             CheckerPredicate::Boolean(true) => (self.state, IntegerInputs::default()),
             CheckerPredicate::Boolean(false) => (IntegerInputs::default(), self.state),
             CheckerPredicate::Integer(predicate) => {
@@ -368,8 +375,8 @@ impl IntegerReturningPath<'_> {
             }
         };
         Some(
-            shows_return_equality(&yes, &self.axes, &self.value, &proof.then_claim)?
-                && shows_return_equality(&no, &self.axes, &self.value, &proof.else_claim)?,
+            shows_return_equality(&yes, &self.axes, &self.value, then_claim)?
+                && shows_return_equality(&no, &self.axes, &self.value, else_claim)?,
         )
     }
 
@@ -580,7 +587,7 @@ pub(super) fn check_integer_return_bound_with_shows<'a>(
     operator: &BinaryOperator,
     bound: &BigInt,
     entry_filter: Option<&[CheckerPredicate]>,
-    proof: &IntegerBranchProof<'_>,
+    proof: &IntegerShowProof<'_>,
 ) -> Option<Result<ProofCoverage<bool>, IntegerCheckFailure<'a>>> {
     check_integer_return_bound_in_scope(calls, operator, bound, entry_filter, Some(proof))
 }
@@ -590,7 +597,7 @@ fn check_integer_return_bound_in_scope<'a>(
     operator: &BinaryOperator,
     bound: &BigInt,
     entry_filter: Option<&[CheckerPredicate]>,
-    proof: Option<&IntegerBranchProof<'_>>,
+    proof: Option<&IntegerShowProof<'_>>,
 ) -> Option<Result<ProofCoverage<bool>, IntegerCheckFailure<'a>>> {
     let relation = IntegerRelation::from_operator(operator)?;
     let paths = match observe_integer_returns_in_scope(calls, entry_filter, None)? {
@@ -603,7 +610,7 @@ fn check_integer_return_bound_in_scope<'a>(
             return Some(Ok(ProofCoverage::Applicable(false)));
         }
         if let Some(proof) = proof {
-            if !path.shows_branch(proof)? {
+            if !path.shows(proof)? {
                 return Some(Ok(ProofCoverage::Applicable(false)));
             }
         }

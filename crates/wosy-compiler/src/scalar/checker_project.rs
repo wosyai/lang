@@ -9,7 +9,7 @@ use super::{
     checker_flow::{
         check_integer_requirement_activity, check_integer_requirements_at_entry, check_integer_return_bound_with_shows, concrete_integer_literal, exact_integer_call_argument,
         exact_integer_return_at_entry, ActualCallResult, CheckerPredicate, ExactIntegerArgument,
-        proves_requirement_with_imported_root_local, ImportedLocal, IntegerBranchProof, IntegerCheckFailure, IntegerComparison, IntegerInputs, IntegerReturn, ProofCoverage,
+        proves_requirement_with_imported_root_local, ImportedLocal, IntegerShowProof, IntegerCheckFailure, IntegerComparison, IntegerInputs, IntegerReturn, ProofCoverage,
     },
     control::{BindingInitialization, BlockItemKind, CheckedCallSignature, ConditionalRegion, InitializationName, InitializationStorage, ModuleInitializationCallTarget, ModuleInitializationDetail, ModuleInitializationStepKind, ModuleInitializationTopology, NamespaceTarget},
     derive_block, derive_expression, project_from_declarations,
@@ -1482,7 +1482,7 @@ impl PlannedModuleProof<'_> {
         if !valid_arbitrary_proof_body(body) {
             return Err(ProjectCheck::Unsupported);
         }
-        let proof = proof_show_branch::<false>(&self.steps, input_names, output, result_type, body)?;
+        let proof = proof_show_plan::<false>(&self.steps, input_names, output, result_type, body)?;
         let checked = check_integer_return_bound_with_shows(body, operator, bound, self.filter.as_deref(), &proof);
         match checked {
             Some(Ok(ProofCoverage::Applicable(true))) => Ok(ProjectCheck::Proved),
@@ -1744,7 +1744,7 @@ fn check_selected_proof(
             error => error,
         })?;
     let checked = if !steps.items.is_empty() {
-        let proof = proof_show_branch::<true>(&steps, &input_names, &output, result_type, body)?;
+        let proof = proof_show_plan::<true>(&steps, &input_names, &output, result_type, body)?;
         check_integer_return_bound_with_shows(body, &operator, &bound, filter.as_deref(), &proof)
     } else if let Some(filter) = filter.as_deref() {
         check_integer_return_bound_where(body, &operator, &bound, filter)
@@ -2063,18 +2063,13 @@ fn proof_input_condition<const VERIFY_LITERAL_FIT: bool>(
     Ok(CheckerPredicate::Integer(predicate))
 }
 
-fn proof_show_branch<'a, const VERIFY_ENTRY_WRITES: bool>(
+fn proof_show_plan<'a, const VERIFY_ENTRY_WRITES: bool>(
     steps: &'a ScalarBlock,
     inputs: &[String],
     output: &str,
     ty: &ScalarType,
     body: &'a FunctionCallSites,
-) -> Result<IntegerBranchProof<'a>, ProjectCheck> {
-    let [ScalarBlockItem::Expression(ScalarExpression::If {
-        condition, then_branch, else_branch, ..
-    })] = steps.items.as_slice() else {
-        return Err(ProjectCheck::Unsupported);
-    };
+) -> Result<IntegerShowProof<'a>, ProjectCheck> {
     let bindings = body.boundary.checker_parameter_bindings.as_deref().ok_or(ProjectCheck::Unsupported)?;
     if VERIFY_ENTRY_WRITES && body.assignments.values().flat_map(|group| group.destinations()).any(|destination| {
         match body.prepared_direct_destination(destination.destination) {
@@ -2085,12 +2080,20 @@ fn proof_show_branch<'a, const VERIFY_ENTRY_WRITES: bool>(
     }) {
         return Err(ProjectCheck::Unsupported);
     }
-    let guard = proof_input_condition::<true>(condition, inputs, body, false)?;
-    Ok(IntegerBranchProof {
-        guard,
-        then_claim: proof_show_claim(then_branch, inputs, output, ty, body, bindings)?,
-        else_claim: proof_show_claim(else_branch, inputs, output, ty, body, bindings)?,
-    })
+    match steps.items.as_slice() {
+        [ScalarBlockItem::Expression(ScalarExpression::Call { .. })] => Ok(IntegerShowProof::Equality(
+            proof_show_claim(steps, inputs, output, ty, body, bindings)?,
+        )),
+        [ScalarBlockItem::Expression(ScalarExpression::If { condition, then_branch, else_branch, .. })] => {
+            let guard = proof_input_condition::<true>(condition, inputs, body, false)?;
+            Ok(IntegerShowProof::Conditional {
+                guard,
+                then_claim: proof_show_claim(then_branch, inputs, output, ty, body, bindings)?,
+                else_claim: proof_show_claim(else_branch, inputs, output, ty, body, bindings)?,
+            })
+        }
+        _ => Err(ProjectCheck::Unsupported),
+    }
 }
 
 fn proof_show_claim<'a>(
@@ -3009,7 +3012,7 @@ mod tests {
         assert_eq!(prove(&app, callable, &proof("ensures (out <= 256)")), ProjectCheck::InvalidProof);
         assert_eq!(
             prove(&app, callable, "proof clamp_bounded for clamp(x) -> (out) ensures (out <= 10) { core.show(out == x); }"),
-            ProjectCheck::Unsupported,
+            ProjectCheck::Refuted,
         );
     }
 
