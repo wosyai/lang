@@ -477,11 +477,40 @@ fn check_package_initialization_with_order<'a>(
     check_package_initialization_observing(prepared, root, ordinals, ()).map(|(initialization, ())| initialization)
 }
 
+#[cfg(feature = "internal-checker")]
+#[cfg_attr(not(test), allow(dead_code))]
+fn collect_package_startup_failures(
+    prepared: &PreparedCheckerProject,
+) -> Result<Vec<ProjectCheck>, ProjectCheck> {
+    let (root, ordinals) = package_initialization_order(prepared.parts().0)?;
+    let mut failures = Vec::new();
+    check_package_initialization_observing_with_policy::<(), true>(
+        prepared, root, ordinals, (), Some(&mut failures),
+    )?;
+    Ok(failures)
+}
+
 fn check_package_initialization_observing<'a, Observer: ActualIntegerObserver>(
     prepared: &'a PreparedCheckerProject,
     root: &'a SourceIdentity,
     ordinals: HashMap<&'a SourceIdentity, usize>,
     observer: Observer,
+) -> Result<(CheckedInitialization<'a>, Observer), ProjectCheck> {
+    check_package_initialization_observing_with_policy::<Observer, false>(prepared, root, ordinals, observer, None)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StartupLane {
+    Feasible,
+    Empty,
+}
+
+fn check_package_initialization_observing_with_policy<'a, Observer: ActualIntegerObserver, const COLLECT: bool>(
+    prepared: &'a PreparedCheckerProject,
+    root: &'a SourceIdentity,
+    ordinals: HashMap<&'a SourceIdentity, usize>,
+    observer: Observer,
+    mut failures: Option<&mut Vec<ProjectCheck>>,
 ) -> Result<(CheckedInitialization<'a>, Observer), ProjectCheck> {
     let (project, calls) = prepared.parts();
     let mut visits = vec![InitializationVisit::Unseen; project.modules.len()];
@@ -489,21 +518,22 @@ fn check_package_initialization_observing<'a, Observer: ActualIntegerObserver>(
         project, calls, active: HashSet::new(), reached: HashSet::new(),
         had_obligations: false, observer, symbolic_module: 0,
     };
-    walk_package_initialization(project, calls, &ordinals, &mut visits, &mut actual, root)?;
+    walk_package_initialization::<COLLECT>(project, calls, &ordinals, &mut visits, &mut actual, root, &mut failures)?;
     Ok((CheckedInitialization { visits, reached: actual.reached, ordinals, had_obligations: actual.had_obligations }, actual.observer))
 }
 
-fn walk_package_initialization(
+fn walk_package_initialization<const COLLECT: bool>(
     project: &ScalarProject,
     calls: &ProjectCallSiteResults,
     ordinals: &HashMap<&SourceIdentity, usize>,
     visits: &mut [InitializationVisit],
     actual: &mut CheckedCalls<'_, impl ActualIntegerObserver>,
     source: &SourceIdentity,
-) -> Result<(), ProjectCheck> {
+    failures: &mut Option<&mut Vec<ProjectCheck>>,
+) -> Result<StartupLane, ProjectCheck> {
     let ordinal = *ordinals.get(source).ok_or(ProjectCheck::RootSourceOutsideInitOrder)?;
     match visits[ordinal] {
-        InitializationVisit::Completed => return Ok(()),
+        InitializationVisit::Completed => return Ok(StartupLane::Feasible),
         InitializationVisit::Started => return Err(ProjectCheck::Unsupported),
         InitializationVisit::Unseen => visits[ordinal] = InitializationVisit::Started,
     }
@@ -520,7 +550,9 @@ fn walk_package_initialization(
             let NamespaceTarget::Bound(target) = target else {
                 return Err(ProjectCheck::Unsupported);
             };
-            walk_package_initialization(project, calls, ordinals, visits, actual, target)?;
+            if walk_package_initialization::<COLLECT>(project, calls, ordinals, visits, actual, target, failures)? == StartupLane::Empty {
+                return Ok(StartupLane::Empty);
+            }
             continue;
         }
         let checked_item = checked_items.next().filter(|item| item.position == step.item)
@@ -565,20 +597,23 @@ fn walk_package_initialization(
             (&step.kind, &checked_item.kind) else {
                 return Err(ProjectCheck::Unsupported);
             };
-        check_initializer_expression(topology, actual, source, &storage, *expression, 0)?;
+        if check_initializer_expression::<COLLECT>(topology, actual, source, &storage, *expression, 0, failures)? == StartupLane::Empty {
+            return Ok(StartupLane::Empty);
+        }
     }
     visits[ordinal] = InitializationVisit::Completed;
-    Ok(())
+    Ok(StartupLane::Feasible)
 }
 
-fn check_initializer_expression(
+fn check_initializer_expression<const COLLECT: bool>(
     topology: &ModuleInitializationTopology,
     actual: &mut CheckedCalls<'_, impl ActualIntegerObserver>,
     source: &SourceIdentity,
     storage: &HashMap<ByteSpan, InitializerValue<'_>>,
     expression: OccurrenceOrdinal,
     depth: usize,
-) -> Result<(), ProjectCheck> {
+    failures: &mut Option<&mut Vec<ProjectCheck>>,
+) -> Result<StartupLane, ProjectCheck> {
     let structure = &topology.structure;
     if let Some(directive) = structure.checker_directives.get(&expression) {
         let predicate = directive.initializer_predicate.as_ref().ok_or(ProjectCheck::Unsupported)?;
@@ -586,9 +621,16 @@ fn check_initializer_expression(
         actual.had_obligations = true;
         if directive.operation.rejects(value, !value) {
             let span = topology.occurrences.get(expression.0).ok_or(ProjectCheck::MissingRootOccurrences)?.span;
-            return Err(selected_failure(source, directive, span, IntegerInputs::closed(), Vec::new()));
+            let failure = selected_failure(source, directive, span, IntegerInputs::closed(), Vec::new());
+            if !COLLECT {
+                return Err(failure);
+            }
+            failures.as_deref_mut().ok_or(ProjectCheck::Unsupported)?.push(failure);
+            if directive.operation == CheckerOperation::Narrow {
+                return Ok(StartupLane::Empty);
+            }
         }
-        return Ok(());
+        return Ok(StartupLane::Feasible);
     }
     if let Some(region) = topology.conditionals.get(&expression) {
         let (condition, then_block, else_block) = match region {
@@ -613,12 +655,19 @@ fn check_initializer_expression(
                 let BlockItemKind::Evaluation { expression } = item.kind else {
                     return Err(ProjectCheck::Unsupported);
                 };
-                check_initializer_expression(topology, actual, source, storage, expression, depth + 1)?;
+                if check_initializer_expression::<COLLECT>(topology, actual, source, storage, expression, depth + 1, failures)?
+                    == StartupLane::Empty
+                {
+                    return Ok(StartupLane::Empty);
+                }
             }
         }
-        return Ok(());
+        return Ok(StartupLane::Feasible);
     }
-    run_initializer_call(topology, actual, expression, &ScalarType::Unit, |_, _| None).map(drop)
+    if COLLECT {
+        return Err(ProjectCheck::Unsupported);
+    }
+    run_initializer_call(topology, actual, expression, &ScalarType::Unit, |_, _| None).map(|_| StartupLane::Feasible)
 }
 
 fn run_initializer_call<'a>(
@@ -3099,6 +3148,99 @@ mod tests {
     use crate::{derive_scalar_declarations_from_cst, parse_source, prepare_scalar_project, ScalarTargetLayout};
 
     const OUTPUT: &str = r#"{ .stdout = ""; .stderr = "unexpected state"; .code = 1; .files = []; }"#;
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn startup_failure_collection_preserves_selected_order_and_stops_an_empty_lane() {
+        let app = source("src/main.w", "collect-startup-failures");
+        let prepare = |text: &str| prepare_checker_project(
+            vec![(declarations(&app, text), Vec::new())], vec![app.clone()], inputs(),
+        ).unwrap();
+        let text = format!(r#"%%start
+            bool enabled = true;
+            bool disabled = false;
+            core.require(false, {OUTPUT});
+            core.narrow(enabled, {OUTPUT});
+            core.require(disabled, {OUTPUT});
+            if (false) {{ core.require(false, {OUTPUT}); }} else {{
+                core.require(false, {OUTPUT});
+                core.narrow(false, {OUTPUT});
+                core.require(false, {OUTPUT});
+            }};
+            core.require(false, {OUTPUT});
+        %%end"#);
+        let prepared = prepare(&text);
+        let failures = collect_package_startup_failures(&prepared).unwrap();
+        let authored = failures.iter().map(|failure| {
+            let ProjectCheck::Failed { source, operation, directive, condition, axes, state, .. } = failure else {
+                panic!("expected an authored startup diagnostic");
+            };
+            assert_eq!(source, &app);
+            assert!(axes.is_empty());
+            assert_eq!(state.row_count(), 1);
+            (*operation, directive.start as usize, &text[condition.start as usize..condition.end as usize])
+        }).collect::<Vec<_>>();
+        let offsets = text.match_indices("core.require(false").map(|(offset, _)| offset).collect::<Vec<_>>();
+        assert_eq!(authored, [
+            (CheckerOperation::Require, offsets[0], "false"),
+            (CheckerOperation::Require, text.find("core.require(disabled").unwrap(), "disabled"),
+            (CheckerOperation::Require, offsets[2], "false"),
+            (CheckerOperation::Narrow, text.find("core.narrow(false").unwrap(), "false"),
+        ]);
+        assert_eq!(check_package_initialization(&prepared), Err(failures.into_iter().next().unwrap()));
+
+        let incomplete = format!(r#"%%start
+            unit() helper = fn {{}};
+            core.require(false, {OUTPUT});
+            helper();
+        %%end"#);
+        assert_eq!(collect_package_startup_failures(&prepare(&incomplete)), Err(ProjectCheck::Unsupported));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn startup_failure_collection_visits_namespaces_once_at_authored_dispatch() {
+        let app = source("src/main.w", "collect-startup-root");
+        let child = source("src/child.w", "collect-startup-child");
+        let root_text = format!(r#"%%start
+            core.require(false, {OUTPUT});
+            child = namespace demo "src/child.w";
+            alias = namespace demo "src/child.w";
+            core.require(false, {OUTPUT});
+        %%end"#);
+        let namespace = |name: &str| {
+            let start = root_text.find(&format!("{name} =")).unwrap();
+            let end = start + root_text[start..].find(';').unwrap() + 1;
+            ScalarNamespaceBinding {
+                binding: name.into(), target: child.clone(), span: ByteSpan::new(start as u32, end as u32),
+            }
+        };
+        let collect = |operation: &str| {
+            let child_text = format!("%%start\ncore.{operation}(false, {OUTPUT});\ncore.require(false, {OUTPUT});\n%%end");
+            let prepared = prepare_checker_project(
+                vec![
+                    (declarations(&app, &root_text), vec![namespace("child"), namespace("alias")]),
+                    (declarations(&child, &child_text), Vec::new()),
+                ],
+                vec![app.clone(), child.clone()],
+                inputs(),
+            ).unwrap();
+            collect_package_startup_failures(&prepared).unwrap().into_iter().map(|failure| {
+                let ProjectCheck::Failed { source, operation, .. } = failure else { panic!("expected failure"); };
+                (source, operation)
+            }).collect::<Vec<_>>()
+        };
+        assert_eq!(collect("require"), [
+            (app.clone(), CheckerOperation::Require),
+            (child.clone(), CheckerOperation::Require),
+            (child.clone(), CheckerOperation::Require),
+            (app.clone(), CheckerOperation::Require),
+        ]);
+        assert_eq!(collect("narrow"), [
+            (app.clone(), CheckerOperation::Require),
+            (child.clone(), CheckerOperation::Narrow),
+        ]);
+    }
 
     #[cfg(feature = "internal-checker")]
     #[test]
