@@ -210,6 +210,22 @@ impl<'a> ScopedAuthoredReturn<'a> for NamedAuthoredReturn<'a> {
     ) -> Option<&'a BigInt> {
         let output = self.output(structure, block, slot)?;
         self.value.get_or_init(|| {
+            if let ScalarExpression::Unary { operator: UnaryOperator::Negate, operand, .. } = output {
+                if let ScalarExpression::Integer { value, .. } = operand.as_ref() {
+                    let Some(OccurrenceNode::Expression(magnitude)) = structure.edges.get(&(
+                        OccurrenceParent::Expression(slot.expression), OccurrenceEdge::UnaryOperand,
+                    )) else { return None; };
+                    if structure.checked_types.expressions.get(&slot.expression) != Some(ty)
+                        || structure.folded_expressions.get(magnitude)
+                            != Some(&super::control::FoldedOccurrence::SignedIntegerMagnitude)
+                    {
+                        return None;
+                    }
+                    #[cfg(test)]
+                    AUTHORED_RETURN_CALCULATIONS.with(|count| count.set(count.get() + 1));
+                    return Some(-value);
+                }
+            }
             let evaluate_closed = || {
                 let (min, max) = super::typecheck::integer_bounds(ty)?;
                 #[cfg(test)]

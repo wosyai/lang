@@ -6811,6 +6811,20 @@ mod tests {
         assert_eq!(count(), 0);
         assert_eq!(check_i32("-(3 + 4)", "true", "out == -7", "i32 live = number(0);", &["leaf"]), [Unsupported]);
         assert_eq!(count(), 0);
+        assert_eq!(check("-7", "true", "out == -7", "", &["leaf", "cite", "plain"]),
+            [Proved, Proved, Unsupported]);
+        assert_eq!(count(), 1);
+        assert_eq!(check("-128", "true", "out == -128", "", &["leaf"]), [Proved]);
+        assert_eq!(count(), 1);
+        assert_eq!(check("-128", "false", "out == -128", "", &["leaf"]), [NoApplicableInputs]);
+        assert_eq!(count(), 0);
+        assert_eq!(check("-7", "true", "out == -7", "i8 live = number(0);", &["leaf"]), [Unsupported]);
+        assert_eq!(count(), 0);
+        let literal_arm = "if (value == 0) { -128 } else { -7 }";
+        assert_eq!(check(literal_arm, "true", "out <= -7", "", &["leaf"]), [Proved]);
+        assert_eq!(count(), 2);
+        assert_eq!(check(literal_arm, "arg == 0", "out == -128", "", &["leaf"]), [Proved]);
+        assert_eq!(count(), 1);
         let negated_arm = "if (value == 0) { -(3 + 4) } else { 0 - 7 }";
         assert_eq!(check_i32(negated_arm, "true", "out == -7", "", &["leaf"]), [Proved]);
         assert_eq!(count(), 2);
