@@ -546,30 +546,57 @@ pub(super) enum IntegerShowProof<'a> {
 }
 
 #[cfg(feature = "internal-checker")]
-pub(super) struct ActualLiteralShow<'a> {
+pub(super) struct ActualFlatShow<'a> {
     bound: &'a BigInt,
     relation: IntegerRelation,
-    extra: ActualLiteralClaim<'a>,
+    extra: ActualFlatClaim<'a>,
 }
 
 #[cfg(feature = "internal-checker")]
-enum ActualLiteralClaim<'a> {
+enum ActualFlatClaim<'a> {
     None,
     Equal(&'a BigInt),
     Impossible,
     Output(IntegerShowOutput, Option<usize>),
     Constraints(IntegerShowConstraints<'a>),
+    Entry { slot: usize, relation: IntegerRelation },
+    MixedEntry(IntegerShowConstraints<'a>, ActualEntryPredicates),
 }
 
 #[cfg(feature = "internal-checker")]
-impl<'a> ActualLiteralShow<'a> {
-    pub(super) fn admit(proof: IntegerShowProof<'a>, mut relation: IntegerRelation, bound: &'a BigInt) -> Option<Self> {
+enum ActualEntryPredicates {
+    One { slot: usize, relation: IntegerRelation },
+    Both(IntegerRelation, IntegerRelation),
+}
+
+#[cfg(feature = "internal-checker")]
+impl ActualEntryPredicates {
+    fn holds(&self, value: &BigInt, arguments: &[&BigInt]) -> Option<bool> {
+        match self {
+            Self::One { slot, relation } => Some(relation.accepts(value.cmp(arguments.get(*slot)?))),
+            Self::Both(first, second) => {
+                let [a, b] = arguments else { return None; };
+                Some(first.accepts(value.cmp(a)) && second.accepts(value.cmp(b)))
+            }
+        }
+    }
+}
+
+#[cfg(feature = "internal-checker")]
+impl<'a> ActualFlatShow<'a> {
+    pub(super) fn admit(
+        proof: IntegerShowProof<'a>, mut relation: IntegerRelation, bound: &'a BigInt,
+        bindings: &[ReferenceBindingId], arity: usize,
+    ) -> Option<Self> {
+        if bindings.len() != arity {
+            return None;
+        }
         let extra = match proof {
             IntegerShowProof::Equality(IntegerReturn::Const(value)) if value == bound => {
                 relation = relation.intersection(IntegerRelation::from_operator(&BinaryOperator::Equal)?);
-                ActualLiteralClaim::None
+                ActualFlatClaim::None
             }
-            IntegerShowProof::Equality(IntegerReturn::Const(value)) => ActualLiteralClaim::Equal(value),
+            IntegerShowProof::Equality(IntegerReturn::Const(value)) => ActualFlatClaim::Equal(value),
             IntegerShowProof::Sequence(claims) => {
                 let mut expected = None;
                 let mut impossible = false;
@@ -582,21 +609,21 @@ impl<'a> ActualLiteralShow<'a> {
                     }
                 }
                 if impossible {
-                    ActualLiteralClaim::Impossible
+                    ActualFlatClaim::Impossible
                 } else if let Some(value) = expected {
                     if value == bound {
                         relation = relation.intersection(IntegerRelation::from_operator(&BinaryOperator::Equal)?);
-                        ActualLiteralClaim::None
+                        ActualFlatClaim::None
                     } else {
-                        ActualLiteralClaim::Equal(value)
+                        ActualFlatClaim::Equal(value)
                     }
                 } else {
-                    ActualLiteralClaim::None
+                    ActualFlatClaim::None
                 }
             }
             IntegerShowProof::Output(IntegerShowOutput::Relation { relation: show, bound: show_bound }) if &show_bound == bound => {
                 relation = relation.intersection(show);
-                ActualLiteralClaim::None
+                ActualFlatClaim::None
             }
             IntegerShowProof::Output(output) => {
                 let skip = match &output {
@@ -606,27 +633,62 @@ impl<'a> ActualLiteralShow<'a> {
                 if let (Some(index), IntegerShowOutput::Conjunction(atoms)) = (skip, &output) {
                     relation = relation.intersection(atoms[index].0);
                 }
-                ActualLiteralClaim::Output(output, skip)
+                ActualFlatClaim::Output(output, skip)
             }
-            IntegerShowProof::MixedSequence { output, entry: [None, None], .. } => ActualLiteralClaim::Constraints(output),
+            IntegerShowProof::MixedSequence { output, entry: [None, None], .. } => ActualFlatClaim::Constraints(output),
+            IntegerShowProof::EntryComparison(entry) => {
+                let slot = bindings.iter().position(|binding| binding == entry.binding)?;
+                ActualFlatClaim::Entry { slot, relation: entry.relation }
+            }
+            IntegerShowProof::MixedSequence { formals, output, entry } if formals == bindings => {
+                let checked = match entry {
+                    [Some(first), None] if arity >= 1 => ActualEntryPredicates::One { slot: 0, relation: first },
+                    [None, Some(second)] if arity == 2 => ActualEntryPredicates::One { slot: 1, relation: second },
+                    [Some(first), Some(second)] if arity == 2 => ActualEntryPredicates::Both(first, second),
+                    _ => return None,
+                };
+                ActualFlatClaim::MixedEntry(output, checked)
+            }
             _ => return None,
         };
         Some(Self { bound, relation, extra })
     }
 
-    pub(super) fn holds(&self, value: &BigInt) -> bool {
+    pub(super) fn holds(&self, value: &BigInt, arguments: &[&BigInt]) -> Option<bool> {
         match &self.extra {
-            ActualLiteralClaim::Constraints(output) => return output.holds_value(value),
-            ActualLiteralClaim::Impossible => return false,
+            ActualFlatClaim::Constraints(output) => return Some(output.holds_value(value)),
+            ActualFlatClaim::Impossible => return Some(false),
+            ActualFlatClaim::MixedEntry(output, entry) => {
+                if !output.holds_value(value) {
+                    return Some(false);
+                }
+                return entry.holds(value, arguments);
+            }
+            ActualFlatClaim::Entry { slot, relation } => {
+                let entry = arguments.get(*slot)?;
+                return Some(self.relation.accepts(value.cmp(self.bound)) && relation.accepts(value.cmp(entry)));
+            }
             _ => {}
         }
-        self.relation.accepts(value.cmp(self.bound)) && match &self.extra {
-            ActualLiteralClaim::None => true,
-            ActualLiteralClaim::Equal(expected) => value == *expected,
-            ActualLiteralClaim::Output(show, skip) => show.holds_value(value, *skip),
-            ActualLiteralClaim::Constraints(_) | ActualLiteralClaim::Impossible => unreachable!(),
-        }
+        Some(self.relation.accepts(value.cmp(self.bound)) && match &self.extra {
+            ActualFlatClaim::None => true,
+            ActualFlatClaim::Equal(expected) => value == *expected,
+            ActualFlatClaim::Output(show, skip) => show.holds_value(value, *skip),
+            _ => unreachable!(),
+        })
     }
+}
+
+#[cfg(feature = "internal-checker")]
+pub(super) fn holds_actual_mixed_entry(
+    output: &IntegerShowConstraints<'_>, entry: &[Option<IntegerRelation>; 2],
+    value: &BigInt, arguments: &[&BigInt],
+) -> Option<bool> {
+    if entry.iter().skip(arguments.len()).any(Option::is_some) {
+        return None;
+    }
+    Some(output.holds_value(value) && arguments.iter().zip(entry).all(|(argument, relation)|
+        relation.is_none_or(|relation| relation.accepts(value.cmp(*argument)))))
 }
 
 #[cfg(feature = "internal-checker")]

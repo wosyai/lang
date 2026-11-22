@@ -1269,11 +1269,50 @@ fn named_proof_actual_flat_show_checks_only_authenticated_integer_returns() {
     assert_eq!(check("i8 first = echo(8); i8 last = echo(7);", "value", guard, bound, shows), Refuted);
     assert_eq!(check("i8 miss = echo(-1);", "value", guard, bound, shows), NoApplicableInputs);
     assert!(matches!(check("i8 miss = echo(-1);", "value", guard, bound, "core.show(out <= 128);"), Invalid(_)));
-    assert_eq!(check(one, "value", guard, bound, "core.show(out == core.old(input));"), Unsupported);
+    assert_eq!(check(one, "value", guard, bound, "core.show(out == core.old(input));"), Proved);
     assert_eq!(check(one, "value", guard, bound, "core.show(out == input);"), Unsupported);
     assert_eq!(check(one, "value", guard, bound,
         "if (input >= 0) { core.show(out == 7); } else { core.show(out == 7); }"), Unsupported);
     assert_eq!(check(one, "if (value == 0) {}; 3 + 4", guard, bound, shows), Unsupported);
+}
+
+#[test]
+fn named_proof_actual_flat_old_shows_check_exact_positional_formals() {
+    let identity = source();
+    let check = |signature: &str, startup: &str, guard: &str, ensures: &str, steps: &str| {
+        check_scalar_module_proof(
+            identity.clone(), "verify",
+            vec![ScalarProofModuleInput {
+                source: identity.clone(),
+                text: format!(r#"%%start
+                    i16({signature}) choose = fn(tag, original) {{
+                        if (original == 0) {{}};
+                        if (tag == 0) {{ 7 }} else {{ original }}
+                    }};
+                    {startup}
+                    proof verify for choose(flag, entry) -> (out) where ({guard}) ensures ({ensures}) {{ {steps} }}
+                %%end"#),
+                namespaces: Vec::new(),
+            }],
+            vec![identity.clone()], ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
+        )
+    };
+    use ScalarModuleProofOutcome::{Invalid, NoApplicableInputs, Proved, Refuted, Unsupported};
+    let good = "i16 first = choose(1, -3); i16 second = choose(0, 7);";
+    let bad = "i16 bad = choose(0, 6); i16 last = choose(0, 7);";
+    let old = "core.show(out <= core.old(entry));";
+    assert_eq!(check("u8, i16", good, "true", "out <= 7", old), Proved);
+    assert_eq!(check("u8, i16", bad, "true", "out <= 7", old), Refuted);
+    assert_eq!(check("u8, i16", good, "true", "out < 7", old), Refuted);
+    assert_eq!(check("u8, i16", good, "false", "out <= 7", old), NoApplicableInputs);
+    assert_eq!(check("u8, i16", good, "true", "out <= 7", "core.show(out <= core.old(flag));"), Unsupported);
+    assert!(matches!(check("u8, i16", good, "false", "out <= 7", "core.show(out <= core.old(unknown));"), Invalid(_)));
+    let mixed = "core.show(out <= core.old(entry)); core.show(out >= core.old(entry));
+        core.show(out <= core.old(flag)); core.show(out != 0);";
+    assert_eq!(check("i16, i16", "i16 one = choose(10, 7); i16 two = choose(8, 6);", "true", "out <= 7", mixed), Proved);
+    assert_eq!(check("i16, i16", "i16 one = choose(6, 7); i16 two = choose(8, 6);", "true", "out <= 7", mixed), Refuted);
+    assert_eq!(check("i16, i16", "i16 one = choose(10, 7);", "true", "out <= 7",
+        "core.show(out == entry); core.show(out <= core.old(flag));"), Unsupported);
 }
 
 #[test]
