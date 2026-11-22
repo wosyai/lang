@@ -1257,3 +1257,59 @@ fn proof_decreases_is_typed_but_does_not_admit_unchecked_induction() {
     assert!(matches!(check_rank("decreases (out)", ""), ScalarModuleProofOutcome::Invalid(_)));
     assert!(matches!(check_rank("decreases (missing)", ""), ScalarModuleProofOutcome::Invalid(_)));
 }
+
+#[test]
+fn named_induction_proves_only_the_complete_canonical_unused_return_case() {
+    let identity = source();
+    let check = |base: u8, filter: &str, recursive: &str, start: &str| {
+        check_scalar_module_proof(
+            identity.clone(),
+            "rank",
+            vec![ScalarProofModuleInput {
+                source: identity.clone(),
+                text: format!(r#"%%start
+                    u8(u8) descend = fn(value) {{
+                        if (value == 0) {{ {base} }} else {{ {recursive} }}
+                    }};
+                    proof rank for descend(entry) -> (out) where ({filter}) ensures (out == 0) decreases (entry) {{
+                        if (entry == 0) {{ core.show(out == 0); }} else {{ core.use(rank(entry - 1)); }}
+                    }}
+                    {start}
+                %%end"#),
+                namespaces: Vec::new(),
+            }],
+            vec![identity.clone()],
+            ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
+        )
+    };
+    let tail = "descend(value - 1)";
+    assert_eq!(check(0, "true", tail, ""), ScalarModuleProofOutcome::Proved);
+    assert_eq!(check(0, "entry == 0", tail, ""), ScalarModuleProofOutcome::Proved);
+    assert_eq!(check(1, "true", tail, ""), ScalarModuleProofOutcome::Refuted);
+    assert_eq!(check(1, "false", tail, ""), ScalarModuleProofOutcome::NoApplicableInputs);
+    assert_eq!(check(0, "entry > 0", tail, ""), ScalarModuleProofOutcome::Unsupported);
+    assert_eq!(check(0, "true", "descend(value - 1) + 1", ""), ScalarModuleProofOutcome::Unsupported);
+    assert_eq!(check(0, "true", "descend(value - 2)", ""), ScalarModuleProofOutcome::Unsupported);
+    assert_eq!(check(0, "true", tail, "u8 actual = descend(7);"), ScalarModuleProofOutcome::Unsupported);
+}
+
+#[test]
+fn proved_named_induction_is_not_a_reusable_module_bound() {
+    let identity = source();
+    let text = format!(r#"%%start
+        u8(u8) descend = fn(value) {{ if (value == 0) {{ 0 }} else {{ descend(value - 1) }} }};
+        unit() caller = fn {{
+            u8 result = descend(7);
+            core.require(result == 0, {OUTPUT});
+        }};
+        proof rank for descend(entry) -> (out) ensures (out == 0) decreases (entry) {{
+            if (entry == 0) {{ core.show(out == 0); }} else {{ core.use(rank(entry - 1)); }}
+        }}
+    %%end"#);
+    let (_, catalog) = wosy_compiler::parse_proof_source(identity.clone(), text, &[])
+        .ok().expect("valid named recursive proof syntax");
+    assert_eq!(check_loaded_scalar_module_proof_call(
+        (&identity, "rank"), (&identity, "caller"), Vec::new(), (catalog, Vec::new()),
+        vec![identity.clone()], ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
+    ), ScalarProofCallOutcome::Unavailable);
+}

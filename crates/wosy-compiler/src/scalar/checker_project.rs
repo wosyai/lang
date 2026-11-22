@@ -1548,6 +1548,8 @@ struct PlannedModuleProof<'a> {
     proof: &'a CstNode,
     canonical_target: &'a ResolvedCallTarget,
     target: (usize, usize),
+    function: &'a ScalarFunction,
+    name: &'a str,
     typed: TypedProofPostcondition<'a>,
     steps: ScalarBlock,
     filter: Option<Vec<CheckerPredicate>>,
@@ -1555,16 +1557,25 @@ struct PlannedModuleProof<'a> {
 
 #[cfg(feature = "internal-checker")]
 impl PreparedProofModule {
-    fn plan_module_proof(&self, proof_source: &SourceIdentity, proof_name: &str) -> Result<PlannedModuleProof<'_>, ProjectCheck> {
+    fn plan_module_proof<'a>(&'a self, proof_source: &SourceIdentity, proof_name: &'a str) -> Result<PlannedModuleProof<'a>, ProjectCheck> {
+        self.plan_module_proof_in_scope::<false>(proof_source, proof_name)
+    }
+
+    fn plan_module_proof_in_scope<'a, const ALLOW_INDUCTION: bool>(
+        &'a self, proof_source: &SourceIdentity, proof_name: &'a str,
+    ) -> Result<PlannedModuleProof<'a>, ProjectCheck> {
         let (proof_source, _) = self.proofs.get_key_value(proof_source).ok_or(ProjectCheck::MissingRoot)?;
         let proof = self.select_resolved(proof_source, proof_name)?;
-        let (module, item, _) = proof.function;
+        let (module, item, function) = proof.function;
         let steps = derive_block(&child(proof.node, SyntaxKind::Block)?);
-        let typed = typed_proof_postcondition::<false>(&self.prepared, proof.function, proof.node)?;
+        let typed = typed_proof_postcondition::<ALLOW_INDUCTION>(&self.prepared, proof.function, proof.node)?;
         let filter = prepare_proof_entry_filter(
             proof.node, proof_source, typed.target.target_layout, &typed.input_names, typed.body,
         )?;
-        Ok(PlannedModuleProof { proof_source, proof: proof.node, canonical_target: proof.target, target: (module, item), typed, steps, filter })
+        Ok(PlannedModuleProof {
+            proof_source, proof: proof.node, canonical_target: proof.target, target: (module, item),
+            function, name: proof_name, typed, steps, filter,
+        })
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -1582,27 +1593,13 @@ impl PreparedProofModule {
         check_decrement_induction_premise(measure, &proof_case.base_guard, filter.as_deref().unwrap_or_default())
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     fn audit_induction_return_witness(
         &self, proof_source: &SourceIdentity, proof_name: &str,
     ) -> Result<InductionPremise, ProjectCheck> {
-        let proof = self.select_resolved(proof_source, proof_name)?;
-        let typed = typed_proof_postcondition::<true>(&self.prepared, proof.function, proof.node)?;
-        let measure = typed.measure.ok_or(ProjectCheck::Unsupported)?;
-        let steps = derive_block(&child(proof.node, SyntaxKind::Block)?);
-        let proof_case = prepare_decrement_proof_steps(proof_name, &steps, &typed, measure)?;
-        let filter = prepare_proof_entry_filter(
-            proof.node, proof_source, typed.target.target_layout, &typed.input_names, typed.body,
-        )?;
-        let base_matches = check_canonical_induction_returns(
-            proof.function.2, proof.target, &typed, measure, &proof_case,
-        )?;
-        let filter = filter.as_deref().unwrap_or_default();
-        let (entries, minimum) = induction_entry_domain(measure, filter)?;
-        if !base_matches && induction_base_reachable(&entries, &proof_case.base_guard)? {
-            return Err(ProjectCheck::Refuted);
-        }
-        check_induction_entry_domain(entries, &minimum, &proof_case.base_guard, filter)
+        let plan = self.plan_module_proof_in_scope::<true>(proof_source, proof_name)?;
+        let measure = plan.typed.measure.ok_or(ProjectCheck::Unsupported)?;
+        Ok(plan.verify_induction_return_witness(measure)?.unwrap_or(InductionPremise::Unreachable))
     }
 
     fn check_module_proofs(&self, proof_names: &[&str]) -> Vec<ScalarModuleProofOutcome> {
@@ -1620,7 +1617,7 @@ impl PreparedProofModule {
                 std::collections::hash_map::Entry::Occupied(first) => duplicate.push((index, *first.get())),
                 std::collections::hash_map::Entry::Vacant(first) => {
                     first.insert(index);
-                    match self.plan_module_proof(proof_source, name) {
+                    match self.plan_module_proof_in_scope::<true>(proof_source, name) {
                         Ok(plan) => plans.push((index, plan)),
                         Err(error) => outcomes[index] = module_proof_outcome(Err(error)),
                     }
@@ -1645,8 +1642,12 @@ impl PreparedProofModule {
         let Ok((root, ordinals)) = package_initialization_order(self.prepared.parts().0) else { return; };
         let mut observers = ActualProofBatch { targets: HashMap::new(), proofs: Vec::with_capacity(plans.len()) };
         for (plan_index, (_, plan)) in plans.iter().enumerate() {
-            observers.targets.entry(plan.target).or_default().push(plan_index);
-            observers.proofs.push(plan.observer());
+            if plan.typed.measure.is_none() {
+                observers.targets.entry(plan.target).or_default().push(plan_index);
+                observers.proofs.push(Some(plan.observer()));
+            } else {
+                observers.proofs.push(None);
+            }
         }
         let Ok((initialization, observers)) =
             check_package_initialization_observing(&self.prepared, root, ordinals, observers)
@@ -1659,8 +1660,16 @@ impl PreparedProofModule {
             {
                 continue;
             }
+            if let Some(measure) = plan.typed.measure {
+                if !initialization.reached.contains(&plan.target) {
+                    outcomes[*index] = module_proof_outcome(plan.verify_unused_induction(measure));
+                }
+                continue;
+            }
             if initialization.reached.contains(&plan.target) {
-                outcomes[*index] = module_proof_outcome(observer.outcome());
+                if let Some(observer) = observer {
+                    outcomes[*index] = module_proof_outcome(observer.outcome());
+                }
             } else if !matches!(plan.typed.goal, TypedProofGoal::Literal { .. }) {
                 continue;
             } else if plan.steps.items.is_empty() {
@@ -1706,6 +1715,35 @@ impl PreparedProofModule {
 
 #[cfg(feature = "internal-checker")]
 impl PlannedModuleProof<'_> {
+    fn verify_induction_return_witness(
+        &self, measure: TypedEntryMeasure<'_>,
+    ) -> Result<Option<InductionPremise>, ProjectCheck> {
+        let proof_case = prepare_decrement_proof_steps(self.name, &self.steps, &self.typed, measure)?;
+        let base_matches = check_canonical_induction_returns(
+            self.function, self.canonical_target, &self.typed, measure, &proof_case,
+        )?;
+        let filter = self.filter.as_deref().unwrap_or_default();
+        let (entries, minimum) = induction_entry_domain(measure, filter)?;
+        if entries.is_empty() {
+            return Ok(None);
+        }
+        if !base_matches && induction_base_reachable(&entries, &proof_case.base_guard)? {
+            return Err(ProjectCheck::Refuted);
+        }
+        check_induction_entry_domain(entries, &minimum, &proof_case.base_guard, filter).map(Some)
+    }
+
+    fn verify_unused_induction(&self, measure: TypedEntryMeasure<'_>) -> Result<ProjectCheck, ProjectCheck> {
+        match self.verify_induction_return_witness(measure) {
+            Ok(None) => Ok(ProjectCheck::NoApplicableInputs),
+            Ok(Some(InductionPremise::Established | InductionPremise::Unreachable)) => Ok(ProjectCheck::Proved),
+            Ok(Some(InductionPremise::NotStrict | InductionPremise::CalleeWhereUnproved)) => Err(ProjectCheck::Unsupported),
+            Err(ProjectCheck::Refuted) => Ok(ProjectCheck::Refuted),
+            Err(error) => Err(error),
+        }
+    }
+
+
     fn observer(&self) -> SelectedProofObserver<'_> {
         SelectedProofObserver {
             guard: if self.steps.items.is_empty() {
@@ -1838,7 +1876,7 @@ impl SelectedProofObserver<'_> {
 #[cfg(feature = "internal-checker")]
 struct ActualProofBatch<'a> {
     targets: HashMap<(usize, usize), Vec<usize>>,
-    proofs: Vec<SelectedProofObserver<'a>>,
+    proofs: Vec<Option<SelectedProofObserver<'a>>>,
 }
 
 #[cfg(feature = "internal-checker")]
@@ -1848,7 +1886,9 @@ impl ActualIntegerObserver for ActualProofBatch<'_> {
     fn observe(&mut self, target: (usize, usize), arguments: &[&BigInt], value: &BigInt) {
         if let Some(proofs) = self.targets.get(&target) {
             for &proof in proofs {
-                self.proofs[proof].record(arguments, value);
+                if let Some(observer) = self.proofs[proof].as_mut() {
+                    observer.record(arguments, value);
+                }
             }
         }
     }
