@@ -1880,13 +1880,16 @@ mod production_bound_reuse {
         (source, name): (&SourceIdentity, &str),
         (caller_source, caller_name): (&SourceIdentity, &str),
     ) -> Option<ScalarProofCallOutcome> {
-        let plan = project.plan_module_proof_in_scope::<true, true>(source, name).ok()?;
-        let TypedProofGoal::Literal { operator, relation, bound } = &plan.typed.goal else { return None; };
+        let plan = project.plan_module_proof_in_scope::<true, true, true>(source, name).ok()?;
+        let goal = &plan.typed.goal;
+        if !matches!(goal, TypedProofGoal::Literal { .. } | TypedProofGoal::DeferredDisjunction(_)) {
+            return None;
+        }
         let (scalar, calls) = project.prepared.parts();
         let caller = select_checked_root(scalar, caller_source, caller_name).ok()?;
         let root = scalar.initialization_order.first()?;
         if plan.typed.measure.is_some()
-            && (operator != &BinaryOperator::Equal || plan.proof_source != root
+            && (!matches!(goal, TypedProofGoal::Literal { operator: BinaryOperator::Equal, .. }) || plan.proof_source != root
                 || &plan.typed.target.source != root || caller_source != root)
         {
             return None;
@@ -1938,7 +1941,7 @@ mod production_bound_reuse {
             }
             let mut issue = || {
                 initialize()?;
-                proved_arbitrary_values(&plan, &output.ty, operator, *relation, bound)
+                proved_arbitrary_values(&plan, &output.ty)
             };
             return imported_outcome(body, ImportedLocal {
                 position,
@@ -1946,9 +1949,10 @@ mod production_bound_reuse {
                 values: ImportedIntegerValues::Deferred { slot, domain, issue: &mut issue },
             });
         }
+        let TypedProofGoal::Literal { bound, .. } = goal else { return None; };
         initialize()?;
         let identity = (plan.proof_source, wosy_syntax::byte_span(plan.proof), name);
-        let verified = VerifiedModuleBound::establish(project, &plan, identity, (operator, *relation, bound), &output.ty, guard.comparisons)?;
+        let verified = VerifiedModuleBound::establish(project, &plan, identity, bound, &output.ty, guard.comparisons)?;
         verified.consume(project, identity, body, position)
     }
 
@@ -1957,7 +1961,7 @@ mod production_bound_reuse {
             issuer: &'a PreparedProofModule,
             plan: &'a PlannedModuleProof<'_>,
             proof_identity: (&'a SourceIdentity, ByteSpan, &'a str),
-            (operator, relation, bound): (&BinaryOperator, IntegerRelation, &BigInt),
+            bound: &BigInt,
             output: &ScalarType,
             guards: Vec<ImportedEntryGuard<'a>>,
         ) -> Option<Self> {
@@ -1971,7 +1975,7 @@ mod production_bound_reuse {
                 if !plan.steps.items.is_empty() || !valid_arbitrary_proof_body(body) {
                     return None;
                 }
-                proved_arbitrary_values(plan, output, operator, relation, bound)?
+                proved_arbitrary_values(plan, output)?
             };
             Some(Self {
                 issuer, proof_identity, guards, values,
@@ -2011,15 +2015,23 @@ mod production_bound_reuse {
 
     fn proved_arbitrary_values(
         plan: &PlannedModuleProof<'_>, output: &ScalarType,
-        operator: &BinaryOperator, relation: IntegerRelation, bound: &BigInt,
     ) -> Option<IntegerSet> {
+        let goal = match &plan.typed.goal {
+            TypedProofGoal::DeferredDisjunction(atoms) => Some(TypedProofGoal::Disjunction(normalize_output_disjunction(output, atoms)?)),
+            _ => None,
+        };
+        let checked_goal = goal.as_ref().unwrap_or(&plan.typed.goal);
         let ProofCoverage::Applicable(paths) = observe_arbitrary_integer_returns(plan.typed.body, plan.filter.as_deref())?.ok()? else {
             return None;
         };
-        if !paths.iter().all(|path| path.output_satisfies(relation, bound) == Some(true)) {
+        if !paths.iter().all(|path| checked_goal.holds_on_returned_path(path) == Some(true)) {
             return None;
         }
-        IntegerSet::from_type(output)?.keep(operator, bound)
+        match (goal, &plan.typed.goal) {
+            (Some(TypedProofGoal::Disjunction(allowed)), _) => Some(allowed),
+            (None, TypedProofGoal::Literal { operator, bound, .. }) => IntegerSet::from_type(output)?.keep(operator, bound),
+            _ => None,
+        }
     }
 
     fn imported_outcome<'a>(body: &'a FunctionCallSites, fact: ImportedLocal<'a>) -> Option<ScalarProofCallOutcome> {
@@ -2086,17 +2098,17 @@ struct PlannedModuleProof<'a> {
 impl PreparedProofModule {
     #[cfg(test)]
     fn plan_module_proof<'a>(&'a self, proof_source: &SourceIdentity, proof_name: &'a str) -> Result<PlannedModuleProof<'a>, ProjectCheck> {
-        self.plan_module_proof_in_scope::<false, true>(proof_source, proof_name)
+        self.plan_module_proof_in_scope::<false, true, false>(proof_source, proof_name)
     }
 
-    fn plan_module_proof_in_scope<'a, const ALLOW_INDUCTION: bool, const ALLOW_DOMAIN: bool>(
+    fn plan_module_proof_in_scope<'a, const ALLOW_INDUCTION: bool, const ALLOW_DOMAIN: bool, const DEFER_OUTPUT_UNION: bool>(
         &'a self, proof_source: &SourceIdentity, proof_name: &'a str,
     ) -> Result<PlannedModuleProof<'a>, ProjectCheck> {
         let (proof_source, _) = self.proofs.get_key_value(proof_source).ok_or(ProjectCheck::MissingRoot)?;
         let proof = self.select_resolved(proof_source, proof_name)?;
         let (module, item, function) = proof.function;
         let steps = derive_block(&child(proof.node, SyntaxKind::Block)?);
-        let typed = typed_proof_postcondition::<ALLOW_INDUCTION>(&self.prepared, proof.function, proof.node, &steps)?;
+        let typed = typed_proof_postcondition::<ALLOW_INDUCTION, DEFER_OUTPUT_UNION>(&self.prepared, proof.function, proof.node, &steps)?;
         let filter = prepare_proof_entry_filter_in_scope(
             proof.node, proof_source, typed.target.target_layout, &typed.input_names, typed.body,
             ALLOW_DOMAIN && steps.items.is_empty() && typed.measure.is_none(),
@@ -2113,7 +2125,7 @@ impl PreparedProofModule {
     ) -> Result<InductionPremise, ProjectCheck> {
         let proof = self.select_resolved(proof_source, proof_name)?;
         let steps = derive_block(&child(proof.node, SyntaxKind::Block)?);
-        let typed = typed_proof_postcondition::<true>(&self.prepared, proof.function, proof.node, &steps)?;
+        let typed = typed_proof_postcondition::<true, false>(&self.prepared, proof.function, proof.node, &steps)?;
         let measure = typed.measure.ok_or(ProjectCheck::Unsupported)?;
         let filter = prepare_proof_entry_filter(
             proof.node, proof_source, typed.target.target_layout, &typed.input_names, typed.body,
@@ -2126,7 +2138,7 @@ impl PreparedProofModule {
     fn audit_induction_return_witness(
         &self, proof_source: &SourceIdentity, proof_name: &str,
     ) -> Result<InductionPremise, ProjectCheck> {
-        let plan = self.plan_module_proof_in_scope::<true, false>(proof_source, proof_name)?;
+        let plan = self.plan_module_proof_in_scope::<true, false, false>(proof_source, proof_name)?;
         let measure = plan.typed.measure.ok_or(ProjectCheck::Unsupported)?;
         Ok(plan.verify_induction_return_witness(measure)?.unwrap_or(InductionPremise::Unreachable))
     }
@@ -2146,7 +2158,7 @@ impl PreparedProofModule {
                 std::collections::hash_map::Entry::Occupied(first) => duplicate.push((index, *first.get())),
                 std::collections::hash_map::Entry::Vacant(first) => {
                     first.insert(index);
-                    match self.plan_module_proof_in_scope::<true, true>(proof_source, name) {
+                    match self.plan_module_proof_in_scope::<true, true, false>(proof_source, name) {
                         Ok(plan) => plans.push((index, plan)),
                         Err(error) => outcomes[index] = module_proof_outcome(Err(error)),
                     }
@@ -2431,6 +2443,7 @@ impl SelectedProofObserver<'_> {
                 TypedProofGoal::Existential { relation, witness, witness_in_domain } =>
                     (*witness_in_domain && relation.accepts(value.cmp(witness))).then_some(true),
                 TypedProofGoal::Disjunction(allowed) => Some(allowed.contains(value)),
+                TypedProofGoal::DeferredDisjunction(_) => None,
                 TypedProofGoal::Conjunction(atoms) => Some(atoms.iter().all(|(relation, bound)| relation.accepts(value.cmp(bound)))),
                 TypedProofGoal::EntryEqual { slot } => arguments.get(*slot).map(|entry| *entry == value),
             };
@@ -2580,6 +2593,8 @@ enum TypedProofGoal {
     },
     Conjunction(Vec<(IntegerRelation, BigInt)>),
     Disjunction(IntegerSet),
+    #[cfg_attr(not(feature = "internal-checker"), allow(dead_code))]
+    DeferredDisjunction([(IntegerRelation, BigInt); 2]),
     Universal { relation: IntegerRelation, bound: BigInt },
     Existential { relation: IntegerRelation, witness: BigInt, witness_in_domain: bool },
     EntryEqual { slot: usize },
@@ -2603,7 +2618,7 @@ impl TypedProofGoal {
                 }
                 Some(true)
             }
-            Self::EntryEqual { .. } => None,
+            Self::EntryEqual { .. } | Self::DeferredDisjunction(_) => None,
         }
     }
 }
@@ -3078,7 +3093,21 @@ fn check_induction_entry_domain(
     Ok(InductionPremise::Established)
 }
 
-fn typed_proof_postcondition<'a, const AUDIT_INDUCTION: bool>(
+#[cfg(all(test, feature = "internal-checker"))]
+thread_local! {
+    static OUTPUT_UNION_NORMALIZATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn normalize_output_disjunction(
+    output: &ScalarType, [(left_relation, left_bound), (right_relation, right_bound)]: &[(IntegerRelation, BigInt); 2],
+) -> Option<IntegerSet> {
+    #[cfg(all(test, feature = "internal-checker"))]
+    OUTPUT_UNION_NORMALIZATIONS.with(|count| count.set(count.get() + 1));
+    let domain = IntegerSet::from_type(output)?;
+    Some(domain.keep_relation(*left_relation, left_bound).join(domain.keep_relation(*right_relation, right_bound)))
+}
+
+fn typed_proof_postcondition<'a, const AUDIT_INDUCTION: bool, const DEFER_OUTPUT_UNION: bool>(
     prepared: &'a PreparedCheckerProject,
     (module, item, function): (usize, usize, &'a ScalarFunction),
     declaration: &CstNode,
@@ -3137,12 +3166,12 @@ fn typed_proof_postcondition<'a, const AUDIT_INDUCTION: bool>(
                 let (_, relation, bound) = checked_literal_output_goal(comparison, output, &input_names, &result.ty)?;
                 Ok::<_, ProjectCheck>((relation, bound))
             };
-            let (left_relation, left_bound) = normalized(left.as_ref())?;
-            let (right_relation, right_bound) = normalized(right.as_ref())?;
-            let domain = IntegerSet::from_type(&result.ty).ok_or(ProjectCheck::Unsupported)?;
-            let allowed = domain.keep_relation(left_relation, &left_bound)
-                .join(domain.keep_relation(right_relation, &right_bound));
-            TypedProofGoal::Disjunction(allowed)
+            let atoms = [normalized(left.as_ref())?, normalized(right.as_ref())?];
+            if DEFER_OUTPUT_UNION {
+                TypedProofGoal::DeferredDisjunction(atoms)
+            } else {
+                TypedProofGoal::Disjunction(normalize_output_disjunction(&result.ty, &atoms).ok_or(ProjectCheck::Unsupported)?)
+            }
         } else if matches!(&ensures, ScalarExpression::Binary { operator: BinaryOperator::And, .. }) {
             let mut pending = vec![&ensures];
             let mut atoms = Vec::new();
@@ -3207,7 +3236,7 @@ fn check_selected_proof(
 ) -> Result<(ProjectCheck, Option<VerifiedReturnBound>), ProjectCheck> {
     let steps = derive_block(&child(declaration, SyntaxKind::Block)?);
     let TypedProofPostcondition { target, body, result_type, input_names, output, goal, .. } =
-        typed_proof_postcondition::<false>(prepared, (module, item, function), declaration, &steps)?;
+        typed_proof_postcondition::<false, false>(prepared, (module, item, function), declaration, &steps)?;
     let TypedProofGoal::Literal { operator, bound, .. } = goal else {
         return Err(ProjectCheck::Unsupported);
     };
@@ -4758,6 +4787,12 @@ mod tests {
                 core.require(result <= 7, {OUTPUT});
             }};
             proof domain for producer(input) -> (out) where (input == 1 || input == 7) ensures (out <= 7) {{}}
+            proof output_union for producer(input) -> (out)
+                where (input == 1 || input == 7) ensures (out == 1 || out == 7) {{}}
+            proof refuted_union for producer(input) -> (out)
+                where (input == 1 || input == 7) ensures (out == 1 || out == 8) {{}}
+            proof no_domain for producer(input) -> (out)
+                where (input == 1) ensures (out == 1 || out == 7) {{}}
             proof false_goal for producer(input) -> (out) where (input == 1 || input == 7) ensures (out <= 1) {{}}
             proof full for producer(input) -> (out) where (input < 8 || input >= 8) ensures (out <= 255) {{}}
             unit(u8) complete = fn(value) {{
@@ -4773,10 +4808,24 @@ mod tests {
             )
         };
         let _ = take_integer_observations();
+        let take_normalizations = || OUTPUT_UNION_NORMALIZATIONS.with(|count| count.replace(0));
+        let _ = take_normalizations();
         for caller in ["hole", "broad", "wrong"] {
             assert_eq!(run("domain", caller), ScalarProofCallOutcome::Unavailable);
             assert_eq!(take_integer_observations(), (0, 0));
+            assert_eq!(run("output_union", caller), ScalarProofCallOutcome::Unavailable);
+            assert_eq!(take_integer_observations(), (0, 0));
+            assert_eq!(take_normalizations(), 0);
         }
+        assert_eq!(run("no_domain", "accepted"), ScalarProofCallOutcome::Unavailable);
+        assert_eq!(take_integer_observations(), (0, 0));
+        assert_eq!(take_normalizations(), 0);
+        assert_eq!(run("output_union", "accepted"), ScalarProofCallOutcome::Established);
+        assert_eq!(take_integer_observations(), (1, 1));
+        assert_eq!(take_normalizations(), 1);
+        assert_eq!(run("refuted_union", "accepted"), ScalarProofCallOutcome::Unavailable);
+        assert_eq!(take_integer_observations(), (1, 1));
+        assert_eq!(take_normalizations(), 1);
         assert_eq!(run("domain", "accepted"), ScalarProofCallOutcome::Established);
         assert_eq!(take_integer_observations(), (1, 1));
         assert_eq!(run("full", "complete"), ScalarProofCallOutcome::Established);

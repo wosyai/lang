@@ -1573,6 +1573,34 @@ fn named_proof_where_disjunction_reuses_only_independently_proved_exact_domain()
 }
 
 #[test]
+fn named_proof_output_disjunction_reuse_preserves_proved_gaps() {
+    let identity = source();
+    let text = format!(r#"%%start
+        u8(u8) producer = fn(value) {{ value }};
+        unit() gap_excluded = fn {{
+            u8 answer = producer(7);
+            core.require(answer != 4, {OUTPUT});
+        }};
+        unit() no_correlation = fn {{
+            u8 answer = producer(7);
+            core.require(answer == 7, {OUTPUT});
+        }};
+        proof exact for producer(input) -> (out)
+            where (input == 1 || input == 7) ensures (out == 1 || out == 7) {{}}
+    %%end"#);
+    let check = |caller: &str| {
+        let (_, catalog) = wosy_compiler::parse_proof_source(identity.clone(), text.clone(), &[])
+            .ok().expect("canonical proof source");
+        check_loaded_scalar_module_proof_call(
+            (&identity, "exact"), (&identity, caller), Vec::new(), (catalog, Vec::new()),
+            vec![identity.clone()], ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
+        )
+    };
+    assert_eq!(check("gap_excluded"), ScalarProofCallOutcome::Established);
+    assert_eq!(check("no_correlation"), ScalarProofCallOutcome::NotEstablished);
+}
+
+#[test]
 fn named_proof_output_disjunction_checks_the_exact_union_on_every_return() {
     let identity = source();
     let check = |goal: &str, guard: &str, actual: &str, steps: &str, alias: &str| {
