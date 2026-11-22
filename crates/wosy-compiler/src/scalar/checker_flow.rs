@@ -450,7 +450,6 @@ pub(super) fn check_integer_requirement_activity(
         .map(|result| result.map(|coverage| matches!(coverage, ProofCoverage::Applicable(true))))
 }
 
-#[cfg(all(test, feature = "internal-checker"))]
 pub(super) fn collect_integer_requirement_failures(
     calls: &FunctionCallSites,
 ) -> Option<(bool, Vec<IntegerCheckFailure<'_>>)> {

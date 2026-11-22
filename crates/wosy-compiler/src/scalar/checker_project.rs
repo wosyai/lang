@@ -7,7 +7,7 @@ use std::hash::{Hash, Hasher};
 use super::{
     checker_directive::{CheckedLiteralOutput, CheckerOperation, InitializerIntegerOperand, InitializerPredicate, PreparedCheckerDirective},
     checker_flow::{
-        check_integer_requirement_activity, check_integer_requirements_with_calls, check_integer_return_bound_with_shows, collect_exact_unit_requirement_failures, concrete_integer_literal, exact_integer_call_argument, exact_integer_call_argument_at,
+        check_integer_requirement_activity, check_integer_requirements_with_calls, collect_integer_requirement_failures, check_integer_return_bound_with_shows, collect_exact_unit_requirement_failures, concrete_integer_literal, exact_integer_call_argument, exact_integer_call_argument_at,
         exact_integer_return_at_entry, ActualCallResult, CheckerPredicate, ExactIntegerArgument,
         proves_requirement_with_imported_root_local, ImportedEntryGuard, ImportedLocal, IntegerShowProof, IntegerCheckFailure, IntegerComparison, IntegerInputs, IntegerReturn, ProofCoverage,
     },
@@ -290,6 +290,23 @@ fn check_package_roots(prepared: &PreparedCheckerProject) -> Result<(), ProjectC
 fn check_package_roots_with_activity(
     prepared: &PreparedCheckerProject, scope: ScalarCheckerScope, startup_count: usize,
 ) -> Result<bool, ProjectCheck> {
+    check_package_roots_with_policy::<false>(prepared, scope, startup_count, None)
+}
+
+#[cfg(feature = "internal-checker")]
+#[cfg_attr(not(test), allow(dead_code))]
+fn collect_ordered_package_failures(
+    prepared: &PreparedCheckerProject, scope: ScalarCheckerScope, startup_count: usize,
+) -> Result<(bool, Vec<ProjectCheck>), ProjectCheck> {
+    let mut failures = Vec::new();
+    let active = check_package_roots_with_policy::<true>(prepared, scope, startup_count, Some(&mut failures))?;
+    Ok((active, failures))
+}
+
+fn check_package_roots_with_policy<const COLLECT: bool>(
+    prepared: &PreparedCheckerProject, scope: ScalarCheckerScope, startup_count: usize,
+    mut failures: Option<&mut Vec<ProjectCheck>>,
+) -> Result<bool, ProjectCheck> {
     let (project, calls) = prepared.parts();
     let (startup, dormant) = project.modules.split_at(startup_count);
     let (root, ordinals) = package_startup_order(project, startup)?;
@@ -320,8 +337,10 @@ fn check_package_roots_with_activity(
     if !potential_obligations {
         return Ok(false);
     }
-    let CheckedInitialization { visits, reached, ordinals, mut had_obligations } =
-        check_package_initialization_with_order(prepared, root, ordinals)?;
+    let (CheckedInitialization { visits, reached, ordinals, mut had_obligations }, ()) =
+        check_package_initialization_observing_with_policy::<(), COLLECT>(
+            prepared, root, ordinals, (), failures.as_deref_mut(),
+        )?;
     if scope == ScalarCheckerScope::MainFlowOnly {
         return Ok(had_obligations);
     }
@@ -330,17 +349,27 @@ fn check_package_roots_with_activity(
             continue;
         }
         let ordinal = *ordinals.get(source).ok_or(ProjectCheck::RootSourceOutsideInitOrder)?;
-        if visits[ordinal] != InitializationVisit::Completed {
-            continue;
-        }
         if let Some(seeds) = authored_roots.remove(&ordinal) {
-            had_obligations |= check_unused_module(project, calls, &project.modules[ordinal], ordinal, &reached, seeds)?;
+            let module = &project.modules[ordinal];
+            if visits[ordinal] != InitializationVisit::Completed {
+                if COLLECT && symbolic_obligation_roots(calls, module, ordinal, seeds)?
+                    .into_iter().any(|item| !reached.contains(&(ordinal, item)))
+                {
+                    return Err(ProjectCheck::Unsupported);
+                }
+                continue;
+            }
+            had_obligations |= check_unused_module::<COLLECT>(
+                project, calls, module, ordinal, &reached, seeds, failures.as_deref_mut(),
+            )?;
         }
     }
     for (index, module) in dormant.iter().enumerate() {
         let ordinal = startup_count + index;
         if let Some(seeds) = authored_roots.remove(&ordinal) {
-            had_obligations |= check_unused_module(project, calls, module, ordinal, &reached, seeds)?;
+            had_obligations |= check_unused_module::<COLLECT>(
+                project, calls, module, ordinal, &reached, seeds, failures.as_deref_mut(),
+            )?;
         }
     }
     Ok(had_obligations)
@@ -390,13 +419,14 @@ fn symbolic_obligation_roots(
     Ok(roots)
 }
 
-fn check_unused_module(
+fn check_unused_module<const COLLECT: bool>(
     project: &ScalarProject,
     calls: &ProjectCallSiteResults,
     module: &ScalarModule,
     ordinal: usize,
     reached: &HashSet<(usize, usize)>,
     authored_roots: Vec<usize>,
+    mut failures: Option<&mut Vec<ProjectCheck>>,
 ) -> Result<bool, ProjectCheck> {
     let symbolic_roots = symbolic_obligation_roots(calls, module, ordinal, authored_roots)?;
     let mut active = false;
@@ -416,7 +446,13 @@ fn check_unused_module(
         {
             return Err(ProjectCheck::Unsupported);
         }
-        if body.structure.checker_direct_targets.is_empty() {
+        if COLLECT {
+            let (observed, selected) = collect_integer_requirement_failures(body).ok_or(ProjectCheck::Unsupported)?;
+            active |= observed;
+            failures.as_deref_mut().ok_or(ProjectCheck::Unsupported)?.extend(
+                selected.into_iter().map(|failure| project_failure(body, &module.source, failure)),
+            );
+        } else if body.structure.checker_direct_targets.is_empty() {
             match check_integer_requirement_activity(body) {
                 Some(Ok(observed)) => active |= observed,
                 Some(Err(failure)) => return Err(project_failure(body, &module.source, failure)),
@@ -3163,6 +3199,127 @@ mod tests {
     use crate::{derive_scalar_declarations_from_cst, parse_source, prepare_scalar_project, ScalarTargetLayout};
 
     const OUTPUT: &str = r#"{ .stdout = ""; .stderr = "unexpected state"; .code = 1; .files = []; }"#;
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordered_package_failure_collection_joins_actual_and_unused_roots_once() {
+        let app = source("src/main.w", "collect-ordered-package-failures");
+        let headings = ["value < 2", "value < 4", "value < 6"];
+        let prepare = |first: u8, second: u8, last: u8| {
+            let output = |code: u8| OUTPUT.replace(".code = 1", &format!(".code = {code}"));
+            let text = format!(r#"%%start
+                unit(u8) unopened = fn(value) {{ core.require(value < 4, {}); }};
+                unit(u8) actual = fn(value) {{ core.require(value < 2, {}); }};
+                unit(u8) later = fn(value) {{ core.require(value < 6, {}); }};
+                actual(3);
+            %%end"#, output(second), output(first), output(last));
+            let prepared = prepare_checker_project(
+                vec![(declarations(&app, &text), Vec::new())], vec![app.clone()], inputs(),
+            ).unwrap();
+            (text, prepared)
+        };
+        for codes in [[0, 23, 9], [0, 0, 0]] {
+            let (text, prepared) = prepare(codes[0], codes[1], codes[2]);
+            let (active, reports) = collect_ordered_package_failures(
+                &prepared, ScalarCheckerScope::CurrentPackage, 1,
+            ).unwrap();
+            assert!(active);
+            let data = reports.iter().map(|failure| {
+                let ProjectCheck::Failed { source, condition, output, state, .. } = failure else {
+                    panic!("expected authored failure");
+                };
+                assert_eq!(source, &app);
+                let intervals = state.intervals_at(0, 0).unwrap().map(|(lo, hi)| (lo.clone(), hi.clone()))
+                    .collect::<Vec<_>>();
+                (&text[condition.start as usize..condition.end as usize], &output.code_value, intervals)
+            }).collect::<Vec<_>>();
+            assert_eq!(data.iter().map(|(condition, _, _)| *condition).collect::<Vec<_>>(), headings);
+            assert_eq!(data.iter().map(|(_, code, _)| (*code).clone()).collect::<Vec<_>>(), codes.map(BigInt::from));
+            assert_eq!(data.iter().map(|(_, _, rows)| rows.clone()).collect::<Vec<_>>(),
+                [(3, 3), (4, 255), (6, 255)].map(|(lo, hi)| vec![(BigInt::from(lo), BigInt::from(hi))]));
+            let (active, main_only) = collect_ordered_package_failures(&prepared, ScalarCheckerScope::MainFlowOnly, 1).unwrap();
+            assert!(active);
+            drop(data);
+            let first = reports.into_iter().next().unwrap();
+            assert_eq!(main_only, [first]);
+            assert_eq!(check_package_roots(&prepared), Err(main_only.into_iter().next().unwrap()));
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordered_package_failure_collection_does_not_publish_incomplete_roots() {
+        let app = source("src/main.w", "collect-incomplete-package-failures");
+        let prepare = |body: &str, startup: &str| {
+            let text = format!(r#"%%start
+                unit() helper = fn {{}};
+                unit(u8) unopened = fn(value) {{ core.require(value < 4, {OUTPUT}); {body} }};
+                core.require(false, {OUTPUT});
+                {startup}
+            %%end"#);
+            prepare_checker_project(
+                vec![(declarations(&app, &text), Vec::new())], vec![app.clone()], inputs(),
+            ).unwrap()
+        };
+        let nested = prepare("helper();", "");
+        assert_eq!(collect_ordered_package_failures(&nested, ScalarCheckerScope::CurrentPackage, 1), Err(ProjectCheck::Unsupported));
+        let dead = prepare("", &format!("core.narrow(false, {OUTPUT});"));
+        assert_eq!(collect_ordered_package_failures(&dead, ScalarCheckerScope::CurrentPackage, 1), Err(ProjectCheck::Unsupported));
+        let (active, main_only) = collect_ordered_package_failures(&dead, ScalarCheckerScope::MainFlowOnly, 1).unwrap();
+        assert!(active);
+        assert_eq!(main_only.len(), 2);
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordered_package_failure_collection_accepts_a_fatal_actual_call_without_pending_roots() {
+        let app = source("src/main.w", "collect-ended-actual-root");
+        let child = source("src/child.w", "collect-unvisited-child-root");
+        let prepare = |unseen: bool| {
+            let namespace = if unseen { "child = namespace demo \"src/child.w\";" } else { "" };
+            let text = format!(r#"%%start
+                unit(u8) actual = fn(value) {{ core.narrow(value < 2, {OUTPUT}); }};
+                actual(3);
+                {namespace}
+                core.require(false, {OUTPUT});
+            %%end"#);
+            let mut sources = vec![app.clone()];
+            let mut bindings = Vec::new();
+            if unseen {
+                let start = text.find(namespace).unwrap();
+                bindings.push(ScalarNamespaceBinding {
+                    binding: "child".into(), target: child.clone(),
+                    span: ByteSpan::new(start as u32, (start + namespace.len()) as u32),
+                });
+                sources.push(child.clone());
+            }
+            let mut items = vec![(declarations(&app, &text), bindings)];
+            if unseen {
+                let child_text = format!(r#"%%start
+                    unit(u8) pending = fn(value) {{ core.require(value == 0, {OUTPUT}); }};
+                    core.require(false, {OUTPUT});
+                %%end"#);
+                items.push((declarations(&child, &child_text), Vec::new()));
+            }
+            prepare_checker_project(items, sources, inputs()).unwrap()
+        };
+        let prepare_without_pending = prepare(false);
+        let (active, failures) = collect_ordered_package_failures(
+            &prepare_without_pending, ScalarCheckerScope::CurrentPackage, 1,
+        ).unwrap();
+        assert!(active);
+        assert!(matches!(failures.as_slice(), [ProjectCheck::Failed {
+            operation: CheckerOperation::Narrow, source, ..
+        }] if source == &app));
+
+        let prepare_with_unseen_pending = prepare(true);
+        assert_eq!(collect_ordered_package_failures(
+            &prepare_with_unseen_pending, ScalarCheckerScope::CurrentPackage, 2,
+        ), Err(ProjectCheck::Unsupported));
+        assert_eq!(collect_ordered_package_failures(
+            &prepare_with_unseen_pending, ScalarCheckerScope::MainFlowOnly, 2,
+        ), Ok((active, failures)));
+    }
 
     #[cfg(feature = "internal-checker")]
     #[test]
