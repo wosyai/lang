@@ -393,12 +393,6 @@ fn compile_project(
         .first()
         .cloned()
         .ok_or_else(|| "project root source is missing".to_owned())?;
-    let root_exports = root_exports.map(|exports| {
-        (
-            exports,
-            compiler_source_identity(&root_node.source, &root_node.content_revision),
-        )
-    });
     let graph = load_reachable_source_graph(
         &project.package,
         root_node,
@@ -409,16 +403,14 @@ fn compile_project(
         render_graph_diagnostics(&error, &texts);
         format_graph_error(error)
     })?;
-    let mut project_declarations = Vec::new();
-    let mut source_by_path = BTreeMap::new();
+    let source_identities: Vec<_> = graph
+        .nodes
+        .iter()
+        .map(|node| compiler_source_identity(&node.source, &node.content_revision))
+        .collect();
+    let root_exports = root_exports.map(|exports| (exports, source_identities[0].clone()));
+    let mut project_declarations = Vec::with_capacity(graph.nodes.len());
     let mut derivation_diagnostics = Vec::new();
-    for node in &graph.nodes {
-        let source = compiler_source_identity(&node.source, &node.content_revision);
-        source_by_path.insert(
-            (node.source.package.clone(), node.source.path.clone()),
-            source,
-        );
-    }
     for node in &graph.nodes {
         let declarations = declarations_by_path
             .remove(&(node.source.package.clone(), node.source.path.clone()))
@@ -432,19 +424,12 @@ fn compile_project(
         let namespace_bindings = node
             .namespace_edges
             .iter()
-            .map(|edge| {
-                Ok(ScalarNamespaceBinding {
-                    binding: edge.binding.clone(),
-                    target: source_by_path
-                        .get(&(edge.origin.clone(), edge.path.clone()))
-                        .cloned()
-                        .ok_or_else(|| {
-                            format!("missing module {}", edge.path.as_path().display())
-                        })?,
-                    span: wosy_syntax::ByteSpan::new(edge.span.range.start, edge.span.range.end),
-                })
+            .map(|edge| ScalarNamespaceBinding {
+                binding: edge.binding.clone(),
+                target: source_identities[edge.target.0].clone(),
+                span: wosy_syntax::ByteSpan::new(edge.span.range.start, edge.span.range.end),
             })
-            .collect::<Result<Vec<_>, String>>()?;
+            .collect();
         project_declarations.push((declarations, namespace_bindings));
     }
     render_project_diagnostics(&derivation_diagnostics, &texts);
@@ -454,18 +439,9 @@ fn compile_project(
     let initialization_order = graph
         .initialization_order
         .iter()
-        .map(|id| {
-            let node = graph
-                .nodes
-                .get(id.0)
-                .ok_or_else(|| format!("missing initialization node {}", id.0))?;
-            source_by_path
-                .get(&(node.source.package.clone(), node.source.path.clone()))
-                .cloned()
-                .ok_or_else(|| format!("missing module {}", node.source.path.as_path().display()))
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    drop(source_by_path);
+        .map(|id| source_identities[id.0].clone())
+        .collect();
+    drop(source_identities);
     drop(declarations_by_path);
     #[cfg(test)]
     routing_observations::record(|counts| counts.preparations += 1);
