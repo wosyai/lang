@@ -10990,34 +10990,37 @@ fn derive_module_reference_origins(
         .collect::<HashSet<_>>();
     let mut errors = Vec::new();
     let mut updates = Vec::new();
+    let mut mixed_targets = HashSet::new();
+    let mut mixed_callers = Vec::new();
+    let mut mixed_producers = Vec::new();
     for (index, item) in items.iter().enumerate() {
         if let ScalarItem::Function(function) = item {
-            updates.push((
-                index,
-                derive_function_reference_result(
-                    source,
-                    function,
-                    &module_names,
-                    &call_sites.functions[&index],
-                    structs,
-                    enums,
-                    capture_call_points,
-                    &mut errors,
-                ),
-            ));
+            let result = derive_function_reference_result(
+                source, function, &module_names, &call_sites.functions[&index],
+                structs, enums, capture_call_points, &mut errors,
+            );
+            let position = updates.len();
+            if result.collect_local_mixed_targets(source, &mut mixed_targets) {
+                mixed_callers.push(position);
+            }
+            if function.generic_parameters.is_empty() && function.overload_arms.is_empty()
+                && matches!(&function.signature, ScalarType::Callable { outputs, .. }
+                    if aggregate::mixed_owned_struct_result(outputs).is_some())
+            {
+                mixed_producers.push((position, function.name_span));
+            }
+            updates.push((index, result));
         }
     }
-    if errors.is_empty() && updates.iter().any(|(_, result)| result.has_mixed_result_calls()) {
-        let owners = updates.iter().filter_map(|(index, result)| {
-            let ScalarItem::Function(function) = &items[*index] else { unreachable!("function result ordinal") };
-            let ScalarType::Callable { outputs, .. } = &function.signature else { return None };
-            (function.generic_parameters.is_empty() && function.overload_arms.is_empty()
-                && aggregate::mixed_owned_struct_result(outputs).is_some()
-                && result.aggregate.proves_mixed_local_owner(&result.cfg))
-                .then_some(function.name_span)
+    if errors.is_empty() && !mixed_targets.is_empty() {
+        let owners = mixed_producers.into_iter().filter_map(|(position, declaration)| {
+            let result = &updates[position].1;
+            (mixed_targets.contains(&declaration) && result.aggregate.proves_mixed_local_owner(&result.cfg))
+                .then_some(declaration)
         }).collect::<HashSet<_>>();
         if !owners.is_empty() {
-            for (index, result) in &mut updates {
+            for position in mixed_callers {
+                let (index, result) = &mut updates[position];
                 let ScalarItem::Function(function) = &items[*index] else { unreachable!("function result ordinal") };
                 result.observe_selected_mixed_receipts(function, &call_sites.functions[index], &module_names,
                     structs, enums, source, &owners, capture_call_points, &mut errors);
@@ -11922,8 +11925,27 @@ struct FunctionReferenceResult {
 }
 
 impl FunctionReferenceResult {
-    fn has_mixed_result_calls(&self) -> bool {
-        !self.aggregate.mixed_result_calls.is_empty() || self.arms.iter().any(Self::has_mixed_result_calls)
+    fn local_mixed_targets<'a>(&'a self, source: &'a SourceIdentity) -> impl Iterator<Item = ByteSpan> + 'a {
+        self.aggregate.mixed_result_calls.iter().filter_map(move |point| {
+            match &self.cfg.initial_points.get(point.0)?.kind {
+                CfgPointKind::Call { target: ResolvedCallTarget::ModuleCallable {
+                    source: actual, declaration_span, concrete: ConcreteCallSelection::Declaration,
+                }, .. } if actual == source => Some(*declaration_span),
+                _ => None,
+            }
+        })
+    }
+
+    fn collect_local_mixed_targets(&self, source: &SourceIdentity, targets: &mut HashSet<ByteSpan>) -> bool {
+        let mut found = false;
+        for declaration in self.local_mixed_targets(source) {
+            targets.insert(declaration);
+            found = true;
+        }
+        for arm in &self.arms {
+            found |= arm.collect_local_mixed_targets(source, targets);
+        }
+        found
     }
 
     fn observe_selected_mixed_receipts(
@@ -11935,13 +11957,7 @@ impl FunctionReferenceResult {
             result.observe_selected_mixed_receipts(function, sites, module_names, structs, enums, source, owners,
                 capture_call_points, errors);
         }
-        if !self.aggregate.mixed_result_calls.iter().any(|point|
-            matches!(&self.cfg.initial_points[point.0].kind, CfgPointKind::Call {
-                target: ResolvedCallTarget::ModuleCallable {
-                    source: actual, declaration_span, concrete: ConcreteCallSelection::Declaration,
-                }, ..
-            } if actual == source && owners.contains(declaration_span)))
-        {
+        if !self.local_mixed_targets(source).any(|declaration| owners.contains(&declaration)) {
             return;
         }
         let mut builder = ReferenceFlowBuilder::new(source, function, module_names, sites, structs, enums);
