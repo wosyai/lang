@@ -6,6 +6,7 @@ use super::expression::{
     emit_unary_value, ExpressionPath,
 };
 use super::*;
+use crate::ScalarPlace;
 
 pub(super) fn integer_width(ty: &ScalarType) -> Option<u32> {
     match ty {
@@ -404,18 +405,7 @@ pub(super) fn place_pointer<'ctx, 'module>(
             ) {
                 return Err("LLVM indexed place requires an array".to_owned());
             }
-            let index = take_basic(match project {
-                Some(project) => emit_project_typed_expression(
-                    context,
-                    state,
-                    index,
-                    &ScalarType::U64,
-                    project.module,
-                    project.modules,
-                )?,
-                None => emit_typed_expression(context, state, index, &ScalarType::U64)?,
-            })?
-            .into_int_value();
+            let index = emit_place_index(context, state, index, project)?;
             if let ScalarType::RuntimeArray { element, .. } = base_type {
                 let element = storage_type(context, &element, state.layouts, state.target_layout)?;
                 return unsafe {
@@ -428,18 +418,66 @@ pub(super) fn place_pointer<'ctx, 'module>(
                 }
                 .map_err(builder_error);
             }
-            let array = storage_type(context, &base_type, state.layouts, state.target_layout)?;
-            unsafe {
-                state.builder.build_in_bounds_gep(
-                    array,
-                    base_pointer,
-                    &[context.i32_type().const_zero(), index],
-                    "array_element",
-                )
-            }
-            .map_err(builder_error)
+            fixed_array_element_pointer(context, state, &base_type, base_pointer, index)
         }
     }
+}
+
+fn emit_place_index<'ctx>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, '_>,
+    index: &ScalarExpression,
+    project: Option<ProjectCallScope<'_>>,
+) -> Result<inkwell::values::IntValue<'ctx>, String> {
+    Ok(take_basic(match project {
+        Some(project) => emit_project_typed_expression(
+            context, state, index, &ScalarType::U64, project.module, project.modules,
+        )?,
+        None => emit_typed_expression(context, state, index, &ScalarType::U64)?,
+    })?.into_int_value())
+}
+
+fn fixed_array_element_pointer<'ctx>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, '_>,
+    ty: &ScalarType,
+    base: PointerValue<'ctx>,
+    index: inkwell::values::IntValue<'ctx>,
+) -> Result<PointerValue<'ctx>, String> {
+    let array = storage_type(context, ty, state.layouts, state.target_layout)?;
+    unsafe {
+        state.builder.build_in_bounds_gep(
+            array, base, &[context.i32_type().const_zero(), index], "array_element",
+        )
+    }
+    .map_err(builder_error)
+}
+
+pub(super) fn checked_fixed_assignment_element_pointer<'ctx>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, '_>,
+    base: &ScalarPlace,
+    index: &ScalarExpression,
+    project: Option<ProjectCallScope<'_>>,
+) -> Result<PointerValue<'ctx>, String> {
+    let ScalarPlace::Name { .. } = base else {
+        return Err("checked fixed assignment requires a directly named array".to_owned());
+    };
+    let Some(ty @ ScalarType::Array { length, .. }) = assignment_place_type(state, base) else {
+        return Err("checked fixed assignment requires a fixed array extent".to_owned());
+    };
+    let pointer = place_pointer(context, state, base, project)?;
+    let index = emit_place_index(context, state, index, project)?;
+    if !index.get_zero_extended_constant().is_some_and(|index| index < length) {
+        let invalid = state.builder.build_int_compare(
+            IntPredicate::UGE, index, context.i64_type().const_int(length, false),
+            "assignment_index_out_of_bounds",
+        ).map_err(builder_error)?;
+        emit_checked_place_guard(
+            context, state, invalid, "assignment_index_panic", "assignment_index_continue",
+        )?;
+    }
+    fixed_array_element_pointer(context, state, &ty, pointer, index)
 }
 
 fn byte_layout_field_pointer<'ctx>(

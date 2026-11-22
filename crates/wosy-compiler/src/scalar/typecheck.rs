@@ -5192,6 +5192,19 @@ fn checked_address_type_in_module(
     }
 }
 
+fn is_direct_fixed_array_element(
+    place: &ScalarPlace,
+    scope: &BTreeMap<String, ScalarType>,
+) -> bool {
+    let ScalarPlace::Index { base, .. } = place else {
+        return false;
+    };
+    let ScalarPlace::Name { name, .. } = base.as_ref() else {
+        return false;
+    };
+    !is_const_binding_name(name) && matches!(scope.get(name), Some(ScalarType::Array { .. }))
+}
+
 fn writable_place_type(
     place: &ScalarPlace,
     target_span: ByteSpan,
@@ -5218,7 +5231,11 @@ fn writable_place_type(
         return ScalarType::Error;
     }
     let ty = writable_path_type(place, scope, program, diagnostics, overloads, inference);
-    if matches!(ty, ScalarType::Struct(_) | ScalarType::Array { .. }) {
+    if matches!(ty, ScalarType::Struct(_) | ScalarType::Array { .. })
+        && !(is_direct_fixed_array_element(place, scope)
+            && copy_policy(&ty, program.structs, program.enums, &BTreeSet::new())
+                == Ok(CopyPolicy::Copy))
+    {
         diagnostics.push(diagnostic(
             program,
             "B0003",
@@ -5266,7 +5283,19 @@ fn writable_place_type_in_module(
         overloads,
         inference,
     );
-    if matches!(ty, ScalarType::Struct(_) | ScalarType::Array { .. }) {
+    if matches!(ty, ScalarType::Struct(_) | ScalarType::Array { .. })
+        && !(is_direct_fixed_array_element(place, scope)
+            && copy_policy_with(
+                &ty,
+                &BTreeSet::new(),
+                &mut |id| modules.iter().find(|candidate| candidate.source == &id.source)
+                    .and_then(|owner| owner.structs.iter().find(|structure| structure.id == *id))
+                    .map(|structure| structure.copy_policy),
+                &mut |id| modules.iter().find(|candidate| candidate.source == &id.source)
+                    .and_then(|owner| owner.enums.iter().find(|enumeration| enumeration.id == *id))
+                    .map(|enumeration| enumeration.copy_policy),
+            ) == Ok(CopyPolicy::Copy))
+    {
         diagnostics.push(module_diagnostic(
             module,
             "B0003",

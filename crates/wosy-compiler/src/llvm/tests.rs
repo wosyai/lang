@@ -6298,6 +6298,37 @@ fn assignment_destinations_are_retained_before_any_write_on_both_targets() {
 }
 
 #[test]
+fn indexed_copy_aggregate_assignment_guards_the_single_saved_selector() {
+    let text = "%%start\nstruct copy Entry { u8 value; }\nEntry[2] entries = [{ .value = 1; }, { .value = 2; }];\nu64(u64) select_index = fn(index) { index };\nu8(u8) replacement = fn(value) { value };\nunit(u64, u8) update = fn(index, value) { entries[select_index(index)] = { .value = replacement(value); }; };\n%%end";
+    for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let source = SourceIdentity::new("project".into(), "package".into(), "src/main.w".into(), "r1".into());
+        let parsed = parse_source(source.clone(), text.into(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let prepared = prepare_scalar_project(
+            vec![(derive_scalar_declarations_from_cst(parsed.result.canonical_cst()), Vec::new())],
+            vec![source],
+            ScalarPreparationInputs { target_layout },
+        ).unwrap_or_else(|invalid| panic!("{:?}", invalid.diagnostics));
+        let build = analyze_scalar_build(&prepared);
+        assert!(build.diagnostics().is_empty(), "{:?}", build.diagnostics());
+        let llvm = emit_scalar_build_single_module_llvm(&build).expect("checked assignment LLVM").to_text();
+        let body = llvm.split_once("define void @update(").expect("update function").1
+            .split_once("\n}").expect("update body").0;
+        let selector = "call i64 @select_index(";
+        let rhs = body.find("call i8 @replacement(").expect("replacement");
+        let selector_at = body.find(selector).expect("selector");
+        assert_eq!(body.matches(selector).count(), 1);
+        let check = body.find("icmp uge i64").expect("full-width checked selector");
+        let branch = body.find("br i1 %assignment_index_out_of_bounds").expect("guard branch");
+        let continuation = body.find("\nassignment_index_continue:").expect("valid continuation");
+        let address = body[continuation..].find("getelementptr inbounds").expect("valid destination") + continuation;
+        assert!(rhs < selector_at && selector_at < check && check < branch && branch < continuation && continuation < address, "{body}");
+        assert!(body[..continuation].contains("call void @__wosy_core_system_panic()"), "{body}");
+        assert!(body[address..].contains("@llvm.memmove"), "{body}");
+    }
+}
+
+#[test]
 fn assignment_selector_effects_execute_once_after_rhs_on_both_targets() {
     for (target_layout, pointer_type, text) in [
         (
