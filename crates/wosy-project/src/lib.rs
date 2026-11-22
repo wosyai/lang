@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use toml_edit::{DocumentMut, Item};
@@ -31,18 +32,21 @@ pub struct SourceObservation {
 }
 
 pub fn source_identity(observations: &[SourceObservation]) -> String {
-    observations
-        .iter()
-        .map(|observation| {
-            format!(
-                "{}:{}:{}",
-                observation.source.package,
-                observation.source.path.as_path().display(),
-                observation.content_revision.0
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(",")
+    let mut identity = String::new();
+    for (index, observation) in observations.iter().enumerate() {
+        if index != 0 {
+            identity.push(',');
+        }
+        write!(
+            &mut identity,
+            "{}:{}:{}",
+            observation.source.package,
+            observation.source.path.as_path().display(),
+            observation.content_revision.0
+        )
+        .expect("formatting source identity into a String");
+    }
+    identity
 }
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -1136,6 +1140,24 @@ mod tests {
         assert_eq!(value["comment_categories"][0], "INTENT");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn source_identity_preserves_lossy_path_display() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let path = PathBuf::from(OsString::from_vec(b"src/\xff.w".to_vec()));
+        let observation = SourceObservation {
+            source: SourceIdentity::new(
+                "project".into(),
+                "app".into(),
+                PackageRelativePath::new(path).expect("relative non-UTF path"),
+            ),
+            content_revision: ContentRevision("revision".into()),
+        };
+        assert_eq!(source_identity(&[observation]), "app:src/\u{fffd}.w:revision");
+    }
+
     #[test]
     fn source_identity_preserves_observation_order_and_revisions() {
         let observations = vec![
@@ -1157,6 +1179,11 @@ mod tests {
             },
         ];
 
+        assert_eq!(source_identity(&[]), "");
+        assert_eq!(
+            source_identity(&observations[..1]),
+            "app:src/main.w:main-revision"
+        );
         assert_eq!(
             source_identity(&observations),
             "app:src/main.w:main-revision,app:src/math.w:math-revision"
