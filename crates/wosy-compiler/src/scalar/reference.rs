@@ -270,6 +270,73 @@ impl ReferenceOriginIndex {
     }
 }
 
+struct ReferenceBindingType {
+    ty: ScalarType,
+    // Present only for a local declaration/assignment introduction in a
+    // prepared body eligible for local deferred reborrowing.
+    local_reborrow_scope: Option<ReferenceScopeId>,
+}
+
+#[derive(Default)]
+pub(super) struct ReferenceBindingTypes(HashMap<ReferenceBindingId, ReferenceBindingType>);
+
+impl ReferenceBindingTypes {
+    fn get(&self, binding: &ReferenceBindingId) -> Option<&ScalarType> {
+        self.0.get(binding).map(|entry| &entry.ty)
+    }
+
+    fn contains_key(&self, binding: &ReferenceBindingId) -> bool {
+        self.0.contains_key(binding)
+    }
+
+    fn record(&mut self, binding: ReferenceBindingId, ty: ScalarType, local_reborrow_scope: Option<ReferenceScopeId>) {
+        self.0.insert(binding, ReferenceBindingType { ty, local_reborrow_scope });
+    }
+
+    #[cfg(test)]
+    fn insert(&mut self, binding: ReferenceBindingId, ty: ScalarType) {
+        self.record(binding, ty, None);
+    }
+
+    fn remove(&mut self, binding: &ReferenceBindingId) {
+        self.0.remove(binding);
+    }
+
+    fn is_local_reborrow_owner(
+        &self, binding: &ReferenceBindingId, borrow: ReferenceScopeId, destination: ReferenceScopeId,
+    ) -> bool {
+        borrow == destination && self.0.get(binding).is_some_and(|entry|
+            entry.local_reborrow_scope == Some(borrow) && aggregate::ordinary_value(&entry.ty))
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn prepared_direct_local_reborrow_owner_requires_the_exact_declared_scope() {
+    let source = SourceIdentity::new("project".into(), "package".into(), "metadata".into(), "r1".into());
+    let span = ByteSpan::new(0, 10);
+    let binding = |start| ReferenceBindingId {
+        source: source.clone(), function_span: span, block_span: span,
+        declaration_span: ByteSpan::new(start, start + 1), kind: ReferenceBindingKind::Declared,
+    };
+    let local = binding(1);
+    let same_block_span = binding(2);
+    let formal = binding(3);
+    let mut types = ReferenceBindingTypes::default();
+    let scope = ReferenceScopeId(1);
+    let other_scope = ReferenceScopeId(2);
+    types.record(local.clone(), ScalarType::U64, Some(scope));
+    types.record(same_block_span.clone(), ScalarType::U64, Some(other_scope));
+    types.record(formal.clone(), ScalarType::U64, None);
+    assert_eq!(types.get(&local), Some(&ScalarType::U64));
+    assert!(types.is_local_reborrow_owner(&local, scope, scope));
+    assert!(!types.is_local_reborrow_owner(&local, scope, other_scope));
+    assert!(!types.is_local_reborrow_owner(&same_block_span, scope, scope));
+    assert!(!types.is_local_reborrow_owner(&formal, scope, scope));
+    types.remove(&local);
+    assert!(!types.is_local_reborrow_owner(&local, scope, scope));
+}
+
 pub(super) struct ReferenceFlowBuilder<'a> {
     capture_call_points: bool,
     aggregate_facts: aggregate::AggregateFlowFacts,
@@ -290,7 +357,7 @@ pub(super) struct ReferenceFlowBuilder<'a> {
     pub(super) call_sites: &'a FunctionCallSites,
     pub(super) origins: HashMap<ReferenceBindingId, BTreeSet<ReferenceOriginId>>,
     pub(super) checked: HashSet<ReferenceBindingId>,
-    pub(super) binding_types: HashMap<ReferenceBindingId, ScalarType>,
+    pub(super) binding_types: ReferenceBindingTypes,
     pub(super) structs: &'a [ScalarStruct],
     pub(super) enums: &'a [ScalarEnum],
     pub(super) generic_parameters: BTreeSet<String>,
@@ -382,7 +449,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
             call_sites,
             origins: HashMap::new(),
             checked: HashSet::new(),
-            binding_types: HashMap::new(),
+            binding_types: ReferenceBindingTypes::default(),
             structs,
             enums,
             generic_parameters: call_sites
@@ -3218,7 +3285,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 kind: ReferenceBindingKind::Declared,
             };
             let previous = self.names.insert(receiver.name.clone(), id.clone());
-            self.binding_types.insert(id.clone(), receiver.ty.clone());
+            self.binding_types.record(id.clone(), receiver.ty.clone(), self.deferred_local_reborrow.then_some(scope));
             declared.push((receiver.name.clone(), id.clone(), previous));
             if matches!(receiver.ty, ScalarType::CheckedReference { .. }) {
                 self.checked.insert(id.clone());
@@ -3305,11 +3372,10 @@ impl<'a> ReferenceFlowBuilder<'a> {
         let CfgPointKind::Borrow { place, loan } = &source.kind else { return None };
         let owner = &place.binding;
         if loan.parent.is_some() || loan.mode != ScalarReferenceMutability::Mutable
-            || !self.binding_types.get(owner).is_some_and(aggregate::ordinary_value)
-            || self.call_sites.boundary.parameters.iter().any(|formal| formal.span == owner.declaration_span)
+            || !self.binding_types.is_local_reborrow_owner(owner, source.scope, self.cfg.points[bind.0].scope)
             || !place.projections.is_empty()
             || !matches!(&place.place, ScalarPlace::Name { name, .. } if self.names.get(name) == Some(owner))
-            || owner.block_span != binding.block_span || source.scope != self.cfg.points[bind.0].scope
+            || !matches!(&self.cfg.points[bind.0].kind, CfgPointKind::Bind { binding: actual } if actual == binding)
             || !matches!(self.cfg.facts.get(origin.0), Some(ReferenceOrigin::Fresh { loan: fact, .. }) if fact == loan)
         {
             return None;
@@ -3686,7 +3752,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         block_span: block.span,
                         kind: ReferenceBindingKind::Declared,
                     };
-                    self.binding_types.insert(id.clone(), receiver.ty.clone());
+                    self.binding_types.record(id.clone(), receiver.ty.clone(), self.deferred_local_reborrow.then_some(scope));
                     if binding.is_allocation {
                         self.cfg.allocations.insert(id.clone());
                     }
@@ -3895,6 +3961,8 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     {
                         let existing_prepared = matches!(&destination, ReferenceAssignmentDestination::PreparedName(DirectDestinationIdentity::Existing(_)));
                         simple_destinations &= existing_prepared;
+                        let prepared_local_introduction = matches!(&destination,
+                            ReferenceAssignmentDestination::PreparedName(DirectDestinationIdentity::Introduce { .. }));
                         let position = slot.position;
                         let target = &assignment.targets[position];
                         if matches!(&destination,
@@ -3965,7 +4033,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                                         ReferenceAnalysisErrorReason::MissingResolvedBinding,
                                     )
                                 })?;
-                                self.binding_types.insert(id.clone(), ty.clone());
+                                self.binding_types.record(id.clone(), ty.clone(), (prepared_local_introduction && self.deferred_local_reborrow).then_some(scope));
                                 declared.push((name.to_owned(), id.clone(), None));
                             }
                             let target_place =
@@ -10974,7 +11042,7 @@ fn build_function_reference_cfg(
         }
         builder
             .binding_types
-            .insert(builder.names[name].clone(), ty.clone());
+            .record(builder.names[name].clone(), ty.clone(), None);
         if slot.ordinal == 0 && matches!(&call_sites.named_place_roots, NamedPlaceRootFacts::Prepared(_))
             && matches!(&function.signature, ScalarType::Callable { parameters, outputs }
             if aggregate::array_roundtrip_signature(parameters, outputs))
