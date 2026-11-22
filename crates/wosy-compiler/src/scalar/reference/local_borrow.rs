@@ -162,7 +162,10 @@ impl Author {
     }
 
     pub(super) fn seal(self, points: &[ReferenceFlowPoint]) -> Option<Box<Sealed>> {
-        let fork = self.fork?;
+        let fork = self.fork;
+        if fork.is_none() && (self.branch.is_some() || self.join.is_some()) {
+            return None;
+        }
         let exit = self.root_exit?;
         if self.pending_loan.is_some() || self.pending_exit.is_some() || exit != points.last()?.id {
             return None;
@@ -174,8 +177,8 @@ impl Author {
             // An install generates its owner on its actual arm; the next
             // reachable install or the root exit retires that holder's version.
             let mut live = Vec::new();
-            for route in [Route::Then, Route::Bypass] {
-                holder.leases(&fork, route, exit, |install, end, last_read| {
+            for &route in Route::feasible(fork.as_ref()) {
+                holder.leases(fork.as_ref(), route, exit, |install, end, last_read| {
                     let start = CfgPointId(install.version.0 + 1);
                     if start < end {
                         owners[install.loan.owner].active[usize::from(install.loan.mutable)].push(Interval { start, end });
@@ -223,14 +226,18 @@ impl Fork {
 }
 
 impl Route {
-    fn reaches(self, fork: &Fork, point: CfgPointId) -> bool {
-        matches!(self, Self::Then) || !fork.takes_then_at(point)
+    fn feasible(fork: Option<&Fork>) -> &'static [Self] {
+        if fork.is_some() { &[Self::Then, Self::Bypass] } else { &[Self::Then] }
+    }
+
+    fn reaches(self, fork: Option<&Fork>, point: CfgPointId) -> bool {
+        matches!(self, Self::Then) || fork.is_none_or(|fork| !fork.takes_then_at(point))
     }
 }
 
 impl Holder {
     fn leases(
-        &self, fork: &Fork, route: Route, exit: CfgPointId,
+        &self, fork: Option<&Fork>, route: Route, exit: CfgPointId,
         mut visit: impl FnMut(&Install, CfgPointId, Option<CfgPointId>),
     ) {
         let mut writes = self.writes.iter().filter(|write| route.reaches(fork, write.version)).peekable();
@@ -293,14 +300,14 @@ struct CarrierRefinement {
 }
 
 impl CarrierRefinement {
-    fn at(&self, point: CfgPointId, inside_then: bool, post_join: bool, mode: AccessMode) -> Option<Option<CfgPointId>> {
+    fn at(&self, point: CfgPointId, sole_route: bool, post_join: bool, mode: AccessMode) -> Option<Option<CfgPointId>> {
         fn at_path(facts: &[ReachingLoan], point: CfgPointId, mode: AccessMode) -> Option<CfgPointId> {
             let end = facts.partition_point(|fact| fact.interval.start <= point);
             let fact = end.checked_sub(1).and_then(|index| facts.get(index))?;
             (point < fact.interval.end && mode.accepts(fact.mutable)).then_some(fact.issue)
         }
         let then = at_path(&self.then, point, mode);
-        if inside_then {
+        if sole_route {
             return Some(then);
         }
         let bypass = at_path(&self.bypass, point, mode);
@@ -334,7 +341,7 @@ impl AccessMode {
 
 pub(crate) struct Sealed {
     exit: CfgPointId,
-    fork: Fork,
+    fork: Option<Fork>,
     holders: Vec<LiveHolder>,
     owner_index: HashMap<ReferenceBindingId, usize>,
     owners: Vec<Owner>,
@@ -347,8 +354,8 @@ impl Sealed {
             return false;
         }
         let next = CfgPointId(index + 1);
-        if point.id == self.fork.branch {
-            point.successors.as_slice() == [next, self.fork.join]
+        if let Some(fork) = self.fork.as_ref().filter(|fork| point.id == fork.branch) {
+            point.successors.as_slice() == [next, fork.join]
         } else if point.id == self.exit {
             point.successors.is_empty()
         } else {
@@ -361,7 +368,7 @@ impl Sealed {
         points: &[ReferenceFlowPoint],
         mode: AccessMode,
     ) -> Option<Vec<SourceSpan>> {
-        let post_join = access > self.fork.join;
+        let post_join = self.fork.as_ref().is_some_and(|fork| access > fork.join);
         if incoming_count != 1 && !post_join {
             #[cfg(test)]
             tests::observe(3);
@@ -386,7 +393,7 @@ impl Sealed {
         }
         #[cfg(test)]
         tests::observe(if borrow { 6 } else { 1 });
-        let inside_then = self.fork.takes_then_at(access);
+        let sole_route = self.fork.as_ref().is_none_or(|fork| fork.takes_then_at(access));
         let mut conflicts = Vec::new();
         // Carrier indices were assigned by the authored BTreeMap in binding order.
         for holder in carriers {
@@ -395,8 +402,8 @@ impl Sealed {
                 #[cfg(test)]
                 tests::observe(2);
                 let mut by_owner = BTreeMap::<usize, CarrierRefinement>::new();
-                for route in [Route::Then, Route::Bypass] {
-                    entry.holder.leases(&self.fork, route, self.exit, |install, _, last_read| {
+                for &route in Route::feasible(self.fork.as_ref()) {
+                    entry.holder.leases(self.fork.as_ref(), route, self.exit, |install, _, last_read| {
                         let start = CfgPointId(install.version.0 + 1);
                         let Some(end) = last_read.filter(|&last| start < last) else { return };
                         let carrier = by_owner.entry(install.loan.owner).or_default();
@@ -412,7 +419,7 @@ impl Sealed {
                 by_owner
             });
             let Some(carrier) = precise.get(&owner_index) else { continue };
-            let Some(issue) = carrier.at(access, inside_then, post_join, mode) else {
+            let Some(issue) = carrier.at(access, sole_route, post_join, mode) else {
                 #[cfg(test)]
                 tests::observe(3);
                 return None;
@@ -517,20 +524,32 @@ pub(super) mod tests {
         builder.record_binding_definition(BlockPosition { block: BlockOrdinal(0), item }, 0, false, Some(initializer));
     }
 
-    fn inert_result(prepared_existing: bool, divergent: bool, borrow_matrix: bool) -> FunctionReferenceResult {
+    fn inert_result(prepared_existing: bool, divergent: bool, borrow_matrix: bool, linear: bool) -> FunctionReferenceResult {
         let source = SourceIdentity::new("project".into(), "package".into(), "metadata".into(), "r1".into());
         let at = |start| ByteSpan::new(start, start + 1);
         let span = ByteSpan::new(0, 100);
         let function = function(span);
-        let calls = prepared();
-        let names = HashSet::new();
-        let mut builder = ReferenceFlowBuilder::new(&source, &function, &names, &calls, &[], &[]);
-        assert!(builder.local_borrow.is_some());
+        let mut calls = prepared();
         let binding = |start| ReferenceBindingId {
             source: source.clone(), function_span: span, block_span: span,
             declaration_span: at(start), kind: ReferenceBindingKind::Declared,
         };
         let (x, y, h1, h2, h3, z, h4) = (binding(20), binding(21), binding(22), binding(23), binding(24), binding(25), binding(26));
+        if linear {
+            calls.conditionals.clear();
+            let NamedPlaceRootFacts::Prepared(roots) = &mut calls.named_place_roots else { unreachable!() };
+            for (occurrence, owner) in [(1, &x), (3, &y), (5, &x), (15, &y), (34, &z)] {
+                roots.insert(OccurrenceOrdinal(occurrence), NamedPlaceRootIdentity::Lexical(owner.clone()));
+            }
+            if borrow_matrix {
+                for occurrence in 40..=44 {
+                    roots.insert(OccurrenceOrdinal(occurrence), NamedPlaceRootIdentity::Lexical(z.clone()));
+                }
+            }
+        }
+        let names = HashSet::new();
+        let mut builder = ReferenceFlowBuilder::new(&source, &function, &names, &calls, &[], &[]);
+        assert!(builder.local_borrow.is_some());
         let root = ReferenceScopeId(0);
         let arm = ReferenceScopeId(1);
         for owner in [&x, &y, &z] {
@@ -589,30 +608,38 @@ pub(super) mod tests {
         }
         let (unread, unread_origins) = loan(&mut builder, &z, at(34));
         bind(&mut builder, &h4, 3, unread, unread_origins);
-        let branch = builder.point(CfgPointKind::Branch { condition: ScalarExpression::Boolean { value: true, span: at(6) } }, at(6), root, BTreeSet::new());
-        builder.point(CfgPointKind::ScopeEnter, at(7), arm, BTreeSet::new());
-        builder.point(CfgPointKind::Read { binding: x.clone() }, at(8), arm, BTreeSet::new());
-        for index in [9, 10] {
-            builder.point(CfgPointKind::Read { binding: y.clone() }, at(index), arm, BTreeSet::new());
-        }
-        let divergent_origins = if divergent {
-            let (rhs, origins) = loan(&mut builder, &x, at(30));
-            let target = builder.reference_place(
-                &ScalarPlace::Name { name: "h1".into(), span: at(31) }, h1.clone(), None,
+        let divergent_origins;
+        if linear {
+            assert!(!divergent);
+            divergent_origins = None;
+            builder.point(CfgPointKind::Read { binding: x.clone() }, at(8), root, BTreeSet::new());
+            builder.point(CfgPointKind::Read { binding: y.clone() }, at(9), root, BTreeSet::new());
+        } else {
+            let branch = builder.point(CfgPointKind::Branch { condition: ScalarExpression::Boolean { value: true, span: at(6) } }, at(6), root, BTreeSet::new());
+            builder.point(CfgPointKind::ScopeEnter, at(7), arm, BTreeSet::new());
+            builder.point(CfgPointKind::Read { binding: x.clone() }, at(8), arm, BTreeSet::new());
+            for index in [9, 10] {
+                builder.point(CfgPointKind::Read { binding: y.clone() }, at(index), arm, BTreeSet::new());
+            }
+            divergent_origins = if divergent {
+                let (rhs, origins) = loan(&mut builder, &x, at(30));
+                let target = builder.reference_place(
+                    &ScalarPlace::Name { name: "h1".into(), span: at(31) }, h1.clone(), None,
+                );
+                let emitted = builder.emit_direct_assignment(h1.clone(), CfgPointKind::Assign {
+                    target, rhs_point: rhs, previous_origins: BTreeSet::new(), previous_loans: vec![],
+                }, rhs, ReferenceValue::Checked(origins.clone()), at(31), arm).expect("typed branch assignment");
+                builder.author_direct_assignment(emitted, prepared_existing);
+                Some(origins)
+            } else { None };
+            let then_end = builder.point(CfgPointKind::ScopeExit, at(11), arm, BTreeSet::new());
+            builder.author_local_scope_exit(then_end, &super::super::super::control::ScopeExitBindings::default(), true);
+            builder.cursor = None;
+            let join = builder.point(CfgPointKind::Join, at(12), root, BTreeSet::new());
+            builder.connect_reference_conditional(
+                &ReferenceConditionalEdges { branch, terminals: [then_end, branch], join }, &calls.conditionals[&OccurrenceOrdinal(0)],
             );
-            let emitted = builder.emit_direct_assignment(h1.clone(), CfgPointKind::Assign {
-                target, rhs_point: rhs, previous_origins: BTreeSet::new(), previous_loans: vec![],
-            }, rhs, ReferenceValue::Checked(origins.clone()), at(31), arm).expect("typed branch assignment");
-            builder.author_direct_assignment(emitted, prepared_existing);
-            Some(origins)
-        } else { None };
-        let then_end = builder.point(CfgPointKind::ScopeExit, at(11), arm, BTreeSet::new());
-        builder.author_local_scope_exit(then_end, &super::super::super::control::ScopeExitBindings::default(), true);
-        builder.cursor = None;
-        let join = builder.point(CfgPointKind::Join, at(12), root, BTreeSet::new());
-        builder.connect_reference_conditional(
-            &ReferenceConditionalEdges { branch, terminals: [then_end, branch], join }, &calls.conditionals[&OccurrenceOrdinal(0)],
-        );
+        }
         builder.point(CfgPointKind::Read { binding: z.clone() }, at(35), root, BTreeSet::new());
         builder.point(CfgPointKind::Read { binding: y.clone() }, at(13), root, BTreeSet::new());
         if let Some(origins) = divergent_origins {
@@ -650,7 +677,7 @@ pub(super) mod tests {
 
     #[test]
     fn production_builder_and_pristine_replay_replace_only_complete_local_read_verdicts() {
-        let mut admitted = inert_result(true, false, false);
+        let mut admitted = inert_result(true, false, false, false);
         assert!(admitted.proof_points.local_borrow.is_some());
         COUNTS.with(|counts| counts.set([0; 7]));
         let staged = definitive(&mut admitted);
@@ -659,7 +686,7 @@ pub(super) mod tests {
         let again = definitive(&mut admitted);
         assert_eq!(staged, again);
         assert_eq!(COUNTS.with(|counts| counts.get()[2]), 2);
-        let mut unprepared = inert_result(false, false, false);
+        let mut unprepared = inert_result(false, false, false, false);
         assert!(unprepared.proof_points.local_borrow.is_none());
         COUNTS.with(|counts| counts.set([0; 7]));
         let incumbent = definitive(&mut unprepared);
@@ -686,12 +713,12 @@ pub(super) mod tests {
             }).collect()
         }
         for divergent in [false, true] {
-            let mut admitted = inert_result(true, divergent, false);
+            let mut admitted = inert_result(true, divergent, false, false);
             assert!(admitted.proof_points.local_borrow.is_some());
             COUNTS.with(|counts| counts.set([0; 7]));
             let staged = definitive(&mut admitted);
             let counts = COUNTS.with(|counts| counts.get());
-            let mut incumbent = inert_result(false, divergent, false);
+            let mut incumbent = inert_result(false, divergent, false, false);
             assert_eq!(staged, definitive(&mut incumbent));
             assert_eq!(at(&staged, 13), vec![vec![ByteSpan::new(3, 4), ByteSpan::new(15, 16)]]);
             assert_eq!(counts[4], if divergent { 2 } else { 0 });
@@ -709,8 +736,8 @@ pub(super) mod tests {
 
     #[test]
     fn production_borrow_modes_use_only_conflicting_live_incoming_loans() {
-        let mut admitted = inert_result(true, false, true);
-        let mut incumbent = inert_result(false, false, true);
+        let mut admitted = inert_result(true, false, true, false);
+        let mut incumbent = inert_result(false, false, true, false);
         assert!(admitted.proof_points.local_borrow.is_some());
         COUNTS.with(|counts| counts.set([0; 7]));
         let errors = definitive(&mut admitted);
@@ -728,6 +755,46 @@ pub(super) mod tests {
         assert_eq!(spans_at(43), Some(vec![ByteSpan::new(42, 43)]));
         // Its earlier read is irrelevant once the next install retires that version.
         assert_eq!(spans_at(44), Some(vec![ByteSpan::new(40, 41), ByteSpan::new(41, 42), ByteSpan::new(43, 44)]));
+    }
+
+    #[test]
+    fn production_straight_line_flow_seals_one_route_and_keeps_reference_diagnostics() {
+        let mut admitted = inert_result(true, false, true, true);
+        let mut incumbent = inert_result(false, false, true, true);
+        let sealed = admitted.proof_points.local_borrow.as_ref().expect("complete linear proof");
+        assert!(sealed.fork.is_none());
+        assert!(incumbent.proof_points.local_borrow.is_none());
+        COUNTS.with(|counts| counts.set([0; 7]));
+        let staged = definitive(&mut admitted);
+        let counts = COUNTS.with(|counts| counts.get());
+        assert_eq!(staged, definitive(&mut incumbent));
+        assert_eq!(&counts[..2], &[2, 3]);
+        assert_eq!(counts[3], 0);
+        assert!(counts[5] > 0 && counts[6] > 0);
+        assert!(staged.iter().any(|error| matches!(error,
+            ReferenceAnalysisError::ConflictingPlace { source_span, .. }
+                if source_span.range == ByteSpan::new(9, 10))));
+        assert!(!staged.iter().any(|error| matches!(error,
+            ReferenceAnalysisError::ConflictingPlace { source_span, .. }
+                if source_span.range == ByteSpan::new(8, 9))));
+    }
+
+    #[test]
+    fn production_straight_line_without_named_places_skips_authoring() {
+        let source = SourceIdentity::new("project".into(), "package".into(), "metadata".into(), "r1".into());
+        let span = ByteSpan::new(0, 100);
+        let function = function(span);
+        let mut calls = prepared();
+        calls.conditionals.clear();
+        let names = HashSet::new();
+        let mut builder = ReferenceFlowBuilder::new(&source, &function, &names, &calls, &[], &[]);
+        assert!(builder.local_borrow.is_none());
+        builder.point(CfgPointKind::Entry, span, ReferenceScopeId(0), BTreeSet::new());
+        builder.point(CfgPointKind::ScopeEnter, span, ReferenceScopeId(0), BTreeSet::new());
+        let exit = builder.point(CfgPointKind::ScopeExit, span, ReferenceScopeId(0), BTreeSet::new());
+        builder.author_local_scope_exit(exit, &super::super::super::control::ScopeExitBindings::default(), true);
+        builder.seal_local_borrow();
+        assert!(builder.proof_points.local_borrow.is_none());
     }
 
 }

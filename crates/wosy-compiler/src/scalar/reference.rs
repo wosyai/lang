@@ -471,9 +471,11 @@ impl<'a> ReferenceFlowBuilder<'a> {
     ) -> Self {
         Self {
             capture_call_points: false,
-            local_borrow: (matches!(call_sites.named_place_roots, NamedPlaceRootFacts::Prepared(_))
-                && call_sites.conditionals.len() == 1
-                && matches!(call_sites.conditionals.values().next(), Some(ConditionalRegion::Unit { .. }))
+            local_borrow: (matches!(&call_sites.named_place_roots, NamedPlaceRootFacts::Prepared(roots)
+                if if call_sites.conditionals.is_empty() { !roots.is_empty() } else {
+                    call_sites.conditionals.len() == 1
+                        && matches!(call_sites.conditionals.values().next(), Some(ConditionalRegion::Unit { .. }))
+                })
                 && call_sites.boundary.root_outputs.is_empty()
                 && call_sites.boundary.parameters.iter().all(|parameter| aggregate::ordinary_value(&parameter.ty))
                 && function.generic_parameters.is_empty() && call_sites.call_occurrences.is_empty()
