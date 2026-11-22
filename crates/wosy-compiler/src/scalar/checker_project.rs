@@ -410,7 +410,7 @@ fn check_package_roots_with_policy<const COLLECT: bool>(
                 continue;
             }
             had_obligations |= check_unused_module::<COLLECT>(
-                project, calls, module, ordinal, &reached, seeds, failures.as_deref_mut(),
+                project, calls, module, ordinal, &reached, seeds, failures.as_deref_mut(), Some(&visits),
             )?;
         }
     }
@@ -418,7 +418,7 @@ fn check_package_roots_with_policy<const COLLECT: bool>(
         let ordinal = startup_count + index;
         if let Some(seeds) = authored_roots.remove(&ordinal) {
             had_obligations |= check_unused_module::<COLLECT>(
-                project, calls, module, ordinal, &reached, seeds, failures.as_deref_mut(),
+                project, calls, module, ordinal, &reached, seeds, failures.as_deref_mut(), None,
             )?;
         }
     }
@@ -477,6 +477,7 @@ fn check_unused_module<const COLLECT: bool>(
     reached: &HashSet<(usize, usize)>,
     authored_roots: Vec<usize>,
     mut failures: Option<&mut Vec<ProjectCheck>>,
+    completed_visits: Option<&[InitializationVisit]>,
 ) -> Result<bool, ProjectCheck> {
     let symbolic_roots = symbolic_obligation_roots(calls, module, ordinal, authored_roots)?;
     let mut active = false;
@@ -517,7 +518,7 @@ fn check_unused_module<const COLLECT: bool>(
             };
             if COLLECT {
                 let sink = RefCell::new(failures.as_deref_mut().ok_or(ProjectCheck::Unsupported)?);
-                let collection = OrderedCallCollection { failures: &sink, visits: None };
+                let collection = OrderedCallCollection { failures: &sink, visits: completed_visits };
                 symbolic.collect_requirements(body, &module.source, IntegerRequirementEntry::Arbitrary, collection)?;
                 active |= symbolic.had_obligations;
             } else {
@@ -998,7 +999,9 @@ impl<Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> CheckedCalls<'
     ) -> Result<ActualCallResult, ProjectCheck> {
         let &(target_module, target_item) = structure.checker_direct_targets.get(&call)
             .ok_or(ProjectCheck::MissingRootOccurrences)?;
-        if !ACTUAL_STARTUP && (*expected != ScalarType::Unit || target_module != self.symbolic_module) {
+        if !ACTUAL_STARTUP && (*expected != ScalarType::Unit
+            || (collection.is_none() && target_module != self.symbolic_module))
+        {
             return Err(ProjectCheck::Unsupported);
         }
         let owner = self.project.modules.get(target_module).ok_or(ProjectCheck::MissingRoot)?;
@@ -1014,7 +1017,7 @@ impl<Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> CheckedCalls<'
         let body = self.calls.function_body(target_module, target_item, None).ok_or(ProjectCheck::MissingRootOccurrences)?;
         let collection = if let Some((caller_source, collection)) = collection {
             if caller_source != &owner.source
-                && (!ACTUAL_STARTUP || *expected != ScalarType::Unit
+                && (*expected != ScalarType::Unit || matches!(&projected, ActualProjectedArguments::SymbolicAxis(..))
                     || caller_source.project != owner.source.project || caller_source.package != owner.source.package
                     || collection.visits.and_then(|visits| visits.get(target_module)) != Some(&InitializationVisit::Completed))
             {
@@ -3528,6 +3531,79 @@ mod tests {
         assert_eq!(collect_ordered_package_failures(&prepared, ScalarCheckerScope::CurrentPackage, 1),
             Err(ProjectCheck::Unsupported));
         assert_eq!(collect_ordered_package_failures(&prepared, ScalarCheckerScope::MainFlowOnly, 1),
+            Ok((true, Vec::new())));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordered_package_symbolic_exact_calls_use_completed_namespaces_without_marking_actual() {
+        let app = source("src/main.w", "collect-symbolic-namespace-root");
+        let child = source("src/child.w", "collect-symbolic-namespace-child");
+        let prepare = |startup: &str, guard: &str| {
+            let root_text = format!(r#"%%start
+                lib = namespace demo "src/child.w";
+                unit(u8) wrapper = fn(value) {{
+                    core.require(value < 3, {OUTPUT});
+                    {guard}
+                    lib.leaf(value);
+                    core.require(value != 3, {OUTPUT});
+                }};
+                {startup}
+            %%end"#);
+            let child_text = format!(r#"%%start
+                core.require(true, {OUTPUT});
+                unit(u8) leaf = fn(value) {{ core.require(value < 2, {OUTPUT}); }};
+            %%end"#);
+            let start = root_text.find("lib =").unwrap();
+            let end = start + root_text[start..].find(';').unwrap() + 1;
+            let prepared = prepare_checker_project(
+                vec![
+                    (declarations(&app, &root_text), vec![ScalarNamespaceBinding {
+                        binding: "lib".into(), target: child.clone(), span: ByteSpan::new(start as u32, end as u32),
+                    }]),
+                    (declarations(&child, &child_text), Vec::new()),
+                ],
+                vec![app.clone(), child.clone()],
+                inputs(),
+            ).unwrap();
+            (prepared, root_text, child_text)
+        };
+        let read = |prepared: &PreparedCheckerProject, root_text: &str, child_text: &str| {
+            let (active, reports) = collect_ordered_package_failures(prepared, ScalarCheckerScope::CurrentPackage, 2)
+                .expect("project with completed same-package namespace");
+            assert!(active);
+            reports.iter().map(|report| {
+                let ProjectCheck::Failed { source, condition, axes, state, .. } = report else { panic!("expected authored report"); };
+                assert_eq!(axes.len(), 1);
+                assert_eq!(&axes[0].0.source, source);
+                let mut values = state.intervals_at(0, 0).unwrap();
+                let (lo, hi) = values.next().unwrap();
+                assert!(values.next().is_none());
+                let from_root = source == &app;
+                assert!(from_root || source == &child);
+                let text = if from_root { root_text } else { child_text };
+                (from_root, text[condition.start as usize..condition.end as usize].to_owned(), lo.clone(), hi.clone())
+            }).collect::<Vec<_>>()
+        };
+        let keep = format!("core.narrow(value == 3, {OUTPUT});");
+        let expected = |from_root, text: &str, lo, hi| (from_root, text.to_owned(), BigInt::from(lo), BigInt::from(hi));
+        let (prepared, root, lib) = prepare("", &keep);
+        assert_eq!(read(&prepared, &root, &lib), [
+            expected(true, "value < 3", 3, 255),
+            expected(false, "value < 2", 3, 3),
+            expected(true, "value != 3", 3, 3),
+            expected(false, "value < 2", 2, 255),
+        ]);
+        let (prepared, root, lib) = prepare("lib.leaf(1);", &keep);
+        assert_eq!(read(&prepared, &root, &lib), [
+            expected(true, "value < 3", 3, 255),
+            expected(false, "value < 2", 3, 3),
+            expected(true, "value != 3", 3, 3),
+        ]);
+        let (prepared, _, _) = prepare("lib.leaf(1);", "");
+        assert_eq!(collect_ordered_package_failures(&prepared, ScalarCheckerScope::CurrentPackage, 2),
+            Err(ProjectCheck::Unsupported));
+        assert_eq!(collect_ordered_package_failures(&prepared, ScalarCheckerScope::MainFlowOnly, 2),
             Ok((true, Vec::new())));
     }
 
