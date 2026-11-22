@@ -1,3 +1,4 @@
+use std::ffi::OsStr;
 use std::io::{self, Write};
 use std::path::Path;
 use std::process::ExitCode;
@@ -6,15 +7,15 @@ use wosy_compiler::{
     check_loaded_scalar_ordered_local_proof_contexts, MainFlowProofReceipt, ScalarOrderedCheckerOutcome,
     ScalarCheckerScope, ScalarPreparationInputs, ScalarTargetLayout,
 };
-use wosy_project::{ProjectConfiguration, ProjectContext};
+use wosy_project::{PackageRelativePath, ProjectConfiguration, ProjectContext};
 
 #[allow(dead_code)]
 #[path = "../src/canonical_loader.rs"]
 mod canonical_loader;
-use canonical_loader::{load_canonical_project_inputs, CanonicalLoadPurpose};
+use canonical_loader::{load_canonical_project_inputs, load_explicit_dormant_proof_sources, CanonicalLoadPurpose};
 
 fn inspect(
-    root: &Path, target: &str, profile: &str, scope: ScalarCheckerScope,
+    root: &Path, target: &str, profile: &str, scope: ScalarCheckerScope, dormant_paths: Vec<&OsStr>,
 ) -> Result<MainFlowProofReceipt, &'static str> {
     let root = root.canonicalize().map_err(|_| "invalid project root")?;
     let (configuration, manifest) =
@@ -30,9 +31,17 @@ fn inspect(
     let loaded = load_canonical_project_inputs(
         &root, &project, &configuration, CanonicalLoadPurpose::LocalProofs, || {},
     ).map_err(|_| "canonical source load failed")?;
+    let dormant = if scope == ScalarCheckerScope::CurrentPackage {
+        let paths = dormant_paths.into_iter().map(|path| PackageRelativePath::new(path.into()))
+            .collect::<Result<Vec<_>, _>>().map_err(|_| "invalid dormant source path")?;
+        load_explicit_dormant_proof_sources(&root, &project, &configuration, paths, &loaded.texts)
+            .map_err(|_| "explicit dormant source load failed")?
+    } else {
+        Vec::new()
+    };
     check_loaded_scalar_ordered_local_proof_contexts(
         loaded.declarations, loaded.proofs.into_values(), loaded.initialization_order, ScalarPreparationInputs { target_layout },
-        scope, Vec::new(),
+        scope, dormant,
     ).map_err(|outcome| match outcome {
         ScalarOrderedCheckerOutcome::Invalid(_) => "checker rejected invalid input",
         _ => "checker did not complete analysis",
@@ -57,20 +66,32 @@ fn render(report: &MainFlowProofReceipt) -> String {
 
 fn main() -> ExitCode {
     let args = std::env::args_os().skip(1).collect::<Vec<_>>();
-    let (root, target, profile, scope) = match args.as_slice() {
-        [root, target, profile] => (root, target, profile, ScalarCheckerScope::CurrentPackage),
-        [root, target, profile, option] if option == "--main-flow-only" =>
-            (root, target, profile, ScalarCheckerScope::MainFlowOnly),
-        _ => {
-            eprintln!("expected explicit PROJECT_ROOT TARGET PROFILE [--main-flow-only]");
-            return ExitCode::from(2);
-        }
+    let [root, target, profile, options @ ..] = args.as_slice() else {
+        eprintln!("expected explicit PROJECT_ROOT TARGET PROFILE [--main-flow-only] [--dormant PATH]...");
+        return ExitCode::from(2);
     };
     let (Some(target), Some(profile)) = (target.to_str(), profile.to_str()) else {
         eprintln!("invalid target or profile");
         return ExitCode::from(2);
     };
-    let report = match inspect(Path::new(root), target, profile, scope) {
+    let mut scope = ScalarCheckerScope::CurrentPackage;
+    let mut dormant_paths = Vec::new();
+    let mut options = options.iter();
+    while let Some(option) = options.next() {
+        if option == "--main-flow-only" && scope == ScalarCheckerScope::CurrentPackage {
+            scope = ScalarCheckerScope::MainFlowOnly;
+        } else if option == "--dormant" {
+            let Some(path) = options.next() else {
+                eprintln!("expected path after --dormant");
+                return ExitCode::from(2);
+            };
+            dormant_paths.push(path.as_os_str());
+        } else {
+            eprintln!("invalid inspector option");
+            return ExitCode::from(2);
+        }
+    }
+    let report = match inspect(Path::new(root), target, profile, scope, dormant_paths) {
         Ok(report) => report,
         Err(reason) => {
             eprintln!("ordered check: incomplete: {reason}");

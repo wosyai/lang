@@ -110,6 +110,81 @@ pub(crate) fn parse_canonical_ordinary_source(
     Ok((output.result.text, declarations))
 }
 
+#[cfg(feature = "internal-checker")]
+pub(crate) struct DormantSourceBoundaries<'a> {
+    root: &'a std::path::Path,
+    project: &'a ProjectContext,
+    dependency_prefixes: Vec<&'a std::path::Path>,
+}
+
+#[cfg(feature = "internal-checker")]
+impl<'a> DormantSourceBoundaries<'a> {
+    pub(crate) fn new(
+        root: &'a std::path::Path, project: &'a ProjectContext, configuration: &'a ProjectConfiguration,
+    ) -> Self {
+        let dependency_prefixes = configuration.resolved_packages.values()
+            .filter_map(|dependency| dependency.project_root.strip_prefix(root).ok())
+            .collect();
+        Self { root, project, dependency_prefixes }
+    }
+
+    pub(crate) fn validate(&self, identity: &ProjectSourceIdentity) -> Result<(), CanonicalLoadFailure> {
+        use std::path::Component;
+        let relative = identity.path.as_path();
+        let spelling = relative.to_str().ok_or_else(|| "dormant source path must be UTF-8".to_owned())?;
+        if spelling.is_empty() || spelling.contains('\\')
+            || !relative.components().all(|component| matches!(component, Component::Normal(_)))
+            || relative.components().collect::<std::path::PathBuf>().as_os_str() != relative.as_os_str()
+        {
+            return Err(format!("dormant source path is not canonical: {spelling}").into());
+        }
+        if identity.project != self.root.to_string_lossy() || identity.package != self.project.package
+            || relative.starts_with("deps")
+            || self.dependency_prefixes.iter().any(|prefix| relative.starts_with(prefix))
+        {
+            return Err(format!("dormant source is outside the current package: {spelling}").into());
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "internal-checker")]
+#[allow(dead_code)]
+pub(crate) fn load_explicit_dormant_proof_sources(
+    root: &std::path::Path, project: &ProjectContext, configuration: &ProjectConfiguration,
+    paths: Vec<PackageRelativePath>, texts: &BTreeMap<ProjectSourceIdentity, String>,
+) -> Result<Vec<wosy_compiler::ScalarProofDeclarations>, CanonicalLoadFailure> {
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    let boundaries = DormantSourceBoundaries::new(root, project, configuration);
+    let identities = paths.into_iter().map(|path| {
+        ProjectSourceIdentity::new(root.to_string_lossy().into_owned(), project.package.clone(), path)
+    }).collect::<Vec<_>>();
+    let mut selected = HashSet::with_capacity(identities.len());
+    for identity in &identities {
+        boundaries.validate(identity)?;
+        if texts.contains_key(identity) || !selected.insert(identity) {
+            return Err(format!("dormant source was already selected: {}", identity.path.as_path().display()).into());
+        }
+    }
+    identities.into_iter().map(|identity| {
+        let path = root.join(identity.path.as_path());
+        let resolved = path.canonicalize().map_err(|error|
+            format!("failed to resolve dormant source {}: {error}", identity.path.as_path().display())
+        )?;
+        if resolved != path || !resolved.is_file() {
+            return Err(format!("dormant source must be a regular non-aliased file: {}", identity.path.as_path().display()).into());
+        }
+        let text = fs::read_to_string(&resolved).map_err(|error|
+            format!("failed to read dormant source {}: {error}", identity.path.as_path().display())
+        )?;
+        let source = canonical_source_identity(identity.project, &identity.package, &identity.path, &text);
+        wosy_compiler::parse_proof_source(source, text, &project.comment_categories)
+            .map(|(_, proof)| proof).map_err(canonical_syntax_failure)
+    }).collect()
+}
+
 pub(crate) fn load_canonical_project_inputs(
     root: &std::path::Path,
     project: &ProjectContext,

@@ -176,5 +176,40 @@ def main():
         assert sorted(entry.name for entry in root.iterdir()) == ["lib.w", "main.w", "wosy.toml"]
 
 
+        source.write_text("%%start i8 startup = 1; %%end", encoding="utf-8")
+        module.write_text("""%%start
+            core.require(false, { .stdout = "must not emit"; .stderr = ""; .code = 71; .files = []; });
+            i8(i8) unused = fn(value) { value };
+            proof uncovered for unused(entry) -> (out) ensures (out != 7) {}
+        %%end""", encoding="utf-8")
+        dormant_command = [*command, "--dormant", "lib.w"]
+        dormant = subprocess.run(dormant_command, cwd=root, capture_output=True, timeout=15)
+        expected_dormant = expected_pass.replace(b"unused proof failures: 0", b"unused proof failures: 1")
+        assert (dormant.returncode, dormant.stdout, dormant.stderr) == (1, expected_dormant, b""), dormant
+
+        for invalid in ("main.w", "./lib.w", "deps/lib.w", "missing.w"):
+            rejected = subprocess.run(
+                [*command, "--dormant", invalid], cwd=root, capture_output=True, timeout=15
+            )
+            assert rejected.returncode == 2 and rejected.stdout == b"", rejected
+
+        alias = root / "alias.w"
+        if sys.platform != "win32":
+            alias.symlink_to(module)
+            rejected_alias = subprocess.run(
+                [*command, "--dormant", alias.name], cwd=root, capture_output=True, timeout=15
+            )
+            assert rejected_alias.returncode == 2 and rejected_alias.stdout == b"", rejected_alias
+            alias.unlink()
+
+        module.write_text("not valid Wosy", encoding="utf-8")
+        for path in ("lib.w", "missing.w"):
+            ignored = subprocess.run(
+                [*main_command, "--dormant", path], cwd=root, capture_output=True, timeout=15
+            )
+            assert (ignored.returncode, ignored.stdout, ignored.stderr) == (0, expected_pass, b""), ignored
+        assert sorted(entry.name for entry in root.iterdir()) == ["lib.w", "main.w", "wosy.toml"]
+
+
 if __name__ == "__main__":
     main()

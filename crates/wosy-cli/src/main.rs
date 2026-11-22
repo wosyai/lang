@@ -391,27 +391,11 @@ fn prepare_explicit_dormant_sources(
     if sources.is_empty() {
         return Ok(Vec::new());
     }
-    let project_identity = root.to_string_lossy();
-    let dependency_prefixes = configuration.resolved_packages.values()
-        .filter_map(|dependency| dependency.project_root.strip_prefix(root).ok())
-        .collect::<Vec<_>>();
+    let boundaries = canonical_loader::DormantSourceBoundaries::new(root, project, configuration);
     let mut selected = HashSet::with_capacity(sources.len());
     for DormantSourceInput { identity, .. } in &sources {
-        use std::path::Component;
-        let relative = identity.path.as_path();
-        let spelling = relative.to_str().ok_or_else(|| "dormant source path must be UTF-8".to_owned())?;
-        if spelling.is_empty() || spelling.contains('\\')
-            || !relative.components().all(|component| matches!(component, Component::Normal(_)))
-            || relative.components().collect::<std::path::PathBuf>().as_os_str() != relative.as_os_str()
-        {
-            return Err(format!("dormant source path is not canonical: {spelling}").into());
-        }
-        if identity.project != project_identity || identity.package != project.package
-            || relative.starts_with("deps")
-            || dependency_prefixes.iter().any(|prefix| relative.starts_with(prefix))
-        {
-            return Err(format!("dormant source is outside the current package: {spelling}").into());
-        }
+        boundaries.validate(identity)?;
+        let spelling = identity.path.as_path().display();
         if texts.contains_key(identity) || !selected.insert(identity) {
             return Err(format!("dormant source was already selected: {spelling}").into());
         }
