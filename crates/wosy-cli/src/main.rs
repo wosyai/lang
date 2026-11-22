@@ -617,10 +617,7 @@ fn check_loaded_proof_selections(
     for &(path, _) in selections {
         if let std::collections::hash_map::Entry::Vacant(entry) = authorities.entry(path) {
             let Some((proof, _)) = loaded.proofs.get(path) else {
-                return Err(CanonicalLoadFailure::Input(format!(
-                    "selected proof source {} is outside the canonical target graph",
-                    path.as_path().display(),
-                )));
+                return Err(selected_source_outside_graph("proof", path));
             };
             entry.insert(proof.declarations().source().clone());
         }
@@ -633,6 +630,48 @@ fn check_loaded_proof_selections(
         ScalarPreparationInputs { target_layout },
     );
     Ok((outcomes, loaded.texts))
+}
+
+#[cfg(feature = "internal-checker")]
+fn selected_source_outside_graph(role: &str, path: &PackageRelativePath) -> CanonicalLoadFailure {
+    CanonicalLoadFailure::Input(format!(
+        "selected {role} source {} is outside the canonical target graph",
+        path.as_path().display(),
+    ))
+}
+
+#[cfg(feature = "internal-checker")]
+type InternalProofCallResult = Result<
+    (wosy_compiler::ScalarProofCallOutcome, BTreeMap<ProjectSourceIdentity, String>),
+    CanonicalLoadFailure,
+>;
+
+#[cfg(feature = "internal-checker")]
+#[cfg_attr(not(test), allow(dead_code))]
+fn check_loaded_proof_call(
+    root: &std::path::Path,
+    project: &ProjectContext,
+    configuration: &ProjectConfiguration,
+    target_layout: ScalarTargetLayout,
+    (proof_file, proof_name): (&PackageRelativePath, &str),
+    (caller_file, caller_name): (&PackageRelativePath, &str),
+) -> InternalProofCallResult {
+    let mut loaded = load_canonical_project_inputs(
+        root, project, configuration, CanonicalLoadPurpose::Proof(HashSet::from([proof_file.clone()])),
+    )?;
+    let catalog = loaded.proofs.remove(proof_file).ok_or_else(|| selected_source_outside_graph("proof", proof_file))?;
+    let caller_node = loaded.graph.nodes.iter().find(|node| {
+        node.source.package == project.package && &node.source.path == caller_file
+    }).ok_or_else(|| selected_source_outside_graph("caller", caller_file))?;
+    let caller_source = compiler_source_identity(&caller_node.source, &caller_node.content_revision);
+    let proof_source = catalog.0.declarations().source().clone();
+    #[cfg(test)]
+    routing_observations::record(|counts| counts.checks += 1);
+    let outcome = wosy_compiler::check_loaded_scalar_module_proof_call(
+        (&proof_source, proof_name), (&caller_source, caller_name), loaded.declarations, catalog,
+        loaded.initialization_order, ScalarPreparationInputs { target_layout },
+    );
+    Ok((outcome, loaded.texts))
 }
 
 fn compile_project(
@@ -1149,6 +1188,50 @@ mod tests {
             &[(&second, "same"), (&missing_one, "same"), (&missing_two, "same")],
         );
         assert!(matches!(missing, Err(CanonicalLoadFailure::Input(error)) if error.contains("absent-z.w")));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn internal_proof_adapter_reuses_only_the_selected_producer_and_caller_from_one_graph() {
+        use wosy_compiler::ScalarProofCallOutcome;
+        let sources = [
+            ("main.w", r#"%%start
+                lib = namespace app "lib.w";
+                u8(u8) alternate = fn(input) { input };
+                unit() consumer = fn {
+                    u8 result = lib.producer(7);
+                    core.require(result <= 10, { .stdout = ""; .stderr = "bad"; .code = 23; .files = []; });
+                };
+                unit() wrong = fn {
+                    u8 result = alternate(7);
+                    core.require(result <= 10, { .stdout = ""; .stderr = "bad"; .code = 23; .files = []; });
+                };
+            %%end"#),
+            ("lib.w", r#"%%start
+                u8(u8) producer = fn(input) { input };
+                proof cap for producer(input) -> (out) where (input > 4 && input <= 10) ensures (out <= 10) {}
+            %%end"#),
+            ("unreachable.w", "this file is not in the target graph"),
+        ];
+        let (project, configuration) = routing_test_project("internal-proof-one-caller", &sources);
+        let main = PackageRelativePath::new("main.w".into()).unwrap();
+        let lib = PackageRelativePath::new("lib.w".into()).unwrap();
+        let unreachable = PackageRelativePath::new("unreachable.w".into()).unwrap();
+        let check = |path, name| check_loaded_proof_call(
+            &project.root, &project, &configuration, ScalarTargetLayout::NATIVE64,
+            (&lib, "cap"), (path, name),
+        );
+        let (result, counts) = routing_observations::observe(|| check(&main, "consumer"));
+        let (result, texts) = result.expect("canonical selected proof and caller");
+        assert_eq!(result, ScalarProofCallOutcome::Established);
+        assert_eq!(texts.len(), 2);
+        assert_eq!(counts, routing_observations::Counts { extractions: 2, checks: 1, ..Default::default() });
+        assert_eq!(check(&main, "wrong").unwrap().0, ScalarProofCallOutcome::Unavailable);
+        assert!(matches!(
+            check(&unreachable, "consumer"),
+            Err(CanonicalLoadFailure::Input(error)) if error.contains("caller source unreachable.w"),
+        ));
+        assert!(!project.root.join(".wosy").exists());
     }
 
     #[cfg(feature = "internal-checker")]
