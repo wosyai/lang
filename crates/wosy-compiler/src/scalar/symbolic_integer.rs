@@ -170,10 +170,24 @@ impl IntegerSet {
     pub(super) fn union<'a>(sets: impl IntoIterator<Item = &'a Self>) -> Self {
         let mut intervals: Vec<_> = sets.into_iter().flat_map(|set| &set.0).collect();
         intervals.sort_unstable_by(|left, right| left.first.cmp(&right.first));
+        let mut intervals = intervals.into_iter();
+        let Some(first) = intervals.next() else { return Self::default(); };
+        let mut first_bound = &first.first;
+        let mut last_bound = &first.last;
         let mut union = Self::default();
         for interval in intervals {
-            union.append(interval.clone());
+            if &interval.last <= last_bound {
+                continue;
+            }
+            if &interval.first <= last_bound || interval.first == last_bound + 1 {
+                last_bound = &interval.last;
+            } else {
+                union.0.push(Interval { first: first_bound.clone(), last: last_bound.clone() });
+                first_bound = &interval.first;
+                last_bound = &interval.last;
+            }
         }
+        union.0.push(Interval { first: first_bound.clone(), last: last_bound.clone() });
         union
     }
 
@@ -230,6 +244,20 @@ impl IntegerSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn union_materializes_only_normalized_disjoint_ranges() {
+        let wide = BigInt::from(1u8) << 300usize;
+        let at = |first: i32, last: i32| Interval { first: -&wide + first, last: -&wide + last };
+        let left = IntegerSet(vec![at(-6, -3), at(4, 5), at(20, 24)]);
+        let right = IntegerSet(vec![at(-9, -7), at(-5, 1), at(3, 4), at(22, 25)]);
+        let covered = IntegerSet(vec![at(-9, -9), at(-2, 0), at(20, 21)]);
+        assert_eq!(
+            IntegerSet::union([&right, &left, &covered, &left, &right]),
+            IntegerSet(vec![at(-9, 1), at(3, 5), at(20, 25)]),
+        );
+        assert_eq!(IntegerSet::union([]), IntegerSet::default());
+    }
 
     #[test]
     fn intersection_materializes_only_changed_nonempty_intervals() {
