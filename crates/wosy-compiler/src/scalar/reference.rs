@@ -5612,6 +5612,15 @@ fn point_last_use_dependencies_keep_canonical_order_and_storage() {
     assert!(point_last_use_dependencies(&CfgPointKind::ScopeExit, &mut pair).is_empty());
 }
 
+fn keep_forward_point_in_place(
+    kind: &CfgPointKind,
+    ordinary_forward: bool,
+    incoming_states: usize,
+) -> bool {
+    ordinary_forward && incoming_states == 1
+        && matches!(kind, CfgPointKind::Call { .. } | CfgPointKind::Branch { .. })
+}
+
 fn transfer_reference_facts(
     mut cfg: ReferenceTransferCfg<'_>,
     deferred_policies: &BTreeMap<usize, CopyPolicy>,
@@ -5940,6 +5949,7 @@ fn transfer_reference_facts(
     });
     let mut forward_cursor = 0;
     let mut forward_single_observation = strictly_forward.then(|| vec![false; cfg.points.len()]);
+    let ordinary_forward = strictly_forward && pending.is_none() && descriptor.is_none();
     let mut errors = Vec::new();
     let mut pending_sites = pending.map_or(&[][..], |pending| pending.sites.as_slice()).iter().peekable();
     loop {
@@ -5958,6 +5968,7 @@ fn transfer_reference_facts(
         let common_aggregate_cutoff = aggregate_deadlines.as_ref()
             .and_then(|_| original_points[id.0].successors.iter().copied().min());
         let states = std::mem::take(&mut incoming[id.0]);
+        let keep_in_place = keep_forward_point_in_place(&original_points[id.0].kind, ordinary_forward, states.len());
         if let Some(single_observation) = &mut forward_single_observation {
             if matches!(&original_points[id.0].kind, CfgPointKind::MoveThrough { place, .. }
                 if !matches!(place, ScalarPlace::Dereference { .. }))
@@ -7387,7 +7398,9 @@ fn transfer_reference_facts(
                         }
                     }
                 }
-            } else {
+            } else if !keep_in_place {
+                // One forward observation is already in cfg.points. Only
+                // mutable kinds can require rewriting in the final drain.
                 observed[id.0] = Some(point.clone());
             }
             if let (Some(cutoff), Some(last_use), Some(flow)) =
@@ -10575,6 +10588,10 @@ fn contract_replay_reset_borrows_only_immutable_point_structure() {
         scope: ReferenceScopeId(0), possible_origins: None, successors: vec![CfgPointId(1)],
     };
     let branch = point(CfgPointKind::Branch { condition: ScalarExpression::Boolean { value: true, span } });
+    assert!(keep_forward_point_in_place(&branch.kind, true, 1));
+    assert!(!keep_forward_point_in_place(&branch.kind, false, 1));
+    assert!(!keep_forward_point_in_place(&branch.kind, true, 0));
+    assert!(!keep_forward_point_in_place(&branch.kind, true, 2));
     let pristine = [branch.clone()];
     let mut live = vec![branch];
     live[0].possible_origins = Some(BTreeSet::from([ReferenceOriginId(0)]));
@@ -10583,6 +10600,7 @@ fn contract_replay_reset_borrows_only_immutable_point_structure() {
     assert_eq!(live[0].successors.as_ptr(), allocation);
     assert!(live[0].possible_origins.is_none());
     live[0].kind = CfgPointKind::Evaluate(ScalarExpression::Boolean { value: false, span });
+    assert!(!keep_forward_point_in_place(&live[0].kind, true, 1));
     reset_contract_replay_points(&mut live, &pristine, true);
     assert!(matches!(&live[0].kind, CfgPointKind::Branch { condition: ScalarExpression::Boolean { value: true, .. } }));
     live.push(point(CfgPointKind::ScopeExit));
@@ -10597,6 +10615,7 @@ fn contract_replay_reset_borrows_only_immutable_point_structure() {
         output: 0, argument_points: vec![CfgPointId(0)],
         target: ResolvedCallTarget::Core(CoreOperationId::IntExtend),
     });
+    assert!(keep_forward_point_in_place(&call.kind, true, 1));
     let pristine = [call.clone()];
     let mut live = vec![call];
     let allocation = live[0].successors.as_ptr();
