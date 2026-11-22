@@ -13062,3 +13062,67 @@ unit(Pair) inspect = fn(owner) {{
         }
     }
 }
+
+#[test]
+fn known_projected_mutable_siblings_only_conflict_when_field_or_ancestor_overlaps() {
+    let mut missed = Vec::new();
+    for (second, body, conflict) in [
+        ("right", "*left = 7; *right = 8; u8 first = *left; u8 second = *right; first; second;", None),
+        ("right", "*right = 8; *left = 7; u8 first = *right; u8 second = *left; first; second;", None),
+        ("right", "*left = 7; *right = 8; (*parent).left = 9; u8 result = owner.left; result;", None),
+        ("left", "*left = 7; *right = 8; u8 first = *left; u8 second = *right; first; second;", Some("&!(*parent).left")),
+        ("right", "(*parent).left = 9; *left = 7; *right = 8;", Some("(*parent).left =")),
+        ("right", "owner = { .left = 3; .right = 4; }; *left = 7; *right = 8;", Some("owner =")),
+    ] {
+        let text = format!(r#"%%start
+struct copy Pair {{ u8 left; u8 right; }}
+unit(Pair) inspect = fn(owner) {{
+    *!Pair parent = &!owner;
+    *!u8 left = &!(*parent).left;
+    *!u8 right = &!(*parent).{second};
+    {body}
+}};
+%%end"#);
+        let parent = text.find("&!owner").unwrap() as u32;
+        let first = text.find("&!(*parent).left").unwrap() as u32;
+        let right = text.find("right =").unwrap();
+        let second_span = text[right..].find("&!(*parent)").map(|offset| (offset + right) as u32).unwrap();
+        let (single, project) = both_reference_functions(&text);
+        for (validator, items, diagnostics) in [
+            ("single", &single.program.items, &single.diagnostics),
+            ("project", &project.project.modules[0].items, &project.diagnostics),
+        ] {
+            let ScalarItem::Function(function) = &items[0] else { panic!("typed callable") };
+            let cfg = &function.reference_cfg;
+            let exact = |span, field_index| cfg.initial_points.iter().find_map(|point| match &point.kind {
+                CfgPointKind::Borrow { loan, .. } if point.source_span.range.start == span
+                    && loan.mode == ScalarReferenceMutability::Mutable
+                    && loan.parent.as_ref().is_some_and(|base| base.creation_span.start == parent
+                        && base.mode == ScalarReferenceMutability::Mutable
+                        && base.origin_place.binding == loan.origin_place.binding
+                        && base.origin_place.projections.is_empty())
+                    && matches!(loan.origin_place.projections.as_slice(),
+                        [ReferencePlaceProjection::Dereference(_), ReferencePlaceProjection::Field(ScalarFieldReference::Resolved(field))]
+                        if field.index == field_index) => Some(loan),
+                _ => None,
+            }).unwrap_or_else(|| panic!("actual canonical siblings: {validator}: {diagnostics:?}"));
+            let left = exact(first, 0);
+            let right = exact(second_span, usize::from(second == "right"));
+            assert_eq!(left.parent, right.parent);
+            if let Some(conflict) = conflict {
+                let start = text.rfind(conflict).unwrap() as u32;
+                let access = start..start + conflict.len() as u32;
+                if !diagnostics.iter().any(|diagnostic| diagnostic.code == "B0003"
+                    && diagnostic.message == "read or move of unavailable place"
+                    && diagnostic.labels.first().is_some_and(|label| access.contains(&label.span.range.start))
+                    && diagnostic.labels.iter().skip(1).any(|label| label.span.range.start == first))
+                {
+                    missed.push((validator, second, body, diagnostics.clone()));
+                }
+            } else if !diagnostics.is_empty() {
+                missed.push((validator, second, body, diagnostics.clone()));
+            }
+        }
+    }
+    assert!(missed.is_empty(), "{missed:?}");
+}

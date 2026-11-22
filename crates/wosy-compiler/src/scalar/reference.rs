@@ -4208,11 +4208,30 @@ fn loan_has_ancestor(loan: &ReferenceLoanId, ancestor: &ReferenceLoanId) -> bool
     false
 }
 
+fn exact_projected_mutable_field(loan: &ReferenceLoanId) -> Option<(&ReferenceLoanId, &ScalarStructFieldId)> {
+    let parent = loan.parent.as_deref()?;
+    if loan.mode != ScalarReferenceMutability::Mutable || parent.mode != ScalarReferenceMutability::Mutable
+        || parent.parent.is_some() || !parent.origin_place.projections.is_empty()
+        || !matches!(parent.origin_place.place, ScalarPlace::Name { .. })
+        || parent.origin_place.binding != loan.origin_place.binding
+    {
+        return None;
+    }
+    let Some((ScalarExpression::Name { .. }, ScalarFieldReference::Resolved(field))) =
+        direct_checked_field_base(&loan.origin_place.place)
+    else { return None };
+    let [ReferencePlaceProjection::Dereference(projected_parent),
+        ReferencePlaceProjection::Field(ScalarFieldReference::Resolved(projected_field))] =
+        loan.origin_place.projections.as_slice()
+    else { return None };
+    (projected_parent.as_ref() == parent && projected_field == field).then_some((parent, field))
+}
+
 enum LoanAccess<'a> {
     Direct,
     DirectShared,
     Through(ReferenceOriginId),
-    WriteThrough(&'a InvalidationCandidate),
+    WriteThrough(&'a InvalidationCandidate, Option<&'a BTreeSet<ReferenceOriginId>>),
     ReadThrough(&'a ReferenceLoanId),
     Borrow(&'a ReferenceLoanId),
 }
@@ -4226,6 +4245,14 @@ fn conflicting_live_loan(
     access: LoanAccess<'_>,
 ) -> Vec<SourceSpan> {
     let place = available_place(place);
+    let projected_write = match access {
+        LoanAccess::WriteThrough(selected, Some(admitted)) => exact_projected_mutable_field(&selected.loan)
+            .filter(|(parent, field)| place.binding == parent.origin_place.binding
+                && matches!(place.projections.as_slice(),
+                    [ReferencePlaceProjection::Field(ScalarFieldReference::Resolved(actual))] if actual == *field))
+            .map(|(parent, field)| (admitted, parent, field)),
+        _ => None,
+    };
     let mut conflicts = Vec::new();
     for (binding, origins) in &state.bindings {
         let mut reachable = false;
@@ -4233,7 +4260,7 @@ fn conflicting_live_loan(
             if match access {
                 LoanAccess::Direct | LoanAccess::DirectShared | LoanAccess::ReadThrough(_) | LoanAccess::Borrow(_) => false,
                 LoanAccess::Through(selected) => *origin == selected,
-                LoanAccess::WriteThrough(selected) => *origin == selected.origin,
+                LoanAccess::WriteThrough(selected, _) => *origin == selected.origin,
             } {
                 continue;
             }
@@ -4247,8 +4274,13 @@ fn conflicting_live_loan(
                         && loan_has_ancestor(loan, selected)
                         && reference_places_overlap(&available_place(&loan.origin_place), &place)
                 }
-                LoanAccess::WriteThrough(selected) => {
-                    loan_borrows_place(loan, &place, None) && !loan_has_ancestor(&selected.loan, loan)
+                LoanAccess::WriteThrough(selected, _) => {
+                    let disjoint_sibling = projected_write.is_some_and(|(admitted, parent, field)| {
+                        admitted.contains(origin) && exact_projected_mutable_field(loan).is_some_and(|(peer_parent, peer_field)|
+                            peer_parent == parent && peer_field.structure == field.structure && peer_field.index != field.index)
+                    });
+                    !disjoint_sibling && loan_borrows_place(loan, &place, None)
+                        && !loan_has_ancestor(&selected.loan, loan)
                 }
                 LoanAccess::Borrow(new) => {
                     (new.mode == ScalarReferenceMutability::Mutable
@@ -4921,6 +4953,7 @@ fn transfer_reference_facts(
     let mut strictly_forward = true;
     let mut projected_leaf_sites = HashMap::new();
     let mut projected_leaf_holders = HashMap::new();
+    let mut projected_store_facts = None::<(BTreeSet<ReferenceOriginId>, HashMap<CfgPointId, ReferenceOriginId>)>;
     let mut projected_exposures = None;
     let mut known_lexical_owners = None::<HashMap<&ReferenceBindingId, Option<ReferencePlaceId>>>;
     let mut aggregate_expiry_allowed = aggregate.is_some();
@@ -5043,14 +5076,21 @@ fn transfer_reference_facts(
                             && !exposed.contains(binding)
                             && !projected_leaf_holders.contains_key(binding)
                         {
-                            projected_leaf_holders.insert(binding, (point.id, point.scope, loan.mode));
+                            let mutable_origin = (loan.mode == ScalarReferenceMutability::Mutable)
+                                .then(|| point.possible_origins.as_ref()
+                                    .filter(|set| set.len() == 1).and_then(BTreeSet::first).copied())
+                                .flatten();
+                            if let Some(origin) = mutable_origin {
+                                projected_store_facts.get_or_insert_with(Default::default).0.insert(origin);
+                            }
+                            projected_leaf_holders.insert(binding, (point.id, point.scope, loan.mode, mutable_origin));
                             projected_leaf_sites.insert(point.id, authority);
                         }
                     }
                 }
             }
             CfgPointKind::Read { binding } => {
-                if let Some(&(borrow, scope, mode)) = projected_leaf_holders.get(binding) {
+                if let Some(&(borrow, scope, mode, mutable_origin)) = projected_leaf_holders.get(binding) {
                     let authorized = match point.successors.as_slice() {
                         [next] => original_points.get(next.0).is_some_and(|next| {
                             if point.scope != scope || next.scope != scope {
@@ -5062,9 +5102,19 @@ fn transfer_reference_facts(
                                     pointer_point: Some(pointer_id), reads_origin: false, ..
                                 } => *pointer_id == point.id && matches!(pointer.as_ref(), ScalarExpression::Name { .. })
                                     && cfg.checked_pointee_reads.binary_search(&next.id).is_ok(),
-                                CfgPointKind::AssignThrough { .. } if mode == ScalarReferenceMutability::Mutable =>
-                                    exact_named_scalar_store_pointer(next, original_points, cfg.checked_named_scalar_stores, &grouped_installs)
-                                        == Some((point.id, binding)),
+                                CfgPointKind::AssignThrough { .. } if mode == ScalarReferenceMutability::Mutable => {
+                                    let exact = exact_named_scalar_store_pointer(
+                                        next, original_points, cfg.checked_named_scalar_stores, &grouped_installs,
+                                    ) == Some((point.id, binding));
+                                    if exact {
+                                        if let (Some(origin), Some((_, stores))) =
+                                            (mutable_origin, &mut projected_store_facts)
+                                        {
+                                            stores.insert(next.id, origin);
+                                        }
+                                    }
+                                    exact
+                                },
                                 _ => false,
                             }
                         }),
@@ -5072,13 +5122,19 @@ fn transfer_reference_facts(
                     };
                     if !authorized {
                         projected_leaf_sites.remove(&borrow);
+                        if let (Some(origin), Some((admitted, _))) = (mutable_origin, &mut projected_store_facts) {
+                            admitted.remove(&origin);
+                        }
                     }
                 }
             }
             CfgPointKind::Assign { target, .. } | CfgPointKind::Move { place: target, .. }
             | CfgPointKind::DeferredMove { place: target, .. } | CfgPointKind::Borrow { place: target, .. } => {
-                if let Some(&(borrow, _, _)) = projected_leaf_holders.get(&target.binding) {
+                if let Some(&(borrow, _, _, mutable_origin)) = projected_leaf_holders.get(&target.binding) {
                     projected_leaf_sites.remove(&borrow);
+                    if let (Some(origin), Some((admitted, _))) = (mutable_origin, &mut projected_store_facts) {
+                        admitted.remove(&origin);
+                    }
                 }
             }
             _ => {}
@@ -6111,6 +6167,11 @@ fn transfer_reference_facts(
                             }
                         }
                     }
+                    let exact_projected_store = match (&projected_store_facts, candidates.as_slice()) {
+                        (Some((admitted, stores)), [candidate]) if stores.get(&id) == Some(&candidate.origin)
+                            && admitted.contains(&candidate.origin) => Some(admitted),
+                        _ => None,
+                    };
                     for candidate in candidates {
                         let target = available_place(&candidate.place);
                         let origins = conflicting_live_loan(
@@ -6119,7 +6180,7 @@ fn transfer_reference_facts(
                             &state,
                             id,
                             &target,
-                            LoanAccess::WriteThrough(candidate),
+                            LoanAccess::WriteThrough(candidate, exact_projected_store),
                         );
                         if !origins.is_empty() {
                             errors.push(ReferenceAnalysisError::ConflictingPlace {
