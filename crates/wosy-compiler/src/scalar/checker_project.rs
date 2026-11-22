@@ -2757,7 +2757,7 @@ impl PreparedProofModule {
                 if let Some(observer) = observer {
                     outcomes[*index] = module_proof_outcome(observer.outcome());
                 }
-            } else if !matches!(plan.typed.goal, TypedProofGoal::Literal { .. } | TypedProofGoal::Conjunction(_) | TypedProofGoal::Disjunction(_) | TypedProofGoal::Universal { .. } | TypedProofGoal::Existential { .. } | TypedProofGoal::EntryWitness { .. } | TypedProofGoal::EntryComparison { .. } | TypedProofGoal::MixedEntryConjunction { .. }) {
+            } else if !matches!(plan.typed.goal, TypedProofGoal::Literal { .. } | TypedProofGoal::Conjunction(_) | TypedProofGoal::Disjunction(_) | TypedProofGoal::Universal { .. } | TypedProofGoal::Existential { .. } | TypedProofGoal::EntryWitness { .. } | TypedProofGoal::EntryComparison { .. } | TypedProofGoal::MixedEntryConjunction { .. } | TypedProofGoal::ConjunctiveExistential(_)) {
                 continue;
             } else if plan.uses_direct_goal() {
                 let key = (plan.target, ExactGuardGroup(plan.filter.as_deref()));
@@ -2961,8 +2961,10 @@ impl PreparedProofModule {
                                 .and_then(|entry| entry.holds(&paths, None))
                         } else if let TypedProofGoal::EntryWitness { slot, relation, domain } = goal {
                             ImmutableProofOutputComparison::prepare(body, *slot, plan.typed.result_type, *relation)
-                                .and_then(|entry| entry.holds_existential_witness(&paths, domain))
+                                .and_then(|entry| entry.holds_existential_witness(&paths, domain, None))
                                 .and_then(|verified| verified.then_some(true))
+                        } else if let TypedProofGoal::ConjunctiveExistential(goal) = goal {
+                            goal.holds_over(&paths, body, plan.typed.result_type)
                         } else if let TypedProofGoal::MixedEntryConjunction { output, entry } = goal {
                             body.boundary.checker_parameter_bindings.as_deref()
                                 .and_then(|formals| evaluate_mixed_entry_output(&paths, formals, output, entry))
@@ -3033,7 +3035,7 @@ impl PlannedModuleProof<'_> {
 
 
     fn uses_direct_goal(&self) -> bool {
-        self.steps.items.is_empty() || matches!(self.typed.goal, TypedProofGoal::Existential { .. } | TypedProofGoal::EntryWitness { .. })
+        self.steps.items.is_empty() || matches!(self.typed.goal, TypedProofGoal::Existential { .. } | TypedProofGoal::EntryWitness { .. } | TypedProofGoal::ConjunctiveExistential(_))
     }
 
     fn observer(&self) -> SelectedProofObserver<'_> {
@@ -3356,6 +3358,7 @@ impl SelectedProofObserver<'_> {
                         };
                         (relation.accepts(value.cmp(candidate)) && domain.contains(candidate)).then_some(true)
                     },
+                    TypedProofGoal::ConjunctiveExistential(goal) => goal.holds_at(value, arguments),
                     TypedProofGoal::Disjunction(allowed) => Some(allowed.contains(value)),
                     TypedProofGoal::DeferredDisjunction(_) => None,
                     TypedProofGoal::MixedEntryConjunction { output, entry } =>
@@ -3503,6 +3506,53 @@ fn check_proof_fragment_impl(
     check_selected_proof(prepared, function, &declaration, &root.source, summary_source)
 }
 
+#[cfg(feature = "internal-checker")]
+enum ConjunctiveWitness {
+    Literal(BigInt, std::cell::OnceCell<bool>),
+    Formal(usize),
+}
+
+#[cfg(feature = "internal-checker")]
+struct ConjunctiveExistential {
+    relation: IntegerRelation,
+    output: IntegerShowConstraints<'static>,
+    domain: IntegerSet,
+    witness: ConjunctiveWitness,
+}
+
+#[cfg(feature = "internal-checker")]
+impl ConjunctiveExistential {
+    fn holds_at(&self, value: &BigInt, arguments: &[&BigInt]) -> Option<bool> {
+        match &self.witness {
+            ConjunctiveWitness::Literal(candidate, admitted) => (self.relation.accepts(value.cmp(candidate))
+                && self.output.holds_value(value)
+                && *admitted.get_or_init(|| self.domain.contains(candidate))).then_some(true),
+            ConjunctiveWitness::Formal(slot) => {
+                let candidate = arguments.get(*slot)?;
+                (self.relation.accepts(value.cmp(candidate)) && self.output.holds_value(value)
+                    && self.domain.contains(candidate)).then_some(true)
+            }
+        }
+    }
+
+    fn holds_over(
+        &self, paths: &[super::checker_flow::IntegerReturningPath<'_>], body: &FunctionCallSites, ty: &ScalarType,
+    ) -> Option<bool> {
+        match &self.witness {
+            ConjunctiveWitness::Literal(candidate, admitted) => {
+                for path in paths {
+                    if !path.output_satisfies_existential_literal(self.relation, candidate, &self.output)? {
+                        return None;
+                    }
+                }
+                admitted.get_or_init(|| self.domain.contains(candidate)).then_some(true)
+            }
+            ConjunctiveWitness::Formal(slot) => ImmutableProofOutputComparison::prepare(body, *slot, ty, self.relation)?
+                .holds_existential_witness(paths, &self.domain, Some(&self.output))?.then_some(true),
+        }
+    }
+}
+
 enum TypedProofGoal {
     Literal {
         operator: BinaryOperator,
@@ -3517,6 +3567,8 @@ enum TypedProofGoal {
     Existential { relation: IntegerRelation, witness: BigInt, witness_in_domain: bool },
     #[cfg(feature = "internal-checker")]
     EntryWitness { slot: usize, relation: IntegerRelation, domain: IntegerSet },
+    #[cfg(feature = "internal-checker")]
+    ConjunctiveExistential(Box<ConjunctiveExistential>),
     EntryComparison { slot: usize, relation: IntegerRelation },
     #[cfg(feature = "internal-checker")]
     MixedEntryConjunction { output: IntegerShowConstraints<'static>, entry: [Option<IntegerRelation>; 2] },
@@ -3540,7 +3592,7 @@ impl TypedProofGoal {
                 }
                 Some(true)
             }
-            Self::EntryComparison { .. } | Self::DeferredDisjunction(_) | Self::MixedEntryConjunction { .. } | Self::EntryWitness { .. } => None,
+            Self::EntryComparison { .. } | Self::DeferredDisjunction(_) | Self::MixedEntryConjunction { .. } | Self::EntryWitness { .. } | Self::ConjunctiveExistential(_) => None,
         }
     }
 }
@@ -3647,18 +3699,21 @@ fn typed_existential_output_goal(
 ) -> Result<TypedProofGoal, ProjectCheck> {
     let (ty, binder) = typed_quantifier_binder(exists, output, inputs, ty)?;
     let predicate = derive_expression(&child(exists, SyntaxKind::Expression)?);
-    let ScalarExpression::Binary { operator, left, right, .. } = predicate else {
-        return Err(ProjectCheck::Unsupported);
+    let simple_relation = || {
+        let ScalarExpression::Binary { operator, left, right, .. } = &predicate else {
+            return Err(ProjectCheck::Unsupported);
+        };
+        if *operator != BinaryOperator::Equal && (!cfg!(feature = "internal-checker") || !allow_named_entry_facts) {
+            return Err(ProjectCheck::Unsupported);
+        }
+        let relation = IntegerRelation::from_operator(operator).ok_or(ProjectCheck::Unsupported)?;
+        if !matches!(left.as_ref(), ScalarExpression::Name { name, .. } if name == output)
+            || !matches!(right.as_ref(), ScalarExpression::Name { name, .. } if name == &binder)
+        {
+            return Err(ProjectCheck::Unsupported);
+        }
+        Ok(relation)
     };
-    if operator != BinaryOperator::Equal && (!cfg!(feature = "internal-checker") || !allow_named_entry_facts) {
-        return Err(ProjectCheck::Unsupported);
-    }
-    let relation = IntegerRelation::from_operator(&operator).ok_or(ProjectCheck::Unsupported)?;
-    if !matches!(left.as_ref(), ScalarExpression::Name { name, .. } if name == output)
-        || !matches!(right.as_ref(), ScalarExpression::Name { name, .. } if name == &binder)
-    {
-        return Err(ProjectCheck::Unsupported);
-    }
     let [ScalarBlockItem::Expression(ScalarExpression::Call {
         receiver, name, arguments, type_arguments, ..
     })] = steps.items.as_slice() else {
@@ -3673,17 +3728,45 @@ fn typed_existential_output_goal(
         return Err(ProjectCheck::Unsupported);
     };
     #[cfg(feature = "internal-checker")]
-    if allow_named_entry_facts {
-        if let ScalarExpression::Name { name, .. } = argument {
-            if is_null_literal_name(name) {
+    if allow_named_entry_facts && matches!(&predicate, ScalarExpression::Binary { operator: BinaryOperator::And, .. }) {
+        let mut relation: Option<IntegerRelation> = None;
+        let mut output_bounds = IntegerShowConstraints::default();
+        visit_output_conjuncts(&predicate, |atom| {
+            if let ScalarExpression::Binary { operator, left, right, .. } = atom {
+                if matches!(right.as_ref(), ScalarExpression::Name { name, .. } if name == &binder) {
+                    if !matches!(left.as_ref(), ScalarExpression::Name { name, .. } if name == output) {
+                        return Err(ProjectCheck::Unsupported);
+                    }
+                    let atom = IntegerRelation::from_operator(operator).ok_or(ProjectCheck::Unsupported)?;
+                    relation = Some(relation.map_or(atom, |known| known.intersection(atom)));
+                    return Ok(());
+                }
+            }
+            let (atom, bound) = typed_output_atom(atom, output, inputs, &ty)?;
+            output_bounds.add(atom, Cow::Owned(bound));
+            Ok(())
+        })?;
+        let relation = relation.ok_or(ProjectCheck::Unsupported)?;
+        let witness = if let ScalarExpression::Name { name, .. } = argument {
+            ConjunctiveWitness::Formal(checked_existential_formal(name, inputs, body, &ty)?)
+        } else {
+            let value = concrete_integer_literal(argument).ok_or(ProjectCheck::Unsupported)?;
+            if !integer_literal_fits_type(value.as_ref(), &ty) {
                 return Err(ProjectCheck::InvalidProof);
             }
-            let slot = inputs.iter().position(|input| input == name).ok_or(ProjectCheck::InvalidProof)?;
-            let parameters = &body.boundary.parameters;
-            let bindings = body.boundary.checker_parameter_bindings.as_deref().ok_or(ProjectCheck::Unsupported)?;
-            if !matches!(parameters.len(), 1 | 2) || bindings.len() != parameters.len() || parameters[slot].ty != ty {
-                return Err(ProjectCheck::Unsupported);
-            }
+            ConjunctiveWitness::Literal(value.into_owned(), std::cell::OnceCell::new())
+        };
+        output_bounds.normalize();
+        let domain = typed_quantifier_domain(exists, &binder, inputs, &ty)?;
+        return Ok(TypedProofGoal::ConjunctiveExistential(Box::new(ConjunctiveExistential {
+            relation, output: output_bounds, domain, witness,
+        })));
+    }
+    let relation = simple_relation()?;
+    #[cfg(feature = "internal-checker")]
+    if allow_named_entry_facts {
+        if let ScalarExpression::Name { name, .. } = argument {
+            let slot = checked_existential_formal(name, inputs, body, &ty)?;
             let domain = typed_quantifier_domain(exists, &binder, inputs, &ty)?;
             return Ok(TypedProofGoal::EntryWitness { slot, relation, domain });
         }
@@ -3695,6 +3778,24 @@ fn typed_existential_output_goal(
     let domain = typed_quantifier_domain(exists, &binder, inputs, &ty)?;
     let witness_in_domain = domain.contains(witness.as_ref());
     Ok(TypedProofGoal::Existential { relation, witness: witness.into_owned(), witness_in_domain })
+}
+
+#[cfg(feature = "internal-checker")]
+fn checked_existential_formal(
+    name: &str, inputs: &[String], body: &FunctionCallSites, ty: &ScalarType,
+) -> Result<usize, ProjectCheck> {
+    if is_null_literal_name(name) {
+        return Err(ProjectCheck::InvalidProof);
+    }
+    let slot = inputs.iter().position(|input| input == name).ok_or(ProjectCheck::InvalidProof)?;
+    let parameters = &body.boundary.parameters;
+    let bindings = body.boundary.checker_parameter_bindings.as_deref().ok_or(ProjectCheck::Unsupported)?;
+    if !matches!(parameters.len(), 1 | 2) || bindings.len() != parameters.len()
+        || parameters.get(slot).is_none_or(|parameter| &parameter.ty != ty)
+    {
+        return Err(ProjectCheck::Unsupported);
+    }
+    Ok(slot)
 }
 
 struct TypedProofPostcondition<'a> {

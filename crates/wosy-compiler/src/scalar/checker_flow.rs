@@ -927,35 +927,67 @@ impl<'a> ImmutableProofOutputComparison<'a> {
     }
 
     pub(super) fn holds_existential_witness(
-        &self, paths: &[IntegerReturningPath<'_>], domain: &IntegerSet,
+        &self, paths: &[IntegerReturningPath<'_>], domain: &IntegerSet, output: Option<&IntegerShowConstraints<'_>>,
     ) -> Option<bool> {
         let equal = IntegerRelation::from_operator(&BinaryOperator::Equal)?;
         let reversed = self.relation.reversed();
         let reflexive = self.relation.accepts(std::cmp::Ordering::Equal);
         for path in paths {
             let witness = path.axes.iter().position(|known| *known == self.binding)?;
-            let other = match path.value {
+            let (returned, comparison) = match path.value {
+                IntegerReturn::Const(value) => {
+                    if output.is_some_and(|bounds| !bounds.holds_value(value)) {
+                        return Some(false);
+                    }
+                    for row in &path.state.0 {
+                        let candidate = &row[witness];
+                        let matches = if self.relation == equal {
+                            candidate.singleton_value() == Some(value)
+                        } else {
+                            candidate.every_at_extremes(reversed, value)
+                        };
+                        if !matches || !candidate.is_subset_of(domain) {
+                            return Some(false);
+                        }
+                    }
+                    continue;
+                }
                 IntegerReturn::Alias(binding) if binding != self.binding => {
                     let (other, comparison) = self.other?;
                     if binding != other {
                         return None;
                     }
-                    Some((path.axes.iter().position(|known| *known == other)?, comparison))
+                    (path.axes.iter().position(|known| *known == other)?, Some(comparison))
                 }
-                _ => None,
+                IntegerReturn::Alias(_) if reflexive => (witness, None),
+                IntegerReturn::Alias(_) => return Some(false),
             };
-            for row in &path.state.0 {
-                let candidate = &row[witness];
-                let matches = match (path.value, other) {
-                    (IntegerReturn::Const(value), _) if self.relation == equal =>
-                        candidate.singleton_value() == Some(value),
-                    (IntegerReturn::Const(value), _) => candidate.every_at_extremes(reversed, value),
-                    (IntegerReturn::Alias(_), Some((other, comparison))) => comparison.holds(&row[other], candidate)?,
-                    (IntegerReturn::Alias(_), None) => reflexive,
-                };
-                if !matches || !candidate.is_subset_of(domain) {
+            let holds = match output {
+                Some(bounds) => Self::holds_existential_alias_rows(path, witness, returned, comparison, domain,
+                    |values| bounds.holds_set(values)),
+                None => Self::holds_existential_alias_rows(path, witness, returned, comparison, domain, |_| true),
+            };
+            if !holds? {
+                return Some(false);
+            }
+        }
+        Some(true)
+    }
+
+    fn holds_existential_alias_rows(
+        path: &IntegerReturningPath<'_>, witness: usize, returned: usize,
+        comparison: Option<CartesianRelation>, domain: &IntegerSet, bounds_hold: impl Fn(&IntegerSet) -> bool,
+    ) -> Option<bool> {
+        for row in &path.state.0 {
+            let candidate = &row[witness];
+            let output = &row[returned];
+            if let Some(comparison) = comparison {
+                if !comparison.holds(output, candidate)? {
                     return Some(false);
                 }
+            }
+            if !bounds_hold(output) || !candidate.is_subset_of(domain) {
+                return Some(false);
             }
         }
         Some(true)
@@ -1059,6 +1091,20 @@ impl IntegerReturningPath<'_> {
                 row[0].covers_closed(first.lower, first.upper) && row[1].covers_closed(second.lower, second.upper)
             }),
             Some(_) => false,
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    pub(super) fn output_satisfies_existential_literal(
+        &self, relation: IntegerRelation, witness: &BigInt, output: &IntegerShowConstraints<'_>,
+    ) -> Option<bool> {
+        match self.value {
+            IntegerReturn::Const(value) => Some(relation.accepts(value.cmp(witness)) && output.holds_value(value)),
+            IntegerReturn::Alias(binding) => {
+                let axis = self.axes.iter().position(|known| *known == binding)?;
+                Some(self.state.0.iter().all(|row|
+                    row[axis].every_at_extremes(relation, witness) && output.holds_set(&row[axis])))
+            }
         }
     }
 

@@ -2960,6 +2960,47 @@ fn named_existential_proof_verifies_all_exact_integer_predicates_for_chosen_witn
 }
 
 #[test]
+fn named_existential_conjunction_verifies_one_typed_witness_against_all_atoms() {
+    let identity = source();
+    let check = |predicate: &str, candidate: &str, guard: &str, actual: &str| {
+        check_scalar_module_proof(
+            identity.clone(), "prove",
+            vec![ScalarProofModuleInput {
+                source: identity.clone(),
+                text: format!(r#"%%start
+                    i16(i16, i16) left = fn(value, sample) {{ if (sample == 0) {{}}; value }};
+                    {actual}
+                    proof prove for left(first, entry) -> (out) where ({guard})
+                        ensures (exists (i16 k where k >= -8 && k != -7) {{ {predicate} }}) {{
+                            core.witness({candidate});
+                        }}
+                %%end"#),
+                namespaces: Vec::new(),
+            }],
+            vec![identity.clone()], ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
+        )
+    };
+    use ScalarModuleProofOutcome::{Invalid, NoApplicableInputs, Proved, Unsupported};
+    let guard = "first >= -12 && first <= -9 && first != -10 && entry >= -8 && entry <= -6 && entry != -7";
+    let valid = "out <= k && (out != k && out >= -12 && out <= -9 && out != -10)";
+    assert_eq!(check(valid, "entry", guard, ""), Proved);
+    assert_eq!(check(valid, "entry", "first >= -12 && first <= -9 && entry == -8", ""), Unsupported);
+    assert_eq!(check(valid, "entry", "first == -9 && entry == -7", ""), Unsupported);
+    assert_eq!(check(valid, "-8", guard, ""), Proved);
+    assert_eq!(check(valid, "-7", guard, ""), Unsupported);
+    assert_eq!(check(valid, "entry", "true", "i16 a = left(-9, -8); i16 b = left(-11, -6);"), Proved);
+    assert_eq!(check(valid, "entry", "true", "i16 a = left(-9, -8); i16 b = left(-10, -6);"), Unsupported);
+    assert_eq!(check(valid, "-8", "true", "i16 a = left(-9, -8); i16 b = left(-11, -6);"), Proved);
+    let contradiction = "out < k && out >= k && out >= -12";
+    assert_eq!(check(contradiction, "entry", guard, ""), Unsupported);
+    assert_eq!(check(contradiction, "entry", "false", ""), NoApplicableInputs);
+    assert_eq!(check(contradiction, "-8", "false", "i16 a = left(-9, -8);"), NoApplicableInputs);
+    assert!(matches!(check("out < k && out >= k && out < 32768", "entry", "false", ""), Invalid(_)));
+    assert_eq!(check("out <= -9 && out != -10", "entry", guard, ""), Unsupported);
+    assert_eq!(check("out < k || out >= -12", "entry", guard, ""), Unsupported);
+}
+
+#[test]
 fn named_proof_entry_witness_checks_domain_and_output_in_same_context() {
     let identity = source();
     let check = |signature: &str, body: &str, candidate: &str, where_guard: &str, startup: &str| {
