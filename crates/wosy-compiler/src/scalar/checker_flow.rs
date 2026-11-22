@@ -15,6 +15,8 @@ use super::{symbolic_integer::IntegerRelation, reference::CheckerIntegerCallArgu
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum CheckerPredicate {
     Boolean(bool),
+    #[cfg_attr(not(feature = "internal-checker"), allow(dead_code))]
+    ProofReflexiveBranch(bool),
     Integer(IntegerPredicate),
     EntryDomain { binding: ReferenceBindingId, values: IntegerSet },
     DirectiveDisjunction { binding: ReferenceBindingId, ty: ScalarType, atoms: [(IntegerRelation, BigInt); 2] },
@@ -121,6 +123,7 @@ struct IntegerRoots<'a> {
     by_binding: HashMap<&'a ReferenceBindingId, usize>,
     parameters: usize,
     reached_obligation: bool,
+    proof_reflexive_branches: bool,
     imported_local: Option<ImportedLocal<'a>>,
 }
 
@@ -228,8 +231,11 @@ impl IntegerInputs {
         let predicate = match predicate {
             CheckerPredicate::Boolean(true) => return Some((self, Self::default(), None)),
             CheckerPredicate::Boolean(false) => return Some((Self::default(), self, None)),
+            CheckerPredicate::ProofReflexiveBranch(value) if roots.proof_reflexive_branches => {
+                return Some(if *value { (self, Self::default(), None) } else { (Self::default(), self, None) });
+            }
             CheckerPredicate::Integer(predicate) => predicate,
-            CheckerPredicate::EntryDomain { .. } | CheckerPredicate::DirectiveDisjunction { .. } => return None,
+            CheckerPredicate::EntryDomain { .. } | CheckerPredicate::DirectiveDisjunction { .. } | CheckerPredicate::ProofReflexiveBranch(_) => return None,
         };
         let (index, ty) = roots.lookup(&predicate.binding)?;
         if ty != &predicate.ty {
@@ -264,7 +270,7 @@ impl IntegerInputs {
             CheckerPredicate::Boolean(true) => return Some(Self::default()),
             CheckerPredicate::Boolean(false) => return Some(Self(self.0.clone())),
             CheckerPredicate::Integer(predicate) => predicate,
-            CheckerPredicate::EntryDomain { .. } | CheckerPredicate::DirectiveDisjunction { .. } => return None,
+            CheckerPredicate::EntryDomain { .. } | CheckerPredicate::DirectiveDisjunction { .. } | CheckerPredicate::ProofReflexiveBranch(_) => return None,
         };
         let (index, ty) = roots.lookup(&predicate.binding)?;
         if ty != &predicate.ty {
@@ -516,7 +522,7 @@ impl IntegerReturningPath<'_> {
         let (yes, no) = match guard {
             CheckerPredicate::Boolean(true) => (self.state, IntegerInputs::default()),
             CheckerPredicate::Boolean(false) => (IntegerInputs::default(), self.state),
-            CheckerPredicate::EntryDomain { .. } | CheckerPredicate::DirectiveDisjunction { .. } => return None,
+            CheckerPredicate::EntryDomain { .. } | CheckerPredicate::DirectiveDisjunction { .. } | CheckerPredicate::ProofReflexiveBranch(_) => return None,
             CheckerPredicate::Integer(predicate) => {
                 let index = self.axes.iter().position(|binding| **binding == predicate.binding)?;
                 self.state.split_axis(index, predicate)?
@@ -552,7 +558,7 @@ pub(super) fn check_integer_requirements(
 pub(super) fn check_integer_requirement_activity(
     calls: &FunctionCallSites,
 ) -> Option<Result<bool, IntegerCheckFailure<'_>>> {
-    run_integer_callable::<false, false>(calls, integer_tail_type(calls), None, None, None, None, None, None)
+    run_integer_callable::<false, false>(calls, integer_tail_type(calls), None, None, None, None, None, None, false)
         .map(|result| result.map(|coverage| matches!(coverage, ProofCoverage::Applicable(true))))
 }
 
@@ -608,7 +614,7 @@ pub(super) fn collect_integer_requirement_failures_with_calls<'a>(
         continuation: IntegerRequirementContinuation::Empty, projected, allow_projected_calls, sink,
     };
     let ProofCoverage::Applicable(active) = run_integer_callable::<false, true>(
-        calls, tail, None, None, None, exact, handle_call, Some(&mut collected),
+        calls, tail, None, None, None, exact, handle_call, Some(&mut collected), false,
     )?.ok()? else { return None; };
     Some((active, collected.continuation))
 }
@@ -753,7 +759,7 @@ pub(super) fn check_integer_requirements_with_calls<'a>(
     handle_call: &mut ActualCallHandler<'a, '_>,
 ) -> Option<Result<bool, IntegerCheckFailure<'a>>> {
     let tail = if exact_arguments.is_none() { integer_tail_type(calls) } else { None };
-    run_integer_callable::<false, false>(calls, tail, None, None, None, exact_arguments, Some(handle_call), None)
+    run_integer_callable::<false, false>(calls, tail, None, None, None, exact_arguments, Some(handle_call), None, false)
         .map(|result| result.map(|coverage| matches!(coverage, ProofCoverage::Applicable(true))))
 }
 
@@ -764,7 +770,7 @@ pub(super) fn proves_requirement_with_imported_root_local<'a>(
     if matches!(&local.values, ImportedIntegerValues::Ready(values, _) if values.is_empty()) {
         return None;
     }
-    match run_integer_callable::<true, false>(calls, integer_tail_type(calls), None, None, Some(local), None, None, None)? {
+    match run_integer_callable::<true, false>(calls, integer_tail_type(calls), None, None, Some(local), None, None, None, false)? {
         Ok(ProofCoverage::Applicable(true)) => Some(true),
         Ok(ProofCoverage::Applicable(false)) => None,
         Ok(ProofCoverage::NoApplicableInputs) => None,
@@ -776,7 +782,7 @@ pub(super) fn proves_requirement_with_imported_root_local<'a>(
 pub(super) fn observe_integer_returns(
     calls: &FunctionCallSites,
 ) -> Option<Result<Vec<IntegerReturningPath<'_>>, IntegerCheckFailure<'_>>> {
-    match observe_integer_returns_in_scope(calls, None, None)? {
+    match observe_integer_returns_in_scope(calls, None, None, false)? {
         Ok(ProofCoverage::Applicable(paths)) => Some(Ok(paths)),
         Ok(ProofCoverage::NoApplicableInputs) => None,
         Err(failure) => Some(Err(failure)),
@@ -788,7 +794,15 @@ pub(super) fn observe_arbitrary_integer_returns<'a>(
     calls: &'a FunctionCallSites,
     entry_filter: Option<&[CheckerPredicate]>,
 ) -> Option<Result<ProofCoverage<Vec<IntegerReturningPath<'a>>>, IntegerCheckFailure<'a>>> {
-    observe_integer_returns_in_scope(calls, entry_filter, None)
+    observe_integer_returns_in_scope(calls, entry_filter, None, false)
+}
+
+#[cfg(feature = "internal-checker")]
+pub(super) fn observe_unused_module_proof_returns<'a>(
+    calls: &'a FunctionCallSites,
+    entry_filter: Option<&[CheckerPredicate]>,
+) -> Option<Result<ProofCoverage<Vec<IntegerReturningPath<'a>>>, IntegerCheckFailure<'a>>> {
+    observe_integer_returns_in_scope(calls, entry_filter, None, true)
 }
 
 #[cfg(all(test, feature = "internal-checker"))]
@@ -805,6 +819,7 @@ fn observe_integer_returns_in_scope<'a>(
     calls: &'a FunctionCallSites,
     entry_filter: Option<&[CheckerPredicate]>,
     exact_arguments: Option<&[&BigInt]>,
+    proof_reflexive_branches: bool,
 ) -> Option<Result<ProofCoverage<Vec<IntegerReturningPath<'a>>>, IntegerCheckFailure<'a>>> {
     let tail = integer_tail_type(calls)?;
     #[cfg(all(test, feature = "internal-checker"))]
@@ -813,7 +828,7 @@ fn observe_integer_returns_in_scope<'a>(
         observations.set(if exact_arguments.is_some() { (arbitrary, actual + 1) } else { (arbitrary + 1, actual) });
     });
     let mut paths = Vec::new();
-    match run_integer_callable::<false, false>(calls, Some(tail), entry_filter, Some(&mut paths), None, exact_arguments, None, None)? {
+    match run_integer_callable::<false, false>(calls, Some(tail), entry_filter, Some(&mut paths), None, exact_arguments, None, None, proof_reflexive_branches)? {
         Ok(ProofCoverage::Applicable(_)) if !paths.is_empty() => {
             Some(Ok(ProofCoverage::Applicable(paths)))
         }
@@ -831,7 +846,7 @@ pub(super) fn exact_integer_return_at_entry(
     if integer_tail_type(calls)? != expected {
         return None;
     }
-    let ProofCoverage::Applicable(paths) = observe_integer_returns_in_scope(calls, None, Some(arguments))?.ok()? else {
+    let ProofCoverage::Applicable(paths) = observe_integer_returns_in_scope(calls, None, Some(arguments), false)?.ok()? else {
         return None;
     };
     fn singleton<'a>(path: &'a IntegerReturningPath<'_>) -> Option<&'a BigInt> {
@@ -889,7 +904,7 @@ fn check_integer_return_bound_in_scope<'a>(
     proof: Option<&IntegerShowProof<'_>>,
 ) -> Option<Result<ProofCoverage<bool>, IntegerCheckFailure<'a>>> {
     let relation = IntegerRelation::from_operator(operator)?;
-    let paths = match observe_integer_returns_in_scope(calls, entry_filter, None)? {
+    let paths = match observe_integer_returns_in_scope(calls, entry_filter, None, false)? {
         Ok(ProofCoverage::Applicable(paths)) => paths,
         Ok(ProofCoverage::NoApplicableInputs) => return Some(Ok(ProofCoverage::NoApplicableInputs)),
         Err(failure) => return Some(Err(failure)),
@@ -926,6 +941,7 @@ fn run_integer_callable<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool>
     exact_arguments: Option<&[&BigInt]>,
     mut handle_call: Option<&mut ActualCallHandler<'a, '_>>,
     mut failures: Option<&mut IntegerFailureCollection<'a, '_>>,
+    proof_reflexive_branches: bool,
 ) -> Option<Result<ProofCoverage<bool>, IntegerCheckFailure<'a>>> {
     let boundary = &calls.boundary;
     let checker_parameters = boundary.checker_parameter_bindings.as_deref()?;
@@ -933,6 +949,7 @@ fn run_integer_callable<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool>
     let mut roots = IntegerRoots {
         parameters: boundary.parameters.len(),
         imported_local,
+        proof_reflexive_branches,
         ..IntegerRoots::default()
     };
     for (binding, parameter) in checker_parameters.iter().zip(&boundary.parameters) {
@@ -959,7 +976,7 @@ fn run_integer_callable<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool>
         match filter {
             CheckerPredicate::Boolean(true) => {}
             CheckerPredicate::Boolean(false) => return Some(Ok(ProofCoverage::NoApplicableInputs)),
-            CheckerPredicate::DirectiveDisjunction { .. } => return None,
+            CheckerPredicate::DirectiveDisjunction { .. } | CheckerPredicate::ProofReflexiveBranch(_) => return None,
             CheckerPredicate::EntryDomain { binding, values } => {
                 let (axis, _) = roots.lookup(binding)?;
                 match row[axis].intersection(values) {

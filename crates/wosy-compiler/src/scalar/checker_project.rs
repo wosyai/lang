@@ -28,7 +28,7 @@ use super::{
     },
 };
 #[cfg(feature = "internal-checker")]
-use super::checker_flow::observe_arbitrary_integer_returns;
+use super::checker_flow::{observe_arbitrary_integer_returns, observe_unused_module_proof_returns};
 use crate::Diagnostic;
 use wosy_syntax::SourceIdentity;
 use wosy_syntax::{CanonicalCstRoot, CstNode, CstToken, SyntaxKind};
@@ -2067,7 +2067,7 @@ impl Hash for ExactGuardGroup<'_> {
             std::mem::discriminant(predicate).hash(state);
             match predicate {
                 CheckerPredicate::Boolean(value) => value.hash(state),
-                CheckerPredicate::DirectiveDisjunction { .. } => {}
+                CheckerPredicate::DirectiveDisjunction { .. } | CheckerPredicate::ProofReflexiveBranch(_) => {}
                 CheckerPredicate::EntryDomain { binding, values } => {
                     binding.hash(state);
                     values.hash(state);
@@ -2246,7 +2246,7 @@ impl PreparedProofModule {
             if !valid_arbitrary_proof_body(body) {
                 continue;
             }
-            match observe_arbitrary_integer_returns(body, guard.0) {
+            match observe_unused_module_proof_returns(body, guard.0) {
                 Some(Ok(ProofCoverage::Applicable(paths))) => {
                     for (index, plan) in group {
                         let goal = &plan.typed.goal;
@@ -2404,7 +2404,7 @@ fn checked_integer_guard_slots<'a, const ALLOW_DOMAIN: bool>(
     for predicate in filter {
         match predicate {
             CheckerPredicate::Boolean(value) => guard.always_rejects |= !value,
-            CheckerPredicate::DirectiveDisjunction { .. } => return None,
+            CheckerPredicate::DirectiveDisjunction { .. } | CheckerPredicate::ProofReflexiveBranch(_) => return None,
             CheckerPredicate::EntryDomain { binding, values } => {
                 if !ALLOW_DOMAIN || guard.domain.is_some() {
                     return None;
@@ -3039,7 +3039,7 @@ fn induction_entry_domain(
         match guard {
             CheckerPredicate::Boolean(true) => {}
             CheckerPredicate::Boolean(false) => return Ok((IntegerSet::default(), minimum)),
-            CheckerPredicate::EntryDomain { .. } | CheckerPredicate::DirectiveDisjunction { .. } => return Err(ProjectCheck::Unsupported),
+            CheckerPredicate::EntryDomain { .. } | CheckerPredicate::DirectiveDisjunction { .. } | CheckerPredicate::ProofReflexiveBranch(_) => return Err(ProjectCheck::Unsupported),
             CheckerPredicate::Integer(predicate) if &predicate.binding == binding => {
                 entries = entries.keep(&predicate.operator, &predicate.bound).ok_or(ProjectCheck::Unsupported)?;
                 if entries.is_empty() {
@@ -3071,7 +3071,7 @@ fn induction_base_reachable(
     }
     match guard {
         CheckerPredicate::Boolean(value) => Ok(*value),
-        CheckerPredicate::EntryDomain { .. } | CheckerPredicate::DirectiveDisjunction { .. } => Err(ProjectCheck::Unsupported),
+        CheckerPredicate::EntryDomain { .. } | CheckerPredicate::DirectiveDisjunction { .. } | CheckerPredicate::ProofReflexiveBranch(_) => Err(ProjectCheck::Unsupported),
         CheckerPredicate::Integer(predicate) => {
             let complement = complement_integer_comparison(&predicate.operator)
                 .and_then(IntegerRelation::from_operator).ok_or(ProjectCheck::Unsupported)?;
@@ -3091,7 +3091,7 @@ fn check_induction_entry_domain(
     match base_guard {
         CheckerPredicate::Boolean(true) => return Ok(InductionPremise::Unreachable),
         CheckerPredicate::Boolean(false) => {}
-        CheckerPredicate::EntryDomain { .. } | CheckerPredicate::DirectiveDisjunction { .. } => return Err(ProjectCheck::Unsupported),
+        CheckerPredicate::EntryDomain { .. } | CheckerPredicate::DirectiveDisjunction { .. } | CheckerPredicate::ProofReflexiveBranch(_) => return Err(ProjectCheck::Unsupported),
         CheckerPredicate::Integer(predicate) => {
             let operator = complement_integer_comparison(&predicate.operator).ok_or(ProjectCheck::Unsupported)?;
             entries = entries.keep(operator, &predicate.bound).ok_or(ProjectCheck::Unsupported)?;
@@ -3326,7 +3326,7 @@ fn issue_return_bound(
     let guards = conditions.unwrap_or_default().iter().map(|condition| {
         match condition {
             CheckerPredicate::Boolean(value) => Some(VerifiedEntryGuard::Boolean(*value)),
-            CheckerPredicate::EntryDomain { .. } | CheckerPredicate::DirectiveDisjunction { .. } => None,
+            CheckerPredicate::EntryDomain { .. } | CheckerPredicate::DirectiveDisjunction { .. } | CheckerPredicate::ProofReflexiveBranch(_) => None,
             CheckerPredicate::Integer(predicate) => {
                 let slot = body.boundary.checker_parameter_bindings.as_deref()?
                     .iter().position(|binding| *binding == predicate.binding)?;

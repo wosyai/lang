@@ -1320,6 +1320,71 @@ fn observed_module_proof_old_selects_exact_typed_entry_slot_for_relations() {
 }
 
 #[test]
+fn named_proof_reflexive_branch_prunes_only_typed_immutable_aliases() {
+    let identity = source();
+    let check = |condition: &str, guard: &str, goal: &str, initial: &str| {
+        check_scalar_module_proof(
+            identity.clone(),
+            "exact",
+            vec![ScalarProofModuleInput {
+                source: identity.clone(),
+                text: format!(r#"%%start
+                    u8(u8, u8) target = fn(x, y) {{
+                        if (y == 0) {{}};
+                        if ({condition}) {{ x + 1 }} else {{ x }}
+                    }};
+                    {initial}
+                    proof exact for target(a, b) -> (out) where ({guard}) ensures ({goal}) {{}}
+                %%end"#),
+                namespaces: Vec::new(),
+            }],
+            vec![identity.clone()],
+            ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
+        )
+    };
+    assert_eq!(check("x < x", "a <= 5", "out <= 5", ""), ScalarModuleProofOutcome::Proved);
+    assert_eq!(check("x != x", "a <= 5", "out < 5", ""), ScalarModuleProofOutcome::Refuted);
+    assert_eq!(check("x != x", "false", "out <= 5", ""), ScalarModuleProofOutcome::NoApplicableInputs);
+    assert_eq!(check("x == x", "a <= 5", "out <= 5", ""), ScalarModuleProofOutcome::Unsupported);
+    assert_eq!(check("x < y", "a <= 5", "out <= 5", ""), ScalarModuleProofOutcome::Unsupported);
+    let startup = "u8 live = target(4, 0);";
+    assert_eq!(check("x < x", "a <= 5", "out <= 5", startup), ScalarModuleProofOutcome::Unsupported);
+}
+
+#[test]
+fn named_proof_reflexive_branch_does_not_change_other_proofs_startup() {
+    let identity = source();
+    let check = |added: &str, selections: &[&str]| {
+        check_scalar_module_proofs(
+            identity.clone(), selections,
+            vec![ScalarProofModuleInput {
+                source: identity.clone(),
+                text: format!(r#"%%start
+                    u8(u8) plain = fn(value) {{ value }};
+                    u8(u8) other = fn(value) {{
+                        if (value != value) {{ value + 1 }} else {{ value }}
+                    }};
+                    u8 startup = other(7);
+                    proof p for plain(input) -> (out) where (input == 7) ensures (out == 7) {{}}
+                    {added}
+                %%end"#),
+                namespaces: Vec::new(),
+            }],
+            vec![identity.clone()],
+            ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
+        ).unwrap()
+    };
+    let q = "proof q for other(input) -> (out) ensures (out <= 255) {}";
+    let invalid = "proof q for other(input) -> (out) ensures (out <= 256) {}";
+    let p = check("", &["p"]);
+    assert_eq!(p, [ScalarModuleProofOutcome::Unsupported]);
+    assert_eq!(check(q, &["p"]), p);
+    assert_eq!(check(q, &["p", "q"]), [ScalarModuleProofOutcome::Unsupported, ScalarModuleProofOutcome::Unsupported]);
+    assert!(matches!(check(invalid, &["p", "q"]).as_slice(),
+        [ScalarModuleProofOutcome::Unsupported, ScalarModuleProofOutcome::Invalid(_)]));
+}
+
+#[test]
 fn unused_module_proof_old_uses_only_immutable_entry_authority() {
     let identity = source();
     let check = |target: &str, goal: &str, guard: &str| {

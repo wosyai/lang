@@ -6790,6 +6790,35 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
     }
 
     #[cfg(any(test, feature = "internal-checker"))]
+    fn checker_branch_predicate(
+        &self, expression: &ScalarExpression, names: &BTreeMap<String, WalkBinding>,
+    ) -> Option<super::checker_flow::CheckerPredicate> {
+        #[cfg(feature = "internal-checker")]
+        use super::{checker_flow::CheckerPredicate, symbolic_integer::IntegerRelation};
+        #[cfg(feature = "internal-checker")]
+        if let ScalarExpression::Binary { operator, left, right, .. } = expression {
+            if let (ScalarExpression::Name { name: lhs, .. }, ScalarExpression::Name { name: rhs, .. }) =
+                (left.as_ref(), right.as_ref())
+            {
+                if lhs == rhs {
+                    let relation = IntegerRelation::from_operator(operator)?;
+                    let WalkMode::Callable(callable) = &self.mode else { return None; };
+                    let PlainNameIdentity::Lexical(_) = callable.target_resolver.plain_name(lhs, names)? else {
+                        return None;
+                    };
+                    let left_type = self.occurrence_typing.checked_expression_type(left)?;
+                    let right_type = self.occurrence_typing.checked_expression_type(right)?;
+                    if left_type == right_type && is_integer_type(left_type) {
+                        return Some(CheckerPredicate::ProofReflexiveBranch(relation.accepts(std::cmp::Ordering::Equal)));
+                    }
+                    return None;
+                }
+            }
+        }
+        self.checker_predicate(expression, names)
+    }
+
+    #[cfg(any(test, feature = "internal-checker"))]
     fn checker_integer_predicate(
         &self,
         expression: &ScalarExpression,
@@ -6947,7 +6976,7 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
                 if let Some(predicate) = self.checked_bool_initializer_predicate(expression, names) {
                     self.initializer_branches.insert(ordinal, predicate);
                 }
-            } else if let Some(predicate) = self.checker_predicate(expression, names) {
+            } else if let Some(predicate) = self.checker_branch_predicate(expression, names) {
                 self.structure.checker_branches.insert(ordinal, predicate);
             }
         }
