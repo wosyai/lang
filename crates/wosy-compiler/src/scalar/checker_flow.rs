@@ -273,7 +273,17 @@ impl<'a> ScopedAuthoredReturn<'a> for NamedAuthoredReturn<'a> {
             };
             let (left, right) = match (left.as_ref(), right.as_ref(), operator) {
                 (ScalarExpression::Name { .. }, ScalarExpression::Name { .. }, BinaryOperator::Add | BinaryOperator::Subtract) => {
-                    let (left, right) = path.distinct_singleton_pair_at(formal_axis(left_ordinal)?, formal_axis(right_ordinal)?)?;
+                    let left_axis = formal_axis(left_ordinal)?;
+                    let right_axis = formal_axis(right_ordinal)?;
+                    if left_axis == right_axis {
+                        if !matches!(operator, BinaryOperator::Subtract) {
+                            return None;
+                        }
+                        #[cfg(test)]
+                        AUTHORED_RETURN_CALCULATIONS.with(|count| count.set(count.get() + 1));
+                        return Some(BigInt::from(0));
+                    }
+                    let (left, right) = path.singleton_pair_at(left_axis, right_axis)?;
                     (Cow::Borrowed(left), Cow::Borrowed(right))
                 }
                 (ScalarExpression::Name { .. }, literal, BinaryOperator::Add | BinaryOperator::Subtract) =>
@@ -479,10 +489,7 @@ impl IntegerInputs {
     }
 
     #[cfg(feature = "internal-checker")]
-    fn distinct_singleton_pair_at(&self, left: usize, right: usize) -> Option<(&BigInt, &BigInt)> {
-        if left == right {
-            return None;
-        }
+    fn singleton_pair_at(&self, left: usize, right: usize) -> Option<(&BigInt, &BigInt)> {
         let (first, rest) = self.0.split_first()?;
         let left_value = first[left].singleton_value()?;
         let right_value = first[right].singleton_value()?;
