@@ -340,6 +340,7 @@ fn prepared_direct_local_reborrow_owner_requires_the_exact_declared_scope() {
 
 pub(super) struct ReferenceFlowBuilder<'a> {
     capture_call_points: bool,
+    root_return_points: std::ops::Range<usize>,
     local_borrow: Option<local_borrow::Author>,
     aggregate_facts: aggregate::AggregateFlowFacts,
     aggregate_result: aggregate::AggregateFlowResult,
@@ -471,6 +472,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
     ) -> Self {
         Self {
             capture_call_points: false,
+            root_return_points: 0..0,
             local_borrow: (matches!(&call_sites.named_place_roots, NamedPlaceRootFacts::Prepared(roots)
                 if !roots.is_empty() || (call_sites.conditionals.len() == 1
                     && matches!(call_sites.conditionals.values().next(), Some(ConditionalRegion::Unit { .. }))))
@@ -4444,6 +4446,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
         let mut return_bounds = None;
         if scope == ReferenceScopeId(0) {
             let backing_forward = self.checked_backing_forward(region, &result.output_points);
+            let first_return_point = self.cfg.points.len();
             let mut value_points = result.output_points.iter();
             for slot in region.final_outputs() {
                 return_bounds.get_or_insert((slot.span.start, slot.span.end)).1 = slot.span.end;
@@ -4464,6 +4467,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         Some((ordinal, primary, self.cursor.expect("checked backing terminal output")));
                 }
             }
+            self.root_return_points = first_return_point..self.cfg.points.len();
         }
         let scope_exit = self.point(CfgPointKind::ScopeExit, region.span, scope, BTreeSet::new());
         if self.aggregate_facts.needs_scope_exit_metadata() {
@@ -11940,11 +11944,11 @@ fn derive_function_reference_result(
     let mut builder =
         ReferenceFlowBuilder::new(source, function, module_names, call_sites, structs, enums);
     builder.capture_call_points = capture_call_points;
-    let (cfg, current_errors, proof_points, aggregate) =
+    let (cfg, current_errors, proof_points, aggregate, checked_contract_returns) =
         build_function_reference_cfg(builder, function, errors.len() == entry_errors);
     errors.extend(current_errors);
     FunctionReferenceResult {
-        checked_contract_returns: CheckedContractReturn::collect(&function.signature, &cfg.initial_points),
+        checked_contract_returns,
         cfg,
         arms,
         proof_points,
@@ -11964,7 +11968,7 @@ fn derive_function_reference_cfg(
 ) -> (ScalarReferenceCfg, Vec<ReferenceAnalysisError>) {
     let builder =
         ReferenceFlowBuilder::new(source, function, module_names, call_sites, structs, enums);
-    let (cfg, errors, _, _) =
+    let (cfg, errors, _, _, _) =
         build_function_reference_cfg(builder, function, prior_children_succeeded);
     (cfg, errors)
 }
@@ -11993,6 +11997,7 @@ fn build_function_reference_cfg(
     Vec<ReferenceAnalysisError>,
     CallablePointFacts,
     aggregate::AggregateFlowResult,
+    Vec<CheckedContractReturn>,
 ) {
     let mut errors = Vec::new();
     let call_sites = builder.call_sites;
@@ -12243,13 +12248,19 @@ fn build_function_reference_cfg(
     }
     aggregate.returning_leaf = errors.is_empty() && prior_children_succeeded && builder.returning_leaf_prefix
         && matches!(builder.cfg.points.last().map(|point| &point.kind), Some(CfgPointKind::Return));
+    let root_return_points = if has_flow {
+        &builder.cfg.initial_points[builder.root_return_points]
+    } else {
+        &[]
+    };
+    let checked_contract_returns = CheckedContractReturn::collect(&function.signature, root_return_points);
     if builder.independent_checked_query {
         aggregate.checked_successor_candidate = aggregate.formal_forward.map(|(_, point, _, _)| point);
-        if !builder.cfg.initial_points.is_empty()
+        if !root_return_points.is_empty()
             && (!builder.aggregate_facts.raw_formals.is_empty()
                 || !builder.aggregate_facts.read_fields.is_empty())
         {
-            let returned = builder.cfg.initial_points.iter().rev().find_map(|point| {
+            let returned = root_return_points.iter().rev().find_map(|point| {
                 match point.kind {
                     CfgPointKind::ReturnOutput { output: 0, value_point, checked: true } => Some(value_point),
                     _ => None,
@@ -12274,5 +12285,5 @@ fn build_function_reference_cfg(
     aggregate.formals = builder.aggregate_facts.formals;
     aggregate.read_formals = builder.aggregate_facts.raw_formals.into_keys().collect();
     aggregate.read_formal_fields = builder.aggregate_facts.read_fields;
-    (builder.cfg, errors, builder.proof_points, aggregate)
+    (builder.cfg, errors, builder.proof_points, aggregate, checked_contract_returns)
 }
