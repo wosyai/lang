@@ -365,7 +365,11 @@ impl<'a> ReferenceFlowBuilder<'a> {
             independent_checked_query: aggregate::checked_scalar_output(&call_sites.boundary.root_outputs),
             checked_scalar_storage: BTreeSet::new(),
             checked_result_origins: BTreeSet::new(),
-            proof_points: CallablePointFacts::default(),
+            proof_points: CallablePointFacts {
+                scope_exit_bindings: matches!(&call_sites.named_place_roots, NamedPlaceRootFacts::Prepared(_))
+                    .then(HashMap::new),
+                ..CallablePointFacts::default()
+            },
             has_projected_child: false,
             deferred_reborrow_roots: Vec::new(),
             deferred_local_reborrow: deferred_named_reborrow_allowed(function, call_sites)
@@ -4263,9 +4267,9 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 }
             }
         }
-        self.point(CfgPointKind::ScopeExit, region.span, scope, BTreeSet::new());
+        let scope_exit = self.point(CfgPointKind::ScopeExit, region.span, scope, BTreeSet::new());
         if self.aggregate_facts.needs_scope_exit_metadata() {
-            self.aggregate_facts.scope_exits.insert(self.cursor.expect("scope exit"), ordinal);
+            self.aggregate_facts.scope_exits.insert(scope_exit, ordinal);
         }
         if scope == ReferenceScopeId(0) && region.final_outputs().next().is_some() {
             let return_span = ByteSpan::new(
@@ -4288,6 +4292,13 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 self.point(CfgPointKind::Return, return_span, scope, BTreeSet::new());
             }
         }
+        let mut leaving = super::control::ScopeExitBindings::default();
+        let prepared = self.proof_points.scope_exit_bindings.as_mut();
+        if prepared.is_some() && scope == ReferenceScopeId(0) {
+            for slot in &calls.boundary.parameters {
+                leaving.insert(parameter_binding_identity(&self.source, self.function_span, block.span, slot));
+            }
+        }
         for (name, id, previous) in declared.into_iter().rev() {
             self.origins.remove(&id);
             self.checked.remove(&id);
@@ -4296,6 +4307,14 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 self.names.insert(name, previous);
             } else {
                 self.names.remove(&name);
+            }
+            if prepared.is_some() {
+                leaving.insert(id);
+            }
+        }
+        if let Some(inventory) = prepared {
+            if !leaving.is_empty() {
+                inventory.insert(scope_exit, leaving);
             }
         }
         Ok(result)
@@ -4317,6 +4336,31 @@ struct ReferenceEdgeState {
     moved_checked_handles: BTreeMap<ReferenceBindingId, Vec<(Vec<ReferencePlaceProjection>, SourceSpan)>>,
     assignment_previous: BTreeMap<CfgPointId, BTreeSet<ReferenceOriginId>>,
 }
+
+impl ReferenceEdgeState {
+    fn expire_scope(
+        &mut self,
+        point: &ReferenceFlowPoint,
+        inventory: Option<&HashMap<CfgPointId, super::control::ScopeExitBindings>>,
+    ) {
+        let exiting = inventory.and_then(|exits| exits.get(&point.id));
+        if inventory.is_some() && exiting.is_none() {
+            return;
+        }
+        let live = |binding: &ReferenceBindingId| match exiting {
+            Some(bindings) => !bindings.contains(binding),
+            None => binding.block_span != point.source_span.range, // detached/unprepared only
+        };
+        self.bindings.retain(|binding, _| live(binding));
+        self.uninitialized.retain(&live);
+        self.moved.retain(|(place, _)| live(&place.binding));
+        self.moved_checked_handles.retain(|binding, _| live(binding));
+        self.released.retain(&live);
+        self.invalidated.retain(&live);
+        self.projected.retain(|known| live(&known.place.binding));
+    }
+}
+
 
 #[derive(Clone, Default, PartialEq)]
 struct ReferencePointValues(Vec<(CfgPointId, BTreeSet<ReferenceOriginId>)>);
@@ -4385,6 +4429,71 @@ fn sparse_reference_point_values_keep_path_presence_and_expire_at_original_bound
     assert_eq!(sibling.get(CfgPointId(1)), None);
     sibling.record(CfgPointId(4), &None, &uses);
     assert_eq!(sibling.get(CfgPointId(0)), None);
+}
+
+#[cfg(test)]
+#[test]
+fn prepared_scope_expiry_uses_exact_declared_and_introduced_bindings() {
+    let source = SourceIdentity::new("project".into(), "package".into(), "metadata".into(), "r1".into());
+    let span = ByteSpan::new(0, 100);
+    let binding = |start| ReferenceBindingId {
+        source: source.clone(), function_span: span, block_span: span,
+        declaration_span: ByteSpan::new(start, start + 1), kind: ReferenceBindingKind::Declared,
+    };
+    let outer = binding(10);
+    let inner = binding(20);
+    let introduced = binding(30);
+    let point = |id, scope| ReferenceFlowPoint {
+        id: CfgPointId(id), kind: CfgPointKind::ScopeExit, source_span: SourceSpan::new(source.clone(), span),
+        scope: ReferenceScopeId(scope), possible_origins: None, successors: Vec::new(),
+    };
+    let inner_exit = point(1, 1);
+    let outer_exit = point(2, 0);
+    let cohort = |bindings: &[&ReferenceBindingId]| {
+        let mut result = super::control::ScopeExitBindings::default();
+        for &binding in bindings {
+            result.insert(binding.clone());
+        }
+        result
+    };
+    let inventory = HashMap::from([
+        (inner_exit.id, cohort(&[&inner, &introduced])),
+        (outer_exit.id, cohort(&[&outer])),
+    ]);
+    let mut different_span = binding(40);
+    different_span.block_span = ByteSpan::new(1, 10);
+    assert!(!inventory[&inner_exit.id].contains(&different_span));
+    let mixed = cohort(&[&inner, &different_span]);
+    assert!(mixed.contains(&inner) && mixed.contains(&different_span));
+    assert!(!mixed.contains(&outer));
+    let mut state = ReferenceEdgeState::default();
+    for binding in [&outer, &inner, &introduced] {
+        let place = ReferencePlaceId {
+            source: source.clone(), function_span: span, block_span: span,
+            declaration_span: binding.declaration_span, binding: binding.clone(),
+            projections: vec![ReferencePlaceProjection::Index(ScalarExpression::Integer { value: 0.into(), span })],
+            place: ScalarPlace::Name { name: String::new(), span },
+        };
+        state.bindings.insert(binding.clone(), BTreeSet::new());
+        state.uninitialized.insert(binding.clone());
+        state.moved.push((place.clone(), SourceSpan::new(source.clone(), span)));
+        state.moved_checked_handles.insert(binding.clone(), Vec::new());
+        state.released.insert(binding.clone());
+        state.invalidated.insert(binding.clone());
+        state.projected.push(ReferenceProjectedState { place, origins: BTreeSet::new(), uninitialized: true });
+    }
+    state.expire_scope(&point(0, 2), Some(&inventory)); // empty checked scope, not detached
+    assert_eq!(state.bindings.len(), 3);
+    state.expire_scope(&inner_exit, Some(&inventory));
+    assert_eq!(state.bindings, BTreeMap::from([(outer.clone(), BTreeSet::new())]));
+    assert_eq!(state.uninitialized, HashSet::from([outer.clone()]));
+    assert!(matches!(state.moved.as_slice(), [(place, _)] if place.binding == outer));
+    assert_eq!(state.moved_checked_handles, BTreeMap::from([(outer.clone(), Vec::new())]));
+    assert_eq!(state.released, BTreeSet::from([outer.clone()]));
+    assert_eq!(state.invalidated, BTreeSet::from([outer.clone()]));
+    assert!(matches!(state.projected.as_slice(), [known] if known.place.binding == outer));
+    state.expire_scope(&outer_exit, Some(&inventory));
+    assert!(state == ReferenceEdgeState::default());
 }
 
 #[derive(Clone, PartialEq)]
@@ -5084,6 +5193,7 @@ impl ScalarDescriptorReplay<'_> {
 
 struct ReferenceTransferCfg<'a> {
     initial_points: &'a [ReferenceFlowPoint],
+    scope_exit_bindings: Option<&'a HashMap<CfgPointId, super::control::ScopeExitBindings>>,
     pending_named_reborrow: Option<&'a super::control::PendingNamedReborrow>,
     resolve_pending_named_reborrow: bool,
     raw_address_exposures: &'a [(CfgPointId, Option<ReferenceBindingId>)],
@@ -5103,6 +5213,7 @@ impl<'a> ReferenceTransferCfg<'a> {
     fn new(cfg: &'a mut ScalarReferenceCfg, proof: Option<&'a CallablePointFacts>) -> Self {
         Self {
             initial_points: &cfg.initial_points,
+            scope_exit_bindings: proof.and_then(|proof| proof.scope_exit_bindings.as_ref()),
             pending_named_reborrow: proof.and_then(|proof| proof.pending_named_reborrow.as_ref()),
             resolve_pending_named_reborrow: false,
             raw_address_exposures: proof.map_or(&[], |proof| &proof.raw_address_exposures),
@@ -6968,29 +7079,7 @@ fn transfer_reference_facts(
                 descriptor.observe(point, &state, &cfg.facts);
             }
             match &point.kind {
-                CfgPointKind::ScopeExit => {
-                    state
-                        .bindings
-                        .retain(|binding, _| binding.block_span != point.source_span.range);
-                    state
-                        .uninitialized
-                        .retain(|binding| binding.block_span != point.source_span.range);
-                    state
-                        .moved
-                        .retain(|(place, _)| place.binding.block_span != point.source_span.range);
-                    state
-                        .moved_checked_handles
-                        .retain(|binding, _| binding.block_span != point.source_span.range);
-                    state
-                        .released
-                        .retain(|binding| binding.block_span != point.source_span.range);
-                    state
-                        .invalidated
-                        .retain(|binding| binding.block_span != point.source_span.range);
-                    state
-                        .projected
-                        .retain(|known| known.place.binding.block_span != point.source_span.range);
-                }
+                CfgPointKind::ScopeExit => state.expire_scope(point, cfg.scope_exit_bindings),
                 CfgPointKind::Read { .. }
                 | CfgPointKind::ReadPlace { .. }
                 | CfgPointKind::Join
@@ -10627,6 +10716,7 @@ fn derive_function_specialized_copy_policies(
             let transferred = transfer_reference_facts(
                 ReferenceTransferCfg {
                     initial_points: &template_cfg.initial_points,
+                    scope_exit_bindings: template_result.proof_points.scope_exit_bindings.as_ref(),
                     pending_named_reborrow: template_result.proof_points.pending_named_reborrow.as_ref(),
                     resolve_pending_named_reborrow: false,
                     raw_address_exposures: &template_result.proof_points.raw_address_exposures,

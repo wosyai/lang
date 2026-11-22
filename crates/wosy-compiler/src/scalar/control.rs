@@ -22,6 +22,8 @@ pub(crate) struct CallablePointFacts {
     pub(super) evaluations: HashMap<OccurrenceOrdinal, super::CfgPointId>,
     pub(super) installs: HashMap<OccurrenceOrdinal, FrozenInstall>,
     pub(super) definitions: HashMap<(BlockOrdinal, usize, usize), BindingDefinition>,
+    // None is the explicit detached/unprepared transfer mode.
+    pub(super) scope_exit_bindings: Option<HashMap<super::CfgPointId, ScopeExitBindings>>,
     pub(super) pending_named_reborrow: Option<PendingNamedReborrow>,
     pub(super) raw_address_exposures: Vec<(super::CfgPointId, Option<super::ReferenceBindingId>)>,
     pub(super) checked_join_values: Vec<(super::CfgPointId, [Option<super::CfgPointId>; 2])>,
@@ -35,6 +37,34 @@ pub(crate) struct CallablePointFacts {
     pub(super) scalar_descriptor_install: ScalarDescriptorCandidates,
     pub(super) backing_descriptor_install: ScalarDescriptorCandidates,
     pub(super) has_nonlexical_install: bool,
+}
+
+#[derive(Default)]
+pub(super) struct ScopeExitBindings {
+    uniform_block_span: Option<ByteSpan>,
+    bindings: HashSet<super::ReferenceBindingId>,
+}
+
+impl ScopeExitBindings {
+    pub(super) fn insert(&mut self, binding: super::ReferenceBindingId) {
+        if self.bindings.is_empty() {
+            self.uniform_block_span = Some(binding.block_span);
+        } else if self.uniform_block_span != Some(binding.block_span) {
+            self.uniform_block_span = None;
+        }
+        self.bindings.insert(binding);
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.bindings.is_empty()
+    }
+
+    pub(super) fn contains(&self, binding: &super::ReferenceBindingId) -> bool {
+        // A different span can only rule out membership. Matching spans
+        // still require the entire checked identity.
+        self.uniform_block_span.is_none_or(|span| span == binding.block_span)
+            && self.bindings.contains(binding)
+    }
 }
 
 #[derive(Clone)]
