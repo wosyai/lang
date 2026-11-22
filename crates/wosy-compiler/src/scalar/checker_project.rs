@@ -2757,7 +2757,7 @@ impl PreparedProofModule {
                 if let Some(observer) = observer {
                     outcomes[*index] = module_proof_outcome(observer.outcome());
                 }
-            } else if !matches!(plan.typed.goal, TypedProofGoal::Literal { .. } | TypedProofGoal::Conjunction(_) | TypedProofGoal::Disjunction(_) | TypedProofGoal::Universal { .. } | TypedProofGoal::UniversalConjunction(_) | TypedProofGoal::Existential { .. } | TypedProofGoal::EntryWitness { .. } | TypedProofGoal::EntryComparison { .. } | TypedProofGoal::MixedEntryConjunction { .. } | TypedProofGoal::ConjunctiveExistential(_)) {
+            } else if !matches!(plan.typed.goal, TypedProofGoal::Literal { .. } | TypedProofGoal::Conjunction(_) | TypedProofGoal::Disjunction(_) | TypedProofGoal::Universal { .. } | TypedProofGoal::UniversalNotEqual(_) | TypedProofGoal::UniversalConjunction(_) | TypedProofGoal::Existential { .. } | TypedProofGoal::EntryWitness { .. } | TypedProofGoal::EntryComparison { .. } | TypedProofGoal::MixedEntryConjunction { .. } | TypedProofGoal::ConjunctiveExistential(_)) {
                 continue;
             } else if plan.uses_direct_goal() {
                 let key = (plan.target, ExactGuardGroup(plan.filter.as_deref()));
@@ -3358,6 +3358,7 @@ impl SelectedProofObserver<'_> {
                         };
                         (relation.accepts(value.cmp(candidate)) && domain.contains(candidate)).then_some(true)
                     },
+                    TypedProofGoal::UniversalNotEqual(domain) => Some(!domain.covers_closed(value, value)),
                     TypedProofGoal::UniversalConjunction(goal) => Some(match goal {
                         UniversalConjunction::Vacuous => true,
                         UniversalConjunction::Impossible => false,
@@ -3577,6 +3578,8 @@ enum TypedProofGoal {
     DeferredDisjunction([(IntegerRelation, BigInt); 2]),
     Universal { relation: IntegerRelation, bound: BigInt },
     #[cfg(feature = "internal-checker")]
+    UniversalNotEqual(IntegerSet),
+    #[cfg(feature = "internal-checker")]
     UniversalConjunction(UniversalConjunction),
     Existential { relation: IntegerRelation, witness: BigInt, witness_in_domain: bool },
     #[cfg(feature = "internal-checker")]
@@ -3598,6 +3601,7 @@ impl TypedProofGoal {
                 if *witness_in_domain && path.output_satisfies(*relation, witness)? { Some(true) } else { None }
             }
             Self::Disjunction(allowed) => path.output_within(allowed),
+            Self::UniversalNotEqual(domain) => path.output_disjoint_from(domain),
             Self::UniversalConjunction(goal) => match goal {
                 UniversalConjunction::Vacuous => Some(true),
                 UniversalConjunction::Impossible => Some(false),
@@ -3646,6 +3650,7 @@ fn typed_universal_output_goal(
     output: &str,
     inputs: &[String],
     output_type: &ScalarType,
+    #[cfg_attr(not(feature = "internal-checker"), allow(unused_variables))] allow_equality: bool,
 ) -> Result<TypedProofGoal, ProjectCheck> {
     let (ty, binder) = typed_quantifier_binder(forall, output, inputs, output_type)?;
     let ScalarExpression::Binary { operator, left, right, .. } = ensures else {
@@ -3655,6 +3660,22 @@ fn typed_universal_output_goal(
         || !matches!(right.as_ref(), ScalarExpression::Name { name, .. } if name == &binder)
     {
         return Err(ProjectCheck::Unsupported);
+    }
+    #[cfg(feature = "internal-checker")]
+    if allow_equality && matches!(operator, BinaryOperator::Equal | BinaryOperator::NotEqual) {
+        let domain = typed_quantifier_domain(forall, &binder, inputs, &ty)?;
+        if domain.is_empty() {
+            return Err(ProjectCheck::Unsupported);
+        }
+        if *operator == BinaryOperator::NotEqual {
+            return Ok(TypedProofGoal::UniversalNotEqual(domain));
+        }
+        return Ok(match domain.into_singleton() {
+            Some(bound) => TypedProofGoal::Universal {
+                relation: IntegerRelation::from_operator(operator).ok_or(ProjectCheck::Unsupported)?, bound,
+            },
+            None => TypedProofGoal::UniversalConjunction(UniversalConjunction::Impossible),
+        });
     }
     let lower = match operator {
         BinaryOperator::Less | BinaryOperator::LessEqual => true,
@@ -4447,7 +4468,9 @@ fn typed_proof_postcondition<'a, const AUDIT_INDUCTION: bool, const DEFER_OUTPUT
             let conjunction = None;
             match conjunction {
                 Some(goal) => goal,
-                None => typed_universal_output_goal(&forall, &ensures, output, &input_names, &result.ty)?,
+                None => typed_universal_output_goal(
+                    &forall, &ensures, output, &input_names, &result.ty, allow_named_entry_facts && steps.items.is_empty(),
+                )?,
             }
         } else if let ScalarExpression::Binary { operator: BinaryOperator::Or, left, right, .. } = &ensures {
             let atoms = typed_output_disjunction(left, right, output, &input_names, &result.ty)?;

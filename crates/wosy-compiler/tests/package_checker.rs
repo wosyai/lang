@@ -2874,6 +2874,42 @@ fn named_universal_conjunction_checks_exact_order_and_empty_inner_vacuity() {
 }
 
 #[test]
+fn named_universal_exact_equality_and_disjointness_use_nonempty_typed_domains() {
+    let identity = source();
+    let check = |body: &str, domain: &str, goal: &str, guard: &str, actual: &str| {
+        check_scalar_module_proof(
+            identity.clone(), "bounded",
+            vec![ScalarProofModuleInput {
+                source: identity.clone(),
+                text: format!(r#"%%start
+                    i16(i16) echo = fn(value) {{ {body} }};
+                    proof bounded for echo(input) -> (out) where ({guard}) forall (i16 k where {domain})
+                        ensures ({goal}) {{}}
+                    {actual}
+                %%end"#),
+                namespaces: Vec::new(),
+            }],
+            vec![identity.clone()], ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
+        )
+    };
+    use ScalarModuleProofOutcome::{Invalid, NoApplicableInputs, Proved, Refuted, Unsupported};
+    assert_eq!(check("value", "k == -7", "out == k", "input == -7", ""), Proved);
+    assert_eq!(check("value", "k == -7", "out == k", "input == -6", ""), Refuted);
+    assert_eq!(check("value", "k >= -8 && k <= -6 && k != -7", "out == k", "true", "i16 a = echo(-8);"), Refuted);
+    assert_eq!(check("value", "k >= -8 && k <= -6 && k != -7", "out == k", "false", "i16 a = echo(-8);"), NoApplicableInputs);
+    let domain = "k >= -8 && k <= -6 && k != -7";
+    assert_eq!(check("value", domain, "out != k", "input == -7", ""), Proved);
+    assert_eq!(check("value", domain, "out != k", "input >= -9 && input <= -7 && input != -8", ""), Proved);
+    assert_eq!(check("value", domain, "out != k", "input >= -9 && input <= -7", ""), Refuted);
+    assert_eq!(check("value", domain, "out != k", "true", "i16 a = echo(-7); i16 b = echo(2);"), Proved);
+    assert_eq!(check("value", domain, "out != k", "true", "i16 a = echo(-7); i16 b = echo(-6); i16 c = echo(2);"), Refuted);
+    assert_eq!(check("value", "false", "out != k", "true", ""), Unsupported);
+    assert_eq!(check("value", "false", "out == k", "true", ""), Unsupported);
+    assert!(matches!(check("value", "k <= 32768", "out != k", "false", ""), Invalid(_)));
+    assert_eq!(check("if (value == 0) {}; 3 + 4", domain, "out != k", "true", "i16 a = echo(0);"), Unsupported);
+}
+
+#[test]
 fn named_universal_proof_reduces_exact_typed_domains_on_shared_actual_and_unused_returns() {
     let identity = source();
     let check = |quantifiers: &str, goal: &str, guard: &str, actual: &str| {

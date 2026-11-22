@@ -1095,6 +1095,17 @@ impl IntegerReturningPath<'_> {
     }
 
     #[cfg(feature = "internal-checker")]
+    pub(super) fn output_disjoint_from(&self, domain: &IntegerSet) -> Option<bool> {
+        match self.value {
+            IntegerReturn::Const(value) => Some(!domain.covers_closed(value, value)),
+            IntegerReturn::Alias(binding) => {
+                let axis = self.axes.iter().position(|known| *known == binding)?;
+                Some(self.state.0.iter().all(|row| row[axis].is_disjoint(domain)))
+            }
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
     pub(super) fn output_satisfies_constraints(&self, output: &IntegerShowConstraints<'_>) -> Option<bool> {
         match self.value {
             IntegerReturn::Const(value) => Some(output.holds_value(value)),

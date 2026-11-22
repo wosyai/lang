@@ -159,6 +159,12 @@ impl IntegerSet {
     }
 
     #[cfg(feature = "internal-checker")]
+    pub(super) fn into_singleton(mut self) -> Option<BigInt> {
+        self.singleton_value()?;
+        self.0.pop().map(|interval| interval.first)
+    }
+
+    #[cfg(feature = "internal-checker")]
     pub(super) fn intervals(&self) -> impl ExactSizeIterator<Item = (&BigInt, &BigInt)> {
         self.0.iter().map(|interval| (&interval.first, &interval.last))
     }
