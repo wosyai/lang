@@ -977,7 +977,9 @@ impl<'a> ReferenceFlowBuilder<'a> {
             BTreeSet::new(),
         );
         let incoming_names = self.names.clone();
-        let incoming_origins = self.origins.clone();
+        // An implicit else has no evaluation and the join clears origins.
+        // Only an actual alternate body consumes a saved entry origin map.
+        let incoming_origins = else_branch.map(|_| self.origins.clone());
         let incoming_checked = self.checked.clone();
         let then_arm = ReferenceConditionalArm {
             result: self.block_result(then_branch, then_block, projected_origins)?,
@@ -987,13 +989,15 @@ impl<'a> ReferenceFlowBuilder<'a> {
         // arm's checked set for the join by moving it out, not cloning it.
         let then_checked = std::mem::replace(&mut self.checked, incoming_checked);
         self.names = incoming_names;
-        self.origins = incoming_origins;
         self.cursor = Some(branch);
         let else_arm = match (else_branch, else_block) {
-            (Some(else_branch), Some(else_block)) => ReferenceConditionalArm {
-                result: self.block_result(else_branch, else_block, projected_origins)?,
-                end: self.cursor.expect("else branch terminal"),
-            },
+            (Some(else_branch), Some(else_block)) => {
+                self.origins = incoming_origins.expect("explicit else entry origins");
+                ReferenceConditionalArm {
+                    result: self.block_result(else_branch, else_block, projected_origins)?,
+                    end: self.cursor.expect("else branch terminal"),
+                }
+            }
             (None, None) => ReferenceConditionalArm {
                 result: ReferenceBlockResult::default(),
                 end: branch,
