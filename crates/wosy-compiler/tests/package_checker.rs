@@ -1071,7 +1071,7 @@ fn unused_symbolic_roots_forward_only_exact_nested_inputs_and_keep_actual_scope_
 
     let transitively_reaches = format!(r#"
         unit() outer = fn {{ wrapper(); }};
-        unit() wrapper = fn {{ leaf(2); }};
+        unit() wrapper = fn {{ leaf(1); leaf(2); }};
         unit(u8) leaf = fn(value) {{ core.require(value < 2, {OUTPUT}); }};
         leaf(1);
     "#);

@@ -294,6 +294,7 @@ fn check_package_roots_with_activity(
     let (startup, dormant) = project.modules.split_at(startup_count);
     let (root, ordinals) = package_startup_order(project, startup)?;
     let mut potential_obligations = false;
+    let mut authored_roots = HashMap::<usize, Vec<usize>>::new();
     for (module, source_module) in project.modules.iter().enumerate() {
         if module < startup_count {
             let region = calls.initialization_region(module).ok_or(ProjectCheck::MissingRootOccurrences)?;
@@ -302,10 +303,17 @@ fn check_package_roots_with_activity(
             };
             potential_obligations |= !topology.structure.checker_directives.is_empty();
         }
+        let is_current_symbolic_package = scope == ScalarCheckerScope::CurrentPackage
+            && source_module.source.project == root.project && source_module.source.package == root.package;
         for (item, declaration) in source_module.items.iter().enumerate() {
             if matches!(declaration, ScalarItem::Function(_)) {
                 let body = calls.function_body(module, item, None).ok_or(ProjectCheck::MissingRootOccurrences)?;
-                potential_obligations |= has_callable_obligations(body);
+                if has_callable_obligations(body) {
+                    potential_obligations = true;
+                    if is_current_symbolic_package {
+                        authored_roots.entry(module).or_default().push(item);
+                    }
+                }
             }
         }
     }
@@ -325,10 +333,15 @@ fn check_package_roots_with_activity(
         if visits[ordinal] != InitializationVisit::Completed {
             continue;
         }
-        had_obligations |= check_unused_module(project, calls, &project.modules[ordinal], ordinal, &reached)?;
+        if let Some(seeds) = authored_roots.remove(&ordinal) {
+            had_obligations |= check_unused_module(project, calls, &project.modules[ordinal], ordinal, &reached, seeds)?;
+        }
     }
     for (index, module) in dormant.iter().enumerate() {
-        had_obligations |= check_unused_module(project, calls, module, startup_count + index, &reached)?;
+        let ordinal = startup_count + index;
+        if let Some(seeds) = authored_roots.remove(&ordinal) {
+            had_obligations |= check_unused_module(project, calls, module, ordinal, &reached, seeds)?;
+        }
     }
     Ok(had_obligations)
 }
@@ -338,37 +351,36 @@ fn record_symbolic_callable_edges(
     ordinal: usize,
     caller: usize,
     callers: &mut HashMap<usize, Vec<usize>>,
-) -> bool {
+) {
     for &(target_module, target_item) in body.structure.checker_direct_targets.values() {
         if target_module == ordinal {
-            callers.entry(target_item).or_default().push(caller);
+            let edges = callers.entry(target_item).or_default();
+            if edges.last() != Some(&caller) {
+                edges.push(caller);
+            }
         }
     }
-    let mut authored = !body.structure.checker_directives.is_empty();
     for arm in &body.arms {
-        authored |= record_symbolic_callable_edges(arm, ordinal, caller, callers);
+        record_symbolic_callable_edges(arm, ordinal, caller, callers);
     }
-    authored
 }
 
 fn symbolic_obligation_roots(
     calls: &ProjectCallSiteResults,
     module: &ScalarModule,
     ordinal: usize,
+    mut pending: Vec<usize>,
 ) -> Result<HashSet<usize>, ProjectCheck> {
     let mut callers = HashMap::new();
-    let mut roots = HashSet::new();
     for (item, declaration) in module.items.iter().enumerate() {
         if !matches!(declaration, ScalarItem::Function(_)) {
             continue;
         }
         let body = calls.function_body(ordinal, item, None).ok_or(ProjectCheck::MissingRootOccurrences)?;
-        if record_symbolic_callable_edges(body, ordinal, item, &mut callers) {
-            roots.insert(item);
-        }
+        record_symbolic_callable_edges(body, ordinal, item, &mut callers);
     }
+    let mut roots: HashSet<_> = pending.iter().copied().collect();
     if !callers.is_empty() {
-        let mut pending: Vec<_> = roots.iter().copied().collect();
         while let Some(target) = pending.pop() {
             if let Some(edges) = callers.remove(&target) {
                 pending.extend(edges.into_iter().filter(|caller| roots.insert(*caller)));
@@ -384,8 +396,9 @@ fn check_unused_module(
     module: &ScalarModule,
     ordinal: usize,
     reached: &HashSet<(usize, usize)>,
+    authored_roots: Vec<usize>,
 ) -> Result<bool, ProjectCheck> {
-    let symbolic_roots = symbolic_obligation_roots(calls, module, ordinal)?;
+    let symbolic_roots = symbolic_obligation_roots(calls, module, ordinal, authored_roots)?;
     let mut active = false;
     for (item, declaration) in module.items.iter().enumerate() {
         let ScalarItem::Function(function) = declaration else {
