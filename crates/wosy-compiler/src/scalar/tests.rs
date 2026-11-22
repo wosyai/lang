@@ -5422,6 +5422,41 @@ fn derives_and_types_fixed_array_index_places_and_addresses() {
 }
 
 #[test]
+fn derives_nested_named_field_reads_and_writes_as_canonical_places() {
+    let text = "%%start\nstruct Leaf { u8 value; }\nstruct Route { Leaf finish; }\nRoute course = { .finish = { .value = 7; }; };\nu8(u8) update = fn(next) {\ncourse.finish.value = next;\ncourse.finish.value\n};\n%%end";
+    let result = validate_text(text);
+    assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+    let ScalarItem::Function(function) = &result.program.items[1] else {
+        panic!("route update")
+    };
+    let ScalarBlockItem::Assignment(assignment) = &function.body.items[0] else {
+        panic!("route assignment")
+    };
+    let ScalarBlockItem::Expression(ScalarExpression::IndexedRead { place: rhs, .. }) =
+        &function.body.items[1]
+    else {
+        panic!("route field read")
+    };
+    let value_id = &result.program.structs.iter().find(|ty| ty.name == "Leaf").unwrap().fields[0].id;
+    let finish_id = &result.program.structs.iter().find(|ty| ty.name == "Route").unwrap().fields[0].id;
+    for place in [&assignment.targets[0].place, rhs] {
+        let ScalarPlace::Field { base, field, span } = place else {
+            panic!("outer projection")
+        };
+        assert_eq!(field, &ScalarFieldReference::Resolved(value_id.clone()));
+        assert_eq!(&text[span.start as usize..span.end as usize], "course.finish.value");
+        let ScalarPlace::Field { base, field, span } = base.as_ref() else {
+            panic!("inner projection")
+        };
+        assert_eq!(field, &ScalarFieldReference::Resolved(finish_id.clone()));
+        assert_eq!(&text[span.start as usize..span.end as usize], "course.finish");
+        assert!(matches!(base.as_ref(), ScalarPlace::Name { name, .. } if name == "course"));
+    }
+    let missing = validate_text(&text.replace("course.finish.value\n", "course.finish.missing\n"));
+    assert!(missing.diagnostics.iter().any(|diagnostic| diagnostic.message == "value has no field"));
+}
+
+#[test]
 fn derives_named_fixed_array_field_reads_and_writes_as_canonical_places() {
     let text = "%%start\nstruct Actor { u8 x; }\nu8() update = fn() {\nActor[2] actors = [{ .x = 7; }, { .x = 9; }];\nactors[1].x = actors[0].x;\nactors[1].x\n};\n%%end";
     let result = validate_text(text);

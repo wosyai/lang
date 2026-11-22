@@ -4489,6 +4489,12 @@ fn derive_expression(node: &CstNode) -> ScalarExpression {
             }
         }
         SyntaxKind::QualifiedMember => {
+            if let Some(tail) = actual.children().next() {
+                return ScalarExpression::IndexedRead {
+                    place: derive_qualified_member_place(&actual, Some(tail)),
+                    span: wosy_syntax::byte_span(&actual),
+                };
+            }
             let identifiers: Vec<CstToken> = actual
                 .children_with_tokens()
                 .filter_map(|element| match element {
@@ -4626,28 +4632,7 @@ fn derive_place(node: &CstNode) -> ScalarPlace {
                 span: token_span(&token),
             }
         }
-        SyntaxKind::QualifiedMember => {
-            let identifiers: Vec<_> = node
-                .children_with_tokens()
-                .filter_map(|element| match element {
-                    NodeOrToken::Token(token) if token.kind() == SyntaxKind::Identifier => {
-                        Some(token)
-                    }
-                    _ => None,
-                })
-                .collect();
-            ScalarPlace::Field {
-                base: Box::new(ScalarPlace::Name {
-                    name: identifiers[0].text().to_owned(),
-                    span: token_span(&identifiers[0]),
-                }),
-                field: ScalarFieldReference::Unresolved {
-                    name: identifiers[1].text().to_owned(),
-                    span: token_span(&identifiers[1]),
-                },
-                span: wosy_syntax::byte_span(node),
-            }
-        }
+        SyntaxKind::QualifiedMember => derive_qualified_member_place(node, node.children().next()),
         SyntaxKind::DereferencedField => {
             let field = direct_token(node, SyntaxKind::Identifier).expect("field name");
             let parent = direct_nodes(node)
@@ -4726,6 +4711,45 @@ fn derive_place(node: &CstNode) -> ScalarPlace {
         }
         _ => panic!("place grammar"),
     }
+}
+
+fn derive_qualified_member_place(node: &CstNode, tail: Option<CstNode>) -> ScalarPlace {
+    fn identifiers(node: &CstNode) -> impl Iterator<Item = CstToken> + '_ {
+        node.children_with_tokens().filter_map(|element| match element {
+            NodeOrToken::Token(token) if token.kind() == SyntaxKind::Identifier => Some(token),
+            _ => None,
+        })
+    }
+
+    let mut head = identifiers(node);
+    let name = head.next().expect("qualified place root");
+    let field = head.next().expect("qualified place member");
+    let start = token_span(&name).start;
+    let mut place = ScalarPlace::Name {
+        name: name.text().to_owned(),
+        span: token_span(&name),
+    };
+    let head_end = if tail.is_some() {
+        token_span(&field).end
+    } else {
+        wosy_syntax::byte_span(node).end
+    };
+    let project = |field: CstToken, end| {
+        let name = field.text().to_owned();
+        let span = token_span(&field);
+        (ScalarFieldReference::Unresolved { name, span }, ByteSpan::new(start, end))
+    };
+    let (field, span) = project(field, head_end);
+    place = ScalarPlace::Field { base: Box::new(place), field, span };
+    if let Some(tail) = tail {
+        debug_assert_eq!(tail.kind(), SyntaxKind::DirectFieldChainTail);
+        for field in identifiers(&tail) {
+            let end = token_span(&field).end;
+            let (field, span) = project(field, end);
+            place = ScalarPlace::Field { base: Box::new(place), field, span };
+        }
+    }
+    place
 }
 
 fn direct_nodes(node: &CstNode) -> Vec<CstNode> {
