@@ -3771,9 +3771,9 @@ fn typed_named_universal_conjunction(
 }
 
 #[cfg(feature = "internal-checker")]
-fn typed_named_repeated_universal(
+fn typed_named_repeated_universal<const DEPENDENT: bool>(
     foralls: impl Iterator<Item = CstNode>, ensures: &ScalarExpression,
-    output: &str, inputs: &[String], ty: &ScalarType,
+    output: &str, inputs: &[String], ty: &ScalarType, dependent: Option<(&CstNode, &ScalarBlock)>,
 ) -> Result<TypedProofGoal, ProjectCheck> {
     use std::cmp::Ordering::{Equal, Greater, Less};
     if !matches!(ensures, ScalarExpression::Binary { operator: BinaryOperator::And, .. }) {
@@ -3789,13 +3789,37 @@ fn typed_named_repeated_universal(
             return Err(ProjectCheck::InvalidProof);
         }
     }
+    let witness = if DEPENDENT {
+        let (exists, steps) = dependent.ok_or(ProjectCheck::Unsupported)?;
+        let (_, existential) = typed_quantifier_binder(exists, output, inputs, ty)?;
+        if names.contains_key(existential.as_str()) {
+            return Err(ProjectCheck::InvalidProof);
+        }
+        let ScalarExpression::Name { name, .. } = authored_witness_argument(steps)? else {
+            return Err(ProjectCheck::Unsupported);
+        };
+        let chosen = *names.get(name.as_str()).ok_or(ProjectCheck::Unsupported)?;
+        Some((exists, existential, chosen))
+    } else {
+        None
+    };
+    let mut saw_existential = false;
     let mut relations = vec![None::<IntegerRelation>; declarations.len()];
     let mut output_bounds = IntegerShowConstraints::default();
     let mut has_output_bounds = false;
     visit_output_conjuncts(ensures, |atom| {
         if let ScalarExpression::Binary { operator, left, right, .. } = atom {
             if let ScalarExpression::Name { name, .. } = right.as_ref() {
-                let slot = *names.get(name.as_str()).ok_or(ProjectCheck::Unsupported)?;
+                let slot = if let Some((_, binder, chosen)) = &witness {
+                    if name == binder {
+                        saw_existential = true;
+                        *chosen
+                    } else {
+                        *names.get(name.as_str()).ok_or(ProjectCheck::Unsupported)?
+                    }
+                } else {
+                    *names.get(name.as_str()).ok_or(ProjectCheck::Unsupported)?
+                };
                 if !matches!(left.as_ref(), ScalarExpression::Name { name, .. } if name == output) {
                     return Err(ProjectCheck::Unsupported);
                 }
@@ -3809,10 +3833,17 @@ fn typed_named_repeated_universal(
         has_output_bounds = true;
         Ok(())
     })?;
+    if DEPENDENT && !saw_existential {
+        return Err(ProjectCheck::Unsupported);
+    }
+    let admission = witness.map(|(exists, binder, chosen)| {
+        let domain = typed_quantifier_domain(exists, &binder, inputs, ty)?;
+        Ok::<_, ProjectCheck>((chosen, domain))
+    }).transpose()?;
     let mut unavailable = false;
     let mut impossible = false;
     let mut forbidden = OwnedIntegerUnion::default();
-    for ((forall, binder), relation) in declarations.into_iter().zip(relations) {
+    for (slot, ((forall, binder), relation)) in declarations.into_iter().zip(relations).enumerate() {
         let domain = typed_quantifier_domain(&forall, &binder, inputs, ty)?;
         let (Some((minimum, maximum)), Some(relation)) = (domain.extremes(), relation) else {
             unavailable = true;
@@ -3822,15 +3853,22 @@ fn typed_named_repeated_universal(
             continue;
         }
         let lower = match (relation.accepts(Less), relation.accepts(Greater), relation.accepts(Equal)) {
-            (true, false, _) => true,
-            (false, true, _) => false,
-            (false, false, true) if minimum == maximum => true,
+            (true, false, _) => Some(true),
+            (false, true, _) => Some(false),
+            (false, false, true) if minimum == maximum => Some(true),
             (false, false, _) => { impossible = true; continue; }
-            (true, true, false) => {
-                forbidden.push(domain);
+            (true, true, false) => None,
+            _ => return Err(ProjectCheck::Unsupported),
+        };
+        if let Some((chosen, existential)) = &admission {
+            if slot == *chosen && !domain.is_subset_of(existential) {
+                impossible = true;
                 continue;
             }
-            _ => return Err(ProjectCheck::Unsupported),
+        }
+        let Some(lower) = lower else {
+            forbidden.push(domain);
+            continue;
         };
         let bound = domain.into_extremum(lower).ok_or(ProjectCheck::Unsupported)?;
         output_bounds.add(relation, Cow::Owned(bound));
@@ -3840,17 +3878,35 @@ fn typed_named_repeated_universal(
         return Err(ProjectCheck::Unsupported);
     }
     if impossible {
-        return Ok(TypedProofGoal::UniversalConjunction(UniversalConjunction::Impossible));
+        return Ok(if DEPENDENT {
+            TypedProofGoal::DependentWitness(DependentWitness::Unavailable)
+        } else {
+            TypedProofGoal::UniversalConjunction(UniversalConjunction::Impossible)
+        });
     }
     if let Some(forbidden) = forbidden.finish() {
         if !has_output_bounds {
-            return Ok(TypedProofGoal::UniversalNotEqual(forbidden));
+            return Ok(if DEPENDENT {
+                TypedProofGoal::DependentWitness(DependentWitness::Avoiding(forbidden))
+            } else {
+                TypedProofGoal::UniversalNotEqual(forbidden)
+            });
         }
         output_bounds.normalize();
-        return Ok(TypedProofGoal::UniversalConjunction(UniversalConjunction::OutputAvoiding(Box::new((output_bounds, forbidden)))));
+        let bounds = Box::new((output_bounds, forbidden));
+        return Ok(if DEPENDENT {
+            TypedProofGoal::DependentWitness(DependentWitness::OutputAvoiding(bounds))
+        } else {
+            TypedProofGoal::UniversalConjunction(UniversalConjunction::OutputAvoiding(bounds))
+        });
     }
     output_bounds.normalize();
-    Ok(TypedProofGoal::UniversalConjunction(UniversalConjunction::Output(Box::new(output_bounds))))
+    let output = Box::new(output_bounds);
+    Ok(if DEPENDENT {
+        TypedProofGoal::DependentWitness(DependentWitness::Output(output))
+    } else {
+        TypedProofGoal::UniversalConjunction(UniversalConjunction::Output(output))
+    })
 }
 
 fn typed_quantifier_binder(
@@ -4676,10 +4732,18 @@ fn typed_proof_postcondition<'a, const AUDIT_INDUCTION: bool, const DEFER_OUTPUT
         if let Some(forall) = foralls.next() {
             #[cfg(feature = "internal-checker")]
             {
-                if !allow_named_entry_facts || foralls.next().is_some() {
+                if !allow_named_entry_facts {
                     return Err(ProjectCheck::Unsupported);
                 }
-                typed_named_dependent_witness(&forall, &exists, steps, output, &input_names, &result.ty)?
+                if let Some(second) = foralls.next() {
+                    let predicate = derive_expression(&child(&exists, SyntaxKind::Expression)?);
+                    typed_named_repeated_universal::<true>(
+                        [forall, second].into_iter().chain(foralls), &predicate, output, &input_names, &result.ty,
+                        Some((&exists, steps)),
+                    )?
+                } else {
+                    typed_named_dependent_witness(&forall, &exists, steps, output, &input_names, &result.ty)?
+                }
             }
             #[cfg(not(feature = "internal-checker"))]
             {
@@ -4701,8 +4765,8 @@ fn typed_proof_postcondition<'a, const AUDIT_INDUCTION: bool, const DEFER_OUTPUT
                     if !allow_named_entry_facts || !steps.items.is_empty() {
                         return Err(ProjectCheck::Unsupported);
                     }
-                    typed_named_repeated_universal(
-                        [forall, second].into_iter().chain(foralls), &ensures, output, &input_names, &result.ty,
+                    typed_named_repeated_universal::<false>(
+                        [forall, second].into_iter().chain(foralls), &ensures, output, &input_names, &result.ty, None,
                     )?
                 }
                 #[cfg(not(feature = "internal-checker"))]

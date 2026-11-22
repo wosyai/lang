@@ -3162,6 +3162,25 @@ fn named_dependent_existential_witness_checks_each_universal_candidate_exactly()
     assert_eq!(check(domain, matching, "out <= k && out >= k && out < -7", "i", "input == -8", ""), Unsupported);
     assert_eq!(check(domain, matching, "out < k && out >= k && out < 0", "i", "input == -8", ""), Unsupported);
     assert!(matches!(check(domain, matching, "out < k && out >= k && out < 32768", "i", "input == -8", ""), Invalid(_)));
+    let repeated = format!("{domain} forall (i16 j where j >= -6)");
+    let opposite = format!("{domain} forall (i16 j where j >= -7)");
+    let chosen_last = format!("forall (i16 j where j >= -6) {domain}");
+    let joint = "out != k && out < j && out >= -8";
+    assert_eq!(check(&repeated, matching, joint, "i", "input == -7", ""), Proved);
+    assert_eq!(check(&chosen_last, matching, joint, "i", "input == -7", ""), Proved);
+    assert_eq!(check(&opposite, matching, joint, "i", "input == -7", ""), Unsupported);
+    assert_eq!(check(&repeated, matching, joint, "i", "true", "i16 a = echo(-7); i16 b = echo(-8);"), Unsupported);
+    assert_eq!(check(&repeated, matching, joint, "i", "true", "i16 a = echo(-7); i16 b = echo(-7);"), Proved);
+    assert_eq!(check(&repeated, too_small, joint, "i", "input == -7", ""), Unsupported);
+    assert_eq!(check(&repeated, too_small, joint, "i", "false", "i16 a = echo(-7);"), NoApplicableInputs);
+    assert_eq!(check(&repeated, matching, "out != i && out < j", "i", "input == -7", ""), Unsupported);
+    assert_eq!(check(&repeated, matching, "out != k && j < k", "i", "input == -7", ""), Unsupported);
+    assert_eq!(check(&repeated, matching, joint, "input", "input == -7", ""), Unsupported);
+    assert_eq!(check(&format!("{domain} forall (i16 j where false)"), matching, joint, "i", "input == -7", ""), Unsupported);
+    assert!(matches!(check(&repeated, "i16 j", "out != j && out < i", "i", "input == -7", ""), Invalid(_)));
+    assert!(matches!(check(&format!("{repeated} forall (i16 i)"), matching, joint, "i", "input == -7", ""), Invalid(_)));
+    assert!(matches!(check(&format!("{repeated} forall (i16 z where z <= 32768)"), too_small,
+        "out != k && out < j && out < z", "i", "input == -7", ""), Invalid(_)));
 }
 
 #[test]
