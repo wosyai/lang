@@ -578,9 +578,35 @@ fn load_canonical_project_inputs(
 #[cfg(feature = "internal-checker")]
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug)]
-struct InternalCheckReceipt {
-    outcome: wosy_compiler::ScalarCheckerOutcome,
+struct InternalCheckReceipt<Outcome = wosy_compiler::ScalarCheckerOutcome> {
+    outcome: Outcome,
     texts: BTreeMap<ProjectSourceIdentity, String>,
+}
+
+#[cfg(feature = "internal-checker")]
+type InternalOrderedCheckReceipt = InternalCheckReceipt<wosy_compiler::ScalarOrderedCheckerOutcome>;
+
+#[cfg(feature = "internal-checker")]
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, PartialEq)]
+enum InternalCheckStatus<'a> {
+    Zero,
+    FirstNonzero(&'a wosy_compiler::ScalarCheckerFailure),
+}
+
+#[cfg(feature = "internal-checker")]
+#[cfg_attr(not(test), allow(dead_code))]
+impl InternalCheckReceipt<wosy_compiler::ScalarOrderedCheckerOutcome> {
+    fn selected_status(&self) -> Option<InternalCheckStatus<'_>> {
+        use wosy_compiler::ScalarOrderedCheckerOutcome;
+        match &self.outcome {
+            ScalarOrderedCheckerOutcome::Passed | ScalarOrderedCheckerOutcome::NoChecks =>
+                Some(InternalCheckStatus::Zero),
+            ScalarOrderedCheckerOutcome::Failed(reports) => Some(reports.iter().find(|report| report.code.bits() != 0)
+                .map_or(InternalCheckStatus::Zero, InternalCheckStatus::FirstNonzero)),
+            ScalarOrderedCheckerOutcome::Unsupported | ScalarOrderedCheckerOutcome::Invalid(_) => None,
+        }
+    }
 }
 
 #[cfg(feature = "internal-checker")]
@@ -648,6 +674,44 @@ fn check_loaded_project(
     scope: wosy_compiler::ScalarCheckerScope,
     dormant_sources: Vec<DormantSourceInput>,
 ) -> Result<InternalCheckReceipt, CanonicalLoadFailure> {
+    check_loaded_project_with(
+        root, project, configuration, target_layout, scope, dormant_sources,
+        wosy_compiler::check_scalar_package_with_dormant_sources,
+    )
+}
+
+#[cfg(feature = "internal-checker")]
+#[cfg_attr(not(test), allow(dead_code))]
+fn check_loaded_ordered_project(
+    root: &std::path::Path,
+    project: &ProjectContext,
+    configuration: &ProjectConfiguration,
+    target_layout: ScalarTargetLayout,
+    scope: wosy_compiler::ScalarCheckerScope,
+    dormant_sources: Vec<DormantSourceInput>,
+) -> Result<InternalOrderedCheckReceipt, CanonicalLoadFailure> {
+    check_loaded_project_with(
+        root, project, configuration, target_layout, scope, dormant_sources,
+        wosy_compiler::check_scalar_package_ordered_with_dormant_sources,
+    )
+}
+
+#[cfg(feature = "internal-checker")]
+fn check_loaded_project_with<Outcome>(
+    root: &std::path::Path,
+    project: &ProjectContext,
+    configuration: &ProjectConfiguration,
+    target_layout: ScalarTargetLayout,
+    scope: wosy_compiler::ScalarCheckerScope,
+    dormant_sources: Vec<DormantSourceInput>,
+    check: impl FnOnce(
+        Vec<(wosy_compiler::ScalarSourceDeclarations, Vec<ScalarNamespaceBinding>)>,
+        Vec<SourceIdentity>,
+        Vec<wosy_compiler::ScalarSourceDeclarations>,
+        ScalarPreparationInputs,
+        wosy_compiler::ScalarCheckerScope,
+    ) -> Outcome,
+) -> Result<InternalCheckReceipt<Outcome>, CanonicalLoadFailure> {
     let CanonicalProjectInputs { declarations, initialization_order, mut texts, .. } =
         load_canonical_project_inputs(root, project, configuration, CanonicalLoadPurpose::Check)?;
     let dormant = if scope == wosy_compiler::ScalarCheckerScope::CurrentPackage {
@@ -657,7 +721,7 @@ fn check_loaded_project(
     };
     #[cfg(test)]
     routing_observations::record(|counts| counts.checks += 1);
-    let outcome = wosy_compiler::check_scalar_package_with_dormant_sources(
+    let outcome = check(
         declarations, initialization_order, dormant, ScalarPreparationInputs { target_layout }, scope,
     );
     Ok(InternalCheckReceipt { outcome, texts })
@@ -1349,6 +1413,94 @@ mod tests {
         assert_eq!(counts, routing_observations::Counts {
             extractions: 1, preparations: 1, builds: 1, single_module_emissions: 1, ..Default::default()
         });
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn internal_ordered_checker_selects_exact_typed_status_and_keeps_every_report() {
+        use wosy_compiler::{ScalarCheckerScope, ScalarOrderedCheckerOutcome};
+        for (second, third) in [
+            ("23", "9"),
+            ("0", "0"),
+            ("340282366920938463463374607431768211456", "9"),
+        ] {
+            let main = r#"%%start
+                core.require(false, { .stdout = "primeiro"; .stderr = ""; .code = 0;
+                    .files = [{ .path = "report.txt"; .text = "α"; }]; });
+                lib = namespace app "lib.w";
+            %%end"#;
+            let library = format!(r#"%%start
+                core.require(false, {{ .stdout = ""; .stderr = "second☕"; .code = {second}; .files = []; }});
+            %%end"#);
+            let dormant = format!(r#"%%start
+                core.require(false, {{ .stdout = "must not initialize"; .stderr = ""; .code = 7; .files = []; }});
+                unit(u8) unused = fn(value) {{
+                    core.require(value < 3, {{ .stdout = "third"; .stderr = ""; .code = {third}; .files = []; }});
+                }};
+            %%end"#);
+            let (project, configuration) = routing_test_project("ordered-internal-checker-receipt", &[
+                ("main.w", main), ("lib.w", &library), ("extra.w", "invalid on-disk source"),
+            ]);
+            let observed = |scope| routing_observations::observe(|| check_loaded_ordered_project(
+                &project.root, &project, &configuration, ScalarTargetLayout::WASM32, scope,
+                vec![received_source(&project.root, "extra.w", &dormant)],
+            ));
+            let (receipt, counts) = observed(ScalarCheckerScope::CurrentPackage);
+            let receipt = receipt.expect("ordered canonical receipt");
+            let ScalarOrderedCheckerOutcome::Failed(reports) = &receipt.outcome else { panic!("expected authored reports"); };
+            let [first, next, last] = reports.as_slice() else { panic!("expected all three reports"); };
+            assert_eq!(reports.iter().map(|report| report.code.to_string()).collect::<Vec<_>>(), ["0", second, third]);
+            assert_eq!((first.source.path.as_str(), next.source.path.as_str(), last.source.path.as_str()),
+                ("main.w", "lib.w", "extra.w"));
+            assert_eq!(&*first.stdout, b"primeiro");
+            assert_eq!(&*next.stderr, "second☕".as_bytes());
+            assert_eq!(&*last.stdout, b"third");
+            assert_eq!(&*first.files[0].text, "α".as_bytes());
+            if second == "0" {
+                assert_eq!(receipt.selected_status(), Some(InternalCheckStatus::Zero));
+            } else {
+                let Some(InternalCheckStatus::FirstNonzero(selected)) = receipt.selected_status() else {
+                    panic!("expected exact first nonzero candidate");
+                };
+                assert!(std::ptr::eq(selected, next));
+                assert_eq!(selected.code.to_string(), second);
+            }
+            assert_eq!(receipt.texts.len(), 3);
+            assert!(receipt.texts.values().any(|text| text == &dormant));
+            assert_eq!(counts, routing_observations::Counts { extractions: 3, checks: 1, ..Default::default() });
+
+            let (main_only, counts) = observed(ScalarCheckerScope::MainFlowOnly);
+            let main_only = main_only.expect("without dormant selection");
+            assert!(matches!(&main_only.outcome, ScalarOrderedCheckerOutcome::Failed(reports) if reports.len() == 2));
+            assert_eq!(main_only.texts.len(), 2);
+            assert_eq!(counts, routing_observations::Counts { extractions: 2, checks: 1, ..Default::default() });
+            assert!(!project.root.join(".wosy").exists());
+            assert!(!project.root.join("report.txt").exists());
+        }
+        assert!(Arguments::try_parse_from(["wosy", "check"]).is_err());
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn internal_ordered_checker_does_not_map_incomplete_analysis_to_zero() {
+        use wosy_compiler::{ScalarCheckerScope, ScalarOrderedCheckerOutcome};
+        let text = r#"%%start
+            unit() leaf = fn {};
+            unit() parent = fn { leaf(); };
+            core.require(false, { .stdout = "not published"; .stderr = ""; .code = 0; .files = []; });
+            parent();
+        %%end"#;
+        let (project, configuration) = routing_test_project("ordered-internal-unsupported", &[("main.w", text)]);
+        let (receipt, counts) = routing_observations::observe(|| check_loaded_ordered_project(
+            &project.root, &project, &configuration, ScalarTargetLayout::WASM32,
+            ScalarCheckerScope::MainFlowOnly, Vec::new(),
+        ));
+        let receipt = receipt.expect("well-formed canonical source");
+        assert_eq!(receipt.outcome, ScalarOrderedCheckerOutcome::Unsupported);
+        assert_eq!(receipt.selected_status(), None);
+        assert_eq!(receipt.texts.len(), 1);
+        assert_eq!(counts, routing_observations::Counts { extractions: 1, checks: 1, ..Default::default() });
+        assert!(!project.root.join(".wosy").exists());
     }
 
     #[cfg(feature = "internal-checker")]
