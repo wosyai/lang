@@ -2067,6 +2067,7 @@ impl Hash for ExactGuardGroup<'_> {
             std::mem::discriminant(predicate).hash(state);
             match predicate {
                 CheckerPredicate::Boolean(value) => value.hash(state),
+                CheckerPredicate::DirectiveDisjunction { .. } => {}
                 CheckerPredicate::EntryDomain { binding, values } => {
                     binding.hash(state);
                     values.hash(state);
@@ -2381,6 +2382,7 @@ fn checked_integer_guard_slots<'a, const ALLOW_DOMAIN: bool>(
     for predicate in filter {
         match predicate {
             CheckerPredicate::Boolean(value) => guard.always_rejects |= !value,
+            CheckerPredicate::DirectiveDisjunction { .. } => return None,
             CheckerPredicate::EntryDomain { binding, values } => {
                 if !ALLOW_DOMAIN || guard.domain.is_some() {
                     return None;
@@ -3014,7 +3016,7 @@ fn induction_entry_domain(
         match guard {
             CheckerPredicate::Boolean(true) => {}
             CheckerPredicate::Boolean(false) => return Ok((IntegerSet::default(), minimum)),
-            CheckerPredicate::EntryDomain { .. } => return Err(ProjectCheck::Unsupported),
+            CheckerPredicate::EntryDomain { .. } | CheckerPredicate::DirectiveDisjunction { .. } => return Err(ProjectCheck::Unsupported),
             CheckerPredicate::Integer(predicate) if &predicate.binding == binding => {
                 entries = entries.keep(&predicate.operator, &predicate.bound).ok_or(ProjectCheck::Unsupported)?;
                 if entries.is_empty() {
@@ -3046,7 +3048,7 @@ fn induction_base_reachable(
     }
     match guard {
         CheckerPredicate::Boolean(value) => Ok(*value),
-        CheckerPredicate::EntryDomain { .. } => Err(ProjectCheck::Unsupported),
+        CheckerPredicate::EntryDomain { .. } | CheckerPredicate::DirectiveDisjunction { .. } => Err(ProjectCheck::Unsupported),
         CheckerPredicate::Integer(predicate) => {
             let complement = complement_integer_comparison(&predicate.operator)
                 .and_then(IntegerRelation::from_operator).ok_or(ProjectCheck::Unsupported)?;
@@ -3066,7 +3068,7 @@ fn check_induction_entry_domain(
     match base_guard {
         CheckerPredicate::Boolean(true) => return Ok(InductionPremise::Unreachable),
         CheckerPredicate::Boolean(false) => {}
-        CheckerPredicate::EntryDomain { .. } => return Err(ProjectCheck::Unsupported),
+        CheckerPredicate::EntryDomain { .. } | CheckerPredicate::DirectiveDisjunction { .. } => return Err(ProjectCheck::Unsupported),
         CheckerPredicate::Integer(predicate) => {
             let operator = complement_integer_comparison(&predicate.operator).ok_or(ProjectCheck::Unsupported)?;
             entries = entries.keep(operator, &predicate.bound).ok_or(ProjectCheck::Unsupported)?;
@@ -3103,8 +3105,7 @@ fn normalize_output_disjunction(
 ) -> Option<IntegerSet> {
     #[cfg(all(test, feature = "internal-checker"))]
     OUTPUT_UNION_NORMALIZATIONS.with(|count| count.set(count.get() + 1));
-    let domain = IntegerSet::from_type(output)?;
-    Some(domain.keep_relation(*left_relation, left_bound).join(domain.keep_relation(*right_relation, right_bound)))
+    IntegerSet::comparison_union(output, (*left_relation, left_bound), (*right_relation, right_bound))
 }
 
 fn typed_proof_postcondition<'a, const AUDIT_INDUCTION: bool, const DEFER_OUTPUT_UNION: bool>(
@@ -3301,7 +3302,7 @@ fn issue_return_bound(
     let guards = conditions.unwrap_or_default().iter().map(|condition| {
         match condition {
             CheckerPredicate::Boolean(value) => Some(VerifiedEntryGuard::Boolean(*value)),
-            CheckerPredicate::EntryDomain { .. } => None,
+            CheckerPredicate::EntryDomain { .. } | CheckerPredicate::DirectiveDisjunction { .. } => None,
             CheckerPredicate::Integer(predicate) => {
                 let slot = body.boundary.checker_parameter_bindings.as_deref()?
                     .iter().position(|binding| *binding == predicate.binding)?;
@@ -3540,9 +3541,10 @@ fn proof_entry_filters(
                 if left.binding != right.binding || left.ty != right.ty {
                     return Err(ProjectCheck::Unsupported);
                 }
-                let domain = IntegerSet::from_type(&left.ty).ok_or(ProjectCheck::Unsupported)?;
-                let values = domain.keep(&left.operator, &left.bound).ok_or(ProjectCheck::Unsupported)?
-                    .join(domain.keep(&right.operator, &right.bound).ok_or(ProjectCheck::Unsupported)?);
+                let left_relation = IntegerRelation::from_operator(&left.operator).ok_or(ProjectCheck::Unsupported)?;
+                let right_relation = IntegerRelation::from_operator(&right.operator).ok_or(ProjectCheck::Unsupported)?;
+                let values = IntegerSet::comparison_union(&left.ty, (left_relation, &left.bound), (right_relation, &right.bound))
+                    .ok_or(ProjectCheck::Unsupported)?;
                 filters.push(CheckerPredicate::EntryDomain { binding: left.binding, values });
                 has_domain = true;
             }
@@ -4018,6 +4020,68 @@ mod tests {
         let prepared = prepare("if (false) { alias.leaf(value); };", "lib.leaf(1);");
         assert_eq!(collect_ordered_package_failures(&prepared, ScalarCheckerScope::CurrentPackage, 2),
             Ok((true, Vec::new())));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordered_package_symbolic_directive_disjunction_preserves_exact_holes_and_narrowing() {
+        use super::super::checker_flow::DIRECTIVE_DISJUNCTION_NORMALIZATIONS;
+        let normalizations = || DIRECTIVE_DISJUNCTION_NORMALIZATIONS.with(|count| count.replace(0));
+        let _ = normalizations();
+        let app = source("src/main.w", "directive-disjunction");
+        let prepare = |guard: &str, actual: &str| {
+            let text = format!(r#"%%start
+                unit(u8, u8) checked = fn(x, y) {{
+                    if (y == 1) {{}};
+                    if (false) {{ core.require(x == 1 || x == 7, {OUTPUT}); }};
+                    core.require({guard}, {OUTPUT});
+                    core.require(x != 4, {OUTPUT});
+                    core.narrow(x == 1 || x == 7, {OUTPUT});
+                    core.require(x == 1, {OUTPUT});
+                }};
+                {actual}
+            %%end"#);
+            let prepared = prepare_checker_project(
+                vec![(declarations(&app, &text), Vec::new())], vec![app.clone()], inputs(),
+            ).unwrap();
+            (text, prepared)
+        };
+        let report = |text: &str, prepared: &PreparedCheckerProject, scope| {
+            let (active, failures) = collect_ordered_package_failures(prepared, scope, 1).unwrap();
+            assert!(active);
+            failures.into_iter().map(|failure| {
+                let ProjectCheck::Failed { condition, state, .. } = failure else { panic!("expected failure"); };
+                let intervals = state.intervals_at(0, 0).unwrap()
+                    .map(|(lo, hi)| (lo.clone(), hi.clone())).collect::<Vec<_>>();
+                (text[condition.start as usize..condition.end as usize].to_owned(), intervals)
+            }).collect::<Vec<_>>()
+        };
+        let expected = |condition: &str, intervals: &[(u8, u8)]| (condition.to_owned(),
+            intervals.iter().map(|&(lo, hi)| (BigInt::from(lo), BigInt::from(hi))).collect::<Vec<_>>());
+        let guard = "x < 2 || x > 6";
+        let (text, project) = prepare(guard, "");
+        assert_eq!(normalizations(), 0);
+        assert_eq!(report(&text, &project, ScalarCheckerScope::CurrentPackage), [
+            expected(guard, &[(2, 6)]),
+            expected("x != 4", &[(4, 4)]),
+            expected("x == 1", &[(7, 7)]),
+        ]);
+        assert_eq!(normalizations(), 2);
+        let (text, project) = prepare(guard, "checked(4, 1);");
+        assert_eq!(normalizations(), 0);
+        assert_eq!(check_package_roots(&project), Err(ProjectCheck::Unsupported));
+        assert_eq!(normalizations(), 0);
+        assert_eq!(report(&text, &project, ScalarCheckerScope::MainFlowOnly), [
+            expected(guard, &[(4, 4)]),
+            expected("x != 4", &[(4, 4)]),
+            expected("x == 1 || x == 7", &[(4, 4)]),
+        ]);
+        assert_eq!(normalizations(), 2);
+
+        let (_, project) = prepare("x < 2 || y > 6", "checked(4, 1);");
+        assert_eq!(collect_ordered_package_failures(&project, ScalarCheckerScope::MainFlowOnly, 1),
+            Err(ProjectCheck::Unsupported));
+        assert_eq!(normalizations(), 0);
     }
 
     #[cfg(feature = "internal-checker")]

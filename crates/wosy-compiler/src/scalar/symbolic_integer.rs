@@ -115,6 +115,13 @@ impl IntegerSet {
         Some(self.keep_relation(IntegerRelation::from_operator(operator)?, bound))
     }
 
+    pub(super) fn comparison_union(
+        ty: &ScalarType, left: (IntegerRelation, &BigInt), right: (IntegerRelation, &BigInt),
+    ) -> Option<Self> {
+        let domain = Self::from_type(ty)?;
+        Some(domain.keep_relation(left.0, left.1).join(domain.keep_relation(right.0, right.1)))
+    }
+
     pub(super) fn keep_relation(&self, relation: IntegerRelation, bound: &BigInt) -> Self {
         self.partition::<false>(relation, bound).0
     }

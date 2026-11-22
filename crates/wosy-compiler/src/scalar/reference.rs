@@ -6782,10 +6782,20 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
         expression: &ScalarExpression,
         names: &BTreeMap<String, WalkBinding>,
     ) -> Option<super::checker_flow::CheckerPredicate> {
-        use super::checker_flow::{CheckerPredicate, IntegerComparison};
+        use super::checker_flow::CheckerPredicate;
         if let ScalarExpression::Boolean { value, .. } = expression {
             return Some(CheckerPredicate::Boolean(*value));
         }
+        self.checker_integer_predicate(expression, names).map(CheckerPredicate::Integer)
+    }
+
+    #[cfg(any(test, feature = "internal-checker"))]
+    fn checker_integer_predicate(
+        &self,
+        expression: &ScalarExpression,
+        names: &BTreeMap<String, WalkBinding>,
+    ) -> Option<super::checker_flow::IntegerPredicate> {
+        use super::checker_flow::IntegerComparison;
         let WalkMode::Callable(callable) = &self.mode else {
             return None;
         };
@@ -6797,7 +6807,27 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
         };
         let left_type = self.occurrence_typing.checked_expression_type(comparison.left)?;
         let right_type = self.occurrence_typing.checked_expression_type(comparison.right)?;
-        comparison.typed(left_type, right_type, binding).map(CheckerPredicate::Integer)
+        comparison.typed(left_type, right_type, binding)
+    }
+
+    #[cfg(any(test, feature = "internal-checker"))]
+    fn checked_callable_directive_predicate(
+        &self, expression: &ScalarExpression, names: &BTreeMap<String, WalkBinding>,
+    ) -> Option<super::checker_flow::CheckerPredicate> {
+        use super::{checker_flow::CheckerPredicate, symbolic_integer::IntegerRelation};
+        let ScalarExpression::Binary { operator: BinaryOperator::Or, left, right, .. } = expression else {
+            return self.checker_predicate(expression, names);
+        };
+        let left = self.checker_integer_predicate(left, names)?;
+        let right = self.checker_integer_predicate(right, names)?;
+        if left.binding != right.binding || left.ty != right.ty {
+            return None;
+        }
+        let lhs = IntegerRelation::from_operator(&left.operator)?;
+        let rhs = IntegerRelation::from_operator(&right.operator)?;
+        Some(CheckerPredicate::DirectiveDisjunction {
+            binding: left.binding, ty: left.ty, atoms: [(lhs, left.bound), (rhs, right.bound)],
+        })
     }
 
     #[cfg(any(test, feature = "internal-checker"))]
@@ -6893,7 +6923,7 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
             let (predicate, initializer_predicate) = if matches!(self.mode, WalkMode::ModuleInitialization { .. }) {
                 (None, self.checked_bool_initializer_predicate(condition, names))
             } else {
-                (self.checker_predicate(condition, names), None)
+                (self.checked_callable_directive_predicate(condition, names), None)
             };
             self.structure.checker_directives.insert(
                 ordinal,

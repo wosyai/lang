@@ -17,6 +17,7 @@ pub(super) enum CheckerPredicate {
     Boolean(bool),
     Integer(IntegerPredicate),
     EntryDomain { binding: ReferenceBindingId, values: IntegerSet },
+    DirectiveDisjunction { binding: ReferenceBindingId, ty: ScalarType, atoms: [(IntegerRelation, BigInt); 2] },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -177,6 +178,48 @@ impl IntegerInputs {
         });
     }
 
+    fn intersection_witness(&self, axis: usize, values: &IntegerSet) -> Self {
+        let mut witness = Self::default();
+        for row in &self.0 {
+            match row[axis].intersection(values) {
+                IntegerIntersection::Empty => {}
+                IntegerIntersection::Unchanged => witness.0.push(row.clone()),
+                IntegerIntersection::Changed(intersection) => {
+                    let mut row = row.clone();
+                    row[axis] = Rc::new(intersection);
+                    witness.0.push(row);
+                }
+            }
+        }
+        witness
+    }
+
+    fn restrict_axis_or_witness(&mut self, axis: usize, values: &IntegerSet) -> Self {
+        let mut rejected_prefix = 0;
+        let mut surviving = false;
+        self.0.retain_mut(|row| match row[axis].intersection(values) {
+            IntegerIntersection::Empty if !surviving => {
+                rejected_prefix += 1;
+                true
+            }
+            IntegerIntersection::Empty => false,
+            IntegerIntersection::Unchanged => {
+                surviving = true;
+                true
+            }
+            IntegerIntersection::Changed(intersection) => {
+                surviving = true;
+                row[axis] = Rc::new(intersection);
+                true
+            }
+        });
+        if !surviving {
+            return std::mem::take(self);
+        }
+        drop(self.0.drain(..rejected_prefix));
+        Self::default()
+    }
+
     fn split(
         self,
         roots: &IntegerRoots<'_>,
@@ -186,7 +229,7 @@ impl IntegerInputs {
             CheckerPredicate::Boolean(true) => return Some((self, Self::default(), None)),
             CheckerPredicate::Boolean(false) => return Some((Self::default(), self, None)),
             CheckerPredicate::Integer(predicate) => predicate,
-            CheckerPredicate::EntryDomain { .. } => return None,
+            CheckerPredicate::EntryDomain { .. } | CheckerPredicate::DirectiveDisjunction { .. } => return None,
         };
         let (index, ty) = roots.lookup(&predicate.binding)?;
         if ty != &predicate.ty {
@@ -221,7 +264,7 @@ impl IntegerInputs {
             CheckerPredicate::Boolean(true) => return Some(Self::default()),
             CheckerPredicate::Boolean(false) => return Some(Self(self.0.clone())),
             CheckerPredicate::Integer(predicate) => predicate,
-            CheckerPredicate::EntryDomain { .. } => return None,
+            CheckerPredicate::EntryDomain { .. } | CheckerPredicate::DirectiveDisjunction { .. } => return None,
         };
         let (index, ty) = roots.lookup(&predicate.binding)?;
         if ty != &predicate.ty {
@@ -462,7 +505,7 @@ impl IntegerReturningPath<'_> {
         let (yes, no) = match guard {
             CheckerPredicate::Boolean(true) => (self.state, IntegerInputs::default()),
             CheckerPredicate::Boolean(false) => (IntegerInputs::default(), self.state),
-            CheckerPredicate::EntryDomain { .. } => return None,
+            CheckerPredicate::EntryDomain { .. } | CheckerPredicate::DirectiveDisjunction { .. } => return None,
             CheckerPredicate::Integer(predicate) => {
                 let index = self.axes.iter().position(|binding| **binding == predicate.binding)?;
                 self.state.split_axis(index, predicate)?
@@ -905,6 +948,7 @@ fn run_integer_callable<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool>
         match filter {
             CheckerPredicate::Boolean(true) => {}
             CheckerPredicate::Boolean(false) => return Some(Ok(ProofCoverage::NoApplicableInputs)),
+            CheckerPredicate::DirectiveDisjunction { .. } => return None,
             CheckerPredicate::EntryDomain { binding, values } => {
                 let (axis, _) = roots.lookup(binding)?;
                 match row[axis].intersection(values) {
@@ -950,6 +994,24 @@ fn run_integer_callable<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool>
     }
 }
 
+#[cfg(all(test, feature = "internal-checker"))]
+thread_local! {
+    pub(super) static DIRECTIVE_DISJUNCTION_NORMALIZATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn normalize_directive_disjunction(
+    operation: CheckerOperation, ty: &ScalarType,
+    [(lhs, left), (rhs, right)]: &[(IntegerRelation, BigInt); 2],
+) -> Option<IntegerSet> {
+    #[cfg(all(test, feature = "internal-checker"))]
+    DIRECTIVE_DISJUNCTION_NORMALIZATIONS.with(|count| count.set(count.get() + 1));
+    match operation {
+        CheckerOperation::Require => Some(IntegerSet::from_type(ty)?
+            .keep_relation(lhs.complement(), left).keep_relation(rhs.complement(), right)),
+        CheckerOperation::Narrow => IntegerSet::comparison_union(ty, (*lhs, left), (*rhs, right)),
+    }
+}
+
 fn walk_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool>(
     calls: &'a FunctionCallSites,
     roots: &mut IntegerRoots<'a>,
@@ -971,6 +1033,23 @@ fn walk_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool>(
                 if let Some(directive) = structure.checker_directives.get(&expression) {
                     let predicate = directive.predicate.as_ref()?;
                     roots.reached_obligation = true;
+                    if let (true, CheckerPredicate::DirectiveDisjunction { binding, ty, atoms }) = (COLLECT, predicate) {
+                        let (axis, actual_type) = roots.lookup(binding)?;
+                        if ty != actual_type {
+                            return None;
+                        }
+                        let values = normalize_directive_disjunction(directive.operation, ty, atoms)?;
+                        let failing = match directive.operation {
+                            CheckerOperation::Require => path.intersection_witness(axis, &values),
+                            CheckerOperation::Narrow => path.restrict_axis_or_witness(axis, &values),
+                        };
+                        if !failing.is_unreachable() {
+                            (failures.as_deref_mut()?.sink)(IntegerCheckFailure {
+                                directive: expression, state: failing, axes: roots.axes.clone(),
+                            });
+                        }
+                        continue;
+                    }
                     if COLLECT && directive.operation == CheckerOperation::Require {
                         let failing = path.failing_witness(roots, predicate)?;
                         if !failing.is_unreachable() {
