@@ -4,7 +4,7 @@ use num_bigint::BigInt;
 
 use super::{
     checker_directive::CheckerOperation,
-    control::{AssignmentReplacement, BindingInitialization, BindingRegion, BlockItemKind, BlockPosition, CheckedCallSignature, ConditionalRegion},
+    control::{AssignmentReplacement, BindingInitialization, BindingRegion, BlockItemKind, BlockPosition, CheckedCallSignature, ConditionalRegion, FinalOutputSlot},
     reference::{BlockOrdinal, DirectDestinationIdentity, FunctionCallSites, OccurrenceEdge, OccurrenceNode, OccurrenceOrdinal, OccurrenceParent, OccurrenceStructure, PlainNameIdentity},
     symbolic_integer::{IntegerIntersection, IntegerSet},
     typecheck::is_integer_type,
@@ -117,6 +117,89 @@ pub(super) struct ImportedEntryGuard<'a> {
     pub(super) slot: usize,
     pub(super) relation: IntegerRelation,
     pub(super) bound: &'a BigInt,
+}
+
+// The ordinary specialization carries no context. Rust monomorphizes this
+// extension point and eliminates its constant-false branch for the unit type.
+trait ScopedAuthoredReturn<'a>: Copy {
+    const ENABLED: bool;
+    fn at(
+        self, structure: &OccurrenceStructure, block: BlockOrdinal, slot: FinalOutputSlot, ty: &ScalarType,
+    ) -> Option<&'a BigInt>;
+}
+
+impl<'a> ScopedAuthoredReturn<'a> for () {
+    const ENABLED: bool = false;
+
+    fn at(self, _: &OccurrenceStructure, _: BlockOrdinal, _: FinalOutputSlot, _: &ScalarType) -> Option<&'a BigInt> {
+        None
+    }
+}
+
+#[cfg(feature = "internal-checker")]
+// Only an admitted named authored proof can supply these borrowed inputs. No
+// arithmetic receipt is attached to the common occurrence data or startup.
+#[derive(Clone, Copy)]
+struct NamedAuthoredReturn<'a> {
+    body: &'a super::ScalarBlock,
+    value: &'a std::cell::OnceCell<Option<BigInt>>,
+}
+
+#[cfg(feature = "internal-checker")]
+impl<'a> ScopedAuthoredReturn<'a> for NamedAuthoredReturn<'a> {
+    const ENABLED: bool = true;
+
+    fn at(
+        self, structure: &OccurrenceStructure, block: BlockOrdinal, slot: FinalOutputSlot,
+        ty: &ScalarType,
+    ) -> Option<&'a BigInt> {
+        if block != structure.root || slot.output != 0 || structure.blocks.get(block.0)?.span != self.body.span
+            || self.body.items.len().checked_sub(1)? != slot.item
+        {
+            return None;
+        }
+        let [output] = self.body.final_output_values.as_slice() else { return None; };
+        if output.position != slot.output || output.span != slot.span
+            || structure.edges.get(&(OccurrenceParent::Block(block), OccurrenceEdge::FinalOutput {
+                item: slot.item, output: slot.output,
+            })) != Some(&OccurrenceNode::Expression(slot.expression))
+        {
+            return None;
+        }
+        self.value.get_or_init(|| {
+            let ScalarExpression::Binary { operator, left, right, .. } = &output.value else { return None; };
+            if !matches!(operator, BinaryOperator::Add | BinaryOperator::Subtract) {
+                return None;
+            }
+            let parent = OccurrenceParent::Expression(slot.expression);
+            let typed_operand = |edge| {
+                let Some(OccurrenceNode::Expression(ordinal)) = structure.edges.get(&(parent, edge)) else { return false; };
+                structure.checked_types.expressions.get(ordinal) == Some(ty)
+            };
+            if structure.checked_types.expressions.get(&slot.expression) != Some(ty)
+                || !typed_operand(OccurrenceEdge::BinaryLeft) || !typed_operand(OccurrenceEdge::BinaryRight)
+            {
+                return None;
+            }
+            let left = concrete_integer_literal(left)?;
+            let right = concrete_integer_literal(right)?;
+            let (min, max) = super::typecheck::integer_bounds(ty)?;
+            let fits = |value: &BigInt| value >= &min && value <= &max;
+            if !fits(&left) || !fits(&right) {
+                return None;
+            }
+            #[cfg(all(test, feature = "internal-checker"))]
+            AUTHORED_RETURN_CALCULATIONS.with(|count| count.set(count.get() + 1));
+            let value = if *operator == BinaryOperator::Add { left.as_ref() + right.as_ref() }
+                else { left.as_ref() - right.as_ref() };
+            fits(&value).then_some(value)
+        }).as_ref()
+    }
+}
+
+#[cfg(all(test, feature = "internal-checker"))]
+thread_local! {
+    pub(super) static AUTHORED_RETURN_CALCULATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 type IntegerRow = Vec<Rc<IntegerSet>>;
@@ -857,7 +940,7 @@ pub(super) fn check_integer_requirements(
 pub(super) fn check_integer_requirement_activity(
     calls: &FunctionCallSites,
 ) -> Option<Result<bool, IntegerCheckFailure<'_>>> {
-    run_integer_callable::<false, false>(calls, integer_tail_type(calls), None, None, None, None, None, None, false)
+    run_integer_callable::<false, false, _>(calls, integer_tail_type(calls), None, None, None, None, None, None, false, ())
         .map(|result| result.map(|coverage| matches!(coverage, ProofCoverage::Applicable(true))))
 }
 
@@ -912,8 +995,8 @@ pub(super) fn collect_integer_requirement_failures_with_calls<'a>(
     let mut collected = IntegerFailureCollection {
         continuation: IntegerRequirementContinuation::Empty, projected, allow_projected_calls, sink,
     };
-    let ProofCoverage::Applicable(active) = run_integer_callable::<false, true>(
-        calls, tail, None, None, None, exact, handle_call, Some(&mut collected), false,
+    let ProofCoverage::Applicable(active) = run_integer_callable::<false, true, _>(
+        calls, tail, None, None, None, exact, handle_call, Some(&mut collected), false, (),
     )?.ok()? else { return None; };
     Some((active, collected.continuation))
 }
@@ -1058,7 +1141,7 @@ pub(super) fn check_integer_requirements_with_calls<'a>(
     handle_call: &mut ActualCallHandler<'a, '_>,
 ) -> Option<Result<bool, IntegerCheckFailure<'a>>> {
     let tail = if exact_arguments.is_none() { integer_tail_type(calls) } else { None };
-    run_integer_callable::<false, false>(calls, tail, None, None, None, exact_arguments, Some(handle_call), None, false)
+    run_integer_callable::<false, false, _>(calls, tail, None, None, None, exact_arguments, Some(handle_call), None, false, ())
         .map(|result| result.map(|coverage| matches!(coverage, ProofCoverage::Applicable(true))))
 }
 
@@ -1069,7 +1152,7 @@ pub(super) fn proves_requirement_with_imported_root_local<'a>(
     if matches!(&local.values, ImportedIntegerValues::Ready(values, _) if values.is_empty()) {
         return None;
     }
-    match run_integer_callable::<true, false>(calls, integer_tail_type(calls), None, None, Some(local), None, None, None, false)? {
+    match run_integer_callable::<true, false, _>(calls, integer_tail_type(calls), None, None, Some(local), None, None, None, false, ())? {
         Ok(ProofCoverage::Applicable(true)) => Some(true),
         Ok(ProofCoverage::Applicable(false)) => None,
         Ok(ProofCoverage::NoApplicableInputs) => None,
@@ -1081,7 +1164,7 @@ pub(super) fn proves_requirement_with_imported_root_local<'a>(
 pub(super) fn observe_integer_returns(
     calls: &FunctionCallSites,
 ) -> Option<Result<Vec<IntegerReturningPath<'_>>, IntegerCheckFailure<'_>>> {
-    match observe_integer_returns_in_scope(calls, None, None, false)? {
+    match observe_integer_returns_in_scope(calls, None, None, false, ())? {
         Ok(ProofCoverage::Applicable(paths)) => Some(Ok(paths)),
         Ok(ProofCoverage::NoApplicableInputs) => None,
         Err(failure) => Some(Err(failure)),
@@ -1093,7 +1176,7 @@ pub(super) fn observe_arbitrary_integer_returns<'a>(
     calls: &'a FunctionCallSites,
     entry_filter: Option<&[CheckerPredicate]>,
 ) -> Option<Result<ProofCoverage<Vec<IntegerReturningPath<'a>>>, IntegerCheckFailure<'a>>> {
-    observe_integer_returns_in_scope(calls, entry_filter, None, false)
+    observe_integer_returns_in_scope(calls, entry_filter, None, false, ())
 }
 
 #[cfg(feature = "internal-checker")]
@@ -1101,7 +1184,7 @@ pub(super) fn observe_unused_module_proof_returns<'a>(
     calls: &'a FunctionCallSites,
     entry_filter: Option<&[CheckerPredicate]>,
 ) -> Option<Result<ProofCoverage<Vec<IntegerReturningPath<'a>>>, IntegerCheckFailure<'a>>> {
-    observe_integer_returns_in_scope(calls, entry_filter, None, true)
+    observe_integer_returns_in_scope(calls, entry_filter, None, true, ())
 }
 
 #[cfg(all(test, feature = "internal-checker"))]
@@ -1114,11 +1197,12 @@ pub(super) fn take_integer_observations() -> (usize, usize) {
     INTEGER_OBSERVATIONS.with(|observations| observations.replace((0, 0)))
 }
 
-fn observe_integer_returns_in_scope<'a>(
+fn observe_integer_returns_in_scope<'a, Authored: ScopedAuthoredReturn<'a>>(
     calls: &'a FunctionCallSites,
     entry_filter: Option<&[CheckerPredicate]>,
     exact_arguments: Option<&[&BigInt]>,
     proof_reflexive_branches: bool,
+    authored_return: Authored,
 ) -> Option<Result<ProofCoverage<Vec<IntegerReturningPath<'a>>>, IntegerCheckFailure<'a>>> {
     let tail = integer_tail_type(calls)?;
     #[cfg(all(test, feature = "internal-checker"))]
@@ -1127,7 +1211,7 @@ fn observe_integer_returns_in_scope<'a>(
         observations.set(if exact_arguments.is_some() { (arbitrary, actual + 1) } else { (arbitrary + 1, actual) });
     });
     let mut paths = Vec::new();
-    match run_integer_callable::<false, false>(calls, Some(tail), entry_filter, Some(&mut paths), None, exact_arguments, None, None, proof_reflexive_branches)? {
+    match run_integer_callable::<false, false, _>(calls, Some(tail), entry_filter, Some(&mut paths), None, exact_arguments, None, None, proof_reflexive_branches, authored_return)? {
         Ok(ProofCoverage::Applicable(_)) if !paths.is_empty() => {
             Some(Ok(ProofCoverage::Applicable(paths)))
         }
@@ -1145,7 +1229,7 @@ pub(super) fn exact_integer_return_at_entry(
     if integer_tail_type(calls)? != expected {
         return None;
     }
-    let ProofCoverage::Applicable(paths) = observe_integer_returns_in_scope(calls, None, Some(arguments), false)?.ok()? else {
+    let ProofCoverage::Applicable(paths) = observe_integer_returns_in_scope(calls, None, Some(arguments), false, ())?.ok()? else {
         return None;
     };
     fn singleton<'a>(path: &'a IntegerReturningPath<'_>) -> Option<&'a BigInt> {
@@ -1203,7 +1287,7 @@ fn check_integer_return_bound_in_scope<'a>(
     proof: Option<&IntegerShowProof<'_>>,
 ) -> Option<Result<ProofCoverage<bool>, IntegerCheckFailure<'a>>> {
     let relation = IntegerRelation::from_operator(operator)?;
-    let paths = match observe_integer_returns_in_scope(calls, entry_filter, None, false)? {
+    let paths = match observe_integer_returns_in_scope(calls, entry_filter, None, false, ())? {
         Ok(ProofCoverage::Applicable(paths)) => paths,
         Ok(ProofCoverage::NoApplicableInputs) => return Some(Ok(ProofCoverage::NoApplicableInputs)),
         Err(failure) => return Some(Err(failure)),
@@ -1230,8 +1314,9 @@ pub(super) fn evaluate_owning_show_conditional(
 #[cfg(feature = "internal-checker")]
 pub(super) fn observe_authored_show_returns<'a>(
     calls: &'a FunctionCallSites, entry_filter: Option<&[CheckerPredicate]>,
+    body: &'a super::ScalarBlock, value: &'a std::cell::OnceCell<Option<BigInt>>,
 ) -> Option<Result<ProofCoverage<Vec<IntegerReturningPath<'a>>>, IntegerCheckFailure<'a>>> {
-    observe_integer_returns_in_scope(calls, entry_filter, None, false)
+    observe_integer_returns_in_scope(calls, entry_filter, None, false, NamedAuthoredReturn { body, value })
 }
 
 pub(super) fn evaluate_borrowed_return_proof(
@@ -1450,7 +1535,7 @@ fn integer_tail_type(calls: &FunctionCallSites) -> Option<&ScalarType> {
     (is_integer_type(&result.ty) && result.ty == output.ty).then_some(&result.ty)
 }
 
-fn run_integer_callable<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool>(
+fn run_integer_callable<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, Authored: ScopedAuthoredReturn<'a>>(
     calls: &'a FunctionCallSites,
     tail: Option<&'a ScalarType>,
     entry_filter: Option<&[CheckerPredicate]>,
@@ -1460,6 +1545,7 @@ fn run_integer_callable<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool>
     mut handle_call: Option<&mut ActualCallHandler<'a, '_>>,
     mut failures: Option<&mut IntegerFailureCollection<'a, '_>>,
     proof_reflexive_branches: bool,
+    authored_return: Authored,
 ) -> Option<Result<ProofCoverage<bool>, IntegerCheckFailure<'a>>> {
     let boundary = &calls.boundary;
     let checker_parameters = boundary.checker_parameter_bindings.as_deref()?;
@@ -1516,7 +1602,7 @@ fn run_integer_callable<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool>
             }
         }
     }
-    let result = walk_integer_block::<USE_IMPORTED_BOUND, COLLECT>(calls, &mut roots, calls.structure.root, IntegerInputs(vec![row]), tail, returns, &mut handle_call, &mut failures)?;
+    let result = walk_integer_block::<USE_IMPORTED_BOUND, COLLECT, _>(calls, &mut roots, calls.structure.root, IntegerInputs(vec![row]), tail, returns, &mut handle_call, &mut failures, authored_return)?;
     if USE_IMPORTED_BOUND && roots.imported_local.is_some() {
         return None;
     }
@@ -1558,7 +1644,7 @@ fn normalize_directive_disjunction(
     }
 }
 
-fn walk_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool>(
+fn walk_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, Authored: ScopedAuthoredReturn<'a>>(
     calls: &'a FunctionCallSites,
     roots: &mut IntegerRoots<'a>,
     block: BlockOrdinal,
@@ -1567,6 +1653,7 @@ fn walk_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool>(
     mut returns: Option<&mut Vec<IntegerReturningPath<'a>>>,
     handle_call: &mut Option<&mut ActualCallHandler<'a, '_>>,
     failures: &mut Option<&mut IntegerFailureCollection<'a, '_>>,
+    authored_return: Authored,
 ) -> Option<IntegerControl<'a>> {
     let depth = roots.axes.len();
     let structure = &calls.structure;
@@ -1655,7 +1742,7 @@ fn walk_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool>(
                             continue;
                         }
                         let control = if let Some(arm) = arm {
-                            walk_integer_block::<USE_IMPORTED_BOUND, COLLECT>(calls, roots, arm, incoming, None, None, handle_call, failures)?
+                            walk_integer_block::<USE_IMPORTED_BOUND, COLLECT, _>(calls, roots, arm, incoming, None, None, handle_call, failures, authored_return)?
                         } else {
                             IntegerControl::Continue(incoming)
                         };
@@ -1692,7 +1779,7 @@ fn walk_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool>(
                         if incoming.is_unreachable() {
                             continue;
                         }
-                        match walk_integer_block::<USE_IMPORTED_BOUND, COLLECT>(calls, roots, arm, incoming, Some(expected), returns.as_deref_mut(), handle_call, failures)? {
+                        match walk_integer_block::<USE_IMPORTED_BOUND, COLLECT, _>(calls, roots, arm, incoming, Some(expected), returns.as_deref_mut(), handle_call, failures, authored_return)? {
                             IntegerControl::Returned => {}
                             failure @ IntegerControl::Fail(_) => return Some(failure),
                             IntegerControl::Continue(outgoing) if COLLECT && outgoing.is_unreachable() => {}
@@ -1704,16 +1791,16 @@ fn walk_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool>(
                 }
                 let value = if let Some(value) = structure.checker_integer_literals.get(&slot.expression) {
                     IntegerReturn::Const(value)
-                } else {
-                    let PlainNameIdentity::Lexical(binding) = calls.prepared_plain_name(slot.expression)?
-                    else {
-                        return None;
-                    };
+                } else if let Some(PlainNameIdentity::Lexical(binding)) = calls.prepared_plain_name(slot.expression) {
                     let (_, binding_type) = roots.lookup(binding)?;
                     if binding_type != ty {
                         return None;
                     }
                     IntegerReturn::Alias(binding)
+                } else if Authored::ENABLED && tail.is_some() {
+                    IntegerReturn::Const(authored_return.at(structure, block, slot, ty)?)
+                } else {
+                    return None;
                 };
                 if tail.is_some() {
                     if let Some(returns) = returns.as_deref_mut() {

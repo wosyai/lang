@@ -2473,7 +2473,8 @@ fn verify_authored_show_group<'step, 'project: 'step>(
     let Some(first) = checks.next() else { return; };
     let plan = first.plan;
     let body = plan.typed.body;
-    let rows = observe_authored_show_returns(body, plan.filter.as_deref());
+    let authored_value = std::cell::OnceCell::new();
+    let rows = observe_authored_show_returns(body, plan.filter.as_deref(), &plan.function.body, &authored_value);
     let checks = std::iter::once(first).chain(checks);
     match rows {
         Some(Ok(ProofCoverage::Applicable(paths))) => {
@@ -6096,6 +6097,59 @@ mod tests {
             assert_eq!(PROOF_CATALOG_INDEX_BUILDS.with(|count| count.replace(0)), 1);
             assert_eq!(take_integer_observations(), (1, 0));
         }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn authored_show_root_literal_arithmetic_is_exact_lazy_and_proof_local() {
+        use super::super::checker_flow::AUTHORED_RETURN_CALCULATIONS;
+        use ScalarModuleProofOutcome::{NoApplicableInputs, Proved, Refuted, Unsupported};
+        let file = source("src/main.w", "authored-root-literal-arithmetic");
+        let check = |body: &str, where_guard: &str, ensures: &str, startup: &str, names: &[&str]| {
+            check_scalar_module_proofs(
+                file.clone(), names,
+                vec![ScalarProofModuleInput {
+                    source: file.clone(),
+                    text: format!(r#"%%start
+                        i8(i8) number = fn(value) {{ if (value == 0) {{}}; {body} }};
+                        {startup}
+                        proof leaf for number(arg) -> (out) where ({where_guard}) ensures ({ensures}) {{
+                            core.show(out <= 7);
+                        }}
+                        proof another for number(arg) -> (out) where ({where_guard}) ensures (out == 7) {{
+                            core.show(out >= 7);
+                        }}
+                        proof cite for number(arg) -> (out) where ({where_guard}) ensures (out <= 7) {{
+                            core.use(leaf(arg));
+                        }}
+                        proof plain for number(arg) -> (out) where ({where_guard}) ensures (out <= 7) {{}}
+                    %%end"#),
+                    namespaces: Vec::new(),
+                }],
+                vec![file.clone()], inputs(),
+            ).unwrap()
+        };
+        let count = || AUTHORED_RETURN_CALCULATIONS.with(|count| count.replace(0));
+        let _ = count();
+        assert_eq!(check("3 + 4", "true", "out <= 7", "", &["another", "leaf", "cite", "plain"]),
+            [Proved, Proved, Proved, Unsupported]);
+        assert_eq!(count(), 1);
+        assert_eq!(check("9 - 2", "true", "out <= 7", "", &["cite"]), [Proved]);
+        assert_eq!(count(), 1);
+        assert_eq!(check("9 - -2", "true", "out <= 7", "", &["leaf", "cite"]), [Refuted, Unsupported]);
+        assert_eq!(count(), 1);
+        assert_eq!(check("127 + 1", "true", "out <= 7", "", &["leaf"]), [Unsupported]);
+        assert_eq!(count(), 1);
+        assert_eq!(check("127 + 1", "false", "out <= 7", "", &["leaf"]), [NoApplicableInputs]);
+        assert_eq!(count(), 0);
+        assert_eq!(check("3 + 4", "true", "out <= 6", "", &["leaf", "cite"]), [Refuted, Unsupported]);
+        assert_eq!(count(), 1);
+        assert_eq!(check("3 + 4", "true", "out <= 7", "i8 live = number(3);", &["leaf", "cite"]),
+            [Unsupported, Unsupported]);
+        assert_eq!(count(), 0);
+        assert_eq!(check("if (value == 0) { 3 + 4 } else { 7 }", "true", "out <= 7", "", &["leaf"]),
+            [Unsupported]);
+        assert_eq!(count(), 0);
     }
 
     #[cfg(feature = "internal-checker")]
