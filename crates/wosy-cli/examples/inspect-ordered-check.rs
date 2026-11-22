@@ -43,10 +43,16 @@ fn render(report: &MainFlowProofReceipt) -> String {
     let actual = report.diagnostics.len();
     let nested = report.diagnostics.iter().filter(|failure| failure.invocation.outer_call.is_some()).count();
     let unused = usize::from(report.symbolic_diagnostic.is_some()) + report.additional_symbolic_diagnostics.len();
-    format!(
+    let mut text = format!(
         "ordered check: complete\ndirective failures: {}\nactual proof failures: {actual} ({nested} nested)\nunused proof failures: {unused}\n",
         report.directives.len(),
-    )
+    );
+    if let Some(entry) = &report.entry_evidence {
+        use std::fmt::Write as _;
+        let _ = writeln!(text, "directive {} entry: {}..{}; failure-time: {}",
+            entry.directive_index + 1, entry.entry_lower, entry.entry_upper, entry.failure_value);
+    }
+    text
 }
 
 fn main() -> ExitCode {

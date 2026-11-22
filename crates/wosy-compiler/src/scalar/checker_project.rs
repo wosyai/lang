@@ -407,6 +407,7 @@ struct PreparedOrderedRun<E: OrderedRunEvidence> {
     directives: Vec<ScalarOrderedCheckerFailure>,
     actual: E,
     symbolic: E::SymbolicReport,
+    entry_evidence: Option<Box<ScalarOrderedEntryEvidence>>,
 }
 
 #[cfg(feature = "internal-checker")]
@@ -422,7 +423,7 @@ fn run_prepared_ordered_check<E: OrderedRunEvidence>(
     } else {
         let (potential_obligations, authored_roots) = package_obligation_roots(prepared, scope, startup_count, root)?;
         if !potential_obligations && !E::CONTEXTUAL {
-            return Ok(PreparedOrderedRun { active: false, directives: effects.records, actual: evidence, symbolic: E::SymbolicReport::default() });
+            return Ok(PreparedOrderedRun { active: false, directives: effects.records, actual: evidence, symbolic: E::SymbolicReport::default(), entry_evidence: None });
         }
         authored_roots
     };
@@ -437,14 +438,21 @@ fn run_prepared_ordered_check<E: OrderedRunEvidence>(
     let mut active = evidence.complete_startup(&initialization.reached)? || initialization.had_obligations;
     let symbolic = if scope == ScalarCheckerScope::CurrentPackage {
         let mut proof = evidence.symbolic();
-        active |= check_package_symbolic_roots::<true, _>(
-            prepared, startup_count, root, initialization, authored_roots, Some(&mut effects), &mut proof,
-        )?;
+        active |= match policy {
+            OrderedReachPolicy::Legacy => check_package_symbolic_roots::<true, false, _>(
+                prepared, startup_count, root, initialization, authored_roots, Some(&mut effects), &mut proof,
+            ),
+            OrderedReachPolicy::Closed => check_package_symbolic_roots::<true, true, _>(
+                prepared, startup_count, root, initialization, authored_roots, Some(&mut effects), &mut proof,
+            ),
+        }?;
         E::finish_symbolic(proof)
     } else {
         E::SymbolicReport::default()
     };
-    Ok(PreparedOrderedRun { active, directives: effects.records, actual: evidence, symbolic })
+    Ok(PreparedOrderedRun {
+        active, directives: effects.records, actual: evidence, symbolic, entry_evidence: effects.entry_evidence,
+    })
 }
 
 #[cfg(all(test, feature = "internal-checker"))]
@@ -468,7 +476,7 @@ fn check_package_roots_with_activity(
     if scope == ScalarCheckerScope::MainFlowOnly {
         return Ok(initialization.had_obligations);
     }
-    check_package_symbolic_roots::<false, _>(
+    check_package_symbolic_roots::<false, false, _>(
         prepared, startup_count, root, initialization, authored_roots, None, &mut (),
     )
 }
@@ -504,7 +512,7 @@ fn package_obligation_roots(
     Ok((potential_obligations, authored_roots))
 }
 
-fn check_package_symbolic_roots<const COLLECT: bool, Proof: SymbolicRootProof>(
+fn check_package_symbolic_roots<const COLLECT: bool, const ENTRY_EVIDENCE: bool, Proof: SymbolicRootProof>(
     prepared: &PreparedCheckerProject, startup_count: usize, root: &SourceIdentity,
     initialization: CheckedInitialization<'_>, mut authored_roots: HashMap<usize, Vec<usize>>,
     mut failures: Option<&mut OrderedFailures>, proof: &mut Proof,
@@ -546,7 +554,7 @@ fn check_package_symbolic_roots<const COLLECT: bool, Proof: SymbolicRootProof>(
                 }
                 continue;
             }
-            had_obligations |= check_unused_module::<COLLECT, _>(
+            had_obligations |= check_unused_module::<COLLECT, ENTRY_EVIDENCE, _>(
                 project, calls, module, ordinal, &reached, selected, failures.as_deref_mut(), Some(&visits), proof,
             )?;
         }
@@ -554,7 +562,7 @@ fn check_package_symbolic_roots<const COLLECT: bool, Proof: SymbolicRootProof>(
     for (index, module) in dormant.iter().enumerate() {
         let ordinal = startup_count + index;
         if let Some(selected) = module_roots(ordinal, module)? {
-            had_obligations |= check_unused_module::<COLLECT, _>(
+            had_obligations |= check_unused_module::<COLLECT, ENTRY_EVIDENCE, _>(
                 project, calls, module, ordinal, &reached, selected, failures.as_deref_mut(), None, proof,
             )?;
         }
@@ -700,7 +708,7 @@ impl SymbolicRootProof for () {
     const ENABLED: bool = false;
 }
 
-fn check_unused_module<const COLLECT: bool, Proof: SymbolicRootProof>(
+fn check_unused_module<const COLLECT: bool, const ENTRY_EVIDENCE: bool, Proof: SymbolicRootProof>(
     project: &ScalarProject,
     calls: &ProjectCallSiteResults,
     module: &ScalarModule,
@@ -746,6 +754,10 @@ fn check_unused_module<const COLLECT: bool, Proof: SymbolicRootProof>(
                 active |= observed;
                 let failures = failures.as_deref_mut().ok_or(ProjectCheck::Unsupported)?;
                 for failure in selected {
+                    #[cfg(feature = "internal-checker")]
+                    if ENTRY_EVIDENCE {
+                        failures.capture_entry_evidence(body, function, &module.source, &failure);
+                    }
                     failures.push_callable(body, &module.source, failure);
                 }
             } else {
@@ -1597,6 +1609,19 @@ fn select_checked_root<'a>(
 struct OrderedFailures {
     records: Vec<ScalarOrderedCheckerFailure>,
     payloads: OrderedFailurePayloads,
+    #[cfg(feature = "internal-checker")]
+    entry_evidence: Option<Box<ScalarOrderedEntryEvidence>>,
+}
+
+#[cfg(feature = "internal-checker")]
+#[doc(hidden)]
+pub struct ScalarOrderedEntryEvidence {
+    pub callable: wosy_syntax::SourceSpan,
+    pub directive_index: usize,
+    pub ty: ScalarType,
+    pub entry_lower: BigInt,
+    pub entry_upper: BigInt,
+    pub failure_value: BigInt,
 }
 
 #[derive(Default)]
@@ -1644,6 +1669,21 @@ impl OrderedFailures {
             witness: ScalarCheckerIntegerWitness { axes, state },
             output: self.payloads.shared(directive),
         });
+    }
+
+    #[cfg(feature = "internal-checker")]
+    fn capture_entry_evidence(
+        &mut self, body: &FunctionCallSites, function: &ScalarFunction, source: &SourceIdentity, failure: &IntegerCheckFailure<'_>,
+    ) {
+        if self.entry_evidence.is_some() {
+            return;
+        }
+        let Some((ty, entry_lower, entry_upper, failure_value)) =
+            super::checker_flow::backward_literal_overwrite_failure(body, failure) else { return; };
+        self.entry_evidence = Some(Box::new(ScalarOrderedEntryEvidence {
+            callable: wosy_syntax::SourceSpan { source: source.clone(), range: function.name_span },
+            directive_index: self.records.len(), ty, entry_lower, entry_upper, failure_value,
+        }));
     }
 
     fn push_callable(&mut self, body: &FunctionCallSites, source: &SourceIdentity, failure: IntegerCheckFailure<'_>) {
@@ -2069,6 +2109,7 @@ pub struct MainFlowProofReceipt {
     pub diagnostics: Vec<MainFlowProofDiagnostic>,
     pub symbolic_diagnostic: Option<SymbolicProofDiagnostic>,
     pub additional_symbolic_diagnostics: Vec<SymbolicProofDiagnostic>,
+    pub entry_evidence: Option<Box<ScalarOrderedEntryEvidence>>,
 }
 
 #[cfg(feature = "internal-checker")]
@@ -2873,6 +2914,7 @@ fn run_closed_without_named_proofs(
     Ok(MainFlowProofReceipt {
         active: run.active, directives: run.directives, diagnostics: Vec::new(),
         symbolic_diagnostic: None, additional_symbolic_diagnostics: Vec::new(),
+        entry_evidence: run.entry_evidence,
     })
 }
 
@@ -2940,7 +2982,7 @@ fn check_loaded_ordered_proof_diagnostics(
     let (symbolic_diagnostic, additional_symbolic_diagnostics) = run.symbolic;
     Ok(MainFlowProofReceipt {
         active: run.active, directives: run.directives, diagnostics: run.actual.observed.diagnostics,
-        symbolic_diagnostic, additional_symbolic_diagnostics,
+        symbolic_diagnostic, additional_symbolic_diagnostics, entry_evidence: run.entry_evidence,
     })
 }
 

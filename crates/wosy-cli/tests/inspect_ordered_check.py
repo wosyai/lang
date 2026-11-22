@@ -47,6 +47,14 @@ PROGRAM = """%%start
 %%end
 """
 
+PREIMAGE = """
+    unit(u8) preimage = fn(value) {
+        core.narrow(value < 4, { .stdout = ""; .stderr = ""; .code = 11; .files = []; });
+        value = 9;
+        core.require(value < 8, { .stdout = ""; .stderr = ""; .code = 71; .files = []; });
+    };
+"""
+
 EXPECTED = (
     b"ordered check: complete\n"
     b"directive failures: 1\n"
@@ -68,9 +76,27 @@ def main():
         assert complete.stdout == EXPECTED, complete
         assert complete.stderr == b"", complete
 
+        source.write_text(f"%%start\n{PREIMAGE}\n%%end\n", encoding="utf-8")
+        preimage = subprocess.run(command, cwd=root, capture_output=True, timeout=15)
+        assert preimage.returncode == 1, preimage
+        assert preimage.stdout == (
+            b"ordered check: complete\ndirective failures: 1\n"
+            b"actual proof failures: 0 (0 nested)\nunused proof failures: 0\n"
+            b"directive 1 entry: 0..3; failure-time: 9\n"
+        ), preimage
+        assert preimage.stderr == b"", preimage
+
+        mismatched = PREIMAGE.replace("unit(u8) preimage = fn(value)", "unit(u8, u8) preimage = fn(value, other)") \
+            .replace("value = 9", "other = 9").replace("require(value", "require(other")
+        source.write_text(f"%%start\n{mismatched}\n%%end\n", encoding="utf-8")
+        wrong_axis = subprocess.run(command, cwd=root, capture_output=True, timeout=15)
+        assert wrong_axis.returncode == 1, wrong_axis
+        assert wrong_axis.stdout == preimage.stdout.split(b"directive 1 entry:", 1)[0], wrong_axis
+        assert wrong_axis.stderr == b"", wrong_axis
+
         incomplete_program = PROGRAM.replace("unused = fn(value) { value }", "unused = fn(value) { value + 1 }")
         assert incomplete_program != PROGRAM
-        source.write_text(incomplete_program, encoding="utf-8")
+        source.write_text(incomplete_program.replace("%%start", f"%%start\n{PREIMAGE}", 1), encoding="utf-8")
         incomplete = subprocess.run(command, cwd=root, capture_output=True, timeout=15)
         assert incomplete.returncode == 2, incomplete
         assert incomplete.stdout == b"", incomplete

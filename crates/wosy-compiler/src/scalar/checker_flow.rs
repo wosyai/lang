@@ -3067,33 +3067,74 @@ fn integer_assignment<'a>(
     roots: &IntegerRoots<'_>,
     position: BlockPosition,
 ) -> Option<(usize, &'a BigInt)> {
+    let (binding, replacement, value) = checked_literal_assignment(calls, position)?;
+    let (axis, ty) = roots.lookup(binding)?;
+    (axis < roots.parameters && ty == replacement).then_some((axis, value))
+}
+
+fn checked_literal_assignment(
+    calls: &FunctionCallSites, position: BlockPosition,
+) -> Option<(&ReferenceBindingId, &ScalarType, &BigInt)> {
     let group = calls.assignments.get(&(position.block, position.item))?;
-    let [rhs] = group.rhs_evaluations().as_slice() else {
-        return None;
-    };
-    let [destination] = group.destinations().as_slice() else {
-        return None;
-    };
+    let [rhs] = group.rhs_evaluations().as_slice() else { return None; };
+    let [destination] = group.destinations().as_slice() else { return None; };
     if group.projected_outputs().len() != 0 {
         return None;
     }
     let DirectDestinationIdentity::Existing(binding) =
         calls.prepared_direct_destination(destination.destination)?
-    else {
-        return None;
-    };
-    let (axis, ty) = roots.lookup(binding)?;
-    if axis >= roots.parameters {
-        return None;
-    }
-    let AssignmentReplacement::Resolved(replacement) = &destination.replacement else {
-        return None;
-    };
-    if ty != replacement {
-        return None;
-    }
+    else { return None; };
+    let AssignmentReplacement::Resolved(replacement) = &destination.replacement else { return None; };
     let value = calls.structure.checker_integer_literals.get(&rhs.expression)?;
-    Some((axis, value))
+    Some((binding, replacement, value))
+}
+
+#[cfg(feature = "internal-checker")]
+pub(super) fn backward_literal_overwrite_failure(
+    calls: &FunctionCallSites, failure: &IntegerCheckFailure<'_>,
+) -> Option<(ScalarType, BigInt, BigInt, BigInt)> {
+    let structure = &calls.structure;
+    let [narrow, write, require] = structure.blocks.get(structure.root.0)?.items.as_slice() else { return None; };
+    let BlockItemKind::Evaluation { expression: narrow_expression } = narrow.kind else { return None; };
+    let BlockItemKind::Assignment { group } = write.kind else { return None; };
+    let BlockItemKind::Evaluation { expression: require_expression } = require.kind else { return None; };
+    if require_expression != failure.directive {
+        return None;
+    }
+    let narrow = structure.checker_directives.get(&narrow_expression)?;
+    let require = structure.checker_directives.get(&require_expression)?;
+    if narrow.operation != CheckerOperation::Narrow || require.operation != CheckerOperation::Require {
+        return None;
+    }
+    let CheckerPredicate::Integer(entry_check) = narrow.predicate.as_ref()? else { return None; };
+    let CheckerPredicate::Integer(failure_check) = require.predicate.as_ref()? else { return None; };
+    if entry_check.binding != failure_check.binding {
+        return None;
+    }
+    let [parameter] = calls.boundary.parameters.as_slice() else { return None; };
+    let [formal] = calls.boundary.checker_parameter_bindings.as_deref()? else { return None; };
+    let [(failure_axis, failure_type)] = failure.axes.as_slice() else { return None; };
+    if *failure_axis != formal || *failure_type != &parameter.ty {
+        return None;
+    }
+    let (destination, replacement, value) = checked_literal_assignment(calls, group)?;
+    let [row] = failure.state.0.as_slice() else { return None; };
+    let [current] = row.as_slice() else { return None; };
+    if destination != formal || &entry_check.binding != formal
+        || replacement != &parameter.ty || entry_check.ty != parameter.ty || failure_check.ty != parameter.ty
+        || entry_check.operator != BinaryOperator::Less || failure_check.operator != BinaryOperator::Less
+        || value < &failure_check.bound || current.singleton_value()? != value
+    {
+        return None;
+    }
+    let (lower, mut upper) = super::typecheck::integer_bounds(&parameter.ty)?;
+    if entry_check.bound <= lower {
+        return None;
+    }
+    if entry_check.bound <= upper {
+        upper = &entry_check.bound - 1u8;
+    }
+    Some((parameter.ty.clone(), lower, upper, value.clone()))
 }
 
 fn integer_local<'a>(
