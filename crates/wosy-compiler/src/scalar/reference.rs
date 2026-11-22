@@ -6639,6 +6639,8 @@ struct StructuralWalker<'a, 'typing> {
     structure: OccurrenceStructure,
     assignments: HashMap<(BlockOrdinal, usize), AssignmentGroup>,
     conditionals: HashMap<OccurrenceOrdinal, ConditionalRegion>,
+    #[cfg(any(test, feature = "internal-checker"))]
+    initializer_branches: HashMap<OccurrenceOrdinal, super::checker_directive::InitializerPredicate>,
     short_circuits: HashMap<OccurrenceOrdinal, ShortCircuitRegion>,
 }
 
@@ -6686,6 +6688,8 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
             structure: OccurrenceStructure::new(span),
             assignments: HashMap::new(),
             conditionals: HashMap::new(),
+            #[cfg(any(test, feature = "internal-checker"))]
+            initializer_branches: HashMap::new(),
             short_circuits: HashMap::new(),
         }
     }
@@ -6778,15 +6782,9 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
         expression: &ScalarExpression,
         names: &BTreeMap<String, WalkBinding>,
     ) -> Option<super::checker_flow::CheckerPredicate> {
-        use super::checker_flow::{concrete_integer_literal, CheckerPredicate, IntegerComparison};
+        use super::checker_flow::{CheckerPredicate, IntegerComparison};
         if let ScalarExpression::Boolean { value, .. } = expression {
             return Some(CheckerPredicate::Boolean(*value));
-        }
-        if matches!(self.mode, WalkMode::ModuleInitialization { .. }) {
-            let (relation, left, right) = self.checked_initializer_comparison(expression)?;
-            let left = concrete_integer_literal(left)?;
-            let right = concrete_integer_literal(right)?;
-            return Some(CheckerPredicate::Boolean(relation.accepts(left.as_ref().cmp(right.as_ref()))));
         }
         let WalkMode::Callable(callable) = &self.mode else {
             return None;
@@ -6817,7 +6815,7 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
     }
 
     #[cfg(any(test, feature = "internal-checker"))]
-    fn initializer_predicate(
+    fn checked_bool_initializer_predicate(
         &self,
         expression: &ScalarExpression,
         names: &BTreeMap<String, WalkBinding>,
@@ -6837,8 +6835,7 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
             Some(span)
         };
         if let Some(span) = storage(expression) {
-            return (self.occurrence_typing.checked_expression_type(expression) == Some(&ScalarType::Bool))
-                .then_some(InitializerPredicate::BooleanStorage(span));
+            return Some(InitializerPredicate::BooleanStorage(span));
         }
         let (relation, left, right) = self.checked_initializer_comparison(expression)?;
         let left_literal = concrete_integer_literal(left);
@@ -6894,7 +6891,7 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
             };
             let condition = &arguments[0];
             let (predicate, initializer_predicate) = if matches!(self.mode, WalkMode::ModuleInitialization { .. }) {
-                (None, self.initializer_predicate(condition, names))
+                (None, self.checked_bool_initializer_predicate(condition, names))
             } else {
                 (self.checker_predicate(condition, names), None)
             };
@@ -6916,7 +6913,11 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
             && matches!(edge, OccurrenceEdge::Condition)
             && self.structure.checked_types.expressions.get(&ordinal) == Some(&ScalarType::Bool)
         {
-            if let Some(predicate) = self.checker_predicate(expression, names) {
+            if matches!(self.mode, WalkMode::ModuleInitialization { .. }) {
+                if let Some(predicate) = self.checked_bool_initializer_predicate(expression, names) {
+                    self.initializer_branches.insert(ordinal, predicate);
+                }
+            } else if let Some(predicate) = self.checker_predicate(expression, names) {
                 self.structure.checker_branches.insert(ordinal, predicate);
             }
         }
@@ -8542,6 +8543,8 @@ fn walk_module_initialization(
         callable_escapes: walker.callable_escapes,
         assignments: walker.assignments,
         conditionals: walker.conditionals,
+        #[cfg(any(test, feature = "internal-checker"))]
+        initializer_branches: walker.initializer_branches,
         short_circuits: walker.short_circuits,
     })
 }

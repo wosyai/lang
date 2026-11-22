@@ -503,6 +503,7 @@ fn actual_empty_module_keeps_its_successful_ordinal_slot() {
                         callable_escapes: HashSet::new(),
                         assignments: HashMap::new(),
                         conditionals: HashMap::new(),
+                        initializer_branches: HashMap::new(),
                         short_circuits: HashMap::new(),
                     }
                 )),

@@ -182,6 +182,8 @@ pub(super) struct ModuleInitializationTopology {
     pub(super) callable_escapes: HashSet<SourceSpan>,
     pub(super) assignments: HashMap<(BlockOrdinal, usize), AssignmentGroup>,
     pub(super) conditionals: HashMap<OccurrenceOrdinal, ConditionalRegion>,
+    #[cfg(any(test, feature = "internal-checker"))]
+    pub(super) initializer_branches: HashMap<OccurrenceOrdinal, super::checker_directive::InitializerPredicate>,
     pub(super) short_circuits: HashMap<OccurrenceOrdinal, ShortCircuitRegion>,
 }
 

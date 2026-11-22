@@ -931,3 +931,34 @@ fn paired_actual_proofs_observe_only_exact_initialized_tuples_in_slot_order() {
         assert_eq!(proof("pair", &incomplete, "first >= 7", "out <= -4"), ScalarModuleProofOutcome::Unsupported, "{extra}");
     }
 }
+
+#[test]
+fn selected_initializer_arm_uses_known_typed_integer_storage_and_exact_results() {
+    let passed = format!(r#"
+        i16(u8, i16) pair = fn(low, high) {{ if (low == 0) {{}}; high }};
+        i16 ceiling = -4;
+        i16 measured = pair(7, -128);
+        bool untouched = true;
+        if (measured <= ceiling) {{
+            if (measured == -128) {{ core.require(untouched, {OUTPUT}); }};
+        }} else {{ untouched = false; }};
+        core.require(untouched, {OUTPUT});
+    "#);
+    assert_eq!(check_scoped(&passed, ScalarCheckerScope::MainFlowOnly), ScalarCheckerOutcome::Passed);
+
+    let failed = format!(r#"
+        i16 measured = -4;
+        if (measured < -128) {{ core.narrow(false, {OUTPUT}); }}
+        else {{ core.require(false, {OUTPUT}); }};
+        core.narrow(false, {OUTPUT});
+    "#);
+    let ScalarCheckerOutcome::Failed(failure) = check(&failed) else {
+        panic!("expected the first requirement failure in the selected else arm");
+    };
+    assert_eq!(failure.operation, ScalarCheckerOperation::Require);
+    let canonical = format!("%%start\n{failed}\n%%end");
+    assert_eq!(failure.condition.start as usize, canonical.find("core.require(false").unwrap() + "core.require(".len());
+
+    let nonliteral = format!("i16 measured = -4; if (!(measured < 0)) {{ core.require(true, {OUTPUT}); }};");
+    assert_eq!(check(&nonliteral), ScalarCheckerOutcome::Unsupported);
+}

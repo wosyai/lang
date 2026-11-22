@@ -436,20 +436,9 @@ fn check_initializer_expression(
             }
             _ => return Err(ProjectCheck::Unsupported),
         };
-        let value = match structure.checker_branches.get(condition) {
-            Some(CheckerPredicate::Boolean(value)) => *value,
-            None if structure.checked_types.expressions.get(condition) == Some(&ScalarType::Bool) => {
-                let Some(InitializationName::Storage(InitializationStorage::Module(span))) =
-                    topology.identities.names.get(condition) else {
-                        return Err(ProjectCheck::Unsupported);
-                    };
-                let Some(InitializerValue::Boolean(value)) = storage.get(span) else {
-                    return Err(ProjectCheck::Unsupported);
-                };
-                *value
-            }
-            _ => return Err(ProjectCheck::Unsupported),
-        };
+        let value = topology.initializer_branches.get(condition)
+            .and_then(|predicate| evaluate_initializer_predicate(predicate, storage))
+            .ok_or(ProjectCheck::Unsupported)?;
         let selected = if value { Some(then_block) } else { else_block };
         if let Some(selected) = selected {
             if depth == MAX_INITIALIZER_BRANCH_DEPTH {
