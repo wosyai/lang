@@ -9,7 +9,7 @@ use super::{
     checker_flow::{
         check_integer_requirement_activity, check_integer_requirements_with_calls, collect_integer_requirement_failures, check_integer_return_bound_with_shows, collect_integer_requirement_failures_with_calls, concrete_integer_literal, exact_integer_call_argument, exact_integer_call_argument_at,
         exact_integer_return_at_entry, ActualCallResult, CheckerPredicate, ExactIntegerArgument, IntegerRequirementContinuation, IntegerRequirementEntry, NestedIntegerArgument, ProjectedIntegerArgument,
-        proves_requirement_with_imported_root_local, ImportedEntryGuard, ImportedLocal, IntegerShowProof, IntegerCheckFailure, IntegerComparison, IntegerInputs, IntegerReturn, ProofCoverage,
+        proves_requirement_with_imported_root_local, ImportedEntryGuard, ImportedIntegerValues, ImportedLocal, IntegerShowProof, IntegerCheckFailure, IntegerComparison, IntegerInputs, IntegerReturn, ProofCoverage,
     },
     control::{BindingInitialization, BlockItemKind, CheckedCallSignature, ConditionalRegion, InitializationName, InitializationStorage, ModuleInitializationCallTarget, ModuleInitializationDetail, ModuleInitializationStepKind, ModuleInitializationTopology, NamespaceTarget},
     derive_block, derive_expression, project_from_declarations,
@@ -1871,10 +1871,6 @@ mod production_bound_reuse {
     struct VerifiedModuleBound<'a> {
         issuer: &'a PreparedProofModule,
         proof_identity: (&'a SourceIdentity, ByteSpan, &'a str),
-        canonical_target: &'a ResolvedCallTarget,
-        target_layout: ScalarTargetLayout,
-        parameters: &'a [ParameterSlot],
-        output: &'a ScalarType,
         guards: Vec<ImportedEntryGuard<'a>>,
         values: IntegerSet,
     }
@@ -1884,32 +1880,35 @@ mod production_bound_reuse {
         (source, name): (&SourceIdentity, &str),
         (caller_source, caller_name): (&SourceIdentity, &str),
     ) -> Option<ScalarProofCallOutcome> {
-        let plan = project.plan_module_proof_in_scope::<true, false>(source, name).ok()?;
+        let plan = project.plan_module_proof_in_scope::<true, true>(source, name).ok()?;
         let TypedProofGoal::Literal { operator, relation, bound } = &plan.typed.goal else { return None; };
         let (scalar, calls) = project.prepared.parts();
         let caller = select_checked_root(scalar, caller_source, caller_name).ok()?;
-        let (root, ordinals) = package_initialization_order(scalar).ok()?;
+        let root = scalar.initialization_order.first()?;
         if plan.typed.measure.is_some()
             && (operator != &BinaryOperator::Equal || plan.proof_source != root
                 || &plan.typed.target.source != root || caller_source != root)
         {
             return None;
         }
-        let initialization = check_package_initialization_with_order(&project.prepared, root, ordinals).ok()?;
-        let &venue = initialization.ordinals.get(plan.proof_source)?;
-        if initialization.visits[venue] != InitializationVisit::Completed
-            || initialization.visits[plan.target.0] != InitializationVisit::Completed
-            || initialization.visits[caller.0] != InitializationVisit::Completed
-            || initialization.reached.contains(&plan.target)
-            || initialization.reached.contains(&(caller.0, caller.1))
-            || (caller.0, caller.1) == plan.target
-        {
-            return None;
-        }
-
+        let initialize = || {
+            let (root, ordinals) = package_initialization_order(scalar).ok()?;
+            let initialization = check_package_initialization_with_order(&project.prepared, root, ordinals).ok()?;
+            let &venue = initialization.ordinals.get(plan.proof_source)?;
+            if initialization.visits[venue] != InitializationVisit::Completed
+                || initialization.visits[plan.target.0] != InitializationVisit::Completed
+                || initialization.visits[caller.0] != InitializationVisit::Completed
+                || initialization.reached.contains(&plan.target)
+                || initialization.reached.contains(&(caller.0, caller.1))
+            {
+                return None;
+            }
+            Some(())
+        };
         let body = calls.function_body(caller.0, caller.1, None)?;
         let (position, origin) = root_local_import_requirement(body)?;
-        if !caller.2.generic_parameters.is_empty() || !caller.2.overload_arms.is_empty()
+        if (caller.0, caller.1) == plan.target
+            || !caller.2.generic_parameters.is_empty() || !caller.2.overload_arms.is_empty()
             || !body.allocation_length_calls.is_empty()
             || !matches!(body.call_occurrences.as_slice(), [call] if call.ordinal == origin.call)
             || body.structure.checker_directives.len() != 1
@@ -1918,9 +1917,39 @@ mod production_bound_reuse {
         }
         let site = body.resolved_call_site(origin.call)?;
         let signature = body.checked_call_signatures.get(&origin.call)?;
+        let layout = scalar.modules[caller.0].target_layout;
+        let producer = plan.typed.body;
+        let [output] = producer.boundary.results.as_slice() else { return None; };
+        if output.ordinal != 0 || !matching_call(
+            plan.canonical_target, plan.typed.target.target_layout, &producer.boundary.parameters, &output.ty,
+            layout, body, origin, &site.target, signature,
+        ) {
+            return None;
+        }
+        let guard = checked_integer_guard_slots::<true>(producer, plan.filter.as_deref().unwrap_or_default())?;
+        if guard.always_rejects {
+            return None;
+        }
+        if let Some((slot, domain)) = guard.domain {
+            if plan.proof_source != root || &plan.typed.target.source != root || caller_source != root
+                || plan.typed.measure.is_some() || !plan.steps.items.is_empty() || !valid_arbitrary_proof_body(producer)
+            {
+                return None;
+            }
+            let mut issue = || {
+                initialize()?;
+                proved_arbitrary_values(&plan, &output.ty, operator, *relation, bound)
+            };
+            return imported_outcome(body, ImportedLocal {
+                position,
+                guards: guard.comparisons,
+                values: ImportedIntegerValues::Deferred { slot, domain, issue: &mut issue },
+            });
+        }
+        initialize()?;
         let identity = (plan.proof_source, wosy_syntax::byte_span(plan.proof), name);
-        let verified = VerifiedModuleBound::establish(project, &plan, identity, (operator, *relation, bound))?;
-        verified.consume(project, identity, scalar.modules[caller.0].target_layout, body, position, origin, &site.target, signature)
+        let verified = VerifiedModuleBound::establish(project, &plan, identity, (operator, *relation, bound), &output.ty, guard.comparisons)?;
+        verified.consume(project, identity, body, position)
     }
 
     impl<'a> VerifiedModuleBound<'a> {
@@ -1929,20 +1958,10 @@ mod production_bound_reuse {
             plan: &'a PlannedModuleProof<'_>,
             proof_identity: (&'a SourceIdentity, ByteSpan, &'a str),
             (operator, relation, bound): (&BinaryOperator, IntegerRelation, &BigInt),
+            output: &ScalarType,
+            guards: Vec<ImportedEntryGuard<'a>>,
         ) -> Option<Self> {
             let body = plan.typed.body;
-            let parameters = body.boundary.parameters.as_slice();
-            if !matches!(parameters.len(), 1 | 2) {
-                return None;
-            }
-            let [output] = body.boundary.results.as_slice() else { return None; };
-            if output.ordinal != 0 {
-                return None;
-            }
-            let guard = checked_integer_guard_slots::<false>(body, plan.filter.as_deref().unwrap_or_default())?;
-            if guard.always_rejects {
-                return None;
-            }
             let values = if let Some(rank) = plan.typed.measure {
                 if !matches!(plan.verify_unused_induction(rank), Ok(ProjectCheck::Proved)) {
                     return None;
@@ -1952,18 +1971,10 @@ mod production_bound_reuse {
                 if !plan.steps.items.is_empty() || !valid_arbitrary_proof_body(body) {
                     return None;
                 }
-                let ProofCoverage::Applicable(paths) = observe_arbitrary_integer_returns(body, plan.filter.as_deref())?.ok()? else {
-                    return None;
-                };
-                if !paths.iter().all(|path| path.output_satisfies(relation, bound) == Some(true)) {
-                    return None;
-                }
-                IntegerSet::from_type(&output.ty)?.keep(operator, bound)?
+                proved_arbitrary_values(plan, output, operator, relation, bound)?
             };
             Some(Self {
-                issuer, proof_identity, canonical_target: plan.canonical_target,
-                target_layout: plan.typed.target.target_layout,
-                parameters, output: &output.ty, guards: guard.comparisons, values,
+                issuer, proof_identity, guards, values,
             })
         }
 
@@ -1971,32 +1982,52 @@ mod production_bound_reuse {
             self,
             issuer: &PreparedProofModule,
             identity: (&SourceIdentity, ByteSpan, &str),
-            caller_layout: ScalarTargetLayout,
             body: &FunctionCallSites,
             position: usize,
-            origin: &CheckerIntegerCallOrigin,
-            target: &ResolvedCallTarget,
-            signature: &CheckedCallSignature,
         ) -> Option<ScalarProofCallOutcome> {
-            let [output] = signature.outputs.outputs.as_slice() else { return None; };
-            let arguments = origin.arguments.as_slice();
-            if !std::ptr::eq(self.issuer, issuer) || self.proof_identity != identity
-                || self.canonical_target != target || self.target_layout != caller_layout
-                || self.output != &output.ty || self.parameters.len() != signature.parameters.len()
-                || self.parameters.len() != arguments.len()
-                || self.parameters.iter().zip(&signature.parameters).zip(arguments).any(|((producer, caller), (ordinal, _))| {
-                    &producer.ty != caller || body.structure.checked_types.expressions.get(ordinal) != Some(caller)
-                })
-            {
+            if !std::ptr::eq(self.issuer, issuer) || self.proof_identity != identity {
                 return None;
             }
-            let fact = ImportedLocal { position, values: self.values, guards: self.guards };
-            Some(if proves_requirement_with_imported_root_local(body, fact)? {
-                ScalarProofCallOutcome::Established
-            } else {
-                ScalarProofCallOutcome::NotEstablished
+            imported_outcome(body, ImportedLocal {
+                position, values: ImportedIntegerValues::ready(self.values), guards: self.guards,
             })
         }
+    }
+
+    fn matching_call(
+        producer_target: &ResolvedCallTarget, producer_layout: ScalarTargetLayout,
+        parameters: &[ParameterSlot], output_type: &ScalarType, caller_layout: ScalarTargetLayout,
+        body: &FunctionCallSites, origin: &CheckerIntegerCallOrigin, target: &ResolvedCallTarget,
+        signature: &CheckedCallSignature,
+    ) -> bool {
+        let [output] = signature.outputs.outputs.as_slice() else { return false; };
+        let arguments = origin.arguments.as_slice();
+        producer_target == target && producer_layout == caller_layout && output_type == &output.ty
+            && parameters.len() == signature.parameters.len() && parameters.len() == arguments.len()
+            && parameters.iter().zip(&signature.parameters).zip(arguments).all(|((producer, caller), (ordinal, _))| {
+                &producer.ty == caller && body.structure.checked_types.expressions.get(ordinal) == Some(caller)
+            })
+    }
+
+    fn proved_arbitrary_values(
+        plan: &PlannedModuleProof<'_>, output: &ScalarType,
+        operator: &BinaryOperator, relation: IntegerRelation, bound: &BigInt,
+    ) -> Option<IntegerSet> {
+        let ProofCoverage::Applicable(paths) = observe_arbitrary_integer_returns(plan.typed.body, plan.filter.as_deref())?.ok()? else {
+            return None;
+        };
+        if !paths.iter().all(|path| path.output_satisfies(relation, bound) == Some(true)) {
+            return None;
+        }
+        IntegerSet::from_type(output)?.keep(operator, bound)
+    }
+
+    fn imported_outcome<'a>(body: &'a FunctionCallSites, fact: ImportedLocal<'a>) -> Option<ScalarProofCallOutcome> {
+        Some(if proves_requirement_with_imported_root_local(body, fact)? {
+            ScalarProofCallOutcome::Established
+        } else {
+            ScalarProofCallOutcome::NotEstablished
+        })
     }
 }
 
@@ -3368,7 +3399,7 @@ fn apply_verified_return_bound(
         }
     }
     let values = IntegerSet::from_type(&verified.output_type)?.keep(&verified.operator, &verified.bound)?;
-    let imported = ImportedLocal { position, values, guards };
+    let imported = ImportedLocal { position, values: ImportedIntegerValues::ready(values), guards };
     Some(if proves_requirement_with_imported_root_local(body, imported)? {
         ImportedRequirement::Proved
     } else {
@@ -4685,7 +4716,6 @@ mod tests {
                 core.require(result <= 7, {OUTPUT});
             }};
             proof entry for producer(input) -> (out) where (input <= 7) ensures (out == core.old(input)) {{}}
-            proof domain for producer(input) -> (out) where (input == 1 || input == 7) ensures (out <= 7) {{}}
             proof literal for producer(input) -> (out) where (input <= 7) ensures (out <= 7) {{}}
         %%end"#);
         let run = |name| {
@@ -4698,9 +4728,60 @@ mod tests {
         let _ = take_integer_observations();
         assert_eq!(run("entry"), ScalarProofCallOutcome::Unavailable);
         assert_eq!(take_integer_observations(), (0, 0));
-        assert_eq!(run("domain"), ScalarProofCallOutcome::Unavailable);
-        assert_eq!(take_integer_observations(), (0, 0));
         assert_eq!(run("literal"), ScalarProofCallOutcome::Established);
+        assert_eq!(take_integer_observations(), (1, 1));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordered_proof_union_reuse_invokes_issuer_only_after_exact_caller_admission() {
+        use super::super::checker_flow::take_integer_observations;
+        let file = source("src/main.w", "union-issuer");
+        let text = format!(r#"%%start
+            u8(u8) producer = fn(value) {{ value }};
+            u8(u8) live = fn(value) {{ value }};
+            u8 actual = live(7);
+            unit() accepted = fn {{
+                u8 result = producer(7);
+                core.require(result <= 7, {OUTPUT});
+            }};
+            unit() hole = fn {{
+                u8 result = producer(4);
+                core.require(result <= 7, {OUTPUT});
+            }};
+            unit(u8) broad = fn(value) {{
+                u8 result = producer(value);
+                core.require(result <= 7, {OUTPUT});
+            }};
+            unit() wrong = fn {{
+                u8 result = live(7);
+                core.require(result <= 7, {OUTPUT});
+            }};
+            proof domain for producer(input) -> (out) where (input == 1 || input == 7) ensures (out <= 7) {{}}
+            proof false_goal for producer(input) -> (out) where (input == 1 || input == 7) ensures (out <= 1) {{}}
+            proof full for producer(input) -> (out) where (input < 8 || input >= 8) ensures (out <= 255) {{}}
+            unit(u8) complete = fn(value) {{
+                u8 result = producer(value);
+                core.require(result <= 255, {OUTPUT});
+            }};
+        %%end"#);
+        let run = |proof, caller| {
+            let (_, catalog) = crate::parse_proof_source(file.clone(), text.clone(), &[]).ok().unwrap();
+            check_loaded_scalar_module_proof_call(
+                (&file, proof), (&file, caller), Vec::new(), (catalog, Vec::new()),
+                vec![file.clone()], inputs(),
+            )
+        };
+        let _ = take_integer_observations();
+        for caller in ["hole", "broad", "wrong"] {
+            assert_eq!(run("domain", caller), ScalarProofCallOutcome::Unavailable);
+            assert_eq!(take_integer_observations(), (0, 0));
+        }
+        assert_eq!(run("domain", "accepted"), ScalarProofCallOutcome::Established);
+        assert_eq!(take_integer_observations(), (1, 1));
+        assert_eq!(run("full", "complete"), ScalarProofCallOutcome::Established);
+        assert_eq!(take_integer_observations(), (1, 1));
+        assert_eq!(run("false_goal", "accepted"), ScalarProofCallOutcome::Unavailable);
         assert_eq!(take_integer_observations(), (1, 1));
     }
 

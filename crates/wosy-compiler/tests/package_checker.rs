@@ -1546,7 +1546,7 @@ fn named_proof_where_disjunction_admits_the_exact_domain_in_actual_and_unused_co
 }
 
 #[test]
-fn named_proof_where_disjunction_does_not_export_or_mix_axis_authority() {
+fn named_proof_where_disjunction_reuses_only_independently_proved_exact_domain() {
     let identity = source();
     let text = format!(r#"%%start
         u8(u8) producer = fn(value) {{ value }};
@@ -1569,7 +1569,7 @@ fn named_proof_where_disjunction_does_not_export_or_mix_axis_authority() {
     assert_eq!(check_loaded_scalar_module_proof_call(
         (&identity, "bounded"), (&identity, "caller"), Vec::new(), (catalog, Vec::new()),
         vec![identity.clone()], ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
-    ), ScalarProofCallOutcome::Unavailable);
+    ), ScalarProofCallOutcome::Established);
 }
 
 #[test]

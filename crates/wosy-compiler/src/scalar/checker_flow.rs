@@ -87,8 +87,24 @@ pub(super) fn concrete_integer_literal(expression: &ScalarExpression) -> Option<
 
 pub(super) struct ImportedLocal<'a> {
     pub(super) position: usize,
-    pub(super) values: IntegerSet,
+    pub(super) values: ImportedIntegerValues<'a>,
     pub(super) guards: Vec<ImportedEntryGuard<'a>>,
+}
+
+pub(super) enum ImportedIntegerValues<'a> {
+    Ready(IntegerSet, std::marker::PhantomData<&'a ()>),
+    #[cfg(feature = "internal-checker")]
+    Deferred {
+        slot: usize,
+        domain: &'a IntegerSet,
+        issue: &'a mut dyn FnMut() -> Option<IntegerSet>,
+    },
+}
+
+impl ImportedIntegerValues<'_> {
+    pub(super) fn ready(values: IntegerSet) -> Self {
+        Self::Ready(values, std::marker::PhantomData)
+    }
 }
 
 pub(super) struct ImportedEntryGuard<'a> {
@@ -687,11 +703,11 @@ pub(super) fn check_integer_requirements_with_calls<'a>(
         .map(|result| result.map(|coverage| matches!(coverage, ProofCoverage::Applicable(true))))
 }
 
-pub(super) fn proves_requirement_with_imported_root_local(
-    calls: &FunctionCallSites,
-    local: ImportedLocal<'_>,
+pub(super) fn proves_requirement_with_imported_root_local<'a>(
+    calls: &'a FunctionCallSites,
+    local: ImportedLocal<'a>,
 ) -> Option<bool> {
-    if local.values.is_empty() {
+    if matches!(&local.values, ImportedIntegerValues::Ready(values, _) if values.is_empty()) {
         return None;
     }
     match run_integer_callable::<true, false>(calls, integer_tail_type(calls), None, None, Some(local), None, None, None)? {
@@ -1129,8 +1145,23 @@ fn walk_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool>(
                     if !applies {
                         return None;
                     }
+                    let values = match local.values {
+                        ImportedIntegerValues::Ready(values, _) => values,
+                        #[cfg(feature = "internal-checker")]
+                        ImportedIntegerValues::Deferred { slot, domain, issue } => {
+                            let admitted = !path.is_unreachable() && match arguments.get(slot).copied().flatten() {
+                                Some(Argument::Literal(value)) => domain.contains(value),
+                                Some(Argument::Axis(axis)) => path.0.iter().all(|row| row[axis].is_subset_of(domain)),
+                                None => false,
+                            };
+                            if !admitted {
+                                return None;
+                            }
+                            issue().filter(|values| !values.is_empty())?
+                        }
+                    };
                     roots.add(&origin.binding, &receiver.ty);
-                    path.append_local(local.values);
+                    path.append_local(values);
                     continue;
                 }
                 if let Some(origin) = structure.checker_integer_call_locals.get(&(block, item.position)) {
