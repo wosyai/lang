@@ -3624,6 +3624,36 @@ thread_local! {
     static OUTPUT_UNION_NORMALIZATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+fn typed_output_conjunction(
+    expression: &ScalarExpression, output: &str, inputs: &[String], ty: &ScalarType,
+) -> Result<Vec<(IntegerRelation, BigInt)>, ProjectCheck> {
+    let mut pending = vec![expression];
+    let mut atoms = Vec::new();
+    while let Some(expression) = pending.pop() {
+        if let ScalarExpression::Binary { operator: BinaryOperator::And, left, right, .. } = expression {
+            pending.push(right);
+            pending.push(left);
+            continue;
+        }
+        let comparison = IntegerComparison::from_expression(expression).ok_or(ProjectCheck::Unsupported)?;
+        let (_, relation, bound) = checked_literal_output_goal(comparison, output, inputs, ty)?;
+        atoms.push((relation, bound));
+    }
+    Ok(atoms)
+}
+
+#[cfg(feature = "internal-checker")]
+fn normalize_show_conjunction(atoms: &mut Vec<(IntegerRelation, BigInt)>) {
+    atoms.sort_unstable_by(|(_, left), (_, right)| left.cmp(right));
+    atoms.dedup_by(|(following, right), (prior, left)| {
+        if left != right {
+            return false;
+        }
+        *prior = prior.intersection(*following);
+        true
+    });
+}
+
 fn typed_output_disjunction(
     left: &ScalarExpression, right: &ScalarExpression, output: &str, inputs: &[String], ty: &ScalarType,
 ) -> Result<[(IntegerRelation, BigInt); 2], ProjectCheck> {
@@ -3704,19 +3734,7 @@ fn typed_proof_postcondition<'a, const AUDIT_INDUCTION: bool, const DEFER_OUTPUT
                 TypedProofGoal::Disjunction(normalize_output_disjunction(&result.ty, &atoms).ok_or(ProjectCheck::Unsupported)?)
             }
         } else if matches!(&ensures, ScalarExpression::Binary { operator: BinaryOperator::And, .. }) {
-            let mut pending = vec![&ensures];
-            let mut atoms = Vec::new();
-            while let Some(expression) = pending.pop() {
-                if let ScalarExpression::Binary { operator: BinaryOperator::And, left, right, .. } = expression {
-                    pending.push(right);
-                    pending.push(left);
-                    continue;
-                }
-                let comparison = IntegerComparison::from_expression(expression).ok_or(ProjectCheck::Unsupported)?;
-                let (_, relation, bound) = checked_literal_output_goal(comparison, output, &input_names, &result.ty)?;
-                atoms.push((relation, bound));
-            }
-            TypedProofGoal::Conjunction(atoms)
+            TypedProofGoal::Conjunction(typed_output_conjunction(&ensures, output, &input_names, &result.ty)?)
         } else if let Some(ensures) = IntegerComparison::from_expression(&ensures) {
             let (operator, relation, bound) = checked_literal_output_goal(ensures, output, &input_names, &result.ty)?;
             TypedProofGoal::Literal { operator, relation, bound }
@@ -4158,6 +4176,14 @@ fn proof_show_plan<'a, const VERIFY_ENTRY_WRITES: bool, const ALLOW_NAMED_STEPS:
                     return Ok(IntegerShowProof::Output(IntegerShowOutput::Disjunction(
                         typed_output_disjunction(left, right, output, inputs, ty)?,
                     )));
+                }
+                if matches!(claim, ScalarExpression::Binary { operator: BinaryOperator::And, .. }) {
+                    if is_null_literal_name(output) || inputs.iter().any(|name| is_null_literal_name(name)) {
+                        return Err(ProjectCheck::InvalidProof);
+                    }
+                    let mut atoms = typed_output_conjunction(claim, output, inputs, ty)?;
+                    normalize_show_conjunction(&mut atoms);
+                    return Ok(IntegerShowProof::Output(IntegerShowOutput::Conjunction(atoms)));
                 }
                 if matches!(claim, ScalarExpression::Binary { operator, .. } if *operator != BinaryOperator::Equal) {
                     if let Some(comparison) = IntegerComparison::from_expression(claim) {
@@ -5419,6 +5445,27 @@ mod tests {
         assert_eq!(take_integer_observations(), (0, 0));
         assert_eq!(run("literal"), ScalarProofCallOutcome::Established);
         assert_eq!(take_integer_observations(), (1, 1));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn proof_show_conjunction_normalizes_same_bound_once_in_owned_plan() {
+        let relation = |operator| IntegerRelation::from_operator(&operator).unwrap();
+        let lower = BigInt::from(-8);
+        let upper = BigInt::from(8);
+        let mut atoms = vec![
+            (relation(BinaryOperator::LessEqual), upper.clone()),
+            (relation(BinaryOperator::GreaterEqual), lower.clone()),
+            (relation(BinaryOperator::LessEqual), upper.clone()),
+            (relation(BinaryOperator::Less), lower.clone()),
+        ];
+        normalize_show_conjunction(&mut atoms);
+        assert_eq!(atoms.len(), 2);
+        assert_eq!(&atoms[0].1, &lower);
+        assert!(!atoms[0].0.accepts(std::cmp::Ordering::Less));
+        assert!(!atoms[0].0.accepts(std::cmp::Ordering::Equal));
+        assert!(!atoms[0].0.accepts(std::cmp::Ordering::Greater));
+        assert_eq!(atoms[1], (relation(BinaryOperator::LessEqual), upper));
     }
 
     #[cfg(feature = "internal-checker")]

@@ -454,6 +454,7 @@ pub(super) enum IntegerShowProof<'a> {
 pub(super) enum IntegerShowOutput {
     Relation { relation: IntegerRelation, bound: BigInt },
     Disjunction([(IntegerRelation, BigInt); 2]),
+    Conjunction(Vec<(IntegerRelation, BigInt)>),
 }
 
 fn binding_satisfies(
@@ -550,12 +551,15 @@ impl IntegerReturningPath<'_> {
     #[cfg(feature = "internal-checker")]
     fn shows_output_with_bound(
         &self, relation: IntegerRelation, bound: &BigInt, show: Option<&IntegerShowOutput>,
-        allowed: &mut Option<IntegerSet>,
+        skip_conjunct: Option<usize>, allowed: &mut Option<IntegerSet>,
     ) -> Option<bool> {
         match self.value {
             IntegerReturn::Const(value) => Some(relation.accepts(value.cmp(bound)) && match show {
                 None => true,
                 Some(IntegerShowOutput::Relation { relation, bound }) => relation.accepts(value.cmp(bound)),
+                Some(IntegerShowOutput::Conjunction(atoms)) => atoms.iter().enumerate().all(|(index, (relation, bound))| {
+                    skip_conjunct == Some(index) || relation.accepts(value.cmp(bound))
+                }),
                 Some(IntegerShowOutput::Disjunction([(left_relation, left), (right_relation, right)])) =>
                     left_relation.accepts(value.cmp(left)) || right_relation.accepts(value.cmp(right)),
             }),
@@ -569,6 +573,9 @@ impl IntegerReturningPath<'_> {
                     let shown = match show {
                         None => true,
                         Some(IntegerShowOutput::Relation { relation, bound }) => values.every_at_extremes(*relation, bound),
+                        Some(IntegerShowOutput::Conjunction(atoms)) => atoms.iter().enumerate().all(|(index, (relation, bound))| {
+                            skip_conjunct == Some(index) || values.every_at_extremes(*relation, bound)
+                        }),
                         Some(IntegerShowOutput::Disjunction([(left_relation, left), (right_relation, right)])) => {
                             let domain = match allowed {
                                 Some(domain) => domain,
@@ -1004,14 +1011,19 @@ fn check_integer_return_bound_in_scope<'a>(
     }
     #[cfg(feature = "internal-checker")]
     if let Some(IntegerShowProof::Output(show)) = proof {
-        let (relation, additional) = match show {
+        let (relation, additional, skip_conjunct) = match show {
             IntegerShowOutput::Relation { relation: other, bound: other_bound } if other_bound == bound =>
-                (relation.intersection(*other), None),
-            _ => (relation, Some(show)),
+                (relation.intersection(*other), None, None),
+            IntegerShowOutput::Conjunction(atoms) => {
+                let index = atoms.binary_search_by(|(_, literal)| literal.cmp(bound)).ok();
+                let combined = index.map_or(relation, |index| relation.intersection(atoms[index].0));
+                (combined, Some(show), index)
+            }
+            _ => (relation, Some(show), None),
         };
         let mut allowed = None;
         for path in &paths {
-            if !path.shows_output_with_bound(relation, bound, additional, &mut allowed)? {
+            if !path.shows_output_with_bound(relation, bound, additional, skip_conjunct, &mut allowed)? {
                 return Some(Ok(ProofCoverage::Applicable(false)));
             }
         }
@@ -1556,16 +1568,16 @@ fn proof_show_output_union_is_lazy_and_exact_for_disconnected_aliases() {
     let minus_one = BigInt::from(-1);
     let show = IntegerShowOutput::Disjunction([(relation(BinaryOperator::Less), zero.clone()), (relation(BinaryOperator::Greater), zero.clone())]);
     let mut allowed = None;
-    assert_eq!(alias.shows_output_with_bound(relation(BinaryOperator::Less), &zero, Some(&show), &mut allowed), Some(false));
+    assert_eq!(alias.shows_output_with_bound(relation(BinaryOperator::Less), &zero, Some(&show), None, &mut allowed), Some(false));
     assert!(allowed.is_none());
 
     let constant = IntegerReturningPath {
         value: IntegerReturn::Const(&minus_one), ty: &ScalarType::I16,
         state: IntegerInputs(vec![Vec::new()]), axes: Vec::new(),
     };
-    assert_eq!(constant.shows_output_with_bound(relation(BinaryOperator::Less), &zero, Some(&show), &mut allowed), Some(true));
+    assert_eq!(constant.shows_output_with_bound(relation(BinaryOperator::Less), &zero, Some(&show), None, &mut allowed), Some(true));
     assert!(allowed.is_none());
 
-    assert_eq!(alias.shows_output_with_bound(relation(BinaryOperator::NotEqual), &zero, Some(&show), &mut allowed), Some(true));
+    assert_eq!(alias.shows_output_with_bound(relation(BinaryOperator::NotEqual), &zero, Some(&show), None, &mut allowed), Some(true));
     assert!(allowed.is_some());
 }

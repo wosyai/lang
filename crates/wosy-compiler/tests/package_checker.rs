@@ -986,6 +986,38 @@ fn named_proof_show_relation_checks_the_typed_bound_without_replacing_ensures() 
 }
 
 #[test]
+fn named_proof_show_conjunction_normalizes_exact_bounds_and_preserves_holes() {
+    let identity = source();
+    let check = |guard: &str, ensures: &str, claim: &str| {
+        check_scalar_module_proof(
+            identity.clone(), "demonstrate",
+            vec![ScalarProofModuleInput {
+                source: identity.clone(),
+                text: format!(r#"%%start
+                    i16(i16) echo = fn(value) {{ value }};
+                    proof demonstrate for echo(input) -> (out) where ({guard}) ensures ({ensures}) {{
+                        core.show({claim});
+                    }}
+                %%end"#),
+                namespaces: Vec::new(),
+            }],
+            vec![identity.clone()], ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
+        )
+    };
+    let disconnected = "input >= -8 && input <= 8 && input != 0";
+    let continuous = "input >= -8 && input <= 8";
+    let repeated = "out <= 8 && out >= -8 && out != 0 && out <= 8 && out >= -8";
+    assert_eq!(check(disconnected, "out <= 8", repeated), ScalarModuleProofOutcome::Proved);
+    assert_eq!(check(continuous, "out <= 8", repeated), ScalarModuleProofOutcome::Refuted);
+    assert_eq!(check(continuous, "out <= 8", "out <= 8 && out <= 8"), ScalarModuleProofOutcome::Proved);
+    assert_eq!(check(continuous, "out < 8", "out <= 8 && out <= 8"), ScalarModuleProofOutcome::Refuted);
+    assert_eq!(check(continuous, "out <= 8", "out >= -8 && out < -8"), ScalarModuleProofOutcome::Refuted);
+    assert_eq!(check("false", "out <= 8", "out >= -8 && out < -8"), ScalarModuleProofOutcome::NoApplicableInputs);
+    assert_eq!(check(disconnected, "out <= 8", "out >= -8 && (out < 0 || out > 0)"), ScalarModuleProofOutcome::Unsupported);
+    assert!(matches!(check(disconnected, "out <= 8", "out >= -8 && out <= 32768"), ScalarModuleProofOutcome::Invalid(_)));
+}
+
+#[test]
 fn sequential_named_proof_shows_verify_each_claim_without_replacing_ensures() {
     let identity = source();
     let check = |target: &str, guard: &str, goal: &str, steps: &str, startup: &str| {
