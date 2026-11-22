@@ -107,14 +107,23 @@ pub(super) struct AggregateEmitter<'ctx, 'plan> {
     input: Option<(usize, PointerValue<'ctx>)>,
 }
 
+fn literal_array_write(
+    plan: Option<ClosedLiteralArray>,
+    ordinal: usize,
+) -> Option<(usize, ReplacementArrayExtent, Option<ArrayWriterSide>)> {
+    let ClosedLiteralArray::Replacement { call, destination, extent, unit, .. } = plan? else {
+        return None;
+    };
+    if call == ordinal {
+        return Some((destination, extent, unit.map(|unit| unit.writer_side)));
+    }
+    let other = unit?.other_writer.filter(|other| other.call == ordinal)?;
+    Some((other.destination, other.extent, Some(ArrayWriterSide::Else)))
+}
+
 impl<'ctx, 'plan> AggregateEmitter<'ctx, 'plan> {
     pub(super) fn literal_array_replacement(&self, ordinal: usize) -> Option<usize> {
-        match self.plan.literal_array? {
-            ClosedLiteralArray::Replacement { call, destination, .. } if call == ordinal => Some(destination),
-            ClosedLiteralArray::Replacement { unit: Some(unit), .. } =>
-                unit.other_writer.filter(|(call, _)| *call == ordinal).map(|(_, destination)| destination),
-            _ => None,
-        }
+        literal_array_write(self.plan.literal_array, ordinal).map(|(destination, _, _)| destination)
     }
 
     pub(super) fn same_array_rebind_destination(&self, ordinal: usize) -> Option<usize> {
@@ -445,8 +454,8 @@ pub(super) fn finish_literal_array_unit(
     let LiteralArrayReceipt::Fresh { joined_storage: Some(storage), .. } =
         std::mem::replace(&mut aggregate.literal_array_receipt, LiteralArrayReceipt::Finished)
     else { return Err("checked array branch did not install a fresh receipt".into()) };
-    // The taken edge updated the private slot; the fallthrough retained it.
-    // Both edges still have exactly one owner, proved before enrollment.
+    // Each checked writer updated the private slot on its own edge. A retained
+    // edge leaves it untouched. Both edges were proved to own exactly one receipt.
     aggregate.literal_array_receipt = LiteralArrayReceipt::Joined(storage);
     Ok(())
 }
@@ -458,20 +467,18 @@ pub(super) fn capture_checked_array_argument_extent<'ctx>(
     values: &[EmitValue<'ctx>],
 ) -> Result<(), String> {
     let Some(aggregate) = state.aggregate.as_mut() else { return Ok(()) };
-    let Some(ClosedLiteralArray::Replacement {
-        call, extent: ReplacementArrayExtent::Argument { occurrence }, ..
-    }) = aggregate.plan.literal_array else { return Ok(()) };
+    let Some(ClosedLiteralArray::Replacement { .. }) = aggregate.plan.literal_array else { return Ok(()) };
     let Some(nodes) = state.body_call_nodes else { return Err("missing checked extent call context".into()) };
-    if nodes.expression_ordinal(expression) != Some(call) {
-        return Ok(());
-    }
+    let Some(call) = nodes.expression_ordinal(expression) else { return Ok(()) };
+    let Some((_, ReplacementArrayExtent::Argument { occurrence }, expected_arm)) =
+        literal_array_write(aggregate.plan.literal_array, call) else { return Ok(()) };
     let ([argument], [EmitValue::Basic(BasicValueEnum::IntValue(extent))]) = (arguments, values)
         else { return Err("checked array extent requires its one scalar argument".into()) };
-    let LiteralArrayReceipt::Original { storage: Some(_), argument_extent, .. } =
+    let LiteralArrayReceipt::Original { storage: Some(_), argument_extent, in_writer, .. } =
         &mut aggregate.literal_array_receipt
     else { return Err("checked array extent has no original receipt".into()) };
     if nodes.expression_ordinal(argument) != Some(occurrence) || extent.get_type().get_bit_width() != 64
-        || argument_extent.is_some()
+        || argument_extent.is_some() || *in_writer != expected_arm
     {
         return Err("checked array extent argument does not match its occurrence".into());
     }
@@ -486,8 +493,10 @@ pub(super) fn install_literal_array_replacement<'ctx>(
     value: &EmitValue<'ctx>,
 ) -> Result<(), String> {
     let Some(aggregate) = state.aggregate.as_mut() else { return Err("missing checked literal array plan".into()) };
-    let Some(ClosedLiteralArray::Replacement { call: planned, extent, unit, .. }) = aggregate.plan.literal_array
+    let Some(ClosedLiteralArray::Replacement { unit, .. }) = aggregate.plan.literal_array
         else { return Err("missing checked literal array replacement".into()) };
+    let Some((_, extent, expected_arm)) = literal_array_write(aggregate.plan.literal_array, call)
+        else { return Err("checked array writer does not match its call".into()) };
     let EmitValue::Basic(BasicValueEnum::PointerValue(fresh)) = value else {
         return Err("checked literal array replacement has no backing".into());
     };
@@ -496,13 +505,7 @@ pub(super) fn install_literal_array_replacement<'ctx>(
     } =
         std::mem::replace(&mut aggregate.literal_array_receipt, LiteralArrayReceipt::Finished)
     else { return Err("checked literal array replacement has no original receipt".into()) };
-    let expected_call = match (unit, in_writer) {
-        (None, None) => Some(planned),
-        (Some(unit), Some(side)) if side == unit.writer_side => Some(planned),
-        (Some(unit), Some(ArrayWriterSide::Else)) => unit.other_writer.map(|(call, _)| call),
-        _ => None,
-    };
-    if expected_call != Some(call) {
+    if in_writer != expected_arm {
         return Err("checked array writer does not match its branch and call".into());
     }
     let length = match (extent, argument_extent) {

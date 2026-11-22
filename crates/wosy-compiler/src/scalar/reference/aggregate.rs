@@ -1747,7 +1747,14 @@ pub(crate) struct ClosedLiteralArrayUnit {
     pub(crate) writer_block: usize,
     pub(crate) writer_side: ArrayWriterSide,
     pub(crate) retained_block: Option<usize>,
-    pub(crate) other_writer: Option<(usize, usize)>,
+    pub(crate) other_writer: Option<ClosedLiteralArrayWrite>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ClosedLiteralArrayWrite {
+    pub(crate) call: usize,
+    pub(crate) destination: usize,
+    pub(crate) extent: ReplacementArrayExtent,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2343,23 +2350,27 @@ fn enroll_literal_array_pair(
         return;
     }
     let FreshArrayExtent::Literal(original_elements) = original.extent else { return };
-    let replacement_extent = match fresh.extent {
-        FreshArrayExtent::Literal(elements) => ReplacementArrayExtent::Literal(elements),
-        FreshArrayExtent::Formal => {
-            let Some(argument) = write.argument else { return };
-            ReplacementArrayExtent::Argument { occurrence: argument.occurrence.0 }
-        }
+    let extent_for = |write: LiteralArrayWrite| match fresh.extent {
+        FreshArrayExtent::Literal(elements) => Some(ReplacementArrayExtent::Literal(elements)),
+        FreshArrayExtent::Formal => write.argument.map(|argument|
+            ReplacementArrayExtent::Argument { occurrence: argument.occurrence.0 }),
     };
-    if let Some(other) = unit.and_then(|unit| unit.other_write) {
-        if !matches!(replacement_extent, ReplacementArrayExtent::Literal(_))
-            || other.rhs == other.writer || other.rhs == write.rhs || other.writer == write.writer
+    let Some(replacement_extent) = extent_for(write) else { return };
+    let other_writer = if let Some(other) = unit.and_then(|unit| unit.other_write) {
+        if other.rhs == other.writer || other.rhs == write.rhs || other.writer == write.writer
             || other.producer == write.producer || other.destination == write.destination
             || other.argument.is_some() != write.argument.is_some()
+            || write.argument.zip(other.argument).is_some_and(|(a, b)|
+                a.read == b.read || a.occurrence == b.occurrence)
             || !unit.is_some_and(|unit| unit.writer_side == ArrayWriterSide::Then && unit.retained.is_some())
         {
             return;
         }
-    }
+        let Some(extent) = extent_for(other) else { return };
+        Some(ClosedLiteralArrayWrite { call: other.producer.0, destination: other.destination.0, extent })
+    } else {
+        None
+    };
     let to_receipt = |allocation: LiteralArrayBind| OriginalArrayReceipt {
         origin: allocation.bind,
         allocation: (allocation.position.block.0, allocation.position.item),
@@ -2385,7 +2396,7 @@ fn enroll_literal_array_pair(
         unit: unit.map(|unit| ClosedLiteralArrayUnit {
             expression: unit.expression.0, writer_block: unit.writer_block.0, writer_side: unit.writer_side,
             retained_block: unit.retained.map(|retained| retained.block.0),
-            other_writer: unit.other_write.map(|other| (other.producer.0, other.destination.0)),
+            other_writer,
         }),
     });
 }
@@ -2417,8 +2428,7 @@ fn install_literal_array_plans(
         if let Some(other) = unit.and_then(|unit| unit.other_write) {
             let Some(other_signature) = body.sites.checked_call_signatures.get(&other.producer) else { continue };
             let [other_output] = other_signature.outputs.outputs.as_slice() else { continue };
-            if !matches!(fresh.extent, FreshArrayExtent::Literal(_))
-                || target_body(declarations, body.cfg, other.rhs) != Some(callee)
+            if target_body(declarations, body.cfg, other.rhs) != Some(callee)
                 || other_signature.parameters != signature.parameters
                 || !same_runtime_array_type(&other_output.ty, &output.ty)
             {
@@ -3312,6 +3322,50 @@ mod tests {
             enroll_literal_array_pair(&mut plans, pair, rejected);
             assert!(plans.bodies.is_empty());
         }
+
+        let mut dual = pair;
+        dual.write.rhs = CfgPointId(8);
+        dual.write.writer = CfgPointId(9);
+        dual.write.argument = Some(LiteralArrayArgument { read: CfgPointId(7), occurrence: OccurrenceOrdinal(9) });
+        dual.exit = CfgPointId(18);
+        let other = LiteralArrayWrite {
+            rhs: CfgPointId(13), writer: CfgPointId(14),
+            producer: OccurrenceOrdinal(11), destination: OccurrenceOrdinal(13),
+            argument: Some(LiteralArrayArgument { read: CfgPointId(12), occurrence: OccurrenceOrdinal(12) }),
+        };
+        let unit = LiteralArrayUnit {
+            expression: OccurrenceOrdinal(4), condition: CfgPointId(4), branch: CfgPointId(5),
+            writer_side: ArrayWriterSide::Then, writer_entry: CfgPointId(6), writer_exit: CfgPointId(10),
+            writer_block: BlockOrdinal(1), writer_scope: ReferenceScopeId(1),
+            retained: Some(LiteralArrayRetained {
+                entry: CfgPointId(11), exit: CfgPointId(15), block: BlockOrdinal(2), scope: ReferenceScopeId(2),
+            }),
+            other_write: Some(other),
+            join: CfgPointId(17),
+        };
+        dual.unit = Some(unit);
+        let mut plans = ClosedAggregates::default();
+        enroll_literal_array_pair(&mut plans, dual, exact);
+        let caller = &plans.bodies[&dual.caller];
+        assert!(matches!(caller.literal_array, Some(ClosedLiteralArray::Replacement {
+            extent: ReplacementArrayExtent::Argument { occurrence: 9 },
+            unit: Some(ClosedLiteralArrayUnit {
+                other_writer: Some(ClosedLiteralArrayWrite {
+                    call: 11, destination: 13, extent: ReplacementArrayExtent::Argument { occurrence: 12 },
+                }), ..
+            }), ..
+        })));
+        assert_eq!(caller.scope_exits, BTreeMap::from([(dual.block.0, dual.exit)]));
+        assert!(caller.releases.is_empty() && caller.input_release.is_none());
+
+        for argument in [None, dual.write.argument] {
+            let mut plans = ClosedAggregates::default();
+            let unit = LiteralArrayUnit {
+                other_write: Some(LiteralArrayWrite { argument, ..other }), ..unit
+            };
+            enroll_literal_array_pair(&mut plans, LiteralArrayPair { unit: Some(unit), ..dual }, exact);
+            assert!(plans.bodies.is_empty());
+        }
     }
 
     #[test]
@@ -3592,7 +3646,7 @@ mod tests {
             LiteralArrayParameters::default());
         let caller = &plans.bodies[&pair.caller];
         assert!(matches!(caller.literal_array, Some(ClosedLiteralArray::Replacement {
-            unit: Some(ClosedLiteralArrayUnit { other_writer: Some((7, 8)), .. }), ..
+            unit: Some(ClosedLiteralArrayUnit { other_writer: Some(ClosedLiteralArrayWrite { call: 7, destination: 8, .. }), .. }), ..
         })));
         assert_eq!(caller.scope_exits, BTreeMap::from([(0, CfgPointId(15))]));
         assert!(caller.releases.is_empty() && caller.input_release.is_none());
