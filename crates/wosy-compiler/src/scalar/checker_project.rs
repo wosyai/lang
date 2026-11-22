@@ -7097,6 +7097,60 @@ mod tests {
 
     #[cfg(feature = "internal-checker")]
     #[test]
+    fn authored_show_two_formal_arithmetic_requires_one_exact_joint_entry() {
+        use super::super::checker_flow::AUTHORED_RETURN_CALCULATIONS;
+        use ScalarModuleProofOutcome::{NoApplicableInputs, Proved, Unsupported};
+        let file = source("src/main.w", "authored-two-formal-arithmetic");
+        let check = |ty: &str, body: &str, guard: &str, ensures: &str, startup: &str, names: &[&str]| {
+            check_scalar_module_proofs(
+                file.clone(), names,
+                vec![ScalarProofModuleInput {
+                    source: file.clone(),
+                    text: format!(r#"%%start
+                        {ty}({ty}, {ty}) number = fn(left, right) {{ {body} }};
+                        {startup}
+                        proof proof_one for number(a, b) -> (out) where ({guard}) ensures ({ensures}) {{
+                            core.show(out <= 7);
+                        }}
+                        proof plain for number(a, b) -> (out) where ({guard}) ensures ({ensures}) {{}}
+                    %%end"#),
+                    namespaces: Vec::new(),
+                }],
+                vec![file.clone()], inputs(),
+            ).unwrap()
+        };
+        let count = || AUTHORED_RETURN_CALCULATIONS.with(|count| count.replace(0));
+        let _ = count();
+        let both = ["proof_one", "plain"];
+        let only = ["proof_one"];
+        let guard = "a == 6 && b == 1";
+        assert_eq!(check("i8", "left + right", guard, "out == 7", "", &both), [Proved, Unsupported]);
+        assert_eq!(count(), 1);
+        assert_eq!(check("i8", "left - right", guard, "out == 5", "", &only), [Proved]);
+        assert_eq!(count(), 1);
+        assert_eq!(check("i8", "right - left", guard, "out == -5", "", &only), [Proved]);
+        assert_eq!(count(), 1);
+        assert_eq!(check("i8", "left + right", "a == 6 && b <= 1", "out <= 7", "", &only), [Unsupported]);
+        assert_eq!(count(), 0);
+        assert_eq!(check("i8", "left + right", "a == 127 && b == 1", "out <= 7", "", &only), [Unsupported]);
+        assert_eq!(count(), 1);
+        assert_eq!(check("u8", "left - right", "a == 0 && b == 1", "out <= 7", "", &only), [Unsupported]);
+        assert_eq!(count(), 1);
+        assert_eq!(check("i8", "if (right == 0) {}; left - left", guard, "out == 0", "", &only), [Unsupported]);
+        assert_eq!(count(), 0);
+        assert_eq!(check("i8", "if (left == 0) {}; i8 local = 6; local + right", guard, "out == 7", "", &only), [Unsupported]);
+        assert_eq!(count(), 0);
+        let branch = "if (left == 6) { left + right } else { 5 }";
+        assert_eq!(check("i8", branch, "b == 1", "out <= 7", "", &only), [Proved]);
+        assert_eq!(count(), 1);
+        assert_eq!(check("i8", "left + right", "false", "out <= 7", "", &only), [NoApplicableInputs]);
+        assert_eq!(count(), 0);
+        assert_eq!(check("i8", "left + right", guard, "out == 7", "i8 live = number(6, 1);", &only), [Unsupported]);
+        assert_eq!(count(), 0);
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
     fn authored_show_implicit_singleton_keeps_identity_and_result_inline() {
         let file = source("src/main.w", "implicit-show-singleton");
         let mut slots = ImplicitAuthoredShows::default();

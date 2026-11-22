@@ -254,6 +254,14 @@ impl<'a> ScopedAuthoredReturn<'a> for NamedAuthoredReturn<'a> {
             }
             let left_ordinal = typed_operand(OccurrenceEdge::BinaryLeft)?;
             let right_ordinal = typed_operand(OccurrenceEdge::BinaryRight)?;
+            let formal_axis = |ordinal| {
+                let Some(PlainNameIdentity::Lexical(binding)) = calls.prepared_plain_name(ordinal) else {
+                    return None;
+                };
+                let (axis, axis_type) = roots.lookup(binding)?;
+                (axis_type == ty && calls.boundary.checker_parameter_bindings.as_deref()?.get(axis) == Some(binding))
+                    .then_some(axis)
+            };
             let exact_formal = |ordinal, literal: &ScalarExpression| {
                 if !matches!(literal, ScalarExpression::Integer { .. })
                     && !matches!(literal, ScalarExpression::Unary { operator: UnaryOperator::Negate, operand, .. }
@@ -261,16 +269,13 @@ impl<'a> ScopedAuthoredReturn<'a> for NamedAuthoredReturn<'a> {
                 {
                     return None;
                 }
-                let Some(PlainNameIdentity::Lexical(binding)) = calls.prepared_plain_name(ordinal) else {
-                    return None;
-                };
-                let (axis, axis_type) = roots.lookup(binding)?;
-                if axis_type != ty || calls.boundary.checker_parameter_bindings.as_deref()?.get(axis) != Some(binding) {
-                    return None;
-                }
-                path.singleton_at(axis).map(Cow::Borrowed)
+                path.singleton_at(formal_axis(ordinal)?).map(Cow::Borrowed)
             };
             let (left, right) = match (left.as_ref(), right.as_ref(), operator) {
+                (ScalarExpression::Name { .. }, ScalarExpression::Name { .. }, BinaryOperator::Add | BinaryOperator::Subtract) => {
+                    let (left, right) = path.distinct_singleton_pair_at(formal_axis(left_ordinal)?, formal_axis(right_ordinal)?)?;
+                    (Cow::Borrowed(left), Cow::Borrowed(right))
+                }
                 (ScalarExpression::Name { .. }, literal, BinaryOperator::Add | BinaryOperator::Subtract) =>
                     (exact_formal(left_ordinal, literal)?, concrete_integer_literal(literal)?),
                 (literal, ScalarExpression::Name { .. }, BinaryOperator::Add) => {
@@ -471,6 +476,19 @@ impl IntegerInputs {
         let (first, rest) = self.0.split_first()?;
         let value = first[axis].singleton_value()?;
         rest.iter().all(|row| row[axis].singleton_value() == Some(value)).then_some(value)
+    }
+
+    #[cfg(feature = "internal-checker")]
+    fn distinct_singleton_pair_at(&self, left: usize, right: usize) -> Option<(&BigInt, &BigInt)> {
+        if left == right {
+            return None;
+        }
+        let (first, rest) = self.0.split_first()?;
+        let left_value = first[left].singleton_value()?;
+        let right_value = first[right].singleton_value()?;
+        rest.iter().all(|row| {
+            row[left].singleton_value() == Some(left_value) && row[right].singleton_value() == Some(right_value)
+        }).then_some((left_value, right_value))
     }
 
     fn project_axis(&self, axis: usize) -> Option<Rc<IntegerSet>> {
