@@ -2510,7 +2510,7 @@ fn verify_authored_show_group<'step, 'project: 'step>(
                 }
             }
         }
-        None => {} // Preserve the default Unsupported outcome.
+        None => {}
     }
 }
 
@@ -2913,7 +2913,7 @@ impl PreparedProofModule {
                                     let conclusion = (*requested_relation, requested);
                                     let implied = cited_bounds.implies(consumer.typed.result_type, premise, conclusion);
                                     if !implied {
-                                        continue; // No theorem to apply; don't inspect or memoize return membership.
+                                        continue;
                                     }
                                 }
                                 if let Some(key) = strict_entry {
@@ -6239,9 +6239,9 @@ mod tests {
         let _ = take_integer_observations();
         assert_eq!(run(&["fails", "passes", "cited"]), [Refuted, Proved, Proved]);
         assert_eq!(take_integer_observations(), (1, 0));
-        assert_eq!(run(&["cited", "failed_citation"]), [Proved, Unsupported]); // Distinct implicit leaves.
+        assert_eq!(run(&["cited", "failed_citation"]), [Proved, Unsupported]);
         assert_eq!(take_integer_observations(), (1, 0));
-        assert_eq!(run(&["passes", "failed_citation"]), [Proved, Unsupported]); // Explicit + implicit.
+        assert_eq!(run(&["passes", "failed_citation"]), [Proved, Unsupported]);
         assert_eq!(take_integer_observations(), (1, 0));
         assert_eq!(run(&["cited", "other_citation"]), [Proved, Proved]);
         assert_eq!(take_integer_observations(), (2, 0));
@@ -6250,7 +6250,7 @@ mod tests {
         assert_eq!(run(&["passes", "other"]), [Proved, Proved]);
         assert_eq!(take_integer_observations(), (2, 0));
         assert_eq!(run(&["passes", "plain"]), [Proved, Proved]);
-        assert_eq!(take_integer_observations(), (2, 0)); // Distinct reflexive authority.
+        assert_eq!(take_integer_observations(), (2, 0));
         assert_eq!(run(&["empty_second", "empty_first"]), [NoApplicableInputs, NoApplicableInputs]);
         assert_eq!(take_integer_observations(), (1, 0));
         assert!(matches!(run(&["invalid"]).as_slice(), [Invalid(_)]));

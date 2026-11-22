@@ -1349,7 +1349,7 @@ pub(super) fn evaluate_mixed_entry_output(
         let returned = match path.value {
             IntegerReturn::Alias(alias) => {
                 if uses_entry && !formals.contains(alias) {
-                    return None; // Unadmitted alias overrides an earlier refutation.
+                    return None;
                 }
                 if !proved { continue; }
                 Some(path.axes.iter().position(|known| *known == alias)?)
@@ -1439,7 +1439,7 @@ pub(super) fn evaluate_borrowed_return_proof(
                 return None;
             }
             if !proved {
-                continue; // Still inspect later return identities for unsupported aliases.
+                continue;
             }
             let axis = path.axes.iter().position(|binding| **binding == guard.binding)?;
             let rows = &path.state.0;
@@ -1528,7 +1528,7 @@ pub(super) fn evaluate_borrowed_return_proof(
                     return Some(false);
                 }
             }
-            _ => return None, // Owning legacy conditionals use the wrapper above.
+            _ => return None,
         }
     }
     Some(true)
