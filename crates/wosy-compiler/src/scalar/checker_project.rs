@@ -1884,7 +1884,7 @@ mod production_bound_reuse {
         (source, name): (&SourceIdentity, &str),
         (caller_source, caller_name): (&SourceIdentity, &str),
     ) -> Option<ScalarProofCallOutcome> {
-        let plan = project.plan_module_proof_in_scope::<true>(source, name).ok()?;
+        let plan = project.plan_module_proof_in_scope::<true, false>(source, name).ok()?;
         let TypedProofGoal::Literal { operator, relation, bound } = &plan.typed.goal else { return None; };
         let (scalar, calls) = project.prepared.parts();
         let caller = select_checked_root(scalar, caller_source, caller_name).ok()?;
@@ -1939,7 +1939,7 @@ mod production_bound_reuse {
             if output.ordinal != 0 {
                 return None;
             }
-            let guard = checked_integer_guard_slots(body, plan.filter.as_deref().unwrap_or_default())?;
+            let guard = checked_integer_guard_slots::<false>(body, plan.filter.as_deref().unwrap_or_default())?;
             if guard.always_rejects {
                 return None;
             }
@@ -2024,6 +2024,10 @@ impl Hash for ExactGuardGroup<'_> {
             std::mem::discriminant(predicate).hash(state);
             match predicate {
                 CheckerPredicate::Boolean(value) => value.hash(state),
+                CheckerPredicate::EntryDomain { binding, values } => {
+                    binding.hash(state);
+                    values.hash(state);
+                }
                 CheckerPredicate::Integer(predicate) => {
                     predicate.binding.hash(state);
                     std::mem::discriminant(&predicate.operator).hash(state);
@@ -2051,10 +2055,10 @@ struct PlannedModuleProof<'a> {
 impl PreparedProofModule {
     #[cfg(test)]
     fn plan_module_proof<'a>(&'a self, proof_source: &SourceIdentity, proof_name: &'a str) -> Result<PlannedModuleProof<'a>, ProjectCheck> {
-        self.plan_module_proof_in_scope::<false>(proof_source, proof_name)
+        self.plan_module_proof_in_scope::<false, true>(proof_source, proof_name)
     }
 
-    fn plan_module_proof_in_scope<'a, const ALLOW_INDUCTION: bool>(
+    fn plan_module_proof_in_scope<'a, const ALLOW_INDUCTION: bool, const ALLOW_DOMAIN: bool>(
         &'a self, proof_source: &SourceIdentity, proof_name: &'a str,
     ) -> Result<PlannedModuleProof<'a>, ProjectCheck> {
         let (proof_source, _) = self.proofs.get_key_value(proof_source).ok_or(ProjectCheck::MissingRoot)?;
@@ -2062,8 +2066,9 @@ impl PreparedProofModule {
         let (module, item, function) = proof.function;
         let steps = derive_block(&child(proof.node, SyntaxKind::Block)?);
         let typed = typed_proof_postcondition::<ALLOW_INDUCTION>(&self.prepared, proof.function, proof.node, &steps)?;
-        let filter = prepare_proof_entry_filter(
+        let filter = prepare_proof_entry_filter_in_scope(
             proof.node, proof_source, typed.target.target_layout, &typed.input_names, typed.body,
+            ALLOW_DOMAIN && steps.items.is_empty() && typed.measure.is_none(),
         )?;
         Ok(PlannedModuleProof {
             proof_source, proof: proof.node, canonical_target: proof.target, target: (module, item),
@@ -2090,7 +2095,7 @@ impl PreparedProofModule {
     fn audit_induction_return_witness(
         &self, proof_source: &SourceIdentity, proof_name: &str,
     ) -> Result<InductionPremise, ProjectCheck> {
-        let plan = self.plan_module_proof_in_scope::<true>(proof_source, proof_name)?;
+        let plan = self.plan_module_proof_in_scope::<true, false>(proof_source, proof_name)?;
         let measure = plan.typed.measure.ok_or(ProjectCheck::Unsupported)?;
         Ok(plan.verify_induction_return_witness(measure)?.unwrap_or(InductionPremise::Unreachable))
     }
@@ -2110,7 +2115,7 @@ impl PreparedProofModule {
                 std::collections::hash_map::Entry::Occupied(first) => duplicate.push((index, *first.get())),
                 std::collections::hash_map::Entry::Vacant(first) => {
                     first.insert(index);
-                    match self.plan_module_proof_in_scope::<true>(proof_source, name) {
+                    match self.plan_module_proof_in_scope::<true, true>(proof_source, name) {
                         Ok(plan) => plans.push((index, plan)),
                         Err(error) => outcomes[index] = module_proof_outcome(Err(error)),
                     }
@@ -2263,7 +2268,7 @@ impl PlannedModuleProof<'_> {
     fn observer(&self) -> SelectedProofObserver<'_> {
         SelectedProofObserver {
             guard: if self.uses_direct_goal() {
-                checked_integer_guard_slots(self.typed.body, self.filter.as_deref().unwrap_or_default())
+                checked_integer_guard_slots::<true>(self.typed.body, self.filter.as_deref().unwrap_or_default())
             } else {
                 None
             },
@@ -2303,12 +2308,14 @@ struct CheckedIntegerGuardSlots<'a> {
     arity: usize,
     always_rejects: bool,
     comparisons: Vec<ImportedEntryGuard<'a>>,
+    domain: Option<(usize, &'a IntegerSet)>,
 }
 
 #[cfg(feature = "internal-checker")]
 impl CheckedIntegerGuardSlots<'_> {
     fn accepts(&self, arguments: &[&BigInt]) -> bool {
         self.arity == arguments.len() && !self.always_rejects
+            && self.domain.is_none_or(|(slot, values)| values.contains(arguments[slot]))
             && self.comparisons.iter().all(|comparison| {
                 arguments.get(comparison.slot).is_some_and(|argument| comparison.relation.accepts((*argument).cmp(comparison.bound)))
             })
@@ -2316,7 +2323,7 @@ impl CheckedIntegerGuardSlots<'_> {
 }
 
 #[cfg(feature = "internal-checker")]
-fn checked_integer_guard_slots<'a>(
+fn checked_integer_guard_slots<'a, const ALLOW_DOMAIN: bool>(
     body: &FunctionCallSites,
     filter: &'a [CheckerPredicate],
 ) -> Option<CheckedIntegerGuardSlots<'a>> {
@@ -2327,10 +2334,17 @@ fn checked_integer_guard_slots<'a>(
     {
         return None;
     }
-    let mut guard = CheckedIntegerGuardSlots { arity: parameters.len(), always_rejects: false, comparisons: Vec::new() };
+    let mut guard = CheckedIntegerGuardSlots { arity: parameters.len(), always_rejects: false, comparisons: Vec::new(), domain: None };
     for predicate in filter {
         match predicate {
             CheckerPredicate::Boolean(value) => guard.always_rejects |= !value,
+            CheckerPredicate::EntryDomain { binding, values } => {
+                if !ALLOW_DOMAIN || guard.domain.is_some() {
+                    return None;
+                }
+                let slot = bindings.iter().position(|known| known == binding)?;
+                guard.domain = Some((slot, values));
+            }
             CheckerPredicate::Integer(predicate) => {
                 let slot = bindings.iter().position(|binding| binding == &predicate.binding)?;
                 guard.comparisons.push(ImportedEntryGuard {
@@ -2424,7 +2438,7 @@ impl<'a> VerifiedInductionExactReturn<'a> {
             };
             Some(Self {
                 target: plan.target, result_type: plan.typed.result_type, value: bound,
-                where_guard: checked_integer_guard_slots(plan.typed.body, plan.filter.as_deref().unwrap_or_default())?,
+                where_guard: checked_integer_guard_slots::<false>(plan.typed.body, plan.filter.as_deref().unwrap_or_default())?,
                 used: false,
             })
         })();
@@ -2954,6 +2968,7 @@ fn induction_entry_domain(
         match guard {
             CheckerPredicate::Boolean(true) => {}
             CheckerPredicate::Boolean(false) => return Ok((IntegerSet::default(), minimum)),
+            CheckerPredicate::EntryDomain { .. } => return Err(ProjectCheck::Unsupported),
             CheckerPredicate::Integer(predicate) if &predicate.binding == binding => {
                 entries = entries.keep(&predicate.operator, &predicate.bound).ok_or(ProjectCheck::Unsupported)?;
                 if entries.is_empty() {
@@ -2985,6 +3000,7 @@ fn induction_base_reachable(
     }
     match guard {
         CheckerPredicate::Boolean(value) => Ok(*value),
+        CheckerPredicate::EntryDomain { .. } => Err(ProjectCheck::Unsupported),
         CheckerPredicate::Integer(predicate) => {
             let complement = complement_integer_comparison(&predicate.operator)
                 .and_then(IntegerRelation::from_operator).ok_or(ProjectCheck::Unsupported)?;
@@ -3004,6 +3020,7 @@ fn check_induction_entry_domain(
     match base_guard {
         CheckerPredicate::Boolean(true) => return Ok(InductionPremise::Unreachable),
         CheckerPredicate::Boolean(false) => {}
+        CheckerPredicate::EntryDomain { .. } => return Err(ProjectCheck::Unsupported),
         CheckerPredicate::Integer(predicate) => {
             let operator = complement_integer_comparison(&predicate.operator).ok_or(ProjectCheck::Unsupported)?;
             entries = entries.keep(operator, &predicate.bound).ok_or(ProjectCheck::Unsupported)?;
@@ -3224,6 +3241,7 @@ fn issue_return_bound(
     let guards = conditions.unwrap_or_default().iter().map(|condition| {
         match condition {
             CheckerPredicate::Boolean(value) => Some(VerifiedEntryGuard::Boolean(*value)),
+            CheckerPredicate::EntryDomain { .. } => None,
             CheckerPredicate::Integer(predicate) => {
                 let slot = body.boundary.checker_parameter_bindings.as_deref()?
                     .iter().position(|binding| *binding == predicate.binding)?;
@@ -3427,17 +3445,23 @@ fn prepare_proof_entry_filter(
     inputs: &[String],
     body: &FunctionCallSites,
 ) -> Result<Option<Vec<CheckerPredicate>>, ProjectCheck> {
+    prepare_proof_entry_filter_in_scope(declaration, source, layout, inputs, body, false)
+}
+
+fn prepare_proof_entry_filter_in_scope(
+    declaration: &CstNode, source: &SourceIdentity, layout: ScalarTargetLayout,
+    inputs: &[String], body: &FunctionCallSites, allow_domain: bool,
+) -> Result<Option<Vec<CheckerPredicate>>, ProjectCheck> {
     typed_proof_where(declaration, source, layout, inputs, body)?
-        .as_ref().map(|expression| proof_entry_filters(expression, inputs, body)).transpose()
+        .as_ref().map(|expression| proof_entry_filters(expression, inputs, body, allow_domain)).transpose()
 }
 
 fn proof_entry_filters(
-    expression: &ScalarExpression,
-    inputs: &[String],
-    body: &FunctionCallSites,
+    expression: &ScalarExpression, inputs: &[String], body: &FunctionCallSites, allow_domain: bool,
 ) -> Result<Vec<CheckerPredicate>, ProjectCheck> {
     let mut filters = Vec::new();
     let mut pending = vec![(expression, false)];
+    let mut has_domain = false;
     while let Some((expression, negated)) = pending.pop() {
         match expression {
             ScalarExpression::Unary { operator: UnaryOperator::LogicalNot, operand, .. } =>
@@ -3445,6 +3469,22 @@ fn proof_entry_filters(
             ScalarExpression::Binary { operator: BinaryOperator::And, left, right, .. } if !negated => {
                 pending.push((right, false));
                 pending.push((left, false));
+            }
+            ScalarExpression::Binary { operator: BinaryOperator::Or, left, right, .. }
+                if !negated && allow_domain && !has_domain =>
+            {
+                let (CheckerPredicate::Integer(left), CheckerPredicate::Integer(right)) = (
+                    proof_input_condition::<false>(left, inputs, body, false)?,
+                    proof_input_condition::<false>(right, inputs, body, false)?,
+                ) else { return Err(ProjectCheck::Unsupported); };
+                if left.binding != right.binding || left.ty != right.ty {
+                    return Err(ProjectCheck::Unsupported);
+                }
+                let domain = IntegerSet::from_type(&left.ty).ok_or(ProjectCheck::Unsupported)?;
+                let values = domain.keep(&left.operator, &left.bound).ok_or(ProjectCheck::Unsupported)?
+                    .join(domain.keep(&right.operator, &right.bound).ok_or(ProjectCheck::Unsupported)?);
+                filters.push(CheckerPredicate::EntryDomain { binding: left.binding, values });
+                has_domain = true;
             }
             _ => filters.push(proof_input_condition::<false>(expression, inputs, body, negated)?),
         }
@@ -4645,6 +4685,7 @@ mod tests {
                 core.require(result <= 7, {OUTPUT});
             }};
             proof entry for producer(input) -> (out) where (input <= 7) ensures (out == core.old(input)) {{}}
+            proof domain for producer(input) -> (out) where (input == 1 || input == 7) ensures (out <= 7) {{}}
             proof literal for producer(input) -> (out) where (input <= 7) ensures (out <= 7) {{}}
         %%end"#);
         let run = |name| {
@@ -4656,6 +4697,8 @@ mod tests {
         };
         let _ = take_integer_observations();
         assert_eq!(run("entry"), ScalarProofCallOutcome::Unavailable);
+        assert_eq!(take_integer_observations(), (0, 0));
+        assert_eq!(run("domain"), ScalarProofCallOutcome::Unavailable);
         assert_eq!(take_integer_observations(), (0, 0));
         assert_eq!(run("literal"), ScalarProofCallOutcome::Established);
         assert_eq!(take_integer_observations(), (1, 1));

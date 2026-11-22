@@ -591,7 +591,7 @@ fn explicit_unused_module_proof_where_filters_typed_entry_only() {
     assert_eq!(proof("false", "out <= 0"), ScalarModuleProofOutcome::NoApplicableInputs);
     assert_eq!(
         proof("input == -128 || input == 0", "out <= 0"),
-        ScalarModuleProofOutcome::Unsupported,
+        ScalarModuleProofOutcome::Proved,
     );
     assert!(matches!(proof("out <= 0", "out <= 0"), ScalarModuleProofOutcome::Invalid(diagnostics) if !diagnostics.is_empty()));
 }
@@ -1510,6 +1510,66 @@ fn named_proof_output_conjunction_checks_every_atom_on_shared_return_paths() {
     assert!(matches!(check("out <= 32768 && out >= -8", "input == 7", "", ""), ScalarModuleProofOutcome::Invalid(_)));
     assert_eq!(check("out >= -8 && input <= 7", "true", "", ""), ScalarModuleProofOutcome::Unsupported);
     assert_eq!(check("out >= -8 && out <= 7", "input == 7", "", "core.show(out == 0);"), ScalarModuleProofOutcome::Unsupported);
+}
+
+#[test]
+fn named_proof_where_disjunction_admits_the_exact_domain_in_actual_and_unused_contexts() {
+    let identity = source();
+    let check = |guard: &str, goal: &str, actual: &str, steps: &str| {
+        check_scalar_module_proof(
+            identity.clone(), "bounded",
+            vec![ScalarProofModuleInput {
+                source: identity.clone(),
+                text: format!(r#"%%start
+                    i16(i16) echo = fn(value) {{ value }};
+                    proof bounded for echo(input) -> (out) where ({guard}) ensures ({goal}) {{ {steps} }}
+                    {actual}
+                %%end"#),
+                namespaces: Vec::new(),
+            }],
+            vec![identity.clone()], ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
+        )
+    };
+    let guard = "(input < -2 || input > 2) && input >= -4 && input <= 4";
+    let goal = "out <= -3 || out >= 3";
+    assert_eq!(check(guard, goal, "", ""), ScalarModuleProofOutcome::Proved);
+    assert_eq!(check(guard, "out <= 4", "", ""), ScalarModuleProofOutcome::Proved);
+    assert_eq!(check(guard, "out < 4", "", ""), ScalarModuleProofOutcome::Refuted);
+    assert_eq!(check(guard, goal, "i16 a = echo(0); i16 b = echo(5);", ""), ScalarModuleProofOutcome::NoApplicableInputs);
+    assert_eq!(check(guard, goal, "i16 a = echo(-4); i16 b = echo(0); i16 c = echo(4);", ""), ScalarModuleProofOutcome::Proved);
+    assert_eq!(check(guard, "out < 4", "i16 a = echo(0); i16 b = echo(4);", ""), ScalarModuleProofOutcome::Refuted);
+    assert_eq!(check("(input < -2 || input > 2) && input == 0", goal, "", ""), ScalarModuleProofOutcome::NoApplicableInputs);
+    assert_eq!(check("input == -3 || true", goal, "", ""), ScalarModuleProofOutcome::Unsupported);
+    assert_eq!(check("input == -3 || input == 3 || input == 4", goal, "", ""), ScalarModuleProofOutcome::Unsupported);
+    assert!(matches!(check("input < 0 || input == 32768", goal, "", ""), ScalarModuleProofOutcome::Invalid(_)));
+    assert_eq!(check(guard, "out <= 4", "", "core.show(out == 0);"), ScalarModuleProofOutcome::Unsupported);
+}
+
+#[test]
+fn named_proof_where_disjunction_does_not_export_or_mix_axis_authority() {
+    let identity = source();
+    let text = format!(r#"%%start
+        u8(u8) producer = fn(value) {{ value }};
+        u8(u8, u8) mixed_axis = fn(a, b) {{ if (b == 0) {{ a }} else {{ a }} }};
+        unit() caller = fn {{
+            u8 answer = producer(7);
+            core.require(answer <= 7, {OUTPUT});
+        }};
+        proof bounded for producer(input) -> (out) where (input == 1 || input == 7) ensures (out <= 7) {{}}
+        proof mixed for mixed_axis(a, b) -> (out) where (a == 1 || b == 7) ensures (out <= 7) {{}}
+    %%end"#);
+    let outcomes = check_scalar_module_proofs(
+        identity.clone(), &["bounded", "mixed"],
+        vec![ScalarProofModuleInput { source: identity.clone(), text: text.clone(), namespaces: Vec::new() }],
+        vec![identity.clone()], ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
+    );
+    assert_eq!(outcomes.unwrap(), [ScalarModuleProofOutcome::Proved, ScalarModuleProofOutcome::Unsupported]);
+    let (_, catalog) = wosy_compiler::parse_proof_source(identity.clone(), text, &[])
+        .ok().expect("canonical proof source");
+    assert_eq!(check_loaded_scalar_module_proof_call(
+        (&identity, "bounded"), (&identity, "caller"), Vec::new(), (catalog, Vec::new()),
+        vec![identity.clone()], ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
+    ), ScalarProofCallOutcome::Unavailable);
 }
 
 #[test]

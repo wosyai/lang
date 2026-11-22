@@ -16,12 +16,13 @@ use super::{symbolic_integer::IntegerRelation, reference::CheckerIntegerCallArgu
 pub(super) enum CheckerPredicate {
     Boolean(bool),
     Integer(IntegerPredicate),
+    EntryDomain { binding: ReferenceBindingId, values: IntegerSet },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct IntegerPredicate {
     pub(super) binding: ReferenceBindingId,
-    ty: ScalarType,
+    pub(super) ty: ScalarType,
     pub(super) operator: BinaryOperator,
     pub(super) bound: BigInt,
 }
@@ -169,6 +170,7 @@ impl IntegerInputs {
             CheckerPredicate::Boolean(true) => return Some((self, Self::default(), None)),
             CheckerPredicate::Boolean(false) => return Some((Self::default(), self, None)),
             CheckerPredicate::Integer(predicate) => predicate,
+            CheckerPredicate::EntryDomain { .. } => return None,
         };
         let (index, ty) = roots.lookup(&predicate.binding)?;
         if ty != &predicate.ty {
@@ -203,6 +205,7 @@ impl IntegerInputs {
             CheckerPredicate::Boolean(true) => return Some(Self::default()),
             CheckerPredicate::Boolean(false) => return Some(Self(self.0.clone())),
             CheckerPredicate::Integer(predicate) => predicate,
+            CheckerPredicate::EntryDomain { .. } => return None,
         };
         let (index, ty) = roots.lookup(&predicate.binding)?;
         if ty != &predicate.ty {
@@ -443,6 +446,7 @@ impl IntegerReturningPath<'_> {
         let (yes, no) = match guard {
             CheckerPredicate::Boolean(true) => (self.state, IntegerInputs::default()),
             CheckerPredicate::Boolean(false) => (IntegerInputs::default(), self.state),
+            CheckerPredicate::EntryDomain { .. } => return None,
             CheckerPredicate::Integer(predicate) => {
                 let index = self.axes.iter().position(|binding| **binding == predicate.binding)?;
                 self.state.split_axis(index, predicate)?
@@ -885,6 +889,14 @@ fn run_integer_callable<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool>
         match filter {
             CheckerPredicate::Boolean(true) => {}
             CheckerPredicate::Boolean(false) => return Some(Ok(ProofCoverage::NoApplicableInputs)),
+            CheckerPredicate::EntryDomain { binding, values } => {
+                let (axis, _) = roots.lookup(binding)?;
+                match row[axis].intersection(values) {
+                    IntegerIntersection::Unchanged => {}
+                    IntegerIntersection::Empty => return Some(Ok(ProofCoverage::NoApplicableInputs)),
+                    IntegerIntersection::Changed(filtered) => row[axis] = Rc::new(filtered),
+                }
+            }
             CheckerPredicate::Integer(predicate) => {
                 let (axis, ty) = roots.lookup(&predicate.binding)?;
                 if ty != &predicate.ty {

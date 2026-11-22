@@ -4,13 +4,13 @@ use num_bigint::BigInt;
 
 use super::{typecheck::integer_bounds, BinaryOperator, ScalarType};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct Interval {
     first: BigInt,
     last: BigInt,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub(super) struct IntegerSet(Vec<Interval>);
 
 #[derive(Debug, Eq, PartialEq)]
