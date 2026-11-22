@@ -453,27 +453,31 @@ pub(super) fn check_integer_requirement_activity(
 pub(super) fn collect_integer_requirement_failures(
     calls: &FunctionCallSites,
 ) -> Option<(bool, Vec<IntegerCheckFailure<'_>>)> {
-    let mut collected = IntegerFailureCollection::default();
+    let mut failures = Vec::new();
+    let mut sink = |failure| failures.push(failure);
+    let mut collected = IntegerFailureCollection { continued: false, sink: &mut sink };
     let coverage = run_integer_callable::<false, true>(
         calls, integer_tail_type(calls), None, None, None, None, None, Some(&mut collected),
     )?.ok()?;
-    Some((matches!(coverage, ProofCoverage::Applicable(true)), collected.failures))
+    Some((matches!(coverage, ProofCoverage::Applicable(true)), failures))
 }
 
-#[derive(Default)]
-pub(super) struct IntegerFailureCollection<'a> {
-    pub(super) continued: bool,
-    pub(super) failures: Vec<IntegerCheckFailure<'a>>,
+struct IntegerFailureCollection<'a, 'sink> {
+    continued: bool,
+    sink: &'sink mut dyn FnMut(IntegerCheckFailure<'a>),
 }
 
 pub(super) fn collect_exact_unit_requirement_failures<'a>(
-    calls: &'a FunctionCallSites, arguments: &[&BigInt],
-) -> Option<(bool, IntegerFailureCollection<'a>)> {
-    let mut collected = IntegerFailureCollection::default();
+    calls: &'a FunctionCallSites,
+    arguments: &[&BigInt],
+    handle_call: Option<&mut ActualCallHandler<'a, '_>>,
+    sink: &mut dyn FnMut(IntegerCheckFailure<'a>),
+) -> Option<(bool, bool)> {
+    let mut collected = IntegerFailureCollection { continued: false, sink };
     let ProofCoverage::Applicable(active) = run_integer_callable::<false, true>(
-        calls, None, None, None, None, Some(arguments), None, Some(&mut collected),
+        calls, None, None, None, None, Some(arguments), handle_call, Some(&mut collected),
     )?.ok()? else { return None; };
-    Some((active, collected))
+    Some((active, collected.continued))
 }
 
 pub(super) type ExactIntegerArgument<'a> = (&'a ScalarType, &'a BigInt);
@@ -532,7 +536,7 @@ fn actual_nested_argument<'a>(
     })
 }
 
-type ActualCallHandler<'a, 'handler> =
+pub(super) type ActualCallHandler<'a, 'handler> =
     dyn FnMut(
         &'a FunctionCallSites, OccurrenceOrdinal, Option<ExactIntegerArgument<'_>>, &ScalarType,
     ) -> Option<ActualCallResult> + 'handler;
@@ -715,7 +719,7 @@ fn run_integer_callable<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool>
     imported_local: Option<ImportedLocal<'a>>,
     exact_arguments: Option<&[&BigInt]>,
     mut handle_call: Option<&mut ActualCallHandler<'a, '_>>,
-    mut failures: Option<&mut IntegerFailureCollection<'a>>,
+    mut failures: Option<&mut IntegerFailureCollection<'a, '_>>,
 ) -> Option<Result<ProofCoverage<bool>, IntegerCheckFailure<'a>>> {
     let boundary = &calls.boundary;
     let checker_parameters = boundary.checker_parameter_bindings.as_deref()?;
@@ -782,7 +786,7 @@ fn walk_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool>(
     tail: Option<&'a ScalarType>,
     mut returns: Option<&mut Vec<IntegerReturningPath<'a>>>,
     handle_call: &mut Option<&mut ActualCallHandler<'a, '_>>,
-    failures: &mut Option<&mut IntegerFailureCollection<'a>>,
+    failures: &mut Option<&mut IntegerFailureCollection<'a, '_>>,
 ) -> Option<IntegerControl<'a>> {
     let depth = roots.axes.len();
     let structure = &calls.structure;
@@ -798,7 +802,7 @@ fn walk_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool>(
                     if COLLECT && directive.operation == CheckerOperation::Require {
                         let failing = path.failing_witness(roots, predicate)?;
                         if !failing.is_unreachable() {
-                            failures.as_deref_mut()?.failures.push(IntegerCheckFailure {
+                            (failures.as_deref_mut()?.sink)(IntegerCheckFailure {
                                 directive: expression, state: failing, axes: roots.axes.clone(),
                             });
                         }
@@ -810,7 +814,7 @@ fn walk_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool>(
                             directive: expression, state: failing, axes: roots.axes.clone(),
                         };
                         if COLLECT {
-                            failures.as_deref_mut()?.failures.push(failure);
+                            (failures.as_deref_mut()?.sink)(failure);
                         } else {
                             return Some(IntegerControl::Fail(failure));
                         }
@@ -819,9 +823,11 @@ fn walk_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool>(
                 } else if structure.checker_direct_targets.contains_key(&expression) {
                     let handle = handle_call.as_mut()?;
                     let argument = actual_nested_argument(calls, expression, roots, &path);
-                    let ActualCallResult::Unit = handle(calls, expression, argument, &ScalarType::Unit)? else {
-                        return None;
-                    };
+                    match handle(calls, expression, argument, &ScalarType::Unit)? {
+                        ActualCallResult::Unit => {}
+                        ActualCallResult::EmptyUnit if COLLECT => path = IntegerInputs::default(),
+                        _ => return None,
+                    }
                 } else {
                     let (condition, then_block, else_block) = match calls.conditionals.get(&expression)? {
                         ConditionalRegion::Unit { condition, then_block, .. } =>
