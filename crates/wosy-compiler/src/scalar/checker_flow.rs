@@ -455,11 +455,8 @@ pub(super) fn collect_integer_requirement_failures(
 ) -> Option<(bool, Vec<IntegerCheckFailure<'_>>)> {
     let mut failures = Vec::new();
     let mut sink = |failure| failures.push(failure);
-    let mut collected = IntegerFailureCollection { continued: false, sink: &mut sink };
-    let coverage = run_integer_callable::<false, true>(
-        calls, integer_tail_type(calls), None, None, None, None, None, Some(&mut collected),
-    )?.ok()?;
-    Some((matches!(coverage, ProofCoverage::Applicable(true)), failures))
+    let (active, _) = collect_integer_requirement_failures_with_calls(calls, None, None, &mut sink)?;
+    Some((active, failures))
 }
 
 struct IntegerFailureCollection<'a, 'sink> {
@@ -467,15 +464,16 @@ struct IntegerFailureCollection<'a, 'sink> {
     sink: &'sink mut dyn FnMut(IntegerCheckFailure<'a>),
 }
 
-pub(super) fn collect_exact_unit_requirement_failures<'a>(
+pub(super) fn collect_integer_requirement_failures_with_calls<'a>(
     calls: &'a FunctionCallSites,
-    arguments: &[&BigInt],
+    exact: Option<&[&BigInt]>,
     handle_call: Option<&mut ActualCallHandler<'a, '_>>,
     sink: &mut dyn FnMut(IntegerCheckFailure<'a>),
 ) -> Option<(bool, bool)> {
     let mut collected = IntegerFailureCollection { continued: false, sink };
+    let tail = if exact.is_none() { integer_tail_type(calls) } else { None };
     let ProofCoverage::Applicable(active) = run_integer_callable::<false, true>(
-        calls, None, None, None, None, Some(arguments), handle_call, Some(&mut collected),
+        calls, tail, None, None, None, exact, handle_call, Some(&mut collected),
     )?.ok()? else { return None; };
     Some((active, collected.continued))
 }
