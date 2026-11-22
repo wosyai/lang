@@ -3907,7 +3907,7 @@ impl PreparedProofModule {
             proof.node, proof_source, typed.target.target_layout, &typed.input_names, typed.body,
         )?;
         let proof_case = prepare_decrement_proof_steps(proof_name, &steps, &typed, measure)?;
-        check_decrement_induction_premise(measure, &proof_case.base_guard, filter.as_deref().unwrap_or_default())
+        check_decrement_induction_premise(measure, &proof_case, filter.as_deref().unwrap_or_default())
     }
 
     #[cfg(test)]
@@ -4388,7 +4388,7 @@ impl PlannedModuleProof<'_> {
         if !base_matches && induction_base_reachable(&entries, &proof_case.base_guard)? {
             return Err(ProjectCheck::Refuted);
         }
-        check_induction_entry_domain(entries, &minimum, &proof_case.base_guard, filter, measure.descending.1).map(Some)
+        check_induction_entry_domain(entries, &minimum, &proof_case, filter, measure.descending.1).map(Some)
     }
 
     fn verify_unused_induction(&self, measure: TypedInductionRank<'_>) -> Result<ProjectCheck, ProjectCheck> {
@@ -5653,6 +5653,7 @@ enum InductionPremise {
 struct TypedInductionProofSteps<'a> {
     base_guard: CheckerPredicate,
     base_claim: IntegerReturn<'a>,
+    decrement: &'a BigInt,
 }
 
 #[cfg(feature = "internal-checker")]
@@ -5698,8 +5699,12 @@ fn prepare_decrement_proof_steps<'a>(
     let ScalarExpression::Binary { operator: BinaryOperator::Subtract, left, right, .. } = argument else {
         return Err(ProjectCheck::Unsupported);
     };
+    let ScalarExpression::Integer { value: decrement, .. } = right.as_ref() else {
+        return Err(ProjectCheck::Unsupported);
+    };
     if !matches!(left.as_ref(), ScalarExpression::Name { name, .. } if name == entry)
-        || !matches!(right.as_ref(), ScalarExpression::Integer { value, .. } if *value == BigInt::from(1))
+        || decrement.sign() != num_bigint::Sign::Plus
+        || !integer_literal_fits_type(decrement, &rank.descending.0.ty)
     {
         return Err(ProjectCheck::Unsupported);
     }
@@ -5709,7 +5714,7 @@ fn prepare_decrement_proof_steps<'a>(
     if matches!(&base_guard, CheckerPredicate::Integer(predicate) if &predicate.binding != rank.descending.1) {
         return Err(ProjectCheck::Unsupported);
     }
-    Ok(TypedInductionProofSteps { base_guard, base_claim })
+    Ok(TypedInductionProofSteps { base_guard, base_claim, decrement })
 }
 
 #[cfg(feature = "internal-checker")]
@@ -5790,7 +5795,7 @@ fn check_canonical_induction_returns(
     if source_outputs.next().is_some()
         || body.occurrences.get(tail.0).map(|node| node.span) != Some(source_tail.span)
         || body.occurrences.get(recursive.0).map(|node| node.span) != Some(expression_span(source_call))
-        || !matches!(right.as_ref(), ScalarExpression::Integer { value, .. } if *value == BigInt::from(1))
+        || !matches!(right.as_ref(), ScalarExpression::Integer { value, .. } if value == proof.decrement)
     {
         return Err(ProjectCheck::Unsupported);
     }
@@ -5821,11 +5826,11 @@ fn check_canonical_induction_returns(
 #[cfg(feature = "internal-checker")]
 fn check_decrement_induction_premise(
     rank: TypedInductionRank<'_>,
-    base_guard: &CheckerPredicate,
+    proof: &TypedInductionProofSteps<'_>,
     entry_filter: &[CheckerPredicate],
 ) -> Result<InductionPremise, ProjectCheck> {
     let (entries, minimum) = induction_entry_domain(rank, entry_filter)?;
-    check_induction_entry_domain(entries, &minimum, base_guard, entry_filter, rank.descending.1)
+    check_induction_entry_domain(entries, &minimum, proof, entry_filter, rank.descending.1)
 }
 
 #[cfg(feature = "internal-checker")]
@@ -5889,11 +5894,11 @@ fn induction_base_reachable(
 fn check_induction_entry_domain(
     mut entries: IntegerSet,
     minimum: &BigInt,
-    base_guard: &CheckerPredicate,
+    proof: &TypedInductionProofSteps<'_>,
     entry_filter: &[CheckerPredicate],
     descending: &ReferenceBindingId,
 ) -> Result<InductionPremise, ProjectCheck> {
-    match base_guard {
+    match &proof.base_guard {
         CheckerPredicate::Boolean(true) => return Ok(InductionPremise::Unreachable),
         CheckerPredicate::Boolean(false) => {}
         CheckerPredicate::EntryDomain { .. } | CheckerPredicate::DirectiveDisjunction { .. } | CheckerPredicate::ProofReflexiveBranch(_) => return Err(ProjectCheck::Unsupported),
@@ -5905,8 +5910,8 @@ fn check_induction_entry_domain(
     if entries.is_empty() {
         return Ok(InductionPremise::Unreachable);
     }
-    let strict = IntegerRelation::from_operator(&BinaryOperator::Greater).expect("integer comparison");
-    if !entries.every(strict, minimum) {
+    let in_range = IntegerRelation::from_operator(&BinaryOperator::GreaterEqual).expect("integer comparison");
+    if !entries.every(in_range, &(minimum + proof.decrement)) {
         return Ok(InductionPremise::NotStrict);
     }
     for guard in entry_filter {
@@ -5915,7 +5920,7 @@ fn check_induction_entry_domain(
                 continue;
             }
             let relation = IntegerRelation::from_operator(&predicate.operator).ok_or(ProjectCheck::Unsupported)?;
-            if !entries.every(relation, &(&predicate.bound + 1)) {
+            if !entries.every(relation, &(&predicate.bound + proof.decrement)) {
                 return Ok(InductionPremise::CalleeWhereUnproved);
             }
         }

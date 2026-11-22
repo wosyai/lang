@@ -2760,6 +2760,37 @@ fn one_independently_verified_equality_supplies_only_applicable_actual_startup_r
 }
 
 #[test]
+fn independently_verified_induction_uses_the_exact_positive_decrement() {
+    let identity = source();
+    let check = |actual_step: &str, proof_step: &str, cutoff: &str, filter: &str, actual: &str| {
+        check_scalar_module_proof(
+            identity.clone(),
+            "rank",
+            vec![ScalarProofModuleInput {
+                source: identity.clone(),
+                text: format!(r#"%%start
+                    u8(u8) descend = fn(value) {{ if (value < {cutoff}) {{ 7 }} else {{ descend(value - {actual_step}) }} }};
+                    proof rank for descend(entry) -> (out) where ({filter}) ensures (out == 7) decreases (entry) {{
+                        if (entry < {cutoff}) {{ core.show(out == 7); }} else {{ core.use(rank(entry - {proof_step})); }}
+                    }}
+                    {actual}
+                %%end"#),
+                namespaces: Vec::new(),
+            }],
+            vec![identity.clone()], ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
+        )
+    };
+    let actual = format!("u8 first = descend(2); u8 second = descend(8); core.require(first == second, {OUTPUT});");
+    assert_eq!(check("3", "3", "3", "entry <= 8", ""), ScalarModuleProofOutcome::Proved);
+    assert_eq!(check("3", "3", "3", "entry <= 8", &actual), ScalarModuleProofOutcome::Proved);
+    assert_eq!(check("3", "3", "3", "entry <= 8", "u8 outside = descend(9);"), ScalarModuleProofOutcome::Unsupported);
+    assert_eq!(check("3", "2", "3", "entry <= 8", ""), ScalarModuleProofOutcome::Unsupported);
+    assert_eq!(check("3", "3", "2", "true", ""), ScalarModuleProofOutcome::Unsupported);
+    assert_eq!(check("3", "3", "3", "entry >= 1 && entry <= 8", ""), ScalarModuleProofOutcome::Unsupported);
+    assert_eq!(check("0", "0", "3", "true", ""), ScalarModuleProofOutcome::Unsupported);
+}
+
+#[test]
 fn named_proof_output_conjunction_checks_every_atom_on_shared_return_paths() {
     let identity = source();
     let check = |goal: &str, guard: &str, actual: &str, steps: &str| {
