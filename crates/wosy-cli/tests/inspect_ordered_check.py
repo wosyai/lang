@@ -231,10 +231,28 @@ def main():
             'ordered check: complete\ndirective failures: 3\n'
             'actual proof failures: 1 (0 nested)\nunused proof failures: 1\n'
             'source texts: 2\nauthored status: 340282366920938463463374607431768211456\n'
-            f'stdout: {"ação".encode().hex()}\nfile "preview.txt": {"β".encode().hex()}\n'
+            f'stdout: {"ação".encode().hex()}\nfile "preview.txt" from "main.w": {"β".encode().hex()}\n'
             f'stderr: {b"second".hex()}\nstdout: {b"third".hex()}\n'
         ).encode()
         assert (effects.returncode, effects.stdout, effects.stderr) == (1, expected_effects, b""), effects
+        complete_source = source.read_text(encoding="utf-8")
+        source.write_text(complete_source.replace('"preview.txt"', '"../preview.txt"'), encoding="utf-8")
+        invalid_path = subprocess.run(effects_command, cwd=root, capture_output=True, timeout=15)
+        assert (invalid_path.returncode, invalid_path.stdout, invalid_path.stderr) == (
+            2, b"", b"ordered check: incomplete: checker rejected invalid input\n"
+        ), invalid_path
+
+        duplicate = complete_source.replace(
+            '.stdout = "third"; .stderr = ""; .code = 33; .files = [];',
+            '.stdout = "third"; .stderr = ""; .code = 33; .files = [{ .path = "preview.txt"; .text = ""; }];',
+        )
+        assert duplicate != complete_source
+        source.write_text(duplicate, encoding="utf-8")
+        duplicate_path = subprocess.run(effects_command, cwd=root, capture_output=True, timeout=15)
+        assert (duplicate_path.returncode, duplicate_path.stdout, duplicate_path.stderr) == (
+            2, b"", b'ordered check: duplicate output path "preview.txt" in "main.w"\n'
+        ), duplicate_path
+        source.write_text(complete_source, encoding="utf-8")
         module.write_text(module.read_text(encoding="utf-8").replace("{ value }", "{ value + 1 }"), encoding="utf-8")
         incomplete = subprocess.run(effects_command, cwd=root, capture_output=True, timeout=15)
         assert (incomplete.returncode, incomplete.stdout, incomplete.stderr) == (

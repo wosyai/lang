@@ -11,7 +11,8 @@ mod canonical_loader;
 #[path = "../src/configured_check.rs"]
 mod configured_check;
 use configured_check::{
-    check_target, ConfiguredCheckLoadError, InternalCheckEffect, InternalCheckStatus, OrderedCheckEffects,
+    check_target, CheckPublicationError, ConfiguredCheckLoadError, InternalCheckStatus,
+    PlannedCheckEffect, PlannedCheckPublication,
 };
 
 fn load_error(error: ConfiguredCheckLoadError) -> &'static str {
@@ -43,38 +44,35 @@ fn render(report: &MainFlowProofReceipt) -> String {
     text
 }
 
-fn inspect_effects(text: &mut String, report: &MainFlowProofReceipt, sources: usize) {
+fn inspect_effects(text: &mut String, publication: &PlannedCheckPublication<'_>) {
     use std::fmt::Write as _;
-    let effects = OrderedCheckEffects::new(&report.directives);
-    let _ = writeln!(text, "source texts: {sources}");
-    match effects.selected_status() {
+    let _ = writeln!(text, "source texts: {}", publication.texts.len());
+    match &publication.status {
         InternalCheckStatus::Zero => { let _ = writeln!(text, "authored status: 0"); }
         InternalCheckStatus::FirstNonzero(report) => {
             let _ = writeln!(text, "authored status: {}", report.code());
         }
     }
-    let result = OrderedCheckEffects::new(&report.directives).visit_authored_effects(|effect| {
+    for effect in &publication.effects {
         let bytes = match effect {
-            InternalCheckEffect::Stdout(bytes) => {
+            PlannedCheckEffect::Stdout(bytes) => {
                 text.push_str("stdout: ");
-                bytes
+                *bytes
             }
-            InternalCheckEffect::Stderr(bytes) => {
+            PlannedCheckEffect::Stderr(bytes) => {
                 text.push_str("stderr: ");
-                bytes
+                *bytes
             }
-            InternalCheckEffect::DeferredFile(file) => {
-                write!(text, "file {:?}: ", file.path)?;
-                &file.text
+            PlannedCheckEffect::DeferredFile { relative, request, source } => {
+                let _ = write!(text, "file {:?} from {:?}: ", relative, source.path);
+                request.text.as_ref()
             }
         };
         for byte in bytes {
-            write!(text, "{byte:02x}")?;
+            let _ = write!(text, "{byte:02x}");
         }
         text.push('\n');
-        Ok::<(), std::fmt::Error>(())
-    });
-    debug_assert!(result.is_ok());
+    }
 }
 
 fn main() -> ExitCode {
@@ -114,20 +112,29 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let report = match receipt.outcome {
-        Ok(report) => report,
-        Err(ScalarOrderedCheckerOutcome::Invalid(_)) => {
+    let publication = match receipt.plan_publication() {
+        Ok(publication) => publication,
+        Err(CheckPublicationError::Incomplete(ScalarOrderedCheckerOutcome::Invalid(_))) => {
             eprintln!("ordered check: incomplete: checker rejected invalid input");
             return ExitCode::from(2);
         }
-        Err(_) => {
+        Err(CheckPublicationError::Incomplete(_)) => {
             eprintln!("ordered check: incomplete: checker did not complete analysis");
             return ExitCode::from(2);
         }
+        Err(CheckPublicationError::InvalidPath { source, request }) => {
+            eprintln!("ordered check: invalid output path {:?} in {:?}", request.path, source.path);
+            return ExitCode::from(2);
+        }
+        Err(CheckPublicationError::DuplicatePath { source, request }) => {
+            eprintln!("ordered check: duplicate output path {:?} in {:?}", request.path, source.path);
+            return ExitCode::from(2);
+        }
     };
-    let mut output = render(&report);
+    let report = publication.report;
+    let mut output = render(report);
     if show_effects {
-        inspect_effects(&mut output, &report, receipt.texts.len());
+        inspect_effects(&mut output, &publication);
     }
     if io::stdout().lock().write_all(output.as_bytes()).is_err() {
         return ExitCode::from(2);
