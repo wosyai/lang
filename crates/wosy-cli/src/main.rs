@@ -9,7 +9,13 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs;
+#[cfg(target_os = "linux")]
+use std::io::{BufWriter, Write};
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::process::ExitCode;
+#[cfg(target_os = "linux")]
+use std::sync::atomic::{AtomicU64, Ordering};
 use wosy_compiler::{
     analyze_scalar_build, derive_scalar_declarations_from_cst, emit_scalar_build_project_llvm_text,
     emit_scalar_build_single_module_llvm_text, parse_source, prepare_scalar_project, publication,
@@ -917,12 +923,67 @@ fn persist_cst(root: &std::path::Path, output: &wosy_compiler::ParseOutput) -> R
     let path = root
         .join(".wosy/cst")
         .join(format!("{}.json", output.result.source.revision));
-    let bytes = serde_json::to_vec_pretty(&output.result.canonical_cst().snapshot_json_serializable())
-        .map_err(|error| error.to_string())?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    let create_parent = || {
+        path.parent().map_or(Ok(()), |parent| {
+            fs::create_dir_all(parent).map_err(|error| error.to_string())
+        })
+    };
+    let snapshot = output.result.canonical_cst().snapshot_json_serializable();
+    #[cfg(target_os = "linux")]
+    {
+        create_parent()?;
+        publish_cst_snapshot(&path, &snapshot)
     }
-    fs::write(&path, bytes).map_err(|error| error.to_string())
+    #[cfg(not(target_os = "linux"))]
+    {
+        let bytes = serde_json::to_vec_pretty(&snapshot).map_err(|error| error.to_string())?;
+        create_parent()?;
+        fs::write(&path, bytes).map_err(|error| error.to_string())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn publish_cst_snapshot(
+    path: &std::path::Path,
+    snapshot: &impl serde::Serialize,
+) -> Result<(), String> {
+    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+    let pid = std::process::id();
+    let (temporary, file) = loop {
+        let nonce = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
+        let temporary = path.with_file_name(format!(".cst-{pid}-{nonce}.tmp"));
+        match fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&temporary) {
+            Ok(file) => break (temporary, file),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.to_string()),
+        }
+    };
+    let result = (|| {
+        let mut writer = BufWriter::new(file);
+        serde_json::to_writer_pretty(&mut writer, snapshot)
+            .map_err(|error| error.to_string())?;
+        writer.flush().map_err(|error| error.to_string())?;
+        match fs::symlink_metadata(path) {
+            Ok(existing) if existing.is_file() => {
+                if existing.mode() & 0o200 == 0 || existing.nlink() != 1 {
+                    return Err("canonical CST snapshot destination is not a writable single-link file".to_owned());
+                }
+                let created = writer.get_ref().metadata().map_err(|error| error.to_string())?;
+                if existing.uid() != created.uid() {
+                    return Err("canonical CST snapshot destination has a different owner".to_owned());
+                }
+            }
+            Ok(_) => return Err("canonical CST snapshot destination is not a regular file".to_owned()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+            Err(error) => return Err(error.to_string()),
+        }
+        drop(writer);
+        fs::rename(&temporary, path).map_err(|error| error.to_string())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
 }
 
 #[cfg(test)]
@@ -2036,19 +2097,86 @@ mod tests {
             &[],
         );
         assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
-        let path = snapshot_test_path("deep");
+        let root = snapshot_test_path("deep").with_extension("");
+        let path = root.join(".wosy/cst/r1.json");
         let tree = output.result.canonical_cst();
         let borrowed = serde_json::to_vec_pretty(&tree.snapshot_json_serializable())
             .expect("serialize borrowed CST snapshot");
         let owned = serde_json::to_vec_pretty(&tree.snapshot())
             .expect("serialize owned CST snapshot");
         assert!(borrowed == owned, "borrowed CST snapshot changed bytes");
-        fs::write(&path, borrowed).expect("write archived snapshot");
+        persist_cst(&root, &output).expect("publish archived snapshot");
+        assert!(fs::read(&path).unwrap() == borrowed, "streamed CST snapshot changed bytes");
 
         let canonical = load_canonical_cst(&path).expect("load deep canonical CST snapshot");
         let scalar = wosy_compiler::derive_scalar_program_from_cst(&canonical);
 
         assert!(!scalar.program.items.is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn failed_snapshot_serialization_preserves_existing_publication() {
+        struct PartialSnapshot;
+        impl serde::Serialize for PartialSnapshot {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                let mut fields = serializer.serialize_seq(Some(2))?;
+                serde::ser::SerializeSeq::serialize_element(&mut fields, "partial snapshot")?;
+                Err(serde::ser::Error::custom("snapshot rejected"))
+            }
+        }
+
+        let root = snapshot_test_path("rejected").with_extension("");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("prior.json");
+        fs::write(&path, b"prior snapshot").unwrap();
+        assert_eq!(publish_cst_snapshot(&path, &PartialSnapshot).unwrap_err(), "snapshot rejected");
+        assert_eq!(fs::read(&path).unwrap().as_slice(), b"prior snapshot");
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn snapshot_publication_keeps_output_private_and_preserves_rejected_destinations() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let root = snapshot_test_path("permissions").with_extension("");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("snapshot.json");
+        publish_cst_snapshot(&path, &"new").unwrap();
+        let mode = |path: &std::path::Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&path) & !0o600, 0);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+        publish_cst_snapshot(&path, &"replacement").unwrap();
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(fs::read(&path).unwrap().as_slice(), b"\"replacement\"");
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).unwrap();
+        assert_eq!(publish_cst_snapshot(&path, &"not published").unwrap_err(),
+            "canonical CST snapshot destination is not a writable single-link file");
+        assert_eq!(mode(&path), 0o400);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let alias = root.join("alias.json");
+        fs::hard_link(&path, &alias).unwrap();
+        assert_eq!(publish_cst_snapshot(&path, &"not published").unwrap_err(),
+            "canonical CST snapshot destination is not a writable single-link file");
+        assert_eq!(fs::read(&alias).unwrap().as_slice(), b"\"replacement\"");
+
+        let link = root.join("link.json");
+        symlink(&path, &link).unwrap();
+        let directory = root.join("directory.json");
+        fs::create_dir(&directory).unwrap();
+        for destination in [&link, &directory] {
+            assert_eq!(publish_cst_snapshot(destination, &"not published").unwrap_err(),
+                "canonical CST snapshot destination is not a regular file");
+        }
+        assert!(fs::symlink_metadata(link).unwrap().file_type().is_symlink());
+        assert!(directory.is_dir());
+        assert_eq!(fs::read(&path).unwrap().as_slice(), b"\"replacement\"");
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 4);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
