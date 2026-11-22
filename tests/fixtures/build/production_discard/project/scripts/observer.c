@@ -10,7 +10,10 @@ extern void __real___wosy_core_free(void *address);
 struct iovec { word destination; u32 length; };
 struct read_site { word destination, iovec, count, stack; };
 
-enum phase { IDLE, DISCARD, RECOVERY, RELEASING, DONE, DESCRIPTOR, DESCRIPTOR_RELEASING };
+enum phase {
+    IDLE, DISCARD, RECOVERY, RELEASING, DONE, DESCRIPTOR, DESCRIPTOR_RELEASING,
+    FORMAT, FORMAT_WRITTEN, FORMAT_RELEASED, FINISHED
+};
 static enum phase phase;
 static u32 which, next_case, reads, recovery_reads, allocations, releases;
 static u32 probe, next_probe, probe_reads;
@@ -21,7 +24,22 @@ static void *backing, *record;
 __attribute__((import_module("wasi_snapshot_preview1"), import_name("proc_exit")))
 #endif
 extern _Noreturn void exit(int code);
-#define require(condition) do { if (!(condition)) exit(__LINE__); } while (0)
+#define require(condition) do { if (!(condition)) exit(1 + ((__LINE__ - 1) % 255)); } while (0)
+
+static void announce_complete(void) {
+#ifdef __wasm__
+    typedef struct { const char *data; u32 length; } output_vector;
+    __attribute__((import_module("wasi_snapshot_preview1"), import_name("fd_write")))
+    extern int host_write(int fd, const output_vector *vectors, int count, u32 *written);
+    static const char marker[] = "numeric formatter owner verified\n";
+    output_vector bytes = { marker, sizeof(marker) - 1 };
+    u32 written = 0;
+    require(host_write(1, &bytes, 1, &written) == 0 && written == bytes.length);
+#else
+    extern int puts(const char *);
+    require(puts("numeric formatter owner verified") >= 0);
+#endif
+}
 
 static u32 final_read(void) {
     return which == 0 ? 1000001 : 3;
@@ -106,6 +124,13 @@ int FD_READ(int descriptor, word address, int vectors, word count) {
 }
 
 void *__wrap___wosy_core_alloc(u64 size, u64 alignment) {
+    if (phase == FORMAT) {
+        require(!allocations && !releases && !backing && size >= 2 && alignment == 1);
+        backing = __real___wosy_core_alloc(size, alignment);
+        require(backing);
+        ++allocations;
+        return backing;
+    }
     if (phase == DESCRIPTOR) {
         if (probe == 3) {
             if (!allocations) {
@@ -152,6 +177,15 @@ void *__wrap___wosy_core_alloc(u64 size, u64 alignment) {
 }
 
 void __wrap___wosy_core_free(void *address) {
+    if (phase == FORMAT_WRITTEN) {
+        require(allocations == 1 && !releases && backing && address == backing);
+        require(((const byte *)backing)[0] == '4' && ((const byte *)backing)[1] == '2');
+        ++releases;
+        __real___wosy_core_free(address);
+        backing = 0;
+        phase = FORMAT_RELEASED;
+        return;
+    }
     if (phase == DESCRIPTOR && probe == 3) {
         require(probe_reads == 2 && allocations == 1 && !releases && address == backing);
         ++releases;
@@ -240,13 +274,31 @@ void CHECKPOINT(int event, int sequence, word data, word slot) {
         require(releases == allocations);
         phase = DONE;
         return;
+    case 8:
+        require(sequence == 0 && phase == DONE && next_probe == 4);
+        backing = 0;
+        allocations = releases = 0;
+        phase = FORMAT;
+        return;
+    case 9:
+        require(sequence == 0 && phase == FORMAT_RELEASED && !backing);
+        require(allocations == 1 && releases == 1);
+        phase = FINISHED;
+        announce_complete();
+        return;
     }
     __wosy_core_system_panic();
 }
 
 int FD_WRITE(int fd, word iovec, int vectors, word count) {
-    (void)fd; (void)iovec; (void)vectors; (void)count;
-    __wosy_core_system_panic();
+    require(phase == FORMAT && allocations == 1 && !releases && backing);
+    require(fd == 1 && vectors == 1 && iovec && count && *(u32 *)count == 0);
+    const struct iovec *buffer = (const struct iovec *)iovec;
+    require(iovec != (word)backing && buffer->destination == (word)backing && buffer->length == 2);
+    require(((const byte *)backing)[0] == '4' && ((const byte *)backing)[1] == '2');
+    *(u32 *)count = 2;
+    phase = FORMAT_WRITTEN;
+    return 0;
 }
 
 int POLL_ONEOFF(word in, word out, int count, word result) {
