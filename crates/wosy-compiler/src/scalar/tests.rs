@@ -13126,3 +13126,69 @@ unit(Pair) inspect = fn(owner) {{
     }
     assert!(missed.is_empty(), "{missed:?}");
 }
+
+#[test]
+fn known_projected_mutable_store_respects_disjoint_shared_sibling_permissions() {
+    let mut mismatches = Vec::new();
+    for (write_field, reverse, body, conflict) in [
+        ("right", false, "*writer = 7; u8 read = *reader; read;", None),
+        ("right", true, "*writer = 7; u8 read = *reader; read;", None),
+        ("right", false, "u8 read = *reader; *writer = 7; (*parent).left = read;", None),
+        ("left", false, "*writer = 7; u8 read = *reader; read;", Some("&!(*parent).left")),
+        ("right", false, "(*parent).left = 3; *writer = 7; u8 read = *reader; read;", Some("(*parent).left =")),
+        ("right", false, "owner = { .left = 3; .right = 4; }; *writer = 7; u8 read = *reader; read;", Some("owner =")),
+    ] {
+        let reader = "*u8 reader = &(*parent).left;";
+        let writer = format!("*!u8 writer = &!(*parent).{write_field};");
+        let (first, second) = if reverse { (writer.as_str(), reader) } else { (reader, writer.as_str()) };
+        let text = format!(r#"%%start
+struct copy Pair {{ u8 left; u8 right; }}
+unit(Pair) inspect = fn(owner) {{
+    *!Pair parent = &!owner;
+    {first}
+    {second}
+    {body}
+}};
+%%end"#);
+        let parent = text.find("&!owner").unwrap() as u32;
+        let reader = text.find("&(*parent).left").unwrap() as u32;
+        let writer = text.find(&format!("&!(*parent).{write_field}")).unwrap() as u32;
+        let (single, project) = both_reference_functions(&text);
+        for (validator, items, diagnostics) in [
+            ("single", &single.program.items, &single.diagnostics),
+            ("project", &project.project.modules[0].items, &project.diagnostics),
+        ] {
+            let ScalarItem::Function(function) = &items[0] else { panic!("typed callable") };
+            let cfg = &function.reference_cfg;
+            let projected = |span, mode, field_index| cfg.initial_points.iter().find_map(|point| match &point.kind {
+                CfgPointKind::Borrow { loan, .. } if point.source_span.range.start == span
+                    && loan.mode == mode && loan.parent.as_ref().is_some_and(|base| {
+                        base.creation_span.start == parent && base.mode == ScalarReferenceMutability::Mutable
+                            && base.origin_place.binding == loan.origin_place.binding
+                            && base.origin_place.projections.is_empty()
+                    })
+                    && matches!(loan.origin_place.projections.as_slice(),
+                        [ReferencePlaceProjection::Dereference(_), ReferencePlaceProjection::Field(ScalarFieldReference::Resolved(field))]
+                            if field.index == field_index) => Some(loan),
+                _ => None,
+            }).unwrap_or_else(|| panic!("{validator} actual mixed projected siblings: {diagnostics:?}"));
+            let held = projected(reader, ScalarReferenceMutability::Shared, 0);
+            let written = projected(writer, ScalarReferenceMutability::Mutable, usize::from(write_field == "right"));
+            assert_eq!(held.parent, written.parent);
+            if let Some(conflict) = conflict {
+                let start = text.rfind(conflict).unwrap() as u32;
+                let requested = start..start + conflict.len() as u32;
+                if !diagnostics.iter().any(|diagnostic| diagnostic.code == "B0003"
+                    && diagnostic.message == "read or move of unavailable place"
+                    && diagnostic.labels.first().is_some_and(|label| requested.contains(&label.span.range.start))
+                    && diagnostic.labels.iter().skip(1).any(|label| label.span.range.start == reader))
+                {
+                    mismatches.push((validator, body, diagnostics.clone()));
+                }
+            } else if !diagnostics.is_empty() {
+                mismatches.push((validator, body, diagnostics.clone()));
+            }
+        }
+    }
+    assert!(mismatches.is_empty(), "{mismatches:?}");
+}

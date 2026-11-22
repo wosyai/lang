@@ -4208,9 +4208,9 @@ fn loan_has_ancestor(loan: &ReferenceLoanId, ancestor: &ReferenceLoanId) -> bool
     false
 }
 
-fn exact_projected_mutable_field(loan: &ReferenceLoanId) -> Option<(&ReferenceLoanId, &ScalarStructFieldId)> {
+fn exact_projected_field_of_mutable_parent(loan: &ReferenceLoanId) -> Option<(&ReferenceLoanId, &ScalarStructFieldId)> {
     let parent = loan.parent.as_deref()?;
-    if loan.mode != ScalarReferenceMutability::Mutable || parent.mode != ScalarReferenceMutability::Mutable
+    if parent.mode != ScalarReferenceMutability::Mutable
         || parent.parent.is_some() || !parent.origin_place.projections.is_empty()
         || !matches!(parent.origin_place.place, ScalarPlace::Name { .. })
         || parent.origin_place.binding != loan.origin_place.binding
@@ -4246,7 +4246,8 @@ fn conflicting_live_loan(
 ) -> Vec<SourceSpan> {
     let place = available_place(place);
     let projected_write = match access {
-        LoanAccess::WriteThrough(selected, Some(admitted)) => exact_projected_mutable_field(&selected.loan)
+        LoanAccess::WriteThrough(selected, Some(admitted)) if selected.loan.mode == ScalarReferenceMutability::Mutable =>
+            exact_projected_field_of_mutable_parent(&selected.loan)
             .filter(|(parent, field)| place.binding == parent.origin_place.binding
                 && matches!(place.projections.as_slice(),
                     [ReferencePlaceProjection::Field(ScalarFieldReference::Resolved(actual))] if actual == *field))
@@ -4276,7 +4277,7 @@ fn conflicting_live_loan(
                 }
                 LoanAccess::WriteThrough(selected, _) => {
                     let disjoint_sibling = projected_write.is_some_and(|(admitted, parent, field)| {
-                        admitted.contains(origin) && exact_projected_mutable_field(loan).is_some_and(|(peer_parent, peer_field)|
+                        admitted.contains(origin) && exact_projected_field_of_mutable_parent(loan).is_some_and(|(peer_parent, peer_field)|
                             peer_parent == parent && peer_field.structure == field.structure && peer_field.index != field.index)
                     });
                     !disjoint_sibling && loan_borrows_place(loan, &place, None)
@@ -5076,21 +5077,22 @@ fn transfer_reference_facts(
                             && !exposed.contains(binding)
                             && !projected_leaf_holders.contains_key(binding)
                         {
-                            let mutable_origin = (loan.mode == ScalarReferenceMutability::Mutable)
+                            let admitted_origin = (!cfg.checked_named_scalar_stores.is_empty()
+                                && loan.parent.as_deref().is_some_and(|parent| parent.mode == ScalarReferenceMutability::Mutable))
                                 .then(|| point.possible_origins.as_ref()
                                     .filter(|set| set.len() == 1).and_then(BTreeSet::first).copied())
                                 .flatten();
-                            if let Some(origin) = mutable_origin {
+                            if let Some(origin) = admitted_origin {
                                 projected_store_facts.get_or_insert_with(Default::default).0.insert(origin);
                             }
-                            projected_leaf_holders.insert(binding, (point.id, point.scope, loan.mode, mutable_origin));
+                            projected_leaf_holders.insert(binding, (point.id, point.scope, loan.mode, admitted_origin));
                             projected_leaf_sites.insert(point.id, authority);
                         }
                     }
                 }
             }
             CfgPointKind::Read { binding } => {
-                if let Some(&(borrow, scope, mode, mutable_origin)) = projected_leaf_holders.get(binding) {
+                if let Some(&(borrow, scope, mode, admitted_origin)) = projected_leaf_holders.get(binding) {
                     let authorized = match point.successors.as_slice() {
                         [next] => original_points.get(next.0).is_some_and(|next| {
                             if point.scope != scope || next.scope != scope {
@@ -5108,7 +5110,7 @@ fn transfer_reference_facts(
                                     ) == Some((point.id, binding));
                                     if exact {
                                         if let (Some(origin), Some((_, stores))) =
-                                            (mutable_origin, &mut projected_store_facts)
+                                            (admitted_origin, &mut projected_store_facts)
                                         {
                                             stores.insert(next.id, origin);
                                         }
@@ -5122,7 +5124,7 @@ fn transfer_reference_facts(
                     };
                     if !authorized {
                         projected_leaf_sites.remove(&borrow);
-                        if let (Some(origin), Some((admitted, _))) = (mutable_origin, &mut projected_store_facts) {
+                        if let (Some(origin), Some((admitted, _))) = (admitted_origin, &mut projected_store_facts) {
                             admitted.remove(&origin);
                         }
                     }
@@ -5130,9 +5132,9 @@ fn transfer_reference_facts(
             }
             CfgPointKind::Assign { target, .. } | CfgPointKind::Move { place: target, .. }
             | CfgPointKind::DeferredMove { place: target, .. } | CfgPointKind::Borrow { place: target, .. } => {
-                if let Some(&(borrow, _, _, mutable_origin)) = projected_leaf_holders.get(&target.binding) {
+                if let Some(&(borrow, _, _, admitted_origin)) = projected_leaf_holders.get(&target.binding) {
                     projected_leaf_sites.remove(&borrow);
-                    if let (Some(origin), Some((admitted, _))) = (mutable_origin, &mut projected_store_facts) {
+                    if let (Some(origin), Some((admitted, _))) = (admitted_origin, &mut projected_store_facts) {
                         admitted.remove(&origin);
                     }
                 }
