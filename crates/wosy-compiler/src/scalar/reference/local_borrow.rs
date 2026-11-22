@@ -19,29 +19,39 @@ struct Holder {
     arms: Option<Box<ArmRuns>>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Arm(usize);
+
+impl Arm {
+    fn new(fork: usize, second: bool) -> Self { Self((fork << 1) | usize::from(second)) }
+    fn fork(self) -> usize { self.0 >> 1 }
+    fn second(self) -> bool { self.0 & 1 != 0 }
+}
+
 struct ArmRun {
     start: usize,
     end: usize,
-    fork: usize,
+    arm: Arm,
 }
 
 #[derive(Default)]
 struct ArmRuns {
     reads: Vec<ArmRun>,
     writes: Vec<ArmRun>,
+    second_read: bool,
 }
 
-fn record_arm(runs: &mut Vec<ArmRun>, index: usize, fork: usize) {
-    if let Some(run) = runs.last_mut().filter(|run| run.end == index && run.fork == fork) {
+fn record_arm(runs: &mut Vec<ArmRun>, index: usize, arm: Arm) {
+    if let Some(run) = runs.last_mut().filter(|run| run.end == index && run.arm == arm) {
         run.end += 1;
     } else {
-        runs.push(ArmRun { start: index, end: index + 1, fork });
+        runs.push(ArmRun { start: index, end: index + 1, arm });
     }
 }
 
-fn next_arm(runs: &mut &[ArmRun], index: usize) -> Option<usize> {
+fn next_arm(runs: &mut &[ArmRun], index: usize) -> Option<Arm> {
     while let Some((run, remaining)) = runs.split_first() {
-        if index < run.end { return (index >= run.start).then_some(run.fork); }
+        if index < run.end { return (index >= run.start).then_some(run.arm); }
         *runs = remaining;
     }
     None
@@ -50,6 +60,7 @@ fn next_arm(runs: &mut &[ArmRun], index: usize) -> Option<usize> {
 struct Fork {
     branch: CfgPointId,
     join: CfgPointId,
+    second: Option<CfgPointId>,
 }
 
 #[derive(Default)]
@@ -82,6 +93,7 @@ pub(crate) struct Author {
     owners: HashMap<ReferenceBindingId, usize>,
     forks: Forks,
     branch: Option<CfgPointId>,
+    second: Option<CfgPointId>,
     join: Option<CfgPointId>,
     root_exit: Option<CfgPointId>,
     pending_exit: Option<(CfgPointId, ReferenceScopeId)>,
@@ -121,8 +133,9 @@ impl Author {
                 && self.pending_loan.is_some(),
             CfgPointKind::Read { binding } => match types.get(binding) {
                 Some(ScalarType::CheckedReference { .. }) => {
+                    let arm = self.arm();
                     let Some(holder) = self.holders.get_mut(binding) else { return false };
-                    holder.record_read(id, self.branch.map(|_| self.forks.len()));
+                    holder.record_read(id, arm);
                     true
                 }
                 Some(ty) => aggregate::ordinary_value(ty),
@@ -170,11 +183,12 @@ impl Author {
 
     pub(super) fn assign(&mut self, binding: &ReferenceBindingId, version: CfgPointId, rhs: CfgPointId) -> bool {
         let Some(loan) = self.pending_loan.take() else { return false };
+        let arm = self.arm();
         let Some(holder) = self.holders.get_mut(binding) else { return false };
         if rhs != loan.issued || loan.issued.0 + 1 != version.0 {
             return false;
         }
-        holder.record_install(Install { version, loan }, self.branch.map(|_| self.forks.len()));
+        holder.record_install(Install { version, loan }, arm);
         true
     }
 
@@ -196,30 +210,49 @@ impl Author {
         }
     }
 
-    pub(super) fn fork(&mut self, edges: &ReferenceConditionalEdges, points: &[ReferenceFlowPoint]) -> bool {
-        if edges.terminals[1] != edges.branch
+    fn arm(&self) -> Option<Arm> {
+        self.branch.map(|_| Arm::new(self.forks.len(), self.second.is_some()))
+    }
+
+    pub(super) fn second_arm(&mut self, entry: CfgPointId) -> bool {
+        self.branch.is_some() && self.join.is_none() && self.pending_loan.is_none()
+            && self.pending_exit.is_none() && self.second.replace(entry).is_none()
+    }
+
+    pub(super) fn fork(
+        &mut self, edges: &ReferenceConditionalEdges, points: &[ReferenceFlowPoint], explicit: bool,
+    ) -> bool {
+        if explicit != self.second.is_some()
             || self.branch != Some(edges.branch) || self.join != Some(edges.join)
             || self.forks.last().is_some_and(|prior| prior.join >= edges.branch)
         {
             return false;
         }
-        let Some([then, bypass]) = edges.entries(points) else { return false };
-        if *bypass != edges.join || then.0 != edges.branch.0 + 1 || edges.terminals[0].0 + 1 != edges.join.0
-            || points[edges.terminals[0].0].successors.as_slice() != [edges.join]
-            || !matches!(points[then.0].kind, CfgPointKind::ScopeEnter)
-            || !matches!(points[edges.terminals[0].0].kind, CfgPointKind::ScopeExit)
+        let Some([then, alternative]) = edges.entries(points) else { return false };
+        let arm = |entry: CfgPointId, end: CfgPointId, next: CfgPointId| {
+            entry < end && end.0 + 1 == next.0
+                && matches!(points[entry.0].kind, CfgPointKind::ScopeEnter)
+                && matches!(points[end.0].kind, CfgPointKind::ScopeExit)
+                && points[end.0].successors.as_slice() == [edges.join]
+        };
+        if then.0 != edges.branch.0 + 1
+            || !arm(*then, edges.terminals[0], *alternative)
             || !matches!(points[edges.join.0].kind, CfgPointKind::Join)
+            || match self.second {
+                Some(entry) => entry != *alternative || !arm(entry, edges.terminals[1], edges.join),
+                None => *alternative != edges.join || edges.terminals[1] != edges.branch,
+            }
         {
             return false;
         }
-        self.forks.push(Fork { branch: edges.branch, join: edges.join });
+        self.forks.push(Fork { branch: edges.branch, join: edges.join, second: self.second.take() });
         self.branch = None;
         self.join = None;
         true
     }
 
     pub(super) fn seal(self, points: &[ReferenceFlowPoint]) -> Option<Box<Sealed>> {
-        if self.branch.is_some() || self.join.is_some() {
+        if self.branch.is_some() || self.join.is_some() || self.second.is_some() {
             return None;
         }
         let exit = self.root_exit?;
@@ -288,14 +321,16 @@ impl Author {
 }
 
 impl Holder {
-    fn record_read(&mut self, point: CfgPointId, arm: Option<usize>) {
+    fn record_read(&mut self, point: CfgPointId, arm: Option<Arm>) {
         if let Some(fork) = arm {
-            record_arm(&mut self.arms.get_or_insert_with(Box::default).reads, self.reads.len(), fork);
+            let arms = self.arms.get_or_insert_with(Box::default);
+            arms.second_read |= fork.second();
+            record_arm(&mut arms.reads, self.reads.len(), fork);
         }
         self.reads.push(point);
     }
 
-    fn record_install(&mut self, install: Install, arm: Option<usize>) {
+    fn record_install(&mut self, install: Install, arm: Option<Arm>) {
         if let Some(fork) = arm {
             record_arm(&mut self.arms.get_or_insert_with(Box::default).writes, self.writes.len(), fork);
         }
@@ -394,6 +429,8 @@ enum Event {
     Read,
     Install(Loan),
     Branch,
+    ThenEnd,
+    SecondEntry,
     Join,
 }
 
@@ -417,7 +454,7 @@ impl Boundary {
 
 impl Holder {
     fn refine(&self, forks: &Forks, exit: CfgPointId) -> Option<Refinement> {
-        if self.arm_runs().1.is_empty() {
+        if self.arms.as_deref().is_none_or(|arms| arms.writes.is_empty() && !arms.second_read) {
             let mut leases = Vec::new();
             self.linear_leases(exit, |install, _, last_read| {
                 let start = CfgPointId(install.version.0 + 1);
@@ -435,7 +472,7 @@ impl Holder {
         let mut reads = self.reads.iter().copied().enumerate().peekable();
         let (mut read_arms, mut write_arms) = self.arm_runs();
         let mut events = Vec::new();
-        let mut current_arm: Option<usize> = None;
+        let mut current_arm: Option<Arm> = None;
         while writes.peek().is_some() || reads.peek().is_some() {
             let (point, arm, event) = if reads.peek().is_some_and(|read|
                 writes.peek().is_none_or(|write| read.1 < write.1.version))
@@ -448,69 +485,100 @@ impl Holder {
             };
             if arm != current_arm {
                 if let Some(previous) = current_arm {
-                    let join = forks.get(previous)?.join;
-                    if join > point { return None; }
-                    events.push(Boundary::new(join, Event::Join));
-                }
-                if let Some(new) = arm {
-                    let fork = forks.get(new)?;
-                    if events.last().is_some_and(|boundary| boundary.point >= fork.branch) {
-                        return None;
+                    let fork = forks.get(previous.fork())?;
+                    if arm.is_some_and(|new| new.fork() == previous.fork()) {
+                        if previous.second() || !arm?.second() { return None; }
+                        Self::split_boundary(&mut events, fork.second?)?;
+                    } else {
+                        Self::close_boundary(&mut events, fork, previous.second())?;
                     }
-                    events.push(Boundary::new(fork.branch, Event::Branch));
+                }
+                if let Some(new) = arm.filter(|new|
+                    current_arm.is_none_or(|prior| prior.fork() != new.fork()))
+                {
+                    let fork = forks.get(new.fork())?;
+                    Self::push_boundary(&mut events, fork.branch, Event::Branch)?;
+                    if new.second() { Self::split_boundary(&mut events, fork.second?)?; }
                 }
                 current_arm = arm;
             }
             if let Some(arm) = arm {
-                let fork = forks.get(arm)?;
-                if point <= fork.branch || point >= fork.join { return None; }
+                let fork = forks.get(arm.fork())?;
+                let inside = if arm.second() {
+                    fork.second? < point && point < fork.join
+                } else {
+                    fork.branch < point && point < fork.second.unwrap_or(fork.join)
+                };
+                if !inside { return None; }
             }
-            if events.last().is_some_and(|boundary| boundary.point >= point) { return None; }
-            events.push(Boundary::new(point, event));
+            Self::push_boundary(&mut events, point, event)?;
         }
         if let Some(last) = current_arm {
-            events.push(Boundary::new(forks.get(last)?.join, Event::Join));
+            Self::close_boundary(&mut events, forks.get(last.fork())?, last.second())?;
         }
 
         let mut reaching = Reaching::Absent;
-        let mut bypass = None;
+        let mut sibling = None;
         for boundary in &mut events {
             match boundary.event {
                 Event::Join => {
-                    if bypass.take()? != reaching { reaching = Reaching::Diverse; }
+                    if sibling.take()? != reaching { reaching = Reaching::Diverse; }
                 }
                 Event::Branch => {
-                    if bypass.replace(reaching).is_some() { return None; }
+                    if sibling.replace(reaching).is_some() { return None; }
                 }
-                Event::Read | Event::Install(_) => {}
+                Event::SecondEntry => reaching = sibling.replace(reaching)?,
+                Event::Read | Event::Install(_) | Event::ThenEnd => {}
             }
             boundary.reaching_before = reaching;
             if let Event::Install(loan) = boundary.event { reaching = Reaching::One(loan); }
             boundary.reaching_after = reaching;
         }
-        if bypass.is_some() { return None; }
+        if sibling.is_some() { return None; }
 
         let mut live = false;
-        let mut bypass = None;
+        let mut sibling = None;
         for boundary in events.iter_mut().rev() {
             match boundary.event {
-                Event::Branch => live |= bypass.take()?,
+                Event::Branch => live |= sibling.take()?,
                 Event::Join => {
-                    if bypass.replace(live).is_some() { return None; }
+                    if sibling.replace(live).is_some() { return None; }
                 }
-                Event::Read | Event::Install(_) => {}
+                Event::ThenEnd => {
+                    std::mem::swap(&mut live, sibling.as_mut()?);
+                }
+                Event::Read | Event::Install(_) | Event::SecondEntry => {}
             }
             boundary.live_after = live;
             match boundary.event {
                 Event::Read => live = true,
                 Event::Install(_) => live = false,
-                Event::Branch | Event::Join => {}
+                Event::Branch | Event::Join | Event::ThenEnd | Event::SecondEntry => {}
             }
             boundary.live_before = live;
         }
-        if bypass.is_some() { return None; }
+        if sibling.is_some() { return None; }
         Some(events)
     }
+
+    fn push_boundary(events: &mut Vec<Boundary>, point: CfgPointId, event: Event) -> Option<()> {
+        if events.last().is_some_and(|last| last.point >= point) { return None; }
+        events.push(Boundary::new(point, event));
+        Some(())
+    }
+
+    fn split_boundary(events: &mut Vec<Boundary>, second: CfgPointId) -> Option<()> {
+        Self::push_boundary(events, CfgPointId(second.0.checked_sub(1)?), Event::ThenEnd)?;
+        Self::push_boundary(events, second, Event::SecondEntry)
+    }
+
+    fn close_boundary(events: &mut Vec<Boundary>, fork: &Fork, on_second: bool) -> Option<()> {
+        if let Some(second) = fork.second.filter(|_| !on_second) {
+            Self::split_boundary(events, second)?;
+        }
+        Self::push_boundary(events, fork.join, Event::Join)
+    }
+
 }
 
 fn access_facts(boundaries: &[Boundary], point: CfgPointId) -> (Reaching, bool) {
@@ -559,11 +627,15 @@ impl Sealed {
         let next = CfgPointId(index + 1);
         let fork = self.forks.get(*fork_index);
         if let Some(fork) = fork.filter(|fork| fork.branch == point.id) {
-            *fork_index += 1;
+            if fork.second.is_none() { *fork_index += 1; }
             matches!(&point.kind, CfgPointKind::Branch { .. })
-                && point.successors.as_slice() == [next, fork.join]
+                && point.successors.as_slice() == [next, fork.second.unwrap_or(fork.join)]
         } else if matches!(&point.kind, CfgPointKind::Branch { .. }) {
             false
+        } else if let Some(fork) = fork.filter(|fork| fork.second == Some(next)) {
+            *fork_index += 1;
+            matches!(&point.kind, CfgPointKind::ScopeExit)
+                && point.successors.as_slice() == [fork.join]
         } else if point.id == self.exit {
             fork.is_none() && point.successors.is_empty()
         } else {
@@ -1095,17 +1167,18 @@ pub(super) mod tests {
         let old = Loan { owner: 0, issued: at(0), mutable: true };
         let taken = Loan { owner: 1, issued: at(6), mutable: false };
         let later = Loan { owner: 0, issued: at(15), mutable: true };
+        let first_arm = Some(Arm::new(0, false));
         let mut holder = Holder::default();
         holder.record_install(Install { version: at(1), loan: old }, None);
-        holder.record_install(Install { version: at(7), loan: taken }, Some(0));
+        holder.record_install(Install { version: at(7), loan: taken }, first_arm);
         holder.record_install(Install { version: at(16), loan: later }, None);
-        holder.record_read(at(8), Some(0));
-        holder.record_read(at(9), Some(0));
+        holder.record_read(at(8), first_arm);
+        holder.record_read(at(9), first_arm);
         holder.record_read(at(12), None);
         holder.record_read(at(18), None);
         assert_eq!(holder.arm_runs().0.len(), 1);
         let mut forks = Forks::default();
-        forks.push(Fork { branch: at(4), join: at(10) });
+        forks.push(Fork { branch: at(4), join: at(10), second: None });
         let facts = holder.refine(&forks, at(20)).expect("one authored fork");
         assert!(matches!(&facts, Refinement::Branching(_)));
         let cases = [
@@ -1138,6 +1211,135 @@ pub(super) mod tests {
         assert!(matches!(&facts, Refinement::Linear(leases) if leases.len() == 1));
         assert!(facts.facts_at(at(16)) == (Reaching::One(old), true));
         assert!(facts.facts_at(at(17)) == (Reaching::Absent, false));
+    }
+
+    #[test]
+    fn sparse_explicit_arms_do_not_carry_reads_or_installs_to_siblings() {
+        let at = CfgPointId;
+        let first = Some(Arm::new(0, false));
+        let second = Some(Arm::new(0, true));
+        let incoming = Loan { owner: 0, issued: at(0), mutable: true };
+        let written = Loan { owner: 1, issued: at(5), mutable: true };
+        let reset = Loan { owner: 0, issued: at(20), mutable: false };
+        let has = |loan| Reaching::One(loan);
+        let mut forks = Forks::default();
+        forks.push(Fork { branch: at(3), join: at(15), second: Some(at(10)) });
+        let mut holder = Holder::default();
+        holder.record_install(Install { version: at(1), loan: incoming }, None);
+        holder.record_read(at(12), second);
+        let facts = holder.refine(&forks, at(30)).expect("read in second arm");
+        for (point, live) in [(2, true), (3, true), (5, false), (9, false), (10, true), (11, true), (12, false), (15, false)] {
+            assert!(facts.facts_at(at(point)) == (has(incoming), live), "point {point}");
+        }
+
+        let mut holder = Holder::default();
+        holder.record_install(Install { version: at(1), loan: incoming }, None);
+        holder.record_install(Install { version: at(6), loan: written }, first);
+        holder.record_read(at(8), first);
+        holder.record_read(at(12), second);
+        holder.record_read(at(17), None);
+        holder.record_install(Install { version: at(21), loan: reset }, None);
+        holder.record_read(at(24), None);
+        let facts = holder.refine(&forks, at(30)).expect("both siblings and root reset");
+        for (point, reaching, live) in [
+            (5, has(incoming), false), (6, has(incoming), true), (7, has(written), true),
+            (9, has(written), true), (10, has(incoming), true), (12, has(incoming), true),
+            (14, has(incoming), true), (15, Reaching::Diverse, true),
+            (17, Reaching::Diverse, false), (21, Reaching::Diverse, true),
+            (22, has(reset), true), (24, has(reset), false),
+        ] {
+            assert!(facts.facts_at(at(point)) == (reaching, live), "point {point}");
+        }
+    }
+
+    #[test]
+    fn production_builder_and_pristine_scan_keep_explicit_siblings_separate() {
+        let reaches = |enabled, malformed| {
+            let source = SourceIdentity::new("project".into(), "package".into(), "metadata".into(), "r1".into());
+            let at = |start| ByteSpan::new(start, start + 1);
+            let span = ByteSpan::new(0, 100);
+            let function = function(span);
+            let root = ReferenceScopeId(0);
+            let first = ReferenceScopeId(1);
+            let second = ReferenceScopeId(2);
+            let binding = |start| ReferenceBindingId {
+                source: source.clone(), function_span: span, block_span: span,
+                declaration_span: at(start), kind: ReferenceBindingKind::Declared,
+            };
+            let (owner, holder) = (binding(20), binding(21));
+            let mut calls = prepared();
+            let NamedPlaceRootFacts::Prepared(roots) = &mut calls.named_place_roots else { unreachable!() };
+            if enabled {
+                roots.insert(OccurrenceOrdinal(1), NamedPlaceRootIdentity::Lexical(owner.clone()));
+            }
+            let region = ConditionalRegion::Value {
+                span, condition: OccurrenceOrdinal(1), then_block: BlockOrdinal(1),
+                else_block: BlockOrdinal(2), resume: OccurrenceOrdinal(2),
+            };
+            calls.conditionals.insert(OccurrenceOrdinal(0), region.clone());
+            let names = HashSet::new();
+            let mut builder = ReferenceFlowBuilder::new(&source, &function, &names, &calls, &[], &[]);
+            builder.binding_types.record(owner.clone(), ScalarType::I32, Some(root));
+            builder.binding_types.record(holder.clone(), ScalarType::CheckedReference {
+                inner: Box::new(ScalarType::I32), mutability: ScalarReferenceMutability::Mutable,
+            }, Some(root));
+            builder.point(CfgPointKind::Entry, span, root, BTreeSet::new());
+            builder.point(CfgPointKind::ScopeEnter, span, root, BTreeSet::new());
+            let (issue, origins) = loan(&mut builder, &owner, at(1));
+            bind(&mut builder, &holder, 0, issue, origins.clone());
+            builder.point(CfgPointKind::Read { binding: owner.clone() }, at(2), root, BTreeSet::new());
+            let branch = builder.point(CfgPointKind::Branch {
+                condition: ScalarExpression::Boolean { value: true, span: at(3) },
+            }, at(3), root, BTreeSet::new());
+            builder.point(CfgPointKind::ScopeEnter, at(4), first, BTreeSet::new());
+            builder.point(CfgPointKind::Read { binding: owner.clone() }, at(5), first, BTreeSet::new());
+            let first_end = builder.point(CfgPointKind::ScopeExit, at(6), first, BTreeSet::new());
+            builder.author_local_scope_exit(first_end, &Default::default(), true);
+            builder.cursor = Some(branch);
+            builder.author_local_second_arm(CfgPointId(builder.cfg.points.len()));
+            let second_entry = builder.point(CfgPointKind::ScopeEnter, at(7), second, BTreeSet::new());
+            builder.point(CfgPointKind::Read { binding: owner.clone() }, at(8), second, BTreeSet::new());
+            builder.point(CfgPointKind::Read { binding: holder.clone() }, at(9), second, origins);
+            let second_end = builder.point(CfgPointKind::ScopeExit, at(10), second, BTreeSet::new());
+            builder.author_local_scope_exit(second_end, &Default::default(), true);
+            builder.cursor = None;
+            let join = builder.point(CfgPointKind::Join, at(11), root, BTreeSet::new());
+            builder.connect_reference_conditional(&ReferenceConditionalEdges {
+                branch, terminals: [first_end, second_end], join,
+            }, &region);
+            builder.point(CfgPointKind::Read { binding: owner.clone() }, at(12), root, BTreeSet::new());
+            let exit = builder.point(CfgPointKind::ScopeExit, span, root, BTreeSet::new());
+            let mut leaving = super::super::super::control::ScopeExitBindings::default();
+            leaving.insert(owner);
+            leaving.insert(holder);
+            builder.author_local_scope_exit(exit, &leaving, true);
+            builder.proof_points.scope_exit_bindings.as_mut().unwrap().insert(exit, leaving);
+            builder.seal_local_borrow();
+            assert_eq!(builder.proof_points.local_borrow.is_some(), enabled);
+            builder.cfg.initial_points = builder.cfg.points.clone();
+            if malformed {
+                builder.cfg.initial_points[first_end.0].successors = vec![second_entry];
+                let sealed = builder.proof_points.local_borrow.as_ref().expect("pristine mismatch");
+                assert!(!sealed.matches_edge_shape(first_end.0, &builder.cfg.initial_points[first_end.0], &mut 0));
+                return None;
+            }
+            let mut result = FunctionReferenceResult {
+                cfg: builder.cfg, proof_points: builder.proof_points,
+                checked_contract_returns: vec![], aggregate: aggregate::AggregateFlowResult::default(), arms: vec![],
+            };
+            Some(definitive(&mut result))
+        };
+        COUNTS.with(|counts| counts.set([0; 7]));
+        let admitted = reaches(true, false).expect("exact production edges");
+        assert!(COUNTS.with(|counts| counts.get()[2]) > 0);
+        let incumbent = reaches(false, false).expect("incumbent verdict");
+        assert_eq!(admitted, incumbent);
+        let diagnostic = |start| admitted.iter().any(|error| matches!(error,
+            ReferenceAnalysisError::ConflictingPlace { source_span, .. }
+                if source_span.range == ByteSpan::new(start, start + 1)));
+        assert!(diagnostic(2) && diagnostic(8));
+        assert!(!diagnostic(5) && !diagnostic(12));
+        assert!(reaches(true, true).is_none());
     }
 
 }

@@ -472,9 +472,8 @@ impl<'a> ReferenceFlowBuilder<'a> {
         Self {
             capture_call_points: false,
             local_borrow: (matches!(&call_sites.named_place_roots, NamedPlaceRootFacts::Prepared(roots)
-                if if call_sites.conditionals.len() == 1 {
-                    matches!(call_sites.conditionals.values().next(), Some(ConditionalRegion::Unit { .. }))
-                } else { !roots.is_empty() })
+                if !roots.is_empty() || (call_sites.conditionals.len() == 1
+                    && matches!(call_sites.conditionals.values().next(), Some(ConditionalRegion::Unit { .. }))))
                 && call_sites.boundary.root_outputs.is_empty()
                 && call_sites.boundary.parameters.iter().all(|parameter| aggregate::ordinary_value(&parameter.ty))
                 && function.generic_parameters.is_empty() && call_sites.call_occurrences.is_empty()
@@ -1050,6 +1049,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
         let else_arm = match (else_branch, else_block) {
             (Some(else_branch), Some(else_block)) => {
                 self.origins = incoming_origins.expect("explicit else entry origins");
+                self.author_local_second_arm(CfgPointId(self.cfg.points.len()));
                 ReferenceConditionalArm {
                     result: self.block_result(else_branch, else_block, projected_origins)?,
                     end: self.cursor.expect("else branch terminal"),
@@ -1067,14 +1067,18 @@ impl<'a> ReferenceFlowBuilder<'a> {
         Ok(([then_arm, else_arm], condition_point, branch))
     }
 
+    fn author_local_second_arm(&mut self, entry: CfgPointId) {
+        if self.local_borrow.as_mut().is_some_and(|author| !author.second_arm(entry)) {
+            self.local_borrow = None;
+        }
+    }
+
     fn connect_reference_conditional(&mut self, edges: &ReferenceConditionalEdges, region: &ConditionalRegion) {
         edges.connect(&mut self.cfg.points);
-        if let Some(author) = &mut self.local_borrow {
-            if !matches!(region, ConditionalRegion::Unit { .. })
-                || !author.fork(edges, &self.cfg.points)
-            {
-                self.local_borrow = None;
-            }
+        if self.local_borrow.as_mut().is_some_and(|author| {
+            !author.fork(edges, &self.cfg.points, matches!(region, ConditionalRegion::Value { .. }))
+        }) {
+            self.local_borrow = None;
         }
     }
 
