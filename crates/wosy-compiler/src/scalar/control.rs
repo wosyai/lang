@@ -59,6 +59,13 @@ impl ScopeExitBindings {
         self.bindings.is_empty()
     }
 
+    pub(super) fn singleton(&self) -> Option<&super::ReferenceBindingId> {
+        if self.bindings.len() != 1 {
+            return None;
+        }
+        self.bindings.iter().next()
+    }
+
     pub(super) fn contains(&self, binding: &super::ReferenceBindingId) -> bool {
         // A different span can only rule out membership. Matching spans
         // still require the entire checked identity.

@@ -4415,6 +4415,16 @@ impl ReferenceEdgeState {
         if inventory.is_some() && exiting.is_none() {
             return;
         }
+        if let Some(binding) = exiting.and_then(super::control::ScopeExitBindings::singleton) {
+            self.bindings.remove(binding);
+            self.uninitialized.remove(binding);
+            self.moved_checked_handles.remove(binding);
+            self.released.remove(binding);
+            self.invalidated.remove(binding);
+            self.moved.retain(|(place, _)| &place.binding != binding);
+            self.projected.retain(|known| &known.place.binding != binding);
+            return;
+        }
         let live = |binding: &ReferenceBindingId| match exiting {
             Some(bindings) => !bindings.contains(binding),
             None => binding.block_span != point.source_span.range, // detached/unprepared only
@@ -4552,6 +4562,17 @@ fn prepared_scope_expiry_uses_exact_declared_and_introduced_bindings() {
     }
     state.expire_scope(&point(0, 2), Some(&inventory)); // empty checked scope, not detached
     assert_eq!(state.bindings.len(), 3);
+    let mut single = state.clone();
+    single.expire_scope(&outer_exit, Some(&inventory));
+    let others = BTreeSet::from([inner.clone(), introduced.clone()]);
+    assert!(single.bindings.keys().eq(others.iter()));
+    assert!(single.moved_checked_handles.keys().eq(others.iter()));
+    assert_eq!(single.uninitialized, HashSet::from([inner.clone(), introduced.clone()]));
+    assert_eq!(single.released, others);
+    assert_eq!(single.invalidated, others);
+    assert!(single.moved.iter().map(|(place, _)| &place.binding).eq([&inner, &introduced]));
+    assert!(single.projected.iter().map(|known| &known.place.binding).eq([&inner, &introduced]));
+
     state.expire_scope(&inner_exit, Some(&inventory));
     assert_eq!(state.bindings, BTreeMap::from([(outer.clone(), BTreeSet::new())]));
     assert_eq!(state.uninitialized, HashSet::from([outer.clone()]));
