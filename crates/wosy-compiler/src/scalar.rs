@@ -4757,7 +4757,9 @@ fn derive_place(node: &CstNode) -> ScalarPlace {
             let children = direct_nodes(node);
             let mut place = children
                 .iter()
-                .find(|child| child.kind() != SyntaxKind::IndexSuffix)
+                .find(|child| {
+                    !matches!(child.kind(), SyntaxKind::IndexSuffix | SyntaxKind::IndexFieldSuffix)
+                })
                 .map(derive_place)
                 .unwrap_or_else(|| {
                     let name =
@@ -4784,6 +4786,17 @@ fn derive_place(node: &CstNode) -> ScalarPlace {
                         wosy_syntax::byte_span(&suffix).end,
                     ),
                     index_span,
+                };
+            }
+            if let Some(suffix) = children.iter().find(|child| child.kind() == SyntaxKind::IndexFieldSuffix) {
+                let field = direct_token(suffix, SyntaxKind::Identifier).expect("indexed field name");
+                place = ScalarPlace::Field {
+                    base: Box::new(place),
+                    field: ScalarFieldReference::Unresolved {
+                        name: field.text().to_owned(),
+                        span: token_span(&field),
+                    },
+                    span: wosy_syntax::byte_span(node),
                 };
             }
             place

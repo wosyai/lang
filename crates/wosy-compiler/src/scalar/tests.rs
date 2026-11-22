@@ -4666,6 +4666,40 @@ fn derives_and_types_fixed_array_index_places_and_addresses() {
 }
 
 #[test]
+fn derives_named_fixed_array_field_reads_and_writes_as_canonical_places() {
+    let text = "%%start\nstruct Actor { u8 x; }\nu8() update = fn() {\nActor[2] actors = [{ .x = 7; }, { .x = 9; }];\nactors[1].x = actors[0].x;\nactors[1].x\n};\n%%end";
+    let result = validate_text(text);
+    assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+    let ScalarItem::Function(function) = &result.program.items[0] else {
+        panic!("actor update")
+    };
+    let ScalarBlockItem::Assignment(assignment) = &function.body.items[1] else {
+        panic!("actor assignment")
+    };
+    let ScalarExpression::IndexedRead { place: rhs, .. } = &assignment.values[0] else {
+        panic!("actor field read")
+    };
+    for (place, index_text, index_offset) in [
+        (&assignment.targets[0].place, "1", text.find("[1].x").unwrap()),
+        (rhs, "0", text.find("[0].x").unwrap()),
+    ] {
+        let ScalarPlace::Field { base, field, span } = place else {
+            panic!("resolved field after index")
+        };
+        assert_eq!(field, &ScalarFieldReference::Resolved(result.program.structs[0].fields[0].id.clone()));
+        let ScalarPlace::Index { base, index_span, .. } = base.as_ref() else {
+            panic!("indexed field base")
+        };
+        assert!(matches!(base.as_ref(), ScalarPlace::Name { name, .. } if name == "actors"));
+        assert_eq!(*index_span, ByteSpan::new(index_offset as u32 + 1, index_offset as u32 + 2));
+        assert_eq!(&text[index_span.start as usize..index_span.end as usize], index_text);
+        assert_eq!(&text[span.start as usize..span.end as usize], format!("actors[{index_text}].x"));
+    }
+    let missing = validate_text(&text.replace("actors[0].x", "actors[0].other"));
+    assert!(missing.diagnostics.iter().any(|diagnostic| diagnostic.message == "value has no field"));
+}
+
+#[test]
 fn derives_pointer_struct_layouts_from_the_target() {
     let text = "%%start\nstruct Pair {\n\t*?u8 address;\n\tu32 count;\n}\n%%end";
     let parsed = parse_source(source(), text.to_owned(), &[]);

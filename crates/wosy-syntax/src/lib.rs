@@ -100,6 +100,7 @@ pub enum SyntaxKind {
     ProofForall = 87,
     ProofQuantifierGuard = 88,
     ProofExists = 89,
+    IndexFieldSuffix = 90,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -199,6 +200,7 @@ impl Language for WosyLanguage {
             87 => SyntaxKind::ProofForall,
             88 => SyntaxKind::ProofQuantifierGuard,
             89 => SyntaxKind::ProofExists,
+            90 => SyntaxKind::IndexFieldSuffix,
             _ => panic!("invalid syntax kind: {}", raw.0),
         }
     }
@@ -845,8 +847,9 @@ fn kind(rule: Rule) -> SyntaxKind {
         Rule::raw_address => SyntaxKind::RawAddress,
         Rule::checked_address => SyntaxKind::CheckedAddress,
         Rule::parenthesized_dereference_place => SyntaxKind::ParenthesizedDereferencePlace,
-        Rule::indexed_place => SyntaxKind::IndexedPlace,
+        Rule::indexed_place | Rule::indexed_value_place => SyntaxKind::IndexedPlace,
         Rule::index_suffix => SyntaxKind::IndexSuffix,
+        Rule::index_field_suffix => SyntaxKind::IndexFieldSuffix,
         Rule::place_target => SyntaxKind::PlaceTarget,
         Rule::primary => SyntaxKind::Primary,
         Rule::error_item => SyntaxKind::Error,
@@ -971,6 +974,29 @@ mod tests {
                 .count(),
             8
         );
+    }
+
+    #[test]
+    fn named_index_then_field_reads_and_writes_keep_lossless_suffixes() {
+        let text = "%%start\nu8 value = actors [ 0 ] # note: field\n . x;\nactors[1].x = value;\nu8 old = actors[1];\nu8 member = holder.actors[0];\n%%end";
+        let parsed = parse(identity(), text.into(), &["note".to_owned()]);
+        assert!(parsed.is_valid(), "{:?}", parsed.errors);
+        assert_eq!(parsed.reconstruct(), text);
+        let places: Vec<_> = parsed.root.descendants()
+            .filter(|node| node.kind() == SyntaxKind::IndexedPlace)
+            .collect();
+        let expected = [
+            vec![SyntaxKind::IndexSuffix, SyntaxKind::IndexFieldSuffix],
+            vec![SyntaxKind::IndexSuffix, SyntaxKind::IndexFieldSuffix],
+            vec![SyntaxKind::IndexSuffix],
+            vec![SyntaxKind::QualifiedMember, SyntaxKind::IndexSuffix],
+        ];
+        assert_eq!(places.len(), expected.len());
+        for (place, expected) in places.iter().zip(expected) {
+            assert_eq!(place.children().map(|child| child.kind()).collect::<Vec<_>>(), expected);
+        }
+        let suffix = places[0].children().last().expect("indexed field suffix");
+        assert_eq!(suffix.text().to_string(), ". x");
     }
 
     #[test]
