@@ -146,6 +146,9 @@ trait ScopedAuthoredReturn<'a>: Copy {
     const OBSERVE_RETURN: bool = false;
 
     #[cfg(feature = "internal-checker")]
+    const REQUIRE_TOTAL_RETURN: bool = false;
+
+    #[cfg(feature = "internal-checker")]
     fn observe_return(
         self, _: FinalOutputSlot, _: IntegerReturn<'a>, _: &IntegerRoots<'a>, _: &IntegerInputs,
     ) -> Option<()> {
@@ -473,7 +476,7 @@ struct LiteralGuardAtReturn<'a> {
 
 #[cfg(feature = "internal-checker")]
 #[derive(Clone, Copy)]
-struct OrderedRootLiteralProof<'a, 'observation> {
+struct OrderedRootLiteralProof<'a, 'observation, const TOTAL: bool> {
     conditions: OrderedRootConditions<'a>,
     relation: IntegerRelation,
     bound: &'observation BigInt,
@@ -482,9 +485,10 @@ struct OrderedRootLiteralProof<'a, 'observation> {
 }
 
 #[cfg(feature = "internal-checker")]
-impl<'a> ScopedAuthoredReturn<'a> for OrderedRootLiteralProof<'a, '_> {
+impl<'a, const TOTAL: bool> ScopedAuthoredReturn<'a> for OrderedRootLiteralProof<'a, '_, TOTAL> {
     const ENABLED: bool = false;
     const OBSERVE_RETURN: bool = true;
+    const REQUIRE_TOTAL_RETURN: bool = TOTAL;
 
     fn at(
         self, _: &FunctionCallSites, _: BlockOrdinal, _: FinalOutputSlot, _: &ScalarType,
@@ -1973,7 +1977,7 @@ pub(super) fn collect_ordered_root_requirement_failures<'a>(
 }
 
 #[cfg(feature = "internal-checker")]
-pub(super) fn collect_ordered_root_literal_proof<'a>(
+pub(super) fn collect_ordered_root_literal_proof<'a, const TOTAL: bool>(
     calls: &'a FunctionCallSites, body: &'a super::ScalarBlock, relation: IntegerRelation, bound: &BigInt,
     predicate: Option<&IntegerPredicate>,
 ) -> Option<(bool, Vec<IntegerCheckFailure<'a>>, bool, Option<SymbolicLiteralFailure<'a>>)> {
@@ -2008,7 +2012,7 @@ pub(super) fn collect_ordered_root_literal_proof<'a>(
     let mut sink = |failure| failures.push(failure);
     let (active, _) = collect_integer_requirement_failures_in_scope(
         calls, IntegerRequirementEntry::Arbitrary, None, false, &mut sink,
-        OrderedRootLiteralProof { conditions: OrderedRootConditions(body), relation, bound, guard: guard.as_ref(), observed: &observed },
+        OrderedRootLiteralProof::<TOTAL> { conditions: OrderedRootConditions(body), relation, bound, guard: guard.as_ref(), observed: &observed },
     )?;
     let (returned, failure) = observed.into_inner();
     Some((active, failures, returned, failure))
@@ -2231,6 +2235,19 @@ pub(super) fn proves_requirement_with_imported_root_local<'a>(
         Ok(ProofCoverage::NoApplicableInputs) => None,
         Err(_) => Some(false),
     }
+}
+
+#[cfg(feature = "internal-checker")]
+pub(super) fn collect_ordered_imported_root_local<'a>(
+    calls: &'a FunctionCallSites, local: ImportedLocal<'a>, sink: &mut dyn FnMut(IntegerCheckFailure<'a>),
+) -> Option<bool> {
+    let mut failures = IntegerFailureCollection {
+        continuation: IntegerRequirementContinuation::Empty, projected: None, allow_projected_calls: false, sink,
+    };
+    let ProofCoverage::Applicable(active) = run_integer_callable::<true, true, _>(
+        calls, integer_tail_type(calls), None, None, Some(local), None, None, Some(&mut failures), false, (),
+    )?.ok()? else { return None; };
+    Some(active)
 }
 
 #[cfg(test)]
@@ -2677,6 +2694,10 @@ fn run_integer_callable<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool,
         }
     }
     let result = walk_integer_block::<USE_IMPORTED_BOUND, COLLECT, _>(calls, &mut roots, calls.structure.root, IntegerInputs(vec![row]), tail, returns, &mut handle_call, &mut failures, authored_return)?;
+    #[cfg(feature = "internal-checker")]
+    if Authored::REQUIRE_TOTAL_RETURN && !matches!(result, IntegerControl::Returned) {
+        return None;
+    }
     if USE_IMPORTED_BOUND && roots.imported_local.is_some() {
         return None;
     }
@@ -2882,7 +2903,12 @@ fn walk_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, A
                         match walk_integer_block::<USE_IMPORTED_BOUND, COLLECT, _>(calls, roots, arm, incoming, Some(expected), returns.as_deref_mut(), handle_call, failures, branch_return)? {
                             IntegerControl::Returned => {}
                             failure @ IntegerControl::Fail(_) => return Some(failure),
-                            IntegerControl::Continue(outgoing) if COLLECT && outgoing.is_unreachable() => {}
+                            IntegerControl::Continue(outgoing) if COLLECT && outgoing.is_unreachable() => {
+                                #[cfg(feature = "internal-checker")]
+                                if Authored::REQUIRE_TOTAL_RETURN {
+                                    return None;
+                                }
+                            }
                             IntegerControl::Continue(_) => return None,
                         }
                     }
