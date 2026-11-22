@@ -1,5 +1,11 @@
 use super::*;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct AggregateObservationMode {
+    literal: bool,
+    legacy: bool,
+}
+
 #[derive(Default)]
 pub(super) struct AggregateFlowFacts {
     pub(super) allocations: BTreeMap<ReferenceBindingId, CfgPointId>,
@@ -756,13 +762,30 @@ impl AggregateFlowFacts {
         !self.formals.is_empty() || !self.raw_formals.is_empty()
     }
 
-    pub(super) fn observes_values(&self) -> bool {
+    // During CFG construction the final route is not yet known. Preserve
+    // legacy scope metadata even when the private observer never enrolls.
+    pub(super) fn needs_scope_exit_metadata(&self) -> bool {
         self.literal_array_bind.is_some() || self.observes_legacy_values()
     }
 
     fn observes_legacy_values(&self) -> bool {
         self.array_formal.is_some() || !self.array_calls.is_empty()
             || !self.checked_producer_arms.is_empty() || !self.views.is_empty() || !self.calls.is_empty() || !self.formals.is_empty() || !self.input_moves.is_empty() || !self.raw_formals.is_empty()
+    }
+
+    // Select observers after CFG construction; this is only a demand gate,
+    // not authority to transfer or release an allocation.
+    pub(super) fn observation_mode(&self) -> Option<AggregateObservationMode> {
+        let legacy = self.observes_legacy_values();
+        let literal = self.literal_array_bind.is_some_and(|allocation|
+            self.allocations.len() == 1 && self.allocations.values().next() == Some(&allocation.bind))
+            && match (self.literal_array_value, self.literal_array_write, self.literal_array_unit) {
+                (Some(_), None, None) => self.literal_array_writer.is_none(),
+                (None, Some(_), None) => self.literal_array_writer.is_none(),
+                (None, Some(_), Some(_)) => true,
+                _ => false,
+            };
+        (literal || legacy).then_some(AggregateObservationMode { literal, legacy })
     }
 
     fn visit_literal_array(
@@ -924,14 +947,17 @@ impl AggregateFlowFacts {
 
     pub(super) fn visit(
         &self,
+        mode: AggregateObservationMode,
         point: &ReferenceFlowPoint,
         state: &mut AggregateEdgeState,
         result: &mut AggregateFlowResult,
         sites: &FunctionCallSites,
         value_deadlines: Option<&[usize]>,
     ) {
-        self.visit_literal_array(point, state, result);
-        if !self.observes_legacy_values() {
+        if mode.literal {
+            self.visit_literal_array(point, state, result);
+        }
+        if !mode.legacy {
             return;
         }
         let id = point.id;
@@ -3236,6 +3262,34 @@ mod tests {
             block: BlockOrdinal(0),
             unit: None,
         }
+    }
+
+    #[test]
+    fn aggregate_observation_ignores_incomplete_literal_candidates() {
+        let pair = synthetic_literal_array_pair();
+        let span = ByteSpan::new(0, 0);
+        let binding = ReferenceBindingId {
+            source: SourceIdentity::new("project".into(), "package".into(), "metadata".into(), "r1".into()),
+            function_span: span, declaration_span: span, block_span: span, kind: ReferenceBindingKind::Declared,
+        };
+        let mut facts = AggregateFlowFacts {
+            allocations: BTreeMap::from([(binding, pair.original.bind)]),
+            literal_array_bind: Some(pair.original),
+            ..AggregateFlowFacts::default()
+        };
+        assert_eq!(facts.observation_mode(), None);
+        facts.calls.insert(pair.write.rhs, pair.write.producer);
+        assert_eq!(facts.observation_mode(), Some(AggregateObservationMode { literal: false, legacy: true }));
+        facts.literal_array_write = Some(pair.write);
+        facts.literal_array_writer = Some(BlockOrdinal(1));
+        assert_eq!(facts.observation_mode(), Some(AggregateObservationMode { literal: false, legacy: true }));
+        facts.literal_array_writer = None;
+        assert_eq!(facts.observation_mode(), Some(AggregateObservationMode { literal: true, legacy: true }));
+        facts.calls.clear();
+        assert_eq!(facts.observation_mode(), Some(AggregateObservationMode { literal: true, legacy: false }));
+        facts.literal_array_write = None;
+        facts.literal_array_value = Some((pair.write.rhs, pair.final_output));
+        assert_eq!(facts.observation_mode(), Some(AggregateObservationMode { literal: true, legacy: false }));
     }
 
     #[test]

@@ -4267,14 +4267,15 @@ fn materialize_assignment_values<'ctx, 'module, 'expected>(
     let mut position = 0;
     let mut values = Vec::new();
     for expression in expressions {
-        let checked_rebind_destination = state.aggregate.as_ref().and_then(|aggregate| {
-            state.body_call_nodes.and_then(|nodes| nodes.expression_ordinal(expression))
-                .and_then(|ordinal| aggregate.same_array_rebind_destination(ordinal))
-        });
-        let literal_array_replacement = state.aggregate.as_ref().and_then(|aggregate| {
-            let call = state.body_call_nodes.and_then(|nodes| nodes.expression_ordinal(expression))?;
-            Some((call, aggregate.literal_array_replacement(call)?))
-        });
+        let (checked_rebind_destination, literal_array_replacement) = state.aggregate.as_ref()
+            .and_then(|aggregate| {
+                let call = state.body_call_nodes.and_then(|nodes| nodes.expression_ordinal(expression))?;
+                Some((
+                    aggregate.same_array_rebind_destination(call),
+                    aggregate.literal_array_replacement(call).map(|destination| (call, destination)),
+                ))
+            })
+            .unwrap_or_default();
         let provenance = if literal_array_replacement.is_some() || checked_rebind_destination.is_some() {
             // Checked receipt routes do not acquire a second lexical owner.
             RuntimeArrayAssignmentProvenance {

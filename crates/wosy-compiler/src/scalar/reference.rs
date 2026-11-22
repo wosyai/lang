@@ -3808,6 +3808,11 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     if let BlockItemKind::FinalOutput(slot) = kind {
                         if scope == ReferenceScopeId(0) && slot.output == 0
                             && self.aggregate_facts.literal_array_bind.is_some()
+                            && matches!(&self.cfg.points[value_point.0].kind, CfgPointKind::Read { binding }
+                                if self.cursor.is_some_and(|moved| moved != value_point
+                                    && matches!(&self.cfg.points[moved.0].kind,
+                                        CfgPointKind::Move { place, owner, ty: ScalarType::RuntimeArray { .. } }
+                                            if owner == binding && place.binding == *binding && place.projections.is_empty())))
                         {
                             self.aggregate_facts.literal_array_value = Some((value_point, slot.expression));
                         }
@@ -4259,7 +4264,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
             }
         }
         self.point(CfgPointKind::ScopeExit, region.span, scope, BTreeSet::new());
-        if self.aggregate_facts.observes_values() {
+        if self.aggregate_facts.needs_scope_exit_metadata() {
             self.aggregate_facts.scope_exits.insert(self.cursor.expect("scope exit"), ordinal);
         }
         if scope == ReferenceScopeId(0) && region.final_outputs().next().is_some() {
@@ -5294,6 +5299,7 @@ fn transfer_reference_facts(
     contracts: &HashMap<CfgPointId, &[ReferenceOrigin]>,
     mut aggregate: Option<(
         &aggregate::AggregateFlowFacts,
+        aggregate::AggregateObservationMode,
         &FunctionCallSites,
         &mut aggregate::AggregateFlowResult,
     )>,
@@ -5620,11 +5626,11 @@ fn transfer_reference_facts(
     }
     let aggregate_deadlines = aggregate.as_ref()
         .filter(|_| aggregate_expiry_allowed)
-        .map(|(facts, _, _)| facts.value_deadlines(&last_use));
+        .map(|(facts, _, _, _)| facts.value_deadlines(&last_use));
     let mut observed = vec![None::<ReferenceFlowPoint>; cfg.points.len()];
     let mut incoming = vec![Vec::<ReferenceEdgeState>::new(); cfg.points.len()];
     incoming[0].push(ReferenceEdgeState {
-        aggregate: aggregate.as_ref().map(|(facts, _, _)| facts.entry_state()),
+        aggregate: aggregate.as_ref().map(|(facts, _, _, _)| facts.entry_state()),
         ..ReferenceEdgeState::default()
     });
     let mut fallback = (!strictly_forward).then(|| {
@@ -5825,10 +5831,10 @@ fn transfer_reference_facts(
                 })
             });
             if !projected_rejected {
-                if let (Some((facts, sites, result)), Some(flow)) =
+                if let (Some((facts, mode, sites, result)), Some(flow)) =
                     (&mut aggregate, &mut state.aggregate)
                 {
-                    facts.visit(initial_point, flow, result, sites, aggregate_deadlines.as_deref());
+                    facts.visit(*mode, initial_point, flow, result, sites, aggregate_deadlines.as_deref());
                 }
             }
             let mut move_alternatives = Vec::new();
@@ -10963,8 +10969,9 @@ fn build_function_reference_cfg(
                 builder.aggregate_facts.formal_forward_shape = Some((moved, call));
             }
         }
-        let flow = builder.aggregate_facts.observes_values().then_some((
+        let flow = builder.aggregate_facts.observation_mode().map(|mode| (
             &builder.aggregate_facts,
+            mode,
             call_sites,
             &mut aggregate,
         ));
