@@ -483,7 +483,7 @@ pub(super) fn collect_integer_requirement_failures(
 pub(super) enum IntegerRequirementEntry<'a> {
     Arbitrary,
     Exact(&'a [&'a BigInt]),
-    Projected(Rc<IntegerSet>),
+    Projected { slot: usize, values: Rc<IntegerSet>, fixed: Option<&'a BigInt> },
 }
 
 pub(super) enum IntegerRequirementContinuation {
@@ -494,7 +494,7 @@ pub(super) enum IntegerRequirementContinuation {
 
 struct IntegerFailureCollection<'a, 'sink> {
     continuation: IntegerRequirementContinuation,
-    projected: Option<Rc<IntegerSet>>,
+    projected: Option<(usize, IntegerRow)>,
     allow_projected_calls: bool,
     sink: &'sink mut dyn FnMut(IntegerCheckFailure<'a>),
 }
@@ -509,7 +509,15 @@ pub(super) fn collect_integer_requirement_failures_with_calls<'a>(
     let (tail, exact, projected) = match entry {
         IntegerRequirementEntry::Arbitrary => (integer_tail_type(calls), None, None),
         IntegerRequirementEntry::Exact(arguments) => (None, Some(arguments), None),
-        IntegerRequirementEntry::Projected(values) => (None, None, Some(values)),
+        IntegerRequirementEntry::Projected { slot, values, fixed } => {
+            let row = match (slot, fixed) {
+                (0, None) => vec![values],
+                (0, Some(fixed)) => vec![values, Rc::new(IntegerSet::singleton(fixed))],
+                (1, Some(fixed)) => vec![Rc::new(IntegerSet::singleton(fixed)), values],
+                _ => return None,
+            };
+            (None, None, Some((slot, row)))
+        }
     };
     let mut collected = IntegerFailureCollection {
         continuation: IntegerRequirementContinuation::Empty, projected, allow_projected_calls, sink,
@@ -563,27 +571,73 @@ pub(super) enum ActualCallResult {
     Integer(BigInt),
 }
 
+pub(super) struct ProjectedIntegerArgument<'a> {
+    pub(super) ty: &'a ScalarType,
+    pub(super) caller_axis: usize,
+    pub(super) slot: usize,
+    path: &'a IntegerInputs,
+    pub(super) fixed: Option<ExactIntegerArgument<'a>>,
+}
+
+#[cfg(test)]
+std::thread_local! {
+    pub(super) static PROJECTED_ARGUMENT_MATERIALIZATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+impl ProjectedIntegerArgument<'_> {
+    pub(super) fn materialize(&self) -> Option<Rc<IntegerSet>> {
+        #[cfg(test)]
+        PROJECTED_ARGUMENT_MATERIALIZATIONS.with(|count| count.set(count.get() + 1));
+        self.path.project_axis(self.caller_axis)
+    }
+}
+
 pub(super) enum NestedIntegerArgument<'a> {
     Single(Option<ExactIntegerArgument<'a>>),
     Pair(ExactIntegerArgument<'a>, ExactIntegerArgument<'a>),
-    Projected { ty: &'a ScalarType, axis: usize, values: Rc<IntegerSet> },
+    Projected(ProjectedIntegerArgument<'a>),
 }
 
-fn nested_integer_axis(
-    calls: &FunctionCallSites, roots: &IntegerRoots<'_>, argument: OccurrenceOrdinal, ty: &ScalarType,
-) -> Option<usize> {
+enum NestedIntegerOperand<'a> {
+    Exact(ExactIntegerArgument<'a>),
+    Axis(&'a ScalarType, usize),
+}
+
+fn nested_integer_operand<'a>(
+    calls: &'a FunctionCallSites, expression: OccurrenceOrdinal, slot: usize,
+    roots: &IntegerRoots<'_>, path: &'a IntegerInputs,
+) -> Option<NestedIntegerOperand<'a>> {
+    let (argument, ty) = checked_integer_call_argument_at(&calls.structure, expression, slot)?;
+    if let Some(value) = calls.structure.checker_integer_literals.get(&argument) {
+        return Some(NestedIntegerOperand::Exact((ty, value)));
+    }
     let PlainNameIdentity::Lexical(binding) = calls.prepared_plain_name(argument)? else { return None; };
     let (axis, binding_type) = roots.lookup(binding)?;
-    (binding_type == ty).then_some(axis)
+    if binding_type != ty {
+        return None;
+    }
+    Some(match path.singleton_at(axis) {
+        Some(value) => NestedIntegerOperand::Exact((ty, value)),
+        None => NestedIntegerOperand::Axis(ty, axis),
+    })
 }
 
-fn exact_nested_pair<'a>(
+fn nested_pair_argument<'a>(
     calls: &'a FunctionCallSites, expression: OccurrenceOrdinal, roots: &IntegerRoots<'_>, path: &'a IntegerInputs,
+    allow_projection: bool,
 ) -> Option<NestedIntegerArgument<'a>> {
-    let lexical = |argument, ty: &ScalarType| path.singleton_at(nested_integer_axis(calls, roots, argument, ty)?);
-    let first = exact_integer_call_argument_at(&calls.structure, expression, 0, lexical)?;
-    let second = exact_integer_call_argument_at(&calls.structure, expression, 1, lexical)?;
-    Some(NestedIntegerArgument::Pair(first, second))
+    let first = nested_integer_operand(calls, expression, 0, roots, path)?;
+    let second = nested_integer_operand(calls, expression, 1, roots, path)?;
+    let (ty, caller_axis, slot, fixed) = match (first, second) {
+        (NestedIntegerOperand::Exact(first), NestedIntegerOperand::Exact(second)) =>
+            return Some(NestedIntegerArgument::Pair(first, second)),
+        (NestedIntegerOperand::Axis(ty, axis), NestedIntegerOperand::Exact(fixed)) if allow_projection =>
+            (ty, axis, 0, fixed),
+        (NestedIntegerOperand::Exact(fixed), NestedIntegerOperand::Axis(ty, axis)) if allow_projection =>
+            (ty, axis, 1, fixed),
+        _ => return None,
+    };
+    Some(NestedIntegerArgument::Projected(ProjectedIntegerArgument { ty, caller_axis, slot, path, fixed: Some(fixed) }))
 }
 
 fn actual_nested_argument<'a>(
@@ -593,24 +647,14 @@ fn actual_nested_argument<'a>(
     path: &'a IntegerInputs,
     allow_projection: bool,
 ) -> NestedIntegerArgument<'a> {
-    let Some((argument, ty)) = checked_integer_call_argument_at(&calls.structure, expression, 0) else {
-        return NestedIntegerArgument::Single(None);
-    };
-    if let Some(value) = calls.structure.checker_integer_literals.get(&argument) {
-        return NestedIntegerArgument::Single(Some((ty, value)));
+    match nested_integer_operand(calls, expression, 0, roots, path) {
+        Some(NestedIntegerOperand::Exact(argument)) => NestedIntegerArgument::Single(Some(argument)),
+        Some(NestedIntegerOperand::Axis(ty, caller_axis)) if allow_projection =>
+            NestedIntegerArgument::Projected(ProjectedIntegerArgument {
+                ty, caller_axis, slot: 0, path, fixed: None,
+            }),
+        _ => NestedIntegerArgument::Single(None),
     }
-    let Some(axis) = nested_integer_axis(calls, roots, argument, ty) else {
-        return NestedIntegerArgument::Single(None);
-    };
-    if let Some(value) = path.singleton_at(axis) {
-        return NestedIntegerArgument::Single(Some((ty, value)));
-    }
-    if allow_projection {
-        if let Some(values) = path.project_axis(axis) {
-            return NestedIntegerArgument::Projected { ty, axis, values };
-        }
-    }
-    NestedIntegerArgument::Single(None)
 }
 
 pub(super) type ActualCallHandler<'a, 'handler> =
@@ -810,12 +854,12 @@ fn run_integer_callable<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool>
         roots.add(binding, &parameter.ty);
     }
     let projected = if COLLECT { failures.as_deref_mut()?.projected.take() } else { None };
-    let projected_entry = projected.is_some();
-    let mut row: IntegerRow = if let Some(projected) = projected {
-        if boundary.parameters.len() != 1 || projected.is_empty() {
+    let projected_slot = projected.as_ref().map(|(slot, _)| *slot);
+    let mut row: IntegerRow = if let Some((slot, row)) = projected {
+        if row.len() != boundary.parameters.len() || row.get(slot)?.is_empty() {
             return None;
         }
-        vec![projected]
+        row
     } else if let Some(arguments) = exact_arguments {
         if arguments.len() != boundary.parameters.len() {
             return None;
@@ -850,10 +894,12 @@ fn run_integer_callable<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool>
     if COLLECT {
         failures.as_deref_mut()?.continuation = match &result {
             IntegerControl::Continue(path) if path.is_unreachable() => IntegerRequirementContinuation::Empty,
-            IntegerControl::Continue(path) if projected_entry =>
-                IntegerRequirementContinuation::Projected(path.project_axis(0)?),
-            IntegerControl::Returned if projected_entry => return None,
-            IntegerControl::Continue(_) | IntegerControl::Returned => IntegerRequirementContinuation::Feasible,
+            IntegerControl::Continue(path) => match projected_slot {
+                Some(slot) => IntegerRequirementContinuation::Projected(path.project_axis(slot)?),
+                None => IntegerRequirementContinuation::Feasible,
+            },
+            IntegerControl::Returned if projected_slot.is_some() => return None,
+            IntegerControl::Returned => IntegerRequirementContinuation::Feasible,
             IntegerControl::Fail(_) => IntegerRequirementContinuation::Empty,
         };
     }
@@ -910,24 +956,21 @@ fn walk_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool>(
                 } else if structure.checker_direct_targets.contains_key(&expression) {
                     let handle = handle_call.as_mut()?;
                     let signature = calls.checked_call_signatures.get(&expression)?;
+                    let project = COLLECT && failures.as_ref().is_some_and(|collection| collection.allow_projected_calls);
                     let argument = if COLLECT && signature.parameters.len() == 2 {
-                        exact_nested_pair(calls, expression, roots, &path)?
+                        nested_pair_argument(calls, expression, roots, &path, project)?
                     } else {
-                        let project = COLLECT && failures.as_ref().is_some_and(|collection| collection.allow_projected_calls);
                         actual_nested_argument(calls, expression, roots, &path, project)
                     };
                     let projected = match &argument {
-                        NestedIntegerArgument::Projected { axis, values, .. } => Some((*axis, Rc::clone(values))),
+                        NestedIntegerArgument::Projected(projection) => Some(projection.caller_axis),
                         _ => None,
                     };
                     match handle(calls, expression, signature, argument, &ScalarType::Unit)? {
                         ActualCallResult::Unit => {}
                         ActualCallResult::EmptyUnit if COLLECT => path = IntegerInputs::default(),
                         ActualCallResult::ProjectedUnit(survivors) if COLLECT => {
-                            let (axis, sent) = projected?;
-                            if !Rc::ptr_eq(&sent, &survivors) {
-                                path.restrict_axis(axis, &survivors);
-                            }
+                            path.restrict_axis(projected?, &survivors);
                         }
                         _ => return None,
                     }

@@ -8,7 +8,7 @@ use super::{
     checker_directive::{CheckedLiteralOutput, CheckerOperation, InitializerIntegerOperand, InitializerPredicate, PreparedCheckerDirective},
     checker_flow::{
         check_integer_requirement_activity, check_integer_requirements_with_calls, collect_integer_requirement_failures, check_integer_return_bound_with_shows, collect_integer_requirement_failures_with_calls, concrete_integer_literal, exact_integer_call_argument, exact_integer_call_argument_at,
-        exact_integer_return_at_entry, ActualCallResult, CheckerPredicate, ExactIntegerArgument, IntegerRequirementContinuation, IntegerRequirementEntry, NestedIntegerArgument,
+        exact_integer_return_at_entry, ActualCallResult, CheckerPredicate, ExactIntegerArgument, IntegerRequirementContinuation, IntegerRequirementEntry, NestedIntegerArgument, ProjectedIntegerArgument,
         proves_requirement_with_imported_root_local, ImportedEntryGuard, ImportedLocal, IntegerShowProof, IntegerCheckFailure, IntegerComparison, IntegerInputs, IntegerReturn, ProofCoverage,
     },
     control::{BindingInitialization, BlockItemKind, CheckedCallSignature, ConditionalRegion, InitializationName, InitializationStorage, ModuleInitializationCallTarget, ModuleInitializationDetail, ModuleInitializationStepKind, ModuleInitializationTopology, NamespaceTarget},
@@ -996,7 +996,7 @@ struct OrderedCallCollection<'a, 'visits> {
 enum ActualProjectedArguments<'a> {
     Single(Option<ExactIntegerArgument<'a>>),
     ExactPair(ExactIntegerArgument<'a>, ExactIntegerArgument<'a>),
-    SymbolicAxis(&'a ScalarType, Rc<IntegerSet>),
+    SymbolicAxis(ProjectedIntegerArgument<'a>),
 }
 
 struct CheckedCalls<'a, Observer, const ACTUAL_STARTUP: bool = true> {
@@ -1055,7 +1055,7 @@ impl<Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> CheckedCalls<'
         let projected = match argument {
             NestedIntegerArgument::Single(exact) => ActualProjectedArguments::Single(exact),
             NestedIntegerArgument::Pair(first, second) => ActualProjectedArguments::ExactPair(first, second),
-            NestedIntegerArgument::Projected { ty, values, .. } => ActualProjectedArguments::SymbolicAxis(ty, values),
+            NestedIntegerArgument::Projected(projection) => ActualProjectedArguments::SymbolicAxis(projection),
         };
         self.run(&caller.structure, call, signature, projected, source, *declaration_span, expected, collection)
     }
@@ -1090,7 +1090,7 @@ impl<Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> CheckedCalls<'
         entry: IntegerRequirementEntry<'_>,
         collection: OrderedCallCollection<'_, '_>,
     ) -> Result<ActualCallResult, ProjectCheck> {
-        let terminal_projection = matches!(&entry, IntegerRequirementEntry::Projected(_));
+        let terminal_projection = matches!(&entry, IntegerRequirementEntry::Projected { .. });
         let mut sink = |failure| collection.failures.borrow_mut().push_callable(body, source, failure);
         let mut nested_error = None;
         let mut nested = |caller: &FunctionCallSites, occurrence, signature: &CheckedCallSignature, argument: NestedIntegerArgument<'_>, expected: &ScalarType| {
@@ -1160,11 +1160,18 @@ impl<Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> CheckedCalls<'
         };
         let target = (target_module, target_item);
         let projected = match projected {
-            ActualProjectedArguments::SymbolicAxis(ty, values) => {
+            ActualProjectedArguments::SymbolicAxis(projection) => {
                 let Some(collection) = collection else { return Err(ProjectCheck::Unsupported); };
-                if ACTUAL_STARTUP || *expected != ScalarType::Unit
-                    || !matches!((signature.parameters.as_slice(), body.boundary.parameters.as_slice()),
-                        ([parameter], [slot]) if parameter == ty && slot.ty == *ty)
+                let ProjectedIntegerArgument { ty, slot, fixed, .. } = projection;
+                let types_match = match (signature.parameters.as_slice(), body.boundary.parameters.as_slice(), fixed) {
+                    ([parameter], [entry], None) => slot == 0 && parameter == ty && entry.ty == *ty,
+                    (parameters @ [_, _], entries @ [_, _], Some((fixed_ty, _))) if slot < 2 => {
+                        parameters[slot] == *ty && entries[slot].ty == *ty
+                            && parameters[1 - slot] == *fixed_ty && entries[1 - slot].ty == *fixed_ty
+                    }
+                    _ => false,
+                };
+                if ACTUAL_STARTUP || *expected != ScalarType::Unit || !types_match
                     || !function.generic_parameters.is_empty() || !function.overload_arms.is_empty()
                     || !body.structure.checker_direct_targets.is_empty()
                     || !body.call_occurrences.is_empty() || !body.allocation_length_calls.is_empty()
@@ -1174,9 +1181,16 @@ impl<Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> CheckedCalls<'
                 {
                     return Err(ProjectCheck::Unsupported);
                 }
-                return self.collect_requirements(
-                    body, &owner.source, IntegerRequirementEntry::Projected(values), collection,
-                );
+                let values = projection.materialize().ok_or(ProjectCheck::Unsupported)?;
+                let outcome = self.collect_requirements(
+                    body, &owner.source, IntegerRequirementEntry::Projected {
+                        slot, values: Rc::clone(&values), fixed: fixed.map(|(_, value)| value),
+                    }, collection,
+                )?;
+                return Ok(match outcome {
+                    ActualCallResult::ProjectedUnit(survivors) if Rc::ptr_eq(&values, &survivors) => ActualCallResult::Unit,
+                    outcome => outcome,
+                });
             }
             exact => exact,
         };
@@ -3808,8 +3822,11 @@ mod tests {
             expected(true, "value != 3", 3, 3),
         ]);
         let (prepared, _, _) = prepare("lib.leaf(1);", "");
+        use super::super::checker_flow::PROJECTED_ARGUMENT_MATERIALIZATIONS;
+        let before = PROJECTED_ARGUMENT_MATERIALIZATIONS.get();
         assert_eq!(collect_ordered_package_failures(&prepared, ScalarCheckerScope::CurrentPackage, 2),
             Err(ProjectCheck::Unsupported));
+        assert_eq!(PROJECTED_ARGUMENT_MATERIALIZATIONS.get(), before);
         assert_eq!(collect_ordered_package_failures(&prepared, ScalarCheckerScope::MainFlowOnly, 2),
             Ok((true, Vec::new())));
     }
@@ -3957,8 +3974,89 @@ mod tests {
         ]);
 
         let (_, prepared) = prepare(&format!("{plain} value = 1;"), "");
+        use super::super::checker_flow::PROJECTED_ARGUMENT_MATERIALIZATIONS;
+        let before = PROJECTED_ARGUMENT_MATERIALIZATIONS.get();
         assert_eq!(collect_ordered_package_failures(&prepared, ScalarCheckerScope::CurrentPackage, 1),
             Err(ProjectCheck::Unsupported));
+        assert_eq!(PROJECTED_ARGUMENT_MATERIALIZATIONS.get(), before);
+        assert_eq!(collect_ordered_package_failures(&prepared, ScalarCheckerScope::MainFlowOnly, 1),
+            Ok((true, Vec::new())));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordered_package_symbolic_projection_pairs_one_exact_axis_with_one_disjoint_axis() {
+        let app = source("src/main.w", "collect-one-projected-pair-axis");
+        let prepare = |body: String| {
+            let text = format!(r#"%%start
+                unit(u8, i8) leaf = fn(left, right) {{
+                    core.require(left < 5, {OUTPUT});
+                    core.require(right < 0, {OUTPUT});
+                    core.narrow(left != 6, {OUTPUT});
+                    core.narrow(right != 2, {OUTPUT});
+                }};
+                unit(u8, i8) wrapper = fn(x, y) {{ {body} }};
+                leaf(1, -1);
+            %%end"#);
+            let prepared = prepare_checker_project(
+                vec![(declarations(&app, &text), Vec::new())], vec![app.clone()], inputs(),
+            ).unwrap();
+            (text, prepared)
+        };
+        let read = |text: &str, prepared: &PreparedCheckerProject| {
+            let (active, reports) = collect_ordered_package_failures(prepared, ScalarCheckerScope::CurrentPackage, 1)
+                .expect("complete typed two-axis reports");
+            assert!(active);
+            reports.iter().map(|report| {
+                let ProjectCheck::Failed { condition, state, axes, .. } = report else { panic!("expected report"); };
+                assert_eq!(state.row_count(), 1);
+                assert_eq!(axes.len(), 2);
+                assert_eq!((&axes[0].1, &axes[1].1), (&ScalarType::U8, &ScalarType::I8));
+                let domains = [0, 1].map(|axis| state.intervals_at(0, axis).unwrap()
+                    .map(|(lo, hi)| (lo.clone(), hi.clone())).collect::<Vec<_>>());
+                (text[condition.start as usize..condition.end as usize].to_owned(), domains)
+            }).collect::<Vec<_>>()
+        };
+        let limits = |pairs: &[(i32, i32)]| pairs.iter()
+            .map(|(lo, hi)| (BigInt::from(*lo), BigInt::from(*hi))).collect::<Vec<_>>();
+        use super::super::checker_flow::PROJECTED_ARGUMENT_MATERIALIZATIONS;
+        let before = PROJECTED_ARGUMENT_MATERIALIZATIONS.get();
+        let (text, prepared) = prepare(format!(r#"
+            if (x < 4) {{ core.narrow(y == -5, {OUTPUT}); }} else {{ core.narrow(y == 0, {OUTPUT}); }};
+            leaf(x, -1);
+            if (y == 0) {{ core.require(x < 5, {OUTPUT}); }};
+        "#));
+        assert_eq!(read(&text, &prepared), [
+            ("left < 5".into(), [limits(&[(5, 255)]), limits(&[(-1, -1)])]),
+            ("x < 5".into(), [limits(&[(5, 5), (7, 255)]), limits(&[(0, 0)])]),
+        ]);
+
+        assert_eq!(PROJECTED_ARGUMENT_MATERIALIZATIONS.get(), before + 1);
+        let (text, prepared) = prepare(format!(r#"
+            if (y < 0) {{ core.narrow(x == 1, {OUTPUT}); }} else {{ core.narrow(x == 2, {OUTPUT}); }};
+            leaf(3, y);
+            if (x == 2) {{ core.require(y < 1, {OUTPUT}); }};
+        "#));
+        assert_eq!(read(&text, &prepared), [
+            ("right < 0".into(), [limits(&[(3, 3)]), limits(&[(0, 127)])]),
+            ("y < 1".into(), [limits(&[(2, 2)]), limits(&[(1, 1), (3, 127)])]),
+        ]);
+
+        let (text, prepared) = prepare(format!(r#"
+            core.narrow(x == 3, {OUTPUT});
+            leaf(x, y);
+            core.require(y < 1, {OUTPUT});
+        "#));
+        assert_eq!(read(&text, &prepared), [
+            ("right < 0".into(), [limits(&[(3, 3)]), limits(&[(0, 127)])]),
+            ("y < 1".into(), [limits(&[(3, 3)]), limits(&[(1, 1), (3, 127)])]),
+        ]);
+
+        let (_, prepared) = prepare("leaf(x, y);".into());
+        let before = PROJECTED_ARGUMENT_MATERIALIZATIONS.get();
+        assert_eq!(collect_ordered_package_failures(&prepared, ScalarCheckerScope::CurrentPackage, 1),
+            Err(ProjectCheck::Unsupported));
+        assert_eq!(PROJECTED_ARGUMENT_MATERIALIZATIONS.get(), before);
         assert_eq!(collect_ordered_package_failures(&prepared, ScalarCheckerScope::MainFlowOnly, 1),
             Ok((true, Vec::new())));
     }
