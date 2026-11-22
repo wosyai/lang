@@ -918,6 +918,72 @@ fn standalone_show_is_a_verified_equality_in_the_selected_unused_entry_domain() 
 }
 
 #[test]
+fn sequential_named_proof_shows_verify_each_claim_without_replacing_ensures() {
+    let identity = source();
+    let check = |target: &str, guard: &str, goal: &str, steps: &str, startup: &str| {
+        check_scalar_module_proof(
+            identity.clone(),
+            "sequence",
+            vec![ScalarProofModuleInput {
+                source: identity.clone(),
+                text: format!(r#"%%start
+                    u8(u8, u8) fixed = fn(x, y) {{ if (x == 0) {{}}; if (y == 0) {{}}; 7 }};
+                    u8(u8, u8) alias = fn(x, y) {{ if (y == 0) {{}}; x }};
+                    {startup}
+                    proof sequence for {target}(first, second) -> (out) where ({guard}) ensures ({goal}) {{
+                        {steps}
+                    }}
+                %%end"#),
+                namespaces: Vec::new(),
+            }],
+            vec![identity.clone()],
+            ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
+        )
+    };
+    let valid = "core.show(out == first); core.show(out == 7); core.show(out == first);";
+    assert_eq!(check("fixed", "first == 7", "out == 7", valid, ""), ScalarModuleProofOutcome::Proved);
+    assert_eq!(check("fixed", "first == 7", "out < 7", valid, ""), ScalarModuleProofOutcome::Refuted);
+    assert_eq!(check("fixed", "false", "out == 7", valid, ""), ScalarModuleProofOutcome::NoApplicableInputs);
+    assert_eq!(check("fixed", "first == 7", "out == 7", valid, "u8 observed = fixed(7, 0);"),
+        ScalarModuleProofOutcome::Unsupported);
+    for failed in ["core.show(out == 8); core.show(out == 7);", "core.show(out == 7); core.show(out == 8);"] {
+        assert_eq!(check("fixed", "first == 7", "out == 7", failed, ""), ScalarModuleProofOutcome::Refuted);
+    }
+    for outside in ["core.show(out == 8); core.show(out == second);", "core.show(out == second); core.show(out == 8);"] {
+        assert_eq!(check("alias", "first == 7", "out == 7", outside, ""), ScalarModuleProofOutcome::Unsupported);
+    }
+    assert!(matches!(check("fixed", "first == 7", "out == 7",
+        "core.show(out == 7); core.show(out == 256);", ""), ScalarModuleProofOutcome::Invalid(_)));
+    assert_eq!(check("fixed", "first == 7", "out == 7",
+        "core.show(out == 7); core.witness(7);", ""), ScalarModuleProofOutcome::Unsupported);
+}
+
+#[test]
+fn sequential_named_proof_shows_reject_the_intrinsic_null_as_an_integer_alias() {
+    let identity = source();
+    let check = |parameters: &str, output: &str, first_claim: &str, second_claim: &str| {
+        check_scalar_module_proof(
+            identity.clone(), "sequence",
+            vec![ScalarProofModuleInput {
+                source: identity.clone(),
+                text: format!(r#"%%start
+                    u8(u8) fixed = fn(value) {{ if (value == 0) {{}}; 7 }};
+                    proof sequence for fixed({parameters}) -> ({output}) ensures ({output} == 7) {{
+                        core.show({first_claim});
+                        core.show({second_claim});
+                    }}
+                %%end"#),
+                namespaces: Vec::new(),
+            }],
+            vec![identity.clone()],
+            ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
+        )
+    };
+    assert!(matches!(check("null", "out", "out == null", "out == 7"), ScalarModuleProofOutcome::Invalid(_)));
+    assert!(matches!(check("entry", "null", "null == 7", "null == 7"), ScalarModuleProofOutcome::Invalid(_)));
+}
+
+#[test]
 fn verified_bound_checks_both_ordered_typed_call_arguments_and_repeated_aliases() {
     let identity = source();
     let use_bound = |proof: &str, caller: &str, extra: &str| {

@@ -416,7 +416,7 @@ pub(super) struct IntegerCheckFailure<'a> {
     pub(super) axes: Vec<(&'a ReferenceBindingId, &'a ScalarType)>,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(super) enum IntegerReturn<'a> {
     Alias(&'a ReferenceBindingId),
     Const(&'a BigInt),
@@ -432,6 +432,7 @@ pub(super) struct IntegerReturningPath<'a> {
 
 pub(super) enum IntegerShowProof<'a> {
     Equality(IntegerReturn<'a>),
+    Sequence(Vec<IntegerReturn<'a>>),
     Conditional {
         guard: CheckerPredicate,
         then_claim: IntegerReturn<'a>,
@@ -517,6 +518,7 @@ impl IntegerReturningPath<'_> {
     fn shows(self, proof: &IntegerShowProof<'_>) -> Option<bool> {
         let (guard, then_claim, else_claim) = match proof {
             IntegerShowProof::Equality(claim) => return shows_return_equality(&self.state, &self.axes, &self.value, claim),
+            IntegerShowProof::Sequence(_) => return None,
             IntegerShowProof::Conditional { guard, then_claim, else_claim } => (guard, then_claim, else_claim),
         };
         let (yes, no) = match guard {
@@ -909,6 +911,24 @@ fn check_integer_return_bound_in_scope<'a>(
         Ok(ProofCoverage::NoApplicableInputs) => return Some(Ok(ProofCoverage::NoApplicableInputs)),
         Err(failure) => return Some(Err(failure)),
     };
+    if let Some(IntegerShowProof::Sequence(claims)) = proof {
+        let mut proved = true;
+        for path in &paths {
+            if proved {
+                proved = path.output_satisfies(relation, bound)?;
+            }
+            for claim in claims {
+                if proved {
+                    proved = shows_return_equality(&path.state, &path.axes, &path.value, claim)?;
+                } else if matches!((&path.value, claim),
+                    (IntegerReturn::Alias(actual), IntegerReturn::Alias(expected)) if actual != expected)
+                {
+                    return None;
+                }
+            }
+        }
+        return Some(Ok(ProofCoverage::Applicable(proved)));
+    }
     for path in paths {
         if !path.output_satisfies(relation, bound)? {
             return Some(Ok(ProofCoverage::Applicable(false)));

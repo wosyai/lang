@@ -2351,7 +2351,10 @@ impl PlannedModuleProof<'_> {
         if !valid_arbitrary_proof_body(body) {
             return Err(ProjectCheck::Unsupported);
         }
-        let proof = proof_show_plan::<false>(&self.steps, input_names, output, result_type, body)?;
+        let proof = proof_show_plan::<false, true>(
+            &self.steps, input_names, output, result_type, body,
+            (operator == &BinaryOperator::Equal).then_some(bound),
+        )?;
         let checked = check_integer_return_bound_with_shows(body, operator, bound, self.filter.as_deref(), &proof);
         match checked {
             Some(Ok(ProofCoverage::Applicable(true))) => Ok(ProjectCheck::Proved),
@@ -3272,7 +3275,7 @@ fn check_selected_proof(
             error => error,
         })?;
     let checked = if !steps.items.is_empty() {
-        let proof = proof_show_plan::<true>(&steps, &input_names, &output, result_type, body)?;
+        let proof = proof_show_plan::<true, false>(&steps, &input_names, &output, result_type, body, None)?;
         check_integer_return_bound_with_shows(body, &operator, &bound, filter.as_deref(), &proof)
     } else if let Some(filter) = filter.as_deref() {
         check_integer_return_bound_where(body, &operator, &bound, filter)
@@ -3620,12 +3623,13 @@ fn proof_input_condition<const VERIFY_LITERAL_FIT: bool>(
     Ok(CheckerPredicate::Integer(predicate))
 }
 
-fn proof_show_plan<'a, const VERIFY_ENTRY_WRITES: bool>(
+fn proof_show_plan<'a, const VERIFY_ENTRY_WRITES: bool, const ALLOW_SEQUENCE: bool>(
     steps: &'a ScalarBlock,
     inputs: &[String],
     output: &str,
     ty: &ScalarType,
     body: &'a FunctionCallSites,
+    ensures_equality: Option<&BigInt>,
 ) -> Result<IntegerShowProof<'a>, ProjectCheck> {
     let bindings = body.boundary.checker_parameter_bindings.as_deref().ok_or(ProjectCheck::Unsupported)?;
     if VERIFY_ENTRY_WRITES && body.assignments.values().flat_map(|group| group.destinations()).any(|destination| {
@@ -3649,6 +3653,23 @@ fn proof_show_plan<'a, const VERIFY_ENTRY_WRITES: bool>(
                 else_claim: proof_show_claim(else_branch, inputs, output, ty, body, bindings)?,
             })
         }
+        [_, _, ..] if ALLOW_SEQUENCE && steps.terminated_items.len() == steps.items.len() => {
+            if is_null_literal_name(output) || inputs.iter().any(|name| is_null_literal_name(name)) {
+                return Err(ProjectCheck::InvalidProof);
+            }
+            let mut seen = HashSet::new();
+            let mut claims = Vec::new();
+            for (item, &terminated) in steps.items.iter().zip(&steps.terminated_items) {
+                let claim = proof_show_item_claim(item, terminated, inputs, output, ty, body, bindings)?;
+                if matches!(claim, IntegerReturn::Const(value) if ensures_equality == Some(value)) {
+                    continue;
+                }
+                if seen.insert(claim) {
+                    claims.push(claim);
+                }
+            }
+            Ok(IntegerShowProof::Sequence(claims))
+        }
         _ => Err(ProjectCheck::Unsupported),
     }
 }
@@ -3661,16 +3682,27 @@ fn proof_show_claim<'a>(
     body: &FunctionCallSites,
     bindings: &'a [ReferenceBindingId],
 ) -> Result<IntegerReturn<'a>, ProjectCheck> {
-    let [ScalarBlockItem::Expression(ScalarExpression::Call {
-        receiver, name, arguments, type_arguments, ..
-    })] = arm.items.as_slice() else {
+    let ([item], [terminated]) = (arm.items.as_slice(), arm.terminated_items.as_slice()) else {
         return Err(ProjectCheck::Unsupported);
     };
-    if receiver.as_deref() != Some("core")
-        || name != "show"
-        || !type_arguments.is_empty()
-        || arm.terminated_items.as_slice() != [true]
-    {
+    proof_show_item_claim(item, *terminated, inputs, output, ty, body, bindings)
+}
+
+fn proof_show_item_claim<'a>(
+    item: &'a ScalarBlockItem,
+    terminated: bool,
+    inputs: &[String],
+    output: &str,
+    ty: &ScalarType,
+    body: &FunctionCallSites,
+    bindings: &'a [ReferenceBindingId],
+) -> Result<IntegerReturn<'a>, ProjectCheck> {
+    let ScalarBlockItem::Expression(ScalarExpression::Call {
+        receiver, name, arguments, type_arguments, ..
+    }) = item else {
+        return Err(ProjectCheck::Unsupported);
+    };
+    if receiver.as_deref() != Some("core") || name != "show" || !type_arguments.is_empty() || !terminated {
         return Err(ProjectCheck::Unsupported);
     }
     let [ScalarExpression::Binary {
