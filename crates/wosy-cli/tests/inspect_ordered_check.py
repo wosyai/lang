@@ -301,5 +301,27 @@ def main():
         ), empty
 
 
+        mixed_bands = """%%start
+            u8(u8) active_band = fn(value) { value };
+            u8(u8) unused_band = fn(value) { value };
+            proof actual for active_band(entry) -> (out) ensures (out < 8) {}
+            proof unused for unused_band(entry) -> (out) where (entry <= 7)
+                forall (u8 ceiling where ceiling >= 6 && ceiling != 6) ensures (out < ceiling) {}
+            u8 reached = active_band(8);
+        %%end"""
+        source.write_text(mixed_bands, encoding="utf-8")
+        package_bands = subprocess.run(command, cwd=root, capture_output=True, timeout=15)
+        expected_mixed = expected_main.replace(b"unused proof failures: 0", b"unused proof failures: 1")
+        assert (package_bands.returncode, package_bands.stdout, package_bands.stderr) == (
+            1, expected_mixed, b""
+        ), package_bands
+        main_bands = subprocess.run(main_command, cwd=root, capture_output=True, timeout=15)
+        assert (main_bands.returncode, main_bands.stdout, main_bands.stderr) == (1, expected_main, b""), main_bands
+
+        source.write_text(mixed_bands.replace("entry <= 7", "entry <= 6"), encoding="utf-8")
+        tight_bands = subprocess.run(command, cwd=root, capture_output=True, timeout=15)
+        assert (tight_bands.returncode, tight_bands.stdout, tight_bands.stderr) == (1, expected_main, b""), tight_bands
+
+
 if __name__ == "__main__":
     main()

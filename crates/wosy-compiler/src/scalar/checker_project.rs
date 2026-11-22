@@ -8607,6 +8607,43 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
 
     #[cfg(feature = "internal-checker")]
     #[test]
+    fn ordered_guarded_unused_universal_preserves_actual_calls_and_exact_scope() {
+        let app = source("src/main.w", "ordered-unused-universal");
+        let run = |upper, scope| {
+            let text = format!(r#"%%start
+                u8(u8) active_band = fn(value) {{ value }};
+                u8(u8) unused_band = fn(value) {{ value }};
+                proof actual for active_band(entry) -> (out) ensures (out < 8) {{}}
+                proof unused for unused_band(entry) -> (out) where (entry <= {upper})
+                    forall (u8 ceiling where ceiling >= 6 && ceiling != 6) ensures (out < ceiling) {{}}
+                u8 reached = active_band(8);
+            %%end"#);
+            let (_, proof) = crate::parse_proof_source(app.clone(), text, &[])
+                .unwrap_or_else(|_| panic!("valid guarded universal proof"));
+            check_loaded_scalar_ordered_local_proof_contexts(
+                Vec::new(), [(proof, Vec::new())], vec![app.clone()], inputs(), scope, Vec::new(),
+            ).unwrap()
+        };
+        let full = run(7, ScalarCheckerScope::CurrentPackage);
+        let main = run(7, ScalarCheckerScope::MainFlowOnly);
+        let tight = run(6, ScalarCheckerScope::CurrentPackage);
+        for receipt in [&full, &main, &tight] {
+            assert!(receipt.active && receipt.directives.is_empty());
+            let [reached] = receipt.diagnostics.as_slice() else { panic!("one actual proof failure"); };
+            assert_eq!(reached.proof.source, app);
+            assert_eq!(reached.invocation.returned, BigInt::from(8));
+            assert!(receipt.additional_symbolic_diagnostics.is_empty());
+        }
+        let symbolic = full.symbolic_diagnostic.unwrap();
+        let seven = BigInt::from(7);
+        assert_eq!(symbolic.proof.source, app);
+        assert_eq!(symbolic.returned, seven);
+        assert_eq!(symbolic.witness.intervals_at(0, 0).unwrap().collect::<Vec<_>>(), [(&seven, &seven)]);
+        assert!(main.symbolic_diagnostic.is_none() && tight.symbolic_diagnostic.is_none());
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
     fn ordered_current_package_auto_proofs_share_unused_returns_in_declaration_order() {
         let app = source("src/main.w", "ordered-automatic-proof-unused-group");
         let run = |text: &str, scope| {
