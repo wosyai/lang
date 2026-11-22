@@ -804,10 +804,14 @@ fn walk_package_initialization<const COLLECT: bool>(
                     let value = if let Some(value) = concrete_integer_literal(expression) {
                         value
                     } else if matches!(expression, ScalarExpression::Call { .. }) {
+                        #[cfg(feature = "internal-checker")]
+                        let proof_site = actual.initializer_proof_site(topology, source, outputs.primary, failures.as_deref())?;
                         let ActualCallResult::Integer(value) = run_initializer_call(
                             topology, actual, outputs.primary, ty,
                             |argument, argument_type| initialized_integer_argument(topology, &storage, argument, argument_type),
                             None,
+                            #[cfg(feature = "internal-checker")]
+                            proof_site,
                         )? else {
                             return Err(ProjectCheck::Unsupported);
                         };
@@ -901,7 +905,7 @@ fn check_initializer_expression<const COLLECT: bool>(
     } else { None };
     match run_initializer_call(topology, actual, expression, &ScalarType::Unit, |argument, ty| {
         if COLLECT { initialized_integer_argument(topology, storage, argument, ty) } else { None }
-    }, collection)? {
+    }, collection, #[cfg(feature = "internal-checker")] None)? {
         ActualCallResult::Unit => Ok(StartupLane::Feasible),
         ActualCallResult::EmptyUnit if COLLECT => Ok(StartupLane::Empty),
         _ => Err(ProjectCheck::Unsupported),
@@ -915,6 +919,7 @@ fn run_initializer_call<'a>(
     expected: &ScalarType,
     initialized_argument: impl Fn(OccurrenceOrdinal, &ScalarType) -> Option<&'a BigInt>,
     collection: Option<(&SourceIdentity, OrderedCallCollection<'_, '_>)>,
+    #[cfg(feature = "internal-checker")] proof_site: Option<InitializerProofSite<'_>>,
 ) -> Result<ActualCallResult, ProjectCheck> {
     let Some(ModuleInitializationCallTarget::Direct {
         declaration,
@@ -938,7 +943,10 @@ fn run_initializer_call<'a>(
         }
         ActualProjectedArguments::Single(argument)
     };
-    actual.run(&topology.structure, occurrence, signature, arguments, &declaration.source, declaration.range, expected, collection)
+    actual.run(
+        &topology.structure, occurrence, signature, arguments, &declaration.source, declaration.range,
+        expected, collection, #[cfg(feature = "internal-checker")] proof_site,
+    )
 }
 
 enum InitializerValue<'a> {
@@ -1015,10 +1023,26 @@ struct CheckedCalls<'a, Observer, const ACTUAL_STARTUP: bool = true> {
     symbolic_module: usize,
 }
 
+#[cfg(feature = "internal-checker")]
+struct InitializerProofSite<'a> {
+    source: &'a SourceIdentity,
+    span: ByteSpan,
+    directive_position: usize,
+}
+
 trait ActualIntegerObserver {
     const ENABLED: bool;
 
     fn observe(&mut self, target: (usize, usize), arguments: &[&BigInt], value: &BigInt);
+
+    #[cfg(feature = "internal-checker")]
+    const CONTEXTUAL: bool = false;
+
+    #[cfg(feature = "internal-checker")]
+    fn observe_initializer(
+        &mut self, _target: (usize, usize), _site: Option<InitializerProofSite<'_>>,
+        _parameters: &[ScalarType], _arguments: &[&BigInt], _value: &BigInt,
+    ) {}
 
     #[cfg(feature = "internal-checker")]
     fn proved_recursive_return(
@@ -1038,6 +1062,19 @@ impl ActualIntegerObserver for () {
 const MAX_ACTUAL_CALL_DEPTH: usize = 64;
 
 impl<Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> CheckedCalls<'_, Observer, ACTUAL_STARTUP> {
+    #[cfg(feature = "internal-checker")]
+    fn initializer_proof_site<'a>(
+        &self, topology: &ModuleInitializationTopology, source: &'a SourceIdentity,
+        occurrence: OccurrenceOrdinal, failures: Option<&OrderedFailures>,
+    ) -> Result<Option<InitializerProofSite<'a>>, ProjectCheck> {
+        if !ACTUAL_STARTUP || !Observer::CONTEXTUAL {
+            return Ok(None);
+        }
+        let span = topology.occurrences.get(occurrence.0).ok_or(ProjectCheck::MissingRootOccurrences)?.span;
+        let directive_position = failures.ok_or(ProjectCheck::Unsupported)?.records.len();
+        Ok(Some(InitializerProofSite { source, span, directive_position }))
+    }
+
     fn nested(
         &mut self,
         caller: &FunctionCallSites,
@@ -1063,7 +1100,10 @@ impl<Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> CheckedCalls<'
             NestedIntegerArgument::Pair(first, second) => ActualProjectedArguments::ExactPair(first, second),
             NestedIntegerArgument::Projected(projection) => ActualProjectedArguments::SymbolicAxis(projection),
         };
-        self.run(&caller.structure, call, signature, projected, source, *declaration_span, expected, collection)
+        self.run(
+            &caller.structure, call, signature, projected, source, *declaration_span, expected, collection,
+            #[cfg(feature = "internal-checker")] None,
+        )
     }
 
     fn requirements(
@@ -1133,6 +1173,7 @@ impl<Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> CheckedCalls<'
         target_span: ByteSpan,
         expected: &ScalarType,
         collection: Option<(&SourceIdentity, OrderedCallCollection<'_, '_>)>,
+        #[cfg(feature = "internal-checker")] proof_site: Option<InitializerProofSite<'_>>,
     ) -> Result<ActualCallResult, ProjectCheck> {
         let &(target_module, target_item) = structure.checker_direct_targets.get(&call)
             .ok_or(ProjectCheck::MissingRootOccurrences)?;
@@ -1259,6 +1300,12 @@ impl<Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> CheckedCalls<'
         if ACTUAL_STARTUP && Observer::ENABLED {
             if let Ok(ActualCallResult::Integer(value)) = &result {
                 self.observer.observe(target, exact, value);
+            }
+        }
+        #[cfg(feature = "internal-checker")]
+        if ACTUAL_STARTUP && Observer::CONTEXTUAL {
+            if let Ok(ActualCallResult::Integer(value)) = &result {
+                self.observer.observe_initializer(target, proof_site, &signature.parameters, exact, value);
             }
         }
         if ACTUAL_STARTUP && result.is_ok() {
@@ -1850,6 +1897,141 @@ fn prepare_loaded_proof_project(
     }
     let root = initialization_order.first().cloned().ok_or(ProjectCheck::MissingRoot)?;
     PreparedProofModule::prepare_declarations(root, declarations, catalogs, initialization_order, inputs)
+}
+
+#[cfg(feature = "internal-checker")]
+#[cfg_attr(not(test), allow(dead_code))]
+struct MainFlowProofReceipt {
+    active: bool,
+    directives: Vec<ScalarOrderedCheckerFailure>,
+    diagnostics: Vec<MainFlowProofDiagnostic>,
+}
+
+#[cfg(feature = "internal-checker")]
+#[cfg_attr(not(test), allow(dead_code))]
+struct MainFlowProofDiagnostic {
+    proof: wosy_syntax::SourceSpan,
+    goal: wosy_syntax::SourceSpan,
+    call: wosy_syntax::SourceSpan,
+    directive_position: usize,
+    arguments: Vec<(ScalarType, BigInt)>,
+    returned: BigInt,
+}
+
+#[cfg(feature = "internal-checker")]
+struct MainFlowProofObserver<'a> {
+    target: (usize, usize),
+    proof_source: &'a SourceIdentity,
+    proof: ByteSpan,
+    goal: ByteSpan,
+    guard: CheckedIntegerGuardSlots<'a>,
+    relation: IntegerRelation,
+    bound: &'a BigInt,
+    seen: bool,
+    active: bool,
+    incomplete: bool,
+    diagnostics: Vec<MainFlowProofDiagnostic>,
+}
+
+#[cfg(feature = "internal-checker")]
+impl ActualIntegerObserver for MainFlowProofObserver<'_> {
+    const ENABLED: bool = false;
+    const CONTEXTUAL: bool = true;
+
+    fn observe(&mut self, _: (usize, usize), _: &[&BigInt], _: &BigInt) {}
+
+    fn observe_initializer(
+        &mut self, target: (usize, usize), site: Option<InitializerProofSite<'_>>,
+        parameters: &[ScalarType], arguments: &[&BigInt], value: &BigInt,
+    ) {
+        if target != self.target {
+            return;
+        }
+        let Some(site) = site else {
+            self.incomplete = true;
+            return;
+        };
+        if arguments.len() != self.guard.arity || arguments.len() != parameters.len() {
+            self.incomplete = true;
+            return;
+        }
+        self.seen = true;
+        if !self.guard.accepts(arguments) {
+            return;
+        }
+        self.active = true;
+        if self.relation.accepts(value.cmp(self.bound)) {
+            return;
+        }
+        self.diagnostics.push(MainFlowProofDiagnostic {
+            proof: wosy_syntax::SourceSpan { source: self.proof_source.clone(), range: self.proof },
+            goal: wosy_syntax::SourceSpan { source: self.proof_source.clone(), range: self.goal },
+            call: wosy_syntax::SourceSpan { source: site.source.clone(), range: site.span },
+            directive_position: site.directive_position,
+            arguments: parameters.iter().cloned().zip(arguments.iter().map(|value| (**value).clone())).collect(),
+            returned: value.clone(),
+        });
+    }
+}
+
+#[cfg(feature = "internal-checker")]
+#[cfg_attr(not(test), allow(dead_code))]
+fn check_loaded_main_flow_proof_diagnostics(
+    declarations: Vec<(ScalarSourceDeclarations, Vec<ScalarNamespaceBinding>)>,
+    proofs: Vec<(ScalarProofDeclarations, Vec<ScalarNamespaceBinding>)>,
+    initialization_order: Vec<SourceIdentity>,
+    inputs: ScalarPreparationInputs,
+) -> Result<MainFlowProofReceipt, ProjectCheck> {
+    if proofs.is_empty() {
+        let (prepared, startup_count) = prepare_checked_package_scope(
+            declarations, initialization_order, Vec::new(), inputs, ScalarCheckerScope::MainFlowOnly,
+        )?;
+        let (active, directives) = collect_ordered_checker_records(&prepared, ScalarCheckerScope::MainFlowOnly, startup_count)?;
+        return Ok(MainFlowProofReceipt { active, directives, diagnostics: Vec::new() });
+    }
+    let prepared = prepare_loaded_proof_project(declarations, proofs, initialization_order, inputs)?;
+    let mut definitions = prepared.proofs.iter().flat_map(|(source, catalog)| {
+        catalog.definitions.iter().enumerate().map(move |(index, node)| (source, catalog.first_query + index, node))
+    });
+    let Some((proof_source, query, definition)) = definitions.next() else {
+        let startup_count = prepared.prepared.parts().0.modules.len();
+        let (active, directives) = collect_ordered_checker_records(
+            &prepared.prepared, ScalarCheckerScope::MainFlowOnly, startup_count,
+        )?;
+        return Ok(MainFlowProofReceipt { active, directives, diagnostics: Vec::new() });
+    };
+    if definitions.next().is_some() || proof_source != &prepared.source {
+        return Err(ProjectCheck::Unsupported);
+    }
+    let selected = prepared.resolve_selected_proof(definition, query)?;
+    let name = module_proof_name(definition).ok_or(ProjectCheck::InvalidProof)?;
+    let plan = prepared.plan_resolved_module_proof::<false, false, false>(proof_source, name.text(), selected)?;
+    let TypedProofGoal::Literal { relation, bound, .. } = &plan.typed.goal else {
+        return Err(ProjectCheck::Unsupported);
+    };
+    if !plan.steps.items.is_empty() || plan.typed.target.source != prepared.source {
+        return Err(ProjectCheck::Unsupported);
+    }
+    let guard = checked_integer_guard_slots::<false>(plan.typed.body, plan.filter.as_deref().unwrap_or_default())
+        .ok_or(ProjectCheck::Unsupported)?;
+    let goal = child(&child(definition, SyntaxKind::ProofEnsures)?, SyntaxKind::Expression)?;
+    let observer = MainFlowProofObserver {
+        target: plan.target, proof_source, proof: wosy_syntax::byte_span(definition),
+        goal: wosy_syntax::byte_span(&goal), guard, relation: *relation, bound,
+        seen: false, active: false, incomplete: false, diagnostics: Vec::new(),
+    };
+    let (root, ordinals) = package_initialization_order(prepared.prepared.parts().0)?;
+    let mut effects = OrderedFailures::default();
+    let (initialization, observer) = check_package_initialization_observing_with_policy::<_, true>(
+        &prepared.prepared, root, ordinals, observer, Some(&mut effects),
+    )?;
+    if observer.incomplete || (initialization.reached.contains(&plan.target) && !observer.seen) {
+        return Err(ProjectCheck::Unsupported);
+    }
+    Ok(MainFlowProofReceipt {
+        active: initialization.had_obligations || observer.active,
+        directives: effects.records, diagnostics: observer.diagnostics,
+    })
 }
 
 #[cfg(feature = "internal-checker")]
@@ -6092,6 +6274,98 @@ mod tests {
         assert_eq!(collect_ordered_package_failures(&actual, ScalarCheckerScope::MainFlowOnly, 1), Err(ProjectCheck::Unsupported));
         let (_, different_axis) = prepare("x < 2 || y > 6", "");
         assert_eq!(collect_ordered_package_failures(&different_axis, ScalarCheckerScope::CurrentPackage, 1), Err(ProjectCheck::Unsupported));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordered_main_flow_auto_proof_diagnostics_use_exact_call_sites_without_authored_effects() {
+        let app = source("src/main.w", "ordered-automatic-proof");
+        let run = |text: &str| {
+            let (_, proof) = crate::parse_proof_source(app.clone(), text.to_owned(), &[])
+                .unwrap_or_else(|_| panic!("valid proof source"));
+            check_loaded_main_flow_proof_diagnostics(
+                Vec::new(), vec![(proof, Vec::new())], vec![app.clone()], inputs(),
+            )
+        };
+        let authored = format!(r#"%%start
+            i8(i8) identity = fn(value) {{ value }};
+            proof bound for identity(entry) -> (out) where (entry >= 6) ensures (out <= 7) {{}}
+            core.require(false, {OUTPUT});
+            i8 excluded = identity(4);
+            i8 proved = identity(6);
+            i8 first = identity(8);
+            i8 second = identity(8);
+            core.require(false, {OUTPUT});
+        %%end"#);
+        let receipt = run(&authored).unwrap();
+        assert!(receipt.active);
+        assert_eq!(receipt.directives.len(), 2);
+        assert_eq!(receipt.diagnostics.len(), 2);
+        let snippet = |span: ByteSpan| &authored[span.start as usize..span.end as usize];
+        let [first, second] = receipt.diagnostics.as_slice() else { unreachable!(); };
+        for diagnostic in [first, second] {
+            assert_eq!(diagnostic.proof.source, app);
+            assert_eq!(diagnostic.goal.source, app);
+            assert_eq!(diagnostic.call.source, app);
+            assert!(snippet(diagnostic.proof.range).starts_with("proof bound"));
+            assert_eq!(snippet(diagnostic.goal.range), "out <= 7");
+            assert_eq!(snippet(diagnostic.call.range), "identity(8)");
+            assert_eq!(diagnostic.directive_position, 1);
+            assert_eq!(diagnostic.arguments, [(ScalarType::I8, BigInt::from(8))]);
+            assert_eq!(diagnostic.returned, BigInt::from(8));
+        }
+        assert!(receipt.directives[0].directive.start < first.call.range.start);
+        assert!(first.call.range.start < second.call.range.start);
+        assert!(second.call.range.start < receipt.directives[1].directive.start);
+        let ordinary = prepare_checker_project(
+            vec![(declarations(&app, &authored), Vec::new())], vec![app.clone()], inputs(),
+        ).unwrap();
+        let (active, effects) = collect_ordered_checker_records(&ordinary, ScalarCheckerScope::MainFlowOnly, 1).unwrap();
+        assert!(active);
+        assert_eq!(effects, receipt.directives);
+        let proof_only = |call: &str| format!(r#"%%start
+            i8(i8) identity = fn(value) {{ value }};
+            proof bound for identity(entry) -> (out) where (entry >= 6) ensures (out <= 7) {{}}
+            i8 result = identity({call});
+        %%end"#);
+        let refuted = run(&proof_only("8")).unwrap();
+        assert!(refuted.active && refuted.directives.is_empty() && refuted.diagnostics.len() == 1);
+        let excluded = run(&proof_only("4")).unwrap();
+        assert!(!excluded.active && excluded.directives.is_empty() && excluded.diagnostics.is_empty());
+        let incomplete = proof_only("8").replace("ensures (out <= 7) {}", "ensures (out <= 7) { core.show(out <= 7); }");
+        assert!(matches!(run(&incomplete), Err(ProjectCheck::Unsupported)));
+        let mixed = proof_only("8").replace("%%end", &format!(r#"
+            unit(i8) wrapper = fn(arg) {{
+                i8 inside = identity(arg);
+                core.require(inside == 8, {OUTPUT});
+            }};
+            wrapper(8);
+            %%end"#));
+        assert!(matches!(run(&mixed), Err(ProjectCheck::Unsupported)));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordered_main_flow_auto_proof_does_not_cover_an_unlocated_nested_call_with_a_direct_call() {
+        let app = source("src/main.w", "ordered-automatic-proof-mixed-context");
+        let span = ByteSpan::new(1, 2);
+        let bound = BigInt::from(7);
+        let value = BigInt::from(8);
+        let mut observer = MainFlowProofObserver {
+            target: (0, 0), proof_source: &app, proof: span, goal: span,
+            guard: CheckedIntegerGuardSlots { arity: 1, always_rejects: false, comparisons: Vec::new(), domain: None },
+            relation: IntegerRelation::from_operator(&BinaryOperator::LessEqual).unwrap(), bound: &bound,
+            seen: false, active: false, incomplete: false, diagnostics: Vec::new(),
+        };
+        observer.observe_initializer(
+            (0, 0), Some(InitializerProofSite { source: &app, span, directive_position: 0 }),
+            &[ScalarType::I8], &[&value], &value,
+        );
+        assert!(observer.seen && !observer.incomplete && observer.diagnostics.len() == 1);
+        observer.observe_initializer((0, 1), None, &[ScalarType::I8], &[&value], &value);
+        assert!(!observer.incomplete);
+        observer.observe_initializer((0, 0), None, &[ScalarType::I8], &[&value], &value);
+        assert!(observer.seen && observer.incomplete && observer.diagnostics.len() == 1);
     }
 
     #[cfg(feature = "internal-checker")]
