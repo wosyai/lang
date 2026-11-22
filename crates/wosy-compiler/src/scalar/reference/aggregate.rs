@@ -168,6 +168,7 @@ impl ArrayWriterSide {
 pub(super) struct LiteralArrayUnit {
     pub(super) expression: OccurrenceOrdinal,
     pub(super) condition: CfgPointId,
+    pub(super) operands: Option<[CfgPointId; 2]>,
     pub(super) branch: CfgPointId,
     pub(super) writer_side: ArrayWriterSide,
     pub(super) writer_entry: CfgPointId,
@@ -189,6 +190,8 @@ enum LiteralArrayPhase {
     Moved(CfgPointId),
     Output(OccurrenceOrdinal),
     ProducerExit(OccurrenceOrdinal),
+    ConditionRead,
+    ConditionLiteral,
     Condition,
     Forked(CfgPointId),
     WriterOriginal,
@@ -800,8 +803,20 @@ impl AggregateFlowFacts {
                 (BeforeBind, CfgPointKind::Evaluate(_)) if point.id == allocation.placeholder => BeforeBind,
                 (BeforeBind, CfgPointKind::Bind { binding: actual })
                     if point.id == allocation.bind && actual == binding => Original,
-                (Original, CfgPointKind::Evaluate(_) | CfgPointKind::Read { .. })
+                (Original, CfgPointKind::Read { .. }) if root && unit.is_some_and(|unit|
+                    unit.operands.is_some_and(|[read, literal]|
+                        read == point.id && point.successors.as_slice() == [literal])) => ConditionRead,
+                (ConditionRead, CfgPointKind::Evaluate(ScalarExpression::Integer { .. }))
+                    if root && unit.is_some_and(|unit| unit.operands.is_some_and(|[_, literal]|
+                        literal == point.id && point.successors.as_slice() == [unit.condition])) =>
+                    ConditionLiteral,
+                (ConditionLiteral, CfgPointKind::Evaluate(ScalarExpression::Binary {
+                    operator: BinaryOperator::Equal, .. }))
                     if root && unit.is_some_and(|unit| unit.condition == point.id
+                        && point.successors.as_slice() == [unit.branch]) => Condition,
+                (Original, CfgPointKind::Evaluate(ScalarExpression::Boolean { .. }) | CfgPointKind::Read { .. })
+                    if root && unit.is_some_and(|unit| unit.operands.is_none()
+                        && unit.condition == point.id
                         && point.successors.as_slice() == [unit.branch]) => Condition,
                 (Condition, CfgPointKind::Branch { .. })
                     if root && unit.is_some_and(|unit| unit.branch == point.id
@@ -3334,7 +3349,7 @@ mod tests {
             argument: Some(LiteralArrayArgument { read: CfgPointId(12), occurrence: OccurrenceOrdinal(12) }),
         };
         let unit = LiteralArrayUnit {
-            expression: OccurrenceOrdinal(4), condition: CfgPointId(4), branch: CfgPointId(5),
+            expression: OccurrenceOrdinal(4), condition: CfgPointId(4), operands: None, branch: CfgPointId(5),
             writer_side: ArrayWriterSide::Then, writer_entry: CfgPointId(6), writer_exit: CfgPointId(10),
             writer_block: BlockOrdinal(1), writer_scope: ReferenceScopeId(1),
             retained: Some(LiteralArrayRetained {
@@ -3382,7 +3397,7 @@ mod tests {
             place: ScalarPlace::Name { name: String::new(), span },
         };
         let unit = LiteralArrayUnit {
-            expression: OccurrenceOrdinal(4), condition: CfgPointId(4), branch: CfgPointId(5),
+            expression: OccurrenceOrdinal(4), condition: CfgPointId(4), operands: None, branch: CfgPointId(5),
             writer_side: ArrayWriterSide::Then, writer_entry: CfgPointId(6), writer_exit: CfgPointId(9), writer_block: BlockOrdinal(1),
             writer_scope: ReferenceScopeId(1), retained: None, other_write: None, join: CfgPointId(10),
         };
@@ -3462,6 +3477,39 @@ mod tests {
         })));
         assert_eq!(caller.scope_exits, BTreeMap::from([(0, CfgPointId(11))]));
         assert!(caller.releases.is_empty() && caller.input_release.is_none());
+
+        // Exercise the same visitor with the two exact operand points.
+        let mut formal = binding.clone();
+        formal.declaration_span = ByteSpan::new(1, 2);
+        let integer = ScalarExpression::Integer { value: 0.into(), span };
+        let comparison = ScalarExpression::Binary {
+            operator: BinaryOperator::Equal,
+            left: Box::new(ScalarExpression::Name { name: String::new(), span }),
+            right: Box::new(integer.clone()),
+            span,
+        };
+        let mut compared = points.to_vec();
+        compared[3].successors = vec![CfgPointId(12)];
+        compared[4].kind = CfgPointKind::Evaluate(comparison.clone());
+        compared[5].kind = CfgPointKind::Branch { condition: comparison };
+        compared.push(point(12, 0, CfgPointKind::Read { binding: formal }, &[13]));
+        compared.push(point(13, 0, CfgPointKind::Evaluate(integer), &[4]));
+        facts.literal_array_unit = Some(LiteralArrayUnit {
+            operands: Some([CfgPointId(12), CfgPointId(13)]),
+            ..unit
+        });
+        let check_comparison = |points: &[ReferenceFlowPoint]| {
+            let mut observed = AggregateFlowResult::default();
+            observe(&facts, points, &[0, 1, 2, 3, 12, 13, 4, 5, 6, 7, 8, 9, 10, 11], &mut observed);
+            observe(&facts, points, &[0, 1, 2, 3, 12, 13, 4, 5, 10, 11], &mut observed);
+            observed.proved_literal_array_route().is_some()
+        };
+        assert!(check_comparison(&compared));
+        let CfgPointKind::Evaluate(ScalarExpression::Binary { operator, .. }) = &mut compared[4].kind
+        else { unreachable!() };
+        *operator = BinaryOperator::Add;
+        assert!(!check_comparison(&compared));
+        facts.literal_array_unit = Some(unit);
 
         let mut different_binding = points.clone();
         let CfgPointKind::Assign { target, .. } = &mut different_binding[8].kind else { unreachable!() };
@@ -3676,6 +3724,7 @@ mod tests {
         let unit = LiteralArrayUnit {
             expression: OccurrenceOrdinal(4),
             condition: CfgPointId(3),
+            operands: None,
             branch: CfgPointId(4),
             writer_side: ArrayWriterSide::Then,
             writer_entry: CfgPointId(5),

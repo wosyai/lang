@@ -946,8 +946,9 @@ impl<'a> ReferenceFlowBuilder<'a> {
         projected_origins: bool,
         checked_result: bool,
         array_return: bool,
-        literal_unit: Option<(OccurrenceOrdinal, aggregate::ArrayWriterSide)>,
+        literal_unit: Option<(OccurrenceOrdinal, aggregate::ArrayWriterSide, Option<ReferenceBindingId>)>,
     ) -> Result<ReferenceValue, ReferenceAnalysisError> {
+        let condition_predecessor = self.cursor;
         let ([then_arm, else_arm], condition_point, branch) = self.conditional_branches(
             condition,
             then_branch,
@@ -1009,7 +1010,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
         }
         self.cfg.points[then_arm.end.0].successors.push(join);
         self.cfg.points[else_arm.end.0].successors.push(join);
-        if let (Some((expression, writer_side)), Some(condition), [then_entry, else_entry]) =
+        if let (Some((expression, writer_side, formal)), Some(condition), [then_entry, else_entry]) =
             (literal_unit, condition_point, self.cfg.points[branch.0].successors.as_slice())
         {
             let (writer_entry, retained_entry) = writer_side.split(*then_entry, *else_entry);
@@ -1029,11 +1030,25 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 }
                 _ => None,
             };
-            if let Some((writer_block, retained)) = edges {
+            // Follow at most two operand edges in the CFG built by the normal
+            // expression visitor, not a second expression or effects walk.
+            let operands = match formal {
+                None => Some(None),
+                Some(formal) => condition_predecessor.and_then(|preceding| {
+                    let [read] = self.cfg.points[preceding.0].successors.as_slice() else { return None };
+                    let [literal] = self.cfg.points[read.0].successors.as_slice() else { return None };
+                    (matches!(&self.cfg.points[read.0].kind, CfgPointKind::Read { binding } if binding == &formal)
+                        && matches!(&self.cfg.points[literal.0].kind,
+                            CfgPointKind::Evaluate(ScalarExpression::Integer { .. }))
+                        && self.cfg.points[literal.0].successors.as_slice() == [condition])
+                        .then_some(Some([*read, *literal]))
+                }),
+            };
+            if let (Some((writer_block, retained)), Some(operands)) = (edges, operands) {
                 let other_write = self.aggregate_facts.literal_array_other_write;
                 if self.aggregate_facts.literal_array_other_writer.is_some() == other_write.is_some() {
                     self.aggregate_facts.literal_array_unit = Some(aggregate::LiteralArrayUnit {
-                        expression, condition, branch, writer_side, writer_entry, writer_exit,
+                        expression, condition, operands, branch, writer_side, writer_entry, writer_exit,
                         writer_block, retained, other_write,
                         writer_scope: self.cfg.points[writer_entry.0].scope, join,
                     });
@@ -1285,7 +1300,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
         then_branch: &ScalarBlock,
         else_branch: Option<&ScalarBlock>,
         region: &ConditionalRegion,
-    ) -> Option<(OccurrenceOrdinal, aggregate::ArrayWriterSide)> {
+    ) -> Option<(OccurrenceOrdinal, aggregate::ArrayWriterSide, Option<ReferenceBindingId>)> {
         let calls = self.call_sites;
         if scope != ReferenceScopeId(0) || self.aggregate_facts.literal_array_bind.is_none()
             || !calls.boundary.root_outputs.is_empty()
@@ -1307,19 +1322,38 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 (*condition, *then_block, Then),
             _ => return None,
         };
-        if !matches!(calls.structure.checked_types.expressions.get(&condition_ordinal), Some(ScalarType::Bool))
-            || !(matches!(condition, ScalarExpression::Boolean { .. })
-                || self.literal_array_formal_binding(condition_ordinal, &ScalarType::Bool).is_some())
-        {
+        let types = &calls.structure.checked_types.expressions;
+        if types.get(&condition_ordinal) != Some(&ScalarType::Bool) {
             return None;
         }
+        let comparison_formal = match condition {
+            ScalarExpression::Boolean { .. } => None,
+            ScalarExpression::Name { .. } => {
+                self.literal_array_formal_binding(condition_ordinal, &ScalarType::Bool)?;
+                None
+            }
+            ScalarExpression::Binary { operator: BinaryOperator::Equal, left, right, .. }
+                if matches!(left.as_ref(), ScalarExpression::Name { .. }) =>
+            {
+                let ScalarExpression::Integer { value, .. } = right.as_ref() else { return None };
+                u64::try_from(value.clone()).ok()?;
+                let parent = OccurrenceParent::Expression(condition_ordinal);
+                let left = self.expression_ordinal(parent, OccurrenceEdge::BinaryLeft);
+                let right = self.expression_ordinal(parent, OccurrenceEdge::BinaryRight);
+                if types.get(&right) != Some(&ScalarType::U64) {
+                    return None;
+                }
+                Some(self.literal_array_formal_binding(left, &ScalarType::U64)?.clone())
+            }
+            _ => return None,
+        };
         self.aggregate_facts.literal_array_writer = Some(writer);
         if let (ConditionalRegion::Value { else_block, .. }, 1, Some(1)) =
             (region, then_branch.items.len(), else_branch.map(|block| block.items.len()))
         {
             self.aggregate_facts.literal_array_other_writer = Some(*else_block);
         }
-        Some((ordinal, side))
+        Some((ordinal, side, comparison_formal))
     }
 
     fn evaluate_expression(
