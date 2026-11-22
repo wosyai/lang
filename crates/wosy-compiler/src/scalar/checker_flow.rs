@@ -424,6 +424,17 @@ impl IntegerReturningPath<'_> {
         }
     }
 
+    #[cfg(feature = "internal-checker")]
+    pub(super) fn output_within(&self, allowed: &IntegerSet) -> Option<bool> {
+        match self.value {
+            IntegerReturn::Alias(binding) => {
+                let axis = self.axes.iter().position(|known| *known == binding)?;
+                Some(self.state.0.iter().all(|row| row[axis].is_subset_of(allowed)))
+            }
+            IntegerReturn::Const(value) => Some(allowed.contains(value)),
+        }
+    }
+
     fn shows(self, proof: &IntegerShowProof<'_>) -> Option<bool> {
         let (guard, then_claim, else_claim) = match proof {
             IntegerShowProof::Equality(claim) => return shows_return_equality(&self.state, &self.axes, &self.value, claim),

@@ -1513,6 +1513,65 @@ fn named_proof_output_conjunction_checks_every_atom_on_shared_return_paths() {
 }
 
 #[test]
+fn named_proof_output_disjunction_checks_the_exact_union_on_every_return() {
+    let identity = source();
+    let check = |goal: &str, guard: &str, actual: &str, steps: &str, alias: &str| {
+        check_scalar_module_proof(
+            identity.clone(),
+            "bounded",
+            vec![ScalarProofModuleInput {
+                source: identity.clone(),
+                text: format!(r#"%%start
+                    i16(i16) echo = fn(value) {{ value }};
+                    proof bounded for echo(input) -> ({alias}) where ({guard}) ensures ({goal}) {{ {steps} }}
+                    {actual}
+                %%end"#),
+                namespaces: Vec::new(),
+            }],
+            vec![identity.clone()], ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
+        )
+    };
+    let split = "out < 0 || out > 0";
+    assert_eq!(check(split, "input != 0", "", "", "out"), ScalarModuleProofOutcome::Proved);
+    assert_eq!(check(split, "input >= -3 && input <= 3", "", "", "out"), ScalarModuleProofOutcome::Refuted);
+    assert_eq!(check(split, "false", "", "", "out"), ScalarModuleProofOutcome::NoApplicableInputs);
+    assert_eq!(check(split, "true", "i16 a = echo(-32768); i16 b = echo(32767);", "", "out"), ScalarModuleProofOutcome::Proved);
+    assert_eq!(check(split, "true", "i16 a = echo(-32768); i16 b = echo(0); i16 c = echo(32767);", "", "out"), ScalarModuleProofOutcome::Refuted);
+    assert_eq!(check("out <= -1 || out >= 0", "true", "", "", "out"), ScalarModuleProofOutcome::Proved);
+    assert_eq!(check("out <= 2 || out >= -2", "true", "", "", "out"), ScalarModuleProofOutcome::Proved);
+    assert_eq!(check("out <= -3 || out >= 3", "input <= -2", "", "", "out"), ScalarModuleProofOutcome::Refuted);
+    assert!(matches!(check("out >= -32768 || out <= 32768", "true", "", "", "out"), ScalarModuleProofOutcome::Invalid(_)));
+    assert!(matches!(check("null < 0 || null > 0", "true", "", "", "null"), ScalarModuleProofOutcome::Invalid(_)));
+    assert_eq!(check("out < 0 || input > 0", "true", "", "", "out"), ScalarModuleProofOutcome::Unsupported);
+    assert_eq!(check("out < 0 || true", "true", "", "", "out"), ScalarModuleProofOutcome::Unsupported);
+    assert_eq!(check(split, "input == 7", "", "core.show(out == 0);", "out"), ScalarModuleProofOutcome::Unsupported);
+}
+
+#[test]
+fn named_proof_output_disjunction_does_not_issue_bound_authority() {
+    let identity = source();
+    let text = format!(r#"%%start
+        u8(u8) producer = fn(value) {{ value }};
+        unit() caller = fn {{
+            u8 answer = producer(7);
+            core.require(answer <= 7, {OUTPUT});
+        }};
+        proof bounded for producer(input) -> (out) where (input <= 7) ensures (out == 7 || out < 7) {{}}
+    %%end"#);
+    assert_eq!(check_scalar_module_proof(
+        identity.clone(), "bounded",
+        vec![ScalarProofModuleInput { source: identity.clone(), text: text.clone(), namespaces: Vec::new() }],
+        vec![identity.clone()], ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
+    ), ScalarModuleProofOutcome::Proved);
+    let (_, catalog) = wosy_compiler::parse_proof_source(identity.clone(), text, &[])
+        .ok().expect("canonical proof source");
+    assert_eq!(check_loaded_scalar_module_proof_call(
+        (&identity, "bounded"), (&identity, "caller"), Vec::new(), (catalog, Vec::new()),
+        vec![identity.clone()], ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
+    ), ScalarProofCallOutcome::Unavailable);
+}
+
+#[test]
 fn verified_output_conjunction_does_not_issue_a_reusable_bound() {
     let identity = source();
     let text = format!(r#"%%start

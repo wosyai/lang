@@ -2183,7 +2183,7 @@ impl PreparedProofModule {
                 if let Some(observer) = observer {
                     outcomes[*index] = module_proof_outcome(observer.outcome());
                 }
-            } else if !matches!(plan.typed.goal, TypedProofGoal::Literal { .. } | TypedProofGoal::Conjunction(_) | TypedProofGoal::Universal { .. } | TypedProofGoal::Existential { .. }) {
+            } else if !matches!(plan.typed.goal, TypedProofGoal::Literal { .. } | TypedProofGoal::Conjunction(_) | TypedProofGoal::Disjunction(_) | TypedProofGoal::Universal { .. } | TypedProofGoal::Existential { .. }) {
                 continue;
             } else if plan.uses_direct_goal() {
                 let key = (plan.target, ExactGuardGroup(plan.filter.as_deref()));
@@ -2385,6 +2385,7 @@ impl SelectedProofObserver<'_> {
                     Some(relation.accepts(value.cmp(bound))),
                 TypedProofGoal::Existential { relation, witness, witness_in_domain } =>
                     (*witness_in_domain && relation.accepts(value.cmp(witness))).then_some(true),
+                TypedProofGoal::Disjunction(allowed) => Some(allowed.contains(value)),
                 TypedProofGoal::Conjunction(atoms) => Some(atoms.iter().all(|(relation, bound)| relation.accepts(value.cmp(bound)))),
                 TypedProofGoal::EntryEqual { slot } => arguments.get(*slot).map(|entry| *entry == value),
             };
@@ -2533,6 +2534,7 @@ enum TypedProofGoal {
         bound: BigInt,
     },
     Conjunction(Vec<(IntegerRelation, BigInt)>),
+    Disjunction(IntegerSet),
     Universal { relation: IntegerRelation, bound: BigInt },
     Existential { relation: IntegerRelation, witness: BigInt, witness_in_domain: bool },
     EntryEqual { slot: usize },
@@ -2547,6 +2549,7 @@ impl TypedProofGoal {
             Self::Existential { relation, witness, witness_in_domain } => {
                 if *witness_in_domain && path.output_satisfies(*relation, witness)? { Some(true) } else { None }
             }
+            Self::Disjunction(allowed) => path.output_within(allowed),
             Self::Conjunction(atoms) => {
                 for (relation, bound) in atoms {
                     if !path.output_satisfies(*relation, bound)? {
@@ -3077,6 +3080,21 @@ fn typed_proof_postcondition<'a, const AUDIT_INDUCTION: bool>(
                 return Err(ProjectCheck::Unsupported);
             }
             typed_universal_output_goal(&forall, &ensures, output, &input_names, &result.ty)?
+        } else if let ScalarExpression::Binary { operator: BinaryOperator::Or, left, right, .. } = &ensures {
+            if is_null_literal_name(output) {
+                return Err(ProjectCheck::InvalidProof);
+            }
+            let normalized = |expression: &ScalarExpression| {
+                let comparison = IntegerComparison::from_expression(expression).ok_or(ProjectCheck::Unsupported)?;
+                let (_, relation, bound) = checked_literal_output_goal(comparison, output, &input_names, &result.ty)?;
+                Ok::<_, ProjectCheck>((relation, bound))
+            };
+            let (left_relation, left_bound) = normalized(left.as_ref())?;
+            let (right_relation, right_bound) = normalized(right.as_ref())?;
+            let domain = IntegerSet::from_type(&result.ty).ok_or(ProjectCheck::Unsupported)?;
+            let allowed = domain.keep_relation(left_relation, &left_bound)
+                .join(domain.keep_relation(right_relation, &right_bound));
+            TypedProofGoal::Disjunction(allowed)
         } else if matches!(&ensures, ScalarExpression::Binary { operator: BinaryOperator::And, .. }) {
             let mut pending = vec![&ensures];
             let mut atoms = Vec::new();

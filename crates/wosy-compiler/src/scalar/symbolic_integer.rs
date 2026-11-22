@@ -88,6 +88,17 @@ impl IntegerSet {
         self.0.is_empty()
     }
 
+    #[cfg(feature = "internal-checker")]
+    pub(super) fn is_subset_of(&self, allowed: &Self) -> bool {
+        let mut enclosing = allowed.0.iter().peekable();
+        self.0.iter().all(|range| {
+            while enclosing.peek().is_some_and(|allowed| allowed.last < range.first) {
+                enclosing.next();
+            }
+            enclosing.peek().is_some_and(|allowed| allowed.first <= range.first && allowed.last >= range.last)
+        })
+    }
+
     pub(super) fn every(&self, relation: IntegerRelation, bound: &BigInt) -> bool {
         self.0.iter().all(|interval| {
             (relation.less || &interval.first >= bound)
