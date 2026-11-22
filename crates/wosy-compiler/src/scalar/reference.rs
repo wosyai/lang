@@ -3269,7 +3269,9 @@ impl<'a> ReferenceFlowBuilder<'a> {
         initializer: Option<CfgPointId>,
     ) {
         if scope != ReferenceScopeId(0) || position.item != 0
-            || !self.call_sites.boundary.parameters.is_empty()
+            || !matches!(self.call_sites.boundary.parameters.as_slice(),
+                [] | [ParameterSlot { ordinal: 0, .. }])
+            || !self.call_sites.boundary.parameters.iter().all(|parameter| aggregate::ordinary_value(&parameter.ty))
             || !matches!(self.call_sites.named_place_roots, NamedPlaceRootFacts::Prepared(_))
         {
             return;
@@ -3299,6 +3301,39 @@ impl<'a> ReferenceFlowBuilder<'a> {
             length_occurrence: length.expression,
             elements,
         });
+    }
+
+    /// A scalar operand enters the private route only as the sole checked
+    /// CallArgument(0) occurrence and exact read of its caller formal.
+    fn literal_array_argument(
+        &self,
+        producer: OccurrenceOrdinal,
+        rhs: CfgPointId,
+    ) -> Option<Option<CfgPointId>> {
+        let CfgPointKind::Call { output: 0, argument_points, .. } = &self.cfg.points.get(rhs.0)?.kind
+        else { return None };
+        match (self.call_sites.boundary.parameters.as_slice(), argument_points.as_slice()) {
+            ([], []) => Some(None),
+            ([formal], [read]) if formal.ordinal == 0 && aggregate::ordinary_value(&formal.ty) => {
+                let structure = &self.call_sites.structure;
+                let OccurrenceNode::Expression(argument) = structure.edges.get(&(
+                    OccurrenceParent::Expression(producer), OccurrenceEdge::CallArgument(0),
+                ))? else { return None };
+                let point = self.cfg.points.get(read.0)?;
+                let CfgPointKind::Read { binding } = &point.kind else { return None };
+                let span = self.call_sites.occurrences.get(argument.0)?.span;
+                let PlainNameIdentity::Lexical(argument_binding) =
+                    self.prepared_name_identity(*argument, span).ok().flatten()?
+                else { return None };
+                let formal_binding = parameter_binding_identity(
+                    &self.source, self.function_span, structure.blocks[structure.root.0].span, formal,
+                );
+                (binding == &formal_binding && argument_binding == binding
+                    && structure.checked_types.expressions.get(argument) == Some(&formal.ty))
+                    .then_some(Some(*read))
+            }
+            _ => None,
+        }
     }
 
     fn record_frozen_install(&mut self, destination: OccurrenceOrdinal, rhs: CfgPointId) {
@@ -3929,12 +3964,15 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             && matches!(output_types[position], ScalarType::RuntimeArray { .. })
                         {
                             if let Some(evaluation) = group.rhs_evaluations().next() {
-                                self.aggregate_facts.literal_array_write = Some(aggregate::LiteralArrayWrite {
-                                    rhs: rhs_point,
-                                    writer: install,
-                                    producer: evaluation.expression,
-                                    destination: slot.destination,
-                                });
+                                if let Some(argument_read) = self.literal_array_argument(evaluation.expression, rhs_point) {
+                                    self.aggregate_facts.literal_array_write = Some(aggregate::LiteralArrayWrite {
+                                        rhs: rhs_point,
+                                        writer: install,
+                                        producer: evaluation.expression,
+                                        destination: slot.destination,
+                                        argument_read,
+                                    });
+                                }
                             }
                         }
                         if let Some(capture) = capture.filter(|_| {
@@ -10591,6 +10629,21 @@ fn derive_function_reference_cfg(
     (cfg, errors)
 }
 
+fn parameter_binding_identity(
+    source: &SourceIdentity,
+    function_span: ByteSpan,
+    block_span: ByteSpan,
+    parameter: &ParameterSlot,
+) -> ReferenceBindingId {
+    ReferenceBindingId {
+        source: source.clone(),
+        function_span,
+        declaration_span: parameter.span,
+        block_span,
+        kind: ReferenceBindingKind::Declared,
+    }
+}
+
 fn build_function_reference_cfg(
     mut builder: ReferenceFlowBuilder<'_>,
     function: &ScalarFunction,
@@ -10612,13 +10665,7 @@ fn build_function_reference_cfg(
     for slot in &call_sites.boundary.parameters {
         builder.names.insert(
             slot.name.clone(),
-            ReferenceBindingId {
-                source: builder.source.clone(),
-                function_span: function.span,
-                declaration_span: slot.span,
-                block_span: function.body.span,
-                kind: ReferenceBindingKind::Declared,
-            },
+            parameter_binding_identity(&builder.source, function.span, function.body.span, slot),
         );
     }
     for slot in &call_sites.boundary.parameters {

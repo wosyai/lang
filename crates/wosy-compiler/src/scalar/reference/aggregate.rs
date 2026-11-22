@@ -116,6 +116,7 @@ pub(super) struct LiteralArrayWrite {
     pub(super) writer: CfgPointId,
     pub(super) producer: OccurrenceOrdinal,
     pub(super) destination: OccurrenceOrdinal,
+    pub(super) argument_read: Option<CfgPointId>,
 }
 
 #[derive(Clone, Copy, Default, PartialEq)]
@@ -127,6 +128,7 @@ enum LiteralArrayPhase {
     Moved(CfgPointId),
     Output(OccurrenceOrdinal),
     ProducerExit(OccurrenceOrdinal),
+    ArgumentRead(CfgPointId),
     Call,
     Replaced,
     Finished,
@@ -665,12 +667,19 @@ impl AggregateFlowFacts {
                     completed = Some(LiteralArrayRoute::FreshLeaf { allocation, output });
                     Finished
                 }
-                (Original, CfgPointKind::Call { output: 0,
+                (Original, CfgPointKind::Read { .. })
+                    if self.literal_array_write.is_some_and(|write| write.argument_read == Some(point.id)) =>
+                    ArgumentRead(point.id),
+                (phase @ (Original | ArgumentRead(_)), CfgPointKind::Call { output: 0,
                     target: ResolvedCallTarget::ModuleCallable {
                         concrete: ConcreteCallSelection::Declaration, ..
                     }, argument_points, .. })
-                    if argument_points.is_empty()
-                        && self.literal_array_write.is_some_and(|write| write.rhs == point.id) => Call,
+                    if self.literal_array_write.is_some_and(|write| write.rhs == point.id
+                        && match (phase, write.argument_read, argument_points.as_slice()) {
+                            (Original, None, []) => true,
+                            (ArgumentRead(seen), Some(expected), [actual]) => seen == expected && seen == *actual,
+                            _ => false,
+                        }) => Call,
                 (Call, CfgPointKind::Assign { target, rhs_point, .. })
                     if &target.binding == binding && target.projections.is_empty()
                         && self.literal_array_write.is_some_and(|write|
@@ -2150,7 +2159,19 @@ fn install_literal_array_plans(
         let [returned] = leaf.sites.boundary.results.as_slice() else { continue };
         let Some(signature) = body.sites.checked_call_signatures.get(&write.producer) else { continue };
         let [output] = signature.outputs.outputs.as_slice() else { continue };
-        if !signature.parameters.is_empty() || !same_runtime_array_type(&output.ty, &returned.ty) {
+        let same_parameters = match (
+            write.argument_read,
+            body.sites.boundary.parameters.as_slice(),
+            leaf.sites.boundary.parameters.as_slice(),
+            signature.parameters.as_slice(),
+        ) {
+            (None, [], [], []) => true,
+            (Some(_), [caller], [callee], [actual]) =>
+                caller.ordinal == 0 && callee.ordinal == 0 && ordinary_value(actual)
+                    && &caller.ty == actual && &callee.ty == actual,
+            _ => false,
+        };
+        if !same_parameters || !same_runtime_array_type(&output.ty, &returned.ty) {
             continue;
         }
         enroll_literal_array_pair(result, LiteralArrayPair {
@@ -2930,6 +2951,7 @@ mod tests {
                 writer: CfgPointId(4),
                 producer: OccurrenceOrdinal(2),
                 destination: OccurrenceOrdinal(3),
+                argument_read: None,
             },
             exit: CfgPointId(5),
             block: BlockOrdinal(0),
