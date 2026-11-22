@@ -2381,14 +2381,22 @@ struct LiteralArrayParameters<'a> {
     signature: &'a [ScalarType],
 }
 
-fn enroll_literal_array_pair(
-    result: &mut ClosedAggregates,
+struct LiteralArrayEnrollment {
+    caller: BodyKey,
+    exit: CfgPointId,
+    block: BlockOrdinal,
+    replacement: ClosedLiteralArray,
+    new_leaf: Option<(BodyKey, ClosedLiteralArray)>,
+}
+
+fn preflight_literal_array_pair(
+    result: &ClosedAggregates,
     pair: LiteralArrayPair,
     parameters: LiteralArrayParameters<'_>,
-) {
+) -> Option<LiteralArrayEnrollment> {
     let LiteralArrayPair { caller, callee, original, fresh, final_output, write, exit, block, unit } = pair;
     if caller == callee || result.bodies.contains_key(&caller) || write.rhs == write.writer {
-        return;
+        return None;
     }
     let same_parameters = match (write.argument, parameters.caller, parameters.callee, parameters.signature) {
         (None, [], [], []) => fresh.extent != FreshArrayExtent::Formal,
@@ -2399,15 +2407,15 @@ fn enroll_literal_array_pair(
         _ => false,
     };
     if !same_parameters {
-        return;
+        return None;
     }
-    let FreshArrayExtent::Literal(original_elements) = original.extent else { return };
+    let FreshArrayExtent::Literal(original_elements) = original.extent else { return None };
     let extent_for = |write: LiteralArrayWrite| match fresh.extent {
         FreshArrayExtent::Literal(elements) => Some(ReplacementArrayExtent::Literal(elements)),
         FreshArrayExtent::Formal => write.argument.map(|argument|
             ReplacementArrayExtent::Argument { occurrence: argument.occurrence.0 }),
     };
-    let Some(replacement_extent) = extent_for(write) else { return };
+    let replacement_extent = extent_for(write)?;
     let other_writer = if let Some(other) = unit.and_then(|unit| unit.other_write) {
         if other.rhs == other.writer || other.rhs == write.rhs || other.writer == write.writer
             || other.producer == write.producer || other.destination == write.destination
@@ -2416,9 +2424,9 @@ fn enroll_literal_array_pair(
                 a.read == b.read || a.occurrence == b.occurrence)
             || !unit.is_some_and(|unit| unit.writer_side == ArrayWriterSide::Then && unit.retained.is_some())
         {
-            return;
+            return None;
         }
-        let Some(extent) = extent_for(other) else { return };
+        let extent = extent_for(other)?;
         Some(ClosedLiteralArrayWrite { call: other.producer.0, destination: other.destination.0, extent })
     } else {
         None
@@ -2431,16 +2439,12 @@ fn enroll_literal_array_pair(
         receipt: to_receipt(fresh), length_occurrence: fresh.length_occurrence.0,
         extent: fresh.extent, output: final_output.0,
     };
-    if let Some(existing) = result.bodies.get(&callee) {
-        if existing.literal_array != Some(producer) {
-            return;
-        }
-    } else {
-        result.bodies.entry(callee).or_default().literal_array = Some(producer);
-    }
-    let plan = result.bodies.entry(caller).or_default();
-    plan.scope_exits.insert(block.0, exit);
-    plan.literal_array = Some(ClosedLiteralArray::Replacement {
+    let new_leaf = match result.bodies.get(&callee) {
+        Some(existing) if existing.literal_array == Some(producer) => None,
+        Some(_) => return None,
+        None => Some((callee, producer)),
+    };
+    let replacement = ClosedLiteralArray::Replacement {
         original: to_receipt(original), original_length_occurrence: original.length_occurrence.0,
         original_elements,
         call: write.producer.0, destination: write.destination.0, exit, block: block.0,
@@ -2450,7 +2454,26 @@ fn enroll_literal_array_pair(
             retained_block: unit.retained.map(|retained| retained.block.0),
             other_writer,
         }),
-    });
+    };
+    Some(LiteralArrayEnrollment { caller, exit, block, replacement, new_leaf })
+}
+
+fn enroll_literal_array_pair(
+    result: &mut ClosedAggregates,
+    pair: LiteralArrayPair,
+    parameters: LiteralArrayParameters<'_>,
+) {
+    // No fallible checks or intervening mutations after preflight: commit both
+    // body plans and the sole scope cleanup together.
+    let Some(LiteralArrayEnrollment { caller, exit, block, replacement, new_leaf }) =
+        preflight_literal_array_pair(result, pair, parameters)
+    else { return };
+    if let Some((callee, producer)) = new_leaf {
+        result.bodies.entry(callee).or_default().literal_array = Some(producer);
+    }
+    let plan = result.bodies.entry(caller).or_default();
+    plan.scope_exits.insert(block.0, exit);
+    plan.literal_array = Some(replacement);
 }
 
 fn install_literal_array_plans(
@@ -3370,6 +3393,37 @@ mod tests {
             assert!(overlapping.bodies[&occupied].ordinary_result);
             assert!(overlapping.bodies[&occupied].literal_array.is_none());
         }
+    }
+
+    #[test]
+    fn literal_array_preflight_is_atomic_and_reuses_only_the_exact_leaf() {
+        let pair = synthetic_literal_array_pair();
+        let parameters = LiteralArrayParameters::default();
+        let mut result = ClosedAggregates::default();
+        let prepared = preflight_literal_array_pair(&result, pair, parameters).expect("valid pair");
+        assert!(matches!(prepared.new_leaf, Some((key, ClosedLiteralArray::FreshLeaf {
+            extent: FreshArrayExtent::Literal(11), ..
+        })) if key == pair.callee));
+        assert!(result.bodies.is_empty());
+        enroll_literal_array_pair(&mut result, pair, parameters);
+
+        let next = LiteralArrayPair { caller: (0, 2, None), ..pair };
+        let leaf = result.bodies[&pair.callee].literal_array;
+        let mut incompatible = next;
+        incompatible.fresh.extent = FreshArrayExtent::Literal(12);
+        assert!(preflight_literal_array_pair(&result, incompatible, parameters).is_none());
+        enroll_literal_array_pair(&mut result, incompatible, parameters);
+        assert_eq!(result.bodies.len(), 2);
+        assert_eq!(result.bodies[&pair.callee].literal_array, leaf);
+        assert_eq!(result.bodies[&pair.caller].scope_exits, BTreeMap::from([(pair.block.0, pair.exit)]));
+
+        let prepared = preflight_literal_array_pair(&result, next, parameters).expect("same leaf");
+        assert!(prepared.new_leaf.is_none());
+        assert_eq!(result.bodies.len(), 2);
+        enroll_literal_array_pair(&mut result, next, parameters);
+        assert_eq!(result.bodies.len(), 3);
+        assert_eq!(result.bodies[&next.caller].scope_exits, BTreeMap::from([(next.block.0, next.exit)]));
+        assert_eq!(result.bodies[&pair.callee].literal_array, leaf);
     }
 
     #[test]
