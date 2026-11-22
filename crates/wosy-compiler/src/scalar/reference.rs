@@ -5316,6 +5316,7 @@ impl ScalarDescriptorReplay<'_> {
 
 struct ReferenceTransferCfg<'a> {
     initial_points: &'a [ReferenceFlowPoint],
+    strictly_forward_out: Option<&'a mut bool>,
     scope_exit_bindings: Option<&'a HashMap<CfgPointId, super::control::ScopeExitBindings>>,
     pending_named_reborrow: Option<&'a super::control::PendingNamedReborrow>,
     resolve_pending_named_reborrow: bool,
@@ -5336,6 +5337,7 @@ impl<'a> ReferenceTransferCfg<'a> {
     fn new(cfg: &'a mut ScalarReferenceCfg, proof: Option<&'a CallablePointFacts>) -> Self {
         Self {
             initial_points: &cfg.initial_points,
+            strictly_forward_out: None,
             scope_exit_bindings: proof.and_then(|proof| proof.scope_exit_bindings.as_ref()),
             pending_named_reborrow: proof.and_then(|proof| proof.pending_named_reborrow.as_ref()),
             resolve_pending_named_reborrow: false,
@@ -5611,7 +5613,7 @@ fn point_last_use_dependencies_keep_canonical_order_and_storage() {
 }
 
 fn transfer_reference_facts(
-    cfg: ReferenceTransferCfg<'_>,
+    mut cfg: ReferenceTransferCfg<'_>,
     deferred_policies: &BTreeMap<usize, CopyPolicy>,
     contracts: &HashMap<CfgPointId, &[ReferenceOrigin]>,
     mut aggregate: Option<(
@@ -5889,6 +5891,9 @@ fn transfer_reference_facts(
         for dependency in dependencies {
             last_use[dependency.0] = point.id.0;
         }
+    }
+    if let Some(out) = cfg.strictly_forward_out.as_deref_mut() {
+        *out = strictly_forward;
     }
     if !strictly_forward {
         if let Some(descriptor) = descriptor.as_deref_mut() {
@@ -10537,6 +10542,70 @@ fn collect_function_output_contracts<'a>(
     }
 }
 
+fn reset_contract_replay_points(
+    live: &mut Vec<ReferenceFlowPoint>,
+    pristine: &[ReferenceFlowPoint],
+    reuse_structure: bool,
+) {
+    if !reuse_structure || live.len() != pristine.len() {
+        *live = pristine.to_vec();
+        return;
+    }
+    for (live, pristine) in live.iter_mut().zip(pristine) {
+        // Outer contract transfer never rewrites these two canonical kinds.
+        // All mutable node kinds, including Evaluate→Borrow, reset fully.
+        if live.id == pristine.id && matches!((&live.kind, &pristine.kind),
+            (CfgPointKind::Call { .. }, CfgPointKind::Call { .. })
+            | (CfgPointKind::Branch { .. }, CfgPointKind::Branch { .. }))
+        {
+            live.possible_origins.clone_from(&pristine.possible_origins);
+        } else {
+            live.clone_from(pristine);
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn contract_replay_reset_borrows_only_immutable_point_structure() {
+    let source = SourceIdentity::new("project".into(), "package".into(), "metadata".into(), "r1".into());
+    let span = ByteSpan::new(0, 10);
+    let point = |kind| ReferenceFlowPoint {
+        id: CfgPointId(0), kind, source_span: SourceSpan::new(source.clone(), span),
+        scope: ReferenceScopeId(0), possible_origins: None, successors: vec![CfgPointId(1)],
+    };
+    let branch = point(CfgPointKind::Branch { condition: ScalarExpression::Boolean { value: true, span } });
+    let pristine = [branch.clone()];
+    let mut live = vec![branch];
+    live[0].possible_origins = Some(BTreeSet::from([ReferenceOriginId(0)]));
+    let allocation = live[0].successors.as_ptr();
+    reset_contract_replay_points(&mut live, &pristine, true);
+    assert_eq!(live[0].successors.as_ptr(), allocation);
+    assert!(live[0].possible_origins.is_none());
+    live[0].kind = CfgPointKind::Evaluate(ScalarExpression::Boolean { value: false, span });
+    reset_contract_replay_points(&mut live, &pristine, true);
+    assert!(matches!(&live[0].kind, CfgPointKind::Branch { condition: ScalarExpression::Boolean { value: true, .. } }));
+    live.push(point(CfgPointKind::ScopeExit));
+    reset_contract_replay_points(&mut live, &pristine, true);
+    assert_eq!(live.len(), pristine.len());
+
+    let call = point(CfgPointKind::Call {
+        expression: ScalarExpression::Call {
+            receiver: None, name: String::new(), receiver_span: None, name_span: span,
+            type_arguments: Vec::new(), arguments: Vec::new(), overload_selection: None, span,
+        },
+        output: 0, argument_points: vec![CfgPointId(0)],
+        target: ResolvedCallTarget::Core(CoreOperationId::IntExtend),
+    });
+    let pristine = [call.clone()];
+    let mut live = vec![call];
+    let allocation = live[0].successors.as_ptr();
+    reset_contract_replay_points(&mut live, &pristine, true);
+    assert_eq!(live[0].successors.as_ptr(), allocation);
+    reset_contract_replay_points(&mut live, &pristine, false);
+    assert_ne!(live[0].successors.as_ptr(), allocation);
+}
+
 fn transfer_function_output_contracts<'a>(
     result: &mut FunctionReferenceResult,
     previous: &ReferenceOutputContracts<'_>,
@@ -10595,7 +10664,11 @@ fn transfer_function_output_contracts<'a>(
         }
     }
     if !result.cfg.initial_points.is_empty() && changed {
-        result.cfg.points = result.cfg.initial_points.clone();
+        let reuse_structure = result.proof_points.strictly_forward_initial_graph
+            && result.proof_points.pending_named_reborrow.is_none()
+            && matches!(result.proof_points.scalar_descriptor_install, ScalarDescriptorCandidates::None)
+            && matches!(result.proof_points.backing_descriptor_install, ScalarDescriptorCandidates::None);
+        reset_contract_replay_points(&mut result.cfg.points, &result.cfg.initial_points, reuse_structure);
         let candidate = match (&result.proof_points.scalar_descriptor_install, &result.proof_points.backing_descriptor_install) {
             (ScalarDescriptorCandidates::One(destination, marker), _) => Some((destination, marker)),
             (ScalarDescriptorCandidates::None, ScalarDescriptorCandidates::One(destination, marker))
@@ -10902,6 +10975,7 @@ fn derive_function_specialized_copy_policies(
             let transferred = transfer_reference_facts(
                 ReferenceTransferCfg {
                     initial_points: &template_cfg.initial_points,
+                    strictly_forward_out: None,
                     scope_exit_bindings: template_result.proof_points.scope_exit_bindings.as_ref(),
                     pending_named_reborrow: template_result.proof_points.pending_named_reborrow.as_ref(),
                     resolve_pending_named_reborrow: false,
@@ -11251,7 +11325,9 @@ fn build_function_reference_cfg(
             call_sites,
             &mut aggregate,
         ));
+        let mut strictly_forward_initial_graph = false;
         let mut provisional_cfg = ReferenceTransferCfg::new(&mut builder.cfg, Some(&builder.proof_points));
+        provisional_cfg.strictly_forward_out = Some(&mut strictly_forward_initial_graph);
         provisional_cfg.resolve_pending_named_reborrow = true;
         let provisional = transfer_reference_facts(
             provisional_cfg,
@@ -11260,6 +11336,7 @@ fn build_function_reference_cfg(
             flow,
             None,
         );
+        builder.proof_points.strictly_forward_initial_graph = strictly_forward_initial_graph;
         if let Some(pending) = &builder.proof_points.pending_named_reborrow {
             let first_unproved = pending.sites.iter().find(|site|
                 !matches!(builder.cfg.points[site.point.0].kind, CfgPointKind::Borrow { .. }));

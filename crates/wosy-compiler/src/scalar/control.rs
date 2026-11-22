@@ -24,6 +24,8 @@ pub(crate) struct CallablePointFacts {
     pub(super) definitions: HashMap<(BlockOrdinal, usize, usize), BindingDefinition>,
     // None is the explicit detached/unprepared transfer mode.
     pub(super) scope_exit_bindings: Option<HashMap<super::CfgPointId, ScopeExitBindings>>,
+    // Set only by provisional transfer on the canonical initial graph.
+    pub(super) strictly_forward_initial_graph: bool,
     pub(super) pending_named_reborrow: Option<PendingNamedReborrow>,
     pub(super) raw_address_exposures: Vec<(super::CfgPointId, Option<super::ReferenceBindingId>)>,
     pub(super) checked_join_values: Vec<(super::CfgPointId, [Option<super::CfgPointId>; 2])>,
