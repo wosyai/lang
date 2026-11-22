@@ -6660,6 +6660,7 @@ fn transfer_reference_facts(
             .and_then(|_| original_points[id.0].successors.iter().copied().min());
         let states = incoming.take(id);
         let incoming_count = states.as_slice().len();
+        let mut local_read_conflicts = None;
         let keep_in_place = keep_forward_point_in_place(&original_points[id.0].kind, ordinary_forward, incoming_count);
         let mut snapshot = if keep_in_place {
             None
@@ -7412,11 +7413,21 @@ fn transfer_reference_facts(
                         continue;
                     }
                     let staged = if place.projections.is_empty() && matches!(&point.kind, CfgPointKind::Read { .. }) {
-                        cfg.local_borrow.and_then(|sealed|
-                            sealed.conflicts(&place.binding, id, incoming_count, original_points))
+                        cfg.local_borrow.and_then(|sealed| {
+                            if incoming_count == 1 {
+                                sealed.conflicts(&place.binding, id, incoming_count, original_points)
+                            } else {
+                                local_read_conflicts.get_or_insert_with(||
+                                    sealed.conflicts(&place.binding, id, incoming_count, original_points)).clone()
+                            }
+                        })
                     } else {
                         None
                     };
+                    #[cfg(test)]
+                    if incoming_count > 1 && staged.as_ref().is_some_and(|spans| !spans.is_empty()) {
+                        local_borrow::tests::observe(4);
+                    }
                     let origins = staged.unwrap_or_else(|| conflicting_live_loan(
                         original_points, cfg.scope_exit_bindings, strictly_forward, &cfg.facts, &state,
                         id, place, LoanAccess::DirectShared,

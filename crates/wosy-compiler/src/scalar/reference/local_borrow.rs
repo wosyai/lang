@@ -292,7 +292,7 @@ struct CarrierRefinement {
 }
 
 impl CarrierRefinement {
-    fn at(&self, point: CfgPointId, inside_then: bool) -> Option<CfgPointId> {
+    fn at(&self, point: CfgPointId, inside_then: bool, post_join: bool) -> Option<Option<CfgPointId>> {
         fn at_path(facts: &[ReachingLoan], point: CfgPointId) -> Option<CfgPointId> {
             let end = facts.partition_point(|fact| fact.interval.start <= point);
             let fact = end.checked_sub(1).and_then(|index| facts.get(index))?;
@@ -300,12 +300,16 @@ impl CarrierRefinement {
         }
         let then = at_path(&self.then, point);
         if inside_then {
-            return then;
+            return Some(then);
         }
-        // At an admitted pre-fork access there is precisely one reaching holder
-        // version, even if the last relevant future use differs by route.
         let bypass = at_path(&self.bypass, point);
-        then.or(bypass)
+        if post_join {
+            // Independent of route, including when the incumbent deduplicates states.
+            (then == bypass).then_some(then)
+        } else {
+            // Before the fork, a single version can have a future use on either route.
+            Some(then.or(bypass))
+        }
     }
 }
 
@@ -343,8 +347,8 @@ impl Sealed {
         &self, owner: &ReferenceBindingId, access: CfgPointId, incoming_count: usize,
         points: &[ReferenceFlowPoint],
     ) -> Option<Vec<SourceSpan>> {
-        // Never replace a per-reaching-state verdict at a join.
-        if incoming_count != 1 || access >= self.fork.join {
+        let post_join = access > self.fork.join;
+        if incoming_count != 1 && !post_join {
             #[cfg(test)]
             tests::observe(3);
             return None;
@@ -391,8 +395,13 @@ impl Sealed {
                 }
                 by_owner
             });
-            let Some(issue) = precise.get(&owner_index).and_then(|carrier| carrier.at(access, inside_then))
-                else { continue };
+            let Some(carrier) = precise.get(&owner_index) else { continue };
+            let Some(issue) = carrier.at(access, inside_then, post_join) else {
+                #[cfg(test)]
+                tests::observe(3);
+                return None;
+            };
+            let Some(issue) = issue else { continue };
             let CfgPointKind::Borrow { place, loan } = &points.get(issue.0)?.kind else {
                 return None;
             };
@@ -409,14 +418,14 @@ impl Sealed {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
     thread_local! {
-        static COUNTS: std::cell::Cell<[usize; 4]> = const { std::cell::Cell::new([0; 4]) };
+        static COUNTS: std::cell::Cell<[usize; 5]> = const { std::cell::Cell::new([0; 5]) };
     }
 
-    pub(super) fn observe(stage: usize) {
+    pub(in crate::scalar::reference) fn observe(stage: usize) {
         COUNTS.with(|counts| {
             let mut next = counts.get();
             next[stage] += 1;
@@ -485,7 +494,7 @@ mod tests {
         builder.record_binding_definition(BlockPosition { block: BlockOrdinal(0), item }, 0, false, Some(initializer));
     }
 
-    fn inert_result(prepared_existing: bool) -> FunctionReferenceResult {
+    fn inert_result(prepared_existing: bool, divergent: bool) -> FunctionReferenceResult {
         let source = SourceIdentity::new("project".into(), "package".into(), "metadata".into(), "r1".into());
         let at = |start| ByteSpan::new(start, start + 1);
         let span = ByteSpan::new(0, 100);
@@ -498,13 +507,13 @@ mod tests {
             source: source.clone(), function_span: span, block_span: span,
             declaration_span: at(start), kind: ReferenceBindingKind::Declared,
         };
-        let (x, y, h1, h2, h3) = (binding(20), binding(21), binding(22), binding(23), binding(24));
+        let (x, y, h1, h2, h3, z, h4) = (binding(20), binding(21), binding(22), binding(23), binding(24), binding(25), binding(26));
         let root = ReferenceScopeId(0);
         let arm = ReferenceScopeId(1);
-        for owner in [&x, &y] {
+        for owner in [&x, &y, &z] {
             builder.binding_types.record(owner.clone(), ScalarType::I32, Some(root));
         }
-        for holder in [&h1, &h2, &h3] {
+        for holder in [&h1, &h2, &h3, &h4] {
             builder.binding_types.record(holder.clone(), ScalarType::CheckedReference {
                 inner: Box::new(ScalarType::I32), mutability: ScalarReferenceMutability::Mutable,
             }, Some(root));
@@ -524,12 +533,25 @@ mod tests {
         builder.author_direct_assignment(emitted, prepared_existing);
         let (second, second_origins) = loan(&mut builder, &x, at(5));
         bind(&mut builder, &h1, 2, second, second_origins);
+        let (unread, unread_origins) = loan(&mut builder, &z, at(34));
+        bind(&mut builder, &h4, 3, unread, unread_origins);
         let branch = builder.point(CfgPointKind::Branch { condition: ScalarExpression::Boolean { value: true, span: at(6) } }, at(6), root, BTreeSet::new());
         builder.point(CfgPointKind::ScopeEnter, at(7), arm, BTreeSet::new());
         builder.point(CfgPointKind::Read { binding: x.clone() }, at(8), arm, BTreeSet::new());
         for index in [9, 10] {
             builder.point(CfgPointKind::Read { binding: y.clone() }, at(index), arm, BTreeSet::new());
         }
+        let divergent_origins = if divergent {
+            let (rhs, origins) = loan(&mut builder, &x, at(30));
+            let target = builder.reference_place(
+                &ScalarPlace::Name { name: "h1".into(), span: at(31) }, h1.clone(), None,
+            );
+            let emitted = builder.emit_direct_assignment(h1.clone(), CfgPointKind::Assign {
+                target, rhs_point: rhs, previous_origins: BTreeSet::new(), previous_loans: vec![],
+            }, rhs, ReferenceValue::Checked(origins.clone()), at(31), arm).expect("typed branch assignment");
+            builder.author_direct_assignment(emitted, prepared_existing);
+            Some(origins)
+        } else { None };
         let then_end = builder.point(CfgPointKind::ScopeExit, at(11), arm, BTreeSet::new());
         builder.author_local_scope_exit(then_end, &super::super::super::control::ScopeExitBindings::default(), true);
         builder.cursor = None;
@@ -537,12 +559,17 @@ mod tests {
         builder.connect_reference_conditional(
             &ReferenceConditionalEdges { branch, terminals: [then_end, branch], join }, &calls.conditionals[&OccurrenceOrdinal(0)],
         );
+        builder.point(CfgPointKind::Read { binding: z.clone() }, at(35), root, BTreeSet::new());
         builder.point(CfgPointKind::Read { binding: y.clone() }, at(13), root, BTreeSet::new());
+        if let Some(origins) = divergent_origins {
+            builder.point(CfgPointKind::Read { binding: x.clone() }, at(32), root, BTreeSet::new());
+            builder.point(CfgPointKind::Read { binding: h1.clone() }, at(33), root, origins);
+        }
         builder.point(CfgPointKind::Read { binding: h2.clone() }, at(14), root, origins);
         builder.point(CfgPointKind::Read { binding: h3.clone() }, at(16), root, third_origins);
         let exit = builder.point(CfgPointKind::ScopeExit, span, root, BTreeSet::new());
         let mut leaving = super::super::super::control::ScopeExitBindings::default();
-        for binding in [x, y, h1, h2, h3] {
+        for binding in [x, y, h1, h2, h3, z, h4] {
             leaving.insert(binding);
         }
         builder.author_local_scope_exit(exit, &leaving, true);
@@ -566,22 +593,21 @@ mod tests {
 
     #[test]
     fn production_builder_and_pristine_replay_replace_only_complete_local_read_verdicts() {
-        let mut admitted = inert_result(true);
+        let mut admitted = inert_result(true, false);
         assert!(admitted.proof_points.local_borrow.is_some());
-        COUNTS.with(|counts| counts.set([0; 4]));
+        COUNTS.with(|counts| counts.set([0; 5]));
         let staged = definitive(&mut admitted);
         let counts = COUNTS.with(|counts| counts.get());
-        assert_eq!(&counts[..3], &[1, 3, 2]);
-        assert!(counts[3] > 0);
+        assert_eq!(counts, [2, 4, 2, 0, 0]);
         let again = definitive(&mut admitted);
         assert_eq!(staged, again);
         assert_eq!(COUNTS.with(|counts| counts.get()[2]), 2);
-        let mut unprepared = inert_result(false);
+        let mut unprepared = inert_result(false, false);
         assert!(unprepared.proof_points.local_borrow.is_none());
-        COUNTS.with(|counts| counts.set([0; 4]));
+        COUNTS.with(|counts| counts.set([0; 5]));
         let incumbent = definitive(&mut unprepared);
         assert_eq!(staged, incumbent);
-        assert_eq!(COUNTS.with(|counts| counts.get()), [0; 4]);
+        assert_eq!(COUNTS.with(|counts| counts.get()), [0; 5]);
         let spans = staged.iter().find_map(|error| match error {
             ReferenceAnalysisError::ConflictingPlace { source_span, origins }
                 if source_span.range == ByteSpan::new(9, 10) => Some(origins),
@@ -592,4 +618,36 @@ mod tests {
         assert!(!staged.iter().any(|error| matches!(error,
             ReferenceAnalysisError::ConflictingPlace { source_span, .. } if source_span.range == ByteSpan::new(8, 9))));
     }
+    #[test]
+    fn production_post_join_agreement_preserves_state_multiplicity_and_divergence_falls_back() {
+        fn at(errors: &[ReferenceAnalysisError], start: u32) -> Vec<Vec<ByteSpan>> {
+            errors.iter().filter_map(|error| match error {
+                ReferenceAnalysisError::ConflictingPlace { source_span, origins }
+                    if source_span.range == ByteSpan::new(start, start + 1) =>
+                    Some(origins.iter().map(|origin| origin.range).collect()),
+                _ => None,
+            }).collect()
+        }
+        for divergent in [false, true] {
+            let mut admitted = inert_result(true, divergent);
+            assert!(admitted.proof_points.local_borrow.is_some());
+            COUNTS.with(|counts| counts.set([0; 5]));
+            let staged = definitive(&mut admitted);
+            let counts = COUNTS.with(|counts| counts.get());
+            let mut incumbent = inert_result(false, divergent);
+            assert_eq!(staged, definitive(&mut incumbent));
+            assert_eq!(at(&staged, 13), vec![vec![ByteSpan::new(3, 4), ByteSpan::new(15, 16)]]);
+            assert_eq!(counts[4], if divergent { 2 } else { 0 });
+            assert_eq!(counts[1], if divergent { 5 } else { 4 });
+            assert_eq!(counts[0], 2);
+            assert!(at(&staged, 35).is_empty());
+            assert_eq!(counts[3], usize::from(divergent));
+            if divergent {
+                let mut divergent_origins = at(&staged, 32);
+                divergent_origins.sort_unstable_by_key(|spans| spans[0].start);
+                assert_eq!(divergent_origins, vec![vec![ByteSpan::new(5, 6)], vec![ByteSpan::new(30, 31)]]);
+            }
+        }
+    }
+
 }
