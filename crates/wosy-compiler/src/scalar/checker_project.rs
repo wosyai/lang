@@ -2719,7 +2719,7 @@ impl PreparedProofModule {
             targets: HashMap::new(), proofs: Vec::with_capacity(plans.len()), induction,
         };
         for (plan_index, (_, plan)) in plans.iter().enumerate() {
-            if plan.typed.measure.is_none() && !matches!(plan.typed.goal, TypedProofGoal::MixedEntryConjunction { .. }) {
+            if plan.typed.measure.is_none() {
                 observers.targets.entry(plan.target).or_default().push(plan_index);
                 observers.proofs.push(Some(plan.observer()));
             } else {
@@ -3296,7 +3296,16 @@ impl SelectedProofObserver<'_> {
                 TypedProofGoal::Existential { relation, witness, witness_in_domain } =>
                     (*witness_in_domain && relation.accepts(value.cmp(witness))).then_some(true),
                 TypedProofGoal::Disjunction(allowed) => Some(allowed.contains(value)),
-                TypedProofGoal::DeferredDisjunction(_) | TypedProofGoal::MixedEntryConjunction { .. } => None,
+                TypedProofGoal::DeferredDisjunction(_) => None,
+                TypedProofGoal::MixedEntryConjunction { output, entry } => {
+                    let compared = entry.iter().take(arguments.len());
+                    if entry.iter().skip(arguments.len()).any(Option::is_some) {
+                        None
+                    } else {
+                        Some(output.holds_value(value) && arguments.iter().zip(compared).all(|(argument, relation)|
+                            relation.is_none_or(|relation| relation.accepts(value.cmp(*argument)))))
+                    }
+                },
                 TypedProofGoal::Conjunction(atoms) => Some(atoms.iter().all(|(relation, bound)| relation.accepts(value.cmp(bound)))),
                 TypedProofGoal::EntryComparison { slot, relation } =>
                     arguments.get(*slot).map(|entry| relation.accepts(value.cmp(entry))),

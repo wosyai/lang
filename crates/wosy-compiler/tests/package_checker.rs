@@ -1198,9 +1198,43 @@ fn named_proof_ensures_mixes_exact_literal_and_immutable_entry_conjuncts() {
     for target in ["const_first", "local_first"] {
         assert_eq!(check(target, "limit >= 0 && limit <= 1", contradiction, ""), Unsupported);
     }
-    assert_eq!(check("echo", scoped, valid, "i16 seen = echo(0, 1);"), Unsupported);
+    assert_eq!(check("echo", scoped, valid, "i16 seen = echo(0, 1);"), Proved);
     assert_eq!(check("echo", scoped, "out >= -2 && out <= 0 && out != -1", ""), Proved);
     assert_eq!(check("echo", scoped, "out <= 0 && out >= 0", ""), Refuted);
+}
+
+#[test]
+fn named_proof_ensures_mixed_uses_only_exact_actual_invocation_tuples() {
+    let identity = source();
+    let check = |startup: &str, body: &str, guard: &str, ensures: &str| {
+        check_scalar_module_proof(
+            identity.clone(), "verify",
+            vec![ScalarProofModuleInput {
+                source: identity.clone(),
+                text: format!(r#"%%start
+                    i16(u8, i16) choose = fn(tag, original) {{
+                        if (original == 0) {{}};
+                        {body}
+                    }};
+                    {startup}
+                    proof verify for choose(tag, entry) -> (out) where ({guard}) ensures ({ensures}) {{}}
+                %%end"#),
+                namespaces: Vec::new(),
+            }],
+            vec![identity.clone()], ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
+        )
+    };
+    use ScalarModuleProofOutcome::{NoApplicableInputs, Proved, Refuted, Unsupported};
+    let body = "if (tag == 0) { 7 } else { original }";
+    let guard = "tag <= 2";
+    let goal = "out <= 8 && out <= core.old(entry) && out >= -8";
+    assert_eq!(check("i16 first = choose(0, 7); i16 second = choose(1, -3);", body, guard, goal), Proved);
+    assert_eq!(check("i16 first = choose(0, 7); i16 bad = choose(0, 6); i16 last = choose(1, 7);",
+        body, guard, goal), Refuted);
+    assert_eq!(check("i16 bad = choose(0, 6); i16 last = choose(1, 7);", body, guard, goal), Refuted);
+    assert_eq!(check("i16 seen = choose(3, 9);", body, guard, goal), NoApplicableInputs);
+    assert_eq!(check("i16 seen = choose(1, 9);", body, guard, goal), Refuted);
+    assert_eq!(check("i16 seen = choose(0, 7);", "if (tag == 0) {}; 3 + 4", guard, goal), Unsupported);
 }
 
 #[test]
