@@ -164,9 +164,7 @@ impl<'a> ScopedAuthoredReturn<'a> for NamedAuthoredReturn<'a> {
         }
         self.value.get_or_init(|| {
             let ScalarExpression::Binary { operator, left, right, .. } = &output.value else { return None; };
-            if !matches!(operator, BinaryOperator::Add | BinaryOperator::Subtract) {
-                return None;
-            }
+            let operation = AuthoredIntegerOperation::checked(operator)?;
             if matches!(left.as_ref(), ScalarExpression::Binary { .. })
                 || matches!(right.as_ref(), ScalarExpression::Binary { .. })
             {
@@ -195,10 +193,43 @@ impl<'a> ScopedAuthoredReturn<'a> for NamedAuthoredReturn<'a> {
             }
             #[cfg(all(test, feature = "internal-checker"))]
             AUTHORED_RETURN_CALCULATIONS.with(|count| count.set(count.get() + 1));
-            let value = if *operator == BinaryOperator::Add { left.as_ref() + right.as_ref() }
-                else { left.as_ref() - right.as_ref() };
+            let value = operation.apply(left, right);
             fits(&value).then_some(value)
         }).as_ref()
+    }
+}
+
+#[cfg(feature = "internal-checker")]
+#[derive(Clone, Copy)]
+enum AuthoredIntegerOperation {
+    Add,
+    Subtract,
+    Multiply,
+}
+
+#[cfg(feature = "internal-checker")]
+impl AuthoredIntegerOperation {
+    fn checked(operator: &BinaryOperator) -> Option<Self> {
+        Some(match operator {
+            BinaryOperator::Add => Self::Add,
+            BinaryOperator::Subtract => Self::Subtract,
+            BinaryOperator::Multiply => Self::Multiply,
+            _ => return None,
+        })
+    }
+
+    fn apply(self, left: Cow<'_, BigInt>, right: Cow<'_, BigInt>) -> BigInt {
+        match (self, left, right) {
+            (Self::Add, Cow::Owned(left), Cow::Owned(right)) => left + right,
+            (Self::Add, Cow::Owned(left), right) => left + right.as_ref(),
+            (Self::Add, left, Cow::Owned(right)) => right + left.as_ref(),
+            (Self::Add, left, right) => left.as_ref() + right.as_ref(),
+            (Self::Subtract, Cow::Owned(left), Cow::Owned(right)) => left - right,
+            (Self::Subtract, Cow::Owned(left), right) => left - right.as_ref(),
+            (Self::Subtract, left, Cow::Owned(right)) => left.as_ref() - right,
+            (Self::Subtract, left, right) => left.as_ref() - right.as_ref(),
+            (Self::Multiply, left, right) => left.as_ref() * right.as_ref(),
+        }
     }
 }
 
@@ -209,8 +240,8 @@ fn nested_authored_integer_return<'a>(
 ) -> Option<BigInt> {
     type Node<'a> = (&'a ScalarExpression, OccurrenceOrdinal);
     enum Frame<'a> {
-        Left { right: Node<'a>, add: bool },
-        Right { left: Cow<'a, BigInt>, add: bool },
+        Left { right: Node<'a>, operation: AuthoredIntegerOperation },
+        Right { left: Cow<'a, BigInt>, operation: AuthoredIntegerOperation },
     }
     let mut stack = Vec::new();
     let mut next = (root, root_ordinal);
@@ -220,16 +251,12 @@ fn nested_authored_integer_return<'a>(
             return None;
         }
         if let ScalarExpression::Binary { operator, left, right, .. } = expression {
-            let add = match operator {
-                BinaryOperator::Add => true,
-                BinaryOperator::Subtract => false,
-                _ => return None,
-            };
+            let operation = AuthoredIntegerOperation::checked(operator)?;
             let child = |edge| match structure.edges.get(&(OccurrenceParent::Expression(ordinal), edge)) {
                 Some(OccurrenceNode::Expression(ordinal)) => Some(*ordinal),
                 _ => None,
             };
-            stack.push(Frame::Left { right: (right, child(OccurrenceEdge::BinaryRight)?), add });
+            stack.push(Frame::Left { right: (right, child(OccurrenceEdge::BinaryRight)?), operation });
             next = (left, child(OccurrenceEdge::BinaryLeft)?);
             continue;
         }
@@ -239,22 +266,13 @@ fn nested_authored_integer_return<'a>(
         }
         loop {
             match stack.pop() {
-                Some(Frame::Left { right, add }) => {
-                    stack.push(Frame::Right { left: value, add });
+                Some(Frame::Left { right, operation }) => {
+                    stack.push(Frame::Right { left: value, operation });
                     next = right;
                     break;
                 }
-                Some(Frame::Right { left, add }) => {
-                    let computed = match (left, value, add) {
-                        (Cow::Owned(left), Cow::Owned(right), true) => left + right,
-                        (Cow::Owned(left), right, true) => left + right.as_ref(),
-                        (left, Cow::Owned(right), true) => right + left.as_ref(),
-                        (left, right, true) => left.as_ref() + right.as_ref(),
-                        (Cow::Owned(left), Cow::Owned(right), false) => left - right,
-                        (Cow::Owned(left), right, false) => left - right.as_ref(),
-                        (left, Cow::Owned(right), false) => left.as_ref() - right,
-                        (left, right, false) => left.as_ref() - right.as_ref(),
-                    };
+                Some(Frame::Right { left, operation }) => {
+                    let computed = operation.apply(left, value);
                     if !fits(&computed) {
                         return None;
                     }
