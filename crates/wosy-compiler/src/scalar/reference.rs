@@ -1008,31 +1008,44 @@ impl<'a> ReferenceFlowBuilder<'a> {
         self.cfg.points[then_arm.end.0].successors.push(join);
         self.cfg.points[else_arm.end.0].successors.push(join);
         if array_return {
-            let formal = self.aggregate_facts.array_formal.as_ref();
-            let arm_move = |arm: &ReferenceConditionalArm| {
-                let formal = formal?;
-                let [value] = arm.result.output_points.as_slice() else { return None };
-                let value = &self.cfg.points[value.0];
-                let [moved] = value.successors.as_slice() else { return None };
-                let moved = &self.cfg.points[moved.0];
-                (matches!(&value.kind, CfgPointKind::Read { binding } if binding == formal)
-                    && matches!(&moved.kind, CfgPointKind::Move { place, owner, ty: ScalarType::RuntimeArray { .. } }
-                        if owner == formal && &place.binding == formal && place.projections.is_empty())
-                    && moved.successors.as_slice() == [arm.end])
-                    .then_some(moved.id)
-            };
-            if let (Some(then_move), Some(else_move)) = (arm_move(&then_arm), arm_move(&else_arm)) {
-                self.aggregate_facts.conditional_array_return = Some(aggregate::ConditionalArrayReturn {
-                    join,
-                    arms: [(then_arm.end, then_move), (else_arm.end, else_move)],
-                });
-            }
+            self.record_conditional_array_return(join, 1, &then_arm, &else_arm);
         }
         Ok(if joined_value || checked_result {
             ReferenceValue::Uncomputed
         } else {
             ReferenceValue::Other
         })
+    }
+
+    fn record_conditional_array_return(
+        &mut self,
+        join: CfgPointId,
+        arity: usize,
+        then_arm: &ReferenceConditionalArm,
+        else_arm: &ReferenceConditionalArm,
+    ) {
+        let arm_move = |arm: &ReferenceConditionalArm| {
+            let formal = self.aggregate_facts.array_formal.as_ref()?;
+            if arm.result.output_points.len() != arity {
+                return None;
+            }
+            let value = &self.cfg.points[arm.result.output_points.first()?.0];
+            let [moved] = value.successors.as_slice() else { return None };
+            let moved = &self.cfg.points[moved.0];
+            let end = &self.cfg.points[arm.end.0];
+            (value.scope == end.scope && moved.scope == end.scope
+                && matches!(&value.kind, CfgPointKind::Read { binding } if binding == formal)
+                && matches!(&moved.kind, CfgPointKind::Move { place, owner, ty: ScalarType::RuntimeArray { .. } }
+                    if owner == formal && &place.binding == formal && place.projections.is_empty())
+                && (arity != 1 || moved.successors.as_slice() == [arm.end]))
+                .then_some(moved.id)
+        };
+        if let (Some(then_move), Some(else_move)) = (arm_move(then_arm), arm_move(else_arm)) {
+            self.aggregate_facts.conditional_array_return = Some(aggregate::ConditionalArrayReturn {
+                join,
+                arms: [(then_arm.end, then_move), (else_arm.end, else_move)],
+            });
+        }
     }
 
     fn projected_conditional(
@@ -1144,6 +1157,16 @@ impl<'a> ReferenceFlowBuilder<'a> {
         let first = result.output_points[0];
         self.cfg.points[then_arm.end.0].successors.push(first);
         self.cfg.points[else_arm.end.0].successors.push(first);
+        // The projected row already binds every root slot to this producer and
+        // its exact arm output. Only lane zero may carry the formal's backing.
+        if scope == ReferenceScopeId(0) && primary.output == 0
+            && self.aggregate_facts.array_formal.is_some()
+            && matches!(row.types.first(), Some(ScalarType::RuntimeArray { .. }))
+            && row.types.iter().skip(1).all(aggregate::array_neutral_scalar)
+            && self.call_sites.boundary.root_outputs.len() == arity
+        {
+            self.record_conditional_array_return(first, arity, &then_arm, &else_arm);
+        }
         Ok(result)
     }
 
