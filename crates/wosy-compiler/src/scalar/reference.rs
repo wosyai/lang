@@ -5144,24 +5144,73 @@ fn previous_candidate_origins(
     candidates: &[InvalidationCandidate],
     projected: Option<DisjointProjectedWrite<'_>>,
 ) -> BTreeSet<ReferenceOriginId> {
+    if candidates.is_empty() {
+        return BTreeSet::new();
+    }
     state
         .bindings
         .values()
         .flat_map(|origins| origins.iter().copied())
         .filter(|origin| match &facts[origin.0] {
             ReferenceOrigin::Fresh { loan, .. } | ReferenceOrigin::BorrowedFrom { loan, .. } => {
-                !projected.is_some_and(|projected| projected.excludes(*origin, loan))
-                    && !candidates
-                    .iter()
-                    .any(|candidate| candidate.origin == *origin)
-                    && candidates.iter().any(|candidate| {
-                        reference_places_overlap(&loan.origin_place, &candidate.place)
-                            && !loan_has_ancestor(&candidate.loan, loan)
-                    })
+                if projected.is_some_and(|projected| projected.excludes(*origin, loan)) {
+                    return false;
+                }
+                let replaces = |candidate: &InvalidationCandidate| {
+                    reference_places_overlap(&loan.origin_place, &candidate.place)
+                        && !loan_has_ancestor(&candidate.loan, loan)
+                };
+                match candidates {
+                    [candidate] => candidate.origin != *origin && replaces(candidate),
+                    _ => !candidates.iter().any(|candidate| candidate.origin == *origin)
+                        && candidates.iter().any(replaces),
+                }
             }
             ReferenceOrigin::Null { .. } | ReferenceOrigin::Invalid { .. } => false,
         })
         .collect()
+}
+
+#[cfg(test)]
+#[test]
+fn previous_candidate_origins_preserve_exact_selected_loan_exclusions() {
+    let source = SourceIdentity::new("project".into(), "package".into(), "metadata".into(), "r1".into());
+    let span = ByteSpan::new(0, 10);
+    let place = |start| {
+        let declaration_span = ByteSpan::new(start, start + 1);
+        ReferencePlaceId {
+            source: source.clone(), function_span: span, block_span: span, declaration_span,
+            binding: ReferenceBindingId {
+                source: source.clone(), function_span: span, block_span: span, declaration_span,
+                kind: ReferenceBindingKind::Declared,
+            },
+            projections: Vec::new(), place: ScalarPlace::Name { name: String::new(), span },
+        }
+    };
+    let loan = |origin_place| ReferenceLoanId {
+        mode: ScalarReferenceMutability::Mutable, origin_place, creation_span: span, parent: None,
+    };
+    let root = place(1);
+    let unrelated = place(2);
+    let facts = [
+        ReferenceOrigin::BorrowedFrom { parameter: 0, loan: loan(root.clone()) },
+        ReferenceOrigin::BorrowedFrom { parameter: 1, loan: loan(root.clone()) },
+        ReferenceOrigin::BorrowedFrom { parameter: 2, loan: loan(root.clone()) },
+        ReferenceOrigin::BorrowedFrom { parameter: 3, loan: loan(unrelated.clone()) },
+    ];
+    let candidates = [
+        InvalidationCandidate { origin: ReferenceOriginId(0), place: root.clone(), loan: loan(root) },
+        InvalidationCandidate { origin: ReferenceOriginId(1), place: unrelated.clone(), loan: loan(unrelated) },
+    ];
+    let mut state = ReferenceEdgeState::default();
+    state.bindings.insert(place(3).binding, BTreeSet::from([
+        ReferenceOriginId(0), ReferenceOriginId(1), ReferenceOriginId(2), ReferenceOriginId(3),
+    ]));
+    assert!(previous_candidate_origins(&state, &facts, &[], None).is_empty());
+    assert_eq!(previous_candidate_origins(&state, &facts, &candidates[..1], None),
+        BTreeSet::from([ReferenceOriginId(1), ReferenceOriginId(2)]));
+    assert_eq!(previous_candidate_origins(&state, &facts, &candidates, None),
+        BTreeSet::from([ReferenceOriginId(2), ReferenceOriginId(3)]));
 }
 
 fn previous_origin_loans(
