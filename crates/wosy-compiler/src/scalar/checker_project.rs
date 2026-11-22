@@ -2538,15 +2538,14 @@ impl PreparedProofModule {
                 let Ok(declaration) = catalog.declaration(peer) else { continue; };
                 let requested = graph.enroll(self, selected, plans, catalog.source, declaration);
                 let Some(immediate) = graph.nodes[requested].plan() else { continue; };
-                let Some((peer_relation, _)) = immediate.peer_literal_goal() else { continue; };
-                if !plan.same_peer_target(immediate) {
+                if !plan.same_peer_target(immediate) || immediate.peer_literal_goal().is_none() {
                     continue;
                 }
                 let strict_entry = if ExactGuardGroup(plan.filter.as_deref()) == ExactGuardGroup(immediate.filter.as_deref()) {
                     None
-                } else if immediate.steps.items.is_empty()
-                    && Some(peer_relation) == IntegerRelation::from_operator(&BinaryOperator::Equal)
-                {
+                } else if immediate.steps.items.is_empty() {
+                    // Narrower caller evidence is admission only. Verification
+                    // and conclusion implication still use the full leaf scope.
                     let Some(entry) = plan.closed_entry_admitted_by_peer(immediate) else { continue; };
                     Some(entry)
                 } else {
@@ -2592,6 +2591,19 @@ impl PreparedProofModule {
                             .find(|holds| *holds != Some(true)).unwrap_or(Some(true));
                         let checked = if proof == Some(true) {
                             for (index, consumer, strict_entry) in consumers {
+                                let TypedProofGoal::Literal { relation: requested_relation, bound: requested, .. } =
+                                    &consumer.typed.goal else { continue; };
+                                if relation != equality {
+                                    let premise = (relation, bound);
+                                    let conclusion = (*requested_relation, requested);
+                                    let implied = premise == conclusion || finite_output_bounds
+                                        .get_or_insert_with(|| integer_bounds(consumer.typed.result_type))
+                                        .as_ref().is_some_and(|(low, high)|
+                                            integer_predicate_implies(premise, conclusion, (low, high)));
+                                    if !implied {
+                                        continue; // No theorem to apply; don't inspect or memoize return membership.
+                                    }
+                                }
                                 if let Some(key) = strict_entry {
                                     let returns = match first_strict_entry {
                                         Some((first, result)) if first == key => result,
@@ -2608,26 +2620,11 @@ impl PreparedProofModule {
                                         continue;
                                     }
                                 }
-                                let TypedProofGoal::Literal { relation: requested_relation, bound: requested, .. } =
-                                    &consumer.typed.goal else { continue; };
-                                if relation == equality {
-                                    outcomes[index] = if requested_relation.accepts(bound.cmp(requested)) {
-                                        ScalarModuleProofOutcome::Proved
-                                    } else {
-                                        ScalarModuleProofOutcome::Refuted
-                                    };
+                                outcomes[index] = if relation == equality && !requested_relation.accepts(bound.cmp(requested)) {
+                                    ScalarModuleProofOutcome::Refuted
                                 } else {
-                                    let premise = (relation, bound);
-                                    let conclusion = (*requested_relation, requested);
-                                    let implied = premise == conclusion || finite_output_bounds
-                                        .get_or_insert_with(|| integer_bounds(consumer.typed.result_type))
-                                        .as_ref().is_some_and(|(low, high)|
-                                            integer_predicate_implies(premise, conclusion, (low, high)));
-                                    if implied {
-                                        outcomes[index] = ScalarModuleProofOutcome::Proved;
-                                    }
-                                    // Failing implication alone does not refute the consumer.
-                                }
+                                    ScalarModuleProofOutcome::Proved
+                                };
                             }
                             CheckedPeerLeaf::Proven
                         } else if proof == Some(false) {
@@ -5765,6 +5762,36 @@ mod tests {
             assert_eq!(PROOF_CATALOG_INDEX_BUILDS.with(|count| count.replace(0)), 1);
             assert_eq!(take_integer_observations(), (1, 0));
         }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn strict_peer_non_equality_checks_implication_before_return_membership() {
+        use super::super::checker_flow::take_integer_observations;
+        let file = source("src/main.w", "strict-peer-predicate");
+        let text = r#"%%start
+            u8(u8) echo = fn(value) { value };
+            proof leaf for echo(input) -> (out) where (input < 8) ensures (out < 8) {}
+            proof narrower for echo(entry) -> (out) where (entry == 6) ensures (out == 6) { core.use(leaf(entry)); }
+            proof weaker for echo(entry) -> (out) where (entry == 6) ensures (out <= 7) { core.use(leaf(entry)); }
+        %%end"#;
+        let _ = take_integer_observations();
+        let _ = STRICT_PEER_ENTRY_CHECKS.with(|count| count.replace(0));
+        let run = |names: &[&str]| check_scalar_module_proofs(
+            file.clone(), names,
+            vec![ScalarProofModuleInput { source: file.clone(), text: text.into(), namespaces: Vec::new() }],
+            vec![file.clone()], inputs(),
+        ).unwrap();
+        assert_eq!(run(&["narrower", "leaf"]), [
+            ScalarModuleProofOutcome::Unsupported, ScalarModuleProofOutcome::Proved,
+        ]);
+        assert_eq!(STRICT_PEER_ENTRY_CHECKS.with(|count| count.replace(0)), 0);
+        assert_eq!(take_integer_observations(), (1, 0));
+        assert_eq!(run(&["narrower", "weaker", "leaf"]), [
+            ScalarModuleProofOutcome::Unsupported, ScalarModuleProofOutcome::Proved, ScalarModuleProofOutcome::Proved,
+        ]);
+        assert_eq!(STRICT_PEER_ENTRY_CHECKS.with(|count| count.replace(0)), 1);
+        assert_eq!(take_integer_observations(), (1, 0));
     }
 
     #[cfg(feature = "internal-checker")]

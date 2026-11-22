@@ -1445,6 +1445,40 @@ fn named_proof_peer_use_consumes_independently_verified_typed_predicates() {
 }
 
 #[test]
+fn named_proof_peer_use_applies_a_direct_non_equality_leaf_to_a_strict_subset() {
+    let identity = source();
+    let check = |leaf_guard: &str, caller_guard: &str, premise: &str, goal: &str| {
+        check_scalar_module_proofs(
+            identity.clone(), &["caller", "leaf"],
+            vec![ScalarProofModuleInput {
+                source: identity.clone(),
+                text: format!(r#"%%start
+                    i8(i8) echo = fn(value) {{ value }};
+                    proof leaf for echo(entry) -> (out) where ({leaf_guard}) ensures ({premise}) {{}}
+                    proof caller for echo(input) -> (out) where ({caller_guard}) ensures ({goal}) {{
+                        core.use(leaf(input));
+                    }}
+                %%end"#),
+                namespaces: Vec::new(),
+            }],
+            vec![identity.clone()],
+            ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
+        ).unwrap()
+    };
+    use ScalarModuleProofOutcome::{NoApplicableInputs, Proved, Refuted, Unsupported};
+    assert_eq!(check("entry < 8", "input == 6", "out < 8", "out <= 7"), [Proved, Proved]);
+    assert_eq!(check("entry < 8", "input >= 5 && input <= 6", "out < 8", "out <= 7"), [Proved, Proved]);
+    assert_eq!(check("entry < 8", "input == 6", "out < 8", "out == 6"), [Unsupported, Proved]);
+    assert_eq!(check("entry < 8", "input == 6", "out <= 6", "out <= 6"), [Unsupported, Refuted]);
+    assert_eq!(check("entry < 8", "input == 8", "out < 8", "out <= 7"), [Unsupported, Proved]);
+    assert_eq!(check("entry != 5", "input >= 4 && input <= 6", "out != 5", "out != 5"), [Unsupported, Proved]);
+    assert_eq!(check("entry < 4 || entry > 5", "input >= 6 && input <= 7", "out != 5", "out != 5"), [Proved, Proved]);
+    assert_eq!(check("entry < 4 || entry > 5", "input >= 3 && input <= 6", "out != 5", "out != 5"), [Unsupported, Proved]);
+    assert_eq!(check("false", "input == 6", "out < 8", "out <= 7"), [Unsupported, NoApplicableInputs]);
+    assert_eq!(check("entry < 8", "input >= 7 && input <= 6", "out < 8", "out <= 7"), [Unsupported, Proved]);
+}
+
+#[test]
 fn named_proof_peer_use_checks_exact_singleton_where_subsets_without_filling_holes() {
     let identity = source();
     let check = |peer_where: &str, caller_where: &str, goal: &str, peers: &[&str]| {
