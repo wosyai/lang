@@ -98,8 +98,7 @@ fn ordered_checker_facade_keeps_validation_and_distinguishes_incomplete_results(
     assert!(matches!(check_ordered(&identity, "%%start\ncore.require(true, {});\n%%end", Vec::new(), scope),
         ScalarOrderedCheckerOutcome::Invalid(_)));
     let unsupported = format!(r#"%%start
-        unit() deep = fn {{}};
-        unit() leaf = fn {{ deep(); }};
+        unit() leaf = fn {{ leaf(); }};
         unit() parent = fn {{ core.require(false, {OUTPUT}); leaf(); }};
         core.require(false, {OUTPUT});
         parent();

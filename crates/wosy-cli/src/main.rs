@@ -1501,7 +1501,7 @@ mod tests {
         use wosy_compiler::{ScalarCheckerScope, ScalarOrderedCheckerOutcome};
         let authored = r#"core.require(false, { .stdout = "never"; .stderr = ""; .code = 0; .files = []; });"#;
         for (tail, expected) in [
-            ("unit() deep = fn {}; unit() leaf = fn { deep(); }; unit() nested = fn { leaf(); }; nested();", "unsupported"),
+            ("unit() leaf = fn { leaf(); }; unit() nested = fn { leaf(); }; nested();", "unsupported"),
             ("core.require(true, {});", "invalid"),
             ("", "failed"),
         ] {
@@ -1597,8 +1597,7 @@ mod tests {
     fn internal_ordered_checker_does_not_map_incomplete_analysis_to_zero() {
         use wosy_compiler::{ScalarCheckerScope, ScalarOrderedCheckerOutcome};
         let text = r#"%%start
-            unit() deep = fn {};
-            unit() leaf = fn { deep(); };
+            unit() leaf = fn { leaf(); };
             unit() parent = fn { leaf(); };
             core.require(false, { .stdout = "not published"; .stderr = ""; .code = 0; .files = []; });
             parent();

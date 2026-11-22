@@ -517,7 +517,7 @@ fn check_unused_module<const COLLECT: bool>(
             };
             if COLLECT {
                 let sink = RefCell::new(failures.as_deref_mut().ok_or(ProjectCheck::Unsupported)?);
-                let collection = OrderedCallCollection { failures: &sink, nested_calls_remaining: 1 };
+                let collection = OrderedCallCollection { failures: &sink };
                 symbolic.collect_requirements(body, &module.source, IntegerRequirementEntry::Arbitrary, collection)?;
                 active |= symbolic.had_obligations;
             } else {
@@ -763,7 +763,7 @@ fn check_initializer_expression<const COLLECT: bool>(
     let sink;
     let collection = if COLLECT {
         sink = RefCell::new(failures.as_deref_mut().ok_or(ProjectCheck::Unsupported)?);
-        Some(OrderedCallCollection { failures: &sink, nested_calls_remaining: 1 })
+        Some(OrderedCallCollection { failures: &sink })
     } else { None };
     match run_initializer_call(topology, actual, expression, &ScalarType::Unit, |_, _| None, collection)? {
         ActualCallResult::Unit => Ok(StartupLane::Feasible),
@@ -855,9 +855,9 @@ fn evaluate_initializer_predicate(
 
 const MAX_INITIALIZER_BRANCH_DEPTH: usize = 64;
 
+#[derive(Clone, Copy)]
 struct OrderedCallCollection<'a> {
     failures: &'a RefCell<&'a mut Vec<ProjectCheck>>,
-    nested_calls_remaining: u8,
 }
 
 enum ActualProjectedArguments<'a> {
@@ -958,13 +958,10 @@ impl<Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> CheckedCalls<'
         entry: IntegerRequirementEntry<'_>,
         collection: OrderedCallCollection<'_>,
     ) -> Result<ActualCallResult, ProjectCheck> {
-        let OrderedCallCollection { failures, nested_calls_remaining } = collection;
-        let mut sink = |failure| failures.borrow_mut().push(project_failure(body, source, failure));
+        let terminal_projection = matches!(&entry, IntegerRequirementEntry::Projected(_));
+        let mut sink = |failure| collection.failures.borrow_mut().push(project_failure(body, source, failure));
         let mut nested_error = None;
         let mut nested = |caller: &FunctionCallSites, occurrence, argument: NestedIntegerArgument<'_>, expected: &ScalarType| {
-            let collection = OrderedCallCollection {
-                failures, nested_calls_remaining: nested_calls_remaining - 1,
-            };
             match self.nested(caller, occurrence, argument, expected, Some((source, collection))) {
                 Ok(result) => Some(result),
                 Err(error) => {
@@ -974,9 +971,9 @@ impl<Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> CheckedCalls<'
             }
         };
         let handler: Option<&mut super::checker_flow::ActualCallHandler<'_, '_>> =
-            if nested_calls_remaining > 0 { Some(&mut nested) } else { None };
+            if terminal_projection { None } else { Some(&mut nested) };
         let Some((active, continuation)) = collect_integer_requirement_failures_with_calls(
-            body, entry, handler, !ACTUAL_STARTUP && nested_calls_remaining > 0, &mut sink,
+            body, entry, handler, !ACTUAL_STARTUP && !terminal_projection, &mut sink,
         ) else {
             return Err(nested_error.unwrap_or(ProjectCheck::Unsupported));
         };
@@ -1019,7 +1016,7 @@ impl<Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> CheckedCalls<'
         let projected = match projected {
             ActualProjectedArguments::SymbolicAxis(ty, values) => {
                 let Some(collection) = collection else { return Err(ProjectCheck::Unsupported); };
-                if ACTUAL_STARTUP || *expected != ScalarType::Unit || collection.nested_calls_remaining != 0
+                if ACTUAL_STARTUP || *expected != ScalarType::Unit
                     || !matches!((signature.parameters.as_slice(), body.boundary.parameters.as_slice()),
                         ([parameter], [slot]) if parameter == ty && slot.ty == *ty)
                     || !function.generic_parameters.is_empty() || !function.overload_arms.is_empty()
@@ -1027,7 +1024,7 @@ impl<Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> CheckedCalls<'
                     || !body.call_occurrences.is_empty() || !body.allocation_length_calls.is_empty()
                     || !body.assignments.is_empty() || !body.arms.is_empty()
                     || body.structure.checker_directives.values().any(|directive| directive.call_signature.is_some())
-                    || self.active.contains(&target)
+                    || self.active.len() == MAX_ACTUAL_CALL_DEPTH || self.active.contains(&target)
                 {
                     return Err(ProjectCheck::Unsupported);
                 }
@@ -3383,8 +3380,7 @@ mod tests {
         let app = source("src/main.w", "collect-incomplete-package-failures");
         let prepare = |body: &str, startup: &str| {
             let text = format!(r#"%%start
-                unit() leaf = fn {{}};
-                unit() helper = fn {{ leaf(); }};
+                unit() helper = fn {{ helper(); }};
                 unit(u8) unopened = fn(value) {{ core.require(value < 4, {OUTPUT}); {body} }};
                 core.require(false, {OUTPUT});
                 {startup}
@@ -3642,8 +3638,7 @@ mod tests {
         assert_eq!(check_package_initialization(&prepared), Err(failures.into_iter().next().unwrap()));
 
         let incomplete = format!(r#"%%start
-            unit() deeper = fn {{}};
-            unit() leaf = fn {{ deeper(); }};
+            unit() leaf = fn {{ leaf(); }};
             unit() helper = fn {{ core.require(false, {OUTPUT}); leaf(); }};
             core.require(false, {OUTPUT});
             helper();
@@ -3725,11 +3720,17 @@ mod tests {
                 core.require(value < 2, {OUTPUT});
                 core.narrow(value < 5, {OUTPUT});
             }};
+            unit(u8) bridge = fn(value) {{
+                core.require(value <= 3, {OUTPUT});
+                inner(value);
+                core.require(value != 4, {OUTPUT});
+            }};
+            unit(u8) relay = fn(value) {{ bridge(value); }};
             unit(u8) outer = fn(value) {{
                 core.require(value < 3, {OUTPUT});
                 mark();
-                inner(3);
-                inner(value);
+                relay(3);
+                relay(value);
                 core.require(value < 4, {OUTPUT});
             }};
         "#);
@@ -3751,11 +3752,14 @@ mod tests {
             ("value < 3", Require, Some(4.into())),
             ("false", Require, None),
             ("value < 2", Require, Some(3.into())),
+            ("value <= 3", Require, Some(4.into())),
             ("value < 2", Require, Some(4.into())),
+            ("value != 4", Require, Some(4.into())),
             ("value < 4", Require, Some(4.into())),
             ("value < 3", Require, Some(5.into())),
             ("false", Require, None),
             ("value < 2", Require, Some(3.into())),
+            ("value <= 3", Require, Some(5.into())),
             ("value < 2", Require, Some(5.into())),
             ("value < 5", Narrow, Some(5.into())),
         ]);
@@ -4691,6 +4695,8 @@ mod tests {
             let source = source("src/main.w", &format!("depth-{depth}"));
             let prepared = prepare_proof_target(&source, &chain(depth)).unwrap();
             assert_eq!(check_package_initialization(&prepared).map(drop), expected);
+            #[cfg(feature = "internal-checker")]
+            assert_eq!(collect_package_startup_failures(&prepared).map(drop), expected);
         }
     }
 
