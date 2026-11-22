@@ -160,6 +160,16 @@ impl IntegerSet {
         joined
     }
 
+    pub(super) fn union<'a>(sets: impl IntoIterator<Item = &'a Self>) -> Self {
+        let mut intervals: Vec<_> = sets.into_iter().flat_map(|set| &set.0).collect();
+        intervals.sort_unstable_by(|left, right| left.first.cmp(&right.first));
+        let mut union = Self::default();
+        for interval in intervals {
+            union.append(interval.clone());
+        }
+        union
+    }
+
     fn append(&mut self, interval: Interval) {
         if let Some(previous) = self
             .0

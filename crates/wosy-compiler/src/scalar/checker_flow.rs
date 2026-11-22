@@ -455,23 +455,36 @@ pub(super) fn collect_integer_requirement_failures(
 ) -> Option<(bool, Vec<IntegerCheckFailure<'_>>)> {
     let mut failures = Vec::new();
     let mut sink = |failure| failures.push(failure);
-    let (active, _) = collect_integer_requirement_failures_with_calls(calls, None, None, &mut sink)?;
+    let (active, _) = collect_integer_requirement_failures_with_calls(calls, IntegerRequirementEntry::Arbitrary, None, false, &mut sink)?;
     Some((active, failures))
+}
+
+pub(super) enum IntegerRequirementEntry<'a> {
+    Arbitrary,
+    Exact(&'a [&'a BigInt]),
+    Projected(Rc<IntegerSet>),
 }
 
 struct IntegerFailureCollection<'a, 'sink> {
     continued: bool,
+    projected: Option<Rc<IntegerSet>>,
+    allow_projected_calls: bool,
     sink: &'sink mut dyn FnMut(IntegerCheckFailure<'a>),
 }
 
 pub(super) fn collect_integer_requirement_failures_with_calls<'a>(
     calls: &'a FunctionCallSites,
-    exact: Option<&[&BigInt]>,
+    entry: IntegerRequirementEntry<'_>,
     handle_call: Option<&mut ActualCallHandler<'a, '_>>,
+    allow_projected_calls: bool,
     sink: &mut dyn FnMut(IntegerCheckFailure<'a>),
 ) -> Option<(bool, bool)> {
-    let mut collected = IntegerFailureCollection { continued: false, sink };
-    let tail = if exact.is_none() { integer_tail_type(calls) } else { None };
+    let (tail, exact, projected) = match entry {
+        IntegerRequirementEntry::Arbitrary => (integer_tail_type(calls), None, None),
+        IntegerRequirementEntry::Exact(arguments) => (None, Some(arguments), None),
+        IntegerRequirementEntry::Projected(values) => (None, None, Some(values)),
+    };
+    let mut collected = IntegerFailureCollection { continued: false, projected, allow_projected_calls, sink };
     let ProofCoverage::Applicable(active) = run_integer_callable::<false, true>(
         calls, tail, None, None, None, exact, handle_call, Some(&mut collected),
     )?.ok()? else { return None; };
@@ -494,20 +507,24 @@ pub(super) fn exact_integer_call_argument_at<'a>(
     slot: usize,
     lexical: impl FnOnce(OccurrenceOrdinal, &ScalarType) -> Option<&'a BigInt>,
 ) -> Option<ExactIntegerArgument<'a>> {
+    let (argument, ty) = checked_integer_call_argument_at(structure, call, slot)?;
+    let value = match structure.checker_integer_literals.get(&argument) {
+        Some(value) => value,
+        None => lexical(argument, ty)?,
+    };
+    Some((ty, value))
+}
+
+fn checked_integer_call_argument_at(
+    structure: &OccurrenceStructure, call: OccurrenceOrdinal, slot: usize,
+) -> Option<(OccurrenceOrdinal, &ScalarType)> {
     let OccurrenceNode::Expression(argument) = structure.edges.get(&(
         OccurrenceParent::Expression(call), OccurrenceEdge::CallArgument(slot),
     ))? else {
         return None;
     };
     let ty = structure.checked_types.expressions.get(argument)?;
-    if !is_integer_type(ty) {
-        return None;
-    }
-    let value = match structure.checker_integer_literals.get(argument) {
-        Some(value) => value,
-        None => lexical(*argument, ty)?,
-    };
-    Some((ty, value))
+    is_integer_type(ty).then_some((*argument, ty))
 }
 
 pub(super) enum ActualCallResult {
@@ -516,27 +533,54 @@ pub(super) enum ActualCallResult {
     Integer(BigInt),
 }
 
+pub(super) enum NestedIntegerArgument<'a> {
+    Single(Option<ExactIntegerArgument<'a>>),
+    Projected(&'a ScalarType, Rc<IntegerSet>),
+}
+
 fn actual_nested_argument<'a>(
     calls: &'a FunctionCallSites,
     expression: OccurrenceOrdinal,
     roots: &IntegerRoots<'_>,
     path: &'a IntegerInputs,
-) -> Option<ExactIntegerArgument<'a>> {
-    exact_integer_call_argument(&calls.structure, expression, |ordinal, ty| {
-        let PlainNameIdentity::Lexical(binding) = calls.prepared_plain_name(ordinal)? else {
-            return None;
+    allow_projection: bool,
+) -> NestedIntegerArgument<'a> {
+    let Some((argument, ty)) = checked_integer_call_argument_at(&calls.structure, expression, 0) else {
+        return NestedIntegerArgument::Single(None);
+    };
+    if let Some(value) = calls.structure.checker_integer_literals.get(&argument) {
+        return NestedIntegerArgument::Single(Some((ty, value)));
+    }
+    let Some((axis, binding_type)) = calls.prepared_plain_name(argument).and_then(|name| match name {
+        PlainNameIdentity::Lexical(binding) => roots.lookup(binding),
+        _ => None,
+    }) else {
+        return NestedIntegerArgument::Single(None);
+    };
+    if binding_type != ty {
+        return NestedIntegerArgument::Single(None);
+    }
+    if let Some(value) = path.singleton_at(axis) {
+        return NestedIntegerArgument::Single(Some((ty, value)));
+    }
+    if allow_projection {
+        let Some((first, rest)) = path.0.split_first() else {
+            return NestedIntegerArgument::Single(None);
         };
-        let (axis, binding_type) = roots.lookup(binding)?;
-        if binding_type != ty {
-            return None;
-        }
-        path.singleton_at(axis)
-    })
+        let first = &first[axis];
+        let values = if rest.iter().all(|row| Rc::ptr_eq(first, &row[axis])) {
+            Rc::clone(first)
+        } else {
+            Rc::new(IntegerSet::union(path.0.iter().map(|row| row[axis].as_ref())))
+        };
+        return NestedIntegerArgument::Projected(ty, values);
+    }
+    NestedIntegerArgument::Single(None)
 }
 
 pub(super) type ActualCallHandler<'a, 'handler> =
     dyn FnMut(
-        &'a FunctionCallSites, OccurrenceOrdinal, Option<ExactIntegerArgument<'_>>, &ScalarType,
+        &'a FunctionCallSites, OccurrenceOrdinal, NestedIntegerArgument<'_>, &ScalarType,
     ) -> Option<ActualCallResult> + 'handler;
 
 pub(super) fn check_integer_requirements_with_calls<'a>(
@@ -730,7 +774,13 @@ fn run_integer_callable<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool>
     for (binding, parameter) in checker_parameters.iter().zip(&boundary.parameters) {
         roots.add(binding, &parameter.ty);
     }
-    let mut row: IntegerRow = if let Some(arguments) = exact_arguments {
+    let projected = if COLLECT { failures.as_deref_mut()?.projected.take() } else { None };
+    let mut row: IntegerRow = if let Some(projected) = projected {
+        if boundary.parameters.len() != 1 || projected.is_empty() {
+            return None;
+        }
+        vec![projected]
+    } else if let Some(arguments) = exact_arguments {
         if arguments.len() != boundary.parameters.len() {
             return None;
         }
@@ -820,7 +870,8 @@ fn walk_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool>(
                     path = passing;
                 } else if structure.checker_direct_targets.contains_key(&expression) {
                     let handle = handle_call.as_mut()?;
-                    let argument = actual_nested_argument(calls, expression, roots, &path);
+                    let project = COLLECT && failures.as_ref().is_some_and(|collection| collection.allow_projected_calls);
+                    let argument = actual_nested_argument(calls, expression, roots, &path, project);
                     match handle(calls, expression, argument, &ScalarType::Unit)? {
                         ActualCallResult::Unit => {}
                         ActualCallResult::EmptyUnit if COLLECT => path = IntegerInputs::default(),
@@ -967,7 +1018,7 @@ fn walk_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool>(
                     let [receiver] = binding.receivers() else {
                         return None;
                     };
-                    let argument = actual_nested_argument(calls, origin.call, roots, &path);
+                    let argument = actual_nested_argument(calls, origin.call, roots, &path, false);
                     let ActualCallResult::Integer(value) = handle(calls, origin.call, argument, &receiver.ty)? else {
                         return None;
                     };
