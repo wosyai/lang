@@ -18,7 +18,8 @@ use std::process::ExitCode;
 use std::sync::atomic::{AtomicU64, Ordering};
 use wosy_compiler::{
     analyze_scalar_build, derive_scalar_declarations_from_cst, emit_scalar_build_project_llvm_text,
-    emit_scalar_build_single_module_llvm_text, parse_source, prepare_scalar_project, publication,
+    emit_scalar_build_single_module_llvm_text, emit_scalar_build_wasm_root_exports_llvm_text,
+    parse_source, prepare_scalar_project, publication,
     serialize_publication, ScalarNamespaceBinding, ScalarPreparationInputs, ScalarTargetLayout,
 };
 use wosy_project::{
@@ -142,8 +143,13 @@ fn build_command(target: Option<&str>, profile: &str) -> Result<(), String> {
     let target_layout = artifact_profile.target_layout().map(scalar_target_layout)?;
     let configuration_identity = blake3::hash(document.raw().as_bytes()).to_hex().to_string();
     drop(document);
-    let (llvm, source_observations) =
-        compile_project(&root, &project, &configuration, target_layout)?;
+    let (llvm, source_observations) = compile_project(
+        &root,
+        &project,
+        &configuration,
+        target_layout,
+        artifact_profile.exports.as_ref(),
+    )?;
     let source_identity = wosy_project::source_identity(&source_observations);
     let artifact_name = &target_profile.main_artifact;
     let output_dir = root
@@ -271,6 +277,7 @@ fn compile_project(
     project: &ProjectContext,
     configuration: &ProjectConfiguration,
     target_layout: ScalarTargetLayout,
+    root_exports: Option<&BTreeMap<String, String>>,
 ) -> Result<(String, Vec<SourceObservation>), String> {
     let root_path = PackageRelativePath::new(project.source_root.clone())?;
     let root_project = root.to_string_lossy().into_owned();
@@ -381,6 +388,12 @@ fn compile_project(
         .first()
         .cloned()
         .ok_or_else(|| "project root source is missing".to_owned())?;
+    let root_exports = root_exports.map(|exports| {
+        (
+            exports,
+            compiler_source_identity(&root_node.source, &root_node.content_revision),
+        )
+    });
     let graph = load_reachable_source_graph(
         &project.package,
         root_node,
@@ -468,7 +481,9 @@ fn compile_project(
         return Err("build rejected by semantic diagnostics".to_owned());
     }
     drop(texts);
-    let llvm = if graph.nodes.len() == 1 {
+    let llvm = if let Some((exports, source)) = root_exports {
+        emit_scalar_build_wasm_root_exports_llvm_text(&validation, &source, exports)?
+    } else if graph.nodes.len() == 1 {
         #[cfg(test)]
         routing_observations::record(|counts| counts.single_module_emissions += 1);
         emit_scalar_build_single_module_llvm_text(&validation)?
@@ -871,6 +886,7 @@ mod routing_observations {
             project,
             configuration,
             ScalarTargetLayout::NATIVE64,
+            None,
         );
         (result, COUNTS.get().expect("active routing observations"))
     }
@@ -924,6 +940,97 @@ mod tests {
             resolved_packages: BTreeMap::new(),
         };
         (project, configuration)
+    }
+
+    fn assert_wasm_root_forwarder(llvm: &str, label: &str, result: &str, types: &[&str]) {
+        let header = format!("define {result} @{label}(");
+        let body = llvm
+            .split_once(header.as_str())
+            .unwrap_or_else(|| panic!("missing wrapper {label}: {llvm}"))
+            .1;
+        let (args, body) = body.split_once(')').expect("wrapper argument list");
+        let parameters = args.split(',').map(str::trim).collect::<Vec<_>>();
+        assert_eq!(parameters.len(), types.len(), "{label}: {args}");
+        for (parameter, ty) in parameters.iter().zip(types) {
+            let (actual, name) = parameter.split_once(' ').expect("typed wrapper parameter");
+            assert_eq!(&actual, ty, "{label}: {parameter}");
+            assert!(name.starts_with('%'), "{label}: {parameter}");
+        }
+        let body = body.split_once("\n}").expect("wrapper body").0;
+        let call_start = format!("call {result} @wosy_fn__");
+        let call = body.split_once(call_start.as_str()).expect("qualified root call").1;
+        let forwarded = call.split_once('(').expect("call arguments").1;
+        let forwarded = forwarded.split_once(')').expect("end of call arguments").0;
+        assert_eq!(
+            forwarded.split(',').map(str::trim).collect::<Vec<_>>(),
+            parameters,
+            "{label}: {body}",
+        );
+    }
+
+    #[test]
+    fn selected_wasm_root_exports_keep_mixed_abi_and_exact_root_identity() {
+        let sources = [
+            (
+                "main.w",
+                "%%start\nmath = namespace app \"math.w\";\ni32(f32,i32,f32) score = fn(left,points,right) { if (left < right) { math.score() + points } else { points } };\nunit(f32,f32,f32,i32,f32) step = fn(a,b,c,n,d) { if (a + b + c > d) { if (n > 0) {}; }; };\n%%end\n",
+            ),
+            ("math.w", "%%start\ni32() score = fn { 42 };\ni32() hidden = fn { 7 };\n%%end\n"),
+        ];
+        let (project, configuration) = routing_test_project("explicit-wasm-root-exports", &sources);
+        let compile = |exports| {
+            compile_project(
+                &project.root,
+                &project,
+                &configuration,
+                ScalarTargetLayout::WASM32,
+                exports,
+            )
+        };
+        let exports = BTreeMap::from([
+            ("demo_score".into(), "score".into()),
+            ("tick".into(), "step".into()),
+        ]);
+        let (llvm, _) = compile(Some(&exports)).expect("emit selected root exports");
+        assert_wasm_root_forwarder(&llvm, "demo_score", "i32", &["float", "i32", "float"]);
+        assert_wasm_root_forwarder(&llvm, "tick", "void", &["float", "float", "float", "i32", "float"]);
+        let (default_llvm, _) = compile(None).expect("emit the unchanged implicit partition");
+        assert!(!default_llvm.contains("@demo_score"), "{default_llvm}");
+        assert!(!default_llvm.contains("@tick"), "{default_llvm}");
+        let absent = BTreeMap::from([("demo_score".into(), "hidden".into())]);
+        assert!(compile(Some(&absent)).expect_err("dependency is not the root").contains("no root function"));
+        let reserved = BTreeMap::from([("_start".into(), "score".into())]);
+        assert!(compile(Some(&reserved)).expect_err("runtime label is reserved").contains("reserved"));
+        fs::remove_dir_all(&project.root).expect("remove routing fixture");
+    }
+
+    #[test]
+    fn singleton_wasm_root_export_keeps_identity_and_rejects_symbol_collision() {
+        let sources = [(
+            "main.w",
+            "%%start\ni32() score = fn { 42 };\ni32() occupied = fn { 7 };\n%%end\n",
+        )];
+        let (project, configuration) = routing_test_project("singleton-root-export", &sources);
+        let compile = |exports| {
+            compile_project(
+                &project.root,
+                &project,
+                &configuration,
+                ScalarTargetLayout::WASM32,
+                exports,
+            )
+        };
+        let same = BTreeMap::from([("score".into(), "score".into())]);
+        let (llvm, _) = compile(Some(&same)).expect("use emitted score symbol");
+        let (default_llvm, _) = compile(None).expect("ordinary singleton");
+        assert_eq!(llvm, default_llvm);
+        let collision = BTreeMap::from([("occupied".into(), "score".into())]);
+        assert!(
+            compile(Some(&collision))
+                .expect_err("cannot reuse another function's emitted symbol")
+                .contains("collides with an emitted symbol")
+        );
+        fs::remove_dir_all(&project.root).expect("remove singleton routing fixture");
     }
 
     #[test]

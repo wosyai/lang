@@ -49,6 +49,15 @@ Rules:
 - Each target needs `root` (entry file relative to the project root), at least one artifact, one artifact profile, and one target profile naming its `main_artifact`.
 - Supported backend/output pairs are `llvm/native` and `llvm/wasm-wasip1` or `llvm/wasm-wasip2`.
 
+An LLVM Wasm artifact profile can opt into stable root-function labels for its builder:
+
+```toml
+[targets.app.artifacts.main.profiles.dev.exports]
+demo_score = "score"
+```
+
+The optional table maps portable external labels to concrete functions in the selected target's entry file. It supports direct `i32`, `u32`, `i64`, `u64`, `f32`, and `f64` parameters and one such result or `unit`. The builder still selects labels to export (for example, `wasm-ld --export=demo_score`); its arguments do not change.
+
 Wasm builders must link `runtime.ll` with a linker that provides `__heap_base` after static storage and the reserved stack, as `wasm-ld` does. The generated LLVM IR enables Wasm bulk memory for functions that copy fixed-size aggregates. This per-function setting overrides Clang’s `-mno-bulk-memory` for those functions. Use a Wasm runner that supports `memory.copy`.
 
 The standard library itself is a dependency-style package (`stdlib/wosy.toml`):

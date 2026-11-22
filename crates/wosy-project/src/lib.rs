@@ -386,6 +386,8 @@ pub struct ArtifactProfile {
     pub output: String,
     pub builder: String,
     pub run_runner: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exports: Option<std::collections::BTreeMap<String, String>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -396,7 +398,13 @@ pub struct TargetLayout {
 
 impl ArtifactProfile {
     pub fn target_layout(&self) -> Result<TargetLayout, String> {
-        match (self.backend.as_str(), self.output.as_str()) {
+        let backend_output = (self.backend.as_str(), self.output.as_str());
+        if self.exports.is_some()
+            && !matches!(backend_output, ("llvm", "wasm-wasip1" | "wasm-wasip2"))
+        {
+            return Err("root exports require a selected LLVM Wasm artifact profile".to_owned());
+        }
+        match backend_output {
             ("llvm", "wasm-wasip1" | "wasm-wasip2") => Ok(TargetLayout {
                 pointer_size: 4,
                 pointer_alignment: 4,
@@ -868,6 +876,7 @@ fn parse_artifacts(
                     output: scalar_string(profile, "output")?,
                     builder: scalar_string(profile, "builder")?,
                     run_runner: scalar_string(profile, "run_runner")?,
+                    exports: profile.get("exports").map(parse_root_exports).transpose()?,
                 },
             );
         }
@@ -880,6 +889,24 @@ fn parse_artifacts(
         );
     }
     Ok(artifacts)
+}
+
+fn parse_root_exports(item: &Item) -> Result<std::collections::BTreeMap<String, String>, String> {
+    let table = item
+        .as_table()
+        .ok_or_else(|| "artifact profile exports must be a table".to_owned())?;
+    if table.iter().next().is_none() {
+        return Err("artifact profile exports must not be empty".to_owned());
+    }
+    table
+        .iter()
+        .map(|(label, source)| {
+            let source = source
+                .as_str()
+                .ok_or_else(|| format!("artifact profile export {label:?} must name a root function"))?;
+            Ok((label.to_owned(), source.to_owned()))
+        })
+        .collect()
 }
 
 fn parse_target_profiles(
@@ -1223,6 +1250,39 @@ mod tests {
     }
 
     #[test]
+    fn artifact_root_exports_parse_optional_nonempty_tables() {
+        let document = r#"
+            [artifacts.main]
+            artifact = "runtime"
+            [artifacts.main.profiles.dev]
+            backend = "llvm"
+            output = "wasm-wasip1"
+            builder = "wasm"
+            run_runner = "wasm"
+            [artifacts.main.profiles.dev.exports]
+            demo_score = "score"
+            tick = "step"
+        "#;
+        let parse = |source: &str| {
+            let doc = source.parse::<DocumentMut>().expect("fixture TOML");
+            parse_artifacts(doc.get("artifacts"))
+        };
+        let artifacts = parse(document).expect("root exports");
+        let profile = &artifacts["main"].profiles["dev"];
+        assert_eq!(profile.exports.as_ref().unwrap()["demo_score"], "score");
+        assert!(profile.target_layout().is_ok());
+        let native = parse(&document.replace("wasm-wasip1", "native")).expect("parse native profile");
+        assert!(native["main"].profiles["dev"].target_layout().is_err());
+        let empty = document.replace("demo_score = \"score\"", "").replace("tick = \"step\"", "");
+        assert!(
+            parse(&empty)
+                .expect_err("empty export table")
+                .contains("must not be empty")
+        );
+        assert!(parse(&document.replace("tick = \"step\"", "tick = 1")).is_err());
+    }
+
+    #[test]
     fn artifact_profile_derives_documented_llvm_target_layouts() {
         for output in ["wasm-wasip1", "wasm-wasip2"] {
             let profile = ArtifactProfile {
@@ -1230,6 +1290,7 @@ mod tests {
                 output: output.to_owned(),
                 builder: "builder".to_owned(),
                 run_runner: "runner".to_owned(),
+                exports: None,
             };
             assert_eq!(
                 profile.target_layout(),
@@ -1244,6 +1305,7 @@ mod tests {
             output: "native".to_owned(),
             builder: "builder".to_owned(),
             run_runner: "runner".to_owned(),
+            exports: None,
         };
         assert_eq!(
             native.target_layout(),
@@ -1257,6 +1319,7 @@ mod tests {
             output: "custom".to_owned(),
             builder: "builder".to_owned(),
             run_runner: "runner".to_owned(),
+            exports: None,
         };
         assert_eq!(
             unsupported.target_layout(),

@@ -339,27 +339,149 @@ fn emit_scalar_llvm_with_metadata(
         &|reservations| prepared.aggregate(reservations),
         &|_, _, function| Some(&function.reference_cfg),
         metadata,
+        &[],
     )
 }
 
 pub fn emit_scalar_build_single_module_llvm(
     validation: &ScalarBuildValidation<'_>,
 ) -> Result<LlvmPartition, String> {
-    emit_scalar_build_single_module_with_metadata(validation, PartitionMetadata::Full)
+    emit_scalar_build_single_module_with_metadata(validation, PartitionMetadata::Full, &[])
 }
 
 pub fn emit_scalar_build_single_module_llvm_text(
     validation: &ScalarBuildValidation<'_>,
 ) -> Result<String, String> {
     Ok(
-        emit_scalar_build_single_module_with_metadata(validation, PartitionMetadata::ExternsOnly)?
+        emit_scalar_build_single_module_with_metadata(validation, PartitionMetadata::ExternsOnly, &[])?
             .into_text(),
     )
+}
+
+struct WasmRootExport<'a> {
+    label: &'a str,
+    symbol: String,
+    signature: &'a ScalarType,
+}
+
+pub fn emit_scalar_build_wasm_root_exports_llvm_text(
+    validation: &ScalarBuildValidation<'_>,
+    root: &wosy_syntax::SourceIdentity,
+    requested: &BTreeMap<String, String>,
+) -> Result<String, String> {
+    let modules = &validation.prepared().project().modules;
+    let singleton = modules.len() == 1;
+    let root_module = modules.iter().find(|module| &module.source == root)
+        .ok_or_else(|| format!("missing selected Wasm export root {}", root.path))?;
+    if root_module.target_layout != ScalarTargetLayout::WASM32 {
+        return Err("Wasm root exports require a Wasm artifact".into());
+    }
+    let direct = |ty: &ScalarType| matches!(
+        ty, ScalarType::I32 | ScalarType::U32 | ScalarType::I64 | ScalarType::U64
+            | ScalarType::F32 | ScalarType::F64
+    );
+    let mut root_functions = requested
+        .values()
+        .map(|name| (name.as_str(), None))
+        .collect::<BTreeMap<_, _>>();
+    for item in &root_module.items {
+        if let ScalarItem::Function(function) = item {
+            if let Some(entry) = root_functions.get_mut(function.name.as_str()) {
+                match entry {
+                    Some((_, ambiguous)) => *ambiguous = true,
+                    None => *entry = Some((function, false)),
+                }
+            }
+        }
+    }
+    let mut exports = Vec::with_capacity(requested.len());
+    for (label, authored) in requested {
+        let mut bytes = label.bytes();
+        if !bytes.next().is_some_and(|c| c.is_ascii_alphabetic() || c == b'_')
+            || !bytes.all(|c| c.is_ascii_alphanumeric() || c == b'_')
+            || matches!(label.as_str(), "main" | "_start" | "memory")
+            || label.starts_with("__") || label.starts_with("wosy_")
+        {
+            return Err(format!("invalid or reserved Wasm root export label {label:?}"));
+        }
+        let (function, ambiguous) = root_functions[authored.as_str()].ok_or_else(|| {
+            format!("Wasm root export {label:?} names no root function {authored:?}")
+        })?;
+        if ambiguous || !function.generic_parameters.is_empty()
+            || !function.overload_arms.is_empty()
+        {
+            return Err(format!("Wasm root export {label:?} needs an unambiguous concrete declaration"));
+        }
+        let ScalarType::Callable { outputs, parameters } = &function.signature else {
+            return Err(format!("Wasm root export {label:?} is not callable"));
+        };
+        if !parameters.iter().all(direct) || !match outputs.outputs.as_slice() {
+            [] => true,
+            [output] => output.ty == ScalarType::Unit || direct(&output.ty),
+            _ => false,
+        } {
+            return Err(format!("Wasm root export {label:?} needs only direct scalar ABI values"));
+        }
+        exports.push(WasmRootExport {
+            label,
+            symbol: if singleton { authored.clone() } else { project_function_name(root, authored) },
+            signature: &function.signature,
+        });
+    }
+    Ok(if singleton {
+        emit_scalar_build_single_module_with_metadata(validation, PartitionMetadata::ExternsOnly, &exports)?
+    } else {
+        emit_scalar_build_project_with_policy(
+            validation, EmissionPolicy::Prepared, PartitionMetadata::ExternsOnly, &exports,
+        )?
+    }.into_text())
+}
+
+fn emit_wasm_root_export_wrappers<'ctx>(
+    context: &'ctx Context,
+    module: &Module<'ctx>,
+    functions: &BTreeMap<String, FunctionValue<'ctx>>,
+    exports: &[WasmRootExport<'_>],
+) -> Result<(), String> {
+    for export in exports {
+        let implementation = functions.get(&export.symbol).copied().ok_or_else(|| {
+            format!("missing emitted implementation of Wasm root export {:?}", export.label)
+        })?;
+        let expected = function_type(context, export.signature, ScalarTargetLayout::WASM32)?;
+        if implementation.get_type() != expected || implementation.get_call_conventions() != 0 {
+            return Err(format!("Wasm root export {:?} has a non-direct ABI", export.label));
+        }
+        if module.get_global(export.label).is_some()
+            || (export.label != export.symbol && module.get_function(export.label).is_some())
+        {
+            return Err(format!("Wasm root export {:?} collides with an emitted symbol", export.label));
+        }
+    }
+    if exports.is_empty() {
+        return Ok(());
+    }
+    let builder = context.create_builder();
+    for export in exports {
+        if export.label == export.symbol {
+            continue;
+        }
+        let implementation = functions[&export.symbol];
+        let wrapper = module.add_function(export.label, implementation.get_type(), Some(Linkage::External));
+        builder.position_at_end(context.append_basic_block(wrapper, "entry"));
+        let arguments = wrapper.get_param_iter().map(Into::into).collect::<Vec<BasicMetadataValueEnum<'ctx>>>();
+        let call = builder.build_call(implementation, &arguments, "root_export_call")
+            .map_err(builder_error)?;
+        let result = call.try_as_basic_value().basic();
+        builder.build_return(result.as_ref().map(|v| v as &dyn inkwell::values::BasicValue))
+            .map_err(builder_error)?;
+    }
+    Ok(())
 }
 
 fn emit_scalar_build_single_module_with_metadata(
     validation: &ScalarBuildValidation<'_>,
     metadata: PartitionMetadata,
+    exports: &[WasmRootExport<'_>],
 ) -> Result<LlvmPartition, String> {
     if !validation.diagnostics().is_empty() {
         return Err("cannot emit LLVM for an invalid scalar program".into());
@@ -389,6 +511,7 @@ fn emit_scalar_build_single_module_with_metadata(
         &|reservations| validation.aggregate(reservations),
         &|item, arm, _| validation.reference_cfg(0, item, arm),
         metadata,
+        exports,
     )
 }
 
@@ -407,6 +530,7 @@ fn emit_single_module_llvm<'a>(
         &'a ScalarFunction,
     ) -> Option<&'a ScalarReferenceCfg>,
     metadata: PartitionMetadata,
+    exports: &[WasmRootExport<'_>],
 ) -> Result<LlvmPartition, String> {
     let prepared_render = generic_input.prepared_render();
     let initializer_nodes = Some(initialization_region.bind_call_nodes(items)?);
@@ -689,6 +813,9 @@ fn emit_single_module_llvm<'a>(
         &layouts,
         target_layout,
     )?;
+    if !exports.is_empty() {
+        emit_wasm_root_export_wrappers(&context, &module, &functions, exports)?;
+    }
     finish_partition(
         ManuallyDrop::into_inner(module),
         source.path.clone(),
@@ -712,6 +839,7 @@ pub fn emit_scalar_project_llvm(
         &build,
         EmissionPolicy::RawCompatibility,
         PartitionMetadata::Full,
+        &[],
     )
 }
 
@@ -722,6 +850,7 @@ pub fn emit_scalar_build_project_llvm(
         validation,
         EmissionPolicy::Prepared,
         PartitionMetadata::Full,
+        &[],
     )
 }
 
@@ -732,6 +861,7 @@ pub fn emit_scalar_build_project_llvm_text(
         validation,
         EmissionPolicy::Prepared,
         PartitionMetadata::ExternsOnly,
+        &[],
     )?
     .into_text())
 }
@@ -740,6 +870,7 @@ fn emit_scalar_build_project_with_policy(
     validation: &ScalarBuildValidation<'_>,
     policy: EmissionPolicy,
     metadata: PartitionMetadata,
+    exports: &[WasmRootExport<'_>],
 ) -> Result<LlvmPartition, String> {
     if !validation.diagnostics().is_empty() {
         return Err("cannot emit LLVM for an invalid scalar project".into());
@@ -759,6 +890,7 @@ fn emit_scalar_build_project_with_policy(
             EmissionPolicy::Prepared => Some(validation),
         },
         metadata,
+        exports,
     )
 }
 
@@ -775,6 +907,7 @@ fn emit_project_llvm<'a>(
     ) -> Option<&'a ScalarReferenceCfg>,
     project_build: Option<&'a ScalarBuildValidation<'a>>,
     metadata: PartitionMetadata,
+    exports: &[WasmRootExport<'_>],
 ) -> Result<LlvmPartition, String> {
     let mut module_ordinals = HashMap::with_capacity(project.modules.len());
     for (ordinal, module) in project.modules.iter().enumerate() {
@@ -1202,6 +1335,9 @@ fn emit_project_llvm<'a>(
         &layouts,
         target_layout,
     )?;
+    if !exports.is_empty() {
+        emit_wasm_root_export_wrappers(&context, &module, &functions, exports)?;
+    }
     finish_partition(
         ManuallyDrop::into_inner(module),
         module_name,
