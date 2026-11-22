@@ -2781,7 +2781,7 @@ impl<'a> MainFlowProofObserver<'a> {
         }
     }
 
-    fn insert(&mut self, scope: ScalarCheckerScope, plan: &PlannedModuleProof<'a>, proof: MainFlowProofPlan<'a>) {
+    fn insert(&mut self, scope: ScalarCheckerScope, allow_issuer: bool, plan: &PlannedModuleProof<'a>, proof: MainFlowProofPlan<'a>) {
         let target = plan.target;
         if self.first.0 == target {
             self.first.1.issuer = None;
@@ -2795,7 +2795,7 @@ impl<'a> MainFlowProofObserver<'a> {
                 group.cases.push(proof);
             }
             std::collections::hash_map::Entry::Vacant(entry) => {
-                let issuer = SymbolicEqualityIssuer::for_symbolic_case(scope, plan, &proof);
+                let issuer = allow_issuer.then(|| SymbolicEqualityIssuer::for_symbolic_case(scope, plan, &proof)).flatten();
                 entry.insert(MainFlowProofTarget { issuer, ..MainFlowProofTarget::new(proof) });
             }
         }
@@ -3035,6 +3035,17 @@ fn check_loaded_ordered_proof_diagnostics(
     inputs: ScalarPreparationInputs,
     scope: ScalarCheckerScope,
 ) -> Result<MainFlowProofReceipt, ProjectCheck> {
+    check_loaded_ordered_proof_diagnostics_in_scope::<false>(declarations, proofs, initialization_order, inputs, scope)
+}
+
+#[cfg(feature = "internal-checker")]
+fn check_loaded_ordered_proof_diagnostics_in_scope<const LOCAL_CATALOGS: bool>(
+    declarations: Vec<(ScalarSourceDeclarations, Vec<ScalarNamespaceBinding>)>,
+    proofs: Vec<(ScalarProofDeclarations, Vec<ScalarNamespaceBinding>)>,
+    initialization_order: Vec<SourceIdentity>,
+    inputs: ScalarPreparationInputs,
+    scope: ScalarCheckerScope,
+) -> Result<MainFlowProofReceipt, ProjectCheck> {
     if proofs.is_empty() {
         let (prepared, startup_count) = prepare_checked_package_scope(
             declarations, initialization_order, Vec::new(), inputs, scope,
@@ -3042,39 +3053,71 @@ fn check_loaded_ordered_proof_diagnostics(
         return run_closed_without_named_proofs(&prepared, scope, startup_count);
     }
     let prepared = prepare_loaded_proof_project(declarations, proofs, initialization_order, inputs)?;
-    if prepared.proofs.iter().any(|(source, catalog)| source != &prepared.source && !catalog.definitions.is_empty()) {
-        return Err(ProjectCheck::Unsupported);
-    }
-    let Some((proof_source, catalog, first, rest)) = prepared.proofs.get_key_value(&prepared.source)
-        .and_then(|(source, catalog)| catalog.definitions.split_first().map(|(first, rest)| (source, catalog, first, rest)))
-    else {
-        let startup_count = prepared.prepared.parts().0.modules.len();
-        return run_closed_without_named_proofs(&prepared.prepared, scope, startup_count);
+    let project = prepared.prepared.parts().0;
+    let startup_count = project.modules.len();
+    let sources = if LOCAL_CATALOGS {
+        project.initialization_order.as_slice()
+    } else {
+        if prepared.proofs.iter().any(|(source, catalog)| source != &prepared.source && !catalog.definitions.is_empty()) {
+            return Err(ProjectCheck::Unsupported);
+        }
+        std::slice::from_ref(&prepared.source)
     };
-    let first_name = module_proof_name(first).ok_or(ProjectCheck::InvalidProof)?;
-    let rest_names = rest.iter().map(|definition| module_proof_name(definition).ok_or(ProjectCheck::InvalidProof))
-        .collect::<Result<Vec<_>, _>>()?;
-    if !rest_names.is_empty() {
-        let mut names = HashSet::with_capacity(catalog.definitions.len());
-        if !std::iter::once(&first_name).chain(&rest_names).all(|name| names.insert(name.text())) {
-            return Err(ProjectCheck::AmbiguousRoot);
+    let mut first = None;
+    let mut others = Vec::new();
+    for source in sources {
+        let Some((proof_source, catalog)) = prepared.proofs.get_key_value(source) else { continue; };
+        if catalog.definitions.is_empty() {
+            continue;
+        }
+        if LOCAL_CATALOGS && (proof_source.project != prepared.source.project || proof_source.package != prepared.source.package) {
+            return Err(ProjectCheck::Unsupported);
+        }
+        let mut select = |index, definition, name| {
+            let selection = (proof_source, name, definition, catalog.first_query + index);
+            if first.is_some() {
+                others.push(selection);
+            } else {
+                first = Some(selection);
+            }
+        };
+        if let [definition] = catalog.definitions.as_slice() {
+            select(0, definition, module_proof_name(definition).ok_or(ProjectCheck::InvalidProof)?);
+        } else {
+            let names = catalog.definitions.iter().map(|definition|
+                module_proof_name(definition).ok_or(ProjectCheck::InvalidProof)
+            ).collect::<Result<Vec<_>, _>>()?;
+            let mut unique = HashSet::with_capacity(names.len());
+            if !names.iter().all(|name| unique.insert(name.text())) {
+                return Err(ProjectCheck::AmbiguousRoot);
+            }
+            drop(unique);
+            for (index, (definition, name)) in catalog.definitions.iter().zip(names).enumerate() {
+                select(index, definition, name);
+            }
         }
     }
+    let Some((source, name, definition, query)) = first.as_ref() else {
+        return run_closed_without_named_proofs(&prepared.prepared, scope, startup_count);
+    };
     let first_plan = prepared.plan_resolved_module_proof::<false, false, false>(
-        proof_source, first_name.text(), prepared.resolve_selected_proof(first, catalog.first_query)?,
+        source, name.text(), prepared.resolve_selected_proof(definition, *query)?,
     )?;
-    let others = rest.iter().zip(&rest_names).enumerate().map(|(index, (definition, name))| {
-        let selected = prepared.resolve_selected_proof(definition, catalog.first_query + 1 + index)?;
-        prepared.plan_resolved_module_proof::<false, false, false>(proof_source, name.text(), selected)
+    let plans = others.iter().map(|(source, name, definition, query)| {
+        let selected = prepared.resolve_selected_proof(definition, *query)?;
+        prepared.plan_resolved_module_proof::<false, false, false>(source, name.text(), selected)
     }).collect::<Result<Vec<_>, _>>()?;
-    let first_case = MainFlowProofCase::prepare(&first_plan, &prepared.source)?;
-    let issuer = SymbolicEqualityIssuer::for_symbolic_case(scope, &first_plan, &first_case);
+    let first_case = MainFlowProofCase::prepare(&first_plan, first_plan.proof_source)?;
+    let issuer = if first_plan.proof_source == &prepared.source {
+        SymbolicEqualityIssuer::for_symbolic_case(scope, &first_plan, &first_case)
+    } else {
+        None
+    };
     let mut observer = MainFlowProofObserver::new(first_plan.target, first_case);
     observer.first.1.issuer = issuer;
-    for plan in &others {
-        observer.insert(scope, plan, MainFlowProofCase::prepare(plan, &prepared.source)?);
+    for plan in &plans {
+        observer.insert(scope, plan.proof_source == &prepared.source, plan, MainFlowProofCase::prepare(plan, plan.proof_source)?);
     }
-    let startup_count = prepared.prepared.parts().0.modules.len();
     let run = run_prepared_ordered_check(
         &prepared.prepared, scope, startup_count, OrderedReachPolicy::Closed,
         NamedOrderedEvidence { observed: observer },
@@ -3096,6 +3139,22 @@ pub fn check_loaded_scalar_ordered_proof_contexts(
 ) -> Result<MainFlowProofReceipt, ScalarOrderedCheckerOutcome> {
     check_loaded_ordered_proof_diagnostics(
         declarations, vec![selected_root], initialization_order, inputs, ScalarCheckerScope::CurrentPackage,
+    ).map_err(|error| match error {
+        ProjectCheck::Invalid(diagnostics) => ScalarOrderedCheckerOutcome::Invalid(diagnostics),
+        _ => ScalarOrderedCheckerOutcome::Unsupported,
+    })
+}
+
+#[cfg(feature = "internal-checker")]
+#[doc(hidden)]
+pub fn check_loaded_scalar_ordered_local_proof_contexts(
+    declarations: Vec<(ScalarSourceDeclarations, Vec<ScalarNamespaceBinding>)>,
+    local_catalogs: impl IntoIterator<Item = (ScalarProofDeclarations, Vec<ScalarNamespaceBinding>)>,
+    initialization_order: Vec<SourceIdentity>,
+    inputs: ScalarPreparationInputs,
+) -> Result<MainFlowProofReceipt, ScalarOrderedCheckerOutcome> {
+    check_loaded_ordered_proof_diagnostics_in_scope::<true>(
+        declarations, local_catalogs.into_iter().collect(), initialization_order, inputs, ScalarCheckerScope::CurrentPackage,
     ).map_err(|error| match error {
         ProjectCheck::Invalid(diagnostics) => ScalarOrderedCheckerOutcome::Invalid(diagnostics),
         _ => ScalarOrderedCheckerOutcome::Unsupported,
@@ -7358,6 +7417,53 @@ mod tests {
         assert_eq!(collect_ordered_package_failures(&actual, ScalarCheckerScope::MainFlowOnly, 1), Err(ProjectCheck::Unsupported));
         let (_, different_axis) = prepare("x < 2 || y > 6", "");
         assert_eq!(collect_ordered_package_failures(&different_axis, ScalarCheckerScope::CurrentPackage, 1), Err(ProjectCheck::Unsupported));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordered_reachable_local_proof_catalogs_report_exact_cross_file_sources() {
+        let app = source("src/main.w", "ordered-local-app");
+        let lib = source("src/lib.w", "ordered-local-lib");
+        let app_text = r#"%%start
+            lib = namespace demo "src/lib.w";
+            i8(i8) main_echo = fn(value) { value };
+            proof shared for main_echo(entry) -> (out) ensures (out < 5) {}
+            i8 first = main_echo(7);
+            i8 second = lib.echo(8);
+        %%end"#;
+        let lib_text = r#"%%start
+            i8(i8) echo = fn(value) { value };
+            i8(i8) unused = fn(value) { value };
+            proof shared for echo(entry) -> (out) ensures (out < 5) {}
+            proof uncovered for unused(entry) -> (out) ensures (out != 7) {}
+        %%end"#;
+        let run = |lib: &SourceIdentity, lib_text: &str| {
+            let (_, root_catalog) = crate::parse_proof_source(app.clone(), app_text.into(), &[]).unwrap_or_else(|_| panic!("valid root proof source"));
+            let (_, lib_catalog) = crate::parse_proof_source(lib.clone(), lib_text.into(), &[]).unwrap_or_else(|_| panic!("valid local proof source"));
+            let binding = ScalarNamespaceBinding {
+                binding: "lib".into(), target: lib.clone(), span: ByteSpan::new(0, 0),
+            };
+            check_loaded_scalar_ordered_local_proof_contexts(
+                Vec::new(), [(lib_catalog, Vec::new()), (root_catalog, vec![binding])],
+                vec![app.clone(), lib.clone()], inputs(),
+            )
+        };
+        let report = run(&lib, lib_text).unwrap();
+        assert!(report.active && report.directives.is_empty());
+        let [first, second] = report.diagnostics.as_slice() else { panic!("both actual proof failures"); };
+        assert_eq!(first.proof.source, app);
+        assert_eq!(second.proof.source, lib);
+        assert_eq!(second.invocation.call.source, app);
+        let range = second.invocation.call.range;
+        assert_eq!(&app_text[range.start as usize..range.end as usize], "lib.echo(8)");
+        let symbolic = report.symbolic_diagnostic.unwrap();
+        assert_eq!(symbolic.callable.source, lib);
+        assert_eq!(symbolic.proof.source, lib);
+        assert!(report.additional_symbolic_diagnostics.is_empty());
+        assert!(matches!(run(&lib, &lib_text.replace("proof uncovered", "proof shared")),
+            Err(ScalarOrderedCheckerOutcome::Unsupported)));
+        let foreign = SourceIdentity { project: "foreign-project".into(), ..lib.clone() };
+        assert!(matches!(run(&foreign, lib_text), Err(ScalarOrderedCheckerOutcome::Unsupported)));
     }
 
     #[cfg(feature = "internal-checker")]

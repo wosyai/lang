@@ -1,13 +1,12 @@
-use std::collections::HashSet;
 use std::io::{self, Write};
 use std::path::Path;
 use std::process::ExitCode;
 
 use wosy_compiler::{
-    check_loaded_scalar_ordered_proof_contexts, MainFlowProofReceipt, ScalarOrderedCheckerOutcome,
+    check_loaded_scalar_ordered_local_proof_contexts, MainFlowProofReceipt, ScalarOrderedCheckerOutcome,
     ScalarPreparationInputs, ScalarTargetLayout,
 };
-use wosy_project::{PackageRelativePath, ProjectConfiguration, ProjectContext};
+use wosy_project::{ProjectConfiguration, ProjectContext};
 
 #[allow(dead_code)]
 #[path = "../src/canonical_loader.rs"]
@@ -26,13 +25,11 @@ fn inspect(root: &Path, target: &str, profile: &str) -> Result<MainFlowProofRece
     let target_layout = ScalarTargetLayout {
         pointer_size: layout.pointer_size, pointer_alignment: layout.pointer_alignment,
     };
-    let selected = PackageRelativePath::new(project.source_root.clone()).map_err(|_| "invalid target path")?;
-    let mut loaded = load_canonical_project_inputs(
-        &root, &project, &configuration, CanonicalLoadPurpose::Proof(HashSet::from([selected.clone()])), || {},
+    let loaded = load_canonical_project_inputs(
+        &root, &project, &configuration, CanonicalLoadPurpose::LocalProofs, || {},
     ).map_err(|_| "canonical source load failed")?;
-    let catalog = loaded.proofs.remove(&selected).ok_or("selected proof root is not in the canonical graph")?;
-    check_loaded_scalar_ordered_proof_contexts(
-        loaded.declarations, catalog, loaded.initialization_order, ScalarPreparationInputs { target_layout },
+    check_loaded_scalar_ordered_local_proof_contexts(
+        loaded.declarations, loaded.proofs.into_values(), loaded.initialization_order, ScalarPreparationInputs { target_layout },
     ).map_err(|outcome| match outcome {
         ScalarOrderedCheckerOutcome::Invalid(_) => "checker rejected invalid input",
         _ => "checker did not complete analysis",

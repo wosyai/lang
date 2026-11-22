@@ -136,6 +136,31 @@ def main():
         assert incomplete.stderr == b"ordered check: incomplete: checker did not complete analysis\n", incomplete
         assert sorted(entry.name for entry in root.iterdir()) == ["main.w", "wosy.toml"]
 
+        module = root / "lib.w"
+        source.write_text(
+            '%%start lib = namespace app "lib.w"; i8 result = lib.echo(8); %%end',
+            encoding="utf-8",
+        )
+        library = """%%start
+            i8(i8) echo = fn(value) { value };
+            i8(i8) unused = fn(value) { value };
+            proof reached for echo(entry) -> (out) ensures (out < 5) {}
+            proof uncovered for unused(entry) -> (out) ensures (out != 7) {}
+        %%end"""
+        module.write_text(library, encoding="utf-8")
+        local = subprocess.run(command, cwd=root, capture_output=True, timeout=15)
+        assert local.returncode == 1 and local.stderr == b"", local
+        assert local.stdout == (
+            b"ordered check: complete\ndirective failures: 0\n"
+            b"actual proof failures: 1 (0 nested)\nunused proof failures: 1\n"
+        ), local
+
+        module.write_text(library.replace("unused = fn(value) { value }", "unused = fn(value) { value + 1 }"), encoding="utf-8")
+        local_incomplete = subprocess.run(command, cwd=root, capture_output=True, timeout=15)
+        assert local_incomplete.returncode == 2 and local_incomplete.stdout == b"", local_incomplete
+        assert local_incomplete.stderr == b"ordered check: incomplete: checker did not complete analysis\n", local_incomplete
+        assert sorted(entry.name for entry in root.iterdir()) == ["lib.w", "main.w", "wosy.toml"]
+
 
 if __name__ == "__main__":
     main()

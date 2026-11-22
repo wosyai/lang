@@ -26,6 +26,9 @@ pub(crate) enum CanonicalLoadPurpose {
     Check,
     #[cfg(feature = "internal-checker")]
     Proof(HashSet<PackageRelativePath>),
+    #[cfg(feature = "internal-checker")]
+    #[allow(dead_code)]
+    LocalProofs,
 }
 
 enum CanonicalSourceDeclarations {
@@ -142,9 +145,15 @@ pub(crate) fn load_canonical_project_inputs(
         let text = fs::read_to_string(&source_path)
             .map_err(|error| format!("failed to read {}: {error}", source_path.display()))?;
         let source = canonical_source_identity(project_identity, &package, &path, &text);
+        #[cfg(feature = "internal-checker")]
+        let parse_proofs = match &purpose {
+            CanonicalLoadPurpose::LocalProofs => package == project.package,
+            CanonicalLoadPurpose::Proof(selected) => package == project.package && selected.contains(&path),
+            _ => false,
+        };
         let (text, declarations) = match &purpose {
             #[cfg(feature = "internal-checker")]
-            CanonicalLoadPurpose::Proof(selected) if package == project.package && selected.contains(&path) => {
+            _ if parse_proofs => {
                 let (text, proof) = wosy_compiler::parse_proof_source(source, text, &project.comment_categories)
                     .map_err(canonical_syntax_failure)?;
                 (text, CanonicalSourceDeclarations::Proof(proof))
@@ -155,7 +164,7 @@ pub(crate) fn load_canonical_project_inputs(
                     match &purpose {
                         CanonicalLoadPurpose::Build(persist) => Some((root, *persist)),
                         #[cfg(feature = "internal-checker")]
-                        CanonicalLoadPurpose::Check | CanonicalLoadPurpose::Proof(_) => None,
+                        CanonicalLoadPurpose::Check | CanonicalLoadPurpose::Proof(_) | CanonicalLoadPurpose::LocalProofs => None,
                     },
                 )?;
                 (text, CanonicalSourceDeclarations::Ordinary(declarations))
