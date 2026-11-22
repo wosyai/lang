@@ -28,7 +28,7 @@ use super::{
     },
 };
 #[cfg(feature = "internal-checker")]
-use super::{checker_flow::{evaluate_borrowed_return_proof, observe_authored_show_returns, integer_predicate_implies, observe_arbitrary_integer_returns, observe_unused_module_proof_returns, GuardedOutputClaims, ImmutableEntryRange, IntegerShowOutput}, symbolic_integer::IntegerShowConstraints, typecheck::integer_bounds};
+use super::{checker_flow::{evaluate_borrowed_return_proof, observe_authored_show_returns, integer_predicate_implies, observe_arbitrary_integer_returns, observe_unused_module_proof_returns, GuardedOutputClaims, ImmutableEntryRange, ImmutableProofOutputComparison, IntegerShowOutput}, symbolic_integer::IntegerShowConstraints, typecheck::integer_bounds};
 use crate::Diagnostic;
 use wosy_syntax::SourceIdentity;
 use wosy_syntax::{CanonicalCstRoot, CstNode, CstToken, SyntaxKind};
@@ -2966,34 +2966,19 @@ impl PreparedProofModule {
                             continue;
                         }
                         let goal = &plan.typed.goal;
-                        let entry = if let TypedProofGoal::EntryComparison { slot, relation } = goal {
-                            let Some(binding) = body.boundary.checker_parameter_bindings.as_ref().and_then(|bindings| bindings.get(*slot)) else {
-                                continue;
-                            };
-                            Some((binding, *relation))
+                        let holds = if let TypedProofGoal::EntryComparison { slot, relation } = goal {
+                            ImmutableProofOutputComparison::prepare(body, *slot, plan.typed.result_type, *relation)
+                                .and_then(|entry| entry.holds(&paths, None))
                         } else {
-                            None
-                        };
-                        let mut holds = Some(true);
-                        for path in &paths {
-                            if let Some((binding, relation)) = entry {
-                                if holds == Some(false) {
-                                    if matches!(path.value, IntegerReturn::Alias(alias) if alias != binding) {
-                                        holds = None;
-                                    }
-                                } else {
-                                    holds = path.output_satisfies_immutable_entry(binding, relation);
-                                }
-                                if holds.is_none() {
-                                    break;
-                                }
-                            } else {
+                            let mut holds = Some(true);
+                            for path in &paths {
                                 holds = goal.holds_on_returned_path(path);
                                 if holds != Some(true) {
                                     break;
                                 }
                             }
-                        }
+                            holds
+                        };
                         outcomes[index] = match holds {
                             Some(true) => ScalarModuleProofOutcome::Proved,
                             Some(false) => ScalarModuleProofOutcome::Refuted,
@@ -4582,15 +4567,9 @@ fn proof_show_plan<'a, const VERIFY_ENTRY_WRITES: bool, const ALLOW_NAMED_STEPS:
             if ALLOW_NAMED_STEPS {
                 if let Some(entry) = checked_old_output_relation(claim, output, inputs, body, ty) {
                     let (slot, relation) = entry?;
-                    let binding = bindings.get(slot).ok_or(ProjectCheck::Unsupported)?;
-                    // Only an independently checked second formal of the same exact
-                    // width/sign may be compared against this immutable entry.
-                    let other = match (bindings, body.boundary.parameters.as_slice()) {
-                        ([_, second], [_, second_param]) if slot == 0 && second_param.ty == *ty => Some(second),
-                        ([first, _], [first_param, _]) if slot == 1 && first_param.ty == *ty => Some(first),
-                        _ => None,
-                    };
-                    return Ok(IntegerShowProof::EntryComparison { binding, relation, other });
+                    let entry = ImmutableProofOutputComparison::prepare(body, slot, ty, relation)
+                        .ok_or(ProjectCheck::Unsupported)?;
+                    return Ok(IntegerShowProof::EntryComparison(entry));
                 }
                 if let ScalarExpression::Binary { operator: BinaryOperator::Or, left, right, .. } = claim {
                     if inputs.iter().any(|name| is_null_literal_name(name)) {

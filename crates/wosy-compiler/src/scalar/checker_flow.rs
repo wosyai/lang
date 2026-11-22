@@ -536,11 +536,7 @@ pub(super) enum IntegerShowProof<'a> {
     #[cfg(feature = "internal-checker")]
     Output(IntegerShowOutput),
     #[cfg(feature = "internal-checker")]
-    EntryComparison {
-        binding: &'a ReferenceBindingId,
-        relation: IntegerRelation,
-        other: Option<&'a ReferenceBindingId>,
-    },
+    EntryComparison(ImmutableProofOutputComparison<'a>),
     #[cfg(feature = "internal-checker")]
     GuardedOutput {
         guard: IntegerPredicate,
@@ -729,6 +725,75 @@ impl CartesianRelation {
     }
 }
 
+#[cfg(feature = "internal-checker")]
+pub(super) struct ImmutableProofOutputComparison<'a> {
+    binding: &'a ReferenceBindingId,
+    relation: IntegerRelation,
+    other: Option<(&'a ReferenceBindingId, CartesianRelation)>,
+}
+
+#[cfg(feature = "internal-checker")]
+impl<'a> ImmutableProofOutputComparison<'a> {
+    pub(super) fn prepare(
+        body: &'a FunctionCallSites, slot: usize, ty: &ScalarType, relation: IntegerRelation,
+    ) -> Option<Self> {
+        let bindings = body.boundary.checker_parameter_bindings.as_deref()?;
+        let parameters = body.boundary.parameters.as_slice();
+        let binding = bindings.get(slot)?;
+        if &parameters.get(slot)?.ty != ty {
+            return None;
+        }
+        let other = match (bindings, parameters) {
+            ([_, other], [_, parameter]) if slot == 0 && &parameter.ty == ty => Some(other),
+            ([other, _], [parameter, _]) if slot == 1 && &parameter.ty == ty => Some(other),
+            _ => None,
+        }.map(|other| (other, CartesianRelation::prepare(relation)));
+        Some(Self { binding, relation, other })
+    }
+
+    pub(super) fn holds(
+        &self, paths: &[IntegerReturningPath<'_>], output: Option<(IntegerRelation, &BigInt)>,
+    ) -> Option<bool> {
+        let mut proved = true;
+        for path in paths {
+            match path.value {
+                IntegerReturn::Alias(alias) if alias != self.binding => {
+                    let (other, comparison) = self.other?;
+                    if alias != other {
+                        return None;
+                    }
+                    if !proved {
+                        continue;
+                    }
+                    let returned = path.axes.iter().position(|known| *known == alias)?;
+                    let old = path.axes.iter().position(|known| *known == self.binding)?;
+                    for row in &path.state.0 {
+                        let result = &row[returned];
+                        if !output.is_none_or(|(relation, bound)| result.every_at_extremes(relation, bound))
+                            || !comparison.holds(result, &row[old])?
+                        {
+                            proved = false;
+                            break;
+                        }
+                    }
+                }
+                IntegerReturn::Alias(_) if proved => {
+                    proved = self.relation.accepts(std::cmp::Ordering::Equal) && match output {
+                        Some((relation, bound)) => path.output_satisfies(relation, bound)?,
+                        None => true,
+                    };
+                }
+                IntegerReturn::Const(value) if proved => {
+                    proved = output.is_none_or(|(relation, bound)| relation.accepts(value.cmp(bound)))
+                        && path.binding_satisfies(self.binding, self.relation.reversed(), value)?;
+                }
+                _ => {}
+            }
+        }
+        Some(proved)
+    }
+}
+
 fn shows_return_equality(
     state: &IntegerInputs,
     axes: &[&ReferenceBindingId],
@@ -784,17 +849,6 @@ impl IntegerReturningPath<'_> {
                 row[0].covers_closed(first.lower, first.upper) && row[1].covers_closed(second.lower, second.upper)
             }),
             Some(_) => false,
-        }
-    }
-
-    #[cfg(feature = "internal-checker")]
-    pub(super) fn output_satisfies_immutable_entry(
-        &self, entry: &ReferenceBindingId, relation: IntegerRelation,
-    ) -> Option<bool> {
-        match self.value {
-            IntegerReturn::Alias(binding) if binding == entry => Some(relation.accepts(std::cmp::Ordering::Equal)),
-            IntegerReturn::Alias(_) => None,
-            IntegerReturn::Const(value) => self.binding_satisfies(entry, relation.reversed(), value),
         }
     }
 
@@ -858,46 +912,12 @@ impl IntegerReturningPath<'_> {
         }
     }
 
-    #[cfg(feature = "internal-checker")]
-    fn entry_show_with_output_bound(
-        &self, binding: &ReferenceBindingId, other: Option<&ReferenceBindingId>,
-        entry_relation: IntegerRelation, relation: IntegerRelation, bound: &BigInt, still_provable: bool,
-    ) -> Option<bool> {
-        match self.value {
-            IntegerReturn::Alias(alias) if alias != binding => {
-                if Some(alias) != other {
-                    return None;
-                }
-                if !still_provable {
-                    return Some(false);
-                }
-                let returned = self.axes.iter().position(|known| *known == alias)?;
-                let old = self.axes.iter().position(|known| *known == binding)?;
-                let comparison = CartesianRelation::prepare(entry_relation);
-                for row in &self.state.0 {
-                    let result = &row[returned];
-                    if !result.every_at_extremes(relation, bound)
-                        || !comparison.holds(result, &row[old])?
-                    {
-                        return Some(false);
-                    }
-                }
-                Some(true)
-            }
-            _ if !still_provable => Some(false),
-            IntegerReturn::Alias(_) => Some(entry_relation.accepts(std::cmp::Ordering::Equal)
-                && self.output_satisfies(relation, bound)?),
-            IntegerReturn::Const(value) => Some(relation.accepts(value.cmp(bound))
-                && self.output_satisfies_immutable_entry(binding, entry_relation)?),
-        }
-    }
-
     fn shows(self, proof: &IntegerShowProof<'_>) -> Option<bool> {
         let (guard, then_claim, else_claim) = match proof {
             IntegerShowProof::Equality(claim) => return shows_return_equality(&self.state, &self.axes, &self.value, claim),
             IntegerShowProof::Sequence(_) => return None,
             #[cfg(feature = "internal-checker")]
-            IntegerShowProof::Output(_) | IntegerShowProof::EntryComparison { .. }
+            IntegerShowProof::Output(_) | IntegerShowProof::EntryComparison(_)
             | IntegerShowProof::GuardedOutput { .. } | IntegerShowProof::MixedSequence { .. } => return None,
             IntegerShowProof::Conditional { guard, then_claim, else_claim } => (guard, then_claim, else_claim),
         };
@@ -1410,12 +1430,8 @@ pub(super) fn evaluate_borrowed_return_proof(
         return Some(proved);
     }
     #[cfg(feature = "internal-checker")]
-    if let Some(IntegerShowProof::EntryComparison { binding, relation: entry_relation, other }) = proof {
-        let mut proved = true;
-        for path in paths {
-            proved = path.entry_show_with_output_bound(binding, *other, *entry_relation, relation, bound, proved)?;
-        }
-        return Some(proved);
+    if let Some(IntegerShowProof::EntryComparison(entry)) = proof {
+        return entry.holds(paths, Some((relation, bound)));
     }
     #[cfg(feature = "internal-checker")]
     if let Some(IntegerShowProof::GuardedOutput { guard, claims }) = proof {

@@ -1116,6 +1116,55 @@ fn named_proof_show_old_orders_same_width_formals_without_crossing_return_rows()
 }
 
 #[test]
+fn named_proof_ensures_compares_exact_immutable_formals_in_same_row() {
+    let identity = source();
+    let check = |target: &str, where_guard: &str, operator: &str| {
+        check_scalar_module_proof(
+            identity.clone(), "verify",
+            vec![ScalarProofModuleInput {
+                source: identity.clone(),
+                text: format!(r#"%%start
+                    i16(i16, i16) echo = fn(value, limit) {{ if (limit == 0) {{}}; value }};
+                    i16(i16, i16) ordered_rows = fn(value, limit) {{
+                        if (limit < 20) {{
+                            if (value < 10) {{ value }} else {{ 0 }}
+                        }} else {{
+                            if (value < 20) {{ value }} else {{ 0 }}
+                        }}
+                    }};
+                    i16(i16, i16) const_first = fn(value, limit) {{
+                        if (value == 0) {{}}; if (limit == 0) {{ 7 }} else {{ i16 local = 3; local }}
+                    }};
+                    i16(i16, i16) local_first = fn(value, limit) {{
+                        if (value == 0) {{}}; if (limit == 0) {{ i16 local = 3; local }} else {{ 7 }}
+                    }};
+                    proof verify for {target}(value, limit) -> (out) where ({where_guard})
+                        ensures (out {operator} core.old(limit)) {{}}
+                %%end"#),
+                namespaces: Vec::new(),
+            }],
+            vec![identity.clone()], ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
+        )
+    };
+    use ScalarModuleProofOutcome::{NoApplicableInputs, Proved, Refuted, Unsupported};
+    let ascending = "value >= -2 && value <= 0 && value != -1 && limit == 1";
+    assert_eq!(check("echo", ascending, "<"), Proved);
+    assert_eq!(check("echo", "value == 1 && limit == 1", "<="), Proved);
+    assert_eq!(check("echo", ascending, ">"), Refuted);
+    assert_eq!(check("echo", "value == 2 && limit == 2", ">="), Proved);
+    assert_eq!(check("echo", "value >= 0 && value <= 1 && limit >= 0 && limit <= 1", "=="), Refuted);
+    assert_eq!(check("echo", "value == 1 && limit == 1", "=="), Proved);
+    assert_eq!(check("echo", "value >= -2 && value <= 0 && value != -1 && limit == -1", "!="), Proved);
+    assert_eq!(check("echo", "value >= -2 && value <= 0 && value != -1 && limit == 0", "!="), Refuted);
+    assert_eq!(check("ordered_rows", "limit >= 10 && limit <= 30", "<"), Proved);
+    assert_eq!(check("ordered_rows", "limit >= 10 && limit <= 30", "!="), Proved);
+    assert_eq!(check("echo", "false", "<"), NoApplicableInputs);
+    for target in ["const_first", "local_first"] {
+        assert_eq!(check(target, "limit >= 0 && limit <= 1", "<"), Unsupported);
+    }
+}
+
+#[test]
 fn named_proof_show_mixed_sequence_holds_all_exact_obligations() {
     let identity = source();
     let check = |target: &str, where_guard: &str, ensures: &str, steps: &str| {
