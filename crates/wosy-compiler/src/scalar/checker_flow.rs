@@ -100,6 +100,8 @@ pub(super) struct ImportedLocal<'a> {
 pub(super) enum ImportedIntegerValues<'a> {
     Ready(IntegerSet, std::marker::PhantomData<&'a ()>),
     #[cfg(feature = "internal-checker")]
+    Shared(&'a Rc<IntegerSet>),
+    #[cfg(feature = "internal-checker")]
     Deferred {
         slot: usize,
         domain: &'a IntegerSet,
@@ -1117,9 +1119,12 @@ impl IntegerInputs {
     }
 
     fn append_local(&mut self, values: IntegerSet) {
-        let value = Rc::new(values);
+        self.append_shared_local(&Rc::new(values));
+    }
+
+    fn append_shared_local(&mut self, values: &Rc<IntegerSet>) {
         for row in &mut self.0 {
-            row.push(Rc::clone(&value));
+            row.push(Rc::clone(values));
         }
     }
 
@@ -2241,6 +2246,9 @@ pub(super) fn proves_requirement_with_imported_root_local<'a>(
 pub(super) fn collect_ordered_imported_root_local<'a>(
     calls: &'a FunctionCallSites, local: ImportedLocal<'a>, sink: &mut dyn FnMut(IntegerCheckFailure<'a>),
 ) -> Option<bool> {
+    if matches!(&local.values, ImportedIntegerValues::Shared(values) if values.is_empty()) {
+        return None;
+    }
     let mut failures = IntegerFailureCollection {
         continuation: IntegerRequirementContinuation::Empty, projected: None, allow_projected_calls: false, sink,
     };
@@ -2989,6 +2997,12 @@ fn walk_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, A
                     }
                     let values = match local.values {
                         ImportedIntegerValues::Ready(values, _) => values,
+                        #[cfg(feature = "internal-checker")]
+                        ImportedIntegerValues::Shared(values) => {
+                            roots.add(&origin.binding, &receiver.ty);
+                            path.append_shared_local(values);
+                            continue;
+                        }
                         #[cfg(feature = "internal-checker")]
                         ImportedIntegerValues::Deferred { slot, domain, issue } => {
                             let admitted = !path.is_unreachable() && match arguments.get(slot).copied().flatten() {

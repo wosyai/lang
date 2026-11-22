@@ -2003,6 +2003,7 @@ struct VerifiedSymbolicEquality<'a> {
     layout: ScalarTargetLayout,
     body: &'a FunctionCallSites,
     bound: &'a BigInt,
+    shared: Option<Rc<IntegerSet>>,
 }
 
 #[cfg(feature = "internal-checker")]
@@ -2010,7 +2011,7 @@ impl SelectedSymbolicProof<'_, '_> {
     fn try_consume_equality(
         &mut self, target: PreparedCallable, calls: &FunctionCallSites, source: &SourceIdentity, effects: &mut OrderedFailures,
     ) -> Result<Option<bool>, ProjectCheck> {
-        let Some(summary) = &self.verified else { return Ok(None); };
+        let Some(summary) = &mut self.verified else { return Ok(None); };
         if target.0 != summary.target.0 || target.1 <= summary.target.1
             || !calls.assignments.is_empty() || !calls.allocation_length_calls.is_empty()
             || !matches!(calls.boundary.results.as_slice(), [result] if result.ty == ScalarType::Unit)
@@ -2031,12 +2032,13 @@ impl SelectedSymbolicProof<'_, '_> {
         ) {
             return Ok(None);
         }
-        let values = ImportedIntegerValues::ready(IntegerSet::singleton(summary.bound));
+        let bound = summary.bound;
+        let shared = summary.shared.get_or_insert_with(|| Rc::new(IntegerSet::singleton(bound)));
+        let values = ImportedIntegerValues::Shared(shared);
         let mut emit = |failure| effects.push_callable(calls, source, failure);
         let active = super::checker_flow::collect_ordered_imported_root_local(
             calls, ImportedLocal { position, values, guards: Vec::new() }, &mut emit,
         ).ok_or(ProjectCheck::Unsupported)?;
-        self.verified = None;
         Ok(Some(active))
     }
 
@@ -2221,7 +2223,7 @@ impl SymbolicRootProof for SelectedSymbolicProof<'_, '_> {
                 if let Some(plan) = candidate {
                     self.verified = Some(VerifiedSymbolicEquality {
                         target, canonical_target: plan.canonical_target, layout: plan.typed.target.target_layout,
-                        body: plan.typed.body, bound: first.bound,
+                        body: plan.typed.body, bound: first.bound, shared: None,
                     });
                 }
             }
@@ -7620,6 +7622,17 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
         let witnesses = failure.witness.intervals_at(0, 1).unwrap().collect::<Vec<_>>();
         let bound = BigInt::from(7);
         assert_eq!(witnesses, [(&bound, &bound)]);
+
+        let second_caller = false_requirement.replace("client", "other");
+        let two_callers = format!("{caller}{second_caller}");
+        let two_text = module(producer, &two_callers, "out == 7");
+        let two = run(&two_text).unwrap();
+        assert!(two.active && two.diagnostics.is_empty() && two.symbolic_diagnostic.is_none());
+        let [early, later] = two.directives.as_slice() else { panic!("startup and second caller failures"); };
+        let snippet = |span: ByteSpan| &two_text[span.start as usize..span.end as usize];
+        assert_eq!(snippet(early.condition), "false");
+        assert_eq!(snippet(later.condition), "result < 7");
+        assert_eq!(later.witness.intervals_at(0, 1).unwrap().collect::<Vec<_>>(), [(&bound, &bound)]);
 
         let refuted = producer.replace("else { 7 }", "else { 8 }");
         assert!(matches!(run(&module(&refuted, &caller, "out == 7")), Err(ProjectCheck::Unsupported)));
