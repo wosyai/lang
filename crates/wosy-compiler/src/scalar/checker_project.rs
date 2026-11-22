@@ -6804,8 +6804,28 @@ mod tests {
         assert_eq!(count(), 1);
         assert_eq!(check_typed("u8", "(16 * 16) * 0", "true", "out == 0", "", &["leaf"]), [Unsupported]);
         assert_eq!(count(), 1);
-        assert_eq!(check("3 + (8 / 2)", "true", "out == 7", "", &["leaf"]), [Unsupported]);
+        assert_eq!(check("3 + (8 / 2)", "true", "out == 7", "", &["leaf", "cite"]), [Proved, Proved]);
         assert_eq!(count(), 1);
+        for (body, ensures) in [
+            ("-9 / 2", "out == -4"),
+            ("9 / -2", "out == -4"),
+            ("-9 / -2", "out == 4"),
+            ("-9 % 2", "out == -1"),
+            ("9 % -2", "out == 1"),
+            ("-9 % -2", "out == -1"),
+            ("(-128 / 2) % 9", "out == -1"),
+        ] {
+            assert_eq!(check(body, "true", ensures, "", &["leaf"]), [Proved]);
+            assert_eq!(count(), 1);
+        }
+        assert_eq!(check_typed("u8", "(255 / 2) % 10", "true", "out == 7", "", &["leaf"]), [Proved]);
+        assert_eq!(count(), 1);
+        for body in ["(9 / (2 - 2)) * 0", "(9 % (2 - 2)) * 0", "(-128 / -1) * 0", "(-128 % -1) * 0"] {
+            assert_eq!(check(body, "true", "out == 0", "", &["leaf"]), [Unsupported]);
+            assert_eq!(count(), 1);
+        }
+        assert_eq!(check("(-128 % -1) * 0", "false", "out == 0", "", &["leaf"]), [NoApplicableInputs]);
+        assert_eq!(count(), 0);
         assert_eq!(check("3 + (2 + value)", "true", "out <= 7", "", &["leaf"]), [Unsupported]);
         assert_eq!(count(), 1);
         assert_eq!(check("(127 + 1) - 127", "false", "out <= 7", "", &["leaf"]), [NoApplicableInputs]);

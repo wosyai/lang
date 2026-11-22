@@ -171,8 +171,7 @@ impl<'a> ScopedAuthoredReturn<'a> for NamedAuthoredReturn<'a> {
                 let (min, max) = super::typecheck::integer_bounds(ty)?;
                 #[cfg(test)]
                 AUTHORED_RETURN_CALCULATIONS.with(|count| count.set(count.get() + 1));
-                return nested_authored_integer_return(&output.value, slot.expression, structure, ty,
-                    |value| value >= &min && value <= &max);
+                return nested_authored_integer_return(&output.value, slot.expression, structure, ty, &min, &max);
             }
             let parent = OccurrenceParent::Expression(slot.expression);
             let typed_operand = |edge| {
@@ -193,7 +192,7 @@ impl<'a> ScopedAuthoredReturn<'a> for NamedAuthoredReturn<'a> {
             }
             #[cfg(all(test, feature = "internal-checker"))]
             AUTHORED_RETURN_CALCULATIONS.with(|count| count.set(count.get() + 1));
-            let value = operation.apply(left, right);
+            let value = operation.apply(left, right, &min)?;
             fits(&value).then_some(value)
         }).as_ref()
     }
@@ -205,6 +204,8 @@ enum AuthoredIntegerOperation {
     Add,
     Subtract,
     Multiply,
+    Divide,
+    Remainder,
 }
 
 #[cfg(feature = "internal-checker")]
@@ -214,12 +215,14 @@ impl AuthoredIntegerOperation {
             BinaryOperator::Add => Self::Add,
             BinaryOperator::Subtract => Self::Subtract,
             BinaryOperator::Multiply => Self::Multiply,
+            BinaryOperator::Divide => Self::Divide,
+            BinaryOperator::Remainder => Self::Remainder,
             _ => return None,
         })
     }
 
-    fn apply(self, left: Cow<'_, BigInt>, right: Cow<'_, BigInt>) -> BigInt {
-        match (self, left, right) {
+    fn apply(self, left: Cow<'_, BigInt>, right: Cow<'_, BigInt>, min: &BigInt) -> Option<BigInt> {
+        Some(match (self, left, right) {
             (Self::Add, Cow::Owned(left), Cow::Owned(right)) => left + right,
             (Self::Add, Cow::Owned(left), right) => left + right.as_ref(),
             (Self::Add, left, Cow::Owned(right)) => right + left.as_ref(),
@@ -229,20 +232,32 @@ impl AuthoredIntegerOperation {
             (Self::Subtract, left, Cow::Owned(right)) => left.as_ref() - right,
             (Self::Subtract, left, right) => left.as_ref() - right.as_ref(),
             (Self::Multiply, left, right) => left.as_ref() * right.as_ref(),
-        }
+            (operation @ (Self::Divide | Self::Remainder), left, right) => {
+                use num_bigint::Sign::{Minus, NoSign};
+                let (left, right) = (left.as_ref(), right.as_ref());
+                if right.sign() == NoSign || (right.sign() == Minus && right.bits() == 1 && left == min) {
+                    return None;
+                }
+                match operation {
+                    Self::Divide => left / right,
+                    _ => left % right,
+                }
+            }
+        })
     }
 }
 
 #[cfg(feature = "internal-checker")]
 fn nested_authored_integer_return<'a>(
     root: &'a ScalarExpression, root_ordinal: OccurrenceOrdinal, structure: &OccurrenceStructure,
-    ty: &ScalarType, fits: impl Fn(&BigInt) -> bool,
+    ty: &ScalarType, min: &BigInt, max: &BigInt,
 ) -> Option<BigInt> {
     type Node<'a> = (&'a ScalarExpression, OccurrenceOrdinal);
     enum Frame<'a> {
         Left { right: Node<'a>, operation: AuthoredIntegerOperation },
         Right { left: Cow<'a, BigInt>, operation: AuthoredIntegerOperation },
     }
+    let fits = |value: &BigInt| value >= min && value <= max;
     let mut stack = Vec::new();
     let mut next = (root, root_ordinal);
     loop {
@@ -272,7 +287,7 @@ fn nested_authored_integer_return<'a>(
                     break;
                 }
                 Some(Frame::Right { left, operation }) => {
-                    let computed = operation.apply(left, value);
+                    let computed = operation.apply(left, value, min)?;
                     if !fits(&computed) {
                         return None;
                     }
