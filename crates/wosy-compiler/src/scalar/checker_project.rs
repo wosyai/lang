@@ -1961,6 +1961,7 @@ struct MainFlowProofReceipt {
 struct MainFlowProofDiagnostic {
     proof: wosy_syntax::SourceSpan,
     goal: wosy_syntax::SourceSpan,
+    failed_step: Option<wosy_syntax::SourceSpan>,
     invocation: Rc<MainFlowProofInvocation>,
 }
 
@@ -2042,11 +2043,14 @@ impl SymbolicRootProof for SelectedSymbolicProof<'_, '_> {
         } else {
             return Ok(None);
         };
+        let MainFlowProofCases::Bare { first, rest } = &group.cases else {
+            return Err(ProjectCheck::Unsupported);
+        };
         let tautological = |proof: &MainFlowProofCase<'_>| !proof.guard.always_rejects
             && proof.guard.comparisons.is_empty() && proof.guard.domain.is_none();
-        let predicate = match group.first.filter {
-            [CheckerPredicate::Integer(predicate)] if group.rest.is_empty() => Some(predicate),
-            _ if tautological(&group.first) && group.rest.iter().all(tautological) => None,
+        let predicate = match first.filter {
+            [CheckerPredicate::Integer(predicate)] if rest.is_empty() => Some(predicate),
+            _ if tautological(first) && rest.iter().all(tautological) => None,
             _ => return Err(ProjectCheck::Unsupported),
         };
         if !calls.structure.checker_direct_targets.is_empty() || !calls.call_occurrences.is_empty()
@@ -2054,8 +2058,7 @@ impl SymbolicRootProof for SelectedSymbolicProof<'_, '_> {
         {
             return Err(ProjectCheck::Unsupported);
         }
-        let first = &group.first;
-        if group.rest.is_empty() {
+        if rest.is_empty() {
             let (active, directives, returned, failure) = super::checker_flow::collect_ordered_root_literal_proof(
                 calls, &function.body, first.relation, first.bound, predicate,
             ).ok_or(ProjectCheck::Unsupported)?;
@@ -2067,7 +2070,7 @@ impl SymbolicRootProof for SelectedSymbolicProof<'_, '_> {
             }
             return Ok(Some(active || returned));
         }
-        let proofs = std::iter::once(first).chain(&group.rest);
+        let proofs = std::iter::once(first).chain(rest);
         let mut checks = proofs.clone().map(|proof| super::checker_flow::SymbolicLiteralCheck {
             relation: proof.relation, bound: proof.bound, failure: None,
         }).collect::<Vec<_>>();
@@ -2088,6 +2091,14 @@ impl SymbolicRootProof for SelectedSymbolicProof<'_, '_> {
 }
 
 #[cfg(feature = "internal-checker")]
+struct MainFlowLiteralShow<'a> {
+    span: ByteSpan,
+    relation: IntegerRelation,
+    bound: Cow<'a, BigInt>,
+    same_bound: bool,
+}
+
+#[cfg(feature = "internal-checker")]
 struct MainFlowProofCase<'a> {
     proof_source: &'a SourceIdentity,
     proof: ByteSpan,
@@ -2100,34 +2111,81 @@ struct MainFlowProofCase<'a> {
 
 #[cfg(feature = "internal-checker")]
 impl<'a> MainFlowProofCase<'a> {
-    fn prepare(plan: &'a PlannedModuleProof<'a>, root: &SourceIdentity) -> Result<Self, ProjectCheck> {
+    fn prepare(plan: &'a PlannedModuleProof<'a>, root: &SourceIdentity) -> Result<MainFlowProofPlan<'a>, ProjectCheck> {
         let TypedProofGoal::Literal { relation, bound, .. } = &plan.typed.goal else {
             return Err(ProjectCheck::Unsupported);
         };
-        if !plan.steps.items.is_empty() || &plan.typed.target.source != root {
+        if &plan.typed.target.source != root {
             return Err(ProjectCheck::Unsupported);
         }
+        let step = match (plan.steps.items.as_slice(), plan.steps.terminated_items.as_slice()) {
+            ([], []) => None,
+            ([step @ ScalarBlockItem::Expression(expression)], [true]) => {
+                if is_null_literal_name(&plan.typed.output) {
+                    return Err(ProjectCheck::InvalidProof);
+                }
+                let claim = proof_show_expression(step, true)?;
+                let comparison = IntegerComparison::from_expression(claim).ok_or(ProjectCheck::Unsupported)?;
+                let (_, shown, literal) = checked_literal_output_goal_borrowed(
+                    comparison, &plan.typed.output, &plan.typed.input_names, plan.typed.result_type,
+                )?;
+                let same_bound = literal.as_ref() == bound;
+                Some(MainFlowLiteralShow { span: super::typecheck::expression_span(expression), relation: shown, bound: literal, same_bound })
+            }
+            _ => return Err(ProjectCheck::Unsupported),
+        };
         let filter = plan.filter.as_deref().unwrap_or_default();
         let guard = checked_integer_guard_slots::<false>(plan.typed.body, filter).ok_or(ProjectCheck::Unsupported)?;
         let goal = child(&child(plan.proof, SyntaxKind::ProofEnsures)?, SyntaxKind::Expression)?;
-        Ok(Self {
+        Ok((Self {
             proof_source: plan.proof_source, proof: wosy_syntax::byte_span(plan.proof),
             goal: wosy_syntax::byte_span(&goal), guard, filter, relation: *relation, bound,
-        })
+        }, step))
+    }
+}
+
+#[cfg(feature = "internal-checker")]
+type MainFlowProofPlan<'a> = (MainFlowProofCase<'a>, Option<MainFlowLiteralShow<'a>>);
+
+#[cfg(feature = "internal-checker")]
+enum MainFlowProofCases<'a> {
+    Bare { first: MainFlowProofCase<'a>, rest: Vec<MainFlowProofCase<'a>> },
+    Authored(Vec<MainFlowProofPlan<'a>>),
+}
+
+#[cfg(feature = "internal-checker")]
+impl<'a> MainFlowProofCases<'a> {
+    fn push(&mut self, (proof, step): MainFlowProofPlan<'a>) {
+        match self {
+            Self::Bare { rest, .. } if step.is_none() => rest.push(proof),
+            Self::Authored(proofs) => proofs.push((proof, step)),
+            Self::Bare { rest, .. } => {
+                let authored = Self::Authored(Vec::with_capacity(rest.len() + 2));
+                let Self::Bare { first, rest } = std::mem::replace(self, authored) else { unreachable!(); };
+                let Self::Authored(proofs) = self else { unreachable!(); };
+                proofs.push((first, None));
+                proofs.extend(rest.into_iter().map(|prior| (prior, None)));
+                proofs.push((proof, step));
+            }
+        }
     }
 }
 
 #[cfg(feature = "internal-checker")]
 struct MainFlowProofTarget<'a> {
-    first: MainFlowProofCase<'a>,
-    rest: Vec<MainFlowProofCase<'a>>,
+    cases: MainFlowProofCases<'a>,
     seen: bool,
 }
 
 #[cfg(feature = "internal-checker")]
 impl<'a> MainFlowProofTarget<'a> {
-    fn new(first: MainFlowProofCase<'a>) -> Self {
-        Self { first, rest: Vec::new(), seen: false }
+    fn new((first, step): MainFlowProofPlan<'a>) -> Self {
+        let cases = if let Some(step) = step {
+            MainFlowProofCases::Authored(vec![(first, Some(step))])
+        } else {
+            MainFlowProofCases::Bare { first, rest: Vec::new() }
+        };
+        Self { cases, seen: false }
     }
 }
 
@@ -2142,20 +2200,20 @@ struct MainFlowProofObserver<'a> {
 
 #[cfg(feature = "internal-checker")]
 impl<'a> MainFlowProofObserver<'a> {
-    fn new(target: (usize, usize), first: MainFlowProofCase<'a>) -> Self {
+    fn new(target: (usize, usize), first: MainFlowProofPlan<'a>) -> Self {
         Self {
             first: (target, MainFlowProofTarget::new(first)), other: HashMap::new(),
             active: false, incomplete: false, diagnostics: Vec::new(),
         }
     }
 
-    fn insert(&mut self, target: (usize, usize), proof: MainFlowProofCase<'a>) {
+    fn insert(&mut self, target: (usize, usize), proof: MainFlowProofPlan<'a>) {
         if self.first.0 == target {
-            self.first.1.rest.push(proof);
+            self.first.1.cases.push(proof);
             return;
         }
         match self.other.entry(target) {
-            std::collections::hash_map::Entry::Occupied(mut entry) => entry.get_mut().rest.push(proof),
+            std::collections::hash_map::Entry::Occupied(mut entry) => entry.get_mut().cases.push(proof),
             std::collections::hash_map::Entry::Vacant(entry) => { entry.insert(MainFlowProofTarget::new(proof)); }
         }
     }
@@ -2189,26 +2247,17 @@ impl ActualIntegerObserver for MainFlowProofObserver<'_> {
             self.incomplete = true;
             return;
         };
-        if arguments.len() != proofs.first.guard.arity || arguments.len() != parameters.len() {
+        if arguments.len() != parameters.len() {
             self.incomplete = true;
             return;
         }
-        proofs.seen = true;
         let mut invocation: Option<Rc<MainFlowProofInvocation>> = None;
-        for proof in std::iter::once(&proofs.first).chain(&proofs.rest) {
-            if !proof.guard.accepts(arguments) {
-                continue;
-            }
-            self.active = true;
-            if proof.relation.accepts(value.cmp(proof.bound)) {
-                continue;
-            }
+        let mut emit = |proof: &MainFlowProofCase<'_>, failed_step: Option<ByteSpan>| {
             let invoked = if let Some(invoked) = &invocation {
                 Rc::clone(invoked)
             } else {
                 let Some(occurrence) = site.topology.occurrences.get(site.occurrence.0) else {
-                    self.incomplete = true;
-                    return;
+                    return false;
                 };
                 let invoked = Rc::new(MainFlowProofInvocation {
                     call: wosy_syntax::SourceSpan { source: site.source.clone(), range: occurrence.span },
@@ -2222,8 +2271,62 @@ impl ActualIntegerObserver for MainFlowProofObserver<'_> {
             self.diagnostics.push(MainFlowProofDiagnostic {
                 proof: wosy_syntax::SourceSpan { source: proof.proof_source.clone(), range: proof.proof },
                 goal: wosy_syntax::SourceSpan { source: proof.proof_source.clone(), range: proof.goal },
+                failed_step: failed_step.map(|range| wosy_syntax::SourceSpan { source: proof.proof_source.clone(), range }),
                 invocation: invoked,
             });
+            true
+        };
+        match &proofs.cases {
+            MainFlowProofCases::Bare { first, rest } => {
+                if arguments.len() != first.guard.arity {
+                    self.incomplete = true;
+                    return;
+                }
+                proofs.seen = true;
+                for proof in std::iter::once(first).chain(rest) {
+                    if !proof.guard.accepts(arguments) {
+                        continue;
+                    }
+                    self.active = true;
+                    if !proof.relation.accepts(value.cmp(proof.bound)) && !emit(proof, None) {
+                        self.incomplete = true;
+                        return;
+                    }
+                }
+            }
+            MainFlowProofCases::Authored(cases) => {
+                if arguments.len() != cases[0].0.guard.arity {
+                    self.incomplete = true;
+                    return;
+                }
+                proofs.seen = true;
+                for (proof, step) in cases {
+                    if !proof.guard.accepts(arguments) {
+                        continue;
+                    }
+                    self.active = true;
+                    let failed_step = if let Some(step) = step {
+                        let comparison = value.cmp(step.bound.as_ref());
+                        if !step.relation.accepts(comparison) {
+                            Some(step.span)
+                        } else {
+                            let ordering = if step.same_bound { comparison } else { value.cmp(proof.bound) };
+                            if proof.relation.accepts(ordering) {
+                                continue;
+                            }
+                            None
+                        }
+                    } else if proof.relation.accepts(value.cmp(proof.bound)) {
+                        continue;
+                    } else {
+                        None
+                    };
+                    if !emit(proof, failed_step) {
+                        self.incomplete = true;
+                        return;
+                    }
+                }
+            }
         }
     }
 }
@@ -6612,7 +6715,7 @@ mod tests {
         assert!(refuted.active && refuted.directives.is_empty() && refuted.diagnostics.len() == 1);
         let excluded = run(&proof_only("4")).unwrap();
         assert!(!excluded.active && excluded.directives.is_empty() && excluded.diagnostics.is_empty());
-        let incomplete = proof_only("8").replace("ensures (out <= 7) {}", "ensures (out <= 7) { core.show(out <= 7); }");
+        let incomplete = proof_only("8").replace("ensures (out <= 7) {}", "ensures (out <= 7) { core.show(out <= 7); core.show(out <= 7); }");
         assert!(matches!(run(&incomplete), Err(ProjectCheck::Unsupported)));
         let mixed = proof_only("8").replace("%%end", &format!(r#"
             unit(i8) wrapper = fn(arg) {{
@@ -6622,6 +6725,69 @@ mod tests {
             wrapper(8);
             %%end"#));
         assert!(matches!(run(&mixed), Err(ProjectCheck::Unsupported)));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordered_main_flow_auto_proof_distinguishes_failed_literal_show_from_ensures() {
+        let app = source("src/main.w", "ordered-automatic-proof-actual-show");
+        let run = |text: &str, scope| {
+            let (_, proof) = crate::parse_proof_source(app.clone(), text.to_owned(), &[])
+                .unwrap_or_else(|_| panic!("valid proof source"));
+            check_loaded_ordered_proof_diagnostics(
+                Vec::new(), vec![(proof, Vec::new())], vec![app.clone()], inputs(), scope,
+            )
+        };
+        let text = format!(r#"%%start
+            i8(i8) identity = fn(value) {{ value }};
+            proof before for identity(entry) -> (out) where (entry == 6) ensures (out < 6) {{}}
+            proof both for identity(entry) -> (out) where (entry >= 5) ensures (out <= 8) {{
+                core.show(out >= 7);
+            }}
+            proof duplicate for identity(entry) -> (out) where (entry == 6) ensures (out < 6) {{
+                core.show(out < 6);
+            }}
+            proof after for identity(entry) -> (out) where (entry == 6) ensures (out != 6) {{}}
+            proof shared_bound for identity(entry) -> (out) where (entry == 6) ensures (out > 7) {{
+                core.show(out < 7);
+            }}
+            i8 excluded = identity(4);
+            core.require(false, {OUTPUT});
+            i8 bad_step = identity(6);
+            i8 passes = identity(7);
+            i8 bad_goal = identity(9);
+            core.require(false, {OUTPUT});
+        %%end"#);
+        let report = run(&text, ScalarCheckerScope::MainFlowOnly).unwrap();
+        assert!(report.active && report.directives.len() == 2);
+        let [before, step, duplicate, after, shared_bound, goal] = report.diagnostics.as_slice() else {
+            panic!("six actual diagnostics");
+        };
+        let snippet = |span: ByteSpan| &text[span.start as usize..span.end as usize];
+        assert!(snippet(before.proof.range).starts_with("proof before") && before.failed_step.is_none());
+        assert!(snippet(after.proof.range).starts_with("proof after") && after.failed_step.is_none());
+        assert!(snippet(shared_bound.proof.range).starts_with("proof shared_bound") && shared_bound.failed_step.is_none());
+        assert!(Rc::ptr_eq(&before.invocation, &after.invocation));
+        assert_eq!(snippet(step.failed_step.as_ref().unwrap().range), "core.show(out >= 7)");
+        assert_eq!(snippet(step.goal.range), "out <= 8");
+        assert_eq!(snippet(duplicate.failed_step.as_ref().unwrap().range), "core.show(out < 6)");
+        assert_eq!(snippet(duplicate.goal.range), "out < 6");
+        assert!(Rc::ptr_eq(&step.invocation, &duplicate.invocation));
+        assert!(goal.failed_step.is_none());
+        assert_eq!(snippet(goal.goal.range), "out <= 8");
+        assert_eq!(snippet(step.invocation.call.range), "identity(6)");
+        assert_eq!(snippet(goal.invocation.call.range), "identity(9)");
+        assert_eq!(step.invocation.directive_position, 1);
+        assert_eq!(goal.invocation.directive_position, 1);
+
+        let unused = r#"%%start
+            i8(i8) identity = fn(value) { value };
+            proof both for identity(entry) -> (out) ensures (out <= 8) { core.show(out >= 7); }
+        %%end"#;
+        assert!(!run(unused, ScalarCheckerScope::MainFlowOnly).unwrap().active);
+        assert!(matches!(run(unused, ScalarCheckerScope::CurrentPackage), Err(ProjectCheck::Unsupported)));
+        let invalid = unused.replace("ensures", "where (false) ensures").replace("out >= 7", "out >= 128");
+        assert!(matches!(run(&invalid, ScalarCheckerScope::MainFlowOnly), Err(ProjectCheck::InvalidProof)));
     }
 
     #[cfg(feature = "internal-checker")]
@@ -6688,11 +6854,11 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
         let region = prepared.parts().1.initialization_region(0).unwrap();
         let ModuleInitializationDetail::Occurrences(topology) = &region.detail else { unreachable!(); };
         let occurrence = *topology.call_targets.keys().next().unwrap();
-        let mut observer = MainFlowProofObserver::new((0, 0), MainFlowProofCase {
+        let mut observer = MainFlowProofObserver::new((0, 0), (MainFlowProofCase {
             proof_source: &app, proof: span, goal: span, filter: &[],
             guard: CheckedIntegerGuardSlots { arity: 1, always_rejects: false, comparisons: Vec::new(), domain: None },
             relation: IntegerRelation::from_operator(&BinaryOperator::LessEqual).unwrap(), bound: &bound,
-        });
+        }, None));
         let effects = OrderedFailures::default();
         observer.observe_initializer(
             (0, 0), Some(InitializerProofSite { source: &app, topology, occurrence, effects: &effects }),
