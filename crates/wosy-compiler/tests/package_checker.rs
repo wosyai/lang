@@ -1290,7 +1290,7 @@ fn named_induction_proves_only_the_complete_canonical_unused_return_case() {
     assert_eq!(check(0, "entry > 0", tail, ""), ScalarModuleProofOutcome::Unsupported);
     assert_eq!(check(0, "true", "descend(value - 1) + 1", ""), ScalarModuleProofOutcome::Unsupported);
     assert_eq!(check(0, "true", "descend(value - 2)", ""), ScalarModuleProofOutcome::Unsupported);
-    assert_eq!(check(0, "true", tail, "u8 actual = descend(7);"), ScalarModuleProofOutcome::Unsupported);
+    assert_eq!(check(0, "true", tail, "u8 actual = descend(7);"), ScalarModuleProofOutcome::Proved);
 }
 
 #[test]
@@ -1344,4 +1344,47 @@ fn named_lexicographic_induction_checks_both_typed_axes_and_exact_recursive_argu
     assert_eq!(check("u8", "0", "true", "offset, entry", "prefix + 1", "offset"), ScalarModuleProofOutcome::Unsupported);
     assert_eq!(check("u8", "0", "true", "offset, entry", "prefix", "offset + 1"), ScalarModuleProofOutcome::Unsupported);
     assert_eq!(check("u8", "0", "true", "entry, offset", "prefix", "offset"), ScalarModuleProofOutcome::Unsupported);
+}
+
+#[test]
+fn one_independently_verified_equality_supplies_only_applicable_actual_startup_returns() {
+    let identity = source();
+    let check = |base: u8, goal: &str, filter: &str, initializers: &str, names: &[&str]| {
+        check_scalar_module_proofs(
+            identity.clone(), names,
+            vec![ScalarProofModuleInput {
+                source: identity.clone(),
+                text: format!(r#"%%start
+                    u8(u8) descend = fn(value) {{ if (value == 0) {{ {base} }} else {{ descend(value - 1) }} }};
+                    proof rank for descend(entry) -> (out) where ({filter}) ensures ({goal}) decreases (entry) {{
+                        if (entry == 0) {{ core.show(out == 0); }} else {{ core.use(rank(entry - 1)); }}
+                    }}
+                    proof literal for descend(input) -> (out) ensures (out <= 7) {{}}
+                    proof invalid for descend(input) -> (out) ensures (unknown <= 7) {{}}
+                    {initializers}
+                %%end"#),
+                namespaces: Vec::new(),
+            }],
+            vec![identity.clone()], ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
+        ).unwrap()
+    };
+    let exact = format!("u8 first = descend(2); u8 second = descend(7); core.require(first == second, {OUTPUT});");
+    assert_eq!(check(0, "out == 0", "entry <= 7", &exact, &["rank"]), [ScalarModuleProofOutcome::Proved]);
+    let different = "u8 first = descend(2); u8 second = descend(8);";
+    assert_eq!(check(0, "out == 0", "entry <= 7", different, &["rank"]), [ScalarModuleProofOutcome::Unsupported]);
+    assert_eq!(check(1, "out == 0", "entry <= 7", &exact, &["rank"]), [ScalarModuleProofOutcome::Unsupported]);
+    assert_eq!(check(0, "out <= 1", "entry <= 7", &exact, &["rank"]), [ScalarModuleProofOutcome::Unsupported]);
+    assert_eq!(check(0, "out == 0", "false", &exact, &["rank"]), [ScalarModuleProofOutcome::Unsupported]);
+    assert_eq!(check(0, "out == 0", "entry <= 7", &exact, &["rank", "literal"]),
+        [ScalarModuleProofOutcome::Unsupported, ScalarModuleProofOutcome::Unsupported]);
+
+    assert_eq!(check(0, "out == 0", "entry <= 7", &exact, &["rank", "missing"]),
+        [ScalarModuleProofOutcome::Unsupported, ScalarModuleProofOutcome::Unsupported]);
+    assert!(matches!(check(0, "out == 0", "entry <= 7", &exact, &["rank", "invalid"]).as_slice(),
+        [ScalarModuleProofOutcome::Unsupported, ScalarModuleProofOutcome::Invalid(_)]));
+    assert_eq!(check(0, "out == 0", "entry <= 7", &exact, &["rank", "rank"]),
+        [ScalarModuleProofOutcome::Proved, ScalarModuleProofOutcome::Proved]);
+
+    let ordinary = format!("u8(u8) descend = fn(value) {{ if (value == 0) {{ 0 }} else {{ descend(value - 1) }} }}; {exact}");
+    assert_eq!(check_scoped(&ordinary, ScalarCheckerScope::MainFlowOnly), ScalarCheckerOutcome::Unsupported);
 }

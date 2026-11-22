@@ -722,6 +722,13 @@ trait ActualIntegerObserver {
     const ENABLED: bool;
 
     fn observe(&mut self, target: (usize, usize), arguments: &[&BigInt], value: &BigInt);
+
+    #[cfg(feature = "internal-checker")]
+    fn proved_recursive_return(
+        &mut self, _target: (usize, usize), _arguments: &[&BigInt], _expected: &ScalarType,
+    ) -> Option<BigInt> {
+        None
+    }
 }
 
 impl ActualIntegerObserver for () {
@@ -844,7 +851,15 @@ impl<Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> CheckedCalls<'
             exact_integer_return_at_entry(body, expected, exact).map(ActualCallResult::Integer)
                 .ok_or(ProjectCheck::Unsupported)
         } else {
-            Err(ProjectCheck::Unsupported)
+            #[cfg(feature = "internal-checker")]
+            let proved = if ACTUAL_STARTUP && Observer::ENABLED {
+                self.observer.proved_recursive_return(target, exact, expected)
+            } else {
+                None
+            };
+            #[cfg(not(feature = "internal-checker"))]
+            let proved = None;
+            proved.map(ActualCallResult::Integer).ok_or(ProjectCheck::Unsupported)
         };
         self.active.remove(&target);
         if ACTUAL_STARTUP && Observer::ENABLED {
@@ -1624,7 +1639,7 @@ impl PreparedProofModule {
                 }
             }
         }
-        self.run_module_proof_plans(&plans, &mut outcomes);
+        self.run_module_proof_plans(&plans, selected.len() == 1, &mut outcomes);
         for (index, first) in duplicate {
             outcomes[index] = outcomes[first].clone();
         }
@@ -1634,13 +1649,29 @@ impl PreparedProofModule {
     fn run_module_proof_plans(
         &self,
         plans: &[(usize, PlannedModuleProof<'_>)],
+        one_distinct_selection: bool,
         outcomes: &mut [ScalarModuleProofOutcome],
     ) {
         if plans.is_empty() {
             return;
         }
         let Ok((root, ordinals)) = package_initialization_order(self.prepared.parts().0) else { return; };
-        let mut observers = ActualProofBatch { targets: HashMap::new(), proofs: Vec::with_capacity(plans.len()) };
+        let mut independently_checked = None;
+        let mut induction = None;
+        if let (true, [(_, plan)]) = (one_distinct_selection, plans) {
+            if plan.proof_source == root && &plan.typed.target.source == root
+                && matches!(&plan.typed.goal, TypedProofGoal::Literal { operator: BinaryOperator::Equal, .. })
+            {
+                if let Some(rank) = plan.typed.measure {
+                    let (checked, token) = VerifiedInductionExactReturn::verify(plan, rank);
+                    induction = token;
+                    independently_checked = Some(checked);
+                }
+            }
+        }
+        let mut observers = ActualProofBatch {
+            targets: HashMap::new(), proofs: Vec::with_capacity(plans.len()), induction,
+        };
         for (plan_index, (_, plan)) in plans.iter().enumerate() {
             if plan.typed.measure.is_none() {
                 observers.targets.entry(plan.target).or_default().push(plan_index);
@@ -1661,8 +1692,12 @@ impl PreparedProofModule {
                 continue;
             }
             if let Some(measure) = plan.typed.measure {
-                if !initialization.reached.contains(&plan.target) {
-                    outcomes[*index] = module_proof_outcome(plan.verify_unused_induction(measure));
+                let used_verified_equality = observers.induction.as_ref()
+                    .is_some_and(|token| token.target == plan.target && token.used);
+                if !initialization.reached.contains(&plan.target) || used_verified_equality {
+                    let checked = independently_checked.take()
+                        .unwrap_or_else(|| plan.verify_unused_induction(measure));
+                    outcomes[*index] = module_proof_outcome(checked);
                 }
                 continue;
             }
@@ -1790,6 +1825,16 @@ struct CheckedIntegerGuardSlots<'a> {
 }
 
 #[cfg(feature = "internal-checker")]
+impl CheckedIntegerGuardSlots<'_> {
+    fn accepts(&self, arguments: &[&BigInt]) -> bool {
+        self.arity == arguments.len() && !self.always_rejects
+            && self.comparisons.iter().all(|comparison| {
+                arguments.get(comparison.slot).is_some_and(|argument| comparison.relation.accepts((*argument).cmp(comparison.bound)))
+            })
+    }
+}
+
+#[cfg(feature = "internal-checker")]
 fn checked_integer_guard_slots<'a>(
     body: &FunctionCallSites,
     filter: &'a [CheckerPredicate],
@@ -1853,11 +1898,7 @@ impl SelectedProofObserver<'_> {
         if matches!(self.coverage, ActualProofCoverage::Unsupported | ActualProofCoverage::Refuted) {
             return;
         }
-        if !guard.always_rejects
-            && guard.comparisons.iter().all(|comparison| {
-                arguments.get(comparison.slot).is_some_and(|argument| comparison.relation.accepts((*argument).cmp(comparison.bound)))
-            })
-        {
+        if guard.accepts(arguments) {
             let holds = match self.goal {
                 TypedProofGoal::Literal { relation, bound, .. } => Some(relation.accepts(value.cmp(bound))),
                 TypedProofGoal::EntryEqual { slot } => arguments.get(*slot).map(|entry| *entry == value),
@@ -1874,14 +1915,60 @@ impl SelectedProofObserver<'_> {
 }
 
 #[cfg(feature = "internal-checker")]
+struct VerifiedInductionExactReturn<'a> {
+    target: (usize, usize),
+    result_type: &'a ScalarType,
+    value: &'a BigInt,
+    where_guard: CheckedIntegerGuardSlots<'a>,
+    used: bool,
+}
+
+#[cfg(feature = "internal-checker")]
+impl<'a> VerifiedInductionExactReturn<'a> {
+    fn verify(plan: &'a PlannedModuleProof<'_>, rank: TypedInductionRank<'_>)
+        -> (Result<ProjectCheck, ProjectCheck>, Option<Self>)
+    {
+        let checked = plan.verify_unused_induction(rank);
+        let token = (|| {
+            if !matches!(checked, Ok(ProjectCheck::Proved)) {
+                return None;
+            }
+            let TypedProofGoal::Literal { operator: BinaryOperator::Equal, bound, .. } = &plan.typed.goal else {
+                return None;
+            };
+            Some(Self {
+                target: plan.target, result_type: plan.typed.result_type, value: bound,
+                where_guard: checked_integer_guard_slots(plan.typed.body, plan.filter.as_deref().unwrap_or_default())?,
+                used: false,
+            })
+        })();
+        (checked, token)
+    }
+}
+
+#[cfg(feature = "internal-checker")]
 struct ActualProofBatch<'a> {
     targets: HashMap<(usize, usize), Vec<usize>>,
     proofs: Vec<Option<SelectedProofObserver<'a>>>,
+    induction: Option<VerifiedInductionExactReturn<'a>>,
 }
 
 #[cfg(feature = "internal-checker")]
 impl ActualIntegerObserver for ActualProofBatch<'_> {
     const ENABLED: bool = true;
+
+    fn proved_recursive_return(
+        &mut self, target: (usize, usize), arguments: &[&BigInt], expected: &ScalarType,
+    ) -> Option<BigInt> {
+        let token = self.induction.as_mut()?;
+        if token.target != target || token.result_type != expected
+            || !token.where_guard.accepts(arguments)
+        {
+            return None;
+        }
+        token.used = true;
+        Some(token.value.clone())
+    }
 
     fn observe(&mut self, target: (usize, usize), arguments: &[&BigInt], value: &BigInt) {
         if let Some(proofs) = self.targets.get(&target) {
