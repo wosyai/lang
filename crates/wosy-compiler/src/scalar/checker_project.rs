@@ -366,26 +366,85 @@ fn check_package_roots(prepared: &PreparedCheckerProject) -> Result<(), ProjectC
     ).map(drop)
 }
 
-fn check_package_roots_with_activity(
-    prepared: &PreparedCheckerProject, scope: ScalarCheckerScope, startup_count: usize,
-) -> Result<bool, ProjectCheck> {
-    check_package_roots_with_policy::<false, false>(prepared, scope, startup_count, None)
-}
-
 #[cfg(feature = "internal-checker")]
 fn collect_ordered_checker_records(
     prepared: &PreparedCheckerProject, scope: ScalarCheckerScope, startup_count: usize,
 ) -> Result<(bool, Vec<ScalarOrderedCheckerFailure>), ProjectCheck> {
-    collect_ordered_checker_records_with_policy::<false>(prepared, scope, startup_count)
+    let run = run_prepared_ordered_check(prepared, scope, startup_count, OrderedReachPolicy::Legacy, ())?;
+    Ok((run.active, run.directives))
 }
 
 #[cfg(feature = "internal-checker")]
-fn collect_ordered_checker_records_with_policy<const PRIVATE_NESTED_SCALAR: bool>(
+#[derive(Clone, Copy)]
+enum OrderedReachPolicy {
+    Legacy,
+    Closed,
+}
+
+#[cfg(feature = "internal-checker")]
+trait OrderedRunEvidence: ActualIntegerObserver {
+    type Symbolic<'a>: SymbolicRootProof where Self: 'a;
+    type SymbolicReport: Default;
+
+    fn complete_startup(&self, reached: &HashSet<PreparedCallable>) -> Result<bool, ProjectCheck>;
+    fn symbolic(&self) -> Self::Symbolic<'_>;
+    fn finish_symbolic<'run>(proof: Self::Symbolic<'run>) -> Self::SymbolicReport where Self: 'run;
+}
+
+#[cfg(feature = "internal-checker")]
+impl OrderedRunEvidence for () {
+    type Symbolic<'a> = ();
+    type SymbolicReport = ();
+
+    fn complete_startup(&self, _: &HashSet<PreparedCallable>) -> Result<bool, ProjectCheck> { Ok(false) }
+    fn symbolic(&self) -> Self::Symbolic<'_> {}
+    fn finish_symbolic<'run>(_: Self::Symbolic<'run>) -> Self::SymbolicReport where Self: 'run {}
+}
+
+#[cfg(feature = "internal-checker")]
+struct PreparedOrderedRun<E: OrderedRunEvidence> {
+    active: bool,
+    directives: Vec<ScalarOrderedCheckerFailure>,
+    actual: E,
+    symbolic: E::SymbolicReport,
+}
+
+#[cfg(feature = "internal-checker")]
+fn run_prepared_ordered_check<E: OrderedRunEvidence>(
     prepared: &PreparedCheckerProject, scope: ScalarCheckerScope, startup_count: usize,
-) -> Result<(bool, Vec<ScalarOrderedCheckerFailure>), ProjectCheck> {
-    let mut failures = OrderedFailures::default();
-    let active = check_package_roots_with_policy::<true, PRIVATE_NESTED_SCALAR>(prepared, scope, startup_count, Some(&mut failures))?;
-    Ok((active, failures.records))
+    policy: OrderedReachPolicy, evidence: E,
+) -> Result<PreparedOrderedRun<E>, ProjectCheck> {
+    let (project, _) = prepared.parts();
+    let (root, ordinals) = package_startup_order(project, &project.modules[..startup_count])?;
+    let mut effects = OrderedFailures::default();
+    let authored_roots = if E::CONTEXTUAL && scope == ScalarCheckerScope::MainFlowOnly {
+        HashMap::new()
+    } else {
+        let (potential_obligations, authored_roots) = package_obligation_roots(prepared, scope, startup_count, root)?;
+        if !potential_obligations && !E::CONTEXTUAL {
+            return Ok(PreparedOrderedRun { active: false, directives: effects.records, actual: evidence, symbolic: E::SymbolicReport::default() });
+        }
+        authored_roots
+    };
+    let (initialization, evidence) = match policy {
+        OrderedReachPolicy::Legacy => check_package_initialization_observing_with_policy::<_, true, false>(
+            prepared, root, ordinals, evidence, Some(&mut effects),
+        ),
+        OrderedReachPolicy::Closed => check_package_initialization_observing_with_policy::<_, true, true>(
+            prepared, root, ordinals, evidence, Some(&mut effects),
+        ),
+    }?;
+    let mut active = evidence.complete_startup(&initialization.reached)? || initialization.had_obligations;
+    let symbolic = if scope == ScalarCheckerScope::CurrentPackage {
+        let mut proof = evidence.symbolic();
+        active |= check_package_symbolic_roots::<true, _>(
+            prepared, startup_count, root, initialization, authored_roots, Some(&mut effects), &mut proof,
+        )?;
+        E::finish_symbolic(proof)
+    } else {
+        E::SymbolicReport::default()
+    };
+    Ok(PreparedOrderedRun { active, directives: effects.records, actual: evidence, symbolic })
 }
 
 #[cfg(all(test, feature = "internal-checker"))]
@@ -396,9 +455,8 @@ fn collect_ordered_package_failures(
     Ok((active, failures.into_iter().map(ordered_failure_as_legacy).collect()))
 }
 
-fn check_package_roots_with_policy<const COLLECT: bool, const PRIVATE_NESTED_SCALAR: bool>(
+fn check_package_roots_with_activity(
     prepared: &PreparedCheckerProject, scope: ScalarCheckerScope, startup_count: usize,
-    mut failures: Option<&mut OrderedFailures>,
 ) -> Result<bool, ProjectCheck> {
     let (project, _) = prepared.parts();
     let (root, ordinals) = package_startup_order(project, &project.modules[..startup_count])?;
@@ -406,14 +464,12 @@ fn check_package_roots_with_policy<const COLLECT: bool, const PRIVATE_NESTED_SCA
     if !potential_obligations {
         return Ok(false);
     }
-    let (initialization, ()) = check_package_initialization_observing_with_policy::<(), COLLECT, PRIVATE_NESTED_SCALAR>(
-        prepared, root, ordinals, (), failures.as_deref_mut(),
-    )?;
+    let initialization = check_package_initialization_with_order(prepared, root, ordinals)?;
     if scope == ScalarCheckerScope::MainFlowOnly {
         return Ok(initialization.had_obligations);
     }
-    check_package_symbolic_roots::<COLLECT, _>(
-        prepared, startup_count, root, initialization, authored_roots, failures, &mut (),
+    check_package_symbolic_roots::<false, _>(
+        prepared, startup_count, root, initialization, authored_roots, None, &mut (),
     )
 }
 
@@ -2761,6 +2817,62 @@ impl ActualIntegerObserver for MainFlowProofObserver<'_> {
 }
 
 #[cfg(feature = "internal-checker")]
+struct NamedOrderedEvidence<'a, 'case> {
+    observed: MainFlowProofObserver<'a>,
+    candidate: Option<&'case PlannedModuleProof<'a>>,
+}
+
+#[cfg(feature = "internal-checker")]
+impl ActualIntegerObserver for NamedOrderedEvidence<'_, '_> {
+    const ENABLED: bool = false;
+    const CONTEXTUAL: bool = true;
+
+    fn observe(&mut self, _: PreparedCallable, _: &[&BigInt], _: &BigInt) {}
+
+    fn observe_initializer(
+        &mut self, target: PreparedCallable, site: Option<InitializerProofSite<'_>>,
+        parameters: &[ScalarType], arguments: &[&BigInt], value: &BigInt,
+    ) {
+        self.observed.observe_initializer(target, site, parameters, arguments, value);
+    }
+}
+
+#[cfg(feature = "internal-checker")]
+impl<'a, 'case> OrderedRunEvidence for NamedOrderedEvidence<'a, 'case> {
+    type Symbolic<'run> = SelectedSymbolicProof<'a, 'run> where Self: 'run;
+    type SymbolicReport = (Option<SymbolicProofDiagnostic>, Vec<SymbolicProofDiagnostic>);
+
+    fn complete_startup(&self, reached: &HashSet<PreparedCallable>) -> Result<bool, ProjectCheck> {
+        if !self.observed.complete(reached) {
+            return Err(ProjectCheck::Unsupported);
+        }
+        Ok(self.observed.active)
+    }
+
+    fn symbolic(&self) -> Self::Symbolic<'_> {
+        SelectedSymbolicProof {
+            watched: &self.observed, candidate: self.candidate, verified: None,
+            failure: None, additional_failures: Vec::new(),
+        }
+    }
+
+    fn finish_symbolic<'run>(proof: Self::Symbolic<'run>) -> Self::SymbolicReport where Self: 'run {
+        (proof.failure, proof.additional_failures)
+    }
+}
+
+#[cfg(feature = "internal-checker")]
+fn run_closed_without_named_proofs(
+    prepared: &PreparedCheckerProject, scope: ScalarCheckerScope, startup_count: usize,
+) -> Result<MainFlowProofReceipt, ProjectCheck> {
+    let run = run_prepared_ordered_check(prepared, scope, startup_count, OrderedReachPolicy::Closed, ())?;
+    Ok(MainFlowProofReceipt {
+        active: run.active, directives: run.directives, diagnostics: Vec::new(),
+        symbolic_diagnostic: None, additional_symbolic_diagnostics: Vec::new(),
+    })
+}
+
+#[cfg(feature = "internal-checker")]
 #[cfg_attr(not(test), allow(dead_code))]
 fn check_loaded_main_flow_proof_diagnostics(
     declarations: Vec<(ScalarSourceDeclarations, Vec<ScalarNamespaceBinding>)>,
@@ -2783,8 +2895,7 @@ fn check_loaded_ordered_proof_diagnostics(
         let (prepared, startup_count) = prepare_checked_package_scope(
             declarations, initialization_order, Vec::new(), inputs, scope,
         )?;
-        let (active, directives) = collect_ordered_checker_records_with_policy::<true>(&prepared, scope, startup_count)?;
-        return Ok(MainFlowProofReceipt { active, directives, diagnostics: Vec::new(), symbolic_diagnostic: None, additional_symbolic_diagnostics: Vec::new() });
+        return run_closed_without_named_proofs(&prepared, scope, startup_count);
     }
     let prepared = prepare_loaded_proof_project(declarations, proofs, initialization_order, inputs)?;
     if prepared.proofs.iter().any(|(source, catalog)| source != &prepared.source && !catalog.definitions.is_empty()) {
@@ -2794,10 +2905,7 @@ fn check_loaded_ordered_proof_diagnostics(
         .and_then(|(source, catalog)| catalog.definitions.split_first().map(|(first, rest)| (source, catalog, first, rest)))
     else {
         let startup_count = prepared.prepared.parts().0.modules.len();
-        let (active, directives) = collect_ordered_checker_records_with_policy::<true>(
-            &prepared.prepared, scope, startup_count,
-        )?;
-        return Ok(MainFlowProofReceipt { active, directives, diagnostics: Vec::new(), symbolic_diagnostic: None, additional_symbolic_diagnostics: Vec::new() });
+        return run_closed_without_named_proofs(&prepared.prepared, scope, startup_count);
     };
     let first_name = module_proof_name(first).ok_or(ProjectCheck::InvalidProof)?;
     let rest_names = rest.iter().map(|definition| module_proof_name(definition).ok_or(ProjectCheck::InvalidProof))
@@ -2820,34 +2928,17 @@ fn check_loaded_ordered_proof_diagnostics(
     for plan in &others {
         observer.insert(plan.target, MainFlowProofCase::prepare(plan, &prepared.source)?);
     }
-    let (root, ordinals) = package_initialization_order(prepared.prepared.parts().0)?;
-    let mut effects = OrderedFailures::default();
-    let (initialization, observer) = check_package_initialization_observing_with_policy::<_, true, true>(
-        &prepared.prepared, root, ordinals, observer, Some(&mut effects),
+    let startup_count = prepared.prepared.parts().0.modules.len();
+    let run = run_prepared_ordered_check(
+        &prepared.prepared, scope, startup_count, OrderedReachPolicy::Closed,
+        NamedOrderedEvidence { observed: observer, candidate: others.is_empty().then_some(&first_plan) },
     )?;
-    if !observer.complete(&initialization.reached) {
-        return Err(ProjectCheck::Unsupported);
-    }
-    let mut active = initialization.had_obligations || observer.active;
-    let (symbolic_diagnostic, additional_symbolic_diagnostics) = if scope == ScalarCheckerScope::CurrentPackage {
-        let mut proof = SelectedSymbolicProof {
-            watched: &observer, candidate: others.is_empty().then_some(&first_plan), verified: None,
-            failure: None, additional_failures: Vec::new(),
-        };
-        let startup_count = prepared.prepared.parts().0.modules.len();
-        let (_, authored_roots) = package_obligation_roots(&prepared.prepared, scope, startup_count, root)?;
-        active |= check_package_symbolic_roots::<true, _>(
-            &prepared.prepared, startup_count, root, initialization, authored_roots, Some(&mut effects), &mut proof,
-        )?;
-        (proof.failure, proof.additional_failures)
-    } else {
-        (None, Vec::new())
-    };
+    let (symbolic_diagnostic, additional_symbolic_diagnostics) = run.symbolic;
     Ok(MainFlowProofReceipt {
-        active, directives: effects.records, diagnostics: observer.diagnostics, symbolic_diagnostic, additional_symbolic_diagnostics,
+        active: run.active, directives: run.directives, diagnostics: run.actual.observed.diagnostics,
+        symbolic_diagnostic, additional_symbolic_diagnostics,
     })
 }
-
 
 #[cfg(feature = "internal-checker")]
 #[doc(hidden)]
@@ -7959,6 +8050,28 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
         let main = run(&text, ScalarCheckerScope::MainFlowOnly).unwrap();
         assert!(main.active && main.diagnostics.len() == 1 && main.directives.is_empty());
         assert!(main.symbolic_diagnostic.is_none() && main.additional_symbolic_diagnostics.is_empty());
+        let without_proofs = text.lines().map(|line| {
+            if line.trim_start().starts_with("proof ") { " ".repeat(line.len()) } else { line.to_owned() }
+        }).collect::<Vec<_>>().join("\n");
+        for scope in [ScalarCheckerScope::MainFlowOnly, ScalarCheckerScope::CurrentPackage] {
+            let no_catalog = check_loaded_ordered_proof_diagnostics(
+                vec![(declarations(&app, &without_proofs), Vec::new())], Vec::new(), vec![app.clone()], inputs(), scope,
+            ).unwrap();
+            let empty_catalog = run(&without_proofs, scope).unwrap();
+            let legacy = check_scalar_package_ordered_with_dormant_sources(
+                vec![(declarations(&app, &without_proofs), Vec::new())],
+                vec![app.clone()], Vec::new(), inputs(), scope,
+            );
+            assert_eq!(no_catalog.directives, empty_catalog.directives);
+            assert!(no_catalog.diagnostics.is_empty() && no_catalog.symbolic_diagnostic.is_none());
+            assert_eq!(no_catalog.active, empty_catalog.active);
+            match scope {
+                ScalarCheckerScope::MainFlowOnly => assert!(matches!(legacy, ScalarOrderedCheckerOutcome::NoChecks)),
+                ScalarCheckerScope::CurrentPackage => {
+                    assert_eq!(legacy, ScalarOrderedCheckerOutcome::Failed(no_catalog.directives));
+                }
+            }
+        }
         let not_reached = text.replace("u8 observed = discovered(1);", "");
         assert!(matches!(run(&not_reached, ScalarCheckerScope::CurrentPackage), Err(ProjectCheck::Unsupported)));
         let incomplete = text.replace("later = fn(value) { value }", "later = fn(value) { value + 1 }");
