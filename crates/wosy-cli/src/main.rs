@@ -596,6 +596,15 @@ enum InternalCheckStatus<'a> {
 
 #[cfg(feature = "internal-checker")]
 #[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, PartialEq)]
+enum InternalCheckEffect<'a> {
+    Stdout(&'a [u8]),
+    Stderr(&'a [u8]),
+    DeferredFile(&'a wosy_compiler::ScalarCheckerTextFile),
+}
+
+#[cfg(feature = "internal-checker")]
+#[cfg_attr(not(test), allow(dead_code))]
 impl InternalCheckReceipt<wosy_compiler::ScalarOrderedCheckerOutcome> {
     fn selected_status(&self) -> Option<InternalCheckStatus<'_>> {
         use wosy_compiler::ScalarOrderedCheckerOutcome;
@@ -606,6 +615,27 @@ impl InternalCheckReceipt<wosy_compiler::ScalarOrderedCheckerOutcome> {
                 .map_or(InternalCheckStatus::Zero, InternalCheckStatus::FirstNonzero)),
             ScalarOrderedCheckerOutcome::Unsupported | ScalarOrderedCheckerOutcome::Invalid(_) => None,
         }
+    }
+
+    fn visit_authored_effects<E>(
+        &self,
+        mut sink: impl FnMut(InternalCheckEffect<'_>) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let wosy_compiler::ScalarOrderedCheckerOutcome::Failed(reports) = &self.outcome else {
+            return Ok(());
+        };
+        for report in reports {
+            if !report.stdout.is_empty() {
+                sink(InternalCheckEffect::Stdout(&report.stdout))?;
+            }
+            if !report.stderr.is_empty() {
+                sink(InternalCheckEffect::Stderr(&report.stderr))?;
+            }
+            for file in &report.files {
+                sink(InternalCheckEffect::DeferredFile(file))?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1413,6 +1443,88 @@ mod tests {
         assert_eq!(counts, routing_observations::Counts {
             extractions: 1, preparations: 1, builds: 1, single_module_emissions: 1, ..Default::default()
         });
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn internal_ordered_effects_visit_only_authored_bytes_and_deferred_files_in_order() {
+        use wosy_compiler::{ScalarCheckerScope, ScalarOrderedCheckerOutcome};
+        let text = r#"%%start
+            core.require(false, { .stdout = "ação\n"; .stderr = "first"; .code = 0;
+                .files = [{ .path = "logs/a.txt"; .text = "☕"; }, { .path = "empty.txt"; .text = ""; }]; });
+            core.require(false, { .stdout = ""; .stderr = "last\t"; .code = 0;
+                .files = [{ .path = "logs/b.txt"; .text = "β"; }]; });
+        %%end"#;
+        let (project, configuration) = routing_test_project("ordered-internal-effects", &[("main.w", text)]);
+        let receipt = check_loaded_ordered_project(
+            &project.root, &project, &configuration, ScalarTargetLayout::WASM32,
+            ScalarCheckerScope::CurrentPackage, Vec::new(),
+        ).expect("complete ordered receipt");
+        let ScalarOrderedCheckerOutcome::Failed(reports) = &receipt.outcome else { panic!("expected authored effects"); };
+        assert_eq!(receipt.selected_status(), Some(InternalCheckStatus::Zero));
+        let mut events = Vec::new();
+        receipt.visit_authored_effects(|effect| {
+            match effect {
+                InternalCheckEffect::Stdout(bytes) => events.push(("stdout", None, bytes.to_vec())),
+                InternalCheckEffect::Stderr(bytes) => events.push(("stderr", None, bytes.to_vec())),
+                InternalCheckEffect::DeferredFile(file) => events.push(("file", Some(file.path.to_string()), file.text.to_vec())),
+            }
+            Ok::<(), ()>(())
+        }).unwrap();
+        assert_eq!(events, [
+            ("stdout", None, "ação\n".as_bytes().to_vec()),
+            ("stderr", None, b"first".to_vec()),
+            ("file", Some("logs/a.txt".into()), "☕".as_bytes().to_vec()),
+            ("file", Some("empty.txt".into()), Vec::new()),
+            ("stderr", None, b"last\t".to_vec()),
+            ("file", Some("logs/b.txt".into()), "β".as_bytes().to_vec()),
+        ]);
+        let mut calls = 0;
+        let refused = receipt.visit_authored_effects(|effect| {
+            calls += 1;
+            if let InternalCheckEffect::DeferredFile(file) = effect {
+                assert!(std::ptr::eq(file, &reports[0].files[0]));
+                return Err("sink refused");
+            }
+            Ok(())
+        });
+        assert_eq!(refused, Err("sink refused"));
+        assert_eq!(calls, 3);
+        assert!(!project.root.join("logs").exists());
+        assert!(!project.root.join("empty.txt").exists());
+        assert!(!project.root.join(".wosy").exists());
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn internal_ordered_effects_do_not_emit_for_invalid_unsupported_or_no_failure() {
+        use wosy_compiler::{ScalarCheckerScope, ScalarOrderedCheckerOutcome};
+        let authored = r#"core.require(false, { .stdout = "never"; .stderr = ""; .code = 0; .files = []; });"#;
+        for (tail, expected) in [
+            ("unit() leaf = fn {}; unit() nested = fn { leaf(); }; nested();", "unsupported"),
+            ("core.require(true, {});", "invalid"),
+            ("", "failed"),
+        ] {
+            let text = format!("%%start\n{authored}\n{tail}\n%%end");
+            let (project, configuration) = routing_test_project("ordered-internal-effect-completion", &[("main.w", &text)]);
+            let receipt = check_loaded_ordered_project(
+                &project.root, &project, &configuration, ScalarTargetLayout::WASM32,
+                ScalarCheckerScope::MainFlowOnly, Vec::new(),
+            ).expect("well-formed canonical source");
+            match &receipt.outcome {
+                ScalarOrderedCheckerOutcome::Unsupported => assert_eq!(expected, "unsupported"),
+                ScalarOrderedCheckerOutcome::Invalid(_) => assert_eq!(expected, "invalid"),
+                ScalarOrderedCheckerOutcome::Failed(_) => assert_eq!(expected, "failed"),
+                outcome => panic!("unexpected {outcome:?}"),
+            }
+            let mut effects = 0;
+            receipt.visit_authored_effects(|_| { effects += 1; Ok::<(), ()>(()) }).unwrap();
+            assert_eq!(effects, usize::from(expected == "failed"));
+        }
+        for outcome in [ScalarOrderedCheckerOutcome::Passed, ScalarOrderedCheckerOutcome::NoChecks] {
+            let receipt = InternalCheckReceipt { outcome, texts: BTreeMap::new() };
+            receipt.visit_authored_effects::<()>(|_| panic!("no authored effects")).unwrap();
+        }
     }
 
     #[cfg(feature = "internal-checker")]
