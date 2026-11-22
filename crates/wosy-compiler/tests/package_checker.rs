@@ -1037,6 +1037,47 @@ fn named_proof_peer_use_checks_one_independent_same_domain_leaf() {
 }
 
 #[test]
+fn named_proof_peer_use_checks_exact_singleton_where_subsets_without_filling_holes() {
+    let identity = source();
+    let check = |peer_where: &str, caller_where: &str, goal: &str, peers: &[&str]| {
+        check_scalar_module_proofs(
+            identity.clone(), peers,
+            vec![ScalarProofModuleInput {
+                source: identity.clone(),
+                text: format!(r#"%%start
+                    u8(u8) fixed = fn(value) {{ if (value > 7) {{ 7 }} else {{ 7 }} }};
+                    proof leaf for fixed(input) -> (out) where ({peer_where}) ensures (out == 7) {{}}
+                    proof consumer for fixed(entry) -> (out) where ({caller_where}) ensures ({goal}) {{
+                        core.use(leaf(entry));
+                    }}
+                %%end"#),
+                namespaces: Vec::new(),
+            }],
+            vec![identity.clone()],
+            ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
+        ).unwrap()
+    };
+    let selections = ["consumer", "leaf"];
+    assert_eq!(check("input <= 7", "entry == 6", "out <= 7", &selections), [
+        ScalarModuleProofOutcome::Proved, ScalarModuleProofOutcome::Proved,
+    ]);
+    assert_eq!(check("input < 3 || input > 5", "entry == 6", "out <= 7", &selections), [
+        ScalarModuleProofOutcome::Proved, ScalarModuleProofOutcome::Proved,
+    ]);
+    assert_eq!(check("input < 3 || input > 5", "entry == 4", "out <= 7", &selections), [
+        ScalarModuleProofOutcome::Unsupported, ScalarModuleProofOutcome::Proved,
+    ]);
+    assert_eq!(check("input <= 7", "entry == 6", "out < 7", &selections), [
+        ScalarModuleProofOutcome::Refuted, ScalarModuleProofOutcome::Proved,
+    ]);
+    assert_eq!(check("input <= 7", "entry == 6", "out <= 7", &["consumer"]),
+        [ScalarModuleProofOutcome::Unsupported]);
+    assert_eq!(check("input <= 7", "entry <= 6", "out <= 7", &selections), [
+        ScalarModuleProofOutcome::Unsupported, ScalarModuleProofOutcome::Proved,
+    ]);
+}
+
+#[test]
 fn verified_bound_checks_both_ordered_typed_call_arguments_and_repeated_aliases() {
     let identity = source();
     let use_bound = |proof: &str, caller: &str, extra: &str| {
