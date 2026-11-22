@@ -1294,24 +1294,36 @@ fn named_induction_proves_only_the_complete_canonical_unused_return_case() {
 }
 
 #[test]
-fn proved_named_induction_is_not_a_reusable_module_bound() {
+fn proved_named_induction_supplies_exact_equality_to_an_independent_applicable_call_only() {
     let identity = source();
-    let text = format!(r#"%%start
-        u8(u8) descend = fn(value) {{ if (value == 0) {{ 0 }} else {{ descend(value - 1) }} }};
-        unit() caller = fn {{
-            u8 result = descend(7);
-            core.require(result == 0, {OUTPUT});
-        }};
-        proof rank for descend(entry) -> (out) ensures (out == 0) decreases (entry) {{
-            if (entry == 0) {{ core.show(out == 0); }} else {{ core.use(rank(entry - 1)); }}
-        }}
-    %%end"#);
-    let (_, catalog) = wosy_compiler::parse_proof_source(identity.clone(), text, &[])
-        .ok().expect("valid named recursive proof syntax");
-    assert_eq!(check_loaded_scalar_module_proof_call(
-        (&identity, "rank"), (&identity, "caller"), Vec::new(), (catalog, Vec::new()),
-        vec![identity.clone()], ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
-    ), ScalarProofCallOutcome::Unavailable);
+    let check = |base: u8, goal: &str, guard: &str, call: &str, requirement: &str, start: &str| {
+        let text = format!(r#"%%start
+            u8(u8) descend = fn(value) {{ if (value == 0) {{ {base} }} else {{ descend(value - 1) }} }};
+            u8(u8) other = fn(value) {{ value }};
+            unit() caller = fn {{
+                u8 result = {call};
+                core.require({requirement}, {OUTPUT});
+            }};
+            proof rank for descend(entry) -> (out) where ({guard}) ensures ({goal}) decreases (entry) {{
+                if (entry == 0) {{ core.show(out == 0); }} else {{ core.use(rank(entry - 1)); }}
+            }}
+            {start}
+        %%end"#);
+        let (_, catalog) = wosy_compiler::parse_proof_source(identity.clone(), text, &[])
+            .ok().expect("valid named recursive proof syntax");
+        check_loaded_scalar_module_proof_call(
+            (&identity, "rank"), (&identity, "caller"), Vec::new(), (catalog, Vec::new()),
+            vec![identity.clone()], ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
+        )
+    };
+    assert_eq!(check(0, "out == 0", "entry <= 7", "descend(7)", "result == 0", ""), ScalarProofCallOutcome::Established);
+    assert_eq!(check(0, "out == 0", "entry <= 7", "descend(7)", "result == 1", ""), ScalarProofCallOutcome::NotEstablished);
+    assert_eq!(check(0, "out == 0", "entry <= 7", "descend(8)", "result == 0", ""), ScalarProofCallOutcome::Unavailable);
+    assert_eq!(check(0, "out == 0", "entry <= 7", "other(7)", "result == 0", ""), ScalarProofCallOutcome::Unavailable);
+    assert_eq!(check(1, "out == 0", "entry <= 7", "descend(7)", "result == 0", ""), ScalarProofCallOutcome::Unavailable);
+    assert_eq!(check(0, "out <= 1", "entry <= 7", "descend(7)", "result == 0", ""), ScalarProofCallOutcome::Unavailable);
+    assert_eq!(check(0, "out == 0", "false", "descend(7)", "result == 0", ""), ScalarProofCallOutcome::Unavailable);
+    assert_eq!(check(0, "out == 0", "entry <= 7", "descend(7)", "result == 0", "u8 actual = descend(3);"), ScalarProofCallOutcome::Unavailable);
 }
 
 #[test]

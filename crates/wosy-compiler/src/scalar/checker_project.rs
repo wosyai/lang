@@ -1420,11 +1420,17 @@ mod production_bound_reuse {
         (source, name): (&SourceIdentity, &str),
         (caller_source, caller_name): (&SourceIdentity, &str),
     ) -> Option<ScalarProofCallOutcome> {
-        let plan = project.plan_module_proof(source, name).ok()?;
+        let plan = project.plan_module_proof_in_scope::<true>(source, name).ok()?;
         let TypedProofGoal::Literal { operator, relation, bound } = &plan.typed.goal else { return None; };
         let (scalar, calls) = project.prepared.parts();
         let caller = select_checked_root(scalar, caller_source, caller_name).ok()?;
         let (root, ordinals) = package_initialization_order(scalar).ok()?;
+        if plan.typed.measure.is_some()
+            && (operator != &BinaryOperator::Equal || plan.proof_source != root
+                || &plan.typed.target.source != root || caller_source != root)
+        {
+            return None;
+        }
         let initialization = check_package_initialization_with_order(&project.prepared, root, ordinals).ok()?;
         let &venue = initialization.ordinals.get(plan.proof_source)?;
         if initialization.visits[venue] != InitializationVisit::Completed
@@ -1461,9 +1467,6 @@ mod production_bound_reuse {
             (operator, relation, bound): (&BinaryOperator, IntegerRelation, &BigInt),
         ) -> Option<Self> {
             let body = plan.typed.body;
-            if !plan.steps.items.is_empty() || !valid_arbitrary_proof_body(body) {
-                return None;
-            }
             let parameters = body.boundary.parameters.as_slice();
             if !matches!(parameters.len(), 1 | 2) {
                 return None;
@@ -1476,13 +1479,23 @@ mod production_bound_reuse {
             if guard.always_rejects {
                 return None;
             }
-            let ProofCoverage::Applicable(paths) = observe_arbitrary_integer_returns(body, plan.filter.as_deref())?.ok()? else {
-                return None;
+            let values = if let Some(rank) = plan.typed.measure {
+                if !matches!(plan.verify_unused_induction(rank), Ok(ProjectCheck::Proved)) {
+                    return None;
+                }
+                IntegerSet::singleton(bound)
+            } else {
+                if !plan.steps.items.is_empty() || !valid_arbitrary_proof_body(body) {
+                    return None;
+                }
+                let ProofCoverage::Applicable(paths) = observe_arbitrary_integer_returns(body, plan.filter.as_deref())?.ok()? else {
+                    return None;
+                };
+                if !paths.iter().all(|path| path.output_satisfies(relation, bound) == Some(true)) {
+                    return None;
+                }
+                IntegerSet::from_type(&output.ty)?.keep(operator, bound)?
             };
-            if !paths.iter().all(|path| path.output_satisfies(relation, bound) == Some(true)) {
-                return None;
-            }
-            let values = IntegerSet::from_type(&output.ty)?.keep(operator, bound)?;
             Some(Self {
                 issuer, proof_identity, canonical_target: plan.canonical_target,
                 target_layout: plan.typed.target.target_layout,
@@ -1572,6 +1585,7 @@ struct PlannedModuleProof<'a> {
 
 #[cfg(feature = "internal-checker")]
 impl PreparedProofModule {
+    #[cfg(test)]
     fn plan_module_proof<'a>(&'a self, proof_source: &SourceIdentity, proof_name: &'a str) -> Result<PlannedModuleProof<'a>, ProjectCheck> {
         self.plan_module_proof_in_scope::<false>(proof_source, proof_name)
     }
