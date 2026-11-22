@@ -731,7 +731,8 @@ impl IntegerReturningPath<'_> {
                 }
                 let returned = self.axes.iter().position(|known| *known == alias)?;
                 let old = self.axes.iter().position(|known| *known == binding)?;
-                let upper_against_lower = entry_relation.accepts(std::cmp::Ordering::Less);
+                use std::cmp::Ordering::{Greater, Less};
+                let comparison = (entry_relation.accepts(Less), entry_relation.accepts(Greater));
                 // A row is a Cartesian product of its component sets: this pure
                 // observer starts with independent entry axes, splits one axis at
                 // a time, and coalesces only rows identical on all other axes.
@@ -741,10 +742,22 @@ impl IntegerReturningPath<'_> {
                     if !result.every_at_extremes(relation, bound) {
                         return Some(false);
                     }
-                    let (result_min, result_max) = result.extremes()?;
-                    let (old_min, old_max) = row[old].extremes()?;
-                    let worst = if upper_against_lower { result_max.cmp(old_min) } else { result_min.cmp(old_max) };
-                    if !entry_relation.accepts(worst) {
+                    let old = &row[old];
+                    let holds = match comparison {
+                        (false, false) => {
+                            // Across independent axes, even identical multi-value
+                            // sets permit choosing two unequal values.
+                            result.singleton_value().is_some_and(|value| Some(value) == old.singleton_value())
+                        }
+                        (true, true) => result.is_disjoint(old),
+                        (upper_against_lower, _) => {
+                            let (result_min, result_max) = result.extremes()?;
+                            let (old_min, old_max) = old.extremes()?;
+                            let worst = if upper_against_lower { result_max.cmp(old_min) } else { result_min.cmp(old_max) };
+                            entry_relation.accepts(worst)
+                        }
+                    };
+                    if !holds {
                         return Some(false);
                     }
                 }

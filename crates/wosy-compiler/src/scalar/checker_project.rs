@@ -4226,16 +4226,12 @@ fn proof_show_plan<'a, const VERIFY_ENTRY_WRITES: bool, const ALLOW_NAMED_STEPS:
                 if let Some(entry) = checked_old_output_relation(claim, output, inputs, body, ty) {
                     let (slot, relation) = entry?;
                     let binding = bindings.get(slot).ok_or(ProjectCheck::Unsupported)?;
-                    let other = if relation.accepts(std::cmp::Ordering::Less) != relation.accepts(std::cmp::Ordering::Greater) {
-                        // Only an independently checked second formal of the same exact
-                        // width/sign may be compared against this immutable entry.
-                        match (bindings, body.boundary.parameters.as_slice()) {
-                            ([_, second], [_, second_param]) if slot == 0 && second_param.ty == *ty => Some(second),
-                            ([first, _], [first_param, _]) if slot == 1 && first_param.ty == *ty => Some(first),
-                            _ => None,
-                        }
-                    } else {
-                        None
+                    // Only an independently checked second formal of the same exact
+                    // width/sign may be compared against this immutable entry.
+                    let other = match (bindings, body.boundary.parameters.as_slice()) {
+                        ([_, second], [_, second_param]) if slot == 0 && second_param.ty == *ty => Some(second),
+                        ([first, _], [first_param, _]) if slot == 1 && first_param.ty == *ty => Some(first),
+                        _ => None,
                     };
                     return Ok(IntegerShowProof::EntryComparison { binding, relation, other });
                 }

@@ -1030,10 +1030,10 @@ fn named_proof_show_old_checks_immutable_entry_and_independent_output_bound() {
                     i16(i16, i16) fixed = fn(tag, value) {{ if (tag == 0) {{}}; if (value == 0) {{}}; 7 }};
                     i16(u8, i16) width = fn(tag, value) {{ if (tag == 0) {{}}; value }};
                     i16(i16, i16) literal_then_alias = fn(tag, value) {{
-                        if (value == 0) {{}}; if (tag == 0) {{ 7 }} else {{ tag }}
+                        if (value == 0) {{}}; if (tag == 0) {{ 7 }} else {{ i16 local = 3; local }}
                     }};
                     i16(i16, i16) alias_then_literal = fn(tag, value) {{
-                        if (value == 0) {{}}; if (tag == 0) {{ tag }} else {{ 7 }}
+                        if (value == 0) {{}}; if (tag == 0) {{ i16 local = 3; local }} else {{ 7 }}
                     }};
                     i16(i16, i16) changed = fn(tag, value) {{ if (tag == 0) {{}}; if (value == 0) {{}}; value = 7; value }};
                     {actual}
@@ -1101,7 +1101,18 @@ fn named_proof_show_old_orders_same_width_formals_without_crossing_return_rows()
     // with limit >= 20. The remaining feasible rows return 0.
     assert_eq!(check("correlated", "limit >= 10 && limit <= 30", "out < 20", strict), ScalarModuleProofOutcome::Proved);
     assert_eq!(check("echo", "false", "out < 0", strict), ScalarModuleProofOutcome::NoApplicableInputs);
-    assert_eq!(check("echo", "value == 0 && limit == 0", "out <= 0", "out == core.old(limit)"), ScalarModuleProofOutcome::Unsupported);
+    let equal = "out == core.old(limit)";
+    let distinct = "out != core.old(limit)";
+    assert_eq!(check("echo", "value == 0 && limit == 0", "out <= 0", equal), ScalarModuleProofOutcome::Proved);
+    assert_eq!(check("echo", "value == 0 && limit == 1", "out <= 0", equal), ScalarModuleProofOutcome::Refuted);
+    assert_eq!(check("echo", "value >= 0 && value <= 1 && limit >= 0 && limit <= 1", "out <= 1", equal), ScalarModuleProofOutcome::Refuted);
+    assert_eq!(check("echo", &format!("{disconnected} && limit == -1"), "out <= 0", distinct), ScalarModuleProofOutcome::Proved);
+    assert_eq!(check("echo", &format!("{disconnected} && limit >= -1 && limit <= 0"), "out <= 0", distinct), ScalarModuleProofOutcome::Refuted);
+    assert_eq!(check("echo", "value >= 0 && value <= 2 && value != 1 && limit >= 1 && limit <= 3 && limit != 2",
+        "out <= 2", distinct), ScalarModuleProofOutcome::Proved);
+    assert_eq!(check("echo", "value >= 0 && value <= 2 && value != 1 && limit >= 1 && limit <= 3 && limit != 2",
+        "out < 2", distinct), ScalarModuleProofOutcome::Refuted);
+    assert_eq!(check("correlated", "limit >= 10 && limit <= 30", "out < 20", distinct), ScalarModuleProofOutcome::Proved);
 }
 
 #[test]

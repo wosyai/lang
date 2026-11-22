@@ -126,6 +126,29 @@ impl IntegerSet {
     }
 
     #[cfg(feature = "internal-checker")]
+    pub(super) fn is_disjoint(&self, other: &Self) -> bool {
+        let (Some((first, last)), Some((other_first, other_last))) = (self.extremes(), other.extremes()) else {
+            return true;
+        };
+        if last < other_first || other_last < first {
+            return true;
+        }
+
+        let (mut left, mut right) = (self.0.iter(), other.0.iter());
+        let (mut a, mut b) = (left.next(), right.next());
+        while let (Some(x), Some(y)) = (a, b) {
+            if x.last < y.first {
+                a = left.next();
+            } else if y.last < x.first {
+                b = right.next();
+            } else {
+                return false;
+            }
+        }
+        true
+    }
+
+    #[cfg(feature = "internal-checker")]
     pub(super) fn every_at_extremes(&self, relation: IntegerRelation, bound: &BigInt) -> bool {
         let Some((lower, upper)) = self.extremes() else { return true; };
         (relation.less || lower >= bound)
