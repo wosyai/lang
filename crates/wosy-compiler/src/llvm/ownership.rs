@@ -1023,6 +1023,24 @@ pub(super) fn emit_standard_allocation_call<'ctx>(
         .ok_or_else(|| "core allocation runtime returned no pointer".to_owned())
 }
 
+pub(super) fn emit_managed_allocation_branch<'ctx>(
+    context: &'ctx Context,
+    state: &EmitState<'ctx, '_>,
+    size: inkwell::values::IntValue<'ctx>,
+    alignment: u64,
+    failure: inkwell::basic_block::BasicBlock<'ctx>,
+    success: inkwell::basic_block::BasicBlock<'ctx>,
+) -> Result<PointerValue<'ctx>, String> {
+    let allocation = emit_standard_allocation_call(
+        state,
+        size.into(),
+        context.i64_type().const_int(alignment, false).into(),
+    )?;
+    let failed = state.builder.build_is_null(allocation, "allocation_failed").map_err(builder_error)?;
+    state.builder.build_conditional_branch(failed, failure, success).map_err(builder_error)?;
+    Ok(allocation)
+}
+
 pub(super) fn emit_runtime_array_allocation<'ctx, 'module>(
     context: &'ctx Context,
     state: &mut EmitState<'ctx, 'module>,
@@ -1073,20 +1091,10 @@ pub(super) fn emit_runtime_array_allocation<'ctx, 'module>(
                 .map_err(builder_error)?
         }
     };
-    let allocation = emit_standard_allocation_call(
-        state,
-        size.into(),
-        context.i64_type().const_int(alignment, false).into(),
-    )?;
-    let failed = state
-        .builder
-        .build_is_null(allocation, "allocation_failed")
-        .map_err(builder_error)?;
     let continue_block = context.append_basic_block(function, "allocation_continue");
-    state
-        .builder
-        .build_conditional_branch(failed, panic_block, continue_block)
-        .map_err(builder_error)?;
+    let allocation = emit_managed_allocation_branch(
+        context, state, size, alignment, panic_block, continue_block,
+    )?;
     state.builder.position_at_end(panic_block);
     let panic = state
         .module
