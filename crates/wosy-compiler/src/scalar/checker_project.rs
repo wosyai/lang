@@ -2516,6 +2516,12 @@ fn verify_authored_show_group<'step, 'project: 'step>(
 }
 
 #[cfg(feature = "internal-checker")]
+enum PeerShowClaims<'a> {
+    One(IntegerRelation, Cow<'a, BigInt>),
+    Many(Box<IntegerShowConstraints<'a>>),
+}
+
+#[cfg(feature = "internal-checker")]
 struct UnusedPeerUse<'plan, 'project> {
     index: usize,
     consumer: &'plan PlannedModuleProof<'project>,
@@ -2878,14 +2884,21 @@ impl PreparedProofModule {
                         continue;
                     }
                 }
-                let mixed_implies_claims = claim.map(|(show_relation, show_bound)| {
-                    let TypedProofGoal::Literal { relation: requested_relation, bound: requested, .. } =
-                        &plan.typed.goal else { return false; };
-                    let show = (show_relation, show_bound.as_ref());
-                    let ensures = (*requested_relation, requested);
+                let mixed_implies_claims = claim.map(|claim| {
                     let premise = (relation, bound);
-                    cited_bounds.implies(plan.typed.result_type, premise, show)
-                        && (show == ensures || cited_bounds.implies(plan.typed.result_type, premise, ensures))
+                    let mut implies = |relation, bound: &BigInt| {
+                        cited_bounds.implies(plan.typed.result_type, premise, (relation, bound))
+                    };
+                    match claim {
+                        PeerShowClaims::One(show_relation, show_bound) => {
+                            let TypedProofGoal::Literal { relation: requested_relation, bound: requested, .. } =
+                                &plan.typed.goal else { return false; };
+                            let ensures = (*requested_relation, requested);
+                            implies(show_relation, show_bound.as_ref())
+                                && ((show_relation, show_bound.as_ref()) == ensures || implies(ensures.0, ensures.1))
+                        }
+                        PeerShowClaims::Many(output) => output.implied_by(premise, implies),
+                    }
                 });
                 let leaf_guard = ExactGuardGroup(leaf.filter.as_deref());
                 arbitrary_groups.entry((plan.target, leaf_guard)).or_default().peer_uses.push(UnusedPeerUse {
@@ -3164,18 +3177,36 @@ impl PlannedModuleProof<'_> {
         self.peer_use_step(item)
     }
 
-    fn citation_then_show(&self) -> Result<Option<(&str, (IntegerRelation, Cow<'_, BigInt>))>, ProjectCheck> {
-        let [use_step, show_step] = self.steps.items.as_slice() else { return Ok(None); };
-        if self.steps.terminated_items.as_slice() != [true, true] {
+    fn citation_then_show(&self) -> Result<Option<(&str, PeerShowClaims<'_>)>, ProjectCheck> {
+        let [use_step, show_steps @ ..] = self.steps.items.as_slice() else { return Ok(None); };
+        let [true, terminated @ ..] = self.steps.terminated_items.as_slice() else { return Ok(None); };
+        if show_steps.is_empty() || terminated.len() != show_steps.len() {
             return Ok(None);
         }
         let Some(peer) = self.peer_use_step(use_step) else { return Ok(None); };
-        let claim = proof_show_expression(show_step, true)?;
+        if let [show] = show_steps {
+            let (relation, bound) = self.checked_peer_show(show, terminated[0])?;
+            return Ok(Some((peer, PeerShowClaims::One(relation, bound))));
+        }
+        let Some((relation, bound)) = self.peer_literal_goal() else { return Err(ProjectCheck::Unsupported); };
+        let mut constraints = IntegerShowConstraints::default();
+        constraints.add(relation, Cow::Borrowed(bound));
+        for (step, terminated) in show_steps.iter().zip(terminated) {
+            let (relation, bound) = self.checked_peer_show(step, *terminated)?;
+            constraints.add(relation, bound);
+        }
+        Ok(Some((peer, PeerShowClaims::Many(Box::new(constraints)))))
+    }
+
+    fn checked_peer_show<'a>(
+        &self, step: &'a ScalarBlockItem, terminated: bool,
+    ) -> Result<(IntegerRelation, Cow<'a, BigInt>), ProjectCheck> {
+        let claim = proof_show_expression(step, terminated)?;
         let comparison = IntegerComparison::from_expression(claim).ok_or(ProjectCheck::Unsupported)?;
         let (_, relation, bound) = checked_literal_output_goal_borrowed(
             comparison, &self.typed.output, &self.typed.input_names, self.typed.result_type,
         )?;
-        Ok(Some((peer, (relation, bound))))
+        Ok((relation, bound))
     }
 
     fn peer_use_step<'a>(&self, item: &'a ScalarBlockItem) -> Option<&'a str> {

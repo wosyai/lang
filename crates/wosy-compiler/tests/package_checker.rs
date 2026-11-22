@@ -1760,6 +1760,20 @@ fn named_proof_citation_then_show_checks_both_claims_against_verified_evidence()
     assert_eq!(check("false", "false", "out < 8", "out < 9", steps), [NoApplicableInputs, NoApplicableInputs]);
     assert!(matches!(check("false", "false", "out < 8", "out < 9",
         "core.use(leaf(arg)); core.show(out <= 128);").as_slice(), [Invalid(_), NoApplicableInputs]));
+    let sequence = "core.use(leaf(arg)); core.show(out <= 10); core.show(out <= 7); core.show(out >= -128);";
+    assert_eq!(run("out < 9", sequence), [Proved, Proved]);
+    assert_eq!(run("out <= 6", sequence), [Unsupported, Proved]);
+    assert_eq!(run("out < 9", "core.use(leaf(arg)); core.show(out <= 7); core.show(out <= 6);"),
+        [Unsupported, Proved]);
+    assert_eq!(run("out < 9", "core.use(cycle_a(arg)); core.show(out <= 7); core.show(out < 9);"),
+        [Unsupported, Proved]);
+    assert_eq!(check("false", "false", "out < 8", "out < 9", sequence), [NoApplicableInputs, NoApplicableInputs]);
+    assert!(matches!(check("false", "false", "out < 8", "out < 9",
+        "core.use(leaf(arg)); core.show(out < 0); core.show(out > 0); core.show(out <= 128);").as_slice(),
+        [Invalid(_), NoApplicableInputs]));
+    let excluded = "core.use(leaf(arg)); core.show(out != 0); core.show(out >= -128); core.show(out != 0);";
+    assert_eq!(check("entry != 0", "arg != 0", "out != 0", "out <= 127", excluded), [Proved, Proved]);
+    assert_eq!(check("entry != 0", "arg != 0", "out != 0", "out != 1", excluded), [Unsupported, Proved]);
 }
 
 #[test]

@@ -134,6 +134,17 @@ impl<'a> IntegerShowConstraints<'a> {
         }
     }
 
+    pub(super) fn implied_by(
+        &self, premise: (IntegerRelation, &BigInt),
+        mut implies: impl FnMut(IntegerRelation, &BigInt) -> bool,
+    ) -> bool {
+        self.lower.as_ref().is_none_or(|(bound, open)| {
+            implies(IntegerRelation { less: false, equal: !open, greater: true }, bound)
+        }) && self.upper.as_ref().is_none_or(|(bound, open)| {
+            implies(IntegerRelation { less: true, equal: !open, greater: false }, bound)
+        }) && self.excluded.iter().all(|hole| !premise.0.accepts(hole.as_ref().cmp(premise.1)))
+    }
+
     pub(super) fn normalize(&mut self) {
         self.excluded.sort_unstable();
         self.excluded.dedup();
