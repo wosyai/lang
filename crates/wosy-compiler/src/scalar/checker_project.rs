@@ -3102,6 +3102,93 @@ mod tests {
 
     #[cfg(feature = "internal-checker")]
     #[test]
+    fn callable_failure_collection_preserves_unproved_rows_and_narrow_reachability() {
+        use super::super::checker_flow::collect_integer_requirement_failures;
+
+        let app = source("src/main.w", "collect-callable-failures");
+        let text = format!(r#"%%start
+            unit(u8) flow = fn(value) {{
+                if (value > 3) {{
+                    core.require(value < 9, {OUTPUT});
+                    core.require(value < 10, {OUTPUT});
+                    core.narrow(value < 4, {OUTPUT});
+                    core.require(false, {OUTPUT});
+                }} else {{
+                    core.require(value == 0, {OUTPUT});
+                    core.narrow(value < 2, {OUTPUT});
+                    core.require(value < 2, {OUTPUT});
+                }};
+                core.require(value < 2, {OUTPUT});
+            }};
+            unit() helper = fn {{}};
+            unit(u8) incomplete = fn(value) {{
+                core.require(value == 0, {OUTPUT});
+                helper();
+            }};
+        %%end"#);
+        let prepared = prepare_checker_project(
+            vec![(declarations(&app, &text), Vec::new())], vec![app], inputs(),
+        ).unwrap();
+        let (_, calls) = prepared.parts();
+        let body = calls.function_body(0, 0, None).unwrap();
+        let (active, failures) = collect_integer_requirement_failures(body).unwrap();
+        assert!(active);
+        let receipts = failures.iter().map(|failure| {
+            let directive = &body.structure.checker_directives[&failure.directive];
+            let condition = &text[directive.condition.start as usize..directive.condition.end as usize];
+            let intervals = failure.state.intervals_at(0, 0).unwrap()
+                .map(|(first, last)| (first.clone(), last.clone())).collect::<Vec<_>>();
+            assert_eq!(failure.state.row_count(), 1);
+            (directive.operation, condition, intervals)
+        }).collect::<Vec<_>>();
+        let bounds = |start, end| vec![(BigInt::from(start), BigInt::from(end))];
+        assert_eq!(receipts, [
+            (CheckerOperation::Require, "value < 9", bounds(9, 255)),
+            (CheckerOperation::Require, "value < 10", bounds(10, 255)),
+            (CheckerOperation::Narrow, "value < 4", bounds(4, 255)),
+            (CheckerOperation::Require, "value == 0", bounds(1, 3)),
+        ]);
+        assert_eq!(check_integer_requirement_activity(body), Some(Err(failures.into_iter().next().unwrap())));
+        assert!(collect_integer_requirement_failures(calls.function_body(0, 2, None).unwrap()).is_none());
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn callable_failure_collection_continues_other_value_returning_arms_after_failed_narrow() {
+        use super::super::checker_flow::collect_integer_requirement_failures;
+
+        let app = source("src/main.w", "collect-value-arm-failures");
+        let text = format!(r#"%%start
+            u8(u8) choose = fn(value) {{
+                if (value >= 8) {{
+                    core.narrow(value < 8, {OUTPUT});
+                    core.require(false, {OUTPUT});
+                    value
+                }} else {{
+                    core.require(value == 0, {OUTPUT});
+                    value
+                }}
+            }};
+        %%end"#);
+        let prepared = prepare_checker_project(
+            vec![(declarations(&app, &text), Vec::new())], vec![app], inputs(),
+        ).unwrap();
+        let (_, calls) = prepared.parts();
+        let body = calls.function_body(0, 0, None).unwrap();
+        let (active, failures) = collect_integer_requirement_failures(body).unwrap();
+        assert!(active);
+        let [first, second] = failures.as_slice() else { panic!("expected exactly two reached failures"); };
+        let condition = |failure: &IntegerCheckFailure<'_>| {
+            let directive = &body.structure.checker_directives[&failure.directive];
+            (directive.operation, &text[directive.condition.start as usize..directive.condition.end as usize])
+        };
+        assert_eq!(condition(first), (CheckerOperation::Narrow, "value < 8"));
+        assert_eq!(condition(second), (CheckerOperation::Require, "value == 0"));
+        assert_eq!(check_integer_requirement_activity(body), Some(Err(failures.into_iter().next().unwrap())));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
     fn strict_induction_premise_preserves_width_reachability_and_callee_preconditions() {
         let check = |ty: &str, filter: &str, base: &str, use_name: &str| {
             let file = source("src/main.w", "strict-premise");

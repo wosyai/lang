@@ -3,6 +3,7 @@ use std::{borrow::Cow, collections::HashMap, rc::Rc};
 use num_bigint::BigInt;
 
 use super::{
+    checker_directive::CheckerOperation,
     control::{AssignmentReplacement, BindingInitialization, BindingRegion, BlockItemKind, BlockPosition, ConditionalRegion},
     reference::{BlockOrdinal, DirectDestinationIdentity, FunctionCallSites, OccurrenceEdge, OccurrenceNode, OccurrenceOrdinal, OccurrenceParent, OccurrenceStructure, PlainNameIdentity},
     symbolic_integer::IntegerSet,
@@ -174,6 +175,32 @@ impl IntegerInputs {
             }
         }
         Some((passing, failing))
+    }
+
+    fn failing_witness(&self, roots: &IntegerRoots<'_>, predicate: &CheckerPredicate) -> Option<Self> {
+        let predicate = match predicate {
+            CheckerPredicate::Boolean(true) => return Some(Self::default()),
+            CheckerPredicate::Boolean(false) => return Some(Self(self.0.clone())),
+            CheckerPredicate::Integer(predicate) => predicate,
+        };
+        let (index, ty) = roots.lookup(&predicate.binding)?;
+        if ty != &predicate.ty {
+            return None;
+        }
+        let relation = IntegerRelation::from_operator(&predicate.operator)?.complement();
+        let mut failing = Self::default();
+        for row in &self.0 {
+            let axis = &row[index];
+            let rejected = axis.keep_relation(relation, &predicate.bound);
+            if !rejected.is_empty() {
+                let mut row = row.clone();
+                if rejected != **axis {
+                    row[index] = Rc::new(rejected);
+                }
+                failing.0.push(row);
+            }
+        }
+        Some(failing)
     }
 
     fn join(mut self, mut other: Self, axis: Option<usize>) -> Self {
@@ -419,8 +446,20 @@ pub(super) fn check_integer_requirements(
 pub(super) fn check_integer_requirement_activity(
     calls: &FunctionCallSites,
 ) -> Option<Result<bool, IntegerCheckFailure<'_>>> {
-    run_integer_callable::<false>(calls, integer_tail_type(calls), None, None, None, None, None)
+    run_integer_callable::<false, false>(calls, integer_tail_type(calls), None, None, None, None, None, None)
         .map(|result| result.map(|coverage| matches!(coverage, ProofCoverage::Applicable(true))))
+}
+
+#[cfg(feature = "internal-checker")]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn collect_integer_requirement_failures(
+    calls: &FunctionCallSites,
+) -> Option<(bool, Vec<IntegerCheckFailure<'_>>)> {
+    let mut failures = Vec::new();
+    let coverage = run_integer_callable::<false, true>(
+        calls, integer_tail_type(calls), None, None, None, None, None, Some(&mut failures),
+    )?.ok()?;
+    Some((matches!(coverage, ProofCoverage::Applicable(true)), failures))
 }
 
 pub(super) type ExactIntegerArgument<'a> = (&'a ScalarType, &'a BigInt);
@@ -489,7 +528,7 @@ pub(super) fn check_integer_requirements_with_calls<'a>(
     handle_call: &mut ActualCallHandler<'a, '_>,
 ) -> Option<Result<bool, IntegerCheckFailure<'a>>> {
     let tail = if exact_arguments.is_none() { integer_tail_type(calls) } else { None };
-    run_integer_callable::<false>(calls, tail, None, None, None, exact_arguments, Some(handle_call))
+    run_integer_callable::<false, false>(calls, tail, None, None, None, exact_arguments, Some(handle_call), None)
         .map(|result| result.map(|coverage| matches!(coverage, ProofCoverage::Applicable(true))))
 }
 
@@ -500,7 +539,7 @@ pub(super) fn proves_requirement_with_imported_root_local(
     if local.values.is_empty() {
         return None;
     }
-    match run_integer_callable::<true>(calls, integer_tail_type(calls), None, None, Some(local), None, None)? {
+    match run_integer_callable::<true, false>(calls, integer_tail_type(calls), None, None, Some(local), None, None, None)? {
         Ok(ProofCoverage::Applicable(true)) => Some(true),
         Ok(ProofCoverage::Applicable(false)) => None,
         Ok(ProofCoverage::NoApplicableInputs) => None,
@@ -549,7 +588,7 @@ fn observe_integer_returns_in_scope<'a>(
         observations.set(if exact_arguments.is_some() { (arbitrary, actual + 1) } else { (arbitrary + 1, actual) });
     });
     let mut paths = Vec::new();
-    match run_integer_callable::<false>(calls, Some(tail), entry_filter, Some(&mut paths), None, exact_arguments, None)? {
+    match run_integer_callable::<false, false>(calls, Some(tail), entry_filter, Some(&mut paths), None, exact_arguments, None, None)? {
         Ok(ProofCoverage::Applicable(_)) if !paths.is_empty() => {
             Some(Ok(ProofCoverage::Applicable(paths)))
         }
@@ -653,7 +692,7 @@ fn integer_tail_type(calls: &FunctionCallSites) -> Option<&ScalarType> {
     (is_integer_type(&result.ty) && result.ty == output.ty).then_some(&result.ty)
 }
 
-fn run_integer_callable<'a, const USE_IMPORTED_BOUND: bool>(
+fn run_integer_callable<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool>(
     calls: &'a FunctionCallSites,
     tail: Option<&'a ScalarType>,
     entry_filter: Option<&[CheckerPredicate]>,
@@ -661,6 +700,7 @@ fn run_integer_callable<'a, const USE_IMPORTED_BOUND: bool>(
     imported_local: Option<ImportedLocal<'a>>,
     exact_arguments: Option<&[&BigInt]>,
     mut handle_call: Option<&mut ActualCallHandler<'a, '_>>,
+    mut failures: Option<&mut Vec<IntegerCheckFailure<'a>>>,
 ) -> Option<Result<ProofCoverage<bool>, IntegerCheckFailure<'a>>> {
     let boundary = &calls.boundary;
     let checker_parameters = boundary.checker_parameter_bindings.as_deref()?;
@@ -700,7 +740,7 @@ fn run_integer_callable<'a, const USE_IMPORTED_BOUND: bool>(
             }
         }
     }
-    let result = walk_integer_block::<USE_IMPORTED_BOUND>(calls, &mut roots, calls.structure.root, IntegerInputs(vec![row]), tail, returns, &mut handle_call)?;
+    let result = walk_integer_block::<USE_IMPORTED_BOUND, COLLECT>(calls, &mut roots, calls.structure.root, IntegerInputs(vec![row]), tail, returns, &mut handle_call, &mut failures)?;
     if USE_IMPORTED_BOUND && roots.imported_local.is_some() {
         return None;
     }
@@ -712,7 +752,7 @@ fn run_integer_callable<'a, const USE_IMPORTED_BOUND: bool>(
     }
 }
 
-fn walk_integer_block<'a, const USE_IMPORTED_BOUND: bool>(
+fn walk_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool>(
     calls: &'a FunctionCallSites,
     roots: &mut IntegerRoots<'a>,
     block: BlockOrdinal,
@@ -720,6 +760,7 @@ fn walk_integer_block<'a, const USE_IMPORTED_BOUND: bool>(
     tail: Option<&'a ScalarType>,
     mut returns: Option<&mut Vec<IntegerReturningPath<'a>>>,
     handle_call: &mut Option<&mut ActualCallHandler<'a, '_>>,
+    failures: &mut Option<&mut Vec<IntegerCheckFailure<'a>>>,
 ) -> Option<IntegerControl<'a>> {
     let depth = roots.axes.len();
     let structure = &calls.structure;
@@ -730,14 +771,27 @@ fn walk_integer_block<'a, const USE_IMPORTED_BOUND: bool>(
         match item.kind {
             BlockItemKind::Evaluation { expression } => {
                 if let Some(directive) = structure.checker_directives.get(&expression) {
-                    let (passing, failing, _) = path.split(roots, directive.predicate.as_ref()?)?;
+                    let predicate = directive.predicate.as_ref()?;
                     roots.reached_obligation = true;
+                    if COLLECT && directive.operation == CheckerOperation::Require {
+                        let failing = path.failing_witness(roots, predicate)?;
+                        if !failing.is_unreachable() {
+                            failures.as_deref_mut()?.push(IntegerCheckFailure {
+                                directive: expression, state: failing, axes: roots.axes.clone(),
+                            });
+                        }
+                        continue;
+                    }
+                    let (passing, failing, _) = path.split(roots, predicate)?;
                     if directive.operation.rejects(!passing.is_unreachable(), !failing.is_unreachable()) {
-                        return Some(IntegerControl::Fail(IntegerCheckFailure {
-                            directive: expression,
-                            state: failing,
-                            axes: roots.axes.clone(),
-                        }));
+                        let failure = IntegerCheckFailure {
+                            directive: expression, state: failing, axes: roots.axes.clone(),
+                        };
+                        if COLLECT {
+                            failures.as_deref_mut()?.push(failure);
+                        } else {
+                            return Some(IntegerControl::Fail(failure));
+                        }
                     }
                     path = passing;
                 } else if structure.checker_direct_targets.contains_key(&expression) {
@@ -763,7 +817,7 @@ fn walk_integer_block<'a, const USE_IMPORTED_BOUND: bool>(
                             continue;
                         }
                         let control = if let Some(arm) = arm {
-                            walk_integer_block::<USE_IMPORTED_BOUND>(calls, roots, arm, incoming, None, None, handle_call)?
+                            walk_integer_block::<USE_IMPORTED_BOUND, COLLECT>(calls, roots, arm, incoming, None, None, handle_call, failures)?
                         } else {
                             IntegerControl::Continue(incoming)
                         };
@@ -800,9 +854,10 @@ fn walk_integer_block<'a, const USE_IMPORTED_BOUND: bool>(
                         if incoming.is_unreachable() {
                             continue;
                         }
-                        match walk_integer_block::<USE_IMPORTED_BOUND>(calls, roots, arm, incoming, Some(expected), returns.as_deref_mut(), handle_call)? {
+                        match walk_integer_block::<USE_IMPORTED_BOUND, COLLECT>(calls, roots, arm, incoming, Some(expected), returns.as_deref_mut(), handle_call, failures)? {
                             IntegerControl::Returned => {}
                             failure @ IntegerControl::Fail(_) => return Some(failure),
+                            IntegerControl::Continue(outgoing) if COLLECT && outgoing.is_unreachable() => {}
                             IntegerControl::Continue(_) => return None,
                         }
                     }

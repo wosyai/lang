@@ -34,6 +34,10 @@ impl IntegerRelation {
         Some(Self { less, equal, greater })
     }
 
+    pub(super) fn complement(self) -> Self {
+        Self { less: !self.less, equal: !self.equal, greater: !self.greater }
+    }
+
     pub(super) fn accepts(self, comparison: Ordering) -> bool {
         match comparison {
             Ordering::Less => self.less,
@@ -90,7 +94,11 @@ impl IntegerSet {
     }
 
     pub(super) fn keep(&self, operator: &BinaryOperator, bound: &BigInt) -> Option<Self> {
-        Some(self.partition::<false>(IntegerRelation::from_operator(operator)?, bound).0)
+        Some(self.keep_relation(IntegerRelation::from_operator(operator)?, bound))
+    }
+
+    pub(super) fn keep_relation(&self, relation: IntegerRelation, bound: &BigInt) -> Self {
+        self.partition::<false>(relation, bound).0
     }
 
     fn partition<const KEEP_COMPLEMENT: bool>(&self, relation: IntegerRelation, bound: &BigInt) -> (Self, Self) {
