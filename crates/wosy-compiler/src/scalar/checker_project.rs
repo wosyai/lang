@@ -1578,9 +1578,31 @@ impl PreparedProofModule {
         let filter = prepare_proof_entry_filter(
             proof.node, proof_source, typed.target.target_layout, &typed.input_names, typed.body,
         )?;
-        check_decrement_induction_premise(
-            proof_name, &steps, &typed, measure, filter.as_deref().unwrap_or_default(),
-        )
+        let proof_case = prepare_decrement_proof_steps(proof_name, &steps, &typed, measure)?;
+        check_decrement_induction_premise(measure, &proof_case.base_guard, filter.as_deref().unwrap_or_default())
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn audit_induction_return_witness(
+        &self, proof_source: &SourceIdentity, proof_name: &str,
+    ) -> Result<InductionPremise, ProjectCheck> {
+        let proof = self.select_resolved(proof_source, proof_name)?;
+        let typed = typed_proof_postcondition::<true>(&self.prepared, proof.function, proof.node)?;
+        let measure = typed.measure.ok_or(ProjectCheck::Unsupported)?;
+        let steps = derive_block(&child(proof.node, SyntaxKind::Block)?);
+        let proof_case = prepare_decrement_proof_steps(proof_name, &steps, &typed, measure)?;
+        let filter = prepare_proof_entry_filter(
+            proof.node, proof_source, typed.target.target_layout, &typed.input_names, typed.body,
+        )?;
+        let base_matches = check_canonical_induction_returns(
+            proof.function.2, proof.target, &typed, measure, &proof_case,
+        )?;
+        let filter = filter.as_deref().unwrap_or_default();
+        let (entries, minimum) = induction_entry_domain(measure, filter)?;
+        if !base_matches && induction_base_reachable(&entries, &proof_case.base_guard)? {
+            return Err(ProjectCheck::Refuted);
+        }
+        check_induction_entry_domain(entries, &minimum, &proof_case.base_guard, filter)
     }
 
     fn check_module_proofs(&self, proof_names: &[&str]) -> Vec<ScalarModuleProofOutcome> {
@@ -1954,13 +1976,18 @@ enum InductionPremise {
 }
 
 #[cfg(feature = "internal-checker")]
-fn check_decrement_induction_premise(
+struct TypedInductionProofSteps<'a> {
+    base_guard: CheckerPredicate,
+    base_claim: IntegerReturn<'a>,
+}
+
+#[cfg(feature = "internal-checker")]
+fn prepare_decrement_proof_steps<'a>(
     proof_name: &str,
-    steps: &ScalarBlock,
-    typed: &TypedProofPostcondition<'_>,
-    (parameter, binding): TypedEntryMeasure<'_>,
-    entry_filter: &[CheckerPredicate],
-) -> Result<InductionPremise, ProjectCheck> {
+    steps: &'a ScalarBlock,
+    typed: &TypedProofPostcondition<'a>,
+    (_, binding): TypedEntryMeasure<'a>,
+) -> Result<TypedInductionProofSteps<'a>, ProjectCheck> {
     let [entry] = typed.input_names.as_slice() else {
         return Err(ProjectCheck::Unsupported);
     };
@@ -1998,25 +2025,170 @@ fn check_decrement_induction_premise(
         return Err(ProjectCheck::Unsupported);
     }
     let base_bindings = std::slice::from_ref(binding);
-    let _base_claim = proof_show_claim(then_branch, &typed.input_names, &typed.output, typed.result_type, typed.body, base_bindings)?;
-    let active = proof_input_condition::<true>(condition, &typed.input_names, typed.body, true)?;
+    let base_claim = proof_show_claim(then_branch, &typed.input_names, &typed.output, typed.result_type, typed.body, base_bindings)?;
+    let base_guard = proof_input_condition::<true>(condition, &typed.input_names, typed.body, false)?;
+    Ok(TypedInductionProofSteps { base_guard, base_claim })
+}
+
+#[cfg(feature = "internal-checker")]
+fn check_canonical_induction_returns(
+    function: &ScalarFunction,
+    target: &ResolvedCallTarget,
+    typed: &TypedProofPostcondition<'_>,
+    (parameter, binding): TypedEntryMeasure<'_>,
+    proof: &TypedInductionProofSteps<'_>,
+) -> Result<bool, ProjectCheck> {
+    use super::reference::{OccurrenceEdge, OccurrenceNode, OccurrenceParent, PlainNameIdentity};
+    use super::typecheck::expression_span;
+
+    let body = typed.body;
+    let structure = &body.structure;
+    let TypedProofGoal::Literal { relation, bound, .. } = &typed.goal else {
+        return Err(ProjectCheck::Unsupported);
+    };
+    let IntegerReturn::Const(claimed_base) = &proof.base_claim else {
+        return Err(ProjectCheck::Unsupported);
+    };
+    if &parameter.ty != typed.result_type || !body.allocation_length_calls.is_empty() {
+        return Err(ProjectCheck::Unsupported);
+    }
+    let output_at = |block: super::reference::BlockOrdinal| {
+        let [item] = structure.blocks.get(block.0)?.items.as_slice() else {
+            return None;
+        };
+        match item.kind {
+            BlockItemKind::FinalOutput(slot) if slot.output == 0
+                && structure.checked_types.expressions.get(&slot.expression) == Some(typed.result_type) => Some(slot.expression),
+            _ => None,
+        }
+    };
+    let tail = output_at(structure.root).ok_or(ProjectCheck::Unsupported)?;
+    let Some(ConditionalRegion::Value { condition, then_block, else_block, .. }) = body.conditionals.get(&tail) else {
+        return Err(ProjectCheck::Unsupported);
+    };
+    if structure.checker_branches.get(condition) != Some(&proof.base_guard) {
+        return Err(ProjectCheck::Unsupported);
+    }
+
+    let base = output_at(*then_block)
+        .and_then(|occurrence| structure.checker_integer_literals.get(&occurrence))
+        .ok_or(ProjectCheck::Unsupported)?;
+
+    let recursive = output_at(*else_block).ok_or(ProjectCheck::Unsupported)?;
+    let [site] = body.call_occurrences.as_slice() else {
+        return Err(ProjectCheck::Unsupported);
+    };
+    if site.ordinal != recursive || body.resolved_call_site(recursive).map(|site| &site.target) != Some(target) {
+        return Err(ProjectCheck::Unsupported);
+    }
+    let signature = body.checked_call_signatures.get(&recursive).ok_or(ProjectCheck::Unsupported)?;
+    if !matches!(signature.parameters.as_slice(), [input] if input == &parameter.ty)
+        || !matches!(signature.outputs.outputs.as_slice(), [output] if &output.ty == typed.result_type)
+    {
+        return Err(ProjectCheck::Unsupported);
+    }
+
+    let source_tail = function.body.tail_conditional().ok_or(ProjectCheck::Unsupported)?;
+    let mut source_outputs = source_tail.else_branch.final_expressions();
+    let Some((source_call @ ScalarExpression::Call { arguments, .. }, _)) = source_outputs.next() else {
+        return Err(ProjectCheck::Unsupported);
+    };
+    let [argument @ ScalarExpression::Binary { operator: BinaryOperator::Subtract, left, right, .. }]
+        = arguments.as_slice() else { return Err(ProjectCheck::Unsupported); };
+    if source_outputs.next().is_some()
+        || body.occurrences.get(tail.0).map(|node| node.span) != Some(source_tail.span)
+        || body.occurrences.get(recursive.0).map(|node| node.span) != Some(expression_span(source_call))
+        || !matches!(right.as_ref(), ScalarExpression::Integer { value, .. } if *value == BigInt::from(1))
+    {
+        return Err(ProjectCheck::Unsupported);
+    }
+    let checked_operand = |parent, edge, expression| {
+        let OccurrenceNode::Expression(occurrence) = structure.edges.get(&(OccurrenceParent::Expression(parent), edge))? else {
+            return None;
+        };
+        (body.occurrences.get(occurrence.0)?.span == expression_span(expression)
+            && structure.checked_types.expressions.get(occurrence) == Some(&parameter.ty)).then_some(*occurrence)
+    };
+    let argument = checked_operand(recursive, OccurrenceEdge::CallArgument(0), argument).ok_or(ProjectCheck::Unsupported)?;
+    let left = checked_operand(argument, OccurrenceEdge::BinaryLeft, left).ok_or(ProjectCheck::Unsupported)?;
+    checked_operand(argument, OccurrenceEdge::BinaryRight, right).ok_or(ProjectCheck::Unsupported)?;
+    if !matches!(body.prepared_plain_name(left), Some(PlainNameIdentity::Lexical(entry)) if entry == binding) {
+        return Err(ProjectCheck::Unsupported);
+    }
+    Ok(base == *claimed_base && relation.accepts(base.cmp(bound)))
+}
+
+#[cfg(feature = "internal-checker")]
+fn check_decrement_induction_premise(
+    (parameter, binding): TypedEntryMeasure<'_>,
+    base_guard: &CheckerPredicate,
+    entry_filter: &[CheckerPredicate],
+) -> Result<InductionPremise, ProjectCheck> {
+    let (entries, minimum) = induction_entry_domain((parameter, binding), entry_filter)?;
+    check_induction_entry_domain(entries, &minimum, base_guard, entry_filter)
+}
+
+#[cfg(feature = "internal-checker")]
+fn induction_entry_domain(
+    (parameter, binding): TypedEntryMeasure<'_>,
+    entry_filter: &[CheckerPredicate],
+) -> Result<(IntegerSet, BigInt), ProjectCheck> {
     let mut entries = IntegerSet::from_type(&parameter.ty).ok_or(ProjectCheck::Unsupported)?;
-    for guard in entry_filter.iter().chain(std::iter::once(&active)) {
+    let minimum = entries.intervals().next().ok_or(ProjectCheck::Unsupported)?.0.clone();
+    for guard in entry_filter {
         match guard {
             CheckerPredicate::Boolean(true) => {}
-            CheckerPredicate::Boolean(false) => return Ok(InductionPremise::Unreachable),
+            CheckerPredicate::Boolean(false) => return Ok((IntegerSet::default(), minimum)),
             CheckerPredicate::Integer(predicate) if &predicate.binding == binding => {
                 entries = entries.keep(&predicate.operator, &predicate.bound).ok_or(ProjectCheck::Unsupported)?;
                 if entries.is_empty() {
-                    return Ok(InductionPremise::Unreachable);
+                    break;
                 }
             }
             CheckerPredicate::Integer(_) => return Err(ProjectCheck::Unsupported),
         }
     }
-    let (minimum, _) = super::typecheck::integer_bounds(&parameter.ty).ok_or(ProjectCheck::Unsupported)?;
+    Ok((entries, minimum))
+}
+
+#[cfg(feature = "internal-checker")]
+fn induction_base_reachable(
+    entries: &IntegerSet,
+    guard: &CheckerPredicate,
+) -> Result<bool, ProjectCheck> {
+    if entries.is_empty() {
+        return Ok(false);
+    }
+    match guard {
+        CheckerPredicate::Boolean(value) => Ok(*value),
+        CheckerPredicate::Integer(predicate) => {
+            let complement = complement_integer_comparison(&predicate.operator)
+                .and_then(IntegerRelation::from_operator).ok_or(ProjectCheck::Unsupported)?;
+            Ok(!entries.every(complement, &predicate.bound))
+        }
+    }
+}
+
+#[cfg(feature = "internal-checker")]
+fn check_induction_entry_domain(
+    mut entries: IntegerSet,
+    minimum: &BigInt,
+    base_guard: &CheckerPredicate,
+    entry_filter: &[CheckerPredicate],
+) -> Result<InductionPremise, ProjectCheck> {
+    match base_guard {
+        CheckerPredicate::Boolean(true) => return Ok(InductionPremise::Unreachable),
+        CheckerPredicate::Boolean(false) => {}
+        CheckerPredicate::Integer(predicate) => {
+            let operator = complement_integer_comparison(&predicate.operator).ok_or(ProjectCheck::Unsupported)?;
+            entries = entries.keep(operator, &predicate.bound).ok_or(ProjectCheck::Unsupported)?;
+        }
+    }
+    if entries.is_empty() {
+        return Ok(InductionPremise::Unreachable);
+    }
     let strict = IntegerRelation::from_operator(&BinaryOperator::Greater).expect("integer comparison");
-    if !entries.every(strict, &minimum) {
+    if !entries.every(strict, minimum) {
         return Ok(InductionPremise::NotStrict);
     }
     for guard in entry_filter {
@@ -2423,6 +2595,18 @@ fn proof_entry_filters(
     Ok(filters)
 }
 
+fn complement_integer_comparison(operator: &BinaryOperator) -> Option<&'static BinaryOperator> {
+    Some(match operator {
+        BinaryOperator::Equal => &BinaryOperator::NotEqual,
+        BinaryOperator::NotEqual => &BinaryOperator::Equal,
+        BinaryOperator::Less => &BinaryOperator::GreaterEqual,
+        BinaryOperator::LessEqual => &BinaryOperator::Greater,
+        BinaryOperator::Greater => &BinaryOperator::LessEqual,
+        BinaryOperator::GreaterEqual => &BinaryOperator::Less,
+        _ => return None,
+    })
+}
+
 fn proof_input_condition<const VERIFY_LITERAL_FIT: bool>(
     expression: &ScalarExpression,
     inputs: &[String],
@@ -2434,15 +2618,7 @@ fn proof_input_condition<const VERIFY_LITERAL_FIT: bool>(
     }
     let mut condition = IntegerComparison::from_expression(expression).ok_or(ProjectCheck::Unsupported)?;
     if negated {
-        condition.operator = match condition.operator {
-            BinaryOperator::Equal => &BinaryOperator::NotEqual,
-            BinaryOperator::NotEqual => &BinaryOperator::Equal,
-            BinaryOperator::Less => &BinaryOperator::GreaterEqual,
-            BinaryOperator::LessEqual => &BinaryOperator::Greater,
-            BinaryOperator::Greater => &BinaryOperator::LessEqual,
-            BinaryOperator::GreaterEqual => &BinaryOperator::Less,
-            _ => return Err(ProjectCheck::Unsupported),
-        };
+        condition.operator = complement_integer_comparison(condition.operator).ok_or(ProjectCheck::Unsupported)?;
     }
     let index = inputs.iter().position(|input| input == condition.name)
         .ok_or(ProjectCheck::InvalidProof)?;
@@ -2572,6 +2748,34 @@ mod tests {
         assert_eq!(check("i8", "true", "entry == 0", "rank"), Ok(InductionPremise::NotStrict));
         assert_eq!(check("u8", "true", "entry == 0", "peer"), Err(ProjectCheck::Unsupported));
         assert!(matches!(check("u8", "unknown < 7", "entry == 0", "rank"), Err(ProjectCheck::Invalid(_))));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn induction_return_witness_binds_the_real_base_and_exact_recursive_tail() {
+        let check = |function: &str, show: u8, goal: u8, guard: &str, filter: &str| {
+            let file = source("src/main.w", "checked-induction-return");
+            let text = format!(r#"%%start
+                u8(u8) other = fn(value) {{ value }};
+                u8(u8) descend = fn(value) {{ {function} }};
+                proof rank for descend(entry) -> (out) where ({filter}) ensures (out == {goal}) decreases (entry) {{
+                    if ({guard}) {{ core.show(out == {show}); }} else {{ core.use(rank(entry - 1)); }}
+                }}
+            %%end"#);
+            let prepared = PreparedProofModule::prepare(file, text, inputs()).unwrap();
+            assert!(matches!(prepared.plan_module_proof(&prepared.source, "rank"), Err(ProjectCheck::Unsupported)));
+            prepared.audit_induction_return_witness(&prepared.source, "rank")
+        };
+        let canonical = "if (value == 0) { 0 } else { descend(value - 1) }";
+        assert_eq!(check(canonical, 0, 0, "entry == 0", "true"), Ok(InductionPremise::Established));
+        assert_eq!(check(canonical, 1, 0, "entry == 0", "true"), Err(ProjectCheck::Refuted));
+        assert_eq!(check(canonical, 0, 1, "entry == 0", "true"), Err(ProjectCheck::Refuted));
+        assert_eq!(check(canonical, 0, 0, "entry == 1", "true"), Err(ProjectCheck::Unsupported));
+        assert_eq!(check("if (value == 0) { 0 } else { descend(value - 2) }", 0, 0, "entry == 0", "true"), Err(ProjectCheck::Unsupported));
+        assert_eq!(check("if (value == 0) { 0 } else { other(value - 1) }", 0, 0, "entry == 0", "true"), Err(ProjectCheck::Unsupported));
+        assert_eq!(check("if (value == 0) { 0 } else { descend(value - 1) + 1 }", 0, 0, "entry == 0", "true"), Err(ProjectCheck::Unsupported));
+        assert_eq!(check(canonical, 1, 0, "entry == 0", "false"), Ok(InductionPremise::Unreachable));
+        assert_eq!(check("if (value == 0) { 0 } else { other(value - 1) }", 1, 0, "entry == 0", "true"), Err(ProjectCheck::Unsupported));
     }
 
     #[test]
