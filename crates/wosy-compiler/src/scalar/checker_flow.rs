@@ -6,7 +6,7 @@ use super::{
     checker_directive::CheckerOperation,
     control::{AssignmentReplacement, BindingInitialization, BindingRegion, BlockItemKind, BlockPosition, ConditionalRegion},
     reference::{BlockOrdinal, DirectDestinationIdentity, FunctionCallSites, OccurrenceEdge, OccurrenceNode, OccurrenceOrdinal, OccurrenceParent, OccurrenceStructure, PlainNameIdentity},
-    symbolic_integer::IntegerSet,
+    symbolic_integer::{IntegerIntersection, IntegerSet},
     typecheck::is_integer_type,
     BinaryOperator, ReferenceBindingId, ScalarExpression, ScalarType, UnaryOperator,
 };
@@ -150,15 +150,13 @@ impl IntegerInputs {
     }
 
     fn restrict_axis(&mut self, axis: usize, survivors: &IntegerSet) {
-        self.0.retain_mut(|row| {
-            let retained = row[axis].intersection(survivors);
-            if retained.is_empty() {
-                return false;
-            }
-            if retained != *row[axis] {
+        self.0.retain_mut(|row| match row[axis].intersection(survivors) {
+            IntegerIntersection::Unchanged => true,
+            IntegerIntersection::Empty => false,
+            IntegerIntersection::Changed(retained) => {
                 row[axis] = Rc::new(retained);
+                true
             }
-            true
         });
     }
 
@@ -1142,4 +1140,33 @@ fn actual_call_projection_accepts_only_the_same_singleton_in_every_row() {
     let broad = IntegerInputs(vec![vec![Rc::new(IntegerSet::from_type(&ScalarType::U8).unwrap())]]);
     assert_eq!(broad.singleton_at(0), None);
     assert_eq!(IntegerInputs::default().singleton_at(0), None);
+}
+
+#[test]
+fn projected_axis_restriction_reuses_unchanged_rc_and_preserves_correlated_rows() {
+    let range = |first: u8, last: u8| {
+        IntegerSet::from_type(&ScalarType::U8).unwrap()
+            .keep(&BinaryOperator::GreaterEqual, &BigInt::from(first)).unwrap()
+            .keep(&BinaryOperator::LessEqual, &BigInt::from(last)).unwrap()
+    };
+    let untouched = Rc::new(range(1, 2));
+    let to_change = Rc::new(range(4, 10));
+    let to_drop = Rc::new(range(12, 15));
+    let untouched_other = Rc::new(range(50, 50));
+    let changed_other = Rc::new(range(60, 60));
+    let dropped_other = Rc::new(range(70, 70));
+    let survivors = Rc::new(range(1, 2).join(range(5, 5)).join(range(7, 8)));
+    assert!(!Rc::ptr_eq(&untouched, &survivors));
+    let mut input = IntegerInputs(vec![
+        vec![Rc::clone(&untouched), Rc::clone(&untouched_other)],
+        vec![Rc::clone(&to_change), Rc::clone(&changed_other)],
+        vec![Rc::clone(&to_drop), Rc::clone(&dropped_other)],
+    ]);
+    input.restrict_axis(0, &survivors);
+    let [first, second] = input.0.as_slice() else { panic!("expected two retained rows"); };
+    assert!(Rc::ptr_eq(&first[0], &untouched));
+    assert!(Rc::ptr_eq(&first[1], &untouched_other));
+    assert!(!Rc::ptr_eq(&second[0], &to_change));
+    assert_eq!(*second[0], range(5, 5).join(range(7, 8)));
+    assert!(Rc::ptr_eq(&second[1], &changed_other));
 }

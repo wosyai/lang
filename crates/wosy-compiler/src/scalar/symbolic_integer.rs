@@ -13,6 +13,13 @@ struct Interval {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) struct IntegerSet(Vec<Interval>);
 
+#[derive(Debug, Eq, PartialEq)]
+pub(super) enum IntegerIntersection {
+    Unchanged,
+    Empty,
+    Changed(IntegerSet),
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct IntegerRelation {
     less: bool,
@@ -170,14 +177,23 @@ impl IntegerSet {
         union
     }
 
-    pub(super) fn intersection(&self, other: &Self) -> Self {
-        let mut result = Self::default();
+    pub(super) fn intersection(&self, other: &Self) -> IntegerIntersection {
+        let mut changed = None::<Vec<Interval>>;
+        let mut matched = 0;
         let (mut left, mut right) = (0, 0);
         while let (Some(a), Some(b)) = (self.0.get(left), other.0.get(right)) {
             let first = (&a.first).max(&b.first);
             let last = (&a.last).min(&b.last);
             if first <= last {
-                result.0.push(Interval { first: first.clone(), last: last.clone() });
+                if let Some(changed) = changed.as_mut() {
+                    changed.push(Interval { first: first.clone(), last: last.clone() });
+                } else if self.0.get(matched).is_some_and(|prior| &prior.first == first && &prior.last == last) {
+                    matched += 1;
+                } else {
+                    let mut intervals = self.0[..matched].to_vec();
+                    intervals.push(Interval { first: first.clone(), last: last.clone() });
+                    changed = Some(intervals);
+                }
             }
             match a.last.cmp(&b.last) {
                 Ordering::Less => left += 1,
@@ -188,7 +204,12 @@ impl IntegerSet {
                 }
             }
         }
-        result
+        match changed {
+            Some(intervals) => IntegerIntersection::Changed(Self(intervals)),
+            None if matched == 0 => IntegerIntersection::Empty,
+            None if matched == self.0.len() => IntegerIntersection::Unchanged,
+            None => IntegerIntersection::Changed(Self(self.0[..matched].to_vec())),
+        }
     }
 
     fn append(&mut self, interval: Interval) {
@@ -209,6 +230,19 @@ impl IntegerSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn intersection_materializes_only_changed_nonempty_intervals() {
+        let isolated = |value: u8| IntegerSet::singleton(&BigInt::from(value));
+        let original = isolated(1).join(isolated(4)).join(isolated(7));
+        let superset = isolated(1).join(isolated(2)).join(isolated(4)).join(isolated(7));
+        assert_eq!(original.intersection(&superset), IntegerIntersection::Unchanged);
+        assert_eq!(original.intersection(&isolated(2)), IntegerIntersection::Empty);
+        assert_eq!(original.intersection(&isolated(1).join(isolated(4))),
+            IntegerIntersection::Changed(isolated(1).join(isolated(4))));
+        assert_eq!(original.intersection(&isolated(1).join(isolated(7))),
+            IntegerIntersection::Changed(isolated(1).join(isolated(7))));
+    }
 
     #[test]
     fn branch_condition_proves_local_bound_and_join_keeps_only_common_facts() {
