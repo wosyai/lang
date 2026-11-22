@@ -308,13 +308,13 @@ struct BatchedLiteralEvidence<'a, 'body, 'observation> {
 
 #[cfg(feature = "internal-checker")]
 #[derive(Clone, Copy)]
-struct OrderedRootLiteralProofs<'a, 'bound, 'checks, 'observation> {
+struct OrderedRootLiteralProofs<'a, 'bound, 'checks, 'observation, const STEP_FIRST: bool> {
     conditions: OrderedRootConditions<'a>,
     observed: &'observation std::cell::RefCell<BatchedLiteralEvidence<'bound, 'a, 'checks>>,
 }
 
 #[cfg(feature = "internal-checker")]
-impl<'a> ScopedAuthoredReturn<'a> for OrderedRootLiteralProofs<'a, '_, '_, '_> {
+impl<'a, 'bound, const STEP_FIRST: bool> ScopedAuthoredReturn<'a> for OrderedRootLiteralProofs<'a, 'bound, '_, '_, STEP_FIRST> {
     const ENABLED: bool = false;
     const OBSERVE_RETURN: bool = true;
 
@@ -350,20 +350,33 @@ impl<'a> ScopedAuthoredReturn<'a> for OrderedRootLiteralProofs<'a, '_, '_, '_> {
                     (Some(domain), low, high)
                 }
             };
-            for check in checks.iter_mut().filter(|check| check.failure.is_none()) {
-                let rejected = check.relation.complement();
-                let witness = if rejected.accepts(low.cmp(check.bound)) {
+            let rejected_point = |relation: IntegerRelation, bound: &'bound BigInt| {
+                let rejected = relation.complement();
+                if rejected.accepts(low.cmp(bound)) {
                     Some(low)
-                } else if rejected.accepts(high.cmp(check.bound)) {
+                } else if rejected.accepts(high.cmp(bound)) {
                     Some(high)
                 } else if rejected.accepts(std::cmp::Ordering::Equal) && domain.is_some_and(|domain|
-                    low < check.bound && check.bound < high && domain.covers_closed(check.bound, check.bound))
+                    low < bound && bound < high && domain.covers_closed(bound, bound))
                 {
-                    Some(check.bound)
+                    Some(bound)
                 } else {
                     None
-                };
-                if let Some(witness) = witness {
+                }
+            };
+            let checks = if STEP_FIRST {
+                let (step, goals) = checks.split_first_mut()?;
+                if let Some(witness) = rejected_point(step.relation, step.bound) {
+                    step.failure = Some(SymbolicLiteralFailure::from_row(slot, roots, row, axis, Cow::Borrowed(witness), None));
+                    *pending = 0;
+                    return Some(());
+                }
+                goals
+            } else {
+                &mut **checks
+            };
+            for check in checks.iter_mut().filter(|check| check.failure.is_none()) {
+                if let Some(witness) = rejected_point(check.relation, check.bound) {
                     check.failure = Some(SymbolicLiteralFailure::from_row(slot, roots, row, axis, Cow::Borrowed(witness), None));
                     *pending -= 1;
                 }
@@ -1928,7 +1941,7 @@ pub(super) fn collect_ordered_root_literal_proof<'a>(
 }
 
 #[cfg(feature = "internal-checker")]
-pub(super) fn collect_ordered_root_literal_proofs<'a>(
+pub(super) fn collect_ordered_root_literal_proofs<'a, const STEP_FIRST: bool>(
     calls: &'a FunctionCallSites, body: &'a super::ScalarBlock,
     checks: &mut [SymbolicLiteralCheck<'_, 'a>],
 ) -> Option<(bool, Vec<IntegerCheckFailure<'a>>, bool)> {
@@ -1937,7 +1950,7 @@ pub(super) fn collect_ordered_root_literal_proofs<'a>(
     let mut sink = |failure| failures.push(failure);
     let (active, _) = collect_integer_requirement_failures_in_scope(
         calls, IntegerRequirementEntry::Arbitrary, None, false, &mut sink,
-        OrderedRootLiteralProofs { conditions: OrderedRootConditions(body), observed: &observed },
+        OrderedRootLiteralProofs::<STEP_FIRST> { conditions: OrderedRootConditions(body), observed: &observed },
     )?;
     Some((active, failures, observed.into_inner().returned))
 }
