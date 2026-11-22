@@ -28,7 +28,7 @@ use super::{
     },
 };
 #[cfg(feature = "internal-checker")]
-use super::checker_flow::{observe_arbitrary_integer_returns, observe_unused_module_proof_returns, ImmutableEntryRange};
+use super::checker_flow::{observe_arbitrary_integer_returns, observe_unused_module_proof_returns, ImmutableEntryRange, IntegerShowOutput};
 use crate::Diagnostic;
 use wosy_syntax::SourceIdentity;
 use wosy_syntax::{CanonicalCstRoot, CstNode, CstToken, SyntaxKind};
@@ -4155,7 +4155,18 @@ fn proof_show_plan<'a, const VERIFY_ENTRY_WRITES: bool, const ALLOW_NAMED_STEPS:
                     if inputs.iter().any(|name| is_null_literal_name(name)) {
                         return Err(ProjectCheck::InvalidProof);
                     }
-                    return Ok(IntegerShowProof::OutputDisjunction(typed_output_disjunction(left, right, output, inputs, ty)?));
+                    return Ok(IntegerShowProof::Output(IntegerShowOutput::Disjunction(
+                        typed_output_disjunction(left, right, output, inputs, ty)?,
+                    )));
+                }
+                if matches!(claim, ScalarExpression::Binary { operator, .. } if *operator != BinaryOperator::Equal) {
+                    if let Some(comparison) = IntegerComparison::from_expression(claim) {
+                        if is_null_literal_name(output) || inputs.iter().any(|name| is_null_literal_name(name)) {
+                            return Err(ProjectCheck::InvalidProof);
+                        }
+                        let (_, relation, bound) = checked_literal_output_goal(comparison, output, inputs, ty)?;
+                        return Ok(IntegerShowProof::Output(IntegerShowOutput::Relation { relation, bound }));
+                    }
                 }
             }
             Ok(IntegerShowProof::Equality(proof_show_equality(claim, inputs, output, ty, body, bindings)?))

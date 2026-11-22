@@ -953,6 +953,39 @@ fn named_proof_show_disjunction_checks_the_entire_return_domain() {
 }
 
 #[test]
+fn named_proof_show_relation_checks_the_typed_bound_without_replacing_ensures() {
+    let identity = source();
+    let check = |guard: &str, ensures: &str, claim: &str, startup: &str| {
+        check_scalar_module_proof(
+            identity.clone(), "demonstrate",
+            vec![ScalarProofModuleInput {
+                source: identity.clone(),
+                text: format!(r#"%%start
+                    i16(i16) echo = fn(value) {{ value }};
+                    {startup}
+                    proof demonstrate for echo(input) -> (out) where ({guard}) ensures ({ensures}) {{
+                        core.show({claim});
+                    }}
+                %%end"#),
+                namespaces: Vec::new(),
+            }],
+            vec![identity.clone()], ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
+        )
+    };
+    assert_eq!(check("input >= -8 && input < 0", "out < 0", "out >= -8", ""), ScalarModuleProofOutcome::Proved);
+    assert_eq!(check("input >= -8 && input < 0", "out < 0", "out > -8", ""), ScalarModuleProofOutcome::Refuted);
+    assert_eq!(check("input == 5", "out >= 5", "out <= 5", ""), ScalarModuleProofOutcome::Proved);
+    assert_eq!(check("input == 5", "out >= 5", "out > 5", ""), ScalarModuleProofOutcome::Refuted);
+    assert_eq!(check("input != 0", "out <= 32767", "out != 0", ""), ScalarModuleProofOutcome::Proved);
+    assert_eq!(check("input != 0", "out != 0", "out != 0", ""), ScalarModuleProofOutcome::Proved);
+    assert_eq!(check("input == 5", "out < 5", "out <= 5", ""), ScalarModuleProofOutcome::Refuted);
+    assert_eq!(check("false", "out >= 5", "out <= 5", ""), ScalarModuleProofOutcome::NoApplicableInputs);
+    assert_eq!(check("input == 5", "out >= 5", "input <= 5", ""), ScalarModuleProofOutcome::Unsupported);
+    assert!(matches!(check("input == 5", "out >= 5", "out < 32768", ""), ScalarModuleProofOutcome::Invalid(_)));
+    assert_eq!(check("input == 5", "out >= 5", "out <= 5", "i16 actual = echo(5);"), ScalarModuleProofOutcome::Unsupported);
+}
+
+#[test]
 fn sequential_named_proof_shows_verify_each_claim_without_replacing_ensures() {
     let identity = source();
     let check = |target: &str, guard: &str, goal: &str, steps: &str, startup: &str| {

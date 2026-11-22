@@ -50,6 +50,11 @@ impl IntegerRelation {
         Self { less: self.greater, equal: self.equal, greater: self.less }
     }
 
+    #[cfg(feature = "internal-checker")]
+    pub(super) fn intersection(self, other: Self) -> Self {
+        Self { less: self.less && other.less, equal: self.equal && other.equal, greater: self.greater && other.greater }
+    }
+
     pub(super) fn accepts_closed(self, lower: &BigInt, upper: &BigInt, bound: &BigInt) -> bool {
         (self.less || lower >= bound)
             && (self.equal || bound < lower || bound > upper)
