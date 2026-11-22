@@ -1,0 +1,595 @@
+use super::*;
+
+struct Loan {
+    owner: usize,
+    issued: CfgPointId,
+    mutable: bool,
+}
+
+struct Install {
+    version: CfgPointId,
+    loan: Loan,
+}
+
+#[derive(Default)]
+struct Holder {
+    writes: Vec<Install>,
+    reads: Vec<CfgPointId>,
+}
+
+struct Fork {
+    branch: CfgPointId,
+    join: CfgPointId,
+}
+
+#[derive(Default)]
+pub(crate) struct Author {
+    pending_loan: Option<Loan>,
+    holders: BTreeMap<ReferenceBindingId, Holder>,
+    owners: HashMap<ReferenceBindingId, usize>,
+    fork: Option<Fork>,
+    branch: Option<CfgPointId>,
+    join: Option<CfgPointId>,
+    root_exit: Option<CfgPointId>,
+    pending_exit: Option<(CfgPointId, ReferenceScopeId)>,
+}
+
+impl Author {
+    pub(super) fn emit(
+        &mut self,
+        id: CfgPointId,
+        kind: &CfgPointKind,
+        scope: ReferenceScopeId,
+        types: &ReferenceBindingTypes,
+    ) -> bool {
+        if self.root_exit.is_some() || self.pending_exit.is_some() || (self.pending_loan.is_some()
+            && !matches!(kind, CfgPointKind::Bind { .. } | CfgPointKind::Assign { .. }))
+        {
+            return false;
+        }
+        match kind {
+            CfgPointKind::Branch { .. } => scope == ReferenceScopeId(0) && self.branch.replace(id).is_none(),
+            CfgPointKind::Join => scope == ReferenceScopeId(0) && self.join.replace(id).is_none(),
+            CfgPointKind::ScopeExit => {
+                self.pending_exit = Some((id, scope));
+                true
+            }
+            CfgPointKind::Entry | CfgPointKind::ScopeEnter
+            | CfgPointKind::Evaluate(ScalarExpression::Boolean { .. } | ScalarExpression::Integer { .. }
+                | ScalarExpression::Float { .. } | ScalarExpression::Char { .. }) => true,
+            CfgPointKind::Bind { binding } => match types.get(binding) {
+                Some(ScalarType::CheckedReference { inner, .. }) =>
+                    scope == ReferenceScopeId(0) && aggregate::ordinary_value(inner),
+                Some(ty) => aggregate::ordinary_value(ty) && self.pending_loan.is_none(),
+                None => false,
+            },
+            CfgPointKind::Assign { target, .. } => target.projections.is_empty()
+                && matches!(&target.place, ScalarPlace::Name { .. })
+                && self.pending_loan.is_some(),
+            CfgPointKind::Read { binding } => match types.get(binding) {
+                Some(ScalarType::CheckedReference { .. }) => {
+                    let Some(holder) = self.holders.get_mut(binding) else { return false };
+                    holder.reads.push(id);
+                    true
+                }
+                Some(ty) => aggregate::ordinary_value(ty),
+                None => false,
+            },
+            CfgPointKind::Borrow { place, loan }
+                if loan.parent.is_none()
+                    && loan.origin_place == *place
+                    && place.projections.is_empty()
+                    && matches!(&place.place, ScalarPlace::Name { .. })
+                    && types.0.get(&place.binding).is_some_and(|binding|
+                        binding.local_reborrow_scope == Some(ReferenceScopeId(0))
+                        && aggregate::ordinary_value(&binding.ty)) =>
+            {
+                let owner = match self.owners.get(&place.binding) {
+                    Some(&owner) => owner,
+                    None => {
+                        let owner = self.owners.len();
+                        self.owners.insert(place.binding.clone(), owner);
+                        owner
+                    }
+                };
+                self.pending_loan = Some(Loan {
+                    owner, issued: id,
+                    mutable: loan.mode == ScalarReferenceMutability::Mutable,
+                });
+                true
+            }
+            _ => false,
+        }
+    }
+
+    pub(super) fn bind(
+        &mut self, binding: &ReferenceBindingId, version: CfgPointId, rhs: Option<CfgPointId>,
+    ) -> bool {
+        let Some(loan) = self.pending_loan.take() else { return false };
+        if rhs != Some(loan.issued) || loan.issued.0 + 1 != version.0 || self.holders.contains_key(binding) {
+            return false;
+        }
+        self.holders.insert(binding.clone(), Holder {
+            writes: vec![Install { version, loan }], reads: Vec::new(),
+        });
+        true
+    }
+
+    pub(super) fn assign(&mut self, binding: &ReferenceBindingId, version: CfgPointId, rhs: CfgPointId) -> bool {
+        let Some(loan) = self.pending_loan.take() else { return false };
+        let Some(holder) = self.holders.get_mut(binding) else { return false };
+        if rhs != loan.issued || loan.issued.0 + 1 != version.0 {
+            return false;
+        }
+        holder.writes.push(Install { version, loan });
+        true
+    }
+
+    pub(super) fn end_scope(
+        &mut self, point: CfgPointId, leaving: &super::super::control::ScopeExitBindings,
+    ) -> bool {
+        let Some((expected, scope)) = self.pending_exit.take() else { return false };
+        if expected != point {
+            return false;
+        }
+        let root = scope == ReferenceScopeId(0);
+        if self.holders.keys().chain(self.owners.keys()).any(|binding| leaving.contains(binding) != root) {
+            return false;
+        }
+        if root {
+            self.root_exit = Some(point);
+        }
+        true
+    }
+
+    pub(super) fn fork(&mut self, edges: &ReferenceConditionalEdges, points: &[ReferenceFlowPoint]) -> bool {
+        if self.fork.is_some() || edges.terminals[1] != edges.branch
+            || self.branch != Some(edges.branch) || self.join != Some(edges.join)
+        {
+            return false;
+        }
+        let Some([then, bypass]) = edges.entries(points) else { return false };
+        if *bypass != edges.join || then.0 != edges.branch.0 + 1 || edges.terminals[0].0 + 1 != edges.join.0
+            || points[edges.terminals[0].0].successors.as_slice() != [edges.join]
+            || !matches!(points[then.0].kind, CfgPointKind::ScopeEnter)
+            || !matches!(points[edges.terminals[0].0].kind, CfgPointKind::ScopeExit)
+            || !matches!(points[edges.join.0].kind, CfgPointKind::Join)
+        {
+            return false;
+        }
+        self.fork = Some(Fork { branch: edges.branch, join: edges.join });
+        true
+    }
+
+    pub(super) fn seal(self, points: &[ReferenceFlowPoint]) -> Option<Box<Sealed>> {
+        let fork = self.fork?;
+        let exit = self.root_exit?;
+        if self.pending_loan.is_some() || self.pending_exit.is_some() || exit != points.last()?.id {
+            return None;
+        }
+        let mut owners = (0..self.owners.len()).map(|_| Owner::default()).collect::<Vec<_>>();
+        let mut holders = Vec::with_capacity(self.holders.len());
+        for (_, holder) in self.holders {
+            // Both passes visit the authored holder events, never the complete CFG.
+            // An install generates its owner on its actual arm; the next
+            // reachable install or the root exit retires that holder's version.
+            let mut live = Vec::new();
+            for route in [Route::Then, Route::Bypass] {
+                holder.leases(&fork, route, exit, |install, end, last_read| {
+                    let start = CfgPointId(install.version.0 + 1);
+                    if install.loan.mutable && start < end {
+                        owners[install.loan.owner].active.push(Interval { start, end });
+                    }
+                    if let Some(end) = last_read.filter(|last| start < *last) {
+                        live.push(Interval { start, end });
+                    }
+                });
+            }
+            if live.is_empty() {
+                continue;
+            }
+            let index = holders.len();
+            for write in &holder.writes {
+                if write.loan.mutable {
+                    let carriers = &mut owners[write.loan.owner].carriers;
+                    if carriers.last() != Some(&index) {
+                        carriers.push(index);
+                    }
+                }
+            }
+            compact(&mut live);
+            holders.push(LiveHolder { holder, live, refined: std::sync::OnceLock::new() });
+        }
+        if owners.iter().all(|owner| owner.carriers.is_empty()) {
+            return None;
+        }
+        for owner in &mut owners {
+            compact(&mut owner.active);
+        }
+        Some(Box::new(Sealed { exit, fork, holders, owner_index: self.owners, owners }))
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Route {
+    Then,
+    Bypass,
+}
+
+impl Fork {
+    fn takes_then_at(&self, point: CfgPointId) -> bool {
+        self.branch < point && point < self.join
+    }
+}
+
+impl Route {
+    fn reaches(self, fork: &Fork, point: CfgPointId) -> bool {
+        matches!(self, Self::Then) || !fork.takes_then_at(point)
+    }
+}
+
+impl Holder {
+    fn leases(
+        &self, fork: &Fork, route: Route, exit: CfgPointId,
+        mut visit: impl FnMut(&Install, CfgPointId, Option<CfgPointId>),
+    ) {
+        let mut writes = self.writes.iter().filter(|write| route.reaches(fork, write.version)).peekable();
+        let mut reads = self.reads.iter().copied().filter(|&read| route.reaches(fork, read)).peekable();
+        while let Some(write) = writes.next() {
+            let end = writes.peek().map_or(exit, |next| next.version);
+            let mut last = None;
+            while let Some(read) = reads.next_if(|read| *read < end) {
+                if write.version < read {
+                    last = Some(read);
+                }
+            }
+            visit(write, end, last);
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Interval {
+    start: CfgPointId,
+    end: CfgPointId,
+}
+
+fn compact(intervals: &mut Vec<Interval>) {
+    intervals.sort_unstable_by_key(|interval| interval.start);
+    let mut retained = 0;
+    for at in 0..intervals.len() {
+        let interval = intervals[at];
+        if retained != 0 && interval.start <= intervals[retained - 1].end {
+            intervals[retained - 1].end = intervals[retained - 1].end.max(interval.end);
+        } else {
+            intervals[retained] = interval;
+            retained += 1;
+        }
+    }
+    intervals.truncate(retained);
+}
+
+fn contains(intervals: &[Interval], point: CfgPointId) -> bool {
+    let end = intervals.partition_point(|interval| interval.start <= point);
+    end != 0 && point < intervals[end - 1].end
+}
+
+struct LiveHolder {
+    holder: Holder,
+    live: Vec<Interval>,
+    refined: std::sync::OnceLock<BTreeMap<usize, CarrierRefinement>>,
+}
+
+struct ReachingLoan {
+    interval: Interval,
+    issue: CfgPointId,
+}
+
+#[derive(Default)]
+struct CarrierRefinement {
+    then: Vec<ReachingLoan>,
+    bypass: Vec<ReachingLoan>,
+}
+
+impl CarrierRefinement {
+    fn at(&self, point: CfgPointId, inside_then: bool) -> Option<CfgPointId> {
+        fn at_path(facts: &[ReachingLoan], point: CfgPointId) -> Option<CfgPointId> {
+            let end = facts.partition_point(|fact| fact.interval.start <= point);
+            let fact = end.checked_sub(1).and_then(|index| facts.get(index))?;
+            (point < fact.interval.end).then_some(fact.issue)
+        }
+        let then = at_path(&self.then, point);
+        if inside_then {
+            return then;
+        }
+        // At an admitted pre-fork access there is precisely one reaching holder
+        // version, even if the last relevant future use differs by route.
+        let bypass = at_path(&self.bypass, point);
+        then.or(bypass)
+    }
+}
+
+#[derive(Default)]
+struct Owner {
+    active: Vec<Interval>,
+    carriers: Vec<usize>,
+}
+
+pub(crate) struct Sealed {
+    exit: CfgPointId,
+    fork: Fork,
+    holders: Vec<LiveHolder>,
+    owner_index: HashMap<ReferenceBindingId, usize>,
+    owners: Vec<Owner>,
+}
+
+impl Sealed {
+    pub(super) fn matches_edge_shape(&self, index: usize, point: &ReferenceFlowPoint) -> bool {
+        let CfgPointId(id) = point.id;
+        if id != index {
+            return false;
+        }
+        let next = CfgPointId(index + 1);
+        if point.id == self.fork.branch {
+            point.successors.as_slice() == [next, self.fork.join]
+        } else if point.id == self.exit {
+            point.successors.is_empty()
+        } else {
+            point.successors.as_slice() == [next]
+        }
+    }
+
+    pub(super) fn conflicts(
+        &self, owner: &ReferenceBindingId, access: CfgPointId, incoming_count: usize,
+        points: &[ReferenceFlowPoint],
+    ) -> Option<Vec<SourceSpan>> {
+        // Never replace a per-reaching-state verdict at a join.
+        if incoming_count != 1 || access >= self.fork.join {
+            #[cfg(test)]
+            tests::observe(3);
+            return None;
+        }
+        let Some(&owner_index) = self.owner_index.get(owner) else { return Some(Vec::new()) };
+        let summary = &self.owners[owner_index];
+        // Function-wide subset forgets versions. Edge generation/retirement and
+        // use-before-retirement liveness are conservative independent filters.
+        let mut carriers = summary.carriers.iter().copied()
+            .filter(|&holder| contains(&self.holders[holder].live, access))
+            .peekable();
+        if !contains(&summary.active, access) || carriers.peek().is_none() {
+            #[cfg(test)]
+            tests::observe(0);
+            return Some(Vec::new());
+        }
+        #[cfg(test)]
+        tests::observe(1);
+        let inside_then = self.fork.takes_then_at(access);
+        let mut conflicts = Vec::new();
+        // Carrier indices were assigned by the authored BTreeMap in binding order.
+        for holder in carriers {
+            let entry = &self.holders[holder];
+            let precise = entry.refined.get_or_init(|| {
+                #[cfg(test)]
+                tests::observe(2);
+                let mut by_owner = BTreeMap::<usize, CarrierRefinement>::new();
+                for route in [Route::Then, Route::Bypass] {
+                    entry.holder.leases(&self.fork, route, self.exit, |install, _, last_read| {
+                        if !install.loan.mutable {
+                            return;
+                        }
+                        let start = CfgPointId(install.version.0 + 1);
+                        let Some(end) = last_read.filter(|&last| start < last) else { return };
+                        let carrier = by_owner.entry(install.loan.owner).or_default();
+                        let facts = match route {
+                            Route::Then => &mut carrier.then,
+                            Route::Bypass => &mut carrier.bypass,
+                        };
+                        facts.push(ReachingLoan {
+                            interval: Interval { start, end }, issue: install.loan.issued,
+                        });
+                    });
+                }
+                by_owner
+            });
+            let Some(issue) = precise.get(&owner_index).and_then(|carrier| carrier.at(access, inside_then))
+                else { continue };
+            let CfgPointKind::Borrow { place, loan } = &points.get(issue.0)?.kind else {
+                return None;
+            };
+            if &place.binding != owner || loan.origin_place != *place
+                || !place.projections.is_empty() || !matches!(&place.place, ScalarPlace::Name { .. })
+                || loan.parent.is_some() || loan.mode != ScalarReferenceMutability::Mutable
+            {
+                return None;
+            }
+            conflicts.push(SourceSpan::new(loan.origin_place.source.clone(), loan.creation_span));
+        }
+        Some(conflicts)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    thread_local! {
+        static COUNTS: std::cell::Cell<[usize; 4]> = const { std::cell::Cell::new([0; 4]) };
+    }
+
+    pub(super) fn observe(stage: usize) {
+        COUNTS.with(|counts| {
+            let mut next = counts.get();
+            next[stage] += 1;
+            counts.set(next);
+        });
+    }
+
+    fn prepared() -> FunctionCallSites {
+        let span = ByteSpan::new(0, 100);
+        FunctionCallSites {
+            boundary: CallableBoundary { parameters: vec![], results: vec![], root_outputs: vec![], generics: vec![] },
+            sites: vec![], arms: vec![], occurrences: vec![], call_occurrences: vec![],
+            declared_unsafe_calls: BTreeSet::new(), callable_escapes: HashSet::new(),
+            overload_reservation_sites: vec![], self_tail_candidates: vec![], allocation_length_calls: vec![],
+            allocation_length_call_targets: HashMap::new(), checked_call_signatures: HashMap::new(),
+            plain_names: PlainNameFacts::Prepared(HashMap::new()), named_place_roots: NamedPlaceRootFacts::Prepared(HashMap::new()),
+            direct_destinations: DirectDestinationFacts::Prepared(HashMap::new()), members: MemberFacts::Prepared(HashMap::new()),
+            query_allocation_outputs: HashMap::new(), structure: OccurrenceStructure::new(span),
+            assignments: HashMap::new(), short_circuits: HashMap::new(),
+            conditionals: HashMap::from([(OccurrenceOrdinal(0), ConditionalRegion::Unit {
+                span, condition: OccurrenceOrdinal(1), then_block: BlockOrdinal(1), fallthrough: OccurrenceOrdinal(2),
+            })]),
+        }
+    }
+
+    fn function(span: ByteSpan) -> ScalarFunction {
+        ScalarFunction {
+            name: "inert".into(), name_span: span,
+            signature: ScalarType::Callable { parameters: vec![], outputs: ScalarOutputSequence { outputs: vec![], span } },
+            parameters: vec![], parameter_spans: vec![],
+            body: ScalarBlock { items: vec![], terminated_items: vec![], expressions: vec![], final_output_values: vec![], span, unsafe_context: false },
+            span, generic_parameters: vec![], overload_arms: vec![],
+            reference_cfg: ScalarReferenceCfg {
+                facts: vec![], points: vec![], initial_points: vec![], allocations: BTreeSet::new(),
+                specialized_policies: vec![], primary_call_points: HashMap::new(),
+            },
+        }
+    }
+
+    fn loan(builder: &mut ReferenceFlowBuilder<'_>, owner: &ReferenceBindingId, span: ByteSpan)
+        -> (CfgPointId, BTreeSet<ReferenceOriginId>)
+    {
+        let place = builder.reference_place(&ScalarPlace::Name { name: "owner".into(), span }, owner.clone(), None);
+        let loan = ReferenceLoanId {
+            origin_place: place.clone(), creation_span: span, parent: None, mode: ScalarReferenceMutability::Mutable,
+        };
+        let id = builder.intern(ReferenceOrigin::Fresh {
+            allocation: ReturnedAllocationId {
+                source: builder.source.clone(), function_span: builder.function_span,
+                declaration_span: owner.declaration_span, creation_span: span,
+            },
+            loan: loan.clone(),
+        });
+        let origins = BTreeSet::from([id]);
+        let point = builder.point(CfgPointKind::Borrow { place, loan }, span, ReferenceScopeId(0), origins.clone());
+        (point, origins)
+    }
+
+    fn bind(
+        builder: &mut ReferenceFlowBuilder<'_>, binding: &ReferenceBindingId, item: usize,
+        initializer: CfgPointId, origins: BTreeSet<ReferenceOriginId>,
+    ) {
+        builder.checked.insert(binding.clone());
+        builder.origins.insert(binding.clone(), origins.clone());
+        builder.point(CfgPointKind::Bind { binding: binding.clone() }, binding.declaration_span, ReferenceScopeId(0), origins);
+        builder.record_binding_definition(BlockPosition { block: BlockOrdinal(0), item }, 0, false, Some(initializer));
+    }
+
+    fn inert_result(prepared_existing: bool) -> FunctionReferenceResult {
+        let source = SourceIdentity::new("project".into(), "package".into(), "metadata".into(), "r1".into());
+        let at = |start| ByteSpan::new(start, start + 1);
+        let span = ByteSpan::new(0, 100);
+        let function = function(span);
+        let calls = prepared();
+        let names = HashSet::new();
+        let mut builder = ReferenceFlowBuilder::new(&source, &function, &names, &calls, &[], &[]);
+        assert!(builder.local_borrow.is_some());
+        let binding = |start| ReferenceBindingId {
+            source: source.clone(), function_span: span, block_span: span,
+            declaration_span: at(start), kind: ReferenceBindingKind::Declared,
+        };
+        let (x, y, h1, h2, h3) = (binding(20), binding(21), binding(22), binding(23), binding(24));
+        let root = ReferenceScopeId(0);
+        let arm = ReferenceScopeId(1);
+        for owner in [&x, &y] {
+            builder.binding_types.record(owner.clone(), ScalarType::I32, Some(root));
+        }
+        for holder in [&h1, &h2, &h3] {
+            builder.binding_types.record(holder.clone(), ScalarType::CheckedReference {
+                inner: Box::new(ScalarType::I32), mutability: ScalarReferenceMutability::Mutable,
+            }, Some(root));
+        }
+        builder.point(CfgPointKind::Entry, span, root, BTreeSet::new());
+        builder.point(CfgPointKind::ScopeEnter, span, root, BTreeSet::new());
+        let (initial, origins) = loan(&mut builder, &x, at(1));
+        bind(&mut builder, &h2, 0, initial, origins);
+        builder.point(CfgPointKind::Read { binding: y.clone() }, at(2), root, BTreeSet::new());
+        let (third, third_origins) = loan(&mut builder, &y, at(15));
+        bind(&mut builder, &h3, 1, third, third_origins.clone());
+        let (rhs, origins) = loan(&mut builder, &y, at(3));
+        let target = builder.reference_place(&ScalarPlace::Name { name: "h2".into(), span: at(4) }, h2.clone(), None);
+        let emitted = builder.emit_direct_assignment(h2.clone(), CfgPointKind::Assign {
+            target, rhs_point: rhs, previous_origins: BTreeSet::new(), previous_loans: vec![],
+        }, rhs, ReferenceValue::Checked(origins.clone()), at(4), root).expect("typed direct assignment");
+        builder.author_direct_assignment(emitted, prepared_existing);
+        let (second, second_origins) = loan(&mut builder, &x, at(5));
+        bind(&mut builder, &h1, 2, second, second_origins);
+        let branch = builder.point(CfgPointKind::Branch { condition: ScalarExpression::Boolean { value: true, span: at(6) } }, at(6), root, BTreeSet::new());
+        builder.point(CfgPointKind::ScopeEnter, at(7), arm, BTreeSet::new());
+        builder.point(CfgPointKind::Read { binding: x.clone() }, at(8), arm, BTreeSet::new());
+        for index in [9, 10] {
+            builder.point(CfgPointKind::Read { binding: y.clone() }, at(index), arm, BTreeSet::new());
+        }
+        let then_end = builder.point(CfgPointKind::ScopeExit, at(11), arm, BTreeSet::new());
+        builder.author_local_scope_exit(then_end, &super::super::super::control::ScopeExitBindings::default(), true);
+        builder.cursor = None;
+        let join = builder.point(CfgPointKind::Join, at(12), root, BTreeSet::new());
+        builder.connect_reference_conditional(
+            &ReferenceConditionalEdges { branch, terminals: [then_end, branch], join }, &calls.conditionals[&OccurrenceOrdinal(0)],
+        );
+        builder.point(CfgPointKind::Read { binding: y.clone() }, at(13), root, BTreeSet::new());
+        builder.point(CfgPointKind::Read { binding: h2.clone() }, at(14), root, origins);
+        builder.point(CfgPointKind::Read { binding: h3.clone() }, at(16), root, third_origins);
+        let exit = builder.point(CfgPointKind::ScopeExit, span, root, BTreeSet::new());
+        let mut leaving = super::super::super::control::ScopeExitBindings::default();
+        for binding in [x, y, h1, h2, h3] {
+            leaving.insert(binding);
+        }
+        builder.author_local_scope_exit(exit, &leaving, true);
+        builder.proof_points.scope_exit_bindings.as_mut().unwrap().insert(exit, leaving);
+        builder.seal_local_borrow();
+        builder.cfg.initial_points = builder.cfg.points.clone();
+        FunctionReferenceResult {
+            cfg: builder.cfg, proof_points: builder.proof_points,
+            checked_contract_returns: vec![], aggregate: aggregate::AggregateFlowResult::default(), arms: vec![],
+        }
+    }
+
+    fn definitive(result: &mut FunctionReferenceResult) -> Vec<ReferenceAnalysisError> {
+        let contracts = ReferenceOutputContracts::default();
+        let mut replays = Vec::new();
+        transfer_function_output_contracts(
+            result, &contracts, &contracts, &mut HashMap::new(), &mut replays, &mut 0,
+        );
+        replays.pop().expect("definitive replay").errors
+    }
+
+    #[test]
+    fn production_builder_and_pristine_replay_replace_only_complete_local_read_verdicts() {
+        let mut admitted = inert_result(true);
+        assert!(admitted.proof_points.local_borrow.is_some());
+        COUNTS.with(|counts| counts.set([0; 4]));
+        let staged = definitive(&mut admitted);
+        let counts = COUNTS.with(|counts| counts.get());
+        assert_eq!(&counts[..3], &[1, 3, 2]);
+        assert!(counts[3] > 0);
+        let again = definitive(&mut admitted);
+        assert_eq!(staged, again);
+        assert_eq!(COUNTS.with(|counts| counts.get()[2]), 2);
+        let mut unprepared = inert_result(false);
+        assert!(unprepared.proof_points.local_borrow.is_none());
+        COUNTS.with(|counts| counts.set([0; 4]));
+        let incumbent = definitive(&mut unprepared);
+        assert_eq!(staged, incumbent);
+        assert_eq!(COUNTS.with(|counts| counts.get()), [0; 4]);
+        let spans = staged.iter().find_map(|error| match error {
+            ReferenceAnalysisError::ConflictingPlace { source_span, origins }
+                if source_span.range == ByteSpan::new(9, 10) => Some(origins),
+            _ => None,
+        }).expect("two ordered holders");
+        assert_eq!(spans.iter().map(|origin| origin.range).collect::<Vec<_>>(),
+            vec![ByteSpan::new(3, 4), ByteSpan::new(15, 16)]);
+        assert!(!staged.iter().any(|error| matches!(error,
+            ReferenceAnalysisError::ConflictingPlace { source_span, .. } if source_span.range == ByteSpan::new(8, 9))));
+    }
+}

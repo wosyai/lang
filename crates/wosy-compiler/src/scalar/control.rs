@@ -25,6 +25,7 @@ pub(super) enum ForwardInitialGraph {
 
 #[derive(Default)]
 pub(crate) struct CallablePointFacts {
+    pub(super) local_borrow: Option<Box<super::reference::local_borrow::Sealed>>,
     pub(super) evaluations: HashMap<OccurrenceOrdinal, super::CfgPointId>,
     pub(super) installs: HashMap<OccurrenceOrdinal, FrozenInstall>,
     pub(super) definitions: HashMap<(BlockOrdinal, usize, usize), BindingDefinition>,

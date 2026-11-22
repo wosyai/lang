@@ -19,6 +19,7 @@ use super::*;
 
 pub(crate) mod aggregate;
 pub(super) mod self_tail;
+pub(super) mod local_borrow;
 
 #[cfg(test)]
 mod input_tests;
@@ -339,6 +340,7 @@ fn prepared_direct_local_reborrow_owner_requires_the_exact_declared_scope() {
 
 pub(super) struct ReferenceFlowBuilder<'a> {
     capture_call_points: bool,
+    local_borrow: Option<local_borrow::Author>,
     aggregate_facts: aggregate::AggregateFlowFacts,
     aggregate_result: aggregate::AggregateFlowResult,
     returning_leaf_prefix: bool,
@@ -386,6 +388,50 @@ struct ReferenceConditionalArm {
     result: ReferenceBlockResult,
 }
 
+struct ReferenceConditionalEdges {
+    branch: CfgPointId,
+    terminals: [CfgPointId; 2],
+    join: CfgPointId,
+}
+
+impl ReferenceConditionalEdges {
+    fn connect(&self, points: &mut [ReferenceFlowPoint]) {
+        for terminal in self.terminals {
+            points[terminal.0].successors.push(self.join);
+        }
+    }
+
+    fn entries<'a>(&self, points: &'a [ReferenceFlowPoint]) -> Option<&'a [CfgPointId; 2]> {
+        points[self.branch.0].successors.as_slice().try_into().ok()
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn reference_conditional_connector_preserves_then_and_unit_bypass_edges() {
+    let source = SourceIdentity::new("project".into(), "package".into(), "metadata".into(), "r1".into());
+    let span = ByteSpan::new(0, 1);
+    let point = |id, kind, scope, successors| ReferenceFlowPoint {
+        id: CfgPointId(id), kind, source_span: SourceSpan::new(source.clone(), span),
+        scope: ReferenceScopeId(scope), possible_origins: None, successors,
+    };
+    let mut points = [
+        point(0, CfgPointKind::Branch { condition: ScalarExpression::Boolean { value: true, span } }, 0, vec![CfgPointId(1)]),
+        point(1, CfgPointKind::ScopeEnter, 1, vec![CfgPointId(2)]),
+        point(2, CfgPointKind::ScopeExit, 1, Vec::new()),
+        point(3, CfgPointKind::Join, 0, Vec::new()),
+    ];
+    let edges = ReferenceConditionalEdges {
+        branch: CfgPointId(0), terminals: [CfgPointId(2), CfgPointId(0)], join: CfgPointId(3),
+    };
+    assert!(edges.entries(&points).is_none());
+    edges.connect(&mut points);
+    assert_eq!(edges.entries(&points), Some(&[CfgPointId(1), CfgPointId(3)]));
+    assert_eq!(points[1].successors, [CfgPointId(2)]);
+    assert_eq!(points[2].successors, [CfgPointId(3)]);
+    assert!(points[3].successors.is_empty());
+}
+
 enum ReferenceAssignmentDestination<'a> {
     RawName,
     PreparedName(&'a DirectDestinationIdentity),
@@ -425,6 +471,14 @@ impl<'a> ReferenceFlowBuilder<'a> {
     ) -> Self {
         Self {
             capture_call_points: false,
+            local_borrow: (matches!(call_sites.named_place_roots, NamedPlaceRootFacts::Prepared(_))
+                && call_sites.conditionals.len() == 1
+                && matches!(call_sites.conditionals.values().next(), Some(ConditionalRegion::Unit { .. }))
+                && call_sites.boundary.root_outputs.is_empty()
+                && call_sites.boundary.parameters.iter().all(|parameter| aggregate::ordinary_value(&parameter.ty))
+                && function.generic_parameters.is_empty() && call_sites.call_occurrences.is_empty()
+                && call_sites.structure.module_storage_uses.is_empty())
+                .then(local_borrow::Author::default),
             aggregate_facts: aggregate::AggregateFlowFacts::default(),
             aggregate_result: aggregate::AggregateFlowResult::default(),
             returning_leaf_prefix: true,
@@ -612,6 +666,11 @@ impl<'a> ReferenceFlowBuilder<'a> {
     ) -> CfgPointId {
         self.returning_leaf_prefix = self.returning_leaf_prefix && aggregate::returning_leaf_point(&kind);
         let id = CfgPointId(self.cfg.points.len());
+        if let Some(author) = &mut self.local_borrow {
+            if !author.emit(id, &kind, scope, &self.binding_types) {
+                self.local_borrow = None;
+            }
+        }
         self.formal_forward_shape = self.formal_forward_shape.and_then(|(moved, call)| {
             match &kind {
                 CfgPointKind::Move { place, .. }
@@ -1007,6 +1066,31 @@ impl<'a> ReferenceFlowBuilder<'a> {
         Ok(([then_arm, else_arm], condition_point, branch))
     }
 
+    fn connect_reference_conditional(&mut self, edges: &ReferenceConditionalEdges, region: &ConditionalRegion) {
+        edges.connect(&mut self.cfg.points);
+        if let Some(author) = &mut self.local_borrow {
+            if !matches!(region, ConditionalRegion::Unit { .. })
+                || !author.fork(edges, &self.cfg.points)
+            {
+                self.local_borrow = None;
+            }
+        }
+    }
+
+    fn seal_local_borrow(&mut self) {
+        self.proof_points.local_borrow = self.local_borrow.take()
+            .filter(|_| self.proof_points.pending_named_reborrow.is_none())
+            .and_then(|author| author.seal(&self.cfg.points));
+    }
+
+    fn author_local_scope_exit(&mut self, point: CfgPointId, leaving: &super::control::ScopeExitBindings, prepared: bool) {
+        if let Some(author) = &mut self.local_borrow {
+            if !prepared || !author.end_scope(point, leaving) {
+                self.local_borrow = None;
+            }
+        }
+    }
+
     fn conditional(
         &mut self,
         condition: &ScalarExpression,
@@ -1080,13 +1164,13 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 }
             }
         }
-        self.cfg.points[then_arm.end.0].successors.push(join);
-        self.cfg.points[else_arm.end.0].successors.push(join);
-        if let (Some((expression, writer_side, formal)), Some(condition), [then_entry, else_entry]) =
-            (literal_unit, condition_point, self.cfg.points[branch.0].successors.as_slice())
+        let edges = ReferenceConditionalEdges { branch, terminals: [then_arm.end, else_arm.end], join };
+        self.connect_reference_conditional(&edges, region);
+        if let (Some((expression, writer_side, formal)), Some(condition), Some([then_entry, else_entry])) =
+            (literal_unit, condition_point, edges.entries(&self.cfg.points))
         {
             let (writer_entry, retained_entry) = writer_side.split(*then_entry, *else_entry);
-            let (writer_exit, retained_exit) = writer_side.split(then_arm.end, else_arm.end);
+            let (writer_exit, retained_exit) = writer_side.split(edges.terminals[0], edges.terminals[1]);
             let edges = match region {
                 ConditionalRegion::Unit { then_block, .. }
                     if writer_side == aggregate::ArrayWriterSide::Then && retained_entry == join =>
@@ -3394,6 +3478,13 @@ impl<'a> ReferenceFlowBuilder<'a> {
         let bind = self.cursor.expect("existing binding definition point");
         if let CfgPointKind::Bind { binding } = &self.cfg.points[bind.0].kind {
             if let Some(ty) = self.binding_types.get(binding) {
+                if let Some(author) = &mut self.local_borrow {
+                    if allocation || (matches!(ty, ScalarType::CheckedReference { .. })
+                        && (receiver != 0 || !author.bind(binding, bind, initializer)))
+                    {
+                        self.local_borrow = None;
+                    }
+                }
                 if !allocation && matches!(ty, ScalarType::CheckedReference { .. }) {
                     if let Some(value) = initializer {
                         let frozen = &self.cfg.points[bind.0].possible_origins;
@@ -3555,12 +3646,56 @@ impl<'a> ReferenceFlowBuilder<'a> {
         }
     }
 
-    fn record_frozen_install(&mut self, destination: OccurrenceOrdinal, rhs: CfgPointId) {
+    fn record_frozen_install(&mut self, destination: OccurrenceOrdinal, emitted: FrozenInstall) {
         if self.capture_call_points {
-            let install = self.cursor.expect("existing assignment install point");
-            self.proof_points
-                .installs
-                .insert(destination, FrozenInstall { rhs, install });
+            self.proof_points.installs.insert(destination, emitted);
+        }
+    }
+
+    fn emit_direct_assignment(
+        &mut self,
+        binding: ReferenceBindingId,
+        assign: CfgPointKind,
+        rhs: CfgPointId,
+        value: ReferenceValue,
+        span: ByteSpan,
+        scope: ReferenceScopeId,
+    ) -> Result<FrozenInstall, ReferenceAnalysisError> {
+        let possible_origins = match value {
+            ReferenceValue::Checked(origins) => {
+                self.checked.insert(binding.clone());
+                self.origins.insert(binding, origins.clone());
+                Some(origins)
+            }
+            ReferenceValue::Uncomputed if self.checked.contains(&binding) => {
+                self.origins.remove(&binding);
+                None
+            }
+            _ if self.checked.contains(&binding) => {
+                return Err(self.missing_origin(
+                    span,
+                    binding,
+                    ReferenceAnalysisErrorReason::MissingCheckedReferenceOrigin,
+                ));
+            }
+            _ => {
+                self.origins.remove(&binding);
+                Some(BTreeSet::new())
+            }
+        };
+        let install = self.point_with_origins(assign, span, scope, possible_origins);
+        Ok(FrozenInstall { rhs, install })
+    }
+
+    fn author_direct_assignment(&mut self, emitted: FrozenInstall, prepared_existing: bool) {
+        let Some(author) = &mut self.local_borrow else { return };
+        let CfgPointKind::Assign { target, .. } = &self.cfg.points[emitted.install.0].kind
+            else { unreachable!("direct assignment install") };
+        if !prepared_existing || !matches!(self.binding_types.get(&target.binding),
+            Some(ScalarType::CheckedReference { inner, .. }) if aggregate::ordinary_value(inner))
+            || !author.assign(&target.binding, emitted.install, emitted.rhs)
+        {
+            self.local_borrow = None;
         }
     }
 
@@ -3977,7 +4112,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                                 self.aggregate_facts.checked_producer_nonlocal_installs.insert(rhs_point);
                             }
                         }
-                        if let ScalarPlace::Name { name, span } = &target.place {
+                        let emitted = if let ScalarPlace::Name { name, span } = &target.place {
                             let lexical = match destination {
                                 ReferenceAssignmentDestination::PreparedName(identity) => {
                                     match identity {
@@ -4015,7 +4150,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                                         ReferenceAnalysisErrorReason::MissingCheckedReferenceOrigin,
                                     ));
                                 }
-                                self.point(
+                                let install = self.point(
                                     CfgPointKind::Evaluate(ScalarExpression::Name {
                                         name: name.clone(),
                                         span: *span,
@@ -4024,7 +4159,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                                     scope,
                                     BTreeSet::new(),
                                 );
-                                self.record_frozen_install(slot.destination, rhs_point);
+                                self.record_frozen_install(slot.destination, FrozenInstall { rhs: rhs_point, install });
                                 continue;
                             };
                             if let Some(name) = introduction {
@@ -4059,27 +4194,10 @@ impl<'a> ReferenceFlowBuilder<'a> {
                                 previous_origins,
                                 previous_loans,
                             };
-                            if let ReferenceValue::Checked(origins) = value {
-                                self.checked.insert(id.clone());
-                                self.origins.insert(id.clone(), origins.clone());
-                                self.point(assign, *span, scope, origins);
-                            } else if matches!(value, ReferenceValue::Uncomputed)
-                                && self.checked.contains(&id)
-                            {
-                                self.checked.insert(id.clone());
-                                self.origins.remove(&id);
-                                self.uncomputed_point(assign, *span, scope);
-                            } else {
-                                if self.checked.contains(&id) {
-                                    return Err(self.missing_origin(
-                                        *span,
-                                        id,
-                                        ReferenceAnalysisErrorReason::MissingCheckedReferenceOrigin,
-                                    ));
-                                }
-                                self.origins.remove(&id);
-                                self.point(assign, *span, scope, BTreeSet::new());
-                            }
+                            let emitted = self.emit_direct_assignment(id, assign, rhs_point, value, *span, scope)?;
+                            self.author_direct_assignment(emitted, existing_prepared && capture.is_none()
+                                && assignment.targets.len() == 1 && assignment.values.len() == 1);
+                            emitted
                         } else {
                             if let ReferenceAssignmentDestination::Through(pointer_point) =
                                 destination
@@ -4169,8 +4287,9 @@ impl<'a> ReferenceFlowBuilder<'a> {
                                     }
                                 }
                             }
-                        }
-                        let install = self.cursor.expect("assignment install point");
+                            FrozenInstall { rhs: rhs_point, install: self.cursor.expect("assignment install point") }
+                        };
+                        let FrozenInstall { rhs: rhs_point, install } = emitted;
                         // Only the checked primary output can start same-array retention.
                         // Projected outputs have distinct points and do not inherit this proof.
                         if simple_destinations && position == 0
@@ -4184,7 +4303,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         {
                             array_rebind = Some((install, slot.destination));
                         }
-                        self.record_frozen_install(slot.destination, rhs_point);
+                        self.record_frozen_install(slot.destination, emitted);
                         let other_writer = item_index == 0
                             && self.aggregate_facts.literal_array_other_writer == Some(ordinal);
                         let literal_writer = (scope == ReferenceScopeId(0) && item_index == 1)
@@ -4383,7 +4502,9 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 leaving.insert(id);
             }
         }
-        if let Some(inventory) = prepared {
+        let prepared = prepared.is_some();
+        self.author_local_scope_exit(scope_exit, &leaving, prepared);
+        if let Some(inventory) = self.proof_points.scope_exit_bindings.as_mut() {
             if !leaving.is_empty() {
                 inventory.insert(scope_exit, leaving);
             }
@@ -5619,6 +5740,7 @@ impl ScalarDescriptorReplay<'_> {
 }
 
 struct ReferenceTransferCfg<'a> {
+    local_borrow: Option<&'a local_borrow::Sealed>,
     initial_points: &'a [ReferenceFlowPoint],
     has_grouped_assignment_capture: Option<bool>,
     forward_initial_graph: Option<super::control::ForwardInitialGraph>,
@@ -5643,6 +5765,7 @@ struct ReferenceTransferCfg<'a> {
 impl<'a> ReferenceTransferCfg<'a> {
     fn new(cfg: &'a mut ScalarReferenceCfg, proof: Option<&'a CallablePointFacts>) -> Self {
         Self {
+            local_borrow: None,
             initial_points: &cfg.initial_points,
             has_grouped_assignment_capture: proof.and_then(|proof| proof.has_grouped_assignment_capture),
             forward_initial_graph: None,
@@ -6196,6 +6319,9 @@ fn transfer_reference_facts(
     )>,
     mut descriptor: Option<&mut ScalarDescriptorReplay<'_>>,
 ) -> Vec<ReferenceAnalysisError> {
+    if !deferred_policies.is_empty() || !contracts.is_empty() || cfg.pending_named_reborrow.is_some() {
+        cfg.local_borrow = None;
+    }
     let original_points = cfg.initial_points;
     let grouped_installs = grouped_assignment_installs(original_points, cfg.has_grouped_assignment_capture);
     let mut last_use = (0..cfg.points.len()).collect::<Vec<_>>();
@@ -6266,6 +6392,9 @@ fn transfer_reference_facts(
     };
     let mut dependency_pair = [CfgPointId(0); 2];
     for (index, point) in original_points.iter().enumerate() {
+        if cfg.local_borrow.is_some_and(|sealed| !sealed.matches_edge_shape(index, point)) {
+            cfg.local_borrow = None;
+        }
         if validate_topology {
             strictly_forward = strictly_forward && point.id.0 == index
                 && point.successors.iter().all(|successor| successor.0 > index && successor.0 < original_points.len());
@@ -7282,7 +7411,16 @@ fn transfer_reference_facts(
                     {
                         continue;
                     }
-                    let origins = conflicting_live_loan(original_points, cfg.scope_exit_bindings, strictly_forward, &cfg.facts, &state, id, place, LoanAccess::DirectShared);
+                    let staged = if place.projections.is_empty() && matches!(&point.kind, CfgPointKind::Read { .. }) {
+                        cfg.local_borrow.and_then(|sealed|
+                            sealed.conflicts(&place.binding, id, incoming_count, original_points))
+                    } else {
+                        None
+                    };
+                    let origins = staged.unwrap_or_else(|| conflicting_live_loan(
+                        original_points, cfg.scope_exit_bindings, strictly_forward, &cfg.facts, &state,
+                        id, place, LoanAccess::DirectShared,
+                    ));
                     if !origins.is_empty() {
                         errors.push(ReferenceAnalysisError::ConflictingPlace { source_span: point.source_span.clone(), origins });
                     }
@@ -11334,6 +11472,9 @@ fn transfer_function_output_contracts<'a>(
         });
         let mut transfer = ReferenceTransferCfg::new(&mut result.cfg, Some(&result.proof_points));
         transfer.forward_initial_graph = topology;
+        if replay.module_calls.is_empty() {
+            transfer.local_borrow = result.proof_points.local_borrow.as_deref();
+        }
         let transferred = transfer_reference_facts(
             transfer,
             &BTreeMap::new(),
@@ -11628,6 +11769,7 @@ fn derive_function_specialized_copy_policies<'a>(
             let mut facts = template_cfg.facts.clone();
             let transferred = transfer_reference_facts(
                 ReferenceTransferCfg {
+                    local_borrow: None,
                     initial_points: &template_cfg.initial_points,
                     has_grouped_assignment_capture: template_result.proof_points.has_grouped_assignment_capture,
                     forward_initial_graph: None,
@@ -11958,8 +12100,11 @@ fn build_function_reference_cfg(
             }
         }
     }
-    let mut provisional_origin_index = (prior_children_succeeded
-        && errors.is_empty() && !builder.cfg.points.is_empty()
+    let has_flow = prior_children_succeeded && errors.is_empty() && !builder.cfg.points.is_empty();
+    if has_flow {
+        builder.seal_local_borrow();
+    }
+    let mut provisional_origin_index = (has_flow
         && builder.proof_points.pending_named_reborrow.is_some()).then_some(builder.origin_index);
     let mut aggregate = std::mem::take(&mut builder.aggregate_result);
     if let ScalarDescriptorCandidates::One(_, marker) = &builder.proof_points.backing_descriptor_install {
@@ -11967,7 +12112,7 @@ fn build_function_reference_cfg(
             &builder.cfg, marker, &builder.aggregate_facts, call_sites,
             &builder.proof_points, builder.structs).map(Box::new);
     }
-    if prior_children_succeeded && errors.is_empty() && !builder.cfg.points.is_empty() {
+    if has_flow {
         builder.cfg.initial_points = builder.cfg.points.clone();
         if let Some((Some(moved), Some(call))) = builder.formal_forward_shape {
             let terminal = builder.cfg.points.last().map(|point| &point.kind);
@@ -11986,6 +12131,7 @@ fn build_function_reference_cfg(
         ));
         let mut forward_initial_graph = None;
         let mut provisional_cfg = ReferenceTransferCfg::new(&mut builder.cfg, Some(&builder.proof_points));
+        provisional_cfg.local_borrow = builder.proof_points.local_borrow.as_deref();
         provisional_cfg.forward_graph_out = Some(&mut forward_initial_graph);
         provisional_cfg.provisional_origin_index = provisional_origin_index.as_mut();
         provisional_cfg.resolve_pending_named_reborrow = true;
