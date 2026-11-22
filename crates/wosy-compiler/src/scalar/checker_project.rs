@@ -28,7 +28,7 @@ use super::{
     },
 };
 #[cfg(feature = "internal-checker")]
-use super::{checker_flow::{integer_predicate_implies, observe_arbitrary_integer_returns, observe_unused_module_proof_returns, GuardedOutputClaims, ImmutableEntryRange, IntegerShowOutput}, symbolic_integer::IntegerShowConstraints, typecheck::integer_bounds};
+use super::{checker_flow::{evaluate_borrowed_return_proof, observe_authored_show_returns, integer_predicate_implies, observe_arbitrary_integer_returns, observe_unused_module_proof_returns, GuardedOutputClaims, ImmutableEntryRange, IntegerShowOutput}, symbolic_integer::IntegerShowConstraints, typecheck::integer_bounds};
 use crate::Diagnostic;
 use wosy_syntax::SourceIdentity;
 use wosy_syntax::{CanonicalCstRoot, CstNode, CstToken, SyntaxKind};
@@ -2315,6 +2315,82 @@ struct UnusedModuleProofGroup<'plan, 'project> {
 }
 
 #[cfg(feature = "internal-checker")]
+struct AuthoredShowCheck<'step, 'project> {
+    index: usize,
+    plan: &'step PlannedModuleProof<'project>,
+    relation: IntegerRelation,
+    bound: &'step BigInt,
+    proof: IntegerShowProof<'step>,
+}
+
+#[cfg(feature = "internal-checker")]
+impl<'step, 'project: 'step> AuthoredShowCheck<'step, 'project> {
+    fn group_key(&self) -> ((usize, usize), ExactGuardGroup<'step>) {
+        (self.plan.target, ExactGuardGroup(self.plan.filter.as_deref()))
+    }
+}
+
+#[cfg(feature = "internal-checker")]
+struct AuthoredShowGroup<'step, 'project> {
+    first: AuthoredShowCheck<'step, 'project>,
+    additional: Vec<AuthoredShowCheck<'step, 'project>>,
+}
+
+#[cfg(feature = "internal-checker")]
+impl<'step, 'project: 'step> AuthoredShowGroup<'step, 'project> {
+    fn new(first: AuthoredShowCheck<'step, 'project>) -> Self {
+        Self { first, additional: Vec::new() }
+    }
+
+    fn checks(self) -> impl Iterator<Item = AuthoredShowCheck<'step, 'project>> {
+        std::iter::once(self.first).chain(self.additional)
+    }
+}
+
+#[cfg(feature = "internal-checker")]
+fn verify_authored_show_group<'step, 'project: 'step>(
+    checks: impl IntoIterator<Item = AuthoredShowCheck<'step, 'project>>,
+    outcomes: &mut [ScalarModuleProofOutcome],
+) {
+    let mut checks = checks.into_iter();
+    let Some(first) = checks.next() else { return; };
+    let plan = first.plan;
+    let body = plan.typed.body;
+    let rows = observe_authored_show_returns(body, plan.filter.as_deref());
+    let checks = std::iter::once(first).chain(checks);
+    match rows {
+        Some(Ok(ProofCoverage::Applicable(paths))) => {
+            for check in checks {
+                outcomes[check.index] = match evaluate_borrowed_return_proof(
+                    &paths, check.relation, check.bound, Some(&check.proof),
+                ) {
+                    Some(true) => ScalarModuleProofOutcome::Proved,
+                    Some(false) => ScalarModuleProofOutcome::Refuted,
+                    None => ScalarModuleProofOutcome::Unsupported,
+                };
+            }
+        }
+        Some(Ok(ProofCoverage::NoApplicableInputs)) => {
+            for check in checks {
+                outcomes[check.index] = ScalarModuleProofOutcome::NoApplicableInputs;
+            }
+        }
+        Some(Err(failure)) => {
+            let shared = module_proof_outcome(Err(project_failure(body, &plan.typed.target.source, failure)));
+            let mut checks = checks.peekable();
+            while let Some(check) = checks.next() {
+                if checks.peek().is_none() {
+                    outcomes[check.index] = shared;
+                    break;
+                }
+                outcomes[check.index] = shared.clone();
+            }
+        }
+        None => {} // Preserve the default Unsupported outcome.
+    }
+}
+
+#[cfg(feature = "internal-checker")]
 struct UnusedPeerUse<'plan, 'project> {
     index: usize,
     consumer: &'plan PlannedModuleProof<'project>,
@@ -2531,6 +2607,8 @@ impl PreparedProofModule {
         else { return; };
         let mut graph = LocalPeerGraph::default();
         let mut pending_peers = Vec::new();
+        let mut first_authored = None;
+        let mut authored_groups = HashMap::new();
         let mut arbitrary_groups = HashMap::<_, UnusedModuleProofGroup<'_, '_>>::new();
         for ((index, plan), observer) in plans.iter().zip(observers.proofs) {
             let Some(&proof_module) = initialization.ordinals.get(plan.proof_source) else { continue; };
@@ -2561,8 +2639,37 @@ impl PreparedProofModule {
             } else if let Some(peer) = plan.direct_peer_use() {
                 pending_peers.push((*index, plan, peer));
             } else {
-                outcomes[*index] = module_proof_outcome(plan.verify_arbitrary_with_steps());
+                let (operator, bound, proof) = match plan.prepare_arbitrary_show() {
+                    Ok(proof) => proof,
+                    Err(error) => {
+                        outcomes[*index] = module_proof_outcome(Err(error));
+                        continue;
+                    }
+                };
+                if matches!(proof, IntegerShowProof::Conditional { .. }) {
+                    outcomes[*index] = module_proof_outcome(plan.verify_prepared_arbitrary_show(operator, bound, &proof));
+                    continue;
+                }
+                let Some(relation) = IntegerRelation::from_operator(operator) else { continue; };
+                let check = AuthoredShowCheck { index: *index, plan, relation, bound, proof };
+                if first_authored.is_none() && authored_groups.is_empty() {
+                    first_authored = Some(check);
+                } else {
+                    if let Some(first) = first_authored.take() {
+                        authored_groups.insert(first.group_key(), AuthoredShowGroup::new(first));
+                    }
+                    match authored_groups.entry(check.group_key()) {
+                        std::collections::hash_map::Entry::Occupied(mut group) => group.get_mut().additional.push(check),
+                        std::collections::hash_map::Entry::Vacant(group) => { group.insert(AuthoredShowGroup::new(check)); }
+                    }
+                }
             }
+        }
+        if let Some(first) = first_authored {
+            verify_authored_show_group(std::iter::once(first), outcomes);
+        }
+        for group in authored_groups.into_values() {
+            verify_authored_show_group(group.checks(), outcomes);
         }
         let mut cited_bounds = PeerPredicateBounds::default();
         if !pending_peers.is_empty() {
@@ -2947,8 +3054,8 @@ impl PlannedModuleProof<'_> {
                 proof_show_expression(item, terminated).is_ok())
     }
 
-    fn verify_arbitrary_with_steps(&self) -> Result<ProjectCheck, ProjectCheck> {
-        let TypedProofPostcondition { target, body, result_type, input_names, output, goal, .. } = &self.typed;
+    fn prepare_arbitrary_show(&self) -> Result<(&BinaryOperator, &BigInt, IntegerShowProof<'_>), ProjectCheck> {
+        let TypedProofPostcondition { body, result_type, input_names, output, goal, .. } = &self.typed;
         let TypedProofGoal::Literal { operator, bound, .. } = goal else {
             return Err(ProjectCheck::Unsupported);
         };
@@ -2959,7 +3066,19 @@ impl PlannedModuleProof<'_> {
             &self.steps, input_names, output, result_type, body,
             Some((operator, bound)),
         )?;
-        let checked = check_integer_return_bound_with_shows(body, operator, bound, self.filter.as_deref(), &proof);
+        Ok((operator, bound, proof))
+    }
+
+    fn verify_arbitrary_with_steps(&self) -> Result<ProjectCheck, ProjectCheck> {
+        let (operator, bound, proof) = self.prepare_arbitrary_show()?;
+        self.verify_prepared_arbitrary_show(operator, bound, &proof)
+    }
+
+    fn verify_prepared_arbitrary_show(
+        &self, operator: &BinaryOperator, bound: &BigInt, proof: &IntegerShowProof<'_>,
+    ) -> Result<ProjectCheck, ProjectCheck> {
+        let TypedProofPostcondition { target, body, .. } = &self.typed;
+        let checked = check_integer_return_bound_with_shows(body, operator, bound, self.filter.as_deref(), proof);
         match checked {
             Some(Ok(ProofCoverage::Applicable(true))) => Ok(ProjectCheck::Proved),
             Some(Ok(ProofCoverage::Applicable(false))) => Ok(ProjectCheck::Refuted),
@@ -5853,6 +5972,45 @@ mod tests {
             assert_eq!(PROOF_CATALOG_INDEX_BUILDS.with(|count| count.replace(0)), 1);
             assert_eq!(take_integer_observations(), (1, 0));
         }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn authored_show_groups_share_only_exact_return_observations() {
+        use super::super::checker_flow::take_integer_observations;
+        use ScalarModuleProofOutcome::{Invalid, NoApplicableInputs, Proved, Refuted};
+        let file = source("src/main.w", "group-authored-shows");
+        let text = r#"%%start
+            u8(u8) echo = fn(arg) { arg };
+            proof passes for echo(entry) -> (out) where (entry < 8) ensures (out <= 7) { core.show(out < 8); }
+            proof fails for echo(entry) -> (out) where (entry < 8) ensures (out <= 7) {
+                core.show(out < 8); core.show(out <= 6);
+            }
+            proof other for echo(entry) -> (out) where (entry < 7) ensures (out <= 6) { core.show(out < 7); }
+            proof plain for echo(entry) -> (out) where (entry < 8) ensures (out <= 7) {}
+            proof empty_first for echo(entry) -> (out) where (false) ensures (out <= 7) { core.show(out < 8); }
+            proof empty_second for echo(entry) -> (out) where (false) ensures (out <= 7) {
+                core.show(out < 8); core.show(out <= 6);
+            }
+            proof invalid for echo(entry) -> (out) where (entry < 8) ensures (out <= 7) { core.show(out < 256); }
+            proof cited for echo(entry) -> (out) where (entry < 8) ensures (out < 8) { core.use(passes(entry)); }
+        %%end"#;
+        let run = |names: &[&str]| check_scalar_module_proofs(
+            file.clone(), names,
+            vec![ScalarProofModuleInput { source: file.clone(), text: text.into(), namespaces: Vec::new() }],
+            vec![file.clone()], inputs(),
+        ).unwrap();
+        let _ = take_integer_observations();
+        assert_eq!(run(&["fails", "passes", "cited"]), [Refuted, Proved, Proved]);
+        assert_eq!(take_integer_observations(), (1, 0));
+        assert_eq!(run(&["passes", "other"]), [Proved, Proved]);
+        assert_eq!(take_integer_observations(), (2, 0));
+        assert_eq!(run(&["passes", "plain"]), [Proved, Proved]);
+        assert_eq!(take_integer_observations(), (2, 0)); // Distinct reflexive authority.
+        assert_eq!(run(&["empty_second", "empty_first"]), [NoApplicableInputs, NoApplicableInputs]);
+        assert_eq!(take_integer_observations(), (1, 0));
+        assert!(matches!(run(&["invalid"]).as_slice(), [Invalid(_)]));
+        assert_eq!(take_integer_observations(), (0, 0));
     }
 
     #[cfg(feature = "internal-checker")]

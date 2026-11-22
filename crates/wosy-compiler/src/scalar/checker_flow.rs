@@ -1208,9 +1208,38 @@ fn check_integer_return_bound_in_scope<'a>(
         Ok(ProofCoverage::NoApplicableInputs) => return Some(Ok(ProofCoverage::NoApplicableInputs)),
         Err(failure) => return Some(Err(failure)),
     };
+    if let Some(proof @ IntegerShowProof::Conditional { .. }) = proof {
+        return Some(Ok(ProofCoverage::Applicable(
+            evaluate_owning_show_conditional(paths, relation, bound, proof)?,
+        )));
+    }
+    Some(Ok(ProofCoverage::Applicable(evaluate_borrowed_return_proof(&paths, relation, bound, proof)?)))
+}
+
+pub(super) fn evaluate_owning_show_conditional(
+    paths: Vec<IntegerReturningPath<'_>>, relation: IntegerRelation, bound: &BigInt, proof: &IntegerShowProof<'_>,
+) -> Option<bool> {
+    for path in paths {
+        if !path.output_satisfies(relation, bound)? || !path.shows(proof)? {
+            return Some(false);
+        }
+    }
+    Some(true)
+}
+
+#[cfg(feature = "internal-checker")]
+pub(super) fn observe_authored_show_returns<'a>(
+    calls: &'a FunctionCallSites, entry_filter: Option<&[CheckerPredicate]>,
+) -> Option<Result<ProofCoverage<Vec<IntegerReturningPath<'a>>>, IntegerCheckFailure<'a>>> {
+    observe_integer_returns_in_scope(calls, entry_filter, None, false)
+}
+
+pub(super) fn evaluate_borrowed_return_proof(
+    paths: &[IntegerReturningPath<'_>], relation: IntegerRelation, bound: &BigInt, proof: Option<&IntegerShowProof<'_>>,
+) -> Option<bool> {
     if let Some(IntegerShowProof::Sequence(claims)) = proof {
         let mut proved = true;
-        for path in &paths {
+        for path in paths {
             if proved {
                 proved = path.output_satisfies(relation, bound)?;
             }
@@ -1224,7 +1253,7 @@ fn check_integer_return_bound_in_scope<'a>(
                 }
             }
         }
-        return Some(Ok(ProofCoverage::Applicable(proved)));
+        return Some(proved);
     }
     #[cfg(feature = "internal-checker")]
     if let Some(IntegerShowProof::MixedSequence { formals, output, entry }) = proof {
@@ -1241,7 +1270,7 @@ fn check_integer_return_bound_in_scope<'a>(
         }
         let typed_entry = &typed_entry[..active];
         let uses_entry = !typed_entry.is_empty();
-        for path in &paths {
+        for path in paths {
             let returned = match path.value {
                 IntegerReturn::Alias(alias) => {
                     if uses_entry && !formals.contains(alias) {
@@ -1293,15 +1322,15 @@ fn check_integer_return_bound_in_scope<'a>(
                 }
             }
         }
-        return Some(Ok(ProofCoverage::Applicable(proved)));
+        return Some(proved);
     }
     #[cfg(feature = "internal-checker")]
     if let Some(IntegerShowProof::EntryComparison { binding, relation: entry_relation, other }) = proof {
         let mut proved = true;
-        for path in &paths {
+        for path in paths {
             proved = path.entry_show_with_output_bound(binding, *other, *entry_relation, relation, bound, proved)?;
         }
-        return Some(Ok(ProofCoverage::Applicable(proved)));
+        return Some(proved);
     }
     #[cfg(feature = "internal-checker")]
     if let Some(IntegerShowProof::GuardedOutput { guard, claims }) = proof {
@@ -1310,7 +1339,7 @@ fn check_integer_return_bound_in_scope<'a>(
         let else_cut = (guard_relation.complement(), &guard.bound);
         let mut literal_cuts = None;
         let mut proved = true;
-        for path in &paths {
+        for path in paths {
             if matches!(path.value, IntegerReturn::Alias(alias) if *alias != guard.binding) {
                 return None;
             }
@@ -1372,7 +1401,7 @@ fn check_integer_return_bound_in_scope<'a>(
                 }
             };
         }
-        return Some(Ok(ProofCoverage::Applicable(proved)));
+        return Some(proved);
     }
     #[cfg(feature = "internal-checker")]
     if let Some(IntegerShowProof::Output(show)) = proof {
@@ -1387,24 +1416,28 @@ fn check_integer_return_bound_in_scope<'a>(
             _ => (relation, Some(show), None),
         };
         let mut allowed = None;
-        for path in &paths {
+        for path in paths {
             if !path.shows_output_with_bound(relation, bound, additional, skip_conjunct, &mut allowed)? {
-                return Some(Ok(ProofCoverage::Applicable(false)));
+                return Some(false);
             }
         }
-        return Some(Ok(ProofCoverage::Applicable(true)));
+        return Some(true);
     }
     for path in paths {
         if !path.output_satisfies(relation, bound)? {
-            return Some(Ok(ProofCoverage::Applicable(false)));
+            return Some(false);
         }
-        if let Some(proof) = proof {
-            if !path.shows(proof)? {
-                return Some(Ok(ProofCoverage::Applicable(false)));
+        match proof {
+            None => {}
+            Some(IntegerShowProof::Equality(claim)) => {
+                if !shows_return_equality(&path.state, &path.axes, &path.value, claim)? {
+                    return Some(false);
+                }
             }
+            _ => return None, // Owning legacy conditionals use the wrapper above.
         }
     }
-    Some(Ok(ProofCoverage::Applicable(true)))
+    Some(true)
 }
 
 fn integer_tail_type(calls: &FunctionCallSites) -> Option<&ScalarType> {
