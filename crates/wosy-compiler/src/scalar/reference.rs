@@ -11013,17 +11013,26 @@ fn derive_module_reference_origins(
         }
     }
     if errors.is_empty() && !mixed_targets.is_empty() {
-        let owners = mixed_producers.into_iter().filter_map(|(position, declaration)| {
+        let mut owners = mixed_producers.iter().filter_map(|&(position, declaration)| {
             let result = &updates[position].1;
             (mixed_targets.contains(&declaration) && result.aggregate.proves_mixed_local_owner(&result.cfg))
                 .then_some(declaration)
         }).collect::<HashSet<_>>();
         if !owners.is_empty() {
+            let forwarders = mixed_producers.into_iter().filter_map(|(position, declaration)| {
+                let (index, result) = &updates[position];
+                let ScalarItem::Function(function) = &items[*index] else { unreachable!("function result ordinal") };
+                result.mixed_forwarded_leaf(source, function, &call_sites.functions[index])
+                    .filter(|leaf| owners.contains(leaf))
+                    .map(|_| declaration)
+            }).collect::<HashSet<_>>();
+            owners.extend(forwarders.iter().copied());
             for position in mixed_callers {
                 let (index, result) = &mut updates[position];
                 let ScalarItem::Function(function) = &items[*index] else { unreachable!("function result ordinal") };
                 result.observe_selected_mixed_receipts(function, &call_sites.functions[index], &module_names,
-                    structs, enums, source, &owners, capture_call_points, &mut errors);
+                    structs, enums, source, &owners, forwarders.contains(&function.name_span),
+                    capture_call_points, &mut errors);
             }
         }
     }
@@ -11948,14 +11957,53 @@ impl FunctionReferenceResult {
         found
     }
 
+    fn mixed_forwarded_leaf(
+        &self, source: &SourceIdentity, function: &ScalarFunction, sites: &FunctionCallSites,
+    ) -> Option<ByteSpan> {
+        let [ScalarBlockItem::LocalBinding(binding),
+            ScalarBlockItem::Expression(ScalarExpression::Name { name: owner, .. }),
+            ScalarBlockItem::Expression(ScalarExpression::Name { name: scalar, .. })] =
+            function.body.items.as_slice() else { return None };
+        let [head, tail] = binding.receivers.as_slice() else { return None };
+        if &head.name != owner || &tail.name != scalar || owner == scalar
+            || binding.output_origin != ScalarBindingOutputOrigin::SingleExpression || binding.is_allocation
+            || !matches!(binding.value, ScalarExpression::Call { ref arguments, .. }
+                if arguments.iter().all(|argument| matches!(argument,
+                    ScalarExpression::Name { .. } | ScalarExpression::Integer { .. }
+                    | ScalarExpression::Boolean { .. } | ScalarExpression::Char { .. }
+                    | ScalarExpression::Float { .. })))
+        {
+            return None;
+        }
+        let ScalarType::Callable { parameters, outputs } = &function.signature else { return None };
+        let [first, second] = outputs.outputs.as_slice() else { return None };
+        if first.ty != head.ty || second.ty != tail.ty || self.aggregate.mixed_result_calls.len() != 1
+            || !parameters.iter().all(aggregate::ordinary_value)
+        {
+            return None;
+        }
+        let call = self.aggregate.mixed_result_calls.first()?;
+        let point = self.cfg.initial_points.get(call.0)?;
+        let CfgPointKind::Call { target: ResolvedCallTarget::ModuleCallable {
+            source: actual, declaration_span, concrete: ConcreteCallSelection::Declaration,
+        }, .. } = &point.kind else { return None };
+        let Some(OccurrenceNode::Expression(ordinal)) = sites.structure.edges.get(&(
+            OccurrenceParent::Block(sites.structure.root), OccurrenceEdge::BindingRoot { item: 0, output: 0 },
+        )) else { return None };
+        let row = sites.checked_call_signatures.get(ordinal)?;
+        let [call_head, call_tail] = row.outputs.outputs.as_slice() else { return None };
+        (actual == source && call_head.ty == head.ty && call_tail.ty == tail.ty
+            && row.parameters.iter().all(aggregate::ordinary_value)).then_some(*declaration_span)
+    }
+
     fn observe_selected_mixed_receipts(
         &mut self, function: &ScalarFunction, sites: &FunctionCallSites, module_names: &HashSet<String>,
         structs: &[ScalarStruct], enums: &[ScalarEnum], source: &SourceIdentity, owners: &HashSet<ByteSpan>,
-        capture_call_points: bool, errors: &mut Vec<ReferenceAnalysisError>,
+        forwards: bool, capture_call_points: bool, errors: &mut Vec<ReferenceAnalysisError>,
     ) {
         for ((result, function), sites) in self.arms.iter_mut().zip(&function.overload_arms).zip(&sites.arms) {
             result.observe_selected_mixed_receipts(function, sites, module_names, structs, enums, source, owners,
-                capture_call_points, errors);
+                false, capture_call_points, errors);
         }
         if !self.local_mixed_targets(source).any(|declaration| owners.contains(&declaration)) {
             return;
@@ -11963,8 +12011,11 @@ impl FunctionReferenceResult {
         let mut builder = ReferenceFlowBuilder::new(source, function, module_names, sites, structs, enums);
         builder.capture_call_points = capture_call_points;
         builder.mixed_owners = Some(owners);
-        let (cfg, emitted_errors, proof_points, aggregate, checked_contract_returns) =
+        let (cfg, emitted_errors, proof_points, mut aggregate, checked_contract_returns) =
             build_function_reference_cfg(builder, function, true);
+        if forwards && aggregate.mixed_result_bindings.len() == 1 {
+            aggregate.mixed_forward = aggregate.mixed_result_bindings.first().copied();
+        }
         errors.extend(emitted_errors);
         self.cfg = cfg;
         self.proof_points = proof_points;

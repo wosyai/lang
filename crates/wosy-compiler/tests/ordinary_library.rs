@@ -610,6 +610,127 @@ if (result != 72) { core.system_panic(); };
 }
 
 #[test]
+fn mixed_owned_struct_forwarder_transports_original_receipts_without_copying() {
+    let app = source("workbench", "src/mixed_owner_forward.w");
+    let text = r#"%%start
+struct Packet { *?u8 data; u64 length; }
+(Packet, u32)(u64, u8, u32) make_packet = fn(length, value, marker) {
+    u8[length] backing;
+    backing[0] = value;
+    *?u8 data = null;
+    unsafe { data = &?backing[0]; };
+    Packet packet = { .data = data; .length = length; };
+    packet, marker
+};
+(Packet, u32)(u64, u8, u32) relay_packet = fn(length, value, marker) {
+    Packet packet, u32 status = make_packet(length, value, marker);
+    packet, status
+};
+Packet shared_packet = { .data = null; .length = 5; };
+(Packet, u32)() ordinary_packet = fn { shared_packet, 7 };
+u64() receive_packets = fn {
+    Packet first, u32 first_status = relay_packet(2, 19, 37);
+    Packet second, u32 second_status = relay_packet(3, 41, 43);
+    Packet plain, u32 plain_status = ordinary_packet();
+    u8 first_byte = unsafe { core.load<u8>(first.data) };
+    u8 second_byte = unsafe { core.load<u8>(second.data) };
+    core.int_extend<u64>(first_byte) + core.int_extend<u64>(second_byte) + core.int_extend<u64>(first_status) + core.int_extend<u64>(second_status) + plain.length + core.int_extend<u64>(plain_status)
+};
+u64 result = receive_packets();
+if (result != 152) { core.system_panic(); };
+%%end"#;
+    for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let prepared = prepare_scalar_project(
+            vec![(declarations(&app, text), Vec::new())],
+            vec![app.clone()],
+            ScalarPreparationInputs { target_layout },
+        ).unwrap_or_else(|error| panic!("{target_layout:?}: {:?}", error.diagnostics));
+        let build = analyze_scalar_build(&prepared);
+        assert!(build.diagnostics().is_empty(), "{:#?}", build.diagnostics());
+        let text = emit_scalar_build_project_llvm(&build).unwrap().to_text();
+        let context = Context::create();
+        let buffer = MemoryBuffer::create_from_memory_range_copy(text.as_bytes(), "mixed-forward");
+        let module = context.create_module_from_ir(buffer).unwrap();
+        module.verify().unwrap();
+        let producer = function_with_suffix(&module, "make_packet");
+        let relay = function_with_suffix(&module, "relay_packet");
+        let receiver = function_with_suffix(&module, "receive_packets");
+        let plain = function_with_suffix(&module, "ordinary_packet");
+        let relay = module.get_function(&relay).unwrap();
+        let caller = module.get_function(&receiver).unwrap();
+        fn calls<'ctx>(function: inkwell::values::FunctionValue<'ctx>)
+            -> Vec<(inkwell::values::InstructionValue<'ctx>, CallSiteValue<'ctx>)>
+        {
+            function.get_basic_blocks().into_iter().flat_map(|block| block.get_instructions())
+                .filter(|inst| inst.get_opcode() == InstructionOpcode::Call)
+                .filter_map(|inst| CallSiteValue::try_from(inst).ok().map(|call| (inst, call))).collect()
+        }
+        let relay_calls = calls(relay);
+        let [(inst, forwarded)] = relay_calls.as_slice() else { panic!("wrapper must only call the leaf") };
+        assert_eq!(forwarded.get_called_fn_value(), module.get_function(&producer));
+        assert_eq!(inst.get_operand(3).unwrap().value(), relay.get_last_param());
+        use inkwell::values::AnyValue;
+        let relay_ir = relay.print_to_string().to_string();
+        assert!(relay_ir.contains("define internal { ptr, i32 }"), "{relay_ir}");
+        assert!(relay_ir.contains("ret { ptr, i32 } %aggregate_original_base"), "{relay_ir}");
+        assert!(!relay_ir.contains("memcpy") && !relay_ir.contains("__wosy_core_free"), "{relay_ir}");
+        assert!(!relay_ir.contains("extractvalue") && !relay_ir.contains("insertvalue"), "{relay_ir}");
+        let caller_calls = calls(caller);
+        let receipts = caller_calls.iter().filter(|(_, call)| call.get_called_fn_value() == Some(relay)).collect::<Vec<_>>();
+        let [(first_inst, first), (second_inst, second)] = receipts.as_slice() else { panic!("two receiver destinations required") };
+        assert_ne!(first_inst.get_operand(3).unwrap().value(), second_inst.get_operand(3).unwrap().value());
+        let first_base = first.try_as_basic_value().basic().unwrap();
+        let second_base = second.try_as_basic_value().basic().unwrap();
+        let releases = caller_calls.iter()
+            .filter(|(_, call)| call.get_called_fn_value() == module.get_function("__wosy_core_free"))
+            .collect::<Vec<_>>();
+        let [(release_first, _), (release_second, _)] = releases.as_slice() else { panic!("two obligations required") };
+        fn base_from<'ctx>(release: &inkwell::values::InstructionValue<'ctx>) -> inkwell::values::InstructionValue<'ctx> {
+            use inkwell::values::BasicValue;
+            release.get_operand(0).unwrap().value().unwrap().as_instruction_value().unwrap()
+        }
+        let (one, two) = (base_from(release_first), base_from(release_second));
+        assert_eq!(one.get_opcode(), InstructionOpcode::ExtractValue);
+        assert_eq!(two.get_opcode(), InstructionOpcode::ExtractValue);
+        let released = [one.get_operand(0).unwrap().value(), two.get_operand(0).unwrap().value()];
+        assert!(released.contains(&Some(first_base)) && released.contains(&Some(second_base)));
+        let caller_ir = caller.print_to_string().to_string();
+        assert!(caller_ir.contains(&format!("call {{ ptr, i32 }} @{plain}()")), "{caller_ir}");
+        fn descriptor_byte_source<'ctx>(
+            load: inkwell::values::InstructionValue<'ctx>,
+        ) -> Option<(inkwell::values::BasicValueEnum<'ctx>, inkwell::values::BasicValueEnum<'ctx>)> {
+            fn through<'ctx>(
+                operand: inkwell::values::BasicValueEnum<'ctx>, opcode: InstructionOpcode,
+            ) -> Option<inkwell::values::InstructionValue<'ctx>> {
+                use inkwell::values::BasicValue;
+                let instruction = operand.as_instruction_value()?;
+                (instruction.get_opcode() == opcode).then_some(instruction)
+            }
+            if load.get_opcode() != InstructionOpcode::Load
+                || !load.print_to_string().to_string().contains("load i8,")
+            {
+                return None;
+            }
+            let address = through(load.get_operand(0)?.value()?, InstructionOpcode::IntToPtr)?;
+            let field_load = through(address.get_operand(0)?.value()?, InstructionOpcode::Load)?;
+            let field = through(field_load.get_operand(0)?.value()?, InstructionOpcode::GetElementPtr)?;
+            let offset = field.get_operand(1)?.value()?.into_int_value();
+            if offset.get_zero_extended_constant()? != 0 { return None; }
+            let descriptor = through(field.get_operand(0)?.value()?, InstructionOpcode::ExtractValue)?;
+            let result = through(descriptor.get_operand(0)?.value()?, InstructionOpcode::InsertValue)?;
+            Some((result.get_operand(0)?.value()?, result.get_operand(1)?.value()?))
+        }
+        let observed = caller.get_basic_blocks().into_iter().flat_map(|block| block.get_instructions())
+            .take_while(|instruction| instruction != release_first)
+            .filter_map(descriptor_byte_source).collect::<Vec<_>>();
+        assert_eq!(observed, [
+            (first_base, first_inst.get_operand(3).unwrap().value().unwrap()),
+            (second_base, second_inst.get_operand(3).unwrap().value().unwrap()),
+        ], "{caller_ir}");
+    }
+}
+
+#[test]
 fn grouped_scalar_descriptor_assignment_preserves_checked_owner_routes() {
     let text = r#"%%start
 struct copy Packet { i32 value; }

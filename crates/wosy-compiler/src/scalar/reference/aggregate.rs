@@ -611,6 +611,7 @@ pub(super) struct AggregateFlowResult {
     pub(super) calls: BTreeMap<CfgPointId, OccurrenceOrdinal>,
     pub(super) mixed_result_calls: BTreeSet<CfgPointId>,
     pub(super) mixed_result_bindings: BTreeSet<CfgPointId>,
+    pub(super) mixed_forward: Option<CfgPointId>,
     pub(super) returns: BTreeMap<CfgPointId, BTreeSet<Option<OwnerSource>>>,
     endpoints: BTreeMap<(CfgPointId, usize), ScopeEndpoint>,
     pub(super) unsupported: BTreeSet<CfgPointId>,
@@ -3234,9 +3235,10 @@ fn closed_aggregates<'a>(
                     ClosedReturn::Allocation { block, item }
                 }
                 OwnerSource::Call(point) => {
-                    if body.has_mixed_struct_result()
-                        || target_body(&declarations, body.cfg, point)
-                            .and_then(|target| bodies.get(&target)).is_some_and(Body::has_mixed_struct_result)
+                    let target_mixed = target_body(&declarations, body.cfg, point)
+                        .and_then(|target| bodies.get(&target)).is_some_and(Body::has_mixed_struct_result);
+                    if (body.has_mixed_struct_result() || target_mixed)
+                        && !(target_mixed && body.has_mixed_struct_result() && facts.mixed_forward == Some(point))
                     {
                         return Err(format!("forwarding a mixed aggregate result is not closed in {:?}", body.source));
                     }

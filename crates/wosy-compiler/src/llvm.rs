@@ -3047,6 +3047,9 @@ fn emit_final_outputs<'ctx, 'module>(
     block: &ScalarBlock,
     emission: BlockEmission<'_>,
 ) -> Result<EmitValue<'ctx>, String> {
+    if matches!(emission, BlockEmission::Return(_)) && aggregate_transfer::forwarded_mixed_return(state) {
+        return Ok(EmitValue::Unit);
+    }
     if let Some(tail) = canonical_tail_if(block, emission) {
         let condition =
             take_basic(emit_expression(context, state, tail.condition)?)?.into_int_value();
@@ -3136,6 +3139,9 @@ fn emit_project_final_outputs<'ctx, 'module>(
     modules: &[&ScalarModule],
     emission: BlockEmission<'_>,
 ) -> Result<EmitValue<'ctx>, String> {
+    if matches!(emission, BlockEmission::Return(_)) && aggregate_transfer::forwarded_mixed_return(state) {
+        return Ok(EmitValue::Unit);
+    }
     if let Some(tail) = canonical_tail_if(block, emission) {
         let condition = take_basic(emit_project_expression(
             context,

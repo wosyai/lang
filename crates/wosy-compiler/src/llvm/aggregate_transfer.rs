@@ -690,11 +690,15 @@ pub(super) fn store_received_binding<'ctx>(
     binding: &ScalarBinding,
     value: &EmitValue<'ctx>,
 ) -> Result<bool, String> {
-    if !matches!(
-        call_action(state, &binding.value),
-        Some((_, ClosedCall::Receive))
-    ) {
-        return Ok(false);
+    match call_action(state, &binding.value) {
+        Some((_, ClosedCall::Forward)) if binding.receivers.len() == 2 => {
+            if !forwarded_mixed_return(state) || !matches!(value, EmitValue::Unit) {
+                return Err("mixed aggregate forwarding binding lacks its original result".into());
+            }
+            return Ok(true);
+        }
+        Some((_, ClosedCall::Receive)) => {}
+        _ => return Ok(false),
     }
     if let [receiver, scalar] = binding.receivers.as_slice() {
         let owner = extract_output(state, value, 0)?;
@@ -704,8 +708,8 @@ pub(super) fn store_received_binding<'ctx>(
         let value = extract_output(state, value, 1)?;
         let slot = entry_storage_alloca(context, state, &scalar.ty, &scalar.name)?;
         store_value(context, state, slot, &scalar.ty, value)?;
-        state.storage.insert(receiver.name.clone(), (destination, receiver.ty.clone()));
         state.storage.insert(scalar.name.clone(), (slot, scalar.ty.clone()));
+        state.storage.insert(receiver.name.clone(), (destination, receiver.ty.clone()));
         return Ok(true);
     }
     let [receiver] = binding.receivers.as_slice() else {
@@ -982,7 +986,7 @@ fn emit_selected_call<'ctx, 'module>(
     } else {
         &empty_outputs
     };
-    let mixed = matches!(action, Some(CallDestination::Body(ClosedCall::Receive)))
+    let mixed = matches!(action, Some(CallDestination::Body(_)))
         && mixed_owned_struct_result(outputs).is_some();
     let destination = match action {
         Some(CallDestination::Body(ClosedCall::Receive) | CallDestination::InitializerTemporary) => {
@@ -1068,6 +1072,14 @@ fn emit_selected_call<'ctx, 'module>(
         .try_as_basic_value()
         .basic()
         .ok_or_else(|| "missing closed aggregate original base".to_owned())?;
+    state.call_owner_flags.clear();
+    if mixed && matches!(action, Some(CallDestination::Body(ClosedCall::Forward))) {
+        let aggregate = state.aggregate.as_mut().expect("closed aggregate call context");
+        if aggregate.mixed_return.replace(transport.into_struct_value()).is_some() {
+            return Err("duplicate mixed aggregate forwarded result".into());
+        }
+        return Ok(EmitValue::Unit);
+    }
     let (base, pair) = if mixed {
         let pair = transport.into_struct_value();
         let base = state.builder.build_extract_value(pair, 0, "aggregate_base")
@@ -1076,7 +1088,6 @@ fn emit_selected_call<'ctx, 'module>(
     } else {
         (transport.into_pointer_value(), None)
     };
-    state.call_owner_flags.clear();
     match action.expect("return transport action") {
         CallDestination::Body(action) => {
             let aggregate = state.aggregate.as_mut().expect("closed aggregate call context");
@@ -1181,6 +1192,12 @@ pub(super) fn release_scope<'ctx>(
         }
     }
     Ok(())
+}
+
+pub(super) fn forwarded_mixed_return(state: &EmitState<'_, '_>) -> bool {
+    state.aggregate.as_ref().is_some_and(|aggregate|
+        matches!(aggregate.plan.returning, Some(ClosedReturn::Forward { .. }))
+            && aggregate.mixed_return.is_some())
 }
 
 pub(super) fn holds_registered_return(state: &EmitState<'_, '_>) -> bool {
@@ -1311,11 +1328,11 @@ pub(super) fn finish_return<'ctx>(
     if matches!(route, ClosedReturn::Allocation { .. }) && !aggregate.committed {
         return Err("closed aggregate return did not commit ownership before cleanup".into());
     }
-    let base = aggregate.base.take()
-        .ok_or_else(|| "missing closed aggregate returned base".to_owned())?;
     if let Some(pair) = aggregate.mixed_return.take() {
         state.builder.build_return(Some(&pair)).map_err(builder_error)?;
     } else {
+        let base = aggregate.base.take()
+            .ok_or_else(|| "missing closed aggregate returned base".to_owned())?;
         state.builder.build_return(Some(&base)).map_err(builder_error)?;
     }
     Ok(Some(()))
