@@ -69,6 +69,10 @@ impl IntegerSet {
         Some((&self.0.first()?.first, &self.0.last()?.last))
     }
 
+    pub(super) fn contains(&self, value: &BigInt) -> bool {
+        self.0.iter().any(|interval| &interval.first <= value && value <= &interval.last)
+    }
+
     pub(super) fn is_empty(&self) -> bool {
         self.0.is_empty()
     }

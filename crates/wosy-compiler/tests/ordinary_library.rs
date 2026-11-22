@@ -920,6 +920,7 @@ fn ordinary_build_erases_named_proofs_before_runtime_diagnostics_and_emits_the_s
     let proofs = r#"
         proof false_claim for identity(v) -> (out) ensures (out <= 10) {}
         proof ghost_quantifier for identity(v) -> (out) forall (u8 i where i < 4) ensures (out <= i) {}
+        proof ghost_witness for identity(v) -> (out) ensures (exists (u8 i where i < 4) { out == i }) { core.witness(255); }
         proof bad_where for identity(v) -> (out) where (unknown <= 10) ensures (out <= 1) {}
         proof unknown_target for missing(v) -> (out) ensures (out <= 255) {}
         proof unchecked_measure for identity(v) -> (out) ensures (out <= 255) decreases (unknown, v) {

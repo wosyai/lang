@@ -99,6 +99,7 @@ pub enum SyntaxKind {
     ProofDecreases = 86,
     ProofForall = 87,
     ProofQuantifierGuard = 88,
+    ProofExists = 89,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -197,6 +198,7 @@ impl Language for WosyLanguage {
             86 => SyntaxKind::ProofDecreases,
             87 => SyntaxKind::ProofForall,
             88 => SyntaxKind::ProofQuantifierGuard,
+            89 => SyntaxKind::ProofExists,
             _ => panic!("invalid syntax kind: {}", raw.0),
         }
     }
@@ -780,6 +782,7 @@ fn kind(rule: Rule) -> SyntaxKind {
         Rule::proof_decreases => SyntaxKind::ProofDecreases,
         Rule::proof_forall => SyntaxKind::ProofForall,
         Rule::proof_quantifier_guard => SyntaxKind::ProofQuantifierGuard,
+        Rule::proof_exists => SyntaxKind::ProofExists,
         Rule::boundary_start => SyntaxKind::BoundaryStart,
         Rule::boundary_end => SyntaxKind::BoundaryEnd,
         Rule::extern_decl => SyntaxKind::ExternDecl,

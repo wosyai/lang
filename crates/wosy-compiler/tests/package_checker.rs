@@ -1529,3 +1529,68 @@ fn named_universal_goal_cannot_issue_a_reusable_literal_bound() {
         vec![identity.clone()], ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
     ), ScalarProofCallOutcome::Unavailable);
 }
+
+#[test]
+fn named_existential_proof_checks_the_authored_typed_witness_on_each_return() {
+    let identity = source();
+    let check = |binder: &str, predicate: &str, witness: &str, guard: &str, actual: &str| {
+        check_scalar_module_proof(
+            identity.clone(),
+            "exists_echo",
+            vec![ScalarProofModuleInput {
+                source: identity.clone(),
+                text: format!(r#"%%start
+                    i16(i16) echo = fn(value) {{ value }};
+                    proof exists_echo for echo(input) -> (out) where ({guard})
+                        ensures (exists ({binder}) {{ {predicate} }}) {{ {witness} }}
+                    {actual}
+                %%end"#),
+                namespaces: Vec::new(),
+            }],
+            vec![identity.clone()], ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
+        )
+    };
+    let binder = "i16 k where k >= -8 && k != -7";
+    let predicate = "out == k";
+    let candidate = "core.witness(-8);";
+    assert_eq!(check(binder, predicate, candidate, "input == -8", ""), ScalarModuleProofOutcome::Proved);
+    assert_eq!(check(binder, predicate, candidate, "true", "i16 a = echo(-8); i16 b = echo(-8);"), ScalarModuleProofOutcome::Proved);
+    assert_eq!(check(binder, predicate, candidate, "true", "i16 a = echo(-8); i16 b = echo(-6);"), ScalarModuleProofOutcome::Unsupported);
+    assert_eq!(check(binder, predicate, "core.witness(-6);", "input == -6", ""), ScalarModuleProofOutcome::Proved);
+    assert_eq!(check(binder, predicate, candidate, "input == -6", ""), ScalarModuleProofOutcome::Unsupported);
+    assert_eq!(check(binder, predicate, "core.witness(-7);", "input == -7", ""), ScalarModuleProofOutcome::Unsupported);
+    assert_eq!(check(binder, predicate, "core.witness(-7);", "false", ""), ScalarModuleProofOutcome::NoApplicableInputs);
+    assert_eq!(check("i16 k where false", predicate, candidate, "true", ""), ScalarModuleProofOutcome::Unsupported);
+    assert_eq!(check("i16 k", predicate, "core.witness(-32768);", "input == -32768", ""), ScalarModuleProofOutcome::Proved);
+    assert!(matches!(check(binder, predicate, "core.witness(32768);", "true", ""), ScalarModuleProofOutcome::Invalid(_)));
+    assert!(matches!(check("i16 null", "out == null", candidate, "true", ""), ScalarModuleProofOutcome::Invalid(_)));
+    assert!(matches!(check("i16 input", "out == input", candidate, "true", ""), ScalarModuleProofOutcome::Invalid(_)));
+    assert_eq!(check(binder, predicate, "core.witness(input);", "true", ""), ScalarModuleProofOutcome::Unsupported);
+    assert_eq!(check(binder, predicate, "core.witness(-8); core.witness(-6);", "true", ""), ScalarModuleProofOutcome::Unsupported);
+    assert_eq!(check(binder, predicate, "", "true", ""), ScalarModuleProofOutcome::Unsupported);
+}
+
+#[test]
+fn named_existential_witness_is_not_a_reusable_output_bound() {
+    let identity = source();
+    let text = format!(r#"%%start
+        u8(u8) producer = fn(value) {{ value }};
+        unit() caller = fn {{
+            u8 answer = producer(7);
+            core.require(answer == 7, {OUTPUT});
+        }};
+        proof witnessed for producer(input) -> (out) where (input == 7)
+            ensures (exists (u8 k where k >= 7) {{ out == k }}) {{ core.witness(7); }}
+    %%end"#);
+    assert_eq!(check_scalar_module_proof(
+        identity.clone(), "witnessed",
+        vec![ScalarProofModuleInput { source: identity.clone(), text: text.clone(), namespaces: Vec::new() }],
+        vec![identity.clone()], ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
+    ), ScalarModuleProofOutcome::Proved);
+    let (_, catalog) = wosy_compiler::parse_proof_source(identity.clone(), text, &[])
+        .ok().expect("valid named proof syntax");
+    assert_eq!(check_loaded_scalar_module_proof_call(
+        (&identity, "witnessed"), (&identity, "caller"), Vec::new(), (catalog, Vec::new()),
+        vec![identity.clone()], ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
+    ), ScalarProofCallOutcome::Unavailable);
+}
