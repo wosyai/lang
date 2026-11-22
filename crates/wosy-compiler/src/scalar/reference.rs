@@ -1024,26 +1024,41 @@ impl<'a> ReferenceFlowBuilder<'a> {
         then_arm: &ReferenceConditionalArm,
         else_arm: &ReferenceConditionalArm,
     ) {
-        let arm_move = |arm: &ReferenceConditionalArm| {
+        let arm_witness = |arm: &ReferenceConditionalArm| {
             let formal = self.aggregate_facts.array_formal.as_ref()?;
             if arm.result.output_points.len() != arity {
                 return None;
             }
             let value = &self.cfg.points[arm.result.output_points.first()?.0];
+            let end = &self.cfg.points[arm.end.0];
+            if value.scope != end.scope {
+                return None;
+            }
+            if arity == 1 && value.successors.as_slice() == [arm.end]
+                && self.aggregate_facts.neutral_array_calls.contains(&value.id)
+                && matches!(&value.kind, CfgPointKind::Call { output: 0,
+                    target: ResolvedCallTarget::ModuleCallable { .. }, .. })
+            {
+                let (_, moved, binding) = self.aggregate_facts.array_calls.get(&value.id)?;
+                return (binding == formal).then_some(aggregate::ConditionalArrayArm {
+                    exit: arm.end,
+                    moved: *moved,
+                    tail_call: Some(value.id),
+                });
+            }
             let [moved] = value.successors.as_slice() else { return None };
             let moved = &self.cfg.points[moved.0];
-            let end = &self.cfg.points[arm.end.0];
-            (value.scope == end.scope && moved.scope == end.scope
+            (moved.scope == end.scope
                 && matches!(&value.kind, CfgPointKind::Read { binding } if binding == formal)
                 && matches!(&moved.kind, CfgPointKind::Move { place, owner, ty: ScalarType::RuntimeArray { .. } }
                     if owner == formal && &place.binding == formal && place.projections.is_empty())
                 && (arity != 1 || moved.successors.as_slice() == [arm.end]))
-                .then_some(moved.id)
+                .then_some(aggregate::ConditionalArrayArm { exit: arm.end, moved: moved.id, tail_call: None })
         };
-        if let (Some(then_move), Some(else_move)) = (arm_move(then_arm), arm_move(else_arm)) {
+        if let (Some(then_arm), Some(else_arm)) = (arm_witness(then_arm), arm_witness(else_arm)) {
             self.aggregate_facts.conditional_array_return = Some(aggregate::ConditionalArrayReturn {
                 join,
-                arms: [(then_arm.end, then_move), (else_arm.end, else_move)],
+                arms: [then_arm, else_arm],
             });
         }
     }

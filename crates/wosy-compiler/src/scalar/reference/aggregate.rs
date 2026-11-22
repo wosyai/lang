@@ -99,8 +99,13 @@ impl AggregateFlowFacts {
 
 pub(super) struct ConditionalArrayReturn {
     pub(super) join: CfgPointId,
-    // Each exact arm exit paired with the final output's checked formal move.
-    pub(super) arms: [(CfgPointId, CfgPointId); 2],
+    pub(super) arms: [ConditionalArrayArm; 2],
+}
+
+pub(super) struct ConditionalArrayArm {
+    pub(super) exit: CfgPointId,
+    pub(super) moved: CfgPointId,
+    pub(super) tail_call: Option<CfgPointId>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -265,6 +270,7 @@ pub(super) struct AggregateEdgeState {
     array_formal_pending: Option<CfgPointId>,
     array_return_forwarded: bool,
     array_conditional_output: Option<CfgPointId>,
+    array_tail_dependency: Option<CfgPointId>,
     array_dependencies: BTreeSet<CfgPointId>,
     local_array: Option<LocalArrayLife>,
 }
@@ -356,6 +362,12 @@ impl ScopeEndpoint {
     }
 }
 
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+pub(super) struct ArrayReturnPath {
+    dependencies: BTreeSet<CfgPointId>,
+    tail_call: Option<CfgPointId>,
+}
+
 #[derive(Default)]
 pub(super) struct AggregateFlowResult {
     pub(super) checked_backing_forward_candidate: Option<(OccurrenceOrdinal, CfgPointId, CfgPointId)>,
@@ -371,7 +383,7 @@ pub(super) struct AggregateFlowResult {
     pub(super) array_neutral: bool,
     array_conditional_forwarded: bool,
     pub(super) array_calls: BTreeMap<CfgPointId, (OccurrenceOrdinal, CfgPointId, ReferenceBindingId)>,
-    pub(super) array_returns: BTreeSet<Option<BTreeSet<CfgPointId>>>,
+    pub(super) array_returns: BTreeSet<Option<ArrayReturnPath>>,
     pub(super) array_rebinds: BTreeMap<CfgPointId, (CfgPointId, ReferenceBindingId, OccurrenceOrdinal)>,
     pub(super) local_array_failure_arms: BTreeMap<usize, Option<CfgPointId>>,
     pub(super) allocation_slots: BTreeMap<CfgPointId, (usize, usize)>,
@@ -696,13 +708,19 @@ impl AggregateFlowFacts {
         }
         if let Some(formal) = &self.array_formal {
             if let Some(conditional) = &self.conditional_array_return {
-                if let Some((_, moved)) = conditional.arms.iter().find(|(end, _)| *end == id) {
-                    state.array_conditional_output = (state.array_formal_pending == Some(*moved))
-                        .then_some(id);
+                if let Some(arm) = conditional.arms.iter().find(|arm| arm.exit == id) {
+                    let verified = state.array_formal_pending == Some(arm.moved);
+                    state.array_conditional_output = verified.then_some(id);
+                    state.array_tail_dependency = arm.tail_call.filter(|_| verified);
+                    if let Some(call) = state.array_tail_dependency {
+                        // A tail call consumes a proof obligation, not a grounding path.
+                        state.array_dependencies.insert(call);
+                    }
                 } else if id == conditional.join {
                     state.array_conditional_output = conditional.arms.iter()
-                        .any(|(end, moved)| state.array_conditional_output == Some(*end)
-                            && state.array_formal_pending == Some(*moved))
+                        .any(|arm| state.array_conditional_output == Some(arm.exit)
+                            && state.array_formal_pending == Some(arm.moved)
+                            && state.array_tail_dependency == arm.tail_call)
                         .then_some(id);
                 }
             }
@@ -777,7 +795,10 @@ impl AggregateFlowFacts {
                     // Every normal return must have carried the checked formal to lane zero.
                     // The pending formal move alone says nothing about a different output.
                     result.array_returns.insert(
-                        state.array_return_forwarded.then(|| state.array_dependencies.clone())
+                        state.array_return_forwarded.then(|| ArrayReturnPath {
+                            dependencies: state.array_dependencies.clone(),
+                            tail_call: state.array_tail_dependency,
+                        })
                     );
                 }
                 _ => {}
@@ -1962,8 +1983,11 @@ fn closed_aggregates<'a>(
                 let valid = facts.array_returns.iter().all(|path| {
                     let Some(path) = path else { return false };
                     let mut self_call = false;
-                    for &point in path {
+                    for &point in &path.dependencies {
                         let Some(target) = target_body(&declarations, body.cfg, point) else { return false };
+                        if path.tail_call == Some(point) && target != key {
+                            return false;
+                        }
                         if facts.array_conditional_forwarded && target != key
                             && !bodies.get(&target).and_then(|callee| callee.facts)
                                 .is_some_and(|callee| callee.array_neutral)
@@ -1973,7 +1997,7 @@ fn closed_aggregates<'a>(
                         self_call |= target == key;
                         dependencies.insert(target);
                     }
-                    grounded |= !self_call;
+                    grounded |= path.tail_call.is_none() && !self_call;
                     true
                 });
                 if valid && grounded {
