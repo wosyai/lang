@@ -5832,11 +5832,48 @@ fn direct_checked_field_base(place: &ScalarPlace) -> Option<(&ScalarExpression, 
     Some((pointer, field))
 }
 
+#[derive(Clone, Copy)]
+struct CheckedProjectedReborrowRead<'a> {
+    pointer: CfgPointId,
+    binding: &'a ReferenceBindingId,
+    span: ByteSpan,
+    origin: ReferenceOriginId,
+}
+
+fn checked_projected_reborrow_read<'a>(
+    points: &'a [ReferenceFlowPoint],
+    borrow: &ReferenceFlowPoint,
+    authority: &super::control::NamedReborrowParent,
+) -> Option<CheckedProjectedReborrowRead<'a>> {
+    if borrow.id != authority.borrow {
+        return None;
+    }
+    let read = points.get(authority.pointer.0)?;
+    Some(CheckedProjectedReborrowRead {
+        pointer: authority.pointer,
+        binding: exact_reborrow_read_edge(read, borrow)?,
+        span: read.source_span.range,
+        origin: authority.origin,
+    })
+}
+
+#[cfg(test)]
 fn exact_projected_reborrow_parent_on_edge(
     state: &ReferenceEdgeState,
     points: &[ReferenceFlowPoint],
     facts: &[ReferenceOrigin],
     authority: &super::control::NamedReborrowParent,
+    loan: &ReferenceLoanId,
+) -> bool {
+    points.get(authority.borrow.0)
+        .and_then(|borrow| checked_projected_reborrow_read(points, borrow, authority))
+        .is_some_and(|read| checked_projected_reborrow_parent_on_edge(state, facts, read, loan))
+}
+
+fn checked_projected_reborrow_parent_on_edge(
+    state: &ReferenceEdgeState,
+    facts: &[ReferenceOrigin],
+    authority: CheckedProjectedReborrowRead<'_>,
     loan: &ReferenceLoanId,
 ) -> bool {
     let Some((ScalarExpression::Name { span, .. }, field @ ScalarFieldReference::Resolved(_))) =
@@ -5847,11 +5884,9 @@ fn exact_projected_reborrow_parent_on_edge(
     else { return false };
     let Some(ReferenceOrigin::Fresh { loan: parent, .. }) = facts.get(authority.origin.0)
     else { return false };
-    let (Some(read), Some(borrow)) = (points.get(authority.pointer.0), points.get(authority.borrow.0))
-    else { return false };
-    let Some(binding) = exact_reborrow_read_edge(read, borrow) else { return false };
+    let binding = authority.binding;
     let owner = &parent.origin_place;
-    if &read.source_span.range != span
+    if &authority.span != span
         || parent.parent.is_some() || !owner.projections.is_empty()
         || !matches!(owner.place, ScalarPlace::Name { .. })
         || owner.binding == *binding || owner.binding != loan.origin_place.binding
@@ -6280,9 +6315,9 @@ fn transfer_reference_facts(
                     .binary_search_by_key(&point.id, |parent| parent.borrow)
                     .ok().map(|index| &cfg.named_reborrow_parents[index]);
                 if let (Some(authority), [next]) = (authority, point.successors.as_slice()) {
-                    let parent = original_points.get(authority.pointer.0);
+                    let parent = checked_projected_reborrow_read(original_points, point, authority);
                     let holder = original_points.get(next.0);
-                    if let (Some(ReferenceFlowPoint { kind: CfgPointKind::Read { binding: parent }, .. }),
+                    if let (Some(parent),
                         Some(ReferenceFlowPoint { kind: CfgPointKind::Bind { binding }, scope, .. }))
                         = (parent, holder)
                     {
@@ -6296,8 +6331,8 @@ fn transfer_reference_facts(
                             .binary_search_by_key(next, |(bind, _)| *bind)
                             .is_ok_and(|index| cfg.checked_binding_initializers[index].1 == point.id);
                         if point.id < *next && point.scope == *scope && exact_init && owner != binding
-                            && parent != binding && !cfg.allocations.contains(binding)
-                            && !*unknown && !exposed.contains(owner) && !exposed.contains(parent)
+                            && parent.binding != binding && !cfg.allocations.contains(binding)
+                            && !*unknown && !exposed.contains(owner) && !exposed.contains(parent.binding)
                             && !exposed.contains(binding)
                             && !projected_leaf_holders.contains_key(binding)
                         {
@@ -6310,7 +6345,7 @@ fn transfer_reference_facts(
                                 projected_store_facts.get_or_insert_with(Default::default).0.insert(origin);
                             }
                             projected_leaf_holders.insert(binding, (point.id, point.scope, loan.mode, admitted_origin));
-                            projected_leaf_sites.insert(point.id, authority);
+                            projected_leaf_sites.insert(point.id, parent);
                         }
                     }
                 }
@@ -6667,7 +6702,7 @@ fn transfer_reference_facts(
             };
             let projected_rejected = projected_loan.is_some_and(|loan| {
                 !projected_authority.is_some_and(|authority| {
-                    exact_projected_reborrow_parent_on_edge(&state, original_points, cfg.facts, authority, loan)
+                    checked_projected_reborrow_parent_on_edge(&state, cfg.facts, authority, loan)
                 })
             });
             if !projected_rejected {
