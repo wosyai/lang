@@ -12738,17 +12738,21 @@ unit(Pair) inspect = fn(owner) {{
 }
 
 #[test]
-fn root_projected_shared_leaf_can_be_read_in_a_contained_conditional() {
-    for (before, after, blocked) in [
-        ("", "owner.left = 9;", false),
-        ("owner.left = 9;", "", true),
+fn root_projected_leaf_can_be_read_in_a_contained_conditional() {
+    for (marker, before, after, blocked) in [
+        ("", "", "owner.left = 9;", false),
+        ("", "owner.left = 9;", "", true),
+        ("!", "", "owner.left = 9;", false),
+        ("!", "owner.left = 9;", "", true),
     ] {
         let text = format!("%%start
 struct copy Pair {{ u8 left; u8 right; }}
-unit(Pair, bool) inspect = fn(owner, choose) {{ *Pair parent = &owner; *u8 leaf = &(*parent).left; {before} if (choose) {{ u8 a = *leaf; a; }} else {{ u8 b = *leaf; b; }}; {after} }};
+unit(Pair, bool) inspect = fn(owner, choose) {{ *{marker}Pair parent = &{marker}owner; *{marker}u8 leaf = &{marker}(*parent).left; {before} if (choose) {{ u8 a = *leaf; a; }} else {{ u8 b = *leaf; b; }}; {after} }};
 %%end");
         let (single, project) = both_reference_functions(&text);
-        let child_span = text.find("&(*parent).left").unwrap() as u32;
+        let child_span = text.find(&format!("&{marker}(*parent).left")).unwrap() as u32;
+        let mode = if marker.is_empty() { ScalarReferenceMutability::Shared }
+            else { ScalarReferenceMutability::Mutable };
         for (items, diagnostics) in [
             (&single.program.items, &single.diagnostics),
             (&project.project.modules[0].items, &project.diagnostics),
@@ -12757,7 +12761,7 @@ unit(Pair, bool) inspect = fn(owner, choose) {{ *Pair parent = &owner; *u8 leaf 
             let cfg = &function.reference_cfg;
             let child = cfg.initial_points.iter().find(|point| point.source_span.range.start == child_span
                 && matches!(&point.kind, CfgPointKind::Borrow { loan, .. }
-                    if loan.parent.is_some() && loan.mode == ScalarReferenceMutability::Shared)).unwrap();
+                    if loan.parent.as_ref().is_some_and(|parent| parent.mode == mode) && loan.mode == mode)).unwrap();
             let observed = cfg.points[child.id.0].possible_origins.as_ref().unwrap();
             assert_eq!(observed.len(), 1, "{diagnostics:#?}");
             if blocked {
@@ -12776,12 +12780,13 @@ unit(Pair, bool) inspect = fn(owner, choose) {{ *Pair parent = &owner; *u8 leaf 
 
 #[test]
 fn known_projected_shared_leaf_keeps_noncanonical_transports_closed() {
-    for (parent, body) in [
-        ("*Pair parent = &owner;", "*u8 leaf = &(*parent).left; *u8 alias = leaf; u8 read = *alias; read;"),
-        ("*Pair parent = &owner;", "*u8 leaf = &(*parent).left; leaf = null;"),
-        ("*Pair parent = &owner;", "&(*parent).left;"),
-        ("*Pair parent = &owner;", "*u8 leaf = &(*parent).left; if (true) { *u8 alias = leaf; u8 read = *alias; read; };"),
-        ("*!Pair parent = &!owner;", "*u8 leaf = &(*parent).left; *u8 alias = leaf; u8 read = *alias; read;"),
+    for (parent, body, child) in [
+        ("*Pair parent = &owner;", "*u8 leaf = &(*parent).left; *u8 alias = leaf; u8 read = *alias; read;", "&(*parent).left"),
+        ("*Pair parent = &owner;", "*u8 leaf = &(*parent).left; leaf = null;", "&(*parent).left"),
+        ("*Pair parent = &owner;", "&(*parent).left;", "&(*parent).left"),
+        ("*Pair parent = &owner;", "*u8 leaf = &(*parent).left; if (true) { *u8 alias = leaf; u8 read = *alias; read; };", "&(*parent).left"),
+        ("*!Pair parent = &!owner;", "*u8 leaf = &(*parent).left; *u8 alias = leaf; u8 read = *alias; read;", "&(*parent).left"),
+        ("*!Pair parent = &!owner;", "*!u8 leaf = &!(*parent).left; if (true) { *leaf = 9; };", "&!(*parent).left"),
     ] {
         let text = format!(r#"%%start
 struct copy Pair {{ u8 left; u8 right; }}
@@ -12790,7 +12795,7 @@ unit(Pair) inspect = fn(owner) {{
     {body}
 }};
 %%end"#);
-        let projected = text.find("&(*parent).left").unwrap() as u32;
+        let projected = text.find(child).unwrap() as u32;
         let (single, project) = both_reference_functions(&text);
         for diagnostics in [&single.diagnostics, &project.diagnostics] {
             assert!(diagnostics.iter().any(|diagnostic| diagnostic.code == "B0003"

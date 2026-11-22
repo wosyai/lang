@@ -6526,8 +6526,7 @@ fn transfer_reference_facts(
                                 CfgPointKind::ReadPlace {
                                     place: ScalarPlace::Dereference { pointer, .. },
                                     pointer_point: Some(pointer_id), reads_origin: false, ..
-                                } => (point.scope == scope || (scope == ReferenceScopeId(0)
-                                        && mode == ScalarReferenceMutability::Shared))
+                                } => (point.scope == scope || scope == ReferenceScopeId(0))
                                     && *pointer_id == point.id && matches!(pointer.as_ref(), ScalarExpression::Name { .. })
                                     && cfg.checked_pointee_reads.binary_search(&next.id).is_ok(),
                                 CfgPointKind::AssignThrough { .. }
