@@ -2182,14 +2182,13 @@ impl SelectedSymbolicProof<'_, '_> {
         {
             return Ok(None);
         }
-        let candidate = match calls.structure.checker_directives.len() {
-            1 => root_local_import_requirement_in::<true>(calls).map(|(position, origin)| (position, origin, None)),
-            2 => root_local_import_requirement_after_narrow(calls)
-                .map(|(position, origin, narrow)| (position, origin, Some(narrow))),
-            _ => None,
-        };
-        let Some((position, origin, narrow)) = candidate else { return Ok(None); };
-        if !matches!(calls.call_occurrences.as_slice(), [call] if call.ordinal == origin.call) {
+        let [call] = calls.call_occurrences.as_slice() else { return Ok(None); };
+        let locals = &calls.structure.checker_integer_call_locals;
+        if locals.len() != 1 || calls.structure.checker_directives.is_empty() {
+            return Ok(None);
+        }
+        let Some((&(block, position), origin)) = locals.iter().next() else { return Ok(None); };
+        if block != calls.structure.root || call.ordinal != origin.call {
             return Ok(None);
         }
         let Some(callee) = calls.structure.checker_direct_targets.get(&origin.call) else { return Ok(None); };
@@ -2200,10 +2199,7 @@ impl SelectedSymbolicProof<'_, '_> {
         } else {
             return Ok(None);
         };
-        if target.0 != summary.target.0 || target.1 <= summary.target.1
-            || narrow.is_some_and(|narrow| summary.guard.as_ref().is_none_or(|guard|
-                !narrow_matches_import_argument(calls, origin, narrow, guard.slot)))
-        {
+        if target.0 != summary.target.0 || target.1 <= summary.target.1 {
             return Ok(None);
         }
         let site = calls.resolved_call_site(origin.call).ok_or(ProjectCheck::MissingRootOccurrences)?;
@@ -6425,12 +6421,6 @@ fn apply_verified_return_bound(
 }
 
 fn root_local_import_requirement(body: &FunctionCallSites) -> Option<(usize, &CheckerIntegerCallOrigin)> {
-    root_local_import_requirement_in::<false>(body)
-}
-
-fn root_local_import_requirement_in<const ALLOW_DISJUNCTION: bool>(
-    body: &FunctionCallSites,
-) -> Option<(usize, &CheckerIntegerCallOrigin)> {
     let structure = &body.structure;
     let root = structure.root;
     let items = &structure.blocks.get(root.0)?.items;
@@ -6438,39 +6428,10 @@ fn root_local_import_requirement_in<const ALLOW_DISJUNCTION: bool>(
         !matches!(item.kind, BlockItemKind::Binding(_))
             || !structure.checker_integer_locals.contains_key(&(root, item.position))
     })?;
-    root_local_import_requirement_at::<ALLOW_DISJUNCTION>(body, &items[first_nonliteral..])
+    root_local_import_requirement_at(body, &items[first_nonliteral..])
 }
 
-#[cfg(feature = "internal-checker")]
-fn root_local_import_requirement_after_narrow(
-    body: &FunctionCallSites,
-) -> Option<(usize, &CheckerIntegerCallOrigin, &super::checker_flow::IntegerPredicate)> {
-    let structure = &body.structure;
-    let [first, rest @ ..] = structure.blocks.get(structure.root.0)?.items.as_slice() else { return None; };
-    let BlockItemKind::Evaluation { expression } = first.kind else { return None; };
-    let directive = structure.checker_directives.get(&expression)?;
-    let CheckerPredicate::Integer(narrow) = directive.predicate.as_ref()? else { return None; };
-    if directive.operation != CheckerOperation::Narrow {
-        return None;
-    }
-    let (position, origin) = root_local_import_requirement_at::<true>(body, rest)?;
-    Some((position, origin, narrow))
-}
-
-#[cfg(feature = "internal-checker")]
-fn narrow_matches_import_argument(
-    body: &FunctionCallSites, origin: &CheckerIntegerCallOrigin, narrow: &super::checker_flow::IntegerPredicate,
-    guarded_slot: usize,
-) -> bool {
-    use super::reference::{CheckerIntegerCallArgument, PlainNameIdentity};
-    let Some((argument, CheckerIntegerCallArgument::PlainName)) = origin.arguments.as_slice().get(guarded_slot) else {
-        return false;
-    };
-    matches!(body.prepared_plain_name(*argument), Some(PlainNameIdentity::Lexical(binding)) if binding == &narrow.binding)
-        && body.structure.checked_types.expressions.get(argument) == Some(&narrow.ty)
-}
-
-fn root_local_import_requirement_at<'a, const ALLOW_DISJUNCTION: bool>(
+fn root_local_import_requirement_at<'a>(
     body: &'a FunctionCallSites, items: &[super::control::BlockItem],
 ) -> Option<(usize, &'a CheckerIntegerCallOrigin)> {
     let structure = &body.structure;
@@ -6487,13 +6448,11 @@ fn root_local_import_requirement_at<'a, const ALLOW_DISJUNCTION: bool>(
         return None;
     };
     let directive = structure.checker_directives.get(&expression)?;
-    let binding = match directive.predicate.as_ref()? {
-        CheckerPredicate::Integer(predicate) => &predicate.binding,
-        CheckerPredicate::DirectiveDisjunction { binding, .. } if ALLOW_DISJUNCTION => binding,
-        _ => return None,
+    let CheckerPredicate::Integer(predicate) = directive.predicate.as_ref()? else {
+        return None;
     };
     let origin = structure.checker_integer_call_locals.get(&(root, binding_item.position))?;
-    if directive.operation != CheckerOperation::Require || binding != &origin.binding {
+    if directive.operation != CheckerOperation::Require || predicate.binding != origin.binding {
         return None;
     }
     Some((binding_item.position, origin))
@@ -8128,6 +8087,46 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
         let second_caller = text.lines().find(|line| line.contains("unit(i16) second")).unwrap();
         let early = text.replace(second_caller, "").replace("i16(i16) high", &format!("{second_caller}\n            i16(i16) high"));
         assert!(matches!(run(&early), Err(ProjectCheck::Unsupported)));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordered_current_package_verified_binding_uses_existing_ordered_continuation() {
+        let app = source("src/main.w", "ordered-automatic-proof-continuation");
+        let run = |text: &str| {
+            let (_, proof) = crate::parse_proof_source(app.clone(), text.to_owned(), &[])
+                .unwrap_or_else(|_| panic!("valid proof source"));
+            check_loaded_ordered_proof_diagnostics(
+                Vec::new(), vec![(proof, Vec::new())], vec![app.clone()], inputs(), ScalarCheckerScope::CurrentPackage,
+            )
+        };
+        let text = format!(r#"%%start
+            i16(i16) producer = fn(input) {{ if (input < 0) {{ input + 1 }} else {{ 7 }} }};
+            unit(i16) client = fn(input) {{
+                core.narrow(input >= 0, {OUTPUT});
+                i16 result = producer(input);
+                core.require(result < 7 || result > 7, {OUTPUT});
+                core.require(result == 8, {OUTPUT});
+            }};
+            proof bound for producer(entry) -> (out) where (entry >= 0) ensures (out == 7) {{}}
+        %%end"#);
+        let report = run(&text).unwrap();
+        let [first, second] = report.directives.as_slice() else { panic!("two failed requirements"); };
+        assert_eq!(&text[first.condition.start as usize..first.condition.end as usize], "result < 7 || result > 7");
+        assert_eq!(&text[second.condition.start as usize..second.condition.end as usize], "result == 8");
+        let seven = BigInt::from(7);
+        for failure in [first, second] {
+            assert_eq!(failure.operation, ScalarCheckerOperation::Require);
+            assert!(failure.witness.intervals_at(0, 1).unwrap().eq([(&seven, &seven)]));
+        }
+        let late = text.replace("result == 8", "input < 7 || result > 7");
+        assert!(matches!(run(&late), Err(ProjectCheck::Unsupported)));
+        let dead = text.replace("input >= 0", "input < -32768");
+        let report = run(&dead).unwrap();
+        let [failure] = report.directives.as_slice() else { panic!("only the fatal Narrow"); };
+        assert_eq!(failure.operation, ScalarCheckerOperation::Narrow);
+        let overlap = text.replace("input >= 0", "input >= -1");
+        assert!(matches!(run(&overlap), Err(ProjectCheck::Unsupported)));
     }
 
     #[cfg(feature = "internal-checker")]
