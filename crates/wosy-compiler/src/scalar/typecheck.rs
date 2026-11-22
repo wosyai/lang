@@ -3364,7 +3364,7 @@ fn check_expression_type_in_module(
         }
     }
     match expression {
-        ScalarExpression::Name { name, span } if name == "null" => {
+        ScalarExpression::Name { name, span } if is_null_literal_name(name) => {
             diagnostics.push(module_diagnostic(
                 module,
                 "B0003",
@@ -4581,7 +4581,7 @@ fn check_expression_type_in_module_expected(
         return then_type;
     }
     if let ScalarExpression::Name { name, span } = expression {
-        if name == "null" {
+        if is_null_literal_name(name) {
             if let Some(
                 pointer @ ScalarType::RawPointer(_) | pointer @ ScalarType::CheckedReference { .. },
             ) = expected
@@ -7965,7 +7965,7 @@ fn check_expression_type(
             ));
             ScalarType::Error
         }
-        ScalarExpression::Name { name, span } if name == "null" => {
+        ScalarExpression::Name { name, span } if is_null_literal_name(name) => {
             diagnostics.push(diagnostic(
                 program,
                 "B0003",
@@ -9071,7 +9071,7 @@ fn check_expression_type_expected(
             }
             return then_type;
         }
-        if matches!(expression, ScalarExpression::Name { name, .. } if name == "null")
+        if matches!(expression, ScalarExpression::Name { name, .. } if is_null_literal_name(name))
             && matches!(
                 expected,
                 ScalarType::RawPointer(_) | ScalarType::CheckedReference { .. }
@@ -9469,9 +9469,13 @@ fn check_expression_type_expected(
     }
 }
 
+pub(super) fn is_null_literal_name(name: &str) -> bool {
+    name == "null"
+}
+
 fn is_null_expression(expression: &ScalarExpression) -> bool {
     match expression {
-        ScalarExpression::Name { name, .. } => name == "null",
+        ScalarExpression::Name { name, .. } => is_null_literal_name(name),
         ScalarExpression::If {
             then_branch,
             else_branch,

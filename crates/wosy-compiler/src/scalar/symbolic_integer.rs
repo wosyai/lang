@@ -65,6 +65,10 @@ impl IntegerSet {
         self.0.iter().map(|interval| (&interval.first, &interval.last))
     }
 
+    pub(super) fn extremes(&self) -> Option<(&BigInt, &BigInt)> {
+        Some((&self.0.first()?.first, &self.0.last()?.last))
+    }
+
     pub(super) fn is_empty(&self) -> bool {
         self.0.is_empty()
     }

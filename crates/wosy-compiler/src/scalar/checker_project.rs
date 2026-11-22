@@ -16,7 +16,7 @@ use super::{
     reference::{CheckerIntegerCallOrigin, CheckerTargetQuery, DirectDestinationIdentity, FunctionCallSites, OccurrenceOrdinal, OccurrenceStructure, ProjectCallSiteResults, ResolvedCheckerTarget},
     static_calls::prepare_project_occurrences,
     symbolic_integer::{IntegerRelation, IntegerSet},
-    typecheck::{integer_literal_fits_type, is_integer_type, typecheck_proof_where},
+    typecheck::{integer_literal_fits_type, is_integer_type, is_null_literal_name, typecheck_proof_where},
     typecheck_scalar_project_in_mode, ByteSpan, ConcreteCallSelection, ReferenceBindingId, ResolvedCallTarget,
     BinaryOperator, ScalarBlock, ScalarBlockItem, ScalarExpression, ScalarFunction, ScalarItem, ScalarModule, ScalarNamespaceBinding, ScalarPreparationInputs,
     ScalarProject, ScalarSourceDeclarations, ScalarTargetLayout, ScalarType, UnaryOperator,
@@ -1719,7 +1719,7 @@ impl PreparedProofModule {
                 if let Some(observer) = observer {
                     outcomes[*index] = module_proof_outcome(observer.outcome());
                 }
-            } else if !matches!(plan.typed.goal, TypedProofGoal::Literal { .. } | TypedProofGoal::Conjunction(_)) {
+            } else if !matches!(plan.typed.goal, TypedProofGoal::Literal { .. } | TypedProofGoal::Conjunction(_) | TypedProofGoal::Universal { .. }) {
                 continue;
             } else if plan.steps.items.is_empty() {
                 let key = (plan.target, ExactGuardGroup(plan.filter.as_deref()));
@@ -1913,7 +1913,8 @@ impl SelectedProofObserver<'_> {
         }
         if guard.accepts(arguments) {
             let holds = match self.goal {
-                TypedProofGoal::Literal { relation, bound, .. } => Some(relation.accepts(value.cmp(bound))),
+                TypedProofGoal::Literal { relation, bound, .. } | TypedProofGoal::Universal { relation, bound } =>
+                    Some(relation.accepts(value.cmp(bound))),
                 TypedProofGoal::Conjunction(atoms) => Some(atoms.iter().all(|(relation, bound)| relation.accepts(value.cmp(bound)))),
                 TypedProofGoal::EntryEqual { slot } => arguments.get(*slot).map(|entry| *entry == value),
             };
@@ -2062,6 +2063,7 @@ enum TypedProofGoal {
         bound: BigInt,
     },
     Conjunction(Vec<(IntegerRelation, BigInt)>),
+    Universal { relation: IntegerRelation, bound: BigInt },
     EntryEqual { slot: usize },
 }
 
@@ -2069,7 +2071,8 @@ enum TypedProofGoal {
 impl TypedProofGoal {
     fn holds_on_returned_path(&self, path: &super::checker_flow::IntegerReturningPath<'_>) -> Option<bool> {
         match self {
-            Self::Literal { relation, bound, .. } => path.output_satisfies(*relation, bound),
+            Self::Literal { relation, bound, .. } | Self::Universal { relation, bound } =>
+                path.output_satisfies(*relation, bound),
             Self::Conjunction(atoms) => {
                 for (relation, bound) in atoms {
                     if !path.output_satisfies(*relation, bound)? {
@@ -2098,6 +2101,63 @@ fn checked_literal_output_goal(
     }
     let relation = IntegerRelation::from_operator(comparison.operator).ok_or(ProjectCheck::Unsupported)?;
     Ok((comparison.operator.clone(), relation, comparison.bound.into_owned()))
+}
+
+fn typed_universal_output_goal(
+    forall: &CstNode,
+    ensures: &ScalarExpression,
+    output: &str,
+    inputs: &[String],
+    output_type: &ScalarType,
+) -> Result<TypedProofGoal, ProjectCheck> {
+    let ty = super::derive_type(&child(forall, SyntaxKind::TypeSpec)?);
+    if &ty != output_type || !is_integer_type(&ty) {
+        return Err(ProjectCheck::Unsupported);
+    }
+    let mut names = identifiers(forall);
+    let binder = names.next().ok_or(ProjectCheck::InvalidProof)?;
+    if names.next().is_some() || binder == output || inputs.contains(&binder)
+        || is_null_literal_name(&binder) || is_null_literal_name(output)
+    {
+        return Err(ProjectCheck::InvalidProof);
+    }
+    let ScalarExpression::Binary { operator, left, right, .. } = ensures else {
+        return Err(ProjectCheck::Unsupported);
+    };
+    if !matches!(left.as_ref(), ScalarExpression::Name { name, .. } if name == output)
+        || !matches!(right.as_ref(), ScalarExpression::Name { name, .. } if name == &binder)
+    {
+        return Err(ProjectCheck::Unsupported);
+    }
+    let lower = match operator {
+        BinaryOperator::Less | BinaryOperator::LessEqual => true,
+        BinaryOperator::Greater | BinaryOperator::GreaterEqual => false,
+        _ => return Err(ProjectCheck::Unsupported),
+    };
+    let mut domain = IntegerSet::from_type(&ty).ok_or(ProjectCheck::Unsupported)?;
+    if let Some(guard) = forall.children().find(|node| node.kind() == SyntaxKind::ProofQuantifierGuard) {
+        let condition = derive_expression(&child(&guard, SyntaxKind::Expression)?);
+        let mut pending = vec![&condition];
+        while let Some(expression) = pending.pop() {
+            match expression {
+                ScalarExpression::Binary { operator: BinaryOperator::And, left, right, .. } => {
+                    pending.push(right);
+                    pending.push(left);
+                }
+                ScalarExpression::Boolean { value: false, .. } => domain = IntegerSet::default(),
+                ScalarExpression::Boolean { value: true, .. } => {}
+                expression => {
+                    let comparison = IntegerComparison::from_expression(expression).ok_or(ProjectCheck::Unsupported)?;
+                    let (operator, _, bound) = checked_literal_output_goal(comparison, &binder, inputs, &ty)?;
+                    domain = domain.keep(&operator, &bound).ok_or(ProjectCheck::Unsupported)?;
+                }
+            }
+        }
+    }
+    let (minimum, maximum) = domain.extremes().ok_or(ProjectCheck::Unsupported)?;
+    let relation = IntegerRelation::from_operator(operator).ok_or(ProjectCheck::Unsupported)?;
+    let bound = if lower { minimum } else { maximum }.clone();
+    Ok(TypedProofGoal::Universal { relation, bound })
 }
 
 struct TypedProofPostcondition<'a> {
@@ -2481,7 +2541,13 @@ fn typed_proof_postcondition<'a, const AUDIT_INDUCTION: bool>(
     if !is_integer_type(&result.ty) {
         return Err(ProjectCheck::Unsupported);
     }
-    let goal = if matches!(&ensures, ScalarExpression::Binary { operator: BinaryOperator::And, .. }) {
+    let mut foralls = declaration.children().filter(|node| node.kind() == SyntaxKind::ProofForall);
+    let goal = if let Some(forall) = foralls.next() {
+        if foralls.next().is_some() || measure.is_some() {
+            return Err(ProjectCheck::Unsupported);
+        }
+        typed_universal_output_goal(&forall, &ensures, output, &input_names, &result.ty)?
+    } else if matches!(&ensures, ScalarExpression::Binary { operator: BinaryOperator::And, .. }) {
         let mut pending = vec![&ensures];
         let mut atoms = Vec::new();
         while let Some(expression) = pending.pop() {

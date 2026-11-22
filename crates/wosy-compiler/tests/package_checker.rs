@@ -1451,3 +1451,81 @@ fn verified_output_conjunction_does_not_issue_a_reusable_bound() {
         vec![identity.clone()], ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
     ), ScalarProofCallOutcome::Unavailable);
 }
+
+#[test]
+fn named_universal_proof_reduces_exact_typed_domains_on_shared_actual_and_unused_returns() {
+    let identity = source();
+    let check = |quantifiers: &str, goal: &str, guard: &str, actual: &str| {
+        check_scalar_module_proof(
+            identity.clone(),
+            "bounded",
+            vec![ScalarProofModuleInput {
+                source: identity.clone(),
+                text: format!(r#"%%start
+                    i16(i16) echo = fn(value) {{ value }};
+                    proof bounded for echo(input) -> (out) where ({guard}) {quantifiers} ensures ({goal}) {{}}
+                    {actual}
+                %%end"#),
+                namespaces: Vec::new(),
+            }],
+            vec![identity.clone()], ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
+        )
+    };
+    let lower = "forall (i16 k where k >= -7 && k != -7)";
+    let upper = "forall (i16 k where k <= 7 && k != 7)";
+    assert_eq!(check(lower, "out <= k", "input <= -6", ""), ScalarModuleProofOutcome::Proved);
+    assert_eq!(check(lower, "out <= k", "input <= -5", ""), ScalarModuleProofOutcome::Refuted);
+    assert_eq!(check(upper, "out >= k", "input >= 6", ""), ScalarModuleProofOutcome::Proved);
+    assert_eq!(check(upper, "out > k", "input >= 6", ""), ScalarModuleProofOutcome::Refuted);
+    assert_eq!(check(lower, "out <= k", "true", "i16 a = echo(-9); i16 b = echo(-6);"), ScalarModuleProofOutcome::Proved);
+    assert_eq!(check(lower, "out <= k", "true", "i16 a = echo(-5); i16 b = echo(-6);"), ScalarModuleProofOutcome::Refuted);
+    assert_eq!(check(lower, "out <= k", "false", ""), ScalarModuleProofOutcome::NoApplicableInputs);
+    assert_eq!(check("forall (i16 k)", "out <= k", "input == -32768", ""), ScalarModuleProofOutcome::Proved);
+    assert_eq!(check("forall (i16 k where k == 1 && k != 1)", "out <= k", "true", ""), ScalarModuleProofOutcome::Unsupported);
+    assert_eq!(check("forall (u16 k)", "out <= k", "true", ""), ScalarModuleProofOutcome::Unsupported);
+    assert_eq!(check("forall (i16 k) forall (i16 j)", "out <= k", "true", ""), ScalarModuleProofOutcome::Unsupported);
+    assert!(matches!(check("forall (i16 null where null >= 7)", "out <= null", "input <= 7", ""), ScalarModuleProofOutcome::Invalid(_)));
+    assert!(matches!(check("forall (i16 input)", "out <= input", "true", ""), ScalarModuleProofOutcome::Invalid(_)));
+    assert!(matches!(check("forall (i16 k where k < 32768)", "out <= k", "true", ""), ScalarModuleProofOutcome::Invalid(_)));
+    assert_eq!(check("forall (i16 k where k >= input)", "out <= k", "true", ""), ScalarModuleProofOutcome::Unsupported);
+}
+
+#[test]
+fn universal_proof_cannot_use_the_intrinsic_null_as_its_output_alias() {
+    let identity = source();
+    let check = |alias: &str| check_scalar_module_proof(
+        identity.clone(),
+        "bounded",
+        vec![ScalarProofModuleInput {
+            source: identity.clone(),
+            text: format!(r#"%%start
+                u8(u8) echo = fn(value) {{ value }};
+                proof bounded for echo(input) -> ({alias}) where (input <= 7)
+                    forall (u8 k where k >= 7) ensures ({alias} <= k) {{}}
+            %%end"#),
+            namespaces: Vec::new(),
+        }],
+        vec![identity.clone()], ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
+    );
+    assert_eq!(check("out"), ScalarModuleProofOutcome::Proved);
+    assert!(matches!(check("null"), ScalarModuleProofOutcome::Invalid(_)));
+}
+
+#[test]
+fn named_universal_goal_cannot_issue_a_reusable_literal_bound() {
+    let identity = source();
+    let text = format!(r#"%%start
+        u8(u8) producer = fn(value) {{ value }};
+        unit() caller = fn {{
+            u8 answer = producer(7);
+            core.require(answer <= 7, {OUTPUT});
+        }};
+        proof bounded for producer(input) -> (out) where (input <= 7) forall (u8 k where k >= 7) ensures (out <= k) {{}}
+    %%end"#);
+    let (_, catalog) = wosy_compiler::parse_proof_source(identity.clone(), text, &[])
+        .ok().expect("valid named proof syntax");
+    assert_eq!(check_loaded_scalar_module_proof_call(
+        (&identity, "bounded"), (&identity, "caller"), Vec::new(), (catalog, Vec::new()),
+        vec![identity.clone()], ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
+    ), ScalarProofCallOutcome::Unavailable);
+}
