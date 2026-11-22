@@ -881,7 +881,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
         scope: ReferenceScopeId,
         region: &ConditionalRegion,
         projected_origins: bool,
-    ) -> Result<[ReferenceConditionalArm; 2], ReferenceAnalysisError> {
+    ) -> Result<([ReferenceConditionalArm; 2], Option<CfgPointId>), ReferenceAnalysisError> {
         let (condition_ordinal, then_block, else_block) = match region {
             ConditionalRegion::Value {
                 condition,
@@ -896,6 +896,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
             } => (*condition, *then_block, None),
         };
         self.expression(condition, scope, condition_ordinal)?;
+        let condition_point = self.cursor;
         let branch = self.point(
             CfgPointKind::Branch {
                 condition: condition.clone(),
@@ -931,7 +932,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
         self.checked.extend(then_checked);
         self.origins.clear();
         self.cursor = None;
-        Ok([then_arm, else_arm])
+        Ok(([then_arm, else_arm], condition_point))
     }
 
     fn conditional(
@@ -945,8 +946,9 @@ impl<'a> ReferenceFlowBuilder<'a> {
         projected_origins: bool,
         checked_result: bool,
         array_return: bool,
+        literal_unit: Option<OccurrenceOrdinal>,
     ) -> Result<ReferenceValue, ReferenceAnalysisError> {
-        let [then_arm, else_arm] = self.conditional_branches(
+        let ([then_arm, else_arm], condition_point) = self.conditional_branches(
             condition,
             then_branch,
             else_branch,
@@ -1007,6 +1009,20 @@ impl<'a> ReferenceFlowBuilder<'a> {
         }
         self.cfg.points[then_arm.end.0].successors.push(join);
         self.cfg.points[else_arm.end.0].successors.push(join);
+        if let (Some(expression), Some(condition), ConditionalRegion::Unit { then_block, .. }) =
+            (literal_unit, condition_point, region)
+        {
+            let branch = else_arm.end;
+            if let [entry, fallthrough] = self.cfg.points[branch.0].successors.as_slice() {
+                if *fallthrough == join {
+                    self.aggregate_facts.literal_array_unit = Some(aggregate::LiteralArrayUnit {
+                        expression, condition, branch, then_entry: *entry,
+                        then_exit: then_arm.end, then_block: *then_block,
+                        then_scope: self.cfg.points[entry.0].scope, join,
+                    });
+                }
+            }
+        }
         if array_return {
             self.record_conditional_array_return(join, 1, &then_arm, &else_arm);
         }
@@ -1081,7 +1097,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
             unreachable!("checked output projection requires a value conditional")
         };
         let region = &self.call_sites.conditionals[&primary.expression];
-        let [then_arm, else_arm] = self.conditional_branches(
+        let ([then_arm, else_arm], _) = self.conditional_branches(
             condition,
             then_branch,
             Some(else_branch),
@@ -1284,6 +1300,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             [output] if matches!(output.ty, ScalarType::RuntimeArray { .. }))
                         && calls.structure.blocks[calls.structure.root.0].final_outputs()
                             .next().is_some_and(|slot| slot.output == 0 && slot.expression == ordinal),
+                    None,
                 )
             }
             ScalarExpression::UnitIf {
@@ -1297,7 +1314,29 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     "expected unit conditional at {ordinal:?} in {:?}",
                     self.source
                 );
-                self.conditional(condition, then_branch, None, span, scope, region, false, false, false)
+                let literal_unit = if scope == ReferenceScopeId(0)
+                    && self.aggregate_facts.literal_array_bind.is_some()
+                    && calls.boundary.root_outputs.is_empty()
+                    && then_branch.items.len() == 1
+                    && matches!(calls.structure.blocks[calls.structure.root.0].items.get(1)
+                        .map(|item| &item.kind), Some(BlockItemKind::Evaluation { expression }) if *expression == ordinal)
+                {
+                    let ConditionalRegion::Unit { condition: condition_ordinal, then_block, .. } = region
+                    else { unreachable!("unit conditional region") };
+                    if matches!(calls.structure.checked_types.expressions.get(condition_ordinal), Some(ScalarType::Bool))
+                        && (matches!(condition.as_ref(), ScalarExpression::Boolean { .. })
+                            || self.literal_array_formal_binding(*condition_ordinal, &ScalarType::Bool).is_some())
+                    {
+                        self.aggregate_facts.literal_array_then = Some(*then_block);
+                        Some(ordinal)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                self.conditional(condition, then_branch, None, span, scope, region,
+                    false, false, false, literal_unit)
             }
             ScalarExpression::Block(block) => {
                 let result = self.block_result(block, self.block_ordinal(parent, OccurrenceEdge::BlockBody), false)?;
@@ -3986,7 +4025,9 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             array_rebind = Some((install, slot.destination));
                         }
                         self.record_frozen_install(slot.destination, rhs_point);
-                        if scope == ReferenceScopeId(0) && item_index == 1 && existing_prepared
+                        let literal_writer = (scope == ReferenceScopeId(0) && item_index == 1)
+                            || (item_index == 0 && self.aggregate_facts.literal_array_then == Some(ordinal));
+                        if literal_writer && existing_prepared
                             && position == 0 && assignment.targets.len() == 1 && assignment.values.len() == 1
                             && self.aggregate_facts.literal_array_bind.is_some()
                             && matches!(output_types[position], ScalarType::RuntimeArray { .. })

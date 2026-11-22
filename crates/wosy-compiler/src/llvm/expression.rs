@@ -303,7 +303,7 @@ pub(super) fn emit_expression<'ctx, 'module>(
             condition,
             then_branch,
             ..
-        } => emit_unit_if(context, state, condition, then_branch),
+        } => emit_unit_if(context, state, expression, condition, then_branch),
         ScalarExpression::Block(block) => emit_block(context, state, block),
         ScalarExpression::RawAddress { place, .. }
         | ScalarExpression::CheckedAddress { place, .. } => Ok(EmitValue::Basic(
@@ -691,7 +691,7 @@ pub(super) fn emit_project_expression<'ctx, 'module>(
             ..
         } => {
             let condition = emit_project_expression(context, state, condition, module, modules)?;
-            emit_project_unit_if(context, state, condition, then_branch, module, modules)
+            emit_project_unit_if(context, state, expression, condition, then_branch, module, modules)
         }
         ScalarExpression::Block(block) => {
             emit_project_block(context, state, block, module, modules)
@@ -2892,6 +2892,7 @@ fn emit_project_if<'ctx, 'module>(
 fn emit_unit_if<'ctx, 'module>(
     context: &'ctx Context,
     state: &mut EmitState<'ctx, 'module>,
+    expression: &ScalarExpression,
     condition: &ScalarExpression,
     then_branch: &ScalarBlock,
 ) -> Result<EmitValue<'ctx>, String> {
@@ -2909,18 +2910,21 @@ fn emit_unit_if<'ctx, 'module>(
         .build_conditional_branch(condition, then_block, merge)
         .map_err(builder_error)?;
     state.builder.position_at_end(then_block);
+    let enrolled = aggregate_transfer::begin_literal_array_unit(state, expression, then_branch)?;
     emit_block(context, state, then_branch)?;
     state
         .builder
         .build_unconditional_branch(merge)
         .map_err(builder_error)?;
     state.builder.position_at_end(merge);
+    aggregate_transfer::finish_literal_array_unit(state, enrolled)?;
     Ok(EmitValue::Unit)
 }
 
 fn emit_project_unit_if<'ctx, 'module>(
     context: &'ctx Context,
     state: &mut EmitState<'ctx, 'module>,
+    expression: &ScalarExpression,
     condition: EmitValue<'ctx>,
     then_branch: &ScalarBlock,
     module: &ScalarModule,
@@ -2940,12 +2944,14 @@ fn emit_project_unit_if<'ctx, 'module>(
         .build_conditional_branch(condition, then_block, merge)
         .map_err(builder_error)?;
     state.builder.position_at_end(then_block);
+    let enrolled = aggregate_transfer::begin_literal_array_unit(state, expression, then_branch)?;
     emit_project_block(context, state, then_branch, module, modules)?;
     state
         .builder
         .build_unconditional_branch(merge)
         .map_err(builder_error)?;
     state.builder.position_at_end(merge);
+    aggregate_transfer::finish_literal_array_unit(state, enrolled)?;
     Ok(EmitValue::Unit)
 }
 
