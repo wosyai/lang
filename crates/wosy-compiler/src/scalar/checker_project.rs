@@ -110,6 +110,17 @@ pub fn check_scalar_package(
     inputs: ScalarPreparationInputs,
     scope: ScalarCheckerScope,
 ) -> ScalarCheckerOutcome {
+    check_scalar_package_with_dormant_sources(declarations, initialization_order, Vec::new(), inputs, scope)
+}
+
+#[cfg(feature = "internal-checker")]
+pub fn check_scalar_package_with_dormant_sources(
+    mut declarations: Vec<(ScalarSourceDeclarations, Vec<ScalarNamespaceBinding>)>,
+    initialization_order: Vec<SourceIdentity>,
+    dormant: Vec<ScalarSourceDeclarations>,
+    inputs: ScalarPreparationInputs,
+    scope: ScalarCheckerScope,
+) -> ScalarCheckerOutcome {
     let mut raw_sources = HashSet::with_capacity(initialization_order.len());
     if initialization_order.is_empty()
         || initialization_order.len() != declarations.len()
@@ -117,8 +128,39 @@ pub fn check_scalar_package(
     {
         return ScalarCheckerOutcome::Unsupported;
     }
+    let startup_count = declarations.len();
+    if scope == ScalarCheckerScope::CurrentPackage && !dormant.is_empty() {
+        let root = &initialization_order[0];
+        fn logical_source(source: &SourceIdentity) -> (&str, &str, &str) {
+            (&source.project, &source.package, &source.path)
+        }
+        let mut startup_keys = HashSet::new();
+        if !declarations.iter().all(|(source, _)| {
+            raw_sources.contains(source.source()) && startup_keys.insert(logical_source(source.source()))
+        }) {
+            return ScalarCheckerOutcome::Unsupported;
+        }
+        let mut dormant_keys = HashSet::new();
+        for source in &dormant {
+            let identity = source.source();
+            let key = logical_source(identity);
+            if identity.project != root.project || identity.package != root.package
+                || startup_keys.contains(&key) || !dormant_keys.insert(key)
+                || source.namespaces().next().is_some()
+            {
+                return ScalarCheckerOutcome::Unsupported;
+            }
+        }
+        if declarations.iter().flat_map(|(_, edges)| edges).any(|edge| {
+            dormant_keys.contains(&logical_source(&edge.target))
+        }) {
+            return ScalarCheckerOutcome::Unsupported;
+        }
+        declarations.extend(dormant.into_iter().map(|source| (source, Vec::new())));
+    }
+
     let result = prepare_checker_project(declarations, initialization_order, inputs)
-        .and_then(|prepared| check_package_roots_with_activity(&prepared, scope));
+        .and_then(|prepared| check_package_roots_with_activity(&prepared, scope, startup_count));
     match result {
         Ok(true) => ScalarCheckerOutcome::Passed,
         Ok(false) => ScalarCheckerOutcome::NoChecks,
@@ -240,21 +282,26 @@ fn has_callable_obligations(body: &FunctionCallSites) -> bool {
 
 #[cfg(test)]
 fn check_package_roots(prepared: &PreparedCheckerProject) -> Result<(), ProjectCheck> {
-    check_package_roots_with_activity(prepared, ScalarCheckerScope::CurrentPackage).map(drop)
+    check_package_roots_with_activity(
+        prepared, ScalarCheckerScope::CurrentPackage, prepared.parts().0.modules.len(),
+    ).map(drop)
 }
 
 fn check_package_roots_with_activity(
-    prepared: &PreparedCheckerProject, scope: ScalarCheckerScope,
+    prepared: &PreparedCheckerProject, scope: ScalarCheckerScope, startup_count: usize,
 ) -> Result<bool, ProjectCheck> {
     let (project, calls) = prepared.parts();
-    let (root, ordinals) = package_initialization_order(project)?;
+    let (startup, dormant) = project.modules.split_at(startup_count);
+    let (root, ordinals) = package_startup_order(project, startup)?;
     let mut potential_obligations = false;
     for (module, source_module) in project.modules.iter().enumerate() {
-        let region = calls.initialization_region(module).ok_or(ProjectCheck::MissingRootOccurrences)?;
-        let ModuleInitializationDetail::Occurrences(topology) = &region.detail else {
-            return Err(ProjectCheck::MissingRootOccurrences);
-        };
-        potential_obligations |= !topology.structure.checker_directives.is_empty();
+        if module < startup_count {
+            let region = calls.initialization_region(module).ok_or(ProjectCheck::MissingRootOccurrences)?;
+            let ModuleInitializationDetail::Occurrences(topology) = &region.detail else {
+                return Err(ProjectCheck::MissingRootOccurrences);
+            };
+            potential_obligations |= !topology.structure.checker_directives.is_empty();
+        }
         for (item, declaration) in source_module.items.iter().enumerate() {
             if matches!(declaration, ScalarItem::Function(_)) {
                 let body = calls.function_body(module, item, None).ok_or(ProjectCheck::MissingRootOccurrences)?;
@@ -278,42 +325,62 @@ fn check_package_roots_with_activity(
         if visits[ordinal] != InitializationVisit::Completed {
             continue;
         }
-        let module = &project.modules[ordinal];
-        for (item, declaration) in module.items.iter().enumerate() {
-            let ScalarItem::Function(function) = declaration else {
-                continue;
-            };
-            if reached.contains(&(ordinal, item)) {
-                continue;
-            }
-            let body = calls.function_body(ordinal, item, None).ok_or(ProjectCheck::MissingRootOccurrences)?;
-            if !has_callable_obligations(body) {
-                continue;
-            }
-            if !function.generic_parameters.is_empty() || !function.overload_arms.is_empty() {
-                return Err(ProjectCheck::Unsupported);
-            }
-            if !matches!(body.boundary.results.as_slice(), [result]
-                if result.ty == ScalarType::Unit || is_integer_type(&result.ty))
-            {
-                return Err(ProjectCheck::Unsupported);
-            }
-            match check_integer_requirement_activity(body) {
-                Some(Ok(active)) => had_obligations |= active,
-                Some(Err(failure)) => return Err(project_failure(body, source, failure)),
-                None => return Err(ProjectCheck::Unsupported),
-            }
-        }
+        had_obligations |= check_unused_module(calls, &project.modules[ordinal], ordinal, &reached)?;
+    }
+    for (index, module) in dormant.iter().enumerate() {
+        had_obligations |= check_unused_module(calls, module, startup_count + index, &reached)?;
     }
     Ok(had_obligations)
+}
+
+fn check_unused_module(
+    calls: &ProjectCallSiteResults,
+    module: &ScalarModule,
+    ordinal: usize,
+    reached: &HashSet<(usize, usize)>,
+) -> Result<bool, ProjectCheck> {
+    let mut active = false;
+    for (item, declaration) in module.items.iter().enumerate() {
+        let ScalarItem::Function(function) = declaration else {
+            continue;
+        };
+        if reached.contains(&(ordinal, item)) {
+            continue;
+        }
+        let body = calls.function_body(ordinal, item, None).ok_or(ProjectCheck::MissingRootOccurrences)?;
+        if !has_callable_obligations(body) {
+            continue;
+        }
+        if !function.generic_parameters.is_empty() || !function.overload_arms.is_empty() {
+            return Err(ProjectCheck::Unsupported);
+        }
+        if !matches!(body.boundary.results.as_slice(), [result]
+            if result.ty == ScalarType::Unit || is_integer_type(&result.ty))
+        {
+            return Err(ProjectCheck::Unsupported);
+        }
+        match check_integer_requirement_activity(body) {
+            Some(Ok(observed)) => active |= observed,
+            Some(Err(failure)) => return Err(project_failure(body, &module.source, failure)),
+            None => return Err(ProjectCheck::Unsupported),
+        }
+    }
+    Ok(active)
 }
 
 fn package_initialization_order(
     project: &ScalarProject,
 ) -> Result<(&SourceIdentity, HashMap<&SourceIdentity, usize>), ProjectCheck> {
-    let ordinals: HashMap<_, _> = project.modules.iter().enumerate()
+    package_startup_order(project, &project.modules)
+}
+
+fn package_startup_order<'a>(
+    project: &'a ScalarProject,
+    startup: &'a [ScalarModule],
+) -> Result<(&'a SourceIdentity, HashMap<&'a SourceIdentity, usize>), ProjectCheck> {
+    let ordinals: HashMap<_, _> = startup.iter().enumerate()
         .map(|(ordinal, module)| (&module.source, ordinal)).collect();
-    if ordinals.len() != project.modules.len() {
+    if ordinals.len() != startup.len() {
         return Err(ProjectCheck::AmbiguousRoot);
     }
     let root = project.initialization_order.first().ok_or(ProjectCheck::MissingRoot)?;

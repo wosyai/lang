@@ -1,7 +1,7 @@
 #![cfg(feature = "internal-checker")]
 
 use wosy_compiler::{
-    check_loaded_scalar_module_proof_call, check_scalar_module_proof, check_scalar_module_proofs, check_scalar_package, derive_scalar_declarations_from_cst, parse_source, prepare_scalar_project,
+    check_loaded_scalar_module_proof_call, check_scalar_module_proof, check_scalar_module_proofs, check_scalar_package, check_scalar_package_with_dormant_sources, derive_scalar_declarations_from_cst, parse_source, prepare_scalar_project,
     ScalarCheckerOperation, ScalarCheckerOutcome, ScalarCheckerScope, ScalarNamespaceBinding,
     ScalarModuleProofOutcome, ScalarProofCallOutcome, ScalarPreparationInputs, ScalarProofModuleInput, ScalarTargetLayout,
 };
@@ -961,4 +961,78 @@ fn selected_initializer_arm_uses_known_typed_integer_storage_and_exact_results()
 
     let nonliteral = format!("i16 measured = -4; if (!(measured < 0)) {{ core.require(true, {OUTPUT}); }};");
     assert_eq!(check(&nonliteral), ScalarCheckerOutcome::Unsupported);
+}
+
+fn dormant_source(identity: SourceIdentity, contents: &str) -> wosy_compiler::ScalarSourceDeclarations {
+    let contents = if contents.is_empty() { "unit() placeholder = fn {};" } else { contents };
+    let parsed = parse_source(identity, format!("%%start\n{contents}\n%%end"), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    derive_scalar_declarations_from_cst(parsed.result.canonical_cst())
+}
+
+#[test]
+fn explicit_dormant_same_package_functions_are_symbolic_without_running_their_initializer() {
+    let main = source();
+    let dormant = SourceIdentity::new("local".into(), "demo".into(), "src/extra.w".into(), "phase4".into());
+    let run = |contents: &str, scope| check_scalar_package_with_dormant_sources(
+        vec![(dormant_source(main.clone(), "unit() started = fn {}; started();"), Vec::new())],
+        vec![main.clone()],
+        vec![dormant_source(dormant.clone(), contents)],
+        ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
+        scope,
+    );
+    let top_only = format!("core.require(false, {OUTPUT});");
+    assert_eq!(run(&top_only, ScalarCheckerScope::CurrentPackage), ScalarCheckerOutcome::NoChecks);
+    let pass = format!("{top_only} unit(u8) dormant_check = fn(value) {{ core.require(value >= 0, {OUTPUT}); }};");
+    assert_eq!(run(&pass, ScalarCheckerScope::CurrentPackage), ScalarCheckerOutcome::Passed);
+    let fail = format!("{top_only} unit(u8) dormant_check = fn(value) {{ core.require(value < 7, {OUTPUT}); }};");
+    let ScalarCheckerOutcome::Failed(failure) = run(&fail, ScalarCheckerScope::CurrentPackage) else {
+        panic!("expected unused call to fail for arbitrary typed inputs");
+    };
+    assert_eq!(failure.source, dormant);
+    let authored = format!("%%start\n{fail}\n%%end");
+    assert_eq!(&authored[failure.condition.start as usize..failure.condition.end as usize], "value < 7");
+    assert_eq!(failure.witness.axes().next().unwrap().1, &wosy_compiler::ScalarType::U8);
+    assert_eq!(failure.witness.intervals_at(0, 0).unwrap().next(), Some((&7.into(), &255.into())));
+    assert_eq!(run(&fail, ScalarCheckerScope::MainFlowOnly), ScalarCheckerOutcome::NoChecks);
+
+    let needs_state = format!("u8 installed = 1; unit() dormant_check = fn {{ core.require(installed == 1, {OUTPUT}); }};");
+    assert_eq!(run(&needs_state, ScalarCheckerScope::CurrentPackage), ScalarCheckerOutcome::Unsupported);
+}
+
+#[test]
+fn explicit_dormant_selection_cannot_alias_startup_or_import_a_namespace_graph() {
+    let main = source();
+    let dormant = SourceIdentity::new("local".into(), "demo".into(), "src/extra.w".into(), "phase4".into());
+    let other_package = SourceIdentity::new("local".into(), "other".into(), "src/extra.w".into(), "phase4".into());
+    let other_revision = SourceIdentity::new("local".into(), "demo".into(), main.path.clone(), "elsewhere".into());
+    let run = |active: &str, links, selected, scope| check_scalar_package_with_dormant_sources(
+        vec![(dormant_source(main.clone(), active), links)],
+        vec![main.clone()],
+        selected,
+        ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
+        scope,
+    );
+    for selection in [
+        vec![dormant_source(other_package, "")],
+        vec![dormant_source(other_revision, "")],
+        vec![dormant_source(dormant.clone(), ""), dormant_source(dormant.clone(), "")],
+        vec![dormant_source(dormant.clone(), r#"owner = namespace demo "main.w";"#)],
+    ] {
+        assert_eq!(run("", Vec::new(), selection, ScalarCheckerScope::CurrentPackage), ScalarCheckerOutcome::Unsupported);
+    }
+    let active = r#"aux = namespace demo "extra.w";"#;
+    let main_declarations = dormant_source(main.clone(), active);
+    let span = main_declarations.namespaces().next().unwrap().binding_span;
+    assert_eq!(run(
+        active,
+        vec![ScalarNamespaceBinding { binding: "aux".into(), target: dormant.clone(), span }],
+        vec![dormant_source(dormant.clone(), "")],
+        ScalarCheckerScope::CurrentPackage,
+    ), ScalarCheckerOutcome::Unsupported);
+    assert_eq!(run(
+        "", Vec::new(),
+        vec![dormant_source(dormant, &format!("unit() invalid = fn {{ core.require(7, {OUTPUT}); }};"))],
+        ScalarCheckerScope::MainFlowOnly,
+    ), ScalarCheckerOutcome::NoChecks);
 }
