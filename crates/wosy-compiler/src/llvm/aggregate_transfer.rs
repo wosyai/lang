@@ -1,5 +1,5 @@
 use super::*;
-use crate::scalar::{ArrayWriterSide, ClosedBody, ClosedCall, ClosedInitializer, ClosedInitializerInput, ClosedInput, ClosedLiteralArray, ClosedLocalArrayRelease, ClosedReturn, ConcreteCallSelection, FreshArrayExtent, ReplacementArrayExtent, ScalarBinding};
+use crate::scalar::{mixed_owned_struct_result, ArrayWriterSide, ClosedBody, ClosedCall, ClosedInitializer, ClosedInitializerInput, ClosedInput, ClosedLiteralArray, ClosedLocalArrayRelease, ClosedReturn, ConcreteCallSelection, FreshArrayExtent, ReplacementArrayExtent, ScalarBinding};
 use inkwell::types::AnyType;
 
 pub(super) struct InitializerEmitter<'ctx, 'plan> {
@@ -91,6 +91,7 @@ pub(super) struct AggregateEmitter<'ctx, 'plan> {
     literal_array_branch_original: Option<LiteralArrayBranchOriginal<'ctx>>,
     base: Option<PointerValue<'ctx>>,
     registered_allocation: Option<String>,
+    mixed_return: Option<inkwell::values::StructValue<'ctx>>,
     failure_site: Option<ClosedLocalArrayRelease>,
     failure_allocation: Option<PendingLocalArrayRelease<'ctx>>,
     failure_arm_visited: bool,
@@ -193,6 +194,7 @@ impl<'ctx, 'plan> AggregateEmitter<'ctx, 'plan> {
             literal_array_branch_original: None,
             base: None,
             registered_allocation: None,
+            mixed_return: None,
             failure_site,
             failure_allocation: None,
             failure_arm_visited: false,
@@ -270,13 +272,10 @@ pub(super) fn definition_type<'ctx>(
     else {
         return Err("invalid closed aggregate declaration".into());
     };
-    if !matches!(
-        outputs.outputs.as_slice(),
-        [crate::ScalarOutput {
-            ty: ScalarType::Struct(_),
-            ..
-        }]
-    ) {
+    let mixed = mixed_owned_struct_result(outputs);
+    if mixed.is_none() && !matches!(outputs.outputs.as_slice(),
+        [crate::ScalarOutput { ty: ScalarType::Struct(_), .. }])
+    {
         return Err("invalid closed aggregate return layout".into());
     }
     let pointer = context.ptr_type(AddressSpace::default());
@@ -285,7 +284,11 @@ pub(super) fn definition_type<'ctx>(
         .map(|ty| basic_type(context, ty, layout).map(Into::into))
         .collect::<Result<Vec<BasicMetadataTypeEnum<'ctx>>, _>>()?;
     arguments.push(pointer.into());
-    Ok(pointer.fn_type(&arguments, false))
+    Ok(match mixed {
+        Some(scalar) => context.struct_type(&[pointer.into(), basic_type(context, scalar, layout)?], false)
+            .fn_type(&arguments, false),
+        None => pointer.fn_type(&arguments, false),
+    })
 }
 
 pub(super) fn has_literal_array_plan(state: &EmitState<'_, '_>) -> bool {
@@ -682,6 +685,7 @@ fn call_action(
 }
 
 pub(super) fn store_received_binding<'ctx>(
+    context: &'ctx Context,
     state: &mut EmitState<'ctx, '_>,
     binding: &ScalarBinding,
     value: &EmitValue<'ctx>,
@@ -691,6 +695,18 @@ pub(super) fn store_received_binding<'ctx>(
         Some((_, ClosedCall::Receive))
     ) {
         return Ok(false);
+    }
+    if let [receiver, scalar] = binding.receivers.as_slice() {
+        let owner = extract_output(state, value, 0)?;
+        let EmitValue::Basic(BasicValueEnum::PointerValue(destination)) = owner else {
+            return Err("mixed aggregate receiver did not receive a destination".into());
+        };
+        let value = extract_output(state, value, 1)?;
+        let slot = entry_storage_alloca(context, state, &scalar.ty, &scalar.name)?;
+        store_value(context, state, slot, &scalar.ty, value)?;
+        state.storage.insert(receiver.name.clone(), (destination, receiver.ty.clone()));
+        state.storage.insert(scalar.name.clone(), (slot, scalar.ty.clone()));
+        return Ok(true);
     }
     let [receiver] = binding.receivers.as_slice() else {
         return Err("closed aggregate receiver has ambiguous outputs".into());
@@ -966,11 +982,16 @@ fn emit_selected_call<'ctx, 'module>(
     } else {
         &empty_outputs
     };
+    let mixed = matches!(action, Some(CallDestination::Body(ClosedCall::Receive)))
+        && mixed_owned_struct_result(outputs).is_some();
     let destination = match action {
         Some(CallDestination::Body(ClosedCall::Receive) | CallDestination::InitializerTemporary) => {
-            let [output] = outputs.outputs.as_slice() else {
+            let ([output] | [output, _]) = outputs.outputs.as_slice() else {
                 return Err(format!("invalid closed aggregate output {symbol}"));
             };
+            if !mixed && outputs.outputs.len() != 1 {
+                return Err(format!("invalid closed aggregate output {symbol}"));
+            }
             Some(entry_storage_alloca(
                 context,
                 state,
@@ -1040,14 +1061,21 @@ fn emit_selected_call<'ctx, 'module>(
         super::expression::publish_checked_return_sidecars(context, state, owner_slots)?;
         return super::expression::ordinary_call_result(call.try_as_basic_value(), outputs);
     }
-    let base = state
+    let transport = state
         .builder
         .build_call(function, &operands, "aggregate_original_base")
         .map_err(builder_error)?
         .try_as_basic_value()
         .basic()
-        .ok_or_else(|| "missing closed aggregate original base".to_owned())?
-        .into_pointer_value();
+        .ok_or_else(|| "missing closed aggregate original base".to_owned())?;
+    let (base, pair) = if mixed {
+        let pair = transport.into_struct_value();
+        let base = state.builder.build_extract_value(pair, 0, "aggregate_base")
+            .map_err(builder_error)?.into_pointer_value();
+        (base, Some(pair))
+    } else {
+        (transport.into_pointer_value(), None)
+    };
     state.call_owner_flags.clear();
     match action.expect("return transport action") {
         CallDestination::Body(action) => {
@@ -1069,7 +1097,17 @@ fn emit_selected_call<'ctx, 'module>(
             }
         }
     }
-    Ok(EmitValue::Basic(destination.expect("return destination").into()))
+    let destination = destination.expect("return destination");
+    if let Some(pair) = pair {
+        let value = state.builder.build_insert_value(pair, destination, 0, "aggregate_values")
+            .map_err(builder_error)?.into_struct_value();
+        Ok(EmitValue::Aggregate {
+            value,
+            outputs: outputs.outputs.iter().map(|output| output.ty.clone()).collect(),
+        })
+    } else {
+        Ok(EmitValue::Basic(destination.into()))
+    }
 }
 
 pub(super) fn release_scope<'ctx>(
@@ -1193,17 +1231,32 @@ pub(super) fn commit_return<'ctx>(
     if !matches!(aggregate.plan.returning, Some(ClosedReturn::Allocation { .. })) {
         return Ok(());
     }
-    let [output] = outputs.outputs.as_slice() else {
+    let mixed = mixed_owned_struct_result(outputs).is_some();
+    let ([output] | [output, _]) = outputs.outputs.as_slice() else {
         return Err("invalid closed aggregate returned descriptor".into());
     };
+    if !mixed && outputs.outputs.len() != 1 {
+        return Err("invalid closed aggregate returned descriptor".into());
+    }
     let destination = aggregate.destination
         .ok_or_else(|| "missing closed aggregate returned destination".to_owned())?;
     let name = aggregate.registered_allocation.take()
         .ok_or_else(|| "missing registered aggregate allocation at handoff".to_owned())?;
-    if aggregate.base.is_none() || !state.runtime_array_owners.get(&name).copied().unwrap_or(false) {
-        return Err("closed aggregate handoff has no live original owner".into());
+    let base = aggregate.base
+        .filter(|_| state.runtime_array_owners.get(&name).copied().unwrap_or(false))
+        .ok_or_else(|| "closed aggregate handoff has no live original owner".to_owned())?;
+    if mixed {
+        let EmitValue::Aggregate { value, .. } = result else {
+            return Err("mixed aggregate return has no ordered values".into());
+        };
+        let descriptor = extract_output(state, result, 0)?;
+        store_value(context, state, destination, &output.ty, descriptor)?;
+        let pair = state.builder.build_insert_value(*value, base, 0, "closed_base")
+            .map_err(builder_error)?.into_struct_value();
+        state.aggregate.as_mut().expect("closed aggregate handoff").mixed_return = Some(pair);
+    } else {
+        store_value(context, state, destination, &output.ty, result.clone())?;
     }
-    store_value(context, state, destination, &output.ty, result.clone())?;
     state.runtime_array_owners.insert(name, false);
     state.aggregate.as_mut().expect("closed aggregate handoff").committed = true;
     Ok(())
@@ -1260,6 +1313,10 @@ pub(super) fn finish_return<'ctx>(
     }
     let base = aggregate.base.take()
         .ok_or_else(|| "missing closed aggregate returned base".to_owned())?;
-    state.builder.build_return(Some(&base)).map_err(builder_error)?;
+    if let Some(pair) = aggregate.mixed_return.take() {
+        state.builder.build_return(Some(&pair)).map_err(builder_error)?;
+    } else {
+        state.builder.build_return(Some(&base)).map_err(builder_error)?;
+    }
     Ok(Some(()))
 }

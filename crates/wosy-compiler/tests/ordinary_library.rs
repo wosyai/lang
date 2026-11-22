@@ -541,6 +541,75 @@ if (false) { accept_packet(make_packet(3)); };
 }
 
 #[test]
+fn mixed_owned_struct_result_has_separate_base_and_scalar_lanes() {
+    let app = source("workbench", "src/mixed_owned_struct.w");
+    let text = r#"%%start
+struct Packet { *?u8 data; u64 length; }
+(Packet, u32)(u64) make_packet = fn(length) {
+    u8[length] backing;
+    backing[0] = 19;
+    *?u8 data = null;
+    unsafe { data = &?backing[0]; };
+    Packet packet = { .data = data; .length = length; };
+    packet, 37
+};
+Packet plain_descriptor = { .data = null; .length = 3; };
+(Packet, u32)() plain_packet = fn { plain_descriptor, 11 };
+u64() consume_packet = fn {
+    Packet packet, u32 marker = make_packet(2);
+    Packet ordinary, u32 bonus = plain_packet();
+    ordinary.length = 5;
+    u8 byte = unsafe { core.load<u8>(packet.data) };
+    ordinary.length + core.int_extend<u64>(byte) + core.int_extend<u64>(marker) + core.int_extend<u64>(bonus)
+};
+u64 result = consume_packet();
+if (result != 72) { core.system_panic(); };
+%%end"#;
+    for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let prepared = prepare_scalar_project(
+            vec![(declarations(&app, text), Vec::new())],
+            vec![app.clone()],
+            ScalarPreparationInputs { target_layout },
+        ).unwrap_or_else(|error| panic!("{target_layout:?}: {:?}", error.diagnostics));
+        let build = analyze_scalar_build(&prepared);
+        assert!(build.diagnostics().is_empty(), "{:#?}", build.diagnostics());
+        let text = emit_scalar_build_project_llvm(&build).unwrap().to_text();
+        let context = Context::create();
+        let buffer = MemoryBuffer::create_from_memory_range_copy(text.as_bytes(), "mixed-owner");
+        let module = context.create_module_from_ir(buffer).unwrap();
+        module.verify().unwrap();
+        let producer = function_with_suffix(&module, "make_packet");
+        let consumer = function_with_suffix(&module, "consume_packet");
+        let plain = function_with_suffix(&module, "plain_packet");
+        use inkwell::values::AnyValue;
+        let producer = module.get_function(&producer).unwrap();
+        let caller = module.get_function(&consumer).unwrap();
+        let definition = producer.print_to_string().to_string();
+        let plain_definition = module.get_function(&plain).unwrap().print_to_string().to_string();
+        assert!(!plain_definition.contains("alloca"), "{plain_definition}");
+        let plain_global_suffix = format!("__{}", b"global_plain_descriptor".iter()
+            .map(|byte| format!("{byte:02x}")).collect::<String>());
+        assert!(plain_definition.contains(&plain_global_suffix), "{plain_definition}");
+        assert!(plain_definition.contains("ret { ptr, i32 }"), "{plain_definition}");
+        let call = caller.print_to_string().to_string();
+        assert!(definition.contains("define internal { ptr, i32 }"), "{definition}");
+        assert!(definition.contains("ret { ptr, i32 }"), "{definition}");
+        assert!(!definition.contains("call void @__wosy_core_free"), "{definition}");
+        assert_eq!(call.matches(&format!("call {{ ptr, i32 }} @{}(", producer.get_name().to_str().unwrap())).count(), 1, "{call}");
+        assert!(call.contains(&format!("call {{ ptr, i32 }} @{plain}()")), "{call}");
+        assert!(call.contains("extractvalue { ptr, i32 } %aggregate_original_base, 0"), "{call}");
+        assert!(call.contains("extractvalue { ptr, i32 } %aggregate_values, 1"), "{call}");
+        assert_eq!(call.matches("call void @__wosy_core_free").count(), 1, "{call}");
+        assert!(call.contains("call void @__wosy_core_free(ptr %aggregate_base)"), "{call}");
+        let release = call.find("call void @__wosy_core_free").unwrap();
+        assert!(call[..release].contains("store i64 5"), "{call}");
+        assert!(call[..release].contains("load i8"), "{call}");
+        assert!(call[..release].contains("add i64"), "{call}");
+        assert!(call[release..].contains("ret i64"), "{call}");
+    }
+}
+
+#[test]
 fn grouped_scalar_descriptor_assignment_preserves_checked_owner_routes() {
     let text = r#"%%start
 struct copy Packet { i32 value; }

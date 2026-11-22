@@ -408,6 +408,13 @@ pub(super) fn checked_scalar_output(outputs: &[RootOutputType]) -> bool {
             if ordinary_value(inner))
 }
 
+pub(crate) fn mixed_owned_struct_result(outputs: &ScalarOutputSequence) -> Option<&ScalarType> {
+    match outputs.outputs.as_slice() {
+        [ScalarOutput { ty: ScalarType::Struct(_), .. }, ScalarOutput { ty, .. }] if ordinary_value(ty) => Some(ty),
+        _ => None,
+    }
+}
+
 pub(in crate::scalar) fn ordinary_value(ty: &ScalarType) -> bool {
     matches!(ty, ScalarType::Bool | ScalarType::Char | ScalarType::I8 | ScalarType::I16 | ScalarType::I32 |
         ScalarType::I64 | ScalarType::I128 | ScalarType::U8 | ScalarType::U16 | ScalarType::U32 |
@@ -602,6 +609,8 @@ pub(super) struct AggregateFlowResult {
     pub(super) local_array_failure_arms: BTreeMap<usize, Option<CfgPointId>>,
     pub(super) allocation_slots: BTreeMap<CfgPointId, (usize, usize)>,
     pub(super) calls: BTreeMap<CfgPointId, OccurrenceOrdinal>,
+    pub(super) mixed_result_calls: BTreeSet<CfgPointId>,
+    pub(super) mixed_result_bindings: BTreeSet<CfgPointId>,
     pub(super) returns: BTreeMap<CfgPointId, BTreeSet<Option<OwnerSource>>>,
     endpoints: BTreeMap<(CfgPointId, usize), ScopeEndpoint>,
     pub(super) unsupported: BTreeSet<CfgPointId>,
@@ -634,6 +643,20 @@ pub(super) struct AggregateFlowResult {
 }
 
 impl AggregateFlowResult {
+    pub(super) fn proves_mixed_local_owner(&self, cfg: &ScalarReferenceCfg) -> bool {
+        let mut owners = self.return_owners(cfg, true);
+        let Some(Some(owner @ OwnerSource::Allocation(_))) = owners.next() else { return false };
+        owners.all(|current| current == Some(owner))
+    }
+
+    fn return_owners<'a>(&'a self, cfg: &'a ScalarReferenceCfg, mixed: bool)
+        -> impl Iterator<Item = Option<OwnerSource>> + 'a
+    {
+        self.returns.iter().filter(move |(point, _)| !mixed || matches!(cfg.points[point.0].kind,
+            CfgPointKind::ReturnOutput { output: 0, .. }))
+            .flat_map(|(_, alternatives)| alternatives.iter().copied())
+    }
+
     fn reject_receipt_loan(&mut self, point: CfgPointId, value: Option<&Value>) -> bool {
         if let Some(Value::ReceiptLoan(call)) = value {
             self.unproved_receipt_loans.entry(*call).or_insert(point);
@@ -695,7 +718,7 @@ impl AggregateFlowResult {
             || (self.checked_producer_authoritative && !self.checked_producer_backing.is_empty())
             || self.checked_backing_assignment.is_some() || self.checked_backing_forward.is_some()
             || self.scalar_descriptor_assignment.is_some() || !self.array_returns.is_empty() || !self.array_rebinds.is_empty()
-            || self.returning_leaf || !self.calls.is_empty() || !self.returns.is_empty() || !self.formals.is_empty() || !self.inputs.is_empty() || !self.raw_terminals.is_empty() || !self.read_formals.is_empty()
+            || self.returning_leaf || !self.calls.is_empty() || !self.mixed_result_calls.is_empty() || !self.returns.is_empty() || !self.formals.is_empty() || !self.inputs.is_empty() || !self.raw_terminals.is_empty() || !self.read_formals.is_empty()
     }
 }
 
@@ -1914,6 +1937,20 @@ struct Body<'a> {
     supports_input_result: bool,
 }
 
+impl Body<'_> {
+    fn has_mixed_struct_result(&self) -> bool {
+        matches!(self.sites.boundary.root_outputs.as_slice(), [
+            RootOutputType { output: 0, ty: ScalarType::Struct(_) },
+            RootOutputType { output: 1, ty },
+        ] if ordinary_value(ty))
+    }
+
+    fn return_owners(&self) -> impl Iterator<Item = Option<OwnerSource>> + '_ {
+        let mixed = self.has_mixed_struct_result();
+        self.facts.into_iter().flat_map(move |facts| facts.return_owners(self.cfg, mixed))
+    }
+}
+
 fn target_body(
     bodies: &HashMap<(&SourceIdentity, ByteSpan), (usize, usize)>,
     cfg: &ScalarReferenceCfg,
@@ -2687,8 +2724,8 @@ fn closed_aggregates<'a>(
                 }
             }
         }
-        for source in body.facts.into_iter().flat_map(|facts| facts.returns.values()).flatten().flatten() {
-            match *source {
+        for source in body.return_owners().flatten() {
+            match source {
                 OwnerSource::Formal(_) => {}
                 OwnerSource::Allocation(_) => {
                     if outgoing.insert(key) {
@@ -2860,6 +2897,9 @@ fn closed_aggregates<'a>(
             let target = region.call_target(call)
                 .ok_or_else(|| topology.missing_call_target(&region.source, call))?;
             let Some(body) = initializer_target(&declarations, target) else { continue };
+            if outgoing.contains(&body) && bodies.get(&body).is_some_and(Body::has_mixed_struct_result) {
+                return Err(format!("mixed aggregate result requires a local binding in {:?}", region.source));
+            }
             let formal = topology.checked_call_signatures.get(&call).and_then(|row| match row.parameters.as_slice() {
                 [ty @ ScalarType::Struct(_)] => Some(ty),
                 _ => None,
@@ -3150,6 +3190,13 @@ fn closed_aggregates<'a>(
             ));
         }
         let Some(facts) = body.facts else { continue };
+        for &point in &facts.mixed_result_calls {
+            if !facts.mixed_result_bindings.contains(&point)
+                && target_body(&declarations, body.cfg, point).is_some_and(|target| outgoing.contains(&target))
+            {
+                return Err(format!("mixed aggregate result requires a matching local binding in {:?}", body.source));
+            }
+        }
         for (&call, &point) in &facts.unproved_receipt_loans {
             if target_body(&declarations, body.cfg, call).is_some_and(|target| outgoing.contains(&target)) {
                 return Err(format!("aggregate owning receipt has an unproved checked loan in {:?} at point {point:?}", body.source));
@@ -3163,10 +3210,7 @@ fn closed_aggregates<'a>(
                     body.source
                 ));
             }
-            let mut values = facts
-                .returns
-                .values()
-                .flat_map(|alternatives| alternatives.iter().copied());
+            let mut values = body.return_owners();
             let Some(Some(owner)) = values.next() else {
                 return Err(format!(
                     "aggregate return owner is not established in {:?}",
@@ -3190,6 +3234,12 @@ fn closed_aggregates<'a>(
                     ClosedReturn::Allocation { block, item }
                 }
                 OwnerSource::Call(point) => {
+                    if body.has_mixed_struct_result()
+                        || target_body(&declarations, body.cfg, point)
+                            .and_then(|target| bodies.get(&target)).is_some_and(Body::has_mixed_struct_result)
+                    {
+                        return Err(format!("forwarding a mixed aggregate result is not closed in {:?}", body.source));
+                    }
                     let call = *facts.calls.get(&point).ok_or_else(|| {
                         format!(
                             "missing aggregate forwarding occurrence in {:?}",

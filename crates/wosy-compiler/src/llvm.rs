@@ -1678,7 +1678,7 @@ fn store_binding_outputs<'ctx, 'module>(
             .insert(receiver.name.clone(), false);
         return Ok(());
     }
-    if aggregate_transfer::store_received_binding(state, binding, &value)? {
+    if aggregate_transfer::store_received_binding(context, state, binding, &value)? {
         return Ok(());
     }
     let receivers = binding_receivers(binding);

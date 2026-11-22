@@ -341,6 +341,7 @@ fn prepared_direct_local_reborrow_owner_requires_the_exact_declared_scope() {
 pub(super) struct ReferenceFlowBuilder<'a> {
     capture_call_points: bool,
     root_return_points: std::ops::Range<usize>,
+    mixed_owners: Option<&'a HashSet<ByteSpan>>,
     local_borrow: Option<local_borrow::Author>,
     aggregate_facts: aggregate::AggregateFlowFacts,
     aggregate_result: aggregate::AggregateFlowResult,
@@ -473,6 +474,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
         Self {
             capture_call_points: false,
             root_return_points: 0..0,
+            mixed_owners: None,
             local_borrow: (matches!(&call_sites.named_place_roots, NamedPlaceRootFacts::Prepared(roots)
                 if !roots.is_empty() || (call_sites.conditionals.len() == 1
                     && matches!(call_sites.conditionals.values().next(), Some(ConditionalRegion::Unit { .. }))))
@@ -1852,6 +1854,8 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             }]
                         )
                     });
+                let mixed_result = signature.is_some_and(|signature|
+                    aggregate::mixed_owned_struct_result(&signature.outputs).is_some());
                 let array_call = array_argument.is_some() && matches!(&calls.named_place_roots, NamedPlaceRootFacts::Prepared(_))
                     && matches!(&call, CfgPointKind::Call {
                     target: ResolvedCallTarget::ModuleCallable { .. }, ..
@@ -1880,6 +1884,17 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 }
                 if carries_struct_result {
                     self.aggregate_facts.calls.insert(id, ordinal);
+                } else if mixed_result {
+                    let selected = matches!(&self.cfg.points[id.0].kind, CfgPointKind::Call {
+                        target: ResolvedCallTarget::ModuleCallable {
+                            source, declaration_span, concrete: ConcreteCallSelection::Declaration,
+                        }, ..
+                    } if source == &self.source
+                        && self.mixed_owners.is_some_and(|owners| owners.contains(declaration_span)));
+                    self.aggregate_result.mixed_result_calls.insert(id);
+                    if selected {
+                        self.aggregate_facts.calls.insert(id, ordinal);
+                    }
                 }
                 if !aggregate_arguments.is_empty() {
                     for (&slot, &provenance) in &aggregate_arguments {
@@ -3871,6 +3886,22 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     } else {
                         None
                     };
+                    if let ([head, tail], Some(point)) = (binding_region.receivers(), call_producer) {
+                        if matches!(head.ty, ScalarType::Struct(_)) && aggregate::ordinary_value(&tail.ty)
+                            && outputs.secondary.as_slice() == [BindingOutput::ProjectPrimary { output: 1 }]
+                            && self.aggregate_facts.calls.contains_key(&point)
+                            && matches!(&self.cfg.points[point.0].kind, CfgPointKind::Call {
+                                target: ResolvedCallTarget::ModuleCallable {
+                                    source, concrete: ConcreteCallSelection::Declaration, ..
+                                }, ..
+                            } if source == &self.source)
+                            && calls.checked_call_signatures.get(&primary_ordinal).is_some_and(|signature|
+                                matches!(signature.outputs.outputs.as_slice(), [first, second]
+                                    if first.ty == head.ty && second.ty == tail.ty))
+                        {
+                            self.aggregate_result.mixed_result_bindings.insert(point);
+                        }
+                    }
                     let initializer = self.cursor.filter(|_| self.cursor != before);
                     if prepared_raw_null
                         && (self.aggregate_facts.local_array_copy_allocation.is_some()
@@ -10976,6 +11007,23 @@ fn derive_module_reference_origins(
             ));
         }
     }
+    if errors.is_empty() && updates.iter().any(|(_, result)| result.has_mixed_result_calls()) {
+        let owners = updates.iter().filter_map(|(index, result)| {
+            let ScalarItem::Function(function) = &items[*index] else { unreachable!("function result ordinal") };
+            let ScalarType::Callable { outputs, .. } = &function.signature else { return None };
+            (function.generic_parameters.is_empty() && function.overload_arms.is_empty()
+                && aggregate::mixed_owned_struct_result(outputs).is_some()
+                && result.aggregate.proves_mixed_local_owner(&result.cfg))
+                .then_some(function.name_span)
+        }).collect::<HashSet<_>>();
+        if !owners.is_empty() {
+            for (index, result) in &mut updates {
+                let ScalarItem::Function(function) = &items[*index] else { unreachable!("function result ordinal") };
+                result.observe_selected_mixed_receipts(function, &call_sites.functions[index], &module_names,
+                    structs, enums, source, &owners, capture_call_points, &mut errors);
+            }
+        }
+    }
     (updates, errors)
 }
 
@@ -11874,6 +11922,40 @@ struct FunctionReferenceResult {
 }
 
 impl FunctionReferenceResult {
+    fn has_mixed_result_calls(&self) -> bool {
+        !self.aggregate.mixed_result_calls.is_empty() || self.arms.iter().any(Self::has_mixed_result_calls)
+    }
+
+    fn observe_selected_mixed_receipts(
+        &mut self, function: &ScalarFunction, sites: &FunctionCallSites, module_names: &HashSet<String>,
+        structs: &[ScalarStruct], enums: &[ScalarEnum], source: &SourceIdentity, owners: &HashSet<ByteSpan>,
+        capture_call_points: bool, errors: &mut Vec<ReferenceAnalysisError>,
+    ) {
+        for ((result, function), sites) in self.arms.iter_mut().zip(&function.overload_arms).zip(&sites.arms) {
+            result.observe_selected_mixed_receipts(function, sites, module_names, structs, enums, source, owners,
+                capture_call_points, errors);
+        }
+        if !self.aggregate.mixed_result_calls.iter().any(|point|
+            matches!(&self.cfg.initial_points[point.0].kind, CfgPointKind::Call {
+                target: ResolvedCallTarget::ModuleCallable {
+                    source: actual, declaration_span, concrete: ConcreteCallSelection::Declaration,
+                }, ..
+            } if actual == source && owners.contains(declaration_span)))
+        {
+            return;
+        }
+        let mut builder = ReferenceFlowBuilder::new(source, function, module_names, sites, structs, enums);
+        builder.capture_call_points = capture_call_points;
+        builder.mixed_owners = Some(owners);
+        let (cfg, emitted_errors, proof_points, aggregate, checked_contract_returns) =
+            build_function_reference_cfg(builder, function, true);
+        errors.extend(emitted_errors);
+        self.cfg = cfg;
+        self.proof_points = proof_points;
+        self.aggregate = aggregate;
+        self.checked_contract_returns = checked_contract_returns;
+    }
+
     fn install(self, function: &mut ScalarFunction) {
         self.install_body(function, 0, None, None);
     }
