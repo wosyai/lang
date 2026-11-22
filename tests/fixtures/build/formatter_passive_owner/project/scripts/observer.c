@@ -67,7 +67,7 @@ void *__wrap___wosy_core_alloc(u64 size, u64 alignment) {
         require((releases == 0 && live == 1) || (releases == 1 && live == 0));
     } else {
         require(size == (stage == 30 ? 39u : 3u) && alignment == 1);
-        require(((stage == 0 || stage == 10 || stage == 22 || stage == 30) && allocations == 0 && live == 0)
+        require(((stage == 0 || stage == 10 || stage == 26 || stage == 30) && allocations == 0 && live == 0)
                 || (stage == 11 && allocations == 1 && live == 1));
     }
     word address = (word)__real___wosy_core_alloc(size, alignment);
@@ -163,8 +163,11 @@ void CHECKPOINT(int mark) {
     case 21: case 22:
         require(stage == mark - 1 && wrote_static && !allocations && !releases && !live);
         break;
+    case 26:
+        require(stage == 22 && wrote_static && !allocations && !releases && !live);
+        break;
     case 23:
-        require(stage == 22 && allocations == 1 && releases == 0 && live == 1);
+        require(stage == 26 && allocations == 1 && releases == 0 && live == 1);
         check_bytes(0, bases[0], 1, "K", 1);
         break;
     case 24: case 25:
