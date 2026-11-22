@@ -142,6 +142,16 @@ trait ScopedAuthoredReturn<'a>: Copy {
         None
     }
 
+    #[cfg(feature = "internal-checker")]
+    const OBSERVE_RETURN: bool = false;
+
+    #[cfg(feature = "internal-checker")]
+    fn observe_return(
+        self, _: FinalOutputSlot, _: IntegerReturn<'a>, _: &IntegerRoots<'a>, _: &IntegerInputs,
+    ) -> Option<()> {
+        Some(())
+    }
+
     fn branch(
         self, _: &OccurrenceStructure, _: BlockOrdinal, _: FinalOutputSlot, _: usize, _: BlockOrdinal,
     ) -> Self {
@@ -242,6 +252,92 @@ impl<'a> ScopedAuthoredReturn<'a> for OrderedRootConditions<'a> {
         let accepted = IntegerCutUnion::new((left_relation, &left_bound), (right_relation, &right_bound), (&min, &max));
         let (yes, no) = path.split_partition(axis, &accepted);
         Some((yes, no, Some(axis)))
+    }
+}
+
+#[cfg(feature = "internal-checker")]
+pub(super) struct SymbolicLiteralFailure<'a> {
+    pub(super) output: super::ByteSpan,
+    pub(super) returned: BigInt,
+    pub(super) state: IntegerInputs,
+    pub(super) axes: Vec<(&'a ReferenceBindingId, &'a ScalarType)>,
+}
+
+#[cfg(feature = "internal-checker")]
+#[derive(Clone, Copy)]
+struct OrderedRootLiteralProof<'a, 'observation> {
+    conditions: OrderedRootConditions<'a>,
+    relation: IntegerRelation,
+    bound: &'observation BigInt,
+    observed: &'observation std::cell::RefCell<(bool, Option<SymbolicLiteralFailure<'a>>)>,
+}
+
+#[cfg(feature = "internal-checker")]
+impl<'a> ScopedAuthoredReturn<'a> for OrderedRootLiteralProof<'a, '_> {
+    const ENABLED: bool = false;
+    const OBSERVE_RETURN: bool = true;
+
+    fn at(
+        self, _: &FunctionCallSites, _: BlockOrdinal, _: FinalOutputSlot, _: &ScalarType,
+        _: &IntegerRoots<'_>, _: &IntegerInputs,
+    ) -> Option<&'a BigInt> {
+        None
+    }
+
+    fn split_unprepared(
+        self, calls: &FunctionCallSites, slot: RootBranchSlot, roots: &IntegerRoots<'_>, path: IntegerInputs,
+    ) -> Option<(IntegerInputs, IntegerInputs, Option<usize>)> {
+        self.conditions.split_unprepared(calls, slot, roots, path)
+    }
+
+    fn observe_return(
+        self, slot: FinalOutputSlot, value: IntegerReturn<'a>, roots: &IntegerRoots<'a>, path: &IntegerInputs,
+    ) -> Option<()> {
+        let axis = match value {
+            IntegerReturn::Const(_) => None,
+            IntegerReturn::Alias(binding) => {
+                let (axis, _) = roots.lookup(binding)?;
+                if axis >= roots.parameters {
+                    return None;
+                }
+                Some(axis)
+            }
+        };
+        let mut observed = self.observed.borrow_mut();
+        observed.0 = true;
+        if observed.1.is_some() {
+            return Some(());
+        }
+        let rejected = self.relation.complement();
+        let failing = match (value, axis) {
+            (IntegerReturn::Const(value), _) => rejected.accepts(value.cmp(self.bound))
+                .then(|| (path.0.first().expect("reached symbolic return"), value)),
+            (IntegerReturn::Alias(_), Some(axis)) => path.0.iter().find_map(|row| {
+                row.get(axis)?.intervals().find_map(|(first, last)| {
+                    if rejected.accepts(first.cmp(self.bound)) {
+                        Some(first)
+                    } else if rejected.accepts(last.cmp(self.bound)) {
+                        Some(last)
+                    } else if first <= self.bound && self.bound <= last && rejected.accepts(std::cmp::Ordering::Equal) {
+                        Some(self.bound)
+                    } else {
+                        None
+                    }
+                }).map(|value| (row, value))
+            }),
+            _ => return None,
+        };
+        if let Some((row, returned)) = failing {
+            let mut row = row[..roots.parameters].to_vec();
+            if let Some(axis) = axis {
+                row[axis] = Rc::new(IntegerSet::singleton(returned));
+            }
+            observed.1 = Some(SymbolicLiteralFailure {
+                output: slot.span, returned: returned.clone(), state: IntegerInputs(vec![row]),
+                axes: roots.axes[..roots.parameters].to_vec(),
+            });
+        }
+        Some(())
     }
 }
 
@@ -1666,6 +1762,21 @@ pub(super) fn collect_ordered_root_requirement_failures<'a>(
     Some((active, failures))
 }
 
+#[cfg(feature = "internal-checker")]
+pub(super) fn collect_ordered_root_literal_proof<'a>(
+    calls: &'a FunctionCallSites, body: &'a super::ScalarBlock, relation: IntegerRelation, bound: &BigInt,
+) -> Option<(bool, Vec<IntegerCheckFailure<'a>>, bool, Option<SymbolicLiteralFailure<'a>>)> {
+    let observed = std::cell::RefCell::new((false, None));
+    let mut failures = Vec::new();
+    let mut sink = |failure| failures.push(failure);
+    let (active, _) = collect_integer_requirement_failures_in_scope(
+        calls, IntegerRequirementEntry::Arbitrary, None, false, &mut sink,
+        OrderedRootLiteralProof { conditions: OrderedRootConditions(body), relation, bound, observed: &observed },
+    )?;
+    let (returned, failure) = observed.into_inner();
+    Some((active, failures, returned, failure))
+}
+
 fn collect_integer_requirement_failures_in_scope<'a, Scoped: ScopedAuthoredReturn<'a>>(
     calls: &'a FunctionCallSites,
     entry: IntegerRequirementEntry<'_>,
@@ -2525,6 +2636,10 @@ fn walk_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, A
                     return None;
                 };
                 if tail.is_some() {
+                    #[cfg(feature = "internal-checker")]
+                    if Authored::OBSERVE_RETURN {
+                        authored_return.observe_return(slot, value, roots, &path)?;
+                    }
                     if let Some(returns) = returns.as_deref_mut() {
                         returns.push(IntegerReturningPath {
                             value,
