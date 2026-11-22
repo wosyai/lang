@@ -264,11 +264,20 @@ pub(super) struct SymbolicLiteralFailure<'a> {
 }
 
 #[cfg(feature = "internal-checker")]
+struct LiteralGuardAtReturn<'a> {
+    axis: usize,
+    relation: IntegerRelation,
+    bound: &'a BigInt,
+    nonfailure: Option<IntegerCutUnion<'a>>,
+}
+
+#[cfg(feature = "internal-checker")]
 #[derive(Clone, Copy)]
 struct OrderedRootLiteralProof<'a, 'observation> {
     conditions: OrderedRootConditions<'a>,
     relation: IntegerRelation,
     bound: &'observation BigInt,
+    guard: Option<&'observation LiteralGuardAtReturn<'observation>>,
     observed: &'observation std::cell::RefCell<(bool, Option<SymbolicLiteralFailure<'a>>)>,
 }
 
@@ -304,36 +313,56 @@ impl<'a> ScopedAuthoredReturn<'a> for OrderedRootLiteralProof<'a, '_> {
             }
         };
         let mut observed = self.observed.borrow_mut();
-        observed.0 = true;
         if observed.1.is_some() {
             return Some(());
         }
         let rejected = self.relation.complement();
-        let failing = match (value, axis) {
-            (IntegerReturn::Const(value), _) => rejected.accepts(value.cmp(self.bound))
-                .then(|| (path.0.first().expect("reached symbolic return"), value)),
-            (IntegerReturn::Alias(_), Some(axis)) => path.0.iter().find_map(|row| {
-                row.get(axis)?.intervals().find_map(|(first, last)| {
-                    if rejected.accepts(first.cmp(self.bound)) {
-                        Some(first)
-                    } else if rejected.accepts(last.cmp(self.bound)) {
-                        Some(last)
-                    } else if first <= self.bound && self.bound <= last && rejected.accepts(std::cmp::Ordering::Equal) {
-                        Some(self.bound)
-                    } else {
-                        None
-                    }
-                }).map(|value| (row, value))
-            }),
-            _ => return None,
-        };
-        if let Some((row, returned)) = failing {
-            let mut row = row[..roots.parameters].to_vec();
+        let mut applicable = self.guard.is_none();
+        let mut failing = None;
+        for row in &path.0 {
+            if let Some(guard) = self.guard.filter(|guard| Some(guard.axis) == axis) {
+                let (admitted, value) = row.get(guard.axis)?
+                    .first_guarded_failure((guard.relation, guard.bound), guard.nonfailure.as_ref()?);
+                applicable |= admitted;
+                if let Some(value) = value {
+                    failing = Some((row, Cow::Owned(value), None));
+                    break;
+                }
+                continue;
+            }
+            let entry = if let Some(guard) = self.guard {
+                let Some(point) = row.get(guard.axis)?.first_comparison_point(guard.relation, guard.bound) else {
+                    continue;
+                };
+                applicable = true;
+                Some((guard.axis, point))
+            } else {
+                None
+            };
+            let returned = match (value, axis) {
+                (IntegerReturn::Const(value), _) => rejected.accepts(value.cmp(self.bound)).then_some(value),
+                (IntegerReturn::Alias(_), Some(axis)) => row.get(axis)?.first_comparison_point(rejected, self.bound),
+                _ => return None,
+            };
+            if let Some(returned) = returned {
+                failing = Some((row, Cow::Borrowed(returned), entry));
+                break;
+            }
+            if matches!(value, IntegerReturn::Const(_)) {
+                break;
+            }
+        }
+        observed.0 |= applicable;
+        if let Some((row, returned, entry)) = failing {
+            let mut state = row[..roots.parameters].to_vec();
+            if let Some((axis, value)) = entry {
+                state[axis] = Rc::new(IntegerSet::singleton(value));
+            }
             if let Some(axis) = axis {
-                row[axis] = Rc::new(IntegerSet::singleton(returned));
+                state[axis] = Rc::new(IntegerSet::singleton(returned.as_ref()));
             }
             observed.1 = Some(SymbolicLiteralFailure {
-                output: slot.span, returned: returned.clone(), state: IntegerInputs(vec![row]),
+                output: slot.span, returned: returned.into_owned(), state: IntegerInputs(vec![state]),
                 axes: roots.axes[..roots.parameters].to_vec(),
             });
         }
@@ -1765,13 +1794,40 @@ pub(super) fn collect_ordered_root_requirement_failures<'a>(
 #[cfg(feature = "internal-checker")]
 pub(super) fn collect_ordered_root_literal_proof<'a>(
     calls: &'a FunctionCallSites, body: &'a super::ScalarBlock, relation: IntegerRelation, bound: &BigInt,
+    predicate: Option<&IntegerPredicate>,
 ) -> Option<(bool, Vec<IntegerCheckFailure<'a>>, bool, Option<SymbolicLiteralFailure<'a>>)> {
+    let bounds;
+    let guard = if let Some(predicate) = predicate {
+        let bindings = calls.boundary.checker_parameter_bindings.as_deref()?;
+        let axis = bindings.iter().position(|binding| binding == &predicate.binding)?;
+        let parameter = calls.boundary.parameters.get(axis)?;
+        if parameter.ty != predicate.ty {
+            return None;
+        }
+        let relation_when = IntegerRelation::from_operator(&predicate.operator)?;
+        bounds = super::typecheck::integer_bounds(&parameter.ty)?;
+        let (min, max) = &bounds;
+        if &predicate.bound < min || &predicate.bound > max {
+            return None;
+        }
+        let nonfailure = if integer_tail_type(calls)? == &parameter.ty {
+            if bound < min || bound > max {
+                return None;
+            }
+            Some(IntegerCutUnion::new((relation_when.complement(), &predicate.bound), (relation, bound), (min, max)))
+        } else {
+            None
+        };
+        Some(LiteralGuardAtReturn { axis, relation: relation_when, bound: &predicate.bound, nonfailure })
+    } else {
+        None
+    };
     let observed = std::cell::RefCell::new((false, None));
     let mut failures = Vec::new();
     let mut sink = |failure| failures.push(failure);
     let (active, _) = collect_integer_requirement_failures_in_scope(
         calls, IntegerRequirementEntry::Arbitrary, None, false, &mut sink,
-        OrderedRootLiteralProof { conditions: OrderedRootConditions(body), relation, bound, observed: &observed },
+        OrderedRootLiteralProof { conditions: OrderedRootConditions(body), relation, bound, guard: guard.as_ref(), observed: &observed },
     )?;
     let (returned, failure) = observed.into_inner();
     Some((active, failures, returned, failure))

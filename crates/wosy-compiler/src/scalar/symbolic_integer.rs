@@ -10,6 +10,19 @@ struct Interval {
     last: BigInt,
 }
 
+#[cfg(feature = "internal-checker")]
+fn literal_point<'a>(interval: &'a Interval, relation: IntegerRelation, bound: &'a BigInt) -> Option<&'a BigInt> {
+    if relation.accepts(interval.first.cmp(bound)) {
+        Some(&interval.first)
+    } else if relation.accepts(interval.last.cmp(bound)) {
+        Some(&interval.last)
+    } else if interval.first <= *bound && *bound <= interval.last && relation.accepts(Ordering::Equal) {
+        Some(bound)
+    } else {
+        None
+    }
+}
+
 fn overlapping_or_adjacent(first: &BigInt, last: &BigInt) -> bool {
     first <= last || *first == last + 1
 }
@@ -419,6 +432,44 @@ impl IntegerSet {
         } else {
             intervals.next_back().map(|interval| interval.last)
         }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    pub(super) fn first_comparison_point<'a>(
+        &'a self, relation: IntegerRelation, bound: &'a BigInt,
+    ) -> Option<&'a BigInt> {
+        self.0.iter().find_map(|interval| literal_point(interval, relation, bound))
+    }
+
+    #[cfg(feature = "internal-checker")]
+    pub(super) fn first_guarded_failure(
+        &self, guard: (IntegerRelation, &BigInt), nonfailure: &IntegerCutUnion<'_>,
+    ) -> (bool, Option<BigInt>) {
+        if let Some(passes) = nonfailure.uniform() {
+            return if passes {
+                (self.first_comparison_point(guard.0, guard.1).is_some(), None)
+            } else {
+                let failed = self.0.first().map(|interval| interval.first.clone());
+                (failed.is_some(), failed)
+            };
+        }
+        let mut applicable = false;
+        let mut cursor = 0;
+        for interval in &self.0 {
+            if !applicable {
+                applicable = literal_point(interval, guard.0, guard.1).is_some();
+            }
+            let mut failed = None;
+            nonfailure.for_each_clipped(interval, &mut cursor, |part| {
+                if !part.accepts && failed.is_none() {
+                    failed = Some(if part.lower.1 { part.lower.0.clone() } else { part.lower.0 + 1 });
+                }
+            });
+            if failed.is_some() {
+                return (true, failed);
+            }
+        }
+        (applicable, None)
     }
 
     #[cfg(feature = "internal-checker")]

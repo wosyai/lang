@@ -1992,6 +1992,7 @@ struct SelectedSymbolicProof<'a> {
     relation: IntegerRelation,
     bound: &'a BigInt,
     failure: Option<SymbolicProofDiagnostic>,
+    predicate: Option<&'a super::checker_flow::IntegerPredicate>,
 }
 
 #[cfg(feature = "internal-checker")]
@@ -2012,7 +2013,7 @@ impl SymbolicRootProof for SelectedSymbolicProof<'_> {
             return Err(ProjectCheck::Unsupported);
         }
         let (active, directives, returned, failure) = super::checker_flow::collect_ordered_root_literal_proof(
-            calls, &function.body, self.relation, self.bound,
+            calls, &function.body, self.relation, self.bound, self.predicate,
         ).ok_or(ProjectCheck::Unsupported)?;
         for directive in directives {
             effects.push_callable(calls, source, directive);
@@ -2232,15 +2233,18 @@ fn check_loaded_ordered_proof_diagnostics(
     }).collect::<Result<Vec<_>, _>>()?;
     let first_case = MainFlowProofCase::prepare(&first_plan, &prepared.source)?;
     let mut symbolic = if scope == ScalarCheckerScope::CurrentPackage {
-        if !others.is_empty() || first_plan.filter.as_deref().unwrap_or_default().iter()
-            .any(|predicate| !matches!(predicate, CheckerPredicate::Boolean(true)))
-        {
+        if !others.is_empty() {
             return Err(ProjectCheck::Unsupported);
         }
+        let predicate = match first_plan.filter.as_deref().unwrap_or_default() {
+            [CheckerPredicate::Integer(predicate)] => Some(predicate),
+            predicates if predicates.iter().all(|predicate| matches!(predicate, CheckerPredicate::Boolean(true))) => None,
+            _ => return Err(ProjectCheck::Unsupported),
+        };
         Some(SelectedSymbolicProof {
             target: first_plan.target, source: first_case.proof_source,
             proof: first_case.proof, goal: first_case.goal, relation: first_case.relation,
-            bound: first_case.bound, failure: None,
+            bound: first_case.bound, failure: None, predicate,
         })
     } else {
         None
@@ -6731,8 +6735,68 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
             "\n                    value + 1\n                } else");
         assert_ne!(unsupported_tail, authored);
         assert!(matches!(run(&unsupported_tail, ScalarCheckerScope::CurrentPackage), Err(ProjectCheck::Unsupported)));
-        let restricted = proof_only.replace("ensures", "where (entry == 1) ensures");
+        let restricted = proof_only.replace("ensures", "where (entry >= 1 && entry <= 2) ensures");
         assert!(matches!(run(&restricted, ScalarCheckerScope::CurrentPackage), Err(ProjectCheck::Unsupported)));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordered_current_package_auto_proof_filters_return_witnesses_without_filtering_directives() {
+        let app = source("src/main.w", "ordered-automatic-proof-unused-where");
+        let run = |text: &str| {
+            let (_, proof) = crate::parse_proof_source(app.clone(), text.to_owned(), &[])
+                .unwrap_or_else(|_| panic!("valid proof source"));
+            check_loaded_ordered_proof_diagnostics(
+                Vec::new(), vec![(proof, Vec::new())], vec![app.clone()], inputs(), ScalarCheckerScope::CurrentPackage,
+            )
+        };
+        let guarded = |where_guard: &str, goal: &str| format!(r#"%%start
+            u8(u8) checked = fn(value) {{ core.require(value < 2, {OUTPUT}); value }};
+            proof bound for checked(entry) -> (out) where ({where_guard}) ensures ({goal}) {{}}
+        %%end"#);
+        let intervals = |witness: &ScalarCheckerIntegerWitness, axis| witness.intervals_at(0, axis).unwrap()
+            .map(|(first, last)| (first.clone(), last.clone())).collect::<Vec<_>>();
+        let passing = run(&guarded("entry != 3", "out != 3")).unwrap();
+        assert!(passing.active && passing.diagnostics.is_empty() && passing.symbolic_diagnostic.is_none());
+        assert_eq!(passing.directives.len(), 1);
+        assert_eq!(intervals(&passing.directives[0].witness, 0), [(BigInt::from(2), BigInt::from(255))]);
+        let refuted = run(&guarded("entry > 6", "out != 7")).unwrap();
+        let failure = refuted.symbolic_diagnostic.unwrap();
+        assert_eq!(failure.directive_position, 1);
+        assert_eq!(failure.returned, BigInt::from(7));
+        assert_eq!(intervals(&failure.witness, 0), [(BigInt::from(7), BigInt::from(7))]);
+        assert_eq!(intervals(&refuted.directives[0].witness, 0), [(BigInt::from(2), BigInt::from(255))]);
+        let tautology = run(&guarded("true && true", "out != 7")).unwrap();
+        assert_eq!(tautology.directives.len(), 1);
+        let tautology_failure = tautology.symbolic_diagnostic.unwrap();
+        assert_eq!(tautology_failure.returned, BigInt::from(7));
+        let no_entry = r#"%%start
+            u8(u8) checked = fn(value) { value };
+            proof bound for checked(entry) -> (out) where (entry > 255) ensures (out == 0) {}
+        %%end"#;
+        let no_entry = run(no_entry).unwrap();
+        assert!(!no_entry.active && no_entry.directives.is_empty() && no_entry.symbolic_diagnostic.is_none());
+        let no_return = format!(r#"%%start
+            u8(u8) checked = fn(value) {{
+                if (value > 6) {{ core.narrow(false, {OUTPUT}); value }} else {{ value }}
+            }};
+            proof bound for checked(entry) -> (out) where (entry > 6) ensures (out != 7) {{}}
+        %%end"#);
+        let no_return = run(&no_return).unwrap();
+        assert!(no_return.active && no_return.directives.len() == 1 && no_return.symbolic_diagnostic.is_none());
+
+        let two_axes = |goal: &str| format!(r#"%%start
+            u16(u8, u16) checked = fn(tag, value) {{
+                if (tag == 1) {{ if (value == 1000) {{ value }} else {{ 0 }} }} else {{ value }}
+            }};
+            proof bound for checked(kind, entry) -> (out) where (kind == 1) ensures ({goal}) {{}}
+        %%end"#);
+        let separated = run(&two_axes("out <= 1000")).unwrap();
+        assert!(separated.active && separated.directives.is_empty() && separated.symbolic_diagnostic.is_none());
+        let exact = run(&two_axes("out < 1000")).unwrap().symbolic_diagnostic.unwrap();
+        assert_eq!(exact.returned, BigInt::from(1000));
+        assert_eq!(intervals(&exact.witness, 0), [(BigInt::from(1), BigInt::from(1))]);
+        assert_eq!(intervals(&exact.witness, 1), [(BigInt::from(1000), BigInt::from(1000))]);
     }
 
     #[cfg(feature = "internal-checker")]
