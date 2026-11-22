@@ -4317,9 +4317,13 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 ),
             }
         }
+        let mut return_bounds = None;
         if scope == ReferenceScopeId(0) {
             let backing_forward = self.checked_backing_forward(region, &result.output_points);
-            for (slot, &value_point) in region.final_outputs().zip(&result.output_points) {
+            let mut value_points = result.output_points.iter();
+            for slot in region.final_outputs() {
+                return_bounds.get_or_insert((slot.span.start, slot.span.end)).1 = slot.span.end;
+                let Some(&value_point) = value_points.next() else { continue };
                 let metadata = &calls.boundary.root_outputs[slot.output];
                 assert_eq!(metadata.output, slot.output);
                 self.uncomputed_point(
@@ -4341,11 +4345,8 @@ impl<'a> ReferenceFlowBuilder<'a> {
         if self.aggregate_facts.needs_scope_exit_metadata() {
             self.aggregate_facts.scope_exits.insert(scope_exit, ordinal);
         }
-        if scope == ReferenceScopeId(0) && region.final_outputs().next().is_some() {
-            let return_span = ByteSpan::new(
-                region.final_outputs().next().expect("output").span.start,
-                region.final_outputs().last().expect("output").span.end,
-            );
+        if let Some((start, end)) = return_bounds {
+            let return_span = ByteSpan::new(start, end);
             if let Some(value) = &result.scalar {
                 match value {
                     ReferenceValue::Checked(origins) => {
