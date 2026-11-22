@@ -494,9 +494,11 @@ impl IntegerReturningPath<'_> {
     }
 
     #[cfg(feature = "internal-checker")]
-    pub(super) fn contains_first_immutable_entry(&self, binding: &ReferenceBindingId, value: &BigInt) -> bool {
+    pub(super) fn covers_first_immutable_entry(
+        &self, binding: &ReferenceBindingId, lower: &BigInt, upper: &BigInt,
+    ) -> bool {
         self.axes.first().is_some_and(|axis| *axis == binding)
-            && self.state.0.iter().any(|row| row[0].contains(value))
+            && self.state.0.iter().any(|row| row[0].covers_closed(lower, upper))
     }
 
     #[cfg(feature = "internal-checker")]

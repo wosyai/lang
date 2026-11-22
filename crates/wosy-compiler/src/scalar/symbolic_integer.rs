@@ -50,6 +50,12 @@ impl IntegerRelation {
         Self { less: self.greater, equal: self.equal, greater: self.less }
     }
 
+    pub(super) fn accepts_closed(self, lower: &BigInt, upper: &BigInt, bound: &BigInt) -> bool {
+        (self.less || lower >= bound)
+            && (self.equal || bound < lower || bound > upper)
+            && (self.greater || upper <= bound)
+    }
+
     pub(super) fn accepts(self, comparison: Ordering) -> bool {
         match comparison {
             Ordering::Less => self.less,
@@ -89,6 +95,12 @@ impl IntegerSet {
         self.0.iter().any(|interval| &interval.first <= value && value <= &interval.last)
     }
 
+    #[cfg(feature = "internal-checker")]
+    pub(super) fn covers_closed(&self, lower: &BigInt, upper: &BigInt) -> bool {
+        let next = self.0.partition_point(|range| &range.last < lower);
+        self.0.get(next).is_some_and(|range| &range.first <= lower && upper <= &range.last)
+    }
+
     pub(super) fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
@@ -105,11 +117,7 @@ impl IntegerSet {
     }
 
     pub(super) fn every(&self, relation: IntegerRelation, bound: &BigInt) -> bool {
-        self.0.iter().all(|interval| {
-            (relation.less || &interval.first >= bound)
-                && (relation.equal || bound < &interval.first || bound > &interval.last)
-                && (relation.greater || &interval.last <= bound)
-        })
+        self.0.iter().all(|interval| relation.accepts_closed(&interval.first, &interval.last, bound))
     }
 
     pub(super) fn split(&self, operator: &BinaryOperator, bound: &BigInt) -> Option<(Self, Self)> {

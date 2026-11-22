@@ -1080,6 +1080,36 @@ fn named_proof_peer_use_checks_exact_singleton_where_subsets_without_filling_hol
 }
 
 #[test]
+fn named_proof_peer_use_checks_a_closed_interval_in_one_returned_entry_row() {
+    let identity = source();
+    let check = |leaf_where: &str, caller_where: &str, goal: &str| {
+        check_scalar_module_proof(
+            identity.clone(), "consumer",
+            vec![ScalarProofModuleInput {
+                source: identity.clone(),
+                text: format!(r#"%%start
+                    i16(i16) fixed = fn(value) {{ if (value < 0) {{ 7 }} else {{ 7 }} }};
+                    proof leaf for fixed(input) -> (out) where ({leaf_where}) ensures (out == 7) {{}}
+                    proof consumer for fixed(entry) -> (out) where ({caller_where}) ensures ({goal}) {{
+                        core.use(leaf(entry));
+                    }}
+                %%end"#),
+                namespaces: Vec::new(),
+            }],
+            vec![identity.clone()],
+            ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
+        )
+    };
+    assert_eq!(check("input <= 10", "entry <= -1 && entry >= -4", "out == 7"), ScalarModuleProofOutcome::Proved);
+    assert_eq!(check("input <= 10", "entry >= -4 && entry <= -1", "out < 7"), ScalarModuleProofOutcome::Refuted);
+    assert_eq!(check("input <= 10", "entry >= -4 && entry <= 1", "out == 7"), ScalarModuleProofOutcome::Unsupported);
+    assert_eq!(check("input <= 10", "entry >= 3 && entry <= 2", "out == 7"), ScalarModuleProofOutcome::Unsupported);
+    assert_eq!(check("input < 3 || input > 5", "entry >= 6 && entry <= 8", "out == 7"), ScalarModuleProofOutcome::Proved);
+    assert_eq!(check("input < 3 || input > 5", "entry >= 2 && entry <= 6", "out == 7"), ScalarModuleProofOutcome::Unsupported);
+    assert_eq!(check("input != 4", "entry >= 3 && entry <= 5", "out == 7"), ScalarModuleProofOutcome::Unsupported);
+}
+
+#[test]
 fn verified_bound_checks_both_ordered_typed_call_arguments_and_repeated_aliases() {
     let identity = source();
     let use_bound = |proof: &str, caller: &str, extra: &str| {
