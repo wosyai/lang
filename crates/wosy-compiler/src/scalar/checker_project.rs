@@ -2322,6 +2322,7 @@ struct UnusedPeerUse<'plan, 'project> {
     relation: IntegerRelation,
     bound: &'plan BigInt,
     strict_entry: Option<StrictPeerDomain<'plan>>,
+    implication_checked: bool,
 }
 
 #[cfg(feature = "internal-checker")]
@@ -2352,6 +2353,42 @@ enum CheckedPeerLeaf {
     Proven,
     Refuted,
     Unavailable,
+}
+
+#[cfg(feature = "internal-checker")]
+#[derive(Default)]
+struct PeerPredicateBounds<'a> {
+    first: Option<(&'a ScalarType, (BigInt, BigInt))>,
+    other: Vec<(&'a ScalarType, (BigInt, BigInt))>,
+}
+
+#[cfg(feature = "internal-checker")]
+impl<'a> PeerPredicateBounds<'a> {
+    fn bounds_for(&mut self, ty: &'a ScalarType) -> Option<&(BigInt, BigInt)> {
+        let first = &mut self.first;
+        if first.is_none() {
+            *first = Some((ty, integer_bounds(ty)?));
+        }
+        let (known, bounds) = first.as_ref()?;
+        if *known == ty {
+            return Some(bounds);
+        }
+        let slot = if let Some(slot) = self.other.iter().position(|(known, _)| *known == ty) {
+            slot
+        } else {
+            self.other.push((ty, integer_bounds(ty)?));
+            self.other.len() - 1
+        };
+        Some(&self.other[slot].1)
+    }
+
+    fn implies(
+        &mut self, ty: &'a ScalarType,
+        premise: (IntegerRelation, &BigInt), conclusion: (IntegerRelation, &BigInt),
+    ) -> bool {
+        premise == conclusion || self.bounds_for(ty).is_some_and(|(low, high)|
+            integer_predicate_implies(premise, conclusion, (low, high)))
+    }
 }
 
 #[cfg(feature = "internal-checker")]
@@ -2527,6 +2564,7 @@ impl PreparedProofModule {
                 outcomes[*index] = module_proof_outcome(plan.verify_arbitrary_with_steps());
             }
         }
+        let mut cited_bounds = PeerPredicateBounds::default();
         if !pending_peers.is_empty() {
             for (_, plan, _) in &pending_peers {
                 selected.sources.get_mut(plan.proof_source).expect("requested peer consumer source")
@@ -2562,7 +2600,7 @@ impl PreparedProofModule {
             // selected leaf's own independently checked outcome, or verify an
             // implicit leaf once in the same authored-step observer mode.
             let mut implicit_show_results = HashMap::new();
-            let mut show_bounds = Vec::<(&ScalarType, (BigInt, BigInt))>::new();
+            let integer_equality = IntegerRelation::from_operator(&BinaryOperator::Equal).expect("checked integer equality");
             for (index, plan, requested, strict_entry) in admitted_roots {
                 let Some(leaf) = graph.terminal(requested) else { continue; };
                 let Some((relation, bound)) = leaf.peer_literal_goal() else { continue; };
@@ -2572,28 +2610,13 @@ impl PreparedProofModule {
                     }
                     let TypedProofGoal::Literal { relation: requested_relation, bound: requested, .. } =
                         &plan.typed.goal else { continue; };
-                    let equality = Some(relation) == IntegerRelation::from_operator(&BinaryOperator::Equal);
-                    if !equality {
-                        let premise = (relation, bound);
-                        let conclusion = (*requested_relation, requested);
-                        // A failed implication is a negative admission filter.
-                        // A successful one is not authority until the leaf
-                        // independently proves every show and its ensures.
-                        let implies = premise == conclusion || {
-                            let ty = plan.typed.result_type;
-                            let slot = if let Some(slot) = show_bounds.iter().position(|(known, _)| *known == ty) {
-                                slot
-                            } else {
-                                let Some(bounds) = integer_bounds(ty) else { continue; };
-                                show_bounds.push((ty, bounds));
-                                show_bounds.len() - 1
-                            };
-                            let (low, high) = &show_bounds[slot].1;
-                            integer_predicate_implies(premise, conclusion, (low, high))
-                        };
-                        if !implies {
-                            continue;
-                        }
+                    let equality = relation == integer_equality;
+                    // A failed implication is a negative admission filter.
+                    // It never grants authority on its own.
+                    if !equality && !cited_bounds.implies(
+                        plan.typed.result_type, (relation, bound), (*requested_relation, requested),
+                    ) {
+                        continue;
                     }
                     let verified = if let Some(selected_leaf) = selected.request(leaf.proof_source, leaf.name) {
                         matches!(outcomes[*selected_leaf], ScalarModuleProofOutcome::Proved)
@@ -2611,9 +2634,23 @@ impl PreparedProofModule {
                     }
                     continue;
                 }
+                // An incompatible strict citation always yields Unsupported,
+                // even if the broader leaf has no returning inputs. Exact
+                // contexts must still observe the leaf's applicability.
+                let implication_checked = strict_entry.is_some() && relation != integer_equality
+                    && selected.request(leaf.proof_source, leaf.name).is_none();
+                if implication_checked {
+                    let TypedProofGoal::Literal { relation: requested_relation, bound: requested, .. } =
+                        &plan.typed.goal else { continue; };
+                    if !cited_bounds.implies(
+                        plan.typed.result_type, (relation, bound), (*requested_relation, requested),
+                    ) {
+                        continue;
+                    }
+                }
                 let leaf_guard = ExactGuardGroup(leaf.filter.as_deref());
                 arbitrary_groups.entry((plan.target, leaf_guard)).or_default().peer_uses.push(UnusedPeerUse {
-                    index, consumer: plan, name: leaf.name, relation, bound, strict_entry,
+                    index, consumer: plan, name: leaf.name, relation, bound, strict_entry, implication_checked,
                 });
             }
         }
@@ -2625,11 +2662,11 @@ impl PreparedProofModule {
                 continue;
             }
             let mut peers = HashMap::new();
-            for UnusedPeerUse { index, consumer, name, relation, bound, strict_entry } in group.peer_uses {
+            for UnusedPeerUse { index, consumer, name, relation, bound, strict_entry, implication_checked } in group.peer_uses {
                 let identity = (consumer.proof_source, name);
                 let (_, _, uses): &mut (_, _, Vec<_>) = peers.entry(identity)
                     .or_insert_with(|| (relation, bound, Vec::new()));
-                uses.push((index, consumer, strict_entry));
+                uses.push((index, consumer, strict_entry, implication_checked));
             }
             match observe_unused_module_proof_returns(body, guard.0) {
                 Some(Ok(ProofCoverage::Applicable(paths))) => {
@@ -2637,21 +2674,17 @@ impl PreparedProofModule {
                     let mut first_strict_entry = None;
                     let mut other_strict_entries = HashMap::new();
                     let equality = IntegerRelation::from_operator(&BinaryOperator::Equal).expect("checked integer equality");
-                    let mut finite_output_bounds = None;
                     for (identity, (relation, bound, consumers)) in peers {
                         let proof = paths.iter().map(|path| path.output_satisfies(relation, bound))
                             .find(|holds| *holds != Some(true)).unwrap_or(Some(true));
                         let checked = if proof == Some(true) {
-                            for (index, consumer, strict_entry) in consumers {
+                            for (index, consumer, strict_entry, implication_checked) in consumers {
                                 let TypedProofGoal::Literal { relation: requested_relation, bound: requested, .. } =
                                     &consumer.typed.goal else { continue; };
-                                if relation != equality {
+                                if relation != equality && !implication_checked {
                                     let premise = (relation, bound);
                                     let conclusion = (*requested_relation, requested);
-                                    let implied = premise == conclusion || finite_output_bounds
-                                        .get_or_insert_with(|| integer_bounds(consumer.typed.result_type))
-                                        .as_ref().is_some_and(|(low, high)|
-                                            integer_predicate_implies(premise, conclusion, (low, high)));
+                                    let implied = cited_bounds.implies(consumer.typed.result_type, premise, conclusion);
                                     if !implied {
                                         continue; // No theorem to apply; don't inspect or memoize return membership.
                                     }
@@ -2736,7 +2769,7 @@ impl PreparedProofModule {
                         outcomes[index] = ScalarModuleProofOutcome::NoApplicableInputs;
                     }
                     for (_, _, consumers) in peers.into_values() {
-                        for (index, _, strict_entry) in consumers {
+                        for (index, _, strict_entry, _) in consumers {
                             if strict_entry.is_none() {
                                 outcomes[index] = ScalarModuleProofOutcome::NoApplicableInputs;
                             }
@@ -5876,6 +5909,8 @@ mod tests {
             proof leaf for echo(input) -> (out) where (input < 8) ensures (out < 8) {}
             proof narrower for echo(entry) -> (out) where (entry == 6) ensures (out == 6) { core.use(leaf(entry)); }
             proof weaker for echo(entry) -> (out) where (entry == 6) ensures (out <= 7) { core.use(leaf(entry)); }
+            proof empty_leaf for echo(input) -> (out) where (false) ensures (out < 8) {}
+            proof empty_exact for echo(entry) -> (out) where (false) ensures (out == 6) { core.use(empty_leaf(entry)); }
         %%end"#;
         let _ = take_integer_observations();
         let _ = STRICT_PEER_ENTRY_CHECKS.with(|count| count.replace(0));
@@ -5884,6 +5919,17 @@ mod tests {
             vec![ScalarProofModuleInput { source: file.clone(), text: text.into(), namespaces: Vec::new() }],
             vec![file.clone()], inputs(),
         ).unwrap();
+        assert_eq!(run(&["narrower"]), [ScalarModuleProofOutcome::Unsupported]);
+        assert_eq!(STRICT_PEER_ENTRY_CHECKS.with(|count| count.replace(0)), 0);
+        assert_eq!(take_integer_observations(), (0, 0));
+        assert_eq!(run(&["narrower", "weaker"]), [
+            ScalarModuleProofOutcome::Unsupported, ScalarModuleProofOutcome::Proved,
+        ]);
+        assert_eq!(STRICT_PEER_ENTRY_CHECKS.with(|count| count.replace(0)), 1);
+        assert_eq!(take_integer_observations(), (1, 0));
+        assert_eq!(run(&["empty_exact"]), [ScalarModuleProofOutcome::NoApplicableInputs]);
+        assert_eq!(STRICT_PEER_ENTRY_CHECKS.with(|count| count.replace(0)), 0);
+        assert_eq!(take_integer_observations(), (1, 0));
         assert_eq!(run(&["narrower", "leaf"]), [
             ScalarModuleProofOutcome::Unsupported, ScalarModuleProofOutcome::Proved,
         ]);
