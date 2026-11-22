@@ -5421,6 +5421,47 @@ fn deferred_local_owner_store(
         && pending.sites.last().is_some_and(|site| site.point < point.id)
 }
 
+fn exact_pending_reborrow_read(
+    read: &ReferenceFlowPoint,
+    borrow: &ReferenceFlowPoint,
+    binding: &ReferenceBindingId,
+) -> bool {
+    read.id < borrow.id
+        && read.scope == borrow.scope
+        && read.successors.as_slice() == [borrow.id]
+        && matches!(&read.kind, CfgPointKind::Read { binding: actual } if actual == binding)
+}
+
+#[cfg(test)]
+#[test]
+fn prepared_deferred_reborrow_requires_the_exact_read_edge() {
+    let source = SourceIdentity::new("project".into(), "package".into(), "metadata".into(), "r1".into());
+    let span = ByteSpan::new(0, 10);
+    let binding = ReferenceBindingId {
+        source: source.clone(), function_span: span, block_span: span,
+        declaration_span: ByteSpan::new(1, 2), kind: ReferenceBindingKind::Declared,
+    };
+    let substitute = ReferenceBindingId { declaration_span: ByteSpan::new(2, 3), ..binding.clone() };
+    let borrow = ReferenceFlowPoint {
+        id: CfgPointId(2), kind: CfgPointKind::Evaluate(ScalarExpression::Boolean { value: true, span }),
+        source_span: SourceSpan::new(source, span), scope: ReferenceScopeId(1),
+        possible_origins: None, successors: Vec::new(),
+    };
+    let mut read = ReferenceFlowPoint {
+        id: CfgPointId(1), kind: CfgPointKind::Read { binding: binding.clone() },
+        successors: vec![borrow.id], ..borrow.clone()
+    };
+    assert!(exact_pending_reborrow_read(&read, &borrow, &binding));
+    assert!(!exact_pending_reborrow_read(&read, &borrow, &substitute));
+    read.scope = ReferenceScopeId(2);
+    assert!(!exact_pending_reborrow_read(&read, &borrow, &binding));
+    read.scope = borrow.scope;
+    read.successors.push(CfgPointId(3));
+    assert!(!exact_pending_reborrow_read(&read, &borrow, &binding));
+    read.successors = vec![CfgPointId(3)];
+    assert!(!exact_pending_reborrow_read(&read, &borrow, &binding));
+}
+
 fn contains_loan_site(binding: &ReferenceBindingId, point: &ReferenceFlowPoint) -> bool {
     let site = point.source_span.range;
     binding.block_span.start <= site.start && site.end <= binding.block_span.end
@@ -5921,18 +5962,17 @@ fn transfer_reference_facts(
         });
         let selected_parent = pending_here.and_then(|(pending, site)| {
             let (root, root_loan) = deferred_reborrow_fact(pending, cfg.facts)?;
+            let read = original_points.get(site.read.0)?;
+            let borrow = &original_points[id.0];
             let Some((producer, holder)) = site.parent else {
-                return Some((pending.origin, &pending.handle));
+                return exact_pending_reborrow_read(read, borrow, &pending.handle)
+                    .then_some((pending.origin, &pending.handle));
             };
-            let read = &original_points[site.read.0];
             let declaration = &original_points[holder.0];
-            let borrow = &original_points[site.point.0];
             let CfgPointKind::Bind { binding } = &declaration.kind else { return None };
             if producer >= holder || holder >= site.read
-                || read.successors.as_slice() != [site.point]
-                || read.scope != borrow.scope
+                || !exact_pending_reborrow_read(read, borrow, binding)
                 || !contains_loan_site(binding, borrow)
-                || !matches!(&read.kind, CfgPointKind::Read { binding: read_binding } if read_binding == binding)
                 || child_holders.get(binding).copied() != Some(producer)
             {
                 return None;
