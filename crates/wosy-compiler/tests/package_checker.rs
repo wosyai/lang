@@ -1,9 +1,9 @@
 #![cfg(feature = "internal-checker")]
 
 use wosy_compiler::{
-    check_scalar_module_proof, check_scalar_module_proofs, check_scalar_package, derive_scalar_declarations_from_cst, parse_source, prepare_scalar_project,
+    check_loaded_scalar_module_proof_call, check_scalar_module_proof, check_scalar_module_proofs, check_scalar_package, derive_scalar_declarations_from_cst, parse_source, prepare_scalar_project,
     ScalarCheckerOperation, ScalarCheckerOutcome, ScalarCheckerScope, ScalarNamespaceBinding,
-    ScalarModuleProofOutcome, ScalarPreparationInputs, ScalarProofModuleInput, ScalarTargetLayout,
+    ScalarModuleProofOutcome, ScalarProofCallOutcome, ScalarPreparationInputs, ScalarProofModuleInput, ScalarTargetLayout,
 };
 use wosy_syntax::SourceIdentity;
 
@@ -674,4 +674,97 @@ fn named_proof_batch_preserves_order_applicability_and_independent_outcomes() {
         Vec::new(),
         ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
     ), Ok(Vec::new()));
+}
+
+#[test]
+fn verified_module_bound_is_used_only_for_the_selected_canonical_call_and_all_guards() {
+    let identity = source();
+    let text = |initialization: &str| format!(r#"%%start
+        u8(u8) producer = fn(value) {{ value }};
+        u8(u8) other = fn(value) {{ value }};
+        unit() accepted = fn {{
+            u8 input = 7;
+            u8 value = producer(input);
+            core.require(value <= 10, {OUTPUT});
+        }};
+        unit() insufficient = fn {{
+            u8 value = producer(7);
+            core.require(value < 7, {OUTPUT});
+        }};
+        unit() excluded = fn {{
+            u8 value = producer(3);
+            core.require(value <= 10, {OUTPUT});
+        }};
+        unit(u8) partial = fn(input) {{
+            u8 value = producer(input);
+            core.require(value <= 10, {OUTPUT});
+        }};
+        unit() wrong_target = fn {{
+            u8 value = other(7);
+            core.require(value <= 10, {OUTPUT});
+        }};
+        unit() extra = fn {{
+            u8 value = producer(7);
+            core.require(value <= 10, {OUTPUT});
+            core.require(true, {OUTPUT});
+        }};
+        proof cap for producer(input) -> (out) where (input > 4 && input <= 10) ensures (out <= 10) {{}}
+        proof false_claim for producer(input) -> (out) where (input <= 10) ensures (out < 10) {{}}
+        proof empty for producer(input) -> (out) where (false) ensures (out <= 10) {{}}
+        proof steps for producer(input) -> (out) where (input <= 10) ensures (out <= 10) {{
+            if (input > 10) {{ core.show(out == 10); }} else {{ core.show(out == input); }}
+        }}
+        {initialization}
+    %%end"#);
+    let use_bound = |proof: &str, caller: &str, initialization: &str| {
+        let (_, catalog) = wosy_compiler::parse_proof_source(identity.clone(), text(initialization), &[])
+            .ok().expect("valid proof syntax");
+        check_loaded_scalar_module_proof_call(
+            (&identity, proof), (&identity, caller), Vec::new(), (catalog, Vec::new()),
+            vec![identity.clone()], ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
+        )
+    };
+    assert_eq!(use_bound("cap", "accepted", ""), ScalarProofCallOutcome::Established);
+    assert_eq!(use_bound("cap", "insufficient", ""), ScalarProofCallOutcome::NotEstablished);
+    for (proof, caller, initialization) in [
+        ("cap", "excluded", ""),
+        ("cap", "partial", ""),
+        ("cap", "wrong_target", ""),
+        ("cap", "extra", ""),
+        ("cap", "absent", ""),
+        ("absent", "accepted", ""),
+        ("false_claim", "accepted", ""),
+        ("empty", "accepted", ""),
+        ("steps", "accepted", ""),
+        ("cap", "accepted", "u8 reached = producer(7);"),
+        ("cap", "accepted", "accepted();"),
+    ] {
+        assert_eq!(use_bound(proof, caller, initialization), ScalarProofCallOutcome::Unavailable, "{proof}/{caller}/{initialization}");
+    }
+}
+
+#[test]
+fn verified_module_bound_cannot_be_issued_for_an_unvisited_proof_source() {
+    let app = source();
+    let hidden = SourceIdentity::new("local".into(), "demo".into(), "src/disconnected.w".into(), "phase4".into());
+    let base = parse_source(app.clone(), "%%start\nbool unused = false;\n%%end".into(), &[]);
+    assert!(base.diagnostics.is_empty());
+    let (_, proof) = wosy_compiler::parse_proof_source(
+        hidden.clone(),
+        format!(r#"%%start
+            u8(u8) producer = fn(input) {{ input }};
+            unit() caller = fn {{
+                u8 value = producer(7);
+                core.require(value <= 10, {OUTPUT});
+            }};
+            proof cap for producer(input) -> (out) where (input <= 10) ensures (out <= 10) {{}}
+        %%end"#),
+        &[],
+    ).ok().expect("valid disconnected proof syntax");
+    assert_eq!(check_loaded_scalar_module_proof_call(
+        (&hidden, "cap"), (&hidden, "caller"),
+        vec![(derive_scalar_declarations_from_cst(base.result.canonical_cst()), Vec::new())],
+        (proof, Vec::new()), vec![app, hidden.clone()],
+        ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
+    ), ScalarProofCallOutcome::Unavailable);
 }

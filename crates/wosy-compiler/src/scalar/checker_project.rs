@@ -9,13 +9,13 @@ use super::{
     checker_flow::{
         check_integer_requirement_activity, check_integer_requirements_at_entry, check_integer_return_bound_with_shows, concrete_integer_literal, exact_integer_call_argument,
         exact_integer_return_at_entry, ActualCallResult, CheckerPredicate, ExactIntegerArgument,
-        IntegerBranchProof, IntegerCheckFailure, IntegerComparison, IntegerInputs, IntegerReturn, ProofCoverage,
+        proves_requirement_with_imported_root_local, ImportedLocal, IntegerBranchProof, IntegerCheckFailure, IntegerComparison, IntegerInputs, IntegerReturn, ProofCoverage,
     },
     control::{BindingInitialization, BlockItemKind, CheckedCallSignature, ConditionalRegion, InitializationName, InitializationStorage, ModuleInitializationCallTarget, ModuleInitializationDetail, ModuleInitializationStepKind, ModuleInitializationTopology, NamespaceTarget},
     derive_block, derive_expression, project_from_declarations,
-    reference::{CheckerTargetQuery, DirectDestinationIdentity, FunctionCallSites, OccurrenceOrdinal, OccurrenceStructure, ProjectCallSiteResults, ResolvedCheckerTarget},
+    reference::{CheckerIntegerCallOrigin, CheckerTargetQuery, DirectDestinationIdentity, FunctionCallSites, OccurrenceOrdinal, OccurrenceStructure, ProjectCallSiteResults, ResolvedCheckerTarget},
     static_calls::prepare_project_occurrences,
-    symbolic_integer::IntegerRelation,
+    symbolic_integer::{IntegerRelation, IntegerSet},
     typecheck::{integer_literal_fits_type, is_integer_type, typecheck_proof_where},
     typecheck_scalar_project_in_mode, ByteSpan, ConcreteCallSelection, ReferenceBindingId, ResolvedCallTarget,
     BinaryOperator, ScalarBlock, ScalarBlockItem, ScalarExpression, ScalarFunction, ScalarItem, ScalarModule, ScalarNamespaceBinding, ScalarPreparationInputs,
@@ -24,9 +24,8 @@ use super::{
 #[cfg(test)]
 use super::{
     checker_flow::{
-        check_integer_requirements, check_integer_return_bound, check_integer_return_bound_where, proves_requirement_with_imported_root_local, ImportedLocal,
+        check_integer_requirements, check_integer_return_bound, check_integer_return_bound_where,
     },
-    symbolic_integer::IntegerSet,
 };
 #[cfg(feature = "internal-checker")]
 use super::checker_flow::observe_arbitrary_integer_returns;
@@ -747,7 +746,6 @@ mod prepared {
 
 use prepared::prepare_checker_project;
 
-#[cfg(test)]
 fn select_checked_root<'a>(
     project: &'a ScalarProject,
     source: &SourceIdentity,
@@ -864,7 +862,6 @@ struct PreparedProofModule {
 struct SelectedModuleProof<'a> {
     node: &'a CstNode,
     function: (usize, usize, &'a ScalarFunction),
-    #[cfg(test)]
     target: &'a ResolvedCallTarget,
 }
 
@@ -1042,7 +1039,7 @@ impl PreparedProofModule {
         if source != &owner.source || *declaration_span != function.name_span {
             return Err(ProjectCheck::MissingRoot);
         }
-        Ok(SelectedModuleProof { node, function: (*module, *item, function), #[cfg(test)] target })
+        Ok(SelectedModuleProof { node, function: (*module, *item, function), target })
     }
 
     #[cfg(test)]
@@ -1129,7 +1126,7 @@ pub fn check_loaded_scalar_module_proofs(
 #[doc(hidden)]
 pub fn check_loaded_scalar_module_proof_selections(
     selections: &[(&SourceIdentity, &str)],
-    mut declarations: Vec<(ScalarSourceDeclarations, Vec<ScalarNamespaceBinding>)>,
+    declarations: Vec<(ScalarSourceDeclarations, Vec<ScalarNamespaceBinding>)>,
     proofs: Vec<(ScalarProofDeclarations, Vec<ScalarNamespaceBinding>)>,
     initialization_order: Vec<SourceIdentity>,
     inputs: ScalarPreparationInputs,
@@ -1137,6 +1134,18 @@ pub fn check_loaded_scalar_module_proof_selections(
     if selections.is_empty() {
         return Ok(Vec::new());
     }
+    let prepared = prepare_loaded_proof_project(declarations, proofs, initialization_order, inputs)
+        .map_err(|error| module_proof_outcome(Err(error)))?;
+    Ok(prepared.check_module_proof_selections(selections))
+}
+
+#[cfg(feature = "internal-checker")]
+fn prepare_loaded_proof_project(
+    mut declarations: Vec<(ScalarSourceDeclarations, Vec<ScalarNamespaceBinding>)>,
+    proofs: Vec<(ScalarProofDeclarations, Vec<ScalarNamespaceBinding>)>,
+    initialization_order: Vec<SourceIdentity>,
+    inputs: ScalarPreparationInputs,
+) -> Result<PreparedProofModule, ProjectCheck> {
     let mut catalogs = Vec::with_capacity(proofs.len());
     declarations.reserve(proofs.len());
     for (proof, namespaces) in proofs {
@@ -1144,13 +1153,146 @@ pub fn check_loaded_scalar_module_proof_selections(
         catalogs.push(ModuleProofCatalog { source: proof_declarations.source().clone(), definitions });
         declarations.push((proof_declarations, namespaces));
     }
-    let Some(root) = initialization_order.first().cloned() else {
-        return Err(ScalarModuleProofOutcome::Unsupported);
-    };
-    let prepared = PreparedProofModule::prepare_declarations(
-        root, declarations, catalogs, initialization_order, inputs,
-    ).map_err(|error| module_proof_outcome(Err(error)))?;
-    Ok(prepared.check_module_proof_selections(selections))
+    let root = initialization_order.first().cloned().ok_or(ProjectCheck::MissingRoot)?;
+    PreparedProofModule::prepare_declarations(root, declarations, catalogs, initialization_order, inputs)
+}
+
+#[cfg(feature = "internal-checker")]
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ScalarProofCallOutcome {
+    Established,
+    NotEstablished,
+    Unavailable,
+}
+
+#[cfg(feature = "internal-checker")]
+#[doc(hidden)]
+pub fn check_loaded_scalar_module_proof_call(
+    proof: (&SourceIdentity, &str),
+    caller: (&SourceIdentity, &str),
+    declarations: Vec<(ScalarSourceDeclarations, Vec<ScalarNamespaceBinding>)>,
+    catalog: (ScalarProofDeclarations, Vec<ScalarNamespaceBinding>),
+    initialization_order: Vec<SourceIdentity>,
+    inputs: ScalarPreparationInputs,
+) -> ScalarProofCallOutcome {
+    let result = prepare_loaded_proof_project(declarations, vec![catalog], initialization_order, inputs)
+        .ok()
+        .and_then(|prepared| production_bound_reuse::apply(&prepared, proof, caller));
+    result.unwrap_or(ScalarProofCallOutcome::Unavailable)
+}
+
+#[cfg(feature = "internal-checker")]
+mod production_bound_reuse {
+    use super::*;
+
+    struct VerifiedModuleBound<'a> {
+        issuer: &'a PreparedProofModule,
+        proof_identity: (&'a SourceIdentity, ByteSpan, &'a str),
+        canonical_target: &'a ResolvedCallTarget,
+        target_layout: ScalarTargetLayout,
+        parameter: &'a ScalarType,
+        output: &'a ScalarType,
+        guard: ActualSingleIntegerGuard<'a>,
+        values: IntegerSet,
+    }
+
+    pub(super) fn apply(
+        project: &PreparedProofModule,
+        (source, name): (&SourceIdentity, &str),
+        (caller_source, caller_name): (&SourceIdentity, &str),
+    ) -> Option<ScalarProofCallOutcome> {
+        let plan = project.plan_module_proof(source, name).ok()?;
+        let (scalar, calls) = project.prepared.parts();
+        let caller = select_checked_root(scalar, caller_source, caller_name).ok()?;
+        let (root, ordinals) = package_initialization_order(scalar).ok()?;
+        let initialization = check_package_initialization_with_order(&project.prepared, root, ordinals).ok()?;
+        let &venue = initialization.ordinals.get(plan.proof_source)?;
+        if initialization.visits[venue] != InitializationVisit::Completed
+            || initialization.visits[plan.target.0] != InitializationVisit::Completed
+            || initialization.visits[caller.0] != InitializationVisit::Completed
+            || initialization.reached.contains(&plan.target)
+            || initialization.reached.contains(&(caller.0, caller.1))
+            || (caller.0, caller.1) == plan.target
+        {
+            return None;
+        }
+
+        let body = calls.function_body(caller.0, caller.1, None)?;
+        let (position, origin) = root_local_import_requirement(body)?;
+        if !caller.2.generic_parameters.is_empty() || !caller.2.overload_arms.is_empty()
+            || !body.allocation_length_calls.is_empty()
+            || !matches!(body.call_occurrences.as_slice(), [call] if call.ordinal == origin.call)
+            || body.structure.checker_directives.len() != 1
+        {
+            return None;
+        }
+        let site = body.resolved_call_site(origin.call)?;
+        let signature = body.checked_call_signatures.get(&origin.call)?;
+        let identity = (plan.proof_source, wosy_syntax::byte_span(plan.proof), name);
+        let verified = VerifiedModuleBound::establish(project, &plan, identity)?;
+        verified.consume(project, identity, scalar.modules[caller.0].target_layout, body, position, origin, &site.target, signature)
+    }
+
+    impl<'a> VerifiedModuleBound<'a> {
+        fn establish(
+            issuer: &'a PreparedProofModule,
+            plan: &'a PlannedModuleProof<'_>,
+            proof_identity: (&'a SourceIdentity, ByteSpan, &'a str),
+        ) -> Option<Self> {
+            let body = plan.typed.body;
+            if !plan.steps.items.is_empty() || !valid_arbitrary_proof_body(body) {
+                return None;
+            }
+            let [parameter] = body.boundary.parameters.as_slice() else { return None; };
+            let [output] = body.boundary.results.as_slice() else { return None; };
+            if output.ordinal != 0 {
+                return None;
+            }
+            let guard = actual_single_integer_guard(body, plan.filter.as_deref().unwrap_or_default())?;
+            let ProofCoverage::Applicable(paths) = observe_arbitrary_integer_returns(body, plan.filter.as_deref())?.ok()? else {
+                return None;
+            };
+            if !paths.iter().all(|path| path.output_satisfies(plan.relation, &plan.typed.bound) == Some(true)) {
+                return None;
+            }
+            let values = IntegerSet::from_type(&output.ty)?.keep(&plan.typed.operator, &plan.typed.bound)?;
+            Some(Self {
+                issuer, proof_identity, canonical_target: plan.canonical_target,
+                target_layout: plan.typed.target.target_layout,
+                parameter: &parameter.ty, output: &output.ty, guard, values,
+            })
+        }
+
+        fn consume(
+            self,
+            issuer: &PreparedProofModule,
+            identity: (&SourceIdentity, ByteSpan, &str),
+            caller_layout: ScalarTargetLayout,
+            body: &FunctionCallSites,
+            position: usize,
+            origin: &CheckerIntegerCallOrigin,
+            target: &ResolvedCallTarget,
+            signature: &CheckedCallSignature,
+        ) -> Option<ScalarProofCallOutcome> {
+            let [parameter] = signature.parameters.as_slice() else { return None; };
+            let [output] = signature.outputs.outputs.as_slice() else { return None; };
+            if !std::ptr::eq(self.issuer, issuer) || self.proof_identity != identity
+                || self.canonical_target != target || self.target_layout != caller_layout
+                || self.parameter != parameter || self.output != &output.ty
+                || body.structure.checked_types.expressions.get(&origin.argument_ordinal) != Some(parameter)
+                || self.guard.always_rejects
+            {
+                return None;
+            }
+            let fact = ImportedLocal { position, values: self.values, guards: self.guard.comparisons };
+            Some(if proves_requirement_with_imported_root_local(body, fact)? {
+                ScalarProofCallOutcome::Established
+            } else {
+                ScalarProofCallOutcome::NotEstablished
+            })
+        }
+    }
 }
 
 #[cfg(feature = "internal-checker")]
@@ -1190,6 +1332,8 @@ impl Hash for ExactGuardGroup<'_> {
 #[cfg(feature = "internal-checker")]
 struct PlannedModuleProof<'a> {
     proof_source: &'a SourceIdentity,
+    proof: &'a CstNode,
+    canonical_target: &'a ResolvedCallTarget,
     target: (usize, usize),
     typed: TypedProofPostcondition<'a>,
     steps: ScalarBlock,
@@ -1209,7 +1353,7 @@ impl PreparedProofModule {
             proof.node, proof_source, typed.target.target_layout, &typed.input_names, typed.body,
         )?;
         let relation = IntegerRelation::from_operator(&typed.operator).ok_or(ProjectCheck::Unsupported)?;
-        Ok(PlannedModuleProof { proof_source, target: (module, item), typed, steps, filter, relation })
+        Ok(PlannedModuleProof { proof_source, proof: proof.node, canonical_target: proof.target, target: (module, item), typed, steps, filter, relation })
     }
 
     fn check_module_proofs(&self, proof_names: &[&str]) -> Vec<ScalarModuleProofOutcome> {
@@ -1741,6 +1885,43 @@ fn apply_verified_return_bound(
         return None;
     }
     let body = calls.function_body(module, item, None)?;
+    let (position, origin) = root_local_import_requirement(body)?;
+    let structure = &body.structure;
+    let site = body.resolved_call_site(origin.call)?;
+    let signature = body.checked_call_signatures.get(&origin.call)?;
+    let [parameter] = signature.parameters.as_slice() else {
+        return None;
+    };
+    let [output] = signature.outputs.outputs.as_slice() else {
+        return None;
+    };
+    if site.target != verified.target
+        || signature.parameters != verified.parameters
+        || verified.output_slot != 0
+        || output.ty != verified.output_type
+        || structure.checked_types.expressions.get(&origin.argument_ordinal)? != parameter
+    {
+        return None;
+    }
+    let mut guards = Vec::new();
+    for guard in &verified.guards {
+        match guard {
+            VerifiedEntryGuard::Boolean(true) => {}
+            VerifiedEntryGuard::Integer { slot: 0, ty, operator, bound } if ty == parameter =>
+                guards.push((IntegerRelation::from_operator(operator)?, bound)),
+            _ => return None,
+        }
+    }
+    let values = IntegerSet::from_type(&verified.output_type)?.keep(&verified.operator, &verified.bound)?;
+    let imported = ImportedLocal { position, values, guards };
+    Some(if proves_requirement_with_imported_root_local(body, imported)? {
+        ImportedRequirement::Proved
+    } else {
+        ImportedRequirement::NotEstablished
+    })
+}
+
+fn root_local_import_requirement(body: &FunctionCallSites) -> Option<(usize, &CheckerIntegerCallOrigin)> {
     let structure = &body.structure;
     let root = structure.root;
     let items = &structure.blocks.get(root.0)?.items;
@@ -1764,40 +1945,10 @@ fn apply_verified_return_bound(
         return None;
     };
     let origin = structure.checker_integer_call_locals.get(&(root, binding_item.position))?;
-    let site = body.resolved_call_site(origin.call)?;
-    let signature = body.checked_call_signatures.get(&origin.call)?;
-    let [parameter] = signature.parameters.as_slice() else {
-        return None;
-    };
-    let [output] = signature.outputs.outputs.as_slice() else {
-        return None;
-    };
-    if directive.operation != CheckerOperation::Require
-        || predicate.binding != origin.binding
-        || site.target != verified.target
-        || signature.parameters != verified.parameters
-        || verified.output_slot != 0
-        || output.ty != verified.output_type
-        || structure.checked_types.expressions.get(&origin.argument_ordinal)? != parameter
-    {
+    if directive.operation != CheckerOperation::Require || predicate.binding != origin.binding {
         return None;
     }
-    let mut guards = Vec::new();
-    for guard in &verified.guards {
-        match guard {
-            VerifiedEntryGuard::Boolean(true) => {}
-            VerifiedEntryGuard::Integer { slot: 0, ty, operator, bound } if ty == parameter =>
-                guards.push((IntegerRelation::from_operator(operator)?, bound)),
-            _ => return None,
-        }
-    }
-    let values = IntegerSet::from_type(&verified.output_type)?.keep(&verified.operator, &verified.bound)?;
-    let imported = ImportedLocal { position: binding_item.position, values, guards };
-    Some(if proves_requirement_with_imported_root_local(body, imported)? {
-        ImportedRequirement::Proved
-    } else {
-        ImportedRequirement::NotEstablished
-    })
+    Some((binding_item.position, origin))
 }
 
 fn pure_proof_input_expression(expression: &ScalarExpression) -> bool {
