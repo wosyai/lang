@@ -6365,7 +6365,7 @@ fn transfer_reference_facts(
         )
     });
     let mut forward_cursor = 0;
-    let mut forward_single_observation = strictly_forward.then(|| vec![false; cfg.points.len()]);
+    let mut forward_single_observation = None;
     let ordinary_forward = strictly_forward && pending.is_none() && descriptor.is_none();
     let mut errors = Vec::new();
     let mut pending_sites = pending.map_or(&[][..], |pending| pending.sites.as_slice()).iter().peekable();
@@ -6386,12 +6386,11 @@ fn transfer_reference_facts(
             .and_then(|_| original_points[id.0].successors.iter().copied().min());
         let states = std::mem::take(&mut incoming[id.0]);
         let keep_in_place = keep_forward_point_in_place(&original_points[id.0].kind, ordinary_forward, states.len());
-        if let Some(single_observation) = &mut forward_single_observation {
-            if matches!(&original_points[id.0].kind, CfgPointKind::MoveThrough { place, .. }
+        if strictly_forward && states.len() == 1
+            && matches!(&original_points[id.0].kind, CfgPointKind::MoveThrough { place, .. }
                 if !matches!(place, ScalarPlace::Dereference { .. }))
-            {
-                single_observation[id.0] = states.len() == 1;
-            }
+        {
+            forward_single_observation.get_or_insert_with(|| vec![false; cfg.points.len()])[id.0] = true;
         }
         let pending_here = pending.and_then(|pending| {
             let site = if strictly_forward {
