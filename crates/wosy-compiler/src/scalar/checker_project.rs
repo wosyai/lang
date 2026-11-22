@@ -1894,6 +1894,38 @@ struct TypedProofPostcondition<'a> {
     goal: TypedProofGoal,
 }
 
+type TypedEntryMeasure<'a> = (&'a super::reference::ParameterSlot, &'a ReferenceBindingId);
+
+fn typed_proof_decreases<'a>(
+    declaration: &CstNode,
+    input_names: &[String],
+    body: &'a FunctionCallSites,
+) -> Result<Option<TypedEntryMeasure<'a>>, ProjectCheck> {
+    let Some(clause) = declaration.children().find(|node| node.kind() == SyntaxKind::ProofDecreases) else {
+        return Ok(None);
+    };
+    let mut expressions = clause.children().filter(|node| node.kind() == SyntaxKind::Expression);
+    let expression = expressions.next().ok_or(ProjectCheck::InvalidProof)?;
+    if expressions.next().is_some() {
+        return Err(ProjectCheck::Unsupported);
+    }
+    let ScalarExpression::Name { name, .. } = derive_expression(&expression) else {
+        return Err(ProjectCheck::Unsupported);
+    };
+    let slot = input_names.iter().position(|input| *input == name).ok_or(ProjectCheck::InvalidProof)?;
+    let parameter = body.boundary.parameters.get(slot).ok_or(ProjectCheck::InvalidProof)?;
+    if !is_integer_type(&parameter.ty) {
+        return Err(if matches!(parameter.ty, ScalarType::F32 | ScalarType::F64) {
+            ProjectCheck::Unsupported
+        } else {
+            ProjectCheck::InvalidProof
+        });
+    }
+    let binding = body.boundary.checker_parameter_bindings.as_deref()
+        .and_then(|bindings| bindings.get(slot)).ok_or(ProjectCheck::Unsupported)?;
+    Ok(Some((parameter, binding)))
+}
+
 fn typed_proof_postcondition<'a>(
     prepared: &'a PreparedCheckerProject,
     (module, item, function): (usize, usize, &'a ScalarFunction),
@@ -1921,6 +1953,9 @@ fn typed_proof_postcondition<'a>(
     let boundary = &body.boundary;
     if input_names.len() != boundary.parameters.len() || output_names.len() != boundary.results.len() {
         return Err(ProjectCheck::InvalidProof);
+    }
+    if typed_proof_decreases(declaration, &input_names, body)?.is_some() {
+        return Err(ProjectCheck::Unsupported);
     }
     let ([result], [output]) = (boundary.results.as_slice(), output_names.as_slice()) else {
         return Err(ProjectCheck::Unsupported);
@@ -2407,6 +2442,24 @@ mod tests {
     use crate::{derive_scalar_declarations_from_cst, parse_source, prepare_scalar_project, ScalarTargetLayout};
 
     const OUTPUT: &str = r#"{ .stdout = ""; .stderr = "unexpected state"; .code = 1; .files = []; }"#;
+
+    #[test]
+    fn proof_decreases_resolves_the_declared_entry_binding_and_checked_width() {
+        let file = source("src/main.w", "typed-decrease");
+        let text = r#"%%start
+            u16(u8, u16) choose = fn(first, second) { if (first == 0) {}; second };
+            proof ranked for choose(other, measure) -> (out) ensures (out <= 10) decreases (measure) {}
+        %%end"#;
+        let prepared = PreparedProofModule::prepare(file, text.into(), inputs()).unwrap();
+        let proof = prepared.select_resolved(&prepared.source, "ranked").unwrap();
+        let (module, item, _) = proof.function;
+        let body = prepared.prepared.parts().1.function_body(module, item, None).unwrap();
+        let (slot, binding) = typed_proof_decreases(proof.node, &["other".into(), "measure".into()], body)
+            .unwrap().expect("can derive the typed measure independently of trusting it");
+        assert_eq!(slot.ordinal, 1);
+        assert_eq!(slot.ty, ScalarType::U16);
+        assert_eq!(binding, &body.boundary.checker_parameter_bindings.as_deref().unwrap()[1]);
+    }
 
     #[cfg(feature = "internal-checker")]
     #[test]

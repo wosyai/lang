@@ -921,6 +921,9 @@ fn ordinary_build_erases_named_proofs_before_runtime_diagnostics_and_emits_the_s
         proof false_claim for identity(v) -> (out) ensures (out <= 10) {}
         proof bad_where for identity(v) -> (out) where (unknown <= 10) ensures (out <= 1) {}
         proof unknown_target for missing(v) -> (out) ensures (out <= 255) {}
+        proof unchecked_measure for identity(v) -> (out) ensures (out <= 255) decreases (unknown, v) {
+            core.use(unchecked_measure(v - 1));
+        }
         proof bad_literal for identity(v) -> (out) ensures (out <= 255) {
             core.show(out == 1__0);
         }

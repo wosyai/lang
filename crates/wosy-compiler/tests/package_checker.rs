@@ -1228,3 +1228,30 @@ fn observed_entry_comparison_does_not_supply_a_reusable_module_bound() {
         vec![identity.clone()], ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
     ), ScalarProofCallOutcome::Unavailable);
 }
+
+#[test]
+fn proof_decreases_is_typed_but_does_not_admit_unchecked_induction() {
+    let identity = source();
+    let check_rank = |clause: &str, steps: &str| {
+        check_scalar_module_proof(
+            identity.clone(),
+            "ranked",
+            vec![ScalarProofModuleInput {
+                source: identity.clone(),
+                text: format!(r#"%%start
+                    u16(u16) state = fn(value) {{ value }};
+                    proof ranked for state(entry) -> (out) where (entry <= 7)
+                        ensures (out <= 7) {clause} {{ {steps} }}
+                %%end"#),
+                namespaces: Vec::new(),
+            }],
+            vec![identity.clone()],
+            ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
+        )
+    };
+    assert_eq!(check_rank("", ""), ScalarModuleProofOutcome::Proved);
+    assert_eq!(check_rank("decreases (entry)", "core.use(ranked(entry - 1));"), ScalarModuleProofOutcome::Unsupported);
+    assert_eq!(check_rank("decreases (entry, entry)", ""), ScalarModuleProofOutcome::Unsupported);
+    assert!(matches!(check_rank("decreases (out)", ""), ScalarModuleProofOutcome::Invalid(_)));
+    assert!(matches!(check_rank("decreases (missing)", ""), ScalarModuleProofOutcome::Invalid(_)));
+}
