@@ -2061,7 +2061,9 @@ impl SymbolicRootProof for SelectedSymbolicProof<'_, '_> {
                     return Err(ProjectCheck::Unsupported);
                 }
                 let MainFlowAuthoredShows::Single(step) = shows else {
-                    let MainFlowAuthoredShows::Multiple { first_span, groups } = shows else { unreachable!(); };
+                    let MainFlowAuthoredShows::Multiple { first_span, groups } = shows else {
+                        return Err(ProjectCheck::Unsupported);
+                    };
                     let mut failed_step: Option<ByteSpan> = None;
                     let mut failed_goal = false;
                     let mut equalities = None;
@@ -2201,6 +2203,7 @@ struct MainFlowLiteralShow<'a> {
 #[cfg(feature = "internal-checker")]
 enum MainFlowAuthoredShows<'a> {
     Single(MainFlowLiteralShow<'a>),
+    Entry { span: ByteSpan, slot: usize, relation: IntegerRelation },
     Multiple { first_span: ByteSpan, groups: Vec<MainFlowShowBound<'a>> },
 }
 
@@ -2318,7 +2321,7 @@ impl<'a> MainFlowProofCase<'a> {
         if &plan.typed.target.source != root {
             return Err(ProjectCheck::Unsupported);
         }
-        let literal_show = |step: &'a ScalarBlockItem, terminated: bool| {
+        let show_claim = |step: &'a ScalarBlockItem, terminated: bool| {
             let ScalarBlockItem::Expression(expression) = step else {
                 return Err(ProjectCheck::Unsupported);
             };
@@ -2328,26 +2331,37 @@ impl<'a> MainFlowProofCase<'a> {
             if is_null_literal_name(&plan.typed.output) {
                 return Err(ProjectCheck::InvalidProof);
             }
-            let claim = proof_show_expression(step, true)?;
+            Ok((super::typecheck::expression_span(expression), proof_show_expression(step, true)?))
+        };
+        let checked_literal = |claim: &'a ScalarExpression| {
             let comparison = IntegerComparison::from_expression(claim).ok_or(ProjectCheck::Unsupported)?;
             let (_, shown, literal) = checked_literal_output_goal_borrowed(
                 comparison, &plan.typed.output, &plan.typed.input_names, plan.typed.result_type,
             )?;
-            Ok((super::typecheck::expression_span(expression), shown, literal))
+            Ok((shown, literal))
         };
         let step = match (plan.steps.items.as_slice(), plan.steps.terminated_items.as_slice()) {
             ([], []) => None,
             ([step], [true]) => {
-                let (span, relation, literal) = literal_show(step, true)?;
-                let same_bound = literal.as_ref() == bound;
-                Some(MainFlowAuthoredShows::Single(MainFlowLiteralShow { span, relation, bound: literal, same_bound }))
+                let (span, claim) = show_claim(step, true)?;
+                if let Some(checked) = checked_old_output_relation(
+                    claim, &plan.typed.output, &plan.typed.input_names, plan.typed.body, plan.typed.result_type,
+                ) {
+                    let (slot, relation) = checked?;
+                    Some(MainFlowAuthoredShows::Entry { span, slot, relation })
+                } else {
+                    let (relation, literal) = checked_literal(claim)?;
+                    let same_bound = literal.as_ref() == bound;
+                    Some(MainFlowAuthoredShows::Single(MainFlowLiteralShow { span, relation, bound: literal, same_bound }))
+                }
             }
             (steps, terminated) if steps.len() >= 2 && steps.len() == terminated.len() => {
                 use std::cmp::Ordering::{Equal, Greater, Less};
                 let mut groups = Vec::with_capacity(steps.len());
                 let mut first_span = None;
                 for (step, &terminated) in steps.iter().zip(terminated) {
-                    let (span, relation, bound) = literal_show(step, terminated)?;
+                    let (span, claim) = show_claim(step, terminated)?;
+                    let (relation, bound) = checked_literal(claim)?;
                     if groups.is_empty() {
                         first_span = Some(span);
                     }
@@ -2545,12 +2559,18 @@ impl ActualIntegerObserver for MainFlowProofObserver<'_> {
                 }
                 proofs.seen = true;
                 for (proof, step) in cases {
-                    if !proof.guard.accepts(arguments) {
-                        continue;
-                    }
-                    self.active = true;
+                    let mut applies = || {
+                        if !proof.guard.accepts(arguments) {
+                            return false;
+                        }
+                        self.active = true;
+                        true
+                    };
                     let failed_step = match step {
                         Some(MainFlowAuthoredShows::Single(step)) => {
+                            if !applies() {
+                                continue;
+                            }
                             let comparison = value.cmp(step.bound.as_ref());
                             if !step.relation.accepts(comparison) {
                                 Some(step.span)
@@ -2563,14 +2583,37 @@ impl ActualIntegerObserver for MainFlowProofObserver<'_> {
                             }
                         }
                         Some(MainFlowAuthoredShows::Multiple { groups, .. }) => {
+                            if !applies() {
+                                continue;
+                            }
                             let failed = first_failed_show(groups, value);
                             if failed.is_none() && proof.relation.accepts(value.cmp(proof.bound)) {
                                 continue;
                             }
                             failed
                         }
-                        None if proof.relation.accepts(value.cmp(proof.bound)) => continue,
-                        None => None,
+                        Some(MainFlowAuthoredShows::Entry { span, slot, relation }) => {
+                            let Some(argument) = arguments.get(*slot) else {
+                                self.incomplete = true;
+                                return;
+                            };
+                            if !applies() {
+                                continue;
+                            }
+                            if !relation.accepts(value.cmp(*argument)) {
+                                Some(*span)
+                            } else if proof.relation.accepts(value.cmp(proof.bound)) {
+                                continue;
+                            } else {
+                                None
+                            }
+                        }
+                        None => {
+                            if !applies() || proof.relation.accepts(value.cmp(proof.bound)) {
+                                continue;
+                            }
+                            None
+                        }
                     };
                     if !emit(proof, failed_step) {
                         self.incomplete = true;
@@ -7039,6 +7082,53 @@ mod tests {
         assert!(run(unused, ScalarCheckerScope::CurrentPackage).unwrap().symbolic_diagnostic.is_some());
         let invalid = unused.replace("ensures", "where (false) ensures").replace("out >= 7", "out >= 128");
         assert!(matches!(run(&invalid, ScalarCheckerScope::MainFlowOnly), Err(ProjectCheck::InvalidProof)));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordered_main_flow_auto_proof_old_show_uses_exact_checked_entry_slot() {
+        let app = source("src/main.w", "ordered-automatic-proof-actual-old-show");
+        let run = |text: &str, scope| {
+            let (_, proof) = crate::parse_proof_source(app.clone(), text.to_owned(), &[])
+                .unwrap_or_else(|_| panic!("valid proof source"));
+            check_loaded_ordered_proof_diagnostics(
+                Vec::new(), vec![(proof, Vec::new())], vec![app.clone()], inputs(), scope,
+            )
+        };
+        let text = r#"%%start
+            i16(i16, i16) choose = fn(tag, original) {
+                if (original == 0) {};
+                if (tag == 0) { 7 } else { original }
+            };
+            proof signed for choose(flag, entry) -> (out) where (entry < 0) ensures (out <= 7) {
+                core.show(out > core.old(flag));
+            }
+            proof bound for choose(flag, entry) -> (out) where (entry >= 0) ensures (out < 7) {
+                core.show(out <= core.old(entry));
+            }
+            i16 first = choose(1, -3);
+            i16 second = choose(0, 6);
+            i16 third = choose(0, 7);
+        %%end"#;
+        let receipt = run(text, ScalarCheckerScope::MainFlowOnly).unwrap();
+        let [first, second, goal] = receipt.diagnostics.as_slice() else { panic!("three actual failures"); };
+        assert!(receipt.active && receipt.directives.is_empty() && receipt.symbolic_diagnostic.is_none());
+        let snippet = |span: ByteSpan| &text[span.start as usize..span.end as usize];
+        assert_eq!(snippet(first.failed_step.as_ref().unwrap().range), "core.show(out > core.old(flag))");
+        assert_eq!(first.invocation.returned, BigInt::from(-3));
+        assert_eq!(first.invocation.arguments, [(ScalarType::I16, BigInt::from(1)), (ScalarType::I16, BigInt::from(-3))]);
+        assert_eq!(snippet(second.failed_step.as_ref().unwrap().range), "core.show(out <= core.old(entry))");
+        assert_eq!(second.invocation.arguments[1].1, BigInt::from(6));
+        assert!(goal.failed_step.is_none());
+        assert_eq!(snippet(goal.goal.range), "out < 7");
+        assert_eq!(goal.invocation.arguments[1].1, BigInt::from(7));
+        let invalid = text.replace("entry < 0", "false").replace("core.old(flag)", "core.old(unknown)");
+        assert!(matches!(run(&invalid, ScalarCheckerScope::MainFlowOnly), Err(ProjectCheck::InvalidProof)));
+        let wrong_width = text.replace("i16(i16, i16)", "i16(u8, i16)");
+        assert!(matches!(run(&wrong_width, ScalarCheckerScope::MainFlowOnly), Err(ProjectCheck::Unsupported)));
+        let unused = text.replace("            i16 first = choose(1, -3);\n            i16 second = choose(0, 6);\n            i16 third = choose(0, 7);\n", "");
+        assert!(!run(&unused, ScalarCheckerScope::MainFlowOnly).unwrap().active);
+        assert!(matches!(run(&unused, ScalarCheckerScope::CurrentPackage), Err(ProjectCheck::Unsupported)));
     }
 
     #[cfg(feature = "internal-checker")]
