@@ -2163,6 +2163,8 @@ impl ProjectedIntegerArgument<'_> {
 
 pub(super) enum NestedIntegerArgument<'a> {
     Single(Option<ExactIntegerArgument<'a>>),
+    #[cfg(feature = "internal-checker")]
+    RootLexical(ExactIntegerArgument<'a>),
     Pair(ExactIntegerArgument<'a>, ExactIntegerArgument<'a>),
     Projected(ProjectedIntegerArgument<'a>),
 }
@@ -3042,6 +3044,16 @@ fn walk_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, A
                     };
                     let signature = calls.checked_call_signatures.get(&origin.call)?;
                     let argument = actual_nested_argument(calls, origin.call, roots, &path, false);
+                    #[cfg(feature = "internal-checker")]
+                    let argument = match argument {
+                        NestedIntegerArgument::Single(Some(exact)) if COLLECT && block == structure.root
+                            && structure.checker_integer_call_locals.len() > 1
+                            && matches!(origin.arguments.as_slice(), [(_, CheckerIntegerCallArgument::PlainName)]) =>
+                        {
+                            NestedIntegerArgument::RootLexical(exact)
+                        }
+                        argument => argument,
+                    };
                     let ActualCallResult::Integer(value) = handle(calls, origin.call, signature, argument, &receiver.ty)? else {
                         return None;
                     };

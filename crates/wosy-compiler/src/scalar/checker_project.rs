@@ -1244,7 +1244,8 @@ impl<Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> CheckedCalls<'
                 {
                     let outer = _ordered.outer.ok_or(ProjectCheck::Unsupported)?;
                     if !ACTUAL_STARTUP || !is_integer_type(expected) || _caller_source != source
-                        || caller.structure.checker_integer_call_locals.len() != 1
+                        || (caller.structure.checker_integer_call_locals.len() != 1
+                            && !matches!(&argument, NestedIntegerArgument::RootLexical(_)))
                         || matches!(&argument, NestedIntegerArgument::Projected(_))
                     {
                         return Err(ProjectCheck::Unsupported);
@@ -1264,6 +1265,8 @@ impl<Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> CheckedCalls<'
         };
         let projected = match argument {
             NestedIntegerArgument::Single(exact) => ActualProjectedArguments::Single(exact),
+            #[cfg(feature = "internal-checker")]
+            NestedIntegerArgument::RootLexical(exact) => ActualProjectedArguments::Single(Some(exact)),
             NestedIntegerArgument::Pair(first, second) => ActualProjectedArguments::ExactPair(first, second),
             NestedIntegerArgument::Projected(projection) => ActualProjectedArguments::SymbolicAxis(projection),
         };
@@ -7360,6 +7363,70 @@ mod tests {
         assert_eq!(second.invocation.arguments, [(ScalarType::I8, nine)]);
         assert_eq!(first.invocation.directive_position, 0);
         assert_eq!(second.invocation.directive_position, 1);
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordered_main_flow_nested_scalar_chains_exact_root_lexical_values() {
+        let app = source("src/main.w", "ordered-automatic-proof-actual-nested-lexical");
+        let text = format!(r#"%%start
+            i8(i8) transform = fn(value) {{ if (value == 6) {{ 7 }} else {{ 10 }} }};
+            i8(i8) identity = fn(value) {{ value }};
+            unit(i8) wrapper = fn(arg) {{
+                i8 first = transform(arg);
+                core.require(first == 8, {OUTPUT});
+                i8 second = identity(first);
+                core.require(second == 8, {OUTPUT});
+            }};
+            proof before for transform(entry) -> (out) ensures (out <= 5) {{}}
+            proof after for identity(entry) -> (out) ensures (out <= 5) {{}}
+            wrapper(6);
+            wrapper(9);
+        %%end"#);
+        let run = |text: &str| {
+            let (_, proof) = crate::parse_proof_source(app.clone(), text.to_owned(), &[])
+                .unwrap_or_else(|_| panic!("valid canonical proof source"));
+            check_loaded_ordered_proof_diagnostics(
+                Vec::new(), vec![(proof, Vec::new())], vec![app.clone()], inputs(), ScalarCheckerScope::MainFlowOnly,
+            )
+        };
+        let report = run(&text).unwrap();
+        assert!(report.active);
+        assert_eq!(report.directives.len(), 4);
+        let snippet = |span: ByteSpan| &text[span.start as usize..span.end as usize];
+        for (index, (diagnostic, (outer, inner, argument, returned))) in report.diagnostics.iter().zip([
+            ("wrapper(6)", "transform(arg)", 6, 7), ("wrapper(6)", "identity(first)", 7, 7),
+            ("wrapper(9)", "transform(arg)", 9, 10), ("wrapper(9)", "identity(first)", 10, 10),
+        ]).enumerate() {
+            assert_eq!(snippet(diagnostic.invocation.outer_call.as_ref().unwrap().range), outer);
+            assert_eq!(snippet(diagnostic.invocation.call.range), inner);
+            assert_eq!(diagnostic.invocation.arguments, [(ScalarType::I8, BigInt::from(argument))]);
+            assert_eq!(diagnostic.invocation.returned, BigInt::from(returned));
+            assert_eq!(diagnostic.invocation.directive_position, index);
+            let witness = &report.directives[index].witness;
+            let axis = 1 + index % 2;
+            let returned = BigInt::from(returned);
+            assert_eq!(witness.intervals_at(0, axis).unwrap().collect::<Vec<_>>(), [(&returned, &returned)]);
+        }
+        assert_eq!(report.diagnostics.len(), 4);
+        let without = text.lines().map(|line| {
+            if line.trim_start().starts_with("proof ") { " ".repeat(line.len()) } else { line.to_owned() }
+        }).collect::<Vec<_>>().join("\n");
+        let ordinary = check_loaded_ordered_proof_diagnostics(
+            vec![(declarations(&app, &without), Vec::new())], Vec::new(), vec![app.clone()], inputs(),
+            ScalarCheckerScope::MainFlowOnly,
+        ).unwrap();
+        assert!(ordinary.diagnostics.is_empty());
+        assert_eq!(report.directives, ordinary.directives);
+        assert!(matches!(check_scalar_package_ordered_with_dormant_sources(
+            vec![(declarations(&app, &without), Vec::new())], vec![app.clone()], Vec::new(), inputs(),
+            ScalarCheckerScope::MainFlowOnly,
+        ), ScalarOrderedCheckerOutcome::Unsupported));
+        let deeper = text.replace("unit(i8) wrapper = fn(arg)", "unit(i8) inner = fn(arg)")
+            .replace("            wrapper(6);", "            unit(i8) wrapper = fn(arg) { inner(arg); };\n            wrapper(6);");
+        assert!(matches!(run(&deeper), Err(ProjectCheck::Unsupported)));
+        let late = text.replace("i8 second = identity(first);", "i8 second = identity(7);");
+        assert!(matches!(run(&late), Err(ProjectCheck::Unsupported)));
     }
 
     #[cfg(feature = "internal-checker")]
