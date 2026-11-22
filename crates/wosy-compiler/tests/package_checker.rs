@@ -768,3 +768,31 @@ fn verified_module_bound_cannot_be_issued_for_an_unvisited_proof_source() {
         ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
     ), ScalarProofCallOutcome::Unavailable);
 }
+
+#[test]
+fn main_initializer_follows_only_the_selected_unit_if_else_arm() {
+    let text = format!(
+        "bool enabled = true; if (enabled) {{ core.require(true, {OUTPUT}); }} else {{ enabled = false; }}; core.require(enabled, {OUTPUT});",
+    );
+    assert_eq!(check_scoped(&text, ScalarCheckerScope::MainFlowOnly), ScalarCheckerOutcome::Passed);
+
+    let text = format!(
+        "if (false) {{ core.narrow(false, {OUTPUT}); }} else {{ core.require(false, {OUTPUT}); }}; core.narrow(false, {OUTPUT});",
+    );
+    let ScalarCheckerOutcome::Failed(failure) = check(&text) else {
+        panic!("expected the first failure in the selected else arm");
+    };
+    assert_eq!(failure.operation, ScalarCheckerOperation::Require);
+    let canonical = format!("%%start\n{text}\n%%end");
+    assert_eq!(failure.condition.start as usize, canonical.find("core.require(false").unwrap() + "core.require(".len());
+
+    let text = format!(
+        "bool enabled = true; if (false) {{ core.require(true, {OUTPUT}); }} else {{ enabled = false; }}; core.require(enabled, {OUTPUT});",
+    );
+    assert_eq!(check(&text), ScalarCheckerOutcome::Unsupported);
+
+    let text = format!(
+        "if (true) {{ 1 }} else {{ 2 }}; core.require(true, {OUTPUT});",
+    );
+    assert!(matches!(check(&text), ScalarCheckerOutcome::Unsupported | ScalarCheckerOutcome::Invalid(_)));
+}

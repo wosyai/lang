@@ -426,7 +426,16 @@ fn check_initializer_expression(
         }
         return Ok(());
     }
-    if let Some(ConditionalRegion::Unit { condition, then_block, .. }) = topology.conditionals.get(&expression) {
+    if let Some(region) = topology.conditionals.get(&expression) {
+        let (condition, then_block, else_block) = match region {
+            ConditionalRegion::Unit { condition, then_block, .. } => (condition, *then_block, None),
+            ConditionalRegion::Value { condition, then_block, else_block, .. }
+                if structure.checked_types.expressions.get(&expression) == Some(&ScalarType::Unit) =>
+            {
+                (condition, *then_block, Some(*else_block))
+            }
+            _ => return Err(ProjectCheck::Unsupported),
+        };
         let value = match structure.checker_branches.get(condition) {
             Some(CheckerPredicate::Boolean(value)) => *value,
             None if structure.checked_types.expressions.get(condition) == Some(&ScalarType::Bool) => {
@@ -441,11 +450,12 @@ fn check_initializer_expression(
             }
             _ => return Err(ProjectCheck::Unsupported),
         };
-        if value {
+        let selected = if value { Some(then_block) } else { else_block };
+        if let Some(selected) = selected {
             if depth == MAX_INITIALIZER_BRANCH_DEPTH {
                 return Err(ProjectCheck::Unsupported);
             }
-            let block = structure.blocks.get(then_block.0).ok_or(ProjectCheck::MissingRootOccurrences)?;
+            let block = structure.blocks.get(selected.0).ok_or(ProjectCheck::MissingRootOccurrences)?;
             for item in &block.items {
                 let BlockItemKind::Evaluation { expression } = item.kind else {
                     return Err(ProjectCheck::Unsupported);
