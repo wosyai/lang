@@ -2820,7 +2820,7 @@ impl PreparedProofModule {
                 }
                 let strict_entry = if ExactGuardGroup(plan.filter.as_deref()) == ExactGuardGroup(immediate.filter.as_deref()) {
                     None
-                } else if claim.is_none() && immediate.steps.items.is_empty() {
+                } else if immediate.steps.items.is_empty() {
                     let Some(entry) = plan.closed_entry_admitted_by_peer(immediate) else { continue; };
                     Some(entry)
                 } else {
@@ -2900,6 +2900,9 @@ impl PreparedProofModule {
                         PeerShowClaims::Many(output) => output.implied_by(premise, implies),
                     }
                 });
+                if strict_entry.is_some() && mixed_implies_claims == Some(false) {
+                    continue;
+                }
                 let leaf_guard = ExactGuardGroup(leaf.filter.as_deref());
                 arbitrary_groups.entry((plan.target, leaf_guard)).or_default().peer_uses.push(UnusedPeerUse {
                     index, consumer: plan, name: leaf.name, relation, bound, strict_entry, implication_checked, mixed_implies_claims,
@@ -2941,22 +2944,22 @@ impl PreparedProofModule {
                             .find(|holds| *holds != Some(true)).unwrap_or(Some(true));
                         let checked = if proof == Some(true) {
                             for (index, consumer, strict_entry, implication_checked, mixed_implies_claims) in consumers {
-                                if let Some(implied) = mixed_implies_claims {
-                                    if implied {
-                                        outcomes[index] = ScalarModuleProofOutcome::Proved;
+                                let legacy = match mixed_implies_claims {
+                                    Some(true) => None,
+                                    Some(false) => continue,
+                                    None => {
+                                        let TypedProofGoal::Literal { relation: requested_relation, bound: requested, .. } =
+                                            &consumer.typed.goal else { continue; };
+                                        if relation != equality && !implication_checked
+                                            && !cited_bounds.implies(
+                                                consumer.typed.result_type, (relation, bound), (*requested_relation, requested),
+                                            )
+                                        {
+                                            continue;
+                                        }
+                                        Some((*requested_relation, requested))
                                     }
-                                    continue;
-                                }
-                                let TypedProofGoal::Literal { relation: requested_relation, bound: requested, .. } =
-                                    &consumer.typed.goal else { continue; };
-                                if relation != equality && !implication_checked {
-                                    let premise = (relation, bound);
-                                    let conclusion = (*requested_relation, requested);
-                                    let implied = cited_bounds.implies(consumer.typed.result_type, premise, conclusion);
-                                    if !implied {
-                                        continue;
-                                    }
-                                }
+                                };
                                 if let Some(key) = strict_entry {
                                     let returns = match first_strict_entry {
                                         Some((first, result)) if first == key => result,
@@ -2973,7 +2976,9 @@ impl PreparedProofModule {
                                         continue;
                                     }
                                 }
-                                outcomes[index] = if relation == equality && !requested_relation.accepts(bound.cmp(requested)) {
+                                outcomes[index] = if legacy.is_some_and(|(requested_relation, requested)|
+                                    relation == equality && !requested_relation.accepts(bound.cmp(requested)))
+                                {
                                     ScalarModuleProofOutcome::Refuted
                                 } else {
                                     ScalarModuleProofOutcome::Proved

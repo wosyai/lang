@@ -1755,7 +1755,7 @@ fn named_proof_citation_then_show_checks_both_claims_against_verified_evidence()
     assert_eq!(run("out < 9", "core.show(out <= 7); core.use(leaf(arg));"), [Unsupported, Proved]);
     assert_eq!(run("out < 9", "core.use(cycle_a(arg)); core.show(out <= 7);"), [Unsupported, Proved]);
     assert_eq!(run("out < 9", "core.use(leaf(0)); core.show(out <= 7);"), [Unsupported, Proved]);
-    assert_eq!(check("entry < 8", "arg == 6", "out < 8", "out < 9", steps), [Unsupported, Proved]);
+    assert_eq!(check("entry < 8", "arg == 6", "out < 8", "out < 9", steps), [Proved, Proved]);
     assert_eq!(check("entry < 8", "arg < 8", "out <= 6", "out < 9", steps), [Unsupported, Refuted]);
     assert_eq!(check("false", "false", "out < 8", "out < 9", steps), [NoApplicableInputs, NoApplicableInputs]);
     assert!(matches!(check("false", "false", "out < 8", "out < 9",
@@ -1774,6 +1774,15 @@ fn named_proof_citation_then_show_checks_both_claims_against_verified_evidence()
     let excluded = "core.use(leaf(arg)); core.show(out != 0); core.show(out >= -128); core.show(out != 0);";
     assert_eq!(check("entry != 0", "arg != 0", "out != 0", "out <= 127", excluded), [Proved, Proved]);
     assert_eq!(check("entry != 0", "arg != 0", "out != 0", "out != 1", excluded), [Unsupported, Proved]);
+    assert_eq!(check("entry < 8", "arg >= 5 && arg <= 6", "out < 8", "out < 9", sequence), [Proved, Proved]);
+    assert_eq!(check("entry < 8", "arg >= 5 && arg <= 6", "out < 8", "out <= 6", sequence), [Unsupported, Proved]);
+    assert_eq!(check("entry < 8", "arg >= 5 && arg <= 6", "out < 8", "out < 9",
+        "core.use(leaf(arg)); core.show(out <= 7); core.show(out <= 6);"), [Unsupported, Proved]);
+    assert_eq!(check("entry < 3 || entry > 5", "arg >= 6 && arg <= 7", "out != 4", "out != 4",
+        "core.use(leaf(arg)); core.show(out != 4);"), [Proved, Proved]);
+    assert_eq!(check("entry < 3 || entry > 5", "arg >= 2 && arg <= 7", "out != 4", "out != 4",
+        "core.use(leaf(arg)); core.show(out != 4);"), [Unsupported, Proved]);
+    assert_eq!(check("false", "arg == 6", "out < 8", "out < 9", sequence), [Unsupported, NoApplicableInputs]);
 }
 
 #[test]
@@ -1856,7 +1865,7 @@ fn named_proof_peer_use_checks_exact_singleton_where_subsets_without_filling_hol
 #[test]
 fn named_proof_peer_use_checks_a_closed_interval_in_one_returned_entry_row() {
     let identity = source();
-    let check = |leaf_where: &str, caller_where: &str, goal: &str| {
+    let check_step = |leaf_where: &str, caller_where: &str, goal: &str, step: &str| {
         check_scalar_module_proof(
             identity.clone(), "consumer",
             vec![ScalarProofModuleInput {
@@ -1865,7 +1874,7 @@ fn named_proof_peer_use_checks_a_closed_interval_in_one_returned_entry_row() {
                     i16(i16) fixed = fn(value) {{ if (value < 0) {{ 7 }} else {{ 7 }} }};
                     proof leaf for fixed(input) -> (out) where ({leaf_where}) ensures (out == 7) {{}}
                     proof consumer for fixed(entry) -> (out) where ({caller_where}) ensures ({goal}) {{
-                        core.use(leaf(entry));
+                        {step}
                     }}
                 %%end"#),
                 namespaces: Vec::new(),
@@ -1874,6 +1883,9 @@ fn named_proof_peer_use_checks_a_closed_interval_in_one_returned_entry_row() {
             ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
         )
     };
+    let check = |leaf_where: &str, caller_where: &str, goal: &str| {
+        check_step(leaf_where, caller_where, goal, "core.use(leaf(entry));")
+    };
     assert_eq!(check("input <= 10", "entry <= -1 && entry >= -4", "out == 7"), ScalarModuleProofOutcome::Proved);
     assert_eq!(check("input <= 10", "entry >= -4 && entry <= -1", "out < 7"), ScalarModuleProofOutcome::Refuted);
     assert_eq!(check("input <= 10", "entry >= -4 && entry <= 1", "out == 7"), ScalarModuleProofOutcome::Unsupported);
@@ -1881,6 +1893,9 @@ fn named_proof_peer_use_checks_a_closed_interval_in_one_returned_entry_row() {
     assert_eq!(check("input < 3 || input > 5", "entry >= 6 && entry <= 8", "out == 7"), ScalarModuleProofOutcome::Proved);
     assert_eq!(check("input < 3 || input > 5", "entry >= 2 && entry <= 6", "out == 7"), ScalarModuleProofOutcome::Unsupported);
     assert_eq!(check("input != 4", "entry >= 3 && entry <= 5", "out == 7"), ScalarModuleProofOutcome::Unsupported);
+    let mixed = "core.use(leaf(entry)); core.show(out <= 7); core.show(out >= 7);";
+    assert_eq!(check_step("input <= 10", "entry <= -1 && entry >= -4", "out == 7", mixed), ScalarModuleProofOutcome::Proved);
+    assert_eq!(check_step("input <= 10", "entry >= -4 && entry <= 1", "out == 7", mixed), ScalarModuleProofOutcome::Unsupported);
 }
 
 #[test]
@@ -1915,6 +1930,10 @@ fn named_proof_peer_use_checks_a_mixed_width_exact_entry_tuple() {
     assert_eq!(check("first == 6 && first == 6", "out == 7", use_leaf), ScalarModuleProofOutcome::Unsupported);
     assert_eq!(check(good, "out == 7", "core.use(leaf(second, first));"), ScalarModuleProofOutcome::Unsupported);
     assert!(matches!(check("first == 256 && second == -8", "out == 7", use_leaf), ScalarModuleProofOutcome::Invalid(_)));
+    let mixed = "core.use(leaf(first, second)); core.show(out <= 7); core.show(out >= 7);";
+    assert_eq!(check(good, "out == 7", mixed), ScalarModuleProofOutcome::Proved);
+    assert_eq!(check("first == 4 && second == -8", "out == 7", mixed), ScalarModuleProofOutcome::Unsupported);
+    assert_eq!(check("first == 6 && second == 0", "out == 7", mixed), ScalarModuleProofOutcome::Unsupported);
 }
 
 #[test]
