@@ -3147,6 +3147,21 @@ fn named_dependent_existential_witness_checks_each_universal_candidate_exactly()
     assert!(matches!(check(domain, "i16 i", "out < i", "i", "true", ""), Invalid(_)));
     assert_eq!(check(domain, "u16 k", "out < k", "i", "true", ""), Unsupported);
     assert_eq!(check(&format!("{domain} forall (i16 j)"), matching, "out < k", "i", "true", ""), Unsupported);
+    let hole_and_bounds = "out != k && out >= -8 && out <= -6";
+    assert_eq!(check(domain, matching, hole_and_bounds, "i", "input == -7", ""), Proved);
+    assert_eq!(check(domain, matching, hole_and_bounds, "i", "input == -6", ""), Unsupported);
+    assert_eq!(check(domain, matching, hole_and_bounds, "i", "input == -5", ""), Unsupported);
+    assert_eq!(check(domain, matching, hole_and_bounds, "i", "true", "i16 a = echo(-7); i16 b = echo(-7);"), Proved);
+    assert_eq!(check(domain, matching, hole_and_bounds, "i", "true", "i16 a = echo(-7); i16 b = echo(-5);"), Unsupported);
+    assert_eq!(check(domain, too_small, hole_and_bounds, "i", "input == -7", ""), Unsupported);
+    assert_eq!(check(domain, too_small, hole_and_bounds, "i", "false", "i16 a = echo(-7);"), NoApplicableInputs);
+    assert_eq!(check(domain, matching, "out <= k && out != k && out >= -9", "i", "input == -9", ""), Proved);
+    assert_eq!(check(domain, matching, "out <= k && out != k && out >= -9", "i", "input == -8", ""), Unsupported);
+    let singleton = "forall (i16 i where i == -8)";
+    assert_eq!(check(singleton, matching, "out <= k && out >= k && out < -7", "i", "input == -8", ""), Proved);
+    assert_eq!(check(domain, matching, "out <= k && out >= k && out < -7", "i", "input == -8", ""), Unsupported);
+    assert_eq!(check(domain, matching, "out < k && out >= k && out < 0", "i", "input == -8", ""), Unsupported);
+    assert!(matches!(check(domain, matching, "out < k && out >= k && out < 32768", "i", "input == -8", ""), Invalid(_)));
 }
 
 #[test]

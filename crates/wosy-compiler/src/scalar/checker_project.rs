@@ -3370,6 +3370,9 @@ impl SelectedProofObserver<'_> {
                         DependentWitness::Unavailable => None,
                         DependentWitness::Comparison(relation, bound) => relation.accepts(value.cmp(bound)).then_some(true),
                         DependentWitness::Avoiding(domain) => (!domain.covers_closed(value, value)).then_some(true),
+                        DependentWitness::Output(output) => output.holds_value(value).then_some(true),
+                        DependentWitness::OutputAvoiding(bounds) =>
+                            (bounds.0.holds_value(value) && !bounds.1.covers_closed(value, value)).then_some(true),
                     },
                     TypedProofGoal::ConjunctiveExistential(goal) => goal.holds_at(value, arguments),
                     TypedProofGoal::Disjunction(allowed) => Some(allowed.contains(value)),
@@ -3579,6 +3582,8 @@ enum DependentWitness {
     Unavailable,
     Comparison(IntegerRelation, BigInt),
     Avoiding(IntegerSet),
+    Output(Box<IntegerShowConstraints<'static>>),
+    OutputAvoiding(Box<(IntegerShowConstraints<'static>, IntegerSet)>),
 }
 
 enum TypedProofGoal {
@@ -3623,6 +3628,9 @@ impl TypedProofGoal {
                 DependentWitness::Unavailable => None,
                 DependentWitness::Comparison(relation, bound) => path.output_satisfies(*relation, bound)?.then_some(true),
                 DependentWitness::Avoiding(domain) => path.output_disjoint_from(domain)?.then_some(true),
+                DependentWitness::Output(output) => path.output_satisfies_constraints(output)?.then_some(true),
+                DependentWitness::OutputAvoiding(bounds) =>
+                    path.output_satisfies_constraints_avoiding(&bounds.0, &bounds.1)?.then_some(true),
             },
             Self::UniversalConjunction(goal) => match goal {
                 UniversalConjunction::Vacuous => Some(true),
@@ -3906,6 +3914,60 @@ fn authored_witness_argument(steps: &ScalarBlock) -> Result<&ScalarExpression, P
 }
 
 #[cfg(feature = "internal-checker")]
+fn typed_existential_conjuncts(
+    predicate: &ScalarExpression, binder: &str, output: &str, inputs: &[String], ty: &ScalarType,
+) -> Result<(IntegerRelation, IntegerShowConstraints<'static>), ProjectCheck> {
+    let mut relation: Option<IntegerRelation> = None;
+    let mut output_bounds = IntegerShowConstraints::default();
+    visit_output_conjuncts(predicate, |atom| {
+        if let ScalarExpression::Binary { operator, left, right, .. } = atom {
+            if matches!(right.as_ref(), ScalarExpression::Name { name, .. } if name == binder) {
+                if !matches!(left.as_ref(), ScalarExpression::Name { name, .. } if name == output) {
+                    return Err(ProjectCheck::Unsupported);
+                }
+                let atom = IntegerRelation::from_operator(operator).ok_or(ProjectCheck::Unsupported)?;
+                relation = Some(relation.map_or(atom, |known| known.intersection(atom)));
+                return Ok(());
+            }
+        }
+        let (atom, bound) = typed_output_atom(atom, output, inputs, ty)?;
+        output_bounds.add(atom, Cow::Owned(bound));
+        Ok(())
+    })?;
+    let relation = relation.ok_or(ProjectCheck::Unsupported)?;
+    Ok((relation, output_bounds))
+}
+
+#[cfg(feature = "internal-checker")]
+fn dependent_witness_conjunction(
+    relation: IntegerRelation, mut output: IntegerShowConstraints<'static>,
+    universal: IntegerSet, existential: &IntegerSet,
+) -> Result<DependentWitness, ProjectCheck> {
+    use std::cmp::Ordering::{Equal, Greater, Less};
+    let lower = match (relation.accepts(Less), relation.accepts(Greater), relation.accepts(Equal)) {
+        (true, false, _) => true,
+        (false, true, _) => false,
+        (false, false, true) if universal.singleton_value().is_some() => true,
+        (false, false, _) => return Ok(DependentWitness::Unavailable),
+        (true, true, false) => {
+            if !universal.is_subset_of(existential) {
+                return Ok(DependentWitness::Unavailable);
+            }
+            output.normalize();
+            return Ok(DependentWitness::OutputAvoiding(Box::new((output, universal))));
+        }
+        _ => return Err(ProjectCheck::Unsupported),
+    };
+    if !universal.is_subset_of(existential) {
+        return Ok(DependentWitness::Unavailable);
+    }
+    let bound = universal.into_extremum(lower).ok_or(ProjectCheck::Unsupported)?;
+    output.add(relation, Cow::Owned(bound));
+    output.normalize();
+    Ok(DependentWitness::Output(Box::new(output)))
+}
+
+#[cfg(feature = "internal-checker")]
 fn typed_named_dependent_witness(
     forall: &CstNode, exists: &CstNode, steps: &ScalarBlock, output: &str, inputs: &[String], ty: &ScalarType,
 ) -> Result<TypedProofGoal, ProjectCheck> {
@@ -3915,6 +3977,20 @@ fn typed_named_dependent_witness(
         return Err(ProjectCheck::InvalidProof);
     }
     let predicate = derive_expression(&child(exists, SyntaxKind::Expression)?);
+    if matches!(&predicate, ScalarExpression::Binary { operator: BinaryOperator::And, .. }) {
+        let (relation, output_bounds) = typed_existential_conjuncts(&predicate, &existential, output, inputs, ty)?;
+        if !matches!(authored_witness_argument(steps)?, ScalarExpression::Name { name, .. } if name == &universal) {
+            return Err(ProjectCheck::Unsupported);
+        }
+        let universal_domain = typed_quantifier_domain(forall, &universal, inputs, ty)?;
+        let existential_domain = typed_quantifier_domain(exists, &existential, inputs, ty)?;
+        if universal_domain.is_empty() {
+            return Err(ProjectCheck::Unsupported);
+        }
+        return Ok(TypedProofGoal::DependentWitness(dependent_witness_conjunction(
+            relation, output_bounds, universal_domain, &existential_domain,
+        )?));
+    }
     let ScalarExpression::Binary { operator, left, right, .. } = predicate else {
         return Err(ProjectCheck::Unsupported);
     };
@@ -3975,24 +4051,8 @@ fn typed_existential_output_goal(
     let argument = authored_witness_argument(steps)?;
     #[cfg(feature = "internal-checker")]
     if allow_named_entry_facts && matches!(&predicate, ScalarExpression::Binary { operator: BinaryOperator::And, .. }) {
-        let mut relation: Option<IntegerRelation> = None;
-        let mut output_bounds = IntegerShowConstraints::default();
-        visit_output_conjuncts(&predicate, |atom| {
-            if let ScalarExpression::Binary { operator, left, right, .. } = atom {
-                if matches!(right.as_ref(), ScalarExpression::Name { name, .. } if name == &binder) {
-                    if !matches!(left.as_ref(), ScalarExpression::Name { name, .. } if name == output) {
-                        return Err(ProjectCheck::Unsupported);
-                    }
-                    let atom = IntegerRelation::from_operator(operator).ok_or(ProjectCheck::Unsupported)?;
-                    relation = Some(relation.map_or(atom, |known| known.intersection(atom)));
-                    return Ok(());
-                }
-            }
-            let (atom, bound) = typed_output_atom(atom, output, inputs, &ty)?;
-            output_bounds.add(atom, Cow::Owned(bound));
-            Ok(())
-        })?;
-        let relation = relation.ok_or(ProjectCheck::Unsupported)?;
+        let (relation, mut output_bounds) =
+            typed_existential_conjuncts(&predicate, &binder, output, inputs, &ty)?;
         let witness = if let ScalarExpression::Name { name, .. } = argument {
             ConjunctiveWitness::Formal(checked_existential_formal(name, inputs, body, &ty)?)
         } else {
