@@ -213,36 +213,46 @@ fn prepare_checked_package_scope(
     }
     let startup_count = declarations.len();
     if scope == ScalarCheckerScope::CurrentPackage && !dormant.is_empty() {
-        let root = &initialization_order[0];
-        fn logical_source(source: &SourceIdentity) -> (&str, &str, &str) {
-            (&source.project, &source.package, &source.path)
-        }
-        let mut startup_keys = HashSet::new();
-        if !declarations.iter().all(|(source, _)| {
-            raw_sources.contains(source.source()) && startup_keys.insert(logical_source(source.source()))
-        }) {
-            return Err(ProjectCheck::Unsupported);
-        }
-        let mut dormant_keys = HashSet::new();
-        for source in &dormant {
-            let identity = source.source();
-            let key = logical_source(identity);
-            if identity.project != root.project || identity.package != root.package
-                || startup_keys.contains(&key) || !dormant_keys.insert(key)
-                || source.namespaces().next().is_some()
-            {
-                return Err(ProjectCheck::Unsupported);
-            }
-        }
-        if declarations.iter().flat_map(|(_, edges)| edges).any(|edge| {
-            dormant_keys.contains(&logical_source(&edge.target))
-        }) {
-            return Err(ProjectCheck::Unsupported);
-        }
+        validate_dormant_source_boundaries(&declarations, &initialization_order[0], |source| raw_sources.contains(source), dormant.iter())?;
         declarations.extend(dormant.into_iter().map(|source| (source, Vec::new())));
     }
 
     Ok((prepare_checker_project(declarations, initialization_order, inputs)?, startup_count))
+}
+
+#[cfg(feature = "internal-checker")]
+fn validate_dormant_source_boundaries<'a>(
+    declarations: &[(ScalarSourceDeclarations, Vec<ScalarNamespaceBinding>)],
+    root: &SourceIdentity,
+    in_startup: impl Fn(&SourceIdentity) -> bool,
+    dormant: impl IntoIterator<Item = &'a ScalarSourceDeclarations>,
+) -> Result<(), ProjectCheck> {
+    fn logical_source(source: &SourceIdentity) -> (&str, &str, &str) {
+        (&source.project, &source.package, &source.path)
+    }
+    let mut startup_keys = HashSet::new();
+    if !declarations.iter().all(|(source, _)| {
+        in_startup(source.source()) && startup_keys.insert(logical_source(source.source()))
+    }) {
+        return Err(ProjectCheck::Unsupported);
+    }
+    let mut dormant_keys = HashSet::new();
+    for source in dormant {
+        let identity = source.source();
+        let key = logical_source(identity);
+        if identity.project != root.project || identity.package != root.package
+            || startup_keys.contains(&key) || !dormant_keys.insert(key)
+            || source.namespaces().next().is_some()
+        {
+            return Err(ProjectCheck::Unsupported);
+        }
+    }
+    if declarations.iter().flat_map(|(_, edges)| edges).any(|edge| {
+        dormant_keys.contains(&logical_source(&edge.target))
+    }) {
+        return Err(ProjectCheck::Unsupported);
+    }
+    Ok(())
 }
 
 #[cfg(feature = "internal-checker")]
@@ -1846,15 +1856,16 @@ impl PreparedProofModule {
             }
             declarations.push((module_declarations, module.namespaces));
         }
-        Self::prepare_declarations(source, declarations, proofs, initialization_order, inputs)
+        Self::prepare_declarations(source, declarations, proofs, initialization_order, inputs, Vec::new())
     }
 
     fn prepare_declarations(
         source: SourceIdentity,
-        declarations: Vec<(ScalarSourceDeclarations, Vec<ScalarNamespaceBinding>)>,
+        mut declarations: Vec<(ScalarSourceDeclarations, Vec<ScalarNamespaceBinding>)>,
         catalogs: Vec<ModuleProofCatalog>,
         initialization_order: Vec<SourceIdentity>,
         inputs: ScalarPreparationInputs,
+        dormant: Vec<ScalarProofDeclarations>,
     ) -> Result<Self, ProjectCheck> {
         let mut graph_sources: HashMap<_, _> = initialization_order.iter().map(|source| (source, false)).collect();
         if graph_sources.len() != initialization_order.len() {
@@ -1875,6 +1886,13 @@ impl PreparedProofModule {
         if graph_sources.values().any(|seen| !seen) {
             return Err(ProjectCheck::MissingRoot);
         }
+        if !dormant.is_empty() {
+            validate_dormant_source_boundaries(
+                &declarations, &source, |source| graph_sources.contains_key(source),
+                dormant.iter().map(ScalarProofDeclarations::declarations),
+            )?;
+            declarations.reserve(dormant.len());
+        }
         let mut proofs = HashMap::new();
         for catalog in catalogs {
             if !graph_sources.contains_key(&catalog.source) {
@@ -1883,6 +1901,12 @@ impl PreparedProofModule {
             if proofs.insert(catalog.source, ModuleProofs { definitions: catalog.definitions, first_query: 0 }).is_some() {
                 return Err(ProjectCheck::AmbiguousRoot);
             }
+        }
+        for ScalarProofDeclarations { declarations: source, definitions } in dormant {
+            if !definitions.is_empty() {
+                proofs.insert(source.source().clone(), ModuleProofs { definitions, first_query: 0 });
+            }
+            declarations.push((source, Vec::new()));
         }
         let mut targets = Vec::new();
         for (source, proofs) in &mut proofs {
@@ -2080,7 +2104,7 @@ pub fn check_loaded_scalar_module_proof_selections(
     if selections.is_empty() {
         return Ok(Vec::new());
     }
-    let prepared = prepare_loaded_proof_project(declarations, proofs, initialization_order, inputs)
+    let prepared = prepare_loaded_proof_project(declarations, proofs, initialization_order, inputs, Vec::new())
         .map_err(|error| module_proof_outcome(Err(error)))?;
     Ok(prepared.check_module_proof_selections(selections))
 }
@@ -2091,6 +2115,7 @@ fn prepare_loaded_proof_project(
     proofs: Vec<(ScalarProofDeclarations, Vec<ScalarNamespaceBinding>)>,
     initialization_order: Vec<SourceIdentity>,
     inputs: ScalarPreparationInputs,
+    dormant: Vec<ScalarProofDeclarations>,
 ) -> Result<PreparedProofModule, ProjectCheck> {
     let mut catalogs = Vec::with_capacity(proofs.len());
     declarations.reserve(proofs.len());
@@ -2100,7 +2125,7 @@ fn prepare_loaded_proof_project(
         declarations.push((proof_declarations, namespaces));
     }
     let root = initialization_order.first().cloned().ok_or(ProjectCheck::MissingRoot)?;
-    PreparedProofModule::prepare_declarations(root, declarations, catalogs, initialization_order, inputs)
+    PreparedProofModule::prepare_declarations(root, declarations, catalogs, initialization_order, inputs, dormant)
 }
 
 #[cfg(feature = "internal-checker")]
@@ -3035,7 +3060,7 @@ fn check_loaded_ordered_proof_diagnostics(
     inputs: ScalarPreparationInputs,
     scope: ScalarCheckerScope,
 ) -> Result<MainFlowProofReceipt, ProjectCheck> {
-    check_loaded_ordered_proof_diagnostics_in_scope::<false>(declarations, proofs, initialization_order, inputs, scope)
+    check_loaded_ordered_proof_diagnostics_in_scope::<false>(declarations, proofs, initialization_order, inputs, scope, Vec::new())
 }
 
 #[cfg(feature = "internal-checker")]
@@ -3045,16 +3070,18 @@ fn check_loaded_ordered_proof_diagnostics_in_scope<const LOCAL_CATALOGS: bool>(
     initialization_order: Vec<SourceIdentity>,
     inputs: ScalarPreparationInputs,
     scope: ScalarCheckerScope,
+    dormant: Vec<ScalarProofDeclarations>,
 ) -> Result<MainFlowProofReceipt, ProjectCheck> {
-    if proofs.is_empty() {
+    let dormant = if scope == ScalarCheckerScope::CurrentPackage { dormant } else { Vec::new() };
+    if proofs.is_empty() && dormant.is_empty() {
         let (prepared, startup_count) = prepare_checked_package_scope(
             declarations, initialization_order, Vec::new(), inputs, scope,
         )?;
         return run_closed_without_named_proofs(&prepared, scope, startup_count);
     }
-    let prepared = prepare_loaded_proof_project(declarations, proofs, initialization_order, inputs)?;
+    let startup_count = initialization_order.len();
+    let prepared = prepare_loaded_proof_project(declarations, proofs, initialization_order, inputs, dormant)?;
     let project = prepared.prepared.parts().0;
-    let startup_count = project.modules.len();
     let sources = if LOCAL_CATALOGS {
         project.initialization_order.as_slice()
     } else {
@@ -3065,7 +3092,7 @@ fn check_loaded_ordered_proof_diagnostics_in_scope<const LOCAL_CATALOGS: bool>(
     };
     let mut first = None;
     let mut others = Vec::new();
-    for source in sources {
+    for source in sources.iter().chain(project.modules[startup_count..].iter().map(|module| &module.source)) {
         let Some((proof_source, catalog)) = prepared.proofs.get_key_value(source) else { continue; };
         if catalog.definitions.is_empty() {
             continue;
@@ -3153,9 +3180,10 @@ pub fn check_loaded_scalar_ordered_local_proof_contexts(
     initialization_order: Vec<SourceIdentity>,
     inputs: ScalarPreparationInputs,
     scope: ScalarCheckerScope,
+    dormant: Vec<ScalarProofDeclarations>,
 ) -> Result<MainFlowProofReceipt, ScalarOrderedCheckerOutcome> {
     check_loaded_ordered_proof_diagnostics_in_scope::<true>(
-        declarations, local_catalogs.into_iter().collect(), initialization_order, inputs, scope,
+        declarations, local_catalogs.into_iter().collect(), initialization_order, inputs, scope, dormant,
     ).map_err(|error| match error {
         ProjectCheck::Invalid(diagnostics) => ScalarOrderedCheckerOutcome::Invalid(diagnostics),
         _ => ScalarOrderedCheckerOutcome::Unsupported,
@@ -3181,7 +3209,7 @@ pub fn check_loaded_scalar_module_proof_call(
     initialization_order: Vec<SourceIdentity>,
     inputs: ScalarPreparationInputs,
 ) -> ScalarProofCallOutcome {
-    let result = prepare_loaded_proof_project(declarations, vec![catalog], initialization_order, inputs)
+    let result = prepare_loaded_proof_project(declarations, vec![catalog], initialization_order, inputs, Vec::new())
         .ok()
         .and_then(|prepared| production_bound_reuse::apply(&prepared, proof, caller));
     result.unwrap_or(ScalarProofCallOutcome::Unavailable)
@@ -7446,7 +7474,7 @@ mod tests {
             };
             check_loaded_scalar_ordered_local_proof_contexts(
                 Vec::new(), [(lib_catalog, Vec::new()), (root_catalog, vec![binding])],
-                vec![app.clone(), lib.clone()], inputs(), scope,
+                vec![app.clone(), lib.clone()], inputs(), scope, Vec::new(),
             )
         };
         let report = run(&lib, lib_text, ScalarCheckerScope::CurrentPackage).unwrap();
@@ -7477,6 +7505,47 @@ mod tests {
             Err(ScalarOrderedCheckerOutcome::Unsupported)));
         let foreign = SourceIdentity { project: "foreign-project".into(), ..lib.clone() };
         assert!(matches!(run(&foreign, lib_text, ScalarCheckerScope::CurrentPackage), Err(ScalarOrderedCheckerOutcome::Unsupported)));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordered_dormant_local_proofs_are_symbolic_without_executing_initialization() {
+        let app = source("src/main.w", "ordered-dormant-app");
+        let local = source("src/dormant.w", "ordered-dormant-local");
+        let app_text = "%%start i8 value = 1; %%end";
+        let local_text = format!(r#"%%start
+            core.require(false, {OUTPUT});
+            i8(i8) unused = fn(value) {{ value }};
+            proof uncovered for unused(entry) -> (out) ensures (out != 7) {{}}
+        %%end"#);
+        let run = |scope, identities: &[&SourceIdentity]| {
+            let catalog = |source: &SourceIdentity| crate::parse_proof_source(
+                source.clone(), local_text.clone(), &[],
+            ).unwrap_or_else(|_| panic!("valid dormant proof source")).1;
+            check_loaded_scalar_ordered_local_proof_contexts(
+                vec![(declarations(&app, app_text), Vec::new())], [],
+                vec![app.clone()], inputs(), scope,
+                identities.iter().map(|source| catalog(source)).collect(),
+            )
+        };
+        let package = run(ScalarCheckerScope::CurrentPackage, &[&local]).unwrap();
+        assert!(package.active && package.directives.is_empty() && package.diagnostics.is_empty());
+        let failure = package.symbolic_diagnostic.unwrap();
+        assert_eq!(failure.proof.source, local);
+        assert_eq!(failure.callable.source, local);
+        assert_eq!(failure.returned, BigInt::from(7));
+        assert!(package.additional_symbolic_diagnostics.is_empty());
+
+        let main = run(ScalarCheckerScope::MainFlowOnly, &[&local]).unwrap();
+        assert!(!main.active && main.directives.is_empty() && main.diagnostics.is_empty());
+        assert!(main.symbolic_diagnostic.is_none() && main.additional_symbolic_diagnostics.is_empty());
+
+        let foreign = SourceIdentity { package: "foreign".into(), ..local.clone() };
+        let alias = source("src/main.w", "different-revision");
+        for disallowed in [&[&local, &local][..], &[&foreign], &[&alias]] {
+            assert!(matches!(run(ScalarCheckerScope::CurrentPackage, disallowed),
+                Err(ScalarOrderedCheckerOutcome::Unsupported)));
+        }
     }
 
     #[cfg(feature = "internal-checker")]

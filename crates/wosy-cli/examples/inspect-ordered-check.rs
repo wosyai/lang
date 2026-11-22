@@ -32,7 +32,7 @@ fn inspect(
     ).map_err(|_| "canonical source load failed")?;
     check_loaded_scalar_ordered_local_proof_contexts(
         loaded.declarations, loaded.proofs.into_values(), loaded.initialization_order, ScalarPreparationInputs { target_layout },
-        scope,
+        scope, Vec::new(),
     ).map_err(|outcome| match outcome {
         ScalarOrderedCheckerOutcome::Invalid(_) => "checker rejected invalid input",
         _ => "checker did not complete analysis",
