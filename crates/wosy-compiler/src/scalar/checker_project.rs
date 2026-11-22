@@ -2757,7 +2757,7 @@ impl PreparedProofModule {
                 if let Some(observer) = observer {
                     outcomes[*index] = module_proof_outcome(observer.outcome());
                 }
-            } else if !matches!(plan.typed.goal, TypedProofGoal::Literal { .. } | TypedProofGoal::Conjunction(_) | TypedProofGoal::Disjunction(_) | TypedProofGoal::Universal { .. } | TypedProofGoal::Existential { .. } | TypedProofGoal::EntryComparison { .. } | TypedProofGoal::MixedEntryConjunction { .. }) {
+            } else if !matches!(plan.typed.goal, TypedProofGoal::Literal { .. } | TypedProofGoal::Conjunction(_) | TypedProofGoal::Disjunction(_) | TypedProofGoal::Universal { .. } | TypedProofGoal::Existential { .. } | TypedProofGoal::EntryWitness { .. } | TypedProofGoal::EntryComparison { .. } | TypedProofGoal::MixedEntryConjunction { .. }) {
                 continue;
             } else if plan.uses_direct_goal() {
                 let key = (plan.target, ExactGuardGroup(plan.filter.as_deref()));
@@ -2959,6 +2959,11 @@ impl PreparedProofModule {
                         let holds = if let TypedProofGoal::EntryComparison { slot, relation } = goal {
                             ImmutableProofOutputComparison::prepare(body, *slot, plan.typed.result_type, *relation)
                                 .and_then(|entry| entry.holds(&paths, None))
+                        } else if let TypedProofGoal::EntryWitness { slot, domain } = goal {
+                            IntegerRelation::from_operator(&BinaryOperator::Equal)
+                                .and_then(|relation| ImmutableProofOutputComparison::prepare(body, *slot, plan.typed.result_type, relation))
+                                .and_then(|entry| entry.holds_existential_witness(&paths, domain))
+                                .and_then(|verified| verified.then_some(true))
                         } else if let TypedProofGoal::MixedEntryConjunction { output, entry } = goal {
                             body.boundary.checker_parameter_bindings.as_deref()
                                 .and_then(|formals| evaluate_mixed_entry_output(&paths, formals, output, entry))
@@ -3029,7 +3034,7 @@ impl PlannedModuleProof<'_> {
 
 
     fn uses_direct_goal(&self) -> bool {
-        self.steps.items.is_empty() || matches!(self.typed.goal, TypedProofGoal::Existential { .. })
+        self.steps.items.is_empty() || matches!(self.typed.goal, TypedProofGoal::Existential { .. } | TypedProofGoal::EntryWitness { .. })
     }
 
     fn observer(&self) -> SelectedProofObserver<'_> {
@@ -3345,6 +3350,13 @@ impl SelectedProofObserver<'_> {
                         Some(relation.accepts(value.cmp(bound))),
                     TypedProofGoal::Existential { relation, witness, witness_in_domain } =>
                         (*witness_in_domain && relation.accepts(value.cmp(witness))).then_some(true),
+                    TypedProofGoal::EntryWitness { slot, domain } => {
+                        let Some(candidate) = arguments.get(*slot) else {
+                            self.coverage = ActualProofCoverage::Unsupported;
+                            return;
+                        };
+                        (value == *candidate && domain.contains(candidate)).then_some(true)
+                    },
                     TypedProofGoal::Disjunction(allowed) => Some(allowed.contains(value)),
                     TypedProofGoal::DeferredDisjunction(_) => None,
                     TypedProofGoal::MixedEntryConjunction { output, entry } =>
@@ -3504,6 +3516,8 @@ enum TypedProofGoal {
     DeferredDisjunction([(IntegerRelation, BigInt); 2]),
     Universal { relation: IntegerRelation, bound: BigInt },
     Existential { relation: IntegerRelation, witness: BigInt, witness_in_domain: bool },
+    #[cfg(feature = "internal-checker")]
+    EntryWitness { slot: usize, domain: IntegerSet },
     EntryComparison { slot: usize, relation: IntegerRelation },
     #[cfg(feature = "internal-checker")]
     MixedEntryConjunction { output: IntegerShowConstraints<'static>, entry: [Option<IntegerRelation>; 2] },
@@ -3527,7 +3541,7 @@ impl TypedProofGoal {
                 }
                 Some(true)
             }
-            Self::EntryComparison { .. } | Self::DeferredDisjunction(_) | Self::MixedEntryConjunction { .. } => None,
+            Self::EntryComparison { .. } | Self::DeferredDisjunction(_) | Self::MixedEntryConjunction { .. } | Self::EntryWitness { .. } => None,
         }
     }
 }
@@ -3629,6 +3643,8 @@ fn typed_quantifier_domain(
 
 fn typed_existential_output_goal(
     exists: &CstNode, steps: &ScalarBlock, output: &str, inputs: &[String], ty: &ScalarType,
+    #[cfg_attr(not(feature = "internal-checker"), allow(unused_variables))] body: &FunctionCallSites,
+    #[cfg_attr(not(feature = "internal-checker"), allow(unused_variables))] allow_named_entry_facts: bool,
 ) -> Result<TypedProofGoal, ProjectCheck> {
     let (ty, binder) = typed_quantifier_binder(exists, output, inputs, ty)?;
     let predicate = derive_expression(&child(exists, SyntaxKind::Expression)?);
@@ -3653,6 +3669,22 @@ fn typed_existential_output_goal(
     let [argument] = arguments.as_slice() else {
         return Err(ProjectCheck::Unsupported);
     };
+    #[cfg(feature = "internal-checker")]
+    if allow_named_entry_facts {
+        if let ScalarExpression::Name { name, .. } = argument {
+            if is_null_literal_name(name) {
+                return Err(ProjectCheck::InvalidProof);
+            }
+            let slot = inputs.iter().position(|input| input == name).ok_or(ProjectCheck::InvalidProof)?;
+            let parameters = &body.boundary.parameters;
+            let bindings = body.boundary.checker_parameter_bindings.as_deref().ok_or(ProjectCheck::Unsupported)?;
+            if !matches!(parameters.len(), 1 | 2) || bindings.len() != parameters.len() || parameters[slot].ty != ty {
+                return Err(ProjectCheck::Unsupported);
+            }
+            let domain = typed_quantifier_domain(exists, &binder, inputs, &ty)?;
+            return Ok(TypedProofGoal::EntryWitness { slot, domain });
+        }
+    }
     let witness = concrete_integer_literal(argument).ok_or(ProjectCheck::Unsupported)?;
     if !integer_literal_fits_type(witness.as_ref(), &ty) {
         return Err(ProjectCheck::InvalidProof);
@@ -4194,7 +4226,7 @@ fn typed_proof_postcondition<'a, const AUDIT_INDUCTION: bool, const DEFER_OUTPUT
     (module, item, function): (usize, usize, &'a ScalarFunction),
     declaration: &CstNode,
     steps: &ScalarBlock,
-    #[cfg_attr(not(feature = "internal-checker"), allow(unused_variables))] allow_mixed_ensures: bool,
+    #[cfg_attr(not(feature = "internal-checker"), allow(unused_variables))] allow_named_entry_facts: bool,
 ) -> Result<TypedProofPostcondition<'a>, ProjectCheck> {
     let target = child(declaration, SyntaxKind::ProofTarget)?;
     let input_names = identifiers(&child(&target, SyntaxKind::Parameters)?).collect::<Vec<_>>();
@@ -4232,7 +4264,7 @@ fn typed_proof_postcondition<'a, const AUDIT_INDUCTION: bool, const DEFER_OUTPUT
         if foralls.next().is_some() || measure.is_some() {
             return Err(ProjectCheck::Unsupported);
         }
-        typed_existential_output_goal(&exists, steps, output, &input_names, &result.ty)?
+        typed_existential_output_goal(&exists, steps, output, &input_names, &result.ty, body, allow_named_entry_facts)?
     } else {
         let ensures = derive_expression(&child(&ensures_node, SyntaxKind::Expression)?);
         if let Some(forall) = foralls.next() {
@@ -4249,7 +4281,7 @@ fn typed_proof_postcondition<'a, const AUDIT_INDUCTION: bool, const DEFER_OUTPUT
             }
         } else if matches!(&ensures, ScalarExpression::Binary { operator: BinaryOperator::And, .. }) {
             #[cfg(feature = "internal-checker")]
-            let mixed = if allow_mixed_ensures && steps.items.is_empty() && measure.is_none() {
+            let mixed = if allow_named_entry_facts && steps.items.is_empty() && measure.is_none() {
                 Some(typed_unused_named_conjunction(&ensures, output, &input_names, body, &result.ty)?)
             } else {
                 None

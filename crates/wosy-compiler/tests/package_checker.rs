@@ -2911,6 +2911,47 @@ fn named_universal_goal_cannot_issue_a_reusable_literal_bound() {
 }
 
 #[test]
+fn named_proof_entry_witness_checks_domain_and_output_in_same_context() {
+    let identity = source();
+    let check = |signature: &str, body: &str, candidate: &str, where_guard: &str, startup: &str| {
+        check_scalar_module_proof(
+            identity.clone(), "prove",
+            vec![ScalarProofModuleInput {
+                source: identity.clone(),
+                text: format!(r#"%%start
+                    i16({signature}) choose = fn(left, right) {{ {body} }};
+                    {startup}
+                    proof prove for choose(first, second) -> (out) where ({where_guard})
+                        ensures (exists (i16 k where k >= -8 && k != -7) {{ out == k }}) {{
+                            core.witness({candidate});
+                        }}
+                %%end"#),
+                namespaces: Vec::new(),
+            }],
+            vec![identity.clone()], ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
+        )
+    };
+    use ScalarModuleProofOutcome::{Invalid, NoApplicableInputs, Proved, Unsupported};
+    let choose_right = "if (left == 0) {}; right";
+    let choose_left = "if (right == 0) {}; left";
+    let two = "i16 a = choose(1, -8); i16 b = choose(2, -6);";
+    let hole = "i16 a = choose(1, -8); i16 b = choose(2, -7); i16 c = choose(3, -6);";
+    assert_eq!(check("u8, i16", choose_right, "second", "true", two), Proved);
+    assert_eq!(check("u8, i16", choose_right, "second", "true", hole), Unsupported);
+    assert_eq!(check("u8, i16", choose_right, "second", "first != 2", hole), Proved);
+    assert_eq!(check("u8, i16", choose_right, "second", "false", hole), NoApplicableInputs);
+    assert_eq!(check("u8, i16", choose_right, "first", "true", two), Unsupported);
+    assert_eq!(check("u8, i16", choose_right, "second",
+        "second >= -8 && second <= -6 && second != -7", ""), Proved);
+    assert_eq!(check("u8, i16", choose_right, "second", "second >= -8 && second <= -6", ""), Unsupported);
+    assert_eq!(check("i16, i16", choose_left, "second", "first == 3 && second == 3", ""), Proved);
+    assert_eq!(check("i16, i16", choose_left, "second", "first == 4 && second == 3", ""), Unsupported);
+    assert_eq!(check("i16, i16", choose_left, "second", "true", "i16 a = choose(3, 4);"), Unsupported);
+    assert_eq!(check("i16, i16", "if (left == 0) {}; if (right == 0) {}; 3", "second", "second == 3", ""), Proved);
+    assert!(matches!(check("u8, i16", choose_right, "out", "false", two), Invalid(_)));
+}
+
+#[test]
 fn named_existential_proof_checks_the_authored_typed_witness_on_each_return() {
     let identity = source();
     let check = |binder: &str, predicate: &str, witness: &str, guard: &str, actual: &str| {

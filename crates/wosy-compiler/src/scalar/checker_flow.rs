@@ -926,6 +926,36 @@ impl<'a> ImmutableProofOutputComparison<'a> {
         Some(Self { binding, relation, other })
     }
 
+    pub(super) fn holds_existential_witness(
+        &self, paths: &[IntegerReturningPath<'_>], domain: &IntegerSet,
+    ) -> Option<bool> {
+        for path in paths {
+            let witness = path.axes.iter().position(|known| *known == self.binding)?;
+            let other = match path.value {
+                IntegerReturn::Alias(binding) if binding != self.binding => {
+                    let (other, _) = self.other?;
+                    if binding != other {
+                        return None;
+                    }
+                    Some(path.axes.iter().position(|known| *known == other)?)
+                }
+                _ => None,
+            };
+            for row in &path.state.0 {
+                let candidate = &row[witness];
+                let matches = match (path.value, other) {
+                    (IntegerReturn::Const(value), _) => candidate.singleton_value() == Some(value),
+                    (IntegerReturn::Alias(_), Some(other)) => CartesianRelation::Equal.holds(&row[other], candidate)?,
+                    (IntegerReturn::Alias(_), None) => true,
+                };
+                if !matches || !candidate.is_subset_of(domain) {
+                    return Some(false);
+                }
+            }
+        }
+        Some(true)
+    }
+
     pub(super) fn holds(
         &self, paths: &[IntegerReturningPath<'_>], output: Option<(IntegerRelation, &BigInt)>,
     ) -> Option<bool> {
