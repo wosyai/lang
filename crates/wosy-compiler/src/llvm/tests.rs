@@ -9193,32 +9193,37 @@ u8(Pair) inspect = fn(owner) {
     }
 }
 
-fn known_store_precedes_load<'ctx>(
-    write: InstructionValue<'ctx>, read: InstructionValue<'ctx>, entry: inkwell::basic_block::BasicBlock<'ctx>,
+fn known_block_reaches<'ctx>(
+    start: inkwell::basic_block::BasicBlock<'ctx>,
+    end: inkwell::basic_block::BasicBlock<'ctx>,
+    excluded: Option<inkwell::basic_block::BasicBlock<'ctx>>,
 ) -> bool {
-    let store_block = write.get_parent().expect("checked store block");
-    let read_block = read.get_parent().expect("checked return load block");
-    if store_block == read_block {
-        std::iter::successors(write.get_next_instruction(), |instruction| instruction.get_next_instruction())
-            .any(|instruction| instruction == read)
+    let mut pending = vec![start];
+    let mut seen = std::collections::HashSet::new();
+    while let Some(block) = pending.pop() {
+        if excluded == Some(block) || !seen.insert(block) {
+            continue;
+        }
+        if block == end {
+            return true;
+        }
+        if let Some(terminal) = block.get_terminator() {
+            pending.extend(terminal.get_operands().filter_map(|operand| operand?.block()));
+        }
+    }
+    false
+}
+
+fn known_instruction_precedes_on_all_paths<'ctx>(
+    before: InstructionValue<'ctx>, after: InstructionValue<'ctx>, entry: inkwell::basic_block::BasicBlock<'ctx>,
+) -> bool {
+    let before_block = before.get_parent().expect("first instruction block");
+    let after_block = after.get_parent().expect("second instruction block");
+    if before_block == after_block {
+        std::iter::successors(before.get_next_instruction(), |instruction| instruction.get_next_instruction())
+            .any(|instruction| instruction == after)
     } else {
-        let reaches = |start: inkwell::basic_block::BasicBlock<'_>, end, excluded| {
-            let mut pending = vec![start];
-            let mut seen = std::collections::HashSet::new();
-            while let Some(block) = pending.pop() {
-                if excluded == Some(block) || !seen.insert(block) {
-                    continue;
-                }
-                if block == end {
-                    return true;
-                }
-                if let Some(terminal) = block.get_terminator() {
-                    pending.extend(terminal.get_operands().filter_map(|operand| operand?.block()));
-                }
-            }
-            false
-        };
-        reaches(entry, read_block, None) && !reaches(entry, read_block, Some(store_block))
+        known_block_reaches(entry, after_block, None) && !known_block_reaches(entry, after_block, Some(before_block))
     }
 }
 
@@ -9329,10 +9334,133 @@ u8(Pair) inspect = fn(owner) {{
                         panic!("one checked byte store to each exact returned field: {ir}");
                     };
                     assert_eq!(*actual, byte, "{ir}");
-                    assert!(known_store_precedes_load(*write, read, entry),
+                    assert!(known_instruction_precedes_on_all_paths(*write, read, entry),
                         "each exact store precedes its returned field load: {ir}");
                 }
             }
+        }
+    }
+}
+
+fn known_unspill_once<'ctx>(
+    instructions: &[InstructionValue<'ctx>], value: BasicValueEnum<'ctx>,
+) -> BasicValueEnum<'ctx> {
+    value.as_instruction_value()
+        .filter(|inst| inst.get_opcode() == InstructionOpcode::Load)
+        .and_then(|load| known_field_operand(load, 0))
+        .and_then(|slot| known_field_stored_value(instructions, slot))
+        .unwrap_or(value)
+}
+
+#[test]
+fn emits_known_recursive_frame_release_after_child_return_and_local_reads() {
+    use inkwell::values::CallSiteValue;
+
+    let source = r#"%%start
+u64(*u8, u64) descend = fn(backing, depth) {
+    u64 length = 4;
+    u8[length] scratch;
+    scratch[0] = core.int_trunc<u8>(depth);
+    u64 subtotal = if (depth == 0) { 0 } else { descend(backing, depth - 1) };
+    subtotal + core.int_extend<u64>(scratch[0]) + core.int_extend<u64>(*backing)
+};
+%%end"#;
+    for layout in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
+        let prepared = prepare_initializer_test(source, layout);
+        let build = analyze_scalar_build(&prepared);
+        assert!(build.diagnostics().is_empty(), "{:?}", build.diagnostics());
+        for (project, partition) in [
+            (false, emit_scalar_build_single_module_llvm(&build)),
+            (true, emit_scalar_build_project_llvm(&build)),
+        ] {
+            let ir = partition.expect("ordinary recursive resource LLVM").to_text();
+            let context = Context::create();
+            let buffer = inkwell::memory_buffer::MemoryBuffer::create_from_memory_range_copy(
+                ir.as_bytes(), "known-recursive-owned-frame",
+            );
+            let module = context.create_module_from_ir(buffer).expect("parse recursive frame LLVM");
+            module.verify().expect("verify recursive frame LLVM");
+            let symbol = self_tail_test_symbol(&prepared.project().modules[0].source, project, "descend");
+            let routine = module.get_function(&symbol).expect("recursive callable");
+            let alloc_symbol = module.get_function("__wosy_core_alloc").expect("ordinary allocator");
+            let release_symbol = module.get_function("__wosy_core_free").expect("ordinary release");
+            let entry = routine.get_first_basic_block().expect("recursive entry");
+            let instructions = routine.get_basic_blocks().iter().flat_map(|block| {
+                std::iter::successors(block.get_first_instruction(), |instruction| instruction.get_next_instruction())
+            }).collect::<Vec<_>>();
+            let unique_call = |target| {
+                let calls = instructions.iter().copied().filter_map(|instruction| {
+                    let call = CallSiteValue::try_from(instruction).ok()?;
+                    (call.get_called_fn_value() == Some(target)).then_some((instruction, call))
+                }).collect::<Vec<_>>();
+                let [only] = calls.as_slice() else { panic!("one actual call to each target: {ir}") };
+                *only
+            };
+            let (allocation, allocation_call) = unique_call(alloc_symbol);
+            let allocated = allocation_call.try_as_basic_value().basic().expect("frame allocation result");
+            let (recursive, _) = unique_call(routine);
+            let (release, _) = unique_call(release_symbol);
+            let incoming = routine.get_nth_param(0).expect("incoming checked backing");
+
+            let unspill = |value| known_unspill_once(&instructions, value);
+            let recurse_backing = known_field_operand(recursive, 0).expect("recursive checked backing operand");
+            assert_eq!(unspill(recurse_backing), incoming, "{ir}");
+            assert_eq!(unspill(known_field_operand(release, 0).expect("released allocation")), allocated, "{ir}");
+
+            let mut scratch = Vec::new();
+            let mut backing = Vec::new();
+            for instruction in instructions.iter().copied().filter(|instruction| {
+                instruction.get_opcode() == InstructionOpcode::Load
+                    && matches!(instruction.get_type(), inkwell::types::AnyTypeEnum::IntType(ty) if ty.get_bit_width() == 8)
+            }) {
+                let Some(address) = known_field_operand(instruction, 0).and_then(|value| value.as_instruction_value())
+                    else { continue };
+                match address.get_opcode() {
+                    InstructionOpcode::GetElementPtr if known_field_operand(address, 0)
+                        .is_some_and(|base| unspill(base) == allocated) => scratch.push(instruction),
+                    InstructionOpcode::IntToPtr if known_field_operand(address, 0)
+                        .is_some_and(|handle| unspill(handle) == incoming) => backing.push(instruction),
+                    _ => {}
+                }
+            }
+            let [scratch] = scratch.as_slice() else { panic!("one real read from this frame's owned scratch: {ir}") };
+            let [backing] = backing.as_slice() else { panic!("one real read from original borrowed backing: {ir}") };
+            let returned = instructions.iter().copied().find(|instruction| {
+                instruction.get_opcode() == InstructionOpcode::Return
+            }).expect("normal frame return");
+
+            let return_value = known_field_operand(returned, 0).expect("actual returned frame result");
+            let contributes = |needle| {
+                let mut pending = vec![return_value];
+                let mut seen = Vec::new();
+                while let Some(value) = pending.pop() {
+                    if seen.contains(&value) { continue; }
+                    seen.push(value);
+                    let Some(instruction) = value.as_instruction_value() else { continue };
+                    if instruction == needle { return true; }
+                    if instruction.get_opcode() == InstructionOpcode::Load {
+                        let source = unspill(value);
+                        if source != value { pending.push(source); }
+                    } else if matches!(instruction.get_opcode(), InstructionOpcode::Add | InstructionOpcode::ZExt
+                        | InstructionOpcode::Phi | InstructionOpcode::Select)
+                    {
+                        pending.extend(instruction.get_operands().filter_map(|operand| operand?.value()));
+                    }
+                }
+                false
+            };
+            assert!(contributes(recursive) && contributes(*scratch) && contributes(*backing), "{ir}");
+
+            let call_block = recursive.get_parent().expect("recursive path");
+            let return_block = returned.get_parent().expect("normal return block");
+            assert_ne!(call_block, entry, "the base path avoids recursive descent: {ir}");
+            assert!(known_block_reaches(entry, return_block, Some(call_block)), "{ir}");
+            assert!(known_instruction_precedes_on_all_paths(allocation, recursive, entry), "{ir}");
+            assert!(known_instruction_precedes_on_all_paths(recursive, *scratch, call_block), "{ir}");
+            assert!(known_instruction_precedes_on_all_paths(recursive, *backing, call_block), "{ir}");
+            assert!(known_instruction_precedes_on_all_paths(*scratch, release, entry), "{ir}");
+            assert!(known_instruction_precedes_on_all_paths(*backing, release, entry), "{ir}");
+            assert!(known_instruction_precedes_on_all_paths(release, returned, entry), "{ir}");
         }
     }
 }
