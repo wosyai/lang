@@ -5003,6 +5003,59 @@ fn conflicting_live_loan(
     conflicts
 }
 
+fn extend_projected_read_origins(
+    state: &ReferenceEdgeState,
+    candidate: &ReferencePlaceId,
+    read: &mut BTreeSet<ReferenceOriginId>,
+) -> bool {
+    let mut found = false;
+    for known in &state.projected {
+        if !known.uninitialized && reference_places_same(&known.place, candidate) {
+            found = true;
+            read.extend(&known.origins);
+        }
+    }
+    found
+}
+
+#[cfg(test)]
+#[test]
+fn projected_read_keeps_presence_separate_from_origin_contents() {
+    let source = SourceIdentity::new("project".into(), "package".into(), "metadata".into(), "r1".into());
+    let span = ByteSpan::new(0, 10);
+    let place = |start| {
+        let declaration_span = ByteSpan::new(start, start + 1);
+        ReferencePlaceId {
+            source: source.clone(), function_span: span, block_span: span, declaration_span,
+            binding: ReferenceBindingId {
+                source: source.clone(), function_span: span, block_span: span, declaration_span,
+                kind: ReferenceBindingKind::Declared,
+            },
+            place: ScalarPlace::Name { name: String::new(), span },
+            projections: vec![ReferencePlaceProjection::Index(ScalarExpression::Integer { value: 0.into(), span })],
+        }
+    };
+    let checked = place(1);
+    let unrelated = place(2);
+    let mut state = ReferenceEdgeState::default();
+    state.projected.push(ReferenceProjectedState {
+        place: checked.clone(), origins: BTreeSet::from([ReferenceOriginId(9)]), uninitialized: true,
+    });
+    state.projected.push(ReferenceProjectedState {
+        place: unrelated, origins: BTreeSet::from([ReferenceOriginId(8)]), uninitialized: false,
+    });
+    let mut read = BTreeSet::new();
+    assert!(!extend_projected_read_origins(&state, &checked, &mut read));
+    state.projected.push(ReferenceProjectedState {
+        place: checked.clone(), origins: BTreeSet::new(), uninitialized: false,
+    });
+    assert!(extend_projected_read_origins(&state, &checked, &mut read));
+    assert!(read.is_empty());
+    state.projected.last_mut().unwrap().origins.insert(ReferenceOriginId(1));
+    assert!(extend_projected_read_origins(&state, &checked, &mut read));
+    assert_eq!(read, BTreeSet::from([ReferenceOriginId(1)]));
+}
+
 fn retire_overwritten_binding_origins(
     state: &mut ReferenceEdgeState,
     previous_origins: &BTreeSet<ReferenceOriginId>,
@@ -7272,23 +7325,12 @@ fn transfer_reference_facts(
                 } => {
                     let mut read = BTreeSet::new();
                     for candidate in candidates {
-                        let matching = state
-                            .projected
-                            .iter()
-                            .filter(|known| {
-                                reference_places_same(&known.place, candidate)
-                                    && !known.uninitialized
-                            })
-                            .collect::<Vec<_>>();
-                        if matching.is_empty() {
+                        if !extend_projected_read_origins(&state, candidate, &mut read) {
                             errors.push(ReferenceAnalysisError::MissingOrigin {
                                 source_span: point.source_span.clone(),
                                 binding_id: candidate.binding.clone(),
                                 reason: ReferenceAnalysisErrorReason::MissingCheckedReferenceOrigin,
                             });
-                        }
-                        for known in matching {
-                            read.extend(&known.origins);
                         }
                     }
                     if read.is_empty() {
