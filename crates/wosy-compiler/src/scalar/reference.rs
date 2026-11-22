@@ -6660,7 +6660,7 @@ fn transfer_reference_facts(
             .and_then(|_| original_points[id.0].successors.iter().copied().min());
         let states = incoming.take(id);
         let incoming_count = states.as_slice().len();
-        let mut local_read_conflicts = None;
+        let mut local_access_conflicts = None;
         let keep_in_place = keep_forward_point_in_place(&original_points[id.0].kind, ordinary_forward, incoming_count);
         let mut snapshot = if keep_in_place {
             None
@@ -7415,10 +7415,10 @@ fn transfer_reference_facts(
                     let staged = if place.projections.is_empty() && matches!(&point.kind, CfgPointKind::Read { .. }) {
                         cfg.local_borrow.and_then(|sealed| {
                             if incoming_count == 1 {
-                                sealed.conflicts(&place.binding, id, incoming_count, original_points)
+                                sealed.conflicts(&place.binding, id, incoming_count, original_points, local_borrow::AccessMode::Shared)
                             } else {
-                                local_read_conflicts.get_or_insert_with(||
-                                    sealed.conflicts(&place.binding, id, incoming_count, original_points)).clone()
+                                local_access_conflicts.get_or_insert_with(||
+                                    sealed.conflicts(&place.binding, id, incoming_count, original_points, local_borrow::AccessMode::Shared)).clone()
                             }
                         })
                     } else {
@@ -7870,16 +7870,27 @@ fn transfer_reference_facts(
                             } else {
                                 LoanAccess::Borrow(loan)
                             };
-                            let origins = conflicting_live_loan(
-                                original_points,
-                                cfg.scope_exit_bindings,
-                                strictly_forward,
-                                &cfg.facts,
-                                &state,
-                                id,
-                                place,
-                                access,
-                            );
+                            let staged = cfg.local_borrow.and_then(|sealed| {
+                                let CfgPointKind::Borrow { place: original, loan: issuance } =
+                                    &original_points[id.0].kind else { return None };
+                                if original != place || issuance != loan || loan.origin_place != *place
+                                    || loan.parent.is_some() || !place.projections.is_empty()
+                                    || !matches!(&place.place, ScalarPlace::Name { .. })
+                                {
+                                    return None;
+                                }
+                                let mode = match loan.mode {
+                                    ScalarReferenceMutability::Shared => local_borrow::AccessMode::Shared,
+                                    ScalarReferenceMutability::Mutable => local_borrow::AccessMode::Exclusive,
+                                };
+                                let verdict = || sealed.conflicts(&place.binding, id, incoming_count, original_points, mode);
+                                if incoming_count == 1 { verdict() }
+                                else { local_access_conflicts.get_or_insert_with(verdict).clone() }
+                            });
+                            let origins = staged.unwrap_or_else(|| conflicting_live_loan(
+                                original_points, cfg.scope_exit_bindings, strictly_forward, &cfg.facts,
+                                &state, id, place, access,
+                            ));
                             if !origins.is_empty() {
                                 errors.push(ReferenceAnalysisError::ConflictingPlace {
                                     source_span: point.source_span.clone(),
