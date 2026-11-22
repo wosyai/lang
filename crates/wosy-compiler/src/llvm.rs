@@ -3531,6 +3531,7 @@ fn retain_assignment_destination<'ctx>(
     state: &mut EmitState<'ctx, '_>,
     target: &crate::scalar::ScalarAssignmentTarget,
     ty: &ScalarType,
+    project: Option<ProjectCallScope<'_>>,
 ) -> Result<AssignmentDestination<'ctx>, String> {
     if *ty == ScalarType::Unit {
         return Ok(AssignmentDestination::Unit);
@@ -3552,6 +3553,13 @@ fn retain_assignment_destination<'ctx>(
                     })
                 }
             }
+        }
+        crate::ScalarPlace::Index { base, index, .. }
+            if matches!(ty, ScalarType::Struct(_) | ScalarType::Array { .. }) =>
+        {
+            Ok(AssignmentDestination::Existing(
+                memory::checked_fixed_assignment_element_pointer(context, state, base, index, project)?,
+            ))
         }
         place => Ok(AssignmentDestination::Existing(place_pointer(
             context, state, place, None,
@@ -3602,7 +3610,7 @@ fn emit_assignment<'ctx, 'module>(
         .targets
         .iter()
         .zip(&values)
-        .map(|(target, value)| retain_assignment_destination(context, state, target, &value.ty))
+        .map(|(target, value)| retain_assignment_destination(context, state, target, &value.ty, None))
         .collect::<Result<Vec<_>, String>>()?;
     let mut previous = assignment
         .targets
@@ -3715,7 +3723,7 @@ fn emit_project_assignment<'ctx, 'module>(
                     .as_pointer_value();
                 Ok(AssignmentDestination::Existing(pointer))
             } else {
-                retain_assignment_destination(context, state, target, ty)
+                retain_assignment_destination(context, state, target, ty, Some(ProjectCallScope { module, modules }))
             }
         })
         .collect::<Result<Vec<_>, String>>()?;
@@ -4181,7 +4189,6 @@ fn emit_checked_dereference_guard<'ctx, 'module>(
     state: &mut EmitState<'ctx, 'module>,
     address: inkwell::values::IntValue<'ctx>,
 ) -> Result<(), String> {
-    declare_core_runtime(context, state.module);
     let is_null = state
         .builder
         .build_int_compare(
@@ -4191,16 +4198,27 @@ fn emit_checked_dereference_guard<'ctx, 'module>(
             "deref_is_null",
         )
         .map_err(builder_error)?;
+    emit_checked_place_guard(context, state, is_null, "deref_null_panic", "deref_null_continue")
+}
+
+fn emit_checked_place_guard<'ctx>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, '_>,
+    invalid: inkwell::values::IntValue<'ctx>,
+    panic_name: &str,
+    continue_name: &str,
+) -> Result<(), String> {
+    declare_core_runtime(context, state.module);
     let function = state
         .builder
         .get_insert_block()
         .and_then(|block| block.get_parent())
-        .ok_or_else(|| "checked dereference has no containing function".to_owned())?;
-    let panic_block = context.append_basic_block(function, "deref_null_panic");
-    let continue_block = context.append_basic_block(function, "deref_null_continue");
+        .ok_or_else(|| "checked place has no containing function".to_owned())?;
+    let panic_block = context.append_basic_block(function, panic_name);
+    let continue_block = context.append_basic_block(function, continue_name);
     state
         .builder
-        .build_conditional_branch(is_null, panic_block, continue_block)
+        .build_conditional_branch(invalid, panic_block, continue_block)
         .map_err(builder_error)?;
     state.builder.position_at_end(panic_block);
     let panic = state
