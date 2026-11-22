@@ -368,6 +368,32 @@ pub(super) struct ArrayReturnPath {
     tail_call: Option<CfgPointId>,
 }
 
+fn grounded_array_return_dependencies(
+    body: BodyKey,
+    paths: &BTreeSet<Option<ArrayReturnPath>>,
+    mut resolve: impl FnMut(CfgPointId) -> Option<BodyKey>,
+) -> Option<BTreeSet<BodyKey>> {
+    let mut grounded = false;
+    let mut dependencies = BTreeSet::new();
+    for path in paths {
+        let path = path.as_ref()?;
+        if path.tail_call.is_some_and(|call| !path.dependencies.contains(&call)) {
+            return None;
+        }
+        let mut self_call = false;
+        for &point in &path.dependencies {
+            let target = resolve(point)?;
+            if path.tail_call == Some(point) && target != body {
+                return None;
+            }
+            self_call |= target == body;
+            dependencies.insert(target);
+        }
+        grounded |= path.tail_call.is_none() && !self_call;
+    }
+    grounded.then_some(dependencies)
+}
+
 #[derive(Default)]
 pub(super) struct AggregateFlowResult {
     pub(super) checked_backing_forward_candidate: Option<(OccurrenceOrdinal, CfgPointId, CfgPointId)>,
@@ -1978,29 +2004,20 @@ fn closed_aggregates<'a>(
                 array_callsites.push((key, body.cfg, facts));
             }
             if body.is_monomorphic && !facts.array_invalid && !facts.array_returns.is_empty() {
-                let mut grounded = false;
-                let mut dependencies = BTreeSet::new();
-                let valid = facts.array_returns.iter().all(|path| {
-                    let Some(path) = path else { return false };
-                    let mut self_call = false;
-                    for &point in &path.dependencies {
-                        let Some(target) = target_body(&declarations, body.cfg, point) else { return false };
-                        if path.tail_call == Some(point) && target != key {
-                            return false;
-                        }
+                if let Some(mut dependencies) = grounded_array_return_dependencies(
+                    key,
+                    &facts.array_returns,
+                    |point| {
+                        let target = target_body(&declarations, body.cfg, point)?;
                         if facts.array_conditional_forwarded && target != key
                             && !bodies.get(&target).and_then(|callee| callee.facts)
                                 .is_some_and(|callee| callee.array_neutral)
                         {
-                            return false;
+                            return None;
                         }
-                        self_call |= target == key;
-                        dependencies.insert(target);
-                    }
-                    grounded |= path.tail_call.is_none() && !self_call;
-                    true
-                });
-                if valid && grounded {
+                        Some(target)
+                    },
+                ) {
                     if dependencies.is_empty() {
                         array_leaves.insert(key);
                     } else {
@@ -2658,6 +2675,46 @@ impl ProjectReferenceResults {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recursive_array_tail_needs_a_grounded_formal_path() {
+        let body = (0, 1, None);
+        let call = CfgPointId(5);
+        let tail = || Some(ArrayReturnPath {
+            dependencies: BTreeSet::from([call]),
+            tail_call: Some(call),
+        });
+        let base = || Some(ArrayReturnPath {
+            dependencies: BTreeSet::new(),
+            tail_call: None,
+        });
+        let resolve_self = |point| (point == call).then_some(body);
+
+        assert_eq!(
+            grounded_array_return_dependencies(body, &BTreeSet::from([base(), tail()]), resolve_self),
+            Some(BTreeSet::from([body])),
+        );
+        assert_eq!(
+            grounded_array_return_dependencies(body, &BTreeSet::from([tail()]), resolve_self),
+            None,
+        );
+        assert_eq!(
+            grounded_array_return_dependencies(body, &BTreeSet::from([base(), tail(), None]), resolve_self),
+            None,
+        );
+        assert_eq!(
+            grounded_array_return_dependencies(body, &BTreeSet::from([base(), tail()]), |_| None),
+            None,
+        );
+        let unlinked_tail = Some(ArrayReturnPath {
+            dependencies: BTreeSet::new(),
+            tail_call: Some(call),
+        });
+        assert_eq!(
+            grounded_array_return_dependencies(body, &BTreeSet::from([base(), unlinked_tail]), resolve_self),
+            None,
+        );
+    }
 
     #[test]
     fn passive_raw_reader_requires_a_grounded_read_and_an_independent_checked_output() {
