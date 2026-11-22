@@ -262,6 +262,7 @@ impl Author {
         let mut owners = (0..self.owners.len()).map(|_| Owner::default()).collect::<Vec<_>>();
         let mut holders = Vec::with_capacity(self.holders.len());
         for (_, holder) in self.holders {
+            let Some(&last_read) = holder.reads.last() else { continue };
             let mut live = Vec::new();
             let (_, mut write_arms) = holder.arm_runs();
             if !write_arms.is_empty() {
@@ -279,20 +280,12 @@ impl Author {
                         retirement = install.version;
                     }
                 }
-                if let Some(&end) = holder.reads.last() {
-                    let start = CfgPointId(holder.writes[0].version.0 + 1);
-                    if start < end { live.push(Interval { start, end }); }
-                }
+                let start = CfgPointId(holder.writes[0].version.0 + 1);
+                if start < last_read { live.push(Interval { start, end: last_read }); }
             } else {
-                holder.linear_leases(exit, |install, end, last_read| {
-                    let start = CfgPointId(install.version.0 + 1);
-                    if start < end {
-                        owners[install.loan.owner].active[usize::from(install.loan.mutable)]
-                            .push(Interval { start, end });
-                    }
-                    if let Some(end) = last_read.filter(|last| start < *last) {
-                        live.push(Interval { start, end });
-                    }
+                holder.live_linear_leases(exit, |loan, interval| {
+                    owners[loan.owner].active[usize::from(loan.mutable)].push(interval);
+                    live.push(interval);
                 });
             }
             if live.is_empty() {
@@ -344,18 +337,20 @@ impl Holder {
         }
     }
 
-    fn linear_leases(
-        &self, exit: CfgPointId, mut visit: impl FnMut(&Install, CfgPointId, Option<CfgPointId>),
-    ) {
+    fn live_linear_leases(&self, exit: CfgPointId, mut visit: impl FnMut(Loan, Interval)) {
         let mut writes = self.writes.iter().peekable();
         let mut reads = self.reads.iter().copied().peekable();
-        while let Some(write) = writes.next() {
-            let end = writes.peek().map_or(exit, |next| next.version);
+        while reads.peek().is_some() {
+            let Some(write) = writes.next() else { break };
+            let retire = writes.peek().map_or(exit, |next| next.version);
+            let start = CfgPointId(write.version.0 + 1);
             let mut last = None;
-            while let Some(read) = reads.next_if(|read| *read < end) {
-                if write.version < read { last = Some(read); }
+            while let Some(read) = reads.next_if(|read| *read < retire) {
+                if start < read { last = Some(read); }
             }
-            visit(write, end, last);
+            if let Some(end) = last {
+                visit(write.loan, Interval { start, end });
+            }
         }
     }
 }
@@ -456,12 +451,7 @@ impl Holder {
     fn refine(&self, forks: &Forks, exit: CfgPointId) -> Option<Refinement> {
         if self.arms.as_deref().is_none_or(|arms| arms.writes.is_empty() && !arms.second_read) {
             let mut leases = Vec::new();
-            self.linear_leases(exit, |install, _, last_read| {
-                let start = CfgPointId(install.version.0 + 1);
-                if let Some(end) = last_read.filter(|&last| start < last) {
-                    leases.push(LinearLease { interval: Interval { start, end }, loan: install.loan });
-                }
-            });
+            self.live_linear_leases(exit, |loan, interval| leases.push(LinearLease { interval, loan }));
             return Some(Refinement::Linear(leases));
         }
         self.branch_boundaries(forks).map(Refinement::Branching)
@@ -1001,14 +991,32 @@ pub(super) mod tests {
         replays.pop().expect("definitive replay").errors
     }
 
+    fn assert_retired_read_clears_before_refinement(result: &FunctionReferenceResult) {
+        let sealed = result.proof_points.local_borrow.as_ref().unwrap();
+        let points = &result.cfg.initial_points;
+        let read = points.iter().find(|point| point.source_span.range == ByteSpan::new(8, 9)
+            && matches!(point.kind, CfgPointKind::Read { .. })).unwrap();
+        let CfgPointKind::Read { binding } = &read.kind else { unreachable!() };
+        let owner = &sealed.owners[sealed.owner_index[binding]];
+        assert!(owner.carriers.iter().any(|&(holder, modes)|
+            modes & 2 != 0 && contains(&sealed.holders[holder].live, read.id)));
+        assert!(!contains(&owner.active[1], read.id));
+        let before = COUNTS.with(|counts| counts.get());
+        assert_eq!(sealed.conflicts(binding, read.id, 1, points, AccessMode::Shared), Some(Vec::new()));
+        let after = COUNTS.with(|counts| counts.get());
+        assert_eq!(after[0], before[0] + 1);
+        assert_eq!(after[1..], before[1..]);
+    }
+
     #[test]
     fn production_builder_and_pristine_replay_replace_only_complete_local_read_verdicts() {
         let mut admitted = inert_result(true, false, false, false, false);
         assert!(admitted.proof_points.local_borrow.is_some());
+        assert_retired_read_clears_before_refinement(&admitted);
         COUNTS.with(|counts| counts.set([0; 7]));
         let staged = definitive(&mut admitted);
         let counts = COUNTS.with(|counts| counts.get());
-        assert_eq!(&counts[..5], &[2, 4, 2, 0, 0]);
+        assert_eq!(&counts[..5], &[3, 3, 2, 0, 0]);
         let again = definitive(&mut admitted);
         assert_eq!(staged, again);
         assert_eq!(COUNTS.with(|counts| counts.get()[2]), 2);
@@ -1029,6 +1037,24 @@ pub(super) mod tests {
             ReferenceAnalysisError::ConflictingPlace { source_span, .. } if source_span.range == ByteSpan::new(8, 9))));
     }
     #[test]
+    fn production_linear_owner_summary_stops_at_last_holder_use() {
+        let mut staged = inert_result(true, false, false, true, false);
+        let mut ordinary = inert_result(false, false, false, true, false);
+        let sealed = staged.proof_points.local_borrow.as_ref().expect("sealed linear analysis");
+        let owner = |start| sealed.owner_index.iter()
+            .find(|(binding, _)| binding.declaration_span == ByteSpan::new(start, start + 1))
+            .map(|(_, &index)| &sealed.owners[index]).unwrap();
+        let at = |start| staged.cfg.initial_points.iter()
+            .find(|point| point.source_span.range == ByteSpan::new(start, start + 1)
+                && matches!(point.kind, CfgPointKind::Read { .. })).unwrap().id;
+        assert!(owner(20).active[1].is_empty());
+        assert!(owner(25).active[1].is_empty());
+        assert!(contains(&owner(21).active[1], at(9)));
+        assert!(!contains(&owner(21).active[1], at(16)));
+        assert_eq!(definitive(&mut staged), definitive(&mut ordinary));
+    }
+
+    #[test]
     fn production_post_join_agreement_preserves_state_multiplicity_and_divergence_falls_back() {
         fn at(errors: &[ReferenceAnalysisError], start: u32) -> Vec<Vec<ByteSpan>> {
             errors.iter().filter_map(|error| match error {
@@ -1041,6 +1067,7 @@ pub(super) mod tests {
         for divergent in [false, true] {
             let mut admitted = inert_result(true, divergent, false, false, false);
             assert!(admitted.proof_points.local_borrow.is_some());
+            if !divergent { assert_retired_read_clears_before_refinement(&admitted); }
             COUNTS.with(|counts| counts.set([0; 7]));
             let staged = definitive(&mut admitted);
             let counts = COUNTS.with(|counts| counts.get());
@@ -1048,8 +1075,8 @@ pub(super) mod tests {
             assert_eq!(staged, definitive(&mut incumbent));
             assert_eq!(at(&staged, 13), vec![vec![ByteSpan::new(3, 4), ByteSpan::new(15, 16)]]);
             assert_eq!(counts[4], if divergent { 2 } else { 0 });
-            assert_eq!(counts[1], if divergent { 5 } else { 4 });
-            assert_eq!(counts[0], 2);
+            assert_eq!(counts[1], if divergent { 5 } else { 3 });
+            assert_eq!(counts[0], if divergent { 2 } else { 3 });
             assert!(at(&staged, 35).is_empty());
             assert_eq!(counts[3], usize::from(divergent));
             if divergent {
@@ -1090,11 +1117,12 @@ pub(super) mod tests {
         let sealed = admitted.proof_points.local_borrow.as_ref().expect("complete linear proof");
         assert!(sealed.forks.first.is_none());
         assert!(incumbent.proof_points.local_borrow.is_none());
+        assert_retired_read_clears_before_refinement(&admitted);
         COUNTS.with(|counts| counts.set([0; 7]));
         let staged = definitive(&mut admitted);
         let counts = COUNTS.with(|counts| counts.get());
         assert_eq!(staged, definitive(&mut incumbent));
-        assert_eq!(&counts[..2], &[2, 3]);
+        assert_eq!(&counts[..2], &[3, 2]);
         assert_eq!(counts[3], 0);
         assert!(counts[5] > 0 && counts[6] > 0);
         assert!(staged.iter().any(|error| matches!(error,
