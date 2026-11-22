@@ -5357,6 +5357,32 @@ fn enforces_assignment_target_and_writable_path_rules_in_projects() {
 }
 
 #[test]
+fn permits_only_copy_aggregates_in_direct_fixed_array_assignments() {
+    let source_text = "%%start\nstruct copy Entry { u8 value; }\nEntry[2] entries = [{ .value = 1; }, { .value = 2; }];\nu8[2][2] rows = [[1, 2], [3, 4]];\nu8[2] fresh = [8, 9];\nu8(u64) update = fn(index) {\nentries[index] = { .value = 7; };\nrows[index] = fresh;\nentries[index].value + rows[index][0]\n};\n%%end";
+    let check_project = |text: &str| {
+        let main = module_source("src/main.w");
+        validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::from_program(module_from_text(main.clone(), text), Vec::new())],
+            vec![main],
+        )).diagnostics
+    };
+    assert!(validate_text(source_text).diagnostics.is_empty());
+    let project = check_project(source_text);
+    assert!(project.is_empty(), "{project:?}");
+    for blocked in [
+        source_text.replace("struct copy Entry", "struct Entry"),
+        source_text.replace("rows", "ROWS"),
+    ] {
+        for diagnostics in [validate_text(&blocked).diagnostics, check_project(&blocked)] {
+            assert!(diagnostics.iter().any(|diagnostic| {
+                diagnostic.code == "B0003"
+                    && diagnostic.message == "assignment place requires a scalar leaf type"
+            }), "{diagnostics:?}");
+        }
+    }
+}
+
+#[test]
 fn derives_and_types_fixed_array_index_places_and_addresses() {
     let text = "%%start\nstruct Record { u8[2] bytes; }\nu8[2][2] matrix = [[1, 2], [3, 4]];\nu64 row = 1;\nu64 column = 0;\nRecord holder = { .bytes = [5, 6]; };\nu8 nested = matrix[row][column];\nu8 field = holder.bytes[column];\n*u8 shared = &matrix[row][column];\n*!u8 mutable = &!holder.bytes[column];\nunsafe { *?u8 raw = &?matrix[row][column]; };\n%%end";
     let result = validate_text(text);
