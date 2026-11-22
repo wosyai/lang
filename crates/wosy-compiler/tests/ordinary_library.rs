@@ -614,6 +614,10 @@ fn mixed_owned_struct_forwarder_transports_original_receipts_without_copying() {
     let app = source("workbench", "src/mixed_owner_forward.w");
     let text = r#"%%start
 struct Packet { *?u8 data; u64 length; }
+(Packet, u32)(u64, u8, u32) forward_packet = fn(length, value, marker) {
+    Packet packet, u32 status = relay_packet(length, value, marker);
+    packet, status
+};
 (Packet, u32)(u64, u8, u32) make_packet = fn(length, value, marker) {
     u8[length] backing;
     backing[0] = value;
@@ -630,7 +634,7 @@ Packet shared_packet = { .data = null; .length = 5; };
 (Packet, u32)() ordinary_packet = fn { shared_packet, 7 };
 u64() receive_packets = fn {
     Packet first, u32 first_status = relay_packet(2, 19, 37);
-    Packet second, u32 second_status = relay_packet(3, 41, 43);
+    Packet second, u32 second_status = forward_packet(3, 41, 43);
     Packet plain, u32 plain_status = ordinary_packet();
     u8 first_byte = unsafe { core.load<u8>(first.data) };
     u8 second_byte = unsafe { core.load<u8>(second.data) };
@@ -654,9 +658,14 @@ if (result != 152) { core.system_panic(); };
         module.verify().unwrap();
         let producer = function_with_suffix(&module, "make_packet");
         let relay = function_with_suffix(&module, "relay_packet");
+        let forward = function_with_suffix(&module, "forward_packet");
         let receiver = function_with_suffix(&module, "receive_packets");
         let plain = function_with_suffix(&module, "ordinary_packet");
-        let relay = module.get_function(&relay).unwrap();
+        let (producer, relay, forward) = (
+            module.get_function(&producer).unwrap(),
+            module.get_function(&relay).unwrap(),
+            module.get_function(&forward).unwrap(),
+        );
         let caller = module.get_function(&receiver).unwrap();
         fn calls<'ctx>(function: inkwell::values::FunctionValue<'ctx>)
             -> Vec<(inkwell::values::InstructionValue<'ctx>, CallSiteValue<'ctx>)>
@@ -665,19 +674,24 @@ if (result != 152) { core.system_panic(); };
                 .filter(|inst| inst.get_opcode() == InstructionOpcode::Call)
                 .filter_map(|inst| CallSiteValue::try_from(inst).ok().map(|call| (inst, call))).collect()
         }
-        let relay_calls = calls(relay);
-        let [(inst, forwarded)] = relay_calls.as_slice() else { panic!("wrapper must only call the leaf") };
-        assert_eq!(forwarded.get_called_fn_value(), module.get_function(&producer));
-        assert_eq!(inst.get_operand(3).unwrap().value(), relay.get_last_param());
         use inkwell::values::AnyValue;
-        let relay_ir = relay.print_to_string().to_string();
-        assert!(relay_ir.contains("define internal { ptr, i32 }"), "{relay_ir}");
-        assert!(relay_ir.contains("ret { ptr, i32 } %aggregate_original_base"), "{relay_ir}");
-        assert!(!relay_ir.contains("memcpy") && !relay_ir.contains("__wosy_core_free"), "{relay_ir}");
-        assert!(!relay_ir.contains("extractvalue") && !relay_ir.contains("insertvalue"), "{relay_ir}");
+        for (wrapper, callee) in [(relay, producer), (forward, relay)] {
+            let wrapper_calls = calls(wrapper);
+            let [(inst, forwarded)] = wrapper_calls.as_slice() else { panic!("wrapper must only call its selected callee") };
+            assert_eq!(forwarded.get_called_fn_value(), Some(callee));
+            assert_eq!(inst.get_operand(3).unwrap().value(), wrapper.get_last_param());
+            let relay_ir = wrapper.print_to_string().to_string();
+            assert!(relay_ir.contains("define internal { ptr, i32 }"), "{relay_ir}");
+            assert!(relay_ir.contains("ret { ptr, i32 } %aggregate_original_base"), "{relay_ir}");
+            assert!(!relay_ir.contains("memcpy") && !relay_ir.contains("__wosy_core_free"), "{relay_ir}");
+            assert!(!relay_ir.contains("extractvalue") && !relay_ir.contains("insertvalue"), "{relay_ir}");
+        }
         let caller_calls = calls(caller);
-        let receipts = caller_calls.iter().filter(|(_, call)| call.get_called_fn_value() == Some(relay)).collect::<Vec<_>>();
+        let receipts = caller_calls.iter().filter(|(_, call)|
+            call.get_called_fn_value().is_some_and(|callee| callee == relay || callee == forward)).collect::<Vec<_>>();
         let [(first_inst, first), (second_inst, second)] = receipts.as_slice() else { panic!("two receiver destinations required") };
+        assert_eq!(first.get_called_fn_value(), Some(relay));
+        assert_eq!(second.get_called_fn_value(), Some(forward));
         assert_ne!(first_inst.get_operand(3).unwrap().value(), second_inst.get_operand(3).unwrap().value());
         let first_base = first.try_as_basic_value().basic().unwrap();
         let second_base = second.try_as_basic_value().basic().unwrap();

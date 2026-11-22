@@ -11019,14 +11019,15 @@ fn derive_module_reference_origins(
                 .then_some(declaration)
         }).collect::<HashSet<_>>();
         if !owners.is_empty() {
-            let forwarders = mixed_producers.into_iter().filter_map(|(position, declaration)| {
+            let mut forwarding_users = HashMap::<_, Vec<_>>::new();
+            for (position, declaration) in mixed_producers {
                 let (index, result) = &updates[position];
                 let ScalarItem::Function(function) = &items[*index] else { unreachable!("function result ordinal") };
-                result.mixed_forwarded_leaf(source, function, &call_sites.functions[index])
-                    .filter(|leaf| owners.contains(leaf))
-                    .map(|_| declaration)
-            }).collect::<HashSet<_>>();
-            owners.extend(forwarders.iter().copied());
+                if let Some(callee) = result.mixed_forwarded_callee(source, function, &call_sites.functions[index]) {
+                    forwarding_users.entry(callee).or_default().push(declaration);
+                }
+            }
+            let forwarders = reachable_mixed_forwarders(&mut owners, forwarding_users);
             for position in mixed_callers {
                 let (index, result) = &mut updates[position];
                 let ScalarItem::Function(function) = &items[*index] else { unreachable!("function result ordinal") };
@@ -11037,6 +11038,40 @@ fn derive_module_reference_origins(
         }
     }
     (updates, errors)
+}
+
+fn reachable_mixed_forwarders(
+    owners: &mut HashSet<ByteSpan>, mut users: HashMap<ByteSpan, Vec<ByteSpan>>,
+) -> HashSet<ByteSpan> {
+    let mut pending = owners.iter().copied().collect::<Vec<_>>();
+    let mut forwarders = HashSet::new();
+    while let Some(callee) = pending.pop() {
+        let Some(callers) = users.remove(&callee) else { continue };
+        for caller in callers {
+            if owners.insert(caller) {
+                forwarders.insert(caller);
+                pending.push(caller);
+            }
+        }
+    }
+    forwarders
+}
+
+#[cfg(test)]
+#[test]
+fn mixed_wrapper_reachability_requires_an_allocation_grounded_predecessor() {
+    let span = |index| ByteSpan::new(index, index + 1);
+    let mut owners = HashSet::from([span(0)]);
+    let actual = reachable_mixed_forwarders(&mut owners, HashMap::from([
+        (span(2), vec![span(3)]),
+        (span(4), vec![span(5)]),
+        (span(0), vec![span(1)]),
+        (span(1), vec![span(2), span(6)]),
+        (span(5), vec![span(4)]),
+        (span(7), vec![span(8)]),
+    ]));
+    assert_eq!(actual, HashSet::from([span(1), span(2), span(3), span(6)]));
+    assert_eq!(owners, HashSet::from([span(0), span(1), span(2), span(3), span(6)]));
 }
 
 fn install_module_reference_results(
@@ -11957,7 +11992,7 @@ impl FunctionReferenceResult {
         found
     }
 
-    fn mixed_forwarded_leaf(
+    fn mixed_forwarded_callee(
         &self, source: &SourceIdentity, function: &ScalarFunction, sites: &FunctionCallSites,
     ) -> Option<ByteSpan> {
         let [ScalarBlockItem::LocalBinding(binding),
