@@ -195,6 +195,16 @@ impl IntegerSet {
     }
 
     #[cfg(feature = "internal-checker")]
+    pub(super) fn into_extremum(self, lower: bool) -> Option<BigInt> {
+        let mut intervals = self.0.into_iter();
+        if lower {
+            intervals.next().map(|interval| interval.first)
+        } else {
+            intervals.next_back().map(|interval| interval.last)
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
     pub(super) fn intervals(&self) -> impl ExactSizeIterator<Item = (&BigInt, &BigInt)> {
         self.0.iter().map(|interval| (&interval.first, &interval.last))
     }

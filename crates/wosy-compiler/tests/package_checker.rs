@@ -2949,6 +2949,45 @@ fn named_universal_conjunction_combines_equality_and_disjointness_with_bounds() 
 }
 
 #[test]
+fn named_repeated_forall_combines_independent_exact_domains_without_cross_binder_arithmetic() {
+    let identity = source();
+    let check = |foralls: &str, goal: &str, guard: &str, actual: &str| {
+        check_scalar_module_proof(
+            identity.clone(), "bounded",
+            vec![ScalarProofModuleInput {
+                source: identity.clone(),
+                text: format!(r#"%%start
+                    i16(i16) echo = fn(value) {{ value }};
+                    proof bounded for echo(input) -> (out) where ({guard}) {foralls}
+                        ensures ({goal}) {{}}
+                    {actual}
+                %%end"#),
+                namespaces: Vec::new(),
+            }],
+            vec![identity.clone()], ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
+        )
+    };
+    use ScalarModuleProofOutcome::{Invalid, NoApplicableInputs, Proved, Refuted, Unsupported};
+    let domains = "forall (i16 lower where lower <= -8) forall (i16 upper where upper >= 8 && upper != 8)";
+    let bounded = "out >= lower && (out < upper && out != 0)";
+    assert_eq!(check(domains, bounded, "input >= -8 && input <= 8 && input != 0", ""), Proved);
+    assert_eq!(check(domains, bounded, "input >= -8 && input <= 8", ""), Refuted);
+    assert_eq!(check(domains, bounded, "input <= 9 && input >= 8", ""), Refuted);
+    assert_eq!(check(domains, bounded, "true", "i16 a = echo(-8); i16 b = echo(8);"), Proved);
+    assert_eq!(check(domains, bounded, "true", "i16 a = echo(-8); i16 b = echo(9);"), Refuted);
+    assert_eq!(check(domains, bounded, "false", "i16 a = echo(9);"), NoApplicableInputs);
+    let third = format!("{domains} forall (i16 cap where cap >= 3)");
+    assert_eq!(check(&third, "out >= lower && out < upper && out <= cap", "input >= -8 && input <= 3", ""), Proved);
+    assert_eq!(check(domains, "out > lower && out <= lower && out < upper", "input == 1", ""), Refuted);
+    assert_eq!(check(domains, "lower <= upper && out < upper", "true", ""), Unsupported);
+    assert_eq!(check(domains, "out < upper && out != 0", "true", ""), Unsupported);
+    assert!(matches!(check("forall (i16 k where k >= 0) forall (i16 k where k <= 1)", "out >= k && out <= k", "true", ""), Invalid(_)));
+    assert_eq!(check("forall (i16 lower where false) forall (i16 upper where upper >= 8)", bounded, "true", ""), Unsupported);
+    assert!(matches!(check("forall (i16 lower where false) forall (i16 upper where upper <= 32768)", bounded, "true", ""), Invalid(_)));
+    assert_eq!(check("forall (u16 lower) forall (i16 upper)", bounded, "true", ""), Unsupported);
+}
+
+#[test]
 fn named_universal_proof_reduces_exact_typed_domains_on_shared_actual_and_unused_returns() {
     let identity = source();
     let check = |quantifiers: &str, goal: &str, guard: &str, actual: &str| {

@@ -3743,6 +3743,73 @@ fn typed_named_universal_conjunction(
     Ok(TypedProofGoal::UniversalConjunction(UniversalConjunction::Output(Box::new(output_bounds))))
 }
 
+#[cfg(feature = "internal-checker")]
+fn typed_named_repeated_universal(
+    foralls: impl Iterator<Item = CstNode>, ensures: &ScalarExpression,
+    output: &str, inputs: &[String], ty: &ScalarType,
+) -> Result<TypedProofGoal, ProjectCheck> {
+    use std::cmp::Ordering::{Equal, Greater, Less};
+    if !matches!(ensures, ScalarExpression::Binary { operator: BinaryOperator::And, .. }) {
+        return Err(ProjectCheck::Unsupported);
+    }
+    let declarations = foralls.map(|forall| {
+        let (_, binder) = typed_quantifier_binder(&forall, output, inputs, ty)?;
+        Ok((forall, binder))
+    }).collect::<Result<Vec<_>, ProjectCheck>>()?;
+    let mut names = HashMap::with_capacity(declarations.len());
+    for (index, (_, name)) in declarations.iter().enumerate() {
+        if names.insert(name.as_str(), index).is_some() {
+            return Err(ProjectCheck::InvalidProof);
+        }
+    }
+    let mut relations = vec![None::<IntegerRelation>; declarations.len()];
+    let mut output_bounds = IntegerShowConstraints::default();
+    visit_output_conjuncts(ensures, |atom| {
+        if let ScalarExpression::Binary { operator, left, right, .. } = atom {
+            if let ScalarExpression::Name { name, .. } = right.as_ref() {
+                let slot = *names.get(name.as_str()).ok_or(ProjectCheck::Unsupported)?;
+                if !matches!(left.as_ref(), ScalarExpression::Name { name, .. } if name == output)
+                    || !matches!(operator, BinaryOperator::Less | BinaryOperator::LessEqual | BinaryOperator::Greater | BinaryOperator::GreaterEqual)
+                {
+                    return Err(ProjectCheck::Unsupported);
+                }
+                let relation = IntegerRelation::from_operator(operator).ok_or(ProjectCheck::Unsupported)?;
+                relations[slot] = Some(relations[slot].map_or(relation, |known| known.intersection(relation)));
+                return Ok(());
+            }
+        }
+        let (relation, bound) = typed_output_atom(atom, output, inputs, ty)?;
+        output_bounds.add(relation, Cow::Owned(bound));
+        Ok(())
+    })?;
+    let mut unavailable = false;
+    let mut impossible = false;
+    for ((forall, binder), relation) in declarations.into_iter().zip(relations) {
+        let domain = typed_quantifier_domain(&forall, &binder, inputs, ty)?;
+        let (Some((minimum, maximum)), Some(relation)) = (domain.extremes(), relation) else {
+            unavailable = true;
+            continue;
+        };
+        let lower = match (relation.accepts(Less), relation.accepts(Greater), relation.accepts(Equal)) {
+            (true, false, _) => true,
+            (false, true, _) => false,
+            (false, false, true) if minimum == maximum => true,
+            (false, false, _) => { impossible = true; continue; }
+            _ => return Err(ProjectCheck::Unsupported),
+        };
+        let bound = domain.into_extremum(lower).ok_or(ProjectCheck::Unsupported)?;
+        output_bounds.add(relation, Cow::Owned(bound));
+    }
+    if unavailable {
+        return Err(ProjectCheck::Unsupported);
+    }
+    if impossible {
+        return Ok(TypedProofGoal::UniversalConjunction(UniversalConjunction::Impossible));
+    }
+    output_bounds.normalize();
+    Ok(TypedProofGoal::UniversalConjunction(UniversalConjunction::Output(Box::new(output_bounds))))
+}
+
 fn typed_quantifier_binder(
     quantifier: &CstNode, output: &str, inputs: &[String], output_type: &ScalarType,
 ) -> Result<(ScalarType, String), ProjectCheck> {
@@ -4465,24 +4532,41 @@ fn typed_proof_postcondition<'a, const AUDIT_INDUCTION: bool, const DEFER_OUTPUT
     } else {
         let ensures = derive_expression(&child(&ensures_node, SyntaxKind::Expression)?);
         if let Some(forall) = foralls.next() {
-            if foralls.next().is_some() || measure.is_some() {
+            if measure.is_some() {
                 return Err(ProjectCheck::Unsupported);
             }
-            #[cfg(feature = "internal-checker")]
-            let conjunction = if allow_named_entry_facts && steps.items.is_empty()
-                && matches!(&ensures, ScalarExpression::Binary { operator: BinaryOperator::And, .. })
-            {
-                Some(typed_named_universal_conjunction(&forall, &ensures, output, &input_names, &result.ty)?)
+            if let Some(second) = foralls.next() {
+                #[cfg(feature = "internal-checker")]
+                {
+                    if !allow_named_entry_facts || !steps.items.is_empty() {
+                        return Err(ProjectCheck::Unsupported);
+                    }
+                    typed_named_repeated_universal(
+                        [forall, second].into_iter().chain(foralls), &ensures, output, &input_names, &result.ty,
+                    )?
+                }
+                #[cfg(not(feature = "internal-checker"))]
+                {
+                    let _ = second;
+                    return Err(ProjectCheck::Unsupported);
+                }
             } else {
-                None
-            };
-            #[cfg(not(feature = "internal-checker"))]
-            let conjunction = None;
-            match conjunction {
-                Some(goal) => goal,
-                None => typed_universal_output_goal(
-                    &forall, &ensures, output, &input_names, &result.ty, allow_named_entry_facts && steps.items.is_empty(),
-                )?,
+                #[cfg(feature = "internal-checker")]
+                let conjunction = if allow_named_entry_facts && steps.items.is_empty()
+                    && matches!(&ensures, ScalarExpression::Binary { operator: BinaryOperator::And, .. })
+                {
+                    Some(typed_named_universal_conjunction(&forall, &ensures, output, &input_names, &result.ty)?)
+                } else {
+                    None
+                };
+                #[cfg(not(feature = "internal-checker"))]
+                let conjunction = None;
+                match conjunction {
+                    Some(goal) => goal,
+                    None => typed_universal_output_goal(
+                        &forall, &ensures, output, &input_names, &result.ty, allow_named_entry_facts && steps.items.is_empty(),
+                    )?,
+                }
             }
         } else if let ScalarExpression::Binary { operator: BinaryOperator::Or, left, right, .. } = &ensures {
             let atoms = typed_output_disjunction(left, right, output, &input_names, &result.ty)?;
