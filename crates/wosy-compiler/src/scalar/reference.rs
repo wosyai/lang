@@ -7811,22 +7811,29 @@ fn transfer_reference_facts(
                     state.return_outputs.insert(*output, origins.clone());
                 }
             }
-            if matches!(
-                point.kind,
-                CfgPointKind::Read { .. }
-                    | CfgPointKind::ReadPlace {
-                        reads_origin: true,
-                        ..
+            let checked_value = match &point.kind {
+                CfgPointKind::ReturnOutput { .. } | CfgPointKind::Return => {
+                    point.possible_origins = checked_value;
+                    None
+                }
+                kind => {
+                    if matches!(
+                        kind,
+                        CfgPointKind::Read { .. }
+                            | CfgPointKind::ReadPlace {
+                                reads_origin: true,
+                                ..
+                            }
+                            | CfgPointKind::Bind { .. }
+                            | CfgPointKind::Assign { .. }
+                            | CfgPointKind::AssignThrough { .. }
+                    ) || checked_join_values.is_some() || checked_block_value.is_some() || point.possible_origins.is_none()
+                    {
+                        point.possible_origins = checked_value.clone();
                     }
-                    | CfgPointKind::Bind { .. }
-                    | CfgPointKind::Assign { .. }
-                    | CfgPointKind::AssignThrough { .. }
-                    | CfgPointKind::ReturnOutput { .. }
-                    | CfgPointKind::Return
-            ) || checked_join_values.is_some() || checked_block_value.is_some() || point.possible_origins.is_none()
-            {
-                point.possible_origins = checked_value.clone();
-            }
+                    checked_value
+                }
+            };
             if let Some(descriptor) = descriptor.as_deref_mut() {
                 descriptor.observe(point, &state, &cfg.facts);
             }
