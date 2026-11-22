@@ -139,6 +139,29 @@ impl IntegerInputs {
         rest.iter().all(|row| row[axis].singleton_value() == Some(value)).then_some(value)
     }
 
+    fn project_axis(&self, axis: usize) -> Option<Rc<IntegerSet>> {
+        let (first, rest) = self.0.split_first()?;
+        let first = &first[axis];
+        Some(if rest.iter().all(|row| Rc::ptr_eq(first, &row[axis])) {
+            Rc::clone(first)
+        } else {
+            Rc::new(IntegerSet::union(self.0.iter().map(|row| row[axis].as_ref())))
+        })
+    }
+
+    fn restrict_axis(&mut self, axis: usize, survivors: &IntegerSet) {
+        self.0.retain_mut(|row| {
+            let retained = row[axis].intersection(survivors);
+            if retained.is_empty() {
+                return false;
+            }
+            if retained != *row[axis] {
+                row[axis] = Rc::new(retained);
+            }
+            true
+        });
+    }
+
     fn split(
         self,
         roots: &IntegerRoots<'_>,
@@ -465,8 +488,14 @@ pub(super) enum IntegerRequirementEntry<'a> {
     Projected(Rc<IntegerSet>),
 }
 
+pub(super) enum IntegerRequirementContinuation {
+    Feasible,
+    Empty,
+    Projected(Rc<IntegerSet>),
+}
+
 struct IntegerFailureCollection<'a, 'sink> {
-    continued: bool,
+    continuation: IntegerRequirementContinuation,
     projected: Option<Rc<IntegerSet>>,
     allow_projected_calls: bool,
     sink: &'sink mut dyn FnMut(IntegerCheckFailure<'a>),
@@ -478,17 +507,19 @@ pub(super) fn collect_integer_requirement_failures_with_calls<'a>(
     handle_call: Option<&mut ActualCallHandler<'a, '_>>,
     allow_projected_calls: bool,
     sink: &mut dyn FnMut(IntegerCheckFailure<'a>),
-) -> Option<(bool, bool)> {
+) -> Option<(bool, IntegerRequirementContinuation)> {
     let (tail, exact, projected) = match entry {
         IntegerRequirementEntry::Arbitrary => (integer_tail_type(calls), None, None),
         IntegerRequirementEntry::Exact(arguments) => (None, Some(arguments), None),
         IntegerRequirementEntry::Projected(values) => (None, None, Some(values)),
     };
-    let mut collected = IntegerFailureCollection { continued: false, projected, allow_projected_calls, sink };
+    let mut collected = IntegerFailureCollection {
+        continuation: IntegerRequirementContinuation::Empty, projected, allow_projected_calls, sink,
+    };
     let ProofCoverage::Applicable(active) = run_integer_callable::<false, true>(
         calls, tail, None, None, None, exact, handle_call, Some(&mut collected),
     )?.ok()? else { return None; };
-    Some((active, collected.continued))
+    Some((active, collected.continuation))
 }
 
 pub(super) type ExactIntegerArgument<'a> = (&'a ScalarType, &'a BigInt);
@@ -530,12 +561,13 @@ fn checked_integer_call_argument_at(
 pub(super) enum ActualCallResult {
     Unit,
     EmptyUnit,
+    ProjectedUnit(Rc<IntegerSet>),
     Integer(BigInt),
 }
 
 pub(super) enum NestedIntegerArgument<'a> {
     Single(Option<ExactIntegerArgument<'a>>),
-    Projected(&'a ScalarType, Rc<IntegerSet>),
+    Projected { ty: &'a ScalarType, axis: usize, values: Rc<IntegerSet> },
 }
 
 fn actual_nested_argument<'a>(
@@ -564,16 +596,9 @@ fn actual_nested_argument<'a>(
         return NestedIntegerArgument::Single(Some((ty, value)));
     }
     if allow_projection {
-        let Some((first, rest)) = path.0.split_first() else {
-            return NestedIntegerArgument::Single(None);
-        };
-        let first = &first[axis];
-        let values = if rest.iter().all(|row| Rc::ptr_eq(first, &row[axis])) {
-            Rc::clone(first)
-        } else {
-            Rc::new(IntegerSet::union(path.0.iter().map(|row| row[axis].as_ref())))
-        };
-        return NestedIntegerArgument::Projected(ty, values);
+        if let Some(values) = path.project_axis(axis) {
+            return NestedIntegerArgument::Projected { ty, axis, values };
+        }
     }
     NestedIntegerArgument::Single(None)
 }
@@ -775,6 +800,7 @@ fn run_integer_callable<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool>
         roots.add(binding, &parameter.ty);
     }
     let projected = if COLLECT { failures.as_deref_mut()?.projected.take() } else { None };
+    let projected_entry = projected.is_some();
     let mut row: IntegerRow = if let Some(projected) = projected {
         if boundary.parameters.len() != 1 || projected.is_empty() {
             return None;
@@ -812,10 +838,13 @@ fn run_integer_callable<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool>
         return None;
     }
     if COLLECT {
-        failures.as_deref_mut()?.continued = match &result {
-            IntegerControl::Continue(path) => !path.is_unreachable(),
-            IntegerControl::Returned => true,
-            IntegerControl::Fail(_) => false,
+        failures.as_deref_mut()?.continuation = match &result {
+            IntegerControl::Continue(path) if path.is_unreachable() => IntegerRequirementContinuation::Empty,
+            IntegerControl::Continue(path) if projected_entry =>
+                IntegerRequirementContinuation::Projected(path.project_axis(0)?),
+            IntegerControl::Returned if projected_entry => return None,
+            IntegerControl::Continue(_) | IntegerControl::Returned => IntegerRequirementContinuation::Feasible,
+            IntegerControl::Fail(_) => IntegerRequirementContinuation::Empty,
         };
     }
     match result {
@@ -872,9 +901,19 @@ fn walk_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool>(
                     let handle = handle_call.as_mut()?;
                     let project = COLLECT && failures.as_ref().is_some_and(|collection| collection.allow_projected_calls);
                     let argument = actual_nested_argument(calls, expression, roots, &path, project);
+                    let projected = match &argument {
+                        NestedIntegerArgument::Projected { axis, values, .. } => Some((*axis, Rc::clone(values))),
+                        _ => None,
+                    };
                     match handle(calls, expression, argument, &ScalarType::Unit)? {
                         ActualCallResult::Unit => {}
                         ActualCallResult::EmptyUnit if COLLECT => path = IntegerInputs::default(),
+                        ActualCallResult::ProjectedUnit(survivors) if COLLECT => {
+                            let (axis, sent) = projected?;
+                            if !Rc::ptr_eq(&sent, &survivors) {
+                                path.restrict_axis(axis, &survivors);
+                            }
+                        }
                         _ => return None,
                     }
                 } else {

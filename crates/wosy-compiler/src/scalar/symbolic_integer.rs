@@ -170,6 +170,27 @@ impl IntegerSet {
         union
     }
 
+    pub(super) fn intersection(&self, other: &Self) -> Self {
+        let mut result = Self::default();
+        let (mut left, mut right) = (0, 0);
+        while let (Some(a), Some(b)) = (self.0.get(left), other.0.get(right)) {
+            let first = (&a.first).max(&b.first);
+            let last = (&a.last).min(&b.last);
+            if first <= last {
+                result.0.push(Interval { first: first.clone(), last: last.clone() });
+            }
+            match a.last.cmp(&b.last) {
+                Ordering::Less => left += 1,
+                Ordering::Greater => right += 1,
+                Ordering::Equal => {
+                    left += 1;
+                    right += 1;
+                }
+            }
+        }
+        result
+    }
+
     fn append(&mut self, interval: Interval) {
         if let Some(previous) = self
             .0

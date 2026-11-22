@@ -8,7 +8,7 @@ use super::{
     checker_directive::{CheckedLiteralOutput, CheckerOperation, InitializerIntegerOperand, InitializerPredicate, PreparedCheckerDirective},
     checker_flow::{
         check_integer_requirement_activity, check_integer_requirements_with_calls, collect_integer_requirement_failures, check_integer_return_bound_with_shows, collect_integer_requirement_failures_with_calls, concrete_integer_literal, exact_integer_call_argument, exact_integer_call_argument_at,
-        exact_integer_return_at_entry, ActualCallResult, CheckerPredicate, ExactIntegerArgument, IntegerRequirementEntry, NestedIntegerArgument,
+        exact_integer_return_at_entry, ActualCallResult, CheckerPredicate, ExactIntegerArgument, IntegerRequirementContinuation, IntegerRequirementEntry, NestedIntegerArgument,
         proves_requirement_with_imported_root_local, ImportedEntryGuard, ImportedLocal, IntegerShowProof, IntegerCheckFailure, IntegerComparison, IntegerInputs, IntegerReturn, ProofCoverage,
     },
     control::{BindingInitialization, BlockItemKind, CheckedCallSignature, ConditionalRegion, InitializationName, InitializationStorage, ModuleInitializationCallTarget, ModuleInitializationDetail, ModuleInitializationStepKind, ModuleInitializationTopology, NamespaceTarget},
@@ -923,7 +923,7 @@ impl<Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> CheckedCalls<'
         let signature = caller.checked_call_signatures.get(&call).ok_or(ProjectCheck::MissingRootOccurrences)?;
         let projected = match argument {
             NestedIntegerArgument::Single(exact) => ActualProjectedArguments::Single(exact),
-            NestedIntegerArgument::Projected(ty, values) => ActualProjectedArguments::SymbolicAxis(ty, values),
+            NestedIntegerArgument::Projected { ty, values, .. } => ActualProjectedArguments::SymbolicAxis(ty, values),
         };
         self.run(&caller.structure, call, signature, projected, source, *declaration_span, expected, collection)
     }
@@ -975,13 +975,17 @@ impl<Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> CheckedCalls<'
         };
         let handler: Option<&mut super::checker_flow::ActualCallHandler<'_, '_>> =
             if nested_calls_remaining > 0 { Some(&mut nested) } else { None };
-        let Some((active, continued)) = collect_integer_requirement_failures_with_calls(
+        let Some((active, continuation)) = collect_integer_requirement_failures_with_calls(
             body, entry, handler, !ACTUAL_STARTUP && nested_calls_remaining > 0, &mut sink,
         ) else {
             return Err(nested_error.unwrap_or(ProjectCheck::Unsupported));
         };
         self.had_obligations |= active;
-        Ok(if continued { ActualCallResult::Unit } else { ActualCallResult::EmptyUnit })
+        Ok(match continuation {
+            IntegerRequirementContinuation::Feasible => ActualCallResult::Unit,
+            IntegerRequirementContinuation::Empty => ActualCallResult::EmptyUnit,
+            IntegerRequirementContinuation::Projected(values) => ActualCallResult::ProjectedUnit(values),
+        })
     }
 
     fn run(
@@ -1022,9 +1026,7 @@ impl<Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> CheckedCalls<'
                     || !body.structure.checker_direct_targets.is_empty()
                     || !body.call_occurrences.is_empty() || !body.allocation_length_calls.is_empty()
                     || !body.assignments.is_empty() || !body.arms.is_empty()
-                    || body.structure.checker_directives.values().any(|directive| {
-                        directive.operation != CheckerOperation::Require || directive.call_signature.is_some()
-                    })
+                    || body.structure.checker_directives.values().any(|directive| directive.call_signature.is_some())
                     || self.active.contains(&target)
                 {
                     return Err(ProjectCheck::Unsupported);
@@ -3509,7 +3511,12 @@ mod tests {
             ("value < 2".into(), Require, bounds(4, 4)),
             ("value < 4".into(), Narrow, bounds(4, 4)),
         ]);
-        let (_, prepared) = prepare("leaf(1);", "", "value");
+        let (text, prepared) = prepare("leaf(1);", "", "value");
+        assert_eq!(receipt(&text, &prepared), [
+            ("value < 3".into(), Require, bounds(3, 255)),
+            ("value < 2".into(), Require, bounds(2, 255)),
+        ]);
+        let (_, prepared) = prepare("leaf(1);", "", "value + 1");
         assert_eq!(collect_ordered_package_failures(&prepared, ScalarCheckerScope::CurrentPackage, 1),
             Err(ProjectCheck::Unsupported));
         assert_eq!(collect_ordered_package_failures(&prepared, ScalarCheckerScope::MainFlowOnly, 1),
@@ -3520,7 +3527,7 @@ mod tests {
     #[test]
     fn ordered_package_symbolic_projection_preserves_disjoint_axis_and_caller_correlations() {
         let app = source("src/main.w", "collect-projected-symbolic-roots");
-        let prepare = |leaf_body: &str| {
+        let prepare = |leaf_body: &str, caller_prune: &str| {
             let text = format!(r#"%%start
                 unit(u8) leaf = fn(value) {{ {leaf_body} }};
                 unit(u8, u8) unused = fn(x, y) {{
@@ -3531,11 +3538,12 @@ mod tests {
                         core.narrow(x >= 6, {OUTPUT});
                         core.narrow(y == 2, {OUTPUT});
                     }};
+                    {caller_prune}
                     leaf(x);
                     if (y == 1) {{
                         core.require(x == 0, {OUTPUT});
                     }} else {{
-                        core.require(x < 8, {OUTPUT});
+                        core.require(x < 7, {OUTPUT});
                     }};
                 }};
                 leaf(1);
@@ -3545,40 +3553,52 @@ mod tests {
             ).unwrap();
             (text, prepared)
         };
-        let plain = format!("core.require(value < 2, {OUTPUT});");
-        let (text, prepared) = prepare(&plain);
-        let (active, reports) = collect_ordered_package_failures(&prepared, ScalarCheckerScope::CurrentPackage, 1)
-            .expect("checked disjoint projection");
-        assert!(active);
-        let reports = reports.iter().map(|report| {
-            let ProjectCheck::Failed { condition, state, axes, .. } = report else { panic!("expected failure"); };
-            assert_eq!(state.row_count(), 1);
-            let domains = axes.iter().enumerate().map(|(axis, (binding, ty))| {
-                assert_eq!(*ty, ScalarType::U8);
-                let at = binding.declaration_span;
-                let domain = state.intervals_at(0, axis).unwrap()
-                    .map(|(lo, hi)| (lo.clone(), hi.clone())).collect::<Vec<_>>();
-                (&text[at.start as usize..at.end as usize], domain)
-            }).collect::<Vec<_>>();
-            (&text[condition.start as usize..condition.end as usize], domains)
-        }).collect::<Vec<_>>();
+        let read_reports = |text: &str, prepared: &PreparedCheckerProject| {
+            let (active, reports) = collect_ordered_package_failures(prepared, ScalarCheckerScope::CurrentPackage, 1)
+                .expect("checked disjoint projection");
+            assert!(active);
+            reports.iter().map(|report| {
+                let ProjectCheck::Failed { condition, state, axes, .. } = report else { panic!("expected failure"); };
+                assert_eq!(state.row_count(), 1);
+                let domains = axes.iter().enumerate().map(|(axis, (binding, ty))| {
+                    assert_eq!(*ty, ScalarType::U8);
+                    let at = binding.declaration_span;
+                    let domain = state.intervals_at(0, axis).unwrap()
+                        .map(|(lo, hi)| (lo.clone(), hi.clone())).collect::<Vec<_>>();
+                    (text[at.start as usize..at.end as usize].to_owned(), domain)
+                }).collect::<Vec<_>>();
+                (text[condition.start as usize..condition.end as usize].to_owned(), domains)
+            }).collect::<Vec<_>>()
+        };
         let limits = |intervals: &[(i32, i32)]| intervals.iter().map(|(lo, hi)| (BigInt::from(*lo), BigInt::from(*hi))).collect::<Vec<_>>();
-        assert_eq!(reports, [
-            ("value < 2", vec![("value", limits(&[(2, 2), (6, 255)]))]),
-            ("x == 0", vec![("x", limits(&[(1, 2)])), ("y", limits(&[(1, 1)]))]),
-            ("x < 8", vec![("x", limits(&[(8, 255)])), ("y", limits(&[(2, 2)]))]),
+        let plain = format!("core.require(value < 2, {OUTPUT});");
+        let (text, prepared) = prepare(&plain, "");
+        assert_eq!(read_reports(&text, &prepared), [
+            ("value < 2".into(), vec![("value".into(), limits(&[(2, 2), (6, 255)]))]),
+            ("x == 0".into(), vec![("x".into(), limits(&[(1, 2)])), ("y".into(), limits(&[(1, 1)]))]),
+            ("x < 7".into(), vec![("x".into(), limits(&[(7, 255)])), ("y".into(), limits(&[(2, 2)]))]),
         ]);
 
-        for unsupported in [
-            format!("{plain} core.narrow(value < 200, {OUTPUT});"),
-            format!("{plain} value = 1;"),
-        ] {
-            let (_, prepared) = prepare(&unsupported);
-            assert_eq!(collect_ordered_package_failures(&prepared, ScalarCheckerScope::CurrentPackage, 1),
-                Err(ProjectCheck::Unsupported));
-            assert_eq!(collect_ordered_package_failures(&prepared, ScalarCheckerScope::MainFlowOnly, 1),
-                Ok((true, Vec::new())));
-        }
+        let partial = format!("{plain} core.narrow(value != 2, {OUTPUT}); core.narrow(value != 8, {OUTPUT}); core.narrow(value < 12, {OUTPUT});");
+        let (text, prepared) = prepare(&partial, "");
+        assert_eq!(read_reports(&text, &prepared), [
+            ("value < 2".into(), vec![("value".into(), limits(&[(2, 2), (6, 255)]))]),
+            ("x == 0".into(), vec![("x".into(), limits(&[(1, 1)])), ("y".into(), limits(&[(1, 1)]))]),
+            ("x < 7".into(), vec![("x".into(), limits(&[(7, 7), (9, 11)])), ("y".into(), limits(&[(2, 2)]))]),
+        ]);
+
+        let all_empty = format!("{plain} core.narrow(value == 1, {OUTPUT});");
+        let (text, prepared) = prepare(&all_empty, &format!("core.narrow(x != 1, {OUTPUT});"));
+        assert_eq!(read_reports(&text, &prepared), [
+            ("value < 2".into(), vec![("value".into(), limits(&[(2, 2), (6, 255)]))]),
+            ("value == 1".into(), vec![("value".into(), limits(&[(0, 0), (2, 2), (6, 255)]))]),
+        ]);
+
+        let (_, prepared) = prepare(&format!("{plain} value = 1;"), "");
+        assert_eq!(collect_ordered_package_failures(&prepared, ScalarCheckerScope::CurrentPackage, 1),
+            Err(ProjectCheck::Unsupported));
+        assert_eq!(collect_ordered_package_failures(&prepared, ScalarCheckerScope::MainFlowOnly, 1),
+            Ok((true, Vec::new())));
     }
 
     #[cfg(feature = "internal-checker")]
