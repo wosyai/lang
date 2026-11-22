@@ -2061,22 +2061,63 @@ impl SymbolicRootProof for SelectedSymbolicProof<'_, '_> {
                     return Err(ProjectCheck::Unsupported);
                 }
                 let MainFlowAuthoredShows::Single(step) = shows else {
-                    let MainFlowAuthoredShows::Multiple(groups) = shows else { unreachable!(); };
+                    let MainFlowAuthoredShows::Multiple { first_span, groups } = shows else { unreachable!(); };
                     let mut failed_step: Option<ByteSpan> = None;
                     let mut failed_goal = false;
-                    let mut select_witness = |value: &BigInt| {
-                        if let Some(candidate) = first_failed_show(groups, value) {
+                    let mut equalities = None;
+                    let mut select_witness = |lo: &BigInt, hi: &BigInt, domain: Option<&IntegerSet>| {
+                        use super::checker_flow::SymbolicProofPoint::{Bound, Lower, Upper};
+                        if failed_step.is_some_and(|prior| prior.start == first_span.start) {
+                            return None;
+                        }
+                        let failed = if lo == hi {
+                            first_failed_show(groups, lo).map(|span| (span, Lower))
+                        } else {
+                            let left = groups.partition_point(|group| group.bound.as_ref() <= lo);
+                            let right = groups.partition_point(|group| group.bound.as_ref() < hi);
+                            let mut candidate = groups.get(left).and_then(|group| group.failures[0]).map(|span| (span, Lower));
+                            if let Some(span) = right.checked_sub(1).and_then(|index| groups[index].failures[2]) {
+                                if candidate.as_ref().is_none_or(|(prior, _)| span.start < prior.start) {
+                                    candidate = Some((span, Upper));
+                                }
+                            }
+                            if candidate.as_ref().is_none_or(|(span, _)| span.start != first_span.start) {
+                                let domain = domain?;
+                                let equalities = equalities.get_or_insert_with(|| ShowEqualityIndex::from_groups(groups));
+                                if let Some(index) = equalities.first_failure(groups, domain) {
+                                    let group = &groups[index];
+                                    let span = group.failures[1]?;
+                                    if candidate.as_ref().is_none_or(|(prior, _)| span.start < prior.start) {
+                                        candidate = Some((span, Bound(group.bound.as_ref())));
+                                    }
+                                }
+                            }
+                            candidate
+                        };
+                        if let Some((candidate, point)) = failed {
                             if failed_step.is_none_or(|prior| candidate.start < prior.start) {
                                 failed_step = Some(candidate);
-                                return true;
+                                return Some(point);
                             }
-                        } else if failed_step.is_none() && !failed_goal && !proof.relation.accepts(value.cmp(proof.bound)) {
-                            failed_goal = true;
-                            return true;
+                        } else if failed_step.is_none() && !failed_goal {
+                            let rejected = proof.relation.complement();
+                            let point = if rejected.accepts(lo.cmp(proof.bound)) {
+                                Some(Lower)
+                            } else if lo != hi && rejected.accepts(hi.cmp(proof.bound)) {
+                                Some(Upper)
+                            } else if rejected.accepts(std::cmp::Ordering::Equal) && lo < proof.bound && proof.bound < hi
+                                && domain.is_some_and(|domain| domain.covers_closed(proof.bound, proof.bound))
+                            {
+                                Some(Bound(proof.bound))
+                            } else {
+                                None
+                            };
+                            failed_goal = point.is_some();
+                            return point;
                         }
-                        false
+                        None
                     };
-                    let (active, directives, returned, failure) = super::checker_flow::collect_ordered_root_constant_proof(
+                    let (active, directives, returned, failure) = super::checker_flow::collect_ordered_root_multiple_proof(
                         calls, &function.body, &mut select_witness,
                     ).ok_or(ProjectCheck::Unsupported)?;
                     for directive in directives {
@@ -2160,7 +2201,7 @@ struct MainFlowLiteralShow<'a> {
 #[cfg(feature = "internal-checker")]
 enum MainFlowAuthoredShows<'a> {
     Single(MainFlowLiteralShow<'a>),
-    Multiple(Vec<MainFlowShowBound<'a>>),
+    Multiple { first_span: ByteSpan, groups: Vec<MainFlowShowBound<'a>> },
 }
 
 #[cfg(feature = "internal-checker")]
@@ -2186,6 +2227,75 @@ fn first_failed_show(groups: &[MainFlowShowBound<'_>], value: &BigInt) -> Option
     let lower_failure = below.checked_sub(1).and_then(|index| groups[index].failures[2]);
     let upper_failure = groups.get(above).and_then(|group| group.failures[0]);
     earliest_show_failure(equal, earliest_show_failure(lower_failure, upper_failure))
+}
+
+#[cfg(feature = "internal-checker")]
+enum ShowEqualityIndex {
+    Empty,
+    Single(usize),
+    Tree { count: usize, indices: Vec<usize> },
+}
+
+#[cfg(feature = "internal-checker")]
+impl ShowEqualityIndex {
+    const EMPTY: usize = usize::MAX;
+
+    fn earliest(groups: &[MainFlowShowBound<'_>], a: usize, b: usize) -> usize {
+        let key = |index| groups.get(index).and_then(|group: &MainFlowShowBound<'_>|
+            group.failures[1].map(|span| (span.start, index)));
+        match (key(a), key(b)) {
+            (Some(a_key), Some(b_key)) if b_key < a_key => b,
+            (Some(_), _) => a,
+            _ => b,
+        }
+    }
+
+    fn from_groups(groups: &[MainFlowShowBound<'_>]) -> Self {
+        let mut equalities = groups.iter().enumerate().filter_map(|(index, group)| group.failures[1].map(|_| index));
+        let Some(first) = equalities.next() else { return Self::Empty; };
+        let Some(second) = equalities.next() else { return Self::Single(first); };
+        let mut indices = Vec::with_capacity(4);
+        indices.extend([first, second]);
+        indices.extend(equalities);
+        let count = indices.len();
+        indices.resize(count * 2, Self::EMPTY);
+        indices.copy_within(..count, count);
+        for node in (1..count).rev() {
+            indices[node] = Self::earliest(groups, indices[2 * node], indices[2 * node + 1]);
+        }
+        Self::Tree { count, indices }
+    }
+
+    fn first_failure(&self, groups: &[MainFlowShowBound<'_>], domain: &IntegerSet) -> Option<usize> {
+        match self {
+            Self::Empty => None,
+            Self::Single(index) => {
+                let bound = groups[*index].bound.as_ref();
+                domain.covers_closed(bound, bound).then_some(*index)
+            }
+            Self::Tree { count, indices } => {
+                let leaves = &indices[*count..];
+                let mut best = Self::EMPTY;
+                for (lo, hi) in domain.intervals() {
+                    let mut start = *count + leaves.partition_point(|&index| groups[index].bound.as_ref() < lo);
+                    let mut end = *count + leaves.partition_point(|&index| groups[index].bound.as_ref() <= hi);
+                    while start < end {
+                        if start & 1 == 1 {
+                            best = Self::earliest(groups, best, indices[start]);
+                            start += 1;
+                        }
+                        if end & 1 == 1 {
+                            end -= 1;
+                            best = Self::earliest(groups, best, indices[end]);
+                        }
+                        start /= 2;
+                        end /= 2;
+                    }
+                }
+                (best != Self::EMPTY).then_some(best)
+            }
+        }
+    }
 }
 
 #[cfg(feature = "internal-checker")]
@@ -2235,8 +2345,12 @@ impl<'a> MainFlowProofCase<'a> {
             (steps, terminated) if steps.len() >= 2 && steps.len() == terminated.len() => {
                 use std::cmp::Ordering::{Equal, Greater, Less};
                 let mut groups = Vec::with_capacity(steps.len());
+                let mut first_span = None;
                 for (step, &terminated) in steps.iter().zip(terminated) {
                     let (span, relation, bound) = literal_show(step, terminated)?;
+                    if groups.is_empty() {
+                        first_span = Some(span);
+                    }
                     let failures = [Less, Equal, Greater].map(|ordering| (!relation.accepts(ordering)).then_some(span));
                     groups.push(MainFlowShowBound { bound, failures });
                 }
@@ -2260,7 +2374,7 @@ impl<'a> MainFlowProofCase<'a> {
                     suffix = earliest_show_failure(suffix, group.failures[0]);
                     group.failures[0] = suffix;
                 }
-                Some(MainFlowAuthoredShows::Multiple(groups))
+                Some(MainFlowAuthoredShows::Multiple { first_span: first_span.ok_or(ProjectCheck::Unsupported)?, groups })
             }
             _ => return Err(ProjectCheck::Unsupported),
         };
@@ -2448,7 +2562,7 @@ impl ActualIntegerObserver for MainFlowProofObserver<'_> {
                                 None
                             }
                         }
-                        Some(MainFlowAuthoredShows::Multiple(groups)) => {
+                        Some(MainFlowAuthoredShows::Multiple { groups, .. }) => {
                             let failed = first_failed_show(groups, value);
                             if failed.is_none() && proof.relation.accepts(value.cmp(proof.bound)) {
                                 continue;
@@ -7236,7 +7350,7 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
         assert!(tied.failed_step.is_some());
         assert_eq!(tied.returned, BigInt::from(8));
 
-        let alias = tie.replace("\n                    6\n", "\n                    value\n");
+        let alias = tie.replace("\n                    6\n", "\n                    value + 1\n");
         assert_ne!(alias, tie);
         assert!(matches!(run(&alias, ScalarCheckerScope::CurrentPackage), Err(ProjectCheck::Unsupported)));
         let dead = alias.replace("core.require", "core.narrow");
@@ -7244,6 +7358,72 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
         assert!(dead.active && dead.directives.len() == 2 && dead.symbolic_diagnostic.is_none());
         let main = run(&text, ScalarCheckerScope::MainFlowOnly).unwrap();
         assert!(!main.active && main.directives.is_empty() && main.symbolic_diagnostic.is_none());
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordered_current_package_auto_proof_multi_show_preserves_exact_alias_holes_and_axes() {
+        let app = source("src/main.w", "ordered-automatic-proof-unused-multi-show-alias");
+        let run = |text: &str| {
+            let (_, proof) = crate::parse_proof_source(app.clone(), text.to_owned(), &[])
+                .unwrap_or_else(|_| panic!("valid proof source"));
+            check_loaded_ordered_proof_diagnostics(
+                Vec::new(), vec![(proof, Vec::new())], vec![app.clone()], inputs(), ScalarCheckerScope::CurrentPackage,
+            )
+        };
+        let text = format!(r#"%%start
+            u8(u8, u8) checked = fn(value, other) {{
+                core.narrow(other == 11, {OUTPUT});
+                core.narrow(value <= 2 || value >= 5, {OUTPUT});
+                value
+            }};
+            proof bound for checked(entry, untouched) -> (out) ensures (out != 3) {{
+                core.show(out != 3);
+                core.show(out != 6);
+                core.show(out != 8);
+                core.show(out < 9);
+            }}
+        %%end"#);
+        let receipt = run(&text).unwrap();
+        assert!(receipt.active && receipt.directives.is_empty() && receipt.diagnostics.is_empty());
+        let diagnostic = receipt.symbolic_diagnostic.unwrap();
+        let snippet = |span: ByteSpan| &text[span.start as usize..span.end as usize];
+        assert_eq!(snippet(diagnostic.failed_step.unwrap().range), "core.show(out != 6)");
+        assert_eq!(diagnostic.returned, BigInt::from(6));
+        let singleton = |axis, value| {
+            let mut intervals = diagnostic.witness.intervals_at(0, axis).unwrap();
+            let expected = BigInt::from(value);
+            assert_eq!(intervals.next(), Some((&expected, &expected)));
+            assert!(intervals.next().is_none());
+        };
+        singleton(0, 6);
+        singleton(1, 11);
+
+        let goal_only = text.replace("core.show(out != 6);", "core.show(out != 4);")
+            .replace("core.show(out != 8);", "core.show(out >= 0);")
+            .replace("core.show(out < 9);", "core.show(out <= 255);")
+            .replace("ensures (out != 3)", "ensures (out != 6)");
+        let goal = run(&goal_only).unwrap().symbolic_diagnostic.unwrap();
+        assert!(goal.failed_step.is_none());
+        assert_eq!(goal.returned, BigInt::from(6));
+
+        let first_endpoint = text.replace("core.show(out != 3);", "core.show(out < 9);");
+        let first_endpoint = run(&first_endpoint).unwrap().symbolic_diagnostic.unwrap();
+        assert!(first_endpoint.failed_step.is_some());
+        assert_eq!(first_endpoint.returned, BigInt::from(255));
+
+        let single_equality = text.replace("core.show(out != 3);", "core.show(out >= 0);")
+            .replace("core.show(out != 8);", "core.show(out <= 255);");
+        let direct = run(&single_equality).unwrap().symbolic_diagnostic.unwrap();
+        assert!(direct.failed_step.is_some());
+        assert_eq!(direct.returned, BigInt::from(6));
+
+        let no_equalities = text.replace("core.show(out != 3);", "core.show(out >= 0);")
+            .replace("core.show(out != 6);", "core.show(out <= 255);")
+            .replace("core.show(out != 8);", "core.show(out < 9);");
+        let endpoint = run(&no_equalities).unwrap().symbolic_diagnostic.unwrap();
+        assert!(endpoint.failed_step.is_some());
+        assert_eq!(endpoint.returned, BigInt::from(255));
     }
 
     #[cfg(feature = "internal-checker")]

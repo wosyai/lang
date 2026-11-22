@@ -390,21 +390,31 @@ impl<'a, 'bound, const STEP_FIRST: bool> ScopedAuthoredReturn<'a> for OrderedRoo
 }
 
 #[cfg(feature = "internal-checker")]
-struct ConstantProofEvidence<'a, 'check> {
-    select_witness: &'check mut dyn FnMut(&BigInt) -> bool,
+pub(super) enum SymbolicProofPoint<'a> {
+    Lower,
+    Upper,
+    Bound(&'a BigInt),
+}
+
+#[cfg(feature = "internal-checker")]
+type SymbolicProofSelect<'a> = dyn FnMut(&BigInt, &BigInt, Option<&IntegerSet>) -> Option<SymbolicProofPoint<'a>> + 'a;
+
+#[cfg(feature = "internal-checker")]
+struct MultipleProofEvidence<'a, 'check, 'bound> {
+    select_witness: &'check mut SymbolicProofSelect<'bound>,
     returned: bool,
     failure: Option<SymbolicLiteralFailure<'a>>,
 }
 
 #[cfg(feature = "internal-checker")]
 #[derive(Clone, Copy)]
-struct OrderedRootConstantProof<'a, 'check, 'observation> {
+struct OrderedRootMultipleProof<'a, 'check, 'observation, 'bound> {
     conditions: OrderedRootConditions<'a>,
-    observed: &'observation std::cell::RefCell<ConstantProofEvidence<'a, 'check>>,
+    observed: &'observation std::cell::RefCell<MultipleProofEvidence<'a, 'check, 'bound>>,
 }
 
 #[cfg(feature = "internal-checker")]
-impl<'a> ScopedAuthoredReturn<'a> for OrderedRootConstantProof<'a, '_, '_> {
+impl<'a> ScopedAuthoredReturn<'a> for OrderedRootMultipleProof<'a, '_, '_, '_> {
     const ENABLED: bool = false;
     const OBSERVE_RETURN: bool = true;
 
@@ -424,12 +434,30 @@ impl<'a> ScopedAuthoredReturn<'a> for OrderedRootConstantProof<'a, '_, '_> {
     fn observe_return(
         self, slot: FinalOutputSlot, value: IntegerReturn<'a>, roots: &IntegerRoots<'a>, path: &IntegerInputs,
     ) -> Option<()> {
-        let Some(row) = path.0.first() else { return Some(()); };
-        let IntegerReturn::Const(value) = value else { return None; };
+        let axis = symbolic_return_axis(value, roots)?;
         let mut observed = self.observed.borrow_mut();
-        observed.returned = true;
-        if (observed.select_witness)(value) {
-            observed.failure = Some(SymbolicLiteralFailure::from_row(slot, roots, row, None, Cow::Borrowed(value), None));
+        let MultipleProofEvidence { select_witness, returned, failure } = &mut *observed;
+        for row in &path.0 {
+            *returned = true;
+            let (lo, hi, domain) = match value {
+                IntegerReturn::Const(value) => (value, value, None),
+                IntegerReturn::Alias(_) => {
+                    let domain = row.get(axis?)?;
+                    let (lo, hi) = domain.extremes()?;
+                    (lo, hi, Some(domain.as_ref()))
+                }
+            };
+            if let Some(point) = select_witness(lo, hi, domain) {
+                let point = match point {
+                    SymbolicProofPoint::Lower => lo,
+                    SymbolicProofPoint::Upper => hi,
+                    SymbolicProofPoint::Bound(point) => point,
+                };
+                *failure = Some(SymbolicLiteralFailure::from_row(slot, roots, row, axis, Cow::Borrowed(point), None));
+            }
+            if axis.is_none() {
+                break;
+            }
         }
         Some(())
     }
@@ -2002,15 +2030,15 @@ pub(super) fn collect_ordered_root_literal_proofs<'a, const STEP_FIRST: bool>(
 }
 
 #[cfg(feature = "internal-checker")]
-pub(super) fn collect_ordered_root_constant_proof<'a>(
-    calls: &'a FunctionCallSites, body: &'a super::ScalarBlock, select_witness: &mut dyn FnMut(&BigInt) -> bool,
+pub(super) fn collect_ordered_root_multiple_proof<'a, 'check, 'bound>(
+    calls: &'a FunctionCallSites, body: &'a super::ScalarBlock, select_witness: &'check mut SymbolicProofSelect<'bound>,
 ) -> Option<(bool, Vec<IntegerCheckFailure<'a>>, bool, Option<SymbolicLiteralFailure<'a>>)> {
-    let observed = std::cell::RefCell::new(ConstantProofEvidence { select_witness, returned: false, failure: None });
+    let observed = std::cell::RefCell::new(MultipleProofEvidence { select_witness, returned: false, failure: None });
     let mut failures = Vec::new();
     let mut sink = |failure| failures.push(failure);
     let (active, _) = collect_integer_requirement_failures_in_scope(
         calls, IntegerRequirementEntry::Arbitrary, None, false, &mut sink,
-        OrderedRootConstantProof { conditions: OrderedRootConditions(body), observed: &observed },
+        OrderedRootMultipleProof { conditions: OrderedRootConditions(body), observed: &observed },
     )?;
     let observed = observed.into_inner();
     Some((active, failures, observed.returned, observed.failure))
