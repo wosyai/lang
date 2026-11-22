@@ -1283,7 +1283,7 @@ fn observed_module_proof_old_compares_the_exact_original_entry_of_each_call() {
     assert_eq!(check_old("constant_value", "input", "true", wrong_then_right), ScalarModuleProofOutcome::Refuted);
     assert_eq!(check_old("constant_value", "input", "input == 7", wrong_then_right), ScalarModuleProofOutcome::Proved);
     assert_eq!(check_old("constant_value", "input", "input > 7", wrong_then_right), ScalarModuleProofOutcome::NoApplicableInputs);
-    assert_eq!(check_old("identity_value", "input", "true", ""), ScalarModuleProofOutcome::Unsupported);
+    assert_eq!(check_old("identity_value", "input", "true", ""), ScalarModuleProofOutcome::Proved);
     assert!(matches!(check_old("identity_value", "out", "true", separate), ScalarModuleProofOutcome::Invalid(_)));
     assert_eq!(check_old("identity_value", "input + 0", "true", separate), ScalarModuleProofOutcome::Unsupported);
     assert_eq!(check_old("different_width", "input", "true", "u16 observed = different_width(7);"), ScalarModuleProofOutcome::Unsupported);
@@ -1314,9 +1314,50 @@ fn observed_module_proof_old_selects_exact_typed_entry_slot_for_relations() {
     assert_eq!(check("out == core.old(original)", "tag == 0", two), ScalarModuleProofOutcome::Proved);
     assert_eq!(check("out < core.old(original)", "true", two), ScalarModuleProofOutcome::Refuted);
     assert_eq!(check("out != core.old(original)", "tag == 1", two), ScalarModuleProofOutcome::NoApplicableInputs);
-    assert_eq!(check("out >= core.old(original)", "true", ""), ScalarModuleProofOutcome::Unsupported);
+    assert_eq!(check("out >= core.old(original)", "true", ""), ScalarModuleProofOutcome::Proved);
     assert_eq!(check("out >= core.old(tag)", "true", two), ScalarModuleProofOutcome::Unsupported);
     assert!(matches!(check("out >= core.old(out)", "true", two), ScalarModuleProofOutcome::Invalid(_)));
+}
+
+#[test]
+fn unused_module_proof_old_uses_only_immutable_entry_authority() {
+    let identity = source();
+    let check = |target: &str, goal: &str, guard: &str| {
+        check_scalar_module_proof(
+            identity.clone(),
+            "snapshot",
+            vec![ScalarProofModuleInput {
+                source: identity.clone(),
+                text: format!(r#"%%start
+                    i16(i16, i16) echo = fn(tag, value) {{ if (tag == 0) {{}}; value }};
+                    i16(i16, i16) constant = fn(tag, value) {{ if (tag == 0) {{}}; if (value == 0) {{}}; 7 }};
+                    i16(i16, i16) changed = fn(tag, value) {{ if (tag == 0) {{}}; if (value == 0) {{}}; value = 7; value }};
+                    i16(i16, i16) literal_then_other = fn(tag, value) {{
+                        if (value == 0) {{}}; if (tag == 0) {{ 7 }} else {{ tag }}
+                    }};
+                    i16(i16, i16) other_then_literal = fn(tag, value) {{
+                        if (value == 0) {{}}; if (tag == 0) {{ tag }} else {{ 7 }}
+                    }};
+                    proof snapshot for {target}(tag, original) -> (out) where ({guard}) ensures ({goal}) {{}}
+                %%end"#),
+                namespaces: Vec::new(),
+            }],
+            vec![identity.clone()],
+            ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
+        )
+    };
+    assert_eq!(check("echo", "out == core.old(original)", "true"), ScalarModuleProofOutcome::Proved);
+    assert_eq!(check("echo", "out < core.old(original)", "true"), ScalarModuleProofOutcome::Refuted);
+    assert_eq!(check("echo", "out == core.old(tag)", "true"), ScalarModuleProofOutcome::Unsupported);
+    assert_eq!(check("constant", "out > core.old(original)", "original < 7"), ScalarModuleProofOutcome::Proved);
+    assert_eq!(check("constant", "out > core.old(original)", "original <= 7"), ScalarModuleProofOutcome::Refuted);
+    assert_eq!(check("constant", "out > core.old(original)", "original == 7"), ScalarModuleProofOutcome::Refuted);
+    assert_eq!(check("constant", "out > core.old(original)", "original != 7 && original == 7"),
+        ScalarModuleProofOutcome::NoApplicableInputs);
+    assert_eq!(check("changed", "out == core.old(original)", "true"), ScalarModuleProofOutcome::Unsupported);
+    for target in ["literal_then_other", "other_then_literal"] {
+        assert_eq!(check(target, "out > core.old(original)", "original == 7"), ScalarModuleProofOutcome::Unsupported);
+    }
 }
 
 #[test]

@@ -487,6 +487,17 @@ impl IntegerReturningPath<'_> {
     }
 
     #[cfg(feature = "internal-checker")]
+    pub(super) fn output_satisfies_immutable_entry(
+        &self, entry: &ReferenceBindingId, relation: IntegerRelation,
+    ) -> Option<bool> {
+        match self.value {
+            IntegerReturn::Alias(binding) if binding == entry => Some(relation.accepts(std::cmp::Ordering::Equal)),
+            IntegerReturn::Alias(_) => None,
+            IntegerReturn::Const(value) => self.binding_satisfies(entry, relation.reversed(), value),
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
     pub(super) fn output_within(&self, allowed: &IntegerSet) -> Option<bool> {
         match self.value {
             IntegerReturn::Alias(binding) => {

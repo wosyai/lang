@@ -45,6 +45,11 @@ impl IntegerRelation {
         Self { less: !self.less, equal: !self.equal, greater: !self.greater }
     }
 
+    #[cfg(feature = "internal-checker")]
+    pub(super) fn reversed(self) -> Self {
+        Self { less: self.greater, equal: self.equal, greater: self.less }
+    }
+
     pub(super) fn accepts(self, comparison: Ordering) -> bool {
         match comparison {
             Ordering::Less => self.less,

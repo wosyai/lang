@@ -2232,7 +2232,7 @@ impl PreparedProofModule {
                 if let Some(observer) = observer {
                     outcomes[*index] = module_proof_outcome(observer.outcome());
                 }
-            } else if !matches!(plan.typed.goal, TypedProofGoal::Literal { .. } | TypedProofGoal::Conjunction(_) | TypedProofGoal::Disjunction(_) | TypedProofGoal::Universal { .. } | TypedProofGoal::Existential { .. }) {
+            } else if !matches!(plan.typed.goal, TypedProofGoal::Literal { .. } | TypedProofGoal::Conjunction(_) | TypedProofGoal::Disjunction(_) | TypedProofGoal::Universal { .. } | TypedProofGoal::Existential { .. } | TypedProofGoal::EntryComparison { .. }) {
                 continue;
             } else if plan.uses_direct_goal() {
                 let key = (plan.target, ExactGuardGroup(plan.filter.as_deref()));
@@ -2249,11 +2249,33 @@ impl PreparedProofModule {
             match observe_arbitrary_integer_returns(body, guard.0) {
                 Some(Ok(ProofCoverage::Applicable(paths))) => {
                     for (index, plan) in group {
+                        let goal = &plan.typed.goal;
+                        let entry = if let TypedProofGoal::EntryComparison { slot, relation } = goal {
+                            let Some(binding) = body.boundary.checker_parameter_bindings.as_ref().and_then(|bindings| bindings.get(*slot)) else {
+                                continue;
+                            };
+                            Some((binding, *relation))
+                        } else {
+                            None
+                        };
                         let mut holds = Some(true);
                         for path in &paths {
-                            holds = plan.typed.goal.holds_on_returned_path(path);
-                            if holds != Some(true) {
-                                break;
+                            if let Some((binding, relation)) = entry {
+                                if holds == Some(false) {
+                                    if matches!(path.value, IntegerReturn::Alias(alias) if alias != binding) {
+                                        holds = None;
+                                    }
+                                } else {
+                                    holds = path.output_satisfies_immutable_entry(binding, relation);
+                                }
+                                if holds.is_none() {
+                                    break;
+                                }
+                            } else {
+                                holds = goal.holds_on_returned_path(path);
+                                if holds != Some(true) {
+                                    break;
+                                }
                             }
                         }
                         outcomes[index] = match holds {
