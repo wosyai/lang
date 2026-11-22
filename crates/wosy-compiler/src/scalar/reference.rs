@@ -5545,6 +5545,7 @@ struct ReferenceTransferCfg<'a> {
     raw_address_exposures: &'a [(CfgPointId, Option<ReferenceBindingId>)],
     points: &'a mut [ReferenceFlowPoint],
     facts: &'a mut Vec<ReferenceOrigin>,
+    provisional_origin_index: Option<&'a mut ReferenceOriginIndex>,
     allocations: &'a BTreeSet<ReferenceBindingId>,
     checked_join_values: &'a [(CfgPointId, [Option<CfgPointId>; 2])],
     checked_block_values: &'a [(CfgPointId, CfgPointId)],
@@ -5566,6 +5567,7 @@ impl<'a> ReferenceTransferCfg<'a> {
             raw_address_exposures: proof.map_or(&[], |proof| &proof.raw_address_exposures),
             points: &mut cfg.points,
             facts: &mut cfg.facts,
+            provisional_origin_index: None,
             allocations: &cfg.allocations,
             checked_join_values: proof.map_or(&[], |proof| &proof.checked_join_values),
             checked_block_values: proof.map_or(&[], |proof| &proof.checked_block_values),
@@ -6370,13 +6372,14 @@ fn transfer_reference_facts(
                         parent: Some(Box::new(parent.clone())),
                     };
                     let child = deferred_reborrow_child(parent_fact, loan.clone());
-                    let child_id = match cfg.facts.iter().position(|origin| *origin == child) {
-                        Some(index) => ReferenceOriginId(index),
-                        None => {
-                            let id = ReferenceOriginId(cfg.facts.len());
-                            cfg.facts.push(child);
-                            id
-                        }
+                    let child_id = if let Some(index) = cfg.provisional_origin_index.as_deref_mut() {
+                        index.intern(cfg.facts, child)
+                    } else if let Some(index) = cfg.facts.iter().position(|origin| *origin == child) {
+                        ReferenceOriginId(index)
+                    } else {
+                        let id = ReferenceOriginId(cfg.facts.len());
+                        cfg.facts.push(child);
+                        id
                     };
                     point.kind = CfgPointKind::Borrow { place: loan.origin_place.clone(), loan };
                     point.possible_origins = Some(BTreeSet::from([child_id]));
@@ -11302,6 +11305,7 @@ fn derive_function_specialized_copy_policies(
                     raw_address_exposures: &template_result.proof_points.raw_address_exposures,
                     points: &mut points,
                     facts: &mut facts,
+                    provisional_origin_index: None,
                     allocations: &template_cfg.allocations,
                     checked_join_values: &template_result.proof_points.checked_join_values,
                     checked_block_values: &template_result.proof_points.checked_block_values,
@@ -11621,7 +11625,9 @@ fn build_function_reference_cfg(
             }
         }
     }
-    drop(builder.origin_index);
+    let mut provisional_origin_index = (prior_children_succeeded
+        && errors.is_empty() && !builder.cfg.points.is_empty()
+        && builder.proof_points.pending_named_reborrow.is_some()).then_some(builder.origin_index);
     let mut aggregate = std::mem::take(&mut builder.aggregate_result);
     if let ScalarDescriptorCandidates::One(_, marker) = &builder.proof_points.backing_descriptor_install {
         aggregate.passive_descriptor_read = passive_descriptor_read(
@@ -11648,6 +11654,7 @@ fn build_function_reference_cfg(
         let mut strictly_forward_initial_graph = false;
         let mut provisional_cfg = ReferenceTransferCfg::new(&mut builder.cfg, Some(&builder.proof_points));
         provisional_cfg.strictly_forward_out = Some(&mut strictly_forward_initial_graph);
+        provisional_cfg.provisional_origin_index = provisional_origin_index.as_mut();
         provisional_cfg.resolve_pending_named_reborrow = true;
         let provisional = transfer_reference_facts(
             provisional_cfg,
@@ -11656,6 +11663,7 @@ fn build_function_reference_cfg(
             flow,
             None,
         );
+        drop(provisional_origin_index);
         builder.proof_points.strictly_forward_initial_graph = strictly_forward_initial_graph;
         if let Some(pending) = &builder.proof_points.pending_named_reborrow {
             let first_unproved = pending.sites.iter().find(|site|
