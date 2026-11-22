@@ -1316,6 +1316,43 @@ fn named_proof_actual_flat_old_shows_check_exact_positional_formals() {
 }
 
 #[test]
+fn named_proof_actual_guarded_show_uses_only_the_checked_actual_arm() {
+    let identity = source();
+    let check = |startup: &str, where_guard: &str, ensures: &str, steps: &str| {
+        check_scalar_module_proof(
+            identity.clone(), "verify",
+            vec![ScalarProofModuleInput {
+                source: identity.clone(),
+                text: format!(r#"%%start
+                    i8(i8) echo = fn(value) {{ value }};
+                    {startup}
+                    proof verify for echo(input) -> (out) where ({where_guard}) ensures ({ensures}) {{ {steps} }}
+                %%end"#),
+                namespaces: Vec::new(),
+            }],
+            vec![identity.clone()], ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
+        )
+    };
+    use ScalarModuleProofOutcome::{Invalid, NoApplicableInputs, Proved, Refuted, Unsupported};
+    let yes = "i8 first = echo(7);";
+    let no = "i8 first = echo(6);";
+    let both = "i8 first = echo(7); i8 second = echo(6);";
+    let literal = "if (input >= 7) { core.show(out <= 7); } else { core.show(out > 7); }";
+    assert_eq!(check(yes, "true", "out <= 7", literal), Proved);
+    assert_eq!(check(no, "true", "out <= 7", literal), Refuted);
+    assert_eq!(check(both, "true", "out <= 7", literal), Refuted);
+    assert_eq!(check(yes, "true", "out < 7", literal), Refuted);
+    assert_eq!(check(yes, "false", "out <= 7", literal), NoApplicableInputs);
+    assert!(matches!(check(yes, "false", "out <= 7", &literal.replace("out > 7", "out > 128")), Invalid(_)));
+    let old = "if (input >= 7) { core.show(out == core.old(input)); } else { core.show(out > core.old(input)); }";
+    assert_eq!(check(yes, "true", "out <= 7", old), Proved);
+    assert_eq!(check(no, "true", "out <= 7", old), Refuted);
+    assert_eq!(check(yes, "true", "out <= 7", &old.replace("old(input)", "old(missing)")), Invalid(Vec::new()));
+    assert_eq!(check(yes, "true", "out <= 7",
+        "if (input >= 7) { core.show(out == 7); } else { core.show(out == 6); }"), Unsupported);
+}
+
+#[test]
 fn named_proof_show_mixed_sequence_holds_all_exact_obligations() {
     let identity = source();
     let check = |target: &str, where_guard: &str, ensures: &str, steps: &str| {

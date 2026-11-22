@@ -3294,7 +3294,10 @@ impl SelectedProofObserver<'_> {
     fn prepare_actual_shows<'a>(plan: &'a PlannedModuleProof<'a>, arity: usize) -> ActualProofMode<'a> {
         let starts_with_show = plan.steps.items.first().zip(plan.steps.terminated_items.first())
             .is_some_and(|(item, &terminated)| proof_show_expression(item, terminated).is_ok());
-        if !starts_with_show {
+        let guarded = matches!(plan.steps.items.as_slice(), [
+            ScalarBlockItem::Expression(ScalarExpression::If { .. })
+        ]);
+        if !starts_with_show && !guarded {
             return ActualProofMode::Direct(None);
         }
         let Some(guard) = checked_integer_guard_slots::<true>(plan.typed.body, plan.filter.as_deref().unwrap_or_default())

@@ -561,6 +561,12 @@ enum ActualFlatClaim<'a> {
     Constraints(IntegerShowConstraints<'a>),
     Entry { slot: usize, relation: IntegerRelation },
     MixedEntry(IntegerShowConstraints<'a>, ActualEntryPredicates),
+    Guarded {
+        slot: usize,
+        relation: IntegerRelation,
+        bound: BigInt,
+        claims: GuardedOutputClaims,
+    },
 }
 
 #[cfg(feature = "internal-checker")]
@@ -649,6 +655,11 @@ impl<'a> ActualFlatShow<'a> {
                 };
                 ActualFlatClaim::MixedEntry(output, checked)
             }
+            IntegerShowProof::GuardedOutput { guard, claims } => {
+                let slot = bindings.iter().position(|binding| *binding == guard.binding)?;
+                let relation = IntegerRelation::from_operator(&guard.operator)?;
+                ActualFlatClaim::Guarded { slot, relation, bound: guard.bound, claims }
+            }
             _ => return None,
         };
         Some(Self { bound, relation, extra })
@@ -667,6 +678,23 @@ impl<'a> ActualFlatShow<'a> {
             ActualFlatClaim::Entry { slot, relation } => {
                 let entry = arguments.get(*slot)?;
                 return Some(self.relation.accepts(value.cmp(self.bound)) && relation.accepts(value.cmp(entry)));
+            }
+            ActualFlatClaim::Guarded { slot, relation, bound, claims } => {
+                let entry = arguments.get(*slot)?;
+                if !self.relation.accepts(value.cmp(self.bound)) {
+                    return Some(false);
+                }
+                let condition = relation.accepts((*entry).cmp(bound));
+                return Some(match claims {
+                    GuardedOutputClaims::Literal { yes, no } => {
+                        let (relation, bound) = if condition { yes } else { no };
+                        relation.accepts(value.cmp(bound))
+                    }
+                    GuardedOutputClaims::ImmutableEntry { yes, no } => {
+                        let relation = if condition { yes } else { no };
+                        relation.accepts(value.cmp(entry))
+                    }
+                });
             }
             _ => {}
         }
