@@ -1238,6 +1238,45 @@ fn named_proof_ensures_mixed_uses_only_exact_actual_invocation_tuples() {
 }
 
 #[test]
+fn named_proof_actual_flat_show_checks_only_authenticated_integer_returns() {
+    let identity = source();
+    let check = |startup: &str, body: &str, guard: &str, ensures: &str, steps: &str| {
+        check_scalar_module_proof(
+            identity.clone(), "verify",
+            vec![ScalarProofModuleInput {
+                source: identity.clone(),
+                text: format!(r#"%%start
+                    i8(i8) echo = fn(value) {{ {body} }};
+                    {startup}
+                    proof verify for echo(input) -> (out) where ({guard}) ensures ({ensures}) {{ {steps} }}
+                %%end"#),
+                namespaces: Vec::new(),
+            }],
+            vec![identity.clone()], ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
+        )
+    };
+    use ScalarModuleProofOutcome::{Invalid, NoApplicableInputs, Proved, Refuted, Unsupported};
+    let guard = "input >= 0";
+    let bound = "out <= 8";
+    let shows = "core.show(out >= 0); core.show(out < 8);";
+    let one = "i8 seen = echo(7);";
+    assert_eq!(check(one, "value", guard, bound, shows), Proved);
+    assert_eq!(check(one, "value", guard, "out < 7", shows), Refuted);
+    assert_eq!(check(one, "value", guard, "out <= 7", "core.show(out == 7); core.show(out == 7);"), Proved);
+    assert_eq!(check(one, "value", guard, bound, "core.show(out == 7); core.show(out == 6);"), Refuted);
+    assert_eq!(check(one, "value", guard, bound, "core.show(out == 7); core.show(out == 6); core.show(out == input);"), Unsupported);
+    assert_eq!(check(one, "value", guard, bound, "core.show(out <= 6);"), Refuted);
+    assert_eq!(check("i8 first = echo(8); i8 last = echo(7);", "value", guard, bound, shows), Refuted);
+    assert_eq!(check("i8 miss = echo(-1);", "value", guard, bound, shows), NoApplicableInputs);
+    assert!(matches!(check("i8 miss = echo(-1);", "value", guard, bound, "core.show(out <= 128);"), Invalid(_)));
+    assert_eq!(check(one, "value", guard, bound, "core.show(out == core.old(input));"), Unsupported);
+    assert_eq!(check(one, "value", guard, bound, "core.show(out == input);"), Unsupported);
+    assert_eq!(check(one, "value", guard, bound,
+        "if (input >= 0) { core.show(out == 7); } else { core.show(out == 7); }"), Unsupported);
+    assert_eq!(check(one, "if (value == 0) {}; 3 + 4", guard, bound, shows), Unsupported);
+}
+
+#[test]
 fn named_proof_show_mixed_sequence_holds_all_exact_obligations() {
     let identity = source();
     let check = |target: &str, where_guard: &str, ensures: &str, steps: &str| {

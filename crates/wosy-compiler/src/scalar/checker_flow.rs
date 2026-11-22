@@ -546,6 +546,90 @@ pub(super) enum IntegerShowProof<'a> {
 }
 
 #[cfg(feature = "internal-checker")]
+pub(super) struct ActualLiteralShow<'a> {
+    bound: &'a BigInt,
+    relation: IntegerRelation,
+    extra: ActualLiteralClaim<'a>,
+}
+
+#[cfg(feature = "internal-checker")]
+enum ActualLiteralClaim<'a> {
+    None,
+    Equal(&'a BigInt),
+    Impossible,
+    Output(IntegerShowOutput, Option<usize>),
+    Constraints(IntegerShowConstraints<'a>),
+}
+
+#[cfg(feature = "internal-checker")]
+impl<'a> ActualLiteralShow<'a> {
+    pub(super) fn admit(proof: IntegerShowProof<'a>, mut relation: IntegerRelation, bound: &'a BigInt) -> Option<Self> {
+        let extra = match proof {
+            IntegerShowProof::Equality(IntegerReturn::Const(value)) if value == bound => {
+                relation = relation.intersection(IntegerRelation::from_operator(&BinaryOperator::Equal)?);
+                ActualLiteralClaim::None
+            }
+            IntegerShowProof::Equality(IntegerReturn::Const(value)) => ActualLiteralClaim::Equal(value),
+            IntegerShowProof::Sequence(claims) => {
+                let mut expected = None;
+                let mut impossible = false;
+                for claim in claims {
+                    let IntegerReturn::Const(value) = claim else { return None; };
+                    if let Some(first) = expected {
+                        impossible |= first != value;
+                    } else {
+                        expected = Some(value);
+                    }
+                }
+                if impossible {
+                    ActualLiteralClaim::Impossible
+                } else if let Some(value) = expected {
+                    if value == bound {
+                        relation = relation.intersection(IntegerRelation::from_operator(&BinaryOperator::Equal)?);
+                        ActualLiteralClaim::None
+                    } else {
+                        ActualLiteralClaim::Equal(value)
+                    }
+                } else {
+                    ActualLiteralClaim::None
+                }
+            }
+            IntegerShowProof::Output(IntegerShowOutput::Relation { relation: show, bound: show_bound }) if &show_bound == bound => {
+                relation = relation.intersection(show);
+                ActualLiteralClaim::None
+            }
+            IntegerShowProof::Output(output) => {
+                let skip = match &output {
+                    IntegerShowOutput::Conjunction(atoms) => atoms.binary_search_by(|(_, literal)| literal.cmp(bound)).ok(),
+                    _ => None,
+                };
+                if let (Some(index), IntegerShowOutput::Conjunction(atoms)) = (skip, &output) {
+                    relation = relation.intersection(atoms[index].0);
+                }
+                ActualLiteralClaim::Output(output, skip)
+            }
+            IntegerShowProof::MixedSequence { output, entry: [None, None], .. } => ActualLiteralClaim::Constraints(output),
+            _ => return None,
+        };
+        Some(Self { bound, relation, extra })
+    }
+
+    pub(super) fn holds(&self, value: &BigInt) -> bool {
+        match &self.extra {
+            ActualLiteralClaim::Constraints(output) => return output.holds_value(value),
+            ActualLiteralClaim::Impossible => return false,
+            _ => {}
+        }
+        self.relation.accepts(value.cmp(self.bound)) && match &self.extra {
+            ActualLiteralClaim::None => true,
+            ActualLiteralClaim::Equal(expected) => value == *expected,
+            ActualLiteralClaim::Output(show, skip) => show.holds_value(value, *skip),
+            ActualLiteralClaim::Constraints(_) | ActualLiteralClaim::Impossible => unreachable!(),
+        }
+    }
+}
+
+#[cfg(feature = "internal-checker")]
 pub(super) enum GuardedOutputClaims {
     Literal { yes: (IntegerRelation, BigInt), no: (IntegerRelation, BigInt) },
     ImmutableEntry { yes: IntegerRelation, no: IntegerRelation },
@@ -573,6 +657,18 @@ impl IntegerShowOutput {
             start = end;
             clause
         })
+    }
+
+    fn holds_value(&self, value: &BigInt, skip_conjunct: Option<usize>) -> bool {
+        match self {
+            Self::Relation { relation, bound } => relation.accepts(value.cmp(bound)),
+            Self::Conjunction(atoms) => atoms.iter().enumerate().all(|(index, (relation, bound))|
+                skip_conjunct == Some(index) || relation.accepts(value.cmp(bound))),
+            Self::Disjunction([(left_relation, left), (right_relation, right)]) =>
+                left_relation.accepts(value.cmp(left)) || right_relation.accepts(value.cmp(right)),
+            Self::Alternatives { atoms, clause_ends } => Self::clauses(atoms, clause_ends).any(|clause|
+                clause.iter().all(|(relation, bound)| relation.accepts(value.cmp(bound)))),
+        }
     }
 
     fn normalize_union(&self, ty: &ScalarType) -> Option<IntegerSet> {
@@ -858,19 +954,8 @@ impl IntegerReturningPath<'_> {
         skip_conjunct: Option<usize>, allowed: &mut Option<IntegerSet>,
     ) -> Option<bool> {
         match self.value {
-            IntegerReturn::Const(value) => Some(relation.accepts(value.cmp(bound)) && match show {
-                None => true,
-                Some(IntegerShowOutput::Relation { relation, bound }) => relation.accepts(value.cmp(bound)),
-                Some(IntegerShowOutput::Conjunction(atoms)) => atoms.iter().enumerate().all(|(index, (relation, bound))| {
-                    skip_conjunct == Some(index) || relation.accepts(value.cmp(bound))
-                }),
-                Some(IntegerShowOutput::Disjunction([(left_relation, left), (right_relation, right)])) =>
-                    left_relation.accepts(value.cmp(left)) || right_relation.accepts(value.cmp(right)),
-                Some(IntegerShowOutput::Alternatives { atoms, clause_ends }) =>
-                    IntegerShowOutput::clauses(atoms, clause_ends).any(|clause| {
-                        clause.iter().all(|(relation, bound)| relation.accepts(value.cmp(bound)))
-                    }),
-            }),
+            IntegerReturn::Const(value) => Some(relation.accepts(value.cmp(bound))
+                && show.is_none_or(|show| show.holds_value(value, skip_conjunct))),
             IntegerReturn::Alias(binding) => {
                 let axis = self.axes.iter().position(|known| *known == binding)?;
                 for row in &self.state.0 {

@@ -28,7 +28,7 @@ use super::{
     },
 };
 #[cfg(feature = "internal-checker")]
-use super::{checker_flow::{evaluate_borrowed_return_proof, evaluate_mixed_entry_output, observe_authored_show_returns, integer_predicate_implies, observe_arbitrary_integer_returns, observe_unused_module_proof_returns, GuardedOutputClaims, ImmutableEntryRange, ImmutableProofOutputComparison, IntegerShowOutput}, symbolic_integer::IntegerShowConstraints, typecheck::integer_bounds};
+use super::{checker_flow::{evaluate_borrowed_return_proof, evaluate_mixed_entry_output, observe_authored_show_returns, integer_predicate_implies, observe_arbitrary_integer_returns, observe_unused_module_proof_returns, ActualLiteralShow, GuardedOutputClaims, ImmutableEntryRange, ImmutableProofOutputComparison, IntegerShowOutput}, symbolic_integer::IntegerShowConstraints, typecheck::integer_bounds};
 use crate::Diagnostic;
 use wosy_syntax::SourceIdentity;
 use wosy_syntax::{CanonicalCstRoot, CstNode, CstToken, SyntaxKind};
@@ -3033,15 +3033,14 @@ impl PlannedModuleProof<'_> {
     }
 
     fn observer(&self) -> SelectedProofObserver<'_> {
-        SelectedProofObserver {
-            guard: if self.uses_direct_goal() {
-                checked_integer_guard_slots::<true>(self.typed.body, self.filter.as_deref().unwrap_or_default())
-            } else {
-                None
-            },
-            goal: &self.typed.goal,
-            coverage: ActualProofCoverage::Unseen,
-        }
+        let mode = if self.uses_direct_goal() {
+            ActualProofMode::Direct(checked_integer_guard_slots::<true>(self.typed.body, self.filter.as_deref().unwrap_or_default()))
+        } else if matches!(self.typed.goal, TypedProofGoal::Literal { .. }) {
+            ActualProofMode::Pending(self)
+        } else {
+            ActualProofMode::Direct(None)
+        };
+        SelectedProofObserver { mode, goal: &self.typed.goal, coverage: ActualProofCoverage::Unseen }
     }
 
     fn same_peer_target(&self, peer: &PlannedModuleProof<'_>) -> bool {
@@ -3255,8 +3254,16 @@ fn checked_integer_guard_slots<'a, const ALLOW_DOMAIN: bool>(
 }
 
 #[cfg(feature = "internal-checker")]
+enum ActualProofMode<'a> {
+    Direct(Option<CheckedIntegerGuardSlots<'a>>),
+    Pending(&'a PlannedModuleProof<'a>),
+    Authored(CheckedIntegerGuardSlots<'a>, Box<ActualLiteralShow<'a>>),
+    Invalid(Box<ProjectCheck>),
+}
+
+#[cfg(feature = "internal-checker")]
 struct SelectedProofObserver<'a> {
-    guard: Option<CheckedIntegerGuardSlots<'a>>,
+    mode: ActualProofMode<'a>,
     goal: &'a TypedProofGoal,
     coverage: ActualProofCoverage,
 }
@@ -3273,6 +3280,9 @@ enum ActualProofCoverage {
 #[cfg(feature = "internal-checker")]
 impl SelectedProofObserver<'_> {
     fn outcome(self) -> Result<ProjectCheck, ProjectCheck> {
+        if let ActualProofMode::Invalid(error) = self.mode {
+            return Err(*error);
+        }
         match self.coverage {
             ActualProofCoverage::Proved => Ok(ProjectCheck::Proved),
             ActualProofCoverage::Refuted => Ok(ProjectCheck::Refuted),
@@ -3281,34 +3291,71 @@ impl SelectedProofObserver<'_> {
         }
     }
 
+    fn prepare_actual_shows<'a>(plan: &'a PlannedModuleProof<'a>, arity: usize) -> ActualProofMode<'a> {
+        let starts_with_show = plan.steps.items.first().zip(plan.steps.terminated_items.first())
+            .is_some_and(|(item, &terminated)| proof_show_expression(item, terminated).is_ok());
+        if !starts_with_show {
+            return ActualProofMode::Direct(None);
+        }
+        let Some(guard) = checked_integer_guard_slots::<true>(plan.typed.body, plan.filter.as_deref().unwrap_or_default())
+            .filter(|guard| guard.arity == arity)
+        else {
+            return ActualProofMode::Direct(None);
+        };
+        let prepared = plan.prepare_arbitrary_show().and_then(|(operator, bound, proof)| {
+            let relation = IntegerRelation::from_operator(operator).ok_or(ProjectCheck::Unsupported)?;
+            ActualLiteralShow::admit(proof, relation, bound).ok_or(ProjectCheck::Unsupported)
+        });
+        match prepared {
+            Ok(show) => ActualProofMode::Authored(guard, Box::new(show)),
+            Err(error @ (ProjectCheck::Invalid(_) | ProjectCheck::InvalidProof)) => ActualProofMode::Invalid(Box::new(error)),
+            Err(_) => ActualProofMode::Direct(None),
+        }
+    }
+
     fn record(&mut self, arguments: &[&BigInt], value: &BigInt) {
-        let Some(guard) = self.guard.as_ref().filter(|guard| guard.arity == arguments.len()) else {
+        let (guard, shows) = match &self.mode {
+            ActualProofMode::Direct(Some(guard)) => (guard, None),
+            ActualProofMode::Authored(guard, show) => (guard, Some(show.as_ref())),
+            ActualProofMode::Pending(plan) => {
+                self.mode = Self::prepare_actual_shows(*plan, arguments.len());
+                return self.record(arguments, value);
+            }
+            ActualProofMode::Direct(None) | ActualProofMode::Invalid(_) => {
+                self.coverage = ActualProofCoverage::Unsupported;
+                return;
+            }
+        };
+        if guard.arity != arguments.len() {
             self.coverage = ActualProofCoverage::Unsupported;
             return;
-        };
+        }
         if matches!(self.coverage, ActualProofCoverage::Unsupported | ActualProofCoverage::Refuted) {
             return;
         }
         if guard.accepts(arguments) {
-            let holds = match self.goal {
-                TypedProofGoal::Literal { relation, bound, .. } | TypedProofGoal::Universal { relation, bound } =>
-                    Some(relation.accepts(value.cmp(bound))),
-                TypedProofGoal::Existential { relation, witness, witness_in_domain } =>
-                    (*witness_in_domain && relation.accepts(value.cmp(witness))).then_some(true),
-                TypedProofGoal::Disjunction(allowed) => Some(allowed.contains(value)),
-                TypedProofGoal::DeferredDisjunction(_) => None,
-                TypedProofGoal::MixedEntryConjunction { output, entry } => {
-                    let compared = entry.iter().take(arguments.len());
-                    if entry.iter().skip(arguments.len()).any(Option::is_some) {
-                        None
-                    } else {
-                        Some(output.holds_value(value) && arguments.iter().zip(compared).all(|(argument, relation)|
-                            relation.is_none_or(|relation| relation.accepts(value.cmp(*argument)))))
-                    }
+            let holds = match shows {
+                Some(show) => Some(show.holds(value)),
+                None => match self.goal {
+                    TypedProofGoal::Literal { relation, bound, .. } | TypedProofGoal::Universal { relation, bound } =>
+                        Some(relation.accepts(value.cmp(bound))),
+                    TypedProofGoal::Existential { relation, witness, witness_in_domain } =>
+                        (*witness_in_domain && relation.accepts(value.cmp(witness))).then_some(true),
+                    TypedProofGoal::Disjunction(allowed) => Some(allowed.contains(value)),
+                    TypedProofGoal::DeferredDisjunction(_) => None,
+                    TypedProofGoal::MixedEntryConjunction { output, entry } => {
+                        let compared = entry.iter().take(arguments.len());
+                        if entry.iter().skip(arguments.len()).any(Option::is_some) {
+                            None
+                        } else {
+                            Some(output.holds_value(value) && arguments.iter().zip(compared).all(|(argument, relation)|
+                                relation.is_none_or(|relation| relation.accepts(value.cmp(*argument)))))
+                        }
+                    },
+                    TypedProofGoal::Conjunction(atoms) => Some(atoms.iter().all(|(relation, bound)| relation.accepts(value.cmp(bound)))),
+                    TypedProofGoal::EntryComparison { slot, relation } =>
+                        arguments.get(*slot).map(|entry| relation.accepts(value.cmp(entry))),
                 },
-                TypedProofGoal::Conjunction(atoms) => Some(atoms.iter().all(|(relation, bound)| relation.accepts(value.cmp(bound)))),
-                TypedProofGoal::EntryComparison { slot, relation } =>
-                    arguments.get(*slot).map(|entry| relation.accepts(value.cmp(entry))),
             };
             self.coverage = match holds {
                 Some(true) => ActualProofCoverage::Proved,
