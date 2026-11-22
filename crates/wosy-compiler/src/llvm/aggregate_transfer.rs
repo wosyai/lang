@@ -7,11 +7,13 @@ pub(super) struct InitializerEmitter<'ctx, 'plan> {
     receipt: Option<(usize, PointerValue<'ctx>)>,
     immediate_consumer: Option<usize>,
     visited: BTreeSet<usize>,
+    ordinary_visited: BTreeSet<usize>,
+    ordinary_binding: Option<usize>,
 }
 
 impl<'ctx, 'plan> InitializerEmitter<'ctx, 'plan> {
     pub(super) fn new(plan: &'plan ClosedInitializer) -> Self {
-        Self { plan, receipt: None, immediate_consumer: None, visited: BTreeSet::new() }
+        Self { plan, receipt: None, immediate_consumer: None, visited: BTreeSet::new(), ordinary_visited: BTreeSet::new(), ordinary_binding: None }
     }
 
     fn visit(&mut self, ordinal: usize) -> Result<(), String> {
@@ -31,7 +33,8 @@ pub(super) fn initializer_namespace_edge(state: &EmitState<'_, '_>) -> Result<()
 
 pub(super) fn finish_initializer(state: &mut EmitState<'_, '_>) -> Result<(), String> {
     if let Some(frame) = state.initializer_aggregate.take() {
-        if frame.receipt.is_some() || frame.immediate_consumer.is_some()
+        if frame.receipt.is_some() || frame.immediate_consumer.is_some() || frame.ordinary_binding.is_some()
+            || frame.ordinary_visited.len() != frame.plan.ordinary_calls.len()
             || frame.visited.len() != frame.plan.installs.len() + frame.plan.immediate.len() + frame.plan.inputs.len() {
             return Err("unfinished closed initializer transfer".into());
         }
@@ -58,7 +61,7 @@ pub(super) struct AggregateEmitter<'ctx, 'plan> {
     destination: Option<PointerValue<'ctx>>,
     ordinary_destination: Option<PointerValue<'ctx>>,
     ordinary_committed: bool,
-    ordinary_called: bool,
+    ordinary_visited: BTreeSet<usize>,
     base: Option<PointerValue<'ctx>>,
     registered_allocation: Option<String>,
     failure_site: Option<((usize, usize), usize)>,
@@ -140,7 +143,7 @@ impl<'ctx, 'plan> AggregateEmitter<'ctx, 'plan> {
             destination,
             ordinary_destination,
             ordinary_committed: false,
-            ordinary_called: false,
+            ordinary_visited: BTreeSet::new(),
             base: None,
             registered_allocation: None,
             failure_site,
@@ -438,6 +441,28 @@ pub(super) fn emit_initializer_binding<'ctx, 'module>(
     Ok(true)
 }
 
+pub(super) fn prepare_ordinary_initializer_binding(
+    state: &mut EmitState<'_, '_>,
+    binding: &ScalarBinding,
+    source: &wosy_syntax::SourceIdentity,
+) -> Result<(), String> {
+    let Some(frame) = state.initializer_aggregate.as_mut() else { return Ok(()) };
+    if frame.plan.ordinary_calls.is_empty() || !matches!(binding.value, ScalarExpression::Call { .. }) {
+        return Ok(());
+    }
+    let nodes = state.initializer_nodes.ok_or_else(|| "missing ordinary initializer nodes".to_owned())?;
+    let (ordinal, _) = nodes.bound_call(&binding.value)?;
+    let Some((_, storage)) = frame.plan.ordinary_calls.get(&ordinal) else { return Ok(()) };
+    let [receiver] = binding.receivers.as_slice() else {
+        return Err("ordinary initializer result changed receiver arity".into());
+    };
+    if binding.is_allocation || source != &storage.source || receiver.name_span != storage.range
+        || frame.ordinary_binding.replace(ordinal).is_some() {
+        return Err("ordinary initializer result changed its binding identity".into());
+    }
+    Ok(())
+}
+
 pub(super) fn emit_call<'ctx, 'module>(
     context: &'ctx Context,
     state: &mut EmitState<'ctx, 'module>,
@@ -448,6 +473,24 @@ pub(super) fn emit_call<'ctx, 'module>(
     if let Some(frame) = state.initializer_aggregate.as_ref() {
         let nodes = state.initializer_nodes.ok_or_else(|| "missing closed initializer nodes".to_owned())?;
         let (ordinal, target) = nodes.bound_call(expression)?;
+        if let Some((declaration, _)) = frame.plan.ordinary_calls.get(&ordinal) {
+            if frame.receipt.is_some() || frame.immediate_consumer.is_some() {
+                return Err("ordinary aggregate result crosses a closed initializer receipt".into());
+            }
+            if !matches!(target, ModuleInitializationCallTarget::Direct {
+                declaration: selected, concrete: ConcreteCallSelection::Declaration,
+            } if declaration == selected) {
+                return Err("ordinary initializer call changed its declaration identity".into());
+            }
+            let frame = state.initializer_aggregate.as_mut().expect("ordinary initializer call frame");
+            if frame.ordinary_binding.take() != Some(ordinal) {
+                return Err("ordinary initializer result outside its bound storage initialization".into());
+            }
+            if !frame.ordinary_visited.insert(ordinal) {
+                return Err("ordinary initializer call occurrence emitted twice".into());
+            }
+            return emit_ordinary_result_call(context, state, expression, arguments, project, Some(target)).map(Some);
+        }
         if let Some(&consumer) = frame.plan.immediate.get(&ordinal) {
             if frame.immediate_consumer != Some(consumer) || frame.receipt.is_some() {
                 return Err("closed initializer immediate producer outside its paired argument".into());
@@ -481,10 +524,10 @@ pub(super) fn emit_call<'ctx, 'module>(
             return Err("ordinary aggregate call changed its declaration identity".into());
         }
         let aggregate = state.aggregate.as_mut().expect("ordinary aggregate call frame");
-        if std::mem::replace(&mut aggregate.ordinary_called, true) {
+        if !aggregate.ordinary_visited.insert(ordinal) {
             return Err("ordinary aggregate call occurrence emitted twice".into());
         }
-        return emit_ordinary_result_call(context, state, expression, arguments, project).map(Some);
+        return emit_ordinary_result_call(context, state, expression, arguments, project, None).map(Some);
     }
     let action = aggregate.plan.calls.get(&ordinal).copied().map(CallDestination::Body);
     let input = aggregate.plan.input_calls.get(&ordinal).map(|&(_, input)| CallInput::Body(input));
@@ -606,8 +649,9 @@ fn emit_ordinary_result_call<'ctx, 'module>(
     expression: &ScalarExpression,
     arguments: &[ScalarExpression],
     project: Option<(&ScalarModule, &[&ScalarModule])>,
+    initializer_target: Option<&ModuleInitializationCallTarget>,
 ) -> Result<EmitValue<'ctx>, String> {
-    let symbol = state.direct_aggregate_symbol(expression, None)?;
+    let symbol = state.direct_aggregate_symbol(expression, initializer_target)?;
     let function = *state.functions.get(symbol)
         .ok_or_else(|| "missing ordinary aggregate producer".to_owned())?;
     let Some(ScalarType::Callable { parameters, outputs }) = state.signatures.get(symbol) else {
@@ -909,7 +953,7 @@ pub(super) fn finish_return<'ctx>(
     if !aggregate.receipts.is_empty() || aggregate.input.is_some() {
         return Err("unreleased closed aggregate receipt".into());
     }
-    if aggregate.ordinary_called == aggregate.plan.ordinary_calls.is_empty() {
+    if aggregate.ordinary_visited.len() != aggregate.plan.ordinary_calls.len() {
         return Err("ordinary aggregate call occurrence was not emitted".into());
     }
     if aggregate.ordinary_destination.is_some() {

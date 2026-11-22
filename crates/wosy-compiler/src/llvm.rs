@@ -923,7 +923,6 @@ fn emit_project_llvm<'a>(
                 .ok_or_else(|| format!("missing module {}", source.path))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    drop(module_ordinals);
     let modules = ordered_modules
         .iter()
         .map(|&(_, module)| module)
@@ -1107,6 +1106,14 @@ fn emit_project_llvm<'a>(
         for specialization in rows.values() {
             reservations.bodies.insert((ordinal, specialization.item_ordinal, specialization.arm_index), matches!(specialization.function, Cow::Borrowed(_)));
         }
+    }
+    let snapshot_struct = |id: &crate::scalar::ScalarStructId| {
+        let &module = module_ordinals.get(&id.source)?;
+        let definition = project.modules.get(module)?.structs.get(id.index)?;
+        (&definition.id == id && layouts.aggregate(id).is_some()).then_some(definition)
+    };
+    if prepared_render && reservations.modules.len() > 1 {
+        reservations.snapshot_struct = Some(&snapshot_struct);
     }
     let aggregates = close_aggregates(&reservations)?;
     for declaration in declarations {
@@ -2851,6 +2858,7 @@ fn initialize_project_module<'ctx, 'module>(
                     })?;
                     continue;
                 }
+                aggregate_transfer::prepare_ordinary_initializer_binding(state, binding, &module.source)?;
                 let value = emit_project_binding_value(context, state, binding, module, modules)?;
                 for (position, (name, ty)) in binding_receivers(binding).iter().enumerate() {
                     if *ty == ScalarType::Unit {

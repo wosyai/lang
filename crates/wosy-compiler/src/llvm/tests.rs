@@ -8849,3 +8849,146 @@ u8(bool) literals = fn(b) { if (b) { 1 } else { 0 } };
         }
     }
 }
+
+#[test]
+fn namespace_copy_snapshots_use_distinct_caller_slots_in_startup_and_value_arms() {
+    let root = "%%start
+shapes = namespace package \"shapes.w\";
+seeds = namespace package \"seeds.w\";
+shapes.Bundle stored = seeds.first();
+u64(bool) choose = fn(flag) {
+    u64 prior = stored.unit_item.total;
+    stored = if (flag) { seeds.first() } else { seeds.second() };
+    prior * 100 + stored.unit_item.total
+};
+%%end";
+    let shapes = "%%start
+struct copy Sample { u64 total; }
+struct copy Bundle { Sample unit_item; u64 guard; }
+%%end";
+    let seeds = "%%start
+shapes = namespace package \"shapes.w\";
+shapes.Sample yellow = { .total = 13; };
+shapes.Sample blue = { .total = 29; };
+shapes.Bundle() first = fn {
+    shapes.Bundle snapshot = { .unit_item = yellow; .guard = 7; };
+    snapshot
+};
+shapes.Bundle() second = fn {
+    shapes.Bundle snapshot = { .unit_item = blue; .guard = 19; };
+    snapshot
+};
+%%end";
+    let source = |path: &str| SourceIdentity::new("project".into(), "package".into(), path.into(), "r1".into());
+    let main = source("main.w");
+    let seed_source = source("seeds.w");
+    let shape_source = source("shapes.w");
+    let declarations = |source, text: &str| {
+        let parsed = parse_source(source, text.into(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        derive_scalar_declarations_from_cst(parsed.result.canonical_cst())
+    };
+    let bindings = |input: &crate::ScalarSourceDeclarations, targets: &[&SourceIdentity]| {
+        input.namespaces().zip(targets.iter().copied()).map(|(namespace, target)| ScalarNamespaceBinding {
+            binding: namespace.binding.clone(), span: namespace.span, target: target.clone(),
+        }).collect::<Vec<_>>()
+    };
+    let prepare = |target_layout, root_text: &str, seed_text: &str| {
+        let root = declarations(main.clone(), root_text);
+        let seeds = declarations(seed_source.clone(), seed_text);
+        let root_bindings = bindings(&root, &[&shape_source, &seed_source]);
+        let seed_bindings = bindings(&seeds, &[&shape_source]);
+        prepare_scalar_project(
+            vec![(root, root_bindings), (seeds, seed_bindings),
+                 (declarations(shape_source.clone(), shapes), Vec::new())],
+            vec![main.clone(), seed_source.clone(), shape_source.clone()],
+            ScalarPreparationInputs { target_layout },
+        ).unwrap()
+    };
+    for target_layout in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
+        let prepared = prepare(target_layout, root, seeds);
+        let build = analyze_scalar_build(&prepared);
+        assert!(build.diagnostics().is_empty(), "{:?}", build.diagnostics());
+        let llvm = emit_scalar_build_project_llvm(&build).unwrap().to_text();
+        let first = project_function_name(&seed_source, "first");
+        let second = project_function_name(&seed_source, "second");
+        for producer in [&first, &second] {
+            let body = llvm.split_once(&format!("define internal void @{producer}("))
+                .expect("ordinary compiler-owned producer ABI").1.split_once("\n}").unwrap().0;
+            let (arguments, body) = body.split_once(')').unwrap();
+            let destination = arguments.strip_prefix("ptr ").expect("fixed destination");
+            assert!(body.lines().any(|line| line.contains("@llvm.memmove.")
+                && line.contains(&format!("ptr align 1 {destination},"))
+                && (line.contains("i32 16, i1 false") || line.contains("i64 16, i1 false"))), "{body}");
+            assert!(body.contains("ret void"), "{body}");
+        }
+        let global = format!("@{}", project_global_name(&main, "stored"));
+        let startup = llvm.lines().skip_while(|line| !line.starts_with("define ") || !line.contains("@main("))
+            .skip(1).take_while(|line| *line != "}").collect::<Vec<_>>();
+        let startup_call = startup.iter().position(|line| line.contains(&format!("call void @{first}(")))
+            .expect("ordinary startup call");
+        let startup_destination = startup[startup_call].split_once("(ptr ").unwrap().1.trim_end_matches(')');
+        let destination_alloca = startup.iter().position(|line| line.contains(
+            &format!("{startup_destination} = alloca [16 x i8], align 8")
+        )).expect("caller startup result storage");
+        let startup_store = startup.iter().position(|line| line.contains("@llvm.memmove.")
+            && line.contains(&format!("ptr align 1 {global},"))
+            && line.contains(startup_destination)).expect("post-return startup copy");
+        assert!(destination_alloca < startup_call && startup_call < startup_store);
+        let choose = project_function_name(&main, "choose");
+        let choose = llvm.split_once(&format!("define i64 @{choose}("))
+            .expect("original scalar consumer ABI").1.split_once("\n}").unwrap().0;
+        assert_eq!(llvm.matches(&format!("call void @{first}(")).count(), 2);
+        assert_eq!(llvm.matches(&format!("call void @{second}(")).count(), 1);
+        let destination_of = |producer| choose.lines().find_map(|line| {
+            line.trim().strip_prefix(&format!("call void @{producer}(ptr "))
+                .and_then(|argument| argument.strip_suffix(')')).map(str::to_owned)
+        }).expect("one caller destination in selected arm");
+        let left = destination_of(&first);
+        let right = destination_of(&second);
+        assert_ne!(left, right);
+        let final_store = choose.lines().find(|line| line.contains("@llvm.memmove.")
+            && line.contains(&format!("ptr align 1 {global},"))).expect("canonical final assignment store");
+        let stage = choose.lines().find(|line| line.contains("@llvm.memmove.")
+            && line.contains("assignment_value")).expect("assignment snapshot staging");
+        assert!(choose.find(&format!("call void @{first}(")).unwrap() < choose.find(stage).unwrap());
+        assert!(choose.find(&format!("call void @{second}(")).unwrap() < choose.find(stage).unwrap());
+        assert!(choose.find(stage).unwrap() < choose.find(final_store).unwrap());
+        for root in [left, right] {
+            assert!(choose.contains(&format!("{root} = alloca [16 x i8], align 8")), "{choose}");
+        }
+
+        let extra_use = root.replace(
+            "u64 prior = stored.unit_item.total;",
+            "shapes.Bundle extra_value = seeds.second(); u64 prior = extra_value.unit_item.total;",
+        );
+        let no_candidate = seeds.replace("shapes.Bundle snapshot = { .unit_item = yellow; .guard = 7; };
+    snapshot",
+                "{ .unit_item = yellow; .guard = 7; }")
+            .replace("shapes.Bundle snapshot = { .unit_item = blue; .guard = 19; };
+    snapshot",
+                "{ .unit_item = blue; .guard = 19; }");
+        for (root_variant, seeds_variant) in [(extra_use.as_str(), seeds), (root, no_candidate.as_str())] {
+            let prepared = prepare(target_layout, root_variant, seeds_variant);
+            let build = analyze_scalar_build(&prepared);
+            assert!(build.diagnostics().is_empty(), "{:?}", build.diagnostics());
+            let project = prepared.project();
+            let snapshot_struct = |id: &crate::ScalarStructId| {
+                let module = project.modules.iter().find(|module| module.source == id.source)?;
+                let structure = module.structs.get(id.index)?;
+                (&structure.id == id && module.layouts.aggregate(id).is_some()).then_some(structure)
+            };
+            let mut reservations = crate::scalar::AggregateReservations::default();
+            reservations.snapshot_struct = Some(&snapshot_struct);
+            for (module, input) in project.modules.iter().enumerate() {
+                reservations.modules.push(module);
+                reservations.bodies.extend(input.items.iter().enumerate().filter_map(|(item, declaration)|
+                    matches!(declaration, ScalarItem::Function(_)).then_some(((module, item, None), true))));
+            }
+            let plans = build.aggregate(&reservations).unwrap();
+            assert!(plans.initializer(&main).is_none_or(|plan| plan.ordinary_calls.is_empty()));
+            assert!(reservations.bodies.keys().all(|&(module, item, arm)|
+                plans.body(module, item, arm).is_none_or(|plan| !plan.ordinary_result && plan.ordinary_calls.is_empty())));
+        }
+    }
+}

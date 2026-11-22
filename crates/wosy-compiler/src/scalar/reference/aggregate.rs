@@ -1334,6 +1334,7 @@ pub(crate) enum ClosedInitializerInput {
 
 #[derive(Debug, Default)]
 pub(crate) struct ClosedInitializer {
+    pub(crate) ordinary_calls: BTreeMap<usize, (SourceSpan, SourceSpan)>,
     pub(crate) installs: HashMap<ByteSpan, usize>,
     pub(crate) immediate: HashMap<usize, usize>,
     pub(crate) inputs: HashMap<usize, ClosedInitializerInput>,
@@ -1361,7 +1362,8 @@ impl ClosedAggregates {
 }
 
 #[derive(Default)]
-pub(crate) struct AggregateReservations {
+pub(crate) struct AggregateReservations<'a> {
+    pub(crate) snapshot_struct: Option<&'a dyn Fn(&ScalarStructId) -> Option<&'a ScalarStruct>>,
     pub(crate) bodies: BTreeMap<BodyKey, bool>,
     pub(crate) modules: Vec<usize>,
 }
@@ -1666,114 +1668,6 @@ fn scalar_only_ordinary_result_use(
         )) == Some(&OccurrenceNode::Expression(call))
 }
 
-pub(super) fn ordinary_result_cohort<'a>(
-    reservations: &AggregateReservations,
-    module_at: impl Fn(usize) -> Option<(&'a SourceIdentity, &'a [ScalarItem], &'a [ScalarStruct], &'a ModuleCallSites)>,
-) -> BTreeMap<BodyKey, OrdinaryResultSite> {
-    let mut definitions = HashMap::new();
-    let mut candidates = BTreeMap::new();
-    for (&key @ (module, item, arm), &ordinary) in &reservations.bodies {
-        if !ordinary || arm.is_some() {
-            continue;
-        }
-        let Some((source, items, structs, _)) = module_at(module) else { return BTreeMap::new() };
-        let Some(ScalarItem::Function(function)) = items.get(item) else { return BTreeMap::new() };
-        if !crate::scalar::typecheck::is_module_private_name(&function.name)
-            || !function.generic_parameters.is_empty()
-            || !function.overload_arms.is_empty()
-        {
-            continue;
-        }
-        let ScalarType::Callable { parameters, outputs } = &function.signature else { continue };
-        if !parameters.iter().all(ordinary_value) {
-            continue;
-        }
-        let [ScalarOutput { ty, .. }] = outputs.outputs.as_slice() else { continue };
-        let ScalarType::Struct(id) = ty else { continue };
-        if !matches!(function.body.final_output_values.as_slice(), [output] if output.ty == *ty) {
-            continue;
-        }
-        let Some(structure) = structs.iter().find(|structure| &structure.id == id) else { continue };
-        let existing = structure.fields.iter().all(|field| ordinary_value(&field.ty))
-            && live_ordinary_result_storage(&function.body, ty, true);
-        if !existing && !nested_copy_local_result(&function.body, ty, structs) {
-            continue;
-        }
-        if definitions.insert((source, function.name_span), key).is_some() {
-            return BTreeMap::new();
-        }
-        candidates.insert(key, OrdinaryResultCandidate::Unused);
-    }
-    if candidates.is_empty() {
-        return BTreeMap::new();
-    }
-    let mut visit = |source: &SourceIdentity, range, site| {
-        if let Some(key) = definitions.get(&(source, range)) {
-            candidates.get_mut(key).expect("ordinary result candidate").record(site);
-        }
-    };
-    for (&caller @ (module, item, arm), &ordinary) in &reservations.bodies {
-        let Some((_, items, _, calls)) = module_at(module) else { return BTreeMap::new() };
-        let Some(ScalarItem::Function(function)) = items.get(item) else { return BTreeMap::new() };
-        let Some(sites) = calls.function_body(item, arm) else { return BTreeMap::new() };
-        if !matches!(&sites.plain_names, PlainNameFacts::Prepared(_))
-            || sites.allocation_length_calls.iter().any(|ordinal| !sites.allocation_length_call_targets.contains_key(ordinal))
-        {
-            return BTreeMap::new();
-        }
-        for escape in &sites.callable_escapes {
-            visit(&escape.source, escape.range, None);
-        }
-        for target in sites.allocation_length_call_targets.values() {
-            match target {
-                ResolvedCallTarget::ModuleCallable { source, declaration_span, .. } => {
-                    visit(source, *declaration_span, None);
-                }
-                ResolvedCallTarget::LocalCallable(_) | ResolvedCallTarget::CallableField { .. } => return BTreeMap::new(),
-                _ => {}
-            }
-        }
-        for occurrence in &sites.call_occurrences {
-            let Some(resolved) = sites.sites.get(occurrence.site) else { return BTreeMap::new() };
-            if matches!(&resolved.target, ResolvedCallTarget::LocalCallable(_) | ResolvedCallTarget::CallableField { .. }) {
-                return BTreeMap::new();
-            }
-            if let ResolvedCallTarget::ModuleCallable { source, declaration_span, concrete } = &resolved.target {
-                let allowed = ordinary && arm.is_none()
-                    && function.generic_parameters.is_empty() && function.overload_arms.is_empty()
-                    && matches!(concrete, ConcreteCallSelection::Declaration)
-                    && scalar_only_ordinary_result_use(function, sites, occurrence.ordinal);
-                visit(source, *declaration_span, allowed.then_some(OrdinaryResultSite {
-                    caller,
-                    call: occurrence.ordinal,
-                }));
-            }
-        }
-    }
-    for &module in &reservations.modules {
-        let Some((_, _, _, calls)) = module_at(module) else { return BTreeMap::new() };
-        let ModuleInitializationDetail::Occurrences(topology) = &calls.initialization.detail else { return BTreeMap::new() };
-        for escape in &topology.callable_escapes {
-            visit(&escape.source, escape.range, None);
-        }
-        for &ordinal in &topology.calls {
-            match calls.initialization.call_target(ordinal) {
-                Some(ModuleInitializationCallTarget::Direct { declaration, .. }
-                    | ModuleInitializationCallTarget::Generic { declaration, .. }) => {
-                    visit(&declaration.source, declaration.range, None);
-                }
-                Some(ModuleInitializationCallTarget::CallableBinding(_) | ModuleInitializationCallTarget::CallableField { .. })
-                | None => return BTreeMap::new(),
-                Some(_) => {}
-            }
-        }
-    }
-    candidates.into_iter().filter_map(|(key, candidate)| match candidate {
-        OrdinaryResultCandidate::Direct(site) if site.caller != key => Some((key, site)),
-        _ => None,
-    }).collect()
-}
-
 struct ModuleInput<'a> {
     source: &'a SourceIdentity,
     items: &'a [ScalarItem],
@@ -1902,28 +1796,368 @@ fn closed_checked_backing_consumer<'a>(
     Ok(consumer)
 }
 
+fn ordinary_snapshot_call_type(
+    signatures: &HashMap<OccurrenceOrdinal, CheckedCallSignature>,
+    call: OccurrenceOrdinal,
+) -> Option<&ScalarType> {
+    let signature = signatures.get(&call)?;
+    let [output] = signature.outputs.outputs.as_slice() else { return None };
+    matches!(output.ty, ScalarType::Struct(_)).then_some(&output.ty)
+}
+
+fn ordinary_snapshot_startup_sites(
+    topology: &ModuleInitializationTopology,
+) -> HashMap<OccurrenceOrdinal, ByteSpan> {
+    let Some(root) = topology.structure.blocks.get(topology.structure.root.0) else {
+        return HashMap::new();
+    };
+    root.items.iter().filter_map(|item| {
+        let BlockItemKind::Binding(binding) = &item.kind else { return None };
+        let BindingInitialization::Outputs(outputs) = &binding.initialization else { return None };
+        let [receiver] = binding.receivers() else { return None };
+        (outputs.secondary.is_empty()
+            && ordinary_snapshot_call_type(&topology.checked_call_signatures, outputs.primary)
+                == Some(&receiver.ty))
+            .then_some((outputs.primary, receiver.span))
+    }).collect()
+}
+
+fn ordinary_snapshot_assignment_sites(
+    sites: &FunctionCallSites,
+) -> HashMap<OccurrenceOrdinal, OccurrenceOrdinal> {
+    let mut pairs = HashMap::new();
+    for group in sites.assignments.values() {
+        let [rhs] = group.rhs_evaluations().as_slice() else { continue };
+        let [slot] = group.destinations().as_slice() else { continue };
+        let AssignmentReplacement::Resolved(ty @ ScalarType::Struct(_)) = &slot.replacement else {
+            continue;
+        };
+        if !group.projected_outputs().as_slice().is_empty() {
+            continue;
+        }
+        let Some(ConditionalRegion::Value { then_block, else_block, .. }) =
+            sites.conditionals.get(&rhs.expression) else { continue };
+        let arm = |block: &BlockOrdinal| {
+            let region = sites.structure.blocks.get(block.0)?;
+            let [item] = region.items.as_slice() else { return None };
+            let BlockItemKind::FinalOutput(output) = &item.kind else { return None };
+            (output.output == 0
+                && ordinary_snapshot_call_type(&sites.checked_call_signatures, output.expression) == Some(ty))
+                .then_some(output.expression)
+        };
+        if let (Some(left), Some(right)) = (arm(then_block), arm(else_block)) {
+            pairs.insert(left, right);
+            pairs.insert(right, left);
+        }
+    }
+    pairs
+}
+
+fn ordinary_snapshot_constructor<'a>(
+    source: &SourceIdentity,
+    function: &ScalarFunction,
+    sites: &FunctionCallSites,
+    ty: &ScalarType,
+    lookup: &dyn Fn(&ScalarStructId) -> Option<&'a ScalarStruct>,
+    copy: &mut HashMap<ScalarStructId, bool>,
+) -> bool {
+    fn is_copy<'a>(
+        ty: &ScalarType,
+        lookup: &dyn Fn(&ScalarStructId) -> Option<&'a ScalarStruct>,
+        copy: &mut HashMap<ScalarStructId, bool>,
+    ) -> bool {
+        if ordinary_value(ty) { return true }
+        let ScalarType::Struct(id) = ty else { return false };
+        if let Some(&proof) = copy.get(id) { return proof }
+        let Some(definition) = lookup(id) else { return false };
+        if definition.copy_policy != CopyPolicy::Copy { return false }
+        copy.insert(id.clone(), false);
+        let proof = definition.fields.iter().all(|field| is_copy(&field.ty, lookup, copy));
+        copy.insert(id.clone(), proof);
+        proof
+    }
+
+    fn value(expression: &ScalarExpression, ordinal: OccurrenceOrdinal, sites: &FunctionCallSites,
+        names: &HashMap<OccurrenceOrdinal, PlainNameIdentity>,
+    ) -> bool {
+        match expression {
+            ScalarExpression::StructLiteral { fields, .. } => fields.iter().enumerate().all(|(position, field)| {
+                matches!(sites.structure.edges.get(&(OccurrenceParent::Expression(ordinal),
+                    OccurrenceEdge::AggregateField(position))),
+                    Some(OccurrenceNode::Expression(nested))
+                    if sites.structure.literal_fields.contains_key(nested) && value(&field.value, *nested, sites, names))
+            }),
+            ScalarExpression::Name { .. } =>
+                matches!(names.get(&ordinal), Some(PlainNameIdentity::ModuleValue(_))),
+            ScalarExpression::Integer { .. } | ScalarExpression::Float { .. }
+            | ScalarExpression::Boolean { .. } | ScalarExpression::Char { .. } => true,
+            _ => false,
+        }
+    }
+
+    let [ScalarBlockItem::LocalBinding(binding), ScalarBlockItem::Expression(ScalarExpression::Name { .. })] =
+        function.body.items.as_slice() else { return false };
+    let [receiver] = binding.receivers.as_slice() else { return false };
+    if function.body.unsafe_context || binding.is_allocation || receiver.ty != *ty
+        || !matches!(binding.value, ScalarExpression::StructLiteral { .. }) || !is_copy(ty, lookup, copy) {
+        return false;
+    }
+    let PlainNameFacts::Prepared(names) = &sites.plain_names else { return false };
+    let root = OccurrenceParent::Block(sites.structure.root);
+    let Some(OccurrenceNode::Expression(initial)) = sites.structure.edges.get(&(
+        root, OccurrenceEdge::BindingRoot { item: 0, output: 0 },
+    )) else { return false };
+    let Some(OccurrenceNode::Expression(result)) = sites.structure.edges.get(&(
+        root, OccurrenceEdge::FinalOutput { item: 1, output: 0 },
+    )) else { return false };
+    matches!(names.get(result), Some(PlainNameIdentity::Lexical(id))
+        if &id.source == source && id.declaration_span == receiver.name_span)
+        && value(&binding.value, *initial, sites, names)
+}
+
+#[derive(Clone, Copy)]
+enum SnapshotUse {
+    Startup { module: usize, ordinal: OccurrenceOrdinal, storage: ByteSpan },
+    Arm { caller: BodyKey, ordinal: OccurrenceOrdinal, peer: BodyKey },
+}
+
+#[derive(Default)]
+struct OrdinaryCohorts {
+    private: BTreeMap<BodyKey, OrdinaryResultCandidate>,
+    namespace: BTreeMap<BodyKey, Vec<SnapshotUse>>,
+    refused: HashSet<BodyKey>,
+    copy: HashMap<ScalarStructId, bool>,
+}
+
+impl OrdinaryCohorts {
+    fn seed<'a>(
+        &mut self,
+        key: BodyKey,
+        monomorphic: bool,
+        source: &SourceIdentity,
+        function: &ScalarFunction,
+        structs: &[ScalarStruct],
+        sites: &FunctionCallSites,
+        lookup: Option<&dyn Fn(&ScalarStructId) -> Option<&'a ScalarStruct>>,
+    ) {
+        if !monomorphic || key.2.is_some()
+            || !function.generic_parameters.is_empty() || !function.overload_arms.is_empty() {
+            return;
+        }
+        let ScalarType::Callable { parameters, outputs } = &function.signature else { return };
+        let [ScalarOutput { ty: ty @ ScalarType::Struct(id), .. }] = outputs.outputs.as_slice() else { return };
+        if !matches!(function.body.final_output_values.as_slice(), [output] if output.ty == *ty)
+            || !parameters.iter().all(ordinary_value) {
+            return;
+        }
+        if crate::scalar::typecheck::is_module_private_name(&function.name) {
+            let Some(structure) = structs.iter().find(|structure| &structure.id == id) else { return };
+            let existing = structure.fields.iter().all(|field| ordinary_value(&field.ty))
+                && live_ordinary_result_storage(&function.body, ty, true);
+            if existing || nested_copy_local_result(&function.body, ty, structs) {
+                self.private.insert(key, OrdinaryResultCandidate::Unused);
+            }
+        } else if let Some(lookup) = lookup {
+            if ordinary_snapshot_constructor(source, function, sites, ty, lookup, &mut self.copy) {
+                self.namespace.insert(key, Vec::new());
+            }
+        }
+    }
+
+    fn record(&mut self, target: BodyKey, site: Option<OrdinaryResultSite>) {
+        if let Some(candidate) = self.private.get_mut(&target) {
+            candidate.record(site);
+        }
+        if self.namespace.contains_key(&target) {
+            self.refused.insert(target);
+        }
+    }
+
+    fn census<'a>(
+        &mut self,
+        reservations: &AggregateReservations,
+        module_at: &impl Fn(usize) -> Option<ModuleInput<'a>>,
+        declarations: &HashMap<(&SourceIdentity, ByteSpan), (usize, usize)>,
+    ) {
+        if (!self.private.is_empty() || !self.namespace.is_empty())
+            && self.collect_uses(reservations, module_at, declarations).is_none()
+        {
+            self.private.clear();
+            self.namespace.clear();
+        }
+    }
+
+    fn collect_uses<'a>(
+        &mut self,
+        reservations: &AggregateReservations,
+        module_at: &impl Fn(usize) -> Option<ModuleInput<'a>>,
+        declarations: &HashMap<(&SourceIdentity, ByteSpan), (usize, usize)>,
+    ) -> Option<()> {
+        let selected = |source: &SourceIdentity, range| declarations.get(&(source, range)).map(|&(module, item)| (module, item, None));
+        for (&caller @ (module, item, arm), &monomorphic) in &reservations.bodies {
+            let input = module_at(module)?;
+            let ScalarItem::Function(function) = input.items.get(item)? else { return None };
+            let sites = input.calls.function_body(item, arm)?;
+            if !matches!(&sites.plain_names, PlainNameFacts::Prepared(_))
+                || sites.allocation_length_calls.iter().any(|ordinal| !sites.allocation_length_call_targets.contains_key(ordinal)) {
+                return None;
+            }
+            for escape in &sites.callable_escapes {
+                if let Some(target) = selected(&escape.source, escape.range) { self.record(target, None); }
+            }
+            for target in sites.allocation_length_call_targets.values() {
+                match target {
+                    ResolvedCallTarget::ModuleCallable { source, declaration_span, .. } => {
+                        if let Some(target) = selected(source, *declaration_span) { self.record(target, None); }
+                    }
+                    ResolvedCallTarget::LocalCallable(_) | ResolvedCallTarget::CallableField { .. } => return None,
+                    _ => {}
+                }
+            }
+            let mut direct = HashMap::new();
+            for occurrence in &sites.call_occurrences {
+                let site = sites.sites.get(occurrence.site)?;
+                match &site.target {
+                    ResolvedCallTarget::ModuleCallable { source, declaration_span, concrete } => {
+                        let Some(target) = selected(source, *declaration_span) else { continue };
+                        if let Some(candidate) = self.private.get_mut(&target) {
+                            let allowed = monomorphic && arm.is_none()
+                                && function.generic_parameters.is_empty() && function.overload_arms.is_empty()
+                                && matches!(concrete, ConcreteCallSelection::Declaration)
+                                && scalar_only_ordinary_result_use(function, sites, occurrence.ordinal);
+                            candidate.record(allowed.then_some(OrdinaryResultSite { caller, call: occurrence.ordinal }));
+                        }
+                        if self.namespace.contains_key(&target) {
+                            if !monomorphic || arm.is_some()
+                                || !function.generic_parameters.is_empty() || !function.overload_arms.is_empty()
+                                || !matches!(concrete, ConcreteCallSelection::Declaration)
+                                || direct.insert(occurrence.ordinal, target).is_some() {
+                                self.refused.insert(target);
+                            }
+                        }
+                    }
+                    ResolvedCallTarget::LocalCallable(_) | ResolvedCallTarget::CallableField { .. } => return None,
+                    _ => {}
+                }
+            }
+            if direct.is_empty() { continue }
+            let pairs = ordinary_snapshot_assignment_sites(sites);
+            for (&ordinal, &producer) in &direct {
+                let Some(&peer) = pairs.get(&ordinal).and_then(|peer| direct.get(peer)) else {
+                    self.refused.insert(producer);
+                    continue;
+                };
+                if caller == producer { self.refused.insert(producer); }
+                self.namespace.get_mut(&producer)?.push(SnapshotUse::Arm { caller, ordinal, peer });
+            }
+        }
+        for &module in &reservations.modules {
+            let input = module_at(module)?;
+            let region = &input.calls.initialization;
+            let ModuleInitializationDetail::Occurrences(topology) = &region.detail else { return None };
+            for escape in &topology.callable_escapes {
+                if let Some(target) = selected(&escape.source, escape.range) { self.record(target, None); }
+            }
+            let mut allowed = None;
+            for &ordinal in &topology.calls {
+                match region.call_target(ordinal) {
+                    Some(ModuleInitializationCallTarget::Direct { declaration, concrete }) => {
+                        let Some(target) = selected(&declaration.source, declaration.range) else { continue };
+                        if let Some(candidate) = self.private.get_mut(&target) { candidate.record(None); }
+                        if let Some(uses) = self.namespace.get_mut(&target) {
+                            let storage = matches!(concrete, ConcreteCallSelection::Declaration)
+                                .then(|| allowed.get_or_insert_with(|| ordinary_snapshot_startup_sites(topology)).get(&ordinal).copied())
+                                .flatten();
+                            if let Some(storage) = storage {
+                                uses.push(SnapshotUse::Startup { module, ordinal, storage });
+                            } else { self.refused.insert(target); }
+                        }
+                    }
+                    Some(ModuleInitializationCallTarget::Generic { declaration, .. }) => {
+                        if let Some(target) = selected(&declaration.source, declaration.range) { self.record(target, None); }
+                    }
+                    Some(ModuleInitializationCallTarget::CallableBinding(_) | ModuleInitializationCallTarget::CallableField { .. })
+                    | None => return None,
+                    _ => {}
+                }
+            }
+        }
+        Some(())
+    }
+
+    fn install<'a>(
+        mut self,
+        module_at: &impl Fn(usize) -> Option<ModuleInput<'a>>,
+        result: &mut ClosedAggregates,
+    ) {
+        let declaration_at = |key: BodyKey| {
+            let input = module_at(key.0)?;
+            let ScalarItem::Function(function) = input.items.get(key.1)? else { return None };
+            Some(SourceSpan::new(input.source.clone(), function.name_span))
+        };
+        for (producer, candidate) in self.private {
+            let OrdinaryResultCandidate::Direct(site) = candidate else { continue };
+            if producer == site.caller || result.bodies.contains_key(&producer) || result.bodies.contains_key(&site.caller) {
+                continue;
+            }
+            let Some(declaration) = declaration_at(producer) else { continue };
+            result.bodies.entry(producer).or_default().ordinary_result = true;
+            result.bodies.entry(site.caller).or_default().ordinary_calls.insert(site.call.0, declaration);
+        }
+        let mut dependent = HashMap::<BodyKey, Vec<BodyKey>>::new();
+        for (&producer, uses) in &self.namespace {
+            if result.bodies.contains_key(&producer) || !uses.iter().any(|site| match site {
+                SnapshotUse::Startup { module, .. } => *module != producer.0,
+                SnapshotUse::Arm { caller, .. } => caller.0 != producer.0,
+            }) {
+                self.refused.insert(producer);
+            }
+            for site in uses {
+                match site {
+                    SnapshotUse::Startup { module, .. } => {
+                        if module_at(*module).is_none_or(|input| result.initializers.contains_key(input.source)) {
+                            self.refused.insert(producer);
+                        }
+                    }
+                    SnapshotUse::Arm { caller, peer, .. } => {
+                        if result.bodies.contains_key(caller) { self.refused.insert(producer); }
+                        dependent.entry(*peer).or_default().push(producer);
+                    }
+                }
+            }
+        }
+        let mut pending = self.refused.iter().copied().collect::<Vec<_>>();
+        while let Some(rejected) = pending.pop() {
+            if let Some(users) = dependent.remove(&rejected) {
+                pending.extend(users.into_iter().filter(|key| self.refused.insert(*key)));
+            }
+        }
+        for (producer, uses) in self.namespace {
+            if self.refused.contains(&producer) { continue }
+            let declaration = declaration_at(producer).expect("indexed ordinary producer");
+            result.bodies.entry(producer).or_default().ordinary_result = true;
+            for site in uses {
+                match site {
+                    SnapshotUse::Startup { module, ordinal, storage } => {
+                        let source = module_at(module).expect("indexed initializer").source;
+                        result.initializers.entry(source.clone()).or_default()
+                            .ordinary_calls.insert(ordinal.0, (declaration.clone(), SourceSpan::new(source.clone(), storage)));
+                    }
+                    SnapshotUse::Arm { caller, ordinal, .. } => {
+                        result.bodies.entry(caller).or_default().ordinary_calls.insert(ordinal.0, declaration.clone());
+                    }
+                }
+            }
+        }
+    }
+}
 fn closed_aggregates<'a>(
     reservations: &AggregateReservations,
     module_at: impl Fn(usize) -> Option<ModuleInput<'a>>,
     result_at: impl Fn(BodyKey, &'a ScalarFunction) -> Option<(Option<&'a AggregateFlowResult>, &'a ScalarReferenceCfg)>,
     initializers: impl Iterator<Item = &'a ModuleInitializationRegion> + Clone,
 ) -> Result<ClosedAggregates, String> {
-    let ordinary = ordinary_result_cohort(reservations, |module| {
-        let input = module_at(module)?;
-        Some((input.source, input.items, input.structs, input.calls))
-    });
-    let install_ordinary = |result: &mut ClosedAggregates| {
-        for (&producer, site) in &ordinary {
-            if result.bodies.contains_key(&producer) || result.bodies.contains_key(&site.caller) {
-                continue;
-            }
-            let Some(input) = module_at(producer.0) else { continue };
-            let Some(ScalarItem::Function(function)) = input.items.get(producer.1) else { continue };
-            let declaration = SourceSpan::new(input.source.clone(), function.name_span);
-            result.bodies.entry(producer).or_default().ordinary_result = true;
-            result.bodies.entry(site.caller).or_default().ordinary_calls.insert(site.call.0, declaration);
-        }
-    };
+    let mut ordinary = OrdinaryCohorts::default();
     let mut bodies = BTreeMap::new();
     let mut declarations = HashMap::new();
     let mut storage_uses = HashMap::<&SourceSpan, usize>::new();
@@ -1939,6 +2173,9 @@ fn closed_aggregates<'a>(
         let (facts, cfg) = result_at(key, body)
             .ok_or_else(|| format!("missing emitted aggregate result {key:?}"))?;
         declarations.insert((input.source, function.name_span), (module, item));
+        ordinary.seed(
+            key, is_monomorphic, input.source, function, input.structs, sites, reservations.snapshot_struct,
+        );
         for (storage, uses) in &sites.structure.module_storage_uses {
             *storage_uses.entry(storage).or_default() += uses.len();
         }
@@ -1956,6 +2193,7 @@ fn closed_aggregates<'a>(
             bodies.insert(key, Body { facts, cfg, sites, source: input.source, is_monomorphic, supports_input_result });
         }
     }
+    ordinary.census(reservations, &module_at, &declarations);
     let mut outgoing = BTreeSet::new();
     let mut pending = Vec::new();
     let mut callers = BTreeMap::<BodyKey, Vec<BodyKey>>::new();
@@ -2157,7 +2395,7 @@ fn closed_aggregates<'a>(
                 }
             }
         }
-        install_ordinary(&mut result);
+        ordinary.install(&module_at, &mut result);
         return Ok(result);
     }
     let mut initializer_uses = Vec::new();
@@ -2596,7 +2834,7 @@ fn closed_aggregates<'a>(
         }
         result.initializers = initializer_plans;
     }
-    install_ordinary(&mut result);
+    ordinary.install(&module_at, &mut result);
     Ok(result)
 }
 
@@ -2823,6 +3061,7 @@ Reading(u64) make_reading = fn(length) {
                         matches!(declaration, ScalarItem::Function(_)).then_some(((0, item, None), true))
                     }).collect(),
                     modules: vec![0],
+                    ..AggregateReservations::default()
                 };
                 let error = build.aggregate(&reservations).err().expect("escaped receipt loan");
                 assert!(error.contains("aggregate owning receipt has an unproved checked loan"), "{error}");
