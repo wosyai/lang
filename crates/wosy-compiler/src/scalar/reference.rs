@@ -5612,12 +5612,58 @@ fn point_last_use_dependencies_keep_canonical_order_and_storage() {
     assert!(point_last_use_dependencies(&CfgPointKind::ScopeExit, &mut pair).is_empty());
 }
 
+#[derive(PartialEq)]
+enum ForwardedMove {
+    Append,
+    Unchanged,
+    DuplicateUnchanged,
+}
+
+fn forwarded_move(
+    moved: &[(ReferencePlaceId, SourceSpan)],
+    place: &ReferencePlaceId,
+    seen_unchanged: &mut bool,
+    single_successor: bool,
+) -> ForwardedMove {
+    if !moved.iter().any(|(known, _)| known == place) {
+        ForwardedMove::Append
+    } else if single_successor && std::mem::replace(seen_unchanged, true) {
+        ForwardedMove::DuplicateUnchanged
+    } else {
+        ForwardedMove::Unchanged
+    }
+}
+
 fn forwarded_edge_seed(state: &mut Option<ReferenceEdgeState>, final_edge: bool) -> ReferenceEdgeState {
     if final_edge {
         state.take().expect("one seed for the final successor alternative")
     } else {
         state.as_ref().expect("seed for remaining successor alternatives").clone()
     }
+}
+
+#[cfg(test)]
+#[test]
+fn single_successor_move_skips_only_duplicate_unchanged_states() {
+    let source = SourceIdentity::new("project".into(), "package".into(), "metadata".into(), "r1".into());
+    let span = ByteSpan::new(0, 10);
+    let place = |start| {
+        let declaration_span = ByteSpan::new(start, start + 1);
+        ReferencePlaceId {
+            source: source.clone(), function_span: span, block_span: span, declaration_span,
+            binding: ReferenceBindingId {
+                source: source.clone(), function_span: span, block_span: span, declaration_span,
+                kind: ReferenceBindingKind::Declared,
+            },
+            projections: Vec::new(), place: ScalarPlace::Name { name: String::new(), span },
+        }
+    };
+    let moved = [1, 2].map(|start| (place(start), SourceSpan::new(source.clone(), span)));
+    let mut seen_unchanged = false;
+    assert!(forwarded_move(&moved, &place(1), &mut seen_unchanged, true) == ForwardedMove::Unchanged);
+    assert!(forwarded_move(&moved, &place(3), &mut seen_unchanged, true) == ForwardedMove::Append);
+    assert!(forwarded_move(&moved, &place(2), &mut seen_unchanged, true) == ForwardedMove::DuplicateUnchanged);
+    assert!(forwarded_move(&moved, &place(2), &mut seen_unchanged, false) == ForwardedMove::Unchanged);
 }
 
 #[cfg(test)]
@@ -7440,6 +7486,7 @@ fn transfer_reference_facts(
                     }
                 }
             };
+            let single_successor = point.successors.len() == 1;
             let mut state = Some(state);
             let mut successors = point.successors.iter().peekable();
             while let Some(successor) = successors.next() {
@@ -7456,11 +7503,21 @@ fn transfer_reference_facts(
                         slot.push(next);
                     }
                 } else {
+                    let mut seen_unchanged = false;
                     let mut alternatives = move_alternatives.iter().peekable();
                     while let Some((place, origin)) = alternatives.next() {
+                        // Same exact seed and successor, hence all no-op
+                        // alternatives remain equal after identical pruning.
+                        let effect = forwarded_move(
+                            &state.as_ref().expect("seed for successor alternatives").moved,
+                            place, &mut seen_unchanged, single_successor,
+                        );
+                        if effect == ForwardedMove::DuplicateUnchanged {
+                            continue;
+                        }
                         let final_edge = final_successor && alternatives.peek().is_none();
                         let mut next = forwarded_edge_seed(&mut state, final_edge);
-                        if !next.moved.iter().any(|(moved, _)| moved == place) {
+                        if effect == ForwardedMove::Append {
                             next.moved.push((place.clone(), origin.clone()));
                         }
                         if successor.0 <= id.0 {
