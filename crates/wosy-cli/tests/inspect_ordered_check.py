@@ -242,16 +242,34 @@ def main():
             2, b"", b"ordered check: incomplete: checker rejected invalid input\n"
         ), invalid_path
 
-        duplicate = complete_source.replace(
-            '.stdout = "third"; .stderr = ""; .code = 33; .files = [];',
-            '.stdout = "third"; .stderr = ""; .code = 33; .files = [{ .path = "preview.txt"; .text = ""; }];',
-        )
-        assert duplicate != complete_source
-        source.write_text(duplicate, encoding="utf-8")
-        duplicate_path = subprocess.run(effects_command, cwd=root, capture_output=True, timeout=15)
-        assert (duplicate_path.returncode, duplicate_path.stdout, duplicate_path.stderr) == (
-            2, b"", b'ordered check: duplicate output path "preview.txt" in "main.w"\n'
-        ), duplicate_path
+        def with_second_path(text, path):
+            changed = text.replace(
+                '.stdout = "third"; .stderr = ""; .code = 33; .files = [];',
+                f'.stdout = "third"; .stderr = ""; .code = 33; .files = [{{ .path = "{path}"; .text = ""; }}];',
+            )
+            assert changed != text
+            return changed
+
+        for first, second in (
+            ("preview.txt", "preview.txt"),
+            ("preview.txt", "PREVIEW.TXT"),
+            ("preview.txt", "preview.txt/child.txt"),
+            ("preview.txt/child.txt", "preview.txt"),
+            ("docs/one.txt", "Docs/two.txt"),
+        ):
+            content = with_second_path(complete_source.replace('"preview.txt"', f'"{first}"'), second)
+            source.write_text(content, encoding="utf-8")
+            conflict = subprocess.run(effects_command, cwd=root, capture_output=True, timeout=15)
+            assert (conflict.returncode, conflict.stdout, conflict.stderr) == (
+                2, b"", f'ordered check: conflicting output path "{second}" in "main.w"\n'.encode()
+            ), conflict
+
+        siblings = with_second_path(complete_source.replace('"preview.txt"', '"docs/one.txt"'), "docs/two.txt")
+        source.write_text(siblings, encoding="utf-8")
+        shared = subprocess.run(effects_command, cwd=root, capture_output=True, timeout=15)
+        assert shared.returncode == 1 and shared.stderr == b"", shared
+        assert shared.stdout.count(b' from "main.w": ') == 2, shared
+
         source.write_text(complete_source, encoding="utf-8")
         module.write_text(module.read_text(encoding="utf-8").replace("{ value }", "{ value + 1 }"), encoding="utf-8")
         incomplete = subprocess.run(effects_command, cwd=root, capture_output=True, timeout=15)

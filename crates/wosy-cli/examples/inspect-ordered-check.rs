@@ -126,8 +126,8 @@ fn main() -> ExitCode {
             eprintln!("ordered check: invalid output path {:?} in {:?}", request.path, source.path);
             return ExitCode::from(2);
         }
-        Err(CheckPublicationError::DuplicatePath { source, request }) => {
-            eprintln!("ordered check: duplicate output path {:?} in {:?}", request.path, source.path);
+        Err(CheckPublicationError::ConflictingPath { source, request }) => {
+            eprintln!("ordered check: conflicting output path {:?} in {:?}", request.path, source.path);
             return ExitCode::from(2);
         }
     };

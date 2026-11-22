@@ -3737,7 +3737,7 @@ mod checker_project;
 #[cfg(any(test, feature = "internal-checker"))]
 mod symbolic_integer;
 #[cfg(feature = "internal-checker")]
-pub use checker_directive::ScalarCheckerTextFile;
+pub use checker_directive::{CheckedOutputTargets, ScalarCheckerTextFile};
 #[cfg(feature = "internal-checker")]
 pub use checker_project::{check_loaded_scalar_module_proof_call, check_loaded_scalar_ordered_proof_contexts, check_loaded_scalar_ordered_local_proof_contexts, MainFlowProofReceipt, MainFlowProofDiagnostic, MainFlowProofInvocation, SymbolicProofDiagnostic, ScalarOrderedEntryEvidence, check_loaded_scalar_module_proof_selections, check_loaded_scalar_module_proofs, check_scalar_module_proof, check_scalar_module_proofs, ScalarProofDeclarations, ScalarProofCallOutcome, check_scalar_package, check_scalar_package_with_dormant_sources, check_scalar_package_ordered_with_dormant_sources, ScalarOrderedCheckerOutcome, ScalarOrderedCheckerFailure, ScalarProofModuleInput, ScalarModuleProofOutcome, ScalarCheckerFailure, ScalarCheckerIntegerWitness, ScalarCheckerOperation, ScalarCheckerOutcome, ScalarCheckerScope};
 #[cfg(feature = "internal-checker")]

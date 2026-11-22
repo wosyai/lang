@@ -1,7 +1,7 @@
-use std::{collections::{BTreeMap, HashSet}, ffi::OsStr, path::{Component, Path, PathBuf}};
+use std::{collections::BTreeMap, ffi::OsStr, path::{Component, Path, PathBuf}};
 
 use wosy_compiler::{
-    check_loaded_scalar_ordered_local_proof_contexts, MainFlowProofReceipt, ScalarCheckerScope,
+    check_loaded_scalar_ordered_local_proof_contexts, CheckedOutputTargets, MainFlowProofReceipt, ScalarCheckerScope,
     ScalarCheckerTextFile, ScalarOrderedCheckerFailure, ScalarOrderedCheckerOutcome,
     ScalarPreparationInputs, ScalarTargetLayout,
 };
@@ -41,7 +41,7 @@ pub(crate) enum CheckPublicationError<'a> {
         source: &'a wosy_syntax::SourceIdentity,
         request: &'a ScalarCheckerTextFile,
     },
-    DuplicatePath {
+    ConflictingPath {
         source: &'a wosy_syntax::SourceIdentity,
         request: &'a ScalarCheckerTextFile,
     },
@@ -51,7 +51,7 @@ impl ConfiguredCheckReceipt {
     pub(crate) fn plan_publication(&self) -> Result<PlannedCheckPublication<'_>, CheckPublicationError<'_>> {
         let report = self.outcome.as_ref().map_err(CheckPublicationError::Incomplete)?;
         let mut effects = Vec::new();
-        let mut seen = HashSet::new();
+        let mut seen = CheckedOutputTargets::default();
         let status = OrderedCheckEffects::new(&report.directives).visit_with_origin(|origin, effect| {
             let planned = match effect {
                 InternalCheckEffect::Stdout(bytes) => PlannedCheckEffect::Stdout(bytes),
@@ -60,8 +60,8 @@ impl ConfiguredCheckReceipt {
                     let source = &origin.source;
                     let relative = normalized_output_path(&request.path)
                         .ok_or(CheckPublicationError::InvalidPath { source, request })?;
-                    if !seen.insert(relative.clone()) {
-                        return Err(CheckPublicationError::DuplicatePath { source, request });
+                    if !seen.insert(&request.path) {
+                        return Err(CheckPublicationError::ConflictingPath { source, request });
                     }
                     PlannedCheckEffect::DeferredFile { relative, request, source }
                 }

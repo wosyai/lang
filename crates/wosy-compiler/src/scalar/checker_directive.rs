@@ -164,6 +164,38 @@ impl CheckerDirectiveShapeErrorKind {
     }
 }
 
+#[derive(Default)]
+#[doc(hidden)]
+pub struct CheckedOutputTargets<'a> {
+    children: HashMap<(usize, String), (usize, &'a str, bool)>,
+}
+
+impl<'a> CheckedOutputTargets<'a> {
+    pub fn insert(&mut self, path: &'a str) -> bool {
+        let mut parent = 0;
+        let mut components = path.split('/').peekable();
+        while let Some(component) = components.next() {
+            let is_file = components.peek().is_none();
+            let next_id = self.children.len() + 1;
+            match self.children.entry((parent, component.to_ascii_uppercase())) {
+                Entry::Vacant(entry) => {
+                    entry.insert((next_id, component, is_file));
+                    parent = next_id;
+                }
+                Entry::Occupied(entry) if !is_file => {
+                    let &(id, spelling, existing_is_file) = entry.get();
+                    if existing_is_file || spelling != component {
+                        return false;
+                    }
+                    parent = id;
+                }
+                Entry::Occupied(_) => return false,
+            }
+        }
+        true
+    }
+}
+
 impl CheckerOutput<'_> {
     pub(super) fn explicit_literal(&self) -> Option<CheckedLiteralOutput> {
         let ScalarExpression::Utf8 { span: stdout, value: stdout_bytes } = self.stdout? else {
@@ -178,28 +210,10 @@ impl CheckerOutput<'_> {
         let files = self.files.as_ref()?.iter()
             .map(CheckerFileOutput::explicit_text)
             .collect::<Option<Vec<_>>>()?;
-        let mut targets = HashMap::new();
-        let mut next_id = 1;
+        let mut targets = CheckedOutputTargets::default();
         for file in &files {
-            let mut parent = 0;
-            let mut components = file.path.split('/').peekable();
-            while let Some(component) = components.next() {
-                let is_file = components.peek().is_none();
-                match targets.entry((parent, component.to_ascii_uppercase())) {
-                    Entry::Vacant(entry) => {
-                        entry.insert((next_id, component, is_file));
-                        parent = next_id;
-                        next_id += 1;
-                    }
-                    Entry::Occupied(entry) if !is_file => {
-                        let &(id, spelling, existing_is_file) = entry.get();
-                        if existing_is_file || spelling != component {
-                            return None;
-                        }
-                        parent = id;
-                    }
-                    Entry::Occupied(_) => return None,
-                }
+            if !targets.insert(file.path) {
+                return None;
             }
         }
         let text_files = files.into_iter().map(|file| ScalarCheckerTextFile {
