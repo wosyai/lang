@@ -2315,8 +2315,92 @@ struct UnusedModuleProofGroup<'plan, 'project> {
 }
 
 #[cfg(feature = "internal-checker")]
+type AuthoredLeafKey<'a> = (&'a SourceIdentity, &'a str);
+
+#[cfg(feature = "internal-checker")]
+#[derive(Default)]
+struct ImplicitAuthoredShows<'a> {
+    first: Option<(AuthoredLeafKey<'a>, Option<usize>, bool)>,
+    index: HashMap<AuthoredLeafKey<'a>, Option<usize>>,
+    additional: Vec<bool>,
+}
+
+#[cfg(feature = "internal-checker")]
+impl<'a> ImplicitAuthoredShows<'a> {
+    fn cite<T>(
+        &mut self, key: AuthoredLeafKey<'a>, prepare: impl FnOnce() -> Option<T>,
+    ) -> (Option<AuthoredShowDestination>, Option<T>) {
+        let (slot, check) = match self.first {
+            Some((first, slot, _)) if first == key => (slot, None),
+            None => {
+                let check = prepare();
+                let slot = check.as_ref().map(|_| 0);
+                self.first = Some((key, slot, false));
+                (slot, check)
+            }
+            Some(_) => match self.index.entry(key) {
+                std::collections::hash_map::Entry::Occupied(entry) => (*entry.get(), None),
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    let check = prepare();
+                    let slot = check.as_ref().map(|_| {
+                        self.additional.push(false);
+                        self.additional.len()
+                    });
+                    entry.insert(slot);
+                    (slot, check)
+                }
+            },
+        };
+        (slot.map(AuthoredShowDestination::Implicit), check)
+    }
+
+    fn outcome_mut(&mut self, slot: usize) -> &mut bool {
+        if slot == 0 {
+            &mut self.first.as_mut().expect("first authored leaf slot").2
+        } else {
+            &mut self.additional[slot - 1]
+        }
+    }
+
+    fn proved(&self, slot: usize) -> bool {
+        if slot == 0 {
+            self.first.as_ref().expect("first authored leaf slot").2
+        } else {
+            self.additional[slot - 1]
+        }
+    }
+}
+
+#[cfg(feature = "internal-checker")]
+#[derive(Clone, Copy)]
+enum AuthoredShowDestination {
+    Selected(usize),
+    Implicit(usize),
+}
+
+#[cfg(feature = "internal-checker")]
+impl AuthoredShowDestination {
+    fn record(
+        self, outcome: ScalarModuleProofOutcome,
+        selected: &mut [ScalarModuleProofOutcome], implicit: &mut ImplicitAuthoredShows<'_>,
+    ) {
+        match self {
+            Self::Selected(index) => selected[index] = outcome,
+            Self::Implicit(index) => *implicit.outcome_mut(index) = matches!(outcome, ScalarModuleProofOutcome::Proved),
+        }
+    }
+
+    fn proved(self, selected: &[ScalarModuleProofOutcome], implicit: &ImplicitAuthoredShows<'_>) -> bool {
+        match self {
+            Self::Selected(index) => matches!(selected[index], ScalarModuleProofOutcome::Proved),
+            Self::Implicit(index) => implicit.proved(index),
+        }
+    }
+}
+
+#[cfg(feature = "internal-checker")]
 struct AuthoredShowCheck<'step, 'project> {
-    index: usize,
+    destination: AuthoredShowDestination,
     plan: &'step PlannedModuleProof<'project>,
     relation: IntegerRelation,
     bound: &'step BigInt,
@@ -2348,9 +2432,42 @@ impl<'step, 'project: 'step> AuthoredShowGroup<'step, 'project> {
 }
 
 #[cfg(feature = "internal-checker")]
+#[derive(Default)]
+struct AuthoredShowSchedule<'step, 'project> {
+    first: Option<AuthoredShowCheck<'step, 'project>>,
+    groups: HashMap<((usize, usize), ExactGuardGroup<'step>), AuthoredShowGroup<'step, 'project>>,
+}
+
+#[cfg(feature = "internal-checker")]
+impl<'step, 'project: 'step> AuthoredShowSchedule<'step, 'project> {
+    fn push(&mut self, check: AuthoredShowCheck<'step, 'project>) {
+        if self.first.is_none() && self.groups.is_empty() {
+            self.first = Some(check);
+            return;
+        }
+        if let Some(first) = self.first.take() {
+            self.groups.insert(first.group_key(), AuthoredShowGroup::new(first));
+        }
+        match self.groups.entry(check.group_key()) {
+            std::collections::hash_map::Entry::Occupied(mut group) => group.get_mut().additional.push(check),
+            std::collections::hash_map::Entry::Vacant(group) => { group.insert(AuthoredShowGroup::new(check)); }
+        }
+    }
+
+    fn verify(self, selected: &mut [ScalarModuleProofOutcome], implicit: &mut ImplicitAuthoredShows<'_>) {
+        if let Some(first) = self.first {
+            verify_authored_show_group(std::iter::once(first), selected, implicit);
+        }
+        for group in self.groups.into_values() {
+            verify_authored_show_group(group.checks(), selected, implicit);
+        }
+    }
+}
+
+#[cfg(feature = "internal-checker")]
 fn verify_authored_show_group<'step, 'project: 'step>(
     checks: impl IntoIterator<Item = AuthoredShowCheck<'step, 'project>>,
-    outcomes: &mut [ScalarModuleProofOutcome],
+    selected: &mut [ScalarModuleProofOutcome], implicit: &mut ImplicitAuthoredShows<'_>,
 ) {
     let mut checks = checks.into_iter();
     let Some(first) = checks.next() else { return; };
@@ -2361,29 +2478,36 @@ fn verify_authored_show_group<'step, 'project: 'step>(
     match rows {
         Some(Ok(ProofCoverage::Applicable(paths))) => {
             for check in checks {
-                outcomes[check.index] = match evaluate_borrowed_return_proof(
+                let outcome = match evaluate_borrowed_return_proof(
                     &paths, check.relation, check.bound, Some(&check.proof),
                 ) {
                     Some(true) => ScalarModuleProofOutcome::Proved,
                     Some(false) => ScalarModuleProofOutcome::Refuted,
                     None => ScalarModuleProofOutcome::Unsupported,
                 };
+                check.destination.record(outcome, selected, implicit);
             }
         }
         Some(Ok(ProofCoverage::NoApplicableInputs)) => {
             for check in checks {
-                outcomes[check.index] = ScalarModuleProofOutcome::NoApplicableInputs;
+                check.destination.record(ScalarModuleProofOutcome::NoApplicableInputs, selected, implicit);
             }
         }
         Some(Err(failure)) => {
-            let shared = module_proof_outcome(Err(project_failure(body, &plan.typed.target.source, failure)));
-            let mut checks = checks.peekable();
-            while let Some(check) = checks.next() {
-                if checks.peek().is_none() {
-                    outcomes[check.index] = shared;
-                    break;
+            // Indirect failures are unavailable authority, not published diagnostics.
+            let mut indices = checks.filter_map(|check| match check.destination {
+                AuthoredShowDestination::Selected(index) => Some(index),
+                AuthoredShowDestination::Implicit(_) => None,
+            }).peekable();
+            if indices.peek().is_some() {
+                let shared = module_proof_outcome(Err(project_failure(body, &plan.typed.target.source, failure)));
+                while let Some(index) = indices.next() {
+                    if indices.peek().is_none() {
+                        selected[index] = shared;
+                        break;
+                    }
+                    selected[index] = shared.clone();
                 }
-                outcomes[check.index] = shared.clone();
             }
         }
         None => {} // Preserve the default Unsupported outcome.
@@ -2607,8 +2731,10 @@ impl PreparedProofModule {
         else { return; };
         let mut graph = LocalPeerGraph::default();
         let mut pending_peers = Vec::new();
-        let mut first_authored = None;
-        let mut authored_groups = HashMap::new();
+        let mut authored = AuthoredShowSchedule::default();
+        let mut first_authored_citation = None;
+        let mut additional_authored_citations = Vec::new();
+        let mut implicit_authored = ImplicitAuthoredShows::default();
         let mut arbitrary_groups = HashMap::<_, UnusedModuleProofGroup<'_, '_>>::new();
         for ((index, plan), observer) in plans.iter().zip(observers.proofs) {
             let Some(&proof_module) = initialization.ordinals.get(plan.proof_source) else { continue; };
@@ -2651,25 +2777,10 @@ impl PreparedProofModule {
                     continue;
                 }
                 let Some(relation) = IntegerRelation::from_operator(operator) else { continue; };
-                let check = AuthoredShowCheck { index: *index, plan, relation, bound, proof };
-                if first_authored.is_none() && authored_groups.is_empty() {
-                    first_authored = Some(check);
-                } else {
-                    if let Some(first) = first_authored.take() {
-                        authored_groups.insert(first.group_key(), AuthoredShowGroup::new(first));
-                    }
-                    match authored_groups.entry(check.group_key()) {
-                        std::collections::hash_map::Entry::Occupied(mut group) => group.get_mut().additional.push(check),
-                        std::collections::hash_map::Entry::Vacant(group) => { group.insert(AuthoredShowGroup::new(check)); }
-                    }
-                }
+                authored.push(AuthoredShowCheck {
+                    destination: AuthoredShowDestination::Selected(*index), plan, relation, bound, proof,
+                });
             }
-        }
-        if let Some(first) = first_authored {
-            verify_authored_show_group(std::iter::once(first), outcomes);
-        }
-        for group in authored_groups.into_values() {
-            verify_authored_show_group(group.checks(), outcomes);
         }
         let mut cited_bounds = PeerPredicateBounds::default();
         if !pending_peers.is_empty() {
@@ -2703,10 +2814,8 @@ impl PreparedProofModule {
             }
             graph.resolve_edges(self, selected, plans);
             graph.resolve_terminals();
-            // The graph may be cited by several selected roots. Reuse the
-            // selected leaf's own independently checked outcome, or verify an
-            // implicit leaf once in the same authored-step observer mode.
-            let mut implicit_show_results = HashMap::new();
+            // Canonical terminal identity keeps independent authored recipes
+            // distinct while deduplicating repeated uses of the same leaf.
             let integer_equality = IntegerRelation::from_operator(&BinaryOperator::Equal).expect("checked integer equality");
             for (index, plan, requested, strict_entry) in admitted_roots {
                 let Some(leaf) = graph.terminal(requested) else { continue; };
@@ -2725,19 +2834,29 @@ impl PreparedProofModule {
                     ) {
                         continue;
                     }
-                    let verified = if let Some(selected_leaf) = selected.request(leaf.proof_source, leaf.name) {
-                        matches!(outcomes[*selected_leaf], ScalarModuleProofOutcome::Proved)
+                    let destination = if let Some(selected_leaf) = selected.request(leaf.proof_source, leaf.name) {
+                        Some(AuthoredShowDestination::Selected(*selected_leaf))
                     } else {
-                        *implicit_show_results.entry((leaf.proof_source, leaf.name)).or_insert_with(|| {
-                            matches!(leaf.verify_arbitrary_with_steps(), Ok(ProjectCheck::Proved))
-                        })
+                        let (destination, check) = implicit_authored.cite((leaf.proof_source, leaf.name), || {
+                            let (operator, bound, proof) = leaf.prepare_arbitrary_show().ok()?;
+                            let relation = IntegerRelation::from_operator(operator)?;
+                            if matches!(proof, IntegerShowProof::Conditional { .. }) {
+                                return None;
+                            }
+                            Some((relation, bound, proof))
+                        });
+                        if let (Some(destination), Some((relation, bound, proof))) = (destination, check) {
+                            authored.push(AuthoredShowCheck { destination, plan: leaf, relation, bound, proof });
+                        }
+                        destination
                     };
-                    if verified {
-                        outcomes[index] = if equality && !requested_relation.accepts(bound.cmp(requested)) {
-                            ScalarModuleProofOutcome::Refuted
+                    if let Some(destination) = destination {
+                        let citation = (index, destination, equality.then_some((*requested_relation, bound, requested)));
+                        if first_authored_citation.is_none() {
+                            first_authored_citation = Some(citation);
                         } else {
-                            ScalarModuleProofOutcome::Proved
-                        };
+                            additional_authored_citations.push(citation);
+                        }
                     }
                     continue;
                 }
@@ -2759,6 +2878,16 @@ impl PreparedProofModule {
                 arbitrary_groups.entry((plan.target, leaf_guard)).or_default().peer_uses.push(UnusedPeerUse {
                     index, consumer: plan, name: leaf.name, relation, bound, strict_entry, implication_checked,
                 });
+            }
+        }
+        authored.verify(outcomes, &mut implicit_authored);
+        for (index, destination, equality) in first_authored_citation.into_iter().chain(additional_authored_citations) {
+            if destination.proved(outcomes, &implicit_authored) {
+                outcomes[index] = if equality.is_some_and(|(relation, bound, requested)| !relation.accepts(bound.cmp(requested))) {
+                    ScalarModuleProofOutcome::Refuted
+                } else {
+                    ScalarModuleProofOutcome::Proved
+                };
             }
         }
         for ((_, guard), group) in arbitrary_groups {
@@ -3067,11 +3196,6 @@ impl PlannedModuleProof<'_> {
             Some((operator, bound)),
         )?;
         Ok((operator, bound, proof))
-    }
-
-    fn verify_arbitrary_with_steps(&self) -> Result<ProjectCheck, ProjectCheck> {
-        let (operator, bound, proof) = self.prepare_arbitrary_show()?;
-        self.verify_prepared_arbitrary_show(operator, bound, &proof)
     }
 
     fn verify_prepared_arbitrary_show(
@@ -5976,9 +6100,28 @@ mod tests {
 
     #[cfg(feature = "internal-checker")]
     #[test]
+    fn authored_show_implicit_singleton_keeps_identity_and_result_inline() {
+        let file = source("src/main.w", "implicit-show-singleton");
+        let mut slots = ImplicitAuthoredShows::default();
+        let (first, check) = slots.cite((&file, "leaf"), || Some("prepared"));
+        assert!(matches!(first, Some(AuthoredShowDestination::Implicit(0))));
+        assert_eq!(check, Some("prepared"));
+        *slots.outcome_mut(0) = true;
+        let (again, check) = slots.cite::<()>((&file, "leaf"), || panic!("reprepared leaf"));
+        assert!(matches!(again, Some(AuthoredShowDestination::Implicit(0))));
+        assert!(check.is_none() && slots.proved(0));
+        assert_eq!(slots.index.capacity(), 0);
+        assert_eq!(slots.additional.capacity(), 0);
+        let (second, _) = slots.cite((&file, "other"), || Some(()));
+        assert!(matches!(second, Some(AuthoredShowDestination::Implicit(1))));
+        assert!(slots.proved(0) && !slots.proved(1));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
     fn authored_show_groups_share_only_exact_return_observations() {
         use super::super::checker_flow::take_integer_observations;
-        use ScalarModuleProofOutcome::{Invalid, NoApplicableInputs, Proved, Refuted};
+        use ScalarModuleProofOutcome::{Invalid, NoApplicableInputs, Proved, Refuted, Unsupported};
         let file = source("src/main.w", "group-authored-shows");
         let text = r#"%%start
             u8(u8) echo = fn(arg) { arg };
@@ -5994,6 +6137,11 @@ mod tests {
             }
             proof invalid for echo(entry) -> (out) where (entry < 8) ensures (out <= 7) { core.show(out < 256); }
             proof cited for echo(entry) -> (out) where (entry < 8) ensures (out < 8) { core.use(passes(entry)); }
+            proof failed_citation for echo(entry) -> (out) where (entry < 8) ensures (out < 8) { core.use(fails(entry)); }
+            proof other_citation for echo(entry) -> (out) where (entry < 7) ensures (out < 7) { core.use(other(entry)); }
+            proof stronger_citation for echo(entry) -> (out) where (entry < 8) ensures (out <= 6) { core.use(passes(entry)); }
+            proof cycle_left for echo(entry) -> (out) where (entry < 8) ensures (out <= 7) { core.use(cycle_right(entry)); }
+            proof cycle_right for echo(entry) -> (out) where (entry < 8) ensures (out <= 7) { core.use(cycle_left(entry)); }
         %%end"#;
         let run = |names: &[&str]| check_scalar_module_proofs(
             file.clone(), names,
@@ -6003,6 +6151,14 @@ mod tests {
         let _ = take_integer_observations();
         assert_eq!(run(&["fails", "passes", "cited"]), [Refuted, Proved, Proved]);
         assert_eq!(take_integer_observations(), (1, 0));
+        assert_eq!(run(&["cited", "failed_citation"]), [Proved, Unsupported]); // Distinct implicit leaves.
+        assert_eq!(take_integer_observations(), (1, 0));
+        assert_eq!(run(&["passes", "failed_citation"]), [Proved, Unsupported]); // Explicit + implicit.
+        assert_eq!(take_integer_observations(), (1, 0));
+        assert_eq!(run(&["cited", "other_citation"]), [Proved, Proved]);
+        assert_eq!(take_integer_observations(), (2, 0));
+        assert_eq!(run(&["stronger_citation", "cycle_left"]), [Unsupported, Unsupported]);
+        assert_eq!(take_integer_observations(), (0, 0));
         assert_eq!(run(&["passes", "other"]), [Proved, Proved]);
         assert_eq!(take_integer_observations(), (2, 0));
         assert_eq!(run(&["passes", "plain"]), [Proved, Proved]);
