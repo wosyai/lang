@@ -5003,6 +5003,18 @@ fn conflicting_live_loan(
     conflicts
 }
 
+fn retire_overwritten_binding_origins(
+    state: &mut ReferenceEdgeState,
+    previous_origins: &BTreeSet<ReferenceOriginId>,
+) {
+    if previous_origins.is_empty() {
+        return;
+    }
+    for origins in state.bindings.values_mut() {
+        origins.retain(|origin| !previous_origins.contains(origin));
+    }
+}
+
 fn update_projected_assignment<'a>(
     state: &mut ReferenceEdgeState,
     targets: impl ExactSizeIterator<Item = &'a ReferencePlaceId> + Clone,
@@ -5025,6 +5037,31 @@ fn update_projected_assignment<'a>(
             retire(state, target);
         }
     }
+}
+
+#[cfg(test)]
+#[test]
+fn overwritten_binding_origins_retire_only_exact_previous_facts() {
+    let source = SourceIdentity::new("project".into(), "package".into(), "metadata".into(), "r1".into());
+    let span = ByteSpan::new(0, 10);
+    let binding = |start| ReferenceBindingId {
+        source: source.clone(), function_span: span, block_span: span,
+        declaration_span: ByteSpan::new(start, start + 1), kind: ReferenceBindingKind::Declared,
+    };
+    let first = binding(1);
+    let alias = binding(2);
+    let untouched = ReferenceOriginId(0);
+    let retired = ReferenceOriginId(1);
+    let mut state = ReferenceEdgeState::default();
+    state.bindings.insert(first.clone(), BTreeSet::from([untouched, retired]));
+    state.bindings.insert(alias.clone(), BTreeSet::from([retired]));
+    let original = state.bindings.clone();
+    retire_overwritten_binding_origins(&mut state, &BTreeSet::new());
+    assert_eq!(state.bindings, original);
+    retire_overwritten_binding_origins(&mut state, &BTreeSet::from([retired]));
+    assert_eq!(state.bindings, BTreeMap::from([
+        (first, BTreeSet::from([untouched])), (alias, BTreeSet::new()),
+    ]));
 }
 
 #[cfg(test)]
@@ -7359,9 +7396,7 @@ fn transfer_reference_facts(
                         state.released.remove(binding);
                         state.invalidated.remove(binding);
                     } else {
-                        for origins in state.bindings.values_mut() {
-                            origins.retain(|origin| !previous_origins.contains(origin));
-                        }
+                        retire_overwritten_binding_origins(&mut state, previous_origins);
                         state
                             .projected
                             .retain(|known| !reference_places_overlap(&known.place, target));
@@ -7403,9 +7438,7 @@ fn transfer_reference_facts(
                     previous_origins,
                     ..
                 } => {
-                    for origins in state.bindings.values_mut() {
-                        origins.retain(|origin| !previous_origins.contains(origin));
-                    }
+                    retire_overwritten_binding_origins(&mut state, previous_origins);
                     let rhs = assignment_rhs
                         .flatten()
                         .filter(|origins| !origins.is_empty());
