@@ -345,6 +345,37 @@ fn canonical_syntax_failure(output: wosy_compiler::ParseOutput) -> CanonicalLoad
     }
 }
 
+fn canonical_source_identity(
+    project_identity: String,
+    package: &str,
+    path: &PackageRelativePath,
+    text: &str,
+) -> SourceIdentity {
+    SourceIdentity::new(
+        project_identity,
+        package.to_owned(),
+        path.as_path().to_string_lossy().replace('\\', "/"),
+        blake3::hash(text.as_bytes()).to_hex().to_string(),
+    )
+}
+
+fn parse_canonical_ordinary_source(
+    source: SourceIdentity,
+    text: String,
+    comment_categories: &[String],
+    persist_in: Option<&std::path::Path>,
+) -> Result<(String, wosy_compiler::ScalarSourceDeclarations), CanonicalLoadFailure> {
+    let output = parse_source(source, text, comment_categories);
+    if !output.diagnostics.is_empty() {
+        return Err(canonical_syntax_failure(output));
+    }
+    if let Some(root) = persist_in {
+        persist_cst(root, &output)?;
+    }
+    let declarations = derive_scalar_declarations_from_cst(output.result.canonical_cst());
+    Ok((output.result.text, declarations))
+}
+
 fn load_canonical_project_inputs(
     root: &std::path::Path,
     project: &ProjectContext,
@@ -378,13 +409,7 @@ fn load_canonical_project_inputs(
         let source_path = package_root.join(path.as_path());
         let text = fs::read_to_string(&source_path)
             .map_err(|error| format!("failed to read {}: {error}", source_path.display()))?;
-        let revision = blake3::hash(text.as_bytes()).to_hex().to_string();
-        let source = SourceIdentity::new(
-            project_identity,
-            package.clone(),
-            path.as_path().to_string_lossy().replace('\\', "/"),
-            revision.clone(),
-        );
+        let source = canonical_source_identity(project_identity, &package, &path, &text);
         let (text, declarations) = match &purpose {
             #[cfg(feature = "internal-checker")]
             CanonicalLoadPurpose::Proof(selected) if package == project.package && selected.contains(&path) => {
@@ -393,15 +418,11 @@ fn load_canonical_project_inputs(
                 (text, CanonicalSourceDeclarations::Proof(proof))
             }
             _ => {
-                let output = parse_source(source, text, &project.comment_categories);
-                if !output.diagnostics.is_empty() {
-                    return Err(canonical_syntax_failure(output));
-                }
-                if matches!(purpose, CanonicalLoadPurpose::Build) {
-                    persist_cst(root, &output)?;
-                }
-                let declarations = derive_scalar_declarations_from_cst(output.result.canonical_cst());
-                (output.result.text, CanonicalSourceDeclarations::Ordinary(declarations))
+                let (text, declarations) = parse_canonical_ordinary_source(
+                    source, text, &project.comment_categories,
+                    matches!(purpose, CanonicalLoadPurpose::Build).then_some(root),
+                )?;
+                (text, CanonicalSourceDeclarations::Ordinary(declarations))
             }
         };
         #[cfg(test)]
@@ -460,7 +481,7 @@ fn load_canonical_project_inputs(
         );
         nodes.push(SourceNodeInput {
             source: graph_source.clone(),
-            content_revision: ContentRevision(revision),
+            content_revision: ContentRevision(source.revision.clone()),
             namespace_edges,
         });
         declarations_by_path.insert((package, path), declarations);
@@ -563,6 +584,61 @@ struct InternalCheckReceipt {
 }
 
 #[cfg(feature = "internal-checker")]
+struct DormantSourceInput {
+    identity: ProjectSourceIdentity,
+    text: String,
+}
+
+#[cfg(feature = "internal-checker")]
+fn prepare_explicit_dormant_sources(
+    root: &std::path::Path,
+    project: &ProjectContext,
+    configuration: &ProjectConfiguration,
+    sources: Vec<DormantSourceInput>,
+    texts: &mut BTreeMap<ProjectSourceIdentity, String>,
+) -> Result<Vec<wosy_compiler::ScalarSourceDeclarations>, CanonicalLoadFailure> {
+    if sources.is_empty() {
+        return Ok(Vec::new());
+    }
+    let project_identity = root.to_string_lossy();
+    let dependency_prefixes = configuration.resolved_packages.values()
+        .filter_map(|dependency| dependency.project_root.strip_prefix(root).ok())
+        .collect::<Vec<_>>();
+    let mut selected = HashSet::with_capacity(sources.len());
+    for DormantSourceInput { identity, .. } in &sources {
+        use std::path::Component;
+        let relative = identity.path.as_path();
+        let spelling = relative.to_str().ok_or_else(|| "dormant source path must be UTF-8".to_owned())?;
+        if spelling.is_empty() || spelling.contains('\\')
+            || !relative.components().all(|component| matches!(component, Component::Normal(_)))
+            || relative.components().collect::<std::path::PathBuf>().as_os_str() != relative.as_os_str()
+        {
+            return Err(format!("dormant source path is not canonical: {spelling}").into());
+        }
+        if identity.project != project_identity || identity.package != project.package
+            || relative.starts_with("deps")
+            || dependency_prefixes.iter().any(|prefix| relative.starts_with(prefix))
+        {
+            return Err(format!("dormant source is outside the current package: {spelling}").into());
+        }
+        if texts.contains_key(identity) || !selected.insert(identity) {
+            return Err(format!("dormant source was already selected: {spelling}").into());
+        }
+    }
+
+    sources.into_iter().map(|DormantSourceInput { identity, text }| {
+        let source = canonical_source_identity(identity.project.clone(), &identity.package, &identity.path, &text);
+        let (text, declarations) = parse_canonical_ordinary_source(
+            source, text, &project.comment_categories, None,
+        )?;
+        #[cfg(test)]
+        routing_observations::record(|counts| counts.extractions += 1);
+        texts.insert(identity, text);
+        Ok(declarations)
+    }).collect()
+}
+
+#[cfg(feature = "internal-checker")]
 #[cfg_attr(not(test), allow(dead_code))]
 fn check_loaded_project(
     root: &std::path::Path,
@@ -570,13 +646,19 @@ fn check_loaded_project(
     configuration: &ProjectConfiguration,
     target_layout: ScalarTargetLayout,
     scope: wosy_compiler::ScalarCheckerScope,
+    dormant_sources: Vec<DormantSourceInput>,
 ) -> Result<InternalCheckReceipt, CanonicalLoadFailure> {
-    let CanonicalProjectInputs { declarations, initialization_order, texts, .. } =
+    let CanonicalProjectInputs { declarations, initialization_order, mut texts, .. } =
         load_canonical_project_inputs(root, project, configuration, CanonicalLoadPurpose::Check)?;
+    let dormant = if scope == wosy_compiler::ScalarCheckerScope::CurrentPackage {
+        prepare_explicit_dormant_sources(root, project, configuration, dormant_sources, &mut texts)?
+    } else {
+        Vec::new()
+    };
     #[cfg(test)]
     routing_observations::record(|counts| counts.checks += 1);
-    let outcome = wosy_compiler::check_scalar_package(
-        declarations, initialization_order, ScalarPreparationInputs { target_layout }, scope,
+    let outcome = wosy_compiler::check_scalar_package_with_dormant_sources(
+        declarations, initialization_order, dormant, ScalarPreparationInputs { target_layout }, scope,
     );
     Ok(InternalCheckReceipt { outcome, texts })
 }
@@ -1285,7 +1367,7 @@ mod tests {
         let (result, counts) = routing_observations::observe(|| {
             check_loaded_project(
                 &project.root, &project, &configuration, ScalarTargetLayout::NATIVE64,
-                wosy_compiler::ScalarCheckerScope::default(),
+                wosy_compiler::ScalarCheckerScope::default(), Vec::new(),
             )
         });
         let InternalCheckReceipt { outcome, texts } = result.expect("canonical checker input");
@@ -1329,7 +1411,7 @@ mod tests {
         let (result, counts) = routing_observations::observe(|| {
             check_loaded_project(
                 &project.root, &project, &configuration, ScalarTargetLayout::WASM32,
-                ScalarCheckerScope::CurrentPackage,
+                ScalarCheckerScope::CurrentPackage, Vec::new(),
             )
         });
         let InternalCheckReceipt { outcome, texts } = result.expect("canonical symbolic receipt");
@@ -1366,7 +1448,7 @@ mod tests {
             let (result, counts) = routing_observations::observe(|| {
                 check_loaded_project(
                 &project.root, &project, &configuration, ScalarTargetLayout::NATIVE64,
-                wosy_compiler::ScalarCheckerScope::default(),
+                wosy_compiler::ScalarCheckerScope::default(), Vec::new(),
             )
             });
             if name == "checker-parse-rejection" {
@@ -1403,7 +1485,7 @@ mod tests {
         let observed = |scope| {
             let (result, counts) = routing_observations::observe(|| {
                 check_loaded_project(
-                    &project.root, &project, &configuration, ScalarTargetLayout::NATIVE64, scope,
+                    &project.root, &project, &configuration, ScalarTargetLayout::NATIVE64, scope, Vec::new(),
                 )
             });
             assert_eq!(counts, routing_observations::Counts { extractions: 1, checks: 1, ..Default::default() });
@@ -1413,6 +1495,91 @@ mod tests {
         assert_eq!(observed(ScalarCheckerScope::MainFlowOnly), ScalarCheckerOutcome::NoChecks);
         assert!(!project.root.join(".wosy").exists());
         assert!(Arguments::try_parse_from(["wosy", "check", "--main-flow-only"]).is_err());
+    }
+
+    #[cfg(feature = "internal-checker")]
+    fn received_source(root: &std::path::Path, path: &str, text: &str) -> DormantSourceInput {
+        DormantSourceInput {
+            identity: ProjectSourceIdentity::new(
+                root.to_string_lossy().into_owned(), "app".into(),
+                PackageRelativePath::new(path.into()).expect("relative fixture"),
+            ),
+            text: text.to_owned(),
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn internal_checker_adapter_prepares_explicit_dormant_receipts_once_without_reading_files() {
+        use wosy_compiler::{ScalarCheckerOutcome, ScalarCheckerScope};
+        let extra = r#"%%start
+            core.require(false, { .stdout = "initializer must not run"; .stderr = ""; .code = 5; .files = []; });
+            unit(u8) dormant_check = fn(value) {
+                core.require(value < 3, { .stdout = "dormant witness"; .stderr = ""; .code = 7; .files = []; });
+            };
+        %%end"#;
+        let (project, configuration) = routing_test_project("internal-dormant-graph", &[
+            ("main.w", "%%start\nunit() main_flow = fn {}; main_flow();\n%%end"),
+            ("extra.w", "invalid on-disk source, unused"),
+            ("not-selected.w", "not valid source"),
+        ]);
+        let (result, counts) = routing_observations::observe(|| check_loaded_project(
+            &project.root, &project, &configuration, ScalarTargetLayout::WASM32,
+            ScalarCheckerScope::CurrentPackage, vec![received_source(&project.root, "extra.w", extra)],
+        ));
+        let InternalCheckReceipt { outcome, texts } = result.expect("canonical dormant receipt");
+        let ScalarCheckerOutcome::Failed(failure) = outcome else { panic!("expected unused function obligation"); };
+        assert_eq!(failure.source.package, project.package);
+        assert_eq!(failure.source.project, project.root.to_string_lossy());
+        assert_eq!(failure.source.path, "extra.w");
+        assert_eq!(failure.source.revision, blake3::hash(extra.as_bytes()).to_string());
+        assert_eq!(failure.stdout.as_ref(), b"dormant witness");
+        assert_eq!(failure.witness.intervals_at(0, 0).unwrap().next(), Some((&3.into(), &255.into())));
+        assert_eq!(texts.len(), 2);
+        assert_eq!(counts, routing_observations::Counts { extractions: 2, checks: 1, ..Default::default() });
+
+        let (result, counts) = routing_observations::observe(|| check_loaded_project(
+            &project.root, &project, &configuration, ScalarTargetLayout::WASM32,
+            ScalarCheckerScope::MainFlowOnly, vec![received_source(&project.root, "missing.w", "invalid syntax")],
+        ));
+        let InternalCheckReceipt { outcome, texts } = result.expect("no dormant parsing for this scope");
+        assert_eq!(outcome, ScalarCheckerOutcome::NoChecks);
+        assert_eq!(texts.len(), 1);
+        assert_eq!(counts, routing_observations::Counts { extractions: 1, checks: 1, ..Default::default() });
+        assert!(!project.root.join(".wosy").exists());
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn internal_checker_adapter_rejects_dormant_identity_aliases_before_parsing_any_receipt() {
+        use wosy_compiler::ScalarCheckerScope;
+        let main = "%%start\nunit() main_flow = fn {};\n%%end";
+        let (project, mut configuration) = routing_test_project("internal-dormant-aliases", &[("main.w", main)]);
+        let dependency = project.root.join("vendor");
+        configuration.resolved_packages.insert("vendor".into(), wosy_project::ResolvedPackage {
+            name: "vendor".into(),
+            project_root: dependency.clone(),
+            source_root: dependency.clone(),
+            identity: ProjectSourceIdentity::new(dependency.to_string_lossy().into_owned(), "vendor".into(), PackageRelativePath::new("src".into()).unwrap()),
+        });
+        for invalid in ["main.w", "./main.w", "duplicate.w", "deps/other.w", "vendor/other.w"] {
+            let (result, counts) = routing_observations::observe(|| check_loaded_project(
+                &project.root, &project, &configuration, ScalarTargetLayout::NATIVE64,
+                ScalarCheckerScope::CurrentPackage,
+                vec![received_source(&project.root, "duplicate.w", "invalid syntax"), received_source(&project.root, invalid, "invalid syntax")],
+            ));
+            assert!(matches!(result, Err(CanonicalLoadFailure::Input(_))), "{invalid}: {result:?}");
+            assert_eq!(counts, routing_observations::Counts { extractions: 1, ..Default::default() });
+        }
+        let mut excluded = received_source(&project.root, "foreign.w", "invalid syntax");
+        excluded.identity.package = "foreign".into();
+        let (result, counts) = routing_observations::observe(|| check_loaded_project(
+            &project.root, &project, &configuration, ScalarTargetLayout::NATIVE64,
+            ScalarCheckerScope::CurrentPackage, vec![excluded],
+        ));
+        assert!(matches!(result, Err(CanonicalLoadFailure::Input(_))));
+        assert_eq!(counts, routing_observations::Counts { extractions: 1, ..Default::default() });
+        assert!(!project.root.join(".wosy").exists());
     }
 
     #[test]
