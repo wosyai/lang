@@ -61,6 +61,9 @@ fn consuming_llvm_text_preserves_exact_header_formatting() {
             functions: Vec::new(),
             text: raw.to_owned(),
         };
+        let mut streamed = Vec::new();
+        partition.write_text(&mut streamed).expect("write LLVM partition");
+        assert_eq!(streamed, expected.as_bytes(), "streamed: {raw:?}");
         assert_eq!(partition.to_text(), expected, "borrowed: {raw:?}");
         assert_eq!(partition.into_text(), expected, "consuming: {raw:?}");
     }
@@ -4416,6 +4419,9 @@ fn serializes_imports_in_metadata_order_without_changing_body_lines() {
         let expected = format!(
             "; ModuleID = 'test'\nsource_filename = \"test\"\n\ndeclare void @{name}() #7\ndeclare void @first() #3\n\nattributes #3 = {{ \"wasm-import-module\"=\"imports\" \"wasm-import-name\"=\"import3\" }}\nattributes #7 = {{ \"wasm-import-module\"=\"imports\" \"wasm-import-name\"=\"import7\" }}\n\ndeclare void @first_extra()\n\ndefine void @main() {{\n  ret void\n}}\n"
         );
+        let mut streamed = Vec::new();
+        partition.write_text(&mut streamed).expect("write extern declarations");
+        assert_eq!(streamed, expected.as_bytes(), "{name}");
         assert_eq!(partition.to_text(), expected, "{name}");
     }
 }

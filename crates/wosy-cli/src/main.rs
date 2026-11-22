@@ -9,7 +9,6 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs;
-#[cfg(target_os = "linux")]
 use std::io::{BufWriter, Write};
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
@@ -17,10 +16,10 @@ use std::process::ExitCode;
 #[cfg(target_os = "linux")]
 use std::sync::atomic::{AtomicU64, Ordering};
 use wosy_compiler::{
-    analyze_scalar_build, derive_scalar_declarations_from_cst, emit_scalar_build_project_llvm_text,
-    emit_scalar_build_single_module_llvm_text, emit_scalar_build_wasm_root_exports_llvm_text,
+    analyze_scalar_build, derive_scalar_declarations_from_cst, emit_scalar_build_project_artifact_llvm,
+    emit_scalar_build_single_module_artifact_llvm, emit_scalar_build_wasm_root_exports_artifact_llvm,
     parse_source_with_snapshot, prepare_scalar_project, publication, serialize_publication,
-    ParseOutput, ScalarNamespaceBinding, ScalarPreparationInputs, ScalarTargetLayout,
+    LlvmPartition, ParseOutput, ScalarNamespaceBinding, ScalarPreparationInputs, ScalarTargetLayout,
 };
 use wosy_project::{
     artifact_manifest_path, discover_root, load_artifact_manifest, load_reachable_source_graph,
@@ -169,7 +168,8 @@ fn build_command(target: Option<&str>, profile: &str) -> Result<(), String> {
         .join(artifact_name);
     fs::create_dir_all(&output_dir).map_err(|error| error.to_string())?;
     let partition_path = output_dir.join("partition.ll");
-    fs::write(&partition_path, &llvm).map_err(|error| error.to_string())?;
+    let llvm_input_identity = write_llvm_partition(&partition_path, &llvm)?;
+    drop(llvm);
     let runtime_path = output_dir.join("runtime.ll");
     let runtime = wosy_compiler::core_runtime(&artifact_profile.backend, &artifact_profile.output)?;
     fs::write(&runtime_path, runtime).map_err(|error| error.to_string())?;
@@ -181,9 +181,8 @@ fn build_command(target: Option<&str>, profile: &str) -> Result<(), String> {
         artifact,
         artifact_profile,
         &source_identity,
-        &llvm,
+        llvm_input_identity,
     )?;
-    drop(llvm);
     let executable = output_dir.join("main");
     let pending_manifest = output_dir.join("artifact-manifest.pending.json");
     let pending = wosy_project::ArtifactManifest {
@@ -216,6 +215,34 @@ fn build_command(target: Option<&str>, profile: &str) -> Result<(), String> {
     publish_artifact(&output_dir, executable, identity, source_observations)?;
     fs::remove_file(pending_manifest).map_err(|error| error.to_string())?;
     Ok(())
+}
+
+struct HashingWriter<W> {
+    output: W,
+    identity: blake3::Hasher,
+}
+
+impl<W: Write> Write for HashingWriter<W> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let written = self.output.write(bytes)?;
+        self.identity.update(&bytes[..written]);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.output.flush()
+    }
+}
+
+fn write_llvm_partition(path: &std::path::Path, llvm: &LlvmPartition) -> Result<String, String> {
+    let file = fs::File::create(path).map_err(|error| error.to_string())?;
+    let mut writer = BufWriter::new(HashingWriter {
+        output: file,
+        identity: blake3::Hasher::new(),
+    });
+    llvm.write_text(&mut writer).map_err(|error| error.to_string())?;
+    writer.flush().map_err(|error| error.to_string())?;
+    Ok(writer.get_ref().identity.finalize().to_hex().to_string())
 }
 
 fn run_command(target: Option<&str>, profile: &str, arguments: &[String]) -> Result<u8, String> {
@@ -293,7 +320,7 @@ fn compile_project(
     configuration: &ProjectConfiguration,
     target_layout: ScalarTargetLayout,
     root_exports: Option<&BTreeMap<String, String>>,
-) -> Result<(String, Vec<SourceObservation>), String> {
+) -> Result<(LlvmPartition, Vec<SourceObservation>), String> {
     let root_path = PackageRelativePath::new(project.source_root.clone())?;
     let root_project = root.to_string_lossy().into_owned();
     let mut discovered = HashMap::from([(
@@ -478,15 +505,15 @@ fn compile_project(
     }
     drop(texts);
     let llvm = if let Some((exports, source)) = root_exports {
-        emit_scalar_build_wasm_root_exports_llvm_text(&validation, &source, exports)?
+        emit_scalar_build_wasm_root_exports_artifact_llvm(&validation, &source, exports)?
     } else if graph.nodes.len() == 1 {
         #[cfg(test)]
         routing_observations::record(|counts| counts.single_module_emissions += 1);
-        emit_scalar_build_single_module_llvm_text(&validation)?
+        emit_scalar_build_single_module_artifact_llvm(&validation)?
     } else {
         #[cfg(test)]
         routing_observations::record(|counts| counts.project_emissions += 1);
-        emit_scalar_build_project_llvm_text(&validation)?
+        emit_scalar_build_project_artifact_llvm(&validation)?
     };
     let source_observations = graph
         .nodes
@@ -721,7 +748,7 @@ fn artifact_identity(
     artifact: &wosy_project::ArtifactConfig,
     artifact_profile: &wosy_project::ArtifactProfile,
     source_identity: &str,
-    llvm: &str,
+    llvm_input_identity: String,
 ) -> Result<ArtifactIdentity, String> {
     let builder = configuration
         .builders
@@ -739,7 +766,7 @@ fn artifact_identity(
         output: artifact_profile.output.clone(),
         builder_identity: serde_json::to_string(builder).map_err(|error| error.to_string())?,
         runner_identity: serde_json::to_string(runner).map_err(|error| error.to_string())?,
-        llvm_input_identity: blake3::hash(llvm.as_bytes()).to_hex().to_string(),
+        llvm_input_identity,
         compiler_identity: compiler_identity(),
         llvm_identity: llvm_identity(),
         builder_toolchain_identity: builder.toolchain_identity.clone(),
@@ -884,7 +911,8 @@ mod routing_observations {
             configuration,
             ScalarTargetLayout::NATIVE64,
             None,
-        );
+        )
+        .map(|(llvm, sources)| (llvm.to_text(), sources));
         (result, COUNTS.get().expect("active routing observations"))
     }
 }
@@ -966,6 +994,44 @@ mod tests {
     }
 
     #[test]
+    fn writes_partition_and_hashes_exact_canonical_bytes() {
+        let sources = [(
+            "main.w",
+            "%%start\nenv = extern wasm \"host\" { unit() log; };\nenv.log();\n%%end\n",
+        )];
+        let (project, configuration) = routing_test_project("streamed-partition", &sources);
+        let (partition, observations) = compile_project(
+            &project.root,
+            &project,
+            &configuration,
+            ScalarTargetLayout::WASM32,
+            None,
+        )
+        .expect("compile actual extern partition");
+        let path = project.root.join("partition.ll");
+        let expected = partition.to_text();
+        let identity = write_llvm_partition(&path, &partition).expect("stream partition");
+        assert_eq!(fs::read(&path).expect("partition bytes"), expected.as_bytes());
+        assert_eq!(identity, blake3::hash(expected.as_bytes()).to_hex().as_str());
+        assert!(expected.contains(r#"wasm-import-module"="host""#));
+        assert_eq!(observations.len(), 1);
+        fs::remove_dir_all(&project.root).expect("remove routing fixture");
+    }
+
+    #[test]
+    fn partition_writer_hashes_only_bytes_accepted_by_output() {
+        let mut storage = [0; 3];
+        let mut writer = HashingWriter {
+            output: &mut storage[..],
+            identity: blake3::Hasher::new(),
+        };
+        assert_eq!(writer.write(b"abcdef").expect("short write"), 3);
+        assert!(writer.write_all(b"def").is_err());
+        assert_eq!(writer.identity.finalize(), blake3::hash(b"abc"));
+        assert_eq!(storage, *b"abc");
+    }
+
+    #[test]
     fn selected_wasm_root_exports_keep_mixed_abi_and_exact_root_identity() {
         let sources = [
             (
@@ -983,6 +1049,7 @@ mod tests {
                 ScalarTargetLayout::WASM32,
                 exports,
             )
+            .map(|(llvm, sources)| (llvm.to_text(), sources))
         };
         let exports = BTreeMap::from([
             ("demo_score".into(), "score".into()),
@@ -1016,6 +1083,7 @@ mod tests {
                 ScalarTargetLayout::WASM32,
                 exports,
             )
+            .map(|(llvm, sources)| (llvm.to_text(), sources))
         };
         let same = BTreeMap::from([("score".into(), "score".into())]);
         let (llvm, _) = compile(Some(&same)).expect("use emitted score symbol");

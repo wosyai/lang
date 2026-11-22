@@ -352,10 +352,13 @@ pub fn emit_scalar_build_single_module_llvm(
 pub fn emit_scalar_build_single_module_llvm_text(
     validation: &ScalarBuildValidation<'_>,
 ) -> Result<String, String> {
-    Ok(
-        emit_scalar_build_single_module_with_metadata(validation, PartitionMetadata::ExternsOnly, &[])?
-            .into_text(),
-    )
+    Ok(emit_scalar_build_single_module_artifact_llvm(validation)?.into_text())
+}
+
+pub fn emit_scalar_build_single_module_artifact_llvm(
+    validation: &ScalarBuildValidation<'_>,
+) -> Result<LlvmPartition, String> {
+    emit_scalar_build_single_module_with_metadata(validation, PartitionMetadata::ExternsOnly, &[])
 }
 
 struct WasmRootExport<'a> {
@@ -369,6 +372,14 @@ pub fn emit_scalar_build_wasm_root_exports_llvm_text(
     root: &wosy_syntax::SourceIdentity,
     requested: &BTreeMap<String, String>,
 ) -> Result<String, String> {
+    Ok(emit_scalar_build_wasm_root_exports_artifact_llvm(validation, root, requested)?.into_text())
+}
+
+pub fn emit_scalar_build_wasm_root_exports_artifact_llvm(
+    validation: &ScalarBuildValidation<'_>,
+    root: &wosy_syntax::SourceIdentity,
+    requested: &BTreeMap<String, String>,
+) -> Result<LlvmPartition, String> {
     let modules = &validation.prepared().project().modules;
     let singleton = modules.len() == 1;
     let root_module = modules.iter().find(|module| &module.source == root)
@@ -428,13 +439,13 @@ pub fn emit_scalar_build_wasm_root_exports_llvm_text(
             signature: &function.signature,
         });
     }
-    Ok(if singleton {
-        emit_scalar_build_single_module_with_metadata(validation, PartitionMetadata::ExternsOnly, &exports)?
+    if singleton {
+        emit_scalar_build_single_module_with_metadata(validation, PartitionMetadata::ExternsOnly, &exports)
     } else {
         emit_scalar_build_project_with_policy(
             validation, EmissionPolicy::Prepared, PartitionMetadata::ExternsOnly, &exports,
-        )?
-    }.into_text())
+        )
+    }
 }
 
 fn emit_wasm_root_export_wrappers<'ctx>(
@@ -857,13 +868,18 @@ pub fn emit_scalar_build_project_llvm(
 pub fn emit_scalar_build_project_llvm_text(
     validation: &ScalarBuildValidation<'_>,
 ) -> Result<String, String> {
-    Ok(emit_scalar_build_project_with_policy(
+    Ok(emit_scalar_build_project_artifact_llvm(validation)?.into_text())
+}
+
+pub fn emit_scalar_build_project_artifact_llvm(
+    validation: &ScalarBuildValidation<'_>,
+) -> Result<LlvmPartition, String> {
+    emit_scalar_build_project_with_policy(
         validation,
         EmissionPolicy::Prepared,
         PartitionMetadata::ExternsOnly,
         &[],
-    )?
-    .into_text())
+    )
 }
 
 fn emit_scalar_build_project_with_policy(
@@ -1373,6 +1389,13 @@ impl LlvmPartition {
     }
 
     pub fn to_text(&self) -> String {
+        let mut bytes = Vec::with_capacity(self.text.len());
+        self.write_text(&mut bytes)
+            .expect("writing to a Vec cannot fail");
+        String::from_utf8(bytes).expect("LLVM partition text is UTF-8")
+    }
+
+    pub fn write_text(&self, output: &mut impl std::io::Write) -> std::io::Result<()> {
         if !self.declarations.is_empty() {
             let mut declarations = self
                 .declarations
@@ -1381,7 +1404,6 @@ impl LlvmPartition {
                 .collect::<HashMap<_, _>>();
             let simple_names = declarations.keys().all(|name| !name.contains('('));
             let mut excluded = Vec::with_capacity(declarations.len());
-            let mut excluded_bytes = 0;
             for (index, line) in self.text.lines().enumerate() {
                 let mut matched = false;
                 if let Some((_, after_at)) = line
@@ -1407,39 +1429,32 @@ impl LlvmPartition {
                 }
                 if index >= 2 && matched {
                     excluded.push(index);
-                    excluded_bytes += line.len();
                 }
             }
-            let mut serialized = String::new();
             let mut lines = self.text.lines();
             if let Some(first) = lines.next() {
-                serialized.push_str(first);
+                output.write_all(first.as_bytes())?;
             }
             if let Some(second) = lines.next() {
-                serialized.push('\n');
-                serialized.push_str(second);
+                output.write_all(b"\n")?;
+                output.write_all(second.as_bytes())?;
             }
-            serialized.push_str("\n\n");
+            output.write_all(b"\n\n")?;
             for declaration in &self.declarations {
                 let line = declarations[declaration.name.as_str()]
                     .expect("LLVM extern declaration is present in module text");
-                serialized.push_str(line);
-                write!(serialized, " #{}", declaration.attributes[0].group,)
-                    .expect("writing to a String cannot fail");
-                serialized.push('\n');
+                writeln!(output, "{line} #{}", declaration.attributes[0].group)?;
             }
-            serialized.push('\n');
+            output.write_all(b"\n")?;
             for attributes in declaration_attributes(&self.declarations) {
                 writeln!(
-                    serialized,
+                    output,
                     "attributes #{} = {{ \"wasm-import-module\"=\"{}\" \"wasm-import-name\"=\"{}\" }}",
                     attributes.group,
                     LlvmQuotedAttribute(&attributes.wasm_import_module),
                     LlvmQuotedAttribute(&attributes.wasm_import_name)
-                )
-                .expect("writing to a String cannot fail");
+                )?;
             }
-            serialized.reserve_exact(self.text.len() - excluded_bytes);
             let mut excluded = excluded.into_iter().peekable();
             let mut first = true;
             for (index, line) in lines.enumerate() {
@@ -1448,32 +1463,36 @@ impl LlvmPartition {
                     continue;
                 }
                 if !std::mem::replace(&mut first, false) {
-                    serialized.push('\n');
+                    output.write_all(b"\n")?;
                 }
-                serialized.push_str(line);
+                output.write_all(line.as_bytes())?;
             }
-            serialized
         } else {
             let excluded = extra_source_filename_blank(&self.text);
-            if excluded.is_none() && !self.text.contains("\r\n") {
-                return self.text.clone();
+            if !self.text.contains("\r\n") {
+                if let Some(index) = excluded {
+                    let offset = self.text.match_indices('\n').nth(index)
+                        .expect("blank LLVM header line has a newline").0;
+                    output.write_all(&self.text.as_bytes()[..offset])?;
+                    return output.write_all(&self.text.as_bytes()[offset + 1..]);
+                }
+                return output.write_all(self.text.as_bytes());
             }
-            let mut serialized = String::with_capacity(self.text.len());
             let mut first = true;
             for (index, line) in self.text.lines().enumerate() {
                 if excluded == Some(index) {
                     continue;
                 }
                 if !std::mem::replace(&mut first, false) {
-                    serialized.push('\n');
+                    output.write_all(b"\n")?;
                 }
-                serialized.push_str(line);
+                output.write_all(line.as_bytes())?;
             }
             if self.text.ends_with('\n') {
-                serialized.push('\n');
+                output.write_all(b"\n")?;
             }
-            serialized
         }
+        Ok(())
     }
 }
 
