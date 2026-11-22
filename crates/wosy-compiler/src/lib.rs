@@ -137,7 +137,7 @@ mod tests {
         let text = "%%start\ni32() example = fn {\n\ti32 result =? 3;\n\tresult\n};\n%%end";
         let output = parse_source(source.clone(), text.into(), &[]);
         assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
-        let scalar = derive_scalar_program(&output.result);
+        let mut scalar = derive_scalar_program(&output.result);
         let [diagnostic] = scalar.diagnostics.as_slice() else {
             panic!("{:?}", scalar.diagnostics);
         };
@@ -145,6 +145,8 @@ mod tests {
         assert_eq!(diagnostic.message, "fallible allocation assignment is not supported by build yet");
         let range = diagnostic.labels[0].span.range;
         assert_eq!(&text[range.start as usize..range.end as usize], "=?");
+        assert!(emit_scalar_llvm(&scalar).is_err());
+        scalar.diagnostics.clear();
         assert!(emit_scalar_llvm(&scalar).is_err());
 
         let ordinary = parse_source(source, text.replace("=?", "="), &[]);

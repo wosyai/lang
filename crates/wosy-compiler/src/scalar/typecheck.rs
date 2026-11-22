@@ -1172,6 +1172,11 @@ pub(super) fn block_item_type_in_module(
 ) -> ScalarType {
     match item {
         ScalarBlockItem::LocalBinding(binding) => {
+            if let Some(operator) = binding.fallible_assignment {
+                diagnostics.push(fallible_assignment_diagnostic(module.source, operator));
+                scope.insert(binding.name.clone(), ScalarType::Error);
+                return ScalarType::Unit;
+            }
             for receiver in &binding.receivers {
                 validate_identifier_style(
                     &module.source,
@@ -6406,6 +6411,15 @@ pub(super) fn module_diagnostic(
     source_diagnostic(&module.source, code, message, span)
 }
 
+fn fallible_assignment_diagnostic(source: &SourceIdentity, span: ByteSpan) -> super::Diagnostic {
+    source_diagnostic(
+        source,
+        "B0003",
+        "fallible allocation assignment is not supported by build yet",
+        span,
+    )
+}
+
 fn source_diagnostic(
     source: &SourceIdentity,
     code: &str,
@@ -7530,6 +7544,11 @@ fn block_item_type(
 ) -> ScalarType {
     match item {
         ScalarBlockItem::LocalBinding(binding) => {
+            if let Some(operator) = binding.fallible_assignment {
+                diagnostics.push(fallible_assignment_diagnostic(program.source, operator));
+                scope.insert(binding.name.clone(), ScalarType::Error);
+                return ScalarType::Unit;
+            }
             for receiver in &binding.receivers {
                 validate_program_identifier_style(
                     program,
