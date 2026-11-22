@@ -4612,6 +4612,18 @@ fn prepared_loan_read_reachability_stops_only_at_the_exact_binding_exit() {
     exact.get_mut(&CfgPointId(1)).unwrap().insert(outer.clone());
     assert!(!reference_read_reachable(&points, Some(&exact), CfgPointId(0), &outer));
     assert!(!reference_read_reachable(&points, None, CfgPointId(0), &outer));
+
+    // A cut or backedge on the first inspected successor must not lose a
+    // deferred sibling. Its traversal reaches the outer read.
+    let mut branched = points.to_vec();
+    branched[0].successors = vec![CfgPointId(2), CfgPointId(1)];
+    branched[1].successors = vec![CfgPointId(1)];
+    assert!(reference_read_reachable(&branched, Some(&exact), CfgPointId(0), &outer));
+    branched[1].kind = CfgPointKind::Join;
+    assert!(reference_read_reachable(&branched, Some(&exact), CfgPointId(0), &outer));
+    let mut pending = Vec::new();
+    assert_eq!(defer_read_search_siblings(&[CfgPointId(2)], &mut pending), Some(CfgPointId(2)));
+    assert_eq!(pending.capacity(), 0);
 }
 
 #[derive(Clone, PartialEq)]
@@ -4735,15 +4747,25 @@ fn reinitialize_checked_handles(
     }
 }
 
+fn defer_read_search_siblings(successors: &[CfgPointId], pending: &mut Vec<CfgPointId>) -> Option<CfgPointId> {
+    let (last, siblings) = successors.split_last()?;
+    pending.extend_from_slice(siblings);
+    Some(*last)
+}
+
 fn reference_read_reachable(
     points: &[ReferenceFlowPoint],
     scope_exits: Option<&HashMap<CfgPointId, super::control::ScopeExitBindings>>,
     from: CfgPointId,
     binding: &ReferenceBindingId,
 ) -> bool {
-    let mut pending = points[from.0].successors.clone();
+    // Follow the last successor directly, pushing only deferred siblings.
+    // This is the same DFS order as extending the stack then popping it,
+    // without allocating a worklist on an ordinary straight-line path.
+    let mut pending = Vec::new();
+    let mut next = defer_read_search_siblings(&points[from.0].successors, &mut pending);
     let mut visited = BTreeSet::new();
-    while let Some(id) = pending.pop() {
+    while let Some(id) = next.take().or_else(|| pending.pop()) {
         if !visited.insert(id.0) {
             continue;
         }
@@ -4759,7 +4781,7 @@ fn reference_read_reachable(
         {
             continue;
         }
-        pending.extend(&points[id.0].successors);
+        next = defer_read_search_siblings(&points[id.0].successors, &mut pending);
     }
     false
 }
