@@ -2124,9 +2124,31 @@ struct LiteralArrayPair {
     block: BlockOrdinal,
 }
 
-fn enroll_literal_array_pair(result: &mut ClosedAggregates, pair: LiteralArrayPair) {
+#[derive(Clone, Copy, Default)]
+struct LiteralArrayParameters<'a> {
+    caller: &'a [ParameterSlot],
+    callee: &'a [ParameterSlot],
+    signature: &'a [ScalarType],
+}
+
+fn enroll_literal_array_pair(
+    result: &mut ClosedAggregates,
+    pair: LiteralArrayPair,
+    parameters: LiteralArrayParameters<'_>,
+) {
     let LiteralArrayPair { caller, callee, original, fresh, final_output, write, exit, block } = pair;
     if caller == callee || result.bodies.contains_key(&caller) || write.rhs == write.writer {
+        return;
+    }
+    let same_parameters = match (write.argument, parameters.caller, parameters.callee, parameters.signature) {
+        (None, [], [], []) => fresh.extent != FreshArrayExtent::Formal,
+        (Some(_), [caller], [callee], [actual]) =>
+            caller.ordinal == 0 && callee.ordinal == 0 && ordinary_value(actual)
+                && &caller.ty == actual && &callee.ty == actual
+                && (fresh.extent != FreshArrayExtent::Formal || *actual == ScalarType::U64),
+        _ => false,
+    };
+    if !same_parameters {
         return;
     }
     let FreshArrayExtent::Literal(original_elements) = original.extent else { return };
@@ -2185,26 +2207,15 @@ fn install_literal_array_plans(
         let [returned] = leaf.sites.boundary.results.as_slice() else { continue };
         let Some(signature) = body.sites.checked_call_signatures.get(&write.producer) else { continue };
         let [output] = signature.outputs.outputs.as_slice() else { continue };
-        let same_parameters = match (
-            write.argument,
-            body.sites.boundary.parameters.as_slice(),
-            leaf.sites.boundary.parameters.as_slice(),
-            signature.parameters.as_slice(),
-        ) {
-            (None, [], [], []) => true,
-            (Some(_), [caller], [callee], [actual]) =>
-                caller.ordinal == 0 && callee.ordinal == 0 && ordinary_value(actual)
-                    && &caller.ty == actual && &callee.ty == actual,
-            _ => false,
-        };
-        if !same_parameters || !same_runtime_array_type(&output.ty, &returned.ty)
-            || (fresh.extent == FreshArrayExtent::Formal
-                && !matches!(signature.parameters.as_slice(), [ScalarType::U64]))
-        {
+        if !same_runtime_array_type(&output.ty, &returned.ty) {
             continue;
         }
         enroll_literal_array_pair(result, LiteralArrayPair {
             caller, callee, original, fresh, final_output, write, exit, block,
+        }, LiteralArrayParameters {
+            caller: &body.sites.boundary.parameters,
+            callee: &leaf.sites.boundary.parameters,
+            signature: &signature.parameters,
         });
     }
 }
@@ -2960,8 +2971,7 @@ impl ProjectReferenceResults {
 mod tests {
     use super::*;
 
-    #[test]
-    fn checked_literal_array_pair_enrolls_distinct_receipts_at_the_exact_exit() {
+    fn synthetic_literal_array_pair() -> LiteralArrayPair {
         let allocation = |bind, length, elements| LiteralArrayBind {
             bind: CfgPointId(bind),
             placeholder: CfgPointId(bind - 1),
@@ -2969,7 +2979,7 @@ mod tests {
             length_occurrence: OccurrenceOrdinal(length),
             extent: FreshArrayExtent::Literal(elements),
         };
-        let pair = LiteralArrayPair {
+        LiteralArrayPair {
             caller: (0, 0, None),
             callee: (0, 1, None),
             original: allocation(2, 1, 3),
@@ -2984,9 +2994,14 @@ mod tests {
             },
             exit: CfgPointId(5),
             block: BlockOrdinal(0),
-        };
+        }
+    }
+
+    #[test]
+    fn checked_literal_array_pair_enrolls_distinct_receipts_at_the_exact_exit() {
+        let pair = synthetic_literal_array_pair();
         let mut plans = ClosedAggregates::default();
-        enroll_literal_array_pair(&mut plans, pair);
+        enroll_literal_array_pair(&mut plans, pair, LiteralArrayParameters::default());
         assert_eq!(plans.bodies.len(), 2);
         assert_eq!(plans.bodies[&pair.callee].literal_array, Some(ClosedLiteralArray::FreshLeaf {
             receipt: OriginalArrayReceipt { origin: CfgPointId(3), allocation: (0, 0) },
@@ -3009,16 +3024,76 @@ mod tests {
         assert!(caller.releases.is_empty());
 
         let mut self_pair = ClosedAggregates::default();
-        enroll_literal_array_pair(&mut self_pair, LiteralArrayPair { callee: pair.caller, ..pair });
+        enroll_literal_array_pair(&mut self_pair, LiteralArrayPair { callee: pair.caller, ..pair },
+            LiteralArrayParameters::default());
         assert!(self_pair.bodies.is_empty());
 
         for occupied in [pair.caller, pair.callee] {
             let mut overlapping = ClosedAggregates::default();
             overlapping.bodies.entry(occupied).or_default().ordinary_result = true;
-            enroll_literal_array_pair(&mut overlapping, pair);
+            enroll_literal_array_pair(&mut overlapping, pair, LiteralArrayParameters::default());
             assert_eq!(overlapping.bodies.len(), 1);
             assert!(overlapping.bodies[&occupied].ordinary_result);
             assert!(overlapping.bodies[&occupied].literal_array.is_none());
+        }
+    }
+
+    #[test]
+    fn checked_formal_extent_enrolls_only_the_exact_u64_argument() {
+        let mut pair = synthetic_literal_array_pair();
+        pair.fresh.extent = FreshArrayExtent::Formal;
+        pair.write.argument = Some(LiteralArrayArgument { read: CfgPointId(3), occurrence: OccurrenceOrdinal(9) });
+        pair.write.rhs = CfgPointId(4);
+        pair.write.writer = CfgPointId(5);
+        pair.write.destination = OccurrenceOrdinal(10);
+        pair.exit = CfgPointId(6);
+        let formal = |ty| ParameterSlot {
+            ordinal: 0,
+            name: String::new(),
+            span: ByteSpan::new(0, 0),
+            ty,
+        };
+        let u64_slot = [formal(ScalarType::U64)];
+        let u32_slot = [formal(ScalarType::U32)];
+        let exact = LiteralArrayParameters {
+            caller: &u64_slot,
+            callee: &u64_slot,
+            signature: &[ScalarType::U64],
+        };
+
+        let mut plans = ClosedAggregates::default();
+        enroll_literal_array_pair(&mut plans, pair, exact);
+        assert_eq!(plans.bodies.len(), 2);
+        assert!(matches!(plans.bodies[&pair.callee].literal_array,
+            Some(ClosedLiteralArray::FreshLeaf {
+                receipt: OriginalArrayReceipt { origin: CfgPointId(3), .. },
+                extent: FreshArrayExtent::Formal, ..
+            })));
+        let caller = &plans.bodies[&pair.caller];
+        assert!(matches!(caller.literal_array, Some(ClosedLiteralArray::Replacement {
+            original: OriginalArrayReceipt { origin: CfgPointId(2), .. },
+            original_elements: 3, destination: 10,
+            extent: ReplacementArrayExtent::Argument { occurrence: 9 }, ..
+        })));
+        assert_eq!(caller.scope_exits, BTreeMap::from([(pair.block.0, pair.exit)]));
+        assert!(caller.releases.is_empty() && caller.input_release.is_none());
+
+        let mut conflicting = pair;
+        conflicting.caller = (0, 2, None);
+        conflicting.fresh.extent = FreshArrayExtent::Literal(11);
+        enroll_literal_array_pair(&mut plans, conflicting, exact);
+        assert_eq!(plans.bodies.len(), 2);
+        assert!(!plans.bodies.contains_key(&conflicting.caller));
+        assert!(matches!(plans.bodies[&pair.callee].literal_array,
+            Some(ClosedLiteralArray::FreshLeaf { extent: FreshArrayExtent::Formal, .. })));
+
+        for rejected in [
+            LiteralArrayParameters { callee: &u32_slot, ..exact },
+            LiteralArrayParameters { caller: &u32_slot, callee: &u32_slot, signature: &[ScalarType::U32] },
+        ] {
+            let mut plans = ClosedAggregates::default();
+            enroll_literal_array_pair(&mut plans, pair, rejected);
+            assert!(plans.bodies.is_empty());
         }
     }
 
