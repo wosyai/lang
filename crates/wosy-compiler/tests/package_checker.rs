@@ -1,8 +1,8 @@
 #![cfg(feature = "internal-checker")]
 
 use wosy_compiler::{
-    check_loaded_scalar_module_proof_call, check_scalar_module_proof, check_scalar_module_proofs, check_scalar_package, check_scalar_package_with_dormant_sources, derive_scalar_declarations_from_cst, parse_source, prepare_scalar_project,
-    ScalarCheckerOperation, ScalarCheckerOutcome, ScalarCheckerScope, ScalarNamespaceBinding,
+    check_loaded_scalar_module_proof_call, check_scalar_module_proof, check_scalar_module_proofs, check_scalar_package, check_scalar_package_with_dormant_sources, check_scalar_package_ordered_with_dormant_sources, derive_scalar_declarations_from_cst, parse_source, prepare_scalar_project,
+    ScalarCheckerOperation, ScalarCheckerOutcome, ScalarCheckerScope, ScalarOrderedCheckerOutcome, ScalarNamespaceBinding,
     ScalarModuleProofOutcome, ScalarProofCallOutcome, ScalarPreparationInputs, ScalarProofModuleInput, ScalarTargetLayout,
 };
 use wosy_syntax::SourceIdentity;
@@ -29,6 +29,85 @@ fn check_scoped(text: &str, scope: ScalarCheckerScope) -> ScalarCheckerOutcome {
         ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
         scope,
     )
+}
+
+fn check_ordered(
+    identity: &SourceIdentity, text: &str, dormant: Vec<(SourceIdentity, &str)>, scope: ScalarCheckerScope,
+) -> ScalarOrderedCheckerOutcome {
+    let parse = |source: &SourceIdentity, text: &str| {
+        let parsed = parse_source(source.clone(), text.to_owned(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        derive_scalar_declarations_from_cst(parsed.result.canonical_cst())
+    };
+    check_scalar_package_ordered_with_dormant_sources(
+        vec![(parse(identity, text), Vec::new())], vec![identity.clone()],
+        dormant.into_iter().map(|(identity, text)| parse(&identity, text)).collect(),
+        ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 }, scope,
+    )
+}
+
+#[test]
+fn ordered_checker_facade_keeps_authored_reports_codes_bytes_and_typed_witnesses() {
+    let identity = source();
+    for codes in [[0, 23, 9], [0, 0, 0]] {
+        let [first, second, third] = codes;
+        let text = format!(r#"%%start
+            unit(u8) unused = fn(value) {{
+                core.require(value < 4, {{ .stdout = "third"; .stderr = ""; .code = {third}; .files = []; }});
+            }};
+            unit(u8) actual = fn(value) {{
+                core.require(value < 2, {{ .stdout = ""; .stderr = "second"; .code = {second}; .files = []; }});
+            }};
+            core.require(false, {{ .stdout = "first"; .stderr = ""; .code = {first};
+                .files = [{{ .path = "out.txt"; .text = "ação\n"; }}]; }});
+            actual(3);
+        %%end"#);
+        let ScalarOrderedCheckerOutcome::Failed(reports) = check_ordered(
+            &identity, &text, Vec::new(), ScalarCheckerScope::CurrentPackage,
+        ) else { panic!("expected complete reports even when every code is zero"); };
+        let [root, actual, unused] = reports.as_slice() else { panic!("expected exactly three reports"); };
+        assert!(reports.iter().all(|report| report.source == identity && report.operation == ScalarCheckerOperation::Require));
+        assert_eq!(reports.iter().map(|report| report.code.clone()).collect::<Vec<_>>(), codes.map(num_bigint::BigInt::from));
+        assert_eq!((&*root.stdout, &*actual.stderr, &*unused.stdout), (&b"first"[..], &b"second"[..], &b"third"[..]));
+        let at = |span: wosy_syntax::ByteSpan| &text[span.start as usize..span.end as usize];
+        assert_eq!((at(root.condition), at(actual.condition), at(unused.condition)), ("false", "value < 2", "value < 4"));
+        assert_eq!(at(actual.code_span), second.to_string());
+        assert_eq!(at(actual.stderr_span), r#""second""#);
+        let [file] = root.files.as_ref() else { panic!("expected only the authored file"); };
+        assert_eq!(&*file.path, "out.txt");
+        assert_eq!(&*file.text, "ação\n".as_bytes());
+        assert_eq!(at(file.path_span), r#""out.txt""#);
+        assert!(root.witness.axes().next().is_none());
+        assert_eq!(actual.witness.axes().next().unwrap().1, &wosy_compiler::ScalarType::U8);
+        for (report, lo, hi) in [(actual, 3, 3), (unused, 4, 255)] {
+            assert_eq!(report.witness.row_count(), 1);
+            assert_eq!(report.witness.intervals_at(0, 0).unwrap().map(|(lo, hi)| (lo.clone(), hi.clone())).collect::<Vec<_>>(),
+                [(num_bigint::BigInt::from(lo), num_bigint::BigInt::from(hi))]);
+        }
+    }
+}
+
+#[test]
+fn ordered_checker_facade_keeps_validation_and_distinguishes_incomplete_results() {
+    let identity = source();
+    let scope = ScalarCheckerScope::CurrentPackage;
+    let no_checks = "%%start\nu8 value = 1;\n%%end";
+    assert_eq!(check_ordered(&identity, no_checks, Vec::new(), scope), ScalarOrderedCheckerOutcome::NoChecks);
+    assert_eq!(check_ordered(&identity, &format!("%%start\ncore.require(true, {OUTPUT});\n%%end"), Vec::new(), scope),
+        ScalarOrderedCheckerOutcome::Passed);
+    assert!(matches!(check_ordered(&identity, "%%start\ncore.require(true, {});\n%%end", Vec::new(), scope),
+        ScalarOrderedCheckerOutcome::Invalid(_)));
+    let unsupported = format!(r#"%%start
+        unit() leaf = fn {{}};
+        unit() parent = fn {{ core.require(false, {OUTPUT}); leaf(); }};
+        core.require(false, {OUTPUT});
+        parent();
+    %%end"#);
+    assert_eq!(check_ordered(&identity, &unsupported, Vec::new(), scope), ScalarOrderedCheckerOutcome::Unsupported);
+    assert_eq!(check_ordered(&identity, no_checks, vec![(identity.clone(), no_checks)], scope),
+        ScalarOrderedCheckerOutcome::Unsupported);
+    assert_eq!(check_ordered(&identity, no_checks, vec![(identity.clone(), no_checks)], ScalarCheckerScope::MainFlowOnly),
+        ScalarOrderedCheckerOutcome::NoChecks);
 }
 
 #[test]

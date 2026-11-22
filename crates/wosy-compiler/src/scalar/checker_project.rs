@@ -104,6 +104,17 @@ pub enum ScalarCheckerOutcome {
 }
 
 #[cfg(feature = "internal-checker")]
+#[doc(hidden)]
+#[derive(Debug, PartialEq)]
+pub enum ScalarOrderedCheckerOutcome {
+    Passed,
+    NoChecks,
+    Unsupported,
+    Invalid(Vec<Diagnostic>),
+    Failed(Vec<ScalarCheckerFailure>),
+}
+
+#[cfg(feature = "internal-checker")]
 pub fn check_scalar_package(
     declarations: Vec<(ScalarSourceDeclarations, Vec<ScalarNamespaceBinding>)>,
     initialization_order: Vec<SourceIdentity>,
@@ -115,18 +126,59 @@ pub fn check_scalar_package(
 
 #[cfg(feature = "internal-checker")]
 pub fn check_scalar_package_with_dormant_sources(
-    mut declarations: Vec<(ScalarSourceDeclarations, Vec<ScalarNamespaceBinding>)>,
+    declarations: Vec<(ScalarSourceDeclarations, Vec<ScalarNamespaceBinding>)>,
     initialization_order: Vec<SourceIdentity>,
     dormant: Vec<ScalarSourceDeclarations>,
     inputs: ScalarPreparationInputs,
     scope: ScalarCheckerScope,
 ) -> ScalarCheckerOutcome {
+    let result = prepare_checked_package_scope(declarations, initialization_order, dormant, inputs, scope)
+        .and_then(|(prepared, startup_count)| check_package_roots_with_activity(&prepared, scope, startup_count));
+    match result {
+        Ok(true) => ScalarCheckerOutcome::Passed,
+        Ok(false) => ScalarCheckerOutcome::NoChecks,
+        Err(ProjectCheck::Invalid(diagnostics)) => ScalarCheckerOutcome::Invalid(diagnostics),
+        Err(error) => materialize_checker_failure(error)
+            .map_or(ScalarCheckerOutcome::Unsupported, ScalarCheckerOutcome::Failed),
+    }
+}
+
+#[cfg(feature = "internal-checker")]
+#[doc(hidden)]
+pub fn check_scalar_package_ordered_with_dormant_sources(
+    declarations: Vec<(ScalarSourceDeclarations, Vec<ScalarNamespaceBinding>)>,
+    initialization_order: Vec<SourceIdentity>,
+    dormant: Vec<ScalarSourceDeclarations>,
+    inputs: ScalarPreparationInputs,
+    scope: ScalarCheckerScope,
+) -> ScalarOrderedCheckerOutcome {
+    let result = prepare_checked_package_scope(declarations, initialization_order, dormant, inputs, scope)
+        .and_then(|(prepared, startup_count)| collect_ordered_package_failures(&prepared, scope, startup_count));
+    match result {
+        Ok((active, failures)) if failures.is_empty() => {
+            if active { ScalarOrderedCheckerOutcome::Passed } else { ScalarOrderedCheckerOutcome::NoChecks }
+        }
+        Ok((_, failures)) => failures.into_iter().map(materialize_checker_failure).collect::<Option<Vec<_>>>()
+            .map_or(ScalarOrderedCheckerOutcome::Unsupported, ScalarOrderedCheckerOutcome::Failed),
+        Err(ProjectCheck::Invalid(diagnostics)) => ScalarOrderedCheckerOutcome::Invalid(diagnostics),
+        Err(_) => ScalarOrderedCheckerOutcome::Unsupported,
+    }
+}
+
+#[cfg(feature = "internal-checker")]
+fn prepare_checked_package_scope(
+    mut declarations: Vec<(ScalarSourceDeclarations, Vec<ScalarNamespaceBinding>)>,
+    initialization_order: Vec<SourceIdentity>,
+    dormant: Vec<ScalarSourceDeclarations>,
+    inputs: ScalarPreparationInputs,
+    scope: ScalarCheckerScope,
+) -> Result<(PreparedCheckerProject, usize), ProjectCheck> {
     let mut raw_sources = HashSet::with_capacity(initialization_order.len());
     if initialization_order.is_empty()
         || initialization_order.len() != declarations.len()
         || !initialization_order.iter().all(|source| raw_sources.insert(source))
     {
-        return ScalarCheckerOutcome::Unsupported;
+        return Err(ProjectCheck::Unsupported);
     }
     let startup_count = declarations.len();
     if scope == ScalarCheckerScope::CurrentPackage && !dormant.is_empty() {
@@ -138,7 +190,7 @@ pub fn check_scalar_package_with_dormant_sources(
         if !declarations.iter().all(|(source, _)| {
             raw_sources.contains(source.source()) && startup_keys.insert(logical_source(source.source()))
         }) {
-            return ScalarCheckerOutcome::Unsupported;
+            return Err(ProjectCheck::Unsupported);
         }
         let mut dormant_keys = HashSet::new();
         for source in &dormant {
@@ -148,44 +200,43 @@ pub fn check_scalar_package_with_dormant_sources(
                 || startup_keys.contains(&key) || !dormant_keys.insert(key)
                 || source.namespaces().next().is_some()
             {
-                return ScalarCheckerOutcome::Unsupported;
+                return Err(ProjectCheck::Unsupported);
             }
         }
         if declarations.iter().flat_map(|(_, edges)| edges).any(|edge| {
             dormant_keys.contains(&logical_source(&edge.target))
         }) {
-            return ScalarCheckerOutcome::Unsupported;
+            return Err(ProjectCheck::Unsupported);
         }
         declarations.extend(dormant.into_iter().map(|source| (source, Vec::new())));
     }
 
-    let result = prepare_checker_project(declarations, initialization_order, inputs)
-        .and_then(|prepared| check_package_roots_with_activity(&prepared, scope, startup_count));
-    match result {
-        Ok(true) => ScalarCheckerOutcome::Passed,
-        Ok(false) => ScalarCheckerOutcome::NoChecks,
-        Err(ProjectCheck::Invalid(diagnostics)) => ScalarCheckerOutcome::Invalid(diagnostics),
-        Err(ProjectCheck::Failed { source, operation, directive, condition, output, axes, state }) =>
-            ScalarCheckerOutcome::Failed(ScalarCheckerFailure {
-                source,
-                operation: match operation {
-                    CheckerOperation::Require => ScalarCheckerOperation::Require,
-                    CheckerOperation::Narrow => ScalarCheckerOperation::Narrow,
-                },
-                directive,
-                condition,
-                stdout_span: output.stdout,
-                stderr_span: output.stderr,
-                code_span: output.code,
-                files_span: output.files,
-                files: output.text_files,
-                stdout: output.stdout_bytes,
-                stderr: output.stderr_bytes,
-                code: output.code_value,
-                witness: ScalarCheckerIntegerWitness { axes, state },
-            }),
-        Err(_) => ScalarCheckerOutcome::Unsupported,
-    }
+    Ok((prepare_checker_project(declarations, initialization_order, inputs)?, startup_count))
+}
+
+#[cfg(feature = "internal-checker")]
+fn materialize_checker_failure(error: ProjectCheck) -> Option<ScalarCheckerFailure> {
+    let ProjectCheck::Failed { source, operation, directive, condition, output, axes, state } = error else {
+        return None;
+    };
+    Some(ScalarCheckerFailure {
+        source,
+        operation: match operation {
+            CheckerOperation::Require => ScalarCheckerOperation::Require,
+            CheckerOperation::Narrow => ScalarCheckerOperation::Narrow,
+        },
+        directive,
+        condition,
+        stdout_span: output.stdout,
+        stderr_span: output.stderr,
+        code_span: output.code,
+        files_span: output.files,
+        files: output.text_files,
+        stdout: output.stdout_bytes,
+        stderr: output.stderr_bytes,
+        code: output.code_value,
+        witness: ScalarCheckerIntegerWitness { axes, state },
+    })
 }
 
 #[derive(Debug, PartialEq)]
@@ -294,7 +345,6 @@ fn check_package_roots_with_activity(
 }
 
 #[cfg(feature = "internal-checker")]
-#[cfg_attr(not(test), allow(dead_code))]
 fn collect_ordered_package_failures(
     prepared: &PreparedCheckerProject, scope: ScalarCheckerScope, startup_count: usize,
 ) -> Result<(bool, Vec<ProjectCheck>), ProjectCheck> {

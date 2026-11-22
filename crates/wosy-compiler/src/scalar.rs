@@ -3739,7 +3739,7 @@ mod symbolic_integer;
 #[cfg(feature = "internal-checker")]
 pub use checker_directive::ScalarCheckerTextFile;
 #[cfg(feature = "internal-checker")]
-pub use checker_project::{check_loaded_scalar_module_proof_call, check_loaded_scalar_module_proof_selections, check_loaded_scalar_module_proofs, check_scalar_module_proof, check_scalar_module_proofs, ScalarProofDeclarations, ScalarProofCallOutcome, check_scalar_package, check_scalar_package_with_dormant_sources, ScalarProofModuleInput, ScalarModuleProofOutcome, ScalarCheckerFailure, ScalarCheckerIntegerWitness, ScalarCheckerOperation, ScalarCheckerOutcome, ScalarCheckerScope};
+pub use checker_project::{check_loaded_scalar_module_proof_call, check_loaded_scalar_module_proof_selections, check_loaded_scalar_module_proofs, check_scalar_module_proof, check_scalar_module_proofs, ScalarProofDeclarations, ScalarProofCallOutcome, check_scalar_package, check_scalar_package_with_dormant_sources, check_scalar_package_ordered_with_dormant_sources, ScalarOrderedCheckerOutcome, ScalarProofModuleInput, ScalarModuleProofOutcome, ScalarCheckerFailure, ScalarCheckerIntegerWitness, ScalarCheckerOperation, ScalarCheckerOutcome, ScalarCheckerScope};
 #[cfg(feature = "internal-checker")]
 pub(crate) use checker_project::derive_scalar_proof_declarations_from_cst;
 pub(crate) use reference::aggregate::{AggregateReservations, ClosedAggregates, ClosedBody, ClosedCall, ClosedInitializer, ClosedInitializerInput, ClosedInput, ClosedReturn};
