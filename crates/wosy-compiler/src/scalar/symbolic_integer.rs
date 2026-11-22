@@ -24,7 +24,6 @@ pub(super) enum IntegerSetPartition {
     Mixed(IntegerSet, IntegerSet),
 }
 
-#[cfg(feature = "internal-checker")]
 pub(super) fn consecutive_integer_cuts(lower: &BigInt, upper: &BigInt) -> bool {
     use num_bigint::Sign::Minus;
     let (smaller, larger) = match (lower.sign() == Minus, upper.sign() == Minus) {
@@ -49,7 +48,6 @@ pub(super) fn consecutive_integer_cuts(lower: &BigInt, upper: &BigInt) -> bool {
     }
 }
 
-#[cfg(feature = "internal-checker")]
 #[derive(Clone, Copy)]
 struct CutCell<'a> {
     lower: (&'a BigInt, bool),
@@ -57,7 +55,6 @@ struct CutCell<'a> {
     accepts: bool,
 }
 
-#[cfg(feature = "internal-checker")]
 impl CutCell<'_> {
     fn nonempty(self) -> bool {
         match self.lower.0.cmp(self.upper.0) {
@@ -75,13 +72,11 @@ impl CutCell<'_> {
     }
 }
 
-#[cfg(feature = "internal-checker")]
 pub(super) struct IntegerCutUnion<'a> {
     cells: [Option<CutCell<'a>>; 5],
     len: usize,
 }
 
-#[cfg(feature = "internal-checker")]
 impl<'a> IntegerCutUnion<'a> {
     pub(super) fn new(
         first: (IntegerRelation, &'a BigInt), second: (IntegerRelation, &'a BigInt),
@@ -115,6 +110,31 @@ impl<'a> IntegerCutUnion<'a> {
         }
         self.cells[self.len] = Some(cell);
         self.len += 1;
+    }
+
+    fn for_each_clipped<'clip>(
+        &'clip self, active: &'clip Interval, cursor: &mut usize, mut visit: impl FnMut(CutCell<'clip>),
+    ) {
+        while self.cells.get(*cursor).copied().flatten().is_some_and(|cell|
+            cell.upper.0 < &active.first || (cell.upper.0 == &active.first && !cell.upper.1))
+        {
+            *cursor += 1;
+        }
+        while let Some(cell) = self.cells.get(*cursor).copied().flatten() {
+            if cell.lower.0 > &active.last || (cell.lower.0 == &active.last && !cell.lower.1) {
+                break;
+            }
+            let lower = if &active.first > cell.lower.0 { (&active.first, true) } else { cell.lower };
+            let upper = if &active.last < cell.upper.0 { (&active.last, true) } else { cell.upper };
+            let clipped = CutCell { lower, upper, accepts: cell.accepts };
+            if clipped.nonempty() {
+                visit(clipped);
+            }
+            if cell.upper.0 > &active.last {
+                break;
+            }
+            *cursor += 1;
+        }
     }
 
     pub(super) fn uniform(&self) -> Option<bool> {
@@ -689,29 +709,12 @@ impl IntegerSet {
         let mut outputs: Option<[Vec<Interval>; 2]> = None;
         let mut cursor = 0;
         for (index, active) in self.0.iter().enumerate() {
-            while accepted.cells.get(cursor).copied().flatten().is_some_and(|cell|
-                cell.upper.0 < &active.first || (cell.upper.0 == &active.first && !cell.upper.1))
-            {
-                cursor += 1;
-            }
             let mut parts = [None; 5];
             let mut len = 0;
-            while let Some(cell) = accepted.cells.get(cursor).copied().flatten() {
-                if cell.lower.0 > &active.last || (cell.lower.0 == &active.last && !cell.lower.1) {
-                    break;
-                }
-                let lower = if &active.first > cell.lower.0 { (&active.first, true) } else { cell.lower };
-                let upper = if &active.last < cell.upper.0 { (&active.last, true) } else { cell.upper };
-                let clipped = CutCell { lower, upper, accepts: cell.accepts };
-                if clipped.nonempty() {
-                    parts[len] = Some(clipped);
-                    len += 1;
-                }
-                if cell.upper.0 > &active.last {
-                    break;
-                }
-                cursor += 1;
-            }
+            accepted.for_each_clipped(active, &mut cursor, |clipped| {
+                parts[len] = Some(clipped);
+                len += 1;
+            });
             if len == 1 {
                 let side = parts[0].expect("single partition segment").accepts as usize;
                 if outputs.is_none() && uniform.is_none_or(|prior| prior == side) {
@@ -734,6 +737,34 @@ impl IntegerSet {
             Some([no, yes]) => IntegerSetPartition::Mixed(Self(yes), Self(no)),
             None if uniform == Some(1) => IntegerSetPartition::True,
             None => IntegerSetPartition::False,
+        }
+    }
+
+    pub(super) fn filter_by(&self, cuts: &IntegerCutUnion<'_>, keep_passing: bool) -> IntegerIntersection {
+        let mut cursor = 0;
+        let mut matched = 0;
+        let mut changed: Option<Vec<Interval>> = None;
+        for (index, active) in self.0.iter().enumerate() {
+            cuts.for_each_clipped(active, &mut cursor, |clipped| {
+                if clipped.accepts != keep_passing {
+                    return;
+                }
+                if let Some(intervals) = &mut changed {
+                    intervals.push(clipped.materialize());
+                } else if index == matched && clipped.lower == (&active.first, true) && clipped.upper == (&active.last, true) {
+                    matched += 1;
+                } else {
+                    let mut intervals = self.0[..matched].to_vec();
+                    intervals.push(clipped.materialize());
+                    changed = Some(intervals);
+                }
+            });
+        }
+        match changed {
+            Some(intervals) => IntegerIntersection::Changed(Self(intervals)),
+            None if matched == 0 => IntegerIntersection::Empty,
+            None if matched == self.0.len() => IntegerIntersection::Unchanged,
+            None => IntegerIntersection::Changed(Self(self.0[..matched].to_vec())),
         }
     }
 
@@ -789,7 +820,18 @@ mod tests {
                         for input in 1_u8..64 {
                             let yes = input & mask;
                             let no = input & !mask;
-                            match domain(input).partition_by(&accepted) {
+                            let original = domain(input);
+                            for (keep, expected) in [(true, yes), (false, no)] {
+                                match original.filter_by(&accepted, keep) {
+                                    IntegerIntersection::Empty => assert_eq!(expected, 0),
+                                    IntegerIntersection::Unchanged => assert_eq!(expected, input),
+                                    IntegerIntersection::Changed(filtered) => {
+                                        assert!(expected != 0 && expected != input);
+                                        assert_eq!(filtered, domain(expected));
+                                    }
+                                }
+                            }
+                            match original.partition_by(&accepted) {
                                 IntegerSetPartition::True => assert_eq!((yes, no), (input, 0)),
                                 IntegerSetPartition::False => assert_eq!((yes, no), (0, input)),
                                 IntegerSetPartition::Mixed(yes_set, no_set) => {

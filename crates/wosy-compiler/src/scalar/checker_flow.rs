@@ -6,14 +6,14 @@ use super::{
     checker_directive::CheckerOperation,
     control::{AssignmentReplacement, BindingInitialization, BindingRegion, BlockItemKind, BlockPosition, CheckedCallSignature, ConditionalRegion, FinalOutputSlot},
     reference::{BlockOrdinal, DirectDestinationIdentity, FunctionCallSites, OccurrenceEdge, OccurrenceNode, OccurrenceOrdinal, OccurrenceParent, OccurrenceStructure, PlainNameIdentity},
-    symbolic_integer::{IntegerIntersection, IntegerSet},
+    symbolic_integer::{IntegerCutUnion, IntegerIntersection, IntegerSet},
     typecheck::is_integer_type,
     BinaryOperator, ReferenceBindingId, ScalarExpression, ScalarType, UnaryOperator,
 };
 use super::{symbolic_integer::IntegerRelation, reference::CheckerIntegerCallArgument};
 
 #[cfg(feature = "internal-checker")]
-use super::symbolic_integer::{consecutive_integer_cuts, IntegerCutUnion, IntegerShowConstraints};
+use super::symbolic_integer::{consecutive_integer_cuts, IntegerShowConstraints};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum CheckerPredicate {
@@ -620,10 +620,13 @@ impl IntegerInputs {
         });
     }
 
-    fn intersection_witness(&self, axis: usize, values: &IntegerSet) -> Self {
+    fn disjunction_failure_witness(&self, axis: usize, cuts: &IntegerCutUnion<'_>) -> Self {
+        if let Some(passes) = cuts.uniform() {
+            return if passes { Self::default() } else { Self(self.0.clone()) };
+        }
         let mut witness = Self::default();
         for row in &self.0 {
-            match row[axis].intersection(values) {
+            match row[axis].filter_by(cuts, false) {
                 IntegerIntersection::Empty => {}
                 IntegerIntersection::Unchanged => witness.0.push(row.clone()),
                 IntegerIntersection::Changed(intersection) => {
@@ -636,10 +639,13 @@ impl IntegerInputs {
         witness
     }
 
-    fn restrict_axis_or_witness(&mut self, axis: usize, values: &IntegerSet) -> Self {
+    fn narrow_disjunction_or_witness(&mut self, axis: usize, cuts: &IntegerCutUnion<'_>) -> Self {
+        if let Some(passes) = cuts.uniform() {
+            return if passes { Self::default() } else { std::mem::take(self) };
+        }
         let mut rejected_prefix = 0;
         let mut surviving = false;
-        self.0.retain_mut(|row| match row[axis].intersection(values) {
+        self.0.retain_mut(|row| match row[axis].filter_by(cuts, true) {
             IntegerIntersection::Empty if !surviving => {
                 rejected_prefix += 1;
                 true
@@ -2321,17 +2327,17 @@ thread_local! {
     pub(super) static DIRECTIVE_DISJUNCTION_NORMALIZATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-fn normalize_directive_disjunction(
-    operation: CheckerOperation, ty: &ScalarType,
-    [(lhs, left), (rhs, right)]: &[(IntegerRelation, BigInt); 2],
-) -> Option<IntegerSet> {
+fn directive_disjunction_cuts<'a>(
+    [(lhs, left), (rhs, right)]: &'a [(IntegerRelation, BigInt); 2],
+    (minimum, maximum): (&'a BigInt, &'a BigInt),
+) -> Option<IntegerCutUnion<'a>> {
+    let fits = |bound: &BigInt| minimum <= bound && bound <= maximum;
+    if !fits(left) || !fits(right) {
+        return None;
+    }
     #[cfg(all(test, feature = "internal-checker"))]
     DIRECTIVE_DISJUNCTION_NORMALIZATIONS.with(|count| count.set(count.get() + 1));
-    match operation {
-        CheckerOperation::Require => Some(IntegerSet::from_type(ty)?
-            .keep_relation(lhs.complement(), left).keep_relation(rhs.complement(), right)),
-        CheckerOperation::Narrow => IntegerSet::comparison_union(ty, (*lhs, left), (*rhs, right)),
-    }
+    Some(IntegerCutUnion::new((*lhs, left), (*rhs, right), (minimum, maximum)))
 }
 
 fn walk_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, Authored: ScopedAuthoredReturn<'a>>(
@@ -2361,10 +2367,11 @@ fn walk_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, A
                         if ty != actual_type {
                             return None;
                         }
-                        let values = normalize_directive_disjunction(directive.operation, ty, atoms)?;
+                        let (minimum, maximum) = super::typecheck::integer_bounds(ty)?;
+                        let cuts = directive_disjunction_cuts(atoms, (&minimum, &maximum))?;
                         let failing = match directive.operation {
-                            CheckerOperation::Require => path.intersection_witness(axis, &values),
-                            CheckerOperation::Narrow => path.restrict_axis_or_witness(axis, &values),
+                            CheckerOperation::Require => path.disjunction_failure_witness(axis, &cuts),
+                            CheckerOperation::Narrow => path.narrow_disjunction_or_witness(axis, &cuts),
                         };
                         if !failing.is_unreachable() {
                             (failures.as_deref_mut()?.sink)(IntegerCheckFailure {
@@ -2669,6 +2676,36 @@ fn integer_local<'a>(
     Some((identity, &receiver.ty, value))
 }
 
+
+#[test]
+fn directive_disjunction_filter_keeps_original_witness_without_building_the_other_side() {
+    let [zero, one, nine] = [0, 1, 9].map(BigInt::from);
+    let ge = IntegerRelation::from_operator(&BinaryOperator::GreaterEqual).unwrap();
+    let less = IntegerRelation::from_operator(&BinaryOperator::Less).unwrap();
+    let greater = IntegerRelation::from_operator(&BinaryOperator::Greater).unwrap();
+    let all = IntegerCutUnion::new((ge, &zero), (less, &zero), (&zero, &nine));
+    let none = IntegerCutUnion::new((less, &zero), (greater, &nine), (&zero, &nine));
+    let excluding_one = IntegerCutUnion::new((less, &zero), (greater, &one), (&zero, &nine));
+    let axis = Rc::new(IntegerSet::singleton(&one));
+    let mut active = IntegerInputs(vec![vec![axis.clone()]]);
+    let storage = active.0.as_ptr();
+    assert!(active.disjunction_failure_witness(0, &all).is_unreachable());
+    assert!(active.narrow_disjunction_or_witness(0, &all).is_unreachable());
+    assert_eq!(active.0.as_ptr(), storage);
+    let witness = active.disjunction_failure_witness(0, &none);
+    assert!(Rc::ptr_eq(&witness.0[0][0], &axis));
+    assert_eq!(active.0.as_ptr(), storage);
+    let witness = active.narrow_disjunction_or_witness(0, &excluding_one);
+    assert!(active.is_unreachable());
+    assert_eq!(witness.0.as_ptr(), storage);
+    assert!(Rc::ptr_eq(&witness.0[0][0], &axis));
+    let mut active = IntegerInputs(vec![vec![axis.clone()]]);
+    let storage = active.0.as_ptr();
+    let witness = active.narrow_disjunction_or_witness(0, &none);
+    assert!(active.is_unreachable());
+    assert_eq!(witness.0.as_ptr(), storage);
+    assert!(Rc::ptr_eq(&witness.0[0][0], &axis));
+}
 
 #[cfg(feature = "internal-checker")]
 #[test]
