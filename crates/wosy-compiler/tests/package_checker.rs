@@ -1719,6 +1719,50 @@ fn named_proof_peer_use_requires_each_authored_show_and_independent_ensures() {
 }
 
 #[test]
+fn named_proof_citation_then_show_checks_both_claims_against_verified_evidence() {
+    let identity = source();
+    let check = |leaf_guard: &str, consumer_guard: &str, leaf_goal: &str, goal: &str, steps: &str| {
+        check_scalar_module_proofs(
+            identity.clone(), &["consumer", "leaf"],
+            vec![ScalarProofModuleInput {
+                source: identity.clone(),
+                text: format!(r#"%%start
+                    i8(i8) echo = fn(value) {{ value }};
+                    proof leaf for echo(entry) -> (out) where ({leaf_guard}) ensures ({leaf_goal}) {{}}
+                    proof cycle_a for echo(entry) -> (out) where ({leaf_guard}) ensures ({leaf_goal}) {{
+                        core.use(cycle_b(entry));
+                    }}
+                    proof cycle_b for echo(entry) -> (out) where ({leaf_guard}) ensures ({leaf_goal}) {{
+                        core.use(cycle_a(entry));
+                    }}
+                    proof consumer for echo(arg) -> (out) where ({consumer_guard}) ensures ({goal}) {{
+                        {steps}
+                    }}
+                %%end"#),
+                namespaces: Vec::new(),
+            }],
+            vec![identity.clone()],
+            ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
+        ).unwrap()
+    };
+    use ScalarModuleProofOutcome::{Invalid, NoApplicableInputs, Proved, Refuted, Unsupported};
+    let run = |goal: &str, steps: &str| check("entry < 8", "arg < 8", "out < 8", goal, steps);
+    let steps = "core.use(leaf(arg)); core.show(out <= 7);";
+    assert_eq!(run("out < 9", steps), [Proved, Proved]);
+    assert_eq!(run("out <= 7", steps), [Proved, Proved]);
+    assert_eq!(run("out <= 6", steps), [Unsupported, Proved]);
+    assert_eq!(run("out < 9", "core.use(leaf(arg)); core.show(out <= 6);"), [Unsupported, Proved]);
+    assert_eq!(run("out < 9", "core.show(out <= 7); core.use(leaf(arg));"), [Unsupported, Proved]);
+    assert_eq!(run("out < 9", "core.use(cycle_a(arg)); core.show(out <= 7);"), [Unsupported, Proved]);
+    assert_eq!(run("out < 9", "core.use(leaf(0)); core.show(out <= 7);"), [Unsupported, Proved]);
+    assert_eq!(check("entry < 8", "arg == 6", "out < 8", "out < 9", steps), [Unsupported, Proved]);
+    assert_eq!(check("entry < 8", "arg < 8", "out <= 6", "out < 9", steps), [Unsupported, Refuted]);
+    assert_eq!(check("false", "false", "out < 8", "out < 9", steps), [NoApplicableInputs, NoApplicableInputs]);
+    assert!(matches!(check("false", "false", "out < 8", "out < 9",
+        "core.use(leaf(arg)); core.show(out <= 128);").as_slice(), [Invalid(_), NoApplicableInputs]));
+}
+
+#[test]
 fn named_proof_peer_use_applies_a_direct_non_equality_leaf_to_a_strict_subset() {
     let identity = source();
     let check = |leaf_guard: &str, caller_guard: &str, premise: &str, goal: &str| {

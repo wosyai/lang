@@ -2524,6 +2524,7 @@ struct UnusedPeerUse<'plan, 'project> {
     bound: &'plan BigInt,
     strict_entry: Option<StrictPeerDomain<'plan>>,
     implication_checked: bool,
+    mixed_implies_claims: Option<bool>,
 }
 
 #[cfg(feature = "internal-checker")]
@@ -2764,8 +2765,19 @@ impl PreparedProofModule {
                 let key = (plan.target, ExactGuardGroup(plan.filter.as_deref()));
                 arbitrary_groups.entry(key).or_default().direct.push((*index, plan));
             } else if let Some(peer) = plan.direct_peer_use() {
-                pending_peers.push((*index, plan, peer));
+                pending_peers.push((*index, plan, peer, None));
             } else {
+                match plan.citation_then_show() {
+                    Ok(Some((peer, claim))) => {
+                        pending_peers.push((*index, plan, peer, Some(claim)));
+                        continue;
+                    }
+                    Err(error) => {
+                        outcomes[*index] = module_proof_outcome(Err(error));
+                        continue;
+                    }
+                    Ok(None) => {}
+                }
                 let (operator, bound, proof) = match plan.prepare_arbitrary_show() {
                     Ok(proof) => proof,
                     Err(error) => {
@@ -2785,14 +2797,14 @@ impl PreparedProofModule {
         }
         let mut cited_bounds = PeerPredicateBounds::default();
         if !pending_peers.is_empty() {
-            for (_, plan, _) in &pending_peers {
+            for (_, plan, _, _) in &pending_peers {
                 selected.sources.get_mut(plan.proof_source).expect("requested peer consumer source")
                     .catalog.get_or_insert_with(|| {
                         Box::new(LocalPeerCatalog::new(plan.proof_source, &self.proofs[plan.proof_source]))
                     });
             }
             let mut admitted_roots = Vec::new();
-            for (index, plan, peer) in pending_peers {
+            for (index, plan, peer, claim) in pending_peers {
                 let Some(catalog) = selected.catalog(plan.proof_source) else { continue; };
                 let Ok(declaration) = catalog.declaration(peer) else { continue; };
                 let requested = graph.enroll(self, selected, plans, catalog.source, declaration);
@@ -2802,23 +2814,23 @@ impl PreparedProofModule {
                 }
                 let strict_entry = if ExactGuardGroup(plan.filter.as_deref()) == ExactGuardGroup(immediate.filter.as_deref()) {
                     None
-                } else if immediate.steps.items.is_empty() {
+                } else if claim.is_none() && immediate.steps.items.is_empty() {
                     let Some(entry) = plan.closed_entry_admitted_by_peer(immediate) else { continue; };
                     Some(entry)
                 } else {
                     continue;
                 };
                 graph.activate(requested);
-                admitted_roots.push((index, plan, requested, strict_entry));
+                admitted_roots.push((index, plan, requested, strict_entry, claim));
             }
             graph.resolve_edges(self, selected, plans);
             graph.resolve_terminals();
             let integer_equality = IntegerRelation::from_operator(&BinaryOperator::Equal).expect("checked integer equality");
-            for (index, plan, requested, strict_entry) in admitted_roots {
+            for (index, plan, requested, strict_entry, claim) in admitted_roots {
                 let Some(leaf) = graph.terminal(requested) else { continue; };
                 let Some((relation, bound)) = leaf.peer_literal_goal() else { continue; };
                 if !leaf.steps.items.is_empty() {
-                    if strict_entry.is_some() {
+                    if strict_entry.is_some() || claim.is_some() {
                         continue;
                     }
                     let TypedProofGoal::Literal { relation: requested_relation, bound: requested, .. } =
@@ -2866,9 +2878,18 @@ impl PreparedProofModule {
                         continue;
                     }
                 }
+                let mixed_implies_claims = claim.map(|(show_relation, show_bound)| {
+                    let TypedProofGoal::Literal { relation: requested_relation, bound: requested, .. } =
+                        &plan.typed.goal else { return false; };
+                    let show = (show_relation, show_bound.as_ref());
+                    let ensures = (*requested_relation, requested);
+                    let premise = (relation, bound);
+                    cited_bounds.implies(plan.typed.result_type, premise, show)
+                        && (show == ensures || cited_bounds.implies(plan.typed.result_type, premise, ensures))
+                });
                 let leaf_guard = ExactGuardGroup(leaf.filter.as_deref());
                 arbitrary_groups.entry((plan.target, leaf_guard)).or_default().peer_uses.push(UnusedPeerUse {
-                    index, consumer: plan, name: leaf.name, relation, bound, strict_entry, implication_checked,
+                    index, consumer: plan, name: leaf.name, relation, bound, strict_entry, implication_checked, mixed_implies_claims,
                 });
             }
         }
@@ -2890,11 +2911,11 @@ impl PreparedProofModule {
                 continue;
             }
             let mut peers = HashMap::new();
-            for UnusedPeerUse { index, consumer, name, relation, bound, strict_entry, implication_checked } in group.peer_uses {
+            for UnusedPeerUse { index, consumer, name, relation, bound, strict_entry, implication_checked, mixed_implies_claims } in group.peer_uses {
                 let identity = (consumer.proof_source, name);
                 let (_, _, uses): &mut (_, _, Vec<_>) = peers.entry(identity)
                     .or_insert_with(|| (relation, bound, Vec::new()));
-                uses.push((index, consumer, strict_entry, implication_checked));
+                uses.push((index, consumer, strict_entry, implication_checked, mixed_implies_claims));
             }
             match observe_unused_module_proof_returns(body, guard.0) {
                 Some(Ok(ProofCoverage::Applicable(paths))) => {
@@ -2906,7 +2927,13 @@ impl PreparedProofModule {
                         let proof = paths.iter().map(|path| path.output_satisfies(relation, bound))
                             .find(|holds| *holds != Some(true)).unwrap_or(Some(true));
                         let checked = if proof == Some(true) {
-                            for (index, consumer, strict_entry, implication_checked) in consumers {
+                            for (index, consumer, strict_entry, implication_checked, mixed_implies_claims) in consumers {
+                                if let Some(implied) = mixed_implies_claims {
+                                    if implied {
+                                        outcomes[index] = ScalarModuleProofOutcome::Proved;
+                                    }
+                                    continue;
+                                }
                                 let TypedProofGoal::Literal { relation: requested_relation, bound: requested, .. } =
                                     &consumer.typed.goal else { continue; };
                                 if relation != equality && !implication_checked {
@@ -2991,7 +3018,7 @@ impl PreparedProofModule {
                         outcomes[index] = ScalarModuleProofOutcome::NoApplicableInputs;
                     }
                     for (_, _, consumers) in peers.into_values() {
-                        for (index, _, strict_entry, _) in consumers {
+                        for (index, _, strict_entry, _, _) in consumers {
                             if strict_entry.is_none() {
                                 outcomes[index] = ScalarModuleProofOutcome::NoApplicableInputs;
                             }
@@ -3130,6 +3157,34 @@ impl PlannedModuleProof<'_> {
     }
 
     fn direct_peer_use(&self) -> Option<&str> {
+        let [item] = self.steps.items.as_slice() else { return None; };
+        if self.steps.terminated_items.as_slice() != [true] {
+            return None;
+        }
+        self.peer_use_step(item)
+    }
+
+    fn citation_then_show(&self) -> Result<Option<(&str, (IntegerRelation, Cow<'_, BigInt>))>, ProjectCheck> {
+        let [use_step, show_step] = self.steps.items.as_slice() else { return Ok(None); };
+        if self.steps.terminated_items.as_slice() != [true, true] {
+            return Ok(None);
+        }
+        let Some(peer) = self.peer_use_step(use_step) else { return Ok(None); };
+        let claim = proof_show_expression(show_step, true)?;
+        let comparison = IntegerComparison::from_expression(claim).ok_or(ProjectCheck::Unsupported)?;
+        let (_, relation, bound) = checked_literal_output_goal_borrowed(
+            comparison, &self.typed.output, &self.typed.input_names, self.typed.result_type,
+        )?;
+        Ok(Some((peer, (relation, bound))))
+    }
+
+    fn peer_use_step<'a>(&self, item: &'a ScalarBlockItem) -> Option<&'a str> {
+        let ScalarBlockItem::Expression(ScalarExpression::Call {
+            receiver: Some(core), name: use_step, type_arguments: use_types, arguments: use_arguments, ..
+        }) = item else { return None; };
+        if core != "core" || use_step != "use" || !use_types.is_empty() {
+            return None;
+        }
         let boundary = &self.typed.body.boundary;
         let bindings = boundary.checker_parameter_bindings.as_deref()?;
         if bindings.len() != self.typed.input_names.len() || !boundary.parameters.iter().all(|slot| is_integer_type(&slot.ty)) {
@@ -3139,14 +3194,7 @@ impl PlannedModuleProof<'_> {
             || !matches!(self.typed.input_names.len(), 1 | 2)
             || is_null_literal_name(&self.typed.output)
             || self.typed.input_names.iter().any(|name| is_null_literal_name(name))
-            || self.steps.terminated_items.as_slice() != [true]
         {
-            return None;
-        }
-        let [ScalarBlockItem::Expression(ScalarExpression::Call {
-            receiver: Some(core), name: use_step, type_arguments: use_types, arguments: use_arguments, ..
-        })] = self.steps.items.as_slice() else { return None; };
-        if core != "core" || use_step != "use" || !use_types.is_empty() {
             return None;
         }
         let [ScalarExpression::Call {
