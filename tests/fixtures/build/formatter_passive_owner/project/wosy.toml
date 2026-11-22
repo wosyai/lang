@@ -115,3 +115,33 @@ run_runner = "wasm"
 
 [targets.controls-wasm.profiles.dev]
 main_artifact = "main"
+
+[targets.initializer-native]
+root = "src/initializer.w"
+
+[targets.initializer-native.artifacts.main]
+artifact = "Main"
+
+[targets.initializer-native.artifacts.main.profiles.dev]
+backend = "llvm"
+output = "native"
+builder = "native"
+run_runner = "native"
+
+[targets.initializer-native.profiles.dev]
+main_artifact = "main"
+
+[targets.initializer-wasm]
+root = "src/initializer.w"
+
+[targets.initializer-wasm.artifacts.main]
+artifact = "Main"
+
+[targets.initializer-wasm.artifacts.main.profiles.dev]
+backend = "llvm"
+output = "wasm-wasip1"
+builder = "wasm"
+run_runner = "wasm"
+
+[targets.initializer-wasm.profiles.dev]
+main_artifact = "main"

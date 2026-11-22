@@ -17,3 +17,8 @@ host output, then prints an empty descriptor (no host write). Neither may
 allocate or release. An independent scoped runtime array then verifies
 one real allocation and release at the original base without relying on
 formatter behavior.
+
+The module initializer control binds the formatted `u128` at module
+scope, moves it into ordinary print, and then exits through the real host.
+It observes one 39-byte allocation, the seven output bytes at its original
+base, and one release before the explicit exit.
