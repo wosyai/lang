@@ -517,7 +517,7 @@ fn check_unused_module<const COLLECT: bool>(
             };
             if COLLECT {
                 let sink = RefCell::new(failures.as_deref_mut().ok_or(ProjectCheck::Unsupported)?);
-                let collection = OrderedCallCollection { failures: &sink };
+                let collection = OrderedCallCollection { failures: &sink, visits: None };
                 symbolic.collect_requirements(body, &module.source, IntegerRequirementEntry::Arbitrary, collection)?;
                 active |= symbolic.had_obligations;
             } else {
@@ -693,7 +693,7 @@ fn walk_package_initialization<const COLLECT: bool>(
             (&step.kind, &checked_item.kind) else {
                 return Err(ProjectCheck::Unsupported);
             };
-        if check_initializer_expression::<COLLECT>(topology, actual, source, &storage, *expression, 0, failures)? == StartupLane::Empty {
+        if check_initializer_expression::<COLLECT>(topology, actual, source, &storage, *expression, 0, failures, visits)? == StartupLane::Empty {
             return Ok(StartupLane::Empty);
         }
     }
@@ -709,6 +709,7 @@ fn check_initializer_expression<const COLLECT: bool>(
     expression: OccurrenceOrdinal,
     depth: usize,
     failures: &mut Option<&mut Vec<ProjectCheck>>,
+    visits: &[InitializationVisit],
 ) -> Result<StartupLane, ProjectCheck> {
     let structure = &topology.structure;
     if let Some(directive) = structure.checker_directives.get(&expression) {
@@ -751,7 +752,7 @@ fn check_initializer_expression<const COLLECT: bool>(
                 let BlockItemKind::Evaluation { expression } = item.kind else {
                     return Err(ProjectCheck::Unsupported);
                 };
-                if check_initializer_expression::<COLLECT>(topology, actual, source, storage, expression, depth + 1, failures)?
+                if check_initializer_expression::<COLLECT>(topology, actual, source, storage, expression, depth + 1, failures, visits)?
                     == StartupLane::Empty
                 {
                     return Ok(StartupLane::Empty);
@@ -763,7 +764,7 @@ fn check_initializer_expression<const COLLECT: bool>(
     let sink;
     let collection = if COLLECT {
         sink = RefCell::new(failures.as_deref_mut().ok_or(ProjectCheck::Unsupported)?);
-        Some(OrderedCallCollection { failures: &sink })
+        Some((source, OrderedCallCollection { failures: &sink, visits: Some(visits) }))
     } else { None };
     match run_initializer_call(topology, actual, expression, &ScalarType::Unit, |_, _| None, collection)? {
         ActualCallResult::Unit => Ok(StartupLane::Feasible),
@@ -778,7 +779,7 @@ fn run_initializer_call<'a>(
     occurrence: OccurrenceOrdinal,
     expected: &ScalarType,
     initialized_argument: impl Fn(OccurrenceOrdinal, &ScalarType) -> Option<&'a BigInt>,
-    collection: Option<OrderedCallCollection<'_>>,
+    collection: Option<(&SourceIdentity, OrderedCallCollection<'_, '_>)>,
 ) -> Result<ActualCallResult, ProjectCheck> {
     let Some(ModuleInitializationCallTarget::Direct {
         declaration,
@@ -856,8 +857,9 @@ fn evaluate_initializer_predicate(
 const MAX_INITIALIZER_BRANCH_DEPTH: usize = 64;
 
 #[derive(Clone, Copy)]
-struct OrderedCallCollection<'a> {
+struct OrderedCallCollection<'a, 'visits> {
     failures: &'a RefCell<&'a mut Vec<ProjectCheck>>,
+    visits: Option<&'visits [InitializationVisit]>,
 }
 
 enum ActualProjectedArguments<'a> {
@@ -905,7 +907,7 @@ impl<Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> CheckedCalls<'
         call: OccurrenceOrdinal,
         argument: NestedIntegerArgument<'_>,
         expected: &ScalarType,
-        collection: Option<(&SourceIdentity, OrderedCallCollection<'_>)>,
+        collection: Option<(&SourceIdentity, OrderedCallCollection<'_, '_>)>,
     ) -> Result<ActualCallResult, ProjectCheck> {
         let site = caller.resolved_call_site(call).ok_or(ProjectCheck::MissingRootOccurrences)?;
         let ResolvedCallTarget::ModuleCallable {
@@ -915,11 +917,9 @@ impl<Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> CheckedCalls<'
         } = &site.target else {
             return Err(ProjectCheck::Unsupported);
         };
-        let collection = match collection {
-            Some((owner, collection)) if owner == source && *expected == ScalarType::Unit => Some(collection),
-            Some(_) => return Err(ProjectCheck::Unsupported),
-            None => None,
-        };
+        if collection.is_some() && *expected != ScalarType::Unit {
+            return Err(ProjectCheck::Unsupported);
+        }
         let signature = caller.checked_call_signatures.get(&call).ok_or(ProjectCheck::MissingRootOccurrences)?;
         let projected = match argument {
             NestedIntegerArgument::Single(exact) => ActualProjectedArguments::Single(exact),
@@ -956,7 +956,7 @@ impl<Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> CheckedCalls<'
         body: &FunctionCallSites,
         source: &SourceIdentity,
         entry: IntegerRequirementEntry<'_>,
-        collection: OrderedCallCollection<'_>,
+        collection: OrderedCallCollection<'_, '_>,
     ) -> Result<ActualCallResult, ProjectCheck> {
         let terminal_projection = matches!(&entry, IntegerRequirementEntry::Projected(_));
         let mut sink = |failure| collection.failures.borrow_mut().push(project_failure(body, source, failure));
@@ -994,7 +994,7 @@ impl<Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> CheckedCalls<'
         target_source: &SourceIdentity,
         target_span: ByteSpan,
         expected: &ScalarType,
-        collection: Option<OrderedCallCollection<'_>>,
+        collection: Option<(&SourceIdentity, OrderedCallCollection<'_, '_>)>,
     ) -> Result<ActualCallResult, ProjectCheck> {
         let &(target_module, target_item) = structure.checker_direct_targets.get(&call)
             .ok_or(ProjectCheck::MissingRootOccurrences)?;
@@ -1012,6 +1012,18 @@ impl<Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> CheckedCalls<'
             return Err(ProjectCheck::Unsupported);
         }
         let body = self.calls.function_body(target_module, target_item, None).ok_or(ProjectCheck::MissingRootOccurrences)?;
+        let collection = if let Some((caller_source, collection)) = collection {
+            if caller_source != &owner.source
+                && (!ACTUAL_STARTUP || *expected != ScalarType::Unit
+                    || caller_source.project != owner.source.project || caller_source.package != owner.source.package
+                    || collection.visits.and_then(|visits| visits.get(target_module)) != Some(&InitializationVisit::Completed))
+            {
+                return Err(ProjectCheck::Unsupported);
+            }
+            Some(collection)
+        } else {
+            None
+        };
         let target = (target_module, target_item);
         let projected = match projected {
             ActualProjectedArguments::SymbolicAxis(ty, values) => {
@@ -3768,6 +3780,94 @@ mod tests {
         let cycle = format!("unit() recurse = fn {{ core.require(false, {OUTPUT}); recurse(); }};");
         let (_, prepared) = prepare(&cycle, "recurse();");
         assert_eq!(collect_package_startup_failures(&prepared), Err(ProjectCheck::Unsupported));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn startup_failure_collection_uses_only_completed_same_package_namespace_calls() {
+        let app = source("src/main.w", "collect-ready-package-root");
+        let child = source("src/child.w", "collect-ready-package-child");
+        let named_output = |code: u8| OUTPUT.replace(".code = 1", &format!(".code = {code}"));
+        let app_text = format!(r#"%%start
+            core.require(false, {});
+            lib = namespace demo "src/child.w";
+            alias = namespace demo "src/child.w";
+            unit(u8) outer = fn(value) {{
+                lib.inner(value);
+                alias.inner(9);
+            }};
+            lib.inner(7);
+            outer(8);
+            core.require(false, {});
+        %%end"#, named_output(11), named_output(44));
+        let child_text = format!(r#"%%start
+            core.require(false, {});
+            unit(u8) inner = fn(value) {{ core.require(value < 7, {}); }};
+        %%end"#, named_output(22), named_output(33));
+        let namespace = |name: &str| {
+            let start = app_text.find(&format!("{name} =")).unwrap();
+            let end = start + app_text[start..].find(';').unwrap() + 1;
+            ScalarNamespaceBinding {
+                binding: name.into(), target: child.clone(), span: ByteSpan::new(start as u32, end as u32),
+            }
+        };
+        let prepared = prepare_checker_project(
+            vec![
+                (declarations(&app, &app_text), vec![namespace("lib"), namespace("alias")]),
+                (declarations(&child, &child_text), Vec::new()),
+            ],
+            vec![app.clone(), child.clone()],
+            inputs(),
+        ).unwrap();
+        let failures = collect_package_startup_failures(&prepared).unwrap();
+        let records = failures.iter().map(|failure| {
+            let ProjectCheck::Failed { source, output, axes, state, .. } = failure else { panic!("expected authored report"); };
+            let value = if axes.is_empty() { None } else {
+                assert_eq!(axes[0].0.source, *source);
+                let mut values = state.intervals_at(0, 0).unwrap();
+                let (lo, hi) = values.next().unwrap();
+                assert_eq!(lo, hi);
+                assert!(values.next().is_none());
+                Some(lo.clone())
+            };
+            (source, output.code_value.clone(), value)
+        }).collect::<Vec<_>>();
+        assert_eq!(records, [
+            (&app, 11.into(), None),
+            (&child, 22.into(), None),
+            (&child, 33.into(), Some(7.into())),
+            (&child, 33.into(), Some(8.into())),
+            (&child, 33.into(), Some(9.into())),
+            (&app, 44.into(), None),
+        ]);
+
+        let (project, calls) = prepared.parts();
+        let (_, ordinals) = package_initialization_order(project).unwrap();
+        let (root, target) = (ordinals[&app], ordinals[&child]);
+        let ModuleInitializationDetail::Occurrences(topology) = &calls.initialization_region(root).unwrap().detail else {
+            panic!("expected checked initialization");
+        };
+        let at = app_text.find("outer(8)").unwrap() as u32;
+        let outer_call = topology.structure.blocks[topology.structure.root.0].items.iter().find_map(|item| {
+            let BlockItemKind::Evaluation { expression } = item.kind else { return None; };
+            (topology.occurrences[expression.0].span.start == at).then_some(expression)
+        }).expect("prepared outer call");
+        for not_ready in [InitializationVisit::Unseen, InitializationVisit::Started] {
+            let mut visits = vec![InitializationVisit::Unseen; project.modules.len()];
+            visits[root] = InitializationVisit::Started;
+            visits[target] = not_ready;
+            let mut actual = CheckedCalls {
+                project, calls, active: HashSet::new(), reached: HashSet::new(),
+                had_obligations: false, observer: (), symbolic_module: 0,
+            };
+            let mut output = Vec::new();
+            let result = check_initializer_expression::<true>(
+                topology, &mut actual, &app, &HashMap::new(), outer_call, 0, &mut Some(&mut output), &visits,
+            );
+            assert!(matches!(result, Err(ProjectCheck::Unsupported)));
+            assert!(output.is_empty());
+            assert!(actual.active.is_empty());
+        }
     }
 
     #[cfg(feature = "internal-checker")]
