@@ -548,6 +548,15 @@ impl<'a> ForbiddenCutPair<'a> {
 }
 
 #[cfg(feature = "internal-checker")]
+pub(super) fn integer_predicate_implies(
+    first: (IntegerRelation, &BigInt), conclusion: (IntegerRelation, &BigInt),
+    bounds: (&BigInt, &BigInt),
+) -> bool {
+    !ForbiddenCutPair::new(first, (conclusion.0.complement(), conclusion.1))
+        .hits(bounds.0, bounds.1)
+}
+
+#[cfg(feature = "internal-checker")]
 fn forbidden_guarded_cuts<'a>(
     guard: (IntegerRelation, &'a BigInt), otherwise: (IntegerRelation, &'a BigInt),
     yes: (IntegerRelation, &'a BigInt), no: (IntegerRelation, &'a BigInt),

@@ -28,7 +28,7 @@ use super::{
     },
 };
 #[cfg(feature = "internal-checker")]
-use super::{checker_flow::{observe_arbitrary_integer_returns, observe_unused_module_proof_returns, GuardedOutputClaims, ImmutableEntryRange, IntegerShowOutput}, symbolic_integer::IntegerShowConstraints};
+use super::{checker_flow::{integer_predicate_implies, observe_arbitrary_integer_returns, observe_unused_module_proof_returns, GuardedOutputClaims, ImmutableEntryRange, IntegerShowOutput}, symbolic_integer::IntegerShowConstraints, typecheck::integer_bounds};
 use crate::Diagnostic;
 use wosy_syntax::SourceIdentity;
 use wosy_syntax::{CanonicalCstRoot, CstNode, CstToken, SyntaxKind};
@@ -2245,7 +2245,7 @@ impl<'a> LocalPeerGraph<'a> {
         while let Some(&index) = self.active.get(ordinal) {
             let request = (|| {
                 let plan = self.nodes[index].plan()?;
-                plan.peer_exact_equality()?;
+                plan.peer_literal_goal()?;
                 if plan.steps.items.is_empty() {
                     return None;
                 }
@@ -2255,11 +2255,11 @@ impl<'a> LocalPeerGraph<'a> {
             if let Some((source, declaration)) = request {
                 let next = self.enroll(project, selected, plans, source, declaration);
                 let from = self.nodes[index].plan().expect("planned peer request");
-                if self.nodes[next].plan().is_some_and(|to| from.same_peer_context(to) && to.peer_exact_equality().is_some()) {
+                if self.nodes[next].plan().is_some_and(|to| from.same_peer_context(to) && to.peer_literal_goal().is_some()) {
                     self.nodes[index].next = Some(next);
                     self.activate(next);
                 }
-            } else if self.nodes[index].plan().is_some_and(|plan| plan.steps.items.is_empty() && plan.peer_exact_equality().is_some()) {
+            } else if self.nodes[index].plan().is_some_and(|plan| plan.steps.items.is_empty() && plan.peer_literal_goal().is_some()) {
                 self.nodes[index].state = LocalPeerState::Terminal(index);
             } else {
                 self.nodes[index].state = LocalPeerState::Rejected;
@@ -2289,9 +2289,8 @@ impl<'a> LocalPeerGraph<'a> {
             };
             while let Some(node) = path.pop() {
                 if let LocalPeerState::Terminal(terminal) = resolved {
-                    let value = |index: usize| self.nodes[index].plan().and_then(PlannedModuleProof::peer_exact_equality)
-                        .map(|(_, bound)| bound);
-                    if value(node) != value(terminal) {
+                    let goal = |index: usize| self.nodes[index].plan().and_then(PlannedModuleProof::peer_literal_goal);
+                    if goal(node) != goal(terminal) {
                         resolved = LocalPeerState::Rejected;
                     }
                 }
@@ -2539,12 +2538,15 @@ impl PreparedProofModule {
                 let Ok(declaration) = catalog.declaration(peer) else { continue; };
                 let requested = graph.enroll(self, selected, plans, catalog.source, declaration);
                 let Some(immediate) = graph.nodes[requested].plan() else { continue; };
-                if !plan.same_peer_target(immediate) || immediate.peer_exact_equality().is_none() {
+                let Some((peer_relation, _)) = immediate.peer_literal_goal() else { continue; };
+                if !plan.same_peer_target(immediate) {
                     continue;
                 }
                 let strict_entry = if ExactGuardGroup(plan.filter.as_deref()) == ExactGuardGroup(immediate.filter.as_deref()) {
                     None
-                } else if immediate.steps.items.is_empty() {
+                } else if immediate.steps.items.is_empty()
+                    && Some(peer_relation) == IntegerRelation::from_operator(&BinaryOperator::Equal)
+                {
                     let Some(entry) = plan.closed_entry_admitted_by_peer(immediate) else { continue; };
                     Some(entry)
                 } else {
@@ -2557,7 +2559,7 @@ impl PreparedProofModule {
             graph.resolve_terminals();
             for (index, plan, requested, strict_entry) in admitted_roots {
                 let Some(leaf) = graph.terminal(requested) else { continue; };
-                let Some((relation, bound)) = leaf.peer_exact_equality() else { continue; };
+                let Some((relation, bound)) = leaf.peer_literal_goal() else { continue; };
                 let leaf_guard = ExactGuardGroup(leaf.filter.as_deref());
                 arbitrary_groups.entry((plan.target, leaf_guard)).or_default().peer_uses.push(UnusedPeerUse {
                     index, consumer: plan, name: leaf.name, relation, bound, strict_entry,
@@ -2583,6 +2585,8 @@ impl PreparedProofModule {
                     let mut checked_peers = HashMap::new();
                     let mut first_strict_entry = None;
                     let mut other_strict_entries = HashMap::new();
+                    let equality = IntegerRelation::from_operator(&BinaryOperator::Equal).expect("checked integer equality");
+                    let mut finite_output_bounds = None;
                     for (identity, (relation, bound, consumers)) in peers {
                         let proof = paths.iter().map(|path| path.output_satisfies(relation, bound))
                             .find(|holds| *holds != Some(true)).unwrap_or(Some(true));
@@ -2604,12 +2608,26 @@ impl PreparedProofModule {
                                         continue;
                                     }
                                 }
-                                let TypedProofGoal::Literal { relation, bound: requested, .. } = &consumer.typed.goal else { continue; };
-                                outcomes[index] = if relation.accepts(bound.cmp(requested)) {
-                                    ScalarModuleProofOutcome::Proved
+                                let TypedProofGoal::Literal { relation: requested_relation, bound: requested, .. } =
+                                    &consumer.typed.goal else { continue; };
+                                if relation == equality {
+                                    outcomes[index] = if requested_relation.accepts(bound.cmp(requested)) {
+                                        ScalarModuleProofOutcome::Proved
+                                    } else {
+                                        ScalarModuleProofOutcome::Refuted
+                                    };
                                 } else {
-                                    ScalarModuleProofOutcome::Refuted
-                                };
+                                    let premise = (relation, bound);
+                                    let conclusion = (*requested_relation, requested);
+                                    let implied = premise == conclusion || finite_output_bounds
+                                        .get_or_insert_with(|| integer_bounds(consumer.typed.result_type))
+                                        .as_ref().is_some_and(|(low, high)|
+                                            integer_predicate_implies(premise, conclusion, (low, high)));
+                                    if implied {
+                                        outcomes[index] = ScalarModuleProofOutcome::Proved;
+                                    }
+                                    // Failing implication alone does not refute the consumer.
+                                }
                             }
                             CheckedPeerLeaf::Proven
                         } else if proof == Some(false) {
@@ -2737,13 +2755,13 @@ impl PlannedModuleProof<'_> {
         self.same_peer_target(peer) && ExactGuardGroup(self.filter.as_deref()) == ExactGuardGroup(peer.filter.as_deref())
     }
 
-    fn peer_exact_equality(&self) -> Option<(IntegerRelation, &BigInt)> {
+    fn peer_literal_goal(&self) -> Option<(IntegerRelation, &BigInt)> {
         if self.typed.measure.is_some() || is_null_literal_name(&self.typed.output)
             || self.typed.input_names.iter().any(|name| is_null_literal_name(name))
         {
             return None;
         }
-        let TypedProofGoal::Literal { operator: BinaryOperator::Equal, relation, bound } = &self.typed.goal
+        let TypedProofGoal::Literal { relation, bound, .. } = &self.typed.goal
             else { return None; };
         Some((*relation, bound))
     }
@@ -5733,17 +5751,20 @@ mod tests {
             ));
         }
         text.push_str("%%end");
-        let _ = take_integer_observations();
-        let _ = UNSELECTED_PEER_PLANS.with(|count| count.replace(0));
-        let _ = PROOF_CATALOG_INDEX_BUILDS.with(|count| count.replace(0));
-        assert_eq!(check_scalar_module_proofs(
-            file.clone(), &["p0", "p16", "p32"],
-            vec![ScalarProofModuleInput { source: file.clone(), text, namespaces: Vec::new() }],
-            vec![file], inputs(),
-        ).unwrap(), [ScalarModuleProofOutcome::Proved, ScalarModuleProofOutcome::Proved, ScalarModuleProofOutcome::Proved]);
-        assert_eq!(UNSELECTED_PEER_PLANS.with(|count| count.replace(0)), 30);
-        assert_eq!(PROOF_CATALOG_INDEX_BUILDS.with(|count| count.replace(0)), 1);
-        assert_eq!(take_integer_observations(), (1, 0));
+        let inequality = text.replace("out == 7", "out < 8");
+        for text in [text, inequality] {
+            let _ = take_integer_observations();
+            let _ = UNSELECTED_PEER_PLANS.with(|count| count.replace(0));
+            let _ = PROOF_CATALOG_INDEX_BUILDS.with(|count| count.replace(0));
+            assert_eq!(check_scalar_module_proofs(
+                file.clone(), &["p0", "p16", "p32"],
+                vec![ScalarProofModuleInput { source: file.clone(), text, namespaces: Vec::new() }],
+                vec![file.clone()], inputs(),
+            ).unwrap(), [ScalarModuleProofOutcome::Proved, ScalarModuleProofOutcome::Proved, ScalarModuleProofOutcome::Proved]);
+            assert_eq!(UNSELECTED_PEER_PLANS.with(|count| count.replace(0)), 30);
+            assert_eq!(PROOF_CATALOG_INDEX_BUILDS.with(|count| count.replace(0)), 1);
+            assert_eq!(take_integer_observations(), (1, 0));
+        }
     }
 
     #[cfg(feature = "internal-checker")]

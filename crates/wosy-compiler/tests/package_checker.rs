@@ -1406,6 +1406,45 @@ fn named_proof_peer_use_checks_one_independent_same_domain_leaf() {
 }
 
 #[test]
+fn named_proof_peer_use_consumes_independently_verified_typed_predicates() {
+    let identity = source();
+    let check = |leaf_guard: &str, root_guard: &str, premise: &str, intermediate: &str, goal: &str, leaf_steps: &str| {
+        check_scalar_module_proofs(
+            identity.clone(), &["root", "leaf"],
+            vec![ScalarProofModuleInput {
+                source: identity.clone(),
+                text: format!(r#"%%start
+                    i8(i8) echo = fn(value) {{ value }};
+                    proof leaf for echo(entry) -> (out) where ({leaf_guard}) ensures ({premise}) {{ {leaf_steps} }}
+                    proof middle for echo(entry) -> (out) where ({leaf_guard}) ensures ({intermediate}) {{
+                        core.use(leaf(entry));
+                    }}
+                    proof root for echo(input) -> (out) where ({root_guard}) ensures ({goal}) {{
+                        core.use(middle(input));
+                    }}
+                %%end"#),
+                namespaces: Vec::new(),
+            }],
+            vec![identity.clone()],
+            ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 },
+        ).unwrap()
+    };
+    use ScalarModuleProofOutcome::{NoApplicableInputs, Proved, Refuted, Unsupported};
+    assert_eq!(check("entry < 8", "input < 8", "out < 8", "out < 8", "out <= 7", ""), [Proved, Proved]);
+    assert_eq!(check("entry < 8", "input < 8", "out < 8", "out < 8", "out < 7", ""), [Unsupported, Proved]);
+    assert_eq!(check("entry < 8", "input < 8", "out < 8", "out <= 8", "out <= 8", ""), [Unsupported, Proved]);
+    assert_eq!(check("entry < 8", "input < 8", "out < 7", "out < 7", "out <= 7", ""), [Unsupported, Refuted]);
+    assert_eq!(check("entry < 8", "input == 6", "out < 8", "out < 8", "out <= 7", ""), [Unsupported, Proved]);
+    assert_eq!(check("entry != 0", "input != 0", "out != 0", "out != 0", "out != 0", ""), [Proved, Proved]);
+    assert_eq!(check("entry != 0", "input != 0", "out != 0", "out != 0", "out != 1", ""), [Unsupported, Proved]);
+    assert_eq!(check("entry != -128", "input != -128", "out != -128", "out != -128", "out >= -127", ""), [Proved, Proved]);
+    assert_eq!(check("entry != 127", "input != 127", "out != 127", "out != 127", "out < 127", ""), [Proved, Proved]);
+    assert_eq!(check("entry < 8", "input < 8", "out < 8", "out < 8", "out <= 7", "core.use(middle(entry));"),
+        [Unsupported, Unsupported]);
+    assert_eq!(check("false", "false", "out < 8", "out < 8", "out <= 7", ""), [NoApplicableInputs, NoApplicableInputs]);
+}
+
+#[test]
 fn named_proof_peer_use_checks_exact_singleton_where_subsets_without_filling_holes() {
     let identity = source();
     let check = |peer_where: &str, caller_where: &str, goal: &str, peers: &[&str]| {
