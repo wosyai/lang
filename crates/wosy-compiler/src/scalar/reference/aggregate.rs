@@ -1301,9 +1301,22 @@ pub(crate) enum ClosedInput {
     Plain,
 }
 
+/// Origin of the existing allocation, not the current value of its binding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct OriginalArrayReceipt {
+    origin: CfgPointId,
+    pub(crate) allocation: (usize, usize),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ClosedLocalArrayRelease {
+    pub(crate) receipt: OriginalArrayReceipt,
+    pub(crate) arm: usize,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ClosedCheckedBacking {
-    pub(crate) allocation: (usize, usize),
+    pub(crate) receipt: OriginalArrayReceipt,
     pub(crate) arms: [usize; 2],
     pub(crate) failure: Option<usize>,
 }
@@ -1324,7 +1337,7 @@ pub(crate) struct ClosedBody {
     pub(crate) input: Option<usize>,
     pub(crate) input_mixed: bool,
     pub(crate) same_array_rebinds: BTreeSet<usize>,
-    pub(crate) local_array_failure: Option<((usize, usize), usize)>,
+    pub(crate) local_array_failure: Option<ClosedLocalArrayRelease>,
     pub(crate) input_release: Option<CfgPointId>,
     pub(crate) input_calls: BTreeMap<usize, (usize, ClosedInput)>,
 }
@@ -2014,7 +2027,10 @@ fn closed_aggregates<'a>(
             continue;
         }
         let Some(&position) = facts.allocation_slots.get(&allocation) else { continue };
-        plan.local_array_failure = Some((position, *arm));
+        plan.local_array_failure = Some(ClosedLocalArrayRelease {
+            receipt: OriginalArrayReceipt { origin: allocation, allocation: position },
+            arm: *arm,
+        });
     }
     if outgoing.is_empty() {
         let mut producers = bodies.iter().filter_map(|(&key, body)| {
@@ -2056,15 +2072,18 @@ fn closed_aggregates<'a>(
                     return None;
                 }
             }
-            let allocation = *facts.allocation_slots.get(&base)?;
+            let receipt = OriginalArrayReceipt {
+                origin: base,
+                allocation: *facts.allocation_slots.get(&base)?,
+            };
             if failure.is_some_and(|arm| {
                 !body.sites.boundary.parameters.iter().all(|parameter| ordinary_value(&parameter.ty))
-                    || result.bodies.get(&key).and_then(|plan| plan.local_array_failure) != Some((allocation, arm))
+                    || result.bodies.get(&key).and_then(|plan| plan.local_array_failure) != Some(ClosedLocalArrayRelease { receipt, arm })
             })
             {
                 return None;
             }
-            Some((key, ClosedCheckedBacking { allocation, arms, failure }))
+            Some((key, ClosedCheckedBacking { receipt, arms, failure }))
         });
         if let Some((producer, plan)) = producers.next() {
             if producers.next().is_none() {

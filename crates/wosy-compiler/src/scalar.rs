@@ -3660,7 +3660,7 @@ pub(crate) mod control;
 mod occurrence_obligations;
 mod reference;
 mod static_calls;
-pub(crate) use reference::aggregate::{AggregateReservations, ClosedAggregates, ClosedBody, ClosedCall, ClosedInitializer, ClosedInitializerInput, ClosedInput, ClosedReturn};
+pub(crate) use reference::aggregate::{AggregateReservations, ClosedAggregates, ClosedBody, ClosedCall, ClosedInitializer, ClosedInitializerInput, ClosedInput, ClosedLocalArrayRelease, ClosedReturn};
 pub(crate) use static_calls::PreparedProgram;
 pub use static_calls::{
     analyze_scalar_build, PreparedScalarProject, ScalarBuildValidation,

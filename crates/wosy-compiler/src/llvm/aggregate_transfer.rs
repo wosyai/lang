@@ -1,5 +1,5 @@
 use super::*;
-use crate::scalar::{ClosedBody, ClosedCall, ClosedInitializer, ClosedInitializerInput, ClosedInput, ClosedReturn, ConcreteCallSelection, ScalarBinding};
+use crate::scalar::{ClosedBody, ClosedCall, ClosedInitializer, ClosedInitializerInput, ClosedInput, ClosedLocalArrayRelease, ClosedReturn, ConcreteCallSelection, ScalarBinding};
 use inkwell::types::AnyType;
 
 pub(super) struct InitializerEmitter<'ctx, 'plan> {
@@ -53,6 +53,13 @@ enum CallInput {
 }
 
 
+struct PendingLocalArrayRelease<'ctx> {
+    route: ClosedLocalArrayRelease,
+    base: PointerValue<'ctx>,
+    live: PointerValue<'ctx>,
+    owner: String,
+}
+
 pub(super) struct AggregateEmitter<'ctx, 'plan> {
     plan: &'plan ClosedBody,
     destination: Option<PointerValue<'ctx>>,
@@ -61,8 +68,8 @@ pub(super) struct AggregateEmitter<'ctx, 'plan> {
     ordinary_called: bool,
     base: Option<PointerValue<'ctx>>,
     registered_allocation: Option<String>,
-    failure_site: Option<((usize, usize), usize)>,
-    failure_allocation: Option<(PointerValue<'ctx>, PointerValue<'ctx>, String)>,
+    failure_site: Option<ClosedLocalArrayRelease>,
+    failure_allocation: Option<PendingLocalArrayRelease<'ctx>>,
     failure_arm_visited: bool,
     committed: bool,
     scalar_descriptor_enrolled: bool,
@@ -130,7 +137,7 @@ impl<'ctx, 'plan> AggregateEmitter<'ctx, 'plan> {
                 && plan.releases.is_empty() && plan.input_calls.is_empty()
         });
         if let Some(failure) = plan.checked_backing_producer.filter(|backing| backing.failure.is_some()) {
-            if failure_site != failure.failure.map(|arm| (failure.allocation, arm)) {
+            if failure_site != failure.failure.map(|arm| ClosedLocalArrayRelease { receipt: failure.receipt, arm }) {
                 return Err("mixed checked backing producer has no matching local release".into());
             }
         }
@@ -248,7 +255,7 @@ pub(super) fn record_allocation<'ctx>(
         return Ok(());
     };
     if aggregate.plan.checked_backing_producer.is_some_and(|plan| {
-        state.body_call_nodes.and_then(|nodes| nodes.binding_position(binding)) == Some(plan.allocation)
+        state.body_call_nodes.and_then(|nodes| nodes.binding_position(binding)) == Some(plan.receipt.allocation)
     }) && aggregate.checked_backing_base.replace((base, name.to_owned())).is_some() {
         return Err("duplicate private checked backing allocation".into());
     }
@@ -277,13 +284,21 @@ pub(super) fn record_failure_allocation<'ctx>(
     let Some(aggregate) = &mut state.aggregate else {
         return Ok(());
     };
-    let Some((position, _)) = aggregate.failure_site else {
+    let Some(route) = aggregate.failure_site else {
         return Ok(());
     };
-    if state.body_call_nodes.and_then(|nodes| nodes.binding_position(binding)) == Some(position)
-        && aggregate.failure_allocation.replace((base, live, name.to_owned())).is_some()
+    if state.body_call_nodes.and_then(|nodes| nodes.binding_position(binding))
+        == Some(route.receipt.allocation)
     {
-        return Err("duplicate local array failure allocation".into());
+        if aggregate.failure_allocation.is_some() || aggregate.failure_arm_visited {
+            return Err("duplicate local array failure allocation".into());
+        }
+        aggregate.failure_allocation = Some(PendingLocalArrayRelease {
+            route,
+            base,
+            live,
+            owner: name.to_owned(),
+        });
     }
     Ok(())
 }
@@ -296,23 +311,27 @@ pub(super) fn release_failure_allocation<'ctx>(
     let Some(aggregate) = &mut state.aggregate else {
         return Ok(());
     };
-    let Some((_, arm)) = aggregate.failure_site else {
+    let Some(route) = aggregate.failure_site else {
         return Ok(());
     };
     let ordinal = state.body_call_nodes.and_then(|nodes| nodes.block_ordinal(block))
         .ok_or_else(|| "missing bound block for local array failure".to_owned())?;
-    if ordinal != arm {
+    if ordinal != route.arm {
         return Ok(());
     }
     if std::mem::replace(&mut aggregate.failure_arm_visited, true) {
         return Err("duplicate local array failure arm".into());
     }
-    let (base, live, owner) = aggregate.failure_allocation.take()
-        .ok_or_else(|| "missing original local array failure allocation".to_owned())?;
+    let PendingLocalArrayRelease { route: recorded, base, live, owner } =
+        aggregate.failure_allocation.take()
+            .ok_or_else(|| "missing original local array failure allocation".to_owned())?;
+    if recorded != route {
+        return Err("planned local array release does not match the recorded receipt".into());
+    }
     if !state.automatic_return_result_owners.is_empty() || !state.joined_return_bindings.is_empty()
         || state.runtime_array_owners.keys().any(|name| name != &owner)
     {
-        if aggregate.plan.checked_backing_producer.is_some_and(|plan| plan.failure == Some(arm)) {
+        if aggregate.plan.checked_backing_producer.is_some_and(|plan| plan.failure == Some(route.arm)) {
             return Err("mixed checked backing release overlaps another owner".into());
         }
         return Ok(());
