@@ -609,8 +609,16 @@ impl AggregateFlowResult {
         }
     }
 
+    fn proved_literal_array_route(&self) -> Option<LiteralArrayRoute> {
+        let route = self.literal_array_route?;
+        (!self.literal_array_unknown
+            && (!matches!(route, LiteralArrayRoute::Replacement { unit: Some(_), .. })
+                || self.literal_array_join.complete()))
+            .then_some(route)
+    }
+
     pub(super) fn has_observations(&self) -> bool {
-        (self.literal_array_route.is_some() && !self.literal_array_unknown)
+        self.proved_literal_array_route().is_some()
             || (self.checked_producer_authoritative && !self.checked_producer_backing.is_empty())
             || self.checked_backing_assignment.is_some() || self.checked_backing_forward.is_some()
             || self.scalar_descriptor_assignment.is_some() || !self.array_returns.is_empty() || !self.array_rebinds.is_empty()
@@ -2282,20 +2290,15 @@ fn install_literal_array_plans(
         if !body.is_monomorphic || caller.2.is_some() {
             continue;
         }
-        let Some(facts) = body.facts.filter(|facts| !facts.literal_array_unknown) else { continue };
         let Some(LiteralArrayRoute::Replacement { original, write, exit, block, unit }) =
-            facts.literal_array_route else { continue };
-        if unit.is_some() && !facts.literal_array_join.complete() {
-            continue;
-        }
+            body.facts.and_then(AggregateFlowResult::proved_literal_array_route) else { continue };
         let Some(callee) = target_body(declarations, body.cfg, write.rhs) else { continue };
         let Some(leaf) = bodies.get(&callee) else { continue };
         if !leaf.is_monomorphic || callee.2.is_some() {
             continue;
         }
-        let Some(facts) = leaf.facts.filter(|facts| !facts.literal_array_unknown) else { continue };
         let Some(LiteralArrayRoute::FreshLeaf { allocation: fresh, output: final_output }) =
-            facts.literal_array_route else { continue };
+            leaf.facts.and_then(AggregateFlowResult::proved_literal_array_route) else { continue };
         let [returned] = leaf.sites.boundary.results.as_slice() else { continue };
         let Some(signature) = body.sites.checked_call_signatures.get(&write.producer) else { continue };
         let [output] = signature.outputs.outputs.as_slice() else { continue };
@@ -3188,6 +3191,123 @@ mod tests {
             let mut plans = ClosedAggregates::default();
             enroll_literal_array_pair(&mut plans, pair, rejected);
             assert!(plans.bodies.is_empty());
+        }
+    }
+
+    #[test]
+    fn prepared_array_unit_cfg_enrolls_one_owner_exit_for_both_paths() {
+        let source = SourceIdentity::new("project".into(), "package".into(), "metadata".into(), "r1".into());
+        let span = ByteSpan::new(0, 0);
+        let binding = ReferenceBindingId {
+            source: source.clone(), function_span: span, declaration_span: span,
+            block_span: span, kind: ReferenceBindingKind::Declared,
+        };
+        let place = ReferencePlaceId {
+            source: source.clone(), function_span: span, declaration_span: span, block_span: span,
+            binding: binding.clone(), projections: Vec::new(),
+            place: ScalarPlace::Name { name: String::new(), span },
+        };
+        let unit = LiteralArrayUnit {
+            expression: OccurrenceOrdinal(4), condition: CfgPointId(4), branch: CfgPointId(5),
+            then_entry: CfgPointId(6), then_exit: CfgPointId(9), then_block: BlockOrdinal(1),
+            then_scope: ReferenceScopeId(1), join: CfgPointId(10),
+        };
+        let mut pair = synthetic_literal_array_pair();
+        pair.original.placeholder = CfgPointId(2);
+        pair.original.bind = CfgPointId(3);
+        pair.write.rhs = CfgPointId(7);
+        pair.write.writer = CfgPointId(8);
+        pair.write.producer = OccurrenceOrdinal(5);
+        pair.write.destination = OccurrenceOrdinal(6);
+        pair.exit = CfgPointId(11);
+        let facts = AggregateFlowFacts {
+            allocations: BTreeMap::from([(binding.clone(), pair.original.bind)]),
+            literal_array_bind: Some(pair.original),
+            literal_array_write: Some(pair.write),
+            literal_array_unit: Some(unit),
+            scope_exits: BTreeMap::from([(pair.exit, pair.block)]),
+            ..AggregateFlowFacts::default()
+        };
+        let boolean = || ScalarExpression::Boolean { value: false, span };
+        let point = |id, scope, kind, successors: &[usize]| ReferenceFlowPoint {
+            id: CfgPointId(id), kind, source_span: SourceSpan::new(source.clone(), span),
+            scope: ReferenceScopeId(scope), possible_origins: None,
+            successors: successors.iter().copied().map(CfgPointId).collect(),
+        };
+        // These are compiler nodes only; no parser or emitter participates.
+        let points = [
+            point(0, 0, CfgPointKind::Entry, &[1]),
+            point(1, 0, CfgPointKind::ScopeEnter, &[2]),
+            point(2, 0, CfgPointKind::Evaluate(boolean()), &[3]),
+            point(3, 0, CfgPointKind::Bind { binding: binding.clone() }, &[4]),
+            point(4, 0, CfgPointKind::Evaluate(boolean()), &[5]),
+            point(5, 0, CfgPointKind::Branch { condition: boolean() }, &[6, 10]),
+            point(6, 1, CfgPointKind::ScopeEnter, &[7]),
+            point(7, 1, CfgPointKind::Call {
+                expression: ScalarExpression::Call {
+                    receiver: None, name: String::new(), receiver_span: None, name_span: span,
+                    type_arguments: Vec::new(), arguments: Vec::new(), overload_selection: None, span,
+                },
+                output: 0, argument_points: Vec::new(),
+                target: ResolvedCallTarget::ModuleCallable {
+                    source: source.clone(), declaration_span: span, concrete: ConcreteCallSelection::Declaration,
+                },
+            }, &[8]),
+            point(8, 1, CfgPointKind::Assign {
+                target: place, rhs_point: pair.write.rhs,
+                previous_origins: BTreeSet::new(), previous_loans: Vec::new(),
+            }, &[9]),
+            point(9, 1, CfgPointKind::ScopeExit, &[10]),
+            point(10, 0, CfgPointKind::Join, &[11]),
+            point(11, 0, CfgPointKind::ScopeExit, &[]),
+        ];
+        let observe = |points: &[ReferenceFlowPoint], path: &[usize], result: &mut AggregateFlowResult| {
+            let mut state = AggregateEdgeState::default();
+            for &id in path {
+                facts.visit_literal_array(&points[id], &mut state, result);
+            }
+        };
+        let writer = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+        let fallthrough = [0, 1, 2, 3, 4, 5, 10, 11];
+        let mut observed = AggregateFlowResult::default();
+        observe(&points, &writer, &mut observed);
+        assert!(observed.proved_literal_array_route().is_none());
+        observe(&points, &fallthrough, &mut observed);
+        let Some(LiteralArrayRoute::Replacement { original, write, exit, block, unit: proved }) =
+            observed.proved_literal_array_route() else { panic!("missing checked joined ownership") };
+        assert_eq!((original, write, exit, block, proved),
+            (pair.original, pair.write, pair.exit, pair.block, Some(unit)));
+
+        let mut plans = ClosedAggregates::default();
+        enroll_literal_array_pair(&mut plans, LiteralArrayPair { original, write, exit, block, unit: proved, ..pair },
+            LiteralArrayParameters::default());
+        let caller = &plans.bodies[&pair.caller];
+        assert!(matches!(caller.literal_array, Some(ClosedLiteralArray::Replacement {
+            unit: Some(ClosedLiteralArrayUnit { expression: 4, then_block: 1 }), ..
+        })));
+        assert_eq!(caller.scope_exits, BTreeMap::from([(0, CfgPointId(11))]));
+        assert!(caller.releases.is_empty() && caller.input_release.is_none());
+
+        let mut different_binding = points.clone();
+        let CfgPointKind::Assign { target, .. } = &mut different_binding[8].kind else { unreachable!() };
+        target.binding.declaration_span = ByteSpan::new(1, 2);
+        target.declaration_span = target.binding.declaration_span;
+
+        let mut wrong_edges = points.clone();
+        wrong_edges[5].successors.swap(0, 1);
+
+        let mut unexpected_effect = points.clone();
+        unexpected_effect[4].kind = CfgPointKind::Bind { binding: binding.clone() };
+
+        let mut wrong_root_exit = points;
+        wrong_root_exit[11].kind = CfgPointKind::Join;
+
+        for changed in [different_binding, wrong_edges, unexpected_effect, wrong_root_exit] {
+            let mut observed = AggregateFlowResult::default();
+            observe(&changed, &writer, &mut observed);
+            observe(&changed, &fallthrough, &mut observed);
+            assert!(observed.literal_array_unknown);
+            assert!(observed.proved_literal_array_route().is_none());
         }
     }
 
