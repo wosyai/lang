@@ -3404,6 +3404,45 @@ fn lowers_integer_literals_in_binary_expressions_to_the_left_operand_width() {
 }
 
 #[test]
+fn emits_contextual_integer_operators_with_literals_on_either_side() {
+    let code = r#"%%start
+u8(u32) stamp = fn(depth) {
+    u8[1] scratch = [0];
+    scratch[0] = 16 + core.int_trunc<u8>(depth);
+    scratch[0]
+};
+u8(u8) divide_left = fn(value) { 233 / value };
+u8(u8) divide_right = fn(value) { value / 233 };
+i8(i8) signed_left = fn(value) { -7 / value };
+u8(u8) shift_unsigned = fn(value) { 233 >> value };
+i8(i8) shift_signed = fn(value) { -7 >> value };
+u8 seed = stamp(3);
+u8 quotient = 233 / seed;
+%%end"#;
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let project = prepare_initializer_test(code, layout);
+        let checked = analyze_scalar_build(&project);
+        assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+        for llvm in [
+            emit_scalar_build_single_module_llvm(&checked).unwrap().to_text(),
+            emit_scalar_build_project_llvm(&checked).unwrap().to_text(),
+        ] {
+            assert!(llvm.contains("add i8 16, %int_trunc"), "{llvm}");
+            let left_divisions = llvm.lines().filter(|line| {
+                line.contains("udiv i8 -23, ") || line.contains("udiv i8 233, ")
+            }).count();
+            assert_eq!(left_divisions, 2, "{llvm}");
+            assert!(llvm.lines().any(|line| line.contains("udiv i8 %")
+                && (line.ends_with(", -23") || line.ends_with(", 233"))), "{llvm}");
+            assert!(llvm.contains("sdiv i8 -7, "), "{llvm}");
+            assert!(llvm.contains("lshr i8 -23, %value")
+                || llvm.contains("lshr i8 233, %value"), "{llvm}");
+            assert!(llvm.contains("ashr i8 -7, %value"), "{llvm}");
+        }
+    }
+}
+
+#[test]
 fn emits_multiple_unit_conditionals_in_a_branch() {
     let source = SourceIdentity::new(
         "project".into(),

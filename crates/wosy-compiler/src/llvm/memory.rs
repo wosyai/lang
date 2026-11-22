@@ -695,7 +695,7 @@ pub(super) fn emit_typed_expression<'ctx, 'module>(
         (ScalarExpression::Integer { value, .. }, ty) if integer_width(ty).is_some() => Ok(
             EmitValue::Basic(integer_constant(context, ty, value)?.into()),
         ),
-        (ScalarExpression::If { .. } | ScalarExpression::Block(_), ty)
+        (ScalarExpression::Binary { .. } | ScalarExpression::If { .. } | ScalarExpression::Block(_), ty)
             if integer_width(ty).is_some() =>
         {
             emit_contextual_numeric(context, state, expression, ty, ExpressionPath::Single)

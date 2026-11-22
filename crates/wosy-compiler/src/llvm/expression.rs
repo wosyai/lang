@@ -346,7 +346,7 @@ pub(super) fn emit_project_typed_expression<'ctx, 'module>(
         ScalarExpression::Integer { value, .. } if integer_width(expected).is_some() => Ok(
             EmitValue::Basic(integer_constant(context, expected, value)?.into()),
         ),
-        ScalarExpression::If { .. } | ScalarExpression::Block(_)
+        ScalarExpression::Binary { .. } | ScalarExpression::If { .. } | ScalarExpression::Block(_)
             if integer_width(expected).is_some() =>
         {
             emit_contextual_numeric(
@@ -2449,23 +2449,32 @@ pub(super) fn emit_contextual_numeric<'ctx, 'module>(
     path: ExpressionPath<'_>,
 ) -> Result<EmitValue<'ctx>, String> {
     let float = matches!(expected, ScalarType::F32 | ScalarType::F64);
+    let integer = !float && integer_width(expected).is_some();
     match expression {
+        ScalarExpression::Integer { value, .. } if integer => {
+            Ok(EmitValue::Basic(integer_constant(context, expected, value)?.into()))
+        }
         ScalarExpression::Float { value, .. } if float => {
             Ok(EmitValue::Basic(float_constant(context, expected, *value)?.into()))
         }
-        ScalarExpression::Unary { operator: operator @ crate::scalar::UnaryOperator::Negate, operand, .. }
-            if float =>
+        ScalarExpression::Unary { operator, operand, .. }
+            if matches!(operator, crate::scalar::UnaryOperator::Negate) && (float || integer)
+                || matches!(operator, crate::scalar::UnaryOperator::BitwiseNot) && integer =>
         {
             let operand = take_basic(emit_contextual_numeric(context, state, operand, expected, path)?)?;
             emit_unary_value(state, operator, operand)
         }
         ScalarExpression::Binary { operator, left, right, .. }
-            if float && matches!(operator, BinaryOperator::Add | BinaryOperator::Subtract
-                | BinaryOperator::Multiply | BinaryOperator::Divide | BinaryOperator::Remainder) =>
+            if (float || integer) && matches!(operator, BinaryOperator::Add | BinaryOperator::Subtract
+                | BinaryOperator::Multiply | BinaryOperator::Divide | BinaryOperator::Remainder)
+                || integer && matches!(operator, BinaryOperator::BitAnd | BinaryOperator::BitOr
+                    | BinaryOperator::BitXor | BinaryOperator::ShiftLeft | BinaryOperator::ShiftRight) =>
         {
             let left = emit_contextual_numeric(context, state, left, expected, path)?;
             let right = emit_contextual_numeric(context, state, right, expected, path)?;
-            emit_binary_values(state, operator, left, right, false)
+            let unsigned = matches!(expected, ScalarType::U8 | ScalarType::U16 | ScalarType::U32
+                | ScalarType::U64 | ScalarType::U128);
+            emit_binary_values(state, operator, left, right, unsigned)
         }
         ScalarExpression::If { condition, then_branch, else_branch, .. } => {
             let condition = take_basic(path.emit(context, state, condition)?)?.into_int_value();
