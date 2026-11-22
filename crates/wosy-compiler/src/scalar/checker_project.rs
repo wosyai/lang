@@ -1719,7 +1719,7 @@ impl PreparedProofModule {
                 if let Some(observer) = observer {
                     outcomes[*index] = module_proof_outcome(observer.outcome());
                 }
-            } else if !matches!(plan.typed.goal, TypedProofGoal::Literal { .. }) {
+            } else if !matches!(plan.typed.goal, TypedProofGoal::Literal { .. } | TypedProofGoal::Conjunction(_)) {
                 continue;
             } else if plan.steps.items.is_empty() {
                 let key = (plan.target, ExactGuardGroup(plan.filter.as_deref()));
@@ -1736,10 +1736,9 @@ impl PreparedProofModule {
             match observe_arbitrary_integer_returns(body, guard.0) {
                 Some(Ok(ProofCoverage::Applicable(paths))) => {
                     for (index, plan) in group {
-                        let TypedProofGoal::Literal { relation, bound, .. } = &plan.typed.goal else { continue; };
                         let mut holds = Some(true);
                         for path in &paths {
-                            holds = path.output_satisfies(*relation, bound);
+                            holds = plan.typed.goal.holds_on_returned_path(path);
                             if holds != Some(true) {
                                 break;
                             }
@@ -1915,6 +1914,7 @@ impl SelectedProofObserver<'_> {
         if guard.accepts(arguments) {
             let holds = match self.goal {
                 TypedProofGoal::Literal { relation, bound, .. } => Some(relation.accepts(value.cmp(bound))),
+                TypedProofGoal::Conjunction(atoms) => Some(atoms.iter().all(|(relation, bound)| relation.accepts(value.cmp(bound)))),
                 TypedProofGoal::EntryEqual { slot } => arguments.get(*slot).map(|entry| *entry == value),
             };
             self.coverage = match holds {
@@ -2061,7 +2061,43 @@ enum TypedProofGoal {
         relation: IntegerRelation,
         bound: BigInt,
     },
+    Conjunction(Vec<(IntegerRelation, BigInt)>),
     EntryEqual { slot: usize },
+}
+
+#[cfg(feature = "internal-checker")]
+impl TypedProofGoal {
+    fn holds_on_returned_path(&self, path: &super::checker_flow::IntegerReturningPath<'_>) -> Option<bool> {
+        match self {
+            Self::Literal { relation, bound, .. } => path.output_satisfies(*relation, bound),
+            Self::Conjunction(atoms) => {
+                for (relation, bound) in atoms {
+                    if !path.output_satisfies(*relation, bound)? {
+                        return Some(false);
+                    }
+                }
+                Some(true)
+            }
+            Self::EntryEqual { .. } => None,
+        }
+    }
+}
+
+fn checked_literal_output_goal(
+    comparison: IntegerComparison<'_>, output: &str, inputs: &[String], ty: &ScalarType,
+) -> Result<(BinaryOperator, IntegerRelation, BigInt), ProjectCheck> {
+    if comparison.name != output {
+        return Err(if inputs.iter().any(|input| input == comparison.name) {
+            ProjectCheck::Unsupported
+        } else {
+            ProjectCheck::InvalidProof
+        });
+    }
+    if !integer_literal_fits_type(comparison.bound.as_ref(), ty) {
+        return Err(ProjectCheck::InvalidProof);
+    }
+    let relation = IntegerRelation::from_operator(comparison.operator).ok_or(ProjectCheck::Unsupported)?;
+    Ok((comparison.operator.clone(), relation, comparison.bound.into_owned()))
 }
 
 struct TypedProofPostcondition<'a> {
@@ -2445,22 +2481,23 @@ fn typed_proof_postcondition<'a, const AUDIT_INDUCTION: bool>(
     if !is_integer_type(&result.ty) {
         return Err(ProjectCheck::Unsupported);
     }
-    let goal = if let Some(ensures) = IntegerComparison::from_expression(&ensures) {
-        if ensures.name != output {
-            return Err(if input_names.iter().any(|input| input == ensures.name) {
-                ProjectCheck::Unsupported
-            } else {
-                ProjectCheck::InvalidProof
-            });
+    let goal = if matches!(&ensures, ScalarExpression::Binary { operator: BinaryOperator::And, .. }) {
+        let mut pending = vec![&ensures];
+        let mut atoms = Vec::new();
+        while let Some(expression) = pending.pop() {
+            if let ScalarExpression::Binary { operator: BinaryOperator::And, left, right, .. } = expression {
+                pending.push(right);
+                pending.push(left);
+                continue;
+            }
+            let comparison = IntegerComparison::from_expression(expression).ok_or(ProjectCheck::Unsupported)?;
+            let (_, relation, bound) = checked_literal_output_goal(comparison, output, &input_names, &result.ty)?;
+            atoms.push((relation, bound));
         }
-        if !integer_literal_fits_type(ensures.bound.as_ref(), &result.ty) {
-            return Err(ProjectCheck::InvalidProof);
-        }
-        TypedProofGoal::Literal {
-            operator: ensures.operator.clone(),
-            relation: IntegerRelation::from_operator(ensures.operator).ok_or(ProjectCheck::Unsupported)?,
-            bound: ensures.bound.into_owned(),
-        }
+        TypedProofGoal::Conjunction(atoms)
+    } else if let Some(ensures) = IntegerComparison::from_expression(&ensures) {
+        let (operator, relation, bound) = checked_literal_output_goal(ensures, output, &input_names, &result.ty)?;
+        TypedProofGoal::Literal { operator, relation, bound }
     } else {
         let ScalarExpression::Binary { operator: BinaryOperator::Equal, left, right, .. } = &ensures else {
             return Err(ProjectCheck::Unsupported);
