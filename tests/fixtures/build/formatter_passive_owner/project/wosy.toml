@@ -1,0 +1,87 @@
+[package]
+name = "formatter_passive_owner"
+default_target = "nested-native"
+
+[dependencies.std]
+path = "stdlib"
+
+[comments]
+categories = []
+
+[builders.native]
+command = ["python", "scripts/build.py", "native"]
+args = []
+toolchain_identity = "llvm-18.1.4"
+
+[builders.wasm]
+command = ["python", "scripts/build.py", "wasm"]
+args = []
+toolchain_identity = "llvm-18.1.4"
+
+[runners.native]
+command = ["python", "scripts/run.py", "native"]
+args = []
+
+[runners.wasm]
+command = ["python", "scripts/run.py", "wasm"]
+args = []
+
+[targets.nested-native]
+root = "src/nested.w"
+
+[targets.nested-native.artifacts.main]
+artifact = "Main"
+
+[targets.nested-native.artifacts.main.profiles.dev]
+backend = "llvm"
+output = "native"
+builder = "native"
+run_runner = "native"
+
+[targets.nested-native.profiles.dev]
+main_artifact = "main"
+
+[targets.nested-wasm]
+root = "src/nested.w"
+
+[targets.nested-wasm.artifacts.main]
+artifact = "Main"
+
+[targets.nested-wasm.artifacts.main.profiles.dev]
+backend = "llvm"
+output = "wasm-wasip1"
+builder = "wasm"
+run_runner = "wasm"
+
+[targets.nested-wasm.profiles.dev]
+main_artifact = "main"
+
+[targets.named-native]
+root = "src/named.w"
+
+[targets.named-native.artifacts.main]
+artifact = "Main"
+
+[targets.named-native.artifacts.main.profiles.dev]
+backend = "llvm"
+output = "native"
+builder = "native"
+run_runner = "native"
+
+[targets.named-native.profiles.dev]
+main_artifact = "main"
+
+[targets.named-wasm]
+root = "src/named.w"
+
+[targets.named-wasm.artifacts.main]
+artifact = "Main"
+
+[targets.named-wasm.artifacts.main.profiles.dev]
+backend = "llvm"
+output = "wasm-wasip1"
+builder = "wasm"
+run_runner = "wasm"
+
+[targets.named-wasm.profiles.dev]
+main_artifact = "main"

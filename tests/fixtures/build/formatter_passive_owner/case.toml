@@ -1,0 +1,45 @@
+shared_stdlib = true
+
+[[steps]]
+command = ["wosy", "build", "nested-native"]
+exit = 0
+
+[[steps]]
+command = ["wosy", "build", "nested-wasm"]
+exit = 0
+
+[[steps]]
+command = ["wosy", "build", "named-native"]
+exit = 0
+
+[[steps]]
+command = ["wosy", "build", "named-wasm"]
+exit = 0
+
+[[assert]]
+command = ["wosy", "run", "nested-native"]
+exit = 0
+stdout = "expected/nested.stdout"
+stderr = "expected/verified.stderr"
+exact = true
+
+[[assert]]
+command = ["wosy", "run", "nested-wasm"]
+exit = 0
+stdout = "expected/nested.stdout"
+stderr = "expected/verified.stderr"
+exact = true
+
+[[assert]]
+command = ["wosy", "run", "named-native"]
+exit = 0
+stdout = "expected/named.stdout"
+stderr = "expected/verified.stderr"
+exact = true
+
+[[assert]]
+command = ["wosy", "run", "named-wasm"]
+exit = 0
+stdout = "expected/named.stdout"
+stderr = "expected/verified.stderr"
+exact = true
