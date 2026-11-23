@@ -134,7 +134,7 @@ mod tests {
         let source = SourceIdentity::new(
             "project".into(), "package".into(), "src/main.w".into(), "r1".into(),
         );
-        let text = "%%start\nu8() example = fn {\n\tu8 result =? 3;\n\tresult\n};\n%%end";
+        let text = "%%start\nbool() example = fn {\n\tbool result =? true;\n\tresult\n};\n%%end";
         let output = parse_source(source.clone(), text.into(), &[]);
         assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
         let mut scalar = derive_scalar_program(&output.result);
@@ -142,7 +142,7 @@ mod tests {
             panic!("{:?}", scalar.diagnostics);
         };
         assert_eq!(diagnostic.code, "B0003");
-        assert_eq!(diagnostic.message, "fallible allocation currently requires a local i32 initialized by an integer literal");
+        assert_eq!(diagnostic.message, "fallible allocation currently requires a local integer initialized by an integer literal");
         let range = diagnostic.labels[0].span.range;
         assert_eq!(&text[range.start as usize..range.end as usize], "=?");
         assert!(emit_scalar_llvm(&scalar).is_err());

@@ -341,6 +341,7 @@ fn prepared_direct_local_reborrow_owner_requires_the_exact_declared_scope() {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct GuardedScalarAllocation {
     binding: ReferenceBindingId,
+    ty: ScalarType,
     condition: usize,
     branch: CfgPointId,
     present_on_then: bool,
@@ -348,6 +349,7 @@ pub(crate) struct GuardedScalarAllocation {
 
 impl GuardedScalarAllocation {
     pub(crate) fn binding(&self) -> &ReferenceBindingId { &self.binding }
+    pub(crate) fn ty(&self) -> &ScalarType { &self.ty }
     pub(crate) fn condition(&self) -> usize { self.condition }
     pub(crate) fn branch(&self) -> CfgPointId { self.branch }
     pub(crate) fn present_on_then(&self) -> bool { self.present_on_then }
@@ -1052,7 +1054,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
         ordinal: OccurrenceOrdinal,
         scope: ReferenceScopeId,
     ) -> Result<Option<(ReferenceBindingId, bool)>, ReferenceAnalysisError> {
-        let Some(fallible_i32_bindings) = &self.proof_points.fallible_allocation_bindings else {
+        let Some(fallible_bindings) = &self.proof_points.fallible_allocation_bindings else {
             return Ok(None);
         };
         if self.call_sites.structure.checked_types.expressions.get(&ordinal) != Some(&ScalarType::Bool) {
@@ -1083,7 +1085,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
             let address = self.expression_ordinal(parent, address_edge);
             let place = self.place_ordinal(OccurrenceParent::Expression(address), OccurrenceEdge::ExpressionPlace);
             if let Some(PreparedPlaceRoot::Lexical(binding)) = self.prepared_place_root(place, *place_span)? {
-                if fallible_i32_bindings.get(binding) == Some(&scope) {
+                if fallible_bindings.get(binding).is_some_and(|(recorded_scope, _)| *recorded_scope == scope) {
                     return Ok(Some((binding.clone(), present_on_then)));
                 }
             }
@@ -4037,8 +4039,8 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     if binding.is_allocation {
                         self.cfg.allocations.insert(id.clone());
                     }
-                    if binding.fallible_assignment.is_some() && receiver.ty == ScalarType::I32 {
-                        self.proof_points.fallible_allocation_bindings.get_or_insert_with(HashMap::new).insert(id.clone(), scope);
+                    if binding.fallible_assignment.is_some() && is_integer_type(&receiver.ty) {
+                        self.proof_points.fallible_allocation_bindings.get_or_insert_with(HashMap::new).insert(id.clone(), (scope, receiver.ty.clone()));
                         self.local_borrow = None;
                     }
                     let origins = match value {
@@ -5992,7 +5994,7 @@ struct ReferenceTransferCfg<'a> {
     allocations: &'a BTreeSet<ReferenceBindingId>,
     checked_join_values: &'a [(CfgPointId, [Option<CfgPointId>; 2])],
     checked_block_values: &'a [(CfgPointId, CfgPointId)],
-    fallible_allocation_bindings: Option<&'a HashMap<ReferenceBindingId, ReferenceScopeId>>,
+    fallible_allocation_bindings: Option<&'a HashMap<ReferenceBindingId, (ReferenceScopeId, ScalarType)>>,
     guarded_allocation_edges: &'a [(CfgPointId, super::control::GuardedAllocationEdge)],
     checked_binding_initializers: &'a [(CfgPointId, CfgPointId)],
     resolved_checked_call_outputs: &'a [CfgPointId],
@@ -12686,10 +12688,14 @@ fn build_function_reference_cfg(
                 builder.proof_points.guarded_scalar_condition,
                 &builder.proof_points.fallible_allocation_bindings,
             ) {
-                if *branch == condition_branch && bindings.len() == 1 && bindings.contains_key(&edge.binding) {
-                    if let Some(then) = builder.cfg.points[branch.0].successors.first() {
+                if *branch == condition_branch && bindings.len() == 1 {
+                    if let (Some(then), Some((_, ty))) = (
+                        builder.cfg.points[branch.0].successors.first(),
+                        bindings.get(&edge.binding),
+                    ) {
                         builder.cfg.guarded_scalar_allocation = Some(Box::new(GuardedScalarAllocation {
                             binding: edge.binding.clone(),
+                            ty: ty.clone(),
                             condition: condition.0,
                             branch: *branch,
                             present_on_then: *then == edge.present,

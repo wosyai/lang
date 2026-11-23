@@ -1042,10 +1042,10 @@ pub(super) fn emit_managed_allocation_branch<'ctx>(
     Ok(allocation)
 }
 
-#[derive(Clone, Copy)]
 pub(super) struct GuardedScalarSite {
     declaration: ByteSpan,
     scope: ByteSpan,
+    ty: ScalarType,
     condition: usize,
     present_on_then: bool,
 }
@@ -1060,6 +1060,7 @@ impl GuardedScalarSite {
         Some(Self {
             declaration: proof.binding().declaration_span,
             scope: proof.binding().block_span,
+            ty: proof.ty().clone(),
             condition: proof.condition(),
             present_on_then: proof.present_on_then(),
         })
@@ -1080,7 +1081,7 @@ pub(super) fn bind_guarded_scalar<'ctx>(
     let [receiver] = binding.receivers.as_slice() else {
         return Err("fallible scalar allocation requires a single receiver".into());
     };
-    let site = state.guarded_scalar.ok_or_else(|| format!(
+    let site = state.guarded_scalar.as_ref().ok_or_else(|| format!(
         "fallible scalar allocation has no prepared ownership for {} at {:?}", receiver.name, receiver.name_span,
     ))?;
     if site.declaration != receiver.name_span {
@@ -1089,7 +1090,14 @@ pub(super) fn bind_guarded_scalar<'ctx>(
             site.declaration, receiver.name, receiver.name_span,
         ));
     }
-    if receiver.ty != ScalarType::I32 || state.guarded_scalar_owner.is_some() {
+    let value_width = match value {
+        BasicValueEnum::IntValue(value) => value.get_type().get_bit_width(),
+        _ => return Err("guarded scalar initializer is not an integer".into()),
+    };
+    if receiver.ty != site.ty
+        || memory::integer_width(&receiver.ty) != Some(value_width)
+        || state.guarded_scalar_owner.is_some()
+    {
         return Err("invalid guarded scalar allocation binding".into());
     }
     declare_core_runtime(context, state.module);
@@ -1109,7 +1117,6 @@ pub(super) fn bind_guarded_scalar<'ctx>(
     state.builder.build_unconditional_branch(continuation).map_err(builder_error)?;
     state.builder.position_at_end(continuation);
     state.storage.insert(receiver.name.clone(), (backing, receiver.ty.clone()));
-    state.guarded_scalar = Some(site);
     state.guarded_scalar_owner = Some(GuardedScalarOwner { backing, present });
     Ok(())
 }
@@ -1118,7 +1125,7 @@ pub(super) fn guarded_scalar_condition<'ctx>(
     state: &EmitState<'ctx, '_>,
     expression: &ScalarExpression,
 ) -> Result<Option<EmitValue<'ctx>>, String> {
-    let Some(site) = state.guarded_scalar else { return Ok(None) };
+    let Some(site) = &state.guarded_scalar else { return Ok(None) };
     if state.body_call_nodes.and_then(|nodes| nodes.expression_ordinal(expression)) != Some(site.condition) {
         return Ok(None);
     }
@@ -1137,7 +1144,7 @@ pub(super) fn release_guarded_scalar<'ctx>(
     state: &mut EmitState<'ctx, '_>,
     scope: ByteSpan,
 ) -> Result<(), String> {
-    if !state.guarded_scalar.is_some_and(|site| site.scope == scope) {
+    if !state.guarded_scalar.as_ref().is_some_and(|site| site.scope == scope) {
         return Ok(());
     }
     let Some(owner) = state.guarded_scalar_owner.take() else { return Ok(()) };
