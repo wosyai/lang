@@ -541,6 +541,10 @@ pub enum CfgPointKind {
         place: ReferencePlaceId,
         loan: ReferenceLoanId,
     },
+    ReborrowThrough {
+        place: ScalarPlace,
+        pointer_point: CfgPointId,
+    },
     Bind {
         binding: ReferenceBindingId,
     },
