@@ -6284,7 +6284,7 @@ fn check_canonical_induction_returns<'a>(
         TypedProofGoal::Literal { relation, bound, .. } | TypedProofGoal::Universal { relation, bound } => (relation, bound),
         _ => return Err(ProjectCheck::Unsupported),
     };
-    if &rank.descending.0.ty != typed.result_type || !body.allocation_length_calls.is_empty() {
+    if !body.allocation_length_calls.is_empty() {
         return Err(ProjectCheck::Unsupported);
     }
     let output_at = |block: super::reference::BlockOrdinal| {
@@ -9477,6 +9477,58 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
             assert!(matches!(run(proofs, actual, ScalarCheckerScope::CurrentPackage),
                 Err(ScalarOrderedCheckerOutcome::Unsupported)));
         }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordered_rank_types_are_independent_of_checked_result_types() {
+        let app = source("src/main.w", "ordered-rank-result-types");
+        let program = r#"%%start
+            u16(i8) descend = fn(value) { if (value == -100) { 1000 } else { descend(value - 1) } };
+            proof rank for descend(entry) -> (out) where (entry >= -100) ensures (out == 1000) decreases (entry) {
+                if (entry == -100) { core.show(out == 1000); } else { core.use(rank(entry - 1)); }
+            }
+        %%end"#;
+        let run = |text: &str, scope| {
+            let (_, proof) = crate::parse_proof_source(app.clone(), text.to_owned(), &[])
+                .unwrap_or_else(|_| panic!("valid mixed-width recurrence"));
+            check_loaded_scalar_ordered_local_proof_contexts(
+                Vec::new(), [(proof, Vec::new())], vec![app.clone()], inputs(), scope, Vec::new(),
+            )
+        };
+        let actual = program.replace("%%end", &format!(r#"
+            u16 answer = descend(-95);
+            core.require(answer == 1000, {OUTPUT});
+            core.require(false, {OUTPUT});
+        %%end"#));
+        for scope in [ScalarCheckerScope::CurrentPackage, ScalarCheckerScope::MainFlowOnly] {
+            let receipt = run(&actual, scope).unwrap();
+            let [directive] = receipt.directives.as_slice() else { panic!("only the unconditional directive"); };
+            assert_eq!(&actual[directive.condition.start as usize..directive.condition.end as usize], "false");
+            assert!(receipt.symbolic_diagnostic.is_none() && receipt.diagnostics.is_empty());
+            let outside = actual.replace("descend(-95)", "descend(-101)");
+            assert!(matches!(run(&outside, scope), Err(ScalarOrderedCheckerOutcome::Unsupported)));
+        }
+        let symbolic = program.replace("%%end", &format!(r#"
+            unit(i8) consumer = fn(input) {{
+                core.narrow(input >= -100, {OUTPUT});
+                u16 answer = descend(input);
+                core.require(answer == 1000, {OUTPUT});
+                core.require(answer == 1001, {OUTPUT});
+            }};
+        %%end"#));
+        let receipt = run(&symbolic, ScalarCheckerScope::CurrentPackage).unwrap();
+        let [directive] = receipt.directives.as_slice() else { panic!("one symbolic failure"); };
+        let answer = BigInt::from(1000);
+        assert!(directive.witness.intervals_at(0, 1).unwrap().eq([(&answer, &answer)]));
+
+        let refuted = program.replace("ensures (out == 1000)", "ensures (out == 1001)");
+        let receipt = run(&refuted, ScalarCheckerScope::CurrentPackage).unwrap();
+        let diagnostic = receipt.symbolic_diagnostic.unwrap();
+        let base = BigInt::from(-100);
+        assert_eq!(diagnostic.returned, answer);
+        assert_eq!(diagnostic.witness.axes[0].1, ScalarType::I8);
+        assert!(diagnostic.witness.intervals_at(0, 0).unwrap().eq([(&base, &base)]));
     }
 
     #[cfg(feature = "internal-checker")]
