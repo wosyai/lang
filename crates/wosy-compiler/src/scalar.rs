@@ -4426,56 +4426,64 @@ fn derive_expression(node: &CstNode) -> ScalarExpression {
             }
         }
         SyntaxKind::Call => {
-            let qualified = direct_nodes(&actual)
-                .into_iter()
-                .find(|child| child.kind() == SyntaxKind::QualifiedCall)
-                .expect("qualified call");
-            let identifiers: Vec<CstToken> = qualified
+            let mut children = actual.children();
+            let mut qualified = None;
+            let mut generic = None;
+            let mut first_argument = None;
+            while let Some(child) = children.next() {
+                match child.kind() {
+                    SyntaxKind::QualifiedCall if qualified.is_none() => qualified = Some(child),
+                    SyntaxKind::GenericTypeArguments if generic.is_none() => generic = Some(child),
+                    SyntaxKind::Expression if first_argument.is_none() =>
+                        first_argument = Some((child, children.clone())),
+                    _ => {}
+                }
+                if qualified.is_some() && generic.is_some() {
+                    break;
+                }
+            }
+            let qualified = qualified.expect("qualified call");
+            let mut identifiers = qualified
                 .children_with_tokens()
                 .filter_map(|element| match element {
                     NodeOrToken::Token(token) if token.kind() == SyntaxKind::Identifier => {
                         Some(token)
                     }
                     _ => None,
-                })
-                .collect();
-            let receiver = identifiers
-                .first()
-                .filter(|_| identifiers.len() == 2)
-                .map(|token| token.text().to_owned());
-            let name_token = identifiers.last().expect("call member");
-            let type_arguments = direct_nodes(&actual)
-                .into_iter()
-                .find(|child| child.kind() == SyntaxKind::GenericTypeArguments)
+                });
+            let first = identifiers.next().expect("call member");
+            let (receiver, name_token) = match identifiers.next() {
+                Some(second) => match identifiers.last() {
+                    Some(last) => (None, last),
+                    None => (Some(first), second),
+                },
+                None => (None, first),
+            };
+            let type_arguments = generic
                 .map(|generic| {
                     generic
                         .children()
                         .filter(|child| child.kind() == SyntaxKind::GenericTypeArgument)
                         .map(|argument| ScalarTypeArgument {
                             ty: derive_type(
-                                &direct_nodes(&argument)
-                                    .into_iter()
-                                    .next()
-                                    .expect("generic type argument type"),
+                                &argument.children().next().expect("generic type argument type"),
                             ),
                             span: wosy_syntax::byte_span(&argument),
                         })
                         .collect()
                 })
-                .map_or_else(Vec::new, |arguments| arguments);
-            let arguments = direct_nodes(&actual)
-                .iter()
+                .unwrap_or_default();
+            let (first_argument, remaining_arguments) =
+                first_argument.map_or((None, children), |(first, rest)| (Some(first), rest));
+            let arguments = first_argument.into_iter().chain(remaining_arguments)
                 .filter(|child| child.kind() == SyntaxKind::Expression)
-                .map(derive_expression)
+                .map(|child| derive_expression(&child))
                 .collect();
             ScalarExpression::Call {
-                receiver,
+                receiver: receiver.as_ref().map(|token| token.text().to_owned()),
                 name: name_token.text().to_owned(),
-                receiver_span: identifiers
-                    .first()
-                    .filter(|_| identifiers.len() == 2)
-                    .map(token_span),
-                name_span: token_span(name_token),
+                receiver_span: receiver.as_ref().map(token_span),
+                name_span: token_span(&name_token),
                 type_arguments,
                 arguments,
                 overload_selection: None,

@@ -6130,6 +6130,74 @@ fn derives_generic_call_type_arguments_with_unresolved_type_and_span() {
     assert_eq!(restored, *type_arguments);
 }
 
+fn generic_call_snapshot() -> wosy_syntax::CanonicalCstSnapshot {
+    use wosy_syntax::{CanonicalCstSnapshotElement as Element, CanonicalCstSnapshotNode};
+    fn call(node: CanonicalCstSnapshotNode) -> Option<CanonicalCstSnapshotNode> {
+        if node.kind == SyntaxKind::Call {
+            return Some(node);
+        }
+        node.children.into_iter().find_map(|child| match child {
+            Element::Node(child) => call(child),
+            Element::Token { .. } => None,
+        })
+    }
+    let parsed = parse_source(source(), "%%start\nmath.wrap<u32>(1, 2);\n%%end".into(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let mut snapshot = parsed.result.canonical_cst().snapshot();
+    snapshot.root = call(snapshot.root).expect("parsed generic call");
+    snapshot
+}
+
+#[test]
+fn derives_reordered_call_children_without_changing_legacy_selection() {
+    use wosy_syntax::CanonicalCstSnapshotElement as Element;
+    let mut snapshot = generic_call_snapshot();
+    snapshot.root.children.reverse();
+    let qualified = snapshot.root.children.iter_mut().find_map(|child| match child {
+        Element::Node(node) if node.kind == SyntaxKind::QualifiedCall => Some(node),
+        _ => None,
+    }).unwrap();
+    qualified.children.push(Element::Token {
+        kind: SyntaxKind::Identifier,
+        text: "last".to_owned(),
+    });
+    let canonical = CanonicalCstRoot::from_snapshot(snapshot);
+    let derived = derive_expression(&canonical.root);
+    let ScalarExpression::Call {
+        receiver, name, receiver_span, name_span, type_arguments, arguments, ..
+    } = derived else { panic!("generic call") };
+    assert_eq!(receiver, None);
+    assert_eq!(receiver_span, None);
+    assert_eq!(name, "last");
+    assert_eq!(name_span.end - name_span.start, 4);
+    assert_eq!(type_arguments.len(), 1);
+    assert_eq!(type_arguments[0].ty, ScalarType::U32);
+    assert!(matches!(arguments.as_slice(), [
+        ScalarExpression::Integer { value: second, .. },
+        ScalarExpression::Integer { value: first, .. },
+    ] if *second == BigInt::from(2) && *first == BigInt::from(1)));
+}
+
+#[test]
+#[should_panic(expected = "qualified call")]
+fn malformed_call_still_reports_missing_callee_before_a_missing_type() {
+    use wosy_syntax::CanonicalCstSnapshotElement as Element;
+    let mut snapshot = generic_call_snapshot();
+    snapshot.root.children.retain(|child|
+        !matches!(child, Element::Node(node) if node.kind == SyntaxKind::QualifiedCall));
+    let generic = snapshot.root.children.iter_mut().find_map(|child| match child {
+        Element::Node(node) if node.kind == SyntaxKind::GenericTypeArguments => Some(node),
+        _ => None,
+    }).unwrap();
+    let argument = generic.children.iter_mut().find_map(|child| match child {
+        Element::Node(node) if node.kind == SyntaxKind::GenericTypeArgument => Some(node),
+        _ => None,
+    }).unwrap();
+    argument.children.clear();
+    let canonical = CanonicalCstRoot::from_snapshot(snapshot);
+    derive_expression(&canonical.root);
+}
+
 #[test]
 fn derives_u32_literal_context_for_generic_integer_extension() {
     let text = "%%start\nu64 result = core.int_extend<u64>(4294967295);\n%%end";
