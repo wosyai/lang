@@ -9739,6 +9739,8 @@ i32() overlap = fn {
         let rejected = parse_source(source.clone(), overlapping.into(), &[]);
         assert!(rejected.diagnostics.is_empty(), "{:?}", rejected.diagnostics);
         let rejected = crate::derive_scalar_program_with_layout(&rejected.result, layout);
-        assert!(rejected.diagnostics.iter().any(|diagnostic| diagnostic.code == "B0003"), "{:?}", rejected.diagnostics);
+        let [diagnostic] = rejected.diagnostics.as_slice() else { panic!("{:?}", rejected.diagnostics) };
+        assert_eq!(diagnostic.code, "B0003");
+        assert!(diagnostic.message.contains("fallible allocation requires one proven null guard for its local binding"), "{diagnostic:?}");
     }
 }
