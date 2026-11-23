@@ -735,7 +735,7 @@ pub(super) mod tests {
             span, generic_parameters: vec![], overload_arms: vec![],
             reference_cfg: ScalarReferenceCfg {
                 facts: vec![], points: vec![], initial_points: vec![], allocations: BTreeSet::new(),
-                specialized_policies: vec![], primary_call_points: HashMap::new(),
+                specialized_policies: vec![], primary_call_points: HashMap::new(), guarded_scalar_allocation: None,
             },
         }
     }

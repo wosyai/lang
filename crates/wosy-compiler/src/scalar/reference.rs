@@ -338,6 +338,21 @@ fn prepared_direct_local_reborrow_owner_requires_the_exact_declared_scope() {
     assert!(!types.is_local_reborrow_owner(&local, scope, scope));
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct GuardedScalarAllocation {
+    binding: ReferenceBindingId,
+    condition: usize,
+    branch: CfgPointId,
+    present_on_then: bool,
+}
+
+impl GuardedScalarAllocation {
+    pub(crate) fn binding(&self) -> &ReferenceBindingId { &self.binding }
+    pub(crate) fn condition(&self) -> usize { self.condition }
+    pub(crate) fn branch(&self) -> CfgPointId { self.branch }
+    pub(crate) fn present_on_then(&self) -> bool { self.present_on_then }
+}
+
 pub(super) struct ReferenceFlowBuilder<'a> {
     capture_call_points: bool,
     root_return_points: std::ops::Range<usize>,
@@ -521,6 +536,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
             origin_index: ReferenceOriginIndex::default(),
             cfg: ScalarReferenceCfg {
                 primary_call_points: HashMap::new(),
+                guarded_scalar_allocation: None,
                 facts: Vec::new(),
                 points: Vec::new(),
                 initial_points: Vec::new(),
@@ -1257,6 +1273,10 @@ impl<'a> ReferenceFlowBuilder<'a> {
         if let Some((binding, present_on_then)) = guarded {
             if let Some([then, otherwise]) = edges.entries(&self.cfg.points) {
                 self.proof_points.record_guarded_allocation(branch, binding, [*then, *otherwise], present_on_then);
+                let condition = match region {
+                    ConditionalRegion::Value { condition, .. } | ConditionalRegion::Unit { condition, .. } => *condition,
+                };
+                self.proof_points.guarded_scalar_condition = Some((branch, condition));
             }
         }
         if let (Some((expression, writer_side, formal)), Some(condition), Some([then_entry, else_entry])) =
@@ -11872,6 +11892,9 @@ fn transfer_function_output_contracts<'a>(
         result.aggregate.checked_backing_assignment = install
             .filter(|(_, marker)| marker.validate_backing)
             .map(|(destination, marker)| (destination.0, marker.call.0, marker.frozen.rhs));
+        if !transferred.is_empty() {
+            result.cfg.guarded_scalar_allocation = None;
+        }
         replay.errors = transferred;
     }
 }
@@ -12657,6 +12680,23 @@ fn build_function_reference_cfg(
             )).cloned());
         }
         if provisional.is_empty() {
+            if let (true, [(branch, edge)], Some((condition_branch, condition)), Some(bindings)) = (
+                errors.is_empty(),
+                builder.proof_points.guarded_allocation_edges.as_slice(),
+                builder.proof_points.guarded_scalar_condition,
+                &builder.proof_points.fallible_allocation_bindings,
+            ) {
+                if *branch == condition_branch && bindings.len() == 1 && bindings.contains_key(&edge.binding) {
+                    if let Some(then) = builder.cfg.points[branch.0].successors.first() {
+                        builder.cfg.guarded_scalar_allocation = Some(Box::new(GuardedScalarAllocation {
+                            binding: edge.binding.clone(),
+                            condition: condition.0,
+                            branch: *branch,
+                            present_on_then: *then == edge.present,
+                        }));
+                    }
+                }
+            }
             for &(end, _) in &builder.aggregate_facts.checked_producer_arms {
                 aggregate.checked_producer_backing.entry(end).or_insert(aggregate::CheckedProducerBacking::Unknown);
             }

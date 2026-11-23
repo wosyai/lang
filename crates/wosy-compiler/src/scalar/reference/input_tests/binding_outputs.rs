@@ -427,6 +427,11 @@ fn prepared_fallible_guard_producer_uses_resolved_binding_and_null_polarity() {
         let [then, otherwise] = result.cfg.points[branch.0].successors.as_slice() else {
             panic!("exact branch successors");
         };
+        let carrier = result.cfg.guarded_scalar_allocation().expect("installed guarded allocation");
+        assert_eq!((carrier.binding(), carrier.branch(), carrier.present_on_then()), (&edge.binding, *branch, present_on_then));
+        let region = calls.functions[&0].conditionals.values().next().expect("resolved condition");
+        let ConditionalRegion::Value { condition, .. } = region else { panic!("value condition"); };
+        assert_eq!(carrier.condition(), condition.0);
         assert_eq!((edge.present, edge.absent), if present_on_then { (*then, *otherwise) } else { (*otherwise, *then) });
         assert!(result.cfg.points.iter().any(|point| matches!(&point.kind, CfgPointKind::Bind { binding } if binding == &edge.binding)));
         assert!(!result.cfg.points.iter().any(|point| matches!(&point.kind, CfgPointKind::Borrow { place, .. } if place.binding == edge.binding)));
@@ -460,9 +465,11 @@ fn prepared_fallible_reads_require_availability_on_all_projected_paths() {
             panic!("local receiver");
         };
         binding.fallible_assignment = Some(binding.name_span);
-        let (_, errors) = derive_module_reference_origins(
+        let (results, errors) = derive_module_reference_origins(
             &program.source, &program.items, &calls, &program.structs, &program.enums, false,
         );
+        let [(_, result)] = results.as_slice() else { panic!("example reference result"); };
+        assert_eq!(result.cfg.guarded_scalar_allocation().is_none(), expected.is_some(), "{body}");
         assert_eq!(errors.len(), usize::from(expected.is_some()), "{body}: {errors:?}");
         assert!(errors.iter().all(|error| Some(error.reason()) == expected));
     }

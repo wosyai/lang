@@ -635,6 +635,8 @@ pub struct ScalarReferenceCfg {
     #[serde(skip)]
     pub specialized_policies: Vec<SpecializedCopyPolicy>,
     #[serde(skip)]
+    guarded_scalar_allocation: Option<Box<reference::GuardedScalarAllocation>>,
+    #[serde(skip)]
     pub(crate) primary_call_points: HashMap<reference::OccurrenceOrdinal, CfgPointId>,
 }
 
@@ -651,6 +653,23 @@ impl PartialEq for ScalarReferenceCfg {
 impl Eq for ScalarReferenceCfg {}
 
 impl ScalarReferenceCfg {
+    pub(crate) fn guarded_scalar_allocation(&self) -> Option<&reference::GuardedScalarAllocation> {
+        self.guarded_scalar_allocation.as_deref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn unsealed_for_test(facts: Vec<ReferenceOrigin>, points: Vec<ReferenceFlowPoint>) -> Self {
+        Self {
+            facts,
+            points,
+            initial_points: Vec::new(),
+            allocations: BTreeSet::new(),
+            specialized_policies: Vec::new(),
+            guarded_scalar_allocation: None,
+            primary_call_points: HashMap::new(),
+        }
+    }
+
     pub(crate) fn primary_call_point(
         &self,
         ordinal: reference::OccurrenceOrdinal,
@@ -3524,6 +3543,7 @@ fn derive_function(node: &CstNode) -> ScalarFunction {
         overload_arms: Vec::new(),
         reference_cfg: ScalarReferenceCfg {
             primary_call_points: HashMap::new(),
+            guarded_scalar_allocation: None,
             facts: Vec::new(),
             points: Vec::new(),
             initial_points: Vec::new(),
@@ -3626,6 +3646,7 @@ fn derive_overload(node: &CstNode) -> ScalarFunction {
                 overload_arms: Vec::new(),
                 reference_cfg: ScalarReferenceCfg {
                     primary_call_points: HashMap::new(),
+                    guarded_scalar_allocation: None,
                     facts: Vec::new(),
                     points: Vec::new(),
                     initial_points: Vec::new(),
@@ -3655,6 +3676,7 @@ fn derive_overload(node: &CstNode) -> ScalarFunction {
         overload_arms: arms,
         reference_cfg: ScalarReferenceCfg {
             primary_call_points: HashMap::new(),
+            guarded_scalar_allocation: None,
             facts: Vec::new(),
             points: Vec::new(),
             initial_points: Vec::new(),
