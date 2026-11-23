@@ -1227,3 +1227,82 @@ i32(u64, bool) inspect_checked = fn(count, flag) {
         }
     }
 }
+
+#[test]
+fn mixed_result_direct_cross_module_receive_preserves_qualified_owner_identity() {
+    let app = source("workbench", "src/cross_mixed.w");
+    let owner = source("payload", "src/owner.w");
+    let decoy = source("payload", "src/decoy.w");
+    let owner_text = r#"%%start
+struct Packet { *?u8 data; u64 length; }
+Packet stored = { .data = null; .length = 7; };
+(u32, Packet)(u64) make_packet = fn(length) {
+    u8[length] backing;
+    backing[0] = 19;
+    *?u8 data = null;
+    unsafe { data = &?backing[0]; };
+    Packet packet = { .data = data; .length = length; };
+    37, packet
+};
+%%end"#;
+    let decoy_text = r#"%%start
+struct Packet { *?u8 data; u64 length; }
+Packet stored = { .data = null; .length = 7; };
+(u32, Packet)(u64) make_packet = fn(length) {
+    u32 marker = core.int_trunc<u32>(length);
+    marker + 38, stored
+};
+%%end"#;
+    assert_eq!(owner_text.find("make_packet"), decoy_text.find("make_packet"));
+    let app_text = r#"%%start
+owned = namespace payload "owner.w";
+plain = namespace payload "decoy.w";
+
+u64() receive = fn {
+    u32 marker, owned.Packet packet = owned.make_packet(2);
+    u32 other, plain.Packet ordinary = plain.make_packet(3);
+    u8 byte = unsafe { core.load<u8>(packet.data) };
+    core.int_extend<u64>(marker) + core.int_extend<u64>(byte) + packet.length +
+        core.int_extend<u64>(other) + ordinary.length
+};
+if (receive() != 106) { core.system_panic(); };
+%%end"#;
+    for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let prepared = prepare_scalar_project(
+            vec![
+                (declarations(&app, app_text), vec![namespace("owned", &owner), namespace("plain", &decoy)]),
+                (declarations(&owner, owner_text), Vec::new()),
+                (declarations(&decoy, decoy_text), Vec::new()),
+            ],
+            vec![app.clone(), owner.clone(), decoy.clone()],
+            ScalarPreparationInputs { target_layout },
+        ).unwrap_or_else(|error| panic!("{target_layout:?}: {:?}", error.diagnostics));
+        let build = analyze_scalar_build(&prepared);
+        assert!(build.diagnostics().is_empty(), "{:?}", build.diagnostics());
+        let ir = emit_scalar_build_project_llvm(&build).unwrap().to_text();
+        let context = Context::create();
+        let buffer = MemoryBuffer::create_from_memory_range_copy(ir.as_bytes(), "qualified-mixed-owner");
+        let module = context.create_module_from_ir(buffer).unwrap();
+        module.verify().unwrap();
+        use inkwell::values::AnyValue;
+        let owner_suffix = format!("__{}__", owner.path.bytes().map(|b| format!("{b:02x}")).collect::<String>());
+        let decoy_suffix = format!("__{}__", decoy.path.bytes().map(|b| format!("{b:02x}")).collect::<String>());
+        let make = |path: &str| module.get_functions().find(|function| {
+            let name = function.get_name().to_str().unwrap();
+            name.contains(path) && name.ends_with("__6d616b655f7061636b6574")
+        }).expect("exact namespace callee");
+        let owner = make(&owner_suffix);
+        let ordinary = make(&decoy_suffix);
+        let receiver = module.get_function(&function_with_suffix(&module, "receive")).unwrap().print_to_string().to_string();
+        assert_eq!(owner.count_params(), 2);
+        assert_eq!(ordinary.count_params(), 1);
+        for function in [owner, ordinary] {
+            let target = function.get_name().to_str().unwrap();
+            assert_eq!(receiver.matches(&format!("call {{ i32, ptr }} @{target}(")).count(), 1, "{receiver}");
+        }
+        assert_eq!(receiver.matches("call void @__wosy_core_free(").count(), 1, "{receiver}");
+        assert!(receiver.contains("extractvalue { i32, ptr } %aggregate_original_base, 1"), "{receiver}");
+        let release = receiver.find("call void @__wosy_core_free(ptr %aggregate_base)").unwrap();
+        assert!(receiver[..release].contains("load i8"), "{receiver}");
+    }
+}

@@ -358,7 +358,7 @@ impl GuardedScalarAllocation {
 pub(super) struct ReferenceFlowBuilder<'a> {
     capture_call_points: bool,
     root_return_points: std::ops::Range<usize>,
-    mixed_owners: Option<&'a HashSet<ByteSpan>>,
+    mixed_owners: Option<MixedReceiptSelection<'a>>,
     local_borrow: Option<local_borrow::Author>,
     aggregate_facts: aggregate::AggregateFlowFacts,
     aggregate_result: aggregate::AggregateFlowResult,
@@ -2011,8 +2011,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         target: ResolvedCallTarget::ModuleCallable {
                             source, declaration_span, concrete: ConcreteCallSelection::Declaration,
                         }, ..
-                    } if source == &self.source
-                        && self.mixed_owners.is_some_and(|owners| owners.contains(declaration_span)));
+                    } if self.mixed_owners.is_some_and(|owners| owners.contains(&self.source, source, declaration_span)));
                     self.aggregate_result.mixed_result_calls.insert(id);
                     if selected {
                         self.aggregate_facts.calls.insert(id, ordinal);
@@ -4025,9 +4024,9 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             && self.aggregate_facts.calls.contains_key(&point)
                             && matches!(&self.cfg.points[point.0].kind, CfgPointKind::Call {
                                 target: ResolvedCallTarget::ModuleCallable {
-                                    source, concrete: ConcreteCallSelection::Declaration, ..
+                                    concrete: ConcreteCallSelection::Declaration, ..
                                 }, ..
-                            } if source == &self.source)
+                            })
                             && calls.checked_call_signatures.get(&primary_ordinal).is_some_and(|signature|
                                 matches!(signature.outputs.outputs.as_slice(), [first, second]
                                     if first.ty == head.ty && second.ty == tail.ty))
@@ -8631,6 +8630,7 @@ impl<'a> CallResolutionModule<'a> {
 #[derive(Default)]
 struct CallDeclarationIndex<'a> {
     modules: HashMap<&'a SourceIdentity, CallDeclarationHeaders<'a>>,
+    duplicate_sources: HashSet<&'a SourceIdentity>,
     structs: BTreeMap<&'a ScalarStructId, &'a ScalarStruct>,
 }
 
@@ -8744,7 +8744,10 @@ impl<'a> CallDeclarationIndex<'a> {
                     ScalarItem::Executable(_) => {}
                 }
             }
-            index.modules.entry(module.source).or_insert(headers);
+            match index.modules.entry(module.source) {
+                std::collections::hash_map::Entry::Vacant(entry) => { entry.insert(headers); }
+                std::collections::hash_map::Entry::Occupied(_) => { index.duplicate_sources.insert(module.source); }
+            }
             for structure in module.structs {
                 index.structs.entry(&structure.id).or_insert(structure);
             }
@@ -9189,6 +9192,7 @@ impl FunctionCallSites {
 }
 
 pub(super) struct ProjectCallSiteResults {
+    duplicate_sources: HashSet<SourceIdentity>,
     modules: Vec<Result<ModuleCallSites, ReferenceAnalysisError>>,
 }
 
@@ -9288,6 +9292,7 @@ fn resolve_project_call_sites_impl(
         .collect::<Vec<_>>();
     let declarations = CallDeclarationIndex::new(&views);
     ProjectCallSiteResults {
+        duplicate_sources: declarations.duplicate_sources.iter().map(|source| (*source).clone()).collect(),
         modules: modules
             .iter()
             .map(|module| {
@@ -11242,17 +11247,94 @@ pub(super) fn record_module_reference_origins(
     errors
 }
 
+type MixedReceiptTargets = HashMap<SourceIdentity, HashSet<ByteSpan>>;
+
+#[derive(Clone, Copy)]
+struct MixedReceiptSelection<'a> {
+    grounds: &'a MixedReceiptTargets,
+    local_forwarders: &'a HashSet<ByteSpan>,
+}
+
+impl MixedReceiptSelection<'_> {
+    fn contains(self, caller: &SourceIdentity, target: &SourceIdentity, span: &ByteSpan) -> bool {
+        self.grounds.get(target).is_some_and(|points| points.contains(span))
+            || (caller == target && self.local_forwarders.contains(span))
+    }
+}
+
+struct MixedReceiptCohort {
+    module_names: HashSet<String>,
+    callers: Vec<usize>,
+    producers: Vec<(usize, ByteSpan, aggregate::MixedOwnerResultLanes)>,
+}
+
+impl MixedReceiptCohort {
+    fn grounds(
+        &self, source: &SourceIdentity, updates: &[(usize, FunctionReferenceResult)], targets: &MixedReceiptTargets,
+    ) -> HashSet<ByteSpan> {
+        let Some(targets) = targets.get(source) else { return HashSet::new() };
+        self.producers.iter().filter_map(|&(position, declaration, lanes)| {
+            let result = &updates[position].1;
+            (targets.contains(&declaration)
+                && (result.aggregate.proves_mixed_local_owner(&result.cfg, lanes)
+                    || result.aggregate.admits_mixed_branch_return()))
+                .then_some(declaration)
+        }).collect()
+    }
+
+    fn select(
+        self, source: &SourceIdentity, items: &[ScalarItem], call_sites: &ModuleCallSites,
+        updates: &mut [(usize, FunctionReferenceResult)], grounds: &MixedReceiptTargets,
+        structs: &[ScalarStruct], enums: &[ScalarEnum], capture_call_points: bool,
+        errors: &mut Vec<ReferenceAnalysisError>,
+    ) {
+        let mut forwarding_users = HashMap::<_, Vec<_>>::new();
+        let forwarders = grounds.get(source).filter(|known| !known.is_empty()).map_or_else(HashSet::new, |known| {
+            for (position, declaration, _) in self.producers {
+                let (index, result) = &updates[position];
+                let ScalarItem::Function(function) = &items[*index] else { unreachable!("function result ordinal") };
+                if let Some(callee) = result.mixed_forwarded_callee(source, function, &call_sites.functions[index]) {
+                    forwarding_users.entry(callee).or_default().push(declaration);
+                }
+            }
+            if forwarding_users.is_empty() { return HashSet::new(); }
+            reachable_mixed_forwarders(&mut known.clone(), forwarding_users)
+        });
+        let owners = MixedReceiptSelection { grounds, local_forwarders: &forwarders };
+        for position in self.callers {
+            let (index, result) = &mut updates[position];
+            let ScalarItem::Function(function) = &items[*index] else { unreachable!("function result ordinal") };
+            result.observe_selected_mixed_receipts(function, &call_sites.functions[index], &self.module_names,
+                structs, enums, source, owners, forwarders.contains(&function.name_span),
+                capture_call_points, errors);
+        }
+    }
+}
+
 fn derive_module_reference_origins(
-    source: &SourceIdentity,
-    items: &[ScalarItem],
-    call_sites: &ModuleCallSites,
-    structs: &[ScalarStruct],
-    enums: &[ScalarEnum],
-    capture_call_points: bool,
-) -> (
-    Vec<(usize, FunctionReferenceResult)>,
-    Vec<ReferenceAnalysisError>,
-) {
+    source: &SourceIdentity, items: &[ScalarItem], call_sites: &ModuleCallSites,
+    structs: &[ScalarStruct], enums: &[ScalarEnum], capture_call_points: bool,
+) -> (Vec<(usize, FunctionReferenceResult)>, Vec<ReferenceAnalysisError>) {
+    let mut targets = HashMap::new();
+    let (mut updates, mut errors, cohort) =
+        derive_module_reference_cohort(source, items, call_sites, structs, enums, capture_call_points, &mut targets);
+    if errors.is_empty() {
+        if let Some(cohort) = cohort {
+            let owners = cohort.grounds(source, &updates, &targets);
+            if !owners.is_empty() {
+                cohort.select(source, items, call_sites, &mut updates, &HashMap::from([(source.clone(), owners)]),
+                    structs, enums, capture_call_points, &mut errors);
+            }
+        }
+    }
+    (updates, errors)
+}
+
+fn derive_module_reference_cohort(
+    source: &SourceIdentity, items: &[ScalarItem], call_sites: &ModuleCallSites,
+    structs: &[ScalarStruct], enums: &[ScalarEnum], capture_call_points: bool,
+    mixed_targets: &mut MixedReceiptTargets,
+) -> (Vec<(usize, FunctionReferenceResult)>, Vec<ReferenceAnalysisError>, Option<MixedReceiptCohort>) {
     #[cfg(test)]
     stage_observations::record_reference_origins();
     let module_names = items
@@ -11267,7 +11349,6 @@ fn derive_module_reference_origins(
         .collect::<HashSet<_>>();
     let mut errors = Vec::new();
     let mut updates = Vec::new();
-    let mut mixed_targets = HashSet::new();
     let mut mixed_callers = Vec::new();
     let mut mixed_producers = Vec::new();
     for (index, item) in items.iter().enumerate() {
@@ -11277,7 +11358,7 @@ fn derive_module_reference_origins(
                 structs, enums, capture_call_points, &mut errors,
             );
             let position = updates.len();
-            if result.collect_local_mixed_targets(source, &mut mixed_targets) {
+            if result.collect_mixed_targets(mixed_targets) {
                 mixed_callers.push(position);
             }
             if function.generic_parameters.is_empty() && function.overload_arms.is_empty() {
@@ -11290,34 +11371,10 @@ fn derive_module_reference_origins(
             updates.push((index, result));
         }
     }
-    if errors.is_empty() && !mixed_targets.is_empty() {
-        let mut owners = mixed_producers.iter().filter_map(|&(position, declaration, lanes)| {
-            let result = &updates[position].1;
-            (mixed_targets.contains(&declaration)
-                && (result.aggregate.proves_mixed_local_owner(&result.cfg, lanes)
-                    || result.aggregate.admits_mixed_branch_return()))
-                .then_some(declaration)
-        }).collect::<HashSet<_>>();
-        if !owners.is_empty() {
-            let mut forwarding_users = HashMap::<_, Vec<_>>::new();
-            for (position, declaration, _) in mixed_producers {
-                let (index, result) = &updates[position];
-                let ScalarItem::Function(function) = &items[*index] else { unreachable!("function result ordinal") };
-                if let Some(callee) = result.mixed_forwarded_callee(source, function, &call_sites.functions[index]) {
-                    forwarding_users.entry(callee).or_default().push(declaration);
-                }
-            }
-            let forwarders = reachable_mixed_forwarders(&mut owners, forwarding_users);
-            for position in mixed_callers {
-                let (index, result) = &mut updates[position];
-                let ScalarItem::Function(function) = &items[*index] else { unreachable!("function result ordinal") };
-                result.observe_selected_mixed_receipts(function, &call_sites.functions[index], &module_names,
-                    structs, enums, source, &owners, forwarders.contains(&function.name_span),
-                    capture_call_points, &mut errors);
-            }
-        }
-    }
-    (updates, errors)
+    let cohort = (!mixed_callers.is_empty() || !mixed_producers.is_empty()).then_some(MixedReceiptCohort {
+        module_names, callers: mixed_callers, producers: mixed_producers,
+    });
+    (updates, errors, cohort)
 }
 
 fn reachable_mixed_forwarders(
@@ -11501,6 +11558,8 @@ fn derive_project_reference_origins(
     Option<(Vec<ScalarStruct>, Vec<ScalarEnum>)>,
 ) {
     let mut inventory = None;
+    let mut targets = HashMap::new();
+    let mut cohorts = Vec::new();
     let mut updates = Vec::new();
     let mut errors = Vec::new();
     for (index, (module, calls)) in modules.iter().zip(&call_sites.modules).enumerate() {
@@ -11518,18 +11577,53 @@ fn derive_project_reference_origins(
                             .collect::<Vec<_>>(),
                     )
                 });
-                let (results, current_errors) = derive_module_reference_origins(
+                let (results, current_errors, cohort) = derive_module_reference_cohort(
                     &module.source,
                     &module.items,
                     sites,
                     structs,
                     enums,
                     capture_call_points,
+                    &mut targets,
                 );
+                if let Some(cohort) = cohort {
+                    cohorts.push((updates.len(), cohort));
+                }
                 updates.push((index, results));
                 errors.extend(current_errors);
             }
             Err(error) => errors.push(error.clone()),
+        }
+    }
+    if errors.is_empty() && !targets.is_empty() {
+        if let Some((source, span)) = (!call_sites.duplicate_sources.is_empty()).then(|| {
+            modules.iter().find_map(|module| {
+                let source = &module.source;
+                if !call_sites.duplicate_sources.contains(source) { return None; }
+                targets.get(source)?.iter().min_by_key(|span| (span.start, span.end)).map(|span| (source, span))
+            })
+        }).flatten() {
+            errors.push(ReferenceAnalysisError::MissingContext {
+                source_span: SourceSpan::new(source.clone(), *span),
+                reason: ReferenceAnalysisErrorReason::MissingResolvedCallTarget,
+            });
+            return (updates, errors, inventory);
+        }
+        let grounds = cohorts.iter().filter_map(|(position, cohort)| {
+            let (index, results) = &updates[*position];
+            let source = &modules[*index].source;
+            let owners = cohort.grounds(source, results, &targets);
+            (!owners.is_empty()).then(|| (source.clone(), owners))
+        }).collect::<MixedReceiptTargets>();
+        if !grounds.is_empty() {
+            let (structs, enums) = inventory.as_ref().expect("mixed project cohorts have declared inventory");
+            for (position, cohort) in cohorts {
+                let (index, results) = &mut updates[position];
+                let module = &modules[*index];
+                let sites = call_sites.modules[*index].as_ref().expect("successful mixed receipt cohort");
+                cohort.select(&module.source, &module.items, sites, results, &grounds,
+                    structs, enums, capture_call_points, &mut errors);
+            }
         }
     }
     (updates, errors, inventory)
@@ -12254,25 +12348,29 @@ struct FunctionReferenceResult {
 }
 
 impl FunctionReferenceResult {
-    fn local_mixed_targets<'a>(&'a self, source: &'a SourceIdentity) -> impl Iterator<Item = ByteSpan> + 'a {
+    fn mixed_targets(&self) -> impl Iterator<Item = (&SourceIdentity, ByteSpan)> {
         self.aggregate.mixed_result_calls.iter().filter_map(move |point| {
             match &self.cfg.initial_points.get(point.0)?.kind {
                 CfgPointKind::Call { target: ResolvedCallTarget::ModuleCallable {
-                    source: actual, declaration_span, concrete: ConcreteCallSelection::Declaration,
-                }, .. } if actual == source => Some(*declaration_span),
+                    source, declaration_span, concrete: ConcreteCallSelection::Declaration,
+                }, .. } => Some((source, *declaration_span)),
                 _ => None,
             }
         })
     }
 
-    fn collect_local_mixed_targets(&self, source: &SourceIdentity, targets: &mut HashSet<ByteSpan>) -> bool {
+    fn collect_mixed_targets(&self, targets: &mut MixedReceiptTargets) -> bool {
         let mut found = false;
-        for declaration in self.local_mixed_targets(source) {
-            targets.insert(declaration);
+        for (source, declaration) in self.mixed_targets() {
+            if let Some(known) = targets.get_mut(source) {
+                known.insert(declaration);
+            } else {
+                targets.insert(source.clone(), HashSet::from([declaration]));
+            }
             found = true;
         }
         for arm in &self.arms {
-            found |= arm.collect_local_mixed_targets(source, targets);
+            found |= arm.collect_mixed_targets(targets);
         }
         found
     }
@@ -12319,14 +12417,14 @@ impl FunctionReferenceResult {
 
     fn observe_selected_mixed_receipts(
         &mut self, function: &ScalarFunction, sites: &FunctionCallSites, module_names: &HashSet<String>,
-        structs: &[ScalarStruct], enums: &[ScalarEnum], source: &SourceIdentity, owners: &HashSet<ByteSpan>,
+        structs: &[ScalarStruct], enums: &[ScalarEnum], source: &SourceIdentity, owners: MixedReceiptSelection<'_>,
         forwards: bool, capture_call_points: bool, errors: &mut Vec<ReferenceAnalysisError>,
     ) {
         for ((result, function), sites) in self.arms.iter_mut().zip(&function.overload_arms).zip(&sites.arms) {
             result.observe_selected_mixed_receipts(function, sites, module_names, structs, enums, source, owners,
                 false, capture_call_points, errors);
         }
-        if !self.local_mixed_targets(source).any(|declaration| owners.contains(&declaration)) {
+        if !self.mixed_targets().any(|(target, declaration)| owners.contains(source, target, &declaration)) {
             return;
         }
         let mut builder = ReferenceFlowBuilder::new(source, function, module_names, sites, structs, enums);
