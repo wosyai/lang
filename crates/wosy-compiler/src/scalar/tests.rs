@@ -7853,6 +7853,34 @@ fn static_uses_share_a_source_span_without_reordering_unused_declarations() {
 }
 
 #[test]
+fn static_uses_restore_shadowed_bindings_and_discard_scope_only_names() {
+    let text = "%%start
+unit(i32, i32, bool) f = fn(value, earlier, branch) {
+    if (branch) {
+        i32 value = value;
+        i32 earlier = 1;
+        i32 scope_only = 2;
+        if (branch) {
+            i32 earlier = earlier;
+        };
+    } else {
+        earlier;
+        scope_only;
+    }
+    earlier;
+};
+%%end";
+    let result = validate_text(text);
+    let spans = unused_binding_spans(&result.program.items);
+    let expected_starts = ["i32 value = value;", "i32 scope_only = 2;", "i32 earlier = earlier;"]
+        .map(|declaration| text.find(declaration).unwrap() as u32);
+    assert_eq!(
+        spans.iter().map(|span| span.start).collect::<Vec<_>>(),
+        expected_starts
+    );
+}
+
+#[test]
 fn counts_resolved_uses_across_initializers_assignments_conditions_calls_and_branches() {
     let result = validate_text(
             "%%start\nunit(i32) consume = fn(value) { value; };\ni32(i32) f = fn(input) { i32 local = input; if (local < 2) { local = local + 1; }; if (local == 2) { consume(local); } else { consume(input); } local };\n%%end",

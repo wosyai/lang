@@ -7230,73 +7230,87 @@ pub(super) fn validate(
     diagnostics
 }
 
-struct StaticUseAnalyzer {
-    visible: BTreeMap<String, ByteSpan>,
+struct StaticUseAnalyzer<'tree> {
+    visible: BTreeMap<&'tree str, ByteSpan>,
+    scope_changes: Vec<(&'tree str, Option<ByteSpan>)>,
     declarations: Vec<ByteSpan>,
     used_spans: HashSet<ByteSpan>,
 }
 
-impl StaticUseAnalyzer {
-    fn new(function: &ScalarFunction) -> Self {
+impl<'tree> StaticUseAnalyzer<'tree> {
+    fn new(function: &'tree ScalarFunction) -> Self {
         let mut analyzer = Self {
             visible: BTreeMap::new(),
+            scope_changes: Vec::new(),
             declarations: Vec::new(),
             used_spans: HashSet::new(),
         };
         for (index, name) in function.parameters.iter().enumerate() {
             if let Some(span) = function.parameter_spans.get(index) {
-                analyzer.visible.insert(name.clone(), *span);
+                analyzer.visible.insert(name.as_str(), *span);
                 analyzer.declarations.push(*span);
             }
         }
         analyzer
     }
 
-    fn block(&mut self, block: &ScalarBlock, visible: &BTreeMap<String, ByteSpan>) {
-        let mut visible = visible.clone();
+    fn block(&mut self, block: &'tree ScalarBlock) {
+        let checkpoint = self.scope_changes.len();
         for item in &block.items {
-            self.item(item, &mut visible);
+            self.item(item, true);
+        }
+        while self.scope_changes.len() > checkpoint {
+            let (name, previous) = self.scope_changes.pop().unwrap();
+            if let Some(span) = previous {
+                self.visible.insert(name, span);
+            } else {
+                self.visible.remove(name);
+            }
         }
     }
 
-    fn item(&mut self, item: &ScalarBlockItem, visible: &mut BTreeMap<String, ByteSpan>) {
+    fn item(&mut self, item: &'tree ScalarBlockItem, nested: bool) {
         match item {
             ScalarBlockItem::LocalBinding(binding) => {
                 if binding.is_allocation {
                     for receiver in &binding.receivers {
                         if let Some(length) = &receiver.allocation_length {
-                            self.expression(length, visible);
+                            self.expression(length);
                         }
                     }
                 } else {
-                    self.expression(&binding.value, visible);
+                    self.expression(&binding.value);
                 }
-                visible.insert(binding.name.clone(), binding.span);
+                let name = binding.name.as_str();
+                let previous = self.visible.insert(name, binding.span);
+                if nested {
+                    self.scope_changes.push((name, previous));
+                }
                 self.declarations.push(binding.span);
             }
-            ScalarBlockItem::Expression(expression) => self.expression(expression, visible),
+            ScalarBlockItem::Expression(expression) => self.expression(expression),
             ScalarBlockItem::Assignment(assignment) => {
                 for (_, value) in assignment.rhs().evaluations() {
-                    self.expression(value, visible);
+                    self.expression(value);
                 }
                 for (position, target) in assignment.targets.iter().enumerate() {
                     if position == 0 || !matches!(&target.place, ScalarPlace::Name { .. }) {
-                        self.place(&target.place, visible);
+                        self.place(&target.place);
                     }
                 }
             }
         }
     }
 
-    fn expression(&mut self, expression: &ScalarExpression, visible: &BTreeMap<String, ByteSpan>) {
+    fn expression(&mut self, expression: &'tree ScalarExpression) {
         match expression {
-            ScalarExpression::Name { name, .. } => self.use_name(name, visible),
-            ScalarExpression::Member { receiver, .. } => self.use_name(receiver, visible),
+            ScalarExpression::Name { name, .. } => self.use_name(name),
+            ScalarExpression::Member { receiver, .. } => self.use_name(receiver),
             ScalarExpression::Unary { operand, .. } | ScalarExpression::ValueField { receiver: operand, .. } =>
-                self.expression(operand, visible),
+                self.expression(operand),
             ScalarExpression::Binary { left, right, .. } => {
-                self.expression(left, visible);
-                self.expression(right, visible);
+                self.expression(left);
+                self.expression(right);
             }
             ScalarExpression::Call {
                 receiver,
@@ -7305,12 +7319,12 @@ impl StaticUseAnalyzer {
                 ..
             } => {
                 if let Some(receiver) = receiver {
-                    self.use_name(receiver, visible);
+                    self.use_name(receiver);
                 } else {
-                    self.use_name(name, visible);
+                    self.use_name(name);
                 }
                 for argument in arguments {
-                    self.expression(argument, visible);
+                    self.expression(argument);
                 }
             }
             ScalarExpression::If {
@@ -7319,31 +7333,31 @@ impl StaticUseAnalyzer {
                 else_branch,
                 ..
             } => {
-                self.expression(condition, visible);
-                self.block(then_branch, visible);
-                self.block(else_branch, visible);
+                self.expression(condition);
+                self.block(then_branch);
+                self.block(else_branch);
             }
             ScalarExpression::UnitIf {
                 condition,
                 then_branch,
                 ..
             } => {
-                self.expression(condition, visible);
-                self.block(then_branch, visible);
+                self.expression(condition);
+                self.block(then_branch);
             }
-            ScalarExpression::Block(block) => self.block(block, visible),
+            ScalarExpression::Block(block) => self.block(block),
             ScalarExpression::RawAddress { place, .. }
             | ScalarExpression::CheckedAddress { place, .. }
-            | ScalarExpression::Dereference { place, .. } => self.place(place, visible),
-            ScalarExpression::IndexedRead { place, .. } => self.place(place, visible),
+            | ScalarExpression::Dereference { place, .. } => self.place(place),
+            ScalarExpression::IndexedRead { place, .. } => self.place(place),
             ScalarExpression::StructLiteral { fields, .. } => {
                 for field in fields {
-                    self.expression(&field.value, visible);
+                    self.expression(&field.value);
                 }
             }
             ScalarExpression::ArrayLiteral { elements, .. } => {
                 for element in elements {
-                    self.expression(element, visible);
+                    self.expression(element);
                 }
             }
             ScalarExpression::Integer { .. }
@@ -7356,20 +7370,20 @@ impl StaticUseAnalyzer {
         }
     }
 
-    fn place(&mut self, place: &ScalarPlace, visible: &BTreeMap<String, ByteSpan>) {
+    fn place(&mut self, place: &'tree ScalarPlace) {
         match place {
-            ScalarPlace::Name { name, .. } => self.use_name(name, visible),
-            ScalarPlace::Field { base, .. } => self.place(base, visible),
-            ScalarPlace::Dereference { pointer, .. } => self.expression(pointer, visible),
+            ScalarPlace::Name { name, .. } => self.use_name(name),
+            ScalarPlace::Field { base, .. } => self.place(base),
+            ScalarPlace::Dereference { pointer, .. } => self.expression(pointer),
             ScalarPlace::Index { base, index, .. } => {
-                self.place(base, visible);
-                self.expression(index, visible);
+                self.place(base);
+                self.expression(index);
             }
         }
     }
 
-    fn use_name(&mut self, name: &str, visible: &BTreeMap<String, ByteSpan>) {
-        if let Some(span) = visible.get(name) {
+    fn use_name(&mut self, name: &str) {
+        if let Some(span) = self.visible.get(name) {
             self.used_spans.insert(*span);
         }
     }
@@ -7388,8 +7402,9 @@ pub(super) fn unused_binding_spans(items: &[ScalarItem]) -> Vec<ByteSpan> {
         .filter_map(|item| match item {
             ScalarItem::Function(function) => {
                 let mut analyzer = StaticUseAnalyzer::new(function);
-                let visible = analyzer.visible.clone();
-                analyzer.block(&function.body, &visible);
+                for item in &function.body.items {
+                    analyzer.item(item, false);
+                }
                 Some(analyzer.unused())
             }
             ScalarItem::Namespace(_)
