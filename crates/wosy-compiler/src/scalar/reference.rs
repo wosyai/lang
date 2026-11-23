@@ -5895,7 +5895,9 @@ fn update_projected_assignment<'a>(
     state: &mut ReferenceEdgeState,
     targets: impl ExactSizeIterator<Item = &'a ReferencePlaceId> + Clone,
     origins: Option<&BTreeSet<ReferenceOriginId>>,
+    retains_loan: bool,
 ) {
+    debug_assert!(!retains_loan || targets.len() == 1);
     let retire = |state: &mut ReferenceEdgeState, target| {
         state.projected.retain(|known| !reference_places_overlap(&known.place, target));
     };
@@ -5906,7 +5908,7 @@ fn update_projected_assignment<'a>(
             }
         }
         for target in targets {
-            write_projected_reference(state, target, origins, false);
+            write_projected_reference(state, target, origins, retains_loan);
         }
     } else {
         for target in targets {
@@ -5970,16 +5972,16 @@ fn projected_assignment_replaces_previous_rows_once_in_candidate_order() {
     let mut without_rhs = state.clone();
     let mut single = state.clone();
     let capacity = single.projected.capacity();
-    update_projected_assignment(&mut single, [&root].into_iter(), Some(&replacement));
+    update_projected_assignment(&mut single, [&root].into_iter(), Some(&replacement), false);
     assert_eq!(single.projected.capacity(), capacity);
     assert!(matches!(single.projected.as_slice(), [first, last]
         if first.place == unrelated && first.origins == previous
         && last.place == root && last.origins == replacement));
-    update_projected_assignment(&mut state, [&root, &projected].into_iter(), Some(&replacement));
+    update_projected_assignment(&mut state, [&root, &projected].into_iter(), Some(&replacement), false);
     assert!(matches!(state.projected.as_slice(), [first, last]
         if first.place == unrelated && first.origins == previous
         && last.place == projected && last.origins == replacement));
-    update_projected_assignment(&mut without_rhs, [&root, &projected].into_iter(), None);
+    update_projected_assignment(&mut without_rhs, [&root, &projected].into_iter(), None, false);
     assert!(matches!(without_rhs.projected.as_slice(), [first]
         if first.place == unrelated && first.origins == previous));
 }
@@ -8853,6 +8855,7 @@ fn transfer_reference_facts(
                 }
                 CfgPointKind::AssignThrough {
                     candidates,
+                    pointer_point,
                     previous_origins,
                     ..
                 } => {
@@ -8861,10 +8864,23 @@ fn transfer_reference_facts(
                         .flatten()
                         .filter(|origins| !origins.is_empty());
                     let installs_reference = point.possible_origins.as_ref().is_none_or(|origins| !origins.is_empty());
+                    let retains_loan = installs_reference && match candidates.as_slice() {
+                        [candidate] => state.point_values.get(*pointer_point).is_some_and(|origins|
+                            origins.len() == 1 && origins.contains(&candidate.origin))
+                            && candidate.loan.mode == ScalarReferenceMutability::Mutable
+                            && candidate.place.binding.kind == ReferenceBindingKind::Declared
+                            && direct_lexical_loan_root(&candidate.loan.origin_place).is_some()
+                            && !candidate.place.projections.is_empty()
+                            && exact_projected_prefix(&candidate.place, &candidate.place)
+                            && rhs.as_ref().is_some_and(|origins| origins.iter().any(|origin|
+                                declared_local_loan(&cfg.facts[origin.0]).is_some())),
+                        _ => false,
+                    };
                     update_projected_assignment(
                         &mut state,
                         candidates.iter().map(|candidate| &candidate.place),
                         if installs_reference { rhs.as_ref() } else { None },
+                        retains_loan,
                     );
                     if installs_reference && rhs.is_none() {
                         errors.push(ReferenceAnalysisError::MissingContext {

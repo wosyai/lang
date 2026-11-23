@@ -4953,6 +4953,34 @@ fn fixed_projected_reference_keeps_its_local_loan_live_until_last_use() {
 }
 
 #[test]
+fn singleton_checked_pointer_store_keeps_projected_local_loan_live() {
+    for (install, uses, conflict) in [
+        ("parcel.item = &value;", "value = 8; *u8 seen = parcel.item; seen;", true),
+        ("*!Bag writer = &!parcel; (*writer).item = &value;", "value = 8; *u8 seen = parcel.item; seen;", true),
+        ("*!Bag writer = &!parcel; (*writer).item = &value;", "*u8 seen = parcel.item; seen; value = 8;", false),
+        ("*!Bag writer = &!parcel; (*writer).item = &value;", "value = 8; *u8 seen = parcel.sibling; seen;", false),
+        ("*!Bag writer = &!parcel; (*writer).item = &value;", "value = 8; parcel.item = null; *u8 seen = parcel.item; seen;", false),
+    ] {
+        let text = format!(
+            "%%start\nstruct Bag {{ *u8 item; *u8 sibling; }}\nunit() update = fn {{ u8 value = 7; Bag parcel = {{ .item = null; .sibling = null; }}; parcel.sibling = null; {install} {uses} }};\n%%end"
+        );
+        let access = text.find("value = 8").unwrap() as u32;
+        let origin = text.find("&value").unwrap() as u32;
+        let (single, project) = both_reference_functions(&text);
+        for diagnostics in [&single.diagnostics, &project.diagnostics] {
+            if conflict {
+                assert!(diagnostics.iter().any(|diagnostic| diagnostic.code == "B0003"
+                    && diagnostic.labels.first().is_some_and(|label| label.span.range.start == access)
+                    && diagnostic.labels.iter().skip(1).any(|label| label.span.range.start == origin)),
+                    "{text}: {diagnostics:?}");
+            } else {
+                assert!(diagnostics.is_empty(), "{text}: {diagnostics:?}");
+            }
+        }
+    }
+}
+
+#[test]
 fn projected_holder_drops_only_slots_whose_local_referent_leaves_scope() {
     for (branch_owner, expired) in [("local; refs[0] = &local;", true), ("local; refs[0] = &outer;", false)] {
         let text = format!(
