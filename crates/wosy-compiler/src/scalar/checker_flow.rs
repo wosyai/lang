@@ -3310,7 +3310,7 @@ fn walk_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, A
 ) -> Option<IntegerControl<'a>> {
     let mut cursor = IntegerBlockCursor::new(block, roots.axes.len(), path);
     drive_integer_block::<USE_IMPORTED_BOUND, COLLECT, _, false>(
-        calls, roots, &mut cursor, root_tail, returns, handle_call, failures, imports, authored_return, false, None,
+        calls, roots, &mut cursor, root_tail, returns, handle_call, failures, imports, authored_return, false, None, None,
     )
 }
 
@@ -3326,6 +3326,7 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
     authored_return: Authored,
     suspend_integer: bool,
     mut return_capture_work: Option<&mut usize>,
+    #[allow(unused_mut)] mut computed_returns: Option<&mut Vec<(usize, IntegerPairReturnPartition)>>,
 ) -> Option<IntegerControl<'a>> {
     let IntegerBlockCursor { mut block, mut next, mut depth, mut path, mut branches, mut terminal } =
         std::mem::replace(cursor, IntegerBlockCursor::new(calls.structure.root, 0, IntegerInputs::default()));
@@ -3346,7 +3347,9 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                     next = 0;
                     continue;
                 }
-                if returns.as_ref().is_some_and(|paths| !paths.is_empty()) {
+                if returns.as_ref().is_some_and(|paths| !paths.is_empty())
+                    || computed_returns.as_ref().is_some_and(|pieces| !pieces.is_empty())
+                {
                     return Some(IntegerControl::Returned);
                 }
             }
@@ -3549,6 +3552,42 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                     }
                     roots.truncate(depth);
                     return Some(IntegerControl::Returned);
+                }
+                #[cfg(feature = "internal-checker")]
+                if let Some(target) = computed_returns.as_deref_mut() {
+                    if let Some((operator, operands)) = structure.checker_integer_final_operations.get(&slot.expression) {
+                        let work = return_capture_work.as_deref_mut()?;
+                        charge_partition_capture(work, &path, roots.axes.len().checked_add(1)?)?;
+                        let at = returns.as_ref()?.len();
+                        let operation = AuthoredIntegerOperation::checked(operator)?;
+                        let (min, max) = super::typecheck::integer_bounds(ty)?;
+                        let axis = |operand| match calls.prepared_plain_name(operand)? {
+                            PlainNameIdentity::Lexical(binding) => {
+                                let (axis, actual) = roots.lookup(binding)?;
+                                (actual == ty).then_some(axis)
+                            }
+                            _ => None,
+                        };
+                        let [left, right] = operands.map(|operand| {
+                            (structure.checker_integer_literals.get(&operand), axis(operand))
+                        });
+                        for row in &path.0 {
+                            let left = singleton_calculation_operand(row, left)?;
+                            let right = singleton_calculation_operand(row, right)?;
+                            if left < &min || left > &max || right < &min || right > &max {
+                                return None;
+                            }
+                            let output = operation.apply(Cow::Borrowed(left), Cow::Borrowed(right), &min)?;
+                            if output < min || output > max { return None; }
+                            target.push((at, IntegerPairReturnPartition {
+                                anchor: row.projected_from,
+                                inputs: [Rc::clone(&row[0]), Rc::clone(&row[1])],
+                                output: IntegerPairPartitionOutput::Singleton(Rc::new(IntegerSet::singleton(&output))),
+                            }));
+                        }
+                        path = IntegerInputs::default();
+                        continue;
+                    }
                 }
                 let value = if let Some(value) = structure.checker_integer_literals.get(&slot.expression) {
                     IntegerReturn::Const(value)
@@ -3828,6 +3867,7 @@ pub(super) struct ExactCallCursor<'a> {
     block: IntegerBlockCursor,
     tail: Option<&'a ScalarType>,
     returned: Vec<IntegerReturningPath<'a>>,
+    computed_returns: Vec<(usize, IntegerPairReturnPartition)>,
     return_capture_work: usize,
     projected_slot: Option<usize>,
     projected_pair: Option<[usize; 2]>,
@@ -3919,7 +3959,7 @@ impl<'a> ExactCallCursor<'a> {
             roots.add(binding, &parameter.ty);
         }
         let block = IntegerBlockCursor::new(calls.structure.root, roots.axes.len(), rows);
-        Some(Self { roots, block, tail, returned: Vec::new(), return_capture_work: 0, projected_slot, projected_pair })
+        Some(Self { roots, block, tail, returned: Vec::new(), computed_returns: Vec::new(), return_capture_work: 0, projected_slot, projected_pair })
     }
 
     pub(super) fn arguments<'borrow>(
@@ -4047,6 +4087,7 @@ impl<'a> ExactCallCursor<'a> {
         mut handle_call: Option<&mut ActualCallHandler<'a, '_>>,
         allow_contextual_local_transfers: bool,
         suspend_integer: bool,
+        allow_computed_pair_returns: bool,
         sink: &mut dyn FnMut(IntegerCheckFailure<'a>),
     ) -> Option<ExactCallProgress<'a>> {
         let mut failures = IntegerFailureCollection {
@@ -4059,6 +4100,8 @@ impl<'a> ExactCallCursor<'a> {
             calls, &mut self.roots, &mut self.block, self.tail, returns, &mut handle_call,
             &mut Some(&mut failures), &mut imports, (), suspend_integer,
             (self.projected_slot.is_some() || self.projected_pair.is_some()).then_some(&mut self.return_capture_work),
+            (allow_computed_pair_returns && suspend_integer && self.projected_pair.is_some() && self.tail.is_some())
+                .then_some(&mut self.computed_returns),
         )?;
         let result = match (self.tail, control) {
             (_, IntegerControl::PendingCall(effect)) => return Some(ExactCallProgress::Pending(effect)),
@@ -4071,12 +4114,16 @@ impl<'a> ExactCallCursor<'a> {
             (None, IntegerControl::Continue(_) | IntegerControl::Returned) => ActualCallResult::Unit,
             (Some(_), IntegerControl::Returned) if self.projected_pair.is_some() => {
                 let caller_axes = self.projected_pair?;
-                let piece_count = self.returned.iter().try_fold(0usize, |count, path| count.checked_add(path.state.0.len()))?;
+                let piece_count = self.returned.iter().try_fold(self.computed_returns.len(), |count, path| count.checked_add(path.state.0.len()))?;
                 if piece_count == 0 || piece_count > MAX_PARTITION_TRANSFER_WORK {
                     return None;
                 }
                 let mut pieces = Vec::with_capacity(piece_count);
-                for path in &self.returned {
+                let mut computed = self.computed_returns.drain(..).peekable();
+                for (index, path) in self.returned.iter().enumerate() {
+                    while computed.peek().is_some_and(|(at, _)| *at == index) {
+                        pieces.push(computed.next()?.1);
+                    }
                     let (alias, constant) = match path.value {
                         IntegerReturn::Const(value) => (None, Some(Rc::new(IntegerSet::singleton(value)))),
                         IntegerReturn::Alias(binding) => (Some(path.axes.iter().position(|axis| *axis == binding)?), None),
@@ -4101,6 +4148,7 @@ impl<'a> ExactCallCursor<'a> {
                         });
                     }
                 }
+                pieces.extend(computed.map(|(_, piece)| piece));
                 ActualCallResult::PartitionedIntegerPair(ProjectedIntegerPair { caller_axes, pieces })
             }
             (Some(_), IntegerControl::Returned) if self.projected_slot.is_some() => {
@@ -4143,6 +4191,13 @@ impl<'a> ExactCallCursor<'a> {
         };
         Some(ExactCallProgress::Done { active: self.roots.reached_obligation, result })
     }
+}
+
+#[cfg(feature = "internal-checker")]
+fn singleton_calculation_operand<'a>(
+    row: &'a IntegerRow, (literal, axis): (Option<&'a BigInt>, Option<usize>),
+) -> Option<&'a BigInt> {
+    literal.or_else(|| row.get(axis?)?.singleton_value())
 }
 
 fn exact_integer_entry_row(exact: &[&BigInt]) -> IntegerRow {

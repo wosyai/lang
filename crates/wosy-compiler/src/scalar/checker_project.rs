@@ -1575,9 +1575,9 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             let handler = Some(&mut nested_value as &mut super::checker_flow::ActualCallHandler<'_, '_>);
             let progress = if active_collection.is_some() {
                 frame.cursor.advance::<true>(body, handler, Observer::PROOF_FREE_CONTEXTUAL_LOCAL_TRANSFERS,
-                    Observer::EXACT_INTEGER_CALL_CONTINUATIONS, &mut sink)
+                    Observer::EXACT_INTEGER_CALL_CONTINUATIONS, Observer::ORDINARY_PROJECTED_PAIR, &mut sink)
             } else {
-                frame.cursor.advance::<false>(body, handler, false, false, &mut sink)
+                frame.cursor.advance::<false>(body, handler, false, false, false, &mut sink)
             }.ok_or_else(|| nested_error.unwrap_or(ProjectCheck::Unsupported))?;
             match progress {
                 ExactCallProgress::Pending(call) => {
@@ -8656,6 +8656,46 @@ mod tests {
                 assert!(matches!(result, Err(ProjectCheck::Unsupported)));
             }
         }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordered_base_symbolic_call_computes_pair_results_from_row_local_singletons() {
+        let report = OUTPUT.replace(".code = 1", ".code = 23");
+        let program = format!(r#"%%start
+            i8(i8) classify = fn(n) {{ if (n < 0) {{ -1 }} else {{ 1 }} }};
+            i8(i8, i8) leaf = fn(n, tag) {{
+                if (tag == -1) {{
+                    if (n == -2) {{ n + tag }} else {{ n }}
+                }} else {{ tag }}
+            }};
+            i8(i8, i8) wrapper = fn(tag, n) {{ i8 result = leaf(n, tag); result }};
+            unit(i8) unused = fn(n) {{
+                i8 tag = classify(n);
+                i8 result = wrapper(tag, n);
+                if (n == -2) {{ core.require(result == -3, {report}); }}
+                else {{ if (tag > 0) {{ core.require(result == 1, {report}); }}; }};
+            }};
+        %%end"#);
+        let run = |revision, text: &str| {
+            let file = source("src/main.w", revision);
+            let prepared = prepare_proof_target(&file, text).unwrap();
+            run_closed_without_named_proofs(&prepared, ScalarCheckerScope::CurrentPackage, 1)
+        };
+        let pass = run("symbolic-computed-pair-sum", &program).unwrap();
+        assert!(pass.active && pass.directives.is_empty());
+        let bad = run("symbolic-computed-pair-witness", &program.replace("result == -3", "result == 0"))
+            .unwrap();
+        let [failure] = bad.directives.as_slice() else { panic!("only the exact sum path fails"); };
+        assert_eq!(failure.code(), &BigInt::from(23));
+        assert_eq!(failure.witness.row_count(), 1);
+        for (axis, value) in [-2, -1, -3].map(BigInt::from).iter().enumerate() {
+            assert!(failure.witness.intervals_at(0, axis).unwrap().eq([(value, value)]));
+        }
+        assert!(matches!(run("symbolic-computed-pair-broad", &program.replace("n == -2) { n + tag", "n < 0) { n + tag")),
+            Err(ProjectCheck::Unsupported)));
+        assert!(matches!(run("symbolic-computed-pair-overflow", &program.replace("n + tag", "n + -127")),
+            Err(ProjectCheck::Unsupported)));
     }
 
     #[cfg(feature = "internal-checker")]

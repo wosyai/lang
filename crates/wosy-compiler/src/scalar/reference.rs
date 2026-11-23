@@ -6148,6 +6148,8 @@ pub(super) struct OccurrenceStructure {
     #[cfg(any(test, feature = "internal-checker"))]
     pub(super) checker_integer_literals: HashMap<OccurrenceOrdinal, BigInt>,
     #[cfg(feature = "internal-checker")]
+    pub(super) checker_integer_final_operations: HashMap<OccurrenceOrdinal, (BinaryOperator, [OccurrenceOrdinal; 2])>,
+    #[cfg(feature = "internal-checker")]
     pub(super) checker_integer_call_subtractions: HashMap<OccurrenceOrdinal, (OccurrenceOrdinal, BigInt)>,
     #[cfg(any(test, feature = "internal-checker"))]
     pub(super) checker_direct_targets: HashMap<OccurrenceOrdinal, (usize, usize)>,
@@ -6186,6 +6188,8 @@ impl OccurrenceStructure {
             checker_branches: HashMap::new(),
             #[cfg(any(test, feature = "internal-checker"))]
             checker_integer_literals: HashMap::new(),
+            #[cfg(feature = "internal-checker")]
+            checker_integer_final_operations: HashMap::new(),
             #[cfg(feature = "internal-checker")]
             checker_integer_call_subtractions: HashMap::new(),
             #[cfg(any(test, feature = "internal-checker"))]
@@ -7295,6 +7299,12 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
         self.expression_children(expression, names, types, ordinal, initializer_statement)?;
         #[cfg(feature = "internal-checker")]
         if checker_enabled && matches!(self.mode, WalkMode::Callable(_))
+            && matches!(edge, OccurrenceEdge::FinalOutput { .. })
+        {
+            self.record_integer_final_operation(ordinal, expression);
+        }
+        #[cfg(feature = "internal-checker")]
+        if checker_enabled && matches!(self.mode, WalkMode::Callable(_))
             && matches!(edge, OccurrenceEdge::CallArgument(0))
             && matches!(parent, OccurrenceParent::Expression(call)
                 if self.structure.checker_direct_targets.contains_key(&call)
@@ -7307,6 +7317,35 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
         }
         Ok(ordinal)
     }
+    #[cfg(feature = "internal-checker")]
+    fn record_integer_final_operation(&mut self, ordinal: OccurrenceOrdinal, expression: &ScalarExpression) {
+        let ScalarExpression::Binary { operator: operator @ (BinaryOperator::Add | BinaryOperator::Subtract),
+            left, right, .. } = expression else { return; };
+        let parent = OccurrenceParent::Expression(ordinal);
+        let Some(OccurrenceNode::Expression(left_ordinal)) =
+            self.structure.edges.get(&(parent, OccurrenceEdge::BinaryLeft)) else { return; };
+        let Some(OccurrenceNode::Expression(right_ordinal)) =
+            self.structure.edges.get(&(parent, OccurrenceEdge::BinaryRight)) else { return; };
+        let Some(ty) = self.structure.checked_types.expressions.get(&ordinal)
+            .filter(|ty| is_integer_type(ty)) else { return; };
+        let operands = [(left.as_ref(), *left_ordinal), (right.as_ref(), *right_ordinal)];
+        if !operands.iter().all(|(value, child)| {
+            self.structure.checked_types.expressions.get(child) == Some(ty)
+                && (matches!(value, ScalarExpression::Name { .. })
+                    || super::checker_flow::concrete_integer_literal(value)
+                        .is_some_and(|literal| super::typecheck::integer_literal_fits_type(&literal, ty)))
+        }) {
+            return;
+        }
+        let ordinals = [*left_ordinal, *right_ordinal];
+        for (value, child) in operands {
+            if let Some(literal) = super::checker_flow::concrete_integer_literal(value) {
+                self.structure.checker_integer_literals.insert(child, literal.into_owned());
+            }
+        }
+        self.structure.checker_integer_final_operations.insert(ordinal, (operator.clone(), ordinals));
+    }
+
     #[cfg(feature = "internal-checker")]
     fn record_integer_call_subtraction(&mut self, ordinal: OccurrenceOrdinal, expression: &ScalarExpression) {
         let ScalarExpression::Binary { operator: super::BinaryOperator::Subtract, left, right, .. } = expression
