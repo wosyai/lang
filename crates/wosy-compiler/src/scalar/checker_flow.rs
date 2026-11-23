@@ -182,10 +182,10 @@ impl<'a> ScopedAuthoredReturn<'a> for () {
 
 #[cfg(feature = "internal-checker")]
 #[derive(Clone, Copy)]
-struct OrderedRootConditions<'a>(&'a super::ScalarBlock);
+struct OrderedRootConditions<'a, const BASE: bool = false>(&'a super::ScalarBlock);
 
 #[cfg(feature = "internal-checker")]
-impl<'a> ScopedAuthoredReturn<'a> for OrderedRootConditions<'a> {
+impl<'a, const BASE: bool> ScopedAuthoredReturn<'a> for OrderedRootConditions<'a, BASE> {
     const ENABLED: bool = false;
 
     fn at(
@@ -222,8 +222,13 @@ impl<'a> ScopedAuthoredReturn<'a> for OrderedRootConditions<'a> {
             ScalarExpression::If { condition, .. } | ScalarExpression::UnitIf { condition, .. } => condition,
             _ => return None,
         };
-        let ScalarExpression::Binary { operator: BinaryOperator::Or, left, right, .. } = condition.as_ref() else {
+        let ScalarExpression::Binary { operator, left, right, .. } = condition.as_ref() else {
             return None;
+        };
+        let conjunction = match operator {
+            BinaryOperator::Or => false,
+            BinaryOperator::And if BASE => true,
+            _ => return None,
         };
         if child(slot.parent, OccurrenceEdge::Condition) != Some(slot.condition)
             || structure.checked_types.expressions.get(&slot.condition) != Some(&ScalarType::Bool)
@@ -247,19 +252,30 @@ impl<'a> ScopedAuthoredReturn<'a> for OrderedRootConditions<'a> {
             {
                 return None;
             }
-            Some((axis, ty, IntegerRelation::from_operator(comparison.operator)?, comparison.bound))
+            Some((axis, ty, comparison.operator, comparison.bound))
         };
-        let (axis, ty, left_relation, left_bound) = atom(left.as_ref(), OccurrenceEdge::BinaryLeft)?;
-        let (other_axis, _, right_relation, right_bound) = atom(right.as_ref(), OccurrenceEdge::BinaryRight)?;
-        if axis != other_axis {
+        let (axis, ty, left_operator, left_bound) = atom(left.as_ref(), OccurrenceEdge::BinaryLeft)?;
+        let (other_axis, other_ty, right_operator, right_bound) = atom(right.as_ref(), OccurrenceEdge::BinaryRight)?;
+        if !conjunction && axis != other_axis {
             return None;
         }
         let (min, max) = super::typecheck::integer_bounds(ty)?;
-        let fits = |bound: &BigInt| &min <= bound && bound <= &max;
-        if !fits(&left_bound) || !fits(&right_bound) {
+        let other_bounds = if ty == other_ty { None } else { Some(super::typecheck::integer_bounds(other_ty)?) };
+        let (other_min, other_max) = other_bounds.as_ref().map_or((&min, &max), |(lo, hi)| (lo, hi));
+        if left_bound.as_ref() < &min || left_bound.as_ref() > &max
+            || right_bound.as_ref() < other_min || right_bound.as_ref() > other_max
+        {
             return None;
         }
-        let accepted = IntegerCutUnion::new((left_relation, &left_bound), (right_relation, &right_bound), (&min, &max));
+        if conjunction {
+            let (left_true, left_false) = path.split_axis(axis, left_operator, &left_bound)?;
+            let (yes, right_false) = left_true.split_axis(other_axis, right_operator, &right_bound)?;
+            return Some((yes, left_false.join(right_false, Some(axis)), Some(axis)));
+        }
+        let accepted = IntegerCutUnion::new(
+            (IntegerRelation::from_operator(left_operator)?, &left_bound),
+            (IntegerRelation::from_operator(right_operator)?, &right_bound), (&min, &max),
+        );
         let (yes, no) = path.split_partition(axis, &accepted);
         Some((yes, no, Some(axis)))
     }
@@ -1101,15 +1117,15 @@ impl IntegerInputs {
         if ty != &predicate.ty {
             return None;
         }
-        let (passing, failing) = self.split_axis(index, predicate)?;
+        let (passing, failing) = self.split_axis(index, &predicate.operator, &predicate.bound)?;
         Some((passing, failing, Some(index)))
     }
 
-    fn split_axis(self, index: usize, predicate: &IntegerPredicate) -> Option<(Self, Self)> {
+    fn split_axis(self, index: usize, operator: &BinaryOperator, bound: &BigInt) -> Option<(Self, Self)> {
         let mut passing = Self::default();
         let mut failing = Self::default();
         for mut row in self.0 {
-            let (yes, no) = row[index].split(&predicate.operator, &predicate.bound)?;
+            let (yes, no) = row[index].split(operator, bound)?;
             if yes.is_empty() {
                 failing.0.push(row);
             } else if no.is_empty() {
@@ -1996,7 +2012,7 @@ impl IntegerReturningPath<'_> {
             CheckerPredicate::EntryDomain { .. } | CheckerPredicate::DirectiveDisjunction { .. } | CheckerPredicate::ProofReflexiveBranch(_) => return None,
             CheckerPredicate::Integer(predicate) => {
                 let index = self.axes.iter().position(|binding| **binding == predicate.binding)?;
-                self.state.split_axis(index, predicate)?
+                self.state.split_axis(index, &predicate.operator, &predicate.bound)?
             }
         };
         Some(
@@ -2080,7 +2096,7 @@ pub(super) fn collect_ordered_root_requirement_failures<'a>(
     let mut failures = Vec::new();
     let mut sink = |failure| failures.push(failure);
     let (active, _) = collect_integer_requirement_failures_in_scope(
-        calls, IntegerRequirementEntry::Arbitrary, None, false, false, &mut sink, OrderedRootConditions(body),
+        calls, IntegerRequirementEntry::Arbitrary, None, false, false, &mut sink, OrderedRootConditions::<true>(body),
     )?;
     Some((active, failures))
 }

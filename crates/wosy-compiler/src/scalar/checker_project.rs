@@ -8500,6 +8500,59 @@ mod tests {
 
     #[cfg(feature = "internal-checker")]
     #[test]
+    fn ordered_base_conjunctive_branch_preserves_both_false_causes_after_join() {
+        let app = source("src/main.w", "root-branch-conjunction");
+        let body = format!(r#"%%start
+            unit(u8, i8) checked = fn(x, y) {{
+                if (x < 2 && y >= -2) {{
+                    core.require(x < 2, {OUTPUT});
+                    core.require(y >= -2, {OUTPUT});
+                    core.require(x != 1, {OUTPUT});
+                    core.narrow(false, {OUTPUT});
+                    core.require(false, {OUTPUT});
+                }} else {{
+                    core.require(false, {OUTPUT});
+                }};
+                core.require(x != 0, {OUTPUT});
+            }};
+            %%end"#);
+        let prepare = |text: &str| prepare_checker_project(
+            vec![(declarations(&app, text), Vec::new())], vec![app.clone()], inputs(),
+        ).unwrap();
+        let project = prepare(&body);
+        let (active, failures) = collect_ordered_package_failures(&project, ScalarCheckerScope::CurrentPackage, 1).unwrap();
+        assert!(active);
+        let failures = failures.iter().map(|failure| {
+            let ProjectCheck::Failed { condition, state, operation, .. } = failure else { panic!("expected callable failure"); };
+            (&body[condition.start as usize..condition.end as usize], *operation, state)
+        }).collect::<Vec<_>>();
+        let [(first, CheckerOperation::Require, then), (second, CheckerOperation::Narrow, removed),
+             (third, CheckerOperation::Require, otherwise), (fourth, CheckerOperation::Require, after)] = failures.as_slice()
+        else { panic!("expected true witness, removed lane, false witness, and continuation"); };
+        assert_eq!((*first, *second, *third, *fourth), ("x != 1", "false", "false", "x != 0"));
+        assert!(then.includes_signed(&[1, -2]));
+        assert!(!then.includes_signed(&[1, -3]));
+        assert!(!then.includes_signed(&[2, -2]));
+        assert!(removed.includes_signed(&[0, 127]));
+        assert!(!removed.includes_signed(&[0, -3]));
+        assert!(otherwise.includes_signed(&[255, 127]));
+        assert!(otherwise.includes_signed(&[2, -2]));
+        assert!(otherwise.includes_signed(&[0, -3]));
+        assert!(!otherwise.includes_signed(&[0, -2]));
+        assert!(after.includes_signed(&[0, -3]));
+        assert!(!after.includes_signed(&[0, -2]));
+        assert!(!after.includes_signed(&[2, -3]));
+        assert_eq!(collect_ordered_package_failures(&project, ScalarCheckerScope::MainFlowOnly, 1), Ok((false, Vec::new())));
+        assert_eq!(check_package_roots(&project), Err(ProjectCheck::Unsupported));
+
+        let outside = body.replace("y >= -2) {", "y >= y) {");
+        assert_ne!(outside, body);
+        assert_eq!(collect_ordered_package_failures(&prepare(&outside), ScalarCheckerScope::CurrentPackage, 1),
+            Err(ProjectCheck::Unsupported));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
     fn ordered_reachable_local_proof_catalogs_report_exact_cross_file_sources() {
         let app = source("src/main.w", "ordered-local-app");
         let lib = source("src/lib.w", "ordered-local-lib");
