@@ -2516,6 +2516,8 @@ use resolution::{
     resolve_program_places, resolve_program_types,
 };
 mod typecheck;
+#[cfg(test)]
+pub(crate) use typecheck::with_test_fallible_admission;
 use typecheck::{
     block_item_type_in_module, block_type_in_module, block_type_in_module_expected,
     check_final_output_prefix, declare_module_name, expect_module_type, expression_span,

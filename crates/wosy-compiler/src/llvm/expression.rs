@@ -207,7 +207,10 @@ pub(super) fn emit_expression<'ctx, 'module>(
             left,
             right,
             ..
-        } => emit_binary(context, state, operator, left, right),
+        } => match super::ownership::guarded_scalar_condition(state, expression)? {
+            Some(value) => Ok(value),
+            None => emit_binary(context, state, operator, left, right),
+        },
         ScalarExpression::Call {
             receiver,
             name,
@@ -659,6 +662,9 @@ pub(super) fn emit_project_expression<'ctx, 'module>(
             right,
             ..
         } => {
+            if let Some(value) = super::ownership::guarded_scalar_condition(state, expression)? {
+                return Ok(value);
+            }
             emit_binary_expression(
                 context,
                 state,

@@ -1172,7 +1172,7 @@ pub(super) fn block_item_type_in_module(
 ) -> ScalarType {
     match item {
         ScalarBlockItem::LocalBinding(binding) => {
-            if let Some(operator) = binding.fallible_assignment {
+            if let Some(operator) = pending_fallible_operator(binding) {
                 diagnostics.push(fallible_assignment_diagnostic(module.source, operator));
                 scope.insert(binding.name.clone(), ScalarType::Error);
                 return ScalarType::Unit;
@@ -6411,6 +6411,31 @@ pub(super) fn module_diagnostic(
     source_diagnostic(&module.source, code, message, span)
 }
 
+fn pending_fallible_operator(binding: &ScalarBinding) -> Option<ByteSpan> {
+    #[cfg(test)]
+    if TEST_FALLIBLE_ADMISSION.get() {
+        return None;
+    }
+    binding.fallible_assignment
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_FALLIBLE_ADMISSION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn with_test_fallible_admission<T>(test: impl FnOnce() -> T) -> T {
+    struct Restore<'a>(&'a std::cell::Cell<bool>, bool);
+    impl Drop for Restore<'_> {
+        fn drop(&mut self) { self.0.set(self.1); }
+    }
+    TEST_FALLIBLE_ADMISSION.with(|enabled| {
+        let _restore = Restore(enabled, enabled.replace(true));
+        test()
+    })
+}
+
 fn fallible_assignment_diagnostic(source: &SourceIdentity, span: ByteSpan) -> super::Diagnostic {
     source_diagnostic(
         source,
@@ -7544,7 +7569,7 @@ fn block_item_type(
 ) -> ScalarType {
     match item {
         ScalarBlockItem::LocalBinding(binding) => {
-            if let Some(operator) = binding.fallible_assignment {
+            if let Some(operator) = pending_fallible_operator(binding) {
                 diagnostics.push(fallible_assignment_diagnostic(program.source, operator));
                 scope.insert(binding.name.clone(), ScalarType::Error);
                 return ScalarType::Unit;

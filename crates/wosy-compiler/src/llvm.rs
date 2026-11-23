@@ -123,6 +123,8 @@ struct EmitState<'ctx, 'module> {
     initializer_aggregate: Option<aggregate_transfer::InitializerEmitter<'ctx, 'module>>,
     initializer_nodes: Option<&'module InitializerCallNodes<'module>>,
     body_call_nodes: Option<&'module CallableBodyCallNodes<'module>>,
+    guarded_scalar: Option<ownership::GuardedScalarSite>,
+    guarded_scalar_owner: Option<ownership::GuardedScalarOwner<'ctx>>,
     initializer_symbols: Option<&'module InitializerSymbols>,
     builder: &'ctx Builder<'ctx>,
     module: &'module Module<'ctx>,
@@ -2028,6 +2030,8 @@ fn emit_function<'ctx, 'module>(
         initializer_aggregate: None,
         initializer_nodes: None,
         body_call_nodes,
+        guarded_scalar: ownership::GuardedScalarSite::from_cfg(reference_cfg),
+        guarded_scalar_owner: None,
         initializer_symbols: Some(initializer_symbols),
         builder,
         module,
@@ -2120,7 +2124,7 @@ fn emit_function<'ctx, 'module>(
         ScalarType::Callable { outputs, .. } => outputs,
         _ => return Err("function has no callable signature".into()),
     };
-    if !aggregate_plan.is_some_and(|plan| plan.input.is_some() || plan.ordinary_result || !plan.ordinary_calls.is_empty()) && self_tail::eligible(context, &state, value, function, reference_cfg) {
+    if state.guarded_scalar.is_none() && !aggregate_plan.is_some_and(|plan| plan.input.is_some() || plan.ordinary_result || !plan.ordinary_calls.is_empty()) && self_tail::eligible(context, &state, value, function, reference_cfg) {
         return self_tail::emit(context, &mut state, value, function, None);
     }
     let single_output = if function.body.items.len() == 1 {
@@ -2205,6 +2209,8 @@ fn emit_main<'ctx, 'module>(
         initializer_aggregate: initializer_plan.map(aggregate_transfer::InitializerEmitter::new),
         initializer_nodes,
         body_call_nodes: None,
+        guarded_scalar: None,
+        guarded_scalar_owner: None,
         initializer_symbols: Some(initializer_symbols),
         builder,
         module,
@@ -2344,6 +2350,8 @@ fn emit_project_function<'ctx, 'module>(
         initializer_aggregate: None,
         initializer_nodes: None,
         body_call_nodes,
+        guarded_scalar: ownership::GuardedScalarSite::from_cfg(reference_cfg),
+        guarded_scalar_owner: None,
         initializer_symbols: Some(initializer_symbols),
         builder,
         module,
@@ -2436,7 +2444,7 @@ fn emit_project_function<'ctx, 'module>(
         ScalarType::Callable { outputs, .. } => outputs,
         _ => return Err("function has no callable signature".into()),
     };
-    if !aggregate_plan.is_some_and(|plan| plan.input.is_some() || plan.ordinary_result || !plan.ordinary_calls.is_empty()) && self_tail::eligible(context, &state, value, function, reference_cfg) {
+    if state.guarded_scalar.is_none() && !aggregate_plan.is_some_and(|plan| plan.input.is_some() || plan.ordinary_result || !plan.ordinary_calls.is_empty()) && self_tail::eligible(context, &state, value, function, reference_cfg) {
         return self_tail::emit(
             context,
             &mut state,
@@ -2547,6 +2555,8 @@ fn emit_project_main<'ctx, 'module>(
         initializer_aggregate: None,
         initializer_nodes: None,
         body_call_nodes: None,
+        guarded_scalar: None,
+        guarded_scalar_owner: None,
         initializer_symbols: Some(initializer_symbols),
         builder,
         module,
@@ -2922,6 +2932,7 @@ fn emit_block_at<'ctx, 'module>(
     if let BlockEmission::Return(outputs) = emission {
         aggregate_transfer::commit_return(context, state, block, &result, outputs)?;
     }
+    ownership::release_guarded_scalar(context, state, block.span)?;
     aggregate_transfer::release_scope(context, state, block)?;
     release_scope_runtime_array_owners(context, state, &runtime_array_owners)?;
     if matches!(emission, BlockEmission::Return(_)) {
@@ -2985,6 +2996,9 @@ fn emit_project_block_at<'ctx, 'module>(
     let final_start = block.items.len() - block.final_output_values.len();
     for item in &block.items[..final_start] {
         match item {
+            ScalarBlockItem::LocalBinding(binding) if binding.fallible_assignment.is_some() => {
+                emit_project_block_item(context, state, item, module, modules)?;
+            }
             ScalarBlockItem::LocalBinding(binding) => {
                 let value = emit_project_binding_value(context, state, binding, module, modules)?;
                 store_binding_outputs(context, state, binding, value)?;
@@ -3006,6 +3020,7 @@ fn emit_project_block_at<'ctx, 'module>(
     if let BlockEmission::Return(outputs) = emission {
         aggregate_transfer::commit_return(context, state, block, &result, outputs)?;
     }
+    ownership::release_guarded_scalar(context, state, block.span)?;
     aggregate_transfer::release_scope(context, state, block)?;
     release_scope_runtime_array_owners(context, state, &runtime_array_owners)?;
     if matches!(emission, BlockEmission::Return(_)) {
@@ -4444,6 +4459,11 @@ fn emit_block_item<'ctx, 'module>(
 ) -> Result<EmitValue<'ctx>, String> {
     match item {
         ScalarBlockItem::LocalBinding(binding) => {
+            if binding.fallible_assignment.is_some() {
+                let value = take_basic(emit_typed_expression(context, state, &binding.value, &ScalarType::I32)?)?;
+                ownership::bind_guarded_scalar(context, state, binding, value)?;
+                return Ok(EmitValue::Unit);
+            }
             let value = emit_binding_value(context, state, binding)?;
             store_binding_outputs(context, state, binding, value)?;
             Ok(EmitValue::Unit)
@@ -4462,6 +4482,13 @@ fn emit_project_block_item<'ctx, 'module>(
 ) -> Result<EmitValue<'ctx>, String> {
     match item {
         ScalarBlockItem::LocalBinding(binding) => {
+            if binding.fallible_assignment.is_some() {
+                let value = take_basic(emit_project_typed_expression(
+                    context, state, &binding.value, &ScalarType::I32, module, modules,
+                )?)?;
+                ownership::bind_guarded_scalar(context, state, binding, value)?;
+                return Ok(EmitValue::Unit);
+            }
             if binding.is_allocation {
                 let receiver = binding
                     .receivers

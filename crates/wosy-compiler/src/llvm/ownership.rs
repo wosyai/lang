@@ -1,5 +1,6 @@
 use super::*;
 use crate::scalar::{CfgPointId, ReferenceFlowPoint};
+use wosy_syntax::ByteSpan;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(super) struct ReturnBranch {
@@ -1039,6 +1040,119 @@ pub(super) fn emit_managed_allocation_branch<'ctx>(
     let failed = state.builder.build_is_null(allocation, "allocation_failed").map_err(builder_error)?;
     state.builder.build_conditional_branch(failed, failure, success).map_err(builder_error)?;
     Ok(allocation)
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct GuardedScalarSite {
+    declaration: ByteSpan,
+    scope: ByteSpan,
+    condition: usize,
+    present_on_then: bool,
+}
+
+impl GuardedScalarSite {
+    pub(super) fn from_cfg(cfg: &ScalarReferenceCfg) -> Option<Self> {
+        let proof = cfg.guarded_scalar_allocation()?;
+        let point = cfg.points.get(proof.branch().0)?;
+        if !matches!(point.kind, crate::scalar::CfgPointKind::Branch { .. }) {
+            return None;
+        }
+        Some(Self {
+            declaration: proof.binding().declaration_span,
+            scope: proof.binding().block_span,
+            condition: proof.condition(),
+            present_on_then: proof.present_on_then(),
+        })
+    }
+}
+
+pub(super) struct GuardedScalarOwner<'ctx> {
+    backing: PointerValue<'ctx>,
+    present: inkwell::values::IntValue<'ctx>,
+}
+
+pub(super) fn bind_guarded_scalar<'ctx>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, '_>,
+    binding: &crate::ScalarBinding,
+    value: BasicValueEnum<'ctx>,
+) -> Result<(), String> {
+    let [receiver] = binding.receivers.as_slice() else {
+        return Err("fallible scalar allocation requires a single receiver".into());
+    };
+    let site = state.guarded_scalar.ok_or_else(|| format!(
+        "fallible scalar allocation has no prepared ownership for {} at {:?}", receiver.name, receiver.name_span,
+    ))?;
+    if site.declaration != receiver.name_span {
+        return Err(format!(
+            "fallible scalar allocation prepared for {:?} does not match {} at {:?}",
+            site.declaration, receiver.name, receiver.name_span,
+        ));
+    }
+    if receiver.ty != ScalarType::I32 || state.guarded_scalar_owner.is_some() {
+        return Err("invalid guarded scalar allocation binding".into());
+    }
+    declare_core_runtime(context, state.module);
+    let (size, align) = allocation_layout(&receiver.ty, state.layouts, state.target_layout)?;
+    let parent = state.builder.get_insert_block().and_then(|block| block.get_parent())
+        .ok_or_else(|| "missing guarded scalar allocation function".to_owned())?;
+    let initialized = context.append_basic_block(parent, "fallible.initialize");
+    let continuation = context.append_basic_block(parent, "fallible.continue");
+    let backing = emit_standard_allocation_call(
+        state, context.i64_type().const_int(size, false).into(),
+        context.i64_type().const_int(align, false).into(),
+    )?;
+    let present = state.builder.build_is_not_null(backing, "fallible.present").map_err(builder_error)?;
+    state.builder.build_conditional_branch(present, initialized, continuation).map_err(builder_error)?;
+    state.builder.position_at_end(initialized);
+    state.builder.build_store(backing, value).map_err(builder_error)?;
+    state.builder.build_unconditional_branch(continuation).map_err(builder_error)?;
+    state.builder.position_at_end(continuation);
+    state.storage.insert(receiver.name.clone(), (backing, receiver.ty.clone()));
+    state.guarded_scalar = Some(site);
+    state.guarded_scalar_owner = Some(GuardedScalarOwner { backing, present });
+    Ok(())
+}
+
+pub(super) fn guarded_scalar_condition<'ctx>(
+    state: &EmitState<'ctx, '_>,
+    expression: &ScalarExpression,
+) -> Result<Option<EmitValue<'ctx>>, String> {
+    let Some(site) = state.guarded_scalar else { return Ok(None) };
+    if state.body_call_nodes.and_then(|nodes| nodes.expression_ordinal(expression)) != Some(site.condition) {
+        return Ok(None);
+    }
+    let owner = state.guarded_scalar_owner.as_ref()
+        .ok_or_else(|| "guarded scalar condition precedes its allocation".to_owned())?;
+    let condition = if site.present_on_then {
+        owner.present
+    } else {
+        state.builder.build_not(owner.present, "fallible.absent").map_err(builder_error)?
+    };
+    Ok(Some(EmitValue::Basic(condition.into())))
+}
+
+pub(super) fn release_guarded_scalar<'ctx>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, '_>,
+    scope: ByteSpan,
+) -> Result<(), String> {
+    if !state.guarded_scalar.is_some_and(|site| site.scope == scope) {
+        return Ok(());
+    }
+    let Some(owner) = state.guarded_scalar_owner.take() else { return Ok(()) };
+    let parent = state.builder.get_insert_block().and_then(|block| block.get_parent())
+        .ok_or_else(|| "missing guarded scalar release function".to_owned())?;
+    let release = state.module.get_function(CORE_FREE_SYMBOL)
+        .ok_or_else(|| "core free runtime declaration is missing".to_owned())?;
+    let present = context.append_basic_block(parent, "fallible.release");
+    let next = context.append_basic_block(parent, "fallible.released");
+    state.builder.build_conditional_branch(owner.present, present, next).map_err(builder_error)?;
+    state.builder.position_at_end(present);
+    state.builder.build_call(release, &[owner.backing.into()], "").map_err(builder_error)?;
+    state.builder.build_unconditional_branch(next).map_err(builder_error)?;
+    state.builder.position_at_end(next);
+    Ok(())
 }
 
 pub(super) fn emit_runtime_array_allocation<'ctx, 'module>(
