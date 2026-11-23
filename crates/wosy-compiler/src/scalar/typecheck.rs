@@ -7052,38 +7052,44 @@ pub(super) fn validate(
                             function.span,
                         ));
                     }
-                    let mut scope = declarations.clone();
-                    let mut visible_names = declaration_names.clone();
-                    let mut folded_names = folded_declarations.clone();
-                    typing.declare_parameters(
-                        function,
-                        parameters,
-                        &mut scope,
-                        &mut visible_names,
-                        &mut folded_names,
-                        &mut diagnostics,
+                    let mut scope = BlockLexicalScope::new(
+                        &declarations,
+                        &declaration_names,
+                        &folded_declarations,
                     );
+                    if !function.parameters.is_empty() {
+                        typing.declare_parameters(
+                            function,
+                            parameters,
+                            scope.types.to_mut(),
+                            scope.names.to_mut(),
+                            scope.folded_names.to_mut(),
+                            &mut diagnostics,
+                        );
+                    }
                     if outputs.outputs.len() > 1 && !function.body.final_output_values.is_empty() {
                         let tail = function.body.tail_conditional();
                         let unsafe_context = tail.is_some() && function.body.unsafe_context;
-                        check_final_output_prefix(
-                            &function.body,
-                            &mut scope,
-                            &mut visible_names,
-                            &mut folded_names,
-                            typing,
-                            &mut diagnostics,
-                            unsafe_context,
-                            overloads,
-                            inference,
-                        );
+                        if function.body.items.len() != function.body.final_output_values.len() {
+                            check_final_output_prefix(
+                                &function.body,
+                                scope.types.to_mut(),
+                                scope.names.to_mut(),
+                                scope.folded_names.to_mut(),
+                                typing,
+                                &mut diagnostics,
+                                unsafe_context,
+                                overloads,
+                                inference,
+                            );
+                        }
                         if let Some(tail) = tail {
                             validate_tail_conditional_return(
                                 tail,
                                 &outputs.outputs,
-                                &scope,
-                                &visible_names,
-                                &folded_names,
+                                &scope.types,
+                                &scope.names,
+                                &scope.folded_names,
                                 typing,
                                 &mut diagnostics,
                                 unsafe_context,
@@ -7110,9 +7116,9 @@ pub(super) fn validate(
                                 expression,
                                 value.span,
                                 outputs,
-                                &scope,
-                                &visible_names,
-                                &folded_names,
+                                &scope.types,
+                                &scope.names,
+                                &scope.folded_names,
                                 &mut diagnostics,
                                 overloads,
                                 inference,
@@ -7134,9 +7140,9 @@ pub(super) fn validate(
                                 let actual = expression_type_expected(
                                     expression,
                                     &output.ty,
-                                    &scope,
-                                    &visible_names,
-                                    &folded_names,
+                                    &scope.types,
+                                    &scope.names,
+                                    &scope.folded_names,
                                     program,
                                     &mut diagnostics,
                                     false,
@@ -7156,9 +7162,9 @@ pub(super) fn validate(
                         let actual = block_type_expected(
                             &function.body,
                             &output.ty,
-                            &scope,
-                            &visible_names,
-                            &folded_names,
+                            &scope.types,
+                            &scope.names,
+                            &scope.folded_names,
                             program,
                             &mut diagnostics,
                             false,
@@ -7175,9 +7181,9 @@ pub(super) fn validate(
                     } else {
                         let actual = block_type(
                             &function.body,
-                            &scope,
-                            &visible_names,
-                            &folded_names,
+                            &scope.types,
+                            &scope.names,
+                            &scope.folded_names,
                             program,
                             &mut diagnostics,
                             false,
