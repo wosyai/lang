@@ -8187,6 +8187,25 @@ impl StructuralWalker<'_, '_> {
         }
     }
 
+    #[cfg(any(test, feature = "internal-checker"))]
+    fn record_contextual_signed_literal(
+        &mut self,
+        ordinal: OccurrenceOrdinal,
+        value: &ScalarExpression,
+        ty: &ScalarType,
+    ) {
+        if !matches!(value, ScalarExpression::Unary {
+            operator: super::UnaryOperator::Negate, ..
+        }) || self.structure.checked_types.expressions.get(&ordinal) != Some(ty) {
+            return;
+        }
+        if let Some(literal) = super::checker_flow::concrete_integer_literal(value)
+            .filter(|literal| super::typecheck::integer_literal_fits_type(literal, ty))
+        {
+            self.structure.checker_integer_literals.insert(ordinal, literal.into_owned());
+        }
+    }
+
     fn binding_region(
         &mut self,
         binding: &ScalarBinding,
@@ -8214,19 +8233,9 @@ impl StructuralWalker<'_, '_> {
             && matches!(self.mode, WalkMode::Callable(_))
         {
             if let (BindingInitialization::Outputs(outputs), [receiver]) = (&initialization, binding.receivers.as_slice()) {
-                if receiver.contextual_storage.is_some()
-                    && outputs.secondary.is_empty()
-                    && self.structure.checked_types.expressions.get(&outputs.primary) == Some(&receiver.ty)
-                {
-                    if let ScalarBindingOutput::Evaluate(value @ ScalarExpression::Unary {
-                        operator: super::UnaryOperator::Negate, ..
-                    }) = binding.output_source(0)
-                    {
-                        if let Some(literal) = super::checker_flow::concrete_integer_literal(value)
-                            .filter(|literal| super::typecheck::integer_literal_fits_type(literal, &receiver.ty))
-                        {
-                            self.structure.checker_integer_literals.insert(outputs.primary, literal.into_owned());
-                        }
+                if receiver.contextual_storage.is_some() && outputs.secondary.is_empty() {
+                    if let ScalarBindingOutput::Evaluate(value) = binding.output_source(0) {
+                        self.record_contextual_signed_literal(outputs.primary, value, &receiver.ty);
                     }
                 }
             }
@@ -8434,6 +8443,23 @@ impl StructuralWalker<'_, '_> {
                         target_span: target.target_span,
                         replacement,
                     });
+                }
+                #[cfg(any(test, feature = "internal-checker"))]
+                if self.occurrence_typing.checker_directives_enabled()
+                    && matches!(self.mode, WalkMode::Callable(_))
+                {
+                    if let ([target], [slot], [evaluation], [value]) = (
+                        assignment.targets.as_slice(), slots.as_slice(),
+                        evaluations.as_slice(), assignment.values.as_slice(),
+                    ) {
+                        if let (ScalarPlace::Contextual { ty, .. }, AssignmentReplacement::Resolved(replacement)) =
+                            (&target.place, &slot.replacement)
+                        {
+                            if ty == replacement {
+                                self.record_contextual_signed_literal(evaluation.expression, value, replacement);
+                            }
+                        }
+                    }
                 }
                 if let DirectDestinationFacts::Prepared(rows) = &mut self.direct_destinations {
                     let resolver = match &self.mode {
