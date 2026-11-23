@@ -122,7 +122,7 @@ fn joined_shared_child_does_not_widen_same_root_rebound_parents() {
 fn joined_child_survives_consecutive_unrelated_scalar_stores() {
     let program = joined("parent = &!second;", true, "unrelated = 4; unrelated = 5;", "first = 3; unrelated;");
     let program = program.replace("u8 first = 7;", "u8 first = 7; u8 unrelated = 0;");
-    check_case(&program, Expected::Valid, true);
+    check(&program, Expected::Valid);
 }
 
 #[test]
@@ -130,4 +130,23 @@ fn joined_child_still_blocks_selected_owner_after_an_unrelated_store() {
     let program = joined("parent = &!second;", true, "unrelated = 4; first = 3;", "unrelated;");
     let program = program.replace("u8 first = 7;", "u8 first = 7; u8 unrelated = 0;");
     check(&program, Expected::LiveConflict);
+}
+
+#[test]
+fn joined_child_reads_both_use_the_selected_owner() {
+    let program = joined("parent = &!second;", true, "", "u8 again = *child; first = 3;");
+    let program = program.replace("    seen\n", "    if (again == seen) { seen } else { 0 }\n");
+    check_case(&program, Expected::Valid, true);
+}
+
+#[test]
+fn joined_child_stays_live_between_typed_reads() {
+    let program = joined("parent = &!second;", true, "", "first = 3; u8 again = *child; again;");
+    check(&program, Expected::LiveConflict);
+}
+
+#[test]
+fn joined_child_still_declines_reference_aliases() {
+    let program = joined("parent = &!second;", true, "", "*u8 alias = child; u8 again = *alias; again;");
+    check(&program, Expected::Declined);
 }

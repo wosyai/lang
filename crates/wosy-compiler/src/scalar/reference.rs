@@ -6311,20 +6311,31 @@ fn joined_root_reborrow_binding<'a>(
     if !matches!(&read.kind, CfgPointKind::Read { binding } if binding == child_binding) {
         return None;
     }
-    let [deref] = read.successors.as_slice() else { return None };
-    let deref = points.get(deref.0)?;
-    if read.scope != child.scope || deref.scope != child.scope
-        || !matches!(&deref.kind, CfgPointKind::ReadPlace {
-            place: ScalarPlace::Dereference { .. }, pointer_point: Some(ptr), reads_origin: false, ..
-        } if *ptr == read.id)
-        || pointee_reads.binary_search(&deref.id).is_err()
-    {
-        return None;
-    }
+    let mut next_pointee = &pointee_reads[pointee_reads.partition_point(|id| *id <= child.id)..];
     for rest in points.get(child.id.0 + 1..)? {
         match &rest.kind {
-            CfgPointKind::Read { binding } if binding == child_binding && rest.id != read.id
-            => return None,
+            CfgPointKind::Read { binding } if binding == child_binding => {
+                let [deref] = rest.successors.as_slice() else { return None };
+                let deref = points.get(deref.0)?;
+                if rest.scope != child.scope || deref.scope != child.scope
+                    || !matches!(&deref.kind, CfgPointKind::ReadPlace {
+                        place: ScalarPlace::Dereference { .. }, pointer_point: Some(ptr), reads_origin: false, ..
+                    } if *ptr == rest.id)
+                {
+                    return None;
+                }
+                let checked = if deref.id.0 == rest.id.0 + 1 {
+                    while next_pointee.first().is_some_and(|id| *id < deref.id) {
+                        next_pointee = &next_pointee[1..];
+                    }
+                    next_pointee.first() == Some(&deref.id)
+                } else {
+                    pointee_reads.binary_search(&deref.id).is_ok()
+                };
+                if !checked {
+                    return None;
+                }
+            }
             CfgPointKind::Assign { target, .. } | CfgPointKind::Borrow { place: target, .. }
             | CfgPointKind::Move { place: target, .. } | CfgPointKind::DeferredMove { place: target, .. }
                 if target.binding == *child_binding => return None,
