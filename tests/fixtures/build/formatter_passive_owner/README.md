@@ -47,3 +47,8 @@ A separate unit-to-unit relay control forwards the moved parameter once
 more before the same terminal read and release. The intermediate
 function must not release or allocate backing. This does not add
 coverage of a multi-output consumer.
+
+The lexical-move control transfers the formatter result to a named value
+in an inner scope. It reads the destination descriptor before that scope
+ends. The same formatter base must remain live across the move and be freed
+once at the inner exit, with no second release at the outer exit.

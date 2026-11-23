@@ -64,6 +64,14 @@ exit = 0
 command = ["wosy", "build", "parameter-relay-wasm"]
 exit = 0
 
+[[steps]]
+command = ["wosy", "build", "lexical-move-native"]
+exit = 0
+
+[[steps]]
+command = ["wosy", "build", "lexical-move-wasm"]
+exit = 0
+
 [[assert]]
 command = ["wosy", "run", "nested-native"]
 exit = 0
@@ -171,6 +179,20 @@ exact = true
 
 [[assert]]
 command = ["wosy", "run", "parameter-relay-wasm"]
+exit = 0
+stdout = "expected/named.stdout"
+stderr = "expected/verified.stderr"
+exact = true
+
+[[assert]]
+command = ["wosy", "run", "lexical-move-native"]
+exit = 0
+stdout = "expected/named.stdout"
+stderr = "expected/verified.stderr"
+exact = true
+
+[[assert]]
+command = ["wosy", "run", "lexical-move-wasm"]
 exit = 0
 stdout = "expected/named.stdout"
 stderr = "expected/verified.stderr"
