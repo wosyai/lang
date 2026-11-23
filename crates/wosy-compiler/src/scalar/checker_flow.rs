@@ -564,6 +564,94 @@ impl<'a, const TOTAL: bool> ScopedAuthoredReturn<'a> for OrderedRootLiteralProof
 
 #[cfg(feature = "internal-checker")]
 #[derive(Clone, Copy)]
+struct OrderedRootEntryEquality<'a, 'scope> {
+    conditions: OrderedRootConditions<'a>,
+    old: usize,
+    guard: Option<(usize, IntegerRelation, &'scope BigInt)>,
+    observed: &'scope std::cell::RefCell<(bool, Option<SymbolicLiteralFailure<'a>>)>,
+}
+
+#[cfg(feature = "internal-checker")]
+impl<'a> ScopedAuthoredReturn<'a> for OrderedRootEntryEquality<'a, '_> {
+    const ENABLED: bool = false;
+    const OBSERVE_RETURN: bool = true;
+
+    fn at(
+        self, _: &FunctionCallSites, _: BlockOrdinal, _: FinalOutputSlot, _: &ScalarType,
+        _: &IntegerRoots<'_>, _: &IntegerInputs,
+    ) -> Option<&'a BigInt> {
+        None
+    }
+
+    fn split_unprepared(
+        self, calls: &FunctionCallSites, slot: RootBranchSlot, roots: &IntegerRoots<'_>, path: IntegerInputs,
+    ) -> Option<(IntegerInputs, IntegerInputs, Option<usize>)> {
+        self.conditions.split_unprepared(calls, slot, roots, path)
+    }
+
+    fn observe_return(
+        self, slot: FinalOutputSlot, value: IntegerReturn<'a>, roots: &IntegerRoots<'a>, path: &IntegerInputs,
+    ) -> Option<()> {
+        let returned_axis = symbolic_return_axis(value, roots)?;
+        let mut observed = self.observed.borrow_mut();
+        if observed.1.is_some() {
+            return Some(());
+        }
+        for row in &path.0 {
+            let restricted = self.guard.map(|(axis, relation, bound)| {
+                let original = row[axis].as_ref();
+                let admitted = if original.every(relation, bound) {
+                    Cow::Borrowed(original)
+                } else {
+                    Cow::Owned(original.keep_relation(relation, bound))
+                };
+                (axis, admitted)
+            });
+            if restricted.as_ref().is_some_and(|(_, axis)| axis.is_empty()) {
+                continue;
+            }
+            observed.0 = true;
+            if returned_axis == Some(self.old) {
+                break;
+            }
+            let axis = |index| {
+                restricted.as_ref().filter(|(slot, _)| index == *slot)
+                    .map_or_else(|| row.get(index).map(Rc::as_ref), |(_, admitted)| Some(admitted.as_ref()))
+            };
+            let (old_min, old_max) = axis(self.old)?.extremes()?;
+            let mismatch = match (value, returned_axis) {
+                (IntegerReturn::Const(returned), None) => {
+                    if returned != old_min { Some((returned, old_min)) }
+                    else if returned != old_max { Some((returned, old_max)) }
+                    else { None }
+                }
+                (IntegerReturn::Alias(_), Some(axis_index)) => {
+                    let (returned_min, returned_max) = axis(axis_index)?.extremes()?;
+                    if returned_min != old_max { Some((returned_min, old_max)) }
+                    else if returned_max != old_min { Some((returned_max, old_min)) }
+                    else { None }
+                }
+                _ => return None,
+            };
+            if let Some((returned, old)) = mismatch {
+                let mut failure = SymbolicLiteralFailure::from_row(
+                    slot, roots, row, returned_axis, Cow::Borrowed(returned), Some((self.old, old)),
+                );
+                if let Some((axis, admitted)) = &restricted {
+                    if *axis != self.old && Some(*axis) != returned_axis {
+                        failure.state.0[0][*axis] = Rc::new(IntegerSet::singleton(admitted.extremes()?.0));
+                    }
+                }
+                observed.1 = Some(failure);
+                break;
+            }
+        }
+        Some(())
+    }
+}
+
+#[cfg(feature = "internal-checker")]
+#[derive(Clone, Copy)]
 struct NamedAuthoredReturn<'a> {
     block: BlockOrdinal,
     body: &'a super::ScalarBlock,
@@ -1989,6 +2077,34 @@ pub(super) fn collect_ordered_root_requirement_failures<'a>(
         calls, IntegerRequirementEntry::Arbitrary, None, false, &mut sink, OrderedRootConditions(body),
     )?;
     Some((active, failures))
+}
+
+#[cfg(feature = "internal-checker")]
+pub(super) fn collect_ordered_root_entry_equality<'a>(
+    calls: &'a FunctionCallSites, body: &'a super::ScalarBlock, old: usize, predicate: Option<&IntegerPredicate>,
+) -> Option<(bool, Vec<IntegerCheckFailure<'a>>, bool, Option<SymbolicLiteralFailure<'a>>)> {
+    let parameters = &calls.boundary.parameters;
+    let bindings = calls.boundary.checker_parameter_bindings.as_deref()?;
+    if &parameters.get(old)?.ty != integer_tail_type(calls)? || parameters.len() > 2 {
+        return None;
+    }
+    let guard = if let Some(predicate) = predicate {
+        let axis = bindings.iter().position(|binding| binding == &predicate.binding)?;
+        if parameters.get(axis)?.ty != predicate.ty {
+            return None;
+        }
+        Some((axis, IntegerRelation::from_operator(&predicate.operator)?, &predicate.bound))
+    } else {
+        None
+    };
+    let observed = std::cell::RefCell::new((false, None));
+    let scope = OrderedRootEntryEquality { conditions: OrderedRootConditions(body), old, guard, observed: &observed };
+    let mut failures = Vec::new();
+    let (active, _) = collect_integer_requirement_failures_in_scope(
+        calls, IntegerRequirementEntry::Arbitrary, None, false, &mut |failure| failures.push(failure), scope,
+    )?;
+    let (returned, failure) = observed.into_inner();
+    Some((active, failures, returned, failure))
 }
 
 #[cfg(feature = "internal-checker")]

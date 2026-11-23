@@ -2489,6 +2489,21 @@ impl SymbolicRootProof for SelectedSymbolicProof<'_, '_> {
             _ => return Err(ProjectCheck::Unsupported),
         };
         if rest.is_empty() {
+            if let MainFlowProofBound::Entry(slot) = first.bound {
+                if Some(first.relation) != IntegerRelation::from_operator(&BinaryOperator::Equal) {
+                    return Err(ProjectCheck::Unsupported);
+                }
+                let (active, directives, returned, failure) = super::checker_flow::collect_ordered_root_entry_equality(
+                    calls, &function.body, slot, predicate,
+                ).ok_or(ProjectCheck::Unsupported)?;
+                for directive in directives {
+                    effects.push_callable(calls, source, directive);
+                }
+                if let Some(failure) = failure {
+                    self.record(first, function, source, effects.records.len(), failure, None);
+                }
+                return Ok(Some(active || returned));
+            }
             let first_bound = first.bound.literal().ok_or(ProjectCheck::Unsupported)?;
             let candidate = group.issuer.as_ref().filter(|_| first.proof_source == source);
             let (active, directives, returned, failure) = if candidate.is_some() {
@@ -8392,9 +8407,56 @@ mod tests {
             assert_eq!((first.invocation.directive_position, second.invocation.directive_position), (0, 1));
         }
         assert!(!run(program, ScalarCheckerScope::MainFlowOnly).unwrap().active);
-        assert!(matches!(run(program, ScalarCheckerScope::CurrentPackage), Err(ProjectCheck::Unsupported)));
+        let symbolic = run(program, ScalarCheckerScope::CurrentPackage).unwrap();
+        let failed = symbolic.symbolic_diagnostic.expect("unused choose has a signed counterexample");
+        assert_eq!(failed.returned, BigInt::from(0));
+        let original = BigInt::from(i16::MAX);
+        let returned = BigInt::from(0);
+        assert!(failed.witness.intervals_at(0, 0).unwrap().eq([(&original, &original)]));
+        assert!(failed.witness.intervals_at(0, 1).unwrap().eq([(&returned, &returned)]));
         let unknown = actual.replace("core.old(entry)", "core.old(unknown)");
         assert!(matches!(run(&unknown, ScalarCheckerScope::MainFlowOnly), Err(ProjectCheck::InvalidProof)));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordered_package_bare_old_goal_keeps_unguarded_directives_and_exact_witness() {
+        let app = source("src/main.w", "ordered-symbolic-old-goal");
+        let run = |text: &str, scope| {
+            let (_, proof) = crate::parse_proof_source(app.clone(), text.to_owned(), &[])
+                .unwrap_or_else(|_| panic!("valid symbolic entry-goal proof"));
+            check_loaded_ordered_proof_diagnostics(
+                Vec::new(), vec![(proof, Vec::new())], vec![app.clone()], inputs(), scope,
+            ).unwrap()
+        };
+        let program = format!(r#"%%start
+            i8(i8, i8) choose = fn(value, gate) {{
+                core.require(gate != -4, {OUTPUT});
+                if (gate != -3) {{ value }} else {{ -2 }}
+            }};
+            proof entry_value for choose(entry, selector) -> (out)
+                where (selector == -3) ensures (out == core.old(entry)) {{}}
+        %%end"#);
+        assert!(!run(&program, ScalarCheckerScope::MainFlowOnly).active);
+        let receipt = run(&program, ScalarCheckerScope::CurrentPackage);
+        let diagnostic = receipt.symbolic_diagnostic.expect("constant differs from retained entry");
+        assert_eq!(diagnostic.returned, BigInt::from(-2));
+        assert_eq!(diagnostic.directive_position, 1);
+        let snippet = |span: ByteSpan| &program[span.start as usize..span.end as usize];
+        assert_eq!(snippet(diagnostic.goal.range), "out == core.old(entry)");
+        assert_eq!(snippet(diagnostic.output.range), "-2");
+        let minimum = BigInt::from(i8::MIN);
+        let gate = BigInt::from(-3);
+        let outside_guard = BigInt::from(-4);
+        assert!(diagnostic.witness.intervals_at(0, 0).unwrap().eq([(&minimum, &minimum)]));
+        assert!(diagnostic.witness.intervals_at(0, 1).unwrap().eq([(&gate, &gate)]));
+        let [directive] = receipt.directives.as_slice() else { panic!("proof guard must not erase authored directive"); };
+        assert!(directive.witness.intervals_at(0, 1).unwrap().eq([(&outside_guard, &outside_guard)]));
+
+        let passing = program.replace("else { -2 }", "else { value }");
+        let receipt = run(&passing, ScalarCheckerScope::CurrentPackage);
+        assert!(receipt.active && receipt.symbolic_diagnostic.is_none());
+        assert_eq!(receipt.directives.len(), 1);
     }
 
     #[cfg(feature = "internal-checker")]
