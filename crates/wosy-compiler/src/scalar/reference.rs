@@ -5255,6 +5255,15 @@ fn is_lexical_field_path(path: &[ReferencePlaceProjection]) -> bool {
     })
 }
 
+fn direct_lexical_loan_root(place: &ReferencePlaceId) -> Option<&ScalarPlace> {
+    let root = reference_root(&place.place);
+    (matches!(root, ScalarPlace::Name { .. })
+        && place.projections.iter().all(|projection| matches!(projection,
+            ReferencePlaceProjection::Field(ScalarFieldReference::Resolved(_))
+                | ReferencePlaceProjection::Index(_))))
+        .then_some(root)
+}
+
 #[derive(Clone, Copy)]
 enum CheckedHandleStorage {
     Lexical,
@@ -6951,7 +6960,6 @@ fn transfer_reference_facts(
                 if !matches!(place, ScalarPlace::Dereference { .. }));
         match &point.kind {
             CfgPointKind::Borrow { place, loan } if loan.parent.is_none()
-                && is_lexical_field_path(&place.projections)
                 && (!place.projections.is_empty() || (
                     matches!(place.place, ScalarPlace::Name { .. })
                         && matches!(loan.origin_place.place, ScalarPlace::Name { .. })
@@ -6959,20 +6967,19 @@ fn transfer_reference_facts(
                         && loan.origin_place.binding == place.binding
                 )) =>
             {
-                let owner = known_lexical_owners.get_or_insert_with(HashMap::new).entry(&place.binding).or_insert(None);
-                let root = reference_root(&place.place);
-                if owner.is_none() && loan.mode == ScalarReferenceMutability::Mutable
-                    && matches!(root, ScalarPlace::Name { .. })
-                {
-                    *owner = Some(ReferencePlaceId {
-                        source: place.source.clone(),
-                        function_span: place.function_span,
-                        declaration_span: place.declaration_span,
-                        block_span: place.block_span,
-                        binding: place.binding.clone(),
-                        projections: Vec::new(),
-                        place: root.clone(),
-                    });
+                if let Some(root) = direct_lexical_loan_root(place) {
+                    let owner = known_lexical_owners.get_or_insert_with(HashMap::new).entry(&place.binding).or_insert(None);
+                    if owner.is_none() && loan.mode == ScalarReferenceMutability::Mutable {
+                        *owner = Some(ReferencePlaceId {
+                            source: place.source.clone(),
+                            function_span: place.function_span,
+                            declaration_span: place.declaration_span,
+                            block_span: place.block_span,
+                            binding: place.binding.clone(),
+                            projections: Vec::new(),
+                            place: root.clone(),
+                        });
+                    }
                 }
             }
             _ => {}
@@ -8029,8 +8036,7 @@ fn transfer_reference_facts(
                 };
                 for place in whole.into_iter().chain(projected) {
                     if !owners.get(&place.binding).is_some_and(Option::is_some)
-                        || !is_lexical_field_path(&place.projections)
-                        || !matches!(reference_root(&place.place), ScalarPlace::Name { .. })
+                        || direct_lexical_loan_root(place).is_none()
                         || original_points[id.0].successors.as_slice().first()
                             .filter(|_| original_points[id.0].successors.len() == 1)
                             .is_some_and(|successor| {
@@ -8567,7 +8573,7 @@ fn transfer_reference_facts(
                                 });
                             }
                             if loan.parent.is_none() {
-                                is_lexical_field_path(&place.projections)
+                                direct_lexical_loan_root(place).is_some()
                             } else {
                                 pending_here.is_some_and(|(_, site)| selected_parent.is_some_and(|(origin, _)|
                                     state.point_values.get(site.read).is_some_and(|origins| origins.contains(&origin))))

@@ -292,7 +292,19 @@ fn replay_observes_only_consumed_first_output_contract_origins() {
         assert!(right_other_output.origins.is_empty());
 
         let mut replays = Vec::new();
-        let mut pointers = Vec::new();
+        let marker = ByteSpan::new(text.len() as u32 + 1, text.len() as u32 + 2);
+        let mark_entries = |updates: &mut [(usize, FunctionReferenceResult)]| {
+            for (_, result) in updates {
+                result.cfg.points[0].source_span.range = marker;
+            }
+        };
+        let assert_replayed = |updates: &[(usize, FunctionReferenceResult)], expected: [bool; 4]| {
+            assert_eq!(updates.len(), expected.len());
+            for ((_, result), replayed) in updates.iter().zip(expected) {
+                let entry = result.cfg.initial_points[0].source_span.range;
+                assert_eq!(result.cfg.points[0].source_span.range, if replayed { entry } else { marker });
+            }
+        };
         let assert_missing_left = |replays: &[ReferenceContractReplay], updates: &[(usize, FunctionReferenceResult)]| {
             assert!(matches!(
                 replays[2].errors.as_slice(),
@@ -309,8 +321,10 @@ fn replay_observes_only_consumed_first_output_contract_origins() {
             (&previous, &current),
             (&current, &current),
         ].into_iter().enumerate() {
+            mark_entries(&mut updates);
             let mut cursor = 0;
             let mut inputs = HashMap::new();
+            let before = updates.iter().map(|(_, result)| result.cfg.points.as_ptr()).collect::<Vec<_>>();
             for (_, result) in &mut updates {
                 transfer_function_output_contracts(
                     result, from, to, &mut inputs, &mut replays, &mut cursor,
@@ -322,13 +336,13 @@ fn replay_observes_only_consumed_first_output_contract_origins() {
             } else {
                 assert!(replays.iter().all(|replay| replay.errors.is_empty()));
             }
-            pointers.push(updates.iter().map(|(_, result)| result.cfg.points.as_ptr()).collect::<Vec<_>>());
+            assert_replayed(&updates, match step {
+                0 => [true; 4],
+                1 => [false, false, true, false],
+                _ => [false; 4],
+            });
+            assert!(updates.iter().zip(before).all(|((_, result), pointer)| result.cfg.points.as_ptr() == pointer));
         }
-        assert_ne!(pointers[0][2], pointers[1][2]);
-        for index in [0, 1, 3] {
-            assert_eq!(pointers[0][index], pointers[1][index]);
-        }
-        assert_eq!(pointers[1], pointers[2]);
         let right_call = replays[3].module_calls[0];
         updates[3].1.aggregate.checked_successor_candidate = Some(right_call);
         let metadata_only = ReferenceOutputContracts::new(vec![
@@ -349,6 +363,7 @@ fn replay_observes_only_consumed_first_output_contract_origins() {
             (&current, &metadata_only, false),
             (&metadata_only, &removed, true),
         ] {
+            mark_entries(&mut updates);
             let mut cursor = 0;
             let mut inputs = HashMap::new();
             let left_before = updates[2].1.cfg.points.as_ptr();
@@ -366,10 +381,8 @@ fn replay_observes_only_consumed_first_output_contract_origins() {
             } else {
                 assert!(replays.iter().all(|replay| replay.errors.is_empty()));
             }
-            assert_eq!(
-                updates[2].1.cfg.points.as_ptr() != left_before,
-                std::ptr::eq(to, &removed),
-            );
+            assert_eq!(updates[2].1.cfg.points.as_ptr(), left_before);
+            assert_replayed(&updates, [false, false, std::ptr::eq(to, &removed), false]);
         }
     }
 }

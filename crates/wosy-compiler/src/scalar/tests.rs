@@ -2241,6 +2241,49 @@ fn checked_aggregate_copy_and_single_move_are_accepted_in_both_pipelines() {
 }
 
 #[test]
+fn direct_indexed_reads_and_borrows_use_the_live_loan_path() {
+    let cases = [
+        ("u8 observed = bytes[0]; observed; retained;", Some("bytes[0]; observed")),
+        ("u8 observed = bytes[index]; observed; retained;", Some("bytes[index]")),
+        ("u8 observed = bytes[1]; observed; retained;", None),
+        ("retained; u8 observed = bytes[0]; observed;", None),
+        ("*u8 reader = &bytes[0]; reader; retained;", Some("&bytes[0]; reader")),
+        ("*u8 reader = &bytes[1]; reader; retained;", None),
+        ("*!u8 writer = &!bytes[index]; writer; retained;", Some("&!bytes[index]")),
+    ];
+    for (parameters, formals, storage) in [
+        ("", "", "u8[2] bytes = [7, 9];"),
+        ("u64", "length", "u8[length] bytes; bytes[0] = 7; bytes[1] = 9;"),
+    ] {
+        for (body, overlap) in cases {
+            let (parameters, formals) = match (body.contains("[index]"), parameters.is_empty()) {
+                (true, true) => ("u64", "index"),
+                (true, false) => ("u64, u64", "index, length"),
+                (false, _) => (parameters, formals),
+            };
+            let function = if formals.is_empty() { "fn".to_owned() } else { format!("fn({formals})") };
+            let text = format!(
+                "%%start\nunit({parameters}) f = {function} {{ {storage} *!u8 retained = &!bytes[0]; {body} }};\n%%end",
+            );
+            let (single, project) = both_reference_functions(&text);
+            for diagnostics in [&single.diagnostics, &project.diagnostics] {
+                if let Some(overlap) = overlap {
+                    let access = text.find(overlap).unwrap() as u32;
+                    let origin = text.find("&!bytes[0]").unwrap() as u32;
+                    assert!(diagnostics.iter().any(|diagnostic| {
+                        diagnostic.code == "B0003"
+                            && diagnostic.labels.first().is_some_and(|label| label.span.range.start == access)
+                            && diagnostic.labels.iter().skip(1).any(|label| label.span.range.start == origin)
+                    }), "{text}: {diagnostics:?}");
+                } else {
+                    assert!(diagnostics.is_empty(), "{text}: {diagnostics:?}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn dynamic_index_write_reports_overlapping_loan_in_both_pipelines() {
     let text = "%%start\nunit(u64) f = fn(index) { u8[2] bytes = [1, 2]; *u8 reader = &bytes[0]; index; bytes[index] = 3; reader; };\n%%end";
     let (single, project) = both_reference_functions(text);
