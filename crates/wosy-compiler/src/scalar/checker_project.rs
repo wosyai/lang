@@ -2737,14 +2737,22 @@ impl SelectedSymbolicProof<'_, '_> {
         let MainFlowProofCases::Bare { first, rest } = &group.cases else { return Err(ProjectCheck::Unsupported); };
         let [parameter] = body.boundary.parameters.as_slice() else { return Err(ProjectCheck::Unsupported); };
         let [output] = body.boundary.results.as_slice() else { return Err(ProjectCheck::Unsupported); };
+        use super::checker_flow::PartitionedProofGoal;
         let issuer = group.issuer.as_ref().filter(|issuer| std::ptr::eq(issuer.body, body));
-        if first.proof_source != source || (issuer.is_none() && !first.guard.always_rejects)
+        let goal = match first.bound {
+            MainFlowProofBound::Literal(bound) => PartitionedProofGoal::Literal(first.relation, bound),
+            MainFlowProofBound::Entry(0) if parameter.ty == output.ty
+                && Some(first.relation) == IntegerRelation::from_operator(&BinaryOperator::Equal) =>
+                    PartitionedProofGoal::EntryEquality,
+            _ => return Err(ProjectCheck::Unsupported),
+        };
+        let literal_bound = first.bound.literal();
+        if first.proof_source != source || (literal_bound.is_some() && issuer.is_none() && !first.guard.always_rejects)
             || !rest.is_empty() || !supported_calling_proof_body(body, &output.ty)
             || first.guard.domain.is_some() || first.guard.comparisons.len() > 1
         {
             return Err(ProjectCheck::Unsupported);
         }
-        let bound = first.bound.literal().ok_or(ProjectCheck::Unsupported)?;
         let domain = IntegerSet::from_type(&parameter.ty).ok_or(ProjectCheck::Unsupported)?;
         let proof_domain = if first.guard.always_rejects {
             None
@@ -2769,17 +2777,18 @@ impl SelectedSymbolicProof<'_, '_> {
             (result, evaluator.had_obligations)
         };
         let Some(proof_domain) = proof_domain else { return Ok(Some(active)); };
-        let elidable = effects.records.len() == first_directive
+        let elidable = literal_bound.is_some() && effects.records.len() == first_directive
             && summary_elision_safe(body)
             && evaluator.reached.iter().all(|&(module, item)| {
                 runtime.calls.function_body(module, item, None).is_some_and(summary_elision_safe)
             });
         let verified = super::checker_flow::verify_partitioned_call_return(
-            body, &result, &proof_domain, elidable, |value| first.relation.accepts(value.cmp(bound)),
+            body, &result, &proof_domain, elidable, goal,
         ).ok_or(ProjectCheck::Unsupported)?;
         if let Some(failure) = verified.failure {
             self.record(first, function, source, effects.records.len(), failure, None);
         } else if verified.covers_guard {
+            let bound = literal_bound.ok_or(ProjectCheck::Unsupported)?;
             let issuer = issuer.ok_or(ProjectCheck::Unsupported)?;
             self.equalities.insert(VerifiedSymbolicEquality {
                 target, canonical_target: issuer.canonical_target, layout: issuer.layout,
@@ -10182,6 +10191,42 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
         assert!(run(&clean).unwrap().symbolic_diagnostic.is_none());
         let cyclic = text.replace("middle(n); produced", "producer(n); produced");
         assert!(matches!(run(&cyclic), Err(ProjectCheck::Unsupported)));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordered_named_proof_checks_calling_producer_against_its_own_entry() {
+        let app = source("src/main.w", "named-proof-calling-producer-entry");
+        let text = format!(r#"%%start
+            unit() checked_step = fn {{ core.require(false, {OUTPUT}); }};
+            i8(i8) leaf = fn(input) {{ input }};
+            i8(i8) wrap = fn(value) {{ i8 middle = leaf(value); middle }};
+            i8(i8) producer = fn(value) {{ checked_step(); i8 result = wrap(value); result }};
+            proof guarded for producer(entry) -> (out) where (entry >= 0) ensures (out == core.old(entry)) {{}}
+        %%end"#);
+        let run = |text: &str| {
+            let (_, proof) = crate::parse_proof_source(app.clone(), text.to_owned(), &[]).ok().unwrap();
+            check_loaded_ordered_proof_diagnostics(
+                Vec::new(), vec![(proof, Vec::new())], vec![app.clone()], inputs(), ScalarCheckerScope::CurrentPackage,
+            )
+        };
+        let proved = run(&text).unwrap();
+        assert!(proved.active && proved.diagnostics.is_empty() && proved.symbolic_diagnostic.is_none());
+        assert!(!proved.directives.is_empty());
+
+        let constant = text.replace("{ input }", "{ if (input < 0) { -3 } else { 7 } }");
+        let failed = run(&constant).unwrap();
+        let proof = failed.symbolic_diagnostic.unwrap();
+        assert_eq!(proof.returned, BigInt::from(7));
+        assert!(proof.witness.intervals_at(0, 0).unwrap().eq([
+            (&BigInt::from(0), &BigInt::from(6)), (&BigInt::from(8), &BigInt::from(127)),
+        ]));
+        assert!(proof.directive_position > 0);
+
+        for guard in ["entry == 7", "entry < -128"] {
+            let unchanged = constant.replace("entry >= 0", guard);
+            assert!(run(&unchanged).unwrap().symbolic_diagnostic.is_none());
+        }
     }
 
     #[cfg(feature = "internal-checker")]

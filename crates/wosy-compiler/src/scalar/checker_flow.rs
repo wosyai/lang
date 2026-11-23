@@ -2384,9 +2384,15 @@ pub(super) struct PartitionedCallProof<'a> {
 }
 
 #[cfg(feature = "internal-checker")]
+pub(super) enum PartitionedProofGoal<'a> {
+    Literal(IntegerRelation, &'a BigInt),
+    EntryEquality,
+}
+
+#[cfg(feature = "internal-checker")]
 pub(super) fn verify_partitioned_call_return<'a>(
     producer: &'a FunctionCallSites, returned: &ActualCallResult, domain: &IntegerSet,
-    eligible_for_elision: bool, accepts: impl Fn(&BigInt) -> bool,
+    eligible_for_elision: bool, goal: PartitionedProofGoal<'_>,
 ) -> Option<PartitionedCallProof<'a>> {
     let ActualCallResult::PartitionedInteger(pieces) = returned else { return None; };
     let [binding] = producer.boundary.checker_parameter_bindings.as_deref()? else { return None; };
@@ -2394,17 +2400,29 @@ pub(super) fn verify_partitioned_call_return<'a>(
     let mut applicable = false;
     let mut covered = Vec::new();
     for piece in pieces {
-        let IntegerPartitionOutput::Singleton(output) = &piece.output else { return None; };
+        let output = match (&goal, &piece.output) {
+            (PartitionedProofGoal::Literal(..), IntegerPartitionOutput::InputAlias) => return None,
+            (_, IntegerPartitionOutput::InputAlias) => None,
+            (_, IntegerPartitionOutput::Singleton(output)) => Some(output.singleton_value()?),
+        };
         let input = match piece.input.intersection(domain) {
             IntegerIntersection::Unchanged => Rc::clone(&piece.input),
             IntegerIntersection::Empty => continue,
             IntegerIntersection::Changed(clipped) => Rc::new(clipped),
         };
         applicable = true;
-        let value = output.singleton_value()?;
-        if !accepts(value) {
+        let failure = match (&goal, output) {
+            (PartitionedProofGoal::Literal(relation, bound), Some(value)) if !relation.accepts(value.cmp(bound)) =>
+                Some((Rc::clone(&input), value)),
+            (PartitionedProofGoal::EntryEquality, Some(value)) if input.singleton_value() != Some(value) => {
+                let unequal = IntegerRelation::from_operator(&BinaryOperator::NotEqual)?;
+                Some((Rc::new(input.keep_relation(unequal, value)), value))
+            }
+            _ => None,
+        };
+        if let Some((violating_inputs, value)) = failure {
             return Some(PartitionedCallProof { applicable: true, covers_guard: false, failure: Some(SymbolicLiteralFailure {
-                output: piece.span, returned: value.clone(), state: IntegerInputs(vec![vec![input]]),
+                output: piece.span, returned: value.clone(), state: IntegerInputs(vec![vec![violating_inputs]]),
                 axes: vec![(binding, &parameter.ty)],
             }) });
         }
