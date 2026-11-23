@@ -182,10 +182,10 @@ impl<'a> ScopedAuthoredReturn<'a> for () {
 
 #[cfg(feature = "internal-checker")]
 #[derive(Clone, Copy)]
-struct OrderedRootConditions<'a, const BASE: bool = false>(&'a super::ScalarBlock);
+struct OrderedRootConditions<'a, const CONJUNCTION: bool = false>(&'a super::ScalarBlock);
 
 #[cfg(feature = "internal-checker")]
-impl<'a, const BASE: bool> ScopedAuthoredReturn<'a> for OrderedRootConditions<'a, BASE> {
+impl<'a, const CONJUNCTION: bool> ScopedAuthoredReturn<'a> for OrderedRootConditions<'a, CONJUNCTION> {
     const ENABLED: bool = false;
 
     fn at(
@@ -227,7 +227,7 @@ impl<'a, const BASE: bool> ScopedAuthoredReturn<'a> for OrderedRootConditions<'a
         };
         let conjunction = match operator {
             BinaryOperator::Or => false,
-            BinaryOperator::And if BASE => true,
+            BinaryOperator::And if CONJUNCTION => true,
             _ => return None,
         };
         if child(slot.parent, OccurrenceEdge::Condition) != Some(slot.condition)
@@ -500,7 +500,7 @@ struct LiteralGuardAtReturn<'a> {
 #[cfg(feature = "internal-checker")]
 #[derive(Clone, Copy)]
 struct OrderedRootLiteralProof<'a, 'observation, const TOTAL: bool> {
-    conditions: OrderedRootConditions<'a>,
+    conditions: OrderedRootConditions<'a, TOTAL>,
     relation: IntegerRelation,
     bound: &'observation BigInt,
     guard: Option<&'observation LiteralGuardAtReturn<'observation>>,

@@ -9674,6 +9674,45 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
 
     #[cfg(feature = "internal-checker")]
     #[test]
+    fn ordered_current_package_reuses_guarded_proof_of_a_conjunctive_producer() {
+        let app = source("src/main.w", "ordered-conjunctive-proof-producer");
+        let run = |text: &str| {
+            let (_, proof) = crate::parse_proof_source(app.clone(), text.to_owned(), &[])
+                .unwrap_or_else(|_| panic!("valid proof source"));
+            check_loaded_ordered_proof_diagnostics(
+                Vec::new(), vec![(proof, Vec::new())], vec![app.clone()], inputs(), ScalarCheckerScope::CurrentPackage,
+            )
+        };
+        let producer = "i8(i8, u8) producer = fn(entry, limit) { if (entry >= 0 && limit >= 0) { 7 } else { 9 } };";
+        let caller = format!("unit() client = fn() {{ i8 result = producer(0, 0); core.require(result == 8, {OUTPUT}); }};");
+        let package = |producer: &str, caller: &str| format!(r#"%%start
+            {producer}
+            {caller}
+            proof bound for producer(entry, limit) -> (out) where (entry >= 0) ensures (out == 7) {{}}
+        %%end"#);
+        let valid = run(&package(producer, &caller)).unwrap();
+        assert!(valid.active && valid.diagnostics.is_empty() && valid.symbolic_diagnostic.is_none());
+        let [failure] = valid.directives.as_slice() else { panic!("one caller requirement"); };
+        let seven = BigInt::from(7);
+        assert!(failure.witness.intervals_at(0, 0).unwrap().eq([(&seven, &seven)]));
+        let outside = caller.replace("producer(0, 0)", "producer(-1, 0)");
+        assert!(matches!(run(&package(producer, &outside)), Err(ProjectCheck::Unsupported)));
+
+        let bad = producer.replace("limit >= 0", "limit > 0");
+        let rejected = run(&package(&bad, "")).unwrap();
+        assert!(rejected.active && rejected.directives.is_empty() && rejected.symbolic_diagnostic.is_some());
+        let computed = producer.replace("limit >= 0", "limit >= limit");
+        assert!(matches!(run(&package(&computed, "")), Err(ProjectCheck::Unsupported)));
+        let effectful = producer.replace("limit >= 0", "predicate(limit) >= 0");
+        let effectful = format!(r#"u8(u8) predicate = fn(limit) {{
+            core.require(limit == 0, {OUTPUT});
+            limit
+        }}; {effectful}"#);
+        assert!(matches!(run(&package(&effectful, &caller)), Err(ProjectCheck::Unsupported)));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
     fn ordered_current_package_guarded_equality_requires_total_admitted_producer_and_contained_caller() {
         let app = source("src/main.w", "ordered-automatic-proof-guarded-summary");
         let run = |text: &str| {
