@@ -111,11 +111,11 @@ pub(super) fn prepare(
                         continue;
                     }
                     let Some(ty) = parent.children().find(|child| child.kind() == SyntaxKind::TypeSpec).map(|ty| derive_type(&ty)) else {
-                        report(span, "contextual declaration requires a scalar integer type");
+                        report(span, "contextual declaration requires an integer or bool type");
                         continue;
                     };
-                    if !typecheck::is_integer_type(&ty) {
-                        report(span, "contextual declaration requires a scalar integer type");
+                    if ty != ScalarType::Bool && !typecheck::is_integer_type(&ty) {
+                        report(span, "contextual declaration requires an integer or bool type");
                         continue;
                     }
                     let waiting = pending.entry(wosy_syntax::byte_span(&binding)).or_default();

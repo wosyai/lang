@@ -3253,6 +3253,9 @@ fn walk_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, A
                 }
                 if let [receiver] = binding.receivers() {
                     if let Some(identity) = &receiver.contextual_storage {
+                        if !super::typecheck::is_integer_type(&receiver.ty) {
+                            return None;
+                        }
                         let BindingInitialization::Outputs(outputs) = &binding.initialization else { return None; };
                         let value = if let Some(literal) = structure.checker_integer_literals.get(&outputs.primary) {
                             Rc::new(IntegerSet::singleton(literal))
