@@ -7814,6 +7814,38 @@ mod tests {
 
     #[cfg(feature = "internal-checker")]
     #[test]
+    fn ordered_contextual_signed_initializer_keeps_exact_minimum_and_fails_closed() {
+        let app = source("src/main.w", "ordered-contextual-negative-initializer");
+        let program = format!(r#"%%start
+            unit(i8) test_value = fn(entry) {{
+                core.require(entry > 0, {OUTPUT});
+                i8 core.context.count = -128;
+                core.require(core.context.count == -127, {OUTPUT});
+            }};
+            test_value(1);
+        %%end"#);
+        let run = |text: &str, scope| check_loaded_scalar_ordered_local_proof_contexts(
+            vec![(declarations(&app, text), Vec::new())], Vec::new(), vec![app.clone()],
+            inputs(), scope, Vec::new(),
+        );
+        for scope in [ScalarCheckerScope::MainFlowOnly, ScalarCheckerScope::CurrentPackage] {
+            let result = run(&program, scope).unwrap_or_else(|error| panic!("{scope:?}: {error:?}"));
+            let [failure] = result.directives.as_slice() else { panic!("expected one authored requirement"); };
+            let minimum = BigInt::from(i8::MIN);
+            assert!(failure.witness.intervals_at(0, 1).unwrap().eq([(&minimum, &minimum)]));
+
+            let expression = program.replace("= -128;", "= 0 - 3;");
+            assert!(matches!(run(&expression, scope), Err(ScalarOrderedCheckerOutcome::Unsupported)));
+            let out_of_range = program.replace("= -128;", "= -129;");
+            assert!(matches!(run(&out_of_range, scope), Err(ScalarOrderedCheckerOutcome::Invalid(_))));
+            let unsigned = program.replace("i8 core.context.count = -128;", "u8 core.context.count = -1;")
+                .replace("core.context.count == -127", "core.context.count == 1");
+            assert!(matches!(run(&unsigned, scope), Err(ScalarOrderedCheckerOutcome::Invalid(_))));
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
     fn ordered_base_call_copies_exact_contextual_integer_into_callee_parameter() {
         let app = source("src/main.w", "ordered-contextual-call-argument");
         let report = |code: i32| OUTPUT.replace(".code = 1", &format!(".code = {code}"));

@@ -8210,6 +8210,28 @@ impl StructuralWalker<'_, '_> {
             BindingInitialization::Outputs(self.binding_outputs(binding, position, scope)?)
         };
         #[cfg(any(test, feature = "internal-checker"))]
+        if self.occurrence_typing.checker_directives_enabled()
+            && matches!(self.mode, WalkMode::Callable(_))
+        {
+            if let (BindingInitialization::Outputs(outputs), [receiver]) = (&initialization, binding.receivers.as_slice()) {
+                if receiver.contextual_storage.is_some()
+                    && outputs.secondary.is_empty()
+                    && self.structure.checked_types.expressions.get(&outputs.primary) == Some(&receiver.ty)
+                {
+                    if let ScalarBindingOutput::Evaluate(value @ ScalarExpression::Unary {
+                        operator: super::UnaryOperator::Negate, ..
+                    }) = binding.output_source(0)
+                    {
+                        if let Some(literal) = super::checker_flow::concrete_integer_literal(value)
+                            .filter(|literal| super::typecheck::integer_literal_fits_type(literal, &receiver.ty))
+                        {
+                            self.structure.checker_integer_literals.insert(outputs.primary, literal.into_owned());
+                        }
+                    }
+                }
+            }
+        }
+        #[cfg(any(test, feature = "internal-checker"))]
         let mut checker_local = match (&initialization, &self.mode) {
             (BindingInitialization::Outputs(outputs), WalkMode::Callable(callable))
                 if self.occurrence_typing.checker_directives_enabled()
