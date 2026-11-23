@@ -6412,7 +6412,7 @@ pub(super) fn module_diagnostic(
 }
 
 fn is_guarded_struct_field_type(ty: &ScalarType) -> bool {
-    matches!(ty, ScalarType::Bool | ScalarType::Char) || is_integer_type(ty)
+    matches!(ty, ScalarType::Bool | ScalarType::Char) || is_integer_type(ty) || is_float_type(ty)
 }
 
 fn pending_fallible_operator(
@@ -6428,7 +6428,12 @@ fn pending_fallible_operator(
         (ScalarType::Struct(id), ScalarExpression::StructLiteral { fields, .. })
             if !fields.is_empty()
                 && fields.iter().all(|field| match &field.value {
-                    ScalarExpression::Integer { .. } | ScalarExpression::Boolean { .. } | ScalarExpression::Char { .. } => true,
+                    ScalarExpression::Integer { .. }
+                    | ScalarExpression::Boolean { .. }
+                    | ScalarExpression::Char { .. }
+                    | ScalarExpression::Float { .. } => true,
+                    ScalarExpression::Unary { operator: UnaryOperator::Negate, operand, .. } =>
+                        matches!(operand.as_ref(), ScalarExpression::Float { .. }),
                     ScalarExpression::Name { name, .. } => scope.get(name).is_some_and(is_guarded_struct_field_type),
                     _ => false,
                 })
@@ -6443,7 +6448,7 @@ fn fallible_assignment_diagnostic(source: &SourceIdentity, span: ByteSpan) -> su
     source_diagnostic(
         source,
         "B0003",
-        "fallible allocation requires a local integer initialized by a literal or a same-type integer binding, or a local struct of integer, bool, or char fields initialized by literals or same-type lexical bindings",
+        "fallible allocation requires a local integer initialized by a literal or a same-type integer binding, or a local struct of integer, bool, char, or float fields initialized by literals or same-type lexical bindings",
         span,
     )
 }
