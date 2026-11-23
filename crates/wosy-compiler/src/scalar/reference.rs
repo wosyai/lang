@@ -1272,16 +1272,6 @@ impl<'a> ReferenceFlowBuilder<'a> {
         }
         let edges = ReferenceConditionalEdges { branch, terminals: [then_arm.end, else_arm.end], join };
         self.connect_reference_conditional(&edges, region);
-        if matches!(region, ConditionalRegion::Value { .. }) {
-            if let Some(bindings) = &self.proof_points.fallible_allocation_bindings {
-                let scopes = [self.cfg.points[then_arm.end.0].scope, self.cfg.points[else_arm.end.0].scope];
-                if scopes[0] != scopes[1] && bindings.len() == 2
-                    && scopes.iter().all(|scope| bindings.values().any(|(defined, _)| defined == scope))
-                {
-                    self.proof_points.guarded_sibling_scopes = Some(scopes);
-                }
-            }
-        }
         if let Some((binding, present_on_then)) = guarded {
             if let Some([then, otherwise]) = edges.entries(&self.cfg.points) {
                 self.proof_points.record_guarded_allocation(branch, binding, [*then, *otherwise], present_on_then);
@@ -3959,12 +3949,13 @@ impl<'a> ReferenceFlowBuilder<'a> {
             "mismatched block item count in {:?}",
             self.source
         );
-        self.point(
+        let scope_entry = self.point(
             CfgPointKind::ScopeEnter,
             region.span,
             scope,
             BTreeSet::new(),
         );
+        let mut declares_fallible = false;
         let mut declared = Vec::new();
         let mut result = ReferenceBlockResult::default();
         let mut next_item = 0;
@@ -4073,6 +4064,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         self.cfg.allocations.insert(id.clone());
                     }
                     if binding.fallible_assignment.is_some() && is_integer_type(&receiver.ty) {
+                        declares_fallible = true;
                         self.proof_points.fallible_allocation_bindings.get_or_insert_with(HashMap::new).insert(id.clone(), (scope, receiver.ty.clone()));
                         self.local_borrow = None;
                     }
@@ -4647,6 +4639,11 @@ impl<'a> ReferenceFlowBuilder<'a> {
             self.root_return_points = first_return_point..self.cfg.points.len();
         }
         let scope_exit = self.point(CfgPointKind::ScopeExit, region.span, scope, BTreeSet::new());
+        if declares_fallible {
+            if let Some(slot) = self.proof_points.guarded_allocation_scopes.iter_mut().find(|slot| slot.is_none()) {
+                *slot = Some(super::control::GuardedAllocationScope { scope, entry: scope_entry, exit: scope_exit });
+            }
+        }
         if self.aggregate_facts.needs_scope_exit_metadata() {
             self.aggregate_facts.scope_exits.insert(scope_exit, ordinal);
         }
@@ -12401,10 +12398,20 @@ fn seal_guarded_scalar_allocations(
     match edges.as_slice() {
         [_] => {}
         [(_, left), (_, right)] => {
-            let scopes = points.guarded_sibling_scopes?;
+            let [Some(first), Some(second)] = points.guarded_allocation_scopes else { return None };
+            if first.exit >= second.entry
+                || !matches!(cfg.points[first.entry.0].kind, CfgPointKind::ScopeEnter)
+                || !matches!(cfg.points[first.exit.0].kind, CfgPointKind::ScopeExit)
+                || !matches!(cfg.points[second.entry.0].kind, CfgPointKind::ScopeEnter)
+                || !matches!(cfg.points[second.exit.0].kind, CfgPointKind::ScopeExit)
+            {
+                return None;
+            }
             let left = bindings.get(&left.binding)?.0;
             let right = bindings.get(&right.binding)?.0;
-            if left == right || !scopes.contains(&left) || !scopes.contains(&right) {
+            if left == right || ![first.scope, second.scope].contains(&left)
+                || ![first.scope, second.scope].contains(&right)
+            {
                 return None;
             }
         }
