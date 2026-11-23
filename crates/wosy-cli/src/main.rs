@@ -844,7 +844,7 @@ fn render_project_diagnostics(
 fn check_command(
     target: Option<&str>, profile: &str, main_flow_only: bool, declared_package: bool,
 ) -> Result<u8, String> {
-    use configured_check::ConfiguredCheckLoadError as LoadError;
+    use configured_check::{CheckPublicationError, CheckStreamPlanError, ConfiguredCheckLoadError as LoadError};
     use wosy_compiler::{Diagnostic, DiagnosticLabel, DiagnosticLabelKind, DiagnosticSeverity,
         ScalarCheckerScope, ScalarOrderedCheckerOutcome};
 
@@ -864,20 +864,27 @@ fn check_command(
             LoadError::PackageSourceRoot(error) => format!("check: {error}"),
             LoadError::DormantPath => "check: invalid declared source path".to_owned(),
         })?;
-    let report = match receipt.outcome {
-        Ok(report) => report,
-        Err(ScalarOrderedCheckerOutcome::Invalid(diagnostics)) => {
-            render_project_diagnostics(&diagnostics, &receipt.texts);
+    let unsupported_output = || "check: result requires unsupported output; no result published".to_owned();
+    let publication = match receipt.plan_publication() {
+        Ok(publication) => publication,
+        Err(CheckPublicationError::Incomplete(ScalarOrderedCheckerOutcome::Invalid(diagnostics))) => {
+            render_project_diagnostics(diagnostics, &receipt.texts);
             return Ok(2);
         }
-        Err(_) => return Err("check: unsupported analysis; no result published".to_owned()),
+        Err(CheckPublicationError::Incomplete(_)) => return Err("check: unsupported analysis; no result published".to_owned()),
+        Err(CheckPublicationError::InvalidPath { .. } | CheckPublicationError::ConflictingPath { .. }) =>
+            return Err(unsupported_output()),
     };
-    if !report.directives.is_empty() || (!declared_package
-        && (report.symbolic_diagnostic.is_some() || !report.additional_symbolic_diagnostics.is_empty()))
-    {
-        return Err("check: result requires unsupported output; no result published".to_owned());
+    let report = publication.report;
+    if !declared_package && (report.symbolic_diagnostic.is_some() || !report.additional_symbolic_diagnostics.is_empty()) {
+        return Err(unsupported_output());
     }
-    let actual = report.diagnostics.into_iter().map(|failure| {
+    let streams = publication.stream_plan().map_err(|error| match error {
+        CheckStreamPlanError::FilePublication => unsupported_output(),
+        CheckStreamPlanError::ExitStatusOutsideByteRange =>
+            "check: selected exit code is outside 0..=255; no result published".to_owned(),
+    })?;
+    let actual = report.diagnostics.iter().map(|failure| {
         let mut labels = vec![
             DiagnosticLabel {
                 kind: DiagnosticLabelKind::Primary,
@@ -886,7 +893,7 @@ fn check_command(
             },
             DiagnosticLabel {
                 kind: DiagnosticLabelKind::Secondary,
-                span: failure.proof,
+                span: failure.proof.clone(),
                 message: "proof declaration".to_owned(),
             },
             DiagnosticLabel {
@@ -898,7 +905,7 @@ fn check_command(
         if failure.failed_step.is_some() {
             labels.push(DiagnosticLabel {
                 kind: DiagnosticLabelKind::Secondary,
-                span: failure.goal,
+                span: failure.goal.clone(),
                 message: "proof goal".to_owned(),
             });
         }
@@ -915,7 +922,7 @@ fn check_command(
             notes: vec![format!("call returned {}", failure.invocation.returned)],
         }
     });
-    let symbolic = report.symbolic_diagnostic.into_iter().chain(report.additional_symbolic_diagnostics).map(|failure| {
+    let symbolic = report.symbolic_diagnostic.iter().chain(&report.additional_symbolic_diagnostics).map(|failure| {
         let mut labels = vec![
             DiagnosticLabel {
                 kind: DiagnosticLabelKind::Primary,
@@ -924,24 +931,24 @@ fn check_command(
             },
             DiagnosticLabel {
                 kind: DiagnosticLabelKind::Secondary,
-                span: failure.proof,
+                span: failure.proof.clone(),
                 message: "proof declaration".to_owned(),
             },
             DiagnosticLabel {
                 kind: DiagnosticLabelKind::Secondary,
-                span: failure.callable,
+                span: failure.callable.clone(),
                 message: "unused function checked symbolically".to_owned(),
             },
             DiagnosticLabel {
                 kind: DiagnosticLabelKind::Secondary,
-                span: failure.output,
+                span: failure.output.clone(),
                 message: "return with a counterexample".to_owned(),
             },
         ];
         if failure.failed_step.is_some() {
             labels.push(DiagnosticLabel {
                 kind: DiagnosticLabelKind::Secondary,
-                span: failure.goal,
+                span: failure.goal.clone(),
                 message: "proof goal".to_owned(),
             });
         }
@@ -952,11 +959,10 @@ fn check_command(
         }
     });
     let diagnostics = actual.chain(symbolic).collect::<Vec<_>>();
-    if diagnostics.is_empty() {
-        return Ok(0);
-    }
-    render_project_diagnostics(&diagnostics, &receipt.texts);
-    Ok(1)
+    let authored_status = streams.publish(&mut std::io::stdout().lock(), &mut std::io::stderr().lock())
+        .map_err(|error| format!("check: could not publish authored streams: {error}"))?;
+    render_project_diagnostics(&diagnostics, publication.texts);
+    Ok(if authored_status != 0 { authored_status } else { u8::from(!diagnostics.is_empty()) })
 }
 
 fn artifact_identity(

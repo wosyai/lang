@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, ffi::OsStr, path::{Component, Path, PathBuf}};
+use std::{collections::BTreeMap, ffi::OsStr, io::{self, Write}, path::{Component, Path, PathBuf}};
 
 use wosy_compiler::{
     check_loaded_scalar_ordered_local_proof_contexts, CheckedOutputTargets, MainFlowProofReceipt, ScalarCheckerScope,
@@ -70,6 +70,49 @@ impl ConfiguredCheckReceipt {
             Ok(())
         })?;
         Ok(PlannedCheckPublication { report, texts: &self.texts, status, effects })
+    }
+}
+
+pub(crate) enum CheckStreamPlanError {
+    FilePublication,
+    ExitStatusOutsideByteRange,
+}
+
+pub(crate) struct PlannedCheckStreams<'a> {
+    status: u8,
+    effects: &'a [PlannedCheckEffect<'a>],
+}
+
+impl PlannedCheckPublication<'_> {
+    pub(crate) fn stream_plan(&self) -> Result<PlannedCheckStreams<'_>, CheckStreamPlanError> {
+        if self.effects.iter().any(|effect| matches!(effect, PlannedCheckEffect::DeferredFile { .. })) {
+            return Err(CheckStreamPlanError::FilePublication);
+        }
+        let status = match &self.status {
+            InternalCheckStatus::Zero => 0,
+            InternalCheckStatus::FirstNonzero(report) => u8::try_from(report.code())
+                .map_err(|_| CheckStreamPlanError::ExitStatusOutsideByteRange)?,
+        };
+        Ok(PlannedCheckStreams { status, effects: &self.effects })
+    }
+}
+
+impl PlannedCheckStreams<'_> {
+    pub(crate) fn publish(self, stdout: &mut impl Write, stderr: &mut impl Write) -> io::Result<u8> {
+        for effect in self.effects {
+            match effect {
+                PlannedCheckEffect::Stdout(bytes) => {
+                    stdout.write_all(bytes)?;
+                    stdout.flush()?;
+                }
+                PlannedCheckEffect::Stderr(bytes) => {
+                    stderr.write_all(bytes)?;
+                    stderr.flush()?;
+                }
+                PlannedCheckEffect::DeferredFile { .. } => unreachable!("file rejected during stream preflight"),
+            }
+        }
+        Ok(self.status)
     }
 }
 

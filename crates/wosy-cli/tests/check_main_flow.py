@@ -45,6 +45,12 @@ EFFECT = """    core.require(false, { .stdout = "must not emit"; .stderr = "must
 """
 
 
+STREAMS = """    core.require(false, { .stdout = "out-a:"; .stderr = "err-a:"; .code = 0; .files = []; });
+    core.require(false, { .stdout = "out-b café:"; .stderr = "err-b:"; .code = 71; .files = []; });
+    core.require(false, { .stdout = "out-c"; .stderr = "err-c"; .code = 19; .files = []; });
+"""
+
+
 def main():
     binary = Path(sys.argv[1]).resolve(strict=True)
     with tempfile.TemporaryDirectory() as directory:
@@ -80,10 +86,43 @@ def main():
         ):
             assert label in failed.stderr, failed
 
-        source.write_text(rejected.replace("%%end", EFFECT + "%%end"), encoding="utf-8")
+        source.write_text(rejected.replace("%%end", STREAMS + EFFECT + "%%end"), encoding="utf-8")
         blocked = check("--main-flow-only")
         assert (blocked.returncode, blocked.stdout) == (2, b""), blocked
         assert blocked.stderr == b"wosy: check: result requires unsupported output; no result published\n", blocked
+
+        expected_stdout = "out-a:out-b café:out-c".encode()
+        expected_stderr = b"err-a:err-b:err-c"
+        source.write_text("%%start\n" + STREAMS + "%%end", encoding="utf-8")
+        effects = check("--main-flow-only")
+        assert (effects.returncode, effects.stdout, effects.stderr) == (71, expected_stdout, expected_stderr), effects
+        merged = subprocess.run(
+            [binary, "check", "--main-flow-only"], cwd=root,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=15,
+        )
+        assert (merged.returncode, merged.stdout) == (71, "out-a:err-a:out-b café:err-b:out-cerr-c".encode()), merged
+        assert not (root / ".wosy").exists()
+
+        zero_codes = STREAMS.replace(".code = 71", ".code = 0").replace(".code = 19", ".code = 0")
+        source.write_text("%%start\n" + zero_codes + "%%end", encoding="utf-8")
+        zero = check("--main-flow-only")
+        assert (zero.returncode, zero.stdout, zero.stderr) == (0, expected_stdout, expected_stderr), zero
+
+        source.write_text(rejected.replace("%%end", STREAMS + "%%end"), encoding="utf-8")
+        mixed = check("--main-flow-only")
+        assert (mixed.returncode, mixed.stdout) == (71, expected_stdout), mixed
+        assert mixed.stderr.startswith(expected_stderr) and mixed.stderr.count(b"proof obligation failed") == 2, mixed
+
+        source.write_text(rejected.replace("%%end", zero_codes + "%%end"), encoding="utf-8")
+        mixed_zero = check("--main-flow-only")
+        assert (mixed_zero.returncode, mixed_zero.stdout) == (1, expected_stdout), mixed_zero
+        assert mixed_zero.stderr.startswith(expected_stderr) and mixed_zero.stderr.count(b"proof obligation failed") == 2, mixed_zero
+
+        out_of_range = STREAMS.replace(".code = 71", ".code = 256")
+        source.write_text(rejected.replace("%%end", out_of_range + "%%end"), encoding="utf-8")
+        bad_code = check("--main-flow-only")
+        assert (bad_code.returncode, bad_code.stdout) == (2, b""), bad_code
+        assert bad_code.stderr == b"wosy: check: selected exit code is outside 0..=255; no result published\n", bad_code
 
         unsupported = PROGRAM.replace("core.old(entry)", "core.old(unknown)")
         source.write_text(unsupported, encoding="utf-8")
