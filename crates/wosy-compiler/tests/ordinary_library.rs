@@ -391,6 +391,57 @@ u8 result = drive(2);
 }
 
 #[test]
+fn recursive_runtime_array_retains_each_local_owner_through_child_return() {
+    let text = r#"%%start
+u8(u64, u8) recursive_owner = fn(depth, tag) {
+    if (depth == 0) {
+        tag
+    } else {
+        u8[depth] bytes;
+        bytes[0] = tag;
+        u64 step = 1;
+        u8 tag_step = 1;
+        u8 nested = recursive_owner(depth - step, tag - tag_step);
+        nested + bytes[0]
+    }
+};
+u8 observed = recursive_owner(3, 3);
+%%end"#;
+    let user = source("workbench", "src/recursive_owner.w");
+    for (target, target_layout) in [
+        ("native64", ScalarTargetLayout::NATIVE64),
+        ("wasm32", ScalarTargetLayout::WASM32),
+    ] {
+        let prepared = prepare_scalar_project(
+            vec![(declarations(&user, text), Vec::new())],
+            vec![user.clone()],
+            ScalarPreparationInputs { target_layout },
+        )
+        .unwrap_or_else(|error| panic!("{target}: {:?}", error.diagnostics));
+        let build = analyze_scalar_build(&prepared);
+        assert!(build.diagnostics().is_empty(), "{target}: {:?}", build.diagnostics());
+        let ir = emit_scalar_build_project_llvm(&build).unwrap().to_text();
+        let context = Context::create();
+        let buffer = MemoryBuffer::create_from_memory_range_copy(ir.as_bytes(), target);
+        let module = context.create_module_from_ir(buffer).unwrap();
+        module.verify().unwrap();
+        let owner = function_with_suffix(&module, "recursive_owner");
+        let calls = direct_calls(&module, &owner);
+        assert!(calls.contains(&owner), "{target}: no recursive call: {calls:?}");
+        assert_eq!(calls.iter().filter(|name| *name == "__wosy_core_alloc").count(), 1, "{target}");
+        assert_eq!(calls.iter().filter(|name| *name == "__wosy_core_free").count(), 1, "{target}");
+        if let Some(out) = std::env::var_os("WOSY_RECURSIVE_OWNER_IR_DIR") {
+            let mut witness = ir.replace("@main(", "@wosy_authored_main(");
+            witness.push_str(&format!(
+                "\ndefine i8 @wosy_recursive_owner_witness(i64 %depth, i8 %tag) {{\nentry:\n  %result = call i8 @{owner}(i64 %depth, i8 %tag)\n  ret i8 %result\n}}\n"
+            ));
+            std::fs::write(std::path::PathBuf::from(out).join(format!("{target}.ll")), witness)
+                .unwrap();
+        }
+    }
+}
+
+#[test]
 fn runtime_array_read_line_graph_emits_the_actual_stdlib_ranges() {
     let app = source("wasi_read_into", "src/main.w");
     let std = source("std", "src/bootstrap.w");
