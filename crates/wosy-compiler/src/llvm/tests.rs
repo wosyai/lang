@@ -8667,6 +8667,61 @@ u64(bool) verify = fn(flag) { Pair value = _make(flag); value.total };
 }
 
 #[test]
+fn closed_copy_result_uses_caller_storage_for_all_exact_consumers() {
+    let text = "%%start
+struct copy Pair { u8 tag; u64 value; }
+Pair(u64) _make = fn(seed) { { .tag = 7; .value = seed; } };
+u64(u64) read_named = fn(seed) { Pair item = _make(seed); item.value };
+u64(u64) read_direct = fn(seed) { _make(seed).value };
+u64(u64) read_grouped = fn(seed) { (_make(seed)).value };
+%%end";
+    for layout in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
+        let prepared = prepare_initializer_test(text, layout);
+        let checked = analyze_scalar_build(&prepared);
+        assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+        let source = &prepared.project().modules[0].source;
+        for (partition, project) in [
+            (emit_scalar_build_single_module_llvm(&checked).unwrap(), false),
+            (emit_scalar_build_project_llvm(&checked).unwrap(), true),
+        ] {
+            let symbol = |name: &str| if project { project_function_name(source, name) } else { name.to_owned() };
+            let producer = symbol("_make");
+            let llvm = partition.to_text();
+            assert_eq!(llvm.matches(&format!("define internal void @{producer}(")).count(), 1);
+            for reader in ["read_named", "read_direct", "read_grouped"] {
+                let reader = symbol(reader);
+                let body = llvm.split_once(&format!("define i64 @{reader}(")).unwrap()
+                    .1.split_once("\n}").unwrap().0;
+                let call = format!("call void @{producer}(");
+                assert_eq!(body.matches(&call).count(), 1);
+                assert!(body.lines().any(|line| line.contains(&call)
+                    && line.ends_with(", ptr %ordinary_result_destination)")), "{body}");
+                assert!(!body.contains("call ptr "), "{body}");
+            }
+        }
+    }
+}
+
+#[test]
+fn closed_copy_result_refuses_every_consumer_when_any_use_is_unproved() {
+    let prefix = "%%start
+struct copy Pair { u8 tag; u64 value; }
+Pair(u64) _make = fn(seed) { { .tag = 7; .value = seed; } };
+u64(u64) read_named = fn(seed) { Pair item = _make(seed); item.value };
+Pair(u64) retain_value = fn(seed) { _make(seed) };
+";
+    let text = format!("{prefix}u64(u64) read_direct = fn(seed) {{ _make(seed).value }};\n%%end");
+    for layout in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
+        let prepared = prepare_initializer_test(&text, layout);
+        let checked = analyze_scalar_build(&prepared);
+        assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+        for result in [emit_scalar_build_single_module_llvm(&checked), emit_scalar_build_project_llvm(&checked)] {
+            assert!(matches!(result, Err(message) if message.contains("no proven caller-owned storage")));
+        }
+    }
+}
+
+#[test]
 fn value_field_projection_loads_only_from_proven_caller_storage() {
     for expression in ["_make(seed).value", "(_make(seed)).value"] {
         let text = format!("%%start

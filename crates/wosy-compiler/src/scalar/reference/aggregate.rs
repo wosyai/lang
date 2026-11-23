@@ -1545,15 +1545,30 @@ pub(crate) struct OrdinaryResultSite {
 enum OrdinaryResultCandidate {
     Unused,
     Direct(OrdinaryResultSite),
+    Multiple(Vec<OrdinaryResultSite>),
     Refused,
 }
 
 impl OrdinaryResultCandidate {
     fn record(&mut self, site: Option<OrdinaryResultSite>) {
-        *self = match (&*self, site) {
-            (Self::Unused, Some(site)) => Self::Direct(site),
-            _ => Self::Refused,
+        let Some(site) = site else {
+            *self = Self::Refused;
+            return;
         };
+        match self {
+            Self::Unused => *self = Self::Direct(site),
+            Self::Direct(first) => *self = Self::Multiple(vec![*first, site]),
+            Self::Multiple(sites) => sites.push(site),
+            Self::Refused => {}
+        }
+    }
+
+    fn sites(&self) -> &[OrdinaryResultSite] {
+        match self {
+            Self::Direct(site) => std::slice::from_ref(site),
+            Self::Multiple(sites) => sites,
+            Self::Unused | Self::Refused => &[],
+        }
     }
 }
 
@@ -2250,13 +2265,21 @@ impl OrdinaryCohorts {
             Some(SourceSpan::new(input.source.clone(), function.name_span))
         };
         for (producer, candidate) in self.private {
-            let OrdinaryResultCandidate::Direct(site) = candidate else { continue };
-            if producer == site.caller || result.bodies.contains_key(&producer) || result.bodies.contains_key(&site.caller) {
+            let sites = candidate.sites();
+            let Some((last, earlier)) = sites.split_last() else { continue };
+            if result.bodies.contains_key(&producer)
+                || sites.iter().any(|site| producer == site.caller || result.bodies.contains_key(&site.caller))
+            {
                 continue;
             }
             let Some(declaration) = declaration_at(producer) else { continue };
             result.bodies.entry(producer).or_default().ordinary_result = true;
-            result.bodies.entry(site.caller).or_default().ordinary_calls.insert(site.call.0, declaration);
+            for site in earlier {
+                result.bodies.entry(site.caller).or_default().ordinary_calls
+                    .insert(site.call.0, declaration.clone());
+            }
+            result.bodies.entry(last.caller).or_default().ordinary_calls
+                .insert(last.call.0, declaration);
         }
         let mut dependent = HashMap::<BodyKey, Vec<BodyKey>>::new();
         for (&producer, uses) in &self.namespace {
