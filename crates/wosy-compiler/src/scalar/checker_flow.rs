@@ -1348,6 +1348,7 @@ pub(super) struct ImmutableEntryRange<'a> {
 
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct IntegerReturningPath<'a> {
+    span: super::ByteSpan,
     pub(super) value: IntegerReturn<'a>,
     pub(super) ty: &'a ScalarType,
     pub(super) state: IntegerInputs,
@@ -2307,8 +2308,49 @@ pub(super) const MAX_ACTUAL_CALL_DEPTH: usize = 64;
 const MAX_PARTITION_TRANSFER_WORK: usize = MAX_ACTUAL_CALL_DEPTH * MAX_ACTUAL_CALL_DEPTH;
 
 pub(super) struct IntegerReturnPartition {
+    span: super::ByteSpan,
     input: Rc<IntegerSet>,
     output: Rc<IntegerSet>,
+}
+
+#[cfg(feature = "internal-checker")]
+pub(super) struct PartitionedCallProof<'a> {
+    pub(super) applicable: bool,
+    pub(super) covers_guard: bool,
+    pub(super) failure: Option<SymbolicLiteralFailure<'a>>,
+}
+
+#[cfg(feature = "internal-checker")]
+pub(super) fn verify_partitioned_call_return<'a>(
+    producer: &'a FunctionCallSites, returned: &ActualCallResult, domain: &IntegerSet,
+    eligible_for_elision: bool, accepts: impl Fn(&BigInt) -> bool,
+) -> Option<PartitionedCallProof<'a>> {
+    let ActualCallResult::PartitionedInteger(pieces) = returned else { return None; };
+    let [binding] = producer.boundary.checker_parameter_bindings.as_deref()? else { return None; };
+    let [parameter] = producer.boundary.parameters.as_slice() else { return None; };
+    let mut applicable = false;
+    let mut covered = Vec::new();
+    for piece in pieces {
+        let input = match piece.input.intersection(domain) {
+            IntegerIntersection::Unchanged => Rc::clone(&piece.input),
+            IntegerIntersection::Empty => continue,
+            IntegerIntersection::Changed(clipped) => Rc::new(clipped),
+        };
+        applicable = true;
+        let value = piece.output.singleton_value()?;
+        if !accepts(value) {
+            return Some(PartitionedCallProof { applicable: true, covers_guard: false, failure: Some(SymbolicLiteralFailure {
+                output: piece.span, returned: value.clone(), state: IntegerInputs(vec![vec![input]]),
+                axes: vec![(binding, &parameter.ty)],
+            }) });
+        }
+        if eligible_for_elision {
+            covered.push(input);
+        }
+    }
+    let covers_guard = eligible_for_elision && applicable
+        && domain.is_subset_of(&IntegerSet::union(covered.iter().map(Rc::as_ref)));
+    Some(PartitionedCallProof { applicable, covers_guard, failure: None })
 }
 
 pub(super) struct ProjectedIntegerArgument<'a> {
@@ -3277,6 +3319,7 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                             charge_partition_capture(work, &path, roots.axes.len())?;
                         }
                         returns.push(IntegerReturningPath {
+                            span: slot.span,
                             value,
                             ty,
                             state: path,
@@ -3667,7 +3710,7 @@ impl<'a> ExactCallCursor<'a> {
                         } else {
                             Rc::clone(constant.as_ref()?)
                         };
-                        pieces.push(IntegerReturnPartition { input, output });
+                        pieces.push(IntegerReturnPartition { span: path.span, input, output });
                     }
                 }
                 if pieces.is_empty() { return None; }
@@ -3956,6 +3999,7 @@ fn strict_peer_typed_tuple_requires_both_axes_in_one_unchanged_return_row() {
     let decoy = binding(3);
     let returned = BigInt::from(7);
     let path = IntegerReturningPath {
+        span: super::ByteSpan::new(0, 0),
         value: IntegerReturn::Const(&returned),
         ty: &ScalarType::I16,
         state: IntegerInputs(vec![
@@ -3988,6 +4032,7 @@ fn proof_show_output_union_is_lazy_and_exact_for_disconnected_aliases() {
     let literal = |value| IntegerSet::singleton(&BigInt::from(value));
     let values = literal(-1).join(literal(1));
     let alias = IntegerReturningPath {
+        span: super::ByteSpan::new(0, 0),
         value: IntegerReturn::Alias(&binding), ty: &ScalarType::I16,
         state: IntegerInputs(vec![vec![Rc::new(values)]]), axes: vec![&binding],
     };
@@ -4000,6 +4045,7 @@ fn proof_show_output_union_is_lazy_and_exact_for_disconnected_aliases() {
     assert!(allowed.is_none());
 
     let constant = IntegerReturningPath {
+        span: super::ByteSpan::new(0, 0),
         value: IntegerReturn::Const(&minus_one), ty: &ScalarType::I16,
         state: IntegerInputs(vec![Vec::new()]), axes: Vec::new(),
     };

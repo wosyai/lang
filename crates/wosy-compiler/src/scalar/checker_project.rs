@@ -741,6 +741,13 @@ impl ActualIntegerObserver for ProofFreeSymbolic {
     fn observe(&mut self, _: (usize, usize), _: &[&BigInt], _: &BigInt) {}
 }
 
+#[derive(Clone, Copy)]
+struct SymbolicProofRuntime<'a> {
+    project: &'a ScalarProject,
+    calls: &'a ProjectCallSiteResults,
+    visits: Option<&'a [InitializationVisit]>,
+}
+
 trait SymbolicRootProof {
     const ENABLED: bool;
     const INTEGER_RETURN_PARTITIONS: bool = false;
@@ -749,7 +756,7 @@ trait SymbolicRootProof {
 
     fn try_collect(
         &mut self, _: PreparedCallable, _: &FunctionCallSites, _: &ScalarFunction, _: &SourceIdentity,
-        _: &mut OrderedFailures,
+        _: &mut OrderedFailures, _: SymbolicProofRuntime<'_>,
     ) -> Result<Option<bool>, ProjectCheck> {
         Ok(None)
     }
@@ -790,6 +797,7 @@ fn check_unused_module<const COLLECT: bool, const ENTRY_EVIDENCE: bool, Proof: S
         if COLLECT && Proof::ENABLED {
             if let Some(observed) = proof.try_collect(
                 (ordinal, item), body, function, &module.source, failures.as_deref_mut().ok_or(ProjectCheck::Unsupported)?,
+                SymbolicProofRuntime { project, calls, visits: completed_visits },
             )? {
                 active |= observed;
                 continue;
@@ -2709,6 +2717,75 @@ impl SelectedSymbolicProof<'_, '_> {
 }
 
 #[cfg(feature = "internal-checker")]
+impl SelectedSymbolicProof<'_, '_> {
+    fn verify_calling_producer(
+        &mut self, target: PreparedCallable, body: &FunctionCallSites, function: &ScalarFunction,
+        source: &SourceIdentity, effects: &mut OrderedFailures, runtime: SymbolicProofRuntime<'_>,
+    ) -> Result<Option<bool>, ProjectCheck> {
+        let watched = self.watched;
+        let group = if watched.first.0 == target { &watched.first.1 } else {
+            watched.other.get(&target).ok_or(ProjectCheck::Unsupported)?
+        };
+        let MainFlowProofCases::Bare { first, rest } = &group.cases else { return Err(ProjectCheck::Unsupported); };
+        let [parameter] = body.boundary.parameters.as_slice() else { return Err(ProjectCheck::Unsupported); };
+        let [output] = body.boundary.results.as_slice() else { return Err(ProjectCheck::Unsupported); };
+        let issuer = group.issuer.as_ref().filter(|issuer| std::ptr::eq(issuer.body, body));
+        if first.proof_source != source || (issuer.is_none() && !first.guard.always_rejects)
+            || !rest.is_empty() || !supported_calling_proof_body(body, &output.ty)
+            || first.guard.domain.is_some() || first.guard.comparisons.len() > 1
+        {
+            return Err(ProjectCheck::Unsupported);
+        }
+        let bound = first.bound.literal().ok_or(ProjectCheck::Unsupported)?;
+        let domain = IntegerSet::from_type(&parameter.ty).ok_or(ProjectCheck::Unsupported)?;
+        let proof_domain = if first.guard.always_rejects {
+            None
+        } else {
+            Some(match first.guard.comparisons.as_slice() {
+                [] => domain.clone(),
+                [comparison] if comparison.slot == 0 => domain.keep_relation(comparison.relation, comparison.bound),
+                _ => return Err(ProjectCheck::Unsupported),
+            })
+        };
+        let cursor = ExactCallCursor::projected(body, Rc::new(domain), &output.ty).ok_or(ProjectCheck::Unsupported)?;
+        let mut evaluator = CheckedCalls::<ProofFreeSymbolic, false> {
+            project: runtime.project, calls: runtime.calls, active: HashSet::from([target]),
+            active_depth: 1, reached: HashSet::new(), had_obligations: false,
+            observer: ProofFreeSymbolic, symbolic_module: target.0,
+        };
+        let first_directive = effects.records.len();
+        let (result, active) = {
+            let sink = RefCell::new(&mut *effects);
+            let collection = OrderedCallCollection { failures: &sink, visits: runtime.visits, outer: None };
+            let result = evaluator.run_call_cursor(body, source, cursor, None, Some(collection))?;
+            (result, evaluator.had_obligations)
+        };
+        let Some(proof_domain) = proof_domain else { return Ok(Some(active)); };
+        let elidable = effects.records.len() == first_directive
+            && summary_elision_safe(body)
+            && evaluator.reached.iter().all(|&(module, item)| {
+                runtime.calls.function_body(module, item, None).is_some_and(summary_elision_safe)
+            });
+        let verified = super::checker_flow::verify_partitioned_call_return(
+            body, &result, &proof_domain, elidable, |value| first.relation.accepts(value.cmp(bound)),
+        ).ok_or(ProjectCheck::Unsupported)?;
+        if let Some(failure) = verified.failure {
+            self.record(first, function, source, effects.records.len(), failure, None);
+        } else if verified.covers_guard {
+            let issuer = issuer.ok_or(ProjectCheck::Unsupported)?;
+            self.equalities.insert(VerifiedSymbolicEquality {
+                target, canonical_target: issuer.canonical_target, layout: issuer.layout,
+                body: issuer.body, bound, shared: std::cell::OnceCell::new(),
+                guards: VerifiedSymbolicGuards::Bare(first.guard.comparisons.first().map(|guard| ImportedEntryGuard {
+                    slot: guard.slot, relation: guard.relation, bound: guard.bound,
+                })),
+            });
+        }
+        Ok(Some(active || verified.applicable))
+    }
+}
+
+#[cfg(feature = "internal-checker")]
 impl SymbolicRootProof for SelectedSymbolicProof<'_, '_> {
     const ENABLED: bool = true;
 
@@ -2723,6 +2800,7 @@ impl SymbolicRootProof for SelectedSymbolicProof<'_, '_> {
     fn try_collect(
         &mut self, target: PreparedCallable, calls: &FunctionCallSites, function: &ScalarFunction,
         source: &SourceIdentity, effects: &mut OrderedFailures,
+        runtime: SymbolicProofRuntime<'_>,
     ) -> Result<Option<bool>, ProjectCheck> {
         let watched = self.watched;
         let group = if watched.first.0 == target {
@@ -2732,10 +2810,12 @@ impl SymbolicRootProof for SelectedSymbolicProof<'_, '_> {
         } else {
             return self.equalities.consume(target, calls, source, effects);
         };
+        if !calls.call_occurrences.is_empty() || !calls.structure.checker_direct_targets.is_empty() {
+            return self.verify_calling_producer(target, calls, function, source, effects, runtime);
+        }
         let tautological = |proof: &MainFlowProofCase<'_>| !proof.guard.always_rejects
             && proof.guard.comparisons.is_empty() && proof.guard.domain.is_none();
-        if !calls.structure.checker_direct_targets.is_empty() || !calls.call_occurrences.is_empty()
-            || !calls.allocation_length_calls.is_empty() || !calls.assignments.is_empty()
+        if !calls.allocation_length_calls.is_empty() || !calls.assignments.is_empty()
         {
             return Err(ProjectCheck::Unsupported);
         }
@@ -3204,7 +3284,8 @@ impl<'a> SymbolicEqualityIssuer<'a> {
         }
         if !(proof.guard.comparisons.is_empty()
             || proof.guard.comparisons.len() == 1 && matches!(proof.filter, [CheckerPredicate::Integer(_)]))
-            || !valid_arbitrary_proof_body(plan.typed.body)
+            || (!valid_arbitrary_proof_body(plan.typed.body)
+                && !supported_calling_proof_body(plan.typed.body, plan.typed.result_type))
         {
             return None;
         }
@@ -3574,6 +3655,7 @@ impl SymbolicRootProof for RankedOrderedSymbolic<'_, '_> {
     fn try_collect(
         &mut self, target: PreparedCallable, calls: &FunctionCallSites, function: &ScalarFunction,
         source: &SourceIdentity, effects: &mut OrderedFailures,
+        _runtime: SymbolicProofRuntime<'_>,
     ) -> Result<Option<bool>, ProjectCheck> {
         if target != self.plan.target {
             let Some(first) = &self.verified else { return Ok(None); };
@@ -3724,16 +3806,17 @@ impl SymbolicRootProof for MixedOrderedSymbolic<'_, '_, '_> {
     fn try_collect(
         &mut self, target: PreparedCallable, calls: &FunctionCallSites, function: &ScalarFunction,
         source: &SourceIdentity, effects: &mut OrderedFailures,
+        runtime: SymbolicProofRuntime<'_>,
     ) -> Result<Option<bool>, ProjectCheck> {
         let (active, failure, additional) = if let Some(rank) = self.ranked.get_mut(&target) {
-            let active = rank.try_collect(target, calls, function, source, effects)?;
+            let active = rank.try_collect(target, calls, function, source, effects, runtime)?;
             if let Some(summary) = rank.verified.take() {
                 let equalities = self.bare.as_mut().map_or(&mut self.ranked_only_equalities, |bare| &mut bare.equalities);
                 equalities.insert(summary);
             }
             (active, rank.failure.take(), Vec::new())
         } else if let Some(bare) = &mut self.bare {
-            let active = bare.try_collect(target, calls, function, source, effects)?;
+            let active = bare.try_collect(target, calls, function, source, effects, runtime)?;
             (active, bare.failure.take(), std::mem::take(&mut bare.additional_failures))
         } else {
             return self.ranked_only_equalities.consume(target, calls, source, effects);
@@ -5510,6 +5593,20 @@ impl PlannedModuleProof<'_> {
             None => Err(ProjectCheck::Unsupported),
         }
     }
+}
+
+#[cfg(feature = "internal-checker")]
+fn summary_elision_safe(body: &FunctionCallSites) -> bool {
+    body.assignments.is_empty() && body.allocation_length_calls.is_empty()
+        && body.structure.checker_contextual_occurrences.is_empty()
+        && body.structure.checker_contextual_read_locals.is_empty()
+        && body.structure.checker_directives.values().all(|directive| directive.operation == CheckerOperation::Require)
+}
+
+#[cfg(feature = "internal-checker")]
+fn supported_calling_proof_body(body: &FunctionCallSites, output: &ScalarType) -> bool {
+    body.boundary.parameters.len() == 1 && !body.structure.checker_integer_call_locals.is_empty()
+        && supported_integer_continuation(body, output)
 }
 
 #[cfg(feature = "internal-checker")]
@@ -9986,6 +10083,93 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
         let second_caller = text.lines().find(|line| line.contains("unit(i16) second")).unwrap();
         let early = text.replace(second_caller, "").replace("i16(i16) high", &format!("{second_caller}\n            i16(i16) high"));
         assert!(matches!(run(&early), Err(ProjectCheck::Unsupported)));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordered_named_proof_checks_actual_return_partitions_from_calling_producer() {
+        let app = source("src/main.w", "named-proof-calling-producer");
+        let text = format!(r#"%%start
+            unit() checked_step = fn {{ core.require(false, {OUTPUT}); }};
+            i8(i8) leaf = fn(n) {{ if (n < 0) {{ -3 }} else {{ 7 }} }};
+            i8(i8) middle = fn(n) {{ i8 mid = leaf(n); mid }};
+            i8(i8) producer = fn(n) {{ checked_step(); i8 produced = middle(n); produced }};
+            proof guarded for producer(entry) -> (out) where (entry >= 0) ensures (out == 7) {{}}
+        %%end"#);
+        let run = |text: &str| {
+            let (_, proof) = crate::parse_proof_source(app.clone(), text.to_owned(), &[]).ok().unwrap();
+            check_loaded_ordered_proof_diagnostics(
+                Vec::new(), vec![(proof, Vec::new())], vec![app.clone()], inputs(), ScalarCheckerScope::CurrentPackage,
+            )
+        };
+        let report = run(&text).unwrap();
+        assert!(report.active && report.diagnostics.is_empty() && report.symbolic_diagnostic.is_none());
+        assert!(report.directives.len() >= 2);
+        let invalid = text.replace("ensures (out == 7)", "ensures (out == 8)");
+        let failed = run(&invalid).unwrap();
+        let proof = failed.symbolic_diagnostic.unwrap();
+        assert_eq!(proof.returned, BigInt::from(7));
+        assert!(proof.witness.intervals_at(0, 0).unwrap().eq([(&BigInt::from(0), &BigInt::from(127))]));
+        assert!(proof.directive_position > 0);
+        let empty = text.replace("entry >= 0", "entry < -128").replace("ensures (out == 7)", "ensures (out == 8)");
+        let vacuous = run(&empty).unwrap();
+        assert!(vacuous.symbolic_diagnostic.is_none());
+
+        let with_client = text.replace("proof guarded", &format!(
+            "unit(i8) client = fn(n) {{ core.narrow(n >= 0, {OUTPUT}); i8 observed = producer(n); core.require(observed == 7, {OUTPUT}); }};\nproof guarded",
+        ));
+        assert!(matches!(run(&with_client), Err(ProjectCheck::Unsupported)));
+        let clean = with_client.replacen(&format!("core.require(false, {OUTPUT});"), "", 1);
+        assert!(run(&clean).unwrap().symbolic_diagnostic.is_none());
+        let cyclic = text.replace("middle(n); produced", "producer(n); produced");
+        assert!(matches!(run(&cyclic), Err(ProjectCheck::Unsupported)));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordered_named_proof_calling_producer_does_not_summarize_narrowed_inputs() {
+        let app = source("src/main.w", "named-proof-calling-producer-narrowed");
+        let text = format!(r#"%%start
+            unit(i8) guard = fn(n) {{ core.narrow(n >= 0, {OUTPUT}); }};
+            i8(i8) leaf = fn(n) {{ if (n < 0) {{ -3 }} else {{ 7 }} }};
+            i8(i8) producer = fn(n) {{ guard(n); i8 produced = leaf(n); produced }};
+            proof guarded for producer(entry) -> (out) ensures (out == 7) {{}}
+        %%end"#);
+        let run = |text: &str| {
+            let (_, proof) = crate::parse_proof_source(app.clone(), text.to_owned(), &[]).ok().unwrap();
+            check_loaded_ordered_proof_diagnostics(
+                Vec::new(), vec![(proof, Vec::new())], vec![app.clone()], inputs(), ScalarCheckerScope::CurrentPackage,
+            )
+        };
+        let proved = run(&text).unwrap();
+        assert!(proved.active && proved.directives.is_empty() && proved.symbolic_diagnostic.is_none());
+        let would_manufacture_output = text.replace("proof guarded", &format!(
+            "unit(i8) client = fn(n) {{ i8 observed = producer(n); core.require(observed == 7, {OUTPUT}); }};\nproof guarded",
+        ));
+        assert!(matches!(run(&would_manufacture_output), Err(ProjectCheck::Unsupported)));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordered_named_proof_calling_producer_obeys_logical_depth() {
+        for (depth, admitted) in [(MAX_ACTUAL_CALL_DEPTH, true), (MAX_ACTUAL_CALL_DEPTH + 1, false)] {
+            let mut text = "%%start\ni8(i8) f0 = fn(input) { if (input < 0) { -3 } else { 7 } };\n".to_owned();
+            for index in 1..depth {
+                text.push_str(&format!("i8(i8) f{index} = fn(input) {{ i8 bridge{index} = f{}(input); bridge{index} }};\n", index - 1));
+            }
+            text.push_str(&format!("proof guarded for f{}(entry) -> (out) where (entry >= 0) ensures (out == 7) {{}}\n%%end", depth - 1));
+            let app = source("src/main.w", &format!("named-proof-calling-depth-{depth}"));
+            let (_, proof) = crate::parse_proof_source(app.clone(), text, &[]).ok().unwrap();
+            let result = check_loaded_ordered_proof_diagnostics(
+                Vec::new(), vec![(proof, Vec::new())], vec![app], inputs(), ScalarCheckerScope::CurrentPackage,
+            );
+            if admitted {
+                let result = result.unwrap();
+                assert!(result.active && result.diagnostics.is_empty() && result.symbolic_diagnostic.is_none());
+            } else {
+                assert!(matches!(result, Err(ProjectCheck::Unsupported)));
+            }
+        }
     }
 
     #[cfg(feature = "internal-checker")]
