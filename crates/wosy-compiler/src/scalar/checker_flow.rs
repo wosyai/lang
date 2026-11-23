@@ -1097,6 +1097,12 @@ impl IntegerRow {
         }
     }
 
+    fn entry_affine(&self, formal: usize, axis: usize) -> Option<&Rc<IntegerAffineTransform>> {
+        let relation = self.affine.as_deref()?;
+        (self.canonical_axis(axis) == relation.output && self.entry_alias(formal, relation.input))
+            .then_some(&relation.transform)
+    }
+
     fn entry_key(&self) -> Option<Result<usize, *const IntegerSet>> {
         self.entry.as_deref().map(|entry| match entry {
             ProjectedEntry::Linked(axis) => Ok(*axis),
@@ -4270,13 +4276,17 @@ impl<'a> ExactCallCursor<'a> {
                     };
                     for row in &path.state.0 {
                         let output = if let Some(axis) = alias {
-                            if let Some(slot) = (0..2).find(|slot| row.entry_alias(*slot, axis))
-                                .filter(|_| row[axis].singleton_value().is_none())
-                            {
-                                IntegerPairPartitionOutput::InputAlias(slot)
-                            } else {
-                                row[axis].singleton_value()?;
+                            if row[axis].singleton_value().is_some() {
                                 IntegerPairPartitionOutput::Singleton(Rc::clone(&row[axis]))
+                            } else if let Some(slot) = (0..2).find(|slot| row.entry_alias(*slot, axis)) {
+                                IntegerPairPartitionOutput::InputAlias(slot)
+                            } else if allow_ordinary_computed_returns {
+                                let (slot, transform) = (0..2).find_map(|slot| {
+                                    row.entry_affine(slot, axis).map(|transform| (slot, transform))
+                                })?;
+                                IntegerPairPartitionOutput::InputAffine(slot, Rc::clone(transform))
+                            } else {
+                                return None;
                             }
                         } else {
                             IntegerPairPartitionOutput::Singleton(Rc::clone(constant.as_ref()?))
@@ -4317,11 +4327,16 @@ impl<'a> ExactCallCursor<'a> {
                     };
                     for row in &path.state.0 {
                         let input = Rc::clone(row.entry_domain(slot));
-                        let output = if alias.is_some_and(|axis| row.entry_alias(slot, axis)) && input.singleton_value().is_none() {
-                            IntegerPartitionOutput::InputAlias
-                        } else if let Some(axis) = alias {
-                            row[axis].singleton_value()?;
-                            IntegerPartitionOutput::Singleton(Rc::clone(&row[axis]))
+                        let output = if let Some(axis) = alias {
+                            if row.entry_alias(slot, axis) && input.singleton_value().is_none() {
+                                IntegerPartitionOutput::InputAlias
+                            } else if row[axis].singleton_value().is_some() {
+                                IntegerPartitionOutput::Singleton(Rc::clone(&row[axis]))
+                            } else if allow_ordinary_computed_returns {
+                                IntegerPartitionOutput::InputAffine(Rc::clone(row.entry_affine(slot, axis)?))
+                            } else {
+                                return None;
+                            }
                         } else {
                             IntegerPartitionOutput::Singleton(Rc::clone(constant.as_ref()?))
                         };
@@ -4378,14 +4393,28 @@ fn computed_projected_value(
         (Some(value), None, AuthoredIntegerOperation::Subtract) if fits(value) => (right.1?, true, value.clone()),
         _ => return None,
     };
-    if row.affine.is_some() { return None; }
-    let origin = match formal {
-        Some(formal) => row.entry_alias(formal, axis).then_some(formal)?,
-        None => (0..2).find(|slot| row.entry_alias(*slot, axis))?,
+    let entry_relation = |slot| {
+        if row.entry_alias(slot, axis) {
+            Some((slot, None))
+        } else {
+            Some((slot, Some(row.entry_affine(slot, axis)?)))
+        }
     };
-    let transform = IntegerAffineTransform { reflected, offset };
+    let (origin, inner) = match formal {
+        Some(formal) => entry_relation(formal)?,
+        None => (0..2).find_map(entry_relation)?,
+    };
+    let mut transform = IntegerAffineTransform { reflected, offset };
     transform.fits(&row[axis], min, max)?;
-    if !reflected && transform.offset.bits() == 0 {
+    if let Some(inner) = inner {
+        if transform.reflected {
+            transform.offset -= &inner.offset;
+        } else {
+            transform.offset += &inner.offset;
+        }
+        transform.reflected ^= inner.reflected;
+    }
+    if !transform.reflected && transform.offset.bits() == 0 {
         Some(ComputedProjectedValue::Identity(origin))
     } else {
         Some(ComputedProjectedValue::Affine(origin, Rc::new(transform)))
