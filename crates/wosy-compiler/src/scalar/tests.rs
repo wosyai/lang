@@ -3061,6 +3061,40 @@ fn checked_core_free_records_typed_owner_and_expires_derived_loans_in_both_valid
 }
 
 #[test]
+fn owner_endpoints_retire_only_projected_slots_with_stale_origins() {
+    for (signature, endpoint) in [
+        ("unit(u64) update = fn(count)", "unsafe { core.free(&first); };"),
+        ("unit(u64) update = fn(count)", "unsafe { core.invalidate(&first); };"),
+        (
+            "unit(u64, *?u8) update = fn(count, raw)",
+            "unsafe { core.invalidate(&first); core.rebind(&first, raw, count); };",
+        ),
+    ] {
+        for reset in [false, true] {
+            let overwrite = if reset { "refs[0] = null;" } else { "" };
+            let text = format!("%%start\n{signature} {{ u8[count] first; u8[count] second; (*u8)[2] refs = [null, null]; refs[0] = &first[0]; refs[1] = &second[0]; {endpoint} {overwrite} *u8 sibling = refs[1]; sibling; *u8 observed = refs[0]; observed; }};\n%%end");
+            let sibling = text.rfind("refs[1]").unwrap() as u32;
+            let observed = text.rfind("refs[0]").unwrap() as u32;
+            let (single, project) = both_reference_functions(&text);
+            for diagnostics in [&single.diagnostics, &project.diagnostics] {
+                if reset {
+                    assert!(diagnostics.is_empty(), "{text}: {diagnostics:?}");
+                } else {
+                    let at = |diagnostic: &super::Diagnostic, offset| {
+                        diagnostic.code == "B0003"
+                            && diagnostic.labels.first().is_some_and(|label| label.span.range.start == offset)
+                    };
+                    assert!(diagnostics.iter().any(|diagnostic| at(diagnostic, observed)),
+                        "{text}: {diagnostics:?}");
+                    assert!(!diagnostics.iter().any(|diagnostic| at(diagnostic, sibling)),
+                        "{text}: {diagnostics:?}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn checked_core_free_retains_all_joined_owner_candidates_in_both_validators() {
     let text = "%%start\nunit(u64, bool) release = fn(count, flag) { u8[count] first; u8[count] second; *u8 alias = &first[0]; if (flag) { alias = &second[0]; }; unsafe { core.free(alias); } };\n%%end";
     let (single, project) = both_reference_functions(text);

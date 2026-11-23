@@ -5198,9 +5198,37 @@ impl ReferenceProjectedState {
         facts: &[ReferenceOrigin],
         live: impl Fn(&ReferenceBindingId) -> bool,
     ) -> bool {
-        live(&self.place.binding) && !self.origins.iter().any(|origin| {
-            declared_local_loan(&facts[origin.0])
+        live(&self.place.binding) && !self.refers_to(facts, |origin| {
+            declared_local_loan(origin)
                 .is_some_and(|loan| !live(&loan.origin_place.binding))
+        })
+    }
+
+    fn refers_to(
+        &self,
+        facts: &[ReferenceOrigin],
+        affected: impl Fn(&ReferenceOrigin) -> bool,
+    ) -> bool {
+        self.origins.iter().any(|origin| affected(&facts[origin.0]))
+    }
+
+    fn refers_to_owner(
+        &self,
+        facts: &[ReferenceOrigin],
+        affected: impl Fn(&ReferenceBindingId) -> bool,
+    ) -> bool {
+        self.refers_to(facts, |origin| match origin {
+            ReferenceOrigin::Fresh { loan, .. } | ReferenceOrigin::BorrowedFrom { loan, .. } => {
+                let mut current = Some(loan);
+                while let Some(loan) = current {
+                    if affected(&loan.origin_place.binding) {
+                        return true;
+                    }
+                    current = loan.parent.as_deref();
+                }
+                false
+            }
+            ReferenceOrigin::Null { .. } | ReferenceOrigin::Invalid { .. } => false,
         })
     }
 }
@@ -8370,6 +8398,9 @@ fn transfer_reference_facts(
                     !candidates
                         .iter()
                         .any(|candidate| reference_places_overlap(&known.place, &candidate.place))
+                        && (candidates.is_empty() || !known.refers_to_owner(&cfg.facts, |binding| {
+                            candidates.iter().any(|candidate| &candidate.place.binding == binding)
+                        }))
                 });
             }
             if let CfgPointKind::Release {
@@ -8391,9 +8422,10 @@ fn transfer_reference_facts(
                         ReferenceOrigin::Null { .. } | ReferenceOrigin::Invalid { .. } => true,
                     });
                 }
-                state
-                    .projected
-                    .retain(|known| &known.place.binding != binding);
+                state.projected.retain(|known| {
+                    &known.place.binding != binding
+                        && !known.refers_to_owner(&cfg.facts, |owner| owner == binding)
+                });
             }
             if let CfgPointKind::CaptureAssignmentPrevious { writes } = &point.kind {
                 for write in writes {
