@@ -982,10 +982,11 @@ struct IntegerRow {
     cells: Vec<Rc<IntegerSet>>,
     equal_axes: Option<Rc<Vec<(usize, usize)>>>,
     entry: Option<Rc<ProjectedEntry>>,
+    projected_from: u16,
 }
 
 impl IntegerRow {
-    fn new(cells: Vec<Rc<IntegerSet>>) -> Self { Self { cells, equal_axes: None, entry: None } }
+    fn new(cells: Vec<Rc<IntegerSet>>) -> Self { Self { cells, equal_axes: None, entry: None, projected_from: 0 } }
 
     fn equal_axes(&self) -> &[(usize, usize)] {
         self.equal_axes.as_deref().map_or(&[], Vec::as_slice)
@@ -1107,6 +1108,7 @@ struct IntegerRoots<'a> {
     by_binding: HashMap<&'a ReferenceBindingId, usize>,
     parameters: usize,
     projected_entry_axis: Option<usize>,
+    unit_pair_work: Option<usize>,
     reached_obligation: bool,
     proof_reflexive_branches: bool,
 }
@@ -1390,7 +1392,7 @@ impl IntegerInputs {
             let left = &mut self.0[0];
             let right = &other.0[0];
             let canonical = left.canonical_axis(axis);
-            if left.entry_key() == right.entry_key() && left.equal_axes() == right.equal_axes() && left.iter().zip(right.iter()).enumerate().all(|(index, (a, b))| {
+            if left.projected_from == right.projected_from && left.entry_key() == right.entry_key() && left.equal_axes() == right.equal_axes() && left.iter().zip(right.iter()).enumerate().all(|(index, (a, b))| {
                 left.canonical_axis(index) == canonical || Rc::ptr_eq(a, b)
             }) {
                 let right = other.0.pop().unwrap();
@@ -1441,7 +1443,7 @@ impl IntegerInputs {
                 row.iter().enumerate().filter_map(|(index, domain)|
                     (row.canonical_axis(index) != canonical).then(|| Rc::as_ptr(domain))).collect()
             };
-            match representatives.entry((row.entry_key(), row.equal_axes.clone(), values)) {
+            match representatives.entry((row.projected_from, row.entry_key(), row.equal_axes.clone(), values)) {
                 std::collections::hash_map::Entry::Occupied(entry) => {
                     let target = &mut joined.0[*entry.get()];
                     merge_axis(target, row, canonical);
@@ -2486,8 +2488,14 @@ pub(super) enum ActualCallResult {
     Unit,
     EmptyUnit,
     ProjectedUnit(Rc<IntegerSet>),
+    ProjectedUnitPair(ProjectedUnitPair),
     Integer(BigInt),
     PartitionedInteger(Vec<IntegerReturnPartition>),
+}
+
+pub(super) struct ProjectedUnitPair {
+    caller_axes: [usize; 2],
+    survivors: IntegerInputs,
 }
 
 pub(super) const MAX_ACTUAL_CALL_DEPTH: usize = 64;
@@ -2568,6 +2576,7 @@ pub(super) enum ProjectedCompanion<'a> {
     Unary,
     Fixed(ExactIntegerArgument<'a>),
     Equal,
+    Independent { ty: &'a ScalarType, axis: usize },
 }
 
 pub(super) struct ProjectedIntegerArgument<'a> {
@@ -2627,7 +2636,7 @@ fn nested_integer_operand<'a>(
 
 fn nested_pair_argument<'a>(
     calls: &'a FunctionCallSites, expression: OccurrenceOrdinal, roots: &IntegerRoots<'_>, path: &'a IntegerInputs,
-    allow_projection: bool, allow_equal: bool,
+    allow_projection: bool, allow_equal: bool, allow_independent: bool,
 ) -> Option<NestedIntegerArgument<'a>> {
     let first = nested_integer_operand(calls, expression, 0, roots, path)?;
     let second = nested_integer_operand(calls, expression, 1, roots, path)?;
@@ -2642,6 +2651,8 @@ fn nested_pair_argument<'a>(
             if allow_equal && left_ty == right_ty && (left == right
                 || path.0.iter().all(|row| row.canonical_axis(left) == row.canonical_axis(right))) =>
             (left_ty, left, 0, ProjectedCompanion::Equal),
+        (NestedIntegerOperand::Axis(ty, left), NestedIntegerOperand::Axis(right_ty, right)) if allow_independent =>
+            (ty, left, 0, ProjectedCompanion::Independent { ty: right_ty, axis: right }),
         _ => return None,
     };
     Some(NestedIntegerArgument::Projected(ProjectedIntegerArgument { ty, caller_axis, slot, path, companion }))
@@ -3303,6 +3314,11 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
         std::mem::replace(cursor, IntegerBlockCursor::new(calls.structure.root, 0, IntegerInputs::default()));
     let structure = &calls.structure;
     loop {
+        if let Some(work) = &mut roots.unit_pair_work {
+            let axes = roots.axes.len().checked_add(1)?;
+            *work = work.checked_add(1)?.checked_add(path.0.len().checked_mul(axes)?)?;
+            if *work > MAX_PARTITION_TRANSFER_WORK { return None; }
+        }
         let items = &structure.blocks.get(block.0)?.items;
         let Some(item) = items.get(next).filter(|_| !path.is_unreachable()) else {
             if SUSPEND_CALL && root_tail.is_some() && branches.is_empty() && path.is_unreachable() {
@@ -3398,7 +3414,7 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                     let signature = calls.checked_call_signatures.get(&expression)?;
                     let project = COLLECT && failures.as_ref().is_some_and(|collection| collection.allow_projected_calls);
                     let argument = if COLLECT && signature.parameters.len() == 2 {
-                        nested_pair_argument(calls, expression, roots, &path, project, false)?
+                        nested_pair_argument(calls, expression, roots, &path, project, false, false)?
                     } else {
                         actual_nested_argument(calls, expression, roots, &path, project)
                     };
@@ -3797,6 +3813,7 @@ pub(super) struct ExactCallCursor<'a> {
     returned: Vec<IntegerReturningPath<'a>>,
     return_capture_work: usize,
     projected_slot: Option<usize>,
+    projected_pair: Option<[usize; 2]>,
 }
 
 impl<'a> ExactCallCursor<'a> {
@@ -3832,31 +3849,68 @@ impl<'a> ExactCallCursor<'a> {
         Self::with_row(calls, expected, row, Some(argument.slot))
     }
 
+    pub(super) fn projected_unit_pair(
+        calls: &'a FunctionCallSites, argument: &ProjectedIntegerArgument<'_>, other: usize,
+    ) -> Option<Self> {
+        let axes = [argument.caller_axis, other];
+        if argument.path.0.len().checked_mul(5)? > MAX_PARTITION_TRANSFER_WORK {
+            return None;
+        }
+        let mut work: usize = 0;
+        let rows = argument.path.0.iter().enumerate().map(|(index, row)| {
+            work = work.checked_add(3)?.checked_add(row[axes[0]].interval_count())?
+                .checked_add(row[axes[1]].interval_count())?;
+            if work > MAX_PARTITION_TRANSFER_WORK { return None; }
+            let first = Rc::clone(&row[axes[0]]);
+            let second = Rc::clone(&row[axes[1]]);
+            let same = row.canonical_axis(axes[0]) == row.canonical_axis(axes[1]);
+            let mut next = if same {
+                let mut next = IntegerRow::new(vec![first]);
+                next.append_alias(0, second);
+                next
+            } else {
+                IntegerRow::new(vec![first, second])
+            };
+            next.projected_from = u16::try_from(index.checked_add(1)?).ok()?;
+            Some(next)
+        }).collect::<Option<Vec<_>>>()?;
+        Self::with_rows(calls, &ScalarType::Unit, IntegerInputs(rows), None, Some(axes))
+    }
+
     fn with_row(calls: &'a FunctionCallSites, expected: &ScalarType, row: IntegerRow, projected_slot: Option<usize>) -> Option<Self> {
+        Self::with_rows(calls, expected, IntegerInputs(vec![row]), projected_slot, None)
+    }
+
+    fn with_rows(
+        calls: &'a FunctionCallSites, expected: &ScalarType, rows: IntegerInputs,
+        projected_slot: Option<usize>, projected_pair: Option<[usize; 2]>,
+    ) -> Option<Self> {
         let tail = if *expected == ScalarType::Unit { None } else {
             Some(integer_tail_type(calls).filter(|tail| *tail == expected)?)
         };
         let boundary = &calls.boundary;
         let bindings = boundary.checker_parameter_bindings.as_deref()?;
-        if row.len() != boundary.parameters.len() || bindings.len() != row.len() {
+        let parameters = boundary.parameters.len();
+        if bindings.len() != parameters || rows.0.iter().any(|row| row.len() != parameters) {
             return None;
         }
         let mut roots = IntegerRoots {
-            parameters: row.len(), projected_entry_axis: projected_slot, ..IntegerRoots::default()
+            parameters, projected_entry_axis: projected_slot, unit_pair_work: projected_pair.map(|_| 0),
+            ..IntegerRoots::default()
         };
         for (binding, parameter) in bindings.iter().zip(&boundary.parameters) {
             roots.add(binding, &parameter.ty);
         }
-        let block = IntegerBlockCursor::new(calls.structure.root, roots.axes.len(), IntegerInputs(vec![row]));
-        Some(Self { roots, block, tail, returned: Vec::new(), return_capture_work: 0, projected_slot })
+        let block = IntegerBlockCursor::new(calls.structure.root, roots.axes.len(), rows);
+        Some(Self { roots, block, tail, returned: Vec::new(), return_capture_work: 0, projected_slot, projected_pair })
     }
 
     pub(super) fn arguments<'borrow>(
         &'borrow self, calls: &'borrow FunctionCallSites, call: OccurrenceOrdinal, parameters: usize,
-        collect: bool, project: bool, project_pair: bool,
+        collect: bool, project: bool, project_pair: bool, project_independent: bool,
     ) -> Option<NestedIntegerArgument<'borrow>> {
         if collect && parameters == 2 {
-            nested_pair_argument(calls, call, &self.roots, &self.block.path, project_pair, project_pair)
+            nested_pair_argument(calls, call, &self.roots, &self.block.path, project_pair, project_pair, project_independent)
         } else {
             Some(actual_nested_argument(calls, call, &self.roots, &self.block.path, project))
         }
@@ -3872,6 +3926,24 @@ impl<'a> ExactCallCursor<'a> {
             }
             (ExactCallEffect::Unit(_), ActualCallResult::ProjectedUnit(survivors)) => {
                 self.block.path.restrict_axis(caller_axis?, &survivors);
+            }
+            (ExactCallEffect::Unit(_), ActualCallResult::ProjectedUnitPair(projected)) => {
+                let original = &self.block.path.0;
+                let mut work: usize = 0;
+                for survivor in &projected.survivors.0 {
+                    let index = usize::from(survivor.projected_from).checked_sub(1)?;
+                    let row = original.get(index)?;
+                    work = work.checked_add(row.len())?.checked_add(2usize.checked_mul(row.equal_axes().len())?)?
+                        .checked_add(survivor[0].interval_count())?.checked_add(survivor[1].interval_count())?;
+                    if work > MAX_PARTITION_TRANSFER_WORK { return None; }
+                }
+                let [first, second] = projected.caller_axes;
+                self.block.path.0 = projected.survivors.0.iter().map(|survivor| {
+                    let mut row = original[usize::from(survivor.projected_from) - 1].clone();
+                    row.replace_domain(first, Rc::clone(&survivor[0]));
+                    row.replace_domain(second, Rc::clone(&survivor[1]));
+                    row
+                }).collect();
             }
             (ExactCallEffect::Integer { binding, ty, .. }, ActualCallResult::PartitionedInteger(pieces)) => {
                 let axis = caller_axis?;
@@ -3941,6 +4013,8 @@ impl<'a> ExactCallCursor<'a> {
             (_, IntegerControl::PendingCall(effect)) => return Some(ExactCallProgress::Pending(effect)),
             (_, IntegerControl::Fail(failure)) => return Some(ExactCallProgress::Failed(failure)),
             (None, IntegerControl::Continue(path)) if COLLECT && path.is_unreachable() => ActualCallResult::EmptyUnit,
+            (None, IntegerControl::Continue(survivors)) if self.projected_pair.is_some() =>
+                ActualCallResult::ProjectedUnitPair(ProjectedUnitPair { caller_axes: self.projected_pair?, survivors }),
             (None, IntegerControl::Continue(path)) if self.projected_slot.is_some() =>
                 ActualCallResult::ProjectedUnit(path.project_entry(self.projected_slot?)?),
             (None, IntegerControl::Continue(_) | IntegerControl::Returned) => ActualCallResult::Unit,

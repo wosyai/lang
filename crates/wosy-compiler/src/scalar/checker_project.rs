@@ -840,8 +840,14 @@ fn check_unused_module<const COLLECT: bool, const ENTRY_EVIDENCE: bool, Proof: S
             }
         } else {
             #[cfg(feature = "internal-checker")]
-            if COLLECT && Proof::INTEGER_RETURN_PARTITIONS && !body.structure.checker_integer_call_locals.is_empty()
+            if COLLECT && Proof::INTEGER_RETURN_PARTITIONS
                 && matches!(body.boundary.results.as_slice(), [result] if result.ty == ScalarType::Unit)
+                && (!body.structure.checker_integer_call_locals.is_empty()
+                    || body.structure.checker_direct_targets.keys().any(|occurrence| {
+                        body.checked_call_signatures.get(occurrence).is_some_and(|signature|
+                            matches!(signature.parameters.as_slice(), [left, right] if is_integer_type(left) && is_integer_type(right))
+                            && matches!(signature.outputs.outputs.as_slice(), [output] if output.ty == ScalarType::Unit))
+                    }))
             {
                 let sink = RefCell::new(failures.as_deref_mut().ok_or(ProjectCheck::Unsupported)?);
                 let collection = OrderedCallCollection { failures: &sink, visits: completed_visits, outer: None };
@@ -1621,6 +1627,7 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
         let arguments = parent.cursor.arguments(
             caller, call, signature.parameters.len(), collection.is_some(), Observer::INTEGER_RETURN_PARTITIONS,
             Observer::ORDINARY_PROJECTED_PAIR,
+            Observer::ORDINARY_PROJECTED_PAIR && *expected == ScalarType::Unit,
         )
             .ok_or(ProjectCheck::Unsupported)?;
         if let NestedIntegerArgument::Projected(projection) = arguments {
@@ -1629,12 +1636,17 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                 || self.active.contains(&target)
                 || !projected_call_types_match(signature, body, &projection)
                 || (!matches!(projection.companion, ProjectedCompanion::Unary) && !Observer::ORDINARY_PROJECTED_PAIR)
-                || (matches!(projection.companion, ProjectedCompanion::Equal) && !body.assignments.is_empty())
+                || (matches!(projection.companion, ProjectedCompanion::Equal | ProjectedCompanion::Independent { .. })
+                    && !body.assignments.is_empty())
             {
                 return Err(ProjectCheck::Unsupported);
             }
-            let values = projection.materialize().ok_or(ProjectCheck::Unsupported)?;
-            let cursor = ExactCallCursor::projected_arguments(body, values, &projection, expected).ok_or(ProjectCheck::Unsupported)?;
+            let cursor = if let ProjectedCompanion::Independent { axis, .. } = projection.companion {
+                ExactCallCursor::projected_unit_pair(body, &projection, axis)
+            } else {
+                let values = projection.materialize().ok_or(ProjectCheck::Unsupported)?;
+                ExactCallCursor::projected_arguments(body, values, &projection, expected)
+            }.ok_or(ProjectCheck::Unsupported)?;
             self.active.insert(target);
             self.active_depth += 1;
             return Ok(ExactCallActivation {
@@ -1742,7 +1754,7 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                 let fixed = match projection.companion {
                     ProjectedCompanion::Unary => None,
                     ProjectedCompanion::Fixed((_, value)) => Some(value),
-                    ProjectedCompanion::Equal => return Err(ProjectCheck::Unsupported),
+                    ProjectedCompanion::Equal | ProjectedCompanion::Independent { .. } => return Err(ProjectCheck::Unsupported),
                 };
                 if ACTUAL_STARTUP || *expected != ScalarType::Unit || !projected_call_types_match(signature, body, &projection)
                     || !function.generic_parameters.is_empty() || !function.overload_arms.is_empty()
@@ -1891,6 +1903,8 @@ fn projected_call_types_match(
                 && parameters[1 - slot] == *fixed_ty && entries[1 - slot].ty == *fixed_ty,
         ([first, second], [left, right], ProjectedCompanion::Equal) =>
             slot == 0 && first == ty && second == ty && left.ty == *ty && right.ty == *ty,
+        ([first, second], [left, right], ProjectedCompanion::Independent { ty: other, .. }) =>
+            slot == 0 && first == ty && second == other && left.ty == *ty && right.ty == *other,
         _ => false,
     }
 }
@@ -8506,6 +8520,45 @@ mod tests {
         let assignment = program.replace("if (left < 0) { right } else { 0 }",
             "left = 0; if (left < 0) { right } else { 0 }");
         assert!(matches!(run("symbolic-equal-pair-assignment", &assignment), Err(ProjectCheck::Unsupported)));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordered_base_symbolic_call_keeps_independent_unit_argument_rows_correlated() {
+        let report = |code| OUTPUT.replace(".code = 1", &format!(".code = {code}"));
+        let program = format!(r#"%%start
+            i8(i8) classify = fn(n) {{ if (n < 0) {{ -1 }} else {{ 1 }} }};
+            unit(i8, i8) leaf = fn(n, tag) {{
+                if (tag < 0) {{ core.narrow(n != -2, {}); }};
+            }};
+            unit(i8, i8) wrapper = fn(tag, n) {{ leaf(n, tag); }};
+            unit(i8) unused = fn(n) {{
+                i8 tag = classify(n);
+                wrapper(tag, n);
+                core.require(n != -2, {});
+                if (tag < 0) {{ core.require(n < 0, {}); }};
+            }};
+        %%end"#, report(5), report(11), report(13));
+        let run = |revision, text: &str| {
+            let file = source("src/main.w", revision);
+            let prepared = prepare_proof_target(&file, text).unwrap();
+            run_closed_without_named_proofs(&prepared, ScalarCheckerScope::CurrentPackage, 1)
+        };
+        let normal = run("symbolic-independent-pair-pass", &program).unwrap();
+        assert!(normal.active && normal.directives.is_empty());
+
+        let changed = program.replace("core.require(n != -2", "core.require(n != -1");
+        let result = run("symbolic-independent-pair-report", &changed).unwrap();
+        let [caller] = result.directives.as_slice() else { panic!("only the surviving caller value fails"); };
+        assert_eq!(caller.code(), &BigInt::from(11));
+        assert_eq!(caller.witness.row_count(), 1);
+        let minus_one = BigInt::from(-1);
+        for axis in 0..2 {
+            assert!(caller.witness.intervals_at(0, axis).unwrap().eq([(&minus_one, &minus_one)]));
+        }
+        let assigns = program.replace("if (tag < 0) { core.narrow",
+            "tag = 0; if (tag < 0) { core.narrow");
+        assert!(matches!(run("symbolic-independent-pair-write-denied", &assigns), Err(ProjectCheck::Unsupported)));
     }
 
     #[cfg(feature = "internal-checker")]
