@@ -325,3 +325,33 @@ run_runner = "wasm"
 
 [targets.raw-view-wasm.profiles.dev]
 main_artifact = "main"
+
+[targets.lexical-move-stale-native]
+root = "src/lexical_move_stale.w"
+
+[targets.lexical-move-stale-native.artifacts.main]
+artifact = "Main"
+
+[targets.lexical-move-stale-native.artifacts.main.profiles.dev]
+backend = "llvm"
+output = "native"
+builder = "native"
+run_runner = "native"
+
+[targets.lexical-move-stale-native.profiles.dev]
+main_artifact = "main"
+
+[targets.lexical-move-stale-wasm]
+root = "src/lexical_move_stale.w"
+
+[targets.lexical-move-stale-wasm.artifacts.main]
+artifact = "Main"
+
+[targets.lexical-move-stale-wasm.artifacts.main.profiles.dev]
+backend = "llvm"
+output = "wasm-wasip1"
+builder = "wasm"
+run_runner = "wasm"
+
+[targets.lexical-move-stale-wasm.profiles.dev]
+main_artifact = "main"

@@ -219,3 +219,13 @@ exit = 0
 stdout = "expected/raw_view.stdout"
 stderr = "expected/verified.stderr"
 exact = true
+
+[[assert]]
+command = ["wosy", "build", "lexical-move-stale-native"]
+exit = 1
+stderr_contains = ["B0003", "read or move of unavailable place", "src/lexical_move_stale.w:11:", "std.print(outer)"]
+
+[[assert]]
+command = ["wosy", "build", "lexical-move-stale-wasm"]
+exit = 1
+stderr_contains = ["B0003", "read or move of unavailable place", "src/lexical_move_stale.w:11:", "std.print(outer)"]

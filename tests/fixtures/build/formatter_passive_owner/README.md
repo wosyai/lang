@@ -57,3 +57,7 @@ The raw-view control points a plain descriptor at a separately owned runtime
 array. Ordinary print must write the original byte at that base without
 releasing it; the live array remains readable afterward and releases its own
 allocation exactly once at scope exit.
+
+A paired compile-negative lexical control attempts to print the original
+binding after the inner move. The source must be rejected for accessing
+the unavailable binding, not for unsupported lowering.
