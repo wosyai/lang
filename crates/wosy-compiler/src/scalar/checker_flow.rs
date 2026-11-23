@@ -971,14 +971,21 @@ thread_local! {
     pub(super) static AUTHORED_RETURN_CALCULATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum ProjectedEntry {
+    Linked(usize),
+    Detached(Rc<IntegerSet>),
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct IntegerRow {
     cells: Vec<Rc<IntegerSet>>,
     equal_axes: Option<Rc<Vec<(usize, usize)>>>,
+    entry: Option<Rc<ProjectedEntry>>,
 }
 
 impl IntegerRow {
-    fn new(cells: Vec<Rc<IntegerSet>>) -> Self { Self { cells, equal_axes: None } }
+    fn new(cells: Vec<Rc<IntegerSet>>) -> Self { Self { cells, equal_axes: None, entry: None } }
 
     fn equal_axes(&self) -> &[(usize, usize)] {
         self.equal_axes.as_deref().map_or(&[], Vec::as_slice)
@@ -1009,13 +1016,41 @@ impl IntegerRow {
         self.cells[canonical] = set;
     }
 
-    fn overwrite(&mut self, axis: usize, domain: Rc<IntegerSet>) {
+    fn entry_domain(&self, formal: usize) -> &Rc<IntegerSet> {
+        match self.entry.as_deref() {
+            None => &self.cells[formal],
+            Some(ProjectedEntry::Linked(axis)) => &self.cells[*axis],
+            Some(ProjectedEntry::Detached(domain)) => domain,
+        }
+    }
+
+    fn entry_alias(&self, formal: usize, axis: usize) -> bool {
+        let canonical = self.canonical_axis(axis);
+        match self.entry.as_deref() {
+            None => canonical == formal,
+            Some(ProjectedEntry::Linked(root)) => canonical == *root,
+            Some(ProjectedEntry::Detached(_)) => false,
+        }
+    }
+
+    fn entry_key(&self) -> Option<Result<usize, *const IntegerSet>> {
+        self.entry.as_deref().map(|entry| match entry {
+            ProjectedEntry::Linked(axis) => Ok(*axis),
+            ProjectedEntry::Detached(domain) => Err(Rc::as_ptr(domain)),
+        })
+    }
+
+    fn overwrite(&mut self, axis: usize, domain: Rc<IntegerSet>, preserve_entry: bool) {
+        let tracks_axis = (preserve_entry && self.entry.is_none())
+            || matches!(self.entry.as_deref(), Some(ProjectedEntry::Linked(root)) if *root == axis);
+        let mut replacement_root = None;
         if let Some(equality) = &mut self.equal_axes {
             if let Ok(member) = equality.binary_search_by_key(&axis, |(alias, _)| *alias) {
                 Rc::make_mut(equality).remove(member);
             } else if let Some(root) = equality.iter().position(|&(_, root)| root == axis) {
                 let equality = Rc::make_mut(equality);
                 let (promoted, _) = equality.remove(root);
+                replacement_root = Some(promoted);
                 for (_, root) in &mut equality[root..] {
                     if *root == axis {
                         *root = promoted;
@@ -1026,10 +1061,19 @@ impl IntegerRow {
                 self.equal_axes = None;
             }
         }
+        if tracks_axis {
+            self.entry = Some(Rc::new(replacement_root.map_or_else(
+                || ProjectedEntry::Detached(Rc::clone(&self.cells[axis])), ProjectedEntry::Linked)));
+        }
         self.cells[axis] = domain;
     }
 
     fn truncate(&mut self, depth: usize) {
+        if let Some(ProjectedEntry::Linked(axis)) = self.entry.as_deref() {
+            if *axis >= depth {
+                self.entry = Some(Rc::new(ProjectedEntry::Detached(Rc::clone(&self.cells[*axis]))));
+            }
+        }
         self.cells.truncate(depth);
         if let Some(equality) = &mut self.equal_axes {
             let keep = equality.partition_point(|(alias, _)| *alias < depth);
@@ -1062,6 +1106,7 @@ struct IntegerRoots<'a> {
     axes: Vec<(&'a ReferenceBindingId, &'a ScalarType)>,
     by_binding: HashMap<&'a ReferenceBindingId, usize>,
     parameters: usize,
+    projected_entry_axis: Option<usize>,
     reached_obligation: bool,
     proof_reflexive_branches: bool,
 }
@@ -1145,12 +1190,20 @@ impl IntegerInputs {
     }
 
     fn project_axis(&self, axis: usize) -> Option<Rc<IntegerSet>> {
+        self.project_domain(|row| &row[axis])
+    }
+
+    fn project_entry(&self, formal: usize) -> Option<Rc<IntegerSet>> {
+        self.project_domain(|row| row.entry_domain(formal))
+    }
+
+    fn project_domain(&self, domain: impl Fn(&IntegerRow) -> &Rc<IntegerSet>) -> Option<Rc<IntegerSet>> {
         let (first, rest) = self.0.split_first()?;
-        let first = &first[axis];
-        Some(if rest.iter().all(|row| Rc::ptr_eq(first, &row[axis])) {
+        let first = domain(first);
+        Some(if rest.iter().all(|row| Rc::ptr_eq(first, domain(row))) {
             Rc::clone(first)
         } else {
-            Rc::new(IntegerSet::union(self.0.iter().map(|row| row[axis].as_ref())))
+            Rc::new(IntegerSet::union(self.0.iter().map(|row| domain(row).as_ref())))
         })
     }
 
@@ -1337,7 +1390,7 @@ impl IntegerInputs {
             let left = &mut self.0[0];
             let right = &other.0[0];
             let canonical = left.canonical_axis(axis);
-            if left.equal_axes() == right.equal_axes() && left.iter().zip(right.iter()).enumerate().all(|(index, (a, b))| {
+            if left.entry_key() == right.entry_key() && left.equal_axes() == right.equal_axes() && left.iter().zip(right.iter()).enumerate().all(|(index, (a, b))| {
                 left.canonical_axis(index) == canonical || Rc::ptr_eq(a, b)
             }) {
                 let right = other.0.pop().unwrap();
@@ -1351,9 +1404,9 @@ impl IntegerInputs {
         Self::compact_axis(self.0.into_iter().chain(other.0), axis)
     }
 
-    fn overwrite(mut self, axis: usize, value: Rc<IntegerSet>) -> Self {
+    fn overwrite(mut self, axis: usize, value: Rc<IntegerSet>, preserve_entry: bool) -> Self {
         for row in &mut self.0 {
-            row.overwrite(axis, Rc::clone(&value));
+            row.overwrite(axis, Rc::clone(&value), preserve_entry);
         }
         if self.0.len() < 2 {
             return self;
@@ -1388,7 +1441,7 @@ impl IntegerInputs {
                 row.iter().enumerate().filter_map(|(index, domain)|
                     (row.canonical_axis(index) != canonical).then(|| Rc::as_ptr(domain))).collect()
             };
-            match representatives.entry((row.equal_axes.clone(), values)) {
+            match representatives.entry((row.entry_key(), row.equal_axes.clone(), values)) {
                 std::collections::hash_map::Entry::Occupied(entry) => {
                     let target = &mut joined.0[*entry.get()];
                     merge_axis(target, row, canonical);
@@ -3495,10 +3548,11 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                 let allow_contextual_local_transfers = || COLLECT && !USE_IMPORTED_BOUND
                     && failures.as_deref().is_some_and(|failure| failure.allow_contextual_local_transfers);
                 let (axis, value) = integer_assignment(calls, roots, group, &path, allow_contextual_local_transfers)?;
-                if axis < roots.parameters && path.axis_has_alias(axis) {
+                let preserve_entry = roots.projected_entry_axis == Some(axis);
+                if axis < roots.parameters && !preserve_entry && path.axis_has_alias(axis) {
                     return None;
                 }
-                path = path.overwrite(axis, value);
+                path = path.overwrite(axis, value, preserve_entry);
             }
             BlockItemKind::Binding(ref binding) => {
                 if USE_IMPORTED_BOUND && block == structure.root
@@ -3694,6 +3748,9 @@ fn charge_partition_capture(retained: &mut usize, path: &IntegerInputs, axes: us
     let mut work = retained.checked_add(axes)?.checked_add(1)?;
     for row in &path.0 {
         work = work.checked_add(1)?.checked_add(row.len())?.checked_add(row.equal_axes().len())?;
+        if let Some(ProjectedEntry::Detached(domain)) = row.entry.as_deref() {
+            work = work.checked_add(domain.interval_count())?;
+        }
         for domain in row.iter() {
             work = work.checked_add(domain.interval_count())?;
             if work > MAX_PARTITION_TRANSFER_WORK {
@@ -3756,7 +3813,9 @@ impl<'a> ExactCallCursor<'a> {
         if row.len() != boundary.parameters.len() || bindings.len() != row.len() {
             return None;
         }
-        let mut roots = IntegerRoots { parameters: row.len(), ..IntegerRoots::default() };
+        let mut roots = IntegerRoots {
+            parameters: row.len(), projected_entry_axis: projected.then_some(0), ..IntegerRoots::default()
+        };
         for (binding, parameter) in bindings.iter().zip(&boundary.parameters) {
             roots.add(binding, &parameter.ty);
         }
@@ -3855,7 +3914,7 @@ impl<'a> ExactCallCursor<'a> {
             (_, IntegerControl::Fail(failure)) => return Some(ExactCallProgress::Failed(failure)),
             (None, IntegerControl::Continue(path)) if COLLECT && path.is_unreachable() => ActualCallResult::EmptyUnit,
             (None, IntegerControl::Continue(path)) if self.projected =>
-                ActualCallResult::ProjectedUnit(path.project_axis(0)?),
+                ActualCallResult::ProjectedUnit(path.project_entry(0)?),
             (None, IntegerControl::Continue(_) | IntegerControl::Returned) => ActualCallResult::Unit,
             (Some(_), IntegerControl::Returned) if self.projected => {
                 let piece_count = self.returned.iter().try_fold(0usize, |count, path| count.checked_add(path.state.0.len()))?;
@@ -3873,8 +3932,8 @@ impl<'a> ExactCallCursor<'a> {
                         IntegerReturn::Alias(_) => None,
                     };
                     for row in &path.state.0 {
-                        let input = Rc::clone(row.first()?);
-                        let output = if alias.is_some_and(|axis| row.canonical_axis(axis) == 0) && input.singleton_value().is_none() {
+                        let input = Rc::clone(row.entry_domain(0));
+                        let output = if alias.is_some_and(|axis| row.entry_alias(0, axis)) && input.singleton_value().is_none() {
                             IntegerPartitionOutput::InputAlias
                         } else if let Some(axis) = alias {
                             row[axis].singleton_value()?;
@@ -4239,9 +4298,9 @@ fn symbolic_local_overwrite_preserves_the_other_members_of_a_value_class() {
     row.append_alias(2, Rc::clone(&old));
     row.append_alias(2, Rc::clone(&old));
     let mut detached = row.clone();
-    detached.overwrite(2, Rc::clone(&zero));
+    detached.overwrite(2, Rc::clone(&zero), false);
     assert_eq!(detached.equal_axes(), &[(3, 0), (4, 1), (5, 1)]);
-    detached.overwrite(1, Rc::clone(&one));
+    detached.overwrite(1, Rc::clone(&one), false);
     assert_eq!(detached.equal_axes(), &[(3, 0), (5, 4)]);
     detached.replace_domain(5, Rc::clone(&zero));
     assert!(Rc::ptr_eq(&detached[0], &old));
@@ -4251,7 +4310,29 @@ fn symbolic_local_overwrite_preserves_the_other_members_of_a_value_class() {
     assert!(Rc::ptr_eq(&detached[5], &zero));
     detached.truncate(4);
     assert_eq!(detached.equal_axes(), &[(3, 0)]);
-    detached.overwrite(3, zero);
+    detached.overwrite(3, zero, false);
     assert!(detached.equal_axes.is_none());
     assert_eq!(row.equal_axes(), &[(2, 1), (3, 0), (4, 1), (5, 1)]);
+}
+
+#[test]
+fn symbolic_projected_entry_survives_rebinding_and_expired_copies() {
+    let old = Rc::new(IntegerSet::from_type(&ScalarType::I8).unwrap());
+    let zero = Rc::new(IntegerSet::singleton(&BigInt::from(0)));
+    let negative = Rc::new(old.keep(&BinaryOperator::Less, &BigInt::from(0)).unwrap());
+    let mut row = IntegerRow::new(vec![Rc::clone(&old)]);
+    row.append_alias(0, Rc::clone(&old));
+    row.append_alias(1, Rc::clone(&old));
+    row.overwrite(0, Rc::clone(&zero), true);
+    assert!(row.entry_alias(0, 1) && row.entry_alias(0, 2));
+    assert!(!row.entry_alias(0, 0));
+    row.overwrite(1, Rc::clone(&zero), false);
+    row.replace_domain(2, Rc::clone(&negative));
+    assert!(Rc::ptr_eq(row.entry_domain(0), &negative));
+    row.truncate(2);
+    assert!(Rc::ptr_eq(row.entry_domain(0), &negative));
+    assert!(!row.entry_alias(0, 1));
+    row.overwrite(0, Rc::clone(&zero), true);
+    assert!(Rc::ptr_eq(row.entry_domain(0), &negative));
+    assert!(Rc::ptr_eq(&row[0], &zero));
 }

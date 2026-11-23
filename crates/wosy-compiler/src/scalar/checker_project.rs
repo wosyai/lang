@@ -733,7 +733,7 @@ fn symbolic_obligation_roots(
 }
 
 #[cfg(feature = "internal-checker")]
-struct ProofFreeSymbolic;
+struct ProofFreeSymbolic<const PROJECTED_WRITES: bool = false>;
 
 #[cfg(feature = "internal-checker")]
 impl SymbolicRootProof for ProofFreeSymbolic {
@@ -742,10 +742,12 @@ impl SymbolicRootProof for ProofFreeSymbolic {
 }
 
 #[cfg(feature = "internal-checker")]
-impl ActualIntegerObserver for ProofFreeSymbolic {
+impl<const PROJECTED_WRITES: bool> ActualIntegerObserver for ProofFreeSymbolic<PROJECTED_WRITES> {
     const ENABLED: bool = false;
     const EXACT_INTEGER_CALL_CONTINUATIONS: bool = true;
     const INTEGER_RETURN_PARTITIONS: bool = true;
+
+    const PROJECTED_FORMAL_WRITES: bool = PROJECTED_WRITES;
 
     fn observe(&mut self, _: (usize, usize), _: &[&BigInt], _: &BigInt) {}
 }
@@ -842,7 +844,7 @@ fn check_unused_module<const COLLECT: bool, const ENTRY_EVIDENCE: bool, Proof: S
             {
                 let sink = RefCell::new(failures.as_deref_mut().ok_or(ProjectCheck::Unsupported)?);
                 let collection = OrderedCallCollection { failures: &sink, visits: completed_visits, outer: None };
-                let mut symbolic = CheckedCalls::<ProofFreeSymbolic, false> {
+                let mut symbolic = CheckedCalls::<ProofFreeSymbolic<true>, false> {
                     project, calls, active: HashSet::from([(ordinal, item)]), active_depth: 1, reached: HashSet::new(),
                     had_obligations: false, observer: ProofFreeSymbolic, symbolic_module: ordinal,
                 };
@@ -1279,6 +1281,7 @@ trait ActualIntegerObserver {
     const EXACT_SELF_UNIT_REENTRY: bool = false;
     const EXACT_INTEGER_CALL_CONTINUATIONS: bool = false;
     const INTEGER_RETURN_PARTITIONS: bool = false;
+    const PROJECTED_FORMAL_WRITES: bool = false;
 
     fn observe(&mut self, target: (usize, usize), arguments: &[&BigInt], value: &BigInt);
 
@@ -1609,14 +1612,16 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
         let signature = caller.checked_call_signatures.get(&call).ok_or(ProjectCheck::Unsupported)?;
         if !matches!(signature.outputs.outputs.as_slice(), [output] if &output.ty == expected)
             || (*expected != ScalarType::Unit && (!Observer::EXACT_INTEGER_CALL_CONTINUATIONS
-                || !supported_integer_continuation(body, expected)))
+                || !supported_integer_continuation_shape(body, expected)))
         {
             return Err(ProjectCheck::Unsupported);
         }
         let arguments = parent.cursor.arguments(caller, call, signature.parameters.len(), collection.is_some(), Observer::INTEGER_RETURN_PARTITIONS)
             .ok_or(ProjectCheck::Unsupported)?;
         if let NestedIntegerArgument::Projected(projection) = arguments {
-            if !Observer::INTEGER_RETURN_PARTITIONS || !body.assignments.is_empty() || self.active.contains(&target)
+            if !Observer::INTEGER_RETURN_PARTITIONS
+                || (!Observer::PROJECTED_FORMAL_WRITES && !body.assignments.is_empty())
+                || self.active.contains(&target)
                 || !matches!(signature.parameters.as_slice(), [ty] if ty == projection.ty)
                 || !matches!(body.boundary.parameters.as_slice(), [formal] if &formal.ty == projection.ty)
             {
@@ -1630,6 +1635,9 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                 body, source: &owner.source, cursor, entry: None, followed_self_edge: false,
                 target: Some((target, true, effect, Some(projection.caller_axis))),
             });
+        }
+        if *expected != ScalarType::Unit && !body.assignments.is_empty() {
+            return Err(ProjectCheck::Unsupported);
         }
         let argument;
         let pair;
@@ -1870,12 +1878,16 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
 }
 
 fn supported_integer_continuation(body: &FunctionCallSites, expected: &ScalarType) -> bool {
+    supported_integer_continuation_shape(body, expected) && body.assignments.is_empty()
+}
+
+fn supported_integer_continuation_shape(body: &FunctionCallSites, expected: &ScalarType) -> bool {
     #[cfg(feature = "internal-checker")]
     let exact_requirements = !body.structure.checker_has_nonexact_require;
     #[cfg(not(feature = "internal-checker"))]
     let exact_requirements = false;
     is_integer_type(expected) && exact_requirements
-        && body.allocation_length_calls.is_empty() && body.assignments.is_empty()
+        && body.allocation_length_calls.is_empty()
 }
 
 #[cfg(test)]
@@ -8335,6 +8347,56 @@ mod tests {
 
     #[cfg(feature = "internal-checker")]
     #[test]
+    fn ordered_base_symbolic_call_formal_writes_preserve_immutable_entry_partitions() {
+        let text = format!(r#"%%start
+            i8(i8) identity = fn(n) {{ n }};
+            i8(i8) reset = fn(n) {{ n = 0; n }};
+            unit(i8) reset_unit = fn(n) {{ n = 0; core.narrow(n == 0, {OUTPUT}); }};
+            i8(i8) copied = fn(n) {{
+                i8 original = identity(n);
+                n = 0;
+                if (original < 0) {{ original }} else {{ n }}
+            }};
+            unit(i8) unused = fn(input) {{
+                i8 written = reset(input);
+                core.require(written == 0, {OUTPUT});
+                reset_unit(input);
+                i8 from_copy = copied(input);
+                if (input < 0) {{ core.require(from_copy < 0, {OUTPUT}); }}
+                else {{ core.require(from_copy == 0, {OUTPUT}); }};
+                core.require(input >= -128, {OUTPUT});
+            }};
+        %%end"#);
+        let run = |revision, text: &str| {
+            let app = source("src/main.w", revision);
+            let prepared = prepare_proof_target(&app, text).unwrap();
+            run_closed_without_named_proofs(&prepared, ScalarCheckerScope::CurrentPackage, 1)
+        };
+        let pass = run("symbolic-formal-write-pass", &text).unwrap();
+        assert!(pass.active && pass.directives.is_empty());
+        let failed = run("symbolic-formal-write-fail", &text.replace("input >= -128", "input == 0")).unwrap();
+        let [failed] = failed.directives.as_slice() else { panic!("caller remains unrestricted by local formal writes"); };
+        let [lower, minus_one, one, upper] = [-128, -1, 1, 127].map(BigInt::from);
+        let (mut negative, mut positive) = (false, false);
+        for row in 0..failed.witness.row_count() {
+            match failed.witness.row_equal_axes(row) {
+                Some([(2, 0)]) => {
+                    assert!(failed.witness.intervals_at(row, 0).unwrap().eq([(&lower, &minus_one)]));
+                    negative = true;
+                }
+                Some([]) => {
+                    assert!(failed.witness.intervals_at(row, 0).unwrap().eq([(&one, &upper)]));
+                    positive = true;
+                }
+                _ => panic!("unexpected entry relation"),
+            }
+        }
+        assert!(negative && positive);
+        assert_eq!(failed.witness.row_count(), 2);
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
     fn ordered_named_proof_does_not_consume_ordinary_alias_effects() {
         let app = source("src/main.w", "named-proof-ordinary-alias-firewall");
         let text = r#"%%start
@@ -10302,6 +10364,8 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
             let unchanged = constant.replace("entry >= 0", guard);
             assert!(run(&unchanged).unwrap().symbolic_diagnostic.is_none());
         }
+        let transitive_write = text.replace("{ input }", "{ input = 0; input }");
+        assert!(matches!(run(&transitive_write), Err(ProjectCheck::Unsupported)));
     }
 
     #[cfg(feature = "internal-checker")]
