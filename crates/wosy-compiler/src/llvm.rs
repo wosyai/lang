@@ -117,6 +117,55 @@ impl<'ctx, 'module> ProjectNames<'ctx, 'module> {
     }
 }
 
+type StorageBinding<'ctx> = (PointerValue<'ctx>, ScalarType);
+
+#[derive(Default)]
+struct StorageBindings<'ctx> {
+    entries: BTreeMap<String, StorageBinding<'ctx>>,
+    undo: Vec<(String, Option<StorageBinding<'ctx>>)>,
+    scoped: bool,
+}
+
+struct StorageScope {
+    undo_start: usize,
+    previously_scoped: bool,
+}
+
+impl<'ctx> StorageBindings<'ctx> {
+    fn get(&self, name: &str) -> Option<&StorageBinding<'ctx>> {
+        self.entries.get(name)
+    }
+
+    fn insert(&mut self, name: String, binding: StorageBinding<'ctx>) {
+        if self.scoped {
+            let undo_name = name.clone();
+            let previous = self.entries.insert(name, binding);
+            self.undo.push((undo_name, previous));
+        } else {
+            self.entries.insert(name, binding);
+        }
+    }
+
+    fn enter_scope(&mut self) -> StorageScope {
+        StorageScope {
+            undo_start: self.undo.len(),
+            previously_scoped: std::mem::replace(&mut self.scoped, true),
+        }
+    }
+
+    fn leave_scope(&mut self, scope: StorageScope) {
+        while self.undo.len() > scope.undo_start {
+            let (name, previous) = self.undo.pop().expect("pending storage change");
+            if let Some(binding) = previous {
+                self.entries.insert(name, binding);
+            } else {
+                self.entries.remove(&name);
+            }
+        }
+        self.scoped = scope.previously_scoped;
+    }
+}
+
 struct EmitState<'ctx, 'module> {
     prepared_render: bool,
     aggregate: Option<aggregate_transfer::AggregateEmitter<'ctx, 'module>>,
@@ -132,7 +181,7 @@ struct EmitState<'ctx, 'module> {
     runtime_array_results: &'ctx BTreeMap<String, RuntimeArrayResultProvenance>,
     dynamic_owner_outputs: &'ctx BTreeMap<String, BTreeSet<usize>>,
     values: BTreeMap<String, EmitValue<'ctx>>,
-    storage: BTreeMap<String, (PointerValue<'ctx>, ScalarType)>,
+    storage: StorageBindings<'ctx>,
     return_bindings: BTreeMap<String, ScalarExpression>,
     fresh_return_outputs: BTreeSet<usize>,
     branch_return_outputs: ownership::ReturnBranches,
@@ -2198,7 +2247,7 @@ fn emit_function<'ctx, 'module>(
         runtime_array_results,
         dynamic_owner_outputs,
         values: BTreeMap::new(),
-        storage: BTreeMap::new(),
+        storage: StorageBindings::default(),
         return_bindings: return_bindings(&function.body),
         fresh_return_outputs,
         branch_return_outputs,
@@ -2375,7 +2424,7 @@ fn emit_main<'ctx, 'module>(
         runtime_array_results,
         dynamic_owner_outputs,
         values: BTreeMap::new(),
-        storage: BTreeMap::new(),
+        storage: StorageBindings::default(),
         return_bindings: BTreeMap::new(),
         fresh_return_outputs: BTreeSet::new(),
         branch_return_outputs: BTreeMap::new(),
@@ -2514,7 +2563,7 @@ fn emit_project_function<'ctx, 'module>(
         runtime_array_results,
         dynamic_owner_outputs,
         values: BTreeMap::new(),
-        storage: BTreeMap::new(),
+        storage: StorageBindings::default(),
         return_bindings: return_bindings(&function.body),
         fresh_return_outputs,
         branch_return_outputs,
@@ -2717,7 +2766,7 @@ fn emit_project_main<'ctx, 'module>(
         runtime_array_results,
         dynamic_owner_outputs,
         values: BTreeMap::new(),
-        storage: BTreeMap::new(),
+        storage: StorageBindings::default(),
         return_bindings: BTreeMap::new(),
         fresh_return_outputs: BTreeSet::new(),
         branch_return_outputs: BTreeMap::new(),
@@ -2919,8 +2968,8 @@ fn initialize_project_module<'ctx, 'module>(
     state.unit_values = current_unit_values;
     state.values = values;
     let mut retained_storage = storage;
-    retained_storage.extend(
-        std::mem::take(&mut state.storage)
+    retained_storage.entries.extend(
+        std::mem::take(&mut state.storage.entries)
             .into_iter()
             .map(|(name, storage)| (project_runtime_array_name(&module.source, &name), storage)),
     );
@@ -3063,7 +3112,7 @@ fn emit_block_at<'ctx, 'module>(
     block: &ScalarBlock,
     emission: BlockEmission<'_>,
 ) -> Result<EmitValue<'ctx>, String> {
-    let storage = state.storage.clone();
+    let storage_scope = state.storage.enter_scope();
     let values = state.values.clone();
     let runtime_array_owners = state.runtime_array_owners.clone();
     let runtime_array_allocations = state.runtime_array_allocations.clone();
@@ -3094,7 +3143,7 @@ fn emit_block_at<'ctx, 'module>(
         aggregate_transfer::release_failure_allocation(context, state, block)?;
         aggregate_transfer::publish_checked_backing_arm(state, block)?;
     }
-    state.storage = storage;
+    state.storage.leave_scope(storage_scope);
     state.values = values;
     state.runtime_array_owners = runtime_array_owners
         .into_iter()
@@ -3136,7 +3185,7 @@ fn emit_project_block_at<'ctx, 'module>(
     modules: &[&ScalarModule],
     emission: BlockEmission<'_>,
 ) -> Result<EmitValue<'ctx>, String> {
-    let storage = state.storage.clone();
+    let storage_scope = state.storage.enter_scope();
     let values = state.values.clone();
     let runtime_array_owners = state.runtime_array_owners.clone();
     let runtime_array_allocations = state.runtime_array_allocations.clone();
@@ -3178,7 +3227,7 @@ fn emit_project_block_at<'ctx, 'module>(
         aggregate_transfer::release_failure_allocation(context, state, block)?;
         aggregate_transfer::publish_checked_backing_arm(state, block)?;
     }
-    state.storage = storage;
+    state.storage.leave_scope(storage_scope);
     state.values = values;
     state.runtime_array_owners = runtime_array_owners
         .into_iter()

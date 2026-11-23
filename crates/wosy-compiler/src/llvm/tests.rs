@@ -43,6 +43,49 @@ fn prepare_initializer_test(
 }
 
 #[test]
+fn storage_scope_undo_restores_shadowed_bindings_and_removes_locals() {
+    let context = Context::create();
+    let module = context.create_module("storage_scope");
+    let pointer = |name| module.add_global(context.i32_type(), None, name).as_pointer_value();
+    let outer = pointer("outer");
+    let shadow = pointer("shadow");
+    let inner = pointer("inner");
+    let temporary = pointer("temporary");
+    let mut storage = super::StorageBindings::default();
+    storage.insert("value".into(), (outer, ScalarType::I32));
+
+    let read_only_scope = storage.enter_scope();
+    assert_eq!(storage.get("value"), Some(&(outer, ScalarType::I32)));
+    storage.leave_scope(read_only_scope);
+    assert_eq!(storage.undo.capacity(), 0);
+
+    let then_scope = storage.enter_scope();
+    storage.insert("value".into(), (shadow, ScalarType::I32));
+    storage.insert("local".into(), (temporary, ScalarType::U32));
+    let inner_scope = storage.enter_scope();
+    storage.insert("value".into(), (inner, ScalarType::U32));
+    storage.insert("value".into(), (temporary, ScalarType::U32));
+    storage.insert("inner".into(), (inner, ScalarType::U32));
+    storage.leave_scope(inner_scope);
+    assert_eq!(storage.get("value"), Some(&(shadow, ScalarType::I32)));
+    assert_eq!(storage.get("local"), Some(&(temporary, ScalarType::U32)));
+    assert!(storage.get("inner").is_none());
+    storage.leave_scope(then_scope);
+
+    let else_scope = storage.enter_scope();
+    assert_eq!(storage.get("value"), Some(&(outer, ScalarType::I32)));
+    assert!(storage.get("local").is_none());
+    storage.insert("other".into(), (inner, ScalarType::I32));
+    storage.leave_scope(else_scope);
+    assert!(storage.get("other").is_none());
+    assert_eq!(storage.get("value"), Some(&(outer, ScalarType::I32)));
+    assert!(storage.undo.is_empty());
+    storage.insert("value".into(), (inner, ScalarType::U32));
+    assert!(storage.undo.is_empty());
+    assert_eq!(storage.get("value"), Some(&(inner, ScalarType::U32)));
+}
+
+#[test]
 fn consuming_llvm_text_preserves_exact_header_formatting() {
     for (raw, expected) in [
         ("source_filename = \"x\"\n", "source_filename = \"x\"\n"),

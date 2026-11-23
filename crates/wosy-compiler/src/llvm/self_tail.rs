@@ -342,7 +342,7 @@ impl<'ctx> ReturnSpine<'ctx, '_> {
                 for ((name, ty), argument) in
                     self.parameter_names.iter().zip(self.parameters).zip(staged)
                 {
-                    let slot = state.storage[name].0;
+                    let slot = state.storage.get(name).expect("self-tail parameter storage").0;
                     store_value(self.context, state, slot, ty, EmitValue::Basic(argument))?;
                 }
                 state
