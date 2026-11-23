@@ -9873,3 +9873,107 @@ if (observed() != 30242) { core.system_panic(); };
         }
     }
 }
+
+#[test]
+fn guarded_fallible_struct_reads_named_fields_once_before_allocation() {
+    let source = SourceIdentity::new("project".into(), "package".into(), "src/main.w".into(), "r1".into());
+    let text = r#"%%start
+struct Record { u8 tag; i32 amount; }
+i32(u8,i32) observed = fn(input_tag,input_wide) {
+	Record held =? { .amount = input_wide; .tag = input_tag; };
+	if (&held == null) { 7 } else { core.int_extend<i32>(held.tag) + held.amount }
+};
+if (observed(241,30001) != 30242) { core.system_panic(); };
+%%end"#;
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let parsed = parse_source(source.clone(), text.into(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let single = crate::derive_scalar_program_with_layout(&parsed.result, layout);
+        assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+        let project = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::from_program(single.program.clone(), Vec::new())],
+            vec![source.clone()],
+        ));
+        assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+        for (project_route, ir) in [
+            (false, emit_scalar_llvm(&single).unwrap().to_text()),
+            (true, emit_scalar_project_llvm(&project).unwrap().to_text()),
+        ] {
+            let symbol = self_tail_test_symbol(&source, project_route, "observed");
+            let body = self_tail_test_body(&ir, "i32", &symbol);
+            let (before, after) = body
+                .split_once("call ptr @__wosy_core_alloc(i64 8, i64 4)")
+                .expect("exact allocation layout");
+            assert!(!after.contains("call ptr @__wosy_core_alloc("), "{body}");
+            let load_for = |ty: &str, name: &str| {
+                let spill = format!("store {ty} %{name}, ptr ");
+                let slot = body.lines().find_map(|line| {
+                    line.trim_start().strip_prefix(spill.as_str())
+                        .and_then(|operands| operands.split(',').next())
+                }).expect("parameter spill");
+                let instruction = format!(" = load {ty}, ptr {slot},");
+                assert_eq!(body.matches(&instruction).count(), 1, "{body}");
+                let load = before.find(&instruction).expect("load before allocator call");
+                let value = before[..load].lines().last().unwrap().trim_start();
+                (load, value)
+            };
+            let (wide_at, wide) = load_for("i32", "input_wide");
+            let (tag_at, tag) = load_for("i8", "input_tag");
+            assert!(wide_at < tag_at, "{body}");
+            let (_, initialize) = after.split_once("\nfallible.initialize:").expect("present block");
+            let (initialize, _) = initialize.split_once("\nfallible.continue:").expect("join block");
+            assert!(initialize.contains(&format!("store i8 {tag}"))
+                && initialize.contains(&format!("store i32 {wide}")), "{body}");
+            assert_eq!(body.matches("call void @__wosy_core_free(ptr %allocation)").count(), 1, "{body}");
+            assert!(!body.contains("struct_literal") && !body.contains("memmove") && !body.contains("memcpy"), "{body}");
+            if let Some(output_dir) = std::env::var_os("WOSY_FALLIBLE_TEST_IR_DIR") {
+                let target = if layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
+                let path = format!("{target}-{}-named-struct.ll", if project_route { "project" } else { "standalone" });
+                std::fs::write(std::path::PathBuf::from(output_dir).join(path), &ir).unwrap();
+            }
+        }
+        let local = text.replace(
+            "Record held =?",
+            "i32 local_amount = input_wide; Record held =?",
+        ).replace(".amount = input_wide;", ".amount = local_amount;");
+        let parsed = parse_source(source.clone(), local, &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let result = crate::derive_scalar_program_with_layout(&parsed.result, layout);
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let project = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::from_program(result.program, Vec::new())],
+            vec![source.clone()],
+        ));
+        assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+        let global = text.replace("i32(u8,i32)", "i32 module_amount = 30001;\ni32(u8,i32)")
+            .replace(".amount = input_wide;", ".amount = module_amount;")
+            .replace("{ 7 } else", "{ input_wide } else");
+        let position = global.find(".amount = module_amount").unwrap() + ".amount = ".len();
+        let span = wosy_syntax::ByteSpan::new(position as u32, (position + "module_amount".len()) as u32);
+        let parsed = parse_source(source.clone(), global, &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let result = crate::derive_scalar_program_with_layout(&parsed.result, layout);
+        let project = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::from_program(result.program, Vec::new())],
+            vec![source.clone()],
+        ));
+        for diagnostics in [&result.diagnostics, &project.diagnostics] {
+            assert!(diagnostics.iter().any(|item| {
+                item.code == "B0003"
+                    && item.message == "fallible struct initializer requires an integer literal or a lexical integer binding"
+                    && item.labels.iter().any(|label| label.span.range == span)
+            }), "{diagnostics:?}");
+        }
+        for (replacement, message) in [
+            ("input_wide + 1", "fallible allocation requires a local integer"),
+            ("input_tag", "expression type does not match expected type"),
+        ] {
+            let rejected = text.replace(".amount = input_wide;", &format!(".amount = {replacement};"))
+                .replace("{ 7 } else", "{ input_wide } else");
+            let parsed = parse_source(source.clone(), rejected, &[]);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let rejected = crate::derive_scalar_program_with_layout(&parsed.result, layout);
+            assert!(rejected.diagnostics.iter().any(|item| item.message.contains(message)), "{:?}", rejected.diagnostics);
+        }
+    }
+}

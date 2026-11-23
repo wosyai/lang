@@ -1096,7 +1096,8 @@ pub(super) fn bind_guarded_scalar<'ctx>(
         return Err("invalid guarded scalar allocation binding".into());
     }
     let aggregate = match (&receiver.ty, &binding.value, value) {
-        (ScalarType::Struct(id), ScalarExpression::StructLiteral { fields, .. }, None) => Some((id, fields)),
+        (ScalarType::Struct(id), ScalarExpression::StructLiteral { fields, .. }, None) =>
+            Some(memory::prepare_struct_literal(context, state, id, fields)?),
         (ty, _, Some(BasicValueEnum::IntValue(value)))
             if memory::integer_width(ty) == Some(value.get_type().get_bit_width()) => None,
         _ => return Err("invalid guarded allocation initializer".into()),
@@ -1114,8 +1115,8 @@ pub(super) fn bind_guarded_scalar<'ctx>(
     let present = state.builder.build_is_not_null(backing, "fallible.present").map_err(builder_error)?;
     state.builder.build_conditional_branch(present, initialized, continuation).map_err(builder_error)?;
     state.builder.position_at_end(initialized);
-    if let Some((id, fields)) = aggregate {
-        memory::emit_struct_literal_into(context, state, id, fields, backing)?;
+    if let Some(values) = aggregate {
+        memory::write_struct_literal(context, state, values, backing)?;
     } else {
         state.builder.build_store(backing, value.expect("checked integer initializer")).map_err(builder_error)?;
     }

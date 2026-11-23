@@ -639,17 +639,22 @@ pub(super) fn emit_struct_literal<'ctx, 'module>(
     );
     let destination = entry_alloca(state, storage.into(), "struct_literal")?;
     align_storage_alloca(destination, Some(layout.alignment))?;
-    emit_struct_literal_into(context, state, id, fields, destination)?;
+    let values = prepare_struct_literal(context, state, id, fields)?;
+    write_struct_literal(context, state, values, destination)?;
     Ok(EmitValue::Basic(destination.into()))
 }
 
-pub(super) fn emit_struct_literal_into<'ctx, 'module>(
+pub(super) struct PreparedStructLiteral<'ctx, 'module> {
+    structure: &'module ScalarStruct,
+    values: BTreeMap<&'module str, (&'module ScalarType, Option<EmitValue<'ctx>>)>,
+}
+
+pub(super) fn prepare_struct_literal<'ctx, 'module>(
     context: &'ctx Context,
     state: &mut EmitState<'ctx, 'module>,
     id: &crate::ScalarStructId,
     fields: &[crate::ScalarStructLiteralField],
-    destination: PointerValue<'ctx>,
-) -> Result<(), String> {
+) -> Result<PreparedStructLiteral<'ctx, 'module>, String> {
     let structure = structure(state.structs, id.clone())?;
     let mut values = BTreeMap::new();
     for field in &structure.fields {
@@ -661,6 +666,16 @@ pub(super) fn emit_struct_literal_into<'ctx, 'module>(
             .expect("validated struct field");
         *value = Some(emit_typed_expression(context, state, &field.value, ty)?);
     }
+    Ok(PreparedStructLiteral { structure, values })
+}
+
+pub(super) fn write_struct_literal<'ctx, 'module>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, 'module>,
+    prepared: PreparedStructLiteral<'ctx, 'module>,
+    destination: PointerValue<'ctx>,
+) -> Result<(), String> {
+    let PreparedStructLiteral { structure, mut values } = prepared;
     for field in &structure.fields {
         let value = values
             .get_mut(field.name.as_str())

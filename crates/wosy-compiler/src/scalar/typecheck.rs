@@ -1172,7 +1172,7 @@ pub(super) fn block_item_type_in_module(
 ) -> ScalarType {
     match item {
         ScalarBlockItem::LocalBinding(binding) => {
-            if let Some(operator) = pending_fallible_operator(binding, module.structs) {
+            if let Some(operator) = pending_fallible_operator(binding, module.structs, scope) {
                 diagnostics.push(fallible_assignment_diagnostic(module.source, operator));
                 scope.insert(binding.name.clone(), ScalarType::Error);
                 return ScalarType::Unit;
@@ -6411,7 +6411,11 @@ pub(super) fn module_diagnostic(
     source_diagnostic(&module.source, code, message, span)
 }
 
-fn pending_fallible_operator(binding: &ScalarBinding, structs: &[ScalarStruct]) -> Option<ByteSpan> {
+fn pending_fallible_operator(
+    binding: &ScalarBinding,
+    structs: &[ScalarStruct],
+    scope: &BTreeMap<String, ScalarType>,
+) -> Option<ByteSpan> {
     let operator = binding.fallible_assignment?;
     let [receiver] = binding.receivers.as_slice() else { return Some(operator) };
     match (&receiver.ty, &binding.value) {
@@ -6419,7 +6423,11 @@ fn pending_fallible_operator(binding: &ScalarBinding, structs: &[ScalarStruct]) 
             if is_integer_type(ty) => None,
         (ScalarType::Struct(id), ScalarExpression::StructLiteral { fields, .. })
             if !fields.is_empty()
-                && fields.iter().all(|field| matches!(&field.value, ScalarExpression::Integer { .. }))
+                && fields.iter().all(|field| match &field.value {
+                    ScalarExpression::Integer { .. } => true,
+                    ScalarExpression::Name { name, .. } => scope.get(name).is_some_and(is_integer_type),
+                    _ => false,
+                })
                 && structs.iter().any(|structure| &structure.id == id
                     && !structure.fields.is_empty()
                     && structure.fields.iter().all(|field| is_integer_type(&field.ty))) => None,
@@ -6431,7 +6439,7 @@ fn fallible_assignment_diagnostic(source: &SourceIdentity, span: ByteSpan) -> su
     source_diagnostic(
         source,
         "B0003",
-        "fallible allocation requires a local integer initialized by a literal or a same-type integer binding, or a local integer-field struct initialized by integer literals",
+        "fallible allocation requires a local integer initialized by a literal or a same-type integer binding, or a local integer-field struct initialized by integer literals or same-type lexical integer bindings",
         span,
     )
 }
@@ -7560,7 +7568,7 @@ fn block_item_type(
 ) -> ScalarType {
     match item {
         ScalarBlockItem::LocalBinding(binding) => {
-            if let Some(operator) = pending_fallible_operator(binding, program.structs) {
+            if let Some(operator) = pending_fallible_operator(binding, program.structs, scope) {
                 diagnostics.push(fallible_assignment_diagnostic(program.source, operator));
                 scope.insert(binding.name.clone(), ScalarType::Error);
                 return ScalarType::Unit;

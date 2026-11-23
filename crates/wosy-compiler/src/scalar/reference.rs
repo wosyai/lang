@@ -355,6 +355,13 @@ impl GuardedScalarAllocation {
     pub(crate) fn present_on_then(&self) -> bool { self.present_on_then }
 }
 
+#[derive(Clone, Copy)]
+enum ExpressionReadMode {
+    Ordinary,
+    ProjectedOrigins,
+    GuardedStructInitializer,
+}
+
 pub(super) struct ReferenceFlowBuilder<'a> {
     capture_call_points: bool,
     root_return_points: std::ops::Range<usize>,
@@ -1527,18 +1534,18 @@ impl<'a> ReferenceFlowBuilder<'a> {
         scope: ReferenceScopeId,
         ordinal: OccurrenceOrdinal,
     ) -> Result<ReferenceValue, ReferenceAnalysisError> {
-        self.expression_with_projected_origins(expression, scope, ordinal, false)
+        self.expression_with_read_mode(expression, scope, ordinal, ExpressionReadMode::Ordinary)
     }
 
-    fn expression_with_projected_origins(
+    fn expression_with_read_mode(
         &mut self,
         expression: &ScalarExpression,
         scope: ReferenceScopeId,
         ordinal: OccurrenceOrdinal,
-        projected_origins: bool,
+        read_mode: ExpressionReadMode,
     ) -> Result<ReferenceValue, ReferenceAnalysisError> {
         let before = self.cursor;
-        let value = self.evaluate_expression(expression, scope, ordinal, projected_origins)?;
+        let value = self.evaluate_expression(expression, scope, ordinal, read_mode)?;
         if self.capture_call_points && self.cursor != before {
             if let Some(point) = self.cursor {
                 self.proof_points.evaluations.insert(ordinal, point);
@@ -1649,7 +1656,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
         expression: &ScalarExpression,
         scope: ReferenceScopeId,
         ordinal: OccurrenceOrdinal,
-        projected_origins: bool,
+        read_mode: ExpressionReadMode,
     ) -> Result<ReferenceValue, ReferenceAnalysisError> {
         let span = expression_span(expression);
         let parent = OccurrenceParent::Expression(ordinal);
@@ -1677,7 +1684,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     span,
                     scope,
                     region,
-                    projected_origins,
+                    matches!(read_mode, ExpressionReadMode::ProjectedOrigins),
                     matches!(calls.structure.checked_types.expressions.get(&ordinal),
                         Some(ScalarType::CheckedReference { .. })),
                     scope == ReferenceScopeId(0) && self.aggregate_facts.array_formal.is_some()
@@ -2170,6 +2177,17 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         self.expression_ordinal(parent, OccurrenceEdge::AggregateField(position));
                     let before = self.cursor;
                     self.expression(&field.value, scope, ordinal)?;
+                    if matches!(read_mode, ExpressionReadMode::GuardedStructInitializer)
+                        && matches!(&field.value, ScalarExpression::Name { .. })
+                        && !self.cursor.is_some_and(|point| {
+                            Some(point) != before && matches!(self.cfg.points[point.0].kind, CfgPointKind::Read { .. })
+                        })
+                    {
+                        return Err(self.missing_context(
+                            expression_span(&field.value),
+                            ReferenceAnalysisErrorReason::NonLexicalFallibleStructInitializer,
+                        ));
+                    }
                     let member = calls.structure.literal_fields.get(&ordinal);
                     let member_type = calls.structure.checked_types.expressions.get(&ordinal);
                     if carrier {
@@ -4008,6 +4026,15 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             BTreeSet::new(),
                         );
                         ReferenceValue::Other
+                    } else if binding.fallible_assignment.is_some()
+                        && matches!(receiver.ty, ScalarType::Struct(_))
+                    {
+                        self.expression_with_read_mode(
+                            primary,
+                            scope,
+                            primary_ordinal,
+                            ExpressionReadMode::GuardedStructInitializer,
+                        )?
                     } else {
                         self.expression(primary, scope, primary_ordinal)?
                     };
@@ -4181,12 +4208,12 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         }
                         _ => unreachable!("expression item region"),
                     };
-                    let value = self.expression_with_projected_origins(
-                        expression,
-                        scope,
-                        ordinal,
-                        projected_origins && matches!(kind, BlockItemKind::FinalOutput(_)),
-                    )?;
+                    let mode = if projected_origins && matches!(kind, BlockItemKind::FinalOutput(_)) {
+                        ExpressionReadMode::ProjectedOrigins
+                    } else {
+                        ExpressionReadMode::Ordinary
+                    };
+                    let value = self.expression_with_read_mode(expression, scope, ordinal, mode)?;
                     let value_point = self.cursor.expect("evaluated output expression");
                     self.move_value(expression, scope, ordinal)?;
                     if let BlockItemKind::FinalOutput(slot) = kind {
