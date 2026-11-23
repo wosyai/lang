@@ -389,12 +389,12 @@ fn release_literal_array_base<'ctx>(
         super::ownership::RuntimeArrayRelease { pointer: base.into(), live: None })
 }
 
-pub(super) fn finish_guarded_receipt_unit<'ctx>(
+pub(super) fn finish_guarded_receipt<'ctx>(
     context: &'ctx Context,
     state: &mut EmitState<'ctx, '_>,
     expression: &ScalarExpression,
-    bypass: inkwell::basic_block::BasicBlock<'ctx>,
     then_end: inkwell::basic_block::BasicBlock<'ctx>,
+    else_end: inkwell::basic_block::BasicBlock<'ctx>,
 ) -> Result<(), String> {
     let Some(aggregate) = &mut state.aggregate else { return Ok(()) };
     if aggregate.plan.guarded_call_releases.is_empty() {
@@ -402,14 +402,23 @@ pub(super) fn finish_guarded_receipt_unit<'ctx>(
     }
     let expression = state.body_call_nodes.and_then(|nodes| nodes.expression_ordinal(expression))
         .ok_or_else(|| "missing conditional aggregate receipt occurrence".to_owned())?;
-    let Some(&receipt) = aggregate.plan.guarded_call_releases.get(&expression) else { return Ok(()) };
-    let phi = state.builder.build_phi(context.bool_type(), "aggregate_receipt_active")
-        .map_err(builder_error)?;
+    let Some(arms) = aggregate.plan.guarded_call_releases.get(&expression) else { return Ok(()) };
     let retained = context.bool_type().const_int(1, false);
     let transferred = context.bool_type().const_zero();
-    phi.add_incoming(&[(&retained, bypass), (&transferred, then_end)]);
-    if aggregate.guarded_receipt_live.insert(receipt, phi.as_basic_value().into_int_value()).is_some() {
-        return Err("duplicate guarded aggregate receipt".into());
+    for (receipts, (moved, keep)) in arms.iter().zip([(then_end, else_end), (else_end, then_end)]) {
+        if receipts.is_empty() {
+            continue;
+        }
+        // Receipts consumed by the same arm share one SSA predicate.
+        let phi = state.builder.build_phi(context.bool_type(), "aggregate_receipt_active")
+            .map_err(builder_error)?;
+        phi.add_incoming(&[(&retained, keep), (&transferred, moved)]);
+        let active = phi.as_basic_value().into_int_value();
+        for &receipt in receipts {
+            if aggregate.guarded_receipt_live.insert(receipt, active).is_some() {
+                return Err("duplicate guarded aggregate receipt".into());
+            }
+        }
     }
     Ok(())
 }
@@ -1233,12 +1242,15 @@ pub(super) fn release_scope<'ctx>(
         .module
         .get_function(CORE_FREE_SYMBOL)
         .ok_or_else(|| "missing closed aggregate release".to_owned())?;
-    for ordinal in releases.into_iter().flatten().rev() {
+    for planned in releases.into_iter().flatten().rev() {
+        let ordinal = &planned.receipt;
         let base = aggregate
             .receipts
             .remove(ordinal)
             .ok_or_else(|| "missing closed aggregate scope receipt".to_owned())?;
-        if let Some(live) = aggregate.guarded_receipt_live.remove(ordinal) {
+        if planned.guarded {
+            let live = aggregate.guarded_receipt_live.remove(ordinal)
+                .ok_or_else(|| "missing guarded aggregate receipt at scope cleanup".to_owned())?;
             let function = state.builder.get_insert_block().and_then(|block| block.get_parent())
                 .ok_or_else(|| "missing guarded aggregate release block".to_owned())?;
             let release = context.append_basic_block(function, "aggregate.receipt.release");
@@ -1249,9 +1261,6 @@ pub(super) fn release_scope<'ctx>(
             state.builder.build_unconditional_branch(next).map_err(builder_error)?;
             state.builder.position_at_end(next);
         } else {
-            if aggregate.plan.guarded_call_inputs.values().any(|guarded| guarded == ordinal) {
-                return Err("missing guarded aggregate receipt at scope cleanup".into());
-            }
             state.builder.build_call(free, &[base.into()], "aggregate_release").map_err(builder_error)?;
         }
     }

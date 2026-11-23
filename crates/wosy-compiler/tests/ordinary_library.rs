@@ -394,6 +394,86 @@ fn conditional_aggregate_input_transfer_leaves_the_other_arm_owning() {
 }
 
 #[test]
+fn conditional_aggregate_value_shares_arm_predicates_and_preserves_receipt_identity() {
+    let app = source("workbench", "src/conditional_aggregate_value.w");
+    let text = include_str!("fixtures/conditional-aggregate-value.w");
+    for (target, target_layout) in [
+        ("native64", ScalarTargetLayout::NATIVE64),
+        ("wasm32", ScalarTargetLayout::WASM32),
+    ] {
+        let emit = |text: &str| {
+            let prepared = prepare_scalar_project(
+                vec![(declarations(&app, text), Vec::new())], vec![app.clone()],
+                ScalarPreparationInputs { target_layout },
+            ).unwrap_or_else(|error| panic!("{target}: {:?}", error.diagnostics));
+            let build = analyze_scalar_build(&prepared);
+            assert!(build.diagnostics().is_empty(), "{target}: {:?}", build.diagnostics());
+            emit_scalar_build_project_llvm(&build).map(|module| module.to_text())
+        };
+        let ir = emit(text).unwrap();
+        let context = Context::create();
+        let buffer = MemoryBuffer::create_from_memory_range_copy(ir.as_bytes(), target);
+        let module = context.create_module_from_ir(buffer).unwrap();
+        module.verify().unwrap();
+        let drive = module.get_function(&function_with_suffix(&module, "drive")).unwrap();
+        let mut guarded = 0;
+        let mut branches = 0;
+        for block in drive.get_basic_blocks() {
+            for instruction in block.get_instructions() {
+                let row = instruction.to_string();
+                if instruction.get_opcode() == InstructionOpcode::Phi && row.contains("aggregate_receipt_active") {
+                    guarded += 1;
+                    assert!(block.get_name().to_str().unwrap().starts_with("if.merge"));
+                }
+                if instruction.get_opcode() == InstructionOpcode::Br && row.contains("aggregate_receipt_active") {
+                    branches += 1;
+                }
+                assert!(!row.contains("aggregate_receipt_live"));
+            }
+        }
+        assert_eq!((guarded, branches), (2, 3), "{target}: {ir}");
+        if let Some(out) = std::env::var_os("WOSY_VALUE_RECEIPT_IR_DIR") {
+            let mut witness = ir.replace("@main(", "@wosy_authored_main(");
+            for (wrapper, source) in [("retain", "retain_witness"), ("transfer", "transfer_witness")] {
+                let symbol = function_with_suffix(&module, source);
+                witness.push_str(&format!(
+                    "\ndefine i64 @wosy_conditional_{wrapper}() {{\nentry:\n  %result = call i64 @{symbol}()\n  ret i64 %result\n}}\n"
+                ));
+            }
+            std::fs::write(std::path::PathBuf::from(out).join(format!("{target}.ll")), witness).unwrap();
+        }
+        // Exercise both contextual numeric emission and the canonical ordered tail,
+        // which use different output paths than a plain scalar expression.
+        let contextual = text.replace("    if (take)", "    u64 result = if (take)")
+            .replace("    }\n};\nu64() retain_witness", "    };\n    result\n};\nu64() retain_witness");
+        let ordered = text.replace("u64(u64, bool) drive", "(u64, bool)(u64, bool) drive")
+            .replace("left + right\n", "left + right, true\n")
+            .replace("        accept_packet(third)\n", "        accept_packet(third), false\n")
+            .replace("fn { drive(2, false) }", "fn { u64 value, bool marker = drive(2, false); value }")
+            .replace("fn { drive(2, true) }", "fn { u64 value, bool marker = drive(2, true); value }");
+        for variant in [contextual, ordered] {
+            let ir = emit(&variant).unwrap_or_else(|error| panic!("{target}: {error}\n{variant}"));
+            let buffer = MemoryBuffer::create_from_memory_range_copy(ir.as_bytes(), target);
+            context.create_module_from_ir(buffer).unwrap().verify().unwrap();
+            assert_eq!(ir.lines().filter(|row| row.contains("aggregate_receipt_active")
+                && row.contains(" = phi i1 ")).count(), 2, "{target}: {ir}");
+        }
+        // A second fork inside either arm is not an exact two-predecessor receipt.
+        // Keep the observable result scalar so an unrelated output error cannot satisfy the oracle.
+        for (needle, replacement) in [
+            ("u64 left = accept_packet(first);",
+             "u64 left = if (take) { accept_packet(first) } else { length };"),
+            ("accept_packet(third)", "if (take) { length } else { accept_packet(third) }"),
+        ] {
+            let bad = text.replace(needle, replacement);
+            let error = emit(&bad).expect_err("nested conditional transfer must fail closed");
+            assert!(format!("{error:?}").contains("aggregate input transfer does not cover every owning path"),
+                "{target}: {error:?}");
+        }
+    }
+}
+
+#[test]
 fn runtime_array_recommit_keeps_the_owner_until_its_real_end() {
     let recursive = r#"
 (u8[], u64)(u8[], u64, u64) carry = fn(bytes, depth, count) {

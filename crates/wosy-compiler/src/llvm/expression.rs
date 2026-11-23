@@ -2478,7 +2478,7 @@ pub(super) fn emit_contextual_numeric<'ctx, 'module>(
         }
         ScalarExpression::If { condition, then_branch, else_branch, .. } => {
             let condition = take_basic(path.emit(context, state, condition)?)?.into_int_value();
-            emit_if_value(context, state, condition, then_branch, else_branch, |state, block| {
+            emit_if_value(context, state, condition, then_branch, else_branch, expression, |state, block| {
                 path.emit_block(context, state, block, BlockEmission::ContextualNumeric(expected))
             })
         }
@@ -2863,7 +2863,8 @@ fn emit_if<'ctx, 'module>(
         condition,
         then_branch,
         else_branch,
-        Some(expression),
+        expression,
+        true,
         |state, block| emit_block(context, state, block),
     )
 }
@@ -2884,7 +2885,8 @@ fn emit_project_if<'ctx, 'module>(
         condition,
         then_branch,
         else_branch,
-        Some(expression),
+        expression,
+        true,
         |state, block| emit_project_block(context, state, block, module, modules),
     )
 }
@@ -2920,7 +2922,7 @@ fn emit_unit_if<'ctx, 'module>(
         .build_unconditional_branch(merge)
         .map_err(builder_error)?;
     state.builder.position_at_end(merge);
-    aggregate_transfer::finish_guarded_receipt_unit(context, state, expression, bypass, then_end)?;
+    aggregate_transfer::finish_guarded_receipt(context, state, expression, then_end, bypass)?;
     aggregate_transfer::finish_literal_array_unit(state, enrolled)?;
     Ok(EmitValue::Unit)
 }
@@ -2958,7 +2960,7 @@ fn emit_project_unit_if<'ctx, 'module>(
         .build_unconditional_branch(merge)
         .map_err(builder_error)?;
     state.builder.position_at_end(merge);
-    aggregate_transfer::finish_guarded_receipt_unit(context, state, expression, bypass, then_end)?;
+    aggregate_transfer::finish_guarded_receipt(context, state, expression, then_end, bypass)?;
     aggregate_transfer::finish_literal_array_unit(state, enrolled)?;
     Ok(EmitValue::Unit)
 }
@@ -2969,12 +2971,13 @@ pub(super) fn emit_if_value<'ctx, 'module, F>(
     condition: inkwell::values::IntValue<'ctx>,
     then_branch: &ScalarBlock,
     else_branch: &ScalarBlock,
+    expression: &ScalarExpression,
     emit: F,
 ) -> Result<EmitValue<'ctx>, String>
 where
     F: Fn(&mut EmitState<'ctx, 'module>, &ScalarBlock) -> Result<EmitValue<'ctx>, String>,
 {
-    emit_if_value_with_route(context, state, condition, then_branch, else_branch, None, emit)
+    emit_if_value_with_route(context, state, condition, then_branch, else_branch, expression, false, emit)
 }
 
 fn emit_if_value_with_route<'ctx, 'module, F>(
@@ -2983,7 +2986,8 @@ fn emit_if_value_with_route<'ctx, 'module, F>(
     condition: inkwell::values::IntValue<'ctx>,
     then_branch: &ScalarBlock,
     else_branch: &ScalarBlock,
-    expression: Option<&ScalarExpression>,
+    expression: &ScalarExpression,
+    literal_array_route: bool,
     emit: F,
 ) -> Result<EmitValue<'ctx>, String>
 where
@@ -3003,12 +3007,9 @@ where
         .build_conditional_branch(condition, then_block, else_block)
         .map_err(builder_error)?;
     state.builder.position_at_end(then_block);
-    let then_writer = match expression {
-        Some(expression) => aggregate_transfer::begin_literal_array_unit(
-            state, expression, then_branch, Some(else_branch), crate::scalar::ArrayWriterSide::Then,
-        )?,
-        None => false,
-    };
+    let then_writer = literal_array_route && aggregate_transfer::begin_literal_array_unit(
+        state, expression, then_branch, Some(else_branch), crate::scalar::ArrayWriterSide::Then,
+    )?;
     let incoming_owners = state.return_owner_flags.clone();
     state.return_owner_flags = incoming_owners.clone();
     let then_value = emit(state, then_branch)?;
@@ -3019,12 +3020,9 @@ where
         .map_err(builder_error)?;
     let then_end = state.builder.get_insert_block().expect("then block");
     state.builder.position_at_end(else_block);
-    let else_writer = match expression {
-        Some(expression) => aggregate_transfer::begin_literal_array_unit(
-            state, expression, then_branch, Some(else_branch), crate::scalar::ArrayWriterSide::Else,
-        )?,
-        None => false,
-    };
+    let else_writer = literal_array_route && aggregate_transfer::begin_literal_array_unit(
+        state, expression, then_branch, Some(else_branch), crate::scalar::ArrayWriterSide::Else,
+    )?;
     state.return_owner_flags = incoming_owners.clone();
     let else_value = emit(state, else_branch)?;
     let else_owners = state.return_owner_flags.clone();
@@ -3034,6 +3032,7 @@ where
         .map_err(builder_error)?;
     let else_end = state.builder.get_insert_block().expect("else block");
     state.builder.position_at_end(merge);
+    aggregate_transfer::finish_guarded_receipt(context, state, expression, then_end, else_end)?;
     let enrolled = then_writer || else_writer;
     if enrolled && !matches!((&then_value, &else_value), (EmitValue::Unit, EmitValue::Unit)) {
         return Err("checked array conditional did not have two Unit arms".into());

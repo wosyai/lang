@@ -68,41 +68,103 @@ pub(super) struct AggregateFlowFacts {
     pub(super) checked_producer_nonlocal_installs: BTreeSet<CfgPointId>,
 }
 
-pub(super) struct UnitInputRegion {
+#[derive(Clone, Copy)]
+pub(super) struct ConditionalInputRegion {
     pub(super) expression: OccurrenceOrdinal,
     pub(super) branch: CfgPointId,
-    pub(super) then_entry: CfgPointId,
-    pub(super) then_exit: CfgPointId,
+    pub(super) entries: [CfgPointId; 2],
+    pub(super) terminals: [CfgPointId; 2],
     pub(super) join: CfgPointId,
 }
 
-fn linear_path(points: &[ReferenceFlowPoint], from: CfgPointId, to: CfgPointId) -> bool {
-    let mut current = from;
-    while current != to {
-        let [next] = points[current.0].successors.as_slice() else { return false };
-        if *next <= current || *next > to {
-            return false;
-        }
-        current = *next;
-    }
-    true
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ConditionalPath {
+    Outside,
+    Prefix,
+    Arm(usize),
+    Suffix,
 }
 
-impl UnitInputRegion {
-    fn proves(&self, points: &[ReferenceFlowPoint], producer: CfgPointId, consumer: CfgPointId, exit: CfgPointId) -> bool {
-        let entry = &points[0];
-        let root = entry.scope;
-        points[producer.0].scope == root
-            && points[self.branch.0].scope == root
-            && points[self.join.0].scope == root
-            && points[exit.0].scope == root
-            && points[self.branch.0].successors.as_slice() == [self.then_entry, self.join]
-            && points[self.then_exit.0].successors.as_slice() == [self.join]
-            && linear_path(points, entry.id, producer)
-            && linear_path(points, producer, self.branch)
-            && linear_path(points, self.then_entry, consumer)
-            && linear_path(points, consumer, self.then_exit)
-            && linear_path(points, self.join, exit)
+// A single-successor entry prefix can reach at most one fork. Certify that
+// fork at most once per body, then classify each candidate by dense CFG index.
+struct ConditionalInputCertificate {
+    paths: Vec<ConditionalPath>,
+    fork: CfgPointId,
+    arms: Option<[Option<ReferenceScopeId>; 2]>,
+}
+
+fn linear_successor(points: &[ReferenceFlowPoint], from: CfgPointId) -> Option<CfgPointId> {
+    let [next] = points[from.0].successors.as_slice() else { return None };
+    (*next > from).then_some(*next)
+}
+
+impl ConditionalInputCertificate {
+    fn prefix(points: &[ReferenceFlowPoint]) -> Self {
+        let mut paths = vec![ConditionalPath::Outside; points.len()];
+        let mut fork = points[0].id;
+        while let Some(next) = linear_successor(points, fork) {
+            paths[fork.0] = ConditionalPath::Prefix;
+            fork = next;
+        }
+        Self { paths, fork, arms: None }
+    }
+
+    fn certify_arms(
+        &mut self, points: &[ReferenceFlowPoint], region: &ConditionalInputRegion,
+    ) -> Option<[Option<ReferenceScopeId>; 2]> {
+        let root = points[0].scope;
+        if points[region.branch.0].scope != root || points[region.join.0].scope != root
+            || points[region.branch.0].successors.as_slice() != region.entries
+        {
+            return None;
+        }
+        let mut scopes = [None; 2];
+        for (side, (entry, end)) in region.entries.into_iter().zip(region.terminals).enumerate() {
+            if side == 1 && entry == region.join && end == region.branch {
+                continue; // A Unit conditional's implicit else is the direct bypass.
+            }
+            if entry >= region.join || end >= region.join
+                || points[end.0].successors.as_slice() != [region.join]
+            {
+                return None;
+            }
+            let mut point = entry;
+            loop {
+                if point > end || self.paths[point.0] != ConditionalPath::Outside {
+                    return None;
+                }
+                self.paths[point.0] = ConditionalPath::Arm(side);
+                if point == end { break; }
+                point = linear_successor(points, point)?;
+            }
+            let scope = points[entry.0].scope;
+            if scope != root && points[end.0].scope == scope {
+                scopes[side] = Some(scope);
+            }
+        }
+        let mut point = region.join;
+        loop {
+            self.paths[point.0] = ConditionalPath::Suffix;
+            let Some(next) = linear_successor(points, point) else { break };
+            point = next;
+        }
+        Some(scopes)
+    }
+
+    fn consuming_side(
+        &self, points: &[ReferenceFlowPoint], producer: CfgPointId, consumer: CfgPointId, exit: CfgPointId,
+    ) -> Option<usize> {
+        let root = points[0].scope;
+        if points[producer.0].scope != root || points[exit.0].scope != root
+            || self.paths[producer.0] != ConditionalPath::Prefix
+            || self.paths[exit.0] != ConditionalPath::Suffix
+        {
+            return None;
+        }
+        let ConditionalPath::Arm(side) = self.paths[consumer.0] else { return None };
+        let scope = Some(points[consumer.0].scope);
+        let arms = self.arms?;
+        (arms[side] == scope && arms[1 - side] != scope).then_some(side)
     }
 }
 
@@ -122,12 +184,16 @@ fn unit_input_receipt_requires_a_dominating_producer_and_an_exact_then_path() {
         point(3, 1, &[4]), point(4, 1, &[5]), point(5, 1, &[6]),
         point(6, 1, &[7]), point(7, 0, &[8]), point(8, 0, &[]),
     ];
-    let region = UnitInputRegion {
+    let region = ConditionalInputRegion {
         expression: OccurrenceOrdinal(1), branch: CfgPointId(2),
-        then_entry: CfgPointId(3), then_exit: CfgPointId(6), join: CfgPointId(7),
+        entries: [CfgPointId(3), CfgPointId(7)], terminals: [CfgPointId(6), CfgPointId(2)],
+        join: CfgPointId(7),
     };
     let proves = |points: &[ReferenceFlowPoint]| {
-        region.proves(points, CfgPointId(1), CfgPointId(4), CfgPointId(8))
+        let mut certificate = ConditionalInputCertificate::prefix(points);
+        if certificate.fork != region.branch { return false; }
+        certificate.arms = certificate.certify_arms(points, &region);
+        certificate.consuming_side(points, CfgPointId(1), CfgPointId(4), CfgPointId(8)) == Some(0)
     };
     assert!(proves(&points));
     points[0].successors.push(CfgPointId(2));
@@ -664,14 +730,19 @@ type LiveReceipt = (OwnerSource, ReferenceBindingId);
 
 #[derive(Default)]
 struct ScopeEndpoint {
-    possible: BTreeSet<LiveReceipt>,
+    possible: BTreeMap<OwnerSource, Option<ReferenceBindingId>>,
     // None means no path has been observed, not a path with no live receipts.
     always: Option<BTreeSet<LiveReceipt>>,
 }
 
 impl ScopeEndpoint {
     fn observe(&mut self, live: BTreeSet<LiveReceipt>) {
-        self.possible.extend(live.iter().cloned());
+        for (owner, binding) in &live {
+            let witness = self.possible.entry(*owner).or_insert_with(|| Some(binding.clone()));
+            if witness.as_ref().is_some_and(|previous| previous != binding) {
+                *witness = None; // More than one binding has carried this owner at the endpoint.
+            }
+        }
         if let Some(always) = &mut self.always {
             always.retain(|receipt| live.contains(receipt));
         } else {
@@ -680,17 +751,17 @@ impl ScopeEndpoint {
     }
 
     fn receipt(&self, owner: OwnerSource) -> Option<bool> {
-        let mut bindings = self.possible.iter().filter(|(source, _)| *source == owner);
-        let receipt = bindings.next()?;
-        Some(bindings.next().is_none()
-            && self.always.as_ref().is_some_and(|always| always.contains(receipt)))
+        self.possible.get(&owner).map(|witness| self.always_retains(owner, witness.as_ref()))
+    }
+
+    fn always_retains(&self, owner: OwnerSource, witness: Option<&ReferenceBindingId>) -> bool {
+        witness.is_some_and(|binding| self.always.as_ref()
+            .is_some_and(|always| always.contains(&(owner, binding.clone()))))
     }
 
     fn has_conditional_unique_receipt(&self, owner: OwnerSource) -> bool {
-        let mut receipts = self.possible.iter().filter(|(source, _)| *source == owner);
-        let Some(receipt) = receipts.next() else { return false };
-        receipts.next().is_none()
-            && self.always.as_ref().is_some_and(|always| !always.contains(receipt))
+        self.possible.get(&owner).and_then(Option::as_ref)
+            .is_some_and(|binding| self.always.is_some() && !self.always_retains(owner, Some(binding)))
     }
 }
 
@@ -813,7 +884,7 @@ struct MixedBranchReturn {
 
 #[derive(Default)]
 pub(super) struct AggregateFlowResult {
-    pub(super) unit_input_regions: BTreeMap<usize, UnitInputRegion>,
+    pub(super) conditional_input_regions: BTreeMap<usize, ConditionalInputRegion>,
     literal_array_route: Option<LiteralArrayRoute>,
     literal_array_unknown: bool,
     literal_array_join: LiteralArrayJoin,
@@ -2132,6 +2203,12 @@ pub(crate) struct ClosedFreshRecommit {
     pub(crate) forward: bool,
 }
 
+#[derive(Debug)]
+pub(crate) struct ClosedOwnerRelease {
+    pub(crate) receipt: usize,
+    pub(crate) guarded: bool,
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct ClosedBody {
     pub(crate) scalar_descriptor_assignment: Option<(usize, usize, usize)>,
@@ -2145,8 +2222,8 @@ pub(crate) struct ClosedBody {
     pub(crate) ordinary_calls: BTreeMap<usize, SourceSpan>,
     pub(crate) calls: BTreeMap<usize, ClosedCall>,
     pub(crate) scope_exits: BTreeMap<usize, CfgPointId>,
-    pub(crate) releases: BTreeMap<CfgPointId, Vec<usize>>,
-    pub(crate) guarded_call_releases: BTreeMap<usize, usize>,
+    pub(crate) releases: BTreeMap<CfgPointId, Vec<ClosedOwnerRelease>>,
+    pub(crate) guarded_call_releases: BTreeMap<usize, [Vec<usize>; 2]>,
     pub(crate) guarded_call_inputs: BTreeMap<usize, usize>,
     pub(crate) input: Option<usize>,
     pub(crate) input_mixed: bool,
@@ -3832,6 +3909,8 @@ fn closed_aggregates<'a>(
                 plan.scope_exits.insert(block, exit);
             }
         }
+        let mut conditional_certificate = None;
+        let mut certified_fork = false;
         for (&point, &call) in &facts.calls {
             if !target_body(&declarations, body.cfg, point)
                 .is_some_and(|target| outgoing.contains(&target))
@@ -3851,22 +3930,31 @@ fn closed_aggregates<'a>(
                         .and_then(|target| bodies.get(&target))
                         .is_some_and(|producer| !producer.has_mixed_struct_result());
                     let structured = eligible_conditional_inputs.get(&(key, point)).and_then(|&(ordinal, consumer)| {
-                        let region = facts.unit_input_regions.get(&body.cfg.points[consumer.0].scope.0)?;
-                        region.proves(&body.cfg.points, point, consumer, exit)
-                            .then_some((ordinal, region.expression.0))
+                        let region = facts.conditional_input_regions.get(&body.cfg.points[consumer.0].scope.0)?;
+                        let points = &body.cfg.points;
+                        let certificate = conditional_certificate
+                            .get_or_insert_with(|| ConditionalInputCertificate::prefix(points));
+                        if certificate.fork != region.branch {
+                            return None;
+                        }
+                        if !certified_fork {
+                            certificate.arms = certificate.certify_arms(points, region);
+                            certified_fork = true;
+                        }
+                        let side = certificate.consuming_side(points, point, consumer, exit)?;
+                        Some((ordinal, region.expression.0, side))
                     });
                     let valid = !always && endpoints.next().is_none() && !returning && ordinary_producer
-                        && plan.guarded_call_releases.is_empty()
                         && facts.endpoints.get(&endpoint)
                             .is_some_and(|endpoint| endpoint.has_conditional_unique_receipt(owner));
-                    let Some((consumer, expression)) = structured.filter(|_| valid) else {
+                    let Some((consumer, expression, side)) = structured.filter(|_| valid) else {
                         return Err(format!("aggregate input transfer does not cover every owning path in {:?}", body.source));
                     };
                     if plan.scope_exits.insert(block, exit).is_some_and(|old| old != exit) {
                         return Err(format!("aggregate release has conflicting scope exits in {:?}", body.source));
                     }
-                    plan.releases.entry(exit).or_default().push(call.0);
-                    plan.guarded_call_releases.insert(expression, call.0);
+                    plan.releases.entry(exit).or_default().push(ClosedOwnerRelease { receipt: call.0, guarded: true });
+                    plan.guarded_call_releases.entry(expression).or_default()[side].push(call.0);
                     plan.guarded_call_inputs.insert(consumer, call.0);
                 }
                 plan.calls.insert(call.0, ClosedCall::Receive);
@@ -3888,7 +3976,7 @@ fn closed_aggregates<'a>(
             if plan.scope_exits.insert(block, exit).is_some_and(|old| old != exit) {
                 return Err(format!("aggregate release has conflicting scope exits in {:?}", body.source));
             }
-            plan.releases.entry(exit).or_default().push(call.0);
+            plan.releases.entry(exit).or_default().push(ClosedOwnerRelease { receipt: call.0, guarded: false });
         }
         if (returning || !plan.calls.is_empty() || plan.input.is_some() || !plan.input_calls.is_empty()) && !body.is_monomorphic {
             return Err(format!("aggregate ownership in generic reservation {key:?} is not closed in {:?}", body.source));

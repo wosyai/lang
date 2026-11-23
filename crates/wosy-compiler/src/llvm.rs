@@ -3089,6 +3089,7 @@ fn emit_final_outputs<'ctx, 'module>(
             condition,
             tail.then_branch,
             tail.else_branch,
+            tail.expression,
             |state, branch| {
                 emit_block_at(context, state, branch, BlockEmission::TailArm(tail.outputs))
             },
@@ -3190,6 +3191,7 @@ fn emit_project_final_outputs<'ctx, 'module>(
             condition,
             tail.then_branch,
             tail.else_branch,
+            tail.expression,
             |state, branch| {
                 emit_project_block_at(
                     context,

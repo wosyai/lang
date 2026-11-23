@@ -1198,6 +1198,17 @@ impl<'a> ReferenceFlowBuilder<'a> {
         }
     }
 
+    fn record_conditional_inputs(&mut self, edges: &ReferenceConditionalEdges, expression: OccurrenceOrdinal) {
+        if let Some(&entries) = edges.entries(&self.cfg.points) {
+            let receipt = aggregate::ConditionalInputRegion {
+                expression, branch: edges.branch, entries, terminals: edges.terminals, join: edges.join,
+            };
+            for entry in entries.into_iter().filter(|&entry| entry != edges.join) {
+                self.aggregate_result.conditional_input_regions.insert(self.cfg.points[entry.0].scope.0, receipt);
+            }
+        }
+    }
+
     fn seal_local_borrow(&mut self) {
         self.proof_points.local_borrow = self.local_borrow.take()
             .filter(|_| self.proof_points.pending_named_reborrow.is_none())
@@ -1220,7 +1231,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
         span: ByteSpan,
         scope: ReferenceScopeId,
         region: &ConditionalRegion,
-        unit_expression: Option<OccurrenceOrdinal>,
+        expression: OccurrenceOrdinal,
         projected_origins: bool,
         checked_result: bool,
         array_return: bool,
@@ -1289,17 +1300,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
         }
         let edges = ReferenceConditionalEdges { branch, terminals: [then_arm.end, else_arm.end], join };
         self.connect_reference_conditional(&edges, region);
-        if let (Some(expression), Some([then_entry, bypass])) =
-            (unit_expression, edges.entries(&self.cfg.points))
-        {
-            if *bypass == join && edges.terminals[1] == branch {
-                self.aggregate_result.unit_input_regions.insert(
-                    self.cfg.points[then_entry.0].scope.0,
-                    aggregate::UnitInputRegion { expression, branch, then_entry: *then_entry,
-                        then_exit: edges.terminals[0], join },
-                );
-            }
-        }
+        self.record_conditional_inputs(&edges, expression);
         if let Some((binding, present_on_then)) = guarded {
             if let Some([then, otherwise]) = edges.entries(&self.cfg.points) {
                 self.proof_points.record_guarded_allocation(branch, binding, [*then, *otherwise], present_on_then);
@@ -1428,7 +1429,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
             unreachable!("checked output projection requires a value conditional")
         };
         let region = &self.call_sites.conditionals[&primary.expression];
-        let ([then_arm, else_arm], _, _, _) = self.conditional_branches(
+        let ([then_arm, else_arm], _, branch, _) = self.conditional_branches(
             condition,
             then_branch,
             Some(else_branch),
@@ -1518,8 +1519,9 @@ impl<'a> ReferenceFlowBuilder<'a> {
         }
         assert_eq!(result.output_points.len(), arity);
         let first = result.output_points[0];
-        self.cfg.points[then_arm.end.0].successors.push(first);
-        self.cfg.points[else_arm.end.0].successors.push(first);
+        let edges = ReferenceConditionalEdges { branch, terminals: [then_arm.end, else_arm.end], join: first };
+        edges.connect(&mut self.cfg.points);
+        self.record_conditional_inputs(&edges, primary.expression);
         if scope == ReferenceScopeId(0) && primary.output == 0
             && self.call_sites.boundary.root_outputs.len() == arity
         {
@@ -1704,7 +1706,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     span,
                     scope,
                     region,
-                    None,
+                    ordinal,
                     matches!(read_mode, ExpressionReadMode::ProjectedOrigins),
                     matches!(calls.structure.checked_types.expressions.get(&ordinal),
                         Some(ScalarType::CheckedReference { .. })),
@@ -1733,7 +1735,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     scope, ordinal, condition, then_branch, None, region,
                 );
                 self.conditional(condition, then_branch, None, span, scope, region,
-                    Some(ordinal), false, false, false, literal_unit)
+                    ordinal, false, false, false, literal_unit)
             }
             ScalarExpression::Block(block) => {
                 let result = self.block_result(block, self.block_ordinal(parent, OccurrenceEdge::BlockBody), false)?;
