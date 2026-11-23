@@ -11253,12 +11253,14 @@ type MixedReceiptTargets = HashMap<SourceIdentity, HashSet<ByteSpan>>;
 struct MixedReceiptSelection<'a> {
     grounds: &'a MixedReceiptTargets,
     local_forwarders: &'a HashSet<ByteSpan>,
+    cross_forwarders: Option<&'a MixedReceiptTargets>,
 }
 
 impl MixedReceiptSelection<'_> {
     fn contains(self, caller: &SourceIdentity, target: &SourceIdentity, span: &ByteSpan) -> bool {
         self.grounds.get(target).is_some_and(|points| points.contains(span))
             || (caller == target && self.local_forwarders.contains(span))
+            || self.cross_forwarders.and_then(|receipts| receipts.get(target)).is_some_and(|points| points.contains(span))
     }
 }
 
@@ -11282,30 +11284,54 @@ impl MixedReceiptCohort {
         }).collect()
     }
 
+    fn forwarders(
+        &self, source: &SourceIdentity, items: &[ScalarItem], sites: &ModuleCallSites,
+        updates: &[(usize, FunctionReferenceResult)], grounds: &MixedReceiptTargets,
+        mut cross_forwarders: Option<&mut MixedReceiptTargets>,
+    ) -> HashSet<ByteSpan> {
+        let local_grounds = grounds.get(source);
+        if self.callers.is_empty() || (local_grounds.is_none() && cross_forwarders.is_none()) {
+            return HashSet::new();
+        }
+        let mut local_users = HashMap::<_, Vec<_>>::new();
+        for &(position, declaration, _) in &self.producers {
+            let (index, result) = &updates[position];
+            let ScalarItem::Function(function) = &items[*index] else { unreachable!("function result ordinal") };
+            let Some((target, callee)) = result.mixed_forwarded_callee(function, &sites.functions[index])
+                else { continue };
+            if source == target {
+                if local_grounds.is_some() {
+                    local_users.entry(callee).or_default().push(declaration);
+                }
+            } else if grounds.get(target).is_some_and(|receipts| receipts.contains(&callee)) {
+                if let Some(cross) = cross_forwarders.as_deref_mut() {
+                    if let Some(receipts) = cross.get_mut(source) {
+                        receipts.insert(declaration);
+                    } else {
+                        cross.insert(source.clone(), HashSet::from([declaration]));
+                    }
+                }
+            }
+        }
+        match local_grounds {
+            Some(known) if !local_users.is_empty() => reachable_mixed_forwarders(&mut known.clone(), local_users),
+            _ => HashSet::new(),
+        }
+    }
+
     fn select(
         self, source: &SourceIdentity, items: &[ScalarItem], call_sites: &ModuleCallSites,
-        updates: &mut [(usize, FunctionReferenceResult)], grounds: &MixedReceiptTargets,
+        updates: &mut [(usize, FunctionReferenceResult)], owners: MixedReceiptSelection<'_>,
         structs: &[ScalarStruct], enums: &[ScalarEnum], capture_call_points: bool,
         errors: &mut Vec<ReferenceAnalysisError>,
     ) {
-        let mut forwarding_users = HashMap::<_, Vec<_>>::new();
-        let forwarders = grounds.get(source).filter(|known| !known.is_empty()).map_or_else(HashSet::new, |known| {
-            for (position, declaration, _) in self.producers {
-                let (index, result) = &updates[position];
-                let ScalarItem::Function(function) = &items[*index] else { unreachable!("function result ordinal") };
-                if let Some(callee) = result.mixed_forwarded_callee(source, function, &call_sites.functions[index]) {
-                    forwarding_users.entry(callee).or_default().push(declaration);
-                }
-            }
-            if forwarding_users.is_empty() { return HashSet::new(); }
-            reachable_mixed_forwarders(&mut known.clone(), forwarding_users)
-        });
-        let owners = MixedReceiptSelection { grounds, local_forwarders: &forwarders };
         for position in self.callers {
             let (index, result) = &mut updates[position];
             let ScalarItem::Function(function) = &items[*index] else { unreachable!("function result ordinal") };
             result.observe_selected_mixed_receipts(function, &call_sites.functions[index], &self.module_names,
-                structs, enums, source, owners, forwarders.contains(&function.name_span),
+                structs, enums, source, owners, owners.local_forwarders.contains(&function.name_span)
+                    || owners.cross_forwarders.and_then(|receipts| receipts.get(source))
+                        .is_some_and(|receipts| receipts.contains(&function.name_span)),
                 capture_call_points, errors);
         }
     }
@@ -11322,8 +11348,10 @@ fn derive_module_reference_origins(
         if let Some(cohort) = cohort {
             let owners = cohort.grounds(source, &updates, &targets);
             if !owners.is_empty() {
-                cohort.select(source, items, call_sites, &mut updates, &HashMap::from([(source.clone(), owners)]),
-                    structs, enums, capture_call_points, &mut errors);
+                let grounds = HashMap::from([(source.clone(), owners)]);
+                let local = cohort.forwarders(source, items, call_sites, &updates, &grounds, None);
+                let selection = MixedReceiptSelection { grounds: &grounds, local_forwarders: &local, cross_forwarders: None };
+                cohort.select(source, items, call_sites, &mut updates, selection, structs, enums, capture_call_points, &mut errors);
             }
         }
     }
@@ -11617,11 +11645,20 @@ fn derive_project_reference_origins(
         }).collect::<MixedReceiptTargets>();
         if !grounds.is_empty() {
             let (structs, enums) = inventory.as_ref().expect("mixed project cohorts have declared inventory");
-            for (position, cohort) in cohorts {
+            let mut cross = HashMap::new();
+            let cohorts = cohorts.into_iter().map(|(position, cohort)| {
+                let (index, results) = &updates[position];
+                let module = &modules[*index];
+                let sites = call_sites.modules[*index].as_ref().expect("successful mixed receipt cohort");
+                let local = cohort.forwarders(&module.source, &module.items, sites, results, &grounds, Some(&mut cross));
+                (position, cohort, local)
+            }).collect::<Vec<_>>();
+            for (position, cohort, local) in cohorts {
                 let (index, results) = &mut updates[position];
                 let module = &modules[*index];
                 let sites = call_sites.modules[*index].as_ref().expect("successful mixed receipt cohort");
-                cohort.select(&module.source, &module.items, sites, results, &grounds,
+                let selection = MixedReceiptSelection { grounds: &grounds, local_forwarders: &local, cross_forwarders: Some(&cross) };
+                cohort.select(&module.source, &module.items, sites, results, selection,
                     structs, enums, capture_call_points, &mut errors);
             }
         }
@@ -12376,8 +12413,8 @@ impl FunctionReferenceResult {
     }
 
     fn mixed_forwarded_callee(
-        &self, source: &SourceIdentity, function: &ScalarFunction, sites: &FunctionCallSites,
-    ) -> Option<ByteSpan> {
+        &self, function: &ScalarFunction, sites: &FunctionCallSites,
+    ) -> Option<(&SourceIdentity, ByteSpan)> {
         let [ScalarBlockItem::LocalBinding(binding),
             ScalarBlockItem::Expression(ScalarExpression::Name { name: first_name, .. }),
             ScalarBlockItem::Expression(ScalarExpression::Name { name: second_name, .. })] =
@@ -12411,8 +12448,8 @@ impl FunctionReferenceResult {
         )) else { return None };
         let row = sites.checked_call_signatures.get(ordinal)?;
         let [call_head, call_tail] = row.outputs.outputs.as_slice() else { return None };
-        (actual == source && call_head.ty == head.ty && call_tail.ty == tail.ty
-            && row.parameters.iter().all(aggregate::ordinary_value)).then_some(*declaration_span)
+        (call_head.ty == head.ty && call_tail.ty == tail.ty
+            && row.parameters.iter().all(aggregate::ordinary_value)).then_some((actual, *declaration_span))
     }
 
     fn observe_selected_mixed_receipts(

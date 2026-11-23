@@ -1230,9 +1230,6 @@ i32(u64, bool) inspect_checked = fn(count, flag) {
 
 #[test]
 fn mixed_result_direct_cross_module_receive_preserves_qualified_owner_identity() {
-    let app = source("workbench", "src/cross_mixed.w");
-    let owner = source("payload", "src/owner.w");
-    let decoy = source("payload", "src/decoy.w");
     let owner_text = r#"%%start
 struct Packet { *?u8 data; u64 length; }
 Packet stored = { .data = null; .length = 7; };
@@ -1267,16 +1264,45 @@ u64() receive = fn {
 };
 if (receive() != 106) { core.system_panic(); };
 %%end"#;
+    let forwarded_text = app_text.replace(
+        "plain = namespace payload \"decoy.w\";",
+        "plain = namespace payload \"decoy.w\";
+relay = namespace payload \"relay.w\";",
+    ).replace("owned.make_packet(2)", "relay.forward(2)");
+    let relay_text = r#"%%start
+owned = namespace payload "owner.w";
+(u32, owned.Packet)(u64) forward = fn(count) {
+    u32 marker, owned.Packet packet = owned.make_packet(count);
+    marker, packet
+};
+%%end"#;
+    for (via_relay, app_text) in [(false, app_text), (true, forwarded_text.as_str())] {
+        verify_qualified_mixed_result(app_text, owner_text, decoy_text, via_relay.then_some(relay_text));
+    }
+}
+
+fn verify_qualified_mixed_result(app_text: &str, owner_text: &str, decoy_text: &str, relay_text: Option<&str>) {
+    let app = source("workbench", "src/cross_mixed.w");
+    let owner = source("payload", "src/owner.w");
+    let decoy = source("payload", "src/decoy.w");
+    let relay = source("payload", "src/relay.w");
     for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
-        let prepared = prepare_scalar_project(
-            vec![
-                (declarations(&app, app_text), vec![namespace("owned", &owner), namespace("plain", &decoy)]),
-                (declarations(&owner, owner_text), Vec::new()),
-                (declarations(&decoy, decoy_text), Vec::new()),
-            ],
-            vec![app.clone(), owner.clone(), decoy.clone()],
-            ScalarPreparationInputs { target_layout },
-        ).unwrap_or_else(|error| panic!("{target_layout:?}: {:?}", error.diagnostics));
+        let mut app_namespaces = vec![namespace("owned", &owner), namespace("plain", &decoy)];
+        if relay_text.is_some() {
+            app_namespaces.push(namespace("relay", &relay));
+        }
+        let mut inputs = vec![
+            (declarations(&app, app_text), app_namespaces),
+            (declarations(&owner, owner_text), Vec::new()),
+            (declarations(&decoy, decoy_text), Vec::new()),
+        ];
+        let mut sources = vec![app.clone(), owner.clone(), decoy.clone()];
+        if let Some(text) = relay_text {
+            inputs.push((declarations(&relay, text), vec![namespace("owned", &owner)]));
+            sources.push(relay.clone());
+        }
+        let prepared = prepare_scalar_project(inputs, sources, ScalarPreparationInputs { target_layout })
+            .unwrap_or_else(|error| panic!("{target_layout:?}: {:?}", error.diagnostics));
         let build = analyze_scalar_build(&prepared);
         assert!(build.diagnostics().is_empty(), "{:?}", build.diagnostics());
         let ir = emit_scalar_build_project_llvm(&build).unwrap().to_text();
@@ -1296,7 +1322,24 @@ if (receive() != 106) { core.system_panic(); };
         let receiver = module.get_function(&function_with_suffix(&module, "receive")).unwrap().print_to_string().to_string();
         assert_eq!(owner.count_params(), 2);
         assert_eq!(ordinary.count_params(), 1);
-        for function in [owner, ordinary] {
+        let called_owner = if relay_text.is_some() {
+            let relay = module.get_function(&function_with_suffix(&module, "forward")).unwrap();
+            let relay_ir = relay.print_to_string().to_string();
+            let mut calls = relay.get_basic_blocks().into_iter().flat_map(|block| block.get_instructions())
+                .filter(|inst| inst.get_opcode() == InstructionOpcode::Call);
+            let call = calls.next().expect("exact forwarded producer call");
+            assert!(calls.next().is_none(), "{relay_ir}");
+            let called = CallSiteValue::try_from(call).unwrap();
+            assert_eq!(called.get_called_fn_value(), Some(owner));
+            assert_eq!(call.get_operand(1).unwrap().value(), relay.get_last_param());
+            let returned = relay.get_basic_blocks().into_iter().flat_map(|block| block.get_instructions())
+                .find(|inst| inst.get_opcode() == InstructionOpcode::Return).expect("whole pair return");
+            assert_eq!(returned.get_operand(0).unwrap().value(), called.try_as_basic_value().basic());
+            relay
+        } else {
+            owner
+        };
+        for function in [called_owner, ordinary] {
             let target = function.get_name().to_str().unwrap();
             assert_eq!(receiver.matches(&format!("call {{ i32, ptr }} @{target}(")).count(), 1, "{receiver}");
         }
