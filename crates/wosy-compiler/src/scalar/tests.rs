@@ -7415,6 +7415,45 @@ fn rejects_invalid_character_shapes_at_literal_spans() {
 }
 
 #[test]
+fn direct_and_grouped_value_field_reads_canonically_derive_both_spans() {
+    for expression in ["make(42).value", "(make(42)).value"] {
+        let text = format!(
+            "%%start\nstruct copy Pair {{ i32 value; }}\nPair(i32) make = fn(seed) {{ {{ .value = seed; }} }};\ni32() get = fn {{ {expression} }};\n%%end"
+        );
+        let start = text.find(expression).unwrap() as u32;
+        let parsed = parse_source(source(), text, &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let declarations = derive_scalar_declarations_from_cst(parsed.result.canonical_cst());
+        assert!(declarations.diagnostics().is_empty(), "{:?}", declarations.diagnostics());
+        let get = declarations.items.iter().find_map(|item| match item {
+            ScalarItem::Function(function) if function.name == "get" => Some(function),
+            _ => None,
+        }).expect("reader function");
+        let [ScalarBlockItem::Expression(ScalarExpression::ValueField { receiver, name, name_span, span })] =
+            get.body.items.as_slice() else { panic!("{:?}", get.body.items) };
+        assert!(matches!(receiver.as_ref(), ScalarExpression::Call { name, .. } if name == "make"));
+        assert_eq!(name, "value");
+        let end = start + expression.len() as u32;
+        assert_eq!(*span, ByteSpan::new(start, end));
+        assert_eq!(*name_span, ByteSpan::new(end - 5, end));
+    }
+}
+
+#[test]
+fn invalid_temporary_places_reject_direct_canonical_derivation_without_panicking() {
+    let text = "%%start
+struct copy Pair { i32 value; }
+Pair(i32) make = fn(seed) { { .value = seed; } };
+unit() set = fn { (make(42)).value = 7; };
+%%end";
+    let parsed = parse_source(source(), text.into(), &[]);
+    assert_eq!(parsed.diagnostics.len(), 1, "{:?}", parsed.diagnostics);
+    let declarations = derive_scalar_declarations_from_cst(parsed.result.canonical_cst());
+    let [diagnostic] = declarations.diagnostics() else { panic!("{:?}", declarations.diagnostics()) };
+    assert_eq!(diagnostic.message, "a field of a temporary is not an assignable or borrowable place");
+}
+
+#[test]
 fn integer_literals_keep_radix_values_and_separator_rules() {
     for (text, value) in [
         ("0", 0),

@@ -477,6 +477,9 @@ fn record_expression_overload_selection(
         ScalarExpression::Unary { operand, .. } => {
             record_expression_overload_selection(operand, expected, scope, overloads)
         }
+        ScalarExpression::ValueField { receiver, .. } => {
+            record_expression_overload_selection(receiver, None, scope, overloads)
+        }
         ScalarExpression::If {
             condition,
             then_branch,

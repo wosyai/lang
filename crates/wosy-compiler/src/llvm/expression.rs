@@ -164,6 +164,8 @@ pub(super) fn emit_expression<'ctx, 'module>(
             Err(format!("unknown LLVM member {receiver}.{name}"))
         }
         ScalarExpression::Dereference { place, .. } => emit_place_value(context, state, place),
+        ScalarExpression::ValueField { receiver, .. } =>
+            emit_value_field(context, state, expression, receiver, None),
         ScalarExpression::IndexedRead { place, .. } => emit_place_value(context, state, place),
         ScalarExpression::Integer { value, .. } => Ok(EmitValue::Basic(
             context
@@ -422,6 +424,8 @@ pub(super) fn emit_project_expression<'ctx, 'module>(
             place,
             Some(ProjectCallScope { module, modules }),
         ),
+        ScalarExpression::ValueField { receiver, .. } =>
+            emit_value_field(context, state, expression, receiver, Some((module, modules))),
         ScalarExpression::IndexedRead { place, .. } => emit_place_value_in_project(
             context,
             state,
@@ -1911,6 +1915,24 @@ fn emit_core_load_project<'ctx, 'module>(
     )?)?
     .into_int_value();
     emit_core_load_values(context, state, pointer, &type_argument.ty)
+}
+
+fn emit_value_field<'ctx, 'module>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, 'module>,
+    expression: &ScalarExpression,
+    receiver: &ScalarExpression,
+    project: Option<(&ScalarModule, &[&ScalarModule])>,
+) -> Result<EmitValue<'ctx>, String> {
+    let nodes = state.body_call_nodes
+        .ok_or_else(|| "call result has no proven caller-owned storage for field projection".to_owned())?;
+    let field = nodes.checked_value_field(expression)
+        .ok_or_else(|| "missing checked value field identity".to_owned())?;
+    let ty = nodes.checked_expression_type(expression)
+        .ok_or_else(|| "missing checked value field type".to_owned())?;
+    let base = aggregate_transfer::emit_value_field_receiver(context, state, receiver, project)?;
+    let pointer = resolved_field_pointer(context, state, base, field)?;
+    load_place_value(context, state, pointer, ty)
 }
 
 fn emit_core_load_values<'ctx, 'module>(

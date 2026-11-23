@@ -93,6 +93,8 @@ pub enum SyntaxKind {
     CopyModifier,
     IndexFieldSuffix,
     DirectFieldChainTail,
+    ValueField,
+    InvalidTemporaryPlace,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -185,6 +187,8 @@ impl Language for WosyLanguage {
             80 => SyntaxKind::CopyModifier,
             81 => SyntaxKind::IndexFieldSuffix,
             82 => SyntaxKind::DirectFieldChainTail,
+            83 => SyntaxKind::ValueField,
+            84 => SyntaxKind::InvalidTemporaryPlace,
             _ => panic!("invalid syntax kind: {}", raw.0),
         }
     }
@@ -537,6 +541,28 @@ fn build_pair(
         build_conditional_block_entry(builder, pair, text, comments, errors);
         return;
     }
+    if pair.as_rule() == Rule::dereferenced_field
+        && !pair.clone().into_inner().next().is_some_and(is_dereference_primary)
+    {
+        builder.start_node(WosyLanguage::kind_to_raw(SyntaxKind::InvalidTemporaryPlace));
+        add_gap(builder, span.as_str(), span.start(), comments);
+        builder.finish_node();
+        errors.push(SyntaxError {
+            span: ByteSpan::new(span.start() as u32, span.end() as u32),
+            message: "a field of a temporary is not an assignable or borrowable place".to_owned(),
+        });
+        return;
+    }
+    if pair.as_rule() == Rule::call_primary {
+        let mut children = pair.into_inner();
+        let call = children.next().expect("call primary head");
+        if let Some(field) = children.next() {
+            build_value_field(builder, call, field, None, text, comments, errors);
+        } else {
+            build_pair(builder, call, text, comments, errors);
+        }
+        return;
+    }
     if pair.as_rule() == Rule::parenthesized_primary {
         build_parenthesized_primary(builder, pair, text, comments, errors);
         return;
@@ -658,6 +684,10 @@ fn build_parenthesized_primary(
     let mut suffix = suffix.into_inner();
     let field = suffix.next().expect("parenthesized field suffix");
     let indices = suffix.next();
+    if !is_dereference_primary(head.clone()) {
+        build_value_field(builder, head, field, indices, text, comments, errors);
+        return;
+    }
     let outer = if indices.is_some() {
         SyntaxKind::IndexedPlace
     } else {
@@ -668,6 +698,43 @@ fn build_parenthesized_primary(
     build_pair(builder, head, text, comments, errors);
     build_pair(builder, field, text, comments, errors);
     builder.finish_node();
+    if let Some(indices) = indices {
+        build_pair(builder, indices, text, comments, errors);
+    }
+    builder.finish_node();
+}
+
+fn is_dereference_primary(mut pair: Pair<'_, Rule>) -> bool {
+    loop {
+        match pair.as_rule() {
+            Rule::dereference => return true,
+            Rule::parenthesized | Rule::parenthesized_primary | Rule::expression | Rule::primary
+            | Rule::logical_or | Rule::logical_and | Rule::bit_or | Rule::bit_xor | Rule::bit_and
+            | Rule::comparison | Rule::shift | Rule::additive | Rule::multiplicative
+            | Rule::unary => {}
+            _ => return false,
+        }
+        let mut children = pair.into_inner();
+        let Some(child) = children.next() else { return false };
+        if children.next().is_some() {
+            return false;
+        }
+        pair = child;
+    }
+}
+
+fn build_value_field(
+    builder: &mut GreenNodeBuilder<'_>,
+    receiver: Pair<'_, Rule>,
+    field: Pair<'_, Rule>,
+    indices: Option<Pair<'_, Rule>>,
+    text: &str,
+    comments: &[TypedComment],
+    errors: &mut Vec<SyntaxError>,
+) {
+    builder.start_node(WosyLanguage::kind_to_raw(SyntaxKind::ValueField));
+    build_pair(builder, receiver, text, comments, errors);
+    build_pair(builder, field, text, comments, errors);
     if let Some(indices) = indices {
         build_pair(builder, indices, text, comments, errors);
     }
@@ -2064,6 +2131,74 @@ mod tests {
             .descendants()
             .any(|node| node.kind() == SyntaxKind::Parenthesized
                 && node.text().to_string() == "(*reader)"));
+    }
+
+    #[test]
+    fn value_field_reads_keep_call_and_place_shapes() {
+        let text = "%%start\nmake(2);\nmake(42).value;\n(make(42)).value;\nitem.value;\n(*ptr).value;\n%%end";
+        let parsed = parse(identity(), text.into(), &[]);
+        assert!(parsed.is_valid(), "{:?}", parsed.errors);
+        assert_eq!(parsed.reconstruct(), text);
+        let nodes = parsed.root.descendants().filter(|node| node.kind() == SyntaxKind::ValueField)
+            .collect::<Vec<_>>();
+        assert_eq!(nodes.len(), 2);
+        for (node, receiver) in nodes.iter().zip([SyntaxKind::Call, SyntaxKind::Parenthesized]) {
+            assert_eq!(node.children().next().unwrap().kind(), receiver);
+            assert!(node.children_with_tokens().any(|element|
+                element.kind() == SyntaxKind::Identifier && element.to_string() == "value"));
+        }
+        for (kind, spelling) in [
+            (SyntaxKind::Call, "make(2)"),
+            (SyntaxKind::QualifiedMember, "item.value"),
+            (SyntaxKind::DereferencedField, "(*ptr).value"),
+        ] {
+            assert!(parsed.root.descendants().any(|node| node.kind() == kind && node.text() == spelling));
+        }
+    }
+
+    #[test]
+    fn value_field_reads_keep_exact_trivia_and_receiver_boundaries() {
+        let direct = "make (42) # note: direct\n . value";
+        let grouped = "(make(42)) # note: grouped\r\n .value # note: index\n [1]";
+        let arithmetic = "(*ptr + 1).field";
+        let text = format!("%%start\n{direct};\n{grouped};\n{arithmetic};\n%%end");
+        let parsed = parse(identity(), text.clone(), &["note".to_owned()]);
+        assert!(parsed.is_valid(), "{:?}", parsed.errors);
+        assert_eq!(parsed.reconstruct(), text);
+        for (spelling, receiver, comment_count) in [
+            (direct, "make (42)", 1),
+            (grouped, "(make(42))", 2),
+            (arithmetic, "(*ptr + 1)", 0),
+        ] {
+            let start = text.find(spelling).unwrap() as u32;
+            let projection = parsed.root.descendants().find(|node| {
+                node.kind() == SyntaxKind::ValueField
+                    && byte_span(node) == ByteSpan::new(start, start + spelling.len() as u32)
+            }).expect("lossless projection");
+            let head = projection.children().next().expect("value receiver");
+            assert_eq!(byte_span(&head), ByteSpan::new(start, start + receiver.len() as u32));
+            assert_eq!(projection.descendants_with_tokens().filter(|element|
+                element.kind() == SyntaxKind::TypedComment).count(), comment_count);
+            assert!(!projection.descendants().any(|node| node.kind() == SyntaxKind::DereferencedField));
+        }
+    }
+
+    #[test]
+    fn value_field_temporaries_do_not_parse_as_places() {
+        for statement in [
+            "(make(42)).value = 5;",
+            "(make(42)).value[1] = 5;",
+            "&(make(42)).value;",
+            "&!(make(42)).value;",
+            "&?(make(42)).value[1];",
+            "(*ptr + 1).field = 5;",
+        ] {
+            let text = format!("%%start\n{statement}\n%%end");
+            let parsed = parse(identity(), text.clone(), &[]);
+            assert_eq!(parsed.errors.len(), 1, "{statement}: {:?}", parsed.errors);
+            assert_eq!(parsed.reconstruct(), text);
+            assert!(!parsed.root.descendants().any(|node| node.kind() == SyntaxKind::ValueField));
+        }
     }
 
     #[test]

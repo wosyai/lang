@@ -518,22 +518,10 @@ pub(super) fn emit_call<'ctx, 'module>(
     if forwards || aggregate.plan.checked_backing_consumer.is_some_and(|(_, call)| ordinal == call) {
         return emit_checked_backing_call(context, state, expression, arguments, project, forwards).map(Some);
     }
-    if let Some(declaration) = aggregate.plan.ordinary_calls.get(&ordinal) {
-        let Some(nodes) = state.body_call_nodes else {
-            return Err("missing ordinary aggregate call identity".into());
-        };
-        let ResolvedCallTarget::ModuleCallable { source, declaration_span, concrete: ConcreteCallSelection::Declaration } = nodes.target(expression)? else {
-            return Err("ordinary aggregate call changed its selected target".into());
-        };
-        if &declaration.source != source || declaration.range != *declaration_span {
-            return Err("ordinary aggregate call changed its declaration identity".into());
-        }
-        let aggregate = state.aggregate.as_mut().expect("ordinary aggregate call frame");
-        if !aggregate.ordinary_visited.insert(ordinal) {
-            return Err("ordinary aggregate call occurrence emitted twice".into());
-        }
-        return emit_ordinary_result_call(context, state, expression, arguments, project, None).map(Some);
+    if let Some(value) = try_emit_witnessed_ordinary_call(context, state, expression, arguments, project, ordinal)? {
+        return Ok(Some(value));
     }
+    let aggregate = state.aggregate.as_ref().expect("closed aggregate call frame");
     let action = aggregate.plan.calls.get(&ordinal).copied().map(CallDestination::Body);
     let input = aggregate.plan.input_calls.get(&ordinal).map(|&(_, input)| CallInput::Body(input));
     if action.is_none() && input.is_none() {
@@ -646,6 +634,51 @@ pub(super) fn release_checked_backing<'ctx>(
         state.builder.build_call(free, &[base.into()], "checked_backing_release").map_err(builder_error)?;
     }
     Ok(())
+}
+
+pub(super) fn emit_value_field_receiver<'ctx, 'module>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, 'module>,
+    receiver: &ScalarExpression,
+    project: Option<(&ScalarModule, &[&ScalarModule])>,
+) -> Result<PointerValue<'ctx>, String> {
+    let ScalarExpression::Call { arguments, .. } = receiver else {
+        return Err("field value receiver must be a call result".to_owned());
+    };
+    let ordinal = state.body_call_nodes.and_then(|nodes| nodes.expression_ordinal(receiver))
+        .ok_or_else(|| "call result has no proven caller-owned storage for field projection".to_owned())?;
+    let value = try_emit_witnessed_ordinary_call(context, state, receiver, arguments, project, ordinal)?
+        .ok_or_else(|| "call result has no proven caller-owned storage for field projection".to_owned())?;
+    match take_basic(value)? {
+        BasicValueEnum::PointerValue(pointer) => Ok(pointer),
+        _ => Err("proven field receiver did not yield caller-owned storage".to_owned()),
+    }
+}
+
+fn try_emit_witnessed_ordinary_call<'ctx, 'module>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, 'module>,
+    expression: &ScalarExpression,
+    arguments: &[ScalarExpression],
+    project: Option<(&ScalarModule, &[&ScalarModule])>,
+    ordinal: usize,
+) -> Result<Option<EmitValue<'ctx>>, String> {
+    let Some(declaration) = state.aggregate.as_ref()
+        .and_then(|aggregate| aggregate.plan.ordinary_calls.get(&ordinal)) else { return Ok(None) };
+    let Some(nodes) = state.body_call_nodes else {
+        return Err("missing ordinary aggregate call identity".into());
+    };
+    let ResolvedCallTarget::ModuleCallable { source, declaration_span, concrete: ConcreteCallSelection::Declaration } = nodes.target(expression)? else {
+        return Err("ordinary aggregate call changed its selected target".into());
+    };
+    if &declaration.source != source || declaration.range != *declaration_span {
+        return Err("ordinary aggregate call changed its declaration identity".into());
+    }
+    let aggregate = state.aggregate.as_mut().expect("ordinary aggregate call frame");
+    if !aggregate.ordinary_visited.insert(ordinal) {
+        return Err("ordinary aggregate call occurrence emitted twice".into());
+    }
+    emit_ordinary_result_call(context, state, expression, arguments, project, None).map(Some)
 }
 
 fn emit_ordinary_result_call<'ctx, 'module>(

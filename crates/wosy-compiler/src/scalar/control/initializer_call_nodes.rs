@@ -923,6 +923,14 @@ impl<'a> CallableBodyCallNodes<'a> {
             .get(ordinal)
     }
 
+    pub(crate) fn checked_value_field(
+        &self,
+        expression: &ScalarExpression,
+    ) -> Option<&'a crate::ScalarStructFieldId> {
+        let ordinal = self.proof_nodes.expressions.get(&std::ptr::from_ref(expression))?;
+        self.proof_nodes.calls?.structure.value_fields.get(ordinal)
+    }
+
     pub(crate) fn checked_place_type(&self, place: &ScalarPlace) -> Option<&'a ScalarType> {
         let ordinal = self.proof_nodes.places.get(&std::ptr::from_ref(place))?;
         self.proof_nodes
@@ -1091,6 +1099,9 @@ impl<'a> Binder<'a, '_> {
                 self.block(parent, Edge::ThenBranch, then_branch)?;
             }
             ScalarExpression::Block(block) => self.block(parent, Edge::BlockBody, block)?,
+            ScalarExpression::ValueField { receiver, .. } => {
+                self.expression(parent, Edge::ValueFieldReceiver, receiver)?;
+            }
             ScalarExpression::RawAddress { place, .. }
             | ScalarExpression::CheckedAddress { place, .. }
             | ScalarExpression::Dereference { place, .. }

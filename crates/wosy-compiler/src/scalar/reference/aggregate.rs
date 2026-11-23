@@ -238,7 +238,7 @@ pub(super) fn checked_scalar_output(outputs: &[RootOutputType]) -> bool {
             if ordinary_value(inner))
 }
 
-pub(super) fn ordinary_value(ty: &ScalarType) -> bool {
+pub(in crate::scalar) fn ordinary_value(ty: &ScalarType) -> bool {
     matches!(ty, ScalarType::Bool | ScalarType::Char | ScalarType::I8 | ScalarType::I16 | ScalarType::I32 |
         ScalarType::I64 | ScalarType::I128 | ScalarType::U8 | ScalarType::U16 | ScalarType::U32 |
         ScalarType::U64 | ScalarType::U128 | ScalarType::F32 | ScalarType::F64)
@@ -1708,6 +1708,16 @@ fn scalar_only_ordinary_result_use(
         || function.body.final_output_values.len() != 1
     {
         return false;
+    }
+    if matches!(function.body.items.as_slice(), [ScalarBlockItem::Expression(ScalarExpression::ValueField { .. })]) {
+        let root = OccurrenceParent::Block(sites.structure.root);
+        let Some(OccurrenceNode::Expression(projection)) = sites.structure.edges.get(&(
+            root, OccurrenceEdge::FinalOutput { item: 0, output: 0 },
+        )) else { return false };
+        return sites.structure.value_fields.contains_key(projection)
+            && sites.structure.edges.get(&(
+                OccurrenceParent::Expression(*projection), OccurrenceEdge::ValueFieldReceiver,
+            )) == Some(&OccurrenceNode::Expression(call));
     }
     let [ScalarBlockItem::LocalBinding(binding), ScalarBlockItem::Expression(expression)] =
         function.body.items.as_slice() else { return false };

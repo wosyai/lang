@@ -1553,6 +1553,11 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 }
                 Ok(ReferenceValue::Other)
             }
+            ScalarExpression::ValueField { receiver, .. } => {
+                self.expression_child(receiver, scope, parent, OccurrenceEdge::ValueFieldReceiver)?;
+                self.point(CfgPointKind::Evaluate(expression.clone()), span, scope, BTreeSet::new());
+                Ok(ReferenceValue::Other)
+            }
             ScalarExpression::Unary { operand, .. } => {
                 self.expression_child(operand, scope, parent, OccurrenceEdge::UnaryOperand)?;
                 self.point(
@@ -5999,6 +6004,7 @@ pub(super) enum OccurrenceEdge {
     BinaryLeft,
     BinaryRight,
     UnaryOperand,
+    ValueFieldReceiver,
     Condition,
     ThenBranch,
     ElseBranch,
@@ -6059,6 +6065,7 @@ pub(super) struct OccurrenceStructure {
     pub(super) edges: HashMap<(OccurrenceParent, OccurrenceEdge), OccurrenceNode>,
     pub(super) checked_types: CheckedOccurrenceTypes,
     pub(super) literal_fields: HashMap<OccurrenceOrdinal, ScalarStructFieldId>,
+    pub(super) value_fields: HashMap<OccurrenceOrdinal, ScalarStructFieldId>,
     pub(super) module_storage_uses: HashMap<SourceSpan, Vec<(OccurrenceOrdinal, ModuleStorageRole)>>,
     pub(super) module_storage_installs: BTreeMap<usize, ModuleStorageInstall>,
     pub(super) initializer_static_utf8: HashSet<OccurrenceOrdinal>,
@@ -6078,6 +6085,7 @@ impl OccurrenceStructure {
             edges: HashMap::new(),
             checked_types: CheckedOccurrenceTypes::default(),
             literal_fields: HashMap::new(),
+            value_fields: HashMap::new(),
             module_storage_uses: HashMap::new(),
             module_storage_installs: BTreeMap::new(),
             initializer_static_utf8: HashSet::new(),
@@ -7347,6 +7355,12 @@ impl StructuralWalker<'_, '_> {
                     ModuleStorageRole::Project
                 };
                 self.place_at(place, names, types, parent, OccurrenceEdge::ExpressionPlace, role)?;
+            }
+            ScalarExpression::ValueField { receiver, .. } => {
+                self.expression(receiver, names, types, parent, OccurrenceEdge::ValueFieldReceiver)?;
+                if let Some(id) = self.occurrence_typing.take_value_field(expression) {
+                    self.structure.value_fields.insert(ordinal, id);
+                }
             }
             ScalarExpression::StructLiteral { fields, .. } => {
                 for (position, field) in fields.iter().enumerate() {

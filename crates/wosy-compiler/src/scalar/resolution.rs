@@ -203,7 +203,7 @@ fn resolve_expression_type_operands(
             resolve(left);
             resolve(right);
         }
-        ScalarExpression::Unary { operand, .. } => resolve(operand),
+        ScalarExpression::Unary { operand, .. } | ScalarExpression::ValueField { receiver: operand, .. } => resolve(operand),
         ScalarExpression::StructLiteral { fields, .. } => {
             for field in fields {
                 resolve(&mut field.value);
@@ -571,7 +571,7 @@ fn resolve_expression_places(
                 owners,
             );
         }
-        ScalarExpression::Unary { operand, .. } => {
+        ScalarExpression::Unary { operand, .. } | ScalarExpression::ValueField { receiver: operand, .. } => {
             resolve_expression_places(
                 operand,
                 scope,
@@ -1477,7 +1477,7 @@ fn resolve_expression_module_places(
                 owners,
             );
         }
-        ScalarExpression::Unary { operand, .. } => {
+        ScalarExpression::Unary { operand, .. } | ScalarExpression::ValueField { receiver: operand, .. } => {
             resolve_expression_module_places(
                 operand,
                 scope,

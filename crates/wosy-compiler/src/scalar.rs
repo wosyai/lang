@@ -945,6 +945,7 @@ enum ScalarFieldIdentity {
 enum ScalarExpressionIdentity {
     Name(String),
     Member(String, String),
+    ValueField(Box<ScalarExpressionIdentity>, String),
     Integer(BigInt),
     InvalidInteger,
     Float(f64),
@@ -1066,6 +1067,8 @@ fn scalar_expression_identity(expression: &ScalarExpression) -> ScalarExpression
         ScalarExpression::Member { receiver, name, .. } => {
             ScalarExpressionIdentity::Member(receiver.clone(), name.clone())
         }
+        ScalarExpression::ValueField { receiver, name, .. } =>
+            ScalarExpressionIdentity::ValueField(Box::new(scalar_expression_identity(receiver)), name.clone()),
         ScalarExpression::Integer { value, .. } => ScalarExpressionIdentity::Integer(value.clone()),
         ScalarExpression::InvalidInteger { .. } => ScalarExpressionIdentity::InvalidInteger,
         ScalarExpression::Float { value, .. } => ScalarExpressionIdentity::Float(*value),
@@ -1787,6 +1790,12 @@ pub enum ScalarExpression {
         name_span: ByteSpan,
         span: ByteSpan,
     },
+    ValueField {
+        receiver: Box<ScalarExpression>,
+        name: String,
+        name_span: ByteSpan,
+        span: ByteSpan,
+    },
     Integer {
         value: BigInt,
         span: ByteSpan,
@@ -2307,7 +2316,16 @@ pub fn derive_scalar_declarations_from_cst(
     canonical: &CanonicalCstRoot,
 ) -> ScalarSourceDeclarations {
     let mut items = Vec::new();
-    let diagnostics = derive_scalar_diagnostics_from_cst(canonical);
+    let (diagnostics, invalid_projection) = collect_scalar_diagnostics(canonical);
+    if invalid_projection {
+        return ScalarSourceDeclarations {
+            source: canonical.source.clone(),
+            items,
+            structs: Vec::new(),
+            enums: Vec::new(),
+            diagnostics,
+        };
+    }
     let source_root = canonical
         .root
         .children()
@@ -2501,8 +2519,12 @@ use typecheck::{
 };
 use typecheck::{split_module_typing, ScalarModuleTyping, ScalarProgramTyping};
 pub fn derive_scalar_diagnostics_from_cst(canonical: &CanonicalCstRoot) -> Vec<super::Diagnostic> {
-    let [mut strings, mut chars, mut integers, mut floats, mut lengths] =
-        [const { Vec::new() }; 5];
+    collect_scalar_diagnostics(canonical).0
+}
+
+fn collect_scalar_diagnostics(canonical: &CanonicalCstRoot) -> (Vec<Diagnostic>, bool) {
+    let [mut strings, mut chars, mut integers, mut floats, mut lengths, mut projections] =
+        [const { Vec::new() }; 6];
     for element in canonical.root.descendants_with_tokens() {
         match element {
             NodeOrToken::Token(token) => {
@@ -2558,6 +2580,28 @@ pub fn derive_scalar_diagnostics_from_cst(canonical: &CanonicalCstRoot) -> Vec<s
             NodeOrToken::Node(node) if node.kind() == SyntaxKind::FixedArrayLength => {
                 lengths.extend(fixed_array_length_diagnostic(&canonical.source, &node));
             }
+            NodeOrToken::Node(node)
+                if node.kind() == SyntaxKind::InvalidTemporaryPlace
+                    || (node.kind() == SyntaxKind::ValueField
+                        && node.children().any(|child| child.kind() == SyntaxKind::IndexSuffix)) =>
+            {
+                let message = if node.kind() == SyntaxKind::InvalidTemporaryPlace {
+                    "a field of a temporary is not an assignable or borrowable place"
+                } else {
+                    "an indexed call result field is not supported"
+                };
+                projections.push(Diagnostic {
+                    code: "B0003".to_owned(),
+                    severity: DiagnosticSeverity::Error,
+                    message: message.to_owned(),
+                    labels: vec![DiagnosticLabel {
+                        kind: DiagnosticLabelKind::Primary,
+                        span: SourceSpan::new(canonical.source.clone(), wosy_syntax::byte_span(&node)),
+                        message: message.to_owned(),
+                    }],
+                    notes: Vec::new(),
+                });
+            }
             _ => {}
         }
     }
@@ -2565,7 +2609,9 @@ pub fn derive_scalar_diagnostics_from_cst(canonical: &CanonicalCstRoot) -> Vec<s
     strings.append(&mut integers);
     strings.append(&mut floats);
     strings.append(&mut lengths);
-    strings
+    let invalid_projection = !projections.is_empty();
+    strings.append(&mut projections);
+    (strings, invalid_projection)
 }
 
 #[cfg(test)]
@@ -4468,6 +4514,16 @@ fn derive_expression(node: &CstNode) -> ScalarExpression {
                 span: wosy_syntax::byte_span(&actual),
             }
         }
+        SyntaxKind::ValueField => {
+            let receiver = actual.children().next().expect("value field receiver");
+            let name = direct_token(&actual, SyntaxKind::Identifier).expect("value field identifier");
+            ScalarExpression::ValueField {
+                receiver: Box::new(derive_expression(&receiver)),
+                name: name.text().to_owned(),
+                name_span: token_span(&name),
+                span: wosy_syntax::byte_span(&actual),
+            }
+        }
         SyntaxKind::FieldAccess => {
             if let Some(field) = actual
                 .descendants()
@@ -4839,6 +4895,7 @@ fn span_of(expression: &ScalarExpression) -> ByteSpan {
     match expression {
         ScalarExpression::Name { span, .. }
         | ScalarExpression::Member { span, .. }
+        | ScalarExpression::ValueField { span, .. }
         | ScalarExpression::Integer { span, .. }
         | ScalarExpression::Float { span, .. }
         | ScalarExpression::InvalidFloat { span }

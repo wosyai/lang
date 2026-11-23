@@ -404,6 +404,7 @@ pub(super) fn expression_span(expression: &ScalarExpression) -> ByteSpan {
         | ScalarExpression::CheckedAddress { span, .. }
         | ScalarExpression::Dereference { span, .. }
         | ScalarExpression::IndexedRead { span, .. }
+        | ScalarExpression::ValueField { span, .. }
         | ScalarExpression::StructLiteral { span, .. }
         | ScalarExpression::ArrayLiteral { span, .. }
         | ScalarExpression::Binary { span, .. }
@@ -3347,6 +3348,29 @@ fn check_expression_type_in_module(
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
     match expression {
+        ScalarExpression::ValueField { receiver, name, name_span, span } => {
+            if !matches!(receiver.as_ref(), ScalarExpression::Call { .. }) {
+                diagnostics.push(module_diagnostic(module, "B0003", "field value receiver must be a call result", *span));
+                return ScalarType::Error;
+            }
+            let ty = expression_type_in_module(
+                receiver, scope, visible_names, folded_names,
+                module, modules, diagnostics, unsafe_context, overloads, inference,
+            );
+            if is_error_type(&ty) {
+                return ScalarType::Error;
+            }
+            match checked_value_field(&ty, name, modules.iter().flat_map(|module| module.structs.iter())) {
+                Ok(field) => {
+                    inference.record_value_field(expression, &field.id);
+                    field.ty.clone()
+                }
+                Err(message) => {
+                    diagnostics.push(module_diagnostic(module, "B0003", message, *name_span));
+                    ScalarType::Error
+                }
+            }
+        }
         ScalarExpression::Name { name, span } if name == "null" => {
             diagnostics.push(module_diagnostic(
                 module,
@@ -5013,6 +5037,27 @@ fn utf8_type_from_context(
         .flat_map(|target| target.structs.iter())
         .find(|structure| structure.id == *expected_id && structure.name == "utf8")
         .map(|structure| ScalarType::Struct(structure.id.clone()))
+}
+
+fn checked_value_field<'a>(
+    receiver: &ScalarType,
+    name: &str,
+    structs: impl Iterator<Item = &'a ScalarStruct>,
+) -> Result<&'a ScalarStructField, &'static str> {
+    let ScalarType::Struct(id) = receiver else {
+        return Err("field value receiver must be a copy struct");
+    };
+    let structure = structs
+        .filter(|structure| structure.copy_policy == CopyPolicy::Copy)
+        .find(|structure| &structure.id == id)
+        .ok_or("field value receiver must be a copy struct")?;
+    let field = structure.fields.iter().find(|field| field.name == name)
+        .ok_or("unknown struct field")?;
+    if super::reference::aggregate::ordinary_value(&field.ty) {
+        Ok(field)
+    } else {
+        Err("field value must be an ordinary copy scalar")
+    }
 }
 
 fn member_field_in_module<'a>(
@@ -6684,7 +6729,7 @@ fn validate_unit_if_position(
             validate_unit_if_position(left, false, source, diagnostics);
             validate_unit_if_position(right, false, source, diagnostics);
         }
-        ScalarExpression::Unary { operand, .. } => {
+        ScalarExpression::Unary { operand, .. } | ScalarExpression::ValueField { receiver: operand, .. } => {
             validate_unit_if_position(operand, false, source, diagnostics);
         }
         ScalarExpression::Call { arguments, .. } => {
@@ -7249,7 +7294,8 @@ impl StaticUseAnalyzer {
         match expression {
             ScalarExpression::Name { name, .. } => self.use_name(name, visible),
             ScalarExpression::Member { receiver, .. } => self.use_name(receiver, visible),
-            ScalarExpression::Unary { operand, .. } => self.expression(operand, visible),
+            ScalarExpression::Unary { operand, .. } | ScalarExpression::ValueField { receiver: operand, .. } =>
+                self.expression(operand, visible),
             ScalarExpression::Binary { left, right, .. } => {
                 self.expression(left, visible);
                 self.expression(right, visible);
@@ -7905,6 +7951,29 @@ fn check_expression_type(
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
     match expression {
+        ScalarExpression::ValueField { receiver, name, name_span, span } => {
+            if !matches!(receiver.as_ref(), ScalarExpression::Call { .. }) {
+                diagnostics.push(diagnostic(program, "B0003", "field value receiver must be a call result", *span));
+                return ScalarType::Error;
+            }
+            let ty = expression_type(
+                receiver, scope, visible_names, folded_names,
+                program, diagnostics, unsafe_context, overloads, inference,
+            );
+            if is_error_type(&ty) {
+                return ScalarType::Error;
+            }
+            match checked_value_field(&ty, name, program.structs.iter()) {
+                Ok(field) => {
+                    inference.record_value_field(expression, &field.id);
+                    field.ty.clone()
+                }
+                Err(message) => {
+                    diagnostics.push(diagnostic(program, "B0003", message, *name_span));
+                    ScalarType::Error
+                }
+            }
+        }
         ScalarExpression::RawAddress { place, span } => {
             if !unsafe_context {
                 diagnostics.push(diagnostic(
