@@ -6415,7 +6415,8 @@ fn pending_fallible_operator(binding: &ScalarBinding) -> Option<ByteSpan> {
     let operator = binding.fallible_assignment?;
     let [receiver] = binding.receivers.as_slice() else { return Some(operator) };
     match (&receiver.ty, &binding.value) {
-        (ty, ScalarExpression::Integer { .. }) if is_integer_type(ty) => None,
+        (ty, ScalarExpression::Integer { .. } | ScalarExpression::Name { .. })
+            if is_integer_type(ty) => None,
         _ => Some(operator),
     }
 }
@@ -6424,7 +6425,7 @@ fn fallible_assignment_diagnostic(source: &SourceIdentity, span: ByteSpan) -> su
     source_diagnostic(
         source,
         "B0003",
-        "fallible allocation currently requires a local integer initialized by an integer literal",
+        "fallible allocation currently requires a local integer initialized by a literal or a same-type integer binding",
         span,
     )
 }

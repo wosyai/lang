@@ -9638,3 +9638,32 @@ fn guarded_integer_literal_uses_exact_declared_layout() {
         }
     }
 }
+
+#[test]
+fn guarded_fallible_named_integer_initializer_stays_single_evaluation() {
+    let source = SourceIdentity::new(
+        "project".into(), "package".into(), "src/main.w".into(), "r1".into(),
+    );
+    let text = "%%start\ni64(i64) dynamic = fn(input) {\n\ti64 result =? input;\n\tif (null != &result) { result } else { 3 }\n};\n%%end";
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let parsed = parse_source(source.clone(), text.into(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let single = crate::derive_scalar_program_with_layout(&parsed.result, layout);
+        assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+        let project = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::from_program(single.program.clone(), Vec::new())],
+            vec![source.clone()],
+        ));
+        assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+        for (project_route, llvm) in [
+            (false, emit_scalar_llvm(&single).expect("single LLVM").to_text()),
+            (true, emit_scalar_project_llvm(&project).expect("project LLVM").to_text()),
+        ] {
+            let symbol = self_tail_test_symbol(&source, project_route, "dynamic");
+            let body = self_tail_test_body(&llvm, "i64", &symbol);
+            assert_eq!(body.matches("call ptr @__wosy_core_alloc(i64 8, i64 8)").count(), 1, "{body}");
+            assert_eq!(body.matches("store i64 %input, ptr %allocation").count(), 1, "{body}");
+            assert_eq!(body.matches("call void @__wosy_core_free(ptr %allocation)").count(), 1, "{body}");
+        }
+    }
+}

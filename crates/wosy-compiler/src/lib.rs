@@ -142,7 +142,7 @@ mod tests {
             panic!("{:?}", scalar.diagnostics);
         };
         assert_eq!(diagnostic.code, "B0003");
-        assert_eq!(diagnostic.message, "fallible allocation currently requires a local integer initialized by an integer literal");
+        assert_eq!(diagnostic.message, "fallible allocation currently requires a local integer initialized by a literal or a same-type integer binding");
         let range = diagnostic.labels[0].span.range;
         assert_eq!(&text[range.start as usize..range.end as usize], "=?");
         assert!(emit_scalar_llvm(&scalar).is_err());
@@ -199,6 +199,25 @@ mod tests {
                     "{ty}: {}", validated.diagnostics.iter().map(|d| d.message.as_str()).collect::<Vec<_>>().join(", "));
                 assert!(emit_scalar_llvm(&validated).is_err());
             }
+        }
+    }
+
+    #[test]
+    fn guarded_dynamic_integer_initializer_keeps_ordinary_type_and_effect_rules() {
+        let source = SourceIdentity::new(
+            "project".into(), "package".into(), "src/main.w".into(), "r1".into(),
+        );
+        for (parameter, rhs, expected) in [
+            ("i64", "input", "expression type does not match expected type"),
+            ("i32", "produce(input)", "fallible allocation currently requires a local integer initialized by a literal or a same-type integer binding"),
+        ] {
+            let text = format!("%%start\ni32(i32) produce = fn(item) {{ item }};\ni32({parameter}) example = fn(input) {{\n\ti32 result =? {rhs};\n\tif (&result == null) {{ 3 }} else {{ result }}\n}};\n%%end");
+            let parsed = parse_source(source.clone(), text, &[]);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let checked = derive_scalar_program(&parsed.result);
+            assert!(checked.diagnostics.iter().any(|diagnostic| diagnostic.message == expected),
+                "{parameter} {rhs}: {:?}", checked.diagnostics);
+            assert!(emit_scalar_llvm(&checked).is_err());
         }
     }
 
