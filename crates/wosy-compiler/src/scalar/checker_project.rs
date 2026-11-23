@@ -8,7 +8,7 @@ use super::{
     checker_directive::{CheckedLiteralOutput, CheckerOperation, InitializerIntegerOperand, InitializerPredicate, PreparedCheckerDirective},
     checker_flow::{
         check_integer_requirement_activity, check_integer_requirements_with_calls, check_integer_return_bound_with_shows, collect_integer_requirement_failures_with_calls, MAX_ACTUAL_CALL_DEPTH, ExactCallCursor, ExactCallEffect, ExactCallProgress, concrete_integer_literal, exact_integer_call_argument, exact_integer_call_argument_at,
-        exact_integer_return_at_entry, ActualCallResult, CheckerPredicate, ExactIntegerArgument, IntegerRequirementContinuation, IntegerRequirementEntry, NestedIntegerArgument, ProjectedIntegerArgument,
+        exact_integer_return_at_entry, ActualCallResult, CheckerPredicate, ExactIntegerArgument, IntegerRequirementContinuation, IntegerRequirementEntry, NestedIntegerArgument, ProjectedCompanion, ProjectedIntegerArgument,
         proves_requirement_with_imported_root_local, ImportedEntryGuard, ImportedIntegerValues, ImportedLocal, IntegerShowProof, IntegerCheckFailure, IntegerComparison, IntegerInputs, IntegerReturn, ProofCoverage,
     },
     control::{BindingInitialization, BlockItemKind, CheckedCallSignature, ConditionalRegion, InitializationName, InitializationStorage, ModuleInitializationCallTarget, ModuleInitializationDetail, ModuleInitializationStepKind, ModuleInitializationTopology, NamespaceTarget},
@@ -1628,14 +1628,13 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                 || (!Observer::PROJECTED_FORMAL_WRITES && !body.assignments.is_empty())
                 || self.active.contains(&target)
                 || !projected_call_types_match(signature, body, &projection)
-                || (projection.fixed.is_some() && !Observer::ORDINARY_PROJECTED_PAIR)
+                || (!matches!(projection.companion, ProjectedCompanion::Unary) && !Observer::ORDINARY_PROJECTED_PAIR)
+                || (matches!(projection.companion, ProjectedCompanion::Equal) && !body.assignments.is_empty())
             {
                 return Err(ProjectCheck::Unsupported);
             }
             let values = projection.materialize().ok_or(ProjectCheck::Unsupported)?;
-            let cursor = ExactCallCursor::projected_with_fixed(
-                body, values, projection.slot, projection.fixed.map(|(_, value)| value), expected,
-            ).ok_or(ProjectCheck::Unsupported)?;
+            let cursor = ExactCallCursor::projected_arguments(body, values, &projection, expected).ok_or(ProjectCheck::Unsupported)?;
             self.active.insert(target);
             self.active_depth += 1;
             return Ok(ExactCallActivation {
@@ -1739,7 +1738,12 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
         let projected = match projected {
             ActualProjectedArguments::SymbolicAxis(projection) => {
                 let Some(collection) = collection else { return Err(ProjectCheck::Unsupported); };
-                let ProjectedIntegerArgument { slot, fixed, .. } = projection;
+                let slot = projection.slot;
+                let fixed = match projection.companion {
+                    ProjectedCompanion::Unary => None,
+                    ProjectedCompanion::Fixed((_, value)) => Some(value),
+                    ProjectedCompanion::Equal => return Err(ProjectCheck::Unsupported),
+                };
                 if ACTUAL_STARTUP || *expected != ScalarType::Unit || !projected_call_types_match(signature, body, &projection)
                     || !function.generic_parameters.is_empty() || !function.overload_arms.is_empty()
                     || !body.structure.checker_direct_targets.is_empty()
@@ -1753,7 +1757,7 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                 let values = projection.materialize().ok_or(ProjectCheck::Unsupported)?;
                 let outcome = self.collect_requirements(
                     body, &owner.source, IntegerRequirementEntry::Projected {
-                        slot, values: Rc::clone(&values), fixed: fixed.map(|(_, value)| value),
+                        slot, values: Rc::clone(&values), fixed,
                     }, collection,
                 )?;
                 return Ok(match outcome {
@@ -1879,12 +1883,14 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
 fn projected_call_types_match(
     signature: &CheckedCallSignature, body: &FunctionCallSites, projection: &ProjectedIntegerArgument<'_>,
 ) -> bool {
-    let ProjectedIntegerArgument { ty, slot, fixed, .. } = *projection;
-    match (signature.parameters.as_slice(), body.boundary.parameters.as_slice(), fixed) {
-        ([parameter], [entry], None) => slot == 0 && parameter == ty && entry.ty == *ty,
-        (parameters @ [_, _], entries @ [_, _], Some((fixed_ty, _))) if slot < 2 =>
+    let ProjectedIntegerArgument { ty, slot, companion, .. } = *projection;
+    match (signature.parameters.as_slice(), body.boundary.parameters.as_slice(), companion) {
+        ([parameter], [entry], ProjectedCompanion::Unary) => slot == 0 && parameter == ty && entry.ty == *ty,
+        (parameters @ [_, _], entries @ [_, _], ProjectedCompanion::Fixed((fixed_ty, _))) if slot < 2 =>
             parameters[slot] == *ty && entries[slot].ty == *ty
                 && parameters[1 - slot] == *fixed_ty && entries[1 - slot].ty == *fixed_ty,
+        ([first, second], [left, right], ProjectedCompanion::Equal) =>
+            slot == 0 && first == ty && second == ty && left.ty == *ty && right.ty == *ty,
         _ => false,
     }
 }
@@ -8451,6 +8457,55 @@ mod tests {
         let varied = program("<").replace("unit(i8) unused = fn(input)", "unit(i8, u8) unused = fn(input, other)")
             .replace("first(input, 9)", "first(input, other)");
         assert!(matches!(run("symbolic-pair-projection-both-varied", &varied), Err(ProjectCheck::Unsupported)));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordered_base_symbolic_call_projects_equal_arguments_without_independent_pairs() {
+        let report = |code| OUTPUT.replace(".code = 1", &format!(".code = {code}"));
+        let program = format!(r#"%%start
+            i8(i8) identity = fn(value) {{ value }};
+            i8(i8, i8) choose = fn(left, right) {{
+                if (left < 0) {{ right }} else {{ 0 }}
+            }};
+            unit(i8) guard = fn(value) {{
+                i8 copy = identity(value);
+                i8 first = choose(value, value);
+                i8 second = choose(value, copy);
+                if (value < 0) {{
+                    core.require(first < 0, {});
+                    core.require(second < 0, {});
+                }} else {{
+                    core.require(first == 0, {});
+                    core.require(second == 0, {});
+                }};
+            }};
+        %%end"#, report(5), report(7), report(11), report(13));
+        let run = |revision, text: &str| {
+            let file = source("src/main.w", revision);
+            let prepared = prepare_proof_target(&file, text).unwrap();
+            run_closed_without_named_proofs(&prepared, ScalarCheckerScope::CurrentPackage, 1)
+        };
+        let yes = run("symbolic-equal-pair-pass", &program).unwrap();
+        assert!(yes.active && yes.directives.is_empty());
+        let no = run("symbolic-equal-pair-report", &program.replace("second < 0", "second >= 0")).unwrap();
+        let [failure] = no.directives.as_slice() else { panic!("only the copied argument partition fails"); };
+        assert_eq!(failure.code(), &BigInt::from(7));
+        assert_eq!(failure.witness.row_count(), 1);
+        assert_eq!(failure.witness.equal_axes(), &[(1, 0), (2, 0), (3, 0)]);
+        let [low, high] = [-128, -1].map(BigInt::from);
+        for axis in 0..4 {
+            assert!(failure.witness.intervals_at(0, axis).unwrap().eq([(&low, &high)]));
+        }
+
+        let mixed = program.replace("i8 copy = identity(value);
+                i8 first = choose(value, value);",
+            "i8 first = choose(value, value);
+                i8 copy = identity(first);");
+        assert!(matches!(run("symbolic-equal-pair-mixed", &mixed), Err(ProjectCheck::Unsupported)));
+        let assignment = program.replace("if (left < 0) { right } else { 0 }",
+            "left = 0; if (left < 0) { right } else { 0 }");
+        assert!(matches!(run("symbolic-equal-pair-assignment", &assignment), Err(ProjectCheck::Unsupported)));
     }
 
     #[cfg(feature = "internal-checker")]

@@ -2563,12 +2563,19 @@ pub(super) fn verify_partitioned_call_return<'a>(
     Some(PartitionedCallProof { applicable, covers_guard, failure: None })
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum ProjectedCompanion<'a> {
+    Unary,
+    Fixed(ExactIntegerArgument<'a>),
+    Equal,
+}
+
 pub(super) struct ProjectedIntegerArgument<'a> {
     pub(super) ty: &'a ScalarType,
     pub(super) caller_axis: usize,
     pub(super) slot: usize,
     path: &'a IntegerInputs,
-    pub(super) fixed: Option<ExactIntegerArgument<'a>>,
+    pub(super) companion: ProjectedCompanion<'a>,
 }
 
 #[cfg(test)]
@@ -2620,20 +2627,24 @@ fn nested_integer_operand<'a>(
 
 fn nested_pair_argument<'a>(
     calls: &'a FunctionCallSites, expression: OccurrenceOrdinal, roots: &IntegerRoots<'_>, path: &'a IntegerInputs,
-    allow_projection: bool,
+    allow_projection: bool, allow_equal: bool,
 ) -> Option<NestedIntegerArgument<'a>> {
     let first = nested_integer_operand(calls, expression, 0, roots, path)?;
     let second = nested_integer_operand(calls, expression, 1, roots, path)?;
-    let (ty, caller_axis, slot, fixed) = match (first, second) {
+    let (ty, caller_axis, slot, companion) = match (first, second) {
         (NestedIntegerOperand::Exact(first), NestedIntegerOperand::Exact(second)) =>
             return Some(NestedIntegerArgument::Pair(first, second)),
         (NestedIntegerOperand::Axis(ty, axis), NestedIntegerOperand::Exact(fixed)) if allow_projection =>
-            (ty, axis, 0, fixed),
+            (ty, axis, 0, ProjectedCompanion::Fixed(fixed)),
         (NestedIntegerOperand::Exact(fixed), NestedIntegerOperand::Axis(ty, axis)) if allow_projection =>
-            (ty, axis, 1, fixed),
+            (ty, axis, 1, ProjectedCompanion::Fixed(fixed)),
+        (NestedIntegerOperand::Axis(left_ty, left), NestedIntegerOperand::Axis(right_ty, right))
+            if allow_equal && left_ty == right_ty && (left == right
+                || path.0.iter().all(|row| row.canonical_axis(left) == row.canonical_axis(right))) =>
+            (left_ty, left, 0, ProjectedCompanion::Equal),
         _ => return None,
     };
-    Some(NestedIntegerArgument::Projected(ProjectedIntegerArgument { ty, caller_axis, slot, path, fixed: Some(fixed) }))
+    Some(NestedIntegerArgument::Projected(ProjectedIntegerArgument { ty, caller_axis, slot, path, companion }))
 }
 
 fn actual_nested_argument<'a>(
@@ -2647,7 +2658,7 @@ fn actual_nested_argument<'a>(
         Some(NestedIntegerOperand::Exact(argument)) => NestedIntegerArgument::Single(Some(argument)),
         Some(NestedIntegerOperand::Axis(ty, caller_axis)) if allow_projection =>
             NestedIntegerArgument::Projected(ProjectedIntegerArgument {
-                ty, caller_axis, slot: 0, path, fixed: None,
+                ty, caller_axis, slot: 0, path, companion: ProjectedCompanion::Unary,
             }),
         _ => NestedIntegerArgument::Single(None),
     }
@@ -3387,7 +3398,7 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                     let signature = calls.checked_call_signatures.get(&expression)?;
                     let project = COLLECT && failures.as_ref().is_some_and(|collection| collection.allow_projected_calls);
                     let argument = if COLLECT && signature.parameters.len() == 2 {
-                        nested_pair_argument(calls, expression, roots, &path, project)?
+                        nested_pair_argument(calls, expression, roots, &path, project, false)?
                     } else {
                         actual_nested_argument(calls, expression, roots, &path, project)
                     };
@@ -3801,19 +3812,24 @@ impl<'a> ExactCallCursor<'a> {
     }
 
     pub(super) fn projected(calls: &'a FunctionCallSites, values: Rc<IntegerSet>, expected: &ScalarType) -> Option<Self> {
-        Self::projected_with_fixed(calls, values, 0, None, expected)
+        Self::with_row(calls, expected, IntegerRow::new(vec![values]), Some(0))
     }
 
-    pub(super) fn projected_with_fixed(
-        calls: &'a FunctionCallSites, values: Rc<IntegerSet>, slot: usize, fixed: Option<&BigInt>, expected: &ScalarType,
+    pub(super) fn projected_arguments(
+        calls: &'a FunctionCallSites, values: Rc<IntegerSet>, argument: &ProjectedIntegerArgument<'_>, expected: &ScalarType,
     ) -> Option<Self> {
-        let cells = match (slot, fixed) {
-            (0, None) => vec![values],
-            (0, Some(value)) => vec![values, Rc::new(IntegerSet::singleton(value))],
-            (1, Some(value)) => vec![Rc::new(IntegerSet::singleton(value)), values],
+        let row = match (argument.slot, argument.companion) {
+            (0, ProjectedCompanion::Unary) => IntegerRow::new(vec![values]),
+            (0, ProjectedCompanion::Fixed((_, value))) => IntegerRow::new(vec![values, Rc::new(IntegerSet::singleton(value))]),
+            (1, ProjectedCompanion::Fixed((_, value))) => IntegerRow::new(vec![Rc::new(IntegerSet::singleton(value)), values]),
+            (0, ProjectedCompanion::Equal) => {
+                let mut row = IntegerRow::new(vec![Rc::clone(&values)]);
+                row.append_alias(0, values);
+                row
+            }
             _ => return None,
         };
-        Self::with_row(calls, expected, IntegerRow::new(cells), Some(slot))
+        Self::with_row(calls, expected, row, Some(argument.slot))
     }
 
     fn with_row(calls: &'a FunctionCallSites, expected: &ScalarType, row: IntegerRow, projected_slot: Option<usize>) -> Option<Self> {
@@ -3840,7 +3856,7 @@ impl<'a> ExactCallCursor<'a> {
         collect: bool, project: bool, project_pair: bool,
     ) -> Option<NestedIntegerArgument<'borrow>> {
         if collect && parameters == 2 {
-            nested_pair_argument(calls, call, &self.roots, &self.block.path, project_pair)
+            nested_pair_argument(calls, call, &self.roots, &self.block.path, project_pair, project_pair)
         } else {
             Some(actual_nested_argument(calls, call, &self.roots, &self.block.path, project))
         }
