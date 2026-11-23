@@ -2058,7 +2058,7 @@ struct IntegerFailureCollection<'a, 'sink> {
     continuation: IntegerRequirementContinuation,
     projected: Option<(usize, IntegerRow)>,
     allow_projected_calls: bool,
-    allow_contextual_read_locals: bool,
+    allow_contextual_local_transfers: bool,
     sink: &'sink mut dyn FnMut(IntegerCheckFailure<'a>),
 }
 
@@ -2067,10 +2067,10 @@ pub(super) fn collect_integer_requirement_failures_with_calls<'a>(
     entry: IntegerRequirementEntry<'_>,
     handle_call: Option<&mut ActualCallHandler<'a, '_>>,
     allow_projected_calls: bool,
-    allow_contextual_read_locals: bool,
+    allow_contextual_local_transfers: bool,
     sink: &mut dyn FnMut(IntegerCheckFailure<'a>),
 ) -> Option<(bool, IntegerRequirementContinuation)> {
-    collect_integer_requirement_failures_in_scope(calls, entry, handle_call, allow_projected_calls, allow_contextual_read_locals, sink, ())
+    collect_integer_requirement_failures_in_scope(calls, entry, handle_call, allow_projected_calls, allow_contextual_local_transfers, sink, ())
 }
 
 #[cfg(feature = "internal-checker")]
@@ -2152,7 +2152,7 @@ pub(super) fn collect_ordered_root_literal_proof<'a, const TOTAL: bool>(
     };
     let active = if TOTAL {
         let mut collected = IntegerFailureCollection {
-            continuation: IntegerRequirementContinuation::Empty, projected: None, allow_projected_calls: false, allow_contextual_read_locals: false, sink: &mut sink,
+            continuation: IntegerRequirementContinuation::Empty, projected: None, allow_projected_calls: false, allow_contextual_local_transfers: false, sink: &mut sink,
         };
         match run_integer_callable::<false, true, _>(
             calls, integer_tail_type(calls), entry_filter, None, &mut [], None, None, Some(&mut collected), false, scope,
@@ -2204,7 +2204,7 @@ fn collect_integer_requirement_failures_in_scope<'a, Scoped: ScopedAuthoredRetur
     entry: IntegerRequirementEntry<'_>,
     handle_call: Option<&mut ActualCallHandler<'a, '_>>,
     allow_projected_calls: bool,
-    allow_contextual_read_locals: bool,
+    allow_contextual_local_transfers: bool,
     sink: &mut dyn FnMut(IntegerCheckFailure<'a>),
     scope: Scoped,
 ) -> Option<(bool, IntegerRequirementContinuation)> {
@@ -2222,7 +2222,7 @@ fn collect_integer_requirement_failures_in_scope<'a, Scoped: ScopedAuthoredRetur
         }
     };
     let mut collected = IntegerFailureCollection {
-        continuation: IntegerRequirementContinuation::Empty, projected, allow_projected_calls, allow_contextual_read_locals, sink,
+        continuation: IntegerRequirementContinuation::Empty, projected, allow_projected_calls, allow_contextual_local_transfers, sink,
     };
     let ProofCoverage::Applicable(active) = run_integer_callable::<false, true, _>(
         calls, tail, None, None, &mut [], exact, handle_call, Some(&mut collected), false, scope,
@@ -2398,7 +2398,7 @@ pub(super) fn collect_ordered_imported_root_locals<'a>(
     calls: &'a FunctionCallSites, imports: &mut [Option<ImportedLocal<'a>>], sink: &mut dyn FnMut(IntegerCheckFailure<'a>),
 ) -> Option<bool> {
     let mut failures = IntegerFailureCollection {
-        continuation: IntegerRequirementContinuation::Empty, projected: None, allow_projected_calls: false, allow_contextual_read_locals: false, sink,
+        continuation: IntegerRequirementContinuation::Empty, projected: None, allow_projected_calls: false, allow_contextual_local_transfers: false, sink,
     };
     let ProofCoverage::Applicable(active) = run_integer_callable::<true, true, _>(
         calls, integer_tail_type(calls), None, None, imports, None, None, Some(&mut failures), false, (),
@@ -2505,7 +2505,7 @@ pub(super) fn collect_exact_integer_return_requirements<'a>(
 
     let tail = integer_tail_type(calls).filter(|tail| *tail == expected)?;
     let mut failures = IntegerFailureCollection {
-        continuation: IntegerRequirementContinuation::Empty, projected: None, allow_projected_calls: false, allow_contextual_read_locals: false, sink,
+        continuation: IntegerRequirementContinuation::Empty, projected: None, allow_projected_calls: false, allow_contextual_local_transfers: false, sink,
     };
     let returned = std::cell::RefCell::new(None);
     let ProofCoverage::Applicable(active) = run_integer_callable::<false, true, _>(
@@ -3158,7 +3158,9 @@ fn walk_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, A
                 }
             }
             BlockItemKind::Assignment { group } => {
-                let (axis, value) = integer_assignment(calls, roots, group, &path)?;
+                let allow_contextual_local_transfers = || COLLECT && !USE_IMPORTED_BOUND
+                    && failures.as_deref().is_some_and(|failure| failure.allow_contextual_local_transfers);
+                let (axis, value) = integer_assignment(calls, roots, group, &path, allow_contextual_local_transfers)?;
                 path = path.overwrite(axis, value);
             }
             BlockItemKind::Binding(ref binding) => {
@@ -3299,7 +3301,7 @@ fn walk_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, A
                     path.append_local(IntegerSet::singleton(value));
                 } else {
                     if !COLLECT || USE_IMPORTED_BOUND
-                        || !failures.as_deref().is_some_and(|failure| failure.allow_contextual_read_locals)
+                        || !failures.as_deref().is_some_and(|failure| failure.allow_contextual_local_transfers)
                     {
                         return None;
                     }
@@ -3330,14 +3332,15 @@ fn integer_assignment(
     roots: &IntegerRoots<'_>,
     position: BlockPosition,
     path: &IntegerInputs,
+    allow_contextual_local_transfers: impl FnOnce() -> bool,
 ) -> Option<(usize, Rc<IntegerSet>)> {
     let (binding, replacement, rhs, destination) = checked_scalar_assignment(calls, position)?;
     let (axis, ty) = roots.lookup(binding)?;
     let value = if let Some(value) = calls.structure.checker_integer_literals.get(&rhs) {
         Rc::new(IntegerSet::singleton(value))
     } else {
-        if !calls.structure.checker_contextual_occurrences.contains(&rhs)
-            || !calls.structure.checker_contextual_occurrences.contains(&destination)
+        if !calls.structure.checker_contextual_occurrences.contains(&destination)
+            || (!calls.structure.checker_contextual_occurrences.contains(&rhs) && !allow_contextual_local_transfers())
         {
             return None;
         }

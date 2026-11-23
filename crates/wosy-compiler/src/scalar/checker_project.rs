@@ -416,7 +416,7 @@ struct ProofFreeOrderedEvidence;
 #[cfg(feature = "internal-checker")]
 impl ActualIntegerObserver for ProofFreeOrderedEvidence {
     const ENABLED: bool = false;
-    const PROOF_FREE_CONTEXTUAL_READ_LOCALS: bool = true;
+    const PROOF_FREE_CONTEXTUAL_LOCAL_TRANSFERS: bool = true;
 
     fn observe(&mut self, _: (usize, usize), _: &[&BigInt], _: &BigInt) {}
 }
@@ -1212,7 +1212,7 @@ enum InitializerProofOrigin<'a> {
 
 trait ActualIntegerObserver {
     const ENABLED: bool;
-    const PROOF_FREE_CONTEXTUAL_READ_LOCALS: bool = false;
+    const PROOF_FREE_CONTEXTUAL_LOCAL_TRANSFERS: bool = false;
 
     fn observe(&mut self, target: (usize, usize), arguments: &[&BigInt], value: &BigInt);
 
@@ -1365,7 +1365,7 @@ impl<Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> CheckedCalls<'
         collection: OrderedCallCollection<'_, '_>,
     ) -> Result<ActualCallResult, ProjectCheck> {
         let terminal_projection = matches!(&entry, IntegerRequirementEntry::Projected { .. });
-        let allow_contextual_read_locals = ACTUAL_STARTUP && Observer::PROOF_FREE_CONTEXTUAL_READ_LOCALS
+        let allow_contextual_local_transfers = ACTUAL_STARTUP && Observer::PROOF_FREE_CONTEXTUAL_LOCAL_TRANSFERS
             && matches!(&entry, IntegerRequirementEntry::Exact(_));
         let mut sink = |failure| collection.failures.borrow_mut().push_callable(body, source, failure);
         let mut nested_error = None;
@@ -1381,7 +1381,7 @@ impl<Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> CheckedCalls<'
         let handler: Option<&mut super::checker_flow::ActualCallHandler<'_, '_>> =
             if terminal_projection { None } else { Some(&mut nested) };
         let Some((active, continuation)) = collect_integer_requirement_failures_with_calls(
-            body, entry, handler, !ACTUAL_STARTUP && !terminal_projection, allow_contextual_read_locals, &mut sink,
+            body, entry, handler, !ACTUAL_STARTUP && !terminal_projection, allow_contextual_local_transfers, &mut sink,
         ) else {
             return Err(nested_error.unwrap_or(ProjectCheck::Unsupported));
         };
@@ -7949,6 +7949,68 @@ mod tests {
             let ordinary = program.replace("i8 saved = core.context.count;", "i8 saved = entry;");
             assert!(matches!(run(&ordinary, scope), Err(ScalarOrderedCheckerOutcome::Unsupported)));
             let different_type = program.replace("i8 saved = core.context.count;", "u8 saved = core.context.count;");
+            assert!(matches!(run(&different_type, scope), Err(ScalarOrderedCheckerOutcome::Invalid(_))));
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordered_contextual_integer_write_restores_the_active_place_from_its_snapshot() {
+        let app = source("src/main.w", "ordered-contextual-restore-local");
+        let report = |code: i32| OUTPUT.replace(".code = 1", &format!(".code = {code}"));
+        let program = format!(r#"%%start
+            unit(i8) test_value = fn(entry) {{
+                i8 core.context.count = 1;
+                if (entry > 0) {{
+                    i8 core.context.count = -128;
+                    i8 saved = core.context.count;
+                    core.context.count = 7;
+                    core.context.count = saved;
+                    core.require(core.context.count == -128, {});
+                    core.require(core.context.count == 7, {});
+                }};
+                core.require(core.context.count == 1, {});
+            }};
+            test_value(1);
+        %%end"#, report(7), report(11), report(17));
+        let run = |text: &str, scope| check_loaded_scalar_ordered_local_proof_contexts(
+            vec![(declarations(&app, text), Vec::new())], Vec::new(), vec![app.clone()],
+            inputs(), scope, Vec::new(),
+        );
+        for scope in [ScalarCheckerScope::MainFlowOnly, ScalarCheckerScope::CurrentPackage] {
+            let receipt = run(&program, scope).unwrap_or_else(|error| panic!("{scope:?}: {error:?}"));
+            let [failure] = receipt.directives.as_slice() else { panic!("expected one authored requirement"); };
+            assert_eq!(failure.code(), &BigInt::from(11));
+            let outer = BigInt::from(1);
+            let restored = BigInt::from(i8::MIN);
+            assert!(failure.witness.intervals_at(0, 1).unwrap().eq([(&outer, &outer)]));
+            assert!(failure.witness.intervals_at(0, 2).unwrap().eq([(&restored, &restored)]));
+            assert!(failure.witness.intervals_at(0, 3).unwrap().eq([(&restored, &restored)]));
+
+            let through_exit = program
+                .replace("core.context.count == 7,", "core.context.count != 7,")
+                .replace("core.context.count == 1,", "core.context.count == -128,");
+            let receipt = run(&through_exit, scope).unwrap_or_else(|error| panic!("{scope:?}: {error:?}"));
+            let [failure] = receipt.directives.as_slice() else { panic!("expected only the outer requirement"); };
+            assert_eq!(failure.code(), &BigInt::from(17));
+            assert!(failure.witness.intervals_at(0, 1).unwrap().eq([(&outer, &outer)]));
+            assert!(failure.witness.intervals_at(0, 2).is_none());
+
+            let literal_local = program.replace("i8 saved = core.context.count;", "i8 saved = -128;");
+            let (prepared, startup_count) = prepare_checked_package_scope(
+                vec![(declarations(&app, &literal_local), Vec::new())], vec![app.clone()], Vec::new(), inputs(), scope,
+            ).unwrap();
+            assert!(matches!(
+                run_prepared_ordered_check(&prepared, scope, startup_count, OrderedReachPolicy::Closed, ()),
+                Err(ProjectCheck::Unsupported)
+            ));
+
+            let ordinary_destination = program.replace(
+                "core.context.count = saved;", "i8 ordinary = 0; ordinary = saved;",
+            );
+            assert!(matches!(run(&ordinary_destination, scope), Err(ScalarOrderedCheckerOutcome::Unsupported)));
+
+            let different_type = literal_local.replace("i8 saved = -128;", "u8 saved = 128;");
             assert!(matches!(run(&different_type, scope), Err(ScalarOrderedCheckerOutcome::Invalid(_))));
         }
     }
