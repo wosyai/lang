@@ -49,6 +49,14 @@ enum Command {
         #[arg(long, default_value = "dev")]
         profile: String,
     },
+    #[cfg(feature = "internal-checker")]
+    Check {
+        target: Option<String>,
+        #[arg(long, default_value = "dev")]
+        profile: String,
+        #[arg(long, required = true)]
+        main_flow_only: bool,
+    },
     Run {
         target: Option<String>,
         #[arg(long, default_value = "dev")]
@@ -81,6 +89,16 @@ fn main() -> ExitCode {
                 ExitCode::from(1)
             }
         },
+        #[cfg(feature = "internal-checker")]
+        Command::Check { target, profile, main_flow_only } => {
+            match check_command(target.as_deref(), &profile, main_flow_only) {
+                Ok(code) => ExitCode::from(code),
+                Err(error) => {
+                    eprintln!("wosy: {error}");
+                    ExitCode::from(2)
+                }
+            }
+        }
         Command::Run {
             target,
             profile,
@@ -297,16 +315,16 @@ fn load_canonical_project_inputs(
 }
 
 impl CanonicalLoadFailure {
-    fn report_build(self) -> String {
+    fn report(self, purpose: &str) -> String {
         match self {
             Self::Input(error) => error,
             Self::Syntax { source, text, diagnostics } => {
                 render_diagnostics(&text, &diagnostics, &source);
-                "build rejected by syntax diagnostics".to_owned()
+                format!("{purpose} rejected by syntax diagnostics")
             }
             Self::Derivation { diagnostics, texts } => {
                 render_project_diagnostics(&diagnostics, &texts);
-                "build rejected by CST derivation diagnostics".to_owned()
+                format!("{purpose} rejected by CST derivation diagnostics")
             }
             Self::Graph { error, texts } => {
                 render_graph_diagnostics(&error, &texts);
@@ -576,7 +594,7 @@ fn compile_project(
         texts,
         ..
     } = load_canonical_project_inputs(root, project, configuration, CanonicalLoadPurpose::Build(persist_cst))
-        .map_err(CanonicalLoadFailure::report_build)?;
+        .map_err(|failure| failure.report("build"))?;
     #[cfg(test)]
     routing_observations::record(|counts| counts.preparations += 1);
     let prepared = prepare_scalar_project(
@@ -805,16 +823,97 @@ fn render_project_diagnostics(
                 )
             })
             .collect();
-        let report = Report::error()
-            .with_code(diagnostic.code.clone())
+        let mut report = Report::error()
             .with_message(diagnostic.message.clone())
             .with_labels(labels)
             .with_notes(diagnostic.notes.clone());
+        if !diagnostic.code.is_empty() {
+            report = report.with_code(diagnostic.code.clone());
+        }
         let config = term::Config::default();
         let stream = StandardStream::stderr(ColorChoice::Auto);
         let mut stream_lock = stream.lock();
         let _ = term::emit(&mut stream_lock, &config, &files, &report);
     }
+}
+
+#[cfg(feature = "internal-checker")]
+fn check_command(target: Option<&str>, profile: &str, main_flow_only: bool) -> Result<u8, String> {
+    use configured_check::ConfiguredCheckLoadError as LoadError;
+    use wosy_compiler::{Diagnostic, DiagnosticLabel, DiagnosticLabelKind, DiagnosticSeverity,
+        ScalarCheckerScope, ScalarOrderedCheckerOutcome};
+
+    if !main_flow_only {
+        return Err("check requires --main-flow-only".to_owned());
+    }
+    let current = env::current_dir().map_err(|error| error.to_string())?;
+    let root = discover_root(&current)?;
+    let receipt = configured_check::check_target(&root, target, profile, ScalarCheckerScope::MainFlowOnly, Vec::new())
+        .map_err(|failure| match failure {
+            LoadError::Canonical(failure) => failure.report("check"),
+            LoadError::Root => "check: invalid project root".to_owned(),
+            LoadError::Manifest => "check: invalid manifest".to_owned(),
+            LoadError::Target => "check: invalid target".to_owned(),
+            LoadError::Profile => "check: invalid target profile".to_owned(),
+            LoadError::Layout => "check: unsupported target layout".to_owned(),
+            LoadError::DormantPath | LoadError::Dormant(_) => "check: unexpected dormant source".to_owned(),
+        })?;
+    let report = match receipt.outcome {
+        Ok(report) => report,
+        Err(ScalarOrderedCheckerOutcome::Invalid(diagnostics)) => {
+            render_project_diagnostics(&diagnostics, &receipt.texts);
+            return Ok(2);
+        }
+        Err(_) => return Err("check: unsupported analysis; no result published".to_owned()),
+    };
+    if !report.directives.is_empty()
+        || report.symbolic_diagnostic.is_some() || !report.additional_symbolic_diagnostics.is_empty()
+    {
+        return Err("check: result requires unsupported output; no result published".to_owned());
+    }
+    if report.diagnostics.is_empty() {
+        return Ok(0);
+    }
+    let diagnostics = report.diagnostics.into_iter().map(|failure| {
+        let mut labels = vec![
+            DiagnosticLabel {
+                kind: DiagnosticLabelKind::Primary,
+                span: failure.failed_step.clone().unwrap_or_else(|| failure.goal.clone()),
+                message: "not satisfied by this call".to_owned(),
+            },
+            DiagnosticLabel {
+                kind: DiagnosticLabelKind::Secondary,
+                span: failure.proof,
+                message: "proof declaration".to_owned(),
+            },
+            DiagnosticLabel {
+                kind: DiagnosticLabelKind::Secondary,
+                span: failure.invocation.call.clone(),
+                message: "applicable call".to_owned(),
+            },
+        ];
+        if failure.failed_step.is_some() {
+            labels.push(DiagnosticLabel {
+                kind: DiagnosticLabelKind::Secondary,
+                span: failure.goal,
+                message: "proof goal".to_owned(),
+            });
+        }
+        if let Some(outer) = &failure.invocation.outer_call {
+            labels.push(DiagnosticLabel {
+                kind: DiagnosticLabelKind::Secondary,
+                span: outer.clone(),
+                message: "reached from this call".to_owned(),
+            });
+        }
+        Diagnostic {
+            code: String::new(), severity: DiagnosticSeverity::Error,
+            message: "proof obligation failed".to_owned(), labels,
+            notes: vec![format!("call returned {}", failure.invocation.returned)],
+        }
+    }).collect::<Vec<_>>();
+    render_project_diagnostics(&diagnostics, &receipt.texts);
+    Ok(1)
 }
 
 fn artifact_identity(
@@ -1694,7 +1793,7 @@ unit(u8) unused = fn(value) {{ core.require(value < 1, {{ .stdout = \"unused dep
 
     #[cfg(feature = "internal-checker")]
     #[test]
-    fn internal_checker_adapter_forwards_main_flow_scope_without_public_flag() {
+    fn internal_checker_adapter_and_opt_in_cli_preserve_main_flow_scope() {
         use wosy_compiler::{ScalarCheckerOutcome, ScalarCheckerScope};
         let (project, configuration) = routing_test_project("internal-main-flow", &[(
             "main.w", r#"%%start
@@ -1717,7 +1816,16 @@ unit(u8) unused = fn(value) {{ core.require(value < 1, {{ .stdout = \"unused dep
         assert!(matches!(observed(ScalarCheckerScope::default()), ScalarCheckerOutcome::Failed(_)));
         assert_eq!(observed(ScalarCheckerScope::MainFlowOnly), ScalarCheckerOutcome::NoChecks);
         assert!(!project.root.join(".wosy").exists());
-        assert!(Arguments::try_parse_from(["wosy", "check", "--main-flow-only"]).is_err());
+        let selected = Arguments::try_parse_from(["wosy", "check", "app", "--main-flow-only"]).unwrap();
+        assert!(matches!(selected.command, Command::Check {
+            target: Some(target), profile, main_flow_only: true,
+        } if target == "app" && profile == "dev"));
+    }
+
+    #[cfg(not(feature = "internal-checker"))]
+    #[test]
+    fn default_cli_does_not_offer_the_opt_in_checker() {
+        assert!(Arguments::try_parse_from(["wosy", "check", "app", "--main-flow-only"]).is_err());
     }
 
     #[cfg(feature = "internal-checker")]
