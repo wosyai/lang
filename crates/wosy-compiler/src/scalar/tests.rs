@@ -101,6 +101,49 @@ fn contextual_storage_preparation_resolves_prior_rhs_and_restores_outer_storage(
 }
 
 #[test]
+fn project_contextual_type_authority_preserves_distinct_same_body_storage() {
+    let first = module_source("src/first.w");
+    let second = module_source("src/second.w");
+    let declaration = |source: SourceIdentity, name: &str, ty: &str| {
+        let text = format!(
+            "%%start\n{ty}() {name} = fn {{ {ty} core.context.count = 1; core.context.count }};\n%%end"
+        );
+        let parsed = parse_source(source, text, &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let declarations = derive_scalar_declarations_from_cst(parsed.result.canonical_cst());
+        assert!(declarations.diagnostics().is_empty());
+        declarations
+    };
+    let prepare = |second_type: &str| {
+        let left = declaration(first.clone(), "left", "i8");
+        let right = declaration(second.clone(), "right", second_type);
+        let left_storage = &left.contextual_places.declarations[0];
+        let right_storage = &right.contextual_places.declarations[0];
+        assert_ne!(left_storage.binding, right_storage.binding);
+        let spans = (left_storage.declaration.clone(), right_storage.declaration.clone());
+        let prepared = prepare_scalar_project(
+            vec![(left, Vec::new()), (right, Vec::new())],
+            vec![first.clone(), second.clone()],
+            ScalarPreparationInputs { target_layout: ScalarTargetLayout::NATIVE64 },
+        );
+        (prepared, spans)
+    };
+    let (valid, _) = prepare("i8");
+    let valid = valid.unwrap_or_else(|rejection| panic!("{:?}", rejection.into_ordered_diagnostics()));
+    assert_eq!(valid.project().modules.len(), 2);
+    let (invalid, (first_span, second_span)) = prepare("i16");
+    let Err(rejection) = invalid else { panic!("accepted conflicting contextual types"); };
+    let diagnostics = rejection.into_ordered_diagnostics();
+    let [diagnostic] = diagnostics.as_slice() else { panic!("{diagnostics:?}"); };
+    assert_eq!(diagnostic.message, "contextual name must have one static type");
+    let [primary, secondary] = diagnostic.labels.as_slice() else { panic!("{diagnostic:?}"); };
+    assert_eq!(primary.kind, DiagnosticLabelKind::Primary);
+    assert_eq!(primary.span, second_span);
+    assert_eq!(secondary.kind, DiagnosticLabelKind::Secondary);
+    assert_eq!(secondary.span, first_span);
+}
+
+#[test]
 fn qualified_old_does_not_become_contextual_storage() {
     let text = "%%start\ni8(i8) identity = fn(value) { value };\nproof entry for identity(input) -> (out) ensures (out == core.old(input)) {}\n%%end";
     let parsed = parse_source(source(), text.to_owned(), &[]);

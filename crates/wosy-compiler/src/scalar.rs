@@ -3101,7 +3101,7 @@ fn project_from_declarations(
 ) -> Result<ScalarProject, ScalarProjectPreparationRejection> {
     let mut modules = Vec::with_capacity(declarations.len());
     let mut diagnostics = Vec::new();
-    let mut contextual_source = None;
+    let mut contextual_types = HashMap::<String, (ScalarType, SourceSpan)>::new();
     for (declarations, namespace_bindings) in declarations {
         let ScalarSourceDeclarations {
             source,
@@ -3111,12 +3111,28 @@ fn project_from_declarations(
             diagnostics: extraction_diagnostics,
             contextual_places,
         } = declarations;
-        if let Some(storage) = contextual_places.declarations.first() {
-            if contextual_source.replace(source.clone()).is_some() {
-                diagnostics.push(contextual::reported_error(
-                    storage.declaration.clone(),
-                    "contextual storage in multiple source modules is not supported",
-                ));
+        for index in contextual_places.first_declarations {
+            let storage = &contextual_places.declarations[index];
+            match contextual_types.get(&storage.name) {
+                Some((ty, first_span)) if *ty != storage.ty => {
+                    let mut diagnostic = contextual::reported_error(
+                        storage.declaration.clone(),
+                        "contextual name must have one static type",
+                    );
+                    diagnostic.labels.push(DiagnosticLabel {
+                        kind: DiagnosticLabelKind::Secondary,
+                        span: first_span.clone(),
+                        message: "first declaration of this contextual name".to_owned(),
+                    });
+                    diagnostics.push(diagnostic);
+                }
+                Some(_) => {}
+                None => {
+                    contextual_types.insert(
+                        storage.name.clone(),
+                        (storage.ty.clone(), storage.declaration.clone()),
+                    );
+                }
             }
         }
         let mut module = ScalarModule::new(source, items, namespace_bindings);

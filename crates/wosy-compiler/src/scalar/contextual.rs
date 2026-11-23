@@ -13,6 +13,7 @@ pub(super) struct ContextualStorage {
 #[derive(Debug, Default)]
 pub(super) struct ContextualPlaces {
     pub(super) declarations: Vec<ContextualStorage>,
+    pub(super) first_declarations: Vec<usize>,
     pub(super) resolved: HashMap<ByteSpan, ContextualOccurrence>,
 }
 
@@ -124,7 +125,9 @@ pub(super) fn prepare(
                     }
                     let id = result.declarations.len();
                     let known = declared_types.entry(name.text().to_owned()).or_insert(id);
-                    if *known != id && result.declarations[*known].ty != ty {
+                    if *known == id {
+                        result.first_declarations.push(id);
+                    } else if result.declarations[*known].ty != ty {
                         report(span, "contextual name must have one static type");
                         continue;
                     }
