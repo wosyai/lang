@@ -988,7 +988,26 @@ impl IntegerAffineTransform {
         domain.affine_unit(self.reflected, &self.offset, inverse)
     }
 
-    #[cfg(feature = "internal-checker")]
+    fn inverse(&self) -> Self {
+        Self { reflected: self.reflected, offset: if self.reflected { self.offset.clone() } else { -&self.offset } }
+    }
+
+    // self(inner(x))
+    fn compose(&self, inner: &Self) -> Self {
+        Self {
+            reflected: self.reflected ^ inner.reflected,
+            offset: if self.reflected { &self.offset - &inner.offset } else { &self.offset + &inner.offset },
+        }
+    }
+
+    fn cancels(&self, inner: &Self) -> bool {
+        if self.reflected != inner.reflected { return false; }
+        if self.reflected { return self.offset == inner.offset; }
+        use num_bigint::Sign::{Minus, NoSign, Plus};
+        matches!((self.offset.sign(), inner.offset.sign()), (Minus, Plus) | (Plus, Minus) | (NoSign, NoSign))
+            && self.offset.magnitude() == inner.offset.magnitude()
+    }
+
     fn fits(&self, domain: &IntegerSet, minimum: &BigInt, maximum: &BigInt) -> Option<()> {
         let (first, last) = domain.extremes()?;
         let (first, last) = if self.reflected {
@@ -1000,11 +1019,36 @@ impl IntegerAffineTransform {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct IntegerAffineAxes {
-    input: usize,
-    output: usize,
-    transform: Rc<IntegerAffineTransform>,
+    anchor: usize,
+    // Each member is ±anchor + offset; appended axes keep this sorted.
+    members: Vec<(usize, Rc<IntegerAffineTransform>)>,
+}
+
+const MAX_AFFINE_MEMBERS: usize = 8;
+
+impl IntegerAffineAxes {
+    fn member(&self, axis: usize) -> Option<&Rc<IntegerAffineTransform>> {
+        let i = self.members.binary_search_by_key(&axis, |(member, _)| *member).ok()?;
+        Some(&self.members[i].1)
+    }
+
+    fn contains(&self, axis: usize) -> bool {
+        axis == self.anchor || self.member(axis).is_some()
+    }
+
+    fn between(&self, from: usize, to: usize) -> Option<Rc<IntegerAffineTransform>> {
+        if from == to { return None; }
+        if from == self.anchor { return self.member(to).cloned(); }
+        let inverse = self.member(from)?.inverse();
+        Some(Rc::new(if to == self.anchor { inverse } else { self.member(to)?.compose(&inverse) }))
+    }
+}
+
+enum AffineAppend {
+    Alias(usize),
+    Member { anchor: usize, transform: Rc<IntegerAffineTransform> },
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -1036,46 +1080,113 @@ impl IntegerRow {
         self.cells.push(domain);
     }
 
-    fn append_affine(&mut self, from: usize, transform: Rc<IntegerAffineTransform>) {
-        debug_assert!(self.affine.is_none());
-        let input = self.canonical_axis(from);
-        let output = self.cells.len();
-        self.cells.push(Rc::new(transform.apply(&self.cells[input], false)));
-        self.affine = Some(Rc::new(IntegerAffineAxes { input, output, transform }));
+    fn prepare_affine(
+        &self, from: usize, domain: &IntegerSet, transform: &Rc<IntegerAffineTransform>, work: &mut usize,
+    ) -> Option<AffineAppend> {
+        let from = self.canonical_axis(from);
+        let (anchor, count, inner) = match self.affine.as_deref() {
+            Some(class) if from != class.anchor =>
+                (class.anchor, class.members.len(), Some(class.member(from)?)),
+            Some(class) => (from, class.members.len(), None),
+            None => (from, 0, None),
+        };
+        let identity = inner.map_or_else(
+            || !transform.reflected && transform.offset.bits() == 0,
+            |inner| transform.cancels(inner),
+        );
+        if identity {
+            charge_call_work(work, self.equal_axes().len().checked_add(1)?)?;
+            return Some(AffineAppend::Alias(anchor));
+        }
+        if count == MAX_AFFINE_MEMBERS { return None; }
+        // Charge mapped intervals, copy-on-write members, new member/domain
+        // storage, and any composed transform before allocating the plan.
+        let stored = if inner.is_some() { 4 } else { 3 };
+        charge_call_work(work, domain.interval_count().checked_add(count)?.checked_add(stored)?)?;
+        let transform = inner.map_or_else(|| Rc::clone(transform), |inner| Rc::new(transform.compose(inner)));
+        Some(AffineAppend::Member { anchor, transform })
+    }
+
+    fn append_affine(&mut self, plan: AffineAppend) {
+        match plan {
+            AffineAppend::Alias(anchor) => self.append_alias(anchor, Rc::clone(&self.cells[anchor])),
+            AffineAppend::Member { anchor, transform } => {
+                let class = self.affine.get_or_insert_with(|| Rc::new(IntegerAffineAxes { anchor, members: Vec::new() }));
+                debug_assert!(class.anchor == anchor && class.members.len() < MAX_AFFINE_MEMBERS);
+                let output = self.cells.len();
+                let domain = Rc::new(transform.apply(&self.cells[anchor], false));
+                Rc::make_mut(class).members.push((output, transform));
+                self.cells.push(domain);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn test_append_affine(&mut self, from: usize, transform: Rc<IntegerAffineTransform>) -> Option<()> {
+        let mut work = 0;
+        let plan = self.prepare_affine(from, &self[from], &transform, &mut work)?;
+        self.append_affine(plan);
+        Some(())
     }
 
     fn affine_touches(&self, axis: usize) -> bool {
-        self.affine.as_ref().is_some_and(|relation| {
-            let axis = self.canonical_axis(axis);
-            axis == relation.input || axis == relation.output
-        })
+        self.affine.as_ref().is_some_and(|class| class.contains(self.canonical_axis(axis)))
     }
 
-    // Each replacement already pays for its own group; an affine endpoint
-    // also transforms the narrowed set and updates the other equality group.
     fn charge_affine_replacement(&self, axis: usize, intervals: usize, work: &mut usize) -> Option<()> {
-        if self.affine_touches(axis) {
-            *work = work.checked_add(intervals)?.checked_add(self.equal_axes().len())?;
+        let axes = self.affine.as_ref().filter(|class| class.contains(self.canonical_axis(axis)))
+            .map_or(0, |class| class.members.len());
+        if axes != 0 {
+            *work = work.checked_add(intervals.checked_add(self.equal_axes().len())?.checked_mul(axes)?)?;
         }
         Some(())
     }
 
     fn replace_domain(&mut self, index: usize, set: Rc<IntegerSet>) {
         let canonical = self.canonical_axis(index);
-        if let Some(relation) = self.affine.as_deref() {
-            let related = if canonical == relation.input {
-                Some((relation.output, false))
-            } else if canonical == relation.output {
-                Some((relation.input, true))
+        if let Some(class) = self.affine.as_ref().filter(|class| class.contains(canonical)).cloned() {
+            let anchor_domain = if let Some(transform) = class.member(canonical) {
+                let anchor = Rc::new(transform.apply(&set, true));
+                self.replace_equal_group(class.anchor, Rc::clone(&anchor));
+                anchor
             } else {
-                None
+                Rc::clone(&set)
             };
-            if let Some((other, inverse)) = related {
-                let transferred = Rc::new(relation.transform.apply(&set, inverse));
-                self.replace_equal_group(other, transferred);
+            for (member, transform) in &class.members {
+                if *member != canonical {
+                    self.replace_equal_group(*member, Rc::new(transform.apply(&anchor_domain, false)));
+                }
             }
         }
         self.replace_equal_group(canonical, set);
+    }
+
+    fn linked_axes(&self, first: usize, second: usize) -> bool {
+        let first = self.canonical_axis(first);
+        let second = self.canonical_axis(second);
+        first == second || self.affine.as_ref().is_some_and(|class| class.contains(first) && class.contains(second))
+    }
+
+    fn charge_affine_pair(&self, [first, second]: [usize; 2], [left, right]: [usize; 2], work: &mut usize) -> Option<()> {
+        if self.affine.is_some() {
+            self.charge_affine_replacement(first, left, work)?;
+            if !self.linked_axes(first, second) {
+                self.charge_affine_replacement(second, right, work)?;
+            }
+        }
+        Some(())
+    }
+
+    // The pair receipt is anchored to this caller row. Reconstruct the first
+    // restriction, then validate rather than overwrite the second if linked.
+    fn replace_pair(&mut self, [first, second]: [usize; 2], [left, right]: [Rc<IntegerSet>; 2]) -> Option<()> {
+        self.replace_domain(first, left);
+        if self.linked_axes(first, second) {
+            (self[second] == right).then_some(())
+        } else {
+            self.replace_domain(second, right);
+            Some(())
+        }
     }
 
     fn replace_equal_group(&mut self, canonical: usize, set: Rc<IntegerSet>) {
@@ -1106,10 +1217,14 @@ impl IntegerRow {
         }
     }
 
-    fn entry_affine(&self, formal: usize, axis: usize) -> Option<&Rc<IntegerAffineTransform>> {
-        let relation = self.affine.as_deref()?;
-        (self.canonical_axis(axis) == relation.output && self.entry_alias(formal, relation.input))
-            .then_some(&relation.transform)
+    fn entry_affine(&self, formal: usize, axis: usize) -> Option<Rc<IntegerAffineTransform>> {
+        let class = self.affine.as_deref()?;
+        let from = match self.entry.as_deref() {
+            None => formal,
+            Some(ProjectedEntry::Linked(root)) => *root,
+            Some(ProjectedEntry::Detached(_)) => return None,
+        };
+        class.between(from, self.canonical_axis(axis))
     }
 
     fn entry_key(&self) -> Option<Result<usize, *const IntegerSet>> {
@@ -1153,8 +1268,13 @@ impl IntegerRow {
                 self.entry = Some(Rc::new(ProjectedEntry::Detached(Rc::clone(&self.cells[*axis]))));
             }
         }
-        if self.affine.as_ref().is_some_and(|relation| relation.output >= depth) {
-            self.affine = None;
+        if let Some(class) = &mut self.affine {
+            let keep = class.members.partition_point(|(member, _)| *member < depth);
+            if keep == 0 {
+                self.affine = None;
+            } else if keep < class.members.len() {
+                Rc::make_mut(class).members.truncate(keep);
+            }
         }
         self.cells.truncate(depth);
         if let Some(equality) = &mut self.equal_axes {
@@ -1327,7 +1447,7 @@ impl IntegerInputs {
                 *work = work.checked_add(row.len())?;
             }
             if extra != 0 && row.affine_touches(axis) {
-                *work = work.checked_add(extra.checked_mul(4)?)?;
+                *work = work.checked_add(extra.checked_mul(4)?.checked_mul(row.affine.as_ref()?.members.len())?)?;
             }
             if *work > MAX_PARTITION_TRANSFER_WORK {
                 return None;
@@ -1611,15 +1731,11 @@ impl IntegerInputs {
         self.0.iter().any(|row| {
             row.len() == coordinates.len()
                 && row.equal_axes().iter().all(|&(alias, root)| Into::<BigInt>::into(coordinates[alias]) == Into::<BigInt>::into(coordinates[root]))
-                && row.affine.as_ref().is_none_or(|relation| {
-                    let input: BigInt = coordinates[relation.input].into();
-                    let output: BigInt = coordinates[relation.output].into();
-                    output == if relation.transform.reflected {
-                        &relation.transform.offset - input
-                    } else {
-                        input + &relation.transform.offset
-                    }
-                })
+                && row.affine.as_ref().is_none_or(|class| class.members.iter().all(|(member, transform)| {
+                    let input: BigInt = coordinates[class.anchor].into();
+                    let output: BigInt = coordinates[*member].into();
+                    output == if transform.reflected { &transform.offset - input } else { input + &transform.offset }
+                }))
                 && row.iter().zip(coordinates).all(|(axis, value)| {
                     axis.split(&BinaryOperator::Equal, &(*value).into())
                         .is_some_and(|(matching, _)| !matching.is_empty())
@@ -3564,9 +3680,9 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                 if let Some(relation) = row.affine.as_deref() {
                     // A single prepared cut can split one interval. Charge both pieces, both
                     // directions of transfer, and equality-group propagation up front.
-                    let intervals = row[relation.input].interval_count().checked_add(1)?;
+                    let intervals = row[relation.anchor].interval_count().checked_add(1)?;
                     let aliases = row.equal_axes().len().checked_add(1)?;
-                    *work = work.checked_add(intervals.checked_add(aliases)?.checked_mul(4)?)?;
+                    *work = work.checked_add(intervals.checked_add(aliases)?.checked_mul(4)?.checked_mul(relation.members.len())?)?;
                 }
                 if *work > MAX_PARTITION_TRANSFER_WORK { return None; }
             }
@@ -4166,6 +4282,7 @@ impl<'a> ExactCallCursor<'a> {
         }
         let mut work: usize = 0;
         let mut affine_work = argument.affine_work.as_deref_mut();
+        let mut seeded_affine = false;
         let rows = argument.path.0.iter().enumerate().map(|(index, row)| {
             let cost = 3usize.checked_add(row[axes[0]].interval_count())?
                 .checked_add(row[axes[1]].interval_count())?;
@@ -4179,13 +4296,18 @@ impl<'a> ExactCallCursor<'a> {
             let first_axis = row.canonical_axis(axes[0]);
             let second_axis = row.canonical_axis(axes[1]);
             let same = first_axis == second_axis;
-            // Pair entry rows can represent equality but not a nonidentity
-            // affine dependency between the two projected endpoints.
-            if !same && row.affine.as_ref().is_some_and(|edge|
-                (first_axis == edge.input && second_axis == edge.output)
-                || (first_axis == edge.output && second_axis == edge.input)) {
-                return None;
-            }
+            let projected_class = if let Some(class) = row.affine.as_deref() {
+                if !same && class.contains(first_axis) && class.contains(second_axis) {
+                    charge_call_work(affine_work.as_deref_mut()?, 1)?;
+                    let transform = class.between(first_axis, second_axis)?;
+                    seeded_affine = true;
+                    Some(Rc::new(IntegerAffineAxes { anchor: 0, members: vec![(1, transform)] }))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
             let first = Rc::clone(&row[axes[0]]);
             let second = Rc::clone(&row[axes[1]]);
             let mut next = if same {
@@ -4195,10 +4317,13 @@ impl<'a> ExactCallCursor<'a> {
             } else {
                 IntegerRow::new(vec![first, second])
             };
+            next.affine = projected_class;
             next.projected_from = u16::try_from(index.checked_add(1)?).ok()?;
             Some(next)
         }).collect::<Option<Vec<_>>>()?;
-        Self::with_rows(calls, expected, IntegerInputs(rows), None, Some(axes))
+        let mut child = Self::with_rows(calls, expected, IntegerInputs(rows), None, Some(axes))?;
+        if seeded_affine { child.roots.affine_work = Some(0); }
+        Some(child)
     }
 
     fn with_row(calls: &'a FunctionCallSites, expected: &ScalarType, row: IntegerRow, projected_slot: Option<usize>) -> Option<Self> {
@@ -4286,68 +4411,63 @@ impl<'a> ExactCallCursor<'a> {
                     let row = original.get(index)?;
                     work = work.checked_add(row.len())?.checked_add(2usize.checked_mul(row.equal_axes().len())?)?
                         .checked_add(survivor[0].interval_count())?.checked_add(survivor[1].interval_count())?;
-                    if row.affine.is_some() {
-                        for (slot, axis) in projected.caller_axes.iter().copied().enumerate() {
-                            row.charge_affine_replacement(axis, survivor[slot].interval_count(), &mut work)?;
-                        }
-                    }
+                    row.charge_affine_pair(projected.caller_axes,
+                        [survivor[0].interval_count(), survivor[1].interval_count()], &mut work)?;
                     if work > MAX_PARTITION_TRANSFER_WORK { return None; }
                 }
                 if let Some(retained) = &mut self.roots.affine_work { *retained = work; }
-                let [first, second] = projected.caller_axes;
                 self.block.path.0 = projected.survivors.0.iter().map(|survivor| {
                     let mut row = original[usize::from(survivor.projected_from) - 1].clone();
-                    row.replace_domain(first, Rc::clone(&survivor[0]));
-                    row.replace_domain(second, Rc::clone(&survivor[1]));
-                    row
-                }).collect();
+                    row.replace_pair(projected.caller_axes, [Rc::clone(&survivor[0]), Rc::clone(&survivor[1])])?;
+                    Some(row)
+                }).collect::<Option<Vec<_>>>()?;
             }
             (ExactCallEffect::Integer { binding, ty, .. }, ActualCallResult::PartitionedIntegerPair(projected)) => {
                 let original = &self.block.path.0;
                 let mut work = self.roots.affine_work.unwrap_or(0);
-                for piece in &projected.pieces {
+                let mut uses_affine = self.roots.affine_work.is_some();
+                let mut joined = Vec::new();
+                for piece in projected.pieces {
                     let index = usize::from(piece.anchor).checked_sub(1)?;
                     let row = original.get(index)?;
-                    work = work.checked_add(row.len().checked_add(1)?)?
+                    let intervals = [piece.inputs[0].interval_count(), piece.inputs[1].interval_count()];
+                    let base = row.len().checked_add(1)?
                         .checked_add(3usize.checked_mul(row.equal_axes().len())?)?
-                        .checked_add(piece.inputs[0].interval_count())?.checked_add(piece.inputs[1].interval_count())?;
-                    if row.affine.is_some() {
-                        for (slot, axis) in projected.caller_axes.iter().copied().enumerate() {
-                            row.charge_affine_replacement(axis, piece.inputs[slot].interval_count(), &mut work)?;
-                        }
-                    }
-                    match &piece.output {
+                        .checked_add(intervals[0])?.checked_add(intervals[1])?;
+                    charge_call_work(&mut work, base)?;
+                    row.charge_affine_pair(projected.caller_axes, intervals, &mut work)?;
+                    if work > MAX_PARTITION_TRANSFER_WORK { return None; }
+                    let plan = match &piece.output {
                         IntegerPairPartitionOutput::InputAlias(slot) | IntegerPairPartitionOutput::InputAffine(slot, _) => {
                             if self.roots.axes.get(projected.caller_axes[*slot])?.1 != ty { return None; }
-                            work = work.checked_add(1)?;
-                            if matches!(&piece.output, IntegerPairPartitionOutput::InputAffine(..)) {
-                                if row.affine.is_some() { return None; }
-                                work = work.checked_add(piece.inputs[*slot].interval_count())?;
-                                self.roots.affine_work.get_or_insert(0);
+                            charge_call_work(&mut work, 1)?;
+                            if let IntegerPairPartitionOutput::InputAffine(_, transform) = &piece.output {
+                                let (min, max) = super::typecheck::integer_bounds(ty)?;
+                                transform.fits(&piece.inputs[*slot], &min, &max)?;
+                                uses_affine = true;
+                                Some(row.prepare_affine(
+                                    projected.caller_axes[*slot], &piece.inputs[*slot], transform, &mut work,
+                                )?)
+                            } else {
+                                None
                             }
                         }
-                        IntegerPairPartitionOutput::Singleton(_) => {}
-                    }
-                    if work > MAX_PARTITION_TRANSFER_WORK { return None; }
-                }
-                if let Some(retained) = &mut self.roots.affine_work { *retained = work; }
-                let [first, second] = projected.caller_axes;
-                self.block.path.0 = projected.pieces.into_iter().map(|piece| {
-                    let mut row = original[usize::from(piece.anchor) - 1].clone();
-                    let [left, right] = piece.inputs;
-                    row.replace_domain(first, left);
-                    row.replace_domain(second, right);
+                        IntegerPairPartitionOutput::Singleton(_) => None,
+                    };
+                    let mut row = row.clone();
+                    row.replace_pair(projected.caller_axes, piece.inputs)?;
                     match piece.output {
                         IntegerPairPartitionOutput::Singleton(output) => row.push(output),
                         IntegerPairPartitionOutput::InputAlias(slot) => {
                             let axis = projected.caller_axes[slot];
                             row.append_alias(axis, Rc::clone(&row[axis]));
                         }
-                        IntegerPairPartitionOutput::InputAffine(slot, transform) =>
-                            row.append_affine(projected.caller_axes[slot], transform),
+                        IntegerPairPartitionOutput::InputAffine(..) => row.append_affine(plan?),
                     }
-                    row
-                }).collect();
+                    joined.push(row);
+                }
+                self.block.path.0 = joined;
+                if uses_affine { self.roots.affine_work = Some(work); }
                 self.roots.add(binding, ty);
             }
             (ExactCallEffect::Integer { binding, ty, .. }, ActualCallResult::PartitionedInteger(pieces)) => {
@@ -4366,9 +4486,10 @@ impl<'a> ExactCallCursor<'a> {
                 let row_intervals = rows.iter().try_fold(0usize, |sum, row| sum.checked_add(row[axis].interval_count()))?;
                 let comparisons = row_intervals.checked_mul(pieces.len())?
                     .checked_add(piece_intervals.checked_mul(rows.len())?)?;
+                let bounds = if affine { Some(super::typecheck::integer_bounds(ty)?) } else { None };
                 let mut retained = self.roots.affine_work;
                 if affine || retained.is_some() {
-                    charge_call_work(retained.get_or_insert(0), comparisons)?;
+                    charge_call_work(retained.get_or_insert(0), comparisons.checked_add(rows.len().checked_mul(pieces.len())?)?)?;
                 } else {
                     let row_copies = rows.len().checked_mul(pieces.len())?.checked_mul(cells)?;
                     let alias_work = rows.iter().try_fold(0usize, |sum, row| sum.checked_add(row.equal_axes().len()))?
@@ -4386,10 +4507,7 @@ impl<'a> ExactCallCursor<'a> {
                             IntegerIntersection::Empty => continue,
                             IntegerIntersection::Changed(values) => Some(values),
                         };
-                        let add_edge = matches!(&piece.output, IntegerPartitionOutput::InputAffine(_));
-                        // One edge per row: disjoint paths may each introduce an edge,
-                        // but never replace an existing relation on a feasible join.
-                        if add_edge && row.affine.is_some() { return None; }
+                        let mut plan = None;
                         if let Some(work) = &mut retained {
                             charge_call_work(work, cells)?;
                             if let Some(values) = &narrowed {
@@ -4399,9 +4517,11 @@ impl<'a> ExactCallCursor<'a> {
                             if matches!(&piece.output, IntegerPartitionOutput::InputAlias) {
                                 charge_call_work(work, row.equal_axes().len())?;
                             }
-                            if add_edge {
+                            if let IntegerPartitionOutput::InputAffine(transform) = &piece.output {
+                                let (min, max) = bounds.as_ref()?;
                                 let values = narrowed.as_ref().unwrap_or_else(|| row[axis].as_ref());
-                                charge_call_work(work, values.interval_count().checked_add(1)?)?;
+                                transform.fits(values, min, max)?;
+                                plan = Some(row.prepare_affine(axis, values, transform, work)?);
                             }
                             if *work > MAX_PARTITION_TRANSFER_WORK { return None; }
                         }
@@ -4412,7 +4532,7 @@ impl<'a> ExactCallCursor<'a> {
                         match &piece.output {
                             IntegerPartitionOutput::Singleton(output) => next.push(Rc::clone(output)),
                             IntegerPartitionOutput::InputAlias => next.append_alias(axis, Rc::clone(&next[axis])),
-                            IntegerPartitionOutput::InputAffine(transform) => next.append_affine(axis, Rc::clone(transform)),
+                            IntegerPartitionOutput::InputAffine(_) => next.append_affine(plan?),
                         }
                         joined.push(next);
                     }
@@ -4485,7 +4605,7 @@ impl<'a> ExactCallCursor<'a> {
                                 let (slot, transform) = (0..2).find_map(|slot| {
                                     row.entry_affine(slot, axis).map(|transform| (slot, transform))
                                 })?;
-                                IntegerPairPartitionOutput::InputAffine(slot, Rc::clone(transform))
+                                IntegerPairPartitionOutput::InputAffine(slot, transform)
                             } else {
                                 return None;
                             }
@@ -4534,7 +4654,7 @@ impl<'a> ExactCallCursor<'a> {
                             } else if row[axis].singleton_value().is_some() {
                                 IntegerPartitionOutput::Singleton(Rc::clone(&row[axis]))
                             } else if allow_ordinary_computed_returns {
-                                IntegerPartitionOutput::InputAffine(Rc::clone(row.entry_affine(slot, axis)?))
+                                IntegerPartitionOutput::InputAffine(row.entry_affine(slot, axis)?)
                             } else {
                                 return None;
                             }
@@ -4603,17 +4723,13 @@ fn computed_projected_value(
     };
     let (origin, inner) = match formal {
         Some(formal) => entry_relation(formal)?,
-        None => (0..2).find_map(entry_relation)?,
+        None => (0..2).find(|slot| row.entry_alias(*slot, axis)).map(|slot| (slot, None))
+            .or_else(|| (0..2).find_map(entry_relation))?,
     };
     let mut transform = IntegerAffineTransform { reflected, offset };
     transform.fits(&row[axis], min, max)?;
     if let Some(inner) = inner {
-        if transform.reflected {
-            transform.offset -= &inner.offset;
-        } else {
-            transform.offset += &inner.offset;
-        }
-        transform.reflected ^= inner.reflected;
+        transform = transform.compose(&inner);
     }
     if !transform.reflected && transform.offset.bits() == 0 {
         Some(ComputedProjectedValue::Identity(origin))
@@ -4744,6 +4860,64 @@ fn integer_local<'a>(
 
 
 #[test]
+fn affine_class_composes_and_refines_from_non_anchor_members() {
+    let domain = IntegerSet::from_type(&ScalarType::U8).unwrap()
+        .keep(&BinaryOperator::LessEqual, &4.into()).unwrap();
+    let reflection = Rc::new(IntegerAffineTransform { reflected: true, offset: 4.into() });
+    let mut row = IntegerRow::new(vec![Rc::new(domain)]);
+    row.test_append_affine(0, Rc::clone(&reflection)).unwrap();
+    row.test_append_affine(1, Rc::new(IntegerAffineTransform { reflected: false, offset: 1.into() })).unwrap();
+    row.test_append_affine(1, reflection).unwrap();
+    assert_eq!(row.canonical_axis(3), 0);
+    let mut rows = IntegerInputs(vec![row]);
+    assert!(rows.includes_signed(&[3i128, 1, 2, 3]));
+    assert!(!rows.includes_signed(&[3i128, 2, 2, 3]));
+    rows.restrict_axis(2, &IntegerSet::singleton(&2.into()));
+    for (axis, value) in [3, 1, 2, 3].into_iter().enumerate() {
+        assert_eq!(rows.singleton_at(axis), Some(&BigInt::from(value)));
+    }
+    rows.0[0].truncate(2);
+    assert_eq!(rows.0[0].affine.as_ref().unwrap().members.len(), 1);
+    rows.0[0].truncate(1);
+    assert!(rows.0[0].affine.is_none());
+}
+
+#[test]
+fn affine_class_cap_allows_identity_alias_and_releases_truncated_members() {
+    let domain = IntegerSet::from_type(&ScalarType::U8).unwrap()
+        .keep(&BinaryOperator::LessEqual, &4.into()).unwrap();
+    let mut row = IntegerRow::new(vec![Rc::new(domain)]);
+    for index in 1..=MAX_AFFINE_MEMBERS {
+        row.test_append_affine(0, Rc::new(IntegerAffineTransform { reflected: false, offset: index.into() })).unwrap();
+    }
+    assert_eq!(row.affine.as_ref().unwrap().members.len(), MAX_AFFINE_MEMBERS);
+    let next = Rc::new(IntegerAffineTransform { reflected: false, offset: (MAX_AFFINE_MEMBERS + 1).into() });
+    assert_eq!(row.test_append_affine(0, Rc::clone(&next)), None);
+    let cancel = Rc::new(IntegerAffineTransform { reflected: false, offset: -BigInt::from(MAX_AFFINE_MEMBERS) });
+    row.test_append_affine(MAX_AFFINE_MEMBERS, cancel).unwrap();
+    assert_eq!(row.canonical_axis(MAX_AFFINE_MEMBERS + 1), 0);
+    row.replace_domain(MAX_AFFINE_MEMBERS, Rc::new(IntegerSet::singleton(&(MAX_AFFINE_MEMBERS + 2).into())));
+    assert_eq!(row[0].singleton_value(), Some(&2.into()));
+    assert_eq!(row[MAX_AFFINE_MEMBERS + 1].singleton_value(), Some(&2.into()));
+    row.truncate(MAX_AFFINE_MEMBERS);
+    assert_eq!(row.affine.as_ref().unwrap().members.len(), MAX_AFFINE_MEMBERS - 1);
+    assert_eq!(row.test_append_affine(0, next), Some(()));
+}
+
+#[test]
+fn affine_class_pair_receipts_do_not_overwrite_a_mismatched_dependent_domain() {
+    let mut row = IntegerRow::new(vec![Rc::new(IntegerSet::from_type(&ScalarType::I8).unwrap())]);
+    let transform = Rc::new(IntegerAffineTransform { reflected: true, offset: (-1).into() });
+    row.test_append_affine(0, transform).unwrap();
+    let set = |number: i8| Rc::new(IntegerSet::singleton(&number.into()));
+    let mut inconsistent = row.clone();
+    assert_eq!(inconsistent.replace_pair([1, 0], [set(2), set(3)]), None);
+    assert_eq!(row.replace_pair([1, 0], [set(2), set(-3)]), Some(()));
+    assert_eq!(row[0], set(-3));
+    assert_eq!(row[1], set(2));
+}
+
+#[test]
 fn affine_disjunction_preflights_three_piece_require_witness() {
     let [zero, one, two, three, four, five] = [0, 1, 2, 3, 4, 5].map(BigInt::from);
     let equal = IntegerRelation::from_operator(&BinaryOperator::Equal).unwrap();
@@ -4751,7 +4925,7 @@ fn affine_disjunction_preflights_three_piece_require_witness() {
     assert_eq!(cuts.max_added_intervals(), 2);
     let domain = IntegerSet::from_type(&ScalarType::U8).unwrap().keep(&BinaryOperator::LessEqual, &four).unwrap();
     let mut row: IntegerRow = std::iter::once(Rc::new(domain)).collect();
-    row.append_affine(0, Rc::new(IntegerAffineTransform { reflected: true, offset: four }));
+    row.test_append_affine(0, Rc::new(IntegerAffineTransform { reflected: true, offset: four })).unwrap();
     let paths = IntegerInputs(vec![row; 8]);
 
     let mut work = MAX_PARTITION_TRANSFER_WORK - 8 * (2 + 4);

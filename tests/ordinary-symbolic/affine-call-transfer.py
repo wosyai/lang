@@ -64,7 +64,6 @@ cases = [
     ("reversed-fixed-companion-preserves-exact-counterexample",fixed.replace("input == 3", "input == 0"),32,b"LINK"),
     ("unit-callee-failure-retains-direct-and-nested-symbolic-contexts",callee_failure,30,b"PRUNEPRUNE"),
     ("unit-callee-failure-is-not-swallowed-when-callee-is-used",callee_failure_through_caller,30,b"PRUNE"),
-    ("second-affine-producing-call-remains-unsupported",make(f'i8 again = affine(value); core.require(again > 0, {report(41,"SECOND")});'),2,b"unsupported analysis"),
 ]
 # All rows with value=1 originate at input=3. Merely intersecting the
 # input/output marginals (or losing the anchor) yields a false witness.
@@ -108,8 +107,84 @@ for name,program,correct,incorrect,code,label in [
     ("unary-integer",unary_integer,"original == 3","original == 2",40,b"UNARY"),
 ]:
     cases.extend([(name,program,0,b""),(name+"-witness",program.replace(correct,incorrect),code,label)])
-cases.append(("dependent-endpoints-not-independent",paired.replace("pick(value, side)", "pick(value, input)"),
-              2,b"unsupported analysis"))
+# Use the second formal's cut to force inverse transport inside the child.
+# Startup reaches the helper with an exact passing pair, ensuring any reported
+# CHILD failure comes from the unused caller rather than a standalone root.
+dependent_unit = make(f"""
+    prune(input, value);
+    if (input >= 0) {{ if (input <= 4) {{
+        core.require(value == 1 || value == 3, {report(42,"PARENT")});
+    }}; }};
+""", f"""unit(i8,i8) prune = fn(n,mapped) {{
+    if (n >= 0) {{
+        if (n <= 4) {{
+            core.narrow(mapped == 1 || mapped == 3, {report(43,"CUT")});
+            core.require(n == 1 || n == 3, {report(44,"CHILD")});
+        }};
+    }};
+}};""").replace("%%end", "prune(1,3);\n    %%end")
+# Obtain an actual tracked alias through the ordinary integer return lane.
+# A direct nonliteral lexical initializer is outside this checker slice.
+dependent_integer = make(f"""
+    i8 alias = echo(value);
+    i8 picked = pick(alias, input);
+    if (picked == 1) {{ core.require(input == 3, {report(45,"REVERSED")}); }};
+    if (picked == 8) {{ core.require(input != 3, {report(46,"PARTITION")}); }};
+""", """
+    i8(i8) echo = fn(n) { n };
+    i8(i8,i8) pick = fn(mapped,n) { if (n == 3) { mapped } else { 8 } };
+""")
+composed = make(f"""
+    i8 image = bump(value);
+    if (input == 1) {{
+        core.require(value == 3, {report(47,"FORWARD3")});
+        core.require(image == 4, {report(47,"FORWARD3")});
+    }};
+    if (image == 2) {{
+        core.require(value == 1, {report(48,"BACK3")});
+        core.require(input == 3, {report(48,"BACK3")});
+    }};
+    if (value == 2) {{
+        core.require(image == 3, {report(49,"MIDDLE3")});
+        core.require(input == 2, {report(49,"MIDDLE3")});
+    }};
+""", "i8(i8) bump = fn(n) { n + 1 };")
+identity = make(f"""
+    i8 again = affine(value);
+    if (input >= 0) {{ if (input <= 4) {{
+        if (again == 2) {{
+            core.require(input == 2, {report(51,"IDENTITY")});
+            core.require(value == 2, {report(51,"IDENTITY")});
+        }};
+    }}; }};
+""")
+paired_composition = make(f"""
+    i8 image = bump(value, input);
+    if (image == 2) {{
+        core.require(input == 3, {report(52,"PAIRSUM")});
+        core.require(value == 1, {report(52,"PAIRSUM")});
+    }};
+""", "i8(i8,i8) bump = fn(mapped,n) { if (n >= 0) { if (n <= 4) { mapped + 1 } else { 8 } } else { 8 } };")
+independent_affine = make(f"""
+    i8 second = affine(side);
+    if (second == 1) {{ core.require(value >= -9, {report(53,"OTHER")}); }};
+""").replace("unit(i8) unused = fn(input)", "unit(i8,i8) unused = fn(input,side)")
+overflow = make(f"""
+    i8 image = bump(value);
+    core.require(image > 0, {report(54,"OVERFLOW")});
+""", "i8(i8) bump = fn(n) { n + 127 };")
+for name,program,correct,incorrect,code,label in [
+    ("dependent-unit",dependent_unit,"core.require(n == 1 || n == 3","core.require(n == 1",44,b"CHILD"),
+    ("dependent-integer-reversed-alias",dependent_integer,"input == 3,","input == 2,",45,b"REVERSED"),
+    ("composed-unary",composed,"require(input == 3","require(input == 1",48,b"BACK3"),
+    ("composed-identity",identity,"require(input == 2","require(input == 1",51,b"IDENTITY"),
+    ("composed-dependent-pair",paired_composition,"require(input == 3","require(input == 2",52,b"PAIRSUM"),
+]:
+    cases.extend([(name,program,0,b""),(name+"-witness",program.replace(correct,incorrect),code,label)])
+cases.extend([
+    ("independent-second-affine-class-remains-unsupported",independent_affine,2,b"unsupported analysis"),
+    ("composed-affine-overflow-remains-unsupported",overflow,2,b"unsupported analysis"),
+])
 cases.append(("previously-unsupported-lexical-exact-assertion", make(f"""
     i8 fixed = echo(input);
     core.require(fixed == 2, {report(30,"EXACT")});
