@@ -11286,7 +11286,9 @@ fn derive_module_reference_origins(
     if errors.is_empty() && !mixed_targets.is_empty() {
         let mut owners = mixed_producers.iter().filter_map(|&(position, declaration, lanes)| {
             let result = &updates[position].1;
-            (mixed_targets.contains(&declaration) && result.aggregate.proves_mixed_local_owner(&result.cfg, lanes))
+            (mixed_targets.contains(&declaration)
+                && (result.aggregate.proves_mixed_local_owner(&result.cfg, lanes)
+                    || result.aggregate.admits_mixed_branch_return()))
                 .then_some(declaration)
         }).collect::<HashSet<_>>();
         if !owners.is_empty() {

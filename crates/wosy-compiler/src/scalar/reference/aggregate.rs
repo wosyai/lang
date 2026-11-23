@@ -716,7 +716,7 @@ struct MixedArmProjection {
     outputs: [CfgPointId; 2],
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct MixedBranchReturn {
     shape: MixedArmProjection,
     allocations: [BlockPosition; 2],
@@ -788,6 +788,10 @@ impl AggregateFlowResult {
     ) -> Option<(OccurrenceOrdinal, [CfgPointId; 2], [BlockPosition; 2])> {
         let plan = self.mixed_branch_return.as_ref()?;
         Some((plan.shape.conditional, plan.shape.outputs, plan.allocations))
+    }
+
+    pub(super) fn admits_mixed_branch_return(&self) -> bool {
+        self.mixed_branch_return.is_some()
     }
 
     pub(super) fn proves_mixed_local_owner(&self, cfg: &ScalarReferenceCfg, lanes: MixedOwnerResultLanes) -> bool {
@@ -1952,6 +1956,7 @@ impl AggregateFlowFacts {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ClosedReturn {
+    MixedBranch,
     Allocation { block: usize, item: usize },
     Forward { call: OccurrenceOrdinal },
 }
@@ -2034,6 +2039,7 @@ pub(crate) struct ClosedBody {
     pub(crate) checked_backing_consumer: Option<(usize, usize)>,
     pub(crate) checked_backing_optional: bool,
     pub(crate) returning: Option<ClosedReturn>,
+    mixed_branch_return: Option<Box<MixedBranchReturn>>,
     pub(crate) ordinary_result: bool,
     pub(crate) ordinary_calls: BTreeMap<usize, SourceSpan>,
     pub(crate) calls: BTreeMap<usize, ClosedCall>,
@@ -2047,6 +2053,21 @@ pub(crate) struct ClosedBody {
     pub(crate) literal_array: Option<ClosedLiteralArray>,
     pub(crate) input_release: Option<CfgPointId>,
     pub(crate) input_calls: BTreeMap<usize, (usize, ClosedInput)>,
+}
+
+impl ClosedBody {
+    pub(crate) fn mixed_branch_conditional(&self) -> Option<usize> {
+        self.mixed_branch_return.as_ref().map(|plan| plan.shape.conditional.0)
+    }
+
+    pub(crate) fn mixed_branch_owner_lane(&self) -> Option<usize> {
+        self.mixed_branch_return.as_ref().map(|plan| plan.shape.owner_lane)
+    }
+
+    pub(crate) fn mixed_branch_arm(&self, block: usize) -> Option<(usize, usize)> {
+        self.mixed_branch_return.as_ref()?.allocations.iter().enumerate()
+            .find_map(|(arm, allocation)| (allocation.block.0 == block).then_some((arm, allocation.item)))
+    }
 }
 
 pub(crate) type BodyKey = (usize, usize, Option<usize>);
@@ -3393,43 +3414,38 @@ fn closed_aggregates<'a>(
                     body.source
                 ));
             };
-            if values.any(|candidate| candidate != Some(owner)) {
-                if let Some(branch) = &facts.mixed_branch_return {
-                    return Err(format!(
-                        "aggregate return owner has conflicting paths in {:?}; branch transfer for output {} is not yet lowered",
-                        body.source, branch.shape.owner_lane,
-                    ));
+            let route = if values.any(|candidate| candidate != Some(owner)) {
+                if facts.mixed_branch_return.is_none() {
+                    return Err(format!("aggregate return owner has conflicting paths in {:?}", body.source));
                 }
-                return Err(format!(
-                    "aggregate return owner has conflicting paths in {:?}",
-                    body.source
-                ));
-            }
-            let route = match owner {
-                OwnerSource::Formal(_) => {
-                    return Err(format!("return of moved formal is not closed in {:?}", body.source));
-                }
-                OwnerSource::Allocation(point) => {
-                    let &(block, item) = facts.allocation_slots.get(&point).ok_or_else(|| {
-                        format!("missing aggregate allocation binding in {:?}", body.source)
-                    })?;
-                    ClosedReturn::Allocation { block, item }
-                }
-                OwnerSource::Call(point) => {
-                    let target_mixed = target_body(&declarations, body.cfg, point)
-                        .and_then(|target| bodies.get(&target)).is_some_and(Body::has_mixed_struct_result);
-                    if (body.has_mixed_struct_result() || target_mixed)
-                        && !(target_mixed && body.has_mixed_struct_result() && facts.mixed_forward == Some(point))
-                    {
-                        return Err(format!("forwarding a mixed aggregate result is not closed in {:?}", body.source));
+                ClosedReturn::MixedBranch
+            } else {
+                match owner {
+                    OwnerSource::Formal(_) => {
+                        return Err(format!("return of moved formal is not closed in {:?}", body.source));
                     }
-                    let call = *facts.calls.get(&point).ok_or_else(|| {
-                        format!(
-                            "missing aggregate forwarding occurrence in {:?}",
-                            body.source
-                        )
-                    })?;
-                    ClosedReturn::Forward { call }
+                    OwnerSource::Allocation(point) => {
+                        let &(block, item) = facts.allocation_slots.get(&point).ok_or_else(|| {
+                            format!("missing aggregate allocation binding in {:?}", body.source)
+                        })?;
+                        ClosedReturn::Allocation { block, item }
+                    }
+                    OwnerSource::Call(point) => {
+                        let target_mixed = target_body(&declarations, body.cfg, point)
+                            .and_then(|target| bodies.get(&target)).is_some_and(Body::has_mixed_struct_result);
+                        if (body.has_mixed_struct_result() || target_mixed)
+                            && !(target_mixed && body.has_mixed_struct_result() && facts.mixed_forward == Some(point))
+                        {
+                            return Err(format!("forwarding a mixed aggregate result is not closed in {:?}", body.source));
+                        }
+                        let call = *facts.calls.get(&point).ok_or_else(|| {
+                            format!(
+                                "missing aggregate forwarding occurrence in {:?}",
+                                body.source
+                            )
+                        })?;
+                        ClosedReturn::Forward { call }
+                    }
                 }
             };
             Some(route)
@@ -3438,6 +3454,9 @@ fn closed_aggregates<'a>(
         };
         let mut plan = result.bodies.remove(&key).unwrap_or_default();
         plan.returning = return_route;
+        if return_route == Some(ClosedReturn::MixedBranch) {
+            plan.mixed_branch_return = facts.mixed_branch_return.clone();
+        }
         plan.input_calls = input_calls.remove(&key).unwrap_or_default();
         if let Some(&(slot, release, mixed)) = input_plans.get(&key) {
             plan.input = Some(slot);

@@ -2866,6 +2866,7 @@ impl<'a> BlockEmission<'a> {
 }
 
 struct CanonicalTailIf<'syntax, 'signature> {
+    expression: &'syntax ScalarExpression,
     condition: &'syntax ScalarExpression,
     then_branch: &'syntax ScalarBlock,
     else_branch: &'syntax ScalarBlock,
@@ -2888,6 +2889,7 @@ fn canonical_tail_if<'syntax, 'signature>(
             else_branch,
             ..
         } => Some(CanonicalTailIf {
+            expression,
             condition,
             then_branch,
             else_branch,
@@ -2929,6 +2931,11 @@ fn emit_block_at<'ctx, 'module>(
         EmitValue::Unit
     };
     let result = finish_block_return(context, state, block, result, emission)?;
+    let result = if let BlockEmission::TailArm(outputs) = emission {
+        aggregate_transfer::commit_mixed_branch_arm(context, state, block, result, outputs)?
+    } else {
+        result
+    };
     if let BlockEmission::Return(outputs) = emission {
         aggregate_transfer::commit_return(context, state, block, &result, outputs)?;
     }
@@ -3017,6 +3024,11 @@ fn emit_project_block_at<'ctx, 'module>(
         EmitValue::Unit
     };
     let result = finish_block_return(context, state, block, result, emission)?;
+    let result = if let BlockEmission::TailArm(outputs) = emission {
+        aggregate_transfer::commit_mixed_branch_arm(context, state, block, result, outputs)?
+    } else {
+        result
+    };
     if let BlockEmission::Return(outputs) = emission {
         aggregate_transfer::commit_return(context, state, block, &result, outputs)?;
     }
@@ -3066,6 +3078,9 @@ fn emit_final_outputs<'ctx, 'module>(
         return Ok(EmitValue::Unit);
     }
     if let Some(tail) = canonical_tail_if(block, emission) {
+        if matches!(emission, BlockEmission::Return(_)) {
+            aggregate_transfer::match_mixed_branch_conditional(state, tail.expression)?;
+        }
         let condition =
             take_basic(emit_expression(context, state, tail.condition)?)?.into_int_value();
         return emit_if_value(
@@ -3158,6 +3173,9 @@ fn emit_project_final_outputs<'ctx, 'module>(
         return Ok(EmitValue::Unit);
     }
     if let Some(tail) = canonical_tail_if(block, emission) {
+        if matches!(emission, BlockEmission::Return(_)) {
+            aggregate_transfer::match_mixed_branch_conditional(state, tail.expression)?;
+        }
         let condition = take_basic(emit_project_expression(
             context,
             state,

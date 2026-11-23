@@ -838,7 +838,7 @@ fn checked_ordinary_join_preserves_null_and_missing_provenance_on_separate_arms(
 }
 
 #[test]
-fn mixed_tail_branch_backings_remain_distinct_without_admitting_lowering() {
+fn mixed_tail_branch_returns_transport_each_distinct_backing() {
     use aggregate::{MixedArmBacking, OwnerSource};
     let source = source();
     let text = r#"%%start
@@ -860,6 +860,14 @@ struct Packet { *?u8 data; u64 length; }
 		43, packet
 	}
 };
+u64(bool) receive = fn(take_left) {
+	u32 status, Packet packet = choose(2, take_left);
+	u8 byte = unsafe { core.load<u8>(packet.data) };
+	core.int_extend<u64>(status) + core.int_extend<u64>(byte) + packet.length
+};
+u64 left_result = receive(true);
+u64 right_result = receive(false);
+if (left_result != 58 || right_result != 68) { core.system_panic(); };
 %%end"#;
     let parsed = parse_source(source.clone(), text.into(), &[]);
     assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
@@ -911,8 +919,26 @@ struct Packet { *?u8 data; u64 length; }
             &result.cfg, aggregate::mixed_owned_struct_result(outputs).unwrap(),
         ));
         let build = crate::scalar::analyze_scalar_build(&prepared);
-        let Err(error) = crate::llvm::emit_scalar_build_project_llvm(&build)
-            else { panic!("observational proof must not admit branch return lowering") };
-        assert!(error.contains("branch transfer for output 1 is not yet lowered"), "{error}");
+        let llvm = crate::llvm::emit_scalar_build_project_llvm(&build)
+            .unwrap_or_else(|error| panic!("{error}")).to_text();
+        let context = inkwell::context::Context::create();
+        let buffer = inkwell::memory_buffer::MemoryBuffer::create_from_memory_range_copy(llvm.as_bytes(), "mixed-branch");
+        let module = context.create_module_from_ir(buffer).unwrap();
+        module.verify().unwrap();
+        use inkwell::values::AnyValue;
+        let get_function = |name: &[u8]| {
+            let suffix = format!("__{}", name.iter().map(|byte| format!("{byte:02x}")).collect::<String>());
+            module.get_functions().find(|function| function.get_name().to_str().unwrap().ends_with(&suffix)).unwrap()
+        };
+        let producer = get_function(b"choose").print_to_string().to_string();
+        let receiver = get_function(b"receive").print_to_string().to_string();
+        assert!(producer.contains("phi { i32, ptr }"), "{producer}");
+        assert_eq!(producer.matches("call ptr @__wosy_core_alloc").count(), 2, "{producer}");
+        assert!(!producer.contains("call void @__wosy_core_free"), "{producer}");
+        assert_eq!(receiver.matches("call void @__wosy_core_free").count(), 1, "{receiver}");
+        assert!(receiver.contains("extractvalue { i32, ptr } %aggregate_original_base, 1"), "{receiver}");
+        let release = receiver.find("call void @__wosy_core_free(ptr %aggregate_base)").unwrap();
+        assert!(receiver[..release].contains("load i8"), "{receiver}");
+
     }
 }

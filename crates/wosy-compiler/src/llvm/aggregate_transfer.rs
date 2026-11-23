@@ -92,6 +92,7 @@ pub(super) struct AggregateEmitter<'ctx, 'plan> {
     base: Option<PointerValue<'ctx>>,
     registered_allocation: Option<String>,
     mixed_return: Option<inkwell::values::StructValue<'ctx>>,
+    mixed_branch_arms: u8,
     failure_site: Option<ClosedLocalArrayRelease>,
     failure_allocation: Option<PendingLocalArrayRelease<'ctx>>,
     failure_arm_visited: bool,
@@ -195,6 +196,7 @@ impl<'ctx, 'plan> AggregateEmitter<'ctx, 'plan> {
             base: None,
             registered_allocation: None,
             mixed_return: None,
+            mixed_branch_arms: 0,
             failure_site,
             failure_allocation: None,
             failure_arm_visited: false,
@@ -541,14 +543,15 @@ pub(super) fn record_allocation<'ctx>(
     }) && aggregate.checked_backing_base.replace((base, name.to_owned())).is_some() {
         return Err("duplicate private checked backing allocation".into());
     }
-    let Some(ClosedReturn::Allocation { block, item }) = aggregate.plan.returning else {
-        return Ok(());
+    let binding_position = || state.body_call_nodes.and_then(|nodes| nodes.binding_position(binding));
+    let registered = match aggregate.plan.returning {
+        Some(ClosedReturn::Allocation { block, item }) => binding_position() == Some((block, item)),
+        Some(ClosedReturn::MixedBranch) => binding_position().is_some_and(|(block, item)| {
+            aggregate.plan.mixed_branch_arm(block).is_some_and(|(_, expected)| item == expected)
+        }),
+        _ => false,
     };
-    if state
-        .body_call_nodes
-        .and_then(|nodes| nodes.binding_position(binding))
-        != Some((block, item))
-    {
+    if !registered {
         return Ok(());
     }
     aggregate.set_base(base)?;
@@ -1211,6 +1214,54 @@ pub(super) fn holds_registered_return(state: &EmitState<'_, '_>) -> bool {
     state.aggregate.as_ref().is_some_and(|aggregate| aggregate.registered_allocation.is_some())
 }
 
+pub(super) fn match_mixed_branch_conditional(
+    state: &EmitState<'_, '_>, expression: &ScalarExpression,
+) -> Result<(), String> {
+    if let Some(conditional) = state.aggregate.as_ref().and_then(|aggregate| aggregate.plan.mixed_branch_conditional()) {
+        if state.body_call_nodes.and_then(|nodes| nodes.expression_ordinal(expression)) != Some(conditional) {
+            return Err("mixed aggregate return conditional does not match its sealed occurrence".into());
+        }
+    }
+    Ok(())
+}
+
+fn mixed_allocation_pair<'ctx>(
+    context: &'ctx Context, state: &mut EmitState<'ctx, '_>, result: &EmitValue<'ctx>,
+    outputs: &crate::ScalarOutputSequence, lane: usize, destination: PointerValue<'ctx>, base: PointerValue<'ctx>,
+) -> Result<inkwell::values::StructValue<'ctx>, String> {
+    let EmitValue::Aggregate { value, .. } = result else {
+        return Err("mixed aggregate return has no ordered values".into());
+    };
+    let descriptor = extract_output(state, result, lane)?;
+    store_value(context, state, destination, &outputs.outputs[lane].ty, descriptor)?;
+    Ok(state.builder.build_insert_value(*value, base, lane as u32, "closed_base")
+        .map_err(builder_error)?.into_struct_value())
+}
+
+pub(super) fn commit_mixed_branch_arm<'ctx>(
+    context: &'ctx Context, state: &mut EmitState<'ctx, '_>, block: &ScalarBlock,
+    result: EmitValue<'ctx>, outputs: &crate::ScalarOutputSequence,
+) -> Result<EmitValue<'ctx>, String> {
+    let Some(aggregate) = state.aggregate.as_mut() else { return Ok(result) };
+    let Some(lane) = aggregate.plan.mixed_branch_owner_lane() else { return Ok(result) };
+    let Some((arm, _)) = state.body_call_nodes.and_then(|nodes| nodes.block_ordinal(block))
+        .and_then(|block| aggregate.plan.mixed_branch_arm(block)) else { return Ok(result) };
+    if aggregate.mixed_branch_arms & (1 << arm) != 0
+        || !mixed_owned_struct_result(outputs).is_some_and(|lanes| lanes.owner == lane)
+    {
+        return Err("invalid sealed mixed aggregate arm".into());
+    }
+    let destination = aggregate.destination.ok_or_else(|| "missing mixed aggregate destination".to_owned())?;
+    let name = aggregate.registered_allocation.take().ok_or_else(|| "missing mixed arm allocation".to_owned())?;
+    let base = aggregate.base.take().filter(|_| state.runtime_array_owners.get(&name) == Some(&true))
+        .ok_or_else(|| "missing live mixed arm backing".to_owned())?;
+    let pair = mixed_allocation_pair(context, state, &result, outputs, lane, destination, base)?;
+    state.runtime_array_owners.insert(name, false);
+    state.aggregate.as_mut().expect("sealed mixed arm").mixed_branch_arms |= 1 << arm;
+    let EmitValue::Aggregate { outputs, .. } = result else { unreachable!("ordered mixed result checked") };
+    Ok(EmitValue::Aggregate { value: pair, outputs })
+}
+
 pub(super) fn commit_return<'ctx>(
     context: &'ctx Context,
     state: &mut EmitState<'ctx, '_>,
@@ -1252,6 +1303,16 @@ pub(super) fn commit_return<'ctx>(
         state.aggregate.as_mut().expect("ordinary aggregate frame").ordinary_committed = true;
         return Ok(());
     }
+    if aggregate.plan.returning == Some(ClosedReturn::MixedBranch) {
+        let EmitValue::Aggregate { value, .. } = result else {
+            return Err("sealed mixed aggregate paths did not form an ordered result".into());
+        };
+        if aggregate.mixed_branch_arms != 0b11 || aggregate.base.is_some() || aggregate.registered_allocation.is_some() {
+            return Err("sealed mixed aggregate paths did not transfer both planned receipts".into());
+        }
+        aggregate.mixed_return = Some(*value);
+        return Ok(());
+    }
     if !matches!(aggregate.plan.returning, Some(ClosedReturn::Allocation { .. })) {
         return Ok(());
     }
@@ -1270,13 +1331,7 @@ pub(super) fn commit_return<'ctx>(
         .filter(|_| state.runtime_array_owners.get(&name).copied().unwrap_or(false))
         .ok_or_else(|| "closed aggregate handoff has no live original owner".to_owned())?;
     if let Some(lanes) = mixed {
-        let EmitValue::Aggregate { value, .. } = result else {
-            return Err("mixed aggregate return has no ordered values".into());
-        };
-        let descriptor = extract_output(state, result, lanes.owner)?;
-        store_value(context, state, destination, &outputs.outputs[lanes.owner].ty, descriptor)?;
-        let pair = state.builder.build_insert_value(*value, base, lanes.owner as u32, "closed_base")
-            .map_err(builder_error)?.into_struct_value();
+        let pair = mixed_allocation_pair(context, state, result, outputs, lanes.owner, destination, base)?;
         state.aggregate.as_mut().expect("closed aggregate handoff").mixed_return = Some(pair);
     } else {
         store_value(context, state, destination, &output.ty, result.clone())?;
