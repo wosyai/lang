@@ -1276,20 +1276,39 @@ owned = namespace payload "owner.w";
     marker, packet
 };
 %%end"#;
-    for (via_relay, app_text) in [(false, app_text), (true, forwarded_text.as_str())] {
-        verify_qualified_mixed_result(app_text, owner_text, decoy_text, via_relay.then_some(relay_text));
+    let second_text = r#"%%start
+owned = namespace payload "owner.w";
+relay = namespace payload "relay.w";
+(u32, owned.Packet)(u64) forward_again = fn(count) {
+    u32 marker, owned.Packet packet = relay.forward(count);
+    marker, packet
+};
+%%end"#;
+    let chained_text = forwarded_text.replace(
+        "relay = namespace payload \"relay.w\";",
+        "next = namespace payload \"next.w\";",
+    ).replace("relay.forward(2)", "next.forward_again(2)");
+    for (app_text, relays) in [
+        (app_text, &[][..]),
+        (forwarded_text.as_str(), &[relay_text][..]),
+        (chained_text.as_str(), &[relay_text, second_text][..]),
+    ] {
+        verify_qualified_mixed_result(app_text, owner_text, decoy_text, relays);
     }
 }
 
-fn verify_qualified_mixed_result(app_text: &str, owner_text: &str, decoy_text: &str, relay_text: Option<&str>) {
+fn verify_qualified_mixed_result(app_text: &str, owner_text: &str, decoy_text: &str, relay_texts: &[&str]) {
     let app = source("workbench", "src/cross_mixed.w");
     let owner = source("payload", "src/owner.w");
     let decoy = source("payload", "src/decoy.w");
     let relay = source("payload", "src/relay.w");
+    let next = source("payload", "src/next.w");
     for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
         let mut app_namespaces = vec![namespace("owned", &owner), namespace("plain", &decoy)];
-        if relay_text.is_some() {
+        if relay_texts.len() == 1 {
             app_namespaces.push(namespace("relay", &relay));
+        } else if relay_texts.len() == 2 {
+            app_namespaces.push(namespace("next", &next));
         }
         let mut inputs = vec![
             (declarations(&app, app_text), app_namespaces),
@@ -1297,9 +1316,13 @@ fn verify_qualified_mixed_result(app_text: &str, owner_text: &str, decoy_text: &
             (declarations(&decoy, decoy_text), Vec::new()),
         ];
         let mut sources = vec![app.clone(), owner.clone(), decoy.clone()];
-        if let Some(text) = relay_text {
+        if let Some(text) = relay_texts.first() {
             inputs.push((declarations(&relay, text), vec![namespace("owned", &owner)]));
             sources.push(relay.clone());
+        }
+        if let Some(text) = relay_texts.get(1) {
+            inputs.push((declarations(&next, text), vec![namespace("owned", &owner), namespace("relay", &relay)]));
+            sources.push(next.clone());
         }
         let prepared = prepare_scalar_project(inputs, sources, ScalarPreparationInputs { target_layout })
             .unwrap_or_else(|error| panic!("{target_layout:?}: {:?}", error.diagnostics));
@@ -1322,23 +1345,22 @@ fn verify_qualified_mixed_result(app_text: &str, owner_text: &str, decoy_text: &
         let receiver = module.get_function(&function_with_suffix(&module, "receive")).unwrap().print_to_string().to_string();
         assert_eq!(owner.count_params(), 2);
         assert_eq!(ordinary.count_params(), 1);
-        let called_owner = if relay_text.is_some() {
-            let relay = module.get_function(&function_with_suffix(&module, "forward")).unwrap();
+        let mut called_owner = owner;
+        for name in ["forward", "forward_again"].into_iter().take(relay_texts.len()) {
+            let relay = module.get_function(&function_with_suffix(&module, name)).unwrap();
             let relay_ir = relay.print_to_string().to_string();
             let mut calls = relay.get_basic_blocks().into_iter().flat_map(|block| block.get_instructions())
                 .filter(|inst| inst.get_opcode() == InstructionOpcode::Call);
             let call = calls.next().expect("exact forwarded producer call");
             assert!(calls.next().is_none(), "{relay_ir}");
             let called = CallSiteValue::try_from(call).unwrap();
-            assert_eq!(called.get_called_fn_value(), Some(owner));
+            assert_eq!(called.get_called_fn_value(), Some(called_owner));
             assert_eq!(call.get_operand(1).unwrap().value(), relay.get_last_param());
             let returned = relay.get_basic_blocks().into_iter().flat_map(|block| block.get_instructions())
                 .find(|inst| inst.get_opcode() == InstructionOpcode::Return).expect("whole pair return");
             assert_eq!(returned.get_operand(0).unwrap().value(), called.try_as_basic_value().basic());
-            relay
-        } else {
-            owner
-        };
+            called_owner = relay;
+        }
         for function in [called_owner, ordinary] {
             let target = function.get_name().to_str().unwrap();
             assert_eq!(receiver.matches(&format!("call {{ i32, ptr }} @{target}(")).count(), 1, "{receiver}");

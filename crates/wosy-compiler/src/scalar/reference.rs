@@ -2011,7 +2011,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         target: ResolvedCallTarget::ModuleCallable {
                             source, declaration_span, concrete: ConcreteCallSelection::Declaration,
                         }, ..
-                    } if self.mixed_owners.is_some_and(|owners| owners.contains(&self.source, source, declaration_span)));
+                    } if self.mixed_owners.is_some_and(|owners| owners.contains(source, declaration_span)));
                     self.aggregate_result.mixed_result_calls.insert(id);
                     if selected {
                         self.aggregate_facts.calls.insert(id, ordinal);
@@ -11248,19 +11248,23 @@ pub(super) fn record_module_reference_origins(
 }
 
 type MixedReceiptTargets = HashMap<SourceIdentity, HashSet<ByteSpan>>;
+type MixedReceiptKey<'a> = (&'a SourceIdentity, ByteSpan);
+type MixedReceiptEdges<'a> = HashMap<MixedReceiptKey<'a>, Vec<MixedReceiptKey<'a>>>;
 
 #[derive(Clone, Copy)]
 struct MixedReceiptSelection<'a> {
     grounds: &'a MixedReceiptTargets,
-    local_forwarders: &'a HashSet<ByteSpan>,
-    cross_forwarders: Option<&'a MixedReceiptTargets>,
+    forwarders: &'a MixedReceiptTargets,
 }
 
 impl MixedReceiptSelection<'_> {
-    fn contains(self, caller: &SourceIdentity, target: &SourceIdentity, span: &ByteSpan) -> bool {
+    fn contains(self, target: &SourceIdentity, span: &ByteSpan) -> bool {
         self.grounds.get(target).is_some_and(|points| points.contains(span))
-            || (caller == target && self.local_forwarders.contains(span))
-            || self.cross_forwarders.and_then(|receipts| receipts.get(target)).is_some_and(|points| points.contains(span))
+            || self.is_forwarder(target, span)
+    }
+
+    fn is_forwarder(self, source: &SourceIdentity, declaration: &ByteSpan) -> bool {
+        self.forwarders.get(source).is_some_and(|points| points.contains(declaration))
     }
 }
 
@@ -11284,38 +11288,19 @@ impl MixedReceiptCohort {
         }).collect()
     }
 
-    fn forwarders(
-        &self, source: &SourceIdentity, items: &[ScalarItem], sites: &ModuleCallSites,
-        updates: &[(usize, FunctionReferenceResult)], grounds: &MixedReceiptTargets,
-        mut cross_forwarders: Option<&mut MixedReceiptTargets>,
-    ) -> HashSet<ByteSpan> {
-        let local_grounds = grounds.get(source);
-        if self.callers.is_empty() || (local_grounds.is_none() && cross_forwarders.is_none()) {
-            return HashSet::new();
+    fn index_forwarders<'a>(
+        &self, source: &'a SourceIdentity, items: &[ScalarItem], sites: &ModuleCallSites,
+        updates: &'a [(usize, FunctionReferenceResult)], edges: &mut MixedReceiptEdges<'a>,
+    ) {
+        if self.callers.is_empty() {
+            return;
         }
-        let mut local_users = HashMap::<_, Vec<_>>::new();
         for &(position, declaration, _) in &self.producers {
             let (index, result) = &updates[position];
             let ScalarItem::Function(function) = &items[*index] else { unreachable!("function result ordinal") };
-            let Some((target, callee)) = result.mixed_forwarded_callee(function, &sites.functions[index])
-                else { continue };
-            if source == target {
-                if local_grounds.is_some() {
-                    local_users.entry(callee).or_default().push(declaration);
-                }
-            } else if grounds.get(target).is_some_and(|receipts| receipts.contains(&callee)) {
-                if let Some(cross) = cross_forwarders.as_deref_mut() {
-                    if let Some(receipts) = cross.get_mut(source) {
-                        receipts.insert(declaration);
-                    } else {
-                        cross.insert(source.clone(), HashSet::from([declaration]));
-                    }
-                }
+            if let Some(callee) = result.mixed_forwarded_callee(function, &sites.functions[index]) {
+                edges.entry(callee).or_default().push((source, declaration));
             }
-        }
-        match local_grounds {
-            Some(known) if !local_users.is_empty() => reachable_mixed_forwarders(&mut known.clone(), local_users),
-            _ => HashSet::new(),
         }
     }
 
@@ -11329,9 +11314,7 @@ impl MixedReceiptCohort {
             let (index, result) = &mut updates[position];
             let ScalarItem::Function(function) = &items[*index] else { unreachable!("function result ordinal") };
             result.observe_selected_mixed_receipts(function, &call_sites.functions[index], &self.module_names,
-                structs, enums, source, owners, owners.local_forwarders.contains(&function.name_span)
-                    || owners.cross_forwarders.and_then(|receipts| receipts.get(source))
-                        .is_some_and(|receipts| receipts.contains(&function.name_span)),
+                structs, enums, source, owners, owners.is_forwarder(source, &function.name_span),
                 capture_call_points, errors);
         }
     }
@@ -11349,8 +11332,10 @@ fn derive_module_reference_origins(
             let owners = cohort.grounds(source, &updates, &targets);
             if !owners.is_empty() {
                 let grounds = HashMap::from([(source.clone(), owners)]);
-                let local = cohort.forwarders(source, items, call_sites, &updates, &grounds, None);
-                let selection = MixedReceiptSelection { grounds: &grounds, local_forwarders: &local, cross_forwarders: None };
+                let mut edges = HashMap::new();
+                cohort.index_forwarders(source, items, call_sites, &updates, &mut edges);
+                let forwarders = reachable_mixed_forwarders(&grounds, edges);
+                let selection = MixedReceiptSelection { grounds: &grounds, forwarders: &forwarders };
                 cohort.select(source, items, call_sites, &mut updates, selection, structs, enums, capture_call_points, &mut errors);
             }
         }
@@ -11405,18 +11390,30 @@ fn derive_module_reference_cohort(
     (updates, errors, cohort)
 }
 
-fn reachable_mixed_forwarders(
-    owners: &mut HashSet<ByteSpan>, mut users: HashMap<ByteSpan, Vec<ByteSpan>>,
-) -> HashSet<ByteSpan> {
-    let mut pending = owners.iter().copied().collect::<Vec<_>>();
-    let mut forwarders = HashSet::new();
+fn reachable_mixed_forwarders<'a>(
+    grounds: &'a MixedReceiptTargets, mut users: MixedReceiptEdges<'a>,
+) -> MixedReceiptTargets {
+    if users.is_empty() {
+        return HashMap::new();
+    }
+    let mut pending = grounds.iter().flat_map(|(source, spans)| spans.iter().map(move |span| (source, *span))).collect::<Vec<_>>();
+    let mut reached = HashSet::new();
     while let Some(callee) = pending.pop() {
         let Some(callers) = users.remove(&callee) else { continue };
         for caller in callers {
-            if owners.insert(caller) {
-                forwarders.insert(caller);
+            if !grounds.get(caller.0).is_some_and(|spans| spans.contains(&caller.1))
+                && reached.insert(caller)
+            {
                 pending.push(caller);
             }
+        }
+    }
+    let mut forwarders = MixedReceiptTargets::new();
+    for (source, span) in reached {
+        if let Some(spans) = forwarders.get_mut(source) {
+            spans.insert(span);
+        } else {
+            forwarders.insert(source.clone(), HashSet::from([span]));
         }
     }
     forwarders
@@ -11426,17 +11423,26 @@ fn reachable_mixed_forwarders(
 #[test]
 fn mixed_wrapper_reachability_requires_an_allocation_grounded_predecessor() {
     let span = |index| ByteSpan::new(index, index + 1);
-    let mut owners = HashSet::from([span(0)]);
-    let actual = reachable_mixed_forwarders(&mut owners, HashMap::from([
-        (span(2), vec![span(3)]),
-        (span(4), vec![span(5)]),
-        (span(0), vec![span(1)]),
-        (span(1), vec![span(2), span(6)]),
-        (span(5), vec![span(4)]),
-        (span(7), vec![span(8)]),
+    let source = |path: &str, revision: &str| SourceIdentity::new(
+        "project".into(), "payload".into(), path.into(), revision.into(),
+    );
+    let origin = source("owner.w", "1");
+    let first = source("first.w", "1");
+    let second = source("second.w", "1");
+    let decoy = source("owner.w", "2");
+    let grounds = HashMap::from([(origin.clone(), HashSet::from([span(0)]))]);
+    let actual = reachable_mixed_forwarders(&grounds, HashMap::from([
+        ((&origin, span(0)), vec![(&first, span(0))]),
+        ((&first, span(0)), vec![(&second, span(0)), (&second, span(1))]),
+        ((&decoy, span(0)), vec![(&first, span(1))]),
+        ((&first, span(4)), vec![(&second, span(4))]),
+        ((&second, span(4)), vec![(&first, span(4))]),
+        ((&second, span(5)), vec![(&second, span(5))]),
     ]));
-    assert_eq!(actual, HashSet::from([span(1), span(2), span(3), span(6)]));
-    assert_eq!(owners, HashSet::from([span(0), span(1), span(2), span(3), span(6)]));
+    assert_eq!(actual, HashMap::from([
+        (first, HashSet::from([span(0)])),
+        (second, HashSet::from([span(0), span(1)])),
+    ]));
 }
 
 fn install_module_reference_results(
@@ -11645,19 +11651,19 @@ fn derive_project_reference_origins(
         }).collect::<MixedReceiptTargets>();
         if !grounds.is_empty() {
             let (structs, enums) = inventory.as_ref().expect("mixed project cohorts have declared inventory");
-            let mut cross = HashMap::new();
-            let cohorts = cohorts.into_iter().map(|(position, cohort)| {
-                let (index, results) = &updates[position];
+            let mut edges = HashMap::new();
+            for (position, cohort) in &cohorts {
+                let (index, results) = &updates[*position];
                 let module = &modules[*index];
                 let sites = call_sites.modules[*index].as_ref().expect("successful mixed receipt cohort");
-                let local = cohort.forwarders(&module.source, &module.items, sites, results, &grounds, Some(&mut cross));
-                (position, cohort, local)
-            }).collect::<Vec<_>>();
-            for (position, cohort, local) in cohorts {
+                cohort.index_forwarders(&module.source, &module.items, sites, results, &mut edges);
+            }
+            let forwarders = reachable_mixed_forwarders(&grounds, edges);
+            let selection = MixedReceiptSelection { grounds: &grounds, forwarders: &forwarders };
+            for (position, cohort) in cohorts {
                 let (index, results) = &mut updates[position];
                 let module = &modules[*index];
                 let sites = call_sites.modules[*index].as_ref().expect("successful mixed receipt cohort");
-                let selection = MixedReceiptSelection { grounds: &grounds, local_forwarders: &local, cross_forwarders: Some(&cross) };
                 cohort.select(&module.source, &module.items, sites, results, selection,
                     structs, enums, capture_call_points, &mut errors);
             }
@@ -12461,7 +12467,7 @@ impl FunctionReferenceResult {
             result.observe_selected_mixed_receipts(function, sites, module_names, structs, enums, source, owners,
                 false, capture_call_points, errors);
         }
-        if !self.mixed_targets().any(|(target, declaration)| owners.contains(source, target, &declaration)) {
+        if !self.mixed_targets().any(|(target, declaration)| owners.contains(target, &declaration)) {
             return;
         }
         let mut builder = ReferenceFlowBuilder::new(source, function, module_names, sites, structs, enums);
