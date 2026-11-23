@@ -839,7 +839,6 @@ fn checked_ordinary_join_preserves_null_and_missing_provenance_on_separate_arms(
 
 #[test]
 fn mixed_tail_branch_returns_transport_each_distinct_backing() {
-    use aggregate::{MixedArmBacking, OwnerSource};
     let source = source();
     let text = r#"%%start
 struct Packet { *?u8 data; u64 length; }
@@ -869,6 +868,17 @@ u64 left_result = receive(true);
 u64 right_result = receive(false);
 if (left_result != 58 || right_result != 68) { core.system_panic(); };
 %%end"#;
+    let forwarded_text = text.replace("u64(bool) receive", r#"(u32, Packet)(u64, bool) relay = fn(amount, use_left) {
+	u32 status, Packet packet = choose(amount, use_left);
+	status, packet
+};
+u64(bool) receive"#).replace("choose(2, take_left)", "relay(2, take_left)");
+    verify_mixed_tail_branch_route(&source, text, false);
+    verify_mixed_tail_branch_route(&source, &forwarded_text, true);
+}
+
+fn verify_mixed_tail_branch_route(source: &SourceIdentity, text: &str, forwarded: bool) {
+    use aggregate::{MixedArmBacking, OwnerSource};
     let parsed = parse_source(source.clone(), text.into(), &[]);
     assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
     for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
@@ -886,7 +896,7 @@ if (left_result != 58 || right_result != 68) { core.system_panic(); };
         }).expect("real prepared conditional producer");
         let calls = prepared.function_calls(0, item);
         let result = derive_function_reference_result(
-            &source, function, &HashSet::new(), calls, &module.structs, &module.enums, true, &mut Vec::new(),
+            source, function, &HashSet::new(), calls, &module.structs, &module.enums, true, &mut Vec::new(),
         );
         let [MixedArmBacking::Exact(left), MixedArmBacking::Exact(right)] = result.aggregate.mixed_arm_backings
             else { panic!("{:?}", result.aggregate.mixed_arm_backings) };
@@ -934,6 +944,23 @@ if (left_result != 58 || right_result != 68) { core.system_panic(); };
         let producer_fn = get_function(b"choose");
         let producer = producer_fn.print_to_string().to_string();
         let receiver = get_function(b"receive").print_to_string().to_string();
+        if forwarded {
+            let relay = get_function(b"relay");
+            let relay_ir = relay.print_to_string().to_string();
+            let relay_instructions = relay.get_basic_blocks().into_iter().flat_map(|block| block.get_instructions())
+                .collect::<Vec<_>>();
+            let calls = relay_instructions.iter().copied().filter_map(|inst| {
+                CallSiteValue::try_from(inst).ok().map(|call| (inst, call))
+            }).collect::<Vec<_>>();
+            let [(instruction, call)] = calls.as_slice() else { panic!("{relay_ir}") };
+            assert_eq!(call.get_called_fn_value(), Some(producer_fn));
+            assert_eq!(instruction.get_operand(2).unwrap().value(), relay.get_last_param());
+            let returned = relay_instructions.iter().find(|inst| inst.get_opcode() == InstructionOpcode::Return)
+                .expect("forwarded mixed pair returned directly");
+            assert_eq!(returned.get_operand(0).unwrap().value(), call.try_as_basic_value().basic());
+            assert!(relay_instructions.iter().all(|inst| !matches!(inst.get_opcode(),
+                InstructionOpcode::ExtractValue | InstructionOpcode::InsertValue)), "{relay_ir}");
+        }
         let destination = producer_fn.get_last_param().expect("closed caller destination");
         let instructions = producer_fn.get_basic_blocks().into_iter().flat_map(|block| block.get_instructions());
         let phis = instructions.filter_map(|instruction| PhiValue::try_from(instruction).ok()).collect::<Vec<_>>();
