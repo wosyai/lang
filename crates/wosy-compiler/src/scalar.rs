@@ -2316,7 +2316,26 @@ pub fn derive_scalar_declarations_from_cst(
     canonical: &CanonicalCstRoot,
 ) -> ScalarSourceDeclarations {
     let mut items = Vec::new();
-    let (diagnostics, invalid_projection) = collect_scalar_diagnostics(canonical);
+    let source_root = canonical.root.children().find(|node| node.kind() == SyntaxKind::Root);
+    let mut struct_prefix = Vec::new();
+    let mut enum_prefix = Vec::new();
+    let mut struct_descendants = Vec::new();
+    let mut enum_descendants = Vec::new();
+    let (diagnostics, invalid_projection) = collect_scalar_diagnostics(canonical, |node| {
+        let Some(root) = source_root.as_ref() else { return };
+        let (prefix, descendants) = match node.kind() {
+            SyntaxKind::StructDecl => (&mut struct_prefix, &mut struct_descendants),
+            SyntaxKind::EnumDecl => (&mut enum_prefix, &mut enum_descendants),
+            _ => unreachable!("aggregate declaration"),
+        };
+        let Some(parent) = node.parent() else { return };
+        if &parent == root {
+            prefix.push(node.clone());
+        } else if !parent.ancestors().any(|ancestor| &ancestor == root) {
+            return;
+        }
+        descendants.push(node);
+    });
     if invalid_projection {
         return ScalarSourceDeclarations {
             source: canonical.source.clone(),
@@ -2326,40 +2345,12 @@ pub fn derive_scalar_declarations_from_cst(
             diagnostics,
         };
     }
-    let source_root = canonical
-        .root
-        .children()
-        .find(|node| node.kind() == SyntaxKind::Root)
-        .expect("source root");
-    let structs = source_root
-        .children()
-        .chain(source_root.descendants())
-        .filter(|node| node.kind() == SyntaxKind::StructDecl)
-        .enumerate()
-        .map(|(index, node)| {
-            derive_struct(
-                node,
-                ScalarStructId {
-                    source: canonical.source.clone(),
-                    index,
-                },
-            )
-        })
+    let source_root = source_root.expect("source root");
+    let structs = struct_prefix.into_iter().chain(struct_descendants).enumerate()
+        .map(|(index, node)| derive_struct(node, ScalarStructId { source: canonical.source.clone(), index }))
         .collect();
-    let enums = source_root
-        .children()
-        .chain(source_root.descendants())
-        .filter(|node| node.kind() == SyntaxKind::EnumDecl)
-        .enumerate()
-        .map(|(index, node)| {
-            derive_enum(
-                node,
-                ScalarEnumId {
-                    source: canonical.source.clone(),
-                    index,
-                },
-            )
-        })
+    let enums = enum_prefix.into_iter().chain(enum_descendants).enumerate()
+        .map(|(index, node)| derive_enum(node, ScalarEnumId { source: canonical.source.clone(), index }))
         .collect();
     let mut generic_function = false;
     for node in source_root.children() {
@@ -2519,10 +2510,13 @@ use typecheck::{
 };
 use typecheck::{split_module_typing, ScalarModuleTyping, ScalarProgramTyping};
 pub fn derive_scalar_diagnostics_from_cst(canonical: &CanonicalCstRoot) -> Vec<super::Diagnostic> {
-    collect_scalar_diagnostics(canonical).0
+    collect_scalar_diagnostics(canonical, |_| {}).0
 }
 
-fn collect_scalar_diagnostics(canonical: &CanonicalCstRoot) -> (Vec<Diagnostic>, bool) {
+fn collect_scalar_diagnostics(
+    canonical: &CanonicalCstRoot,
+    mut record_declaration: impl FnMut(CstNode),
+) -> (Vec<Diagnostic>, bool) {
     let [mut strings, mut chars, mut integers, mut floats, mut lengths, mut projections] =
         [const { Vec::new() }; 6];
     for element in canonical.root.descendants_with_tokens() {
@@ -2602,6 +2596,9 @@ fn collect_scalar_diagnostics(canonical: &CanonicalCstRoot) -> (Vec<Diagnostic>,
                     notes: Vec::new(),
                 });
             }
+            NodeOrToken::Node(node)
+                if matches!(node.kind(), SyntaxKind::StructDecl | SyntaxKind::EnumDecl) =>
+                record_declaration(node),
             _ => {}
         }
     }

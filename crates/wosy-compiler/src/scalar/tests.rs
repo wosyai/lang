@@ -7415,6 +7415,47 @@ fn rejects_invalid_character_shapes_at_literal_spans() {
 }
 
 #[test]
+fn shared_cst_declaration_walk_keeps_legacy_membership_order_and_ids() {
+    use wosy_syntax::{CanonicalCstSnapshotElement as Element, CanonicalCstSnapshotNode};
+    fn find(node: &CanonicalCstSnapshotNode, kind: SyntaxKind, spelling: &str) -> CanonicalCstSnapshotNode {
+        if node.kind == kind && node.text.starts_with(spelling) {
+            return node.clone();
+        }
+        for child in &node.children {
+            if let Element::Node(child) = child {
+                if child.text.contains(spelling) {
+                    return find(child, kind, spelling);
+                }
+            }
+        }
+        panic!("missing declaration {spelling}");
+    }
+    let text = "%%start
+struct First { i32 value; }
+enum Early { zero; }
+struct Last { i32 value; }
+enum Late { one; }
+%%end";
+    let parsed = parse_source(source(), text.into(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let mut snapshot = parsed.result.canonical_cst().snapshot();
+    let last = find(&snapshot.root, SyntaxKind::StructDecl, "struct Last");
+    let late = find(&snapshot.root, SyntaxKind::EnumDecl, "enum Late");
+    let first = find(&snapshot.root, SyntaxKind::StructDecl, "struct First");
+    let selected = snapshot.root.children.iter_mut().find_map(|child| match child {
+        Element::Node(node) if node.kind == SyntaxKind::Root => Some(node),
+        _ => None,
+    }).unwrap();
+    selected.children.extend([Element::Node(last), Element::Node(late)]);
+    snapshot.root.children.push(Element::Node(first));
+    let declarations = derive_scalar_declarations_from_cst(&CanonicalCstRoot::from_snapshot(snapshot));
+    assert_eq!(declarations.structs.iter().map(|decl| (decl.name.as_str(), decl.id.index)).collect::<Vec<_>>(),
+        [("Last", 0), ("First", 1), ("Last", 2), ("Last", 3)]);
+    assert_eq!(declarations.enums.iter().map(|decl| (decl.name.as_str(), decl.id.index)).collect::<Vec<_>>(),
+        [("Late", 0), ("Early", 1), ("Late", 2), ("Late", 3)]);
+}
+
+#[test]
 fn direct_and_grouped_value_field_reads_canonically_derive_both_spans() {
     for expression in ["make(42).value", "(make(42)).value"] {
         let text = format!(
