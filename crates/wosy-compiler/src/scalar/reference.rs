@@ -6294,7 +6294,7 @@ fn joined_root_reborrow_binding<'a>(
     }
     let [read] = child.successors.as_slice() else { return None };
     let mut read = points.get(read.0)?;
-    if let CfgPointKind::Evaluate(ScalarExpression::Integer { .. }) = read.kind {
+    while matches!(read.kind, CfgPointKind::Evaluate(ScalarExpression::Integer { .. })) {
         let literal = read;
         let [assign] = literal.successors.as_slice() else { return None };
         let assign = points.get(assign.0)?;

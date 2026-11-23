@@ -13,6 +13,10 @@ enum Expected {
 }
 
 fn check(text: &str, expected: Expected) {
+    check_case(text, expected, false);
+}
+
+fn check_case(text: &str, expected: Expected, write_witness: bool) {
     let source = SourceIdentity::new(
         "project".into(),
         "package".into(),
@@ -58,7 +62,7 @@ fn check(text: &str, expected: Expected) {
         if matches!(expected, Expected::Valid) && text.contains("child") {
             let standalone = emit_scalar_llvm(&single).expect("standalone LLVM").to_text();
             let project = emit_scalar_project_llvm(&project).expect("project LLVM").to_text();
-            if let Some(out) = std::env::var_os("WOSY_REBORROW_TEST_IR_DIR") {
+            if let Some(out) = std::env::var_os("WOSY_REBORROW_TEST_IR_DIR").filter(|_| write_witness) {
                 for (route, ir) in [("standalone", standalone), ("project", project)] {
                     let path = std::path::PathBuf::from(&out).join(format!("{target}-{route}.ll"));
                     std::fs::write(path, &ir).unwrap();
@@ -112,4 +116,18 @@ fn joined_child_never_outlives_a_branch_local_owner() {
 #[test]
 fn joined_shared_child_does_not_widen_same_root_rebound_parents() {
     check(&joined("second; parent = &!first;", true, "", ""), Expected::NullParent);
+}
+
+#[test]
+fn joined_child_survives_consecutive_unrelated_scalar_stores() {
+    let program = joined("parent = &!second;", true, "unrelated = 4; unrelated = 5;", "first = 3; unrelated;");
+    let program = program.replace("u8 first = 7;", "u8 first = 7; u8 unrelated = 0;");
+    check_case(&program, Expected::Valid, true);
+}
+
+#[test]
+fn joined_child_still_blocks_selected_owner_after_an_unrelated_store() {
+    let program = joined("parent = &!second;", true, "unrelated = 4; first = 3;", "unrelated;");
+    let program = program.replace("u8 first = 7;", "u8 first = 7; u8 unrelated = 0;");
+    check(&program, Expected::LiveConflict);
 }
