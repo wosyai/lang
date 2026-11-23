@@ -9583,6 +9583,11 @@ fn guarded_fallible_scalar_uses_shared_lexical_ownership_on_both_targets() {
                 (false, emit_scalar_llvm(&single).expect("single LLVM").to_text()),
                 (true, emit_scalar_project_llvm(&project).expect("project LLVM").to_text()),
             ] {
+                if let Some(output_dir) = std::env::var_os("WOSY_FALLIBLE_TEST_IR_DIR") {
+                    let target = if layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
+                    let file = format!("{target}-{}.ll", if project_route { "project" } else { "standalone" });
+                    std::fs::write(std::path::PathBuf::from(output_dir).join(file), &llvm).expect("guarded test IR");
+                }
                 for (name, initial) in [("observed", 42), ("flipped", 19), ("nested", 25)] {
                     let symbol = self_tail_test_symbol(&source, project_route, name);
                     let body = self_tail_test_body(&llvm, "i32", &symbol);
@@ -9590,6 +9595,13 @@ fn guarded_fallible_scalar_uses_shared_lexical_ownership_on_both_targets() {
                     assert_eq!(body.matches("icmp ne ptr %allocation, null").count(), 1, "{body}");
                     assert_eq!(body.matches("call void @__wosy_core_free(ptr %allocation)").count(), 1, "{body}");
                     assert_eq!(body.matches(&format!("store i32 {initial}, ptr %allocation")).count(), 1, "{body}");
+                    assert!(body.contains("br i1 %fallible.present, label %fallible.initialize, label %fallible.continue"), "{body}");
+                    assert!(body.contains("br i1 %fallible.present, label %fallible.release, label %fallible.released"), "{body}");
+                    if name == "flipped" {
+                        assert!(body.contains("br i1 %fallible.present, label %if.then, label %if.else"), "{body}");
+                    } else {
+                        assert!(body.lines().any(|line| line.contains("br i1 %fallible.absent, label %if.then") && line.contains("label %if.else")), "{body}");
+                    }
                     let (_, initialize) = body.split_once("\nfallible.initialize:").expect("initialize block");
                     let (initialize, _) = initialize.split_once("\nfallible.continue:").expect("continue block");
                     assert!(initialize.contains(&format!("store i32 {initial}, ptr %allocation")), "{body}");
