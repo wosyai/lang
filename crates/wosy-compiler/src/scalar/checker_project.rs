@@ -938,10 +938,18 @@ fn walk_package_initialization<const COLLECT: bool, const PRIVATE_NESTED_SCALAR:
                     } else if matches!(expression, ScalarExpression::Call { .. }) {
                         #[cfg(feature = "internal-checker")]
                         let proof_site = actual.initializer_proof_site(topology, source, outputs.primary, failures.as_deref());
+                        #[cfg(feature = "internal-checker")]
+                        let sink = failures.as_deref_mut().map(RefCell::new);
+                        #[cfg(feature = "internal-checker")]
+                        let collection = sink.as_ref().map(|failures| (source, OrderedCallCollection {
+                            failures, visits: None, outer: None,
+                        }));
+                        #[cfg(not(feature = "internal-checker"))]
+                        let collection = None;
                         let ActualCallResult::Integer(value) = run_initializer_call(
                             topology, actual, outputs.primary, ty,
                             |argument, argument_type| initialized_integer_argument(topology, &storage, argument, argument_type),
-                            None,
+                            collection,
                             #[cfg(feature = "internal-checker")]
                             proof_site,
                         )? else {
@@ -1064,6 +1072,7 @@ fn run_initializer_call<'a>(
         return Err(ProjectCheck::Unsupported);
     };
     let signature = topology.checked_call_signatures.get(&occurrence).ok_or(ProjectCheck::MissingRootOccurrences)?;
+    let collection = collection.filter(|(source, _)| !is_integer_type(expected) || *source == &declaration.source);
     let arguments = if signature.parameters.len() == 2
         && (is_integer_type(expected) || (*expected == ScalarType::Unit && collection.is_some()))
     {
@@ -1176,7 +1185,7 @@ struct InitializerProofSite<'a> {
 
 #[cfg(feature = "internal-checker")]
 enum InitializerProofOrigin<'a> {
-    Direct { topology: &'a ModuleInitializationTopology, occurrence: OccurrenceOrdinal, effects: &'a OrderedFailures },
+    Direct { topology: &'a ModuleInitializationTopology, occurrence: OccurrenceOrdinal, directive_position: usize },
     Nested { outer: OrderedInitializerCall<'a>, caller: &'a FunctionCallSites, inner: OccurrenceOrdinal, directive_position: usize },
 }
 
@@ -1215,12 +1224,12 @@ impl<Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> CheckedCalls<'
     #[cfg(feature = "internal-checker")]
     fn initializer_proof_site<'a>(
         &self, topology: &'a ModuleInitializationTopology, source: &'a SourceIdentity,
-        occurrence: OccurrenceOrdinal, failures: Option<&'a OrderedFailures>,
+        occurrence: OccurrenceOrdinal, failures: Option<&OrderedFailures>,
     ) -> Option<InitializerProofSite<'a>> {
         if !ACTUAL_STARTUP || !Observer::CONTEXTUAL {
             return None;
         }
-        Some(InitializerProofSite { source, call: InitializerProofOrigin::Direct { topology, occurrence, effects: failures? } })
+        Some(InitializerProofSite { source, call: InitializerProofOrigin::Direct { topology, occurrence, directive_position: failures?.records.len() } })
     }
 
     fn nested(
@@ -1472,14 +1481,34 @@ impl<Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> CheckedCalls<'
                 .ok_or(ProjectCheck::Unsupported)
         } else {
             #[cfg(feature = "internal-checker")]
-            let proved = if ACTUAL_STARTUP && Observer::ENABLED {
-                self.observer.proved_recursive_return(target, exact, expected)
-            } else {
-                None
-            };
+            let collected = collection.filter(|_| ACTUAL_STARTUP && is_integer_type(expected)
+                && !body.structure.checker_directives.is_empty()
+                && !body.structure.checker_has_nonexact_require
+                && body.call_occurrences.is_empty() && body.allocation_length_calls.is_empty() && body.assignments.is_empty()
+            ).map(|collection| {
+                let mut failures = collection.failures.borrow_mut();
+                let mut sink = |failure| failures.push_callable(body, &owner.source, failure);
+                super::checker_flow::collect_exact_integer_return_requirements(body, expected, exact, &mut sink)
+                    .map(|(active, value)| {
+                        self.had_obligations |= active;
+                        ActualCallResult::Integer(value)
+                    }).ok_or(ProjectCheck::Unsupported)
+            });
             #[cfg(not(feature = "internal-checker"))]
-            let proved = None;
-            proved.map(ActualCallResult::Integer).ok_or(ProjectCheck::Unsupported)
+            let collected = None;
+            if let Some(result) = collected {
+                result
+            } else {
+                #[cfg(feature = "internal-checker")]
+                let proved = if ACTUAL_STARTUP && Observer::ENABLED {
+                    self.observer.proved_recursive_return(target, exact, expected)
+                } else {
+                    None
+                };
+                #[cfg(not(feature = "internal-checker"))]
+                let proved = None;
+                proved.map(ActualCallResult::Integer).ok_or(ProjectCheck::Unsupported)
+            }
         };
         self.active.remove(&target);
         if ACTUAL_STARTUP && Observer::ENABLED {
@@ -1490,6 +1519,12 @@ impl<Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> CheckedCalls<'
         #[cfg(feature = "internal-checker")]
         if ACTUAL_STARTUP && Observer::CONTEXTUAL {
             if let Ok(ActualCallResult::Integer(value)) = &result {
+                let mut proof_site = proof_site;
+                if let (Some(InitializerProofSite { call: InitializerProofOrigin::Direct { directive_position, .. }, .. }), Some(collection)) =
+                    (&mut proof_site, collection)
+                {
+                    *directive_position = collection.failures.borrow().records.len();
+                }
                 self.observer.observe_initializer(target, proof_site, &signature.parameters, exact, value);
             }
         }
@@ -2961,9 +2996,9 @@ impl ActualIntegerObserver for MainFlowProofObserver<'_> {
                 Rc::clone(invoked)
             } else {
                 let (outer, inner, directive_position) = match &site.call {
-                    InitializerProofOrigin::Direct { topology, occurrence, effects } => {
+                    InitializerProofOrigin::Direct { topology, occurrence, directive_position } => {
                         let Some(node) = topology.occurrences.get(occurrence.0) else { return false; };
-                        (None, node.span, effects.records.len())
+                        (None, node.span, *directive_position)
                     }
                     InitializerProofOrigin::Nested { outer, caller, inner, directive_position } => {
                         let Some(outer) = outer.topology.occurrences.get(outer.occurrence.0) else { return false; };
@@ -7668,6 +7703,51 @@ mod tests {
 
     #[cfg(feature = "internal-checker")]
     #[test]
+    fn ordered_base_actual_value_call_collects_require_then_uses_exact_return() {
+        let app = source("src/main.w", "ordered-base-value-require");
+        let report = |code: i32| OUTPUT.replace(".code = 1", &format!(".code = {code}"));
+        let program = format!(r#"%%start
+            i8(i8) evaluate = fn(input) {{
+                core.require(input > 0, {});
+                if (input < 0) {{ -7 }} else {{ input }}
+            }};
+            i8 first = evaluate(-3);
+            core.require(first == -8, {});
+            i8 second = evaluate(-3);
+            core.require(second == -7, {});
+            i8 third = evaluate(3);
+            core.require(third == 3, {});
+        %%end"#, report(7), report(13), report(17), report(23));
+        let run = |text: &str, scope| {
+            check_loaded_scalar_ordered_local_proof_contexts(
+                vec![(declarations(&app, text), Vec::new())], Vec::new(), vec![app.clone()],
+                inputs(), scope, Vec::new(),
+            )
+        };
+        for scope in [ScalarCheckerScope::MainFlowOnly, ScalarCheckerScope::CurrentPackage] {
+            let receipt = run(&program, scope).unwrap_or_else(|error| panic!("proof-free exact actual calls in {scope:?}: {error:?}"));
+            assert!(receipt.active && receipt.diagnostics.is_empty() && receipt.symbolic_diagnostic.is_none());
+            let [first, caller, second] = receipt.directives.as_slice() else { panic!("two actual callee records with one caller record in between"); };
+            let text = |span: ByteSpan| &program[span.start as usize..span.end as usize];
+            assert_eq!(text(first.condition), "input > 0");
+            assert_eq!(text(caller.condition), "first == -8");
+            assert_eq!(text(second.condition), "input > 0");
+            assert_eq!(first.code(), &BigInt::from(7));
+            assert_eq!(caller.code(), &BigInt::from(13));
+            assert_eq!(second.code(), &BigInt::from(7));
+            assert_eq!(first.directive, second.directive);
+            let entry = BigInt::from(-3);
+            assert!(first.witness.intervals_at(0, 0).unwrap().eq([(&entry, &entry)]));
+            assert_eq!(first.witness, second.witness);
+
+            let incomplete = program.replace("core.require(input > 0", "core.narrow(input > 0")
+                .replace("i8 first = evaluate(-3);", &format!("core.require(false, {}); i8 first = evaluate(-3);", report(31)));
+            assert!(matches!(run(&incomplete, scope), Err(ScalarOrderedCheckerOutcome::Unsupported)));
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
     fn ordered_package_failure_collection_does_not_publish_incomplete_roots() {
         let app = source("src/main.w", "collect-incomplete-package-failures");
         let prepare = |body: &str, startup: &str| {
@@ -8675,7 +8755,7 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
         }, None));
         let effects = OrderedFailures::default();
         observer.observe_initializer(
-            (0, 0), Some(InitializerProofSite { source: &app, call: InitializerProofOrigin::Direct { topology, occurrence, effects: &effects } }),
+            (0, 0), Some(InitializerProofSite { source: &app, call: InitializerProofOrigin::Direct { topology, occurrence, directive_position: effects.records.len() } }),
             &[ScalarType::I8], &[&value], &value,
         );
         assert!(observer.first.1.seen && !observer.incomplete && observer.diagnostics.len() == 1);

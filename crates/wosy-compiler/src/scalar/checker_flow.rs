@@ -2458,6 +2458,54 @@ fn observe_integer_returns_in_scope<'a, Authored: ScopedAuthoredReturn<'a>>(
     }
 }
 
+#[cfg(feature = "internal-checker")]
+pub(super) fn collect_exact_integer_return_requirements<'a>(
+    calls: &'a FunctionCallSites, expected: &ScalarType, arguments: &[&BigInt],
+    sink: &mut dyn FnMut(IntegerCheckFailure<'a>),
+) -> Option<(bool, BigInt)> {
+    #[derive(Clone, Copy)]
+    struct ExactReturn<'a>(&'a std::cell::RefCell<Option<BigInt>>);
+
+    impl<'body> ScopedAuthoredReturn<'body> for ExactReturn<'_> {
+        const ENABLED: bool = false;
+        const OBSERVE_RETURN: bool = true;
+        const REQUIRE_TOTAL_RETURN: bool = true;
+
+        fn at(
+            self, _: &FunctionCallSites, _: BlockOrdinal, _: FinalOutputSlot, _: &ScalarType,
+            _: &IntegerRoots<'_>, _: &IntegerInputs,
+        ) -> Option<&'body BigInt> {
+            None
+        }
+
+        fn observe_return(
+            self, _: FinalOutputSlot, value: IntegerReturn<'body>, roots: &IntegerRoots<'body>, path: &IntegerInputs,
+        ) -> Option<()> {
+            let value = match value {
+                IntegerReturn::Const(value) => value,
+                IntegerReturn::Alias(binding) => path.singleton_at(roots.lookup(binding)?.0)?,
+            };
+            let mut returned = self.0.borrow_mut();
+            if let Some(earlier) = returned.as_ref() {
+                return (earlier == value).then_some(());
+            }
+            *returned = Some(value.clone());
+            Some(())
+        }
+    }
+
+    let tail = integer_tail_type(calls).filter(|tail| *tail == expected)?;
+    let mut failures = IntegerFailureCollection {
+        continuation: IntegerRequirementContinuation::Empty, projected: None, allow_projected_calls: false, sink,
+    };
+    let returned = std::cell::RefCell::new(None);
+    let ProofCoverage::Applicable(active) = run_integer_callable::<false, true, _>(
+        calls, Some(tail), None, None, &mut [], Some(arguments), None,
+        Some(&mut failures), false, ExactReturn(&returned),
+    )?.ok()? else { return None; };
+    Some((active, returned.into_inner()?))
+}
+
 pub(super) fn exact_integer_return_at_entry(
     calls: &FunctionCallSites,
     expected: &ScalarType,

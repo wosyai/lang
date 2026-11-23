@@ -6088,6 +6088,8 @@ pub(super) struct OccurrenceStructure {
     pub(super) checked_types: CheckedOccurrenceTypes,
     #[cfg(any(test, feature = "internal-checker"))]
     pub(super) checker_directives: HashMap<OccurrenceOrdinal, super::checker_directive::PreparedCheckerDirective>,
+    #[cfg(feature = "internal-checker")]
+    pub(super) checker_has_nonexact_require: bool,
     #[cfg(any(test, feature = "internal-checker"))]
     pub(super) checker_branches: HashMap<OccurrenceOrdinal, super::checker_flow::CheckerPredicate>,
     #[cfg(any(test, feature = "internal-checker"))]
@@ -6119,6 +6121,8 @@ impl OccurrenceStructure {
             checked_types: CheckedOccurrenceTypes::default(),
             #[cfg(any(test, feature = "internal-checker"))]
             checker_directives: HashMap::new(),
+            #[cfg(feature = "internal-checker")]
+            checker_has_nonexact_require: false,
             #[cfg(any(test, feature = "internal-checker"))]
             checker_branches: HashMap::new(),
             #[cfg(any(test, feature = "internal-checker"))]
@@ -6960,6 +6964,12 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
             } else {
                 (self.checked_callable_directive_predicate(condition, names), None)
             };
+            #[cfg(feature = "internal-checker")]
+            {
+                use super::{checker_directive::CheckerOperation, checker_flow::CheckerPredicate};
+                self.structure.checker_has_nonexact_require |= marker.operation != CheckerOperation::Require
+                    || !matches!(predicate, Some(CheckerPredicate::Boolean(_) | CheckerPredicate::Integer(_)));
+            }
             self.structure.checker_directives.insert(
                 ordinal,
                 PreparedCheckerDirective {
