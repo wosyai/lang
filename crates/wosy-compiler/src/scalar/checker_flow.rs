@@ -1051,6 +1051,15 @@ impl IntegerRow {
         })
     }
 
+    // Each replacement already pays for its own group; an affine endpoint
+    // also transforms the narrowed set and updates the other equality group.
+    fn charge_affine_replacement(&self, axis: usize, intervals: usize, work: &mut usize) -> Option<()> {
+        if self.affine_touches(axis) {
+            *work = work.checked_add(intervals)?.checked_add(self.equal_axes().len())?;
+        }
+        Some(())
+    }
+
     fn replace_domain(&mut self, index: usize, set: Rc<IntegerSet>) {
         let canonical = self.canonical_axis(index);
         if let Some(relation) = self.affine.as_deref() {
@@ -1248,10 +1257,18 @@ impl IntegerInputs {
     }
 
     fn singleton_axis(&self, axis: usize) -> Option<(&BigInt, &Rc<IntegerSet>)> {
+        self.singleton_axis_with(axis, || Some(()))
+    }
+
+    fn singleton_axis_with(
+        &self, axis: usize, mut inspect: impl FnMut() -> Option<()>,
+    ) -> Option<(&BigInt, &Rc<IntegerSet>)> {
         let (first, rest) = self.0.split_first()?;
+        inspect()?;
         let domain = &first[axis];
         let value = domain.singleton_value()?;
-        rest.iter().all(|row| row[axis].singleton_value() == Some(value)).then_some((value, domain))
+        rest.iter().all(|row| inspect().is_some() && row[axis].singleton_value() == Some(value))
+            .then_some((value, domain))
     }
 
     #[cfg(feature = "internal-checker")]
@@ -2723,6 +2740,7 @@ pub(super) struct ProjectedIntegerArgument<'a> {
     pub(super) slot: usize,
     path: &'a IntegerInputs,
     pub(super) companion: ProjectedCompanion<'a>,
+    affine_work: Option<&'a mut usize>,
 }
 
 #[cfg(test)]
@@ -2731,11 +2749,72 @@ std::thread_local! {
 }
 
 impl ProjectedIntegerArgument<'_> {
+    pub(super) fn materialize_bounded(&mut self) -> Option<Rc<IntegerSet>> {
+        let Some(work) = self.affine_work.as_deref_mut() else { return self.materialize(); };
+        #[cfg(test)]
+        PROJECTED_ARGUMENT_MATERIALIZATIONS.with(|count| count.set(count.get() + 1));
+        let (first, rest) = self.path.0.split_first()?;
+        let first = &first[self.caller_axis];
+        charge_call_work(work, 1)?;
+        let mut remaining = rest.iter().map(|row| &row[self.caller_axis]);
+        while let Some(domain) = remaining.next() {
+            charge_call_work(work, 1)?;
+            if Rc::ptr_eq(first, domain) { continue; }
+
+            // Only allocate the distinct-set table once the shared-domain fast
+            // path fails. Prefix rows all point to `first`; don't rescan them.
+            let mut seen = std::collections::HashSet::new();
+            let mut unique = Vec::new();
+            let mut intervals = 0usize;
+            for domain in [first, domain].into_iter().chain(remaining) {
+                charge_call_work(work, 1)?;
+                if seen.insert(Rc::as_ptr(domain)) {
+                    let count = domain.interval_count();
+                    charge_call_work(work, count)?;
+                    intervals = intervals.checked_add(count)?;
+                    unique.push(domain.as_ref());
+                }
+            }
+            // IntegerSet::union gathers, sorts and normalizes intervals.
+            let levels = usize::BITS - intervals.leading_zeros();
+            charge_call_work(work, intervals.checked_mul(1 + levels as usize)?)?;
+            return Some(Rc::new(IntegerSet::union(unique)));
+        }
+        Some(Rc::clone(first))
+    }
+
     pub(super) fn materialize(&self) -> Option<Rc<IntegerSet>> {
         #[cfg(test)]
         PROJECTED_ARGUMENT_MATERIALIZATIONS.with(|count| count.set(count.get() + 1));
         self.path.project_axis(self.caller_axis)
     }
+}
+
+#[test]
+fn bounded_projection_charges_shared_domain_by_row_not_interval() {
+    let shared = Rc::new(IntegerSet::union((0..8).map(|value| IntegerSet::singleton(&BigInt::from(value * 2)))
+        .collect::<Vec<_>>().iter()));
+    let rows = IntegerInputs((0..16).map(|_| IntegerRow::new(vec![Rc::clone(&shared)])).collect());
+    let mut work = MAX_PARTITION_TRANSFER_WORK - 16;
+    let mut projection = ProjectedIntegerArgument {
+        ty: &ScalarType::I8, caller_axis: 0, slot: 0, path: &rows,
+        companion: ProjectedCompanion::Unary, affine_work: Some(&mut work),
+    };
+    assert!(Rc::ptr_eq(&projection.materialize_bounded().unwrap(), &shared));
+    assert_eq!(work, MAX_PARTITION_TRANSFER_WORK);
+}
+
+#[test]
+fn bounded_projection_charges_distinct_interval_sort_before_materializing() {
+    let first = Rc::new(IntegerSet::singleton(&BigInt::from(1)));
+    let second = Rc::new(IntegerSet::singleton(&BigInt::from(3)));
+    let rows = IntegerInputs(vec![IntegerRow::new(vec![first]), IntegerRow::new(vec![second])]);
+    let mut work = MAX_PARTITION_TRANSFER_WORK - 9;
+    let mut projection = ProjectedIntegerArgument {
+        ty: &ScalarType::I8, caller_axis: 0, slot: 0, path: &rows,
+        companion: ProjectedCompanion::Unary, affine_work: Some(&mut work),
+    };
+    assert!(projection.materialize_bounded().is_none());
 }
 
 pub(super) enum NestedIntegerArgument<'a> {
@@ -2753,9 +2832,16 @@ enum NestedIntegerOperand<'a> {
     Axis(&'a ScalarType, usize),
 }
 
+// Hold a sticky exhausted value so argument discovery can distinguish a
+// missing operand from a refused scan even on the unary fallback route.
+fn charge_call_work(work: &mut usize, cost: usize) -> Option<()> {
+    *work = work.saturating_add(cost);
+    (*work <= MAX_PARTITION_TRANSFER_WORK).then_some(())
+}
+
 fn nested_integer_operand<'a>(
     calls: &'a FunctionCallSites, expression: OccurrenceOrdinal, slot: usize,
-    roots: &IntegerRoots<'_>, path: &'a IntegerInputs,
+    roots: &IntegerRoots<'_>, path: &'a IntegerInputs, work: Option<&mut usize>,
 ) -> Option<NestedIntegerOperand<'a>> {
     let (argument, ty) = checked_integer_call_argument_at(&calls.structure, expression, slot)?;
     if let Some(value) = calls.structure.checker_integer_literals.get(&argument) {
@@ -2766,7 +2852,12 @@ fn nested_integer_operand<'a>(
     if binding_type != ty {
         return None;
     }
-    Some(match path.singleton_at(axis) {
+    let singleton = if let Some(work) = work {
+        path.singleton_axis_with(axis, || charge_call_work(work, 1)).map(|(value, _)| value)
+    } else {
+        path.singleton_at(axis)
+    };
+    Some(match singleton {
         Some(value) => NestedIntegerOperand::Exact((ty, value)),
         None => NestedIntegerOperand::Axis(ty, axis),
     })
@@ -2774,10 +2865,20 @@ fn nested_integer_operand<'a>(
 
 fn nested_pair_argument<'a>(
     calls: &'a FunctionCallSites, expression: OccurrenceOrdinal, roots: &IntegerRoots<'_>, path: &'a IntegerInputs,
-    allow_projection: bool, allow_equal: bool, allow_independent: bool,
+    allow_projection: bool, allow_equal: bool, allow_independent: bool, mut work: Option<&mut usize>,
 ) -> Option<NestedIntegerArgument<'a>> {
-    let first = nested_integer_operand(calls, expression, 0, roots, path)?;
-    let second = nested_integer_operand(calls, expression, 1, roots, path)?;
+    let first = nested_integer_operand(calls, expression, 0, roots, path, work.as_deref_mut())?;
+    let second = nested_integer_operand(calls, expression, 1, roots, path, work.as_deref_mut())?;
+    let mut equal_axes = |left, right| {
+        left == right || path.0.iter().all(|row| {
+            if let Some(work) = work.as_deref_mut() {
+                // One binary search per canonical lookup, not a scan of all aliases.
+                let comparisons = usize::BITS - row.equal_axes().len().leading_zeros();
+                if charge_call_work(work, 1 + 2 * comparisons as usize).is_none() { return false; }
+            }
+            row.canonical_axis(left) == row.canonical_axis(right)
+        })
+    };
     let (ty, caller_axis, slot, companion) = match (first, second) {
         (NestedIntegerOperand::Exact(first), NestedIntegerOperand::Exact(second)) =>
             return Some(NestedIntegerArgument::Pair(first, second)),
@@ -2786,14 +2887,13 @@ fn nested_pair_argument<'a>(
         (NestedIntegerOperand::Exact(fixed), NestedIntegerOperand::Axis(ty, axis)) if allow_projection =>
             (ty, axis, 1, ProjectedCompanion::Fixed(fixed)),
         (NestedIntegerOperand::Axis(left_ty, left), NestedIntegerOperand::Axis(right_ty, right))
-            if allow_equal && left_ty == right_ty && (left == right
-                || path.0.iter().all(|row| row.canonical_axis(left) == row.canonical_axis(right))) =>
+            if allow_equal && left_ty == right_ty && equal_axes(left, right) =>
             (left_ty, left, 0, ProjectedCompanion::Equal),
         (NestedIntegerOperand::Axis(ty, left), NestedIntegerOperand::Axis(right_ty, right)) if allow_independent =>
             (ty, left, 0, ProjectedCompanion::Independent { ty: right_ty, axis: right }),
         _ => return None,
     };
-    Some(NestedIntegerArgument::Projected(ProjectedIntegerArgument { ty, caller_axis, slot, path, companion }))
+    Some(NestedIntegerArgument::Projected(ProjectedIntegerArgument { ty, caller_axis, slot, path, companion, affine_work: None }))
 }
 
 fn actual_nested_argument<'a>(
@@ -2801,13 +2901,13 @@ fn actual_nested_argument<'a>(
     expression: OccurrenceOrdinal,
     roots: &IntegerRoots<'_>,
     path: &'a IntegerInputs,
-    allow_projection: bool,
+    allow_projection: bool, work: Option<&mut usize>,
 ) -> NestedIntegerArgument<'a> {
-    match nested_integer_operand(calls, expression, 0, roots, path) {
+    match nested_integer_operand(calls, expression, 0, roots, path, work) {
         Some(NestedIntegerOperand::Exact(argument)) => NestedIntegerArgument::Single(Some(argument)),
         Some(NestedIntegerOperand::Axis(ty, caller_axis)) if allow_projection =>
             NestedIntegerArgument::Projected(ProjectedIntegerArgument {
-                ty, caller_axis, slot: 0, path, companion: ProjectedCompanion::Unary,
+                ty, caller_axis, slot: 0, path, companion: ProjectedCompanion::Unary, affine_work: None,
             }),
         _ => NestedIntegerArgument::Single(None),
     }
@@ -3571,9 +3671,9 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                     let signature = calls.checked_call_signatures.get(&expression)?;
                     let project = COLLECT && failures.as_ref().is_some_and(|collection| collection.allow_projected_calls);
                     let argument = if COLLECT && signature.parameters.len() == 2 {
-                        nested_pair_argument(calls, expression, roots, &path, project, false, false)?
+                        nested_pair_argument(calls, expression, roots, &path, project, false, false, None)?
                     } else {
-                        actual_nested_argument(calls, expression, roots, &path, project)
+                        actual_nested_argument(calls, expression, roots, &path, project, None)
                     };
                     let projected = match &argument {
                         NestedIntegerArgument::Projected(projection) => Some(projection.caller_axis),
@@ -3870,7 +3970,7 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                     }
                     let handle = handle_call.as_mut()?;
                     let signature = calls.checked_call_signatures.get(&origin.call)?;
-                    let argument = actual_nested_argument(calls, origin.call, roots, &path, false);
+                    let argument = actual_nested_argument(calls, origin.call, roots, &path, false, None);
                     #[cfg(feature = "internal-checker")]
                     let argument = if matches!(origin.arguments.as_slice(), [(_, CheckerIntegerCallArgument::ContextualValue)]) {
                         let NestedIntegerArgument::Single(Some(exact)) = argument else { return None; };
@@ -4058,20 +4158,36 @@ impl<'a> ExactCallCursor<'a> {
     }
 
     pub(super) fn projected_pair(
-        calls: &'a FunctionCallSites, argument: &ProjectedIntegerArgument<'_>, other: usize, expected: &ScalarType,
+        calls: &'a FunctionCallSites, argument: &mut ProjectedIntegerArgument<'_>, other: usize, expected: &ScalarType,
     ) -> Option<Self> {
         let axes = [argument.caller_axis, other];
         if argument.path.0.len().checked_mul(5)? > MAX_PARTITION_TRANSFER_WORK {
             return None;
         }
         let mut work: usize = 0;
+        let mut affine_work = argument.affine_work.as_deref_mut();
         let rows = argument.path.0.iter().enumerate().map(|(index, row)| {
-            work = work.checked_add(3)?.checked_add(row[axes[0]].interval_count())?
+            let cost = 3usize.checked_add(row[axes[0]].interval_count())?
                 .checked_add(row[axes[1]].interval_count())?;
-            if work > MAX_PARTITION_TRANSFER_WORK { return None; }
+            if let Some(affine_work) = affine_work.as_deref_mut() {
+                let comparisons = usize::BITS - row.equal_axes().len().leading_zeros();
+                charge_call_work(affine_work, cost.checked_add(2 * comparisons as usize)?)?;
+            } else {
+                work = work.checked_add(cost)?;
+                if work > MAX_PARTITION_TRANSFER_WORK { return None; }
+            }
+            let first_axis = row.canonical_axis(axes[0]);
+            let second_axis = row.canonical_axis(axes[1]);
+            let same = first_axis == second_axis;
+            // Pair entry rows can represent equality but not a nonidentity
+            // affine dependency between the two projected endpoints.
+            if !same && row.affine.as_ref().is_some_and(|edge|
+                (first_axis == edge.input && second_axis == edge.output)
+                || (first_axis == edge.output && second_axis == edge.input)) {
+                return None;
+            }
             let first = Rc::clone(&row[axes[0]]);
             let second = Rc::clone(&row[axes[1]]);
-            let same = row.canonical_axis(axes[0]) == row.canonical_axis(axes[1]);
             let mut next = if same {
                 let mut next = IntegerRow::new(vec![first]);
                 next.append_alias(0, second);
@@ -4114,22 +4230,26 @@ impl<'a> ExactCallCursor<'a> {
     }
 
     pub(super) fn arguments<'borrow>(
-        &'borrow self, calls: &'borrow FunctionCallSites, call: OccurrenceOrdinal, parameters: usize,
+        &'borrow mut self, calls: &'borrow FunctionCallSites, call: OccurrenceOrdinal, parameters: usize,
         collect: bool, project: bool, project_pair: bool, project_independent: bool,
     ) -> Option<NestedIntegerArgument<'borrow>> {
-        let argument = if collect && parameters == 2 {
-            nested_pair_argument(calls, call, &self.roots, &self.block.path, project_pair, project_pair, project_independent)?
+        let mut work = self.roots.affine_work;
+        let mut argument = if collect && parameters == 2 {
+            nested_pair_argument(calls, call, &self.roots, &self.block.path,
+                project_pair, project_pair, project_independent, work.as_mut())?
         } else {
-            actual_nested_argument(calls, call, &self.roots, &self.block.path, project)
+            actual_nested_argument(calls, call, &self.roots, &self.block.path, project, work.as_mut())
         };
-        if self.roots.affine_work.is_some() {
-            let exact = match &argument {
-                NestedIntegerArgument::Single(Some(_)) | NestedIntegerArgument::Pair(..) => true,
-                NestedIntegerArgument::Single(None) => parameters == 0,
-                _ => false,
-            };
-            if !exact && self.block.path.0.iter().any(|row| row.affine.is_some()) {
-                return None;
+        self.roots.affine_work = work;
+        if let Some(work) = &mut self.roots.affine_work {
+            if *work > MAX_PARTITION_TRANSFER_WORK { return None; }
+            match &mut argument {
+                NestedIntegerArgument::Projected(projection) if project_pair =>
+                    projection.affine_work = Some(work),
+                NestedIntegerArgument::Single(Some(_)) | NestedIntegerArgument::Pair(..) => {}
+                NestedIntegerArgument::Single(None) if parameters == 0 => {}
+                _ if self.block.path.0.iter().any(|row| row.affine.is_some()) => return None,
+                _ => {}
             }
         }
         Some(argument)
@@ -4144,18 +4264,36 @@ impl<'a> ExactCallCursor<'a> {
                 self.block.path.append_local(IntegerSet::singleton(&value));
             }
             (ExactCallEffect::Unit(_), ActualCallResult::ProjectedUnit(survivors)) => {
-                self.block.path.restrict_axis(caller_axis?, &survivors);
+                let axis = caller_axis?;
+                if let Some(work) = &mut self.roots.affine_work {
+                    let survivor_intervals = survivors.interval_count();
+                    for row in &self.block.path.0 {
+                        let comparisons = row[axis].interval_count().checked_add(survivor_intervals)?;
+                        *work = work.checked_add(comparisons)?.checked_add(row.equal_axes().len())?.checked_add(1)?;
+                        row.charge_affine_replacement(axis, comparisons, work)?;
+                        if *work > MAX_PARTITION_TRANSFER_WORK {
+                            return None;
+                        }
+                    }
+                }
+                self.block.path.restrict_axis(axis, &survivors);
             }
             (ExactCallEffect::Unit(_), ActualCallResult::ProjectedUnitPair(projected)) => {
                 let original = &self.block.path.0;
-                let mut work: usize = 0;
+                let mut work = self.roots.affine_work.unwrap_or(0);
                 for survivor in &projected.survivors.0 {
                     let index = usize::from(survivor.projected_from).checked_sub(1)?;
                     let row = original.get(index)?;
                     work = work.checked_add(row.len())?.checked_add(2usize.checked_mul(row.equal_axes().len())?)?
                         .checked_add(survivor[0].interval_count())?.checked_add(survivor[1].interval_count())?;
+                    if row.affine.is_some() {
+                        for (slot, axis) in projected.caller_axes.iter().copied().enumerate() {
+                            row.charge_affine_replacement(axis, survivor[slot].interval_count(), &mut work)?;
+                        }
+                    }
                     if work > MAX_PARTITION_TRANSFER_WORK { return None; }
                 }
+                if let Some(retained) = &mut self.roots.affine_work { *retained = work; }
                 let [first, second] = projected.caller_axes;
                 self.block.path.0 = projected.survivors.0.iter().map(|survivor| {
                     let mut row = original[usize::from(survivor.projected_from) - 1].clone();
@@ -4166,18 +4304,24 @@ impl<'a> ExactCallCursor<'a> {
             }
             (ExactCallEffect::Integer { binding, ty, .. }, ActualCallResult::PartitionedIntegerPair(projected)) => {
                 let original = &self.block.path.0;
-                let mut work: usize = 0;
+                let mut work = self.roots.affine_work.unwrap_or(0);
                 for piece in &projected.pieces {
                     let index = usize::from(piece.anchor).checked_sub(1)?;
                     let row = original.get(index)?;
                     work = work.checked_add(row.len().checked_add(1)?)?
                         .checked_add(3usize.checked_mul(row.equal_axes().len())?)?
                         .checked_add(piece.inputs[0].interval_count())?.checked_add(piece.inputs[1].interval_count())?;
+                    if row.affine.is_some() {
+                        for (slot, axis) in projected.caller_axes.iter().copied().enumerate() {
+                            row.charge_affine_replacement(axis, piece.inputs[slot].interval_count(), &mut work)?;
+                        }
+                    }
                     match &piece.output {
                         IntegerPairPartitionOutput::InputAlias(slot) | IntegerPairPartitionOutput::InputAffine(slot, _) => {
                             if self.roots.axes.get(projected.caller_axes[*slot])?.1 != ty { return None; }
                             work = work.checked_add(1)?;
                             if matches!(&piece.output, IntegerPairPartitionOutput::InputAffine(..)) {
+                                if row.affine.is_some() { return None; }
                                 work = work.checked_add(piece.inputs[*slot].interval_count())?;
                                 self.roots.affine_work.get_or_insert(0);
                             }
@@ -4186,6 +4330,7 @@ impl<'a> ExactCallCursor<'a> {
                     }
                     if work > MAX_PARTITION_TRANSFER_WORK { return None; }
                 }
+                if let Some(retained) = &mut self.roots.affine_work { *retained = work; }
                 let [first, second] = projected.caller_axes;
                 self.block.path.0 = projected.pieces.into_iter().map(|piece| {
                     let mut row = original[usize::from(piece.anchor) - 1].clone();
@@ -4219,33 +4364,54 @@ impl<'a> ExactCallCursor<'a> {
                 let rows = &self.block.path.0;
                 let cells = self.roots.axes.len().checked_add(1)?;
                 let row_intervals = rows.iter().try_fold(0usize, |sum, row| sum.checked_add(row[axis].interval_count()))?;
-                let row_copies = rows.len().checked_mul(pieces.len())?.checked_mul(cells)?;
                 let comparisons = row_intervals.checked_mul(pieces.len())?
                     .checked_add(piece_intervals.checked_mul(rows.len())?)?;
-                let alias_work = rows.iter().try_fold(0usize, |sum, row| sum.checked_add(row.equal_axes().len()))?
-                    .checked_mul(pieces.len())?;
-                let affine_work = if affine {
-                    self.roots.affine_work.get_or_insert(0);
-                    // Intersections have at most the sum of the two input lists' intervals.
-                    comparisons
-                } else { 0 };
-                if row_copies.checked_add(comparisons)?.checked_add(alias_work)?.checked_add(affine_work)? > MAX_PARTITION_TRANSFER_WORK {
-                    return None;
+                let mut retained = self.roots.affine_work;
+                if affine || retained.is_some() {
+                    charge_call_work(retained.get_or_insert(0), comparisons)?;
+                } else {
+                    let row_copies = rows.len().checked_mul(pieces.len())?.checked_mul(cells)?;
+                    let alias_work = rows.iter().try_fold(0usize, |sum, row| sum.checked_add(row.equal_axes().len()))?
+                        .checked_mul(pieces.len())?;
+                    if row_copies.checked_add(comparisons)?.checked_add(alias_work)? > MAX_PARTITION_TRANSFER_WORK {
+                        return None;
+                    }
                 }
                 let original = std::mem::take(&mut self.block.path.0);
                 let mut joined = Vec::new();
                 for row in &original {
                     for piece in &pieces {
-                        let overlap = match row[axis].intersection(&piece.input) {
-                            IntegerIntersection::Unchanged => Rc::clone(&row[axis]),
+                        let narrowed = match row[axis].intersection(&piece.input) {
+                            IntegerIntersection::Unchanged => None,
                             IntegerIntersection::Empty => continue,
-                            IntegerIntersection::Changed(values) => Rc::new(values),
+                            IntegerIntersection::Changed(values) => Some(values),
                         };
+                        let add_edge = matches!(&piece.output, IntegerPartitionOutput::InputAffine(_));
+                        // One edge per row: disjoint paths may each introduce an edge,
+                        // but never replace an existing relation on a feasible join.
+                        if add_edge && row.affine.is_some() { return None; }
+                        if let Some(work) = &mut retained {
+                            charge_call_work(work, cells)?;
+                            if let Some(values) = &narrowed {
+                                charge_call_work(work, row.equal_axes().len())?;
+                                row.charge_affine_replacement(axis, values.interval_count(), work)?;
+                            }
+                            if matches!(&piece.output, IntegerPartitionOutput::InputAlias) {
+                                charge_call_work(work, row.equal_axes().len())?;
+                            }
+                            if add_edge {
+                                let values = narrowed.as_ref().unwrap_or_else(|| row[axis].as_ref());
+                                charge_call_work(work, values.interval_count().checked_add(1)?)?;
+                            }
+                            if *work > MAX_PARTITION_TRANSFER_WORK { return None; }
+                        }
                         let mut next = row.clone();
-                        next.replace_domain(axis, Rc::clone(&overlap));
+                        if let Some(values) = narrowed {
+                            next.replace_domain(axis, Rc::new(values));
+                        }
                         match &piece.output {
                             IntegerPartitionOutput::Singleton(output) => next.push(Rc::clone(output)),
-                            IntegerPartitionOutput::InputAlias => next.append_alias(axis, overlap),
+                            IntegerPartitionOutput::InputAlias => next.append_alias(axis, Rc::clone(&next[axis])),
                             IntegerPartitionOutput::InputAffine(transform) => next.append_affine(axis, Rc::clone(transform)),
                         }
                         joined.push(next);
@@ -4253,6 +4419,7 @@ impl<'a> ExactCallCursor<'a> {
                 }
                 self.roots.add(binding, ty);
                 self.block.path = IntegerInputs(joined);
+                self.roots.affine_work = retained;
             }
             _ => return None,
         }

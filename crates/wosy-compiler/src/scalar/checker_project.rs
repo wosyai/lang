@@ -1630,7 +1630,7 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             Observer::ORDINARY_PROJECTED_PAIR,
         )
             .ok_or(ProjectCheck::Unsupported)?;
-        if let NestedIntegerArgument::Projected(projection) = arguments {
+        if let NestedIntegerArgument::Projected(mut projection) = arguments {
             if !Observer::INTEGER_RETURN_PARTITIONS
                 || (!Observer::PROJECTED_FORMAL_WRITES && !body.assignments.is_empty())
                 || self.active.contains(&target)
@@ -1642,9 +1642,9 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                 return Err(ProjectCheck::Unsupported);
             }
             let cursor = if let ProjectedCompanion::Independent { axis, .. } = projection.companion {
-                ExactCallCursor::projected_pair(body, &projection, axis, expected)
+                ExactCallCursor::projected_pair(body, &mut projection, axis, expected)
             } else {
-                let values = projection.materialize().ok_or(ProjectCheck::Unsupported)?;
+                let values = projection.materialize_bounded().ok_or(ProjectCheck::Unsupported)?;
                 ExactCallCursor::projected_arguments(body, values, &projection, expected)
             }.ok_or(ProjectCheck::Unsupported)?;
             self.active.insert(target);
