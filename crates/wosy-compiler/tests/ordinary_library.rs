@@ -684,6 +684,58 @@ if (result != 58) { core.system_panic(); };
 }
 
 #[test]
+fn mixed_reversed_result_joins_scalar_writes_without_changing_the_owner() {
+    let app = source("workbench", "src/reversed_owned_join.w");
+    let text = r#"%%start
+struct Packet { *?u8 data; u64 length; }
+(u32, Packet)(u64, bool) make_packet = fn(length, choose_other) {
+    u8[length] backing;
+    backing[0] = 19;
+    *?u8 data = null;
+    unsafe { data = &?backing[0]; };
+    Packet packet = { .data = data; .length = length; };
+    u32 marker = 37;
+    if (choose_other) { marker = 43; };
+    marker, packet
+};
+u64(bool) consume_packet = fn(choose_other) {
+    u32 marker, Packet packet = make_packet(2, choose_other);
+    u8 byte = unsafe { core.load<u8>(packet.data) };
+    packet.length + core.int_extend<u64>(byte) + core.int_extend<u64>(marker)
+};
+u64 primary = consume_packet(false);
+u64 alternate = consume_packet(true);
+if (primary != 58 || alternate != 64) { core.system_panic(); };
+%%end"#;
+    for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let prepared = prepare_scalar_project(
+            vec![(declarations(&app, text), Vec::new())],
+            vec![app.clone()],
+            ScalarPreparationInputs { target_layout },
+        ).unwrap_or_else(|error| panic!("{target_layout:?}: {:?}", error.diagnostics));
+        let build = analyze_scalar_build(&prepared);
+        assert!(build.diagnostics().is_empty(), "{:#?}", build.diagnostics());
+        let llvm = emit_scalar_build_project_llvm(&build).unwrap().to_text();
+        let context = Context::create();
+        let buffer = MemoryBuffer::create_from_memory_range_copy(llvm.as_bytes(), "reversed-owner-join");
+        let module = context.create_module_from_ir(buffer).unwrap();
+        module.verify().unwrap();
+        use inkwell::values::AnyValue;
+        let producer = function_with_suffix(&module, "make_packet");
+        let consumer = function_with_suffix(&module, "consume_packet");
+        let producer_ir = module.get_function(&producer).unwrap().print_to_string().to_string();
+        let consumer_ir = module.get_function(&consumer).unwrap().print_to_string().to_string();
+        assert!(producer_ir.contains("br i1 ") && producer_ir.contains("ret { i32, ptr }"), "{producer_ir}");
+        assert!(!producer_ir.contains("call void @__wosy_core_free"), "{producer_ir}");
+        assert_eq!(consumer_ir.matches(&format!("call {{ i32, ptr }} @{producer}(")).count(), 1, "{consumer_ir}");
+        assert!(consumer_ir.contains("extractvalue { i32, ptr } %aggregate_original_base, 1"), "{consumer_ir}");
+        assert_eq!(consumer_ir.matches("call void @__wosy_core_free").count(), 1, "{consumer_ir}");
+        let release = consumer_ir.find("call void @__wosy_core_free(ptr %aggregate_base)").expect("exact owner release");
+        assert!(consumer_ir[..release].contains("load i8"), "{consumer_ir}");
+    }
+}
+
+#[test]
 fn mixed_owned_struct_forwarder_transports_original_receipts_without_copying() {
     let app = source("workbench", "src/mixed_owner_forward.w");
     let text = r#"%%start
