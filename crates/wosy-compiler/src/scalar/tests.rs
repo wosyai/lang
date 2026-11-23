@@ -7415,6 +7415,64 @@ fn rejects_invalid_character_shapes_at_literal_spans() {
 }
 
 #[test]
+fn cst_literal_diagnostics_keep_category_order_and_exact_spans() {
+    let text = r#"%%start
+struct Bounds { i32[-3] first; i32[0b2] second; }
+f64 floating = 1.0e999;
+std.utf8 first_string = "\q";
+char character = '\z';
+i32 integer = 0xg;
+std.utf8 second_string = "\v";
+%%end"#;
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let canonical = parsed.result.canonical_cst();
+    let expected = [
+        ("B0003", "invalid string literal", r"\q", "invalid string literal"),
+        ("B0003", "invalid string literal", r"\v", "invalid string literal"),
+        ("B0003", "invalid character literal", r"\z", "invalid character literal"),
+        ("B0010", "invalid integer literal", "0b2", "invalid integer literal"),
+        ("B0010", "invalid integer literal", "0xg", "invalid integer literal"),
+        (
+            "B0010",
+            "invalid finite floating-point literal",
+            "1.0e999",
+            "invalid finite floating-point literal",
+        ),
+        (
+            "B0003",
+            "fixed array length must be an unsigned u64",
+            "-3",
+            "invalid fixed array length",
+        ),
+        (
+            "B0003",
+            "fixed array length must be an unsigned u64",
+            "0b2",
+            "invalid fixed array length",
+        ),
+    ];
+    let expected = expected.map(|(code, message, literal, label)| {
+        let start = text.find(literal).expect("in fixture") as u32;
+        super::super::Diagnostic {
+            code: code.to_owned(),
+            severity: super::super::DiagnosticSeverity::Error,
+            message: message.to_owned(),
+            labels: vec![super::super::DiagnosticLabel {
+                kind: super::super::DiagnosticLabelKind::Primary,
+                span: SourceSpan::new(
+                    canonical.source.clone(),
+                    ByteSpan::new(start, start + literal.len() as u32),
+                ),
+                message: label.to_owned(),
+            }],
+            notes: Vec::new(),
+        }
+    });
+    assert_eq!(derive_scalar_diagnostics_from_cst(canonical), expected);
+}
+
+#[test]
 fn reports_malformed_string_escapes_at_their_exact_spans() {
     let cases = [
         (r##"\q"##, 1, 3),

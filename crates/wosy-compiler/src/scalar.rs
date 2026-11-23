@@ -2501,12 +2501,71 @@ use typecheck::{
 };
 use typecheck::{split_module_typing, ScalarModuleTyping, ScalarProgramTyping};
 pub fn derive_scalar_diagnostics_from_cst(canonical: &CanonicalCstRoot) -> Vec<super::Diagnostic> {
-    let mut diagnostics = string_diagnostics(canonical);
-    diagnostics.extend(char_diagnostics(canonical));
-    diagnostics.extend(integer_diagnostics(canonical));
-    diagnostics.extend(float_diagnostics(canonical));
-    diagnostics.extend(fixed_array_length_diagnostics(canonical));
-    diagnostics
+    let [mut strings, mut chars, mut integers, mut floats, mut lengths] =
+        [const { Vec::new() }; 5];
+    for element in canonical.root.descendants_with_tokens() {
+        match element {
+            NodeOrToken::Token(token) => {
+                let (diagnostics, code, message, span) = match token.kind() {
+                    SyntaxKind::String => {
+                        let Err((start, length)) = decode_string(token.text()) else {
+                            continue;
+                        };
+                        (
+                            &mut strings,
+                            "B0003",
+                            "invalid string literal",
+                            string_error_span(&token, start, length),
+                        )
+                    }
+                    SyntaxKind::Char => {
+                        let Err((start, length)) = decode_char(token.text()) else {
+                            continue;
+                        };
+                        (
+                            &mut chars,
+                            "B0003",
+                            "invalid character literal",
+                            string_error_span(&token, start, length),
+                        )
+                    }
+                    SyntaxKind::Integer if parse_integer(token.text()).is_none() => (
+                        &mut integers,
+                        "B0010",
+                        "invalid integer literal",
+                        token_span(&token),
+                    ),
+                    SyntaxKind::Float if parse_float(token.text()).is_none() => (
+                        &mut floats,
+                        "B0010",
+                        "invalid finite floating-point literal",
+                        token_span(&token),
+                    ),
+                    _ => continue,
+                };
+                diagnostics.push(super::Diagnostic {
+                    code: code.to_owned(),
+                    severity: super::DiagnosticSeverity::Error,
+                    message: message.to_owned(),
+                    labels: vec![super::DiagnosticLabel {
+                        kind: super::DiagnosticLabelKind::Primary,
+                        span: SourceSpan::new(canonical.source.clone(), span),
+                        message: message.to_owned(),
+                    }],
+                    notes: Vec::new(),
+                });
+            }
+            NodeOrToken::Node(node) if node.kind() == SyntaxKind::FixedArrayLength => {
+                lengths.extend(fixed_array_length_diagnostic(&canonical.source, &node));
+            }
+            _ => {}
+        }
+    }
+    strings.append(&mut chars);
+    strings.append(&mut integers);
+    strings.append(&mut floats);
+    strings.append(&mut lengths);
+    strings
 }
 
 #[cfg(test)]
@@ -3836,33 +3895,26 @@ fn derive_callable_array_type(node: &CstNode) -> ScalarType {
     derive_type(node)
 }
 
-fn fixed_array_length_diagnostics(canonical: &CanonicalCstRoot) -> Vec<super::Diagnostic> {
-    canonical
-        .root
-        .descendants()
-        .filter(|node| node.kind() == SyntaxKind::FixedArrayLength)
-        .filter_map(|length| {
-            let token = direct_token(&length, SyntaxKind::Integer)?;
-            let negative = length
-                .children_with_tokens()
-                .any(|element| matches!(element, NodeOrToken::Token(token) if token.kind() == SyntaxKind::Punctuation && token.text() == "-"));
-            (!negative && parse_integer(token.text())
-                .and_then(|value| u64::try_from(value).ok())
-                .is_none()
-                || negative)
-                .then(|| super::Diagnostic {
-                    code: "B0003".to_owned(),
-                    severity: super::DiagnosticSeverity::Error,
-                    message: "fixed array length must be an unsigned u64".to_owned(),
-                    labels: vec![super::DiagnosticLabel {
-                        kind: super::DiagnosticLabelKind::Primary,
-                        span: SourceSpan::new(canonical.source.clone(), wosy_syntax::byte_span(&length)),
-                        message: "invalid fixed array length".to_owned(),
-                    }],
-                    notes: Vec::new(),
-                })
+fn fixed_array_length_diagnostic(
+    source: &SourceIdentity,
+    length: &CstNode,
+) -> Option<super::Diagnostic> {
+    let token = direct_token(length, SyntaxKind::Integer)?;
+    let negative = length
+        .children_with_tokens()
+        .any(|element| matches!(element, NodeOrToken::Token(token) if token.kind() == SyntaxKind::Punctuation && token.text() == "-"));
+    (negative || parse_integer(token.text()).and_then(|value| u64::try_from(value).ok()).is_none())
+        .then(|| super::Diagnostic {
+            code: "B0003".to_owned(),
+            severity: super::DiagnosticSeverity::Error,
+            message: "fixed array length must be an unsigned u64".to_owned(),
+            labels: vec![super::DiagnosticLabel {
+                kind: super::DiagnosticLabelKind::Primary,
+                span: SourceSpan::new(source.clone(), wosy_syntax::byte_span(length)),
+                message: "invalid fixed array length".to_owned(),
+            }],
+            notes: Vec::new(),
         })
-        .collect()
 }
 
 fn qualified_type(node: &CstNode) -> ScalarType {
@@ -3992,89 +4044,6 @@ fn decode_char(value: &str) -> Result<char, (usize, usize)> {
     Ok(character)
 }
 
-fn string_diagnostics(canonical: &CanonicalCstRoot) -> Vec<super::Diagnostic> {
-    canonical
-        .root
-        .descendants_with_tokens()
-        .filter_map(|element| match element {
-            NodeOrToken::Token(token) if token.kind() == SyntaxKind::String => {
-                decode_string(token.text())
-                    .err()
-                    .map(|(start, length)| super::Diagnostic {
-                        code: "B0003".to_owned(),
-                        severity: super::DiagnosticSeverity::Error,
-                        message: "invalid string literal".to_owned(),
-                        labels: vec![super::DiagnosticLabel {
-                            kind: super::DiagnosticLabelKind::Primary,
-                            span: SourceSpan::new(
-                                canonical.source.clone(),
-                                string_error_span(&token, start, length),
-                            ),
-                            message: "invalid string literal".to_owned(),
-                        }],
-                        notes: Vec::new(),
-                    })
-            }
-            _ => None,
-        })
-        .collect()
-}
-
-fn char_diagnostics(canonical: &CanonicalCstRoot) -> Vec<super::Diagnostic> {
-    canonical
-        .root
-        .descendants_with_tokens()
-        .filter_map(|element| match element {
-            NodeOrToken::Token(token) if token.kind() == SyntaxKind::Char => {
-                decode_char(token.text())
-                    .err()
-                    .map(|(start, length)| super::Diagnostic {
-                        code: "B0003".to_owned(),
-                        severity: super::DiagnosticSeverity::Error,
-                        message: "invalid character literal".to_owned(),
-                        labels: vec![super::DiagnosticLabel {
-                            kind: super::DiagnosticLabelKind::Primary,
-                            span: SourceSpan::new(
-                                canonical.source.clone(),
-                                string_error_span(&token, start, length),
-                            ),
-                            message: "invalid character literal".to_owned(),
-                        }],
-                        notes: Vec::new(),
-                    })
-            }
-            _ => None,
-        })
-        .collect()
-}
-
-fn integer_diagnostics(canonical: &CanonicalCstRoot) -> Vec<super::Diagnostic> {
-    canonical
-        .root
-        .descendants_with_tokens()
-        .filter_map(|element| match element {
-            NodeOrToken::Token(token) if token.kind() == SyntaxKind::Integer => {
-                if parse_integer(token.text()).is_none() {
-                    Some(super::Diagnostic {
-                        code: "B0010".to_owned(),
-                        severity: super::DiagnosticSeverity::Error,
-                        message: "invalid integer literal".to_owned(),
-                        labels: vec![super::DiagnosticLabel {
-                            kind: super::DiagnosticLabelKind::Primary,
-                            span: SourceSpan::new(canonical.source.clone(), token_span(&token)),
-                            message: "invalid integer literal".to_owned(),
-                        }],
-                        notes: Vec::new(),
-                    })
-                } else {
-                    None
-                }
-            }
-            _ => None,
-        })
-        .collect()
-}
-
 fn parse_float(text: &str) -> Option<f64> {
     if text.starts_with('_') || text.ends_with('_') || text.contains("__") {
         return None;
@@ -4093,31 +4062,6 @@ fn parse_float(text: &str) -> Option<f64> {
     }
     let value = text.replace('_', "").parse::<f64>().ok()?;
     value.is_finite().then_some(value)
-}
-
-fn float_diagnostics(canonical: &CanonicalCstRoot) -> Vec<super::Diagnostic> {
-    canonical
-        .root
-        .descendants_with_tokens()
-        .filter_map(|element| match element {
-            NodeOrToken::Token(token) if token.kind() == SyntaxKind::Float => {
-                parse_float(token.text())
-                    .is_none()
-                    .then(|| super::Diagnostic {
-                        code: "B0010".to_owned(),
-                        severity: super::DiagnosticSeverity::Error,
-                        message: "invalid finite floating-point literal".to_owned(),
-                        labels: vec![super::DiagnosticLabel {
-                            kind: super::DiagnosticLabelKind::Primary,
-                            span: SourceSpan::new(canonical.source.clone(), token_span(&token)),
-                            message: "invalid finite floating-point literal".to_owned(),
-                        }],
-                        notes: Vec::new(),
-                    })
-            }
-            _ => None,
-        })
-        .collect()
 }
 
 fn string_error_span(token: &CstToken, start: usize, length: usize) -> ByteSpan {
