@@ -8494,8 +8494,52 @@ mod tests {
         assert_eq!(collect_ordered_package_failures(&prepared, ScalarCheckerScope::MainFlowOnly, 1), Ok((false, Vec::new())));
         let (_, actual) = prepare(guard, "checked(7, 1);");
         assert_eq!(collect_ordered_package_failures(&actual, ScalarCheckerScope::MainFlowOnly, 1), Err(ProjectCheck::Unsupported));
-        let (_, different_axis) = prepare("x < 2 || y > 6", "");
-        assert_eq!(collect_ordered_package_failures(&different_axis, ScalarCheckerScope::CurrentPackage, 1), Err(ProjectCheck::Unsupported));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordered_base_cross_axis_disjunction_preserves_both_true_causes_after_join() {
+        let app = source("src/main.w", "root-branch-cross-axis-disjunction");
+        let body = format!(r#"%%start
+            unit(u8, i8) checked = fn(x, y) {{
+                if (x < 2 || y >= -2) {{
+                    core.require(false, {OUTPUT});
+                }} else {{
+                    core.require(x >= 2, {OUTPUT});
+                    core.require(y < -2, {OUTPUT});
+                    core.narrow(false, {OUTPUT});
+                    core.require(false, {OUTPUT});
+                }};
+                core.require(x != 2, {OUTPUT});
+            }};
+            %%end"#);
+        let prepare = |text: &str| prepare_checker_project(
+            vec![(declarations(&app, text), Vec::new())], vec![app.clone()], inputs(),
+        ).unwrap();
+        let project = prepare(&body);
+        let (active, failures) = collect_ordered_package_failures(&project, ScalarCheckerScope::CurrentPackage, 1).unwrap();
+        assert!(active);
+        let records = failures.iter().map(|failure| {
+            let ProjectCheck::Failed { condition, state, operation, .. } = failure else { panic!("expected callable failure"); };
+            (&body[condition.start as usize..condition.end as usize], *operation, state)
+        }).collect::<Vec<_>>();
+        let [("false", CheckerOperation::Require, entered), ("false", CheckerOperation::Narrow, removed),
+             ("x != 2", CheckerOperation::Require, after)] = records.as_slice()
+        else { panic!("expected separate true, false and continued paths"); };
+        assert!(entered.includes_signed(&[0, -128]));
+        assert!(entered.includes_signed(&[2, -2]));
+        assert!(!entered.includes_signed(&[2, -3]));
+        assert!(removed.includes_signed(&[2, -3]));
+        assert!(!removed.includes_signed(&[2, -2]));
+        assert!(!removed.includes_signed(&[1, -3]));
+        assert!(after.includes_signed(&[2, -2]));
+        assert!(!after.includes_signed(&[2, -3]));
+        assert!(!after.includes_signed(&[1, -2]));
+        assert_eq!(collect_ordered_package_failures(&project, ScalarCheckerScope::MainFlowOnly, 1), Ok((false, Vec::new())));
+        let outside = body.replace("y >= -2)", "y >= y)");
+        assert_ne!(outside, body);
+        assert_eq!(collect_ordered_package_failures(&prepare(&outside), ScalarCheckerScope::CurrentPackage, 1),
+            Err(ProjectCheck::Unsupported));
     }
 
     #[cfg(feature = "internal-checker")]
@@ -9695,8 +9739,15 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
         let [failure] = valid.directives.as_slice() else { panic!("one caller requirement"); };
         let seven = BigInt::from(7);
         assert!(failure.witness.intervals_at(0, 0).unwrap().eq([(&seven, &seven)]));
-        let outside = caller.replace("producer(0, 0)", "producer(-1, 0)");
-        assert!(matches!(run(&package(producer, &outside)), Err(ProjectCheck::Unsupported)));
+        let either = producer.replace("&& limit >= 0", "|| limit > 0");
+        let disjunctive = run(&package(&either, &caller)).unwrap();
+        assert!(disjunctive.active && disjunctive.diagnostics.is_empty() && disjunctive.symbolic_diagnostic.is_none());
+        let [failure] = disjunctive.directives.as_slice() else { panic!("one caller requirement"); };
+        assert!(failure.witness.intervals_at(0, 0).unwrap().eq([(&seven, &seven)]));
+        let outside = caller.replace("producer(0, 0)", "producer(-1, 1)");
+        assert!(matches!(run(&package(&either, &outside)), Err(ProjectCheck::Unsupported)));
+        let outside_conjunction = caller.replace("producer(0, 0)", "producer(-1, 0)");
+        assert!(matches!(run(&package(producer, &outside_conjunction)), Err(ProjectCheck::Unsupported)));
 
         let bad = producer.replace("limit >= 0", "limit > 0");
         let rejected = run(&package(&bad, "")).unwrap();

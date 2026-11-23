@@ -182,10 +182,10 @@ impl<'a> ScopedAuthoredReturn<'a> for () {
 
 #[cfg(feature = "internal-checker")]
 #[derive(Clone, Copy)]
-struct OrderedRootConditions<'a, const CONJUNCTION: bool = false>(&'a super::ScalarBlock);
+struct OrderedRootConditions<'a, const EXACT_COMPOUND: bool = false>(&'a super::ScalarBlock);
 
 #[cfg(feature = "internal-checker")]
-impl<'a, const CONJUNCTION: bool> ScopedAuthoredReturn<'a> for OrderedRootConditions<'a, CONJUNCTION> {
+impl<'a, const EXACT_COMPOUND: bool> ScopedAuthoredReturn<'a> for OrderedRootConditions<'a, EXACT_COMPOUND> {
     const ENABLED: bool = false;
 
     fn at(
@@ -227,7 +227,7 @@ impl<'a, const CONJUNCTION: bool> ScopedAuthoredReturn<'a> for OrderedRootCondit
         };
         let conjunction = match operator {
             BinaryOperator::Or => false,
-            BinaryOperator::And if CONJUNCTION => true,
+            BinaryOperator::And if EXACT_COMPOUND => true,
             _ => return None,
         };
         if child(slot.parent, OccurrenceEdge::Condition) != Some(slot.condition)
@@ -256,7 +256,7 @@ impl<'a, const CONJUNCTION: bool> ScopedAuthoredReturn<'a> for OrderedRootCondit
         };
         let (axis, ty, left_operator, left_bound) = atom(left.as_ref(), OccurrenceEdge::BinaryLeft)?;
         let (other_axis, other_ty, right_operator, right_bound) = atom(right.as_ref(), OccurrenceEdge::BinaryRight)?;
-        if !conjunction && axis != other_axis {
+        if !conjunction && axis != other_axis && !EXACT_COMPOUND {
             return None;
         }
         let (min, max) = super::typecheck::integer_bounds(ty)?;
@@ -271,6 +271,11 @@ impl<'a, const CONJUNCTION: bool> ScopedAuthoredReturn<'a> for OrderedRootCondit
             let (left_true, left_false) = path.split_axis(axis, left_operator, &left_bound)?;
             let (yes, right_false) = left_true.split_axis(other_axis, right_operator, &right_bound)?;
             return Some((yes, left_false.join(right_false, Some(axis)), Some(axis)));
+        }
+        if axis != other_axis {
+            let (left_true, left_false) = path.split_axis(axis, left_operator, &left_bound)?;
+            let (right_true, no) = left_false.split_axis(other_axis, right_operator, &right_bound)?;
+            return Some((left_true.join(right_true, Some(axis)), no, Some(axis)));
         }
         let accepted = IntegerCutUnion::new(
             (IntegerRelation::from_operator(left_operator)?, &left_bound),
