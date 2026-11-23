@@ -4045,22 +4045,29 @@ fn decode_char(value: &str) -> Result<char, (usize, usize)> {
 }
 
 fn parse_float(text: &str) -> Option<f64> {
-    if text.starts_with('_') || text.ends_with('_') || text.contains("__") {
-        return None;
-    }
-    let mut previous = None;
-    for character in text.chars() {
-        if character == '_'
-            && matches!(
-                previous,
-                None | Some('.') | Some('e') | Some('E') | Some('+') | Some('-')
-            )
-        {
+    let normalized;
+    let text = if text.contains('_') {
+        if text.starts_with('_') || text.ends_with('_') || text.contains("__") {
             return None;
         }
-        previous = Some(character);
-    }
-    let value = text.replace('_', "").parse::<f64>().ok()?;
+        let mut previous = None;
+        for character in text.chars() {
+            if character == '_'
+                && matches!(
+                    previous,
+                    None | Some('.') | Some('e') | Some('E') | Some('+') | Some('-')
+                )
+            {
+                return None;
+            }
+            previous = Some(character);
+        }
+        normalized = text.replace('_', "");
+        normalized.as_str()
+    } else {
+        text
+    };
+    let value = text.parse::<f64>().ok()?;
     value.is_finite().then_some(value)
 }
 
@@ -4820,16 +4827,7 @@ fn parse_integer(text: &str) -> Option<BigInt> {
             previous_underscore = false;
         }
     }
-    BigInt::parse_bytes(
-        digits
-            .as_bytes()
-            .iter()
-            .filter(|byte| **byte != b'_')
-            .copied()
-            .collect::<Vec<_>>()
-            .as_slice(),
-        radix,
-    )
+    BigInt::parse_bytes(digits.as_bytes(), radix)
 }
 
 fn token_span(token: &CstToken) -> ByteSpan {

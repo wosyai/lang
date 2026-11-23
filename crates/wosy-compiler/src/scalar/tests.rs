@@ -7415,6 +7415,52 @@ fn rejects_invalid_character_shapes_at_literal_spans() {
 }
 
 #[test]
+fn integer_literals_keep_radix_values_and_separator_rules() {
+    for (text, value) in [
+        ("0", 0),
+        ("12345", 12345),
+        ("12_345", 12345),
+        ("0xAa", 170),
+        ("0XA_a", 170),
+        ("0b1010", 10),
+        ("0B10_10", 10),
+        ("0o17", 15),
+        ("0O1_7", 15),
+    ] {
+        assert_eq!(parse_integer(text), Some(BigInt::from(value)), "{text}");
+    }
+    let large = "340282366920938463463374607431768211456";
+    assert_eq!(parse_integer(large), Some(BigInt::from(1) << 128));
+    for text in [
+        "", "0x", "0b", "0o", "+1", "-1", "0x+1", "0x-1", "10u8", "0b2", "0xg",
+        "0o8", "_1", "1_", "1__2", "0x_FF", "0B1_", "0o1__7", "１２",
+    ] {
+        assert_eq!(parse_integer(text), None, "{text}");
+    }
+}
+
+#[test]
+fn float_literals_keep_exact_values_and_separator_rules() {
+    for (text, value) in [
+        ("1.5", 1.5_f64),
+        ("1_.5", 1.5),
+        ("1_0.2_5e-1", 1.025),
+        ("1e1_0", 1e10),
+        ("1_e2", 1e2),
+        ("1E+2", 1e2),
+        ("1e-999", 0.0),
+    ] {
+        assert_eq!(parse_float(text).map(f64::to_bits), Some(value.to_bits()), "{text}");
+    }
+    for text in [
+        "", "NaN", "inf", "1.0e999", "1_0e999", "1.2f32", "1e", "1e+", "_1.0",
+        "1.0_", "1.0__2", "1._0", "1e_2", "1E_2", "1e+_2", "1e-_2",
+    ] {
+        assert_eq!(parse_float(text), None, "{text}");
+    }
+}
+
+#[test]
 fn cst_literal_diagnostics_keep_category_order_and_exact_spans() {
     let text = r#"%%start
 struct Bounds { i32[-3] first; i32[0b2] second; }
