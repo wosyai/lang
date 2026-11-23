@@ -1250,8 +1250,25 @@ impl<Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> CheckedCalls<'
             return Err(ProjectCheck::Unsupported);
         };
         #[cfg(feature = "internal-checker")]
+        let contextual_value = matches!(&argument, NestedIntegerArgument::ContextualValue(_));
+        #[cfg(feature = "internal-checker")]
+        if contextual_value && (!ACTUAL_STARTUP || Observer::ENABLED || Observer::CONTEXTUAL) {
+            return Err(ProjectCheck::Unsupported);
+        }
+        #[cfg(feature = "internal-checker")]
         let mut proof_site = None;
         let collection = match collection {
+            #[cfg(feature = "internal-checker")]
+            Some((caller_source, ordered)) if contextual_value => {
+                if caller_source != source || ordered.outer.is_none()
+                    || caller.structure.checker_integer_call_locals.len() != 1 || !is_integer_type(expected)
+                {
+                    return Err(ProjectCheck::Unsupported);
+                }
+                Some((caller_source, OrderedCallCollection { outer: None, ..ordered }))
+            }
+            #[cfg(feature = "internal-checker")]
+            None if contextual_value => return Err(ProjectCheck::Unsupported),
             Some((caller_source, ordered)) if *expected == ScalarType::Unit => {
                 #[cfg(feature = "internal-checker")]
                 let ordered = OrderedCallCollection { outer: None, ..ordered };
@@ -1284,7 +1301,8 @@ impl<Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> CheckedCalls<'
         let projected = match argument {
             NestedIntegerArgument::Single(exact) => ActualProjectedArguments::Single(exact),
             #[cfg(feature = "internal-checker")]
-            NestedIntegerArgument::RootLexical(exact) => ActualProjectedArguments::Single(Some(exact)),
+            NestedIntegerArgument::RootLexical(exact) | NestedIntegerArgument::ContextualValue(exact) =>
+                ActualProjectedArguments::Single(Some(exact)),
             NestedIntegerArgument::Pair(first, second) => ActualProjectedArguments::ExactPair(first, second),
             NestedIntegerArgument::Projected(projection) => ActualProjectedArguments::SymbolicAxis(projection),
         };
@@ -7791,6 +7809,52 @@ mod tests {
             let incomplete = program.replace("core.require(input > 0", "core.narrow(input > 0")
                 .replace("i8 first = evaluate(-3);", &format!("core.require(false, {}); i8 first = evaluate(-3);", report(31)));
             assert!(matches!(run(&incomplete, scope), Err(ScalarOrderedCheckerOutcome::Unsupported)));
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordered_base_call_copies_exact_contextual_integer_into_callee_parameter() {
+        let app = source("src/main.w", "ordered-contextual-call-argument");
+        let report = |code: i32| OUTPUT.replace(".code = 1", &format!(".code = {code}"));
+        let program = format!(r#"%%start
+            i8(i8) evaluate = fn(input) {{
+                core.require(input < 0, {});
+                if (input > 0) {{ 7 }} else {{ input }}
+            }};
+            unit(i8) caller = fn(entry) {{
+                core.require(entry > 0, {});
+                i8 core.context.count = 3;
+                i8 result = evaluate(core.context.count);
+                core.require(result == 8, {});
+                core.require(core.context.count == 3, {});
+            }};
+            caller(1);
+        %%end"#, report(7), report(5), report(13), report(17));
+        let run = |text: &str, scope| check_loaded_scalar_ordered_local_proof_contexts(
+            vec![(declarations(&app, text), Vec::new())], Vec::new(), vec![app.clone()],
+            inputs(), scope, Vec::new(),
+        );
+        for scope in [ScalarCheckerScope::MainFlowOnly, ScalarCheckerScope::CurrentPackage] {
+            let receipt = run(&program, scope)
+                .unwrap_or_else(|error| panic!("proof-free contextual arguments in {scope:?}: {error:?}"));
+            assert!(receipt.active && receipt.diagnostics.is_empty() && receipt.symbolic_diagnostic.is_none());
+            let [callee, caller] = receipt.directives.as_slice() else { panic!("expected callee then caller"); };
+            let text = |span: ByteSpan| &program[span.start as usize..span.end as usize];
+            assert_eq!(text(callee.condition), "input < 0");
+            assert_eq!(text(caller.condition), "result == 8");
+            assert_eq!(callee.code(), &BigInt::from(7));
+            assert_eq!(caller.code(), &BigInt::from(13));
+            let input = BigInt::from(3);
+            let result = BigInt::from(7);
+            assert!(callee.witness.intervals_at(0, 0).unwrap().eq([(&input, &input)]));
+            assert!(caller.witness.intervals_at(0, 1).unwrap().eq([(&input, &input)]));
+            assert!(caller.witness.intervals_at(0, 2).unwrap().eq([(&result, &result)]));
+
+            let narrowing = program.replace("core.require(input < 0", "core.narrow(input < 0");
+            assert!(matches!(run(&narrowing, scope), Err(ScalarOrderedCheckerOutcome::Unsupported)));
+            let ordinary = program.replace("core.context.count", "count");
+            assert!(matches!(run(&ordinary, scope), Err(ScalarOrderedCheckerOutcome::Unsupported)));
         }
     }
 

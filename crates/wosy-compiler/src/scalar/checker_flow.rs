@@ -2295,6 +2295,8 @@ pub(super) enum NestedIntegerArgument<'a> {
     Single(Option<ExactIntegerArgument<'a>>),
     #[cfg(feature = "internal-checker")]
     RootLexical(ExactIntegerArgument<'a>),
+    #[cfg(feature = "internal-checker")]
+    ContextualValue(ExactIntegerArgument<'a>),
     Pair(ExactIntegerArgument<'a>, ExactIntegerArgument<'a>),
     Projected(ProjectedIntegerArgument<'a>),
 }
@@ -3176,6 +3178,7 @@ fn walk_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, A
                     for (slot, (ordinal, argument)) in origin.arguments.as_slice().iter().enumerate() {
                         arguments[slot] = Some(match argument {
                             CheckerIntegerCallArgument::Literal(value) => Argument::Literal(value),
+                            CheckerIntegerCallArgument::ContextualValue => return None,
                             CheckerIntegerCallArgument::PlainName => {
                                 let PlainNameIdentity::Lexical(argument) = calls.prepared_plain_name(*ordinal)? else {
                                     return None;
@@ -3234,6 +3237,17 @@ fn walk_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, A
                     };
                     let signature = calls.checked_call_signatures.get(&origin.call)?;
                     let argument = actual_nested_argument(calls, origin.call, roots, &path, false);
+                    #[cfg(feature = "internal-checker")]
+                    let argument = if matches!(origin.arguments.as_slice(), [(_, CheckerIntegerCallArgument::ContextualValue)]) {
+                        let NestedIntegerArgument::Single(Some(exact)) = argument else { return None; };
+                        NestedIntegerArgument::ContextualValue(exact)
+                    } else {
+                        argument
+                    };
+                    #[cfg(not(feature = "internal-checker"))]
+                    if matches!(origin.arguments.as_slice(), [(_, CheckerIntegerCallArgument::ContextualValue)]) {
+                        return None;
+                    }
                     #[cfg(feature = "internal-checker")]
                     let argument = match argument {
                         NestedIntegerArgument::Single(Some(exact)) if COLLECT && block == structure.root

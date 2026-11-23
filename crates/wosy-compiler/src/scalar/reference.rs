@@ -6128,6 +6128,7 @@ impl CheckerIntegerCallArguments {
 pub(super) enum CheckerIntegerCallArgument {
     Literal(BigInt),
     PlainName,
+    ContextualValue,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -8171,6 +8172,8 @@ impl StructuralWalker<'_, '_> {
             let origin = match expression {
                 ScalarExpression::Integer { value, .. } => CheckerIntegerCallArgument::Literal(value.clone()),
                 ScalarExpression::Name { .. } => CheckerIntegerCallArgument::PlainName,
+                ScalarExpression::Contextual { .. } if arguments.len() == 1 =>
+                    CheckerIntegerCallArgument::ContextualValue,
                 _ => return None,
             };
             Some((*argument, origin))
