@@ -394,3 +394,41 @@ unit(*!u8) transfer = fn(input) {
         assert!(public.diagnostics.is_empty(), "{:?}", public.diagnostics);
     }
 }
+
+#[test]
+fn prepared_fallible_guard_producer_uses_resolved_binding_and_null_polarity() {
+    for (comparison, then_value, otherwise_value, present_on_then) in [
+        ("&result == null", "7", "result", false),
+        ("null != &result", "result", "7", true),
+    ] {
+        let text = format!("%%start\ni32() example = fn {{\n\ti32 result = 42;\n\tif ({comparison}) {{ {then_value} }} else {{ {otherwise_value} }}\n}};\n%%end");
+        let parsed = parse_source(source(), text, &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let (typed, occurrences) = typecheck_scalar_program_with_occurrences(
+            derive_scalar_declarations_from_cst(parsed.result.canonical_cst()),
+            ScalarTargetLayout::WASM32,
+        );
+        assert!(typed.diagnostics.is_empty(), "{:?}", typed.diagnostics);
+        let mut program = typed.program;
+        let calls = resolve_program_call_sites_with_occurrences(&program, occurrences).unwrap();
+        let ScalarItem::Function(function) = &mut program.items[0] else { panic!("example") };
+        let ScalarBlockItem::LocalBinding(binding) = &mut function.body.items[0] else {
+            panic!("local receiver");
+        };
+        binding.fallible_assignment = Some(binding.name_span);
+        let (results, errors) = derive_module_reference_origins(
+            &program.source, &program.items, &calls, &program.structs, &program.enums, false,
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+        let [(0, result)] = results.as_slice() else { panic!("example reference result") };
+        let [(branch, edge)] = result.proof_points.guarded_allocation_edges.as_slice() else {
+            panic!("one typed guard");
+        };
+        let [then, otherwise] = result.cfg.points[branch.0].successors.as_slice() else {
+            panic!("exact branch successors");
+        };
+        assert_eq!((edge.present, edge.absent), if present_on_then { (*then, *otherwise) } else { (*otherwise, *then) });
+        assert!(result.cfg.points.iter().any(|point| matches!(&point.kind, CfgPointKind::Bind { binding } if binding == &edge.binding)));
+        assert!(!result.cfg.points.iter().any(|point| matches!(&point.kind, CfgPointKind::Borrow { place, .. } if place.binding == edge.binding)));
+    }
+}

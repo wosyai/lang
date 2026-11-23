@@ -55,6 +55,28 @@ pub(crate) struct CallablePointFacts {
     pub(super) has_nonlexical_install: bool,
 }
 
+impl CallablePointFacts {
+    pub(super) fn record_guarded_allocation(
+        &mut self,
+        branch: super::CfgPointId,
+        binding: super::ReferenceBindingId,
+        [then, otherwise]: [super::CfgPointId; 2],
+        present_on_then: bool,
+    ) {
+        if then == otherwise {
+            return;
+        }
+        let (present, absent) = if present_on_then { (then, otherwise) } else { (otherwise, then) };
+        if let Err(position) = self.guarded_allocation_edges.binary_search_by_key(&branch, |(point, _)| *point) {
+            self.guarded_allocation_edges.insert(position, (branch, GuardedAllocationEdge {
+                binding,
+                present,
+                absent,
+            }));
+        }
+    }
+}
+
 #[derive(Default)]
 pub(super) struct ScopeExitBindings {
     uniform_block_span: Option<ByteSpan>,

@@ -349,6 +349,7 @@ pub(super) struct ReferenceFlowBuilder<'a> {
     formal_forward_shape: Option<(Option<CfgPointId>, Option<CfgPointId>)>,
     independent_checked_query: bool,
     checked_scalar_storage: BTreeSet<ReferenceBindingId>,
+    fallible_i32_bindings: Option<HashMap<ReferenceBindingId, ReferenceScopeId>>,
     checked_result_origins: BTreeSet<ReferenceOriginId>,
     proof_points: CallablePointFacts,
     has_projected_child: bool,
@@ -489,6 +490,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
             formal_forward_shape: None,
             independent_checked_query: aggregate::checked_scalar_output(&call_sites.boundary.root_outputs),
             checked_scalar_storage: BTreeSet::new(),
+            fallible_i32_bindings: None,
             checked_result_origins: BTreeSet::new(),
             proof_points: CallablePointFacts {
                 has_grouped_assignment_capture: Some(false),
@@ -1008,6 +1010,51 @@ impl<'a> ReferenceFlowBuilder<'a> {
         Ok(BTreeSet::from([self.intern(fact)]))
     }
 
+    fn guarded_fallible_binding(
+        &self,
+        condition: &ScalarExpression,
+        ordinal: OccurrenceOrdinal,
+        scope: ReferenceScopeId,
+    ) -> Result<Option<(ReferenceBindingId, bool)>, ReferenceAnalysisError> {
+        let Some(fallible_i32_bindings) = &self.fallible_i32_bindings else {
+            return Ok(None);
+        };
+        if self.call_sites.structure.checked_types.expressions.get(&ordinal) != Some(&ScalarType::Bool) {
+            return Ok(None);
+        }
+        let ScalarExpression::Binary { operator, left, right, .. } = condition else {
+            return Ok(None);
+        };
+        let present_on_then = match operator {
+            BinaryOperator::Equal => false,
+            BinaryOperator::NotEqual => true,
+            _ => return Ok(None),
+        };
+        let parent = OccurrenceParent::Expression(ordinal);
+        for (address, address_edge, null, null_edge) in [
+            (left.as_ref(), OccurrenceEdge::BinaryLeft, right.as_ref(), OccurrenceEdge::BinaryRight),
+            (right.as_ref(), OccurrenceEdge::BinaryRight, left.as_ref(), OccurrenceEdge::BinaryLeft),
+        ] {
+            let ScalarExpression::CheckedAddress { mutability: ScalarReferenceMutability::Shared, place, .. } = address else {
+                continue;
+            };
+            let ScalarPlace::Name { span: place_span, .. } = place else { continue };
+            let ScalarExpression::Name { span: null_span, .. } = null else { continue };
+            let null = self.expression_ordinal(parent, null_edge);
+            if !matches!(self.prepared_name_identity(null, *null_span)?, Some(PlainNameIdentity::Null)) {
+                continue;
+            }
+            let address = self.expression_ordinal(parent, address_edge);
+            let place = self.place_ordinal(OccurrenceParent::Expression(address), OccurrenceEdge::ExpressionPlace);
+            if let Some(PreparedPlaceRoot::Lexical(binding)) = self.prepared_place_root(place, *place_span)? {
+                if fallible_i32_bindings.get(binding) == Some(&scope) {
+                    return Ok(Some((binding.clone(), present_on_then)));
+                }
+            }
+        }
+        Ok(None)
+    }
+
     fn conditional_branches(
         &mut self,
         condition: &ScalarExpression,
@@ -1016,7 +1063,8 @@ impl<'a> ReferenceFlowBuilder<'a> {
         scope: ReferenceScopeId,
         region: &ConditionalRegion,
         projected_origins: bool,
-    ) -> Result<([ReferenceConditionalArm; 2], Option<CfgPointId>, CfgPointId), ReferenceAnalysisError> {
+        observe_fallible: bool,
+    ) -> Result<([ReferenceConditionalArm; 2], Option<CfgPointId>, CfgPointId, Option<(ReferenceBindingId, bool)>), ReferenceAnalysisError> {
         let (condition_ordinal, then_block, else_block) = match region {
             ConditionalRegion::Value {
                 condition,
@@ -1030,7 +1078,17 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 ..
             } => (*condition, *then_block, None),
         };
-        self.expression(condition, scope, condition_ordinal)?;
+        let guarded = if observe_fallible {
+            self.guarded_fallible_binding(condition, condition_ordinal, scope)?
+        } else {
+            None
+        };
+        if guarded.is_some() {
+            self.local_borrow = None;
+            self.point(CfgPointKind::Evaluate(condition.clone()), expression_span(condition), scope, BTreeSet::new());
+        } else {
+            self.expression(condition, scope, condition_ordinal)?;
+        }
         let condition_point = self.cursor;
         let branch = self.point(
             CfgPointKind::Branch {
@@ -1068,7 +1126,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
         self.checked.extend(then_checked);
         self.origins.clear();
         self.cursor = None;
-        Ok(([then_arm, else_arm], condition_point, branch))
+        Ok(([then_arm, else_arm], condition_point, branch, guarded))
     }
 
     fn author_local_second_arm(&mut self, entry: CfgPointId) {
@@ -1114,13 +1172,14 @@ impl<'a> ReferenceFlowBuilder<'a> {
         literal_unit: Option<(OccurrenceOrdinal, aggregate::ArrayWriterSide, Option<ReferenceBindingId>)>,
     ) -> Result<ReferenceValue, ReferenceAnalysisError> {
         let condition_predecessor = self.cursor;
-        let ([then_arm, else_arm], condition_point, branch) = self.conditional_branches(
+        let ([then_arm, else_arm], condition_point, branch, guarded) = self.conditional_branches(
             condition,
             then_branch,
             else_branch,
             scope,
             region,
             projected_origins,
+            true,
         )?;
         let joined_value = then_arm.result.scalar.is_some() && else_arm.result.scalar.is_some();
         let join = match (
@@ -1175,6 +1234,11 @@ impl<'a> ReferenceFlowBuilder<'a> {
         }
         let edges = ReferenceConditionalEdges { branch, terminals: [then_arm.end, else_arm.end], join };
         self.connect_reference_conditional(&edges, region);
+        if let Some((binding, present_on_then)) = guarded {
+            if let Some([then, otherwise]) = edges.entries(&self.cfg.points) {
+                self.proof_points.record_guarded_allocation(branch, binding, [*then, *otherwise], present_on_then);
+            }
+        }
         if let (Some((expression, writer_side, formal)), Some(condition), Some([then_entry, else_entry])) =
             (literal_unit, condition_point, edges.entries(&self.cfg.points))
         {
@@ -1294,13 +1358,14 @@ impl<'a> ReferenceFlowBuilder<'a> {
             unreachable!("checked output projection requires a value conditional")
         };
         let region = &self.call_sites.conditionals[&primary.expression];
-        let ([then_arm, else_arm], _, _) = self.conditional_branches(
+        let ([then_arm, else_arm], _, _, _) = self.conditional_branches(
             condition,
             then_branch,
             Some(else_branch),
             scope,
             region,
             true,
+            false,
         )?;
         let arity = row.types.len();
         assert!(arity > 1);
@@ -3930,6 +3995,9 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     if binding.is_allocation {
                         self.cfg.allocations.insert(id.clone());
                     }
+                    if binding.fallible_assignment.is_some() && receiver.ty == ScalarType::I32 {
+                        self.fallible_i32_bindings.get_or_insert_with(HashMap::new).insert(id.clone(), scope);
+                    }
                     let origins = match value {
                         ReferenceValue::Checked(origins) => Some(origins),
                         ReferenceValue::Other
@@ -4683,6 +4751,29 @@ fn sparse_reference_point_values_keep_path_presence_and_expire_at_original_bound
     assert_eq!(sibling.get(CfgPointId(1)), None);
     sibling.record(CfgPointId(4), &None, &uses);
     assert_eq!(sibling.get(CfgPointId(0)), None);
+}
+
+#[cfg(test)]
+#[test]
+fn guarded_allocation_facts_seal_distinct_polarities_in_branch_order() {
+    let source = SourceIdentity::new("project".into(), "package".into(), "metadata".into(), "r1".into());
+    let span = ByteSpan::new(0, 100);
+    let binding = ReferenceBindingId {
+        source, function_span: span, block_span: span,
+        declaration_span: ByteSpan::new(10, 11), kind: ReferenceBindingKind::Declared,
+    };
+    let mut facts = CallablePointFacts::default();
+    let [outer, inner] = [CfgPointId(1), CfgPointId(3)];
+    facts.record_guarded_allocation(inner, binding.clone(), [CfgPointId(4), CfgPointId(6)], false);
+    facts.record_guarded_allocation(outer, binding.clone(), [CfgPointId(2), CfgPointId(8)], true);
+    facts.record_guarded_allocation(inner, binding.clone(), [CfgPointId(4), CfgPointId(6)], true);
+    facts.record_guarded_allocation(CfgPointId(9), binding.clone(), [CfgPointId(10); 2], true);
+    let [(first, first_edges), (second, second_edges)] = facts.guarded_allocation_edges.as_slice() else {
+        panic!("expected two distinct branch facts");
+    };
+    assert_eq!((*first, first_edges.present, first_edges.absent), (outer, CfgPointId(2), CfgPointId(8)));
+    assert_eq!((*second, second_edges.present, second_edges.absent), (inner, CfgPointId(6), CfgPointId(4)));
+    assert_eq!((&first_edges.binding, &second_edges.binding), (&binding, &binding));
 }
 
 #[cfg(test)]
