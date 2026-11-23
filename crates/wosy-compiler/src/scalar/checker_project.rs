@@ -8744,8 +8744,49 @@ mod tests {
             assert!(failure.witness.intervals_at(0, axis).unwrap().eq([(value, value)]));
         }
         assert!(matches!(run("symbolic-computed-single-broad", &program.replace(
-            "if (n == -2) { n = 3; n + 1 }", "if (n < 0) { n + 1 }")), Err(ProjectCheck::Unsupported)));
+            "if (n == -2) { n = 3; n + 1 }", "if (n < 0) { n + n }")), Err(ProjectCheck::Unsupported)));
         assert!(matches!(run("symbolic-computed-single-overflow", &program.replace("n = 3; n + 1", "n = 127; n + 1")),
+            Err(ProjectCheck::Unsupported)));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordered_base_symbolic_call_affine_return_narrows_both_ways_without_filling_gaps() {
+        let report = OUTPUT.replace(".code = 1", ".code = 31");
+        let program = format!(r#"%%start
+            i8(i8, i8) affine = fn(n, tag) {{
+                if (tag < 0) {{
+                    if (n >= 0) {{
+                        if (n <= 4) {{ if (n != 2) {{ n + 1 }} else {{ 0 }} }} else {{ 0 }}
+                    }} else {{ 0 }}
+                }} else {{ 0 }}
+            }};
+            unit(i8, i8) unused = fn(input, tag) {{
+                i8 result = affine(input, tag);
+                if (tag < 0) {{ if (input == 0) {{ core.require(result == 1, {report}); }}; }};
+                if (result == 5) {{
+                    core.require(input == 4, {report});
+                    core.require(tag < 0, {report});
+                }};
+                core.require(result != 3, {report});
+            }};
+        %%end"#);
+        let run = |revision, text: &str| {
+            let source = source("src/main.w", revision);
+            let target = prepare_proof_target(&source, text).unwrap();
+            run_closed_without_named_proofs(&target, ScalarCheckerScope::CurrentPackage, 1)
+        };
+        let pass = run("symbolic-affine-pass", &program).unwrap();
+        assert!(pass.active && pass.directives.is_empty());
+        let bad = run("symbolic-affine-witness", &program.replace("input == 4", "input == 3")).unwrap();
+        let [failure] = bad.directives.as_slice() else { panic!("only the affine witness fails"); };
+        assert_eq!(failure.code(), &BigInt::from(31));
+        assert_eq!(failure.witness.row_count(), 1);
+        let [four, minimum, negative_one, five] = [4, -128, -1, 5].map(BigInt::from);
+        assert!(failure.witness.intervals_at(0, 0).unwrap().eq([(&four, &four)]));
+        assert!(failure.witness.intervals_at(0, 1).unwrap().eq([(&minimum, &negative_one)]));
+        assert!(failure.witness.intervals_at(0, 2).unwrap().eq([(&five, &five)]));
+        assert!(matches!(run("symbolic-affine-overflow", &program.replace("n <= 4", "n <= 127")),
             Err(ProjectCheck::Unsupported)));
     }
 

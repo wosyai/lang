@@ -411,6 +411,25 @@ impl IntegerSet {
         Self(vec![Interval { first: value.clone(), last: value.clone() }])
     }
 
+    pub(super) fn affine_unit(&self, reflected: bool, offset: &BigInt, inverse: bool) -> Self {
+        if reflected {
+            Self(self.0.iter().rev().map(|interval| Interval {
+                first: offset - &interval.last,
+                last: offset - &interval.first,
+            }).collect())
+        } else if inverse {
+            Self(self.0.iter().map(|interval| Interval {
+                first: &interval.first - offset,
+                last: &interval.last - offset,
+            }).collect())
+        } else {
+            Self(self.0.iter().map(|interval| Interval {
+                first: &interval.first + offset,
+                last: &interval.last + offset,
+            }).collect())
+        }
+    }
+
     pub(super) fn singleton_value(&self) -> Option<&BigInt> {
         match self.0.as_slice() {
             [interval] if interval.first == interval.last => Some(&interval.first),

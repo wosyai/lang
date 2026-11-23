@@ -977,16 +977,47 @@ enum ProjectedEntry {
     Detached(Rc<IntegerSet>),
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct IntegerAffineTransform {
+    reflected: bool,
+    offset: BigInt,
+}
+
+impl IntegerAffineTransform {
+    fn apply(&self, domain: &IntegerSet, inverse: bool) -> IntegerSet {
+        domain.affine_unit(self.reflected, &self.offset, inverse)
+    }
+
+    #[cfg(feature = "internal-checker")]
+    fn fits(&self, domain: &IntegerSet, minimum: &BigInt, maximum: &BigInt) -> Option<()> {
+        let (first, last) = domain.extremes()?;
+        let (first, last) = if self.reflected {
+            (&self.offset - last, &self.offset - first)
+        } else {
+            (first + &self.offset, last + &self.offset)
+        };
+        (first >= *minimum && last <= *maximum).then_some(())
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct IntegerAffineAxes {
+    input: usize,
+    output: usize,
+    transform: Rc<IntegerAffineTransform>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct IntegerRow {
     cells: Vec<Rc<IntegerSet>>,
     equal_axes: Option<Rc<Vec<(usize, usize)>>>,
+    affine: Option<Rc<IntegerAffineAxes>>,
     entry: Option<Rc<ProjectedEntry>>,
     projected_from: u16,
 }
 
 impl IntegerRow {
-    fn new(cells: Vec<Rc<IntegerSet>>) -> Self { Self { cells, equal_axes: None, entry: None, projected_from: 0 } }
+    fn new(cells: Vec<Rc<IntegerSet>>) -> Self { Self { cells, equal_axes: None, affine: None, entry: None, projected_from: 0 } }
 
     fn equal_axes(&self) -> &[(usize, usize)] {
         self.equal_axes.as_deref().map_or(&[], Vec::as_slice)
@@ -1005,8 +1036,40 @@ impl IntegerRow {
         self.cells.push(domain);
     }
 
+    fn append_affine(&mut self, from: usize, transform: Rc<IntegerAffineTransform>) {
+        debug_assert!(self.affine.is_none());
+        let input = self.canonical_axis(from);
+        let output = self.cells.len();
+        self.cells.push(Rc::new(transform.apply(&self.cells[input], false)));
+        self.affine = Some(Rc::new(IntegerAffineAxes { input, output, transform }));
+    }
+
+    fn affine_touches(&self, axis: usize) -> bool {
+        self.affine.as_ref().is_some_and(|relation| {
+            let axis = self.canonical_axis(axis);
+            axis == relation.input || axis == relation.output
+        })
+    }
+
     fn replace_domain(&mut self, index: usize, set: Rc<IntegerSet>) {
         let canonical = self.canonical_axis(index);
+        if let Some(relation) = self.affine.as_deref() {
+            let related = if canonical == relation.input {
+                Some((relation.output, false))
+            } else if canonical == relation.output {
+                Some((relation.input, true))
+            } else {
+                None
+            };
+            if let Some((other, inverse)) = related {
+                let transferred = Rc::new(relation.transform.apply(&set, inverse));
+                self.replace_equal_group(other, transferred);
+            }
+        }
+        self.replace_equal_group(canonical, set);
+    }
+
+    fn replace_equal_group(&mut self, canonical: usize, set: Rc<IntegerSet>) {
         if let Some(equality) = &self.equal_axes {
             for &(alias, root) in equality.iter() {
                 if root == canonical {
@@ -1075,6 +1138,9 @@ impl IntegerRow {
                 self.entry = Some(Rc::new(ProjectedEntry::Detached(Rc::clone(&self.cells[*axis]))));
             }
         }
+        if self.affine.as_ref().is_some_and(|relation| relation.output >= depth) {
+            self.affine = None;
+        }
         self.cells.truncate(depth);
         if let Some(equality) = &mut self.equal_axes {
             let keep = equality.partition_point(|(alias, _)| *alias < depth);
@@ -1109,6 +1175,7 @@ struct IntegerRoots<'a> {
     parameters: usize,
     projected_entry_axis: Option<usize>,
     unit_pair_work: Option<usize>,
+    affine_work: Option<usize>,
     reached_obligation: bool,
     proof_reflexive_branches: bool,
 }
@@ -1392,7 +1459,8 @@ impl IntegerInputs {
             let left = &mut self.0[0];
             let right = &other.0[0];
             let canonical = left.canonical_axis(axis);
-            if left.projected_from == right.projected_from && left.entry_key() == right.entry_key() && left.equal_axes() == right.equal_axes() && left.iter().zip(right.iter()).enumerate().all(|(index, (a, b))| {
+            if left.affine.is_none() && right.affine.is_none()
+                && left.projected_from == right.projected_from && left.entry_key() == right.entry_key() && left.equal_axes() == right.equal_axes() && left.iter().zip(right.iter()).enumerate().all(|(index, (a, b))| {
                 left.canonical_axis(index) == canonical || Rc::ptr_eq(a, b)
             }) {
                 let right = other.0.pop().unwrap();
@@ -1436,6 +1504,10 @@ impl IntegerInputs {
         let mut joined = Self::default();
         let mut representatives = HashMap::new();
         for row in rows {
+            if row.affine.is_some() {
+                joined.0.push(row);
+                continue;
+            }
             let canonical = row.canonical_axis(axis);
             let values: Vec<_> = if row.equal_axes.is_none() {
                 row[..axis].iter().chain(&row[axis + 1..]).map(Rc::as_ptr).collect()
@@ -1490,6 +1562,15 @@ impl IntegerInputs {
         self.0.iter().any(|row| {
             row.len() == coordinates.len()
                 && row.equal_axes().iter().all(|&(alias, root)| Into::<BigInt>::into(coordinates[alias]) == Into::<BigInt>::into(coordinates[root]))
+                && row.affine.as_ref().is_none_or(|relation| {
+                    let input: BigInt = coordinates[relation.input].into();
+                    let output: BigInt = coordinates[relation.output].into();
+                    output == if relation.transform.reflected {
+                        &relation.transform.offset - input
+                    } else {
+                        input + &relation.transform.offset
+                    }
+                })
                 && row.iter().zip(coordinates).all(|(axis, value)| {
                     axis.split(&BinaryOperator::Equal, &(*value).into())
                         .is_some_and(|(matching, _)| !matching.is_empty())
@@ -2518,6 +2599,7 @@ enum ComputedIntegerReturn {
 enum IntegerPairPartitionOutput {
     Singleton(Rc<IntegerSet>),
     InputAlias(usize),
+    InputAffine(usize, Rc<IntegerAffineTransform>),
 }
 
 pub(super) const MAX_ACTUAL_CALL_DEPTH: usize = 64;
@@ -2532,6 +2614,7 @@ pub(super) struct IntegerReturnPartition {
 enum IntegerPartitionOutput {
     Singleton(Rc<IntegerSet>),
     InputAlias,
+    InputAffine(Rc<IntegerAffineTransform>),
 }
 
 #[cfg(feature = "internal-checker")]
@@ -2559,7 +2642,8 @@ pub(super) fn verify_partitioned_call_return<'a>(
     let mut covered = Vec::new();
     for piece in pieces {
         let output = match (&goal, &piece.output) {
-            (PartitionedProofGoal::Literal(..), IntegerPartitionOutput::InputAlias) => return None,
+            (_, IntegerPartitionOutput::InputAffine(_))
+            | (PartitionedProofGoal::Literal(..), IntegerPartitionOutput::InputAlias) => return None,
             (_, IntegerPartitionOutput::InputAlias) => None,
             (_, IntegerPartitionOutput::Singleton(output)) => Some(output.singleton_value()?),
         };
@@ -3342,6 +3426,19 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
             *work = work.checked_add(1)?.checked_add(path.0.len().checked_mul(axes)?)?;
             if *work > MAX_PARTITION_TRANSFER_WORK { return None; }
         }
+        if let Some(work) = &mut roots.affine_work {
+            for row in &path.0 {
+                *work = work.checked_add(1)?;
+                if let Some(relation) = row.affine.as_deref() {
+                    // A single prepared cut can split one interval. Charge both pieces, both
+                    // directions of transfer, and equality-group propagation up front.
+                    let intervals = row[relation.input].interval_count().checked_add(1)?;
+                    let aliases = row.equal_axes().len().checked_add(1)?;
+                    *work = work.checked_add(intervals.checked_add(aliases)?.checked_mul(4)?)?;
+                }
+                if *work > MAX_PARTITION_TRANSFER_WORK { return None; }
+            }
+        }
         let items = &structure.blocks.get(block.0)?.items;
         let Some(item) = items.get(next).filter(|_| !path.is_unreachable()) else {
             if SUSPEND_CALL && root_tail.is_some() && branches.is_empty() && path.is_unreachable() {
@@ -3392,6 +3489,9 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                     let predicate = directive.predicate.as_ref()?;
                     roots.reached_obligation = true;
                     if let (true, CheckerPredicate::DirectiveDisjunction { binding, ty, atoms }) = (COLLECT, predicate) {
+                        if roots.affine_work.is_some() && path.0.iter().any(|row| row.affine.is_some()) {
+                            return None;
+                        }
                         let (axis, actual_type) = roots.lookup(binding)?;
                         if ty != actual_type {
                             return None;
@@ -3577,24 +3677,26 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                             (structure.checker_integer_literals.get(&operand), axis(operand))
                         });
                         for row in &path.0 {
-                            let left = singleton_calculation_operand(row, left)?;
-                            let right = singleton_calculation_operand(row, right)?;
-                            if left < &min || left > &max || right < &min || right > &max {
-                                return None;
-                            }
-                            let output = operation.apply(Cow::Borrowed(left), Cow::Borrowed(right), &min)?;
-                            if output < min || output > max { return None; }
-                            let output = Rc::new(IntegerSet::singleton(&output));
+                            let value = computed_projected_value(row, roots.projected_entry_axis,
+                                operation, left, right, &min, &max)?;
                             let piece = if let Some(formal) = roots.projected_entry_axis {
                                 ComputedIntegerReturn::Projected(IntegerReturnPartition {
                                     span: slot.span, input: Rc::clone(row.entry_domain(formal)),
-                                    output: IntegerPartitionOutput::Singleton(output),
+                                    output: match value {
+                                        ComputedProjectedValue::Singleton(output) => IntegerPartitionOutput::Singleton(output),
+                                        ComputedProjectedValue::Identity(_) => IntegerPartitionOutput::InputAlias,
+                                        ComputedProjectedValue::Affine(_, transform) => IntegerPartitionOutput::InputAffine(transform),
+                                    },
                                 })
                             } else {
                                 ComputedIntegerReturn::Pair(IntegerPairReturnPartition {
                                     anchor: row.projected_from,
                                     inputs: [Rc::clone(&row[0]), Rc::clone(&row[1])],
-                                    output: IntegerPairPartitionOutput::Singleton(output),
+                                    output: match value {
+                                        ComputedProjectedValue::Singleton(output) => IntegerPairPartitionOutput::Singleton(output),
+                                        ComputedProjectedValue::Identity(axis) => IntegerPairPartitionOutput::InputAlias(axis),
+                                        ComputedProjectedValue::Affine(axis, transform) => IntegerPairPartitionOutput::InputAffine(axis, transform),
+                                    },
                                 })
                             };
                             target.push((at, piece));
@@ -3646,6 +3748,9 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                     && failures.as_deref().is_some_and(|failure| failure.allow_contextual_local_transfers);
                 let (axis, value) = integer_assignment(calls, roots, group, &path, allow_contextual_local_transfers)?;
                 let preserve_entry = roots.projected_entry_axis == Some(axis);
+                if roots.affine_work.is_some() && path.0.iter().any(|row| row.affine_touches(axis)) {
+                    return None;
+                }
                 if axis < roots.parameters && !preserve_entry && path.axis_has_alias(axis) {
                     return None;
                 }
@@ -3980,6 +4085,9 @@ impl<'a> ExactCallCursor<'a> {
         &'borrow self, calls: &'borrow FunctionCallSites, call: OccurrenceOrdinal, parameters: usize,
         collect: bool, project: bool, project_pair: bool, project_independent: bool,
     ) -> Option<NestedIntegerArgument<'borrow>> {
+        if self.roots.affine_work.is_some() && self.block.path.0.iter().any(|row| row.affine.is_some()) {
+            return None;
+        }
         if collect && parameters == 2 {
             nested_pair_argument(calls, call, &self.roots, &self.block.path, project_pair, project_pair, project_independent)
         } else {
@@ -4025,11 +4133,16 @@ impl<'a> ExactCallCursor<'a> {
                     work = work.checked_add(row.len().checked_add(1)?)?
                         .checked_add(3usize.checked_mul(row.equal_axes().len())?)?
                         .checked_add(piece.inputs[0].interval_count())?.checked_add(piece.inputs[1].interval_count())?;
-                    if let IntegerPairPartitionOutput::InputAlias(slot) = &piece.output {
-                        if self.roots.axes.get(projected.caller_axes[*slot])?.1 != ty {
-                            return None;
+                    match &piece.output {
+                        IntegerPairPartitionOutput::InputAlias(slot) | IntegerPairPartitionOutput::InputAffine(slot, _) => {
+                            if self.roots.axes.get(projected.caller_axes[*slot])?.1 != ty { return None; }
+                            work = work.checked_add(1)?;
+                            if matches!(&piece.output, IntegerPairPartitionOutput::InputAffine(..)) {
+                                work = work.checked_add(piece.inputs[*slot].interval_count())?;
+                                self.roots.affine_work.get_or_insert(0);
+                            }
                         }
-                        work = work.checked_add(1)?;
+                        IntegerPairPartitionOutput::Singleton(_) => {}
                     }
                     if work > MAX_PARTITION_TRANSFER_WORK { return None; }
                 }
@@ -4045,6 +4158,8 @@ impl<'a> ExactCallCursor<'a> {
                             let axis = projected.caller_axes[slot];
                             row.append_alias(axis, Rc::clone(&row[axis]));
                         }
+                        IntegerPairPartitionOutput::InputAffine(slot, transform) =>
+                            row.append_affine(projected.caller_axes[slot], transform),
                     }
                     row
                 }).collect();
@@ -4052,21 +4167,29 @@ impl<'a> ExactCallCursor<'a> {
             }
             (ExactCallEffect::Integer { binding, ty, .. }, ActualCallResult::PartitionedInteger(pieces)) => {
                 let axis = caller_axis?;
-                if pieces.iter().any(|piece| matches!(&piece.output, IntegerPartitionOutput::InputAlias))
-                    && self.roots.axes.get(axis)?.1 != ty
-                {
+                let (piece_intervals, depends_on_input, affine) = pieces.iter().try_fold(
+                    (0usize, false, false), |(sum, depends, affine), piece| Some((
+                        sum.checked_add(piece.input.interval_count())?,
+                        depends || !matches!(&piece.output, IntegerPartitionOutput::Singleton(_)),
+                        affine || matches!(&piece.output, IntegerPartitionOutput::InputAffine(_)),
+                    )))?;
+                if depends_on_input && self.roots.axes.get(axis)?.1 != ty {
                     return None;
                 }
                 let rows = &self.block.path.0;
                 let cells = self.roots.axes.len().checked_add(1)?;
                 let row_intervals = rows.iter().try_fold(0usize, |sum, row| sum.checked_add(row[axis].interval_count()))?;
-                let piece_intervals = pieces.iter().try_fold(0usize, |sum, piece| sum.checked_add(piece.input.interval_count()))?;
                 let row_copies = rows.len().checked_mul(pieces.len())?.checked_mul(cells)?;
                 let comparisons = row_intervals.checked_mul(pieces.len())?
                     .checked_add(piece_intervals.checked_mul(rows.len())?)?;
                 let alias_work = rows.iter().try_fold(0usize, |sum, row| sum.checked_add(row.equal_axes().len()))?
                     .checked_mul(pieces.len())?;
-                if row_copies.checked_add(comparisons)?.checked_add(alias_work)? > MAX_PARTITION_TRANSFER_WORK {
+                let affine_work = if affine {
+                    self.roots.affine_work.get_or_insert(0);
+                    // Intersections have at most the sum of the two input lists' intervals.
+                    comparisons
+                } else { 0 };
+                if row_copies.checked_add(comparisons)?.checked_add(alias_work)?.checked_add(affine_work)? > MAX_PARTITION_TRANSFER_WORK {
                     return None;
                 }
                 let original = std::mem::take(&mut self.block.path.0);
@@ -4083,6 +4206,7 @@ impl<'a> ExactCallCursor<'a> {
                         match &piece.output {
                             IntegerPartitionOutput::Singleton(output) => next.push(Rc::clone(output)),
                             IntegerPartitionOutput::InputAlias => next.append_alias(axis, overlap),
+                            IntegerPartitionOutput::InputAffine(transform) => next.append_affine(axis, Rc::clone(transform)),
                         }
                         joined.push(next);
                     }
@@ -4225,6 +4349,47 @@ fn singleton_calculation_operand<'a>(
     row: &'a IntegerRow, (literal, axis): (Option<&'a BigInt>, Option<usize>),
 ) -> Option<&'a BigInt> {
     literal.or_else(|| row.get(axis?)?.singleton_value())
+}
+
+#[cfg(feature = "internal-checker")]
+enum ComputedProjectedValue {
+    Singleton(Rc<IntegerSet>),
+    Identity(usize),
+    Affine(usize, Rc<IntegerAffineTransform>),
+}
+
+#[cfg(feature = "internal-checker")]
+fn computed_projected_value(
+    row: &IntegerRow, formal: Option<usize>, operation: AuthoredIntegerOperation,
+    left: (Option<&BigInt>, Option<usize>), right: (Option<&BigInt>, Option<usize>),
+    min: &BigInt, max: &BigInt,
+) -> Option<ComputedProjectedValue> {
+    let fits = |value: &BigInt| value >= min && value <= max;
+    let left_exact = singleton_calculation_operand(row, left);
+    let right_exact = singleton_calculation_operand(row, right);
+    let (axis, reflected, offset) = match (left_exact, right_exact, operation) {
+        (Some(left), Some(right), operation) if fits(left) && fits(right) => {
+            let value = operation.apply(Cow::Borrowed(left), Cow::Borrowed(right), min)?;
+            return fits(&value).then(|| ComputedProjectedValue::Singleton(Rc::new(IntegerSet::singleton(&value))));
+        }
+        (None, Some(value), AuthoredIntegerOperation::Add) if fits(value) => (left.1?, false, value.clone()),
+        (Some(value), None, AuthoredIntegerOperation::Add) if fits(value) => (right.1?, false, value.clone()),
+        (None, Some(value), AuthoredIntegerOperation::Subtract) if fits(value) => (left.1?, false, -value),
+        (Some(value), None, AuthoredIntegerOperation::Subtract) if fits(value) => (right.1?, true, value.clone()),
+        _ => return None,
+    };
+    if row.affine.is_some() { return None; }
+    let origin = match formal {
+        Some(formal) => row.entry_alias(formal, axis).then_some(formal)?,
+        None => (0..2).find(|slot| row.entry_alias(*slot, axis))?,
+    };
+    let transform = IntegerAffineTransform { reflected, offset };
+    transform.fits(&row[axis], min, max)?;
+    if !reflected && transform.offset.bits() == 0 {
+        Some(ComputedProjectedValue::Identity(origin))
+    } else {
+        Some(ComputedProjectedValue::Affine(origin, Rc::new(transform)))
+    }
 }
 
 fn exact_integer_entry_row(exact: &[&BigInt]) -> IntegerRow {
