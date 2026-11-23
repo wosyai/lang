@@ -5556,6 +5556,51 @@ bool integer_inversion = !1;
 }
 
 #[test]
+fn nested_bitwise_truncation_context_requires_a_known_operand_type() {
+    for (body, diagnostic) in [
+        (
+            "core.int_trunc<i32>((value ^ (value >> 16)) & 255)",
+            None,
+        ),
+        (
+            "core.int_trunc<i32>(255 & (value ^ (16 >> value)))",
+            None,
+        ),
+        (
+            "i64 masked = (value ^ (value >> 16)) & 255; core.int_trunc<i32>(masked)",
+            None,
+        ),
+        (
+            "core.int_trunc<i32>((1 ^ (2 >> 3)) & 255)",
+            Some("requires a destination with the appropriate integer width"),
+        ),
+        (
+            "u64 unsigned = 1; core.int_trunc<i32>(value & unsigned)",
+            Some("type does not match"),
+        ),
+    ] {
+        let text = format!("%%start\ni32(i64) sample = fn(value) {{ {body} }};\n%%end");
+        let standalone = validate_text(&text);
+        let project = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::new(source(), standalone.program.items.clone(), Vec::new())],
+            vec![source()],
+        ));
+        for diagnostics in [&standalone.diagnostics, &project.diagnostics] {
+            if let Some(expected) = diagnostic {
+                assert!(
+                    diagnostics.iter().any(|diagnostic| {
+                        diagnostic.code == "B0003" && diagnostic.message.contains(expected)
+                    }),
+                    "{body}: {diagnostics:?}",
+                );
+            } else {
+                assert!(diagnostics.is_empty(), "{body}: {diagnostics:?}");
+            }
+        }
+    }
+}
+
+#[test]
 fn preserves_scalar_precedence_and_left_associativity() {
     let result = validate_text(
         "%%start\ni32 value = 1 | 2 ^ 3 & 4 << 1 + 2 * 3;\ni32 shifts = 8 >> 1 >> 1;\n%%end",

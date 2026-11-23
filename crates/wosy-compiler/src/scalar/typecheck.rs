@@ -3111,6 +3111,50 @@ fn is_float_arithmetic_operator(operator: &BinaryOperator) -> bool {
 // Leaves and obvious non-float shapes need no cache access. Check both
 // children shallowly before following a composite, so ordinary arithmetic
 // spines with a named or integer operand have no recursive shape walk.
+fn is_homogeneous_bitwise(operator: &BinaryOperator) -> bool {
+    matches!(
+        operator,
+        BinaryOperator::BitAnd
+            | BinaryOperator::BitOr
+            | BinaryOperator::BitXor
+            | BinaryOperator::ShiftLeft
+            | BinaryOperator::ShiftRight
+    )
+}
+
+fn is_integer_literal_operand(expression: &ScalarExpression) -> bool {
+    match expression {
+        ScalarExpression::Integer { .. } => true,
+        ScalarExpression::Unary {
+            operator: UnaryOperator::Negate | UnaryOperator::BitwiseNot,
+            operand,
+            ..
+        } => matches!(operand.as_ref(), ScalarExpression::Integer { .. }),
+        _ => false,
+    }
+}
+
+fn infer_bitwise_operands(
+    left: &ScalarExpression,
+    right: &ScalarExpression,
+    mut check: impl FnMut(&ScalarExpression, Option<&ScalarType>) -> ScalarType,
+) -> (ScalarType, ScalarType) {
+    let left_literal = is_integer_literal_operand(left);
+    let right_literal = is_integer_literal_operand(right);
+    if left_literal && !right_literal {
+        let right_type = check(right, None);
+        let left_type = check(left, is_integer_type(&right_type).then_some(&right_type));
+        (left_type, right_type)
+    } else {
+        let left_type = check(left, None);
+        let right_type = check(
+            right,
+            (!left_literal && right_literal && is_integer_type(&left_type)).then_some(&left_type),
+        );
+        (left_type, right_type)
+    }
+}
+
 fn float_literal_leaf(expression: &ScalarExpression) -> Option<bool> {
     match expression {
         ScalarExpression::Float { .. } => Some(true),
@@ -3550,6 +3594,12 @@ fn check_expression_type_in_module(
             right,
             span,
         } => {
+            if is_homogeneous_bitwise(operator) {
+                return check_expression_type_in_module_expected(
+                    expression, None, scope, visible_names, folded_names, module, modules,
+                    diagnostics, unsafe_context, overloads, inference,
+                );
+            }
             let literal_operands = float_literal_arithmetic_operands(operator, left, right, inference);
             if let Some(inferred) = infer_float_literal_arithmetic(literal_operands, left, right, |operand, expected| {
                 expression_type_in_module_expected(
@@ -4746,7 +4796,14 @@ fn check_expression_type_in_module_expected(
             );
         }
         let bool_context = ScalarType::Bool;
-        let (left_type, right_type) = if comparison && is_null_expression(left) {
+        let (left_type, right_type) = if bitwise && arithmetic_context.is_none() {
+            infer_bitwise_operands(left, right, |operand, expected| {
+                expression_type_in_module_expected(
+                    operand, expected, scope, visible_names, folded_names, module, modules,
+                    diagnostics, unsafe_context, overloads, inference,
+                )
+            })
+        } else if comparison && is_null_expression(left) {
             let right_type = expression_type_in_module_expected(
                 right,
                 None,
@@ -8094,33 +8151,23 @@ fn check_expression_type(
                     inference,
                 );
             }
-            let left_type = expression_type(
-                left,
-                scope,
-                visible_names,
-                folded_names,
-                program,
-                diagnostics,
-                unsafe_context,
-                overloads,
-                inference,
-            );
-            let right_type = if comparison {
-                expression_type_expected(
-                    right,
-                    &left_type,
-                    scope,
-                    visible_names,
-                    folded_names,
-                    program,
-                    diagnostics,
-                    unsafe_context,
-                    overloads,
-                    inference,
-                )
+            let (left_type, right_type) = if is_homogeneous_bitwise(operator) {
+                infer_bitwise_operands(left, right, |operand, expected| {
+                    if let Some(expected) = expected {
+                        expression_type_expected(
+                            operand, expected, scope, visible_names, folded_names, program,
+                            diagnostics, unsafe_context, overloads, inference,
+                        )
+                    } else {
+                        expression_type(
+                            operand, scope, visible_names, folded_names, program, diagnostics,
+                            unsafe_context, overloads, inference,
+                        )
+                    }
+                })
             } else {
-                expression_type(
-                    right,
+                let left_type = expression_type(
+                    left,
                     scope,
                     visible_names,
                     folded_names,
@@ -8129,7 +8176,34 @@ fn check_expression_type(
                     unsafe_context,
                     overloads,
                     inference,
-                )
+                );
+                let right_type = if comparison {
+                    expression_type_expected(
+                        right,
+                        &left_type,
+                        scope,
+                        visible_names,
+                        folded_names,
+                        program,
+                        diagnostics,
+                        unsafe_context,
+                        overloads,
+                        inference,
+                    )
+                } else {
+                    expression_type(
+                        right,
+                        scope,
+                        visible_names,
+                        folded_names,
+                        program,
+                        diagnostics,
+                        unsafe_context,
+                        overloads,
+                        inference,
+                    )
+                };
+                (left_type, right_type)
             };
             if is_error_type(&left_type) || is_error_type(&right_type) {
                 return ScalarType::Error;
