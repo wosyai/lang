@@ -5891,6 +5891,24 @@ fn retire_overwritten_binding_origins(
     }
 }
 
+fn definite_assignment_candidate<'a>(
+    candidates: &'a [InvalidationCandidate],
+    original_origins: Option<&BTreeSet<ReferenceOriginId>>,
+) -> Option<&'a InvalidationCandidate> {
+    let [candidate] = candidates else { return None };
+    (candidate.loan.mode == ScalarReferenceMutability::Mutable
+        && original_origins.is_some_and(|origins|
+            origins.len() == 1 && origins.contains(&candidate.origin)))
+        .then_some(candidate)
+}
+
+fn restore_definitely_written_place(state: &mut ReferenceEdgeState, target: &ReferencePlaceId) {
+    if !state.moved_checked_handles.is_empty() {
+        reinitialize_checked_handles(state, target, CheckedHandleStorage::Pointee);
+    }
+    state.moved.retain(|(moved, _)| !exact_projected_prefix(target, moved));
+}
+
 fn update_projected_assignment<'a>(
     state: &mut ReferenceEdgeState,
     mut targets: impl ExactSizeIterator<Item = (&'a ReferencePlaceId, bool)> + Clone,
@@ -5989,6 +6007,44 @@ fn projected_assignment_preserves_alternatives_only_for_exact_initialized_slots(
     let projected = place(1, &[0]);
     let missing = place(1, &[1]);
     let unrelated = place(2, &[]);
+    let candidate = |origin, place: &ReferencePlaceId| InvalidationCandidate {
+        origin: ReferenceOriginId(origin),
+        place: place.clone(),
+        loan: ReferenceLoanId {
+            mode: ScalarReferenceMutability::Mutable,
+            origin_place: place.clone(),
+            creation_span: span,
+            parent: None,
+        },
+    };
+    let one = BTreeSet::from([ReferenceOriginId(0)]);
+    let two = BTreeSet::from([ReferenceOriginId(0), ReferenceOriginId(1)]);
+    let mut availability = ReferenceEdgeState::default();
+    let descendant = place(1, &[0, 2]);
+    let sibling_descendant = place(1, &[1, 2]);
+    let container = place(1, &[]);
+    for moved in [&container, &projected, &descendant, &missing, &sibling_descendant] {
+        availability.moved.push((moved.clone(), SourceSpan::new(source.clone(), span)));
+    }
+    for (candidates, original) in [
+        (vec![candidate(0, &projected), candidate(1, &missing)], &two),
+        (vec![candidate(0, &projected)], &two),
+    ] {
+        if let Some(definite) = definite_assignment_candidate(&candidates, Some(original)) {
+            restore_definitely_written_place(&mut availability, &definite.place);
+        }
+        assert_eq!(availability.moved.len(), 5);
+    }
+    let mut same_slot = projected.clone();
+    let [ReferencePlaceProjection::Index(ScalarExpression::Integer { span: replacement_span, .. })] =
+        same_slot.projections.as_mut_slice() else { unreachable!() };
+    *replacement_span = ByteSpan::new(4, 5);
+    let single_candidate = [candidate(0, &same_slot)];
+    let definite = definite_assignment_candidate(&single_candidate, Some(&one)).unwrap();
+    restore_definitely_written_place(&mut availability, &definite.place);
+    assert!(availability.moved.iter().map(|(place, _)| place)
+        .eq([&container, &missing, &sibling_descendant]));
+
     let previous = BTreeSet::from([ReferenceOriginId(0)]);
     let replacement = BTreeSet::from([ReferenceOriginId(1)]);
     let mut state = ReferenceEdgeState::default();
@@ -8363,6 +8419,11 @@ fn transfer_reference_facts(
                     state.assignment_previous.insert(*write, origins);
                 }
             }
+            let definite_assignment = match &point.kind {
+                CfgPointKind::AssignThrough { candidates, pointer_point, .. } =>
+                    definite_assignment_candidate(candidates, state.point_values.get(*pointer_point)).is_some(),
+                _ => false,
+            };
             let projected_write = (|| {
                 let (admitted, stores) = projected_store_facts.as_ref()?;
                 let CfgPointKind::AssignThrough { candidates, .. } = &point.kind else { return None };
@@ -8668,16 +8729,6 @@ fn transfer_reference_facts(
                     });
                 }
                 CfgPointKind::AssignThrough { candidates, .. } => {
-                    if !state.moved_checked_handles.is_empty() {
-                        if let Some((first, alternatives)) = candidates.split_first() {
-                            let target = available_place(&first.place);
-                            if alternatives.iter().all(|candidate| {
-                                reference_places_same(&target, &available_place(&candidate.place))
-                            }) {
-                                reinitialize_checked_handles(&mut state, &target, CheckedHandleStorage::Pointee);
-                            }
-                        }
-                    }
                     for candidate in candidates {
                         let target = available_place(&candidate.place);
                         let origins = conflicting_live_loan(
@@ -8696,10 +8747,9 @@ fn transfer_reference_facts(
                                 origins,
                             });
                         }
-                        state.moved.retain(|(moved, _)| {
-                            moved.binding != target.binding
-                                || !moved.projections.starts_with(&target.projections)
-                        });
+                        if definite_assignment {
+                            restore_definitely_written_place(&mut state, &target);
+                        }
                     }
                 }
                 _ => {}
@@ -8922,7 +8972,6 @@ fn transfer_reference_facts(
                 }
                 CfgPointKind::AssignThrough {
                     candidates,
-                    pointer_point,
                     previous_origins,
                     ..
                 } => {
@@ -8931,11 +8980,6 @@ fn transfer_reference_facts(
                         .flatten()
                         .filter(|origins| !origins.is_empty());
                     let installs_reference = point.possible_origins.as_ref().is_none_or(|origins| !origins.is_empty());
-                    let unique_target = match candidates.as_slice() {
-                        [candidate] => state.point_values.get(*pointer_point).is_some_and(|origins|
-                            origins.len() == 1 && origins.contains(&candidate.origin)),
-                        _ => false,
-                    };
                     let installs_local_loan = installs_reference
                         && rhs.as_ref().is_some_and(|origins| origins.iter().any(|origin|
                             declared_local_loan(&cfg.facts[origin.0]).is_some()));
@@ -8946,7 +8990,7 @@ fn transfer_reference_facts(
                                 && candidate.loan.mode == ScalarReferenceMutability::Mutable
                                 && direct_lexical_loan_root(&candidate.loan.origin_place).is_some())),
                         if installs_reference { rhs.as_ref() } else { None },
-                        unique_target,
+                        definite_assignment,
                         installs_local_loan,
                     );
                     if installs_reference && rhs.is_none() {
