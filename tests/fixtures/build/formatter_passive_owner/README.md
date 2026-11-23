@@ -52,3 +52,8 @@ The lexical-move control transfers the formatter result to a named value
 in an inner scope. It reads the destination descriptor before that scope
 ends. The same formatter base must remain live across the move and be freed
 once at the inner exit, with no second release at the outer exit.
+
+The raw-view control points a plain descriptor at a separately owned runtime
+array. Ordinary print must write the original byte at that base without
+releasing it; the live array remains readable afterward and releases its own
+allocation exactly once at scope exit.

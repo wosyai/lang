@@ -72,6 +72,14 @@ exit = 0
 command = ["wosy", "build", "lexical-move-wasm"]
 exit = 0
 
+[[steps]]
+command = ["wosy", "build", "raw-view-native"]
+exit = 0
+
+[[steps]]
+command = ["wosy", "build", "raw-view-wasm"]
+exit = 0
+
 [[assert]]
 command = ["wosy", "run", "nested-native"]
 exit = 0
@@ -195,5 +203,19 @@ exact = true
 command = ["wosy", "run", "lexical-move-wasm"]
 exit = 0
 stdout = "expected/named.stdout"
+stderr = "expected/verified.stderr"
+exact = true
+
+[[assert]]
+command = ["wosy", "run", "raw-view-native"]
+exit = 0
+stdout = "expected/raw_view.stdout"
+stderr = "expected/verified.stderr"
+exact = true
+
+[[assert]]
+command = ["wosy", "run", "raw-view-wasm"]
+exit = 0
+stdout = "expected/raw_view.stdout"
 stderr = "expected/verified.stderr"
 exact = true

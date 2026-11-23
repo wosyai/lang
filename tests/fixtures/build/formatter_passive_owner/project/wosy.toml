@@ -295,3 +295,33 @@ run_runner = "wasm"
 
 [targets.lexical-move-wasm.profiles.dev]
 main_artifact = "main"
+
+[targets.raw-view-native]
+root = "src/raw_view.w"
+
+[targets.raw-view-native.artifacts.main]
+artifact = "Main"
+
+[targets.raw-view-native.artifacts.main.profiles.dev]
+backend = "llvm"
+output = "native"
+builder = "native"
+run_runner = "native"
+
+[targets.raw-view-native.profiles.dev]
+main_artifact = "main"
+
+[targets.raw-view-wasm]
+root = "src/raw_view.w"
+
+[targets.raw-view-wasm.artifacts.main]
+artifact = "Main"
+
+[targets.raw-view-wasm.artifacts.main.profiles.dev]
+backend = "llvm"
+output = "wasm-wasip1"
+builder = "wasm"
+run_runner = "wasm"
+
+[targets.raw-view-wasm.profiles.dev]
+main_artifact = "main"
