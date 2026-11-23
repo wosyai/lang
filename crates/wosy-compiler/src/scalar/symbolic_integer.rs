@@ -477,6 +477,10 @@ impl IntegerSet {
         self.0.iter().map(|interval| (&interval.first, &interval.last))
     }
 
+    pub(super) fn interval_count(&self) -> usize {
+        self.0.len()
+    }
+
     pub(super) fn extremes(&self) -> Option<(&BigInt, &BigInt)> {
         Some((&self.0.first()?.first, &self.0.last()?.last))
     }

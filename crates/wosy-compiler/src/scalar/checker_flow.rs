@@ -2300,6 +2300,15 @@ pub(super) enum ActualCallResult {
     EmptyUnit,
     ProjectedUnit(Rc<IntegerSet>),
     Integer(BigInt),
+    PartitionedInteger(Vec<IntegerReturnPartition>),
+}
+
+pub(super) const MAX_ACTUAL_CALL_DEPTH: usize = 64;
+const MAX_PARTITION_TRANSFER_WORK: usize = MAX_ACTUAL_CALL_DEPTH * MAX_ACTUAL_CALL_DEPTH;
+
+pub(super) struct IntegerReturnPartition {
+    input: Rc<IntegerSet>,
+    output: Rc<IntegerSet>,
 }
 
 pub(super) struct ProjectedIntegerArgument<'a> {
@@ -2987,11 +2996,12 @@ struct IntegerBlockCursor {
     depth: usize,
     path: IntegerInputs,
     branches: Vec<UnitBranchFrame>,
+    terminal: Vec<(BlockOrdinal, IntegerInputs, usize)>,
 }
 
 impl IntegerBlockCursor {
     fn new(block: BlockOrdinal, depth: usize, path: IntegerInputs) -> Self {
-        Self { block, next: 0, depth, path, branches: Vec::new() }
+        Self { block, next: 0, depth, path, branches: Vec::new(), terminal: Vec::new() }
     }
 }
 
@@ -3009,7 +3019,7 @@ fn walk_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, A
 ) -> Option<IntegerControl<'a>> {
     let mut cursor = IntegerBlockCursor::new(block, roots.axes.len(), path);
     drive_integer_block::<USE_IMPORTED_BOUND, COLLECT, _, false>(
-        calls, roots, &mut cursor, root_tail, returns, handle_call, failures, imports, authored_return, false,
+        calls, roots, &mut cursor, root_tail, returns, handle_call, failures, imports, authored_return, false, None,
     )
 }
 
@@ -3024,13 +3034,26 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
     imports: &mut &mut [Option<ImportedLocal<'a>>],
     authored_return: Authored,
     suspend_integer: bool,
+    mut return_capture_work: Option<&mut usize>,
 ) -> Option<IntegerControl<'a>> {
-    let IntegerBlockCursor { mut block, mut next, mut depth, mut path, mut branches } =
+    let IntegerBlockCursor { mut block, mut next, mut depth, mut path, mut branches, mut terminal } =
         std::mem::replace(cursor, IntegerBlockCursor::new(calls.structure.root, 0, IntegerInputs::default()));
     let structure = &calls.structure;
     loop {
         let items = &structure.blocks.get(block.0)?.items;
         let Some(item) = items.get(next).filter(|_| !path.is_unreachable()) else {
+            if SUSPEND_CALL && root_tail.is_some() && branches.is_empty() && path.is_unreachable() {
+                if let Some((arm, incoming, arm_depth)) = terminal.pop() {
+                    roots.truncate(arm_depth);
+                    block = arm;
+                    path = incoming;
+                    next = 0;
+                    continue;
+                }
+                if returns.as_ref().is_some_and(|paths| !paths.is_empty()) {
+                    return Some(IntegerControl::Returned);
+                }
+            }
             if roots.axes.len() != depth {
                 path.drop_locals(depth);
                 roots.truncate(depth);
@@ -3105,7 +3128,7 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                     path = passing;
                 } else if structure.checker_direct_targets.contains_key(&expression) {
                     if SUSPEND_CALL {
-                        *cursor = IntegerBlockCursor { block, next, depth, path, branches };
+                        *cursor = IntegerBlockCursor { block, next, depth, path, branches, terminal };
                         return Some(IntegerControl::PendingCall(ExactCallEffect::Unit(expression)));
                     }
                     let handle = handle_call.as_mut()?;
@@ -3195,6 +3218,10 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                             return None;
                         }
                         (block, path) = match (yes.is_unreachable(), no.is_unreachable()) {
+                            (false, false) => {
+                                terminal.push((*else_block, no, roots.axes.len()));
+                                (*then_block, yes)
+                            }
                             (false, true) => (*then_block, yes),
                             (true, false) => (*else_block, no),
                             _ => return None,
@@ -3246,12 +3273,19 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                         authored_return.observe_return(slot, value, roots, &path)?;
                     }
                     if let Some(returns) = returns.as_deref_mut() {
+                        if let Some(work) = return_capture_work.as_deref_mut() {
+                            charge_partition_capture(work, &path, roots.axes.len())?;
+                        }
                         returns.push(IntegerReturningPath {
                             value,
                             ty,
                             state: path,
                             axes: roots.axes.iter().map(|(binding, _)| *binding).collect(),
                         });
+                    }
+                    if SUSPEND_CALL {
+                        path = IntegerInputs::default();
+                        continue;
                     }
                     roots.truncate(depth);
                     return Some(IntegerControl::Returned);
@@ -3338,7 +3372,7 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                 if let Some(origin) = structure.checker_integer_call_locals.get(&(block, item.position)) {
                     let [receiver] = binding.receivers() else { return None; };
                     if SUSPEND_CALL && suspend_integer && !matches!(origin.arguments.as_slice(), [(_, CheckerIntegerCallArgument::ContextualValue)]) {
-                        *cursor = IntegerBlockCursor { block, next, depth, path, branches };
+                        *cursor = IntegerBlockCursor { block, next, depth, path, branches, terminal };
                         return Some(IntegerControl::PendingCall(ExactCallEffect::Integer {
                             call: origin.call, binding: &origin.binding, ty: &receiver.ty,
                         }));
@@ -3453,48 +3487,131 @@ pub(super) enum ExactCallProgress<'a> {
     Failed(IntegerCheckFailure<'a>),
 }
 
+fn charge_partition_capture(retained: &mut usize, path: &IntegerInputs, axes: usize) -> Option<()> {
+    let mut work = retained.checked_add(axes)?.checked_add(1)?;
+    for row in &path.0 {
+        work = work.checked_add(1)?.checked_add(row.len())?;
+        for domain in row {
+            work = work.checked_add(domain.interval_count())?;
+            if work > MAX_PARTITION_TRANSFER_WORK {
+                return None;
+            }
+        }
+    }
+    if work > MAX_PARTITION_TRANSFER_WORK {
+        return None;
+    }
+    *retained = work;
+    Some(())
+}
+
+#[test]
+fn symbolic_return_capture_charges_retained_rows_before_committing() {
+    let row = vec![Rc::new(IntegerSet::singleton(&BigInt::from(1))); 16];
+    let small = IntegerInputs(vec![row.clone(); 16]);
+    let large = IntegerInputs(vec![row.clone(); 128]);
+    let mut retained = 0;
+    assert_eq!(charge_partition_capture(&mut retained, &small, row.len()), Some(()));
+    let first = retained;
+    assert_eq!(charge_partition_capture(&mut retained, &small, row.len()), Some(()));
+    assert_eq!(retained, first * 2);
+    assert_eq!(charge_partition_capture(&mut retained, &large, row.len()), None);
+    assert_eq!(retained, first * 2);
+}
+
 pub(super) struct ExactCallCursor<'a> {
     roots: IntegerRoots<'a>,
     block: IntegerBlockCursor,
     tail: Option<&'a ScalarType>,
+    returned: Vec<IntegerReturningPath<'a>>,
+    return_capture_work: usize,
+    projected: bool,
 }
 
 impl<'a> ExactCallCursor<'a> {
     pub(super) fn new(calls: &'a FunctionCallSites, exact: &[&BigInt], expected: &ScalarType) -> Option<Self> {
+        Self::with_row(calls, expected, exact_integer_entry_row(exact), false)
+    }
+
+    pub(super) fn arbitrary_unit(calls: &'a FunctionCallSites) -> Option<Self> {
+        let row = calls.boundary.parameters.iter()
+            .map(|parameter| IntegerSet::from_type(&parameter.ty).map(Rc::new))
+            .collect::<Option<IntegerRow>>()?;
+        Self::with_row(calls, &ScalarType::Unit, row, false)
+    }
+
+    pub(super) fn projected(calls: &'a FunctionCallSites, values: Rc<IntegerSet>, expected: &ScalarType) -> Option<Self> {
+        Self::with_row(calls, expected, vec![values], true)
+    }
+
+    fn with_row(calls: &'a FunctionCallSites, expected: &ScalarType, row: IntegerRow, projected: bool) -> Option<Self> {
         let tail = if *expected == ScalarType::Unit { None } else {
             Some(integer_tail_type(calls).filter(|tail| *tail == expected)?)
         };
         let boundary = &calls.boundary;
         let bindings = boundary.checker_parameter_bindings.as_deref()?;
-        if exact.len() != boundary.parameters.len() || bindings.len() != exact.len() {
+        if row.len() != boundary.parameters.len() || bindings.len() != row.len() {
             return None;
         }
-        let mut roots = IntegerRoots { parameters: exact.len(), ..IntegerRoots::default() };
+        let mut roots = IntegerRoots { parameters: row.len(), ..IntegerRoots::default() };
         for (binding, parameter) in bindings.iter().zip(&boundary.parameters) {
             roots.add(binding, &parameter.ty);
         }
-        let row = exact_integer_entry_row(exact);
         let block = IntegerBlockCursor::new(calls.structure.root, roots.axes.len(), IntegerInputs(vec![row]));
-        Some(Self { roots, block, tail })
+        Some(Self { roots, block, tail, returned: Vec::new(), return_capture_work: 0, projected })
     }
 
     pub(super) fn arguments<'borrow>(
-        &'borrow self, calls: &'borrow FunctionCallSites, call: OccurrenceOrdinal, parameters: usize, collect: bool,
+        &'borrow self, calls: &'borrow FunctionCallSites, call: OccurrenceOrdinal, parameters: usize,
+        collect: bool, project: bool,
     ) -> Option<NestedIntegerArgument<'borrow>> {
         if collect && parameters == 2 {
             nested_pair_argument(calls, call, &self.roots, &self.block.path, false)
         } else {
-            Some(actual_nested_argument(calls, call, &self.roots, &self.block.path, false))
+            Some(actual_nested_argument(calls, call, &self.roots, &self.block.path, project))
         }
     }
 
-    pub(super) fn resume(&mut self, effect: ExactCallEffect<'a>, result: ActualCallResult) -> Option<()> {
+    pub(super) fn resume(&mut self, effect: ExactCallEffect<'a>, caller_axis: Option<usize>, result: ActualCallResult) -> Option<()> {
         match (effect, result) {
             (ExactCallEffect::Unit(_), ActualCallResult::Unit) => {}
             (ExactCallEffect::Unit(_), ActualCallResult::EmptyUnit) => self.block.path = IntegerInputs::default(),
             (ExactCallEffect::Integer { binding, ty, .. }, ActualCallResult::Integer(value)) => {
                 self.roots.add(binding, ty);
                 self.block.path.append_local(IntegerSet::singleton(&value));
+            }
+            (ExactCallEffect::Unit(_), ActualCallResult::ProjectedUnit(survivors)) => {
+                self.block.path.restrict_axis(caller_axis?, &survivors);
+            }
+            (ExactCallEffect::Integer { binding, ty, .. }, ActualCallResult::PartitionedInteger(pieces)) => {
+                let axis = caller_axis?;
+                let rows = &self.block.path.0;
+                let cells = self.roots.axes.len().checked_add(1)?;
+                let row_intervals = rows.iter().try_fold(0usize, |sum, row| sum.checked_add(row[axis].interval_count()))?;
+                let piece_intervals = pieces.iter().try_fold(0usize, |sum, piece| sum.checked_add(piece.input.interval_count()))?;
+                let row_copies = rows.len().checked_mul(pieces.len())?.checked_mul(cells)?;
+                let comparisons = row_intervals.checked_mul(pieces.len())?
+                    .checked_add(piece_intervals.checked_mul(rows.len())?)?;
+                if row_copies.checked_add(comparisons)? > MAX_PARTITION_TRANSFER_WORK {
+                    return None;
+                }
+                let original = std::mem::take(&mut self.block.path.0);
+                let mut joined = Vec::new();
+                for row in &original {
+                    for piece in &pieces {
+                        let overlap = match row[axis].intersection(&piece.input) {
+                            IntegerIntersection::Unchanged => Rc::clone(&row[axis]),
+                            IntegerIntersection::Empty => continue,
+                            IntegerIntersection::Changed(values) => Rc::new(values),
+                        };
+                        let mut next = row.clone();
+                        next[axis] = overlap;
+                        next.push(Rc::clone(&piece.output));
+                        joined.push(next);
+                    }
+                }
+                self.roots.add(binding, ty);
+                self.block.path = IntegerInputs(joined);
             }
             _ => return None,
         }
@@ -3514,19 +3631,50 @@ impl<'a> ExactCallCursor<'a> {
             projected: None, allow_projected_calls: false, allow_contextual_local_transfers, sink,
         };
         let mut imports: &mut [Option<ImportedLocal<'a>>] = &mut [];
-        let mut returned = Vec::new();
-        let returns = self.tail.is_some().then_some(&mut returned);
+        let returns = self.tail.is_some().then_some(&mut self.returned);
         let control = drive_integer_block::<false, COLLECT, _, true>(
             calls, &mut self.roots, &mut self.block, self.tail, returns, &mut handle_call,
             &mut Some(&mut failures), &mut imports, (), suspend_integer,
+            self.projected.then_some(&mut self.return_capture_work),
         )?;
         let result = match (self.tail, control) {
             (_, IntegerControl::PendingCall(effect)) => return Some(ExactCallProgress::Pending(effect)),
             (_, IntegerControl::Fail(failure)) => return Some(ExactCallProgress::Failed(failure)),
             (None, IntegerControl::Continue(path)) if COLLECT && path.is_unreachable() => ActualCallResult::EmptyUnit,
+            (None, IntegerControl::Continue(path)) if self.projected =>
+                ActualCallResult::ProjectedUnit(path.project_axis(0)?),
             (None, IntegerControl::Continue(_) | IntegerControl::Returned) => ActualCallResult::Unit,
+            (Some(_), IntegerControl::Returned) if self.projected => {
+                let piece_count = self.returned.iter().try_fold(0usize, |count, path| count.checked_add(path.state.0.len()))?;
+                if piece_count > MAX_PARTITION_TRANSFER_WORK {
+                    return None;
+                }
+                let mut pieces = Vec::with_capacity(piece_count);
+                for path in &self.returned {
+                    let alias = match path.value {
+                        IntegerReturn::Const(_) => None,
+                        IntegerReturn::Alias(binding) => Some(path.axes.iter().position(|axis| *axis == binding)?),
+                    };
+                    let constant = match path.value {
+                        IntegerReturn::Const(value) => Some(Rc::new(IntegerSet::singleton(value))),
+                        IntegerReturn::Alias(_) => None,
+                    };
+                    for row in &path.state.0 {
+                        let input = Rc::clone(row.first()?);
+                        let output = if let Some(axis) = alias {
+                            row[axis].singleton_value()?;
+                            Rc::clone(&row[axis])
+                        } else {
+                            Rc::clone(constant.as_ref()?)
+                        };
+                        pieces.push(IntegerReturnPartition { input, output });
+                    }
+                }
+                if pieces.is_empty() { return None; }
+                ActualCallResult::PartitionedInteger(pieces)
+            }
             (Some(_), IntegerControl::Returned) => {
-                let [path] = returned.as_slice() else { return None; };
+                let [path] = self.returned.as_slice() else { return None; };
                 ActualCallResult::Integer(path.singleton_return()?.clone())
             }
             (Some(_), IntegerControl::Continue(_)) => return None,
