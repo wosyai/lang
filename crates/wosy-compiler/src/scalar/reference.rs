@@ -1961,8 +1961,8 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             }]
                         )
                     });
-                let mixed_result = signature.is_some_and(|signature|
-                    aggregate::mixed_owned_struct_result(&signature.outputs).is_some());
+                let mixed_result = signature.and_then(|signature|
+                    aggregate::mixed_owned_struct_result(&signature.outputs));
                 let array_call = array_argument.is_some() && matches!(&calls.named_place_roots, NamedPlaceRootFacts::Prepared(_))
                     && matches!(&call, CfgPointKind::Call {
                     target: ResolvedCallTarget::ModuleCallable { .. }, ..
@@ -1991,7 +1991,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 }
                 if carries_struct_result {
                     self.aggregate_facts.calls.insert(id, ordinal);
-                } else if mixed_result {
+                } else if let Some(lanes) = mixed_result {
                     let selected = matches!(&self.cfg.points[id.0].kind, CfgPointKind::Call {
                         target: ResolvedCallTarget::ModuleCallable {
                             source, declaration_span, concrete: ConcreteCallSelection::Declaration,
@@ -2001,6 +2001,9 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     self.aggregate_result.mixed_result_calls.insert(id);
                     if selected {
                         self.aggregate_facts.calls.insert(id, ordinal);
+                        if lanes.owner == 1 {
+                            self.aggregate_facts.secondary_owner_calls.insert(id);
+                        }
                     }
                 }
                 if !aggregate_arguments.is_empty() {
@@ -3488,7 +3491,12 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 }
                 BindingOutput::ProjectPrimary { output } => {
                     if let Some(producer) = call_producer {
-                        self.project_call_output(producer, primary, *output);
+                        let projection = self.project_call_output(producer, primary, *output);
+                        if *output == 1 && self.aggregate_facts.secondary_owner_calls.contains(&producer)
+                            && self.aggregate_result.mixed_result_bindings.contains(&producer)
+                        {
+                            self.aggregate_facts.secondary_owner_outputs.insert(projection, producer);
+                        }
                     }
                 }
             }
@@ -3996,7 +4004,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         None
                     };
                     if let ([head, tail], Some(point)) = (binding_region.receivers(), call_producer) {
-                        if matches!(head.ty, ScalarType::Struct(_)) && aggregate::ordinary_value(&tail.ty)
+                        if aggregate::mixed_owner_result_lanes(&head.ty, &tail.ty).is_some()
                             && outputs.secondary.as_slice() == [BindingOutput::ProjectPrimary { output: 1 }]
                             && self.aggregate_facts.calls.contains_key(&point)
                             && matches!(&self.cfg.points[point.0].kind, CfgPointKind::Call {
@@ -12253,7 +12261,7 @@ impl FunctionReferenceResult {
             ScalarBlockItem::Expression(ScalarExpression::Name { name: scalar, .. })] =
             function.body.items.as_slice() else { return None };
         let [head, tail] = binding.receivers.as_slice() else { return None };
-        if &head.name != owner || &tail.name != scalar || owner == scalar
+        if !matches!(head.ty, ScalarType::Struct(_)) || &head.name != owner || &tail.name != scalar || owner == scalar
             || binding.output_origin != ScalarBindingOutputOrigin::SingleExpression || binding.is_allocation
             || !matches!(binding.value, ScalarExpression::Call { ref arguments, .. }
                 if arguments.iter().all(|argument| matches!(argument,

@@ -37,6 +37,8 @@ pub(super) struct AggregateFlowFacts {
     pub(super) installations: BTreeMap<CfgPointId, (CfgPointId, BlockPosition)>,
     receipt_aliases: BTreeSet<CfgPointId>,
     pub(super) calls: BTreeMap<CfgPointId, OccurrenceOrdinal>,
+    pub(super) secondary_owner_calls: BTreeSet<CfgPointId>,
+    pub(super) secondary_owner_outputs: BTreeMap<CfgPointId, CfgPointId>,
     pub(super) projected_reads: BTreeMap<CfgPointId, bool>,
     pub(super) scalar_receipt_reads: BTreeSet<CfgPointId>,
     pub(super) scope_exits: BTreeMap<CfgPointId, BlockOrdinal>,
@@ -415,8 +417,11 @@ pub(crate) struct MixedOwnerResultLanes {
 }
 
 pub(crate) fn mixed_owner_result_lanes(first: &ScalarType, second: &ScalarType) -> Option<MixedOwnerResultLanes> {
-    (matches!(first, ScalarType::Struct(_)) && ordinary_value(second))
-        .then_some(MixedOwnerResultLanes { owner: 0, scalar: 1 })
+    match (first, second) {
+        (ScalarType::Struct(_), scalar) if ordinary_value(scalar) => Some(MixedOwnerResultLanes { owner: 0, scalar: 1 }),
+        (scalar, ScalarType::Struct(_)) if ordinary_value(scalar) => Some(MixedOwnerResultLanes { owner: 1, scalar: 0 }),
+        _ => None,
+    }
 }
 
 pub(crate) fn mixed_owned_struct_result(outputs: &ScalarOutputSequence) -> Option<MixedOwnerResultLanes> {
@@ -436,7 +441,7 @@ fn mixed_owner_lanes_do_not_admit_other_result_shapes() {
         mixed_owner_result_lanes(&owner, &scalar),
         Some(MixedOwnerResultLanes { owner: 0, scalar: 1 }),
     );
-    assert!(mixed_owner_result_lanes(&scalar, &owner).is_none());
+    assert_eq!(mixed_owner_result_lanes(&scalar, &owner), Some(MixedOwnerResultLanes { owner: 1, scalar: 0 }));
     assert!(mixed_owner_result_lanes(&owner, &owner).is_none());
     assert!(mixed_owner_result_lanes(&scalar, &scalar).is_none());
 }
@@ -1576,6 +1581,8 @@ impl AggregateFlowFacts {
                     }
                     None
                 }
+                CfgPointKind::Call { output: 1, .. } => self.secondary_owner_outputs.get(&id)
+                    .map(|&producer| Value::Aggregate { backing: OwnerSource::Call(producer), field: None }),
                 CfgPointKind::Call {
                     output: 0,
                     target,
@@ -1717,7 +1724,7 @@ impl AggregateFlowFacts {
                     if self.temporary_arguments.contains(&id) {
                         state.pending_temporaries.insert(id, point.scope);
                     }
-                    offset.or_else(|| self.calls.contains_key(&id).then_some(Value::Aggregate {
+                    offset.or_else(|| (self.calls.contains_key(&id) && !self.secondary_owner_calls.contains(&id)).then_some(Value::Aggregate {
                         backing: OwnerSource::Call(id),
                         field: None,
                     }))

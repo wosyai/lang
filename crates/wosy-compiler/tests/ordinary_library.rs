@@ -610,6 +610,63 @@ if (result != 72) { core.system_panic(); };
 }
 
 #[test]
+fn mixed_reversed_result_keeps_ordinary_scalar_and_owns_exact_second_lane() {
+    let app = source("workbench", "src/reversed_owned_struct.w");
+    let text = r#"%%start
+struct Packet { *?u8 data; u64 length; }
+(u32, Packet)(u64) make_packet = fn(length) {
+    u8[length] backing;
+    backing[0] = 19;
+    *?u8 data = null;
+    unsafe { data = &?backing[0]; };
+    Packet packet = { .data = data; .length = length; };
+    37, packet
+};
+u64() consume_packet = fn {
+    u32 marker, Packet packet = make_packet(2);
+    u8 byte = unsafe { core.load<u8>(packet.data) };
+    packet.length + core.int_extend<u64>(byte) + core.int_extend<u64>(marker)
+};
+u64 result = consume_packet();
+if (result != 58) { core.system_panic(); };
+%%end"#;
+    for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let prepared = prepare_scalar_project(
+            vec![(declarations(&app, text), Vec::new())],
+            vec![app.clone()],
+            ScalarPreparationInputs { target_layout },
+        ).unwrap_or_else(|error| panic!("{target_layout:?}: {:?}", error.diagnostics));
+        let build = analyze_scalar_build(&prepared);
+        assert!(build.diagnostics().is_empty(), "{:#?}", build.diagnostics());
+        let llvm = emit_scalar_build_project_llvm(&build).unwrap().to_text();
+        let context = Context::create();
+        let buffer = MemoryBuffer::create_from_memory_range_copy(llvm.as_bytes(), "reversed-owner");
+        let module = context.create_module_from_ir(buffer).unwrap();
+        module.verify().unwrap();
+        use inkwell::values::AnyValue;
+        let producer = function_with_suffix(&module, "make_packet");
+        let caller = function_with_suffix(&module, "consume_packet");
+        let producer_body = module.get_function(&producer).unwrap().print_to_string().to_string();
+        let caller_body = module.get_function(&caller).unwrap().print_to_string().to_string();
+        assert!(producer_body.contains("ret { i32, ptr }"), "{producer_body}");
+        assert!(!producer_body.contains("call void @__wosy_core_free"), "{producer_body}");
+        assert_eq!(caller_body.matches(&format!("call {{ i32, ptr }} @{producer}(")).count(), 1, "{caller_body}");
+        assert!(caller_body.contains("extractvalue { i32, ptr } %aggregate_original_base, 1"), "{caller_body}");
+        assert!(caller_body.contains("extractvalue { i32, ptr } %aggregate_values, 0"), "{caller_body}");
+        assert_eq!(caller_body.matches("call void @__wosy_core_free").count(), 1, "{caller_body}");
+        let release = caller_body.find("call void @__wosy_core_free(ptr %aggregate_base)").expect("exact owner release");
+        assert!(caller_body[..release].contains("load i8"), "{caller_body}");
+
+        let wrong_lanes = text.replace("u32 marker, Packet packet = make_packet(2)", "Packet packet, u32 marker = make_packet(2)");
+        assert!(prepare_scalar_project(
+            vec![(declarations(&app, &wrong_lanes), Vec::new())],
+            vec![app.clone()],
+            ScalarPreparationInputs { target_layout },
+        ).is_err());
+    }
+}
+
+#[test]
 fn mixed_owned_struct_forwarder_transports_original_receipts_without_copying() {
     let app = source("workbench", "src/mixed_owner_forward.w");
     let text = r#"%%start
