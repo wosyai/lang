@@ -9548,68 +9548,66 @@ u64(*u8, u64) descend = fn(backing, depth) {
 
 #[test]
 fn guarded_fallible_scalar_uses_shared_lexical_ownership_on_both_targets() {
-    crate::scalar::with_test_fallible_admission(|| {
-        let source = SourceIdentity::new(
-            "project".into(), "package".into(), "src/main.w".into(), "r1".into(),
-        );
-        let text = "%%start\ni32() observed = fn {\n\ti32 result =? 42;\n\tif (&result == null) { 7 } else { result }\n};\ni32() flipped = fn {\n\ti32 result =? 19;\n\tif (null != &result) { result } else { 9 }\n};\ni32(bool) nested = fn(gate) {\n\tif (gate) {\n\t\ti32 result =? 25;\n\t\tif (&result == null) { 11 } else { result }\n\t} else { 13 }\n};\n%%end";
-        for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
-            let parsed = parse_source(source.clone(), text.into(), &[]);
-            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
-            let single = crate::derive_scalar_program_with_layout(&parsed.result, layout);
-            assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
-            for item in &single.program.items {
-                let ScalarItem::Function(function) = item else { continue };
-                assert!(
-                    function.reference_cfg.guarded_scalar_allocation().is_some(),
-                    "missing checked allocation proof for {}", function.name,
-                );
+    let source = SourceIdentity::new(
+        "project".into(), "package".into(), "src/main.w".into(), "r1".into(),
+    );
+    let text = "%%start\ni32() observed = fn {\n\ti32 result =? 42;\n\tif (&result == null) { 7 } else { result }\n};\ni32() flipped = fn {\n\ti32 result =? 19;\n\tif (null != &result) { result } else { 9 }\n};\ni32(bool) nested = fn(gate) {\n\tif (gate) {\n\t\ti32 result =? 25;\n\t\tif (&result == null) { 11 } else { result }\n\t} else { 13 }\n};\n%%end";
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let parsed = parse_source(source.clone(), text.into(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let single = crate::derive_scalar_program_with_layout(&parsed.result, layout);
+        assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+        for item in &single.program.items {
+            let ScalarItem::Function(function) = item else { continue };
+            assert!(
+                function.reference_cfg.guarded_scalar_allocation().is_some(),
+                "missing checked allocation proof for {}", function.name,
+            );
+        }
+        let rebuilt = crate::scalar::PreparedProgram::rebuild_raw(&single.program).expect("raw rebuild");
+        for item in &rebuilt.program().items {
+            let ScalarItem::Function(function) = item else { continue };
+            let proof = function.reference_cfg.guarded_scalar_allocation()
+                .unwrap_or_else(|| panic!("raw rebuild dropped proof for {}", function.name));
+            let declaration = proof.binding().declaration_span;
+            assert_eq!(&text[declaration.start as usize..declaration.end as usize], "result");
+            assert!(matches!(function.reference_cfg.points[proof.branch().0].kind, crate::scalar::CfgPointKind::Branch { .. }), "raw rebuild changed branch for {}", function.name);
+        }
+        let project = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::from_program(single.program.clone(), Vec::new())],
+            vec![source.clone()],
+        ));
+        assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+        for (project_route, llvm) in [
+            (false, emit_scalar_llvm(&single).expect("single LLVM").to_text()),
+            (true, emit_scalar_project_llvm(&project).expect("project LLVM").to_text()),
+        ] {
+            if let Some(output_dir) = std::env::var_os("WOSY_FALLIBLE_TEST_IR_DIR") {
+                let target = if layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
+                let file = format!("{target}-{}.ll", if project_route { "project" } else { "standalone" });
+                std::fs::write(std::path::PathBuf::from(output_dir).join(file), &llvm).expect("guarded test IR");
             }
-            let rebuilt = crate::scalar::PreparedProgram::rebuild_raw(&single.program).expect("raw rebuild");
-            for item in &rebuilt.program().items {
-                let ScalarItem::Function(function) = item else { continue };
-                let proof = function.reference_cfg.guarded_scalar_allocation()
-                    .unwrap_or_else(|| panic!("raw rebuild dropped proof for {}", function.name));
-                let declaration = proof.binding().declaration_span;
-                assert_eq!(&text[declaration.start as usize..declaration.end as usize], "result");
-                assert!(matches!(function.reference_cfg.points[proof.branch().0].kind, crate::scalar::CfgPointKind::Branch { .. }), "raw rebuild changed branch for {}", function.name);
-            }
-            let project = validate_scalar_project(ScalarProject::new(
-                vec![ScalarModule::from_program(single.program.clone(), Vec::new())],
-                vec![source.clone()],
-            ));
-            assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
-            for (project_route, llvm) in [
-                (false, emit_scalar_llvm(&single).expect("single LLVM").to_text()),
-                (true, emit_scalar_project_llvm(&project).expect("project LLVM").to_text()),
-            ] {
-                if let Some(output_dir) = std::env::var_os("WOSY_FALLIBLE_TEST_IR_DIR") {
-                    let target = if layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
-                    let file = format!("{target}-{}.ll", if project_route { "project" } else { "standalone" });
-                    std::fs::write(std::path::PathBuf::from(output_dir).join(file), &llvm).expect("guarded test IR");
+            for (name, initial) in [("observed", 42), ("flipped", 19), ("nested", 25)] {
+                let symbol = self_tail_test_symbol(&source, project_route, name);
+                let body = self_tail_test_body(&llvm, "i32", &symbol);
+                assert_eq!(body.matches("call ptr @__wosy_core_alloc(i64 4, i64 4)").count(), 1, "{body}");
+                assert_eq!(body.matches("icmp ne ptr %allocation, null").count(), 1, "{body}");
+                assert_eq!(body.matches("call void @__wosy_core_free(ptr %allocation)").count(), 1, "{body}");
+                assert_eq!(body.matches(&format!("store i32 {initial}, ptr %allocation")).count(), 1, "{body}");
+                assert!(body.contains("br i1 %fallible.present, label %fallible.initialize, label %fallible.continue"), "{body}");
+                assert!(body.contains("br i1 %fallible.present, label %fallible.release, label %fallible.released"), "{body}");
+                if name == "flipped" {
+                    assert!(body.contains("br i1 %fallible.present, label %if.then, label %if.else"), "{body}");
+                } else {
+                    assert!(body.lines().any(|line| line.contains("br i1 %fallible.absent, label %if.then") && line.contains("label %if.else")), "{body}");
                 }
-                for (name, initial) in [("observed", 42), ("flipped", 19), ("nested", 25)] {
-                    let symbol = self_tail_test_symbol(&source, project_route, name);
-                    let body = self_tail_test_body(&llvm, "i32", &symbol);
-                    assert_eq!(body.matches("call ptr @__wosy_core_alloc(i64 4, i64 4)").count(), 1, "{body}");
-                    assert_eq!(body.matches("icmp ne ptr %allocation, null").count(), 1, "{body}");
-                    assert_eq!(body.matches("call void @__wosy_core_free(ptr %allocation)").count(), 1, "{body}");
-                    assert_eq!(body.matches(&format!("store i32 {initial}, ptr %allocation")).count(), 1, "{body}");
-                    assert!(body.contains("br i1 %fallible.present, label %fallible.initialize, label %fallible.continue"), "{body}");
-                    assert!(body.contains("br i1 %fallible.present, label %fallible.release, label %fallible.released"), "{body}");
-                    if name == "flipped" {
-                        assert!(body.contains("br i1 %fallible.present, label %if.then, label %if.else"), "{body}");
-                    } else {
-                        assert!(body.lines().any(|line| line.contains("br i1 %fallible.absent, label %if.then") && line.contains("label %if.else")), "{body}");
-                    }
-                    let (_, initialize) = body.split_once("\nfallible.initialize:").expect("initialize block");
-                    let (initialize, _) = initialize.split_once("\nfallible.continue:").expect("continue block");
-                    assert!(initialize.contains(&format!("store i32 {initial}, ptr %allocation")), "{body}");
-                    let (_, cleanup) = body.split_once("\nfallible.release:").expect("release block");
-                    let (cleanup, _) = cleanup.split_once("\nfallible.released:").expect("release continuation");
-                    assert!(cleanup.contains("call void @__wosy_core_free(ptr %allocation)"), "{body}");
-                }
+                let (_, initialize) = body.split_once("\nfallible.initialize:").expect("initialize block");
+                let (initialize, _) = initialize.split_once("\nfallible.continue:").expect("continue block");
+                assert!(initialize.contains(&format!("store i32 {initial}, ptr %allocation")), "{body}");
+                let (_, cleanup) = body.split_once("\nfallible.release:").expect("release block");
+                let (cleanup, _) = cleanup.split_once("\nfallible.released:").expect("release continuation");
+                assert!(cleanup.contains("call void @__wosy_core_free(ptr %allocation)"), "{body}");
             }
         }
-    });
+    }
 }

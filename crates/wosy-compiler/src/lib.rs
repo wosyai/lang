@@ -134,7 +134,7 @@ mod tests {
         let source = SourceIdentity::new(
             "project".into(), "package".into(), "src/main.w".into(), "r1".into(),
         );
-        let text = "%%start\ni32() example = fn {\n\ti32 result =? 3;\n\tresult\n};\n%%end";
+        let text = "%%start\nu8() example = fn {\n\tu8 result =? 3;\n\tresult\n};\n%%end";
         let output = parse_source(source.clone(), text.into(), &[]);
         assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
         let mut scalar = derive_scalar_program(&output.result);
@@ -142,7 +142,7 @@ mod tests {
             panic!("{:?}", scalar.diagnostics);
         };
         assert_eq!(diagnostic.code, "B0003");
-        assert_eq!(diagnostic.message, "fallible allocation assignment is not supported by build yet");
+        assert_eq!(diagnostic.message, "fallible allocation currently requires a local i32 initialized by an integer literal");
         let range = diagnostic.labels[0].span.range;
         assert_eq!(&text[range.start as usize..range.end as usize], "=?");
         assert!(emit_scalar_llvm(&scalar).is_err());
@@ -154,6 +154,30 @@ mod tests {
         let scalar = derive_scalar_program(&ordinary.result);
         assert!(scalar.diagnostics.is_empty(), "{:?}", scalar.diagnostics);
         emit_scalar_llvm(&scalar).expect("ordinary assignment LLVM");
+    }
+
+    #[test]
+    fn source_fallible_allocation_rejects_unproved_read_and_unsupported_access() {
+        let source = SourceIdentity::new(
+            "project".into(), "package".into(), "src/main.w".into(), "r1".into(),
+        );
+        for (body, expected) in [
+            ("result", "fallible allocation is not known to be available"),
+            ("if (&result == null) { result } else { 7 }", "fallible allocation is not known to be available"),
+            ("i32 observed = if (&result == null) { 7 } else { result };\n\tobserved;\n\tif (&result == null) { 9 } else { result }", "fallible allocation requires one proven null guard for its local binding"),
+            ("result = 19;\n\t7", "fallible allocation does not support aliasing or reassignment"),
+            ("*i32 alias = &result;\n\talias;\n\t7", "fallible allocation does not support aliasing or reassignment"),
+        ] {
+            let text = format!("%%start\ni32() example = fn {{\n\ti32 result =? 3;\n\t{body}\n}};\n%%end");
+            let parsed = parse_source(source.clone(), text, &[]);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let mut checked = derive_scalar_program(&parsed.result);
+            assert!(checked.diagnostics.iter().any(|diagnostic| diagnostic.message == expected),
+                "{body}: {:?}", checked.diagnostics);
+            assert!(emit_scalar_llvm(&checked).is_err());
+            checked.diagnostics.clear();
+            assert!(emit_scalar_llvm(&checked).is_err());
+        }
     }
 
     #[test]

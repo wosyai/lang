@@ -706,6 +706,7 @@ pub enum ReferenceAnalysisErrorReason {
     MissingCheckedReferenceOrigin,
     UnavailableFallibleAllocation,
     UnsupportedFallibleAllocationAccess,
+    MissingGuardedAllocationProof,
     MissingRequiredDereferenceOrigin,
     MoveFromArrayElement,
     MovedPlace,
@@ -722,6 +723,7 @@ impl ReferenceAnalysisErrorReason {
             Self::MissingCheckedReferenceOrigin => "missing checked-reference origin",
             Self::UnavailableFallibleAllocation => "fallible allocation is not known to be available",
             Self::UnsupportedFallibleAllocationAccess => "fallible allocation does not support aliasing or reassignment",
+            Self::MissingGuardedAllocationProof => "fallible allocation requires one proven null guard for its local binding",
             Self::MissingRequiredDereferenceOrigin => "missing required dereference origin",
             Self::MoveFromArrayElement => "array elements cannot be moved individually",
             Self::MovedPlace => "read or move of unavailable place",
@@ -2516,8 +2518,6 @@ use resolution::{
     resolve_program_places, resolve_program_types,
 };
 mod typecheck;
-#[cfg(test)]
-pub(crate) use typecheck::with_test_fallible_admission;
 use typecheck::{
     block_item_type_in_module, block_type_in_module, block_type_in_module_expected,
     check_final_output_prefix, declare_module_name, expect_module_type, expression_span,

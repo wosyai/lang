@@ -6412,35 +6412,20 @@ pub(super) fn module_diagnostic(
 }
 
 fn pending_fallible_operator(binding: &ScalarBinding) -> Option<ByteSpan> {
-    #[cfg(test)]
-    if TEST_FALLIBLE_ADMISSION.get() {
-        return None;
+    let operator = binding.fallible_assignment?;
+    let [receiver] = binding.receivers.as_slice() else { return Some(operator) };
+    match (&receiver.ty, &binding.value) {
+        (ScalarType::I32, ScalarExpression::Integer { value, .. })
+            if i32::try_from(value).is_ok() => None,
+        _ => Some(operator),
     }
-    binding.fallible_assignment
-}
-
-#[cfg(test)]
-thread_local! {
-    static TEST_FALLIBLE_ADMISSION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-#[cfg(test)]
-pub(crate) fn with_test_fallible_admission<T>(test: impl FnOnce() -> T) -> T {
-    struct Restore<'a>(&'a std::cell::Cell<bool>, bool);
-    impl Drop for Restore<'_> {
-        fn drop(&mut self) { self.0.set(self.1); }
-    }
-    TEST_FALLIBLE_ADMISSION.with(|enabled| {
-        let _restore = Restore(enabled, enabled.replace(true));
-        test()
-    })
 }
 
 fn fallible_assignment_diagnostic(source: &SourceIdentity, span: ByteSpan) -> super::Diagnostic {
     source_diagnostic(
         source,
         "B0003",
-        "fallible allocation assignment is not supported by build yet",
+        "fallible allocation currently requires a local i32 initialized by an integer literal",
         span,
     )
 }

@@ -12704,6 +12704,17 @@ fn build_function_reference_cfg(
         } else {
             aggregate.checked_producer_backing.clear();
         }
+        if errors.is_empty() && builder.cfg.guarded_scalar_allocation.is_none() {
+            if let Some(bindings) = &builder.proof_points.fallible_allocation_bindings {
+                if let Some(binding) = bindings.keys().min() {
+                    errors.push(ReferenceAnalysisError::MissingOrigin {
+                        source_span: SourceSpan::new(builder.source.clone(), binding.declaration_span),
+                        binding_id: binding.clone(),
+                        reason: ReferenceAnalysisErrorReason::MissingGuardedAllocationProof,
+                    });
+                }
+            }
+        }
     }
     aggregate.returning_leaf = errors.is_empty() && prior_children_succeeded && builder.returning_leaf_prefix
         && matches!(builder.cfg.points.last().map(|point| &point.kind), Some(CfgPointKind::Return));
