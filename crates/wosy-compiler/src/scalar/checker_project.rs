@@ -733,7 +733,7 @@ fn symbolic_obligation_roots(
 }
 
 #[cfg(feature = "internal-checker")]
-struct ProofFreeSymbolic<const PROJECTED_WRITES: bool = false>;
+struct ProofFreeSymbolic<const ORDINARY_PROJECTIONS: bool = false>;
 
 #[cfg(feature = "internal-checker")]
 impl SymbolicRootProof for ProofFreeSymbolic {
@@ -742,12 +742,13 @@ impl SymbolicRootProof for ProofFreeSymbolic {
 }
 
 #[cfg(feature = "internal-checker")]
-impl<const PROJECTED_WRITES: bool> ActualIntegerObserver for ProofFreeSymbolic<PROJECTED_WRITES> {
+impl<const ORDINARY_PROJECTIONS: bool> ActualIntegerObserver for ProofFreeSymbolic<ORDINARY_PROJECTIONS> {
     const ENABLED: bool = false;
     const EXACT_INTEGER_CALL_CONTINUATIONS: bool = true;
     const INTEGER_RETURN_PARTITIONS: bool = true;
 
-    const PROJECTED_FORMAL_WRITES: bool = PROJECTED_WRITES;
+    const PROJECTED_FORMAL_WRITES: bool = ORDINARY_PROJECTIONS;
+    const ORDINARY_PROJECTED_PAIR: bool = ORDINARY_PROJECTIONS;
 
     fn observe(&mut self, _: (usize, usize), _: &[&BigInt], _: &BigInt) {}
 }
@@ -1282,6 +1283,7 @@ trait ActualIntegerObserver {
     const EXACT_INTEGER_CALL_CONTINUATIONS: bool = false;
     const INTEGER_RETURN_PARTITIONS: bool = false;
     const PROJECTED_FORMAL_WRITES: bool = false;
+    const ORDINARY_PROJECTED_PAIR: bool = false;
 
     fn observe(&mut self, target: (usize, usize), arguments: &[&BigInt], value: &BigInt);
 
@@ -1616,19 +1618,24 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
         {
             return Err(ProjectCheck::Unsupported);
         }
-        let arguments = parent.cursor.arguments(caller, call, signature.parameters.len(), collection.is_some(), Observer::INTEGER_RETURN_PARTITIONS)
+        let arguments = parent.cursor.arguments(
+            caller, call, signature.parameters.len(), collection.is_some(), Observer::INTEGER_RETURN_PARTITIONS,
+            Observer::ORDINARY_PROJECTED_PAIR,
+        )
             .ok_or(ProjectCheck::Unsupported)?;
         if let NestedIntegerArgument::Projected(projection) = arguments {
             if !Observer::INTEGER_RETURN_PARTITIONS
                 || (!Observer::PROJECTED_FORMAL_WRITES && !body.assignments.is_empty())
                 || self.active.contains(&target)
-                || !matches!(signature.parameters.as_slice(), [ty] if ty == projection.ty)
-                || !matches!(body.boundary.parameters.as_slice(), [formal] if &formal.ty == projection.ty)
+                || !projected_call_types_match(signature, body, &projection)
+                || (projection.fixed.is_some() && !Observer::ORDINARY_PROJECTED_PAIR)
             {
                 return Err(ProjectCheck::Unsupported);
             }
             let values = projection.materialize().ok_or(ProjectCheck::Unsupported)?;
-            let cursor = ExactCallCursor::projected(body, values, expected).ok_or(ProjectCheck::Unsupported)?;
+            let cursor = ExactCallCursor::projected_with_fixed(
+                body, values, projection.slot, projection.fixed.map(|(_, value)| value), expected,
+            ).ok_or(ProjectCheck::Unsupported)?;
             self.active.insert(target);
             self.active_depth += 1;
             return Ok(ExactCallActivation {
@@ -1732,16 +1739,8 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
         let projected = match projected {
             ActualProjectedArguments::SymbolicAxis(projection) => {
                 let Some(collection) = collection else { return Err(ProjectCheck::Unsupported); };
-                let ProjectedIntegerArgument { ty, slot, fixed, .. } = projection;
-                let types_match = match (signature.parameters.as_slice(), body.boundary.parameters.as_slice(), fixed) {
-                    ([parameter], [entry], None) => slot == 0 && parameter == ty && entry.ty == *ty,
-                    (parameters @ [_, _], entries @ [_, _], Some((fixed_ty, _))) if slot < 2 => {
-                        parameters[slot] == *ty && entries[slot].ty == *ty
-                            && parameters[1 - slot] == *fixed_ty && entries[1 - slot].ty == *fixed_ty
-                    }
-                    _ => false,
-                };
-                if ACTUAL_STARTUP || *expected != ScalarType::Unit || !types_match
+                let ProjectedIntegerArgument { slot, fixed, .. } = projection;
+                if ACTUAL_STARTUP || *expected != ScalarType::Unit || !projected_call_types_match(signature, body, &projection)
                     || !function.generic_parameters.is_empty() || !function.overload_arms.is_empty()
                     || !body.structure.checker_direct_targets.is_empty()
                     || !body.call_occurrences.is_empty() || !body.allocation_length_calls.is_empty()
@@ -1874,6 +1873,19 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             self.reached.insert(target);
         }
         result
+    }
+}
+
+fn projected_call_types_match(
+    signature: &CheckedCallSignature, body: &FunctionCallSites, projection: &ProjectedIntegerArgument<'_>,
+) -> bool {
+    let ProjectedIntegerArgument { ty, slot, fixed, .. } = *projection;
+    match (signature.parameters.as_slice(), body.boundary.parameters.as_slice(), fixed) {
+        ([parameter], [entry], None) => slot == 0 && parameter == ty && entry.ty == *ty,
+        (parameters @ [_, _], entries @ [_, _], Some((fixed_ty, _))) if slot < 2 =>
+            parameters[slot] == *ty && entries[slot].ty == *ty
+                && parameters[1 - slot] == *fixed_ty && entries[1 - slot].ty == *fixed_ty,
+        _ => false,
     }
 }
 
@@ -8393,6 +8405,52 @@ mod tests {
         }
         assert!(negative && positive);
         assert_eq!(failed.witness.row_count(), 2);
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordered_base_symbolic_call_projects_either_slot_beside_a_fixed_argument() {
+        let report = |code| OUTPUT.replace(".code = 1", &format!(".code = {code}"));
+        let program = |expression: &str| format!(r#"%%start
+            i8(u8, i8) last = fn(fixed, value) {{
+                if (fixed == 9) {{ if (value < 0) {{ value }} else {{ 0 }} }} else {{ 1 }}
+            }};
+            i8(i8, u8) first = fn(value, fixed) {{
+                i8 observed = last(fixed, value);
+                value = 4;
+                if (observed < 0) {{ observed }} else {{ value }}
+            }};
+            unit(u8, i8) guard = fn(fixed, value) {{
+                if (fixed == 9) {{ core.narrow(value != -2, {}); }};
+            }};
+            unit(i8) unused = fn(input) {{
+                i8 got = first(input, 9);
+                guard(9, input);
+                core.require(input != -2, {});
+                if (input < 0) {{ core.require(got {expression} 0, {}); }}
+                else {{ core.require(got == 4, {}); }};
+            }};
+        %%end"#, report(5), report(7), report(11), report(13));
+        let run = |revision, text: &str| {
+            let file = source("src/main.w", revision);
+            let prepared = prepare_proof_target(&file, text).unwrap();
+            run_closed_without_named_proofs(&prepared, ScalarCheckerScope::CurrentPackage, 1)
+        };
+        let pass = run("symbolic-pair-projection-pass", &program("<")).unwrap();
+        assert!(pass.active && pass.directives.is_empty());
+        let fail = run("symbolic-pair-projection-fail", &program(">=")).unwrap();
+        let [failure] = fail.directives.as_slice() else { panic!("only the negative caller partition fails"); };
+        assert_eq!(failure.code(), &BigInt::from(11));
+        assert_eq!(failure.witness.row_count(), 1);
+        assert_eq!(failure.witness.equal_axes(), &[(1, 0)]);
+        let [lower, before, after] = [-128, -3, -1].map(BigInt::from);
+        for axis in 0..2 {
+            assert!(failure.witness.intervals_at(0, axis).unwrap().eq([(&lower, &before), (&after, &after)]));
+        }
+
+        let varied = program("<").replace("unit(i8) unused = fn(input)", "unit(i8, u8) unused = fn(input, other)")
+            .replace("first(input, 9)", "first(input, other)");
+        assert!(matches!(run("symbolic-pair-projection-both-varied", &varied), Err(ProjectCheck::Unsupported)));
     }
 
     #[cfg(feature = "internal-checker")]

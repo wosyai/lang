@@ -7079,7 +7079,7 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
         #[cfg(any(test, feature = "internal-checker"))]
         let checker_enabled = self.occurrence_typing.checker_directives_enabled();
         #[cfg(any(test, feature = "internal-checker"))]
-        let checked_unit_pair_argument = checker_enabled
+        let checked_scalar_pair_argument = checker_enabled
             && matches!(self.mode, WalkMode::Callable(_))
             && (matches!(edge, OccurrenceEdge::CallArgument(1))
                 || (matches!(edge, OccurrenceEdge::CallArgument(0))
@@ -7087,7 +7087,8 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
             && matches!(parent, OccurrenceParent::Expression(call)
                 if self.checked_call_signatures.get(&call).is_some_and(|signature| {
                     signature.parameters.len() == 2 && signature.parameters.iter().all(is_integer_type)
-                        && matches!(signature.outputs.outputs.as_slice(), [output] if output.ty == ScalarType::Unit)
+                        && matches!(signature.outputs.outputs.as_slice(), [output]
+                            if output.ty == ScalarType::Unit || is_integer_type(&output.ty))
                 }));
         #[cfg(any(test, feature = "internal-checker"))]
         if checker_enabled
@@ -7096,11 +7097,11 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
                 OccurrenceEdge::AssignmentRhs { .. }
                     | OccurrenceEdge::BindingRoot { .. }
                     | OccurrenceEdge::FinalOutput { .. }
-            ) || initializer_literal_argument || checked_unit_pair_argument
+            ) || initializer_literal_argument || checked_scalar_pair_argument
                 || (matches!(edge, OccurrenceEdge::CallArgument(0)) && matches!(self.mode, WalkMode::Callable(_))))
             && self.structure.checked_types.expressions.get(&ordinal).is_some_and(is_integer_type)
         {
-            let value = if initializer_literal_argument || checked_unit_pair_argument
+            let value = if initializer_literal_argument || checked_scalar_pair_argument
                 || matches!(edge, OccurrenceEdge::FinalOutput { .. })
             {
                 super::checker_flow::concrete_integer_literal(expression).map(std::borrow::Cow::into_owned)

@@ -3785,26 +3785,38 @@ pub(super) struct ExactCallCursor<'a> {
     tail: Option<&'a ScalarType>,
     returned: Vec<IntegerReturningPath<'a>>,
     return_capture_work: usize,
-    projected: bool,
+    projected_slot: Option<usize>,
 }
 
 impl<'a> ExactCallCursor<'a> {
     pub(super) fn new(calls: &'a FunctionCallSites, exact: &[&BigInt], expected: &ScalarType) -> Option<Self> {
-        Self::with_row(calls, expected, exact_integer_entry_row(exact), false)
+        Self::with_row(calls, expected, exact_integer_entry_row(exact), None)
     }
 
     pub(super) fn arbitrary_unit(calls: &'a FunctionCallSites) -> Option<Self> {
         let row = calls.boundary.parameters.iter()
             .map(|parameter| IntegerSet::from_type(&parameter.ty).map(Rc::new))
             .collect::<Option<IntegerRow>>()?;
-        Self::with_row(calls, &ScalarType::Unit, row, false)
+        Self::with_row(calls, &ScalarType::Unit, row, None)
     }
 
     pub(super) fn projected(calls: &'a FunctionCallSites, values: Rc<IntegerSet>, expected: &ScalarType) -> Option<Self> {
-        Self::with_row(calls, expected, IntegerRow::new(vec![values]), true)
+        Self::projected_with_fixed(calls, values, 0, None, expected)
     }
 
-    fn with_row(calls: &'a FunctionCallSites, expected: &ScalarType, row: IntegerRow, projected: bool) -> Option<Self> {
+    pub(super) fn projected_with_fixed(
+        calls: &'a FunctionCallSites, values: Rc<IntegerSet>, slot: usize, fixed: Option<&BigInt>, expected: &ScalarType,
+    ) -> Option<Self> {
+        let cells = match (slot, fixed) {
+            (0, None) => vec![values],
+            (0, Some(value)) => vec![values, Rc::new(IntegerSet::singleton(value))],
+            (1, Some(value)) => vec![Rc::new(IntegerSet::singleton(value)), values],
+            _ => return None,
+        };
+        Self::with_row(calls, expected, IntegerRow::new(cells), Some(slot))
+    }
+
+    fn with_row(calls: &'a FunctionCallSites, expected: &ScalarType, row: IntegerRow, projected_slot: Option<usize>) -> Option<Self> {
         let tail = if *expected == ScalarType::Unit { None } else {
             Some(integer_tail_type(calls).filter(|tail| *tail == expected)?)
         };
@@ -3814,21 +3826,21 @@ impl<'a> ExactCallCursor<'a> {
             return None;
         }
         let mut roots = IntegerRoots {
-            parameters: row.len(), projected_entry_axis: projected.then_some(0), ..IntegerRoots::default()
+            parameters: row.len(), projected_entry_axis: projected_slot, ..IntegerRoots::default()
         };
         for (binding, parameter) in bindings.iter().zip(&boundary.parameters) {
             roots.add(binding, &parameter.ty);
         }
         let block = IntegerBlockCursor::new(calls.structure.root, roots.axes.len(), IntegerInputs(vec![row]));
-        Some(Self { roots, block, tail, returned: Vec::new(), return_capture_work: 0, projected })
+        Some(Self { roots, block, tail, returned: Vec::new(), return_capture_work: 0, projected_slot })
     }
 
     pub(super) fn arguments<'borrow>(
         &'borrow self, calls: &'borrow FunctionCallSites, call: OccurrenceOrdinal, parameters: usize,
-        collect: bool, project: bool,
+        collect: bool, project: bool, project_pair: bool,
     ) -> Option<NestedIntegerArgument<'borrow>> {
         if collect && parameters == 2 {
-            nested_pair_argument(calls, call, &self.roots, &self.block.path, false)
+            nested_pair_argument(calls, call, &self.roots, &self.block.path, project_pair)
         } else {
             Some(actual_nested_argument(calls, call, &self.roots, &self.block.path, project))
         }
@@ -3907,16 +3919,17 @@ impl<'a> ExactCallCursor<'a> {
         let control = drive_integer_block::<false, COLLECT, _, true>(
             calls, &mut self.roots, &mut self.block, self.tail, returns, &mut handle_call,
             &mut Some(&mut failures), &mut imports, (), suspend_integer,
-            self.projected.then_some(&mut self.return_capture_work),
+            self.projected_slot.map(|_| &mut self.return_capture_work),
         )?;
         let result = match (self.tail, control) {
             (_, IntegerControl::PendingCall(effect)) => return Some(ExactCallProgress::Pending(effect)),
             (_, IntegerControl::Fail(failure)) => return Some(ExactCallProgress::Failed(failure)),
             (None, IntegerControl::Continue(path)) if COLLECT && path.is_unreachable() => ActualCallResult::EmptyUnit,
-            (None, IntegerControl::Continue(path)) if self.projected =>
-                ActualCallResult::ProjectedUnit(path.project_entry(0)?),
+            (None, IntegerControl::Continue(path)) if self.projected_slot.is_some() =>
+                ActualCallResult::ProjectedUnit(path.project_entry(self.projected_slot?)?),
             (None, IntegerControl::Continue(_) | IntegerControl::Returned) => ActualCallResult::Unit,
-            (Some(_), IntegerControl::Returned) if self.projected => {
+            (Some(_), IntegerControl::Returned) if self.projected_slot.is_some() => {
+                let slot = self.projected_slot?;
                 let piece_count = self.returned.iter().try_fold(0usize, |count, path| count.checked_add(path.state.0.len()))?;
                 if piece_count > MAX_PARTITION_TRANSFER_WORK {
                     return None;
@@ -3932,8 +3945,8 @@ impl<'a> ExactCallCursor<'a> {
                         IntegerReturn::Alias(_) => None,
                     };
                     for row in &path.state.0 {
-                        let input = Rc::clone(row.entry_domain(0));
-                        let output = if alias.is_some_and(|axis| row.entry_alias(0, axis)) && input.singleton_value().is_none() {
+                        let input = Rc::clone(row.entry_domain(slot));
+                        let output = if alias.is_some_and(|axis| row.entry_alias(slot, axis)) && input.singleton_value().is_none() {
                             IntegerPartitionOutput::InputAlias
                         } else if let Some(axis) = alias {
                             row[axis].singleton_value()?;
