@@ -185,6 +185,7 @@ pub(crate) enum ConfiguredCheckLoadError {
     Target,
     Profile,
     Layout,
+    Dependency(String),
     Canonical(CanonicalLoadFailure),
     DormantPath,
     Dormant(CanonicalLoadFailure),
@@ -198,23 +199,23 @@ pub(crate) fn check_target(
     scope: ScalarCheckerScope,
     dormant_paths: Vec<&OsStr>,
 ) -> Result<ConfiguredCheckReceipt, ConfiguredCheckLoadError> {
-    configured_target(root, target, profile, scope, DormantSelection::Explicit(dormant_paths))
+    configured_target(root, target, profile, scope, Some(dormant_paths))
 }
 
 enum DormantSelection<'a> {
     Explicit(Vec<&'a OsStr>),
-    DeclaredPackage,
+    DeclaredPackage(PackageRelativePath),
 }
 
 pub(crate) fn check_declared_package_target(
     root: &Path, target: Option<&str>, profile: &str,
 ) -> Result<ConfiguredCheckReceipt, ConfiguredCheckLoadError> {
-    configured_target(root, target, profile, ScalarCheckerScope::CurrentPackage, DormantSelection::DeclaredPackage)
+    configured_target(root, target, profile, ScalarCheckerScope::CurrentPackage, None)
 }
 
 fn configured_target(
     root: &Path, target: Option<&str>, profile: &str,
-    scope: ScalarCheckerScope, selection: DormantSelection<'_>,
+    scope: ScalarCheckerScope, dormant_paths: Option<Vec<&OsStr>>,
 ) -> Result<ConfiguredCheckReceipt, ConfiguredCheckLoadError> {
     use ConfiguredCheckLoadError as LoadError;
     let root = root.canonicalize().map_err(|_| LoadError::Root)?;
@@ -226,6 +227,34 @@ fn configured_target(
     let (_, _, artifact, _) = configuration.artifact_profile(&target, profile)
         .map_err(|_| LoadError::Profile)?;
     let layout = artifact.target_layout().map_err(|_| LoadError::Layout)?;
+    let selection = match dormant_paths {
+        Some(paths) => DormantSelection::Explicit(paths),
+        None => DormantSelection::DeclaredPackage(
+            ProjectContext::declared_package_source_root(manifest.as_table()).map_err(LoadError::PackageSourceRoot)?,
+        ),
+    };
+    check_configured_proof_scope(&project, &configuration, layout, scope, selection)
+}
+
+pub(crate) fn check_direct_dependency_primary(
+    root: &Path, dependency: &str,
+) -> Result<ConfiguredCheckReceipt, ConfiguredCheckLoadError> {
+    use ConfiguredCheckLoadError as LoadError;
+    let root = root.canonicalize().map_err(|_| LoadError::Root)?;
+    let (_, _, selection) = ProjectConfiguration::load_with_direct_dependency_check_target(&root, dependency, None, None)
+        .map_err(LoadError::Dependency)?;
+    check_configured_proof_scope(
+        &selection.project, &selection.configuration, selection.layout, ScalarCheckerScope::CurrentPackage,
+        DormantSelection::DeclaredPackage(selection.source_directory),
+    )
+}
+
+fn check_configured_proof_scope(
+    project: &ProjectContext, configuration: &ProjectConfiguration, layout: wosy_project::TargetLayout,
+    scope: ScalarCheckerScope, selection: DormantSelection<'_>,
+) -> Result<ConfiguredCheckReceipt, ConfiguredCheckLoadError> {
+    use ConfiguredCheckLoadError as LoadError;
+    let root = project.root.as_path();
     let target_layout = ScalarTargetLayout {
         pointer_size: layout.pointer_size, pointer_alignment: layout.pointer_alignment,
     };
@@ -239,28 +268,26 @@ fn configured_target(
             };
             (CanonicalLoadPurpose::LocalProofs, (paths, false))
         }
-        DormantSelection::DeclaredPackage => {
-            let directory = ProjectContext::declared_package_source_root(manifest.as_table())
-                .map_err(LoadError::PackageSourceRoot)?;
-            let paths = declared_package_proof_paths(&root, &project, &configuration, &directory)
+        DormantSelection::DeclaredPackage(directory) => {
+            let paths = declared_package_proof_paths(root, project, configuration, &directory)
                 .map_err(LoadError::Dormant)?;
             let sources = paths.iter().cloned().collect();
             (CanonicalLoadPurpose::PackageProofs(sources), (paths, true))
         }
     };
-    let mut loaded = load_canonical_project_inputs(&root, &project, &configuration, purpose, || {})
+    let mut loaded = load_canonical_project_inputs(root, project, configuration, purpose, || {})
         .map_err(LoadError::Canonical)?;
     let (mut paths, discovered) = dormant_paths;
     if discovered {
         paths.retain(|path| !loaded.proofs.contains_key(path));
     }
-    let dormant = load_explicit_dormant_proof_sources(&root, &project, &configuration, paths, &mut loaded.texts)
+    let dormant = load_explicit_dormant_proof_sources(root, project, configuration, paths, &mut loaded.texts)
         .map_err(LoadError::Dormant)?;
     let outcome = check_loaded_scalar_ordered_local_proof_contexts(
         loaded.declarations, loaded.proofs.into_values(), loaded.initialization_order,
         ScalarPreparationInputs { target_layout }, scope, dormant,
     );
-    Ok(ConfiguredCheckReceipt { root, outcome, texts: loaded.texts })
+    Ok(ConfiguredCheckReceipt { root: root.to_owned(), outcome, texts: loaded.texts })
 }
 
 #[derive(Debug, PartialEq)]

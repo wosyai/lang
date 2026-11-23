@@ -861,6 +861,7 @@ fn check_command(
             LoadError::Target => "check: invalid target".to_owned(),
             LoadError::Profile => "check: invalid target profile".to_owned(),
             LoadError::Layout => "check: unsupported target layout".to_owned(),
+        LoadError::Dependency(error) => format!("check: {error}"),
             LoadError::PackageSourceRoot(error) => format!("check: {error}"),
             LoadError::DormantPath => "check: invalid declared source path".to_owned(),
         })?;
@@ -1609,7 +1610,7 @@ unit(u8) unused = fn(value) {{ core.require(value < 1, {{ .stdout = \"unused dep
             emit("own dep", 7),
         )).unwrap();
 
-        let (parent, document, selection) = ProjectConfiguration::load_with_direct_dependency_check_target(root, "dep", "own", "checked").unwrap();
+        let (parent, document, selection) = ProjectConfiguration::load_with_direct_dependency_check_target(root, "dep", Some("own"), Some("checked")).unwrap();
         let parent_project = ProjectContext::from_manifest(root, "main", document.as_table()).unwrap();
         let parent_layout = parent.artifact_profile("main", "dev").unwrap().2.target_layout().unwrap();
         assert_eq!(parent_layout.pointer_size, 8);
@@ -1629,9 +1630,49 @@ unit(u8) unused = fn(value) {{ core.require(value < 1, {{ .stdout = \"unused dep
         assert_eq!(failures.iter().map(|failure| failure.stdout()).collect::<Vec<_>>(), [b"parent import".as_slice(), b"parent".as_slice()]);
         assert_eq!(parent.texts.len(), 2);
         assert_eq!(
-            ProjectConfiguration::load_with_direct_dependency_check_target(root, "dep", "own", "dev").err().as_deref(),
+            ProjectConfiguration::load_with_direct_dependency_check_target(root, "dep", Some("own"), Some("dev")).err().as_deref(),
             Some("target own profile dev is missing"),
         );
+        use configured_check::{check_direct_dependency_primary, CheckPublicationError, ConfiguredCheckLoadError};
+        let child_manifest = manifest("dep", "src", "own", "src/own.w", "checked", "wasm-wasip1");
+        let explicit = "root = \"src/own.w\"";
+        let selectors = format!("{explicit}\ndefault_profile = \"checked\"");
+        let child_manifest = child_manifest.replace(explicit, &selectors);
+        fs::write(dep.join("wosy.toml"), &child_manifest).unwrap();
+        fs::write(dep.join("src/own.w"), r#"%%start
+    i16(i16, i16) choose = fn(left, right) { if (right < 0) { left } else { right } };
+    proof identity for choose(entry, selector) -> (out)
+        where (entry >= -5) ensures (out == core.old(entry)) {}
+    i16 answer = choose(4, 8);
+    core.require(false, { .stdout = "child startup"; .stderr = ""; .code = 11;
+        .files = [{ .path = "child.txt"; .text = "not yet published"; }]; });
+%%end"#).unwrap();
+        fs::write(dep.join("src/fallback.w"), r#"%%start
+    u8(u8) fallback = fn(value) { value };
+    proof every_return for fallback(entry) -> (out) ensures (out != 7) {}
+%%end"#).unwrap();
+
+        let (_, _, primary) = ProjectConfiguration::load_with_direct_dependency_check_target(root, "dep", None, None).unwrap();
+        assert_eq!(primary.layout.pointer_size, 4);
+        let checked = check_direct_dependency_primary(root, "dep").ok().expect("direct child input");
+        let publication = checked.plan_publication().ok().expect("closed child proof scope");
+        assert_eq!(checked.root, dep);
+        assert_eq!(publication.report.diagnostics.len(), 1);
+        assert_eq!(publication.report.diagnostics[0].invocation.call.source.path, "src/own.w");
+        assert_eq!(publication.report.symbolic_diagnostic.as_ref().unwrap().proof.source.path, "src/fallback.w");
+        assert_eq!(publication.report.directives.len(), 1);
+        assert_eq!(publication.report.directives[0].stdout(), b"child startup");
+        assert!(!root.join(".wosy").exists() && !dep.join(".wosy").exists());
+
+        let unsupported = fs::read_to_string(dep.join("src/own.w")).unwrap().replace("core.old(entry)", "core.old(unknown)");
+        fs::write(dep.join("src/own.w"), unsupported).unwrap();
+        let incomplete = check_direct_dependency_primary(root, "dep").ok().expect("incomplete child proof");
+        assert!(matches!(incomplete.plan_publication(), Err(CheckPublicationError::Incomplete(_))));
+        assert!(!root.join(".wosy").exists() && !dep.join(".wosy").exists());
+        fs::write(dep.join("wosy.toml"), child_manifest.replace(&selectors, explicit)).unwrap();
+        assert!(matches!(check_direct_dependency_primary(root, "dep"), Err(ConfiguredCheckLoadError::Dependency(message))
+            if message.contains("target own has no declared default_profile")));
+        assert!(ProjectConfiguration::load_with_direct_dependency_check_target(root, "dep", Some("own"), Some("checked")).is_ok());
         assert!(!root.join(".wosy").exists() && !dep.join(".wosy").exists());
         fs::remove_dir_all(root).unwrap();
     }

@@ -426,6 +426,8 @@ pub struct TargetProfile {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TargetConfig {
     pub root: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_profile: Option<String>,
     pub artifacts: std::collections::BTreeMap<String, ArtifactConfig>,
     pub profiles: std::collections::BTreeMap<String, TargetProfile>,
 }
@@ -443,6 +445,7 @@ pub struct ProjectConfiguration {
 #[cfg(feature = "internal-checker")]
 #[doc(hidden)]
 pub struct DirectDependencyCheckTarget {
+    pub source_directory: PackageRelativePath,
     pub project: ProjectContext,
     pub configuration: ProjectConfiguration,
     pub layout: TargetLayout,
@@ -465,21 +468,29 @@ impl ProjectConfiguration {
     #[cfg(feature = "internal-checker")]
     #[doc(hidden)]
     pub fn load_with_direct_dependency_check_target(
-        root: &Path, dependency: &str, target: &str, profile: &str,
+        root: &Path, dependency: &str, target: Option<&str>, profile: Option<&str>,
     ) -> Result<(Self, toml_edit::ImDocument<String>, DirectDependencyCheckTarget), String> {
         let document = toml_edit::ImDocument::parse(
             fs::read_to_string(root.join("wosy.toml")).map_err(|error| error.to_string())?,
         ).map_err(|error| error.to_string())?;
         let mut selection = None;
         let configuration = Self::from_document::<true>(root, &document, dependency, |resolved, child| {
-            let child_configuration = Self::from_document::<false>(&resolved.project_root, child, "", |_, _| Ok(()))?;
-            let project = ProjectContext::from_manifest(&resolved.project_root, target, child.as_table())?;
+            let child_root = resolved.project_root.canonicalize().map_err(|error| error.to_string())?;
+            if child_root == root {
+                return Err(format!("dependency {dependency} resolves to the parent package"));
+            }
+            let child_configuration = Self::from_document::<false>(&child_root, child, "", |_, _| Ok(()))?;
+            let target = child_configuration.resolve_target(target)?;
+            let project = ProjectContext::from_manifest(&child_root, &target, child.as_table())?;
             if project.package != resolved.name {
                 return Err(format!("dependency {dependency} identity mismatch"));
             }
-            let (_, _, artifact, _) = child_configuration.artifact_profile(target, profile)?;
+            let profile = profile.or(child_configuration.target_config(&target)?.default_profile.as_deref())
+                .ok_or_else(|| format!("target {target} has no declared default_profile"))?;
+            let (_, _, artifact, _) = child_configuration.artifact_profile(&target, profile)?;
             let layout = artifact.target_layout()?;
-            selection = Some(DirectDependencyCheckTarget { project, configuration: child_configuration, layout });
+            let source_directory = resolved.identity.path.clone();
+            selection = Some(DirectDependencyCheckTarget { source_directory, project, configuration: child_configuration, layout });
             Ok(())
         })?;
         let selection = selection.ok_or_else(|| format!("direct dependency {dependency} is missing"))?;
@@ -524,12 +535,17 @@ impl ProjectConfiguration {
                 .and_then(Item::as_value)
                 .and_then(|value| value.as_str())
                 .ok_or_else(|| format!("target {name} has no root"))?;
+            let default_profile = table.get("default_profile").map(|item| {
+                item.as_value().and_then(|value| value.as_str()).filter(|profile| !profile.is_empty())
+                    .map(str::to_owned).ok_or_else(|| format!("target {name} default_profile must be a nonempty string"))
+            }).transpose()?;
             let artifacts = parse_artifacts(table.get("artifacts"))?;
             let profiles = parse_target_profiles(table.get("profiles"))?;
             targets.insert(
                 name.to_owned(),
                 TargetConfig {
                     root: PathBuf::from(root),
+                    default_profile,
                     artifacts,
                     profiles,
                 },
@@ -695,6 +711,17 @@ fn resolve_local_packages_observing<const OBSERVE: bool>(
     for (name, declaration) in dependencies {
         let package_root = root.join(&declaration.path);
         let manifest_path = package_root.join("wosy.toml");
+        if OBSERVE && name == selected
+            && !fs::symlink_metadata(&manifest_path).is_ok_and(|metadata| metadata.is_file())
+        {
+            return Err(DependencyResolutionError {
+                diagnostics: vec![DependencyDiagnostic {
+                    code: "P0002".to_owned(),
+                    message: format!("dependency {name} manifest is not a regular non-aliased file"),
+                    span: declaration.span.clone(),
+                }],
+            });
+        }
         let content =
             fs::read_to_string(&manifest_path).map_err(|_| DependencyResolutionError {
                 diagnostics: vec![DependencyDiagnostic {
