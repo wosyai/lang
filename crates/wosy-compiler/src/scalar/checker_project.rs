@@ -2196,11 +2196,14 @@ struct VerifiedSymbolicEquality<'a> {
 }
 
 #[cfg(feature = "internal-checker")]
-impl SelectedSymbolicProof<'_, '_> {
-    fn try_consume_equality(
-        &mut self, target: PreparedCallable, calls: &FunctionCallSites, source: &SourceIdentity, effects: &mut OrderedFailures,
-    ) -> Result<Option<bool>, ProjectCheck> {
-        let Some(first) = &self.verified else { return Ok(None); };
+impl<'a> VerifiedSymbolicEquality<'a> {
+    fn consume<'scope>(
+        &self, find_additional: impl Fn(&PreparedCallable) -> Option<&'scope Self>,
+        target: PreparedCallable, calls: &FunctionCallSites, source: &SourceIdentity, effects: &mut OrderedFailures,
+    ) -> Result<Option<bool>, ProjectCheck>
+    where 'a: 'scope,
+    {
+        let first = self;
         if target.0 != first.target.0 || target.1 <= first.target.1
             || !calls.assignments.is_empty() || !calls.allocation_length_calls.is_empty()
             || !matches!(calls.boundary.results.as_slice(), [result] if result.ty == ScalarType::Unit)
@@ -2221,7 +2224,7 @@ impl SelectedSymbolicProof<'_, '_> {
             let Some(callee) = calls.structure.checker_direct_targets.get(&origin.call) else { return Ok(None); };
             let summary = if *callee == first.target {
                 first
-            } else if let Some(summary) = self.additional_verified.get(callee) {
+            } else if let Some(summary) = find_additional(callee) {
                 summary
             } else {
                 return Ok(None);
@@ -2283,6 +2286,17 @@ impl SelectedSymbolicProof<'_, '_> {
         }.ok_or(ProjectCheck::Unsupported)?;
         Ok(Some(active))
     }
+}
+
+#[cfg(feature = "internal-checker")]
+impl<'a> SelectedSymbolicProof<'a, '_> {
+    fn remember_equality(&mut self, summary: VerifiedSymbolicEquality<'a>) {
+        if self.verified.is_none() {
+            self.verified = Some(summary);
+        } else {
+            self.additional_verified.insert(summary.target, summary);
+        }
+    }
 
     fn record(
         &mut self, proof: &MainFlowProofCase<'_>, function: &ScalarFunction, source: &SourceIdentity,
@@ -2330,7 +2344,8 @@ impl SymbolicRootProof for SelectedSymbolicProof<'_, '_> {
         } else if let Some(group) = watched.other.get(&target) {
             group
         } else {
-            return self.try_consume_equality(target, calls, source, effects);
+            let Some(first) = &self.verified else { return Ok(None); };
+            return first.consume(|callee| self.additional_verified.get(callee), target, calls, source, effects);
         };
         let tautological = |proof: &MainFlowProofCase<'_>| !proof.guard.always_rejects
             && proof.guard.comparisons.is_empty() && proof.guard.domain.is_none();
@@ -2468,11 +2483,7 @@ impl SymbolicRootProof for SelectedSymbolicProof<'_, '_> {
                             slot: guard.slot, relation: guard.relation, bound: guard.bound,
                         }),
                     };
-                    if self.verified.is_none() {
-                        self.verified = Some(summary);
-                    } else {
-                        self.additional_verified.insert(target, summary);
-                    }
+                    self.remember_equality(summary);
                 }
             }
             for directive in directives {
@@ -3050,6 +3061,7 @@ struct RankedOrderedEvidence<'a, 'proof> {
     plan: &'proof PlannedModuleProof<'a>,
     rank: TypedInductionRank<'a>,
     allow_reached: bool,
+    allow_symbolic_summary: bool,
     reached_return: Option<Option<VerifiedInductionExactReturn<'proof>>>,
 }
 
@@ -3079,6 +3091,8 @@ struct RankedOrderedSymbolic<'a, 'proof> {
     plan: &'proof PlannedModuleProof<'a>,
     rank: TypedInductionRank<'a>,
     failure: Option<SymbolicProofDiagnostic>,
+    allow_summary: bool,
+    verified: Option<VerifiedSymbolicEquality<'proof>>,
 }
 
 #[cfg(feature = "internal-checker")]
@@ -3097,7 +3111,10 @@ impl<'a, 'proof> OrderedRunEvidence for RankedOrderedEvidence<'a, 'proof> {
     }
 
     fn symbolic(&self) -> Self::Symbolic<'_> {
-        RankedOrderedSymbolic { plan: self.plan, rank: self.rank, failure: None }
+        RankedOrderedSymbolic {
+            plan: self.plan, rank: self.rank, failure: None,
+            allow_summary: self.allow_symbolic_summary, verified: None,
+        }
     }
 
     fn finish_symbolic<'run>(proof: Self::Symbolic<'run>) -> Self::SymbolicReport where Self: 'run {
@@ -3117,16 +3134,21 @@ impl SymbolicRootProof for RankedOrderedSymbolic<'_, '_> {
     }
 
     fn try_collect(
-        &mut self, target: PreparedCallable, _: &FunctionCallSites, function: &ScalarFunction,
+        &mut self, target: PreparedCallable, calls: &FunctionCallSites, function: &ScalarFunction,
         source: &SourceIdentity, effects: &mut OrderedFailures,
     ) -> Result<Option<bool>, ProjectCheck> {
         if target != self.plan.target {
-            return Ok(None);
+            let Some(first) = &self.verified else { return Ok(None); };
+            return first.consume(|_| None, target, calls, source, effects);
         }
         match self.plan.verify_induction_return_witness(self.rank)? {
             RankedInductionOutcome::NoApplicable => Ok(Some(false)),
-            RankedInductionOutcome::Premise(InductionPremise::Established | InductionPremise::Unreachable) =>
-                Ok(Some(true)),
+            RankedInductionOutcome::Premise(InductionPremise::Established | InductionPremise::Unreachable) => {
+                if self.allow_summary {
+                    self.verified = ranked_symbolic_equality(self.plan, source);
+                }
+                Ok(Some(true))
+            }
             RankedInductionOutcome::Refuted(base) => {
                 let proof_span = |range| wosy_syntax::SourceSpan { source: base.proof_source.clone(), range };
                 let callable_span = |range| wosy_syntax::SourceSpan { source: source.clone(), range };
@@ -3157,6 +3179,33 @@ impl SymbolicRootProof for RankedOrderedSymbolic<'_, '_> {
             _ => Err(ProjectCheck::Unsupported),
         }
     }
+}
+
+#[cfg(feature = "internal-checker")]
+fn ranked_symbolic_equality<'proof>(
+    plan: &'proof PlannedModuleProof<'_>, source: &SourceIdentity,
+) -> Option<VerifiedSymbolicEquality<'proof>> {
+    if plan.proof_source != source {
+        return None;
+    }
+    let TypedProofGoal::Literal { operator: BinaryOperator::Equal, bound, .. } = &plan.typed.goal else {
+        return None;
+    };
+    let guard = match plan.filter.as_deref().unwrap_or_default() {
+        [] => None,
+        [CheckerPredicate::Integer(predicate)] => {
+            let bindings = plan.typed.body.boundary.checker_parameter_bindings.as_deref()?;
+            let slot = bindings.iter().position(|binding| binding == &predicate.binding)?;
+            Some(ImportedEntryGuard {
+                slot, relation: IntegerRelation::from_operator(&predicate.operator)?, bound: &predicate.bound,
+            })
+        }
+        _ => return None,
+    };
+    Some(VerifiedSymbolicEquality {
+        target: plan.target, canonical_target: plan.canonical_target, layout: plan.typed.target.target_layout,
+        body: plan.typed.body, bound, shared: std::cell::OnceCell::new(), guard,
+    })
 }
 
 #[cfg(feature = "internal-checker")]
@@ -3228,7 +3277,11 @@ impl SymbolicRootProof for MixedOrderedSymbolic<'_, '_, '_> {
         source: &SourceIdentity, effects: &mut OrderedFailures,
     ) -> Result<Option<bool>, ProjectCheck> {
         let (active, failure) = if target == self.ranked.plan.target {
-            (self.ranked.try_collect(target, calls, function, source, effects)?, self.ranked.failure.take())
+            let active = self.ranked.try_collect(target, calls, function, source, effects)?;
+            if let Some(summary) = self.ranked.verified.take() {
+                self.bare.remember_equality(summary);
+            }
+            (active, self.ranked.failure.take())
         } else {
             (self.bare.try_collect(target, calls, function, source, effects)?, self.bare.failure.take())
         };
@@ -3254,6 +3307,7 @@ fn run_closed_ranked_checks<'a, 'proof, const LOCAL_CATALOGS: bool>(
     let ranked = RankedOrderedEvidence {
         plan, rank,
         allow_reached: plan.proof_source == &prepared.source || (LOCAL_CATALOGS && plan.target.0 < startup_count),
+        allow_symbolic_summary: plan.proof_source == &prepared.source,
         reached_return: None,
     };
     if let Some(bare) = bare {
@@ -9366,6 +9420,64 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
         for proofs in [[ranked, duplicate.as_str()], [duplicate.as_str(), ranked], [ranked, duplicate_ranked.as_str()]] {
             assert!(matches!(run(proofs, actual, ScalarCheckerScope::CurrentPackage),
                 Err(ScalarOrderedCheckerOutcome::Unsupported)));
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordered_verified_ranked_equality_refines_later_symbolic_calls() {
+        let app = source("src/main.w", "ordered-ranked-symbolic-import");
+        let run = |text: &str, scope| {
+            let (_, proof) = crate::parse_proof_source(app.clone(), text.to_owned(), &[])
+                .unwrap_or_else(|_| panic!("valid ranked symbolic import source"));
+            check_loaded_scalar_ordered_local_proof_contexts(
+                Vec::new(), [(proof, Vec::new())], vec![app.clone()], inputs(), scope, Vec::new(),
+            )
+        };
+        let ranked = r#"proof rank for descend(entry) -> (out) where (entry <= 8) ensures (out == 4) decreases (entry) {
+            if (entry < 3) { core.show(out == 4); } else { core.use(rank(entry - 3)); }
+        }"#;
+        let bare = "proof bound for fixed(entry) -> (out) ensures (out == 7) {}";
+        for mixed in [false, true] {
+            let (fixed, call, proof, other_requirement) = if mixed {
+                (
+                    "u8(u8) fixed = fn(value) { if (value == 0) { 7 } else { 7 } };",
+                    "u8 other = fixed(input);", bare, format!("core.require(other == 7, {OUTPUT});"),
+                )
+            } else {
+                ("", "", "", String::new())
+            };
+            let text = format!(r#"%%start
+                u8(u8) descend = fn(value) {{ if (value < 3) {{ 4 }} else {{ descend(value - 3) }} }};
+                {fixed}
+                unit(u8) client = fn(input) {{
+                    core.narrow(input <= 8, {OUTPUT});
+                    u8 value = descend(input);
+                    {call}
+                    core.require(value == 4, {OUTPUT});
+                    {other_requirement}
+                    core.require(value == 5, {OUTPUT});
+                }};
+                {proof}
+                {ranked}
+            %%end"#);
+            let checked = run(&text, ScalarCheckerScope::CurrentPackage).unwrap();
+            assert!(checked.active && checked.diagnostics.is_empty() && checked.symbolic_diagnostic.is_none());
+            let [failure] = checked.directives.as_slice() else { panic!("one later symbolic failure"); };
+            assert_eq!(&text[failure.condition.start as usize..failure.condition.end as usize], "value == 5");
+            let four = BigInt::from(4);
+            assert!(failure.witness.intervals_at(0, 1).unwrap().eq([(&four, &four)]));
+            let main = run(&text, ScalarCheckerScope::MainFlowOnly).unwrap();
+            assert!(!main.active && main.directives.is_empty());
+            for rejected in [
+                text.replace("core.narrow(input <= 8", "core.narrow(input <= 9"),
+                text.replace("ensures (out == 4)", "ensures (out == 5)"),
+                text.replace("entry <= 8", "false"),
+                text.replace("%%end", "u8 reached = descend(8); %%end"),
+            ] {
+                assert!(matches!(run(&rejected, ScalarCheckerScope::CurrentPackage),
+                    Err(ScalarOrderedCheckerOutcome::Unsupported)));
+            }
         }
     }
 
