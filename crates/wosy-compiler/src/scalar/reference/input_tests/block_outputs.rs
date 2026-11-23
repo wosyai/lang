@@ -836,3 +836,64 @@ fn checked_ordinary_join_preserves_null_and_missing_provenance_on_separate_arms(
         assert_eq!(cfg.points[join.0].possible_origins.as_ref(), Some(&known_then.union(known_else).copied().collect()));
     }
 }
+
+#[test]
+fn mixed_tail_branch_backings_remain_distinct_without_admitting_lowering() {
+    use aggregate::{MixedArmBacking, OwnerSource};
+    let source = source();
+    let text = r#"%%start
+struct Packet { *?u8 data; u64 length; }
+(u32, Packet)(u64, bool) choose = fn(count, first) {
+	if (first) {
+		u8[count] left;
+		left[0] = 19;
+		*?u8 address = null;
+		unsafe { address = &?left[0]; };
+		Packet packet = { .data = address; .length = count; };
+		37, packet
+	} else {
+		u8[count] right;
+		right[0] = 23;
+		*?u8 address = null;
+		unsafe { address = &?right[0]; };
+		Packet packet = { .data = address; .length = count; };
+		43, packet
+	}
+};
+%%end"#;
+    let parsed = parse_source(source.clone(), text.into(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let prepared = prepare_scalar_project(
+            vec![(derive_scalar_declarations_from_cst(parsed.result.canonical_cst()), Vec::new())],
+            vec![source.clone()],
+            ScalarPreparationInputs { target_layout },
+        ).unwrap_or_else(|failure| panic!("{:?}", failure.diagnostics));
+        let module = &prepared.project().modules[0];
+        let (item, function) = module.items.iter().enumerate().find_map(|(item, declaration)| {
+            match declaration {
+                ScalarItem::Function(function) if function.name == "choose" => Some((item, function)),
+                _ => None,
+            }
+        }).expect("real prepared conditional producer");
+        let calls = prepared.function_calls(0, item);
+        let result = derive_function_reference_result(
+            &source, function, &HashSet::new(), calls, &module.structs, &module.enums, true, &mut Vec::new(),
+        );
+        let [MixedArmBacking::Exact(left), MixedArmBacking::Exact(right)] = result.aggregate.mixed_arm_backings
+            else { panic!("{:?}", result.aggregate.mixed_arm_backings) };
+        assert_ne!(left, right);
+        let [_, owner] = calls.boundary.root_outputs.as_slice() else { panic!("mixed callable outputs") };
+        assert_eq!(owner.output, 1);
+        let return_owners = result.aggregate.returns.iter().find_map(|(point, owners)| {
+            matches!(result.cfg.points[point.0].kind, CfgPointKind::ReturnOutput { output: 1, .. }).then_some(owners)
+        }).expect("canonical result lane");
+        assert_eq!(return_owners, &BTreeSet::from([
+            Some(OwnerSource::Allocation(left)), Some(OwnerSource::Allocation(right)),
+        ]));
+        let ScalarType::Callable { outputs, .. } = &function.signature else { panic!("callable") };
+        assert!(!result.aggregate.proves_mixed_local_owner(
+            &result.cfg, aggregate::mixed_owned_struct_result(outputs).unwrap(),
+        ));
+    }
+}

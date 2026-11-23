@@ -38,6 +38,7 @@ pub(super) struct AggregateFlowFacts {
     receipt_aliases: BTreeSet<CfgPointId>,
     pub(super) calls: BTreeMap<CfgPointId, OccurrenceOrdinal>,
     pub(super) secondary_owner_calls: BTreeSet<CfgPointId>,
+    pub(super) mixed_arm_projection: Option<(CfgPointId, [BlockOrdinal; 2])>,
     pub(super) secondary_owner_outputs: BTreeMap<CfgPointId, CfgPointId>,
     pub(super) projected_reads: BTreeMap<CfgPointId, bool>,
     pub(super) scalar_receipt_reads: BTreeSet<CfgPointId>,
@@ -617,6 +618,41 @@ impl LiteralArrayJoin {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum MixedArmBacking {
+    #[default]
+    Unseen,
+    Exact(CfgPointId),
+    Unproved,
+}
+
+impl MixedArmBacking {
+    fn observe(&mut self, backing: Option<CfgPointId>) {
+        *self = match (*self, backing) {
+            (Self::Unseen, Some(point)) => Self::Exact(point),
+            (Self::Exact(known), Some(point)) if known == point => Self::Exact(point),
+            _ => Self::Unproved,
+        };
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn mixed_arm_backing_never_recovers_from_conflicting_evidence() {
+    let mut arm = MixedArmBacking::Unseen;
+    arm.observe(Some(CfgPointId(1)));
+    arm.observe(Some(CfgPointId(1)));
+    assert_eq!(arm, MixedArmBacking::Exact(CfgPointId(1)));
+    arm.observe(Some(CfgPointId(2)));
+    arm.observe(Some(CfgPointId(1)));
+    assert_eq!(arm, MixedArmBacking::Unproved);
+
+    let mut arm = MixedArmBacking::Unseen;
+    arm.observe(None);
+    arm.observe(Some(CfgPointId(1)));
+    assert_eq!(arm, MixedArmBacking::Unproved);
+}
+
 #[derive(Default)]
 pub(super) struct AggregateFlowResult {
     literal_array_route: Option<LiteralArrayRoute>,
@@ -643,6 +679,7 @@ pub(super) struct AggregateFlowResult {
     pub(super) mixed_result_calls: BTreeSet<CfgPointId>,
     pub(super) mixed_result_bindings: BTreeSet<CfgPointId>,
     pub(super) mixed_forward: Option<CfgPointId>,
+    pub(super) mixed_arm_backings: [MixedArmBacking; 2],
     pub(super) returns: BTreeMap<CfgPointId, BTreeSet<Option<OwnerSource>>>,
     endpoints: BTreeMap<(CfgPointId, usize), ScopeEndpoint>,
     pub(super) unsupported: BTreeSet<CfgPointId>,
@@ -836,6 +873,7 @@ impl AggregateFlowFacts {
 
     fn observes_legacy_values(&self) -> bool {
         self.array_formal.is_some() || !self.array_calls.is_empty()
+            || self.mixed_arm_projection.is_some()
             || !self.checked_producer_arms.is_empty() || !self.views.is_empty() || !self.calls.is_empty() || !self.formals.is_empty() || !self.input_moves.is_empty() || !self.raw_formals.is_empty()
     }
 
@@ -1732,20 +1770,43 @@ impl AggregateFlowFacts {
                 CfgPointKind::ConditionalOutput {
                     then_point,
                     else_point,
-                } => match (state.values.get(then_point), state.values.get(else_point)) {
-                    (Some(value), None) | (None, Some(value)) => {
-                        result.account_raw(id, Some(value));
-                        Some(*value)
+                } => {
+                    let values = (state.values.get(then_point), state.values.get(else_point));
+                    if let Some((_, blocks)) = self.mixed_arm_projection.filter(|(point, _)| *point == id) {
+                        match values {
+                            (Some(value), None) | (None, Some(value)) => {
+                                let arm = usize::from(values.0.is_none());
+                                let backing = match value {
+                                    Value::Aggregate { backing: OwnerSource::Allocation(point), .. }
+                                        if !state.moved.contains(&OwnerSource::Allocation(*point))
+                                            && self.allocation_slots.get(point).is_some_and(|(block, _)| *block == blocks[arm].0)
+                                        => Some(*point),
+                                    _ => None,
+                                };
+                                result.mixed_arm_backings[arm].observe(backing);
+                            }
+                            _ => {
+                                for arm in &mut result.mixed_arm_backings {
+                                    arm.observe(None);
+                                }
+                            }
+                        }
                     }
-                    (None, None) => None,
-                    (Some(left), Some(right)) => {
-                        result.account_raw(id, Some(left));
-                        result.account_raw(id, Some(right));
-                        let receipt = result.reject_receipt_loan(id, Some(left))
-                            | result.reject_receipt_loan(id, Some(right));
-                        (!receipt).then_some(Value::Unknown)
+                    match values {
+                        (Some(value), None) | (None, Some(value)) => {
+                            result.account_raw(id, Some(value));
+                            Some(*value)
+                        }
+                        (None, None) => None,
+                        (Some(left), Some(right)) => {
+                            result.account_raw(id, Some(left));
+                            result.account_raw(id, Some(right));
+                            let receipt = result.reject_receipt_loan(id, Some(left))
+                                | result.reject_receipt_loan(id, Some(right));
+                            (!receipt).then_some(Value::Unknown)
+                        }
                     }
-                },
+                }
                 CfgPointKind::ReturnOutput { value_point, .. } => {
                     let return_value = state.values.get(value_point);
                     result.account_raw(id, return_value);

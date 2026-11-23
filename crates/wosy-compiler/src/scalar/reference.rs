@@ -1492,6 +1492,24 @@ impl<'a> ReferenceFlowBuilder<'a> {
         let first = result.output_points[0];
         self.cfg.points[then_arm.end.0].successors.push(first);
         self.cfg.points[else_arm.end.0].successors.push(first);
+        if scope == ReferenceScopeId(0) && primary.output == 0
+            && self.call_sites.boundary.root_outputs.len() == arity
+        {
+            if let ([first, second], ConditionalRegion::Value { then_block, else_block, .. }) =
+                (row.types.as_slice(), region)
+            {
+                let slots = &self.aggregate_facts.allocation_slots;
+                if slots.len() == 2
+                    && slots.values().any(|(block, _)| *block == then_block.0)
+                    && slots.values().any(|(block, _)| *block == else_block.0)
+                {
+                    if let Some(lanes) = aggregate::mixed_owner_result_lanes(first, second) {
+                        self.aggregate_facts.mixed_arm_projection =
+                            Some((result.output_points[lanes.owner], [*then_block, *else_block]));
+                    }
+                }
+            }
+        }
         // The projected row already binds every root slot to this producer and
         // its exact arm output. Only lane zero may carry the formal's backing.
         if scope == ReferenceScopeId(0) && primary.output == 0
