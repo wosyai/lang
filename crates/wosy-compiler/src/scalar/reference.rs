@@ -4570,6 +4570,18 @@ struct ReferenceEdgeState {
 }
 
 impl ReferenceEdgeState {
+    fn refine_allocation_edge(
+        &mut self,
+        edge: &super::control::GuardedAllocationEdge,
+        successor: CfgPointId,
+    ) {
+        if successor == edge.absent {
+            self.uninitialized.insert(edge.binding.clone());
+        } else if successor == edge.present {
+            self.uninitialized.remove(&edge.binding);
+        }
+    }
+
     fn expire_scope(
         &mut self,
         point: &ReferenceFlowPoint,
@@ -4671,6 +4683,34 @@ fn sparse_reference_point_values_keep_path_presence_and_expire_at_original_bound
     assert_eq!(sibling.get(CfgPointId(1)), None);
     sibling.record(CfgPointId(4), &None, &uses);
     assert_eq!(sibling.get(CfgPointId(0)), None);
+}
+
+#[cfg(test)]
+#[test]
+fn guarded_allocation_availability_refines_only_the_exact_successor_binding() {
+    let source = SourceIdentity::new("project".into(), "package".into(), "metadata".into(), "r1".into());
+    let span = ByteSpan::new(0, 100);
+    let binding = |start| ReferenceBindingId {
+        source: source.clone(), function_span: span, block_span: span,
+        declaration_span: ByteSpan::new(start, start + 1), kind: ReferenceBindingKind::Declared,
+    };
+    let target = binding(10);
+    let unrelated = binding(20);
+    let edge = super::control::GuardedAllocationEdge {
+        binding: target.clone(), present: CfgPointId(3), absent: CfgPointId(2),
+    };
+    let mut entry = ReferenceEdgeState::default();
+    entry.uninitialized.insert(unrelated.clone());
+    let mut failure = entry.clone();
+    failure.refine_allocation_edge(&edge, edge.absent);
+    assert_eq!(failure.uninitialized, HashSet::from([target.clone(), unrelated.clone()]));
+    let mut other = failure.clone();
+    other.refine_allocation_edge(&edge, CfgPointId(4));
+    assert!(other == failure);
+    let mut success = failure.clone();
+    success.refine_allocation_edge(&edge, edge.present);
+    assert!(success == entry);
+    assert!(failure.uninitialized.contains(&target));
 }
 
 #[cfg(test)]
@@ -5795,6 +5835,7 @@ struct ReferenceTransferCfg<'a> {
     allocations: &'a BTreeSet<ReferenceBindingId>,
     checked_join_values: &'a [(CfgPointId, [Option<CfgPointId>; 2])],
     checked_block_values: &'a [(CfgPointId, CfgPointId)],
+    guarded_allocation_edges: &'a [(CfgPointId, super::control::GuardedAllocationEdge)],
     checked_binding_initializers: &'a [(CfgPointId, CfgPointId)],
     resolved_checked_call_outputs: &'a [CfgPointId],
     checked_pointee_reads: &'a [CfgPointId],
@@ -5820,6 +5861,7 @@ impl<'a> ReferenceTransferCfg<'a> {
             allocations: &cfg.allocations,
             checked_join_values: proof.map_or(&[], |proof| &proof.checked_join_values),
             checked_block_values: proof.map_or(&[], |proof| &proof.checked_block_values),
+            guarded_allocation_edges: proof.map_or(&[], |proof| &proof.guarded_allocation_edges),
             checked_binding_initializers: proof.map_or(&[], |proof| &proof.checked_binding_initializers),
             resolved_checked_call_outputs: proof.map_or(&[], |proof| &proof.resolved_checked_call_outputs),
             checked_pointee_reads: proof.map_or(&[], |proof| &proof.checked_pointee_reads),
@@ -6702,6 +6744,18 @@ fn transfer_reference_facts(
         };
         let common_aggregate_cutoff = aggregate_deadlines.as_ref()
             .and_then(|_| original_points[id.0].successors.iter().copied().min());
+        let guarded_allocation_edge = if cfg.guarded_allocation_edges.is_empty() {
+            None
+        } else {
+            cfg.guarded_allocation_edges.binary_search_by_key(&id, |(branch, _)| *branch)
+                .ok()
+                .map(|index| &cfg.guarded_allocation_edges[index].1)
+                .filter(|edge| matches!(original_points[id.0].kind, CfgPointKind::Branch { .. })
+                    && edge.present != edge.absent
+                    && matches!(original_points[id.0].successors.as_slice(), [first, second]
+                        if (*first, *second) == (edge.present, edge.absent)
+                            || (*first, *second) == (edge.absent, edge.present)))
+        };
         let states = incoming.take(id);
         let incoming_count = states.as_slice().len();
         let mut local_access_conflicts = None;
@@ -8169,6 +8223,9 @@ fn transfer_reference_facts(
                 flow.expire_before(cutoff, last_use);
             }
             let prune_for_successor = |next: &mut ReferenceEdgeState, successor| {
+                if let Some(edge) = guarded_allocation_edge {
+                    next.refine_allocation_edge(edge, successor);
+                }
                 if common_aggregate_cutoff.is_some_and(|cutoff| cutoff < successor) {
                     if let (Some(last_use), Some(flow)) = (&aggregate_deadlines, &mut next.aggregate) {
                         flow.expire_before(successor, last_use);
@@ -11914,6 +11971,7 @@ fn derive_function_specialized_copy_policies<'a>(
                     allocations: &template_cfg.allocations,
                     checked_join_values: &template_result.proof_points.checked_join_values,
                     checked_block_values: &template_result.proof_points.checked_block_values,
+                    guarded_allocation_edges: &template_result.proof_points.guarded_allocation_edges,
                     checked_binding_initializers: &template_result.proof_points.checked_binding_initializers,
                     resolved_checked_call_outputs: &template_result.proof_points.resolved_checked_call_outputs,
                     checked_pointee_reads: &template_result.proof_points.checked_pointee_reads,

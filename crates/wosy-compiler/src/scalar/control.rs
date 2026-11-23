@@ -23,6 +23,12 @@ pub(super) enum ForwardInitialGraph {
     Linear,
 }
 
+pub(super) struct GuardedAllocationEdge {
+    pub(super) binding: super::ReferenceBindingId,
+    pub(super) present: super::CfgPointId,
+    pub(super) absent: super::CfgPointId,
+}
+
 #[derive(Default)]
 pub(crate) struct CallablePointFacts {
     pub(super) local_borrow: Option<Box<super::reference::local_borrow::Sealed>>,
@@ -37,6 +43,7 @@ pub(crate) struct CallablePointFacts {
     pub(super) raw_address_exposures: Vec<(super::CfgPointId, Option<super::ReferenceBindingId>)>,
     pub(super) checked_join_values: Vec<(super::CfgPointId, [Option<super::CfgPointId>; 2])>,
     pub(super) checked_block_values: Vec<(super::CfgPointId, super::CfgPointId)>,
+    pub(super) guarded_allocation_edges: Vec<(super::CfgPointId, GuardedAllocationEdge)>,
     pub(super) checked_binding_initializers: Vec<(super::CfgPointId, super::CfgPointId)>,
     pub(super) resolved_checked_call_outputs: Vec<super::CfgPointId>,
     pub(super) checked_named_scalar_stores: Vec<super::CfgPointId>,
