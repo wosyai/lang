@@ -3127,7 +3127,7 @@ impl SymbolicRootProof for RankedOrderedSymbolic<'_, '_> {
             RankedInductionOutcome::NoApplicable => Ok(Some(false)),
             RankedInductionOutcome::Premise(InductionPremise::Established | InductionPremise::Unreachable) =>
                 Ok(Some(true)),
-            RankedInductionOutcome::Refuted(Some(base)) => {
+            RankedInductionOutcome::Refuted(base) => {
                 let proof_span = |range| wosy_syntax::SourceSpan { source: base.proof_source.clone(), range };
                 let callable_span = |range| wosy_syntax::SourceSpan { source: source.clone(), range };
                 let (goal, failed_step) = match base.rejected {
@@ -3137,6 +3137,9 @@ impl SymbolicRootProof for RankedOrderedSymbolic<'_, '_> {
                         (wosy_syntax::byte_span(&goal), Some(proof_span(range)))
                     }
                 };
+                let earlier = self.rank.earlier.zip(base.earlier.as_ref());
+                let axes = earlier.into_iter().map(|((slot, binding), _)| (binding.clone(), slot.ty.clone()))
+                    .chain([(self.rank.descending.1.clone(), base.entry_type)]).collect();
                 self.failure = Some(SymbolicProofDiagnostic {
                     proof: proof_span(wosy_syntax::byte_span(self.plan.proof)),
                     goal: proof_span(goal), failed_step,
@@ -3144,8 +3147,8 @@ impl SymbolicRootProof for RankedOrderedSymbolic<'_, '_> {
                     output: wosy_syntax::SourceSpan { source: base.return_source.clone(), range: base.return_span },
                     directive_position: effects.records.len(),
                     witness: ScalarCheckerIntegerWitness {
-                        axes: vec![(self.rank.descending.1.clone(), base.entry_type)],
-                        state: IntegerInputs::single_axis_point(&base.entry),
+                        axes,
+                        state: IntegerInputs::entry_point(earlier.map(|(_, value)| value), &base.entry),
                     },
                     returned: base.returned.clone(),
                 });
@@ -3245,7 +3248,7 @@ fn run_closed_ranked_checks<'a, 'proof, const LOCAL_CATALOGS: bool>(
     prepared: &PreparedProofModule, scope: ScalarCheckerScope, startup_count: usize,
     plan: &'proof PlannedModuleProof<'a>, rank: TypedInductionRank<'a>, bare: Option<&'proof PlannedModuleProof<'a>>,
 ) -> Result<MainFlowProofReceipt, ProjectCheck> {
-    if rank.earlier.is_some() || plan.proof_source != &plan.typed.target.source {
+    if plan.proof_source != &plan.typed.target.source {
         return Err(ProjectCheck::Unsupported);
     }
     let ranked = RankedOrderedEvidence {
@@ -4733,34 +4736,35 @@ impl PlannedModuleProof<'_> {
             self.function, self.canonical_target, &self.typed, measure, &proof_case,
         )?;
         let filter = self.filter.as_deref().unwrap_or_default();
-        let (entries, minimum) = induction_entry_domain(measure, filter)?;
+        let (entries, minimum, earlier) = induction_entry_domain(measure, filter)?;
         if entries.is_empty() {
             return Ok(RankedInductionOutcome::NoApplicable);
         }
         if let Some(failure) = failure {
-            if measure.earlier.is_none() {
-                let entry = match &proof_case.base_guard {
-                    CheckerPredicate::Boolean(true) => entries.extremes().map(|(first, _)| first.clone()),
-                    CheckerPredicate::Boolean(false) => None,
-                    CheckerPredicate::Integer(predicate) => entries.keep(&predicate.operator, &predicate.bound)
-                        .ok_or(ProjectCheck::Unsupported)?.extremes().map(|(first, _)| first.clone()),
-                    _ => return Err(ProjectCheck::Unsupported),
+            let entry = match &proof_case.base_guard {
+                CheckerPredicate::Boolean(true) => entries.extremes().map(|(first, _)| first.clone()),
+                CheckerPredicate::Boolean(false) => None,
+                CheckerPredicate::Integer(predicate) => entries.keep(&predicate.operator, &predicate.bound)
+                    .ok_or(ProjectCheck::Unsupported)?.extremes().map(|(first, _)| first.clone()),
+                _ => return Err(ProjectCheck::Unsupported),
+            };
+            if let Some(entry) = entry {
+                let earlier = if let Some(domain) = earlier {
+                    Some(domain.extremes().ok_or(ProjectCheck::Unsupported)?.0.clone())
+                } else {
+                    None
                 };
-                if let Some(entry) = entry {
-                    let rejected = if failure.show_failed {
-                        RankedBaseRejection::AuthoredShow(proof_case.base_show)
-                    } else {
-                        let goal = child(&child(self.proof, SyntaxKind::ProofEnsures)?, SyntaxKind::Expression)?;
-                        RankedBaseRejection::Goal(wosy_syntax::byte_span(&goal))
-                    };
-                    return Ok(RankedInductionOutcome::Refuted(Some(RankedBaseWitness {
-                        proof_source: self.proof_source, return_source: &self.typed.target.source,
-                        entry_type: measure.descending.0.ty.clone(), entry, returned: failure.returned,
-                        return_span: failure.return_span, rejected,
-                    })));
-                }
-            } else if induction_base_reachable(&entries, &proof_case.base_guard)? {
-                return Ok(RankedInductionOutcome::Refuted(None));
+                let rejected = if failure.show_failed {
+                    RankedBaseRejection::AuthoredShow(proof_case.base_show)
+                } else {
+                    let goal = child(&child(self.proof, SyntaxKind::ProofEnsures)?, SyntaxKind::Expression)?;
+                    RankedBaseRejection::Goal(wosy_syntax::byte_span(&goal))
+                };
+                return Ok(RankedInductionOutcome::Refuted(RankedBaseWitness {
+                    proof_source: self.proof_source, return_source: &self.typed.target.source,
+                    entry_type: measure.descending.0.ty.clone(), earlier, entry, returned: failure.returned,
+                    return_span: failure.return_span, rejected,
+                }));
             }
         }
         check_induction_entry_domain(entries, &minimum, &proof_case, filter, measure.descending.1)
@@ -6033,7 +6037,7 @@ enum InductionPremise {
 enum RankedInductionOutcome<'a> {
     NoApplicable,
     Premise(InductionPremise),
-    Refuted(Option<RankedBaseWitness<'a>>),
+    Refuted(RankedBaseWitness<'a>),
 }
 
 #[cfg(feature = "internal-checker")]
@@ -6042,6 +6046,7 @@ struct RankedBaseWitness<'a> {
     proof_source: &'a SourceIdentity,
     return_source: &'a SourceIdentity,
     entry_type: ScalarType,
+    earlier: Option<BigInt>,
     entry: BigInt,
     returned: &'a BigInt,
     return_span: ByteSpan,
@@ -6256,7 +6261,7 @@ fn check_decrement_induction_premise(
     proof: &TypedInductionProofSteps<'_>,
     entry_filter: &[CheckerPredicate],
 ) -> Result<InductionPremise, ProjectCheck> {
-    let (entries, minimum) = induction_entry_domain(rank, entry_filter)?;
+    let (entries, minimum, _) = induction_entry_domain(rank, entry_filter)?;
     check_induction_entry_domain(entries, &minimum, proof, entry_filter, rank.descending.1)
 }
 
@@ -6264,7 +6269,7 @@ fn check_decrement_induction_premise(
 fn induction_entry_domain(
     rank: TypedInductionRank<'_>,
     entry_filter: &[CheckerPredicate],
-) -> Result<(IntegerSet, BigInt), ProjectCheck> {
+) -> Result<(IntegerSet, BigInt, Option<IntegerSet>), ProjectCheck> {
     let (parameter, binding) = rank.descending;
     let mut entries = IntegerSet::from_type(&parameter.ty).ok_or(ProjectCheck::Unsupported)?;
     let mut earlier = match rank.earlier {
@@ -6275,7 +6280,7 @@ fn induction_entry_domain(
     for guard in entry_filter {
         match guard {
             CheckerPredicate::Boolean(true) => {}
-            CheckerPredicate::Boolean(false) => return Ok((IntegerSet::default(), minimum)),
+            CheckerPredicate::Boolean(false) => return Ok((IntegerSet::default(), minimum, None)),
             CheckerPredicate::EntryDomain { .. } | CheckerPredicate::DirectiveDisjunction { .. } | CheckerPredicate::ProofReflexiveBranch(_) => return Err(ProjectCheck::Unsupported),
             CheckerPredicate::Integer(predicate) if &predicate.binding == binding => {
                 entries = entries.keep(&predicate.operator, &predicate.bound).ok_or(ProjectCheck::Unsupported)?;
@@ -6290,31 +6295,12 @@ fn induction_entry_domain(
                 }
                 *domain = domain.keep(&predicate.operator, &predicate.bound).ok_or(ProjectCheck::Unsupported)?;
                 if domain.is_empty() {
-                    return Ok((IntegerSet::default(), minimum));
+                    return Ok((IntegerSet::default(), minimum, None));
                 }
             }
         }
     }
-    Ok((entries, minimum))
-}
-
-#[cfg(feature = "internal-checker")]
-fn induction_base_reachable(
-    entries: &IntegerSet,
-    guard: &CheckerPredicate,
-) -> Result<bool, ProjectCheck> {
-    if entries.is_empty() {
-        return Ok(false);
-    }
-    match guard {
-        CheckerPredicate::Boolean(value) => Ok(*value),
-        CheckerPredicate::EntryDomain { .. } | CheckerPredicate::DirectiveDisjunction { .. } | CheckerPredicate::ProofReflexiveBranch(_) => Err(ProjectCheck::Unsupported),
-        CheckerPredicate::Integer(predicate) => {
-            let complement = complement_integer_comparison(&predicate.operator)
-                .and_then(IntegerRelation::from_operator).ok_or(ProjectCheck::Unsupported)?;
-            Ok(!entries.every(complement, &predicate.bound))
-        }
-    }
+    Ok((entries, minimum, earlier.map(|(domain, _)| domain)))
 }
 
 #[cfg(feature = "internal-checker")]
@@ -9035,6 +9021,59 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
 
     #[cfg(feature = "internal-checker")]
     #[test]
+    fn ordered_lexicographic_rank_checks_exact_calls_and_base_witness() {
+        let app = source("src/main.w", "ordered-lexicographic-rank");
+        let proof_source = r#"%%start
+            u8(i16, u8) descend = fn(tag, value) { if (value < 3) { 4 } else { descend(tag, value - 3) } };
+            proof rank for descend(tag, entry) -> (out)
+                where (tag >= 11 && entry <= 8) ensures (out == 4) decreases (tag, entry) {
+                if (entry < 3) { core.show(out == 4); } else { core.use(rank(tag, entry - 3)); }
+            }
+        %%end"#;
+        let run = |text: &str, scope| {
+            let (_, proof) = crate::parse_proof_source(app.clone(), text.to_owned(), &[])
+                .unwrap_or_else(|_| panic!("valid lexicographic rank"));
+            check_loaded_scalar_ordered_local_proof_contexts(
+                Vec::new(), [(proof, Vec::new())], vec![app.clone()], inputs(), scope, Vec::new(),
+            )
+        };
+        let startup = format!(r#"
+            u8 actual = descend(11, 8);
+            core.require(actual == 4, {OUTPUT});
+            core.require(false, {OUTPUT});
+        %%end"#);
+        let reached = proof_source.replace("%%end", &startup);
+        for scope in [ScalarCheckerScope::CurrentPackage, ScalarCheckerScope::MainFlowOnly] {
+            let checked = run(&reached, scope).unwrap();
+            assert!(checked.active && checked.diagnostics.is_empty() && checked.symbolic_diagnostic.is_none());
+            assert_eq!(checked.directives.len(), 1);
+            let condition = checked.directives[0].condition;
+            assert_eq!(&reached[condition.start as usize..condition.end as usize], "false");
+            for invalid in [
+                reached.replace("descend(11, 8)", "descend(10, 8)"),
+                reached.replace("descend(11, 8)", "descend(11, 9)"),
+                reached.replace("descend(tag, value - 3)", "descend(tag + 1, value - 3)"),
+                reached.replace("rank(tag, entry - 3)", "rank(tag + 1, entry - 3)"),
+            ] {
+                assert!(matches!(run(&invalid, scope), Err(ScalarOrderedCheckerOutcome::Unsupported)));
+            }
+        }
+        let refuted = proof_source.replace("out == 4) decreases", "out == 5) decreases")
+            .replace("entry <= 8", "entry == 2");
+        let current = run(&refuted, ScalarCheckerScope::CurrentPackage).unwrap();
+        let witness = current.symbolic_diagnostic.unwrap();
+        assert_eq!(witness.returned, BigInt::from(4));
+        assert!(witness.failed_step.is_none());
+        assert_eq!(&refuted[witness.goal.range.start as usize..witness.goal.range.end as usize], "out == 5");
+        let [tag, value] = [BigInt::from(11), BigInt::from(2)];
+        assert!(witness.witness.intervals_at(0, 0).unwrap().eq([(&tag, &tag)]));
+        assert!(witness.witness.intervals_at(0, 1).unwrap().eq([(&value, &value)]));
+        let excluded = run(&refuted, ScalarCheckerScope::MainFlowOnly).unwrap();
+        assert!(!excluded.active && excluded.symbolic_diagnostic.is_none());
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
     fn ordered_qualified_ranked_equality_uses_only_owning_reachable_local_catalog() {
         let app = source("src/main.w", "ordered-qualified-rank-app");
         let local = source("src/lib.w", "ordered-qualified-rank-library");
@@ -10111,7 +10150,7 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
                 assert!(matches!(outcome, RankedInductionOutcome::NoApplicable));
                 return;
             };
-            let RankedInductionOutcome::Refuted(Some(witness)) = outcome else {
+            let RankedInductionOutcome::Refuted(witness) = outcome else {
                 panic!("one-axis admitted base refutation");
             };
             assert_eq!(witness.entry_type, ScalarType::U8);

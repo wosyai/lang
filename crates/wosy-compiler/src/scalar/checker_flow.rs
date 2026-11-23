@@ -895,8 +895,9 @@ impl IntegerInputs {
     }
 
     #[cfg(feature = "internal-checker")]
-    pub(super) fn single_axis_point(value: &BigInt) -> Self {
-        Self(vec![vec![Rc::new(IntegerSet::singleton(value))]])
+    pub(super) fn entry_point(earlier: Option<&BigInt>, value: &BigInt) -> Self {
+        Self(vec![earlier.into_iter().chain([value])
+            .map(|value| Rc::new(IntegerSet::singleton(value))).collect()])
     }
 
     fn singleton_at(&self, axis: usize) -> Option<&BigInt> {
