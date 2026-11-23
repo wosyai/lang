@@ -1293,6 +1293,32 @@ impl IntegerInputs {
         });
     }
 
+    fn charge_affine_disjunction(
+        &self, axis: usize, cuts: &IntegerCutUnion<'_>, require: bool, work: &mut usize,
+    ) -> Option<()> {
+        let uniform = cuts.uniform();
+        let extra = cuts.max_added_intervals().saturating_sub(1);
+        let copies = require && uniform != Some(true);
+        if extra == 0 && !copies {
+            return Some(());
+        }
+        for row in &self.0 {
+            if row.affine.is_none() {
+                continue;
+            }
+            if copies {
+                *work = work.checked_add(row.len())?;
+            }
+            if extra != 0 && row.affine_touches(axis) {
+                *work = work.checked_add(extra.checked_mul(4)?)?;
+            }
+            if *work > MAX_PARTITION_TRANSFER_WORK {
+                return None;
+            }
+        }
+        Some(())
+    }
+
     fn disjunction_failure_witness(&self, axis: usize, cuts: &IntegerCutUnion<'_>) -> Self {
         if let Some(passes) = cuts.uniform() {
             return if passes { Self::default() } else { Self(self.0.clone()) };
@@ -3495,15 +3521,15 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                     let predicate = directive.predicate.as_ref()?;
                     roots.reached_obligation = true;
                     if let (true, CheckerPredicate::DirectiveDisjunction { binding, ty, atoms }) = (COLLECT, predicate) {
-                        if roots.affine_work.is_some() && path.0.iter().any(|row| row.affine.is_some()) {
-                            return None;
-                        }
                         let (axis, actual_type) = roots.lookup(binding)?;
                         if ty != actual_type {
                             return None;
                         }
                         let (minimum, maximum) = super::typecheck::integer_bounds(ty)?;
                         let cuts = directive_disjunction_cuts(atoms, (&minimum, &maximum))?;
+                        if let Some(work) = &mut roots.affine_work {
+                            path.charge_affine_disjunction(axis, &cuts, directive.operation == CheckerOperation::Require, work)?;
+                        }
                         let failing = match directive.operation {
                             CheckerOperation::Require => path.disjunction_failure_witness(axis, &cuts),
                             CheckerOperation::Narrow => path.narrow_disjunction_or_witness(axis, &cuts),
@@ -4091,14 +4117,22 @@ impl<'a> ExactCallCursor<'a> {
         &'borrow self, calls: &'borrow FunctionCallSites, call: OccurrenceOrdinal, parameters: usize,
         collect: bool, project: bool, project_pair: bool, project_independent: bool,
     ) -> Option<NestedIntegerArgument<'borrow>> {
-        if self.roots.affine_work.is_some() && self.block.path.0.iter().any(|row| row.affine.is_some()) {
-            return None;
-        }
-        if collect && parameters == 2 {
-            nested_pair_argument(calls, call, &self.roots, &self.block.path, project_pair, project_pair, project_independent)
+        let argument = if collect && parameters == 2 {
+            nested_pair_argument(calls, call, &self.roots, &self.block.path, project_pair, project_pair, project_independent)?
         } else {
-            Some(actual_nested_argument(calls, call, &self.roots, &self.block.path, project))
+            actual_nested_argument(calls, call, &self.roots, &self.block.path, project)
+        };
+        if self.roots.affine_work.is_some() {
+            let exact = match &argument {
+                NestedIntegerArgument::Single(Some(_)) | NestedIntegerArgument::Pair(..) => true,
+                NestedIntegerArgument::Single(None) => parameters == 0,
+                _ => false,
+            };
+            if !exact && self.block.path.0.iter().any(|row| row.affine.is_some()) {
+                return None;
+            }
         }
+        Some(argument)
     }
 
     pub(super) fn resume(&mut self, effect: ExactCallEffect<'a>, caller_axis: Option<usize>, result: ActualCallResult) -> Option<()> {
@@ -4541,6 +4575,31 @@ fn integer_local<'a>(
     Some((identity, &receiver.ty, value))
 }
 
+
+#[test]
+fn affine_disjunction_preflights_three_piece_require_witness() {
+    let [zero, one, two, three, four, five] = [0, 1, 2, 3, 4, 5].map(BigInt::from);
+    let equal = IntegerRelation::from_operator(&BinaryOperator::Equal).unwrap();
+    let cuts = IntegerCutUnion::new((equal, &one), (equal, &three), (&zero, &five));
+    assert_eq!(cuts.max_added_intervals(), 2);
+    let domain = IntegerSet::from_type(&ScalarType::U8).unwrap().keep(&BinaryOperator::LessEqual, &four).unwrap();
+    let mut row: IntegerRow = std::iter::once(Rc::new(domain)).collect();
+    row.append_affine(0, Rc::new(IntegerAffineTransform { reflected: true, offset: four }));
+    let paths = IntegerInputs(vec![row; 8]);
+
+    let mut work = MAX_PARTITION_TRANSFER_WORK - 8 * (2 + 4);
+    assert_eq!(paths.charge_affine_disjunction(1, &cuts, true, &mut work), Some(()));
+    assert_eq!(work, MAX_PARTITION_TRANSFER_WORK);
+    let witness = paths.disjunction_failure_witness(1, &cuts);
+    assert_eq!(witness.0.len(), 8);
+    for row in &witness.0 {
+        assert_eq!(row[0].interval_count(), 3);
+        assert_eq!(row[1].interval_count(), 3);
+        assert!(row[0].keep(&BinaryOperator::Equal, &two).unwrap().singleton_value().is_some());
+    }
+    let mut work = MAX_PARTITION_TRANSFER_WORK - 8 * (2 + 4) + 1;
+    assert_eq!(paths.charge_affine_disjunction(1, &cuts, true, &mut work), None);
+}
 
 #[test]
 fn directive_disjunction_filter_keeps_original_witness_without_building_the_other_side() {

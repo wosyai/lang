@@ -150,6 +150,10 @@ impl<'a> IntegerCutUnion<'a> {
         }
     }
 
+    pub(super) fn max_added_intervals(&self) -> usize {
+        self.len.saturating_sub(1) / 2
+    }
+
     pub(super) fn uniform(&self) -> Option<bool> {
         if self.len == 1 { self.cells[0].map(|cell| cell.accepts) } else { None }
     }
