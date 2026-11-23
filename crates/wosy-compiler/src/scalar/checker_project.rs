@@ -220,7 +220,6 @@ fn prepare_checked_package_scope(
     Ok((prepare_checker_project(declarations, initialization_order, inputs)?, startup_count))
 }
 
-#[cfg(feature = "internal-checker")]
 fn validate_dormant_source_boundaries<'a>(
     declarations: &[(ScalarSourceDeclarations, Vec<ScalarNamespaceBinding>)],
     root: &SourceIdentity,
@@ -1889,7 +1888,7 @@ impl PreparedProofModule {
         if !dormant.is_empty() {
             validate_dormant_source_boundaries(
                 &declarations, &source, |source| graph_sources.contains_key(source),
-                dormant.iter().map(ScalarProofDeclarations::declarations),
+                dormant.iter().map(|proof| &proof.declarations),
             )?;
             declarations.reserve(dormant.len());
         }
