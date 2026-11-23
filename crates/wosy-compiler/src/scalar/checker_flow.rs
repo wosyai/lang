@@ -100,7 +100,12 @@ pub(super) struct ImportedLocal<'a> {
 pub(super) enum ImportedIntegerValues<'a> {
     Ready(IntegerSet, std::marker::PhantomData<&'a ()>),
     #[cfg(feature = "internal-checker")]
-    Shared { values: &'a std::cell::OnceCell<Rc<IntegerSet>>, bound: &'a BigInt, guard: Option<&'a ImportedEntryGuard<'a>> },
+    Shared {
+        values: &'a std::cell::OnceCell<Rc<IntegerSet>>,
+        bound: &'a BigInt,
+        guards: &'a [ImportedEntryGuard<'a>],
+        domain: Option<(usize, &'a IntegerSet)>,
+    },
     #[cfg(feature = "internal-checker")]
     Deferred {
         slot: usize,
@@ -3023,11 +3028,17 @@ fn walk_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, A
                     if !local.guards.iter().all(&applies) {
                         return None;
                     }
+                    #[cfg(feature = "internal-checker")]
+                    let in_domain = |(slot, domain): (usize, &IntegerSet)| match arguments.get(slot).copied().flatten() {
+                        Some(Argument::Literal(value)) => domain.contains(value),
+                        Some(Argument::Axis(axis)) => path.0.iter().all(|row| row[axis].is_subset_of(domain)),
+                        None => false,
+                    };
                     let values = match local.values {
                         ImportedIntegerValues::Ready(values, _) => values,
                         #[cfg(feature = "internal-checker")]
-                        ImportedIntegerValues::Shared { values, bound, guard } => {
-                            if guard.is_some_and(|guard| !applies(guard)) {
+                        ImportedIntegerValues::Shared { values, bound, guards, domain } => {
+                            if !guards.iter().all(applies) || domain.is_some_and(|domain| !in_domain(domain)) {
                                 return None;
                             }
                             roots.add(&origin.binding, &receiver.ty);
@@ -3037,11 +3048,7 @@ fn walk_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, A
                         }
                         #[cfg(feature = "internal-checker")]
                         ImportedIntegerValues::Deferred { slot, domain, issue } => {
-                            let admitted = !path.is_unreachable() && match arguments.get(slot).copied().flatten() {
-                                Some(Argument::Literal(value)) => domain.contains(value),
-                                Some(Argument::Axis(axis)) => path.0.iter().all(|row| row[axis].is_subset_of(domain)),
-                                None => false,
-                            };
+                            let admitted = !path.is_unreachable() && in_domain((slot, domain));
                             if !admitted {
                                 return None;
                             }

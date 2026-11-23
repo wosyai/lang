@@ -2192,7 +2192,13 @@ struct VerifiedSymbolicEquality<'a> {
     body: &'a FunctionCallSites,
     bound: &'a BigInt,
     shared: std::cell::OnceCell<Rc<IntegerSet>>,
-    guard: Option<ImportedEntryGuard<'a>>,
+    guards: VerifiedSymbolicGuards<'a>,
+}
+
+#[cfg(feature = "internal-checker")]
+enum VerifiedSymbolicGuards<'a> {
+    Bare(Option<ImportedEntryGuard<'a>>),
+    Ranked(CheckedIntegerGuardSlots<'a>),
 }
 
 #[cfg(feature = "internal-checker")]
@@ -2241,7 +2247,11 @@ impl<'a> VerifiedSymbolicEquality<'a> {
             ) {
                 return Ok(None);
             }
-            let values = ImportedIntegerValues::Shared { values: &summary.shared, bound: summary.bound, guard: summary.guard.as_ref() };
+            let (guards, domain) = match &summary.guards {
+                VerifiedSymbolicGuards::Bare(guard) => (guard.as_slice(), None),
+                VerifiedSymbolicGuards::Ranked(guards) => (guards.comparisons.as_slice(), guards.domain),
+            };
+            let values = ImportedIntegerValues::Shared { values: &summary.shared, bound: summary.bound, guards, domain };
             Ok(Some(ImportedLocal { position, values, guards: Vec::new() }))
         };
         let mut emit = |failure| effects.push_callable(calls, source, failure);
@@ -2479,9 +2489,9 @@ impl SymbolicRootProof for SelectedSymbolicProof<'_, '_> {
                     let summary = VerifiedSymbolicEquality {
                         target, canonical_target: plan.canonical_target, layout: plan.layout,
                         body: plan.body, bound: first.bound, shared: std::cell::OnceCell::new(),
-                        guard: first.guard.comparisons.first().map(|guard| ImportedEntryGuard {
+                        guards: VerifiedSymbolicGuards::Bare(first.guard.comparisons.first().map(|guard| ImportedEntryGuard {
                             slot: guard.slot, relation: guard.relation, bound: guard.bound,
-                        }),
+                        })),
                     };
                     self.remember_equality(summary);
                 }
@@ -3191,20 +3201,14 @@ fn ranked_symbolic_equality<'proof>(
     let TypedProofGoal::Literal { operator: BinaryOperator::Equal, bound, .. } = &plan.typed.goal else {
         return None;
     };
-    let guard = match plan.filter.as_deref().unwrap_or_default() {
-        [] => None,
-        [CheckerPredicate::Integer(predicate)] => {
-            let bindings = plan.typed.body.boundary.checker_parameter_bindings.as_deref()?;
-            let slot = bindings.iter().position(|binding| binding == &predicate.binding)?;
-            Some(ImportedEntryGuard {
-                slot, relation: IntegerRelation::from_operator(&predicate.operator)?, bound: &predicate.bound,
-            })
-        }
-        _ => return None,
-    };
+    let guards = checked_integer_guard_slots::<true>(plan.typed.body, plan.filter.as_deref().unwrap_or_default())?;
+    if guards.always_rejects {
+        return None;
+    }
     Some(VerifiedSymbolicEquality {
         target: plan.target, canonical_target: plan.canonical_target, layout: plan.typed.target.target_layout,
-        body: plan.typed.body, bound, shared: std::cell::OnceCell::new(), guard,
+        body: plan.typed.body, bound, shared: std::cell::OnceCell::new(),
+        guards: VerifiedSymbolicGuards::Ranked(guards),
     })
 }
 
@@ -9478,6 +9482,49 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
                 assert!(matches!(run(&rejected, ScalarCheckerScope::CurrentPackage),
                     Err(ScalarOrderedCheckerOutcome::Unsupported)));
             }
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordered_ranked_summary_preserves_exact_conjunctive_and_disjoint_guards() {
+        let app = source("src/main.w", "ordered-ranked-domain-import");
+        let text = format!(r#"%%start
+            u8(u8, u8) descend = fn(tag, value) {{ if (value < 3) {{ 7 }} else {{ descend(tag, value - 3) }} }};
+            proof rank for descend(tag, entry) -> (out) where (tag >= 2 && (entry == 2 || entry == 5))
+                ensures (out == 7) decreases (tag, entry) {{
+                if (entry < 3) {{ core.show(out == 7); }} else {{ core.use(rank(tag, entry - 3)); }}
+            }}
+            unit(u8, u8) client = fn(tag, input) {{
+                core.narrow(tag >= 2, {OUTPUT});
+                core.narrow(input == 2 || input == 5, {OUTPUT});
+                u8 result = descend(tag, input);
+                core.require(result == 7, {OUTPUT});
+                core.require(result == 8, {OUTPUT});
+            }};
+        %%end"#);
+        let run = |text: &str| {
+            let (_, proof) = crate::parse_proof_source(app.clone(), text.to_owned(), &[])
+                .unwrap_or_else(|_| panic!("valid ranked contextual import"));
+            check_loaded_scalar_ordered_local_proof_contexts(
+                Vec::new(), [(proof, Vec::new())], vec![app.clone()], inputs(),
+                ScalarCheckerScope::CurrentPackage, Vec::new(),
+            )
+        };
+        let checked = run(&text).unwrap();
+        assert!(checked.active && checked.diagnostics.is_empty() && checked.symbolic_diagnostic.is_none());
+        let [failure] = checked.directives.as_slice() else { panic!("one rejected symbolic requirement"); };
+        assert_eq!(&text[failure.condition.start as usize..failure.condition.end as usize], "result == 8");
+        let seven = BigInt::from(7);
+        assert!(failure.witness.intervals_at(0, 2).unwrap().eq([(&seven, &seven)]));
+        let literal = text.replace("descend(tag, input);", "descend(tag, 5);");
+        assert!(run(&literal).is_ok());
+        for rejected in [
+            text.replace("core.narrow(tag >= 2", "core.narrow(tag >= 1"),
+            text.replace("input == 2 || input == 5", "input == 2 || input == 4"),
+            literal.replace("descend(tag, 5);", "descend(tag, 4);"),
+        ] {
+            assert!(matches!(run(&rejected), Err(ScalarOrderedCheckerOutcome::Unsupported)));
         }
     }
 
