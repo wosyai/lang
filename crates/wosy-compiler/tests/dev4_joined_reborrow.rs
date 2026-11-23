@@ -192,9 +192,31 @@ fn joined_child_stays_live_until_checked_callee_reads_it() {
 }
 
 #[test]
+fn joined_child_is_read_by_checked_scalar_arithmetic_before_owner_reuse() {
+    for behavior in ["*value + 1", "1 + *value"] {
+        let program = joined_with_pointer_read(
+            "u8 through_call = pointer(child); first = 3;", behavior,
+        );
+        let program = program.replace(
+            "    seen\n",
+            "    if (through_call == seen + 1) { seen } else { 0 }\n",
+        );
+        check(&program, Expected::Valid);
+    }
+}
+
+#[test]
+fn joined_child_stays_live_until_checked_scalar_arithmetic_reads_it() {
+    let program = joined_with_pointer_read(
+        "first = 3; u8 through_call = pointer(child); through_call;", "*value + 1",
+    );
+    check(&program, Expected::LiveConflict);
+}
+
+#[test]
 fn joined_child_declines_a_callee_without_a_prepared_read_effect() {
     let program = joined_with_pointer_read(
-        "u8 through_call = pointer(child); through_call;", "*value + 1",
+        "u8 through_call = pointer(child); through_call;", "*value + *value",
     );
     check(&program, Expected::NullParent);
 }

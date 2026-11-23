@@ -9269,17 +9269,41 @@ impl SharedScalarReadEffect {
         if &result.ty != inner.as_ref() {
             return None;
         }
-        let [ScalarBlockItem::Expression(ScalarExpression::Dereference {
-            place: ScalarPlace::Dereference { pointer, .. }, ..
-        })] = function.body.items.as_slice() else { return None };
-        if !matches!(pointer.as_ref(), ScalarExpression::Name { .. }) {
+        let [ScalarBlockItem::Expression(expression)] = function.body.items.as_slice() else {
             return None;
-        }
+        };
         let structure = &calls.structure;
-        let OccurrenceNode::Expression(read) = *structure.edges.get(&(
+        let OccurrenceNode::Expression(output) = *structure.edges.get(&(
             OccurrenceParent::Block(structure.root),
             OccurrenceEdge::FinalOutput { item: 0, output: result.ordinal },
         ))? else { return None };
+        let (expression, read) = match expression {
+            ScalarExpression::Binary {
+                operator: BinaryOperator::Add | BinaryOperator::Subtract | BinaryOperator::Multiply,
+                left, right, ..
+            } if calls.call_occurrences.is_empty()
+                && structure.checked_types.expressions.get(&output) == Some(inner.as_ref()) =>
+            {
+                let (operand, edge) = match (left.as_ref(), right.as_ref()) {
+                    (operand @ ScalarExpression::Dereference { .. }, ScalarExpression::Integer { .. }) =>
+                        (operand, OccurrenceEdge::BinaryLeft),
+                    (ScalarExpression::Integer { .. }, operand @ ScalarExpression::Dereference { .. }) =>
+                        (operand, OccurrenceEdge::BinaryRight),
+                    _ => return None,
+                };
+                let OccurrenceNode::Expression(read) = *structure.edges.get(&(
+                    OccurrenceParent::Expression(output), edge,
+                ))? else { return None };
+                (operand, read)
+            }
+            _ => (expression, output),
+        };
+        let ScalarExpression::Dereference {
+            place: ScalarPlace::Dereference { pointer, .. }, ..
+        } = expression else { return None };
+        if !matches!(pointer.as_ref(), ScalarExpression::Name { .. }) {
+            return None;
+        }
         let OccurrenceNode::Place(place) = *structure.edges.get(&(
             OccurrenceParent::Expression(read), OccurrenceEdge::ExpressionPlace,
         ))? else { return None };

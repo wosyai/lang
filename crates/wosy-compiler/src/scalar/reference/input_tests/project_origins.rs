@@ -871,7 +871,7 @@ if (true) { flag, number = reverse(); };
 #[test]
 fn prepared_shared_scalar_read_effect_is_exact_to_declaration_and_formal() {
     let reader = "u8(*u8) sample = fn(value) { *value };";
-    let non_reader = "u8(*u8) sample = fn(value) { *value + 1 };";
+    let non_reader = "u8(*u8) sample = fn(value) { *value + *value };";
     let other = "        *u8(*u8) escape = fn(value) { value };\n        u8(*u8) alias = fn(value) { *u8 copy = value; *copy };\n        u8(*!u8) exclusive = fn(value) { *value };\n        u8(u8) by_value = fn(value) { value };";
     let native = ScalarTargetLayout::NATIVE64;
     let raw = project(vec![
