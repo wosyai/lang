@@ -7013,7 +7013,9 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
                 || (matches!(edge, OccurrenceEdge::CallArgument(0)) && matches!(self.mode, WalkMode::Callable(_))))
             && self.structure.checked_types.expressions.get(&ordinal).is_some_and(is_integer_type)
         {
-            let value = if initializer_literal_argument || checked_unit_pair_argument {
+            let value = if initializer_literal_argument || checked_unit_pair_argument
+                || matches!(edge, OccurrenceEdge::FinalOutput { .. })
+            {
                 super::checker_flow::concrete_integer_literal(expression).map(std::borrow::Cow::into_owned)
             } else if let ScalarExpression::Integer { value, .. } = expression {
                 Some(value.clone())
