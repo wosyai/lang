@@ -417,6 +417,7 @@ struct ProofFreeOrderedEvidence;
 impl ActualIntegerObserver for ProofFreeOrderedEvidence {
     const ENABLED: bool = false;
     const PROOF_FREE_CONTEXTUAL_LOCAL_TRANSFERS: bool = true;
+    const EXACT_SELF_UNIT_REENTRY: bool = true;
 
     fn observe(&mut self, _: (usize, usize), _: &[&BigInt], _: &BigInt) {}
 }
@@ -799,7 +800,7 @@ fn check_unused_module<const COLLECT: bool, const ENTRY_EVIDENCE: bool, Proof: S
             }
         } else {
             let mut symbolic = CheckedCalls::<(), false> {
-                project, calls, active: HashSet::from([(ordinal, item)]), reached: HashSet::new(),
+                project, calls, active: HashSet::from([(ordinal, item)]), active_depth: 1, reached: HashSet::new(),
                 had_obligations: false, observer: (), symbolic_module: ordinal,
             };
             if COLLECT {
@@ -896,7 +897,7 @@ fn check_package_initialization_observing_with_policy<'a, Observer: ActualIntege
     let (project, calls) = prepared.parts();
     let mut visits = vec![InitializationVisit::Unseen; project.modules.len()];
     let mut actual = CheckedCalls {
-        project, calls, active: HashSet::new(), reached: HashSet::new(),
+        project, calls, active: HashSet::new(), active_depth: 0, reached: HashSet::new(),
         had_obligations: false, observer, symbolic_module: 0,
     };
     walk_package_initialization::<COLLECT, PRIVATE_NESTED_SCALAR>(project, calls, &ordinals, &mut visits, &mut actual, root, &mut failures)?;
@@ -1111,7 +1112,7 @@ fn run_initializer_call<'a>(
     };
     actual.run(
         &topology.structure, occurrence, signature, arguments, &declaration.source, declaration.range,
-        expected, collection, #[cfg(feature = "internal-checker")] proof_site,
+        expected, collection, None, #[cfg(feature = "internal-checker")] proof_site,
     )
 }
 
@@ -1192,6 +1193,7 @@ struct CheckedCalls<'a, Observer, const ACTUAL_STARTUP: bool = true> {
     project: &'a ScalarProject,
     calls: &'a ProjectCallSiteResults,
     active: HashSet<(usize, usize)>,
+    active_depth: usize,
     reached: HashSet<(usize, usize)>,
     had_obligations: bool,
     observer: Observer,
@@ -1213,6 +1215,7 @@ enum InitializerProofOrigin<'a> {
 trait ActualIntegerObserver {
     const ENABLED: bool;
     const PROOF_FREE_CONTEXTUAL_LOCAL_TRANSFERS: bool = false;
+    const EXACT_SELF_UNIT_REENTRY: bool = false;
 
     fn observe(&mut self, target: (usize, usize), arguments: &[&BigInt], value: &BigInt);
 
@@ -1262,6 +1265,7 @@ impl<Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> CheckedCalls<'
         argument: NestedIntegerArgument<'_>,
         expected: &ScalarType,
         collection: Option<(&SourceIdentity, OrderedCallCollection<'_, '_>)>,
+        caller_entry: Option<(&BigInt, &mut bool)>,
     ) -> Result<ActualCallResult, ProjectCheck> {
         let site = caller.resolved_call_site(call).ok_or(ProjectCheck::MissingRootOccurrences)?;
         let ResolvedCallTarget::ModuleCallable {
@@ -1330,6 +1334,7 @@ impl<Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> CheckedCalls<'
         };
         self.run(
             &caller.structure, call, signature, projected, source, *declaration_span, expected, collection,
+            caller_entry.map(|(value, followed)| (caller, value, followed)),
             #[cfg(feature = "internal-checker")] proof_site,
         )
     }
@@ -1340,9 +1345,11 @@ impl<Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> CheckedCalls<'
         source: &SourceIdentity,
         exact: Option<&[&BigInt]>,
     ) -> Result<bool, ProjectCheck> {
+        let caller_entry = self.exact_self_entry(exact);
+        let mut followed_self_edge = false;
         let mut nested_error = None;
         let checked = check_integer_requirements_with_calls(body, exact, &mut |caller, occurrence, signature, argument, expected| {
-            match self.nested(caller, occurrence, signature, argument, expected, None) {
+            match self.nested(caller, occurrence, signature, argument, expected, None, caller_entry.map(|value| (value, &mut followed_self_edge))) {
                 Ok(result) => Some(result),
                 Err(error) => {
                     nested_error = Some(error);
@@ -1365,12 +1372,17 @@ impl<Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> CheckedCalls<'
         collection: OrderedCallCollection<'_, '_>,
     ) -> Result<ActualCallResult, ProjectCheck> {
         let terminal_projection = matches!(&entry, IntegerRequirementEntry::Projected { .. });
+        let caller_entry = self.exact_self_entry(match &entry {
+            IntegerRequirementEntry::Exact(values) => Some(*values),
+            _ => None,
+        });
         let allow_contextual_local_transfers = ACTUAL_STARTUP && Observer::PROOF_FREE_CONTEXTUAL_LOCAL_TRANSFERS
             && matches!(&entry, IntegerRequirementEntry::Exact(_));
         let mut sink = |failure| collection.failures.borrow_mut().push_callable(body, source, failure);
+        let mut followed_self_edge = false;
         let mut nested_error = None;
         let mut nested = |caller: &FunctionCallSites, occurrence, signature: &CheckedCallSignature, argument: NestedIntegerArgument<'_>, expected: &ScalarType| {
-            match self.nested(caller, occurrence, signature, argument, expected, Some((source, collection))) {
+            match self.nested(caller, occurrence, signature, argument, expected, Some((source, collection)), caller_entry.map(|value| (value, &mut followed_self_edge))) {
                 Ok(result) => Some(result),
                 Err(error) => {
                     nested_error = Some(error);
@@ -1393,6 +1405,15 @@ impl<Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> CheckedCalls<'
         })
     }
 
+    fn exact_self_entry<'entry>(&self, exact: Option<&[&'entry BigInt]>) -> Option<&'entry BigInt> {
+        if ACTUAL_STARTUP && Observer::EXACT_SELF_UNIT_REENTRY {
+            if let Some([value]) = exact {
+                return Some(*value);
+            }
+        }
+        None
+    }
+
     fn run(
         &mut self,
         structure: &OccurrenceStructure,
@@ -1403,6 +1424,7 @@ impl<Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> CheckedCalls<'
         target_span: ByteSpan,
         expected: &ScalarType,
         collection: Option<(&SourceIdentity, OrderedCallCollection<'_, '_>)>,
+        recursive_origin: Option<(&FunctionCallSites, &BigInt, &mut bool)>,
         #[cfg(feature = "internal-checker")] proof_site: Option<InitializerProofSite<'_>>,
     ) -> Result<ActualCallResult, ProjectCheck> {
         let &(target_module, target_item) = structure.checker_direct_targets.get(&call)
@@ -1460,7 +1482,7 @@ impl<Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> CheckedCalls<'
                     || !body.call_occurrences.is_empty() || !body.allocation_length_calls.is_empty()
                     || !body.assignments.is_empty() || !body.arms.is_empty()
                     || body.structure.checker_directives.values().any(|directive| directive.call_signature.is_some())
-                    || self.active.len() == MAX_ACTUAL_CALL_DEPTH || self.active.contains(&target)
+                    || self.active_depth == MAX_ACTUAL_CALL_DEPTH || self.active.contains(&target)
                 {
                     return Err(ProjectCheck::Unsupported);
                 }
@@ -1498,12 +1520,22 @@ impl<Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> CheckedCalls<'
             }
             _ => return Err(ProjectCheck::Unsupported),
         };
-        if self.active.len() == MAX_ACTUAL_CALL_DEPTH {
+        if self.active_depth == MAX_ACTUAL_CALL_DEPTH {
             return Err(ProjectCheck::Unsupported);
         }
-        if !self.active.insert(target) {
-            return Err(ProjectCheck::Unsupported);
+        let first_activation = self.active.insert(target);
+        if !first_activation {
+            match (recursive_origin, exact) {
+                (Some((caller, previous, followed)), [value])
+                    if !*followed && *expected == ScalarType::Unit && std::ptr::eq(caller, body)
+                        && value.sign() != num_bigint::Sign::Minus && *value < previous =>
+                {
+                    *followed = true;
+                }
+                _ => return Err(ProjectCheck::Unsupported),
+            }
         }
+        self.active_depth += 1;
         let result = if *expected == ScalarType::Unit {
             if let Some(collection) = collection {
                 self.collect_requirements(body, &owner.source, IntegerRequirementEntry::Exact(exact), collection)
@@ -1552,7 +1584,10 @@ impl<Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> CheckedCalls<'
                 proved.map(ActualCallResult::Integer).ok_or(ProjectCheck::Unsupported)
             }
         };
-        self.active.remove(&target);
+        self.active_depth -= 1;
+        if first_activation {
+            self.active.remove(&target);
+        }
         if ACTUAL_STARTUP && Observer::ENABLED {
             if let Ok(ActualCallResult::Integer(value)) = &result {
                 self.observer.observe(target, exact, value);
@@ -11227,7 +11262,7 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
             visits[root] = InitializationVisit::Started;
             visits[target] = not_ready;
             let mut actual = CheckedCalls {
-                project, calls, active: HashSet::new(), reached: HashSet::new(),
+                project, calls, active: HashSet::new(), active_depth: 0, reached: HashSet::new(),
                 had_obligations: false, observer: (), symbolic_module: 0,
             };
             let mut output = OrderedFailures::default();
@@ -12828,6 +12863,99 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
         let text = "%%start\nunit() cycle = fn { cycle(); };\ncycle();\n%%end";
         let prepared = prepare_proof_target(&file, text).unwrap();
         assert_eq!(check_package_initialization(&prepared).map(drop), Err(ProjectCheck::Unsupported));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn exact_actual_unit_self_calls_descend_without_admitting_cycles() {
+        let text = |base_limit: u8, next: &str, tail: &str| format!(r#"%%start
+            unit(u8) descend = fn(value) {{
+                if (value == 2) {{ descend({next}); }};
+                if (value == 1) {{ descend(0); }};
+                core.require(value >= {base_limit}, {OUTPUT});
+            }};
+            descend(2);
+            {tail}
+        %%end"#);
+        let run = |revision, text: &str, scope| {
+            let prepared = prepare_proof_target(&source("src/main.w", revision), text).unwrap();
+            run_closed_without_named_proofs(&prepared, scope, 1)
+        };
+        for scope in [ScalarCheckerScope::MainFlowOnly, ScalarCheckerScope::CurrentPackage] {
+            let pass = run("exact-self-pass", &text(0, "1", "descend(2);"), scope).unwrap();
+            assert!(pass.active && pass.directives.is_empty());
+            let late = OUTPUT.replace(".code = 1", ".code = 5");
+            let failure = run("exact-self-failure", &text(3, "1", &format!("core.require(false, {late});")), scope).unwrap();
+            let [base, inner, outer, startup] = failure.directives.as_slice()
+                else { panic!("expected the three reached frames in return order before the startup directive"); };
+            for (failed, value) in [base, inner, outer].into_iter().zip(0..3) {
+                assert_eq!(failed.code(), &BigInt::from(1));
+                let value = BigInt::from(value);
+                assert!(failed.witness.intervals_at(0, 0).unwrap().eq([(&value, &value)]));
+            }
+            assert_eq!(startup.code(), &BigInt::from(5));
+            for (revision, argument) in [("same-entry", "2"), ("increased-entry", "3"), ("computed-entry", "value - 1")] {
+                assert!(matches!(run(revision, &text(0, argument, ""), scope), Err(ProjectCheck::Unsupported)), "{revision}");
+            }
+            let duplicate = text(0, "1", "").replace("descend(1);", "descend(1); descend(0);");
+            assert!(matches!(run("duplicate-reached-self-edge", &duplicate, scope), Err(ProjectCheck::Unsupported)));
+            let mutual = format!(r#"%%start
+                unit(u8) first = fn(n) {{ if (n == 2) {{ second(1); }}; core.require(n >= 0, {OUTPUT}); }};
+                unit(u8) second = fn(n) {{ if (n == 1) {{ first(0); }}; }};
+                first(2);
+            %%end"#);
+            assert!(matches!(run("mutual-cycle", &mutual, scope), Err(ProjectCheck::Unsupported)));
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn exact_actual_unit_self_calls_count_all_active_frames() {
+        let program = |wrappers: usize| {
+            let mut text = format!("%%start\nunit(u8) descend = fn(n) {{ if (n == 1) {{ descend(0); }}; core.require(n <= 1, {OUTPUT}); }};\n");
+            for index in 0..wrappers {
+                let body = if index == 0 { "descend(1);".to_owned() } else { format!("f{}();", index - 1) };
+                text.push_str(&format!("unit() f{index} = fn {{ {body} }};\n"));
+            }
+            text.push_str(&format!("f{}();\n%%end", wrappers - 1));
+            text
+        };
+        for (frames, admitted) in [(MAX_ACTUAL_CALL_DEPTH, true), (MAX_ACTUAL_CALL_DEPTH + 1, false)] {
+            let file = source("src/main.w", &format!("exact-self-frame-{frames}"));
+            let prepared = prepare_proof_target(&file, &program(frames - 2)).unwrap();
+            let result = run_closed_without_named_proofs(&prepared, ScalarCheckerScope::MainFlowOnly, 1);
+            if admitted {
+                let result = result.unwrap();
+                assert!(result.active && result.directives.is_empty());
+            } else {
+                assert!(matches!(result, Err(ProjectCheck::Unsupported)));
+            }
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn exact_actual_unit_self_calls_do_not_expand_named_proof_reuse() {
+        let file = source("src/main.w", "exact-self-named-proof-isolation");
+        let run = |start| {
+            let text = format!(r#"%%start
+                unit(u8) descend = fn(n) {{ if (n == 1) {{ descend(0); }}; core.require(n <= 1, {OUTPUT}); }};
+                descend({start});
+                u8(u8) producer = fn(value) {{ value }};
+                unit() caller = fn {{
+                    u8 result = producer(7);
+                    core.require(result <= 7, {OUTPUT});
+                }};
+                proof literal for producer(input) -> (out) where (input <= 7) ensures (out <= 7) {{}}
+            %%end"#);
+            let (_, catalog) = crate::parse_proof_source(file.clone(), text, &[]).ok().unwrap();
+            check_loaded_scalar_module_proof_call(
+                (&file, "literal"), (&file, "caller"), Vec::new(), (catalog, Vec::new()),
+                vec![file.clone()], inputs(),
+            )
+        };
+        assert_eq!(run(0), ScalarProofCallOutcome::Established);
+        assert_eq!(run(1), ScalarProofCallOutcome::Unavailable);
     }
 
     #[test]
