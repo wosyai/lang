@@ -9662,7 +9662,17 @@ fn guarded_fallible_named_integer_initializer_stays_single_evaluation() {
             let symbol = self_tail_test_symbol(&source, project_route, "dynamic");
             let body = self_tail_test_body(&llvm, "i64", &symbol);
             assert_eq!(body.matches("call ptr @__wosy_core_alloc(i64 8, i64 8)").count(), 1, "{body}");
-            assert_eq!(body.matches("store i64 %input, ptr %allocation").count(), 1, "{body}");
+            let input_slot = body.lines().find_map(|line| {
+                line.trim_start().strip_prefix("store i64 %input, ptr ")
+                    .and_then(|operands| operands.split(',').next())
+            }).expect("input parameter spill");
+            let mut loads = body.lines().filter_map(|line| {
+                let (value, operands) = line.trim_start().split_once(" = load i64, ptr ")?;
+                (operands.split(',').next() == Some(input_slot)).then_some(value)
+            });
+            let input_value = loads.next().expect("named initializer load");
+            assert!(loads.next().is_none(), "{body}");
+            assert_eq!(body.matches(&format!("store i64 {input_value}, ptr %allocation")).count(), 1, "{body}");
             assert_eq!(body.matches("call void @__wosy_core_free(ptr %allocation)").count(), 1, "{body}");
         }
     }
