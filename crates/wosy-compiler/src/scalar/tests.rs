@@ -4916,6 +4916,43 @@ fn projected_checked_constant_indices_preserve_disjoint_origins() {
 }
 
 #[test]
+fn fixed_projected_reference_keeps_its_local_loan_live_until_last_use() {
+    for (body, conflict) in [
+        ("bytes[0] = 8; *u8 observed = refs[0]; observed;", true),
+        ("*u8 observed = refs[0]; observed; bytes[0] = 8;", false),
+        ("*u8 observed = refs[0]; observed; bytes[0] = 8; u8 other = *unrelated; other;", false),
+        ("bytes[0] = 8; u8 other = *unrelated; other; *u8 observed = refs[0]; observed;", true),
+        ("bytes[0] = 8; refs[0] = null; *u8 observed = refs[0]; observed;", false),
+        ("bytes[0] = 8; *u8 observed = refs[1]; observed;", false),
+        ("bytes[0] = 8; if (take) { *u8 observed = refs[0]; observed; };", true),
+        ("bytes[0] = 8; if (take) { refs[0] = null; }; *u8 observed = refs[0]; observed;", true),
+    ] {
+        let function = if body.contains("take") {
+            "unit(bool) f = fn(take)"
+        } else if body.contains("unrelated") {
+            "unit(*u8) f = fn(unrelated)"
+        } else {
+            "unit() f = fn"
+        };
+        let text = format!("%%start\n{function} {{ u8[2] bytes = [7, 9]; (*u8)[2] refs = [null, null]; refs[0] = &bytes[0]; refs[1] = null; {body} }};\n%%end");
+        let access = text.find("bytes[0] = 8").unwrap() as u32;
+        let origin = text.find("&bytes[0]").unwrap() as u32;
+        let (single, project) = both_reference_functions(&text);
+        for diagnostics in [&single.diagnostics, &project.diagnostics] {
+            if conflict {
+                assert!(diagnostics.iter().any(|diagnostic| {
+                    diagnostic.code == "B0003"
+                        && diagnostic.labels.first().is_some_and(|label| label.span.range.start == access)
+                        && diagnostic.labels.iter().skip(1).any(|label| label.span.range.start == origin)
+                }), "{text}: {diagnostics:?}");
+            } else {
+                assert!(diagnostics.is_empty(), "{text}: {diagnostics:?}");
+            }
+        }
+    }
+}
+
+#[test]
 fn projected_holder_drops_only_slots_whose_local_referent_leaves_scope() {
     for (branch_owner, expired) in [("local; refs[0] = &local;", true), ("local; refs[0] = &outer;", false)] {
         let text = format!(

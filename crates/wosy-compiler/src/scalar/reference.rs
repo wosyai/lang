@@ -5428,6 +5428,17 @@ fn reference_read_reachable(
     from: CfgPointId,
     binding: &ReferenceBindingId,
 ) -> bool {
+    reference_holder_read_reachable(points, scope_exits, strictly_forward, from, binding, None)
+}
+
+fn reference_holder_read_reachable(
+    points: &[ReferenceFlowPoint],
+    scope_exits: Option<&HashMap<CfgPointId, super::control::ScopeExitBindings>>,
+    strictly_forward: bool,
+    from: CfgPointId,
+    binding: &ReferenceBindingId,
+    projected: Option<&ReferencePlaceId>,
+) -> bool {
     let mut pending = Vec::new();
     let successors = &points[from.0].successors;
     let mut track_visited = !strictly_forward || successors.len() > 1;
@@ -5439,6 +5450,28 @@ fn reference_read_reachable(
         }
         if matches!(&points[id.0].kind, CfgPointKind::Read { binding: read } if read == binding) {
             return true;
+        }
+        if let Some(projected) = projected {
+            match &points[id.0].kind {
+                CfgPointKind::ReadPlace { candidates, pointer_point, reads_origin, .. }
+                    if (pointer_point.is_some() && candidates.is_empty()
+                        && (*reads_origin || points[id.0].possible_origins.is_none()))
+                        || candidates.iter().any(|candidate| reference_places_overlap(candidate, projected)) =>
+                {
+                    return true;
+                }
+                CfgPointKind::Borrow { place, .. } | CfgPointKind::Move { place, .. }
+                    if reference_places_overlap(place, projected) =>
+                {
+                    return true;
+                }
+                CfgPointKind::Assign { target, .. }
+                    if exact_projected_prefix(target, projected) =>
+                {
+                    continue;
+                }
+                _ => {}
+            }
         }
         if matches!(&points[id.0].kind, CfgPointKind::Assign { target, .. } if target.binding == *binding && target.projections.is_empty())
             || matches!(&points[id.0].kind, CfgPointKind::Bind { binding: bound } if bound == binding)
@@ -5455,6 +5488,19 @@ fn reference_read_reachable(
     }
     false
 }
+
+fn exact_projected_prefix(prefix: &ReferencePlaceId, place: &ReferencePlaceId) -> bool {
+    prefix.binding == place.binding
+        && prefix.projections.len() <= place.projections.len()
+        && prefix.projections.iter().zip(&place.projections).all(|(a, b)| match (a, b) {
+            (ReferencePlaceProjection::Field(ScalarFieldReference::Resolved(a)),
+             ReferencePlaceProjection::Field(ScalarFieldReference::Resolved(b))) => a == b,
+            (ReferencePlaceProjection::Index(ScalarExpression::Integer { value: a, .. }),
+             ReferencePlaceProjection::Index(ScalarExpression::Integer { value: b, .. })) => a == b,
+            _ => false,
+        })
+}
+
 
 fn loan_borrows_place(
     loan: &ReferenceLoanId,
@@ -5601,8 +5647,16 @@ fn conflicting_live_loan(
         if !row.retains_loan || row.uninitialized {
             continue;
         }
+        let mut reachable = None;
         for origin in &row.origins {
             if let Some(loan) = conflicting_loan(facts, *origin, &place, access) {
+                if declared_local_loan(&facts[origin.0]).is_some()
+                    && !*reachable.get_or_insert_with(|| reference_holder_read_reachable(
+                        points, scope_exits, strictly_forward, point, &row.place.binding, Some(&row.place),
+                    ))
+                {
+                    continue;
+                }
                 if !conflicts.iter().any(|span| span.source == loan.origin_place.source
                     && span.range == loan.creation_span) {
                     conflicts.push(SourceSpan::new(loan.origin_place.source.clone(), loan.creation_span));
@@ -5852,7 +5906,7 @@ fn update_projected_assignment<'a>(
             }
         }
         for target in targets {
-            write_projected_reference(state, target, origins);
+            write_projected_reference(state, target, origins, false);
         }
     } else {
         for target in targets {
@@ -5911,8 +5965,8 @@ fn projected_assignment_replaces_previous_rows_once_in_candidate_order() {
     let previous = BTreeSet::from([ReferenceOriginId(0)]);
     let replacement = BTreeSet::from([ReferenceOriginId(1)]);
     let mut state = ReferenceEdgeState::default();
-    write_projected_reference(&mut state, &projected, &previous);
-    write_projected_reference(&mut state, &unrelated, &previous);
+    write_projected_reference(&mut state, &projected, &previous, false);
+    write_projected_reference(&mut state, &unrelated, &previous, false);
     let mut without_rhs = state.clone();
     let mut single = state.clone();
     let capacity = single.projected.capacity();
@@ -5934,12 +5988,13 @@ fn write_projected_reference(
     state: &mut ReferenceEdgeState,
     place: &ReferencePlaceId,
     origins: &BTreeSet<ReferenceOriginId>,
+    retains_loan: bool,
 ) {
     state
         .projected
         .retain(|known| !reference_places_overlap(&known.place, place));
     state.projected.push(ReferenceProjectedState {
-        retains_loan: false,
+        retains_loan,
         place: place.clone(),
         origins: origins.clone(),
         uninitialized: false,
@@ -8775,7 +8830,10 @@ fn transfer_reference_facts(
                                 } else if let Some(holder) = holder_write {
                                     holder.write(&mut state, target, &origins, &cfg.facts);
                                 } else if !holder.is_some_and(|holder| holder.selected(target)) {
-                                    write_projected_reference(&mut state, target, &origins);
+                                    let retains_loan = direct_lexical_loan_root(target).is_some()
+                                        && exact_projected_prefix(target, target)
+                                        && origins.iter().any(|origin| declared_local_loan(&cfg.facts[origin.0]).is_some());
+                                    write_projected_reference(&mut state, target, &origins, retains_loan);
                                 }
                                 Some(origins)
                             }
