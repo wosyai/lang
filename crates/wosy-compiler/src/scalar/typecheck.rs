@@ -7231,9 +7231,9 @@ pub(super) fn validate(
 }
 
 struct StaticUseAnalyzer {
-    visible: BTreeMap<String, usize>,
+    visible: BTreeMap<String, ByteSpan>,
     declarations: Vec<ByteSpan>,
-    uses: BTreeSet<usize>,
+    used_spans: HashSet<ByteSpan>,
 }
 
 impl StaticUseAnalyzer {
@@ -7241,26 +7241,25 @@ impl StaticUseAnalyzer {
         let mut analyzer = Self {
             visible: BTreeMap::new(),
             declarations: Vec::new(),
-            uses: BTreeSet::new(),
+            used_spans: HashSet::new(),
         };
         for (index, name) in function.parameters.iter().enumerate() {
             if let Some(span) = function.parameter_spans.get(index) {
-                let id = analyzer.declarations.len();
-                analyzer.visible.insert(name.clone(), id);
+                analyzer.visible.insert(name.clone(), *span);
                 analyzer.declarations.push(*span);
             }
         }
         analyzer
     }
 
-    fn block(&mut self, block: &ScalarBlock, visible: &BTreeMap<String, usize>) {
+    fn block(&mut self, block: &ScalarBlock, visible: &BTreeMap<String, ByteSpan>) {
         let mut visible = visible.clone();
         for item in &block.items {
             self.item(item, &mut visible);
         }
     }
 
-    fn item(&mut self, item: &ScalarBlockItem, visible: &mut BTreeMap<String, usize>) {
+    fn item(&mut self, item: &ScalarBlockItem, visible: &mut BTreeMap<String, ByteSpan>) {
         match item {
             ScalarBlockItem::LocalBinding(binding) => {
                 if binding.is_allocation {
@@ -7272,8 +7271,7 @@ impl StaticUseAnalyzer {
                 } else {
                     self.expression(&binding.value, visible);
                 }
-                let id = self.declarations.len();
-                visible.insert(binding.name.clone(), id);
+                visible.insert(binding.name.clone(), binding.span);
                 self.declarations.push(binding.span);
             }
             ScalarBlockItem::Expression(expression) => self.expression(expression, visible),
@@ -7290,7 +7288,7 @@ impl StaticUseAnalyzer {
         }
     }
 
-    fn expression(&mut self, expression: &ScalarExpression, visible: &BTreeMap<String, usize>) {
+    fn expression(&mut self, expression: &ScalarExpression, visible: &BTreeMap<String, ByteSpan>) {
         match expression {
             ScalarExpression::Name { name, .. } => self.use_name(name, visible),
             ScalarExpression::Member { receiver, .. } => self.use_name(receiver, visible),
@@ -7358,7 +7356,7 @@ impl StaticUseAnalyzer {
         }
     }
 
-    fn place(&mut self, place: &ScalarPlace, visible: &BTreeMap<String, usize>) {
+    fn place(&mut self, place: &ScalarPlace, visible: &BTreeMap<String, ByteSpan>) {
         match place {
             ScalarPlace::Name { name, .. } => self.use_name(name, visible),
             ScalarPlace::Field { base, .. } => self.place(base, visible),
@@ -7370,25 +7368,16 @@ impl StaticUseAnalyzer {
         }
     }
 
-    fn use_name(&mut self, name: &str, visible: &BTreeMap<String, usize>) {
-        if let Some(id) = visible.get(name) {
-            self.uses.insert(*id);
+    fn use_name(&mut self, name: &str, visible: &BTreeMap<String, ByteSpan>) {
+        if let Some(span) = visible.get(name) {
+            self.used_spans.insert(*span);
         }
     }
 
     fn unused(self) -> Vec<ByteSpan> {
         self.declarations
-            .iter()
-            .enumerate()
-            .filter_map(|(id, span)| {
-                let used = self.uses.contains(&id)
-                    || self
-                        .declarations
-                        .iter()
-                        .enumerate()
-                        .any(|(other_id, other)| other == span && self.uses.contains(&other_id));
-                (!used).then_some(*span)
-            })
+            .into_iter()
+            .filter(|span| !self.used_spans.contains(span))
             .collect()
     }
 }

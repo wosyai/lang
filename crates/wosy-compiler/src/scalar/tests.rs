@@ -7834,6 +7834,25 @@ fn reports_unused_local_and_parameter_at_declaration_spans() {
 }
 
 #[test]
+fn static_uses_share_a_source_span_without_reordering_unused_declarations() {
+    let result = validate_text(
+        "%%start\ni32(i32, i32, i32, i32, i32) f = fn(first, read, alias, last, other) { read };\n%%end",
+    );
+    let mut items = result.program.items;
+    let ScalarItem::Function(function) = &mut items[0] else {
+        panic!("function item");
+    };
+    function.parameter_spans[2] = function.parameter_spans[1];
+    function.parameter_spans[4] = function.parameter_spans[0];
+    let expected = [
+        function.parameter_spans[0],
+        function.parameter_spans[3],
+        function.parameter_spans[4],
+    ];
+    assert_eq!(unused_binding_spans(&items), expected);
+}
+
+#[test]
 fn counts_resolved_uses_across_initializers_assignments_conditions_calls_and_branches() {
     let result = validate_text(
             "%%start\nunit(i32) consume = fn(value) { value; };\ni32(i32) f = fn(input) { i32 local = input; if (local < 2) { local = local + 1; }; if (local == 2) { consume(local); } else { consume(input); } local };\n%%end",
