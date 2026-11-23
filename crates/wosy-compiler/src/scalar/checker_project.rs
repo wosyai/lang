@@ -4732,27 +4732,22 @@ impl PlannedModuleProof<'_> {
         &self, measure: TypedInductionRank<'_>,
     ) -> Result<RankedInductionOutcome<'_>, ProjectCheck> {
         let proof_case = prepare_decrement_proof_steps(self.name, &self.steps, &self.typed, measure)?;
-        let failure = check_canonical_induction_returns(
-            self.function, self.canonical_target, &self.typed, measure, &proof_case,
-        )?;
         let filter = self.filter.as_deref().unwrap_or_default();
-        let (entries, minimum, earlier) = induction_entry_domain(measure, filter)?;
-        if entries.is_empty() {
+        let domains = induction_entry_domain(measure, &proof_case, filter)?;
+        let failure = check_canonical_induction_returns(
+            self.function, self.canonical_target, &self.typed, measure, &proof_case, &domains.descending,
+        )?;
+        if domains.descending.is_empty() {
             return Ok(RankedInductionOutcome::NoApplicable);
         }
         if let Some(failure) = failure {
-            let entry = match &proof_case.base_guard {
-                CheckerPredicate::Boolean(true) => entries.extremes().map(|(first, _)| first.clone()),
-                CheckerPredicate::Boolean(false) => None,
-                CheckerPredicate::Integer(predicate) => entries.keep(&predicate.operator, &predicate.bound)
-                    .ok_or(ProjectCheck::Unsupported)?.extremes().map(|(first, _)| first.clone()),
-                _ => return Err(ProjectCheck::Unsupported),
-            };
-            if let Some(entry) = entry {
-                let earlier = if let Some(domain) = earlier {
-                    Some(domain.extremes().ok_or(ProjectCheck::Unsupported)?.0.clone())
+            if let Some(active) = domains.base_witness(&proof_case)? {
+                let (earlier, entry) = if proof_case.reset.is_some() {
+                    (Some(active), domains.descending.extremes().ok_or(ProjectCheck::Unsupported)?.0.clone())
                 } else {
-                    None
+                    let earlier = domains.earlier.as_ref()
+                        .and_then(IntegerSet::extremes).map(|(first, _)| first.clone());
+                    (earlier, active)
                 };
                 let rejected = if failure.show_failed {
                     RankedBaseRejection::AuthoredShow(proof_case.base_show)
@@ -4767,7 +4762,7 @@ impl PlannedModuleProof<'_> {
                 }));
             }
         }
-        check_induction_entry_domain(&entries, &minimum, &proof_case)
+        check_induction_entry_domain(&domains, &proof_case)
             .map(RankedInductionOutcome::Premise)
     }
 
@@ -6073,6 +6068,7 @@ struct TypedInductionProofSteps<'a> {
     base_claim: Cow<'a, BigInt>,
     base_show: ByteSpan,
     decrement: &'a BigInt,
+    reset: Option<Cow<'a, BigInt>>,
 }
 
 #[cfg(feature = "internal-checker")]
@@ -6085,7 +6081,6 @@ fn prepare_decrement_proof_steps<'a>(
     if typed.input_names.len() != 1 + usize::from(rank.earlier.is_some()) {
         return Err(ProjectCheck::Unsupported);
     }
-    let entry = &typed.input_names[rank.descending.0.ordinal];
     let [ScalarBlockItem::Expression(ScalarExpression::If {
         condition, then_branch, else_branch, ..
     })] = steps.items.as_slice() else {
@@ -6109,12 +6104,19 @@ fn prepare_decrement_proof_steps<'a>(
     if use_name != proof_name || !type_arguments.is_empty() {
         return Err(ProjectCheck::Unsupported);
     }
-    let argument = match (rank.earlier, arguments.as_slice()) {
-        (None, [decrement]) => decrement,
+    let ((parameter, binding), argument, reset) = match (rank.earlier, arguments.as_slice()) {
+        (None, [decrement]) => (rank.descending, decrement, None),
         (Some((earlier, _)), [ScalarExpression::Name { name, .. }, decrement])
-            if name == &typed.input_names[earlier.ordinal] => decrement,
+            if name == &typed.input_names[earlier.ordinal] => (rank.descending, decrement, None),
+        (Some(earlier), [decrement, suffix]) => {
+            let reset = concrete_integer_literal(suffix)
+                .filter(|value| integer_literal_fits_type(value.as_ref(), &rank.descending.0.ty))
+                .ok_or(ProjectCheck::Unsupported)?;
+            (earlier, decrement, Some(reset))
+        }
         _ => return Err(ProjectCheck::Unsupported),
     };
+    let entry = &typed.input_names[parameter.ordinal];
     let ScalarExpression::Binary { operator: BinaryOperator::Subtract, left, right, .. } = argument else {
         return Err(ProjectCheck::Unsupported);
     };
@@ -6123,7 +6125,7 @@ fn prepare_decrement_proof_steps<'a>(
     };
     if !matches!(left.as_ref(), ScalarExpression::Name { name, .. } if name == entry)
         || decrement.sign() != num_bigint::Sign::Plus
-        || !integer_literal_fits_type(decrement, &rank.descending.0.ty)
+        || !integer_literal_fits_type(decrement, &parameter.ty)
     {
         return Err(ProjectCheck::Unsupported);
     }
@@ -6143,10 +6145,10 @@ fn prepare_decrement_proof_steps<'a>(
     let base_claim = claim.bound;
     let base_show = super::typecheck::expression_span(show);
     let base_guard = proof_input_condition::<true>(condition, &typed.input_names, typed.body, false)?;
-    if matches!(&base_guard, CheckerPredicate::Integer(predicate) if &predicate.binding != rank.descending.1) {
+    if matches!(&base_guard, CheckerPredicate::Integer(predicate) if &predicate.binding != binding) {
         return Err(ProjectCheck::Unsupported);
     }
-    Ok(TypedInductionProofSteps { base_guard, base_claim, base_show, decrement })
+    Ok(TypedInductionProofSteps { base_guard, base_claim, base_show, decrement, reset })
 }
 
 #[cfg(feature = "internal-checker")]
@@ -6156,18 +6158,23 @@ fn check_canonical_induction_returns<'a>(
     typed: &TypedProofPostcondition<'a>,
     rank: TypedInductionRank<'_>,
     proof: &TypedInductionProofSteps<'_>,
+    suffix_domain: &IntegerSet,
 ) -> Result<Option<CheckedRankedBaseFailure<'a>>, ProjectCheck> {
     use super::reference::{OccurrenceEdge, OccurrenceNode, OccurrenceParent, PlainNameIdentity};
     use super::typecheck::expression_span;
 
-    let (parameter, binding) = rank.descending;
+    let (parameter, binding) = if proof.reset.is_some() {
+        rank.earlier.ok_or(ProjectCheck::Unsupported)?
+    } else {
+        rank.descending
+    };
     let body = typed.body;
     let structure = &body.structure;
     let (relation, bound) = match &typed.goal {
         TypedProofGoal::Literal { relation, bound, .. } | TypedProofGoal::Universal { relation, bound } => (relation, bound),
         _ => return Err(ProjectCheck::Unsupported),
     };
-    if &parameter.ty != typed.result_type || !body.allocation_length_calls.is_empty() {
+    if &rank.descending.0.ty != typed.result_type || !body.allocation_length_calls.is_empty() {
         return Err(ProjectCheck::Unsupported);
     }
     let output_at = |block: super::reference::BlockOrdinal| {
@@ -6188,7 +6195,33 @@ fn check_canonical_induction_returns<'a>(
         return Err(ProjectCheck::Unsupported);
     }
 
-    let base_occurrence = output_at(*then_block).ok_or(ProjectCheck::Unsupported)?;
+    let base_output = output_at(*then_block).ok_or(ProjectCheck::Unsupported)?;
+    let base_occurrence = if proof.reset.is_some() {
+        if let Some(ConditionalRegion::Value { condition, then_block, else_block, .. }) = body.conditionals.get(&base_output) {
+            let Some(CheckerPredicate::Integer(predicate)) = structure.checker_branches.get(condition) else {
+                return Err(ProjectCheck::Unsupported);
+            };
+            if &predicate.binding != rank.descending.1 || predicate.ty != rank.descending.0.ty {
+                return Err(ProjectCheck::Unsupported);
+            }
+            let then_output = output_at(*then_block).filter(|slot| structure.checker_integer_literals.contains_key(slot))
+                .ok_or(ProjectCheck::Unsupported)?;
+            let else_output = output_at(*else_block).filter(|slot| structure.checker_integer_literals.contains_key(slot))
+                .ok_or(ProjectCheck::Unsupported)?;
+            let relation = IntegerRelation::from_operator(&predicate.operator).ok_or(ProjectCheck::Unsupported)?;
+            if suffix_domain.every(relation, &predicate.bound) {
+                then_output
+            } else if suffix_domain.every(relation.complement(), &predicate.bound) {
+                else_output
+            } else {
+                return Err(ProjectCheck::Unsupported);
+            }
+        } else {
+            base_output
+        }
+    } else {
+        base_output
+    };
     let base = structure.checker_integer_literals.get(&base_occurrence).ok_or(ProjectCheck::Unsupported)?;
 
     let recursive = output_at(*else_block).ok_or(ProjectCheck::Unsupported)?;
@@ -6201,7 +6234,7 @@ fn check_canonical_induction_returns<'a>(
     let signature = body.checked_call_signatures.get(&recursive).ok_or(ProjectCheck::Unsupported)?;
     let parameters_match = match (rank.earlier, signature.parameters.as_slice()) {
         (None, [input]) => input == &parameter.ty,
-        (Some((earlier, _)), [first, second]) => first == &earlier.ty && second == &parameter.ty,
+        (Some((earlier, _)), [first, second]) => first == &earlier.ty && second == &rank.descending.0.ty,
         _ => false,
     };
     if !parameters_match || !matches!(signature.outputs.outputs.as_slice(), [output] if &output.ty == typed.result_type)
@@ -6214,9 +6247,10 @@ fn check_canonical_induction_returns<'a>(
     let Some((source_call @ ScalarExpression::Call { arguments, .. }, _)) = source_outputs.next() else {
         return Err(ProjectCheck::Unsupported);
     };
-    let (argument, earlier_argument) = match (rank.earlier, arguments.as_slice()) {
-        (None, [decrement]) => (decrement, None),
-        (Some(earlier), [first, decrement]) => (decrement, Some((first, earlier))),
+    let (argument, unchanged, reset) = match (rank.earlier, proof.reset.as_ref(), arguments.as_slice()) {
+        (None, None, [decrement]) => (decrement, None, None),
+        (Some(earlier), None, [first, decrement]) => (decrement, Some((first, earlier)), None),
+        (Some(_), Some(value), [decrement, suffix]) => (decrement, None, Some((suffix, value))),
         _ => return Err(ProjectCheck::Unsupported),
     };
     let ScalarExpression::Binary { operator: BinaryOperator::Subtract, left, right, .. }
@@ -6235,10 +6269,18 @@ fn check_canonical_induction_returns<'a>(
         (body.occurrences.get(occurrence.0)?.span == expression_span(expression)
             && structure.checked_types.expressions.get(occurrence) == Some(ty)).then_some(*occurrence)
     };
-    if let Some((expression, (earlier, expected))) = earlier_argument {
+    if let Some((expression, (earlier, expected))) = unchanged {
         let first = checked_operand(recursive, OccurrenceEdge::CallArgument(earlier.ordinal), expression, &earlier.ty)
             .ok_or(ProjectCheck::Unsupported)?;
         if !matches!(body.prepared_plain_name(first), Some(PlainNameIdentity::Lexical(entry)) if entry == expected) {
+            return Err(ProjectCheck::Unsupported);
+        }
+    }
+    if let Some((suffix, value)) = reset {
+        let slot = rank.descending.0;
+        checked_operand(recursive, OccurrenceEdge::CallArgument(slot.ordinal), suffix, &slot.ty)
+            .ok_or(ProjectCheck::Unsupported)?;
+        if concrete_integer_literal(suffix).as_deref() != Some(value.as_ref()) {
             return Err(ProjectCheck::Unsupported);
         }
     }
@@ -6263,26 +6305,62 @@ fn check_decrement_induction_premise(
     proof: &TypedInductionProofSteps<'_>,
     entry_filter: &[CheckerPredicate],
 ) -> Result<InductionPremise, ProjectCheck> {
-    let (entries, minimum, _) = induction_entry_domain(rank, entry_filter)?;
-    check_induction_entry_domain(&entries, &minimum, proof)
+    let domains = induction_entry_domain(rank, proof, entry_filter)?;
+    check_induction_entry_domain(&domains, proof)
+}
+
+#[cfg(feature = "internal-checker")]
+struct InductionEntryDomains {
+    descending: IntegerSet,
+    earlier: Option<IntegerSet>,
+    minimum: BigInt,
+}
+
+#[cfg(feature = "internal-checker")]
+impl InductionEntryDomains {
+    fn decreasing(&self, proof: &TypedInductionProofSteps<'_>) -> Result<&IntegerSet, ProjectCheck> {
+        if proof.reset.is_some() {
+            self.earlier.as_ref().ok_or(ProjectCheck::Unsupported)
+        } else {
+            Ok(&self.descending)
+        }
+    }
+
+    fn base_witness(&self, proof: &TypedInductionProofSteps<'_>) -> Result<Option<BigInt>, ProjectCheck> {
+        let domain = self.decreasing(proof)?;
+        Ok(match &proof.base_guard {
+            CheckerPredicate::Boolean(true) => domain.extremes().map(|(first, _)| first.clone()),
+            CheckerPredicate::Boolean(false) => None,
+            CheckerPredicate::Integer(predicate) => domain.keep(&predicate.operator, &predicate.bound)
+                .ok_or(ProjectCheck::Unsupported)?.extremes().map(|(first, _)| first.clone()),
+            _ => return Err(ProjectCheck::Unsupported),
+        })
+    }
 }
 
 #[cfg(feature = "internal-checker")]
 fn induction_entry_domain(
     rank: TypedInductionRank<'_>,
+    proof: &TypedInductionProofSteps<'_>,
     entry_filter: &[CheckerPredicate],
-) -> Result<(IntegerSet, BigInt, Option<IntegerSet>), ProjectCheck> {
+) -> Result<InductionEntryDomains, ProjectCheck> {
     let (parameter, binding) = rank.descending;
     let mut entries = IntegerSet::from_type(&parameter.ty).ok_or(ProjectCheck::Unsupported)?;
     let mut earlier = match rank.earlier {
         Some((slot, binding)) => Some((IntegerSet::from_type(&slot.ty).ok_or(ProjectCheck::Unsupported)?, binding)),
         None => None,
     };
-    let minimum = entries.intervals().next().ok_or(ProjectCheck::Unsupported)?.0.clone();
+    let active = if proof.reset.is_some() {
+        &earlier.as_ref().ok_or(ProjectCheck::Unsupported)?.0
+    } else {
+        &entries
+    };
+    let minimum = active.extremes().ok_or(ProjectCheck::Unsupported)?.0.clone();
+    let empty = |minimum| InductionEntryDomains { descending: IntegerSet::default(), earlier: None, minimum };
     for guard in entry_filter {
         let (guard_binding, domain_guard) = match guard {
             CheckerPredicate::Boolean(true) => continue,
-            CheckerPredicate::Boolean(false) => return Ok((IntegerSet::default(), minimum, None)),
+            CheckerPredicate::Boolean(false) => return Ok(empty(minimum)),
             CheckerPredicate::Integer(predicate) => (&predicate.binding, None),
             CheckerPredicate::EntryDomain { binding, values } => (binding, Some(values)),
             _ => return Err(ProjectCheck::Unsupported),
@@ -6300,24 +6378,27 @@ fn induction_entry_domain(
             match domain.intersection(accepted) {
                 IntegerIntersection::Unchanged => {}
                 IntegerIntersection::Changed(retained) => *domain = retained,
-                IntegerIntersection::Empty => return Ok((IntegerSet::default(), minimum, None)),
+                IntegerIntersection::Empty => return Ok(empty(minimum)),
             }
         } else if let CheckerPredicate::Integer(predicate) = guard {
             *domain = domain.keep(&predicate.operator, &predicate.bound).ok_or(ProjectCheck::Unsupported)?;
             if domain.is_empty() {
-                return Ok((IntegerSet::default(), minimum, None));
+                return Ok(empty(minimum));
             }
         }
     }
-    Ok((entries, minimum, earlier.map(|(domain, _)| domain)))
+    Ok(InductionEntryDomains { descending: entries, minimum, earlier: earlier.map(|(domain, _)| domain) })
 }
 
 #[cfg(feature = "internal-checker")]
 fn check_induction_entry_domain(
-    entry_domain: &IntegerSet,
-    minimum: &BigInt,
+    domains: &InductionEntryDomains,
     proof: &TypedInductionProofSteps<'_>,
 ) -> Result<InductionPremise, ProjectCheck> {
+    if domains.descending.is_empty() {
+        return Ok(InductionPremise::Unreachable);
+    }
+    let entry_domain = domains.decreasing(proof)?;
     let narrowed;
     let recursive = match &proof.base_guard {
         CheckerPredicate::Boolean(true) => return Ok(InductionPremise::Unreachable),
@@ -6332,12 +6413,14 @@ fn check_induction_entry_domain(
     let Some((first, _)) = recursive.extremes() else {
         return Ok(InductionPremise::Unreachable);
     };
-    if first < &(minimum + proof.decrement) {
+    if first < &(&domains.minimum + proof.decrement) {
         return Ok(InductionPremise::NotStrict);
     }
-    if !recursive.intervals().all(|(lo, hi)| {
-        entry_domain.covers_closed(&(lo - proof.decrement), &(hi - proof.decrement))
-    }) {
+    if proof.reset.as_ref().is_some_and(|reset| !domains.descending.contains(reset.as_ref()))
+        || !recursive.intervals().all(|(lo, hi)| {
+            entry_domain.covers_closed(&(lo - proof.decrement), &(hi - proof.decrement))
+        })
+    {
         return Ok(InductionPremise::CalleeWhereUnproved);
     }
     Ok(InductionPremise::Established)
@@ -9072,6 +9155,62 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
             "where ((entry == -120 || entry == -110) && entry == -115)");
         let checked = run(&dead, ScalarCheckerScope::CurrentPackage).unwrap();
         assert!(!checked.active && checked.symbolic_diagnostic.is_none());
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordered_lexicographic_prefix_decrease_admits_only_exact_suffix_reset() {
+        let app = source("src/main.w", "ordered-prefix-reset");
+        let proof_source = r#"%%start
+            u8(u8, u8) descend = fn(page, slot) {
+                if (page == 0) { if (slot >= 1) { 7 } else { 8 } } else { descend(page - 1, 5) }
+            };
+            proof rank for descend(page, slot) -> (out)
+                where (page <= 4 && slot >= 1 && slot <= 5) ensures (out == 7) decreases (page, slot) {
+                if (page == 0) { core.show(out == 7); } else { core.use(rank(page - 1, 5)); }
+            }
+        %%end"#;
+        let run = |text: &str, scope| {
+            let (_, proof) = crate::parse_proof_source(app.clone(), text.to_owned(), &[])
+                .unwrap_or_else(|_| panic!("valid prefix-reset rank"));
+            check_loaded_scalar_ordered_local_proof_contexts(
+                Vec::new(), [(proof, Vec::new())], vec![app.clone()], inputs(), scope, Vec::new(),
+            )
+        };
+        let startup = format!(r#"
+            u8 actual = descend(4, 1);
+            core.require(actual == 7, {OUTPUT});
+            core.require(false, {OUTPUT});
+        %%end"#);
+        let reached = proof_source.replace("%%end", &startup);
+        for scope in [ScalarCheckerScope::CurrentPackage, ScalarCheckerScope::MainFlowOnly] {
+            let checked = run(&reached, scope).unwrap();
+            assert!(checked.active && checked.diagnostics.is_empty() && checked.symbolic_diagnostic.is_none());
+            let [directive] = checked.directives.as_slice() else { panic!("one unchanged actual directive"); };
+            assert_eq!(&reached[directive.condition.start as usize..directive.condition.end as usize], "false");
+            for invalid in [
+                reached.replace("rank(page - 1, 5)", "rank(page - 1, 4)"),
+                reached.replace("descend(page - 1, 5)", "descend(page - 1, slot)"),
+                reached.replace("page - 1", "page - 0"),
+                reached.replace("page == 0", "page < 0"),
+                reached.replace("page <= 4", "page >= 1"),
+                reached.replace("page - 1, 5", "page - 1, 0"),
+                reached.replace("descend(4, 1)", "descend(4, 0)"),
+                reached.replace("&& slot >= 1 &&", "&&"),
+            ] {
+                assert!(matches!(run(&invalid, scope), Err(ScalarOrderedCheckerOutcome::Unsupported)));
+            }
+        }
+        let refuted = proof_source.replace("out == 7) decreases", "out == 8) decreases");
+        let checked = run(&refuted, ScalarCheckerScope::CurrentPackage).unwrap();
+        let witness = checked.symbolic_diagnostic.unwrap();
+        assert_eq!(witness.returned, BigInt::from(7));
+        assert!(witness.failed_step.is_none());
+        assert_eq!(&refuted[witness.goal.range.start as usize..witness.goal.range.end as usize], "out == 8");
+        assert_eq!(&refuted[witness.output.range.start as usize..witness.output.range.end as usize], "7");
+        let (page, slot) = (BigInt::from(0), BigInt::from(1));
+        assert!(witness.witness.intervals_at(0, 0).unwrap().eq([(&page, &page)]));
+        assert!(witness.witness.intervals_at(0, 1).unwrap().eq([(&slot, &slot)]));
     }
 
     #[cfg(feature = "internal-checker")]
