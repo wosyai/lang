@@ -435,12 +435,15 @@ fn prepared_fallible_guard_producer_uses_resolved_binding_and_null_polarity() {
 
 #[test]
 fn prepared_fallible_reads_require_availability_on_all_projected_paths() {
-    for (body, should_reject) in [
-        ("if (&result == null) { 7 } else { result }", false),
-        ("if (&result != null) { result } else { 7 }", false),
-        ("result", true),
-        ("if (&result == null) { result } else { 7 }", true),
-        ("i32 observed = if (&result == null) { 7 } else { result };\n\tobserved;\n\tresult", true),
+    use ReferenceAnalysisErrorReason::{UnavailableFallibleAllocation as Unavailable, UnsupportedFallibleAllocationAccess as Unsupported};
+    for (body, expected) in [
+        ("if (&result == null) { 7 } else { result }", None),
+        ("if (&result != null) { result } else { 7 }", None),
+        ("result", Some(Unavailable)),
+        ("if (&result == null) { result } else { 7 }", Some(Unavailable)),
+        ("i32 observed = if (&result == null) { 7 } else { result };\n\tobserved;\n\tresult", Some(Unavailable)),
+        ("result = 19;\n\t7", Some(Unsupported)),
+        ("*i32 alias = &result;\n\talias;\n\t7", Some(Unsupported)),
     ] {
         let text = format!("%%start\ni32() example = fn {{\n\ti32 result = 42;\n\t{body}\n}};\n%%end");
         let parsed = parse_source(source(), text, &[]);
@@ -457,19 +460,10 @@ fn prepared_fallible_reads_require_availability_on_all_projected_paths() {
             panic!("local receiver");
         };
         binding.fallible_assignment = Some(binding.name_span);
-        let (mut results, errors) = derive_module_reference_origins(
+        let (_, errors) = derive_module_reference_origins(
             &program.source, &program.items, &calls, &program.structs, &program.enums, false,
         );
-        assert!(errors.is_empty(), "{errors:?}");
-        let [(0, result)] = results.as_mut_slice() else { panic!("example reference result") };
-        result.cfg.points.clone_from(&result.cfg.initial_points);
-        let errors = transfer_reference_facts(
-            ReferenceTransferCfg::new(&mut result.cfg, Some(&result.proof_points)),
-            &BTreeMap::new(), &HashMap::new(), None, None,
-        );
-        assert_eq!(errors.len(), usize::from(should_reject), "{body}: {errors:?}");
-        assert!(errors.iter().all(|error| matches!(error, ReferenceAnalysisError::MissingOrigin {
-            reason: ReferenceAnalysisErrorReason::UnavailableFallibleAllocation, ..
-        })));
+        assert_eq!(errors.len(), usize::from(expected.is_some()), "{body}: {errors:?}");
+        assert!(errors.iter().all(|error| Some(error.reason()) == expected));
     }
 }

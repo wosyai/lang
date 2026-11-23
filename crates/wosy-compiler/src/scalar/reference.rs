@@ -1008,6 +1008,28 @@ impl<'a> ReferenceFlowBuilder<'a> {
         Ok(BTreeSet::from([self.intern(fact)]))
     }
 
+    fn reject_fallible_address(
+        &self,
+        place: &ScalarPlace,
+        ordinal: OccurrenceOrdinal,
+        source: ByteSpan,
+    ) -> Result<(), ReferenceAnalysisError> {
+        let Some(bindings) = &self.proof_points.fallible_allocation_bindings else {
+            return Ok(());
+        };
+        let ScalarPlace::Name { span, .. } = place else {
+            return Ok(());
+        };
+        if let Some(PreparedPlaceRoot::Lexical(binding)) = self.prepared_place_root(ordinal, *span)? {
+            if bindings.contains_key(binding) {
+                return Err(self.missing_origin(
+                    source, binding.clone(), ReferenceAnalysisErrorReason::UnsupportedFallibleAllocationAccess,
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn guarded_fallible_binding(
         &self,
         condition: &ScalarExpression,
@@ -2209,6 +2231,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
             ScalarExpression::RawAddress { place, .. } => {
                 let place_ordinal = self.place_ordinal(parent, OccurrenceEdge::ExpressionPlace);
                 self.place_expressions(place, scope, place_ordinal)?;
+                self.reject_fallible_address(place, place_ordinal, span)?;
                 self.check_raw_address_access(place, place_ordinal, span, scope)?;
                 let value = self.point(
                     CfgPointKind::Evaluate(expression.clone()),
@@ -2375,6 +2398,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 mutability, place, ..
             } => {
                 let place_ordinal = self.place_ordinal(parent, OccurrenceEdge::ExpressionPlace);
+                self.reject_fallible_address(place, place_ordinal, span)?;
                 let root = self.place_root(place, place_ordinal);
                 let mut named_parent_point = None;
                 let mut reborrow = None;
@@ -7988,7 +8012,7 @@ fn transfer_reference_facts(
                     errors.push(ReferenceAnalysisError::MissingOrigin {
                         source_span: point.source_span.clone(),
                         binding_id: target.binding.clone(),
-                        reason: ReferenceAnalysisErrorReason::UnavailableFallibleAllocation,
+                        reason: ReferenceAnalysisErrorReason::UnsupportedFallibleAllocationAccess,
                     });
                     None
                 }
@@ -12623,6 +12647,14 @@ fn build_function_reference_cfg(
                     });
                 }
             }
+        }
+        if builder.proof_points.fallible_allocation_bindings.is_some() {
+            errors.extend(provisional.iter().filter(|error| matches!(error,
+                ReferenceAnalysisError::MissingOrigin {
+                    reason: ReferenceAnalysisErrorReason::UnavailableFallibleAllocation
+                        | ReferenceAnalysisErrorReason::UnsupportedFallibleAllocationAccess, ..
+                }
+            )).cloned());
         }
         if provisional.is_empty() {
             for &(end, _) in &builder.aggregate_facts.checked_producer_arms {
