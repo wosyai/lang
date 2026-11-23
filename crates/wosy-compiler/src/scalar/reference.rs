@@ -2081,6 +2081,21 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     for (&slot, &provenance) in &aggregate_arguments {
                         self.aggregate_result.inputs.entry((id, ordinal.0, slot, provenance)).or_default();
                     }
+                    if self.aggregate_facts.formals.len() == 1
+                        && self.aggregate_facts.raw_formals.is_empty()
+                        && !calls.declared_unsafe_calls.contains(&ordinal.0)
+                        && matches!(&self.cfg.points[id.0].kind, CfgPointKind::Call {
+                            target: ResolvedCallTarget::ModuleCallable {
+                                concrete: ConcreteCallSelection::Declaration, ..
+                            }, ..
+                        })
+                    {
+                        for &value in aggregate_arguments.values() {
+                            if let aggregate::ArgumentProvenance::WholeMove(moved) = value {
+                                self.aggregate_facts.conditional_formal_moves.insert(moved, id);
+                            }
+                        }
+                    }
                     self.aggregate_facts.input_moves.insert(id, (ordinal, aggregate_arguments));
                 }
                 if !raw_arguments.is_empty() {

@@ -1129,6 +1129,14 @@ fn emit_selected_call<'ctx, 'module>(
                 }
                 base
             }
+            CallInput::Body(ClosedInput::ForwardFormalDeferred(source)) => {
+                let aggregate = state.aggregate.as_ref().expect("closed aggregate input context");
+                let (formal, base) = aggregate.input.ok_or_else(|| "missing deferred formal base at owner transfer".to_owned())?;
+                if formal != source || aggregate.plan.input_release_guard.is_none() {
+                    return Err("conditional formal owner transfer identity mismatch".to_owned());
+                }
+                base
+            }
             CallInput::Body(ClosedInput::Plain) => context.ptr_type(AddressSpace::default()).const_null(),
             CallInput::Initializer(input) => {
                 let frame = state.initializer_aggregate.as_mut().expect("closed initializer input frame");
@@ -1271,10 +1279,17 @@ pub(super) fn release_scope<'ctx>(
         if aggregate.plan.input != Some(slot) {
             return Err("formal owner release identity mismatch".to_owned());
         }
-        if aggregate.plan.input_mixed {
+        let active = if let Some(guard) = aggregate.plan.input_release_guard {
+            Some(aggregate.receipt_guards.get(&guard).copied()
+                .ok_or_else(|| "missing guarded formal receipt at scope cleanup".to_owned())?)
+        } else if aggregate.plan.input_mixed {
+            Some(state.builder.build_is_not_null(base, "aggregate_formal_owned").map_err(builder_error)?)
+        } else {
+            None
+        };
+        if let Some(live) = active {
             let current = state.builder.get_insert_block().and_then(|block| block.get_parent())
-                .ok_or_else(|| "missing mixed aggregate formal owner block".to_owned())?;
-            let live = state.builder.build_is_not_null(base, "aggregate_formal_owned").map_err(builder_error)?;
+                .ok_or_else(|| "missing guarded aggregate formal owner block".to_owned())?;
             let release = context.append_basic_block(current, "aggregate.formal.release");
             let next = context.append_basic_block(current, "aggregate.formal.end");
             state.builder.build_conditional_branch(live, release, next).map_err(builder_error)?;

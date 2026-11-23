@@ -668,6 +668,87 @@ fn lexical_aggregate_transfer_releases_at_the_exact_owner_scope() {
 }
 
 #[test]
+fn conditional_formal_transfer_uses_original_hidden_base_in_recursive_frames() {
+    let app = source("workbench", "src/conditional_formal_transfer.w");
+    let text = include_str!("fixtures/conditional-formal-transfer.w");
+    for (target, target_layout) in [
+        ("native64", ScalarTargetLayout::NATIVE64),
+        ("wasm32", ScalarTargetLayout::WASM32),
+    ] {
+        let emit = |text: &str| {
+            let prepared = prepare_scalar_project(
+                vec![(declarations(&app, text), Vec::new())], vec![app.clone()],
+                ScalarPreparationInputs { target_layout },
+            ).unwrap_or_else(|error| panic!("{target}: {:?}", error.diagnostics));
+            let build = analyze_scalar_build(&prepared);
+            assert!(build.diagnostics().is_empty(), "{target}: {:?}", build.diagnostics());
+            emit_scalar_build_project_llvm(&build).map(|module| module.to_text())
+        };
+        let ir = emit(text).unwrap_or_else(|error| panic!("{target}: {error}"));
+        let context = Context::create();
+        let buffer = MemoryBuffer::create_from_memory_range_copy(ir.as_bytes(), target);
+        let module = context.create_module_from_ir(buffer).unwrap();
+        module.verify().unwrap();
+        let relay = module.get_function(&function_with_suffix(&module, "relay")).unwrap();
+        let consumer = module.get_function(&function_with_suffix(&module, "accept_packet")).unwrap();
+        let release = module.get_function("__wosy_core_free").unwrap();
+        let rows: Vec<_> = relay.get_basic_blocks().into_iter()
+            .flat_map(|block| block.get_instructions()).collect();
+        let matching = |opcode, name: &str| rows.iter().filter(|row|
+            row.get_opcode() == opcode && row.to_string().contains(name)
+        ).count();
+        assert_eq!(matching(InstructionOpcode::Phi, "aggregate_receipt_active"), 1, "{target}: {ir}");
+        assert_eq!(matching(InstructionOpcode::Br, "aggregate_receipt_active"), 1, "{target}: {ir}");
+        let uses = |callee, last_arg: bool| rows.iter().filter_map(|&row| {
+            if row.get_opcode() != InstructionOpcode::Call { return None; }
+            let call = CallSiteValue::try_from(row).unwrap();
+            (call.get_called_fn_value() == Some(callee)).then(|| {
+                let slot = if last_arg { call.count_arguments() - 1 } else { 0 };
+                row.get_operand(slot).unwrap().value().unwrap()
+            })
+        }).collect::<Vec<_>>();
+        assert_eq!(uses(consumer, true), [relay.get_last_param().unwrap()], "{target}: {ir}");
+        assert_eq!(uses(release, false), [relay.get_last_param().unwrap()], "{target}: {ir}");
+        assert_eq!(matching(InstructionOpcode::Alloca, "aggregate_receipt_active"), 0, "{target}: {ir}");
+
+        if let Some(out) = std::env::var_os("WOSY_FORMAL_RECEIPT_IR_DIR") {
+            let mut witness = ir.replace("@main(", "@wosy_authored_main(");
+            for name in ["case_zero", "case_two", "case_three"] {
+                let symbol = function_with_suffix(&module, name);
+                witness.push_str(&format!(
+                    "\ndefine i64 @wosy_{name}() {{\nentry:\n  %result = call i64 @{symbol}()\n  ret i64 %result\n}}\n"
+                ));
+            }
+            std::fs::write(std::path::PathBuf::from(out).join(format!("{target}.ll")), witness).unwrap();
+        }
+
+        // A local receipt taking the identical fork in this relay should
+        // share the formal plan's certified CFG and emitted guard.
+        let combined = text.replace(
+            "if (take) { accept_packet(packet) } else { packet.length }",
+            "Packet local = make_packet(2); if (take) { u64 added = accept_packet(local); u64 moved = accept_packet(packet); moved + added } else { packet.length }",
+        );
+        let combined = emit(&combined).unwrap_or_else(|error| panic!("{target}: {error}"));
+        let buffer = MemoryBuffer::create_from_memory_range_copy(combined.as_bytes(), target);
+        context.create_module_from_ir(buffer).unwrap().verify().unwrap();
+        assert_eq!(combined.lines().filter(|row| row.contains("aggregate_receipt_active")
+            && row.contains(" = phi i1 ")).count(), 1, "{target}: {combined}");
+        assert_eq!(combined.lines().filter(|row| row.contains("br i1 %aggregate_receipt_active"))
+            .count(), 2, "{target}: {combined}");
+
+        let nonterminal = text
+            .replace("u64(Packet, bool) relay", "u64(Packet) forward = fn(packet) { accept_packet(packet) };\nu64(Packet, bool) relay")
+            .replace("if (take) { accept_packet(packet) }", "if (take) { forward(packet) }");
+        let error = emit(&nonterminal).expect_err("a conditional formal relay requires a terminal destination");
+        assert!(error.contains("aggregate owning formal conditional transfer"), "{target}: {error}");
+
+        let unseeded = text.replace("relay(packet, take)", "accept_packet(packet)");
+        let error = emit(&unseeded).expect_err("a relay without an owned incoming mode must fail closed");
+        assert!(error.contains("aggregate owning formal conditional transfer"), "{target}: {error}");
+    }
+}
+
+#[test]
 fn runtime_array_recommit_keeps_the_owner_until_its_real_end() {
     let recursive = r#"
 (u8[], u64)(u8[], u64, u64) carry = fn(bytes, depth, count) {
