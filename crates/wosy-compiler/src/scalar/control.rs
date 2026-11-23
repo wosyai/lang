@@ -47,7 +47,7 @@ pub(crate) struct CallablePointFacts {
     pub(super) forward_initial_graph: Option<ForwardInitialGraph>,
     pub(super) has_grouped_assignment_capture: Option<bool>,
     pub(super) pending_named_reborrow: Option<PendingNamedReborrow>,
-    pub(super) indexed_holder: Option<Box<super::reference::SelectedIndexedHolder>>,
+    pub(super) indexed_holders: Option<Box<super::reference::SelectedIndexedHolders>>,
     pub(super) raw_address_exposures: Vec<(super::CfgPointId, Option<super::ReferenceBindingId>)>,
     pub(super) checked_join_values: Vec<(super::CfgPointId, [Option<super::CfgPointId>; 2])>,
     pub(super) checked_block_values: Vec<(super::CfgPointId, super::CfgPointId)>,

@@ -2888,12 +2888,8 @@ impl<'a> ReferenceFlowBuilder<'a> {
         {
             return;
         }
-        let selected = self.proof_points.indexed_holder.get_or_insert_with(|| Box::new(SelectedIndexedHolder {
-            holder: holder.clone(), selector: selector.clone(), sites: HashSet::new(),
-        }));
-        if selected.holder == *holder && selected.selector == *selector {
-            selected.sites.insert(span);
-        }
+        self.proof_points.indexed_holders.get_or_insert_with(Default::default)
+            .record(holder, selector, span);
     }
 
     fn read_checked_place_root(
@@ -5649,6 +5645,36 @@ fn selected_holder_keeps_projected_only_shared_loan_live_until_replaced() {
     assert!(state.projected.loan_rows().is_empty());
 }
 
+#[derive(Default)]
+pub(super) struct SelectedIndexedHolders {
+    by_holder: HashMap<ReferenceBindingId, SelectedIndexedHolder>,
+    selectors: HashSet<ReferenceBindingId>,
+}
+
+impl SelectedIndexedHolders {
+    fn record(&mut self, holder: &ReferenceBindingId, selector: &ReferenceBindingId, span: ByteSpan) {
+        if let Some(selected) = self.by_holder.get_mut(holder) {
+            if selected.selector == *selector {
+                selected.sites.insert(span);
+            }
+        } else {
+            self.selectors.insert(selector.clone());
+            self.by_holder.insert(holder.clone(), SelectedIndexedHolder {
+                holder: holder.clone(), selector: selector.clone(), sites: HashSet::from([span]),
+            });
+        }
+    }
+
+    fn disabled_by<'a>(&self, point: &'a ReferenceFlowPoint) -> Option<&'a ReferenceBindingId> {
+        match &point.kind {
+            CfgPointKind::Borrow { place, .. } if self.by_holder.contains_key(&place.binding)
+                || self.selectors.contains(&place.binding) => Some(&place.binding),
+            CfgPointKind::Assign { target, .. } if self.selectors.contains(&target.binding) => Some(&target.binding),
+            _ => None,
+        }
+    }
+}
+
 pub(super) struct SelectedIndexedHolder {
     holder: ReferenceBindingId,
     selector: ReferenceBindingId,
@@ -5665,15 +5691,6 @@ impl SelectedIndexedHolder {
     fn constant(&self, place: &ReferencePlaceId) -> bool {
         place.binding == self.holder
             && matches!(place.projections.as_slice(), [ReferencePlaceProjection::Index(ScalarExpression::Integer { .. })])
-    }
-
-    fn conflicts_with_enrollment(&self, point: &ReferenceFlowPoint) -> bool {
-        match &point.kind {
-            CfgPointKind::Borrow { place, .. } =>
-                place.binding == self.holder || place.binding == self.selector,
-            CfgPointKind::Assign { target, .. } => target.binding == self.selector,
-            _ => false,
-        }
     }
 
     fn eligible_origins(origins: &BTreeSet<ReferenceOriginId>, facts: &[ReferenceOrigin]) -> bool {
@@ -6357,7 +6374,7 @@ struct ReferenceTransferCfg<'a> {
     scope_exit_bindings: Option<&'a HashMap<CfgPointId, super::control::ScopeExitBindings>>,
     pending_named_reborrow: Option<&'a super::control::PendingNamedReborrow>,
     resolve_pending_named_reborrow: bool,
-    indexed_holder: Option<&'a SelectedIndexedHolder>,
+    indexed_holders: Option<&'a SelectedIndexedHolders>,
     raw_address_exposures: &'a [(CfgPointId, Option<ReferenceBindingId>)],
     points: &'a mut [ReferenceFlowPoint],
     facts: &'a mut Vec<ReferenceOrigin>,
@@ -6386,7 +6403,7 @@ impl<'a> ReferenceTransferCfg<'a> {
             scope_exit_bindings: proof.and_then(|proof| proof.scope_exit_bindings.as_ref()),
             pending_named_reborrow: proof.and_then(|proof| proof.pending_named_reborrow.as_ref()),
             resolve_pending_named_reborrow: false,
-            indexed_holder: proof.and_then(|proof| proof.indexed_holder.as_deref()),
+            indexed_holders: proof.and_then(|proof| proof.indexed_holders.as_deref()),
             raw_address_exposures: proof.map_or(&[], |proof| &proof.raw_address_exposures),
             points: &mut cfg.points,
             facts: &mut cfg.facts,
@@ -7124,7 +7141,8 @@ fn transfer_reference_facts(
     let mut strictly_forward = true;
     let mut unbranched = !matches!(cfg.forward_initial_graph, Some(super::control::ForwardInitialGraph::Branched));
     let validate_topology = cfg.forward_initial_graph.is_none();
-    let mut indexed_holder = cfg.indexed_holder.filter(|_| cfg.raw_address_exposures.is_empty() && deferred_policies.is_empty());
+    let indexed_holders = cfg.indexed_holders.filter(|_| cfg.raw_address_exposures.is_empty() && deferred_policies.is_empty());
+    let mut disabled_indexed_bindings = HashSet::new();
     let mut projected_leaf_sites = HashMap::new();
     let mut projected_leaf_holders = HashMap::new();
     let mut projected_store_facts = None::<(BTreeSet<ReferenceOriginId>, HashMap<CfgPointId, ReferenceOriginId>)>;
@@ -7190,8 +7208,8 @@ fn transfer_reference_facts(
     let mut dependency_pair = [CfgPointId(0); 2];
     let mut local_fork_index = 0;
     for (index, point) in original_points.iter().enumerate() {
-        if indexed_holder.is_some_and(|holder| holder.conflicts_with_enrollment(point)) {
-            indexed_holder = None;
+        if let Some(binding) = indexed_holders.and_then(|holders| holders.disabled_by(point)) {
+            disabled_indexed_bindings.insert(binding);
         }
         if cfg.local_borrow.is_some_and(|sealed| !sealed.matches_edge_shape(index, point, &mut local_fork_index)) {
             cfg.local_borrow = None;
@@ -7424,6 +7442,11 @@ fn transfer_reference_facts(
     for parent in cfg.named_reborrow_parents {
         last_use[parent.pointer.0] = last_use[parent.pointer.0].max(parent.borrow.0);
     }
+    let indexed_holder = |binding: &ReferenceBindingId| {
+        let holder = indexed_holders?.by_holder.get(binding)?;
+        (!disabled_indexed_bindings.contains(binding)
+            && !disabled_indexed_bindings.contains(&holder.selector)).then_some(holder)
+    };
     let aggregate_deadlines = aggregate.as_ref()
         .filter(|_| aggregate_expiry_allowed)
         .map(|(facts, _, _, _)| facts.value_deadlines(&last_use));
@@ -8554,7 +8577,7 @@ fn transfer_reference_facts(
                 } => {
                     let mut read = BTreeSet::new();
                     for candidate in candidates {
-                        if !extend_projected_read_origins(&state, candidate, &mut read, indexed_holder) {
+                        if !extend_projected_read_origins(&state, candidate, &mut read, indexed_holder(&candidate.binding)) {
                             errors.push(ReferenceAnalysisError::MissingOrigin {
                                 source_span: point.source_span.clone(),
                                 binding_id: candidate.binding.clone(),
@@ -8677,7 +8700,8 @@ fn transfer_reference_facts(
                 } => {
                     let binding = &target.binding;
                     let installs_reference = point.possible_origins.as_ref().is_none_or(|origins| !origins.is_empty());
-                    let holder_write = indexed_holder.filter(|holder|
+                    let holder = indexed_holder(binding);
+                    let holder_write = holder.filter(|holder|
                         installs_reference && (holder.selected(target) || holder.constant(target))
                             && assignment_rhs.as_ref().and_then(|value| value.as_ref()).is_some_and(|origins|
                                 SelectedIndexedHolder::eligible_origins(origins, &cfg.facts))
@@ -8707,7 +8731,7 @@ fn transfer_reference_facts(
                                     state.bindings.insert(binding.clone(), origins.clone());
                                 } else if let Some(holder) = holder_write {
                                     holder.write(&mut state, target, &origins, &cfg.facts);
-                                } else if !indexed_holder.is_some_and(|holder| holder.selected(target)) {
+                                } else if !holder.is_some_and(|holder| holder.selected(target)) {
                                     write_projected_reference(&mut state, target, &origins);
                                 }
                                 Some(origins)
@@ -13065,7 +13089,7 @@ fn derive_function_specialized_copy_policies<'a>(
                     scope_exit_bindings: template_result.proof_points.scope_exit_bindings.as_ref(),
                     pending_named_reborrow: template_result.proof_points.pending_named_reborrow.as_ref(),
                     resolve_pending_named_reborrow: false,
-                    indexed_holder: None,
+                    indexed_holders: None,
                     raw_address_exposures: &template_result.proof_points.raw_address_exposures,
                     points: &mut points,
                     facts: &mut facts,

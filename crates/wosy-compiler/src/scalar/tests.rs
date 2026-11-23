@@ -4942,6 +4942,31 @@ fn indexed_checked_holder_relays_one_unchanged_formal_selector() {
 }
 
 #[test]
+fn indexed_checked_holder_relays_independent_arrays_and_selectors() {
+    for (left_read, expected) in [
+        ("*u8 a = left[i]; a;", &[2, 3][..]),
+        ("i = 0;", &[3][..]),
+    ] {
+        let text = format!("%%start\nunit(u64, u64, *u8, *u8) update = fn(i, j, first, second) {{ (*u8)[2] left = [null, null]; (*u8)[2] right = [null, null]; left[i] = first; right[j] = second; {left_read} *u8 b = right[j]; b; }};\n%%end");
+        let (single, project) = both_reference_functions(&text);
+        for (items, diagnostics) in [
+            (&single.program.items, &single.diagnostics),
+            (&project.project.modules[0].items, &project.diagnostics),
+        ] {
+            assert!(diagnostics.is_empty(), "{text}: {diagnostics:?}");
+            let ScalarItem::Function(function) = &items[0] else { panic!("function") };
+            let actual = function.reference_cfg.points.iter()
+                .filter(|point| matches!(point.kind, CfgPointKind::ReadPlace { reads_origin: true, .. }))
+                .map(|point| match sole_fact(function, point) {
+                    ReferenceOrigin::BorrowedFrom { parameter, .. } => *parameter,
+                    origin => panic!("unexpected origin {origin:?}"),
+                }).collect::<Vec<_>>();
+            assert_eq!(actual, expected);
+        }
+    }
+}
+
+#[test]
 fn indexed_checked_holder_does_not_widen_a_fresh_local_into_an_outer_slot() {
     let text = "%%start\nunit(bool, u64, *u8) update = fn(take, index, argument) { (*u8)[2] refs = [null, null]; refs[0] = argument; if (take) { u8 local = 1; refs[0] = &local; refs[index] = argument; }; *u8 observed = refs[0]; observed; };\n%%end";
     let (single, project) = both_reference_functions(text);
