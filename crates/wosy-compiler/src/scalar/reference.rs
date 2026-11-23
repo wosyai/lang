@@ -4826,7 +4826,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
 struct ReferenceEdgeState {
     aggregate: Option<aggregate::AggregateEdgeState>,
     bindings: BTreeMap<ReferenceBindingId, BTreeSet<ReferenceOriginId>>,
-    projected: Vec<ReferenceProjectedState>,
+    projected: ReferenceProjectedRows,
     uninitialized: HashSet<ReferenceBindingId>,
     value: Option<BTreeSet<ReferenceOriginId>>,
     released: BTreeSet<ReferenceBindingId>,
@@ -5077,7 +5077,7 @@ fn prepared_scope_expiry_uses_exact_declared_and_introduced_bindings() {
         state.moved_checked_handles.insert(binding.clone(), Vec::new());
         state.released.insert(binding.clone());
         state.invalidated.insert(binding.clone());
-        state.projected.push(ReferenceProjectedState { place, origins: BTreeSet::new(), uninitialized: true });
+        state.projected.push(ReferenceProjectedState { retains_loan: false, place, origins: BTreeSet::new(), uninitialized: true });
     }
     state.expire_scope(&point(0, 2), Some(&inventory)); // empty checked scope, not detached
     assert_eq!(state.bindings.len(), 3);
@@ -5144,8 +5144,52 @@ fn prepared_loan_read_reachability_stops_only_at_the_exact_binding_exit() {
     assert_eq!(pending.capacity(), 0);
 }
 
+#[derive(Clone, Default, PartialEq)]
+struct ReferenceProjectedRows {
+    rows: Vec<ReferenceProjectedState>,
+    live_loans: bool,
+}
+
+impl ReferenceProjectedRows {
+    fn push(&mut self, row: ReferenceProjectedState) {
+        self.live_loans |= row.retains_loan && !row.uninitialized;
+        self.rows.push(row);
+    }
+
+    fn retain(&mut self, mut keep: impl FnMut(&ReferenceProjectedState) -> bool) {
+        if self.live_loans {
+            self.retain_mut(|row| keep(row));
+        } else {
+            self.rows.retain(keep);
+        }
+    }
+
+    fn retain_mut(&mut self, mut keep: impl FnMut(&mut ReferenceProjectedState) -> bool) {
+        let mut live_loans = false;
+        self.rows.retain_mut(|row| {
+            let retained = keep(row);
+            live_loans |= retained && row.retains_loan && !row.uninitialized;
+            retained
+        });
+        self.live_loans = live_loans;
+    }
+
+    fn loan_rows(&self) -> &[ReferenceProjectedState] {
+        if self.live_loans { &self.rows } else { &[] }
+    }
+}
+
+impl std::ops::Deref for ReferenceProjectedRows {
+    type Target = Vec<ReferenceProjectedState>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.rows
+    }
+}
+
 #[derive(Clone, PartialEq)]
 struct ReferenceProjectedState {
+    retains_loan: bool,
     place: ReferencePlaceId,
     origins: BTreeSet<ReferenceOriginId>,
     uninitialized: bool,
@@ -5447,6 +5491,7 @@ impl DisjointProjectedWrite<'_> {
     }
 }
 
+#[derive(Clone, Copy)]
 enum LoanAccess<'a> {
     Direct,
     DirectShared,
@@ -5454,6 +5499,45 @@ enum LoanAccess<'a> {
     WriteThrough(&'a InvalidationCandidate, Option<DisjointProjectedWrite<'a>>),
     ReadThrough(&'a ReferenceLoanId),
     Borrow(&'a ReferenceLoanId),
+}
+
+fn conflicting_loan<'a>(
+    facts: &'a [ReferenceOrigin],
+    origin: ReferenceOriginId,
+    place: &ReferencePlaceId,
+    access: LoanAccess<'_>,
+) -> Option<&'a ReferenceLoanId> {
+    if match access {
+        LoanAccess::Direct | LoanAccess::DirectShared | LoanAccess::ReadThrough(_) | LoanAccess::Borrow(_) => false,
+        LoanAccess::Through(selected) => origin == selected,
+        LoanAccess::WriteThrough(selected, _) => origin == selected.origin,
+    } {
+        return None;
+    }
+    let loan = match &facts[origin.0] {
+        ReferenceOrigin::Fresh { loan, .. } | ReferenceOrigin::BorrowedFrom { loan, .. } => loan,
+        _ => return None,
+    };
+    (match access {
+        LoanAccess::ReadThrough(selected) => {
+            loan.mode == ScalarReferenceMutability::Mutable
+                && loan_has_ancestor(loan, selected)
+                && reference_places_overlap(&available_place_for_check(&loan.origin_place), place)
+        }
+        LoanAccess::WriteThrough(selected, projected) => {
+            !projected.is_some_and(|projected| projected.excludes(origin, loan))
+                && loan_borrows_place(loan, place, None)
+                && !loan_has_ancestor(&selected.loan, loan)
+        }
+        LoanAccess::Borrow(new) => {
+            (new.mode == ScalarReferenceMutability::Mutable
+                || loan.mode == ScalarReferenceMutability::Mutable)
+                && reference_places_overlap(&available_place_for_check(&loan.origin_place), place)
+                && !loan_has_ancestor(new, loan)
+        }
+        LoanAccess::DirectShared => loan_borrows_place(loan, place, Some(ScalarReferenceMutability::Mutable)),
+        LoanAccess::Direct | LoanAccess::Through(_) => loan_borrows_place(loan, place, None),
+    }).then_some(loan)
 }
 
 fn conflicting_live_loan(
@@ -5471,40 +5555,9 @@ fn conflicting_live_loan(
     for (binding, origins) in &state.bindings {
         let mut reachable = false;
         for origin in origins {
-            if match access {
-                LoanAccess::Direct | LoanAccess::DirectShared | LoanAccess::ReadThrough(_) | LoanAccess::Borrow(_) => false,
-                LoanAccess::Through(selected) => *origin == selected,
-                LoanAccess::WriteThrough(selected, _) => *origin == selected.origin,
-            } {
+            let Some(loan) = conflicting_loan(facts, *origin, &place, access) else {
                 continue;
-            }
-            let loan = match &facts[origin.0] {
-                ReferenceOrigin::Fresh { loan, .. } | ReferenceOrigin::BorrowedFrom { loan, .. } => loan,
-                _ => continue,
             };
-            let conflicts_with_access = match access {
-                LoanAccess::ReadThrough(selected) => {
-                    loan.mode == ScalarReferenceMutability::Mutable
-                        && loan_has_ancestor(loan, selected)
-                        && reference_places_overlap(&available_place_for_check(&loan.origin_place), &place)
-                }
-                LoanAccess::WriteThrough(selected, projected) => {
-                    !projected.is_some_and(|projected| projected.excludes(*origin, loan))
-                        && loan_borrows_place(loan, &place, None)
-                        && !loan_has_ancestor(&selected.loan, loan)
-                }
-                LoanAccess::Borrow(new) => {
-                    (new.mode == ScalarReferenceMutability::Mutable
-                        || loan.mode == ScalarReferenceMutability::Mutable)
-                        && reference_places_overlap(&available_place_for_check(&loan.origin_place), &place)
-                        && !loan_has_ancestor(new, loan)
-                }
-                LoanAccess::DirectShared => loan_borrows_place(loan, &place, Some(ScalarReferenceMutability::Mutable)),
-                LoanAccess::Direct | LoanAccess::Through(_) => loan_borrows_place(loan, &place, None),
-            };
-            if !conflicts_with_access {
-                continue;
-            }
             if !reachable {
                 if !reference_read_reachable(points, scope_exits, strictly_forward, point, binding) {
                     break;
@@ -5517,7 +5570,83 @@ fn conflicting_live_loan(
             ));
         }
     }
+    for row in state.projected.loan_rows() {
+        if !row.retains_loan || row.uninitialized {
+            continue;
+        }
+        for origin in &row.origins {
+            if let Some(loan) = conflicting_loan(facts, *origin, &place, access) {
+                if !conflicts.iter().any(|span| span.source == loan.origin_place.source
+                    && span.range == loan.creation_span) {
+                    conflicts.push(SourceSpan::new(loan.origin_place.source.clone(), loan.creation_span));
+                }
+            }
+        }
+    }
     conflicts
+}
+
+#[cfg(test)]
+#[test]
+fn selected_holder_keeps_projected_only_shared_loan_live_until_replaced() {
+    let source = SourceIdentity::new("project".into(), "package".into(), "metadata".into(), "r1".into());
+    let span = ByteSpan::new(0, 10);
+    let place = |start| {
+        let declaration_span = ByteSpan::new(start, start + 1);
+        let binding = ReferenceBindingId {
+            source: source.clone(), function_span: span, block_span: span,
+            declaration_span, kind: ReferenceBindingKind::Declared,
+        };
+        ReferencePlaceId {
+            source: source.clone(), function_span: span, block_span: span, declaration_span,
+            binding, projections: Vec::new(), place: ScalarPlace::Name { name: String::new(), span },
+        }
+    };
+    let referent = place(1);
+    let mut slot = place(2);
+    slot.projections.push(ReferencePlaceProjection::Index(
+        ScalarExpression::Integer { value: 0.into(), span },
+    ));
+    let holder = SelectedIndexedHolder {
+        holder: slot.binding.clone(), selector: place(3).binding, sites: HashSet::new(),
+    };
+    let creation_span = ByteSpan::new(4, 5);
+    let unrelated = place(6);
+    let loan = |origin_place| ReferenceLoanId {
+        mode: ScalarReferenceMutability::Shared, origin_place, creation_span, parent: None,
+    };
+    let facts = [
+        ReferenceOrigin::BorrowedFrom { parameter: 0, loan: loan(referent.clone()) },
+        ReferenceOrigin::BorrowedFrom { parameter: 1, loan: loan(unrelated.clone()) },
+        ReferenceOrigin::Null { span },
+    ];
+    let mut state = ReferenceEdgeState::default();
+    holder.write(&mut state, &slot, &BTreeSet::from([ReferenceOriginId(0)]), &facts);
+    assert!(state.bindings.is_empty());
+    let conflicts = |state: &ReferenceEdgeState, place: &ReferencePlaceId, access: LoanAccess<'_>| {
+        conflicting_live_loan(&[], None, true, &facts, state, CfgPointId(0), place, access)
+    };
+    assert_eq!(conflicts(&state, &referent, LoanAccess::Direct),
+        vec![SourceSpan::new(source, creation_span)]);
+    assert!(conflicts(&state, &referent, LoanAccess::DirectShared).is_empty());
+    assert!(conflicts(&state, &unrelated, LoanAccess::Direct).is_empty());
+    holder.write(&mut state, &slot, &BTreeSet::from([ReferenceOriginId(1)]), &facts);
+    assert!(conflicts(&state, &referent, LoanAccess::Direct).is_empty());
+    assert_eq!(conflicts(&state, &unrelated, LoanAccess::Direct).len(), 1);
+    let exit = ReferenceFlowPoint {
+        id: CfgPointId(0), kind: CfgPointKind::ScopeExit,
+        source_span: SourceSpan::new(referent.source.clone(), span),
+        scope: ReferenceScopeId(0), possible_origins: None, successors: vec![],
+    };
+    let mut cohort = super::control::ScopeExitBindings::default();
+    cohort.insert(slot.binding.clone());
+    state.expire_scope(&exit, Some(&HashMap::from([(exit.id, cohort)])));
+    assert!(!state.projected.live_loans);
+    assert!(conflicts(&state, &unrelated, LoanAccess::Direct).is_empty());
+    holder.write(&mut state, &slot, &BTreeSet::from([ReferenceOriginId(2)]), &facts);
+    assert!(!state.projected.is_empty());
+    assert!(!state.projected.live_loans);
+    assert!(state.projected.loan_rows().is_empty());
 }
 
 pub(super) struct SelectedIndexedHolder {
@@ -5561,6 +5690,9 @@ impl SelectedIndexedHolder {
         origins: &BTreeSet<ReferenceOriginId>, facts: &[ReferenceOrigin],
     ) {
         let selected = self.selected(target);
+        let holds_loan = |origins: &BTreeSet<ReferenceOriginId>| origins.iter()
+            .any(|origin| matches!(facts[origin.0], ReferenceOrigin::BorrowedFrom { .. }));
+        let retained_loan = holds_loan(origins);
         state.projected.retain_mut(|known| {
             if !reference_places_overlap(&known.place, target) {
                 return true;
@@ -5572,6 +5704,7 @@ impl SelectedIndexedHolder {
                 if !Self::eligible_origins(&known.origins, facts) {
                     return false;
                 }
+                known.retains_loan |= retained_loan || holds_loan(&known.origins);
                 known.origins.extend(origins);
                 true
             } else {
@@ -5579,6 +5712,7 @@ impl SelectedIndexedHolder {
             }
         });
         state.projected.push(ReferenceProjectedState {
+            retains_loan: retained_loan,
             place: target.clone(), origins: origins.clone(), uninitialized: false,
         });
     }
@@ -5592,7 +5726,7 @@ fn extend_projected_read_origins(
 ) -> bool {
     let mut found = false;
     let selected = holder.filter(|holder| holder.selected(candidate));
-    for known in &state.projected {
+    for known in state.projected.iter() {
         if !known.uninitialized && (selected.is_some_and(|holder| holder.selected(&known.place))
             || reference_places_same(&known.place, candidate)) {
             found = true;
@@ -5623,19 +5757,22 @@ fn projected_read_keeps_presence_separate_from_origin_contents() {
     let unrelated = place(2);
     let mut state = ReferenceEdgeState::default();
     state.projected.push(ReferenceProjectedState {
+        retains_loan: false,
         place: checked.clone(), origins: BTreeSet::from([ReferenceOriginId(9)]), uninitialized: true,
     });
     state.projected.push(ReferenceProjectedState {
+        retains_loan: false,
         place: unrelated, origins: BTreeSet::from([ReferenceOriginId(8)]), uninitialized: false,
     });
     let mut read = BTreeSet::new();
     assert!(!extend_projected_read_origins(&state, &checked, &mut read, None));
     state.projected.push(ReferenceProjectedState {
+        retains_loan: false,
         place: checked.clone(), origins: BTreeSet::new(), uninitialized: false,
     });
     assert!(extend_projected_read_origins(&state, &checked, &mut read, None));
     assert!(read.is_empty());
-    state.projected.last_mut().unwrap().origins.insert(ReferenceOriginId(1));
+    state.projected.rows.last_mut().unwrap().origins.insert(ReferenceOriginId(1));
     assert!(extend_projected_read_origins(&state, &checked, &mut read, None));
     assert_eq!(read, BTreeSet::from([ReferenceOriginId(1)]));
 }
@@ -5754,6 +5891,7 @@ fn write_projected_reference(
         .projected
         .retain(|known| !reference_places_overlap(&known.place, place));
     state.projected.push(ReferenceProjectedState {
+        retains_loan: false,
         place: place.clone(),
         origins: origins.clone(),
         uninitialized: false,
@@ -8162,7 +8300,8 @@ fn transfer_reference_facts(
                     {
                         continue;
                     }
-                    let staged = if place.projections.is_empty() && matches!(&point.kind, CfgPointKind::Read { .. }) {
+                    let staged = if !state.projected.live_loans && place.projections.is_empty()
+                        && matches!(&point.kind, CfgPointKind::Read { .. }) {
                         cfg.local_borrow.and_then(|sealed| {
                             if incoming_count == 1 {
                                 sealed.conflicts(&place.binding, id, incoming_count, original_points, local_borrow::AccessMode::Shared)
@@ -8326,7 +8465,7 @@ fn transfer_reference_facts(
                         || (pending_allowed
                             && pending.is_some_and(|pending| deferred_local_owner_store(pending, point, original_points)))
                     {
-                        let staged = cfg.local_borrow.and_then(|sealed| {
+                        let staged = cfg.local_borrow.filter(|_| !state.projected.live_loans).and_then(|sealed| {
                             if !target.projections.is_empty() || !matches!(&target.place, ScalarPlace::Name { .. }) {
                                 return None;
                             }
@@ -8692,7 +8831,7 @@ fn transfer_reference_facts(
                                         .is_some_and(|origins| origins.contains(&parent.origin)))
                             }
                         };
-                        if check && !state.bindings.is_empty() {
+                        if check && (!state.bindings.is_empty() || state.projected.live_loans) {
                             let access = if loan.parent.is_none()
                                 && matches!(reference_root(&place.place), ScalarPlace::Name { .. })
                             {
@@ -8703,7 +8842,7 @@ fn transfer_reference_facts(
                             } else {
                                 LoanAccess::Borrow(loan)
                             };
-                            let staged = cfg.local_borrow.and_then(|sealed| {
+                            let staged = cfg.local_borrow.filter(|_| !state.projected.live_loans).and_then(|sealed| {
                                 let CfgPointKind::Borrow { place: original, loan: issuance } =
                                     &original_points[id.0].kind else { return None };
                                 if original != place || issuance != loan || loan.origin_place != *place
