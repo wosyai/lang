@@ -2387,6 +2387,7 @@ impl SymbolicRootProof for SelectedSymbolicProof<'_, '_> {
                 if !tautological(proof) {
                     return Err(ProjectCheck::Unsupported);
                 }
+                let proof_bound = proof.bound.literal().ok_or(ProjectCheck::Unsupported)?;
                 let MainFlowAuthoredShows::Single(step) = shows else {
                     let MainFlowAuthoredShows::Multiple { first_span, groups } = shows else {
                         return Err(ProjectCheck::Unsupported);
@@ -2430,14 +2431,14 @@ impl SymbolicRootProof for SelectedSymbolicProof<'_, '_> {
                             }
                         } else if failed_step.is_none() && !failed_goal {
                             let rejected = proof.relation.complement();
-                            let point = if rejected.accepts(lo.cmp(proof.bound)) {
+                            let point = if rejected.accepts(lo.cmp(proof_bound)) {
                                 Some(Lower)
-                            } else if lo != hi && rejected.accepts(hi.cmp(proof.bound)) {
+                            } else if lo != hi && rejected.accepts(hi.cmp(proof_bound)) {
                                 Some(Upper)
-                            } else if rejected.accepts(std::cmp::Ordering::Equal) && lo < proof.bound && proof.bound < hi
-                                && domain.is_some_and(|domain| domain.covers_closed(proof.bound, proof.bound))
+                            } else if rejected.accepts(std::cmp::Ordering::Equal) && lo < proof_bound && proof_bound < hi
+                                && domain.is_some_and(|domain| domain.covers_closed(proof_bound, proof_bound))
                             {
-                                Some(Bound(proof.bound))
+                                Some(Bound(proof_bound))
                             } else {
                                 None
                             };
@@ -2462,7 +2463,7 @@ impl SymbolicRootProof for SelectedSymbolicProof<'_, '_> {
                         relation: step.relation, bound: &step.bound, failure: None,
                     },
                     super::checker_flow::SymbolicLiteralCheck {
-                        relation: proof.relation, bound: proof.bound, failure: None,
+                        relation: proof.relation, bound: proof_bound, failure: None,
                     },
                 ];
                 let count = if step.same_bound && step.relation == proof.relation { 1 } else { 2 };
@@ -2488,21 +2489,22 @@ impl SymbolicRootProof for SelectedSymbolicProof<'_, '_> {
             _ => return Err(ProjectCheck::Unsupported),
         };
         if rest.is_empty() {
+            let first_bound = first.bound.literal().ok_or(ProjectCheck::Unsupported)?;
             let candidate = group.issuer.as_ref().filter(|_| first.proof_source == source);
             let (active, directives, returned, failure) = if candidate.is_some() {
                 super::checker_flow::collect_ordered_root_literal_proof::<true>(
-                    calls, &function.body, first.relation, first.bound, None, Some(first.filter),
+                    calls, &function.body, first.relation, first_bound, None, Some(first.filter),
                 )
             } else {
                 super::checker_flow::collect_ordered_root_literal_proof::<false>(
-                    calls, &function.body, first.relation, first.bound, predicate, None,
+                    calls, &function.body, first.relation, first_bound, predicate, None,
                 )
             }.ok_or(ProjectCheck::Unsupported)?;
             if returned && failure.is_none() {
                 if let Some(plan) = candidate {
                     let summary = VerifiedSymbolicEquality {
                         target, canonical_target: plan.canonical_target, layout: plan.layout,
-                        body: plan.body, bound: first.bound, shared: std::cell::OnceCell::new(),
+                        body: plan.body, bound: first_bound, shared: std::cell::OnceCell::new(),
                         guards: VerifiedSymbolicGuards::Bare(first.guard.comparisons.first().map(|guard| ImportedEntryGuard {
                             slot: guard.slot, relation: guard.relation, bound: guard.bound,
                         })),
@@ -2519,9 +2521,10 @@ impl SymbolicRootProof for SelectedSymbolicProof<'_, '_> {
             return Ok(Some(active || returned));
         }
         let proofs = std::iter::once(first).chain(rest);
-        let mut checks = proofs.clone().map(|proof| super::checker_flow::SymbolicLiteralCheck {
-            relation: proof.relation, bound: proof.bound, failure: None,
-        }).collect::<Vec<_>>();
+        let mut checks = proofs.clone().map(|proof| {
+            let bound = proof.bound.literal().ok_or(ProjectCheck::Unsupported)?;
+            Ok(super::checker_flow::SymbolicLiteralCheck { relation: proof.relation, bound, failure: None })
+        }).collect::<Result<Vec<_>, ProjectCheck>>()?;
         let (active, directives, returned) = super::checker_flow::collect_ordered_root_literal_proofs::<false>(
             calls, &function.body, &mut checks,
         ).ok_or(ProjectCheck::Unsupported)?;
@@ -2648,6 +2651,31 @@ impl ShowEqualityIndex {
 }
 
 #[cfg(feature = "internal-checker")]
+enum MainFlowProofBound<'a> {
+    Literal(&'a BigInt),
+    Entry(usize),
+}
+
+#[cfg(feature = "internal-checker")]
+impl<'a> MainFlowProofBound<'a> {
+    fn literal(&self) -> Option<&'a BigInt> {
+        match self {
+            Self::Literal(value) => Some(value),
+            Self::Entry(_) => None,
+        }
+    }
+
+    fn for_actual<'call>(&self, arguments: &[&'call BigInt]) -> Option<&'call BigInt>
+    where 'a: 'call,
+    {
+        match self {
+            Self::Literal(value) => Some(value),
+            Self::Entry(slot) => arguments.get(*slot).copied(),
+        }
+    }
+}
+
+#[cfg(feature = "internal-checker")]
 struct MainFlowProofCase<'a> {
     proof_source: &'a SourceIdentity,
     proof: ByteSpan,
@@ -2655,15 +2683,17 @@ struct MainFlowProofCase<'a> {
     guard: CheckedIntegerGuardSlots<'a>,
     filter: &'a [CheckerPredicate],
     relation: IntegerRelation,
-    bound: &'a BigInt,
+    bound: MainFlowProofBound<'a>,
 }
 
 #[cfg(feature = "internal-checker")]
 impl<'a> MainFlowProofCase<'a> {
     fn prepare(plan: &'a PlannedModuleProof<'a>, root: &SourceIdentity) -> Result<MainFlowProofPlan<'a>, ProjectCheck> {
         let (relation, bound) = match &plan.typed.goal {
-            TypedProofGoal::Literal { relation, bound, .. } => (relation, bound),
-            TypedProofGoal::Universal { relation, bound } if plan.steps.items.is_empty() => (relation, bound),
+            TypedProofGoal::Literal { relation, bound, .. } => (relation, MainFlowProofBound::Literal(bound)),
+            TypedProofGoal::Universal { relation, bound } if plan.steps.items.is_empty() => (relation, MainFlowProofBound::Literal(bound)),
+            TypedProofGoal::EntryComparison { slot, relation } if plan.steps.items.is_empty() =>
+                (relation, MainFlowProofBound::Entry(*slot)),
             _ => return Err(ProjectCheck::Unsupported),
         };
         if &plan.typed.target.source != root {
@@ -2699,7 +2729,7 @@ impl<'a> MainFlowProofCase<'a> {
                     Some(MainFlowAuthoredShows::Entry { span, slot, relation })
                 } else {
                     let (relation, literal) = checked_literal(claim)?;
-                    let same_bound = literal.as_ref() == bound;
+                    let same_bound = bound.literal() == Some(literal.as_ref());
                     Some(MainFlowAuthoredShows::Single(MainFlowLiteralShow { span, relation, bound: literal, same_bound }))
                 }
             }
@@ -2956,7 +2986,11 @@ impl ActualIntegerObserver for MainFlowProofObserver<'_> {
                         continue;
                     }
                     self.active = true;
-                    if !proof.relation.accepts(value.cmp(proof.bound)) && !emit(proof, None) {
+                    let Some(bound) = proof.bound.for_actual(arguments) else {
+                        self.incomplete = true;
+                        return;
+                    };
+                    if !proof.relation.accepts(value.cmp(bound)) && !emit(proof, None) {
                         self.incomplete = true;
                         return;
                     }
@@ -2969,6 +3003,10 @@ impl ActualIntegerObserver for MainFlowProofObserver<'_> {
                 }
                 proofs.seen = true;
                 for (proof, step) in cases {
+                    let Some(bound) = proof.bound.for_actual(arguments) else {
+                        self.incomplete = true;
+                        return;
+                    };
                     let mut applies = || {
                         if !proof.guard.accepts(arguments) {
                             return false;
@@ -2985,7 +3023,7 @@ impl ActualIntegerObserver for MainFlowProofObserver<'_> {
                             if !step.relation.accepts(comparison) {
                                 Some(step.span)
                             } else {
-                                let ordering = if step.same_bound { comparison } else { value.cmp(proof.bound) };
+                                let ordering = if step.same_bound { comparison } else { value.cmp(bound) };
                                 if proof.relation.accepts(ordering) {
                                     continue;
                                 }
@@ -2997,7 +3035,7 @@ impl ActualIntegerObserver for MainFlowProofObserver<'_> {
                                 continue;
                             }
                             let failed = first_failed_show(groups, value);
-                            if failed.is_none() && proof.relation.accepts(value.cmp(proof.bound)) {
+                            if failed.is_none() && proof.relation.accepts(value.cmp(bound)) {
                                 continue;
                             }
                             failed
@@ -3012,14 +3050,14 @@ impl ActualIntegerObserver for MainFlowProofObserver<'_> {
                             }
                             if !relation.accepts(value.cmp(*argument)) {
                                 Some(*span)
-                            } else if proof.relation.accepts(value.cmp(proof.bound)) {
+                            } else if proof.relation.accepts(value.cmp(bound)) {
                                 continue;
                             } else {
                                 None
                             }
                         }
                         None => {
-                            if !applies() || proof.relation.accepts(value.cmp(proof.bound)) {
+                            if !applies() || proof.relation.accepts(value.cmp(bound)) {
                                 continue;
                             }
                             None
@@ -8314,6 +8352,53 @@ mod tests {
 
     #[cfg(feature = "internal-checker")]
     #[test]
+    fn ordered_main_flow_bare_old_goal_uses_distinct_actual_snapshots() {
+        let app = source("src/main.w", "ordered-automatic-proof-actual-old-goal");
+        let program = r#"%%start
+            i16(i16, i16) choose = fn(left, right) { if (right < 0) { left } else { right } };
+            proof identity for choose(entry, selector) -> (out)
+                where (entry >= -5) ensures (out == core.old(entry)) {}
+        %%end"#;
+        let actual = program.replace("%%end", &format!(r#"
+            i16 passes = choose(2, -3);
+            i16 first = choose(4, 8);
+            core.require(false, {OUTPUT});
+            i16 second = choose(4, 8);
+            i16 excluded = choose(-6, 8);
+        %%end"#));
+        let run = |text: &str, scope| {
+            let (_, proof) = crate::parse_proof_source(app.clone(), text.to_owned(), &[])
+                .unwrap_or_else(|_| panic!("valid actual entry-goal proof"));
+            check_loaded_ordered_proof_diagnostics(
+                Vec::new(), vec![(proof, Vec::new())], vec![app.clone()], inputs(), scope,
+            )
+        };
+        for scope in [ScalarCheckerScope::MainFlowOnly, ScalarCheckerScope::CurrentPackage] {
+            let receipt = run(&actual, scope).unwrap();
+            assert!(receipt.active && receipt.directives.len() == 1 && receipt.symbolic_diagnostic.is_none());
+            let [first, second] = receipt.diagnostics.as_slice() else { panic!("distinct repeated call failures"); };
+            let snippet = |span: ByteSpan| &actual[span.start as usize..span.end as usize];
+            assert_eq!(snippet(first.goal.range), "out == core.old(entry)");
+            assert_eq!(first.goal, second.goal);
+            assert!(first.failed_step.is_none() && second.failed_step.is_none());
+            assert_eq!(snippet(first.invocation.call.range), "choose(4, 8)");
+            assert_eq!(snippet(second.invocation.call.range), "choose(4, 8)");
+            assert_ne!(first.invocation.call.range, second.invocation.call.range);
+            assert!(!Rc::ptr_eq(&first.invocation, &second.invocation));
+            assert_eq!(first.invocation.arguments, [(ScalarType::I16, BigInt::from(4)), (ScalarType::I16, BigInt::from(8))]);
+            assert_eq!(first.invocation.arguments, second.invocation.arguments);
+            assert_eq!(first.invocation.returned, BigInt::from(8));
+            assert_eq!(second.invocation.returned, BigInt::from(8));
+            assert_eq!((first.invocation.directive_position, second.invocation.directive_position), (0, 1));
+        }
+        assert!(!run(program, ScalarCheckerScope::MainFlowOnly).unwrap().active);
+        assert!(matches!(run(program, ScalarCheckerScope::CurrentPackage), Err(ProjectCheck::Unsupported)));
+        let unknown = actual.replace("core.old(entry)", "core.old(unknown)");
+        assert!(matches!(run(&unknown, ScalarCheckerScope::MainFlowOnly), Err(ProjectCheck::InvalidProof)));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
     fn ordered_main_flow_auto_proof_old_show_uses_exact_checked_entry_slot() {
         let app = source("src/main.w", "ordered-automatic-proof-actual-old-show");
         let run = |text: &str, scope| {
@@ -8469,7 +8554,7 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
         let mut observer = MainFlowProofObserver::new((0, 0), (MainFlowProofCase {
             proof_source: &app, proof: span, goal: span, filter: &[],
             guard: CheckedIntegerGuardSlots { arity: 1, always_rejects: false, comparisons: Vec::new(), domain: None },
-            relation: IntegerRelation::from_operator(&BinaryOperator::LessEqual).unwrap(), bound: &bound,
+            relation: IntegerRelation::from_operator(&BinaryOperator::LessEqual).unwrap(), bound: MainFlowProofBound::Literal(&bound),
         }, None));
         let effects = OrderedFailures::default();
         observer.observe_initializer(
