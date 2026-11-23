@@ -88,6 +88,7 @@ pub(super) struct AggregateEmitter<'ctx, 'plan> {
     ordinary_committed: bool,
     ordinary_called: bool,
     literal_array_receipt: LiteralArrayReceipt<'ctx>,
+    pub(super) fresh_recommit_extent: Option<(usize, inkwell::values::IntValue<'ctx>)>,
     literal_array_branch_original: Option<LiteralArrayBranchOriginal<'ctx>>,
     base: Option<PointerValue<'ctx>>,
     registered_allocation: Option<String>,
@@ -126,6 +127,10 @@ fn literal_array_write(
 impl<'ctx, 'plan> AggregateEmitter<'ctx, 'plan> {
     pub(super) fn literal_array_replacement(&self, ordinal: usize) -> Option<usize> {
         literal_array_write(self.plan.literal_array, ordinal).map(|(destination, _, _)| destination)
+    }
+
+    pub(super) fn fresh_array_recommit(&self, ordinal: usize) -> Option<crate::scalar::ClosedFreshRecommit> {
+        self.plan.fresh_array_recommits.get(&ordinal).copied()
     }
 
     pub(super) fn same_array_rebind_destination(&self, ordinal: usize) -> Option<usize> {
@@ -192,6 +197,7 @@ impl<'ctx, 'plan> AggregateEmitter<'ctx, 'plan> {
             ordinary_committed: false,
             ordinary_called: false,
             literal_array_receipt: LiteralArrayReceipt::Awaiting,
+            fresh_recommit_extent: None,
             literal_array_branch_original: None,
             base: None,
             registered_allocation: None,
@@ -475,6 +481,26 @@ pub(super) fn capture_checked_array_argument_extent<'ctx>(
     values: &[EmitValue<'ctx>],
 ) -> Result<(), String> {
     let Some(aggregate) = state.aggregate.as_mut() else { return Ok(()) };
+    if !aggregate.plan.fresh_array_recommits.is_empty() {
+        let nodes = state.body_call_nodes.ok_or("missing fresh array recommit context")?;
+        if let Some(call) = nodes.expression_ordinal(expression) {
+            if let Some(recommit) = aggregate.fresh_array_recommit(call) {
+                if let (crate::scalar::RecommittedArrayExtent::Formal(slot), Some(occurrence)) =
+                    (recommit.size, recommit.argument)
+                {
+                    let argument = arguments.get(slot).ok_or("missing fresh array extent argument")?;
+                    let Some(EmitValue::Basic(BasicValueEnum::IntValue(extent))) = values.get(slot)
+                    else { return Err("fresh array extent is not an integer".into()) };
+                    if nodes.expression_ordinal(argument) != Some(occurrence)
+                        || extent.get_type().get_bit_width() != 64
+                        || aggregate.fresh_recommit_extent.replace((call, *extent)).is_some()
+                    {
+                        return Err("fresh array extent differs from prepared argument".into());
+                    }
+                }
+            }
+        }
+    }
     let Some(ClosedLiteralArray::Replacement { .. }) = aggregate.plan.literal_array else { return Ok(()) };
     let Some(nodes) = state.body_call_nodes else { return Err("missing checked extent call context".into()) };
     let Some(call) = nodes.expression_ordinal(expression) else { return Ok(()) };

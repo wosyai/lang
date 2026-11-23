@@ -65,7 +65,7 @@ pub enum ScalarType {
     Error,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub enum ScalarReferenceMutability {
     Shared,
     Mutable,
@@ -819,7 +819,7 @@ impl ReferenceAnalysisError {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct ScalarStructId {
     pub source: SourceIdentity,
     pub index: usize,
@@ -844,7 +844,7 @@ pub struct ScalarAutomaticReturnResult {
     pub state: ScalarAutomaticReturnResultState,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct ScalarEnumId {
     pub source: SourceIdentity,
     pub index: usize,
@@ -1017,7 +1017,7 @@ enum ScalarExpressionIdentity {
     Block(ScalarBlockIdentity),
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 enum ScalarTypeIdentity {
     Unit,
     Bool,
@@ -3705,7 +3705,7 @@ pub(crate) mod control;
 mod occurrence_obligations;
 mod reference;
 mod static_calls;
-pub(crate) use reference::aggregate::{mixed_owned_struct_result, mixed_owner_result_lanes, AggregateReservations, ArrayWriterSide, ClosedAggregates, ClosedBody, ClosedCall, ClosedInitializer, ClosedInitializerInput, ClosedInput, ClosedLiteralArray, ClosedLocalArrayRelease, ClosedReturn, FreshArrayExtent, ReplacementArrayExtent};
+pub(crate) use reference::aggregate::{mixed_owned_struct_result, mixed_owner_result_lanes, AggregateReservations, ArrayWriterSide, ClosedAggregates, ClosedBody, ClosedCall, ClosedFreshRecommit, ClosedInitializer, ClosedInitializerInput, ClosedInput, ClosedLiteralArray, ClosedLocalArrayRelease, ClosedReturn, FreshArrayExtent, RecommittedArrayExtent, ReplacementArrayExtent};
 pub(crate) use static_calls::PreparedProgram;
 pub use static_calls::{
     analyze_scalar_build, PreparedScalarProject, ScalarBuildValidation,

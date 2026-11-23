@@ -521,6 +521,7 @@ pub(super) struct AggregateEdgeState {
     array_return_forwarded: bool,
     array_conditional_output: Option<CfgPointId>,
     array_tail_dependency: Option<CfgPointId>,
+    array_last_recommit: Option<CfgPointId>,
     array_dependencies: BTreeSet<CfgPointId>,
     local_array: Option<LocalArrayLife>,
     literal_array_phase: LiteralArrayPhase,
@@ -614,10 +615,17 @@ impl ScopeEndpoint {
     }
 }
 
-#[derive(PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RecommittedArrayExtent {
+    Literal(u64),
+    Formal(usize),
+}
+
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct ArrayReturnPath {
     dependencies: BTreeSet<CfgPointId>,
     tail_call: Option<CfgPointId>,
+    last_producer: Option<CfgPointId>,
 }
 
 fn grounded_array_return_dependencies(
@@ -629,7 +637,9 @@ fn grounded_array_return_dependencies(
     let mut dependencies = BTreeSet::new();
     for path in paths {
         let path = path.as_ref()?;
-        if path.tail_call.is_some_and(|call| !path.dependencies.contains(&call)) {
+        if path.tail_call.is_some_and(|call| !path.dependencies.contains(&call))
+            || path.last_producer.is_some_and(|call| !path.dependencies.contains(&call))
+        {
             return None;
         }
         let mut self_call = false;
@@ -741,6 +751,7 @@ pub(super) struct AggregateFlowResult {
     array_conditional_forwarded: bool,
     pub(super) array_calls: BTreeMap<CfgPointId, (OccurrenceOrdinal, CfgPointId, ReferenceBindingId)>,
     pub(super) array_returns: BTreeSet<Option<ArrayReturnPath>>,
+    pub(super) fresh_recommit_leaf: Option<RecommittedArrayExtent>,
     pub(super) array_rebinds: BTreeMap<CfgPointId, (CfgPointId, ReferenceBindingId, OccurrenceOrdinal)>,
     pub(super) local_array_failure_arms: BTreeMap<usize, Option<CfgPointId>>,
     pub(super) allocation_slots: BTreeMap<CfgPointId, (usize, usize)>,
@@ -868,7 +879,7 @@ impl AggregateFlowResult {
         self.proved_literal_array_route_ref().is_some()
             || (self.checked_producer_authoritative && !self.checked_producer_backing.is_empty())
             || self.checked_backing_assignment.is_some() || self.checked_backing_forward.is_some()
-            || self.scalar_descriptor_assignment.is_some() || !self.array_returns.is_empty() || !self.array_rebinds.is_empty()
+            || self.scalar_descriptor_assignment.is_some() || self.fresh_recommit_leaf.is_some() || !self.array_returns.is_empty() || !self.array_rebinds.is_empty()
             || self.returning_leaf || !self.calls.is_empty() || !self.mixed_result_calls.is_empty() || !self.returns.is_empty() || !self.formals.is_empty() || !self.inputs.is_empty() || !self.raw_terminals.is_empty() || !self.read_formals.is_empty()
     }
 }
@@ -1376,6 +1387,7 @@ impl AggregateFlowFacts {
                         state.array_formal_pending = None;
                         state.array_formal_live = true;
                         state.array_dependencies.insert(*rhs_point);
+                        state.array_last_recommit = Some(*rhs_point);
                     } else {
                         result.array_invalid = true;
                     }
@@ -1394,6 +1406,7 @@ impl AggregateFlowFacts {
                         state.array_return_forwarded.then(|| ArrayReturnPath {
                             dependencies: state.array_dependencies.clone(),
                             tail_call: state.array_tail_dependency,
+                            last_producer: state.array_tail_dependency.or(state.array_last_recommit),
                         })
                     );
                 }
@@ -2031,6 +2044,14 @@ pub(crate) enum ClosedLiteralArray {
     },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ClosedFreshRecommit {
+    pub(crate) destination: usize,
+    pub(crate) size: RecommittedArrayExtent,
+    pub(crate) argument: Option<usize>,
+    pub(crate) forward: bool,
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct ClosedBody {
     pub(crate) scalar_descriptor_assignment: Option<(usize, usize, usize)>,
@@ -2049,6 +2070,7 @@ pub(crate) struct ClosedBody {
     pub(crate) input_mixed: bool,
     // Checked primary call occurrence -> exact destination place occurrence.
     pub(crate) same_array_rebinds: BTreeMap<usize, usize>,
+    pub(crate) fresh_array_recommits: BTreeMap<usize, ClosedFreshRecommit>,
     pub(crate) local_array_failure: Option<ClosedLocalArrayRelease>,
     pub(crate) literal_array: Option<ClosedLiteralArray>,
     pub(crate) input_release: Option<CfgPointId>,
@@ -2792,6 +2814,262 @@ fn install_literal_array_plans(
     }
 }
 
+fn recommit_extent_occurrence(
+    body: &Body<'_>, point: CfgPointId, ordinal: OccurrenceOrdinal, position: usize,
+) -> Option<OccurrenceOrdinal> {
+    let CfgPointKind::Call { output: 0, argument_points, .. } = &body.cfg.initial_points.get(point.0)?.kind
+    else { return None };
+    let OccurrenceNode::Expression(argument) = *body.sites.structure.edges.get(&(
+        OccurrenceParent::Expression(ordinal), OccurrenceEdge::CallArgument(position),
+    ))? else { return None };
+    (body.sites.structure.checked_types.expressions.get(&argument) == Some(&ScalarType::U64)
+        && argument_points.get(position).is_some()).then_some(argument)
+}
+
+fn formal_recommit_extent(
+    body: &Body<'_>, point: CfgPointId, ordinal: OccurrenceOrdinal, extent: RecommittedArrayExtent,
+) -> Option<RecommittedArrayExtent> {
+    let RecommittedArrayExtent::Formal(position) = extent else { return Some(extent) };
+    let argument = recommit_extent_occurrence(body, point, ordinal, position)?;
+    let PlainNameIdentity::Lexical(identity) = body.sites.prepared_plain_name(argument)? else { return None };
+    let CfgPointKind::Call { argument_points, .. } = &body.cfg.initial_points.get(point.0)?.kind
+    else { return None };
+    let CfgPointKind::Read { binding } = &body.cfg.initial_points.get(argument_points[position].0)?.kind
+    else { return None };
+    let formal = body.sites.boundary.parameters.iter().find(|slot| slot.span == identity.declaration_span)?;
+    (binding == identity && identity.source == *body.source && formal.ty == ScalarType::U64
+        && identity.function_span == body.cfg.initial_points.first()?.source_span.range)
+        .then_some(RecommittedArrayExtent::Formal(formal.ordinal))
+}
+
+fn fresh_recursive_recommit(
+    body: &Body<'_>, key: BodyKey, bodies: &BTreeMap<BodyKey, Body<'_>>,
+    declarations: &HashMap<(&SourceIdentity, ByteSpan), (usize, usize)>,
+) -> Option<RecommittedArrayExtent> {
+    let facts = body.facts?;
+    if !body.is_monomorphic || !facts.array_neutral || facts.array_invalid
+        || facts.array_conditional_forwarded
+    {
+        return None;
+    }
+    let mut ground = None;
+    let mut recursive = None;
+    for path in &facts.array_returns {
+        let path = path.as_ref()?;
+        let point = path.last_producer?;
+        if path.tail_call.is_some() || path.dependencies.len() != 1 || !path.dependencies.contains(&point) {
+            return None;
+        }
+        let (ordinal, _, _) = facts.array_calls.get(&point)?;
+        let target = target_body(declarations, body.cfg, point)?;
+        if target == key {
+            // The ordinary branch-only forwarding slice has one exact self call.
+            if recursive.replace((point, *ordinal)).is_some() {
+                return None;
+            }
+        } else {
+            let leaf = bodies.get(&target)?;
+            if !leaf.is_monomorphic || leaf.source != body.source {
+                return None;
+            }
+            let extent = formal_recommit_extent(body, point, *ordinal, leaf.facts?.fresh_recommit_leaf?)?;
+            if ground.replace(extent).is_some_and(|prior| prior != extent) {
+                return None;
+            }
+        }
+    }
+    let extent = ground?;
+    if facts.array_rebinds.len() != facts.array_returns.len() || facts.array_calls.len() != facts.array_returns.len()
+        || body.cfg.initial_points.iter().any(|point| match &point.kind {
+            CfgPointKind::ReadPlace { .. } => true,
+            CfgPointKind::Assign { target, .. } => match extent {
+                RecommittedArrayExtent::Literal(_) => false,
+                RecommittedArrayExtent::Formal(slot) => body.sites.boundary.parameters.get(slot)
+                    .is_none_or(|formal| target.binding.declaration_span == formal.span),
+            },
+            _ => false,
+        })
+    {
+        return None;
+    }
+    let (point, ordinal) = recursive?;
+    (formal_recommit_extent(body, point, ordinal, extent)? == extent).then_some(extent)
+}
+
+#[derive(Eq, Hash, PartialEq)]
+struct FreshRecursiveCallSignature(Vec<ScalarTypeIdentity>, Vec<ScalarTypeIdentity>);
+
+fn fresh_recursive_call_signature<'a>(
+    parameters: impl Iterator<Item = &'a ScalarType>, outputs: impl Iterator<Item = &'a ScalarType>,
+) -> FreshRecursiveCallSignature {
+    FreshRecursiveCallSignature(parameters.map(scalar_type_identity).collect(), outputs.map(scalar_type_identity).collect())
+}
+
+fn could_call_fresh_recursive_array(
+    signature: Option<&CheckedCallSignature>, candidates: &HashSet<FreshRecursiveCallSignature>,
+) -> bool {
+    signature.is_none_or(|sig| neutral_array_signature(&sig.parameters, &sig.outputs)
+        && candidates.contains(&fresh_recursive_call_signature(
+            sig.parameters.iter(), sig.outputs.outputs.iter().map(|output| &output.ty),
+        )))
+}
+
+fn install_fresh_recursive_recommits<'a>(
+    reservations: &AggregateReservations, module_at: &impl Fn(usize) -> Option<ModuleInput<'a>>,
+    bodies: &BTreeMap<BodyKey, Body<'_>>, declarations: &HashMap<(&SourceIdentity, ByteSpan), (usize, usize)>,
+    result: &mut ClosedAggregates,
+) -> Result<(), String> {
+    let mut returns = BTreeMap::new();
+    for (&key, body) in bodies {
+        if let Some(extent) = fresh_recursive_recommit(body, key, bodies, declarations) {
+            returns.insert(key, extent);
+        }
+    }
+    if returns.is_empty() { return Ok(()) }
+    let signatures: HashSet<_> = returns.keys().map(|key| {
+        let boundary = &bodies[key].sites.boundary;
+        fresh_recursive_call_signature(boundary.parameters.iter().map(|slot| &slot.ty),
+            boundary.results.iter().map(|slot| &slot.ty))
+    }).collect();
+    let mut planned = Vec::new();
+    for (&key, body) in bodies {
+        let Some(facts) = body.facts.filter(|_| body.is_monomorphic) else { continue };
+        if facts.array_rebinds.is_empty() { continue }
+        let forward = returns.contains_key(&key);
+        let local = (!forward).then(|| facts.allocation_slots.keys().filter_map(|bind| {
+            match &body.cfg.initial_points.get(bind.0)?.kind {
+                CfgPointKind::Bind { binding } => Some(binding),
+                _ => None,
+            }
+        }).collect::<HashSet<_>>());
+        for (&assign, &(call, ref binding, destination)) in &facts.array_rebinds {
+            let Some(target) = target_body(declarations, body.cfg, call) else { continue };
+            let Some(callee) = bodies.get(&target).filter(|callee| callee.source == body.source) else { continue };
+            let extent = if forward {
+                returns.get(&target).copied().or_else(|| callee.facts?.fresh_recommit_leaf)
+            } else {
+                if body.cfg.initial_points[assign.0].scope != ReferenceScopeId(0)
+                    || !local.as_ref().is_some_and(|owners| owners.contains(binding))
+                {
+                    continue;
+                }
+                returns.get(&target).copied()
+            };
+            let Some(size) = extent else { continue };
+            let Some(&(ordinal, _, _)) = facts.array_calls.get(&call) else { continue };
+            let argument = match size {
+                RecommittedArrayExtent::Literal(_) => None,
+                RecommittedArrayExtent::Formal(position) => {
+                    let Some(occurrence) = recommit_extent_occurrence(body, call, ordinal, position) else { continue };
+                    Some(occurrence.0)
+                }
+            };
+            planned.push((key, target, ordinal, ClosedFreshRecommit {
+                destination: destination.0, size, argument, forward,
+            }));
+        }
+    }
+    let covered: HashSet<_> = planned.iter().map(|&(caller, target, ordinal, _)| (caller, target, ordinal)).collect();
+    let mut definitions = HashMap::<&SourceIdentity, HashMap<ByteSpan, BodyKey>>::new();
+    for &key @ (module, item, _) in returns.keys() {
+        let input = module_at(module).ok_or("missing fresh array result module")?;
+        let Some(ScalarItem::Function(function)) = input.items.get(item) else {
+            return Err("missing fresh array result declaration".into());
+        };
+        definitions.entry(input.source).or_default().insert(function.name_span, key);
+    }
+    let declaration_key = |source: &SourceIdentity, span: ByteSpan| {
+        definitions.get(source).and_then(|functions| functions.get(&span)).copied()
+    };
+    let mut rejected = BTreeSet::new();
+    for &caller @ (module, item, arm) in reservations.bodies.keys() {
+        let input = module_at(module).ok_or("missing fresh return use module")?;
+        let sites = input.calls.function_body(item, arm).ok_or("missing fresh return use body")?;
+        if !matches!(&sites.plain_names, PlainNameFacts::Prepared(_))
+            || sites.allocation_length_calls.iter().any(|ordinal| !sites.allocation_length_call_targets.contains_key(ordinal))
+        {
+            return Err(format!("cannot verify fresh array return without prepared ownership uses in {:?}", input.source));
+        }
+        for escape in &sites.callable_escapes {
+            if let Some(key) = declaration_key(&escape.source, escape.range) {
+                rejected.insert(key);
+            }
+        }
+        let direct_result = |target: &ResolvedCallTarget, ordinal: Option<OccurrenceOrdinal>| {
+            match target {
+                ResolvedCallTarget::ModuleCallable { source, declaration_span, concrete } => {
+                    declaration_key(source, *declaration_span)
+                        .filter(|key| !matches!(concrete, ConcreteCallSelection::Declaration)
+                            || !ordinal.is_some_and(|ordinal| covered.contains(&(caller, *key, ordinal))))
+                }
+                _ => None,
+            }
+        };
+        for (&ordinal, target) in &sites.allocation_length_call_targets {
+            if could_call_fresh_recursive_array(sites.checked_call_signatures.get(&ordinal), &signatures)
+                && matches!(target, ResolvedCallTarget::LocalCallable(_) | ResolvedCallTarget::CallableField { .. })
+            {
+                return Err(format!("cannot verify indirect fresh array use in {:?}", input.source));
+            }
+            if let Some(key) = direct_result(target, None) {
+                rejected.insert(key);
+            }
+        }
+        for call in &sites.call_occurrences {
+            let target = &sites.sites.get(call.site).ok_or("missing fresh return call occurrence")?.target;
+            if matches!(target, ResolvedCallTarget::LocalCallable(_) | ResolvedCallTarget::CallableField { .. })
+                && could_call_fresh_recursive_array(sites.checked_call_signatures.get(&call.ordinal), &signatures)
+            {
+                return Err(format!("cannot verify indirect fresh array use in {:?}", input.source));
+            }
+            if let Some(key) = direct_result(target, Some(call.ordinal)) {
+                rejected.insert(key);
+            }
+        }
+    }
+    for &module in &reservations.modules {
+        let input = module_at(module).ok_or("missing fresh return use module")?;
+        let ModuleInitializationDetail::Occurrences(topology) = &input.calls.initialization.detail else {
+            return Err("missing fresh return initializer use inventory".into());
+        };
+        for escape in &topology.callable_escapes {
+            if let Some(key) = declaration_key(&escape.source, escape.range) {
+                rejected.insert(key);
+            }
+        }
+        for &ordinal in &topology.calls {
+            match input.calls.initialization.call_target(ordinal) {
+                Some(ModuleInitializationCallTarget::Direct { declaration, .. }
+                    | ModuleInitializationCallTarget::Generic { declaration, .. }) => {
+                    if let Some(key) = declaration_key(&declaration.source, declaration.range) {
+                        rejected.insert(key);
+                    }
+                }
+                Some(ModuleInitializationCallTarget::CallableBinding(_) | ModuleInitializationCallTarget::CallableField { .. })
+                    if could_call_fresh_recursive_array(topology.checked_call_signatures.get(&ordinal), &signatures) =>
+                        return Err(format!("cannot verify indirect fresh array initializer use in {:?}", input.source)),
+                None => return Err(format!("missing fresh array initializer call target in {:?}", input.source)),
+                _ => {}
+            }
+        }
+    }
+    if let Some(key) = rejected.first() {
+        return Err(format!("fresh recursive array result has an unsupported ownership receiver in {:?}", bodies[key].source));
+    }
+    for (key, target, ordinal, receipt) in planned {
+        let plan = result.bodies.entry(key).or_default();
+        let has_literal_replacement = matches!(plan.literal_array,
+            Some(ClosedLiteralArray::Replacement { call, unit, .. })
+                if call == ordinal.0 || unit.and_then(|unit| unit.other_writer)
+                    .is_some_and(|writer| writer.call == ordinal.0));
+        if plan.same_array_rebinds.contains_key(&ordinal.0) || has_literal_replacement {
+            return Err(format!("overlapping array ownership receipts at {key:?} for {target:?}"));
+        }
+        plan.fresh_array_recommits.insert(ordinal.0, receipt);
+    }
+    Ok(())
+}
+
 fn closed_aggregates<'a>(
     reservations: &AggregateReservations,
     module_at: impl Fn(usize) -> Option<ModuleInput<'a>>,
@@ -2986,10 +3264,11 @@ fn closed_aggregates<'a>(
             arm: *arm,
         });
     }
-    let finalize_cohorts = |mut result: ClosedAggregates| {
+    let finalize_cohorts = |mut result: ClosedAggregates| -> Result<ClosedAggregates, String> {
         install_ordinary(&mut result);
         install_literal_array_plans(&literal_array_callers, &bodies, &declarations, &mut result);
-        result
+        install_fresh_recursive_recommits(reservations, &module_at, &bodies, &declarations, &mut result)?;
+        Ok(result)
     };
     if outgoing.is_empty() {
         let mut producers = bodies.iter().filter_map(|(&key, body)| {
@@ -3070,8 +3349,9 @@ fn closed_aggregates<'a>(
                 }
             }
         }
-        return Ok(finalize_cohorts(result));
+        return finalize_cohorts(result);
     }
+
     let mut initializer_uses = Vec::new();
     let mut initializer_escapes = Vec::new();
     for region in initializers {
@@ -3514,7 +3794,7 @@ fn closed_aggregates<'a>(
             ));
         }
         if returning || !plan.calls.is_empty() || plan.input.is_some() || !plan.input_calls.is_empty()
-            || !plan.same_array_rebinds.is_empty() || plan.scalar_descriptor_assignment.is_some()
+            || !plan.same_array_rebinds.is_empty() || !plan.fresh_array_recommits.is_empty() || plan.scalar_descriptor_assignment.is_some()
             || plan.checked_backing_wrapper.is_some()
         {
             result.bodies.insert(key, plan);
@@ -3526,7 +3806,7 @@ fn closed_aggregates<'a>(
         }
         result.initializers = initializer_plans;
     }
-    Ok(finalize_cohorts(result))
+    finalize_cohorts(result)
 }
 
 pub(in crate::scalar) fn close_installed(
@@ -3567,6 +3847,96 @@ impl ProjectReferenceResults {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn indirect_fresh_array_use_requires_the_same_normalized_signature() {
+        let row = |element: ScalarType, count: usize, result: ScalarType, span: ByteSpan| CheckedCallSignature {
+            parameters: std::iter::once(ScalarType::RuntimeArray { element: Box::new(element.clone()), span })
+                .chain(std::iter::repeat_n(ScalarType::U64, count)).collect(),
+            outputs: ScalarOutputSequence {
+                outputs: vec![ScalarOutput { ty: ScalarType::RuntimeArray { element: Box::new(element), span }, span },
+                    ScalarOutput { ty: result, span }],
+                span,
+            },
+            overload: None,
+            overload_origin: None,
+        };
+        let base = row(ScalarType::U8, 3, ScalarType::U64, ByteSpan::new(1, 4));
+        let candidates = HashSet::from([fresh_recursive_call_signature(
+            base.parameters.iter(), base.outputs.outputs.iter().map(|output| &output.ty),
+        )]);
+        let other_site = ByteSpan::new(5, 9);
+        assert!(could_call_fresh_recursive_array(None, &candidates));
+        assert!(could_call_fresh_recursive_array(Some(&row(ScalarType::U8, 3, ScalarType::U64, other_site)), &candidates));
+        assert!(!could_call_fresh_recursive_array(Some(&row(ScalarType::U16, 3, ScalarType::U64, other_site)), &candidates));
+        assert!(!could_call_fresh_recursive_array(Some(&row(ScalarType::U8, 2, ScalarType::U64, other_site)), &candidates));
+        assert!(!could_call_fresh_recursive_array(Some(&row(ScalarType::U8, 3, ScalarType::Bool, other_site)), &candidates));
+    }
+
+    #[test]
+    fn recursive_array_replacement_closes_typed_owner_receipts() {
+        let text = include_str!("../../../tests/fixtures/recursive-replacement.w");
+        let source = SourceIdentity::new("project".into(), "workbench".into(), "src/recursive_replacement.w".into(), "r1".into());
+        let parsed = crate::parse_source(source.clone(), text.into(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let prepared = prepare_scalar_project(
+            vec![(derive_scalar_declarations_from_cst(parsed.result.canonical_cst()), Vec::new())],
+            vec![source.clone()],
+            ScalarPreparationInputs { target_layout: ScalarTargetLayout::NATIVE64 },
+        ).unwrap_or_else(|failure| panic!("{:?}", failure.diagnostics));
+        let module = &prepared.project().modules[0];
+        let mut results = BTreeMap::new();
+        let mut declarations = HashMap::new();
+        let mut lookup = HashMap::new();
+        for (item, declaration) in module.items.iter().enumerate() {
+            let ScalarItem::Function(function) = declaration else { continue };
+            let key = (0, item, None);
+            let sites = prepared.function_calls(0, item);
+            let mut errors = Vec::new();
+            let result = derive_function_reference_result(&source, function, &HashSet::new(), sites,
+                &module.structs, &module.enums, None, true, &mut errors);
+            assert!(errors.is_empty(), "{errors:?}");
+            results.insert(key, (result, sites));
+            lookup.insert(function.name.as_str(), key);
+            declarations.insert((&source, function.name_span), (0, item));
+        }
+        let mut bodies = BTreeMap::new();
+        for (&key, (result, sites)) in &results {
+            bodies.insert(key, Body { facts: Some(&result.aggregate), cfg: &result.cfg, sites, source: &source,
+                is_monomorphic: true, supports_input_result: false });
+        }
+        let leaf = &results[&lookup["replace_owner"]].0;
+        assert_eq!(leaf.aggregate.fresh_recommit_leaf, Some(RecommittedArrayExtent::Formal(1)),
+            "fresh leaf declined: {:?}", leaf.cfg.initial_points);
+        let key = lookup["recursive_return"];
+        let recursive = &results[&key].0;
+        let facts = &recursive.aggregate;
+        assert!(facts.array_neutral && !facts.array_invalid && !facts.array_conditional_forwarded,
+            "recursive effects declined: neutral={}, invalid={}, conditional={}; points={:?}",
+            facts.array_neutral, facts.array_invalid, facts.array_conditional_forwarded, recursive.cfg.initial_points);
+        assert_eq!(facts.array_returns.len(), 2, "return paths: {:?}", facts.array_returns);
+        assert_eq!(facts.array_rebinds.len(), 2, "recommits: {:?}", facts.array_rebinds);
+        assert_eq!(facts.array_calls.len(), 2, "calls: {:?}", facts.array_calls);
+        assert_eq!(fresh_recursive_recommit(&bodies[&key], key, &bodies, &declarations),
+            Some(RecommittedArrayExtent::Formal(2)), "recursive result declined: {:?}", facts.array_returns);
+        let caller = &results[&lookup["recursive_replacement"]].0;
+        assert_eq!(caller.aggregate.array_rebinds.len(), 1, "outer recommit declined: {:?}", caller.cfg.initial_points);
+        assert_eq!(caller.aggregate.allocation_slots.len(), 1, "outer allocation: {:?}", caller.aggregate.allocation_slots);
+
+        let build = analyze_scalar_build(&prepared);
+        assert!(build.diagnostics().is_empty(), "{:?}", build.diagnostics());
+        let reservations = AggregateReservations {
+            bodies: lookup.values().copied().map(|key| (key, true)).collect(),
+            modules: vec![0],
+        };
+        let plans = build.aggregate(&reservations).expect("actual build ownership plans");
+        let forwards = &plans.bodies[&key].fresh_array_recommits;
+        assert_eq!(forwards.len(), 2);
+        assert!(forwards.values().all(|receipt| receipt.forward));
+        let receivers = &plans.bodies[&lookup["recursive_replacement"]].fresh_array_recommits;
+        assert_eq!(receivers.len(), 1);
+        assert!(receivers.values().all(|receipt| !receipt.forward));
+    }
 
     fn synthetic_literal_array_pair() -> LiteralArrayPair {
         let allocation = |bind, length, elements| LiteralArrayBind {
@@ -4279,10 +4649,12 @@ mod tests {
         let tail = || Some(ArrayReturnPath {
             dependencies: BTreeSet::from([call]),
             tail_call: Some(call),
+            last_producer: Some(call),
         });
         let base = || Some(ArrayReturnPath {
             dependencies: BTreeSet::new(),
             tail_call: None,
+            last_producer: None,
         });
         let resolve_self = |point| (point == call).then_some(body);
 
@@ -4305,6 +4677,7 @@ mod tests {
         let unlinked_tail = Some(ArrayReturnPath {
             dependencies: BTreeSet::new(),
             tail_call: Some(call),
+            last_producer: Some(call),
         });
         assert_eq!(
             grounded_array_return_dependencies(body, &BTreeSet::from([base(), unlinked_tail]), resolve_self),

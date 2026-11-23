@@ -3120,7 +3120,7 @@ fn emit_final_outputs<'ctx, 'module>(
         {
             record_forwarded_return_owner(context, state, expression, output.position)?;
         }
-        transfer_runtime_array_return(state, block, expression, &output.ty);
+        transfer_runtime_array_return(state, block, expression, ty);
         transfer_automatic_return_result(state, expression);
         return Ok(value);
     }
@@ -3229,7 +3229,7 @@ fn emit_project_final_outputs<'ctx, 'module>(
         {
             record_forwarded_return_owner(context, state, expression, output.position)?;
         }
-        transfer_runtime_array_return(state, block, expression, &output.ty);
+        transfer_runtime_array_return(state, block, expression, ty);
         transfer_automatic_return_result(state, expression);
         return Ok(value);
     }
@@ -3381,6 +3381,7 @@ struct AssignmentValue<'ctx> {
     runtime_array_source: Option<PointerValue<'ctx>>,
     checked_rebind_destination: Option<usize>,
     literal_array_replacement: Option<(usize, usize)>,
+    fresh_array_recommit: Option<(crate::scalar::ClosedFreshRecommit, inkwell::values::IntValue<'ctx>)>,
 }
 
 struct RuntimeArrayAssignment<'ctx> {
@@ -3388,6 +3389,7 @@ struct RuntimeArrayAssignment<'ctx> {
     previous: Option<ownership::RuntimeArrayRelease<'ctx>>,
     same_array_rebind: bool,
     literal_array_call: Option<usize>,
+    fresh_array_slots: Option<(PointerValue<'ctx>, PointerValue<'ctx>, inkwell::values::IntValue<'ctx>)>,
 }
 
 fn stage_runtime_array_assignments<'ctx>(
@@ -3459,6 +3461,7 @@ fn stage_runtime_array_assignments<'ctx>(
             staged.push(Some(RuntimeArrayAssignment {
                 owns: false, previous: None, same_array_rebind: false,
                 literal_array_call: Some(call),
+                fresh_array_slots: None,
             }));
             continue;
         }
@@ -3481,6 +3484,7 @@ fn stage_runtime_array_assignments<'ctx>(
                 previous: None,
                 same_array_rebind: true,
                 literal_array_call: None,
+                fresh_array_slots: None,
             }));
             continue;
         }
@@ -3490,6 +3494,36 @@ fn stage_runtime_array_assignments<'ctx>(
         };
         if !matches!(value.ty, ScalarType::RuntimeArray { .. }) {
             staged.push(None);
+            continue;
+        }
+        if let Some((proof, length)) = value.fresh_array_recommit {
+            if state.body_call_nodes.and_then(|nodes| nodes.place_ordinal(&target.place)) != Some(proof.destination)
+                || !matches!(destination, AssignmentDestination::Existing(_))
+                || !matches!(&value.value, EmitValue::Basic(BasicValueEnum::PointerValue(_)))
+                || retains_storage[position]
+            {
+                return Err("fresh owner recommit differs from prepared destination".into());
+            }
+            let previous = ownership::capture_runtime_array_release(context, state, name)?;
+            let fresh_array_slots = if proof.forward {
+                if previous.is_some() {
+                    return Err("forwarding fresh owner cannot discard a local allocation".into());
+                }
+                None
+            } else {
+                if previous.is_none() {
+                    return Err("fresh owner recommit has no displaced local allocation".into());
+                }
+                Some((
+                    *state.runtime_array_lengths.get(name).ok_or("fresh owner recommit lacks extent storage")?,
+                    *state.runtime_array_live.get(name).ok_or("fresh owner recommit lacks live storage")?,
+                    length,
+                ))
+            };
+            staged.push(Some(RuntimeArrayAssignment {
+                owns: !proof.forward, previous, same_array_rebind: false,
+                literal_array_call: None, fresh_array_slots,
+            }));
             continue;
         }
         let protected = retains_storage[position]
@@ -3504,6 +3538,7 @@ fn stage_runtime_array_assignments<'ctx>(
             previous,
             same_array_rebind: false,
             literal_array_call: None,
+            fresh_array_slots: None,
         }));
     }
     for (name, slot) in sources {
@@ -3711,6 +3746,7 @@ fn emit_assignment<'ctx, 'module>(
             runtime_array_source: _,
             checked_rebind_destination: _,
             literal_array_replacement: _,
+            fresh_array_recommit: _,
         } = staged;
         let Some(destination) = install_assignment_destination(state, target, &ty, destination)
         else {
@@ -3828,6 +3864,7 @@ fn emit_project_assignment<'ctx, 'module>(
             runtime_array_source: _,
             checked_rebind_destination: _,
             literal_array_replacement: _,
+            fresh_array_recommit: _,
         } = staged;
         let Some(destination) = install_assignment_destination(state, target, &ty, destination)
         else {
@@ -4041,6 +4078,10 @@ fn transition_runtime_array_assignment<'ctx, 'module>(
     }
     if let Some(previous) = staged.previous {
         ownership::consume_runtime_array_release(context, state, previous)?;
+    }
+    if let Some((length_slot, live_slot, length)) = staged.fresh_array_slots {
+        state.builder.build_store(length_slot, length).map_err(builder_error)?;
+        state.builder.build_store(live_slot, context.bool_type().const_int(1, false)).map_err(builder_error)?;
     }
     state.runtime_array_owners.insert(name.clone(), staged.owns);
     state.runtime_array_allocations.insert(name.clone(), false);
@@ -4324,16 +4365,17 @@ fn materialize_assignment_values<'ctx, 'module, 'expected>(
     let mut position = 0;
     let mut values = Vec::new();
     for expression in expressions {
-        let (checked_rebind_destination, literal_array_replacement) = state.aggregate.as_ref()
+        let (checked_rebind_destination, literal_array_replacement, fresh_recommit) = state.aggregate.as_ref()
             .and_then(|aggregate| {
                 let call = state.body_call_nodes.and_then(|nodes| nodes.expression_ordinal(expression))?;
                 Some((
                     aggregate.same_array_rebind_destination(call),
                     aggregate.literal_array_replacement(call).map(|destination| (call, destination)),
+                    aggregate.fresh_array_recommit(call).map(|proof| (call, proof)),
                 ))
             })
             .unwrap_or_default();
-        let provenance = if literal_array_replacement.is_some() || checked_rebind_destination.is_some() {
+        let provenance = if literal_array_replacement.is_some() || checked_rebind_destination.is_some() || fresh_recommit.is_some() {
             // Checked receipt routes do not acquire a second lexical owner.
             RuntimeArrayAssignmentProvenance {
                 result: RuntimeArrayResultProvenance::CheckedReceipt,
@@ -4355,6 +4397,19 @@ fn materialize_assignment_values<'ctx, 'module, 'expected>(
         };
         let expected_type = expected(position);
         let value = emit(state, expression, expected_type)?;
+        let fresh_recommit = if let Some((call, proof)) = fresh_recommit {
+            use crate::scalar::RecommittedArrayExtent;
+            let extent = match (proof.size, proof.argument) {
+                (RecommittedArrayExtent::Literal(elements), None) => context.i64_type().const_int(elements, false),
+                (RecommittedArrayExtent::Formal(_), Some(_)) => state.aggregate.as_mut()
+                    .and_then(|aggregate| aggregate.fresh_recommit_extent.take())
+                    .filter(|(captured, _)| *captured == call)
+                    .map(|(_, length)| length)
+                    .ok_or("missing captured fresh recommit extent")?,
+                _ => return Err("invalid prepared fresh recommit extent".into()),
+            };
+            Some((proof, extent))
+        } else { None };
         let joined_source = if let ScalarExpression::Name { name, .. } = expression {
             if let Some((owner_slot, _)) = state.joined_return_bindings.get(name) {
                 let storage = state
@@ -4407,6 +4462,7 @@ fn materialize_assignment_values<'ctx, 'module, 'expected>(
                     runtime_array_source: None,
                     checked_rebind_destination,
                     literal_array_replacement,
+                    fresh_array_recommit: None,
                 });
                 position += 1;
                 continue;
@@ -4436,6 +4492,7 @@ fn materialize_assignment_values<'ctx, 'module, 'expected>(
                 runtime_array_source,
                 checked_rebind_destination,
                 literal_array_replacement,
+                fresh_array_recommit: if output_position == 0 { fresh_recommit } else { None },
             });
             position += 1;
         }

@@ -13113,6 +13113,84 @@ fn parameter_binding_identity(
     }
 }
 
+fn fresh_recommit_leaf_extent(
+    source: &SourceIdentity, function: &ScalarFunction, calls: &FunctionCallSites,
+    cfg: &ScalarReferenceCfg, allocations: &BTreeMap<ReferenceBindingId, CfgPointId>,
+) -> Option<aggregate::RecommittedArrayExtent> {
+    let ScalarType::Callable { parameters, outputs } = &function.signature else { return None };
+    if !aggregate::neutral_array_signature(parameters, outputs)
+        || !function.generic_parameters.is_empty() || !function.overload_arms.is_empty()
+        || !calls.call_occurrences.is_empty() || !calls.structure.module_storage_uses.is_empty()
+        || allocations.len() != 1
+    {
+        return None;
+    }
+    let [ScalarBlockItem::LocalBinding(declaration), ..] = function.body.items.as_slice() else {
+        return None;
+    };
+    let [receiver] = declaration.receivers.as_slice() else { return None };
+    if !declaration.is_allocation || declaration.fallible_assignment.is_some()
+        || !aggregate::same_runtime_array_type(&receiver.ty, &outputs.outputs[0].ty)
+    {
+        return None;
+    }
+    let (owner, &bind) = allocations.iter().next()?;
+    if owner.declaration_span != receiver.name_span {
+        return None;
+    }
+    let BlockItemKind::Binding(region) = &calls.structure.blocks[calls.structure.root.0].items.first()?.kind else {
+        return None;
+    };
+    let BindingInitialization::Allocation { lengths } = &region.initialization else { return None };
+    let [length] = lengths.as_slice() else { return None };
+    if length.position != 0 || calls.structure.checked_types.expressions.get(&length.expression)
+        != Some(&ScalarType::U64)
+    {
+        return None;
+    }
+    let extent = match receiver.allocation_length.as_ref()? {
+        ScalarExpression::Integer { value, .. } => aggregate::RecommittedArrayExtent::Literal(
+            u64::try_from(value.clone()).ok()?,
+        ),
+        ScalarExpression::Name { .. } => {
+            let PlainNameIdentity::Lexical(binding) = calls.prepared_plain_name(length.expression)? else {
+                return None;
+            };
+            let formal = calls.boundary.parameters.iter().find(|slot| slot.ty == ScalarType::U64
+                && binding.declaration_span == slot.span
+                && binding == &parameter_binding_identity(source, function.span, function.body.span, slot))?;
+            aggregate::RecommittedArrayExtent::Formal(formal.ordinal)
+        }
+        _ => return None,
+    };
+
+    let mut returned = false;
+    let mut moved = None;
+    for point in &cfg.points[bind.0 + 1..] {
+        match &point.kind {
+            CfgPointKind::Assign { target, .. } if target.binding == *owner && target.projections.is_empty() => return None,
+            CfgPointKind::Borrow { .. } | CfgPointKind::Release { .. } | CfgPointKind::Invalidate { .. }
+            | CfgPointKind::AssignThrough { .. } | CfgPointKind::MoveThrough { .. }
+            | CfgPointKind::DeferredMoveThrough { .. }
+            | CfgPointKind::Evaluate(ScalarExpression::RawAddress { .. } | ScalarExpression::CheckedAddress { .. }) => return None,
+            CfgPointKind::Move { owner: moved_owner, .. } if moved_owner == owner => {
+                if moved.replace(point.id).is_some() { return None }
+            }
+            CfgPointKind::ReturnOutput { output: 0, value_point, .. } => {
+                let read = cfg.points.get(value_point.0)?;
+                if returned || !matches!(&read.kind, CfgPointKind::Read { binding } if binding == owner)
+                    || moved.is_none_or(|moved| read.successors.as_slice() != [moved])
+                {
+                    return None;
+                }
+                returned = true;
+            }
+            _ => {}
+        }
+    }
+    returned.then_some(extent)
+}
+
 fn build_function_reference_cfg(
     mut builder: ReferenceFlowBuilder<'_>,
     function: &ScalarFunction,
@@ -13402,6 +13480,11 @@ fn build_function_reference_cfg(
                 }
             }
         }
+    }
+    if has_flow && prior_children_succeeded && errors.is_empty() {
+        aggregate.fresh_recommit_leaf = fresh_recommit_leaf_extent(
+            &builder.source, function, call_sites, &builder.cfg, &builder.aggregate_facts.allocations,
+        );
     }
     aggregate.returning_leaf = errors.is_empty() && prior_children_succeeded && builder.returning_leaf_prefix
         && matches!(builder.cfg.points.last().map(|point| &point.kind), Some(CfgPointKind::Return));

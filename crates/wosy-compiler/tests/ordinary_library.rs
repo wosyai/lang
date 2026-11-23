@@ -442,6 +442,61 @@ u8 observed = recursive_owner(3, 3);
 }
 
 #[test]
+fn recursive_runtime_array_replacement_returns_the_new_owner_to_the_final_receiver() {
+    let text = include_str!("fixtures/recursive-replacement.w");
+    let user = source("workbench", "src/recursive_replacement.w");
+    for (target, target_layout) in [
+        ("native64", ScalarTargetLayout::NATIVE64),
+        ("wasm32", ScalarTargetLayout::WASM32),
+    ] {
+        let prepared = prepare_scalar_project(
+            vec![(declarations(&user, text), Vec::new())],
+            vec![user.clone()],
+            ScalarPreparationInputs { target_layout },
+        )
+        .unwrap_or_else(|error| panic!("{target}: {:?}", error.diagnostics));
+        let build = analyze_scalar_build(&prepared);
+        assert!(build.diagnostics().is_empty(), "{target}: {:?}", build.diagnostics());
+        let ir = emit_scalar_build_project_llvm(&build).unwrap().to_text();
+        let context = Context::create();
+        let buffer = MemoryBuffer::create_from_memory_range_copy(ir.as_bytes(), target);
+        let module = context.create_module_from_ir(buffer).unwrap();
+        module.verify().unwrap();
+        let receive = function_with_suffix(&module, "recursive_replacement");
+        let descend = function_with_suffix(&module, "recursive_return");
+        let replace = function_with_suffix(&module, "replace_owner");
+        let calls = direct_calls(&module, &descend);
+        assert!(calls.contains(&descend) && calls.contains(&replace), "{target}: {calls:?}");
+
+        let free = "call void @__wosy_core_free";
+        let replacement_body = ir.lines().find(|line| line.starts_with("define ")
+            && line.contains(&format!("@{replace}("))).and_then(|header| ir.split_once(header))
+            .expect("replacement definition").1
+            .split_once("\n}").unwrap().0;
+        let (before_copy, _) = replacement_body.split_once("load i8, ptr %array_element")
+            .expect("replacement reads original");
+        assert!(before_copy.contains("call ptr @__wosy_core_alloc"), "{replacement_body}");
+        assert!(!replacement_body.contains(free), "{replacement_body}");
+        let receiver_body = ir.split_once(&format!("define i8 @{receive}(")).unwrap().1
+            .split_once("\n}").unwrap().0;
+        let (before_transfer, after_transfer) = receiver_body.split_once(&format!("@{descend}(")).unwrap();
+        let (_, after_use) = after_transfer.split_once("load i8, ptr %array_element")
+            .expect("outer receiver uses replacement");
+        assert!(!before_transfer.contains(free), "{receiver_body}");
+        assert_eq!(after_use.matches(free).count(), 1, "{receiver_body}");
+
+        if let Some(out) = std::env::var_os("WOSY_RECURSIVE_REPLACEMENT_IR_DIR") {
+            let mut witness = ir.replace("@main(", "@wosy_authored_main(");
+            witness.push_str(&format!(
+                "\ndefine i8 @wosy_recursive_replacement_witness(i64 %depth, i64 %original_length, i64 %replacement_length) {{\nentry:\n  %result = call i8 @{receive}(i64 %depth, i64 %original_length, i64 %replacement_length)\n  ret i8 %result\n}}\n"
+            ));
+            std::fs::write(std::path::PathBuf::from(out).join(format!("{target}.ll")), witness)
+                .unwrap();
+        }
+    }
+}
+
+#[test]
 fn runtime_array_read_line_graph_emits_the_actual_stdlib_ranges() {
     let app = source("wasi_read_into", "src/main.w");
     let std = source("std", "src/bootstrap.w");
