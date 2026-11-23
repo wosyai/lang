@@ -5893,28 +5893,52 @@ fn retire_overwritten_binding_origins(
 
 fn update_projected_assignment<'a>(
     state: &mut ReferenceEdgeState,
-    targets: impl ExactSizeIterator<Item = &'a ReferencePlaceId> + Clone,
+    mut targets: impl ExactSizeIterator<Item = (&'a ReferencePlaceId, bool)> + Clone,
     origins: Option<&BTreeSet<ReferenceOriginId>>,
-    retains_loan: bool,
+    unique_target: bool,
+    installs_local_loan: bool,
 ) {
-    debug_assert!(!retains_loan || targets.len() == 1);
-    let retire = |state: &mut ReferenceEdgeState, target| {
-        state.projected.retain(|known| !reference_places_overlap(&known.place, target));
-    };
-    if let Some(origins) = origins {
-        if targets.len() > 1 {
-            for target in targets.clone() {
-                retire(state, target);
+    if targets.len() == 0 {
+        return;
+    }
+    if unique_target {
+        debug_assert_eq!(targets.len(), 1);
+        let (target, can_retain_loan) = targets.next().unwrap();
+        if let Some(origins) = origins {
+            write_projected_reference(state, target, origins, installs_local_loan && can_retain_loan
+                && target.binding.kind == ReferenceBindingKind::Declared
+                && !target.projections.is_empty()
+                && exact_projected_prefix(target, target));
+        } else {
+            state.projected.retain(|known| !reference_places_overlap(&known.place, target));
+        }
+        return;
+    }
+    state.projected.retain_mut(|known| {
+        let mut exact = false;
+        for (target, can_retain_loan) in targets.clone() {
+            if reference_places_overlap(&known.place, target) {
+                if !reference_places_same(&known.place, target) || (installs_local_loan && !can_retain_loan) {
+                    return false;
+                }
+                exact = true;
             }
         }
-        for target in targets {
-            write_projected_reference(state, target, origins, retains_loan);
+        if !exact {
+            return true;
         }
-    } else {
-        for target in targets {
-            retire(state, target);
+        let Some(origins) = origins else { return false };
+        if known.uninitialized
+            || known.place.binding.kind != ReferenceBindingKind::Declared
+            || known.place.projections.is_empty()
+            || !exact_projected_prefix(&known.place, &known.place)
+        {
+            return false;
         }
-    }
+        known.retains_loan |= installs_local_loan;
+        known.origins.extend(origins);
+        true
+    });
 }
 
 #[cfg(test)]
@@ -5944,7 +5968,7 @@ fn overwritten_binding_origins_retire_only_exact_previous_facts() {
 
 #[cfg(test)]
 #[test]
-fn projected_assignment_replaces_previous_rows_once_in_candidate_order() {
+fn projected_assignment_preserves_alternatives_only_for_exact_initialized_slots() {
     let source = SourceIdentity::new("project".into(), "package".into(), "metadata".into(), "r1".into());
     let span = ByteSpan::new(0, 10);
     let place = |start, indices: &[u32]| {
@@ -5963,27 +5987,70 @@ fn projected_assignment_replaces_previous_rows_once_in_candidate_order() {
     };
     let root = place(1, &[]);
     let projected = place(1, &[0]);
+    let missing = place(1, &[1]);
     let unrelated = place(2, &[]);
     let previous = BTreeSet::from([ReferenceOriginId(0)]);
     let replacement = BTreeSet::from([ReferenceOriginId(1)]);
     let mut state = ReferenceEdgeState::default();
-    write_projected_reference(&mut state, &projected, &previous, false);
+    write_projected_reference(&mut state, &projected, &previous, true);
     write_projected_reference(&mut state, &unrelated, &previous, false);
-    let mut without_rhs = state.clone();
+
     let mut single = state.clone();
     let capacity = single.projected.capacity();
-    update_projected_assignment(&mut single, [&root].into_iter(), Some(&replacement), false);
+    update_projected_assignment(&mut single, [(&root, true)].into_iter(), Some(&replacement), true, false);
     assert_eq!(single.projected.capacity(), capacity);
     assert!(matches!(single.projected.as_slice(), [first, last]
         if first.place == unrelated && first.origins == previous
         && last.place == root && last.origins == replacement));
-    update_projected_assignment(&mut state, [&root, &projected].into_iter(), Some(&replacement), false);
-    assert!(matches!(state.projected.as_slice(), [first, last]
-        if first.place == unrelated && first.origins == previous
-        && last.place == projected && last.origins == replacement));
-    update_projected_assignment(&mut without_rhs, [&root, &projected].into_iter(), None, false);
+    assert!(!single.projected.live_loans);
+
+    let mut filtered_single = state.clone();
+    update_projected_assignment(&mut filtered_single, [(&projected, true)].into_iter(),
+        Some(&replacement), false, false);
+    assert_eq!(filtered_single.projected[0].origins,
+        BTreeSet::from([ReferenceOriginId(0), ReferenceOriginId(1)]));
+    assert!(filtered_single.projected.live_loans);
+
+    let mut weak = state.clone();
+    update_projected_assignment(&mut weak, [(&projected, true), (&missing, true)].into_iter(),
+        Some(&replacement), false, false);
+    assert!(matches!(weak.projected.as_slice(), [first, last]
+        if first.place == projected && first.retains_loan
+        && first.origins == BTreeSet::from([ReferenceOriginId(0), ReferenceOriginId(1)])
+        && last.place == unrelated && last.origins == previous));
+    assert!(weak.projected.live_loans);
+
+    let mut uninitialized = state.clone();
+    uninitialized.projected.rows[0].uninitialized = true;
+    update_projected_assignment(&mut uninitialized, [(&projected, true), (&missing, true)].into_iter(),
+        Some(&replacement), false, true);
+    assert_eq!(uninitialized.projected.len(), 1);
+    assert_eq!(uninitialized.projected[0].place, unrelated);
+    assert!(!uninitialized.projected.live_loans);
+
+    let mut mixed_candidates = state.clone();
+    write_projected_reference(&mut mixed_candidates, &projected, &previous, false);
+    write_projected_reference(&mut mixed_candidates, &missing, &previous, false);
+    update_projected_assignment(&mut mixed_candidates,
+        [(&projected, true), (&missing, false)].into_iter(), Some(&replacement), false, true);
+    assert_eq!(mixed_candidates.projected.len(), 2);
+    assert!(mixed_candidates.projected.iter().all(|row| row.place != missing));
+    let retained = mixed_candidates.projected.iter().find(|row| row.place == projected).unwrap();
+    assert!(retained.retains_loan);
+    assert_eq!(retained.origins, BTreeSet::from([ReferenceOriginId(0), ReferenceOriginId(1)]));
+    assert!(mixed_candidates.projected.live_loans);
+
+    let mut without_rhs = state.clone();
+    update_projected_assignment(&mut without_rhs, [(&projected, true), (&missing, true)].into_iter(),
+        None, false, false);
     assert!(matches!(without_rhs.projected.as_slice(), [first]
         if first.place == unrelated && first.origins == previous));
+
+    update_projected_assignment(&mut state, [(&root, true), (&projected, true)].into_iter(),
+        Some(&replacement), false, false);
+    assert!(matches!(state.projected.as_slice(), [first]
+        if first.place == unrelated && first.origins == previous));
+    assert!(!state.projected.live_loans);
 }
 
 fn write_projected_reference(
@@ -8864,23 +8931,23 @@ fn transfer_reference_facts(
                         .flatten()
                         .filter(|origins| !origins.is_empty());
                     let installs_reference = point.possible_origins.as_ref().is_none_or(|origins| !origins.is_empty());
-                    let retains_loan = installs_reference && match candidates.as_slice() {
+                    let unique_target = match candidates.as_slice() {
                         [candidate] => state.point_values.get(*pointer_point).is_some_and(|origins|
-                            origins.len() == 1 && origins.contains(&candidate.origin))
-                            && candidate.loan.mode == ScalarReferenceMutability::Mutable
-                            && candidate.place.binding.kind == ReferenceBindingKind::Declared
-                            && direct_lexical_loan_root(&candidate.loan.origin_place).is_some()
-                            && !candidate.place.projections.is_empty()
-                            && exact_projected_prefix(&candidate.place, &candidate.place)
-                            && rhs.as_ref().is_some_and(|origins| origins.iter().any(|origin|
-                                declared_local_loan(&cfg.facts[origin.0]).is_some())),
+                            origins.len() == 1 && origins.contains(&candidate.origin)),
                         _ => false,
                     };
+                    let installs_local_loan = installs_reference
+                        && rhs.as_ref().is_some_and(|origins| origins.iter().any(|origin|
+                            declared_local_loan(&cfg.facts[origin.0]).is_some()));
                     update_projected_assignment(
                         &mut state,
-                        candidates.iter().map(|candidate| &candidate.place),
+                        candidates.iter().map(|candidate| (&candidate.place,
+                            installs_local_loan
+                                && candidate.loan.mode == ScalarReferenceMutability::Mutable
+                                && direct_lexical_loan_root(&candidate.loan.origin_place).is_some())),
                         if installs_reference { rhs.as_ref() } else { None },
-                        retains_loan,
+                        unique_target,
+                        installs_local_loan,
                     );
                     if installs_reference && rhs.is_none() {
                         errors.push(ReferenceAnalysisError::MissingContext {

@@ -4981,6 +4981,44 @@ fn singleton_checked_pointer_store_keeps_projected_local_loan_live() {
 }
 
 #[test]
+fn conditional_checked_pointer_store_preserves_unwritten_projected_loans() {
+    for (overwrite, conflict) in [("", true), ("first.item = null;", false)] {
+        let text = format!(
+            "%%start
+struct Bag {{ *u8 item; }}
+unit(bool) update = fn(choose) {{
+    u8 value = 7;
+    Bag first = {{ .item = null; }};
+    Bag second = {{ .item = null; }};
+    first.item = &value;
+    second.item = null;
+    *!Bag writer = null;
+    if (choose) {{ writer = &!first; }} else {{ writer = &!second; }};
+    (*writer).item = null;
+    {overwrite}
+    value = 8;
+    *u8 observed = first.item;
+    observed;
+}};
+%%end"
+        );
+        let access = text.find("value = 8").unwrap() as u32;
+        let origin = text.find("&value").unwrap() as u32;
+        let (single, project) = both_reference_functions(&text);
+        for diagnostics in [&single.diagnostics, &project.diagnostics] {
+            if conflict {
+                assert!(diagnostics.iter().any(|diagnostic| diagnostic.code == "B0003"
+                    && diagnostic.labels.first().is_some_and(|label| label.span.range.start == access)
+                    && diagnostic.labels.iter().skip(1).any(|label| label.span.range.start == origin)),
+                    "{text}: {diagnostics:?}");
+            } else {
+                assert!(diagnostics.is_empty(), "{text}: {diagnostics:?}");
+            }
+        }
+    }
+}
+
+#[test]
 fn projected_holder_drops_only_slots_whose_local_referent_leaves_scope() {
     for (branch_owner, expired) in [("local; refs[0] = &local;", true), ("local; refs[0] = &outer;", false)] {
         let text = format!(
