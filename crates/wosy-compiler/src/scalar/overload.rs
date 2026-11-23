@@ -438,6 +438,7 @@ fn record_expression_overload_selection(
     overloads: &BTreeMap<String, &ScalarOverloadHeader>,
 ) {
     match expression {
+        ScalarExpression::Contextual { .. } => {},
         ScalarExpression::Call {
             receiver,
             name,
@@ -509,6 +510,7 @@ fn record_expression_overload_selection(
         ScalarExpression::RawAddress { place, .. }
         | ScalarExpression::CheckedAddress { place, .. }
         | ScalarExpression::Dereference { place, .. } => match place {
+            ScalarPlace::Contextual { .. } => {},
             ScalarPlace::Dereference { pointer, .. } => {
                 record_expression_overload_selection(pointer, None, scope, overloads)
             }
@@ -559,6 +561,7 @@ fn record_place_overload_selections(
     overloads: &BTreeMap<String, &ScalarOverloadHeader>,
 ) {
     match place {
+        ScalarPlace::Contextual { .. } => {},
         ScalarPlace::Name { .. } => {}
         ScalarPlace::Dereference { pointer, .. } => {
             record_expression_overload_selection(pointer, None, scope, overloads)
@@ -603,9 +606,11 @@ fn record_block_item_overload_selections(
                 &scope,
                 overloads,
             );
-            scope.insert(binding.name.clone(), binding.declared_type.clone());
-            for receiver in &binding.receivers {
-                scope.insert(receiver.name.clone(), receiver.ty.clone());
+            if binding.contextual_storage().is_none() {
+                scope.insert(binding.name.clone(), binding.declared_type.clone());
+                for receiver in &binding.receivers {
+                    scope.insert(receiver.name.clone(), receiver.ty.clone());
+                }
             }
         }
         ScalarBlockItem::Expression(expression) => {

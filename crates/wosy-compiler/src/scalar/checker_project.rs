@@ -7648,6 +7648,54 @@ mod tests {
 
     #[cfg(feature = "internal-checker")]
     #[test]
+    fn ordered_base_contextual_writes_keep_outer_binding_and_exact_witness() {
+        let app = source("src/main.w", "ordered-base-contextual-storage");
+        let program = format!(r#"%%start
+            unit(i8) state = fn(selector) {{
+                i8 core.context.count = 1;
+                if (selector < 0) {{
+                    i8 core.context.count = core.context.count;
+                    core.require(core.context.count == 1, {OUTPUT});
+                    core.context.count = 2;
+                    core.require(core.context.count == 2, {OUTPUT});
+                }} else {{
+                    core.context.count = 3;
+                }};
+                if (selector < 0) {{
+                    core.require(core.context.count == 1, {OUTPUT});
+                }} else {{
+                    core.require(core.context.count == 3, {OUTPUT});
+                }};
+            }};
+        %%end"#);
+        let run = |text: &str, scope| {
+            check_loaded_scalar_ordered_local_proof_contexts(
+                vec![(declarations(&app, text), Vec::new())], Vec::new(), vec![app.clone()],
+                inputs(), scope, Vec::new(),
+            ).unwrap_or_else(|error| panic!("proof-free contextual checking in {scope:?}: {error:?}"))
+        };
+        let valid = run(&program, ScalarCheckerScope::CurrentPackage);
+        assert!(valid.active && valid.directives.is_empty());
+        assert!(!run(&program, ScalarCheckerScope::MainFlowOnly).active);
+        let rejected = program.replace("core.context.count == 2", "core.context.count == 9")
+            .replace("core.context.count == 3", "core.context.count == 1");
+        let rejected = run(&rejected, ScalarCheckerScope::CurrentPackage);
+        let [inner, outer] = rejected.directives.as_slice() else { panic!("one inner and one outer failure"); };
+        let inner_axes = inner.witness.axes().collect::<Vec<_>>();
+        let outer_axes = outer.witness.axes().collect::<Vec<_>>();
+        assert_eq!((inner_axes.len(), outer_axes.len()), (3, 2));
+        assert_eq!(inner_axes[1], outer_axes[1]);
+        assert_ne!(inner_axes[1], inner_axes[2]);
+        let point = |v| BigInt::from(v);
+        assert!(inner.witness.intervals_at(0, 0).unwrap().eq([(&point(-128), &point(-1))]));
+        assert!(inner.witness.intervals_at(0, 1).unwrap().eq([(&point(1), &point(1))]));
+        assert!(inner.witness.intervals_at(0, 2).unwrap().eq([(&point(2), &point(2))]));
+        assert!(outer.witness.intervals_at(0, 0).unwrap().eq([(&point(0), &point(127))]));
+        assert!(outer.witness.intervals_at(0, 1).unwrap().eq([(&point(3), &point(3))]));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
     fn ordered_base_checker_local_writes_keep_scopes_and_correlated_lanes() {
         let app = source("src/main.w", "ordered-base-local-scoped-writes");
         let program = format!(r#"%%start

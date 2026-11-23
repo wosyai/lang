@@ -1059,6 +1059,7 @@ impl<'a> Binder<'a, '_> {
         }
         let parent = Parent::Expression(ordinal);
         match expression {
+            ScalarExpression::Contextual { .. } => {}
             ScalarExpression::Call { arguments, .. } => {
                 (self.bind_call)(ordinal, expression)?;
                 for (index, argument) in arguments.iter().enumerate() {
@@ -1129,6 +1130,7 @@ impl<'a> Binder<'a, '_> {
         }
         let parent = Parent::Place(ordinal);
         match place {
+            ScalarPlace::Contextual { .. } => Ok(()),
             ScalarPlace::Name { .. } => {
                 if let Some(bind_named_place) = &mut self.bind_named_place {
                     bind_named_place(ordinal, place);

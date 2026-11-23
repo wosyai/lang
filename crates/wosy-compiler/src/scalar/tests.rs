@@ -27,6 +27,115 @@ fn validate_text(text: &str) -> ScalarValidation {
 }
 
 #[test]
+fn canonical_contextual_places_preserve_spans_and_storage_roles() {
+    let text = r#"%%start
+        i8() counter = fn {
+            i8 core.context.count = -1;
+            core.context.count = 2;
+            core.context.count
+        };
+    %%end"#;
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let canonical = parsed.result.canonical_cst();
+    let places = canonical.root.descendants().filter(|node| node.kind() == SyntaxKind::ContextualPlace)
+        .map(|node| wosy_syntax::byte_span(&node)).collect::<Vec<_>>();
+    assert_eq!(places.len(), 3);
+    assert!(places.windows(2).all(|pair| pair[0].end < pair[1].start));
+    for span in &places {
+        assert_eq!(text[span.start as usize..span.end as usize].trim_end(), "core.context.count");
+    }
+    let derived = derive_scalar_declarations_from_cst(canonical);
+    assert_eq!(derived.items.len(), 1);
+    assert!(derived.diagnostics().is_empty());
+    assert_eq!(derived.contextual_places.resolved.len(), places.len());
+}
+
+#[test]
+fn contextual_storage_preparation_resolves_prior_rhs_and_restores_outer_storage() {
+    let text = r#"%%start
+        i8(i8) counter = fn(selector) {
+            i8 core.context.count = 1;
+            if (selector < 0) {
+                i8 core.context.count = core.context.count;
+                core.context.count = 2;
+            };
+            core.context.count
+        };
+    %%end"#;
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let canonical = parsed.result.canonical_cst();
+    let declaration = derive_scalar_declarations_from_cst(canonical);
+    let places = canonical.root.descendants().filter(|node| node.kind() == SyntaxKind::ContextualPlace)
+        .map(|node| wosy_syntax::byte_span(&node)).collect::<Vec<_>>();
+    let plan = declaration.contextual_places;
+    assert_eq!(plan.declarations.len(), 2);
+    let [outer, inner] = plan.declarations.as_slice() else { unreachable!() };
+    assert_eq!(outer.ty, ScalarType::I8);
+    assert_eq!(inner.ty, ScalarType::I8);
+    assert_eq!(outer.declaration.range, places[0]);
+    assert_eq!(inner.declaration.range, places[1]);
+    assert_ne!(outer.scope, inner.scope);
+    use contextual::ContextualRole::{Assign, Declare, Read};
+    assert_eq!(places.iter().map(|span| {
+        let occurrence = plan.resolved[span];
+        (occurrence.storage, occurrence.role)
+    }).collect::<Vec<_>>(), [(0, Declare), (1, Declare), (0, Read), (1, Assign), (0, Read)]);
+    assert_eq!(outer.binding.declaration_span, places[0]);
+    assert_eq!(inner.binding.declaration_span, places[1]);
+    assert_eq!(outer.binding.function_span, inner.binding.function_span);
+    assert_ne!(outer.binding, inner.binding);
+
+    for (body, expected) in [
+        ("i8 core.context.count = 1; i8 core.context.count = 2; 0", "already declared"),
+        ("i8 core.context.count = 1; if (selector < 0) { i16 core.context.count = 2; }; 0", "one static type"),
+        ("i8 core.context.count = core.context.count; 0", "inherited contextual"),
+    ] {
+        let text = format!("%%start\ni8(i8) counter = fn(selector) {{ {body} }};\n%%end");
+        let parsed = parse_source(source(), text, &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let declaration = derive_scalar_declarations_from_cst(parsed.result.canonical_cst());
+        assert!(declaration.diagnostics().iter().any(|diagnostic| diagnostic.message.contains(expected)));
+    }
+}
+
+#[test]
+fn qualified_old_does_not_become_contextual_storage() {
+    let text = "%%start\ni8(i8) identity = fn(value) { value };\nproof entry for identity(input) -> (out) ensures (out == core.old(input)) {}\n%%end";
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let canonical = parsed.result.canonical_cst();
+    assert!(!canonical.root.descendants().any(|node| node.kind() == SyntaxKind::ContextualPlace));
+    let declaration = derive_scalar_declarations_from_cst(canonical);
+    assert!(declaration.contextual_places.declarations.is_empty());
+    assert!(declaration.diagnostics().is_empty());
+}
+
+#[test]
+fn contextual_nested_assignment_is_rejected_before_scalar_derivation() {
+    let text = r#"%%start
+        unit(i8) sink = fn(incoming) { if (incoming == 0) {}; };
+        i8() counter = fn {
+            i8 core.context.count = 1;
+            sink((core.context.count = 2));
+            core.context.count
+        };
+    %%end"#;
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let declaration = derive_scalar_declarations_from_cst(parsed.result.canonical_cst());
+    assert!(declaration.items.is_empty());
+    let diagnostics = declaration.diagnostics();
+    let [diagnostic] = diagnostics else { panic!("{diagnostics:?}"); };
+    assert!(diagnostic.message.contains("standalone assignment statement"));
+    let span = diagnostic.labels[0].span.range;
+    let write = text.find("core.context.count = 2").unwrap() as u32;
+    assert_eq!(span.start, write);
+    assert!(span.end <= write + "core.context.count ".len() as u32);
+}
+
+#[test]
 fn source_aggregate_copy_policies_in_both_validators() {
     for (text, expected, invalid_modifier) in [
             (

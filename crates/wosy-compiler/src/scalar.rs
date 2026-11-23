@@ -910,6 +910,11 @@ pub enum ScalarPlace {
         name: String,
         span: ByteSpan,
     },
+    Contextual {
+        binding: ReferenceBindingId,
+        ty: ScalarType,
+        span: ByteSpan,
+    },
     Field {
         base: Box<ScalarPlace>,
         field: ScalarFieldReference,
@@ -930,6 +935,7 @@ pub enum ScalarPlace {
 #[derive(Clone, Debug, PartialEq)]
 enum ScalarPlaceIdentity {
     Name(String),
+    Contextual(ReferenceBindingId),
     Field(Box<ScalarPlaceIdentity>, ScalarFieldIdentity),
     Dereference(Box<ScalarExpressionIdentity>),
     Index(Box<ScalarPlaceIdentity>, Box<ScalarExpressionIdentity>),
@@ -944,6 +950,7 @@ enum ScalarFieldIdentity {
 #[derive(Clone, Debug, PartialEq)]
 enum ScalarExpressionIdentity {
     Name(String),
+    Contextual(ReferenceBindingId),
     Member(String, String),
     Integer(BigInt),
     InvalidInteger,
@@ -1032,6 +1039,7 @@ enum ScalarBlockItemIdentity {
 fn scalar_place_identity(place: &ScalarPlace) -> ScalarPlaceIdentity {
     match place {
         ScalarPlace::Name { name, .. } => ScalarPlaceIdentity::Name(name.clone()),
+        ScalarPlace::Contextual { binding, .. } => ScalarPlaceIdentity::Contextual(binding.clone()),
         ScalarPlace::Field { base, field, .. } => ScalarPlaceIdentity::Field(
             Box::new(scalar_place_identity(base)),
             match field {
@@ -1053,7 +1061,7 @@ fn scalar_place_identity(place: &ScalarPlace) -> ScalarPlaceIdentity {
 
 fn scalar_place_target_span(place: &ScalarPlace) -> ByteSpan {
     match place {
-        ScalarPlace::Name { span, .. } | ScalarPlace::Dereference { span, .. } => *span,
+        ScalarPlace::Name { span, .. } | ScalarPlace::Contextual { span, .. } | ScalarPlace::Dereference { span, .. } => *span,
         ScalarPlace::Field { base, span, .. } | ScalarPlace::Index { base, span, .. } => {
             ByteSpan::new(scalar_place_target_span(base).start, span.end)
         }
@@ -1063,6 +1071,7 @@ fn scalar_place_target_span(place: &ScalarPlace) -> ByteSpan {
 fn scalar_expression_identity(expression: &ScalarExpression) -> ScalarExpressionIdentity {
     match expression {
         ScalarExpression::Name { name, .. } => ScalarExpressionIdentity::Name(name.clone()),
+        ScalarExpression::Contextual { binding, .. } => ScalarExpressionIdentity::Contextual(binding.clone()),
         ScalarExpression::Member { receiver, name, .. } => {
             ScalarExpressionIdentity::Member(receiver.clone(), name.clone())
         }
@@ -1318,6 +1327,8 @@ pub struct ScalarEnum {
 pub struct ScalarOutputReceiver {
     pub name: String,
     pub name_span: ByteSpan,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contextual_storage: Option<ReferenceBindingId>,
     pub ty: ScalarType,
     pub allocation_length: Option<ScalarExpression>,
     pub span: ByteSpan,
@@ -1718,6 +1729,7 @@ fn overload_argument_type(
     scope: &BTreeMap<String, ScalarType>,
 ) -> Option<ScalarOverloadArgument> {
     match expression {
+        ScalarExpression::Contextual { ty, .. } => Some(ScalarOverloadArgument::Typed(ty.clone())),
         ScalarExpression::Name { name, .. } => {
             scope.get(name).cloned().map(ScalarOverloadArgument::Typed)
         }
@@ -1777,6 +1789,11 @@ pub enum UnaryOperator {
 pub enum ScalarExpression {
     Name {
         name: String,
+        span: ByteSpan,
+    },
+    Contextual {
+        binding: ReferenceBindingId,
+        ty: ScalarType,
         span: ByteSpan,
     },
     Member {
@@ -2054,6 +2071,10 @@ pub(crate) enum ScalarBindingOutput<'a> {
 }
 
 impl ScalarBinding {
+    pub(crate) fn contextual_storage(&self) -> Option<&ReferenceBindingId> {
+        self.receivers.first()?.contextual_storage.as_ref()
+    }
+
     pub(crate) fn output_source(&self, position: usize) -> ScalarBindingOutput<'_> {
         if position == 0 {
             return ScalarBindingOutput::Evaluate(&self.value);
@@ -2265,6 +2286,8 @@ pub struct ScalarSourceDeclarations {
     structs: Vec<ScalarStruct>,
     enums: Vec<ScalarEnum>,
     diagnostics: Vec<super::Diagnostic>,
+    #[allow(dead_code)]
+    contextual_places: contextual::ContextualPlaces,
 }
 
 impl ScalarSourceDeclarations {
@@ -2323,12 +2346,52 @@ fn derive_scalar_declarations(
         .children()
         .find(|node| node.kind() == SyntaxKind::Root)
         .expect("source root");
-    let mut has_named_proofs = false;
+    let has_named_proofs = source_root.children().any(|node| node.kind() == SyntaxKind::ProofDecl);
+    let pruned = has_named_proofs.then(|| runtime_module_roots(&source_root));
+    let runtime_roots = pruned.as_deref().unwrap_or_else(|| std::slice::from_ref(&source_root));
+    #[cfg(any(test, feature = "internal-checker"))]
+    let include_proof_diagnostics = proofs.is_some();
+    #[cfg(not(any(test, feature = "internal-checker")))]
+    let include_proof_diagnostics = false;
+    let diagnostic_roots = if has_named_proofs && !include_proof_diagnostics {
+        runtime_roots
+    } else {
+        std::slice::from_ref(&canonical.root)
+    };
+    let mut diagnostics = scalar_diagnostics_in_roots(canonical, diagnostic_roots);
+    let mut structs = Vec::new();
+    let mut enums = Vec::new();
+    let mut contextual = false;
+    for node in diagnostic_roots.iter().flat_map(CstNode::descendants) {
+        match node.kind() {
+            SyntaxKind::StructDecl => {
+                let id = ScalarStructId { source: canonical.source.clone(), index: structs.len() };
+                structs.push(derive_struct(node, id));
+            }
+            SyntaxKind::EnumDecl => {
+                let id = ScalarEnumId { source: canonical.source.clone(), index: enums.len() };
+                enums.push(derive_enum(node, id));
+            }
+            SyntaxKind::ContextualPlace => contextual = true,
+            _ => {}
+        }
+    }
+    let contextual_places = if contextual {
+        contextual::prepare(canonical, diagnostic_roots, &mut diagnostics)
+    } else {
+        contextual::ContextualPlaces::default()
+    };
+    if contextual && has_named_proofs && include_proof_diagnostics {
+        diagnostics.push(contextual::reported_error(
+            SourceSpan::new(canonical.source.clone(), wosy_syntax::byte_span(&source_root)),
+            "contextual storage with named proofs is not supported by this checker boundary",
+        ));
+    }
+    let derive_items = !contextual || diagnostics.is_empty();
     let mut generic_function = false;
-    for node in source_root.children() {
+    for node in source_root.children().filter(|_| derive_items) {
         match node.kind() {
             SyntaxKind::ProofDecl => {
-                has_named_proofs = true;
                 #[cfg(any(test, feature = "internal-checker"))]
                 if let Some(proofs) = proofs.as_deref_mut() {
                     proofs.push(node);
@@ -2338,13 +2401,13 @@ fn derive_scalar_declarations(
             }
             SyntaxKind::NamespaceDecl => items.push(ScalarItem::Namespace(derive_namespace(&node))),
             SyntaxKind::ExternDecl => items.push(ScalarItem::Extern(derive_extern(&node))),
-            SyntaxKind::BindingDecl => items.push(ScalarItem::Binding(derive_binding(&node))),
+            SyntaxKind::BindingDecl => items.push(ScalarItem::Binding(derive_binding(&node, &contextual_places))),
             SyntaxKind::FunctionDecl if !generic_function => {
-                items.push(ScalarItem::Function(derive_function(&node)))
+                items.push(ScalarItem::Function(derive_function(&node, &contextual_places)))
             }
-            SyntaxKind::OverloadDecl => items.push(ScalarItem::Function(derive_overload(&node))),
+            SyntaxKind::OverloadDecl => items.push(ScalarItem::Function(derive_overload(&node, &contextual_places))),
             SyntaxKind::GenericFunctionDecl => {
-                items.push(ScalarItem::Function(derive_generic_function(&node)));
+                items.push(ScalarItem::Function(derive_generic_function(&node, &contextual_places)));
                 generic_function = true;
             }
             SyntaxKind::Item => {
@@ -2361,19 +2424,19 @@ fn derive_scalar_declarations(
                             items.push(ScalarItem::Extern(derive_extern(&item)))
                         }
                         SyntaxKind::BindingDecl => {
-                            items.push(ScalarItem::Binding(derive_binding(&item)))
+                            items.push(ScalarItem::Binding(derive_binding(&item, &contextual_places)))
                         }
                         SyntaxKind::FunctionDecl if !has_generic_function => {
-                            items.push(ScalarItem::Function(derive_function(&item)))
+                            items.push(ScalarItem::Function(derive_function(&item, &contextual_places)))
                         }
                         SyntaxKind::OverloadDecl => {
-                            items.push(ScalarItem::Function(derive_overload(&item)))
+                            items.push(ScalarItem::Function(derive_overload(&item, &contextual_places)))
                         }
                         SyntaxKind::GenericFunctionDecl => {
-                            items.push(ScalarItem::Function(derive_generic_function(&item)))
+                            items.push(ScalarItem::Function(derive_generic_function(&item, &contextual_places)))
                         }
                         SyntaxKind::TopLevelItem => {
-                            items.push(ScalarItem::Executable(derive_executable_item(&item)))
+                            items.push(ScalarItem::Executable(derive_executable_item(&item, &contextual_places)))
                         }
                         _ => {}
                     }
@@ -2385,52 +2448,13 @@ fn derive_scalar_declarations(
             generic_function = false;
         }
     }
-    let pruned = has_named_proofs.then(|| runtime_module_roots(&source_root));
-    let runtime_roots = pruned.as_deref().unwrap_or_else(|| std::slice::from_ref(&source_root));
-    #[cfg(any(test, feature = "internal-checker"))]
-    let include_proof_diagnostics = proofs.is_some();
-    #[cfg(not(any(test, feature = "internal-checker")))]
-    let include_proof_diagnostics = false;
-    let diagnostic_roots = if has_named_proofs && !include_proof_diagnostics {
-        runtime_roots
-    } else {
-        std::slice::from_ref(&canonical.root)
-    };
-    let diagnostics = scalar_diagnostics_in_roots(canonical, diagnostic_roots);
-    let structs = runtime_roots.iter()
-        .flat_map(CstNode::descendants)
-        .filter(|node| node.kind() == SyntaxKind::StructDecl)
-        .enumerate()
-        .map(|(index, node)| {
-            derive_struct(
-                node,
-                ScalarStructId {
-                    source: canonical.source.clone(),
-                    index,
-                },
-            )
-        })
-        .collect();
-    let enums = runtime_roots.iter()
-        .flat_map(CstNode::descendants)
-        .filter(|node| node.kind() == SyntaxKind::EnumDecl)
-        .enumerate()
-        .map(|(index, node)| {
-            derive_enum(
-                node,
-                ScalarEnumId {
-                    source: canonical.source.clone(),
-                    index,
-                },
-            )
-        })
-        .collect();
     ScalarSourceDeclarations {
         source: canonical.source.clone(),
         items,
         structs,
         enums,
         diagnostics,
+        contextual_places,
     }
 }
 
@@ -2452,6 +2476,7 @@ fn typecheck_scalar_program_with_occurrences(
         structs,
         enums,
         mut diagnostics,
+        ..
     } = declarations;
     let mut program = ScalarProgram {
         source,
@@ -2502,6 +2527,7 @@ pub fn derive_scalar_program_from_cst_with_layout(
     }
 }
 
+mod contextual;
 mod declarations;
 use declarations::ScalarDeclarationEnvironment;
 mod inference;
@@ -3075,6 +3101,7 @@ fn project_from_declarations(
 ) -> Result<ScalarProject, ScalarProjectPreparationRejection> {
     let mut modules = Vec::with_capacity(declarations.len());
     let mut diagnostics = Vec::new();
+    let mut contextual_source = None;
     for (declarations, namespace_bindings) in declarations {
         let ScalarSourceDeclarations {
             source,
@@ -3082,7 +3109,16 @@ fn project_from_declarations(
             structs,
             enums,
             diagnostics: extraction_diagnostics,
+            contextual_places,
         } = declarations;
+        if let Some(storage) = contextual_places.declarations.first() {
+            if contextual_source.replace(source.clone()).is_some() {
+                diagnostics.push(contextual::reported_error(
+                    storage.declaration.clone(),
+                    "contextual storage in multiple source modules is not supported",
+                ));
+            }
+        }
         let mut module = ScalarModule::new(source, items, namespace_bindings);
         module.structs = structs;
         module.enums = enums;
@@ -3186,7 +3222,7 @@ fn derive_extern(node: &CstNode) -> ScalarExtern {
     }
 }
 
-fn derive_binding(node: &CstNode) -> ScalarBinding {
+fn derive_binding(node: &CstNode, places: &contextual::ContextualPlaces) -> ScalarBinding {
     let receiver_list = direct_nodes(node)
         .into_iter()
         .find(|child| child.kind() == SyntaxKind::ReceiverList)
@@ -3195,11 +3231,16 @@ fn derive_binding(node: &CstNode) -> ScalarBinding {
         .children()
         .filter(|child| child.kind() == SyntaxKind::Receiver)
         .map(|receiver| {
-            let name = direct_token(&receiver, SyntaxKind::Identifier).expect("receiver name");
+            let contextual = receiver.children().find(|child| child.kind() == SyntaxKind::ContextualPlace);
+            let name = direct_token(contextual.as_ref().unwrap_or(&receiver), SyntaxKind::Identifier).expect("receiver name");
+            let storage = contextual.as_ref().map(|node| {
+                places.storage(wosy_syntax::byte_span(node), contextual::ContextualRole::Declare)
+                    .expect("prepared contextual declaration")
+            });
             let allocation_length = receiver
                 .children()
                 .find(|child| child.kind() == SyntaxKind::Expression)
-                .map(|child| derive_expression(&child));
+                .map(|child| derive_expression_with_places(&child, places));
             let ty = allocation_length.as_ref().map_or_else(
                 || {
                     let ty_node = direct_nodes(&receiver)
@@ -3220,6 +3261,7 @@ fn derive_binding(node: &CstNode) -> ScalarBinding {
             ScalarOutputReceiver {
                 name: name.text().to_owned(),
                 name_span: token_span(&name),
+                contextual_storage: storage.map(|slot| slot.binding.clone()),
                 ty,
                 allocation_length,
                 span: wosy_syntax::byte_span(&receiver),
@@ -3234,7 +3276,7 @@ fn derive_binding(node: &CstNode) -> ScalarBinding {
         output_list
             .children()
             .filter(|child| child.kind() == SyntaxKind::Expression)
-            .map(|child| derive_expression(&child))
+            .map(|child| derive_expression_with_places(&child, places))
             .collect::<Vec<_>>()
     });
     let value = outputs
@@ -3525,7 +3567,7 @@ fn output_sequence(node: &CstNode) -> ScalarOutputSequence {
     }
 }
 
-fn derive_function(node: &CstNode) -> ScalarFunction {
+fn derive_function(node: &CstNode, places: &contextual::ContextualPlaces) -> ScalarFunction {
     let children = direct_nodes(node);
     let signature = derive_type(
         children
@@ -3565,7 +3607,7 @@ fn derive_function(node: &CstNode) -> ScalarFunction {
     let mut body = children
         .iter()
         .find(|child| child.kind() == SyntaxKind::Block)
-        .map(|node| derive_block(node))
+        .map(|node| derive_block_with_context(node, false, places))
         .expect("function block");
     if let ScalarType::Callable { outputs, .. } = &signature {
         for (value, output) in body.final_output_values.iter_mut().zip(&outputs.outputs) {
@@ -3604,7 +3646,7 @@ fn derive_generic_parameters(node: &CstNode) -> Vec<ScalarGenericParameter> {
         .unwrap_or_default()
 }
 
-fn derive_generic_function(node: &CstNode) -> ScalarFunction {
+fn derive_generic_function(node: &CstNode, places: &contextual::ContextualPlaces) -> ScalarFunction {
     let generic = direct_nodes(node)
         .into_iter()
         .find(|child| child.kind() == SyntaxKind::GenericDecl)
@@ -3613,13 +3655,13 @@ fn derive_generic_function(node: &CstNode) -> ScalarFunction {
         .into_iter()
         .find(|child| child.kind() == SyntaxKind::FunctionDecl)
         .expect("generic function declaration");
-    let mut function = derive_function(&function);
+    let mut function = derive_function(&function, places);
     function.generic_parameters = derive_generic_parameters(&generic);
     function.span = wosy_syntax::byte_span(node);
     function
 }
 
-fn derive_overload(node: &CstNode) -> ScalarFunction {
+fn derive_overload(node: &CstNode, places: &contextual::ContextualPlaces) -> ScalarFunction {
     let name = direct_token(node, SyntaxKind::Identifier).expect("overload name");
     let arms: Vec<ScalarFunction> = node
         .children()
@@ -3660,11 +3702,12 @@ fn derive_overload(node: &CstNode) -> ScalarFunction {
                         })
                         .collect()
                 });
-            let mut body = derive_block(
+            let mut body = derive_block_with_context(
                 children
                     .iter()
                     .find(|child| child.kind() == SyntaxKind::Block)
                     .expect("overload arm block"),
+                false, places,
             );
             if let ScalarType::Callable { outputs, .. } = &signature {
                 for (value, output) in body.final_output_values.iter_mut().zip(&outputs.outputs) {
@@ -4206,17 +4249,17 @@ fn string_error_span(token: &CstToken, start: usize, length: usize) -> ByteSpan 
 }
 
 fn derive_block(node: &CstNode) -> ScalarBlock {
-    derive_block_with_context(node, false)
+    derive_block_with_context(node, false, &contextual::ContextualPlaces::default())
 }
 
-fn derive_block_with_context(node: &CstNode, unsafe_context: bool) -> ScalarBlock {
+fn derive_block_with_context(node: &CstNode, unsafe_context: bool, places: &contextual::ContextualPlaces) -> ScalarBlock {
     let block_items = node
         .children()
         .filter(|child| child.kind() == SyntaxKind::BlockItem)
         .collect::<Vec<_>>();
     let mut items = block_items
         .iter()
-        .map(derive_block_item)
+        .map(|item| derive_block_item(item, places))
         .collect::<Vec<_>>();
     let mut final_output_values = direct_nodes(node)
         .into_iter()
@@ -4231,7 +4274,7 @@ fn derive_block_with_context(node: &CstNode, unsafe_context: bool) -> ScalarBloc
                 .filter(|child| child.kind() == SyntaxKind::Expression)
                 .enumerate()
                 .map(|(position, child)| {
-                    let value = derive_expression(&child);
+                    let value = derive_expression_with_places(&child, places);
                     ScalarOutputValue {
                         position,
                         ty: ScalarType::Error,
@@ -4301,40 +4344,40 @@ fn derive_block_with_context(node: &CstNode, unsafe_context: bool) -> ScalarBloc
     }
 }
 
-fn derive_block_item(node: &CstNode) -> ScalarBlockItem {
+fn derive_block_item(node: &CstNode, places: &contextual::ContextualPlaces) -> ScalarBlockItem {
     let child = direct_nodes(node).into_iter().next().expect("block item");
     match child.kind() {
-        SyntaxKind::LocalBinding => ScalarBlockItem::LocalBinding(derive_binding(&child)),
+        SyntaxKind::LocalBinding => ScalarBlockItem::LocalBinding(derive_binding(&child, places)),
         SyntaxKind::Expression => {
             let actual = direct_nodes(&child).into_iter().next().expect("expression");
             match actual.kind() {
-                SyntaxKind::Assignment => ScalarBlockItem::Assignment(derive_assignment(&actual)),
-                _ => ScalarBlockItem::Expression(derive_expression(&child)),
+                SyntaxKind::Assignment => ScalarBlockItem::Assignment(derive_assignment(&actual, places)),
+                _ => ScalarBlockItem::Expression(derive_expression_with_places(&child, places)),
             }
         }
         _ => panic!("block item grammar"),
     }
 }
 
-fn derive_executable_item(node: &CstNode) -> ScalarBlockItem {
+fn derive_executable_item(node: &CstNode, places: &contextual::ContextualPlaces) -> ScalarBlockItem {
     let child = direct_nodes(node)
         .into_iter()
         .next()
         .expect("executable item");
     match child.kind() {
-        SyntaxKind::Assignment => ScalarBlockItem::Assignment(derive_assignment(&child)),
+        SyntaxKind::Assignment => ScalarBlockItem::Assignment(derive_assignment(&child, places)),
         SyntaxKind::Expression => {
             let actual = direct_nodes(&child).into_iter().next().expect("expression");
             match actual.kind() {
-                SyntaxKind::Assignment => ScalarBlockItem::Assignment(derive_assignment(&actual)),
-                _ => ScalarBlockItem::Expression(derive_expression(&child)),
+                SyntaxKind::Assignment => ScalarBlockItem::Assignment(derive_assignment(&actual, places)),
+                _ => ScalarBlockItem::Expression(derive_expression_with_places(&child, places)),
             }
         }
         _ => panic!("top-level item grammar"),
     }
 }
 
-fn derive_assignment(node: &CstNode) -> ScalarAssignment {
+fn derive_assignment(node: &CstNode, places: &contextual::ContextualPlaces) -> ScalarAssignment {
     let targets_node = direct_nodes(node)
         .into_iter()
         .find(|child| child.kind() == SyntaxKind::AssignmentTargets)
@@ -4353,7 +4396,7 @@ fn derive_assignment(node: &CstNode) -> ScalarAssignment {
                 })
                 .collect();
             let target = identifiers.last().expect("assignment target name");
-            let place = derive_place(&target_node);
+            let place = derive_place(&target_node, places);
             ScalarAssignmentTarget {
                 receiver: (identifiers.len() == 2).then(|| identifiers[0].text().to_owned()),
                 target: target.text().to_owned(),
@@ -4390,7 +4433,7 @@ fn derive_assignment(node: &CstNode) -> ScalarAssignment {
     let values = output_list
         .children()
         .filter(|child| child.kind() == SyntaxKind::Expression)
-        .map(|child| derive_expression(&child))
+        .map(|child| derive_expression_with_places(&child, places))
         .collect::<Vec<_>>();
     let value = values[0].clone();
     ScalarAssignment {
@@ -4406,6 +4449,10 @@ fn derive_assignment(node: &CstNode) -> ScalarAssignment {
 }
 
 fn derive_expression(node: &CstNode) -> ScalarExpression {
+    derive_expression_with_places(node, &contextual::ContextualPlaces::default())
+}
+
+fn derive_expression_with_places(node: &CstNode, places: &contextual::ContextualPlaces) -> ScalarExpression {
     let actual = if node.kind() == SyntaxKind::Expression {
         direct_nodes(node)[0].clone()
     } else {
@@ -4415,17 +4462,17 @@ fn derive_expression(node: &CstNode) -> ScalarExpression {
         SyntaxKind::IfExpr => {
             let children = direct_nodes(&actual);
             ScalarExpression::If {
-                condition: Box::new(derive_expression(&children[0])),
-                then_branch: derive_block(&children[1]),
-                else_branch: derive_block(&children[2]),
+                condition: Box::new(derive_expression_with_places(&children[0], places)),
+                then_branch: derive_block_with_context(&children[1], false, places),
+                else_branch: derive_block_with_context(&children[2], false, places),
                 span: wosy_syntax::byte_span(&actual),
             }
         }
         SyntaxKind::UnitIfExpr => {
             let children = direct_nodes(&actual);
             ScalarExpression::UnitIf {
-                condition: Box::new(derive_expression(&children[0])),
-                then_branch: derive_block(&children[1]),
+                condition: Box::new(derive_expression_with_places(&children[0], places)),
+                then_branch: derive_block_with_context(&children[1], false, places),
                 span: wosy_syntax::byte_span(&actual),
             }
         }
@@ -4434,13 +4481,13 @@ fn derive_expression(node: &CstNode) -> ScalarExpression {
                 .into_iter()
                 .find(|child| child.kind() == SyntaxKind::Block)
                 .expect("unsafe block"),
-            true,
+            true, places,
         )),
         SyntaxKind::ArrayLiteral => ScalarExpression::ArrayLiteral {
             elements: direct_nodes(&actual)
                 .into_iter()
                 .filter(|child| child.kind() == SyntaxKind::Expression)
-                .map(|child| derive_expression(&child))
+                .map(|child| derive_expression_with_places(&child, places))
                 .collect(),
             span: wosy_syntax::byte_span(&actual),
         },
@@ -4453,14 +4500,14 @@ fn derive_expression(node: &CstNode) -> ScalarExpression {
         },
         SyntaxKind::Binary => {
             let children = semantic_children(&actual);
-            let mut value = derive_element(&children[0]);
+            let mut value = derive_element(&children[0], places);
             let mut index = 1;
             while index < children.len() {
                 let NodeOrToken::Token(operator_token) = &children[index] else {
                     panic!("binary operator token")
                 };
                 let operator = operator(operator_token.text());
-                let right = derive_element(&children[index + 1]);
+                let right = derive_element(&children[index + 1], places);
                 let span = ByteSpan::new(span_of(&value).start, span_of(&right).end);
                 value = ScalarExpression::Binary {
                     operator,
@@ -4478,7 +4525,7 @@ fn derive_expression(node: &CstNode) -> ScalarExpression {
                 panic!("unary expression children")
             };
             let NodeOrToken::Token(operator_token) = first else {
-                return derive_element(first);
+                return derive_element(first, places);
             };
             let operator = match operator_token.text() {
                 "!" => UnaryOperator::LogicalNot,
@@ -4486,7 +4533,7 @@ fn derive_expression(node: &CstNode) -> ScalarExpression {
                 "-" => UnaryOperator::Negate,
                 _ => panic!("unary operator grammar"),
             };
-            let operand = derive_element(children.get(1).expect("unary operand"));
+            let operand = derive_element(children.get(1).expect("unary operand"), places);
             let span = ByteSpan::new(
                 operator_token.text_range().start().into(),
                 span_of(&operand).end,
@@ -4549,7 +4596,7 @@ fn derive_expression(node: &CstNode) -> ScalarExpression {
             let arguments = direct_nodes(&actual)
                 .iter()
                 .filter(|child| child.kind() == SyntaxKind::Expression)
-                .map(derive_expression)
+                .map(|child| derive_expression_with_places(child, places))
                 .collect();
             ScalarExpression::Call {
                 receiver,
@@ -4600,19 +4647,25 @@ fn derive_expression(node: &CstNode) -> ScalarExpression {
                 .find(|child| child.kind() == SyntaxKind::DereferencedField)
             {
                 ScalarExpression::Dereference {
-                    place: derive_place(&field),
+                    place: derive_place(&field, places),
                     span: wosy_syntax::byte_span(&actual),
                 }
             } else {
-                derive_element(&semantic_children(&actual)[0])
+                derive_element(&semantic_children(&actual)[0], places)
             }
         }
+        SyntaxKind::ContextualPlace => {
+            let span = wosy_syntax::byte_span(&actual);
+            let storage = places.storage(span, contextual::ContextualRole::Read)
+                .expect("prepared contextual read");
+            ScalarExpression::Contextual { binding: storage.binding.clone(), ty: storage.ty.clone(), span }
+        }
         SyntaxKind::IndexedPlace => ScalarExpression::IndexedRead {
-            place: derive_place(&actual),
+            place: derive_place(&actual, places),
             span: wosy_syntax::byte_span(&actual),
         },
         SyntaxKind::Dereference | SyntaxKind::DereferencedField => ScalarExpression::Dereference {
-            place: derive_place(&actual),
+            place: derive_place(&actual, places),
             span: wosy_syntax::byte_span(&actual),
         },
         SyntaxKind::CheckedAddress => {
@@ -4633,7 +4686,7 @@ fn derive_expression(node: &CstNode) -> ScalarExpression {
                 } else {
                     ScalarReferenceMutability::Shared
                 },
-                place: derive_place(&target),
+                place: derive_place(&target, places),
                 span: wosy_syntax::byte_span(&actual),
             }
         }
@@ -4643,7 +4696,7 @@ fn derive_expression(node: &CstNode) -> ScalarExpression {
                 .find(|child| child.kind() == SyntaxKind::PlaceTarget)
                 .expect("raw address target");
             ScalarExpression::RawAddress {
-                place: derive_place(&target),
+                place: derive_place(&target, places),
                 span: wosy_syntax::byte_span(&actual),
             }
         }
@@ -4656,7 +4709,7 @@ fn derive_expression(node: &CstNode) -> ScalarExpression {
                     let value = field
                         .descendants()
                         .find(|child| child.kind() == SyntaxKind::Expression)
-                        .map(|child| derive_expression(&child))
+                        .map(|child| derive_expression_with_places(&child, places))
                         .expect("field value");
                     ScalarStructLiteralField {
                         name: name.text().to_owned(),
@@ -4668,32 +4721,33 @@ fn derive_expression(node: &CstNode) -> ScalarExpression {
                 .collect(),
             span: wosy_syntax::byte_span(&actual),
         },
-        SyntaxKind::Parenthesized => derive_expression(&direct_nodes(&actual)[0]),
-        SyntaxKind::Expression => derive_element(&semantic_children(&actual)[0]),
+        SyntaxKind::Parenthesized => derive_expression_with_places(&direct_nodes(&actual)[0], places),
+        SyntaxKind::Expression => derive_element(&semantic_children(&actual)[0], places),
         _ => {
             let children = semantic_children(&actual);
             children
                 .first()
-                .map(derive_element)
+                .map(|element| derive_element(element, places))
                 .unwrap_or_else(|| panic!("expression grammar {:?}", actual.kind()))
         }
     }
 }
 
-fn derive_place(node: &CstNode) -> ScalarPlace {
+fn derive_place(node: &CstNode, places: &contextual::ContextualPlaces) -> ScalarPlace {
     match node.kind() {
         SyntaxKind::ParenthesizedDereferencePlace => derive_place(
             &direct_nodes(node)
                 .into_iter()
                 .find(|child| child.kind() == SyntaxKind::Dereference)
                 .expect("parenthesized dereference place"),
+            places,
         ),
         SyntaxKind::PlaceTarget => {
-            derive_place(&direct_nodes(node).into_iter().next().expect("place target"))
+            derive_place(&direct_nodes(node).into_iter().next().expect("place target"), places)
         }
         SyntaxKind::AssignmentTarget => {
             if let Some(child) = direct_nodes(node).into_iter().next() {
-                derive_place(&child)
+                derive_place(&child, places)
             } else {
                 let name = direct_token(node, SyntaxKind::Identifier).expect("place name");
                 ScalarPlace::Name {
@@ -4710,6 +4764,12 @@ fn derive_place(node: &CstNode) -> ScalarPlace {
             }
         }
         SyntaxKind::QualifiedMember => derive_qualified_member_place(node, node.children().next()),
+        SyntaxKind::ContextualPlace => {
+            let span = wosy_syntax::byte_span(node);
+            let storage = places.storage(span, contextual::ContextualRole::Assign)
+                .expect("prepared contextual assignment");
+            ScalarPlace::Contextual { binding: storage.binding.clone(), ty: storage.ty.clone(), span }
+        }
         SyntaxKind::DereferencedField => {
             let field = direct_token(node, SyntaxKind::Identifier).expect("field name");
             let parent = direct_nodes(node)
@@ -4721,7 +4781,7 @@ fn derive_place(node: &CstNode) -> ScalarPlace {
                 .find(|child| child.kind() == SyntaxKind::Dereference)
                 .expect("dereference expression");
             ScalarPlace::Field {
-                base: Box::new(derive_place(&dereference)),
+                base: Box::new(derive_place(&dereference, places)),
                 field: ScalarFieldReference::Unresolved {
                     name: field.text().to_owned(),
                     span: token_span(&field),
@@ -4730,11 +4790,12 @@ fn derive_place(node: &CstNode) -> ScalarPlace {
             }
         }
         SyntaxKind::Dereference => ScalarPlace::Dereference {
-            pointer: Box::new(derive_expression(
+            pointer: Box::new(derive_expression_with_places(
                 &direct_nodes(node)
                     .into_iter()
                     .next()
                     .expect("dereference pointer"),
+                places,
             )),
             span: wosy_syntax::byte_span(node),
         },
@@ -4745,7 +4806,7 @@ fn derive_place(node: &CstNode) -> ScalarPlace {
                 .find(|child| {
                     !matches!(child.kind(), SyntaxKind::IndexSuffix | SyntaxKind::IndexFieldSuffix)
                 })
-                .map(derive_place)
+                .map(|child| derive_place(child, places))
                 .unwrap_or_else(|| {
                     let name =
                         direct_token(node, SyntaxKind::Identifier).expect("indexed place name");
@@ -4765,7 +4826,7 @@ fn derive_place(node: &CstNode) -> ScalarPlace {
                 let index_span = wosy_syntax::byte_span(&index);
                 place = ScalarPlace::Index {
                     base: Box::new(place),
-                    index: Box::new(derive_expression(&index)),
+                    index: Box::new(derive_expression_with_places(&index, places)),
                     span: ByteSpan::new(
                         wosy_syntax::byte_span(node).start,
                         wosy_syntax::byte_span(&suffix).end,
@@ -4860,9 +4921,9 @@ fn direct_token(node: &CstNode, kind: SyntaxKind) -> Option<CstToken> {
         })
 }
 
-fn derive_element(element: &NodeOrToken<CstNode, CstToken>) -> ScalarExpression {
+fn derive_element(element: &NodeOrToken<CstNode, CstToken>, places: &contextual::ContextualPlaces) -> ScalarExpression {
     match element {
-        NodeOrToken::Node(node) => derive_expression(node),
+        NodeOrToken::Node(node) => derive_expression_with_places(node, places),
         NodeOrToken::Token(token) => match token.kind() {
             SyntaxKind::Boolean => ScalarExpression::Boolean {
                 value: token.text() == "true",
@@ -4973,6 +5034,7 @@ fn token_span(token: &CstToken) -> ByteSpan {
 fn span_of(expression: &ScalarExpression) -> ByteSpan {
     match expression {
         ScalarExpression::Name { span, .. }
+        | ScalarExpression::Contextual { span, .. }
         | ScalarExpression::Member { span, .. }
         | ScalarExpression::Integer { span, .. }
         | ScalarExpression::Float { span, .. }

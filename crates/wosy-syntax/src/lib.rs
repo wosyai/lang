@@ -102,6 +102,7 @@ pub enum SyntaxKind {
     ProofExists = 89,
     IndexFieldSuffix = 90,
     DirectFieldChainTail = 91,
+    ContextualPlace = 92,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -203,6 +204,7 @@ impl Language for WosyLanguage {
             89 => SyntaxKind::ProofExists,
             90 => SyntaxKind::IndexFieldSuffix,
             91 => SyntaxKind::DirectFieldChainTail,
+            92 => SyntaxKind::ContextualPlace,
             _ => panic!("invalid syntax kind: {}", raw.0),
         }
     }
@@ -827,6 +829,7 @@ fn kind(rule: Rule) -> SyntaxKind {
         Rule::generic_type_arguments => SyntaxKind::GenericTypeArguments,
         Rule::generic_type_argument => SyntaxKind::GenericTypeArgument,
         Rule::qualified_member => SyntaxKind::QualifiedMember,
+        Rule::contextual_place => SyntaxKind::ContextualPlace,
         Rule::assignment_target | Rule::non_indexed_assignment_target => SyntaxKind::AssignmentTarget,
         Rule::unsafe_expr => SyntaxKind::Unsafe,
         Rule::assignment => SyntaxKind::Assignment,

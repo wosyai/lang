@@ -33,6 +33,7 @@ fn raw_project(
         structs,
         enums,
         diagnostics,
+        ..
     } = declarations;
     assert!(diagnostics.is_empty());
     let initialization_order = vec![source.clone()];

@@ -133,6 +133,8 @@ struct EmitState<'ctx, 'module> {
     dynamic_owner_outputs: &'ctx BTreeMap<String, BTreeSet<usize>>,
     values: BTreeMap<String, EmitValue<'ctx>>,
     storage: BTreeMap<String, (PointerValue<'ctx>, ScalarType)>,
+    contextual_storage: BTreeMap<std::rc::Rc<crate::scalar::ReferenceBindingId>, (PointerValue<'ctx>, ScalarType)>,
+    contextual_installs: Vec<std::rc::Rc<crate::scalar::ReferenceBindingId>>,
     return_bindings: BTreeMap<String, ScalarExpression>,
     fresh_return_outputs: BTreeSet<usize>,
     branch_return_outputs: ownership::ReturnBranches,
@@ -1598,6 +1600,20 @@ fn store_binding_outputs<'ctx, 'module>(
     binding: &crate::ScalarBinding,
     value: EmitValue<'ctx>,
 ) -> Result<(), String> {
+    if let [receiver] = binding.receivers.as_slice() {
+        if let Some(id) = &receiver.contextual_storage {
+            let value = take_basic(value)?;
+            let slot = entry_storage_alloca(context, state, &receiver.ty, "contextual")?;
+            state.builder.build_store(slot, value).map_err(builder_error)?;
+            let id = std::rc::Rc::new(id.clone());
+            let std::collections::btree_map::Entry::Vacant(entry) = state.contextual_storage.entry(id.clone()) else {
+                return Err("duplicate prepared LLVM contextual storage".to_owned());
+            };
+            entry.insert((slot, receiver.ty.clone()));
+            state.contextual_installs.push(id);
+            return Ok(());
+        }
+    }
     if binding.is_allocation {
         let receiver = binding
             .receivers
@@ -2037,6 +2053,8 @@ fn emit_function<'ctx, 'module>(
         dynamic_owner_outputs,
         values: BTreeMap::new(),
         storage: BTreeMap::new(),
+        contextual_storage: BTreeMap::new(),
+        contextual_installs: Vec::new(),
         return_bindings: return_bindings(&function.body),
         fresh_return_outputs,
         branch_return_outputs,
@@ -2214,6 +2232,8 @@ fn emit_main<'ctx, 'module>(
         dynamic_owner_outputs,
         values: BTreeMap::new(),
         storage: BTreeMap::new(),
+        contextual_storage: BTreeMap::new(),
+        contextual_installs: Vec::new(),
         return_bindings: BTreeMap::new(),
         fresh_return_outputs: BTreeSet::new(),
         branch_return_outputs: BTreeMap::new(),
@@ -2353,6 +2373,8 @@ fn emit_project_function<'ctx, 'module>(
         dynamic_owner_outputs,
         values: BTreeMap::new(),
         storage: BTreeMap::new(),
+        contextual_storage: BTreeMap::new(),
+        contextual_installs: Vec::new(),
         return_bindings: return_bindings(&function.body),
         fresh_return_outputs,
         branch_return_outputs,
@@ -2556,6 +2578,8 @@ fn emit_project_main<'ctx, 'module>(
         dynamic_owner_outputs,
         values: BTreeMap::new(),
         storage: BTreeMap::new(),
+        contextual_storage: BTreeMap::new(),
+        contextual_installs: Vec::new(),
         return_bindings: BTreeMap::new(),
         fresh_return_outputs: BTreeSet::new(),
         branch_return_outputs: BTreeMap::new(),
@@ -2901,6 +2925,7 @@ fn emit_block_at<'ctx, 'module>(
     emission: BlockEmission<'_>,
 ) -> Result<EmitValue<'ctx>, String> {
     let storage = state.storage.clone();
+    let contextual_depth = state.contextual_installs.len();
     let values = state.values.clone();
     let runtime_array_owners = state.runtime_array_owners.clone();
     let runtime_array_allocations = state.runtime_array_allocations.clone();
@@ -2932,6 +2957,9 @@ fn emit_block_at<'ctx, 'module>(
         aggregate_transfer::publish_checked_backing_arm(state, block)?;
     }
     state.storage = storage;
+    for id in state.contextual_installs.drain(contextual_depth..) {
+        state.contextual_storage.remove(id.as_ref());
+    }
     state.values = values;
     state.runtime_array_owners = runtime_array_owners
         .into_iter()
@@ -2974,6 +3002,7 @@ fn emit_project_block_at<'ctx, 'module>(
     emission: BlockEmission<'_>,
 ) -> Result<EmitValue<'ctx>, String> {
     let storage = state.storage.clone();
+    let contextual_depth = state.contextual_installs.len();
     let values = state.values.clone();
     let runtime_array_owners = state.runtime_array_owners.clone();
     let runtime_array_allocations = state.runtime_array_allocations.clone();
@@ -3016,6 +3045,9 @@ fn emit_project_block_at<'ctx, 'module>(
         aggregate_transfer::publish_checked_backing_arm(state, block)?;
     }
     state.storage = storage;
+    for id in state.contextual_installs.drain(contextual_depth..) {
+        state.contextual_storage.remove(id.as_ref());
+    }
     state.values = values;
     state.runtime_array_owners = runtime_array_owners
         .into_iter()
@@ -3537,6 +3569,14 @@ fn retain_assignment_destination<'ctx>(
         return Ok(AssignmentDestination::Unit);
     }
     match &target.place {
+        crate::ScalarPlace::Contextual { binding, ty: expected, .. } => {
+            let (pointer, stored) = state.contextual_storage.get(binding)
+                .ok_or_else(|| "missing prepared LLVM contextual destination".to_owned())?;
+            if stored != expected || expected != ty {
+                return Err("invalid prepared LLVM contextual destination type".to_owned());
+            }
+            Ok(AssignmentDestination::Existing(*pointer))
+        }
         crate::ScalarPlace::Name { name, .. } => {
             match state.storage.get(name).map(|(slot, _)| *slot).or_else(|| {
                 state
@@ -3984,6 +4024,8 @@ fn assignment_place_type<'ctx, 'module>(
     place: &crate::ScalarPlace,
 ) -> Option<ScalarType> {
     match place {
+        crate::ScalarPlace::Contextual { binding, ty, .. } => state.contextual_storage.get(binding)
+            .and_then(|(_, stored)| (stored == ty).then(|| ty.clone())),
         crate::ScalarPlace::Name { name, .. } => state
             .storage
             .get(name.as_str())

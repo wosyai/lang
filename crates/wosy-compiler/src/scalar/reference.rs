@@ -695,6 +695,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
     ) -> Result<ReferencePlaceId, ReferenceAnalysisError> {
         let root = reference_root(place);
         let (binding, parent) = match root {
+            ScalarPlace::Contextual { binding, .. } => (binding.clone(), None),
             ScalarPlace::Name { name, span } => (self.binding(name, *span)?, None),
             ScalarPlace::Dereference { pointer, .. } => {
                 let ScalarExpression::Name { name, span } = pointer.as_ref() else {
@@ -1800,6 +1801,17 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 );
                 Ok(ReferenceValue::Other)
             }
+            ScalarExpression::Contextual { binding, .. } => {
+                let prepared = self.prepared_name_identity(ordinal, span)?;
+                if !matches!(prepared, Some(PlainNameIdentity::Lexical(id)) if id == binding)
+                    || !self.binding_types.contains_key(binding)
+                {
+                    return Err(self.missing_context(span, ReferenceAnalysisErrorReason::MissingResolvedBinding));
+                }
+                self.read_checked_place_root(binding, span, scope);
+                self.point(CfgPointKind::Evaluate(expression.clone()), span, scope, BTreeSet::new());
+                Ok(ReferenceValue::Other)
+            }
             ScalarExpression::Name { name, .. } => {
                 let identity = self.prepared_name_identity(ordinal, span)?;
                 let canonical_null = matches!(identity, Some(PlainNameIdentity::Null));
@@ -2108,6 +2120,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
     ) -> Result<(), ReferenceAnalysisError> {
         let parent = OccurrenceParent::Place(ordinal);
         match place {
+            ScalarPlace::Contextual { binding, span, .. } => self.read_checked_place_root(binding, *span, scope),
             ScalarPlace::Name { name, span } => {
                 if let Some(binding) = root_binding {
                     self.read_checked_place_root(binding, *span, scope);
@@ -2316,6 +2329,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
         let pointer_point = match canonical_root {
             None => None,
             Some(root) => match root.place {
+                ScalarPlace::Contextual { .. } => None,
                 ScalarPlace::Dereference { span, .. } => {
                     Some(*self.dereference_points.get(&root.ordinal).ok_or_else(|| {
                         self.missing_context(
@@ -2455,6 +2469,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
     ) -> Result<(), ReferenceAnalysisError> {
         let parent = OccurrenceParent::Place(ordinal);
         match place {
+            ScalarPlace::Contextual { .. } => {},
             ScalarPlace::Name { .. } | ScalarPlace::Dereference { .. } => {}
             ScalarPlace::Field { base, .. } => self.place_indices(
                 base,
@@ -2478,6 +2493,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
         place: &ScalarPlace,
     ) -> Result<ScalarType, ReferenceAnalysisError> {
         match place {
+            ScalarPlace::Contextual { ty, .. } => Ok(ty.clone()),
             ScalarPlace::Name { name, span } => {
                 let binding = self.binding(name, *span)?;
                 self.binding_types.get(&binding).cloned().ok_or_else(|| {
@@ -2992,6 +3008,16 @@ impl<'a> ReferenceFlowBuilder<'a> {
         scope: ReferenceScopeId,
         ordinal: OccurrenceOrdinal,
     ) -> Result<ReferenceAssignmentDestination<'a>, ReferenceAnalysisError> {
+        if let ScalarPlace::Contextual { binding, span, .. } = &target.place {
+            if let DirectDestinationFacts::Prepared(rows) = &self.call_sites.direct_destinations {
+                if let Some(identity @ DirectDestinationIdentity::Existing(id)) = rows.get(&ordinal) {
+                    if id == binding && self.binding_types.contains_key(binding) {
+                        return Ok(ReferenceAssignmentDestination::PreparedName(identity));
+                    }
+                }
+            }
+            return Err(self.missing_context(*span, ReferenceAnalysisErrorReason::MissingResolvedBinding));
+        }
         if let ScalarPlace::Name { span, .. } = &target.place {
             return match &self.call_sites.direct_destinations {
                 DirectDestinationFacts::Raw => Ok(ReferenceAssignmentDestination::RawName),
@@ -3089,6 +3115,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
             BTreeSet::new(),
         );
         let mut declared = Vec::new();
+        let mut declared_contextual = Vec::new();
         let mut result = ReferenceBlockResult::default();
         let mut next_item = 0;
         while next_item < region.items.len() {
@@ -3168,6 +3195,13 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             .insert(primary_ordinal, initializer.expect("raw null evaluation"));
                     }
                     self.move_value(primary, scope, primary_ordinal)?;
+                    if let Some(id) = &receiver.contextual_storage {
+                        self.binding_types.insert(id.clone(), receiver.ty.clone());
+                        self.point(CfgPointKind::Bind { binding: id.clone() }, receiver.span, scope, BTreeSet::new());
+                        self.record_binding_definition(position, 0, false, initializer);
+                        declared_contextual.push(id);
+                        continue;
+                    }
                     let id = ReferenceBindingId {
                         source: self.source.clone(),
                         function_span: self.function_span,
@@ -3368,6 +3402,17 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             if self.aggregate_facts.local_array_copy_allocation.is_some() {
                                 self.aggregate_facts.checked_producer_nonlocal_installs.insert(rhs_point);
                             }
+                        }
+                        if let ScalarPlace::Contextual { binding, span, .. } = &target.place {
+                            let target = self.reference_place(&target.place, binding.clone(), None);
+                            self.point(CfgPointKind::Assign {
+                                target,
+                                rhs_point,
+                                previous_origins: BTreeSet::new(),
+                                previous_loans: Vec::new(),
+                            }, *span, scope, BTreeSet::new());
+                            self.record_frozen_install(slot.destination, rhs_point);
+                            continue;
                         }
                         if let ScalarPlace::Name { name, span } = &target.place {
                             let lexical = match destination {
@@ -3703,6 +3748,9 @@ impl<'a> ReferenceFlowBuilder<'a> {
             } else {
                 self.point(CfgPointKind::Return, return_span, scope, BTreeSet::new());
             }
+        }
+        for id in declared_contextual {
+            self.binding_types.remove(id);
         }
         for (name, id, previous) in declared.into_iter().rev() {
             self.origins.remove(&id);
@@ -5647,6 +5695,7 @@ fn synthetic_member_place(
 
 fn reference_root(place: &ScalarPlace) -> &ScalarPlace {
     match place {
+        ScalarPlace::Contextual { .. } => place,
         ScalarPlace::Name { .. } | ScalarPlace::Dereference { .. } => place,
         ScalarPlace::Field { base, .. } | ScalarPlace::Index { base, .. } => reference_root(base),
     }
@@ -5658,6 +5707,7 @@ fn collect_reference_projections(
     projections: &mut Vec<ReferencePlaceProjection>,
 ) {
     match place {
+        ScalarPlace::Contextual { .. } => {},
         ScalarPlace::Name { .. } => {}
         ScalarPlace::Dereference { .. } => {
             if let Some(parent) = parent {
@@ -6087,6 +6137,8 @@ pub(super) struct OccurrenceStructure {
     pub(super) edges: HashMap<(OccurrenceParent, OccurrenceEdge), OccurrenceNode>,
     pub(super) checked_types: CheckedOccurrenceTypes,
     #[cfg(any(test, feature = "internal-checker"))]
+    pub(super) checker_contextual_occurrences: HashSet<OccurrenceOrdinal>,
+    #[cfg(any(test, feature = "internal-checker"))]
     pub(super) checker_directives: HashMap<OccurrenceOrdinal, super::checker_directive::PreparedCheckerDirective>,
     #[cfg(feature = "internal-checker")]
     pub(super) checker_has_nonexact_require: bool,
@@ -6119,6 +6171,8 @@ impl OccurrenceStructure {
             blocks: vec![BlockRegion::new(span, Vec::new())],
             edges: HashMap::new(),
             checked_types: CheckedOccurrenceTypes::default(),
+            #[cfg(any(test, feature = "internal-checker"))]
+            checker_contextual_occurrences: HashSet::new(),
             #[cfg(any(test, feature = "internal-checker"))]
             checker_directives: HashMap::new(),
             #[cfg(feature = "internal-checker")]
@@ -6834,10 +6888,24 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
         expression: &ScalarExpression,
         names: &BTreeMap<String, WalkBinding>,
     ) -> Option<super::checker_flow::IntegerPredicate> {
-        use super::checker_flow::IntegerComparison;
+        use super::checker_flow::{concrete_integer_literal, IntegerComparison, IntegerPredicate};
         let WalkMode::Callable(callable) = &self.mode else {
             return None;
         };
+        if let ScalarExpression::Binary { operator, left, right, .. } = expression {
+            if let ScalarExpression::Contextual { binding, ty, .. } = left.as_ref() {
+                super::symbolic_integer::IntegerRelation::from_operator(operator)?;
+                if self.occurrence_typing.checked_expression_type(left)? != ty
+                    || self.occurrence_typing.checked_expression_type(right)? != ty
+                {
+                    return None;
+                }
+                return Some(IntegerPredicate {
+                    binding: binding.clone(), ty: ty.clone(), operator: operator.clone(),
+                    bound: concrete_integer_literal(right)?.into_owned(),
+                });
+            }
+        }
         let comparison = IntegerComparison::from_expression(expression)?;
         let PlainNameIdentity::Lexical(binding) =
             callable.target_resolver.plain_name(comparison.name, names)?
@@ -7067,6 +7135,14 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
                 }
                 identities.insert(ordinal, identity);
             }
+        }
+        if let (ScalarExpression::Contextual { binding, .. }, PlainNameFacts::Prepared(identities)) =
+            (expression, &mut self.plain_names)
+        {
+            #[cfg(any(test, feature = "internal-checker"))]
+            self.structure.checker_contextual_occurrences.insert(ordinal);
+            self.occurrences[ordinal.0].requires_plain_name = true;
+            identities.insert(ordinal, PlainNameIdentity::Lexical(binding.clone()));
         }
         if let (
             ScalarExpression::Name { name, .. },
@@ -7792,6 +7868,10 @@ impl StructuralWalker<'_, '_> {
         }
         let parent = OccurrenceParent::Place(ordinal);
         match place {
+            ScalarPlace::Contextual { .. } => {
+                #[cfg(any(test, feature = "internal-checker"))]
+                self.structure.checker_contextual_occurrences.insert(ordinal);
+            }
             ScalarPlace::Name { name, .. } => {
                 if !self.structure.resolved_namespace_places.contains_key(&ordinal) {
                     let context = match &self.mode {
@@ -8151,6 +8231,15 @@ impl StructuralWalker<'_, '_> {
                 | WalkMode::ModuleInitialization { .. }
         ) {
             for receiver in &binding.receivers {
+                if let Some(id) = &receiver.contextual_storage {
+                    #[cfg(any(test, feature = "internal-checker"))]
+                    if self.occurrence_typing.checker_directives_enabled() {
+                        self.structure.checker_integer_locals.insert((position.block, position.item), id.clone());
+                    }
+                    #[cfg(not(any(test, feature = "internal-checker")))]
+                    let _ = id;
+                    continue;
+                }
                 scope
                     .types
                     .insert(receiver.name.clone(), receiver.ty.clone());
@@ -8329,6 +8418,11 @@ impl StructuralWalker<'_, '_> {
                     };
                     let mut introduced = BTreeMap::new();
                     for (target, slot) in assignment.targets.iter().zip(&slots) {
+                        if let ScalarPlace::Contextual { binding, .. } = &target.place {
+                            self.occurrences[slot.destination.0].requires_direct_destination = true;
+                            rows.insert(slot.destination, DirectDestinationIdentity::Existing(binding.clone()));
+                            continue;
+                        }
                         let ScalarPlace::Name { name, .. } = &target.place else {
                             continue;
                         };

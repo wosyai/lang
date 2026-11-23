@@ -414,7 +414,9 @@ fn resolve_item_places(
                     owners,
                 );
             }
-            scope.insert(binding.name.clone(), binding.declared_type.clone());
+            if binding.contextual_storage().is_none() {
+                scope.insert(binding.name.clone(), binding.declared_type.clone());
+            }
         }
         ScalarBlockItem::Expression(expression) => resolve_expression_places(
             expression,
@@ -505,6 +507,7 @@ fn resolve_expression_places(
     owners: &ScalarAssignmentOwners,
 ) {
     match expression {
+        ScalarExpression::Contextual { .. } => {},
         ScalarExpression::RawAddress { place, .. }
         | ScalarExpression::CheckedAddress { place, .. }
         | ScalarExpression::Dereference { place, .. } => resolve_place(
@@ -718,6 +721,7 @@ fn resolve_place(
     owners: &ScalarAssignmentOwners,
 ) {
     match place {
+        ScalarPlace::Contextual { .. } => {},
         ScalarPlace::Name { .. } => {}
         ScalarPlace::Dereference { pointer, .. } => resolve_expression_places(
             pointer,
@@ -739,6 +743,7 @@ fn resolve_place(
                 owners,
             );
             let base_type = match base.as_ref() {
+                ScalarPlace::Contextual { ty, .. } => ty.clone(),
                 ScalarPlace::Dereference { pointer, .. } => {
                     let mut scratch = ScalarInferenceBuilder::new(owners);
                     match expression_type(
@@ -1278,7 +1283,9 @@ fn resolve_item_module_places(
                     owners,
                 );
             }
-            scope.insert(binding.name.clone(), binding.declared_type.clone());
+            if binding.contextual_storage().is_none() {
+                scope.insert(binding.name.clone(), binding.declared_type.clone());
+            }
         }
         ScalarBlockItem::Expression(expression) => resolve_expression_module_places(
             expression,
@@ -1393,6 +1400,7 @@ fn resolve_expression_module_places(
     owners: &ScalarAssignmentOwners,
 ) {
     match expression {
+        ScalarExpression::Contextual { .. } => {},
         ScalarExpression::RawAddress { place, .. }
         | ScalarExpression::CheckedAddress { place, .. }
         | ScalarExpression::Dereference { place, .. } => resolve_module_place(
@@ -1678,6 +1686,7 @@ fn resolve_module_place(
     owners: &ScalarAssignmentOwners,
 ) {
     match place {
+        ScalarPlace::Contextual { .. } => {},
         ScalarPlace::Name { .. } => {}
         ScalarPlace::Dereference { pointer, .. } => resolve_expression_module_places(
             pointer,
@@ -1705,6 +1714,7 @@ fn resolve_module_place(
                 owners,
             );
             let base_type = match base.as_ref() {
+                ScalarPlace::Contextual { ty, .. } => ty.clone(),
                 ScalarPlace::Dereference { pointer, .. } => {
                     let mut scratch = ScalarInferenceBuilder::new(owners);
                     match expression_type_in_module(

@@ -15,6 +15,7 @@ impl PreparedProgram {
                 structs: program.structs.clone(),
                 enums: program.enums.clone(),
                 diagnostics: Vec::new(),
+                contextual_places: contextual::ContextualPlaces::default(),
             },
             program.target_layout,
         )

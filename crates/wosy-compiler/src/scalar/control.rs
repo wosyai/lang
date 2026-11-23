@@ -463,6 +463,7 @@ pub(super) struct BindingReceiverSlot {
     pub(super) name: String,
     pub(super) span: ByteSpan,
     pub(super) ty: ScalarType,
+    pub(super) contextual_storage: Option<super::ReferenceBindingId>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -500,6 +501,7 @@ impl BindingRegion {
             name: binding.name.clone(),
             span: binding.name_span,
             ty: binding.declared_type.clone(),
+            contextual_storage: binding.receivers.first().and_then(|receiver| receiver.contextual_storage.clone()),
         });
         receivers.extend(binding.receivers.iter().enumerate().skip(1).map(
             |(position, receiver)| BindingReceiverSlot {
@@ -507,6 +509,7 @@ impl BindingRegion {
                 name: receiver.name.clone(),
                 span: receiver.name_span,
                 ty: receiver.ty.clone(),
+                contextual_storage: receiver.contextual_storage.clone(),
             },
         ));
         Self {

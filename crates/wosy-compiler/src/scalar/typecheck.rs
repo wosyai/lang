@@ -393,6 +393,7 @@ fn scalar_call_result_in_module(outputs: &ScalarOutputSequence) -> ScalarType {
 pub(super) fn expression_span(expression: &ScalarExpression) -> ByteSpan {
     match expression {
         ScalarExpression::Name { span, .. }
+        | ScalarExpression::Contextual { span, .. }
         | ScalarExpression::Integer { span, .. }
         | ScalarExpression::InvalidInteger { span, .. }
         | ScalarExpression::Float { span, .. }
@@ -1261,6 +1262,9 @@ pub(super) fn block_item_type_in_module(
                     overloads,
                     inference,
                 );
+            if binding.contextual_storage().is_some() {
+                return ScalarType::Unit;
+            }
             if declare_module_name(
                 module,
                 &binding.name,
@@ -3440,6 +3444,7 @@ fn check_expression_type_in_module(
             ));
             ScalarType::Error
         }
+        ScalarExpression::Contextual { ty, .. } => ty.clone(),
         ScalarExpression::Name { name, span } => scope.get(name).cloned().unwrap_or_else(|| {
             diagnostics.push(module_diagnostic(module, "B0001", "unknown name", *span));
             ScalarType::Error
@@ -5098,6 +5103,7 @@ fn member_field_in_module<'a>(
 
 fn is_supported_checked_address_place(place: &ScalarPlace) -> bool {
     match place {
+        ScalarPlace::Contextual { .. } => false,
         ScalarPlace::Name { .. } => true,
         ScalarPlace::Field { base, .. } => matches!(base.as_ref(), ScalarPlace::Name { .. }),
         ScalarPlace::Dereference { .. } => true,
@@ -5404,6 +5410,7 @@ fn writable_place_contains_raw_dereference(
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> bool {
     match place {
+        ScalarPlace::Contextual { .. } => false,
         ScalarPlace::Name { .. } => false,
         ScalarPlace::Field { base, .. } | ScalarPlace::Index { base, .. } => {
             writable_place_contains_raw_dereference(
@@ -5441,6 +5448,7 @@ fn writable_place_contains_raw_dereference_in_module(
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> bool {
     match place {
+        ScalarPlace::Contextual { .. } => false,
         ScalarPlace::Name { .. } => false,
         ScalarPlace::Field { base, .. } | ScalarPlace::Index { base, .. } => {
             writable_place_contains_raw_dereference_in_module(
@@ -5479,7 +5487,7 @@ fn writable_path_type(
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
     let ty = match place {
-        ScalarPlace::Name { .. } => check_place_type(
+        ScalarPlace::Name { .. } | ScalarPlace::Contextual { .. } => check_place_type(
             place,
             scope,
             program,
@@ -5595,7 +5603,7 @@ fn writable_path_type_in_module(
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
     let ty = match place {
-        ScalarPlace::Name { .. } => check_place_type_in_module(
+        ScalarPlace::Name { .. } | ScalarPlace::Contextual { .. } => check_place_type_in_module(
             place,
             scope,
             module,
@@ -5763,6 +5771,11 @@ fn check_place_type(
     raw_address: bool,
 ) -> ScalarType {
     match place {
+        ScalarPlace::Contextual { ty, .. } if !raw_address => ty.clone(),
+        ScalarPlace::Contextual { span, .. } => {
+            diagnostics.push(diagnostic(program, "B0003", "contextual address is not supported", *span));
+            ScalarType::Error
+        }
         ScalarPlace::Name { name, span } => scope.get(name).cloned().unwrap_or_else(|| {
             diagnostics.push(diagnostic(program, "B0001", "unknown name", *span));
             ScalarType::Error
@@ -5903,6 +5916,11 @@ fn check_place_type_in_module(
     raw_address: bool,
 ) -> ScalarType {
     match place {
+        ScalarPlace::Contextual { ty, .. } if !raw_address => ty.clone(),
+        ScalarPlace::Contextual { span, .. } => {
+            diagnostics.push(module_diagnostic(module, "B0003", "contextual address is not supported", *span));
+            ScalarType::Error
+        }
         ScalarPlace::Name { name, span } => scope.get(name).cloned().unwrap_or_else(|| {
             diagnostics.push(module_diagnostic(module, "B0001", "unknown name", *span));
             ScalarType::Error
@@ -6124,6 +6142,7 @@ fn checked_dereference_type(
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
     let ty = match place {
+        ScalarPlace::Contextual { .. } => ScalarType::Error,
         ScalarPlace::Dereference { pointer, span } => checked_dereference_target_type(
             pointer,
             *span,
@@ -6240,6 +6259,7 @@ fn checked_dereference_type_in_module(
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
     let (dereference, pointer, dereference_span, field) = match place {
+        ScalarPlace::Contextual { .. } => return ScalarType::Error,
         ScalarPlace::Dereference { pointer, span } => (place, pointer, *span, None),
         ScalarPlace::Field {
             base,
@@ -6680,6 +6700,7 @@ fn validate_unit_if_position(
     diagnostics: &mut Vec<super::Diagnostic>,
 ) {
     match expression {
+        ScalarExpression::Contextual { .. } => {},
         ScalarExpression::UnitIf {
             condition,
             then_branch,
@@ -6762,6 +6783,7 @@ fn validate_unit_if_position_in_place(
     diagnostics: &mut Vec<super::Diagnostic>,
 ) {
     match place {
+        ScalarPlace::Contextual { .. } => {},
         ScalarPlace::Dereference { pointer, .. } => {
             validate_unit_if_position(pointer, false, source, diagnostics)
         }
@@ -7258,9 +7280,11 @@ impl StaticUseAnalyzer {
                 } else {
                     self.expression(&binding.value, visible);
                 }
-                let id = self.declarations.len();
-                visible.insert(binding.name.clone(), id);
-                self.declarations.push(binding.span);
+                if binding.contextual_storage().is_none() {
+                    let id = self.declarations.len();
+                    visible.insert(binding.name.clone(), id);
+                    self.declarations.push(binding.span);
+                }
             }
             ScalarBlockItem::Expression(expression) => self.expression(expression, visible),
             ScalarBlockItem::Assignment(assignment) => {
@@ -7278,6 +7302,7 @@ impl StaticUseAnalyzer {
 
     fn expression(&mut self, expression: &ScalarExpression, visible: &BTreeMap<String, usize>) {
         match expression {
+            ScalarExpression::Contextual { .. } => {},
             ScalarExpression::Name { name, .. } => self.use_name(name, visible),
             ScalarExpression::Member { receiver, .. } => self.use_name(receiver, visible),
             ScalarExpression::Unary { operand, .. } => self.expression(operand, visible),
@@ -7345,6 +7370,7 @@ impl StaticUseAnalyzer {
 
     fn place(&mut self, place: &ScalarPlace, visible: &BTreeMap<String, usize>) {
         match place {
+            ScalarPlace::Contextual { .. } => {},
             ScalarPlace::Name { name, .. } => self.use_name(name, visible),
             ScalarPlace::Field { base, .. } => self.place(base, visible),
             ScalarPlace::Dereference { pointer, .. } => self.expression(pointer, visible),
@@ -7665,6 +7691,9 @@ fn block_item_type(
                 overloads,
                 inference,
             );
+            if binding.contextual_storage().is_some() {
+                return ScalarType::Unit;
+            }
             if declare_program_name(
                 program,
                 &binding.name,
@@ -7889,6 +7918,7 @@ fn validate_assignment_target_distinctness(
 
 fn place_contains_dynamic_index(place: &ScalarPlace) -> bool {
     match place {
+        ScalarPlace::Contextual { .. } => false,
         ScalarPlace::Name { .. } | ScalarPlace::Dereference { .. } => false,
         ScalarPlace::Field { base, .. } => place_contains_dynamic_index(base),
         ScalarPlace::Index { base, index, .. } => {
@@ -8003,6 +8033,7 @@ fn check_expression_type(
             ));
             ScalarType::Error
         }
+        ScalarExpression::Contextual { ty, .. } => ty.clone(),
         ScalarExpression::Name { name, span } => scope.get(name).cloned().unwrap_or_else(|| {
             diagnostics.push(diagnostic(program, "B0001", "unknown name", *span));
             ScalarType::Error

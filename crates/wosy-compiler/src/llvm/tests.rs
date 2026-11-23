@@ -4308,6 +4308,34 @@ fn retains_core_runtime_declarations_when_serializing_wasm_externs() {
 }
 
 #[test]
+fn emits_contextual_scoped_integer_places_for_native64_and_wasm32() {
+    let source = SourceIdentity::new("project".into(), "package".into(), "src/main.w".into(), "r1".into());
+    let text = r#"%%start
+        i8(i8) counter = fn(selector) {
+            i8 core.context.count = 1;
+            if (selector < 0) {
+                i8 core.context.count = core.context.count;
+                core.context.count = 2;
+            } else {
+                core.context.count = 3;
+            };
+            core.context.count
+        };
+    %%end"#;
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let parsed = parse_source(source.clone(), text.to_owned(), &[]);
+        let validation = crate::derive_scalar_program_with_layout(&parsed.result, layout);
+        assert!(validation.diagnostics.is_empty(), "{:?}", validation.diagnostics);
+        let llvm = emit_scalar_llvm(&validation).expect("contextual integer cells").to_text();
+        assert_eq!(llvm.lines().filter(|line|
+            line.trim_start().starts_with("%contextual") && line.contains(" = alloca i8")
+        ).count(), 2, "{llvm}");
+        assert!(llvm.contains("store i8 2"), "{llvm}");
+        assert!(llvm.contains("store i8 3"), "{llvm}");
+    }
+}
+
+#[test]
 fn emits_mutable_typed_place_writes_for_wasm32_and_native64() {
     let source = SourceIdentity::new(
         "project".into(),

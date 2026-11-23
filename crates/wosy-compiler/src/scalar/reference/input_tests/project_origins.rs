@@ -11,6 +11,7 @@ fn raw_module(path: &str, text: &str, target: ScalarTargetLayout) -> ScalarModul
         structs,
         enums,
         diagnostics,
+        ..
     } = derive_scalar_declarations_from_cst(parsed.result.canonical_cst());
     assert!(diagnostics.is_empty(), "{diagnostics:?}");
     let mut module = ScalarModule::new(source, items, Vec::new());

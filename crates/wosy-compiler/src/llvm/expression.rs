@@ -90,6 +90,19 @@ pub(super) fn emit_expression<'ctx, 'module>(
     expression: &ScalarExpression,
 ) -> Result<EmitValue<'ctx>, String> {
     match expression {
+        ScalarExpression::Contextual { binding, ty, .. } => {
+            let (slot, stored) = state.contextual_storage.get(binding)
+                .ok_or_else(|| "missing prepared LLVM contextual storage".to_owned())?;
+            if ty != stored {
+                return Err("invalid prepared LLVM contextual storage type".to_owned());
+            }
+            let value = state.builder.build_load(
+                storage_type(context, ty, state.layouts, state.target_layout)?,
+                *slot,
+                "contextual.value",
+            ).map_err(builder_error)?;
+            Ok(EmitValue::Basic(value))
+        }
         ScalarExpression::Name { name, .. } => {
             if name == "null" {
                 return Ok(EmitValue::Basic(
@@ -604,6 +617,7 @@ pub(super) fn emit_project_expression<'ctx, 'module>(
                 .collect::<Result<Vec<_>, _>>()?;
             emit_call_values(context, state, &target, values)
         }
+        ScalarExpression::Contextual { .. } => emit_expression(context, state, expression),
         ScalarExpression::Name { name, .. } => emit_expression(
             context,
             state,
@@ -838,6 +852,7 @@ fn emit_call<'ctx, 'module>(
 
 fn allocation_root_name(place: &crate::ScalarPlace) -> Result<&str, String> {
     match place {
+        crate::ScalarPlace::Contextual { .. } => Err("contextual storage is not an allocation root".to_owned()),
         crate::ScalarPlace::Name { name, .. } => Ok(name),
         crate::ScalarPlace::Index { base, .. } | crate::ScalarPlace::Field { base, .. } => {
             allocation_root_name(base)

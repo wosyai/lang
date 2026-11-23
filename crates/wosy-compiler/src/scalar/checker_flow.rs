@@ -994,9 +994,14 @@ impl IntegerInputs {
     }
 
     fn singleton_at(&self, axis: usize) -> Option<&BigInt> {
+        self.singleton_axis(axis).map(|(value, _)| value)
+    }
+
+    fn singleton_axis(&self, axis: usize) -> Option<(&BigInt, &Rc<IntegerSet>)> {
         let (first, rest) = self.0.split_first()?;
-        let value = first[axis].singleton_value()?;
-        rest.iter().all(|row| row[axis].singleton_value() == Some(value)).then_some(value)
+        let domain = &first[axis];
+        let value = domain.singleton_value()?;
+        rest.iter().all(|row| row[axis].singleton_value() == Some(value)).then_some((value, domain))
     }
 
     #[cfg(feature = "internal-checker")]
@@ -1205,8 +1210,7 @@ impl IntegerInputs {
         Self::compact_axis(self.0.into_iter().chain(other.0), axis)
     }
 
-    fn overwrite(mut self, axis: usize, value: &BigInt) -> Self {
-        let value = Rc::new(IntegerSet::singleton(value));
+    fn overwrite(mut self, axis: usize, value: Rc<IntegerSet>) -> Self {
         for row in &mut self.0 {
             row[axis] = Rc::clone(&value);
         }
@@ -3149,7 +3153,7 @@ fn walk_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, A
                 }
             }
             BlockItemKind::Assignment { group } => {
-                let (axis, value) = integer_assignment(calls, roots, group)?;
+                let (axis, value) = integer_assignment(calls, roots, group, &path)?;
                 path = path.overwrite(axis, value);
             }
             BlockItemKind::Binding(ref binding) => {
@@ -3247,6 +3251,29 @@ fn walk_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, A
                     path.append_local(IntegerSet::singleton(&value));
                     continue;
                 }
+                if let [receiver] = binding.receivers() {
+                    if let Some(identity) = &receiver.contextual_storage {
+                        let BindingInitialization::Outputs(outputs) = &binding.initialization else { return None; };
+                        let value = if let Some(literal) = structure.checker_integer_literals.get(&outputs.primary) {
+                            Rc::new(IntegerSet::singleton(literal))
+                        } else {
+                            if !structure.checker_contextual_occurrences.contains(&outputs.primary) {
+                                return None;
+                            }
+                            let PlainNameIdentity::Lexical(source) = calls.prepared_plain_name(outputs.primary)? else { return None; };
+                            let (axis, ty) = roots.lookup(source)?;
+                            if ty != &receiver.ty {
+                                return None;
+                            }
+                            Rc::clone(path.singleton_axis(axis)?.1)
+                        };
+                        let identity = structure.checker_integer_locals.get(&(block, item.position))
+                            .filter(|prepared| *prepared == identity)?;
+                        roots.add(identity, &receiver.ty);
+                        path.append_shared_local(&value);
+                        continue;
+                    }
+                }
                 let (identity, ty, value) = integer_local(calls, binding, block, item.position)?;
                 roots.add(identity, ty);
                 path.append_local(IntegerSet::singleton(value));
@@ -3260,19 +3287,43 @@ fn walk_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, A
     Some(IntegerControl::Continue(path))
 }
 
-fn integer_assignment<'a>(
-    calls: &'a FunctionCallSites,
+fn integer_assignment(
+    calls: &FunctionCallSites,
     roots: &IntegerRoots<'_>,
     position: BlockPosition,
-) -> Option<(usize, &'a BigInt)> {
-    let (binding, replacement, value) = checked_literal_assignment(calls, position)?;
+    path: &IntegerInputs,
+) -> Option<(usize, Rc<IntegerSet>)> {
+    let (binding, replacement, rhs, destination) = checked_scalar_assignment(calls, position)?;
     let (axis, ty) = roots.lookup(binding)?;
+    let value = if let Some(value) = calls.structure.checker_integer_literals.get(&rhs) {
+        Rc::new(IntegerSet::singleton(value))
+    } else {
+        if !calls.structure.checker_contextual_occurrences.contains(&rhs)
+            || !calls.structure.checker_contextual_occurrences.contains(&destination)
+        {
+            return None;
+        }
+        let PlainNameIdentity::Lexical(source) = calls.prepared_plain_name(rhs)? else { return None; };
+        let (source, source_ty) = roots.lookup(source)?;
+        if source_ty != replacement {
+            return None;
+        }
+        Rc::clone(path.singleton_axis(source)?.1)
+    };
     (ty == replacement).then_some((axis, value))
 }
 
+#[cfg(feature = "internal-checker")]
 fn checked_literal_assignment(
     calls: &FunctionCallSites, position: BlockPosition,
 ) -> Option<(&ReferenceBindingId, &ScalarType, &BigInt)> {
+    let (binding, ty, rhs, _) = checked_scalar_assignment(calls, position)?;
+    Some((binding, ty, calls.structure.checker_integer_literals.get(&rhs)?))
+}
+
+fn checked_scalar_assignment(
+    calls: &FunctionCallSites, position: BlockPosition,
+) -> Option<(&ReferenceBindingId, &ScalarType, OccurrenceOrdinal, OccurrenceOrdinal)> {
     let group = calls.assignments.get(&(position.block, position.item))?;
     let [rhs] = group.rhs_evaluations().as_slice() else { return None; };
     let [destination] = group.destinations().as_slice() else { return None; };
@@ -3283,8 +3334,7 @@ fn checked_literal_assignment(
         calls.prepared_direct_destination(destination.destination)?
     else { return None; };
     let AssignmentReplacement::Resolved(replacement) = &destination.replacement else { return None; };
-    let value = calls.structure.checker_integer_literals.get(&rhs.expression)?;
-    Some((binding, replacement, value))
+    Some((binding, replacement, rhs.expression, destination.destination))
 }
 
 #[cfg(feature = "internal-checker")]

@@ -325,6 +325,7 @@ pub(super) fn place_pointer<'ctx, 'module>(
     project: Option<ProjectCallScope<'_>>,
 ) -> Result<PointerValue<'ctx>, String> {
     match place {
+        crate::ScalarPlace::Contextual { binding, .. } => state.contextual_storage.get(binding).map(|(pointer, _)| *pointer).ok_or_else(|| "missing prepared LLVM contextual storage".to_owned()),
         crate::ScalarPlace::Name { name, .. } => {
             if let Some((slot, ty)) = state.storage.get(name).cloned() {
                 if matches!(ty, ScalarType::RuntimeArray { .. }) {
@@ -538,6 +539,7 @@ pub(super) fn emit_place_value_in_project<'ctx, 'module>(
 ) -> Result<EmitValue<'ctx>, String> {
     let pointer = place_pointer(context, state, place, project)?;
     let ty = match place {
+        crate::ScalarPlace::Contextual { ty, .. } => ty.clone(),
         crate::ScalarPlace::Field { field, .. } => {
             let ScalarFieldReference::Resolved(field) = field else {
                 return Err("unresolved LLVM struct field".to_owned());

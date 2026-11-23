@@ -266,5 +266,52 @@ def check_file_output(binary):
         assert not (caller / ".wosy").exists()
 
 
+def check_contextual_storage(binary):
+    def require(condition, message, code):
+        return (
+            f'core.require({condition}, {{ .stdout = "{message}";'
+            f' .stderr = ""; .code = {code}; .files = []; }});'
+        )
+
+    with tempfile.TemporaryDirectory() as scratch:
+        root = Path(scratch)
+        (root / "src").mkdir()
+        manifest = MANIFEST.replace('default_target = "app"', 'default_target = "app"\nsource_root = "src"')
+        manifest = manifest.replace('root = "main.w"', 'root = "src/main.w"')
+        (root / "wosy.toml").write_text(manifest, encoding="utf-8")
+        source = root / "src" / "main.w"
+        program = f"""%%start
+        unit(i8) state = fn(selector) {{
+            i8 core.context.count = 1;
+            if (selector < 0) {{
+                i8 core.context.count = core.context.count;
+                {require("core.context.count == 1", "bad init", 7)}
+                core.context.count = 2;
+                {require("core.context.count == 9", "inner:", 31)}
+            }} else {{
+                core.context.count = 3;
+            }};
+            if (selector < 0) {{
+                {require("core.context.count == 1", "bad restore", 11)}
+            }} else {{
+                {require("core.context.count == 1", "outer", 37)}
+            }};
+        }};
+        %%end"""
+
+        def run(scope):
+            return subprocess.run(
+                [binary, "check", scope], cwd=root, capture_output=True, timeout=15
+            )
+
+        source.write_text(program, encoding="utf-8")
+        result = run("--main-flow-only")
+        assert (result.returncode, result.stdout, result.stderr) == (0, b"", b""), result
+        result = run("--declared-package")
+        assert (result.returncode, result.stdout, result.stderr) == (31, b"inner:outer", b""), result
+        assert not (root / ".wosy").exists()
+
+
 if __name__ == "__main__":
     main()
+    check_contextual_storage(Path(sys.argv[1]).resolve())
