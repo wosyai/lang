@@ -8700,6 +8700,57 @@ mod tests {
 
     #[cfg(feature = "internal-checker")]
     #[test]
+    fn ordered_base_symbolic_call_computes_single_axis_returns_without_losing_entry() {
+        let report = OUTPUT.replace(".code = 1", ".code = 23");
+        let program = format!(r#"%%start
+            i8(i8) unary = fn(n) {{
+                if (n == -2) {{ n = 3; n + 1 }} else {{ n }}
+            }};
+            i8(u8, i8) fixed = fn(tag, n) {{
+                if (tag == 9) {{ if (n == -2) {{ n - 2 }} else {{ n }} }} else {{ 1 }}
+            }};
+            i8(i8, i8) equal = fn(n, same) {{
+                if (n == -2) {{ n - same }} else {{ n }}
+            }};
+            unit(i8) unused = fn(input) {{
+                i8 u = unary(input);
+                i8 f = fixed(9, input);
+                i8 e = equal(input, input);
+                if (input == -2) {{
+                    core.require(u == 4, {report});
+                    core.require(f == -4, {report});
+                    core.require(e == 0, {report});
+                }} else {{
+                    if (input < 0) {{
+                        core.require(u < 0, {report});
+                        core.require(f < 0, {report});
+                        core.require(e < 0, {report});
+                    }};
+                }};
+            }};
+        %%end"#);
+        let run = |revision, text: &str| {
+            let source = source("src/main.w", revision);
+            let target = prepare_proof_target(&source, text).unwrap();
+            run_closed_without_named_proofs(&target, ScalarCheckerScope::CurrentPackage, 1)
+        };
+        let pass = run("symbolic-computed-single-pass", &program).unwrap();
+        assert!(pass.active && pass.directives.is_empty());
+        let bad = run("symbolic-computed-single-witness", &program.replace("u == 4", "u == 3")).unwrap();
+        let [failure] = bad.directives.as_slice() else { panic!("only the overridden unary result fails"); };
+        assert_eq!(failure.code(), &BigInt::from(23));
+        assert_eq!(failure.witness.row_count(), 1);
+        for (axis, value) in [-2, 4, -4, 0].map(BigInt::from).iter().enumerate() {
+            assert!(failure.witness.intervals_at(0, axis).unwrap().eq([(value, value)]));
+        }
+        assert!(matches!(run("symbolic-computed-single-broad", &program.replace(
+            "if (n == -2) { n = 3; n + 1 }", "if (n < 0) { n + 1 }")), Err(ProjectCheck::Unsupported)));
+        assert!(matches!(run("symbolic-computed-single-overflow", &program.replace("n = 3; n + 1", "n = 127; n + 1")),
+            Err(ProjectCheck::Unsupported)));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
     fn ordered_base_symbolic_call_returns_resume_surviving_terminal_arm() {
         let report = |code| OUTPUT.replace(".code = 1", &format!(".code = {code}"));
         for first_empty in [true, false] {
