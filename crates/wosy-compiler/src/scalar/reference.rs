@@ -11250,24 +11250,25 @@ fn derive_module_reference_origins(
             if result.collect_local_mixed_targets(source, &mut mixed_targets) {
                 mixed_callers.push(position);
             }
-            if function.generic_parameters.is_empty() && function.overload_arms.is_empty()
-                && matches!(&function.signature, ScalarType::Callable { outputs, .. }
-                    if aggregate::mixed_owned_struct_result(outputs).is_some())
-            {
-                mixed_producers.push((position, function.name_span));
+            if function.generic_parameters.is_empty() && function.overload_arms.is_empty() {
+                if let ScalarType::Callable { outputs, .. } = &function.signature {
+                    if let Some(lanes) = aggregate::mixed_owned_struct_result(outputs) {
+                        mixed_producers.push((position, function.name_span, lanes));
+                    }
+                }
             }
             updates.push((index, result));
         }
     }
     if errors.is_empty() && !mixed_targets.is_empty() {
-        let mut owners = mixed_producers.iter().filter_map(|&(position, declaration)| {
+        let mut owners = mixed_producers.iter().filter_map(|&(position, declaration, lanes)| {
             let result = &updates[position].1;
-            (mixed_targets.contains(&declaration) && result.aggregate.proves_mixed_local_owner(&result.cfg))
+            (mixed_targets.contains(&declaration) && result.aggregate.proves_mixed_local_owner(&result.cfg, lanes))
                 .then_some(declaration)
         }).collect::<HashSet<_>>();
         if !owners.is_empty() {
             let mut forwarding_users = HashMap::<_, Vec<_>>::new();
-            for (position, declaration) in mixed_producers {
+            for (position, declaration, _) in mixed_producers {
                 let (index, result) = &updates[position];
                 let ScalarItem::Function(function) = &items[*index] else { unreachable!("function result ordinal") };
                 if let Some(callee) = result.mixed_forwarded_callee(source, function, &call_sites.functions[index]) {

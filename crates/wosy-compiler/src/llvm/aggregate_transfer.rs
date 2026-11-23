@@ -1,5 +1,5 @@
 use super::*;
-use crate::scalar::{mixed_owned_struct_result, ArrayWriterSide, ClosedBody, ClosedCall, ClosedInitializer, ClosedInitializerInput, ClosedInput, ClosedLiteralArray, ClosedLocalArrayRelease, ClosedReturn, ConcreteCallSelection, FreshArrayExtent, ReplacementArrayExtent, ScalarBinding};
+use crate::scalar::{mixed_owned_struct_result, mixed_owner_result_lanes, ArrayWriterSide, ClosedBody, ClosedCall, ClosedInitializer, ClosedInitializerInput, ClosedInput, ClosedLiteralArray, ClosedLocalArrayRelease, ClosedReturn, ConcreteCallSelection, FreshArrayExtent, ReplacementArrayExtent, ScalarBinding};
 use inkwell::types::AnyType;
 
 pub(super) struct InitializerEmitter<'ctx, 'plan> {
@@ -285,8 +285,11 @@ pub(super) fn definition_type<'ctx>(
         .collect::<Result<Vec<BasicMetadataTypeEnum<'ctx>>, _>>()?;
     arguments.push(pointer.into());
     Ok(match mixed {
-        Some(scalar) => context.struct_type(&[pointer.into(), basic_type(context, scalar, layout)?], false)
-            .fn_type(&arguments, false),
+        Some(lanes) => {
+            let mut transport = [pointer.into(); 2];
+            transport[lanes.scalar] = basic_type(context, &outputs.outputs[lanes.scalar].ty, layout)?;
+            context.struct_type(&transport, false).fn_type(&arguments, false)
+        }
         None => pointer.fn_type(&arguments, false),
     })
 }
@@ -700,12 +703,16 @@ pub(super) fn store_received_binding<'ctx>(
         Some((_, ClosedCall::Receive)) => {}
         _ => return Ok(false),
     }
-    if let [receiver, scalar] = binding.receivers.as_slice() {
-        let owner = extract_output(state, value, 0)?;
+    if let [head, tail] = binding.receivers.as_slice() {
+        let lanes = mixed_owner_result_lanes(&head.ty, &tail.ty)
+            .ok_or_else(|| "invalid mixed aggregate result binding".to_owned())?;
+        let receiver = &binding.receivers[lanes.owner];
+        let scalar = &binding.receivers[lanes.scalar];
+        let owner = extract_output(state, value, lanes.owner)?;
         let EmitValue::Basic(BasicValueEnum::PointerValue(destination)) = owner else {
             return Err("mixed aggregate receiver did not receive a destination".into());
         };
-        let value = extract_output(state, value, 1)?;
+        let value = extract_output(state, value, lanes.scalar)?;
         let slot = entry_storage_alloca(context, state, &scalar.ty, &scalar.name)?;
         store_value(context, state, slot, &scalar.ty, value)?;
         state.storage.insert(scalar.name.clone(), (slot, scalar.ty.clone()));
@@ -987,19 +994,19 @@ fn emit_selected_call<'ctx, 'module>(
         &empty_outputs
     };
     let mixed = matches!(action, Some(CallDestination::Body(_)))
-        && mixed_owned_struct_result(outputs).is_some();
+        .then(|| mixed_owned_struct_result(outputs)).flatten();
     let destination = match action {
         Some(CallDestination::Body(ClosedCall::Receive) | CallDestination::InitializerTemporary) => {
             let ([output] | [output, _]) = outputs.outputs.as_slice() else {
                 return Err(format!("invalid closed aggregate output {symbol}"));
             };
-            if !mixed && outputs.outputs.len() != 1 {
+            if mixed.is_none() && outputs.outputs.len() != 1 {
                 return Err(format!("invalid closed aggregate output {symbol}"));
             }
             Some(entry_storage_alloca(
                 context,
                 state,
-                &output.ty,
+                &mixed.map_or(output, |lanes| &outputs.outputs[lanes.owner]).ty,
                 "aggregate_destination",
             )?)
         }
@@ -1073,18 +1080,18 @@ fn emit_selected_call<'ctx, 'module>(
         .basic()
         .ok_or_else(|| "missing closed aggregate original base".to_owned())?;
     state.call_owner_flags.clear();
-    if mixed && matches!(action, Some(CallDestination::Body(ClosedCall::Forward))) {
+    if mixed.is_some() && matches!(action, Some(CallDestination::Body(ClosedCall::Forward))) {
         let aggregate = state.aggregate.as_mut().expect("closed aggregate call context");
         if aggregate.mixed_return.replace(transport.into_struct_value()).is_some() {
             return Err("duplicate mixed aggregate forwarded result".into());
         }
         return Ok(EmitValue::Unit);
     }
-    let (base, pair) = if mixed {
+    let (base, pair) = if let Some(lanes) = mixed {
         let pair = transport.into_struct_value();
-        let base = state.builder.build_extract_value(pair, 0, "aggregate_base")
+        let base = state.builder.build_extract_value(pair, lanes.owner as u32, "aggregate_base")
             .map_err(builder_error)?.into_pointer_value();
-        (base, Some(pair))
+        (base, Some((pair, lanes.owner)))
     } else {
         (transport.into_pointer_value(), None)
     };
@@ -1109,8 +1116,8 @@ fn emit_selected_call<'ctx, 'module>(
         }
     }
     let destination = destination.expect("return destination");
-    if let Some(pair) = pair {
-        let value = state.builder.build_insert_value(pair, destination, 0, "aggregate_values")
+    if let Some((pair, lane)) = pair {
+        let value = state.builder.build_insert_value(pair, destination, lane as u32, "aggregate_values")
             .map_err(builder_error)?.into_struct_value();
         Ok(EmitValue::Aggregate {
             value,
@@ -1248,11 +1255,11 @@ pub(super) fn commit_return<'ctx>(
     if !matches!(aggregate.plan.returning, Some(ClosedReturn::Allocation { .. })) {
         return Ok(());
     }
-    let mixed = mixed_owned_struct_result(outputs).is_some();
+    let mixed = mixed_owned_struct_result(outputs);
     let ([output] | [output, _]) = outputs.outputs.as_slice() else {
         return Err("invalid closed aggregate returned descriptor".into());
     };
-    if !mixed && outputs.outputs.len() != 1 {
+    if mixed.is_none() && outputs.outputs.len() != 1 {
         return Err("invalid closed aggregate returned descriptor".into());
     }
     let destination = aggregate.destination
@@ -1262,13 +1269,13 @@ pub(super) fn commit_return<'ctx>(
     let base = aggregate.base
         .filter(|_| state.runtime_array_owners.get(&name).copied().unwrap_or(false))
         .ok_or_else(|| "closed aggregate handoff has no live original owner".to_owned())?;
-    if mixed {
+    if let Some(lanes) = mixed {
         let EmitValue::Aggregate { value, .. } = result else {
             return Err("mixed aggregate return has no ordered values".into());
         };
-        let descriptor = extract_output(state, result, 0)?;
-        store_value(context, state, destination, &output.ty, descriptor)?;
-        let pair = state.builder.build_insert_value(*value, base, 0, "closed_base")
+        let descriptor = extract_output(state, result, lanes.owner)?;
+        store_value(context, state, destination, &outputs.outputs[lanes.owner].ty, descriptor)?;
+        let pair = state.builder.build_insert_value(*value, base, lanes.owner as u32, "closed_base")
             .map_err(builder_error)?.into_struct_value();
         state.aggregate.as_mut().expect("closed aggregate handoff").mixed_return = Some(pair);
     } else {

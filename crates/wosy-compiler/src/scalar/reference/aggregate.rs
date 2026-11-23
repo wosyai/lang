@@ -408,11 +408,37 @@ pub(super) fn checked_scalar_output(outputs: &[RootOutputType]) -> bool {
             if ordinary_value(inner))
 }
 
-pub(crate) fn mixed_owned_struct_result(outputs: &ScalarOutputSequence) -> Option<&ScalarType> {
-    match outputs.outputs.as_slice() {
-        [ScalarOutput { ty: ScalarType::Struct(_), .. }, ScalarOutput { ty, .. }] if ordinary_value(ty) => Some(ty),
-        _ => None,
-    }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct MixedOwnerResultLanes {
+    pub(crate) owner: usize,
+    pub(crate) scalar: usize,
+}
+
+pub(crate) fn mixed_owner_result_lanes(first: &ScalarType, second: &ScalarType) -> Option<MixedOwnerResultLanes> {
+    (matches!(first, ScalarType::Struct(_)) && ordinary_value(second))
+        .then_some(MixedOwnerResultLanes { owner: 0, scalar: 1 })
+}
+
+pub(crate) fn mixed_owned_struct_result(outputs: &ScalarOutputSequence) -> Option<MixedOwnerResultLanes> {
+    let [first, second] = outputs.outputs.as_slice() else { return None };
+    mixed_owner_result_lanes(&first.ty, &second.ty)
+}
+
+#[cfg(test)]
+#[test]
+fn mixed_owner_lanes_do_not_admit_other_result_shapes() {
+    let owner = ScalarType::Struct(ScalarStructId {
+        source: SourceIdentity::new("project".into(), "package".into(), "metadata".into(), "r1".into()),
+        index: 0,
+    });
+    let scalar = ScalarType::U64;
+    assert_eq!(
+        mixed_owner_result_lanes(&owner, &scalar),
+        Some(MixedOwnerResultLanes { owner: 0, scalar: 1 }),
+    );
+    assert!(mixed_owner_result_lanes(&scalar, &owner).is_none());
+    assert!(mixed_owner_result_lanes(&owner, &owner).is_none());
+    assert!(mixed_owner_result_lanes(&scalar, &scalar).is_none());
 }
 
 pub(in crate::scalar) fn ordinary_value(ty: &ScalarType) -> bool {
@@ -644,17 +670,17 @@ pub(super) struct AggregateFlowResult {
 }
 
 impl AggregateFlowResult {
-    pub(super) fn proves_mixed_local_owner(&self, cfg: &ScalarReferenceCfg) -> bool {
-        let mut owners = self.return_owners(cfg, true);
+    pub(super) fn proves_mixed_local_owner(&self, cfg: &ScalarReferenceCfg, lanes: MixedOwnerResultLanes) -> bool {
+        let mut owners = self.return_owners(cfg, Some(lanes.owner));
         let Some(Some(owner @ OwnerSource::Allocation(_))) = owners.next() else { return false };
         owners.all(|current| current == Some(owner))
     }
 
-    fn return_owners<'a>(&'a self, cfg: &'a ScalarReferenceCfg, mixed: bool)
+    fn return_owners<'a>(&'a self, cfg: &'a ScalarReferenceCfg, owner_lane: Option<usize>)
         -> impl Iterator<Item = Option<OwnerSource>> + 'a
     {
-        self.returns.iter().filter(move |(point, _)| !mixed || matches!(cfg.points[point.0].kind,
-            CfgPointKind::ReturnOutput { output: 0, .. }))
+        self.returns.iter().filter(move |(point, _)| owner_lane.is_none_or(|owner| matches!(cfg.points[point.0].kind,
+            CfgPointKind::ReturnOutput { output, .. } if output == owner)))
             .flat_map(|(_, alternatives)| alternatives.iter().copied())
     }
 
@@ -1939,16 +1965,19 @@ struct Body<'a> {
 }
 
 impl Body<'_> {
+    fn mixed_result_lanes(&self) -> Option<MixedOwnerResultLanes> {
+        let [RootOutputType { output: 0, ty: first }, RootOutputType { output: 1, ty: second }] =
+            self.sites.boundary.root_outputs.as_slice() else { return None };
+        mixed_owner_result_lanes(first, second)
+    }
+
     fn has_mixed_struct_result(&self) -> bool {
-        matches!(self.sites.boundary.root_outputs.as_slice(), [
-            RootOutputType { output: 0, ty: ScalarType::Struct(_) },
-            RootOutputType { output: 1, ty },
-        ] if ordinary_value(ty))
+        self.mixed_result_lanes().is_some()
     }
 
     fn return_owners(&self) -> impl Iterator<Item = Option<OwnerSource>> + '_ {
-        let mixed = self.has_mixed_struct_result();
-        self.facts.into_iter().flat_map(move |facts| facts.return_owners(self.cfg, mixed))
+        let lane = self.mixed_result_lanes().map(|lanes| lanes.owner);
+        self.facts.into_iter().flat_map(move |facts| facts.return_owners(self.cfg, lane))
     }
 }
 
