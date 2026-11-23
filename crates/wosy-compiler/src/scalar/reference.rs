@@ -4062,7 +4062,9 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     if binding.is_allocation {
                         self.cfg.allocations.insert(id.clone());
                     }
-                    if binding.fallible_assignment.is_some() && is_integer_type(&receiver.ty) {
+                    if binding.fallible_assignment.is_some()
+                        && (is_integer_type(&receiver.ty) || matches!(receiver.ty, ScalarType::Struct(_)))
+                    {
                         declares_fallible = true;
                         self.proof_points.fallible_allocation_bindings.get_or_insert_with(HashMap::new).insert(id.clone(), (scope, receiver.ty.clone()));
                         self.local_borrow = None;
@@ -6579,6 +6581,22 @@ fn linear_incoming_slot_preserves_gaps_and_distinct_ordered_states() {
     assert_eq!(incoming.next_forward(5), Some(CfgPointId(7)));
 }
 
+fn require_available_fallible_read(
+    bindings: &HashMap<ReferenceBindingId, (ReferenceScopeId, ScalarType)>,
+    state: &ReferenceEdgeState,
+    binding: &ReferenceBindingId,
+    point: &ReferenceFlowPoint,
+    errors: &mut Vec<ReferenceAnalysisError>,
+) {
+    if state.uninitialized.contains(binding) && bindings.contains_key(binding) {
+        errors.push(ReferenceAnalysisError::MissingOrigin {
+            source_span: point.source_span.clone(),
+            binding_id: binding.clone(),
+            reason: ReferenceAnalysisErrorReason::UnavailableFallibleAllocation,
+        });
+    }
+}
+
 fn transfer_reference_facts(
     mut cfg: ReferenceTransferCfg<'_>,
     deferred_policies: &BTreeMap<usize, CopyPolicy>,
@@ -7726,6 +7744,13 @@ fn transfer_reference_facts(
                 }
             }
             for place in read_places {
+                if let Some(bindings) = cfg.fallible_allocation_bindings {
+                    if matches!(&point.kind, CfgPointKind::ReadPlace { pointer_point: None, .. })
+                        && is_lexical_field_path(&place.projections)
+                    {
+                        require_available_fallible_read(bindings, &state, &place.binding, point, &mut errors);
+                    }
+                }
                 let normalized = available_place_for_check(place);
                 if let Some(storage) = handle_storage {
                     let storage_place = if matches!(storage, CheckedHandleStorage::Pointee) {
@@ -7959,15 +7984,8 @@ fn transfer_reference_facts(
                     }
                 }
                 CfgPointKind::Read { binding } => {
-                    if cfg.fallible_allocation_bindings.is_some()
-                        && state.uninitialized.contains(binding)
-                        && cfg.fallible_allocation_bindings.is_some_and(|bindings| bindings.contains_key(binding))
-                    {
-                        errors.push(ReferenceAnalysisError::MissingOrigin {
-                            source_span: point.source_span.clone(),
-                            binding_id: binding.clone(),
-                            reason: ReferenceAnalysisErrorReason::UnavailableFallibleAllocation,
-                        });
+                    if let Some(bindings) = cfg.fallible_allocation_bindings {
+                        require_available_fallible_read(bindings, &state, binding, point, &mut errors);
                     }
                     let origins = unavailable_checked_handles(&state, binding, &[], CheckedHandleStorage::Lexical);
                     if !origins.is_empty() {

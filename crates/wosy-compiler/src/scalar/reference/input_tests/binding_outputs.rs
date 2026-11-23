@@ -474,3 +474,41 @@ fn prepared_fallible_reads_require_availability_on_all_projected_paths() {
         assert!(errors.iter().all(|error| Some(error.reason()) == expected));
     }
 }
+
+#[test]
+fn prepared_fallible_field_reads_require_the_exact_present_root() {
+    use ReferenceAnalysisErrorReason::UnavailableFallibleAllocation;
+    for (body, needs_refusal) in [
+        ("if (&held == null) { 7 } else { held.value }", false),
+        ("if (null != &held) { held.value } else { 7 }", false),
+        ("if (&held == null) { held.value } else { 7 }", true),
+        ("i32 prior = if (&held == null) { 7 } else { held.value };\n\tprior + held.value", true),
+        ("held.value", true),
+    ] {
+        let text = format!("%%start\nstruct Record {{ i32 value; }}\ni32() example = fn {{\n\tRecord held = {{ .value = 42; }};\n\t{body}\n}};\n%%end");
+        let parsed = parse_source(source(), text.clone(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let (typed, occurrences) = typecheck_scalar_program_with_occurrences(
+            derive_scalar_declarations_from_cst(parsed.result.canonical_cst()),
+            ScalarTargetLayout::WASM32,
+        );
+        assert!(typed.diagnostics.is_empty(), "{:?}", typed.diagnostics);
+        let mut program = typed.program;
+        let calls = resolve_program_call_sites_with_occurrences(&program, occurrences).unwrap();
+        let [ScalarItem::Function(function)] = program.items.as_mut_slice() else { panic!("example") };
+        let ScalarBlockItem::LocalBinding(binding) = &mut function.body.items[0] else { panic!("record receiver") };
+        binding.fallible_assignment = Some(binding.name_span);
+        let (results, errors) = derive_module_reference_origins(
+            &program.source, &program.items, &calls, &program.structs, &program.enums, false,
+        );
+        let [(_, result)] = results.as_slice() else { panic!("example reference result"); };
+        let reads = result.cfg.points.iter().filter(|point| matches!(&point.kind,
+            CfgPointKind::ReadPlace { candidates, pointer_point: None, .. } if candidates.iter().any(|place|
+                matches!(place.projections.as_slice(), [ReferencePlaceProjection::Field(ScalarFieldReference::Resolved(_))])
+            )));
+        assert!(reads.count() >= 1, "{body}");
+        assert_eq!(result.cfg.guarded_scalar_allocation().is_none(), needs_refusal, "{body}");
+        assert_eq!(errors.len(), usize::from(needs_refusal), "{body}: {errors:?}");
+        assert!(errors.iter().all(|error| error.reason() == UnavailableFallibleAllocation), "{body}: {errors:?}");
+    }
+}
