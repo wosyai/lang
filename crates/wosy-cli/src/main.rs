@@ -856,6 +856,7 @@ fn check_command(target: Option<&str>, profile: &str, main_flow_only: bool) -> R
             LoadError::Target => "check: invalid target".to_owned(),
             LoadError::Profile => "check: invalid target profile".to_owned(),
             LoadError::Layout => "check: unsupported target layout".to_owned(),
+            LoadError::PackageSourceRoot(error) => format!("check: {error}"),
             LoadError::DormantPath | LoadError::Dormant(_) => "check: unexpected dormant source".to_owned(),
         })?;
     let report = match receipt.outcome {
@@ -1820,6 +1821,112 @@ unit(u8) unused = fn(value) {{ core.require(value < 1, {{ .stdout = \"unused dep
         assert!(matches!(selected.command, Command::Check {
             target: Some(target), profile, main_flow_only: true,
         } if target == "app" && profile == "dev"));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn configured_declared_package_scope_uses_exact_membership_without_dormant_initializers() {
+        use configured_check::{check_declared_package_target, ConfiguredCheckLoadError};
+        let root = snapshot_test_path("declared-scope").with_extension("");
+        let manifest = r#"
+[package]
+name = "app"
+default_target = "app"
+source_root = "src"
+
+[comments]
+categories = []
+[builders]
+[runners]
+
+[targets.app]
+root = "src/main.w"
+[targets.app.artifacts.main]
+artifact = "RuntimeStdio"
+[targets.app.artifacts.main.profiles.dev]
+backend = "llvm"
+output = "native"
+builder = "never"
+run_runner = "never"
+[targets.app.profiles.dev]
+main_artifact = "main"
+"#;
+        let main = r#"%%start
+            imported = namespace app "src/live.w";
+            u8 actual = imported.run(7);
+        %%end"#;
+        let dormant = r#"%%start
+            core.require(false, { .stdout = "forbidden initializer"; .stderr = ""; .code = 19; .files = []; });
+            u8(u8) dormant = fn(value) { value };
+            proof checks for dormant(entry) -> (out) ensures (out != 7) {}
+        %%end"#;
+        let write = |path: &str, text: &str| {
+            let path = root.join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, text).unwrap();
+        };
+        for (path, content) in [
+            ("wosy.toml", manifest), ("src/main.w", main),
+            ("src/live.w", "%%start u8(u8) run = fn(value) { value }; %%end"),
+            ("src/features/dormant.w", dormant),
+            ("stray.w", "intentionally invalid outside the declared tree"),
+            ("src/other_package/wosy.toml", r#"[package]
+name = "other"
+source_root = "src"
+"#),
+            ("src/other_package/src/broken.w", "intentionally invalid in the nested package"),
+            ("src/.wosy/broken.w", "intentionally invalid in generated state"),
+        ] {
+            write(path, content);
+        }
+        let checked = check_declared_package_target(&root, None, "dev")
+            .unwrap_or_else(|_| panic!("configured tree should close"));
+        let report = checked.outcome.unwrap();
+        assert!(report.active && report.directives.is_empty() && report.diagnostics.is_empty());
+        let failure = report.symbolic_diagnostic.unwrap();
+        assert_eq!(failure.proof.source.path, "src/features/dormant.w");
+        assert_eq!(failure.returned.to_string(), "7");
+        assert!(report.additional_symbolic_diagnostics.is_empty());
+        assert_eq!(checked.texts.len(), 3);
+        assert!(!root.join(".wosy").exists());
+
+        write("wosy.toml", &manifest.replace("source_root = \"src\"\n", ""));
+        assert!(matches!(check_declared_package_target(&root, None, "dev"),
+            Err(ConfiguredCheckLoadError::PackageSourceRoot(_))));
+        write("wosy.toml", manifest);
+        write("src/main.w", &main.replace("src/live.w", "stray.w"));
+        assert!(matches!(check_declared_package_target(&root, None, "dev"),
+            Err(ConfiguredCheckLoadError::Canonical(CanonicalLoadFailure::Input(message)))
+                if message.contains("outside the declared package source tree")));
+        write("src/main.w", main);
+        let nested = "src/other_package/wosy.toml";
+        write(nested, "[package]\nname =");
+        assert!(matches!(check_declared_package_target(&root, None, "dev"),
+            Err(ConfiguredCheckLoadError::Dormant(CanonicalLoadFailure::Input(message)))
+                if message.contains("invalid nested package identity")));
+        fs::remove_file(root.join(nested)).unwrap();
+        fs::create_dir(root.join(nested)).unwrap();
+        assert!(matches!(check_declared_package_target(&root, None, "dev"),
+            Err(ConfiguredCheckLoadError::Dormant(CanonicalLoadFailure::Input(message)))
+                if message.contains("nested package manifest is not a non-aliased regular file")));
+        fs::remove_dir(root.join(nested)).unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(root.join("wosy.toml"), root.join(nested)).unwrap();
+            assert!(matches!(check_declared_package_target(&root, None, "dev"),
+                Err(ConfiguredCheckLoadError::Dormant(CanonicalLoadFailure::Input(message)))
+                    if message.contains("nested package manifest is not a non-aliased regular file")));
+            fs::remove_file(root.join(nested)).unwrap();
+        }
+        write(nested, "[package]\nname = \"other\"\nsource_root = \"src\"\n");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(root.join("stray.w"), root.join("src/alias.w")).unwrap();
+            assert!(matches!(check_declared_package_target(&root, None, "dev"),
+                Err(ConfiguredCheckLoadError::Dormant(CanonicalLoadFailure::Input(message)))
+                    if message.contains("package source path is aliased")));
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(not(feature = "internal-checker"))]

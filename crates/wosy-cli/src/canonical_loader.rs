@@ -29,6 +29,8 @@ pub(crate) enum CanonicalLoadPurpose {
     #[cfg(feature = "internal-checker")]
     #[allow(dead_code)]
     LocalProofs,
+    #[cfg(feature = "internal-checker")]
+    PackageProofs(HashSet<PackageRelativePath>),
 }
 
 enum CanonicalSourceDeclarations {
@@ -133,8 +135,10 @@ impl<'a> DormantSourceBoundaries<'a> {
         let relative = identity.path.as_path();
         let spelling = relative.to_str().ok_or_else(|| "dormant source path must be UTF-8".to_owned())?;
         if spelling.is_empty() || spelling.contains('\\')
-            || !relative.components().all(|component| matches!(component, Component::Normal(_)))
-            || relative.components().collect::<std::path::PathBuf>().as_os_str() != relative.as_os_str()
+            || !relative.components().map(|component| match component {
+                Component::Normal(name) => name.to_str(),
+                _ => None,
+            }).eq(spelling.split('/').map(Some))
         {
             return Err(format!("dormant source path is not canonical: {spelling}").into());
         }
@@ -187,6 +191,84 @@ pub(crate) fn load_explicit_dormant_proof_sources(
     }).collect()
 }
 
+#[cfg(feature = "internal-checker")]
+pub(crate) fn declared_package_proof_paths(
+    root: &std::path::Path, project: &ProjectContext, configuration: &ProjectConfiguration,
+    directory: &PackageRelativePath,
+) -> Result<Vec<PackageRelativePath>, CanonicalLoadFailure> {
+    use std::io::ErrorKind;
+    use std::path::Component;
+
+    let boundaries = DormantSourceBoundaries::new(root, project, configuration);
+    let identity = |path| ProjectSourceIdentity::new(root.to_string_lossy().into_owned(), project.package.clone(), path);
+    boundaries.validate(&identity(directory.clone()))?;
+    let source_root = directory.as_path();
+    let reserved = |name: &std::ffi::OsStr| matches!(name.to_str(), Some(".git" | ".wosy" | "deps" | "patches" | "references"));
+    if source_root.components().any(|part| matches!(part, Component::Normal(name) if reserved(name))) {
+        return Err("declared package source root uses a reserved directory".to_owned().into());
+    }
+    let source_absolute = root.join(source_root);
+    if source_absolute.canonicalize().ok().as_ref() != Some(&source_absolute) || !source_absolute.is_dir() {
+        return Err("declared package source root is not a non-aliased directory".to_owned().into());
+    }
+
+    let mut pending = vec![source_absolute.clone()];
+    let mut paths = Vec::new();
+    while let Some(directory) = pending.pop() {
+        let manifest = directory.join("wosy.toml");
+        match fs::symlink_metadata(&manifest) {
+            Ok(metadata) => {
+                if !metadata.is_file() || manifest.canonicalize().ok().as_ref() != Some(&manifest) {
+                    return Err(format!("nested package manifest is not a non-aliased regular file: {}", manifest.display()).into());
+                }
+                ProjectContext::read_package_identity(&manifest)
+                    .map_err(|error| format!("invalid nested package identity {}: {error}", manifest.display()))?;
+                if directory == source_absolute {
+                    return Err("declared package source root is a separate package".to_owned().into());
+                }
+                continue;
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("could not inspect package boundary {}: {error}", directory.display()).into()),
+        }
+        let mut entries = fs::read_dir(&directory)
+            .and_then(|entries| entries.collect::<Result<Vec<_>, _>>())
+            .map_err(|error| format!("could not list package sources {}: {error}", directory.display()))?;
+        entries.sort_by_cached_key(|entry| entry.file_name());
+        for entry in entries {
+            if reserved(&entry.file_name()) {
+                continue;
+            }
+            let path = entry.path();
+            let relative = path.strip_prefix(root).map_err(|_| "source path left the current package".to_owned())?;
+            if boundaries.dependency_prefixes.iter().any(|prefix| relative.starts_with(prefix)) {
+                continue;
+            }
+            let ty = entry.file_type().map_err(|error| format!("could not inspect package path {}: {error}", path.display()))?;
+            if ty.is_symlink() {
+                return Err(format!("package source path is aliased: {}", relative.display()).into());
+            }
+            if ty.is_dir() {
+                pending.push(path);
+            } else if path.extension().is_some_and(|extension| extension == "w") {
+                if !ty.is_file() {
+                    return Err(format!("package source is not a regular file: {}", relative.display()).into());
+                }
+                let spelling = relative.components().map(|part| match part {
+                    Component::Normal(name) => name.to_str(),
+                    _ => None,
+                }).collect::<Option<Vec<_>>>().ok_or_else(|| "package source path must be UTF-8 and relative".to_owned())?
+                    .join("/");
+                let selected = identity(PackageRelativePath::new(spelling.into())?);
+                boundaries.validate(&selected)?;
+                paths.push(selected.path);
+            }
+        }
+    }
+    paths.sort_unstable();
+    Ok(paths)
+}
+
 pub(crate) fn load_canonical_project_inputs(
     root: &std::path::Path,
     project: &ProjectContext,
@@ -219,12 +301,22 @@ pub(crate) fn load_canonical_project_inputs(
             )
         };
         let source_path = package_root.join(path.as_path());
+        #[cfg(feature = "internal-checker")]
+        if let CanonicalLoadPurpose::PackageProofs(sources) = &purpose {
+            if package == project.package
+                && (!sources.contains(&path)
+                    || source_path.canonicalize().ok().as_ref() != Some(&source_path))
+            {
+                return Err(format!("reachable source is outside the declared package source tree or aliased: {}",
+                    path.as_path().display()).into());
+            }
+        }
         let text = fs::read_to_string(&source_path)
             .map_err(|error| format!("failed to read {}: {error}", source_path.display()))?;
         let source = canonical_source_identity(project_identity, &package, &path, &text);
         #[cfg(feature = "internal-checker")]
         let parse_proofs = match &purpose {
-            CanonicalLoadPurpose::LocalProofs => package == project.package,
+            CanonicalLoadPurpose::LocalProofs | CanonicalLoadPurpose::PackageProofs(_) => package == project.package,
             CanonicalLoadPurpose::Proof(selected) => package == project.package && selected.contains(&path),
             _ => false,
         };
@@ -241,7 +333,8 @@ pub(crate) fn load_canonical_project_inputs(
                     match &purpose {
                         CanonicalLoadPurpose::Build(persist) => Some((root, *persist)),
                         #[cfg(feature = "internal-checker")]
-                        CanonicalLoadPurpose::Check | CanonicalLoadPurpose::Proof(_) | CanonicalLoadPurpose::LocalProofs => None,
+                        CanonicalLoadPurpose::Check | CanonicalLoadPurpose::Proof(_) | CanonicalLoadPurpose::LocalProofs
+                            | CanonicalLoadPurpose::PackageProofs(_) => None,
                     },
                 )?;
                 (text, CanonicalSourceDeclarations::Ordinary(declarations))

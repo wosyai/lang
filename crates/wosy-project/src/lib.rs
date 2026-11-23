@@ -1090,6 +1090,29 @@ impl ProjectContext {
         ))
     }
 
+    #[cfg(feature = "internal-checker")]
+    #[doc(hidden)]
+    pub fn read_package_identity(manifest: &Path) -> Result<String, String> {
+        let content = fs::read_to_string(manifest).map_err(|error| error.to_string())?;
+        let document = toml_edit::ImDocument::parse(content).map_err(|error| error.to_string())?;
+        let package = document.get("package").and_then(Item::as_table)
+            .ok_or_else(|| "package is missing from wosy.toml".to_owned())?;
+        let name = scalar_string(package, "name")?;
+        if name.is_empty() || name.trim() != name {
+            return Err("package name must not be empty or padded".to_owned());
+        }
+        Ok(name)
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[doc(hidden)]
+    pub fn declared_package_source_root(document: &toml_edit::Table) -> Result<PackageRelativePath, String> {
+        let table = document.get("package").and_then(Item::as_table)
+            .ok_or_else(|| "package is missing from wosy.toml".to_owned())?;
+        let path = scalar_string(table, "source_root")?;
+        PackageRelativePath::new(path.into())
+    }
+
     pub fn source_path(&self) -> PathBuf {
         self.root.join(&self.source_root)
     }
