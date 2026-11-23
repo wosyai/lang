@@ -38,7 +38,7 @@ pub(super) struct AggregateFlowFacts {
     receipt_aliases: BTreeSet<CfgPointId>,
     pub(super) calls: BTreeMap<CfgPointId, OccurrenceOrdinal>,
     pub(super) secondary_owner_calls: BTreeSet<CfgPointId>,
-    pub(super) mixed_arm_projection: Option<(CfgPointId, [BlockOrdinal; 2])>,
+    mixed_arm_projection: Option<MixedArmProjection>,
     pub(super) secondary_owner_outputs: BTreeMap<CfgPointId, CfgPointId>,
     pub(super) projected_reads: BTreeMap<CfgPointId, bool>,
     pub(super) scalar_receipt_reads: BTreeSet<CfgPointId>,
@@ -69,6 +69,60 @@ pub(super) struct AggregateFlowFacts {
 }
 
 impl AggregateFlowFacts {
+    pub(super) fn record_mixed_arm_projection(
+        &mut self, conditional: OccurrenceOrdinal, owner_projection: CfgPointId, owner_lane: usize,
+        blocks: [BlockOrdinal; 2], outputs: [CfgPointId; 2],
+    ) {
+        let slots = &self.allocation_slots;
+        if slots.len() == 2 && blocks[0] != blocks[1]
+            && slots.values().any(|(block, _)| *block == blocks[0].0)
+            && slots.values().any(|(block, _)| *block == blocks[1].0)
+        {
+            self.mixed_arm_projection = Some(MixedArmProjection {
+                conditional, owner_projection, owner_lane, blocks, outputs,
+            });
+        }
+    }
+
+    pub(super) fn seal_mixed_branch_return(
+        &self, cfg: &ScalarReferenceCfg, root_returns: &[ReferenceFlowPoint], result: &mut AggregateFlowResult,
+    ) {
+        let Some(shape) = self.mixed_arm_projection else { return };
+        let [MixedArmBacking::Exact(left), MixedArmBacking::Exact(right)] = result.mixed_arm_backings else { return };
+        if left == right || !result.unsupported.is_empty() || !result.unproved_receipt_loans.is_empty() {
+            return;
+        }
+        let Some(owner_return) = root_returns.get(shape.owner_lane).filter(|point| matches!(point.kind,
+            CfgPointKind::ReturnOutput { output, value_point, checked: false }
+                if output == shape.owner_lane && value_point == shape.owner_projection))
+        else { return };
+        let [then_point, else_point] = shape.outputs;
+        if !matches!(cfg.points[shape.owner_projection.0].kind,
+            CfgPointKind::ConditionalOutput { then_point: first, else_point: second }
+                if first == then_point && second == else_point)
+        {
+            return;
+        }
+        let Some(owners) = result.returns.get(&owner_return.id) else { return };
+        if owners.len() != 2 || !owners.contains(&Some(OwnerSource::Allocation(left)))
+            || !owners.contains(&Some(OwnerSource::Allocation(right)))
+        {
+            return;
+        }
+        let [Some(&(left_block, left_item)), Some(&(right_block, right_item))] =
+            [self.allocation_slots.get(&left), self.allocation_slots.get(&right)] else { return };
+        if [left_block, right_block] != shape.blocks.map(|block| block.0) {
+            return;
+        }
+        result.mixed_branch_return = Some(Box::new(MixedBranchReturn {
+            shape,
+            allocations: [
+                BlockPosition { block: shape.blocks[0], item: left_item },
+                BlockPosition { block: shape.blocks[1], item: right_item },
+            ],
+        }));
+    }
+
     pub(super) fn observe_binding(
         &mut self,
         cfg: &ScalarReferenceCfg,
@@ -653,6 +707,21 @@ fn mixed_arm_backing_never_recovers_from_conflicting_evidence() {
     assert_eq!(arm, MixedArmBacking::Unproved);
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MixedArmProjection {
+    conditional: OccurrenceOrdinal,
+    owner_projection: CfgPointId,
+    owner_lane: usize,
+    blocks: [BlockOrdinal; 2],
+    outputs: [CfgPointId; 2],
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct MixedBranchReturn {
+    shape: MixedArmProjection,
+    allocations: [BlockPosition; 2],
+}
+
 #[derive(Default)]
 pub(super) struct AggregateFlowResult {
     literal_array_route: Option<LiteralArrayRoute>,
@@ -680,6 +749,7 @@ pub(super) struct AggregateFlowResult {
     pub(super) mixed_result_bindings: BTreeSet<CfgPointId>,
     pub(super) mixed_forward: Option<CfgPointId>,
     pub(super) mixed_arm_backings: [MixedArmBacking; 2],
+    mixed_branch_return: Option<Box<MixedBranchReturn>>,
     pub(super) returns: BTreeMap<CfgPointId, BTreeSet<Option<OwnerSource>>>,
     endpoints: BTreeMap<(CfgPointId, usize), ScopeEndpoint>,
     pub(super) unsupported: BTreeSet<CfgPointId>,
@@ -712,6 +782,14 @@ pub(super) struct AggregateFlowResult {
 }
 
 impl AggregateFlowResult {
+    #[cfg(test)]
+    pub(super) fn mixed_branch_return_locations(
+        &self,
+    ) -> Option<(OccurrenceOrdinal, [CfgPointId; 2], [BlockPosition; 2])> {
+        let plan = self.mixed_branch_return.as_ref()?;
+        Some((plan.shape.conditional, plan.shape.outputs, plan.allocations))
+    }
+
     pub(super) fn proves_mixed_local_owner(&self, cfg: &ScalarReferenceCfg, lanes: MixedOwnerResultLanes) -> bool {
         let mut owners = self.return_owners(cfg, Some(lanes.owner));
         let Some(Some(owner @ OwnerSource::Allocation(_))) = owners.next() else { return false };
@@ -1772,7 +1850,7 @@ impl AggregateFlowFacts {
                     else_point,
                 } => {
                     let values = (state.values.get(then_point), state.values.get(else_point));
-                    if let Some((_, blocks)) = self.mixed_arm_projection.filter(|(point, _)| *point == id) {
+                    if let Some(MixedArmProjection { blocks, .. }) = self.mixed_arm_projection.filter(|shape| shape.owner_projection == id) {
                         match values {
                             (Some(value), None) | (None, Some(value)) => {
                                 let arm = usize::from(values.0.is_none());
@@ -3316,6 +3394,12 @@ fn closed_aggregates<'a>(
                 ));
             };
             if values.any(|candidate| candidate != Some(owner)) {
+                if let Some(branch) = &facts.mixed_branch_return {
+                    return Err(format!(
+                        "aggregate return owner has conflicting paths in {:?}; branch transfer for output {} is not yet lowered",
+                        body.source, branch.shape.owner_lane,
+                    ));
+                }
                 return Err(format!(
                     "aggregate return owner has conflicting paths in {:?}",
                     body.source

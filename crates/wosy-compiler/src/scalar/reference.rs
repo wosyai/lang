@@ -1498,15 +1498,12 @@ impl<'a> ReferenceFlowBuilder<'a> {
             if let ([first, second], ConditionalRegion::Value { then_block, else_block, .. }) =
                 (row.types.as_slice(), region)
             {
-                let slots = &self.aggregate_facts.allocation_slots;
-                if slots.len() == 2
-                    && slots.values().any(|(block, _)| *block == then_block.0)
-                    && slots.values().any(|(block, _)| *block == else_block.0)
-                {
-                    if let Some(lanes) = aggregate::mixed_owner_result_lanes(first, second) {
-                        self.aggregate_facts.mixed_arm_projection =
-                            Some((result.output_points[lanes.owner], [*then_block, *else_block]));
-                    }
+                if let Some(lanes) = aggregate::mixed_owner_result_lanes(first, second) {
+                    self.aggregate_facts.record_mixed_arm_projection(
+                        primary.expression, result.output_points[lanes.owner], lanes.owner,
+                        [*then_block, *else_block],
+                        [then_arm.result.output_points[lanes.owner], else_arm.result.output_points[lanes.owner]],
+                    );
                 }
             }
         }
@@ -12735,6 +12732,11 @@ fn build_function_reference_cfg(
                 aggregate.checked_producer_backing.entry(end).or_insert(aggregate::CheckedProducerBacking::Unknown);
             }
             aggregate.checked_producer_sources = std::mem::take(&mut builder.aggregate_facts.checked_producer_arms);
+            if errors.is_empty() {
+                builder.aggregate_facts.seal_mixed_branch_return(
+                    &builder.cfg, &builder.cfg.initial_points[builder.root_return_points.clone()], &mut aggregate,
+                );
+            }
         } else {
             aggregate.checked_producer_backing.clear();
         }

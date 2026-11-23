@@ -891,9 +891,28 @@ struct Packet { *?u8 data; u64 length; }
         assert_eq!(return_owners, &BTreeSet::from([
             Some(OwnerSource::Allocation(left)), Some(OwnerSource::Allocation(right)),
         ]));
+        let (producer, arm_outputs, allocations) = result.aggregate.mixed_branch_return_locations()
+            .expect("sealed canonical branch metadata");
+        let ConditionalRegion::Value { then_block, else_block, .. } = &calls.conditionals[&producer]
+            else { panic!("value conditional") };
+        assert_eq!([allocations[0].block, allocations[1].block], [*then_block, *else_block]);
+        assert_eq!(
+            [(allocations[0].block.0, allocations[0].item), (allocations[1].block.0, allocations[1].item)],
+            [result.aggregate.allocation_slots[&left], result.aggregate.allocation_slots[&right]],
+        );
+        let owner_return = result.cfg.points.iter().find_map(|point| match point.kind {
+            CfgPointKind::ReturnOutput { output: 1, value_point, .. } => Some(value_point),
+            _ => None,
+        }).expect("canonical owner return");
+        assert!(matches!(result.cfg.points[owner_return.0].kind,
+            CfgPointKind::ConditionalOutput { then_point, else_point } if [then_point, else_point] == arm_outputs));
         let ScalarType::Callable { outputs, .. } = &function.signature else { panic!("callable") };
         assert!(!result.aggregate.proves_mixed_local_owner(
             &result.cfg, aggregate::mixed_owned_struct_result(outputs).unwrap(),
         ));
+        let build = crate::scalar::analyze_scalar_build(&prepared);
+        let Err(error) = crate::llvm::emit_scalar_build_project_llvm(&build)
+            else { panic!("observational proof must not admit branch return lowering") };
+        assert!(error.contains("branch transfer for output 1 is not yet lowered"), "{error}");
     }
 }
