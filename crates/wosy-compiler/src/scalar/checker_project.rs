@@ -411,6 +411,27 @@ impl OrderedRunEvidence for () {
 }
 
 #[cfg(feature = "internal-checker")]
+struct ProofFreeOrderedEvidence;
+
+#[cfg(feature = "internal-checker")]
+impl ActualIntegerObserver for ProofFreeOrderedEvidence {
+    const ENABLED: bool = false;
+    const PROOF_FREE_CONTEXTUAL_READ_LOCALS: bool = true;
+
+    fn observe(&mut self, _: (usize, usize), _: &[&BigInt], _: &BigInt) {}
+}
+
+#[cfg(feature = "internal-checker")]
+impl OrderedRunEvidence for ProofFreeOrderedEvidence {
+    type Symbolic<'a> = ();
+    type SymbolicReport = ();
+
+    fn complete_startup(&self, _: &HashSet<PreparedCallable>) -> Result<bool, ProjectCheck> { Ok(false) }
+    fn symbolic(&self) -> Self::Symbolic<'_> {}
+    fn finish_symbolic<'run>(_: Self::Symbolic<'run>) -> Self::SymbolicReport where Self: 'run {}
+}
+
+#[cfg(feature = "internal-checker")]
 struct PreparedOrderedRun<E: OrderedRunEvidence> {
     active: bool,
     directives: Vec<ScalarOrderedCheckerFailure>,
@@ -1191,6 +1212,7 @@ enum InitializerProofOrigin<'a> {
 
 trait ActualIntegerObserver {
     const ENABLED: bool;
+    const PROOF_FREE_CONTEXTUAL_READ_LOCALS: bool = false;
 
     fn observe(&mut self, target: (usize, usize), arguments: &[&BigInt], value: &BigInt);
 
@@ -1343,6 +1365,8 @@ impl<Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> CheckedCalls<'
         collection: OrderedCallCollection<'_, '_>,
     ) -> Result<ActualCallResult, ProjectCheck> {
         let terminal_projection = matches!(&entry, IntegerRequirementEntry::Projected { .. });
+        let allow_contextual_read_locals = ACTUAL_STARTUP && Observer::PROOF_FREE_CONTEXTUAL_READ_LOCALS
+            && matches!(&entry, IntegerRequirementEntry::Exact(_));
         let mut sink = |failure| collection.failures.borrow_mut().push_callable(body, source, failure);
         let mut nested_error = None;
         let mut nested = |caller: &FunctionCallSites, occurrence, signature: &CheckedCallSignature, argument: NestedIntegerArgument<'_>, expected: &ScalarType| {
@@ -1357,7 +1381,7 @@ impl<Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> CheckedCalls<'
         let handler: Option<&mut super::checker_flow::ActualCallHandler<'_, '_>> =
             if terminal_projection { None } else { Some(&mut nested) };
         let Some((active, continuation)) = collect_integer_requirement_failures_with_calls(
-            body, entry, handler, !ACTUAL_STARTUP && !terminal_projection, &mut sink,
+            body, entry, handler, !ACTUAL_STARTUP && !terminal_projection, allow_contextual_read_locals, &mut sink,
         ) else {
             return Err(nested_error.unwrap_or(ProjectCheck::Unsupported));
         };
@@ -3515,7 +3539,7 @@ fn run_closed_ranked_checks<'a, 'proof, const LOCAL_CATALOGS: bool>(
 fn run_closed_without_named_proofs(
     prepared: &PreparedCheckerProject, scope: ScalarCheckerScope, startup_count: usize,
 ) -> Result<MainFlowProofReceipt, ProjectCheck> {
-    let run = run_prepared_ordered_check(prepared, scope, startup_count, OrderedReachPolicy::Closed, ())?;
+    let run = run_prepared_ordered_check(prepared, scope, startup_count, OrderedReachPolicy::Closed, ProofFreeOrderedEvidence)?;
     Ok(MainFlowProofReceipt {
         active: run.active, directives: run.directives, diagnostics: Vec::new(),
         symbolic_diagnostic: None, additional_symbolic_diagnostics: Vec::new(),
@@ -7877,6 +7901,83 @@ mod tests {
             assert!(matches!(run(&expression, scope), Err(ScalarOrderedCheckerOutcome::Unsupported)));
             let out_of_range = program.replace("= -128;", "= -129;");
             assert!(matches!(run(&out_of_range, scope), Err(ScalarOrderedCheckerOutcome::Invalid(_))));
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordered_contextual_read_snapshots_the_active_place_into_an_ordinary_local() {
+        let app = source("src/main.w", "ordered-contextual-read-local");
+        let report = |code: i32| OUTPUT.replace(".code = 1", &format!(".code = {code}"));
+        let program = format!(r#"%%start
+            unit(i8) test_value = fn(entry) {{
+                core.require(entry > 0, {});
+                i8 core.context.count = 1;
+                if (entry > 0) {{
+                    i8 core.context.count = -128;
+                    i8 saved = core.context.count;
+                    core.context.count = 7;
+                    core.require(core.context.count == 7, {});
+                    core.require(saved == 7, {});
+                }};
+                core.require(core.context.count == 1, {});
+            }};
+            test_value(1);
+        %%end"#, report(5), report(7), report(11), report(17));
+        let run = |text: &str, scope| check_loaded_scalar_ordered_local_proof_contexts(
+            vec![(declarations(&app, text), Vec::new())], Vec::new(), vec![app.clone()],
+            inputs(), scope, Vec::new(),
+        );
+        for scope in [ScalarCheckerScope::MainFlowOnly, ScalarCheckerScope::CurrentPackage] {
+            let (prepared, startup_count) = prepare_checked_package_scope(
+                vec![(declarations(&app, &program), Vec::new())], vec![app.clone()], Vec::new(), inputs(), scope,
+            ).unwrap();
+            assert!(matches!(
+                run_prepared_ordered_check(&prepared, scope, startup_count, OrderedReachPolicy::Closed, ()),
+                Err(ProjectCheck::Unsupported)
+            ));
+            let receipt = run(&program, scope).unwrap_or_else(|error| panic!("{scope:?}: {error:?}"));
+            let [failure] = receipt.directives.as_slice() else { panic!("expected one authored requirement"); };
+            assert_eq!(failure.code(), &BigInt::from(11));
+            let original = BigInt::from(1);
+            let overwritten = BigInt::from(7);
+            let saved = BigInt::from(i8::MIN);
+            assert!(failure.witness.intervals_at(0, 1).unwrap().eq([(&original, &original)]));
+            assert!(failure.witness.intervals_at(0, 2).unwrap().eq([(&overwritten, &overwritten)]));
+            assert!(failure.witness.intervals_at(0, 3).unwrap().eq([(&saved, &saved)]));
+
+            let ordinary = program.replace("i8 saved = core.context.count;", "i8 saved = entry;");
+            assert!(matches!(run(&ordinary, scope), Err(ScalarOrderedCheckerOutcome::Unsupported)));
+            let different_type = program.replace("i8 saved = core.context.count;", "u8 saved = core.context.count;");
+            assert!(matches!(run(&different_type, scope), Err(ScalarOrderedCheckerOutcome::Invalid(_))));
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn contextual_read_local_does_not_widen_named_bound_import_prefix() {
+        let app = source("src/main.w", "contextual-local-import-prefix");
+        for (saved, allowed) in [("3", true), ("core.context.count", false)] {
+            let program = format!(r#"%%start
+                u8(u8) clamp = fn(value) {{ if (value > 10) {{ 10 }} else {{ value }} }};
+                u8() caller = fn {{
+                    u8 core.context.count = 3;
+                    u8 saved = {saved};
+                    u8 result = clamp(7);
+                    core.require(result <= 10, {OUTPUT});
+                    result + saved + core.context.count
+                }};
+            %%end"#);
+            let prepared = prepare_checker_project(
+                vec![(declarations(&app, &program), Vec::new())], vec![app.clone()], inputs(),
+            ).unwrap();
+            let (project, calls) = prepared.parts();
+            let (module, item, _) = select_checked_root(project, &app, "caller").unwrap();
+            let body = calls.function_body(module, item, None).unwrap();
+            let key = (body.structure.root, 1);
+            assert_eq!(body.structure.checker_integer_locals.contains_key(&key), allowed);
+            assert_eq!(body.structure.checker_contextual_read_locals.contains_key(&key), !allowed);
+            assert_eq!(root_local_import_requirement(body).map(|(position, _)| position), allowed.then_some(2));
         }
     }
 

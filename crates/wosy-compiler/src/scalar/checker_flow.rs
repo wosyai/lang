@@ -2038,7 +2038,7 @@ pub(super) fn collect_integer_requirement_failures(
 ) -> Option<(bool, Vec<IntegerCheckFailure<'_>>)> {
     let mut failures = Vec::new();
     let mut sink = |failure| failures.push(failure);
-    let (active, _) = collect_integer_requirement_failures_with_calls(calls, IntegerRequirementEntry::Arbitrary, None, false, &mut sink)?;
+    let (active, _) = collect_integer_requirement_failures_with_calls(calls, IntegerRequirementEntry::Arbitrary, None, false, false, &mut sink)?;
     Some((active, failures))
 }
 
@@ -2058,6 +2058,7 @@ struct IntegerFailureCollection<'a, 'sink> {
     continuation: IntegerRequirementContinuation,
     projected: Option<(usize, IntegerRow)>,
     allow_projected_calls: bool,
+    allow_contextual_read_locals: bool,
     sink: &'sink mut dyn FnMut(IntegerCheckFailure<'a>),
 }
 
@@ -2066,9 +2067,10 @@ pub(super) fn collect_integer_requirement_failures_with_calls<'a>(
     entry: IntegerRequirementEntry<'_>,
     handle_call: Option<&mut ActualCallHandler<'a, '_>>,
     allow_projected_calls: bool,
+    allow_contextual_read_locals: bool,
     sink: &mut dyn FnMut(IntegerCheckFailure<'a>),
 ) -> Option<(bool, IntegerRequirementContinuation)> {
-    collect_integer_requirement_failures_in_scope(calls, entry, handle_call, allow_projected_calls, sink, ())
+    collect_integer_requirement_failures_in_scope(calls, entry, handle_call, allow_projected_calls, allow_contextual_read_locals, sink, ())
 }
 
 #[cfg(feature = "internal-checker")]
@@ -2078,7 +2080,7 @@ pub(super) fn collect_ordered_root_requirement_failures<'a>(
     let mut failures = Vec::new();
     let mut sink = |failure| failures.push(failure);
     let (active, _) = collect_integer_requirement_failures_in_scope(
-        calls, IntegerRequirementEntry::Arbitrary, None, false, &mut sink, OrderedRootConditions(body),
+        calls, IntegerRequirementEntry::Arbitrary, None, false, false, &mut sink, OrderedRootConditions(body),
     )?;
     Some((active, failures))
 }
@@ -2105,7 +2107,7 @@ pub(super) fn collect_ordered_root_entry_equality<'a>(
     let scope = OrderedRootEntryEquality { conditions: OrderedRootConditions(body), old, guard, observed: &observed };
     let mut failures = Vec::new();
     let (active, _) = collect_integer_requirement_failures_in_scope(
-        calls, IntegerRequirementEntry::Arbitrary, None, false, &mut |failure| failures.push(failure), scope,
+        calls, IntegerRequirementEntry::Arbitrary, None, false, false, &mut |failure| failures.push(failure), scope,
     )?;
     let (returned, failure) = observed.into_inner();
     Some((active, failures, returned, failure))
@@ -2150,7 +2152,7 @@ pub(super) fn collect_ordered_root_literal_proof<'a, const TOTAL: bool>(
     };
     let active = if TOTAL {
         let mut collected = IntegerFailureCollection {
-            continuation: IntegerRequirementContinuation::Empty, projected: None, allow_projected_calls: false, sink: &mut sink,
+            continuation: IntegerRequirementContinuation::Empty, projected: None, allow_projected_calls: false, allow_contextual_read_locals: false, sink: &mut sink,
         };
         match run_integer_callable::<false, true, _>(
             calls, integer_tail_type(calls), entry_filter, None, &mut [], None, None, Some(&mut collected), false, scope,
@@ -2160,7 +2162,7 @@ pub(super) fn collect_ordered_root_literal_proof<'a, const TOTAL: bool>(
         }
     } else {
         collect_integer_requirement_failures_in_scope(
-            calls, IntegerRequirementEntry::Arbitrary, None, false, &mut sink, scope,
+            calls, IntegerRequirementEntry::Arbitrary, None, false, false, &mut sink, scope,
         )?.0
     };
     let (returned, failure) = observed.into_inner();
@@ -2176,7 +2178,7 @@ pub(super) fn collect_ordered_root_literal_proofs<'a, const STEP_FIRST: bool>(
     let mut failures = Vec::new();
     let mut sink = |failure| failures.push(failure);
     let (active, _) = collect_integer_requirement_failures_in_scope(
-        calls, IntegerRequirementEntry::Arbitrary, None, false, &mut sink,
+        calls, IntegerRequirementEntry::Arbitrary, None, false, false, &mut sink,
         OrderedRootLiteralProofs::<STEP_FIRST> { conditions: OrderedRootConditions(body), observed: &observed },
     )?;
     Some((active, failures, observed.into_inner().returned))
@@ -2190,7 +2192,7 @@ pub(super) fn collect_ordered_root_multiple_proof<'a, 'check, 'bound>(
     let mut failures = Vec::new();
     let mut sink = |failure| failures.push(failure);
     let (active, _) = collect_integer_requirement_failures_in_scope(
-        calls, IntegerRequirementEntry::Arbitrary, None, false, &mut sink,
+        calls, IntegerRequirementEntry::Arbitrary, None, false, false, &mut sink,
         OrderedRootMultipleProof { conditions: OrderedRootConditions(body), observed: &observed },
     )?;
     let observed = observed.into_inner();
@@ -2202,6 +2204,7 @@ fn collect_integer_requirement_failures_in_scope<'a, Scoped: ScopedAuthoredRetur
     entry: IntegerRequirementEntry<'_>,
     handle_call: Option<&mut ActualCallHandler<'a, '_>>,
     allow_projected_calls: bool,
+    allow_contextual_read_locals: bool,
     sink: &mut dyn FnMut(IntegerCheckFailure<'a>),
     scope: Scoped,
 ) -> Option<(bool, IntegerRequirementContinuation)> {
@@ -2219,7 +2222,7 @@ fn collect_integer_requirement_failures_in_scope<'a, Scoped: ScopedAuthoredRetur
         }
     };
     let mut collected = IntegerFailureCollection {
-        continuation: IntegerRequirementContinuation::Empty, projected, allow_projected_calls, sink,
+        continuation: IntegerRequirementContinuation::Empty, projected, allow_projected_calls, allow_contextual_read_locals, sink,
     };
     let ProofCoverage::Applicable(active) = run_integer_callable::<false, true, _>(
         calls, tail, None, None, &mut [], exact, handle_call, Some(&mut collected), false, scope,
@@ -2395,7 +2398,7 @@ pub(super) fn collect_ordered_imported_root_locals<'a>(
     calls: &'a FunctionCallSites, imports: &mut [Option<ImportedLocal<'a>>], sink: &mut dyn FnMut(IntegerCheckFailure<'a>),
 ) -> Option<bool> {
     let mut failures = IntegerFailureCollection {
-        continuation: IntegerRequirementContinuation::Empty, projected: None, allow_projected_calls: false, sink,
+        continuation: IntegerRequirementContinuation::Empty, projected: None, allow_projected_calls: false, allow_contextual_read_locals: false, sink,
     };
     let ProofCoverage::Applicable(active) = run_integer_callable::<true, true, _>(
         calls, integer_tail_type(calls), None, None, imports, None, None, Some(&mut failures), false, (),
@@ -2502,7 +2505,7 @@ pub(super) fn collect_exact_integer_return_requirements<'a>(
 
     let tail = integer_tail_type(calls).filter(|tail| *tail == expected)?;
     let mut failures = IntegerFailureCollection {
-        continuation: IntegerRequirementContinuation::Empty, projected: None, allow_projected_calls: false, sink,
+        continuation: IntegerRequirementContinuation::Empty, projected: None, allow_projected_calls: false, allow_contextual_read_locals: false, sink,
     };
     let returned = std::cell::RefCell::new(None);
     let ProofCoverage::Applicable(active) = run_integer_callable::<false, true, _>(
@@ -3291,9 +3294,27 @@ fn walk_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, A
                         continue;
                     }
                 }
-                let (identity, ty, value) = integer_local(calls, binding, block, item.position)?;
-                roots.add(identity, ty);
-                path.append_local(IntegerSet::singleton(value));
+                if let Some((identity, ty, value)) = integer_local(calls, binding, block, item.position) {
+                    roots.add(identity, ty);
+                    path.append_local(IntegerSet::singleton(value));
+                } else {
+                    if !COLLECT || USE_IMPORTED_BOUND
+                        || !failures.as_deref().is_some_and(|failure| failure.allow_contextual_read_locals)
+                    {
+                        return None;
+                    }
+                    let identity = structure.checker_contextual_read_locals.get(&(block, item.position))?;
+                    let [receiver] = binding.receivers() else { return None; };
+                    let BindingInitialization::Outputs(outputs) = &binding.initialization else { return None; };
+                    let PlainNameIdentity::Lexical(source) = calls.prepared_plain_name(outputs.primary)? else { return None; };
+                    let (axis, ty) = roots.lookup(source)?;
+                    if ty != &receiver.ty {
+                        return None;
+                    }
+                    let value = Rc::clone(path.singleton_axis(axis)?.1);
+                    roots.add(identity, &receiver.ty);
+                    path.append_shared_local(&value);
+                }
             }
         }
     }

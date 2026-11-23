@@ -6152,6 +6152,8 @@ pub(super) struct OccurrenceStructure {
     #[cfg(any(test, feature = "internal-checker"))]
     pub(super) checker_integer_locals: HashMap<(BlockOrdinal, usize), ReferenceBindingId>,
     #[cfg(any(test, feature = "internal-checker"))]
+    pub(super) checker_contextual_read_locals: HashMap<(BlockOrdinal, usize), ReferenceBindingId>,
+    #[cfg(any(test, feature = "internal-checker"))]
     pub(super) checker_integer_call_locals: HashMap<(BlockOrdinal, usize), CheckerIntegerCallOrigin>,
     pub(super) literal_fields: HashMap<OccurrenceOrdinal, ScalarStructFieldId>,
     pub(super) module_storage_uses: HashMap<SourceSpan, Vec<(OccurrenceOrdinal, ModuleStorageRole)>>,
@@ -6186,6 +6188,8 @@ impl OccurrenceStructure {
             checker_direct_targets: HashMap::new(),
             #[cfg(any(test, feature = "internal-checker"))]
             checker_integer_locals: HashMap::new(),
+            #[cfg(any(test, feature = "internal-checker"))]
+            checker_contextual_read_locals: HashMap::new(),
             #[cfg(any(test, feature = "internal-checker"))]
             checker_integer_call_locals: HashMap::new(),
             literal_fields: HashMap::new(),
@@ -8248,11 +8252,17 @@ impl StructuralWalker<'_, '_> {
                     && outputs.secondary.is_empty() =>
             {
                 if self.structure.checker_integer_literals.contains_key(&outputs.primary) {
-                    Some((callable.target_resolver, None))
+                    Some((callable.target_resolver, None, false))
+                } else if binding.receivers[0].contextual_storage.is_none()
+                    && is_integer_type(&binding.declared_type)
+                    && self.structure.checker_contextual_occurrences.contains(&outputs.primary)
+                    && self.structure.checked_types.expressions.get(&outputs.primary) == Some(&binding.declared_type)
+                {
+                    Some((callable.target_resolver, None, true))
                 } else {
                     self.checker_integer_call_arguments(binding, outputs.primary)
                         .map(|arguments| {
-                            (callable.target_resolver, Some((outputs.primary, arguments)))
+                            (callable.target_resolver, Some((outputs.primary, arguments)), false)
                         })
                 }
             }
@@ -8283,7 +8293,7 @@ impl StructuralWalker<'_, '_> {
                     introduced_by_assignment: false,
                 };
                 #[cfg(any(test, feature = "internal-checker"))]
-                if let Some((callable, from_call)) = checker_local.take() {
+                if let Some((callable, from_call, contextual_read)) = checker_local.take() {
                     let binding = lexical.reference_id(callable.source, callable.function_span);
                     let key = (position.block, position.item);
                     if let Some((call, arguments)) = from_call {
@@ -8295,6 +8305,8 @@ impl StructuralWalker<'_, '_> {
                                 arguments,
                             },
                         );
+                    } else if contextual_read {
+                        self.structure.checker_contextual_read_locals.insert(key, binding);
                     } else {
                         self.structure.checker_integer_locals.insert(key, binding);
                     }
