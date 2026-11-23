@@ -1303,13 +1303,22 @@ pub(crate) struct ClosedCheckedBacking {
 }
 
 #[derive(Debug)]
-pub(crate) struct ClosedIndexedSnapshot {
+pub(crate) struct ClosedIndexedSnapshot<Storage = SourceSpan> {
     pub(crate) value: usize,
     pub(crate) place: usize,
     pub(crate) base: usize,
     pub(crate) index: usize,
-    pub(crate) storage: SourceSpan,
+    pub(crate) storage: Storage,
     pub(crate) length: u64,
+}
+
+impl ClosedIndexedSnapshot<&SourceSpan> {
+    fn into_owned(self) -> ClosedIndexedSnapshot {
+        ClosedIndexedSnapshot {
+            value: self.value, place: self.place, base: self.base, index: self.index,
+            storage: self.storage.clone(), length: self.length,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -1322,6 +1331,7 @@ pub(crate) struct ClosedBody {
     pub(crate) returning: Option<ClosedReturn>,
     pub(crate) ordinary_result: bool,
     pub(crate) ordinary_indexed: Option<ClosedIndexedSnapshot>,
+    pub(crate) terminal_indexed: Option<Box<[ClosedIndexedSnapshot; 2]>>,
     pub(crate) ordinary_calls: BTreeMap<usize, SourceSpan>,
     pub(crate) calls: BTreeMap<usize, ClosedCall>,
     pub(crate) scope_exits: BTreeMap<usize, CfgPointId>,
@@ -2020,28 +2030,35 @@ fn ordinary_snapshot_constructor<'a>(
         && value(&binding.value, *initial, sites, names)
 }
 
-fn ordinary_indexed_snapshot<'a>(
-    source: &SourceIdentity,
-    function: &ScalarFunction,
+fn ordinary_indexed_inputs(
     sites: &FunctionCallSites,
-    ty: &ScalarType,
-    lookup: &dyn Fn(&ScalarStructId) -> Option<&'a ScalarStruct>,
-    copy: &mut HashMap<ScalarStructId, bool>,
-) -> Option<ClosedIndexedSnapshot> {
-    let [ScalarBlockItem::Expression(ScalarExpression::IndexedRead { place, .. })] =
-        function.body.items.as_slice() else { return None };
-    let ScalarPlace::Index { base, index, .. } = place else { return None };
-    if function.body.unsafe_context
-        || !matches!(base.as_ref(), ScalarPlace::Name { .. })
-        || !matches!(index.as_ref(), ScalarExpression::Name { .. }) {
-        return None;
-    }
+) -> Option<(&ParameterSlot, &HashMap<OccurrenceOrdinal, PlainNameIdentity>)> {
     let [parameter] = sites.boundary.parameters.as_slice() else { return None };
     if parameter.ordinal != 0 || parameter.ty != ScalarType::U64 {
         return None;
     }
     let PlainNameFacts::Prepared(names) = &sites.plain_names else { return None };
-    let root = OccurrenceParent::Block(sites.structure.root);
+    Some((parameter, names))
+}
+
+fn ordinary_indexed_leaf<'a>(
+    source: &SourceIdentity,
+    block: &ScalarBlock,
+    block_ordinal: BlockOrdinal,
+    sites: &'a FunctionCallSites,
+    ty: &ScalarType,
+    parameter: &ParameterSlot,
+    names: &HashMap<OccurrenceOrdinal, PlainNameIdentity>,
+) -> Option<ClosedIndexedSnapshot<&'a SourceSpan>> {
+    let [ScalarBlockItem::Expression(ScalarExpression::IndexedRead { place, .. })] =
+        block.items.as_slice() else { return None };
+    let ScalarPlace::Index { base, index, .. } = place else { return None };
+    if block.unsafe_context || block.final_output_values.len() != 1
+        || !matches!(base.as_ref(), ScalarPlace::Name { .. })
+        || !matches!(index.as_ref(), ScalarExpression::Name { .. }) {
+        return None;
+    }
+    let root = OccurrenceParent::Block(block_ordinal);
     let Some(OccurrenceNode::Expression(value)) =
         sites.structure.edges.get(&(root, OccurrenceEdge::FinalOutput { item: 0, output: 0 }))
         else { return None };
@@ -2060,13 +2077,88 @@ fn ordinary_indexed_snapshot<'a>(
     if &storage.source != source || element.as_ref() != ty || *length == 0
         || !matches!(names.get(index), Some(PlainNameIdentity::Lexical(id))
             if &id.source == source && id.declaration_span == parameter.span)
-        || !ordinary_snapshot_copy(ty, lookup, copy) {
+    {
         return None;
     }
     Some(ClosedIndexedSnapshot {
         value: value.0, place: place.0, base: base.0, index: index.0,
-        storage: storage.clone(), length: *length,
+        storage, length: *length,
     })
+}
+
+fn ordinary_indexed_snapshot<'a>(
+    source: &SourceIdentity,
+    function: &ScalarFunction,
+    sites: &FunctionCallSites,
+    ty: &ScalarType,
+    lookup: &dyn Fn(&ScalarStructId) -> Option<&'a ScalarStruct>,
+    copy: &mut HashMap<ScalarStructId, bool>,
+) -> Option<ClosedIndexedSnapshot> {
+    let (parameter, names) = ordinary_indexed_inputs(sites)?;
+    let witness = ordinary_indexed_leaf(source, &function.body, sites.structure.root, sites, ty, parameter, names)?;
+    ordinary_snapshot_copy(ty, lookup, copy).then(|| witness.into_owned())
+}
+
+fn ordinary_terminal_indexed_snapshot(
+    source: &SourceIdentity,
+    function: &ScalarFunction,
+    sites: &FunctionCallSites,
+    ty: &ScalarType,
+    structs: &[ScalarStruct],
+    copy: &mut HashMap<ScalarStructId, bool>,
+) -> Option<[ClosedIndexedSnapshot; 2]> {
+    let [ScalarBlockItem::Expression(ScalarExpression::If {
+        condition, then_branch, else_branch, ..
+    })] = function.body.items.as_slice() else { return None };
+    if function.body.unsafe_context || function.body.final_output_values.len() != 1 {
+        return None;
+    }
+    let root = OccurrenceParent::Block(sites.structure.root);
+    let Some(OccurrenceNode::Expression(terminal)) = sites.structure.edges.get(&(
+        root, OccurrenceEdge::FinalOutput { item: 0, output: 0 },
+    )) else { return None };
+    let ConditionalRegion::Value { condition: condition_id, then_block, else_block, .. } =
+        sites.conditionals.get(terminal)? else { return None };
+    if sites.structure.checked_types.expressions.get(condition_id) != Some(&ScalarType::Bool) {
+        return None;
+    }
+    let (parameter, names) = ordinary_indexed_inputs(sites)?;
+    let pure_scalar = |expression: &ScalarExpression, ordinal: OccurrenceOrdinal| {
+        if !sites.structure.checked_types.expressions.get(&ordinal).is_some_and(ordinary_value) {
+            return false;
+        }
+        match expression {
+            ScalarExpression::Boolean { .. } | ScalarExpression::Integer { .. }
+            | ScalarExpression::Char { .. } | ScalarExpression::Float { .. } => true,
+            ScalarExpression::Name { .. } => match names.get(&ordinal) {
+                Some(PlainNameIdentity::ModuleValue(storage)) => &storage.source == source,
+                Some(PlainNameIdentity::Lexical(binding)) => &binding.source == source
+                    && binding.function_span == function.span
+                    && parameter.span == binding.declaration_span,
+                _ => false,
+            },
+            _ => false,
+        }
+    };
+    if let ScalarExpression::Binary {
+        operator: BinaryOperator::Equal | BinaryOperator::NotEqual,
+        left,
+        right,
+        ..
+    } = condition.as_ref() {
+        let parent = OccurrenceParent::Expression(*condition_id);
+        for (operand, edge) in [(left, OccurrenceEdge::BinaryLeft), (right, OccurrenceEdge::BinaryRight)] {
+            let Some(OccurrenceNode::Expression(ordinal)) = sites.structure.edges.get(&(parent, edge))
+                else { return None };
+            if !pure_scalar(operand, *ordinal) { return None }
+        }
+    } else if !pure_scalar(condition, *condition_id) {
+        return None;
+    }
+    let then_witness = ordinary_indexed_leaf(source, then_branch, *then_block, sites, ty, parameter, names)?;
+    let else_witness = ordinary_indexed_leaf(source, else_branch, *else_block, sites, ty, parameter, names)?;
+    let lookup = |id: &ScalarStructId| structs.iter().find(|structure| &structure.id == id);
+    ordinary_snapshot_copy(ty, &lookup, copy).then(|| [then_witness.into_owned(), else_witness.into_owned()])
 }
 
 #[derive(Clone, Copy)]
@@ -2080,6 +2172,7 @@ struct OrdinaryCohorts {
     private: BTreeMap<BodyKey, OrdinaryResultCandidate>,
     namespace: BTreeMap<BodyKey, Vec<SnapshotUse>>,
     indexed: BTreeMap<BodyKey, ClosedIndexedSnapshot>,
+    terminal_indexed: BTreeMap<BodyKey, [ClosedIndexedSnapshot; 2]>,
     refused: HashSet<BodyKey>,
     copy: HashMap<ScalarStructId, bool>,
 }
@@ -2112,6 +2205,11 @@ impl OrdinaryCohorts {
                     || ordinary_scalar_parameter_result(source, function, sites, structure));
             if existing || nested_copy_local_result(&function.body, ty, structs) {
                 self.private.insert(key, OrdinaryResultCandidate::Unused);
+            } else if let Some(witnesses) =
+                ordinary_terminal_indexed_snapshot(source, function, sites, ty, structs, &mut self.copy)
+            {
+                self.private.insert(key, OrdinaryResultCandidate::Unused);
+                self.terminal_indexed.insert(key, witnesses);
             }
         } else if let Some(lookup) = lookup {
             if ordinary_snapshot_constructor(source, function, sites, ty, lookup, &mut self.copy) {
@@ -2144,6 +2242,7 @@ impl OrdinaryCohorts {
             self.private.clear();
             self.namespace.clear();
             self.indexed.clear();
+            self.terminal_indexed.clear();
         }
     }
 
@@ -2273,7 +2372,9 @@ impl OrdinaryCohorts {
                 continue;
             }
             let Some(declaration) = declaration_at(producer) else { continue };
-            result.bodies.entry(producer).or_default().ordinary_result = true;
+            let producer_plan = result.bodies.entry(producer).or_default();
+            producer_plan.ordinary_result = true;
+            producer_plan.terminal_indexed = self.terminal_indexed.remove(&producer).map(Box::new);
             for site in earlier {
                 result.bodies.entry(site.caller).or_default().ordinary_calls
                     .insert(site.call.0, declaration.clone());

@@ -8667,6 +8667,67 @@ u64(bool) verify = fn(flag) { Pair value = _make(flag); value.total };
 }
 
 #[test]
+fn private_terminal_global_copy_snapshot_checks_each_arm_and_copies_before_return() {
+    let text = "%%start
+struct copy Pair { u8 tag; u64 value; }
+u32 side = 0;
+Pair[2] left = [{ .tag = 1; .value = 40; }, { .tag = 2; .value = 42; }];
+Pair[2] right = [{ .tag = 3; .value = 70; }, { .tag = 4; .value = 71; }];
+Pair(u64) _pick = fn(index) { if (side == 0) { left[index] } else { right[index] } };
+u64(u64) read_direct = fn(index) { _pick(index).value };
+%%end";
+    for layout in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
+        let prepared = prepare_initializer_test(text, layout);
+        let checked = analyze_scalar_build(&prepared);
+        assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+        let source = &prepared.project().modules[0].source;
+        for (partition, project) in [
+            (emit_scalar_build_single_module_llvm(&checked).unwrap(), false),
+            (emit_scalar_build_project_llvm(&checked).unwrap(), true),
+        ] {
+            let symbol = |name: &str| if project { project_function_name(source, name) } else { name.to_owned() };
+            let producer = symbol("_pick");
+            let reader = symbol("read_direct");
+            let llvm = partition.to_text();
+            let producer_body = llvm.split_once(&format!("define internal void @{producer}(")).unwrap()
+                .1.split_once("\n}").unwrap().0;
+            assert_eq!(producer_body.matches("icmp uge i64").count(), 2, "{producer_body}");
+            assert_eq!(producer_body.matches("@__wosy_core_system_panic()").count(), 2, "{producer_body}");
+            assert!(producer_body.contains("phi ptr "), "{producer_body}");
+            let copy = producer_body.find("@llvm.memmove.").expect("copy before returning");
+            assert!(copy < producer_body.find("ret void").unwrap(), "{producer_body}");
+            assert!(!producer_body.contains("ret ptr"), "{producer_body}");
+            let reader_body = llvm.split_once(&format!("define i64 @{reader}(")).unwrap()
+                .1.split_once("\n}").unwrap().0;
+            assert_eq!(reader_body.matches(&format!("call void @{producer}(")).count(), 1);
+            assert!(reader_body.contains("ordinary_result_destination"));
+            assert!(reader_body.contains("load i64, ptr %value"));
+        }
+    }
+}
+
+#[test]
+fn private_terminal_global_copy_snapshot_refuses_calling_conditions_and_computed_indexes() {
+    for (condition, index) in [("choose()", "index"), ("side == 0", "index + 1")] {
+        let text = format!("%%start
+struct copy Pair {{ u64 value; }}
+u32 side = 0;
+bool() choose = fn {{ side == 0 }};
+Pair[2] left = [{{ .value = 40; }}, {{ .value = 42; }}];
+Pair[2] right = [{{ .value = 70; }}, {{ .value = 71; }}];
+Pair(u64) _pick = fn(index) {{ if ({condition}) {{ left[{index}] }} else {{ right[index] }} }};
+u64(u64) read_direct = fn(index) {{ _pick(index).value }};
+%%end");
+        let prepared = prepare_initializer_test(&text, ScalarTargetLayout::WASM32);
+        let checked = analyze_scalar_build(&prepared);
+        assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+        for result in [emit_scalar_build_single_module_llvm(&checked), emit_scalar_build_project_llvm(&checked)] {
+            assert!(matches!(result, Err(message) if message.contains("no proven caller-owned storage")));
+        }
+    }
+}
+
+#[test]
 fn closed_copy_result_uses_caller_storage_for_all_exact_consumers() {
     let text = "%%start
 struct copy Pair { u8 tag; u64 value; }

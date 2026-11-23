@@ -3242,7 +3242,15 @@ fn emit_final_outputs<'ctx, 'module>(
             return Ok(value);
         }
         let ty = emission.expected_numeric().unwrap_or(&output.ty);
-        let value = emit_typed_expression(context, state, expression, ty)?;
+        let snapshot = if matches!(expression, ScalarExpression::IndexedRead { .. }) {
+            aggregate_transfer::emit_checked_ordinary_snapshot(context, state, expression, None)?
+        } else {
+            None
+        };
+        let value = match snapshot {
+            Some(value) => value,
+            None => emit_typed_expression(context, state, expression, ty)?,
+        };
         if !state
             .branch_return_outputs
             .contains_key(&(block.span.start, block.span.end))
@@ -3345,7 +3353,7 @@ fn emit_project_final_outputs<'ctx, 'module>(
         }
         let ty = emission.expected_numeric().unwrap_or(&output.ty);
         let value = match aggregate_transfer::emit_checked_ordinary_snapshot(
-            context, state, expression, module, modules,
+            context, state, expression, Some(ProjectCallScope { module, modules }),
         )? {
             Some(value) => value,
             None => emit_project_typed_expression(context, state, expression, ty, module, modules)?,

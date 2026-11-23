@@ -64,7 +64,7 @@ pub(super) struct AggregateEmitter<'ctx, 'plan> {
     destination: Option<PointerValue<'ctx>>,
     ordinary_destination: Option<PointerValue<'ctx>>,
     ordinary_committed: bool,
-    ordinary_indexed_emitted: bool,
+    ordinary_indexed_emitted: u8,
     ordinary_visited: BTreeSet<usize>,
     base: Option<PointerValue<'ctx>>,
     registered_allocation: Option<String>,
@@ -147,7 +147,7 @@ impl<'ctx, 'plan> AggregateEmitter<'ctx, 'plan> {
             destination,
             ordinary_destination,
             ordinary_committed: false,
-            ordinary_indexed_emitted: false,
+            ordinary_indexed_emitted: 0,
             ordinary_visited: BTreeSet::new(),
             base: None,
             registered_allocation: None,
@@ -926,12 +926,23 @@ pub(super) fn emit_checked_ordinary_snapshot<'ctx, 'module>(
     context: &'ctx Context,
     state: &mut EmitState<'ctx, 'module>,
     expression: &ScalarExpression,
-    module: &ScalarModule,
-    modules: &[&ScalarModule],
+    project: Option<ProjectCallScope<'_>>,
 ) -> Result<Option<EmitValue<'ctx>>, String> {
     let Some(aggregate) = state.aggregate.as_ref() else { return Ok(None) };
-    let Some(proof) = aggregate.plan.ordinary_indexed.as_ref() else { return Ok(None) };
+    let terminal = aggregate.plan.terminal_indexed.as_deref();
+    let ordinary = aggregate.plan.ordinary_indexed.as_ref();
+    if terminal.is_none() && ordinary.is_none() { return Ok(None) }
     let nodes = state.body_call_nodes.ok_or_else(|| "missing checked snapshot body nodes".to_owned())?;
+    let ordinal = nodes.expression_ordinal(expression);
+    let (proof, bit) = if let Some(proof) = ordinary {
+        (proof, 1)
+    } else if let Some((position, proof)) = terminal.into_iter().flatten().enumerate()
+        .find(|(_, proof)| Some(proof.value) == ordinal)
+    {
+        (proof, 1 << position)
+    } else {
+        return Ok(None);
+    };
     let ScalarExpression::IndexedRead { place, .. } = expression else {
         return Err("checked snapshot changed its final expression".into());
     };
@@ -941,31 +952,33 @@ pub(super) fn emit_checked_ordinary_snapshot<'ctx, 'module>(
     let ScalarPlace::Name { name, .. } = base.as_ref() else {
         return Err("checked snapshot changed its storage root".into());
     };
-    if nodes.expression_ordinal(expression) != Some(proof.value)
+    if ordinal != Some(proof.value)
         || nodes.place_ordinal(place) != Some(proof.place)
         || nodes.place_ordinal(base) != Some(proof.base)
         || nodes.expression_ordinal(index) != Some(proof.index)
         || !matches!(nodes.named_place_root(base),
             Some(NamedPlaceRootIdentity::ModuleValue(storage)) if storage == &proof.storage)
-        || module.source != proof.storage.source
-        || aggregate.ordinary_indexed_emitted
+        || aggregate.ordinary_indexed_emitted & bit != 0
     {
         return Err("checked snapshot changed its prepared source identity".into());
     }
-    let (global, ty) = state.project_names.ok_or_else(|| "missing checked snapshot module scope".to_owned())?
-        .for_module(module).globals.get(name)
-        .ok_or_else(|| "missing checked snapshot module storage".to_owned())?;
+    let (global, ty) = match project {
+        Some(scope) if scope.module.source == proof.storage.source => state.project_names
+            .ok_or_else(|| "missing checked snapshot module scope".to_owned())?
+            .for_module(scope.module).globals.get(name),
+        Some(_) => return Err("checked snapshot changed its storage module".into()),
+        None => state.globals.get(name),
+    }.ok_or_else(|| "missing checked snapshot module storage".to_owned())?;
     if nodes.checked_place_type(base) != Some(ty)
         || !matches!(ty, ScalarType::Array { length, .. } if *length == proof.length)
     {
         return Err("checked snapshot changed its prepared storage type".into());
     }
     let pointer = checked_fixed_element_pointer(
-        context, state, ty, global.as_pointer_value(), proof.length, index,
-        Some(ProjectCallScope { module, modules }),
+        context, state, ty, global.as_pointer_value(), proof.length, index, project,
         ("snapshot_index_out_of_bounds", "snapshot_index_panic", "snapshot_index_continue"),
     )?;
-    state.aggregate.as_mut().expect("checked snapshot frame").ordinary_indexed_emitted = true;
+    state.aggregate.as_mut().expect("checked snapshot frame").ordinary_indexed_emitted |= bit;
     Ok(Some(EmitValue::Basic(pointer.into())))
 }
 
@@ -1042,7 +1055,12 @@ pub(super) fn finish_return<'ctx>(
         return Err("ordinary aggregate call occurrence was not emitted".into());
     }
     if aggregate.ordinary_destination.is_some() {
-        if aggregate.plan.ordinary_indexed.is_some() != aggregate.ordinary_indexed_emitted {
+        let expected_indexed = if aggregate.plan.terminal_indexed.is_some() {
+            0b11
+        } else {
+            u8::from(aggregate.plan.ordinary_indexed.is_some())
+        };
+        if expected_indexed != aggregate.ordinary_indexed_emitted {
             return Err("missing checked ordinary snapshot read".into());
         }
         if !aggregate.ordinary_committed {
