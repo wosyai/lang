@@ -1009,6 +1009,26 @@ impl IntegerRow {
         self.cells[canonical] = set;
     }
 
+    fn overwrite(&mut self, axis: usize, domain: Rc<IntegerSet>) {
+        if let Some(equality) = &mut self.equal_axes {
+            if let Ok(member) = equality.binary_search_by_key(&axis, |(alias, _)| *alias) {
+                Rc::make_mut(equality).remove(member);
+            } else if let Some(root) = equality.iter().position(|&(_, root)| root == axis) {
+                let equality = Rc::make_mut(equality);
+                let (promoted, _) = equality.remove(root);
+                for (_, root) in &mut equality[root..] {
+                    if *root == axis {
+                        *root = promoted;
+                    }
+                }
+            }
+            if equality.is_empty() {
+                self.equal_axes = None;
+            }
+        }
+        self.cells[axis] = domain;
+    }
+
     fn truncate(&mut self, depth: usize) {
         self.cells.truncate(depth);
         if let Some(equality) = &mut self.equal_axes {
@@ -1333,7 +1353,7 @@ impl IntegerInputs {
 
     fn overwrite(mut self, axis: usize, value: Rc<IntegerSet>) -> Self {
         for row in &mut self.0 {
-            row[axis] = Rc::clone(&value);
+            row.overwrite(axis, Rc::clone(&value));
         }
         if self.0.len() < 2 {
             return self;
@@ -3475,7 +3495,7 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                 let allow_contextual_local_transfers = || COLLECT && !USE_IMPORTED_BOUND
                     && failures.as_deref().is_some_and(|failure| failure.allow_contextual_local_transfers);
                 let (axis, value) = integer_assignment(calls, roots, group, &path, allow_contextual_local_transfers)?;
-                if path.axis_has_alias(axis) {
+                if axis < roots.parameters && path.axis_has_alias(axis) {
                     return None;
                 }
                 path = path.overwrite(axis, value);
@@ -4206,4 +4226,32 @@ fn proof_show_output_union_is_lazy_and_exact_for_disconnected_aliases() {
 
     assert_eq!(alias.shows_output_with_bound(relation(BinaryOperator::NotEqual), &zero, Some(&show), None, &mut allowed), Some(true));
     assert!(allowed.is_some());
+}
+
+#[test]
+fn symbolic_local_overwrite_preserves_the_other_members_of_a_value_class() {
+    let old = Rc::new(IntegerSet::from_type(&ScalarType::I8).unwrap());
+    let zero = Rc::new(IntegerSet::singleton(&BigInt::from(0)));
+    let one = Rc::new(IntegerSet::singleton(&BigInt::from(1)));
+    let mut row = IntegerRow::new(vec![Rc::clone(&old), Rc::clone(&old)]);
+    row.append_alias(1, Rc::clone(&old));
+    row.append_alias(0, Rc::clone(&old));
+    row.append_alias(2, Rc::clone(&old));
+    row.append_alias(2, Rc::clone(&old));
+    let mut detached = row.clone();
+    detached.overwrite(2, Rc::clone(&zero));
+    assert_eq!(detached.equal_axes(), &[(3, 0), (4, 1), (5, 1)]);
+    detached.overwrite(1, Rc::clone(&one));
+    assert_eq!(detached.equal_axes(), &[(3, 0), (5, 4)]);
+    detached.replace_domain(5, Rc::clone(&zero));
+    assert!(Rc::ptr_eq(&detached[0], &old));
+    assert!(Rc::ptr_eq(&detached[1], &one));
+    assert!(Rc::ptr_eq(&detached[2], &zero));
+    assert!(Rc::ptr_eq(&detached[4], &zero));
+    assert!(Rc::ptr_eq(&detached[5], &zero));
+    detached.truncate(4);
+    assert_eq!(detached.equal_axes(), &[(3, 0)]);
+    detached.overwrite(3, zero);
+    assert!(detached.equal_axes.is_none());
+    assert_eq!(row.equal_axes(), &[(2, 1), (3, 0), (4, 1), (5, 1)]);
 }

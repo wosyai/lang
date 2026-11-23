@@ -8257,7 +8257,20 @@ mod tests {
             assert!(failed.witness.intervals_at(0, axis).unwrap().eq([(&BigInt::from(-128), &BigInt::from(-1))]));
         }
         let changed = text.replace("if (input < 0)", "observed = 0; if (input < 0)");
-        assert!(matches!(run("symbolic-identity-write", &changed), Err(ProjectCheck::Unsupported)));
+        let changed = run("symbolic-identity-write", &changed).unwrap();
+        assert_eq!(changed.directives.len(), 2);
+        let zero = BigInt::from(0);
+        let [low, high] = [-128, -1].map(BigInt::from);
+        for (code, axes) in [(7, 3), (17, 2)] {
+            let code = BigInt::from(code);
+            let failed = changed.directives.iter().find(|failed| *failed.code() == code).unwrap();
+            assert!(failed.witness.equal_axes().is_empty());
+            assert_eq!(failed.witness.row_count(), 1);
+            assert!(failed.witness.intervals_at(0, 0).unwrap().eq([(&low, &high)]));
+            for axis in 1..axes {
+                assert!(failed.witness.intervals_at(0, axis).unwrap().eq([(&zero, &zero)]));
+            }
+        }
         let mixed = text.replace("fn(value) { value }", "fn(value) { if (value < 0) { value } else { 1 } }");
         assert!(run("symbolic-identity-mixed", &mixed).unwrap().directives.is_empty());
     }
@@ -8294,8 +8307,30 @@ mod tests {
             && failed.witness.intervals_at(row, 0).unwrap().eq([(&minus_one, &minus_one)])));
         assert!((0..2).any(|row| failed.witness.row_equal_axes(row) == Some(&[])
             && failed.witness.intervals_at(row, 0).unwrap().eq([(&zero, &max)])));
-        let assigned = text.replace("if (observed < -1)", "observed = 0; if (observed < -1)");
-        assert!(matches!(run("symbolic-mixed-write", &assigned), Err(ProjectCheck::Unsupported)));
+        let assigned = text.replace("core.require(observed <= 0,", "observed = 0; core.require(observed == 0,");
+        assert!(run("symbolic-mixed-write", &assigned).unwrap().directives.is_empty());
+
+        let siblings = format!(r#"%%start
+            i8(i8) identity = fn(n) {{ n }};
+            unit(i8) unused = fn(input) {{
+                i8 changed = identity(input);
+                i8 sibling = identity(changed);
+                changed = 0;
+                core.require(changed == 0, {OUTPUT});
+                if (sibling < 0) {{
+                    i8 nested = identity(sibling);
+                    core.require(input < 0, {OUTPUT});
+                    core.require(nested < 0, {OUTPUT});
+                }};
+                core.require(changed == 0, {OUTPUT});
+            }};
+        %%end"#);
+        assert!(run("symbolic-sibling-write", &siblings).unwrap().directives.is_empty());
+        let negative = siblings.replace("input < 0", "input >= 0");
+        let negative = run("symbolic-sibling-write-fail", &negative).unwrap();
+        let [failed] = negative.directives.as_slice() else { panic!("the input remains negative on the sibling branch"); };
+        assert_eq!(failed.witness.equal_axes(), &[(2, 0), (3, 0)]);
+        assert!(failed.witness.intervals_at(0, 1).unwrap().eq([(&zero, &zero)]));
     }
 
     #[cfg(feature = "internal-checker")]
