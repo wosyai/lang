@@ -130,7 +130,8 @@ impl Author {
             },
             CfgPointKind::Assign { target, .. } => target.projections.is_empty()
                 && matches!(&target.place, ScalarPlace::Name { .. })
-                && self.pending_loan.is_some(),
+                && (self.pending_loan.is_some()
+                    || types.get(&target.binding).is_some_and(aggregate::ordinary_value)),
             CfgPointKind::Read { binding } => match types.get(binding) {
                 Some(ScalarType::CheckedReference { .. }) => {
                     let arm = self.arm();
@@ -190,6 +191,10 @@ impl Author {
         }
         holder.record_install(Install { version, loan }, arm);
         true
+    }
+
+    pub(super) fn accept_ordinary_store(&self) -> bool {
+        self.pending_loan.is_none()
     }
 
     pub(super) fn end_scope(
@@ -649,14 +654,18 @@ impl Sealed {
         let active = contains(&summary.active[1], access)
             || (matches!(mode, AccessMode::Exclusive) && contains(&summary.active[0], access));
         #[cfg(test)]
-        let borrow = matches!(&points[access.0].kind, CfgPointKind::Borrow { .. });
+        let (clear_stage, refine_stage) = match &points[access.0].kind {
+            CfgPointKind::Borrow { .. } => (5, 6),
+            CfgPointKind::Assign { .. } => (7, 8),
+            _ => (0, 1),
+        };
         if !active || carriers.peek().is_none() {
             #[cfg(test)]
-            tests::observe(if borrow { 5 } else { 0 });
+            tests::observe(clear_stage);
             return Some(Vec::new());
         }
         #[cfg(test)]
-        tests::observe(if borrow { 6 } else { 1 });
+        tests::observe(refine_stage);
         let mut conflicts = Vec::new();
         // Carrier indices were assigned by the authored BTreeMap in binding order.
         for holder in carriers {
@@ -697,7 +706,7 @@ pub(super) mod tests {
     use super::*;
 
     thread_local! {
-        static COUNTS: std::cell::Cell<[usize; 7]> = const { std::cell::Cell::new([0; 7]) };
+        static COUNTS: std::cell::Cell<[usize; 9]> = const { std::cell::Cell::new([0; 9]) };
     }
 
     pub(in crate::scalar::reference) fn observe(stage: usize) {
@@ -778,6 +787,12 @@ pub(super) mod tests {
     }
 
     fn inert_result(prepared_existing: bool, divergent: bool, borrow_matrix: bool, linear: bool, sequential: bool) -> FunctionReferenceResult {
+        inert_result_with_stores(prepared_existing, divergent, borrow_matrix, linear, sequential, false)
+    }
+
+    fn inert_result_with_stores(
+        prepared_existing: bool, divergent: bool, borrow_matrix: bool, linear: bool, sequential: bool, stores: bool,
+    ) -> FunctionReferenceResult {
         let source = SourceIdentity::new("project".into(), "package".into(), "metadata".into(), "r1".into());
         let at = |start| ByteSpan::new(start, start + 1);
         let span = ByteSpan::new(0, 100);
@@ -817,7 +832,12 @@ pub(super) mod tests {
         }
         for holder in [&h1, &h2, &h3, &h4] {
             builder.binding_types.record(holder.clone(), ScalarType::CheckedReference {
-                inner: Box::new(ScalarType::I32), mutability: ScalarReferenceMutability::Mutable,
+                inner: Box::new(ScalarType::I32),
+                mutability: if stores && holder == &h4 {
+                    ScalarReferenceMutability::Shared
+                } else {
+                    ScalarReferenceMutability::Mutable
+                },
             }, Some(root));
         }
         builder.point(CfgPointKind::Entry, span, root, BTreeSet::new());
@@ -866,8 +886,30 @@ pub(super) mod tests {
                 builder.point(CfgPointKind::Read { binding: holder }, at(46), root, origins);
             }
         }
-        let (unread, unread_origins) = loan(&mut builder, &z, at(34));
-        bind(&mut builder, &h4, 3, unread, unread_origins);
+        let ordinary_store = |builder: &mut ReferenceFlowBuilder<'_>, owner: &ReferenceBindingId, start, scope| {
+            let span = at(start);
+            let rhs = builder.point(CfgPointKind::Evaluate(ScalarExpression::Integer {
+                value: 1.into(), span,
+            }), span, scope, BTreeSet::new());
+            let target = builder.reference_place(
+                &ScalarPlace::Name { name: "owner".into(), span }, owner.clone(), None,
+            );
+            let emitted = builder.emit_direct_assignment(owner.clone(), CfgPointKind::Assign {
+                target, rhs_point: rhs, previous_origins: BTreeSet::new(), previous_loans: vec![],
+            }, rhs, ReferenceValue::Other, span, scope).expect("typed ordinary store");
+            builder.author_direct_assignment(emitted, prepared_existing);
+        };
+        let (unread, unread_origins) = if stores {
+            loan_with_mode(&mut builder, &z, at(34), ScalarReferenceMutability::Shared)
+        } else {
+            loan(&mut builder, &z, at(34))
+        };
+        bind(&mut builder, &h4, 3, unread, unread_origins.clone());
+        if stores {
+            ordinary_store(&mut builder, &z, 50, root);
+            builder.point(CfgPointKind::Read { binding: h4.clone() }, at(51), root, unread_origins);
+            ordinary_store(&mut builder, &z, 52, root);
+        }
         let divergent_origins;
         if linear {
             assert!(!divergent);
@@ -877,6 +919,9 @@ pub(super) mod tests {
         } else {
             let branch = builder.point(CfgPointKind::Branch { condition: ScalarExpression::Boolean { value: true, span: at(6) } }, at(6), root, BTreeSet::new());
             builder.point(CfgPointKind::ScopeEnter, at(7), arm, BTreeSet::new());
+            if stores {
+                ordinary_store(&mut builder, &y, 54, arm);
+            }
             builder.point(CfgPointKind::Read { binding: x.clone() }, at(8), arm, BTreeSet::new());
             for index in [9, 10] {
                 builder.point(CfgPointKind::Read { binding: y.clone() }, at(index), arm, BTreeSet::new());
@@ -902,6 +947,9 @@ pub(super) mod tests {
         }
         builder.point(CfgPointKind::Read { binding: z.clone() }, at(35), root, BTreeSet::new());
         builder.point(CfgPointKind::Read { binding: y.clone() }, at(13), root, BTreeSet::new());
+        if stores {
+            ordinary_store(&mut builder, &x, 55, root);
+        }
         if let Some(origins) = divergent_origins {
             builder.point(CfgPointKind::Read { binding: x.clone() }, at(32), root, BTreeSet::new());
             builder.point(CfgPointKind::Read { binding: h1.clone() }, at(33), root, origins);
@@ -1013,7 +1061,7 @@ pub(super) mod tests {
         let mut admitted = inert_result(true, false, false, false, false);
         assert!(admitted.proof_points.local_borrow.is_some());
         assert_retired_read_clears_before_refinement(&admitted);
-        COUNTS.with(|counts| counts.set([0; 7]));
+        COUNTS.with(|counts| counts.set([0; 9]));
         let staged = definitive(&mut admitted);
         let counts = COUNTS.with(|counts| counts.get());
         assert_eq!(&counts[..5], &[3, 3, 2, 0, 0]);
@@ -1022,10 +1070,10 @@ pub(super) mod tests {
         assert_eq!(COUNTS.with(|counts| counts.get()[2]), 2);
         let mut unprepared = inert_result(false, false, false, false, false);
         assert!(unprepared.proof_points.local_borrow.is_none());
-        COUNTS.with(|counts| counts.set([0; 7]));
+        COUNTS.with(|counts| counts.set([0; 9]));
         let incumbent = definitive(&mut unprepared);
         assert_eq!(staged, incumbent);
-        assert_eq!(COUNTS.with(|counts| counts.get()), [0; 7]);
+        assert_eq!(COUNTS.with(|counts| counts.get()), [0; 9]);
         let spans = staged.iter().find_map(|error| match error {
             ReferenceAnalysisError::ConflictingPlace { source_span, origins }
                 if source_span.range == ByteSpan::new(9, 10) => Some(origins),
@@ -1068,7 +1116,7 @@ pub(super) mod tests {
             let mut admitted = inert_result(true, divergent, false, false, false);
             assert!(admitted.proof_points.local_borrow.is_some());
             if !divergent { assert_retired_read_clears_before_refinement(&admitted); }
-            COUNTS.with(|counts| counts.set([0; 7]));
+            COUNTS.with(|counts| counts.set([0; 9]));
             let staged = definitive(&mut admitted);
             let counts = COUNTS.with(|counts| counts.get());
             let mut incumbent = inert_result(false, divergent, false, false, false);
@@ -1092,7 +1140,7 @@ pub(super) mod tests {
         let mut admitted = inert_result(true, false, true, false, false);
         let mut incumbent = inert_result(false, false, true, false, false);
         assert!(admitted.proof_points.local_borrow.is_some());
-        COUNTS.with(|counts| counts.set([0; 7]));
+        COUNTS.with(|counts| counts.set([0; 9]));
         let errors = definitive(&mut admitted);
         let counts = COUNTS.with(|counts| counts.get());
         assert_eq!(errors, definitive(&mut incumbent));
@@ -1111,6 +1159,36 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn production_ordinary_owner_writes_use_staged_exclusive_verdicts() {
+        let at = |errors: &[ReferenceAnalysisError], start| errors.iter().filter_map(|error| match error {
+            ReferenceAnalysisError::ConflictingPlace { source_span, origins }
+                if source_span.range == ByteSpan::new(start, start + 1) =>
+                Some(origins.iter().map(|origin| origin.range.start).collect::<Vec<_>>()),
+            _ => None,
+        }).collect::<Vec<_>>();
+        for (linear, divergent) in [(true, false), (false, false), (false, true)] {
+            let mut admitted = inert_result_with_stores(true, divergent, false, linear, false, true);
+            let mut incumbent = inert_result_with_stores(false, divergent, false, linear, false, true);
+            assert!(admitted.proof_points.local_borrow.is_some());
+            assert!(incumbent.proof_points.local_borrow.is_none());
+            COUNTS.with(|counts| counts.set([0; 9]));
+            let staged = definitive(&mut admitted);
+            let counts = COUNTS.with(|counts| counts.get());
+            assert_eq!(staged, definitive(&mut incumbent));
+            assert!(counts[7] > 0 && counts[8] > 0);
+            assert_eq!(at(&staged, 50), vec![vec![34]]);
+            assert!(at(&staged, 52).is_empty());
+            if !linear {
+                assert_eq!(at(&staged, 54), vec![vec![3, 15]]);
+            }
+            let mut post_join = at(&staged, 55);
+            post_join.sort_unstable();
+            assert_eq!(post_join, if divergent { vec![vec![5], vec![30]] } else { vec![] });
+            assert_eq!(counts[3] > 0, divergent);
+        }
+    }
+
+    #[test]
     fn production_straight_line_flow_seals_one_route_and_keeps_reference_diagnostics() {
         let mut admitted = inert_result(true, false, true, true, false);
         let mut incumbent = inert_result(false, false, true, true, false);
@@ -1118,7 +1196,7 @@ pub(super) mod tests {
         assert!(sealed.forks.first.is_none());
         assert!(incumbent.proof_points.local_borrow.is_none());
         assert_retired_read_clears_before_refinement(&admitted);
-        COUNTS.with(|counts| counts.set([0; 7]));
+        COUNTS.with(|counts| counts.set([0; 9]));
         let staged = definitive(&mut admitted);
         let counts = COUNTS.with(|counts| counts.get());
         assert_eq!(staged, definitive(&mut incumbent));
@@ -1162,11 +1240,11 @@ pub(super) mod tests {
         assert!(sealed.holders.iter().all(|holder| holder.holder.arm_runs().1.is_empty()));
         assert!(incumbent.proof_points.local_borrow.is_none());
         assert!(branch_store.proof_points.local_borrow.is_some());
-        COUNTS.with(|counts| counts.set([0; 7]));
+        COUNTS.with(|counts| counts.set([0; 9]));
         let staged = definitive(&mut admitted);
         let counts = COUNTS.with(|counts| counts.get());
         assert_eq!(staged, definitive(&mut incumbent));
-        COUNTS.with(|counts| counts.set([0; 7]));
+        COUNTS.with(|counts| counts.set([0; 9]));
         let overwritten = definitive(&mut branch_store);
         let overwrite_counts = COUNTS.with(|counts| counts.get());
         assert_eq!(overwritten, definitive(&mut branch_store_incumbent));
@@ -1357,7 +1435,7 @@ pub(super) mod tests {
             };
             Some(definitive(&mut result))
         };
-        COUNTS.with(|counts| counts.set([0; 7]));
+        COUNTS.with(|counts| counts.set([0; 9]));
         let admitted = reaches(true, false).expect("exact production edges");
         assert!(COUNTS.with(|counts| counts.get()[2]) > 0);
         let incumbent = reaches(false, false).expect("incumbent verdict");

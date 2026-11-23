@@ -3863,10 +3863,12 @@ impl<'a> ReferenceFlowBuilder<'a> {
         let Some(author) = &mut self.local_borrow else { return };
         let CfgPointKind::Assign { target, .. } = &self.cfg.points[emitted.install.0].kind
             else { unreachable!("direct assignment install") };
-        if !prepared_existing || !matches!(self.binding_types.get(&target.binding),
-            Some(ScalarType::CheckedReference { inner, .. }) if aggregate::ordinary_value(inner))
-            || !author.assign(&target.binding, emitted.install, emitted.rhs)
-        {
+        if !prepared_existing || !match self.binding_types.get(&target.binding) {
+            Some(ScalarType::CheckedReference { inner, .. }) if aggregate::ordinary_value(inner) =>
+                author.assign(&target.binding, emitted.install, emitted.rhs),
+            Some(ty) if aggregate::ordinary_value(ty) => author.accept_ordinary_store(),
+            _ => false,
+        } {
             self.local_borrow = None;
         }
     }
@@ -7918,16 +7920,18 @@ fn transfer_reference_facts(
                         || (pending_allowed
                             && pending.is_some_and(|pending| deferred_local_owner_store(pending, point, original_points)))
                     {
-                        let origins = conflicting_live_loan(
-                            original_points,
-                            cfg.scope_exit_bindings,
-                            strictly_forward,
-                            &cfg.facts,
-                            &state,
-                            id,
-                            &target,
-                            LoanAccess::Direct,
-                        );
+                        let staged = cfg.local_borrow.and_then(|sealed| {
+                            if !target.projections.is_empty() || !matches!(&target.place, ScalarPlace::Name { .. }) {
+                                return None;
+                            }
+                            let verdict = || sealed.conflicts(&target.binding, id, incoming_count, original_points, local_borrow::AccessMode::Exclusive);
+                            if incoming_count == 1 { verdict() }
+                            else { local_access_conflicts.get_or_insert_with(verdict).clone() }
+                        });
+                        let origins = staged.unwrap_or_else(|| conflicting_live_loan(
+                            original_points, cfg.scope_exit_bindings, strictly_forward, &cfg.facts,
+                            &state, id, &target, LoanAccess::Direct,
+                        ));
                         if !origins.is_empty() {
                             errors.push(ReferenceAnalysisError::ConflictingPlace {
                                 source_span: point.source_span.clone(),
