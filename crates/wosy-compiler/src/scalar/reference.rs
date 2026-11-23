@@ -6147,6 +6147,8 @@ pub(super) struct OccurrenceStructure {
     pub(super) checker_branches: HashMap<OccurrenceOrdinal, super::checker_flow::CheckerPredicate>,
     #[cfg(any(test, feature = "internal-checker"))]
     pub(super) checker_integer_literals: HashMap<OccurrenceOrdinal, BigInt>,
+    #[cfg(feature = "internal-checker")]
+    pub(super) checker_integer_call_subtractions: HashMap<OccurrenceOrdinal, (OccurrenceOrdinal, BigInt)>,
     #[cfg(any(test, feature = "internal-checker"))]
     pub(super) checker_direct_targets: HashMap<OccurrenceOrdinal, (usize, usize)>,
     #[cfg(any(test, feature = "internal-checker"))]
@@ -6184,6 +6186,8 @@ impl OccurrenceStructure {
             checker_branches: HashMap::new(),
             #[cfg(any(test, feature = "internal-checker"))]
             checker_integer_literals: HashMap::new(),
+            #[cfg(feature = "internal-checker")]
+            checker_integer_call_subtractions: HashMap::new(),
             #[cfg(any(test, feature = "internal-checker"))]
             checker_direct_targets: HashMap::new(),
             #[cfg(any(test, feature = "internal-checker"))]
@@ -7288,8 +7292,43 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
             }
         }
         self.expression_children(expression, names, types, ordinal, initializer_statement)?;
+        #[cfg(feature = "internal-checker")]
+        if checker_enabled && matches!(self.mode, WalkMode::Callable(_))
+            && matches!(edge, OccurrenceEdge::CallArgument(0))
+            && matches!(parent, OccurrenceParent::Expression(call)
+                if self.structure.checker_direct_targets.contains_key(&call)
+                    && self.checked_call_signatures.get(&call).is_some_and(|signature| {
+                        matches!(signature.parameters.as_slice(), [parameter] if is_integer_type(parameter))
+                            && matches!(signature.outputs.outputs.as_slice(), [output] if output.ty == ScalarType::Unit)
+                    }))
+        {
+            self.record_integer_call_subtraction(ordinal, expression);
+        }
         Ok(ordinal)
     }
+    #[cfg(feature = "internal-checker")]
+    fn record_integer_call_subtraction(&mut self, ordinal: OccurrenceOrdinal, expression: &ScalarExpression) {
+        let ScalarExpression::Binary { operator: super::BinaryOperator::Subtract, left, right, .. } = expression
+            else { return; };
+        if !matches!(left.as_ref(), ScalarExpression::Name { .. }) {
+            return;
+        }
+        let ScalarExpression::Integer { value, .. } = right.as_ref() else { return; };
+        if value.sign() != num_bigint::Sign::Plus {
+            return;
+        }
+        let parent = OccurrenceParent::Expression(ordinal);
+        let Some(OccurrenceNode::Expression(left)) = self.structure.edges.get(&(parent, OccurrenceEdge::BinaryLeft)) else { return; };
+        let Some(OccurrenceNode::Expression(right)) = self.structure.edges.get(&(parent, OccurrenceEdge::BinaryRight)) else { return; };
+        let Some(ty) = self.structure.checked_types.expressions.get(&ordinal) else { return; };
+        if self.structure.checked_types.expressions.get(left) == Some(ty)
+            && self.structure.checked_types.expressions.get(right) == Some(ty)
+            && super::typecheck::integer_literal_fits_type(value, ty)
+        {
+            self.structure.checker_integer_call_subtractions.insert(ordinal, (*left, value.clone()));
+        }
+    }
+
 }
 
 impl CallableTargetResolver<'_> {

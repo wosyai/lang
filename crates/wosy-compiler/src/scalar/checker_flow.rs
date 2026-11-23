@@ -2032,6 +2032,7 @@ enum IntegerControl<'a> {
     Continue(IntegerInputs),
     Returned,
     Fail(IntegerCheckFailure<'a>),
+    PendingUnit(OccurrenceOrdinal),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -2885,7 +2886,7 @@ fn run_integer_callable<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool,
         if arguments.len() != boundary.parameters.len() {
             return None;
         }
-        arguments.iter().map(|value| Rc::new(IntegerSet::singleton(value))).collect()
+        exact_integer_entry_row(arguments)
     } else {
         boundary.parameters.iter()
             .map(|parameter| IntegerSet::from_type(&parameter.ty).map(Rc::new))
@@ -2943,6 +2944,7 @@ fn run_integer_callable<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool,
             IntegerControl::Returned if projected_slot.is_some() => return None,
             IntegerControl::Returned => IntegerRequirementContinuation::Feasible,
             IntegerControl::Fail(_) => IntegerRequirementContinuation::Empty,
+            IntegerControl::PendingUnit(_) => return None,
         };
     }
     match result {
@@ -2950,6 +2952,7 @@ fn run_integer_callable<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool,
             Some(Ok(ProofCoverage::Applicable(roots.reached_obligation)))
         }
         IntegerControl::Fail(failure) => Some(Err(failure)),
+        IntegerControl::PendingUnit(_) => None,
     }
 }
 
@@ -2971,24 +2974,92 @@ fn directive_disjunction_cuts<'a>(
     Some(IntegerCutUnion::new((*lhs, left), (*rhs, right), (minimum, maximum)))
 }
 
+struct UnitBranchFrame {
+    block: BlockOrdinal,
+    next: usize,
+    depth: usize,
+    axis: Option<usize>,
+    alternate: Option<(Option<BlockOrdinal>, IntegerInputs)>,
+    first: Option<IntegerInputs>,
+}
+
+struct IntegerBlockCursor {
+    block: BlockOrdinal,
+    next: usize,
+    depth: usize,
+    path: IntegerInputs,
+    branches: Vec<UnitBranchFrame>,
+}
+
+impl IntegerBlockCursor {
+    fn new(block: BlockOrdinal, depth: usize, path: IntegerInputs) -> Self {
+        Self { block, next: 0, depth, path, branches: Vec::new() }
+    }
+}
+
 fn walk_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, Authored: ScopedAuthoredReturn<'a>>(
     calls: &'a FunctionCallSites,
     roots: &mut IntegerRoots<'a>,
     block: BlockOrdinal,
-    mut path: IntegerInputs,
-    tail: Option<&'a ScalarType>,
+    path: IntegerInputs,
+    root_tail: Option<&'a ScalarType>,
+    returns: Option<&mut Vec<IntegerReturningPath<'a>>>,
+    handle_call: &mut Option<&mut ActualCallHandler<'a, '_>>,
+    failures: &mut Option<&mut IntegerFailureCollection<'a, '_>>,
+    imports: &mut &mut [Option<ImportedLocal<'a>>],
+    authored_return: Authored,
+) -> Option<IntegerControl<'a>> {
+    let mut cursor = IntegerBlockCursor::new(block, roots.axes.len(), path);
+    drive_integer_block::<USE_IMPORTED_BOUND, COLLECT, _, false>(
+        calls, roots, &mut cursor, root_tail, returns, handle_call, failures, imports, authored_return,
+    )
+}
+
+fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, Authored: ScopedAuthoredReturn<'a>, const SUSPEND_UNIT: bool>(
+    calls: &'a FunctionCallSites,
+    roots: &mut IntegerRoots<'a>,
+    cursor: &mut IntegerBlockCursor,
+    root_tail: Option<&'a ScalarType>,
     mut returns: Option<&mut Vec<IntegerReturningPath<'a>>>,
     handle_call: &mut Option<&mut ActualCallHandler<'a, '_>>,
     failures: &mut Option<&mut IntegerFailureCollection<'a, '_>>,
     imports: &mut &mut [Option<ImportedLocal<'a>>],
     authored_return: Authored,
 ) -> Option<IntegerControl<'a>> {
-    let depth = roots.axes.len();
+    let IntegerBlockCursor { mut block, mut next, mut depth, mut path, mut branches } =
+        std::mem::replace(cursor, IntegerBlockCursor::new(calls.structure.root, 0, IntegerInputs::default()));
     let structure = &calls.structure;
-    for item in &structure.blocks.get(block.0)?.items {
-        if path.is_unreachable() {
-            break;
-        }
+    loop {
+        let items = &structure.blocks.get(block.0)?.items;
+        let Some(item) = items.get(next).filter(|_| !path.is_unreachable()) else {
+            if roots.axes.len() != depth {
+                path.drop_locals(depth);
+                roots.truncate(depth);
+            }
+            let Some(mut frame) = branches.pop() else {
+                return Some(IntegerControl::Continue(path));
+            };
+            if let Some((alternate_block, alternate_path)) = frame.alternate.take() {
+                if let Some(alternate_block) = alternate_block {
+                    frame.first = Some(path);
+                    branches.push(frame);
+                    block = alternate_block;
+                    next = 0;
+                    depth = roots.axes.len();
+                    path = alternate_path;
+                    continue;
+                }
+                path = path.join(alternate_path, frame.axis);
+            } else if let Some(first) = frame.first {
+                path = first.join(path, frame.axis);
+            }
+            block = frame.block;
+            next = frame.next;
+            depth = frame.depth;
+            continue;
+        };
+        next += 1;
+        let tail = if branches.is_empty() { root_tail } else { None };
         match item.kind {
             BlockItemKind::Evaluation { expression } => {
                 if let Some(directive) = structure.checker_directives.get(&expression) {
@@ -3034,6 +3105,10 @@ fn walk_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, A
                     }
                     path = passing;
                 } else if structure.checker_direct_targets.contains_key(&expression) {
+                    if SUSPEND_UNIT {
+                        *cursor = IntegerBlockCursor { block, next, depth, path, branches };
+                        return Some(IntegerControl::PendingUnit(expression));
+                    }
                     let handle = handle_call.as_mut()?;
                     let signature = calls.checked_call_signatures.get(&expression)?;
                     let project = COLLECT && failures.as_ref().is_some_and(|collection| collection.allow_projected_calls);
@@ -3075,28 +3150,20 @@ fn walk_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, A
                         #[cfg(not(feature = "internal-checker"))]
                         return None;
                     };
-                    let mut continuation: Option<IntegerInputs> = None;
-                    for (arm, incoming) in [(Some(then_block), yes), (else_block, no)] {
-                        if incoming.is_unreachable() {
+                    let (arm, incoming, alternate) = if yes.is_unreachable() {
+                        let Some(else_block) = else_block.filter(|_| !no.is_unreachable()) else {
+                            path = no;
                             continue;
-                        }
-                        let control = if let Some(arm) = arm {
-                            walk_integer_block::<USE_IMPORTED_BOUND, COLLECT, _>(calls, roots, arm, incoming, None, None, handle_call, failures, imports, authored_return)?
-                        } else {
-                            IntegerControl::Continue(incoming)
                         };
-                        match control {
-                            IntegerControl::Continue(outgoing) => {
-                                continuation = Some(match continuation {
-                                    Some(previous) => previous.join(outgoing, axis),
-                                    None => outgoing,
-                                });
-                            }
-                            failure @ IntegerControl::Fail(_) => return Some(failure),
-                            IntegerControl::Returned => return None,
-                        }
-                    }
-                    path = continuation.unwrap_or_default();
+                        (else_block, no, None)
+                    } else {
+                        (then_block, yes, (!no.is_unreachable()).then_some((else_block, no)))
+                    };
+                    branches.push(UnitBranchFrame { block, next, depth, axis, alternate, first: None });
+                    block = arm;
+                    next = 0;
+                    depth = roots.axes.len();
+                    path = incoming;
                 }
             }
             BlockItemKind::FinalOutput(slot) => {
@@ -3143,6 +3210,7 @@ fn walk_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, A
                                 }
                             }
                             IntegerControl::Continue(_) => return None,
+                            IntegerControl::PendingUnit(_) => return None,
                         }
                     }
                     roots.truncate(depth);
@@ -3341,11 +3409,75 @@ fn walk_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, A
             }
         }
     }
-    if roots.axes.len() != depth {
-        path.drop_locals(depth);
-        roots.truncate(depth);
+}
+
+pub(super) enum ExactUnitProgress<'a> {
+    Pending(OccurrenceOrdinal),
+    Done { active: bool, feasible: bool },
+    Failed(IntegerCheckFailure<'a>),
+}
+
+pub(super) struct ExactUnitCursor<'a> {
+    roots: IntegerRoots<'a>,
+    block: IntegerBlockCursor,
+}
+
+impl<'a> ExactUnitCursor<'a> {
+    pub(super) fn new(calls: &'a FunctionCallSites, exact: &[&BigInt]) -> Option<Self> {
+        let boundary = &calls.boundary;
+        let bindings = boundary.checker_parameter_bindings.as_deref()?;
+        if exact.len() != boundary.parameters.len() || bindings.len() != exact.len() {
+            return None;
+        }
+        let mut roots = IntegerRoots { parameters: exact.len(), ..IntegerRoots::default() };
+        for (binding, parameter) in bindings.iter().zip(&boundary.parameters) {
+            roots.add(binding, &parameter.ty);
+        }
+        let row = exact_integer_entry_row(exact);
+        let block = IntegerBlockCursor::new(calls.structure.root, roots.axes.len(), IntegerInputs(vec![row]));
+        Some(Self { roots, block })
     }
-    Some(IntegerControl::Continue(path))
+
+    pub(super) fn arguments<'borrow>(
+        &'borrow self, calls: &'borrow FunctionCallSites, call: OccurrenceOrdinal, parameters: usize, collect: bool,
+    ) -> Option<NestedIntegerArgument<'borrow>> {
+        if collect && parameters == 2 {
+            nested_pair_argument(calls, call, &self.roots, &self.block.path, false)
+        } else {
+            Some(actual_nested_argument(calls, call, &self.roots, &self.block.path, false))
+        }
+    }
+
+    pub(super) fn suppress_continuation(&mut self) {
+        self.block.path = IntegerInputs::default();
+    }
+
+    pub(super) fn advance<const COLLECT: bool>(
+        &mut self,
+        calls: &'a FunctionCallSites,
+        mut handle_call: Option<&mut ActualCallHandler<'a, '_>>,
+        allow_contextual_local_transfers: bool,
+        sink: &mut dyn FnMut(IntegerCheckFailure<'a>),
+    ) -> Option<ExactUnitProgress<'a>> {
+        let mut failures = IntegerFailureCollection {
+            continuation: IntegerRequirementContinuation::Empty,
+            projected: None, allow_projected_calls: false, allow_contextual_local_transfers, sink,
+        };
+        let mut imports: &mut [Option<ImportedLocal<'a>>] = &mut [];
+        match drive_integer_block::<false, COLLECT, _, true>(
+            calls, &mut self.roots, &mut self.block, None, None, &mut handle_call,
+            &mut Some(&mut failures), &mut imports, (),
+        )? {
+            IntegerControl::PendingUnit(call) => Some(ExactUnitProgress::Pending(call)),
+            IntegerControl::Continue(path) => Some(ExactUnitProgress::Done { active: self.roots.reached_obligation, feasible: !path.is_unreachable() }),
+            IntegerControl::Returned => Some(ExactUnitProgress::Done { active: self.roots.reached_obligation, feasible: true }),
+            IntegerControl::Fail(failure) => Some(ExactUnitProgress::Failed(failure)),
+        }
+    }
+}
+
+fn exact_integer_entry_row(exact: &[&BigInt]) -> IntegerRow {
+    exact.iter().map(|value| Rc::new(IntegerSet::singleton(value))).collect()
 }
 
 fn integer_assignment(
