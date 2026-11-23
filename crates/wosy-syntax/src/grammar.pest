@@ -45,10 +45,13 @@ unsafe_marker = { unsafe_keyword }
 unsafe_keyword = { "unsafe" }
 identifier = @{ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
 parameters = { "(" ~ (identifier ~ ("," ~ identifier)*)? ~ ")" }
-block = { "{" ~ block_item* ~ final_output_list? ~ "}" }
-block_item = { local_binding | if_block_item | unsafe_block_item ~ !";" | expression ~ ";" }
+block = { "{" ~ (conditional_block_entry | block_item)* ~ final_output_list? ~ "}" }
+conditional_block_entry = { conditional_expr ~ (conditional_terminated | conditional_tail | conditional_unterminated) }
+conditional_terminated = { ";" }
+conditional_tail = { &"}" }
+conditional_unterminated = { !";" ~ !"}" }
+block_item = { local_binding | unsafe_block_item ~ !";" | expression ~ ";" }
 unsafe_block_item = { unsafe_expr }
-if_block_item = { conditional_expr ~ !";" ~ !"}" }
 final_output_list = { output_list }
 local_binding = { allocation_binding | receiver_list ~ "=" ~ output_list ~ ";" }
 allocation_binding = { runtime_receiver ~ ";" }

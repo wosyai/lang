@@ -533,6 +533,10 @@ fn build_pair(
         );
         return;
     }
+    if pair.as_rule() == Rule::conditional_block_entry {
+        build_conditional_block_entry(builder, pair, text, comments, errors);
+        return;
+    }
     if pair.as_rule() == Rule::parenthesized_primary {
         build_parenthesized_primary(builder, pair, text, comments, errors);
         return;
@@ -592,6 +596,49 @@ fn build_pair(
         cursor = child_span.end();
     }
     add_gap(builder, &text[cursor..span.end()], cursor, comments);
+    builder.finish_node();
+}
+
+fn build_conditional_block_entry(
+    builder: &mut GreenNodeBuilder<'_>,
+    pair: Pair<'_, Rule>,
+    text: &str,
+    comments: &[TypedComment],
+    errors: &mut Vec<SyntaxError>,
+) {
+    let span = pair.as_span();
+    let mut children = pair.into_inner();
+    let condition = children.next().expect("leading block conditional");
+    let condition_end = condition.as_span().end();
+    let ending = children
+        .find(|child| {
+            matches!(
+                child.as_rule(),
+                Rule::conditional_terminated | Rule::conditional_tail | Rule::conditional_unterminated
+            )
+        })
+        .expect("block conditional ending");
+    let tail = ending.as_rule() == Rule::conditional_tail;
+    builder.start_node(WosyLanguage::kind_to_raw(if tail {
+        SyntaxKind::FinalOutputList
+    } else {
+        SyntaxKind::BlockItem
+    }));
+    if tail {
+        builder.start_node(WosyLanguage::kind_to_raw(SyntaxKind::OutputList));
+    }
+    builder.start_node(WosyLanguage::kind_to_raw(SyntaxKind::Expression));
+    build_pair(builder, condition, text, comments, errors);
+    if ending.as_rule() == Rule::conditional_unterminated {
+        add_gap(builder, &text[condition_end..span.end()], condition_end, comments);
+    }
+    builder.finish_node();
+    if tail || ending.as_rule() == Rule::conditional_terminated {
+        add_gap(builder, &text[condition_end..span.end()], condition_end, comments);
+    }
+    if tail {
+        builder.finish_node();
+    }
     builder.finish_node();
 }
 
@@ -777,7 +824,6 @@ fn kind(rule: Rule) -> SyntaxKind {
         Rule::block => SyntaxKind::Block,
         Rule::block_item => SyntaxKind::BlockItem,
         Rule::unsafe_block_item => SyntaxKind::Expression,
-        Rule::if_block_item => SyntaxKind::Expression,
         Rule::final_output_list => SyntaxKind::FinalOutputList,
         Rule::expression => SyntaxKind::Expression,
         Rule::call => SyntaxKind::Call,
@@ -2335,6 +2381,125 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["input", "input + 1"]
         );
+    }
+
+    #[test]
+    fn direct_block_conditionals_keep_wrappers_and_delimiter_trivia() {
+        let text = "%%start\nunit() f = fn {\n\tif (true) { 1; } # doc: statement\n\tif (false) { 2; }  ;\n\tif (true) { if (false) { 3 } else { 4 } } else { 5 } # doc: tail\n};\n%%end";
+        let result = parse(identity(), text.into(), &["doc".into()]);
+        assert!(result.is_valid(), "{:?}", result.errors);
+        assert_eq!(result.reconstruct(), text);
+        let block = result
+            .root
+            .descendants()
+            .find(|node| node.kind() == SyntaxKind::Block)
+            .unwrap();
+        let entries: Vec<_> = block.children().collect();
+        assert_eq!(
+            entries.iter().map(CstNode::kind).collect::<Vec<_>>(),
+            [SyntaxKind::BlockItem, SyntaxKind::BlockItem, SyntaxKind::FinalOutputList]
+        );
+        let expression = |node: &CstNode| node.children().next().unwrap();
+        assert_eq!(expression(&entries[0]).kind(), SyntaxKind::Expression);
+        assert!(
+            expression(&entries[0]).text().to_string().contains("# doc: statement")
+        );
+        assert_eq!(expression(&entries[1]).text().to_string(), "if (false) { 2; }");
+        assert_eq!(entries[1].text().to_string(), "if (false) { 2; }  ;");
+        let outputs = expression(&entries[2]);
+        assert_eq!(outputs.kind(), SyntaxKind::OutputList);
+        assert_eq!(expression(&outputs).kind(), SyntaxKind::Expression);
+        assert_eq!(
+            entries[2].text().to_string(),
+            "if (true) { if (false) { 3 } else { 4 } } else { 5 } # doc: tail\n"
+        );
+        assert_eq!(outputs.text().to_string(), entries[2].text().to_string());
+        assert_eq!(
+            expression(&outputs).text().to_string(),
+            "if (true) { if (false) { 3 } else { 4 } } else { 5 }"
+        );
+        assert_eq!(result.comments.len(), 2);
+    }
+
+    #[test]
+    fn direct_conditional_fallback_and_ordered_multi_output_are_unchanged() {
+        let text = "%%start\ni32(i32) if = fn(input) { input };\n(i32, i32)() f = fn {\n\tif(1);\n\tif(2),\n\tif (true) { 3 } else { 4 }\n};\n%%end";
+        let result = parse(identity(), text.into(), &[]);
+        assert!(result.is_valid(), "{:?}", result.errors);
+        assert_eq!(result.reconstruct(), text);
+        let block = result
+            .root
+            .descendants()
+            .filter(|node| node.kind() == SyntaxKind::FunctionDecl)
+            .nth(1)
+            .unwrap()
+            .children()
+            .find(|node| node.kind() == SyntaxKind::Block)
+            .unwrap();
+        assert_eq!(
+            block.children().map(|entry| entry.kind()).collect::<Vec<_>>(),
+            [SyntaxKind::BlockItem, SyntaxKind::FinalOutputList]
+        );
+        let outputs = block
+            .children()
+            .find(|entry| entry.kind() == SyntaxKind::FinalOutputList)
+            .unwrap()
+            .children()
+            .next()
+            .unwrap();
+        assert_eq!(
+            outputs
+                .children()
+                .map(|node| node.children().next().unwrap().kind())
+                .collect::<Vec<_>>(),
+            [SyntaxKind::Primary, SyntaxKind::IfExpr]
+        );
+        assert!(outputs
+            .descendants()
+            .any(|node| node.kind() == SyntaxKind::Call && node.text() == "if(2)"));
+    }
+
+    #[test]
+    fn nested_direct_conditions_keep_identifier_calls_in_their_tails() {
+        let text = "%%start\ni32(i32) if = fn(input) { input };\ni32() f = fn { if (true) { if (false) { if(2) } else { if(3) } } else { if(4) } };\n%%end";
+        let result = parse(identity(), text.into(), &[]);
+        assert!(result.is_valid(), "{:?}", result.errors);
+        assert_eq!(result.reconstruct(), text);
+        let tail_calls = result
+            .root
+            .descendants()
+            .filter(|node| node.kind() == SyntaxKind::Call)
+            .map(|node| node.text().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(tail_calls, ["if(2)", "if(3)", "if(4)"]);
+    }
+
+    #[test]
+    fn direct_conditional_does_not_widen_malformed_block_recovery() {
+        for text in [
+            "%%start\n(i32, i32)() f = fn { if (true) { 1 } else { 2 }, 3 };\n%%end",
+            "%%start\ni32() f = fn { if (true) { 1 } else { };\n%%end",
+        ] {
+            let result = parse(identity(), text.into(), &[]);
+            assert!(!result.is_valid());
+            assert_eq!(result.reconstruct(), text);
+            assert_eq!(result.errors.len(), 1);
+            assert_eq!(
+                result.errors[0].span,
+                ByteSpan::new(
+                    "%%start\n".len() as u32,
+                    (text.rfind(';').unwrap() + 1) as u32,
+                )
+            );
+            assert_eq!(
+                result.errors[0].message,
+                "source does not match the base grammar"
+            );
+            assert!(!result
+                .root
+                .descendants()
+                .any(|node| node.kind() == SyntaxKind::FunctionDecl));
+        }
     }
 
     #[test]
