@@ -1721,7 +1721,7 @@ fn ordinary_result_read_root(expression: &ScalarExpression) -> Option<&str> {
     }
 }
 
-fn scalar_only_ordinary_result_use(
+fn named_scalar_ordinary_result_use(
     function: &ScalarFunction,
     sites: &FunctionCallSites,
     call: OccurrenceOrdinal,
@@ -1733,16 +1733,6 @@ fn scalar_only_ordinary_result_use(
         || function.body.final_output_values.len() != 1
     {
         return false;
-    }
-    if matches!(function.body.items.as_slice(), [ScalarBlockItem::Expression(ScalarExpression::ValueField { .. })]) {
-        let root = OccurrenceParent::Block(sites.structure.root);
-        let Some(OccurrenceNode::Expression(projection)) = sites.structure.edges.get(&(
-            root, OccurrenceEdge::FinalOutput { item: 0, output: 0 },
-        )) else { return false };
-        return sites.structure.value_fields.contains_key(projection)
-            && sites.structure.edges.get(&(
-                OccurrenceParent::Expression(*projection), OccurrenceEdge::ValueFieldReceiver,
-            )) == Some(&OccurrenceNode::Expression(call));
     }
     let [ScalarBlockItem::LocalBinding(binding), ScalarBlockItem::Expression(expression)] =
         function.body.items.as_slice() else { return false };
@@ -1891,6 +1881,18 @@ fn ordinary_snapshot_call_type(
     let signature = signatures.get(&call)?;
     let [output] = signature.outputs.outputs.as_slice() else { return None };
     matches!(output.ty, ScalarType::Struct(_)).then_some(&output.ty)
+}
+
+fn ordinary_projection_receivers(sites: &FunctionCallSites) -> HashSet<OccurrenceOrdinal> {
+    sites.structure.value_fields.iter().filter_map(|(projection, field)| {
+        let Some(OccurrenceNode::Expression(receiver)) = sites.structure.edges.get(&(
+            OccurrenceParent::Expression(*projection), OccurrenceEdge::ValueFieldReceiver,
+        )) else { return None };
+        match ordinary_snapshot_call_type(&sites.checked_call_signatures, *receiver) {
+            Some(ScalarType::Struct(id)) if id == &field.structure => Some(*receiver),
+            _ => None,
+        }
+    }).collect()
 }
 
 fn ordinary_snapshot_startup_sites(
@@ -2274,6 +2276,7 @@ impl OrdinaryCohorts {
                 }
             }
             let mut direct = HashMap::new();
+            let mut projection_receivers = None;
             for occurrence in &sites.call_occurrences {
                 let site = sites.sites.get(occurrence.site)?;
                 match &site.target {
@@ -2283,7 +2286,10 @@ impl OrdinaryCohorts {
                             let allowed = monomorphic && arm.is_none()
                                 && function.generic_parameters.is_empty() && function.overload_arms.is_empty()
                                 && matches!(concrete, ConcreteCallSelection::Declaration)
-                                && scalar_only_ordinary_result_use(function, sites, occurrence.ordinal);
+                                && ((!sites.structure.value_fields.is_empty() && projection_receivers
+                                    .get_or_insert_with(|| ordinary_projection_receivers(sites))
+                                    .contains(&occurrence.ordinal))
+                                    || named_scalar_ordinary_result_use(function, sites, occurrence.ordinal));
                             candidate.record(allowed.then_some(OrdinaryResultSite { caller, call: occurrence.ordinal }));
                         }
                         if self.namespace.contains_key(&target) {

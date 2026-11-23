@@ -8667,6 +8667,70 @@ u64(bool) verify = fn(flag) { Pair value = _make(flag); value.total };
 }
 
 #[test]
+fn private_projection_remains_at_exact_binding_assignment_and_branch_sites() {
+    let text = "%%start
+struct copy Pair { u8 tag; u64 value; }
+u64 trace = 0;
+u64(u64) record = fn(digit) { trace = trace * 10 + digit; digit };
+Pair(u64) _make_pair = fn(seed) { { .tag = 7; .value = seed; } };
+u64(bool) read_slots = fn(selected) {
+    u64 before = record(1);
+    u64 value = _make_pair(record(2)).value;
+    value = value + (if (selected) { (_make_pair(record(3))).value } else { 11 });
+    u64 after = record(4);
+    before + value + after
+};
+%%end";
+    for layout in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
+        let prepared = prepare_initializer_test(text, layout);
+        let checked = analyze_scalar_build(&prepared);
+        assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+        let source = &prepared.project().modules[0].source;
+        for (project, partition) in [
+            (false, emit_scalar_build_single_module_llvm(&checked).unwrap()),
+            (true, emit_scalar_build_project_llvm(&checked).unwrap()),
+        ] {
+            let symbol = |name: &str| if project { project_function_name(source, name) } else { name.to_owned() };
+            let producer = symbol("_make_pair");
+            let record = symbol("record");
+            let reader = symbol("read_slots");
+            let llvm = partition.to_text();
+            assert!(llvm.contains(&format!("define internal void @{producer}(")), "{llvm}");
+            let reader = llvm.split_once(&format!("define i64 @{reader}(")).unwrap()
+                .1.split_once("\n}").unwrap().0;
+            let constructor_call = format!("call void @{producer}(");
+            let trace_call = format!("call i64 @{record}(");
+            assert_eq!(reader.matches(&constructor_call).count(), 2, "{reader}");
+            assert_eq!(reader.matches(&trace_call).count(), 4, "{reader}");
+            assert_eq!(reader.lines().filter(|line| line.trim_start().starts_with("%ordinary_result_destination")
+                && line.contains("alloca [16 x i8], align 8")).count(), 2, "{reader}");
+            assert!(!reader.contains("call ptr "), "{reader}");
+        }
+    }
+}
+
+#[test]
+fn private_projection_refuses_same_producer_when_an_aggregate_assignment_is_unproved() {
+    let text = "%%start
+struct copy Pair { u64 value; }
+Pair(u64) _make_pair = fn(seed) { { .value = seed; } };
+u64(u64) read_value = fn(seed) { u64 word = _make_pair(seed).value; word };
+u64(u64) replace_value = fn(seed) {
+    Pair item = { .value = 13; };
+    u64 original = item.value;
+    item = _make_pair(seed);
+    original + item.value
+};
+%%end";
+    let prepared = prepare_initializer_test(text, ScalarTargetLayout::WASM32);
+    let checked = analyze_scalar_build(&prepared);
+    assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+    for result in [emit_scalar_build_single_module_llvm(&checked), emit_scalar_build_project_llvm(&checked)] {
+        assert!(matches!(result, Err(message) if message.contains("no proven caller-owned storage")));
+    }
+}
+
+#[test]
 fn private_terminal_global_copy_snapshot_checks_each_arm_and_copies_before_return() {
     let text = "%%start
 struct copy Pair { u8 tag; u64 value; }
