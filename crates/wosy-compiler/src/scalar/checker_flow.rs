@@ -3219,7 +3219,7 @@ fn integer_assignment<'a>(
 ) -> Option<(usize, &'a BigInt)> {
     let (binding, replacement, value) = checked_literal_assignment(calls, position)?;
     let (axis, ty) = roots.lookup(binding)?;
-    (axis < roots.parameters && ty == replacement).then_some((axis, value))
+    (ty == replacement).then_some((axis, value))
 }
 
 fn checked_literal_assignment(

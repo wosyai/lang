@@ -7613,6 +7613,61 @@ mod tests {
 
     #[cfg(feature = "internal-checker")]
     #[test]
+    fn ordered_base_checker_local_writes_keep_scopes_and_correlated_lanes() {
+        let app = source("src/main.w", "ordered-base-local-scoped-writes");
+        let program = format!(r#"%%start
+            unit(i8) state = fn(selector) {{
+                i8 outer = 0;
+                if (selector < 0) {{
+                    i8 scratch = 1;
+                    scratch = 2;
+                    core.require(scratch == 2, {OUTPUT});
+                    outer = 3;
+                }} else {{
+                    i8 scratch = 4;
+                    scratch = 5;
+                    core.require(scratch == 5, {OUTPUT});
+                    core.require(outer == 0, {OUTPUT});
+                }};
+                if (selector < 0) {{
+                    core.require(outer == 3, {OUTPUT});
+                }} else {{
+                    core.require(outer == 0, {OUTPUT});
+                }};
+            }};
+        %%end"#);
+        let run = |text: &str, scope| {
+            check_loaded_scalar_ordered_local_proof_contexts(
+                vec![(declarations(&app, text), Vec::new())], Vec::new(), vec![app.clone()],
+                inputs(), scope, Vec::new(),
+            ).unwrap_or_else(|error| panic!("proof-free checked local writes in {scope:?}: {error:?}"))
+        };
+        let full = run(&program, ScalarCheckerScope::CurrentPackage);
+        assert!(full.active && full.directives.is_empty());
+        let main_only = run(&program, ScalarCheckerScope::MainFlowOnly);
+        assert!(!main_only.active && main_only.directives.is_empty());
+
+        let rejected = program.replace("require(scratch == 5", "require(scratch == 4")
+            .replace("require(outer == 3", "require(outer == 0");
+        let observed = run(&rejected, ScalarCheckerScope::CurrentPackage);
+        let [inner, after] = observed.directives.as_slice() else { panic!("two exact scoped failures"); };
+        let condition = |span: ByteSpan| &rejected[span.start as usize..span.end as usize];
+        assert_eq!(condition(inner.condition), "scratch == 4");
+        assert_eq!(condition(after.condition), "outer == 0");
+        assert_eq!(inner.witness.axes().len(), 3);
+        assert_eq!(after.witness.axes().len(), 2);
+        assert_eq!(inner.witness.row_count(), 1);
+        assert_eq!(after.witness.row_count(), 1);
+        let point = |v| BigInt::from(v);
+        assert!(inner.witness.intervals_at(0, 0).unwrap().eq([(&point(0), &point(127))]));
+        assert!(inner.witness.intervals_at(0, 1).unwrap().eq([(&point(0), &point(0))]));
+        assert!(inner.witness.intervals_at(0, 2).unwrap().eq([(&point(5), &point(5))]));
+        assert!(after.witness.intervals_at(0, 0).unwrap().eq([(&point(-128), &point(-1))]));
+        assert!(after.witness.intervals_at(0, 1).unwrap().eq([(&point(3), &point(3))]));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
     fn ordered_package_failure_collection_does_not_publish_incomplete_roots() {
         let app = source("src/main.w", "collect-incomplete-package-failures");
         let prepare = |body: &str, startup: &str| {
