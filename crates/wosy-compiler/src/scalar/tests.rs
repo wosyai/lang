@@ -4916,6 +4916,61 @@ fn projected_checked_constant_indices_preserve_disjoint_origins() {
 }
 
 #[test]
+fn indexed_checked_holder_relays_one_unchanged_formal_selector() {
+    let text = "%%start\nunit(u64, *u8, *u8, *u8) update = fn(index, first, second, third) { (*u8)[2] refs = [null, null]; refs[0] = first; refs[1] = second; refs[index] = third; *u8 selected = refs[index]; *u8 sibling = refs[1]; refs[0] = first; *u8 possible = refs[index]; selected; sibling; possible; };\n%%end";
+    let (single, project) = both_reference_functions(text);
+    for (items, diagnostics) in [
+        (&single.program.items, &single.diagnostics),
+        (&project.project.modules[0].items, &project.diagnostics),
+    ] {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let ScalarItem::Function(function) = &items[0] else { panic!("function") };
+        let reads = function.reference_cfg.points.iter()
+            .filter(|point| matches!(point.kind, CfgPointKind::ReadPlace { reads_origin: true, .. }))
+            .collect::<Vec<_>>();
+        assert_eq!(reads.len(), 3);
+        for (read, expected) in reads.into_iter().zip([&[3][..], &[2, 3], &[1, 3]]) {
+            let mut actual = read.possible_origins.as_ref().unwrap().iter().map(|id|
+                match &function.reference_cfg.facts[id.0] {
+                    ReferenceOrigin::BorrowedFrom { parameter, .. } => *parameter,
+                    origin => panic!("unexpected origin {origin:?}"),
+                }).collect::<Vec<_>>();
+            actual.sort_unstable();
+            assert_eq!(actual, expected);
+        }
+    }
+}
+
+#[test]
+fn indexed_checked_holder_does_not_widen_a_fresh_local_into_an_outer_slot() {
+    let text = "%%start\nunit(bool, u64, *u8) update = fn(take, index, argument) { (*u8)[2] refs = [null, null]; refs[0] = argument; if (take) { u8 local = 1; refs[0] = &local; refs[index] = argument; }; *u8 observed = refs[0]; observed; };\n%%end";
+    let (single, project) = both_reference_functions(text);
+    let read = text.rfind("refs[0]").unwrap() as u32;
+    for diagnostics in [&single.diagnostics, &project.diagnostics] {
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "B0003" && diagnostic.labels.first().is_some_and(|label| label.span.range.start == read)
+        }), "{diagnostics:?}");
+    }
+}
+
+#[test]
+fn indexed_checked_holder_declines_local_owners_and_mutated_selectors() {
+    for (signature, parameters, setup, replacement, after) in [
+        ("u64", "index", "u8 local = 1;", "&local", ""),
+        ("u64, *u8", "index, argument", "", "argument", "index = 0;"),
+    ] {
+        let text = format!("%%start\nunit({signature}) update = fn({parameters}) {{ {setup} (*u8)[2] refs = [null, null]; refs[index] = {replacement}; {after} *u8 observed = refs[index]; observed; }};\n%%end");
+        let (single, project) = both_reference_functions(&text);
+        let start = text.rfind("refs[index]").unwrap() as u32;
+        for diagnostics in [&single.diagnostics, &project.diagnostics] {
+            assert!(diagnostics.iter().any(|diagnostic| diagnostic.code == "B0003"
+                && diagnostic.labels.first().is_some_and(|label| label.span.range.start == start)),
+                "{text}: {diagnostics:?}");
+        }
+    }
+}
+
+#[test]
 fn checked_dereference_field_write_transfers_checked_rhs() {
     let text = "%%start\nstruct Bag { *u8 item; }\nunit(u8) update = fn(value) { Bag parcel = { .item = null; }; *!Bag writer = &!parcel; (*writer).item = &value; *u8 reader = parcel.item; reader; };\n%%end";
     let (single, project) = both_reference_functions(text);

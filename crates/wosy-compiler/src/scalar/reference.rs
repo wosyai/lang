@@ -2848,7 +2848,10 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 self.place_ordinal(parent, OccurrenceEdge::PlaceBase),
                 root_binding,
             )?,
-            ScalarPlace::Index { base, index, .. } => {
+            ScalarPlace::Index { base, index, span, .. } => {
+                if let Some(binding) = root_binding {
+                    self.record_indexed_holder(place, *span, binding, ordinal);
+                }
                 self.place_expressions_with_binding(
                     base,
                     scope,
@@ -2859,6 +2862,38 @@ impl<'a> ReferenceFlowBuilder<'a> {
             }
         }
         Ok(())
+    }
+
+    fn record_indexed_holder(
+        &mut self, place: &ScalarPlace, span: ByteSpan, holder: &ReferenceBindingId,
+        ordinal: OccurrenceOrdinal,
+    ) {
+        let ScalarPlace::Index { base, index, .. } = place else { return };
+        if !matches!(base.as_ref(), ScalarPlace::Name { .. })
+            || !matches!(index.as_ref(), ScalarExpression::Name { .. })
+            || !matches!(self.binding_types.get(holder), Some(ScalarType::Array { element, .. })
+                if matches!(element.as_ref(), ScalarType::CheckedReference { mutability: ScalarReferenceMutability::Shared, inner }
+                    if aggregate::ordinary_value(inner)))
+            || !self.call_sites.call_occurrences.is_empty()
+            || !self.call_sites.callable_escapes.is_empty()
+        {
+            return;
+        }
+        let index = self.expression_ordinal(OccurrenceParent::Place(ordinal), OccurrenceEdge::PlaceIndex);
+        let Some(PlainNameIdentity::Lexical(selector)) = self.call_sites.prepared_plain_name(index) else { return };
+        if self.call_sites.structure.checked_types.expressions.get(&index) != Some(&ScalarType::U64)
+            || !self.call_sites.boundary.parameters.iter().any(|slot|
+                slot.ty == ScalarType::U64 && slot.span == selector.declaration_span)
+            || self.call_sites.boundary.parameters.iter().any(|slot| slot.span == holder.declaration_span)
+        {
+            return;
+        }
+        let selected = self.proof_points.indexed_holder.get_or_insert_with(|| Box::new(SelectedIndexedHolder {
+            holder: holder.clone(), selector: selector.clone(), sites: HashSet::new(),
+        }));
+        if selected.holder == *holder && selected.selector == *selector {
+            selected.sites.insert(span);
+        }
     }
 
     fn read_checked_place_root(
@@ -5485,14 +5520,81 @@ fn conflicting_live_loan(
     conflicts
 }
 
+pub(super) struct SelectedIndexedHolder {
+    holder: ReferenceBindingId,
+    selector: ReferenceBindingId,
+    sites: HashSet<ByteSpan>,
+}
+
+impl SelectedIndexedHolder {
+    fn selected(&self, place: &ReferencePlaceId) -> bool {
+        place.binding == self.holder
+            && matches!(&place.place, ScalarPlace::Index { span, .. } if self.sites.contains(span))
+            && matches!(place.projections.as_slice(), [ReferencePlaceProjection::Index(ScalarExpression::Name { .. })])
+    }
+
+    fn constant(&self, place: &ReferencePlaceId) -> bool {
+        place.binding == self.holder
+            && matches!(place.projections.as_slice(), [ReferencePlaceProjection::Index(ScalarExpression::Integer { .. })])
+    }
+
+    fn conflicts_with_enrollment(&self, point: &ReferenceFlowPoint) -> bool {
+        match &point.kind {
+            CfgPointKind::Borrow { place, .. } =>
+                place.binding == self.holder || place.binding == self.selector,
+            CfgPointKind::Assign { target, .. } => target.binding == self.selector,
+            _ => false,
+        }
+    }
+
+    fn eligible_origins(origins: &BTreeSet<ReferenceOriginId>, facts: &[ReferenceOrigin]) -> bool {
+        !origins.is_empty() && origins.iter().all(|origin| match &facts[origin.0] {
+            ReferenceOrigin::Null { .. } => true,
+            ReferenceOrigin::BorrowedFrom { loan, .. } =>
+                loan.mode == ScalarReferenceMutability::Shared && loan.parent.is_none(),
+            _ => false,
+        })
+    }
+
+    fn write(
+        &self, state: &mut ReferenceEdgeState, target: &ReferencePlaceId,
+        origins: &BTreeSet<ReferenceOriginId>, facts: &[ReferenceOrigin],
+    ) {
+        let selected = self.selected(target);
+        state.projected.retain_mut(|known| {
+            if !reference_places_overlap(&known.place, target) {
+                return true;
+            }
+            if if selected { self.constant(&known.place) } else { self.selected(&known.place) } {
+                if known.uninitialized {
+                    return true;
+                }
+                if !Self::eligible_origins(&known.origins, facts) {
+                    return false;
+                }
+                known.origins.extend(origins);
+                true
+            } else {
+                false
+            }
+        });
+        state.projected.push(ReferenceProjectedState {
+            place: target.clone(), origins: origins.clone(), uninitialized: false,
+        });
+    }
+}
+
 fn extend_projected_read_origins(
     state: &ReferenceEdgeState,
     candidate: &ReferencePlaceId,
     read: &mut BTreeSet<ReferenceOriginId>,
+    holder: Option<&SelectedIndexedHolder>,
 ) -> bool {
     let mut found = false;
+    let selected = holder.filter(|holder| holder.selected(candidate));
     for known in &state.projected {
-        if !known.uninitialized && reference_places_same(&known.place, candidate) {
+        if !known.uninitialized && (selected.is_some_and(|holder| holder.selected(&known.place))
+            || reference_places_same(&known.place, candidate)) {
             found = true;
             read.extend(&known.origins);
         }
@@ -5527,14 +5629,14 @@ fn projected_read_keeps_presence_separate_from_origin_contents() {
         place: unrelated, origins: BTreeSet::from([ReferenceOriginId(8)]), uninitialized: false,
     });
     let mut read = BTreeSet::new();
-    assert!(!extend_projected_read_origins(&state, &checked, &mut read));
+    assert!(!extend_projected_read_origins(&state, &checked, &mut read, None));
     state.projected.push(ReferenceProjectedState {
         place: checked.clone(), origins: BTreeSet::new(), uninitialized: false,
     });
-    assert!(extend_projected_read_origins(&state, &checked, &mut read));
+    assert!(extend_projected_read_origins(&state, &checked, &mut read, None));
     assert!(read.is_empty());
     state.projected.last_mut().unwrap().origins.insert(ReferenceOriginId(1));
-    assert!(extend_projected_read_origins(&state, &checked, &mut read));
+    assert!(extend_projected_read_origins(&state, &checked, &mut read, None));
     assert_eq!(read, BTreeSet::from([ReferenceOriginId(1)]));
 }
 
@@ -6117,6 +6219,7 @@ struct ReferenceTransferCfg<'a> {
     scope_exit_bindings: Option<&'a HashMap<CfgPointId, super::control::ScopeExitBindings>>,
     pending_named_reborrow: Option<&'a super::control::PendingNamedReborrow>,
     resolve_pending_named_reborrow: bool,
+    indexed_holder: Option<&'a SelectedIndexedHolder>,
     raw_address_exposures: &'a [(CfgPointId, Option<ReferenceBindingId>)],
     points: &'a mut [ReferenceFlowPoint],
     facts: &'a mut Vec<ReferenceOrigin>,
@@ -6145,6 +6248,7 @@ impl<'a> ReferenceTransferCfg<'a> {
             scope_exit_bindings: proof.and_then(|proof| proof.scope_exit_bindings.as_ref()),
             pending_named_reborrow: proof.and_then(|proof| proof.pending_named_reborrow.as_ref()),
             resolve_pending_named_reborrow: false,
+            indexed_holder: proof.and_then(|proof| proof.indexed_holder.as_deref()),
             raw_address_exposures: proof.map_or(&[], |proof| &proof.raw_address_exposures),
             points: &mut cfg.points,
             facts: &mut cfg.facts,
@@ -6882,6 +6986,7 @@ fn transfer_reference_facts(
     let mut strictly_forward = true;
     let mut unbranched = !matches!(cfg.forward_initial_graph, Some(super::control::ForwardInitialGraph::Branched));
     let validate_topology = cfg.forward_initial_graph.is_none();
+    let mut indexed_holder = cfg.indexed_holder.filter(|_| cfg.raw_address_exposures.is_empty() && deferred_policies.is_empty());
     let mut projected_leaf_sites = HashMap::new();
     let mut projected_leaf_holders = HashMap::new();
     let mut projected_store_facts = None::<(BTreeSet<ReferenceOriginId>, HashMap<CfgPointId, ReferenceOriginId>)>;
@@ -6947,6 +7052,9 @@ fn transfer_reference_facts(
     let mut dependency_pair = [CfgPointId(0); 2];
     let mut local_fork_index = 0;
     for (index, point) in original_points.iter().enumerate() {
+        if indexed_holder.is_some_and(|holder| holder.conflicts_with_enrollment(point)) {
+            indexed_holder = None;
+        }
         if cfg.local_borrow.is_some_and(|sealed| !sealed.matches_edge_shape(index, point, &mut local_fork_index)) {
             cfg.local_borrow = None;
         }
@@ -8307,7 +8415,7 @@ fn transfer_reference_facts(
                 } => {
                     let mut read = BTreeSet::new();
                     for candidate in candidates {
-                        if !extend_projected_read_origins(&state, candidate, &mut read) {
+                        if !extend_projected_read_origins(&state, candidate, &mut read, indexed_holder) {
                             errors.push(ReferenceAnalysisError::MissingOrigin {
                                 source_span: point.source_span.clone(),
                                 binding_id: candidate.binding.clone(),
@@ -8429,6 +8537,12 @@ fn transfer_reference_facts(
                     ..
                 } => {
                     let binding = &target.binding;
+                    let installs_reference = point.possible_origins.as_ref().is_none_or(|origins| !origins.is_empty());
+                    let holder_write = indexed_holder.filter(|holder|
+                        installs_reference && (holder.selected(target) || holder.constant(target))
+                            && assignment_rhs.as_ref().and_then(|value| value.as_ref()).is_some_and(|origins|
+                                SelectedIndexedHolder::eligible_origins(origins, &cfg.facts))
+                    );
                     reinitialize_checked_handles(&mut state, target, CheckedHandleStorage::Lexical);
                     if target.projections.is_empty() {
                         state.bindings.remove(binding);
@@ -8440,16 +8554,11 @@ fn transfer_reference_facts(
                         state.invalidated.remove(binding);
                     } else {
                         retire_overwritten_binding_origins(&mut state, previous_origins);
-                        state
-                            .projected
-                            .retain(|known| !reference_places_overlap(&known.place, target));
+                        if holder_write.is_none() {
+                            state.projected.retain(|known| !reference_places_overlap(&known.place, target));
+                        }
                     }
-                    if point.possible_origins.is_none()
-                        || point
-                            .possible_origins
-                            .as_ref()
-                            .is_some_and(|set| !set.is_empty())
-                    {
+                    if installs_reference {
                         match assignment_rhs
                             .flatten()
                             .filter(|origins| !origins.is_empty())
@@ -8457,7 +8566,9 @@ fn transfer_reference_facts(
                             Some(origins) => {
                                 if target.projections.is_empty() {
                                     state.bindings.insert(binding.clone(), origins.clone());
-                                } else {
+                                } else if let Some(holder) = holder_write {
+                                    holder.write(&mut state, target, &origins, &cfg.facts);
+                                } else if !indexed_holder.is_some_and(|holder| holder.selected(target)) {
                                     write_projected_reference(&mut state, target, &origins);
                                 }
                                 Some(origins)
@@ -12815,6 +12926,7 @@ fn derive_function_specialized_copy_policies<'a>(
                     scope_exit_bindings: template_result.proof_points.scope_exit_bindings.as_ref(),
                     pending_named_reborrow: template_result.proof_points.pending_named_reborrow.as_ref(),
                     resolve_pending_named_reborrow: false,
+                    indexed_holder: None,
                     raw_address_exposures: &template_result.proof_points.raw_address_exposures,
                     points: &mut points,
                     facts: &mut facts,
