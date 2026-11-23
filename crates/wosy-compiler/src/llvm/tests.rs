@@ -8667,6 +8667,51 @@ u64(bool) verify = fn(flag) { Pair value = _make(flag); value.total };
 }
 
 #[test]
+fn closed_copy_parameter_result_writes_caller_storage_before_returning() {
+    let text = "%%start
+struct copy Pair { u8 tag; u64 total; }
+Pair(u64) _make = fn(seed) { { .tag = 7; .total = seed; } };
+u64(u64) verify = fn(seed) { Pair item = _make(seed); item.total };
+%%end";
+    for (layout, size_ty) in [
+        (ScalarTargetLayout::WASM32, "i32"),
+        (ScalarTargetLayout::NATIVE64, "i64"),
+    ] {
+        let prepared = prepare_initializer_test(text, layout);
+        let checked = analyze_scalar_build(&prepared);
+        assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+        let source = &prepared.project().modules[0].source;
+        for (producer, caller, partition) in [
+            ("_make".to_owned(), "verify".to_owned(),
+                emit_scalar_build_single_module_llvm(&checked).unwrap()),
+            (project_function_name(source, "_make"), project_function_name(source, "verify"),
+                emit_scalar_build_project_llvm(&checked).unwrap()),
+        ] {
+            let llvm = partition.to_text();
+            let (_, tail) = llvm.split_once(&format!("define internal void @{producer}(i64 %seed, ptr "))
+                .expect("checked caller destination parameter");
+            let (destination, body) = tail.split_once(')').expect("producer parameters");
+            let (body, _) = body.split_once("\n}").expect("producer end");
+            let copy = body.lines().find(|line| line.contains("@llvm.memmove.")
+                && line.contains(&format!("ptr align 1 {destination},"))
+                && line.contains(&format!("{size_ty} 16, i1 false")))
+                .expect("aligned result bytes copied into caller destination");
+            assert!(body.contains("store i64 %seed"), "{body}");
+            assert!(body.find(copy).unwrap() < body.find("ret void").unwrap(), "{body}");
+            assert!(!body.contains("ret ptr"), "{body}");
+
+            let caller = llvm.split_once(&format!("define i64 @{caller}(")).expect("caller")
+                .1.split_once("\n}").expect("caller end").0;
+            assert!(caller.contains("alloca [16 x i8], align 8"), "{caller}");
+            assert_eq!(caller.matches(&format!("call void @{producer}(")).count(), 1);
+            assert!(caller.lines().any(|line| line.contains(&format!("call void @{producer}("))
+                && line.ends_with(", ptr %ordinary_result_destination)")), "{caller}");
+            assert!(caller.contains("ret i64 "), "{caller}");
+        }
+    }
+}
+
+#[test]
 fn closed_nested_copy_local_result_uses_caller_storage_for_scalar_projection() {
     let text = "%%start
 struct copy Part { u8 tag; u64 score; }

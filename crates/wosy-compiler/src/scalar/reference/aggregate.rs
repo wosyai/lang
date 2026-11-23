@@ -1584,6 +1584,48 @@ fn live_ordinary_result_storage(block: &ScalarBlock, ty: &ScalarType, root: bool
     }
 }
 
+fn ordinary_scalar_parameter_result(
+    source: &SourceIdentity,
+    function: &ScalarFunction,
+    sites: &FunctionCallSites,
+    structure: &ScalarStruct,
+) -> bool {
+    if structure.copy_policy != CopyPolicy::Copy || function.body.unsafe_context
+        || sites.boundary.parameters.is_empty()
+    {
+        return false;
+    }
+    let [ScalarBlockItem::Expression(ScalarExpression::StructLiteral { fields, .. })] =
+        function.body.items.as_slice() else { return false };
+    let PlainNameFacts::Prepared(names) = &sites.plain_names else { return false };
+    let root = OccurrenceParent::Block(sites.structure.root);
+    let Some(OccurrenceNode::Expression(value)) = sites.structure.edges.get(&(
+        root, OccurrenceEdge::FinalOutput { item: 0, output: 0 },
+    )) else { return false };
+    fields.iter().enumerate().all(|(position, field)| {
+        match &field.value {
+            ScalarExpression::Integer { .. } | ScalarExpression::Float { .. }
+            | ScalarExpression::Boolean { .. } | ScalarExpression::Char { .. } => true,
+            ScalarExpression::Name { .. } => {
+                let Some(OccurrenceNode::Expression(ordinal)) = sites.structure.edges.get(&(
+                    OccurrenceParent::Expression(*value), OccurrenceEdge::AggregateField(position),
+                )) else { return false };
+                let Some(field_id) = sites.structure.literal_fields.get(ordinal) else { return false };
+                let Some(declared) = structure.fields.get(field_id.index)
+                    .filter(|declared| &declared.id == field_id) else { return false };
+                let Some(PlainNameIdentity::Lexical(binding)) = names.get(ordinal) else { return false };
+                &binding.source == source
+                    && binding.function_span == function.span
+                    && matches!(binding.kind, ReferenceBindingKind::Declared)
+                    && sites.structure.checked_types.expressions.get(ordinal) == Some(&declared.ty)
+                    && sites.boundary.parameters.iter().any(|parameter|
+                        parameter.span == binding.declaration_span && parameter.ty == declared.ty)
+            }
+            _ => false,
+        }
+    })
+}
+
 fn nested_copy_local_result(
     block: &ScalarBlock,
     ty: &ScalarType,
@@ -2041,7 +2083,8 @@ impl OrdinaryCohorts {
         if crate::scalar::typecheck::is_module_private_name(&function.name) {
             let Some(structure) = structs.iter().find(|structure| &structure.id == id) else { return };
             let existing = structure.fields.iter().all(|field| ordinary_value(&field.ty))
-                && live_ordinary_result_storage(&function.body, ty, true);
+                && (live_ordinary_result_storage(&function.body, ty, true)
+                    || ordinary_scalar_parameter_result(source, function, sites, structure));
             if existing || nested_copy_local_result(&function.body, ty, structs) {
                 self.private.insert(key, OrdinaryResultCandidate::Unused);
             }
