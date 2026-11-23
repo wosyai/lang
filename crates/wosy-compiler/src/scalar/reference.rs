@@ -2105,6 +2105,12 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 if matches!(operator, BinaryOperator::And | BinaryOperator::Or) {
                     let region = &calls.short_circuits[&ordinal];
                     self.expression(left, scope, region.left)?;
+                    // Operand evaluation is linear in this reference CFG, but the
+                    // right operand is conditional in LLVM. Do not use its path
+                    // as an exact ownership merge or dominating producer corridor.
+                    if let Some(left_end) = self.cursor {
+                        self.aggregate_result.conditional_input_barriers.insert(left_end);
+                    }
                     self.expression(right, scope, region.right)?;
                 } else {
                     let left_ordinal = self.expression_ordinal(parent, OccurrenceEdge::BinaryLeft);

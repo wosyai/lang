@@ -107,8 +107,8 @@ pub(super) struct AggregateEmitter<'ctx, 'plan> {
     checked_backing_released: bool,
     checked_backing_forwarded: bool,
     receipts: BTreeMap<usize, PointerValue<'ctx>>,
-    // Only receipts with a proved split between an input move and scope cleanup.
-    guarded_receipt_live: BTreeMap<usize, inkwell::values::IntValue<'ctx>>,
+    // SSA join values indexed by the function-local, shared guard plan.
+    receipt_guards: BTreeMap<usize, inkwell::values::IntValue<'ctx>>,
     input: Option<(usize, PointerValue<'ctx>)>,
 }
 
@@ -218,7 +218,7 @@ impl<'ctx, 'plan> AggregateEmitter<'ctx, 'plan> {
             checked_backing_released: false,
             checked_backing_forwarded: false,
             receipts: BTreeMap::new(),
-            guarded_receipt_live: BTreeMap::new(),
+            receipt_guards: BTreeMap::new(),
         }))
     }
 
@@ -403,21 +403,19 @@ pub(super) fn finish_conditional_receipts<'ctx>(
     let expression = state.body_call_nodes.and_then(|nodes| nodes.expression_ordinal(expression))
         .ok_or_else(|| "missing conditional aggregate receipt occurrence".to_owned())?;
     let Some(plan) = aggregate.plan.conditional_inputs.get(&expression) else { return Ok(()) };
-    let retained = context.bool_type().const_int(1, false);
-    let transferred = context.bool_type().const_zero();
-    for (receipts, (moved, keep)) in plan.consumed_on_one_arm.iter().zip([(then_end, else_end), (else_end, then_end)]) {
-        if receipts.is_empty() {
-            continue;
-        }
-        // Receipts consumed by the same arm share one SSA predicate.
+    for &(guard, arms) in &plan.guards {
+        let incoming = |gate| match gate {
+            crate::scalar::ReceiptGate::Retained => Ok(context.bool_type().const_int(1, false)),
+            crate::scalar::ReceiptGate::Transferred => Ok(context.bool_type().const_zero()),
+            crate::scalar::ReceiptGate::Guard(child) => aggregate.receipt_guards.get(&child).copied()
+                .ok_or_else(|| "missing nested aggregate receipt guard".to_owned()),
+        };
+        let [then_live, else_live] = [incoming(arms[0])?, incoming(arms[1])?];
         let phi = state.builder.build_phi(context.bool_type(), "aggregate_receipt_active")
             .map_err(builder_error)?;
-        phi.add_incoming(&[(&retained, keep), (&transferred, moved)]);
-        let active = phi.as_basic_value().into_int_value();
-        for &receipt in receipts {
-            if aggregate.guarded_receipt_live.insert(receipt, active).is_some() {
-                return Err("duplicate guarded aggregate receipt".into());
-            }
+        phi.add_incoming(&[(&else_live, else_end), (&then_live, then_end)]);
+        if aggregate.receipt_guards.insert(guard, phi.as_basic_value().into_int_value()).is_some() {
+            return Err("duplicate conditional aggregate receipt guard".into());
         }
     }
     for receipt in &plan.consumed_on_both_arms {
@@ -1252,8 +1250,8 @@ pub(super) fn release_scope<'ctx>(
             .receipts
             .remove(ordinal)
             .ok_or_else(|| "missing closed aggregate scope receipt".to_owned())?;
-        if planned.guarded {
-            let live = aggregate.guarded_receipt_live.remove(ordinal)
+        if let Some(guard) = planned.guard {
+            let live = aggregate.receipt_guards.get(&guard).copied()
                 .ok_or_else(|| "missing guarded aggregate receipt at scope cleanup".to_owned())?;
             let function = state.builder.get_insert_block().and_then(|block| block.get_parent())
                 .ok_or_else(|| "missing guarded aggregate release block".to_owned())?;
@@ -1458,7 +1456,7 @@ pub(super) fn finish_return<'ctx>(
     if aggregate.plan.scalar_descriptor_assignment.is_some() && !aggregate.scalar_descriptor_enrolled {
         return Err("descriptor assignment did not commit ownership".into());
     }
-    if !aggregate.receipts.is_empty() || !aggregate.guarded_receipt_live.is_empty() || aggregate.input.is_some() {
+    if !aggregate.receipts.is_empty() || aggregate.receipt_guards.len() != aggregate.plan.conditional_guard_count || aggregate.input.is_some() {
         return Err("unreleased closed aggregate receipt".into());
     }
     if aggregate.ordinary_called == aggregate.plan.ordinary_calls.is_empty() {
