@@ -2491,11 +2491,28 @@ pub(super) enum ActualCallResult {
     ProjectedUnitPair(ProjectedUnitPair),
     Integer(BigInt),
     PartitionedInteger(Vec<IntegerReturnPartition>),
+    PartitionedIntegerPair(ProjectedIntegerPair),
 }
 
 pub(super) struct ProjectedUnitPair {
     caller_axes: [usize; 2],
     survivors: IntegerInputs,
+}
+
+pub(super) struct ProjectedIntegerPair {
+    caller_axes: [usize; 2],
+    pieces: Vec<IntegerPairReturnPartition>,
+}
+
+struct IntegerPairReturnPartition {
+    anchor: u16,
+    inputs: [Rc<IntegerSet>; 2],
+    output: IntegerPairPartitionOutput,
+}
+
+enum IntegerPairPartitionOutput {
+    Singleton(Rc<IntegerSet>),
+    InputAlias(usize),
 }
 
 pub(super) const MAX_ACTUAL_CALL_DEPTH: usize = 64;
@@ -3849,8 +3866,8 @@ impl<'a> ExactCallCursor<'a> {
         Self::with_row(calls, expected, row, Some(argument.slot))
     }
 
-    pub(super) fn projected_unit_pair(
-        calls: &'a FunctionCallSites, argument: &ProjectedIntegerArgument<'_>, other: usize,
+    pub(super) fn projected_pair(
+        calls: &'a FunctionCallSites, argument: &ProjectedIntegerArgument<'_>, other: usize, expected: &ScalarType,
     ) -> Option<Self> {
         let axes = [argument.caller_axis, other];
         if argument.path.0.len().checked_mul(5)? > MAX_PARTITION_TRANSFER_WORK {
@@ -3874,7 +3891,7 @@ impl<'a> ExactCallCursor<'a> {
             next.projected_from = u16::try_from(index.checked_add(1)?).ok()?;
             Some(next)
         }).collect::<Option<Vec<_>>>()?;
-        Self::with_rows(calls, &ScalarType::Unit, IntegerInputs(rows), None, Some(axes))
+        Self::with_rows(calls, expected, IntegerInputs(rows), None, Some(axes))
     }
 
     fn with_row(calls: &'a FunctionCallSites, expected: &ScalarType, row: IntegerRow, projected_slot: Option<usize>) -> Option<Self> {
@@ -3945,6 +3962,40 @@ impl<'a> ExactCallCursor<'a> {
                     row
                 }).collect();
             }
+            (ExactCallEffect::Integer { binding, ty, .. }, ActualCallResult::PartitionedIntegerPair(projected)) => {
+                let original = &self.block.path.0;
+                let mut work: usize = 0;
+                for piece in &projected.pieces {
+                    let index = usize::from(piece.anchor).checked_sub(1)?;
+                    let row = original.get(index)?;
+                    work = work.checked_add(row.len().checked_add(1)?)?
+                        .checked_add(3usize.checked_mul(row.equal_axes().len())?)?
+                        .checked_add(piece.inputs[0].interval_count())?.checked_add(piece.inputs[1].interval_count())?;
+                    if let IntegerPairPartitionOutput::InputAlias(slot) = &piece.output {
+                        if self.roots.axes.get(projected.caller_axes[*slot])?.1 != ty {
+                            return None;
+                        }
+                        work = work.checked_add(1)?;
+                    }
+                    if work > MAX_PARTITION_TRANSFER_WORK { return None; }
+                }
+                let [first, second] = projected.caller_axes;
+                self.block.path.0 = projected.pieces.into_iter().map(|piece| {
+                    let mut row = original[usize::from(piece.anchor) - 1].clone();
+                    let [left, right] = piece.inputs;
+                    row.replace_domain(first, left);
+                    row.replace_domain(second, right);
+                    match piece.output {
+                        IntegerPairPartitionOutput::Singleton(output) => row.push(output),
+                        IntegerPairPartitionOutput::InputAlias(slot) => {
+                            let axis = projected.caller_axes[slot];
+                            row.append_alias(axis, Rc::clone(&row[axis]));
+                        }
+                    }
+                    row
+                }).collect();
+                self.roots.add(binding, ty);
+            }
             (ExactCallEffect::Integer { binding, ty, .. }, ActualCallResult::PartitionedInteger(pieces)) => {
                 let axis = caller_axis?;
                 if pieces.iter().any(|piece| matches!(&piece.output, IntegerPartitionOutput::InputAlias))
@@ -4007,7 +4058,7 @@ impl<'a> ExactCallCursor<'a> {
         let control = drive_integer_block::<false, COLLECT, _, true>(
             calls, &mut self.roots, &mut self.block, self.tail, returns, &mut handle_call,
             &mut Some(&mut failures), &mut imports, (), suspend_integer,
-            self.projected_slot.map(|_| &mut self.return_capture_work),
+            (self.projected_slot.is_some() || self.projected_pair.is_some()).then_some(&mut self.return_capture_work),
         )?;
         let result = match (self.tail, control) {
             (_, IntegerControl::PendingCall(effect)) => return Some(ExactCallProgress::Pending(effect)),
@@ -4018,6 +4069,40 @@ impl<'a> ExactCallCursor<'a> {
             (None, IntegerControl::Continue(path)) if self.projected_slot.is_some() =>
                 ActualCallResult::ProjectedUnit(path.project_entry(self.projected_slot?)?),
             (None, IntegerControl::Continue(_) | IntegerControl::Returned) => ActualCallResult::Unit,
+            (Some(_), IntegerControl::Returned) if self.projected_pair.is_some() => {
+                let caller_axes = self.projected_pair?;
+                let piece_count = self.returned.iter().try_fold(0usize, |count, path| count.checked_add(path.state.0.len()))?;
+                if piece_count == 0 || piece_count > MAX_PARTITION_TRANSFER_WORK {
+                    return None;
+                }
+                let mut pieces = Vec::with_capacity(piece_count);
+                for path in &self.returned {
+                    let (alias, constant) = match path.value {
+                        IntegerReturn::Const(value) => (None, Some(Rc::new(IntegerSet::singleton(value)))),
+                        IntegerReturn::Alias(binding) => (Some(path.axes.iter().position(|axis| *axis == binding)?), None),
+                    };
+                    for row in &path.state.0 {
+                        let output = if let Some(axis) = alias {
+                            if let Some(slot) = (0..2).find(|slot| row.entry_alias(*slot, axis))
+                                .filter(|_| row[axis].singleton_value().is_none())
+                            {
+                                IntegerPairPartitionOutput::InputAlias(slot)
+                            } else {
+                                row[axis].singleton_value()?;
+                                IntegerPairPartitionOutput::Singleton(Rc::clone(&row[axis]))
+                            }
+                        } else {
+                            IntegerPairPartitionOutput::Singleton(Rc::clone(constant.as_ref()?))
+                        };
+                        pieces.push(IntegerPairReturnPartition {
+                            anchor: row.projected_from,
+                            inputs: [Rc::clone(&row[0]), Rc::clone(&row[1])],
+                            output,
+                        });
+                    }
+                }
+                ActualCallResult::PartitionedIntegerPair(ProjectedIntegerPair { caller_axes, pieces })
+            }
             (Some(_), IntegerControl::Returned) if self.projected_slot.is_some() => {
                 let slot = self.projected_slot?;
                 let piece_count = self.returned.iter().try_fold(0usize, |count, path| count.checked_add(path.state.0.len()))?;

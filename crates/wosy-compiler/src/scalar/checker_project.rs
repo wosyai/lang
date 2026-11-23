@@ -1627,7 +1627,7 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
         let arguments = parent.cursor.arguments(
             caller, call, signature.parameters.len(), collection.is_some(), Observer::INTEGER_RETURN_PARTITIONS,
             Observer::ORDINARY_PROJECTED_PAIR,
-            Observer::ORDINARY_PROJECTED_PAIR && *expected == ScalarType::Unit,
+            Observer::ORDINARY_PROJECTED_PAIR,
         )
             .ok_or(ProjectCheck::Unsupported)?;
         if let NestedIntegerArgument::Projected(projection) = arguments {
@@ -1642,7 +1642,7 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                 return Err(ProjectCheck::Unsupported);
             }
             let cursor = if let ProjectedCompanion::Independent { axis, .. } = projection.companion {
-                ExactCallCursor::projected_unit_pair(body, &projection, axis)
+                ExactCallCursor::projected_pair(body, &projection, axis, expected)
             } else {
                 let values = projection.materialize().ok_or(ProjectCheck::Unsupported)?;
                 ExactCallCursor::projected_arguments(body, values, &projection, expected)
@@ -8475,7 +8475,7 @@ mod tests {
 
     #[cfg(feature = "internal-checker")]
     #[test]
-    fn ordered_base_symbolic_call_projects_equal_arguments_without_independent_pairs() {
+    fn ordered_base_symbolic_call_preserves_equal_and_mixed_argument_rows() {
         let report = |code| OUTPUT.replace(".code = 1", &format!(".code = {code}"));
         let program = format!(r#"%%start
             i8(i8) identity = fn(value) {{ value }};
@@ -8516,7 +8516,17 @@ mod tests {
                 i8 first = choose(value, value);",
             "i8 first = choose(value, value);
                 i8 copy = identity(first);");
-        assert!(matches!(run("symbolic-equal-pair-mixed", &mixed), Err(ProjectCheck::Unsupported)));
+        let mixed_pass = run("symbolic-equal-pair-mixed", &mixed).unwrap();
+        assert!(mixed_pass.active && mixed_pass.directives.is_empty());
+        let mixed_fail = run("symbolic-equal-pair-mixed-report", &mixed.replace("second == 0", "second < 0")).unwrap();
+        let [failure] = mixed_fail.directives.as_slice() else { panic!("only the unequal nonnegative partition fails"); };
+        assert_eq!(failure.code(), &BigInt::from(13));
+        assert_eq!(failure.witness.row_count(), 1);
+        let [zero, maximum] = [0, 127].map(BigInt::from);
+        assert!(failure.witness.intervals_at(0, 0).unwrap().eq([(&zero, &maximum)]));
+        for axis in 1..4 {
+            assert!(failure.witness.intervals_at(0, axis).unwrap().eq([(&zero, &zero)]));
+        }
         let assignment = program.replace("if (left < 0) { right } else { 0 }",
             "left = 0; if (left < 0) { right } else { 0 }");
         assert!(matches!(run("symbolic-equal-pair-assignment", &assignment), Err(ProjectCheck::Unsupported)));
@@ -8559,6 +8569,55 @@ mod tests {
         let assigns = program.replace("if (tag < 0) { core.narrow",
             "tag = 0; if (tag < 0) { core.narrow");
         assert!(matches!(run("symbolic-independent-pair-write-denied", &assigns), Err(ProjectCheck::Unsupported)));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordered_base_symbolic_call_transports_independent_pair_return_aliases() {
+        let report = |code| OUTPUT.replace(".code = 1", &format!(".code = {code}"));
+        let program = format!(r#"%%start
+            i8(i8) classify = fn(n) {{ if (n < 0) {{ -1 }} else {{ 1 }} }};
+            i8(i8, i8) leaf = fn(n, tag) {{
+                if (tag < 0) {{ n }} else {{ if (tag > 0) {{ tag }} else {{ 0 }} }}
+            }};
+            i8(i8, i8) wrapper = fn(tag, n) {{ i8 result = leaf(n, tag); result }};
+            unit(i8) unused = fn(n) {{
+                i8 tag = classify(n);
+                i8 selected = wrapper(tag, n);
+                if (tag < 0) {{
+                    if (selected == -2) {{ core.require(n == -2, {}); }};
+                    core.require(selected < 0, {});
+                }} else {{
+                    core.require(selected == 1, {});
+                }};
+            }};
+            unit(i8, i8) positive_alias = fn(x, tag) {{
+                i8 selected = wrapper(tag, x);
+                if (tag > 0) {{
+                    if (selected == 2) {{ core.require(tag == 2, {}); }};
+                }};
+            }};
+        %%end"#, report(5), report(7), report(11), report(13));
+        let run = |revision, text: &str| {
+            let file = source("src/main.w", revision);
+            let prepared = prepare_proof_target(&file, text).unwrap();
+            run_closed_without_named_proofs(&prepared, ScalarCheckerScope::CurrentPackage, 1)
+        };
+        let positive = run("symbolic-pair-result-pass", &program).unwrap();
+        assert!(positive.active && positive.directives.is_empty());
+
+        let changed = program.replace("core.require(n == -2", "core.require(n == -1");
+        let negative = run("symbolic-pair-result-report", &changed).unwrap();
+        let [failure] = negative.directives.as_slice() else { panic!("only the feasible pair fails"); };
+        assert_eq!(failure.code(), &BigInt::from(5));
+        assert_eq!(failure.witness.row_count(), 1);
+        let want = [BigInt::from(-2), BigInt::from(-1), BigInt::from(-2)];
+        for (axis, value) in want.iter().enumerate() {
+            assert!(failure.witness.intervals_at(0, axis).unwrap().eq([(value, value)]));
+        }
+
+        let assigns = program.replace("if (tag < 0) { n }", "tag = 0; if (tag < 0) { n }");
+        assert!(matches!(run("symbolic-pair-result-write-denied", &assigns), Err(ProjectCheck::Unsupported)));
     }
 
     #[cfg(feature = "internal-checker")]
