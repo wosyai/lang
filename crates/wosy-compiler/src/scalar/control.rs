@@ -43,6 +43,7 @@ pub(crate) struct CallablePointFacts {
     pub(super) raw_address_exposures: Vec<(super::CfgPointId, Option<super::ReferenceBindingId>)>,
     pub(super) checked_join_values: Vec<(super::CfgPointId, [Option<super::CfgPointId>; 2])>,
     pub(super) checked_block_values: Vec<(super::CfgPointId, super::CfgPointId)>,
+    pub(super) fallible_allocation_bindings: Option<HashMap<super::ReferenceBindingId, super::ReferenceScopeId>>,
     pub(super) guarded_allocation_edges: Vec<(super::CfgPointId, GuardedAllocationEdge)>,
     pub(super) checked_binding_initializers: Vec<(super::CfgPointId, super::CfgPointId)>,
     pub(super) resolved_checked_call_outputs: Vec<super::CfgPointId>,

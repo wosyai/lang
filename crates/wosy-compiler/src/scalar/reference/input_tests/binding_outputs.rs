@@ -432,3 +432,44 @@ fn prepared_fallible_guard_producer_uses_resolved_binding_and_null_polarity() {
         assert!(!result.cfg.points.iter().any(|point| matches!(&point.kind, CfgPointKind::Borrow { place, .. } if place.binding == edge.binding)));
     }
 }
+
+#[test]
+fn prepared_fallible_reads_require_availability_on_all_projected_paths() {
+    for (body, should_reject) in [
+        ("if (&result == null) { 7 } else { result }", false),
+        ("if (&result != null) { result } else { 7 }", false),
+        ("result", true),
+        ("if (&result == null) { result } else { 7 }", true),
+        ("i32 observed = if (&result == null) { 7 } else { result };\n\tobserved;\n\tresult", true),
+    ] {
+        let text = format!("%%start\ni32() example = fn {{\n\ti32 result = 42;\n\t{body}\n}};\n%%end");
+        let parsed = parse_source(source(), text, &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let (typed, occurrences) = typecheck_scalar_program_with_occurrences(
+            derive_scalar_declarations_from_cst(parsed.result.canonical_cst()),
+            ScalarTargetLayout::WASM32,
+        );
+        assert!(typed.diagnostics.is_empty(), "{:?}", typed.diagnostics);
+        let mut program = typed.program;
+        let calls = resolve_program_call_sites_with_occurrences(&program, occurrences).unwrap();
+        let ScalarItem::Function(function) = &mut program.items[0] else { panic!("example") };
+        let ScalarBlockItem::LocalBinding(binding) = &mut function.body.items[0] else {
+            panic!("local receiver");
+        };
+        binding.fallible_assignment = Some(binding.name_span);
+        let (mut results, errors) = derive_module_reference_origins(
+            &program.source, &program.items, &calls, &program.structs, &program.enums, false,
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+        let [(0, result)] = results.as_mut_slice() else { panic!("example reference result") };
+        result.cfg.points.clone_from(&result.cfg.initial_points);
+        let errors = transfer_reference_facts(
+            ReferenceTransferCfg::new(&mut result.cfg, Some(&result.proof_points)),
+            &BTreeMap::new(), &HashMap::new(), None, None,
+        );
+        assert_eq!(errors.len(), usize::from(should_reject), "{body}: {errors:?}");
+        assert!(errors.iter().all(|error| matches!(error, ReferenceAnalysisError::MissingOrigin {
+            reason: ReferenceAnalysisErrorReason::UnavailableFallibleAllocation, ..
+        })));
+    }
+}

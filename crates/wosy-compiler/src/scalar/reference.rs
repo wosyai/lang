@@ -349,7 +349,6 @@ pub(super) struct ReferenceFlowBuilder<'a> {
     formal_forward_shape: Option<(Option<CfgPointId>, Option<CfgPointId>)>,
     independent_checked_query: bool,
     checked_scalar_storage: BTreeSet<ReferenceBindingId>,
-    fallible_i32_bindings: Option<HashMap<ReferenceBindingId, ReferenceScopeId>>,
     checked_result_origins: BTreeSet<ReferenceOriginId>,
     proof_points: CallablePointFacts,
     has_projected_child: bool,
@@ -490,7 +489,6 @@ impl<'a> ReferenceFlowBuilder<'a> {
             formal_forward_shape: None,
             independent_checked_query: aggregate::checked_scalar_output(&call_sites.boundary.root_outputs),
             checked_scalar_storage: BTreeSet::new(),
-            fallible_i32_bindings: None,
             checked_result_origins: BTreeSet::new(),
             proof_points: CallablePointFacts {
                 has_grouped_assignment_capture: Some(false),
@@ -1016,7 +1014,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
         ordinal: OccurrenceOrdinal,
         scope: ReferenceScopeId,
     ) -> Result<Option<(ReferenceBindingId, bool)>, ReferenceAnalysisError> {
-        let Some(fallible_i32_bindings) = &self.fallible_i32_bindings else {
+        let Some(fallible_i32_bindings) = &self.proof_points.fallible_allocation_bindings else {
             return Ok(None);
         };
         if self.call_sites.structure.checked_types.expressions.get(&ordinal) != Some(&ScalarType::Bool) {
@@ -3996,7 +3994,8 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         self.cfg.allocations.insert(id.clone());
                     }
                     if binding.fallible_assignment.is_some() && receiver.ty == ScalarType::I32 {
-                        self.fallible_i32_bindings.get_or_insert_with(HashMap::new).insert(id.clone(), scope);
+                        self.proof_points.fallible_allocation_bindings.get_or_insert_with(HashMap::new).insert(id.clone(), scope);
+                        self.local_borrow = None;
                     }
                     let origins = match value {
                         ReferenceValue::Checked(origins) => Some(origins),
@@ -4645,7 +4644,11 @@ impl ReferenceEdgeState {
     ) {
         if successor == edge.absent {
             self.uninitialized.insert(edge.binding.clone());
-        } else if successor == edge.present {
+        } else if successor == edge.present
+            && !self.released.contains(&edge.binding)
+            && !self.invalidated.contains(&edge.binding)
+            && !self.moved.iter().any(|(place, _)| place.binding == edge.binding)
+        {
             self.uninitialized.remove(&edge.binding);
         }
     }
@@ -4802,6 +4805,25 @@ fn guarded_allocation_availability_refines_only_the_exact_successor_binding() {
     success.refine_allocation_edge(&edge, edge.present);
     assert!(success == entry);
     assert!(failure.uninitialized.contains(&target));
+    failure.released.insert(target.clone());
+    let mut retired = failure.clone();
+    retired.refine_allocation_edge(&edge, edge.present);
+    assert!(retired == failure);
+
+    failure.released.clear();
+    let moved = ReferencePlaceId {
+        source: source.clone(),
+        function_span: span,
+        declaration_span: target.declaration_span,
+        block_span: span,
+        binding: target.clone(),
+        projections: Vec::new(),
+        place: ScalarPlace::Name { name: "target".into(), span },
+    };
+    failure.moved.push((moved, SourceSpan::new(source, span)));
+    let mut moved_edge = failure.clone();
+    moved_edge.refine_allocation_edge(&edge, edge.present);
+    assert!(moved_edge == failure);
 }
 
 #[cfg(test)]
@@ -5926,6 +5948,7 @@ struct ReferenceTransferCfg<'a> {
     allocations: &'a BTreeSet<ReferenceBindingId>,
     checked_join_values: &'a [(CfgPointId, [Option<CfgPointId>; 2])],
     checked_block_values: &'a [(CfgPointId, CfgPointId)],
+    fallible_allocation_bindings: Option<&'a HashMap<ReferenceBindingId, ReferenceScopeId>>,
     guarded_allocation_edges: &'a [(CfgPointId, super::control::GuardedAllocationEdge)],
     checked_binding_initializers: &'a [(CfgPointId, CfgPointId)],
     resolved_checked_call_outputs: &'a [CfgPointId],
@@ -5952,6 +5975,7 @@ impl<'a> ReferenceTransferCfg<'a> {
             allocations: &cfg.allocations,
             checked_join_values: proof.map_or(&[], |proof| &proof.checked_join_values),
             checked_block_values: proof.map_or(&[], |proof| &proof.checked_block_values),
+            fallible_allocation_bindings: proof.and_then(|proof| proof.fallible_allocation_bindings.as_ref()),
             guarded_allocation_edges: proof.map_or(&[], |proof| &proof.guarded_allocation_edges),
             checked_binding_initializers: proof.map_or(&[], |proof| &proof.checked_binding_initializers),
             resolved_checked_call_outputs: proof.map_or(&[], |proof| &proof.resolved_checked_call_outputs),
@@ -7860,6 +7884,16 @@ fn transfer_reference_facts(
                     }
                 }
                 CfgPointKind::Read { binding } => {
+                    if cfg.fallible_allocation_bindings.is_some()
+                        && state.uninitialized.contains(binding)
+                        && cfg.fallible_allocation_bindings.is_some_and(|bindings| bindings.contains_key(binding))
+                    {
+                        errors.push(ReferenceAnalysisError::MissingOrigin {
+                            source_span: point.source_span.clone(),
+                            binding_id: binding.clone(),
+                            reason: ReferenceAnalysisErrorReason::UnavailableFallibleAllocation,
+                        });
+                    }
                     let origins = unavailable_checked_handles(&state, binding, &[], CheckedHandleStorage::Lexical);
                     if !origins.is_empty() {
                         errors.push(ReferenceAnalysisError::ConflictingPlace {
@@ -7913,6 +7947,12 @@ fn transfer_reference_facts(
                     }
                 }
                 CfgPointKind::Bind { binding }
+                    if cfg.fallible_allocation_bindings.is_some_and(|bindings| bindings.contains_key(binding)) =>
+                {
+                    state.uninitialized.insert(binding.clone());
+                    None
+                }
+                CfgPointKind::Bind { binding }
                     if point.possible_origins.is_none()
                         || point
                             .possible_origins
@@ -7941,6 +7981,16 @@ fn transfer_reference_facts(
                             None
                         }
                     }
+                }
+                CfgPointKind::Assign { target, .. }
+                    if cfg.fallible_allocation_bindings.is_some_and(|bindings| bindings.contains_key(&target.binding)) =>
+                {
+                    errors.push(ReferenceAnalysisError::MissingOrigin {
+                        source_span: point.source_span.clone(),
+                        binding_id: target.binding.clone(),
+                        reason: ReferenceAnalysisErrorReason::UnavailableFallibleAllocation,
+                    });
+                    None
                 }
                 CfgPointKind::Assign {
                     target,
@@ -12062,6 +12112,7 @@ fn derive_function_specialized_copy_policies<'a>(
                     allocations: &template_cfg.allocations,
                     checked_join_values: &template_result.proof_points.checked_join_values,
                     checked_block_values: &template_result.proof_points.checked_block_values,
+                    fallible_allocation_bindings: template_result.proof_points.fallible_allocation_bindings.as_ref(),
                     guarded_allocation_edges: &template_result.proof_points.guarded_allocation_edges,
                     checked_binding_initializers: &template_result.proof_points.checked_binding_initializers,
                     resolved_checked_call_outputs: &template_result.proof_points.resolved_checked_call_outputs,
