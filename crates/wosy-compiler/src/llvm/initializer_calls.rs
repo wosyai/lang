@@ -149,13 +149,13 @@ pub(super) fn collect_body_overload_reservations(
     Ok(())
 }
 
-pub(super) enum PreparedCall {
+pub(super) enum PreparedCall<'symbols> {
     Core(CoreOperationId),
-    Symbol(String),
+    Symbol(Cow<'symbols, str>),
     Indirect,
 }
 
-impl PreparedCall {
+impl PreparedCall<'_> {
     pub(super) fn symbol(&self) -> Option<&str> {
         match self {
             Self::Symbol(symbol) => Some(symbol),
@@ -172,7 +172,7 @@ impl<'ctx, 'module> EmitState<'ctx, 'module> {
     pub(super) fn prepared_call(
         &self,
         expression: &ScalarExpression,
-    ) -> Result<Option<PreparedCall>, String> {
+    ) -> Result<Option<PreparedCall<'module>>, String> {
         if !self.prepared_render {
             return Ok(None);
         }
@@ -197,7 +197,7 @@ impl<'ctx, 'module> EmitState<'ctx, 'module> {
                                 let lookup = specialization_lookup_key(base, type_arguments);
                                 self.call_targets
                                     .get(&lookup)
-                                    .cloned()
+                                    .map(|symbol| Cow::Borrowed(symbol.as_str()))
                                     .ok_or_else(|| format!("unknown LLVM callable {base}"))?
                             }
                             _ => self.direct_symbol(base, concrete)?,
@@ -317,36 +317,39 @@ impl<'ctx, 'module> EmitState<'ctx, 'module> {
         }
     }
 
-    fn symbols(&self) -> &InitializerSymbols {
+    fn symbols(&self) -> &'module InitializerSymbols {
         self.initializer_symbols
             .expect("prepared LLVM symbol table")
     }
 
     fn direct_symbol(
         &self,
-        base: &str,
+        base: &'module str,
         concrete: &ConcreteCallSelection,
-    ) -> Result<String, String> {
+    ) -> Result<Cow<'module, str>, String> {
         match concrete {
-            ConcreteCallSelection::Declaration => Ok(base.to_owned()),
+            ConcreteCallSelection::Declaration => Ok(Cow::Borrowed(base)),
             ConcreteCallSelection::Overload(selection) => {
                 let key = selected_overload_lookup_key(base, selection);
-                self.call_targets.get(&key).cloned().ok_or_else(|| {
-                    if self.body_call_nodes.is_some() {
-                        format!("unknown LLVM callable {base}")
-                    } else {
-                        format!("internal error: missing LLVM initializer overload {key}")
-                    }
-                })
+                self.call_targets
+                    .get(&key)
+                    .map(|symbol| Cow::Borrowed(symbol.as_str()))
+                    .ok_or_else(|| {
+                        if self.body_call_nodes.is_some() {
+                            format!("unknown LLVM callable {base}")
+                        } else {
+                            format!("internal error: missing LLVM initializer overload {key}")
+                        }
+                    })
             }
         }
     }
 
-    fn external_symbol(&self, declaration: &SourceSpan) -> Result<String, String> {
+    fn external_symbol(&self, declaration: &SourceSpan) -> Result<Cow<'module, str>, String> {
         self.symbols()
             .externs
             .get(declaration)
-            .cloned()
+            .map(|symbol| Cow::Borrowed(symbol.as_str()))
             .ok_or_else(|| {
                 let region = if self.body_call_nodes.is_some() {
                     "body"
@@ -360,7 +363,7 @@ impl<'ctx, 'module> EmitState<'ctx, 'module> {
     fn initializer_symbol(
         &self,
         target: &ModuleInitializationCallTarget,
-    ) -> Result<Option<String>, String> {
+    ) -> Result<Option<Cow<'module, str>>, String> {
         let symbols = self.symbols();
         let name = match target {
             ModuleInitializationCallTarget::Direct {
@@ -375,7 +378,7 @@ impl<'ctx, 'module> EmitState<'ctx, 'module> {
                 type_arguments,
             } => {
                 let (_, base) = symbols.function_entry(declaration)?;
-                generic_specialization_name(base, type_arguments)
+                Cow::Owned(generic_specialization_name(base, type_arguments))
             }
             ModuleInitializationCallTarget::Extern(declaration) => {
                 self.external_symbol(declaration)?
@@ -408,7 +411,7 @@ impl<'ctx, 'module> EmitState<'ctx, 'module> {
             }
             PreparedCall::Indirect => Ok(None),
             PreparedCall::Symbol(symbol) => {
-                let Some(ScalarType::Callable { outputs, .. }) = self.signatures.get(&symbol)
+                let Some(ScalarType::Callable { outputs, .. }) = self.signatures.get(symbol.as_ref())
                 else {
                     return Err(self.missing_prepared_signature(&symbol));
                 };

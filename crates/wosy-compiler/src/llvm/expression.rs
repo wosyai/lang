@@ -752,7 +752,7 @@ fn initializer_core_name(operation: CoreOperationId) -> &'static str {
 fn emit_prepared_call<'ctx, 'module>(
     context: &'ctx Context,
     state: &mut EmitState<'ctx, 'module>,
-    selected: &PreparedCall,
+    selected: &PreparedCall<'_>,
     receiver: Option<&str>,
     name: &str,
     arguments: &[ScalarExpression],
@@ -894,7 +894,7 @@ fn core_effect_owners<'ctx, 'module>(
 
 fn uses_invalidation_event(
     state: &EmitState<'_, '_>,
-    selected: &Option<PreparedCall>,
+    selected: &Option<PreparedCall<'_>>,
     span: wosy_syntax::ByteSpan,
 ) -> Result<bool, String> {
     let Some((operation, _, _)) = state.invalidations.get(&(span.start, span.end)) else {

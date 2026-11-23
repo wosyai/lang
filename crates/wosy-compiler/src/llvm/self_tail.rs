@@ -140,14 +140,14 @@ fn argument_is_representable(
             let Some(ScalarType::Callable {
                 parameters,
                 outputs,
-            }) = state.signatures.get(&symbol)
+            }) = state.signatures.get(symbol.as_ref())
             else {
                 return false;
             };
             let [result] = outputs.outputs.as_slice() else {
                 return false;
             };
-            let Some(&callee) = state.functions.get(&symbol) else {
+            let Some(&callee) = state.functions.get(symbol.as_ref()) else {
                 return false;
             };
             &result.ty == expected
