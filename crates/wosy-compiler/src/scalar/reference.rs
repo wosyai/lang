@@ -12257,11 +12257,12 @@ impl FunctionReferenceResult {
         &self, source: &SourceIdentity, function: &ScalarFunction, sites: &FunctionCallSites,
     ) -> Option<ByteSpan> {
         let [ScalarBlockItem::LocalBinding(binding),
-            ScalarBlockItem::Expression(ScalarExpression::Name { name: owner, .. }),
-            ScalarBlockItem::Expression(ScalarExpression::Name { name: scalar, .. })] =
+            ScalarBlockItem::Expression(ScalarExpression::Name { name: first_name, .. }),
+            ScalarBlockItem::Expression(ScalarExpression::Name { name: second_name, .. })] =
             function.body.items.as_slice() else { return None };
         let [head, tail] = binding.receivers.as_slice() else { return None };
-        if !matches!(head.ty, ScalarType::Struct(_)) || &head.name != owner || &tail.name != scalar || owner == scalar
+        if aggregate::mixed_owner_result_lanes(&head.ty, &tail.ty).is_none()
+            || &head.name != first_name || &tail.name != second_name || first_name == second_name
             || binding.output_origin != ScalarBindingOutputOrigin::SingleExpression || binding.is_allocation
             || !matches!(binding.value, ScalarExpression::Call { ref arguments, .. }
                 if arguments.iter().all(|argument| matches!(argument,
