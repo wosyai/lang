@@ -181,6 +181,28 @@ mod tests {
     }
 
     #[test]
+    fn guarded_integer_allocation_rejects_literal_overflow_before_emission() {
+        let source = SourceIdentity::new(
+            "project".into(), "package".into(), "src/main.w".into(), "r1".into(),
+        );
+        for (ty, literal) in [
+            ("u8", "256"), ("i16", "32768"), ("u64", "18446744073709551616"),
+            ("u128", "340282366920938463463374607431768211456"),
+        ] {
+            let text = format!("%%start\n{ty}() example = fn {{\n\t{ty} result =? {literal};\n\tif (&result == null) {{ 0 }} else {{ result }}\n}};\n%%end");
+            let parsed = parse_source(source.clone(), text, &[]);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            for layout in [crate::ScalarTargetLayout::NATIVE64, crate::ScalarTargetLayout::WASM32] {
+                let validated = crate::derive_scalar_program_with_layout(&parsed.result, layout);
+                assert!(validated.diagnostics.iter().any(|diagnostic|
+                    diagnostic.message == "integer literal is outside the resolved target type range"),
+                    "{ty}: {}", validated.diagnostics.iter().map(|d| d.message.as_str()).collect::<Vec<_>>().join(", "));
+                assert!(emit_scalar_llvm(&validated).is_err());
+            }
+        }
+    }
+
+    #[test]
     fn validates_an_ordinary_function_named_while() {
         let text = "%%start\ni32(i32) while = fn(value) { value };\ni32 result = while(2);\n%%end";
         let output = parse_source(

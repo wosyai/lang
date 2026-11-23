@@ -9617,11 +9617,12 @@ fn guarded_integer_literal_uses_exact_declared_layout() {
     let source = SourceIdentity::new(
         "project".into(), "package".into(), "src/main.w".into(), "r1".into(),
     );
-    for (ty, ir_ty, width, literal) in [
-        ("u8", "i8", 1, "241"),
-        ("i16", "i16", 2, "30001"),
-        ("u64", "i64", 8, "4294967301"),
-        ("u128", "i128", 16, "18446744073709551619"),
+    for (ty, ir_ty, width, literal, stored) in [
+        ("u8", "i8", 1, "241", "-15"),
+        ("i16", "i16", 2, "30001", "30001"),
+        ("u64", "i64", 8, "4294967301", "4294967301"),
+        ("u128", "i128", 16, "18446744073709551619", "18446744073709551619"),
+        ("u128", "i128", 16, "340282366920938463463374607431768211455", "-1"),
     ] {
         let text = format!("%%start\n{ty}() checked = fn {{\n\t{ty} result =? {literal};\n\tif (&result == null) {{ 3 }} else {{ result }}\n}};\n%%end");
         let parsed = parse_source(source.clone(), text, &[]);
@@ -9632,7 +9633,7 @@ fn guarded_integer_literal_uses_exact_declared_layout() {
             let llvm = emit_scalar_llvm(&single).expect("guarded integer LLVM").to_text();
             let body = self_tail_test_body(&llvm, ir_ty, "checked");
             assert_eq!(body.matches(&format!("call ptr @__wosy_core_alloc(i64 {width}, i64 {width})")).count(), 1, "{body}");
-            assert_eq!(body.matches(&format!("store {ir_ty} ")).count(), 1, "{body}");
+            assert_eq!(body.matches(&format!("store {ir_ty} {stored}, ptr %allocation")).count(), 1, "{body}");
             assert!(body.contains("call void @__wosy_core_free(ptr %allocation)"), "{body}");
         }
     }
