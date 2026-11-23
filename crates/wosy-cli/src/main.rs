@@ -50,12 +50,15 @@ enum Command {
         profile: String,
     },
     #[cfg(feature = "internal-checker")]
+    #[command(group(clap::ArgGroup::new("check_scope").required(true).args(["main_flow_only", "declared_package"])))]
     Check {
         target: Option<String>,
         #[arg(long, default_value = "dev")]
         profile: String,
-        #[arg(long, required = true)]
+        #[arg(long, help = "Check only the selected target's main flow")]
         main_flow_only: bool,
+        #[arg(long, help = "Also check unused functions in the declared package source root")]
+        declared_package: bool,
     },
     Run {
         target: Option<String>,
@@ -90,8 +93,8 @@ fn main() -> ExitCode {
             }
         },
         #[cfg(feature = "internal-checker")]
-        Command::Check { target, profile, main_flow_only } => {
-            match check_command(target.as_deref(), &profile, main_flow_only) {
+        Command::Check { target, profile, main_flow_only, declared_package } => {
+            match check_command(target.as_deref(), &profile, main_flow_only, declared_package) {
                 Ok(code) => ExitCode::from(code),
                 Err(error) => {
                     eprintln!("wosy: {error}");
@@ -838,26 +841,28 @@ fn render_project_diagnostics(
 }
 
 #[cfg(feature = "internal-checker")]
-fn check_command(target: Option<&str>, profile: &str, main_flow_only: bool) -> Result<u8, String> {
+fn check_command(
+    target: Option<&str>, profile: &str, main_flow_only: bool, declared_package: bool,
+) -> Result<u8, String> {
     use configured_check::ConfiguredCheckLoadError as LoadError;
     use wosy_compiler::{Diagnostic, DiagnosticLabel, DiagnosticLabelKind, DiagnosticSeverity,
         ScalarCheckerScope, ScalarOrderedCheckerOutcome};
 
-    if !main_flow_only {
-        return Err("check requires --main-flow-only".to_owned());
-    }
     let current = env::current_dir().map_err(|error| error.to_string())?;
     let root = discover_root(&current)?;
-    let receipt = configured_check::check_target(&root, target, profile, ScalarCheckerScope::MainFlowOnly, Vec::new())
-        .map_err(|failure| match failure {
-            LoadError::Canonical(failure) => failure.report("check"),
+    let receipt = match (main_flow_only, declared_package) {
+        (true, false) => configured_check::check_target(&root, target, profile, ScalarCheckerScope::MainFlowOnly, Vec::new()),
+        (false, true) => configured_check::check_declared_package_target(&root, target, profile),
+        _ => return Err("check requires exactly one scope".to_owned()),
+    }.map_err(|failure| match failure {
+            LoadError::Canonical(failure) | LoadError::Dormant(failure) => failure.report("check"),
             LoadError::Root => "check: invalid project root".to_owned(),
             LoadError::Manifest => "check: invalid manifest".to_owned(),
             LoadError::Target => "check: invalid target".to_owned(),
             LoadError::Profile => "check: invalid target profile".to_owned(),
             LoadError::Layout => "check: unsupported target layout".to_owned(),
             LoadError::PackageSourceRoot(error) => format!("check: {error}"),
-            LoadError::DormantPath | LoadError::Dormant(_) => "check: unexpected dormant source".to_owned(),
+            LoadError::DormantPath => "check: invalid declared source path".to_owned(),
         })?;
     let report = match receipt.outcome {
         Ok(report) => report,
@@ -867,15 +872,12 @@ fn check_command(target: Option<&str>, profile: &str, main_flow_only: bool) -> R
         }
         Err(_) => return Err("check: unsupported analysis; no result published".to_owned()),
     };
-    if !report.directives.is_empty()
-        || report.symbolic_diagnostic.is_some() || !report.additional_symbolic_diagnostics.is_empty()
+    if !report.directives.is_empty() || (!declared_package
+        && (report.symbolic_diagnostic.is_some() || !report.additional_symbolic_diagnostics.is_empty()))
     {
         return Err("check: result requires unsupported output; no result published".to_owned());
     }
-    if report.diagnostics.is_empty() {
-        return Ok(0);
-    }
-    let diagnostics = report.diagnostics.into_iter().map(|failure| {
+    let actual = report.diagnostics.into_iter().map(|failure| {
         let mut labels = vec![
             DiagnosticLabel {
                 kind: DiagnosticLabelKind::Primary,
@@ -912,7 +914,47 @@ fn check_command(target: Option<&str>, profile: &str, main_flow_only: bool) -> R
             message: "proof obligation failed".to_owned(), labels,
             notes: vec![format!("call returned {}", failure.invocation.returned)],
         }
-    }).collect::<Vec<_>>();
+    });
+    let symbolic = report.symbolic_diagnostic.into_iter().chain(report.additional_symbolic_diagnostics).map(|failure| {
+        let mut labels = vec![
+            DiagnosticLabel {
+                kind: DiagnosticLabelKind::Primary,
+                span: failure.failed_step.clone().unwrap_or_else(|| failure.goal.clone()),
+                message: "not satisfied by this symbolic call".to_owned(),
+            },
+            DiagnosticLabel {
+                kind: DiagnosticLabelKind::Secondary,
+                span: failure.proof,
+                message: "proof declaration".to_owned(),
+            },
+            DiagnosticLabel {
+                kind: DiagnosticLabelKind::Secondary,
+                span: failure.callable,
+                message: "unused function checked symbolically".to_owned(),
+            },
+            DiagnosticLabel {
+                kind: DiagnosticLabelKind::Secondary,
+                span: failure.output,
+                message: "return with a counterexample".to_owned(),
+            },
+        ];
+        if failure.failed_step.is_some() {
+            labels.push(DiagnosticLabel {
+                kind: DiagnosticLabelKind::Secondary,
+                span: failure.goal,
+                message: "proof goal".to_owned(),
+            });
+        }
+        Diagnostic {
+            code: String::new(), severity: DiagnosticSeverity::Error,
+            message: "proof obligation failed".to_owned(), labels,
+            notes: vec![format!("symbolic call can return {}", failure.returned)],
+        }
+    });
+    let diagnostics = actual.chain(symbolic).collect::<Vec<_>>();
+    if diagnostics.is_empty() {
+        return Ok(0);
+    }
     render_project_diagnostics(&diagnostics, &receipt.texts);
     Ok(1)
 }
@@ -1819,7 +1861,7 @@ unit(u8) unused = fn(value) {{ core.require(value < 1, {{ .stdout = \"unused dep
         assert!(!project.root.join(".wosy").exists());
         let selected = Arguments::try_parse_from(["wosy", "check", "app", "--main-flow-only"]).unwrap();
         assert!(matches!(selected.command, Command::Check {
-            target: Some(target), profile, main_flow_only: true,
+            target: Some(target), profile, main_flow_only: true, declared_package: false,
         } if target == "app" && profile == "dev"));
     }
 

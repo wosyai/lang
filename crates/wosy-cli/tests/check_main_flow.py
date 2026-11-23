@@ -92,5 +92,70 @@ def main():
         assert b"check: unsupported analysis; no result published" in incomplete.stderr, incomplete
 
 
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory).resolve()
+        source_root = root / "src"
+        source_root.mkdir()
+        manifest = root / "wosy.toml"
+        declared = MANIFEST.replace('default_target = "app"', 'default_target = "app"\nsource_root = "src"')
+        declared = declared.replace('root = "main.w"', 'root = "src/main.w"')
+        manifest.write_text(declared, encoding="utf-8")
+        source = source_root / "main.w"
+        source.write_text(PROGRAM, encoding="utf-8")
+        dormant = source_root / "fallback.w"
+        dormant_program = """%%start
+    u8(u8) fallback = fn(value) { value };
+    proof every_return for fallback(entry) -> (out) ensures (out != 7) {}
+""" + EFFECT + "%%end"
+        dormant.write_text(dormant_program, encoding="utf-8")
+        (root / "stray.w").write_text("invalid syntax outside the declared source tree", encoding="utf-8")
+
+        def check(*args):
+            result = subprocess.run(
+                [binary, "check", *args], cwd=root, capture_output=True, timeout=15
+            )
+            assert sorted(path.relative_to(root).as_posix() for path in root.rglob("*") if path.is_file()) == [
+                "src/fallback.w", "src/main.w", "stray.w", "wosy.toml"
+            ]
+            assert not (root / ".wosy").exists()
+            return result
+
+        main_flow = check("--main-flow-only")
+        assert (main_flow.returncode, main_flow.stdout, main_flow.stderr) == (0, b"", b""), main_flow
+
+        wider = check("app", "--profile", "dev", "--declared-package")
+        assert wider.returncode == 1 and wider.stdout == b"", wider
+        assert wider.stderr.count(b"proof obligation failed") == 1, wider
+        for label in (
+            b"proof declaration", b"out != 7", b"src/fallback.w",
+            b"unused function checked symbolically", b"return with a counterexample",
+            b"symbolic call can return 7",
+        ):
+            assert label in wider.stderr, wider
+        assert b"must not emit" not in wider.stderr, wider
+
+        source.write_text(PROGRAM.replace("choose(2, -3)", "choose(4, 8)"), encoding="utf-8")
+        both = check("--declared-package")
+        assert both.returncode == 1 and both.stdout == b"", both
+        assert both.stderr.count(b"proof obligation failed") == 2, both
+        assert both.stderr.index(b"call returned 8") < both.stderr.index(b"symbolic call can return 7"), both
+
+        source.write_text(PROGRAM, encoding="utf-8")
+        dormant.write_text(dormant_program.replace("out != 7", "out <= 255"), encoding="utf-8")
+        passed = check("--declared-package")
+        assert (passed.returncode, passed.stdout, passed.stderr) == (0, b"", b""), passed
+
+        conflict = check("--main-flow-only", "--declared-package")
+        assert conflict.returncode == 2 and conflict.stdout == b"", conflict
+        assert b"--main-flow-only" in conflict.stderr and b"--declared-package" in conflict.stderr, conflict
+
+        manifest.write_text(declared.replace('source_root = "src"\n', ''), encoding="utf-8")
+        absent = check("--declared-package")
+        assert absent.returncode == 2 and absent.stdout == b"", absent
+        assert b"source_root" in absent.stderr, absent
+        still_main = check("--main-flow-only")
+        assert (still_main.returncode, still_main.stdout, still_main.stderr) == (0, b"", b""), still_main
+
+
 if __name__ == "__main__":
     main()
