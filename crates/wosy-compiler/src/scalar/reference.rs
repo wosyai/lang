@@ -366,6 +366,7 @@ pub(super) struct ReferenceFlowBuilder<'a> {
     capture_call_points: bool,
     root_return_points: std::ops::Range<usize>,
     mixed_owners: Option<MixedReceiptSelection<'a>>,
+    shared_scalar_read_effects: Option<&'a HashMap<ByteSpan, SharedScalarReadEffect>>,
     local_borrow: Option<local_borrow::Author>,
     aggregate_facts: aggregate::AggregateFlowFacts,
     aggregate_result: aggregate::AggregateFlowResult,
@@ -380,6 +381,7 @@ pub(super) struct ReferenceFlowBuilder<'a> {
     deferred_local_reborrow: bool,
     joined_local_reborrow: bool,
     has_joined_root_reborrow: bool,
+    joined_reborrow_call_admission: Option<bool>,
     pub(super) source: SourceIdentity,
     pub(super) function_span: ByteSpan,
     pub(super) names: BTreeMap<String, ReferenceBindingId>,
@@ -503,6 +505,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
             capture_call_points: false,
             root_return_points: 0..0,
             mixed_owners: None,
+            shared_scalar_read_effects: None,
             local_borrow: (matches!(&call_sites.named_place_roots, NamedPlaceRootFacts::Prepared(roots)
                 if !roots.is_empty() || (call_sites.conditionals.len() == 1
                     && matches!(call_sites.conditionals.values().next(), Some(ConditionalRegion::Unit { .. }))))
@@ -529,6 +532,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
             deferred_local_reborrow: local_reborrow && call_sites.call_occurrences.is_empty(),
             joined_local_reborrow: local_reborrow,
             has_joined_root_reborrow: false,
+            joined_reborrow_call_admission: None,
             source: source.clone(),
             function_span: function.span,
             names: BTreeMap::new(),
@@ -2006,7 +2010,35 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         | ResolvedCallTarget::CallableField { .. }, ..
                 }) && matches!(signature.and_then(|signature| signature.outputs.outputs.first()),
                     Some(ScalarOutput { ty: ScalarType::CheckedReference { .. }, .. }));
+                let read_effect_argument = if self.joined_local_reborrow
+                    && self.shared_scalar_read_effects.is_some_and(|effects| !effects.is_empty())
+                    && !calls.declared_unsafe_calls.contains(&ordinal.0)
+                {
+                    (|| {
+                        let CfgPointKind::Call { target, argument_points, .. } = &call else { return None };
+                        let effect = shared_scalar_read_effect(&self.source, target, self.shared_scalar_read_effects)?;
+                        let [parameter] = signature?.parameters.as_slice() else { return None };
+                        let ScalarType::CheckedReference { mutability: ScalarReferenceMutability::Shared, inner } = parameter else {
+                            return None;
+                        };
+                        let [output] = signature?.outputs.outputs.as_slice() else { return None };
+                        if &output.ty != inner.as_ref() || !aggregate::ordinary_value(inner) {
+                            return None;
+                        }
+                        let argument = self.expression_ordinal(parent, OccurrenceEdge::CallArgument(effect.parameter));
+                        let PlainNameIdentity::Lexical(binding) = calls.prepared_plain_name(argument)? else {
+                            return None;
+                        };
+                        let point = *argument_points.get(effect.parameter)?;
+                        (calls.structure.checked_types.expressions.get(&argument) == Some(parameter)
+                            && matches!(&self.cfg.points[point.0].kind, CfgPointKind::Read { binding: read } if read == binding))
+                            .then_some(point)
+                    })()
+                } else { None };
                 let id = self.point_with_origins(call, span, scope, cast_origins.clone());
+                if let Some(argument) = read_effect_argument {
+                    self.proof_points.shared_scalar_read_calls.push((id, argument));
+                }
                 if checked_call_output {
                     self.proof_points.resolved_checked_call_outputs.push(id);
                 }
@@ -2538,7 +2570,11 @@ impl<'a> ReferenceFlowBuilder<'a> {
                                 && self.joined_local_reborrow
                                 && !self.has_joined_root_reborrow
                                 && matches!(binding.kind, ReferenceBindingKind::Declared)
-                                && joined_reborrow_calls_are_scalar(&self.source, self.call_sites)
+                                && *self.joined_reborrow_call_admission.get_or_insert_with(|| {
+                                    joined_reborrow_calls_are_supported(
+                                        &self.source, self.call_sites, self.shared_scalar_read_effects,
+                                    )
+                                })
                             {
                                 let pointer_point = self.cursor.expect("named checked read");
                                 let point = self.point_with_origins(
@@ -6084,6 +6120,7 @@ struct ReferenceTransferCfg<'a> {
     checked_binding_initializers: &'a [(CfgPointId, CfgPointId)],
     resolved_checked_call_outputs: &'a [CfgPointId],
     checked_pointee_reads: &'a [CfgPointId],
+    shared_scalar_read_calls: &'a [(CfgPointId, CfgPointId)],
     checked_named_scalar_stores: &'a [CfgPointId],
     named_reborrow_parents: &'a [super::control::NamedReborrowParent],
 }
@@ -6111,6 +6148,7 @@ impl<'a> ReferenceTransferCfg<'a> {
             checked_binding_initializers: proof.map_or(&[], |proof| &proof.checked_binding_initializers),
             resolved_checked_call_outputs: proof.map_or(&[], |proof| &proof.resolved_checked_call_outputs),
             checked_pointee_reads: proof.map_or(&[], |proof| &proof.checked_pointee_reads),
+            shared_scalar_read_calls: proof.map_or(&[], |proof| &proof.shared_scalar_read_calls),
             checked_named_scalar_stores: proof.map_or(&[], |proof| &proof.checked_named_scalar_stores),
             named_reborrow_parents: proof.map_or(&[], |proof| &proof.named_reborrow_parents),
         }
@@ -6129,12 +6167,32 @@ fn deferred_named_reborrow_allowed(function: &ScalarFunction, calls: &FunctionCa
         && calls.structure.module_storage_uses.is_empty()
 }
 
-fn joined_reborrow_calls_are_scalar(source: &SourceIdentity, calls: &FunctionCallSites) -> bool {
+fn shared_scalar_read_effect(
+    source: &SourceIdentity, target: &ResolvedCallTarget,
+    effects: Option<&HashMap<ByteSpan, SharedScalarReadEffect>>,
+) -> Option<SharedScalarReadEffect> {
+    let ResolvedCallTarget::ModuleCallable {
+        source: callee, declaration_span, concrete: ConcreteCallSelection::Declaration,
+    } = target else { return None };
+    (callee == source).then_some(())?;
+    effects?.get(declaration_span).copied()
+}
+
+fn joined_reborrow_calls_are_supported(
+    source: &SourceIdentity, calls: &FunctionCallSites,
+    effects: Option<&HashMap<ByteSpan, SharedScalarReadEffect>>,
+) -> bool {
     calls.call_occurrences.iter().all(|call| {
-        matches!(&calls.sites[call.site].target,
+        let target = &calls.sites[call.site].target;
+        if calls.declared_unsafe_calls.contains(&call.ordinal.0) {
+            return false;
+        }
+        if shared_scalar_read_effect(source, target, effects).is_some() {
+            return true;
+        }
+        matches!(target,
             ResolvedCallTarget::ModuleCallable { source: callee, concrete: ConcreteCallSelection::Declaration, .. }
                 if callee == source)
-            && !calls.declared_unsafe_calls.contains(&call.ordinal.0)
             && calls.checked_call_signatures.get(&call.ordinal).is_some_and(|signature|
                 signature.parameters.iter().all(aggregate::ordinary_value)
                     && match signature.outputs.outputs.as_slice() {
@@ -6290,8 +6348,9 @@ fn joined_root_reborrow_binding<'a>(
     point: &ReferenceFlowPoint,
     initializers: &[(CfgPointId, CfgPointId)],
     pointee_reads: &[CfgPointId],
+    read_calls: &[(CfgPointId, CfgPointId)],
     exposures: &[(CfgPointId, Option<ReferenceBindingId>)],
-) -> Option<&'a ReferenceBindingId> {
+) -> Option<(&'a ReferenceBindingId, &'a ReferenceBindingId)> {
     let CfgPointKind::ReborrowThrough { place: ScalarPlace::Dereference { pointer, .. }, pointer_point } =
         &point.kind else { return None };
     let CfgPointKind::Read { binding } = &points.get(pointer_point.0)?.kind else { return None };
@@ -6336,8 +6395,16 @@ fn joined_root_reborrow_binding<'a>(
             CfgPointKind::Read { binding } if binding == child_binding => {
                 let [deref] = rest.successors.as_slice() else { return None };
                 let deref = points.get(deref.0)?;
-                if rest.scope != child.scope || deref.scope != child.scope
-                    || !matches!(&deref.kind, CfgPointKind::ReadPlace {
+                if rest.scope != child.scope || deref.scope != child.scope {
+                    return None;
+                }
+                if matches!(&deref.kind, CfgPointKind::Call { output: 0, argument_points, .. }
+                    if argument_points.as_slice() == [rest.id])
+                    && read_calls.binary_search(&(deref.id, rest.id)).is_ok()
+                {
+                    continue;
+                }
+                if !matches!(&deref.kind, CfgPointKind::ReadPlace {
                         place: ScalarPlace::Dereference { .. }, pointer_point: Some(ptr), reads_origin: false, ..
                     } if *ptr == rest.id)
                 {
@@ -6361,7 +6428,7 @@ fn joined_root_reborrow_binding<'a>(
             _ => (),
         }
     }
-    Some(binding)
+    Some((binding, child_binding))
 }
 
 fn checked_joined_reborrow_parent<'a>(
@@ -7124,6 +7191,7 @@ fn transfer_reference_facts(
         )
     });
     let mut forward_cursor = 0;
+    let mut joined_call_child = None;
     let mut forward_single_observation = None;
     let ordinary_forward = strictly_forward && pending.is_none() && descriptor.is_none();
     let mut errors = Vec::new();
@@ -7308,13 +7376,13 @@ fn transfer_reference_facts(
         {
             joined_root_reborrow_binding(
                 original_points, initial_point, cfg.checked_binding_initializers, cfg.checked_pointee_reads,
-                cfg.raw_address_exposures,
+                cfg.shared_scalar_read_calls, cfg.raw_address_exposures,
             )
         } else {
             None
         };
         let joined_reborrow_parents = match (&initial_point.kind, joined_reborrow_binding, states.as_slice()) {
-            (CfgPointKind::ReborrowThrough { pointer_point, .. }, Some(binding), [left, right]) => {
+            (CfgPointKind::ReborrowThrough { pointer_point, .. }, Some((binding, _)), [left, right]) => {
                 let exact = |state| checked_joined_reborrow_parent(
                     original_points, initial_point, cfg.facts, cfg.allocations, *pointer_point, state, binding,
                 );
@@ -7329,6 +7397,19 @@ fn transfer_reference_facts(
             }
             _ => None,
         };
+        if let (Some((_, child)), Some(parents)) = (joined_reborrow_binding, joined_reborrow_parents) {
+            if !cfg.shared_scalar_read_calls.is_empty() {
+                joined_call_child = Some((child, initial_point.source_span.range, parents));
+            }
+        }
+        let joined_call = if let Some((child, creation, parents)) = joined_call_child {
+            if matches!(initial_point.kind, CfgPointKind::Call { output: 0, .. }) {
+                cfg.shared_scalar_read_calls.binary_search_by_key(&id, |&(call, _)| call)
+                    .ok().map(|index| cfg.shared_scalar_read_calls[index].1).filter(|argument|
+                        matches!(&original_points[argument.0].kind, CfgPointKind::Read { binding } if binding == child))
+                    .map(|argument| (child, creation, parents, argument))
+            } else { None }
+        } else { None };
         let projected_loan = match &initial_point.kind {
             CfgPointKind::Borrow { place, loan } if direct_checked_field_base(&place.place).is_some() => Some(loan),
             _ => None,
@@ -7420,6 +7501,41 @@ fn transfer_reference_facts(
                 }
                 _ => None,
             };
+            if let Some((child, creation, parents, argument)) = joined_call {
+                let valid = state.point_values.get(argument).and_then(|origins|
+                    origins.first().filter(|_| origins.len() == 1)
+                ).and_then(|origin| {
+                    let ReferenceOrigin::Fresh { loan, .. } = cfg.facts.get(origin.0)? else {
+                        return None;
+                    };
+                    let parent = loan.parent.as_deref()?;
+                    let owner = &parent.origin_place;
+                    (loan.creation_span == creation && loan.mode == ScalarReferenceMutability::Shared
+                        && parents.iter().any(|id| matches!(&cfg.facts[id.0],
+                            ReferenceOrigin::Fresh { loan, .. } if loan == parent))
+                        && exact_live_reborrow_holder(&state, child, *origin)
+                        && !state.released.contains(&owner.binding)
+                        && !state.invalidated.contains(&owner.binding)
+                        && !state.uninitialized.contains(&owner.binding)
+                        && !unavailable_place(&state, owner)).then_some(loan)
+                });
+                if let Some(loan) = valid {
+                    let origins = conflicting_live_loan(
+                        original_points, cfg.scope_exit_bindings, strictly_forward, &cfg.facts,
+                        &state, id, &loan.origin_place, LoanAccess::ReadThrough(loan),
+                    );
+                    if !origins.is_empty() {
+                        errors.push(ReferenceAnalysisError::ConflictingPlace {
+                            source_span: initial_point.source_span.clone(), origins,
+                        });
+                    }
+                } else {
+                    errors.push(ReferenceAnalysisError::MissingContext {
+                        source_span: initial_point.source_span.clone(),
+                        reason: ReferenceAnalysisErrorReason::MissingRequiredDereferenceOrigin,
+                    });
+                }
+            }
             let call_origins = if let CfgPointKind::Call { output, argument_points, .. } =
                 &cfg.points[id.0].kind
             {
@@ -8428,6 +8544,7 @@ fn transfer_reference_facts(
                     };
                     Some(BTreeSet::from([child]))
                 }
+                CfgPointKind::Call { .. } if joined_call.is_some() => None,
                 CfgPointKind::Evaluate(_)
                 | CfgPointKind::Borrow { .. }
                 | CfgPointKind::Call { .. } => 'value: {
@@ -9130,9 +9247,61 @@ fn resolve_program_call_sites_impl(
     )
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SharedScalarReadEffect {
+    parameter: usize,
+}
+
+impl SharedScalarReadEffect {
+    fn prepare(
+        source: &SourceIdentity, function: &ScalarFunction, calls: &FunctionCallSites,
+    ) -> Option<Self> {
+        let [parameter] = calls.boundary.parameters.as_slice() else { return None };
+        let ScalarType::CheckedReference {
+            mutability: ScalarReferenceMutability::Shared, inner,
+        } = &parameter.ty else { return None };
+        if !aggregate::ordinary_value(inner)
+            || !function.generic_parameters.is_empty() || !function.overload_arms.is_empty()
+        {
+            return None;
+        }
+        let [result] = calls.boundary.results.as_slice() else { return None };
+        if &result.ty != inner.as_ref() {
+            return None;
+        }
+        let [ScalarBlockItem::Expression(ScalarExpression::Dereference {
+            place: ScalarPlace::Dereference { pointer, .. }, ..
+        })] = function.body.items.as_slice() else { return None };
+        if !matches!(pointer.as_ref(), ScalarExpression::Name { .. }) {
+            return None;
+        }
+        let structure = &calls.structure;
+        let OccurrenceNode::Expression(read) = *structure.edges.get(&(
+            OccurrenceParent::Block(structure.root),
+            OccurrenceEdge::FinalOutput { item: 0, output: result.ordinal },
+        ))? else { return None };
+        let OccurrenceNode::Place(place) = *structure.edges.get(&(
+            OccurrenceParent::Expression(read), OccurrenceEdge::ExpressionPlace,
+        ))? else { return None };
+        let OccurrenceNode::Expression(pointer) = *structure.edges.get(&(
+            OccurrenceParent::Place(place), OccurrenceEdge::DereferencePointer,
+        ))? else { return None };
+        let PlainNameIdentity::Lexical(binding) = calls.prepared_plain_name(pointer)? else {
+            return None;
+        };
+        (binding.source == *source && binding.function_span == function.span
+            && binding.block_span == function.body.span && binding.declaration_span == parameter.span
+            && binding.kind == ReferenceBindingKind::Declared
+            && structure.checked_types.expressions.get(&pointer) == Some(&parameter.ty)
+            && structure.checked_types.expressions.get(&read) == Some(inner.as_ref()))
+            .then_some(Self { parameter: parameter.ordinal })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct ModuleCallSites {
     functions: BTreeMap<usize, FunctionCallSites>,
+    shared_scalar_read_effects: HashMap<ByteSpan, SharedScalarReadEffect>,
     pub(super) initialization: ModuleInitializationRegion,
 }
 
@@ -11194,6 +11363,7 @@ fn resolve_module_call_sites(
     #[cfg(test)]
     stage_observations::record_call_sites();
     let mut functions = BTreeMap::new();
+    let mut shared_scalar_read_effects = HashMap::new();
     for (index, item) in items.iter().enumerate() {
         if let ScalarItem::Function(function) = item {
             let mut calls = resolve_function_call_sites(
@@ -11206,6 +11376,9 @@ fn resolve_module_call_sites(
             )?;
             if select_executable_calls {
                 calls.self_tail_candidates = self_tail::select(source, function, &calls);
+                if let Some(effect) = SharedScalarReadEffect::prepare(source, function, &calls) {
+                    shared_scalar_read_effects.insert(function.name_span, effect);
+                }
             }
             functions.insert(index, calls);
         }
@@ -11228,6 +11401,7 @@ fn resolve_module_call_sites(
         )?));
     let calls = ModuleCallSites {
         functions,
+        shared_scalar_read_effects,
         initialization,
     };
     if select_executable_calls {
@@ -11601,7 +11775,7 @@ impl MixedReceiptCohort {
             let (index, result) = &mut updates[position];
             let ScalarItem::Function(function) = &items[*index] else { unreachable!("function result ordinal") };
             result.observe_selected_mixed_receipts(function, &call_sites.functions[index], &self.module_names,
-                structs, enums, source, owners, owners.is_forwarder(source, &function.name_span),
+                structs, enums, source, &call_sites.shared_scalar_read_effects, owners, owners.is_forwarder(source, &function.name_span),
                 capture_call_points, errors);
         }
     }
@@ -11655,7 +11829,7 @@ fn derive_module_reference_cohort(
         if let ScalarItem::Function(function) = item {
             let result = derive_function_reference_result(
                 source, function, &module_names, &call_sites.functions[&index],
-                structs, enums, capture_call_points, &mut errors,
+                structs, enums, Some(&call_sites.shared_scalar_read_effects), capture_call_points, &mut errors,
             );
             let position = updates.len();
             if result.collect_mixed_targets(mixed_targets) {
@@ -12623,6 +12797,7 @@ fn derive_function_specialized_copy_policies<'a>(
                     checked_binding_initializers: &template_result.proof_points.checked_binding_initializers,
                     resolved_checked_call_outputs: &template_result.proof_points.resolved_checked_call_outputs,
                     checked_pointee_reads: &template_result.proof_points.checked_pointee_reads,
+                    shared_scalar_read_calls: &template_result.proof_points.shared_scalar_read_calls,
                     checked_named_scalar_stores: &template_result.proof_points.checked_named_scalar_stores,
                     named_reborrow_parents: &template_result.proof_points.named_reborrow_parents,
                 },
@@ -12747,11 +12922,12 @@ impl FunctionReferenceResult {
 
     fn observe_selected_mixed_receipts(
         &mut self, function: &ScalarFunction, sites: &FunctionCallSites, module_names: &HashSet<String>,
-        structs: &[ScalarStruct], enums: &[ScalarEnum], source: &SourceIdentity, owners: MixedReceiptSelection<'_>,
+        structs: &[ScalarStruct], enums: &[ScalarEnum], source: &SourceIdentity,
+        effects: &HashMap<ByteSpan, SharedScalarReadEffect>, owners: MixedReceiptSelection<'_>,
         forwards: bool, capture_call_points: bool, errors: &mut Vec<ReferenceAnalysisError>,
     ) {
         for ((result, function), sites) in self.arms.iter_mut().zip(&function.overload_arms).zip(&sites.arms) {
-            result.observe_selected_mixed_receipts(function, sites, module_names, structs, enums, source, owners,
+            result.observe_selected_mixed_receipts(function, sites, module_names, structs, enums, source, effects, owners,
                 false, capture_call_points, errors);
         }
         if !self.mixed_targets().any(|(target, declaration)| owners.contains(target, &declaration)) {
@@ -12760,6 +12936,7 @@ impl FunctionReferenceResult {
         let mut builder = ReferenceFlowBuilder::new(source, function, module_names, sites, structs, enums);
         builder.capture_call_points = capture_call_points;
         builder.mixed_owners = Some(owners);
+        builder.shared_scalar_read_effects = Some(effects);
         let (cfg, emitted_errors, proof_points, mut aggregate, checked_contract_returns) =
             build_function_reference_cfg(builder, function, true);
         if forwards && aggregate.mixed_result_bindings.len() == 1 {
@@ -12807,6 +12984,7 @@ pub(super) fn record_function_reference_origins(
         call_sites,
         structs,
         enums,
+        None,
         false,
         &mut errors,
     );
@@ -12867,6 +13045,7 @@ fn derive_function_reference_result(
     call_sites: &FunctionCallSites,
     structs: &[ScalarStruct],
     enums: &[ScalarEnum],
+    effects: Option<&HashMap<ByteSpan, SharedScalarReadEffect>>,
     capture_call_points: bool,
     errors: &mut Vec<ReferenceAnalysisError>,
 ) -> FunctionReferenceResult {
@@ -12881,6 +13060,7 @@ fn derive_function_reference_result(
             calls,
             structs,
             enums,
+            effects,
             capture_call_points,
             errors,
         ));
@@ -12888,6 +13068,7 @@ fn derive_function_reference_result(
     let mut builder =
         ReferenceFlowBuilder::new(source, function, module_names, call_sites, structs, enums);
     builder.capture_call_points = capture_call_points;
+    builder.shared_scalar_read_effects = effects;
     let (cfg, current_errors, proof_points, aggregate, checked_contract_returns) =
         build_function_reference_cfg(builder, function, errors.len() == entry_errors);
     errors.extend(current_errors);

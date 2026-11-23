@@ -13,10 +13,10 @@ enum Expected {
 }
 
 fn check(text: &str, expected: Expected) {
-    check_case(text, expected, false);
+    check_case(text, expected, None);
 }
 
-fn check_case(text: &str, expected: Expected, write_witness: bool) {
+fn check_case(text: &str, expected: Expected, witness_dir: Option<&str>) {
     let source = SourceIdentity::new(
         "project".into(),
         "package".into(),
@@ -62,7 +62,7 @@ fn check_case(text: &str, expected: Expected, write_witness: bool) {
         if matches!(expected, Expected::Valid) && text.contains("child") {
             let standalone = emit_scalar_llvm(&single).expect("standalone LLVM").to_text();
             let project = emit_scalar_project_llvm(&project).expect("project LLVM").to_text();
-            if let Some(out) = std::env::var_os("WOSY_REBORROW_TEST_IR_DIR").filter(|_| write_witness) {
+            if let Some(out) = witness_dir.and_then(std::env::var_os) {
                 for (route, ir) in [("standalone", standalone), ("project", project)] {
                     let path = std::path::PathBuf::from(&out).join(format!("{target}-{route}.ll"));
                     std::fs::write(path, &ir).unwrap();
@@ -160,7 +160,7 @@ fn joined_with_scalar_call(after_read: &str) -> String {
 fn joined_child_survives_a_direct_scalar_call() {
     let program = joined_with_scalar_call("u8 through_call = scalar(seen); u8 again = *child; first = 3;");
     let program = program.replace("    seen\n", "    if (again == through_call) { seen } else { 0 }\n");
-    check_case(&program, Expected::Valid, true);
+    check_case(&program, Expected::Valid, Some("WOSY_REBORROW_TEST_IR_DIR"));
 }
 
 #[test]
@@ -169,9 +169,39 @@ fn joined_child_remains_live_after_a_direct_scalar_call() {
     check(&program, Expected::LiveConflict);
 }
 
+fn joined_with_pointer_read(after_read: &str, behavior: &str) -> String {
+    let program = joined("parent = &!second;", true, "", after_read);
+    program.replace("%%start\n", &format!("%%start\nu8(*u8) pointer = fn(value) {{ {behavior} }};\n"))
+}
+
 #[test]
-fn joined_child_still_declines_checked_reference_calls() {
-    let program = joined("parent = &!second;", true, "", "u8 through_call = pointer(child); through_call;");
-    let program = program.replace("%%start\n", "%%start\nu8(*u8) pointer = fn(value) { *value };\n");
+fn joined_child_is_read_by_checked_callee_before_selected_owner_is_reusable() {
+    let program = joined_with_pointer_read(
+        "u8 through_call = pointer(child); first = 3;", "*value",
+    );
+    let program = program.replace("    seen\n", "    if (through_call == seen) { through_call } else { 0 }\n");
+    check_case(&program, Expected::Valid, Some("WOSY_REBORROW_CALL_TEST_IR_DIR"));
+}
+
+#[test]
+fn joined_child_stays_live_until_checked_callee_reads_it() {
+    let program = joined_with_pointer_read(
+        "first = 3; u8 through_call = pointer(child); through_call;", "*value",
+    );
+    check(&program, Expected::LiveConflict);
+}
+
+#[test]
+fn joined_child_declines_a_callee_without_a_prepared_read_effect() {
+    let program = joined_with_pointer_read(
+        "u8 through_call = pointer(child); through_call;", "*value + 1",
+    );
+    check(&program, Expected::NullParent);
+}
+
+#[test]
+fn joined_child_cannot_escape_in_a_callee_return() {
+    let program = joined("parent = &!second;", true, "", "*u8 escaped = pointer(child); *escaped;");
+    let program = program.replace("%%start\n", "%%start\n*u8(*u8) pointer = fn(value) { value };\n");
     check(&program, Expected::NullParent);
 }

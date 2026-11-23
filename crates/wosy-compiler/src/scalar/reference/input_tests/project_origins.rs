@@ -488,6 +488,7 @@ fn actual_empty_module_keeps_its_successful_ordinal_slot() {
         calls.modules,
         vec![Ok(ModuleCallSites {
             functions: BTreeMap::new(),
+            shared_scalar_read_effects: HashMap::new(),
             initialization: ModuleInitializationRegion {
                 source: modules[0].source.clone(),
                 steps: Vec::new(),
@@ -865,4 +866,35 @@ if (true) { flag, number = reverse(); };
             }
         }
     }
+}
+
+#[test]
+fn prepared_shared_scalar_read_effect_is_exact_to_declaration_and_formal() {
+    let reader = "u8(*u8) sample = fn(value) { *value };";
+    let non_reader = "u8(*u8) sample = fn(value) { *value + 1 };";
+    let other = "        *u8(*u8) escape = fn(value) { value };\n        u8(*u8) alias = fn(value) { *u8 copy = value; *copy };\n        u8(*!u8) exclusive = fn(value) { *value };\n        u8(u8) by_value = fn(value) { value };";
+    let native = ScalarTargetLayout::NATIVE64;
+    let raw = project(vec![
+        raw_module("reader.w", &format!("%%start\n{reader}\n{other}\n%%end"), native),
+        raw_module("other.w", &format!("%%start\n{non_reader}\n%%end"), native),
+    ]);
+    let (typed, occurrences) = typecheck_scalar_project_with_occurrences(raw);
+    assert!(typed.diagnostics.is_empty(), "{:?}", typed.diagnostics);
+    let modules = &typed.project.modules;
+    let calls = resolve_project_call_sites_with_occurrences(modules, occurrences);
+    let reader_call_sites = calls.module(0);
+    let other_call_sites = calls.module(1);
+    let find_sample = |module: &ScalarModule| {
+        module.items.iter().find_map(|item| match item {
+            ScalarItem::Function(function) if function.name == "sample" => Some(function.name_span),
+            _ => None,
+        }).unwrap()
+    };
+    let reader_span = find_sample(&modules[0]);
+    assert_eq!(reader_span, find_sample(&modules[1]));
+    assert_eq!(
+        reader_call_sites.shared_scalar_read_effects,
+        HashMap::from([(reader_span, SharedScalarReadEffect { parameter: 0 })]),
+    );
+    assert!(other_call_sites.shared_scalar_read_effects.is_empty());
 }
