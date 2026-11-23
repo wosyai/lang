@@ -930,10 +930,42 @@ if (left_result != 58 || right_result != 68) { core.system_panic(); };
             let suffix = format!("__{}", name.iter().map(|byte| format!("{byte:02x}")).collect::<String>());
             module.get_functions().find(|function| function.get_name().to_str().unwrap().ends_with(&suffix)).unwrap()
         };
-        let producer = get_function(b"choose").print_to_string().to_string();
+        use inkwell::values::{BasicValue, CallSiteValue, InstructionOpcode, PhiValue};
+        let producer_fn = get_function(b"choose");
+        let producer = producer_fn.print_to_string().to_string();
         let receiver = get_function(b"receive").print_to_string().to_string();
-        assert!(producer.contains("phi { i32, ptr }"), "{producer}");
-        assert_eq!(producer.matches("call ptr @__wosy_core_alloc").count(), 2, "{producer}");
+        let destination = producer_fn.get_last_param().expect("closed caller destination");
+        let instructions = producer_fn.get_basic_blocks().into_iter().flat_map(|block| block.get_instructions());
+        let phis = instructions.filter_map(|instruction| PhiValue::try_from(instruction).ok()).collect::<Vec<_>>();
+        let [pair] = phis.as_slice() else { panic!("{producer}") };
+        assert_eq!(pair.count_incoming(), 2, "{producer}");
+        let mut allocations = Vec::with_capacity(2);
+        let mut incoming_blocks = Vec::with_capacity(2);
+        for (incoming, block) in pair.get_incomings() {
+            let committed = incoming.as_instruction_value().expect("arm receipt construction");
+            assert_eq!(committed.get_opcode(), InstructionOpcode::InsertValue);
+            assert_eq!(committed.get_parent(), Some(block));
+            let ordered = committed.get_operand(0).unwrap().value().unwrap();
+            let allocation = committed.get_operand(1).unwrap().value().unwrap().as_instruction_value().unwrap();
+            let allocator = CallSiteValue::try_from(allocation).unwrap().get_called_fn_value().unwrap();
+            assert_eq!(allocator.get_name().to_str().unwrap(), "__wosy_core_alloc");
+            allocations.push(allocation);
+            incoming_blocks.push(block);
+            let installs = block.get_instructions()
+                .filter(|inst| CallSiteValue::try_from(*inst).ok()
+                    .and_then(|call| call.get_called_fn_value())
+                    .is_some_and(|fun| fun.get_name().to_bytes().starts_with(b"llvm.memmove"))
+                    && inst.get_operand(0).and_then(|dest| dest.value()) == Some(destination))
+                .collect::<Vec<_>>();
+            let [install] = installs.as_slice() else { panic!("{producer}") };
+            assert!(block.get_instructions().take_while(|inst| *inst != committed).any(|inst| inst == *install));
+            let descriptor = install.get_operand(1).unwrap().value().unwrap().as_instruction_value().unwrap();
+            assert_eq!(descriptor.get_opcode(), InstructionOpcode::ExtractValue);
+            assert_eq!(descriptor.get_operand(0).unwrap().value(), Some(ordered));
+            assert!(descriptor.print_to_string().to_string().ends_with(", 1"));
+        }
+        assert_ne!(allocations[0], allocations[1]);
+        assert_ne!(incoming_blocks[0], incoming_blocks[1]);
         assert!(!producer.contains("call void @__wosy_core_free"), "{producer}");
         assert_eq!(receiver.matches("call void @__wosy_core_free").count(), 1, "{receiver}");
         assert!(receiver.contains("extractvalue { i32, ptr } %aggregate_original_base, 1"), "{receiver}");
