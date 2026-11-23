@@ -307,7 +307,7 @@ impl<'a> SymbolicLiteralFailure<'a> {
         if let Some(axis) = axis {
             state[axis] = Rc::new(IntegerSet::singleton(returned.as_ref()));
         }
-        Self { output: slot.span, returned: returned.into_owned(), state: IntegerInputs(vec![state]),
+        Self { output: slot.span, returned: returned.into_owned(), state: IntegerInputs::from_cells(vec![state]),
             axes: roots.axes[..roots.parameters].to_vec() }
     }
 }
@@ -971,12 +971,76 @@ thread_local! {
     pub(super) static AUTHORED_RETURN_CALCULATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-type IntegerRow = Vec<Rc<IntegerSet>>;
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct IntegerRow {
+    cells: Vec<Rc<IntegerSet>>,
+    equal_axes: Option<Rc<Vec<(usize, usize)>>>,
+}
+
+impl IntegerRow {
+    fn new(cells: Vec<Rc<IntegerSet>>) -> Self { Self { cells, equal_axes: None } }
+
+    fn equal_axes(&self) -> &[(usize, usize)] {
+        self.equal_axes.as_deref().map_or(&[], Vec::as_slice)
+    }
+
+    fn canonical_axis(&self, axis: usize) -> usize {
+        let equality = self.equal_axes();
+        equality.binary_search_by_key(&axis, |(alias, _)| *alias).ok()
+            .map_or(axis, |index| equality[index].1)
+    }
+
+    fn append_alias(&mut self, from: usize, domain: Rc<IntegerSet>) {
+        let canonical = self.canonical_axis(from);
+        let next = self.cells.len();
+        Rc::make_mut(self.equal_axes.get_or_insert_with(|| Rc::new(Vec::new()))).push((next, canonical));
+        self.cells.push(domain);
+    }
+
+    fn replace_domain(&mut self, index: usize, set: Rc<IntegerSet>) {
+        let canonical = self.canonical_axis(index);
+        if let Some(equality) = &self.equal_axes {
+            for &(alias, root) in equality.iter() {
+                if root == canonical {
+                    self.cells[alias] = Rc::clone(&set);
+                }
+            }
+        }
+        self.cells[canonical] = set;
+    }
+
+    fn truncate(&mut self, depth: usize) {
+        self.cells.truncate(depth);
+        if let Some(equality) = &mut self.equal_axes {
+            let keep = equality.partition_point(|(alias, _)| *alias < depth);
+            if keep == 0 {
+                self.equal_axes = None;
+            } else if keep != equality.len() {
+                Rc::make_mut(equality).truncate(keep);
+            }
+        }
+    }
+}
+
+impl std::ops::Deref for IntegerRow {
+    type Target = Vec<Rc<IntegerSet>>;
+    fn deref(&self) -> &Self::Target { &self.cells }
+}
+
+impl std::ops::DerefMut for IntegerRow {
+    fn deref_mut(&mut self) -> &mut Self::Target { &mut self.cells }
+}
+
+impl FromIterator<Rc<IntegerSet>> for IntegerRow {
+    fn from_iter<T: IntoIterator<Item = Rc<IntegerSet>>>(iter: T) -> Self {
+        Self::new(iter.into_iter().collect())
+    }
+}
+
 #[derive(Default)]
 struct IntegerRoots<'a> {
     axes: Vec<(&'a ReferenceBindingId, &'a ScalarType)>,
     by_binding: HashMap<&'a ReferenceBindingId, usize>,
-    equal_axes: Vec<(usize, usize)>,
     parameters: usize,
     reached_obligation: bool,
     proof_reflexive_branches: bool,
@@ -994,50 +1058,43 @@ impl<'a> IntegerRoots<'a> {
         Some((index, self.axes[index].1))
     }
 
-    fn add_equal_axis(&mut self, binding: &'a ReferenceBindingId, ty: &'a ScalarType, from: usize) {
-        let canonical = canonical_axis(&self.equal_axes, from);
-        self.equal_axes.push((self.axes.len(), canonical));
-        self.add(binding, ty);
-    }
-
-    fn axis_has_alias(&self, axis: usize) -> bool {
-        let canonical = canonical_axis(&self.equal_axes, axis);
-        self.equal_axes.iter().any(|(_, root)| *root == canonical)
-    }
-
     fn truncate(&mut self, depth: usize) {
-        self.equal_axes.truncate(self.equal_axes.partition_point(|(alias, _)| *alias < depth));
         for (binding, _) in self.axes.drain(depth..) {
             self.by_binding.remove(binding);
         }
     }
 }
 
-fn canonical_axis(equality: &[(usize, usize)], axis: usize) -> usize {
-    equality.binary_search_by_key(&axis, |(alias, _)| *alias).ok()
-        .map_or(axis, |index| equality[index].1)
-}
-
-fn replace_equal_domains(row: &mut IntegerRow, equality: &[(usize, usize)], index: usize, set: Rc<IntegerSet>) {
-    if equality.is_empty() {
-        row[index] = set;
-        return;
-    }
-    let canonical = canonical_axis(equality, index);
-    for &(alias, root) in equality {
-        if root == canonical {
-            row[alias] = Rc::clone(&set);
-        }
-    }
-    row[canonical] = set;
-}
-
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(super) struct IntegerInputs(Vec<IntegerRow>);
 
 impl IntegerInputs {
+    #[cfg(any(test, feature = "internal-checker"))]
+    fn from_cells(rows: Vec<Vec<Rc<IntegerSet>>>) -> Self {
+        Self(rows.into_iter().map(IntegerRow::new).collect())
+    }
+
+    fn axis_has_alias(&self, axis: usize) -> bool {
+        self.0.iter().any(|row| {
+            let canonical = row.canonical_axis(axis);
+            row.equal_axes().iter().any(|(_, root)| *root == canonical)
+        })
+    }
+
+    fn common_equal_axes(&self) -> Vec<(usize, usize)> {
+        let Some((first, rest)) = self.0.split_first() else { return Vec::new(); };
+        first.equal_axes().iter().copied().filter(|&(axis, canonical)|
+            rest.iter().all(|row| row.canonical_axis(axis) == row.canonical_axis(canonical))
+        ).collect()
+    }
+
+    #[cfg(feature = "internal-checker")]
+    pub(super) fn row_equal_axes(&self, row: usize) -> Option<&[(usize, usize)]> {
+        Some(self.0.get(row)?.equal_axes())
+    }
+
     pub(super) fn closed() -> Self {
-        Self(vec![Vec::new()])
+        Self(vec![IntegerRow::default()])
     }
 
     #[cfg(feature = "internal-checker")]
@@ -1077,18 +1134,18 @@ impl IntegerInputs {
         })
     }
 
-    fn restrict_axis(&mut self, axis: usize, survivors: &IntegerSet, equality: &[(usize, usize)]) {
+    fn restrict_axis(&mut self, axis: usize, survivors: &IntegerSet) {
         self.0.retain_mut(|row| match row[axis].intersection(survivors) {
             IntegerIntersection::Unchanged => true,
             IntegerIntersection::Empty => false,
             IntegerIntersection::Changed(retained) => {
-                replace_equal_domains(row, equality, axis, Rc::new(retained));
+                row.replace_domain(axis, Rc::new(retained));
                 true
             }
         });
     }
 
-    fn disjunction_failure_witness(&self, axis: usize, cuts: &IntegerCutUnion<'_>, equality: &[(usize, usize)]) -> Self {
+    fn disjunction_failure_witness(&self, axis: usize, cuts: &IntegerCutUnion<'_>) -> Self {
         if let Some(passes) = cuts.uniform() {
             return if passes { Self::default() } else { Self(self.0.clone()) };
         }
@@ -1099,7 +1156,7 @@ impl IntegerInputs {
                 IntegerIntersection::Unchanged => witness.0.push(row.clone()),
                 IntegerIntersection::Changed(intersection) => {
                     let mut row = row.clone();
-                    replace_equal_domains(&mut row, equality, axis, Rc::new(intersection));
+                    row.replace_domain(axis, Rc::new(intersection));
                     witness.0.push(row);
                 }
             }
@@ -1107,7 +1164,7 @@ impl IntegerInputs {
         witness
     }
 
-    fn narrow_disjunction_or_witness(&mut self, axis: usize, cuts: &IntegerCutUnion<'_>, equality: &[(usize, usize)]) -> Self {
+    fn narrow_disjunction_or_witness(&mut self, axis: usize, cuts: &IntegerCutUnion<'_>) -> Self {
         if let Some(passes) = cuts.uniform() {
             return if passes { Self::default() } else { std::mem::take(self) };
         }
@@ -1125,7 +1182,7 @@ impl IntegerInputs {
             }
             IntegerIntersection::Changed(intersection) => {
                 surviving = true;
-                replace_equal_domains(row, equality, axis, Rc::new(intersection));
+                row.replace_domain(axis, Rc::new(intersection));
                 true
             }
         });
@@ -1154,16 +1211,16 @@ impl IntegerInputs {
         if ty != &predicate.ty {
             return None;
         }
-        let (passing, failing) = self.split_equal_axis(index, &predicate.operator, &predicate.bound, &roots.equal_axes)?;
+        let (passing, failing) = self.split_equal_axis(index, &predicate.operator, &predicate.bound)?;
         Some((passing, failing, Some(index)))
     }
 
     #[cfg(feature = "internal-checker")]
     fn split_axis(self, index: usize, operator: &BinaryOperator, bound: &BigInt) -> Option<(Self, Self)> {
-        self.split_equal_axis(index, operator, bound, &[])
+        self.split_equal_axis(index, operator, bound)
     }
 
-    fn split_equal_axis(self, index: usize, operator: &BinaryOperator, bound: &BigInt, equality: &[(usize, usize)]) -> Option<(Self, Self)> {
+    fn split_equal_axis(self, index: usize, operator: &BinaryOperator, bound: &BigInt) -> Option<(Self, Self)> {
         let mut passing = Self::default();
         let mut failing = Self::default();
         for mut row in self.0 {
@@ -1174,8 +1231,8 @@ impl IntegerInputs {
                 passing.0.push(row);
             } else {
                 let mut alternate = row.clone();
-                replace_equal_domains(&mut row, equality, index, Rc::new(yes));
-                replace_equal_domains(&mut alternate, equality, index, Rc::new(no));
+                row.replace_domain(index, Rc::new(yes));
+                alternate.replace_domain(index, Rc::new(no));
                 passing.0.push(row);
                 failing.0.push(alternate);
             }
@@ -1200,8 +1257,8 @@ impl IntegerInputs {
                 IntegerSetPartition::Mixed(yes, no) => {
                     let (retained, moved) = if *retained_side.get_or_insert(true) { (yes, no) } else { (no, yes) };
                     let mut alternate = row.clone();
-                    row[index] = Rc::new(retained);
-                    alternate[index] = Rc::new(moved);
+                    row.replace_domain(index, Rc::new(retained));
+                    alternate.replace_domain(index, Rc::new(moved));
                     other.0.push(alternate);
                     return true;
                 }
@@ -1235,7 +1292,7 @@ impl IntegerInputs {
             if !rejected.is_empty() {
                 let mut row = row.clone();
                 if rejected != **axis {
-                    replace_equal_domains(&mut row, &roots.equal_axes, index, Rc::new(rejected));
+                    row.replace_domain(index, Rc::new(rejected));
                 }
                 failing.0.push(row);
             }
@@ -1245,36 +1302,33 @@ impl IntegerInputs {
 
     #[cfg(feature = "internal-checker")]
     fn join(self, other: Self, axis: Option<usize>) -> Self {
-        self.join_equal(other, axis, &[])
+        self.join_equal(other, axis)
     }
 
-    fn join_equal(mut self, mut other: Self, axis: Option<usize>, equality: &[(usize, usize)]) -> Self {
+    fn join_equal(mut self, mut other: Self, axis: Option<usize>) -> Self {
         if self.is_unreachable() {
             return other;
         }
         if other.is_unreachable() {
             return self;
         }
-        let axis = canonical_axis(equality, axis.expect("both nonempty paths require a partition axis"));
+        let axis = axis.expect("both nonempty paths require a partition axis");
         if self.0.len() == 1 && other.0.len() == 1 {
             let left = &mut self.0[0];
             let right = &other.0[0];
-            if left.iter().zip(right).enumerate().all(|(index, (a, b))| {
-                canonical_axis(equality, index) == axis || Rc::ptr_eq(a, b)
+            let canonical = left.canonical_axis(axis);
+            if left.equal_axes() == right.equal_axes() && left.iter().zip(right.iter()).enumerate().all(|(index, (a, b))| {
+                left.canonical_axis(index) == canonical || Rc::ptr_eq(a, b)
             }) {
                 let right = other.0.pop().unwrap();
-                merge_axis(left, right, axis);
-                if !equality.is_empty() {
-                    let domain = Rc::clone(&left[axis]);
-                    replace_equal_domains(left, equality, axis, domain);
-                }
+                merge_axis(left, right, canonical);
             } else {
                 self.0.append(&mut other.0);
             }
             return self;
         }
 
-        Self::compact_axis(self.0.into_iter().chain(other.0), axis, equality)
+        Self::compact_axis(self.0.into_iter().chain(other.0), axis)
     }
 
     fn overwrite(mut self, axis: usize, value: Rc<IntegerSet>) -> Self {
@@ -1284,7 +1338,7 @@ impl IntegerInputs {
         if self.0.len() < 2 {
             return self;
         }
-        Self::compact_axis(self.0, axis, &[])
+        Self::compact_axis(self.0, axis)
     }
 
     fn append_local(&mut self, values: IntegerSet) {
@@ -1303,24 +1357,21 @@ impl IntegerInputs {
         }
     }
 
-    fn compact_axis(rows: impl IntoIterator<Item = IntegerRow>, axis: usize, equality: &[(usize, usize)]) -> Self {
+    fn compact_axis(rows: impl IntoIterator<Item = IntegerRow>, axis: usize) -> Self {
         let mut joined = Self::default();
         let mut representatives = HashMap::new();
         for row in rows {
-            let key: Vec<_> = if equality.is_empty() {
+            let canonical = row.canonical_axis(axis);
+            let values: Vec<_> = if row.equal_axes.is_none() {
                 row[..axis].iter().chain(&row[axis + 1..]).map(Rc::as_ptr).collect()
             } else {
                 row.iter().enumerate().filter_map(|(index, domain)|
-                    (canonical_axis(equality, index) != axis).then(|| Rc::as_ptr(domain))).collect()
+                    (row.canonical_axis(index) != canonical).then(|| Rc::as_ptr(domain))).collect()
             };
-            match representatives.entry(key) {
+            match representatives.entry((row.equal_axes.clone(), values)) {
                 std::collections::hash_map::Entry::Occupied(entry) => {
                     let target = &mut joined.0[*entry.get()];
-                    merge_axis(target, row, axis);
-                    if !equality.is_empty() {
-                        let domain = Rc::clone(&target[axis]);
-                        replace_equal_domains(target, equality, axis, domain);
-                    }
+                    merge_axis(target, row, canonical);
                 }
                 std::collections::hash_map::Entry::Vacant(entry) => {
                     entry.insert(joined.0.len());
@@ -1363,6 +1414,7 @@ impl IntegerInputs {
     fn includes_coordinates<T: Copy + Into<BigInt>>(&self, coordinates: &[T]) -> bool {
         self.0.iter().any(|row| {
             row.len() == coordinates.len()
+                && row.equal_axes().iter().all(|&(alias, root)| Into::<BigInt>::into(coordinates[alias]) == Into::<BigInt>::into(coordinates[root]))
                 && row.iter().zip(coordinates).all(|(axis, value)| {
                     axis.split(&BinaryOperator::Equal, &(*value).into())
                         .is_some_and(|(matching, _)| !matching.is_empty())
@@ -1375,10 +1427,14 @@ fn merge_axis(representative: &mut IntegerRow, row: IntegerRow, axis: usize) {
     if Rc::ptr_eq(&representative[axis], &row[axis]) {
         return;
     }
-    let replacement = row.into_iter().nth(axis).expect("canonical integer axis");
+    let replacement = row.cells.into_iter().nth(axis).expect("canonical integer axis");
     let previous = std::mem::replace(&mut representative[axis], replacement);
     let target = Rc::make_mut(&mut representative[axis]);
     *target = Rc::unwrap_or_clone(previous).join(std::mem::take(target));
+    if representative.equal_axes.is_some() {
+        let domain = Rc::clone(&representative[axis]);
+        representative.replace_domain(axis, domain);
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1405,7 +1461,6 @@ pub(super) struct ImmutableEntryRange<'a> {
 
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct IntegerReturningPath<'a> {
-    aliases_formal: bool,
     span: super::ByteSpan,
     pub(super) value: IntegerReturn<'a>,
     pub(super) ty: &'a ScalarType,
@@ -2306,7 +2361,7 @@ fn collect_integer_requirement_failures_in_scope<'a, Scoped: ScopedAuthoredRetur
                 (1, Some(fixed)) => vec![Rc::new(IntegerSet::singleton(fixed)), values],
                 _ => return None,
             };
-            (None, None, Some((slot, row)))
+            (None, None, Some((slot, IntegerRow::new(row))))
         }
     };
     let mut collected = IntegerFailureCollection {
@@ -2422,7 +2477,7 @@ pub(super) fn verify_partitioned_call_return<'a>(
         };
         if let Some((violating_inputs, value)) = failure {
             return Some(PartitionedCallProof { applicable: true, covers_guard: false, failure: Some(SymbolicLiteralFailure {
-                output: piece.span, returned: value.clone(), state: IntegerInputs(vec![vec![violating_inputs]]),
+                output: piece.span, returned: value.clone(), state: IntegerInputs::from_cells(vec![vec![violating_inputs]]),
                 axes: vec![(binding, &parameter.ty)],
             }) });
         }
@@ -3195,9 +3250,9 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                     path = alternate_path;
                     continue;
                 }
-                path = path.join_equal(alternate_path, frame.axis, &roots.equal_axes);
+                path = path.join_equal(alternate_path, frame.axis);
             } else if let Some(first) = frame.first {
-                path = first.join_equal(path, frame.axis, &roots.equal_axes);
+                path = first.join_equal(path, frame.axis);
             }
             block = frame.block;
             next = frame.next;
@@ -3219,12 +3274,12 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                         let (minimum, maximum) = super::typecheck::integer_bounds(ty)?;
                         let cuts = directive_disjunction_cuts(atoms, (&minimum, &maximum))?;
                         let failing = match directive.operation {
-                            CheckerOperation::Require => path.disjunction_failure_witness(axis, &cuts, &roots.equal_axes),
-                            CheckerOperation::Narrow => path.narrow_disjunction_or_witness(axis, &cuts, &roots.equal_axes),
+                            CheckerOperation::Require => path.disjunction_failure_witness(axis, &cuts),
+                            CheckerOperation::Narrow => path.narrow_disjunction_or_witness(axis, &cuts),
                         };
                         if !failing.is_unreachable() {
                             (failures.as_deref_mut()?.sink)(IntegerCheckFailure {
-                                directive: expression, state: failing, axes: roots.axes.clone(), equal_axes: roots.equal_axes.clone(),
+                                directive: expression, equal_axes: failing.common_equal_axes(), state: failing, axes: roots.axes.clone(),
                             });
                         }
                         continue;
@@ -3233,7 +3288,7 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                         let failing = path.failing_witness(roots, predicate)?;
                         if !failing.is_unreachable() {
                             (failures.as_deref_mut()?.sink)(IntegerCheckFailure {
-                                directive: expression, state: failing, axes: roots.axes.clone(), equal_axes: roots.equal_axes.clone(),
+                                directive: expression, equal_axes: failing.common_equal_axes(), state: failing, axes: roots.axes.clone(),
                             });
                         }
                         continue;
@@ -3241,7 +3296,7 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                     let (passing, failing, _) = path.split(roots, predicate)?;
                     if directive.operation.rejects(!passing.is_unreachable(), !failing.is_unreachable()) {
                         let failure = IntegerCheckFailure {
-                            directive: expression, state: failing, axes: roots.axes.clone(), equal_axes: roots.equal_axes.clone(),
+                            directive: expression, equal_axes: failing.common_equal_axes(), state: failing, axes: roots.axes.clone(),
                         };
                         if COLLECT {
                             (failures.as_deref_mut()?.sink)(failure);
@@ -3271,7 +3326,7 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                         ActualCallResult::Unit => {}
                         ActualCallResult::EmptyUnit if COLLECT => path = IntegerInputs::default(),
                         ActualCallResult::ProjectedUnit(survivors) if COLLECT => {
-                            path.restrict_axis(projected?, &survivors, &roots.equal_axes);
+                            path.restrict_axis(projected?, &survivors);
                         }
                         _ => return None,
                     }
@@ -3400,11 +3455,8 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                         if let Some(work) = return_capture_work.as_deref_mut() {
                             charge_partition_capture(work, &path, roots.axes.len())?;
                         }
-                        let aliases_formal = roots.parameters == 1 && matches!(value,
-                            IntegerReturn::Alias(binding) if roots.lookup(binding).is_some_and(|(axis, _)|
-                                canonical_axis(&roots.equal_axes, axis) == 0));
                         returns.push(IntegerReturningPath {
-                            aliases_formal, span: slot.span,
+                            span: slot.span,
                             value,
                             ty,
                             state: path,
@@ -3423,7 +3475,7 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                 let allow_contextual_local_transfers = || COLLECT && !USE_IMPORTED_BOUND
                     && failures.as_deref().is_some_and(|failure| failure.allow_contextual_local_transfers);
                 let (axis, value) = integer_assignment(calls, roots, group, &path, allow_contextual_local_transfers)?;
-                if roots.axis_has_alias(axis) {
+                if path.axis_has_alias(axis) {
                     return None;
                 }
                 path = path.overwrite(axis, value);
@@ -3621,8 +3673,8 @@ pub(super) enum ExactCallProgress<'a> {
 fn charge_partition_capture(retained: &mut usize, path: &IntegerInputs, axes: usize) -> Option<()> {
     let mut work = retained.checked_add(axes)?.checked_add(1)?;
     for row in &path.0 {
-        work = work.checked_add(1)?.checked_add(row.len())?;
-        for domain in row {
+        work = work.checked_add(1)?.checked_add(row.len())?.checked_add(row.equal_axes().len())?;
+        for domain in row.iter() {
             work = work.checked_add(domain.interval_count())?;
             if work > MAX_PARTITION_TRANSFER_WORK {
                 return None;
@@ -3639,8 +3691,8 @@ fn charge_partition_capture(retained: &mut usize, path: &IntegerInputs, axes: us
 #[test]
 fn symbolic_return_capture_charges_retained_rows_before_committing() {
     let row = vec![Rc::new(IntegerSet::singleton(&BigInt::from(1))); 16];
-    let small = IntegerInputs(vec![row.clone(); 16]);
-    let large = IntegerInputs(vec![row.clone(); 128]);
+    let small = IntegerInputs::from_cells(vec![row.clone(); 16]);
+    let large = IntegerInputs::from_cells(vec![row.clone(); 128]);
     let mut retained = 0;
     assert_eq!(charge_partition_capture(&mut retained, &small, row.len()), Some(()));
     let first = retained;
@@ -3672,7 +3724,7 @@ impl<'a> ExactCallCursor<'a> {
     }
 
     pub(super) fn projected(calls: &'a FunctionCallSites, values: Rc<IntegerSet>, expected: &ScalarType) -> Option<Self> {
-        Self::with_row(calls, expected, vec![values], true)
+        Self::with_row(calls, expected, IntegerRow::new(vec![values]), true)
     }
 
     fn with_row(calls: &'a FunctionCallSites, expected: &ScalarType, row: IntegerRow, projected: bool) -> Option<Self> {
@@ -3712,15 +3764,13 @@ impl<'a> ExactCallCursor<'a> {
                 self.block.path.append_local(IntegerSet::singleton(&value));
             }
             (ExactCallEffect::Unit(_), ActualCallResult::ProjectedUnit(survivors)) => {
-                self.block.path.restrict_axis(caller_axis?, &survivors, &self.roots.equal_axes);
+                self.block.path.restrict_axis(caller_axis?, &survivors);
             }
             (ExactCallEffect::Integer { binding, ty, .. }, ActualCallResult::PartitionedInteger(pieces)) => {
                 let axis = caller_axis?;
-                let aliases = matches!(&pieces.first()?.output, IntegerPartitionOutput::InputAlias);
-                if pieces.iter().any(|piece| matches!(&piece.output, IntegerPartitionOutput::InputAlias) != aliases) {
-                    return None;
-                }
-                if aliases && self.roots.axes.get(axis)?.1 != ty {
+                if pieces.iter().any(|piece| matches!(&piece.output, IntegerPartitionOutput::InputAlias))
+                    && self.roots.axes.get(axis)?.1 != ty
+                {
                     return None;
                 }
                 let rows = &self.block.path.0;
@@ -3730,7 +3780,9 @@ impl<'a> ExactCallCursor<'a> {
                 let row_copies = rows.len().checked_mul(pieces.len())?.checked_mul(cells)?;
                 let comparisons = row_intervals.checked_mul(pieces.len())?
                     .checked_add(piece_intervals.checked_mul(rows.len())?)?;
-                if row_copies.checked_add(comparisons)? > MAX_PARTITION_TRANSFER_WORK {
+                let alias_work = rows.iter().try_fold(0usize, |sum, row| sum.checked_add(row.equal_axes().len()))?
+                    .checked_mul(pieces.len())?;
+                if row_copies.checked_add(comparisons)?.checked_add(alias_work)? > MAX_PARTITION_TRANSFER_WORK {
                     return None;
                 }
                 let original = std::mem::take(&mut self.block.path.0);
@@ -3743,17 +3795,15 @@ impl<'a> ExactCallCursor<'a> {
                             IntegerIntersection::Changed(values) => Rc::new(values),
                         };
                         let mut next = row.clone();
-                        let output = match &piece.output {
-                            IntegerPartitionOutput::Singleton(output) => Rc::clone(output),
-                            IntegerPartitionOutput::InputAlias => Rc::clone(&overlap),
-                        };
-                        replace_equal_domains(&mut next, &self.roots.equal_axes, axis, overlap);
-                        next.push(output);
+                        next.replace_domain(axis, Rc::clone(&overlap));
+                        match &piece.output {
+                            IntegerPartitionOutput::Singleton(output) => next.push(Rc::clone(output)),
+                            IntegerPartitionOutput::InputAlias => next.append_alias(axis, overlap),
+                        }
                         joined.push(next);
                     }
                 }
-                if aliases { self.roots.add_equal_axis(binding, ty, axis); }
-                else { self.roots.add(binding, ty); }
+                self.roots.add(binding, ty);
                 self.block.path = IntegerInputs(joined);
             }
             _ => return None,
@@ -3793,8 +3843,6 @@ impl<'a> ExactCallCursor<'a> {
                     return None;
                 }
                 let mut pieces = Vec::with_capacity(piece_count);
-                let preserve_alias = self.returned.iter().all(|path| path.aliases_formal)
-                    && self.returned.iter().any(|path| path.state.0.iter().any(|row| row[0].singleton_value().is_none()));
                 for path in &self.returned {
                     let alias = match path.value {
                         IntegerReturn::Const(_) => None,
@@ -3806,7 +3854,7 @@ impl<'a> ExactCallCursor<'a> {
                     };
                     for row in &path.state.0 {
                         let input = Rc::clone(row.first()?);
-                        let output = if preserve_alias {
+                        let output = if alias.is_some_and(|axis| row.canonical_axis(axis) == 0) && input.singleton_value().is_none() {
                             IntegerPartitionOutput::InputAlias
                         } else if let Some(axis) = alias {
                             row[axis].singleton_value()?;
@@ -3961,21 +4009,21 @@ fn directive_disjunction_filter_keeps_original_witness_without_building_the_othe
     let none = IntegerCutUnion::new((less, &zero), (greater, &nine), (&zero, &nine));
     let excluding_one = IntegerCutUnion::new((less, &zero), (greater, &one), (&zero, &nine));
     let axis = Rc::new(IntegerSet::singleton(&one));
-    let mut active = IntegerInputs(vec![vec![axis.clone()]]);
+    let mut active = IntegerInputs::from_cells(vec![vec![axis.clone()]]);
     let storage = active.0.as_ptr();
-    assert!(active.disjunction_failure_witness(0, &all, &[]).is_unreachable());
-    assert!(active.narrow_disjunction_or_witness(0, &all, &[]).is_unreachable());
+    assert!(active.disjunction_failure_witness(0, &all).is_unreachable());
+    assert!(active.narrow_disjunction_or_witness(0, &all).is_unreachable());
     assert_eq!(active.0.as_ptr(), storage);
-    let witness = active.disjunction_failure_witness(0, &none, &[]);
+    let witness = active.disjunction_failure_witness(0, &none);
     assert!(Rc::ptr_eq(&witness.0[0][0], &axis));
     assert_eq!(active.0.as_ptr(), storage);
-    let witness = active.narrow_disjunction_or_witness(0, &excluding_one, &[]);
+    let witness = active.narrow_disjunction_or_witness(0, &excluding_one);
     assert!(active.is_unreachable());
     assert_eq!(witness.0.as_ptr(), storage);
     assert!(Rc::ptr_eq(&witness.0[0][0], &axis));
-    let mut active = IntegerInputs(vec![vec![axis.clone()]]);
+    let mut active = IntegerInputs::from_cells(vec![vec![axis.clone()]]);
     let storage = active.0.as_ptr();
-    let witness = active.narrow_disjunction_or_witness(0, &none, &[]);
+    let witness = active.narrow_disjunction_or_witness(0, &none);
     assert!(active.is_unreachable());
     assert_eq!(witness.0.as_ptr(), storage);
     assert!(Rc::ptr_eq(&witness.0[0][0], &axis));
@@ -3994,19 +4042,19 @@ fn ordered_root_partition_reuses_original_one_sided_rows_and_axes() {
     let middle = at(&two);
     let other_middle = at(&three);
     let untouched = at(&nine);
-    let passing = IntegerInputs(vec![vec![outer.clone(), untouched.clone()], vec![other_outer.clone(), untouched.clone()]]);
+    let passing = IntegerInputs::from_cells(vec![vec![outer.clone(), untouched.clone()], vec![other_outer.clone(), untouched.clone()]]);
     let before = passing.0.as_ptr();
     let (passing, failing) = passing.split_partition(0, &accepted);
     assert!(failing.is_unreachable());
     assert_eq!(passing.0.as_ptr(), before);
     assert!(Rc::ptr_eq(&passing.0[0][0], &outer) && Rc::ptr_eq(&passing.0[1][0], &other_outer));
-    let failing = IntegerInputs(vec![vec![middle.clone(), untouched.clone()], vec![other_middle, untouched.clone()]]);
+    let failing = IntegerInputs::from_cells(vec![vec![middle.clone(), untouched.clone()], vec![other_middle, untouched.clone()]]);
     let before = failing.0.as_ptr();
     let (passing, failing) = failing.split_partition(0, &accepted);
     assert!(passing.is_unreachable());
     assert_eq!(failing.0.as_ptr(), before);
     assert!(Rc::ptr_eq(&failing.0[0][0], &middle) && Rc::ptr_eq(&failing.0[1][1], &untouched));
-    let mixed = IntegerInputs(vec![vec![outer.clone(), untouched.clone()], vec![middle.clone(), untouched.clone()]]);
+    let mixed = IntegerInputs::from_cells(vec![vec![outer.clone(), untouched.clone()], vec![middle.clone(), untouched.clone()]]);
     let before = mixed.0.as_ptr();
     let (passing, failing) = mixed.split_partition(0, &accepted);
     assert_eq!(passing.0.as_ptr(), before);
@@ -4020,11 +4068,11 @@ fn actual_call_projection_accepts_only_the_same_singleton_in_every_row() {
     let one = BigInt::from(1);
     let two = BigInt::from(2);
     let coordinate = |value| Rc::new(IntegerSet::singleton(value));
-    let same = IntegerInputs(vec![vec![coordinate(&one)], vec![coordinate(&one)]]);
+    let same = IntegerInputs::from_cells(vec![vec![coordinate(&one)], vec![coordinate(&one)]]);
     assert_eq!(same.singleton_at(0), Some(&one));
-    let distinct = IntegerInputs(vec![vec![coordinate(&one)], vec![coordinate(&two)]]);
+    let distinct = IntegerInputs::from_cells(vec![vec![coordinate(&one)], vec![coordinate(&two)]]);
     assert_eq!(distinct.singleton_at(0), None);
-    let broad = IntegerInputs(vec![vec![Rc::new(IntegerSet::from_type(&ScalarType::U8).unwrap())]]);
+    let broad = IntegerInputs::from_cells(vec![vec![Rc::new(IntegerSet::from_type(&ScalarType::U8).unwrap())]]);
     assert_eq!(broad.singleton_at(0), None);
     assert_eq!(IntegerInputs::default().singleton_at(0), None);
 }
@@ -4044,12 +4092,12 @@ fn projected_axis_restriction_reuses_unchanged_rc_and_preserves_correlated_rows(
     let dropped_other = Rc::new(range(70, 70));
     let survivors = Rc::new(range(1, 2).join(range(5, 5)).join(range(7, 8)));
     assert!(!Rc::ptr_eq(&untouched, &survivors));
-    let mut input = IntegerInputs(vec![
+    let mut input = IntegerInputs::from_cells(vec![
         vec![Rc::clone(&untouched), Rc::clone(&untouched_other)],
         vec![Rc::clone(&to_change), Rc::clone(&changed_other)],
         vec![Rc::clone(&to_drop), Rc::clone(&dropped_other)],
     ]);
-    input.restrict_axis(0, &survivors, &[]);
+    input.restrict_axis(0, &survivors);
     let [first, second] = input.0.as_slice() else { panic!("expected two retained rows"); };
     assert!(Rc::ptr_eq(&first[0], &untouched));
     assert!(Rc::ptr_eq(&first[1], &untouched_other));
@@ -4103,11 +4151,10 @@ fn strict_peer_typed_tuple_requires_both_axes_in_one_unchanged_return_row() {
     let decoy = binding(3);
     let returned = BigInt::from(7);
     let path = IntegerReturningPath {
-        aliases_formal: false,
         span: super::ByteSpan::new(0, 0),
         value: IntegerReturn::Const(&returned),
         ty: &ScalarType::I16,
-        state: IntegerInputs(vec![
+        state: IntegerInputs::from_cells(vec![
             vec![Rc::new(IntegerSet::singleton(&BigInt::from(1))), Rc::new(IntegerSet::singleton(&BigInt::from(-8)))],
             vec![Rc::new(IntegerSet::singleton(&BigInt::from(2))), Rc::new(IntegerSet::singleton(&BigInt::from(-3)))],
         ]),
@@ -4137,10 +4184,9 @@ fn proof_show_output_union_is_lazy_and_exact_for_disconnected_aliases() {
     let literal = |value| IntegerSet::singleton(&BigInt::from(value));
     let values = literal(-1).join(literal(1));
     let alias = IntegerReturningPath {
-        aliases_formal: false,
         span: super::ByteSpan::new(0, 0),
         value: IntegerReturn::Alias(&binding), ty: &ScalarType::I16,
-        state: IntegerInputs(vec![vec![Rc::new(values)]]), axes: vec![&binding],
+        state: IntegerInputs::from_cells(vec![vec![Rc::new(values)]]), axes: vec![&binding],
     };
     let relation = |operator| IntegerRelation::from_operator(&operator).unwrap();
     let zero = BigInt::from(0);
@@ -4151,10 +4197,9 @@ fn proof_show_output_union_is_lazy_and_exact_for_disconnected_aliases() {
     assert!(allowed.is_none());
 
     let constant = IntegerReturningPath {
-        aliases_formal: false,
         span: super::ByteSpan::new(0, 0),
         value: IntegerReturn::Const(&minus_one), ty: &ScalarType::I16,
-        state: IntegerInputs(vec![Vec::new()]), axes: Vec::new(),
+        state: IntegerInputs(vec![IntegerRow::default()]), axes: Vec::new(),
     };
     assert_eq!(constant.shows_output_with_bound(relation(BinaryOperator::Less), &zero, Some(&show), None, &mut allowed), Some(true));
     assert!(allowed.is_none());

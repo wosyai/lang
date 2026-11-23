@@ -89,6 +89,10 @@ impl ScalarCheckerIntegerWitness {
         &self.equal_axes
     }
 
+    pub fn row_equal_axes(&self, row: usize) -> Option<&[(usize, usize)]> {
+        self.state.row_equal_axes(row)
+    }
+
     pub fn intervals_at(
         &self,
         row: usize,
@@ -8255,7 +8259,43 @@ mod tests {
         let changed = text.replace("if (input < 0)", "observed = 0; if (input < 0)");
         assert!(matches!(run("symbolic-identity-write", &changed), Err(ProjectCheck::Unsupported)));
         let mixed = text.replace("fn(value) { value }", "fn(value) { if (value < 0) { value } else { 1 } }");
-        assert!(matches!(run("symbolic-identity-mixed", &mixed), Err(ProjectCheck::Unsupported)));
+        assert!(run("symbolic-identity-mixed", &mixed).unwrap().directives.is_empty());
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordered_base_symbolic_call_mixed_returns_preserve_row_local_equality() {
+        let text = format!(r#"%%start
+            i8(i8) select = fn(n) {{ if (n < 0) {{ n }} else {{ -1 }} }};
+            i8(i8) wrap = fn(n) {{ i8 inner = select(n); inner }};
+            unit(i8) unused = fn(input) {{
+                i8 observed = wrap(input);
+                if (observed < -1) {{ core.require(input < -1, {OUTPUT}); }}
+                else {{ core.require(observed == -1, {OUTPUT}); }};
+                core.narrow(observed == -1, {OUTPUT});
+                if (input < 0) {{ core.require(input == -1, {OUTPUT}); }}
+                else {{ core.require(observed == -1, {OUTPUT}); }};
+                core.require(observed <= 0, {OUTPUT});
+            }};
+        %%end"#);
+        let run = |revision, text: &str| {
+            let app = source("src/main.w", revision);
+            let prepared = prepare_proof_target(&app, text).unwrap();
+            run_closed_without_named_proofs(&prepared, ScalarCheckerScope::CurrentPackage, 1)
+        };
+        let pass = run("symbolic-mixed-pass", &text).unwrap();
+        assert!(pass.active && pass.directives.is_empty());
+        let failed = run("symbolic-mixed-fail", &text.replace("observed <= 0", "observed > 0")).unwrap();
+        let [failed] = failed.directives.as_slice() else { panic!("only the final requirement fails"); };
+        assert!(failed.witness.equal_axes().is_empty());
+        assert_eq!(failed.witness.row_count(), 2);
+        let [minus_one, zero, max] = [-1, 0, 127].map(BigInt::from);
+        assert!((0..2).any(|row| failed.witness.row_equal_axes(row) == Some(&[(1, 0)])
+            && failed.witness.intervals_at(row, 0).unwrap().eq([(&minus_one, &minus_one)])));
+        assert!((0..2).any(|row| failed.witness.row_equal_axes(row) == Some(&[])
+            && failed.witness.intervals_at(row, 0).unwrap().eq([(&zero, &max)])));
+        let assigned = text.replace("if (observed < -1)", "observed = 0; if (observed < -1)");
+        assert!(matches!(run("symbolic-mixed-write", &assigned), Err(ProjectCheck::Unsupported)));
     }
 
     #[cfg(feature = "internal-checker")]
