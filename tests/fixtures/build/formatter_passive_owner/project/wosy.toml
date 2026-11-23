@@ -235,3 +235,33 @@ run_runner = "wasm"
 
 [targets.parameter-wasm.profiles.dev]
 main_artifact = "main"
+
+[targets.parameter-relay-native]
+root = "src/parameter_relay.w"
+
+[targets.parameter-relay-native.artifacts.main]
+artifact = "Main"
+
+[targets.parameter-relay-native.artifacts.main.profiles.dev]
+backend = "llvm"
+output = "native"
+builder = "native"
+run_runner = "native"
+
+[targets.parameter-relay-native.profiles.dev]
+main_artifact = "main"
+
+[targets.parameter-relay-wasm]
+root = "src/parameter_relay.w"
+
+[targets.parameter-relay-wasm.artifacts.main]
+artifact = "Main"
+
+[targets.parameter-relay-wasm.artifacts.main.profiles.dev]
+backend = "llvm"
+output = "wasm-wasip1"
+builder = "wasm"
+run_runner = "wasm"
+
+[targets.parameter-relay-wasm.profiles.dev]
+main_artifact = "main"

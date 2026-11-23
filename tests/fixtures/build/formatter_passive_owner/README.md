@@ -42,3 +42,8 @@ user function that reads through the descriptor and returns unit.
 The original backing must remain live through that read and be released
 once in the callee. This does not test forwarding into a multi-output
 consumer.
+
+A separate unit-to-unit relay control forwards the moved parameter once
+more before the same terminal read and release. The intermediate
+function must not release or allocate backing. This does not add
+coverage of a multi-output consumer.
