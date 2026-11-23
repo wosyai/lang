@@ -1051,23 +1051,29 @@ pub(super) struct GuardedScalarSite {
 }
 
 impl GuardedScalarSite {
-    pub(super) fn from_cfg(cfg: &ScalarReferenceCfg) -> Option<Self> {
-        let proof = cfg.guarded_scalar_allocation()?;
-        let point = cfg.points.get(proof.branch().0)?;
-        if !matches!(point.kind, crate::scalar::CfgPointKind::Branch { .. }) {
+    pub(super) fn all_from_cfg(cfg: &ScalarReferenceCfg) -> Option<Box<[Self]>> {
+        let proofs = cfg.guarded_scalar_allocations();
+        if proofs.is_empty() {
             return None;
         }
-        Some(Self {
-            declaration: proof.binding().declaration_span,
-            scope: proof.binding().block_span,
-            ty: proof.ty().clone(),
-            condition: proof.condition(),
-            present_on_then: proof.present_on_then(),
-        })
+        proofs.iter().map(|proof| {
+            let point = cfg.points.get(proof.branch().0)?;
+            if !matches!(point.kind, crate::scalar::CfgPointKind::Branch { .. }) {
+                return None;
+            }
+            Some(Self {
+                declaration: proof.binding().declaration_span,
+                scope: proof.binding().block_span,
+                ty: proof.ty().clone(),
+                condition: proof.condition(),
+                present_on_then: proof.present_on_then(),
+            })
+        }).collect()
     }
 }
 
 pub(super) struct GuardedScalarOwner<'ctx> {
+    site: usize,
     backing: PointerValue<'ctx>,
     present: inkwell::values::IntValue<'ctx>,
 }
@@ -1081,15 +1087,11 @@ pub(super) fn bind_guarded_scalar<'ctx>(
     let [receiver] = binding.receivers.as_slice() else {
         return Err("fallible scalar allocation requires a single receiver".into());
     };
-    let site = state.guarded_scalar.as_ref().ok_or_else(|| format!(
-        "fallible scalar allocation has no prepared ownership for {} at {:?}", receiver.name, receiver.name_span,
-    ))?;
-    if site.declaration != receiver.name_span {
-        return Err(format!(
-            "fallible scalar allocation prepared for {:?} does not match {} at {:?}",
-            site.declaration, receiver.name, receiver.name_span,
-        ));
-    }
+    let (index, site) = state.guarded_scalar.as_deref().unwrap_or_default().iter().enumerate()
+        .find(|(_, site)| site.declaration == receiver.name_span)
+        .ok_or_else(|| format!(
+            "fallible scalar allocation has no prepared ownership for {} at {:?}", receiver.name, receiver.name_span,
+        ))?;
     let value_width = match value {
         BasicValueEnum::IntValue(value) => value.get_type().get_bit_width(),
         _ => return Err("guarded scalar initializer is not an integer".into()),
@@ -1117,7 +1119,7 @@ pub(super) fn bind_guarded_scalar<'ctx>(
     state.builder.build_unconditional_branch(continuation).map_err(builder_error)?;
     state.builder.position_at_end(continuation);
     state.storage.insert(receiver.name.clone(), (backing, receiver.ty.clone()));
-    state.guarded_scalar_owner = Some(GuardedScalarOwner { backing, present });
+    state.guarded_scalar_owner = Some(GuardedScalarOwner { site: index, backing, present });
     Ok(())
 }
 
@@ -1125,11 +1127,12 @@ pub(super) fn guarded_scalar_condition<'ctx>(
     state: &EmitState<'ctx, '_>,
     expression: &ScalarExpression,
 ) -> Result<Option<EmitValue<'ctx>>, String> {
-    let Some(site) = &state.guarded_scalar else { return Ok(None) };
-    if state.body_call_nodes.and_then(|nodes| nodes.expression_ordinal(expression)) != Some(site.condition) {
-        return Ok(None);
-    }
+    let Some(sites) = &state.guarded_scalar else { return Ok(None) };
+    let condition = state.body_call_nodes.and_then(|nodes| nodes.expression_ordinal(expression));
+    let Some((index, site)) = sites.iter().enumerate().find(|(_, site)| condition == Some(site.condition))
+        else { return Ok(None) };
     let owner = state.guarded_scalar_owner.as_ref()
+        .filter(|owner| owner.site == index)
         .ok_or_else(|| "guarded scalar condition precedes its allocation".to_owned())?;
     let condition = if site.present_on_then {
         owner.present
@@ -1144,10 +1147,11 @@ pub(super) fn release_guarded_scalar<'ctx>(
     state: &mut EmitState<'ctx, '_>,
     scope: ByteSpan,
 ) -> Result<(), String> {
-    if !state.guarded_scalar.as_ref().is_some_and(|site| site.scope == scope) {
+    let Some(owner) = state.guarded_scalar_owner.as_ref() else { return Ok(()) };
+    if state.guarded_scalar.as_deref().and_then(|sites| sites.get(owner.site)).map(|site| site.scope) != Some(scope) {
         return Ok(());
     }
-    let Some(owner) = state.guarded_scalar_owner.take() else { return Ok(()) };
+    let owner = state.guarded_scalar_owner.take().expect("matched guarded ownership");
     let parent = state.builder.get_insert_block().and_then(|block| block.get_parent())
         .ok_or_else(|| "missing guarded scalar release function".to_owned())?;
     let release = state.module.get_function(CORE_FREE_SYMBOL)

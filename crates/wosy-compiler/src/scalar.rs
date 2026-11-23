@@ -635,7 +635,7 @@ pub struct ScalarReferenceCfg {
     #[serde(skip)]
     pub specialized_policies: Vec<SpecializedCopyPolicy>,
     #[serde(skip)]
-    guarded_scalar_allocation: Option<Box<reference::GuardedScalarAllocation>>,
+    guarded_scalar_allocation: Option<Box<[reference::GuardedScalarAllocation]>>,
     #[serde(skip)]
     pub(crate) primary_call_points: HashMap<reference::OccurrenceOrdinal, CfgPointId>,
 }
@@ -653,8 +653,13 @@ impl PartialEq for ScalarReferenceCfg {
 impl Eq for ScalarReferenceCfg {}
 
 impl ScalarReferenceCfg {
+    pub(crate) fn guarded_scalar_allocations(&self) -> &[reference::GuardedScalarAllocation] {
+        self.guarded_scalar_allocation.as_deref().unwrap_or_default()
+    }
+
+    #[cfg(test)]
     pub(crate) fn guarded_scalar_allocation(&self) -> Option<&reference::GuardedScalarAllocation> {
-        self.guarded_scalar_allocation.as_deref()
+        match self.guarded_scalar_allocations() { [site] => Some(site), _ => None }
     }
 
     #[cfg(test)]

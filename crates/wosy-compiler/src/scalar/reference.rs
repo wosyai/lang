@@ -1272,13 +1272,23 @@ impl<'a> ReferenceFlowBuilder<'a> {
         }
         let edges = ReferenceConditionalEdges { branch, terminals: [then_arm.end, else_arm.end], join };
         self.connect_reference_conditional(&edges, region);
+        if matches!(region, ConditionalRegion::Value { .. }) {
+            if let Some(bindings) = &self.proof_points.fallible_allocation_bindings {
+                let scopes = [self.cfg.points[then_arm.end.0].scope, self.cfg.points[else_arm.end.0].scope];
+                if scopes[0] != scopes[1] && bindings.len() == 2
+                    && scopes.iter().all(|scope| bindings.values().any(|(defined, _)| defined == scope))
+                {
+                    self.proof_points.guarded_sibling_scopes = Some(scopes);
+                }
+            }
+        }
         if let Some((binding, present_on_then)) = guarded {
             if let Some([then, otherwise]) = edges.entries(&self.cfg.points) {
                 self.proof_points.record_guarded_allocation(branch, binding, [*then, *otherwise], present_on_then);
                 let condition = match region {
                     ConditionalRegion::Value { condition, .. } | ConditionalRegion::Unit { condition, .. } => *condition,
                 };
-                self.proof_points.guarded_scalar_condition = Some((branch, condition));
+                self.proof_points.guarded_scalar_conditions.push((branch, condition));
             }
         }
         if let (Some((expression, writer_side, formal)), Some(condition), Some([then_entry, else_entry])) =
@@ -12379,6 +12389,42 @@ pub(super) fn record_function_reference_origins(
     errors
 }
 
+fn seal_guarded_scalar_allocations(
+    cfg: &ScalarReferenceCfg, points: &CallablePointFacts,
+) -> Option<Box<[GuardedScalarAllocation]>> {
+    let bindings = points.fallible_allocation_bindings.as_ref()?;
+    let edges = &points.guarded_allocation_edges;
+    let conditions = &points.guarded_scalar_conditions;
+    if edges.len() != bindings.len() || conditions.len() != bindings.len() {
+        return None;
+    }
+    match edges.as_slice() {
+        [_] => {}
+        [(_, left), (_, right)] => {
+            let scopes = points.guarded_sibling_scopes?;
+            let left = bindings.get(&left.binding)?.0;
+            let right = bindings.get(&right.binding)?.0;
+            if left == right || !scopes.contains(&left) || !scopes.contains(&right) {
+                return None;
+            }
+        }
+        _ => return None,
+    }
+    edges.iter().map(|(branch, edge)| {
+        let condition = conditions.iter().find_map(|(point, condition)| (*point == *branch).then_some(*condition))?;
+        let (scope, ty) = bindings.get(&edge.binding)?;
+        let point = cfg.points.get(branch.0)?;
+        let then = point.successors.first()?;
+        if point.scope != *scope || !matches!(point.kind, CfgPointKind::Branch { .. }) {
+            return None;
+        }
+        Some(GuardedScalarAllocation {
+            binding: edge.binding.clone(), ty: ty.clone(), condition: condition.0,
+            branch: *branch, present_on_then: *then == edge.present,
+        })
+    }).collect()
+}
+
 fn derive_function_reference_result(
     source: &SourceIdentity,
     function: &ScalarFunction,
@@ -12709,26 +12755,8 @@ fn build_function_reference_cfg(
             )).cloned());
         }
         if provisional.is_empty() {
-            if let (true, [(branch, edge)], Some((condition_branch, condition)), Some(bindings)) = (
-                errors.is_empty(),
-                builder.proof_points.guarded_allocation_edges.as_slice(),
-                builder.proof_points.guarded_scalar_condition,
-                &builder.proof_points.fallible_allocation_bindings,
-            ) {
-                if *branch == condition_branch && bindings.len() == 1 {
-                    if let (Some(then), Some((_, ty))) = (
-                        builder.cfg.points[branch.0].successors.first(),
-                        bindings.get(&edge.binding),
-                    ) {
-                        builder.cfg.guarded_scalar_allocation = Some(Box::new(GuardedScalarAllocation {
-                            binding: edge.binding.clone(),
-                            ty: ty.clone(),
-                            condition: condition.0,
-                            branch: *branch,
-                            present_on_then: *then == edge.present,
-                        }));
-                    }
-                }
+            if errors.is_empty() {
+                builder.cfg.guarded_scalar_allocation = seal_guarded_scalar_allocations(&builder.cfg, &builder.proof_points);
             }
             for &(end, _) in &builder.aggregate_facts.checked_producer_arms {
                 aggregate.checked_producer_backing.entry(end).or_insert(aggregate::CheckedProducerBacking::Unknown);
