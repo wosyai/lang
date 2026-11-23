@@ -4916,6 +4916,30 @@ fn projected_checked_constant_indices_preserve_disjoint_origins() {
 }
 
 #[test]
+fn projected_holder_drops_only_slots_whose_local_referent_leaves_scope() {
+    for (branch_owner, expired) in [("local; refs[0] = &local;", true), ("local; refs[0] = &outer;", false)] {
+        let text = format!(
+            "%%start\nunit(bool) update = fn(take) {{ u8 outer = 1; (*u8)[2] refs = [null, null]; refs[0] = &outer; refs[1] = &outer; if (take) {{ u8 local = 2; {branch_owner} }}; *u8 sibling = refs[1]; sibling; *u8 observed = refs[0]; observed; }};\n%%end"
+        );
+        let sibling = text.rfind("refs[1]").unwrap() as u32;
+        let observed = text.rfind("refs[0]").unwrap() as u32;
+        let (single, project) = both_reference_functions(&text);
+        for diagnostics in [&single.diagnostics, &project.diagnostics] {
+            if expired {
+                assert!(diagnostics.iter().any(|diagnostic| diagnostic.code == "B0003"
+                    && diagnostic.labels.first().is_some_and(|label| label.span.range.start == observed)),
+                    "{text}: {diagnostics:?}");
+                assert!(!diagnostics.iter().any(|diagnostic|
+                    diagnostic.labels.first().is_some_and(|label| label.span.range.start == sibling)),
+                    "{text}: {diagnostics:?}");
+            } else {
+                assert!(diagnostics.is_empty(), "{text}: {diagnostics:?}");
+            }
+        }
+    }
+}
+
+#[test]
 fn indexed_checked_holder_relays_one_unchanged_formal_selector() {
     let text = "%%start\nunit(u64, *u8, *u8, *u8) update = fn(index, first, second, third) { (*u8)[2] refs = [null, null]; refs[0] = first; refs[1] = second; refs[index] = third; *u8 selected = refs[index]; *u8 sibling = refs[1]; refs[0] = first; *u8 possible = refs[index]; selected; sibling; possible; };\n%%end";
     let (single, project) = both_reference_functions(text);

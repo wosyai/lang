@@ -4855,6 +4855,7 @@ impl ReferenceEdgeState {
         &mut self,
         point: &ReferenceFlowPoint,
         inventory: Option<&HashMap<CfgPointId, super::control::ScopeExitBindings>>,
+        facts: &[ReferenceOrigin],
     ) {
         let exiting = inventory.and_then(|exits| exits.get(&point.id));
         if inventory.is_some() && exiting.is_none() {
@@ -4867,7 +4868,7 @@ impl ReferenceEdgeState {
             self.released.remove(binding);
             self.invalidated.remove(binding);
             self.moved.retain(|(place, _)| &place.binding != binding);
-            self.projected.retain(|known| &known.place.binding != binding);
+            self.projected.retain(|known| known.survives_scope(facts, |owner| owner != binding));
             return;
         }
         let live = |binding: &ReferenceBindingId| match exiting {
@@ -4880,7 +4881,7 @@ impl ReferenceEdgeState {
         self.moved_checked_handles.retain(|binding, _| live(binding));
         self.released.retain(&live);
         self.invalidated.retain(&live);
-        self.projected.retain(|known| live(&known.place.binding));
+        self.projected.retain(|known| known.survives_scope(facts, &live));
     }
 }
 
@@ -5075,10 +5076,10 @@ fn prepared_scope_expiry_uses_exact_declared_and_introduced_bindings() {
         state.invalidated.insert(binding.clone());
         state.projected.push(ReferenceProjectedState { retains_loan: false, place, origins: BTreeSet::new(), uninitialized: true });
     }
-    state.expire_scope(&point(0, 2), Some(&inventory)); // empty checked scope, not detached
+    state.expire_scope(&point(0, 2), Some(&inventory), &[]); // empty checked scope, not detached
     assert_eq!(state.bindings.len(), 3);
     let mut single = state.clone();
-    single.expire_scope(&outer_exit, Some(&inventory));
+    single.expire_scope(&outer_exit, Some(&inventory), &[]);
     let others = BTreeSet::from([inner.clone(), introduced.clone()]);
     assert!(single.bindings.keys().eq(others.iter()));
     assert!(single.moved_checked_handles.keys().eq(others.iter()));
@@ -5088,7 +5089,7 @@ fn prepared_scope_expiry_uses_exact_declared_and_introduced_bindings() {
     assert!(single.moved.iter().map(|(place, _)| &place.binding).eq([&inner, &introduced]));
     assert!(single.projected.iter().map(|known| &known.place.binding).eq([&inner, &introduced]));
 
-    state.expire_scope(&inner_exit, Some(&inventory));
+    state.expire_scope(&inner_exit, Some(&inventory), &[]);
     assert_eq!(state.bindings, BTreeMap::from([(outer.clone(), BTreeSet::new())]));
     assert_eq!(state.uninitialized, HashSet::from([outer.clone()]));
     assert!(matches!(state.moved.as_slice(), [(place, _)] if place.binding == outer));
@@ -5096,7 +5097,7 @@ fn prepared_scope_expiry_uses_exact_declared_and_introduced_bindings() {
     assert_eq!(state.released, BTreeSet::from([outer.clone()]));
     assert_eq!(state.invalidated, BTreeSet::from([outer.clone()]));
     assert!(matches!(state.projected.as_slice(), [known] if known.place.binding == outer));
-    state.expire_scope(&outer_exit, Some(&inventory));
+    state.expire_scope(&outer_exit, Some(&inventory), &[]);
     assert!(state == ReferenceEdgeState::default());
 }
 
@@ -5189,6 +5190,20 @@ struct ReferenceProjectedState {
     place: ReferencePlaceId,
     origins: BTreeSet<ReferenceOriginId>,
     uninitialized: bool,
+}
+
+impl ReferenceProjectedState {
+    fn survives_scope(
+        &self,
+        facts: &[ReferenceOrigin],
+        live: impl Fn(&ReferenceBindingId) -> bool,
+    ) -> bool {
+        live(&self.place.binding) && !self.origins.iter().any(|origin| {
+            matches!(&facts[origin.0], ReferenceOrigin::Fresh { loan, .. }
+                if loan.origin_place.binding.kind == ReferenceBindingKind::Declared
+                    && !live(&loan.origin_place.binding))
+        })
+    }
 }
 
 fn reference_places_same(left: &ReferencePlaceId, right: &ReferencePlaceId) -> bool {
@@ -5636,7 +5651,7 @@ fn selected_holder_keeps_projected_only_shared_loan_live_until_replaced() {
     };
     let mut cohort = super::control::ScopeExitBindings::default();
     cohort.insert(slot.binding.clone());
-    state.expire_scope(&exit, Some(&HashMap::from([(exit.id, cohort)])));
+    state.expire_scope(&exit, Some(&HashMap::from([(exit.id, cohort)])), &facts);
     assert!(!state.projected.live_loans);
     assert!(conflicts(&state, &unrelated, LoanAccess::Direct).is_empty());
     holder.write(&mut state, &slot, &BTreeSet::from([ReferenceOriginId(2)]), &facts);
@@ -8996,7 +9011,7 @@ fn transfer_reference_facts(
                 descriptor.observe(point, &state, &cfg.facts);
             }
             match &point.kind {
-                CfgPointKind::ScopeExit => state.expire_scope(point, cfg.scope_exit_bindings),
+                CfgPointKind::ScopeExit => state.expire_scope(point, cfg.scope_exit_bindings, &cfg.facts),
                 CfgPointKind::Read { .. }
                 | CfgPointKind::ReadPlace { .. }
                 | CfgPointKind::Join
