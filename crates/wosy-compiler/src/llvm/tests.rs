@@ -10059,3 +10059,80 @@ if (observed(true,30001) != 30001 || observed(false,30001) != 13) { core.system_
         }
     }
 }
+
+#[test]
+fn guarded_fallible_struct_snapshots_char_fields() {
+    let source = SourceIdentity::new("project".into(), "package".into(), "src/main.w".into(), "r1".into());
+    let text = r#"%%start
+struct Record { bool active; char observed; char marker; }
+u32(char) inspect = fn(input_char) {
+	Record held =? { .marker = 'Q'; .observed = input_char; .active = true; };
+	if (&held == null) { 7 } else {
+		if (!held.active || held.marker != 'Q') { 11 } else { core.bitcast<u32>(held.observed) }
+	}
+};
+if (inspect('G') != 71) { core.system_panic(); };
+%%end"#;
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let parsed = parse_source(source.clone(), text.into(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let single = crate::derive_scalar_program_with_layout(&parsed.result, layout);
+        assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+        let project = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::from_program(single.program.clone(), Vec::new())],
+            vec![source.clone()],
+        ));
+        assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+        for (project_route, ir) in [
+            (false, emit_scalar_llvm(&single).unwrap().to_text()),
+            (true, emit_scalar_project_llvm(&project).unwrap().to_text()),
+        ] {
+            let symbol = self_tail_test_symbol(&source, project_route, "inspect");
+            let body = self_tail_test_body(&ir, "i32", &symbol);
+            let (before, after) = body
+                .split_once("call ptr @__wosy_core_alloc(i64 12, i64 4)")
+                .expect("mixed scalar allocation layout");
+            assert!(!after.contains("call ptr @__wosy_core_alloc("), "{body}");
+            let slot = before.lines().find_map(|line| {
+                line.trim_start().strip_prefix("store i32 %input_char, ptr ")
+                    .and_then(|operands| operands.split(',').next())
+            }).expect("character parameter spill");
+            let instruction = format!(" = load i32, ptr {slot},");
+            assert_eq!(body.matches(&instruction).count(), 1, "{body}");
+            let load = before.find(&instruction).expect("character snapshot before allocation");
+            let character = before[..load].lines().last().unwrap().trim_start();
+            let (_, initialize) = after.split_once("\nfallible.initialize:").expect("present block");
+            let (initialize, _) = initialize.split_once("\nfallible.continue:").expect("join block");
+            assert!(initialize.contains(&format!("store i32 {character},")), "{body}");
+            assert!(initialize.contains("store i32 81,") && initialize.contains("store i1 true,"), "{body}");
+            for offset in [0, 4, 8] {
+                assert!(initialize.contains(&format!("getelementptr inbounds i8, ptr %allocation, i8 {offset}")), "{body}");
+            }
+            assert_eq!(body.matches("call void @__wosy_core_free(ptr %allocation)").count(), 1, "{body}");
+            assert!(!body.contains("struct_literal") && !body.contains("memmove") && !body.contains("memcpy"), "{body}");
+            if let Some(output_dir) = std::env::var_os("WOSY_FALLIBLE_TEST_IR_DIR") {
+                let target = if layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
+                let path = format!("{target}-{}-char-struct.ll", if project_route { "project" } else { "standalone" });
+                std::fs::write(std::path::PathBuf::from(output_dir).join(path), &ir).unwrap();
+            }
+        }
+        for (from, to, diagnostic) in [
+            (".marker = 'Q'", ".marker = 81", "expression type does not match expected type"),
+            (".marker = 'Q'", ".marker = global_marker", "fallible struct initializer requires a literal or a lexical binding of the field type"),
+            (".observed = input_char", ".observed = identity(input_char)", "fallible allocation requires a local integer"),
+        ] {
+            let rejected = text.replace("%%start\n", "%%start\nchar global_marker = 'Q';\nchar(char) identity = fn(value) { value };\n")
+                .replace(from, to);
+            let parsed = parse_source(source.clone(), rejected, &[]);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let single = crate::derive_scalar_program_with_layout(&parsed.result, layout);
+            let project = validate_scalar_project(ScalarProject::new(
+                vec![ScalarModule::from_program(single.program.clone(), Vec::new())],
+                vec![source.clone()],
+            ));
+            for diagnostics in [&single.diagnostics, &project.diagnostics] {
+                assert!(diagnostics.iter().any(|item| item.message.contains(diagnostic)), "{diagnostics:?}");
+            }
+        }
+    }
+}
