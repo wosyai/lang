@@ -623,6 +623,51 @@ fn nested_aggregate_transfer_shares_and_merges_path_receipts() {
 }
 
 #[test]
+fn lexical_aggregate_transfer_releases_at_the_exact_owner_scope() {
+    let app = source("workbench", "src/lexical_aggregate_transfer.w");
+    let text = include_str!("fixtures/lexical-aggregate-transfer.w");
+    for (target, target_layout) in [
+        ("native64", ScalarTargetLayout::NATIVE64),
+        ("wasm32", ScalarTargetLayout::WASM32),
+    ] {
+        let prepared = prepare_scalar_project(
+            vec![(declarations(&app, text), Vec::new())], vec![app.clone()],
+            ScalarPreparationInputs { target_layout },
+        ).unwrap_or_else(|error| panic!("{target}: {:?}", error.diagnostics));
+        let build = analyze_scalar_build(&prepared);
+        assert!(build.diagnostics().is_empty(), "{target}: {:?}", build.diagnostics());
+        let ir = emit_scalar_build_project_llvm(&build).unwrap().to_text();
+        let context = Context::create();
+        let buffer = MemoryBuffer::create_from_memory_range_copy(ir.as_bytes(), target);
+        let module = context.create_module_from_ir(buffer).unwrap();
+        module.verify().unwrap();
+
+        let drive = module.get_function(&function_with_suffix(&module, "drive")).unwrap();
+        let blocks = drive.get_basic_blocks();
+        let rows: Vec<_> = blocks.iter().flat_map(|block| block.get_instructions()).collect();
+        let named_guards = |opcode| rows.iter().filter(|row|
+            row.get_opcode() == opcode && row.to_string().contains("aggregate_receipt_active")
+        ).count();
+        // One plain-block guard, one left-child guard, one independent parent guard.
+        // The right child's exhaustive merge requires no guard of its own.
+        assert_eq!(named_guards(InstructionOpcode::Phi), 3, "{target}: {ir}");
+        assert_eq!(named_guards(InstructionOpcode::Br), 3, "{target}: {ir}");
+        assert!(!ir.contains("aggregate_receipt_live"));
+
+        if let Some(out) = std::env::var_os("WOSY_LEXICAL_RECEIPT_IR_DIR") {
+            let mut witness = ir.replace("@main(", "@wosy_authored_main(");
+            for name in ["case_ff", "case_ft", "case_tf", "case_tt"] {
+                let symbol = function_with_suffix(&module, name);
+                witness.push_str(&format!(
+                    "\ndefine i64 @wosy_{name}() {{\nentry:\n  %result = call i64 @{symbol}()\n  ret i64 %result\n}}\n"
+                ));
+            }
+            std::fs::write(std::path::PathBuf::from(out).join(format!("{target}.ll")), witness).unwrap();
+        }
+    }
+}
+
+#[test]
 fn runtime_array_recommit_keeps_the_owner_until_its_real_end() {
     let recursive = r#"
 (u8[], u64)(u8[], u64, u64) carry = fn(bytes, depth, count) {
