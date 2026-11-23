@@ -378,6 +378,7 @@ pub(super) struct ReferenceFlowBuilder<'a> {
     has_projected_child: bool,
     deferred_reborrow_roots: Vec<(ReferenceBindingId, super::control::DeferredReborrowRoot, CfgPointId, ReferenceOriginId)>,
     deferred_local_reborrow: bool,
+    joined_local_reborrow: bool,
     has_joined_root_reborrow: bool,
     pub(super) source: SourceIdentity,
     pub(super) function_span: ByteSpan,
@@ -496,6 +497,8 @@ impl<'a> ReferenceFlowBuilder<'a> {
         structs: &'a [ScalarStruct],
         enums: &'a [ScalarEnum],
     ) -> Self {
+        let local_reborrow = deferred_named_reborrow_allowed(function, call_sites)
+            && call_sites.boundary.parameters.iter().all(|slot| aggregate::ordinary_value(&slot.ty));
         Self {
             capture_call_points: false,
             root_return_points: 0..0,
@@ -523,9 +526,8 @@ impl<'a> ReferenceFlowBuilder<'a> {
             },
             has_projected_child: false,
             deferred_reborrow_roots: Vec::new(),
-            deferred_local_reborrow: deferred_named_reborrow_allowed(function, call_sites)
-                && call_sites.call_occurrences.is_empty()
-                && call_sites.boundary.parameters.iter().all(|slot| aggregate::ordinary_value(&slot.ty)),
+            deferred_local_reborrow: local_reborrow && call_sites.call_occurrences.is_empty(),
+            joined_local_reborrow: local_reborrow,
             has_joined_root_reborrow: false,
             source: source.clone(),
             function_span: function.span,
@@ -2533,9 +2535,10 @@ impl<'a> ReferenceFlowBuilder<'a> {
                                     Some(ScalarType::CheckedReference {
                                         mutability: ScalarReferenceMutability::Mutable, inner,
                                     }) if aggregate::ordinary_value(inner))
-                                && self.deferred_local_reborrow
+                                && self.joined_local_reborrow
                                 && !self.has_joined_root_reborrow
                                 && matches!(binding.kind, ReferenceBindingKind::Declared)
+                                && joined_reborrow_calls_are_scalar(&self.source, self.call_sites)
                             {
                                 let pointer_point = self.cursor.expect("named checked read");
                                 let point = self.point_with_origins(
@@ -6124,6 +6127,22 @@ fn deferred_named_reborrow_allowed(function: &ScalarFunction, calls: &FunctionCa
             })
         && matches!(calls.named_place_roots, NamedPlaceRootFacts::Prepared(_))
         && calls.structure.module_storage_uses.is_empty()
+}
+
+fn joined_reborrow_calls_are_scalar(source: &SourceIdentity, calls: &FunctionCallSites) -> bool {
+    calls.call_occurrences.iter().all(|call| {
+        matches!(&calls.sites[call.site].target,
+            ResolvedCallTarget::ModuleCallable { source: callee, concrete: ConcreteCallSelection::Declaration, .. }
+                if callee == source)
+            && !calls.declared_unsafe_calls.contains(&call.ordinal.0)
+            && calls.checked_call_signatures.get(&call.ordinal).is_some_and(|signature|
+                signature.parameters.iter().all(aggregate::ordinary_value)
+                    && match signature.outputs.outputs.as_slice() {
+                        [] => true,
+                        [output] => output.ty == ScalarType::Unit || aggregate::ordinary_value(&output.ty),
+                        _ => false,
+                    })
+    })
 }
 
 fn deferred_reborrow_owner(pending: &super::control::PendingNamedReborrow) -> &ReferenceBindingId {

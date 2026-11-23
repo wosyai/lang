@@ -136,7 +136,7 @@ fn joined_child_still_blocks_selected_owner_after_an_unrelated_store() {
 fn joined_child_reads_both_use_the_selected_owner() {
     let program = joined("parent = &!second;", true, "", "u8 again = *child; first = 3;");
     let program = program.replace("    seen\n", "    if (again == seen) { seen } else { 0 }\n");
-    check_case(&program, Expected::Valid, true);
+    check(&program, Expected::Valid);
 }
 
 #[test]
@@ -149,4 +149,29 @@ fn joined_child_stays_live_between_typed_reads() {
 fn joined_child_still_declines_reference_aliases() {
     let program = joined("parent = &!second;", true, "", "*u8 alias = child; u8 again = *alias; again;");
     check(&program, Expected::Declined);
+}
+
+fn joined_with_scalar_call(after_read: &str) -> String {
+    let program = joined("parent = &!second;", true, "", after_read);
+    program.replace("%%start\n", "%%start\nu8(u8) scalar = fn(value) { value };\n")
+}
+
+#[test]
+fn joined_child_survives_a_direct_scalar_call() {
+    let program = joined_with_scalar_call("u8 through_call = scalar(seen); u8 again = *child; first = 3;");
+    let program = program.replace("    seen\n", "    if (again == through_call) { seen } else { 0 }\n");
+    check_case(&program, Expected::Valid, true);
+}
+
+#[test]
+fn joined_child_remains_live_after_a_direct_scalar_call() {
+    let program = joined_with_scalar_call("u8 through_call = scalar(seen); first = 3; u8 again = *child; through_call; again;");
+    check(&program, Expected::LiveConflict);
+}
+
+#[test]
+fn joined_child_still_declines_checked_reference_calls() {
+    let program = joined("parent = &!second;", true, "", "u8 through_call = pointer(child); through_call;");
+    let program = program.replace("%%start\n", "%%start\nu8(*u8) pointer = fn(value) { *value };\n");
+    check(&program, Expected::NullParent);
 }
