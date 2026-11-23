@@ -68,6 +68,78 @@ pub(super) struct AggregateFlowFacts {
     pub(super) checked_producer_nonlocal_installs: BTreeSet<CfgPointId>,
 }
 
+pub(super) struct UnitInputRegion {
+    pub(super) expression: OccurrenceOrdinal,
+    pub(super) branch: CfgPointId,
+    pub(super) then_entry: CfgPointId,
+    pub(super) then_exit: CfgPointId,
+    pub(super) join: CfgPointId,
+}
+
+fn linear_path(points: &[ReferenceFlowPoint], from: CfgPointId, to: CfgPointId) -> bool {
+    let mut current = from;
+    while current != to {
+        let [next] = points[current.0].successors.as_slice() else { return false };
+        if *next <= current || *next > to {
+            return false;
+        }
+        current = *next;
+    }
+    true
+}
+
+impl UnitInputRegion {
+    fn proves(&self, points: &[ReferenceFlowPoint], producer: CfgPointId, consumer: CfgPointId, exit: CfgPointId) -> bool {
+        let entry = &points[0];
+        let root = entry.scope;
+        points[producer.0].scope == root
+            && points[self.branch.0].scope == root
+            && points[self.join.0].scope == root
+            && points[exit.0].scope == root
+            && points[self.branch.0].successors.as_slice() == [self.then_entry, self.join]
+            && points[self.then_exit.0].successors.as_slice() == [self.join]
+            && linear_path(points, entry.id, producer)
+            && linear_path(points, producer, self.branch)
+            && linear_path(points, self.then_entry, consumer)
+            && linear_path(points, consumer, self.then_exit)
+            && linear_path(points, self.join, exit)
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn unit_input_receipt_requires_a_dominating_producer_and_an_exact_then_path() {
+    let source = SourceIdentity::new("project".into(), "package".into(), "metadata".into(), "r1".into());
+    let span = ByteSpan::new(0, 1);
+    let point = |id, scope, successors: &[usize]| ReferenceFlowPoint {
+        id: CfgPointId(id), kind: CfgPointKind::Join,
+        source_span: SourceSpan::new(source.clone(), span),
+        scope: ReferenceScopeId(scope), possible_origins: None,
+        successors: successors.iter().copied().map(CfgPointId).collect(),
+    };
+    let mut points = [
+        point(0, 0, &[1]), point(1, 0, &[2]), point(2, 0, &[3, 7]),
+        point(3, 1, &[4]), point(4, 1, &[5]), point(5, 1, &[6]),
+        point(6, 1, &[7]), point(7, 0, &[8]), point(8, 0, &[]),
+    ];
+    let region = UnitInputRegion {
+        expression: OccurrenceOrdinal(1), branch: CfgPointId(2),
+        then_entry: CfgPointId(3), then_exit: CfgPointId(6), join: CfgPointId(7),
+    };
+    let proves = |points: &[ReferenceFlowPoint]| {
+        region.proves(points, CfgPointId(1), CfgPointId(4), CfgPointId(8))
+    };
+    assert!(proves(&points));
+    points[0].successors.push(CfgPointId(2));
+    assert!(!proves(&points));
+    points[0].successors.pop();
+    points[3].successors.push(CfgPointId(5));
+    assert!(!proves(&points));
+    points[3].successors.pop();
+    points[6].successors[0] = CfgPointId(8);
+    assert!(!proves(&points));
+}
+
 impl AggregateFlowFacts {
     pub(super) fn record_mixed_arm_projection(
         &mut self, conditional: OccurrenceOrdinal, owner_projection: CfgPointId, owner_lane: usize,
@@ -613,6 +685,13 @@ impl ScopeEndpoint {
         Some(bindings.next().is_none()
             && self.always.as_ref().is_some_and(|always| always.contains(receipt)))
     }
+
+    fn has_conditional_unique_receipt(&self, owner: OwnerSource) -> bool {
+        let mut receipts = self.possible.iter().filter(|(source, _)| *source == owner);
+        let Some(receipt) = receipts.next() else { return false };
+        receipts.next().is_none()
+            && self.always.as_ref().is_some_and(|always| !always.contains(receipt))
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -734,6 +813,7 @@ struct MixedBranchReturn {
 
 #[derive(Default)]
 pub(super) struct AggregateFlowResult {
+    pub(super) unit_input_regions: BTreeMap<usize, UnitInputRegion>,
     literal_array_route: Option<LiteralArrayRoute>,
     literal_array_unknown: bool,
     literal_array_join: LiteralArrayJoin,
@@ -2066,6 +2146,8 @@ pub(crate) struct ClosedBody {
     pub(crate) calls: BTreeMap<usize, ClosedCall>,
     pub(crate) scope_exits: BTreeMap<usize, CfgPointId>,
     pub(crate) releases: BTreeMap<CfgPointId, Vec<usize>>,
+    pub(crate) guarded_call_releases: BTreeMap<usize, usize>,
+    pub(crate) guarded_call_inputs: BTreeMap<usize, usize>,
     pub(crate) input: Option<usize>,
     pub(crate) input_mixed: bool,
     // Checked primary call occurrence -> exact destination place occurrence.
@@ -3130,7 +3212,7 @@ fn closed_aggregates<'a>(
     let mut forward_edges = BTreeMap::new();
     let mut modes = BTreeMap::<(BodyKey, usize), (bool, bool)>::new();
     let mut seed_targets = BTreeMap::<BodyKey, BTreeSet<(BodyKey, usize)>>::new();
-    let mut input_users = BTreeMap::<(BodyKey, usize), Vec<(BodyKey, usize, ArgumentProvenance, &BTreeSet<Option<InputOrigin>>) >>::new();
+    let mut input_users = BTreeMap::<(BodyKey, usize), Vec<(BodyKey, CfgPointId, usize, ArgumentProvenance, &BTreeSet<Option<InputOrigin>>) >>::new();
     let mut array_callsites = Vec::new();
     let mut literal_array_callers = Vec::new();
     let mut array_leaves = BTreeSet::new();
@@ -3178,7 +3260,7 @@ fn closed_aggregates<'a>(
             for (&(point, ordinal, slot, moved), origins) in &facts.inputs {
                 if let Some(target) = target_body(&declarations, body.cfg, point) {
                     let receiver = (target, slot);
-                    input_users.entry(receiver).or_default().push((key, ordinal, moved, origins));
+                    input_users.entry(receiver).or_default().push((key, point, ordinal, moved, origins));
                     let mode = modes.entry(receiver).or_default();
                     for source in origins {
                         match *source {
@@ -3447,6 +3529,7 @@ fn closed_aggregates<'a>(
     let mut input_plans = BTreeMap::<BodyKey, (usize, Option<(CfgPointId, usize)>, bool)>::new();
     let mut input_calls = BTreeMap::<BodyKey, BTreeMap<usize, (usize, ClosedInput)>>::new();
     let mut discharged_by_inputs = BTreeSet::<(BodyKey, CfgPointId)>::new();
+    let mut eligible_conditional_inputs = BTreeMap::<(BodyKey, CfgPointId), (usize, CfgPointId)>::new();
     let active = |caller, source| {
         let producer = match source {
             Some(InputOrigin::Owner(OwnerSource::Call(producer)) | InputOrigin::Immediate(producer)) => producer,
@@ -3526,7 +3609,7 @@ fn closed_aggregates<'a>(
             terminal_formals.push((callee, slot));
             Some(endpoint)
         };
-        for (caller, ordinal, moved, origins) in users {
+        for (caller, consumer, ordinal, moved, origins) in users {
             if origins.is_empty() && !initializer_owned_formals.contains(&(callee, slot)) {
                 continue;
             }
@@ -3547,6 +3630,9 @@ fn closed_aggregates<'a>(
                     let call = bodies[&caller].facts.and_then(|f| f.calls.get(&producer)).ok_or_else(|| "missing owning input source receipt".to_owned())?;
                     if !discharged_by_inputs.insert((caller, producer)) {
                         return Err(format!("aggregate owning input has ambiguous source transfer in {:?} at call {ordinal}", bodies[&caller].source));
+                    }
+                    if release.is_some() && !mixed {
+                        eligible_conditional_inputs.insert((caller, producer), (ordinal, consumer));
                     }
                     ClosedInput::Transfer(call.0)
                 }
@@ -3757,14 +3843,35 @@ fn closed_aggregates<'a>(
                 plan.calls.insert(call.0, ClosedCall::Forward);
                 continue;
             }
+            let owner = OwnerSource::Call(point);
+            let mut endpoints = facts.owner_endpoints(owner);
             if discharged_by_inputs.contains(&(key, point)) {
-                if facts.owner_endpoints(OwnerSource::Call(point)).next().is_some() {
-                    return Err(format!("aggregate input transfer does not cover every owning path in {:?}", body.source));
+                if let Some((endpoint @ (exit, block), always)) = endpoints.next() {
+                    let ordinary_producer = target_body(&declarations, body.cfg, point)
+                        .and_then(|target| bodies.get(&target))
+                        .is_some_and(|producer| !producer.has_mixed_struct_result());
+                    let structured = eligible_conditional_inputs.get(&(key, point)).and_then(|&(ordinal, consumer)| {
+                        let region = facts.unit_input_regions.get(&body.cfg.points[consumer.0].scope.0)?;
+                        region.proves(&body.cfg.points, point, consumer, exit)
+                            .then_some((ordinal, region.expression.0))
+                    });
+                    let valid = !always && endpoints.next().is_none() && !returning && ordinary_producer
+                        && plan.guarded_call_releases.is_empty()
+                        && facts.endpoints.get(&endpoint)
+                            .is_some_and(|endpoint| endpoint.has_conditional_unique_receipt(owner));
+                    let Some((consumer, expression)) = structured.filter(|_| valid) else {
+                        return Err(format!("aggregate input transfer does not cover every owning path in {:?}", body.source));
+                    };
+                    if plan.scope_exits.insert(block, exit).is_some_and(|old| old != exit) {
+                        return Err(format!("aggregate release has conflicting scope exits in {:?}", body.source));
+                    }
+                    plan.releases.entry(exit).or_default().push(call.0);
+                    plan.guarded_call_releases.insert(expression, call.0);
+                    plan.guarded_call_inputs.insert(consumer, call.0);
                 }
                 plan.calls.insert(call.0, ClosedCall::Receive);
                 continue;
             }
-            let mut endpoints = facts.owner_endpoints(OwnerSource::Call(point));
             let Some(((exit, block), always)) = endpoints.next() else {
                 return Err(format!(
                     "aggregate owning call has no proved endpoint in {:?}",

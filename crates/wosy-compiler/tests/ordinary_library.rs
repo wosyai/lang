@@ -292,6 +292,108 @@ u64 result = drive(2);
 }
 
 #[test]
+fn conditional_aggregate_input_transfer_leaves_the_other_arm_owning() {
+    let app = source("workbench", "src/conditional_aggregate_transfer.w");
+    let text = include_str!("fixtures/conditional-aggregate-transfer.w");
+    for (target, target_layout) in [
+        ("native64", ScalarTargetLayout::NATIVE64),
+        ("wasm32", ScalarTargetLayout::WASM32),
+    ] {
+        let prepared = prepare_scalar_project(
+            vec![(declarations(&app, text), Vec::new())],
+            vec![app.clone()],
+            ScalarPreparationInputs { target_layout },
+        )
+        .unwrap_or_else(|error| panic!("{target}: {:?}", error.diagnostics));
+        let build = analyze_scalar_build(&prepared);
+        assert!(build.diagnostics().is_empty(), "{target}: {:?}", build.diagnostics());
+        let ir = emit_scalar_build_project_llvm(&build).unwrap().to_text();
+        let context = Context::create();
+        let buffer = MemoryBuffer::create_from_memory_range_copy(ir.as_bytes(), target);
+        let module = context.create_module_from_ir(buffer).unwrap();
+        module.verify().unwrap();
+
+        let drive = module.get_function(&function_with_suffix(&module, "drive")).unwrap();
+        let producer = module.get_function(&function_with_suffix(&module, "make_packet")).unwrap();
+        let consumer = module.get_function(&function_with_suffix(&module, "accept_packet")).unwrap();
+        let release = module.get_function("__wosy_core_free").unwrap();
+        let mut produced = None;
+        let mut passed = None;
+        let mut freed = None;
+        let mut receipt_phi = None;
+        let mut consumer_block = None;
+        for block in drive.get_basic_blocks() {
+            for instruction in block.get_instructions() {
+                let printed = instruction.to_string();
+                assert!(!printed.contains("aggregate_receipt_live"), "{target}: {printed}");
+                if instruction.get_opcode() == InstructionOpcode::Phi
+                    && printed.contains("aggregate_receipt_active")
+                {
+                    assert!(block.get_name().to_str().unwrap().starts_with("if.merge"));
+                    assert!(receipt_phi.replace((instruction, block)).is_none());
+                }
+                if instruction.get_opcode() != InstructionOpcode::Call {
+                    continue;
+                }
+                let call = CallSiteValue::try_from(instruction).unwrap();
+                match call.get_called_fn_value() {
+                    Some(callee) if callee == producer => {
+                        assert!(produced.replace(call.try_as_basic_value().basic().unwrap()).is_none());
+                    }
+                    Some(callee) if callee == consumer => {
+                        assert!(block.get_name().to_str().unwrap().starts_with("if.then"));
+                        consumer_block = Some(block);
+                        let base = instruction.get_operand(call.count_arguments() - 1).unwrap().value().unwrap();
+                        assert!(passed.replace(base).is_none());
+                    }
+                    Some(callee) if callee == release => {
+                        assert!(block.get_name().to_str().unwrap().starts_with("aggregate.receipt.release"));
+                        let base = instruction.get_operand(0).unwrap().value().unwrap();
+                        assert!(freed.replace(base).is_none());
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let (instruction, merge) = receipt_phi.unwrap();
+        let phi = inkwell::values::PhiValue::try_from(instruction).unwrap();
+        assert_eq!(phi.count_incoming(), 2);
+        let (keep, bypass) = phi.get_incoming(0).unwrap();
+        let (moved, then_end) = phi.get_incoming(1).unwrap();
+        assert_eq!(keep.into_int_value().get_zero_extended_constant(), Some(1));
+        assert_eq!(moved.into_int_value().get_zero_extended_constant(), Some(0));
+        assert_ne!(bypass, then_end);
+        assert_eq!(Some(then_end), consumer_block);
+        assert_eq!(bypass.get_terminator().unwrap().get_operand(1).unwrap().block(), Some(merge));
+        assert_eq!(then_end.get_terminator().unwrap().get_operand(0).unwrap().block(), Some(merge));
+        assert!(produced.is_some());
+        assert_eq!(passed, produced, "{target}");
+        assert_eq!(freed, produced, "{target}");
+        let consumer_releases: Vec<_> = consumer.get_basic_blocks().into_iter()
+            .flat_map(|block| block.get_instructions())
+            .filter(|instruction| instruction.get_opcode() == InstructionOpcode::Call
+                && CallSiteValue::try_from(*instruction).unwrap().get_called_fn_value() == Some(release))
+            .collect();
+        let [callee_release] = consumer_releases.as_slice() else {
+            panic!("{target}: expected one terminal consumer release");
+        };
+        assert_eq!(callee_release.get_operand(0).unwrap().value(), consumer.get_last_param());
+
+        if let Some(out) = std::env::var_os("WOSY_CONDITIONAL_AGGREGATE_IR_DIR") {
+            let retain = function_with_suffix(&module, "retain_witness");
+            let transfer = function_with_suffix(&module, "transfer_witness");
+            let mut witness = ir.replace("@main(", "@wosy_authored_main(");
+            for (name, target) in [("retain", retain), ("transfer", transfer)] {
+                witness.push_str(&format!(
+                    "\ndefine i64 @wosy_conditional_{name}() {{\nentry:\n  %result = call i64 @{target}()\n  ret i64 %result\n}}\n"
+                ));
+            }
+            std::fs::write(std::path::PathBuf::from(out).join(format!("{target}.ll")), witness).unwrap();
+        }
+    }
+}
+
+#[test]
 fn runtime_array_recommit_keeps_the_owner_until_its_real_end() {
     let recursive = r#"
 (u8[], u64)(u8[], u64, u64) carry = fn(bytes, depth, count) {

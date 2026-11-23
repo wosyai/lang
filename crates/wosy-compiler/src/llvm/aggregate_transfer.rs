@@ -107,6 +107,8 @@ pub(super) struct AggregateEmitter<'ctx, 'plan> {
     checked_backing_released: bool,
     checked_backing_forwarded: bool,
     receipts: BTreeMap<usize, PointerValue<'ctx>>,
+    // Only receipts with a proved split between an input move and scope cleanup.
+    guarded_receipt_live: BTreeMap<usize, inkwell::values::IntValue<'ctx>>,
     input: Option<(usize, PointerValue<'ctx>)>,
 }
 
@@ -216,6 +218,7 @@ impl<'ctx, 'plan> AggregateEmitter<'ctx, 'plan> {
             checked_backing_released: false,
             checked_backing_forwarded: false,
             receipts: BTreeMap::new(),
+            guarded_receipt_live: BTreeMap::new(),
         }))
     }
 
@@ -384,6 +387,31 @@ fn release_literal_array_base<'ctx>(
 ) -> Result<(), String> {
     super::ownership::consume_runtime_array_release(context, state,
         super::ownership::RuntimeArrayRelease { pointer: base.into(), live: None })
+}
+
+pub(super) fn finish_guarded_receipt_unit<'ctx>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, '_>,
+    expression: &ScalarExpression,
+    bypass: inkwell::basic_block::BasicBlock<'ctx>,
+    then_end: inkwell::basic_block::BasicBlock<'ctx>,
+) -> Result<(), String> {
+    let Some(aggregate) = &mut state.aggregate else { return Ok(()) };
+    if aggregate.plan.guarded_call_releases.is_empty() {
+        return Ok(());
+    }
+    let expression = state.body_call_nodes.and_then(|nodes| nodes.expression_ordinal(expression))
+        .ok_or_else(|| "missing conditional aggregate receipt occurrence".to_owned())?;
+    let Some(&receipt) = aggregate.plan.guarded_call_releases.get(&expression) else { return Ok(()) };
+    let phi = state.builder.build_phi(context.bool_type(), "aggregate_receipt_active")
+        .map_err(builder_error)?;
+    let retained = context.bool_type().const_int(1, false);
+    let transferred = context.bool_type().const_zero();
+    phi.add_incoming(&[(&retained, bypass), (&transferred, then_end)]);
+    if aggregate.guarded_receipt_live.insert(receipt, phi.as_basic_value().into_int_value()).is_some() {
+        return Err("duplicate guarded aggregate receipt".into());
+    }
+    Ok(())
 }
 
 pub(super) fn begin_literal_array_unit(
@@ -1071,8 +1099,16 @@ fn emit_selected_call<'ctx, 'module>(
     let owner_slots = super::expression::stage_checked_return_sidecars(context, state, owner_outputs, &mut operands)?;
     if let Some(input) = input {
         let base = match input {
-            CallInput::Body(ClosedInput::Transfer(receipt)) => state.aggregate.as_mut().expect("closed aggregate input context").receipts.remove(&receipt)
-                .ok_or_else(|| "missing owner receipt at committed input call".to_owned())?,
+            CallInput::Body(ClosedInput::Transfer(receipt)) => {
+                let aggregate = state.aggregate.as_mut().expect("closed aggregate input context");
+                if aggregate.plan.guarded_call_inputs.get(&ordinal) == Some(&receipt) {
+                    aggregate.receipts.get(&receipt).copied()
+                        .ok_or_else(|| "missing guarded owner receipt at committed input call".to_owned())?
+                } else {
+                    aggregate.receipts.remove(&receipt)
+                        .ok_or_else(|| "missing owner receipt at committed input call".to_owned())?
+                }
+            },
             CallInput::Body(ClosedInput::ForwardFormal(source)) => {
                 let aggregate = state.aggregate.as_mut().expect("closed aggregate input context");
                 let (formal, base) = aggregate.input.take()
@@ -1202,10 +1238,22 @@ pub(super) fn release_scope<'ctx>(
             .receipts
             .remove(ordinal)
             .ok_or_else(|| "missing closed aggregate scope receipt".to_owned())?;
-        state
-            .builder
-            .build_call(free, &[base.into()], "aggregate_release")
-            .map_err(builder_error)?;
+        if let Some(live) = aggregate.guarded_receipt_live.remove(ordinal) {
+            let function = state.builder.get_insert_block().and_then(|block| block.get_parent())
+                .ok_or_else(|| "missing guarded aggregate release block".to_owned())?;
+            let release = context.append_basic_block(function, "aggregate.receipt.release");
+            let next = context.append_basic_block(function, "aggregate.receipt.end");
+            state.builder.build_conditional_branch(live, release, next).map_err(builder_error)?;
+            state.builder.position_at_end(release);
+            state.builder.build_call(free, &[base.into()], "aggregate_release").map_err(builder_error)?;
+            state.builder.build_unconditional_branch(next).map_err(builder_error)?;
+            state.builder.position_at_end(next);
+        } else {
+            if aggregate.plan.guarded_call_inputs.values().any(|guarded| guarded == ordinal) {
+                return Err("missing guarded aggregate receipt at scope cleanup".into());
+            }
+            state.builder.build_call(free, &[base.into()], "aggregate_release").map_err(builder_error)?;
+        }
     }
     if release_input {
         let (slot, base) = aggregate.input.take().ok_or_else(|| "missing original formal base at owner exit".to_owned())?;
@@ -1397,7 +1445,7 @@ pub(super) fn finish_return<'ctx>(
     if aggregate.plan.scalar_descriptor_assignment.is_some() && !aggregate.scalar_descriptor_enrolled {
         return Err("descriptor assignment did not commit ownership".into());
     }
-    if !aggregate.receipts.is_empty() || aggregate.input.is_some() {
+    if !aggregate.receipts.is_empty() || !aggregate.guarded_receipt_live.is_empty() || aggregate.input.is_some() {
         return Err("unreleased closed aggregate receipt".into());
     }
     if aggregate.ordinary_called == aggregate.plan.ordinary_calls.is_empty() {

@@ -2897,11 +2897,11 @@ fn emit_unit_if<'ctx, 'module>(
     then_branch: &ScalarBlock,
 ) -> Result<EmitValue<'ctx>, String> {
     let condition = take_basic(emit_expression(context, state, condition)?)?.into_int_value();
-    let function = state
+    let bypass = state
         .builder
         .get_insert_block()
-        .ok_or_else(|| "missing insertion block".to_owned())?
-        .get_parent()
+        .ok_or_else(|| "missing insertion block".to_owned())?;
+    let function = bypass.get_parent()
         .ok_or_else(|| "missing function".to_owned())?;
     let then_block = context.append_basic_block(function, "if.then");
     let merge = context.append_basic_block(function, "if.merge");
@@ -2914,11 +2914,13 @@ fn emit_unit_if<'ctx, 'module>(
         state, expression, then_branch, None, crate::scalar::ArrayWriterSide::Then,
     )?;
     emit_block(context, state, then_branch)?;
+    let then_end = state.builder.get_insert_block().ok_or_else(|| "missing if arm terminal".to_owned())?;
     state
         .builder
         .build_unconditional_branch(merge)
         .map_err(builder_error)?;
     state.builder.position_at_end(merge);
+    aggregate_transfer::finish_guarded_receipt_unit(context, state, expression, bypass, then_end)?;
     aggregate_transfer::finish_literal_array_unit(state, enrolled)?;
     Ok(EmitValue::Unit)
 }
@@ -2933,11 +2935,11 @@ fn emit_project_unit_if<'ctx, 'module>(
     modules: &[&ScalarModule],
 ) -> Result<EmitValue<'ctx>, String> {
     let condition = take_basic(condition)?.into_int_value();
-    let function = state
+    let bypass = state
         .builder
         .get_insert_block()
-        .ok_or_else(|| "missing insertion block".to_owned())?
-        .get_parent()
+        .ok_or_else(|| "missing insertion block".to_owned())?;
+    let function = bypass.get_parent()
         .ok_or_else(|| "missing function".to_owned())?;
     let then_block = context.append_basic_block(function, "if.then");
     let merge = context.append_basic_block(function, "if.merge");
@@ -2950,11 +2952,13 @@ fn emit_project_unit_if<'ctx, 'module>(
         state, expression, then_branch, None, crate::scalar::ArrayWriterSide::Then,
     )?;
     emit_project_block(context, state, then_branch, module, modules)?;
+    let then_end = state.builder.get_insert_block().ok_or_else(|| "missing if arm terminal".to_owned())?;
     state
         .builder
         .build_unconditional_branch(merge)
         .map_err(builder_error)?;
     state.builder.position_at_end(merge);
+    aggregate_transfer::finish_guarded_receipt_unit(context, state, expression, bypass, then_end)?;
     aggregate_transfer::finish_literal_array_unit(state, enrolled)?;
     Ok(EmitValue::Unit)
 }
