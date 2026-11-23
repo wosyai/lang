@@ -4369,15 +4369,20 @@ fn derive_expression(node: &CstNode) -> ScalarExpression {
             span: wosy_syntax::byte_span(&actual),
         },
         SyntaxKind::Binary => {
-            let children = semantic_children(&actual);
-            let mut value = derive_element(&children[0]);
-            let mut index = 1;
-            while index < children.len() {
-                let NodeOrToken::Token(operator_token) = &children[index] else {
+            let mut children = semantic_children(&actual).enumerate();
+            let (_, first) = children
+                .next()
+                .unwrap_or_else(|| semantic_child_out_of_bounds(0));
+            let mut value = derive_element(&first);
+            while let Some((index, element)) = children.next() {
+                let NodeOrToken::Token(operator_token) = element else {
                     panic!("binary operator token")
                 };
                 let operator = operator(operator_token.text());
-                let right = derive_element(&children[index + 1]);
+                let (_, right) = children
+                    .next()
+                    .unwrap_or_else(|| semantic_child_out_of_bounds(index + 1));
+                let right = derive_element(&right);
                 let span = ByteSpan::new(span_of(&value).start, span_of(&right).end);
                 value = ScalarExpression::Binary {
                     operator,
@@ -4385,17 +4390,16 @@ fn derive_expression(node: &CstNode) -> ScalarExpression {
                     right: Box::new(right),
                     span,
                 };
-                index += 2;
             }
             value
         }
         SyntaxKind::Unary => {
-            let children = semantic_children(&actual);
-            let Some(first) = children.first() else {
+            let mut children = semantic_children(&actual);
+            let Some(first) = children.next() else {
                 panic!("unary expression children")
             };
             let NodeOrToken::Token(operator_token) = first else {
-                return derive_element(first);
+                return derive_element(&first);
             };
             let operator = match operator_token.text() {
                 "!" => UnaryOperator::LogicalNot,
@@ -4403,7 +4407,7 @@ fn derive_expression(node: &CstNode) -> ScalarExpression {
                 "-" => UnaryOperator::Negate,
                 _ => panic!("unary operator grammar"),
             };
-            let operand = derive_element(children.get(1).expect("unary operand"));
+            let operand = derive_element(&children.next().expect("unary operand"));
             let span = ByteSpan::new(
                 operator_token.text_range().start().into(),
                 span_of(&operand).end,
@@ -4539,7 +4543,11 @@ fn derive_expression(node: &CstNode) -> ScalarExpression {
                     span: wosy_syntax::byte_span(&actual),
                 }
             } else {
-                derive_element(&semantic_children(&actual)[0])
+                derive_element(
+                    &semantic_children(&actual)
+                        .next()
+                        .unwrap_or_else(|| semantic_child_out_of_bounds(0)),
+                )
             }
         }
         SyntaxKind::IndexedPlace => ScalarExpression::IndexedRead {
@@ -4604,14 +4612,15 @@ fn derive_expression(node: &CstNode) -> ScalarExpression {
             span: wosy_syntax::byte_span(&actual),
         },
         SyntaxKind::Parenthesized => derive_expression(&direct_nodes(&actual)[0]),
-        SyntaxKind::Expression => derive_element(&semantic_children(&actual)[0]),
-        _ => {
-            let children = semantic_children(&actual);
-            children
-                .first()
-                .map(derive_element)
-                .unwrap_or_else(|| panic!("expression grammar {:?}", actual.kind()))
-        }
+        SyntaxKind::Expression => derive_element(
+            &semantic_children(&actual)
+                .next()
+                .unwrap_or_else(|| semantic_child_out_of_bounds(0)),
+        ),
+        _ => semantic_children(&actual)
+            .next()
+            .map(|first| derive_element(&first))
+            .unwrap_or_else(|| panic!("expression grammar {:?}", actual.kind())),
     }
 }
 
@@ -4768,7 +4777,12 @@ fn direct_nodes(node: &CstNode) -> Vec<CstNode> {
     node.children().collect()
 }
 
-fn semantic_children(node: &CstNode) -> Vec<NodeOrToken<CstNode, CstToken>> {
+#[cold]
+fn semantic_child_out_of_bounds(index: usize) -> ! {
+    panic!("index out of bounds: the len is {index} but the index is {index}")
+}
+
+fn semantic_children(node: &CstNode) -> impl Iterator<Item = NodeOrToken<CstNode, CstToken>> {
     node.children_with_tokens()
         .filter(|element| match element {
             NodeOrToken::Node(_) => true,
@@ -4784,7 +4798,6 @@ fn semantic_children(node: &CstNode) -> Vec<NodeOrToken<CstNode, CstToken>> {
                     | SyntaxKind::Operator
             ),
         })
-        .collect()
 }
 
 fn direct_token(node: &CstNode, kind: SyntaxKind) -> Option<CstToken> {

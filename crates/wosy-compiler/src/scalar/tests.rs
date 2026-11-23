@@ -5178,6 +5178,63 @@ fn derives_valid_scalar_bindings_arithmetic_call_and_if() {
 }
 
 #[test]
+fn streams_binary_and_unary_children_in_precedence_order_with_exact_spans() {
+    let text = "%%start\ni32 value = 9 - 2 * -3 - 1;\n%%end";
+    let result = validate_text(text);
+    assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+    let [ScalarItem::Binding(binding)] = result.program.items.as_slice() else {
+        panic!("scalar result binding");
+    };
+    let bytes = |expression: &ScalarExpression| {
+        let span = span_of(expression);
+        &text[span.start as usize..span.end as usize]
+    };
+    let ScalarExpression::Binary { operator: BinaryOperator::Subtract, left, right, .. } =
+        &binding.value
+    else { panic!("outer subtraction") };
+    assert_eq!(bytes(&binding.value), "9 - 2 * -3 - 1");
+    assert_eq!(bytes(right), "1");
+    let ScalarExpression::Binary { operator: BinaryOperator::Subtract, left, right, .. } =
+        left.as_ref()
+    else { panic!("left-associated subtraction") };
+    assert_eq!(bytes(left), "9");
+    assert_eq!(bytes(right), "2 * -3");
+    let ScalarExpression::Binary { operator: BinaryOperator::Multiply, left, right, .. } =
+        right.as_ref()
+    else { panic!("higher-precedence multiplication") };
+    assert_eq!(bytes(left), "2");
+    assert!(matches!(right.as_ref(), ScalarExpression::Unary { operator: UnaryOperator::Negate, .. }));
+    assert_eq!(bytes(right), "-3");
+}
+
+fn malformed_binary_without_rhs(operator: &str) -> CanonicalCstRoot {
+    use wosy_syntax::{CanonicalCstSnapshotElement as Element, CanonicalCstSnapshotNode};
+    let parsed = parse_source(source(), "%%start\n1;\n%%end".into(), &[]);
+    let mut snapshot = parsed.result.canonical_cst().snapshot();
+    snapshot.root = CanonicalCstSnapshotNode {
+        kind: SyntaxKind::Binary,
+        text: format!("1{operator}"),
+        children: vec![
+            Element::Token { kind: SyntaxKind::Integer, text: "1".to_owned() },
+            Element::Token { kind: SyntaxKind::Operator, text: operator.to_owned() },
+        ],
+    };
+    CanonicalCstRoot::from_snapshot(snapshot)
+}
+
+#[test]
+#[should_panic(expected = "operator grammar")]
+fn malformed_binary_reports_bad_operator_before_missing_rhs() {
+    derive_expression(&malformed_binary_without_rhs("?").root);
+}
+
+#[test]
+#[should_panic(expected = "index out of bounds: the len is 2 but the index is 2")]
+fn malformed_binary_with_valid_operator_retains_missing_rhs_error() {
+    derive_expression(&malformed_binary_without_rhs("+").root);
+}
+
+#[test]
 fn reports_integer_range_at_literal_span_and_preserves_i32_max() {
     let invalid_text = "%%start\ni32 value = 2147483648;\n%%end";
     let invalid = validate_text(invalid_text);
