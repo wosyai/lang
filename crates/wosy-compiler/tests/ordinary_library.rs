@@ -474,6 +474,80 @@ fn conditional_aggregate_value_shares_arm_predicates_and_preserves_receipt_ident
 }
 
 #[test]
+fn sequential_aggregate_transfer_retires_exhaustive_receipts_without_a_guard() {
+    let app = source("workbench", "src/sequential_aggregate_transfer.w");
+    let text = include_str!("fixtures/sequential-aggregate-transfer.w");
+    for (target, target_layout) in [
+        ("native64", ScalarTargetLayout::NATIVE64),
+        ("wasm32", ScalarTargetLayout::WASM32),
+    ] {
+        let prepared = prepare_scalar_project(
+            vec![(declarations(&app, text), Vec::new())], vec![app.clone()],
+            ScalarPreparationInputs { target_layout },
+        ).unwrap_or_else(|error| panic!("{target}: {:?}", error.diagnostics));
+        let build = analyze_scalar_build(&prepared);
+        assert!(build.diagnostics().is_empty(), "{target}: {:?}", build.diagnostics());
+        let ir = emit_scalar_build_project_llvm(&build).unwrap().to_text();
+        let context = Context::create();
+        let buffer = MemoryBuffer::create_from_memory_range_copy(ir.as_bytes(), target);
+        let module = context.create_module_from_ir(buffer).unwrap();
+        module.verify().unwrap();
+
+        let drive = module.get_function(&function_with_suffix(&module, "drive")).unwrap();
+        let producer = module.get_function(&function_with_suffix(&module, "make_packet")).unwrap();
+        let consumer = module.get_function(&function_with_suffix(&module, "accept_packet")).unwrap();
+        let release = module.get_function("__wosy_core_free").unwrap();
+        let mut produced = Vec::new();
+        let mut transferred = Vec::new();
+        let mut released = Vec::new();
+        let mut receipt_merges = Vec::new();
+        let mut guarded_branches = 0;
+        for block in drive.get_basic_blocks() {
+            for instruction in block.get_instructions() {
+                let row = instruction.to_string();
+                assert!(!row.contains("aggregate_receipt_live"));
+                if instruction.get_opcode() == InstructionOpcode::Phi && row.contains("aggregate_receipt_active") {
+                    receipt_merges.push(block);
+                }
+                if instruction.get_opcode() == InstructionOpcode::Br && row.contains("aggregate_receipt_active") {
+                    guarded_branches += 1;
+                }
+                if instruction.get_opcode() != InstructionOpcode::Call { continue; }
+                let call = CallSiteValue::try_from(instruction).unwrap();
+                let pointer = |slot| instruction.get_operand(slot).unwrap().value().unwrap();
+                match call.get_called_fn_value() {
+                    Some(callee) if callee == producer => produced.push(call.try_as_basic_value().basic().unwrap()),
+                    Some(callee) if callee == consumer => transferred.push(pointer(call.count_arguments() - 1)),
+                    Some(callee) if callee == release => released.push(pointer(0)),
+                    _ => {}
+                }
+            }
+        }
+        let [first, preserved, second, exhaustive] = produced.as_slice() else {
+            panic!("{target}: {ir}");
+        };
+        assert_eq!(transferred.len(), 4, "{target}: {ir}");
+        for (receipt, uses) in [(first, 1), (preserved, 0), (second, 1), (exhaustive, 2)] {
+            assert_eq!(transferred.iter().filter(|other| *other == receipt).count(), uses, "{target}: {ir}");
+        }
+        assert_eq!(released, [*second, *preserved, *first], "{target}: {ir}");
+        assert_eq!(receipt_merges.len(), 2, "{target}: {ir}");
+        assert_ne!(receipt_merges[0], receipt_merges[1], "{target}: {ir}");
+        assert_eq!(guarded_branches, 2, "{target}: {ir}");
+        if let Some(out) = std::env::var_os("WOSY_SEQUENTIAL_RECEIPT_IR_DIR") {
+            let mut witness = ir.replace("@main(", "@wosy_authored_main(");
+            for name in ["case_ff", "case_ft", "case_tf", "case_tt"] {
+                let symbol = function_with_suffix(&module, name);
+                witness.push_str(&format!(
+                    "\ndefine i64 @wosy_{name}() {{\nentry:\n  %result = call i64 @{symbol}()\n  ret i64 %result\n}}\n"
+                ));
+            }
+            std::fs::write(std::path::PathBuf::from(out).join(format!("{target}.ll")), witness).unwrap();
+        }
+    }
+}
+
+#[test]
 fn runtime_array_recommit_keeps_the_owner_until_its_real_end() {
     let recursive = r#"
 (u8[], u64)(u8[], u64, u64) carry = fn(bytes, depth, count) {

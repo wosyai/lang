@@ -1203,9 +1203,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
             let receipt = aggregate::ConditionalInputRegion {
                 expression, branch: edges.branch, entries, terminals: edges.terminals, join: edges.join,
             };
-            for entry in entries.into_iter().filter(|&entry| entry != edges.join) {
-                self.aggregate_result.conditional_input_regions.insert(self.cfg.points[entry.0].scope.0, receipt);
-            }
+            self.aggregate_result.conditional_input_regions.insert(edges.branch, receipt);
         }
     }
 

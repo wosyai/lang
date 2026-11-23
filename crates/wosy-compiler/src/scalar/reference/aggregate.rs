@@ -80,17 +80,16 @@ pub(super) struct ConditionalInputRegion {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ConditionalPath {
     Outside,
-    Prefix,
-    Arm(usize),
-    Suffix,
+    Spine,
+    Arm { fork: usize, side: usize },
 }
 
-// A single-successor entry prefix can reach at most one fork. Certify that
-// fork at most once per body, then classify each candidate by dense CFG index.
+// Walk the root spine once. Each certified fork takes both exact linear
+// paths to the same join, allowing the walk to resume at that join. Dense
+// labels keep candidate membership checks independent of CFG size.
 struct ConditionalInputCertificate {
     paths: Vec<ConditionalPath>,
-    fork: CfgPointId,
-    arms: Option<[Option<ReferenceScopeId>; 2]>,
+    forks: Vec<ConditionalInputRegion>,
 }
 
 fn linear_successor(points: &[ReferenceFlowPoint], from: CfgPointId) -> Option<CfgPointId> {
@@ -99,72 +98,76 @@ fn linear_successor(points: &[ReferenceFlowPoint], from: CfgPointId) -> Option<C
 }
 
 impl ConditionalInputCertificate {
-    fn prefix(points: &[ReferenceFlowPoint]) -> Self {
-        let mut paths = vec![ConditionalPath::Outside; points.len()];
-        let mut fork = points[0].id;
-        while let Some(next) = linear_successor(points, fork) {
-            paths[fork.0] = ConditionalPath::Prefix;
-            fork = next;
+    fn build(points: &[ReferenceFlowPoint], regions: &BTreeMap<CfgPointId, ConditionalInputRegion>) -> Self {
+        let mut certificate = Self {
+            paths: vec![ConditionalPath::Outside; points.len()],
+            forks: Vec::new(),
+        };
+        let mut point = points[0].id;
+        loop {
+            certificate.paths[point.0] = ConditionalPath::Spine;
+            if let Some(next) = linear_successor(points, point) {
+                point = next;
+                continue;
+            }
+            let Some(region) = regions.get(&point) else { break };
+            if !certificate.certify_arms(points, region) {
+                break;
+            }
+            certificate.forks.push(*region);
+            point = region.join;
         }
-        Self { paths, fork, arms: None }
+        certificate
     }
 
-    fn certify_arms(
-        &mut self, points: &[ReferenceFlowPoint], region: &ConditionalInputRegion,
-    ) -> Option<[Option<ReferenceScopeId>; 2]> {
+    fn certify_arms(&mut self, points: &[ReferenceFlowPoint], region: &ConditionalInputRegion) -> bool {
         let root = points[0].scope;
         if points[region.branch.0].scope != root || points[region.join.0].scope != root
+            || region.branch >= region.join
             || points[region.branch.0].successors.as_slice() != region.entries
         {
-            return None;
+            return false;
         }
-        let mut scopes = [None; 2];
         for (side, (entry, end)) in region.entries.into_iter().zip(region.terminals).enumerate() {
             if side == 1 && entry == region.join && end == region.branch {
                 continue; // A Unit conditional's implicit else is the direct bypass.
             }
-            if entry >= region.join || end >= region.join
+            let scope = points[entry.0].scope;
+            if entry <= region.branch || entry >= region.join || end >= region.join
+                || scope == root || points[end.0].scope != scope
                 || points[end.0].successors.as_slice() != [region.join]
             {
-                return None;
+                return false;
             }
             let mut point = entry;
             loop {
                 if point > end || self.paths[point.0] != ConditionalPath::Outside {
-                    return None;
+                    return false;
                 }
-                self.paths[point.0] = ConditionalPath::Arm(side);
+                self.paths[point.0] = ConditionalPath::Arm { fork: self.forks.len(), side };
                 if point == end { break; }
-                point = linear_successor(points, point)?;
-            }
-            let scope = points[entry.0].scope;
-            if scope != root && points[end.0].scope == scope {
-                scopes[side] = Some(scope);
+                let Some(next) = linear_successor(points, point) else { return false };
+                point = next;
             }
         }
-        let mut point = region.join;
-        loop {
-            self.paths[point.0] = ConditionalPath::Suffix;
-            let Some(next) = linear_successor(points, point) else { break };
-            point = next;
-        }
-        Some(scopes)
+        true
     }
 
-    fn consuming_side(
-        &self, points: &[ReferenceFlowPoint], producer: CfgPointId, consumer: CfgPointId, exit: CfgPointId,
-    ) -> Option<usize> {
+    fn consuming_arm(
+        &self, points: &[ReferenceFlowPoint], producer: CfgPointId, consumer: CfgPointId, exit: Option<CfgPointId>,
+    ) -> Option<(OccurrenceOrdinal, usize)> {
         let root = points[0].scope;
-        if points[producer.0].scope != root || points[exit.0].scope != root
-            || self.paths[producer.0] != ConditionalPath::Prefix
-            || self.paths[exit.0] != ConditionalPath::Suffix
+        let ConditionalPath::Arm { fork, side } = self.paths[consumer.0] else { return None };
+        let region = self.forks.get(fork)?;
+        if producer >= region.branch || points[producer.0].scope != root
+            || self.paths[producer.0] != ConditionalPath::Spine
+            || points[consumer.0].scope != points[region.entries[side].0].scope
+            || exit.is_some_and(|exit| region.join > exit || points[exit.0].scope != root
+                || self.paths[exit.0] != ConditionalPath::Spine)
         {
             return None;
         }
-        let ConditionalPath::Arm(side) = self.paths[consumer.0] else { return None };
-        let scope = Some(points[consumer.0].scope);
-        let arms = self.arms?;
-        (arms[side] == scope && arms[1 - side] != scope).then_some(side)
+        Some((region.expression, side))
     }
 }
 
@@ -190,10 +193,9 @@ fn unit_input_receipt_requires_a_dominating_producer_and_an_exact_then_path() {
         join: CfgPointId(7),
     };
     let proves = |points: &[ReferenceFlowPoint]| {
-        let mut certificate = ConditionalInputCertificate::prefix(points);
-        if certificate.fork != region.branch { return false; }
-        certificate.arms = certificate.certify_arms(points, &region);
-        certificate.consuming_side(points, CfgPointId(1), CfgPointId(4), CfgPointId(8)) == Some(0)
+        let regions = BTreeMap::from([(region.branch, region)]);
+        ConditionalInputCertificate::build(points, &regions)
+            .consuming_arm(points, CfgPointId(1), CfgPointId(4), Some(CfgPointId(8))) == Some((region.expression, 0))
     };
     assert!(proves(&points));
     points[0].successors.push(CfgPointId(2));
@@ -204,6 +206,43 @@ fn unit_input_receipt_requires_a_dominating_producer_and_an_exact_then_path() {
     points[3].successors.pop();
     points[6].successors[0] = CfgPointId(8);
     assert!(!proves(&points));
+}
+
+#[cfg(test)]
+#[test]
+fn conditional_input_spine_distinguishes_arms_and_producer_epochs() {
+    let source = SourceIdentity::new("project".into(), "package".into(), "metadata".into(), "r1".into());
+    let span = ByteSpan::new(0, 1);
+    let point = |id, scope, successors: &[usize]| ReferenceFlowPoint {
+        id: CfgPointId(id), kind: CfgPointKind::Join,
+        source_span: SourceSpan::new(source.clone(), span),
+        scope: ReferenceScopeId(scope), possible_origins: None,
+        successors: successors.iter().copied().map(CfgPointId).collect(),
+    };
+    let points = [
+        point(0, 0, &[1]), point(1, 0, &[2]), point(2, 0, &[3, 4]),
+        point(3, 1, &[5]), point(4, 2, &[5]), point(5, 0, &[6]),
+        point(6, 0, &[7]), point(7, 0, &[8, 9]), point(8, 3, &[10]),
+        point(9, 4, &[10]), point(10, 0, &[11]), point(11, 0, &[]),
+    ];
+    let region = |expression, branch, entries: [usize; 2], join| ConditionalInputRegion {
+        expression: OccurrenceOrdinal(expression), branch: CfgPointId(branch),
+        entries: entries.map(CfgPointId), terminals: entries.map(CfgPointId), join: CfgPointId(join),
+    };
+    let regions = BTreeMap::from([
+        (CfgPointId(2), region(1, 2, [3, 4], 5)),
+        (CfgPointId(7), region(2, 7, [8, 9], 10)),
+    ]);
+    let certificate = ConditionalInputCertificate::build(&points, &regions);
+    let arm = |producer, consumer, exit| certificate.consuming_arm(
+        &points, CfgPointId(producer), CfgPointId(consumer), Some(CfgPointId(exit)),
+    );
+    assert_eq!(arm(1, 3, 11), Some((OccurrenceOrdinal(1), 0)));
+    assert_eq!(arm(6, 8, 11), Some((OccurrenceOrdinal(2), 0)));
+    assert_eq!(arm(6, 9, 11), Some((OccurrenceOrdinal(2), 1)));
+    assert_eq!(arm(6, 3, 11), None);
+    assert_eq!(arm(3, 8, 11), None);
+    assert_eq!(arm(1, 8, 5), None);
 }
 
 impl AggregateFlowFacts {
@@ -884,7 +923,7 @@ struct MixedBranchReturn {
 
 #[derive(Default)]
 pub(super) struct AggregateFlowResult {
-    pub(super) conditional_input_regions: BTreeMap<usize, ConditionalInputRegion>,
+    pub(super) conditional_input_regions: BTreeMap<CfgPointId, ConditionalInputRegion>,
     literal_array_route: Option<LiteralArrayRoute>,
     literal_array_unknown: bool,
     literal_array_join: LiteralArrayJoin,
@@ -2210,6 +2249,12 @@ pub(crate) struct ClosedOwnerRelease {
 }
 
 #[derive(Debug, Default)]
+pub(crate) struct ClosedConditionalInputs {
+    pub(crate) consumed_on_one_arm: [Vec<usize>; 2],
+    pub(crate) consumed_on_both_arms: Vec<usize>,
+}
+
+#[derive(Debug, Default)]
 pub(crate) struct ClosedBody {
     pub(crate) scalar_descriptor_assignment: Option<(usize, usize, usize)>,
     pub(crate) checked_backing_producer: Option<ClosedCheckedBacking>,
@@ -2223,8 +2268,8 @@ pub(crate) struct ClosedBody {
     pub(crate) calls: BTreeMap<usize, ClosedCall>,
     pub(crate) scope_exits: BTreeMap<usize, CfgPointId>,
     pub(crate) releases: BTreeMap<CfgPointId, Vec<ClosedOwnerRelease>>,
-    pub(crate) guarded_call_releases: BTreeMap<usize, [Vec<usize>; 2]>,
-    pub(crate) guarded_call_inputs: BTreeMap<usize, usize>,
+    pub(crate) conditional_inputs: BTreeMap<usize, ClosedConditionalInputs>,
+    pub(crate) deferred_call_inputs: BTreeMap<usize, usize>,
     pub(crate) input: Option<usize>,
     pub(crate) input_mixed: bool,
     // Checked primary call occurrence -> exact destination place occurrence.
@@ -3605,8 +3650,9 @@ fn closed_aggregates<'a>(
     }
     let mut input_plans = BTreeMap::<BodyKey, (usize, Option<(CfgPointId, usize)>, bool)>::new();
     let mut input_calls = BTreeMap::<BodyKey, BTreeMap<usize, (usize, ClosedInput)>>::new();
-    let mut discharged_by_inputs = BTreeSet::<(BodyKey, CfgPointId)>::new();
-    let mut eligible_conditional_inputs = BTreeMap::<(BodyKey, CfgPointId), (usize, CfgPointId)>::new();
+    // A single direct transfer needs no join. Up to two terminal transfers may
+    // defer receipt retirement, but only an exact opposite-arm pair is valid.
+    let mut discharged_by_inputs = BTreeMap::<(BodyKey, CfgPointId), [Option<(usize, CfgPointId)>; 2]>::new();
     let active = |caller, source| {
         let producer = match source {
             Some(InputOrigin::Owner(OwnerSource::Call(producer)) | InputOrigin::Immediate(producer)) => producer,
@@ -3705,11 +3751,17 @@ fn closed_aggregates<'a>(
                 Some(source @ Some(InputOrigin::Owner(_))) if matches!(moved, ArgumentProvenance::WholeMove(_)) => {
                     let producer = active(caller, *source).ok_or_else(|| format!("aggregate owning input has unproved emitted incoming use in {:?} at call {ordinal} slot {slot}", bodies[&caller].source))?;
                     let call = bodies[&caller].facts.and_then(|f| f.calls.get(&producer)).ok_or_else(|| "missing owning input source receipt".to_owned())?;
-                    if !discharged_by_inputs.insert((caller, producer)) {
-                        return Err(format!("aggregate owning input has ambiguous source transfer in {:?} at call {ordinal}", bodies[&caller].source));
-                    }
-                    if release.is_some() && !mixed {
-                        eligible_conditional_inputs.insert((caller, producer), (ordinal, consumer));
+                    let eligible = (release.is_some() && !mixed).then_some((ordinal, consumer));
+                    match discharged_by_inputs.entry((caller, producer)) {
+                        std::collections::btree_map::Entry::Vacant(entry) => {
+                            entry.insert([eligible, None]);
+                        }
+                        std::collections::btree_map::Entry::Occupied(mut entry)
+                            if eligible.is_some() && entry.get()[0].is_some() && entry.get()[1].is_none() =>
+                        {
+                            entry.get_mut()[1] = eligible;
+                        }
+                        _ => return Err(format!("aggregate owning input has ambiguous source transfer in {:?} at call {ordinal}", bodies[&caller].source)),
                     }
                     ClosedInput::Transfer(call.0)
                 }
@@ -3734,7 +3786,7 @@ fn closed_aggregates<'a>(
                         }
                     }
                     let call = facts.calls.get(producer).ok_or_else(|| "missing immediate owning input receipt".to_owned())?;
-                    if !discharged_by_inputs.insert((caller, *producer)) {
+                    if discharged_by_inputs.insert((caller, *producer), [None; 2]).is_some() {
                         return Err(format!("aggregate owning input has ambiguous source transfer in {:?} at call {ordinal}", caller_body.source));
                     }
                     ClosedInput::Transfer(call.0)
@@ -3909,8 +3961,20 @@ fn closed_aggregates<'a>(
                 plan.scope_exits.insert(block, exit);
             }
         }
+        // Index observed endpoints once. Looking up every owner by scanning all
+        // scopes would make a chain of otherwise linear certificates quadratic.
+        let mut call_endpoints = BTreeMap::<_, Vec<_>>::new();
+        if !facts.calls.is_empty() {
+            for (&endpoint, receipts) in &facts.endpoints {
+                for (&owner, witness) in &receipts.possible {
+                    if let OwnerSource::Call(point) = owner {
+                        call_endpoints.entry(point).or_default()
+                            .push((endpoint, receipts.always_retains(owner, witness.as_ref())));
+                    }
+                }
+            }
+        }
         let mut conditional_certificate = None;
-        let mut certified_fork = false;
         for (&point, &call) in &facts.calls {
             if !target_body(&declarations, body.cfg, point)
                 .is_some_and(|target| outgoing.contains(&target))
@@ -3923,39 +3987,49 @@ fn closed_aggregates<'a>(
                 continue;
             }
             let owner = OwnerSource::Call(point);
-            let mut endpoints = facts.owner_endpoints(owner);
-            if discharged_by_inputs.contains(&(key, point)) {
-                if let Some((endpoint @ (exit, block), always)) = endpoints.next() {
+            let mut endpoints = call_endpoints.get(&point).into_iter().flatten().copied();
+            if let Some(&[first, second]) = discharged_by_inputs.get(&(key, point)) {
+                let endpoint = endpoints.next();
+                if endpoint.is_some() || second.is_some() {
                     let ordinary_producer = target_body(&declarations, body.cfg, point)
                         .and_then(|target| bodies.get(&target))
                         .is_some_and(|producer| !producer.has_mixed_struct_result());
-                    let structured = eligible_conditional_inputs.get(&(key, point)).and_then(|&(ordinal, consumer)| {
-                        let region = facts.conditional_input_regions.get(&body.cfg.points[consumer.0].scope.0)?;
-                        let points = &body.cfg.points;
-                        let certificate = conditional_certificate
-                            .get_or_insert_with(|| ConditionalInputCertificate::prefix(points));
-                        if certificate.fork != region.branch {
-                            return None;
-                        }
-                        if !certified_fork {
-                            certificate.arms = certificate.certify_arms(points, region);
-                            certified_fork = true;
-                        }
-                        let side = certificate.consuming_side(points, point, consumer, exit)?;
-                        Some((ordinal, region.expression.0, side))
+                    let points = &body.cfg.points;
+                    let certificate = conditional_certificate.get_or_insert_with(|| {
+                        ConditionalInputCertificate::build(points, &facts.conditional_input_regions)
                     });
-                    let valid = !always && endpoints.next().is_none() && !returning && ordinary_producer
-                        && facts.endpoints.get(&endpoint)
-                            .is_some_and(|endpoint| endpoint.has_conditional_unique_receipt(owner));
-                    let Some((consumer, expression, side)) = structured.filter(|_| valid) else {
-                        return Err(format!("aggregate input transfer does not cover every owning path in {:?}", body.source));
-                    };
-                    if plan.scope_exits.insert(block, exit).is_some_and(|old| old != exit) {
-                        return Err(format!("aggregate release has conflicting scope exits in {:?}", body.source));
+                    let uncovered = || format!(
+                        "aggregate input transfer does not cover every owning path in {:?}", body.source
+                    );
+                    if returning || !ordinary_producer || endpoints.next().is_some() {
+                        return Err(uncovered());
                     }
-                    plan.releases.entry(exit).or_default().push(ClosedOwnerRelease { receipt: call.0, guarded: true });
-                    plan.guarded_call_releases.entry(expression).or_default()[side].push(call.0);
-                    plan.guarded_call_inputs.insert(consumer, call.0);
+                    let (ordinal, consumer) = first.ok_or_else(uncovered)?;
+                    let (expression, side) = certificate.consuming_arm(
+                        points, point, consumer, endpoint.map(|((exit, _), _)| exit)
+                    ).ok_or_else(uncovered)?;
+                    let merge = plan.conditional_inputs.entry(expression.0).or_default();
+                    match (endpoint, second) {
+                        (Some((endpoint @ (exit, block), false)), None)
+                            if facts.endpoints.get(&endpoint)
+                                .is_some_and(|endpoint| endpoint.has_conditional_unique_receipt(owner)) =>
+                        {
+                            if plan.scope_exits.insert(block, exit).is_some_and(|old| old != exit) {
+                                return Err(format!("aggregate release has conflicting scope exits in {:?}", body.source));
+                            }
+                            plan.releases.entry(exit).or_default().push(ClosedOwnerRelease { receipt: call.0, guarded: true });
+                            merge.consumed_on_one_arm[side].push(call.0);
+                        }
+                        (None, Some((other_ordinal, other_consumer)))
+                            if certificate.consuming_arm(points, point, other_consumer, None)
+                                == Some((expression, 1 - side)) =>
+                        {
+                            merge.consumed_on_both_arms.push(call.0);
+                            plan.deferred_call_inputs.insert(other_ordinal, call.0);
+                        }
+                        _ => return Err(uncovered()),
+                    }
+                    plan.deferred_call_inputs.insert(ordinal, call.0);
                 }
                 plan.calls.insert(call.0, ClosedCall::Receive);
                 continue;

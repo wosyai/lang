@@ -2922,7 +2922,7 @@ fn emit_unit_if<'ctx, 'module>(
         .build_unconditional_branch(merge)
         .map_err(builder_error)?;
     state.builder.position_at_end(merge);
-    aggregate_transfer::finish_guarded_receipt(context, state, expression, then_end, bypass)?;
+    aggregate_transfer::finish_conditional_receipts(context, state, expression, then_end, bypass)?;
     aggregate_transfer::finish_literal_array_unit(state, enrolled)?;
     Ok(EmitValue::Unit)
 }
@@ -2960,7 +2960,7 @@ fn emit_project_unit_if<'ctx, 'module>(
         .build_unconditional_branch(merge)
         .map_err(builder_error)?;
     state.builder.position_at_end(merge);
-    aggregate_transfer::finish_guarded_receipt(context, state, expression, then_end, bypass)?;
+    aggregate_transfer::finish_conditional_receipts(context, state, expression, then_end, bypass)?;
     aggregate_transfer::finish_literal_array_unit(state, enrolled)?;
     Ok(EmitValue::Unit)
 }
@@ -3032,7 +3032,7 @@ where
         .map_err(builder_error)?;
     let else_end = state.builder.get_insert_block().expect("else block");
     state.builder.position_at_end(merge);
-    aggregate_transfer::finish_guarded_receipt(context, state, expression, then_end, else_end)?;
+    aggregate_transfer::finish_conditional_receipts(context, state, expression, then_end, else_end)?;
     let enrolled = then_writer || else_writer;
     if enrolled && !matches!((&then_value, &else_value), (EmitValue::Unit, EmitValue::Unit)) {
         return Err("checked array conditional did not have two Unit arms".into());

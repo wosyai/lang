@@ -389,7 +389,7 @@ fn release_literal_array_base<'ctx>(
         super::ownership::RuntimeArrayRelease { pointer: base.into(), live: None })
 }
 
-pub(super) fn finish_guarded_receipt<'ctx>(
+pub(super) fn finish_conditional_receipts<'ctx>(
     context: &'ctx Context,
     state: &mut EmitState<'ctx, '_>,
     expression: &ScalarExpression,
@@ -397,15 +397,15 @@ pub(super) fn finish_guarded_receipt<'ctx>(
     else_end: inkwell::basic_block::BasicBlock<'ctx>,
 ) -> Result<(), String> {
     let Some(aggregate) = &mut state.aggregate else { return Ok(()) };
-    if aggregate.plan.guarded_call_releases.is_empty() {
+    if aggregate.plan.conditional_inputs.is_empty() {
         return Ok(());
     }
     let expression = state.body_call_nodes.and_then(|nodes| nodes.expression_ordinal(expression))
         .ok_or_else(|| "missing conditional aggregate receipt occurrence".to_owned())?;
-    let Some(arms) = aggregate.plan.guarded_call_releases.get(&expression) else { return Ok(()) };
+    let Some(plan) = aggregate.plan.conditional_inputs.get(&expression) else { return Ok(()) };
     let retained = context.bool_type().const_int(1, false);
     let transferred = context.bool_type().const_zero();
-    for (receipts, (moved, keep)) in arms.iter().zip([(then_end, else_end), (else_end, then_end)]) {
+    for (receipts, (moved, keep)) in plan.consumed_on_one_arm.iter().zip([(then_end, else_end), (else_end, then_end)]) {
         if receipts.is_empty() {
             continue;
         }
@@ -419,6 +419,10 @@ pub(super) fn finish_guarded_receipt<'ctx>(
                 return Err("duplicate guarded aggregate receipt".into());
             }
         }
+    }
+    for receipt in &plan.consumed_on_both_arms {
+        aggregate.receipts.remove(receipt)
+            .ok_or_else(|| "missing exhaustive aggregate receipt at conditional merge".to_owned())?;
     }
     Ok(())
 }
@@ -1110,9 +1114,9 @@ fn emit_selected_call<'ctx, 'module>(
         let base = match input {
             CallInput::Body(ClosedInput::Transfer(receipt)) => {
                 let aggregate = state.aggregate.as_mut().expect("closed aggregate input context");
-                if aggregate.plan.guarded_call_inputs.get(&ordinal) == Some(&receipt) {
+                if aggregate.plan.deferred_call_inputs.get(&ordinal) == Some(&receipt) {
                     aggregate.receipts.get(&receipt).copied()
-                        .ok_or_else(|| "missing guarded owner receipt at committed input call".to_owned())?
+                        .ok_or_else(|| "missing deferred owner receipt at committed input call".to_owned())?
                 } else {
                     aggregate.receipts.remove(&receipt)
                         .ok_or_else(|| "missing owner receipt at committed input call".to_owned())?
