@@ -627,7 +627,6 @@ pub(super) fn emit_struct_literal<'ctx, 'module>(
     let crate::ScalarType::Struct(id) = expected else {
         return Err("struct literal requires a resolved struct type".to_owned());
     };
-    let structure = structure(state.structs, id.clone())?;
     let layout = state
         .layouts
         .aggregate(id)
@@ -640,6 +639,18 @@ pub(super) fn emit_struct_literal<'ctx, 'module>(
     );
     let destination = entry_alloca(state, storage.into(), "struct_literal")?;
     align_storage_alloca(destination, Some(layout.alignment))?;
+    emit_struct_literal_into(context, state, id, fields, destination)?;
+    Ok(EmitValue::Basic(destination.into()))
+}
+
+pub(super) fn emit_struct_literal_into<'ctx, 'module>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, 'module>,
+    id: &crate::ScalarStructId,
+    fields: &[crate::ScalarStructLiteralField],
+    destination: PointerValue<'ctx>,
+) -> Result<(), String> {
+    let structure = structure(state.structs, id.clone())?;
     let mut values = BTreeMap::new();
     for field in &structure.fields {
         values.entry(field.name.as_str()).or_insert((&field.ty, None));
@@ -664,7 +675,7 @@ pub(super) fn emit_struct_literal<'ctx, 'module>(
             byte_layout_field_pointer(context, state, destination, offset, field.name.as_str())?;
         store_value(context, state, pointer, &field.ty, value)?;
     }
-    Ok(EmitValue::Basic(destination.into()))
+    Ok(())
 }
 
 pub(super) fn emit_array_literal<'ctx, 'module>(

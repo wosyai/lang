@@ -4478,7 +4478,11 @@ fn emit_block_item<'ctx, 'module>(
     match item {
         ScalarBlockItem::LocalBinding(binding) => {
             if binding.fallible_assignment.is_some() {
-                let value = take_basic(emit_typed_expression(context, state, &binding.value, &binding.declared_type)?)?;
+                let value = if matches!(binding.declared_type, ScalarType::Struct(_)) {
+                    None
+                } else {
+                    Some(take_basic(emit_typed_expression(context, state, &binding.value, &binding.declared_type)?)?)
+                };
                 ownership::bind_guarded_scalar(context, state, binding, value)?;
                 return Ok(EmitValue::Unit);
             }
@@ -4501,9 +4505,13 @@ fn emit_project_block_item<'ctx, 'module>(
     match item {
         ScalarBlockItem::LocalBinding(binding) => {
             if binding.fallible_assignment.is_some() {
-                let value = take_basic(emit_project_typed_expression(
-                    context, state, &binding.value, &binding.declared_type, module, modules,
-                )?)?;
+                let value = if matches!(binding.declared_type, ScalarType::Struct(_)) {
+                    None
+                } else {
+                    Some(take_basic(emit_project_typed_expression(
+                        context, state, &binding.value, &binding.declared_type, module, modules,
+                    )?)?)
+                };
                 ownership::bind_guarded_scalar(context, state, binding, value)?;
                 return Ok(EmitValue::Unit);
             }

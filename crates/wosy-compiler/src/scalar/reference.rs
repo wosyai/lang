@@ -1035,10 +1035,11 @@ impl<'a> ReferenceFlowBuilder<'a> {
         let Some(bindings) = &self.proof_points.fallible_allocation_bindings else {
             return Ok(());
         };
-        let ScalarPlace::Name { span, .. } = place else {
+        let root = self.place_root(place, ordinal);
+        let ScalarPlace::Name { span, .. } = root.place else {
             return Ok(());
         };
-        if let Some(PreparedPlaceRoot::Lexical(binding)) = self.prepared_place_root(ordinal, *span)? {
+        if let Some(PreparedPlaceRoot::Lexical(binding)) = self.prepared_place_root(root.ordinal, *span)? {
             if bindings.contains_key(binding) {
                 return Err(self.missing_origin(
                     source, binding.clone(), ReferenceAnalysisErrorReason::UnsupportedFallibleAllocationAccess,
@@ -6586,15 +6587,23 @@ fn require_available_fallible_read(
     state: &ReferenceEdgeState,
     binding: &ReferenceBindingId,
     point: &ReferenceFlowPoint,
+    whole: bool,
     errors: &mut Vec<ReferenceAnalysisError>,
 ) {
-    if state.uninitialized.contains(binding) && bindings.contains_key(binding) {
-        errors.push(ReferenceAnalysisError::MissingOrigin {
-            source_span: point.source_span.clone(),
-            binding_id: binding.clone(),
-            reason: ReferenceAnalysisErrorReason::UnavailableFallibleAllocation,
-        });
-    }
+    let unavailable = state.uninitialized.contains(binding);
+    let Some((_, ty)) = (whole || unavailable).then(|| bindings.get(binding)).flatten() else { return };
+    let reason = if whole && matches!(ty, ScalarType::Struct(_)) {
+        ReferenceAnalysisErrorReason::UnsupportedFallibleWholeAggregateRead
+    } else if unavailable {
+        ReferenceAnalysisErrorReason::UnavailableFallibleAllocation
+    } else {
+        return;
+    };
+    errors.push(ReferenceAnalysisError::MissingOrigin {
+        source_span: point.source_span.clone(),
+        binding_id: binding.clone(),
+        reason,
+    });
 }
 
 fn transfer_reference_facts(
@@ -7748,7 +7757,7 @@ fn transfer_reference_facts(
                     if matches!(&point.kind, CfgPointKind::ReadPlace { pointer_point: None, .. })
                         && is_lexical_field_path(&place.projections)
                     {
-                        require_available_fallible_read(bindings, &state, &place.binding, point, &mut errors);
+                        require_available_fallible_read(bindings, &state, &place.binding, point, false, &mut errors);
                     }
                 }
                 let normalized = available_place_for_check(place);
@@ -7985,7 +7994,7 @@ fn transfer_reference_facts(
                 }
                 CfgPointKind::Read { binding } => {
                     if let Some(bindings) = cfg.fallible_allocation_bindings {
-                        require_available_fallible_read(bindings, &state, binding, point, &mut errors);
+                        require_available_fallible_read(bindings, &state, binding, point, true, &mut errors);
                     }
                     let origins = unavailable_checked_handles(&state, binding, &[], CheckedHandleStorage::Lexical);
                     if !origins.is_empty() {
@@ -12916,7 +12925,8 @@ fn build_function_reference_cfg(
             errors.extend(provisional.iter().filter(|error| matches!(error,
                 ReferenceAnalysisError::MissingOrigin {
                     reason: ReferenceAnalysisErrorReason::UnavailableFallibleAllocation
-                        | ReferenceAnalysisErrorReason::UnsupportedFallibleAllocationAccess, ..
+                        | ReferenceAnalysisErrorReason::UnsupportedFallibleAllocationAccess
+                        | ReferenceAnalysisErrorReason::UnsupportedFallibleWholeAggregateRead, ..
                 }
             )).cloned());
         }

@@ -1082,7 +1082,7 @@ pub(super) fn bind_guarded_scalar<'ctx>(
     context: &'ctx Context,
     state: &mut EmitState<'ctx, '_>,
     binding: &crate::ScalarBinding,
-    value: BasicValueEnum<'ctx>,
+    value: Option<BasicValueEnum<'ctx>>,
 ) -> Result<(), String> {
     let [receiver] = binding.receivers.as_slice() else {
         return Err("fallible scalar allocation requires a single receiver".into());
@@ -1092,16 +1092,15 @@ pub(super) fn bind_guarded_scalar<'ctx>(
         .ok_or_else(|| format!(
             "fallible scalar allocation has no prepared ownership for {} at {:?}", receiver.name, receiver.name_span,
         ))?;
-    let value_width = match value {
-        BasicValueEnum::IntValue(value) => value.get_type().get_bit_width(),
-        _ => return Err("guarded scalar initializer is not an integer".into()),
-    };
-    if receiver.ty != site.ty
-        || memory::integer_width(&receiver.ty) != Some(value_width)
-        || state.guarded_scalar_owner.is_some()
-    {
+    if receiver.ty != site.ty || state.guarded_scalar_owner.is_some() {
         return Err("invalid guarded scalar allocation binding".into());
     }
+    let aggregate = match (&receiver.ty, &binding.value, value) {
+        (ScalarType::Struct(id), ScalarExpression::StructLiteral { fields, .. }, None) => Some((id, fields)),
+        (ty, _, Some(BasicValueEnum::IntValue(value)))
+            if memory::integer_width(ty) == Some(value.get_type().get_bit_width()) => None,
+        _ => return Err("invalid guarded allocation initializer".into()),
+    };
     declare_core_runtime(context, state.module);
     let (size, align) = allocation_layout(&receiver.ty, state.layouts, state.target_layout)?;
     let parent = state.builder.get_insert_block().and_then(|block| block.get_parent())
@@ -1115,7 +1114,11 @@ pub(super) fn bind_guarded_scalar<'ctx>(
     let present = state.builder.build_is_not_null(backing, "fallible.present").map_err(builder_error)?;
     state.builder.build_conditional_branch(present, initialized, continuation).map_err(builder_error)?;
     state.builder.position_at_end(initialized);
-    state.builder.build_store(backing, value).map_err(builder_error)?;
+    if let Some((id, fields)) = aggregate {
+        memory::emit_struct_literal_into(context, state, id, fields, backing)?;
+    } else {
+        state.builder.build_store(backing, value.expect("checked integer initializer")).map_err(builder_error)?;
+    }
     state.builder.build_unconditional_branch(continuation).map_err(builder_error)?;
     state.builder.position_at_end(continuation);
     state.storage.insert(receiver.name.clone(), (backing, receiver.ty.clone()));

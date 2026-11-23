@@ -9814,3 +9814,62 @@ i32() nested = fn {
         assert!(diagnostic.message.contains("fallible allocation requires one proven null guard for its local binding"), "{diagnostic:?}");
     }
 }
+
+#[test]
+fn guarded_fallible_struct_initializes_the_exact_backing_fields() {
+    let source = SourceIdentity::new("project".into(), "package".into(), "src/main.w".into(), "r1".into());
+    let text = r#"%%start
+struct Record { u8 tag; i32 amount; }
+i32() observed = fn {
+	Record held =? { .tag = 241; .amount = 30001; };
+	if (&held == null) { 7 } else { core.int_extend<i32>(held.tag) + held.amount }
+};
+if (observed() != 30242) { core.system_panic(); };
+%%end"#;
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let parsed = parse_source(source.clone(), text.into(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let single = crate::derive_scalar_program_with_layout(&parsed.result, layout);
+        assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+        let project = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::from_program(single.program.clone(), Vec::new())],
+            vec![source.clone()],
+        ));
+        assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+        for (project_route, ir) in [
+            (false, emit_scalar_llvm(&single).unwrap().to_text()),
+            (true, emit_scalar_project_llvm(&project).unwrap().to_text()),
+        ] {
+            let symbol = self_tail_test_symbol(&source, project_route, "observed");
+            let body = self_tail_test_body(&ir, "i32", &symbol);
+            assert_eq!(body.matches("call ptr @__wosy_core_alloc(i64 8, i64 4)").count(), 1, "{body}");
+            assert_eq!(body.matches("call void @__wosy_core_free(ptr %allocation)").count(), 1, "{body}");
+            assert!(!body.contains("struct_literal") && !body.contains("memmove") && !body.contains("memcpy"), "{body}");
+            let (_, initialize) = body.split_once("\nfallible.initialize:").expect("initialize block");
+            let (initialize, _) = initialize.split_once("\nfallible.continue:").expect("initialize continuation");
+            assert!(initialize.contains("store i8 -15") && initialize.contains("store i32 30001"), "{body}");
+            assert!(initialize.contains("getelementptr inbounds i8, ptr %allocation, i8 0")
+                && initialize.contains("getelementptr inbounds i8, ptr %allocation, i8 4"), "{body}");
+            if let Some(output_dir) = std::env::var_os("WOSY_FALLIBLE_TEST_IR_DIR") {
+                let target = if layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
+                let path = format!("{target}-{}-struct.ll", if project_route { "project" } else { "standalone" });
+                std::fs::write(std::path::PathBuf::from(output_dir).join(path), &ir).unwrap();
+            }
+        }
+        for (replacement, diagnostic) in [
+            ("held.amount", "fallible allocation is not known to be available"),
+            ("if (&held == null) { 7 } else { Record copied = held; copied.amount }", "fallible struct allocation currently supports only direct field reads"),
+            ("if (&held == null) { 7 } else { *i32 alias = &held.amount; *alias }", "fallible allocation does not support aliasing or reassignment"),
+            ("if (&held == null) { 7 } else { held.amount = 1; held.amount }", "fallible allocation does not support aliasing or reassignment"),
+        ] {
+            let rejected = text.replace(
+                "if (&held == null) { 7 } else { core.int_extend<i32>(held.tag) + held.amount }",
+                replacement,
+            );
+            let parsed = parse_source(source.clone(), rejected, &[]);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let rejected = crate::derive_scalar_program_with_layout(&parsed.result, layout);
+            assert!(rejected.diagnostics.iter().any(|item| item.message == diagnostic), "{:?}", rejected.diagnostics);
+        }
+    }
+}
