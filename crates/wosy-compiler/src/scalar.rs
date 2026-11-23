@@ -731,7 +731,7 @@ impl ReferenceAnalysisErrorReason {
             Self::UnavailableFallibleAllocation => "fallible allocation is not known to be available",
             Self::UnsupportedFallibleAllocationAccess => "fallible allocation does not support aliasing or reassignment",
             Self::UnsupportedFallibleWholeAggregateRead => "fallible struct allocation currently supports only direct field reads",
-            Self::NonLexicalFallibleStructInitializer => "fallible struct initializer requires an integer literal or a lexical integer binding",
+            Self::NonLexicalFallibleStructInitializer => "fallible struct initializer requires a literal or a lexical binding of the field type",
             Self::MissingGuardedAllocationProof => "fallible allocation requires one proven null guard for its local binding",
             Self::MissingRequiredDereferenceOrigin => "missing required dereference origin",
             Self::MoveFromArrayElement => "array elements cannot be moved individually",

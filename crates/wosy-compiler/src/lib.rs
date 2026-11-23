@@ -142,7 +142,7 @@ mod tests {
             panic!("{:?}", scalar.diagnostics);
         };
         assert_eq!(diagnostic.code, "B0003");
-        assert_eq!(diagnostic.message, "fallible allocation requires a local integer initialized by a literal or a same-type integer binding, or a local integer-field struct initialized by integer literals or same-type lexical integer bindings");
+        assert_eq!(diagnostic.message, "fallible allocation requires a local integer initialized by a literal or a same-type integer binding, or a local struct of integer or bool fields initialized by literals or same-type lexical bindings");
         let range = diagnostic.labels[0].span.range;
         assert_eq!(&text[range.start as usize..range.end as usize], "=?");
         assert!(emit_scalar_llvm(&scalar).is_err());
@@ -209,7 +209,7 @@ mod tests {
         );
         for (parameter, rhs, expected) in [
             ("i64", "input", "expression type does not match expected type"),
-            ("i32", "produce(input)", "fallible allocation requires a local integer initialized by a literal or a same-type integer binding, or a local integer-field struct initialized by integer literals or same-type lexical integer bindings"),
+            ("i32", "produce(input)", "fallible allocation requires a local integer initialized by a literal or a same-type integer binding, or a local struct of integer or bool fields initialized by literals or same-type lexical bindings"),
         ] {
             let text = format!("%%start\ni32(i32) produce = fn(item) {{ item }};\ni32({parameter}) example = fn(input) {{\n\ti32 result =? {rhs};\n\tif (&result == null) {{ 3 }} else {{ result }}\n}};\n%%end");
             let parsed = parse_source(source.clone(), text, &[]);
