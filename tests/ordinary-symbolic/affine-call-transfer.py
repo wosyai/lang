@@ -190,6 +190,78 @@ cases.append(("previously-unsupported-lexical-exact-assertion", make(f"""
     core.require(fixed == 2, {report(30,"EXACT")});
     if (value == 1) {{ core.require(input == 3, {report(32,"CORRELATION")}); }};
 """, "i8(i8) echo = fn(n) { n };"), 30, b"EXACT"))
+direct_alias_pair = dependent_integer.replace("echo(value)", "value").replace(
+    "    i8(i8) echo = fn(n) { n };\n", "")
+standalone_copy = f"""%%start
+    unit(i8) snapshot = fn(entry) {{
+        i8 first = entry;
+        i8 second = first;
+        if (entry == 3) {{
+            i8 scoped = second;
+            core.require(scoped == 3, {report(55,"SCOPED")});
+        }} else {{
+            i8 scoped = first;
+            core.require(scoped != 3, {report(55,"SCOPED")});
+        }};
+        if (second == 1) {{ core.require(entry == 1, {report(56,"STANDALONE")}); }};
+    }};
+    %%end"""
+standalone_return = f"""%%start
+    i8(i8) snapshot = fn(entry) {{
+        i8 copy = entry;
+        if (entry == 3) {{ core.require(copy == 3, {report(57,"RETURN-COPY")}); }};
+        copy
+    }};
+    %%end"""
+# The copy-free wrapper is itself unused. Mark the helper reached by one
+# passing startup call, so its failing symbolic context can only come through
+# the wrapper rather than through an independently selected symbolic root.
+unary_wrapper_copy = f"""%%start
+    unit(i8) helper = fn(input) {{
+        i8 copy = input;
+        if (input == 1) {{ core.require(copy == 1, {report(63,"WRAPPER")}); }};
+    }};
+    unit(i8) bridge = fn(input) {{ helper(input); }};
+    unit(i8) wrapper = fn(input) {{ bridge(input); }};
+    bridge(0);
+    %%end"""
+snapshot_write = f"""%%start
+    unit(i8) snapshot = fn(entry) {{
+        i8 first = entry;
+        i8 saved = first;
+        first = 7;
+        core.require(first == 7, {report(58,"NEW")});
+        if (entry == 1) {{ core.require(saved == 1, {report(59,"OLD")}); }};
+    }};
+    %%end"""
+startup_copy = f"""%%start
+    i8(i8) relay = fn(input) {{ i8 copy = input; copy }};
+    unit(i8) snapshot = fn(entry) {{
+        i8 copied = entry;
+        i8 result = relay(copied);
+        core.require(result == 3, {report(60,"STARTUP")});
+    }};
+    snapshot(2);
+    %%end"""
+affine_write = make(f"""
+    i8 saved = value;
+    value = 7;
+    core.require(saved == 7, {report(61,"AFFINE-WRITE")});
+    core.require(value == 7, {report(62,"CURRENT")});
+""")
+for name,program,correct,incorrect,code,label in [
+    ("direct-lexical-affine-pair",direct_alias_pair,"input == 3,","input == 2,",45,b"REVERSED"),
+    ("standalone-unit-lexical-copies",standalone_copy,"entry == 1,","entry == 2,",56,b"STANDALONE"),
+    ("standalone-integer-lexical-copy",standalone_return,"copy == 3","copy == 1",57,b"RETURN-COPY"),
+    ("copy-free-transitive-unary-wrapper",unary_wrapper_copy,"copy == 1","copy == 2",63,b"WRAPPER"),
+    ("lexical-copy-snapshot-on-local-rebind",snapshot_write,"saved == 1","saved == 7",59,b"OLD"),
+]:
+    cases.extend([(name,program,0,b""),(name+"-witness",program.replace(correct,incorrect),code,label)])
+cases.extend([
+    ("exact-startup-lexical-copy",startup_copy,60,b"STARTUP"),
+    ("affine-member-rebind-stays-unsupported",affine_write,2,b"unsupported analysis"),
+    ("computed-local-not-lexical-copy",standalone_return.replace("copy = entry;", "copy = entry + 1;"),2,b"unsupported analysis"),
+])
 with tempfile.TemporaryDirectory(prefix="affine-calls-") as path:
     root=Path(path)
     (root/"src").mkdir()
@@ -197,8 +269,9 @@ with tempfile.TemporaryDirectory(prefix="affine-calls-") as path:
         (root/"wosy.toml").write_text(manifest.format(output=target))
         for scope in ("--main-flow-only","--declared-package"):
             for name,text,expected,stderr in cases:
-                code = expected if scope == "--declared-package" else 0
-                expected_stderr = stderr if scope == "--declared-package" else b""
+                included = scope == "--declared-package" or name == "exact-startup-lexical-copy"
+                code = expected if included else 0
+                expected_stderr = stderr if included else b""
                 (root/"src/main.w").write_text(text.strip()+"\n")
                 res=subprocess.run([cli,"check",scope],cwd=root,capture_output=True,timeout=20)
                 print(target,scope,name,res.returncode,res.stdout,res.stderr,flush=True)

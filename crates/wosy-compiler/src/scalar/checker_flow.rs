@@ -137,6 +137,8 @@ struct RootBranchSlot {
 
 trait ScopedAuthoredReturn<'a>: Copy {
     const ENABLED: bool;
+    #[cfg(feature = "internal-checker")]
+    const ALLOW_LEXICAL_COPIES: bool = false;
     fn at(
         self, calls: &FunctionCallSites, block: BlockOrdinal, slot: FinalOutputSlot, ty: &ScalarType,
         roots: &IntegerRoots<'_>, path: &IntegerInputs,
@@ -182,11 +184,14 @@ impl<'a> ScopedAuthoredReturn<'a> for () {
 
 #[cfg(feature = "internal-checker")]
 #[derive(Clone, Copy)]
-struct OrderedRootConditions<'a, const EXACT_COMPOUND: bool = false>(&'a super::ScalarBlock);
+struct OrderedRootConditions<'a, const EXACT_COMPOUND: bool = false, const LEXICAL_COPIES: bool = false>(&'a super::ScalarBlock);
 
 #[cfg(feature = "internal-checker")]
-impl<'a, const EXACT_COMPOUND: bool> ScopedAuthoredReturn<'a> for OrderedRootConditions<'a, EXACT_COMPOUND> {
+impl<'a, const EXACT_COMPOUND: bool, const LEXICAL_COPIES: bool> ScopedAuthoredReturn<'a>
+    for OrderedRootConditions<'a, EXACT_COMPOUND, LEXICAL_COPIES>
+{
     const ENABLED: bool = false;
+    const ALLOW_LEXICAL_COPIES: bool = LEXICAL_COPIES;
 
     fn at(
         self, _: &FunctionCallSites, _: BlockOrdinal, _: FinalOutputSlot, _: &ScalarType,
@@ -1311,6 +1316,10 @@ struct IntegerRoots<'a> {
     projected_entry_axis: Option<usize>,
     unit_pair_work: Option<usize>,
     affine_work: Option<usize>,
+    #[cfg(feature = "internal-checker")]
+    allow_lexical_copies: bool,
+    #[cfg(feature = "internal-checker")]
+    lexical_copy_work: Option<usize>,
     reached_obligation: bool,
     proof_reflexive_branches: bool,
 }
@@ -1338,6 +1347,21 @@ impl<'a> IntegerRoots<'a> {
 pub(super) struct IntegerInputs(Vec<IntegerRow>);
 
 impl IntegerInputs {
+    // Only visited from actual copy/relational transfer sites, never from the
+    // generic drive loop. Affine rows are already metered by that lane.
+    #[cfg(feature = "internal-checker")]
+    fn charge_copy_alias_work(&self, work: &mut Option<usize>, passes: usize) -> Option<()> {
+        if let Some(work) = work {
+            for row in &self.0 {
+                charge_call_work(work, 1)?;
+                if row.affine.is_none() && row.equal_axes.is_some() {
+                    charge_call_work(work, row.equal_axes().len().checked_mul(passes)?)?;
+                }
+            }
+        }
+        Some(())
+    }
+
     #[cfg(any(test, feature = "internal-checker"))]
     fn from_cells(rows: Vec<Vec<Rc<IntegerSet>>>) -> Self {
         Self(rows.into_iter().map(IntegerRow::new).collect())
@@ -2539,13 +2563,19 @@ pub(super) fn collect_integer_requirement_failures_with_calls<'a>(
 
 #[cfg(feature = "internal-checker")]
 pub(super) fn collect_ordered_root_requirement_failures<'a>(
-    calls: &'a FunctionCallSites, body: &'a super::ScalarBlock,
+    calls: &'a FunctionCallSites, body: &'a super::ScalarBlock, allow_lexical_copies: bool,
 ) -> Option<(bool, Vec<IntegerCheckFailure<'a>>)> {
     let mut failures = Vec::new();
     let mut sink = |failure| failures.push(failure);
-    let (active, _) = collect_integer_requirement_failures_in_scope(
-        calls, IntegerRequirementEntry::Arbitrary, None, false, false, &mut sink, OrderedRootConditions::<true>(body),
-    )?;
+    let (active, _) = if allow_lexical_copies && !calls.structure.checker_integer_copy_locals.is_empty() {
+        collect_integer_requirement_failures_in_scope(
+            calls, IntegerRequirementEntry::Arbitrary, None, false, false, &mut sink, OrderedRootConditions::<true, true>(body),
+        )
+    } else {
+        collect_integer_requirement_failures_in_scope(
+            calls, IntegerRequirementEntry::Arbitrary, None, false, false, &mut sink, OrderedRootConditions::<true>(body),
+        )
+    }?;
     Some((active, failures))
 }
 
@@ -3505,6 +3535,8 @@ fn run_integer_callable<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool,
     let mut roots = IntegerRoots {
         parameters: boundary.parameters.len(),
         proof_reflexive_branches,
+        #[cfg(feature = "internal-checker")]
+        allow_lexical_copies: Authored::ALLOW_LEXICAL_COPIES,
         ..IntegerRoots::default()
     };
     for (binding, parameter) in checker_parameters.iter().zip(&boundary.parameters) {
@@ -3720,8 +3752,18 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                     path = alternate_path;
                     continue;
                 }
+                #[cfg(feature = "internal-checker")]
+                if !path.is_unreachable() && !alternate_path.is_unreachable() {
+                    path.charge_copy_alias_work(&mut roots.lexical_copy_work, 2)?;
+                    alternate_path.charge_copy_alias_work(&mut roots.lexical_copy_work, 2)?;
+                }
                 path = path.join_equal(alternate_path, frame.axis);
             } else if let Some(first) = frame.first {
+                #[cfg(feature = "internal-checker")]
+                if !path.is_unreachable() && !first.is_unreachable() {
+                    path.charge_copy_alias_work(&mut roots.lexical_copy_work, 2)?;
+                    first.charge_copy_alias_work(&mut roots.lexical_copy_work, 2)?;
+                }
                 path = first.join_equal(path, frame.axis);
             }
             block = frame.block;
@@ -3736,6 +3778,10 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                 if let Some(directive) = structure.checker_directives.get(&expression) {
                     let predicate = directive.predicate.as_ref()?;
                     roots.reached_obligation = true;
+                    #[cfg(feature = "internal-checker")]
+                    if matches!(predicate, CheckerPredicate::Integer(_) | CheckerPredicate::DirectiveDisjunction { .. }) {
+                        path.charge_copy_alias_work(&mut roots.lexical_copy_work, 2)?;
+                    }
                     if let (true, CheckerPredicate::DirectiveDisjunction { binding, ty, atoms }) = (COLLECT, predicate) {
                         let (axis, actual_type) = roots.lookup(binding)?;
                         if ty != actual_type {
@@ -3812,6 +3858,10 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                             (condition, *then_block, Some(*else_block)),
                         _ => return None,
                     };
+                    #[cfg(feature = "internal-checker")]
+                    if !matches!(structure.checker_branches.get(condition), Some(CheckerPredicate::Boolean(_))) {
+                        path.charge_copy_alias_work(&mut roots.lexical_copy_work, 4)?;
+                    }
                     let (yes, no, axis) = if let Some(predicate) = structure.checker_branches.get(condition) {
                         path.split(roots, predicate)?
                     } else {
@@ -3853,6 +3903,10 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                     calls.conditionals.get(&slot.expression)
                 {
                     let expected = tail?;
+                    #[cfg(feature = "internal-checker")]
+                    if !matches!(structure.checker_branches.get(condition), Some(CheckerPredicate::Boolean(_))) {
+                        path.charge_copy_alias_work(&mut roots.lexical_copy_work, 4)?;
+                    }
                     let (yes, no, _) = if let Some(predicate) = structure.checker_branches.get(condition) {
                         path.split(roots, predicate)?
                     } else {
@@ -4002,6 +4056,8 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                 if axis < roots.parameters && !preserve_entry && path.axis_has_alias(axis) {
                     return None;
                 }
+                #[cfg(feature = "internal-checker")]
+                path.charge_copy_alias_work(&mut roots.lexical_copy_work, 2)?;
                 path = path.overwrite(axis, value, preserve_entry);
             }
             BlockItemKind::Binding(ref binding) => {
@@ -4138,6 +4194,37 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                             .filter(|prepared| *prepared == identity)?;
                         roots.add(identity, &receiver.ty);
                         path.append_shared_local(&value);
+                        continue;
+                    }
+                }
+                #[cfg(feature = "internal-checker")]
+                if roots.allow_lexical_copies {
+                    if let Some(origin) = structure.checker_integer_copy_locals.get(&(block, item.position)) {
+                        let [receiver] = binding.receivers() else { return None; };
+                        let BindingInitialization::Outputs(outputs) = &binding.initialization else { return None; };
+                        if origin.source != outputs.primary || !outputs.secondary.is_empty()
+                            || receiver.contextual_storage.is_some()
+                            || structure.checked_types.expressions.get(&origin.source)? != &receiver.ty
+                        {
+                            return None;
+                        }
+                        let PlainNameIdentity::Lexical(source) = calls.prepared_plain_name(origin.source)? else { return None; };
+                        let (axis, ty) = roots.lookup(source)?;
+                        if ty != &receiver.ty { return None; }
+                        // Read the old binding before installing the new one. Every
+                        // row holds its own domain and class/equality relationship.
+                        for row in &path.0 {
+                            let work = if row.affine.is_some() {
+                                roots.affine_work.as_mut()?
+                            } else {
+                                roots.lexical_copy_work.get_or_insert(0)
+                            };
+                            charge_call_work(work, row.equal_axes().len().checked_add(2)?)?;
+                        }
+                        for row in &mut path.0 {
+                            row.append_alias(axis, Rc::clone(&row[axis]));
+                        }
+                        roots.add(&origin.binding, ty);
                         continue;
                     }
                 }
@@ -4401,6 +4488,8 @@ impl<'a> ExactCallCursor<'a> {
                         }
                     }
                 }
+                #[cfg(feature = "internal-checker")]
+                self.block.path.charge_copy_alias_work(&mut self.roots.lexical_copy_work, 1)?;
                 self.block.path.restrict_axis(axis, &survivors);
             }
             (ExactCallEffect::Unit(_), ActualCallResult::ProjectedUnitPair(projected)) => {
@@ -4553,8 +4642,13 @@ impl<'a> ExactCallCursor<'a> {
         allow_contextual_local_transfers: bool,
         suspend_integer: bool,
         allow_ordinary_computed_returns: bool,
+        allow_lexical_copies: bool,
         sink: &mut dyn FnMut(IntegerCheckFailure<'a>),
     ) -> Option<ExactCallProgress<'a>> {
+        #[cfg(feature = "internal-checker")]
+        { self.roots.allow_lexical_copies = allow_lexical_copies && !calls.structure.checker_integer_copy_locals.is_empty(); }
+        #[cfg(not(feature = "internal-checker"))]
+        let _ = allow_lexical_copies;
         let mut failures = IntegerFailureCollection {
             continuation: IntegerRequirementContinuation::Empty,
             projected: None, allow_projected_calls: false, allow_contextual_local_transfers, sink,

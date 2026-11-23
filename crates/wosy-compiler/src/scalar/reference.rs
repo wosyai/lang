@@ -6131,6 +6131,13 @@ pub(super) enum CheckerIntegerCallArgument {
     ContextualValue,
 }
 
+#[cfg(feature = "internal-checker")]
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct CheckerIntegerCopyOrigin {
+    pub(super) binding: ReferenceBindingId,
+    pub(super) source: OccurrenceOrdinal,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct OccurrenceStructure {
     pub(super) root: BlockOrdinal,
@@ -6155,6 +6162,8 @@ pub(super) struct OccurrenceStructure {
     pub(super) checker_direct_targets: HashMap<OccurrenceOrdinal, (usize, usize)>,
     #[cfg(any(test, feature = "internal-checker"))]
     pub(super) checker_integer_locals: HashMap<(BlockOrdinal, usize), ReferenceBindingId>,
+    #[cfg(feature = "internal-checker")]
+    pub(super) checker_integer_copy_locals: HashMap<(BlockOrdinal, usize), CheckerIntegerCopyOrigin>,
     #[cfg(any(test, feature = "internal-checker"))]
     pub(super) checker_contextual_read_locals: HashMap<(BlockOrdinal, usize), ReferenceBindingId>,
     #[cfg(any(test, feature = "internal-checker"))]
@@ -6196,6 +6205,8 @@ impl OccurrenceStructure {
             checker_direct_targets: HashMap::new(),
             #[cfg(any(test, feature = "internal-checker"))]
             checker_integer_locals: HashMap::new(),
+            #[cfg(feature = "internal-checker")]
+            checker_integer_copy_locals: HashMap::new(),
             #[cfg(any(test, feature = "internal-checker"))]
             checker_contextual_read_locals: HashMap::new(),
             #[cfg(any(test, feature = "internal-checker"))]
@@ -8347,6 +8358,18 @@ impl StructuralWalker<'_, '_> {
             }
             _ => None,
         };
+        #[cfg(feature = "internal-checker")]
+        let checker_copy = match (&initialization, &self.mode, &self.plain_names, binding.receivers.as_slice()) {
+            (BindingInitialization::Outputs(outputs), WalkMode::Callable(callable), PlainNameFacts::Prepared(names), [receiver])
+                if self.occurrence_typing.checker_directives_enabled() && outputs.secondary.is_empty()
+                    && receiver.contextual_storage.is_none() && is_integer_type(&receiver.ty)
+                    && self.structure.checked_types.expressions.get(&outputs.primary) == Some(&receiver.ty)
+                    && matches!(names.get(&outputs.primary), Some(PlainNameIdentity::Lexical(_))) =>
+            {
+                Some((outputs.primary, callable.target_resolver))
+            }
+            _ => None,
+        };
         if matches!(
             self.mode,
             WalkMode::Callable(_)
@@ -8389,6 +8412,12 @@ impl StructuralWalker<'_, '_> {
                     } else {
                         self.structure.checker_integer_locals.insert(key, binding);
                     }
+                }
+                #[cfg(feature = "internal-checker")]
+                if let Some((source, callable)) = checker_copy {
+                    let binding = lexical.reference_id(callable.source, callable.function_span);
+                    self.structure.checker_integer_copy_locals.insert((position.block, position.item),
+                        CheckerIntegerCopyOrigin { binding, source });
                 }
                 scope.names.insert(receiver.name.clone(), lexical);
             }
