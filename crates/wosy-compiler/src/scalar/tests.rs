@@ -4940,6 +4940,33 @@ fn projected_holder_drops_only_slots_whose_local_referent_leaves_scope() {
 }
 
 #[test]
+fn checked_alias_loaded_while_projected_owner_is_live_cannot_outlive_owner() {
+    for (referent, expired) in [("inner", true), ("outer", false)] {
+        let text = format!(
+            "%%start\nunit(bool) update = fn(take) {{ u8 outer = 1; *u8 observed = &outer; if (take) {{ u8 inner = 2; inner; (*u8)[2] refs = [null, null]; refs[0] = &{referent}; *u8 loaded = refs[0]; observed = loaded; }}; observed; }};\n%%end"
+        );
+        let final_read = text.rfind("observed").unwrap() as u32;
+        let inner_read = text.find("loaded;").unwrap() as u32;
+        let creation = text.find("&inner");
+        let (single, project) = both_reference_functions(&text);
+        for diagnostics in [&single.diagnostics, &project.diagnostics] {
+            if expired {
+                assert!(diagnostics.iter().any(|diagnostic| diagnostic.code == "B0003"
+                    && diagnostic.labels.first().is_some_and(|label| label.span.range.start == final_read)
+                    && diagnostic.labels.iter().skip(1).any(|label|
+                        label.span.range.start == creation.unwrap() as u32)),
+                    "{text}: {diagnostics:?}");
+                assert!(!diagnostics.iter().any(|diagnostic| diagnostic.labels.first()
+                    .is_some_and(|label| label.span.range.start == inner_read)),
+                    "{text}: {diagnostics:?}");
+            } else {
+                assert!(diagnostics.is_empty(), "{text}: {diagnostics:?}");
+            }
+        }
+    }
+}
+
+#[test]
 fn indexed_checked_holder_relays_one_unchanged_formal_selector() {
     let text = "%%start\nunit(u64, *u8, *u8, *u8) update = fn(index, first, second, third) { (*u8)[2] refs = [null, null]; refs[0] = first; refs[1] = second; refs[index] = third; *u8 selected = refs[index]; *u8 sibling = refs[1]; refs[0] = first; *u8 possible = refs[index]; selected; sibling; possible; };\n%%end";
     let (single, project) = both_reference_functions(text);

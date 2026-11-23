@@ -5199,11 +5199,27 @@ impl ReferenceProjectedState {
         live: impl Fn(&ReferenceBindingId) -> bool,
     ) -> bool {
         live(&self.place.binding) && !self.origins.iter().any(|origin| {
-            matches!(&facts[origin.0], ReferenceOrigin::Fresh { loan, .. }
-                if loan.origin_place.binding.kind == ReferenceBindingKind::Declared
-                    && !live(&loan.origin_place.binding))
+            declared_local_loan(&facts[origin.0])
+                .is_some_and(|loan| !live(&loan.origin_place.binding))
         })
     }
+}
+
+fn declared_local_loan(origin: &ReferenceOrigin) -> Option<&ReferenceLoanId> {
+    match origin {
+        ReferenceOrigin::Fresh { loan, .. }
+            if loan.origin_place.binding.kind == ReferenceBindingKind::Declared => Some(loan),
+        _ => None,
+    }
+}
+
+fn expired_local_loan_at(origin: &ReferenceOrigin, use_site: &SourceSpan) -> Option<SourceSpan> {
+    let loan = declared_local_loan(origin)?;
+    let owner = &loan.origin_place.binding;
+    (owner.source == use_site.source
+        && (use_site.range.start < owner.block_span.start
+            || use_site.range.end > owner.block_span.end))
+        .then(|| SourceSpan::new(owner.source.clone(), loan.creation_span))
 }
 
 fn reference_places_same(left: &ReferencePlaceId, right: &ReferencePlaceId) -> bool {
@@ -8649,7 +8665,19 @@ fn transfer_reference_facts(
                         match state.bindings.get(binding).filter(|origins| {
                             !origins.is_empty() && !state.uninitialized.contains(binding)
                         }) {
-                            Some(origins) => Some(origins.clone()),
+                            Some(origins) => {
+                                if let Some(expired) = origins.iter().find_map(|origin|
+                                    expired_local_loan_at(&cfg.facts[origin.0], &point.source_span))
+                                {
+                                    errors.push(ReferenceAnalysisError::ConflictingPlace {
+                                        source_span: point.source_span.clone(),
+                                        origins: vec![expired],
+                                    });
+                                    None
+                                } else {
+                                    Some(origins.clone())
+                                }
+                            }
                             None => {
                                 errors.push(ReferenceAnalysisError::MissingOrigin {
                                     source_span: point.source_span.clone(),
