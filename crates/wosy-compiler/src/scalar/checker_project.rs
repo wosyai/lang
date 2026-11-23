@@ -428,7 +428,7 @@ impl ActualIntegerObserver for ProofFreeOrderedEvidence {
     const PROOF_FREE_CONTEXTUAL_LOCAL_TRANSFERS: bool = true;
     const EXACT_SELF_UNIT_REENTRY: bool = true;
     const EXACT_INTEGER_CALL_CONTINUATIONS: bool = true;
-    const ORDINARY_LEXICAL_COPIES: bool = true;
+    const ORDINARY_INTEGER_LOCALS: bool = true;
 
     fn observe(&mut self, _: (usize, usize), _: &[&BigInt], _: &BigInt) {}
 }
@@ -562,18 +562,18 @@ fn check_package_symbolic_roots<const COLLECT: bool, const ENTRY_EVIDENCE: bool,
     let (project, calls) = prepared.parts();
     let dormant = &project.modules[startup_count..];
     let CheckedInitialization { visits, reached, ordinals, mut had_obligations } = initialization;
-    let mut copy_callers = HashSet::new();
+    let mut ordinary_local_callers = HashSet::new();
     let mut ordered_roots = if COLLECT {
         close_ordered_symbolic_roots(std::mem::take(&mut authored_roots), || {
-            let mut copy_seeds = Vec::new();
+            let mut ordinary_local_seeds = Vec::new();
             let callers = ordered_symbolic_callers(project, calls, root,
-                Proof::INTEGER_RETURN_PARTITIONS.then_some(&mut copy_seeds))?;
+                Proof::INTEGER_RETURN_PARTITIONS.then_some(&mut ordinary_local_seeds))?;
             // The same prepared reverse call graph supplies both root selection
-            // and lexical-copy cursor eligibility, including transitive callers.
-            copy_callers.extend(copy_seeds.iter().copied());
-            while let Some(callee) = copy_seeds.pop() {
+            // and ordinary-local cursor eligibility, including transitive callers.
+            ordinary_local_callers.extend(ordinary_local_seeds.iter().copied());
+            while let Some(callee) = ordinary_local_seeds.pop() {
                 if let Some(edges) = callers.get(&callee) {
-                    copy_seeds.extend(edges.iter().copied().filter(|caller| copy_callers.insert(*caller)));
+                    ordinary_local_seeds.extend(edges.iter().copied().filter(|caller| ordinary_local_callers.insert(*caller)));
                 }
             }
             Ok(callers)
@@ -609,7 +609,7 @@ fn check_package_symbolic_roots<const COLLECT: bool, const ENTRY_EVIDENCE: bool,
                 continue;
             }
             had_obligations |= check_unused_module::<COLLECT, ENTRY_EVIDENCE, _>(
-                project, calls, module, ordinal, &reached, selected, &copy_callers, failures.as_deref_mut(), Some(&visits), proof,
+                project, calls, module, ordinal, &reached, selected, &ordinary_local_callers, failures.as_deref_mut(), Some(&visits), proof,
             )?;
         }
     }
@@ -617,7 +617,7 @@ fn check_package_symbolic_roots<const COLLECT: bool, const ENTRY_EVIDENCE: bool,
         let ordinal = startup_count + index;
         if let Some(selected) = module_roots(ordinal, module)? {
             had_obligations |= check_unused_module::<COLLECT, ENTRY_EVIDENCE, _>(
-                project, calls, module, ordinal, &reached, selected, &copy_callers, failures.as_deref_mut(), None, proof,
+                project, calls, module, ordinal, &reached, selected, &ordinary_local_callers, failures.as_deref_mut(), None, proof,
             )?;
         }
     }
@@ -630,10 +630,10 @@ fn ordered_symbolic_callers(
     project: &ScalarProject,
     calls: &ProjectCallSiteResults,
     root: &SourceIdentity,
-    mut copy_seeds: Option<&mut Vec<PreparedCallable>>,
+    mut ordinary_local_seeds: Option<&mut Vec<PreparedCallable>>,
 ) -> Result<HashMap<PreparedCallable, Vec<PreparedCallable>>, ProjectCheck> {
     #[cfg(not(feature = "internal-checker"))]
-    let _ = &mut copy_seeds;
+    let _ = &mut ordinary_local_seeds;
     let mut callers = HashMap::new();
     for (module, source_module) in project.modules.iter().enumerate() {
         if source_module.source.project != root.project || source_module.source.package != root.package {
@@ -645,8 +645,8 @@ fn ordered_symbolic_callers(
             }
             let body = calls.function_body(module, item, None).ok_or(ProjectCheck::MissingRootOccurrences)?;
             #[cfg(feature = "internal-checker")]
-            if let Some(seeds) = copy_seeds.as_deref_mut() {
-                if !body.structure.checker_integer_copy_locals.is_empty() {
+            if let Some(seeds) = ordinary_local_seeds.as_deref_mut() {
+                if !body.structure.checker_ordinary_integer_locals.is_empty() {
                     seeds.push((module, item));
                 }
             }
@@ -771,7 +771,7 @@ impl<const ORDINARY_PROJECTIONS: bool> ActualIntegerObserver for ProofFreeSymbol
 
     const PROJECTED_FORMAL_WRITES: bool = ORDINARY_PROJECTIONS;
     const ORDINARY_PROJECTED_PAIR: bool = ORDINARY_PROJECTIONS;
-    const ORDINARY_LEXICAL_COPIES: bool = ORDINARY_PROJECTIONS;
+    const ORDINARY_INTEGER_LOCALS: bool = ORDINARY_PROJECTIONS;
 
     fn observe(&mut self, _: (usize, usize), _: &[&BigInt], _: &BigInt) {}
 }
@@ -808,13 +808,13 @@ fn check_unused_module<const COLLECT: bool, const ENTRY_EVIDENCE: bool, Proof: S
     ordinal: usize,
     reached: &HashSet<(usize, usize)>,
     symbolic_roots: HashSet<usize>,
-    copy_callers: &HashSet<PreparedCallable>,
+    ordinary_local_callers: &HashSet<PreparedCallable>,
     mut failures: Option<&mut OrderedFailures>,
     completed_visits: Option<&[InitializationVisit]>,
     proof: &mut Proof,
 ) -> Result<bool, ProjectCheck> {
     #[cfg(not(feature = "internal-checker"))]
-    let _ = copy_callers;
+    let _ = ordinary_local_callers;
     let mut active = false;
     for (item, declaration) in module.items.iter().enumerate() {
         let ScalarItem::Function(function) = declaration else {
@@ -845,7 +845,7 @@ fn check_unused_module<const COLLECT: bool, const ENTRY_EVIDENCE: bool, Proof: S
         if COLLECT && Proof::INTEGER_RETURN_PARTITIONS
             && matches!(body.boundary.results.as_slice(), [result] if result.ty == ScalarType::Unit)
             && !body.structure.checker_direct_targets.is_empty()
-            && (copy_callers.contains(&(ordinal, item))
+            && (ordinary_local_callers.contains(&(ordinal, item))
                 || !body.structure.checker_integer_call_locals.is_empty()
                 || body.structure.checker_direct_targets.keys().any(|occurrence| {
                     body.checked_call_signatures.get(occurrence).is_some_and(|signature|
@@ -1320,7 +1320,7 @@ trait ActualIntegerObserver {
     const INTEGER_RETURN_PARTITIONS: bool = false;
     const PROJECTED_FORMAL_WRITES: bool = false;
     const ORDINARY_PROJECTED_PAIR: bool = false;
-    const ORDINARY_LEXICAL_COPIES: bool = false;
+    const ORDINARY_INTEGER_LOCALS: bool = false;
 
     fn observe(&mut self, target: (usize, usize), arguments: &[&BigInt], value: &BigInt);
 
@@ -1607,7 +1607,7 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             let progress = if active_collection.is_some() {
                 frame.cursor.advance::<true>(body, handler, Observer::PROOF_FREE_CONTEXTUAL_LOCAL_TRANSFERS,
                     Observer::EXACT_INTEGER_CALL_CONTINUATIONS, Observer::ORDINARY_PROJECTED_PAIR,
-                    Observer::ORDINARY_LEXICAL_COPIES, &mut sink)
+                    Observer::ORDINARY_INTEGER_LOCALS, &mut sink)
             } else {
                 frame.cursor.advance::<false>(body, handler, false, false, false, false, &mut sink)
             }.ok_or_else(|| nested_error.unwrap_or(ProjectCheck::Unsupported))?;
@@ -1858,7 +1858,7 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
         } else if ACTUAL_STARTUP && Observer::EXACT_INTEGER_CALL_CONTINUATIONS && collection.is_some()
             && (!body.call_occurrences.is_empty() || {
                 #[cfg(feature = "internal-checker")]
-                { Observer::ORDINARY_LEXICAL_COPIES && !body.structure.checker_integer_copy_locals.is_empty() }
+                { Observer::ORDINARY_INTEGER_LOCALS && !body.structure.checker_ordinary_integer_locals.is_empty() }
                 #[cfg(not(feature = "internal-checker"))]
                 { false }
             })
@@ -9156,7 +9156,7 @@ mod tests {
         let (module, item, _) = select_checked_root(project, &app, "snapshot").unwrap();
         let body = calls.function_body(module, item, None).unwrap();
         let key = |index| (body.structure.root, index);
-        let copies = &body.structure.checker_integer_copy_locals;
+        let copies = &body.structure.checker_ordinary_integer_locals;
         let first = &copies[&key(0)];
         let second = &copies[&key(1)];
         assert_eq!(body.prepared_plain_name(first.source),
@@ -9164,6 +9164,47 @@ mod tests {
         assert_eq!(body.prepared_plain_name(second.source), Some(&PlainNameIdentity::Lexical(first.binding.clone())));
         assert!(!body.structure.checker_integer_locals.contains_key(&key(0)));
         assert!(!body.structure.checker_integer_call_locals.contains_key(&key(0)));
+        assert!(root_local_import_requirement(body).is_none());
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn prepared_inline_arithmetic_isolated_from_named_integer_evidence() {
+        use super::super::reference::{CheckerOrdinaryIntegerLocalKind, CheckerOrdinaryIntegerOperand, PlainNameIdentity};
+        let app = source("src/main.w", "inline-arithmetic-origin");
+        let program = format!(r#"%%start
+            unit(i8) use_math = fn(entry) {{
+                i8 flipped = -2 - entry;
+                i8 adjusted = flipped + -1;
+                core.require(adjusted > 0, {OUTPUT});
+            }};
+        %%end"#);
+        let prepared = prepare_checker_project(
+            vec![(declarations(&app, &program), Vec::new())], vec![app.clone()], inputs(),
+        ).unwrap();
+        let (project, calls) = prepared.parts();
+        let (module, item, _) = select_checked_root(project, &app, "use_math").unwrap();
+        let body = calls.function_body(module, item, None).unwrap();
+        let key = |index| (body.structure.root, index);
+        let locals = &body.structure.checker_ordinary_integer_locals;
+        let first = &locals[&key(0)];
+        let second = &locals[&key(1)];
+        let CheckerOrdinaryIntegerLocalKind::Arithmetic {
+            operator: super::super::BinaryOperator::Subtract,
+            operands: [CheckerOrdinaryIntegerOperand::Literal(first_literal), CheckerOrdinaryIntegerOperand::Lexical(entry)],
+        } = &first.kind else { panic!("missing checked signed subtraction"); };
+        let CheckerOrdinaryIntegerLocalKind::Arithmetic {
+            operator: super::super::BinaryOperator::Add,
+            operands: [CheckerOrdinaryIntegerOperand::Lexical(flipped), CheckerOrdinaryIntegerOperand::Literal(second_literal)],
+        } = &second.kind else { panic!("missing checked signed addition"); };
+        assert_eq!(first_literal, &BigInt::from(-2));
+        assert_eq!(second_literal, &BigInt::from(-1));
+        assert_eq!(body.prepared_plain_name(*entry), Some(&PlainNameIdentity::Lexical(
+            body.boundary.checker_parameter_bindings.as_ref().unwrap()[0].clone())));
+        assert_eq!(body.prepared_plain_name(*flipped), Some(&PlainNameIdentity::Lexical(first.binding.clone())));
+        assert!(body.structure.checker_integer_final_operations.is_empty());
+        assert!(body.structure.checker_integer_locals.is_empty());
+        assert!(body.structure.checker_integer_call_locals.is_empty());
         assert!(root_local_import_requirement(body).is_none());
     }
 

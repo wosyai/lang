@@ -138,7 +138,7 @@ struct RootBranchSlot {
 trait ScopedAuthoredReturn<'a>: Copy {
     const ENABLED: bool;
     #[cfg(feature = "internal-checker")]
-    const ALLOW_LEXICAL_COPIES: bool = false;
+    const ALLOW_ORDINARY_INTEGER_LOCALS: bool = false;
     fn at(
         self, calls: &FunctionCallSites, block: BlockOrdinal, slot: FinalOutputSlot, ty: &ScalarType,
         roots: &IntegerRoots<'_>, path: &IntegerInputs,
@@ -184,14 +184,14 @@ impl<'a> ScopedAuthoredReturn<'a> for () {
 
 #[cfg(feature = "internal-checker")]
 #[derive(Clone, Copy)]
-struct OrderedRootConditions<'a, const EXACT_COMPOUND: bool = false, const LEXICAL_COPIES: bool = false>(&'a super::ScalarBlock);
+struct OrderedRootConditions<'a, const EXACT_COMPOUND: bool = false, const ORDINARY_LOCALS: bool = false>(&'a super::ScalarBlock);
 
 #[cfg(feature = "internal-checker")]
-impl<'a, const EXACT_COMPOUND: bool, const LEXICAL_COPIES: bool> ScopedAuthoredReturn<'a>
-    for OrderedRootConditions<'a, EXACT_COMPOUND, LEXICAL_COPIES>
+impl<'a, const EXACT_COMPOUND: bool, const ORDINARY_LOCALS: bool> ScopedAuthoredReturn<'a>
+    for OrderedRootConditions<'a, EXACT_COMPOUND, ORDINARY_LOCALS>
 {
     const ENABLED: bool = false;
-    const ALLOW_LEXICAL_COPIES: bool = LEXICAL_COPIES;
+    const ALLOW_ORDINARY_INTEGER_LOCALS: bool = ORDINARY_LOCALS;
 
     fn at(
         self, _: &FunctionCallSites, _: BlockOrdinal, _: FinalOutputSlot, _: &ScalarType,
@@ -1317,9 +1317,9 @@ struct IntegerRoots<'a> {
     unit_pair_work: Option<usize>,
     affine_work: Option<usize>,
     #[cfg(feature = "internal-checker")]
-    allow_lexical_copies: bool,
+    allow_ordinary_integer_locals: bool,
     #[cfg(feature = "internal-checker")]
-    lexical_copy_work: Option<usize>,
+    ordinary_local_work: Option<usize>,
     reached_obligation: bool,
     proof_reflexive_branches: bool,
 }
@@ -1350,7 +1350,7 @@ impl IntegerInputs {
     // Only visited from actual copy/relational transfer sites, never from the
     // generic drive loop. Affine rows are already metered by that lane.
     #[cfg(feature = "internal-checker")]
-    fn charge_copy_alias_work(&self, work: &mut Option<usize>, passes: usize) -> Option<()> {
+    fn charge_local_alias_work(&self, work: &mut Option<usize>, passes: usize) -> Option<()> {
         if let Some(work) = work {
             for row in &self.0 {
                 charge_call_work(work, 1)?;
@@ -2563,11 +2563,11 @@ pub(super) fn collect_integer_requirement_failures_with_calls<'a>(
 
 #[cfg(feature = "internal-checker")]
 pub(super) fn collect_ordered_root_requirement_failures<'a>(
-    calls: &'a FunctionCallSites, body: &'a super::ScalarBlock, allow_lexical_copies: bool,
+    calls: &'a FunctionCallSites, body: &'a super::ScalarBlock, allow_ordinary_integer_locals: bool,
 ) -> Option<(bool, Vec<IntegerCheckFailure<'a>>)> {
     let mut failures = Vec::new();
     let mut sink = |failure| failures.push(failure);
-    let (active, _) = if allow_lexical_copies && !calls.structure.checker_integer_copy_locals.is_empty() {
+    let (active, _) = if allow_ordinary_integer_locals && !calls.structure.checker_ordinary_integer_locals.is_empty() {
         collect_integer_requirement_failures_in_scope(
             calls, IntegerRequirementEntry::Arbitrary, None, false, false, &mut sink, OrderedRootConditions::<true, true>(body),
         )
@@ -3536,7 +3536,7 @@ fn run_integer_callable<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool,
         parameters: boundary.parameters.len(),
         proof_reflexive_branches,
         #[cfg(feature = "internal-checker")]
-        allow_lexical_copies: Authored::ALLOW_LEXICAL_COPIES,
+        allow_ordinary_integer_locals: Authored::ALLOW_ORDINARY_INTEGER_LOCALS,
         ..IntegerRoots::default()
     };
     for (binding, parameter) in checker_parameters.iter().zip(&boundary.parameters) {
@@ -3754,15 +3754,15 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                 }
                 #[cfg(feature = "internal-checker")]
                 if !path.is_unreachable() && !alternate_path.is_unreachable() {
-                    path.charge_copy_alias_work(&mut roots.lexical_copy_work, 2)?;
-                    alternate_path.charge_copy_alias_work(&mut roots.lexical_copy_work, 2)?;
+                    path.charge_local_alias_work(&mut roots.ordinary_local_work, 2)?;
+                    alternate_path.charge_local_alias_work(&mut roots.ordinary_local_work, 2)?;
                 }
                 path = path.join_equal(alternate_path, frame.axis);
             } else if let Some(first) = frame.first {
                 #[cfg(feature = "internal-checker")]
                 if !path.is_unreachable() && !first.is_unreachable() {
-                    path.charge_copy_alias_work(&mut roots.lexical_copy_work, 2)?;
-                    first.charge_copy_alias_work(&mut roots.lexical_copy_work, 2)?;
+                    path.charge_local_alias_work(&mut roots.ordinary_local_work, 2)?;
+                    first.charge_local_alias_work(&mut roots.ordinary_local_work, 2)?;
                 }
                 path = first.join_equal(path, frame.axis);
             }
@@ -3780,7 +3780,7 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                     roots.reached_obligation = true;
                     #[cfg(feature = "internal-checker")]
                     if matches!(predicate, CheckerPredicate::Integer(_) | CheckerPredicate::DirectiveDisjunction { .. }) {
-                        path.charge_copy_alias_work(&mut roots.lexical_copy_work, 2)?;
+                        path.charge_local_alias_work(&mut roots.ordinary_local_work, 2)?;
                     }
                     if let (true, CheckerPredicate::DirectiveDisjunction { binding, ty, atoms }) = (COLLECT, predicate) {
                         let (axis, actual_type) = roots.lookup(binding)?;
@@ -3860,7 +3860,7 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                     };
                     #[cfg(feature = "internal-checker")]
                     if !matches!(structure.checker_branches.get(condition), Some(CheckerPredicate::Boolean(_))) {
-                        path.charge_copy_alias_work(&mut roots.lexical_copy_work, 4)?;
+                        path.charge_local_alias_work(&mut roots.ordinary_local_work, 4)?;
                     }
                     let (yes, no, axis) = if let Some(predicate) = structure.checker_branches.get(condition) {
                         path.split(roots, predicate)?
@@ -3905,7 +3905,7 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                     let expected = tail?;
                     #[cfg(feature = "internal-checker")]
                     if !matches!(structure.checker_branches.get(condition), Some(CheckerPredicate::Boolean(_))) {
-                        path.charge_copy_alias_work(&mut roots.lexical_copy_work, 4)?;
+                        path.charge_local_alias_work(&mut roots.ordinary_local_work, 4)?;
                     }
                     let (yes, no, _) = if let Some(predicate) = structure.checker_branches.get(condition) {
                         path.split(roots, predicate)?
@@ -4057,7 +4057,7 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                     return None;
                 }
                 #[cfg(feature = "internal-checker")]
-                path.charge_copy_alias_work(&mut roots.lexical_copy_work, 2)?;
+                path.charge_local_alias_work(&mut roots.ordinary_local_work, 2)?;
                 path = path.overwrite(axis, value, preserve_entry);
             }
             BlockItemKind::Binding(ref binding) => {
@@ -4198,8 +4198,8 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                     }
                 }
                 #[cfg(feature = "internal-checker")]
-                if roots.allow_lexical_copies {
-                    if let Some(origin) = structure.checker_integer_copy_locals.get(&(block, item.position)) {
+                if roots.allow_ordinary_integer_locals {
+                    if let Some(origin) = structure.checker_ordinary_integer_locals.get(&(block, item.position)) {
                         let [receiver] = binding.receivers() else { return None; };
                         let BindingInitialization::Outputs(outputs) = &binding.initialization else { return None; };
                         if origin.source != outputs.primary || !outputs.secondary.is_empty()
@@ -4208,23 +4208,34 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                         {
                             return None;
                         }
-                        let PlainNameIdentity::Lexical(source) = calls.prepared_plain_name(origin.source)? else { return None; };
-                        let (axis, ty) = roots.lookup(source)?;
-                        if ty != &receiver.ty { return None; }
-                        // Read the old binding before installing the new one. Every
-                        // row holds its own domain and class/equality relationship.
-                        for row in &path.0 {
-                            let work = if row.affine.is_some() {
-                                roots.affine_work.as_mut()?
-                            } else {
-                                roots.lexical_copy_work.get_or_insert(0)
-                            };
-                            charge_call_work(work, row.equal_axes().len().checked_add(2)?)?;
+                        match &origin.kind {
+                            super::reference::CheckerOrdinaryIntegerLocalKind::Copy => {
+                                let PlainNameIdentity::Lexical(source) = calls.prepared_plain_name(origin.source)? else { return None; };
+                                let (axis, ty) = roots.lookup(source)?;
+                                if ty != &receiver.ty { return None; }
+                                // Read the old binding before installing the new one.
+                                for row in &path.0 {
+                                    let work = if row.affine.is_some() {
+                                        roots.affine_work.as_mut()?
+                                    } else {
+                                        roots.ordinary_local_work.get_or_insert(0)
+                                    };
+                                    charge_call_work(work, row.equal_axes().len().checked_add(2)?)?;
+                                }
+                                for row in &mut path.0 {
+                                    row.append_alias(axis, Rc::clone(&row[axis]));
+                                }
+                            }
+                            super::reference::CheckerOrdinaryIntegerLocalKind::Arithmetic { operator, operands } => {
+                                let operation = AuthoredIntegerOperation::checked(operator)?;
+                                let operand = |operand| ordinary_local_operand(calls, roots, &receiver.ty, operand);
+                                let left = operand(&operands[0])?;
+                                let right = operand(&operands[1])?;
+                                path.append_ordinary_calculation(operation, left, right, &receiver.ty,
+                                    &mut roots.ordinary_local_work, &mut roots.affine_work)?;
+                            }
                         }
-                        for row in &mut path.0 {
-                            row.append_alias(axis, Rc::clone(&row[axis]));
-                        }
-                        roots.add(&origin.binding, ty);
+                        roots.add(&origin.binding, &receiver.ty);
                         continue;
                     }
                 }
@@ -4489,7 +4500,7 @@ impl<'a> ExactCallCursor<'a> {
                     }
                 }
                 #[cfg(feature = "internal-checker")]
-                self.block.path.charge_copy_alias_work(&mut self.roots.lexical_copy_work, 1)?;
+                self.block.path.charge_local_alias_work(&mut self.roots.ordinary_local_work, 1)?;
                 self.block.path.restrict_axis(axis, &survivors);
             }
             (ExactCallEffect::Unit(_), ActualCallResult::ProjectedUnitPair(projected)) => {
@@ -4642,13 +4653,13 @@ impl<'a> ExactCallCursor<'a> {
         allow_contextual_local_transfers: bool,
         suspend_integer: bool,
         allow_ordinary_computed_returns: bool,
-        allow_lexical_copies: bool,
+        allow_ordinary_integer_locals: bool,
         sink: &mut dyn FnMut(IntegerCheckFailure<'a>),
     ) -> Option<ExactCallProgress<'a>> {
         #[cfg(feature = "internal-checker")]
-        { self.roots.allow_lexical_copies = allow_lexical_copies && !calls.structure.checker_integer_copy_locals.is_empty(); }
+        { self.roots.allow_ordinary_integer_locals = allow_ordinary_integer_locals && !calls.structure.checker_ordinary_integer_locals.is_empty(); }
         #[cfg(not(feature = "internal-checker"))]
-        let _ = allow_lexical_copies;
+        let _ = allow_ordinary_integer_locals;
         let mut failures = IntegerFailureCollection {
             continuation: IntegerRequirementContinuation::Empty,
             projected: None, allow_projected_calls: false, allow_contextual_local_transfers, sink,
@@ -4775,8 +4786,28 @@ impl<'a> ExactCallCursor<'a> {
 }
 
 #[cfg(feature = "internal-checker")]
+type IntegerCalculationOperand<'a> = (Option<&'a BigInt>, Option<usize>);
+
+#[cfg(feature = "internal-checker")]
+fn ordinary_local_operand<'a>(
+    calls: &FunctionCallSites, roots: &IntegerRoots<'_>, expected: &ScalarType,
+    operand: &'a super::reference::CheckerOrdinaryIntegerOperand,
+) -> Option<IntegerCalculationOperand<'a>> {
+    use super::reference::CheckerOrdinaryIntegerOperand::{Lexical, Literal};
+    match operand {
+        Literal(value) => Some((Some(value), None)),
+        Lexical(occurrence) => {
+            let PlainNameIdentity::Lexical(binding) = calls.prepared_plain_name(*occurrence)? else { return None; };
+            let (axis, ty) = roots.lookup(binding)?;
+            (ty == expected && calls.structure.checked_types.expressions.get(occurrence)? == expected)
+                .then_some((None, Some(axis)))
+        }
+    }
+}
+
+#[cfg(feature = "internal-checker")]
 fn singleton_calculation_operand<'a>(
-    row: &'a IntegerRow, (literal, axis): (Option<&'a BigInt>, Option<usize>),
+    row: &'a IntegerRow, (literal, axis): IntegerCalculationOperand<'a>,
 ) -> Option<&'a BigInt> {
     literal.or_else(|| row.get(axis?)?.singleton_value())
 }
@@ -4789,24 +4820,87 @@ enum ComputedProjectedValue {
 }
 
 #[cfg(feature = "internal-checker")]
-fn computed_projected_value(
-    row: &IntegerRow, formal: Option<usize>, operation: AuthoredIntegerOperation,
-    left: (Option<&BigInt>, Option<usize>), right: (Option<&BigInt>, Option<usize>),
+enum ComputedRowInteger {
+    Singleton(BigInt),
+    Affine(usize, IntegerAffineTransform),
+}
+
+#[cfg(feature = "internal-checker")]
+fn compute_row_integer_operation(
+    row: &IntegerRow, operation: AuthoredIntegerOperation,
+    left: IntegerCalculationOperand<'_>, right: IntegerCalculationOperand<'_>,
     min: &BigInt, max: &BigInt,
-) -> Option<ComputedProjectedValue> {
+) -> Option<ComputedRowInteger> {
     let fits = |value: &BigInt| value >= min && value <= max;
     let left_exact = singleton_calculation_operand(row, left);
     let right_exact = singleton_calculation_operand(row, right);
     let (axis, reflected, offset) = match (left_exact, right_exact, operation) {
         (Some(left), Some(right), operation) if fits(left) && fits(right) => {
             let value = operation.apply(Cow::Borrowed(left), Cow::Borrowed(right), min)?;
-            return fits(&value).then(|| ComputedProjectedValue::Singleton(Rc::new(IntegerSet::singleton(&value))));
+            return fits(&value).then(|| ComputedRowInteger::Singleton(value));
         }
         (None, Some(value), AuthoredIntegerOperation::Add) if fits(value) => (left.1?, false, value.clone()),
         (Some(value), None, AuthoredIntegerOperation::Add) if fits(value) => (right.1?, false, value.clone()),
         (None, Some(value), AuthoredIntegerOperation::Subtract) if fits(value) => (left.1?, false, -value),
         (Some(value), None, AuthoredIntegerOperation::Subtract) if fits(value) => (right.1?, true, value.clone()),
         _ => return None,
+    };
+    let transform = IntegerAffineTransform { reflected, offset };
+    transform.fits(&row[axis], min, max)?;
+    Some(ComputedRowInteger::Affine(axis, transform))
+}
+
+#[cfg(feature = "internal-checker")]
+impl IntegerInputs {
+    fn append_ordinary_calculation(
+        &mut self, operation: AuthoredIntegerOperation,
+        left: IntegerCalculationOperand<'_>, right: IntegerCalculationOperand<'_>, ty: &ScalarType,
+        local_work: &mut Option<usize>, affine_work: &mut Option<usize>,
+    ) -> Option<()> {
+        let work = local_work.get_or_insert(0);
+        // At most two operand inspections, one typed calculation, one output
+        // cell and one pass through the input rows. Integer types end at 128 bits.
+        charge_call_work(work, self.0.len().checked_mul(5)?.checked_add(1)?)?;
+        let (min, max) = super::typecheck::integer_bounds(ty)?;
+        for row in &mut self.0 {
+            match compute_row_integer_operation(row, operation, left, right, &min, &max)? {
+                ComputedRowInteger::Singleton(value) => row.push(Rc::new(IntegerSet::singleton(&value))),
+                ComputedRowInteger::Affine(axis, transform)
+                    if !transform.reflected && transform.offset.bits() == 0 =>
+                {
+                    // An identity of a non-anchor member is still an equality
+                    // copy, not another member with a redundant transform.
+                    let meter = affine_work.as_mut().filter(|_| row.affine.is_some()).unwrap_or(&mut *work);
+                    charge_call_work(meter, row.equal_axes().len().checked_add(1)?)?;
+                    row.append_alias(axis, Rc::clone(&row[axis]));
+                }
+                ComputedRowInteger::Affine(axis, transform) => {
+                    let transform = Rc::new(transform);
+                    let meter = affine_work.as_mut().filter(|_| row.affine.is_some()).unwrap_or(&mut *work);
+                    let plan = row.prepare_affine(axis, &row[axis], &transform, meter)?;
+                    if matches!(&plan, AffineAppend::Member { .. }) {
+                        affine_work.get_or_insert(0);
+                    }
+                    row.append_affine(plan);
+                }
+            }
+        }
+        // A declined row abandons the cursor; no partially evaluated lane or
+        // collected diagnostics are published on an Unsupported result.
+        Some(())
+    }
+}
+
+#[cfg(feature = "internal-checker")]
+fn computed_projected_value(
+    row: &IntegerRow, formal: Option<usize>, operation: AuthoredIntegerOperation,
+    left: IntegerCalculationOperand<'_>, right: IntegerCalculationOperand<'_>,
+    min: &BigInt, max: &BigInt,
+) -> Option<ComputedProjectedValue> {
+    let (axis, mut transform) = match compute_row_integer_operation(row, operation, left, right, min, max)? {
+        ComputedRowInteger::Singleton(value) =>
+            return Some(ComputedProjectedValue::Singleton(Rc::new(IntegerSet::singleton(&value)))),
+        ComputedRowInteger::Affine(axis, transform) => (axis, transform),
     };
     let entry_relation = |slot| {
         if row.entry_alias(slot, axis) {
@@ -4820,8 +4914,6 @@ fn computed_projected_value(
         None => (0..2).find(|slot| row.entry_alias(*slot, axis)).map(|slot| (slot, None))
             .or_else(|| (0..2).find_map(entry_relation))?,
     };
-    let mut transform = IntegerAffineTransform { reflected, offset };
-    transform.fits(&row[axis], min, max)?;
     if let Some(inner) = inner {
         transform = transform.compose(&inner);
     }

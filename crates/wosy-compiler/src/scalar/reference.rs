@@ -6133,9 +6133,24 @@ pub(super) enum CheckerIntegerCallArgument {
 
 #[cfg(feature = "internal-checker")]
 #[derive(Clone, Debug, PartialEq)]
-pub(super) struct CheckerIntegerCopyOrigin {
+pub(super) struct CheckerOrdinaryIntegerLocal {
     pub(super) binding: ReferenceBindingId,
     pub(super) source: OccurrenceOrdinal,
+    pub(super) kind: CheckerOrdinaryIntegerLocalKind,
+}
+
+#[cfg(feature = "internal-checker")]
+#[derive(Clone, Debug, PartialEq)]
+pub(super) enum CheckerOrdinaryIntegerLocalKind {
+    Copy,
+    Arithmetic { operator: BinaryOperator, operands: [CheckerOrdinaryIntegerOperand; 2] },
+}
+
+#[cfg(feature = "internal-checker")]
+#[derive(Clone, Debug, PartialEq)]
+pub(super) enum CheckerOrdinaryIntegerOperand {
+    Literal(BigInt),
+    Lexical(OccurrenceOrdinal),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -6163,7 +6178,7 @@ pub(super) struct OccurrenceStructure {
     #[cfg(any(test, feature = "internal-checker"))]
     pub(super) checker_integer_locals: HashMap<(BlockOrdinal, usize), ReferenceBindingId>,
     #[cfg(feature = "internal-checker")]
-    pub(super) checker_integer_copy_locals: HashMap<(BlockOrdinal, usize), CheckerIntegerCopyOrigin>,
+    pub(super) checker_ordinary_integer_locals: HashMap<(BlockOrdinal, usize), CheckerOrdinaryIntegerLocal>,
     #[cfg(any(test, feature = "internal-checker"))]
     pub(super) checker_contextual_read_locals: HashMap<(BlockOrdinal, usize), ReferenceBindingId>,
     #[cfg(any(test, feature = "internal-checker"))]
@@ -6206,7 +6221,7 @@ impl OccurrenceStructure {
             #[cfg(any(test, feature = "internal-checker"))]
             checker_integer_locals: HashMap::new(),
             #[cfg(feature = "internal-checker")]
-            checker_integer_copy_locals: HashMap::new(),
+            checker_ordinary_integer_locals: HashMap::new(),
             #[cfg(any(test, feature = "internal-checker"))]
             checker_contextual_read_locals: HashMap::new(),
             #[cfg(any(test, feature = "internal-checker"))]
@@ -7329,32 +7344,58 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
         Ok(ordinal)
     }
     #[cfg(feature = "internal-checker")]
-    fn record_integer_final_operation(&mut self, ordinal: OccurrenceOrdinal, expression: &ScalarExpression) {
+    fn simple_integer_operation<'syntax>(
+        &self, ordinal: OccurrenceOrdinal, expression: &'syntax ScalarExpression,
+    ) -> Option<(BinaryOperator, [(OccurrenceOrdinal, Option<std::borrow::Cow<'syntax, BigInt>>); 2])> {
         let ScalarExpression::Binary { operator: operator @ (BinaryOperator::Add | BinaryOperator::Subtract),
-            left, right, .. } = expression else { return; };
+            left, right, .. } = expression else { return None; };
         let parent = OccurrenceParent::Expression(ordinal);
-        let Some(OccurrenceNode::Expression(left_ordinal)) =
-            self.structure.edges.get(&(parent, OccurrenceEdge::BinaryLeft)) else { return; };
-        let Some(OccurrenceNode::Expression(right_ordinal)) =
-            self.structure.edges.get(&(parent, OccurrenceEdge::BinaryRight)) else { return; };
-        let Some(ty) = self.structure.checked_types.expressions.get(&ordinal)
-            .filter(|ty| is_integer_type(ty)) else { return; };
-        let operands = [(left.as_ref(), *left_ordinal), (right.as_ref(), *right_ordinal)];
-        if !operands.iter().all(|(value, child)| {
-            self.structure.checked_types.expressions.get(child) == Some(ty)
-                && (matches!(value, ScalarExpression::Name { .. })
-                    || super::checker_flow::concrete_integer_literal(value)
-                        .is_some_and(|literal| super::typecheck::integer_literal_fits_type(&literal, ty)))
-        }) {
-            return;
-        }
-        let ordinals = [*left_ordinal, *right_ordinal];
-        for (value, child) in operands {
-            if let Some(literal) = super::checker_flow::concrete_integer_literal(value) {
+        let OccurrenceNode::Expression(left_ordinal) = self.structure.edges.get(&(parent, OccurrenceEdge::BinaryLeft))?
+            else { return None; };
+        let OccurrenceNode::Expression(right_ordinal) = self.structure.edges.get(&(parent, OccurrenceEdge::BinaryRight))?
+            else { return None; };
+        let ty = self.structure.checked_types.expressions.get(&ordinal).filter(|ty| is_integer_type(ty))?;
+        let checked = |child, value: &'syntax ScalarExpression| {
+            if self.structure.checked_types.expressions.get(&child) != Some(ty) { return None; }
+            let literal = super::checker_flow::concrete_integer_literal(value);
+            if let Some(literal) = &literal {
+                if !super::typecheck::integer_literal_fits_type(literal, ty) { return None; }
+            } else if !matches!(value, ScalarExpression::Name { .. }) {
+                return None;
+            }
+            Some((child, literal))
+        };
+        Some((operator.clone(), [checked(*left_ordinal, left.as_ref())?, checked(*right_ordinal, right.as_ref())?]))
+    }
+
+    #[cfg(feature = "internal-checker")]
+    fn record_integer_final_operation(&mut self, ordinal: OccurrenceOrdinal, expression: &ScalarExpression) {
+        let Some((operator, [left, right])) = self.simple_integer_operation(ordinal, expression) else { return; };
+        let ordinals = [left.0, right.0];
+        for (child, literal) in [left, right] {
+            if let Some(literal) = literal {
                 self.structure.checker_integer_literals.insert(child, literal.into_owned());
             }
         }
-        self.structure.checker_integer_final_operations.insert(ordinal, (operator.clone(), ordinals));
+        self.structure.checker_integer_final_operations.insert(ordinal, (operator, ordinals));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    fn ordinary_integer_local(
+        &self, source: OccurrenceOrdinal, expression: &ScalarExpression,
+        names: &HashMap<OccurrenceOrdinal, PlainNameIdentity>,
+    ) -> Option<CheckerOrdinaryIntegerLocalKind> {
+        let lexical = |ordinal| matches!(names.get(&ordinal), Some(PlainNameIdentity::Lexical(_)));
+        if lexical(source) { return Some(CheckerOrdinaryIntegerLocalKind::Copy); }
+        let (operator, [left, right]) = self.simple_integer_operation(source, expression)?;
+        let typed = |(ordinal, literal): (_, Option<std::borrow::Cow<'_, BigInt>>)| {
+            if let Some(literal) = literal {
+                Some(CheckerOrdinaryIntegerOperand::Literal(literal.into_owned()))
+            } else {
+                lexical(ordinal).then_some(CheckerOrdinaryIntegerOperand::Lexical(ordinal))
+            }
+        };
+        Some(CheckerOrdinaryIntegerLocalKind::Arithmetic { operator, operands: [typed(left)?, typed(right)?] })
     }
 
     #[cfg(feature = "internal-checker")]
@@ -8359,14 +8400,15 @@ impl StructuralWalker<'_, '_> {
             _ => None,
         };
         #[cfg(feature = "internal-checker")]
-        let checker_copy = match (&initialization, &self.mode, &self.plain_names, binding.receivers.as_slice()) {
+        let mut ordinary_local = match (&initialization, &self.mode, &self.plain_names, binding.receivers.as_slice()) {
             (BindingInitialization::Outputs(outputs), WalkMode::Callable(callable), PlainNameFacts::Prepared(names), [receiver])
                 if self.occurrence_typing.checker_directives_enabled() && outputs.secondary.is_empty()
                     && receiver.contextual_storage.is_none() && is_integer_type(&receiver.ty)
-                    && self.structure.checked_types.expressions.get(&outputs.primary) == Some(&receiver.ty)
-                    && matches!(names.get(&outputs.primary), Some(PlainNameIdentity::Lexical(_))) =>
+                    && self.structure.checked_types.expressions.get(&outputs.primary) == Some(&receiver.ty) =>
             {
-                Some((outputs.primary, callable.target_resolver))
+                let ScalarBindingOutput::Evaluate(expression) = binding.output_source(0) else { unreachable!() };
+                self.ordinary_integer_local(outputs.primary, expression, names)
+                    .map(|kind| (outputs.primary, callable.target_resolver, kind))
             }
             _ => None,
         };
@@ -8414,10 +8456,10 @@ impl StructuralWalker<'_, '_> {
                     }
                 }
                 #[cfg(feature = "internal-checker")]
-                if let Some((source, callable)) = checker_copy {
+                if let Some((source, callable, kind)) = ordinary_local.take() {
                     let binding = lexical.reference_id(callable.source, callable.function_span);
-                    self.structure.checker_integer_copy_locals.insert((position.block, position.item),
-                        CheckerIntegerCopyOrigin { binding, source });
+                    self.structure.checker_ordinary_integer_locals.insert((position.block, position.item),
+                        CheckerOrdinaryIntegerLocal { binding, source, kind });
                 }
                 scope.names.insert(receiver.name.clone(), lexical);
             }

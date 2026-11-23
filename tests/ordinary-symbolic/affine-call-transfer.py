@@ -260,7 +260,91 @@ for name,program,correct,incorrect,code,label in [
 cases.extend([
     ("exact-startup-lexical-copy",startup_copy,60,b"STARTUP"),
     ("affine-member-rebind-stays-unsupported",affine_write,2,b"unsupported analysis"),
-    ("computed-local-not-lexical-copy",standalone_return.replace("copy = entry;", "copy = entry + 1;"),2,b"unsupported analysis"),
+    ("unguarded-inline-overflow",standalone_return.replace("copy = entry;", "copy = entry + 1;"),2,b"unsupported analysis"),
+])
+def bounds(axis, low, high):
+    return (f'core.narrow({axis} >= {low}, {report(64,"RANGE")});\n'
+            f'core.narrow({axis} <= {high}, {report(64,"RANGE")});')
+
+inline_affine = f"""%%start
+    unit(i8) transform = fn(entry) {{
+        {bounds("entry",0,4)}
+        i8 reflected = 4 - entry;
+        i8 adjusted = reflected + -2;
+        i8 identity = adjusted + 0;
+        if (identity == 0) {{
+            core.require(entry == 2, {report(65,"INLINE-BACK")});
+            core.require(reflected == 2, {report(65,"INLINE-BACK")});
+        }};
+        if (entry == 3) {{ core.require(adjusted == -1, {report(66,"INLINE-FORWARD")}); }};
+    }};
+    %%end"""
+inline_pair = f"""%%start
+    unit(i8,i8) prune = fn(mapped, base) {{
+        core.narrow(mapped == 1 || mapped == 3, {report(67,"PAIR-CUT")});
+        core.require(base == 1 || base == 3, {report(68,"INLINE-PAIR")});
+    }};
+    unit(i8) caller = fn(entry) {{
+        {bounds("entry",0,4)}
+        i8 reflected = 4 - entry;
+        prune(reflected, entry);
+        core.require(entry == 1 || entry == 3, {report(69,"PAIR-PARENT")});
+    }};
+    prune(1,3);
+    %%end"""
+inline_return = f"""%%start
+    i8(i8) transform = fn(entry) {{
+        {bounds("entry",0,4)}
+        i8 adjusted = entry - 1;
+        if (adjusted == 2) {{ core.require(entry == 3, {report(70,"INLINE-RETURN")}); }};
+        adjusted
+    }};
+    %%end"""
+inline_wrapper = f"""%%start
+    unit(i8) helper = fn(entry) {{
+        {bounds("entry",0,4)}
+        i8 adjusted = entry + 1;
+        if (adjusted == 3) {{ core.require(entry == 2, {report(71,"INLINE-WRAPPER")}); }};
+    }};
+    unit(i8) wrapper = fn(entry) {{ helper(entry); }};
+    helper(0);
+    %%end"""
+inline_startup = f"""%%start
+    unit(i8) exact = fn(entry) {{
+        i8 adjusted = -2 - entry;
+        core.require(adjusted == 0, {report(72,"INLINE-STARTUP")});
+    }};
+    exact(1);
+    %%end"""
+inline_two_broad = f"""%%start
+    unit(i8,i8) exact = fn(entry, offset) {{
+        {bounds("entry",0,4)}
+        {bounds("offset",0,4)}
+        i8 adjusted = entry + offset;
+        core.require(adjusted >= 0, {report(73,"INLINE-DUAL")});
+    }};
+    %%end"""
+inline_second_class = f"""%%start
+    unit(i8,i8) exact = fn(entry, offset) {{
+        {bounds("entry",0,4)}
+        {bounds("offset",0,4)}
+        i8 first = 4 - entry;
+        i8 other = offset - 1;
+        if (first == 0) {{ core.require(other <= 3, {report(74,"INLINE-OTHER")}); }};
+    }};
+    %%end"""
+for name,program,correct,incorrect,code,label in [
+    ("inline-reflected-composed",inline_affine,"entry == 2,","entry == 3,",65,b"INLINE-BACK"),
+    ("inline-dependent-pair",inline_pair,"core.require(base == 1 || base == 3","core.require(base == 3",68,b"INLINE-PAIR"),
+    ("inline-integer-root",inline_return,"entry == 3,","entry == 4,",70,b"INLINE-RETURN"),
+    ("inline-arithmetic-through-copy-free-wrapper",inline_wrapper,"entry == 2,","entry == 4,",71,b"INLINE-WRAPPER"),
+]:
+    cases.extend([(name,program,0,b""),(name+"-witness",program.replace(correct,incorrect),code,label)])
+cases.extend([
+    ("exact-startup-inline-arithmetic",inline_startup,72,b"INLINE-STARTUP"),
+    ("inline-nonlinear-remains-unsupported",inline_return.replace("entry - 1","entry * 1"),2,b"unsupported analysis"),
+    ("inline-two-broad-operands-remain-unsupported",inline_two_broad,2,b"unsupported analysis"),
+    ("inline-unrelated-second-class-remains-unsupported",inline_second_class,2,b"unsupported analysis"),
 ])
 with tempfile.TemporaryDirectory(prefix="affine-calls-") as path:
     root=Path(path)
@@ -269,7 +353,7 @@ with tempfile.TemporaryDirectory(prefix="affine-calls-") as path:
         (root/"wosy.toml").write_text(manifest.format(output=target))
         for scope in ("--main-flow-only","--declared-package"):
             for name,text,expected,stderr in cases:
-                included = scope == "--declared-package" or name == "exact-startup-lexical-copy"
+                included = scope == "--declared-package" or name in ("exact-startup-lexical-copy", "exact-startup-inline-arithmetic")
                 code = expected if included else 0
                 expected_stderr = stderr if included else b""
                 (root/"src/main.w").write_text(text.strip()+"\n")
