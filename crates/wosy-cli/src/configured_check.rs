@@ -13,6 +13,7 @@ use crate::canonical_loader::{
 };
 
 pub(crate) struct ConfiguredCheckReceipt {
+    pub(crate) root: PathBuf,
     pub(crate) outcome: Result<MainFlowProofReceipt, ScalarOrderedCheckerOutcome>,
     pub(crate) texts: BTreeMap<SourceIdentity, String>,
 }
@@ -73,32 +74,60 @@ impl ConfiguredCheckReceipt {
     }
 }
 
-pub(crate) enum CheckStreamPlanError {
-    FilePublication,
+pub(crate) enum CheckPublicationPreflightError {
+    UnsupportedFilePublication,
     ExitStatusOutsideByteRange,
+    File(io::Error),
 }
 
-pub(crate) struct PlannedCheckStreams<'a> {
+pub(crate) struct PreparedCheckPublication<'a> {
     status: u8,
     effects: &'a [PlannedCheckEffect<'a>],
+    #[cfg(target_os = "linux")]
+    files: Option<file_publication::PreparedFiles>,
 }
 
+#[cfg(target_os = "linux")]
+#[path = "check_file_publication.rs"]
+mod file_publication;
+
 impl PlannedCheckPublication<'_> {
-    pub(crate) fn stream_plan(&self) -> Result<PlannedCheckStreams<'_>, CheckStreamPlanError> {
-        if self.effects.iter().any(|effect| matches!(effect, PlannedCheckEffect::DeferredFile { .. })) {
-            return Err(CheckStreamPlanError::FilePublication);
-        }
+    pub(crate) fn prepare(&self, root: &Path) -> Result<PreparedCheckPublication<'_>, CheckPublicationPreflightError> {
         let status = match &self.status {
             InternalCheckStatus::Zero => 0,
             InternalCheckStatus::FirstNonzero(report) => u8::try_from(report.code())
-                .map_err(|_| CheckStreamPlanError::ExitStatusOutsideByteRange)?,
+                .map_err(|_| CheckPublicationPreflightError::ExitStatusOutsideByteRange)?,
         };
-        Ok(PlannedCheckStreams { status, effects: &self.effects })
+        let requests = self.effects.iter().filter_map(|effect| match effect {
+            PlannedCheckEffect::DeferredFile { relative, request, .. } => Some((relative.as_path(), request.text.as_ref())),
+            _ => None,
+        }).collect::<Vec<_>>();
+        if requests.iter().any(|(path, _)| path.components().count() != 1)
+            || (!cfg!(target_os = "linux") && !requests.is_empty())
+        {
+            return Err(CheckPublicationPreflightError::UnsupportedFilePublication);
+        }
+        #[cfg(target_os = "linux")]
+        let files = if requests.is_empty() {
+            None
+        } else {
+            Some(file_publication::PreparedFiles::new(root, &requests)
+                .map_err(CheckPublicationPreflightError::File)?)
+        };
+        #[cfg(not(target_os = "linux"))]
+        let _ = root;
+        Ok(PreparedCheckPublication {
+            status, effects: &self.effects,
+            #[cfg(target_os = "linux")]
+            files,
+        })
     }
 }
 
-impl PlannedCheckStreams<'_> {
+impl PreparedCheckPublication<'_> {
     pub(crate) fn publish(self, stdout: &mut impl Write, stderr: &mut impl Write) -> io::Result<u8> {
+        #[cfg(target_os = "linux")]
+        let mut staged = self.files.as_ref().map(|files| files.payloads.iter());
         for effect in self.effects {
             match effect {
                 PlannedCheckEffect::Stdout(bytes) => {
@@ -109,7 +138,17 @@ impl PlannedCheckStreams<'_> {
                     stderr.write_all(bytes)?;
                     stderr.flush()?;
                 }
-                PlannedCheckEffect::DeferredFile { .. } => unreachable!("file rejected during stream preflight"),
+                PlannedCheckEffect::DeferredFile { relative, .. } => {
+                    #[cfg(target_os = "linux")]
+                    self.files.as_ref().expect("file preflight").publish(
+                        staged.as_mut().and_then(Iterator::next).expect("one staged payload per request"), relative,
+                    )?;
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        let _ = relative;
+                        unreachable!("file publication is not supported on this platform");
+                    }
+                }
             }
         }
         Ok(self.status)
@@ -221,7 +260,7 @@ fn configured_target(
         loaded.declarations, loaded.proofs.into_values(), loaded.initialization_order,
         ScalarPreparationInputs { target_layout }, scope, dormant,
     );
-    Ok(ConfiguredCheckReceipt { outcome, texts: loaded.texts })
+    Ok(ConfiguredCheckReceipt { root, outcome, texts: loaded.texts })
 }
 
 #[derive(Debug, PartialEq)]

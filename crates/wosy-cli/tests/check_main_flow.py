@@ -1,4 +1,5 @@
 from pathlib import Path
+import os
 import subprocess
 import sys
 import tempfile
@@ -86,7 +87,7 @@ def main():
         ):
             assert label in failed.stderr, failed
 
-        source.write_text(rejected.replace("%%end", STREAMS + EFFECT + "%%end"), encoding="utf-8")
+        source.write_text(rejected.replace("%%end", STREAMS + EFFECT.replace("must-not-create.txt", "nested/must-not-create.txt") + "%%end"), encoding="utf-8")
         blocked = check("--main-flow-only")
         assert (blocked.returncode, blocked.stdout) == (2, b""), blocked
         assert blocked.stderr == b"wosy: check: result requires unsupported output; no result published\n", blocked
@@ -194,6 +195,75 @@ def main():
         assert b"source_root" in absent.stderr, absent
         still_main = check("--main-flow-only")
         assert (still_main.returncode, still_main.stdout, still_main.stderr) == (0, b"", b""), still_main
+
+    if sys.platform == "linux":
+        check_file_output(binary)
+
+
+def check_file_output(binary):
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory).resolve()
+        project = root / "project"
+        project.mkdir()
+        (project / "wosy.toml").write_text(MANIFEST, encoding="utf-8")
+        caller = project / "caller"
+        caller.mkdir()
+        source = project / "main.w"
+        output = project / ".wosy" / "outputs" / "check"
+        outside = root / "outside"
+        outside.mkdir()
+        sentinel = outside / "protected.txt"
+        sentinel.write_bytes(b"unchanged")
+        one = EFFECT.replace("must-not-create.txt", "proof.txt").replace("must not write", "proof café")
+        two = EFFECT.replace("must-not-create.txt", "empty.txt").replace("must not write", "")
+
+        def check(code):
+            source.write_text("%%start\n" + code + "%%end", encoding="utf-8")
+            return subprocess.run(
+                [binary, "check", "--main-flow-only"], cwd=caller,
+                capture_output=True, timeout=15,
+            )
+
+        bad_code = check(STREAMS.replace(".code = 71", ".code = 256") + one)
+        assert bad_code.returncode == 2 and bad_code.stdout == b"", bad_code
+        assert b"outside 0..=255" in bad_code.stderr and not output.exists(), bad_code
+
+        for directory in (output.parent.parent, output.parent, output):
+            directory.parent.mkdir(parents=True, exist_ok=True)
+            directory.symlink_to(outside, target_is_directory=True)
+            blocked = check(STREAMS + one)
+            assert blocked.returncode == 2 and blocked.stdout == b"", blocked
+            assert b"no result published" in blocked.stderr and not (outside / "proof.txt").exists(), blocked
+            directory.unlink()
+
+        success = check(STREAMS + one + two)
+        assert success.returncode == 71, success
+        assert success.stdout == "out-a:out-b café:out-cmust not emitmust not emit".encode(), success
+        assert success.stderr == b"err-a:err-b:err-cmust not emitmust not emit", success
+        assert sorted(path.name for path in output.iterdir()) == ["empty.txt", "proof.txt"]
+        assert (output / "proof.txt").read_bytes() == "proof café".encode()
+        assert (output / "empty.txt").read_bytes() == b""
+
+        for create in (
+            lambda target: target.symlink_to(sentinel),
+            lambda target: os.link(sentinel, target),
+            lambda target: os.mkfifo(target),
+        ):
+            conflict = output / "protected.txt"
+            create(conflict)
+            before = sorted(path.name for path in output.iterdir())
+            blocked = check(STREAMS + one.replace("proof.txt", "new.txt") + two.replace("empty.txt", "protected.txt"))
+            assert blocked.returncode == 2 and blocked.stdout == b"", blocked
+            assert b"protected.txt already exists" in blocked.stderr, blocked
+            assert sorted(path.name for path in output.iterdir()) == before
+            assert sentinel.read_bytes() == b"unchanged"
+            conflict.unlink()
+
+        added = check(one.replace("proof.txt", "new.txt"))
+        assert (added.returncode, added.stdout, added.stderr) == (71, b"must not emit", b"must not emit"), added
+        assert sorted(path.name for path in output.iterdir()) == ["empty.txt", "new.txt", "proof.txt"]
+        assert (output / "new.txt").read_bytes() == "proof café".encode()
+        assert not (caller / ".wosy").exists()
 
 
 if __name__ == "__main__":

@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [features]
-internal-checker = ["wosy-compiler/internal-checker", "wosy-project/internal-checker"]
+internal-checker = ["wosy-compiler/internal-checker", "wosy-project/internal-checker", "dep:rustix"]
 
 [dependencies]
 blake3.workspace = true
@@ -16,6 +16,9 @@ serde_json.workspace = true
 wosy-compiler.workspace = true
 wosy-project.workspace = true
 wosy-syntax.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "1.1.4", features = ["fs"], optional = true }
 
 [[bin]]
 name = "wosy"

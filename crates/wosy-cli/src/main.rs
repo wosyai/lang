@@ -844,7 +844,7 @@ fn render_project_diagnostics(
 fn check_command(
     target: Option<&str>, profile: &str, main_flow_only: bool, declared_package: bool,
 ) -> Result<u8, String> {
-    use configured_check::{CheckPublicationError, CheckStreamPlanError, ConfiguredCheckLoadError as LoadError};
+    use configured_check::{CheckPublicationError, CheckPublicationPreflightError, ConfiguredCheckLoadError as LoadError};
     use wosy_compiler::{Diagnostic, DiagnosticLabel, DiagnosticLabelKind, DiagnosticSeverity,
         ScalarCheckerScope, ScalarOrderedCheckerOutcome};
 
@@ -879,9 +879,11 @@ fn check_command(
     if !declared_package && (report.symbolic_diagnostic.is_some() || !report.additional_symbolic_diagnostics.is_empty()) {
         return Err(unsupported_output());
     }
-    let streams = publication.stream_plan().map_err(|error| match error {
-        CheckStreamPlanError::FilePublication => unsupported_output(),
-        CheckStreamPlanError::ExitStatusOutsideByteRange =>
+    let authored = publication.prepare(&receipt.root).map_err(|error| match error {
+        CheckPublicationPreflightError::UnsupportedFilePublication => unsupported_output(),
+        CheckPublicationPreflightError::File(error) =>
+            format!("check: could not prepare authored files; no result published: {error}"),
+        CheckPublicationPreflightError::ExitStatusOutsideByteRange =>
             "check: selected exit code is outside 0..=255; no result published".to_owned(),
     })?;
     let actual = report.diagnostics.iter().map(|failure| {
@@ -959,8 +961,8 @@ fn check_command(
         }
     });
     let diagnostics = actual.chain(symbolic).collect::<Vec<_>>();
-    let authored_status = streams.publish(&mut std::io::stdout().lock(), &mut std::io::stderr().lock())
-        .map_err(|error| format!("check: could not publish authored streams: {error}"))?;
+    let authored_status = authored.publish(&mut std::io::stdout().lock(), &mut std::io::stderr().lock())
+        .map_err(|error| format!("check: could not complete authored output; earlier records may already be published: {error}"))?;
     render_project_diagnostics(&diagnostics, publication.texts);
     Ok(if authored_status != 0 { authored_status } else { u8::from(!diagnostics.is_empty()) })
 }
