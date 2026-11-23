@@ -70,6 +70,7 @@ pub struct ScalarCheckerFailure {
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct ScalarCheckerIntegerWitness {
+    equal_axes: Vec<(usize, usize)>,
     axes: Vec<(ReferenceBindingId, ScalarType)>,
     state: IntegerInputs,
 }
@@ -82,6 +83,10 @@ impl ScalarCheckerIntegerWitness {
 
     pub fn row_count(&self) -> usize {
         self.state.row_count()
+    }
+
+    pub fn equal_axes(&self) -> &[(usize, usize)] {
+        &self.equal_axes
     }
 
     pub fn intervals_at(
@@ -272,7 +277,7 @@ fn materialize_checker_failure(error: ProjectCheck) -> Option<ScalarCheckerFailu
         stdout: output.stdout_bytes,
         stderr: output.stderr_bytes,
         code: output.code_value,
-        witness: ScalarCheckerIntegerWitness { axes, state },
+        witness: ScalarCheckerIntegerWitness { axes, state, equal_axes: Vec::new() },
     })
 }
 
@@ -1064,7 +1069,7 @@ fn check_initializer_expression<const COLLECT: bool, const PRIVATE_NESTED_SCALAR
                 return Err(selected_failure(source, directive, span, IntegerInputs::closed(), Vec::new()));
             }
             failures.as_deref_mut().ok_or(ProjectCheck::Unsupported)?
-                .push(source, directive, span, IntegerInputs::closed(), Vec::new());
+                .push(source, directive, span, IntegerInputs::closed(), Vec::new(), Vec::new());
             if directive.operation == CheckerOperation::Narrow {
                 return Ok(StartupLane::Empty);
             }
@@ -2041,13 +2046,14 @@ impl OrderedFailures {
         span: ByteSpan,
         state: IntegerInputs,
         axes: Vec<(ReferenceBindingId, ScalarType)>,
+        equal_axes: Vec<(usize, usize)>,
     ) {
         self.records.push(ScalarOrderedCheckerFailure {
             source: source.clone(),
             operation: directive.operation.into(),
             directive: span,
             condition: directive.condition,
-            witness: ScalarCheckerIntegerWitness { axes, state },
+            witness: ScalarCheckerIntegerWitness { axes, state, equal_axes },
             output: self.payloads.shared(directive),
         });
     }
@@ -2074,6 +2080,7 @@ impl OrderedFailures {
             body.occurrences[failure.directive.0].span,
             failure.state,
             failure.axes.into_iter().map(|(binding, ty)| (binding.clone(), ty.clone())).collect(),
+            failure.equal_axes,
         );
     }
 }
@@ -2081,7 +2088,7 @@ impl OrderedFailures {
 #[cfg(all(test, feature = "internal-checker"))]
 fn ordered_failure_as_legacy(failure: ScalarOrderedCheckerFailure) -> ProjectCheck {
     let ScalarOrderedCheckerFailure {
-        source, operation, directive, condition, witness: ScalarCheckerIntegerWitness { axes, state }, output,
+        source, operation, directive, condition, witness: ScalarCheckerIntegerWitness { axes, state, .. }, output,
     } = failure;
     let operation = match operation {
         ScalarCheckerOperation::Require => CheckerOperation::Require,
@@ -2703,6 +2710,7 @@ impl SelectedSymbolicProof<'_, '_> {
             callable: callable_span(function.name_span), output: callable_span(failure.output),
             directive_position: position,
             witness: ScalarCheckerIntegerWitness {
+                equal_axes: Vec::new(),
                 axes: failure.axes.into_iter().map(|(binding, ty)| (binding.clone(), ty.clone())).collect(),
                 state: failure.state,
             },
@@ -3689,6 +3697,7 @@ impl SymbolicRootProof for RankedOrderedSymbolic<'_, '_> {
                     output: wosy_syntax::SourceSpan { source: base.return_source.clone(), range: base.return_span },
                     directive_position: effects.records.len(),
                     witness: ScalarCheckerIntegerWitness {
+                        equal_axes: Vec::new(),
                         axes,
                         state: IntegerInputs::entry_point(earlier.map(|(_, value)| value), &base.entry),
                     },
@@ -8200,9 +8209,59 @@ mod tests {
         assert_eq!(failed.code(), &BigInt::from(7));
         assert!(failed.witness.intervals_at(0, 0).unwrap().eq([(&BigInt::from(-128), &BigInt::from(-1))]));
         assert!(failed.witness.intervals_at(0, 1).unwrap().eq([(&BigInt::from(-7), &BigInt::from(-7))]));
-        let alias = text.replace("if (n < 0) { -7 } else { 6 }", "n");
-        assert!(matches!(run("symbolic-returns-alias", &alias, ScalarCheckerScope::CurrentPackage),
-            Err(ProjectCheck::Unsupported)));
+
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordered_base_symbolic_call_identity_shares_live_input_axis() {
+        let report = |code| OUTPUT.replace(".code = 1", &format!(".code = {code}"));
+        let text = format!(r#"%%start
+            i8(i8) identity = fn(value) {{ value }};
+            i8(i8) wrapped = fn(value) {{ i8 intermediate = identity(value); intermediate }};
+            unit(i8) unused = fn(input) {{
+                i8 observed = wrapped(input);
+                if (input < 0) {{
+                    i8 nested_alias = identity(observed);
+                    core.require(nested_alias < 0, {});
+                }} else {{ core.require(observed >= 0, {}); }};
+                core.narrow(observed >= 0, {});
+                core.require(input >= 0, {});
+            }};
+        %%end"#, report(7), report(11), report(13), report(17));
+        let run = |revision, input: &str| {
+            let app = source("src/main.w", revision);
+            let prepared = prepare_proof_target(&app, input).unwrap();
+            run_closed_without_named_proofs(&prepared, ScalarCheckerScope::CurrentPackage, 1)
+        };
+        let pass = run("symbolic-identity-pass", &text).unwrap();
+        assert!(pass.active && pass.directives.is_empty());
+        let failure = run("symbolic-identity-fail", &text.replace("nested_alias < 0", "nested_alias >= 0")).unwrap();
+        let [failed] = failure.directives.as_slice() else { panic!("only the nested alias requirement fails"); };
+        assert_eq!(failed.code(), &BigInt::from(7));
+        assert_eq!(failed.witness.equal_axes(), &[(1, 0), (2, 0)]);
+        for axis in 0..3 {
+            assert!(failed.witness.intervals_at(0, axis).unwrap().eq([(&BigInt::from(-128), &BigInt::from(-1))]));
+        }
+        let changed = text.replace("if (input < 0)", "observed = 0; if (input < 0)");
+        assert!(matches!(run("symbolic-identity-write", &changed), Err(ProjectCheck::Unsupported)));
+        let mixed = text.replace("fn(value) { value }", "fn(value) { if (value < 0) { value } else { 1 } }");
+        assert!(matches!(run("symbolic-identity-mixed", &mixed), Err(ProjectCheck::Unsupported)));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordered_named_proof_does_not_consume_ordinary_alias_effects() {
+        let app = source("src/main.w", "named-proof-ordinary-alias-firewall");
+        let text = r#"%%start
+            i8(i8) identity = fn(value) { value };
+            i8(i8) wrapped = fn(value) { i8 intermediate = identity(value); intermediate };
+            proof point for wrapped(entry) -> (out) where (entry == 7) ensures (out == 7) {}
+        %%end"#;
+        let (_, proof) = crate::parse_proof_source(app.clone(), text.to_owned(), &[]).ok().unwrap();
+        assert!(matches!(check_loaded_ordered_proof_diagnostics(
+            Vec::new(), vec![(proof, Vec::new())], vec![app], inputs(), ScalarCheckerScope::CurrentPackage,
+        ), Err(ProjectCheck::Unsupported)));
     }
 
     #[cfg(feature = "internal-checker")]
