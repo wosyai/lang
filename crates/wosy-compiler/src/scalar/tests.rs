@@ -6695,6 +6695,51 @@ bool integer_inversion = !1;
 }
 
 #[test]
+fn nested_bitwise_truncation_context_requires_a_known_operand_type() {
+    for (body, diagnostic) in [
+        (
+            "core.int_trunc<i32>((value ^ (value >> 16)) & 255)",
+            None,
+        ),
+        (
+            "core.int_trunc<i32>(255 & (value ^ (16 >> value)))",
+            None,
+        ),
+        (
+            "i64 masked = (value ^ (value >> 16)) & 255; core.int_trunc<i32>(masked)",
+            None,
+        ),
+        (
+            "core.int_trunc<i32>((1 ^ (2 >> 3)) & 255)",
+            Some("requires a destination with the appropriate integer width"),
+        ),
+        (
+            "u64 unsigned = 1; core.int_trunc<i32>(value & unsigned)",
+            Some("type does not match"),
+        ),
+    ] {
+        let text = format!("%%start\ni32(i64) sample = fn(value) {{ {body} }};\n%%end");
+        let standalone = validate_text(&text);
+        let project = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::new(source(), standalone.program.items.clone(), Vec::new())],
+            vec![source()],
+        ));
+        for diagnostics in [&standalone.diagnostics, &project.diagnostics] {
+            if let Some(expected) = diagnostic {
+                assert!(
+                    diagnostics.iter().any(|diagnostic| {
+                        diagnostic.code == "B0003" && diagnostic.message.contains(expected)
+                    }),
+                    "{body}: {diagnostics:?}",
+                );
+            } else {
+                assert!(diagnostics.is_empty(), "{body}: {diagnostics:?}");
+            }
+        }
+    }
+}
+
+#[test]
 fn preserves_scalar_precedence_and_left_associativity() {
     let result = validate_text(
         "%%start\ni32 value = 1 | 2 ^ 3 & 4 << 1 + 2 * 3;\ni32 shifts = 8 >> 1 >> 1;\n%%end",
@@ -8573,6 +8618,91 @@ fn rejects_invalid_character_shapes_at_literal_spans() {
             .expect("character diagnostic");
         assert!(diagnostic.labels[0].span.range.start >= literal_start);
         assert!(diagnostic.labels[0].span.range.end <= literal_end);
+    }
+}
+
+#[test]
+fn direct_and_grouped_value_field_reads_canonically_derive_both_spans() {
+    for expression in ["make(42).value", "(make(42)).value"] {
+        let text = format!(
+            "%%start\nstruct copy Pair {{ i32 value; }}\nPair(i32) make = fn(seed) {{ {{ .value = seed; }} }};\ni32() get = fn {{ {expression} }};\n%%end"
+        );
+        let start = text.find(expression).unwrap() as u32;
+        let parsed = parse_source(source(), text, &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let declarations = derive_scalar_declarations_from_cst(parsed.result.canonical_cst());
+        assert!(declarations.diagnostics().is_empty(), "{:?}", declarations.diagnostics());
+        let get = declarations.items.iter().find_map(|item| match item {
+            ScalarItem::Function(function) if function.name == "get" => Some(function),
+            _ => None,
+        }).expect("reader function");
+        let [ScalarBlockItem::Expression(ScalarExpression::ValueField { receiver, name, name_span, span })] =
+            get.body.items.as_slice() else { panic!("{:?}", get.body.items) };
+        assert!(matches!(receiver.as_ref(), ScalarExpression::Call { name, .. } if name == "make"));
+        assert_eq!(name, "value");
+        let end = start + expression.len() as u32;
+        assert_eq!(*span, ByteSpan::new(start, end));
+        assert_eq!(*name_span, ByteSpan::new(end - 5, end));
+    }
+}
+
+#[test]
+fn invalid_temporary_places_reject_direct_canonical_derivation_without_panicking() {
+    let text = "%%start
+struct copy Pair { i32 value; }
+Pair(i32) make = fn(seed) { { .value = seed; } };
+unit() set = fn { (make(42)).value = 7; };
+%%end";
+    let parsed = parse_source(source(), text.into(), &[]);
+    assert_eq!(parsed.diagnostics.len(), 1, "{:?}", parsed.diagnostics);
+    let declarations = derive_scalar_declarations_from_cst(parsed.result.canonical_cst());
+    let [diagnostic] = declarations.diagnostics() else { panic!("{:?}", declarations.diagnostics()) };
+    assert_eq!(diagnostic.message, "a field of a temporary is not an assignable or borrowable place");
+}
+
+#[test]
+fn integer_literals_keep_radix_values_and_separator_rules() {
+    for (text, value) in [
+        ("0", 0),
+        ("12345", 12345),
+        ("12_345", 12345),
+        ("0xAa", 170),
+        ("0XA_a", 170),
+        ("0b1010", 10),
+        ("0B10_10", 10),
+        ("0o17", 15),
+        ("0O1_7", 15),
+    ] {
+        assert_eq!(parse_integer(text), Some(BigInt::from(value)), "{text}");
+    }
+    let large = "340282366920938463463374607431768211456";
+    assert_eq!(parse_integer(large), Some(BigInt::from(1) << 128));
+    for text in [
+        "", "0x", "0b", "0o", "+1", "-1", "0x+1", "0x-1", "10u8", "0b2", "0xg",
+        "0o8", "_1", "1_", "1__2", "0x_FF", "0B1_", "0o1__7", "１２",
+    ] {
+        assert_eq!(parse_integer(text), None, "{text}");
+    }
+}
+
+#[test]
+fn float_literals_keep_exact_values_and_separator_rules() {
+    for (text, value) in [
+        ("1.5", 1.5_f64),
+        ("1_.5", 1.5),
+        ("1_0.2_5e-1", 1.025),
+        ("1e1_0", 1e10),
+        ("1_e2", 1e2),
+        ("1E+2", 1e2),
+        ("1e-999", 0.0),
+    ] {
+        assert_eq!(parse_float(text).map(f64::to_bits), Some(value.to_bits()), "{text}");
+    }
+    for text in [
+        "", "NaN", "inf", "1.0e999", "1_0e999", "1.2f32", "1e", "1e+", "_1.0",
+        "1.0_", "1.0__2", "1._0", "1e_2", "1E_2", "1e+_2", "1e-_2",
+    ] {
+        assert_eq!(parse_float(text), None, "{text}");
     }
 }
 
@@ -14176,4 +14306,45 @@ unit(Pair) inspect = fn(owner) {
                 "{diagnostics:?}");
         }
     }
+}
+
+#[test]
+fn shared_cst_declaration_walk_keeps_legacy_membership_order_and_ids() {
+    use wosy_syntax::{CanonicalCstSnapshotElement as Element, CanonicalCstSnapshotNode};
+    fn find(node: &CanonicalCstSnapshotNode, kind: SyntaxKind, spelling: &str) -> CanonicalCstSnapshotNode {
+        if node.kind == kind && node.text.starts_with(spelling) {
+            return node.clone();
+        }
+        for child in &node.children {
+            if let Element::Node(child) = child {
+                if child.text.contains(spelling) {
+                    return find(child, kind, spelling);
+                }
+            }
+        }
+        panic!("missing declaration {spelling}");
+    }
+    let text = "%%start
+struct First { i32 value; }
+enum Early { zero; }
+struct Last { i32 value; }
+enum Late { one; }
+%%end";
+    let parsed = parse_source(source(), text.into(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let mut snapshot = parsed.result.canonical_cst().snapshot();
+    let last = find(&snapshot.root, SyntaxKind::StructDecl, "struct Last");
+    let late = find(&snapshot.root, SyntaxKind::EnumDecl, "enum Late");
+    let first = find(&snapshot.root, SyntaxKind::StructDecl, "struct First");
+    let selected = snapshot.root.children.iter_mut().find_map(|child| match child {
+        Element::Node(node) if node.kind == SyntaxKind::Root => Some(node),
+        _ => None,
+    }).unwrap();
+    selected.children.extend([Element::Node(last), Element::Node(late)]);
+    snapshot.root.children.push(Element::Node(first));
+    let declarations = derive_scalar_declarations_from_cst(&CanonicalCstRoot::from_snapshot(snapshot));
+    assert_eq!(declarations.structs.iter().map(|decl| (decl.name.as_str(), decl.id.index)).collect::<Vec<_>>(),
+        [("Last", 0), ("First", 1), ("Last", 2), ("Last", 3)]);
+    assert_eq!(declarations.enums.iter().map(|decl| (decl.name.as_str(), decl.id.index)).collect::<Vec<_>>(),
+        [("Late", 0), ("Early", 1), ("Late", 2), ("Late", 3)]);
 }

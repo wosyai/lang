@@ -1,0 +1,231 @@
+shared_stdlib = true
+
+[[steps]]
+command = ["wosy", "build", "nested-native"]
+exit = 0
+
+[[steps]]
+command = ["wosy", "build", "nested-wasm"]
+exit = 0
+
+[[steps]]
+command = ["wosy", "build", "named-native"]
+exit = 0
+
+[[steps]]
+command = ["wosy", "build", "named-wasm"]
+exit = 0
+
+[[steps]]
+command = ["wosy", "build", "controls-native"]
+exit = 0
+
+[[steps]]
+command = ["wosy", "build", "controls-wasm"]
+exit = 0
+
+[[steps]]
+command = ["wosy", "build", "initializer-native"]
+exit = 0
+
+[[steps]]
+command = ["wosy", "build", "initializer-wasm"]
+exit = 0
+
+[[steps]]
+command = ["wosy", "build", "checked-parse-native"]
+exit = 0
+
+[[steps]]
+command = ["wosy", "build", "checked-parse-wasm"]
+exit = 0
+
+[[steps]]
+command = ["wosy", "build", "forwarded-native"]
+exit = 0
+
+[[steps]]
+command = ["wosy", "build", "forwarded-wasm"]
+exit = 0
+
+[[steps]]
+command = ["wosy", "build", "parameter-native"]
+exit = 0
+
+[[steps]]
+command = ["wosy", "build", "parameter-wasm"]
+exit = 0
+
+[[steps]]
+command = ["wosy", "build", "parameter-relay-native"]
+exit = 0
+
+[[steps]]
+command = ["wosy", "build", "parameter-relay-wasm"]
+exit = 0
+
+[[steps]]
+command = ["wosy", "build", "lexical-move-native"]
+exit = 0
+
+[[steps]]
+command = ["wosy", "build", "lexical-move-wasm"]
+exit = 0
+
+[[steps]]
+command = ["wosy", "build", "raw-view-native"]
+exit = 0
+
+[[steps]]
+command = ["wosy", "build", "raw-view-wasm"]
+exit = 0
+
+[[assert]]
+command = ["wosy", "run", "nested-native"]
+exit = 0
+stdout = "expected/nested.stdout"
+stderr = "expected/verified.stderr"
+exact = true
+
+[[assert]]
+command = ["wosy", "run", "nested-wasm"]
+exit = 0
+stdout = "expected/nested.stdout"
+stderr = "expected/verified.stderr"
+exact = true
+
+[[assert]]
+command = ["wosy", "run", "named-native"]
+exit = 0
+stdout = "expected/named.stdout"
+stderr = "expected/verified.stderr"
+exact = true
+
+[[assert]]
+command = ["wosy", "run", "named-wasm"]
+exit = 0
+stdout = "expected/named.stdout"
+stderr = "expected/verified.stderr"
+exact = true
+
+[[assert]]
+command = ["wosy", "run", "controls-native"]
+exit = 0
+stdout = "expected/controls.stdout"
+stderr = "expected/verified.stderr"
+exact = true
+
+[[assert]]
+command = ["wosy", "run", "controls-wasm"]
+exit = 0
+stdout = "expected/controls.stdout"
+stderr = "expected/verified.stderr"
+exact = true
+
+[[assert]]
+command = ["wosy", "run", "initializer-native"]
+exit = 0
+stdout = "expected/initializer.stdout"
+stderr = "expected/verified.stderr"
+exact = true
+
+[[assert]]
+command = ["wosy", "run", "initializer-wasm"]
+exit = 0
+stdout = "expected/initializer.stdout"
+stderr = "expected/verified.stderr"
+exact = true
+
+[[assert]]
+command = ["wosy", "run", "checked-parse-native"]
+exit = 0
+stdout = "expected/named.stdout"
+stderr = "expected/verified.stderr"
+exact = true
+
+[[assert]]
+command = ["wosy", "run", "checked-parse-wasm"]
+exit = 0
+stdout = "expected/named.stdout"
+stderr = "expected/verified.stderr"
+exact = true
+
+[[assert]]
+command = ["wosy", "run", "forwarded-native"]
+exit = 0
+stdout = "expected/nested.stdout"
+stderr = "expected/verified.stderr"
+exact = true
+
+[[assert]]
+command = ["wosy", "run", "forwarded-wasm"]
+exit = 0
+stdout = "expected/nested.stdout"
+stderr = "expected/verified.stderr"
+exact = true
+
+[[assert]]
+command = ["wosy", "run", "parameter-native"]
+exit = 0
+stdout = "expected/named.stdout"
+stderr = "expected/verified.stderr"
+exact = true
+
+[[assert]]
+command = ["wosy", "run", "parameter-wasm"]
+exit = 0
+stdout = "expected/named.stdout"
+stderr = "expected/verified.stderr"
+exact = true
+
+[[assert]]
+command = ["wosy", "run", "parameter-relay-native"]
+exit = 0
+stdout = "expected/named.stdout"
+stderr = "expected/verified.stderr"
+exact = true
+
+[[assert]]
+command = ["wosy", "run", "parameter-relay-wasm"]
+exit = 0
+stdout = "expected/named.stdout"
+stderr = "expected/verified.stderr"
+exact = true
+
+[[assert]]
+command = ["wosy", "run", "lexical-move-native"]
+exit = 0
+stdout = "expected/named.stdout"
+stderr = "expected/verified.stderr"
+exact = true
+
+[[assert]]
+command = ["wosy", "run", "lexical-move-wasm"]
+exit = 0
+stdout = "expected/named.stdout"
+stderr = "expected/verified.stderr"
+exact = true
+
+[[assert]]
+command = ["wosy", "run", "raw-view-native"]
+exit = 0
+stdout = "expected/raw_view.stdout"
+stderr = "expected/verified.stderr"
+exact = true
+
+[[assert]]
+command = ["wosy", "run", "raw-view-wasm"]
+exit = 0
+stdout = "expected/raw_view.stdout"
+stderr = "expected/verified.stderr"
+exact = true
+
+[[assert]]
+command = ["wosy", "build", "lexical-move-stale-native"]
+exit = 1
+stderr_contains = ["B0003", "read or move of unavailable place", "src/lexical_move_stale.w:11:", "std.print(outer)"]
+
+[[assert]]
+command = ["wosy", "build", "lexical-move-stale-wasm"]
+exit = 1
+stderr_contains = ["B0003", "read or move of unavailable place", "src/lexical_move_stale.w:11:", "std.print(outer)"]

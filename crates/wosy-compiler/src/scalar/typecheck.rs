@@ -404,6 +404,7 @@ pub(super) fn expression_span(expression: &ScalarExpression) -> ByteSpan {
         | ScalarExpression::CheckedAddress { span, .. }
         | ScalarExpression::Dereference { span, .. }
         | ScalarExpression::IndexedRead { span, .. }
+        | ScalarExpression::ValueField { span, .. }
         | ScalarExpression::StructLiteral { span, .. }
         | ScalarExpression::ArrayLiteral { span, .. }
         | ScalarExpression::Binary { span, .. }
@@ -3116,6 +3117,50 @@ fn is_float_arithmetic_operator(operator: &BinaryOperator) -> bool {
 // Leaves and obvious non-float shapes need no cache access. Check both
 // children shallowly before following a composite, so ordinary arithmetic
 // spines with a named or integer operand have no recursive shape walk.
+fn is_homogeneous_bitwise(operator: &BinaryOperator) -> bool {
+    matches!(
+        operator,
+        BinaryOperator::BitAnd
+            | BinaryOperator::BitOr
+            | BinaryOperator::BitXor
+            | BinaryOperator::ShiftLeft
+            | BinaryOperator::ShiftRight
+    )
+}
+
+fn is_integer_literal_operand(expression: &ScalarExpression) -> bool {
+    match expression {
+        ScalarExpression::Integer { .. } => true,
+        ScalarExpression::Unary {
+            operator: UnaryOperator::Negate | UnaryOperator::BitwiseNot,
+            operand,
+            ..
+        } => matches!(operand.as_ref(), ScalarExpression::Integer { .. }),
+        _ => false,
+    }
+}
+
+fn infer_bitwise_operands(
+    left: &ScalarExpression,
+    right: &ScalarExpression,
+    mut check: impl FnMut(&ScalarExpression, Option<&ScalarType>) -> ScalarType,
+) -> (ScalarType, ScalarType) {
+    let left_literal = is_integer_literal_operand(left);
+    let right_literal = is_integer_literal_operand(right);
+    if left_literal && !right_literal {
+        let right_type = check(right, None);
+        let left_type = check(left, is_integer_type(&right_type).then_some(&right_type));
+        (left_type, right_type)
+    } else {
+        let left_type = check(left, None);
+        let right_type = check(
+            right,
+            (!left_literal && right_literal && is_integer_type(&left_type)).then_some(&left_type),
+        );
+        (left_type, right_type)
+    }
+}
+
 fn float_literal_leaf(expression: &ScalarExpression) -> Option<bool> {
     match expression {
         ScalarExpression::Float { .. } => Some(true),
@@ -3308,6 +3353,29 @@ fn check_expression_type_in_module(
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
     match expression {
+        ScalarExpression::ValueField { receiver, name, name_span, span } => {
+            if !matches!(receiver.as_ref(), ScalarExpression::Call { .. }) {
+                diagnostics.push(module_diagnostic(module, "B0003", "field value receiver must be a call result", *span));
+                return ScalarType::Error;
+            }
+            let ty = expression_type_in_module(
+                receiver, scope, visible_names, folded_names,
+                module, modules, diagnostics, unsafe_context, overloads, inference,
+            );
+            if is_error_type(&ty) {
+                return ScalarType::Error;
+            }
+            match checked_value_field(&ty, name, |id| modules.get(overloads.module_ordinal_for_source(&id.source)?)?.structs.get(id.index)) {
+                Ok(field) => {
+                    inference.record_value_field(expression, &field.id);
+                    field.ty.clone()
+                }
+                Err(message) => {
+                    diagnostics.push(module_diagnostic(module, "B0003", message, *name_span));
+                    ScalarType::Error
+                }
+            }
+        }
         ScalarExpression::Name { name, span } if name == "null" => {
             diagnostics.push(module_diagnostic(
                 module,
@@ -3555,6 +3623,12 @@ fn check_expression_type_in_module(
             right,
             span,
         } => {
+            if is_homogeneous_bitwise(operator) {
+                return check_expression_type_in_module_expected(
+                    expression, None, scope, visible_names, folded_names, module, modules,
+                    diagnostics, unsafe_context, overloads, inference,
+                );
+            }
             let literal_operands = float_literal_arithmetic_operands(operator, left, right, inference);
             if let Some(inferred) = infer_float_literal_arithmetic(literal_operands, left, right, |operand, expected| {
                 expression_type_in_module_expected(
@@ -4751,7 +4825,14 @@ fn check_expression_type_in_module_expected(
             );
         }
         let bool_context = ScalarType::Bool;
-        let (left_type, right_type) = if comparison && is_null_expression(left) {
+        let (left_type, right_type) = if bitwise && arithmetic_context.is_none() {
+            infer_bitwise_operands(left, right, |operand, expected| {
+                expression_type_in_module_expected(
+                    operand, expected, scope, visible_names, folded_names, module, modules,
+                    diagnostics, unsafe_context, overloads, inference,
+                )
+            })
+        } else if comparison && is_null_expression(left) {
             let right_type = expression_type_in_module_expected(
                 right,
                 None,
@@ -4961,6 +5042,26 @@ fn utf8_type_from_context(
         .flat_map(|target| target.structs.iter())
         .find(|structure| structure.id == *expected_id && structure.name == "utf8")
         .map(|structure| ScalarType::Struct(structure.id.clone()))
+}
+
+fn checked_value_field<'a>(
+    receiver: &ScalarType,
+    name: &str,
+    lookup: impl FnOnce(&ScalarStructId) -> Option<&'a ScalarStruct>,
+) -> Result<&'a ScalarStructField, &'static str> {
+    let ScalarType::Struct(id) = receiver else {
+        return Err("field value receiver must be a copy struct");
+    };
+    let structure = lookup(id)
+        .filter(|structure| &structure.id == id && structure.copy_policy == CopyPolicy::Copy)
+        .ok_or("field value receiver must be a copy struct")?;
+    let field = structure.fields.iter().find(|field| field.name == name)
+        .ok_or("unknown struct field")?;
+    if super::reference::aggregate::ordinary_value(&field.ty) {
+        Ok(field)
+    } else {
+        Err("field value must be an ordinary copy scalar")
+    }
 }
 
 fn member_field_in_module<'a>(
@@ -6765,7 +6866,7 @@ fn validate_unit_if_position(
             validate_unit_if_position(left, false, source, diagnostics);
             validate_unit_if_position(right, false, source, diagnostics);
         }
-        ScalarExpression::Unary { operand, .. } => {
+        ScalarExpression::Unary { operand, .. } | ScalarExpression::ValueField { receiver: operand, .. } => {
             validate_unit_if_position(operand, false, source, diagnostics);
         }
         ScalarExpression::Call { arguments, .. } => {
@@ -7348,7 +7449,7 @@ impl<'tree> StaticUseAnalyzer<'tree> {
         match expression {
             ScalarExpression::Name { name, .. } => self.use_name(name),
             ScalarExpression::Member { receiver, .. } => self.use_name(receiver),
-            ScalarExpression::Unary { operand, .. } => self.expression(operand),
+            ScalarExpression::Unary { operand, .. } | ScalarExpression::ValueField { receiver: operand, .. } => self.expression(operand),
             ScalarExpression::Binary { left, right, .. } => {
                 self.expression(left);
                 self.expression(right);
@@ -8001,6 +8102,29 @@ fn check_expression_type(
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
     match expression {
+        ScalarExpression::ValueField { receiver, name, name_span, span } => {
+            if !matches!(receiver.as_ref(), ScalarExpression::Call { .. }) {
+                diagnostics.push(diagnostic(program, "B0003", "field value receiver must be a call result", *span));
+                return ScalarType::Error;
+            }
+            let ty = expression_type(
+                receiver, scope, visible_names, folded_names,
+                program, diagnostics, unsafe_context, overloads, inference,
+            );
+            if is_error_type(&ty) {
+                return ScalarType::Error;
+            }
+            match checked_value_field(&ty, name, |id| program.structs.get(id.index)) {
+                Ok(field) => {
+                    inference.record_value_field(expression, &field.id);
+                    field.ty.clone()
+                }
+                Err(message) => {
+                    diagnostics.push(diagnostic(program, "B0003", message, *name_span));
+                    ScalarType::Error
+                }
+            }
+        }
         ScalarExpression::RawAddress { place, span } => {
             if !unsafe_context {
                 diagnostics.push(diagnostic(
@@ -8247,33 +8371,23 @@ fn check_expression_type(
                     inference,
                 );
             }
-            let left_type = expression_type(
-                left,
-                scope,
-                visible_names,
-                folded_names,
-                program,
-                diagnostics,
-                unsafe_context,
-                overloads,
-                inference,
-            );
-            let right_type = if comparison {
-                expression_type_expected(
-                    right,
-                    &left_type,
-                    scope,
-                    visible_names,
-                    folded_names,
-                    program,
-                    diagnostics,
-                    unsafe_context,
-                    overloads,
-                    inference,
-                )
+            let (left_type, right_type) = if is_homogeneous_bitwise(operator) {
+                infer_bitwise_operands(left, right, |operand, expected| {
+                    if let Some(expected) = expected {
+                        expression_type_expected(
+                            operand, expected, scope, visible_names, folded_names, program,
+                            diagnostics, unsafe_context, overloads, inference,
+                        )
+                    } else {
+                        expression_type(
+                            operand, scope, visible_names, folded_names, program, diagnostics,
+                            unsafe_context, overloads, inference,
+                        )
+                    }
+                })
             } else {
-                expression_type(
-                    right,
+                let left_type = expression_type(
+                    left,
                     scope,
                     visible_names,
                     folded_names,
@@ -8282,7 +8396,34 @@ fn check_expression_type(
                     unsafe_context,
                     overloads,
                     inference,
-                )
+                );
+                let right_type = if comparison {
+                    expression_type_expected(
+                        right,
+                        &left_type,
+                        scope,
+                        visible_names,
+                        folded_names,
+                        program,
+                        diagnostics,
+                        unsafe_context,
+                        overloads,
+                        inference,
+                    )
+                } else {
+                    expression_type(
+                        right,
+                        scope,
+                        visible_names,
+                        folded_names,
+                        program,
+                        diagnostics,
+                        unsafe_context,
+                        overloads,
+                        inference,
+                    )
+                };
+                (left_type, right_type)
             };
             if is_error_type(&left_type) || is_error_type(&right_type) {
                 return ScalarType::Error;

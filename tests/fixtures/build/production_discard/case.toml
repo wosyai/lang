@@ -11,13 +11,13 @@ exit = 0
 [[assert]]
 command = ["wosy", "run", "native"]
 exit = 0
-stdout = "expected/empty"
+stdout = "expected/verified"
 stderr = "expected/empty"
 exact = true
 
 [[assert]]
 command = ["wosy", "run", "wasm"]
 exit = 0
-stdout = "expected/empty"
+stdout = "expected/verified"
 stderr = "expected/empty"
 exact = true

@@ -433,7 +433,7 @@ pub(super) fn place_pointer<'ctx, 'module>(
             let ScalarType::Array { length, .. } = base_type else { unreachable!("fixed array") };
             let checked = !fixed_index_has_raw_root(state, base);
             if checked {
-                check_fixed_index(context, state, index, length, false)?;
+                check_fixed_index(context, state, index, length, None)?;
             }
             fixed_array_element_pointer(context, state, &base_type, base_pointer, index, checked)
         }
@@ -539,6 +539,22 @@ fn fixed_array_element_pointer<'ctx>(
         }
     }
     let array = storage_type(context, ty, state.layouts, state.target_layout)?;
+    // The release helper and domain checks consume the full language-level
+    // selector; target-width conversion belongs only at address construction.
+    let index = if state.target_layout == ScalarTargetLayout::WASM32
+        && index.get_type().get_bit_width() > 32
+    {
+        state
+            .builder
+            .build_int_truncate(
+                index,
+                pointer_integer_type(context, state.target_layout),
+                "array_address_index",
+            )
+            .map_err(builder_error)?
+    } else {
+        index
+    };
     unsafe {
         state.builder.build_in_bounds_gep(
             array, base, &[context.i32_type().const_zero(), index], "array_element",
@@ -562,8 +578,26 @@ pub(super) fn checked_fixed_assignment_element_pointer<'ctx>(
     };
     let pointer = place_pointer(context, state, base, project)?;
     let index = emit_place_index(context, state, index, project)?;
-    check_fixed_index(context, state, index, length, true)?;
+    check_fixed_index(context, state, index, length, Some((
+        "assignment_index_out_of_bounds", "assignment_index_panic", "assignment_index_continue",
+    )))?;
     fixed_array_element_pointer(context, state, &ty, pointer, index, true)
+}
+
+pub(super) fn checked_ordinary_snapshot_element_pointer<'ctx>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, '_>,
+    ty: &ScalarType,
+    pointer: PointerValue<'ctx>,
+    length: u64,
+    index: &ScalarExpression,
+    project: Option<ProjectCallScope<'_>>,
+) -> Result<PointerValue<'ctx>, String> {
+    let index = emit_place_index(context, state, index, project)?;
+    check_fixed_index(context, state, index, length, Some((
+        "snapshot_index_out_of_bounds", "snapshot_index_panic", "snapshot_index_continue",
+    )))?;
+    fixed_array_element_pointer(context, state, ty, pointer, index, true)
 }
 
 fn check_fixed_index<'ctx>(
@@ -571,7 +605,7 @@ fn check_fixed_index<'ctx>(
     state: &mut EmitState<'ctx, '_>,
     index: inkwell::values::IntValue<'ctx>,
     length: u64,
-    legacy_named_aggregate_assignment: bool,
+    legacy_guard_labels: Option<(&str, &str, &str)>,
 ) -> Result<(), String> {
     if index.get_zero_extended_constant().is_some_and(|index| index < length) {
         return Ok(());
@@ -583,12 +617,12 @@ fn check_fixed_index<'ctx>(
     if state.require_release_checked_access {
         return Err("fixed-array index lacks its prepared release helper".to_owned());
     }
-    if legacy_named_aggregate_assignment {
+    if let Some((invalid_label, panic_label, continue_label)) = legacy_guard_labels {
         let invalid = state.builder.build_int_compare(
-            IntPredicate::UGE, index, count, "assignment_index_out_of_bounds",
+            IntPredicate::UGE, index, count, invalid_label,
         ).map_err(builder_error)?;
         emit_checked_place_guard(
-            context, state, invalid, "assignment_index_panic", "assignment_index_continue",
+            context, state, invalid, panic_label, continue_label,
         )?;
     }
     Ok(())

@@ -130,6 +130,10 @@ pub(super) struct ScalarTypingView<'a> {
 }
 
 impl ScalarTypingView<'_> {
+    pub(super) fn module_ordinal_for_source(&self, source: &SourceIdentity) -> Option<usize> {
+        self.environment.sources.get(source).copied()
+    }
+
     pub(super) fn imported(&self, source: &SourceIdentity) -> Self {
         Self {
             environment: self.environment,
@@ -476,6 +480,9 @@ fn record_expression_overload_selection(
         }
         ScalarExpression::Unary { operand, .. } => {
             record_expression_overload_selection(operand, expected, scope, overloads)
+        }
+        ScalarExpression::ValueField { receiver, .. } => {
+            record_expression_overload_selection(receiver, None, scope, overloads)
         }
         ScalarExpression::If {
             condition,

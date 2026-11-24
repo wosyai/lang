@@ -1018,7 +1018,7 @@ entry:
   %array_element = getelementptr inbounds [1 x i8], ptr %array_literal, i32 0, i32 0
   store i8 0, ptr %array_element, align 1
   call void @llvm.memmove.p0.p0.i32(ptr align 1 %scratch, ptr align 1 %array_literal, i32 1, i1 false)
-  %array_element2 = getelementptr inbounds [1 x i8], ptr %scratch, i32 0, i64 0
+  %array_element2 = getelementptr inbounds [1 x i8], ptr %scratch, i32 0, i32 0
   %address = ptrtoint ptr %array_element2 to i32
   store i32 %address, ptr %view, align 4
   store i32 4, ptr %status, align 4
@@ -1123,12 +1123,12 @@ if.merge40:                                       ; preds = %if.then39, %short_c
   br label %if.merge
 
 if.then46:                                        ; preds = %if.merge
-  %array_element48 = getelementptr inbounds [1 x i8], ptr %scratch, i32 0, i64 0
+  %array_element48 = getelementptr inbounds [1 x i8], ptr %scratch, i32 0, i32 0
   %address49 = ptrtoint ptr %array_element48 to i32
   %call50 = call i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__35643331306166383930353963333332336639373264353135616334663231366631396431373637343130346537376536633663393136666232653230366564__5f726561645f6c696e655f646973636172645f73746570(i32 %address49)
   store i32 %call50, ptr %first_outcome, align 4
   %first_outcome51 = load i32, ptr %first_outcome, align 4
-  %array_element52 = getelementptr inbounds [1 x i8], ptr %scratch, i32 0, i64 0
+  %array_element52 = getelementptr inbounds [1 x i8], ptr %scratch, i32 0, i32 0
   %address53 = ptrtoint ptr %array_element52 to i32
   %call54 = call i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__35643331306166383930353963333332336639373264353135616334663231366631396431373637343130346537376536633663393136666232653230366564__5f726561645f6c696e655f646973636172645f636f6e74696e7565(i32 %first_outcome51, i32 %address53)
   store i32 %call54, ptr %outcome, align 4
@@ -1641,7 +1641,7 @@ if.then:                                          ; preds = %allocation_continue
 if.merge:                                         ; preds = %if.then, %allocation_continue
   store i64 2, ptr %two, align 4
   %bytes15 = load ptr, ptr %bytes_backing, align 8
-  %array_element16 = getelementptr inbounds [1 x i8], ptr %scratch, i32 0, i64 0
+  %array_element16 = getelementptr inbounds [1 x i8], ptr %scratch, i32 0, i32 0
   %address = ptrtoint ptr %array_element16 to i32
   %max_bytes17 = load i64, ptr %max_bytes1, align 4
   %max_bytes18 = load i64, ptr %max_bytes1, align 4
@@ -1677,12 +1677,12 @@ if.merge:                                         ; preds = %if.then, %allocatio
   br i1 %eq, label %if.then40, label %if.merge41
 
 if.then40:                                        ; preds = %if.merge
-  %array_element42 = getelementptr inbounds [1 x i8], ptr %scratch, i32 0, i64 0
+  %array_element42 = getelementptr inbounds [1 x i8], ptr %scratch, i32 0, i32 0
   %address43 = ptrtoint ptr %array_element42 to i32
   %call44 = call i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__35643331306166383930353963333332336639373264353135616334663231366631396431373637343130346537376536633663393136666232653230366564__5f726561645f6c696e655f646973636172645f73746570(i32 %address43)
   store i32 %call44, ptr %first_outcome, align 4
   %first_outcome45 = load i32, ptr %first_outcome, align 4
-  %array_element46 = getelementptr inbounds [1 x i8], ptr %scratch, i32 0, i64 0
+  %array_element46 = getelementptr inbounds [1 x i8], ptr %scratch, i32 0, i32 0
   %address47 = ptrtoint ptr %array_element46 to i32
   %call48 = call i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__35643331306166383930353963333332336639373264353135616334663231366631396431373637343130346537376536633663393136666232653230366564__5f726561645f6c696e655f646973636172645f636f6e74696e7565(i32 %first_outcome45, i32 %address47)
   store i32 %call48, ptr %outcome, align 4
@@ -1927,7 +1927,7 @@ if.else:                                          ; preds = %entry
   %zero5 = load i64, ptr %zero, align 4
   store i64 %zero5, ptr %count, align 4
   store i1 false, ptr %complete, align 1
-  %array_element6 = getelementptr inbounds [1 x i8], ptr %scratch, i32 0, i64 0
+  %array_element6 = getelementptr inbounds [1 x i8], ptr %scratch, i32 0, i32 0
   %address = ptrtoint ptr %array_element6 to i32
   %one7 = load i64, ptr %one, align 4
   %call = call { i64, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__35643331306166383930353963333332336639373264353135616334663231366631396431373637343130346537376536633663393136666232653230366564__726561645f696e746f(i32 %address, i64 %one7)
@@ -1967,7 +1967,7 @@ if.then18:                                        ; preds = %if.else14
   br label %if.merge20
 
 if.else19:                                        ; preds = %if.else14
-  %array_element21 = getelementptr inbounds [1 x i8], ptr %scratch, i32 0, i64 0
+  %array_element21 = getelementptr inbounds [1 x i8], ptr %scratch, i32 0, i32 0
   %place = load i8, ptr %array_element21, align 1
   store i8 %place, ptr %first, align 1
   %first22 = load i8, ptr %first, align 1

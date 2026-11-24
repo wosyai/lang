@@ -84,6 +84,7 @@ pub(super) struct PreparationOccurrenceTyping {
     expressions: HashMap<*const ScalarExpression, CheckedExpressionType>,
     members: HashMap<*const ScalarExpression, CheckedMember>,
     literal_fields: HashMap<*const ScalarExpression, ScalarStructFieldId>,
+    value_fields: HashMap<*const ScalarExpression, ScalarStructFieldId>,
     folded_expressions: HashMap<*const ScalarExpression, FoldedOccurrence>,
     needs_checked_access: bool,
     places: HashMap<*const ScalarPlace, ScalarType>,
@@ -108,6 +109,10 @@ impl PreparationOccurrenceTyping {
         value: &ScalarExpression,
     ) -> Option<ScalarStructFieldId> {
         self.literal_fields.remove(&std::ptr::from_ref(value))
+    }
+
+    pub(super) fn take_value_field(&mut self, value: &ScalarExpression) -> Option<ScalarStructFieldId> {
+        self.value_fields.remove(&std::ptr::from_ref(value))
     }
 
     pub(super) fn take_member(&mut self, expression: &ScalarExpression) -> Option<CheckedMember> {
@@ -304,6 +309,12 @@ impl<'a> ScalarInferenceBuilder<'a> {
             self.occurrences
                 .members
                 .insert(std::ptr::from_ref(expression), member);
+        }
+    }
+
+    pub(super) fn record_value_field(&mut self, value: &ScalarExpression, id: &ScalarStructFieldId) {
+        if !self.suppress_checked_occurrences {
+            self.occurrences.value_fields.insert(std::ptr::from_ref(value), id.clone());
         }
     }
 

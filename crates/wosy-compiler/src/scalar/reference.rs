@@ -2399,6 +2399,11 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 }
                 Ok(ReferenceValue::Other)
             }
+            ScalarExpression::ValueField { receiver, .. } => {
+                self.expression_child(receiver, scope, parent, OccurrenceEdge::ValueFieldReceiver)?;
+                self.point(CfgPointKind::Evaluate(expression.clone()), span, scope, BTreeSet::new());
+                Ok(ReferenceValue::Other)
+            }
             ScalarExpression::Unary { operand, .. } => {
                 self.expression_child(operand, scope, parent, OccurrenceEdge::UnaryOperand)?;
                 self.point(
@@ -11333,6 +11338,7 @@ pub(super) enum OccurrenceEdge {
     BinaryLeft,
     BinaryRight,
     UnaryOperand,
+    ValueFieldReceiver,
     Condition,
     ThenBranch,
     ElseBranch,
@@ -11394,6 +11400,7 @@ pub(super) struct OccurrenceStructure {
     pub(super) checked_types: CheckedOccurrenceTypes,
     proven_index_values: HashMap<OccurrenceOrdinal, u64>,
     pub(super) literal_fields: HashMap<OccurrenceOrdinal, ScalarStructFieldId>,
+    pub(super) value_fields: HashMap<OccurrenceOrdinal, ScalarStructFieldId>,
     pub(super) module_storage_uses: HashMap<SourceSpan, Vec<(OccurrenceOrdinal, ModuleStorageRole)>>,
     pub(super) module_storage_installs: BTreeMap<usize, ModuleStorageInstall>,
     pub(super) initializer_static_utf8: HashSet<OccurrenceOrdinal>,
@@ -11414,6 +11421,7 @@ impl OccurrenceStructure {
             checked_types: CheckedOccurrenceTypes::default(),
             proven_index_values: HashMap::new(),
             literal_fields: HashMap::new(),
+            value_fields: HashMap::new(),
             module_storage_uses: HashMap::new(),
             module_storage_installs: BTreeMap::new(),
             initializer_static_utf8: HashSet::new(),
@@ -12774,6 +12782,12 @@ impl StructuralWalker<'_, '_> {
                     ModuleStorageRole::Project
                 };
                 self.place_at(place, names, types, parent, OccurrenceEdge::ExpressionPlace, role)?;
+            }
+            ScalarExpression::ValueField { receiver, .. } => {
+                self.expression(receiver, names, types, parent, OccurrenceEdge::ValueFieldReceiver)?;
+                if let Some(id) = self.occurrence_typing.take_value_field(expression) {
+                    self.structure.value_fields.insert(ordinal, id);
+                }
             }
             ScalarExpression::StructLiteral { fields, .. } => {
                 for (position, field) in fields.iter().enumerate() {
@@ -14747,7 +14761,8 @@ fn reset_contract_replay_points(
     }
     for (live, pristine) in live.iter_mut().zip(pristine) {
         if live.id == pristine.id && matches!((&live.kind, &pristine.kind),
-            (CfgPointKind::Call { .. }, CfgPointKind::Call { .. })
+            (CfgPointKind::Evaluate(_), CfgPointKind::Evaluate(_))
+            | (CfgPointKind::Call { .. }, CfgPointKind::Call { .. })
             | (CfgPointKind::Branch { .. }, CfgPointKind::Branch { .. }))
         {
             live.possible_origins.clone_from(&pristine.possible_origins);
@@ -14789,6 +14804,15 @@ fn contract_replay_reset_borrows_only_immutable_point_structure() {
     live.push(point(CfgPointKind::ScopeExit));
     reset_contract_replay_points(&mut live, &pristine, true);
     assert_eq!(live.len(), pristine.len());
+
+    let evaluate = point(CfgPointKind::Evaluate(ScalarExpression::Boolean { value: false, span }));
+    let pristine = [evaluate.clone()];
+    let mut live = vec![evaluate];
+    live[0].possible_origins = Some(BTreeSet::from([ReferenceOriginId(0)]));
+    let allocation = live[0].successors.as_ptr();
+    reset_contract_replay_points(&mut live, &pristine, true);
+    assert_eq!(live[0].successors.as_ptr(), allocation);
+    assert!(live[0].possible_origins.is_none());
 
     let call = point(CfgPointKind::Call {
         expression: ScalarExpression::Call {

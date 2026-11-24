@@ -65,4 +65,8 @@ observer.checkpoint(7, 2, null, null);
 observer.checkpoint(5, 3, null, null);
 descriptor_probe(3);
 observer.checkpoint(7, 3, null, null);
+observer.checkpoint(8, 0, null, null);
+u64 value = 42;
+std.print(std.format(value));
+observer.checkpoint(9, 0, null, null);
 %%end
