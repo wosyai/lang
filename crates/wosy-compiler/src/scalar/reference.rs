@@ -2078,10 +2078,10 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             CfgPointKind::Read { binding }
                                 if matches!(calls.prepared_plain_name(argument),
                                     Some(PlainNameIdentity::Lexical(expected)) if expected == binding) =>
-                                Some((point, joined_effect.is_some(), effect.parameter == 0 && !effect.forwarded && !effect.returns_formal,
+                                Some((point, joined_effect.is_some(), effect.parameter == 0 && !effect.joined_only && !effect.returns_formal,
                                     effect.returns_formal)),
                             CfgPointKind::Borrow { place, loan }
-                                if effect.parameter == 0 && !effect.forwarded && !effect.returns_formal
+                                if effect.parameter == 0 && !effect.joined_only && !effect.returns_formal
                                     && matches!(target, ResolvedCallTarget::ModuleCallable { .. })
                                     && loan.mode == ScalarReferenceMutability::Shared && loan.parent.is_none()
                                     && loan.origin_place == *place =>
@@ -6988,7 +6988,7 @@ fn shared_scalar_read_effect(
 ) -> Option<SharedScalarReadEffect> {
     if matches!(target, ResolvedCallTarget::LocalCallable(_)) {
         return (calls.local_shared_call_families.get(&ordinal) == Some(&true))
-            .then_some(SharedScalarReadEffect { parameter: 0, descriptor: false, forwarded: false, returns_formal: false });
+            .then_some(SharedScalarReadEffect { parameter: 0, descriptor: false, joined_only: false, returns_formal: false });
     }
     let ResolvedCallTarget::ModuleCallable {
         source: callee, declaration_span, concrete: ConcreteCallSelection::Declaration,
@@ -10386,9 +10386,78 @@ struct SharedScalarReadEffect {
     parameter: usize,
     // Descriptor projections authorize only this exact direct receipt read.
     descriptor: bool,
-    // Transitive wrappers authorize only exact joined call observations.
-    forwarded: bool,
+    // Structured bodies and transitive wrappers authorize only exact joined observations.
+    joined_only: bool,
     returns_formal: bool,
+}
+
+// A small, total structural pass for one typed conditional-reader body.
+// Ordinary unary readers retain their existing, narrower legacy certificate.
+fn exact_joined_conditional_reader(
+    expression: &ScalarExpression,
+    ordinal: OccurrenceOrdinal,
+    structure: &OccurrenceStructure,
+    parameter: &ParameterSlot,
+    inner: &ScalarType,
+    formal_name: &impl Fn(OccurrenceOrdinal, ByteSpan) -> bool,
+    mut remaining: usize,
+) -> Option<()> {
+    let mut pending = vec![(expression, ordinal)];
+    while let Some((expression, ordinal)) = pending.pop() {
+        remaining = remaining.checked_sub(1)?;
+        let ty = structure.checked_types.expressions.get(&ordinal)?;
+        if ty != inner && *ty != ScalarType::Bool { return None; }
+        let parent = OccurrenceParent::Expression(ordinal);
+        let child = |edge| match structure.edges.get(&(parent, edge))? {
+            OccurrenceNode::Expression(child) => Some(*child),
+            _ => None,
+        };
+        match expression {
+            ScalarExpression::Integer { .. } if ty == inner => {},
+            ScalarExpression::Boolean { .. } if *ty == ScalarType::Bool => {},
+            ScalarExpression::Dereference { place: ScalarPlace::Dereference { pointer, .. }, .. }
+                if ty == inner && matches!(pointer.as_ref(), ScalarExpression::Name { .. }) =>
+            {
+                let OccurrenceNode::Place(place) = *structure.edges.get(&(parent, OccurrenceEdge::ExpressionPlace))?
+                    else { return None };
+                let OccurrenceNode::Expression(pointer) = *structure.edges.get(&(
+                    OccurrenceParent::Place(place), OccurrenceEdge::DereferencePointer,
+                ))? else { return None };
+                if !formal_name(pointer, parameter.span)
+                    || structure.checked_types.expressions.get(&pointer) != Some(&parameter.ty)
+                {
+                    return None;
+                }
+            }
+            ScalarExpression::Binary {
+                operator: BinaryOperator::Add | BinaryOperator::Subtract | BinaryOperator::Multiply
+                    | BinaryOperator::Equal | BinaryOperator::NotEqual | BinaryOperator::Less
+                    | BinaryOperator::LessEqual | BinaryOperator::Greater | BinaryOperator::GreaterEqual,
+                left, right, ..
+            } => {
+                pending.push((right.as_ref(), child(OccurrenceEdge::BinaryRight)?));
+                pending.push((left.as_ref(), child(OccurrenceEdge::BinaryLeft)?));
+            }
+            ScalarExpression::If { condition, then_branch, else_branch, .. } => {
+                let condition_node = child(OccurrenceEdge::Condition)?;
+                if structure.checked_types.expressions.get(&condition_node) != Some(&ScalarType::Bool) {
+                    return None;
+                }
+                for (branch, edge) in [(else_branch, OccurrenceEdge::ElseBranch), (then_branch, OccurrenceEdge::ThenBranch)] {
+                    let [ScalarBlockItem::Expression(result)] = branch.items.as_slice() else { return None };
+                    let OccurrenceNode::Block(block) = *structure.edges.get(&(parent, edge))? else { return None };
+                    let OccurrenceNode::Expression(output) = *structure.edges.get(&(
+                        OccurrenceParent::Block(block), OccurrenceEdge::FinalOutput { item: 0, output: 0 },
+                    ))? else { return None };
+                    if structure.checked_types.expressions.get(&output) != Some(ty) { return None; }
+                    pending.push((result, output));
+                }
+                pending.push((condition.as_ref(), condition_node));
+            }
+            _ => return None,
+        }
+    }
+    Some(())
 }
 
 impl SharedScalarReadEffect {
@@ -10431,11 +10500,20 @@ impl SharedScalarReadEffect {
             && formal_name(output, parameter.span)
             && structure.checked_types.expressions.get(&output) == Some(&result.ty)
         {
-            return Some(Self { parameter: parameter.ordinal, descriptor: false, forwarded: false, returns_formal: true });
+            return Some(Self { parameter: parameter.ordinal, descriptor: false, joined_only: false, returns_formal: true });
         }
         if if descriptor { !aggregate::ordinary_value(&result.ty) || !calls.call_occurrences.is_empty() }
             else { &result.ty != inner.as_ref() || !aggregate::ordinary_value(inner) } {
             return None;
+        }
+        if scalar.is_none() && !descriptor && matches!(expression, ScalarExpression::If { .. })
+            && calls.call_occurrences.is_empty()
+        {
+            const MAX_CONDITIONAL_READER_NODES: usize = 32;
+            exact_joined_conditional_reader(expression, output, structure, parameter,
+                inner, &formal_name, MAX_CONDITIONAL_READER_NODES)?;
+            return Some(Self { parameter: parameter.ordinal, descriptor: false,
+                joined_only: true, returns_formal: false });
         }
         let (expression, read) = match (scalar, expression) {
             (Some(scalar), ScalarExpression::Binary { operator: BinaryOperator::Add, left, right, .. })
@@ -10505,7 +10583,7 @@ impl SharedScalarReadEffect {
         (formal_name(pointer, parameter.span)
             && structure.checked_types.expressions.get(&pointer) == Some(&parameter.ty)
             && structure.checked_types.expressions.get(&read) == Some(&result.ty))
-            .then_some(Self { parameter: parameter.ordinal, descriptor, forwarded: false, returns_formal: false })
+            .then_some(Self { parameter: parameter.ordinal, descriptor, joined_only: false, returns_formal: false })
     }
 }
 
@@ -10894,7 +10972,7 @@ impl ProjectCallSiteResults {
     pub(super) fn has_closed_shared_scalar_reader(&self, module: usize, declaration: ByteSpan) -> bool {
         self.modules.get(module).and_then(|row| row.as_ref().ok())
             .is_some_and(|calls| calls.shared_scalar_read_effects.get(&declaration)
-                .is_some_and(|effect| effect.parameter == 0 && !effect.descriptor && !effect.forwarded && !effect.returns_formal))
+                .is_some_and(|effect| effect.parameter == 0 && !effect.descriptor && !effect.joined_only && !effect.returns_formal))
     }
 
     pub(super) fn lookup_errors(&self) -> impl Iterator<Item = &ReferenceAnalysisError> {
@@ -12627,7 +12705,7 @@ fn close_local_shared_call_families(
     let is_reader = |expression| {
         matches!(calls.prepared_plain_name(expression), Some(PlainNameIdentity::ModuleValue(declaration))
             if declaration.source == *source && readers.get(&declaration.range)
-                .is_some_and(|effect| effect.parameter == 0 && !effect.descriptor && !effect.forwarded && !effect.returns_formal))
+                .is_some_and(|effect| effect.parameter == 0 && !effect.descriptor && !effect.joined_only && !effect.returns_formal))
     };
     for block in &calls.structure.blocks {
         for item in &block.items {
@@ -12712,7 +12790,7 @@ fn ground_shared_reader_forwarders<'a>(
         if let Some(callers) = reverse.remove(&target) {
             for (index, declaration) in callers {
                 rows[index].1.shared_scalar_read_effects.insert(declaration, SharedScalarReadEffect {
-                    parameter: 0, descriptor: false, forwarded: true,
+                    parameter: 0, descriptor: false, joined_only: true,
                     returns_formal: target.2 == SharedForwardKind::ReturnedFormal,
                 });
                 grounded.push((index, declaration, target.2));

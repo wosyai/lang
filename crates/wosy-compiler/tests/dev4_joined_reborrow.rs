@@ -841,6 +841,30 @@ fn joined_child_crosses_grounded_forward_reader_chain() {
 }
 
 #[test]
+fn joined_child_is_read_by_bounded_pure_conditional_callee() {
+    let body = "if (*value == 7) { *value + 1 } else { *value + 2 }";
+    let program = joined_with_pointer_read("u8 observed = pointer(child); first = 3;", body)
+        .replace("    seen\n", "    if (first == 3) { if (choose) { if (observed == 8) { seen } else { 0 } } else { if (observed == 11) { seen } else { 0 } } } else { 0 }\n");
+    check_case(&program, Expected::Valid, Some("WOSY_JOINED_CONDITIONAL_READER_IR_DIR"));
+
+    let live = program.replace("u8 observed = pointer(child); first = 3;",
+        "first = 3; u8 observed = pointer(child);");
+    assert_ne!(live, program);
+    check(&live, Expected::LiveConflict);
+    let opaque = program.replace("{ *value + 2 }", "{ u8 local = *value; local + 2 }");
+    assert_ne!(opaque, program);
+    check(&opaque, Expected::NullParent);
+    // 31 shallow arithmetic nodes plus the condition and other arm exceed
+    // the reader budget without producing a long linear expression.
+    let pair = "(1 + 1)";
+    let four = format!("({pair} + {pair})");
+    let eight = format!("({four} + {four})");
+    let above_cap = program.replace("*value + 2", &format!("({eight} + {eight})"));
+    assert_ne!(above_cap, program);
+    check(&above_cap, Expected::NullParent);
+}
+
+#[test]
 fn joined_child_is_read_by_checked_callee_before_selected_owner_is_reusable() {
     let program = joined_with_pointer_read(
         "u8 through_call = pointer(child); first = 3;", "*value",
