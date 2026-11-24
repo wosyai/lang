@@ -1,6 +1,6 @@
 //! Quantified claims about prepared immutable fixed-array return cells.
 use super::*;
-use super::super::checker_flow::observe_fixed_array_returns;
+use super::super::checker_flow::{observe_fixed_array_returns, FixedArrayQuantifier};
 
 pub(super) struct ArrayProof<'a> {
     proof: &'a CstNode,
@@ -10,7 +10,7 @@ pub(super) struct ArrayProof<'a> {
     failed_step: Option<ByteSpan>,
     entry_filter: Option<Vec<CheckerPredicate>>,
     domain: IntegerSet,
-    witness: Option<BigInt>,
+    quantifier: FixedArrayQuantifier<BigInt>,
     relation: IntegerRelation,
     expected: BigInt,
     result: &'a ScalarType,
@@ -117,7 +117,9 @@ impl<'a> ArrayProof<'a> {
         }
         let steps = derive_block(&block);
         let mut failed_step = None;
-        let witness = if existential {
+        let quantifier_kind = if existential && steps.items.is_empty() {
+            FixedArrayQuantifier::FindWitness
+        } else if existential {
             let value = concrete_integer_literal(authored_witness_argument(&steps)?)
                 .ok_or(ProjectCheck::Unsupported)?.into_owned();
             if !integer_literal_fits_type(&value, &index_ty) || !domain.contains(&value)
@@ -129,7 +131,7 @@ impl<'a> ArrayProof<'a> {
                 return Err(ProjectCheck::Unsupported);
             };
             failed_step = Some(super::super::typecheck::expression_span(expression));
-            Some(value)
+            FixedArrayQuantifier::ExplicitWitness(value)
         } else {
             if !steps.items.is_empty() {
                 let ([item], [true]) = (steps.items.as_slice(), steps.terminated_items.as_slice()) else {
@@ -141,15 +143,17 @@ impl<'a> ArrayProof<'a> {
                 let ScalarBlockItem::Expression(expression) = item else { return Err(ProjectCheck::Unsupported); };
                 failed_step = Some(super::super::typecheck::expression_span(expression));
             }
-            if domain.extremes().is_some_and(|(first, last)| u64::try_from(first).is_err()
-                || u64::try_from(last).ok().is_none_or(|index| index >= *length))
-            {
-                return Err(ProjectCheck::Unsupported);
-            }
-            None
+            FixedArrayQuantifier::All
         };
-        Ok(Self { proof, source, target, goal: wosy_syntax::byte_span(&goal_node), failed_step,
-            entry_filter, domain, witness, relation, expected, result: &output.ty })
+        if !matches!(quantifier_kind, FixedArrayQuantifier::ExplicitWitness(_))
+            && domain.extremes().is_some_and(|(first, last)| u64::try_from(first).is_err()
+                || u64::try_from(last).ok().is_none_or(|index| index >= *length))
+        {
+            return Err(ProjectCheck::Unsupported);
+        }
+        let goal = if matches!(quantifier_kind, FixedArrayQuantifier::FindWitness) { &quantifier } else { &goal_node };
+        Ok(Self { proof, source, target, goal: wosy_syntax::byte_span(goal), failed_step,
+            entry_filter, domain, quantifier: quantifier_kind, relation, expected, result: &output.ty })
     }
 
     fn verify_return(
@@ -164,7 +168,7 @@ impl<'a> ArrayProof<'a> {
             return Err(ProjectCheck::Unsupported);
         }
         match observe_fixed_array_returns(
-            body, self.result, self.entry_filter.as_deref(), &self.domain, self.witness.as_ref(), (self.relation, &self.expected),
+            body, self.result, self.entry_filter.as_deref(), &self.domain, self.quantifier.as_ref(), (self.relation, &self.expected),
         ).ok_or(ProjectCheck::Unsupported)? {
             ProofCoverage::NoApplicableInputs => Ok(ProofCoverage::NoApplicableInputs),
             ProofCoverage::Applicable(None) => Ok(ProofCoverage::Applicable(None)),
@@ -177,7 +181,7 @@ impl<'a> ArrayProof<'a> {
                 Ok(ProofCoverage::Applicable(Some(AggregateProofDiagnostic {
                     proof: at(wosy_syntax::byte_span(self.proof)), goal: at(self.goal), failed_step: self.failed_step.map(at),
                     output: wosy_syntax::SourceSpan::new(source.clone(), failure.span),
-                    index: BigInt::from(failure.index), value: failure.value,
+                    cell: failure.cell.map(|(index, value)| AggregateProofCell { index: BigInt::from(index), value }),
                     witness: ScalarCheckerIntegerWitness { equal_axes, axes, state: failure.inputs },
                 })))
             }

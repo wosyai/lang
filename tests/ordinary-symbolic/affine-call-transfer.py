@@ -2437,7 +2437,47 @@ cases.extend([
         .replace("%%end", "i16 startup = producer(0, 3); %%end"), 1, b"proof obligation failed"),
 ])
 
+inferred_array_exists = """%%start
+    i8[3](i8) reflect = fn(value) { [value, 127, -1 - value] };
+    proof covered for reflect(entry) -> (items)
+        ensures (exists (u64 i where i == 0 || i == 2) { items[i] >= 0 }) {}
+%%end"""
+inferred_array_exists_captured = inferred_array_exists.replace("[value, 127, -1 - value]", """
+    i8 inverse = -1 - value;
+    i8[3] saved = [value, 127, inverse];
+    i8[3] copied = saved;
+    copied
+""")
+inferred_array_exists_branch = """%%start
+    i8[2](i8) choose = fn(value) {
+        if (value < 0) { [value, 0] } else { [0, -1 - value] }
+    };
+    proof covered for choose(entry) -> (items)
+        ensures (exists (u64 i where i < 2) { items[i] >= 0 }) {}
+%%end"""
+cases.extend([
+    ("ordinary-inferred-array-exists-direct", inferred_array_exists, 0, b""),
+    ("ordinary-inferred-array-exists-captured", inferred_array_exists_captured, 0, b""),
+    ("ordinary-inferred-array-exists-hole-refuted", inferred_array_exists_captured.replace("items[i] >= 0", "items[i] > 0"),
+        1, b"proof obligation failed"),
+    ("ordinary-inferred-array-exists-empty-refuted", inferred_array_exists.replace("i == 0 || i == 2", "i < 0"),
+        1, b"proof obligation failed"),
+    ("ordinary-inferred-array-exists-vacuous", inferred_array_exists.replace("i == 0 || i == 2", "i < 0")
+        .replace("ensures (exists", "where (false) ensures (exists"), 0, b""),
+    ("ordinary-inferred-array-exists-branches", inferred_array_exists_branch, 0, b""),
+    ("ordinary-inferred-array-exists-branch-refuted", inferred_array_exists_branch.replace("[0, -1 - value]", "[-1, -1 - value]"),
+        1, b"proof obligation failed"),
+    ("ordinary-inferred-array-exists-refuses-outside-array", inferred_array_exists.replace("i == 0 || i == 2", "i < 4"),
+        2, b"unsupported analysis"),
+    ("ordinary-inferred-array-exists-refuses-masked-arithmetic", inferred_array_exists.replace(
+        "[value, 127, -1 - value]", "[7, 127, value + 1]").replace("i == 0 || i == 2", "i == 0"),
+        2, b"unsupported analysis"),
+])
+
 proof_diagnostic_notes = {
+    "ordinary-inferred-array-exists-hole-refuted": b"symbolic call entry: value = -1",
+    "ordinary-inferred-array-exists-empty-refuted": b"symbolic call can return an array with no matching index",
+    "ordinary-inferred-array-exists-branch-refuted": b"symbolic call entry: value = 0",
     "ordinary-pair-bounded-summary-refutes-proof": b"symbolic call can return 7",
     "exact-startup-pair-bounded-summary-refutes-proof": b"call returned 7",
     "ordinary-unary-bounded-summary-refutes-proof": b"symbolic call can return 7",
@@ -3265,6 +3305,9 @@ with tempfile.TemporaryDirectory(prefix="affine-calls-") as path:
                         assert b"proof issued" in res.stderr and b"producer(3,7)" in res.stderr, res
                     if name == "ordinary-verified-unary-entry-refuted":
                         assert b"symbolic call entry: value = 1" in res.stderr,res
+                    if name.startswith("ordinary-inferred-array-exists-"):
+                        assert b"returned array" in res.stderr and b"no matching index" in res.stderr, res
+                        assert b"symbolic call can return cell" not in res.stderr, res
                     if name == "ordinary-fixed-array-symbolic-cells-correlated":
                         assert b"symbolic call entry: left = 2, right = 4" in res.stderr,res
                     if name == "ordinary-fixed-array-symbolic-cells-copy-refuted":

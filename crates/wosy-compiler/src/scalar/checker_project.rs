@@ -4338,9 +4338,16 @@ pub struct AggregateProofDiagnostic {
     pub goal: wosy_syntax::SourceSpan,
     pub failed_step: Option<wosy_syntax::SourceSpan>,
     pub output: wosy_syntax::SourceSpan,
+    // An inferred existential refutes the array as a whole, not one cell.
+    pub cell: Option<AggregateProofCell>,
+    pub witness: ScalarCheckerIntegerWitness,
+}
+
+#[cfg(feature = "internal-checker")]
+#[doc(hidden)]
+pub struct AggregateProofCell {
     pub index: BigInt,
     pub value: BigInt,
-    pub witness: ScalarCheckerIntegerWitness,
 }
 
 #[cfg(feature = "internal-checker")]
@@ -16725,7 +16732,8 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
             (existential.replace("witness(1)", "witness(2)"), 2, 0, "core.witness(2)"),
         ] {
             let failure = ordered(&refuted, ScalarCheckerScope::CurrentPackage).unwrap().aggregate_diagnostic.unwrap();
-            assert_eq!((failure.index, failure.value), (BigInt::from(index), BigInt::from(value)));
+            let cell = failure.cell.as_ref().expect("single rejected array cell");
+            assert_eq!((&cell.index, &cell.value), (&BigInt::from(index), &BigInt::from(value)));
             assert_eq!(failure.witness.row_count(), 1);
             assert_eq!(failure.witness.axes().len(), 0);
             assert_eq!(failure.output.source, app);
@@ -16778,15 +16786,16 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
         assert!(proved.active && proved.aggregate_diagnostic.is_none());
         let broken = program.replace("value - 0", "value + 1");
         let failure = ordered(&broken, scope).unwrap().aggregate_diagnostic.unwrap();
-        assert_eq!(failure.index, BigInt::from(0));
-        assert_eq!(failure.value, BigInt::from(8));
+        let cell = failure.cell.as_ref().expect("single rejected array cell");
+        assert_eq!(cell.index, BigInt::from(0));
+        assert_eq!(cell.value, BigInt::from(8));
         assert!(failure.witness.intervals_at(0, 0).unwrap().eq([(&7.into(), &7.into())]));
         let at = |span: ByteSpan| &broken[span.start as usize..span.end as usize];
         assert_eq!(at(failure.output.range), "adjusted");
         assert_eq!(at(failure.failed_step.unwrap().range), "core.show(items[i] == 7)");
         let broader = program.replace("entry == 6", "entry == 5");
         let failure = ordered(&broader, scope).unwrap().aggregate_diagnostic.unwrap();
-        assert_eq!(failure.value, BigInt::from(6));
+        assert_eq!(failure.cell.as_ref().expect("single rejected array cell").value, BigInt::from(6));
         assert!(failure.witness.intervals_at(0, 0).unwrap().eq([(&5.into(), &5.into())]));
         assert_eq!(&broader[failure.output.range.start as usize..failure.output.range.end as usize], "value + 1");
         let bounded = program.replace("entry == 6 || entry == 7", "entry >= 5 && entry <= 7")
@@ -16811,7 +16820,7 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
             {}
         %%end"#;
         let failure = ordered(correlated, scope).unwrap().aggregate_diagnostic.unwrap();
-        assert_eq!(failure.value, BigInt::from(6));
+        assert_eq!(failure.cell.as_ref().expect("single rejected array cell").value, BigInt::from(6));
         assert_eq!(failure.witness.row_count(), 1);
         assert_eq!(failure.witness.axes().len(), 2);
         let [left, right] = [BigInt::from(2), BigInt::from(4)];
@@ -16828,6 +16837,92 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
         assert!(combined.aggregate_diagnostic.is_some() && combined.directives.len() == 1);
         let main = ordered(&broken, ScalarCheckerScope::MainFlowOnly).unwrap();
         assert!(!main.active && main.aggregate_diagnostic.is_none());
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn inferred_fixed_array_exists_uses_each_returns_correlated_cells() {
+        let app = source("src/main.w", "inferred-fixed-array-exists");
+        let direct = r#"%%start
+            i8[3](i8) reflect = fn(value) { [value, 127, -1 - value] };
+            proof covered for reflect(entry) -> (items)
+                ensures (exists (u64 i where i == 0 || i == 2) { items[i] >= 0 })
+            {}
+        %%end"#;
+        let captured = direct.replace("[value, 127, -1 - value]", r#"
+            i8 inverse = -1 - value;
+            i8[3] saved = [value, 127, inverse];
+            i8[3] copied = saved;
+            copied
+        "#);
+        let parse = |text: &str| crate::parse_proof_source(app.clone(), text.to_owned(), &[]).ok().unwrap().1;
+        let run = |text: &str, scope| check_loaded_scalar_ordered_local_proof_contexts(
+            Vec::new(), [(parse(text), Vec::new())], vec![app.clone()], inputs(), scope, Vec::new(),
+        );
+        let selected = |text: &str| check_loaded_scalar_module_proofs(
+            &["covered"], Vec::new(), (parse(text), Vec::new()), vec![app.clone()], inputs(),
+        ).unwrap();
+        let scope = ScalarCheckerScope::CurrentPackage;
+        for program in [direct, captured.as_str()] {
+            let proved = run(program, scope).unwrap();
+            assert!(proved.active && proved.aggregate_diagnostic.is_none());
+            assert_eq!(selected(program), [ScalarModuleProofOutcome::Proved]);
+            let refuted = program.replace("items[i] >= 0", "items[i] > 0");
+            let failure = run(&refuted, scope).unwrap().aggregate_diagnostic.unwrap();
+            assert!(failure.cell.is_none() && failure.failed_step.is_none());
+            assert_eq!(failure.witness.row_count(), 1);
+            assert_eq!(failure.witness.axes().len(), 1);
+            let negative_one = BigInt::from(-1);
+            // The array returned at -1 is [-1, 127, 0]; neither admitted cell is positive.
+            assert!(failure.witness.intervals_at(0, 0).unwrap().eq([(&negative_one, &negative_one)]));
+            assert_eq!(selected(&refuted), [ScalarModuleProofOutcome::Refuted]);
+            let main = run(&refuted, ScalarCheckerScope::MainFlowOnly).unwrap();
+            assert!(!main.active && main.aggregate_diagnostic.is_none());
+            // The cell at index 1 would mask the counterexample if the
+            // quantified domain were treated as one contiguous interval.
+            let all_cells = refuted.replace("i == 0 || i == 2", "i < 3");
+            assert!(run(&all_cells, scope).unwrap().aggregate_diagnostic.is_none());
+        }
+
+        let empty = direct.replace("i == 0 || i == 2", "i < 0");
+        assert!(run(&empty, scope).unwrap().aggregate_diagnostic.unwrap().cell.is_none());
+        assert_eq!(selected(&empty), [ScalarModuleProofOutcome::Refuted]);
+        let no_call = empty.replace("ensures (exists", "where (false) ensures (exists");
+        let inactive = run(&no_call, scope).unwrap();
+        assert!(!inactive.active && inactive.aggregate_diagnostic.is_none());
+        let out_of_range = direct.replace("i == 0 || i == 2", "i < 4");
+        assert!(matches!(run(&out_of_range, scope), Err(ScalarOrderedCheckerOutcome::Unsupported)));
+        let overflow = direct.replace("[value, 127, -1 - value]", "[7, 127, value + 1]")
+            .replace("i == 0 || i == 2", "i == 0");
+        assert!(matches!(run(&overflow, scope), Err(ScalarOrderedCheckerOutcome::Unsupported)),
+            "a passing selected cell cannot mask an unmodeled returned calculation");
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn inferred_fixed_array_exists_checks_each_return_branch() {
+        let app = source("src/main.w", "inferred-array-exists-branches");
+        let program = r#"%%start
+            i8[2](i8) choose = fn(value) {
+                if (value < 0) { [value, 0] } else { [0, -1 - value] }
+            };
+            proof covered for choose(entry) -> (items)
+                ensures (exists (u64 i where i < 2) { items[i] >= 0 })
+            {}
+        %%end"#;
+        let run = |text: &str| {
+            let (_, catalog) = crate::parse_proof_source(app.clone(), text.to_owned(), &[]).ok().unwrap();
+            check_loaded_scalar_ordered_local_proof_contexts(Vec::new(), [(catalog, Vec::new())],
+                vec![app.clone()], inputs(), ScalarCheckerScope::CurrentPackage, Vec::new())
+        };
+        assert!(run(program).unwrap().aggregate_diagnostic.is_none());
+        let wrong_arm = program.replace("[0, -1 - value]", "[-1, -1 - value]");
+        let failure = run(&wrong_arm).unwrap().aggregate_diagnostic.unwrap();
+        assert!(failure.cell.is_none());
+        let zero = BigInt::from(0);
+        assert!(failure.witness.intervals_at(0, 0).unwrap().eq([(&zero, &zero)]));
+        let returned = failure.output.range;
+        assert_eq!(&wrong_arm[returned.start as usize..returned.end as usize], "[-1, -1 - value]");
     }
 
     #[cfg(feature = "internal-checker")]

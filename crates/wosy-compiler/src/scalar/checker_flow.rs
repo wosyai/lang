@@ -4159,11 +4159,29 @@ pub(super) fn observe_integer_returns(
 pub(super) const MAX_FIXED_ARRAY_RETURN_CELLS: usize = MAX_PARTITION_TRANSFER_WORK / 4;
 
 #[cfg(feature = "internal-checker")]
-pub(super) struct FixedArrayCellFailure {
-    pub(super) index: usize,
+pub(super) struct FixedArrayReturnFailure {
+    pub(super) cell: Option<(usize, BigInt)>,
     pub(super) span: super::ByteSpan,
-    pub(super) value: BigInt,
     pub(super) inputs: IntegerInputs,
+}
+
+#[cfg(feature = "internal-checker")]
+#[derive(Clone, Copy)]
+pub(super) enum FixedArrayQuantifier<W> {
+    All,
+    ExplicitWitness(W),
+    FindWitness,
+}
+
+#[cfg(feature = "internal-checker")]
+impl<W> FixedArrayQuantifier<W> {
+    pub(super) fn as_ref(&self) -> FixedArrayQuantifier<&W> {
+        match self {
+            Self::All => FixedArrayQuantifier::All,
+            Self::ExplicitWitness(witness) => FixedArrayQuantifier::ExplicitWitness(witness),
+            Self::FindWitness => FixedArrayQuantifier::FindWitness,
+        }
+    }
 }
 
 #[cfg(feature = "internal-checker")]
@@ -4176,43 +4194,50 @@ struct RejectedCell<'a> {
 #[cfg(feature = "internal-checker")]
 impl RejectedCell<'_> {
     fn source_inputs(&self, parameters: usize, work: &mut usize) -> Option<IntegerInputs> {
-        charge_call_work(work, self.row.len().checked_add(parameters)?.checked_add(1)?)?;
-        let mut row = self.row.clone();
-        let restrict = |row: &mut IntegerRow, axis, value: &BigInt, work: &mut usize| {
-            charge_call_work(work, row.equal_axes().len().checked_add(1)?)?;
-            row.charge_affine_replacement(axis, 1, work)?;
-            charge_call_work(work, 0)?;
-            row.replace_domain(axis, Rc::new(IntegerSet::singleton(value)));
-            Some(())
-        };
-        // Fix the actual rejected value while hidden snapshot/affine axes
-        // are still present. Only then choose points for the source parameters.
-        if let Some((axis, point)) = &self.point {
-            restrict(&mut row, *axis, point, work)?;
-        }
-        for axis in 0..parameters {
-            let domain = row.get(axis)?;
-            if domain.singleton_value().is_none() {
-                let point = domain.extremes()?.0.clone();
-                restrict(&mut row, axis, &point, work)?;
-            }
-        }
-        row.truncate(parameters);
-        Some(IntegerInputs(vec![row]))
+        array_entry_point(self.row, self.point.as_ref(), parameters, work)
     }
+}
+
+#[cfg(feature = "internal-checker")]
+fn array_entry_point(
+    original: &IntegerRow, point: Option<&(usize, BigInt)>, parameters: usize, work: &mut usize,
+) -> Option<IntegerInputs> {
+    charge_call_work(work, original.len().checked_add(parameters)?.checked_add(1)?)?;
+    let mut row = original.clone();
+    let restrict = |row: &mut IntegerRow, axis, value: &BigInt, work: &mut usize| {
+        charge_call_work(work, row.equal_axes().len().checked_add(1)?)?;
+        row.charge_affine_replacement(axis, 1, work)?;
+        charge_call_work(work, 0)?;
+        row.replace_domain(axis, Rc::new(IntegerSet::singleton(value)));
+        Some(())
+    };
+    // Existing row constraints still include hidden captures and aliases.
+    // Restrict a concrete rejected cell first when one was selected.
+    if let Some((axis, point)) = point {
+        restrict(&mut row, *axis, point, work)?;
+    }
+    for axis in 0..parameters {
+        let domain = row.get(axis)?;
+        if domain.singleton_value().is_none() {
+            let point = domain.extremes()?.0.clone();
+            restrict(&mut row, axis, &point, work)?;
+        }
+    }
+    row.truncate(parameters);
+    Some(IntegerInputs(vec![row]))
 }
 
 #[cfg(feature = "internal-checker")]
 struct FixedArrayObservationState {
     work: usize,
-    failure: Option<FixedArrayCellFailure>,
+    failure: Option<FixedArrayReturnFailure>,
 }
 
 #[cfg(feature = "internal-checker")]
 #[derive(Clone, Copy)]
 struct FixedArrayObservation<'a> {
     domain: &'a IntegerSet,
-    witness: Option<&'a BigInt>,
+    quantifier: FixedArrayQuantifier<&'a BigInt>,
     rejected: IntegerRelation,
     expected: &'a BigInt,
     state: &'a std::cell::RefCell<FixedArrayObservationState>,
@@ -4253,78 +4278,187 @@ impl<'body> ScopedAuthoredReturn<'body> for FixedArrayObservation<'_> {
         let mut state = self.state.borrow_mut();
         let rejected = self.rejected;
         charge_call_work(&mut state.work, cells.len().checked_mul(self.domain.interval_count().checked_add(1)?)?)?;
+        let mut unwitnessed = if matches!(self.quantifier, FixedArrayQuantifier::FindWitness) && state.failure.is_none() {
+            charge_call_work(&mut state.work, path.0.len())?;
+            Some(UnwitnessedArrayRows {
+                left: path.0.len(),
+                rows: path.0.iter().map(|row| Some(Cow::Borrowed(row))).collect(),
+            })
+        } else {
+            None
+        };
         for (index, cell) in cells.iter().enumerate() {
             let CheckerSnapshotNode::Leaf(leaf) = cell else { return None; };
             let leaf = shape.leaves.get(*leaf)?;
             if leaf.ty != **element { return None; }
-            let check = state.failure.is_none() && {
+            let check = state.failure.is_none() && unwitnessed.as_ref().is_none_or(|rows| rows.left != 0) && {
                 let index = BigInt::from(index);
-                self.witness.map_or_else(|| self.domain.contains(&index), |chosen| chosen == &index)
+                match self.quantifier {
+                    FixedArrayQuantifier::ExplicitWitness(chosen) => chosen == &index,
+                    FixedArrayQuantifier::All | FixedArrayQuantifier::FindWitness => self.domain.contains(&index),
+                }
             };
-            let failure = if captured {
+            let read = if captured {
                 let (axis, actual) = roots.lookup(&leaf.capture)?;
                 if actual != &leaf.ty { return None; }
-                if check { first_rejected_array_cell(path, axis, rejected, self.expected, &mut state.work)? } else { None }
+                FixedArrayRead::Axis(axis)
             } else {
                 match &leaf.operand {
-                    CheckerSnapshotOperand::Literal(value) => (check && rejected.accepts(value.cmp(self.expected)))
-                        .then(|| RejectedCell { row: &path.0[0], point: None, value: value.clone() }),
+                    CheckerSnapshotOperand::Literal(value) => FixedArrayRead::Literal(value),
                     CheckerSnapshotOperand::Binding(binding) => {
                         let (axis, actual) = roots.lookup(binding)?;
                         if actual != &leaf.ty { return None; }
-                        if check { first_rejected_array_cell(path, axis, rejected, self.expected, &mut state.work)? } else { None }
+                        FixedArrayRead::Axis(axis)
                     }
                     CheckerSnapshotOperand::Affine { source, operator, literal, source_on_left } => {
                         let (operation, left, right) = checked_snapshot_operation(
                             roots, &leaf.ty, source, operator, literal, *source_on_left,
                         )?;
-                        let (min, max) = super::typecheck::integer_bounds(&leaf.ty)?;
-                        charge_call_work(&mut state.work, path.0.len().checked_mul(5)?)?;
+                        FixedArrayRead::Arithmetic(operation, left, right)
+                    }
+                }
+            };
+            let failure = match read {
+                FixedArrayRead::Literal(value) if check => {
+                    if let Some(rows) = &mut unwitnessed {
+                        if !rejected.accepts(value.cmp(self.expected)) { rows.left = 0; }
+                        None
+                    } else {
+                        rejected.accepts(value.cmp(self.expected))
+                            .then(|| RejectedCell { row: &path.0[0], point: None, value: value.clone() })
+                    }
+                }
+                FixedArrayRead::Axis(axis) if check => {
+                    let cut = FixedArrayCut { axis, relation: rejected, bound: Cow::Borrowed(self.expected), transform: None };
+                    charge_call_work(&mut state.work, path.0.len())?;
+                    if let Some(rows) = &mut unwitnessed {
+                        for index in 0..path.0.len() {
+                            rows.retain_rejected(index, &cut, &mut state.work)?;
+                        }
+                        None
+                    } else {
                         let mut failure = None;
                         for row in &path.0 {
-                            // Use ordinary checked arithmetic and pull the failing cut back
-                            // through its exact affine image without filling domain holes.
-                            let value = compute_row_integer_operation(row, operation, left, right, &min, &max)?;
-                            if check && failure.is_none() {
-                                failure = match value {
-                                    ComputedRowInteger::Singleton(value) => rejected.accepts(value.cmp(self.expected))
-                                        .then_some(RejectedCell { row, point: None, value }),
-                                    ComputedRowInteger::Affine(axis, transform) => {
-                                        let domain = row.get(axis)?;
-                                        charge_call_work(&mut state.work, domain.interval_count())?;
-                                        let (relation, bound) = transform.pull_back_cut(rejected, self.expected);
-                                        domain.first_comparison_point(relation, &bound)
-                                            .map(|point| RejectedCell { row, point: Some((axis, point.clone())), value: transform.apply_point(point) })
-                                    }
-                                };
-                            }
+                            failure = cut.first_rejected(row, &mut state.work)?;
+                            if failure.is_some() { break; }
                         }
                         failure
                     }
                 }
+                FixedArrayRead::Arithmetic(operation, left, right) => {
+                    let (min, max) = super::typecheck::integer_bounds(&leaf.ty)?;
+                    charge_call_work(&mut state.work, path.0.len().checked_mul(5)?)?;
+                    let mut failure = None;
+                    for (index, row) in path.0.iter().enumerate() {
+                        // Always validate the real calculation on the original row,
+                        // not on the smaller set of entries still without a witness.
+                        let value = compute_row_integer_operation(row, operation, left, right, &min, &max)?;
+                        if check && failure.is_none() {
+                            let pending = unwitnessed.as_ref().is_none_or(|rows| rows.contains(index));
+                            if !pending { continue; }
+                            match value {
+                                ComputedRowInteger::Singleton(value) => {
+                                    let fails = rejected.accepts(value.cmp(self.expected));
+                                    if let Some(rows) = &mut unwitnessed {
+                                        if !fails { rows.remove(index); }
+                                    } else if fails {
+                                        failure = Some(RejectedCell { row, point: None, value });
+                                    }
+                                }
+                                ComputedRowInteger::Affine(axis, transform) => {
+                                    let (relation, bound) = transform.pull_back_cut(rejected, self.expected);
+                                    let cut = FixedArrayCut { axis, relation, bound: Cow::Owned(bound), transform: Some(transform) };
+                                    if let Some(rows) = &mut unwitnessed {
+                                        rows.retain_rejected(index, &cut, &mut state.work)?;
+                                    } else {
+                                        failure = cut.first_rejected(row, &mut state.work)?;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    failure
+                }
+                FixedArrayRead::Literal(_) | FixedArrayRead::Axis(_) => None,
             };
             if let Some(failure) = failure {
                 let inputs = failure.source_inputs(roots.parameters, &mut state.work)?;
-                state.failure = Some(FixedArrayCellFailure { index, span: leaf.span, value: failure.value, inputs });
+                state.failure = Some(FixedArrayReturnFailure { cell: Some((index, failure.value)), span: leaf.span, inputs });
             }
+        }
+        if let Some(rows) = unwitnessed.filter(|rows| rows.left != 0) {
+            charge_call_work(&mut state.work, rows.rows.len())?;
+            let row = rows.rows.iter().flatten().next()?.as_ref();
+            let inputs = array_entry_point(row, None, roots.parameters, &mut state.work)?;
+            state.failure = Some(FixedArrayReturnFailure { cell: None, span: slot.span, inputs });
         }
         Some(())
     }
 }
 
 #[cfg(feature = "internal-checker")]
-fn first_rejected_array_cell<'a>(
-    path: &'a IntegerInputs, axis: usize, relation: IntegerRelation, expected: &BigInt, work: &mut usize,
-) -> Option<Option<RejectedCell<'a>>> {
-    charge_call_work(work, path.0.len())?;
-    for row in &path.0 {
-        let domain = row.get(axis)?;
+enum FixedArrayRead<'a> {
+    Literal(&'a BigInt),
+    Axis(usize),
+    Arithmetic(AuthoredIntegerOperation, IntegerCalculationOperand<'a>, IntegerCalculationOperand<'a>),
+}
+
+#[cfg(feature = "internal-checker")]
+struct FixedArrayCut<'a> {
+    axis: usize,
+    relation: IntegerRelation,
+    bound: Cow<'a, BigInt>,
+    transform: Option<IntegerAffineTransform>,
+}
+
+#[cfg(feature = "internal-checker")]
+impl FixedArrayCut<'_> {
+    fn first_rejected<'a>(&self, row: &'a IntegerRow, work: &mut usize) -> Option<Option<RejectedCell<'a>>> {
+        let domain = row.get(self.axis)?;
         charge_call_work(work, domain.interval_count())?;
-        if let Some(value) = domain.first_comparison_point(relation, expected) {
-            return Some(Some(RejectedCell { row, point: Some((axis, value.clone())), value: value.clone() }));
-        }
+        Some(domain.first_comparison_point(self.relation, &self.bound).map(|point| {
+            let value = self.transform.as_ref().map_or_else(|| point.clone(), |transform| transform.apply_point(point));
+            RejectedCell { row, point: Some((self.axis, point.clone())), value }
+        }))
     }
-    Some(None)
+}
+
+// These are the entries on one return path at which every candidate tested
+// so far fails. Narrow each entry row with the same scalar cuts used to
+// refute a specific cell; never take a cross-product of cell marginals.
+#[cfg(feature = "internal-checker")]
+struct UnwitnessedArrayRows<'a> {
+    left: usize,
+    rows: Vec<Option<Cow<'a, IntegerRow>>>,
+}
+
+#[cfg(feature = "internal-checker")]
+impl UnwitnessedArrayRows<'_> {
+    fn contains(&self, index: usize) -> bool { self.left != 0 && self.rows[index].is_some() }
+
+    fn remove(&mut self, index: usize) {
+        debug_assert!(self.contains(index));
+        self.rows[index] = None;
+        self.left -= 1;
+    }
+
+    fn retain_rejected(&mut self, index: usize, cut: &FixedArrayCut<'_>, work: &mut usize) -> Option<()> {
+        if self.left == 0 { return Some(()); }
+        let Some(row) = self.rows.get_mut(index)?.as_mut() else { return Some(()); };
+        let domain = row.get(cut.axis)?;
+        charge_call_work(work, domain.interval_count().checked_mul(3)?.checked_add(1)?)?;
+        let remaining = domain.keep_relation(cut.relation, &cut.bound);
+        if remaining.is_empty() {
+            self.remove(index);
+        } else if remaining != **domain {
+            let copy = if matches!(row, Cow::Borrowed(_)) { row.len() } else { 0 };
+            charge_call_work(work, copy.checked_add(row.equal_axes().len())?)?;
+            row.charge_affine_replacement(cut.axis, remaining.interval_count(), work)?;
+            charge_call_work(work, 0)?;
+            row.to_mut().replace_domain(cut.axis, Rc::new(remaining));
+        }
+        Some(())
+    }
 }
 
 /// Read-only consumer of the same prepared blocks, local capture axes and
@@ -4332,15 +4466,16 @@ fn first_rejected_array_cell<'a>(
 #[cfg(feature = "internal-checker")]
 pub(super) fn observe_fixed_array_returns(
     calls: &FunctionCallSites, result: &ScalarType, entry_filter: Option<&[CheckerPredicate]>,
-    domain: &IntegerSet, witness: Option<&BigInt>, (relation, expected): (IntegerRelation, &BigInt),
-) -> Option<ProofCoverage<Option<FixedArrayCellFailure>>> {
+    domain: &IntegerSet, quantifier: FixedArrayQuantifier<&BigInt>, (relation, expected): (IntegerRelation, &BigInt),
+) -> Option<ProofCoverage<Option<FixedArrayReturnFailure>>> {
     if !matches!(result, ScalarType::Array { .. }) { return None; }
     let state = std::cell::RefCell::new(FixedArrayObservationState { work: 0, failure: None });
-    let observer = FixedArrayObservation { domain, witness, rejected: relation.complement(), expected, state: &state };
+    let observer = FixedArrayObservation { domain, quantifier, rejected: relation.complement(), expected, state: &state };
     match run_integer_callable::<false, false, _>(
         calls, Some(result), entry_filter, None, &mut [], None, None, None, false, observer,
     )?.ok()? {
-        ProofCoverage::Applicable(_) if !domain.is_empty() => Some(ProofCoverage::Applicable(state.into_inner().failure)),
+        ProofCoverage::Applicable(_) if !domain.is_empty() || matches!(quantifier, FixedArrayQuantifier::FindWitness) =>
+            Some(ProofCoverage::Applicable(state.into_inner().failure)),
         _ => Some(ProofCoverage::NoApplicableInputs),
     }
 }

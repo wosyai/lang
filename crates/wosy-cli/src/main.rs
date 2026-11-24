@@ -1085,22 +1085,29 @@ fn check_command(
         }
     });
     let aggregate = report.aggregate_diagnostic.iter().map(|failure| {
+        let (primary, output, note) = if let Some(cell) = &failure.cell {
+            ("not satisfied by this returned array cell", "returned cell",
+                format!("symbolic call can return cell [{}] = {}", cell.index, cell.value))
+        } else {
+            ("no index satisfies this existential goal", "returned array",
+                "symbolic call can return an array with no matching index".to_owned())
+        };
         let mut labels = vec![
             DiagnosticLabel {
                 kind: DiagnosticLabelKind::Primary,
                 span: failure.failed_step.as_ref().unwrap_or(&failure.goal).clone(),
-                message: "not satisfied by this returned array cell".to_owned(),
+                message: primary.to_owned(),
             },
             DiagnosticLabel { kind: DiagnosticLabelKind::Secondary, span: failure.proof.clone(),
                 message: "proof declaration".to_owned() },
             DiagnosticLabel { kind: DiagnosticLabelKind::Secondary, span: failure.output.clone(),
-                message: "returned cell".to_owned() },
+                message: output.to_owned() },
         ];
         if failure.failed_step.is_some() {
             labels.push(DiagnosticLabel { kind: DiagnosticLabelKind::Secondary, span: failure.goal.clone(),
                 message: "proof goal".to_owned() });
         }
-        let mut notes = vec![format!("symbolic call can return cell [{}] = {}", failure.index, failure.value)];
+        let mut notes = vec![note];
         if let Some(entry) = symbolic_entry_point_note(&failure.witness, publication.texts) {
             notes.push(entry);
         }
