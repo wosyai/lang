@@ -6277,6 +6277,8 @@ pub(super) struct OccurrenceStructure {
     #[cfg(feature = "internal-checker")]
     checker_snapshot_bindings: HashMap<(ByteSpan, ByteSpan), (BlockOrdinal, usize)>,
     #[cfg(feature = "internal-checker")]
+    pub(super) checker_snapshot_copies: HashMap<(BlockOrdinal, usize), CheckerSnapshotCopy>,
+    #[cfg(feature = "internal-checker")]
     pub(super) checker_ordinary_scalar_locals: HashMap<(BlockOrdinal, usize), CheckerOrdinaryScalarLocal>,
     #[cfg(feature = "internal-checker")]
     pub(super) checker_has_extended_scalar_local: bool,
@@ -6296,7 +6298,29 @@ pub(super) struct OccurrenceStructure {
         HashMap<OccurrenceOrdinal, ConditionalOutputProjection>,
 }
 
+#[cfg(feature = "internal-checker")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct CheckerSnapshotCopy {
+    source: (BlockOrdinal, usize),
+    constructor: (BlockOrdinal, usize),
+}
+
 impl OccurrenceStructure {
+    #[cfg(feature = "internal-checker")]
+    fn select_snapshot(&mut self, mut key: (BlockOrdinal, usize))
+        -> Option<std::rc::Rc<super::checker_directive::CheckerSnapshotShape>>
+    {
+        // Each new copy edge becomes demanded once. A shared ancestry need
+        // not be walked again for each file/path that selects the same value.
+        let constructor = self.checker_snapshot_copies.get(&key).map_or(key, |copy| copy.constructor);
+        let shape = self.checker_snapshot_locals.get(&constructor)?.clone();
+        while self.checker_selected_snapshots.insert(key) {
+            let Some(copy) = self.checker_snapshot_copies.get(&key) else { break; };
+            key = copy.source;
+        }
+        Some(shape)
+    }
+
     #[cfg(feature = "internal-checker")]
     pub(super) fn has_ordinary_integer_operations(&self) -> bool {
         !self.checker_ordinary_scalar_locals.is_empty() || !self.checker_selected_snapshots.is_empty() || self.has_ordinary_predicates()
@@ -6359,6 +6383,8 @@ impl OccurrenceStructure {
             checker_selected_snapshots: HashSet::new(),
             #[cfg(feature = "internal-checker")]
             checker_snapshot_bindings: HashMap::new(),
+            #[cfg(feature = "internal-checker")]
+            checker_snapshot_copies: HashMap::new(),
             #[cfg(feature = "internal-checker")]
             checker_ordinary_scalar_locals: HashMap::new(),
             #[cfg(feature = "internal-checker")]
@@ -7533,8 +7559,9 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
                             if let Some(key) = self.structure.checker_snapshot_bindings.get(&(
                                 declaration.declaration_span, declaration.block_span,
                             )) {
-                                self.structure.checker_selected_snapshots.insert(*key);
-                                file.selection = CheckerStateSelection::Aggregate(self.structure.checker_snapshot_locals[key].clone());
+                                if let Some(shape) = self.structure.select_snapshot(*key) {
+                                    file.selection = CheckerStateSelection::Aggregate(shape);
+                                }
                             }
                         }
                     } else if let Some(PlainNameIdentity::Lexical(binding)) = callable.target_resolver.plain_name(lexical, names) {
@@ -9003,13 +9030,29 @@ impl StructuralWalker<'_, '_> {
                 && receiver.contextual_storage.is_none()
             {
                 if self.occurrence_typing.checker_demands_snapshot(&binding.declared_type) {
-                    let lexical = WalkBinding { declaration_span: receiver.name_span, block_span, introduced_by_assignment: false };
-                    let identity = lexical.reference_id(callable.target_resolver.source, callable.target_resolver.function_span);
-                    if let Some(shape) = self.checker_snapshot_shape(binding, outputs.primary, &identity,
-                        callable.target_resolver.declarations)
+                    let key = (position.block, position.item);
+                    let declarations = callable.target_resolver.declarations;
+                    let source = if let ScalarBindingOutput::Evaluate(ScalarExpression::Name { name, .. }) =
+                        binding.output_source(0)
                     {
-                        let key = (position.block, position.item);
-                        self.structure.checker_snapshot_locals.insert(key, std::rc::Rc::new(shape));
+                        self.checker_snapshot_copy(name, scope, outputs.primary, &receiver.ty, declarations)
+                    } else {
+                        None
+                    };
+                    let found = if let Some(copy) = source {
+                        self.structure.checker_snapshot_copies.insert(key, copy);
+                        true
+                    } else {
+                        let lexical = WalkBinding { declaration_span: receiver.name_span, block_span, introduced_by_assignment: false };
+                        let identity = lexical.reference_id(callable.target_resolver.source, callable.target_resolver.function_span);
+                        if let Some(shape) = self.checker_snapshot_shape(binding, outputs.primary, &identity, declarations) {
+                            self.structure.checker_snapshot_locals.insert(key, std::rc::Rc::new(shape));
+                            true
+                        } else {
+                            false
+                        }
+                    };
+                    if found {
                         self.structure.checker_snapshot_bindings.insert((receiver.name_span, block_span), key);
                     }
                 }
@@ -9081,6 +9124,39 @@ impl StructuralWalker<'_, '_> {
             }
         }
         Ok(BindingRegion::new(initialization, binding))
+    }
+
+    #[cfg(feature = "internal-checker")]
+    fn checker_snapshot_copy(
+        &self, name: &str, scope: &WalkScope, occurrence: OccurrenceOrdinal, ty: &ScalarType,
+        declarations: &CallDeclarationIndex<'_>,
+    ) -> Option<CheckerSnapshotCopy> {
+        let source = scope.names.get(name).filter(|binding| !binding.introduced_by_assignment)?;
+        let source = *self.structure.checker_snapshot_bindings.get(&(source.declaration_span, source.block_span))?;
+        let constructor = self.structure.checker_snapshot_copies.get(&source).map_or(source, |copy| copy.constructor);
+        // Array type nodes include the declaration's spelling spans.
+        // Compare checked lengths and leaf identity instead. Walk the two
+        // types together, bounded by the original snapshot shape depth.
+        let mut expected = ty;
+        let mut actual = self.structure.checked_types.expressions.get(&occurrence)?;
+        for _ in 0..=8 {
+            match (expected, actual) {
+                (ScalarType::Array { element: left, length: left_length, .. },
+                 ScalarType::Array { element: right, length: right_length, .. }) if left_length == right_length =>
+                {
+                    expected = left;
+                    actual = right;
+                }
+                (ScalarType::Struct(left), ScalarType::Struct(right)) if left == right
+                    && declarations.structs.get(left)?.copy_policy == CopyPolicy::Copy =>
+                    return Some(CheckerSnapshotCopy { source, constructor }),
+                (left, right) if matches!(ty, ScalarType::Array { .. }) && (is_integer_type(left) || *left == ScalarType::Bool)
+                    && left == right =>
+                    return Some(CheckerSnapshotCopy { source, constructor }),
+                _ => return None,
+            }
+        }
+        None
     }
 
     #[cfg(feature = "internal-checker")]

@@ -5306,6 +5306,9 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                     // Legacy early-failure checks do not materialize authored
                     // state and must never expose internal capture columns.
                     if !COLLECT { return None; }
+                    // Exact typed aggregate copies share the already-live
+                    // construction captures. They add no witness columns.
+                    if structure.checker_snapshot_copies.contains_key(&(block, item.position)) { continue; }
                     let shape = structure.checker_snapshot_locals.get(&(block, item.position))?;
                     use super::checker_directive::CheckerSnapshotOperand;
                     for field in shape.leaves.iter() {

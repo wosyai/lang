@@ -1668,6 +1668,31 @@ state_nominal = f"""%%start
         core.require(value != 7, {state_report(170,"SNAPSHOT","snapshot",', { .path = "copy.json"; .state = snapshot; }')});
     }};
     %%end"""
+def copied_state_program(declarations, ty, initializer, extra="", second=True):
+    report_copy = state_report(57,"COPIED-STATE","copy_two",
+        ', { .path = "copy.json"; .state = copy_one; }' if second else "")
+    return f"""%%start
+    {declarations}
+    unit(i8) check = fn(value) {{
+        core.narrow(value == 1 || value == 3, {report(167,"HOLES")});
+        {ty} original = {initializer};
+        {ty} copy_one = original;
+        {extra}
+        value = 7;
+        {ty} copy_two = copy_one;
+        core.require(value != 7, {report_copy});
+    }};
+    %%end"""
+nominal_copy = copied_state_program("struct copy Snapshot { i8 saved; }","Snapshot","{ .saved = value; }")
+fixed_array_copy = copied_state_program("","i8[2]","[value, 4]")
+nominal_move = copied_state_program("struct Snapshot { i8 saved; }","Snapshot","{ .saved = value; }",second=False)
+nominal_mutated_copy = copied_state_program("struct copy Snapshot { i8 saved; }","Snapshot","{ .saved = value; }","copy_one.saved = 9;")
+cases.extend([
+    ("authored-state-nominal-copy-chain",nominal_copy,57,b"COPIED-STATE"),
+    ("authored-state-array-copy-chain",fixed_array_copy,57,b"COPIED-STATE"),
+    ("authored-state-nominal-move-not-copy",nominal_move,2,b"unsupported analysis"),
+    ("authored-state-nominal-copy-mutation-unsupported",nominal_mutated_copy,2,b"unsupported analysis"),
+])
 state_nominal_nested_scope = f"""%%start
     struct Snapshot {{ i8 saved; }}
     unit(i8) check = fn(value) {{
@@ -1764,7 +1789,14 @@ nested_array_bytes = state_bytes({
         "flags": array_state({"kind": "bool"}, [typed_state("bool", True), typed_state("bool", False)]),
     },
 })
+copied_alternatives = typed_state("i8", {"kind": "alternatives", "values": [1,3]})
+copied_nominal_bytes = state_bytes({
+    "type": {"kind": "struct", "name": "Snapshot"}, "value": {"saved": copied_alternatives}
+})
+copied_array_bytes = state_bytes(array_state({"kind":"i8"}, [copied_alternatives, typed_state("i8", 4)]))
 authored_files = {
+    "authored-state-nominal-copy-chain": {"state.json": copied_nominal_bytes, "copy.json": copied_nominal_bytes},
+    "authored-state-array-copy-chain": {"state.json": copied_array_bytes, "copy.json": copied_array_bytes},
     "authored-unary-state-preserves-holes": {
         "before.json": b'{"type":{"kind":"i8"},"value":{"kind":"alternatives","values":[-7,2]}}\n',
         "reflected.json": b'{"type":{"kind":"i8"},"value":{"kind":"alternatives","values":[-2,7]}}\n',

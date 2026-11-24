@@ -10522,6 +10522,50 @@ mod tests {
 
     #[cfg(feature = "internal-checker")]
     #[test]
+    fn copied_aggregate_state_has_only_one_construction_capture() {
+        let app = source("src/main.w", "copied-aggregate-state");
+        for (declarations, ty, init) in [
+            ("struct copy Snapshot { i8 saved; }", "Snapshot", "{ .saved = value; }"),
+            ("", "i8[2]", "[value, 4]"),
+        ] {
+            let text = format!(r#"%%start
+                {declarations}
+                unit(i8) check = fn(value) {{
+                    core.narrow(value == 1 || value == 3, {OUTPUT});
+                    {ty} original = {init};
+                    {ty} copy_one = original;
+                    value = 7;
+                    {ty} copy_two = copy_one;
+                    core.require(value != 7, {{ .stdout = ""; .stderr = ""; .code = 57;
+                        .files = [{{ .path = "a.json"; .state = copy_two; }},
+                                  {{ .path = "b.json"; .state = copy_one; }}]; }});
+                }};
+            %%end"#);
+            let prepared = prepare_proof_target(&app, &text).unwrap();
+            let (project, calls) = prepared.parts();
+            let (module, item, _) = select_checked_root(project, &app, "check").unwrap();
+            let structure = &calls.function_body(module, item, None).unwrap().structure;
+            assert_eq!(structure.checker_snapshot_locals.len(), 1);
+            assert_eq!(structure.checker_snapshot_copies.len(), 2);
+            assert_eq!(structure.checker_selected_snapshots.len(), 3);
+            let receipt = run_closed_without_named_proofs(&prepared, ScalarCheckerScope::CurrentPackage, 1).unwrap();
+            let [failure] = receipt.directives.as_slice() else { panic!("one copy witness"); };
+            assert_eq!(failure.witness.axes().len(), 1);
+            assert!(failure.witness.equal_axes().is_empty());
+            assert_eq!(failure.files()[0].text, failure.files()[1].text);
+            let json = std::str::from_utf8(&failure.files()[0].text).unwrap();
+            assert!(json.contains(r#"{"kind":"alternatives","values":[1,3]}"#));
+            if ty == "Snapshot" {
+                let mutated = text.replace("value = 7;", "copy_one.saved = 9; value = 7;");
+                let prepared = prepare_proof_target(&app, &mutated).unwrap();
+                assert!(matches!(run_closed_without_named_proofs(&prepared, ScalarCheckerScope::CurrentPackage, 1),
+                    Err(ProjectCheck::Unsupported)));
+            }
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
     fn nominal_state_capture_leaves_only_lexical_coordinates_in_public_witness() {
         let app = source("src/main.w", "nominal-state-public-witness");
         let program = r#"%%start
