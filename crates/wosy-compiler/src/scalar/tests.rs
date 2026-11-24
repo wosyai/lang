@@ -6260,6 +6260,63 @@ fn derives_valid_scalar_bindings_arithmetic_call_and_if() {
 }
 
 #[test]
+fn streams_binary_and_unary_children_in_precedence_order_with_exact_spans() {
+    let text = "%%start\ni32 value = 9 - 2 * -3 - 1;\n%%end";
+    let result = validate_text(text);
+    assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+    let [ScalarItem::Binding(binding)] = result.program.items.as_slice() else {
+        panic!("scalar result binding");
+    };
+    let bytes = |expression: &ScalarExpression| {
+        let span = span_of(expression);
+        &text[span.start as usize..span.end as usize]
+    };
+    let ScalarExpression::Binary { operator: BinaryOperator::Subtract, left, right, .. } =
+        &binding.value
+    else { panic!("outer subtraction") };
+    assert_eq!(bytes(&binding.value), "9 - 2 * -3 - 1");
+    assert_eq!(bytes(right), "1");
+    let ScalarExpression::Binary { operator: BinaryOperator::Subtract, left, right, .. } =
+        left.as_ref()
+    else { panic!("left-associated subtraction") };
+    assert_eq!(bytes(left), "9");
+    assert_eq!(bytes(right), "2 * -3");
+    let ScalarExpression::Binary { operator: BinaryOperator::Multiply, left, right, .. } =
+        right.as_ref()
+    else { panic!("higher-precedence multiplication") };
+    assert_eq!(bytes(left), "2");
+    assert!(matches!(right.as_ref(), ScalarExpression::Unary { operator: UnaryOperator::Negate, .. }));
+    assert_eq!(bytes(right), "-3");
+}
+
+fn malformed_binary_without_rhs(operator: &str) -> CanonicalCstRoot {
+    use wosy_syntax::{CanonicalCstSnapshotElement as Element, CanonicalCstSnapshotNode};
+    let parsed = parse_source(source(), "%%start\n1;\n%%end".into(), &[]);
+    let mut snapshot = parsed.result.canonical_cst().snapshot();
+    snapshot.root = CanonicalCstSnapshotNode {
+        kind: SyntaxKind::Binary,
+        text: format!("1{operator}"),
+        children: vec![
+            Element::Token { kind: SyntaxKind::Integer, text: "1".to_owned() },
+            Element::Token { kind: SyntaxKind::Operator, text: operator.to_owned() },
+        ],
+    };
+    CanonicalCstRoot::from_snapshot(snapshot)
+}
+
+#[test]
+#[should_panic(expected = "operator grammar")]
+fn malformed_binary_reports_bad_operator_before_missing_rhs() {
+    derive_expression(&malformed_binary_without_rhs("?").root);
+}
+
+#[test]
+#[should_panic(expected = "index out of bounds: the len is 2 but the index is 2")]
+fn malformed_binary_with_valid_operator_retains_missing_rhs_error() {
+    derive_expression(&malformed_binary_without_rhs("+").root);
+}
+
+#[test]
 fn reports_integer_range_at_literal_span_and_preserves_i32_max() {
     let invalid_text = "%%start\ni32 value = 2147483648;\n%%end";
     let invalid = validate_text(invalid_text);
@@ -7165,6 +7222,74 @@ fn derives_generic_call_type_arguments_with_unresolved_type_and_span() {
     let restored: Vec<ScalarTypeArgument> =
         serde_json::from_str(&serialized).expect("deserialize type arguments");
     assert_eq!(restored, *type_arguments);
+}
+
+fn generic_call_snapshot() -> wosy_syntax::CanonicalCstSnapshot {
+    use wosy_syntax::{CanonicalCstSnapshotElement as Element, CanonicalCstSnapshotNode};
+    fn call(node: CanonicalCstSnapshotNode) -> Option<CanonicalCstSnapshotNode> {
+        if node.kind == SyntaxKind::Call {
+            return Some(node);
+        }
+        node.children.into_iter().find_map(|child| match child {
+            Element::Node(child) => call(child),
+            Element::Token { .. } => None,
+        })
+    }
+    let parsed = parse_source(source(), "%%start\nmath.wrap<u32>(1, 2);\n%%end".into(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let mut snapshot = parsed.result.canonical_cst().snapshot();
+    snapshot.root = call(snapshot.root).expect("parsed generic call");
+    snapshot
+}
+
+#[test]
+fn derives_reordered_call_children_without_changing_legacy_selection() {
+    use wosy_syntax::CanonicalCstSnapshotElement as Element;
+    let mut snapshot = generic_call_snapshot();
+    snapshot.root.children.reverse();
+    let qualified = snapshot.root.children.iter_mut().find_map(|child| match child {
+        Element::Node(node) if node.kind == SyntaxKind::QualifiedCall => Some(node),
+        _ => None,
+    }).unwrap();
+    qualified.children.push(Element::Token {
+        kind: SyntaxKind::Identifier,
+        text: "last".to_owned(),
+    });
+    let canonical = CanonicalCstRoot::from_snapshot(snapshot);
+    let derived = derive_expression(&canonical.root);
+    let ScalarExpression::Call {
+        receiver, name, receiver_span, name_span, type_arguments, arguments, ..
+    } = derived else { panic!("generic call") };
+    assert_eq!(receiver, None);
+    assert_eq!(receiver_span, None);
+    assert_eq!(name, "last");
+    assert_eq!(name_span.end - name_span.start, 4);
+    assert_eq!(type_arguments.len(), 1);
+    assert_eq!(type_arguments[0].ty, ScalarType::U32);
+    assert!(matches!(arguments.as_slice(), [
+        ScalarExpression::Integer { value: second, .. },
+        ScalarExpression::Integer { value: first, .. },
+    ] if *second == BigInt::from(2) && *first == BigInt::from(1)));
+}
+
+#[test]
+#[should_panic(expected = "qualified call")]
+fn malformed_call_still_reports_missing_callee_before_a_missing_type() {
+    use wosy_syntax::CanonicalCstSnapshotElement as Element;
+    let mut snapshot = generic_call_snapshot();
+    snapshot.root.children.retain(|child|
+        !matches!(child, Element::Node(node) if node.kind == SyntaxKind::QualifiedCall));
+    let generic = snapshot.root.children.iter_mut().find_map(|child| match child {
+        Element::Node(node) if node.kind == SyntaxKind::GenericTypeArguments => Some(node),
+        _ => None,
+    }).unwrap();
+    let argument = generic.children.iter_mut().find_map(|child| match child {
+        Element::Node(node) if node.kind == SyntaxKind::GenericTypeArgument => Some(node),
+        _ => None,
+    }).unwrap();
+    argument.children.clear();
+    let canonical = CanonicalCstRoot::from_snapshot(snapshot);
+    derive_expression(&canonical.root);
 }
 
 #[test]
@@ -8452,6 +8577,64 @@ fn rejects_invalid_character_shapes_at_literal_spans() {
 }
 
 #[test]
+fn cst_literal_diagnostics_keep_category_order_and_exact_spans() {
+    let text = r#"%%start
+struct Bounds { i32[-3] first; i32[0b2] second; }
+f64 floating = 1.0e999;
+std.utf8 first_string = "\q";
+char character = '\z';
+i32 integer = 0xg;
+std.utf8 second_string = "\v";
+%%end"#;
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let canonical = parsed.result.canonical_cst();
+    let expected = [
+        ("B0003", "invalid string literal", r"\q", "invalid string literal"),
+        ("B0003", "invalid string literal", r"\v", "invalid string literal"),
+        ("B0003", "invalid character literal", r"\z", "invalid character literal"),
+        ("B0010", "invalid integer literal", "0b2", "invalid integer literal"),
+        ("B0010", "invalid integer literal", "0xg", "invalid integer literal"),
+        (
+            "B0010",
+            "invalid finite floating-point literal",
+            "1.0e999",
+            "invalid finite floating-point literal",
+        ),
+        (
+            "B0003",
+            "fixed array length must be an unsigned u64",
+            "-3",
+            "invalid fixed array length",
+        ),
+        (
+            "B0003",
+            "fixed array length must be an unsigned u64",
+            "0b2",
+            "invalid fixed array length",
+        ),
+    ];
+    let expected = expected.map(|(code, message, literal, label)| {
+        let start = text.find(literal).expect("in fixture") as u32;
+        super::super::Diagnostic {
+            code: code.to_owned(),
+            severity: super::super::DiagnosticSeverity::Error,
+            message: message.to_owned(),
+            labels: vec![super::super::DiagnosticLabel {
+                kind: super::super::DiagnosticLabelKind::Primary,
+                span: SourceSpan::new(
+                    canonical.source.clone(),
+                    ByteSpan::new(start, start + literal.len() as u32),
+                ),
+                message: label.to_owned(),
+            }],
+            notes: Vec::new(),
+        }
+    });
+    assert_eq!(derive_scalar_diagnostics_from_cst(canonical), expected);
+}
+
+#[test]
 fn reports_malformed_string_escapes_at_their_exact_spans() {
     let cases = [
         (r##"\q"##, 1, 3),
@@ -8559,6 +8742,53 @@ fn reports_unused_local_and_parameter_at_declaration_spans() {
         function.parameter_spans[0]
     );
     assert_eq!(diagnostics[1].labels[0].span.range, local_span);
+}
+
+#[test]
+fn static_uses_share_a_source_span_without_reordering_unused_declarations() {
+    let result = validate_text(
+        "%%start\ni32(i32, i32, i32, i32, i32) f = fn(first, read, alias, last, other) { read };\n%%end",
+    );
+    let mut items = result.program.items;
+    let ScalarItem::Function(function) = &mut items[0] else {
+        panic!("function item");
+    };
+    function.parameter_spans[2] = function.parameter_spans[1];
+    function.parameter_spans[4] = function.parameter_spans[0];
+    let expected = [
+        function.parameter_spans[0],
+        function.parameter_spans[3],
+        function.parameter_spans[4],
+    ];
+    assert_eq!(unused_binding_spans(&items), expected);
+}
+
+#[test]
+fn static_uses_restore_shadowed_bindings_and_discard_scope_only_names() {
+    let text = "%%start
+unit(i32, i32, bool) f = fn(value, earlier, branch) {
+    if (branch) {
+        i32 value = value;
+        i32 earlier = 1;
+        i32 scope_only = 2;
+        if (branch) {
+            i32 earlier = earlier;
+        };
+    } else {
+        earlier;
+        scope_only;
+    }
+    earlier;
+};
+%%end";
+    let result = validate_text(text);
+    let spans = unused_binding_spans(&result.program.items);
+    let expected_starts = ["i32 value = value;", "i32 scope_only = 2;", "i32 earlier = earlier;"]
+        .map(|declaration| text.find(declaration).unwrap() as u32);
+    assert_eq!(
+        spans.iter().map(|span| span.start).collect::<Vec<_>>(),
+        expected_starts
+    );
 }
 
 #[test]

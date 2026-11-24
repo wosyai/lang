@@ -7088,38 +7088,44 @@ pub(super) fn validate(
                             function.span,
                         ));
                     }
-                    let mut scope = declarations.clone();
-                    let mut visible_names = declaration_names.clone();
-                    let mut folded_names = folded_declarations.clone();
-                    typing.declare_parameters(
-                        function,
-                        parameters,
-                        &mut scope,
-                        &mut visible_names,
-                        &mut folded_names,
-                        &mut diagnostics,
+                    let mut scope = BlockLexicalScope::new(
+                        &declarations,
+                        &declaration_names,
+                        &folded_declarations,
                     );
+                    if !function.parameters.is_empty() {
+                        typing.declare_parameters(
+                            function,
+                            parameters,
+                            scope.types.to_mut(),
+                            scope.names.to_mut(),
+                            scope.folded_names.to_mut(),
+                            &mut diagnostics,
+                        );
+                    }
                     if outputs.outputs.len() > 1 && !function.body.final_output_values.is_empty() {
                         let tail = function.body.tail_conditional();
                         let unsafe_context = tail.is_some() && function.body.unsafe_context;
-                        check_final_output_prefix(
-                            &function.body,
-                            &mut scope,
-                            &mut visible_names,
-                            &mut folded_names,
-                            typing,
-                            &mut diagnostics,
-                            unsafe_context,
-                            overloads,
-                            inference,
-                        );
+                        if function.body.items.len() != function.body.final_output_values.len() {
+                            check_final_output_prefix(
+                                &function.body,
+                                scope.types.to_mut(),
+                                scope.names.to_mut(),
+                                scope.folded_names.to_mut(),
+                                typing,
+                                &mut diagnostics,
+                                unsafe_context,
+                                overloads,
+                                inference,
+                            );
+                        }
                         if let Some(tail) = tail {
                             validate_tail_conditional_return(
                                 tail,
                                 &outputs.outputs,
-                                &scope,
-                                &visible_names,
-                                &folded_names,
+                                &scope.types,
+                                &scope.names,
+                                &scope.folded_names,
                                 typing,
                                 &mut diagnostics,
                                 unsafe_context,
@@ -7146,9 +7152,9 @@ pub(super) fn validate(
                                 expression,
                                 value.span,
                                 outputs,
-                                &scope,
-                                &visible_names,
-                                &folded_names,
+                                &scope.types,
+                                &scope.names,
+                                &scope.folded_names,
                                 &mut diagnostics,
                                 overloads,
                                 inference,
@@ -7170,9 +7176,9 @@ pub(super) fn validate(
                                 let actual = expression_type_expected(
                                     expression,
                                     &output.ty,
-                                    &scope,
-                                    &visible_names,
-                                    &folded_names,
+                                    &scope.types,
+                                    &scope.names,
+                                    &scope.folded_names,
                                     program,
                                     &mut diagnostics,
                                     false,
@@ -7192,9 +7198,9 @@ pub(super) fn validate(
                         let actual = block_type_expected(
                             &function.body,
                             &output.ty,
-                            &scope,
-                            &visible_names,
-                            &folded_names,
+                            &scope.types,
+                            &scope.names,
+                            &scope.folded_names,
                             program,
                             &mut diagnostics,
                             false,
@@ -7211,9 +7217,9 @@ pub(super) fn validate(
                     } else {
                         let actual = block_type(
                             &function.body,
-                            &scope,
-                            &visible_names,
-                            &folded_names,
+                            &scope.types,
+                            &scope.names,
+                            &scope.folded_names,
                             program,
                             &mut diagnostics,
                             false,
@@ -7266,74 +7272,86 @@ pub(super) fn validate(
     diagnostics
 }
 
-struct StaticUseAnalyzer {
-    visible: BTreeMap<String, usize>,
+struct StaticUseAnalyzer<'tree> {
+    visible: BTreeMap<&'tree str, ByteSpan>,
+    scope_changes: Vec<(&'tree str, Option<ByteSpan>)>,
     declarations: Vec<ByteSpan>,
-    uses: BTreeSet<usize>,
+    used_spans: HashSet<ByteSpan>,
 }
 
-impl StaticUseAnalyzer {
-    fn new(function: &ScalarFunction) -> Self {
+impl<'tree> StaticUseAnalyzer<'tree> {
+    fn new(function: &'tree ScalarFunction) -> Self {
         let mut analyzer = Self {
             visible: BTreeMap::new(),
+            scope_changes: Vec::new(),
             declarations: Vec::new(),
-            uses: BTreeSet::new(),
+            used_spans: HashSet::new(),
         };
         for (index, name) in function.parameters.iter().enumerate() {
             if let Some(span) = function.parameter_spans.get(index) {
-                let id = analyzer.declarations.len();
-                analyzer.visible.insert(name.clone(), id);
+                analyzer.visible.insert(name.as_str(), *span);
                 analyzer.declarations.push(*span);
             }
         }
         analyzer
     }
 
-    fn block(&mut self, block: &ScalarBlock, visible: &BTreeMap<String, usize>) {
-        let mut visible = visible.clone();
+    fn block(&mut self, block: &'tree ScalarBlock) {
+        let checkpoint = self.scope_changes.len();
         for item in &block.items {
-            self.item(item, &mut visible);
+            self.item(item, true);
+        }
+        while self.scope_changes.len() > checkpoint {
+            let (name, previous) = self.scope_changes.pop().unwrap();
+            if let Some(span) = previous {
+                self.visible.insert(name, span);
+            } else {
+                self.visible.remove(name);
+            }
         }
     }
 
-    fn item(&mut self, item: &ScalarBlockItem, visible: &mut BTreeMap<String, usize>) {
+    fn item(&mut self, item: &'tree ScalarBlockItem, nested: bool) {
         match item {
             ScalarBlockItem::LocalBinding(binding) => {
                 if binding.is_allocation {
                     for receiver in &binding.receivers {
                         if let Some(length) = &receiver.allocation_length {
-                            self.expression(length, visible);
+                            self.expression(length);
                         }
                     }
                 } else {
-                    self.expression(&binding.value, visible);
+                    self.expression(&binding.value);
                 }
-                let id = self.declarations.len();
-                visible.insert(binding.name.clone(), id);
+                let name = binding.name.as_str();
+                let previous = self.visible.insert(name, binding.span);
+                if nested {
+                    self.scope_changes.push((name, previous));
+                }
                 self.declarations.push(binding.span);
             }
-            ScalarBlockItem::Expression(expression) => self.expression(expression, visible),
+            ScalarBlockItem::Expression(expression) => self.expression(expression),
             ScalarBlockItem::Assignment(assignment) => {
                 for (_, value) in assignment.rhs().evaluations() {
-                    self.expression(value, visible);
+                    self.expression(value);
                 }
                 for (position, target) in assignment.targets.iter().enumerate() {
                     if position == 0 || !matches!(&target.place, ScalarPlace::Name { .. }) {
-                        self.place(&target.place, visible);
+                        self.place(&target.place);
                     }
                 }
             }
         }
     }
 
-    fn expression(&mut self, expression: &ScalarExpression, visible: &BTreeMap<String, usize>) {
+    fn expression(&mut self, expression: &'tree ScalarExpression) {
         match expression {
-            ScalarExpression::Name { name, .. } => self.use_name(name, visible),
-            ScalarExpression::Member { receiver, .. } => self.use_name(receiver, visible),
-            ScalarExpression::Unary { operand, .. } => self.expression(operand, visible),
+            ScalarExpression::Name { name, .. } => self.use_name(name),
+            ScalarExpression::Member { receiver, .. } => self.use_name(receiver),
+            ScalarExpression::Unary { operand, .. } => self.expression(operand),
             ScalarExpression::Binary { left, right, .. } => {
-                self.expression(left, visible);
-                self.expression(right, visible);
+                self.expression(left);
+                self.expression(right);
             }
             ScalarExpression::Call {
                 receiver,
@@ -7342,12 +7360,12 @@ impl StaticUseAnalyzer {
                 ..
             } => {
                 if let Some(receiver) = receiver {
-                    self.use_name(receiver, visible);
+                    self.use_name(receiver);
                 } else {
-                    self.use_name(name, visible);
+                    self.use_name(name);
                 }
                 for argument in arguments {
-                    self.expression(argument, visible);
+                    self.expression(argument);
                 }
             }
             ScalarExpression::If {
@@ -7356,31 +7374,31 @@ impl StaticUseAnalyzer {
                 else_branch,
                 ..
             } => {
-                self.expression(condition, visible);
-                self.block(then_branch, visible);
-                self.block(else_branch, visible);
+                self.expression(condition);
+                self.block(then_branch);
+                self.block(else_branch);
             }
             ScalarExpression::UnitIf {
                 condition,
                 then_branch,
                 ..
             } => {
-                self.expression(condition, visible);
-                self.block(then_branch, visible);
+                self.expression(condition);
+                self.block(then_branch);
             }
-            ScalarExpression::Block(block) => self.block(block, visible),
+            ScalarExpression::Block(block) => self.block(block),
             ScalarExpression::RawAddress { place, .. }
             | ScalarExpression::CheckedAddress { place, .. }
-            | ScalarExpression::Dereference { place, .. } => self.place(place, visible),
-            ScalarExpression::IndexedRead { place, .. } => self.place(place, visible),
+            | ScalarExpression::Dereference { place, .. } => self.place(place),
+            ScalarExpression::IndexedRead { place, .. } => self.place(place),
             ScalarExpression::StructLiteral { fields, .. } => {
                 for field in fields {
-                    self.expression(&field.value, visible);
+                    self.expression(&field.value);
                 }
             }
             ScalarExpression::ArrayLiteral { elements, .. } => {
                 for element in elements {
-                    self.expression(element, visible);
+                    self.expression(element);
                 }
             }
             ScalarExpression::Integer { .. }
@@ -7393,37 +7411,28 @@ impl StaticUseAnalyzer {
         }
     }
 
-    fn place(&mut self, place: &ScalarPlace, visible: &BTreeMap<String, usize>) {
+    fn place(&mut self, place: &'tree ScalarPlace) {
         match place {
-            ScalarPlace::Name { name, .. } => self.use_name(name, visible),
-            ScalarPlace::Field { base, .. } => self.place(base, visible),
-            ScalarPlace::Dereference { pointer, .. } => self.expression(pointer, visible),
+            ScalarPlace::Name { name, .. } => self.use_name(name),
+            ScalarPlace::Field { base, .. } => self.place(base),
+            ScalarPlace::Dereference { pointer, .. } => self.expression(pointer),
             ScalarPlace::Index { base, index, .. } => {
-                self.place(base, visible);
-                self.expression(index, visible);
+                self.place(base);
+                self.expression(index);
             }
         }
     }
 
-    fn use_name(&mut self, name: &str, visible: &BTreeMap<String, usize>) {
-        if let Some(id) = visible.get(name) {
-            self.uses.insert(*id);
+    fn use_name(&mut self, name: &str) {
+        if let Some(span) = self.visible.get(name) {
+            self.used_spans.insert(*span);
         }
     }
 
     fn unused(self) -> Vec<ByteSpan> {
         self.declarations
-            .iter()
-            .enumerate()
-            .filter_map(|(id, span)| {
-                let used = self.uses.contains(&id)
-                    || self
-                        .declarations
-                        .iter()
-                        .enumerate()
-                        .any(|(other_id, other)| other == span && self.uses.contains(&other_id));
-                (!used).then_some(*span)
-            })
+            .into_iter()
+            .filter(|span| !self.used_spans.contains(span))
             .collect()
     }
 }
@@ -7434,8 +7443,9 @@ pub(super) fn unused_binding_spans(items: &[ScalarItem]) -> Vec<ByteSpan> {
         .filter_map(|item| match item {
             ScalarItem::Function(function) => {
                 let mut analyzer = StaticUseAnalyzer::new(function);
-                let visible = analyzer.visible.clone();
-                analyzer.block(&function.body, &visible);
+                for item in &function.body.items {
+                    analyzer.item(item, false);
+                }
                 Some(analyzer.unused())
             }
             ScalarItem::Namespace(_)

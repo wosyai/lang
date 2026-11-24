@@ -2546,12 +2546,71 @@ use typecheck::{
 };
 use typecheck::{split_module_typing, ScalarModuleTyping, ScalarProgramTyping};
 pub fn derive_scalar_diagnostics_from_cst(canonical: &CanonicalCstRoot) -> Vec<super::Diagnostic> {
-    let mut diagnostics = string_diagnostics(canonical);
-    diagnostics.extend(char_diagnostics(canonical));
-    diagnostics.extend(integer_diagnostics(canonical));
-    diagnostics.extend(float_diagnostics(canonical));
-    diagnostics.extend(fixed_array_length_diagnostics(canonical));
-    diagnostics
+    let [mut strings, mut chars, mut integers, mut floats, mut lengths] =
+        [const { Vec::new() }; 5];
+    for element in canonical.root.descendants_with_tokens() {
+        match element {
+            NodeOrToken::Token(token) => {
+                let (diagnostics, code, message, span) = match token.kind() {
+                    SyntaxKind::String => {
+                        let Err((start, length)) = decode_string(token.text()) else {
+                            continue;
+                        };
+                        (
+                            &mut strings,
+                            "B0003",
+                            "invalid string literal",
+                            string_error_span(&token, start, length),
+                        )
+                    }
+                    SyntaxKind::Char => {
+                        let Err((start, length)) = decode_char(token.text()) else {
+                            continue;
+                        };
+                        (
+                            &mut chars,
+                            "B0003",
+                            "invalid character literal",
+                            string_error_span(&token, start, length),
+                        )
+                    }
+                    SyntaxKind::Integer if parse_integer(token.text()).is_none() => (
+                        &mut integers,
+                        "B0010",
+                        "invalid integer literal",
+                        token_span(&token),
+                    ),
+                    SyntaxKind::Float if parse_float(token.text()).is_none() => (
+                        &mut floats,
+                        "B0010",
+                        "invalid finite floating-point literal",
+                        token_span(&token),
+                    ),
+                    _ => continue,
+                };
+                diagnostics.push(super::Diagnostic {
+                    code: code.to_owned(),
+                    severity: super::DiagnosticSeverity::Error,
+                    message: message.to_owned(),
+                    labels: vec![super::DiagnosticLabel {
+                        kind: super::DiagnosticLabelKind::Primary,
+                        span: SourceSpan::new(canonical.source.clone(), span),
+                        message: message.to_owned(),
+                    }],
+                    notes: Vec::new(),
+                });
+            }
+            NodeOrToken::Node(node) if node.kind() == SyntaxKind::FixedArrayLength => {
+                lengths.extend(fixed_array_length_diagnostic(&canonical.source, &node));
+            }
+            _ => {}
+        }
+    }
+    strings.append(&mut chars);
+    strings.append(&mut integers);
+    strings.append(&mut floats);
+    strings.append(&mut lengths);
+    strings
 }
 
 #[cfg(test)]
@@ -3886,33 +3945,26 @@ fn derive_callable_array_type(node: &CstNode) -> ScalarType {
     derive_type(node)
 }
 
-fn fixed_array_length_diagnostics(canonical: &CanonicalCstRoot) -> Vec<super::Diagnostic> {
-    canonical
-        .root
-        .descendants()
-        .filter(|node| node.kind() == SyntaxKind::FixedArrayLength)
-        .filter_map(|length| {
-            let token = direct_token(&length, SyntaxKind::Integer)?;
-            let negative = length
-                .children_with_tokens()
-                .any(|element| matches!(element, NodeOrToken::Token(token) if token.kind() == SyntaxKind::Punctuation && token.text() == "-"));
-            (!negative && parse_integer(token.text())
-                .and_then(|value| u64::try_from(value).ok())
-                .is_none()
-                || negative)
-                .then(|| super::Diagnostic {
-                    code: "B0003".to_owned(),
-                    severity: super::DiagnosticSeverity::Error,
-                    message: "fixed array length must be an unsigned u64".to_owned(),
-                    labels: vec![super::DiagnosticLabel {
-                        kind: super::DiagnosticLabelKind::Primary,
-                        span: SourceSpan::new(canonical.source.clone(), wosy_syntax::byte_span(&length)),
-                        message: "invalid fixed array length".to_owned(),
-                    }],
-                    notes: Vec::new(),
-                })
+fn fixed_array_length_diagnostic(
+    source: &SourceIdentity,
+    length: &CstNode,
+) -> Option<super::Diagnostic> {
+    let token = direct_token(length, SyntaxKind::Integer)?;
+    let negative = length
+        .children_with_tokens()
+        .any(|element| matches!(element, NodeOrToken::Token(token) if token.kind() == SyntaxKind::Punctuation && token.text() == "-"));
+    (negative || parse_integer(token.text()).and_then(|value| u64::try_from(value).ok()).is_none())
+        .then(|| super::Diagnostic {
+            code: "B0003".to_owned(),
+            severity: super::DiagnosticSeverity::Error,
+            message: "fixed array length must be an unsigned u64".to_owned(),
+            labels: vec![super::DiagnosticLabel {
+                kind: super::DiagnosticLabelKind::Primary,
+                span: SourceSpan::new(source.clone(), wosy_syntax::byte_span(length)),
+                message: "invalid fixed array length".to_owned(),
+            }],
+            notes: Vec::new(),
         })
-        .collect()
 }
 
 fn qualified_type(node: &CstNode) -> ScalarType {
@@ -4042,89 +4094,6 @@ fn decode_char(value: &str) -> Result<char, (usize, usize)> {
     Ok(character)
 }
 
-fn string_diagnostics(canonical: &CanonicalCstRoot) -> Vec<super::Diagnostic> {
-    canonical
-        .root
-        .descendants_with_tokens()
-        .filter_map(|element| match element {
-            NodeOrToken::Token(token) if token.kind() == SyntaxKind::String => {
-                decode_string(token.text())
-                    .err()
-                    .map(|(start, length)| super::Diagnostic {
-                        code: "B0003".to_owned(),
-                        severity: super::DiagnosticSeverity::Error,
-                        message: "invalid string literal".to_owned(),
-                        labels: vec![super::DiagnosticLabel {
-                            kind: super::DiagnosticLabelKind::Primary,
-                            span: SourceSpan::new(
-                                canonical.source.clone(),
-                                string_error_span(&token, start, length),
-                            ),
-                            message: "invalid string literal".to_owned(),
-                        }],
-                        notes: Vec::new(),
-                    })
-            }
-            _ => None,
-        })
-        .collect()
-}
-
-fn char_diagnostics(canonical: &CanonicalCstRoot) -> Vec<super::Diagnostic> {
-    canonical
-        .root
-        .descendants_with_tokens()
-        .filter_map(|element| match element {
-            NodeOrToken::Token(token) if token.kind() == SyntaxKind::Char => {
-                decode_char(token.text())
-                    .err()
-                    .map(|(start, length)| super::Diagnostic {
-                        code: "B0003".to_owned(),
-                        severity: super::DiagnosticSeverity::Error,
-                        message: "invalid character literal".to_owned(),
-                        labels: vec![super::DiagnosticLabel {
-                            kind: super::DiagnosticLabelKind::Primary,
-                            span: SourceSpan::new(
-                                canonical.source.clone(),
-                                string_error_span(&token, start, length),
-                            ),
-                            message: "invalid character literal".to_owned(),
-                        }],
-                        notes: Vec::new(),
-                    })
-            }
-            _ => None,
-        })
-        .collect()
-}
-
-fn integer_diagnostics(canonical: &CanonicalCstRoot) -> Vec<super::Diagnostic> {
-    canonical
-        .root
-        .descendants_with_tokens()
-        .filter_map(|element| match element {
-            NodeOrToken::Token(token) if token.kind() == SyntaxKind::Integer => {
-                if parse_integer(token.text()).is_none() {
-                    Some(super::Diagnostic {
-                        code: "B0010".to_owned(),
-                        severity: super::DiagnosticSeverity::Error,
-                        message: "invalid integer literal".to_owned(),
-                        labels: vec![super::DiagnosticLabel {
-                            kind: super::DiagnosticLabelKind::Primary,
-                            span: SourceSpan::new(canonical.source.clone(), token_span(&token)),
-                            message: "invalid integer literal".to_owned(),
-                        }],
-                        notes: Vec::new(),
-                    })
-                } else {
-                    None
-                }
-            }
-            _ => None,
-        })
-        .collect()
-}
-
 fn parse_float(text: &str) -> Option<f64> {
     if text.starts_with('_') || text.ends_with('_') || text.contains("__") {
         return None;
@@ -4143,31 +4112,6 @@ fn parse_float(text: &str) -> Option<f64> {
     }
     let value = text.replace('_', "").parse::<f64>().ok()?;
     value.is_finite().then_some(value)
-}
-
-fn float_diagnostics(canonical: &CanonicalCstRoot) -> Vec<super::Diagnostic> {
-    canonical
-        .root
-        .descendants_with_tokens()
-        .filter_map(|element| match element {
-            NodeOrToken::Token(token) if token.kind() == SyntaxKind::Float => {
-                parse_float(token.text())
-                    .is_none()
-                    .then(|| super::Diagnostic {
-                        code: "B0010".to_owned(),
-                        severity: super::DiagnosticSeverity::Error,
-                        message: "invalid finite floating-point literal".to_owned(),
-                        labels: vec![super::DiagnosticLabel {
-                            kind: super::DiagnosticLabelKind::Primary,
-                            span: SourceSpan::new(canonical.source.clone(), token_span(&token)),
-                            message: "invalid finite floating-point literal".to_owned(),
-                        }],
-                        notes: Vec::new(),
-                    })
-            }
-            _ => None,
-        })
-        .collect()
 }
 
 fn string_error_span(token: &CstToken, start: usize, length: usize) -> ByteSpan {
@@ -4425,15 +4369,20 @@ fn derive_expression(node: &CstNode) -> ScalarExpression {
             span: wosy_syntax::byte_span(&actual),
         },
         SyntaxKind::Binary => {
-            let children = semantic_children(&actual);
-            let mut value = derive_element(&children[0]);
-            let mut index = 1;
-            while index < children.len() {
-                let NodeOrToken::Token(operator_token) = &children[index] else {
+            let mut children = semantic_children(&actual).enumerate();
+            let (_, first) = children
+                .next()
+                .unwrap_or_else(|| semantic_child_out_of_bounds(0));
+            let mut value = derive_element(&first);
+            while let Some((index, element)) = children.next() {
+                let NodeOrToken::Token(operator_token) = element else {
                     panic!("binary operator token")
                 };
                 let operator = operator(operator_token.text());
-                let right = derive_element(&children[index + 1]);
+                let (_, right) = children
+                    .next()
+                    .unwrap_or_else(|| semantic_child_out_of_bounds(index + 1));
+                let right = derive_element(&right);
                 let span = ByteSpan::new(span_of(&value).start, span_of(&right).end);
                 value = ScalarExpression::Binary {
                     operator,
@@ -4441,17 +4390,16 @@ fn derive_expression(node: &CstNode) -> ScalarExpression {
                     right: Box::new(right),
                     span,
                 };
-                index += 2;
             }
             value
         }
         SyntaxKind::Unary => {
-            let children = semantic_children(&actual);
-            let Some(first) = children.first() else {
+            let mut children = semantic_children(&actual);
+            let Some(first) = children.next() else {
                 panic!("unary expression children")
             };
             let NodeOrToken::Token(operator_token) = first else {
-                return derive_element(first);
+                return derive_element(&first);
             };
             let operator = match operator_token.text() {
                 "!" => UnaryOperator::LogicalNot,
@@ -4459,7 +4407,7 @@ fn derive_expression(node: &CstNode) -> ScalarExpression {
                 "-" => UnaryOperator::Negate,
                 _ => panic!("unary operator grammar"),
             };
-            let operand = derive_element(children.get(1).expect("unary operand"));
+            let operand = derive_element(&children.next().expect("unary operand"));
             let span = ByteSpan::new(
                 operator_token.text_range().start().into(),
                 span_of(&operand).end,
@@ -4482,56 +4430,64 @@ fn derive_expression(node: &CstNode) -> ScalarExpression {
             }
         }
         SyntaxKind::Call => {
-            let qualified = direct_nodes(&actual)
-                .into_iter()
-                .find(|child| child.kind() == SyntaxKind::QualifiedCall)
-                .expect("qualified call");
-            let identifiers: Vec<CstToken> = qualified
+            let mut children = actual.children();
+            let mut qualified = None;
+            let mut generic = None;
+            let mut first_argument = None;
+            while let Some(child) = children.next() {
+                match child.kind() {
+                    SyntaxKind::QualifiedCall if qualified.is_none() => qualified = Some(child),
+                    SyntaxKind::GenericTypeArguments if generic.is_none() => generic = Some(child),
+                    SyntaxKind::Expression if first_argument.is_none() =>
+                        first_argument = Some((child, children.clone())),
+                    _ => {}
+                }
+                if qualified.is_some() && generic.is_some() {
+                    break;
+                }
+            }
+            let qualified = qualified.expect("qualified call");
+            let mut identifiers = qualified
                 .children_with_tokens()
                 .filter_map(|element| match element {
                     NodeOrToken::Token(token) if token.kind() == SyntaxKind::Identifier => {
                         Some(token)
                     }
                     _ => None,
-                })
-                .collect();
-            let receiver = identifiers
-                .first()
-                .filter(|_| identifiers.len() == 2)
-                .map(|token| token.text().to_owned());
-            let name_token = identifiers.last().expect("call member");
-            let type_arguments = direct_nodes(&actual)
-                .into_iter()
-                .find(|child| child.kind() == SyntaxKind::GenericTypeArguments)
+                });
+            let first = identifiers.next().expect("call member");
+            let (receiver, name_token) = match identifiers.next() {
+                Some(second) => match identifiers.last() {
+                    Some(last) => (None, last),
+                    None => (Some(first), second),
+                },
+                None => (None, first),
+            };
+            let type_arguments = generic
                 .map(|generic| {
                     generic
                         .children()
                         .filter(|child| child.kind() == SyntaxKind::GenericTypeArgument)
                         .map(|argument| ScalarTypeArgument {
                             ty: derive_type(
-                                &direct_nodes(&argument)
-                                    .into_iter()
-                                    .next()
-                                    .expect("generic type argument type"),
+                                &argument.children().next().expect("generic type argument type"),
                             ),
                             span: wosy_syntax::byte_span(&argument),
                         })
                         .collect()
                 })
-                .map_or_else(Vec::new, |arguments| arguments);
-            let arguments = direct_nodes(&actual)
-                .iter()
+                .unwrap_or_default();
+            let (first_argument, remaining_arguments) =
+                first_argument.map_or((None, children), |(first, rest)| (Some(first), rest));
+            let arguments = first_argument.into_iter().chain(remaining_arguments)
                 .filter(|child| child.kind() == SyntaxKind::Expression)
-                .map(derive_expression)
+                .map(|child| derive_expression(&child))
                 .collect();
             ScalarExpression::Call {
-                receiver,
+                receiver: receiver.as_ref().map(|token| token.text().to_owned()),
                 name: name_token.text().to_owned(),
-                receiver_span: identifiers
-                    .first()
-                    .filter(|_| identifiers.len() == 2)
-                    .map(token_span),
-                name_span: token_span(name_token),
+                receiver_span: receiver.as_ref().map(token_span),
+                name_span: token_span(&name_token),
                 type_arguments,
                 arguments,
                 overload_selection: None,
@@ -4577,7 +4533,11 @@ fn derive_expression(node: &CstNode) -> ScalarExpression {
                     span: wosy_syntax::byte_span(&actual),
                 }
             } else {
-                derive_element(&semantic_children(&actual)[0])
+                derive_element(
+                    &semantic_children(&actual)
+                        .next()
+                        .unwrap_or_else(|| semantic_child_out_of_bounds(0)),
+                )
             }
         }
         SyntaxKind::IndexedPlace => ScalarExpression::IndexedRead {
@@ -4642,14 +4602,15 @@ fn derive_expression(node: &CstNode) -> ScalarExpression {
             span: wosy_syntax::byte_span(&actual),
         },
         SyntaxKind::Parenthesized => derive_expression(&direct_nodes(&actual)[0]),
-        SyntaxKind::Expression => derive_element(&semantic_children(&actual)[0]),
-        _ => {
-            let children = semantic_children(&actual);
-            children
-                .first()
-                .map(derive_element)
-                .unwrap_or_else(|| panic!("expression grammar {:?}", actual.kind()))
-        }
+        SyntaxKind::Expression => derive_element(
+            &semantic_children(&actual)
+                .next()
+                .unwrap_or_else(|| semantic_child_out_of_bounds(0)),
+        ),
+        _ => semantic_children(&actual)
+            .next()
+            .map(|first| derive_element(&first))
+            .unwrap_or_else(|| panic!("expression grammar {:?}", actual.kind())),
     }
 }
 
@@ -4806,7 +4767,12 @@ fn direct_nodes(node: &CstNode) -> Vec<CstNode> {
     node.children().collect()
 }
 
-fn semantic_children(node: &CstNode) -> Vec<NodeOrToken<CstNode, CstToken>> {
+#[cold]
+fn semantic_child_out_of_bounds(index: usize) -> ! {
+    panic!("index out of bounds: the len is {index} but the index is {index}")
+}
+
+fn semantic_children(node: &CstNode) -> impl Iterator<Item = NodeOrToken<CstNode, CstToken>> {
     node.children_with_tokens()
         .filter(|element| match element {
             NodeOrToken::Node(_) => true,
@@ -4822,7 +4788,6 @@ fn semantic_children(node: &CstNode) -> Vec<NodeOrToken<CstNode, CstToken>> {
                     | SyntaxKind::Operator
             ),
         })
-        .collect()
 }
 
 fn direct_token(node: &CstNode, kind: SyntaxKind) -> Option<CstToken> {
