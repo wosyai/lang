@@ -7150,7 +7150,7 @@ fn joined_root_reborrow_binding<'a>(
                     alias_count += 1;
                     continue;
                 }
-                if rest.scope == child.scope && writable
+                if writable
                     && exact_named_scalar_store_pointer(deref, points, scalar_stores, grouped_installs)
                     == Some((rest.id, holder, None))
                 {
