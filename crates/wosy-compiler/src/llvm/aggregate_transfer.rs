@@ -86,6 +86,7 @@ pub(super) struct AggregateEmitter<'ctx, 'plan> {
     destination: Option<PointerValue<'ctx>>,
     ordinary_destination: Option<PointerValue<'ctx>>,
     local_choice_destination: Option<PointerValue<'ctx>>,
+    local_choice_committed: bool,
     ordinary_committed: bool,
     ordinary_called: bool,
     literal_array_receipt: LiteralArrayReceipt<'ctx>,
@@ -199,6 +200,7 @@ impl<'ctx, 'plan> AggregateEmitter<'ctx, 'plan> {
             destination,
             ordinary_destination,
             local_choice_destination: None,
+            local_choice_committed: false,
             ordinary_committed: false,
             ordinary_called: false,
             literal_array_receipt: LiteralArrayReceipt::Awaiting,
@@ -771,7 +773,7 @@ fn commit_local_choice<'ctx>(
     aggregate: &mut AggregateEmitter<'ctx, '_>, conditional: usize, base: PointerValue<'ctx>,
 ) -> Result<PointerValue<'ctx>, String> {
     if aggregate.plan.local_choice_arms < 2 || aggregate.structured_arms_visited != aggregate.plan.local_choice_arms
-        || aggregate.committed
+        || aggregate.local_choice_committed
     {
         return Err("invalid local conditional owner commit".into());
     }
@@ -779,7 +781,7 @@ fn commit_local_choice<'ctx>(
     if aggregate.receipts.insert(conditional, base).is_some() {
         return Err("duplicate local conditional owner receipt".into());
     }
-    aggregate.committed = true;
+    aggregate.local_choice_committed = true;
     Ok(descriptor)
 }
 
@@ -1713,7 +1715,7 @@ pub(super) fn finish_return<'ctx>(
         return Err("descriptor assignment did not commit ownership".into());
     }
     if (aggregate.plan.local_choice_binding.is_some() || aggregate.plan.local_choice_immediate.is_some())
-        && (!aggregate.committed || aggregate.local_choice_destination.is_some()) {
+        && (!aggregate.local_choice_committed || aggregate.local_choice_destination.is_some()) {
         return Err("local conditional owner was not committed to lexical storage".into());
     }
     if !aggregate.receipts.is_empty() || aggregate.receipt_guards.len() != aggregate.plan.conditional_guard_count || aggregate.input.is_some() {

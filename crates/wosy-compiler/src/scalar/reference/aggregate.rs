@@ -2801,6 +2801,7 @@ pub(super) fn exact_owning_call_arguments<'a>(
 #[derive(Clone, Copy)]
 enum LocalChoiceUse {
     Observe(CfgPointId),
+    Return { call: OccurrenceOrdinal, output: OccurrenceOrdinal },
     Consume { point: CfgPointId, ordinal: OccurrenceOrdinal, slot: usize },
 }
 
@@ -2847,12 +2848,13 @@ impl Body<'_> {
         let facts = self.facts?;
         if !self.is_monomorphic || !(2..=MAX_LOCAL_CHOICE_LEAVES).contains(&facts.calls.len()) { return None; }
         let [output_ty] = self.sites.boundary.root_outputs.as_slice() else { return None };
-        if !ordinary_value(&output_ty.ty) { return None; }
+        let returns_owner = matches!(output_ty.ty, ScalarType::Struct(_));
+        if !returns_owner && !ordinary_value(&output_ty.ty) { return None; }
         let structure = &self.sites.structure;
         let root = structure.root;
         const MAX_PRE_TRANSFER_OBSERVATIONS: usize = 3;
         let (bind, alias, before_consume, result) = match structure.blocks.get(root.0)?.items.as_slice() {
-            [result] => return self.immediate_receipt_choice(result, output_ty),
+            [result] if !returns_owner => return self.immediate_receipt_choice(result, output_ty),
             [bind, alias, result] if matches!(&alias.kind, BlockItemKind::Binding(view)
                 if matches!(view.receivers(), [receiver] if matches!(receiver.ty, ScalarType::CheckedReference { .. }))) =>
                 (bind, Some(alias), &[][..], result),
@@ -2865,10 +2867,14 @@ impl Body<'_> {
         let [receiver] = binding.receivers() else { return None };
         let BindingInitialization::Outputs(init) = &binding.initialization else { return None };
         let ScalarType::Struct(descriptor) = &receiver.ty else { return None };
-        if !init.secondary.is_empty() || output.output != 0
+        if (returns_owner && (receiver.ty != output_ty.ty || alias.is_some()))
+            || !init.secondary.is_empty() || output.output != 0
             || structure.checked_types.expressions.get(&init.primary) != Some(&receiver.ty)
             || structure.checked_types.expressions.get(&output.expression) != Some(&output_ty.ty)
         { return None; }
+        if !matches!(self.sites.conditionals.get(&init.primary), Some(ConditionalRegion::Value { .. })) {
+            return None;
+        }
         let region = facts.conditional_input_regions.values().find(|region| region.expression == init.primary)?;
         let points = &self.cfg.points;
         let join = points.get(region.join.0)?;
@@ -3035,6 +3041,32 @@ impl Body<'_> {
             } else {
                 read = after_reader;
             }
+        }
+        if returns_owner {
+            let step = recommits.last()?;
+            let span = self.sites.occurrences.get(output.expression.0)?.span;
+            let moved = next(read.id)?;
+            let returned = next(moved.id)?;
+            let exit = next(returned.id)?;
+            if saved_count != 0
+                || !matches!(self.sites.prepared_plain_name(output.expression),
+                    Some(PlainNameIdentity::Lexical(binding)) if binding == holder)
+                || [read, moved, returned, exit].into_iter().any(|point| point.scope != scope)
+                || read.source_span.range != span || moved.source_span.range != span
+                || !matches!(&read.kind, CfgPointKind::Read { binding } if binding == holder)
+                || !matches!(&moved.kind, CfgPointKind::Move { owner, place, ty } if owner == holder
+                    && &place.binding == holder && place.projections.is_empty() && ty == &receiver.ty)
+                || !matches!(returned.kind, CfgPointKind::ReturnOutput { output: 0, value_point, checked: false }
+                    if value_point == read.id)
+                || !matches!(exit.kind, CfgPointKind::ScopeExit)
+                || !self.return_owners().eq([Some(OwnerSource::Call(step.point))])
+            { return None; }
+            return Some(LocalReceiptChoice {
+                block: root, item: Some(bind.position), conditional: init.primary,
+                leaves: self.local_choice_leaves(init.primary, &receiver.ty, &recommits)?,
+                use_site: LocalChoiceUse::Return { call: step.ordinal, output: output.expression },
+                recommits,
+            });
         }
         let end_use = |last: &ReferenceFlowPoint| {
             let returned = next(last.id)?;
@@ -4582,6 +4614,9 @@ fn closed_aggregates<'a>(
         previous: CfgPointId,
         birth: CfgPointId,
     }
+    let mut selected_returns = BTreeMap::<BodyKey, LocalReceiptChoice>::new();
+    let mut selected_return_waiters = BTreeMap::<BodyKey, Vec<BodyKey>>::new();
+    let mut selected_return_dependencies = BTreeMap::<BodyKey, usize>::new();
     let mut recommit_observers = BTreeMap::<(BodyKey, CfgPointId), BTreeSet<(BodyKey, usize)>>::new();
     let mut recommit_edges = BTreeMap::<(BodyKey, CfgPointId), Vec<(CfgPointId, Option<CfgPointId>)>>::new();
     let mut structured_returns = BTreeMap::new();
@@ -4680,6 +4715,27 @@ fn closed_aggregates<'a>(
                 }
             }
         }
+        if matches!(body.sites.boundary.root_outputs.as_slice(),
+            [output] if matches!(output.ty, ScalarType::Struct(_)))
+        {
+            if let Some(choice) = body.local_receipt_choice(|point| {
+                let target = target_body(&declarations, body.cfg, point)?;
+                Some((target, *identity_relays.get(&target)?))
+            }) {
+                let dependencies: Option<BTreeSet<_>> = choice.leaves.iter().map(|&point| {
+                    let target = target_body(&declarations, body.cfg, point)?;
+                    (!bodies.get(&target)?.has_mixed_struct_result()).then_some(target)
+                }).collect();
+                if let Some(dependencies) = dependencies {
+                    selected_return_dependencies.insert(key, dependencies.len());
+                    for dependency in dependencies {
+                        selected_return_waiters.entry(dependency).or_default().push(key);
+                    }
+                    selected_returns.insert(key, choice);
+                    continue;
+                }
+            }
+        }
         if let Some(shape) = body.structured_owner_return().filter(StructuredOwnerReturn::has_owning_leaf) {
             for &leaf in &shape.leaves {
                 if let Some(target) = target_body(&declarations, body.cfg, leaf) {
@@ -4722,12 +4778,23 @@ fn closed_aggregates<'a>(
     // Only independently allocated owners seed the two worklists. A wrapper
     // becomes an owning producer when its returned recommit has such a seed.
     // Each observed call edge is consumed once, including through wrapper chains.
+    // A selected returned receipt additionally waits for every distinct factory
+    // target; validation of its body and each factory still happens below.
     loop {
         if let Some(target) = pending.pop() {
             if let Some(body_callers) = callers.remove(&target) {
                 for caller in body_callers {
                     if outgoing.insert(caller) {
                         pending.push(caller);
+                    }
+                }
+            }
+            if let Some(waiters) = selected_return_waiters.remove(&target) {
+                for waiter in waiters {
+                    let remaining = selected_return_dependencies.get_mut(&waiter).expect("indexed selected owner return");
+                    *remaining -= 1;
+                    if *remaining == 0 && outgoing.insert(waiter) {
+                        pending.push(waiter);
                     }
                 }
             }
@@ -5012,10 +5079,17 @@ fn closed_aggregates<'a>(
         }
         initializer_users.entry(receiver).or_default().push(index);
     }
-    let mut local_choices = BTreeMap::new();
+    selected_returns.retain(|key, _| outgoing.contains(key));
+    let mut local_choices = selected_returns;
+    for choice in local_choices.values() {
+        for step in &choice.recommits {
+            result.bodies.entry(step.relay).or_default().identity_relay = Some(step.slot);
+        }
+    }
     let mut local_choice_consumers = BTreeMap::new();
     for (&key, body) in &bodies {
-        if outgoing.contains(&key) { continue; }
+        if outgoing.contains(&key) || matches!(body.sites.boundary.root_outputs.as_slice(),
+            [output] if matches!(output.ty, ScalarType::Struct(_))) { continue; }
         let Some(choice) = body.local_receipt_choice(|point| {
             let target = target_body(&declarations, body.cfg, point)?;
             Some((target, *identity_relays.get(&target)?))
@@ -5425,7 +5499,9 @@ fn closed_aggregates<'a>(
                     body.source
                 ));
             }
-            let route = if let Some(shape) = structured_returns.get(&key) {
+            let route = if let Some(LocalChoiceUse::Return { call, output }) = local_choices.get(&key).map(|choice| choice.use_site) {
+                ClosedReturn::Recommit { call: call.0, output: output.0 }
+            } else if let Some(shape) = structured_returns.get(&key) {
                 if !shape.complete || !shape.has_owning_leaf() || shape.leaves.iter().any(|&leaf| {
                     target_body(&declarations, body.cfg, leaf).is_none_or(|target|
                         !outgoing.contains(&target) || bodies.get(&target).is_none_or(Body::has_mixed_struct_result))

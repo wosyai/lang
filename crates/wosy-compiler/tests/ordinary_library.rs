@@ -958,6 +958,96 @@ fn aggregate_owner_recommit_preserves_the_original_base_across_ordinary_identity
 }
 
 #[test]
+fn selected_recommitted_owner_returns_its_backing_to_the_caller() {
+    let app = source("workbench", "src/selected_recommitted_return.w");
+    let text = include_str!("fixtures/structured-local-choice.w")
+        .replace("u64(u64, bool) drive = fn(depth, choose) {",
+            "u64(*Packet) read_amount = fn(view) { (*view).length };\nPacket(Packet) relay = fn(packet) { packet };\nPacket(u64, bool) shipment = fn(depth, choose) {")
+        .replace("    chosen.length\n};", concat!(
+            "    read_amount(&chosen);\n",
+            "    Packet returned = relay(chosen);\n",
+            "    read_amount(&returned);\n",
+            "    returned\n",
+            "};\n",
+            "u64(u64, bool) drive = fn(depth, choose) { Packet received = shipment(depth, choose); received.length };"));
+    for (target, target_layout) in [("native64", ScalarTargetLayout::NATIVE64), ("wasm32", ScalarTargetLayout::WASM32)] {
+        for (route, project) in [("single", false), ("project", true)] {
+            let prepared = prepare_scalar_project(
+                vec![(declarations(&app, &text), Vec::new())], vec![app.clone()],
+                ScalarPreparationInputs { target_layout },
+            ).unwrap_or_else(|error| panic!("{target}/{route}: {:?}", error.diagnostics));
+            let build = analyze_scalar_build(&prepared);
+            assert!(build.diagnostics().is_empty(), "{target}/{route}: {:?}", build.diagnostics());
+            let ir = if project { emit_scalar_build_project_llvm(&build) }
+                else { wosy_compiler::emit_scalar_build_single_module_llvm(&build) }
+                .unwrap_or_else(|error| panic!("{target}/{route}: {error}")).to_text();
+            let context = Context::create();
+            let module = context.create_module_from_ir(
+                MemoryBuffer::create_from_memory_range_copy(ir.as_bytes(), target)).unwrap();
+            module.verify().unwrap();
+            let symbol = |name: &str| if project { function_with_suffix(&module, name) } else { name.to_owned() };
+            let find = |name| module.get_function(&symbol(name)).unwrap();
+            let (ship, drive, relay, reader, free) = (
+                find("shipment"), find("drive"), find("relay"), find("read_amount"),
+                module.get_function("__wosy_core_free").unwrap(),
+            );
+            let factories = [find("make_short"), find("make_long")];
+            assert_eq!(ship.count_params(), 3, "{ir}");
+            assert_eq!(relay.count_params(), 1, "{ir}");
+            assert_eq!(drive.count_params(), 2, "{ir}");
+            let mut original = Vec::new();
+            let mut reads_and_handoff = Vec::new();
+            let mut returned = None;
+            let mut bases = Vec::new();
+            for row in ship.get_basic_blocks().into_iter().flat_map(|block| block.get_instructions()) {
+                if row.get_opcode() == InstructionOpcode::Phi && row.to_string().contains("phi ptr") {
+                    let incoming = (0..row.get_num_operands()).filter_map(|n| row.get_operand(n)?.value()).collect::<Vec<_>>();
+                    bases.push((inkwell::values::PhiValue::try_from(row).unwrap().as_basic_value(), incoming));
+                }
+                if row.get_opcode() == InstructionOpcode::Return {
+                    assert!(returned.replace(row.get_operand(0).unwrap().value().unwrap()).is_none());
+                }
+                let Ok(call) = CallSiteValue::try_from(row) else { continue };
+                let callee = call.get_called_fn_value().unwrap();
+                assert_ne!(callee, free, "producer must transfer ownership");
+                if factories.contains(&callee) {
+                    original.push(call.try_as_basic_value().basic().unwrap());
+                } else if callee == reader || callee == relay {
+                    assert_eq!(call.count_arguments(), 1);
+                    reads_and_handoff.push(callee);
+                }
+            }
+            assert_eq!(reads_and_handoff, [reader, relay, reader]);
+            let [(selected, incoming)] = bases.as_slice() else { panic!("{ir}") };
+            assert_eq!(returned, Some(*selected), "return the actual original-base phi");
+            assert_eq!(incoming.len(), 2);
+            assert_eq!(original.len(), 2);
+            assert!(original.iter().all(|base| incoming.contains(base)));
+            let mut received = None;
+            let mut released = Vec::new();
+            for row in drive.get_basic_blocks().into_iter().flat_map(|block| block.get_instructions()) {
+                let Ok(call) = CallSiteValue::try_from(row) else { continue };
+                match call.get_called_fn_value() {
+                    Some(target) if target == ship => assert!(received.replace(call.try_as_basic_value().basic().unwrap()).is_none()),
+                    Some(target) if target == free => released.push(row.get_operand(0).unwrap().value().unwrap()),
+                    _ => {}
+                }
+            }
+            assert_eq!(released, [received.expect("one received backing")], "caller releases the transferred original once");
+            if let Some(out) = std::env::var_os("WOSY_SELECTED_RECOMMITTED_RETURN_IR_DIR") {
+                let out = std::path::PathBuf::from(out).join(route);
+                std::fs::create_dir_all(&out).unwrap();
+                let mut witness = ir.replace("@main(", "@wosy_authored_main(");
+                for name in ["case_zero", "case_two", "case_three"] {
+                    witness.push_str(&format!("\ndefine i64 @wosy_{name}() {{\nentry:\n  %v = call i64 @{}()\n  ret i64 %v\n}}\n", symbol(name)));
+                }
+                std::fs::write(out.join(format!("{target}.ll")), witness).unwrap();
+            }
+        }
+    }
+}
+
+#[test]
 fn recommitted_wrapper_return_preserves_one_base_across_two_owning_returns() {
     let app = source("workbench", "src/recommitted_wrapper_return.w");
     let text = include_str!("fixtures/recommitted-wrapper-return.w");
