@@ -9,6 +9,7 @@ enum Expected {
     Valid,
     NullParent,
     LiveConflict,
+    LiveDescendantConflict,
     Declined,
 }
 
@@ -48,9 +49,10 @@ fn check_case(text: &str, expected: Expected, witness_dir: Option<&str>) {
                     }), "{target}/{route}: {diagnostics:?}");
                 }
                 Expected::Declined => assert!(diagnostics.iter().any(|item| item.code == "B0003"), "{target}/{route}: {diagnostics:?}"),
-                Expected::LiveConflict => {
+                Expected::LiveConflict | Expected::LiveDescendantConflict => {
                     let write = text.find("first = 3").expect("owner write") as u32;
-                    let child = text.find("&(*parent)").expect("child reborrow") as u32;
+                    let loan = if matches!(expected, Expected::LiveDescendantConflict) { "&(*child)" } else { "&(*parent)" };
+                    let child = text.find(loan).expect("child reborrow") as u32;
                     assert!(diagnostics.iter().any(|diagnostic| {
                         diagnostic.code == "B0003"
                             && diagnostic.labels.first().is_some_and(|label| label.span.range.start == write)
@@ -191,6 +193,23 @@ fn joined_child_alias_does_not_authorize_rebinding() {
     let program = joined("parent = &!second;", true, "",
         "*u8 alias = child; alias = null; u8 again = *alias; again;");
     check(&program, Expected::Declined);
+}
+
+#[test]
+fn joined_shared_descendant_uses_the_selected_parent_until_its_last_read() {
+    let program = joined("parent = &!second;", true, "",
+        "*u8 nested = &(*child); u8 again = *nested; first = 3;")
+        .replace("    seen\n", "    if (again == seen) { again } else { 0 }\n");
+    check_case(&program, Expected::Valid, Some("WOSY_REBORROW_DESCENDANT_IR_DIR"));
+    let live = program.replace("u8 again = *nested; first = 3;", "first = 3; u8 again = *nested;");
+    assert_ne!(live, program);
+    check(&live, Expected::LiveDescendantConflict);
+    let alias = program.replace("*u8 nested = &(*child);", "*u8 alias = child; *u8 nested = &(*alias);");
+    assert_ne!(alias, program);
+    check(&alias, Expected::Valid);
+    let third = program.replace("u8 again = *nested;", "*u8 third = &(*nested); u8 again = *third;");
+    assert_ne!(third, program);
+    check(&third, Expected::Declined);
 }
 
 fn joined_with_scalar_call(after_read: &str) -> String {
