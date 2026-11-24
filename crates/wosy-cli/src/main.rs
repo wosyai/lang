@@ -978,10 +978,14 @@ fn check_command(
                 message: "proof goal".to_owned(),
             });
         }
+        let mut notes = vec![format!("symbolic call can return {}", failure.returned)];
+        if let Some(entry) = symbolic_entry_point_note(&failure.witness, publication.texts) {
+            notes.push(entry);
+        }
         Diagnostic {
             code: String::new(), severity: DiagnosticSeverity::Error,
             message: "proof obligation failed".to_owned(), labels,
-            notes: vec![format!("symbolic call can return {}", failure.returned)],
+            notes,
         }
     });
     let contextual = report.contextual_diagnostic.iter().map(|failure| {
@@ -1028,19 +1032,8 @@ fn check_command(
                 message: "proof goal".to_owned() });
         }
         let mut notes = vec![format!("symbolic call can return cell [{}] = {}", failure.index, failure.value)];
-        let entries = failure.witness.axes().enumerate().map(|(axis, (binding, _))| {
-            let mut points = failure.witness.intervals_at(0, axis)?;
-            let (first, last) = points.next()?;
-            if first != last || points.len() != 0 { return None; }
-            let name = PackageRelativePath::new(binding.source.path.clone().into()).ok()
-                .map(|path| ProjectSourceIdentity::new(binding.source.project.clone(), binding.source.package.clone(), path))
-                .and_then(|source| publication.texts.get(&source))
-                .and_then(|text| text.get(binding.declaration_span.start as usize..binding.declaration_span.end as usize));
-            let name = name.map_or_else(|| format!("argument {}", axis + 1), str::to_owned);
-            Some(format!("{name} = {first}"))
-        }).collect::<Option<Vec<_>>>();
-        if let Some(entries) = entries.filter(|entries| !entries.is_empty()) {
-            notes.push(format!("symbolic call entry: {}", entries.join(", ")));
+        if let Some(entry) = symbolic_entry_point_note(&failure.witness, publication.texts) {
+            notes.push(entry);
         }
         Diagnostic {
             code: String::new(), severity: DiagnosticSeverity::Error,
@@ -1052,6 +1045,26 @@ fn check_command(
         .map_err(|error| format!("check: could not complete authored output; earlier records may already be published: {error}"))?;
     render_project_diagnostics(&diagnostics, publication.texts);
     Ok(if authored_status != 0 { authored_status } else { u8::from(!diagnostics.is_empty()) })
+}
+
+#[cfg(feature = "internal-checker")]
+fn symbolic_entry_point_note(
+    witness: &wosy_compiler::ScalarCheckerIntegerWitness,
+    texts: &BTreeMap<ProjectSourceIdentity, String>,
+) -> Option<String> {
+    if witness.row_count() != 1 || witness.axes().len() == 0 { return None; }
+    let entries = witness.axes().enumerate().map(|(axis, (binding, _))| {
+        let mut points = witness.intervals_at(0, axis)?;
+        let (first, last) = points.next()?;
+        if first != last || points.len() != 0 { return None; }
+        let name = PackageRelativePath::new(binding.source.path.clone().into()).ok()
+            .map(|path| ProjectSourceIdentity::new(binding.source.project.clone(), binding.source.package.clone(), path))
+            .and_then(|source| texts.get(&source))
+            .and_then(|text| text.get(binding.declaration_span.start as usize..binding.declaration_span.end as usize));
+        let name = name.map_or_else(|| format!("argument {}", axis + 1), str::to_owned);
+        Some(format!("{name} = {first}"))
+    }).collect::<Option<Vec<_>>>()?;
+    Some(format!("symbolic call entry: {}", entries.join(", ")))
 }
 
 fn artifact_identity(

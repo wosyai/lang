@@ -4507,16 +4507,16 @@ fn capture_named_calling_partitions<'a>(
     if citation_only && !citation_safe_calling_body(body) { return Err(ProjectCheck::Unsupported); }
     let mut cursor = ExactCallCursor::projected(body, Rc::new(domain), &output.ty).ok_or(ProjectCheck::Unsupported)?;
     cursor.observe_named_affine_partitions(false).ok_or(ProjectCheck::Unsupported)?;
-    run_named_partition_cursor(target, body, source, cursor, effects, runtime, citation_only, false, false)
+    run_named_partition_cursor::<false>(target, body, source, cursor, effects, runtime, citation_only, false, false)
 }
 
 #[cfg(feature = "internal-checker")]
-fn run_named_partition_cursor<'a>(
+fn run_named_partition_cursor<'a, const ORDINARY_LOCALS: bool>(
     target: PreparedCallable, body: &'a FunctionCallSites, source: &'a SourceIdentity,
     cursor: ExactCallCursor<'a>, effects: &mut OrderedFailures, runtime: SymbolicProofRuntime<'a>,
     citation_only: bool, named_pair: bool, named_mixed_pair: bool,
 ) -> Result<(ActualCallResult, bool, HashSet<PreparedCallable>), ProjectCheck> {
-    let mut evaluator = CheckedCalls::<ProofFreeSymbolic<false, true>, false> {
+    let mut evaluator = CheckedCalls::<ProofFreeSymbolic<ORDINARY_LOCALS, true>, false> {
         project: runtime.project, calls: runtime.calls, active: HashSet::from([target]),
         active_depth: 1, reached: HashSet::new(), had_obligations: false,
         observer: ProofFreeSymbolic { ordinary_projected_effects: false, citation_only, named_pair, named_mixed_pair, named_pair_work: 0 }, symbolic_module: target.0,
@@ -4654,7 +4654,7 @@ impl<'a> SelectedSymbolicProof<'a, '_> {
         }
         let cursor = ExactCallCursor::named_pair_root(body, &output.ty, full.clone(), bool_axis).ok_or(ProjectCheck::Unsupported)?;
         let mut private_effects = OrderedFailures::default();
-        let (returned, active, reached) = run_named_partition_cursor(target, body, source, cursor, &mut private_effects,
+        let (returned, active, reached) = run_named_partition_cursor::<false>(target, body, source, cursor, &mut private_effects,
             runtime, true, true, mixed)?;
         let complete = if let Some(axis) = bool_axis {
             covers_all_named_mixed_pair_inputs(&returned, axis, &full[1 - axis], &mut work)
@@ -4708,6 +4708,67 @@ impl<'a> SelectedSymbolicProof<'a, '_> {
             }
         }
         Ok(Some(applicable))
+    }
+
+    fn verify_unary_entry_relationship(
+        &mut self, target: PreparedCallable, body: &FunctionCallSites, function: &ScalarFunction,
+        source: &SourceIdentity, effects: &mut OrderedFailures, runtime: SymbolicProofRuntime<'_>,
+        group: &MainFlowProofTarget<'a>, case: &MainFlowProofCase<'a>,
+    ) -> Result<Option<bool>, ProjectCheck> {
+        use super::checker_flow::{charge_call_work, covers_all_partitioned_call_inputs, verify_partitioned_call_return,
+            PartitionedProofGoal};
+        let [input] = body.boundary.parameters.as_slice() else { return Err(ProjectCheck::Unsupported); };
+        let [output] = body.boundary.results.as_slice() else { return Err(ProjectCheck::Unsupported); };
+        if case.proof_source != source || !supports_unary_entry_proof(body, &output.ty) || case.guard.domain.is_some() {
+            return Err(ProjectCheck::Unsupported);
+        }
+        let (goal, summary) = match case.bound {
+            MainFlowProofBound::Entry(0) => (PartitionedProofGoal::EntryEquality(0), VerifiedSymbolicResult::EntryAlias(0)),
+            MainFlowProofBound::EntryAffine { slot: 0, transform } =>
+                (PartitionedProofGoal::EntryAffineEquality { slot: 0, transform },
+                 VerifiedSymbolicResult::EntryAffine { slot: 0, transform: Rc::clone(transform) }),
+            _ => return Err(ProjectCheck::Unsupported),
+        };
+        if case.guard.always_rejects { return Ok(Some(false)); }
+        let mut work = 0;
+        charge_call_work(&mut work, body.occurrences.len().checked_add(case.guard.comparisons.len())
+            .ok_or(ProjectCheck::Unsupported)?).ok_or(ProjectCheck::Unsupported)?;
+        let mut domain = IntegerSet::from_type(&input.ty).ok_or(ProjectCheck::Unsupported)?;
+        for guard in &case.guard.comparisons {
+            if guard.slot != 0 { return Err(ProjectCheck::Unsupported); }
+            charge_call_work(&mut work, domain.interval_count()).ok_or(ProjectCheck::Unsupported)?;
+            domain = domain.keep_relation(guard.relation, guard.bound);
+        }
+        if domain.is_empty() { return Ok(Some(false)); }
+        // Keep the guarded entry axis live all the way to partition
+        // serialization. The ordinary-local driver below already models
+        // immutable add/subtract and aliases on that axis. Exact-only extended
+        // local modes are not valid on a projected cursor.
+        let mut cursor = ExactCallCursor::projected(body, Rc::new(domain.clone()), &output.ty).ok_or(ProjectCheck::Unsupported)?;
+        cursor.observe_named_affine_partitions(true).ok_or(ProjectCheck::Unsupported)?;
+        let mut isolated = OrderedFailures::default();
+        let (returned, active, dependencies) = run_named_partition_cursor::<true>(
+            target, body, source, cursor, &mut isolated, runtime, true, false, false,
+        )?;
+        if active || !isolated.records.is_empty() || !dependencies.is_empty()
+            || covers_all_partitioned_call_inputs(&returned, &domain, &mut work) != Some(true)
+        {
+            return Err(ProjectCheck::Unsupported);
+        }
+        let checked = verify_partitioned_call_return(body, &returned, &domain, false, goal, Some(&mut work))
+            .ok_or(ProjectCheck::Unsupported)?;
+        if !checked.applicable { return Err(ProjectCheck::Unsupported); }
+        if let Some(failure) = checked.failure {
+            self.record(case, function, source, effects.records.len(), failure, None)?;
+        } else if let Some(issuer) = group.issuer.as_ref().filter(|issuer| std::ptr::eq(issuer.body, body)) {
+            self.equalities.insert(VerifiedSymbolicEquality {
+                target, canonical_target: issuer.canonical_target, layout: issuer.layout, body: issuer.body,
+                result: summary, guards: VerifiedSymbolicGuards::Rectangle {
+                    guards: case.guard.comparisons.clone(), _dependency_definitions: dependencies,
+                },
+            });
+        }
+        Ok(Some(true))
     }
 
     fn verify_calling_producer(
@@ -4930,6 +4991,15 @@ impl SymbolicRootProof for SelectedSymbolicProof<'_, '_> {
         } else {
             return self.equalities.consume(target, calls, source, effects);
         };
+        if let MainFlowProofCases::Bare { first, rest } = &group.cases {
+            if rest.is_empty() && calls.boundary.parameters.len() == 1
+                && matches!(first.bound, MainFlowProofBound::Entry(0) | MainFlowProofBound::EntryAffine { slot: 0, .. })
+                && Some(first.relation) == IntegerRelation::from_operator(&BinaryOperator::Equal)
+                && calls.boundary.results.first().is_some_and(|out| supports_unary_entry_proof(calls, &out.ty))
+            {
+                return self.verify_unary_entry_relationship(target, calls, function, source, effects, runtime, group, first);
+            }
+        }
         if named_exact_mixed_pair(&calls.boundary.parameters, |entry| &entry.ty) {
             return self.verify_calling_pair(target, calls, function, source, effects, runtime, group);
         }
@@ -5326,12 +5396,23 @@ impl<'a> MainFlowProofBound<'a> {
         }
     }
 
-    fn for_actual<'call>(&self, arguments: &[&'call BigInt]) -> Option<&'call BigInt>
+    fn for_actual<'call>(
+        &self, arguments: &[&'call BigInt], parameters: &[ScalarType],
+    ) -> Option<Cow<'call, BigInt>>
     where 'a: 'call,
     {
         match self {
-            Self::Literal(value) => Some(value),
-            Self::Entry(slot) => arguments.get(*slot).copied(),
+            Self::Literal(value) => Some(Cow::Borrowed(value)),
+            Self::Entry(slot) => arguments.get(*slot).map(|value| Cow::Borrowed(*value)),
+            Self::EntryAffine { slot: 0, transform } => {
+                // Only the enrolled unary, same-width proof can interpret an
+                // affine goal for a real call. Rectangular concrete goals
+                // (including authored shows) retain their prior refusal.
+                let ([parameter], [entry]) = (parameters, arguments) else { return None; };
+                if !is_integer_type(parameter) { return None; }
+                let value = transform.apply_point(entry);
+                integer_literal_fits_type(&value, parameter).then_some(Cow::Owned(value))
+            }
             Self::EntryAffine { .. } => None,
         }
     }
@@ -5672,7 +5753,9 @@ impl<'a> SymbolicEqualityIssuer<'a> {
         let affine = matches!(&plan.typed.goal, TypedProofGoal::EntryAffine { slot, relation, .. }
             if parameters.get(*slot).is_some_and(|entry| &entry.ty == plan.typed.result_type)
                 && Some(*relation) == IntegerRelation::from_operator(&BinaryOperator::Equal));
-        if rectangular && (literal || entry || affine) {
+        if (rectangular && (literal || entry || affine))
+            || ((entry || affine) && supports_unary_entry_proof(body, plan.typed.result_type))
+        {
             return Some(Self { canonical_target: plan.canonical_target, layout: plan.typed.target.target_layout, body });
         }
         if !literal || !(proof.guard.comparisons.is_empty()
@@ -5783,8 +5866,10 @@ impl<'a> MainFlowProofObserver<'a> {
 
     fn eligible_pure_affine_case(plan: &PlannedModuleProof<'_>, proof: &MainFlowProofPlan<'_>) -> bool {
         plan.steps.items.is_empty() && plan.typed.measure.is_none()
-            && matches!(&plan.typed.goal, TypedProofGoal::Literal { .. })
-            && matches!(proof.0.filter, [] | [CheckerPredicate::Boolean(true) | CheckerPredicate::Integer(_)])
+            && ((matches!(&plan.typed.goal, TypedProofGoal::Literal { .. })
+                && matches!(proof.0.filter, [] | [CheckerPredicate::Boolean(true) | CheckerPredicate::Integer(_)]))
+                || (matches!(&plan.typed.goal, TypedProofGoal::EntryAffine { .. } | TypedProofGoal::EntryComparison { .. })
+                    && supports_unary_entry_proof(plan.typed.body, plan.typed.result_type)))
     }
 
     fn insert(&mut self, scope: ScalarCheckerScope, allow_issuer: bool, plan: &PlannedModuleProof<'a>, proof: MainFlowProofPlan<'a>) {
@@ -5840,7 +5925,8 @@ impl ActualIntegerObserver for MainFlowProofObserver<'_> {
     fn permits_named_pure_affine_return(&self, target: PreparedCallable, arguments: &[&BigInt]) -> bool {
         if self.pure_affine_target != Some(target) { return false; }
         let MainFlowProofCases::Bare { first, .. } = &self.first.1.cases else { return false; };
-        first.guard.accepts(arguments)
+        // An actual call outside the proof guard still gets ordinary evaluation.
+        !matches!(first.bound, MainFlowProofBound::Literal(_)) || first.guard.accepts(arguments)
     }
 
     fn observe_initializer(
@@ -5914,11 +6000,11 @@ impl ActualIntegerObserver for MainFlowProofObserver<'_> {
                         continue;
                     }
                     self.active = true;
-                    let Some(bound) = proof.bound.for_actual(arguments) else {
+                    let Some(bound) = proof.bound.for_actual(arguments, parameters) else {
                         self.incomplete = true;
                         return;
                     };
-                    if !proof.relation.accepts(value.cmp(bound)) && !emit(proof, None) {
+                    if !proof.relation.accepts(value.cmp(bound.as_ref())) && !emit(proof, None) {
                         self.incomplete = true;
                         return;
                     }
@@ -5931,7 +6017,7 @@ impl ActualIntegerObserver for MainFlowProofObserver<'_> {
                 }
                 proofs.seen = true;
                 for (proof, step) in cases {
-                    let Some(bound) = proof.bound.for_actual(arguments) else {
+                    let Some(bound) = proof.bound.for_actual(arguments, parameters) else {
                         self.incomplete = true;
                         return;
                     };
@@ -5951,7 +6037,7 @@ impl ActualIntegerObserver for MainFlowProofObserver<'_> {
                             if !step.relation.accepts(comparison) {
                                 Some(step.span)
                             } else {
-                                let ordering = if step.same_bound { comparison } else { value.cmp(bound) };
+                                let ordering = if step.same_bound { comparison } else { value.cmp(bound.as_ref()) };
                                 if proof.relation.accepts(ordering) {
                                     continue;
                                 }
@@ -5975,7 +6061,7 @@ impl ActualIntegerObserver for MainFlowProofObserver<'_> {
                                 _ => unreachable!(),
                             };
                             let failed = first_failed_show(groups, value);
-                            if failed.is_none() && proof.relation.accepts(value.cmp(bound)) {
+                            if failed.is_none() && proof.relation.accepts(value.cmp(bound.as_ref())) {
                                 continue;
                             }
                             failed
@@ -6013,7 +6099,7 @@ impl ActualIntegerObserver for MainFlowProofObserver<'_> {
                                     return;
                                 }
                             };
-                            if failed.is_none() && proof.relation.accepts(value.cmp(bound)) { continue; }
+                            if failed.is_none() && proof.relation.accepts(value.cmp(bound.as_ref())) { continue; }
                             failed
                         }
                         Some(MainFlowAuthoredShows::CallingCitation { .. }) => {
@@ -6031,14 +6117,14 @@ impl ActualIntegerObserver for MainFlowProofObserver<'_> {
                             }
                             if !relation.accepts(value.cmp(*argument)) {
                                 Some(*span)
-                            } else if proof.relation.accepts(value.cmp(bound)) {
+                            } else if proof.relation.accepts(value.cmp(bound.as_ref())) {
                                 continue;
                             } else {
                                 None
                             }
                         }
                         None => {
-                            if !applies() || proof.relation.accepts(value.cmp(bound)) {
+                            if !applies() || proof.relation.accepts(value.cmp(bound.as_ref())) {
                                 continue;
                             }
                             None
@@ -9710,6 +9796,13 @@ fn checked_old_output_relation(
 }
 
 #[cfg(feature = "internal-checker")]
+fn supports_unary_entry_proof(body: &FunctionCallSites, output: &ScalarType) -> bool {
+    matches!(body.boundary.parameters.as_slice(), [input] if &input.ty == output && is_integer_type(output))
+        && citation_safe_calling_body(body)
+        && body.call_occurrences.is_empty()
+}
+
+#[cfg(feature = "internal-checker")]
 fn supports_rectangular_calling_proof(body: &FunctionCallSites) -> bool {
     matches!(body.boundary.parameters.as_slice(), [left, right] if is_integer_type(&left.ty) && is_integer_type(&right.ty))
         && citation_safe_calling_body(body) && !body.structure.checker_integer_call_locals.is_empty()
@@ -9880,7 +9973,9 @@ fn typed_proof_postcondition<'a, const AUDIT_INDUCTION: bool, const DEFER_OUTPUT
             TypedProofGoal::Literal { operator, relation, bound }
         } else {
             #[cfg(feature = "internal-checker")]
-            let affine = if allow_named_entry_facts && measure.is_none() && supports_rectangular_calling_proof(body)
+            let affine = if allow_named_entry_facts && measure.is_none()
+                && (supports_rectangular_calling_proof(body)
+                    || steps.items.is_empty() && supports_unary_entry_proof(body, &result.ty))
             {
                 checked_affine_old_output(&ensures, output, &input_names, body, &result.ty)
             } else { None };
@@ -18410,6 +18505,82 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
             let result = run(&rejected);
             assert!(matches!(result, Err(ProjectCheck::Unsupported)), "{label}: {:?}", result.err());
         }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordered_unary_entry_relations_are_verified_and_reused_only_for_guarded_inputs() {
+        let app = source("src/main.w", "unary-entry-relations");
+        let text = r#"%%start
+            u8(u8) increment = fn(value) {
+                u8 advanced = value + 1;
+                advanced
+            };
+            proof advanced for increment(entry) -> (out)
+                where (entry >= 1 && entry <= 8) ensures (out == core.old(entry) + 1) {}
+        %%end"#;
+        let run = |text: &str, scope| {
+            let (_, catalog) = crate::parse_proof_source(app.clone(), text.to_owned(), &[]).ok().unwrap();
+            check_loaded_scalar_ordered_local_proof_contexts(Vec::new(), [(catalog, Vec::new())],
+                vec![app.clone()], inputs(), scope, Vec::new())
+        };
+        let scope = ScalarCheckerScope::CurrentPackage;
+        let proved = run(text, scope).unwrap();
+        assert!(proved.active && proved.symbolic_diagnostic.is_none());
+        let broken = text.replace("core.old(entry) + 1", "core.old(entry) + 2");
+        let failure = run(&broken, scope).unwrap().symbolic_diagnostic.unwrap();
+        assert_eq!(failure.returned, BigInt::from(2));
+        let one = BigInt::from(1);
+        assert!(failure.witness.intervals_at(0, 0).unwrap().eq([(&one, &one)]));
+        let goal = failure.goal.range;
+        assert_eq!(&broken[goal.start as usize..goal.end as usize], "out == core.old(entry) + 2");
+        let impossible = text.replace("entry >= 1 && entry <= 8", "entry >= 1 && entry < 1");
+        assert!(!run(&impossible, scope).unwrap().active);
+        let overflow = text.replace("entry <= 8", "entry <= 255");
+        assert!(matches!(run(&overflow, scope), Err(ScalarOrderedCheckerOutcome::Unsupported)));
+        let undefined_goal = text.replace("entry <= 8", "entry <= 254").replace("core.old(entry) + 1", "core.old(entry) + 2");
+        assert!(matches!(run(&undefined_goal, scope), Err(ScalarOrderedCheckerOutcome::Unsupported)));
+
+        let silent = r#"{ .stdout = ""; .stderr = ""; .code = 0; .files = []; }"#;
+        let consumer = format!(r#"
+            unit(u8) consumer = fn(value) {{
+                core.narrow(value >= 1, {silent});
+                core.narrow(value <= 8, {silent});
+                u8 returned = increment(value);
+                core.require(returned != 9, {OUTPUT});
+            }};
+        %%end"#);
+        let combined = text.replace("%%end", &consumer);
+        let report = run(&combined, scope).unwrap();
+        assert!(report.active && report.symbolic_diagnostic.is_none());
+        let failed = report.directives.last().unwrap();
+        assert_eq!(failed.operation, ScalarCheckerOperation::Require);
+        let eight = BigInt::from(8);
+        assert!(failed.witness.intervals_at(0, 0).unwrap().eq([(&eight, &eight)]));
+        for unsafe_import in [
+            combined.replace("core.narrow(value <= 8", "core.narrow(value <= 9"),
+            combined.replace("core.old(entry) + 1", "core.old(entry) + 2"),
+            combined.replace("where (entry >= 1 && entry <= 8)", "where (false)"),
+        ] {
+            assert!(matches!(run(&unsafe_import, scope), Err(ScalarOrderedCheckerOutcome::Unsupported)));
+        }
+
+        let actual = broken.replace("%%end", "u8 rejected = increment(4); u8 outside = increment(0); %%end");
+        let verified = run(&actual, ScalarCheckerScope::MainFlowOnly).unwrap();
+        let [failure] = verified.diagnostics.as_slice() else { panic!("one applicable refutation"); };
+        assert_eq!(failure.invocation.returned, BigInt::from(5));
+        assert_eq!(failure.invocation.arguments, [(ScalarType::U8, BigInt::from(4))]);
+
+        // Rectangular proofs may carry these symbolic goals, but there is no
+        // corresponding concrete rectangular evaluator in this gate.
+        let transform = Rc::new(super::super::checker_flow::IntegerAffineTransform::unit(false, 1.into()));
+        let point = BigInt::from(4);
+        let unary = MainFlowProofBound::EntryAffine { slot: 0, transform: &transform };
+        assert_eq!(unary.for_actual(&[&point], &[ScalarType::U8]).as_deref(), Some(&5.into()));
+        assert!(unary.for_actual(&[&point, &point], &[ScalarType::U8, ScalarType::U8]).is_none());
+        let second = MainFlowProofBound::EntryAffine { slot: 1, transform: &transform };
+        assert!(second.for_actual(&[&point, &point], &[ScalarType::U8, ScalarType::U8]).is_none());
+        assert!(unary.for_actual(&[&255.into()], &[ScalarType::U8]).is_none());
     }
 
     #[cfg(feature = "internal-checker")]

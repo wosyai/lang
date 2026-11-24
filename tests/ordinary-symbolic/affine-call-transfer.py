@@ -1870,6 +1870,38 @@ cases.extend([
         2,b"unsupported analysis"),
 ])
 
+unary_entry_relation = """%%start
+    u8(u8) increment = fn(value) {
+        u8 advanced = value + 1;
+        advanced
+    };
+    proof advance for increment(entry) -> (out)
+        where (entry >= 1 && entry <= 8) ensures (out == core.old(entry) + 1) {}
+%%end"""
+unary_summary_call = unary_entry_relation.replace("%%end", f"""
+    unit(u8) consumer = fn(value) {{
+        core.narrow(value >= 1, {report(0,"")});
+        core.narrow(value <= 8, {report(0,"")});
+        u8 observed = increment(value);
+        core.require(observed != 9, {report(48,"UNARY-VERIFIED-ENTRY")});
+    }};
+%%end""")
+unary_bad_premise = unary_entry_relation.replace("core.old(entry) + 1", "core.old(entry) + 2")
+cases.extend([
+    ("ordinary-verified-unary-entry-affine", unary_entry_relation, 0, b""),
+    ("ordinary-verified-unary-entry-refuted", unary_bad_premise, 1, b"proof obligation failed"),
+    ("ordinary-verified-unary-entry-caller-refuted", unary_summary_call, 48, b"UNARY-VERIFIED-ENTRY"),
+    ("ordinary-verified-unary-entry-caller-passed", unary_summary_call.replace("observed != 9", "observed <= 9"), 0, b""),
+    ("ordinary-verified-unary-entry-caller-outside", unary_summary_call.replace("core.narrow(value <= 8", "core.narrow(value <= 9"),
+        2, b"unsupported analysis"),
+    ("ordinary-verified-unary-entry-caller-no-unproved-summary", unary_summary_call.replace("core.old(entry) + 1", "core.old(entry) + 2"),
+        2, b"unsupported analysis"),
+    ("ordinary-verified-unary-entry-identity", unary_entry_relation.replace("value + 1", "value + 0")
+        .replace("core.old(entry) + 1", "core.old(entry)"), 0, b""),
+    ("exact-startup-verified-unary-entry-proved", unary_entry_relation.replace("%%end", "u8 saved = increment(4); %%end"), 0, b""),
+    ("exact-startup-verified-unary-entry-refuted", unary_bad_premise.replace("%%end", "u8 saved = increment(4); %%end"),
+        1, b"proof obligation failed"),
+])
 symbolic_named_pair_affine = """%%start
     i16(i16, i16) leaf = fn(tag, value) { if (tag < 0) {}; -1 - value };
     i16(i16, i16) producer = fn(tag, value) { i16 result = leaf(tag, value); result };
@@ -2123,6 +2155,8 @@ correlated_array_witness = """%%start
 %%end"""
 cases.append(("ordinary-fixed-array-symbolic-cells-correlated", correlated_array_witness, 1, b"proof obligation failed"))
 proof_diagnostic_notes = {
+    "ordinary-verified-unary-entry-refuted": b"symbolic call can return 2",
+    "exact-startup-verified-unary-entry-refuted": b"call returned 5",
     "ordinary-fixed-array-symbolic-cells-correlated": b"symbolic call can return cell [0] = 6",
     "ordinary-fixed-array-symbolic-cells-copy-refuted": b"symbolic call can return cell [0] = 8",
     "ordinary-fixed-array-symbolic-cells-branch-refuted": b"symbolic call can return cell [0] = 6",
@@ -2897,6 +2931,8 @@ with tempfile.TemporaryDirectory(prefix="affine-calls-") as path:
                         assert b"COPY-PRIOR-UNPUBLISHED" not in res.stderr and b"COPY-FORMAL-UNPUBLISHED" not in res.stderr,res
                 elif included and name in proof_diagnostic_notes:
                     assert expected_stderr in res.stderr and proof_diagnostic_notes[name] in res.stderr,res
+                    if name == "ordinary-verified-unary-entry-refuted":
+                        assert b"symbolic call entry: value = 1" in res.stderr,res
                     if name == "ordinary-fixed-array-symbolic-cells-correlated":
                         assert b"symbolic call entry: left = 2, right = 4" in res.stderr,res
                     if name == "ordinary-fixed-array-symbolic-cells-copy-refuted":

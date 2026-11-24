@@ -1077,7 +1077,7 @@ impl IntegerAffineTransform {
     }
 
     #[cfg(feature = "internal-checker")]
-    fn apply_point(&self, input: &BigInt) -> BigInt {
+    pub(super) fn apply_point(&self, input: &BigInt) -> BigInt {
         if self.reflected { &self.offset - input } else { input + &self.offset }
     }
 
@@ -3689,29 +3689,17 @@ pub(super) fn verify_named_pair_return<'a>(
                 returned
             }
             (PartitionedProofGoal::EntryAffineEquality { slot, transform }, actual) => {
-                let (actual_transform, constant) = match actual {
-                    IntegerPairPartitionOutput::Singleton(values) => (None, Some(values.singleton_value()?)),
-                    IntegerPairPartitionOutput::InputAlias(axis) if *axis == slot => (None, None),
-                    IntegerPairPartitionOutput::InputAffine(axis, actual) if *axis == slot => (Some(actual), None),
+                let actual = match actual {
+                    IntegerPairPartitionOutput::Singleton(values) => AxisProofValue::Literal(values.singleton_value()?),
+                    IntegerPairPartitionOutput::InputAlias(axis) if *axis == slot => AxisProofValue::Identity,
+                    IntegerPairPartitionOutput::InputAffine(axis, actual) if *axis == slot => AxisProofValue::Affine(actual),
                     _ => return None,
                 };
-                if let Some(constant) = constant {
-                    let (cut_relation, cut) = transform.pull_back_cut(unequal()?, constant);
-                    if constrain(cells.get_mut(slot)?, cut_relation, &cut, work)?.is_none() { continue; }
-                    constant.clone()
-                } else {
-                    let inverse = transform.inverse();
-                    let relative = if let Some(actual) = actual_transform { inverse.compose(actual) } else { inverse };
-                    if relative.identity_everywhere() { continue; }
-                    let source = cells.get_mut(slot)?;
-                    let example = if let Some(fixed) = relative.integral_reflection_fixed_point() {
-                        let Some(example) = constrain(source, unequal()?, &fixed, work)? else { continue; };
-                        example
-                    } else {
-                        source.extremes()?.0.clone()
-                    };
-                    actual_transform.map_or_else(|| example.clone(), |actual| actual.apply_point(&example))
-                }
+                let cell = cells.get_mut(slot)?;
+                let Some((violating, returned)) = rejected_entry_relationship(cell, actual, transform, work)?
+                    else { continue; };
+                *cell = violating;
+                returned
             }
         };
         return Some(PartitionedCallProof { applicable, covers_guard: false, failure: Some(SymbolicLiteralFailure {
@@ -3721,6 +3709,43 @@ pub(super) fn verify_named_pair_return<'a>(
         }) });
     }
     Some(PartitionedCallProof { applicable, covers_guard: false, failure: None })
+}
+
+#[cfg(feature = "internal-checker")]
+enum AxisProofValue<'a> {
+    Literal(&'a BigInt),
+    Identity,
+    Affine(&'a IntegerAffineTransform),
+}
+
+/// Solve equality on the same typed entry axis. The returned pair contains
+/// actual violating entries and the observed result at their first point.
+#[cfg(feature = "internal-checker")]
+fn rejected_entry_relationship(
+    input: &Rc<IntegerSet>, actual: AxisProofValue<'_>, expected: &IntegerAffineTransform, work: &mut usize,
+) -> Option<Option<(Rc<IntegerSet>, BigInt)>> {
+    charge_call_work(work, input.interval_count().checked_mul(3)?.checked_add(5)?)?;
+    let unequal = IntegerRelation::from_operator(&BinaryOperator::NotEqual)?;
+    let rejected = if let AxisProofValue::Literal(value) = actual {
+        let (relation, cut) = expected.pull_back_cut(unequal, value);
+        Rc::new(input.keep_relation(relation, &cut))
+    } else {
+        let inverse = expected.inverse();
+        let relative = if let AxisProofValue::Affine(actual) = actual { inverse.compose(actual) } else { inverse };
+        if relative.identity_everywhere() { return Some(None); }
+        if let Some(fixed) = relative.integral_reflection_fixed_point() {
+            Rc::new(input.keep_relation(unequal, &fixed))
+        } else {
+            Rc::clone(input)
+        }
+    };
+    let Some((first, _)) = rejected.extremes() else { return Some(None); };
+    let value = match actual {
+        AxisProofValue::Literal(value) => value.clone(),
+        AxisProofValue::Identity => first.clone(),
+        AxisProofValue::Affine(transform) => transform.apply_point(first),
+    };
+    Some(Some((rejected, value)))
 }
 
 #[cfg(feature = "internal-checker")]
@@ -3741,10 +3766,23 @@ pub(super) fn verify_partitioned_call_return<'a>(
     producer: &'a FunctionCallSites, returned: &ActualCallResult, domain: &IntegerSet,
     eligible_for_elision: bool, goal: PartitionedProofGoal<'_>, mut work: Option<&mut usize>,
 ) -> Option<PartitionedCallProof<'a>> {
-    if matches!(goal, PartitionedProofGoal::EntryEquality(slot) if slot != 0) { return None; }
+    if matches!(goal, PartitionedProofGoal::EntryEquality(slot)
+        | PartitionedProofGoal::EntryAffineEquality { slot, .. } if slot != 0)
+    {
+        return None;
+    }
     let ActualCallResult::PartitionedInteger(pieces) = returned else { return None; };
     let [binding] = producer.boundary.checker_parameter_bindings.as_deref()? else { return None; };
     let [parameter] = producer.boundary.parameters.as_slice() else { return None; };
+    if let PartitionedProofGoal::EntryAffineEquality { transform, .. } = goal {
+        if domain.is_empty() {
+            return Some(PartitionedCallProof { applicable: false, covers_guard: false, failure: None });
+        }
+        let [result] = producer.boundary.results.as_slice() else { return None; };
+        if result.ty != parameter.ty { return None; }
+        let (min, max) = super::typecheck::integer_bounds(&result.ty)?;
+        transform.fits(domain, &min, &max)?;
+    }
     let mut applicable = false;
     let mut can_elide = eligible_for_elision;
     let mut covered = Vec::new();
@@ -3766,7 +3804,16 @@ pub(super) fn verify_partitioned_call_return<'a>(
         };
         applicable = true;
         let failure = match (&goal, &piece.output) {
-            (PartitionedProofGoal::EntryAffineEquality { .. }, _) => return None,
+            (PartitionedProofGoal::EntryAffineEquality { transform, .. }, output) => {
+                let actual = match output {
+                    IntegerPartitionOutput::Singleton(values) => AxisProofValue::Literal(values.singleton_value()?),
+                    IntegerPartitionOutput::InputAlias => AxisProofValue::Identity,
+                    IntegerPartitionOutput::InputAffine(transform) => AxisProofValue::Affine(transform),
+                };
+                let meter = work.as_deref_mut().unwrap_or(&mut relational_work);
+                rejected_entry_relationship(&input, actual, transform, meter)?
+                    .map(|(entries, value)| (entries, Cow::Owned(value)))
+            }
             (PartitionedProofGoal::Literal(relation, bound), IntegerPartitionOutput::Singleton(output)) => {
                 let value = output.singleton_value()?;
                 (!relation.accepts(value.cmp(bound))).then(|| (Rc::clone(&input), Cow::Borrowed(value)))
@@ -3821,6 +3868,11 @@ pub(super) fn verify_partitioned_call_return<'a>(
             }
         };
         if let Some((violating_inputs, value)) = failure {
+            let violating_inputs = if matches!(goal, PartitionedProofGoal::EntryEquality(_) | PartitionedProofGoal::EntryAffineEquality { .. }) {
+                Rc::new(IntegerSet::singleton(violating_inputs.extremes()?.0))
+            } else {
+                violating_inputs
+            };
             return Some(PartitionedCallProof { applicable: true, covers_guard: false, failure: Some(SymbolicLiteralFailure {
                 output: piece.span, returned: value.into_owned(), state: IntegerInputs::from_cells(vec![vec![violating_inputs]]),
                 axes: vec![(binding, &parameter.ty)],
