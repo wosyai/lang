@@ -10262,3 +10262,74 @@ fn guarded_fallible_whole_copy_overwrites_one_original_backing() {
         }
     }
 }
+
+#[test]
+fn guarded_fallible_named_aliases_keep_one_backing_and_one_presence_guard() {
+    let source = SourceIdentity::new("project".into(), "package".into(), "src/main.w".into(), "r1".into());
+    let text = include_str!("../../tests/fixtures/guarded-fallible-named-alias.w");
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let parsed = parse_source(source.clone(), text.into(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let single = crate::derive_scalar_program_with_layout(&parsed.result, layout);
+        assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+        for item in &single.program.items {
+            let ScalarItem::Function(function) = item else { continue };
+            let proof = function.reference_cfg.guarded_scalar_allocation().expect("one exact guard");
+            assert_eq!(proof.alias_accesses().len(), if function.name == "shared" { 1 } else { 3 });
+        }
+        let project = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::from_program(single.program.clone(), Vec::new())],
+            vec![source.clone()],
+        ));
+        assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+        for (project_route, llvm) in [
+            (false, emit_scalar_llvm(&single).expect("single LLVM").to_text()),
+            (true, emit_scalar_project_llvm(&project).expect("project LLVM").to_text()),
+        ] {
+            for (name, condition, positive, negative, reads, writes) in [
+                ("shared", "absent", "if.else", "if.then", 1, 0),
+                ("exclusive", "present", "if.then", "if.else", 2, 1),
+            ] {
+                let body = self_tail_test_body(&llvm, "i64", &self_tail_test_symbol(&source, project_route, name));
+                assert_eq!(body.matches("call ptr @__wosy_core_alloc(i64 8, i64 8)").count(), 1, "{body}");
+                assert_eq!(body.matches("call void @__wosy_core_free(ptr %allocation)").count(), 1, "{body}");
+                assert_eq!(body.matches("icmp ne ptr %allocation, null").count(), 1, "{body}");
+                assert!(body.contains(&format!("br i1 %fallible.{condition}, label %if.then, label %if.else")), "{body}");
+                assert!(body.contains("br i1 %fallible.present, label %fallible.release, label %fallible.released"), "{body}");
+                assert_eq!(body.matches("ptrtoint ptr %allocation to ").count(), 1, "{body}");
+                assert!(!body.lines().any(|row|
+                    row.trim_start().starts_with("%deref_is_null")
+                        || row.starts_with("deref_null_panic")
+                        || row.starts_with("deref_null_continue")), "{body}");
+                let release_prefix = "wosy_fn__776f73795f746f6f6c636861696e5f7374646c6962__7372632f636865636b65645f6163636573732e77__";
+                let null_helper_suffix = "__636865636b5f6e6f6e5f6e756c6c5f61646472657373";
+                assert!(!body.lines().any(|row| row.split_once("call void @")
+                    .and_then(|(_, callee)| callee.split_once('('))
+                    .is_some_and(|(callee, _)| callee.starts_with(release_prefix)
+                        && callee.ends_with(null_helper_suffix))), "{body}");
+                let basic_block = |label: &str| {
+                    let suffix = body.split_once(&format!("\n{label}:")).unwrap().1;
+                    suffix.split_once("\n\n").unwrap().0
+                };
+                let good = basic_block(positive);
+                assert_eq!(good.lines().filter(|line| line.contains("load i64, ptr %deref")).count(), reads, "{body}");
+                assert_eq!(good.lines().filter(|line| line.contains("store i64 ") && line.contains(", ptr %deref")).count(), writes, "{body}");
+                assert!(!basic_block(negative).contains("ptr %deref"), "{body}");
+            }
+            if let Some(directory) = std::env::var_os("WOSY_FALLIBLE_ALIAS_IR_DIR") {
+                let target = if layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
+                let route = if project_route { "project" } else { "standalone" };
+                let directory = std::path::PathBuf::from(directory);
+                std::fs::write(directory.join(format!("{target}-{route}.ll")), &llvm).unwrap();
+                let mut controlled = llvm.replace("define i32 @main(", "define i32 @wosy_authored_main(");
+                for name in ["shared", "exclusive"] {
+                    let callee = self_tail_test_symbol(&source, project_route, name);
+                    controlled.push_str(&format!(
+                        "\ndefine i64 @wosy_test_{name}(i64 %input) {{\nentry:\n  %result = call i64 @{callee}(i64 %input)\n  ret i64 %result\n}}\n"
+                    ));
+                }
+                std::fs::write(directory.join(format!("{target}-{route}-control.ll")), controlled).unwrap();
+            }
+        }
+    }
+}

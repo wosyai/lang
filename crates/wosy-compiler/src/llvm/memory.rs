@@ -376,7 +376,9 @@ pub(super) fn place_pointer<'ctx, 'module>(
             .into_int_value();
             pointer_target_type(state, pointer, project)
                 .ok_or_else(|| "unknown LLVM dereference target type".to_owned())?;
-            if dereference_requires_null_guard(state, pointer, project) {
+            if dereference_requires_null_guard(state, pointer, project)
+                && !ownership::guarded_alias_has_non_null_proof(state, pointer)
+            {
                 emit_checked_dereference_guard(context, state, pointer_value)?;
             }
             state

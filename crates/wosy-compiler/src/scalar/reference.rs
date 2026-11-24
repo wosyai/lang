@@ -345,6 +345,7 @@ pub(crate) struct GuardedScalarAllocation {
     condition: usize,
     branch: CfgPointId,
     present_on_then: bool,
+    alias_accesses: Box<[usize]>,
 }
 
 impl GuardedScalarAllocation {
@@ -353,6 +354,7 @@ impl GuardedScalarAllocation {
     pub(crate) fn condition(&self) -> usize { self.condition }
     pub(crate) fn branch(&self) -> CfgPointId { self.branch }
     pub(crate) fn present_on_then(&self) -> bool { self.present_on_then }
+    pub(crate) fn alias_accesses(&self) -> &[usize] { &self.alias_accesses }
 }
 
 #[derive(Clone, Copy)]
@@ -360,6 +362,8 @@ enum ExpressionReadMode {
     Ordinary,
     ProjectedOrigins,
     GuardedStructInitializer,
+    FallibleAliasInitializer,
+    DereferenceOperand,
 }
 
 const MAX_JOINED_REBORROW_PARENTS: usize = 4;
@@ -1104,6 +1108,36 @@ impl<'a> ReferenceFlowBuilder<'a> {
         Ok(BTreeSet::from([self.intern(fact)]))
     }
 
+    fn prepared_fallible_alias(
+        &self,
+        binding: &crate::ScalarBinding,
+        expression: &ScalarExpression,
+        ordinal: OccurrenceOrdinal,
+        scope: ReferenceScopeId,
+        expected: &ScalarType,
+    ) -> Option<ReferenceBindingId> {
+        let sites = self.proof_points.fallible_allocation_bindings.as_ref()?;
+        if binding.receivers.len() != 1 || binding.fallible_assignment.is_some()
+            || binding.output_origin != ScalarBindingOutputOrigin::SingleExpression
+        {
+            return None;
+        }
+        let ScalarExpression::CheckedAddress { mutability, place, .. } = expression else { return None };
+        let ScalarType::CheckedReference { mutability: expected_mode, inner } = expected else { return None };
+        if mutability != expected_mode || !matches!(place, ScalarPlace::Name { .. })
+            || self.call_sites.structure.checked_types.expressions.get(&ordinal) != Some(expected)
+        {
+            return None;
+        }
+        let place = self.place_ordinal(OccurrenceParent::Expression(ordinal), OccurrenceEdge::ExpressionPlace);
+        let NamedPlaceRootFacts::Prepared(roots) = &self.call_sites.named_place_roots else { return None };
+        let NamedPlaceRootIdentity::Lexical(owner) = roots.get(&place)? else { return None };
+        let site = sites.get(owner)?;
+        (site.scope == scope && site.ty == **inner && (is_integer_type(inner) || site.whole_copy)
+            && self.call_sites.structure.checked_types.places.get(&place) == Some(inner.as_ref()))
+            .then(|| owner.clone())
+    }
+
     fn reject_fallible_address(
         &self,
         place: &ScalarPlace,
@@ -1114,11 +1148,19 @@ impl<'a> ReferenceFlowBuilder<'a> {
             return Ok(());
         };
         let root = self.place_root(place, ordinal);
-        let ScalarPlace::Name { span, .. } = root.place else {
-            return Ok(());
-        };
+        if let ScalarPlace::Dereference { pointer, .. } = root.place {
+            let operand = self.expression_ordinal(OccurrenceParent::Place(root.ordinal), OccurrenceEdge::DereferencePointer);
+            if let ScalarExpression::Name { span, .. } = pointer.as_ref() {
+                if let Some(PlainNameIdentity::Lexical(alias)) = self.prepared_name_identity(operand, *span)? {
+                    if self.proof_points.fallible_aliases.contains_key(alias) {
+                        return Err(self.missing_origin(source, alias.clone(), ReferenceAnalysisErrorReason::UnsupportedFallibleAllocationAccess));
+                    }
+                }
+            }
+        }
+        let ScalarPlace::Name { span, .. } = root.place else { return Ok(()) };
         if let Some(PreparedPlaceRoot::Lexical(binding)) = self.prepared_place_root(root.ordinal, *span)? {
-            if bindings.contains_key(binding) {
+            if bindings.contains_key(binding) || self.proof_points.fallible_aliases.contains_key(binding) {
                 return Err(self.missing_origin(
                     source, binding.clone(), ReferenceAnalysisErrorReason::UnsupportedFallibleAllocationAccess,
                 ));
@@ -1152,15 +1194,26 @@ impl<'a> ReferenceFlowBuilder<'a> {
             (left.as_ref(), OccurrenceEdge::BinaryLeft, right.as_ref(), OccurrenceEdge::BinaryRight),
             (right.as_ref(), OccurrenceEdge::BinaryRight, left.as_ref(), OccurrenceEdge::BinaryLeft),
         ] {
-            let ScalarExpression::CheckedAddress { mutability: ScalarReferenceMutability::Shared, place, .. } = address else {
-                continue;
-            };
-            let ScalarPlace::Name { span: place_span, .. } = place else { continue };
             let ScalarExpression::Name { span: null_span, .. } = null else { continue };
             let null = self.expression_ordinal(parent, null_edge);
             if !matches!(self.prepared_name_identity(null, *null_span)?, Some(PlainNameIdentity::Null)) {
                 continue;
             }
+            if let ScalarExpression::Name { span, .. } = address {
+                let alias = self.expression_ordinal(parent, address_edge);
+                if let Some(PlainNameIdentity::Lexical(alias)) = self.prepared_name_identity(alias, *span)? {
+                    if let Some(owner) = self.proof_points.fallible_aliases.get(alias) {
+                        if fallible_bindings.get(owner).is_some_and(|site| site.scope == scope) {
+                            return Ok(Some((owner.clone(), present_on_then)));
+                        }
+                    }
+                }
+                continue;
+            }
+            let ScalarExpression::CheckedAddress { mutability: ScalarReferenceMutability::Shared, place, .. } = address else {
+                continue;
+            };
+            let ScalarPlace::Name { span: place_span, .. } = place else { continue };
             let address = self.expression_ordinal(parent, address_edge);
             let place = self.place_ordinal(OccurrenceParent::Expression(address), OccurrenceEdge::ExpressionPlace);
             if let Some(PreparedPlaceRoot::Lexical(binding)) = self.prepared_place_root(place, *place_span)? {
@@ -2674,6 +2727,12 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     None => self.binding(name, span)?,
                     _ => unreachable!("null and module name reads handled above"),
                 };
+                if let Some(owner) = self.proof_points.fallible_aliases.get(&binding) {
+                    if !matches!(read_mode, ExpressionReadMode::DereferenceOperand) {
+                        return Err(self.missing_origin(span, binding, ReferenceAnalysisErrorReason::UnsupportedFallibleAllocationAccess));
+                    }
+                    self.proof_points.fallible_alias_accesses.push((ordinal, owner.clone()));
+                }
                 if self.checked.contains(&binding) {
                     if self.origins.contains_key(&binding) {
                         let origins = self.required(&binding, span)?;
@@ -2692,7 +2751,9 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 mutability, place, ..
             } => {
                 let place_ordinal = self.place_ordinal(parent, OccurrenceEdge::ExpressionPlace);
-                self.reject_fallible_address(place, place_ordinal, span)?;
+                if !matches!(read_mode, ExpressionReadMode::FallibleAliasInitializer) {
+                    self.reject_fallible_address(place, place_ordinal, span)?;
+                }
                 let root = self.place_root(place, place_ordinal);
                 let proof_place = self.proof_place(place, place_ordinal);
                 if let ScalarPlace::Index { base, index, .. } = proof_place.as_ref() {
@@ -3099,7 +3160,8 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 }
             }
             ScalarPlace::Dereference { pointer, .. } => {
-                self.expression_child(pointer, scope, parent, OccurrenceEdge::DereferencePointer)?;
+                let operand = self.expression_ordinal(parent, OccurrenceEdge::DereferencePointer);
+                self.expression_with_read_mode(pointer, scope, operand, ExpressionReadMode::DereferenceOperand)?;
                 let ScalarPlace::Dereference { span, .. } = place else {
                     unreachable!()
                 };
@@ -4459,8 +4521,11 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         }
                         _ => (false, false),
                     };
+                    let alias_owner = self.prepared_fallible_alias(binding, primary, primary_ordinal, scope, &receiver.ty);
                     let before = self.cursor;
-                    let value = if raw_null {
+                    let value = if alias_owner.is_some() {
+                        self.expression_with_read_mode(primary, scope, primary_ordinal, ExpressionReadMode::FallibleAliasInitializer)?
+                    } else if raw_null {
                         self.point(
                             CfgPointKind::Evaluate(primary.clone()),
                             expression_span(primary),
@@ -4529,6 +4594,9 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         kind: ReferenceBindingKind::Declared,
                     };
                     self.binding_types.record(id.clone(), receiver.ty.clone(), self.deferred_local_reborrow.then_some(scope));
+                    if let Some(owner) = alias_owner {
+                        self.proof_points.fallible_aliases.insert(id.clone(), owner);
+                    }
                     if binding.is_allocation {
                         self.cfg.allocations.insert(id.clone());
                     }
@@ -7311,6 +7379,7 @@ struct ReferenceTransferCfg<'a> {
     checked_join_values: &'a [(CfgPointId, [Option<CfgPointId>; 2])],
     checked_block_values: &'a [(CfgPointId, CfgPointId)],
     fallible_allocation_bindings: Option<&'a HashMap<ReferenceBindingId, super::control::GuardedAllocationBinding>>,
+    fallible_aliases: Option<&'a HashMap<ReferenceBindingId, ReferenceBindingId>>,
     guarded_allocation_edges: &'a [(CfgPointId, super::control::GuardedAllocationEdge)],
     checked_binding_initializers: &'a [(CfgPointId, CfgPointId)],
     resolved_checked_call_outputs: &'a [CfgPointId],
@@ -7345,6 +7414,7 @@ impl<'a> ReferenceTransferCfg<'a> {
             checked_join_values: proof.map_or(&[], |proof| &proof.checked_join_values),
             checked_block_values: proof.map_or(&[], |proof| &proof.checked_block_values),
             fallible_allocation_bindings: proof.and_then(|proof| proof.fallible_allocation_bindings.as_ref()),
+            fallible_aliases: proof.map(|proof| &proof.fallible_aliases).filter(|aliases| !aliases.is_empty()),
             guarded_allocation_edges: proof.map_or(&[], |proof| &proof.guarded_allocation_edges),
             checked_binding_initializers: proof.map_or(&[], |proof| &proof.checked_binding_initializers),
             resolved_checked_call_outputs: proof.map_or(&[], |proof| &proof.resolved_checked_call_outputs),
@@ -10008,7 +10078,11 @@ fn transfer_reference_facts(
                 }
                 CfgPointKind::Read { binding } => {
                     if let Some(bindings) = cfg.fallible_allocation_bindings {
-                        require_available_fallible_read(bindings, &state, binding, point, true, &mut errors);
+                        if let Some(owner) = cfg.fallible_aliases.and_then(|aliases| aliases.get(binding)) {
+                            require_available_fallible_read(bindings, &state, owner, point, false, &mut errors);
+                        } else {
+                            require_available_fallible_read(bindings, &state, binding, point, true, &mut errors);
+                        }
                     }
                     let origins = unavailable_checked_handles(&state, binding, &[], CheckedHandleStorage::Lexical);
                     if !origins.is_empty() {
@@ -10109,6 +10183,16 @@ fn transfer_reference_facts(
                             None
                         }
                     }
+                }
+                CfgPointKind::Assign { target, .. }
+                    if cfg.fallible_aliases.is_some_and(|aliases| aliases.contains_key(&target.binding)) =>
+                {
+                    errors.push(ReferenceAnalysisError::MissingOrigin {
+                        source_span: point.source_span.clone(),
+                        binding_id: target.binding.clone(),
+                        reason: ReferenceAnalysisErrorReason::UnsupportedFallibleAllocationAccess,
+                    });
+                    None
                 }
                 CfgPointKind::Assign { target, .. }
                     if let Some(site) = cfg.fallible_allocation_bindings.and_then(|bindings| bindings.get(&target.binding)) =>
@@ -15124,6 +15208,7 @@ fn derive_function_specialized_copy_policies<'a>(
                     checked_join_values: &template_result.proof_points.checked_join_values,
                     checked_block_values: &template_result.proof_points.checked_block_values,
                     fallible_allocation_bindings: template_result.proof_points.fallible_allocation_bindings.as_ref(),
+                    fallible_aliases: Some(&template_result.proof_points.fallible_aliases).filter(|aliases| !aliases.is_empty()),
                     guarded_allocation_edges: &template_result.proof_points.guarded_allocation_edges,
                     checked_binding_initializers: &template_result.proof_points.checked_binding_initializers,
                     resolved_checked_call_outputs: &template_result.proof_points.resolved_checked_call_outputs,
@@ -15371,6 +15456,14 @@ fn seal_guarded_scalar_allocations(
         Some(GuardedScalarAllocation {
             binding: edge.binding.clone(), ty: site.ty.clone(), condition: condition.0,
             branch: *branch, present_on_then: *then == edge.present,
+            alias_accesses: {
+                let mut accesses = points.fallible_alias_accesses.iter()
+                    .filter_map(|(ordinal, owner)| (owner == &edge.binding).then_some(ordinal.0))
+                    .collect::<Vec<_>>();
+                accesses.sort_unstable();
+                accesses.dedup();
+                accesses.into_boxed_slice()
+            },
         })
     }).collect()
 }

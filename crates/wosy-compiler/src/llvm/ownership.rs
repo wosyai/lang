@@ -1157,6 +1157,7 @@ pub(super) struct GuardedScalarSite {
     ty: ScalarType,
     condition: usize,
     present_on_then: bool,
+    alias_accesses: Box<[usize]>,
 }
 
 impl GuardedScalarSite {
@@ -1176,6 +1177,7 @@ impl GuardedScalarSite {
                 ty: proof.ty().clone(),
                 condition: proof.condition(),
                 present_on_then: proof.present_on_then(),
+                alias_accesses: proof.alias_accesses().into(),
             })
         }).collect()
     }
@@ -1234,6 +1236,17 @@ pub(super) fn bind_guarded_scalar<'ctx>(
     state.storage.insert(receiver.name.clone(), (backing, receiver.ty.clone()));
     state.guarded_scalar_owner = Some(GuardedScalarOwner { site: index, backing, present });
     Ok(())
+}
+
+pub(super) fn guarded_alias_has_non_null_proof(
+    state: &EmitState<'_, '_>,
+    pointer: &ScalarExpression,
+) -> bool {
+    let Some(sites) = &state.guarded_scalar else { return false };
+    let Some(operand) = state.body_call_nodes.and_then(|nodes| nodes.expression_ordinal(pointer))
+        else { return false };
+    let Some(owner) = &state.guarded_scalar_owner else { return false };
+    sites.get(owner.site).is_some_and(|site| site.alias_accesses.binary_search(&operand).is_ok())
 }
 
 pub(super) fn guarded_scalar_condition<'ctx>(
