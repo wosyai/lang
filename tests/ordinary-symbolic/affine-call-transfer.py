@@ -1487,19 +1487,24 @@ startup_conditional_scalar = f"""%%start
         core.require(value != 37, {report(45,"VALUE-PRODUCER")});
         value
     }};
-    bool ready = true;
+    i8 warm = step(0);
+    bool ready = warm == 0;
     bool chosen = if (ready) {{ ready }} else {{ false }};
-    i8 status = if (chosen) {{ if (ready) {{ step(37) }} else {{ 8 }} }} else {{
-        core.require(false, {report(19,"OPAQUE-ARM")});
-        19
+    i8 status = if (chosen) {{
+        core.require(false, {report(43,"VALUE-ARM")});
+        if (ready) {{ step(37) }} else {{ 8 }}
+    }} else {{
+        i8 held = 19;
+        held
     }};
     core.require(false, {{ .stdout = ""; .stderr = "VALUE-STORED"; .code = status;
         .files = [{{ .path = "status.json"; .state = status; }}]; }});
     %%end"""
 cases.extend([
-    ("exact-startup-conditional-scalar-binding",startup_conditional_scalar,45,b"VALUE-PRODUCERVALUE-STORED"),
-    ("exact-startup-conditional-scalar-binding-empty",startup_conditional_scalar.replace("core.require(value","core.narrow(value"),45,b"VALUE-PRODUCER"),
-    ("exact-startup-conditional-scalar-binding-opaque",startup_conditional_scalar.replace("ready = true","ready = false"),2,b"unsupported analysis"),
+    ("exact-startup-conditional-scalar-binding",startup_conditional_scalar,43,b"VALUE-ARMVALUE-PRODUCERVALUE-STORED"),
+    ("exact-startup-conditional-scalar-binding-empty",startup_conditional_scalar.replace("core.require(value","core.narrow(value"),43,b"VALUE-ARMVALUE-PRODUCER"),
+    ("exact-startup-conditional-scalar-binding-arm-empty",startup_conditional_scalar.replace("core.require(false, " + report(43,"VALUE-ARM"),"core.narrow(false, " + report(43,"VALUE-ARM")),43,b"VALUE-ARM"),
+    ("exact-startup-conditional-scalar-binding-opaque",startup_conditional_scalar.replace("warm == 0","warm != 0"),2,b"unsupported analysis"),
 ])
 mixed_startup_unit_storage = f"""%%start
     unit(bool, i8) release = fn(enabled, code) {{

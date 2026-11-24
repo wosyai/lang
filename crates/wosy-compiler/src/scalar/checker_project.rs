@@ -11,7 +11,7 @@ use super::{
         exact_integer_return_at_entry, ActualCallResult, CheckerPredicate, ExactIntegerArgument, IntegerRequirementContinuation, IntegerRequirementEntry, NestedIntegerArgument, ProjectedCompanion, ProjectedIntegerArgument,
         proves_requirement_with_imported_root_local, ImportedEntryGuard, ImportedIntegerValues, ImportedLocal, IntegerShowProof, IntegerCheckFailure, IntegerComparison, IntegerInputs, IntegerReturn, ProofCoverage,
     },
-    control::{BindingInitialization, BlockItemKind, CheckedCallSignature, ConditionalRegion, InitializationName, InitializationStorage, ModuleInitializationCallTarget, ModuleInitializationDetail, ModuleInitializationStepKind, ModuleInitializationTopology, NamespaceTarget},
+    control::{BindingInitialization, BlockItem, BlockItemKind, CheckedCallSignature, ConditionalRegion, InitializationName, InitializationStorage, ModuleInitializationCallTarget, ModuleInitializationDetail, ModuleInitializationStepKind, ModuleInitializationTopology, NamespaceTarget},
     derive_block, derive_expression, project_from_declarations,
     reference::{CheckerIntegerCallOrigin, CheckerTargetQuery, DirectDestinationIdentity, FunctionCallSites, OccurrenceOrdinal, OccurrenceStructure, ProjectCallSiteResults, ResolvedCheckerTarget},
     static_calls::prepare_project_occurrences,
@@ -1231,16 +1231,9 @@ fn check_initializer_expression<const COLLECT: bool, const PRIVATE_NESTED_SCALAR
                 return Err(ProjectCheck::Unsupported);
             }
             let block = structure.blocks.get(selected.0).ok_or(ProjectCheck::MissingRootOccurrences)?;
-            for item in &block.items {
-                let BlockItemKind::Evaluation { expression } = item.kind else {
-                    return Err(ProjectCheck::Unsupported);
-                };
-                if check_initializer_expression::<COLLECT, PRIVATE_NESTED_SCALAR>(topology, actual, source, storage, expression, depth + 1, failures, visits)?
-                    == StartupLane::Empty
-                {
-                    return Ok(StartupLane::Empty);
-                }
-            }
+            return check_initializer_statements::<COLLECT, PRIVATE_NESTED_SCALAR>(
+                topology, actual, source, storage, &block.items, depth + 1, failures, visits,
+            );
         }
         return Ok(StartupLane::Feasible);
     }
@@ -1266,6 +1259,27 @@ fn check_initializer_expression<const COLLECT: bool, const PRIVATE_NESTED_SCALAR
         ActualCallResult::EmptyUnit if COLLECT => Ok(StartupLane::Empty),
         _ => Err(ProjectCheck::Unsupported),
     }
+}
+
+fn check_initializer_statements<const COLLECT: bool, const PRIVATE_NESTED_SCALAR: bool>(
+    topology: &ModuleInitializationTopology,
+    actual: &mut CheckedCalls<'_, impl ActualIntegerObserver>,
+    source: &SourceIdentity,
+    storage: &HashMap<ByteSpan, InitializerValue<'_>>,
+    statements: &[BlockItem],
+    depth: usize,
+    failures: &mut Option<&mut OrderedFailures>,
+    visits: &[InitializationVisit],
+) -> Result<StartupLane, ProjectCheck> {
+    for item in statements {
+        let BlockItemKind::Evaluation { expression } = item.kind else { return Err(ProjectCheck::Unsupported); };
+        if check_initializer_expression::<COLLECT, PRIVATE_NESTED_SCALAR>(
+            topology, actual, source, storage, expression, depth, failures, visits,
+        )? == StartupLane::Empty {
+            return Ok(StartupLane::Empty);
+        }
+    }
+    Ok(StartupLane::Feasible)
 }
 
 // None is a reached call that pruned the startup lane, not an opaque condition.
@@ -1311,8 +1325,8 @@ fn selected_startup_scalar<'a>(
     failures: &mut Option<&mut OrderedFailures>,
     visits: &[InitializationVisit],
 ) -> Result<Option<InitializerValue<'a>>, ProjectCheck> {
-    // Follow only the reached scalar arm. Do not walk an unselected block,
-    // and never interpret statements or output groups as scalar tails.
+    // Follow only the reached scalar arm. Its statement prefix uses the
+    // startup Unit evaluator; only its checked final output produces a value.
     let mut remaining = MAX_INITIALIZER_BRANCH_DEPTH;
     while let ScalarExpression::If { then_branch, else_branch, .. } = expression {
         if remaining == 0 { return Err(ProjectCheck::Unsupported); }
@@ -1328,9 +1342,9 @@ fn selected_startup_scalar<'a>(
             storage, failures, visits, true)? else { return Ok(None); };
         let (ast, selected) = if taken { (then_branch, then_block) } else { (else_branch, else_block) };
         let block = topology.structure.blocks.get(selected.0).ok_or(ProjectCheck::MissingRootOccurrences)?;
-        let [item] = block.items.as_slice() else { return Err(ProjectCheck::Unsupported); };
+        let Some((item, statements)) = block.items.split_last() else { return Err(ProjectCheck::Unsupported); };
         let BlockItemKind::FinalOutput(slot) = &item.kind else { return Err(ProjectCheck::Unsupported); };
-        if slot.output != 0 || ast.unsafe_context || ast.items.len() != 1 || ast.final_output_values.len() != 1 {
+        if slot.output != 0 || ast.unsafe_context || ast.items.len() != block.items.len() || ast.final_output_values.len() != 1 {
             return Err(ProjectCheck::Unsupported);
         }
         let (tail, _) = ast.final_expressions().next().ok_or(ProjectCheck::Unsupported)?;
@@ -1338,6 +1352,11 @@ fn selected_startup_scalar<'a>(
         occurrence = slot.expression;
         if topology.structure.checked_types.expressions.get(&occurrence) != Some(expected) {
             return Err(ProjectCheck::Unsupported);
+        }
+        if check_initializer_statements::<true, false>(
+            topology, actual, source, storage, statements, MAX_INITIALIZER_BRANCH_DEPTH - remaining, failures, visits,
+        )? == StartupLane::Empty {
+            return Ok(None);
         }
     }
 
@@ -10195,11 +10214,15 @@ mod tests {
                 core.require(value != 37, { .stdout = ""; .stderr = "producer"; .code = 45; .files = []; });
                 value
             };
-            bool ready = true;
+            i8 warm = step(0);
+            bool ready = warm == 0;
             bool chosen = if (ready) { ready } else { false };
-            i8 status = if (chosen) { if (ready) { step(37) } else { 8 } } else {
-                core.require(false, { .stdout = ""; .stderr = "opaque arm"; .code = 19; .files = []; });
-                19
+            i8 status = if (chosen) {
+                core.require(false, { .stdout = ""; .stderr = "arm"; .code = 43; .files = []; });
+                if (ready) { step(37) } else { 8 }
+            } else {
+                i8 held = 19;
+                held
             };
             core.require(false, { .stdout = ""; .stderr = "after"; .code = status;
                 .files = [{ .path = "status.json"; .state = status; }]; });
@@ -10210,14 +10233,20 @@ mod tests {
                 run_closed_without_named_proofs(&prepared, scope, 1)
             };
             let receipt = run(program).unwrap();
-            let [first, last] = receipt.directives.as_slice() else { panic!("producer then selected result"); };
-            assert_eq!(first.code(), &BigInt::from(45));
+            let [arm, producer, last] = receipt.directives.as_slice() else { panic!("arm, producer, then selected result"); };
+            assert_eq!(arm.code(), &BigInt::from(43));
+            assert_eq!(producer.code(), &BigInt::from(45));
             assert_eq!(last.code(), &BigInt::from(37));
             assert_eq!(last.files()[0].text.as_ref(), b"{\"type\":{\"kind\":\"i8\"},\"value\":37}\n");
             let empty = run(&program.replace("core.require(value", "core.narrow(value")).unwrap();
-            let [failure] = empty.directives.as_slice() else { panic!("producer emptied selected output"); };
+            let [arm, failure] = empty.directives.as_slice() else { panic!("producer emptied selected output"); };
+            assert_eq!(arm.code(), &BigInt::from(43));
             assert_eq!(failure.code(), &BigInt::from(45));
-            assert!(matches!(run(&program.replace("ready = true", "ready = false")), Err(ProjectCheck::Unsupported)));
+            let early = run(&program.replace(r#"core.require(false, { .stdout = ""; .stderr = "arm""#,
+                r#"core.narrow(false, { .stdout = ""; .stderr = "arm""#)).unwrap();
+            let [failure] = early.directives.as_slice() else { panic!("arm emptied before its output"); };
+            assert_eq!(failure.code(), &BigInt::from(43));
+            assert!(matches!(run(&program.replace("warm == 0", "warm != 0")), Err(ProjectCheck::Unsupported)));
         }
     }
 
