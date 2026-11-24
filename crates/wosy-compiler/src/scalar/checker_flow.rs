@@ -105,6 +105,13 @@ pub(super) enum ImportedVerifiedReturn<'a> {
     EntryAlias(usize),
     EntryAffine { slot: usize, transform: &'a Rc<IntegerAffineTransform> },
     UnaryPartitions(&'a [IntegerReturnPartition]),
+    PairPartitions(&'a ProjectedIntegerPair),
+}
+
+#[derive(Clone, Copy)]
+enum ImportedScalarArgument<'a> {
+    Literal(&'a BigInt),
+    Axis(usize),
 }
 
 pub(super) enum ImportedIntegerValues<'a> {
@@ -6129,11 +6136,7 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                     let [receiver] = binding.receivers() else {
                         return None;
                     };
-                    #[derive(Clone, Copy)]
-                    enum Argument<'a> {
-                        Literal(&'a BigInt),
-                        Axis(usize),
-                    }
+                    use ImportedScalarArgument as Argument;
                     let mut arguments = [None; 2];
                     for (slot, (ordinal, argument)) in origin.arguments.as_slice().iter().enumerate() {
                         arguments[slot] = Some(match argument {
@@ -6191,7 +6194,7 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                                 return None;
                             }
                             let slot = match &result {
-                                ImportedVerifiedReturn::Constant { .. } => None,
+                                ImportedVerifiedReturn::Constant { .. } | ImportedVerifiedReturn::PairPartitions(_) => None,
                                 ImportedVerifiedReturn::EntryAlias(slot) | ImportedVerifiedReturn::EntryAffine { slot, .. } => Some(*slot),
                                 ImportedVerifiedReturn::UnaryPartitions(_) => Some(0),
                             };
@@ -6247,6 +6250,13 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                                         Some(roots.ordinary_local_work.get_or_insert(0)))?;
                                     let ScalarOutputRows::Bound(rows) = joined else { return None; };
                                     path = rows;
+                                }
+                                (ImportedVerifiedReturn::PairPartitions(pair), None) => {
+                                    let [Some(first), Some(second)] = arguments else { return None; };
+                                    let [(left, _), (right, _)] = origin.arguments.as_slice() else { return None; };
+                                    let types = [structure.checked_types.expressions.get(left)?, structure.checked_types.expressions.get(right)?];
+                                    path = transfer_imported_pair_returns(&path.0, [first, second], types, &receiver.ty, pair,
+                                        &mut roots.affine_work, roots.ordinary_local_work.get_or_insert(0))?;
                                 }
                                 _ => return None,
                             }
@@ -6714,6 +6724,138 @@ impl ScalarOutputRows {
             Self::Guard { .. } => None,
         }
     }
+}
+
+// Attach a paired return to the invocation's own caller row. A fresh call
+// already supplies row-relative cells; a verified import intersects its
+// declaration-relative cells with the call arguments before attaching them.
+fn attach_pair_return(
+    row: &IntegerRow, axes: [Option<usize>; 2], types: [&ScalarType; 2], ty: &ScalarType,
+    cells: [Rc<IntegerSet>; 2], output: &IntegerPairPartitionOutput, joined: &mut ScalarOutputRows,
+    work: &mut usize,
+) -> Option<bool> {
+    let intervals = [cells[0].interval_count(), cells[1].interval_count()];
+    let base = row.len().checked_add(1)?
+        .checked_add(3usize.checked_mul(row.equal_axes().len())?)?
+        .checked_add(intervals[0])?.checked_add(intervals[1])?;
+    charge_call_work(work, base)?;
+    match axes {
+        [Some(first), Some(second)] => row.charge_affine_pair([first, second], intervals, work)?,
+        [Some(axis), None] => row.charge_affine_replacement(axis, intervals[0], work)?,
+        [None, Some(axis)] => row.charge_affine_replacement(axis, intervals[1], work)?,
+        [None, None] => (),
+    }
+    charge_call_work(work, 0)?;
+    let mut affine = None;
+    let mut fixed = None;
+    match output {
+        IntegerPairPartitionOutput::Singleton(output) => fixed = Some(Rc::clone(output)),
+        IntegerPairPartitionOutput::InputAlias(slot) | IntegerPairPartitionOutput::InputAffine(slot, _) => {
+            if types.get(*slot)? != &ty { return None; }
+            charge_call_work(work, 1)?;
+            let transform = match output {
+                IntegerPairPartitionOutput::InputAffine(_, transform) => Some(transform),
+                _ => None,
+            };
+            let cell = cells.get(*slot)?;
+            if let Some(axis) = axes[*slot] {
+                if let Some(transform) = transform {
+                    let (min, max) = super::typecheck::integer_bounds(ty)?;
+                    transform.fits(cell, &min, &max)?;
+                    affine = Some(row.prepare_affine(axis, cell, transform, work)?);
+                }
+            } else {
+                // Only the verified import can supply a literal argument.
+                #[cfg(not(feature = "internal-checker"))]
+                return None;
+                #[cfg(feature = "internal-checker")]
+                {
+                    let input = cell.singleton_value()?;
+                    fixed = Some(if let Some(transform) = transform {
+                        let value = transform.apply_point(input);
+                        if !super::typecheck::integer_literal_fits_type(&value, ty) { return None; }
+                        Rc::new(IntegerSet::singleton(&value))
+                    } else {
+                        Rc::clone(cell)
+                    });
+                }
+            }
+        }
+    }
+    let mut row = row.clone();
+    let [left, right] = cells;
+    match axes {
+        [Some(first), Some(second)] => row.replace_pair([first, second], [left, right])?,
+        [Some(axis), None] => row.replace_domain(axis, left),
+        [None, Some(axis)] => row.replace_domain(axis, right),
+        [None, None] => (),
+    }
+    if let Some(output) = fixed {
+        joined.push_singleton(row, output)?;
+    } else if let Some(plan) = affine {
+        joined.push_affine(row, plan)?;
+        return Some(true);
+    } else if let IntegerPairPartitionOutput::InputAlias(slot) = output {
+        joined.push_alias(row, axes[*slot]?)?;
+    } else {
+        return None;
+    }
+    Some(false)
+}
+
+#[cfg(feature = "internal-checker")]
+fn transfer_imported_pair_returns(
+    rows: &[IntegerRow], arguments: [ImportedScalarArgument<'_>; 2], types: [&ScalarType; 2], ty: &ScalarType,
+    pair: &ProjectedIntegerPair, retained_affine: &mut Option<usize>, import_meter: &mut usize,
+) -> Option<IntegerInputs> {
+    if pair.caller_axes != [0, 1] || !types.into_iter().all(is_integer_type) { return None; }
+    use ImportedScalarArgument::{Axis, Literal};
+    let axes = arguments.map(|argument| match argument { Axis(axis) => Some(axis), Literal(_) => None });
+    let mut joined = ScalarOutputRows::Bound(IntegerInputs::default());
+    let mut uses_affine = retained_affine.is_some();
+    let work = retained_affine.as_mut().unwrap_or(import_meter);
+    charge_call_work(work, rows.len().checked_mul(pair.pieces.len().checked_add(1)?)?)?;
+    for row in rows {
+        if let [Some(first), Some(second)] = axes {
+            // These receipts were proved as independent rectangles. Do not
+            // flatten an equality or affine link between the actual arguments.
+            let lookup = (usize::BITS - row.equal_axes().len().leading_zeros()) as usize;
+            charge_call_work(work, lookup.checked_mul(2)?.checked_add(MAX_AFFINE_MEMBERS + 1)?)?;
+            if row.linked_axes(first, second) { return None; }
+        }
+        let mut matched = false;
+        'pieces: for piece in &pair.pieces {
+            if piece.anchor != 0 { return None; }
+            let mut cells = [Rc::clone(&piece.inputs[0]), Rc::clone(&piece.inputs[1])];
+            for (slot, cell) in cells.iter_mut().enumerate() {
+                let comparison = match arguments[slot] {
+                    Literal(value) => {
+                        charge_call_work(work, cell.interval_count())?;
+                        if !cell.contains(value) { continue 'pieces; }
+                        if cell.singleton_value().is_none() { *cell = Rc::new(IntegerSet::singleton(value)); }
+                        continue;
+                    }
+                    Axis(axis) => row.get(axis)?,
+                };
+                charge_call_work(work, comparison.interval_count().checked_add(cell.interval_count())?)?;
+                match comparison.intersection(cell) {
+                    IntegerIntersection::Unchanged => *cell = Rc::clone(comparison),
+                    IntegerIntersection::Empty => continue 'pieces,
+                    IntegerIntersection::Changed(values) => *cell = Rc::new(values),
+                }
+            }
+            uses_affine |= attach_pair_return(row, axes, types, ty, cells, &piece.output, &mut joined, work)?;
+            matched = true;
+        }
+        // Full guarded coverage was established at issuance. Do not silently
+        // drop a caller row if its receipt unexpectedly has no overlap.
+        if !matched { return None; }
+    }
+    if uses_affine {
+        *retained_affine = Some(*work);
+    }
+    let ScalarOutputRows::Bound(rows) = joined else { return None; };
+    Some(rows)
 }
 
 // Both a freshly executed projected call and an authenticated reuse of its
@@ -7297,40 +7439,13 @@ impl<'a> ExactCallCursor<'a> {
                 let mut work = self.roots.affine_work.unwrap_or(0);
                 let mut uses_affine = self.roots.affine_work.is_some();
                 let mut joined = self.scalar_output_rows(binding, ty)?;
+                let [first, second] = projected.caller_axes;
+                let types = [self.roots.axes.get(first)?.1, self.roots.axes.get(second)?.1];
+                let axes = [Some(first), Some(second)];
                 for piece in projected.pieces {
                     let index = usize::from(piece.anchor).checked_sub(1)?;
                     let row = original.get(index)?;
-                    let intervals = [piece.inputs[0].interval_count(), piece.inputs[1].interval_count()];
-                    let base = row.len().checked_add(1)?
-                        .checked_add(3usize.checked_mul(row.equal_axes().len())?)?
-                        .checked_add(intervals[0])?.checked_add(intervals[1])?;
-                    charge_call_work(&mut work, base)?;
-                    row.charge_affine_pair(projected.caller_axes, intervals, &mut work)?;
-                    if work > MAX_PARTITION_TRANSFER_WORK { return None; }
-                    let plan = match &piece.output {
-                        IntegerPairPartitionOutput::InputAlias(slot) | IntegerPairPartitionOutput::InputAffine(slot, _) => {
-                            if self.roots.axes.get(projected.caller_axes[*slot])?.1 != ty { return None; }
-                            charge_call_work(&mut work, 1)?;
-                            if let IntegerPairPartitionOutput::InputAffine(_, transform) = &piece.output {
-                                let (min, max) = super::typecheck::integer_bounds(ty)?;
-                                transform.fits(&piece.inputs[*slot], &min, &max)?;
-                                uses_affine = true;
-                                Some(row.prepare_affine(
-                                    projected.caller_axes[*slot], &piece.inputs[*slot], transform, &mut work,
-                                )?)
-                            } else {
-                                None
-                            }
-                        }
-                        IntegerPairPartitionOutput::Singleton(_) => None,
-                    };
-                    let mut row = row.clone();
-                    row.replace_pair(projected.caller_axes, piece.inputs)?;
-                    match piece.output {
-                        IntegerPairPartitionOutput::Singleton(output) => joined.push_singleton(row, output)?,
-                        IntegerPairPartitionOutput::InputAlias(slot) => joined.push_alias(row, projected.caller_axes[slot])?,
-                        IntegerPairPartitionOutput::InputAffine(..) => joined.push_affine(row, plan?)?,
-                    }
+                    uses_affine |= attach_pair_return(row, axes, types, ty, piece.inputs, &piece.output, &mut joined, &mut work)?;
                 }
                 if uses_affine { self.roots.affine_work = Some(work); }
                 self.finish_scalar_rows(joined, binding, ty)?;

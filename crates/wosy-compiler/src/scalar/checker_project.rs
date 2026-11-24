@@ -4417,6 +4417,7 @@ enum VerifiedSymbolicResult<'a> {
     EntryAlias(usize),
     EntryAffine { slot: usize, transform: Rc<super::checker_flow::IntegerAffineTransform> },
     UnaryPartitions(Vec<super::checker_flow::IntegerReturnPartition>),
+    PairPartitions(super::checker_flow::ProjectedIntegerPair),
 }
 
 #[cfg(feature = "internal-checker")]
@@ -4488,6 +4489,7 @@ impl<'a> VerifiedSymbolicSummary<'a> {
                 VerifiedSymbolicResult::EntryAlias(slot) => ImportedVerifiedReturn::EntryAlias(*slot),
                 VerifiedSymbolicResult::EntryAffine { slot, transform } => ImportedVerifiedReturn::EntryAffine { slot: *slot, transform },
                 VerifiedSymbolicResult::UnaryPartitions(pieces) => ImportedVerifiedReturn::UnaryPartitions(pieces),
+                VerifiedSymbolicResult::PairPartitions(pair) => ImportedVerifiedReturn::PairPartitions(pair),
             };
             let values = ImportedIntegerValues::Shared { result, guards, domain, meter_rectangle };
             Ok(Some(ImportedLocal { position, values, guards: Vec::new() }))
@@ -4913,7 +4915,7 @@ impl<'a> SelectedSymbolicProof<'a, '_> {
         let issuer = if !mixed && bare.is_some_and(|(_, rest)| rest.is_empty()) {
             group.issuer.as_ref().filter(|issuer| std::ptr::eq(issuer.body, body))
         } else { None };
-        let mut dependencies = issuer.map(|_| reached);
+        let mut publication = None;
         let mut applicable = false;
         let mut peer_nodes = Vec::new();
         let mut peer_states = Vec::new();
@@ -4964,27 +4966,38 @@ impl<'a> SelectedSymbolicProof<'a, '_> {
             } else if has_citation && bare && checked.applicable {
                 peer_states[index] = LocalPeerState::Terminal(index);
             } else if let (Some(issuer), true) = (issuer, checked.applicable) {
-                let result = match *goal {
-                    PartitionedProofGoal::Literal(relation, bound)
-                        if Some(relation) == IntegerRelation::from_operator(&BinaryOperator::Equal) =>
-                        VerifiedSymbolicResult::Constant { bound, shared: std::cell::OnceCell::new() },
-                    PartitionedProofGoal::EntryEquality(slot) => VerifiedSymbolicResult::EntryAlias(slot),
-                    PartitionedProofGoal::EntryAffineEquality { slot, transform } =>
-                        VerifiedSymbolicResult::EntryAffine { slot, transform: Rc::clone(transform) },
-                    _ => return Err(ProjectCheck::Unsupported),
-                };
-                // Full pre-guard joint coverage and proof-free execution
-                // were checked above. All guarded returns satisfy the
-                // certified constant or exact entry-alias relation.
-                self.equalities.insert(VerifiedSymbolicSummary {
-                    target, canonical_target: issuer.canonical_target, layout: issuer.layout,
-                    body: issuer.body, result,
-                    guards: VerifiedSymbolicGuards::Partitioned {
-                        guards: case.guard.comparisons.clone(),
-                        _dependency_definitions: dependencies.take().ok_or(ProjectCheck::Unsupported)?,
-                    },
-                });
+                publication = Some((issuer, case, *goal));
             }
+        }
+        if let Some((issuer, case, goal)) = publication {
+            let result = match goal {
+                PartitionedProofGoal::Literal(relation, bound)
+                    if Some(relation) == IntegerRelation::from_operator(&BinaryOperator::Equal) =>
+                    VerifiedSymbolicResult::Constant { bound, shared: std::cell::OnceCell::new() },
+                PartitionedProofGoal::EntryEquality(slot) => VerifiedSymbolicResult::EntryAlias(slot),
+                PartitionedProofGoal::EntryAffineEquality { slot, transform } =>
+                    VerifiedSymbolicResult::EntryAffine { slot, transform: Rc::clone(transform) },
+                PartitionedProofGoal::Literal(..) => {
+                    if !reached.iter().all(|&(module, item)|
+                        runtime.calls.function_body(module, item, None).is_some_and(summary_elision_safe))
+                    {
+                        return Err(ProjectCheck::Unsupported);
+                    }
+                    let ActualCallResult::PartitionedIntegerPair(pair) = returned else { return Err(ProjectCheck::Unsupported); };
+                    VerifiedSymbolicResult::PairPartitions(pair)
+                }
+            };
+            // Full joint coverage and proof-free execution were checked
+            // above. For a broad bound retain the exact pair partitions;
+            // consumers must still establish every guard before importing.
+            self.equalities.insert(VerifiedSymbolicSummary {
+                target, canonical_target: issuer.canonical_target, layout: issuer.layout,
+                body: issuer.body, result,
+                guards: VerifiedSymbolicGuards::Partitioned {
+                    guards: case.guard.comparisons.clone(),
+                    _dependency_definitions: reached,
+                },
+            });
         }
         Ok(Some(applicable))
     }
@@ -5259,7 +5272,7 @@ impl SymbolicRootProof for SelectedSymbolicProof<'_, '_> {
             return self.verify_case_citation_cohort(target, calls, function, source, effects, runtime, cases, cohort);
         }
         if let MainFlowProofCases::Bare { first, rest } = &group.cases {
-            if rest.is_empty() && first.bound.literal().is_some()
+            if rest.is_empty() && calls.boundary.parameters.len() == 1 && first.bound.literal().is_some()
                 && Some(first.relation) != IntegerRelation::from_operator(&BinaryOperator::Equal)
             {
                 if let Some(issuer) = group.issuer.as_ref().filter(|issuer| std::ptr::eq(issuer.body, calls)) {
@@ -6034,13 +6047,15 @@ impl<'a> SymbolicSummaryIssuer<'a> {
             && proof.filter.len() <= 2
             && proof.filter.iter().all(|atom| matches!(atom, CheckerPredicate::Integer(_) | CheckerPredicate::Boolean(true)));
         let literal = matches!(&plan.typed.goal, TypedProofGoal::Literal { operator: BinaryOperator::Equal, .. });
+        let bounded_pair = rectangular && !literal && matches!(&plan.typed.goal, TypedProofGoal::Literal { .. })
+            && summary_elision_safe(body);
         let entry = matches!(&plan.typed.goal, TypedProofGoal::EntryComparison { slot, relation }
             if parameters.get(*slot).is_some_and(|entry| &entry.ty == plan.typed.result_type)
                 && Some(*relation) == IntegerRelation::from_operator(&BinaryOperator::Equal));
         let affine = matches!(&plan.typed.goal, TypedProofGoal::EntryAffine { slot, relation, .. }
             if parameters.get(*slot).is_some_and(|entry| &entry.ty == plan.typed.result_type)
                 && Some(*relation) == IntegerRelation::from_operator(&BinaryOperator::Equal));
-        if (rectangular && (literal || entry || affine))
+        if (rectangular && (literal || entry || affine || bounded_pair))
             || ((entry || affine) && supports_unary_entry_proof(body, plan.typed.result_type))
         {
             return Some(Self { canonical_target: plan.canonical_target, layout: plan.typed.target.target_layout, body });
@@ -19280,6 +19295,129 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
         assert_eq!(observed.invocation.arguments, [(ScalarType::U8, BigInt::from(8))]);
         assert_eq!(observed.invocation.returned, seven);
         assert!(receipt.symbolic_diagnostic.is_none());
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordered_pair_bounded_summary_keeps_joint_returns_and_invocation_identity() {
+        let app = source("src/main.w", "ordered-pair-bounded-summary");
+        let producer = r#"%%start
+            i16(i8, i16) leaf = fn(tag, value) { if (tag > 0) { value } else { 7 } };
+            i16(i8, i16) producer = fn(tag, value) { i16 result = leaf(tag, value); result };
+            proof bounded for producer(selector, before) -> (out)
+                where (selector <= 4 && before <= 3) ensures (out <= 7) {}
+        %%end"#;
+        let consumer = producer.replace("%%end", &format!(r#"
+            unit(i8, i16) consume = fn(tag, value) {{
+                core.narrow(tag <= 4, {OUTPUT});
+                core.narrow(value <= 3, {OUTPUT});
+                i16 observed = producer(tag, value);
+                i16 same_arg = producer(1, value);
+                i16 fixed_value = producer(tag, 3);
+                i16 fixed_both = producer(0, 3);
+                core.require(fixed_both == 7, {OUTPUT});
+                if (tag <= 0) {{
+                    core.require(observed == 7, {OUTPUT});
+                    core.require(fixed_value == 7, {OUTPUT});
+                }} else {{
+                    core.require(observed <= 3, {OUTPUT});
+                    core.require(fixed_value == 3, {OUTPUT});
+                    if (value == 2) {{
+                        core.require(observed == 2, {OUTPUT});
+                        core.require(same_arg == 2, {OUTPUT});
+                    }};
+                }};
+            }};
+        %%end"#));
+        let run = |text: &str, scope| {
+            let (_, proof) = crate::parse_proof_source(app.clone(), text.to_owned(), &[]).ok().unwrap();
+            check_loaded_ordered_proof_diagnostics_in_scope::<true>(
+                Vec::new(), vec![(proof, Vec::new())], vec![app.clone()], inputs(), scope, Vec::new(),
+            )
+        };
+        let package = ScalarCheckerScope::CurrentPackage;
+        let main = ScalarCheckerScope::MainFlowOnly;
+        let proved = run(&consumer, package).unwrap();
+        assert!(proved.active && proved.symbolic_diagnostic.is_none() && proved.directives.is_empty());
+        assert!(!run(&consumer, main).unwrap().active);
+        let failed = consumer.replace("observed == 2", "observed != 2");
+        let receipt = run(&failed, package).unwrap();
+        let [failure] = receipt.directives.as_slice() else { panic!("one authentic joint witness"); };
+        let two = BigInt::from(2);
+        let three = BigInt::from(3);
+        let seven = BigInt::from(7);
+        let witness = &failure.witness;
+        assert!(witness.intervals_at(0, 0).unwrap().eq([(&BigInt::from(1), &BigInt::from(4))]));
+        for axis in [1, 2, 3] {
+            assert!(witness.intervals_at(0, axis).unwrap().eq([(&two, &two)]));
+        }
+        assert!(witness.intervals_at(0, 4).unwrap().eq([(&three, &three)]));
+        assert!(witness.intervals_at(0, 5).unwrap().eq([(&seven, &seven)]));
+        assert_eq!(witness.row_equal_axes(0), Some(&[(2, 1), (3, 1)][..]));
+
+        for refused in [
+            consumer.replace("core.narrow(tag <= 4", "core.narrow(tag <= 5"),
+            consumer.replace("core.narrow(value <= 3", "core.narrow(value <= 4"),
+            consumer.replace("producer(0, 3)", "producer(5, 3)"),
+            consumer.replace("ensures (out <= 7)", "ensures (out < 7)"),
+            consumer.replace("%%end", "i16 startup = producer(0, 3); %%end"),
+            consumer.replace("if (tag > 0)", &format!("core.require(false, {OUTPUT}); if (tag > 0)")),
+        ] {
+            assert!(matches!(run(&refused, package), Err(ProjectCheck::Unsupported)));
+        }
+        let refuted = producer.replace("ensures (out <= 7)", "ensures (out < 7)");
+        let receipt = run(&refuted, package).unwrap();
+        let failure = receipt.symbolic_diagnostic.unwrap();
+        assert_eq!(failure.returned, seven);
+        assert!(failure.witness.intervals_at(0, 0).unwrap().eq([(&BigInt::from(-128), &BigInt::from(0))]));
+        assert!(failure.witness.intervals_at(0, 1).unwrap().eq([(&BigInt::from(-32768), &three)]));
+        let reached = refuted.replace("%%end", "i16 startup = producer(0, 3); %%end");
+        let receipt = run(&reached, main).unwrap();
+        let [observed] = receipt.diagnostics.as_slice() else { panic!("actual application is checked independently"); };
+        assert_eq!(observed.invocation.arguments, [(ScalarType::I8, BigInt::from(0)), (ScalarType::I16, three)]);
+        assert_eq!(observed.invocation.returned, seven);
+        assert!(receipt.symbolic_diagnostic.is_none());
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordered_pair_bounded_summary_reuses_affine_output_on_its_actual_axis() {
+        let app = source("src/main.w", "ordered-pair-bounded-affine-summary");
+        let program = format!(r#"%%start
+            i16(i16, i16) leaf = fn(tag, value) {{ if (tag < 0) {{}}; -1 - value }};
+            i16(i16, i16) producer = fn(tag, value) {{ i16 result = leaf(tag, value); result }};
+            proof bounded for producer(selector, before) -> (out)
+                where (selector >= 0 && before >= 10) ensures (out <= -11) {{}}
+            unit(i16, i16) consume = fn(tag, value) {{
+                core.narrow(tag >= 0, {OUTPUT});
+                core.narrow(value >= 10, {OUTPUT});
+                i16 observed = producer(tag, value);
+                i16 fixed = producer(tag, 12);
+                i16 selected = producer(1, value);
+                core.require(fixed == -13, {OUTPUT});
+                if (value == 12) {{
+                    core.require(observed == -13, {OUTPUT});
+                    core.require(selected == -13, {OUTPUT});
+                }};
+            }};
+        %%end"#);
+        let run = |text: &str| {
+            let (_, proof) = crate::parse_proof_source(app.clone(), text.to_owned(), &[]).ok().unwrap();
+            check_loaded_ordered_proof_diagnostics_in_scope::<true>(
+                Vec::new(), vec![(proof, Vec::new())], vec![app.clone()], inputs(), ScalarCheckerScope::CurrentPackage, Vec::new(),
+            )
+        };
+        let proved = run(&program).unwrap();
+        assert!(proved.active && proved.symbolic_diagnostic.is_none() && proved.directives.is_empty());
+        let failed = program.replace("observed == -13", "observed != -13");
+        let receipt = run(&failed).unwrap();
+        let [failure] = receipt.directives.as_slice() else { panic!("one actual affine witness"); };
+        assert!(failure.witness.intervals_at(0, 1).unwrap().eq([(&BigInt::from(12), &BigInt::from(12))]));
+        for axis in 2..=4 {
+            assert!(failure.witness.intervals_at(0, axis).unwrap().eq([(&BigInt::from(-13), &BigInt::from(-13))]));
+        }
+        let coupled = program.replace("producer(tag, value)", "producer(value, value)");
+        assert!(matches!(run(&coupled), Err(ProjectCheck::Unsupported)));
     }
 
     #[cfg(feature = "internal-checker")]

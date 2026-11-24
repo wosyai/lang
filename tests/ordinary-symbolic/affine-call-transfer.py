@@ -2377,7 +2377,69 @@ cases.extend([
         .replace("%%end", "u8 startup = producer(8); %%end"), 1, b"proof obligation failed"),
 ])
 
+pair_bound_producer = """%%start
+    i16(i8, i16) leaf = fn(tag, value) { if (tag > 0) { value } else { 7 } };
+    i16(i8, i16) producer = fn(tag, value) { i16 result = leaf(tag, value); result };
+    proof bounded for producer(selector, before) -> (out)
+        where (selector <= 4 && before <= 3) ensures (out <= 7) {}
+%%end"""
+pair_bound_consumer = pair_bound_producer.replace("%%end",f"""
+    unit(i8, i16) consume = fn(tag, value) {{
+        core.narrow(tag <= 4, {report(56,"PAIR-TAG")});
+        core.narrow(value <= 3, {report(57,"PAIR-VALUE")});
+        i16 observed = producer(tag, value);
+        i16 same_arg = producer(1, value);
+        i16 fixed_value = producer(tag, 3);
+        i16 fixed_both = producer(0, 3);
+        core.require(fixed_both == 7, {report(58,"PAIR-FIXED-BOTH")});
+        if (tag <= 0) {{
+            core.require(observed == 7, {report(59,"PAIR-NONPOSITIVE-TAG")});
+            core.require(fixed_value == 7, {report(60,"PAIR-NONPOSITIVE-FIXED")});
+        }} else {{
+            core.require(observed <= 3, {report(61,"PAIR-DEPENDENT-BOUND")});
+            core.require(fixed_value == 3, {report(62,"PAIR-DEPENDENT-FIXED")});
+            if (value == 2) {{
+                core.require(observed == 2, {report(63,"PAIR-DEPENDENT-ALIAS")});
+                core.require(same_arg == 2, {report(64,"PAIR-DEPENDENT-FIXED-TAG")});
+            }};
+        }};
+    }};
+%%end""")
+pair_bound_affine = verified_rectangular_affine.replace(
+    "out == -1 - core.old(before)", "out <= -11").replace(
+    "i16 observed = producer(tag, value);",
+    f"""i16 observed = producer(tag, value);
+        i16 fixed = producer(tag, 12);
+        i16 selected = producer(1, value);
+        core.require(fixed == -13, {report(65,"PAIR-AFFINE-FIXED")});
+        if (value == 12) {{ core.require(selected == -13, {report(66,"PAIR-AFFINE-SELECTED")}); }};""")
+cases.extend([
+    ("ordinary-pair-bounded-summary-proved", pair_bound_consumer, 0, b""),
+    ("ordinary-pair-bounded-summary-refutes-consumer", pair_bound_consumer.replace("observed == 2", "observed != 2"),
+        63, b"PAIR-DEPENDENT-ALIAS"),
+    ("ordinary-pair-bounded-summary-refuses-first-guard", pair_bound_consumer.replace("core.narrow(tag <= 4", "core.narrow(tag <= 5"),
+        2, b"unsupported analysis"),
+    ("ordinary-pair-bounded-summary-refuses-second-guard", pair_bound_consumer.replace("core.narrow(value <= 3", "core.narrow(value <= 4"),
+        2, b"unsupported analysis"),
+    ("ordinary-pair-bounded-summary-refuses-literal", pair_bound_consumer.replace("producer(0, 3)", "producer(5, 3)"),
+        2, b"unsupported analysis"),
+    ("ordinary-pair-bounded-summary-refuses-effectful-dependency", pair_bound_consumer.replace(
+        "if (tag > 0)", f"core.require(false, {report(67,'PAIR-NO-ELISION')}); if (tag > 0)"),
+        2, b"unsupported analysis"),
+    ("ordinary-pair-bounded-summary-refutes-proof", pair_bound_producer.replace("out <= 7", "out < 7"),
+        1, b"proof obligation failed"),
+    ("ordinary-pair-bounded-summary-affine", pair_bound_affine, 0, b""),
+    ("ordinary-pair-bounded-summary-refutes-affine", pair_bound_affine.replace("observed == -13", "observed != -13"),
+        48, b"VERIFIED-AFFINE-OUTPUT"),
+    ("ordinary-pair-bounded-summary-refuses-linked-arguments", pair_bound_affine.replace("producer(tag, value)", "producer(value, value)"),
+        2, b"unsupported analysis"),
+    ("exact-startup-pair-bounded-summary-refutes-proof", pair_bound_producer.replace("out <= 7", "out < 7")
+        .replace("%%end", "i16 startup = producer(0, 3); %%end"), 1, b"proof obligation failed"),
+])
+
 proof_diagnostic_notes = {
+    "ordinary-pair-bounded-summary-refutes-proof": b"symbolic call can return 7",
+    "exact-startup-pair-bounded-summary-refutes-proof": b"call returned 7",
     "ordinary-unary-bounded-summary-refutes-proof": b"symbolic call can return 7",
     "exact-startup-unary-bounded-summary-refutes-proof": b"call returned 7",
     "ordinary-authored-case-citation-ordered-diagnostics": b"core.show(out == 8)",
