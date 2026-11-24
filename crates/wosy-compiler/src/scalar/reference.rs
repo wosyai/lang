@@ -6161,6 +6161,19 @@ pub(super) struct CheckerOrdinaryIntegerComparison {
     pub(super) relation: super::symbolic_integer::IntegerRelation,
 }
 
+#[cfg(feature = "internal-checker")]
+#[derive(Clone, Debug, PartialEq)]
+pub(super) enum CheckerOrdinaryBoolean {
+    Constant(bool),
+    Integer(super::checker_flow::IntegerPredicate),
+    Lexical(CheckerOrdinaryIntegerComparison),
+    And(Box<[Self; 2]>),
+    Or(Box<[Self; 2]>),
+    Not(Box<Self>),
+    // A well-typed but unsupported expression is harmless if short-circuited.
+    Opaque,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct OccurrenceStructure {
     pub(super) root: BlockOrdinal,
@@ -6186,6 +6199,8 @@ pub(super) struct OccurrenceStructure {
     #[cfg(any(test, feature = "internal-checker"))]
     pub(super) checker_integer_locals: HashMap<(BlockOrdinal, usize), ReferenceBindingId>,
     #[cfg(feature = "internal-checker")]
+    pub(super) checker_ordinary_booleans: HashMap<OccurrenceOrdinal, CheckerOrdinaryBoolean>,
+    #[cfg(feature = "internal-checker")]
     pub(super) checker_ordinary_integer_comparisons: HashMap<OccurrenceOrdinal, CheckerOrdinaryIntegerComparison>,
     #[cfg(feature = "internal-checker")]
     pub(super) checker_ordinary_integer_locals: HashMap<(BlockOrdinal, usize), CheckerOrdinaryIntegerLocal>,
@@ -6208,7 +6223,12 @@ pub(super) struct OccurrenceStructure {
 impl OccurrenceStructure {
     #[cfg(feature = "internal-checker")]
     pub(super) fn has_ordinary_integer_operations(&self) -> bool {
-        !self.checker_ordinary_integer_locals.is_empty() || !self.checker_ordinary_integer_comparisons.is_empty()
+        !self.checker_ordinary_integer_locals.is_empty() || self.has_ordinary_predicates()
+    }
+
+    #[cfg(feature = "internal-checker")]
+    pub(super) fn has_ordinary_predicates(&self) -> bool {
+        !self.checker_ordinary_integer_comparisons.is_empty() || !self.checker_ordinary_booleans.is_empty()
     }
 
     fn new(span: ByteSpan) -> Self {
@@ -6239,6 +6259,8 @@ impl OccurrenceStructure {
             checker_ordinary_integer_locals: HashMap::new(),
             #[cfg(feature = "internal-checker")]
             checker_ordinary_integer_comparisons: HashMap::new(),
+            #[cfg(feature = "internal-checker")]
+            checker_ordinary_booleans: HashMap::new(),
             #[cfg(any(test, feature = "internal-checker"))]
             checker_contextual_read_locals: HashMap::new(),
             #[cfg(any(test, feature = "internal-checker"))]
@@ -7046,6 +7068,78 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
         Some(CheckerOrdinaryIntegerComparison { operands, ty, relation })
     }
 
+    #[cfg(feature = "internal-checker")]
+    fn ordinary_compound(
+        &self, expression: &ScalarExpression, names: &BTreeMap<String, WalkBinding>, occurrence: Option<OccurrenceOrdinal>,
+    ) -> Option<CheckerOrdinaryBoolean> {
+        if !matches!(self.mode, WalkMode::Callable(_)) || !matches!(expression,
+            ScalarExpression::Binary { operator: BinaryOperator::And | BinaryOperator::Or, .. }
+                | ScalarExpression::Unary { operator: super::UnaryOperator::LogicalNot, .. })
+        {
+            return None;
+        }
+        // Bound discovery as well as metadata allocation. Keep the
+        // admitted prefix so dead oversized subtrees remain harmless.
+        let mut remaining = 32;
+        Some(self.prepare_ordinary_boolean(expression, names, occurrence, &mut remaining)
+            .unwrap_or(CheckerOrdinaryBoolean::Opaque))
+    }
+
+    #[cfg(feature = "internal-checker")]
+    fn prepare_ordinary_boolean(
+        &self, expression: &ScalarExpression, names: &BTreeMap<String, WalkBinding>,
+        occurrence: Option<OccurrenceOrdinal>, remaining: &mut usize,
+    ) -> Option<CheckerOrdinaryBoolean> {
+        use CheckerOrdinaryBoolean as Boolean;
+        if *remaining == 0 { return Some(Boolean::Opaque); }
+        *remaining -= 1;
+        let child = |edge| -> Option<Option<OccurrenceOrdinal>> {
+            let Some(parent) = occurrence else { return Some(None); };
+            let OccurrenceNode::Expression(child) = self.structure.edges.get(&(OccurrenceParent::Expression(parent), edge))?
+                else { return None; };
+            Some(Some(*child))
+        };
+        Some(match expression {
+            ScalarExpression::Boolean { value, .. } => Boolean::Constant(*value),
+            ScalarExpression::Binary { operator: operator @ (BinaryOperator::And | BinaryOperator::Or), left, right, .. } => {
+                let lhs = self.prepare_ordinary_boolean(left, names, child(OccurrenceEdge::BinaryLeft)?, remaining)?;
+                let rhs = self.prepare_ordinary_boolean(right, names, child(OccurrenceEdge::BinaryRight)?, remaining)?;
+                let operands = Box::new([lhs, rhs]);
+                if *operator == BinaryOperator::And { Boolean::And(operands) } else { Boolean::Or(operands) }
+            }
+            ScalarExpression::Unary { operator: super::UnaryOperator::LogicalNot, operand, .. } =>
+                Boolean::Not(Box::new(self.prepare_ordinary_boolean(operand, names, child(OccurrenceEdge::UnaryOperand)?, remaining)?)),
+            _ => {
+                if let Some(comparison) = self.ordinary_integer_comparison(expression, names, occurrence) {
+                    Boolean::Lexical(comparison)
+                } else if let Some(predicate) = self.ordinary_literal_predicate(expression, names, occurrence) {
+                    Boolean::Integer(predicate)
+                } else {
+                    Boolean::Opaque
+                }
+            }
+        })
+    }
+
+    #[cfg(feature = "internal-checker")]
+    fn ordinary_literal_predicate(
+        &self, expression: &ScalarExpression, names: &BTreeMap<String, WalkBinding>, occurrence: Option<OccurrenceOrdinal>,
+    ) -> Option<super::checker_flow::IntegerPredicate> {
+        let comparison = super::checker_flow::IntegerComparison::from_expression(expression)?;
+        let Some(occurrence) = occurrence else { return self.checker_integer_predicate(expression, names); };
+        let child = |edge| {
+            let OccurrenceNode::Expression(child) = self.structure.edges.get(&(OccurrenceParent::Expression(occurrence), edge))?
+                else { return None; };
+            Some(*child)
+        };
+        let left = child(OccurrenceEdge::BinaryLeft)?;
+        let right = child(OccurrenceEdge::BinaryRight)?;
+        let PlainNameFacts::Prepared(identities) = &self.plain_names else { return None; };
+        let PlainNameIdentity::Lexical(binding) = identities.get(&left)? else { return None; };
+        let types = &self.structure.checked_types.expressions;
+        comparison.typed(types.get(&left)?, types.get(&right)?, binding.clone())
+    }
+
     #[cfg(any(test, feature = "internal-checker"))]
     fn checked_bool_initializer_predicate(
         &self,
@@ -7131,7 +7225,9 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
             {
                 use super::{checker_directive::CheckerOperation, checker_flow::CheckerPredicate};
                 if predicate.is_none() {
-                    if let Some(comparison) = self.ordinary_integer_comparison(condition, names, None) {
+                    if let Some(compound) = self.ordinary_compound(condition, names, None) {
+                        self.structure.checker_ordinary_booleans.insert(ordinal, compound);
+                    } else if let Some(comparison) = self.ordinary_integer_comparison(condition, names, None) {
                         self.structure.checker_ordinary_integer_comparisons.insert(ordinal, comparison);
                     }
                 }
@@ -7386,7 +7482,9 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
         self.expression_children(expression, names, types, ordinal, initializer_statement)?;
         #[cfg(feature = "internal-checker")]
         if checker_enabled && matches!(edge, OccurrenceEdge::Condition) {
-            if let Some(comparison) = self.ordinary_integer_comparison(expression, names, Some(ordinal)) {
+            if let Some(compound) = self.ordinary_compound(expression, names, Some(ordinal)) {
+                self.structure.checker_ordinary_booleans.insert(ordinal, compound);
+            } else if let Some(comparison) = self.ordinary_integer_comparison(expression, names, Some(ordinal)) {
                 self.structure.checker_ordinary_integer_comparisons.insert(ordinal, comparison);
             }
         }

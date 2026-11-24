@@ -469,6 +469,81 @@ cases.extend([
     ("exact-startup-lexical-comparison",compare_startup,94,b"ACTUAL-COMPARE"),
     ("independent-lexical-comparison-remains-unsupported",independent_compare,2,b"unsupported analysis"),
 ])
+compound_branch = f"""%%start
+    unit(i8) check = fn(entry) {{
+        {bounds("entry",0,6)}
+        i8 reflected = 6 - entry;
+        if (reflected > entry && entry >= 2) {{
+            core.require(entry == 2, {report(96,"COMPOUND-THEN")});
+        }} else {{
+            core.require(entry != 2, {report(97,"COMPOUND-ELSE")});
+        }};
+    }};
+    %%end"""
+compound_require = f"""%%start
+    unit(i8) check = fn(entry) {{
+        {bounds("entry",-4,1)}
+        i8 reflected = -3 - entry;
+        core.require((entry <= -2 && reflected > entry) || (entry >= -1 && reflected < entry),
+            {report(98,"COMPOUND-REQUIRE")});
+    }};
+    %%end"""
+compound_narrow = f"""%%start
+    unit(u8) check = fn(entry) {{
+        core.narrow(entry <= 4, {report(99,"BOUND")});
+        u8 reflected = 4 - entry;
+        core.narrow(!(entry == reflected) && (entry == 1 || reflected == 1),
+            {report(100,"COMPOUND-NARROW")});
+        core.require(entry == 1 || entry == 3, {report(101,"COMPOUND-REFINE")});
+    }};
+    %%end"""
+compound_short = f"""%%start
+    unit(i8,i8) check = fn(entry, other) {{
+        {bounds("entry",0,4)}
+        if (entry > 4 && entry < other) {{ core.require(false, {report(102,"DEAD-RHS")}); }};
+        core.require(entry <= 4 || entry < other, {report(103,"SHORT-OR")});
+    }};
+    %%end"""
+compound_narrow_empty = f"""%%start
+    unit(u8) check = fn(entry) {{
+        core.narrow(entry <= 4, {report(104,"BOUND")});
+        u8 reflected = 4 - entry;
+        core.narrow(entry == reflected && entry != reflected, {report(105,"EMPTY-COMPOUND")});
+    }};
+    %%end"""
+for name,program,correct,incorrect,code,label in [
+    ("compound-lexical-branch",compound_branch,"entry == 2,","entry == 3,",96,b"COMPOUND-THEN"),
+    ("compound-signed-require",compound_require,"entry >= -1 &&","entry >= 0 &&",98,b"COMPOUND-REQUIRE"),
+    ("compound-unsigned-narrow",compound_narrow,"entry == 1 || entry == 3","entry == 1 || entry == 2",101,b"COMPOUND-REFINE"),
+]:
+    cases.extend([(name,program,0,b""),(name+"-witness",program.replace(correct,incorrect),code,label)])
+cases.extend([
+    ("compound-skips-unreachable-independent-rhs",compound_short,0,b""),
+    # The RHS compares two independent broad inputs only when at least two
+    # left values survive. A singleton left value is an admissible literal cut.
+    ("compound-reachable-independent-rhs-refused",compound_short.replace("entry > 4 &&","entry >= 3 &&"),2,b"unsupported analysis"),
+    ("compound-reached-singleton-rhs-can-report",compound_short.replace("entry > 4 &&","entry >= 4 &&"),102,b"DEAD-RHS"),
+    ("compound-contradiction-reports-narrow",compound_narrow_empty,105,b"EMPTY-COMPOUND"),
+])
+# Repeated always-true legacy formal/literal ORs must not grow alternative
+# rows or run out of the new compound lane's transfer budget.
+legacy_tautology = f"""%%start
+    unit(i8) check = fn(entry) {{
+        {" ".join(f'if (entry < 0 || entry >= 0) {{ core.require(entry >= -128, {report(106,"LEGACY")}); }};' for _ in range(96))}
+    }};
+    %%end"""
+oversized_rhs = " && ".join(["(entry >= 0)"] * 34)
+short_oversized = f"""%%start
+    unit(i8) check = fn(entry) {{
+        {bounds("entry",0,4)}
+        core.require(entry <= 4 || ({oversized_rhs}), {report(107,"OVERSIZED")});
+    }};
+    %%end"""
+cases.extend([
+    ("legacy-formal-tautologies-stay-compact",legacy_tautology,0,b""),
+    ("compound-dead-oversized-rhs-is-not-analyzed",short_oversized,0,b""),
+    ("compound-reached-oversized-rhs-is-unrepresentable",short_oversized.replace("entry <= 4 ||","entry < 4 ||"),2,b"unsupported analysis"),
+])
 with tempfile.TemporaryDirectory(prefix="affine-calls-") as path:
     root=Path(path)
     (root/"src").mkdir()

@@ -1965,12 +1965,13 @@ fn supported_integer_continuation_shape_for(body: &FunctionCallSites, expected: 
     if supported_integer_continuation_shape(body, expected) { return true; }
     #[cfg(feature = "internal-checker")]
     if ordinary && is_integer_type(expected) && body.allocation_length_calls.is_empty()
-        && !body.structure.checker_ordinary_integer_comparisons.is_empty()
+        && body.structure.has_ordinary_predicates()
     {
         return body.structure.checker_directives.iter().all(|(occurrence, directive)| {
             directive.operation == CheckerOperation::Require
                 && (matches!(directive.predicate, Some(CheckerPredicate::Boolean(_) | CheckerPredicate::Integer(_)))
-                    || body.structure.checker_ordinary_integer_comparisons.contains_key(occurrence))
+                    || body.structure.checker_ordinary_integer_comparisons.contains_key(occurrence)
+                    || body.structure.checker_ordinary_booleans.contains_key(occurrence))
         });
     }
     #[cfg(not(feature = "internal-checker"))]

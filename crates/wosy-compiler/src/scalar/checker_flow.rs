@@ -145,6 +145,13 @@ trait ScopedAuthoredReturn<'a>: Copy {
     ) -> Option<&'a BigInt>;
 
     #[cfg(feature = "internal-checker")]
+    fn prefer_legacy_root_compound(
+        self, _: &FunctionCallSites, _: BlockOrdinal, _: OccurrenceOrdinal, _: &IntegerRoots<'_>,
+    ) -> bool {
+        false
+    }
+
+    #[cfg(feature = "internal-checker")]
     fn split_unprepared(
         self, _: &FunctionCallSites, _: RootBranchSlot, _: &IntegerRoots<'_>, _: IntegerInputs,
     ) -> Option<(IntegerInputs, IntegerInputs, Option<usize>)> {
@@ -198,6 +205,26 @@ impl<'a, const EXACT_COMPOUND: bool, const ORDINARY_LOCALS: bool> ScopedAuthored
         _: &IntegerRoots<'_>, _: &IntegerInputs,
     ) -> Option<&'a BigInt> {
         None
+    }
+
+    fn prefer_legacy_root_compound(
+        self, calls: &FunctionCallSites, block: BlockOrdinal, condition: OccurrenceOrdinal, roots: &IntegerRoots<'_>,
+    ) -> bool {
+        // A root-level pair of formal/literal cuts was already supported.
+        // Keep the existing compact union path, notably for repeated ORs
+        // that cover the whole type without creating any alternative rows.
+        if !ORDINARY_LOCALS || !EXACT_COMPOUND || block != calls.structure.root || !calls.assignments.is_empty() {
+            return false;
+        }
+        use super::reference::CheckerOrdinaryBoolean as Boolean;
+        let Some(Boolean::Or(operands) | Boolean::And(operands)) =
+            calls.structure.checker_ordinary_booleans.get(&condition) else { return false; };
+        let Some(formals) = calls.boundary.checker_parameter_bindings.as_deref() else { return false; };
+        operands.iter().all(|operand| {
+            let Boolean::Integer(predicate) = operand else { return false; };
+            roots.lookup(&predicate.binding)
+                .is_some_and(|(axis, _)| formals.get(axis) == Some(&predicate.binding))
+        })
     }
 
     fn split_unprepared(
@@ -3663,7 +3690,7 @@ fn run_integer_callable<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool,
         allow_ordinary_affine_overwrites: Authored::ALLOW_ORDINARY_INTEGER_LOCALS,
         #[cfg(feature = "internal-checker")]
         ordinary_comparison_work: (Authored::ALLOW_ORDINARY_INTEGER_LOCALS
-            && !calls.structure.checker_ordinary_integer_comparisons.is_empty()).then_some(0),
+            && calls.structure.has_ordinary_predicates()).then_some(0),
         ..IntegerRoots::default()
     };
     for (binding, parameter) in checker_parameters.iter().zip(&boundary.parameters) {
@@ -3832,17 +3859,36 @@ fn prepared_comparison_axes(
 }
 
 #[cfg(feature = "internal-checker")]
+enum OrdinaryIntegerAtom<'a> {
+    Lexical([usize; 2], IntegerRelation),
+    Literal(usize, IntegerRelation, &'a BigInt),
+}
+
+#[cfg(feature = "internal-checker")]
 impl IntegerInputs {
     fn ordinary_comparison(
         &self, axes: [usize; 2], relation: IntegerRelation, selected: [bool; 2], work: &mut usize,
     ) -> Option<[Self; 2]> {
+        self.ordinary_atom(OrdinaryIntegerAtom::Lexical(axes, relation), selected, work)
+    }
+
+    fn ordinary_atom(&self, atom: OrdinaryIntegerAtom<'_>, selected: [bool; 2], work: &mut usize) -> Option<[Self; 2]> {
         let mut output = [Self::default(), Self::default()];
         for row in &self.0 {
-            // Bound identity/singleton discovery and constant-width arithmetic
-            // before deriving the cut. Typed operands are at most 128 bits.
-            let lookups = usize::BITS - row.equal_axes().len().leading_zeros();
-            charge_call_work(work, 8 + 2 * lookups as usize)?;
-            match ordinary_comparison_cut(row, axes, relation)? {
+            let cut = match atom {
+                OrdinaryIntegerAtom::Lexical(axes, relation) => {
+                    // Bound identity/singleton discovery and constant-width
+                    // arithmetic before deriving the checked integer cut.
+                    let lookups = usize::BITS - row.equal_axes().len().leading_zeros();
+                    charge_call_work(work, 8 + 2 * lookups as usize)?;
+                    ordinary_comparison_cut(row, axes, relation)?
+                }
+                OrdinaryIntegerAtom::Literal(axis, relation, bound) => {
+                    charge_call_work(work, 1)?;
+                    OrdinaryComparisonCut::Bound { axis, relation, bound: Cow::Borrowed(bound) }
+                }
+            };
+            match cut {
                 OrdinaryComparisonCut::Constant(result) => {
                     let lane = result as usize;
                     if selected[lane] {
@@ -3882,16 +3928,77 @@ impl IntegerInputs {
         Some(output)
     }
 
-    fn ordinary_branch(
+    fn ordinary_boolean(
+        &self, condition: &super::reference::CheckerOrdinaryBoolean, roots: &IntegerRoots<'_>,
+        selected: [bool; 2], work: &mut usize,
+    ) -> Option<[Self; 2]> {
+        use super::reference::CheckerOrdinaryBoolean as Boolean;
+        let mut output = [Self::default(), Self::default()];
+        if self.is_unreachable() { return Some(output); }
+        charge_call_work(work, 1)?;
+        match condition {
+            Boolean::Opaque => return None,
+            Boolean::Constant(value) => {
+                let lane = *value as usize;
+                if selected[lane] {
+                    for row in &self.0 {
+                        charge_call_work(work, row.len().checked_add(1)?)?;
+                    }
+                    output[lane].0 = self.0.clone();
+                }
+            }
+            Boolean::Integer(predicate) => {
+                let (axis, ty) = roots.lookup(&predicate.binding)?;
+                if ty != &predicate.ty { return None; }
+                let relation = IntegerRelation::from_operator(&predicate.operator)?;
+                return self.ordinary_atom(OrdinaryIntegerAtom::Literal(axis, relation, &predicate.bound), selected, work);
+            }
+            Boolean::Lexical(comparison) => {
+                let axes = prepared_comparison_axes(roots, comparison)?;
+                return self.ordinary_comparison(axes, comparison.relation, selected, work);
+            }
+            Boolean::Not(value) => {
+                let [no, yes] = self.ordinary_boolean(value, roots, [selected[1], selected[0]], work)?;
+                return Some([yes, no]);
+            }
+            Boolean::And(operands) | Boolean::Or(operands) => {
+                let and = matches!(condition, Boolean::And(_));
+                let continuing = usize::from(and);
+                let stop = 1 - continuing;
+                let mut left_selected = selected;
+                left_selected[continuing] = true;
+                let mut left = self.ordinary_boolean(&operands[0], roots, left_selected, work)?;
+                let right = left[continuing].ordinary_boolean(&operands[1], roots, selected, work)?;
+                output[stop] = std::mem::take(&mut left[stop]);
+                for (output, mut right) in output.iter_mut().zip(right) {
+                    let pushed = right.0.len();
+                    if pushed != 0 {
+                        let total = output.0.len().checked_add(pushed)?;
+                        let relocated = if total > output.0.capacity() { output.0.len() } else { 0 };
+                        charge_call_work(work, pushed.checked_add(relocated)?)?;
+                        output.0.append(&mut right.0);
+                    }
+                }
+            }
+        }
+        Some(output)
+    }
+
+    fn ordinary_predicate_at(
         &self, structure: &OccurrenceStructure, condition: OccurrenceOrdinal, roots: &mut IntegerRoots<'_>,
+        selected: [bool; 2],
     ) -> Option<Option<[Self; 2]>> {
-        if roots.ordinary_comparison_work.is_none() { return Some(None); }
-        let Some(comparison) = structure.checker_ordinary_integer_comparisons.get(&condition) else {
+        let Some(mut work) = roots.ordinary_comparison_work else { return Some(None); };
+        let partitions = if let Some(compound) = structure.checker_ordinary_booleans.get(&condition) {
+            self.ordinary_boolean(compound, roots, selected, &mut work)?
+        } else if let Some(comparison) = structure.checker_ordinary_integer_comparisons.get(&condition) {
+            let axes = prepared_comparison_axes(roots, comparison)?;
+            self.ordinary_comparison(axes, comparison.relation, selected, &mut work)?
+        } else {
             return Some(None);
         };
-        let axes = prepared_comparison_axes(roots, comparison)?;
-        self.ordinary_comparison(axes, comparison.relation, [true, true], roots.ordinary_comparison_work.as_mut()?)
-            .map(Some)
+        roots.ordinary_comparison_work = Some(work);
+        Some(Some(partitions))
     }
 
 }
@@ -4043,13 +4150,10 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                 if let Some(directive) = structure.checker_directives.get(&expression) {
                     #[cfg(feature = "internal-checker")]
                     if COLLECT && roots.ordinary_comparison_work.is_some() {
-                        if let Some(comparison) = structure.checker_ordinary_integer_comparisons.get(&expression) {
-                            let axes = prepared_comparison_axes(roots, comparison)?;
-                            let require = directive.operation == CheckerOperation::Require;
-                            let work = roots.ordinary_comparison_work.as_mut()?;
-                            let [rejected, accepted] = path.ordinary_comparison(
-                                axes, comparison.relation, [require, !require], work,
-                            )?;
+                        let require = directive.operation == CheckerOperation::Require;
+                        if let Some([rejected, accepted]) = path.ordinary_predicate_at(
+                            structure, expression, roots, [require, !require],
+                        )? {
                             roots.reached_obligation = true;
                             let failing = if require { rejected } else if accepted.is_unreachable() {
                                 std::mem::take(&mut path)
@@ -4058,6 +4162,7 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                                 IntegerInputs::default()
                             };
                             if !failing.is_unreachable() {
+                                let work = roots.ordinary_comparison_work.as_mut()?;
                                 let equal_axes = failing.common_equal_axes_bounded(work)?;
                                 charge_call_work(work, roots.axes.len())?;
                                 (failures.as_deref_mut()?.sink)(IntegerCheckFailure {
@@ -4151,7 +4256,11 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                     };
                     #[cfg(feature = "internal-checker")]
                     let ordinary = {
-                        let comparison = path.ordinary_branch(structure, *condition, roots)?;
+                        let comparison = if authored_return.prefer_legacy_root_compound(calls, block, *condition, roots) {
+                            None
+                        } else {
+                            path.ordinary_predicate_at(structure, *condition, roots, [true, true])?
+                        };
                         if comparison.is_none()
                             && !matches!(structure.checker_branches.get(condition), Some(CheckerPredicate::Boolean(_)))
                         {
@@ -4207,7 +4316,11 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                     let expected = tail?;
                     #[cfg(feature = "internal-checker")]
                     let ordinary = {
-                        let comparison = path.ordinary_branch(structure, *condition, roots)?;
+                        let comparison = if authored_return.prefer_legacy_root_compound(calls, block, *condition, roots) {
+                            None
+                        } else {
+                            path.ordinary_predicate_at(structure, *condition, roots, [true, true])?
+                        };
                         if comparison.is_none()
                             && !matches!(structure.checker_branches.get(condition), Some(CheckerPredicate::Boolean(_)))
                         {
@@ -4989,7 +5102,7 @@ impl<'a> ExactCallCursor<'a> {
         {
             self.roots.allow_ordinary_integer_locals = allow_ordinary_integer_locals && !calls.structure.checker_ordinary_integer_locals.is_empty();
             self.roots.allow_ordinary_affine_overwrites = allow_ordinary_integer_locals;
-            if allow_ordinary_integer_locals && !calls.structure.checker_ordinary_integer_comparisons.is_empty() {
+            if allow_ordinary_integer_locals && calls.structure.has_ordinary_predicates() {
                 self.roots.ordinary_comparison_work.get_or_insert(0);
             }
         }
@@ -5423,6 +5536,27 @@ fn affine_class_cap_allows_identity_alias_and_releases_truncated_members() {
     row.truncate(MAX_AFFINE_MEMBERS);
     assert_eq!(row.affine.as_ref().unwrap().members.len(), MAX_AFFINE_MEMBERS - 1);
     assert_eq!(row.test_append_affine(0, next), Some(()));
+}
+
+#[cfg(feature = "internal-checker")]
+#[test]
+fn ordinary_compounds_only_evaluate_reached_rhs() {
+    use super::reference::CheckerOrdinaryBoolean as Boolean;
+    let input = IntegerInputs::closed();
+    let roots = IntegerRoots::default();
+    let mut work = 0;
+    let dead_or = Boolean::Or(Box::new([Boolean::Constant(true), Boolean::Opaque]));
+    let [false_lane, true_lane] = input.ordinary_boolean(&dead_or, &roots, [true, true], &mut work).unwrap();
+    assert!(false_lane.is_unreachable());
+    assert!(!true_lane.is_unreachable());
+    let dead_and = Boolean::And(Box::new([Boolean::Constant(false), Boolean::Opaque]));
+    let [false_lane, true_lane] = input.ordinary_boolean(&dead_and, &roots, [true, false], &mut work).unwrap();
+    assert!(!false_lane.is_unreachable());
+    assert!(true_lane.is_unreachable());
+    let reached = Boolean::Not(Box::new(Boolean::Or(Box::new([Boolean::Constant(false), Boolean::Opaque]))));
+    assert!(input.ordinary_boolean(&reached, &roots, [false, true], &mut work).is_none());
+    let mut exhausted = MAX_PARTITION_TRANSFER_WORK;
+    assert!(input.ordinary_boolean(&dead_or, &roots, [true, true], &mut exhausted).is_none());
 }
 
 #[cfg(feature = "internal-checker")]
