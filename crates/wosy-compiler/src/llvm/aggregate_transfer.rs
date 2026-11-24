@@ -276,7 +276,7 @@ impl<'ctx, 'plan> AggregateEmitter<'ctx, 'plan> {
 
 pub(super) fn linkage(plan: Option<&ClosedBody>) -> Option<Linkage> {
     plan.filter(|body| body.returning.is_some() || !body.inputs.is_empty() || body.checked_backing_producer.is_some()
-        || body.checked_backing_wrapper.is_some() || body.ordinary_result || body.array_descriptor_return || body.array_descriptor_identity || body.borrowed_extent_observer.is_some())
+        || body.checked_backing_wrapper.is_some() || body.ordinary_result || body.array_descriptor_return || body.array_descriptor_identity || body.borrowed_extent_observer.is_some() || body.borrowed_extent_forward.is_some())
         .map(|_| Linkage::Internal)
 }
 
@@ -430,7 +430,7 @@ pub(super) fn definition_type<'ctx>(
     layout: ScalarTargetLayout,
     plan: Option<&ClosedBody>,
 ) -> Result<FunctionType<'ctx>, String> {
-    if plan.is_some_and(|body| body.borrowed_extent_observer.is_some()) {
+    if plan.is_some_and(|body| body.borrowed_extent_observer.is_some() || body.borrowed_extent_forward.is_some()) {
         let ScalarType::Callable { parameters, outputs } = &function.signature else {
             return Err("invalid checked borrowed extent declaration".into());
         };
@@ -1250,28 +1250,34 @@ pub(super) fn emit_array_descriptor_forward<'ctx>(
     definition: FunctionValue<'ctx>,
     function: &ScalarFunction,
     call: usize,
+    borrowed: bool,
 ) -> Result<(), String> {
     let Some((expression, _)) = function.body.final_expressions().next() else {
-        return Err("missing checked owning array forwarding expression".into());
+        return Err("missing checked array forwarding expression".into());
     };
     if state.body_call_nodes.and_then(|nodes| nodes.expression_ordinal(expression)) != Some(call) {
-        return Err("checked owning array forwarding occurrence changed".into());
+        return Err("checked array forwarding occurrence changed".into());
     }
     let selected = state.prepared_call(expression)?.ok_or("missing qualified array forwarding target")?;
-    let symbol = selected.symbol().ok_or("checked owning array forwarding lost its declaration")?;
-    let target = *state.functions.get(symbol).ok_or("missing checked owning array forwarding target")?;
-    let descriptor = array_descriptor_type(context);
+    let symbol = selected.symbol().ok_or("checked array forwarding lost its declaration")?;
+    let target = *state.functions.get(symbol).ok_or("missing checked array forwarding target")?;
+    let descriptor = if borrowed {
+        borrowed_extent_type(context, state.target_layout)
+    } else {
+        array_descriptor_type(context)
+    };
+    let result: BasicTypeEnum<'ctx> = if borrowed { context.i64_type().into() } else { descriptor.into() };
     let Some(BasicValueEnum::StructValue(parameter)) = definition.get_first_param() else {
-        return Err("missing checked owning array forwarding parameter".into());
+        return Err("missing checked array forwarding parameter".into());
     };
     if parameter.get_type() != descriptor || target.get_linkage() != Linkage::Internal
         || target.get_type().get_param_types().as_slice() != [descriptor.into()]
-        || target.get_type().get_return_type() != Some(descriptor.into())
+        || target.get_type().get_return_type() != Some(result)
     {
-        return Err("checked owning array forwarding types differ from the paired plan".into());
+        return Err("checked array forwarding types differ from the paired plan".into());
     }
     let pair = state.builder.build_call(target, &[parameter.into()], "array_forward")
-        .map_err(builder_error)?.try_as_basic_value().basic().ok_or("missing checked forwarded array pair")?;
+        .map_err(builder_error)?.try_as_basic_value().basic().ok_or("missing checked forwarded array result")?;
     state.builder.build_return(Some(&pair)).map_err(builder_error)?;
     Ok(())
 }

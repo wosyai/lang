@@ -2426,7 +2426,10 @@ fn emit_function<'ctx, 'module>(
         next_block: 0,
     };
     if let Some(call) = array_descriptor_forward {
-        return aggregate_transfer::emit_array_descriptor_forward(context, &state, value, function, call);
+        return aggregate_transfer::emit_array_descriptor_forward(context, &state, value, function, call, false);
+    }
+    if let Some(call) = aggregate_plan.and_then(|plan| plan.borrowed_extent_forward) {
+        return aggregate_transfer::emit_array_descriptor_forward(context, &state, value, function, call, true);
     }
     initialize_joined_return_bindings(context, &mut state, joined_bindings)?;
     if let ScalarType::Callable { parameters, .. } = &function.signature {
@@ -2785,7 +2788,10 @@ fn emit_project_function<'ctx, 'module>(
         next_block: 0,
     };
     if let Some(call) = array_descriptor_forward {
-        return aggregate_transfer::emit_array_descriptor_forward(context, &state, value, function, call);
+        return aggregate_transfer::emit_array_descriptor_forward(context, &state, value, function, call, false);
+    }
+    if let Some(call) = aggregate_plan.and_then(|plan| plan.borrowed_extent_forward) {
+        return aggregate_transfer::emit_array_descriptor_forward(context, &state, value, function, call, true);
     }
     initialize_joined_return_bindings(context, &mut state, joined_bindings)?;
     if let ScalarType::Callable { parameters, .. } = &function.signature {

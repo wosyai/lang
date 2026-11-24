@@ -4956,6 +4956,18 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     let value_point = self.cursor.expect("evaluated output expression");
                     self.move_value(expression, scope, ordinal)?;
                     if let BlockItemKind::FinalOutput(slot) = kind {
+                        if scope == ReferenceScopeId(0) && slot.output == 0 && region.items.len() == 1
+                            && matches!(calls.boundary.root_outputs.as_slice(), [output] if output.ty == ScalarType::U64)
+                            && matches!(calls.boundary.parameters.as_slice(), [formal]
+                                if matches!(&formal.ty, ScalarType::CheckedReference {
+                                    mutability: ScalarReferenceMutability::Shared, inner,
+                                } if matches!(inner.as_ref(), ScalarType::RuntimeArray { .. })))
+                            && !calls.declared_unsafe_calls.contains(&slot.expression.0)
+                            && matches!(&self.cfg.points[value_point.0].kind, CfgPointKind::Call { output: 0,
+                                target: ResolvedCallTarget::ModuleCallable { concrete: ConcreteCallSelection::Declaration, .. }, .. })
+                        {
+                            self.aggregate_facts.borrowed_extent_forward = Some((value_point, slot.expression));
+                        }
                         if scope == ReferenceScopeId(0) && slot.output == 0
                             && matches!(calls.boundary.root_outputs.as_slice(), [output] if output.ty == ScalarType::U64)
                             && !calls.declared_unsafe_calls.contains(&slot.expression.0)
@@ -16531,6 +16543,7 @@ fn build_function_reference_cfg(
     }
     aggregate.borrowed_extent_observer = builder.aggregate_facts.borrowed_extent_observer;
     aggregate.borrowed_extent_call = builder.aggregate_facts.borrowed_extent_call;
+    aggregate.borrowed_extent_forward = builder.aggregate_facts.borrowed_extent_forward;
     aggregate.array_formal_extent_required = !builder.aggregate_facts.array_formal_extent_borrows.is_empty();
     aggregate.literal_array_extent_required = builder.aggregate_facts.literal_array_extent_output
         .map(|(_, occurrence)| occurrence);

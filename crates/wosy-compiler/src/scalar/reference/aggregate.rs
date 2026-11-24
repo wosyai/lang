@@ -64,6 +64,7 @@ pub(super) struct AggregateFlowFacts {
     pub(super) conditional_array_return: Option<ConditionalArrayReturn>,
     pub(super) array_installs: BTreeMap<CfgPointId, OccurrenceOrdinal>,
     pub(super) borrowed_extent_observer: Option<(CfgPointId, OccurrenceOrdinal, ByteSpan)>,
+    pub(super) borrowed_extent_forward: Option<(CfgPointId, OccurrenceOrdinal)>,
     pub(super) borrowed_extent_call: Option<(CfgPointId, OccurrenceOrdinal, ByteSpan, Option<ByteSpan>)>,
     pub(super) array_formal_extent_borrows: BTreeSet<CfgPointId>,
     pub(super) neutral_array_calls: BTreeSet<CfgPointId>,
@@ -1255,6 +1256,7 @@ pub(super) struct AggregateFlowResult {
     pub(super) array_invalid: bool,
     pub(super) array_neutral: bool,
     pub(super) borrowed_extent_observer: Option<(CfgPointId, OccurrenceOrdinal, ByteSpan)>,
+    pub(super) borrowed_extent_forward: Option<(CfgPointId, OccurrenceOrdinal)>,
     pub(super) borrowed_extent_call: Option<(CfgPointId, OccurrenceOrdinal, ByteSpan, Option<ByteSpan>)>,
     pub(super) array_formal_extent_required: bool,
     array_conditional_forwarded: bool,
@@ -1490,7 +1492,7 @@ impl AggregateFlowResult {
     }
 
     pub(super) fn has_observations(&self) -> bool {
-        self.borrowed_extent_observer.is_some() || self.borrowed_extent_call.is_some()
+        self.borrowed_extent_observer.is_some() || self.borrowed_extent_call.is_some() || self.borrowed_extent_forward.is_some()
             || self.array_formal_extent_required || self.literal_array_index_required.is_some() || self.literal_array_extent_required.is_some() || self.proved_literal_array_route_ref().is_some()
             || (self.checked_producer_authoritative && !self.checked_producer_backing.is_empty())
             || self.checked_backing_assignment.is_some() || self.checked_backing_forward.is_some()
@@ -2954,6 +2956,7 @@ pub(crate) struct ClosedBody {
     pub(crate) replacement_extent_observation: Option<usize>,
     pub(crate) array_descriptor_return: bool,
     pub(crate) borrowed_extent_observer: Option<(usize, ByteSpan)>,
+    pub(crate) borrowed_extent_forward: Option<usize>,
     pub(crate) borrowed_extent_call: Option<(usize, ByteSpan, Option<ByteSpan>)>,
     pub(crate) array_descriptor_identity: bool,
     pub(crate) array_descriptor_observer: Option<ByteSpan>,
@@ -5841,15 +5844,48 @@ fn seal_array_descriptor_identities(
         candidates.insert((caller, ordinal.0), (target, binding.declaration_span, destination.0, observation.0));
     }
     if candidates.is_empty() { return; }
+    let sealed = closed_descriptor_routes(ordinary, declarations, routes, bodies, result, |route| match *route {
+        ArrayDescriptorRoute::Identity(_) => None,
+        ArrayDescriptorRoute::Forward { call, point } => Some((call, point)),
+    }, |caller, call| candidates.get(&(caller, call)).map(|(target, ..)| *target));
+    for key in sealed {
+        let definition = result.bodies.entry(key).or_default();
+        definition.array_descriptor_identity = true;
+        match routes[&key] {
+            ArrayDescriptorRoute::Identity(observer) => definition.array_descriptor_observer = observer,
+            ArrayDescriptorRoute::Forward { call, .. } => definition.array_descriptor_forward = Some(call.0),
+        }
+        let uses = ordinary.array_uses[&key].as_ref().expect("complete descriptor call census");
+        for &(caller, call) in uses {
+            if let Some(&(_, binding, destination, observation)) = candidates.get(&(caller, call)) {
+                let plan = result.bodies.entry(caller).or_default();
+                plan.same_array_rebinds.insert(call, destination);
+                plan.array_descriptor_rebinds.insert(call, (binding, destination));
+                plan.array_descriptor_calls.insert(call);
+                plan.replacement_extent_observation = Some(observation);
+            }
+        }
+    }
+}
+
+fn closed_descriptor_routes<Route>(
+    ordinary: &OrdinaryCohorts,
+    declarations: &HashMap<(&SourceIdentity, ByteSpan), (usize, usize)>,
+    routes: &BTreeMap<BodyKey, Route>,
+    bodies: &BTreeMap<BodyKey, Body<'_>>,
+    result: &ClosedAggregates,
+    forward: impl Fn(&Route) -> Option<(OccurrenceOrdinal, CfgPointId)>,
+    caller_target: impl Fn(BodyKey, usize) -> Option<BodyKey>,
+) -> Vec<BodyKey> {
     // Each wrapper has at most one outgoing edge. A connected component
-    // with an identity leaf therefore cannot contain a forwarding cycle.
+    // with a terminal descriptor leaf cannot contain a forwarding cycle.
     // Count exact census admissions while walking incoming edges once, so
     // many wrappers sharing one leaf do not rescan that leaf's uses.
     let mut edges = HashMap::new();
     let mut neighbors = HashMap::<_, Vec<_>>::new();
     for (&key, route) in routes {
-        if let ArrayDescriptorRoute::Forward { call, point } = route {
-            if let Some(target) = target_body(declarations, bodies[&key].cfg, *point)
+        if let Some((call, point)) = forward(route) {
+            if let Some(target) = target_body(declarations, bodies[&key].cfg, point)
                 .filter(|target| routes.contains_key(target))
             {
                 edges.insert(key, (target, call.0));
@@ -5858,6 +5894,7 @@ fn seal_array_descriptor_identities(
         }
     }
     let mut visited = HashSet::new();
+    let mut sealed = Vec::new();
     for &start in routes.keys() {
         if !visited.insert(start) { continue }
         let mut component = Vec::new();
@@ -5870,9 +5907,9 @@ fn seal_array_descriptor_identities(
         while let Some(key) = pending.pop() {
             component.push(key);
             closed &= !result.bodies.contains_key(&key);
-            match routes[&key] {
-                ArrayDescriptorRoute::Identity(_) => grounded = true,
-                ArrayDescriptorRoute::Forward { .. } => {
+            match forward(&routes[&key]) {
+                None => grounded = true,
+                Some(_) => {
                     if let Some(&(target, _)) = edges.get(&key) {
                         expected_forwards += 1;
                         if visited.insert(target) { pending.push(target); }
@@ -5888,7 +5925,7 @@ fn seal_array_descriptor_identities(
             }
             if let Some(uses) = ordinary.array_uses.get(&key).and_then(Option::as_ref).filter(|uses| !uses.is_empty()) {
                 for &(caller, call) in uses {
-                    if candidates.get(&(caller, call)).is_some_and(|(target, ..)| *target == key) {
+                    if caller_target(caller, call) == Some(key) {
                         has_local = true;
                     } else {
                         if edges.get(&caller) == Some(&(key, call)) {
@@ -5903,32 +5940,23 @@ fn seal_array_descriptor_identities(
             }
         }
         if !(closed && grounded && has_local && admitted_forwards.len() == expected_forwards) { continue }
-        for key in component {
-            let definition = result.bodies.entry(key).or_default();
-            definition.array_descriptor_identity = true;
-            match routes[&key] {
-                ArrayDescriptorRoute::Identity(observer) => definition.array_descriptor_observer = observer,
-                ArrayDescriptorRoute::Forward { call, .. } => definition.array_descriptor_forward = Some(call.0),
-            }
-            let uses = ordinary.array_uses[&key].as_ref().expect("complete descriptor call census");
-            for &(caller, call) in uses {
-                if let Some(&(_, binding, destination, observation)) = candidates.get(&(caller, call)) {
-                    let plan = result.bodies.entry(caller).or_default();
-                    plan.same_array_rebinds.insert(call, destination);
-                    plan.array_descriptor_rebinds.insert(call, (binding, destination));
-                    plan.array_descriptor_calls.insert(call);
-                    plan.replacement_extent_observation = Some(observation);
-                }
-            }
-        }
+        sealed.extend(component);
     }
+    sealed
+}
+
+#[derive(Clone, Copy)]
+enum BorrowedExtentRoute {
+    Observer(OccurrenceOrdinal, ByteSpan),
+    Forward(OccurrenceOrdinal, CfgPointId),
 }
 
 fn seal_borrowed_extent_observers(
     ordinary: &OrdinaryCohorts,
-    observations: &BTreeMap<BodyKey, (OccurrenceOrdinal, ByteSpan)>,
+    observations: &BTreeMap<BodyKey, BorrowedExtentRoute>,
     callers: &[(BodyKey, &Body<'_>, (CfgPointId, OccurrenceOrdinal, ByteSpan, Option<ByteSpan>))],
     declarations: &HashMap<(&SourceIdentity, ByteSpan), (usize, usize)>,
+    bodies: &BTreeMap<BodyKey, Body<'_>>,
     result: &mut ClosedAggregates,
     checked_access: bool,
 ) {
@@ -5939,20 +5967,54 @@ fn seal_borrowed_extent_observers(
             sites.insert((caller, occurrence.0), (target, declaration, alias));
         }
     }
-    for (&target, &(observation, formal)) in observations {
-        let Some(uses) = ordinary.array_uses.get(&target).and_then(Option::as_ref).filter(|uses| !uses.is_empty())
-        else { continue };
-        if result.bodies.contains_key(&target)
-            || !uses.iter().all(|use_site| sites.get(use_site).is_some_and(|(key, ..)| *key == target))
-        {
-            continue;
+    if sites.is_empty() { return; }
+    let sealed = closed_descriptor_routes(ordinary, declarations, observations, bodies, result, |route| match *route {
+        BorrowedExtentRoute::Observer(..) => None,
+        BorrowedExtentRoute::Forward(call, point) => Some((call, point)),
+    }, |caller, call| sites.get(&(caller, call)).map(|(target, ..)| *target));
+    for target in sealed {
+        let definition = result.bodies.entry(target).or_default();
+        match observations[&target] {
+            BorrowedExtentRoute::Observer(observation, formal) =>
+                definition.borrowed_extent_observer = Some((observation.0, formal)),
+            BorrowedExtentRoute::Forward(call, _) =>
+                definition.borrowed_extent_forward = Some(call.0),
         }
-        result.bodies.entry(target).or_default().borrowed_extent_observer = Some((observation.0, formal));
-        for &(caller, call) in uses {
-            let (_, owner, alias) = sites[&(caller, call)];
-            result.bodies.entry(caller).or_default().borrowed_extent_call = Some((call, owner, alias));
+        for &(caller, call) in ordinary.array_uses[&target].as_ref().expect("complete borrowed extent census") {
+            if let Some(&(_, owner, alias)) = sites.get(&(caller, call)) {
+                result.bodies.entry(caller).or_default().borrowed_extent_call = Some((call, owner, alias));
+            }
         }
     }
+}
+
+fn exact_borrowed_extent_forward(body: &Body<'_>, point: CfgPointId, call: OccurrenceOrdinal) -> bool {
+    let [formal] = body.sites.boundary.parameters.as_slice() else { return false };
+    let points = &body.cfg.initial_points;
+    let Some(signature) = body.sites.checked_call_signatures.get(&call) else { return false };
+    let [ty] = signature.parameters.as_slice() else { return false };
+    if !body.is_monomorphic || points.len() > 8 || body.sites.declared_unsafe_calls.contains(&call.0)
+        || !matches!((&formal.ty, ty), (
+            ScalarType::CheckedReference { mutability: ScalarReferenceMutability::Shared, inner: source },
+            ScalarType::CheckedReference { mutability: ScalarReferenceMutability::Shared, inner: destination },
+        ) if same_runtime_array_type(source, destination))
+        || !matches!(signature.outputs.outputs.as_slice(), [output] if output.ty == ScalarType::U64)
+    {
+        return false;
+    }
+    let Some(ReferenceFlowPoint { kind: CfgPointKind::Call { output: 0, target: ResolvedCallTarget::ModuleCallable {
+        concrete: ConcreteCallSelection::Declaration, ..
+    }, argument_points, .. }, successors, .. }) = points.get(point.0) else { return false };
+    let ([read], [output]) = (argument_points.as_slice(), successors.as_slice()) else { return false };
+    let CfgPointKind::Read { binding } = &points[read.0].kind else { return false };
+    binding.declaration_span == formal.span && points[read.0].successors.as_slice() == [point]
+        && matches!(points[output.0].kind, CfgPointKind::ReturnOutput { output: 0, value_point, checked: false } if value_point == point)
+        && points.iter().all(|current| match &current.kind {
+            CfgPointKind::Entry | CfgPointKind::ScopeEnter | CfgPointKind::ScopeExit | CfgPointKind::Return => true,
+            CfgPointKind::Bind { binding: actual } => actual == binding
+                && points[0].successors.as_slice() == [current.id] && current.scope == ReferenceScopeId(0),
+            _ => [*read, point, *output].contains(&current.id),
+        })
 }
 
 fn exact_borrowed_extent_observer(body: &Body<'_>, point: CfgPointId, call: OccurrenceOrdinal) -> bool {
@@ -6470,7 +6532,12 @@ fn closed_aggregates<'a>(
                 if let Some((_, observation, formal)) = facts.and_then(|facts| facts.borrowed_extent_observer)
                     .filter(|(point, call, _)| exact_borrowed_extent_observer(&body, *point, *call))
                 {
-                    borrowed_extent_observers.insert(key, (observation, formal));
+                    borrowed_extent_observers.insert(key, BorrowedExtentRoute::Observer(observation, formal));
+                    ordinary.array_uses.entry(key).or_insert_with(|| Some(Vec::new()));
+                } else if let Some((point, call)) = facts.and_then(|facts| facts.borrowed_extent_forward)
+                    .filter(|(point, call)| exact_borrowed_extent_forward(&body, *point, *call))
+                {
+                    borrowed_extent_observers.insert(key, BorrowedExtentRoute::Forward(call, point));
                     ordinary.array_uses.entry(key).or_insert_with(|| Some(Vec::new()));
                 }
                 if let Some(route) = array_descriptor_route(&body) {
@@ -6889,7 +6956,7 @@ fn closed_aggregates<'a>(
         seal_array_descriptor_identities(&ordinary, &returned_extent_requirements,
             &declarations, &array_descriptor_identities, &bodies, &mut result);
         seal_borrowed_extent_observers(&ordinary, &borrowed_extent_observers, &borrowed_extent_callers,
-            &declarations, &mut result, reservations.checked_access);
+            &declarations, &bodies, &mut result, reservations.checked_access);
         for &(key, source) in &borrowed_extent_requirements {
             if !result.bodies.get(&key).is_some_and(|plan| plan.borrowed_extent_observer.is_some()) {
                 return Err(format!("core.array_len requires a closed checked borrowed runtime extent in {source:?}"));

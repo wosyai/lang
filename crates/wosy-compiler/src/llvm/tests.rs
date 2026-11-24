@@ -11716,6 +11716,8 @@ fn direct_shared_runtime_array_borrow_transports_one_exact_extent() {
     let source = SourceIdentity::new("project".into(), "package".into(), "src/borrowed_runtime_extent.w".into(), "r1".into());
     let text = "%%start
 u64(*(u8[])) extent = fn(view) { core.array_len(&(*view)) };
+u64(*(u8[])) relay_one = fn(view) { extent(view) };
+u64(*(u8[])) relay_two = fn(view) { relay_one(view) };
 u64(u64) observe = fn(count) {
     u8[count] bytes;
     extent(&bytes)
@@ -11724,7 +11726,7 @@ u64(u64) via_aliases = fn(count) {
     u8[count] bytes;
     *(u8[]) first = &bytes;
     *(u8[]) second = first;
-    extent(second)
+    relay_two(second)
 };
 if (observe(2) != 2) { core.system_panic(); };
 if (via_aliases(7) != 7) { core.system_panic(); };
@@ -11733,7 +11735,7 @@ if (via_aliases(7) != 7) { core.system_panic(); };
     u8[count] bytes;
     *(u8[]) alias = &bytes;
     count;
-    extent(alias)
+    relay_one(alias)
 };
 if (not_exact(3) != 3) { core.system_panic(); };
 if (observe(2)");
@@ -11769,8 +11771,19 @@ if (observe(2)");
             assert!(body.find(guard).unwrap() < body.find("ret i64 %borrowed_array_extent").expect("full incoming extent"), "{body}");
             assert!(!body.contains("deref_is_null") && !body.contains("inttoptr")
                 && !body.contains("getelementptr") && !body.contains("@__wosy_core_free"), "{body}");
-            let call = format!("call i64 @{target}({paired} %borrowed_array_argument)");
-            for named in ["observe", "via_aliases"] {
+            for (relay, next) in [("relay_two", "relay_one"), ("relay_one", "extent")] {
+                let relay = project_function_name(&source, relay);
+                let next = project_function_name(&source, next);
+                let relay = llvm.split_once(&format!("define internal i64 @{relay}({paired} %view)"))
+                    .expect("same checked borrowed descriptor signature").1.split_once("\n}").unwrap().0;
+                assert_eq!(relay.matches(&format!("%array_forward = call i64 @{next}({paired} %view)")).count(), 1, "{relay}");
+                assert!(relay.contains("ret i64 %array_forward"), "{relay}");
+                assert!(!relay.contains("extractvalue") && !relay.contains("insertvalue")
+                    && !relay.contains("call void") && !relay.contains("getelementptr"), "{relay}");
+            }
+            for (named, next) in [("observe", "extent"), ("via_aliases", "relay_two")] {
+                let next = project_function_name(&source, next);
+                let call = format!("call i64 @{next}({paired} %borrowed_array_argument)");
                 let caller = self_tail_test_body(&llvm, "i64", &project_function_name(&source, named));
                 assert_eq!(caller.matches(&call).count(), 1, "{caller}");
                 assert_eq!(caller.matches("call void @__wosy_core_free(").count(), 1, "{caller}");
