@@ -1056,6 +1056,18 @@ enum AffineAppend {
     Member { anchor: usize, transform: Rc<IntegerAffineTransform> },
 }
 
+enum EqualOverwrite {
+    Unchanged,
+    RemoveAlias(usize),
+    Promote { index: usize, axis: usize },
+}
+
+#[cfg(feature = "internal-checker")]
+enum AffineOverwrite {
+    Unchanged,
+    Replace(Option<Rc<IntegerAffineAxes>>),
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct IntegerRow {
     cells: Vec<Rc<IntegerSet>>,
@@ -1239,32 +1251,106 @@ impl IntegerRow {
         })
     }
 
-    fn overwrite(&mut self, axis: usize, domain: Rc<IntegerSet>, preserve_entry: bool) {
-        let tracks_axis = (preserve_entry && self.entry.is_none())
-            || matches!(self.entry.as_deref(), Some(ProjectedEntry::Linked(root)) if *root == axis);
-        let mut replacement_root = None;
-        if let Some(equality) = &mut self.equal_axes {
-            if let Ok(member) = equality.binary_search_by_key(&axis, |(alias, _)| *alias) {
-                Rc::make_mut(equality).remove(member);
-            } else if let Some(root) = equality.iter().position(|&(_, root)| root == axis) {
-                let equality = Rc::make_mut(equality);
-                let (promoted, _) = equality.remove(root);
-                replacement_root = Some(promoted);
-                for (_, root) in &mut equality[root..] {
-                    if *root == axis {
-                        *root = promoted;
-                    }
-                }
-            }
-            if equality.is_empty() {
-                self.equal_axes = None;
-            }
+    fn equal_overwrite(&self, axis: usize) -> EqualOverwrite {
+        let Some(equality) = &self.equal_axes else { return EqualOverwrite::Unchanged; };
+        if let Ok(index) = equality.binary_search_by_key(&axis, |(alias, _)| *alias) {
+            EqualOverwrite::RemoveAlias(index)
+        } else if let Some(index) = equality.iter().position(|&(_, root)| root == axis) {
+            EqualOverwrite::Promote { index, axis: equality[index].0 }
+        } else {
+            EqualOverwrite::Unchanged
         }
-        if tracks_axis {
+    }
+
+    fn tracks_overwrite(&self, axis: usize, preserve_entry: bool) -> bool {
+        (preserve_entry && self.entry.is_none())
+            || matches!(self.entry.as_deref(), Some(ProjectedEntry::Linked(root)) if *root == axis)
+    }
+
+    fn overwrite_prepared(&mut self, axis: usize, domain: Rc<IntegerSet>, preserve_entry: bool, equal: EqualOverwrite) {
+        let replacement_root = match equal {
+            EqualOverwrite::Unchanged => None,
+            EqualOverwrite::RemoveAlias(index) => {
+                let equality = Rc::make_mut(self.equal_axes.as_mut().expect("prepared alias"));
+                equality.remove(index);
+                if equality.is_empty() { self.equal_axes = None; }
+                None
+            }
+            EqualOverwrite::Promote { index, axis: promoted } => {
+                let equality = Rc::make_mut(self.equal_axes.as_mut().expect("prepared alias promotion"));
+                equality.remove(index);
+                for (_, root) in &mut equality[index..] {
+                    if *root == axis { *root = promoted; }
+                }
+                if equality.is_empty() { self.equal_axes = None; }
+                Some(promoted)
+            }
+        };
+        if self.tracks_overwrite(axis, preserve_entry) {
             self.entry = Some(Rc::new(replacement_root.map_or_else(
                 || ProjectedEntry::Detached(Rc::clone(&self.cells[axis])), ProjectedEntry::Linked)));
         }
         self.cells[axis] = domain;
+    }
+
+    fn overwrite(&mut self, axis: usize, domain: Rc<IntegerSet>, preserve_entry: bool) {
+        self.overwrite_prepared(axis, domain, preserve_entry, self.equal_overwrite(axis));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    fn prepare_affine_overwrite(
+        &self, axis: usize, preserve_entry: bool, work: &mut usize,
+    ) -> Option<(EqualOverwrite, AffineOverwrite)> {
+        let aliases = self.equal_axes().len();
+        charge_call_work(work, aliases.checked_add(1)?)?;
+        let equal = self.equal_overwrite(axis);
+        if !matches!(&equal, EqualOverwrite::Unchanged) {
+            // Copy-on-write, removal and possible retargeting of the group.
+            charge_call_work(work, aliases.checked_mul(3)?)?;
+        }
+        let Some(class) = self.affine.as_deref().filter(|class| class.contains(axis)) else {
+            // A destination alias is not itself a class endpoint. Detaching it
+            // leaves the pre-write class and its other aliases unchanged.
+            return Some((equal, AffineOverwrite::Unchanged));
+        };
+        let promoted = match &equal {
+            EqualOverwrite::Promote { axis, .. } => Some(*axis),
+            _ => None,
+        };
+        if promoted.is_none() && self.tracks_overwrite(axis, preserve_entry) {
+            // No distinct lexical snapshot denotes the old projected formal.
+            // A detached marginal cannot prove correlation with surviving values.
+            return None;
+        }
+        let survivors = class.members.len().checked_add(usize::from(promoted.is_some()))?;
+        if survivors <= 1 {
+            return Some((equal, AffineOverwrite::Replace(None)));
+        }
+        // At most MAX_AFFINE_MEMBERS+1 endpoints; pay for the list,
+        // ordering, one inverse, and at most one composition per endpoint.
+        let order_levels = usize::BITS - survivors.leading_zeros();
+        charge_call_work(work, survivors.checked_mul(4 + order_levels as usize)?.checked_add(2)?)?;
+        let mut ordered: Vec<_> = std::iter::once(class.anchor)
+            .chain(class.members.iter().map(|(member, _)| *member))
+            .filter_map(|old_axis| {
+                if old_axis == axis {
+                    promoted.map(|new_axis| (new_axis, old_axis))
+                } else {
+                    Some((old_axis, old_axis))
+                }
+            }).collect();
+        ordered.sort_unstable_by_key(|&(new_axis, _)| new_axis);
+        let ((anchor, old_anchor), members) = ordered.split_first()?;
+        let inverse = if *old_anchor == class.anchor { None } else { Some(Rc::new(class.member(*old_anchor)?.inverse())) };
+        let members = members.iter().map(|&(new_axis, old_axis)| {
+            let transform = match &inverse {
+                None => Rc::clone(class.member(old_axis)?),
+                Some(inverse) if old_axis == class.anchor => Rc::clone(inverse),
+                Some(inverse) => Rc::new(class.member(old_axis)?.compose(inverse)),
+            };
+            Some((new_axis, transform))
+        }).collect::<Option<Vec<_>>>()?;
+        Some((equal, AffineOverwrite::Replace(Some(Rc::new(IntegerAffineAxes { anchor: *anchor, members })))))
     }
 
     fn truncate(&mut self, depth: usize) {
@@ -1318,6 +1404,8 @@ struct IntegerRoots<'a> {
     affine_work: Option<usize>,
     #[cfg(feature = "internal-checker")]
     allow_ordinary_integer_locals: bool,
+    #[cfg(feature = "internal-checker")]
+    allow_ordinary_affine_overwrites: bool,
     #[cfg(feature = "internal-checker")]
     ordinary_local_work: Option<usize>,
     reached_obligation: bool,
@@ -1675,6 +1763,20 @@ impl IntegerInputs {
             return self;
         }
         Self::compact_axis(self.0, axis)
+    }
+
+    #[cfg(feature = "internal-checker")]
+    fn overwrite_affine(&mut self, axis: usize, value: &Rc<IntegerSet>, preserve_entry: bool, work: &mut usize) -> Option<()> {
+        for row in &mut self.0 {
+            let (equal, affine) = row.prepare_affine_overwrite(axis, preserve_entry, work)?;
+            row.overwrite_prepared(axis, Rc::clone(value), preserve_entry, equal);
+            if let AffineOverwrite::Replace(new) = affine {
+                row.affine = new;
+            }
+        }
+        // Keep source row order even if rewriting a row makes a relation
+        // disappear. Captured/anchored failure structure must not coalesce.
+        Some(())
     }
 
     fn append_local(&mut self, values: IntegerSet) {
@@ -3537,6 +3639,8 @@ fn run_integer_callable<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool,
         proof_reflexive_branches,
         #[cfg(feature = "internal-checker")]
         allow_ordinary_integer_locals: Authored::ALLOW_ORDINARY_INTEGER_LOCALS,
+        #[cfg(feature = "internal-checker")]
+        allow_ordinary_affine_overwrites: Authored::ALLOW_ORDINARY_INTEGER_LOCALS,
         ..IntegerRoots::default()
     };
     for (binding, parameter) in checker_parameters.iter().zip(&boundary.parameters) {
@@ -4048,10 +4152,27 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
             BlockItemKind::Assignment { group } => {
                 let allow_contextual_local_transfers = || COLLECT && !USE_IMPORTED_BOUND
                     && failures.as_deref().is_some_and(|failure| failure.allow_contextual_local_transfers);
-                let (axis, value) = integer_assignment(calls, roots, group, &path, allow_contextual_local_transfers)?;
+                let (axis, value, rhs, destination) = integer_assignment(calls, roots, group, &path, allow_contextual_local_transfers)?;
+                #[cfg(not(feature = "internal-checker"))]
+                let _ = (rhs, destination);
                 let preserve_entry = roots.projected_entry_axis == Some(axis);
-                if roots.affine_work.is_some() && path.0.iter().any(|row| row.affine_touches(axis)) {
-                    return None;
+                if let Some(work) = &mut roots.affine_work {
+                    if path.0.iter().any(|row| row.affine_touches(axis)) {
+                        #[cfg(feature = "internal-checker")]
+                        {
+                            if !roots.allow_ordinary_affine_overwrites
+                                || (axis < roots.parameters && roots.unit_pair_work.is_some())
+                                || !structure.checker_integer_literals.contains_key(&rhs)
+                                || structure.checker_contextual_occurrences.contains(&destination)
+                            {
+                                return None;
+                            }
+                            path.overwrite_affine(axis, &value, preserve_entry, work)?;
+                            continue;
+                        }
+                        #[cfg(not(feature = "internal-checker"))]
+                        { let _ = work; return None; }
+                    }
                 }
                 if axis < roots.parameters && !preserve_entry && path.axis_has_alias(axis) {
                     return None;
@@ -4657,7 +4778,10 @@ impl<'a> ExactCallCursor<'a> {
         sink: &mut dyn FnMut(IntegerCheckFailure<'a>),
     ) -> Option<ExactCallProgress<'a>> {
         #[cfg(feature = "internal-checker")]
-        { self.roots.allow_ordinary_integer_locals = allow_ordinary_integer_locals && !calls.structure.checker_ordinary_integer_locals.is_empty(); }
+        {
+            self.roots.allow_ordinary_integer_locals = allow_ordinary_integer_locals && !calls.structure.checker_ordinary_integer_locals.is_empty();
+            self.roots.allow_ordinary_affine_overwrites = allow_ordinary_integer_locals;
+        }
         #[cfg(not(feature = "internal-checker"))]
         let _ = allow_ordinary_integer_locals;
         let mut failures = IntegerFailureCollection {
@@ -4934,7 +5058,7 @@ fn integer_assignment(
     position: BlockPosition,
     path: &IntegerInputs,
     allow_contextual_local_transfers: impl FnOnce() -> bool,
-) -> Option<(usize, Rc<IntegerSet>)> {
+) -> Option<(usize, Rc<IntegerSet>, OccurrenceOrdinal, OccurrenceOrdinal)> {
     let (binding, replacement, rhs, destination) = checked_scalar_assignment(calls, position)?;
     let (axis, ty) = roots.lookup(binding)?;
     let value = if let Some(value) = calls.structure.checker_integer_literals.get(&rhs) {
@@ -4952,7 +5076,7 @@ fn integer_assignment(
         }
         Rc::clone(path.singleton_axis(source)?.1)
     };
-    (ty == replacement).then_some((axis, value))
+    (ty == replacement).then_some((axis, value, rhs, destination))
 }
 
 #[cfg(feature = "internal-checker")]
@@ -5088,6 +5212,44 @@ fn affine_class_cap_allows_identity_alias_and_releases_truncated_members() {
     row.truncate(MAX_AFFINE_MEMBERS);
     assert_eq!(row.affine.as_ref().unwrap().members.len(), MAX_AFFINE_MEMBERS - 1);
     assert_eq!(row.test_append_affine(0, next), Some(()));
+}
+
+#[cfg(feature = "internal-checker")]
+#[test]
+fn affine_overwrite_reanchors_a_promoted_old_anchor_behind_members() {
+    let domain = IntegerSet::from_type(&ScalarType::U8).unwrap()
+        .keep(&BinaryOperator::LessEqual, &4.into()).unwrap();
+    let mut row = IntegerRow::new(vec![Rc::new(domain)]);
+    row.test_append_affine(0, Rc::new(IntegerAffineTransform { reflected: true, offset: 4.into() })).unwrap();
+    row.test_append_affine(1, Rc::new(IntegerAffineTransform { reflected: false, offset: 1.into() })).unwrap();
+    row.append_alias(0, Rc::clone(&row[0]));
+    let mut inputs = IntegerInputs(vec![row]);
+    let mut work = 0;
+    inputs.overwrite_affine(0, &Rc::new(IntegerSet::singleton(&7.into())), true, &mut work).unwrap();
+    assert_eq!(inputs.0[0].affine.as_ref().unwrap().anchor, 1);
+    assert_eq!(inputs.0[0].entry.as_deref(), Some(&ProjectedEntry::Linked(3)));
+    inputs.restrict_axis(2, &IntegerSet::singleton(&2.into()));
+    assert!(inputs.includes_signed(&[7, 1, 2, 3]));
+    assert!(!inputs.includes_signed(&[7, 1, 2, 0]));
+    assert_eq!(inputs.0[0].entry_domain(0).singleton_value(), Some(&3.into()));
+    inputs.0[0].truncate(2);
+    assert!(inputs.0[0].affine.is_none());
+    assert_eq!(inputs.0[0].entry_domain(0).singleton_value(), Some(&3.into()));
+}
+
+#[cfg(feature = "internal-checker")]
+#[test]
+fn affine_overwrite_fails_closed_without_a_projected_snapshot_or_budget() {
+    let domain = IntegerSet::from_type(&ScalarType::U8).unwrap()
+        .keep(&BinaryOperator::LessEqual, &4.into()).unwrap();
+    let mut row = IntegerRow::new(vec![Rc::new(domain)]);
+    row.test_append_affine(0, Rc::new(IntegerAffineTransform { reflected: true, offset: 4.into() })).unwrap();
+    let mut available = 0;
+    assert!(row.prepare_affine_overwrite(0, true, &mut available).is_none());
+    let mut exhausted = MAX_PARTITION_TRANSFER_WORK;
+    assert!(row.prepare_affine_overwrite(0, false, &mut exhausted).is_none());
+    assert_eq!(row.affine.as_ref().unwrap().anchor, 0);
+    assert!(row.entry.is_none());
 }
 
 #[test]

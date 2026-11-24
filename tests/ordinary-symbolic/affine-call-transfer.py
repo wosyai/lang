@@ -246,7 +246,7 @@ startup_copy = f"""%%start
 affine_write = make(f"""
     i8 saved = value;
     value = 7;
-    core.require(saved == 7, {report(61,"AFFINE-WRITE")});
+    if (input == 1) {{ core.require(saved == 3, {report(61,"AFFINE-WRITE")}); }};
     core.require(value == 7, {report(62,"CURRENT")});
 """)
 for name,program,correct,incorrect,code,label in [
@@ -259,7 +259,8 @@ for name,program,correct,incorrect,code,label in [
     cases.extend([(name,program,0,b""),(name+"-witness",program.replace(correct,incorrect),code,label)])
 cases.extend([
     ("exact-startup-lexical-copy",startup_copy,60,b"STARTUP"),
-    ("affine-member-rebind-stays-unsupported",affine_write,2,b"unsupported analysis"),
+    ("overwrite-affine-call-result",affine_write,0,b""),
+    ("overwrite-affine-call-result-witness",affine_write.replace("saved == 3","saved == 7"),61,b"AFFINE-WRITE"),
     ("unguarded-inline-overflow",standalone_return.replace("copy = entry;", "copy = entry + 1;"),2,b"unsupported analysis"),
 ])
 def bounds(axis, low, high):
@@ -345,6 +346,67 @@ cases.extend([
     ("inline-nonlinear-remains-unsupported",inline_return.replace("entry - 1","entry * 1"),2,b"unsupported analysis"),
     ("inline-two-broad-operands-remain-unsupported",inline_two_broad,2,b"unsupported analysis"),
     ("inline-unrelated-second-class-remains-unsupported",inline_second_class,2,b"unsupported analysis"),
+])
+overwrite_member = f"""%%start
+    unit(i8) transform = fn(entry) {{
+        {bounds("entry",0,4)}
+        i8 first = 4 - entry;
+        i8 second = first + 1;
+        i8 saved = first;
+        first = 7;
+        core.require(first == 7, {report(75,"NEW-MEMBER")});
+        if (second == 2) {{
+            core.require(saved == 1, {report(76,"OLD-MEMBER")});
+            core.require(entry == 3, {report(77,"OTHER-MEMBER")});
+        }};
+    }};
+    %%end"""
+overwrite_anchor = f"""%%start
+    unit(i8) transform = fn(entry) {{
+        {bounds("entry",0,4)}
+        i8 first = 4 - entry;
+        i8 second = first + 1;
+        entry = 7;
+        core.require(entry == 7, {report(78,"NEW-ANCHOR")});
+        if (second == 2) {{ core.require(first == 1, {report(79,"REANCHOR")}); }};
+    }};
+    %%end"""
+overwrite_anchor_alias = overwrite_anchor.replace(
+    "entry = 7;", "i8 saved = entry;\n        entry = 7;").replace(
+    "core.require(first == 1", f'core.require(saved == 3, {report(80,"OLD-ANCHOR")}); core.require(first == 1')
+overwrite_alias = overwrite_member.replace("first = 7;", "saved = 7;").replace(
+    "core.require(first == 7", "core.require(saved == 7").replace(
+    "core.require(saved == 1", "core.require(first == 1")
+projected_snapshot = f"""%%start
+    unit(i8) gate = fn(entry) {{
+        if (entry < 5) {{
+            i8 saved = entry;
+            i8 flipped = 4 - entry;
+            entry = 7;
+            core.require(entry == 7, {report(81,"NEW-PROJECTED")});
+            core.narrow(flipped == 1 || flipped == 3, {report(82,"PROJECTED-CUT")});
+            if (flipped == 1) {{ core.require(saved == 3, {report(83,"PROJECTED-ENTRY")}); }};
+        }};
+    }};
+    unit(i8) original = fn(input) {{
+        {bounds("input",0,4)}
+        gate(input);
+        core.require(input == 1 || input == 3, {report(84,"CALLER-ENTRY")});
+    }};
+    gate(5);
+    %%end"""
+for name,program,correct,incorrect,code,label in [
+    ("overwrite-affine-canonical-member",overwrite_member,"saved == 1","saved == 7",76,b"OLD-MEMBER"),
+    ("overwrite-affine-anchor-without-snapshot",overwrite_anchor,"first == 1","first == 3",79,b"REANCHOR"),
+    ("overwrite-affine-anchor-with-snapshot",overwrite_anchor_alias,"saved == 3","saved == 7",80,b"OLD-ANCHOR"),
+    ("overwrite-affine-alias-only",overwrite_alias,"first == 1","first == 7",76,b"OLD-MEMBER"),
+    ("overwrite-projected-formal-through-snapshot",projected_snapshot,"saved == 3","saved == 7",83,b"PROJECTED-ENTRY"),
+]:
+    cases.extend([(name,program,0,b""),(name+"-witness",program.replace(correct,incorrect),code,label)])
+cases.extend([
+    ("overwrite-projected-formal-without-snapshot-refused",projected_snapshot.replace(
+        "i8 saved = entry;","").replace("core.require(saved == 3","core.require(flipped == 1"),2,b"unsupported analysis"),
+    ("nonliteral-affine-reassignment-remains-unsupported",overwrite_member.replace("first = 7;","first = second;"),2,b"unsupported analysis"),
 ])
 with tempfile.TemporaryDirectory(prefix="affine-calls-") as path:
     root=Path(path)
