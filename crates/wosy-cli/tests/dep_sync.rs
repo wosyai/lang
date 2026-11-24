@@ -1230,17 +1230,26 @@ fn stdlib_resolves_the_same_modules_in_selected_local_and_locked_packages() {
     let fixture = Fixture::new();
     let (upstream, _) = fixture.origin("packages/remote_lib", "remote_lib");
     let stdlib = upstream.join("stdlib");
-    fs::create_dir_all(stdlib.join("src/wasi")).unwrap();
-    fs::write(
-        stdlib.join("src/bootstrap.w"),
-        include_str!("../../../stdlib/src/bootstrap.w"),
-    )
-    .unwrap();
-    fs::write(
-        stdlib.join("src/wasi/preview1.w"),
-        include_str!("../../../stdlib/src/wasi/preview1.w"),
-    )
-    .unwrap();
+    // Stage the actual shipped package. The monorepo sibling and the
+    // standalone runner can only depend on inputs from the selected tree.
+    let package_files: &[(&str, &[u8])] = &[
+        (".gitignore", include_bytes!("../../../stdlib/.gitignore")),
+        ("wosy.toml", include_bytes!("../../../stdlib/wosy.toml")),
+        ("wosy.lock", include_bytes!("../../../stdlib/wosy.lock")),
+        ("wosy.meta.json", include_bytes!("../../../stdlib/wosy.meta.json")),
+        ("src/bootstrap.w", include_bytes!("../../../stdlib/src/bootstrap.w")),
+        ("src/wasi/preview1.w", include_bytes!("../../../stdlib/src/wasi/preview1.w")),
+        ("scripts/build-wasm", include_bytes!("../../../stdlib/scripts/build-wasm")),
+        ("scripts/run-wasmtime", include_bytes!("../../../stdlib/scripts/run-wasmtime")),
+        ("scripts/start.ll", include_bytes!("../../../stdlib/scripts/start.ll")),
+        ("tests/smoke.w", include_bytes!("../../../stdlib/tests/smoke.w")),
+    ];
+    for &(name, contents) in package_files {
+        let path = stdlib.join(name);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, contents).unwrap();
+    }
+    let revision = commit(&upstream, "Record the ordinary standard-library package");
 
     let consumer = fixture.project("consumer", "remote_lib", "packages/remote_lib");
     let consumer_manifest = consumer.join("wosy.toml");
@@ -1256,25 +1265,37 @@ fn stdlib_resolves_the_same_modules_in_selected_local_and_locked_packages() {
     );
     fs::write(consumer.join("src/main.w"), source).unwrap();
 
-    // Select a target within the real stdlib package using the fixture's
-    // builder and runner. The target root remains project-relative; the same
-    // namespace bindings run unchanged when std is a dependency.
-    let mut std_manifest = include_str!("../../../stdlib/wosy.toml")
-        .parse::<DocumentMut>()
-        .unwrap();
-    std_manifest["package"]["default_target"] = toml_edit::value("app");
-    for table in ["comments", "builders", "runners", "targets"] {
-        std_manifest[table] = manifest[table].clone();
-    }
-    fs::write(stdlib.join("wosy.toml"), std_manifest.to_string()).unwrap();
-    fs::write(stdlib.join("src/main.w"), source).unwrap();
-    let revision = commit(&upstream, "Record the ordinary standard-library package");
+    // The checked-in primary target needs no fixture target or profile.
+    expect_success(&wosy(&stdlib, &["parse"]));
+    let std_manifest_path = stdlib.join("wosy.toml");
+    let std_manifest_bytes = fs::read(&std_manifest_path).unwrap();
+    let mut std_manifest = read_toml(&std_manifest_path);
+    assert_eq!(std_manifest["package"]["default_target"].as_str(), Some("smoke"));
+    assert_eq!(std_manifest["targets"]["smoke"]["root"].as_str(), Some("tests/smoke.w"));
+    assert_eq!(fs::read(stdlib.join("wosy.lock")).unwrap(), b"version = 1\n");
+    assert_eq!(fs::read(stdlib.join("wosy.meta.json")).unwrap(), b"{}\n");
 
+    // Keep this routing test independent of external LLVM and Wasmtime.
+    // The only fixture override is the two external driver commands; the
+    // shipped package's target, profile and source run through the real CLI.
+    std_manifest["builders"]["llvm_wasm"]["command"] =
+        manifest["builders"]["fixture"]["command"].clone();
+    std_manifest["runners"]["wasmtime"]["command"] =
+        manifest["runners"]["fixture"]["command"].clone();
+    fs::write(&std_manifest_path, std_manifest.to_string()).unwrap();
     // A project-root lookalike must not shadow the declared namespace root.
     fs::write(stdlib.join("bootstrap.w"), "invalid base source").unwrap();
-    let own_artifact = stub_artifact(&stdlib);
+    let own_artifact = stdlib.join(".wosy/artifacts/smoke/dev/main");
+    fs::create_dir_all(&own_artifact).unwrap();
+    fs::write(own_artifact.join("main"), "fixture builder stand-in").unwrap();
     expect_success(&wosy(&stdlib, &["build"]));
     expect_success(&wosy(&stdlib, &["run"]));
+    let own_manifest = load_artifact_manifest(&own_artifact.join("artifact-manifest.json")).unwrap();
+    assert_eq!(
+        own_manifest.source_observations[0].source.path.as_path(),
+        Path::new("tests/smoke.w"),
+    );
+    fs::write(&std_manifest_path, std_manifest_bytes).unwrap();
 
     let local_consumer = fixture.project("local_consumer", "remote_lib", ".");
     fs::copy(&consumer_manifest, local_consumer.join("wosy.toml")).unwrap();
@@ -1295,6 +1316,9 @@ fn stdlib_resolves_the_same_modules_in_selected_local_and_locked_packages() {
     expect_success(&wosy(&consumer, &["dep", "sync"]));
     let dependency_root = consumer.join("deps/std");
     assert!(!dependency_root.join("bootstrap.w").exists());
+    for &(name, contents) in package_files {
+        assert_eq!(fs::read(dependency_root.join(name)).unwrap(), contents, "{name}");
+    }
     let consumer_artifact = stub_artifact(&consumer);
     expect_success(&wosy(&consumer, &["build"]));
     expect_success(&wosy(&consumer, &["run"]));
@@ -1303,7 +1327,8 @@ fn stdlib_resolves_the_same_modules_in_selected_local_and_locked_packages() {
         let manifest = load_artifact_manifest(&artifact.join("artifact-manifest.json")).unwrap();
         let mut modules = Vec::new();
         for entry in manifest.source_observations {
-            if entry.source.package == "std" && entry.source.path.as_path() != Path::new("src/main.w") {
+            if entry.source.package == "std"
+                && entry.source.path.as_path() != Path::new("tests/smoke.w") {
                 assert_eq!(
                     Path::new(&entry.source.project).canonicalize().unwrap(),
                     package_root.canonicalize().unwrap(),

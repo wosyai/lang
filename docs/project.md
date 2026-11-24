@@ -65,12 +65,15 @@ The optional table maps portable external labels to concrete functions in the se
 
 Wasm builders must link `runtime.ll` with a linker that provides `__heap_base` after static storage and the reserved stack, as `wasm-ld` does. The generated LLVM IR enables Wasm bulk memory for functions that copy fixed-size aggregates. This per-function setting overrides Clang’s `-mno-bulk-memory` for those functions. Use a Wasm runner that supports `memory.copy`.
 
-The standard library itself is a dependency-style package (`stdlib/wosy.toml`):
+The standard library itself is an ordinary package (`stdlib/wosy.toml`).
+Its manifest declares a directly selectable `smoke` target in addition to
+its source root:
 
 ```toml
 [package]
 name = "std"
 source_root = "src"
+default_target = "smoke"
 ```
 
 ## `wosy.lock`

@@ -1,10 +1,22 @@
 # Standard library
 
-The standard library consists of two sources: `stdlib/src/bootstrap.w` and `stdlib/src/wasi/preview1.w`. Import them as a path dependency named `std`.
+The compiler repository carries the ordinary `std` package under `stdlib/`.
+Add it by local path, or add the repository as a Git dependency with
+`--path stdlib/wosy.toml` and run `wosy dep sync`. Its primary modules are
+`src/bootstrap.w` and `src/wasi/preview1.w`. In a consuming program:
 
 ```wosy
 std = namespace std "bootstrap.w";
 ```
+
+## Build the package directly
+
+From the `stdlib/` directory, run `wosy build` and then `wosy run`. The
+default `smoke` target imports the ordinary package sources and prints
+`Wosy standard library` under WASI Preview 1. Its local build and run scripts
+need Python 3, Clang 18.1.x, `wasm-ld`, and Wasmtime on `PATH`. A consuming
+project still uses its own builder and runner; it does not run these scripts
+just because it imports `std`.
 
 ## Text
 
