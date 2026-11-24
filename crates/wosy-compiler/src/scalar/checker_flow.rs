@@ -3278,6 +3278,15 @@ pub(super) fn collect_pure_affine_literal_proofs<'a>(
     calls: &'a FunctionCallSites, body: &'a super::ScalarBlock,
     filter: &[CheckerPredicate], checks: &mut [SymbolicLiteralCheck<'_, 'a>],
 ) -> Option<bool> {
+    collect_closed_literal_proofs(calls, body, integer_tail_type(calls)?, filter, checks)
+}
+
+#[cfg(feature = "internal-checker")]
+pub(super) fn collect_closed_literal_proofs<'a>(
+    calls: &'a FunctionCallSites, body: &'a super::ScalarBlock, expected: &ScalarType,
+    filter: &[CheckerPredicate], checks: &mut [SymbolicLiteralCheck<'_, 'a>],
+) -> Option<bool> {
+    let tail = ordinary_tail_type(calls, *expected == ScalarType::Bool).filter(|tail| *tail == expected)?;
     let observed = std::cell::RefCell::new(BatchedLiteralEvidence { returned: false, work: 0, pending: checks.len(), checks });
     let mut sink = |_| {};
     let mut collected = IntegerFailureCollection {
@@ -3287,7 +3296,7 @@ pub(super) fn collect_pure_affine_literal_proofs<'a>(
     // This caller admitted a pure producer before entering the shared
     // filter, so evaluation cannot hide an obligation outside the filter.
     run_integer_callable::<false, true, _>(
-        calls, integer_tail_type(calls), Some(filter), None, &mut [], None, None, Some(&mut collected), false,
+        calls, Some(tail), Some(filter), None, &mut [], None, None, Some(&mut collected), false,
         OrderedRootLiteralProofs::<false, true> { conditions: OrderedRootConditions(body, false), observed: &observed },
     )?.ok()?;
     Some(observed.into_inner().returned)
@@ -4886,6 +4895,13 @@ fn observe_integer_returns_in_scope<'a, Authored: ScopedAuthoredReturn<'a>>(
     authored_return: Authored,
 ) -> Option<Result<ProofCoverage<Vec<IntegerReturningPath<'a>>>, IntegerCheckFailure<'a>>> {
     let tail = integer_tail_type(calls)?;
+    observe_typed_scalar_returns(calls, tail, entry_filter, exact_arguments, proof_reflexive_branches, authored_return)
+}
+
+fn observe_typed_scalar_returns<'a, Authored: ScopedAuthoredReturn<'a>>(
+    calls: &'a FunctionCallSites, tail: &'a ScalarType, entry_filter: Option<&[CheckerPredicate]>,
+    exact_arguments: Option<&[&BigInt]>, proof_reflexive_branches: bool, authored_return: Authored,
+) -> Option<Result<ProofCoverage<Vec<IntegerReturningPath<'a>>>, IntegerCheckFailure<'a>>> {
     #[cfg(all(test, feature = "internal-checker"))]
     INTEGER_OBSERVATIONS.with(|observations| {
         let (arbitrary, actual) = observations.get();
@@ -5000,13 +5016,25 @@ pub(super) fn exact_named_pure_affine_return_at_entry(
     exact_integer_return_at_entry_mode(calls, expected, arguments, PureAffineReturn)
 }
 
+#[cfg(feature = "internal-checker")]
+pub(super) fn exact_named_boolean_return_at_entry(calls: &FunctionCallSites, arguments: &[&BigInt]) -> Option<BigInt> {
+    let tail = ordinary_tail_type(calls, true).filter(|tail| **tail == ScalarType::Bool)?;
+    let value = exact_typed_leaf_return_at_entry(calls, tail, arguments, PureAffineReturn)?;
+    bool_result_lane(&value)?;
+    Some(value)
+}
+
 fn exact_integer_return_at_entry_mode<'a, Authored: ScopedAuthoredReturn<'a>>(
     calls: &'a FunctionCallSites, expected: &ScalarType, arguments: &[&BigInt], mode: Authored,
 ) -> Option<BigInt> {
-    if integer_tail_type(calls)? != expected {
-        return None;
-    }
-    let ProofCoverage::Applicable(paths) = observe_integer_returns_in_scope(calls, None, Some(arguments), false, mode)?.ok()?
+    let tail = integer_tail_type(calls).filter(|tail| *tail == expected)?;
+    exact_typed_leaf_return_at_entry(calls, tail, arguments, mode)
+}
+
+fn exact_typed_leaf_return_at_entry<'a, Authored: ScopedAuthoredReturn<'a>>(
+    calls: &'a FunctionCallSites, tail: &'a ScalarType, arguments: &[&BigInt], mode: Authored,
+) -> Option<BigInt> {
+    let ProofCoverage::Applicable(paths) = observe_typed_scalar_returns(calls, tail, None, Some(arguments), false, mode)?.ok()?
         else { return None; };
     let (first, rest) = paths.split_first()?;
     let value = first.singleton_return()?;

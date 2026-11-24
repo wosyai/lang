@@ -1142,7 +1142,7 @@ fn check_command(
         Diagnostic {
             code: String::new(), severity: DiagnosticSeverity::Error,
             message: "proof obligation failed".to_owned(), labels,
-            notes: vec![format!("call returned {}", failure.invocation.returned)],
+            notes: vec![format!("call returned {}", proof_scalar_text(&failure.invocation.returned, failure.invocation.returned_boolean))],
         }
     });
     let symbolic = report.symbolic_diagnostic.iter().chain(&report.additional_symbolic_diagnostics).map(|failure| {
@@ -1175,8 +1175,8 @@ fn check_command(
                 message: "proof goal".to_owned(),
             });
         }
-        let mut notes = vec![format!("symbolic call can return {}", failure.returned)];
-        if let Some(entry) = entry_point_note(&failure.witness, publication.texts, false) {
+        let mut notes = vec![format!("symbolic call can return {}", proof_scalar_text(&failure.returned, failure.returned_boolean))];
+        if let Some(entry) = entry_point_note(&failure.witness, publication.texts, false, failure.returned_boolean.is_some()) {
             notes.push(entry);
         }
         Diagnostic {
@@ -1243,7 +1243,7 @@ fn check_command(
                 message: "applicable call".to_owned() });
         }
         let mut notes = vec![note];
-        if let Some(entry) = entry_point_note(&failure.witness, publication.texts, actual) {
+        if let Some(entry) = entry_point_note(&failure.witness, publication.texts, actual, false) {
             notes.push(entry);
         }
         Diagnostic {
@@ -1259,13 +1259,18 @@ fn check_command(
 }
 
 #[cfg(feature = "internal-checker")]
+fn proof_scalar_text(value: impl std::fmt::Display, boolean: Option<bool>) -> String {
+    boolean.map_or_else(|| value.to_string(), |value| value.to_string())
+}
+
+#[cfg(feature = "internal-checker")]
 fn entry_point_note(
     witness: &wosy_compiler::ScalarCheckerIntegerWitness,
     texts: &BTreeMap<ProjectSourceIdentity, String>,
-    actual: bool,
+    actual: bool, boolean_proof: bool,
 ) -> Option<String> {
     if witness.row_count() != 1 || witness.axes().len() == 0 { return None; }
-    let entries = witness.axes().enumerate().map(|(axis, (binding, _))| {
+    let entries = witness.axes().enumerate().map(|(axis, (binding, ty))| {
         let mut points = witness.intervals_at(0, axis)?;
         let (first, last) = points.next()?;
         if first != last || points.len() != 0 { return None; }
@@ -1274,7 +1279,10 @@ fn entry_point_note(
             .and_then(|source| texts.get(&source))
             .and_then(|text| text.get(binding.declaration_span.start as usize..binding.declaration_span.end as usize));
         let name = name.map_or_else(|| format!("argument {}", axis + 1), str::to_owned);
-        Some(format!("{name} = {first}"))
+        Some(format!("{name} = {}", proof_scalar_text(first,
+            if boolean_proof && matches!(ty, wosy_compiler::ScalarType::Bool) {
+                u8::try_from(first).ok().filter(|&lane| lane <= 1).map(|lane| lane == 1)
+            } else { None })))
     }).collect::<Option<Vec<_>>>()?;
     let origin = if actual { "call entry" } else { "symbolic call entry" };
     Some(format!("{origin}: {}", entries.join(", ")))

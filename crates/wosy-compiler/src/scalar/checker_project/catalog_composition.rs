@@ -104,6 +104,10 @@ impl<Scalar: SymbolicRootProof, Array: SymbolicRootProof> SymbolicRootProof
         self.array.seed(roots, reached);
     }
 
+    fn watches_boolean_return(&self, target: PreparedCallable) -> bool {
+        self.scalar.watches_boolean_return(target)
+    }
+
     fn try_collect(
         &mut self, target: PreparedCallable, body: &FunctionCallSites, function: &ScalarFunction,
         source: &SourceIdentity, effects: &mut OrderedFailures, runtime: SymbolicProofRuntime<'_>,

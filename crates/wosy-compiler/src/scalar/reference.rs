@@ -7024,7 +7024,11 @@ fn resolve_project_call_sites_impl(
                         (parameters.as_slice(), outputs.outputs.as_slice()),
                         ([input], [output]) if is_integer_type(input) && input == &output.ty))
             );
-            if same_package && (qualified || case_candidate) {
+            let boolean_candidate = matches!(&modules[declaration.0].items[declaration.1],
+                ScalarItem::Function(function) if matches!(&function.signature,
+                    ScalarType::Callable { parameters, outputs } if matches!(parameters.as_slice(), [] | [_])
+                        && matches!(outputs.outputs.as_slice(), [output] if output.ty == ScalarType::Bool)));
+            if same_package && (qualified || case_candidate || boolean_candidate) {
                 declarations.nested_proof_watch.entry((source, declaration_span))
                     .or_insert(ProofTargetUse { declaration, nested: std::cell::Cell::new(false) });
             }

@@ -45,12 +45,8 @@ impl<'a> ArrayProof<'a> {
             return Err(ProjectCheck::Unsupported);
         }
         let target_node = child(proof, SyntaxKind::ProofTarget)?;
-        let mut parameters = target_node.children_with_tokens().filter(|entry| entry.kind() == SyntaxKind::Parameters);
-        let inputs = match parameters.next() {
-            Some(entry) => entry.into_node().map_or_else(Vec::new, |node| identifiers(&node).collect::<Vec<_>>()),
-            None => return Err(ProjectCheck::InvalidProof),
-        };
-        if parameters.next().is_some() || inputs.len() != body.boundary.parameters.len() {
+        let inputs = proof_input_names(&target_node)?;
+        if inputs.len() != body.boundary.parameters.len() {
             return Err(ProjectCheck::InvalidProof);
         }
         let outputs = child(&child(proof, SyntaxKind::ProofOutputs)?, SyntaxKind::Parameters)?;

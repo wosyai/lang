@@ -2677,7 +2677,48 @@ cases.extend([
     ("exact-startup-mixed-array-catalog-ranked-guard-refuses", mixed_array_ranked.replace("descend(8)", "descend(9)"),
         2, b"unsupported analysis"),
 ])
+boolean_proof_reached = f"""%%start
+    bool(bool) identity = fn(flag) {{ flag }};
+    bool() always = fn {{ true }};
+    u8[1]() make = fn {{ [7] }};
+    proof wanted for identity(entry) -> (out) where (entry) ensures (out == true) {{}}
+    proof from_nullary for always() -> (out) ensures (out) {{}}
+    proof cells for make() -> (items) forall (u64 i where i == 0) ensures (items[i] == 7) {{}}
+    bool first = identity(true);
+    bool outside = identity(false);
+    bool duplicate = identity(true);
+    bool initialized = always();
+    u8[1] data = make();
+    u8 cell = data[0];
+    core.require(first, {report(41,"FIRST-BOOLEAN")});
+    core.require(duplicate, {report(43,"DUPLICATE-BOOLEAN")});
+    core.require(initialized, {report(44,"NULLARY-BOOLEAN")});
+    core.require(cell == 7, {report(45,"UNRELATED-ARRAY")});
+%%end"""
+boolean_proof_symbolic = """%%start
+    bool(i8) nonnegative = fn(value) { if (value >= 0) { true } else { false } };
+    bool(bool) identity = fn(flag) { flag };
+    proof positive for nonnegative(arg) -> (out) where (arg == 3 || arg == 5) ensures (out) {}
+    proof shown for nonnegative(arg) -> (out) where (arg == 3 || arg == 5) ensures (out != false)
+        { core.show(out == true); }
+    proof copy_claim for identity(entry) -> (out) where (entry != false) ensures (out) {}
+%%end"""
+cases.extend([
+    ("exact-startup-boolean-return-proof-proved", boolean_proof_reached, 0, b""),
+    ("exact-startup-boolean-return-proof-refuted", boolean_proof_reached.replace("out == true", "out != true"),
+        1, b"proof obligation failed"),
+    ("exact-startup-boolean-return-proof-outside-guard", boolean_proof_reached.replace(
+        "%%end", "core.require(outside, " + report(42,"OUTSIDE-BOOLEAN") + "); %%end"), 42, b"OUTSIDE-BOOLEAN"),
+    ("ordinary-boolean-return-proof-proved", boolean_proof_symbolic, 0, b""),
+    ("ordinary-boolean-return-proof-refuted", boolean_proof_symbolic.replace("core.show(out == true)", "core.show(!out)")
+        .replace("where (entry != false) ensures (out)", "where (entry != false) ensures (!out)"),
+        1, b"proof obligation failed"),
+    ("ordinary-boolean-return-proof-refuses-unanalyzed-nested-call", boolean_proof_symbolic.replace(
+        "%%end", "bool(bool) relay = fn(flag) { identity(flag) }; %%end"), 2, b"unsupported analysis"),
+])
 proof_diagnostic_notes = {
+    "exact-startup-boolean-return-proof-refuted": b"call returned true",
+    "ordinary-boolean-return-proof-refuted": b"symbolic call entry: flag = true",
     "exact-startup-mixed-array-catalog-two-failures": b"call returned cell [0] = 3",
     "exact-startup-mixed-array-catalog-output-once": b"call returned cell [0] = 3",
     "ordinary-mixed-array-catalog-citation-refuted": b"symbolic call can return cell [0] = 3",
@@ -3495,6 +3536,16 @@ with tempfile.TemporaryDirectory(prefix="affine-calls-") as path:
                         assert b"COPY-PRIOR-UNPUBLISHED" not in res.stderr and b"COPY-FORMAL-UNPUBLISHED" not in res.stderr,res
                 elif included and name in proof_diagnostic_notes:
                     assert expected_stderr in res.stderr and proof_diagnostic_notes[name] in res.stderr,res
+                    if "-boolean-return-proof-" in name:
+                        failures = res.stderr.split(b"error: proof obligation failed")[1:]
+                        assert len(failures) == 2, res
+                        if name.startswith("exact-startup-"):
+                            assert b"symbolic call" not in res.stderr, res
+                            assert all(b"identity(true)" in failure and b"call returned true" in failure for failure in failures), res
+                        else:
+                            assert b"proof shown" in failures[0] and b"core.show(!out)" in failures[0], res
+                            assert b"proof copy_claim" in failures[1] and b"symbolic call entry: flag = true" in failures[1], res
+                            assert all(b"symbolic call can return true" in failure for failure in failures), res
                     if "-mixed-array-catalog-" in name:
                         failures = res.stderr.split(b"error: proof obligation failed")[1:]
                         assert len(failures) == 2, res
