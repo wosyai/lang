@@ -1935,6 +1935,11 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             return Err(self.missing_context(span, ReferenceAnalysisErrorReason::UnprovedArrayLength));
                         };
                         match self.binding_types.get(&place.binding) {
+                            _ if matches!(place.place, ScalarPlace::Dereference { .. })
+                                && matches!(place.projections.as_slice(), [ReferencePlaceProjection::Dereference(_)])
+                                && signature.is_some_and(|signature| matches!(signature.parameters.as_slice(),
+                                    [ScalarType::CheckedReference { mutability: ScalarReferenceMutability::Shared, inner }]
+                                        if matches!(inner.as_ref(), ScalarType::Array { .. }))) => {}
                             Some(ScalarType::Array { .. }) if place.projections.is_empty() => {}
                             Some(ScalarType::RuntimeArray { .. }) if place.projections.is_empty()
                                 && self.cfg.allocations.contains(&place.binding) => {

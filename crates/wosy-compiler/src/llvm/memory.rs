@@ -363,24 +363,7 @@ pub(super) fn place_pointer<'ctx, 'module>(
             Ok(global.as_pointer_value())
         }
         crate::ScalarPlace::Dereference { pointer, .. } => {
-            let pointer_value = take_basic(match project {
-                Some(project) => emit_project_expression(
-                    context,
-                    state,
-                    pointer,
-                    project.module,
-                    project.modules,
-                )?,
-                None => emit_expression(context, state, pointer)?,
-            })?
-            .into_int_value();
-            pointer_target_type(state, pointer, project)
-                .ok_or_else(|| "unknown LLVM dereference target type".to_owned())?;
-            if dereference_requires_null_guard(state, pointer, project)
-                && !ownership::guarded_alias_has_non_null_proof(state, pointer)
-            {
-                emit_checked_dereference_guard(context, state, pointer_value)?;
-            }
+            let (_, pointer_value) = dereference_address(context, state, pointer, project)?;
             state
                 .builder
                 .build_int_to_ptr(
@@ -444,16 +427,44 @@ pub(super) fn place_pointer<'ctx, 'module>(
     }
 }
 
+fn dereference_address<'ctx, 'module>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, 'module>,
+    pointer: &ScalarExpression,
+    project: Option<ProjectCallScope<'_>>,
+) -> Result<(ScalarType, inkwell::values::IntValue<'ctx>), String> {
+    let pointer_value = take_basic(match project {
+        Some(project) => emit_project_expression(context, state, pointer, project.module, project.modules)?,
+        None => emit_expression(context, state, pointer)?,
+    })?.into_int_value();
+    let pointee = pointer_target_type(state, pointer, project)
+        .ok_or_else(|| "unknown LLVM dereference target type".to_owned())?;
+    if dereference_requires_null_guard(state, pointer, project)
+        && !ownership::guarded_alias_has_non_null_proof(state, pointer)
+    {
+        emit_checked_dereference_guard(context, state, pointer_value)?;
+    }
+    Ok((pointee, pointer_value))
+}
+
 pub(super) fn emit_array_len<'ctx>(
     context: &'ctx Context,
     state: &mut EmitState<'ctx, '_>,
     expression: &ScalarExpression,
     arguments: &[ScalarExpression],
+    project: Option<ProjectCallScope<'_>>,
 ) -> Result<EmitValue<'ctx>, String> {
     super::aggregate_transfer::check_replacement_extent_observation(state, expression)?;
     let [ScalarExpression::CheckedAddress { place, .. }] = arguments else {
         return Err("core.array_len lacks a prepared named array address".into());
     };
+    if let crate::ScalarPlace::Dereference { pointer, .. } = place {
+        // Observe the checked place normally: the existing null policy owns
+        // validation before even a constant extent may be observed.
+        let (ScalarType::Array { length, .. }, _) = dereference_address(context, state, pointer, project)?
+        else { return Err("core.array_len lacks a checked fixed-array referent".into()) };
+        return Ok(EmitValue::Basic(context.i64_type().const_int(length, false).into()));
+    }
     let crate::ScalarPlace::Name { name, .. } = place else {
         return Err("core.array_len lacks a prepared named array address".into());
     };

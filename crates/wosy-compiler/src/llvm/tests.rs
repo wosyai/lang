@@ -11657,3 +11657,57 @@ if (roundtrip(2)");
         }
     }
 }
+
+#[test]
+fn borrowed_fixed_array_extent_uses_the_canonical_checked_null_policy() {
+    let source = SourceIdentity::new("project".into(), "package".into(), "src/borrowed_fixed_extent.w".into(), "r1".into());
+    let text = "%%start
+u64(*(u8[3])) extent = fn(view) { core.array_len(&(*view)) };
+u64() observe = fn {
+    u8[3] bytes = [1, 2, 3];
+    *(u8[3]) view = &bytes;
+    extent(view)
+};
+if (observe() != 3) { core.system_panic(); };
+%%end";
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let parsed = parse_source(source.clone(), text.into(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let prepared = crate::prepare_scalar_project_with_access(
+            vec![(crate::derive_scalar_declarations_from_cst(parsed.result.canonical_cst()), vec![])],
+            vec![source.clone()],
+            ScalarPreparationInputs { target_layout: layout },
+            Some(wosy_stdlib_source::CheckedAccessComponent::linked()),
+        ).unwrap();
+        let checked = analyze_scalar_build(&prepared);
+        assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+        let llvm = emit_scalar_build_project_llvm(&checked).unwrap().to_text();
+        let body = self_tail_test_body(&llvm, "i64", &project_function_name(&source, "extent"));
+        let [guard] = body.lines().filter(|line| line.contains("call void @wosy_fn__776f73795f746f6f6c636861696e5f7374646c6962__")
+            && line.contains("__636865636b5f6e6f6e5f6e756c6c5f61646472657373(")).collect::<Vec<_>>()[..]
+        else { panic!("exact authenticated non-null guard: {body}") };
+        let address_width = if layout == ScalarTargetLayout::WASM32 { "i32" } else { "i64" };
+        assert!(guard.contains(&format!("({address_width} %")), "{body}");
+        assert!(body.find(guard).unwrap() < body.find("ret i64 3").expect("type-known full-width extent"), "{body}");
+        assert!(!body.contains("deref_is_null") && !body.contains("inttoptr") && !body.contains("getelementptr"), "{body}");
+        if let Some(out) = std::env::var_os("WOSY_FIXED_BORROWED_EXTENT_IR_DIR") {
+            let target = if layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
+            let controlled = llvm.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);
+            assert_ne!(controlled, llvm);
+            std::fs::write(std::path::PathBuf::from(out).join(format!("{target}-project-control.ll")),
+                controlled).unwrap();
+        }
+        for rejected in [
+            "u64(*(u8[])) extent = fn(view) { core.array_len(&(*view)) };",
+            "u64(*?u8) extent = fn(view) { unsafe { core.array_len(&(*view)) } };",
+        ] {
+            let text = format!("%%start\n{rejected}\n%%end");
+            let parsed = parse_source(source.clone(), text, &[]);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let checked = crate::derive_scalar_program_with_layout(&parsed.result, layout);
+            assert!(checked.diagnostics.iter().any(|diagnostic|
+                diagnostic.message == "core.array_len requires the shared address of a named array place"),
+                "{:?}", checked.diagnostics);
+        }
+    }
+}

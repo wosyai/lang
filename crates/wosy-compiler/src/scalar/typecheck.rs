@@ -1538,12 +1538,24 @@ fn validate_assignment_target_distinctness_in_module(
 fn array_len_address<'a>(
     expression: &ScalarExpression,
     arguments: &'a [ScalarExpression],
+    scope: &BTreeMap<String, ScalarType>,
 ) -> Option<&'a ScalarExpression> {
     let ScalarExpression::Call { type_arguments, .. } = expression else { return None };
     let [address @ ScalarExpression::CheckedAddress {
-        mutability: ScalarReferenceMutability::Shared, place: ScalarPlace::Name { .. }, ..
+        mutability: ScalarReferenceMutability::Shared, place, ..
     }] = arguments else { return None };
-    type_arguments.is_empty().then_some(address)
+    if !type_arguments.is_empty() { return None; }
+    match place {
+        ScalarPlace::Name { .. } => Some(address),
+        ScalarPlace::Dereference { pointer, .. } => {
+            let ScalarExpression::Name { name, .. } = pointer.as_ref() else { return None };
+            // Fixed views derive their extent from the exact checked referent
+            // type, not the address. Runtime views do not yet carry a count.
+            matches!(scope.get(name), Some(ScalarType::CheckedReference { inner, .. })
+                if matches!(inner.as_ref(), ScalarType::Array { .. })).then_some(address)
+        }
+        _ => None,
+    }
 }
 
 fn is_array_len_operand(ty: &ScalarType) -> bool {
@@ -1745,7 +1757,7 @@ fn type_core_memory_in_module(
             (parameters, ScalarType::Unit)
         }
         "array_len" => {
-            let Some(address) = array_len_address(expression, arguments) else {
+            let Some(address) = array_len_address(expression, arguments, scope) else {
                 diagnostics.push(module_diagnostic(module, "B0003",
                     "core.array_len requires the shared address of a named array place", span));
                 return ScalarType::Error;
@@ -1968,7 +1980,7 @@ fn type_core_memory(
             (parameters, ScalarType::Unit)
         }
         "array_len" => {
-            let Some(address) = array_len_address(expression, arguments) else {
+            let Some(address) = array_len_address(expression, arguments, scope) else {
                 diagnostics.push(diagnostic(program, "B0003",
                     "core.array_len requires the shared address of a named array place", span));
                 return ScalarType::Error;
