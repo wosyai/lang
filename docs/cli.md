@@ -46,6 +46,11 @@ the imported module has initialized, or an unused symbolic root in the
 declared-package scope. This profile does not support nested calls through the
 qualified target or publish an ordinary call summary for it.
 
+Non-inductive proofs of pure unary integer functions can use check-time
+`if` case splits on the input, including nested splits and ordered
+`core.show` steps that compare the returned value with a literal or
+establish equality to the input. These steps do not execute in artifacts.
+
 Check diagnostics and stream output work on native CLI hosts. Authored file
 output currently requires a Linux CLI host and a flat filename under
 `.wosy/outputs/check/`; other file requests are refused before authored output

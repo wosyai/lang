@@ -2245,7 +2245,46 @@ for name, text, child, code, why in [
     namespace_children[name] = child
     cases.append((name, text, code, why))
 
+authored_case_proof = """%%start
+    u8(u8) clamp = fn(value) { if (value > 10) { 10 } else { value } };
+    proof clamped for clamp(x) -> (out) ensures (out <= 10) {
+        if (x > 10) { core.show(out == 10); }
+        else { core.show(out == x); }
+    }
+%%end"""
+authored_case_startup = authored_case_proof.replace("%%end", f"""
+    u8 uncapped = clamp(6);
+    u8 capped = clamp(11);
+    core.require(uncapped == 6, {report(42,"WRONG-UNCAPPED-RETURN")});
+    core.require(capped == 10, {report(43,"WRONG-CAPPED-RETURN")});
+%%end""")
+authored_case_nested = authored_case_startup.replace(
+    "if (x > 10) { core.show(out == 10); }",
+    """if (x > 10) {
+            if (x > 12) { core.show(out == 10); }
+            else { core.show(out <= 10); core.show(out == 10); }
+        }""").replace("core.show(out == x);", "core.show(out == core.old(x));")
+cases.extend([
+    ("ordinary-authored-case-proof-documented-clamp", authored_case_proof, 0, b""),
+    ("ordinary-authored-case-proof-refuted-show", authored_case_proof.replace("if (x > 10)", "if (x > 11)"),
+        1, b"proof obligation failed"),
+    ("ordinary-authored-case-proof-refuted-goal", authored_case_proof.replace("ensures (out <= 10)", "ensures (out <= 9)"),
+        1, b"proof obligation failed"),
+    ("exact-startup-authored-case-proof-documented-clamp", authored_case_startup, 0, b""),
+    ("exact-startup-authored-case-proof-wrong-arm", authored_case_startup.replace("if (x > 10)", "if (x > 11)"),
+        1, b"proof obligation failed"),
+    ("exact-startup-authored-case-proof-nested", authored_case_nested, 0, b""),
+    ("exact-startup-authored-case-proof-nested-first-show",
+        authored_case_nested.replace("core.show(out <= 10); core.show(out == 10);",
+            "core.show(out < 10); core.show(out == 8);"),
+        1, b"proof obligation failed"),
+])
+
 proof_diagnostic_notes = {
+    "ordinary-authored-case-proof-refuted-show": b"symbolic call entry: value = 11",
+    "ordinary-authored-case-proof-refuted-goal": b"symbolic call can return 10",
+    "exact-startup-authored-case-proof-wrong-arm": b"call returned 10",
+    "exact-startup-authored-case-proof-nested-first-show": b"call returned 10",
     "exact-startup-qualified-scalar-proof-refuted": b"call returned 7",
     "ordinary-qualified-scalar-proof-unused-refuted": b"symbolic call can return 7",
     "ordered-calling-citation-pair-show-refuted": b"symbolic call can return 7",
@@ -3032,6 +3071,13 @@ with tempfile.TemporaryDirectory(prefix="affine-calls-") as path:
                         assert b"COPY-PRIOR-UNPUBLISHED" not in res.stderr and b"COPY-FORMAL-UNPUBLISHED" not in res.stderr,res
                 elif included and name in proof_diagnostic_notes:
                     assert expected_stderr in res.stderr and proof_diagnostic_notes[name] in res.stderr,res
+                    if name in ("ordinary-authored-case-proof-refuted-show", "exact-startup-authored-case-proof-wrong-arm"):
+                        assert b"core.show(out == x)" in res.stderr and b"proof goal" in res.stderr, res
+                    if name == "exact-startup-authored-case-proof-nested-first-show":
+                        primary = res.stderr.split(b"not satisfied by this call", 1)[0]
+                        assert b"core.show(out < 10)" in primary, res
+                    if name == "ordinary-authored-case-proof-refuted-goal":
+                        assert b"ensures (out <= 9)" in res.stderr and b"proof goal" not in res.stderr, res
                     if name == "exact-startup-qualified-scalar-proof-refuted":
                         assert res.stderr.count(b"proof obligation failed") == 1, res
                         assert b"src/main.w" in res.stderr and b"imported.value(3)" in res.stderr, res

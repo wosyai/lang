@@ -7,6 +7,8 @@ use std::hash::{Hash, Hasher};
 #[cfg(feature = "internal-checker")]
 mod array_quantifier;
 #[cfg(feature = "internal-checker")]
+mod case_splits;
+#[cfg(feature = "internal-checker")]
 mod ranked;
 
 use super::{
@@ -4583,7 +4585,7 @@ fn run_named_partition_cursor<'a, const ORDINARY_LOCALS: bool>(
 }
 
 #[cfg(feature = "internal-checker")]
-fn capture_citation_partitions<'a>(
+fn capture_closed_partitioned_returns<'a>(
     target: PreparedCallable, body: &'a FunctionCallSites, source: &'a SourceIdentity,
     runtime: SymbolicProofRuntime<'a>, full: &IntegerSet, work: &mut usize,
 ) -> Option<ActualCallResult> {
@@ -4634,6 +4636,42 @@ impl SelectedSymbolicProof<'_, '_> {
 
 #[cfg(feature = "internal-checker")]
 impl<'a> SelectedSymbolicProof<'a, '_> {
+    fn verify_case_shows(
+        &mut self, target: PreparedCallable, body: &FunctionCallSites, function: &ScalarFunction,
+        source: &SourceIdentity, effects: &OrderedFailures, runtime: SymbolicProofRuntime<'_>,
+        proof: &MainFlowProofCase<'_>, steps: &case_splits::CaseShows<'_>,
+    ) -> Result<Option<bool>, ProjectCheck> {
+        use super::checker_flow::{verify_partitioned_call_return, PartitionedProofGoal};
+        if proof.proof_source != source || proof.guard.domain.is_some() {
+            return Err(ProjectCheck::Unsupported);
+        }
+        if proof.guard.always_rejects { return Ok(Some(false)); }
+        let [input] = body.boundary.parameters.as_slice() else { return Err(ProjectCheck::Unsupported); };
+        let mut work = 0;
+        let mut domain = [IntegerSet::from_type(&input.ty).ok_or(ProjectCheck::Unsupported)?];
+        clip_proof_entry_domains(&mut domain, &proof.guard.comparisons, &mut work)?;
+        let [domain] = domain;
+        if domain.is_empty() { return Ok(Some(false)); }
+        // A single independent producer traversal covers the admitted domain.
+        // The authored proof only partitions and tests the returned paths.
+        let returned = capture_closed_partitioned_returns(target, body, source, runtime, &domain, &mut work)
+            .ok_or(ProjectCheck::Unsupported)?;
+        if let Some((failure, span)) = steps.check_partitions(body, &returned, &domain, &mut work)
+            .ok_or(ProjectCheck::Unsupported)?
+        {
+            self.record(proof, function, source, effects.records.len(), failure, Some(span))?;
+        } else {
+            let bound = proof.bound.literal().ok_or(ProjectCheck::Unsupported)?;
+            let goal = PartitionedProofGoal::Literal(proof.relation, bound);
+            let checked = verify_partitioned_call_return(body, &returned, &domain, false, goal, Some(&mut work))
+                .ok_or(ProjectCheck::Unsupported)?;
+            if let Some(failure) = checked.failure {
+                self.record(proof, function, source, effects.records.len(), failure, None)?;
+            }
+        }
+        Ok(Some(true))
+    }
+
     fn verify_calling_pair(
         &mut self, target: PreparedCallable, body: &FunctionCallSites, function: &ScalarFunction,
         source: &SourceIdentity, effects: &mut OrderedFailures, runtime: SymbolicProofRuntime<'_>,
@@ -4696,7 +4734,7 @@ impl<'a> SelectedSymbolicProof<'a, '_> {
             let mut domains = full.clone();
             let mut clipped = [false; 2];
             if has_citation {
-                clip_calling_proof_domains(&mut domains, &case.guard.comparisons, &mut work)?;
+                clip_proof_entry_domains(&mut domains, &case.guard.comparisons, &mut work)?;
             } else {
                 for guard in &case.guard.comparisons {
                     let seen = clipped.get_mut(guard.slot).ok_or(ProjectCheck::Unsupported)?;
@@ -4942,7 +4980,7 @@ impl<'a> SelectedSymbolicProof<'a, '_> {
             if !case.guard.always_rejects {
                 let applicable = if has_citation {
                     let mut applicable = [domain.clone()];
-                    clip_calling_proof_domains(&mut applicable, &case.guard.comparisons, &mut proof_work)?;
+                    clip_proof_entry_domains(&mut applicable, &case.guard.comparisons, &mut proof_work)?;
                     let [applicable] = applicable;
                     applicable
                 } else {
@@ -4960,7 +4998,7 @@ impl<'a> SelectedSymbolicProof<'a, '_> {
         }
         let first_directive = effects.records.len();
         let (result, active, reached) = if has_citation {
-            let result = capture_citation_partitions(target, body, source, runtime, &domain, &mut proof_work)
+            let result = capture_closed_partitioned_returns(target, body, source, runtime, &domain, &mut proof_work)
                 .ok_or(ProjectCheck::Unsupported)?;
             (result, false, HashSet::new())
         } else {
@@ -5096,6 +5134,9 @@ impl SymbolicRootProof for SelectedSymbolicProof<'_, '_> {
                 let [(proof, Some(shows))] = cases.as_slice() else {
                     return Err(ProjectCheck::Unsupported);
                 };
+                if let MainFlowAuthoredShows::Cases(steps) = shows {
+                    return self.verify_case_shows(target, calls, function, source, effects, runtime, proof, steps);
+                }
                 if !tautological(proof) {
                     return Err(ProjectCheck::Unsupported);
                 }
@@ -5297,6 +5338,7 @@ struct MainFlowLiteralShow<'a> {
 
 #[cfg(feature = "internal-checker")]
 enum MainFlowAuthoredShows<'a> {
+    Cases(case_splits::CaseShows<'a>),
     Single(MainFlowLiteralShow<'a>),
     CallingCitation { peer: u32, show: Option<MainFlowLiteralShow<'a>>, output_type: &'a ScalarType },
     Entry { span: ByteSpan, slot: usize, relation: IntegerRelation },
@@ -5669,6 +5711,19 @@ impl<'a> MainFlowProofCase<'a> {
             )?;
             Ok((shown, literal))
         };
+        #[derive(Clone, Copy)]
+        enum AuthoredShape { Cases, Rewrite }
+        // Use the existing bounded authored-shape scan for both special
+        // forms. An oversized body stays in the legacy flat path, rather
+        // than acquiring a new scan (or losing legacy flat admission).
+        let shape = if citation.is_none() && super::checker_flow::charge_call_work(&mut 0, plan.steps.items.len()).is_some() {
+            plan.steps.items.iter().find_map(|item| match item {
+                ScalarBlockItem::Expression(ScalarExpression::If { .. } | ScalarExpression::UnitIf { .. }) =>
+                    Some(AuthoredShape::Cases),
+                _ if flat_rewrite_arguments(item).is_some() => Some(AuthoredShape::Rewrite),
+                _ => None,
+            })
+        } else { None };
         let step = if let Some((peer, show)) = citation {
             if peer.peer_literal_goal().is_none() || (!peer.steps.items.is_empty() && peer.direct_peer_use().is_none())
                 || !plan.same_peer_target(peer) || plan.peer_literal_goal().is_none()
@@ -5684,9 +5739,9 @@ impl<'a> MainFlowProofCase<'a> {
             Some(MainFlowAuthoredShows::CallingCitation {
                 peer: wosy_syntax::byte_span(peer.proof).start, show, output_type: plan.typed.result_type,
             })
-        } else if super::checker_flow::charge_call_work(&mut 0, plan.steps.items.len()).is_some()
-            && plan.steps.items.iter().any(|item| flat_rewrite_arguments(item).is_some())
-        {
+        } else if matches!(shape, Some(AuthoredShape::Cases)) {
+            Some(MainFlowAuthoredShows::Cases(case_splits::CaseShows::prepare(plan)?))
+        } else if matches!(shape, Some(AuthoredShape::Rewrite)) {
             Some(prepare_flat_rewrite_shows(plan, bound.literal().ok_or(ProjectCheck::Unsupported)?)?)
         } else if rectangular && !plan.steps.items.is_empty() {
             let steps = &plan.steps.items;
@@ -5879,6 +5934,7 @@ impl<'a> MainFlowProofTarget<'a> {
             len.saturating_mul(depth.saturating_mul(2).saturating_add(4)).saturating_add(depth)
         };
         let step_work = match step {
+            Some(MainFlowAuthoredShows::Cases(steps)) => steps.work(),
             Some(MainFlowAuthoredShows::Multiple { groups, .. }) => depth(groups.len()).saturating_add(4),
             Some(MainFlowAuthoredShows::Rectangular { shows, .. }) => indexed_show_work(shows.len()),
             Some(MainFlowAuthoredShows::CallingSequence { steps, .. }) => indexed_show_work(steps.len()),
@@ -6183,6 +6239,21 @@ impl ActualIntegerObserver for MainFlowProofObserver<'_> {
                         true
                     };
                     let failed_step = match step {
+                        Some(MainFlowAuthoredShows::Cases(steps)) => {
+                            let [entry] = arguments else { self.incomplete = true; return; };
+                            // The named stack already paid this authored cost.
+                            if !matches!(&site.call, InitializerProofOrigin::Stacked { .. })
+                                && super::checker_flow::charge_call_work(&mut self.named_exact_work,
+                                    MainFlowProofTarget::nested_case_work(proof, step.as_ref())).is_none()
+                            {
+                                self.incomplete = true;
+                                return;
+                            }
+                            if !applies() { continue; }
+                            if let Some(span) = steps.check_actual(entry, value) { Some(span) }
+                            else if proof.relation.accepts(value.cmp(bound.as_ref())) { continue; }
+                            else { None }
+                        }
                         Some(MainFlowAuthoredShows::Single(step)) => {
                             if !applies() {
                                 continue;
@@ -7453,7 +7524,7 @@ fn admits_partitioned_citation(
 }
 
 #[cfg(feature = "internal-checker")]
-fn clip_calling_proof_domains(
+fn clip_proof_entry_domains(
     mut domains: impl AsMut<[IntegerSet]>, guards: &[ImportedEntryGuard<'_>], work: &mut usize,
 ) -> Result<(), ProjectCheck> {
     use super::checker_flow::charge_call_work;
@@ -8485,7 +8556,7 @@ impl PreparedProofModule {
         };
         let Some((returned, work)) = capture.get_or_insert_with(|| {
             let mut work = 0;
-            let returned = capture_citation_partitions(target, body, &owner.source, runtime, &full, &mut work)?;
+            let returned = capture_closed_partitioned_returns(target, body, &owner.source, runtime, &full, &mut work)?;
             Some((returned, work))
         }) else { return; };
         let Some(count) = group.direct.len().checked_add(group.peer_uses.len()) else { return; };
@@ -13800,6 +13871,84 @@ mod tests {
         assert!(run(unused, ScalarCheckerScope::CurrentPackage).unwrap().symbolic_diagnostic.is_some());
         let invalid = unused.replace("ensures", "where (false) ensures").replace("out >= 7", "out >= 128");
         assert!(matches!(run(&invalid, ScalarCheckerScope::MainFlowOnly), Err(ProjectCheck::InvalidProof)));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordered_authored_scalar_cases_follow_reached_and_symbolic_return_paths() {
+        let app = source("src/main.w", "ordered-authored-scalar-cases");
+        let clamp = r#"%%start
+            u8(u8) clamp = fn(value) { if (value > 10) { 10 } else { value } };
+            proof clamp_bounded for clamp(x) -> (out) ensures (out <= 10) {
+                if (x > 10) { core.show(out == 10); }
+                else { core.show(out == x); }
+            }
+        %%end"#;
+        let run = |text: &str, scope| {
+            let (_, proof) = crate::parse_proof_source(app.clone(), text.to_owned(), &[]).ok().unwrap();
+            check_loaded_ordered_proof_diagnostics_in_scope::<true>(
+                Vec::new(), vec![(proof, Vec::new())], vec![app.clone()], inputs(), scope, Vec::new(),
+            )
+        };
+        let unused = run(clamp, ScalarCheckerScope::CurrentPackage).unwrap();
+        assert!(unused.active && unused.symbolic_diagnostic.is_none() && unused.directives.is_empty());
+        let no_else = clamp.replace("else { core.show(out == x); }", "");
+        let one_arm = run(&no_else, ScalarCheckerScope::CurrentPackage).unwrap();
+        assert!(one_arm.active && one_arm.symbolic_diagnostic.is_none());
+        let excluded = run(clamp, ScalarCheckerScope::MainFlowOnly).unwrap();
+        assert!(!excluded.active && excluded.symbolic_diagnostic.is_none());
+        let reached = clamp.replace("%%end", &format!(
+            "u8 unchanged = clamp(6); u8 capped = clamp(11); u8 high = clamp(13);
+             core.require(unchanged == 6, {OUTPUT}); core.require(capped == 10, {OUTPUT});
+             core.require(high == 10, {OUTPUT}); %%end"));
+        let nested = |text: &str| text.replace(
+            "if (x > 10) { core.show(out == 10); }",
+            "if (x > 10) {
+                 if (x > 12) { core.show(out == 10); }
+                 else { core.show(out <= 10); core.show(out == 10); }
+             }",
+        ).replace("core.show(out == x);", "core.show(out == core.old(x));");
+        let nested_unused = run(&nested(clamp), ScalarCheckerScope::CurrentPackage).unwrap();
+        assert!(nested_unused.active && nested_unused.symbolic_diagnostic.is_none());
+        let wrong_split = clamp.replace("if (x > 10)", "if (x > 11)");
+        let symbolic = run(&wrong_split, ScalarCheckerScope::CurrentPackage).unwrap().symbolic_diagnostic.unwrap();
+        let show = symbolic.failed_step.unwrap().range;
+        assert_eq!(&wrong_split[show.start as usize..show.end as usize], "core.show(out == x)");
+        assert_eq!(symbolic.returned, BigInt::from(10));
+        let eleven = BigInt::from(11);
+        assert!(symbolic.witness.intervals_at(0, 0).unwrap().eq([(&eleven, &eleven)]));
+        let wrong_goal = clamp.replace("ensures (out <= 10)", "ensures (out <= 9)");
+        let goal = run(&wrong_goal, ScalarCheckerScope::CurrentPackage).unwrap().symbolic_diagnostic.unwrap();
+        assert!(goal.failed_step.is_none());
+        assert_eq!(goal.returned, BigInt::from(10));
+        let unreachable = wrong_split.replace("ensures", "where (x <= 10) ensures");
+        let guarded = run(&unreachable, ScalarCheckerScope::CurrentPackage).unwrap();
+        assert!(guarded.active && guarded.symbolic_diagnostic.is_none());
+        let nested_reached = nested(&reached);
+        let one_arm_reached = reached.replace("else { core.show(out == x); }", "");
+        for scope in [ScalarCheckerScope::MainFlowOnly, ScalarCheckerScope::CurrentPackage] {
+            for text in [&reached, &nested_reached, &one_arm_reached] {
+                let verified = run(text, scope).unwrap();
+                assert!(verified.active && verified.diagnostics.is_empty() && verified.directives.is_empty());
+                assert!(verified.symbolic_diagnostic.is_none());
+            }
+            let wrong = reached.replace("if (x > 10)", "if (x > 11)");
+            let failure = run(&wrong, scope).unwrap();
+            let [diagnostic] = failure.diagnostics.as_slice() else { panic!("only the reached false arm should report"); };
+            let snippet = |span: ByteSpan| &wrong[span.start as usize..span.end as usize];
+            assert_eq!(snippet(diagnostic.failed_step.as_ref().unwrap().range), "core.show(out == x)");
+            assert_eq!(snippet(diagnostic.invocation.call.range), "clamp(11)");
+            assert_eq!(diagnostic.invocation.arguments, [(ScalarType::U8, eleven.clone())]);
+            assert_eq!(diagnostic.invocation.returned, BigInt::from(10));
+            assert!(failure.symbolic_diagnostic.is_none() && failure.directives.is_empty());
+
+            let order = nested(&reached).replace("core.show(out <= 10); core.show(out == 10);",
+                "core.show(out < 10); core.show(out == 8);");
+            let failure = run(&order, scope).unwrap();
+            let [diagnostic] = failure.diagnostics.as_slice() else { panic!("only the selected inner arm fails"); };
+            let span = diagnostic.failed_step.as_ref().unwrap().range;
+            assert_eq!(&order[span.start as usize..span.end as usize], "core.show(out < 10)");
+        }
     }
 
     #[cfg(feature = "internal-checker")]
