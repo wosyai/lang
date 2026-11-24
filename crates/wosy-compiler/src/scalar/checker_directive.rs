@@ -517,6 +517,15 @@ mod tests {
             .find(|directive| directive.operation == CheckerOperation::Narrow)
             .expect("narrow directive");
         assert_eq!(retained_probe.call_signature.as_ref(), Some(&expected_probe));
+        #[cfg(feature = "internal-checker")]
+        {
+            let receipts = &body.structure.checker_ordinary_directive_calls;
+            assert_eq!(receipts.len(), 1);
+            let (&ordinal, receipt) = receipts.iter().next().unwrap();
+            assert!(receipt.operands.is_empty());
+            assert!(matches!(directives[&ordinal].operation, CheckerOperation::Narrow));
+            assert!(body.resolved_call_site(ordinal).is_none());
+        }
         assert!(body.call_occurrences.is_empty());
         for occurrence in directives.keys() {
             assert_eq!(body.structure.checked_types.expressions.get(occurrence), Some(&ScalarType::Unit));
@@ -878,7 +887,7 @@ mod tests {
     }
 
     #[test]
-    fn mutable_local_is_outside_constant_binding_slice() {
+    fn literal_local_overwrite_reports_the_current_value() {
         use crate::scalar::checker_flow::check_integer_requirements;
         check_source(
             r#"
@@ -889,7 +898,15 @@ mod tests {
                 value
             };
             "#,
-            |body| assert_eq!(check_integer_requirements(body), None),
+            |body| {
+                let failure = check_integer_requirements(body).unwrap().unwrap_err();
+                let local = body.structure.checker_integer_locals.values().next().unwrap();
+                assert_eq!(failure.axes[1], (local, &ScalarType::U8));
+                assert!(failure.state.includes(&[0, 2]));
+                assert!(failure.state.includes(&[255, 2]));
+                assert!(!failure.state.includes(&[0, 1]));
+                assert!(!failure.state.includes(&[255, 1]));
+            },
         );
     }
 

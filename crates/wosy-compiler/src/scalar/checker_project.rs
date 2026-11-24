@@ -845,7 +845,7 @@ fn check_unused_module<const COLLECT: bool, const ENTRY_EVIDENCE: bool, Proof: S
         #[cfg(feature = "internal-checker")]
         if COLLECT && Proof::INTEGER_RETURN_PARTITIONS
             && matches!(body.boundary.results.as_slice(), [result] if matches!(result.ty, ScalarType::Unit | ScalarType::Bool))
-            && !body.structure.checker_direct_targets.is_empty()
+            && (!body.structure.checker_direct_targets.is_empty() || !body.structure.checker_ordinary_directive_calls.is_empty())
             && (ordinary_local_callers.contains(&(ordinal, item))
                 || !body.structure.checker_integer_call_locals.is_empty()
                 || body.structure.checker_direct_targets.keys().any(|occurrence| {
@@ -1544,6 +1544,12 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
     ) -> Result<((usize, usize), &'project ScalarModule, &'project ScalarFunction, &'project FunctionCallSites), ProjectCheck> {
         let &target = structure.checker_direct_targets.get(&call)
             .ok_or(ProjectCheck::MissingRootOccurrences)?;
+        self.validated_prepared_body(target, target_source, target_span)
+    }
+
+    fn validated_prepared_body(
+        &self, target: (usize, usize), target_source: &SourceIdentity, target_span: ByteSpan,
+    ) -> Result<((usize, usize), &'project ScalarModule, &'project ScalarFunction, &'project FunctionCallSites), ProjectCheck> {
         let (target_module, target_item) = target;
         let owner = self.project.modules.get(target_module).ok_or(ProjectCheck::MissingRoot)?;
         let Some(ScalarItem::Function(function)) = owner.items.get(target_item) else {
@@ -1624,7 +1630,12 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                     self.had_obligations |= active;
                     let completed = frames.pop().unwrap();
                     let Some((target, first_activation, effect, caller_axis)) = completed.target else { return Ok(result); };
-                    self.reached.insert(target);
+                    #[cfg(feature = "internal-checker")]
+                    let hypothetical = frames.last().is_some_and(|parent|
+                        parent.body.structure.checker_ordinary_directive_calls.contains_key(&effect.occurrence()));
+                    #[cfg(not(feature = "internal-checker"))]
+                    let hypothetical = false;
+                    if !hypothetical { self.reached.insert(target); }
                     self.active_depth -= 1;
                     if first_activation { self.active.remove(&target); }
                     frames.last_mut().ok_or(ProjectCheck::Unsupported)?.cursor.resume(effect, caller_axis, result)
@@ -1642,17 +1653,43 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
         let caller = parent.body;
         let call = effect.occurrence();
         let expected = effect.expected();
-        let site = caller.resolved_call_site(call).ok_or(ProjectCheck::MissingRootOccurrences)?;
-        let ResolvedCallTarget::ModuleCallable { source, declaration_span, concrete: ConcreteCallSelection::Declaration } =
-            &site.target else { return Err(ProjectCheck::Unsupported); };
-        let (target, owner, _, body) = self.validated_direct_body(&caller.structure, call, source, *declaration_span)?;
+        let prepared = {
+            #[cfg(feature = "internal-checker")]
+            if let Some(receipt) = caller.structure.checker_ordinary_directive_calls.get(&call) {
+                if !Observer::ORDINARY_INTEGER_LOCALS || collection.is_none() || *expected != ScalarType::Bool {
+                    return Err(ProjectCheck::Unsupported);
+                }
+                let (target, owner, _, body) = self.validated_prepared_body(receipt.target, &receipt.source, receipt.declaration)?;
+                if parent.source != &owner.source || !body.structure.checker_directives.is_empty()
+                    || !body.call_occurrences.is_empty() || !body.allocation_length_calls.is_empty()
+                    || !body.assignments.is_empty() || !body.arms.is_empty()
+                    || !body.structure.checker_contextual_occurrences.is_empty()
+                {
+                    return Err(ProjectCheck::Unsupported);
+                }
+                let signature = caller.structure.checker_directives.get(&call)
+                    .and_then(|directive| directive.call_signature.as_ref()).ok_or(ProjectCheck::MissingRootOccurrences)?;
+                Some((target, owner, body, signature))
+            } else { None }
+            #[cfg(not(feature = "internal-checker"))]
+            { None }
+        };
+        let (target, owner, body, signature) = if let Some(prepared) = prepared {
+            prepared
+        } else {
+            let site = caller.resolved_call_site(call).ok_or(ProjectCheck::MissingRootOccurrences)?;
+            let ResolvedCallTarget::ModuleCallable { source, declaration_span, concrete: ConcreteCallSelection::Declaration } =
+                &site.target else { return Err(ProjectCheck::Unsupported); };
+            let (target, owner, _, body) = self.validated_direct_body(&caller.structure, call, source, *declaration_span)?;
+            let signature = caller.checked_call_signatures.get(&call).ok_or(ProjectCheck::Unsupported)?;
+            (target, owner, body, signature)
+        };
         if collection.is_some_and(|collection| parent.source != &owner.source
             && (*expected != ScalarType::Unit || parent.source.project != owner.source.project || parent.source.package != owner.source.package
                 || collection.visits.and_then(|visits| visits.get(target.0)) != Some(&InitializationVisit::Completed)))
         {
             return Err(ProjectCheck::Unsupported);
         }
-        let signature = caller.checked_call_signatures.get(&call).ok_or(ProjectCheck::Unsupported)?;
         if !matches!(signature.outputs.outputs.as_slice(), [output] if &output.ty == expected)
             || (*expected != ScalarType::Unit && (!Observer::EXACT_INTEGER_CALL_CONTINUATIONS
                 || !supported_integer_continuation_shape_for(body, expected, Observer::ORDINARY_INTEGER_LOCALS)))
@@ -1976,7 +2013,8 @@ fn supported_integer_continuation_shape_for(body: &FunctionCallSites, expected: 
             directive.operation == CheckerOperation::Require
                 && (matches!(directive.predicate, Some(CheckerPredicate::Boolean(_) | CheckerPredicate::Integer(_)))
                     || body.structure.checker_ordinary_integer_comparisons.contains_key(occurrence)
-                    || body.structure.checker_ordinary_booleans.contains_key(occurrence))
+                    || body.structure.checker_ordinary_booleans.contains_key(occurrence)
+                    || body.structure.checker_ordinary_directive_calls.contains_key(occurrence))
         });
     }
     #[cfg(not(feature = "internal-checker"))]

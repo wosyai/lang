@@ -778,6 +778,39 @@ cases.extend([
     ("exact-startup-direct-guard-reached-call-reports",
      guard_actual.replace("entry > 4 &&","entry >= 4 &&"),136,b"REACHED-CALLEE"),
 ])
+directive_probe = f"""%%start
+    bool(i8) admitted = fn(entry) {{ if (entry < 4) {{ true }} else {{ false }} }};
+    unit(i8) check = fn(entry) {{
+        core.narrow(admitted(entry), {report(145,"DIRECT-NARROW")});
+        core.require(entry <= 3, {report(146,"PROBE-REFINEMENT")});
+    }};
+    %%end"""
+directive_preserve = f"""%%start
+    bool(i8) admitted = fn(entry) {{ if (entry < 4) {{ true }} else {{ false }} }};
+    unit(i8) check = fn(entry) {{
+        core.require(admitted(entry), {report(147,"DIRECT-REQUIRE")});
+        if (entry == 5) {{ core.require(false, {report(148,"REQUIRE-KEEPS-PATH")}); }};
+    }};
+    %%end"""
+directive_fixed = f"""%%start
+    bool(bool,i8) admitted = fn(flag, entry) {{
+        if (flag) {{ if (entry < 4) {{ true }} else {{ false }} }} else {{ false }}
+    }};
+    unit(i8) check = fn(entry) {{
+        core.narrow(admitted(true,entry), {report(149,"DIRECT-FIXED")});
+        core.require(entry <= 3, {report(150,"DIRECT-FIXED-OUT")});
+    }};
+    %%end"""
+directive_actual = directive_probe.replace("%%end","check(5);\n    %%end")
+directive_impure = directive_probe.replace("if (entry < 4)", f'core.require(entry >= 0, {report(151,"IMPURE")}); if (entry < 4)')
+cases.extend([
+    ("bare-directive-predicate-narrows-symbolic-input",directive_probe,0,b""),
+    ("bare-directive-predicate-narrow-witness",directive_probe.replace("entry <= 3","entry <= 2"),146,b"PROBE-REFINEMENT"),
+    ("bare-directive-require-keeps-original-continuation",directive_preserve,147,b"DIRECT-REQUIRE" b"REQUIRE-KEEPS-PATH"),
+    ("bare-directive-predicate-fixed-bool",directive_fixed,0,b""),
+    ("exact-startup-bare-directive-reports-empty-narrow",directive_actual,145,b"DIRECT-NARROW"),
+    ("hypothetical-directive-callee-require-refused",directive_impure,2,b"unsupported analysis"),
+])
 with tempfile.TemporaryDirectory(prefix="affine-calls-") as path:
     root=Path(path)
     (root/"src").mkdir()
@@ -785,7 +818,7 @@ with tempfile.TemporaryDirectory(prefix="affine-calls-") as path:
         (root/"wosy.toml").write_text(manifest.format(output=target))
         for scope in ("--main-flow-only","--declared-package"):
             for name,text,expected,stderr in cases:
-                included = scope == "--declared-package" or name in ("exact-startup-lexical-copy", "exact-startup-inline-arithmetic", "exact-startup-lexical-comparison", "exact-startup-bool-argument", "exact-startup-staged-bool-result", "exact-startup-direct-guard-skips-dead-call", "exact-startup-direct-guard-reached-call-reports")
+                included = scope == "--declared-package" or name in ("exact-startup-lexical-copy", "exact-startup-inline-arithmetic", "exact-startup-lexical-comparison", "exact-startup-bool-argument", "exact-startup-staged-bool-result", "exact-startup-direct-guard-skips-dead-call", "exact-startup-direct-guard-reached-call-reports", "exact-startup-bare-directive-reports-empty-narrow")
                 code = expected if included else 0
                 expected_stderr = stderr if included else b""
                 (root/"src/main.w").write_text(text.strip()+"\n")

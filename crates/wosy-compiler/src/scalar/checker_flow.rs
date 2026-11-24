@@ -3162,6 +3162,13 @@ fn nested_integer_operand<'a>(
         return Some(NestedIntegerOperand::Exact((ty, value)));
     }
     let PlainNameIdentity::Lexical(binding) = calls.prepared_plain_name(argument)? else { return None; };
+    nested_lexical_operand(ty, binding, roots, path, work)
+}
+
+fn nested_lexical_operand<'a>(
+    ty: &'a ScalarType, binding: &ReferenceBindingId, roots: &IntegerRoots<'_>,
+    path: &'a IntegerInputs, work: Option<&mut usize>,
+) -> Option<NestedIntegerOperand<'a>> {
     let (axis, binding_type) = roots.lookup(binding)?;
     if binding_type != ty {
         return None;
@@ -3183,6 +3190,13 @@ fn nested_pair_argument<'a>(
 ) -> Option<NestedIntegerArgument<'a>> {
     let first = nested_integer_operand(calls, expression, 0, roots, path, allow_bool, work.as_deref_mut())?;
     let second = nested_integer_operand(calls, expression, 1, roots, path, allow_bool, work.as_deref_mut())?;
+    classify_nested_pair(first, second, path, allow_projection, allow_equal, allow_independent, work)
+}
+
+fn classify_nested_pair<'a>(
+    first: NestedIntegerOperand<'a>, second: NestedIntegerOperand<'a>, path: &'a IntegerInputs,
+    allow_projection: bool, allow_equal: bool, allow_independent: bool, mut work: Option<&mut usize>,
+) -> Option<NestedIntegerArgument<'a>> {
     let mut equal_axes = |left, right| {
         left == right || path.0.iter().all(|row| {
             if let Some(work) = work.as_deref_mut() {
@@ -3217,13 +3231,45 @@ fn actual_nested_argument<'a>(
     path: &'a IntegerInputs,
     allow_projection: bool, allow_bool: bool, work: Option<&mut usize>,
 ) -> NestedIntegerArgument<'a> {
-    match nested_integer_operand(calls, expression, 0, roots, path, allow_bool, work) {
+    classify_nested_single(
+        nested_integer_operand(calls, expression, 0, roots, path, allow_bool, work),
+        path, allow_projection,
+    )
+}
+
+fn classify_nested_single<'a>(
+    operand: Option<NestedIntegerOperand<'a>>, path: &'a IntegerInputs, allow_projection: bool,
+) -> NestedIntegerArgument<'a> {
+    match operand {
         Some(NestedIntegerOperand::Exact(argument)) => NestedIntegerArgument::Single(Some(argument)),
         Some(NestedIntegerOperand::Axis(ty, caller_axis)) if allow_projection =>
             NestedIntegerArgument::Projected(ProjectedIntegerArgument {
                 ty, caller_axis, slot: 0, path, companion: ProjectedCompanion::Unary, affine_work: None,
             }),
         _ => NestedIntegerArgument::Single(None),
+    }
+}
+
+#[cfg(feature = "internal-checker")]
+fn ordinary_directive_arguments<'a>(
+    operands: &'a [super::reference::CheckerDirectiveCallOperand], parameters: &'a [ScalarType],
+    roots: &IntegerRoots<'_>, path: &'a IntegerInputs, unary_projection: bool, pair_projection: bool,
+    mut work: Option<&mut usize>,
+) -> Option<NestedIntegerArgument<'a>> {
+    use super::reference::CheckerDirectiveCallOperand as Operand;
+    let mut resolve = |operand: &'a Operand, ty: &'a ScalarType| match operand {
+        Operand::Literal(value) => Some(NestedIntegerOperand::Exact((ty, value))),
+        Operand::Lexical(binding) => nested_lexical_operand(ty, binding, roots, path, work.as_deref_mut()),
+    };
+    match (operands, parameters) {
+        ([], []) => Some(NestedIntegerArgument::Single(None)),
+        ([operand], [ty]) => Some(classify_nested_single(Some(resolve(operand, ty)?), path, unary_projection)),
+        ([left, right], [left_ty, right_ty]) => {
+            let left = resolve(left, left_ty)?;
+            let right = resolve(right, right_ty)?;
+            classify_nested_pair(left, right, path, pair_projection, pair_projection, pair_projection, work)
+        }
+        _ => None,
     }
 }
 
@@ -4180,6 +4226,7 @@ struct OrdinaryGuard {
     next: Option<super::reference::CheckerOrdinaryBoolean>,
     frames: Vec<GuardFrame>,
     returned: Option<[IntegerInputs; 2]>,
+    directive_before: Option<IntegerInputs>,
 }
 
 #[cfg(feature = "internal-checker")]
@@ -4404,12 +4451,14 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
         next += 1;
         let tail = if branches.is_empty() { root_tail } else { None };
         #[cfg(feature = "internal-checker")]
-        let evaluated_guard = {
-            let mut result = None;
+        let mut evaluated_guard = {
+            let mut result = (None, None);
             if SUSPEND_CALL && suspend_integer && roots.ordinary_comparison_work.is_some()
-                && !structure.checker_ordinary_call_guards.is_empty()
+                && (!structure.checker_ordinary_call_guards.is_empty() || !structure.checker_ordinary_directive_calls.is_empty())
             {
                 let condition = match &item.kind {
+                    BlockItemKind::Evaluation { expression } if structure.checker_ordinary_directive_calls.contains_key(expression) =>
+                        Some(*expression),
                     BlockItemKind::Evaluation { expression } => match calls.conditionals.get(expression) {
                         Some(ConditionalRegion::Unit { condition, .. }) => Some(*condition),
                         Some(ConditionalRegion::Value { condition, .. })
@@ -4426,13 +4475,21 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                     _ => None,
                 };
                 if let Some((condition, nodes)) = condition.and_then(|condition|
-                    structure.checker_ordinary_call_guards.get(&condition).map(|nodes| (condition, *nodes)))
+                    structure.checker_ordinary_call_guards.get(&condition).copied()
+                        .or_else(|| structure.checker_ordinary_directive_calls.contains_key(&condition).then_some(1))
+                        .map(|nodes| (condition, nodes)))
                 {
                     if guard.is_none() {
-                        charge_call_work(roots.ordinary_comparison_work.as_mut()?, nodes)?;
-                        let boolean = structure.checker_ordinary_booleans.get(&condition)?.clone();
+                        let work = roots.ordinary_comparison_work.as_mut()?;
+                        charge_call_work(work, nodes)?;
+                        let (boolean, directive_before) = if structure.checker_ordinary_directive_calls.contains_key(&condition) {
+                            charge_partition_capture(work, &path, roots.axes.len())?;
+                            (super::reference::CheckerOrdinaryBoolean::Call(condition), Some(IntegerInputs(path.0.clone())))
+                        } else {
+                            (structure.checker_ordinary_booleans.get(&condition)?.clone(), None)
+                        };
                         guard = Some(OrdinaryGuard {
-                            condition, next: Some(boolean), frames: Vec::new(), returned: None,
+                            condition, next: Some(boolean), frames: Vec::new(), returned: None, directive_before,
                         });
                     }
                     let active = guard.as_mut()?;
@@ -4446,7 +4503,10 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                                 call, binding: None, ty: &ScalarType::Bool,
                             }));
                         }
-                        GuardProgress::Done(rows) => { result = Some(rows); guard = None; }
+                        GuardProgress::Done(rows) => {
+                            result = (Some(rows), active.directive_before.take());
+                            guard = None;
+                        }
                     }
                 } else if guard.is_some() { return None; }
             }
@@ -4455,6 +4515,31 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
         match item.kind {
             BlockItemKind::Evaluation { expression } => {
                 if let Some(directive) = structure.checker_directives.get(&expression) {
+                    #[cfg(feature = "internal-checker")]
+                    if evaluated_guard.1.is_some() {
+                        let [rejected, accepted] = evaluated_guard.0.take()?;
+                        let before = evaluated_guard.1.take()?;
+                        if !COLLECT { return None; }
+                        roots.reached_obligation = true;
+                        let failing = if directive.operation == CheckerOperation::Require {
+                            path = before;
+                            rejected
+                        } else if accepted.is_unreachable() {
+                            before
+                        } else {
+                            path = accepted;
+                            IntegerInputs::default()
+                        };
+                        if !failing.is_unreachable() {
+                            let work = roots.ordinary_comparison_work.as_mut()?;
+                            let equal_axes = failing.common_equal_axes_bounded(work)?;
+                            charge_call_work(work, roots.axes.len())?;
+                            (failures.as_deref_mut()?.sink)(IntegerCheckFailure {
+                                directive: expression, equal_axes, state: failing, axes: roots.axes.clone(),
+                            });
+                        }
+                        continue;
+                    }
                     #[cfg(feature = "internal-checker")]
                     if COLLECT && roots.ordinary_comparison_work.is_some() {
                         let require = directive.operation == CheckerOperation::Require;
@@ -4563,8 +4648,8 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                     };
                     #[cfg(feature = "internal-checker")]
                     let ordinary = {
-                        let comparison = if evaluated_guard.is_some() {
-                            evaluated_guard
+                        let comparison = if evaluated_guard.0.is_some() {
+                            evaluated_guard.0
                         } else if authored_return.prefer_legacy_root_compound(calls, block, *condition, roots) {
                             None
                         } else {
@@ -4625,8 +4710,8 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                     let expected = tail?;
                     #[cfg(feature = "internal-checker")]
                     let ordinary = {
-                        let comparison = if evaluated_guard.is_some() {
-                            evaluated_guard
+                        let comparison = if evaluated_guard.0.is_some() {
+                            evaluated_guard.0
                         } else if authored_return.prefer_legacy_root_compound(calls, block, *condition, roots) {
                             None
                         } else {
@@ -5298,7 +5383,19 @@ impl<'a> ExactCallCursor<'a> {
         collect: bool, project: bool, project_pair: bool, project_independent: bool, allow_bool: bool,
     ) -> Option<NestedIntegerArgument<'borrow>> {
         let mut work = self.roots.affine_work;
-        let mut argument = if collect && parameters == 2 {
+        let ordinary_arguments = {
+            #[cfg(feature = "internal-checker")]
+            if let Some(receipt) = calls.structure.checker_ordinary_directive_calls.get(&call) {
+                let signature = calls.structure.checker_directives.get(&call)?.call_signature.as_ref()?;
+                Some(ordinary_directive_arguments(&receipt.operands, &signature.parameters, &self.roots,
+                    &self.block.path, project, project_pair, work.as_mut())?)
+            } else { None }
+            #[cfg(not(feature = "internal-checker"))]
+            { None }
+        };
+        let mut argument = if let Some(arguments) = ordinary_arguments {
+            arguments
+        } else if collect && parameters == 2 {
             nested_pair_argument(calls, call, &self.roots, &self.block.path,
                 project_pair, project_pair, project_independent, allow_bool, work.as_mut())?
         } else {
@@ -6063,6 +6160,7 @@ fn direct_guard_cursor_requests_only_reached_ordinary_calls() {
         next: Some(Boolean::And(Box::new([Boolean::Constant(enabled), Boolean::Call(call)]))),
         frames: Vec::new(),
         returned: None,
+        directive_before: None,
     };
     let mut roots = IntegerRoots { ordinary_comparison_work: Some(0), ..IntegerRoots::default() };
     let mut path = IntegerInputs::closed();

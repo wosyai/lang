@@ -6194,6 +6194,22 @@ impl CheckerOrdinaryBoolean {
     }
 }
 
+#[cfg(feature = "internal-checker")]
+#[derive(Clone, Debug, PartialEq)]
+pub(super) enum CheckerDirectiveCallOperand {
+    Literal(BigInt),
+    Lexical(ReferenceBindingId),
+}
+
+#[cfg(feature = "internal-checker")]
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct CheckerOrdinaryDirectiveCall {
+    pub(super) target: (usize, usize),
+    pub(super) source: SourceIdentity,
+    pub(super) declaration: ByteSpan,
+    pub(super) operands: Box<[CheckerDirectiveCallOperand]>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct OccurrenceStructure {
     pub(super) root: BlockOrdinal,
@@ -6218,6 +6234,8 @@ pub(super) struct OccurrenceStructure {
     pub(super) checker_direct_targets: HashMap<OccurrenceOrdinal, (usize, usize)>,
     #[cfg(any(test, feature = "internal-checker"))]
     pub(super) checker_integer_locals: HashMap<(BlockOrdinal, usize), ReferenceBindingId>,
+    #[cfg(feature = "internal-checker")]
+    pub(super) checker_ordinary_directive_calls: HashMap<OccurrenceOrdinal, CheckerOrdinaryDirectiveCall>,
     #[cfg(feature = "internal-checker")]
     pub(super) checker_ordinary_call_guards: HashMap<OccurrenceOrdinal, usize>,
     #[cfg(feature = "internal-checker")]
@@ -6255,6 +6273,7 @@ impl OccurrenceStructure {
     #[cfg(feature = "internal-checker")]
     pub(super) fn has_ordinary_predicates(&self) -> bool {
         !self.checker_ordinary_integer_comparisons.is_empty() || !self.checker_ordinary_booleans.is_empty()
+            || !self.checker_ordinary_directive_calls.is_empty()
     }
 
     fn new(span: ByteSpan) -> Self {
@@ -6293,6 +6312,8 @@ impl OccurrenceStructure {
             checker_ordinary_booleans: HashMap::new(),
             #[cfg(feature = "internal-checker")]
             checker_ordinary_call_guards: HashMap::new(),
+            #[cfg(feature = "internal-checker")]
+            checker_ordinary_directive_calls: HashMap::new(),
             #[cfg(any(test, feature = "internal-checker"))]
             checker_contextual_read_locals: HashMap::new(),
             #[cfg(any(test, feature = "internal-checker"))]
@@ -7119,6 +7140,44 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
     }
 
     #[cfg(feature = "internal-checker")]
+    fn ordinary_directive_call(
+        &self, condition: &ScalarExpression, names: &BTreeMap<String, WalkBinding>,
+        types: &BTreeMap<String, ScalarType>, signature: &CheckedCallSignature,
+    ) -> Option<CheckerOrdinaryDirectiveCall> {
+        let WalkMode::Callable(callable) = &self.mode else { return None; };
+        let ScalarExpression::Call { arguments, .. } = condition else { return None; };
+        let [output] = signature.outputs.outputs.as_slice() else { return None; };
+        if output.ty != ScalarType::Bool || signature.parameters.len() != arguments.len() || arguments.len() > 2 {
+            return None;
+        }
+        let mut origin = None;
+        let (target, _) = callable.target_resolver.resolve(condition, names, types, Some(signature), Some(&mut origin)).ok()?;
+        let ResolvedCallTarget::ModuleCallable { source, declaration_span, concrete: ConcreteCallSelection::Declaration } = target
+            else { return None; };
+        if &source != callable.target_resolver.source { return None; }
+        let operands = arguments.iter().zip(&signature.parameters).map(|(argument, ty)| {
+            if self.occurrence_typing.checked_expression_type(argument)? != ty || (!is_integer_type(ty) && *ty != ScalarType::Bool) {
+                return None;
+            }
+            match argument {
+                ScalarExpression::Name { name, .. } => {
+                    let PlainNameIdentity::Lexical(binding) = callable.target_resolver.plain_name(name, names)? else { return None; };
+                    Some(CheckerDirectiveCallOperand::Lexical(binding))
+                }
+                ScalarExpression::Boolean { value, .. } if *ty == ScalarType::Bool =>
+                    Some(CheckerDirectiveCallOperand::Literal(BigInt::from(u8::from(*value)))),
+                _ if is_integer_type(ty) => {
+                    let literal = super::checker_flow::concrete_integer_literal(argument)?;
+                    super::typecheck::integer_literal_fits_type(&literal, ty)
+                        .then(|| CheckerDirectiveCallOperand::Literal(literal.into_owned()))
+                }
+                _ => None,
+            }
+        }).collect::<Option<Vec<_>>>()?.into_boxed_slice();
+        Some(CheckerOrdinaryDirectiveCall { target: origin?, source, declaration: declaration_span, operands })
+    }
+
+    #[cfg(feature = "internal-checker")]
     fn ordinary_bool_call(&self, expression: &ScalarExpression, call: OccurrenceOrdinal) -> Option<OccurrenceOrdinal> {
         let ScalarExpression::Call { arguments, .. } = expression else { return None; };
         let signature = self.checked_call_signatures.get(&call)?;
@@ -7305,6 +7364,13 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
                 self.structure.checker_has_nonexact_require |= marker.operation != CheckerOperation::Require
                     || !matches!(predicate, Some(CheckerPredicate::Boolean(_) | CheckerPredicate::Integer(_)));
             }
+            let call_signature = self.occurrence_typing.take_call(condition);
+            #[cfg(feature = "internal-checker")]
+            if let Some(receipt) = call_signature.as_ref()
+                .and_then(|signature| self.ordinary_directive_call(condition, names, types, signature))
+            {
+                self.structure.checker_ordinary_directive_calls.insert(ordinal, receipt);
+            }
             self.structure.checker_directives.insert(
                 ordinal,
                 PreparedCheckerDirective {
@@ -7312,7 +7378,7 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
                     condition: expression_span(condition),
                     predicate,
                     initializer_predicate,
-                    call_signature: self.occurrence_typing.take_call(condition),
+                    call_signature,
                     output: marker.output,
                 },
             );
