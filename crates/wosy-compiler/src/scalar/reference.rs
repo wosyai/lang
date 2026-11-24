@@ -384,6 +384,7 @@ pub(super) struct ReferenceFlowBuilder<'a> {
     deferred_local_reborrow: bool,
     joined_local_reborrow: bool,
     has_joined_root_reborrow: bool,
+    joined_mutable_child: Option<ReferenceBindingId>,
     joined_reborrow_call_admission: Option<bool>,
     pub(super) source: SourceIdentity,
     pub(super) function_span: ByteSpan,
@@ -535,6 +536,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
             deferred_local_reborrow: local_reborrow && call_sites.call_occurrences.is_empty(),
             joined_local_reborrow: local_reborrow,
             has_joined_root_reborrow: false,
+            joined_mutable_child: None,
             joined_reborrow_call_admission: None,
             source: source.clone(),
             function_span: function.span,
@@ -2649,7 +2651,11 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             let joined_mode = if !self.has_joined_root_reborrow {
                                 Some(ScalarReferenceMutability::Mutable)
                             } else if self.proof_points.joined_shared_descendants.len() < MAX_JOINED_REBORROW_DESCENDANTS {
-                                Some(ScalarReferenceMutability::Shared)
+                                Some(if self.joined_mutable_child.as_ref() == Some(&binding) {
+                                    ScalarReferenceMutability::Mutable
+                                } else {
+                                    ScalarReferenceMutability::Shared
+                                })
                             } else {
                                 None
                             };
@@ -3882,6 +3888,17 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             || frozen == &self.cfg.points[value.0].possible_origins
                         {
                             self.proof_points.checked_binding_initializers.push((bind, value));
+                            if self.has_joined_root_reborrow && receiver == 0
+                                && matches!(ty, ScalarType::CheckedReference {
+                                    mutability: ScalarReferenceMutability::Mutable, inner,
+                                } if aggregate::ordinary_value(inner))
+                                && matches!(self.cfg.points[value.0].kind,
+                                    CfgPointKind::ReborrowThrough { mode: ScalarReferenceMutability::Mutable, .. })
+                                && self.cfg.points[value.0].successors.as_slice() == [bind]
+                                && self.cfg.points[value.0].scope == self.cfg.points[bind.0].scope
+                            {
+                                self.joined_mutable_child = Some(binding.clone());
+                            }
                             if self.has_joined_root_reborrow && receiver == 0
                                 && matches!(ty, ScalarType::CheckedReference {
                                     mutability: ScalarReferenceMutability::Shared, inner,
@@ -7058,7 +7075,6 @@ fn joined_root_reborrow_binding<'a>(
         return None;
     }
     let mutable = *mode == ScalarReferenceMutability::Mutable;
-    if mutable && !descendant_sites.is_empty() { return None; }
     let [bind] = point.successors.as_slice() else { return None };
     let child = points.get(bind.0)?;
     let CfgPointKind::Bind { binding: child_binding } = &child.kind else { return None };
@@ -7100,6 +7116,7 @@ fn joined_root_reborrow_binding<'a>(
                     return None;
                 }
                 let birth = holders[holder];
+                let writable = mutable && birth == point.id;
                 if let CfgPointKind::ReborrowThrough {
                     mode: ScalarReferenceMutability::Shared, place: ScalarPlace::Dereference { pointer, .. }, pointer_point,
                 } = &deref.kind
@@ -7119,7 +7136,7 @@ fn joined_root_reborrow_binding<'a>(
                     continue;
                 }
                 if let CfgPointKind::Bind { binding: alias } = &deref.kind {
-                    if mutable || aliases.binary_search(&(deref.id, rest.id)).is_err()
+                    if writable || aliases.binary_search(&(deref.id, rest.id)).is_err()
                         || alias == binding || holders.contains_key(alias) || alias_count == MAX_JOINED_REBORROW_ALIASES
                     {
                         return None;
@@ -7128,12 +7145,12 @@ fn joined_root_reborrow_binding<'a>(
                     alias_count += 1;
                     continue;
                 }
-                if mutable && exact_named_scalar_store_pointer(deref, points, scalar_stores, grouped_installs)
+                if writable && exact_named_scalar_store_pointer(deref, points, scalar_stores, grouped_installs)
                     == Some((rest.id, holder, None))
                 {
                     continue;
                 }
-                if !mutable && matches!(&deref.kind, CfgPointKind::Call { output: 0, argument_points, .. }
+                if !writable && matches!(&deref.kind, CfgPointKind::Call { output: 0, argument_points, .. }
                     if argument_points.as_slice() == [rest.id])
                     && read_calls.binary_search(&(deref.id, rest.id)).is_ok()
                 {
@@ -7174,7 +7191,7 @@ struct JoinedLoanFamily<'a> {
 }
 
 impl JoinedLoanFamily<'_> {
-    fn live_shared_origin(
+    fn live_authorized_origin(
         &self, points: &[ReferenceFlowPoint], facts: &[ReferenceOrigin], state: &ReferenceEdgeState,
         holder: &ReferenceBindingId, read: CfgPointId,
     ) -> Option<ReferenceOriginId> {
@@ -7187,9 +7204,11 @@ impl JoinedLoanFamily<'_> {
         // Compare the current edge's exact loan chain with the authored
         // issuance chain; neither selected root's observation authorizes the other edge.
         for _ in 0..=MAX_JOINED_REBORROW_DESCENDANTS {
-            if current.mode != ScalarReferenceMutability::Shared
-                || current.creation_span != points.get(issuance.0)?.source_span.range
-            { return None; }
+            let site = points.get(issuance.0)?;
+            let CfgPointKind::ReborrowThrough { mode, .. } = site.kind else { return None };
+            if current.mode != mode || current.creation_span != site.source_span.range {
+                return None;
+            }
             let parent = current.parent.as_deref()?;
             if issuance == self.first_issuance {
                 let owner = &parent.origin_place;
@@ -8183,7 +8202,9 @@ fn transfer_reference_facts(
             _ => None,
         };
         if let (Some(shape), Some(parents)) = (joined_reborrow_binding, joined_reborrow_parents) {
-            if matches!(initial_point.kind, CfgPointKind::ReborrowThrough { mode: ScalarReferenceMutability::Shared, .. }) {
+            if !shape.descendants.is_empty()
+                || matches!(initial_point.kind, CfgPointKind::ReborrowThrough { mode: ScalarReferenceMutability::Shared, .. })
+            {
                 joined_family = Some(JoinedLoanFamily { shape, first_issuance: id, selected_parents: parents });
             }
         }
@@ -8192,7 +8213,10 @@ fn transfer_reference_facts(
             let index = cfg.shared_scalar_read_calls.binary_search_by_key(&id, |&(call, _)| call).ok()?;
             let argument = cfg.shared_scalar_read_calls[index].1;
             let CfgPointKind::Read { binding } = &original_points[argument.0].kind else { return None };
-            family.shape.holders.contains_key(binding).then_some((family, binding, argument))
+            let issuance = *family.shape.holders.get(binding)?;
+            matches!(original_points[issuance.0].kind, CfgPointKind::ReborrowThrough {
+                mode: ScalarReferenceMutability::Shared, ..
+            }).then_some((family, binding, argument))
         });
         let projected_loan = match &initial_point.kind {
             CfgPointKind::Borrow { place, loan } if direct_checked_field_base(&place.place).is_some() => Some(loan),
@@ -8286,7 +8310,7 @@ fn transfer_reference_facts(
                 _ => None,
             };
             if let Some((family, holder, argument)) = joined_call {
-                let valid = family.live_shared_origin(original_points, cfg.facts, &state, holder, argument)
+                let valid = family.live_authorized_origin(original_points, cfg.facts, &state, holder, argument)
                     .and_then(|origin| match cfg.facts.get(origin.0)? {
                         ReferenceOrigin::Fresh { loan, .. } => Some(loan),
                         _ => None,
@@ -9298,7 +9322,7 @@ fn transfer_reference_facts(
                     let admitted = admitted.or_else(|| {
                         let family = joined_family.as_ref()?;
                         let (_, holder) = family.shape.descendants.get(&id)?;
-                        family.live_shared_origin(original_points, cfg.facts, &state, holder, *pointer_point)
+                        family.live_authorized_origin(original_points, cfg.facts, &state, holder, *pointer_point)
                     });
                     let Some(parent_id) = admitted else {
                         let reason = ReferenceAnalysisErrorReason::MissingRequiredDereferenceOrigin;

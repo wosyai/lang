@@ -12,6 +12,7 @@ enum Expected {
     LiveDescendantConflict,
     LiveFamilyConflict,
     LiveMutableConflict,
+    FrozenMutableConflict,
     Declined,
 }
 
@@ -51,19 +52,32 @@ fn check_case(text: &str, expected: Expected, witness_dir: Option<&str>) {
                     }), "{target}/{route}: {diagnostics:?}");
                 }
                 Expected::Declined => assert!(diagnostics.iter().any(|item| item.code == "B0003"), "{target}/{route}: {diagnostics:?}"),
-                Expected::LiveConflict | Expected::LiveDescendantConflict | Expected::LiveFamilyConflict | Expected::LiveMutableConflict => {
-                    let write = text.find("first = 3").expect("owner write") as u32;
+                Expected::LiveConflict | Expected::LiveDescendantConflict | Expected::LiveFamilyConflict | Expected::LiveMutableConflict | Expected::FrozenMutableConflict => {
+                    let write = if matches!(expected, Expected::FrozenMutableConflict) { "*child = seen + 4" } else { "first = 3" };
+                    let write = text.find(write).expect("conflicting write") as u32;
+                    let frozen = matches!(expected, Expected::FrozenMutableConflict);
+                    // Indirect stores first read the checked holder. The conflict is on
+                    // that operand token, not on the dereference operator or a later read.
+                    let write = write + u32::from(frozen);
                     let loan = match expected {
                         Expected::LiveDescendantConflict => "&(*child)",
                         Expected::LiveFamilyConflict => "&(*left)",
                         Expected::LiveMutableConflict => "&!(*parent)",
+                        Expected::FrozenMutableConflict => "&(*child)",
                         _ => "&(*parent)",
                     };
                     let child = text.find(loan).expect("child reborrow") as u32;
                     assert!(diagnostics.iter().any(|diagnostic| {
                         diagnostic.code == "B0003"
-                            && diagnostic.labels.first().is_some_and(|label| label.span.range.start == write)
-                            && diagnostic.labels.iter().skip(1).any(|label| label.span.range.start == child)
+                            && (!frozen || diagnostic.message == "read or move of unavailable place")
+                            && diagnostic.labels.first().is_some_and(|label| {
+                                label.span.range.start == write
+                                    && (!frozen || label.span.range.end == write + "child".len() as u32)
+                            })
+                            && diagnostic.labels.iter().skip(1).any(|label| {
+                                label.span.range.start == child
+                                    && (!frozen || label.span.range.end == child + loan.len() as u32)
+                            })
                     }), "{target}/{route}: {diagnostics:?}");
                 }
             }
@@ -261,9 +275,23 @@ fn joined_mutable_child_updates_only_its_selected_lexical_owner() {
     assert_ne!(live, program);
     check(&live, Expected::LiveMutableConflict);
 
-    let descendant = program.replace("u8 changed = *child;", "*u8 nested = &(*child); u8 changed = *nested;");
+    let descendant = program.replace("u8 changed = *child;", "*!u8 nested = &!(*child); u8 changed = *nested;");
     assert_ne!(descendant, program);
     check(&descendant, Expected::Declined);
+}
+
+#[test]
+fn joined_mutable_child_resumes_writes_after_shared_descendant_last_use() {
+    let program = joined_with_pointer_read(
+        "*child = seen + 2; *u8 frozen = &(*child); *u8 alias = frozen; u8 observed = pointer(alias); \
+         *child = seen + 4; u8 changed = *child; u8 left = first; u8 right = second;", "*value",
+    ).replace("*u8 child = &(*parent);", "*!u8 child = &!(*parent);")
+        .replace("    seen\n", "    if (choose) { if (observed == 9 && changed == 11 && left == 11 && right == 9) { seen } else { 0 } } else { if (observed == 11 && changed == 13 && left == 7 && right == 13) { seen } else { 0 } }\n");
+    check_case(&program, Expected::Valid, Some("WOSY_JOINED_FREEZE_IR_DIR"));
+    let live = program.replace("u8 observed = pointer(alias); *child = seen + 4;",
+        "*child = seen + 4; u8 observed = pointer(alias);");
+    assert_ne!(live, program);
+    check(&live, Expected::FrozenMutableConflict);
 }
 
 fn joined_with_scalar_call(after_read: &str) -> String {
