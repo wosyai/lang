@@ -446,6 +446,7 @@ impl ActualIntegerObserver for ProofFreeOrderedEvidence {
     const EXACT_INTEGER_NARROW_CONTINUATIONS: bool = true;
     const EXACT_INTEGER_LOCAL_WRITES: bool = true;
     const EXACT_COMPLETED_NAMESPACE_INTEGER_RETURNS: bool = true;
+    const EXACT_CONTEXTUAL_BOOLEAN_UNIT: bool = true;
     const ORDINARY_INTEGER_LOCALS: bool = true;
 
     fn observe(&mut self, _: (usize, usize), _: &[&BigInt], _: &BigInt) {}
@@ -1372,6 +1373,8 @@ trait ActualIntegerObserver {
     const EXACT_INTEGER_LOCAL_WRITES: bool = false;
     #[cfg(feature = "internal-checker")]
     const EXACT_COMPLETED_NAMESPACE_INTEGER_RETURNS: bool = false;
+    #[cfg(feature = "internal-checker")]
+    const EXACT_CONTEXTUAL_BOOLEAN_UNIT: bool = false;
     const INTEGER_RETURN_PARTITIONS: bool = false;
     const PROJECTED_FORMAL_WRITES: bool = false;
     const ORDINARY_PROJECTED_PAIR: bool = false;
@@ -1706,6 +1709,12 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
         #[allow(unused_mut)]
         let mut cursor = ExactCallCursor::new(body, exact, expected).ok_or(ProjectCheck::Unsupported)?;
         #[cfg(feature = "internal-checker")]
+        if ACTUAL_STARTUP && collection.is_some() && *expected == ScalarType::Unit && Observer::EXACT_CONTEXTUAL_BOOLEAN_UNIT
+            && body.structure.checker_has_bool_contextual_declaration
+        {
+            cursor.allow_exact_contextual_bool();
+        }
+        #[cfg(feature = "internal-checker")]
         if self.exact_integer_narrow_profile(collection.is_some()) { cursor.allow_empty_integer(); }
         #[cfg(feature = "internal-checker")]
         if self.exact_integer_local_write_shape(body, expected, collection.is_some()) {
@@ -1932,6 +1941,12 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
         }
         #[allow(unused_mut)]
         let mut cursor = ExactCallCursor::new(body, exact, expected).ok_or(ProjectCheck::Unsupported)?;
+        #[cfg(feature = "internal-checker")]
+        if ACTUAL_STARTUP && collection.is_some() && *expected == ScalarType::Unit && Observer::EXACT_CONTEXTUAL_BOOLEAN_UNIT
+            && body.structure.checker_has_bool_contextual_declaration
+        {
+            cursor.allow_exact_contextual_bool();
+        }
         #[cfg(feature = "internal-checker")]
         if self.exact_integer_narrow_profile(collection.is_some()) { cursor.allow_empty_integer(); }
         #[cfg(feature = "internal-checker")]
@@ -13176,6 +13191,43 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
             assert!(matches!(result, Err(ProjectCheck::Unsupported)));
             assert!(output.records.is_empty());
             assert!(actual.active.is_empty());
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn exact_contextual_boolean_overwrites_inner_place_and_restores_outer_binding() {
+        let inner = OUTPUT.replace(".code = 1", ".code = 98");
+        let outer = OUTPUT.replace(".code = 1", ".code = 99");
+        let program = format!(r#"%%start
+            unit() startup = fn {{
+                bool initial = true;
+                bool core.context.ready = initial;
+                if (core.context.ready) {{
+                    bool core.context.ready = core.context.ready;
+                    core.context.ready = false;
+                    core.require(core.context.ready, {inner});
+                }};
+                core.require(!core.context.ready, {outer});
+            }};
+            startup();
+        %%end"#);
+        let app = source("src/main.w", "exact-contextual-bool");
+        let prepared = prepare_proof_target(&app, &program).unwrap();
+        for scope in [ScalarCheckerScope::MainFlowOnly, ScalarCheckerScope::CurrentPackage] {
+            let receipt = run_closed_without_named_proofs(&prepared, scope, 1).unwrap();
+            let [inner, outer] = receipt.directives.as_slice() else { panic!("expected inner and restored outer Boolean receipts"); };
+            assert_eq!(inner.code(), &BigInt::from(98));
+            assert_eq!(outer.code(), &BigInt::from(99));
+            let inner_axes = inner.witness.axes().collect::<Vec<_>>();
+            let outer_axes = outer.witness.axes().collect::<Vec<_>>();
+            assert_eq!((inner_axes.len(), outer_axes.len()), (3, 2));
+            assert_eq!(inner_axes[1], outer_axes[1]);
+            assert_ne!(inner_axes[2], outer_axes[1]);
+            let zero = BigInt::from(0);
+            let one = BigInt::from(1);
+            assert!(inner.witness.intervals_at(0, 2).unwrap().eq([(&zero, &zero)]));
+            assert!(outer.witness.intervals_at(0, 1).unwrap().eq([(&one, &one)]));
         }
     }
 

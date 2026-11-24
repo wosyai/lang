@@ -875,6 +875,23 @@ def state_report(code, label, selected, extra=""):
     return ('{ .stdout = ""; .stderr = "'+label+'"; .code = '+str(code)
             +'; .files = [{ .path = "state.json"; .state = '+selected+'; }'+extra+']; }')
 
+contextual_bool_scopes = f"""%%start
+    unit() startup = fn {{
+        bool initial = true;
+        bool core.context.ready = initial;
+        if (core.context.ready) {{
+            bool core.context.ready = core.context.ready;
+            core.context.ready = false;
+            core.require(core.context.ready, {state_report(220,"INNER-FALSE","core.context.ready").replace("state.json","inner.json")});
+        }};
+        core.require(!core.context.ready, {state_report(221,"OUTER-TRUE","core.context.ready").replace("state.json","outer.json")});
+    }};
+    startup();
+    %%end"""
+cases.extend([
+    ("exact-startup-contextual-bool-restores-outer",contextual_bool_scopes,220,b"INNER-FALSEOUTER-TRUE"),
+    ("symbolic-contextual-bool-still-fails-closed",contextual_bool_scopes.replace("    startup();", ""),2,b"unsupported analysis"),
+])
 namespace_scalar_key = "exact-startup-completed-namespace-scalar-return"
 namespace_scalar_main = f"""%%start
     core.require(false, {report(210,"ROOT")});
@@ -1331,6 +1348,10 @@ nested_array_bytes = state_bytes({
     },
 })
 authored_files = {
+    "exact-startup-contextual-bool-restores-outer": {
+        "inner.json": b'{"type":{"kind":"bool"},"value":false}\n',
+        "outer.json": b'{"type":{"kind":"bool"},"value":true}\n',
+    },
     "authored-state-fixed-array-precision": {"state.json": fixed_array_bytes, "copy.json": fixed_array_bytes},
     "authored-state-array-inside-nominal": {"state.json": nested_array_bytes},
     namespace_scalar_key: {

@@ -6170,6 +6170,7 @@ pub(super) struct CheckerOrdinaryIntegerComparison {
 pub(super) enum CheckerOrdinaryBoolean {
     Constant(bool),
     Binding(ReferenceBindingId),
+    ContextualBinding(ReferenceBindingId),
     Call(OccurrenceOrdinal),
     Integer(super::checker_flow::IntegerPredicate),
     Lexical(CheckerOrdinaryIntegerComparison),
@@ -6220,6 +6221,8 @@ pub(super) struct OccurrenceStructure {
     pub(super) checked_types: CheckedOccurrenceTypes,
     #[cfg(feature = "internal-checker")]
     pub(super) checker_contextual_declarations: HashSet<(BlockOrdinal, usize)>,
+    #[cfg(feature = "internal-checker")]
+    pub(super) checker_has_bool_contextual_declaration: bool,
     #[cfg(any(test, feature = "internal-checker"))]
     pub(super) checker_contextual_occurrences: HashSet<OccurrenceOrdinal>,
     #[cfg(any(test, feature = "internal-checker"))]
@@ -6307,6 +6310,8 @@ impl OccurrenceStructure {
             checker_contextual_occurrences: HashSet::new(),
             #[cfg(feature = "internal-checker")]
             checker_contextual_declarations: HashSet::new(),
+            #[cfg(feature = "internal-checker")]
+            checker_has_bool_contextual_declaration: false,
             #[cfg(any(test, feature = "internal-checker"))]
             checker_directives: HashMap::new(),
             #[cfg(feature = "internal-checker")]
@@ -7224,9 +7229,25 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
     }
 
     #[cfg(feature = "internal-checker")]
+    fn ordinary_contextual_bool(
+        &self, expression: &ScalarExpression, occurrence: Option<OccurrenceOrdinal>,
+    ) -> Option<ReferenceBindingId> {
+        let ScalarExpression::Contextual { binding, ty: ScalarType::Bool, .. } = expression else { return None; };
+        if !matches!(self.mode, WalkMode::Callable(_)) { return None; }
+        let ty = match occurrence {
+            Some(ordinal) => self.structure.checked_types.expressions.get(&ordinal)?,
+            None => self.occurrence_typing.checked_expression_type(expression)?,
+        };
+        (*ty == ScalarType::Bool).then(|| binding.clone())
+    }
+
+    #[cfg(feature = "internal-checker")]
     fn ordinary_compound(
         &self, expression: &ScalarExpression, names: &BTreeMap<String, WalkBinding>, occurrence: Option<OccurrenceOrdinal>,
     ) -> Option<CheckerOrdinaryBoolean> {
+        if let Some(binding) = self.ordinary_contextual_bool(expression, occurrence) {
+            return Some(CheckerOrdinaryBoolean::ContextualBinding(binding));
+        }
         if let Some(binding) = self.ordinary_bool_binding(expression, names, occurrence) {
             return Some(CheckerOrdinaryBoolean::Binding(binding));
         }
@@ -7271,7 +7292,9 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
             ScalarExpression::Unary { operator: super::UnaryOperator::LogicalNot, operand, .. } =>
                 Boolean::Not(Box::new(self.prepare_ordinary_boolean(operand, names, child(OccurrenceEdge::UnaryOperand)?, remaining)?)),
             _ => {
-                if let Some(binding) = self.ordinary_bool_binding(expression, names, occurrence) {
+                if let Some(binding) = self.ordinary_contextual_bool(expression, occurrence) {
+                    Boolean::ContextualBinding(binding)
+                } else if let Some(binding) = self.ordinary_bool_binding(expression, names, occurrence) {
                     Boolean::Binding(binding)
                 } else if let Some(call) = occurrence.and_then(|call| self.ordinary_bool_call(expression, call)) {
                     Boolean::Call(call)
@@ -8792,6 +8815,15 @@ impl StructuralWalker<'_, '_> {
                 if receiver.contextual_storage.is_some() && outputs.secondary.is_empty() {
                     if let ScalarBindingOutput::Evaluate(value) = binding.output_source(0) {
                         self.record_contextual_signed_literal(outputs.primary, value, &receiver.ty);
+                        #[cfg(feature = "internal-checker")]
+                        if receiver.ty == ScalarType::Bool
+                            && self.structure.checked_types.expressions.get(&outputs.primary) == Some(&ScalarType::Bool)
+                        {
+                            if let ScalarExpression::Boolean { value, .. } = value {
+                                self.structure.checker_ordinary_bool_literals.insert(outputs.primary,
+                                    BigInt::from(u8::from(*value)));
+                            }
+                        }
                     }
                 }
             }
@@ -8864,6 +8896,8 @@ impl StructuralWalker<'_, '_> {
                     #[cfg(any(test, feature = "internal-checker"))]
                     if self.occurrence_typing.checker_directives_enabled() {
                         self.structure.checker_integer_locals.insert((position.block, position.item), id.clone());
+                        #[cfg(feature = "internal-checker")]
+                        { self.structure.checker_has_bool_contextual_declaration |= receiver.ty == ScalarType::Bool; }
                         #[cfg(feature = "internal-checker")]
                         if is_integer_type(&receiver.ty) && matches!(&initialization,
                             BindingInitialization::Outputs(outputs) if outputs.secondary.is_empty()

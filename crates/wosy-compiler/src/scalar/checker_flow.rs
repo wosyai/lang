@@ -1442,6 +1442,8 @@ struct IntegerRoots<'a> {
     #[cfg(feature = "internal-checker")]
     allow_ordinary_contextual_places: bool,
     #[cfg(feature = "internal-checker")]
+    allow_exact_contextual_bool: bool,
+    #[cfg(feature = "internal-checker")]
     ordinary_local_work: Option<usize>,
     #[cfg(feature = "internal-checker")]
     ordinary_comparison_work: Option<usize>,
@@ -4264,7 +4266,10 @@ impl IntegerInputs {
                     output[lane].0 = self.0.clone();
                 }
             }
-            Boolean::Binding(binding) => {
+            Boolean::Binding(binding) | Boolean::ContextualBinding(binding) => {
+                if matches!(condition, Boolean::ContextualBinding(_)) && !roots.allow_exact_contextual_bool {
+                    return None;
+                }
                 let (axis, ty) = roots.lookup(binding)?;
                 if *ty != ScalarType::Bool { return None; }
                 let one = BigInt::from(1u8);
@@ -5003,6 +5008,23 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
             }
             BlockItemKind::Assignment { group } => {
                 #[cfg(feature = "internal-checker")]
+                if roots.allow_exact_contextual_bool {
+                    if let Some((binding, ScalarType::Bool, rhs, destination)) = checked_scalar_assignment(calls, group) {
+                        if structure.checker_contextual_occurrences.contains(&destination) {
+                            let (axis, ty) = roots.lookup(binding)?;
+                            if *ty != ScalarType::Bool { return None; }
+                            let [row] = path.0.as_mut_slice() else { return None; };
+                            if row.affine.is_some() || row.entry.is_some() { return None; }
+                            bool_result_lane(row.get(axis)?.singleton_value()?)?;
+                            charge_call_work(roots.ordinary_local_work.get_or_insert(0),
+                                4usize.checked_add(row.equal_axes().len().checked_mul(3)?)?)?;
+                            let value = exact_contextual_boolean_value(calls, roots, row, rhs)?;
+                            row.overwrite(axis, value, false);
+                            continue;
+                        }
+                    }
+                }
+                #[cfg(feature = "internal-checker")]
                 if roots.projected_scalar_local_write {
                     if let Some(write) = projected_scalar_local_write(calls, group) {
                         path = apply_projected_scalar_local_write(calls, roots, path, write)?;
@@ -5188,6 +5210,21 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                 }
                 if let [receiver] = binding.receivers() {
                     if let Some(identity) = &receiver.contextual_storage {
+                        #[cfg(feature = "internal-checker")]
+                        if receiver.ty == ScalarType::Bool && roots.allow_exact_contextual_bool {
+                            let BindingInitialization::Outputs(outputs) = &binding.initialization else { return None; };
+                            if !outputs.secondary.is_empty() { return None; }
+                            let registered = structure.checker_integer_locals.get(&(block, item.position))?;
+                            if registered != identity { return None; }
+                            let [row] = path.0.as_slice() else { return None; };
+                            if row.affine.is_some() || row.entry.is_some() { return None; }
+                            let growth = row.len().checked_mul(3)?.checked_add(4)?;
+                            charge_call_work(roots.ordinary_local_work.get_or_insert(0), growth)?;
+                            let value = exact_contextual_boolean_value(calls, roots, row, outputs.primary)?;
+                            roots.add(identity, &receiver.ty);
+                            path.append_shared_local(&value);
+                            continue;
+                        }
                         if !super::typecheck::is_integer_type(&receiver.ty) {
                             return None;
                         }
@@ -5524,6 +5561,12 @@ impl<'a> ExactCallCursor<'a> {
         debug_assert!(self.projected_slot.is_none() && self.projected_pair.is_none());
         debug_assert!(self.tail.is_some_and(is_integer_type));
         self.roots.exact_returning_local_writes = true;
+    }
+
+    #[cfg(feature = "internal-checker")]
+    pub(super) fn allow_exact_contextual_bool(&mut self) {
+        debug_assert!(self.tail.is_none() && self.projected_slot.is_none() && self.projected_pair.is_none());
+        self.roots.allow_exact_contextual_bool = true;
     }
 
     pub(super) fn new(calls: &'a FunctionCallSites, exact: &[&BigInt], expected: &ScalarType) -> Option<Self> {
@@ -6478,6 +6521,23 @@ fn exact_returning_local_write_value(
     if source_ty != ty { return None; }
     let value = row.get(source)?;
     value.singleton_value()?;
+    Some(Rc::clone(value))
+}
+
+#[cfg(feature = "internal-checker")]
+fn exact_contextual_boolean_value(
+    calls: &FunctionCallSites, roots: &IntegerRoots<'_>, row: &IntegerRow, rhs: OccurrenceOrdinal,
+) -> Option<Rc<IntegerSet>> {
+    if calls.structure.checked_types.expressions.get(&rhs)? != &ScalarType::Bool { return None; }
+    if let Some(value) = scalar_call_literal(&calls.structure, rhs, &ScalarType::Bool, true) {
+        bool_result_lane(value)?;
+        return Some(Rc::new(IntegerSet::singleton(value)));
+    }
+    let PlainNameIdentity::Lexical(source) = calls.prepared_plain_name(rhs)? else { return None; };
+    let (axis, ty) = roots.lookup(source)?;
+    if *ty != ScalarType::Bool { return None; }
+    let value = row.get(axis)?;
+    bool_result_lane(value.singleton_value()?)?;
     Some(Rc::clone(value))
 }
 
