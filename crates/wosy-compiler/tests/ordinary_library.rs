@@ -1368,6 +1368,14 @@ fn lexical_conditional_owner_choice_releases_selected_original_after_read() {
     let consumed = text.replace("u64(u64, bool) drive", "u64(Packet) consume = fn(packet) { packet.length };\nu64(u64, bool) drive")
         .replace("    chosen.length", "    consume(chosen)");
     assert_ne!(consumed, text);
+    let recommit = |source: &str, endpoint: &str| source
+        .replace("u64(u64, bool) drive",
+            "Packet(u64, Packet, bool) first_relay = fn(prefix, packet, toggle) { prefix; toggle; packet };\nPacket(Packet) last_relay = fn(packet) { packet };\nu64(u64, bool) drive")
+        .replace(endpoint, &format!("Packet moved = first_relay(depth, chosen, choose);\n    Packet returned = last_relay(moved);\n    {}", endpoint.replace("chosen", "returned")));
+    let recommitted_release = recommit(text, "chosen.length");
+    let recommitted_consume = recommit(&consumed, "consume(chosen)");
+    assert_ne!(recommitted_release, text);
+    assert_ne!(recommitted_consume, consumed);
     let borrowed_then_consumed = consumed.replace("u64(Packet) consume",
         "u64(*u64) read_selected = fn(view) { *view };\nu64(Packet) consume")
         .replace("    consume(chosen)", "    read_selected(&chosen.length);\n    consume(chosen)");
@@ -1451,6 +1459,8 @@ fn lexical_conditional_owner_choice_releases_selected_original_after_read() {
     let nested_borrow = nested(&named_borrow);
     for (text, use_site) in [(text, "choice"), (consumed.as_str(), "consume"),
         (temporary.as_str(), "consume-temporary"), (borrowed.as_str(), "borrow"),
+        (recommitted_release.as_str(), "release-after-recommit"),
+        (recommitted_consume.as_str(), "consume-after-recommit"),
         (borrowed_then_consumed.as_str(), "consume-after-borrow"),
         (saved_then_consumed.as_str(), "consume-after-saved-borrow"),
         (through_calls.as_str(), "consume-after-forwarded-borrow"),
@@ -1467,6 +1477,7 @@ fn lexical_conditional_owner_choice_releases_selected_original_after_read() {
         let nested = use_site.starts_with("nested-");
         let base_use = use_site.strip_prefix("nested-").unwrap_or(use_site);
         let consuming = base_use.starts_with("consume");
+        let recommitting = base_use.ends_with("-recommit");
         let releases_saved = matches!(base_use, "release-after-saved-borrows" | "release-after-scalar-continuation");
         let multiple = releases_saved || base_use == "consume-after-multiple-borrows";
         let updates_metadata = base_use == "consume-after-metadata-write";
@@ -1486,7 +1497,7 @@ fn lexical_conditional_owner_choice_releases_selected_original_after_read() {
                     if project { emit_scalar_build_project_llvm(&build) }
                     else { wosy_compiler::emit_scalar_build_single_module_llvm(&build) }.map(|module| module.to_text())
                 };
-                let ir = emit(text).unwrap_or_else(|error| panic!("{target}/{project}: {error}"));
+                let ir = emit(text).unwrap_or_else(|error| panic!("{use_site}/{target}/{project}: {error}"));
                 let context = Context::create();
                 let module = context.create_module_from_ir(MemoryBuffer::create_from_memory_range_copy(ir.as_bytes(), target)).unwrap();
                 module.verify().unwrap();
@@ -1497,6 +1508,17 @@ fn lexical_conditional_owner_choice_releases_selected_original_after_read() {
                 let mut producers = vec![find("make_short"), find("make_long")];
                 if nested { producers.push(find("make_later")); }
                 let consumer = consuming.then(|| find("consume"));
+                let relays = recommitting.then(|| [find("first_relay"), find("last_relay")]);
+                if let Some([first, last]) = relays {
+                    for (relay, slot) in [(first, 1), (last, 0)] {
+                        let rows: Vec<_> = relay.get_basic_blocks().into_iter()
+                            .flat_map(|block| block.get_instructions()).collect();
+                        let [returned] = rows.as_slice() else { panic!("{ir}") };
+                        assert_eq!(returned.get_opcode(), InstructionOpcode::Return);
+                        assert_eq!(returned.get_operand(0).unwrap().value(), relay.get_nth_param(slot));
+                    }
+                }
+                let mut recommitted = Vec::new();
                 let reader = borrowing.then(|| find("read_selected"));
                 let whole_reader = multiple.then(|| find("read_whole"));
                 let mut expected_readers = whole_reader.into_iter().chain(reader);
@@ -1520,7 +1542,11 @@ fn lexical_conditional_owner_choice_releases_selected_original_after_read() {
                     let Some(callee) = call.get_called_fn_value() else { continue };
                     if producers.contains(&callee) {
                         writes.push((callee, arg(call.count_arguments() - 1), call.try_as_basic_value().basic().unwrap()));
+                    } else if relays.is_some_and(|relays| relays.contains(&callee)) {
+                        assert_eq!(call.count_arguments(), if Some(callee) == relays.map(|[first, _]| first) { 3 } else { 1 });
+                        recommitted.push(callee);
                     } else if Some(callee) == consumer {
+                        assert!(!recommitting || recommitted.len() == 2, "both identity returns precede terminal transfer");
                         assert!(!borrowing || reader_seen, "the certified read precedes sole owner transfer");
                         if middle_slot {
                             assert_eq!(call.count_arguments(), 4);
@@ -1537,10 +1563,12 @@ fn lexical_conditional_owner_choice_releases_selected_original_after_read() {
                         assert_eq!(arg(0).into_int_value().get_type().get_bit_width(), target_layout.pointer_size as u32 * 8);
                         reader_seen = Some(callee) == reader;
                     } else if callee.get_name().to_str().unwrap() == "__wosy_core_free" {
+                        assert!(!recommitting || recommitted.len() == 2, "both identity returns precede lexical release");
                         assert!(!borrowing || reader_seen, "the shared loan must end before release");
                         released.push(arg(0));
                     }
                 }
+                assert!(recommitted.iter().copied().eq(relays.into_iter().flatten()), "emit the exact relay chain once");
                 assert!(expected_readers.next().is_none(), "all authored observations must be emitted");
                 assert_eq!(writes.len(), producers.len(), "one call per exact leaf");
                 let descriptor = writes[0].1;
@@ -1571,7 +1599,12 @@ fn lexical_conditional_owner_choice_releases_selected_original_after_read() {
                         assert!(reads.contains(&descriptor), "the read must borrow the descriptor handed to consumer");
                     }
                     assert!(released.is_empty(), "the caller transferred rather than freed the receipt");
-                    assert_eq!(transfers, [(descriptor, selected)], "pass the descriptor and its independent backing");
+                    if recommitting {
+                        assert_eq!(transfers.len(), 1, "only the final receipt may transfer");
+                        assert_ne!(transfers[0].0, selected, "the returned descriptor remains distinct from its backing");
+                    } else {
+                        assert_eq!(transfers, [(descriptor, selected)], "pass the descriptor and its independent backing");
+                    }
                     let frees = |function: inkwell::values::FunctionValue<'_>| function.get_basic_blocks()
                         .into_iter().flat_map(|block| block.get_instructions()).filter(|row| {
                             let Ok(call) = CallSiteValue::try_from(*row) else { return false };
@@ -1623,6 +1656,8 @@ fn lexical_conditional_owner_choice_releases_selected_original_after_read() {
                         if base_use == "borrow" || releases_saved {
                             assert!(reads.contains(&descriptor), "field loan must borrow from the joined descriptor slot");
                         }
+                    } else if recommitting {
+                        assert!(!reads.is_empty(), "observe the recommitted descriptor");
                     } else {
                         assert!(reads.contains(&descriptor), "final field observation must use that slot");
                     }
@@ -1699,7 +1734,9 @@ fn lexical_conditional_owner_choice_releases_selected_original_after_read() {
                     assert!(emit(&uncertified).expect_err("only a certified noescape reader may borrow the joined owner")
                         .contains("aggregate owning call has no proved endpoint"));
                 } else {
-                    let extra = text.replace("    chosen.length\n", "    u64 observed = chosen.length;\n    observed\n");
+                    let holder = if recommitting { "returned" } else { "chosen" };
+                    let extra = text.replace(&format!("    {holder}.length\n"),
+                        &format!("    u64 observed = {holder}.length;\n    observed\n"));
                     assert_ne!(extra, text);
                     assert!(emit(&extra).expect_err("the extra binding is outside the exact observation-and-release corridor")
                         .contains("aggregate owning call has no proved endpoint"));
@@ -1710,10 +1747,12 @@ fn lexical_conditional_owner_choice_releases_selected_original_after_read() {
                         let high = choice_tree(split, high);
                         format!("if (depth < {split}) {{ {low} }} else {{ {high} }}")
                     }
-                    let many = text.replace("else { make_long(2) }", &format!("else {{ {} }}", choice_tree(0, 8)));
-                    assert_eq!(many.matches("make_long(2)").count(), 8);
-                    assert!(emit(&many).expect_err("nine owning leaves exceed the closed proof bound")
-                        .contains("aggregate owning call has no proved endpoint"));
+                    if !recommitting {
+                        let many = text.replace("else { make_long(2) }", &format!("else {{ {} }}", choice_tree(0, 8)));
+                        assert_eq!(many.matches("make_long(2)").count(), 8);
+                        assert!(emit(&many).expect_err("nine owning leaves exceed the closed proof bound")
+                            .contains("aggregate owning call has no proved endpoint"));
+                    }
                 }
             }
         }

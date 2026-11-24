@@ -2804,12 +2804,20 @@ enum LocalChoiceUse {
     Consume { point: CfgPointId, ordinal: OccurrenceOrdinal, slot: usize },
 }
 
+struct LocalChoiceRecommit {
+    relay: BodyKey,
+    slot: usize,
+    point: CfgPointId,
+    ordinal: OccurrenceOrdinal,
+}
+
 struct LocalReceiptChoice {
     block: BlockOrdinal,
     item: Option<usize>,
     conditional: OccurrenceOrdinal,
     leaves: BTreeSet<CfgPointId>,
     use_site: LocalChoiceUse,
+    recommits: Vec<LocalChoiceRecommit>,
 }
 
 struct Body<'a> {
@@ -2832,7 +2840,10 @@ impl Body<'_> {
         self.mixed_result_lanes().is_some()
     }
 
-    fn local_receipt_choice(&self) -> Option<LocalReceiptChoice> {
+    fn local_receipt_choice(
+        &self,
+        exact_relay: impl Fn(CfgPointId) -> Option<(BodyKey, usize)>,
+    ) -> Option<LocalReceiptChoice> {
         let facts = self.facts?;
         if !self.is_monomorphic || !(2..=MAX_LOCAL_CHOICE_LEAVES).contains(&facts.calls.len()) { return None; }
         let [output_ty] = self.sites.boundary.root_outputs.as_slice() else { return None };
@@ -2845,7 +2856,7 @@ impl Body<'_> {
             [bind, alias, result] if matches!(&alias.kind, BlockItemKind::Binding(view)
                 if matches!(view.receivers(), [receiver] if matches!(receiver.ty, ScalarType::CheckedReference { .. }))) =>
                 (bind, Some(alias), &[][..], result),
-            [bind, before_consume @ .., result] if before_consume.len() <= MAX_PRE_TRANSFER_OBSERVATIONS + 1 =>
+            [bind, before_consume @ .., result] =>
                 (bind, None, before_consume, result),
             _ => return None,
         };
@@ -2871,6 +2882,47 @@ impl Body<'_> {
             || join.source_span.range != self.sites.occurrences.get(init.primary.0)?.span
         { return None; }
         let mut read = read;
+        let mut holder = holder;
+        let mut current_producer = None;
+        let mut recommits = Vec::new();
+        let mut before_consume = before_consume;
+        // A selected backing may pass through a prefix of ordinary identity
+        // returns. Each step consumes the preceding lexical binding and
+        // immediately installs the unchanged descriptor in a fresh binding.
+        while let Some((BlockItem { kind: BlockItemKind::Binding(step), .. }, rest)) = before_consume.split_first() {
+            let [next_receiver] = step.receivers() else { break };
+            let BindingInitialization::Outputs(step_init) = &step.initialization else { break };
+            if next_receiver.ty != receiver.ty { break; }
+            let signature = self.sites.checked_call_signatures.get(&step_init.primary)?;
+            let [returned] = signature.outputs.outputs.as_slice() else { return None };
+            if !step_init.secondary.is_empty() || returned.ty != receiver.ty
+                || structure.checked_types.expressions.get(&step_init.primary) != Some(&receiver.ty)
+            { return None; }
+            let (call, slot, moved) = exact_owning_call_arguments(
+                points, read, scope, self.sites, step_init.primary, &signature.parameters, holder, &receiver.ty,
+            )?;
+            let (relay, relay_slot) = exact_relay(call.id)?;
+            let origins = facts.inputs.get(&(call.id, step_init.primary.0, slot, ArgumentProvenance::WholeMove(moved)))?;
+            let installed = next(call.id)?;
+            let CfgPointKind::Bind { binding } = &installed.kind else { return None };
+            if current_producer.is_some_and(|previous| previous >= call.id)
+                || slot != relay_slot || call.scope != scope || installed.scope != scope
+                || facts.calls.get(&call.id) != Some(&step_init.primary)
+                || !origins.iter().copied().eq([current_producer.map(|point| InputOrigin::Owner(OwnerSource::Call(point)))])
+                || !facts.direct_receipt_bindings.get(&call.id).is_some_and(|(site, holder)|
+                    *site == installed.id && holder == binding)
+                || binding == holder || binding.declaration_span != next_receiver.span
+            { return None; }
+            read = next(installed.id)?;
+            if read.scope != scope { return None; }
+            holder = binding;
+            current_producer = Some(call.id);
+            recommits.push(LocalChoiceRecommit { relay, slot, point: call.id, ordinal: step_init.primary });
+            before_consume = rest;
+        }
+        // The original selected-loan proof covers the installed join binding,
+        // not a synthesized loan on a later recommit binding.
+        if !recommits.is_empty() && (alias.is_some() || !before_consume.is_empty()) { return None; }
         let before_consume = if let Some((BlockItem {
             kind: BlockItemKind::Assignment { group }, ..
         }, rest)) = before_consume.split_first() {
@@ -3052,7 +3104,7 @@ impl Body<'_> {
             if let [parameter @ ScalarType::CheckedReference {
                 mutability: ScalarReferenceMutability::Shared, inner,
             }] = signature.parameters.as_slice() {
-                if self.sites.declared_unsafe_calls.contains(&scalar_call.0) { return None; }
+                if current_producer.is_some() || self.sites.declared_unsafe_calls.contains(&scalar_call.0) { return None; }
                 let OccurrenceNode::Expression(argument) = *structure.edges.get(&(
                     OccurrenceParent::Expression(scalar_call), OccurrenceEdge::CallArgument(0),
                 ))? else { return None };
@@ -3096,7 +3148,9 @@ impl Body<'_> {
                     points, read, scope, self.sites, scalar_call, &signature.parameters, holder, &receiver.ty,
                 )?;
                 let origins = facts.inputs.get(&(consumer.id, scalar_call.0, owned_slot, ArgumentProvenance::WholeMove(moved)))?;
-                if origins.len() != 1 || !origins.contains(&None) { return None; }
+                if !origins.iter().copied().eq([current_producer.map(|point| InputOrigin::Owner(OwnerSource::Call(point)))]) {
+                    return None;
+                }
                 if let Some(binding) = saved_observation {
                     let OccurrenceNode::Expression(right) = *structure.edges.get(&(
                         OccurrenceParent::Expression(output.expression), OccurrenceEdge::BinaryRight,
@@ -3120,7 +3174,7 @@ impl Body<'_> {
         };
         Some(LocalReceiptChoice {
             block: root, item: Some(bind.position), conditional: init.primary,
-            leaves: self.local_choice_leaves(init.primary, &receiver.ty)?, use_site,
+            leaves: self.local_choice_leaves(init.primary, &receiver.ty, &recommits)?, use_site, recommits,
         })
     }
 
@@ -3162,12 +3216,15 @@ impl Body<'_> {
         if origins.len() != 1 || !origins.contains(&None) { return None; }
         Some(LocalReceiptChoice {
             block: structure.root, item: None, conditional,
-            leaves: self.local_choice_leaves(conditional, parameter)?,
+            leaves: self.local_choice_leaves(conditional, parameter, &[])?,
             use_site: LocalChoiceUse::Consume { point: consumer.id, ordinal: output.expression, slot: 0 },
+            recommits: Vec::new(),
         })
     }
 
-    fn local_choice_leaves(&self, conditional: OccurrenceOrdinal, ty: &ScalarType) -> Option<BTreeSet<CfgPointId>> {
+    fn local_choice_leaves(
+        &self, conditional: OccurrenceOrdinal, ty: &ScalarType, recommits: &[LocalChoiceRecommit],
+    ) -> Option<BTreeSet<CfgPointId>> {
         let facts = self.facts?;
         let structure = &self.sites.structure;
         let points = &self.cfg.points;
@@ -3214,7 +3271,11 @@ impl Body<'_> {
                 }
             }
         }
-        (leaves.len() == facts.calls.len()).then_some(leaves)
+        // Every call is either a factory leaf or one predetermined prefix
+        // call. The bounded prefix is linear and strictly ordered; verify
+        // its exact call IDs are disjoint from the factory leaves.
+        (leaves.len() + recommits.len() == facts.calls.len()
+            && recommits.iter().all(|step| !leaves.contains(&step.point))).then_some(leaves)
     }
 
     fn structured_owner_return(&self) -> Option<StructuredOwnerReturn> {
@@ -4942,7 +5003,10 @@ fn closed_aggregates<'a>(
     let mut local_choice_consumers = BTreeMap::new();
     for (&key, body) in &bodies {
         if outgoing.contains(&key) { continue; }
-        let Some(choice) = body.local_receipt_choice() else { continue };
+        let Some(choice) = body.local_receipt_choice(|point| {
+            let target = target_body(&declarations, body.cfg, point)?;
+            Some((target, *identity_relays.get(&target)?))
+        }) else { continue };
         if !choice.leaves.iter().all(|&leaf| target_body(&declarations, body.cfg, leaf)
             .is_some_and(|target| outgoing.contains(&target)
                 && bodies.get(&target).is_some_and(|callee| !callee.has_mixed_struct_result())))
@@ -4951,7 +5015,11 @@ fn closed_aggregates<'a>(
             let callee = target_body(&declarations, body.cfg, point).ok_or("missing local conditional owner consumer")?;
             let mode = modes.get_mut(&(callee, slot)).ok_or("missing local conditional owner input")?;
             mode.0 = true;
-            local_choice_consumers.insert((key, point, ordinal.0), (slot, choice.conditional.0));
+            let receipt = choice.recommits.last().map_or(choice.conditional, |step| step.ordinal);
+            local_choice_consumers.insert((key, point, ordinal.0), (slot, receipt.0));
+        }
+        for step in &choice.recommits {
+            result.bodies.entry(step.relay).or_default().identity_relay = Some(step.slot);
         }
         local_choices.insert(key, choice);
     }
@@ -5486,15 +5554,24 @@ fn closed_aggregates<'a>(
             } else {
                 return Err("local conditional temporary has no consumer".into());
             }
+            let mut receipt = choice.conditional;
+            for step in &choice.recommits {
+                if plan.recommits.insert(step.ordinal.0, receipt.0).is_some() {
+                    return Err("duplicate local conditional recommit".into());
+                }
+                receipt = step.ordinal;
+            }
             if let LocalChoiceUse::Observe(exit) = choice.use_site {
                 plan.scope_exits.insert(choice.block.0, exit);
-                record_release(&mut plan, exit, exit, ClosedOwnerRelease { receipt: choice.conditional.0, guard: None })?;
+                record_release(&mut plan, exit, exit, ClosedOwnerRelease { receipt: receipt.0, guard: None })?;
             }
         }
         for (&point, &call) in &facts.calls {
             let previous = recommitted.get(&(key, point));
             if let Some(origin) = previous {
-                plan.recommits.insert(call.0, facts.calls[&origin.previous].0);
+                if plan.recommits.insert(call.0, facts.calls[&origin.previous].0).is_some() {
+                    return Err("ordinary and selected recommits overlap".into());
+                }
             } else if !target_body(&declarations, body.cfg, point)
                 .is_some_and(|target| outgoing.contains(&target))
             {
