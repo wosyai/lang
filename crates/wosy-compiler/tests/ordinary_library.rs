@@ -866,7 +866,14 @@ fn conditional_formal_transfer_uses_original_hidden_base_in_recursive_frames() {
 #[test]
 fn aggregate_owner_recommit_preserves_the_original_base_across_ordinary_identity_calls() {
     let app = source("workbench", "src/aggregate_owner_recommit.w");
-    let text = include_str!("fixtures/aggregate-owner-recommit.w");
+    let unary = include_str!("fixtures/aggregate-owner-recommit.w");
+    let companions = unary
+        .replace("Packet(Packet) first_identity = fn(packet) { packet };",
+            "Packet(u64, Packet, bool) first_identity = fn(prefix, packet, toggle) { prefix; toggle; packet };")
+        .replace("Packet(Packet) second_identity = fn(packet) { packet };",
+            "Packet(bool, u64, Packet) second_identity = fn(toggle, suffix, packet) { toggle; suffix; packet };")
+        .replace("first_identity(original)", "first_identity(length, original, true)")
+        .replace("second_identity(middle)", "second_identity(take, 7, middle)");
     for (target, target_layout) in [
         ("native64", ScalarTargetLayout::NATIVE64),
         ("wasm32", ScalarTargetLayout::WASM32),
@@ -880,60 +887,68 @@ fn aggregate_owner_recommit_preserves_the_original_base_across_ordinary_identity
             assert!(build.diagnostics().is_empty(), "{target}: {:?}", build.diagnostics());
             emit_scalar_build_project_llvm(&build).map(|module| module.to_text())
         };
-        let ir = emit(text).unwrap_or_else(|error| panic!("{target}: {error}"));
-        let context = Context::create();
-        let buffer = MemoryBuffer::create_from_memory_range_copy(ir.as_bytes(), target);
-        let module = context.create_module_from_ir(buffer).unwrap();
-        module.verify().unwrap();
-        let find = |name| module.get_function(&function_with_suffix(&module, name)).unwrap();
-        let (drive, producer, consumer) = (find("drive"), find("make_packet"), find("accept_packet"));
-        let (first, second) = (find("first_identity"), find("second_identity"));
-        let release = module.get_function("__wosy_core_free").unwrap();
-        for relay in [first, second] {
-            assert_eq!(relay.count_params(), 1, "{target}: {ir}");
-            assert!(matches!(relay.get_type().get_return_type(), Some(inkwell::types::BasicTypeEnum::PointerType(_))));
-            let rows: Vec<_> = relay.get_basic_blocks().into_iter()
-                .flat_map(|block| block.get_instructions()).collect();
-            let [return_row] = rows.as_slice() else { panic!("{target}: {ir}"); };
-            assert_eq!(return_row.get_opcode(), InstructionOpcode::Return);
-            assert_eq!(return_row.get_operand(0).unwrap().value(), relay.get_first_param());
-        }
-        let mut produced = Vec::new();
-        let mut passed = Vec::new();
-        let mut released = Vec::new();
-        let mut relays = Vec::new();
-        for row in drive.get_basic_blocks().into_iter().flat_map(|block| block.get_instructions()) {
-            if row.get_opcode() != InstructionOpcode::Call { continue; }
-            let call = CallSiteValue::try_from(row).unwrap();
-            let argument = |slot| row.get_operand(slot).unwrap().value().unwrap();
-            match call.get_called_fn_value() {
-                Some(callee) if callee == producer => produced.push(call.try_as_basic_value().basic().unwrap()),
-                Some(callee) if callee == consumer => passed.push(argument(call.count_arguments() - 1)),
-                Some(callee) if callee == release => released.push(argument(0)),
-                Some(callee) if callee == first || callee == second => {
-                    assert_eq!(call.count_arguments(), 1, "{target}: {ir}");
-                    relays.push(callee);
+        for (variant, text, slots, arities) in [
+            ("unary", unary, [0, 0], [1, 1]),
+            ("companions", companions.as_str(), [1, 2], [3, 3]),
+        ] {
+            let ir = emit(text).unwrap_or_else(|error| panic!("{target}: {error}"));
+            let context = Context::create();
+            let buffer = MemoryBuffer::create_from_memory_range_copy(ir.as_bytes(), target);
+            let module = context.create_module_from_ir(buffer).unwrap();
+            module.verify().unwrap();
+            let find = |name| module.get_function(&function_with_suffix(&module, name)).unwrap();
+            let (drive, producer, consumer) = (find("drive"), find("make_packet"), find("accept_packet"));
+            let (first, second) = (find("first_identity"), find("second_identity"));
+            let release = module.get_function("__wosy_core_free").unwrap();
+            for ((relay, slot), arity) in [first, second].into_iter().zip(slots).zip(arities) {
+                assert_eq!(relay.count_params(), arity, "{target}: {ir}");
+                assert!(matches!(relay.get_type().get_return_type(), Some(inkwell::types::BasicTypeEnum::PointerType(_))));
+                let rows: Vec<_> = relay.get_basic_blocks().into_iter()
+                    .flat_map(|block| block.get_instructions()).collect();
+                let [return_row] = rows.as_slice() else { panic!("{target}: {ir}"); };
+                assert_eq!(return_row.get_opcode(), InstructionOpcode::Return);
+                assert_eq!(return_row.get_operand(0).unwrap().value(), relay.get_nth_param(slot));
+            }
+            let mut produced = Vec::new();
+            let mut passed = Vec::new();
+            let mut released = Vec::new();
+            let mut relays = Vec::new();
+            for row in drive.get_basic_blocks().into_iter().flat_map(|block| block.get_instructions()) {
+                if row.get_opcode() != InstructionOpcode::Call { continue; }
+                let call = CallSiteValue::try_from(row).unwrap();
+                let argument = |slot| row.get_operand(slot).unwrap().value().unwrap();
+                match call.get_called_fn_value() {
+                    Some(callee) if callee == producer => produced.push(call.try_as_basic_value().basic().unwrap()),
+                    Some(callee) if callee == consumer => passed.push(argument(call.count_arguments() - 1)),
+                    Some(callee) if callee == release => released.push(argument(0)),
+                    Some(callee) if callee == first || callee == second => {
+                        assert_eq!(call.count_arguments(), arities[usize::from(callee == second)], "{target}: {ir}");
+                        relays.push(callee);
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
-        }
-        let [original, keeper, trailing] = produced.as_slice() else { panic!("{target}: {ir}"); };
-        assert_eq!(relays, [first, second]);
-        assert_eq!(passed, [*original]);
-        assert_eq!(released, [*trailing, *keeper, *original]);
+            let [original, keeper, trailing] = produced.as_slice() else { panic!("{target}: {ir}"); };
+            assert_eq!(relays, [first, second]);
+            assert_eq!(passed, [*original]);
+            assert_eq!(released, [*trailing, *keeper, *original]);
 
-        if let Some(out) = std::env::var_os("WOSY_RECOMMIT_RECEIPT_IR_DIR") {
-            let mut witness = ir.replace("@main(", "@wosy_authored_main(");
-            for (wrapper, name) in [("retain", "retain_witness"), ("transfer", "transfer_witness")] {
-                let symbol = function_with_suffix(&module, name);
-                witness.push_str(&format!(
-                    "\ndefine i64 @wosy_{wrapper}() {{\nentry:\n  %result = call i64 @{symbol}()\n  ret i64 %result\n}}\n"
-                ));
+            if let Some(out) = std::env::var_os("WOSY_RECOMMIT_RECEIPT_IR_DIR") {
+                let mut witness = ir.replace("@main(", "@wosy_authored_main(");
+                for (wrapper, name) in [("retain", "retain_witness"), ("transfer", "transfer_witness")] {
+                    let symbol = function_with_suffix(&module, name);
+                    witness.push_str(&format!(
+                        "\ndefine i64 @wosy_{wrapper}() {{\nentry:\n  %result = call i64 @{symbol}()\n  ret i64 %result\n}}\n"
+                    ));
+                }
+                let filename = if variant == "unary" { format!("{target}.ll") }
+                    else { format!("{variant}-{target}.ll") };
+                std::fs::write(std::path::PathBuf::from(out).join(filename), witness).unwrap();
             }
-            std::fs::write(std::path::PathBuf::from(out).join(format!("{target}.ll")), witness).unwrap();
+
         }
 
-        let replacement = text.replace(
+        let replacement = unary.replace(
             "Packet(Packet) second_identity = fn(packet) { packet };",
             "Packet(Packet) second_identity = fn(packet) { Packet different = { .data = null; .length = packet.length; }; different };",
         );

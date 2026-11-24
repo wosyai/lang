@@ -897,10 +897,11 @@ pub(super) fn requires_scoped_function_emission(plan: Option<&ClosedBody>) -> bo
 pub(super) fn emit_identity_relay<'ctx>(
     builder: &inkwell::builder::Builder<'ctx>,
     definition: FunctionValue<'ctx>,
+    owner_slot: usize,
 ) -> Result<(), String> {
-    let parameter = definition.get_first_param()
+    let parameter = definition.get_nth_param(owner_slot as u32)
         .ok_or_else(|| "missing same-owner relay parameter".to_owned())?;
-    if definition.count_params() != 1 || !matches!(parameter, BasicValueEnum::PointerValue(_))
+    if !matches!(parameter, BasicValueEnum::PointerValue(_))
         || !matches!(definition.get_type().get_return_type(), Some(inkwell::types::BasicTypeEnum::PointerType(_)))
     {
         return Err("same-owner relay changed its ordinary descriptor ABI".into());

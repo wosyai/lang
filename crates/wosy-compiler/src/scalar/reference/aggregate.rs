@@ -2641,7 +2641,7 @@ pub(crate) struct ClosedBody {
     pub(crate) ordinary_calls: BTreeMap<usize, SourceSpan>,
     pub(crate) calls: BTreeMap<usize, ClosedCall>,
     pub(crate) recommits: BTreeMap<usize, usize>,
-    pub(crate) identity_relay: bool,
+    pub(crate) identity_relay: Option<usize>,
     pub(crate) scope_exits: BTreeMap<usize, CfgPointId>,
     pub(crate) releases: BTreeMap<CfgPointId, Vec<ClosedOwnerRelease>>,
     pub(crate) conditional_inputs: BTreeMap<usize, ClosedConditionalInputs>,
@@ -2744,6 +2744,8 @@ impl StructuredOwnerReturn {
 
 // Exact source-ordered scalar companions around a unique whole owner move.
 // Used by both local receipt seeding and prepared owning-formal hops.
+const MAX_OWNING_CALL_ARGUMENTS: usize = 4;
+
 pub(super) fn exact_owning_call_arguments<'a>(
     points: &'a [ReferenceFlowPoint], first: &'a ReferenceFlowPoint, scope: ReferenceScopeId,
     sites: &FunctionCallSites, ordinal: OccurrenceOrdinal, parameters: &[ScalarType],
@@ -2751,7 +2753,6 @@ pub(super) fn exact_owning_call_arguments<'a>(
 ) -> Option<(&'a ReferenceFlowPoint, usize, CfgPointId)> {
     let structure = &sites.structure;
     let next = |id| linear_successor(points, id).and_then(|next| points.get(next.0));
-    const MAX_OWNING_CALL_ARGUMENTS: usize = 4;
     if parameters.len() > MAX_OWNING_CALL_ARGUMENTS || sites.declared_unsafe_calls.contains(&ordinal.0) {
         return None;
     }
@@ -3489,21 +3490,28 @@ impl Body<'_> {
             .then_some((call, terminal.expression))
     }
 
-    fn is_exact_identity_relay(&self) -> bool {
-        let Some(facts) = self.facts else { return false };
-        let ([parameter], [output]) = (
-            self.sites.boundary.parameters.as_slice(),
-            self.sites.boundary.root_outputs.as_slice(),
-        ) else { return false };
-        let Some(formal) = facts.formals.get(&0) else { return false };
-        if !self.is_monomorphic || parameter.ordinal != 0 || output.output != 0
-            || !matches!(parameter.ty, ScalarType::Struct(_)) || parameter.ty != output.ty
+    fn exact_identity_relay_slot(&self) -> Option<usize> {
+        let facts = self.facts?;
+        let [output] = self.sites.boundary.root_outputs.as_slice() else { return None };
+        let parameters = &self.sites.boundary.parameters;
+        if !self.is_monomorphic || parameters.len() > MAX_OWNING_CALL_ARGUMENTS || output.output != 0
+            || !matches!(output.ty, ScalarType::Struct(_))
+        { return None; }
+        let slot = parameters.iter().position(|parameter| parameter.ty == output.ty)?;
+        let parameter = &parameters[slot];
+        let formal = facts.formals.get(&slot)?;
+        if parameters.iter().enumerate().any(|(index, parameter)|
+            index != parameter.ordinal || (index != slot && !ordinary_value(&parameter.ty)))
             || !self.cfg.allocations.is_empty()
             || !facts.unsupported.is_empty() || facts.raw_invalid.is_some()
-            || !self.return_owners().eq([Some(OwnerSource::Formal(0))])
+            || !self.return_owners().eq([Some(OwnerSource::Formal(slot))])
         {
-            return false;
+            return None;
         }
+        let is_companion = |binding: &ReferenceBindingId| binding.kind == ReferenceBindingKind::Declared
+            && binding.source == formal.source && binding.function_span == formal.function_span
+            && binding.block_span == formal.block_span && parameters.iter().enumerate().any(|(index, parameter)|
+                index != slot && parameter.span == binding.declaration_span);
         let mut read = None;
         let mut moved = false;
         let mut returned = false;
@@ -3511,21 +3519,23 @@ impl Body<'_> {
             if self.cfg.points.get(i + 1).map_or(!point.successors.is_empty(), |next|
                 point.successors.as_slice() != [next.id])
             {
-                return false;
+                return None;
             }
             match &point.kind {
                 CfgPointKind::Entry | CfgPointKind::ScopeEnter | CfgPointKind::ScopeExit | CfgPointKind::Return => {}
-                CfgPointKind::Bind { binding } if binding == formal => {}
+                CfgPointKind::Bind { binding } if binding == formal || is_companion(binding) => {}
+                // A discarded lexical scalar read is not an effect of the relay.
+                CfgPointKind::Read { binding } if !moved && is_companion(binding) => {}
                 CfgPointKind::Read { binding } if binding == formal && read.is_none() => read = Some(point.id),
                 CfgPointKind::Move { place, owner, ty } if read.is_some() && !moved
                     && owner == formal && place.binding == *formal && place.projections.is_empty()
                     && *ty == parameter.ty => moved = true,
                 CfgPointKind::ReturnOutput { output: 0, value_point, checked: false }
                     if moved && !returned && read == Some(*value_point) => returned = true,
-                _ => return false,
+                _ => return None,
             }
         }
-        returned
+        returned.then_some(slot)
     }
 
     fn return_owners(&self) -> impl Iterator<Item = Option<OwnerSource>> + '_ {
@@ -4488,8 +4498,8 @@ fn closed_aggregates<'a>(
             bodies.insert(key, Body { facts, cfg, sites, source: input.source, is_monomorphic, supports_input_result });
         }
     }
-    let identity_relays: BTreeSet<_> = bodies.iter().filter_map(|(&key, body)|
-        (key.2.is_none() && body.is_exact_identity_relay()).then_some(key)
+    let identity_relays: BTreeMap<_, _> = bodies.iter().filter_map(|(&key, body)|
+        key.2.is_none().then(|| body.exact_identity_relay_slot().map(|slot| (key, slot))).flatten()
     ).collect();
     // Only observed whole-move origins can re-key backing in the owning
     // caller. Direct identity relays themselves keep ordinary value ABI.
@@ -4562,15 +4572,15 @@ fn closed_aggregates<'a>(
                     for source in origins {
                         match *source {
                             Some(InputOrigin::Owner(OwnerSource::Call(producer)) | InputOrigin::Immediate(producer)) => {
-                                if identity_relays.contains(&target) {
+                                if let Some(&owning_slot) = identity_relays.get(&target) {
                                     let whole_move = match (*source, moved) {
                                         (Some(InputOrigin::Owner(_)), ArgumentProvenance::WholeMove(moved))
-                                            if origins.len() == 1 && slot == 0 => Some(moved),
+                                            if origins.len() == 1 && slot == owning_slot => Some(moved),
                                         _ => None,
                                     };
                                     recommit_edges.entry((key, producer)).or_default().push((point, whole_move));
                                 } else if let Some(origin) = target_body(&declarations, body.cfg, producer) {
-                                    if identity_relays.contains(&origin) {
+                                    if identity_relays.contains_key(&origin) {
                                         recommit_observers.entry((key, producer)).or_default().insert(receiver);
                                     } else {
                                         seed_targets.entry(origin).or_default().insert(receiver);
@@ -4617,7 +4627,7 @@ fn closed_aggregates<'a>(
                 }
                 OwnerSource::Call(point) => {
                     if let Some(target) = target_body(&declarations, body.cfg, point) {
-                        if identity_relays.contains(&target) {
+                        if identity_relays.contains_key(&target) {
                             recommit_returns.insert((key, point));
                         } else {
                             callers.entry(target).or_default().push(key);
@@ -4671,15 +4681,32 @@ fn closed_aggregates<'a>(
                 if owner == binding && place.binding == *binding && place.projections.is_empty())
             || facts.conditional_input_barriers.range(producer..=*result_bind).next().is_some()
             || !facts.calls.contains_key(&producer) || !facts.calls.contains_key(&consumer)
-            || recommitted.insert((caller, consumer), RecommitOrigin { previous: producer, birth }).is_some()
         {
             return Err(unsupported());
         }
         // This relay must return the caller's descriptor, not the ordinary
         // parameter copy in a callee-owned stack slot.
-        let relay = target_body(&declarations, body.cfg, consumer).filter(|relay| identity_relays.contains(relay))
+        let relay = target_body(&declarations, body.cfg, consumer).filter(|relay| identity_relays.contains_key(relay))
             .ok_or_else(unsupported)?;
-        result.bodies.entry(relay).or_default().identity_relay = true;
+        let slot = identity_relays[&relay];
+        let callee_parameters = &bodies[&relay].sites.boundary.parameters;
+        if callee_parameters.len() > 1 {
+            let CfgPointKind::Call { argument_points, .. } = &points[consumer.0].kind else { return Err(unsupported()) };
+            let first = argument_points.first().and_then(|first| points.get(first.0)).ok_or_else(unsupported)?;
+            let ordinal = facts.calls[&consumer];
+            let parameters: Vec<_> = callee_parameters.iter().map(|parameter| parameter.ty.clone()).collect();
+            if first.id <= *original_bind
+                || exact_owning_call_arguments(points, first, root, body.sites, ordinal, &parameters,
+                binding, &callee_parameters[slot].ty).map(|(point, slot, moved)| (point.id, slot, moved))
+                != Some((consumer, slot, moved))
+            {
+                return Err(unsupported());
+            }
+        }
+        if recommitted.insert((caller, consumer), RecommitOrigin { previous: producer, birth }).is_some() {
+            return Err(unsupported());
+        }
+        result.bodies.entry(relay).or_default().identity_relay = Some(slot);
         let recommitted_value = (caller, consumer);
         if recommit_returns.contains(&recommitted_value) && outgoing.insert(caller) {
             pending.push(caller);
@@ -5664,7 +5691,7 @@ fn closed_aggregates<'a>(
             ));
         }
         if returning || !plan.calls.is_empty() || !plan.recommits.is_empty() || plan.input.is_some() || !plan.input_calls.is_empty()
-            || plan.identity_relay || !plan.same_array_rebinds.is_empty() || !plan.fresh_array_recommits.is_empty() || plan.scalar_descriptor_assignment.is_some()
+            || plan.identity_relay.is_some() || !plan.same_array_rebinds.is_empty() || !plan.fresh_array_recommits.is_empty() || plan.scalar_descriptor_assignment.is_some()
             || plan.checked_backing_wrapper.is_some()
         {
             result.bodies.insert(key, plan);
