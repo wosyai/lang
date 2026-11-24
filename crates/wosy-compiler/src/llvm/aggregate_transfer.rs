@@ -300,9 +300,19 @@ pub(super) fn borrowed_extent_at(
                 && nodes.lexical_expression_declaration(pointer) == Some(formal)))
 }
 
-pub(super) fn tracks_borrowed_extent(state: &EmitState<'_, '_>, declaration: wosy_syntax::ByteSpan) -> bool {
-    state.aggregate.as_ref().and_then(|aggregate| aggregate.plan.borrowed_extent_call)
-        .is_some_and(|(_, expected)| expected == declaration)
+pub(super) fn capture_borrowed_extent<'ctx>(
+    state: &mut EmitState<'ctx, '_>,
+    declaration: wosy_syntax::ByteSpan,
+    count: inkwell::values::IntValue<'ctx>,
+) -> Result<(), String> {
+    if let Some(aggregate) = &mut state.aggregate {
+        if aggregate.plan.borrowed_extent_call.is_some_and(|(_, owner, _)| owner == declaration)
+            && aggregate.borrowed_extent.replace(count).is_some()
+        {
+            return Err("duplicate sealed borrowed array allocation".into());
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn extract_borrowed_extent_formal<'ctx>(
@@ -330,19 +340,23 @@ pub(super) fn emit_borrowed_extent_call<'ctx>(
     arguments: &[ScalarExpression],
     values: &[EmitValue<'ctx>],
 ) -> Result<Option<EmitValue<'ctx>>, String> {
-    let Some((occurrence, declaration)) = state.aggregate.as_ref().and_then(|aggregate| aggregate.plan.borrowed_extent_call)
+    let Some((occurrence, declaration, alias)) = state.aggregate.as_ref().and_then(|aggregate| aggregate.plan.borrowed_extent_call)
     else { return Ok(None) };
     let nodes = state.body_call_nodes.ok_or("missing sealed checked borrow nodes")?;
     if nodes.expression_ordinal(expression) != Some(occurrence) { return Ok(None); }
-    let [ScalarExpression::CheckedAddress { place: place @ crate::ScalarPlace::Name { name, .. }, .. }] = arguments
-    else { return Err("missing sealed borrowed array address".into()) };
-    if nodes.lexical_place_declaration(place) != Some(declaration) {
-        return Err("sealed borrowed extent changed its lexical backing".into());
+    let exact = match (arguments, alias) {
+        ([ScalarExpression::CheckedAddress { place: place @ crate::ScalarPlace::Name { .. }, .. }], None) =>
+            nodes.lexical_place_declaration(place) == Some(declaration),
+        ([argument @ ScalarExpression::Name { .. }], Some(alias)) =>
+            nodes.lexical_expression_declaration(argument) == Some(alias),
+        _ => false,
+    };
+    if !exact {
+        return Err("sealed borrowed extent changed its checked argument identity".into());
     }
     let [EmitValue::Basic(BasicValueEnum::IntValue(address))] = values
     else { return Err("missing sealed borrowed array address value".into()) };
-    let (storage, _) = state.storage.get(name).ok_or("missing sealed borrowed array storage")?;
-    let count = super::memory::capture_local_runtime_extent(context, state, place, *storage, false)?
+    let count = state.aggregate.as_mut().and_then(|aggregate| aggregate.borrowed_extent.take())
         .ok_or("missing sealed borrowed array extent")?;
     let function = *state.functions.get(symbol).ok_or("missing sealed borrowed array observer")?;
     let descriptor = borrowed_extent_type(context, state.target_layout);

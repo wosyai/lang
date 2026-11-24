@@ -4172,6 +4172,37 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 Some(PlainNameIdentity::Lexical(prepared)) if prepared == source)
     }
 
+    fn borrowed_extent_argument(
+        &self,
+        argument: CfgPointId,
+        aliases: usize,
+    ) -> Option<(ByteSpan, Option<ByteSpan>)> {
+        let points = &self.cfg.points;
+        let mut value = argument;
+        let mut alias = None;
+        let installs = &self.proof_points.checked_binding_initializers;
+        for &(bind, initial) in installs.get(installs.len().checked_sub(aliases)?..)?.iter().rev() {
+            let CfgPointKind::Read { binding } = &points.get(value.0)?.kind else { return None };
+            if !matches!(self.binding_types.get(binding), Some(ScalarType::CheckedReference {
+                mutability: ScalarReferenceMutability::Shared, inner,
+            }) if matches!(inner.as_ref(), ScalarType::RuntimeArray { .. }))
+                || !matches!(&points[bind.0].kind, CfgPointKind::Bind { binding: actual } if actual == binding)
+                || points[bind.0].scope != ReferenceScopeId(0)
+                || points[bind.0].successors.as_slice() != [value]
+                || points[initial.0].successors.as_slice() != [bind]
+            {
+                return None;
+            }
+            alias.get_or_insert(binding.declaration_span);
+            value = initial;
+        }
+        let CfgPointKind::Borrow { place, loan } = &points.get(value.0)?.kind else { return None };
+        (loan.parent.is_none() && loan.mode == ScalarReferenceMutability::Shared
+            && place.projections.is_empty() && matches!(place.place, ScalarPlace::Name { .. })
+            && self.cfg.allocations.contains(&place.binding))
+            .then_some((place.binding.declaration_span, alias))
+    }
+
     fn record_binding_definition(
         &mut self,
         position: BlockPosition,
@@ -4927,27 +4958,30 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     if let BlockItemKind::FinalOutput(slot) = kind {
                         if scope == ReferenceScopeId(0) && slot.output == 0
                             && matches!(calls.boundary.root_outputs.as_slice(), [output] if output.ty == ScalarType::U64)
-                            && matches!(region.items.as_slice(), [
-                                BlockItem { kind: BlockItemKind::Binding(binding), .. },
-                                BlockItem { kind: BlockItemKind::FinalOutput(_), .. },
-                            ] if matches!(binding.initialization, BindingInitialization::Allocation { .. }))
                             && !calls.declared_unsafe_calls.contains(&slot.expression.0)
                             && calls.checked_call_signatures.get(&slot.expression).is_some_and(|signature|
                                 matches!(signature.parameters.as_slice(), [ScalarType::CheckedReference {
                                     mutability: ScalarReferenceMutability::Shared, inner,
                                 }] if matches!(inner.as_ref(), ScalarType::RuntimeArray { .. })))
                         {
-                            if let CfgPointKind::Call { output: 0, target: ResolvedCallTarget::ModuleCallable {
-                                concrete: ConcreteCallSelection::Declaration, ..
-                            }, argument_points, .. } = &self.cfg.points[value_point.0].kind {
-                                if let [argument] = argument_points.as_slice() {
-                                    if let CfgPointKind::Borrow { place, loan } = &self.cfg.points[argument.0].kind {
-                                        if loan.parent.is_none() && loan.mode == ScalarReferenceMutability::Shared
-                                            && place.projections.is_empty() && matches!(place.place, ScalarPlace::Name { .. })
-                                            && self.cfg.allocations.contains(&place.binding)
-                                        {
-                                            self.aggregate_facts.borrowed_extent_call =
-                                                Some((value_point, slot.expression, place.binding.declaration_span));
+                            if let [
+                                BlockItem { kind: BlockItemKind::Binding(root), .. },
+                                aliases @ ..,
+                                BlockItem { kind: BlockItemKind::FinalOutput(_), .. },
+                            ] = region.items.as_slice() {
+                                if matches!(root.initialization, BindingInitialization::Allocation { .. })
+                                    && aliases.iter().all(|item| matches!(&item.kind,
+                                        BlockItemKind::Binding(binding) if binding.receivers().len() == 1
+                                            && matches!(&binding.initialization, BindingInitialization::Outputs(init)
+                                                if init.secondary.is_empty())))
+                                {
+                                    if let CfgPointKind::Call { output: 0, target: ResolvedCallTarget::ModuleCallable {
+                                        concrete: ConcreteCallSelection::Declaration, ..
+                                    }, argument_points, .. } = &self.cfg.points[value_point.0].kind {
+                                        if let [argument] = argument_points.as_slice() {
+                                            if let Some((owner, alias)) = self.borrowed_extent_argument(*argument, aliases.len()) {
+                                                self.aggregate_facts.borrowed_extent_call = Some((value_point, slot.expression, owner, alias));
+                                            }
                                         }
                                     }
                                 }

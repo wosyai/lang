@@ -11720,12 +11720,19 @@ u64(u64) observe = fn(count) {
     u8[count] bytes;
     extent(&bytes)
 };
+u64(u64) via_aliases = fn(count) {
+    u8[count] bytes;
+    *(u8[]) first = &bytes;
+    *(u8[]) second = first;
+    extent(second)
+};
 if (observe(2) != 2) { core.system_panic(); };
-if (observe(7) != 7) { core.system_panic(); };
+if (via_aliases(7) != 7) { core.system_panic(); };
 %%end";
     let unpaired = text.replace("if (observe(2)", "u64(u64) not_exact = fn(count) {
     u8[count] bytes;
     *(u8[]) alias = &bytes;
+    count;
     extent(alias)
 };
 if (not_exact(3) != 3) { core.system_panic(); };
@@ -11762,11 +11769,17 @@ if (observe(2)");
             assert!(body.find(guard).unwrap() < body.find("ret i64 %borrowed_array_extent").expect("full incoming extent"), "{body}");
             assert!(!body.contains("deref_is_null") && !body.contains("inttoptr")
                 && !body.contains("getelementptr") && !body.contains("@__wosy_core_free"), "{body}");
-            let caller = self_tail_test_body(&llvm, "i64", &project_function_name(&source, "observe"));
             let call = format!("call i64 @{target}({paired} %borrowed_array_argument)");
-            assert_eq!(caller.matches(&call).count(), 1, "{caller}");
-            assert_eq!(caller.matches("call void @__wosy_core_free(").count(), 1, "{caller}");
-            assert!(caller.find(&call).unwrap() < caller.find("call void @__wosy_core_free(").unwrap(), "{caller}");
+            for named in ["observe", "via_aliases"] {
+                let caller = self_tail_test_body(&llvm, "i64", &project_function_name(&source, named));
+                assert_eq!(caller.matches(&call).count(), 1, "{caller}");
+                assert_eq!(caller.matches("call void @__wosy_core_free(").count(), 1, "{caller}");
+                let allocation = caller.lines().find(|line| line.contains("call ptr @__wosy_core_alloc("))
+                    .unwrap_or_else(|| panic!("original allocation: {caller}"));
+                let count = allocation.split_once("(i64 ").unwrap().1.split_once(',').unwrap().0;
+                assert!(caller.contains(&format!("insertvalue {paired} %borrowed_array_argument_address, i64 {count}, 1")), "{caller}");
+                assert!(caller.find(&call).unwrap() < caller.find("call void @__wosy_core_free(").unwrap(), "{caller}");
+            }
             if let Some(out) = std::env::var_os("WOSY_RUNTIME_BORROWED_EXTENT_IR_DIR") {
                 let target = if layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
                 let controlled = llvm.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);

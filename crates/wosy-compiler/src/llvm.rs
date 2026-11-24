@@ -1939,9 +1939,9 @@ fn store_binding_outputs<'ctx, 'module>(
         let prepared = state.body_call_nodes.is_some_and(|nodes| nodes.binding_position(binding).is_some());
         let checked_extent = prepared && state.require_release_checked_access
             && state.indexed_runtime_allocations.contains(&declaration);
-        let tracked_extent = checked_extent || aggregate_transfer::tracks_borrowed_extent(state, receiver.name_span)
-            || (prepared && state.observed_runtime_allocations.as_deref()
-                .is_some_and(|owners| owners.binary_search(&declaration).is_ok()));
+        let tracked_extent = checked_extent || (prepared && state.observed_runtime_allocations.as_deref()
+            .is_some_and(|owners| owners.binary_search(&declaration).is_ok()));
+        aggregate_transfer::capture_borrowed_extent(state, receiver.name_span, length)?;
         let slot = ownership::emit_runtime_array_allocation_with_domain(
             context, state, element, length, checked_extent,
         )?;

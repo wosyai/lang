@@ -64,7 +64,7 @@ pub(super) struct AggregateFlowFacts {
     pub(super) conditional_array_return: Option<ConditionalArrayReturn>,
     pub(super) array_installs: BTreeMap<CfgPointId, OccurrenceOrdinal>,
     pub(super) borrowed_extent_observer: Option<(CfgPointId, OccurrenceOrdinal, ByteSpan)>,
-    pub(super) borrowed_extent_call: Option<(CfgPointId, OccurrenceOrdinal, ByteSpan)>,
+    pub(super) borrowed_extent_call: Option<(CfgPointId, OccurrenceOrdinal, ByteSpan, Option<ByteSpan>)>,
     pub(super) array_formal_extent_borrows: BTreeSet<CfgPointId>,
     pub(super) neutral_array_calls: BTreeSet<CfgPointId>,
     pub(super) neutral_array_projections: BTreeMap<CfgPointId, CfgPointId>,
@@ -1255,7 +1255,7 @@ pub(super) struct AggregateFlowResult {
     pub(super) array_invalid: bool,
     pub(super) array_neutral: bool,
     pub(super) borrowed_extent_observer: Option<(CfgPointId, OccurrenceOrdinal, ByteSpan)>,
-    pub(super) borrowed_extent_call: Option<(CfgPointId, OccurrenceOrdinal, ByteSpan)>,
+    pub(super) borrowed_extent_call: Option<(CfgPointId, OccurrenceOrdinal, ByteSpan, Option<ByteSpan>)>,
     pub(super) array_formal_extent_required: bool,
     array_conditional_forwarded: bool,
     pub(super) array_calls: BTreeMap<CfgPointId, (OccurrenceOrdinal, CfgPointId, ReferenceBindingId)>,
@@ -2954,7 +2954,7 @@ pub(crate) struct ClosedBody {
     pub(crate) replacement_extent_observation: Option<usize>,
     pub(crate) array_descriptor_return: bool,
     pub(crate) borrowed_extent_observer: Option<(usize, ByteSpan)>,
-    pub(crate) borrowed_extent_call: Option<(usize, ByteSpan)>,
+    pub(crate) borrowed_extent_call: Option<(usize, ByteSpan, Option<ByteSpan>)>,
     pub(crate) array_descriptor_identity: bool,
     pub(crate) array_descriptor_observer: Option<ByteSpan>,
     pub(crate) array_descriptor_forward: Option<usize>,
@@ -5927,29 +5927,30 @@ fn seal_array_descriptor_identities(
 fn seal_borrowed_extent_observers(
     ordinary: &OrdinaryCohorts,
     observations: &BTreeMap<BodyKey, (OccurrenceOrdinal, ByteSpan)>,
-    callers: &[(BodyKey, &Body<'_>, (CfgPointId, OccurrenceOrdinal, ByteSpan))],
+    callers: &[(BodyKey, &Body<'_>, (CfgPointId, OccurrenceOrdinal, ByteSpan, Option<ByteSpan>))],
     declarations: &HashMap<(&SourceIdentity, ByteSpan), (usize, usize)>,
     result: &mut ClosedAggregates,
     checked_access: bool,
 ) {
     if !checked_access || observations.is_empty() { return; }
     let mut sites = HashMap::new();
-    for &(caller, body, (point, occurrence, declaration)) in callers {
+    for &(caller, body, (point, occurrence, declaration, alias)) in callers {
         if let Some(target) = target_body(declarations, body.cfg, point).filter(|target| observations.contains_key(target)) {
-            sites.insert((caller, occurrence.0), (target, declaration));
+            sites.insert((caller, occurrence.0), (target, declaration, alias));
         }
     }
     for (&target, &(observation, formal)) in observations {
         let Some(uses) = ordinary.array_uses.get(&target).and_then(Option::as_ref).filter(|uses| !uses.is_empty())
         else { continue };
         if result.bodies.contains_key(&target)
-            || !uses.iter().all(|use_site| sites.get(use_site).is_some_and(|(key, _)| *key == target))
+            || !uses.iter().all(|use_site| sites.get(use_site).is_some_and(|(key, ..)| *key == target))
         {
             continue;
         }
         result.bodies.entry(target).or_default().borrowed_extent_observer = Some((observation.0, formal));
         for &(caller, call) in uses {
-            result.bodies.entry(caller).or_default().borrowed_extent_call = Some((call, sites[&(caller, call)].1));
+            let (_, owner, alias) = sites[&(caller, call)];
+            result.bodies.entry(caller).or_default().borrowed_extent_call = Some((call, owner, alias));
         }
     }
 }
