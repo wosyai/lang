@@ -8766,11 +8766,12 @@ impl StructuralWalker<'_, '_> {
         let Some(&callee) = self.structure.checker_direct_targets.get(&call) else { return; };
         let declarations = walk.target_resolver.declarations;
         if caller.owner.0 != callee.0 {
-            if unit_call { return; }
             let Some(site) = walk.call_occurrences.binary_search_by_key(&call.0, |entry| entry.ordinal.0)
                 .ok().and_then(|index| walk.sites.get(walk.call_occurrences[index].site)) else { return; };
             let ResolvedCallTarget::ModuleCallable { source, declaration_span, .. } = &site.target else { return; };
-            if !declarations.nested_proof_watch.get(&(source, *declaration_span))
+            let caller_source = walk.target_resolver.source;
+            if caller_source.project != source.project || caller_source.package != source.package { return; }
+            if !unit_call && !declarations.nested_proof_watch.get(&(source, *declaration_span))
                 .is_some_and(|watch| watch.qualified_scalar && watch.declaration == callee) { return; }
         }
         let mut work = declarations.nested_scalar_work.get();

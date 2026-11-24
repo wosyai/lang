@@ -2181,7 +2181,7 @@ struct InitializerProofSite<'a> {
 enum InitializerProofOrigin<'a> {
     Direct { topology: &'a ModuleInitializationTopology, occurrence: OccurrenceOrdinal, directive_position: usize },
     Nested { outer: OrderedInitializerCall<'a>, caller: &'a FunctionCallSites, inner: OccurrenceOrdinal, directive_position: usize },
-    Stacked { outer: ByteSpan, intermediate: Vec<ByteSpan>, inner: ByteSpan, directive_position: usize, nested_scalar: bool },
+    Stacked { outer: wosy_syntax::SourceSpan, intermediate: Vec<wosy_syntax::SourceSpan>, inner: ByteSpan, directive_position: usize, nested_scalar: bool },
 }
 
 trait ActualIntegerObserver {
@@ -2838,11 +2838,15 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                         if let Some((parameters, entry, proof_work)) = site.observed_entry {
                             let ActualCallResult::Integer(value) = &result else { return Err(ProjectCheck::Unsupported); };
                             let ordered = collection.ok_or(ProjectCheck::Unsupported)?;
-                            let outer = named_root.ok_or(ProjectCheck::Unsupported)?.outer;
+                            let outer = wosy_syntax::SourceSpan::new(
+                                frames.first().ok_or(ProjectCheck::Unsupported)?.source.clone(),
+                                named_root.ok_or(ProjectCheck::Unsupported)?.outer,
+                            );
                             let cost = frames.len().checked_add(proof_work).ok_or(ProjectCheck::Unsupported)?;
                             self.observer.charge_named_exact_work(cost).ok_or(ProjectCheck::Unsupported)?;
-                            let intermediate = frames.iter().skip(1)
-                                .map(|frame| frame.named_site.as_ref().map(|site| site.call))
+                            let intermediate = frames.windows(2)
+                                .map(|edge| edge[1].named_site.as_ref()
+                                    .map(|site| wosy_syntax::SourceSpan::new(edge[0].source.clone(), site.call)))
                                 .collect::<Option<Vec<_>>>().ok_or(ProjectCheck::Unsupported)?;
                             let directive_position = ordered.failures.borrow().records.len();
                             let unary;
@@ -2980,7 +2984,13 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             && (if *expected == ScalarType::Bool { pure_literal_proof_leaf(body, ProofLiteralType::Boolean) }
                 else { qualified_integer_proof_leaf(body, expected) });
         #[cfg(feature = "internal-checker")]
-        let ordinary_named = nested_scalar || (routed_parent && parent.source == &owner.source
+        let cross_source_unit = routed_parent && routed_unit && parent.source != &owner.source
+            && self.observer.named_nested_scalar_route(target)
+            && body.checker_pure_calling_frame()
+            && collection.is_some_and(|ordered|
+                self.completed_namespace_call(parent.source, owner, target.0, body, signature, expected, ordered.visits));
+        #[cfg(feature = "internal-checker")]
+        let ordinary_named = nested_scalar || cross_source_unit || (routed_parent && parent.source == &owner.source
             && (routed_unit || self.observer.named_nested_scalar_route(target)));
         #[cfg(not(feature = "internal-checker"))]
         let ordinary_named = false;
@@ -2994,7 +3004,7 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             return Err(ProjectCheck::Unsupported);
         }
         #[cfg(feature = "internal-checker")]
-        if NAMED && ((parent.source != &owner.source && !nested_scalar)
+        if NAMED && ((parent.source != &owner.source && !nested_scalar && !cross_source_unit)
             || self.active.contains(&target)
             || !(if routed_unit { ordinary_named && *expected == ScalarType::Unit && body.checker_named_route_frame() }
                 else { matches!(effect, ExactCallEffect::Scalar { binding: Some(_), .. })
@@ -7012,17 +7022,15 @@ fn proof_invocation(
         InitializerProofOrigin::Nested { outer, caller, inner, directive_position } => {
             let outer = outer.topology.occurrences.get(outer.occurrence.0)?;
             let inner = caller.occurrences.get(inner.0)?;
-            (Some(outer.span), &[][..], inner.span, *directive_position)
+            (Some(wosy_syntax::SourceSpan::new(site.source.clone(), outer.span)), &[][..], inner.span, *directive_position)
         }
         InitializerProofOrigin::Stacked { outer, intermediate, inner, directive_position, .. } => {
-            (Some(*outer), intermediate.as_slice(), *inner, *directive_position)
+            (Some(outer.clone()), intermediate.as_slice(), *inner, *directive_position)
         }
     };
     Some(Rc::new(MainFlowProofInvocation {
-        outer_call: outer.map(|range| wosy_syntax::SourceSpan { source: site.source.clone(), range }),
-        intermediate_calls: intermediate.iter().map(|&range| wosy_syntax::SourceSpan {
-            source: site.source.clone(), range,
-        }).collect(),
+        outer_call: outer,
+        intermediate_calls: intermediate.to_vec(),
         call: wosy_syntax::SourceSpan { source: site.source.clone(), range: inner },
         namespaced_callable: (site.source != proof.owner)
             .then(|| wosy_syntax::SourceSpan::new(proof.owner.clone(), proof.definition)),
@@ -17968,6 +17976,61 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
             }
             assert!(first.invocation.intermediate_calls[0].range.start < second.invocation.intermediate_calls[0].range.start);
             assert!(run(&main.replace("out == 6", "out == 7"), library, scope).unwrap().diagnostics.is_empty());
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordered_completed_namespace_unit_bridge_preserves_each_call_source() {
+        let app = source("src/main.w", "ordered-qualified-bridge-app");
+        let lib = source("src/calc.w", "ordered-qualified-bridge-owner");
+        let main = r#"%%start
+            imported = namespace demo "src/calc.w";
+            proof checked for imported.pick(entry) -> (out) where (entry >= 0) ensures (out == 6) {}
+            unit() boot = fn { imported.bridge(3); imported.bridge(3); };
+            boot();
+        %%end"#;
+        let library = format!(r#"%%start
+            i8(i8) pick = fn(value) {{ if (value >= 0) {{ 7 }} else {{ 4 }} }};
+            unit(i8) worker = fn(value) {{ i8 saved = pick(value); core.require(saved == 7, {OUTPUT}); }};
+            unit(i8) bridge = fn(value) {{ worker(value); }};
+        %%end"#);
+        let run = |text: &str, provider: &str, scope| {
+            let (_, catalog) = crate::parse_proof_source(app.clone(), text.to_owned(), &[]).ok().unwrap();
+            let import = ScalarNamespaceBinding { binding: "imported".into(), target: lib.clone(), span: ByteSpan::new(0, 0) };
+            check_loaded_scalar_ordered_local_proof_contexts(
+                vec![(declarations(&lib, provider), Vec::new())], [(catalog, vec![import])],
+                vec![app.clone(), lib.clone()], inputs(), scope, Vec::new(),
+            )
+        };
+        let at = |span: &wosy_syntax::SourceSpan| {
+            let text = if span.source == app { main } else { assert_eq!(span.source, lib); &library };
+            &text[span.range.start as usize..span.range.end as usize]
+        };
+        for scope in [ScalarCheckerScope::MainFlowOnly, ScalarCheckerScope::CurrentPackage] {
+            let receipt = run(main, &library, scope).unwrap();
+            assert!(receipt.directives.is_empty() && receipt.symbolic_diagnostic.is_none());
+            let [first, second] = receipt.diagnostics.as_slice() else { panic!("one diagnostic per real activation"); };
+            for failure in [first, second] {
+                let invocation = &failure.invocation;
+                assert_eq!(failure.proof.source, app);
+                assert_eq!(invocation.call.source, lib);
+                assert_eq!(at(&invocation.call), "pick(value)");
+                let outer = invocation.outer_call.as_ref().unwrap();
+                assert_eq!(outer.source, app);
+                assert_eq!(at(outer), "boot()");
+                let [cross, local] = invocation.intermediate_calls.as_slice() else { panic!("missing call route"); };
+                assert_eq!(cross.source, app);
+                assert_eq!(at(cross), "imported.bridge(3)");
+                assert_eq!(local.source, lib);
+                assert_eq!(at(local), "worker(value)");
+                assert_eq!(invocation.arguments, [(ScalarType::I8, BigInt::from(3))]);
+                assert_eq!(invocation.returned, BigInt::from(7));
+            }
+            assert!(first.invocation.intermediate_calls[0].range.start < second.invocation.intermediate_calls[0].range.start);
+            assert!(run(&main.replace("out == 6", "out == 7"), &library, scope).unwrap().diagnostics.is_empty());
+            let effectful = library.replace("worker(value);", &format!("core.require(false, {OUTPUT}); worker(value);"));
+            assert!(matches!(run(main, &effectful, scope), Err(ScalarOrderedCheckerOutcome::Unsupported)));
         }
     }
 
