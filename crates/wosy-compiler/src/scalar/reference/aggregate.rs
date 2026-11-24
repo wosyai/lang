@@ -2843,6 +2843,7 @@ struct LocalChoiceSibling {
     join: CfgPointId,
     leaves: BTreeSet<CfgPointId>,
     consumer: Option<LocalChoiceConsumer>,
+    alternative_consumer: Option<LocalChoiceConsumer>,
 }
 
 struct LocalReceiptChoice {
@@ -3048,31 +3049,42 @@ impl Body<'_> {
                 // usual closed owning-formal graph before the primary exits.
                 // Find its exact lexical owning argument; never search calls
                 // or flow points for a substitute after a failed proof.
+                let selected_conditional = match self.sites.conditionals.get(&expression) {
+                    Some(ConditionalRegion::Unit { condition, then_block, .. }) =>
+                        Some((*condition, *then_block, None)),
+                    Some(ConditionalRegion::Value { condition, then_block, else_block, .. })
+                        if !sibling_choices.is_empty()
+                            && structure.checked_types.expressions.get(&expression).is_some_and(ordinary_value) =>
+                        Some((*condition, *then_block, Some(*else_block))),
+                    _ => None,
+                };
                 let (call_expression, first, call_scope, conditional) =
-                    if let Some(ConditionalRegion::Unit { condition, then_block, .. }) =
-                        self.sites.conditionals.get(&expression)
-                    {
+                    if let Some((condition, then_block, alternative)) = selected_conditional {
                         let [item] = structure.blocks.get(then_block.0)?.items.as_slice() else { return None };
-                        let BlockItemKind::Evaluation { expression: call_expression } = item.kind else { return None };
+                        let call_expression = match (&item.kind, alternative) {
+                            (BlockItemKind::Evaluation { expression }, None) => *expression,
+                            (BlockItemKind::FinalOutput(output), Some(_)) if output.output == 0 => output.expression,
+                            _ => return None,
+                        };
                         let branch = next(read.id)?;
                         let region = facts.conditional_input_regions.get(&branch.id)?;
                         let join = points.get(region.join.0)?;
                         let entry = points.get(region.entries[0].0)?;
                         let first = next(entry.id)?;
                         if region.expression != expression || region.branch != branch.id
-                            || structure.checked_types.expressions.get(condition) != Some(&ScalarType::Bool)
+                            || structure.checked_types.expressions.get(&condition) != Some(&ScalarType::Bool)
                             || read.source_span.range != self.sites.occurrences.get(condition.0)?.span
-                            || !matches!((self.sites.prepared_plain_name(*condition), &read.kind),
+                            || !matches!((self.sites.prepared_plain_name(condition), &read.kind),
                                 (Some(PlainNameIdentity::Lexical(expected)), CfgPointKind::Read { binding }) if expected == binding)
                             || branch.scope != scope || join.scope != scope || branch.id >= join.id
                             || !matches!(branch.kind, CfgPointKind::Branch { .. })
                             || !matches!(join.kind, CfgPointKind::Join)
                             || branch.successors.as_slice() != region.entries
-                            || region.entries[1] != join.id || region.terminals[1] != branch.id
+                            || (alternative.is_none() && (region.entries[1] != join.id || region.terminals[1] != branch.id))
                             || !matches!(entry.kind, CfgPointKind::ScopeEnter) || entry.scope == scope
                             || first.scope != entry.scope
                         { return None; }
-                        (call_expression, first, entry.scope, Some((expression, region)))
+                        (call_expression, first, entry.scope, Some((expression, region, alternative)))
                     } else {
                         (expression, read, scope, None)
                     };
@@ -3086,7 +3098,7 @@ impl Body<'_> {
                         OccurrenceParent::Expression(call_expression), OccurrenceEdge::CallArgument(slot),
                     ))? else { return None };
                     let PlainNameIdentity::Lexical(identity) = self.sites.prepared_plain_name(argument)? else { return None };
-                    if identity == holder && conditional.is_some() {
+                    if identity == holder && conditional.is_some_and(|(_, _, alternative)| alternative.is_none()) {
                         Some((signature, slot, ty, identity, None))
                     } else {
                         let index = siblings.iter().position(|(_, binding, _)| *binding == identity)?;
@@ -3114,7 +3126,32 @@ impl Body<'_> {
                         || call.source_span.range != self.sites.occurrences.get(call_expression.0)?.span
                         || !origins.iter().copied().eq([origin])
                     { return None; }
-                    read = if let Some((_, region)) = conditional {
+                    let alternative_consumer = if let Some((conditional, region, Some(alternative))) = conditional {
+                        let [item] = structure.blocks.get(alternative.0)?.items.as_slice() else { return None };
+                        let BlockItemKind::FinalOutput(output) = &item.kind else { return None };
+                        let other = self.sites.checked_call_signatures.get(&output.expression)?;
+                        let [other_scalar] = other.outputs.outputs.as_slice() else { return None };
+                        let entry = points.get(region.entries[1].0)?;
+                        let exit = points.get(region.terminals[1].0)?;
+                        if sibling_index.is_none() || output.output != 0 || other_scalar.ty != scalar.ty
+                            || structure.checked_types.expressions.get(&output.expression) != Some(&scalar.ty)
+                            || !matches!(entry.kind, CfgPointKind::ScopeEnter) || entry.scope == scope || entry.scope == call_scope
+                            || !matches!(exit.kind, CfgPointKind::ScopeExit) || exit.scope != entry.scope
+                            || next(exit.id)?.id != region.join
+                        { return None; }
+                        let (other_call, other_slot, other_move) = exact_owning_call_arguments(
+                            points, next(entry.id)?, entry.scope, self.sites, output.expression, &other.parameters, binding, ty,
+                        )?;
+                        if other_call.id == call.id || other_call.scope != entry.scope || next(other_call.id)?.id != exit.id
+                            || other_call.source_span.range != self.sites.occurrences.get(output.expression.0)?.span
+                            || !facts.inputs.get(&(other_call.id, output.expression.0, other_slot,
+                                ArgumentProvenance::WholeMove(other_move)))?.iter().copied().eq([origin])
+                        { return None; }
+                        Some(LocalChoiceConsumer {
+                            point: other_call.id, ordinal: output.expression, slot: other_slot, retained_unless: Some(conditional),
+                        })
+                    } else { None };
+                    read = if let Some((_, region, _)) = conditional {
                         let exit = next(call.id)?;
                         if exit.id != region.terminals[0] || exit.scope != call_scope
                             || !matches!(exit.kind, CfgPointKind::ScopeExit) || next(exit.id)?.id != region.join
@@ -3126,7 +3163,7 @@ impl Body<'_> {
                     if read.scope != scope { return None; }
                     let consumer = LocalChoiceConsumer {
                         point: call.id, ordinal: call_expression, slot,
-                        retained_unless: conditional.map(|(condition, _)| condition),
+                        retained_unless: conditional.map(|(condition, _, _)| condition),
                     };
                     if let Some(index) = sibling_index {
                         let (birth, _, state) = &mut siblings[index];
@@ -3134,6 +3171,7 @@ impl Body<'_> {
                         if *state == LocalSiblingState::Retired || sibling.consumer.replace(consumer).is_some() {
                             return None;
                         }
+                        sibling.alternative_consumer = alternative_consumer;
                         // Even with a bypass, only cleanup may see the
                         // receipt again: its lexical holder is retired.
                         *state = LocalSiblingState::Retired;
@@ -3175,7 +3213,8 @@ impl Body<'_> {
                     let leaves = self.local_choice_leaves(step_init.primary, &next_receiver.ty, Some(*region))?;
                     siblings.push((sibling_join.id, binding, LocalSiblingState::Unused));
                     sibling_choices.push(LocalChoiceSibling {
-                        conditional: step_init.primary, item: position, join: sibling_join.id, leaves, consumer: None,
+                        conditional: step_init.primary, item: position, join: sibling_join.id, leaves,
+                        consumer: None, alternative_consumer: None,
                     });
                     read = next(installed.id)?;
                     if read.scope != scope { return None; }
@@ -5579,8 +5618,9 @@ fn closed_aggregates<'a>(
             LocalChoiceUse::Consume { point, ordinal, slot } => Some((point, ordinal, slot, primary_receipt)),
             _ => choice.guarded_primary.map(|consumer| (consumer.point, consumer.ordinal, consumer.slot, primary_receipt)),
         };
-        let secondary = choice.sibling_choices.iter().filter_map(|sibling|
-            sibling.consumer.map(|consumer| (consumer.point, consumer.ordinal, consumer.slot, sibling.conditional)));
+        let secondary = choice.sibling_choices.iter().flat_map(|sibling|
+            sibling.consumer.into_iter().chain(sibling.alternative_consumer)
+                .map(|consumer| (consumer.point, consumer.ordinal, consumer.slot, sibling.conditional)));
         for (point, ordinal, slot, receipt) in primary.into_iter().chain(secondary) {
             let callee = target_body(&declarations, bodies[&key].cfg, point)
                 .ok_or("missing local conditional owner consumer")?;
@@ -6127,7 +6167,21 @@ fn closed_aggregates<'a>(
             for sibling in &choice.sibling_choices {
                 plan.local_choice_arms.push((sibling.conditional.0, sibling.leaves.len()));
                 plan.local_choice_bindings.insert((choice.block.0, sibling.item), sibling.conditional.0);
-                let release_guard = plan.selected_receipt_release(sibling.conditional, sibling.consumer)?;
+                let release_guard = if let Some(alternative) = sibling.alternative_consumer {
+                    let first = sibling.consumer.ok_or("missing first exhaustive selected transfer")?;
+                    let condition = first.retained_unless.ok_or("missing exhaustive selected conditional")?;
+                    if alternative.retained_unless != Some(condition) { return Err("mismatched exhaustive selected arms".into()); }
+                    for consumer in [first, alternative] {
+                        if plan.deferred_call_inputs.insert(consumer.ordinal.0, sibling.conditional.0).is_some() {
+                            return Err("duplicate exhaustive selected transfer".into());
+                        }
+                    }
+                    plan.conditional_inputs.entry(condition.0).or_default()
+                        .consumed_on_both_arms.push(sibling.conditional.0);
+                    None
+                } else {
+                    plan.selected_receipt_release(sibling.conditional, sibling.consumer)?
+                };
                 if let Some(guard) = release_guard {
                     plan.scope_exits.insert(choice.block.0, choice.exit);
                     record_release(&mut plan, choice.exit, sibling.join,

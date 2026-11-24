@@ -980,12 +980,17 @@ fn independent_conditioned_owners_keep_separate_receipts_at_one_exit() {
         ("guard-secondary-return-primary", false, true, true, true),
         ("guard-primary-after-read", false, false, true, false),
         ("guard-primary-after-recommit", false, false, true, false),
+        ("exhaustive-secondary", false, true, true, false),
     ] {
         let guard_primary = variant.starts_with("guard-primary-");
+        let exhaustive = variant == "exhaustive-secondary";
         let migrate_primary = variant == "guard-primary-after-recommit";
         let mut text = factory_source.to_owned();
         if primary_transfer || secondary_transfer || guard_primary {
             text.push_str("u64(Packet) sink = fn(packet) { packet.length };\n");
+        }
+        if exhaustive {
+            text.push_str("u64(u64, Packet) alternative_sink = fn(extra, packet) { packet.length + extra };\n");
         }
         if migrate_primary {
             text.push_str("Packet(Packet) relay = fn(packet) { packet };\n");
@@ -1009,6 +1014,8 @@ fn independent_conditioned_owners_keep_separate_receipts_at_one_exit() {
             }
             let holder = if migrate_primary { "current" } else { "first" };
             text.push_str(&format!("    u64 saved = read_amount(&{holder});\n    if (take) {{ sink({holder}); }};\n"));
+        } else if exhaustive {
+            text.push_str("    if (take) { sink(second) } else { alternative_sink(1, second) };\n");
         } else if guarded { text.push_str("    if (take) { sink(second); };\n"); }
         else if secondary_transfer { text.push_str("    sink(second);\n"); }
         text.push_str(if primary_return { concat!(
@@ -1056,6 +1063,8 @@ fn independent_conditioned_owners_keep_separate_receipts_at_one_exit() {
                 let mut returned = None;
                 let factories = [find("make_short"), find("make_long")];
                 let sink = (primary_transfer || secondary_transfer || guard_primary).then(|| find("sink"));
+                let alternative_sink = exhaustive.then(|| find("alternative_sink"));
+                let mut alternative_passed = None;
                 let free = module.get_function("__wosy_core_free").unwrap();
                 let mut produced = [Vec::new(), Vec::new()];
                 let mut merges = Vec::new();
@@ -1082,6 +1091,10 @@ fn independent_conditioned_owners_keep_separate_receipts_at_one_exit() {
                     if factories.contains(&callee) {
                         let choice = usize::from(arg(0).into_int_value().get_zero_extended_constant().unwrap() >= 7);
                         produced[choice].push((call.try_as_basic_value().basic().unwrap(), arg(1)));
+                    } else if Some(callee) == alternative_sink {
+                        assert_eq!(call.count_arguments(), 3);
+                        assert_eq!(arg(0).into_int_value().get_zero_extended_constant(), Some(1));
+                        assert!(alternative_passed.replace(arg(2)).is_none());
                     } else if Some(callee) == sink {
                         assert_eq!(call.count_arguments(), 2);
                         assert!(!guard_primary || read_amounts == 1, "guarded handoff follows the author's certified read");
@@ -1113,8 +1126,9 @@ fn independent_conditioned_owners_keep_separate_receipts_at_one_exit() {
                 let expected_transfers = secondary_transfer.then_some(chosen[1].0).into_iter()
                     .chain((primary_transfer || guard_primary).then_some(chosen[0].0));
                 assert!(passed.iter().copied().eq(expected_transfers), "only the named receipts transfer in source order");
-                assert_eq!(guards, if guarded { vec![vec![0, 1]] } else { vec![] });
-                let expected_local = (!secondary_transfer || guarded).then_some(chosen[1].0).into_iter()
+                assert_eq!(guards, if guarded && !exhaustive { vec![vec![0, 1]] } else { vec![] });
+                assert_eq!(alternative_passed, exhaustive.then_some(chosen[1].0));
+                let expected_local = (!secondary_transfer || (guarded && !exhaustive)).then_some(chosen[1].0).into_iter()
                     .chain((!primary_transfer && !primary_return).then_some(chosen[0].0));
                 assert!(released.iter().copied().eq(expected_local), "only retained original backings release locally");
                 assert_eq!(relay_calls, usize::from(primary_return || migrate_primary));
@@ -1136,7 +1150,7 @@ fn independent_conditioned_owners_keep_separate_receipts_at_one_exit() {
                     }
                     assert_eq!(caller_releases, [received.expect("one returned backing")]);
                 }
-                if let Some(sink) = sink {
+                for sink in [sink, alternative_sink].into_iter().flatten() {
                     let releases: Vec<_> = sink.get_basic_blocks().into_iter().flat_map(|block| block.get_instructions())
                         .filter(|row| CallSiteValue::try_from(*row).ok().and_then(|call| call.get_called_fn_value()) == Some(free))
                         .map(|row| row.get_operand(0).unwrap().value().unwrap()).collect();
