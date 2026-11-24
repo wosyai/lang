@@ -1607,8 +1607,11 @@ fn checked_scalar_reader_keeps_received_owner_live() {
             };
             let inline_named = text.replace("    read_length(view)", "    *view + 1");
             assert_ne!(inline_named, text);
+            let metadata = text.replace("    *u64 view = &packet.length;",
+                "    packet.length = 9;\n    *u64 view = &packet.length;");
+            assert_ne!(metadata, text);
             for (text, route) in [(text, "named"), (&immediate, "immediate"),
-                (&inline_named, "inline-named")]
+                (&inline_named, "inline-named"), (&metadata, "metadata")]
             {
                 let inline = route.starts_with("inline-");
                 let ir = emit(text).unwrap_or_else(|error| panic!("{target}/{project}: {error}"));
@@ -1622,6 +1625,13 @@ fn checked_scalar_reader_keeps_received_owner_live() {
                         && seen == ["allocate"] && row.to_string().contains("load i64,")
                     {
                         seen.push("read");
+                    }
+                    if route == "metadata" && row.get_opcode() == InstructionOpcode::Store
+                        && row.get_operand(0).and_then(|operand| operand.value())
+                            .filter(|value| value.is_int_value())
+                            .and_then(|value| value.into_int_value().get_zero_extended_constant()) == Some(9)
+                    {
+                        seen.push("write");
                     }
                     if row.get_opcode() != InstructionOpcode::Call { continue; }
                     let call = CallSiteValue::try_from(row).unwrap();
@@ -1640,7 +1650,9 @@ fn checked_scalar_reader_keeps_received_owner_live() {
                         seen.push("release");
                     }
                 }
-                assert_eq!(seen, ["allocate", "read", "release"], "{target}/{project}: {ir}");
+                let expected = if route == "metadata" { vec!["allocate", "write", "read", "release"] }
+                    else { vec!["allocate", "read", "release"] };
+                assert_eq!(seen, expected, "{target}/{project}: {ir}");
                 if let Some(out) = std::env::var_os("WOSY_RECEIPT_FIELD_IR_DIR") {
                     let base = if project { "project" } else { "single" };
                     let out = std::path::PathBuf::from(out).join(
@@ -1654,6 +1666,19 @@ fn checked_scalar_reader_keeps_received_owner_live() {
                     let uncertified = text.replace("{ *view + 1 }", "{ u64 observed = *view; observed + 1 }");
                     assert!(emit(&uncertified).expect_err("signature alone cannot certify a checked reader")
                         .contains("aggregate owning receipt has an unproved checked loan"));
+                }
+                if route == "metadata" {
+                    let overwrites_backing_view = text.replace("    packet.length = 9;", "    packet.data = null;");
+                    assert!(emit(&overwrites_backing_view).expect_err("a store to the backing field is not scalar metadata")
+                        .contains("aggregate transfer has unsupported use"));
+                    let overlap = text.replace("    packet.length = 9;\n    *u64 view = &packet.length;",
+                        "    *u64 view = &packet.length;\n    packet.length = 9;");
+                    assert_ne!(overlap, text);
+                    let prepared = prepare_scalar_project(vec![(declarations(&app, &overlap), vec![])],
+                        vec![app.clone()], ScalarPreparationInputs { target_layout }).unwrap();
+                    let checked = analyze_scalar_build(&prepared);
+                    assert!(checked.diagnostics().iter().any(|error| error.labels.iter()
+                        .any(|label| label.message == "origin of conflicting place or loan")), "{target}: {:?}", checked.diagnostics());
                 }
             }
             for width in [8, 64] {

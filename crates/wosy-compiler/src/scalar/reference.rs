@@ -4700,6 +4700,29 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             FrozenInstall { rhs: rhs_point, install: self.cursor.expect("assignment install point") }
                         };
                         let FrozenInstall { rhs: rhs_point, install } = emitted;
+                        if capture.is_none() && assignment.targets.len() == 1 && assignment.values.len() == 1
+                            && position == 0 && aggregate::ordinary_value(&output_types[position])
+                            && matches!(&slot.replacement, AssignmentReplacement::Resolved(ty) if ty == &output_types[position])
+                        {
+                            if let CfgPointKind::Assign { target, rhs_point: actual, .. } = &self.cfg.points[install.0].kind {
+                                if let (ScalarPlace::Field { base, field: ScalarFieldReference::Resolved(field), .. },
+                                    [ReferencePlaceProjection::Field(ScalarFieldReference::Resolved(projection))]) =
+                                    (&target.place, target.projections.as_slice())
+                                {
+                                    if let ScalarPlace::Name { span, .. } = base.as_ref() {
+                                        let root = self.place_root(&target.place, slot.destination);
+                                        if *actual == rhs_point && field == projection
+                                            && matches!(self.binding_types.get(&target.binding),
+                                                Some(ScalarType::Struct(id)) if *id == field.structure)
+                                            && matches!(self.prepared_place_root(root.ordinal, *span)?,
+                                                Some(PreparedPlaceRoot::Lexical(binding)) if binding == &target.binding)
+                                        {
+                                            self.aggregate_facts.receipt_scalar_field_writes.insert(install);
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         // Only the checked primary output can start same-array retention.
                         // Projected outputs have distinct points and do not inherit this proof.
                         if simple_destinations && position == 0

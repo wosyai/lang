@@ -43,6 +43,7 @@ pub(super) struct AggregateFlowFacts {
     mixed_arm_projection: Option<MixedArmProjection>,
     pub(super) secondary_owner_outputs: BTreeMap<CfgPointId, CfgPointId>,
     pub(super) projected_reads: BTreeMap<CfgPointId, bool>,
+    pub(super) receipt_scalar_field_writes: BTreeSet<CfgPointId>,
     pub(super) scalar_receipt_reads: BTreeSet<CfgPointId>,
     pub(super) scope_exits: BTreeMap<CfgPointId, BlockOrdinal>,
     pub(super) formals: BTreeMap<usize, ReferenceBindingId>,
@@ -2116,6 +2117,13 @@ impl AggregateFlowFacts {
                         {
                             *value = None;
                         }
+                    } else if self.receipt_scalar_field_writes.contains(&id) && rhs.is_none()
+                        && matches!(state.bindings.get(&target.binding),
+                            Some((Some(Value::Aggregate { backing: backing @ OwnerSource::Call(_), field: None }), _, Some(_)))
+                                if !state.moved.contains(backing))
+                    {
+                        // A checked lexical write to an ordinary scalar field
+                        // cannot replace the descriptor's backing receipt.
                     } else if let Some((value @ Some(Value::Plain(_) | Value::CheckedRawNull | Value::CheckedNullDescriptor), _, _)) = state.bindings.get_mut(&target.binding) {
                         *value = None;
                     } else if state

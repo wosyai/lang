@@ -44,6 +44,13 @@ int main(void) { return check(); }
 #endif
 """
 
+expected = 4
+if sys.argv[3:] == ["metadata"]:
+    expected = 10
+    runtime = runtime.replace("observed != 4", "observed != 10")
+elif sys.argv[3:]:
+    raise SystemExit("optional third argument must be metadata")
+
 with tempfile.TemporaryDirectory(prefix="receipt-field-", dir=ir_dir) as tmp:
     work = Path(tmp)
     trace = work / "trace.c"
@@ -51,7 +58,7 @@ with tempfile.TemporaryDirectory(prefix="receipt-field-", dir=ir_dir) as tmp:
     native = work / "check-native"
     run(clang, "-O0", trace, ir_dir / "native64.ll", "-o", native)
     run(native)
-    print("Native64: checked reader result 4 and exactly one original backing release", flush=True)
+    print(f"Native64: checked reader result {expected} and exactly one original backing release", flush=True)
 
     triple = "--target=wasm32-unknown-wasi"
     wosy, stub, wasm = work / "wosy.o", work / "trace.o", work / "check.wasm"
@@ -63,4 +70,4 @@ import fs from "node:fs";
 const {instance:{exports:e}} = await WebAssembly.instantiate(fs.readFileSync(process.argv[1]));
 if (e.check() !== 0) throw new Error("checked field receipt trace failed");
 """, wasm)
-    print("Wasm32: checked reader result 4 and exactly one original backing release", flush=True)
+    print(f"Wasm32: checked reader result {expected} and exactly one original backing release", flush=True)
