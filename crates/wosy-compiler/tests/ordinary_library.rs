@@ -1155,6 +1155,61 @@ fn projected_recursive_holder_retires_only_the_replaced_lane() {
 }
 
 #[test]
+fn recursive_fallible_owner_keeps_successful_ancestors_until_their_actual_exit() {
+    let app = source("workbench", "src/recursive_fallible_owner.w");
+    let text = include_str!("fixtures/recursive-fallible-owner.w");
+    for (target, target_layout) in [
+        ("native64", ScalarTargetLayout::NATIVE64),
+        ("wasm32", ScalarTargetLayout::WASM32),
+    ] {
+        let prepared = prepare_scalar_project(
+            vec![(declarations(&app, text), Vec::new())], vec![app.clone()],
+            ScalarPreparationInputs { target_layout },
+        ).unwrap_or_else(|error| panic!("{target}: {:?}", error.diagnostics));
+        let build = analyze_scalar_build(&prepared);
+        assert!(build.diagnostics().is_empty(), "{target}: {:?}", build.diagnostics());
+        let ir = emit_scalar_build_project_llvm(&build).unwrap_or_else(|error| panic!("{target}: {error}")).to_text();
+        let context = Context::create();
+        let buffer = MemoryBuffer::create_from_memory_range_copy(ir.as_bytes(), target);
+        let module = context.create_module_from_ir(buffer).unwrap();
+        module.verify().unwrap();
+        let frame = module.get_function(&function_with_suffix(&module, "frame")).unwrap();
+        let alloc = module.get_function("__wosy_core_alloc").unwrap();
+        let free = module.get_function("__wosy_core_free").unwrap();
+        let mut allocation = None;
+        let mut release = None;
+        let mut recurses = false;
+        for block in frame.get_basic_blocks() {
+            for row in block.get_instructions().filter(|row| row.get_opcode() == InstructionOpcode::Call) {
+                let call = CallSiteValue::try_from(row).unwrap();
+                match call.get_called_fn_value() {
+                    Some(callee) if callee == alloc => assert!(allocation.replace(call.try_as_basic_value().basic().unwrap()).is_none()),
+                    Some(callee) if callee == free => {
+                        assert!(block.get_name().to_str().unwrap().starts_with("fallible.release"));
+                        assert!(release.replace(row.get_operand(0).unwrap().value().unwrap()).is_none());
+                    }
+                    Some(callee) if callee == frame => recurses = true,
+                    _ => panic!("{target}: unexpected call in fallible frame: {row}"),
+                }
+            }
+        }
+        assert!(allocation.is_some() && recurses, "{target}: {ir}");
+        assert_eq!(allocation, release, "{target}: {ir}");
+
+        if let Some(out) = std::env::var_os("WOSY_RECURSIVE_FALLIBLE_IR_DIR") {
+            let mut ir = ir.replace("@main(", "@wosy_authored_main(");
+            for name in ["no_allocation", "three_frames"] {
+                let symbol = function_with_suffix(&module, name);
+                ir.push_str(&format!(
+                    "\ndefine i64 @wosy_{name}() {{\nentry:\n  %result = call i64 @{symbol}()\n  ret i64 %result\n}}\n"
+                ));
+            }
+            std::fs::write(std::path::PathBuf::from(out).join(format!("{target}.ll")), ir).unwrap();
+        }
+    }
+}
+
+#[test]
 fn runtime_array_recommit_keeps_the_owner_until_its_real_end() {
     let recursive = r#"
 (u8[], u64)(u8[], u64, u64) carry = fn(bytes, depth, count) {
