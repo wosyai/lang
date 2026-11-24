@@ -454,6 +454,7 @@ impl ActualIntegerObserver for ProofFreeOrderedEvidence {
     const REAL_EXTENDED_SCALAR_LOCALS: bool = true;
     const REAL_MODULE_BOOLEAN_INITIALIZERS: bool = true;
     const REAL_BOOLEAN_NARROW_CONTINUATIONS: bool = true;
+    const AUTHORED_STARTUP_SCALARS: bool = true;
     const ORDINARY_INTEGER_LOCALS: bool = true;
 
     fn observe(&mut self, _: (usize, usize), _: &[&BigInt], _: &BigInt) {}
@@ -522,11 +523,11 @@ fn run_prepared_ordered_check<E: OrderedRunEvidence>(
     // any client-visible code, stream, or file effect.
     if effects.has_selected_code && !E::AUTHORED_SINGLETON_CODE { return Err(ProjectCheck::Unsupported); }
     if effects.has_authored_state || effects.has_selected_code || !effects.snapshot_records.is_empty() {
-        let mut work = 0;
+        let mut work = effects.startup_output_work;
         let mut hidden = effects.snapshot_records.into_iter().peekable();
         for (index, record) in effects.records.iter_mut().enumerate() {
             if !record.output.state_files.is_empty() || !matches!(record.output.code_value, CheckerCode::Literal(_)) {
-                record.output = Rc::new(render_authored_output(record, &mut work).ok_or(ProjectCheck::Unsupported)?);
+                record.output = Rc::new(render_authored_output(&record.output, &record.witness, None, &mut work).ok_or(ProjectCheck::Unsupported)?);
             }
             if hidden.peek() == Some(&index) {
                 hidden.next();
@@ -1173,11 +1174,30 @@ fn check_initializer_expression<const COLLECT: bool, const PRIVATE_NESTED_SCALAR
         actual.had_obligations = true;
         if directive.operation.rejects(value, !value) {
             let span = topology.occurrences.get(expression.0).ok_or(ProjectCheck::MissingRootOccurrences)?.span;
+            #[cfg(feature = "internal-checker")]
+            let startup_values = directive.output.has_module_values;
+            #[cfg(feature = "internal-checker")]
+            if startup_values && (!COLLECT || !actual.permits_authored_startup_scalars()) {
+                return Err(ProjectCheck::Unsupported);
+            }
             if !COLLECT {
                 return Err(selected_failure(source, directive, span, IntegerInputs::closed(), Vec::new()));
             }
-            failures.as_deref_mut().ok_or(ProjectCheck::Unsupported)?
-                .push(source, directive, span, IntegerInputs::closed(), Vec::new(), Vec::new());
+            let effects = failures.as_deref_mut().ok_or(ProjectCheck::Unsupported)?;
+            #[cfg(feature = "internal-checker")]
+            if startup_values {
+                // Resolve before recording, so a rejected/missing startup
+                // value neither clones an unchecked payload nor leaves a
+                // partially rendered record in the ordered ledger.
+                let witness = ScalarCheckerIntegerWitness { axes: Vec::new(), equal_axes: Vec::new(), state: IntegerInputs::closed() };
+                let output = render_authored_output(&directive.output, &witness, Some(storage), &mut effects.startup_output_work)
+                    .ok_or(ProjectCheck::Unsupported)?;
+                effects.push_with_witness(source, directive, span, witness, Rc::new(output));
+            } else {
+                effects.push(source, directive, span, IntegerInputs::closed(), Vec::new(), Vec::new());
+            }
+            #[cfg(not(feature = "internal-checker"))]
+            effects.push(source, directive, span, IntegerInputs::closed(), Vec::new(), Vec::new());
             if directive.operation == CheckerOperation::Narrow {
                 return Ok(StartupLane::Empty);
             }
@@ -1434,6 +1454,8 @@ trait ActualIntegerObserver {
     const REAL_MODULE_BOOLEAN_INITIALIZERS: bool = false;
     #[cfg(feature = "internal-checker")]
     const REAL_BOOLEAN_NARROW_CONTINUATIONS: bool = false;
+    #[cfg(feature = "internal-checker")]
+    const AUTHORED_STARTUP_SCALARS: bool = false;
     const INTEGER_RETURN_PARTITIONS: bool = false;
     const PROJECTED_FORMAL_WRITES: bool = false;
     const ORDINARY_PROJECTED_PAIR: bool = false;
@@ -1645,6 +1667,9 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             IntegerRequirementContinuation::Projected(values) => ActualCallResult::ProjectedUnit(values),
         })
     }
+
+    #[cfg(feature = "internal-checker")]
+    fn permits_authored_startup_scalars(&self) -> bool { ACTUAL_STARTUP && Observer::AUTHORED_STARTUP_SCALARS }
 
     fn real_module_boolean_initializer(&self, expected: &ScalarType, collecting: bool) -> bool {
         #[cfg(feature = "internal-checker")]
@@ -2474,6 +2499,8 @@ struct OrderedFailures {
     #[cfg(feature = "internal-checker")]
     has_selected_code: bool,
     #[cfg(feature = "internal-checker")]
+    startup_output_work: usize,
+    #[cfg(feature = "internal-checker")]
     snapshot_records: Vec<usize>,
     #[cfg(feature = "internal-checker")]
     entry_evidence: Option<Box<ScalarOrderedEntryEvidence>>,
@@ -2528,18 +2555,22 @@ impl OrderedFailures {
         axes: Vec<(ReferenceBindingId, ScalarType)>,
         equal_axes: Vec<(usize, usize)>,
     ) {
+        let output = self.payloads.shared(directive);
+        self.push_with_witness(source, directive, span, ScalarCheckerIntegerWitness { axes, state, equal_axes }, output);
+    }
+
+    fn push_with_witness(
+        &mut self, source: &SourceIdentity, directive: &PreparedCheckerDirective, span: ByteSpan,
+        witness: ScalarCheckerIntegerWitness, output: Rc<CheckedLiteralOutput>,
+    ) {
         #[cfg(feature = "internal-checker")]
         {
-            self.has_authored_state |= !directive.output.state_files.is_empty();
-            self.has_selected_code |= !matches!(directive.output.code_value, CheckerCode::Literal(_));
+            self.has_authored_state |= !output.state_files.is_empty();
+            self.has_selected_code |= !matches!(output.code_value, CheckerCode::Literal(_));
         }
         self.records.push(ScalarOrderedCheckerFailure {
-            source: source.clone(),
-            operation: directive.operation.into(),
-            directive: span,
-            condition: directive.condition,
-            witness: ScalarCheckerIntegerWitness { axes, state, equal_axes },
-            output: self.payloads.shared(directive),
+            source: source.clone(), operation: directive.operation.into(), directive: span,
+            condition: directive.condition, witness, output,
         });
     }
 
@@ -2575,17 +2606,45 @@ impl OrderedFailures {
 }
 
 #[cfg(feature = "internal-checker")]
-fn render_authored_output(record: &ScalarOrderedCheckerFailure, work: &mut usize) -> Option<CheckedLiteralOutput> {
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum AuthoredScalarOrigin<'a> {
+    Binding(&'a ReferenceBindingId),
+    Module(ByteSpan),
+}
+
+#[cfg(feature = "internal-checker")]
+fn render_authored_output(
+    prepared: &CheckedLiteralOutput, witness: &ScalarCheckerIntegerWitness,
+    startup: Option<&HashMap<ByteSpan, InitializerValue<'_>>>, work: &mut usize,
+) -> Option<CheckedLiteralOutput> {
     use super::{checker_directive::{CheckerStateSelection, CheckerStateType, ScalarCheckerTextFile}, checker_flow::charge_call_work};
-    let prepared = &record.output;
-    let projected_code = match &prepared.code_value {
-        CheckerCode::Literal(_) => None,
-        CheckerCode::Binding(binding, ty) => {
-            let values = project_authored_scalar(record, binding, ty, work)?;
-            values.singleton_value()?;
-            Some((binding.as_ref(), ty, values))
+    let scalar = |origin, ty, work: &mut usize| match origin {
+        AuthoredScalarOrigin::Binding(binding) => project_authored_scalar(witness, binding, ty, work),
+        AuthoredScalarOrigin::Module(span) => {
+            charge_call_work(work, 1)?;
+            let value = match startup?.get(&span)? {
+                InitializerValue::Boolean(value) if *ty == ScalarType::Bool => {
+                    return Some(Rc::new(IntegerSet::singleton(&BigInt::from(u8::from(*value)))));
+                }
+                InitializerValue::Integer { ty: actual, value } if *actual == ty => value,
+                _ => return None,
+            };
+            Some(Rc::new(IntegerSet::singleton(value)))
         }
+    };
+    let selected_code = match &prepared.code_value {
+        CheckerCode::Literal(_) => None,
+        CheckerCode::Binding(binding, ty) => Some((AuthoredScalarOrigin::Binding(binding.as_ref()), ty)),
+        CheckerCode::Module(span, ty) => Some((AuthoredScalarOrigin::Module(*span), ty)),
         CheckerCode::Lexical(..) => return None,
+    };
+    let projected_code = match selected_code {
+        Some((origin, ty)) => {
+            let values = scalar(origin, ty, work)?;
+            values.singleton_value()?;
+            Some((origin, ty, values))
+        }
+        None => None,
     };
     let count = prepared.text_files.len().checked_add(prepared.state_files.len())?;
     let mut copied_bytes = prepared.stdout_bytes.len().checked_add(prepared.stderr_bytes.len())?;
@@ -2598,15 +2657,11 @@ fn render_authored_output(record: &ScalarOrderedCheckerFailure, work: &mut usize
         copied_bytes = copied_bytes.checked_add(file.path.len())?;
     }
     charge_call_work(work, count.checked_add(copied_bytes.div_ceil(32))?)?;
-    let mut output = (**prepared).clone();
-    if let Some((_, _, values)) = &projected_code {
-        output.code_value = CheckerCode::Literal(values.singleton_value()?.clone());
-    }
-    let mut text = std::mem::take(&mut output.text_files).into_vec().into_iter();
-    let mut selected = std::mem::take(&mut output.state_files).into_vec().into_iter().peekable();
+    let mut text = prepared.text_files.iter();
+    let mut selected = prepared.state_files.iter().peekable();
     let mut files = Vec::with_capacity(count);
-    // Output paths may select the same authored binding. Reuse the exact
-    // projection and encoding only within this one immutable witness.
+    // Cache within this one immutable observation only. Borrow checked
+    // binding identities instead of cloning source metadata per output path.
     let mut encoded = HashMap::new();
     let mut encoded_shapes = HashMap::new();
     for position in 0..count {
@@ -2614,31 +2669,35 @@ fn render_authored_output(record: &ScalarOrderedCheckerFailure, work: &mut usize
             let file = selected.next()?;
             let bytes: &Box<[u8]> = match (&file.selection, &file.ty) {
                 (CheckerStateSelection::Aggregate(shape), CheckerStateType::Nominal(_) | CheckerStateType::FixedArray) => {
-                    // Shape addresses are stable: the prepared directive owns
-                    // every shape for this entire materialization.
                     match encoded_shapes.entry(Rc::as_ptr(shape)) {
                         std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
                         std::collections::hash_map::Entry::Vacant(entry) => {
                             let mut json = String::new();
-                            encode_snapshot_node(&shape.root, shape, record, work, &mut json)?;
+                            encode_snapshot_node(&shape.root, shape, witness, work, &mut json)?;
                             json.push('\n');
                             entry.insert(json.into_bytes().into_boxed_slice())
                         }
                     }
                 }
-                (CheckerStateSelection::Binding(binding), CheckerStateType::Scalar(file_ty)) => {
-                    let (ty, bytes) = match encoded.entry(binding.clone()) {
+                (selection, CheckerStateType::Scalar(file_ty)) => {
+                    let origin = match selection {
+                        CheckerStateSelection::Binding(binding) => AuthoredScalarOrigin::Binding(binding),
+                        CheckerStateSelection::Module(span) => AuthoredScalarOrigin::Module(*span),
+                        _ => return None,
+                    };
+                    let (ty, bytes) = match encoded.entry(origin) {
                         std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
                         std::collections::hash_map::Entry::Vacant(entry) => {
-                            let json = match &projected_code {
-                                Some((code_binding, code_ty, values)) if *code_binding == binding && *code_ty == file_ty =>
-                                    serialize_scalar_analysis_state(file_ty, values)?,
-                                _ => encode_authored_scalar(record, binding, file_ty, work)?,
+                            let values = match &projected_code {
+                                Some((code_origin, code_ty, values)) if *code_origin == origin && *code_ty == file_ty =>
+                                    Rc::clone(values),
+                                _ => scalar(origin, file_ty, work)?,
                             };
-                            entry.insert((file_ty.clone(), json.into_bytes().into_boxed_slice()))
+                            let json = serialize_scalar_analysis_state(file_ty, &values)?;
+                            entry.insert((file_ty, json.into_bytes().into_boxed_slice()))
                         }
                     };
-                    if ty != file_ty { return None; }
+                    if *ty != file_ty { return None; }
                     bytes
                 }
                 _ => return None,
@@ -2646,33 +2705,40 @@ fn render_authored_output(record: &ScalarOrderedCheckerFailure, work: &mut usize
             // Each file owns its bytes; meter both copying and publication.
             charge_call_work(work, bytes.len().div_ceil(32).checked_mul(2)?)?;
             files.push(ScalarCheckerTextFile {
-                path: file.path, path_span: file.path_span, text_span: file.state_span, text: bytes.clone(),
+                path: file.path.clone(), path_span: file.path_span, text_span: file.state_span, text: bytes.clone(),
             });
         } else {
-            files.push(text.next()?);
+            files.push(text.next()?.clone());
         }
     }
-    output.text_files = files.into_boxed_slice();
-    Some(output)
+    let code_value = match projected_code {
+        Some((_, _, values)) => CheckerCode::Literal(values.singleton_value()?.clone()),
+        None => prepared.code_value.clone(),
+    };
+    Some(CheckedLiteralOutput {
+        stdout: prepared.stdout, stderr: prepared.stderr, code: prepared.code, files: prepared.files,
+        stdout_bytes: prepared.stdout_bytes.clone(), stderr_bytes: prepared.stderr_bytes.clone(), code_value,
+        text_files: files.into_boxed_slice(), state_files: Box::new([]), has_module_values: false,
+    })
 }
 
 #[cfg(feature = "internal-checker")]
 fn project_authored_scalar(
-    record: &ScalarOrderedCheckerFailure, binding: &ReferenceBindingId, ty: &ScalarType, work: &mut usize,
+    witness: &ScalarCheckerIntegerWitness, binding: &ReferenceBindingId, ty: &ScalarType, work: &mut usize,
 ) -> Option<Rc<IntegerSet>> {
     use super::checker_flow::charge_call_work;
-    charge_call_work(work, record.witness.axes.len().checked_add(1)?)?;
-    let axis = record.witness.axes.iter().position(|(id, axis_ty)| id == binding && axis_ty == ty)?;
-    let values = record.witness.state.project_axis_bounded(axis, work)?;
+    charge_call_work(work, witness.axes.len().checked_add(1)?)?;
+    let axis = witness.axes.iter().position(|(id, axis_ty)| id == binding && axis_ty == ty)?;
+    let values = witness.state.project_axis_bounded(axis, work)?;
     charge_call_work(work, values.interval_count())?;
     Some(values)
 }
 
 #[cfg(feature = "internal-checker")]
 fn encode_authored_scalar(
-    record: &ScalarOrderedCheckerFailure, binding: &ReferenceBindingId, ty: &ScalarType, work: &mut usize,
+    witness: &ScalarCheckerIntegerWitness, binding: &ReferenceBindingId, ty: &ScalarType, work: &mut usize,
 ) -> Option<String> {
-    let values = project_authored_scalar(record, binding, ty, work)?;
+    let values = project_authored_scalar(witness, binding, ty, work)?;
     serialize_scalar_analysis_state(ty, &values)
 }
 
@@ -2680,13 +2746,13 @@ fn encode_authored_scalar(
 fn encode_snapshot_node(
     node: &super::checker_directive::CheckerSnapshotNode,
     shape: &super::checker_directive::CheckerSnapshotShape,
-    record: &ScalarOrderedCheckerFailure, work: &mut usize, json: &mut String,
+    witness: &ScalarCheckerIntegerWitness, work: &mut usize, json: &mut String,
 ) -> Option<()> {
     use super::{checker_directive::CheckerSnapshotNode, checker_flow::charge_call_work};
     match node {
         CheckerSnapshotNode::Leaf(index) => {
             let leaf = shape.leaves.get(*index)?;
-            let node = encode_authored_scalar(record, &leaf.capture, &leaf.ty, work)?;
+            let node = encode_authored_scalar(witness, &leaf.capture, &leaf.ty, work)?;
             json.push_str(node.strip_suffix('\n')?);
         }
         CheckerSnapshotNode::Array(elements) => {
@@ -2696,7 +2762,7 @@ fn encode_snapshot_node(
             for (index, child) in elements.iter().enumerate() {
                 charge_call_work(work, 1)?;
                 if index != 0 { json.push(','); }
-                encode_snapshot_node(child, shape, record, work, json)?;
+                encode_snapshot_node(child, shape, witness, work, json)?;
             }
             json.push_str("]}");
         }
@@ -2710,7 +2776,7 @@ fn encode_snapshot_node(
                 if index != 0 { json.push(','); }
                 json.push_str(&serde_json::to_string(name.as_ref()).ok()?);
                 json.push(':');
-                encode_snapshot_node(child, shape, record, work, json)?;
+                encode_snapshot_node(child, shape, witness, work, json)?;
             }
             json.push_str("}}");
         }
@@ -9891,6 +9957,48 @@ mod tests {
             assert_eq!(body.structure.checker_contextual_read_locals.contains_key(&key), !allowed);
             assert_eq!(root_local_import_requirement(body).map(|(position, _)| position), allowed.then_some(2));
         }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn startup_module_output_captures_only_successfully_initialized_values() {
+        let app = source("src/main.w", "startup-module-selected-output");
+        let program = r#"%%start
+            i8(i8) identity = fn(value) { value };
+            bool(bool) truth = fn(value) { value };
+            i8 status = identity(37);
+            bool ready = truth(true);
+            core.narrow(false, { .stdout = ""; .stderr = ""; .code = status; .files = [
+                { .path = "status.json"; .state = status; }, { .path = "ready.json"; .state = ready; }
+            ]; });
+            core.require(false, { .stdout = ""; .stderr = "unreachable"; .code = 1; .files = []; });
+        %%end"#;
+        let prepared = prepare_proof_target(&app, program).unwrap();
+        for scope in [ScalarCheckerScope::MainFlowOnly, ScalarCheckerScope::CurrentPackage] {
+            let receipt = run_closed_without_named_proofs(&prepared, scope, 1).unwrap();
+            let [failure] = receipt.directives.as_slice() else { panic!("only startup Narrow may report"); };
+            assert_eq!(failure.code(), &BigInt::from(37));
+            assert_eq!(failure.witness.axes().len(), 0);
+            let [status, ready] = failure.files() else { panic!("two authored outputs"); };
+            assert_eq!(status.text.as_ref(), b"{\"type\":{\"kind\":\"i8\"},\"value\":37}\n");
+            assert_eq!(ready.text.as_ref(), b"{\"type\":{\"kind\":\"bool\"},\"value\":true}\n");
+        }
+
+        let (project, calls) = prepared.parts();
+        let ModuleInitializationDetail::Occurrences(topology) = &calls.initialization_region(0).unwrap().detail
+            else { panic!("expected prepared startup"); };
+        let narrow = topology.structure.checker_directives.iter().find_map(|(site, directive)|
+            (directive.operation == CheckerOperation::Narrow).then_some(*site)).unwrap();
+        let mut actual = CheckedCalls {
+            project, calls, active: HashSet::new(), active_depth: 0, reached: HashSet::new(),
+            had_obligations: false, observer: ProofFreeOrderedEvidence, symbolic_module: 0,
+        };
+        let mut effects = OrderedFailures::default();
+        let mut failures = Some(&mut effects);
+        assert!(matches!(check_initializer_expression::<true, true>(topology, &mut actual, &app,
+            &HashMap::new(), narrow, 0, &mut failures, &[InitializationVisit::Started]),
+            Err(ProjectCheck::Unsupported)));
+        assert!(effects.records.is_empty());
     }
 
     #[cfg(feature = "internal-checker")]

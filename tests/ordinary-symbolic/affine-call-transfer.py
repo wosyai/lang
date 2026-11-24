@@ -1422,6 +1422,27 @@ state_holes = f"""%%start
         core.require(false, {state_report(168,"ALTERNATIVES","value")});
     }};
     %%end"""
+module_authored_output = f"""%%start
+    i8(i8) identity = fn(value) {{ value }};
+    bool(bool) truth = fn(value) {{ value }};
+    i8 status = identity(37);
+    bool ready = truth(true);
+    core.require(status != 37, {{
+        .stdout = ""; .stderr = "MODULE-STATE"; .code = status;
+        .files = [
+            {{ .path = "status.json"; .state = status; }},
+            {{ .path = "note.txt"; .text = "selected at startup"; }},
+            {{ .path = "ready.json"; .state = ready; }},
+            {{ .path = "status-copy.json"; .state = status; }}
+        ];
+    }});
+    core.require(false, {report(200,"AFTER-MODULE-STATE")});
+    %%end"""
+cases.extend([
+    ("exact-startup-module-typed-code-state",module_authored_output,37,b"MODULE-STATEAFTER-MODULE-STATE"),
+    ("exact-startup-module-typed-narrow-prestate",module_authored_output.replace("core.require(status","core.narrow(status"),37,b"MODULE-STATE"),
+    ("exact-startup-module-success-skips-state",module_authored_output.replace("core.require(status != 37","core.require(status == 37"),200,b"AFTER-MODULE-STATE"),
+])
 lexical_code_report = state_report(0,"LEXICAL-CODE","status").replace(".code = 0",".code = status")
 lexical_code = f"""%%start
     unit(i8) check = fn(status) {{
@@ -1584,6 +1605,12 @@ nested_array_bytes = state_bytes({
     },
 })
 authored_files = {
+    **{name: {
+        "status.json": b'{"type":{"kind":"i8"},"value":37}\n',
+        "status-copy.json": b'{"type":{"kind":"i8"},"value":37}\n',
+        "ready.json": b'{"type":{"kind":"bool"},"value":true}\n',
+        "note.txt": b"selected at startup",
+    } for name in ("exact-startup-module-typed-code-state", "exact-startup-module-typed-narrow-prestate")},
     **{name: {"state.json": b'{"type":{"kind":"bool"},"value":false}\n'} for name in (
         "exact-startup-lexical-bool-narrow-empties-initializer",
         "exact-startup-lexical-bool-narrow-empties-bound-local",

@@ -7501,6 +7501,28 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
                     }
                 }
             }
+            #[cfg(feature = "internal-checker")]
+            if let WalkMode::ModuleInitialization { source, declarations } = &self.mode {
+                use super::checker_directive::{CheckerCode, CheckerStateSelection, CheckerStateType};
+                let resolve = |name: &str| match initializer_storage(name, names, source, declarations)? {
+                    InitializationStorage::Module(span) => Some(span),
+                    _ => None,
+                };
+                if let CheckerCode::Lexical(name, ty) = &output.code_value {
+                    if let Some(span) = resolve(name) {
+                        output.code_value = CheckerCode::Module(span, ty.clone());
+                        output.has_module_values = true;
+                    }
+                }
+                for file in output.state_files.iter_mut() {
+                    if let (CheckerStateSelection::Lexical(name), CheckerStateType::Scalar(_)) = (&file.selection, &file.ty) {
+                        if let Some(span) = resolve(name) {
+                            file.selection = CheckerStateSelection::Module(span);
+                            output.has_module_values = true;
+                        }
+                    }
+                }
+            }
             self.structure.checker_directives.insert(
                 ordinal,
                 PreparedCheckerDirective {

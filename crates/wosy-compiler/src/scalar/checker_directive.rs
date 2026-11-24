@@ -59,6 +59,8 @@ pub(super) struct CheckedLiteralOutput {
     pub(super) code_value: CheckerCode,
     pub(super) text_files: Box<[ScalarCheckerTextFile]>,
     pub(super) state_files: Box<[CheckerStateFile]>,
+    #[cfg(feature = "internal-checker")]
+    pub(super) has_module_values: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -67,6 +69,8 @@ pub(super) enum CheckerCode {
     Lexical(std::rc::Rc<str>, ScalarType),
     #[cfg(feature = "internal-checker")]
     Binding(std::rc::Rc<ReferenceBindingId>, ScalarType),
+    #[cfg(feature = "internal-checker")]
+    Module(ByteSpan, ScalarType),
 }
 
 impl CheckerCode {
@@ -86,6 +90,8 @@ pub(super) enum CheckerStateSelection {
     Binding(ReferenceBindingId),
     #[cfg(feature = "internal-checker")]
     Aggregate(std::rc::Rc<CheckerSnapshotShape>),
+    #[cfg(feature = "internal-checker")]
+    Module(ByteSpan),
 }
 
 #[cfg(feature = "internal-checker")]
@@ -335,6 +341,8 @@ impl CheckerOutput<'_> {
             code_value,
             text_files: text_files.into_boxed_slice(),
             state_files: state_files.into_boxed_slice(),
+            #[cfg(feature = "internal-checker")]
+            has_module_values: false,
         })
     }
 }
