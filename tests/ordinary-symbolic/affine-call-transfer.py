@@ -1443,6 +1443,20 @@ cases.extend([
     ("exact-startup-module-typed-narrow-prestate",module_authored_output.replace("core.require(status","core.narrow(status"),37,b"MODULE-STATE"),
     ("exact-startup-module-success-skips-state",module_authored_output.replace("core.require(status != 37","core.require(status == 37"),200,b"AFTER-MODULE-STATE"),
 ])
+mixed_startup_unit_storage = f"""%%start
+    unit(bool, i8) release = fn(enabled, code) {{
+        core.narrow(enabled, {{ .stdout = ""; .stderr = "UNIT-EMPTY"; .code = code;
+            .files = [{{ .path = "gate.json"; .state = enabled; }}]; }});
+    }};
+    i8 status = 37;
+    bool ready = status == 38;
+    release(ready, status);
+    core.require(false, {report(55,"UNIT-AFTER")});
+    %%end"""
+cases.extend([
+    ("exact-startup-unit-mixed-storage-empty",mixed_startup_unit_storage,37,b"UNIT-EMPTY"),
+    ("exact-startup-unit-mixed-storage-live",mixed_startup_unit_storage.replace("status == 38","status == 37"),55,b"UNIT-AFTER"),
+])
 startup_condition_producer = f"""%%start
     bool(bool) gate = fn(value) {{
         core.require(false, {report(47,"CALL")});
@@ -1665,6 +1679,7 @@ nested_array_bytes = state_bytes({
     },
 })
 authored_files = {
+    "exact-startup-unit-mixed-storage-empty": {"gate.json": b'{"type":{"kind":"bool"},"value":false}\n'},
     "exact-startup-bool-condition-call-empty": {"state.json": b'{"type":{"kind":"bool"},"value":false}\n'},
     "exact-startup-computed-bool-binding-true": {"answer.json": b'{"type":{"kind":"bool"},"value":true}\n'},
     "exact-startup-computed-bool-binding-false": {"answer.json": b'{"type":{"kind":"bool"},"value":false}\n'},

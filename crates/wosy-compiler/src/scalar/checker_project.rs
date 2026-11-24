@@ -1164,12 +1164,12 @@ fn check_initializer_expression<const COLLECT: bool, const PRIVATE_NESTED_SCALAR
 ) -> Result<StartupLane, ProjectCheck> {
     let structure = &topology.structure;
     #[cfg(feature = "internal-checker")]
-    let allow_logic = COLLECT && actual.permits_authored_startup_scalars();
+    let allow_authored_startup = COLLECT && actual.permits_authored_startup_scalars();
     #[cfg(not(feature = "internal-checker"))]
-    let allow_logic = false;
+    let allow_authored_startup = false;
     if let Some(directive) = structure.checker_directives.get(&expression) {
         let predicate = directive.initializer_predicate.as_ref().ok_or(ProjectCheck::Unsupported)?;
-        let value = evaluate_initializer_predicate(predicate, storage, allow_logic).ok_or(ProjectCheck::Unsupported)?;
+        let value = evaluate_initializer_predicate(predicate, storage, allow_authored_startup).ok_or(ProjectCheck::Unsupported)?;
         actual.had_obligations = true;
         if directive.operation.rejects(value, !value) {
             let span = topology.occurrences.get(expression.0).ok_or(ProjectCheck::MissingRootOccurrences)?.span;
@@ -1214,10 +1214,10 @@ fn check_initializer_expression<const COLLECT: bool, const PRIVATE_NESTED_SCALAR
             _ => return Err(ProjectCheck::Unsupported),
         };
         let value = match topology.initializer_predicates.get(condition) {
-            Some(predicate) => evaluate_initializer_predicate(predicate, storage, allow_logic)
+            Some(predicate) => evaluate_initializer_predicate(predicate, storage, allow_authored_startup)
                 .ok_or(ProjectCheck::Unsupported)?,
             #[cfg(feature = "internal-checker")]
-            None if allow_logic && structure.checked_types.expressions.get(condition) == Some(&ScalarType::Bool)
+            None if allow_authored_startup && structure.checked_types.expressions.get(condition) == Some(&ScalarType::Bool)
                 && topology.call_targets.contains_key(condition) =>
             {
                 match run_scalar_initializer_call(
@@ -1260,7 +1260,13 @@ fn check_initializer_expression<const COLLECT: bool, const PRIVATE_NESTED_SCALAR
         }))
     } else { None };
     match run_initializer_call(topology, actual, expression, &ScalarType::Unit, |argument, ty| {
-        if COLLECT { initialized_integer_argument(topology, storage, argument, ty) } else { None }
+        if allow_authored_startup {
+            initialized_scalar_initializer_argument(topology, storage, argument, ty)
+        } else if COLLECT {
+            initialized_integer_argument(topology, storage, argument, ty)
+        } else {
+            None
+        }
     }, collection, #[cfg(feature = "internal-checker")] None)? {
         ActualCallResult::Unit => Ok(StartupLane::Feasible),
         ActualCallResult::EmptyUnit if COLLECT => Ok(StartupLane::Empty),
@@ -10063,6 +10069,36 @@ mod tests {
             &HashMap::new(), narrow, 0, &mut failures, &[InitializationVisit::Started]),
             Err(ProjectCheck::Unsupported)));
         assert!(effects.records.is_empty());
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn reached_startup_unit_call_uses_initialized_mixed_arguments() {
+        let app = source("src/main.w", "startup-unit-mixed-storage");
+        let program = r#"%%start
+            unit(bool, i8) release = fn(enabled, code) {
+                core.narrow(enabled, { .stdout = ""; .stderr = ""; .code = code;
+                    .files = [{ .path = "gate.json"; .state = enabled; }]; });
+            };
+            i8 status = 37;
+            bool ready = status == 38;
+            release(ready, status);
+            core.require(false, { .stdout = ""; .stderr = "after"; .code = 55; .files = []; });
+        %%end"#;
+        for scope in [ScalarCheckerScope::MainFlowOnly, ScalarCheckerScope::CurrentPackage] {
+            let prepared = prepare_proof_target(&app, program).unwrap();
+            let receipt = run_closed_without_named_proofs(&prepared, scope, 1).unwrap();
+            let [failure] = receipt.directives.as_slice() else { panic!("only the reached Narrow"); };
+            assert_eq!(failure.code(), &BigInt::from(37));
+            assert_eq!(failure.files()[0].text.as_ref(), b"{\"type\":{\"kind\":\"bool\"},\"value\":false}\n");
+
+            let live_program = program.replace("status == 38", "status == 37");
+            let prepared = prepare_proof_target(&app, &live_program).unwrap();
+            let receipt = run_closed_without_named_proofs(&prepared, scope, 1).unwrap();
+            let [failure] = receipt.directives.as_slice() else { panic!("only the downstream Require"); };
+            assert_eq!(failure.code(), &BigInt::from(55));
+            assert!(failure.files().is_empty());
+        }
     }
 
     #[cfg(feature = "internal-checker")]
