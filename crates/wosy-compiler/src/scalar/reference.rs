@@ -15849,6 +15849,8 @@ fn build_function_reference_cfg(
                 builder.aggregate_facts.formal_forward_shape = Some((moved, call));
             }
         }
+        builder.aggregate_facts.multi_formal_forward_shape =
+            aggregate::exact_multi_formal_forward(&builder.cfg.points, call_sites, &builder.aggregate_facts);
         let flow = builder.aggregate_facts.observation_mode().map(|mode| (
             &builder.aggregate_facts,
             mode,

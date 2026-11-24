@@ -4316,6 +4316,15 @@ if (run() != 42) { core.system_panic(); };
 
 #[test]
 fn multi_owning_formals_release_each_exact_original_base() {
+    assert_multi_owning_formals(false);
+}
+
+#[test]
+fn multi_owning_formals_forward_a_complete_permutation_to_grounded_cleanup() {
+    assert_multi_owning_formals(true);
+}
+
+fn assert_multi_owning_formals(forwarded: bool) {
     let app = source("workbench", "src/multi_owning_formals.w");
     let factory = include_str!("fixtures/conditional-formal-transfer.w")
         .split_once("u64(Packet) accept_packet")
@@ -4325,7 +4334,17 @@ fn multi_owning_formals_release_each_exact_original_base() {
         "Packet factory_value = { .data = data; .length = length; };\n    factory_value",
     );
     assert!(factory.contains("Packet factory_value ="));
-    let text = format!("{factory}{}", include_str!("fixtures/multi-owning-formals.w"));
+    let body = include_str!("fixtures/multi-owning-formals.w");
+    let body = if forwarded {
+        let relays = include_str!("fixtures/multi-owning-forwarders.w");
+        let body = body.replace("u64() drive", &format!("{relays}u64() drive"))
+            .replace("combine(third, 10, first, second)", "relay_first(third, 10, first, second)");
+        assert!(body.contains("relay_first(third, 10, first, second)"));
+        body
+    } else {
+        body.to_owned()
+    };
+    let text = format!("{factory}{body}");
     for (target, target_layout) in [
         ("native64", ScalarTargetLayout::NATIVE64),
         ("wasm32", ScalarTargetLayout::WASM32),
@@ -4364,13 +4383,44 @@ fn multi_owning_formals_release_each_exact_original_base() {
             ).collect();
             assert_eq!(cleanup, [6, 5, 4].map(|slot| combine.get_nth_param(slot).unwrap()));
 
+            let consumer = if forwarded {
+                let relay_first = module.get_function(&name("relay_first")).unwrap();
+                let relay_second = module.get_function(&name("relay_second")).unwrap();
+                for (relay, next, permutation) in [
+                    (relay_first, relay_second, [5, 6, 4]),
+                    (relay_second, combine, [6, 4, 5]),
+                ] {
+                    assert_eq!(relay.get_linkage(), inkwell::module::Linkage::Internal);
+                    assert_eq!(relay.count_params(), 7);
+                    let mut forwards = 0;
+                    for (row, call) in calls(relay) {
+                        let callee = call.get_called_fn_value().expect("direct callee");
+                        if callee == next {
+                            assert_eq!(call.count_arguments(), 7);
+                            for (slot, previous) in (4..7).zip(permutation) {
+                                assert_eq!(row.get_operand(slot).unwrap().value().unwrap(),
+                                    relay.get_nth_param(previous).unwrap());
+                            }
+                            forwards += 1;
+                        } else {
+                            assert!(callee.get_name().to_str().unwrap().starts_with("llvm.memmove."),
+                                "{target}/{route}: unexpected relay effect {row}");
+                        }
+                    }
+                    assert_eq!(forwards, 1);
+                }
+                relay_first
+            } else {
+                combine
+            };
+
             let mut created = Vec::new();
             let mut transfers = 0;
             let mut retained_cleanup = 0;
             for (row, call) in calls(drive) {
                 if call.get_called_fn_value() == Some(factory) {
                     created.push(call.try_as_basic_value().basic().unwrap());
-                } else if call.get_called_fn_value() == Some(combine) {
+                } else if call.get_called_fn_value() == Some(consumer) {
                     assert_eq!(created.len(), 4);
                     assert_eq!(call.count_arguments(), 7);
                     for (slot, creation) in [(4, 2), (5, 0), (6, 1)] {
@@ -4384,7 +4434,8 @@ fn multi_owning_formals_release_each_exact_original_base() {
                 }
             }
             assert_eq!((created.len(), transfers, retained_cleanup), (4, 1, 1));
-            if let Some(directory) = std::env::var_os("WOSY_MULTI_OWNER_IR_DIR") {
+            let output_env = if forwarded { "WOSY_MULTI_OWNER_FORWARD_IR_DIR" } else { "WOSY_MULTI_OWNER_IR_DIR" };
+            if let Some(directory) = std::env::var_os(output_env) {
                 let mut witness = ir.replace("define i32 @main(", "define i32 @wosy_authored_main(");
                 witness.push_str(&format!("\ndefine i64 @wosy_test_multi_owning_formals() {{\nentry:\n  %value = call i64 @{}()\n  ret i64 %value\n}}\n", name("drive")));
                 std::fs::write(std::path::PathBuf::from(directory).join(format!("{target}-{route}.ll")), witness).unwrap();

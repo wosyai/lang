@@ -51,6 +51,7 @@ pub(super) struct AggregateFlowFacts {
     pub(super) temporary_arguments: BTreeSet<CfgPointId>,
     pub(super) conditional_formal_moves: BTreeMap<CfgPointId, CfgPointId>,
     pub(super) formal_forward_shape: Option<(CfgPointId, CfgPointId)>,
+    pub(super) multi_formal_forward_shape: Option<Box<MultiFormalForwardShape>>,
     pub(super) array_formal: Option<ReferenceBindingId>,
     pub(super) array_calls: BTreeMap<CfgPointId, (OccurrenceOrdinal, CfgPointId, ReferenceBindingId)>,
     // Primary return value and the whole-place move that follows its evaluation.
@@ -1257,6 +1258,7 @@ pub(super) struct AggregateFlowResult {
     pub(super) formals: BTreeMap<usize, ReferenceBindingId>,
     pub(super) formal_unsupported: BTreeSet<usize>,
     pub(super) formal_forward: Option<(usize, CfgPointId, usize, usize)>,
+    multi_formal_forward: BTreeMap<(CfgPointId, usize, usize), usize>,
     conditional_formal_overflow: bool,
     conditional_formal_forwards: BTreeSet<(usize, CfgPointId, usize, usize, CfgPointId)>,
     pub(super) checked_successor_candidate: Option<CfgPointId>,
@@ -2216,7 +2218,9 @@ impl AggregateFlowFacts {
                         if place.projections.is_empty() {
                             match state.bindings.remove(owner).and_then(|(value, _, _)| value) {
                                 Some(Value::Aggregate { backing: OwnerSource::Formal(slot), field: None })
-                                    if self.formal_forward_shape.is_some_and(|(moved, _)| moved == id)
+                                    if (self.formal_forward_shape.is_some_and(|(moved, _)| moved == id)
+                                        || self.multi_formal_forward_shape.as_ref().is_some_and(|shape|
+                                            shape.lanes.get(&id).is_some_and(|&(source, _)| source == slot)))
                                         && self.formals.get(&slot) == Some(owner) => {
                                     state.input_moves.insert(id, InputOrigin::Formal(slot));
                                 }
@@ -2365,7 +2369,9 @@ impl AggregateFlowFacts {
                                 let source = match moved {
                                     ArgumentProvenance::WholeMove(moved) => state.input_moves.remove(&moved).filter(|owner| {
                                         if let InputOrigin::Formal(formal) = owner {
-                                            self.formal_forward_shape == Some((moved, id))
+                                            (self.formal_forward_shape == Some((moved, id))
+                                                || self.multi_formal_forward_shape.as_ref().is_some_and(|shape|
+                                                    shape.call == id && shape.lanes.get(&moved) == Some(&(*formal, slot))))
                                                 && actual == Some(InputOrigin::Owner(OwnerSource::Formal(*formal)))
                                         } else if let InputOrigin::ConditionalFormal(formal) = owner {
                                             self.conditional_formal_moves.get(&moved) == Some(&id)
@@ -2385,11 +2391,19 @@ impl AggregateFlowFacts {
                                 };
                                 result.inputs.entry((id, ordinal.0, slot, moved)).or_default().insert(source);
                                 if let Some(InputOrigin::Formal(formal)) = source {
-                                    let transfer = (formal, id, ordinal.0, slot);
-                                    if result.formal_forward.is_some_and(|old| old != transfer) {
-                                        result.formal_unsupported.insert(formal);
+                                    if self.multi_formal_forward_shape.as_ref().is_some_and(|shape| shape.call == id) {
+                                        if result.multi_formal_forward.insert((id, ordinal.0, slot), formal)
+                                            .is_some_and(|old| old != formal)
+                                        {
+                                            result.formal_unsupported.insert(formal);
+                                        }
+                                    } else {
+                                        let transfer = (formal, id, ordinal.0, slot);
+                                        if result.formal_forward.is_some_and(|old| old != transfer) {
+                                            result.formal_unsupported.insert(formal);
+                                        }
+                                        result.formal_forward = Some(transfer);
                                     }
-                                    result.formal_forward = Some(transfer);
                                     continue;
                                 }
                                 if let (Some(InputOrigin::ConditionalFormal(formal)), ArgumentProvenance::WholeMove(moved)) = (source, moved) {
@@ -2813,6 +2827,112 @@ impl StructuredOwnerReturn {
 // Used by both local receipt seeding and prepared owning-formal hops.
 const MAX_OWNING_CALL_ARGUMENTS: usize = 4;
 
+pub(super) struct MultiFormalForwardShape {
+    call: CfgPointId,
+    // Exact whole move -> (source formal slot, destination call slot).
+    lanes: BTreeMap<CfgPointId, (usize, usize)>,
+}
+
+pub(super) fn exact_multi_formal_forward(
+    points: &[ReferenceFlowPoint], sites: &FunctionCallSites, facts: &AggregateFlowFacts,
+) -> Option<Box<MultiFormalForwardShape>> {
+    if !(2..=MAX_OWNING_CALL_ARGUMENTS).contains(&facts.formals.len())
+        || !facts.raw_formals.is_empty() || !ordinary_formal_outputs(&sites.boundary.root_outputs)
+        || facts.input_moves.len() != 1
+    {
+        return None;
+    }
+    let [item] = sites.structure.blocks.get(sites.structure.root.0)?.items.as_slice() else { return None };
+    let BlockItemKind::FinalOutput(output) = &item.kind else { return None };
+    let (&call, &(ordinal, ref moves)) = facts.input_moves.first_key_value()?;
+    if output.output != 0 || output.expression != ordinal || moves.len() != facts.formals.len() {
+        return None;
+    }
+    let call_point = points.get(call.0)?;
+    let CfgPointKind::Call { argument_points, .. } = &call_point.kind else { return None };
+    let signature = sites.checked_call_signatures.get(&ordinal)?;
+    if signature.parameters.len() > MAX_OWNING_CALL_ARGUMENTS
+        || sites.declared_unsafe_calls.contains(&ordinal.0)
+        || signature.outputs.outputs.len() != 1
+        || &signature.outputs.outputs[0].ty != &sites.boundary.root_outputs.first()?.ty
+    {
+        return None;
+    }
+    let next = |id| linear_successor(points, id).and_then(|next| points.get(next.0));
+    let mut point = points.get(argument_points.first()?.0)?;
+    let mut heads = [CfgPointId(0); MAX_OWNING_CALL_ARGUMENTS];
+    let mut lanes = BTreeMap::new();
+    let mut seen = [false; MAX_OWNING_CALL_ARGUMENTS];
+    for (slot, parameter) in signature.parameters.iter().enumerate() {
+        let plain = exact_call_argument_head(sites, ordinal, slot, parameter, point, call_point.scope)?;
+        heads[slot] = point.id;
+        if let Some(&ArgumentProvenance::WholeMove(expected)) = moves.get(&slot) {
+            let Some(PlainNameIdentity::Lexical(holder)) = plain else { return None };
+            let (index, (&formal, _)) = facts.formals.iter().enumerate().find(|(_, (_, binding))| *binding == holder)?;
+            let declared = sites.boundary.parameters.get(formal)?;
+            let moved = next(point.id)?;
+            if seen[index] || declared.ty != *parameter || moved.id != expected
+                || !exact_call_argument_move(point, moved, holder, parameter)
+            {
+                return None;
+            }
+            seen[index] = true;
+            lanes.insert(moved.id, (formal, slot));
+            point = next(moved.id)?;
+        } else {
+            if moves.contains_key(&slot) || !exact_pure_call_companion(&point.kind, plain) || !ordinary_value(parameter) {
+                return None;
+            }
+            point = next(point.id)?;
+        }
+    }
+    if point.id != call || lanes.len() != facts.formals.len()
+        || !exact_direct_call(point, &heads[..signature.parameters.len()])
+        || !matches!(&next(call)?.kind, CfgPointKind::ReturnOutput { output: 0, value_point, checked: false } if *value_point == call)
+    {
+        return None;
+    }
+    Some(Box::new(MultiFormalForwardShape { call, lanes }))
+}
+
+fn exact_call_argument_head<'a>(
+    sites: &'a FunctionCallSites, ordinal: OccurrenceOrdinal, slot: usize,
+    parameter: &ScalarType, point: &ReferenceFlowPoint, scope: ReferenceScopeId,
+) -> Option<Option<&'a PlainNameIdentity>> {
+    let OccurrenceNode::Expression(argument) = *sites.structure.edges.get(&(
+        OccurrenceParent::Expression(ordinal), OccurrenceEdge::CallArgument(slot),
+    ))? else { return None };
+    let span = sites.occurrences.get(argument.0)?.span;
+    (point.scope == scope && point.source_span.range == span
+        && sites.structure.checked_types.expressions.get(&argument) == Some(parameter))
+        .then(|| sites.prepared_plain_name(argument))
+}
+
+fn exact_call_argument_move(
+    read: &ReferenceFlowPoint, moved: &ReferenceFlowPoint,
+    holder: &ReferenceBindingId, parameter: &ScalarType,
+) -> bool {
+    moved.scope == read.scope && moved.source_span == read.source_span
+        && matches!(&read.kind, CfgPointKind::Read { binding } if binding == holder)
+        && matches!(&moved.kind, CfgPointKind::Move { owner, place, ty }
+            if owner == holder && &place.binding == holder && place.projections.is_empty() && ty == parameter)
+}
+
+fn exact_pure_call_companion(kind: &CfgPointKind, plain: Option<&PlainNameIdentity>) -> bool {
+    match (kind, plain) {
+        (CfgPointKind::Read { binding }, Some(PlainNameIdentity::Lexical(expected))) => binding == expected,
+        (CfgPointKind::Evaluate(ScalarExpression::Boolean { .. } | ScalarExpression::Char { .. }
+            | ScalarExpression::Integer { .. } | ScalarExpression::Float { .. }), None) => true,
+        _ => false,
+    }
+}
+
+fn exact_direct_call(point: &ReferenceFlowPoint, heads: &[CfgPointId]) -> bool {
+    matches!(&point.kind, CfgPointKind::Call { output: 0, target: ResolvedCallTarget::ModuleCallable {
+        concrete: ConcreteCallSelection::Declaration, .. }, argument_points: actual, .. }
+        if actual.as_slice() == heads)
+}
+
 pub(super) fn exact_owning_call_arguments<'a>(
     points: &'a [ReferenceFlowPoint], first: &'a ReferenceFlowPoint, scope: ReferenceScopeId,
     sites: &FunctionCallSites, ordinal: OccurrenceOrdinal, parameters: &[ScalarType],
@@ -2829,7 +2949,6 @@ fn exact_bounded_call_arguments<'a>(
     sites: &FunctionCallSites, ordinal: OccurrenceOrdinal, parameters: &[ScalarType],
     owner: Option<(&ReferenceBindingId, &ScalarType)>,
 ) -> Option<(&'a ReferenceFlowPoint, Option<(usize, CfgPointId)>)> {
-    let structure = &sites.structure;
     let next = |id| linear_successor(points, id).and_then(|next| points.get(next.0));
     if parameters.len() > MAX_OWNING_CALL_ARGUMENTS || sites.declared_unsafe_calls.contains(&ordinal.0) {
         return None;
@@ -2838,40 +2957,27 @@ fn exact_bounded_call_arguments<'a>(
     let mut owned = None;
     let mut consumer = first;
     for (slot, parameter) in parameters.iter().enumerate() {
-        let OccurrenceNode::Expression(argument) = *structure.edges.get(&(
-            OccurrenceParent::Expression(ordinal), OccurrenceEdge::CallArgument(slot),
-        ))? else { return None };
-        let span = sites.occurrences.get(argument.0)?.span;
-        if consumer.scope != scope || consumer.source_span.range != span
-            || structure.checked_types.expressions.get(&argument) != Some(parameter)
-        { return None; }
+        let plain = exact_call_argument_head(sites, ordinal, slot, parameter, consumer, scope)?;
         argument_points[slot] = consumer.id;
-        let plain = sites.prepared_plain_name(argument);
         if let Some((holder, _)) = owner.filter(|(_, holder_type)| parameter == *holder_type) {
             let moved = next(consumer.id)?;
-            if owned.is_some() || moved.scope != scope || moved.source_span.range != span
+            if owned.is_some()
                 || !matches!(plain, Some(PlainNameIdentity::Lexical(binding)) if binding == holder)
-                || !matches!(&consumer.kind, CfgPointKind::Read { binding } if binding == holder)
-                || !matches!(&moved.kind, CfgPointKind::Move { owner, place, ty }
-                    if owner == holder && &place.binding == holder && place.projections.is_empty() && ty == parameter)
+                || !exact_call_argument_move(consumer, moved, holder, parameter)
             { return None; }
             owned = Some((slot, moved.id));
             consumer = next(moved.id)?;
         } else {
-            if !ordinary_value(parameter) || !match (&consumer.kind, plain) {
-                (CfgPointKind::Read { binding }, Some(PlainNameIdentity::Lexical(expected))) =>
-                    binding == expected && owner.is_none_or(|(holder, _)| binding != holder),
-                (CfgPointKind::Evaluate(ScalarExpression::Boolean { .. } | ScalarExpression::Char { .. }
-                    | ScalarExpression::Integer { .. } | ScalarExpression::Float { .. }), None) => true,
-                _ => false,
-            } { return None; }
+            if !ordinary_value(parameter) || !exact_pure_call_companion(&consumer.kind, plain)
+                || matches!(plain, Some(PlainNameIdentity::Lexical(binding))
+                    if owner.is_some_and(|(holder, _)| binding == holder))
+            { return None; }
             consumer = next(consumer.id)?;
         }
     }
-    if !matches!(&consumer.kind, CfgPointKind::Call { output: 0, target: ResolvedCallTarget::ModuleCallable {
-        concrete: ConcreteCallSelection::Declaration, .. }, argument_points: actual, .. }
-        if actual.as_slice() == &argument_points[..parameters.len()])
-    { return None; }
+    if !exact_direct_call(consumer, &argument_points[..parameters.len()]) {
+        return None;
+    }
     Some((consumer, owned))
 }
 
@@ -5328,9 +5434,12 @@ fn closed_aggregates<'a>(
                             _ => {}
                         }
                     }
-                    if let Some((formal, call, forward_ordinal, forward_slot)) = facts.formal_forward {
-                        if (point, ordinal, slot) == (call, forward_ordinal, forward_slot) {
-                            forward_edges.insert((key, formal), (target, slot));
+                    let forwarded = facts.multi_formal_forward.get(&(point, ordinal, slot)).copied()
+                        .or_else(|| facts.formal_forward.and_then(|(formal, call, forward_ordinal, forward_slot)|
+                            ((point, ordinal, slot) == (call, forward_ordinal, forward_slot)).then_some(formal)));
+                    if let Some(formal) = forwarded {
+                        if forward_edges.insert((key, formal), (target, slot)).is_some_and(|known| known != (target, slot)) {
+                            return Err(format!("aggregate formal has multiple straight-line destinations in {:?}", body.source));
                         }
                     }
                     if !facts.conditional_formal_overflow {
@@ -5866,13 +5975,20 @@ fn closed_aggregates<'a>(
         }
         let body = bodies.get(&callee).ok_or_else(|| format!("missing owning formal reservation {callee:?}"))?;
         let facts = body.facts.ok_or_else(|| format!("missing owning formal facts {callee:?}"))?;
-        let multiple = owned_slots[&callee] > 1;
-        if multiple && (mixed || forward_edges.contains_key(&(callee, slot))
+        let lane_count = owned_slots[&callee];
+        let multiple = lane_count > 1;
+        if !facts.multi_formal_forward.is_empty()
+            && (facts.multi_formal_forward.len() != lane_count || lane_count != facts.formals.len()
+                || !forward_edges.get(&(callee, slot)).is_some_and(|&(target, _)| owned_slots.get(&target) == Some(&lane_count)))
+        {
+            return Err(format!("aggregate direct forwarding requires all of its exact owning lanes in {:?} at slot {slot}", body.source));
+        }
+        if multiple && (mixed || (facts.multi_formal_forward.is_empty() && forward_edges.contains_key(&(callee, slot)))
             || conditional_forward_edges.contains_key(&(callee, slot))
             || !ordinary_formal_outputs(&body.sites.boundary.root_outputs)
             || !facts.raw_uses.is_empty())
         {
-            return Err(format!("aggregate multiple owning inputs require exact terminal formals in {:?} at slot {slot}", body.source));
+            return Err(format!("aggregate multiple owning inputs require exact terminal or fully forwarded formals in {:?} at slot {slot}", body.source));
         }
         if !body.is_monomorphic || !body.supports_input_result || outgoing.contains(&callee)
             || !facts.formals.contains_key(&slot) || facts.formal_unsupported.contains(&slot) || facts.raw_invalid.is_some() {
@@ -6113,8 +6229,14 @@ fn closed_aggregates<'a>(
                 }
                 _ => return Err(format!("aggregate owning input has unproved emitted incoming use in {:?} at call {ordinal} slot {slot}", bodies[&caller].source)),
             }};
-            if multiple && !matches!(action, ClosedInput::Transfer(_)) {
-                return Err(format!("aggregate multiple owning inputs require distinct local owner transfers in {:?} at call {ordinal}", bodies[&caller].source));
+            if multiple && !match action {
+                ClosedInput::Transfer(_) => true,
+                ClosedInput::ForwardFormal(formal) => bodies[&caller].facts.is_some_and(|facts|
+                    facts.multi_formal_forward.get(&(consumer, ordinal, slot)) == Some(&formal)
+                    && facts.multi_formal_forward.len() == lane_count),
+                _ => false,
+            } {
+                return Err(format!("aggregate multiple owning inputs require distinct exact owner transfers in {:?} at call {ordinal}", bodies[&caller].source));
             }
             match input_calls.entry(caller).or_default().entry(ordinal) {
                 std::collections::btree_map::Entry::Vacant(entry) => {
@@ -6137,12 +6259,16 @@ fn closed_aggregates<'a>(
         if !actions.is_some_and(|actions| actions.as_slice().iter().map(|(slot, _)| slot).eq(formals.keys())) {
             return Err(format!("aggregate multiple owning inputs have incomplete call proof in {:?} at call {ordinal}", bodies[&caller].source));
         }
-        // Deduplicate by exact original receipt, not descriptor type or
-        // argument spelling. Every simultaneous lane needs a distinct base.
-        let mut receipts = BTreeSet::new();
-        if !actions.expect("exact owning input slots").as_slice().iter().all(|(_, action)|
-            matches!(*action, ClosedInput::Transfer(receipt) if receipts.insert(receipt)))
-        {
+        // Each direct call transfers either distinct local receipts or one
+        // complete permutation of its caller's original owning formals.
+        let slots = actions.expect("exact owning input slots").as_slice();
+        let mut authorities = BTreeSet::new();
+        let forwards = matches!(slots[0].1, ClosedInput::ForwardFormal(_));
+        if !slots.iter().all(|(_, action)| match *action {
+            ClosedInput::Transfer(receipt) if !forwards => authorities.insert(receipt),
+            ClosedInput::ForwardFormal(formal) if forwards => authorities.insert(formal),
+            _ => false,
+        }) {
             return Err(format!("aggregate multiple owning inputs share one source receipt in {:?} at call {ordinal}", bodies[&caller].source));
         }
     }
