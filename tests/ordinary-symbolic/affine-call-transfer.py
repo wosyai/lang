@@ -1448,6 +1448,32 @@ cases.extend([
     ("exact-startup-scalar-narrow-prunes-return-chain",scalar_narrow,185,b"NARROW-PRESTATE"),
     ("exact-startup-scalar-narrow-surviving-return",scalar_narrow.replace("forward(1)","forward(3)"),186,b"AFTER-RETURNAFTER-INIT"),
 ])
+two_edge_ranked = """%%start
+    u16(i8, u8) descend = fn(page, slot) {
+        if (slot == 0) {
+            if (page == 0) { 7 } else { descend(page - 1, 3) }
+        } else { descend(page, slot - 1) }
+    };
+    proof rank for descend(p, s) -> (out)
+        where (p >= 0 && p <= 2 && s <= 3) ensures (out == 7) decreases (p, s) {
+            if (s == 0) {
+                if (p == 0) { core.show(out == 7); } else { core.use(rank(p - 1, 3)); }
+            } else { core.use(rank(p, s - 1)); }
+        }
+%%end"""
+two_edge_ranked_reached = two_edge_ranked.replace("%%end",
+    "u16 result = descend(2, 2); core.require(result == 7, " + report(233,"TWO-EDGE-RANK") + "); %%end")
+cases.extend([
+    ("exact-startup-two-edge-ranked-verified", two_edge_ranked_reached, 0, b""),
+    ("exact-startup-two-edge-ranked-missing-transition",
+        two_edge_ranked_reached.replace("descend(page, slot - 1)", "7"), 2, b"unsupported analysis"),
+    ("exact-startup-two-edge-ranked-reset-outside-guard",
+        two_edge_ranked_reached.replace("s <= 3", "s <= 2"), 2, b"unsupported analysis"),
+    ("ordinary-ranked-two-edge-symbolic", two_edge_ranked, 0, b""),
+    ("ordinary-ranked-two-edge-base-refuted", two_edge_ranked.replace("{ 7 } else", "{ 8 } else"),
+        1, b"proof obligation failed"),
+])
+
 ranked_return = f"""%%start
     u8(u8) descend = fn(value) {{
         if (value > 0) {{
@@ -1924,6 +1950,7 @@ cases.extend([
         b"proof obligation failed"),
 ])
 proof_diagnostic_notes = {
+    "ordinary-ranked-two-edge-base-refuted": b"symbolic call can return 8",
     "ordinary-rectangular-authored-show-goal-failure": b"symbolic call can return 245",
     "ordinary-rectangular-authored-show-first-step-failure": b"symbolic call can return 245",
     "ordinary-named-symbolic-mixed-false-refuted": b"symbolic call can return 12",

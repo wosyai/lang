@@ -7758,6 +7758,9 @@ impl PlannedModuleProof<'_> {
     fn verify_induction_return_witness(
         &self, measure: TypedInductionRank<'_>,
     ) -> Result<RankedInductionOutcome<'_>, ProjectCheck> {
+        if measure.earlier.is_some() && has_two_edge_ranked_steps(&self.steps) {
+            return verify_two_edge_ranked_return(self, measure);
+        }
         let proof_case = prepare_decrement_proof_steps(self.name, &self.steps, &self.typed, measure)?;
         let filter = self.filter.as_deref().unwrap_or_default();
         let domains = induction_entry_domain(measure, &proof_case, filter)?;
@@ -9158,13 +9161,27 @@ fn prepare_decrement_proof_steps<'a>(
     })] = steps.items.as_slice() else {
         return Err(ProjectCheck::Unsupported);
     };
+    let (binding, decrement, reset) = prepare_ranked_self_use(proof_name, else_branch, typed, rank)?;
+    let (base_claim, base_show) = prepare_ranked_base_show(then_branch, typed)?;
+    let base_guard = proof_input_condition::<true>(condition, &typed.input_names, typed.body, false)?;
+    if matches!(&base_guard, CheckerPredicate::Integer(predicate) if &predicate.binding != binding) {
+        return Err(ProjectCheck::Unsupported);
+    }
+    Ok(TypedInductionProofSteps { base_guard, base_claim, base_show, decrement, reset })
+}
+
+#[cfg(feature = "internal-checker")]
+fn prepare_ranked_self_use<'a>(
+    proof_name: &str, steps: &'a ScalarBlock, typed: &TypedProofPostcondition<'a>,
+    rank: TypedInductionRank<'a>,
+) -> Result<(&'a ReferenceBindingId, &'a BigInt, Option<Cow<'a, BigInt>>), ProjectCheck> {
     let [ScalarBlockItem::Expression(ScalarExpression::Call {
         receiver: Some(core), name: use_step, type_arguments: use_types, arguments: use_arguments, ..
-    })] = else_branch.items.as_slice() else {
+    })] = steps.items.as_slice() else {
         return Err(ProjectCheck::Unsupported);
     };
     if core != "core" || use_step != "use" || !use_types.is_empty()
-        || else_branch.terminated_items.as_slice() != [true]
+        || steps.terminated_items.as_slice() != [true]
     {
         return Err(ProjectCheck::Unsupported);
     }
@@ -9201,8 +9218,15 @@ fn prepare_decrement_proof_steps<'a>(
     {
         return Err(ProjectCheck::Unsupported);
     }
+    Ok((binding, decrement, reset))
+}
+
+#[cfg(feature = "internal-checker")]
+fn prepare_ranked_base_show<'a>(
+    steps: &'a ScalarBlock, typed: &TypedProofPostcondition<'a>,
+) -> Result<(Cow<'a, BigInt>, ByteSpan), ProjectCheck> {
     let ([show_item @ ScalarBlockItem::Expression(show)], [terminated]) =
-        (then_branch.items.as_slice(), then_branch.terminated_items.as_slice())
+        (steps.items.as_slice(), steps.terminated_items.as_slice())
     else {
         return Err(ProjectCheck::Unsupported);
     };
@@ -9216,11 +9240,20 @@ fn prepare_decrement_proof_steps<'a>(
     }
     let base_claim = claim.bound;
     let base_show = super::typecheck::expression_span(show);
-    let base_guard = proof_input_condition::<true>(condition, &typed.input_names, typed.body, false)?;
-    if matches!(&base_guard, CheckerPredicate::Integer(predicate) if &predicate.binding != binding) {
-        return Err(ProjectCheck::Unsupported);
+    Ok((base_claim, base_show))
+}
+
+#[cfg(feature = "internal-checker")]
+fn ranked_output_at(
+    body: &FunctionCallSites, block: super::reference::BlockOrdinal, ty: &ScalarType,
+) -> Option<OccurrenceOrdinal> {
+    let structure = &body.structure;
+    let [item] = structure.blocks.get(block.0)?.items.as_slice() else { return None; };
+    match item.kind {
+        BlockItemKind::FinalOutput(slot) if slot.output == 0
+            && structure.checked_types.expressions.get(&slot.expression) == Some(ty) => Some(slot.expression),
+        _ => None,
     }
-    Ok(TypedInductionProofSteps { base_guard, base_claim, base_show, decrement, reset })
 }
 
 #[cfg(feature = "internal-checker")]
@@ -9232,14 +9265,6 @@ fn check_canonical_induction_returns<'a>(
     proof: &TypedInductionProofSteps<'_>,
     suffix_domain: &IntegerSet,
 ) -> Result<Option<CheckedRankedBaseFailure<'a>>, ProjectCheck> {
-    use super::reference::{OccurrenceEdge, OccurrenceNode, OccurrenceParent, PlainNameIdentity};
-    use super::typecheck::expression_span;
-
-    let (parameter, binding) = if proof.reset.is_some() {
-        rank.earlier.ok_or(ProjectCheck::Unsupported)?
-    } else {
-        rank.descending
-    };
     let body = typed.body;
     let structure = &body.structure;
     let (relation, bound) = match &typed.goal {
@@ -9249,16 +9274,7 @@ fn check_canonical_induction_returns<'a>(
     if !body.allocation_length_calls.is_empty() {
         return Err(ProjectCheck::Unsupported);
     }
-    let output_at = |block: super::reference::BlockOrdinal| {
-        let [item] = structure.blocks.get(block.0)?.items.as_slice() else {
-            return None;
-        };
-        match item.kind {
-            BlockItemKind::FinalOutput(slot) if slot.output == 0
-                && structure.checked_types.expressions.get(&slot.expression) == Some(typed.result_type) => Some(slot.expression),
-            _ => None,
-        }
-    };
+    let output_at = |block| ranked_output_at(body, block, typed.result_type);
     let tail = output_at(structure.root).ok_or(ProjectCheck::Unsupported)?;
     let Some(ConditionalRegion::Value { condition, then_block, else_block, .. }) = body.conditionals.get(&tail) else {
         return Err(ProjectCheck::Unsupported);
@@ -9303,6 +9319,38 @@ fn check_canonical_induction_returns<'a>(
     if site.ordinal != recursive || body.resolved_call_site(recursive).map(|site| &site.target) != Some(target) {
         return Err(ProjectCheck::Unsupported);
     }
+    let source_tail = function.body.tail_conditional().ok_or(ProjectCheck::Unsupported)?;
+    if body.occurrences.get(tail.0).map(|node| node.span) != Some(source_tail.span) {
+        return Err(ProjectCheck::Unsupported);
+    }
+    check_ranked_recursive_tail(target, typed, rank, recursive, &source_tail.else_branch, proof.decrement, proof.reset.as_ref())?;
+    let show_failed = base != proof.base_claim.as_ref();
+    if !show_failed && relation.accepts(base.cmp(bound)) {
+        return Ok(None);
+    }
+    let return_span = body.occurrences.get(base_occurrence.0).ok_or(ProjectCheck::Unsupported)?.span;
+    Ok(Some(CheckedRankedBaseFailure { returned: base, return_span, show_failed }))
+}
+
+#[cfg(feature = "internal-checker")]
+fn check_ranked_recursive_tail(
+    target: &ResolvedCallTarget, typed: &TypedProofPostcondition<'_>, rank: TypedInductionRank<'_>,
+    recursive: OccurrenceOrdinal, source_block: &ScalarBlock, decrement: &BigInt,
+    reset_value: Option<&Cow<'_, BigInt>>,
+) -> Result<(), ProjectCheck> {
+    use super::reference::{OccurrenceEdge, OccurrenceNode, OccurrenceParent, PlainNameIdentity};
+    use super::typecheck::expression_span;
+
+    let (parameter, binding) = if reset_value.is_some() {
+        rank.earlier.ok_or(ProjectCheck::Unsupported)?
+    } else {
+        rank.descending
+    };
+    let body = typed.body;
+    let structure = &body.structure;
+    if body.resolved_call_site(recursive).map(|site| &site.target) != Some(target) {
+        return Err(ProjectCheck::Unsupported);
+    }
     let signature = body.checked_call_signatures.get(&recursive).ok_or(ProjectCheck::Unsupported)?;
     let parameters_match = match (rank.earlier, signature.parameters.as_slice()) {
         (None, [input]) => input == &parameter.ty,
@@ -9314,12 +9362,11 @@ fn check_canonical_induction_returns<'a>(
         return Err(ProjectCheck::Unsupported);
     }
 
-    let source_tail = function.body.tail_conditional().ok_or(ProjectCheck::Unsupported)?;
-    let mut source_outputs = source_tail.else_branch.final_expressions();
+    let mut source_outputs = source_block.final_expressions();
     let Some((source_call @ ScalarExpression::Call { arguments, .. }, _)) = source_outputs.next() else {
         return Err(ProjectCheck::Unsupported);
     };
-    let (argument, unchanged, reset) = match (rank.earlier, proof.reset.as_ref(), arguments.as_slice()) {
+    let (argument, unchanged, reset) = match (rank.earlier, reset_value, arguments.as_slice()) {
         (None, None, [decrement]) => (decrement, None, None),
         (Some(earlier), None, [first, decrement]) => (decrement, Some((first, earlier)), None),
         (Some(_), Some(value), [decrement, suffix]) => (decrement, None, Some((suffix, value))),
@@ -9328,9 +9375,8 @@ fn check_canonical_induction_returns<'a>(
     let ScalarExpression::Binary { operator: BinaryOperator::Subtract, left, right, .. }
         = argument else { return Err(ProjectCheck::Unsupported); };
     if source_outputs.next().is_some()
-        || body.occurrences.get(tail.0).map(|node| node.span) != Some(source_tail.span)
         || body.occurrences.get(recursive.0).map(|node| node.span) != Some(expression_span(source_call))
-        || !matches!(right.as_ref(), ScalarExpression::Integer { value, .. } if value == proof.decrement)
+        || !matches!(right.as_ref(), ScalarExpression::Integer { value, .. } if value == decrement)
     {
         return Err(ProjectCheck::Unsupported);
     }
@@ -9363,12 +9409,161 @@ fn check_canonical_induction_returns<'a>(
     if !matches!(body.prepared_plain_name(left), Some(PlainNameIdentity::Lexical(entry)) if entry == binding) {
         return Err(ProjectCheck::Unsupported);
     }
-    let show_failed = base != proof.base_claim.as_ref();
-    if !show_failed && relation.accepts(base.cmp(bound)) {
-        return Ok(None);
+    Ok(())
+}
+
+/// Enrol only the exact nested two-arm form; leave the original single
+/// transition path unchanged.
+#[cfg(feature = "internal-checker")]
+fn has_two_edge_ranked_steps(steps: &ScalarBlock) -> bool {
+    matches!(steps.items.as_slice(),
+        [ScalarBlockItem::Expression(ScalarExpression::If { then_branch, .. })]
+        if matches!(then_branch.items.as_slice(), [ScalarBlockItem::Expression(ScalarExpression::If { .. })]))
+}
+
+#[cfg(feature = "internal-checker")]
+fn verify_two_edge_ranked_return<'a>(
+    plan: &'a PlannedModuleProof<'a>, rank: TypedInductionRank<'_>,
+) -> Result<RankedInductionOutcome<'a>, ProjectCheck> {
+    use super::checker_flow::charge_call_work;
+    let (prefix_slot, prefix_binding) = rank.earlier.ok_or(ProjectCheck::Unsupported)?;
+    let (suffix_slot, suffix_binding) = rank.descending;
+    let [ScalarBlockItem::Expression(ScalarExpression::If {
+        condition: suffix_condition, then_branch: suffix_zero, else_branch: suffix_step, ..
+    })] = plan.steps.items.as_slice() else { return Err(ProjectCheck::Unsupported); };
+    let [ScalarBlockItem::Expression(ScalarExpression::If {
+        condition: prefix_condition, then_branch: base, else_branch: reset_step, ..
+    })] = suffix_zero.items.as_slice() else { return Err(ProjectCheck::Unsupported); };
+
+    let typed = &plan.typed;
+    let (suffix_step_binding, suffix_decrement, suffix_reset) = prepare_ranked_self_use(plan.name, suffix_step, typed, rank)?;
+    let (reset_binding, prefix_decrement, reset) = prepare_ranked_self_use(plan.name, reset_step, typed, rank)?;
+    let reset = reset.ok_or(ProjectCheck::Unsupported)?;
+    if suffix_step_binding != suffix_binding || suffix_reset.is_some() || reset_binding != prefix_binding {
+        return Err(ProjectCheck::Unsupported);
     }
-    let return_span = body.occurrences.get(base_occurrence.0).ok_or(ProjectCheck::Unsupported)?.span;
-    Ok(Some(CheckedRankedBaseFailure { returned: base, return_span, show_failed }))
+    let (base_claim, base_show) = prepare_ranked_base_show(base, typed)?;
+    let condition = |expression, expected: &ReferenceBindingId, ty| {
+        let predicate = proof_input_condition::<true>(expression, &typed.input_names, typed.body, false)?;
+        if !matches!(&predicate, CheckerPredicate::Integer(predicate)
+            if &predicate.binding == expected && &predicate.ty == ty)
+        {
+            return Err(ProjectCheck::Unsupported);
+        }
+        Ok(predicate)
+    };
+    let suffix_guard = condition(suffix_condition, suffix_binding, &suffix_slot.ty)?;
+    let prefix_guard = condition(prefix_condition, prefix_binding, &prefix_slot.ty)?;
+
+    let body = typed.body;
+    let structure = &body.structure;
+    // Exactly two actual entrances to recursion, both direct typed value
+    // tail slots; no effects or incidental calls can hide in the proof.
+    let [first, second] = body.call_occurrences.as_slice() else { return Err(ProjectCheck::Unsupported); };
+    if !body.assignments.is_empty() || !body.allocation_length_calls.is_empty()
+        || !structure.checker_directives.is_empty() || !body.arms.is_empty()
+        || structure.has_ordinary_contextual_places() || structure.checker_has_bool_contextual_declaration
+    {
+        return Err(ProjectCheck::Unsupported);
+    }
+    let output = |block| ranked_output_at(body, block, typed.result_type).ok_or(ProjectCheck::Unsupported);
+    let split = |ordinal, expected: &CheckerPredicate| match body.conditionals.get(&ordinal) {
+        Some(ConditionalRegion::Value { condition, then_block, else_block, .. })
+            if structure.checker_branches.get(condition) == Some(expected) =>
+                Ok((*then_block, *else_block)),
+        _ => Err(ProjectCheck::Unsupported),
+    };
+    let outer = output(structure.root)?;
+    let (outer_then, outer_else) = split(outer, &suffix_guard)?;
+    let inner = output(outer_then)?;
+    let (inner_then, inner_else) = split(inner, &prefix_guard)?;
+    let suffix_site = output(outer_else)?;
+    let reset_site = output(inner_else)?;
+    if reset_site == suffix_site || ![first.ordinal, second.ordinal].contains(&reset_site)
+        || ![first.ordinal, second.ordinal].contains(&suffix_site)
+    {
+        return Err(ProjectCheck::Unsupported);
+    }
+    let runtime_outer = plan.function.body.tail_conditional().ok_or(ProjectCheck::Unsupported)?;
+    let runtime_inner = runtime_outer.then_branch.tail_conditional().ok_or(ProjectCheck::Unsupported)?;
+    if body.occurrences.get(outer.0).map(|node| node.span) != Some(runtime_outer.span)
+        || body.occurrences.get(inner.0).map(|node| node.span) != Some(runtime_inner.span)
+    {
+        return Err(ProjectCheck::Unsupported);
+    }
+    check_ranked_recursive_tail(plan.canonical_target, typed, rank, suffix_site,
+        &runtime_outer.else_branch, suffix_decrement, None)?;
+    check_ranked_recursive_tail(plan.canonical_target, typed, rank, reset_site,
+        &runtime_inner.else_branch, prefix_decrement, Some(&reset))?;
+    let base_output = output(inner_then)?;
+    let actual_base = structure.checker_integer_literals.get(&base_output).ok_or(ProjectCheck::Unsupported)?;
+    let (relation, bound) = match &typed.goal {
+        TypedProofGoal::Literal { relation, bound, .. } | TypedProofGoal::Universal { relation, bound } => (relation, bound),
+        _ => return Err(ProjectCheck::Unsupported),
+    };
+
+    // Keep the same joint rectangle: where atoms are independently
+    // authenticated by slot, then each lexicographic arm clips its actual
+    // coordinate. Meter repeated intersections and translated intervals.
+    let filter = plan.filter.as_deref().unwrap_or_default();
+    let mut work = 0;
+    charge_call_work(&mut work, filter.len()).ok_or(ProjectCheck::Unsupported)?;
+    let filter_intervals = filter.iter().try_fold(2usize, |total, predicate| total.checked_add(match predicate {
+        CheckerPredicate::EntryDomain { values, .. } => values.interval_count(),
+        _ => 1,
+    })).ok_or(ProjectCheck::Unsupported)?;
+    charge_call_work(&mut work, filter_intervals.checked_mul(filter.len().checked_add(8)
+        .ok_or(ProjectCheck::Unsupported)?).ok_or(ProjectCheck::Unsupported)?)
+        .ok_or(ProjectCheck::Unsupported)?;
+    let suffix_case = TypedInductionProofSteps {
+        base_guard: suffix_guard, base_claim, base_show, decrement: suffix_decrement, reset: None,
+    };
+    let domains = induction_entry_domain(rank, &suffix_case, filter)?;
+    if domains.descending.is_empty() { return Ok(RankedInductionOutcome::NoApplicable); }
+    let prefix_domain = domains.earlier.as_ref().ok_or(ProjectCheck::Unsupported)?;
+    let refine = |domain: &IntegerSet, guard: &CheckerPredicate, pass| {
+        let CheckerPredicate::Integer(predicate) = guard else { return Err(ProjectCheck::Unsupported); };
+        let operator = if pass { &predicate.operator } else {
+            complement_integer_comparison(&predicate.operator).ok_or(ProjectCheck::Unsupported)?
+        };
+        domain.keep(operator, &predicate.bound).ok_or(ProjectCheck::Unsupported)
+    };
+    let suffix_base = refine(&domains.descending, &suffix_case.base_guard, true)?;
+    let suffix_recursive = refine(&domains.descending, &suffix_case.base_guard, false)?;
+    let prefix_base = refine(prefix_domain, &prefix_guard, true)?;
+    let prefix_recursive = refine(prefix_domain, &prefix_guard, false)?;
+    let show_failed = actual_base != suffix_case.base_claim.as_ref();
+    if let (Some((page, _)), Some((slot, _))) = (prefix_base.extremes(), suffix_base.extremes()) {
+        if show_failed || !relation.accepts(actual_base.cmp(bound)) {
+            let rejected = if show_failed {
+                RankedBaseRejection::AuthoredShow(base_show)
+            } else {
+                let goal = child(&child(plan.proof, SyntaxKind::ProofEnsures)?, SyntaxKind::Expression)?;
+                RankedBaseRejection::Goal(wosy_syntax::byte_span(&goal))
+            };
+            return Ok(RankedInductionOutcome::Refuted(RankedBaseWitness {
+                proof_source: plan.proof_source, return_source: &typed.target.source,
+                entry_type: suffix_slot.ty.clone(), earlier: Some(page.clone()), entry: slot.clone(),
+                returned: actual_base, return_span: body.occurrences.get(base_output.0)
+                    .ok_or(ProjectCheck::Unsupported)?.span, rejected,
+            }));
+        }
+    }
+    let suffix_premise = check_ranked_transition(&domains.descending, &suffix_recursive,
+        &domains.minimum, suffix_decrement, true)?;
+    let prefix_premise = if suffix_base.is_empty() {
+        InductionPremise::Unreachable
+    } else {
+        let (minimum, _) = super::typecheck::integer_bounds(&prefix_slot.ty).ok_or(ProjectCheck::Unsupported)?;
+        check_ranked_transition(prefix_domain, &prefix_recursive, &minimum,
+            prefix_decrement, domains.descending.contains(&reset))?
+    };
+    for premise in [suffix_premise, prefix_premise] {
+        if matches!(premise, InductionPremise::NotStrict | InductionPremise::CalleeWhereUnproved) {
+            return Ok(RankedInductionOutcome::Premise(premise));
+        }
+    }
+    Ok(RankedInductionOutcome::Premise(InductionPremise::Established))
 }
 
 #[cfg(feature = "internal-checker")]
@@ -9482,15 +9677,24 @@ fn check_induction_entry_domain(
         }
         _ => return Err(ProjectCheck::Unsupported),
     };
+    check_ranked_transition(entry_domain, recursive, &domains.minimum, proof.decrement,
+        proof.reset.as_ref().is_none_or(|reset| domains.descending.contains(reset.as_ref())))
+}
+
+#[cfg(feature = "internal-checker")]
+fn check_ranked_transition(
+    entry_domain: &IntegerSet, recursive: &IntegerSet, minimum: &BigInt, decrement: &BigInt,
+    reset_within_guard: bool,
+) -> Result<InductionPremise, ProjectCheck> {
     let Some((first, _)) = recursive.extremes() else {
         return Ok(InductionPremise::Unreachable);
     };
-    if first < &(&domains.minimum + proof.decrement) {
+    if first < &(minimum + decrement) {
         return Ok(InductionPremise::NotStrict);
     }
-    if proof.reset.as_ref().is_some_and(|reset| !domains.descending.contains(reset.as_ref()))
+    if !reset_within_guard
         || !recursive.intervals().all(|(lo, hi)| {
-            entry_domain.covers_closed(&(lo - proof.decrement), &(hi - proof.decrement))
+            entry_domain.covers_closed(&(lo - decrement), &(hi - decrement))
         })
     {
         return Ok(InductionPremise::CalleeWhereUnproved);
@@ -14905,6 +15109,58 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
         let (page, slot) = (BigInt::from(0), BigInt::from(1));
         assert!(witness.witness.intervals_at(0, 0).unwrap().eq([(&page, &page)]));
         assert!(witness.witness.intervals_at(0, 1).unwrap().eq([(&slot, &slot)]));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordered_two_edge_lexicographic_rank_checks_suffix_and_reset() {
+        let app = source("src/main.w", "ordered-two-edge-rank");
+        let text = r#"%%start
+            u16(i8, u8) descend = fn(page, slot) {
+                if (slot == 0) {
+                    if (page == 0) { 7 } else { descend(page - 1, 3) }
+                } else { descend(page, slot - 1) }
+            };
+            proof rank for descend(p, s) -> (out)
+                where (p >= 0 && p <= 2 && s <= 3) ensures (out == 7) decreases (p, s) {
+                    if (s == 0) {
+                        if (p == 0) { core.show(out == 7); } else { core.use(rank(p - 1, 3)); }
+                    } else { core.use(rank(p, s - 1)); }
+                }
+        %%end"#;
+        let run = |text: &str, scope| {
+            let (_, proof) = crate::parse_proof_source(app.clone(), text.to_owned(), &[]).ok().unwrap();
+            check_loaded_scalar_ordered_local_proof_contexts(
+                Vec::new(), [(proof, Vec::new())], vec![app.clone()], inputs(), scope, Vec::new(),
+            )
+        };
+        let reached = text.replace("%%end", &format!(
+            "u16 result = descend(2, 2); core.require(result == 7, {OUTPUT}); %%end"));
+        for scope in [ScalarCheckerScope::MainFlowOnly, ScalarCheckerScope::CurrentPackage] {
+            let report = run(&reached, scope).unwrap();
+            assert!(report.active && report.directives.is_empty() && report.symbolic_diagnostic.is_none());
+        }
+        let scope = ScalarCheckerScope::CurrentPackage;
+        let report = run(text, scope).unwrap();
+        assert!(report.active && report.symbolic_diagnostic.is_none());
+        let bad_base = text.replace("{ 7 } else", "{ 8 } else");
+        let failure = run(&bad_base, scope).unwrap().symbolic_diagnostic.unwrap();
+        assert_eq!(failure.returned, BigInt::from(8));
+        assert!(failure.failed_step.is_some());
+        let zero = BigInt::from(0);
+        assert!(failure.witness.intervals_at(0, 0).unwrap().eq([(&zero, &zero)]));
+        assert!(failure.witness.intervals_at(0, 1).unwrap().eq([(&zero, &zero)]));
+        for (label, rejected) in [
+            ("changed suffix derivation", text.replace("rank(p, s - 1)", "rank(p, s - 2)")),
+            ("not a checked recursive suffix", text.replace("descend(page, slot - 1)", "7")),
+            ("wrong reset argument", text.replace("rank(p - 1, 3)", "rank(p - 1, 2)")),
+            ("reset outside callee where", text.replace("s <= 3", "s <= 2")),
+            ("signed prefix underflow", text.replace("p >= 0 && ", "")),
+            ("runtime and proof split differ", text.replace("if (slot == 0)", "if (slot == 1)")),
+        ] {
+            let result = run(&rejected, scope);
+            assert!(matches!(result, Err(ScalarOrderedCheckerOutcome::Unsupported)), "{label}: {:?}", result.err());
+        }
     }
 
     #[cfg(feature = "internal-checker")]
