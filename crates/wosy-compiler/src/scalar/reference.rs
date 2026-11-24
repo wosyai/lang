@@ -14360,6 +14360,16 @@ fn build_function_reference_cfg(
     }
     aggregate.array_calls = builder.aggregate_facts.array_calls;
     aggregate.checked_result_origins = builder.checked_result_origins;
+    if builder.aggregate_facts.calls.len() == 2 {
+        let structure = &call_sites.structure;
+        if matches!(structure.blocks[structure.root.0].items.first().map(|item| &item.kind),
+            Some(BlockItemKind::Binding(binding))
+                if matches!(&binding.initialization, BindingInitialization::Outputs(init)
+                    if matches!(call_sites.conditionals.get(&init.primary), Some(ConditionalRegion::Value { .. }))))
+        {
+            aggregate.local_choice_reader_calls = std::mem::take(&mut builder.aggregate_facts.receipt_loan_read_calls);
+        }
+    }
     aggregate.allocation_slots = builder.aggregate_facts.allocation_slots;
     aggregate.calls = builder.aggregate_facts.calls;
     aggregate.formals = builder.aggregate_facts.formals;

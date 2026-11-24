@@ -1353,7 +1353,17 @@ fn lexical_conditional_owner_choice_releases_selected_original_after_read() {
     let consumed = text.replace("u64(u64, bool) drive", "u64(Packet) consume = fn(packet) { packet.length };\nu64(u64, bool) drive")
         .replace("    chosen.length", "    consume(chosen)");
     assert_ne!(consumed, text);
-    for (text, consuming) in [(text, false), (consumed.as_str(), true)] {
+    let borrowed = text.replace("u64(u64, bool) drive", "u64(*u64) read_selected = fn(view) { *view };\nu64(u64, bool) drive")
+        .replace("    chosen.length", "    read_selected(&chosen.length)");
+    let named_borrow = text.replace("u64(u64, bool) drive", "u64(*Packet) read_selected = fn(view) { (*view).length };\nu64(u64, bool) drive")
+        .replace("    chosen.length", "    *Packet view = &chosen;\n    read_selected(view)");
+    assert_ne!(borrowed, text);
+    assert_ne!(named_borrow, text);
+    for (text, use_site) in [(text, "choice"), (consumed.as_str(), "consume"),
+        (borrowed.as_str(), "borrow"), (named_borrow.as_str(), "named-borrow")]
+    {
+        let consuming = use_site == "consume";
+        let borrowing = matches!(use_site, "borrow" | "named-borrow");
         for (target, target_layout) in [("native64", ScalarTargetLayout::NATIVE64), ("wasm32", ScalarTargetLayout::WASM32)] {
             for project in [false, true] {
                 let emit = |text: &str| {
@@ -1374,6 +1384,8 @@ fn lexical_conditional_owner_choice_releases_selected_original_after_read() {
                 assert_eq!(drive.count_params(), 2, "lexical choice introduces no hidden result ABI");
                 let (short, long) = (find("make_short"), find("make_long"));
                 let consumer = consuming.then(|| find("consume"));
+                let reader = borrowing.then(|| find("read_selected"));
+                let mut reader_seen = false;
                 let mut transfers = Vec::new();
                 let mut writes = Vec::new();
                 let mut merges = Vec::new();
@@ -1396,7 +1408,13 @@ fn lexical_conditional_owner_choice_releases_selected_original_after_read() {
                     } else if Some(callee) == consumer {
                         assert_eq!(call.count_arguments(), 2);
                         transfers.push((arg(0), arg(1)));
+                    } else if Some(callee) == reader {
+                        assert!(!reader_seen);
+                        assert_eq!(call.count_arguments(), 1, "a reader never receives the owning sidecar");
+                        assert_eq!(arg(0).into_int_value().get_type().get_bit_width(), target_layout.pointer_size as u32 * 8);
+                        reader_seen = true;
                     } else if callee.get_name().to_str().unwrap() == "__wosy_core_free" {
+                        assert!(!borrowing || reader_seen, "the shared loan must end before release");
                         released.push(arg(0));
                     }
                 }
@@ -1419,11 +1437,17 @@ fn lexical_conditional_owner_choice_releases_selected_original_after_read() {
                         }).collect::<Vec<_>>();
                     assert_eq!(frees, [consumer.get_last_param().unwrap()]);
                 } else {
-                    assert!(reads.contains(&first.1), "final field observation must use that slot");
+                    if borrowing {
+                        assert!(reader_seen);
+                        if use_site == "borrow" {
+                            assert!(reads.contains(&first.1), "field loan must borrow from the joined descriptor slot");
+                        }
+                    } else {
+                        assert!(reads.contains(&first.1), "final field observation must use that slot");
+                    }
                     assert_eq!(&released, &[*selected], "free only the selected original backing");
                 }
                 if let Some(out) = std::env::var_os("WOSY_NAMED_FACTORY_IR_DIR") {
-                    let use_site = if consuming { "consume" } else { "choice" };
                     let route = if project { "project" } else { "single" };
                     let out = std::path::PathBuf::from(out).join(format!("lexical-{use_site}-{route}"));
                     std::fs::create_dir_all(&out).unwrap();
@@ -1439,6 +1463,12 @@ fn lexical_conditional_owner_choice_releases_selected_original_after_read() {
                     assert_ne!(forward, text);
                     assert!(emit(&forward).expect_err("the joined owner must reach a proved terminal consumer")
                         .contains("local conditional owner requires a proved terminal consumer"));
+                } else if borrowing {
+                    let uncertified = text.replace("{ *view }", "{ u64 seen = *view; seen }")
+                        .replace("{ (*view).length }", "{ u64 seen = (*view).length; seen }");
+                    assert_ne!(uncertified, text);
+                    assert!(emit(&uncertified).expect_err("only a certified noescape reader may borrow the joined owner")
+                        .contains("aggregate owning call has no proved endpoint"));
                 } else {
                     let extra = text.replace("    chosen.length\n", "    u64 observed = chosen.length;\n    observed\n");
                     assert_ne!(extra, text);

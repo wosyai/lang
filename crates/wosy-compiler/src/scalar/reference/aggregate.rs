@@ -1170,6 +1170,7 @@ struct MixedBranchReturn {
 
 #[derive(Default)]
 pub(super) struct AggregateFlowResult {
+    pub(super) local_choice_reader_calls: BTreeMap<CfgPointId, (CfgPointId, OccurrenceOrdinal)>,
     pub(super) conditional_input_regions: BTreeMap<CfgPointId, ConditionalInputRegion>,
     pub(super) conditional_input_barriers: BTreeSet<CfgPointId>,
     structured_local_backings: BTreeMap<usize, Option<(CfgPointId, CfgPointId)>>,
@@ -2764,7 +2765,11 @@ impl Body<'_> {
         if !ordinary_value(&output_ty.ty) { return None; }
         let structure = &self.sites.structure;
         let root = structure.root;
-        let [bind, result] = structure.blocks.get(root.0)?.items.as_slice() else { return None };
+        let (bind, alias, result) = match structure.blocks.get(root.0)?.items.as_slice() {
+            [bind, result] => (bind, None, result),
+            [bind, alias, result] => (bind, Some(alias), result),
+            _ => return None,
+        };
         let (BlockItemKind::Binding(binding), BlockItemKind::FinalOutput(output)) = (&bind.kind, &result.kind)
             else { return None };
         let [receiver] = binding.receivers() else { return None };
@@ -2798,7 +2803,7 @@ impl Body<'_> {
                 && matches!(exit.kind, CfgPointKind::ScopeExit)).then_some(exit.id)
         };
         let use_site = if let Some((observed, field)) = self.sites.prepared_lexical_member(output.expression) {
-            if observed != holder || &field.structure != descriptor
+            if alias.is_some() || observed != holder || &field.structure != descriptor
                 || !matches!(&read.kind, CfgPointKind::ReadPlace { pointer_point: None, reads_origin: false,
                     candidates, .. } if matches!(candidates.as_slice(), [place] if &place.binding == holder &&
                         matches!(place.projections.as_slice(),
@@ -2809,28 +2814,73 @@ impl Body<'_> {
             let signature = self.sites.checked_call_signatures.get(&output.expression)?;
             let [parameter] = signature.parameters.as_slice() else { return None };
             let [scalar] = signature.outputs.outputs.as_slice() else { return None };
-            if parameter != &receiver.ty || scalar.ty != output_ty.ty
+            if scalar.ty != output_ty.ty
                 || self.sites.declared_unsafe_calls.contains(&output.expression.0)
             { return None; }
             let OccurrenceNode::Expression(argument) = *structure.edges.get(&(
                 OccurrenceParent::Expression(output.expression), OccurrenceEdge::CallArgument(0),
             ))? else { return None };
             let argument_span = self.sites.occurrences.get(argument.0)?.span;
-            let moved = next(read.id)?;
-            let consumer = next(moved.id)?;
-            if moved.scope != scope || read.source_span.range != argument_span || moved.source_span.range != argument_span
-                || !matches!(self.sites.prepared_plain_name(argument), Some(PlainNameIdentity::Lexical(binding)) if binding == holder)
-                || !matches!(&read.kind, CfgPointKind::Read { binding } if binding == holder)
-                || !matches!(&moved.kind, CfgPointKind::Move { owner, place, ty }
-                    if owner == holder && &place.binding == holder && place.projections.is_empty() && ty == parameter)
-                || !matches!(&consumer.kind, CfgPointKind::Call { output: 0, target: ResolvedCallTarget::ModuleCallable {
-                    concrete: ConcreteCallSelection::Declaration, .. }, argument_points, .. }
-                    if argument_points.as_slice() == [read.id])
-            { return None; }
-            let origins = facts.inputs.get(&(consumer.id, output.expression.0, 0, ArgumentProvenance::WholeMove(moved.id)))?;
-            if origins.len() != 1 || !origins.contains(&None) { return None; }
-            end_use(consumer)?;
-            LocalChoiceUse::Consume { point: consumer.id, ordinal: output.expression }
+            if let ScalarType::CheckedReference { mutability: ScalarReferenceMutability::Shared, inner } = parameter {
+                let CfgPointKind::Borrow { place, loan } = &read.kind else { return None };
+                if &place.binding != holder || loan.parent.is_some() || loan.origin_place != *place
+                    || loan.mode != ScalarReferenceMutability::Shared
+                    || structure.checked_types.expressions.get(&argument) != Some(parameter)
+                    || !match (&place.place, place.projections.as_slice()) {
+                        (ScalarPlace::Name { .. }, []) => inner.as_ref() == &receiver.ty,
+                        (ScalarPlace::Field { base, field: ScalarFieldReference::Resolved(field), .. },
+                            [ReferencePlaceProjection::Field(ScalarFieldReference::Resolved(projection))]) =>
+                            matches!(base.as_ref(), ScalarPlace::Name { .. }) && &field.structure == descriptor
+                                && field == projection && ordinary_value(inner),
+                        _ => false,
+                    }
+                { return None; }
+                let (input, borrow_expression) = if let Some(alias) = alias {
+                    let BlockItemKind::Binding(view) = &alias.kind else { return None };
+                    let [view_receiver] = view.receivers() else { return None };
+                    let BindingInitialization::Outputs(init) = &view.initialization else { return None };
+                    let view_bind = next(read.id)?;
+                    let input = next(view_bind.id)?;
+                    let PlainNameIdentity::Lexical(view_identity) = self.sites.prepared_plain_name(argument)?
+                        else { return None };
+                    if &view_receiver.ty != parameter || !init.secondary.is_empty()
+                        || structure.checked_types.expressions.get(&init.primary) != Some(parameter)
+                        || view_identity.declaration_span != view_receiver.span
+                        || view_bind.scope != scope || input.scope != scope
+                        || input.source_span.range != argument_span
+                        || !matches!(&view_bind.kind, CfgPointKind::Bind { binding } if binding == view_identity)
+                        || !matches!(&input.kind, CfgPointKind::Read { binding } if binding == view_identity)
+                    { return None; }
+                    (input, init.primary)
+                } else {
+                    (read, argument)
+                };
+                let reader = next(input.id)?;
+                if read.source_span.range != self.sites.occurrences.get(borrow_expression.0)?.span
+                    || facts.local_choice_reader_calls.get(&reader.id) != Some(&(input.id, output.expression))
+                    || !matches!(&reader.kind, CfgPointKind::Call { output: 0, target: ResolvedCallTarget::ModuleCallable {
+                        concrete: ConcreteCallSelection::Declaration, .. }, argument_points, .. }
+                        if argument_points.as_slice() == [input.id])
+                { return None; }
+                LocalChoiceUse::Observe(end_use(reader)?)
+            } else {
+                if alias.is_some() || parameter != &receiver.ty { return None; }
+                let moved = next(read.id)?;
+                let consumer = next(moved.id)?;
+                if moved.scope != scope || read.source_span.range != argument_span || moved.source_span.range != argument_span
+                    || !matches!(self.sites.prepared_plain_name(argument), Some(PlainNameIdentity::Lexical(binding)) if binding == holder)
+                    || !matches!(&read.kind, CfgPointKind::Read { binding } if binding == holder)
+                    || !matches!(&moved.kind, CfgPointKind::Move { owner, place, ty }
+                        if owner == holder && &place.binding == holder && place.projections.is_empty() && ty == parameter)
+                    || !matches!(&consumer.kind, CfgPointKind::Call { output: 0, target: ResolvedCallTarget::ModuleCallable {
+                        concrete: ConcreteCallSelection::Declaration, .. }, argument_points, .. }
+                        if argument_points.as_slice() == [read.id])
+                { return None; }
+                let origins = facts.inputs.get(&(consumer.id, output.expression.0, 0, ArgumentProvenance::WholeMove(moved.id)))?;
+                if origins.len() != 1 || !origins.contains(&None) { return None; }
+                end_use(consumer)?;
+                LocalChoiceUse::Consume { point: consumer.id, ordinal: output.expression }
+            }
         };
         let prove_arm = |block: BlockOrdinal, side: usize| {
             let [item] = structure.blocks.get(block.0)?.items.as_slice() else { return None };
