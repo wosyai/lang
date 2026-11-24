@@ -119,11 +119,35 @@ anything from the graph. The version 1 source hash is BLAKE3 of
 `wosy-package-source-v1` followed by a zero byte, then, for each tracked
 regular file in sorted UTF-8 path order: its package-relative path length in
 bytes (unsigned 64-bit little endian), its path bytes with `/` separators,
-and the 32 raw bytes of its file-content BLAKE3 hash. Symlinks, submodules and
-patches for a Git dependency are not supported by this version. Sync does not
-overwrite an edited or unverified directory. Moving the same project with
-its checkouts preserves their provenance; copying them to a different project
-does not. Patch replay, snapshots and revision updates are not implemented.
+and the 32 raw bytes of its file-content BLAKE3 hash. Symlinks and submodules are not supported inside Git checkouts.
+Sync does not overwrite an edited or unverified directory. Moving the same
+project with its checkouts preserves their provenance; copying them to a
+different project does not.
+
+## Dependency patches
+
+`wosy dep snapshot` records edits to reached Git dependencies, including
+transitive packages, in `patches/<package>/<uuid-v7>.patch`. The canonical
+filename uses lowercase hyphenated UUIDv7. Other files in that directory are
+not patch inputs. Each patch is a standard Git binary diff; renames, binary
+changes and executable modes are preserved. Snapshot leaves the checkout and
+lock untouched and writes no new patch when there is no new edit. Reconstructing
+an old baseline can require access to the exact locked revision. A manifest
+edit can be captured before its new dependency graph has a lock. Run
+`wosy dep update` to resolve newly reached or removed dependencies when ready.
+
+`wosy dep sync` applies the selected patch stack in UUID order. Changing a
+patch invalidates the previously applied stack until sync reconciles it.
+The original Git content hash remains unchanged by patches. Build and run
+continue to observe editable source bytes, and the applied patch stack is
+also part of their input identity. Local dependencies are not patch inputs.
+
+`wosy dep update` selects same-origin fast-forward revisions and reapplies the
+same project-owned patch files. A divergent tip, unappliable patch or edited
+checkout that would be replaced leaves the old lock and worktree in place.
+A successful update removes verified, clean checkouts no longer in the
+resolved graph. It does not delete their authored patches; adding a package back
+reapplies its existing patches. An edited or unverified checkout blocks removal.
 
 ## Source graph
 

@@ -1,15 +1,16 @@
-use super::{git_wire::{self, GitOid}, graph, load_git, load_local_declarations, GitDirectory, GitProject, LockedInputId, LockedPackage, ProjectSnapshot, DEPS};
-use crate::{project_dependencies, scalar_string, GitSource};
+use super::{git_wire::{self, GitOid, GitTreeOid}, graph, load_git, load_local_declarations, GitDirectory, GitProject, LockedInputId, LockedPackage, ProjectSnapshot, DEPS};
+use super::patches::{GitOverlay, PatchStack, PatchStackId};
+use crate::{dependency_diagnostic, project_dependencies, scalar_string, DependencyDeclaration, DependencySource, GitSource};
 use std::cell::Cell;
-use std::collections::BTreeMap;
-use std::fs::{self, OpenOptions};
-use std::io::ErrorKind;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs::{self, File, OpenOptions};
+use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use toml_edit::Item;
 
-const PINS: &str = ".wosy-pins";
+pub(super) const PINS: &str = ".wosy-pins";
 
 pub fn sync_dependencies(root: &Path) -> Result<(), String> {
     let snapshot = ProjectSnapshot::sync(root)?;
@@ -30,18 +31,54 @@ pub fn sync_dependencies(root: &Path) -> Result<(), String> {
                     git = Some(snapshot.git_project()?);
                 }
                 let git = git.as_ref().expect("opened Git project");
-                let checkout = if let Some(checkout) = git.installed(name, pin)? {
-                    if source_hash(&checkout)? != pin.source_hash {
-                        return Err(format!(
-                            "dependency {name} installed tree differs from its pinned source; dep sync did not overwrite {}",
-                            git.root.join(DEPS).join(name).display()
-                        ));
+                let stack = PatchStack::load(&git.directory, name)?;
+                let mut install = None;
+                let mut live = None;
+                let checkout = if let Some(installed) = git.installed(name, pin)? {
+                    let actual = tree_identity(&installed.checkout)?;
+                    let stack_changed = installed.stack != stack.identity();
+                    let pristine = if stack_changed && installed.baseline.is_none() {
+                        Some(downloads.pristine(git, name, pin)?)
+                    } else {
+                        None
+                    };
+                    let baseline = installed.baseline.or_else(|| pristine.as_ref().map(|pristine| pristine.identity.working));
+                    let unchanged = baseline.map_or(actual.original_v1 == pin.source_hash, |baseline| baseline == actual.working);
+                    if !unchanged {
+                        return Err(dirty_checkout(git, name));
                     }
-                    checkout
+                    if stack_changed {
+                        let before = PreviousCheckout { checkout: installed.checkout, baseline: actual.working };
+                        let (checkout, working) = if let Some(pristine) = pristine {
+                            downloads.replay(git, name, &pristine, &stack)?
+                        } else {
+                            downloads.overlay(git, name, pin, &stack)?
+                        };
+                        install = Some((working, Some(before)));
+                        checkout
+                    } else {
+                        let checkout = installed.checkout.clone();
+                        live = Some(installed);
+                        checkout
+                    }
                 } else {
-                    downloads.install_candidate(git, name, pin)?
+                    let (checkout, working) = downloads.overlay(git, name, pin, &stack)?;
+                    install = Some((working, None));
+                    checkout
                 };
-                load_git(root, declaration, checkout, pin, None)
+                let loaded = load_git(root, declaration, checkout.clone(), pin, None)?;
+                let routes = FrozenRoutes::capture(&loaded.dependencies);
+                if let Some((working, previous)) = install {
+                    downloads.prepare_install(git, name, pin, &stack, checkout, working, previous, &routes)?;
+                } else if let Some(live) = live {
+                    if let Some(baseline) = live.baseline {
+                        if live.routes.as_ref() != Some(&routes) {
+                            downloads.refresh_receipt(git, name, pin, &stack, live.checkout, baseline, &routes)?;
+                        }
+                    }
+                }
+                Ok(loaded)
+
             }
         }
     })?;
@@ -56,42 +93,172 @@ pub fn sync_dependencies(root: &Path) -> Result<(), String> {
 pub(super) struct Staging {
     stage: Option<Stage>,
     pending: Vec<PendingInstall>,
+    retirements: Vec<Retirement>,
     tips: BTreeMap<String, (PathBuf, GitOid)>,
-    exact: BTreeMap<(String, String), PathBuf>,
+    exact: BTreeMap<(String, GitOid), PathBuf>,
+    ancestry: BTreeSet<(String, GitOid, GitOid)>,
+}
+
+/// Exact fetched Git object tree and the identities recorded while extracting
+/// its blob bytes. Replays can use these objects directly, without re-reading
+/// the immutable worktree to rebuild an equivalent Git index.
+pub(super) struct PristinePackage {
+    pub(super) checkout: GitDirectory,
+    pub(super) identity: TreeIdentity,
+    pub(super) tree: GitTreeOid,
+    pub(super) repository: PathBuf,
+}
+
+/// One observed working generation. Native Git reads only these frozen files,
+/// never a second view of the live checkout.
+pub(super) struct FrozenTree {
+    pub(super) directory: GitDirectory,
+    pub(super) files: BTreeMap<String, (blake3::Hash, bool)>,
+    pub(super) working: WorkingTreeId,
+}
+
+impl PristinePackage {
+    pub(super) fn require_pin_hash(&self, name: &str, pin: &LockedPackage) -> Result<(), String> {
+        if pin.source_hash != self.identity.original_v1 {
+            return Err(format!(
+                "dependency {name} source hash mismatch: expected {}, got {}",
+                pin.source_hash, self.identity.original_v1,
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl Staging {
-    fn install_candidate(
+    pub(super) fn freeze_working(
+        &mut self,
+        git: &GitProject,
+        name: &str,
+        live: &GitDirectory,
+    ) -> Result<FrozenTree, String> {
+        let stage = self.workspace(git)?;
+        let slot = Path::new("snapshots").join(name);
+        let frozen = stage.path.join(&slot);
+        fs::create_dir_all(&frozen).map_err(|error| format!("cannot stage snapshot for {name}: {error}"))?;
+        let mut files = BTreeMap::new();
+        collect_tree_files(live, |path, contents, executable| {
+            let destination = frozen.join(path);
+            let snapshot = (|| -> std::io::Result<blake3::Hash> {
+                fs::create_dir_all(destination.parent().expect("snapshot file parent"))?;
+                let output = OpenOptions::new().write(true).create_new(true).open(destination)?;
+                copy_hashed(contents, output)
+            })().map_err(|error| format!("cannot capture {name} file {path}: {error}"))?;
+            files.insert(path.to_owned(), (snapshot, executable));
+            Ok(())
+        })?;
+        let working = identity_from_files(&files).working;
+        let directory = stage.handle.directory(&slot)?.ok_or_else(|| format!("staged snapshot for {name} disappeared"))?;
+        Ok(FrozenTree { directory, files, working })
+    }
+
+    pub(super) fn prepare_install(
         &mut self,
         git: &GitProject,
         name: &str,
         pin: &LockedPackage,
-    ) -> Result<GitDirectory, String> {
-        let checkout = self.fetch(git, name, &pin.source, &pin.revision)?;
-        let actual = source_hash(&checkout)?;
-        if pin.source_hash != actual {
-            return Err(format!(
-                "dependency {name} source hash mismatch: expected {}, got {actual}", pin.source_hash,
-            ));
-        }
-        let staging = self.stage.as_ref().expect("prepared checkout staging");
+        stack: &PatchStack,
+        checkout: GitDirectory,
+        working: WorkingTreeId,
+        previous_checkout: Option<PreviousCheckout>,
+        routes: &FrozenRoutes,
+    ) -> Result<(), String> {
+        self.prepare(git, name, pin, stack, checkout, working, previous_checkout, routes, false)
+    }
+
+    pub(super) fn refresh_receipt(
+        &mut self,
+        git: &GitProject,
+        name: &str,
+        pin: &LockedPackage,
+        stack: &PatchStack,
+        checkout: GitDirectory,
+        baseline: WorkingTreeId,
+        routes: &FrozenRoutes,
+    ) -> Result<(), String> {
+        self.prepare(git, name, pin, stack, checkout, baseline, None, routes, true)
+    }
+
+    fn prepare(
+        &mut self,
+        git: &GitProject,
+        name: &str,
+        pin: &LockedPackage,
+        stack: &PatchStack,
+        checkout: GitDirectory,
+        working: WorkingTreeId,
+        previous_checkout: Option<PreviousCheckout>,
+        routes: &FrozenRoutes,
+        receipt_only: bool,
+    ) -> Result<(), String> {
+        let staging = self.workspace(git)?;
         let receipt = staging.path.join(DEPS).join(PINS).join(name);
         fs::create_dir_all(receipt.parent().expect("receipt staging parent"))
             .map_err(|error| format!("cannot create provenance staging directory: {error}"))?;
-        let expected_receipt = InstallEvidence::new(&git.directory, &checkout, name, pin).receipt();
+        let expected_receipt = overlay_receipt(&git.directory, &checkout, name, pin, stack.identity(), working, routes)?;
         fs::write(&receipt, &expected_receipt)
             .map_err(|error| format!("cannot stage provenance for {name}: {error}"))?;
         self.pending.push(PendingInstall {
             name: name.to_owned(),
             expected_checkout: checkout.clone(),
             expected_receipt,
-            expected_source_hash: pin.source_hash.clone(),
+            expected_working: working,
+            previous_checkout,
+            receipt_only,
             destination: git.root.join(DEPS).join(name),
             previous_receipt: false,
             receipt_published: false,
             checkout_published: false,
         });
-        Ok(checkout)
+        Ok(())
+    }
+
+    pub(super) fn pristine(
+        &mut self,
+        git: &GitProject,
+        slot: &str,
+        pin: &LockedPackage,
+    ) -> Result<PristinePackage, String> {
+        let pristine = self.fetch(git, slot, &pin.source, &pin.revision)?;
+        pristine.require_pin_hash(slot, pin)?;
+        Ok(pristine)
+    }
+
+    pub(super) fn overlay(
+        &mut self,
+        git: &GitProject,
+        slot: &str,
+        pin: &LockedPackage,
+        stack: &PatchStack,
+    ) -> Result<(GitDirectory, WorkingTreeId), String> {
+        let pristine = self.pristine(git, slot, pin)?;
+        self.replay(git, slot, &pristine, stack)
+    }
+
+    pub(super) fn replay(
+        &mut self,
+        git: &GitProject,
+        slot: &str,
+        pristine: &PristinePackage,
+        stack: &PatchStack,
+    ) -> Result<(GitDirectory, WorkingTreeId), String> {
+        if stack.is_empty() {
+            return Ok((pristine.checkout.clone(), pristine.identity.working));
+        }
+        let staging = self.workspace(git)?;
+        let overlay = GitOverlay::for_pristine(git, staging, pristine);
+        let applied = overlay.apply(slot, &pristine.tree, stack)?;
+        let destination = staging.path.join(DEPS).join(slot);
+        // The pristine objects and digest remain available in the private
+        // repository; only the effective source tree needs to stay on disk.
+        fs::remove_dir_all(&destination)
+            .map_err(|error| format!("cannot replace private pristine stage for {slot}: {error}"))?;
+        let identity = overlay.materialize(&applied, &destination)?;
+        Ok((staging.checkout(slot)?, identity.working))
     }
 
     pub(super) fn workspace(&mut self, git: &GitProject) -> Result<&Stage, String> {
@@ -104,13 +271,13 @@ impl Staging {
         slot: &str,
         source: &GitSource,
         revision: &GitOid,
-    ) -> Result<GitDirectory, String> {
+    ) -> Result<PristinePackage, String> {
         let (checkout, unused_repository, stage) = {
             let staging = self.workspace(git)?;
             let (checkout, repository) = staging.git_paths(slot)?;
             (checkout, repository, staging.handle.clone())
         };
-        let key = (source.origin.clone(), revision.as_str().to_owned());
+        let key = (source.origin.clone(), revision.clone());
         let repository = if let Some(repository) = self.exact.get(&key) {
             repository.clone()
         } else {
@@ -118,8 +285,22 @@ impl Staging {
             self.exact.insert(key, unused_repository.clone());
             unused_repository
         };
-        materialize_tree(&git.directory, &stage, &repository, &checkout, source, revision)?;
-        self.stage.as_ref().expect("prepared checkout staging").checkout(slot)
+        let staging = self.stage.as_ref().expect("prepared checkout staging");
+        staging.fetched(git, slot, repository, &checkout, source, revision)
+    }
+
+    pub(super) fn fetch_requirement(
+        &mut self,
+        git: &GitProject,
+        slot: &str,
+        requirement: &graph::GitRequirement,
+        history: bool,
+    ) -> Result<(PristinePackage, GitOid), String> {
+        let source = &requirement.source;
+        match &requirement.revision {
+            Some(revision) => Ok((self.fetch(git, slot, source, revision)?, revision.clone())),
+            None => self.fetch_tip_with_history(git, slot, source, history),
+        }
     }
 
     pub(super) fn fetch_tip(
@@ -127,7 +308,17 @@ impl Staging {
         git: &GitProject,
         slot: &str,
         source: &GitSource,
-    ) -> Result<(GitDirectory, GitOid), String> {
+    ) -> Result<(PristinePackage, GitOid), String> {
+        self.fetch_tip_with_history(git, slot, source, false)
+    }
+
+    fn fetch_tip_with_history(
+        &mut self,
+        git: &GitProject,
+        slot: &str,
+        source: &GitSource,
+        history: bool,
+    ) -> Result<(PristinePackage, GitOid), String> {
         let (checkout, unused_repository, stage) = {
             let staging = self.workspace(git)?;
             let (checkout, repository) = staging.git_paths(slot)?;
@@ -136,26 +327,167 @@ impl Staging {
         let (repository, revision) = if let Some(existing) = self.tips.get(&source.origin) {
             existing.clone()
         } else {
-            checked_output(
-                git_command(&git.directory, &stage, None)?
-                    .args(["clone", "--quiet", "--bare", "--single-branch", "--depth=1", "--no-tags", "--no-local", "--template=", "--"])
-                    .arg(&source.origin)
-                    .arg(&unused_repository),
-                "clone",
-            )?;
-            let revision = read_commit(&git.directory, &stage, &unused_repository, "HEAD^{commit}")?;
+            let mut command = git_command(&git.directory, &stage, None)?;
+            command.args(["clone", "--quiet", "--bare", "--single-branch", "--no-tags", "--no-local", "--template="]);
+            if !history {
+                command.arg("--depth=1");
+            }
+            checked_output(command.arg("--").arg(&source.origin).arg(&unused_repository), "clone")?;
+            let revision = read_oid(&git.directory, &stage, &unused_repository, "HEAD^{commit}")?;
             let resolved = (unused_repository, revision);
-            self.exact.insert((source.origin.clone(), resolved.1.as_str().to_owned()), resolved.0.clone());
+            self.exact.insert((source.origin.clone(), resolved.1.clone()), resolved.0.clone());
             self.tips.insert(source.origin.clone(), resolved.clone());
             resolved
         };
-        materialize_tree(&git.directory, &stage, &repository, &checkout, source, &revision)?;
-        let staged = self.stage.as_ref().expect("prepared checkout staging").checkout(slot)?;
-        Ok((staged, revision))
+        let staging = self.stage.as_ref().expect("prepared checkout staging");
+        let pristine = staging.fetched(git, slot, repository, &checkout, source, &revision)?;
+        Ok((pristine, revision))
+    }
+
+    pub(super) fn require_forward(
+        &mut self,
+        git: &GitProject,
+        pristine: &PristinePackage,
+        source: &GitSource,
+        old: &GitOid,
+        new: &GitOid,
+    ) -> Result<(), String> {
+        if old == new {
+            return Ok(());
+        }
+        let key = (source.origin.clone(), old.clone(), new.clone());
+        if self.ancestry.contains(&key) {
+            return Ok(());
+        }
+        let staging = self.stage.as_ref().expect("prepared candidate staging");
+        let output = git_command(&git.directory, &staging.handle, Some(&pristine.repository))?
+            .args(["merge-base", "--is-ancestor", old.as_str(), new.as_str()])
+            .output().map_err(|error| format!("cannot check revision ancestry: {error}"))?;
+        match output.status.code() {
+            Some(0) => {
+                self.ancestry.insert(key);
+                Ok(())
+            }
+            Some(1) => Err(format!(
+                "Git origin {} diverged: {} is not an ancestor of {}",
+                source.origin, old.as_str(), new.as_str()
+            )),
+            _ => Err(format!(
+                "cannot establish forward history for {} ({} to {}): {}",
+                source.origin, old.as_str(), new.as_str(), String::from_utf8_lossy(&output.stderr)
+            )),
+        }
+    }
+
+    pub(super) fn retire(
+        &mut self,
+        git: &GitProject,
+        name: &str,
+        previous: Option<PreviousCheckout>,
+    ) -> Result<(), String> {
+        self.workspace(git)?;
+        self.retirements.push(Retirement {
+            name: name.to_owned(),
+            previous,
+            moved_checkout: false,
+            moved_receipt: false,
+        });
+        Ok(())
     }
 
     fn publish(self, git: &GitProject) -> Result<(), String> {
-        publish_staging(&git.directory, self.stage, self.pending)
+        self.publish_with(git, |_| Ok(()))
+    }
+
+    pub(super) fn publish_with(
+        self,
+        git: &GitProject,
+        commit: impl FnOnce(Option<&Stage>) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let mut retirements = self.retirements;
+        publish_staging(&git.directory, self.stage, self.pending, |stage| {
+            if retirements.is_empty() {
+                commit(stage)
+            } else {
+                let stage = stage.expect("prepared retirements");
+                publish_retirements(git, stage, &mut retirements, || commit(Some(stage)))
+            }
+        })
+    }
+}
+
+struct Retirement {
+    name: String,
+    previous: Option<PreviousCheckout>,
+    moved_checkout: bool,
+    moved_receipt: bool,
+}
+
+fn publish_retirements(
+    git: &GitProject,
+    stage: &Stage,
+    entries: &mut [Retirement],
+    commit: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    let Some(deps) = git.directory.directory(Path::new(DEPS))? else {
+        if entries.iter().any(|entry| entry.previous.is_some()) {
+            return Err("installed dependencies disappeared during update".to_owned());
+        }
+        return commit();
+    };
+    let receipts = deps.directory(Path::new(PINS))?;
+    let retired = Path::new("retired-checkouts");
+    let retired_receipts = Path::new("retired-receipts");
+    for dir in [retired, retired_receipts] {
+        stage.handle.mkdir(dir).map_err(|error| format!("cannot stage retired dependencies: {error}"))?;
+    }
+    let retired = stage.handle.directory(retired)?.expect("created retirement stage");
+    let retired_receipts = stage.handle.directory(retired_receipts)?.expect("created receipt retirement stage");
+    let apply = (|| {
+        for entry in entries.iter_mut() {
+            let path = Path::new(&entry.name);
+            let ready = deps.directory(path)?;
+            if ready.as_ref() != entry.previous.as_ref().map(|previous| &previous.checkout) {
+                return Err(format!("cannot retire {}: installed checkout changed", entry.name));
+            }
+            if let Some(previous) = &entry.previous {
+                deps.rename(path, &retired, path)
+                    .map_err(|error| format!("cannot stage retirement of {}: {error}", entry.name))?;
+                entry.moved_checkout = true;
+                if tree_identity(&previous.checkout)?.working != previous.baseline {
+                    return Err(dirty_checkout(git, &entry.name));
+                }
+            }
+            if let Some(receipts) = &receipts {
+                if receipts.source(path)?.is_some() {
+                    receipts.rename(path, &retired_receipts, path)
+                        .map_err(|error| format!("cannot stage receipt retirement for {}: {error}", entry.name))?;
+                    entry.moved_receipt = true;
+                }
+            }
+        }
+        commit()
+    })();
+    let Err(error) = apply else { return Ok(()); };
+    let mut recovery = Vec::new();
+    for entry in entries.iter().rev() {
+        let path = Path::new(&entry.name);
+        if entry.moved_checkout {
+            if let Err(error) = retired.rename(path, &deps, path) {
+                recovery.push(format!("{} checkout: {error}", entry.name));
+            }
+        }
+        if entry.moved_receipt {
+            if let Err(error) = retired_receipts.rename(path, receipts.as_ref().expect("previous receipt directory"), path) {
+                recovery.push(format!("{} receipt: {error}", entry.name));
+            }
+        }
+    }
+    if recovery.is_empty() {
+        Err(error)
+    } else {
+        stage.preserve.set(true);
+        Err(format!("{error}; retirement rollback incomplete: {}; recovery under {}", recovery.join("; "), stage.display.display()))
     }
 }
 
@@ -163,12 +495,14 @@ fn publish_staging(
     project: &GitDirectory,
     stage: Option<Stage>,
     mut new_packages: Vec<PendingInstall>,
+    commit: impl FnOnce(Option<&Stage>) -> Result<(), String>,
 ) -> Result<(), String> {
-    // Validate every package before any publish. A clean project gets the
-    // complete dependency tree and its receipts from a single rename.
-    let Some(staging) = stage else {
-        return Ok(());
-    };
+    if new_packages.is_empty() {
+        return commit(stage.as_ref());
+    }
+    // Validate the whole graph before any publish. A clean project gets
+    // checkouts and their receipts with one directory rename.
+    let staging = stage.expect("all installs have staging");
     let stage_handle = &staging.handle;
     let stage_deps = stage_handle.directory(Path::new(DEPS))?
         .ok_or_else(|| "staged deps disappeared".to_owned())?;
@@ -177,11 +511,26 @@ fn publish_staging(
         verify_staged(&stage_deps, &new_packages)?;
         stage_handle.rename(dep_name, project, dep_name)
             .map_err(|error| format!("cannot publish {DEPS}: {error}"))?;
+        if let Err(cause) = commit(Some(&staging)) {
+            let unchanged = new_packages.iter().all(|entry| {
+                tree_identity(&entry.expected_checkout)
+                    .is_ok_and(|identity| identity.working == entry.expected_working)
+            });
+            if unchanged {
+                if let Err(error) = project.rename(dep_name, stage_handle, dep_name) {
+                    staging.preserve.set(true);
+                    return Err(format!("{cause}; cannot restore absent {DEPS}: {error}"));
+                }
+                return Err(cause);
+            }
+            staging.preserve.set(true);
+            return Err(format!("{cause}; changed published checkouts were left in place"));
+        }
         return Ok(());
     };
     publish_updates(
         project, dep_name, &deps, stage_handle, &stage_deps, &staging,
-        &mut new_packages, GitDirectory::rename,
+        &mut new_packages, GitDirectory::rename, || commit(Some(&staging)),
     )
 }
 
@@ -190,7 +539,7 @@ fn verify_staged(deps: &GitDirectory, pending: &[PendingInstall]) -> Result<(), 
         .ok_or_else(|| "staged provenance directory disappeared".to_owned())?;
     for install in pending {
         let name = Path::new(&install.name);
-        if deps.directory(name)?.as_ref() != Some(&install.expected_checkout)
+        if (!install.receipt_only && deps.directory(name)?.as_ref() != Some(&install.expected_checkout))
             || receipts.read_text(name)?.as_deref() != Some(install.expected_receipt.as_str())
         {
             return Err(format!("staged dependency {} changed during publication", install.name));
@@ -199,11 +548,25 @@ fn verify_staged(deps: &GitDirectory, pending: &[PendingInstall]) -> Result<(), 
     Ok(())
 }
 
+pub(super) struct PreviousCheckout {
+    pub(super) checkout: GitDirectory,
+    pub(super) baseline: WorkingTreeId,
+}
+
+pub(super) fn dirty_checkout(git: &GitProject, name: &str) -> String {
+    format!(
+        "dependency {name} installed tree differs (unsnapshotted edits); did not overwrite {}",
+        git.root.join(DEPS).join(name).display()
+    )
+}
+
 struct PendingInstall {
     name: String,
     expected_checkout: GitDirectory,
     expected_receipt: String,
-    expected_source_hash: String,
+    expected_working: WorkingTreeId,
+    previous_checkout: Option<PreviousCheckout>,
+    receipt_only: bool,
     destination: PathBuf,
     previous_receipt: bool,
     receipt_published: bool,
@@ -224,25 +587,39 @@ fn publish_updates(
     staging: &Stage,
     pending: &mut [PendingInstall],
     mut rename: impl FnMut(&GitDirectory, &Path, &GitDirectory, &Path) -> std::io::Result<()>,
+    commit: impl FnOnce() -> Result<(), String>,
 ) -> Result<(), String> {
     verify_staged(stage_deps, pending)?;
     let pins_name = Path::new(PINS);
-    if deps.directory(pins_name)?.is_none() {
-        deps.mkdir(pins_name)
-            .map_err(|error| format!("cannot create installed provenance directory: {error}"))?;
-    }
-    let receipts = deps.directory(pins_name)?
-        .ok_or_else(|| "installed provenance directory disappeared".to_owned())?;
+    let live_receipts = deps.directory(pins_name)?;
     let staged_receipts = stage_deps.directory(pins_name)?
         .ok_or_else(|| "staged provenance directory disappeared".to_owned())?;
     let preexisting_receipts = pending.iter().map(|install| {
-        validate_receipt_destination(&receipts, Path::new(&install.name))
+        live_receipts.as_ref().map_or(Ok(false), |receipts| {
+            validate_receipt_destination(receipts, Path::new(&install.name))
+        })
     }).collect::<Result<Vec<_>, _>>()?;
     let previous_name = Path::new("previous-receipts");
     stage.mkdir(previous_name)
         .map_err(|error| format!("cannot stage previous dependency provenance: {error}"))?;
     let previous = stage.directory(previous_name)?
         .ok_or_else(|| "previous provenance staging directory disappeared".to_owned())?;
+    let made_receipts = live_receipts.is_none();
+    let receipts = match live_receipts {
+        Some(receipts) => receipts,
+        None => {
+            deps.mkdir(pins_name)
+                .map_err(|error| format!("cannot create installed provenance directory: {error}"))?;
+            match deps.directory(pins_name) {
+                Ok(Some(directory)) => directory,
+                Ok(None) => return Err("created provenance directory disappeared".to_owned()),
+                Err(error) => {
+                    let _ = deps.remove_empty_directory(pins_name);
+                    return Err(error);
+                }
+            }
+        }
+    };
 
     let publish = (|| {
         // Checkouts become visible only once their exact receipts are ready.
@@ -261,18 +638,36 @@ fn publish_updates(
         }
         for install in pending.iter_mut() {
             let name = Path::new(&install.name);
-            rename(stage_deps, name, deps, name).map_err(|error| {
-                format!("cannot publish {}: {error}", install.destination.display())
-            })?;
-            install.checkout_published = true;
-
+            if install.receipt_only {
+                if deps.directory(name)?.as_ref() != Some(&install.expected_checkout) {
+                    return Err(format!("{} changed during publication", install.destination.display()));
+                }
+                continue;
+            }
+            if let Some(previous) = &install.previous_checkout {
+                if deps.directory(name)?.as_ref() != Some(&previous.checkout) {
+                    return Err(format!("{} changed during publication", install.destination.display()));
+                }
+                stage_deps.exchange(name, deps, name)
+                    .map_err(|error| format!("cannot replace {}: {error}", install.destination.display()))?;
+                install.checkout_published = true;
+                // The old inode remains reachable in staging. Checking it
+                // after displacement protects edits during preparation.
+                if tree_identity(&previous.checkout)?.working != previous.baseline {
+                    return Err(format!("{} was edited before publication", install.destination.display()));
+                }
+            } else {
+                rename(stage_deps, name, deps, name)
+                    .map_err(|error| format!("cannot publish {}: {error}", install.destination.display()))?;
+                install.checkout_published = true;
+            }
         }
         if project.directory(dep_name)?.as_ref() != Some(deps)
             || deps.directory(pins_name)?.as_ref() != Some(&receipts)
         {
             return Err("installed dependency or provenance directory changed during publication".to_owned());
         }
-        Ok(())
+        commit()
     })();
     let Err(cause) = publish else { return Ok(()); };
 
@@ -284,13 +679,18 @@ fn publish_updates(
             // path that was subsequently replaced or edited by an external process.
             let unchanged = deps.directory(name).ok().flatten().is_some_and(|checkout| {
                 checkout == install.expected_checkout
-                    && source_hash(&checkout).is_ok_and(|hash| hash == install.expected_source_hash)
+                    && tree_identity(&checkout).is_ok_and(|identity| identity.working == install.expected_working)
             });
             if !unchanged {
                 rollback_errors.push(format!("{} changed before rollback and was left in place", install.destination.display()));
                 continue;
             }
-            if let Err(error) = rename(deps, name, stage_deps, name) {
+            let restore = if install.previous_checkout.is_some() {
+                deps.exchange(name, stage_deps, name)
+            } else {
+                rename(deps, name, stage_deps, name)
+            };
+            if let Err(error) = restore {
                 rollback_errors.push(format!("could not move {} back to staging: {error}", install.destination.display()));
                 // Its matching receipt should remain usable.
                 continue;
@@ -308,6 +708,14 @@ fn publish_updates(
             }
         }
     }
+    if made_receipts && deps.directory(pins_name).ok().flatten().as_ref() == Some(&receipts) {
+        // Never remove a pre-existing directory or concurrently added contents.
+        if let Err(error) = deps.remove_empty_directory(pins_name) {
+            if error.kind() != ErrorKind::NotFound {
+                rollback_errors.push(format!("could not remove newly created provenance directory: {error}"));
+            }
+        }
+    }
     if rollback_errors.is_empty() {
         Err(cause)
     } else {
@@ -316,15 +724,93 @@ fn publish_updates(
     }
 }
 
-pub(super) fn reject_unsupported_patches(project: &GitDirectory, name: &str) -> Result<(), String> {
-    let path = Path::new("patches").join(name);
-    if let Some(patches) = project.directory(&path)? {
-        let files = patches.entries().map_err(|error| format!("cannot read {}: {error}", path.display()))?;
-        if !files.is_empty() {
-            return Err(format!("dependency {name} has patches; this version of dep sync does not apply patches"));
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub(super) struct FrozenRoutes(BTreeMap<String, DependencySource>);
+
+impl FrozenRoutes {
+    pub(super) fn capture(declarations: &graph::Declarations) -> Self {
+        Self(declarations.iter().map(|(name, declaration)| (name.clone(), declaration.source.clone())).collect())
+    }
+
+    pub(super) fn declarations(&self, root: &Path, package: &str) -> graph::Declarations {
+        self.0.iter().map(|(name, source)| {
+            let declaration = DependencyDeclaration {
+                name: name.clone(),
+                source: source.clone(),
+                span: dependency_diagnostic(root, package, "P0002", "", 0..0).span,
+            };
+            (name.clone(), declaration)
+        }).collect()
+    }
+
+    fn hash(&self, digest: &mut blake3::Hasher) {
+        fn field(digest: &mut blake3::Hasher, bytes: &[u8]) {
+            digest.update(&(bytes.len() as u64).to_le_bytes());
+            digest.update(bytes);
+        }
+        digest.update(&(self.0.len() as u64).to_le_bytes());
+        for (name, source) in &self.0 {
+            field(digest, name.as_bytes());
+            match source {
+                DependencySource::Local { path } => {
+                    digest.update(b"L");
+                    field(digest, path.as_os_str().as_encoded_bytes());
+                }
+                DependencySource::Git(source) => {
+                    digest.update(b"G");
+                    field(digest, source.origin.as_bytes());
+                    field(digest, source.package_path.as_bytes());
+                }
+            }
         }
     }
-    Ok(())
+}
+
+#[derive(Clone)]
+pub(super) struct Installation {
+    pub(super) checkout: GitDirectory,
+    pub(super) stack: PatchStackId,
+    pub(super) baseline: Option<WorkingTreeId>,
+    pub(super) routes: Option<FrozenRoutes>,
+}
+
+impl Installation {
+    pub(super) fn require_stack(&self, name: &str, stack: PatchStackId) -> Result<(), String> {
+        if self.stack != stack {
+            Err(format!("dependency {name} has unapplied patch changes; run wosy dep sync"))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct OverlayReceipt {
+    version: u8,
+    stack: PatchStackId,
+    baseline: WorkingTreeId,
+    routes: FrozenRoutes,
+    seal: String,
+}
+
+pub(super) fn overlay_receipt(
+    project: &GitDirectory,
+    checkout: &GitDirectory,
+    name: &str,
+    pin: &LockedPackage,
+    stack: PatchStackId,
+    baseline: WorkingTreeId,
+    routes: &FrozenRoutes,
+) -> Result<String, String> {
+    let evidence = InstallEvidence::new(project, checkout, name, pin);
+    let record = OverlayReceipt {
+        version: 1,
+        stack,
+        baseline,
+        routes: routes.clone(),
+        seal: evidence.seal(Some((stack, baseline, routes))),
+    };
+    serde_json::to_string(&record).map_err(|error| error.to_string())
 }
 
 pub(super) fn verify_installed(
@@ -332,18 +818,33 @@ pub(super) fn verify_installed(
     project: &GitDirectory,
     name: &str,
     pin: &LockedPackage,
-) -> Result<Option<GitDirectory>, String> {
+) -> Result<Option<Installation>, String> {
     let Some(deps) = project.directory(Path::new(DEPS))? else { return Ok(None); };
     let Some(checkout) = deps.directory(Path::new(name))? else { return Ok(None); };
-    let expected = InstallEvidence::new(project, &checkout, name, pin).receipt();
+    let evidence = InstallEvidence::new(project, &checkout, name, pin);
     let receipt = deps.read_text(&Path::new(PINS).join(name))?;
-    if receipt.as_deref() != Some(expected.as_str()) {
-        return Err(format!(
-            "dependency {name} is not verified for its wosy.lock pin; move {} aside and run wosy dep sync",
-            root.join(DEPS).join(name).display()
-        ));
+    if let Some(receipt) = receipt {
+        if let Ok(record) = serde_json::from_str::<OverlayReceipt>(&receipt) {
+            if record.version == 1
+                && record.seal == evidence.seal(Some((record.stack, record.baseline, &record.routes)))
+            {
+                return Ok(Some(Installation {
+                    checkout,
+                    stack: record.stack,
+                    baseline: Some(record.baseline),
+                    routes: Some(record.routes),
+                }));
+            }
+        } else if receipt == evidence.receipt() {
+            // Phase 5 proved original bytes but did not record a mode-aware
+            // baseline. Preserve the empty stack until a real base is needed.
+            return Ok(Some(Installation { checkout, stack: PatchStack::empty().identity(), baseline: None, routes: None }));
+        }
     }
-    Ok(Some(checkout))
+    Err(format!(
+        "dependency {name} is not verified for its wosy.lock pin; move {} aside and run wosy dep sync",
+        root.join(DEPS).join(name).display()
+    ))
 }
 
 /// Physical installation evidence is distinct from the portable locked input.
@@ -366,13 +867,23 @@ impl<'a> InstallEvidence<'a> {
     }
 
     fn receipt(&self) -> String {
+        format!("{}\n", self.seal(None))
+    }
+
+    fn seal(&self, overlay: Option<(PatchStackId, WorkingTreeId, &FrozenRoutes)>) -> String {
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"wosy-package-install-v1\0");
         for field in [self.name.as_bytes(), self.input.as_bytes(), self.project, self.checkout] {
             hasher.update(&(field.len() as u64).to_le_bytes());
             hasher.update(field);
         }
-        format!("{}\n", hasher.finalize().to_hex())
+        if let Some((stack, baseline, routes)) = overlay {
+            hasher.update(b"wosy-installed-overlay-v1\0");
+            hasher.update(stack.as_bytes());
+            hasher.update(&baseline.0);
+            routes.hash(&mut hasher);
+        }
+        hasher.finalize().to_hex().to_string()
     }
 }
 
@@ -392,6 +903,38 @@ impl Stage {
         fs::create_dir_all(repository.parent().expect("stage repository parent"))
             .map_err(|error| format!("cannot create Git staging directory: {error}"))?;
         Ok((checkout, repository))
+    }
+
+    fn fetched(
+        &self,
+        git: &GitProject,
+        slot: &str,
+        repository: PathBuf,
+        checkout: &Path,
+        source: &GitSource,
+        revision: &GitOid,
+    ) -> Result<PristinePackage, String> {
+        let selected_oid = if source.package_path == "." {
+            let selector = format!("{}^{{tree}}", revision.as_str());
+            read_oid(&git.directory, &self.handle, &repository, &selector)?
+        } else {
+            let path = Path::new(&source.package_path);
+            let selected = checked_output(
+                git_command(&git.directory, &self.handle, Some(&repository))?
+                    .args(["--literal-pathspecs", "ls-tree", "-z", "--full-tree", revision.as_str(), "--"])
+                    .arg(path),
+                "ls-tree",
+            )?;
+            git_wire::selected_tree(&selected.stdout, path)?
+        };
+        let object_type = checked_output(
+            git_command(&git.directory, &self.handle, Some(&repository))?
+                .args(["cat-file", "-t", selected_oid.as_str()]),
+            "cat-file",
+        )?;
+        let tree = GitTreeOid::from_cat_file_type(selected_oid, &object_type.stdout)?;
+        let identity = materialize_tree(&git.directory, &self.handle, &repository, checkout, &tree)?;
+        Ok(PristinePackage { checkout: self.checkout(slot)?, identity, tree, repository })
     }
 
     fn checkout(&self, slot: &str) -> Result<GitDirectory, String> {
@@ -459,7 +1002,7 @@ fn get_stage<'a>(
     Ok(stage.as_ref().expect("staging directory exists"))
 }
 
-fn git_command(project: &GitDirectory, stage: &GitDirectory, repository: Option<&Path>) -> Result<Command, String> {
+pub(super) fn git_command(project: &GitDirectory, stage: &GitDirectory, repository: Option<&Path>) -> Result<Command, String> {
     let mut command = Command::new("git");
     let cwd = project.descriptor_path()
         .map_err(|error| format!("cannot access Git project descriptor: {error}"))?;
@@ -498,7 +1041,7 @@ fn checked_output(command: &mut Command, stage: &str) -> Result<Output, String> 
     Ok(output)
 }
 
-fn read_commit(project: &GitDirectory, stage: &GitDirectory, repository: &Path, reference: &str) -> Result<GitOid, String> {
+fn read_oid(project: &GitDirectory, stage: &GitDirectory, repository: &Path, reference: &str) -> Result<GitOid, String> {
     let output = checked_output(
         git_command(project, stage, Some(repository))?.args(["rev-parse", "--verify", reference]),
         "rev-parse",
@@ -527,55 +1070,80 @@ fn fetch_exact(
             .arg(revision.as_str()),
         "fetch",
     )?;
-    if read_commit(project, stage, repository, "FETCH_HEAD^{commit}")? != *revision {
+    if read_oid(project, stage, repository, "FETCH_HEAD^{commit}")? != *revision {
         return Err(format!("fetch did not provide the pinned commit {}", revision.as_str()));
     }
     Ok(())
 }
 
-fn materialize_tree(
+pub(super) fn materialize_tree(
     project: &GitDirectory,
     stage: &GitDirectory,
     repository: &Path,
     checkout: &Path,
-    source: &GitSource,
-    revision: &GitOid,
-) -> Result<(), String> {
+    tree: &GitTreeOid,
+) -> Result<TreeIdentity, String> {
     let mut command = git_command(project, stage, Some(repository))?;
-    command.args(["--literal-pathspecs", "ls-tree", "-r", "-z", "--full-tree"])
-        .arg(revision.as_str()).arg("--");
-    let subdirectory = (source.package_path != ".").then(|| Path::new(&source.package_path));
-    if let Some(path) = subdirectory {
-        command.arg(path);
-    }
+    command.args(["ls-tree", "-r", "-z", "--full-tree"]).arg(tree.as_str()).arg("--");
     let indexed = checked_output(&mut command, "ls-tree")?;
     fs::create_dir_all(checkout)
         .map_err(|error| format!("cannot create package staging directory: {error}"))?;
-    // Exact Git blobs bypass checkout filters and archive export exclusions.
+    let mut digests = BTreeMap::new();
+    // Exact blobs are written and hashed together. No checkout filters, archive
+    // exclusions, or later immutable-tree capture participate.
     for entry in git_wire::blobs(&indexed.stdout)? {
         let entry = entry?;
         let path = entry.path.as_path();
-        let path = match subdirectory {
-            Some(prefix) => path.strip_prefix(prefix)
-                .ok().filter(|path| !path.as_os_str().is_empty())
-                .ok_or_else(|| format!("{} is not a package directory", prefix.display()))?,
-            None => path,
-        };
         let destination = checkout.join(path);
         fs::create_dir_all(destination.parent().expect("checkout file parent"))
             .map_err(|error| format!("cannot create parent for {}: {error}", path.display()))?;
-        let file = OpenOptions::new().write(true).create_new(true).open(&destination)
+        let mut file = OpenOptions::new().write(true).create_new(true).open(&destination)
             .map_err(|error| format!("cannot create {}: {error}", path.display()))?;
-        checked_output(
-            git_command(project, stage, Some(repository))?
-                .args(["cat-file", "blob", entry.oid.as_str()])
-                .stdout(Stdio::from(file)),
-            "cat-file",
-        )?;
+        let mut command = git_command(project, stage, Some(repository))?;
+        command.args(["cat-file", "blob", entry.oid.as_str()]);
+        let contents = stream_blob(command, &mut file)
+            .map_err(|error| format!("cannot extract {}: {error}", path.display()))?;
         restore_mode(&destination, entry.executable)
             .map_err(|error| format!("cannot set permissions for {}: {error}", path.display()))?;
+        let path = path.to_str().expect("Git adapter requires UTF-8 paths");
+        digests.insert(path.to_owned(), (contents, entry.executable));
     }
-    Ok(())
+    Ok(identity_from_files(&digests))
+}
+
+fn copy_hashed(mut source: impl Read, mut output: impl Write) -> std::io::Result<blake3::Hash> {
+    let mut hasher = blake3::Hasher::new();
+    let mut chunk = [0; 32 * 1024];
+    loop {
+        let n = source.read(&mut chunk)?;
+        if n == 0 {
+            return Ok(hasher.finalize());
+        }
+        output.write_all(&chunk[..n])?;
+        hasher.update(&chunk[..n]);
+    }
+}
+
+fn stream_blob(mut command: Command, file: &mut File) -> Result<blake3::Hash, String> {
+    let mut child = command.stdout(Stdio::piped()).stderr(Stdio::piped())
+        .spawn().map_err(|error| error.to_string())?;
+    let mut stdout = child.stdout.take().expect("piped blob");
+    let mut stderr = child.stderr.take().expect("piped Git diagnostics");
+    std::thread::scope(|scope| {
+        let diagnostics = scope.spawn(move || {
+            let mut bytes = Vec::new();
+            stderr.read_to_end(&mut bytes).map(|_| bytes)
+        });
+        let received = copy_hashed(&mut stdout, file);
+        drop(stdout);
+        let status = child.wait().map_err(|error| error.to_string())?;
+        let diagnostics = diagnostics.join().map_err(|_| "Git diagnostic reader failed".to_owned())?
+            .map_err(|error| error.to_string())?;
+        if !status.success() {
+            return Err(format!("git cat-file failed: {}", String::from_utf8_lossy(&diagnostics)));
+        }
+        received.map_err(|error| error.to_string())
+    })
 }
 
 #[cfg(unix)]
@@ -595,28 +1163,35 @@ fn restore_mode(_path: &Path, _executable: bool) -> std::io::Result<()> {
     Ok(())
 }
 
-pub(super) fn source_hash(root: &GitDirectory) -> Result<String, String> {
+fn collect_tree_files(
+    root: &GitDirectory,
+    mut visit: impl FnMut(&str, File, bool) -> Result<(), String>,
+) -> Result<(), String> {
     fn collect(
         root: &GitDirectory,
         directory: &GitDirectory,
         relative: &Path,
-        files: &mut BTreeMap<String, blake3::Hash>,
+        visit: &mut impl FnMut(&str, File, bool) -> Result<(), String>,
     ) -> Result<(), String> {
         let read_error = |error| format!("cannot read Git dependency path {}: {error}", relative.display());
         for name in directory.entries().map_err(read_error)? {
             let path = relative.join(name);
             let file = root.open(&path)?
-                .ok_or_else(|| format!("Git dependency path {} changed while hashing", path.display()))?;
+                .ok_or_else(|| format!("Git dependency path {} changed while reading", path.display()))?;
             let metadata = file.metadata().map_err(read_error)?;
             if metadata.is_dir() {
-                // The handle whose type was checked also determines which directory is listed.
                 let child = GitDirectory::new(file)?;
-                collect(root, &child, &path, files)?;
+                collect(root, &child, &path, visit)?;
             } else if metadata.is_file() {
-                let mut content = blake3::Hasher::new();
-                content.update_reader(file).map_err(read_error)?;
+                #[cfg(unix)]
+                let executable = {
+                    use std::os::unix::fs::PermissionsExt;
+                    metadata.permissions().mode() & 0o100 != 0
+                };
+                #[cfg(not(unix))]
+                let executable = false;
                 let path = path.to_str().ok_or_else(|| "non-UTF-8 Git dependency path".to_owned())?;
-                files.insert(path.to_owned(), content.finalize());
+                visit(path, file, executable)?;
             } else {
                 return Err(format!("{} is not a regular dependency file", path.display()));
             }
@@ -624,16 +1199,46 @@ pub(super) fn source_hash(root: &GitDirectory) -> Result<String, String> {
         Ok(())
     }
 
+    collect(root, root, Path::new(""), &mut visit)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(super) struct WorkingTreeId(pub(super) [u8; 32]);
+
+pub(super) struct TreeIdentity {
+    pub(super) original_v1: String,
+    pub(super) working: WorkingTreeId,
+}
+
+pub(super) fn tree_identity(root: &GitDirectory) -> Result<TreeIdentity, String> {
     let mut files = BTreeMap::new();
-    collect(root, root, Path::new(""), &mut files)?;
-    let mut tree = blake3::Hasher::new();
-    tree.update(b"wosy-package-source-v1\0");
-    for (path, content) in files {
-        tree.update(&(path.len() as u64).to_le_bytes());
-        tree.update(path.as_bytes());
-        tree.update(content.as_bytes());
+    collect_tree_files(root, |path, file, executable| {
+        let mut content = blake3::Hasher::new();
+        content.update_reader(file)
+            .map_err(|error| format!("cannot read Git dependency path {path}: {error}"))?;
+        files.insert(path.to_owned(), (content.finalize(), executable));
+        Ok(())
+    })?;
+    Ok(identity_from_files(&files))
+}
+
+fn identity_from_files(files: &BTreeMap<String, (blake3::Hash, bool)>) -> TreeIdentity {
+    let mut original = blake3::Hasher::new();
+    original.update(b"wosy-package-source-v1\0");
+    let mut working = blake3::Hasher::new();
+    working.update(b"wosy-working-package-v1\0");
+    for (path, (content, executable)) in files {
+        for digest in [&mut original, &mut working] {
+            digest.update(&(path.len() as u64).to_le_bytes());
+            digest.update(path.as_bytes());
+            digest.update(content.as_bytes());
+        }
+        working.update(&[u8::from(*executable)]);
     }
-    Ok(tree.finalize().to_hex().to_string())
+    TreeIdentity {
+        original_v1: original.finalize().to_hex().to_string(),
+        working: WorkingTreeId(*working.finalize().as_bytes()),
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -673,16 +1278,92 @@ mod tests {
     }
 
     #[test]
+    fn failed_lock_exchange_restores_replaced_and_retired_checkouts_and_receipts() {
+        let mut outer = None;
+        let (temp_path, temp) = GitDirectory::project(&std::env::temp_dir()).unwrap();
+        let root = get_stage(&mut outer, &temp_path, &temp).unwrap();
+        let live_deps_path = root.path.join(DEPS);
+        fs::create_dir_all(live_deps_path.join(PINS)).unwrap();
+        fs::create_dir(live_deps_path.join("sample")).unwrap();
+        fs::create_dir(live_deps_path.join("obsolete")).unwrap();
+        fs::write(live_deps_path.join("sample/source.w"), b"previous live source").unwrap();
+        fs::write(live_deps_path.join(PINS).join("sample"), b"previous receipt").unwrap();
+        fs::write(live_deps_path.join("obsolete/source.w"), b"obsolete clean source").unwrap();
+        fs::write(live_deps_path.join(PINS).join("obsolete"), b"obsolete receipt").unwrap();
+        fs::write(root.path.join("wosy.lock"), b"previous lock").unwrap();
+        let live_deps = root.handle.directory(Path::new(DEPS)).unwrap().unwrap();
+        let live_sample = live_deps.directory(Path::new("sample")).unwrap().unwrap();
+        let old_tree = tree_identity(&live_sample).unwrap().working;
+        let obsolete = live_deps.directory(Path::new("obsolete")).unwrap().unwrap();
+        let old_obsolete = tree_identity(&obsolete).unwrap().working;
+        let git = GitProject { root: root.display.clone(), directory: root.handle.clone() };
+        let mut retirements = [Retirement {
+            name: "obsolete".to_owned(),
+            previous: Some(PreviousCheckout { checkout: obsolete, baseline: old_obsolete }),
+            moved_checkout: false,
+            moved_receipt: false,
+        }];
+
+        let mut candidate = None;
+        let stage = get_stage(&mut candidate, &root.display, &root.handle).unwrap();
+        let prepared_path = stage.path.join(DEPS);
+        fs::create_dir_all(prepared_path.join(PINS)).unwrap();
+        fs::create_dir(prepared_path.join("sample")).unwrap();
+        fs::write(prepared_path.join("sample/source.w"), b"prepared successor").unwrap();
+        fs::write(prepared_path.join(PINS).join("sample"), b"prepared receipt").unwrap();
+        let prepared = stage.handle.directory(Path::new(DEPS)).unwrap().unwrap();
+        let sample = prepared.directory(Path::new("sample")).unwrap().unwrap();
+        let working = tree_identity(&sample).unwrap().working;
+        let mut installs = [PendingInstall {
+            name: "sample".to_owned(),
+            expected_checkout: sample,
+            expected_receipt: "prepared receipt".to_owned(),
+            expected_working: working,
+            previous_checkout: Some(PreviousCheckout { checkout: live_sample, baseline: old_tree }),
+            receipt_only: false,
+            destination: live_deps_path.join("sample"),
+            previous_receipt: false,
+            receipt_published: false,
+            checkout_published: false,
+        }];
+        let result = publish_updates(
+            &root.handle, Path::new(DEPS), &live_deps, &stage.handle, &prepared, stage,
+            &mut installs, GitDirectory::rename, || {
+                publish_retirements(&git, stage, &mut retirements, || {
+                    assert_eq!(fs::read(live_deps_path.join("sample/source.w")).unwrap(), b"prepared successor");
+                    assert!(!live_deps_path.join("obsolete").exists());
+                    assert!(!live_deps_path.join(PINS).join("obsolete").exists());
+                    stage.handle.exchange(Path::new("missing-lock"), &root.handle, Path::new("wosy.lock"))
+                        .map_err(|error| error.to_string())
+                })
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(fs::read(live_deps_path.join("sample/source.w")).unwrap(), b"previous live source");
+        assert_eq!(fs::read(live_deps_path.join(PINS).join("sample")).unwrap(), b"previous receipt");
+        assert_eq!(fs::read(live_deps_path.join("obsolete/source.w")).unwrap(), b"obsolete clean source");
+        assert_eq!(fs::read(live_deps_path.join(PINS).join("obsolete")).unwrap(), b"obsolete receipt");
+        assert_eq!(fs::read(root.path.join("wosy.lock")).unwrap(), b"previous lock");
+    }
+
+    #[test]
     fn publication_restores_checkout_and_old_receipts_when_later_rename_fails() {
+        test_checkout_rename_rollback(true);
+        test_checkout_rename_rollback(false);
+    }
+
+    fn test_checkout_rename_rollback(had_receipts: bool) {
         let mut stage = None;
         let (root, project) = GitDirectory::project(&std::env::temp_dir()).unwrap();
         let staging = get_stage(&mut stage, &root, &project).unwrap();
         let deps_path = staging.path.join("existing");
         let receipts_path = deps_path.join(PINS);
-        fs::create_dir_all(&receipts_path).unwrap();
-        fs::write(receipts_path.join("first"), "previous receipt").unwrap();
         let existing = deps_path.join("unchanged");
-        fs::create_dir(&existing).unwrap();
+        fs::create_dir_all(&existing).unwrap();
+        if had_receipts {
+            fs::create_dir(&receipts_path).unwrap();
+            fs::write(receipts_path.join("first"), "previous receipt").unwrap();
+        }
         fs::write(existing.join("edit"), "keep user edit").unwrap();
         let staged_path = staging.path.join(DEPS);
         fs::create_dir_all(staged_path.join(PINS)).unwrap();
@@ -699,16 +1380,18 @@ mod tests {
                 name: name.to_owned(),
                 expected_checkout: stage_deps.directory(Path::new(name)).unwrap().unwrap(),
                 expected_receipt: "new receipt".to_owned(),
-                expected_source_hash: String::new(),
+                expected_working: WorkingTreeId([0; 32]),
+                previous_checkout: None,
+                receipt_only: false,
                 destination: deps_path.join(name),
                 previous_receipt: false,
                 receipt_published: false,
                 checkout_published: false,
             }
         });
-        let expected_hash = source_hash(&installs[0].expected_checkout).unwrap();
+        let expected = tree_identity(&installs[0].expected_checkout).unwrap().working;
         for install in &mut installs {
-            install.expected_source_hash.clone_from(&expected_hash);
+            install.expected_working = expected;
         }
         let error = publish_updates(
             &stage, Path::new("existing"), &deps, &stage, &stage_deps, staging,
@@ -718,13 +1401,17 @@ mod tests {
             } else {
                 from.rename(name, into, dest)
             }
-        }).unwrap_err();
+        }, || Ok(())).unwrap_err();
 
         assert!(error.contains("simulated checkout rename failure"));
         assert!(!error.contains("rollback incomplete"));
         assert!(!deps_path.join("first").exists());
         assert!(!deps_path.join("second").exists());
-        assert_eq!(fs::read_to_string(receipts_path.join("first")).unwrap(), "previous receipt");
+        if had_receipts {
+            assert_eq!(fs::read_to_string(receipts_path.join("first")).unwrap(), "previous receipt");
+        } else {
+            assert!(!receipts_path.exists());
+        }
         assert!(!receipts_path.join("second").exists());
         assert_eq!(fs::read_to_string(existing.join("edit")).unwrap(), "keep user edit");
     }

@@ -1,7 +1,7 @@
 use super::{
-    git_sync::{source_hash, Staging},
+    git_sync::Staging,
     graph, load_git, load_local, normalize_package_path, valid_origin, valid_package_name,
-    GitDirectory, GitProject, LockedPackage, PackageLock, ProjectSnapshot, LOCKFILE,
+    patches::{PatchStack, PatchStackId}, GitDirectory, GitProject, LockedPackage, PackageLock, ProjectSnapshot, LOCKFILE,
 };
 use crate::{project_dependencies, scalar_string, DependencyDeclaration, DependencySource, GitSource};
 use std::collections::BTreeMap;
@@ -31,9 +31,6 @@ pub fn add_dependency(root: &Path, source: &str, package_path: Option<&str>) -> 
     snapshot.check_reached(&closure.git_packages)?;
 
     let (name, source) = preview.select(source, package_path)?;
-    if !valid_package_name(&name) {
-        return Err(format!("dependency name {name:?} must be a snake_case Wosy package name"));
-    }
     if name == root_name || old_declarations.contains_key(&name) {
         return Err(format!("project already declares package {name}"));
     }
@@ -84,7 +81,7 @@ struct Preview<'a> {
     git: Option<GitProject>,
     pins: PackageLock,
     staging: Staging,
-    checkouts: BTreeMap<String, GitDirectory>,
+    checkouts: BTreeMap<String, (GitDirectory, PatchStackId)>,
     inspected: Option<(String, InspectedSource, ImDocument<String>)>,
 }
 
@@ -143,7 +140,7 @@ impl Preview<'_> {
             let text = fs::read_to_string(&local_path)
                 .map_err(|error| format!("cannot read {}: {error}", local_path.display()))?;
             let manifest = ImDocument::parse(text).map_err(|error| error.to_string())?;
-            let name = manifest_name(&manifest)?;
+            let name = selected_package_name(&manifest)?;
             self.inspected = Some((name.clone(), InspectedSource::Local(self.snapshot.root().join(source)), manifest));
             return Ok((name, DependencySource::Local { path: PathBuf::from(source) }));
         }
@@ -160,17 +157,23 @@ impl Preview<'_> {
             return Ok((name.clone(), DependencySource::Git(source)));
         }
         let git = self.git.as_ref().expect("opened Git project");
-        let (checkout, revision) = self.staging.fetch_tip(git, ".selected", &source)?;
-        let text = checkout.read_text(Path::new(MANIFEST))?
+        let (pristine, revision) = self.staging.fetch_tip(git, ".selected", &source)?;
+        let text = pristine.checkout.read_text(Path::new(MANIFEST))?
             .ok_or_else(|| format!("selected Git package has no {MANIFEST}"))?;
         let manifest = ImDocument::parse(text).map_err(|error| error.to_string())?;
-        let name = manifest_name(&manifest)?;
-        self.inspected = Some((name.clone(), InspectedSource::Git(source.clone()), manifest));
+        let name = selected_package_name(&manifest)?;
         if self.pins.packages.contains_key(&name) {
             return Err(format!("conflicting package binding for {name}; existing pin was not changed"));
         }
-        let pin = LockedPackage { source: source.clone(), revision, source_hash: source_hash(&checkout)? };
-        self.checkouts.insert(name.clone(), checkout);
+        let pin = LockedPackage { source: source.clone(), revision, source_hash: pristine.identity.original_v1.clone() };
+        let stack = PatchStack::load(&git.directory, &name)?;
+        let effective = if stack.is_empty() {
+            self.inspected = Some((name.clone(), InspectedSource::Git(source.clone()), manifest));
+            pristine.checkout
+        } else {
+            self.staging.replay(git, ".selected", &pristine, &stack)?.0
+        };
+        self.checkouts.insert(name.clone(), (effective, stack.identity()));
         self.pins.packages.insert(name.clone(), pin);
         Ok((name, DependencySource::Git(source)))
     }
@@ -187,37 +190,30 @@ impl Preview<'_> {
         let git = self.git.as_ref().expect("opened Git project");
         let name = declaration.name.as_str();
         if !self.pins.packages.contains_key(name) && allow_new {
-            let (checkout, revision) = match &requirement.revision {
-                Some(revision) => (
-                    self.staging.fetch(git, name, source, revision)?,
-                    revision.clone(),
-                ),
-                None => self.staging.fetch_tip(git, name, source)?,
-            };
-            let pin = LockedPackage { source: source.clone(), revision, source_hash: source_hash(&checkout)? };
-            self.checkouts.insert(name.to_owned(), checkout);
+            let (pristine, revision) = self.staging.fetch_requirement(git, name, requirement, false)?;
+            let pin = LockedPackage { source: source.clone(), revision, source_hash: pristine.identity.original_v1.clone() };
+            let stack = PatchStack::load(&git.directory, name)?;
+            let effective = self.staging.replay(git, name, &pristine, &stack)?.0;
+            self.checkouts.insert(name.to_owned(), (effective, stack.identity()));
             self.pins.packages.insert(name.to_owned(), pin);
         }
         let pin = self.pins.pin_for_requirement(name, requirement)?;
         if !self.checkouts.contains_key(name) {
+            let stack = PatchStack::load(&git.directory, name)?;
+            let stack_id = stack.identity();
             let checkout = if let Some(existing) = git.installed(name, pin)? {
-                existing
+                existing.require_stack(name, stack_id)?;
+                existing.checkout
             } else {
-                let downloaded = self.staging.fetch(git, name, source, &pin.revision)?;
-                if source_hash(&downloaded)? != pin.source_hash {
-                    return Err(format!("dependency {name} source hash mismatch"));
-                }
-                downloaded
+                self.staging.overlay(git, name, pin, &stack)?.0
             };
-            self.checkouts.insert(name.to_owned(), checkout);
+            self.checkouts.insert(name.to_owned(), (checkout, stack_id));
         }
-        load_git(
-            self.snapshot.root(),
-            declaration,
-            self.checkouts[name].clone(),
-            pin,
-            inspected,
-        )
+        let (checkout, stack) = &self.checkouts[name];
+        let mut loaded = load_git(self.snapshot.root(), declaration, checkout.clone(), pin, inspected)?;
+        loaded.source.as_mut().expect("Git source binding").patch_stack_id = Some(*stack);
+        Ok(loaded)
+
     }
 }
 
@@ -225,6 +221,14 @@ fn manifest_name(document: &ImDocument<String>) -> Result<String, String> {
     let package = document.get("package").and_then(Item::as_table)
         .ok_or_else(|| "package is missing from wosy.toml".to_owned())?;
     scalar_string(package, "name")
+}
+
+fn selected_package_name(document: &ImDocument<String>) -> Result<String, String> {
+    let name = manifest_name(document)?;
+    if !valid_package_name(&name) {
+        return Err(format!("dependency name {name:?} must be a snake_case Wosy package name"));
+    }
+    Ok(name)
 }
 
 fn package_directory(path: &str) -> Result<String, String> {

@@ -27,8 +27,24 @@ Materializes the exact Git revisions already recorded in
 dependencies. It never selects a revision or rewrites the lockfile. Local
 dependencies stay where they are. Sync reads their declarations to find
 transitive Git pins but does not load or check local source files. A verified,
-unmodified dependency works offline; if an installed tree differs, sync fails
-without overwriting it.
+unmodified dependency works offline. Sync applies the project's patches in their
+recorded order; if there are unsnapshotted edits, it fails without overwriting
+them.
+
+## `wosy dep snapshot`
+
+Records unsnapshotted edits in reached Git dependencies as ordered project
+patches. It does not replace live source files or write the lock. A changed
+authored patch stack must be synced first. Snapshot may need to retrieve the
+exact locked Git revision to reconstruct the patch baseline.
+
+## `wosy dep update`
+
+Advances reached Git dependencies to same-origin fast-forward revisions and
+replays their project patches. It will not follow a rewritten or unrelated tip,
+overwrite unsnapshotted edits, or publish a lock for a patch conflict. An update
+can resolve graph changes authored in dependency manifests. It removes clean,
+verified checkouts no longer needed, without altering project-owned patches.
 
 ## `wosy parse [TARGET]`
 

@@ -10,12 +10,16 @@ mod anchored;
 mod git_sync;
 mod git_wire;
 mod graph;
+mod lifecycle;
+mod patches;
 mod snapshot;
 
 pub(crate) use snapshot::ProjectSnapshot;
 
 pub use add::add_dependency;
 pub use anchored::GitDirectory;
+pub use lifecycle::{snapshot_dependencies, update_dependencies};
+pub use patches::PatchStackId;
 pub use git_sync::sync_dependencies;
 
 const LOCKFILE: &str = "wosy.lock";
@@ -167,10 +171,10 @@ struct GitProject {
 }
 
 impl GitProject {
-    fn installed(&self, name: &str, pin: &LockedPackage) -> Result<Option<GitDirectory>, String> {
-        git_sync::reject_unsupported_patches(&self.directory, name)?;
+    fn installed(&self, name: &str, pin: &LockedPackage) -> Result<Option<git_sync::Installation>, String> {
         git_sync::verify_installed(&self.root, &self.directory, name, pin)
     }
+
 }
 
 pub(super) fn resolve_installed(
@@ -190,9 +194,14 @@ pub(super) fn resolve_installed(
                     git = Some(snapshot.git_project()?);
                 }
                 let git = git.as_ref().expect("opened Git project");
-                let checkout = git.installed(name, pin)?
+                let stack = patches::PatchStack::load(&git.directory, name)?.identity();
+                let installed = git.installed(name, pin)?
                     .ok_or_else(|| format!("dependency {name} is not materialized; run wosy dep sync"))?;
-                load_git(root, declaration, checkout, pin, None)
+                installed.require_stack(name, stack)?;
+                let mut loaded = load_git(root, declaration, installed.checkout, pin, None)?;
+                loaded.source.as_mut().expect("Git source binding").patch_stack_id = Some(stack);
+                Ok(loaded)
+
             }
         }
     })?;

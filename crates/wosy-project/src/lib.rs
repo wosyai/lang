@@ -125,6 +125,7 @@ pub struct ResolvedPackage {
     #[serde(skip)]
     pub git_checkout: Option<packages::GitDirectory>,
     pub git_pin_identity: Option<packages::LockedInputId>,
+    pub patch_stack_id: Option<packages::PatchStackId>,
     pub local_root_identity: Option<PathBuf>,
     pub dependencies: Vec<String>,
     pub project_root: PathBuf,
@@ -796,6 +797,7 @@ fn load_dependency_package(
         name: resolved_name.clone(),
         git_checkout,
         git_pin_identity: None,
+        patch_stack_id: None,
         local_root_identity: None,
         dependencies: Vec::new(),
         source_root: package_root.join(&source_root),
@@ -1562,6 +1564,7 @@ mod tests {
             ResolvedPackage {
                 git_checkout: None,
                 git_pin_identity: None,
+        patch_stack_id: None,
                 local_root_identity: None,
                 dependencies: Vec::new(),
                 name: "std".to_owned(),

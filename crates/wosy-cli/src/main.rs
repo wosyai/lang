@@ -72,6 +72,10 @@ enum DepCommand {
     },
     /// Materialize the exact dependencies in wosy.lock
     Sync,
+    /// Record live Git dependency edits as project patches
+    Snapshot,
+    /// Advance locked Git dependencies and replay their project patches
+    Update,
 }
 
 fn main() -> ExitCode {
@@ -83,6 +87,8 @@ fn main() -> ExitCode {
                     wosy_project::packages::add_dependency(root, &source, path.as_deref())
                 }),
                 DepCommand::Sync => dep_command(wosy_project::packages::sync_dependencies),
+                DepCommand::Snapshot => dep_command(wosy_project::packages::snapshot_dependencies),
+                DepCommand::Update => dep_command(wosy_project::packages::update_dependencies),
             };
             match result {
                 Ok(()) => ExitCode::SUCCESS,
@@ -292,7 +298,7 @@ fn project_configuration_identity(
         hasher.update(bytes);
     }
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"wosy-package-closure-v1\0");
+    hasher.update(b"wosy-package-closure-v2\0");
     hasher.update(blake3::hash(manifest).as_bytes());
     hasher.update(&(configuration.resolved_packages.len() as u64).to_le_bytes());
     for (name, package) in &configuration.resolved_packages {
@@ -306,6 +312,9 @@ fn project_configuration_identity(
         if let Some(pin) = &package.git_pin_identity {
             field(&mut hasher, b"git");
             field(&mut hasher, pin.as_bytes());
+            let patches = package.patch_stack_id
+                .ok_or_else(|| format!("Git dependency {name} has no verified patch stack"))?;
+            field(&mut hasher, patches.as_bytes());
         } else {
             field(&mut hasher, b"local");
             let local = package.local_root_identity.as_ref()

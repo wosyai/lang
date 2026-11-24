@@ -282,7 +282,7 @@ fn dep_sync_refuses_edited_trees_bad_hashes_and_disagreeing_pins() {
 }
 
 #[test]
-fn dep_sync_rejects_other_package_names_and_unsupported_patches() {
+fn dep_sync_rejects_other_package_names_and_invalid_patch_ids() {
     let fixture = Fixture::new();
     fixture.local();
     let (_, revision) = fixture.origin(".", "remote_lib");
@@ -297,7 +297,7 @@ fn dep_sync_rejects_other_package_names_and_unsupported_patches() {
     let patches = with_patches.join("patches/remote_lib");
     fs::create_dir_all(&patches).unwrap();
     fs::write(patches.join("pending.patch"), "not yet supported").unwrap();
-    expect_error(&wosy(&with_patches, &["dep", "sync"]), "does not apply patches");
+    expect_error(&wosy(&with_patches, &["dep", "sync"]), "invalid patch");
     assert_eq!(fs::read_to_string(with_patches.join("wosy.lock")).unwrap(), lock);
     assert!(!with_patches.join("deps").exists());
 }
@@ -674,6 +674,23 @@ fn repository_relative_dependency_never_uses_a_host_path_as_fallback() {
 }
 
 #[test]
+fn dep_add_does_not_materialize_a_file_selected_as_a_package_directory() {
+    let fixture = Fixture::new();
+    fixture.local();
+    fixture.origin("packages/remote_lib", "remote_lib");
+    let project = fixture.project("clean", "remote_lib", "packages/remote_lib");
+    without_git_declaration(&project);
+    let manifest = project.join("wosy.toml");
+    let original = fs::read(&manifest).unwrap();
+
+    let result = wosy(&project, &["dep", "add", "../upstream", "--path", "packages/remote_lib/src/nested/dependency.w"]);
+    assert!(!result.status.success());
+    assert_eq!(fs::read(&manifest).unwrap(), original);
+    assert!(!project.join("wosy.lock").exists());
+    assert!(!project.join("deps").exists());
+}
+
+#[test]
 fn a_sibling_pin_cannot_be_advanced_separately_even_if_already_reached() {
     let fixture = Fixture::new();
     fixture.local();
@@ -850,4 +867,289 @@ fn local_add_preserves_a_linked_manifest_and_its_target() {
     assert_eq!(fs::read_link(&manifest).unwrap(), actual);
     assert_eq!(fs::read_to_string(actual).unwrap(), original);
     assert!(!project.join("wosy.lock").exists());
+}
+
+fn phase6_project(fixture: &Fixture, name: &str) -> (PathBuf, PathBuf) {
+    fixture.local();
+    let (origin, _) = fixture.origin(".", "remote_lib");
+    let project = fixture.project(name, "remote_lib", ".");
+    without_git_declaration(&project);
+    (origin, project)
+}
+
+fn phase6_install(project: &Path) {
+    expect_success(&wosy(project, &["dep", "add", "../upstream", "--path", "."]));
+    expect_success(&wosy(project, &["dep", "sync"]));
+}
+
+fn patch_files(project: &Path) -> Vec<(std::ffi::OsString, Vec<u8>)> {
+    let mut files = fs::read_dir(project.join("patches/remote_lib")).unwrap()
+        .map(|entry| {
+            let entry = entry.unwrap();
+            (entry.file_name(), fs::read(entry.path()).unwrap())
+        })
+        .collect::<Vec<_>>();
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    files
+}
+
+fn set_executable(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let mut permissions = fs::metadata(path).unwrap().permissions();
+    permissions.set_mode(permissions.mode() | 0o100);
+    fs::set_permissions(path, permissions).unwrap();
+}
+
+fn executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    fs::metadata(path).unwrap().permissions().mode() & 0o100 != 0
+}
+
+#[test]
+fn snapshots_replay_ordered_binary_rename_and_mode_edits() {
+    let fixture = Fixture::new();
+    let (origin, project) = phase6_project(&fixture, "clean");
+    fs::write(origin.join("binary.dat"), b"\0\xff\x91original\0").unwrap();
+    fs::write(origin.join("old name.bin"), b"\0exact renamed bytes\xff").unwrap();
+    fs::write(origin.join("tool.txt"), b"persistent file mode\n").unwrap();
+    commit(&origin, "Track binary and mode fixture files");
+    phase6_install(&project);
+
+    let checkout = project.join("deps/remote_lib");
+    assert!(!executable(&checkout.join("tool.txt")));
+    let first = b"%%start\ni32 value = 41;\n%%end\n";
+    fs::write(checkout.join(GIT_SOURCE), first).unwrap();
+    fs::write(checkout.join("binary.dat"), b"\0\xff\x01revised bytes\0").unwrap();
+    fs::rename(checkout.join("old name.bin"), checkout.join("new name.bin")).unwrap();
+    set_executable(&checkout.join("tool.txt"));
+    expect_success(&wosy(&project, &["dep", "snapshot"]));
+    let one = patch_files(&project);
+    assert_eq!(one.len(), 1);
+
+    let second = b"%%start\ni32 value = 75;\n%%end\n";
+    fs::write(checkout.join(GIT_SOURCE), second).unwrap();
+    expect_success(&wosy(&project, &["dep", "snapshot"]));
+    let two = patch_files(&project);
+    assert_eq!(two.len(), 2);
+    assert_eq!(two[0], one[0]);
+    expect_success(&wosy(&project, &["dep", "snapshot"]));
+    assert_eq!(patch_files(&project), two);
+
+    let lock = fs::read(project.join("wosy.lock")).unwrap();
+    fs::remove_dir_all(&checkout).unwrap();
+    expect_success(&wosy(&project, &["dep", "sync"]));
+    assert_eq!(fs::read(&checkout.join(GIT_SOURCE)).unwrap(), second);
+    assert_eq!(fs::read(checkout.join("binary.dat")).unwrap(), b"\0\xff\x01revised bytes\0");
+    assert_eq!(fs::read(checkout.join("new name.bin")).unwrap(), b"\0exact renamed bytes\xff");
+    assert!(!checkout.join("old name.bin").exists());
+    assert!(executable(&checkout.join("tool.txt")));
+    assert_eq!(fs::read(project.join("wosy.lock")).unwrap(), lock);
+    assert_eq!(patch_files(&project), two);
+
+    let saved_origin = origin.with_file_name("offline-origin");
+    fs::rename(origin, saved_origin).unwrap();
+    expect_success(&wosy(&project, &["dep", "snapshot"]));
+    assert_eq!(patch_files(&project), two);
+    expect_success(&wosy(&project, &["dep", "sync"]));
+    stub_artifact(&project);
+    expect_success(&wosy(&project, &["build"]));
+    expect_success(&wosy(&project, &["run"]));
+}
+
+#[test]
+fn update_does_not_replace_an_inconsistent_hash_at_the_same_revision() {
+    let fixture = Fixture::new();
+    fixture.local();
+    let (_, revision) = fixture.origin(".", "remote_lib");
+    let project = fixture.project("clean", "remote_lib", ".");
+    checked_in_lock(&project, "remote_lib", "remote_lib", &revision, ".");
+    let lock_path = project.join("wosy.lock");
+    let mut lock = read_toml(&lock_path);
+    lock["packages"]["remote_lib"]["source_hash"] = toml_edit::value("0".repeat(64));
+    let locked = lock.to_string();
+    fs::write(&lock_path, &locked).unwrap();
+    let manifest = project.join("wosy.toml");
+    let original = fs::read(&manifest).unwrap();
+
+    assert!(!wosy(&project, &["dep", "update"]).status.success());
+    assert_eq!(fs::read(&manifest).unwrap(), original);
+    assert_eq!(fs::read_to_string(&lock_path).unwrap(), locked);
+    assert!(!project.join("deps").exists());
+}
+
+#[test]
+fn changed_patch_stack_waits_for_sync_and_does_not_clobber_live_edits() {
+    let fixture = Fixture::new();
+    let (_, project) = phase6_project(&fixture, "clean");
+    phase6_install(&project);
+    let checkout = project.join("deps/remote_lib");
+    fs::write(checkout.join(GIT_SOURCE), NEW_SOURCE).unwrap();
+    expect_success(&wosy(&project, &["dep", "snapshot"]));
+    stub_artifact(&project);
+    expect_success(&wosy(&project, &["build"]));
+    expect_success(&wosy(&project, &["run"]));
+
+    let patch = patch_files(&project).pop().unwrap();
+    fs::remove_file(project.join("patches/remote_lib").join(patch.0)).unwrap();
+    assert!(!wosy(&project, &["run"]).status.success());
+    assert!(!wosy(&project, &["dep", "snapshot"]).status.success());
+
+    fs::write(checkout.join("live-edit.txt"), b"work in progress").unwrap();
+    assert!(!wosy(&project, &["dep", "sync"]).status.success());
+    assert_eq!(fs::read(checkout.join("live-edit.txt")).unwrap(), b"work in progress");
+    assert_eq!(fs::read(checkout.join(GIT_SOURCE)).unwrap(), NEW_SOURCE);
+    fs::remove_file(checkout.join("live-edit.txt")).unwrap();
+    expect_success(&wosy(&project, &["dep", "sync"]));
+    assert_eq!(fs::read(checkout.join(GIT_SOURCE)).unwrap(), OLD_SOURCE);
+    assert!(!wosy(&project, &["run"]).status.success());
+    expect_success(&wosy(&project, &["build"]));
+}
+
+#[test]
+fn update_replays_patches_and_rejects_conflict_divergence_and_dirty_replacements() {
+    let fixture = Fixture::new();
+    let (origin, project) = phase6_project(&fixture, "clean");
+    let initial = git(&origin, &["rev-parse", "HEAD"]);
+    phase6_install(&project);
+    let checkout = project.join("deps/remote_lib");
+    fs::write(checkout.join(GIT_SOURCE), NEW_SOURCE).unwrap();
+    expect_success(&wosy(&project, &["dep", "snapshot"]));
+    let patches = patch_files(&project);
+
+    fs::write(origin.join("upstream-added.txt"), b"nonconflicting\n").unwrap();
+    let forward = commit(&origin, "Advance without touching the local patch");
+    expect_success(&wosy(&project, &["dep", "update"]));
+    let lockpath = project.join("wosy.lock");
+    let lockbytes = fs::read(&lockpath).unwrap();
+    assert_eq!(read_toml(&lockpath)["packages"]["remote_lib"]["rev"].as_str(), Some(forward.as_str()));
+    assert_eq!(patch_files(&project), patches);
+    assert_eq!(fs::read(checkout.join(GIT_SOURCE)).unwrap(), NEW_SOURCE);
+    assert_eq!(fs::read(checkout.join("upstream-added.txt")).unwrap(), b"nonconflicting\n");
+
+    fs::write(checkout.join("local-edit.txt"), b"unsnapshotted").unwrap();
+    fs::write(origin.join("second-upstream.txt"), b"another forward file\n").unwrap();
+    commit(&origin, "Another ordinary successor");
+    assert!(!wosy(&project, &["dep", "update"]).status.success());
+    assert_eq!(fs::read(checkout.join("local-edit.txt")).unwrap(), b"unsnapshotted");
+    assert_eq!(fs::read(&lockpath).unwrap(), lockbytes);
+    fs::remove_file(checkout.join("local-edit.txt")).unwrap();
+
+    fs::write(origin.join(GIT_SOURCE), b"%%start\ni32 value = 999;\n%%end\n").unwrap();
+    commit(&origin, "Conflict with the project patch");
+    assert!(!wosy(&project, &["dep", "update"]).status.success());
+    assert_eq!(fs::read(&lockpath).unwrap(), lockbytes);
+    assert_eq!(fs::read(checkout.join(GIT_SOURCE)).unwrap(), NEW_SOURCE);
+    assert!(!checkout.join("second-upstream.txt").exists());
+
+    // Rewind only this disposable origin; installed Wosy state must not move.
+    git(&origin, &["reset", "--hard", &initial]);
+    assert!(!wosy(&project, &["dep", "update"]).status.success());
+    assert_eq!(fs::read(&lockpath).unwrap(), lockbytes);
+    assert_eq!(patch_files(&project), patches);
+    assert_eq!(fs::read(checkout.join("upstream-added.txt")).unwrap(), b"nonconflicting\n");
+}
+
+#[test]
+fn a_transitive_git_checkout_uses_the_same_snapshot_and_replay() {
+    let fixture = Fixture::new();
+    fixture.local();
+    make_monorepo(&fixture);
+    let project = fixture.project("clean", "remote_lib", "packages/remote_lib");
+    without_git_declaration(&project);
+    expect_success(&wosy(&project, &[
+        "dep", "add", "../upstream", "--path", "packages/remote_lib",
+    ]));
+    expect_success(&wosy(&project, &["dep", "sync"]));
+    let leaf = project.join("deps/leaf_lib");
+    let leaf_src = leaf.join("src/library.w");
+    let changed = b"%%start\ni32 value = 92;\n%%end\n";
+    fs::write(&leaf_src, changed).unwrap();
+    expect_success(&wosy(&project, &["dep", "snapshot"]));
+    assert_eq!(fs::read_dir(project.join("patches/leaf_lib")).unwrap().count(), 1);
+    assert!(!project.join("patches/remote_lib").exists());
+    assert!(!project.join("patches/local_lib").exists());
+
+    fs::remove_dir_all(&leaf).unwrap();
+    expect_success(&wosy(&project, &["dep", "sync"]));
+    assert_eq!(fs::read(leaf_src).unwrap(), changed);
+    assert_eq!(fs::read(fixture.0.join("local_lib/src/nested/library.w")).unwrap(), LOCAL_SOURCE);
+    stub_artifact(&project);
+    expect_success(&wosy(&project, &["build"]));
+}
+
+#[test]
+fn manifest_patches_add_retire_and_restore_repository_siblings() {
+    let fixture = Fixture::new();
+    fixture.local();
+    let (origin, _) = fixture.origin("packages/remote_lib", "remote_lib");
+    let upstream_leaf = origin.join("packages/leaf_lib");
+    write_package(&upstream_leaf, "leaf_lib", "src");
+    fs::write(upstream_leaf.join("src/library.w"), LOCAL_SOURCE).unwrap();
+    commit(&origin, "Provide a sibling package that is not yet a dependency");
+    let project = fixture.project("clean", "remote_lib", "packages/remote_lib");
+    without_git_declaration(&project);
+    expect_success(&wosy(&project, &["dep", "add", "../upstream", "--path", "packages/remote_lib"]));
+    expect_success(&wosy(&project, &["dep", "sync"]));
+    let lock = project.join("wosy.lock");
+    let original_lock = fs::read(&lock).unwrap();
+    let parent = project.join("deps/remote_lib");
+    let parent_manifest = parent.join("wosy.toml");
+    let original_manifest = fs::read(&parent_manifest).unwrap();
+    let leaf = project.join("deps/leaf_lib");
+    let leaf_receipt = project.join("deps/.wosy-pins/leaf_lib");
+    let leaf_patches = project.join("patches/leaf_lib");
+    let sibling_edge = "\n[dependencies.leaf_lib]\npath = \"../leaf_lib\"\n";
+
+    append_manifest(&parent, sibling_edge);
+    expect_success(&wosy(&project, &["dep", "snapshot"]));
+    assert_eq!(patch_files(&project).len(), 1);
+    assert_eq!(fs::read(&lock).unwrap(), original_lock);
+    assert!(!wosy(&project, &["dep", "sync"]).status.success());
+    assert_eq!(fs::read(&lock).unwrap(), original_lock);
+    assert!(!leaf.exists());
+
+    fs::write(origin.join("upstream-note.txt"), b"an unrelated forward revision").unwrap();
+    let next = commit(&origin, "Advance the declaring repository snapshot");
+    expect_success(&wosy(&project, &["dep", "update"]));
+    let resolved = read_toml(&lock);
+    for name in ["remote_lib", "leaf_lib"] {
+        assert_eq!(resolved["packages"][name]["rev"].as_str(), Some(next.as_str()));
+    }
+    assert_eq!(fs::read(leaf.join("src/library.w")).unwrap(), LOCAL_SOURCE);
+    assert!(leaf_receipt.is_file());
+
+    fs::write(leaf.join("src/library.w"), NEW_SOURCE).unwrap();
+    expect_success(&wosy(&project, &["dep", "snapshot"]));
+    let mut leaf_entries = fs::read_dir(&leaf_patches).unwrap();
+    let leaf_patch = leaf_entries.next().unwrap().unwrap().path();
+    assert!(leaf_entries.next().is_none());
+    let leaf_patch_bytes = fs::read(&leaf_patch).unwrap();
+    fs::write(&parent_manifest, original_manifest).unwrap();
+    expect_success(&wosy(&project, &["dep", "snapshot"]));
+    let locked_leaf = fs::read(&lock).unwrap();
+    let installed_receipt = fs::read(&leaf_receipt).unwrap();
+
+    let dirty = leaf.join("unsnapshotted.txt");
+    fs::write(&dirty, b"authored and not in a patch").unwrap();
+    assert!(!wosy(&project, &["dep", "update"]).status.success());
+    assert_eq!(fs::read(&lock).unwrap(), locked_leaf);
+    assert_eq!(fs::read(&leaf_receipt).unwrap(), installed_receipt);
+    assert_eq!(fs::read(&dirty).unwrap(), b"authored and not in a patch");
+    fs::remove_file(dirty).unwrap();
+    expect_success(&wosy(&project, &["dep", "update"]));
+    assert!(!read_toml(&lock)["packages"].as_table().unwrap().contains_key("leaf_lib"));
+    assert!(!leaf.exists());
+    assert!(!leaf_receipt.exists());
+    assert_eq!(fs::read(&leaf_patch).unwrap(), leaf_patch_bytes);
+
+    append_manifest(&parent, sibling_edge);
+    expect_success(&wosy(&project, &["dep", "snapshot"]));
+    expect_success(&wosy(&project, &["dep", "update"]));
+    assert_eq!(read_toml(&lock)["packages"]["leaf_lib"]["rev"].as_str(), Some(next.as_str()));
+    assert_eq!(fs::read(leaf.join("src/library.w")).unwrap(), NEW_SOURCE);
+    assert_eq!(fs::read(leaf_patch).unwrap(), leaf_patch_bytes);
+    expect_success(&wosy(&project, &["dep", "sync"]));
+    stub_artifact(&project);
+    expect_success(&wosy(&project, &["build"]));
+    expect_success(&wosy(&project, &["run"]));
 }

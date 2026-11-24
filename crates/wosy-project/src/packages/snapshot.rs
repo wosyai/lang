@@ -121,7 +121,7 @@ impl ProjectSnapshot {
             Err(_) => false,
         };
         if self.manifest()? != manifest || lock_changed {
-            return Err("project manifest or lock changed during dep add; nothing was published".to_owned());
+            return Err("project manifest or lock changed during package operation; nothing was published".to_owned());
         }
         Ok(())
     }
