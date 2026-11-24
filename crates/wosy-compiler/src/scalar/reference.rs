@@ -1926,12 +1926,14 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 let signature = calls.checked_call_signatures.get(&ordinal);
                 let widened_borrow = (|| {
                     let owners = self.widened_arrays.as_ref()?;
-                    if scope != ReferenceScopeId(0) || !self.generic_parameters.is_empty()
+                    if !self.generic_parameters.is_empty()
                         || calls.declared_unsafe_calls.contains(&ordinal.0)
                         || !matches!(target, ResolvedCallTarget::ModuleCallable { concrete: ConcreteCallSelection::Declaration, .. })
                     { return None; }
                     let [ScalarExpression::CheckedAddress { mutability: ScalarReferenceMutability::Shared,
                         place: ScalarPlace::Name { name, .. }, .. }] = arguments.as_slice() else { return None };
+                    // The binding must belong to an enclosing live root owner;
+                    // nested borrowers do not acquire that allocation's cleanup.
                     let binding = self.names.get(name)?;
                     if binding.block_span != calls.structure.blocks[calls.structure.root.0].span || !owners.contains(binding) {
                         return None;

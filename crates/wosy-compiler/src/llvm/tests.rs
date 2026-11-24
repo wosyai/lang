@@ -12066,6 +12066,18 @@ u64() rebound = fn() {
 if (joined(true) != 2) { core.system_panic(); };
 if (joined(false) != 3) { core.system_panic(); };
 if (rebound() != 23) { core.system_panic(); };
+u64(bool) nested = fn(pick) {
+    u8[] bytes = [3, 5, 7];
+    u64 picked = if (pick) {
+        u64 inner = if (pick) { relay(&bytes) } else { 0 };
+        inner + 10
+    } else {
+        relay(&bytes) + 20
+    };
+    picked + extent(&bytes)
+};
+if (nested(true) != 16) { core.system_panic(); };
+if (nested(false) != 26) { core.system_panic(); };
 %%end";
     for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
         for access in [true, false] {
@@ -12154,7 +12166,51 @@ if (rebound() != 23) { core.system_panic(); };
                 assert_eq!(operand(cleanup, 0).as_instruction_value(), Some(backing));
             }
             assert!(before < free_old && free_old < after && after < free_new, "{rebound}");
-            if let Some(out) = std::env::var_os("WOSY_REPEAT_WIDENED_BORROW_IR_DIR") {
+            let nested = self_tail_test_body(&llvm, "i64", &project_function_name(&source, "nested"));
+            assert_eq!(nested.matches("call ptr @__wosy_core_alloc(").count(), 1, "{nested}");
+            assert_eq!(nested.matches("call void @__wosy_core_free(").count(), 1, "{nested}");
+            let function = module.get_function(&project_function_name(&source, "nested")).unwrap();
+            let extent_function = module.get_function(&target).unwrap();
+            let mut allocation = None;
+            let mut cleanup = None;
+            let mut readers = Vec::new();
+            for block in function.get_basic_blocks() {
+                for instruction in std::iter::successors(block.get_first_instruction(), |instruction| instruction.get_next_instruction()) {
+                    let Some(callee) = CallSiteValue::try_from(instruction).ok().and_then(|call| call.get_called_fn_value())
+                    else { continue };
+                    if callee == alloc {
+                        assert!(allocation.replace(instruction).is_none(), "{nested}");
+                    } else if callee == free {
+                        assert!(cleanup.replace((block, instruction)).is_none(), "{nested}");
+                    } else if callee == relay || callee == extent_function {
+                        readers.push((block, instruction, callee));
+                    }
+                }
+            }
+            let allocation = allocation.unwrap();
+            let (exit, cleanup) = cleanup.unwrap();
+            let [first, second, third] = readers.as_slice() else { panic!("{nested}") };
+            assert_eq!([first, second, third].iter().filter(|item| item.2 == relay).count(), 2, "{nested}");
+            assert_ne!(first.0, second.0, "{nested}");
+            assert_ne!(first.0, third.0, "{nested}");
+            assert_ne!(second.0, third.0, "{nested}");
+            for (_, reader, callee) in readers {
+                let extent = known_field_operand(reader, 0).unwrap().as_instruction_value().unwrap();
+                assert_eq!(extent.get_indices(), vec![1]);
+                assert_eq!(known_field_operand(extent, 1).unwrap().into_int_value().get_zero_extended_constant(), Some(3));
+                let partial = known_field_operand(extent, 0).unwrap().as_instruction_value().unwrap();
+                assert_eq!(partial.get_indices(), vec![0]);
+                let address = known_field_operand(partial, 1).unwrap().as_instruction_value().unwrap();
+                assert_eq!(address.get_opcode(), InstructionOpcode::PtrToInt);
+                assert_eq!(known_field_operand(address, 0).unwrap().as_instruction_value(), Some(allocation));
+                if callee == extent_function {
+                    assert_eq!(reader.get_parent(), Some(exit));
+                    assert!(std::iter::successors(reader.get_next_instruction(), |instruction| instruction.get_next_instruction())
+                        .any(|instruction| instruction == cleanup), "{nested}");
+                }
+            }
+            assert_eq!(known_field_operand(cleanup, 0).unwrap().as_instruction_value(), Some(allocation));
+            if let Some(out) = std::env::var_os("WOSY_NESTED_WIDENED_BORROW_IR_DIR") {
                 let target = if layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
                 let controlled = llvm.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);
                 assert_ne!(controlled, llvm);
