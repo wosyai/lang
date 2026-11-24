@@ -4395,14 +4395,14 @@ pub struct SymbolicProofDiagnostic {
 #[cfg(feature = "internal-checker")]
 struct SelectedSymbolicProof<'a, 'case> {
     watched: &'case MainFlowProofObserver<'a>,
-    equalities: SymbolicEqualityIndex<'a>,
+    equalities: SymbolicSummaryIndex<'a>,
     failure: Option<SymbolicProofDiagnostic>,
     additional_failures: Vec<SymbolicProofDiagnostic>,
     snapshot_work: usize,
 }
 
 #[cfg(feature = "internal-checker")]
-struct VerifiedSymbolicEquality<'a> {
+struct VerifiedSymbolicSummary<'a> {
     target: PreparedCallable,
     canonical_target: &'a ResolvedCallTarget,
     layout: ScalarTargetLayout,
@@ -4416,12 +4416,13 @@ enum VerifiedSymbolicResult<'a> {
     Constant { bound: &'a BigInt, shared: std::cell::OnceCell<Rc<IntegerSet>> },
     EntryAlias(usize),
     EntryAffine { slot: usize, transform: Rc<super::checker_flow::IntegerAffineTransform> },
+    UnaryPartitions(Vec<super::checker_flow::IntegerReturnPartition>),
 }
 
 #[cfg(feature = "internal-checker")]
 enum VerifiedSymbolicGuards<'a> {
     Bare(Option<ImportedEntryGuard<'a>>),
-    Rectangle {
+    Partitioned {
         guards: Vec<ImportedEntryGuard<'a>>,
         // Ordinals belong to this immutable prepared source/layout; the
         // dispatch authenticated each reached declaration before executing.
@@ -4431,7 +4432,7 @@ enum VerifiedSymbolicGuards<'a> {
 }
 
 #[cfg(feature = "internal-checker")]
-impl<'a> VerifiedSymbolicEquality<'a> {
+impl<'a> VerifiedSymbolicSummary<'a> {
     fn consume<'scope>(
         &self, find_additional: impl Fn(&PreparedCallable) -> Option<&'scope Self>,
         target: PreparedCallable, calls: &FunctionCallSites, source: &SourceIdentity, effects: &mut OrderedFailures,
@@ -4478,7 +4479,7 @@ impl<'a> VerifiedSymbolicEquality<'a> {
             }
             let (guards, domain, meter_rectangle) = match &summary.guards {
                 VerifiedSymbolicGuards::Bare(guard) => (guard.as_slice(), None, false),
-                VerifiedSymbolicGuards::Rectangle { guards, .. } => (guards.as_slice(), None, true),
+                VerifiedSymbolicGuards::Partitioned { guards, .. } => (guards.as_slice(), None, true),
                 VerifiedSymbolicGuards::Ranked(guards) => (guards.comparisons.as_slice(), guards.domain, false),
             };
             use super::checker_flow::ImportedVerifiedReturn;
@@ -4486,6 +4487,7 @@ impl<'a> VerifiedSymbolicEquality<'a> {
                 VerifiedSymbolicResult::Constant { bound, shared } => ImportedVerifiedReturn::Constant { values: shared, bound },
                 VerifiedSymbolicResult::EntryAlias(slot) => ImportedVerifiedReturn::EntryAlias(*slot),
                 VerifiedSymbolicResult::EntryAffine { slot, transform } => ImportedVerifiedReturn::EntryAffine { slot: *slot, transform },
+                VerifiedSymbolicResult::UnaryPartitions(pieces) => ImportedVerifiedReturn::UnaryPartitions(pieces),
             };
             let values = ImportedIntegerValues::Shared { result, guards, domain, meter_rectangle };
             Ok(Some(ImportedLocal { position, values, guards: Vec::new() }))
@@ -4536,14 +4538,14 @@ impl<'a> VerifiedSymbolicEquality<'a> {
 
 #[cfg(feature = "internal-checker")]
 #[derive(Default)]
-struct SymbolicEqualityIndex<'a> {
-    first: Option<VerifiedSymbolicEquality<'a>>,
-    other: HashMap<PreparedCallable, VerifiedSymbolicEquality<'a>>,
+struct SymbolicSummaryIndex<'a> {
+    first: Option<VerifiedSymbolicSummary<'a>>,
+    other: HashMap<PreparedCallable, VerifiedSymbolicSummary<'a>>,
 }
 
 #[cfg(feature = "internal-checker")]
-impl<'a> SymbolicEqualityIndex<'a> {
-    fn insert(&mut self, summary: VerifiedSymbolicEquality<'a>) {
+impl<'a> SymbolicSummaryIndex<'a> {
+    fn insert(&mut self, summary: VerifiedSymbolicSummary<'a>) {
         if self.first.is_none() {
             self.first = Some(summary);
         } else {
@@ -4673,6 +4675,50 @@ fn case_proof_domain(
 
 #[cfg(feature = "internal-checker")]
 impl<'a> SelectedSymbolicProof<'a, '_> {
+    fn verify_unary_partitioned_bound(
+        &mut self, target: PreparedCallable, body: &FunctionCallSites, function: &ScalarFunction,
+        source: &SourceIdentity, effects: &OrderedFailures, runtime: SymbolicProofRuntime<'_>,
+        proof: &MainFlowProofCase<'a>, issuer: &SymbolicSummaryIssuer<'a>,
+    ) -> Result<Option<bool>, ProjectCheck> {
+        use super::checker_flow::{charge_call_work, covers_all_partitioned_call_inputs, verify_partitioned_call_return, PartitionedProofGoal};
+        let [input] = body.boundary.parameters.as_slice() else { return Err(ProjectCheck::Unsupported); };
+        let full = IntegerSet::from_type(&input.ty).ok_or(ProjectCheck::Unsupported)?;
+        let mut work = 0;
+        charge_call_work(&mut work, body.occurrences.len()).ok_or(ProjectCheck::Unsupported)?;
+        let domain = case_proof_domain(proof, source, &full, &mut work)?;
+        if domain.is_empty() { return Ok(Some(false)); }
+        // No summary is visible while this independently observes the real
+        // producer and its local subcalls. Capture only the proved domain.
+        let mut private = OrderedFailures::default();
+        let (returned, active, dependencies) = capture_named_calling_partitions(
+            target, body, source, &mut private, runtime, domain.clone(), true,
+        )?;
+        if active || !private.records.is_empty()
+            || !dependencies.iter().all(|&(module, item)|
+                runtime.calls.function_body(module, item, None).is_some_and(summary_elision_safe))
+            || covers_all_partitioned_call_inputs(&returned, &domain, &mut work) != Some(true)
+        {
+            return Err(ProjectCheck::Unsupported);
+        }
+        let goal = PartitionedProofGoal::Literal(proof.relation, proof.bound.literal().ok_or(ProjectCheck::Unsupported)?);
+        let checked = verify_partitioned_call_return(body, &returned, &domain, false, goal, Some(&mut work))
+            .ok_or(ProjectCheck::Unsupported)?;
+        if !checked.applicable { return Err(ProjectCheck::Unsupported); }
+        if let Some(failure) = checked.failure {
+            self.record(proof, function, source, effects.records.len(), failure, None)?;
+        } else {
+            let ActualCallResult::PartitionedInteger(pieces) = returned else { return Err(ProjectCheck::Unsupported); };
+            self.equalities.insert(VerifiedSymbolicSummary {
+                target, canonical_target: issuer.canonical_target, layout: issuer.layout, body: issuer.body,
+                result: VerifiedSymbolicResult::UnaryPartitions(pieces),
+                guards: VerifiedSymbolicGuards::Partitioned {
+                    guards: proof.guard.comparisons.clone(), _dependency_definitions: dependencies,
+                },
+            });
+        }
+        Ok(Some(true))
+    }
+
     fn verify_case_shows(
         &mut self, target: PreparedCallable, body: &FunctionCallSites, function: &ScalarFunction,
         source: &SourceIdentity, effects: &OrderedFailures, runtime: SymbolicProofRuntime<'_>,
@@ -4930,10 +4976,10 @@ impl<'a> SelectedSymbolicProof<'a, '_> {
                 // Full pre-guard joint coverage and proof-free execution
                 // were checked above. All guarded returns satisfy the
                 // certified constant or exact entry-alias relation.
-                self.equalities.insert(VerifiedSymbolicEquality {
+                self.equalities.insert(VerifiedSymbolicSummary {
                     target, canonical_target: issuer.canonical_target, layout: issuer.layout,
                     body: issuer.body, result,
-                    guards: VerifiedSymbolicGuards::Rectangle {
+                    guards: VerifiedSymbolicGuards::Partitioned {
                         guards: case.guard.comparisons.clone(),
                         _dependency_definitions: dependencies.take().ok_or(ProjectCheck::Unsupported)?,
                     },
@@ -4994,9 +5040,9 @@ impl<'a> SelectedSymbolicProof<'a, '_> {
         if let Some(failure) = checked.failure {
             self.record(case, function, source, effects.records.len(), failure, None)?;
         } else if let Some(issuer) = group.issuer.as_ref().filter(|issuer| std::ptr::eq(issuer.body, body)) {
-            self.equalities.insert(VerifiedSymbolicEquality {
+            self.equalities.insert(VerifiedSymbolicSummary {
                 target, canonical_target: issuer.canonical_target, layout: issuer.layout, body: issuer.body,
-                result: summary, guards: VerifiedSymbolicGuards::Rectangle {
+                result: summary, guards: VerifiedSymbolicGuards::Partitioned {
                     guards: case.guard.comparisons.clone(), _dependency_definitions: dependencies,
                 },
             });
@@ -5170,7 +5216,7 @@ impl<'a> SelectedSymbolicProof<'a, '_> {
             } else if verified.covers_guard {
                 let bound = case.bound.literal().ok_or(ProjectCheck::Unsupported)?;
                 let issuer = issuer.ok_or(ProjectCheck::Unsupported)?;
-                self.equalities.insert(VerifiedSymbolicEquality {
+                self.equalities.insert(VerifiedSymbolicSummary {
                     target, canonical_target: issuer.canonical_target, layout: issuer.layout,
                     body: issuer.body, result: VerifiedSymbolicResult::Constant { bound, shared: std::cell::OnceCell::new() },
                     guards: VerifiedSymbolicGuards::Bare(case.guard.comparisons.first().map(|guard| ImportedEntryGuard {
@@ -5213,6 +5259,13 @@ impl SymbolicRootProof for SelectedSymbolicProof<'_, '_> {
             return self.verify_case_citation_cohort(target, calls, function, source, effects, runtime, cases, cohort);
         }
         if let MainFlowProofCases::Bare { first, rest } = &group.cases {
+            if rest.is_empty() && first.bound.literal().is_some()
+                && Some(first.relation) != IntegerRelation::from_operator(&BinaryOperator::Equal)
+            {
+                if let Some(issuer) = group.issuer.as_ref().filter(|issuer| std::ptr::eq(issuer.body, calls)) {
+                    return self.verify_unary_partitioned_bound(target, calls, function, source, effects, runtime, first, issuer);
+                }
+            }
             if rest.is_empty() && calls.boundary.parameters.len() == 1
                 && matches!(first.bound, MainFlowProofBound::Entry(0) | MainFlowProofBound::EntryAffine { slot: 0, .. })
                 && Some(first.relation) == IntegerRelation::from_operator(&BinaryOperator::Equal)
@@ -5394,7 +5447,7 @@ impl SymbolicRootProof for SelectedSymbolicProof<'_, '_> {
             }.ok_or(ProjectCheck::Unsupported)?;
             if returned && failure.is_none() {
                 if let Some(plan) = candidate {
-                    let summary = VerifiedSymbolicEquality {
+                    let summary = VerifiedSymbolicSummary {
                         target, canonical_target: plan.canonical_target, layout: plan.layout,
                         body: plan.body, result: VerifiedSymbolicResult::Constant { bound: first_bound, shared: std::cell::OnceCell::new() },
                         guards: VerifiedSymbolicGuards::Bare(first.guard.comparisons.first().map(|guard| ImportedEntryGuard {
@@ -5948,14 +6001,14 @@ impl<'a> MainFlowProofCases<'a> {
 }
 
 #[cfg(feature = "internal-checker")]
-struct SymbolicEqualityIssuer<'a> {
+struct SymbolicSummaryIssuer<'a> {
     canonical_target: &'a ResolvedCallTarget,
     layout: ScalarTargetLayout,
     body: &'a FunctionCallSites,
 }
 
 #[cfg(feature = "internal-checker")]
-impl<'a> SymbolicEqualityIssuer<'a> {
+impl<'a> SymbolicSummaryIssuer<'a> {
     fn for_symbolic_case(
         scope: ScalarCheckerScope, plan: &PlannedModuleProof<'a>,
         (proof, authored): &MainFlowProofPlan<'a>,
@@ -5967,6 +6020,13 @@ impl<'a> SymbolicEqualityIssuer<'a> {
         }
         let body = plan.typed.body;
         let parameters = &body.boundary.parameters;
+        if matches!(&plan.typed.goal, TypedProofGoal::Literal { operator, .. } if *operator != BinaryOperator::Equal)
+            && matches!(parameters.as_slice(), [input] if &input.ty == plan.typed.result_type)
+            && supported_calling_proof_body(body, plan.typed.result_type)
+            && citation_safe_calling_body(body) && summary_elision_safe(body)
+        {
+            return Some(Self { canonical_target: plan.canonical_target, layout: plan.typed.target.target_layout, body });
+        }
         let rectangular = matches!(parameters.as_slice(), [left, right]
             if is_integer_type(&left.ty) && is_integer_type(&right.ty))
             && !body.structure.checker_integer_call_locals.is_empty()
@@ -6049,7 +6109,7 @@ struct MainFlowProofTarget<'a> {
     qualified_leaf: bool,
     nested_observation_work: usize,
     cases: MainFlowProofCases<'a>,
-    issuer: Option<SymbolicEqualityIssuer<'a>>,
+    issuer: Option<SymbolicSummaryIssuer<'a>>,
     seen: bool,
 }
 
@@ -6153,7 +6213,7 @@ impl<'a> MainFlowProofObserver<'a> {
         proof: MainFlowProofPlan<'a>,
     ) -> Self {
         let issuer = if plan.proof_source == root_source {
-            SymbolicEqualityIssuer::for_symbolic_case(scope, plan, &proof)
+            SymbolicSummaryIssuer::for_symbolic_case(scope, plan, &proof)
         } else {
             None
         };
@@ -6202,7 +6262,7 @@ impl<'a> MainFlowProofObserver<'a> {
                 group.cases.push(proof);
             }
             std::collections::hash_map::Entry::Vacant(entry) => {
-                let issuer = allow_issuer.then(|| SymbolicEqualityIssuer::for_symbolic_case(scope, plan, &proof)).flatten();
+                let issuer = allow_issuer.then(|| SymbolicSummaryIssuer::for_symbolic_case(scope, plan, &proof)).flatten();
                 entry.insert(MainFlowProofTarget { issuer, ..MainFlowProofTarget::new(proof) });
             }
         }
@@ -6607,7 +6667,7 @@ impl<'a> OrderedRunEvidence for NamedOrderedEvidence<'a> {
     fn symbolic(&self) -> Self::Symbolic<'_> {
         SelectedSymbolicProof {
             watched: &self.observed,
-            equalities: SymbolicEqualityIndex::default(),
+            equalities: SymbolicSummaryIndex::default(),
             failure: None, additional_failures: Vec::new(), snapshot_work: 0,
         }
     }
@@ -6653,7 +6713,7 @@ struct RankedOrderedSymbolic<'a, 'proof> {
     rank: TypedInductionRank<'a>,
     failure: Option<SymbolicProofDiagnostic>,
     allow_summary: bool,
-    verified: Option<VerifiedSymbolicEquality<'proof>>,
+    verified: Option<VerifiedSymbolicSummary<'proof>>,
 }
 
 #[cfg(feature = "internal-checker")]
@@ -6747,7 +6807,7 @@ impl SymbolicRootProof for RankedOrderedSymbolic<'_, '_> {
 #[cfg(feature = "internal-checker")]
 fn ranked_symbolic_equality<'proof>(
     plan: &'proof PlannedModuleProof<'_>, source: &SourceIdentity,
-) -> Option<VerifiedSymbolicEquality<'proof>> {
+) -> Option<VerifiedSymbolicSummary<'proof>> {
     if plan.proof_source != source {
         return None;
     }
@@ -6758,7 +6818,7 @@ fn ranked_symbolic_equality<'proof>(
     if guards.always_rejects {
         return None;
     }
-    Some(VerifiedSymbolicEquality {
+    Some(VerifiedSymbolicSummary {
         target: plan.target, canonical_target: plan.canonical_target, layout: plan.typed.target.target_layout,
         body: plan.typed.body, result: VerifiedSymbolicResult::Constant { bound, shared: std::cell::OnceCell::new() },
         guards: VerifiedSymbolicGuards::Ranked(guards),
@@ -6798,7 +6858,7 @@ impl ActualIntegerObserver for MixedOrderedEvidence<'_, '_> {
 struct MixedOrderedSymbolic<'a, 'proof, 'run> {
     ranked: HashMap<PreparedCallable, RankedOrderedSymbolic<'a, 'proof>>,
     bare: Option<SelectedSymbolicProof<'proof, 'run>>,
-    ranked_only_equalities: SymbolicEqualityIndex<'proof>,
+    ranked_only_equalities: SymbolicSummaryIndex<'proof>,
     first: Option<SymbolicProofDiagnostic>,
     rest: Vec<SymbolicProofDiagnostic>,
 }
@@ -6823,7 +6883,7 @@ impl<'a, 'proof> OrderedRunEvidence for MixedOrderedEvidence<'a, 'proof> {
         MixedOrderedSymbolic {
             ranked: self.ranked.iter().map(|(target, evidence)| (*target, evidence.symbolic())).collect(),
             bare: self.bare.as_ref().map(|evidence| evidence.symbolic()),
-            ranked_only_equalities: SymbolicEqualityIndex::default(),
+            ranked_only_equalities: SymbolicSummaryIndex::default(),
             first: None, rest: Vec::new(),
         }
     }
@@ -19155,6 +19215,71 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
             let report = run(&refused);
             assert!(matches!(report, Err(ProjectCheck::Unsupported)), "{label}: {:?}", report.err());
         }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordered_unary_bounded_summary_reuses_only_authenticated_return_partitions() {
+        let app = source("src/main.w", "ordered-unary-bounded-summary");
+        let producer = r#"%%start
+            u8(u8) select_value = fn(value) { if (value < 5) { value } else { 7 } };
+            u8(u8) producer = fn(value) { u8 result = select_value(value); result };
+            proof bounded for producer(entry) -> (out) where (entry >= 1 && entry <= 10) ensures (out <= 7) {}
+        %%end"#;
+        let program = producer.replace("%%end", &format!(r#"
+            unit(u8) consume = fn(input) {{
+                core.narrow(input >= 1, {OUTPUT});
+                core.narrow(input <= 10, {OUTPUT});
+                u8 observed = producer(input);
+                u8 fixed_result = producer(8);
+                core.require(fixed_result == 7, {OUTPUT});
+                core.require(observed != 5, {OUTPUT});
+                if (input == 3) {{ core.require(observed == 3, {OUTPUT}); }};
+                if (input >= 5) {{ core.require(observed == 7, {OUTPUT}); }};
+            }};
+        %%end"#));
+        let run = |text: &str, scope| {
+            let (_, proof) = crate::parse_proof_source(app.clone(), text.to_owned(), &[]).ok().unwrap();
+            check_loaded_ordered_proof_diagnostics_in_scope::<true>(
+                Vec::new(), vec![(proof, Vec::new())], vec![app.clone()], inputs(), scope, Vec::new(),
+            )
+        };
+        let package = ScalarCheckerScope::CurrentPackage;
+        let main = ScalarCheckerScope::MainFlowOnly;
+        let proved = run(&program, package).unwrap();
+        assert!(proved.active && proved.symbolic_diagnostic.is_none() && proved.directives.is_empty());
+        assert!(!run(&program, main).unwrap().active);
+        let failed = program.replace("observed == 3", "observed != 3");
+        let receipt = run(&failed, package).unwrap();
+        let [failure] = receipt.directives.as_slice() else { panic!("one genuine consumer witness"); };
+        let three = BigInt::from(3);
+        let seven = BigInt::from(7);
+        assert!(failure.witness.intervals_at(0, 0).unwrap().eq([(&three, &three)]));
+        assert!(failure.witness.intervals_at(0, 1).unwrap().eq([(&three, &three)]));
+        assert!(failure.witness.intervals_at(0, 2).unwrap().eq([(&seven, &seven)]));
+        assert_eq!(failure.witness.row_equal_axes(0), Some(&[(1, 0)][..]));
+
+        let bad_guard = program.replace("input <= 10", "input <= 11");
+        let bad_literal = program.replace("producer(8)", "producer(11)");
+        let wrong_goal = program.replace("ensures (out <= 7)", "ensures (out < 7)");
+        let reached_only = program.replace("%%end", "u8 startup = producer(8); %%end");
+        let effectful = program.replace("if (value < 5)", &format!("core.require(false, {OUTPUT}); if (value < 5)"));
+        for (label, closed) in [("guard", bad_guard), ("literal", bad_literal), ("false proof", wrong_goal),
+            ("actual context cannot certify symbolic imports", reached_only), ("effectful subcall", effectful)]
+        {
+            assert!(matches!(run(&closed, package), Err(ProjectCheck::Unsupported)), "{label}");
+        }
+        let proof_refuted = producer.replace("ensures (out <= 7)", "ensures (out < 7)");
+        let receipt = run(&proof_refuted, package).unwrap();
+        let failure = receipt.symbolic_diagnostic.unwrap();
+        assert_eq!(failure.returned, seven);
+        assert!(failure.witness.intervals_at(0, 0).unwrap().eq([(&BigInt::from(5), &BigInt::from(10))]));
+        let reached = proof_refuted.replace("%%end", "u8 startup = producer(8); %%end");
+        let receipt = run(&reached, main).unwrap();
+        let [observed] = receipt.diagnostics.as_slice() else { panic!("real reached proof failure"); };
+        assert_eq!(observed.invocation.arguments, [(ScalarType::U8, BigInt::from(8))]);
+        assert_eq!(observed.invocation.returned, seven);
+        assert!(receipt.symbolic_diagnostic.is_none());
     }
 
     #[cfg(feature = "internal-checker")]

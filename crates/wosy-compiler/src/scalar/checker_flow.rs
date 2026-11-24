@@ -104,6 +104,7 @@ pub(super) enum ImportedVerifiedReturn<'a> {
     Constant { values: &'a std::cell::OnceCell<Rc<IntegerSet>>, bound: &'a BigInt },
     EntryAlias(usize),
     EntryAffine { slot: usize, transform: &'a Rc<IntegerAffineTransform> },
+    UnaryPartitions(&'a [IntegerReturnPartition]),
 }
 
 pub(super) enum ImportedIntegerValues<'a> {
@@ -6189,16 +6190,18 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                             if !guards.iter().all(applies) || domain.is_some_and(|domain| !in_domain(domain)) {
                                 return None;
                             }
-                            let alias = match &result {
+                            let slot = match &result {
                                 ImportedVerifiedReturn::Constant { .. } => None,
-                                ImportedVerifiedReturn::EntryAlias(slot) | ImportedVerifiedReturn::EntryAffine { slot, .. } => {
-                                    let (argument, _) = origin.arguments.as_slice().get(*slot)?;
-                                    if !meter_rectangle || structure.checked_types.expressions.get(argument) != Some(&receiver.ty) {
-                                        return None;
-                                    }
-                                    Some(arguments.get(*slot).copied().flatten()?)
-                                }
+                                ImportedVerifiedReturn::EntryAlias(slot) | ImportedVerifiedReturn::EntryAffine { slot, .. } => Some(*slot),
+                                ImportedVerifiedReturn::UnaryPartitions(_) => Some(0),
                             };
+                            let alias = if let Some(slot) = slot {
+                                let (argument, _) = origin.arguments.as_slice().get(slot)?;
+                                if !meter_rectangle || structure.checked_types.expressions.get(argument) != Some(&receiver.ty) {
+                                    return None;
+                                }
+                                Some(arguments.get(slot).copied().flatten()?)
+                            } else { None };
                             roots.add(&origin.binding, &receiver.ty);
                             match (result, alias) {
                                 (ImportedVerifiedReturn::Constant { values, bound }, None) => {
@@ -6231,6 +6234,19 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                                             }
                                         }
                                     }
+                                }
+                                (ImportedVerifiedReturn::UnaryPartitions(pieces), Some(Argument::Literal(value))) => {
+                                    let work = roots.ordinary_local_work.get_or_insert(0);
+                                    let returned = singleton_return_from_partitions(pieces, value, &receiver.ty, work)?;
+                                    path.append_local(IntegerSet::singleton(&returned));
+                                }
+                                (ImportedVerifiedReturn::UnaryPartitions(pieces), Some(Argument::Axis(axis))) => {
+                                    let mut joined = ScalarOutputRows::Bound(IntegerInputs::default());
+                                    transfer_unary_return_partitions(&path.0, axis, roots.axes.get(axis)?.1,
+                                        &receiver.ty, roots.axes.len(), pieces, &mut joined, &mut roots.affine_work,
+                                        Some(roots.ordinary_local_work.get_or_insert(0)))?;
+                                    let ScalarOutputRows::Bound(rows) = joined else { return None; };
+                                    path = rows;
                                 }
                                 _ => return None,
                             }
@@ -6698,6 +6714,101 @@ impl ScalarOutputRows {
             Self::Guard { .. } => None,
         }
     }
+}
+
+// Both a freshly executed projected call and an authenticated reuse of its
+// exact partitions attach returns to the same immutable caller-entry row.
+fn transfer_unary_return_partitions(
+    rows: &[IntegerRow], axis: usize, entry_type: &ScalarType, ty: &ScalarType, cells: usize,
+    pieces: &[IntegerReturnPartition], joined: &mut ScalarOutputRows,
+    retained: &mut Option<usize>, import_meter: Option<&mut usize>,
+) -> Option<()> {
+    let (piece_intervals, depends_on_input, affine) = pieces.iter().try_fold(
+        (0usize, false, false), |(sum, depends, affine), piece| Some((
+            sum.checked_add(piece.input.interval_count())?,
+            depends || !matches!(&piece.output, IntegerPartitionOutput::Singleton(_)),
+            affine || matches!(&piece.output, IntegerPartitionOutput::InputAffine(_)),
+        )))?;
+    if depends_on_input && entry_type != ty {
+        return None;
+    }
+    let row_intervals = rows.iter().try_fold(0usize, |sum, row| sum.checked_add(row[axis].interval_count()))?;
+    let comparisons = row_intervals.checked_mul(pieces.len())?
+        .checked_add(piece_intervals.checked_mul(rows.len())?)?;
+    let bounds = if affine { Some(super::typecheck::integer_bounds(ty)?) } else { None };
+    if affine || retained.is_some() {
+        charge_call_work(retained.get_or_insert(0), comparisons.checked_add(rows.len().checked_mul(pieces.len())?)?)?;
+    } else {
+        let row_copies = rows.len().checked_mul(pieces.len())?.checked_mul(cells)?;
+        let alias_work = rows.iter().try_fold(0usize, |sum, row| sum.checked_add(row.equal_axes().len()))?
+            .checked_mul(pieces.len())?;
+        let cost = row_copies.checked_add(comparisons)?.checked_add(alias_work)?;
+        if let Some(meter) = import_meter {
+            charge_call_work(meter, cost)?;
+        } else if cost > MAX_PARTITION_TRANSFER_WORK {
+            return None;
+        }
+    }
+    for row in rows {
+        for piece in pieces {
+            let narrowed = match row[axis].intersection(&piece.input) {
+                IntegerIntersection::Unchanged => None,
+                IntegerIntersection::Empty => continue,
+                IntegerIntersection::Changed(values) => Some(values),
+            };
+            let mut plan = None;
+            if let Some(work) = retained.as_mut() {
+                charge_call_work(work, cells)?;
+                if let Some(values) = &narrowed {
+                    charge_call_work(work, row.equal_axes().len())?;
+                    row.charge_affine_replacement(axis, values.interval_count(), work)?;
+                }
+                if matches!(&piece.output, IntegerPartitionOutput::InputAlias) {
+                    charge_call_work(work, row.equal_axes().len())?;
+                }
+                if let IntegerPartitionOutput::InputAffine(transform) = &piece.output {
+                    let (min, max) = bounds.as_ref()?;
+                    let values = narrowed.as_ref().unwrap_or_else(|| row[axis].as_ref());
+                    transform.fits(values, min, max)?;
+                    plan = Some(row.prepare_affine(axis, values, transform, work)?);
+                }
+                if *work > MAX_PARTITION_TRANSFER_WORK { return None; }
+            }
+            let mut next = row.clone();
+            if let Some(values) = narrowed {
+                next.replace_domain(axis, Rc::new(values));
+            }
+            match &piece.output {
+                IntegerPartitionOutput::Singleton(output) => joined.push_singleton(next, Rc::clone(output))?,
+                IntegerPartitionOutput::InputAlias => joined.push_alias(next, axis)?,
+                IntegerPartitionOutput::InputAffine(_) => joined.push_affine(next, plan?)?,
+            }
+        }
+    }
+    Some(())
+}
+
+#[cfg(feature = "internal-checker")]
+fn singleton_return_from_partitions(
+    pieces: &[IntegerReturnPartition], input: &BigInt, ty: &ScalarType, work: &mut usize,
+) -> Option<BigInt> {
+    let mut returned = None;
+    for piece in pieces {
+        charge_call_work(work, piece.input.interval_count().checked_add(1)?)?;
+        if !piece.input.contains(input) { continue; }
+        let value = match &piece.output {
+            IntegerPartitionOutput::Singleton(output) => output.singleton_value()?.clone(),
+            IntegerPartitionOutput::InputAlias => input.clone(),
+            IntegerPartitionOutput::InputAffine(transform) => transform.apply_point(input),
+        };
+        if !super::typecheck::integer_literal_fits_type(&value, ty) { return None; }
+        if let Some(prior) = &returned {
+            if prior != &value { return None; }
+        } else {
+            returned = Some(value);
+        }
+    }
+    returned
 }
 
 pub(super) struct ExactCallCursor<'a> {
@@ -7226,70 +7337,10 @@ impl<'a> ExactCallCursor<'a> {
             }
             (ExactCallEffect::Scalar { binding, ty, .. }, ActualCallResult::PartitionedInteger(pieces)) => {
                 let axis = caller_axis?;
-                let (piece_intervals, depends_on_input, affine) = pieces.iter().try_fold(
-                    (0usize, false, false), |(sum, depends, affine), piece| Some((
-                        sum.checked_add(piece.input.interval_count())?,
-                        depends || !matches!(&piece.output, IntegerPartitionOutput::Singleton(_)),
-                        affine || matches!(&piece.output, IntegerPartitionOutput::InputAffine(_)),
-                    )))?;
-                if depends_on_input && self.roots.axes.get(axis)?.1 != ty {
-                    return None;
-                }
-                let rows = &self.block.path.0;
-                let cells = self.roots.axes.len().checked_add(1)?;
-                let row_intervals = rows.iter().try_fold(0usize, |sum, row| sum.checked_add(row[axis].interval_count()))?;
-                let comparisons = row_intervals.checked_mul(pieces.len())?
-                    .checked_add(piece_intervals.checked_mul(rows.len())?)?;
-                let bounds = if affine { Some(super::typecheck::integer_bounds(ty)?) } else { None };
                 let mut retained = self.roots.affine_work;
-                if affine || retained.is_some() {
-                    charge_call_work(retained.get_or_insert(0), comparisons.checked_add(rows.len().checked_mul(pieces.len())?)?)?;
-                } else {
-                    let row_copies = rows.len().checked_mul(pieces.len())?.checked_mul(cells)?;
-                    let alias_work = rows.iter().try_fold(0usize, |sum, row| sum.checked_add(row.equal_axes().len()))?
-                        .checked_mul(pieces.len())?;
-                    if row_copies.checked_add(comparisons)?.checked_add(alias_work)? > MAX_PARTITION_TRANSFER_WORK {
-                        return None;
-                    }
-                }
-                let original = std::mem::take(&mut self.block.path.0);
                 let mut joined = self.scalar_output_rows(binding, ty)?;
-                for row in &original {
-                    for piece in &pieces {
-                        let narrowed = match row[axis].intersection(&piece.input) {
-                            IntegerIntersection::Unchanged => None,
-                            IntegerIntersection::Empty => continue,
-                            IntegerIntersection::Changed(values) => Some(values),
-                        };
-                        let mut plan = None;
-                        if let Some(work) = &mut retained {
-                            charge_call_work(work, cells)?;
-                            if let Some(values) = &narrowed {
-                                charge_call_work(work, row.equal_axes().len())?;
-                                row.charge_affine_replacement(axis, values.interval_count(), work)?;
-                            }
-                            if matches!(&piece.output, IntegerPartitionOutput::InputAlias) {
-                                charge_call_work(work, row.equal_axes().len())?;
-                            }
-                            if let IntegerPartitionOutput::InputAffine(transform) = &piece.output {
-                                let (min, max) = bounds.as_ref()?;
-                                let values = narrowed.as_ref().unwrap_or_else(|| row[axis].as_ref());
-                                transform.fits(values, min, max)?;
-                                plan = Some(row.prepare_affine(axis, values, transform, work)?);
-                            }
-                            if *work > MAX_PARTITION_TRANSFER_WORK { return None; }
-                        }
-                        let mut next = row.clone();
-                        if let Some(values) = narrowed {
-                            next.replace_domain(axis, Rc::new(values));
-                        }
-                        match &piece.output {
-                            IntegerPartitionOutput::Singleton(output) => joined.push_singleton(next, Rc::clone(output))?,
-                            IntegerPartitionOutput::InputAlias => joined.push_alias(next, axis)?,
-                            IntegerPartitionOutput::InputAffine(_) => joined.push_affine(next, plan?)?,
-                        }
-                    }
-                }
+                transfer_unary_return_partitions(&self.block.path.0, axis, self.roots.axes.get(axis)?.1, ty,
+                    self.roots.axes.len().checked_add(1)?, &pieces, &mut joined, &mut retained, None)?;
                 self.roots.affine_work = retained;
                 self.finish_scalar_rows(joined, binding, ty)?;
             }

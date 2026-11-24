@@ -58,6 +58,12 @@ cited precondition. The cited proof is checked independently. Only the
 branch and its descendants can use its equality, including for rewrites.
 Proof steps do not execute in artifacts.
 
+Supported bare integer comparison proofs can refine ordinary unary calls
+in the declared-package scope. For a pure local producer, the checker
+retains the verified return partitions under the proof's precondition, so
+reuse preserves the connection between each argument and its return.
+Calls outside the verified precondition cannot borrow that result.
+
 Check diagnostics and stream output work on native CLI hosts. Authored file
 output currently requires a Linux CLI host and a flat filename under
 `.wosy/outputs/check/`; other file requests are refused before authored output

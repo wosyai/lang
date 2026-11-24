@@ -2346,7 +2346,40 @@ cases.extend([
         2, b"unsupported analysis"),
 ])
 
+bounded_summary_producer = """%%start
+    u8(u8) select_value = fn(value) { if (value < 5) { value } else { 7 } };
+    u8(u8) producer = fn(value) { u8 result = select_value(value); result };
+    proof bounded for producer(entry) -> (out) where (entry >= 1 && entry <= 10) ensures (out <= 7) {}
+%%end"""
+bounded_summary_consumer = bounded_summary_producer.replace("%%end", f"""
+    unit(u8) consume = fn(input) {{
+        core.narrow(input >= 1, {report(50,"INPUT-LOW")});
+        core.narrow(input <= 10, {report(51,"INPUT-HIGH")});
+        u8 observed = producer(input);
+        u8 fixed_result = producer(8);
+        core.require(fixed_result == 7, {report(52,"WRONG-FIXED-RETURN")});
+        core.require(observed != 5, {report(53,"UNREACHABLE-RETURN")});
+        if (input == 3) {{ core.require(observed == 3, {report(54,"REAL-DEPENDENT-RETURN")}); }};
+        if (input >= 5) {{ core.require(observed == 7, {report(55,"WRONG-HIGH-RETURN")}); }};
+    }};
+%%end""")
+cases.extend([
+    ("ordinary-unary-bounded-summary-proved", bounded_summary_consumer, 0, b""),
+    ("ordinary-unary-bounded-summary-refutes-consumer", bounded_summary_consumer.replace("observed == 3", "observed != 3"),
+        54, b"REAL-DEPENDENT-RETURN"),
+    ("ordinary-unary-bounded-summary-refuses-guard", bounded_summary_consumer.replace("input <= 10", "input <= 11"),
+        2, b"unsupported analysis"),
+    ("ordinary-unary-bounded-summary-refuses-literal", bounded_summary_consumer.replace("producer(8)", "producer(11)"),
+        2, b"unsupported analysis"),
+    ("ordinary-unary-bounded-summary-refutes-proof", bounded_summary_producer.replace("out <= 7", "out < 7"),
+        1, b"proof obligation failed"),
+    ("exact-startup-unary-bounded-summary-refutes-proof", bounded_summary_producer.replace("out <= 7", "out < 7")
+        .replace("%%end", "u8 startup = producer(8); %%end"), 1, b"proof obligation failed"),
+])
+
 proof_diagnostic_notes = {
+    "ordinary-unary-bounded-summary-refutes-proof": b"symbolic call can return 7",
+    "exact-startup-unary-bounded-summary-refutes-proof": b"call returned 7",
     "ordinary-authored-case-citation-ordered-diagnostics": b"core.show(out == 8)",
     "exact-startup-authored-case-citation-ordered-diagnostics": b"core.show(out == 8)",
     "ordinary-authored-case-citation-refuted-premise": b"symbolic call can return 9",
