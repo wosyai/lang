@@ -4717,7 +4717,11 @@ impl<'a> ReferenceFlowBuilder<'a> {
                                             && matches!(self.prepared_place_root(root.ordinal, *span)?,
                                                 Some(PreparedPlaceRoot::Lexical(binding)) if binding == &target.binding)
                                         {
-                                            self.aggregate_facts.receipt_scalar_field_writes.insert(install);
+                                            if let Some(evaluation) = group.rhs_evaluations().next() {
+                                                self.aggregate_facts.receipt_scalar_field_writes.insert(
+                                                    install, (evaluation.expression, slot.destination),
+                                                );
+                                            }
                                         }
                                     }
                                 }

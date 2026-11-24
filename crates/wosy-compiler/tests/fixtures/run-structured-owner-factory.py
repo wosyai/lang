@@ -56,7 +56,7 @@ int main(void) { return check(); }
 # The named variant deliberately puts a different length in the alternate
 # descriptor without changing its backing size or the allocation trace.
 label = "alternate selected bases and eight exact receipts released in order"
-if sys.argv[3:] in (["named"], ["all-local"]):
+if sys.argv[3:] in (["named"], ["all-local"], ["named-metadata"]):
     runtime = runtime.replace("wosy_case_zero() != 2", "wosy_case_zero() != 12")
     runtime = runtime.replace("wosy_case_three() != 2", "wosy_case_three() != 12")
 if sys.argv[3:] == ["all-local"]:
@@ -66,8 +66,12 @@ if sys.argv[3:] == ["all-local"]:
     runtime = runtime.replace("allocated != 4 || released != 4 || peak != 3", "allocated != 2 || released != 2 || peak != 1")
     runtime = runtime.replace("allocated != 8 || released != 8 || peak != 4", "allocated != 3 || released != 3 || peak != 1")
     label = "branch-local bases, three allocations and three exact caller releases"
+elif sys.argv[3:] == ["named-metadata"]:
+    runtime = runtime.replace("wosy_case_two() != 2", "wosy_case_two() != 21")
+    runtime = runtime.replace("wosy_case_three() != 12", "wosy_case_three() != 21")
+    label = "updated descriptor value with eight exact original backing releases"
 elif sys.argv[3:] not in ([], ["named"]):
-    raise SystemExit("optional third argument must be named or all-local")
+    raise SystemExit("optional third argument must be named, all-local or named-metadata")
 
 with tempfile.TemporaryDirectory(prefix="conditional-receipt-", dir=ir_dir) as tmp:
     work = Path(tmp)

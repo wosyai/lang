@@ -1112,7 +1112,11 @@ fn structured_named_terminal_moves_descriptor_and_keeps_original_backing() {
     let mutual = text.replace("Packet incoming = factory(depth - 1, length, !choose);",
         "Packet incoming = peer(depth - 1, length, !choose);")
         .replace("u64(u64, bool) drive", "Packet(u64, u64, bool) peer = fn(depth, length, choose) {\n    Packet incoming = factory(depth, length, choose);\n    read_amount(&incoming.length);\n    Packet intermediate = incoming;\n    intermediate.length;\n    Packet selected = intermediate;\n    selected\n};\nu64(u64, bool) drive");
-    for (text, mutual) in [(text, false), (mutual.as_str(), true)] {
+    let updated = text.replace("        selected\n", "        selected.length = 21;\n        selected\n");
+    assert_ne!(updated, text);
+    for (text, mutual, metadata) in [(text, false, false), (mutual.as_str(), true, false),
+        (updated.as_str(), false, true)]
+    {
         for (target, target_layout) in [("native64", ScalarTargetLayout::NATIVE64), ("wasm32", ScalarTargetLayout::WASM32)] {
             for project in [false, true] {
                 let emit = |text: &str| {
@@ -1159,9 +1163,16 @@ fn structured_named_terminal_moves_descriptor_and_keeps_original_backing() {
                 let dest = factory.get_last_param().unwrap();
                 let mut received = Vec::new();
                 let mut copied = 0;
+                let mut metadata_stores = 0;
                 let mut released = Vec::new();
                 let mut incoming = Vec::new();
                 for row in factory.get_basic_blocks().into_iter().flat_map(|b| b.get_instructions()) {
+                    if row.get_opcode() == InstructionOpcode::Store
+                        && row.get_operand(0).and_then(|operand| operand.value()).filter(|value| value.is_int_value())
+                            .and_then(|value| value.into_int_value().get_zero_extended_constant()) == Some(21)
+                    {
+                        metadata_stores += 1;
+                    }
                     if row.get_opcode() == InstructionOpcode::Phi {
                         incoming.extend((0..row.get_num_operands()).filter_map(|n| row.get_operand(n)?.value()));
                     }
@@ -1179,14 +1190,16 @@ fn structured_named_terminal_moves_descriptor_and_keeps_original_backing() {
                         released.push(arg(0));
                     }
                 }
+                assert_eq!(metadata_stores, usize::from(metadata), "{target}/{project}: {ir}");
                 assert_eq!((received.len(), copied, released.len()), (2, 2, 1), "{target}/{project}: {ir}");
                 for base in received {
                     assert!(incoming.contains(&base) && !released.contains(&base), "{target}/{project}: {ir}");
                 }
                 if let Some(out) = std::env::var_os("WOSY_NAMED_FACTORY_IR_DIR") {
-                    let route = match (mutual, project) {
-                        (true, true) => "mutual-project", (true, false) => "mutual-single",
-                        (false, true) => "project", (false, false) => "single",
+                    let route = match (mutual, metadata, project) {
+                        (_, true, true) => "named-metadata-project", (_, true, false) => "named-metadata-single",
+                        (true, false, true) => "mutual-project", (true, false, false) => "mutual-single",
+                        (false, false, true) => "project", (false, false, false) => "single",
                     };
                     let out = std::path::PathBuf::from(out).join(route);
                     std::fs::create_dir_all(&out).unwrap();
@@ -1201,6 +1214,12 @@ fn structured_named_terminal_moves_descriptor_and_keeps_original_backing() {
                         "Packet intermediate = incoming;\n    length;");
                     assert!(emit(&indirect_root).expect_err("alias is not the exact root binding")
                         .contains("aggregate forwarding has no exact root binding"));
+                }
+                if metadata {
+                    let compound = text.replace("selected.length = 21;", "selected.length = length + 1;");
+                    assert_ne!(compound, text);
+                    assert!(emit(&compound).expect_err("a compound RHS is outside this exact store corridor")
+                        .contains("structured aggregate return is not closed on every result path"));
                 }
                 let unrelated = text.replace("        intermediate.length;", "        frame.length;");
                 assert_ne!(unrelated, text);

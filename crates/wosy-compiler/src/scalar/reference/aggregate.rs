@@ -43,7 +43,7 @@ pub(super) struct AggregateFlowFacts {
     mixed_arm_projection: Option<MixedArmProjection>,
     pub(super) secondary_owner_outputs: BTreeMap<CfgPointId, CfgPointId>,
     pub(super) projected_reads: BTreeMap<CfgPointId, bool>,
-    pub(super) receipt_scalar_field_writes: BTreeSet<CfgPointId>,
+    pub(super) receipt_scalar_field_writes: BTreeMap<CfgPointId, (OccurrenceOrdinal, OccurrenceOrdinal)>,
     pub(super) scalar_receipt_reads: BTreeSet<CfgPointId>,
     pub(super) scope_exits: BTreeMap<CfgPointId, BlockOrdinal>,
     pub(super) formals: BTreeMap<usize, ReferenceBindingId>,
@@ -1174,6 +1174,7 @@ pub(super) struct AggregateFlowResult {
     pub(super) conditional_input_barriers: BTreeSet<CfgPointId>,
     structured_local_backings: BTreeMap<usize, Option<(CfgPointId, CfgPointId)>>,
     direct_receipt_bindings: BTreeMap<CfgPointId, (CfgPointId, ReferenceBindingId)>,
+    scalar_receipt_writes: BTreeMap<CfgPointId, Option<(OccurrenceOrdinal, OccurrenceOrdinal, CfgPointId)>>,
     immediate_receipt_reads: BTreeMap<CfgPointId, Option<(OccurrenceOrdinal, CfgPointId, CfgPointId)>>,
     literal_array_route: Option<LiteralArrayRoute>,
     literal_array_unknown: bool,
@@ -2117,13 +2118,26 @@ impl AggregateFlowFacts {
                         {
                             *value = None;
                         }
-                    } else if self.receipt_scalar_field_writes.contains(&id) && rhs.is_none()
+                    } else if self.receipt_scalar_field_writes.contains_key(&id) && rhs.is_none()
                         && matches!(state.bindings.get(&target.binding),
                             Some((Some(Value::Aggregate { backing: backing @ OwnerSource::Call(_), field: None }), _, Some(_)))
                                 if !state.moved.contains(backing))
                     {
-                        // A checked lexical write to an ordinary scalar field
-                        // cannot replace the descriptor's backing receipt.
+                        // Associate the exact typed write with the underlying owner
+                        // only after establishing the live receipt on this edge.
+                        if matches!(sites.boundary.root_outputs.as_slice(), [RootOutputType { ty: ScalarType::Struct(_), .. }])
+                            && matches!(points.get(rhs_point.0).map(|point| &point.kind), Some(CfgPointKind::Evaluate(
+                                ScalarExpression::Boolean { .. } | ScalarExpression::Char { .. } |
+                                ScalarExpression::Integer { .. } | ScalarExpression::Float { .. })))
+                        {
+                            let Some((Some(Value::Aggregate { backing: OwnerSource::Call(producer), .. }), _, _)) =
+                                state.bindings.get(&target.binding) else { unreachable!("validated scalar receipt target") };
+                            let (rhs, destination) = self.receipt_scalar_field_writes[&id];
+                            let receipt = Some((rhs, destination, *producer));
+                            result.scalar_receipt_writes.entry(id).and_modify(|known| {
+                                if *known != receipt { *known = None; }
+                            }).or_insert(receipt);
+                        }
                     } else if let Some((value @ Some(Value::Plain(_) | Value::CheckedRawNull | Value::CheckedNullDescriptor), _, _)) = state.bindings.get_mut(&target.binding) {
                         *value = None;
                     } else if state
@@ -2788,6 +2802,7 @@ impl Body<'_> {
     // Single-receiver, same-scope whole moves preserve the original receipt.
     // A linear observation corridor may read an ordinary scalar field or
     // pass an immediate checked loan to a sealed reader of the current holder.
+    // A primitive literal store may update that holder without changing its backing.
     fn named_terminal_producer(
         &self, block: BlockOrdinal, terminal: OccurrenceOrdinal, calls: &BTreeMap<usize, CfgPointId>,
         ty: &ScalarType,
@@ -2799,6 +2814,7 @@ impl Body<'_> {
         enum Observation<'a> {
             Field(&'a ReferenceBindingId, &'a ScalarStructFieldId, ByteSpan),
             Reader(OccurrenceOrdinal),
+            Store { rhs: OccurrenceOrdinal, destination: OccurrenceOrdinal },
         }
         let facts = self.facts?;
         let mut links = Vec::new();
@@ -2819,6 +2835,18 @@ impl Body<'_> {
                     } else {
                         return None;
                     }
+                    continue;
+                }
+                if let BlockItemKind::Assignment { group } = &item.kind {
+                    let row = self.sites.assignments.get(&(group.block, group.item))?;
+                    let [rhs] = row.rhs_evaluations().as_slice() else { return None };
+                    let [slot] = row.installs().as_slice() else { return None };
+                    if !row.projected_outputs().as_slice().is_empty()
+                        || !matches!(&slot.replacement, AssignmentReplacement::Resolved(ty) if ordinary_value(ty))
+                    {
+                        return None;
+                    }
+                    observations.push(Observation::Store { rhs: rhs.expression, destination: slot.destination });
                     continue;
                 }
                 let BlockItemKind::Binding(bind) = &item.kind else { return None };
@@ -2866,6 +2894,23 @@ impl Body<'_> {
                             return None;
                         }
                         cursor = observed;
+                    }
+                    Observation::Store { rhs, destination } => {
+                        if !matches!(&observed.kind, CfgPointKind::Evaluate(
+                            ScalarExpression::Boolean { .. } | ScalarExpression::Char { .. } |
+                            ScalarExpression::Integer { .. } | ScalarExpression::Float { .. }))
+                            || observed.source_span.range != self.sites.occurrences.get(rhs.0)?.span
+                        {
+                            return None;
+                        }
+                        let write = next(observed)?;
+                        if !matches!(&write.kind, CfgPointKind::Assign { target, rhs_point, .. }
+                                if target.binding == *identity && *rhs_point == observed.id)
+                            || facts.scalar_receipt_writes.get(&write.id) != Some(&Some((rhs, destination, producer)))
+                        {
+                            return None;
+                        }
+                        cursor = write;
                     }
                     Observation::Reader(ordinal) => {
                         let CfgPointKind::Borrow { place, .. } = &observed.kind else { return None };
