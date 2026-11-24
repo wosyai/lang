@@ -5113,8 +5113,12 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                 if roots.allow_real_integer_tail_call && COLLECT && SUSPEND_CALL && suspend_integer
                     && structure.checker_direct_targets.contains_key(&slot.expression)
                 {
+                    // Only the outer symbolic return can discard the child's
+                    // exact partition without needing to compose it again.
+                    let symbolic_root = discarded_return.as_deref().copied() == Some(false)
+                        && block == structure.root && branches.is_empty();
                     if !tail.is_some_and(is_integer_type) || !terminal.is_empty()
-                        || !returns.as_ref().is_some_and(|completed| completed.is_empty())
+                        || (!symbolic_root && !returns.as_ref().is_some_and(|completed| completed.is_empty()))
                     {
                         return None;
                     }
@@ -5916,6 +5920,11 @@ impl<'a> ExactCallCursor<'a> {
     }
 
     #[cfg(feature = "internal-checker")]
+    pub(super) fn discards_symbolic_integer_return(&self) -> bool {
+        self.tail.is_some_and(is_integer_type) && self.discarded_return == Some(false)
+    }
+
+    #[cfg(feature = "internal-checker")]
     pub(super) fn allow_symbolic_contextual_bool(&mut self) {
         debug_assert!(self.projected_slot.is_none() && self.projected_pair.is_none());
         self.roots.allow_symbolic_contextual_bool = true;
@@ -6123,6 +6132,14 @@ impl<'a> ExactCallCursor<'a> {
 
     pub(super) fn resume(&mut self, effect: ExactCallEffect<'a>, caller_axis: Option<usize>, result: ActualCallResult) -> Option<()> {
         match (effect, result) {
+            #[cfg(feature = "internal-checker")]
+            (ExactCallEffect::TailInteger { ty, .. }, ActualCallResult::PartitionedInteger(pieces))
+                if caller_axis.is_some() && self.tail == Some(ty) && self.roots.allow_real_integer_tail_call
+                    && self.discards_symbolic_integer_return() && self.tail_call_result.is_none()
+                    && !pieces.is_empty() =>
+            {
+                self.tail_call_result = Some(ActualCallResult::Unit);
+            }
             #[cfg(feature = "internal-checker")]
             (ExactCallEffect::TailInteger { ty, .. }, result @ (ActualCallResult::Integer(_) | ActualCallResult::EmptyScalar)) => {
                 if caller_axis.is_some() || self.tail != Some(ty) || !self.roots.allow_real_integer_tail_call

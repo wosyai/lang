@@ -892,6 +892,11 @@ fn check_unused_module<const COLLECT: bool, const ENTRY_EVIDENCE: bool, Proof: S
             }
         }
         #[cfg(feature = "internal-checker")]
+        let symbolic_integer_tail = !Proof::ENABLED && is_integer_type(&body.boundary.results[0].ty)
+            && body.structure.blocks.get(body.structure.root.0).and_then(|block| block.items.last())
+                .is_some_and(|item| matches!(&item.kind, BlockItemKind::FinalOutput(slot)
+                    if body.structure.checker_direct_targets.contains_key(&slot.expression)));
+        #[cfg(feature = "internal-checker")]
         if COLLECT && Proof::INTEGER_RETURN_PARTITIONS
             && matches!(body.boundary.results.as_slice(), [result]
                 if matches!(result.ty, ScalarType::Unit | ScalarType::Bool)
@@ -900,7 +905,7 @@ fn check_unused_module<const COLLECT: bool, const ENTRY_EVIDENCE: bool, Proof: S
                         && !body.structure.has_ordinary_contextual_places()
                         && !body.structure.checker_has_bool_contextual_declaration))
             && (!body.structure.checker_direct_targets.is_empty() || !body.structure.checker_ordinary_directive_calls.is_empty())
-            && (ordinary_local_callers.contains(&(ordinal, item))
+            && (symbolic_integer_tail || ordinary_local_callers.contains(&(ordinal, item))
                 || !body.structure.checker_integer_call_locals.is_empty()
                 || body.structure.checker_direct_targets.keys().any(|occurrence| {
                     body.checked_call_signatures.get(occurrence).is_some_and(|signature|
@@ -916,6 +921,7 @@ fn check_unused_module<const COLLECT: bool, const ENTRY_EVIDENCE: bool, Proof: S
             };
             let mut cursor = ExactCallCursor::arbitrary_root(body, &body.boundary.results[0].ty)
                 .ok_or(ProjectCheck::Unsupported)?;
+            if symbolic_integer_tail { cursor.allow_real_integer_tail_call(); }
             if !Proof::ENABLED && body.structure.checker_has_extended_scalar_local {
                 cursor.allow_extended_scalar_locals();
             }
@@ -2193,11 +2199,36 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             (target, owner, body, signature)
         };
         #[cfg(feature = "internal-checker")]
-        if matches!(effect, ExactCallEffect::TailInteger { .. })
-            && (!ACTUAL_STARTUP || collection.is_none() || !Observer::REAL_INTEGER_TAIL_CALLS
-                || parent.source != &owner.source || self.active.contains(&target))
-        {
-            return Err(ProjectCheck::Unsupported);
+        if matches!(effect, ExactCallEffect::TailInteger { .. }) {
+            if collection.is_none() || parent.source != &owner.source || self.active.contains(&target) {
+                return Err(ProjectCheck::Unsupported);
+            }
+            if !ACTUAL_STARTUP {
+                use super::reference::{OccurrenceEdge, OccurrenceNode, OccurrenceParent, PlainNameIdentity};
+                let lexical_argument = match caller.structure.edges.get(&(
+                    OccurrenceParent::Expression(call), OccurrenceEdge::CallArgument(0),
+                )) {
+                    Some(OccurrenceNode::Expression(argument)) => {
+                        matches!(caller.prepared_plain_name(*argument), Some(PlainNameIdentity::Lexical(_)))
+                            && signature.parameters.first() == caller.structure.checked_types.expressions.get(argument)
+                    }
+                    _ => false,
+                };
+                if !lexical_argument || !parent.cursor.discards_symbolic_integer_return()
+                    || !self.observer.permits_ordinary_projected_effects()
+                    || !matches!(signature.parameters.as_slice(), [ty] if is_integer_type(ty))
+                    || !body.call_occurrences.is_empty() || !body.allocation_length_calls.is_empty()
+                    || !body.assignments.is_empty() || !body.arms.is_empty()
+                    || !body.structure.checker_directives.is_empty()
+                    || body.structure.has_ordinary_contextual_places()
+                    || body.structure.checker_has_bool_contextual_declaration
+                    || !body.structure.checker_selected_snapshots.is_empty()
+                {
+                    return Err(ProjectCheck::Unsupported);
+                }
+            } else if !Observer::REAL_INTEGER_TAIL_CALLS {
+                return Err(ProjectCheck::Unsupported);
+            }
         }
         if collection.is_some_and(|collection| parent.source != &owner.source
             && !self.completed_namespace_call(parent.source, owner, target.0, body, signature, expected, collection.visits))
@@ -16803,6 +16834,38 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
                     .eq(expected.iter().copied().map(BigInt::from)));
             }
         }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn symbolic_integer_root_tail_uses_projected_return_without_issuing_summary() {
+        let text = format!(r#"%%start
+            i8(i8) pick = fn(entry) {{
+                if (entry < 0) {{ 9 }} else {{ entry }}
+            }};
+            i8(i8) forward = fn(input) {{
+                core.require(input >= 0, {OUTPUT});
+                pick(input)
+            }};
+        %%end"#);
+        let root = source("src/main.w", "symbolic-integer-root-tail");
+        let prepared = prepare_proof_target(&root, &text).unwrap();
+        let receipt = run_closed_without_named_proofs(&prepared, ScalarCheckerScope::CurrentPackage, 1).unwrap();
+        let [failure] = receipt.directives.as_slice() else { panic!("one root requirement must fail"); };
+        let (min, max) = (BigInt::from(-128), BigInt::from(-1));
+        assert!(failure.witness.intervals_at(0, 0).unwrap().eq([(&min, &max)]));
+        let singleton = text.replace("core.require(input >= 0,", "core.narrow(input == 3,");
+        let prepared = prepare_proof_target(&root, &singleton).unwrap();
+        let receipt = run_closed_without_named_proofs(&prepared, ScalarCheckerScope::CurrentPackage, 1).unwrap();
+        assert!(receipt.directives.is_empty());
+        let literal = text.replace("pick(input)", "pick(3)");
+        let prepared = prepare_proof_target(&root, &literal).unwrap();
+        assert!(matches!(run_closed_without_named_proofs(&prepared, ScalarCheckerScope::CurrentPackage, 1),
+            Err(ProjectCheck::Unsupported)));
+        let with_obligation = text.replace("if (entry < 0)", &format!("core.require(entry >= 0, {OUTPUT}); if (entry < 0)"));
+        let prepared = prepare_proof_target(&root, &with_obligation).unwrap();
+        assert!(matches!(run_closed_without_named_proofs(&prepared, ScalarCheckerScope::CurrentPackage, 1),
+            Err(ProjectCheck::Unsupported)));
     }
 
     #[cfg(feature = "internal-checker")]

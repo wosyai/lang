@@ -1227,6 +1227,26 @@ cases.extend([
     ("conditional-scalar-binding-skips-unreached-operand",conditional_binding_narrowed,244,b"BIND-ONLY-REACHED"),
     ("conditional-scalar-binding-refuses-reached-operand",conditional_binding_narrowed.replace("core.narrow","core.require"),2,b"unsupported analysis"),
 ])
+symbolic_integer_root_tail = f"""%%start
+    i8(i8) pick = fn(entry) {{
+        if (entry < 0) {{ 9 }} else {{ entry }}
+    }};
+    i8(i8) forward = fn(input) {{
+        core.require(input >= 0, {state_report(33,"SYMBOLIC-TAIL-INPUT","input")});
+        pick(input)
+    }};
+    %%end"""
+cases.extend([
+    ("symbolic-integer-root-tail-projects-conditional-callee",symbolic_integer_root_tail,33,b"SYMBOLIC-TAIL-INPUT"),
+    ("symbolic-integer-root-tail-accepts-lexical-singleton",symbolic_integer_root_tail.replace(
+        "core.require(input >= 0,", "core.narrow(input == 3,"),0,b""),
+    ("symbolic-integer-root-tail-refuses-literal",symbolic_integer_root_tail.replace("pick(input)", "pick(3)"),
+        2,b"unsupported analysis"),
+    ("symbolic-integer-root-tail-refuses-leaf-obligation",symbolic_integer_root_tail.replace(
+        "if (entry < 0)",f"core.require(entry >= 0, {report(34,'SYMBOLIC-TAIL-LEAF')}); if (entry < 0)"),
+        2,b"unsupported analysis"),
+])
+
 integer_symbolic_root_call = f"""%%start
     i8(i8) transfer = fn(entry) {{
         if (entry < 0) {{ 13 }} else {{ entry }}
@@ -2173,6 +2193,9 @@ authored_files = {
     namespace_scalar_key: {
         "call.json": b'{"type":{"kind":"i8"},"value":7}\n',
         "state.json": b'{"type":{"kind":"i8"},"value":1}\n',
+    },
+    "symbolic-integer-root-tail-projects-conditional-callee": {
+        "state.json": b'{"type":{"kind":"i8"},"value":{"kind":"range","minimum":-128,"maximum":-1}}\n',
     },
     "integer-symbolic-root-call-preimages": {
         "state.json": b'{"type":{"kind":"i8"},"value":{"kind":"range","minimum":-128,"maximum":-1}}\n',
