@@ -8925,27 +8925,72 @@ fn typed_quantifier_binder(
 fn typed_quantifier_domain(
     quantifier: &CstNode, binder: &str, inputs: &[String], ty: &ScalarType,
 ) -> Result<IntegerSet, ProjectCheck> {
-    let mut domain = IntegerSet::from_type(ty).ok_or(ProjectCheck::Unsupported)?;
-    if let Some(guard) = quantifier.children().find(|node| node.kind() == SyntaxKind::ProofQuantifierGuard) {
-        let condition = derive_expression(&child(&guard, SyntaxKind::Expression)?);
-        let mut pending = vec![&condition];
-        while let Some(expression) = pending.pop() {
-            match expression {
-                ScalarExpression::Binary { operator: BinaryOperator::And, left, right, .. } => {
-                    pending.push(right);
-                    pending.push(left);
-                }
-                ScalarExpression::Boolean { value: false, .. } => domain = IntegerSet::default(),
-                ScalarExpression::Boolean { value: true, .. } => {}
-                expression => {
-                    let comparison = IntegerComparison::from_expression(expression).ok_or(ProjectCheck::Unsupported)?;
-                    let (operator, _, bound) = checked_literal_output_goal(comparison, binder, inputs, ty)?;
-                    domain = domain.keep(&operator, &bound).ok_or(ProjectCheck::Unsupported)?;
-                }
+    use super::{checker_flow::charge_call_work, symbolic_integer::IntegerIntersection};
+
+    let universe = IntegerSet::from_type(ty).ok_or(ProjectCheck::Unsupported)?;
+    let Some(guard) = quantifier.children().find(|node| node.kind() == SyntaxKind::ProofQuantifierGuard) else {
+        return Ok(universe);
+    };
+    let expression = child(&guard, SyntaxKind::Expression)?;
+    let mut work = 0;
+    charge_call_work(&mut work, u32::from(expression.text_range().len()) as usize / 32 + 1)
+        .ok_or(ProjectCheck::Unsupported)?;
+    // Derivation is recursive; inspect CST depth and charge before deriving the
+    // expression. Keep the existing checker depth and work budgets.
+    let mut pending = vec![(expression.clone(), 1)];
+    while let Some((node, depth)) = pending.pop() {
+        if depth > MAX_ACTUAL_CALL_DEPTH { return Err(ProjectCheck::Unsupported); }
+        for child in node.children() {
+            charge_call_work(&mut work, 1).ok_or(ProjectCheck::Unsupported)?;
+            pending.push((child, depth + 1));
+        }
+    }
+    let condition = derive_expression(&expression);
+    enum Task<'a> {
+        Visit(&'a ScalarExpression, bool),
+        Combine { union: bool },
+    }
+    let mut tasks = vec![Task::Visit(&condition, false)];
+    let mut domains = Vec::<IntegerSet>::new();
+    while let Some(task) = tasks.pop() {
+        match task {
+            Task::Visit(ScalarExpression::Unary { operator: UnaryOperator::LogicalNot, operand, .. }, negated) =>
+                tasks.push(Task::Visit(operand, !negated)),
+            Task::Visit(ScalarExpression::Binary { operator, left, right, .. }, negated)
+                if matches!(operator, BinaryOperator::And | BinaryOperator::Or) => {
+                tasks.push(Task::Combine { union: (*operator == BinaryOperator::Or) != negated });
+                tasks.push(Task::Visit(right, negated));
+                tasks.push(Task::Visit(left, negated));
+            }
+            Task::Visit(ScalarExpression::Boolean { value, .. }, negated) =>
+                domains.push(if *value != negated { universe.clone() } else { IntegerSet::default() }),
+            Task::Visit(expression, negated) => {
+                let comparison = IntegerComparison::from_expression(expression).ok_or(ProjectCheck::Unsupported)?;
+                let (operator, _, bound) = checked_literal_output_goal(comparison, binder, inputs, ty)?;
+                let relation = IntegerRelation::from_operator(&operator).ok_or(ProjectCheck::Unsupported)?;
+                domains.push(universe.keep_relation(if negated { relation.complement() } else { relation }, &bound));
+            }
+            Task::Combine { union } => {
+                let right = domains.pop().ok_or(ProjectCheck::Unsupported)?;
+                let left = domains.pop().ok_or(ProjectCheck::Unsupported)?;
+                let cost = left.interval_count().checked_add(right.interval_count())
+                    .and_then(|total| total.checked_add(1)).ok_or(ProjectCheck::Unsupported)?;
+                charge_call_work(&mut work, cost).ok_or(ProjectCheck::Unsupported)?;
+                let next = if union {
+                    left.join(right)
+                } else {
+                    match left.intersection(&right) {
+                        IntegerIntersection::Unchanged => left,
+                        IntegerIntersection::Empty => IntegerSet::default(),
+                        IntegerIntersection::Changed(changed) => changed,
+                    }
+                };
+                domains.push(next);
             }
         }
     }
-    Ok(domain)
+    let [domain] = domains.as_mut_slice() else { return Err(ProjectCheck::Unsupported); };
+    Ok(std::mem::take(domain))
 }
 
 fn authored_witness_argument(steps: &ScalarBlock) -> Result<&ScalarExpression, ProjectCheck> {
@@ -15721,6 +15766,60 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
             ] {
                 assert!(matches!(run(invalid, ScalarCheckerScope::CurrentPackage),
                     Err(ScalarOrderedCheckerOutcome::Unsupported)));
+            }
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn quantified_where_preserves_disjoint_domains_for_selected_universal_and_witness() {
+        let app = source("src/main.w", "ordered-disjoint-quantifiers");
+        for (goal, steps, failed) in [
+            ("out != index", "", ScalarModuleProofOutcome::Refuted),
+            ("exists (u8 chosen where chosen == 2 || chosen == 4) { out != chosen }", "core.witness(index);",
+                ScalarModuleProofOutcome::Unsupported),
+        ] {
+            for (entry, expected) in [(3, ScalarModuleProofOutcome::Proved), (4, failed)] {
+                let text = format!(r#"%%start
+                    u8(u8) checked = fn(value) {{ value }};
+                    proof disjoint for checked(entry) -> (out) where (entry == {entry})
+                        forall (u8 index where !(index != 2 && index != 4))
+                        ensures ({goal}) {{ {steps} }}
+                %%end"#);
+                let (_, proof) = crate::parse_proof_source(app.clone(), text, &[])
+                    .unwrap_or_else(|_| panic!("valid quantified proof"));
+                let outcomes = check_loaded_scalar_module_proofs(
+                    &["disjoint"], Vec::new(), (proof, Vec::new()), vec![app.clone()], inputs(),
+                ).unwrap();
+                assert_eq!(outcomes, [expected], "actual entry {entry}, goal {goal}");
+            }
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn public_ordered_quantified_where_reduces_exact_nonempty_domain() {
+        let app = source("src/main.w", "public-ordered-disjoint-quantifiers");
+        for entry in [1, 2] {
+            let text = format!(r#"%%start
+                u8(u8) checked = fn(value) {{ value }};
+                proof disjoint for checked(entry) -> (out) where (entry == {entry})
+                    forall (u8 index where index == 2 || !(index != 4))
+                    ensures (out < index) {{}}
+            %%end"#);
+            let (_, proof) = crate::parse_proof_source(app.clone(), text, &[])
+                .unwrap_or_else(|_| panic!("valid quantified proof"));
+            let report = check_loaded_scalar_ordered_local_proof_contexts(
+                Vec::new(), [(proof, Vec::new())], vec![app.clone()], inputs(),
+                ScalarCheckerScope::CurrentPackage, Vec::new(),
+            ).unwrap();
+            assert!(report.directives.is_empty() && report.diagnostics.is_empty());
+            if entry == 2 {
+                let failure = report.symbolic_diagnostic.unwrap();
+                assert_eq!(failure.proof.source, app);
+                assert_eq!(failure.returned, BigInt::from(entry));
+            } else {
+                assert!(report.symbolic_diagnostic.is_none());
             }
         }
     }
