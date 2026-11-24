@@ -2683,7 +2683,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                                 if matches!(place, ScalarPlace::Dereference { .. }) {
                                     return aggregate::ordinary_value(inner);
                                 }
-                                if self.has_joined_root_reborrow || *mutability != ScalarReferenceMutability::Shared
+                                if self.has_joined_root_reborrow
                                     || !matches!(direct_checked_field_base(place),
                                         Some((written, ScalarFieldReference::Resolved(field)))
                                             if written == pointer.as_ref()
@@ -2697,8 +2697,8 @@ impl<'a> ReferenceFlowBuilder<'a> {
                                     Some(PlainNameIdentity::Lexical(expected)) if expected == &binding)
                                     && self.call_sites.structure.checked_types.expressions.get(&pointer_ordinal) == Some(ty)
                                     && matches!(self.call_sites.structure.checked_types.expressions.get(&ordinal),
-                                        Some(ScalarType::CheckedReference { mutability: ScalarReferenceMutability::Shared, inner })
-                                            if inner.as_ref() == field_type)
+                                        Some(ScalarType::CheckedReference { mutability: output_mode, inner })
+                                            if output_mode == mutability && inner.as_ref() == field_type)
                             });
                             if (*mutability == ScalarReferenceMutability::Shared || !self.has_joined_root_reborrow
                                 || self.joined_mutable_child.as_ref() == Some(&binding))
@@ -7122,11 +7122,10 @@ fn joined_root_reborrow_binding<'a>(
     let CfgPointKind::ReborrowThrough { mode, place, pointer_point } = &point.kind else { return None };
     let pointer = match place {
         ScalarPlace::Dereference { pointer, .. } => pointer.as_ref(),
-        _ if *mode == ScalarReferenceMutability::Shared => match direct_checked_field_base(place)? {
+        _ => match direct_checked_field_base(place)? {
             (pointer, ScalarFieldReference::Resolved(_)) => pointer,
             _ => return None,
         },
-        _ => return None,
     };
     let CfgPointKind::Read { binding } = &points.get(pointer_point.0)?.kind else { return None };
     let ScalarExpression::Name { span, .. } = pointer else { return None };

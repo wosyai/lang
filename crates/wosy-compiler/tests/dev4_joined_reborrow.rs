@@ -14,6 +14,7 @@ enum Expected {
     LiveSelectedFieldConflict,
     LiveNestedFieldConflict,
     LiveJoinedProjectionConflict,
+    LiveMutableProjectionConflict,
     LiveSelectedIndexConflict,
     LiveDescendantConflict,
     LiveFamilyConflict,
@@ -59,12 +60,12 @@ fn check_case(text: &str, expected: Expected, witness_dir: Option<&str>) {
                     }), "{target}/{route}: {diagnostics:?}");
                 }
                 Expected::Declined => assert!(diagnostics.iter().any(|item| item.code == "B0003"), "{target}/{route}: {diagnostics:?}"),
-                Expected::LiveConflict | Expected::LiveSelectedFieldConflict | Expected::LiveNestedFieldConflict | Expected::LiveJoinedProjectionConflict | Expected::LiveSelectedIndexConflict | Expected::LiveDescendantConflict | Expected::LiveFamilyConflict | Expected::LiveMutableConflict | Expected::FrozenMutableConflict | Expected::LiveExclusiveConflict => {
+                Expected::LiveConflict | Expected::LiveSelectedFieldConflict | Expected::LiveNestedFieldConflict | Expected::LiveJoinedProjectionConflict | Expected::LiveMutableProjectionConflict | Expected::LiveSelectedIndexConflict | Expected::LiveDescendantConflict | Expected::LiveFamilyConflict | Expected::LiveMutableConflict | Expected::FrozenMutableConflict | Expected::LiveExclusiveConflict => {
                     let write = match expected {
                         Expected::FrozenMutableConflict | Expected::LiveExclusiveConflict => "*child = seen + 4",
                         Expected::LiveSelectedFieldConflict => "owner.left = 3",
                         Expected::LiveNestedFieldConflict => "owner.values[0] = 3",
-                        Expected::LiveJoinedProjectionConflict => "first.value = 3",
+                        Expected::LiveJoinedProjectionConflict | Expected::LiveMutableProjectionConflict => "first.value = 3",
                         Expected::LiveSelectedIndexConflict => "bytes[0] = 3",
                         _ => "first = 3",
                     };
@@ -75,7 +76,7 @@ fn check_case(text: &str, expected: Expected, witness_dir: Option<&str>) {
                         Expected::FrozenMutableConflict | Expected::LiveExclusiveConflict => Some((1, "child".len())),
                         Expected::LiveSelectedFieldConflict => Some(("owner.".len(), "left".len())),
                         Expected::LiveNestedFieldConflict => Some(("owner.".len(), "values".len())),
-                        Expected::LiveJoinedProjectionConflict => Some(("first.".len(), "value".len())),
+                        Expected::LiveJoinedProjectionConflict | Expected::LiveMutableProjectionConflict => Some(("first.".len(), "value".len())),
                         Expected::LiveSelectedIndexConflict => Some((0, "bytes".len())),
                         _ => None,
                     };
@@ -87,6 +88,7 @@ fn check_case(text: &str, expected: Expected, witness_dir: Option<&str>) {
                         Expected::FrozenMutableConflict => "&(*child)",
                         Expected::LiveExclusiveConflict => "&!(*child)",
                         Expected::LiveJoinedProjectionConflict => "&(*parent).value",
+                        Expected::LiveMutableProjectionConflict => "&!(*parent).value",
                         _ => "&(*parent)",
                     };
                     let child = text.find(loan).expect("child reborrow") as u32;
@@ -301,6 +303,30 @@ fn joined_struct_parent_reborrows_one_exact_scalar_field() {
         "first.value = 3;\n    u8 seen = *child;");
     assert_ne!(live, program);
     check(&live, Expected::LiveJoinedProjectionConflict);
+}
+
+#[test]
+fn joined_struct_parent_grants_one_exclusive_scalar_field() {
+    let program = joined_with_pointer_read(
+        "*child = seen + 2; *u8 frozen = &(*child); u8 read = pointer(frozen); *child = seen + 4; \
+         u8 changed = *child; u8 first_value = first.value; u8 second_value = second.value;",
+        "*value",
+    ).replace("%%start\n", "%%start\nstruct copy Pair { u8 value; u8 other; }\n")
+        .replace("u8 first = 7;\n    u8 second = 9;",
+            "Pair first = { .value = 7; .other = 1; }; Pair second = { .value = 9; .other = 2; };")
+        .replace("*!u8 parent = null;", "*!Pair parent = null;")
+        .replace("*u8 child = &(*parent);", "*!u8 child = &!(*parent).value;")
+        .replace("    seen\n",
+            "    if (first.other == 1 && second.other == 2 && read == seen + 2 && changed == seen + 4) { if (choose) { if (first_value == 11 && second_value == 9) { seen } else { 0 } } else { if (first_value == 7 && second_value == 13) { seen } else { 0 } } } else { 0 }\n");
+    check_case(&program, Expected::Valid, Some("WOSY_JOINED_MUTABLE_PROJECTION_IR_DIR"));
+
+    let live = program.replace("u8 seen = *child;", "first.value = 3; u8 seen = *child;");
+    assert_ne!(live, program);
+    check(&live, Expected::LiveMutableProjectionConflict);
+    let frozen = program.replace("u8 read = pointer(frozen); *child = seen + 4;",
+        "*child = seen + 4; u8 read = pointer(frozen);");
+    assert_ne!(frozen, program);
+    check(&frozen, Expected::FrozenMutableConflict);
 }
 
 #[test]
