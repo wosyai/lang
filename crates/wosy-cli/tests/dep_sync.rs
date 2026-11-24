@@ -1153,3 +1153,171 @@ fn manifest_patches_add_retire_and_restore_repository_siblings() {
     expect_success(&wosy(&project, &["build"]));
     expect_success(&wosy(&project, &["run"]));
 }
+
+#[test]
+fn run_rejects_artifacts_built_with_the_old_namespace_root_rule() {
+    let fixture = Fixture::new();
+    let project = fixture.project("legacy_namespace", "remote_lib", ".");
+    let manifest_path = project.join("wosy.toml");
+    let mut manifest = read_toml(&manifest_path);
+    manifest.as_table_mut().remove("dependencies");
+    let bare = manifest.to_string();
+    manifest["package"]["source_root"] = toml_edit::value("src");
+    let explicit = manifest.to_string();
+    fs::write(
+        project.join("src/main.w"),
+        "%%start\nmath = namespace app \"library.w\";\ni32 value = math.value;\n%%end\n",
+    )
+    .unwrap();
+    let decoy = project.join("library.w");
+    fs::write(&decoy, LOCAL_SOURCE).unwrap();
+    let artifact_path = stub_artifact(&project).join("artifact-manifest.json");
+
+    if let Some(legacy_wosy) = std::env::var_os("WOSY_TEST_PRE_NAMESPACE_ROOT_BIN") {
+        // An isolated review can supply the exact parent binary, built once
+        // before the final candidate in the shared target.
+        fs::write(&manifest_path, &explicit).unwrap();
+        for args in [["build"], ["run"]] {
+            expect_success(&Command::new(&legacy_wosy)
+                .current_dir(&project)
+                .args(args)
+                .output()
+                .unwrap());
+        }
+    } else {
+        // Reproduce an actual old-routed artifact without a second binary:
+        // build under unchanged bare-manifest routing, then put the former
+        // configuration identity for the explicit manifest on that artifact.
+        fs::write(&manifest_path, &bare).unwrap();
+        expect_success(&wosy(&project, &["build"]));
+        expect_success(&wosy(&project, &["run"]));
+        let mut artifact = load_artifact_manifest(&artifact_path).unwrap();
+        assert_eq!(
+            artifact.identity.configuration_identity,
+            blake3::hash(bare.as_bytes()).to_hex().as_str(),
+        );
+        artifact.identity.configuration_identity = blake3::hash(explicit.as_bytes()).to_hex().to_string();
+        fs::write(
+            &artifact_path,
+            serde_json::to_vec_pretty(&artifact).unwrap(),
+        )
+        .unwrap();
+        fs::write(&manifest_path, &explicit).unwrap();
+    }
+    let artifact = load_artifact_manifest(&artifact_path).unwrap();
+    assert_eq!(
+        artifact.identity.configuration_identity,
+        blake3::hash(explicit.as_bytes()).to_hex().as_str(),
+    );
+    assert!(artifact.source_observations.iter().any(|entry| {
+        entry.source.path.as_path() == Path::new("library.w")
+            && entry.content_revision.0 == blake3::hash(LOCAL_SOURCE).to_hex().as_str()
+    }));
+    assert_eq!(fs::read(&decoy).unwrap(), LOCAL_SOURCE);
+    assert!(!project.join("src/library.w").exists());
+
+    // Neither the old artifact nor the old unqualified filesystem fallback
+    // is valid now, even though the legacy observation is still unchanged.
+    expect_error(&wosy(&project, &["run"]), "artifact manifest is stale");
+    expect_error(
+        &wosy(&project, &["build"]),
+        "M0001: missing module app::library.w",
+    );
+}
+
+#[test]
+fn stdlib_resolves_the_same_modules_in_selected_local_and_locked_packages() {
+    let fixture = Fixture::new();
+    let (upstream, _) = fixture.origin("packages/remote_lib", "remote_lib");
+    let stdlib = upstream.join("stdlib");
+    fs::create_dir_all(stdlib.join("src/wasi")).unwrap();
+    fs::write(
+        stdlib.join("src/bootstrap.w"),
+        include_str!("../../../stdlib/src/bootstrap.w"),
+    )
+    .unwrap();
+    fs::write(
+        stdlib.join("src/wasi/preview1.w"),
+        include_str!("../../../stdlib/src/wasi/preview1.w"),
+    )
+    .unwrap();
+
+    let consumer = fixture.project("consumer", "remote_lib", "packages/remote_lib");
+    let consumer_manifest = consumer.join("wosy.toml");
+    let mut manifest = read_toml(&consumer_manifest);
+    manifest.as_table_mut().remove("dependencies");
+    manifest["targets"]["app"]["artifacts"]["main"]["profiles"]["dev"]["output"] =
+        toml_edit::value("wasm-wasip1");
+    fs::write(&consumer_manifest, manifest.to_string()).unwrap();
+    // Reuse the existing ordinary-stdlib client. The test is about package
+    // loading, not compiler lowering of an owning return into global storage.
+    let source = include_str!(
+        "../../../tests/fixtures/build/shared_stdlib_local_dependency/project/src/main.w"
+    );
+    fs::write(consumer.join("src/main.w"), source).unwrap();
+
+    // Select a target within the real stdlib package using the fixture's
+    // builder and runner. The target root remains project-relative; the same
+    // namespace bindings run unchanged when std is a dependency.
+    let mut std_manifest = include_str!("../../../stdlib/wosy.toml")
+        .parse::<DocumentMut>()
+        .unwrap();
+    std_manifest["package"]["default_target"] = toml_edit::value("app");
+    for table in ["comments", "builders", "runners", "targets"] {
+        std_manifest[table] = manifest[table].clone();
+    }
+    fs::write(stdlib.join("wosy.toml"), std_manifest.to_string()).unwrap();
+    fs::write(stdlib.join("src/main.w"), source).unwrap();
+    let revision = commit(&upstream, "Record the ordinary standard-library package");
+
+    // A project-root lookalike must not shadow the declared namespace root.
+    fs::write(stdlib.join("bootstrap.w"), "invalid base source").unwrap();
+    let own_artifact = stub_artifact(&stdlib);
+    expect_success(&wosy(&stdlib, &["build"]));
+    expect_success(&wosy(&stdlib, &["run"]));
+
+    let local_consumer = fixture.project("local_consumer", "remote_lib", ".");
+    fs::copy(&consumer_manifest, local_consumer.join("wosy.toml")).unwrap();
+    fs::write(local_consumer.join("src/main.w"), source).unwrap();
+    expect_success(&wosy(&local_consumer, &["dep", "add", "../upstream/stdlib"]));
+    expect_success(&wosy(&local_consumer, &["dep", "sync"]));
+    assert!(!local_consumer.join("deps/std").exists());
+    let local_artifact = stub_artifact(&local_consumer);
+    expect_success(&wosy(&local_consumer, &["build"]));
+    expect_success(&wosy(&local_consumer, &["run"]));
+
+    expect_success(&wosy(&consumer, &[
+        "dep", "add", "../upstream", "--path", "stdlib/wosy.toml",
+    ]));
+    let lock = read_toml(&consumer.join("wosy.lock"));
+    assert_eq!(lock["packages"]["std"]["path"].as_str(), Some("stdlib"));
+    assert_eq!(lock["packages"]["std"]["rev"].as_str(), Some(revision.as_str()));
+    expect_success(&wosy(&consumer, &["dep", "sync"]));
+    let dependency_root = consumer.join("deps/std");
+    assert!(!dependency_root.join("bootstrap.w").exists());
+    let consumer_artifact = stub_artifact(&consumer);
+    expect_success(&wosy(&consumer, &["build"]));
+    expect_success(&wosy(&consumer, &["run"]));
+
+    let observations = |artifact: &Path, package_root: &Path| {
+        let manifest = load_artifact_manifest(&artifact.join("artifact-manifest.json")).unwrap();
+        let mut modules = Vec::new();
+        for entry in manifest.source_observations {
+            if entry.source.package == "std" && entry.source.path.as_path() != Path::new("src/main.w") {
+                assert_eq!(
+                    Path::new(&entry.source.project).canonicalize().unwrap(),
+                    package_root.canonicalize().unwrap(),
+                );
+                modules.push((entry.source.path.as_path().to_owned(), entry.content_revision));
+            }
+        }
+        modules
+    };
+    let standalone = observations(&own_artifact, &stdlib);
+    assert_eq!(standalone.iter().map(|(path, _)| path.as_path()).collect::<Vec<_>>(), [
+        Path::new("src/bootstrap.w"),
+        Path::new("src/wasi/preview1.w"),
+    ]);
+    assert_eq!(observations(&local_artifact, &stdlib), standalone);
+    assert_eq!(observations(&consumer_artifact, &dependency_root), standalone);
+}

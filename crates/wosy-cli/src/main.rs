@@ -5,7 +5,6 @@ use codespan_reporting::term;
 use codespan_reporting::term::termcolor::{ColorChoice, StandardStream};
 #[cfg(test)]
 use serde::Deserialize;
-use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs;
@@ -23,9 +22,10 @@ use wosy_compiler::{
 };
 use wosy_project::{
     artifact_manifest_path, discover_root, load_artifact_manifest, load_reachable_source_graph,
-    publish_artifact, ArtifactIdentity, ContentRevision, NamespaceEdgeInput, PackageRelativePath,
-    ProjectConfiguration, ProjectContext, SourceIdentity as ProjectSourceIdentity, SourceNodeInput,
-    SourceObservation, SourceSpan as ProjectSourceSpan,
+    publish_artifact, ArtifactIdentity, ContentRevision, NamespaceEdgeInput, NamespacePackages,
+    PackageRelativePath, ProjectConfiguration, ProjectContext,
+    SourceIdentity as ProjectSourceIdentity, SourceNodeInput, SourceObservation,
+    SourceSpan as ProjectSourceSpan,
 };
 #[cfg(test)]
 use wosy_compiler::parse_source;
@@ -290,8 +290,20 @@ fn project_configuration_identity(
     manifest: &[u8],
     configuration: &ProjectConfiguration,
 ) -> Result<String, String> {
+    let manifest_identity = blake3::hash(manifest);
+    // A manifest that declared source_root used to route its own namespaces
+    // from the project root. Do not accept a pre-change artifact that observed
+    // those other files, even if they still exist with the original bytes.
+    let manifest_identity = if configuration.module_source_root.is_some() {
+        blake3::Hasher::new()
+            .update(b"wosy-selected-package-namespace-root-v1\0")
+            .update(manifest_identity.as_bytes())
+            .finalize()
+    } else {
+        manifest_identity
+    };
     if configuration.resolved_packages.is_empty() {
-        return Ok(blake3::hash(manifest).to_hex().to_string());
+        return Ok(manifest_identity.to_hex().to_string());
     }
     fn field(hasher: &mut blake3::Hasher, bytes: &[u8]) {
         hasher.update(&(bytes.len() as u64).to_le_bytes());
@@ -299,7 +311,7 @@ fn project_configuration_identity(
     }
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"wosy-package-closure-v2\0");
-    hasher.update(blake3::hash(manifest).as_bytes());
+    hasher.update(manifest_identity.as_bytes());
     hasher.update(&(configuration.resolved_packages.len() as u64).to_le_bytes());
     for (name, package) in &configuration.resolved_packages {
         let source_root: std::path::PathBuf = package.identity.path.as_path().components()
@@ -433,6 +445,11 @@ fn compile_project(
 ) -> Result<(LlvmPartition, Vec<SourceObservation>), String> {
     let root_path = PackageRelativePath::new(project.source_root.clone())?;
     let root_project = root.to_string_lossy().into_owned();
+    let packages = NamespacePackages {
+        root_name: &project.package,
+        root_source: configuration.module_source_root.as_ref(),
+        dependencies: &configuration.resolved_packages,
+    };
     let mut discovered = HashMap::from([(
         project.package.as_str(),
         HashSet::from([root_path.clone()]),
@@ -489,33 +506,24 @@ fn compile_project(
             let module_path = serde_json::from_str::<String>(&namespace.path)
                 .map_err(|error| format!("invalid namespace path: {error}"))?;
             let module_path = PackageRelativePath::new(module_path.into())?;
-            let (target_package, target_root, target_path) = if namespace.package == project.package {
-                (project.package.as_str(), root, Cow::Borrowed(&module_path))
-            } else {
-                let (package, resolved) = configuration
-                    .resolved_packages
-                    .get_key_value(&namespace.package)
-                    .ok_or_else(|| format!("dependency package {} is missing", namespace.package))?;
-                let target_path = PackageRelativePath::new(
-                    resolved.identity.path.as_path().join(module_path.as_path()),
-                )?;
-                (
-                    package.as_str(),
-                    resolved.project_root.as_path(),
-                    Cow::Owned(target_path),
-                )
-            };
+            let module = packages
+                .resolve(&namespace.package, &module_path)
+                .ok_or_else(|| format!("dependency package {} is missing", namespace.package))?;
+            let target_package = module.package;
             let already_discovered = discovered
                 .get(target_package)
-                .is_some_and(|paths| paths.contains(target_path.as_ref()));
+                .is_some_and(|paths| paths.contains(module.path.as_ref()));
             if !already_discovered {
                 let available = if let Some((_, checkout)) = configuration.git_package(target_package)? {
-                    checkout.source(target_path.as_path())?.map(Some)
+                    checkout.source(module.path.as_path())?.map(Some)
                 } else {
-                    target_root.join(target_path.as_path()).is_file().then_some(None)
+                    let target_root = module
+                        .dependency
+                        .map_or(root, |resolved| resolved.project_root.as_path());
+                    target_root.join(module.path.as_path()).is_file().then_some(None)
                 };
                 if let Some(checked_git_source) = available {
-                    let target_path = target_path.into_owned();
+                    let target_path = module.path.into_owned();
                     discovered
                         .entry(target_package)
                         .or_default()
@@ -558,13 +566,7 @@ fn compile_project(
     drop((discovered, pending));
 
     let root_node = root_node.ok_or_else(|| "project root source is missing".to_owned())?;
-    let graph = load_reachable_source_graph(
-        &project.package,
-        root_node,
-        nodes,
-        &configuration.resolved_packages,
-    )
-    .map_err(|error| {
+    let graph = load_reachable_source_graph(&packages, root_node, nodes).map_err(|error| {
         render_graph_diagnostics(&error, &texts);
         format_graph_error(error)
     })?;
@@ -1081,6 +1083,7 @@ mod tests {
         };
         let configuration = ProjectConfiguration {
             default_target: "app".to_owned(),
+            module_source_root: None,
             builders: BTreeMap::new(),
             runners: BTreeMap::new(),
             targets: BTreeMap::new(),

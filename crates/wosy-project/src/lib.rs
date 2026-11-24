@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 use std::fs;
@@ -243,11 +244,52 @@ impl GraphLoadError {
     }
 }
 
+/// Maps a base namespace path to a package-relative module path. Discovery and
+/// graph construction use the same mapping, including for the selected package.
+pub struct NamespacePackages<'a> {
+    pub root_name: &'a str,
+    pub root_source: Option<&'a PackageRelativePath>,
+    pub dependencies: &'a BTreeMap<String, ResolvedPackage>,
+}
+
+pub struct NamespaceModule<'a, 'p> {
+    pub package: &'a str,
+    pub dependency: Option<&'a ResolvedPackage>,
+    pub path: Cow<'p, PackageRelativePath>,
+}
+
+impl<'a> NamespacePackages<'a> {
+    pub fn resolve<'p>(
+        &self,
+        origin: &str,
+        path: &'p PackageRelativePath,
+    ) -> Option<NamespaceModule<'a, 'p>> {
+        let (package, dependency, source_root) = if origin == self.root_name {
+            (
+                self.root_name,
+                None,
+                self.root_source.filter(|root| root.as_path() != Path::new(".")),
+            )
+        } else {
+            let (name, resolved) = self.dependencies.get_key_value(origin)?;
+            (name.as_str(), Some(resolved), Some(&resolved.identity.path))
+        };
+        let path = match source_root.map(PackageRelativePath::as_path) {
+            Some(root) => Cow::Owned(PackageRelativePath::new(root.join(path.as_path())).ok()?),
+            _ => Cow::Borrowed(path),
+        };
+        Some(NamespaceModule {
+            package,
+            dependency,
+            path,
+        })
+    }
+}
+
 pub fn load_reachable_source_graph(
-    package: &str,
+    packages: &NamespacePackages<'_>,
     root: SourceNodeInput,
     available: Vec<SourceNodeInput>,
-    resolved_packages: &BTreeMap<String, ResolvedPackage>,
 ) -> Result<SourceGraph, GraphLoadError> {
     let root_key = source_key(&root.source);
     let root_span = SourceSpan {
@@ -267,10 +309,9 @@ pub fn load_reachable_source_graph(
     let mut node_by_path = HashMap::new();
     let mut stack = Vec::new();
     visit_source(
-        package,
+        packages,
         &root_key,
         &sources,
-        resolved_packages,
         &mut graph,
         &mut node_by_path,
         &mut stack,
@@ -281,10 +322,9 @@ pub fn load_reachable_source_graph(
 }
 
 fn visit_source(
-    package: &str,
+    packages: &NamespacePackages<'_>,
     key: &(String, String, PackageRelativePath),
     sources: &BTreeMap<(String, String, PackageRelativePath), SourceNodeInput>,
-    resolved_packages: &BTreeMap<String, ResolvedPackage>,
     graph: &mut SourceGraph,
     node_by_path: &mut HashMap<(String, String, PackageRelativePath), SourceNodeId>,
     stack: &mut Vec<SourceNodeId>,
@@ -338,24 +378,21 @@ fn visit_source(
     stack.push(id);
 
     for edge in &source.namespace_edges {
-        let (target_project, target_path) = if edge.origin == package {
-            (source.source.project.as_str(), edge.path.clone())
-        } else {
-            let resolved = resolved_packages
-                .get(&edge.origin)
-                .ok_or_else(|| GraphLoadError::missing(edge, edge.path.clone()))?;
-            let target_path = PackageRelativePath::new(
-                resolved.identity.path.as_path().join(edge.path.as_path()),
-            )
-            .map_err(|_| GraphLoadError::missing(edge, edge.path.clone()))?;
-            (resolved.identity.project.as_str(), target_path)
-        };
-        let target_key = source_key_parts(target_project, &edge.origin, target_path);
+        let module = packages
+            .resolve(&edge.origin, &edge.path)
+            .ok_or_else(|| GraphLoadError::missing(edge, edge.path.clone()))?;
+        // A root qualifier belongs only to the root project's own sources.
+        // Do not make an importing dependency's use of it reach back into the
+        // consumer; retain the importer's project identity in that case.
+        let target_project = module.dependency.map_or(
+            source.source.project.as_str(),
+            |resolved| resolved.identity.project.as_str(),
+        );
+        let target_key = source_key_parts(target_project, module.package, module.path.into_owned());
         let target = visit_source(
-            package,
+            packages,
             &target_key,
             sources,
-            resolved_packages,
             graph,
             node_by_path,
             stack,
@@ -466,6 +503,10 @@ pub struct TargetConfig {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ProjectConfiguration {
     pub default_target: String,
+    /// Base namespace paths for this package use this directory. Old root
+    /// manifests without [package].source_root use paths from the project root.
+    #[serde(default)]
+    pub module_source_root: Option<PackageRelativePath>,
     pub builders: std::collections::BTreeMap<String, BuilderConfig>,
     pub runners: std::collections::BTreeMap<String, RunnerConfig>,
     pub targets: std::collections::BTreeMap<String, TargetConfig>,
@@ -487,6 +528,16 @@ impl ProjectConfiguration {
             .and_then(Item::as_table)
             .ok_or_else(|| "package is missing".to_owned())?;
         let package_name = scalar_string(package, "name")?;
+        let module_source_root = package
+            .get("source_root")
+            .map(|root| {
+                let root = root
+                    .as_str()
+                    .ok_or_else(|| "package.source_root must be a string".to_owned())?;
+                PackageRelativePath::new(root.into())
+                    .map_err(|error| format!("invalid package.source_root: {error}"))
+            })
+            .transpose()?;
         let dependencies = project_dependencies(root, &package_name, &document)?;
         let resolved_packages = packages::resolve_installed(&snapshot, root, &package_name, &dependencies)?;
         let default_target = scalar_string(package, "default_target")?;
@@ -520,6 +571,7 @@ impl ProjectConfiguration {
         Ok((
             Self {
                 default_target,
+                module_source_root,
                 builders,
                 runners,
                 targets,
@@ -1321,6 +1373,7 @@ mod tests {
         );
         let invalid = ProjectConfiguration {
             default_target: "missing".to_owned(),
+            module_source_root: None,
             builders: BTreeMap::new(),
             runners: BTreeMap::new(),
             targets: BTreeMap::new(),
@@ -1456,6 +1509,22 @@ mod tests {
         }
     }
 
+    fn app_graph(
+        root: SourceNodeInput,
+        available: Vec<SourceNodeInput>,
+        dependencies: &BTreeMap<String, ResolvedPackage>,
+    ) -> Result<SourceGraph, GraphLoadError> {
+        load_reachable_source_graph(
+            &NamespacePackages {
+                root_name: "app",
+                root_source: None,
+                dependencies,
+            },
+            root,
+            available,
+        )
+    }
+
     #[test]
     fn reachable_graph_visits_edges_in_source_order_once() {
         let root = source(
@@ -1465,8 +1534,7 @@ mod tests {
                 edge("src/main.w", "src/math.w", "again"),
             ],
         );
-        let graph = load_reachable_source_graph(
-            "app",
+        let graph = app_graph(
             root,
             vec![source("src/math.w", Vec::new())],
             &BTreeMap::new(),
@@ -1496,8 +1564,7 @@ mod tests {
         first.content_revision = ContentRevision("first".to_owned());
         let mut last = source("src/main.w", vec![edge("src/main.w", "src/math.w", "last")]);
         last.content_revision = ContentRevision("last".to_owned());
-        let graph = load_reachable_source_graph(
-            "app",
+        let graph = app_graph(
             root,
             vec![first, source("src/math.w", Vec::new()), last],
             &BTreeMap::new(),
@@ -1515,8 +1582,7 @@ mod tests {
     #[test]
     fn missing_module_has_typed_m0001_requesting_span() {
         let root = source("src/main.w", vec![edge("src/main.w", "src/math.w", "math")]);
-        let error = load_reachable_source_graph("app", root, Vec::new(), &BTreeMap::new())
-            .expect_err("missing");
+        let error = app_graph(root, Vec::new(), &BTreeMap::new()).expect_err("missing");
 
         assert_eq!(error.diagnostics.len(), 1);
         match &error.diagnostics[0] {
@@ -1578,8 +1644,7 @@ mod tests {
             },
         );
 
-        let graph = load_reachable_source_graph("app", root, vec![dependency], &resolved)
-            .expect("package-qualified graph");
+        let graph = app_graph(root, vec![dependency], &resolved).expect("package-qualified graph");
 
         assert_eq!(graph.nodes.len(), 2);
         assert_eq!(graph.nodes[0].namespace_edges[0].target, SourceNodeId(1));
@@ -1591,8 +1656,7 @@ mod tests {
     fn cycle_has_typed_m0003_participating_sources() {
         let root = source("src/main.w", vec![edge("src/main.w", "src/math.w", "math")]);
         let math = source("src/math.w", vec![edge("src/math.w", "src/main.w", "main")]);
-        let error = load_reachable_source_graph("app", root, vec![math], &BTreeMap::new())
-            .expect_err("cycle");
+        let error = app_graph(root, vec![math], &BTreeMap::new()).expect_err("cycle");
 
         match &error.diagnostics[0] {
             GraphDiagnostic::Cycle(diagnostic) => {
