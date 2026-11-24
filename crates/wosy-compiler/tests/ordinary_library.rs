@@ -1394,6 +1394,18 @@ fn lexical_conditional_owner_choice_releases_selected_original_after_read() {
         .replace("consume(chosen) + observed", "consume(returned) + observed");
     assert_ne!(read_recommitted_release, recommitted_release);
     assert_ne!(read_recommitted_consume, saved_then_consumed);
+    let interleaved_release = read_recommitted_release
+        .replace("    Packet moved = first_relay", "    u64 prior = read_selected(&chosen);\n    Packet moved = first_relay")
+        .replace("    read_selected(&returned)", "    u64 subsequent = read_selected(&returned);\n    prior + subsequent")
+        .replace("drive(0, false) }", "if (drive(0, false) == 24) { 12 } else { 0 } }")
+        .replace("drive(2, true) }", "if (drive(2, true) == 4) { 2 } else { 0 } }")
+        .replace("drive(3, true) }", "if (drive(3, true) == 24) { 12 } else { 0 } }");
+    let interleaved_consume = read_recommitted_consume
+        .replace("    Packet moved = first_relay", "    u64 prior = read_selected(&chosen.length);\n    Packet moved = first_relay")
+        .replace("consume(returned) + observed", "consume(returned) + (prior + observed)")
+        .replace("== 24", "== 36").replace("== 4) { 2", "== 6) { 2");
+    assert_ne!(interleaved_release, read_recommitted_release);
+    assert_ne!(interleaved_consume, read_recommitted_consume);
     let forwarding = |consume: &str| saved_then_consumed.replace(
         "u64(Packet) consume = fn(packet) { packet.length };",
         &format!("u64(Packet) terminal = fn(packet) {{ packet.length }};\n\
@@ -1470,6 +1482,8 @@ fn lexical_conditional_owner_choice_releases_selected_original_after_read() {
         (recommitted_consume.as_str(), "consume-after-recommit"),
         (read_recommitted_release.as_str(), "release-after-read-recommit"),
         (read_recommitted_consume.as_str(), "consume-after-read-recommit"),
+        (interleaved_release.as_str(), "release-interleaved-read-recommit"),
+        (interleaved_consume.as_str(), "consume-interleaved-read-recommit"),
         (borrowed_then_consumed.as_str(), "consume-after-borrow"),
         (saved_then_consumed.as_str(), "consume-after-saved-borrow"),
         (through_calls.as_str(), "consume-after-forwarded-borrow"),
@@ -1488,6 +1502,7 @@ fn lexical_conditional_owner_choice_releases_selected_original_after_read() {
         let consuming = base_use.starts_with("consume");
         let recommitting = base_use.ends_with("-recommit");
         let reading_recommit = base_use.ends_with("-read-recommit");
+        let interleaved = base_use.contains("-interleaved-");
         let releases_saved = matches!(base_use, "release-after-saved-borrows" | "release-after-scalar-continuation");
         let multiple = releases_saved || base_use == "consume-after-multiple-borrows";
         let updates_metadata = base_use == "consume-after-metadata-write";
@@ -1531,7 +1546,8 @@ fn lexical_conditional_owner_choice_releases_selected_original_after_read() {
                 let mut recommitted = Vec::new();
                 let reader = borrowing.then(|| find("read_selected"));
                 let whole_reader = multiple.then(|| find("read_whole"));
-                let mut expected_readers = whole_reader.into_iter().chain(reader);
+                let mut expected_readers = whole_reader.into_iter()
+                    .chain(reader.filter(|_| interleaved)).chain(reader);
                 let mut reader_seen = false;
                 let mut transfers = Vec::new();
                 let mut writes = Vec::new();
@@ -1569,7 +1585,10 @@ fn lexical_conditional_owner_choice_releases_selected_original_after_read() {
                         }
                     } else if Some(callee) == reader || Some(callee) == whole_reader {
                         assert_eq!(expected_readers.next(), Some(callee), "every authored loan is observed in order");
-                        assert!(!recommitting || recommitted.len() == 2, "read only after both exact relay returns");
+                        if recommitting {
+                            let expected_relays = if interleaved && !reader_seen { 0 } else { 2 };
+                            assert_eq!(recommitted.len(), expected_relays, "each read must be on its exact side of the relay chain");
+                        }
                         assert_eq!(call.count_arguments(), 1, "a reader never receives the owning sidecar");
                         assert_eq!(arg(0).into_int_value().get_type().get_bit_width(), target_layout.pointer_size as u32 * 8);
                         reader_seen = Some(callee) == reader;

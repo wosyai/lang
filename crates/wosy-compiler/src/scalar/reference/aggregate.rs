@@ -2885,55 +2885,17 @@ impl Body<'_> {
         let mut holder = holder;
         let mut current_producer = None;
         let mut recommits = Vec::new();
-        let mut before_consume = before_consume;
-        // A selected backing may pass through a prefix of ordinary identity
-        // returns. Each step consumes the preceding lexical binding and
-        // immediately installs the unchanged descriptor in a fresh binding.
-        while let Some((BlockItem { kind: BlockItemKind::Binding(step), .. }, rest)) = before_consume.split_first() {
-            let [next_receiver] = step.receivers() else { break };
-            let BindingInitialization::Outputs(step_init) = &step.initialization else { break };
-            if next_receiver.ty != receiver.ty { break; }
-            let signature = self.sites.checked_call_signatures.get(&step_init.primary)?;
-            let [returned] = signature.outputs.outputs.as_slice() else { return None };
-            if !step_init.secondary.is_empty() || returned.ty != receiver.ty
-                || structure.checked_types.expressions.get(&step_init.primary) != Some(&receiver.ty)
-            { return None; }
-            let (call, slot, moved) = exact_owning_call_arguments(
-                points, read, scope, self.sites, step_init.primary, &signature.parameters, holder, &receiver.ty,
-            )?;
-            let (relay, relay_slot) = exact_relay(call.id)?;
-            let origins = facts.inputs.get(&(call.id, step_init.primary.0, slot, ArgumentProvenance::WholeMove(moved)))?;
-            let installed = next(call.id)?;
-            let CfgPointKind::Bind { binding } = &installed.kind else { return None };
-            if current_producer.is_some_and(|previous| previous >= call.id)
-                || slot != relay_slot || call.scope != scope || installed.scope != scope
-                || facts.calls.get(&call.id) != Some(&step_init.primary)
-                || facts.unproved_receipt_loans.contains_key(&call.id)
-                || !origins.iter().copied().eq([current_producer.map(|point| InputOrigin::Owner(OwnerSource::Call(point)))])
-                || !facts.direct_receipt_bindings.get(&call.id).is_some_and(|(site, holder)|
-                    *site == installed.id && holder == binding)
-                || binding == holder || binding.declaration_span != next_receiver.span
-            { return None; }
-            read = next(installed.id)?;
-            if read.scope != scope { return None; }
-            holder = binding;
-            current_producer = Some(call.id);
-            recommits.push(LocalChoiceRecommit { relay, slot, point: call.id, ordinal: step_init.primary });
-            before_consume = rest;
-        }
         // The original joined binding needs its prepared reader certificate.
         // Once recommitted, additionally require the issued loan and exact
         // current producer from ordinary receipt liveness, not the old key.
-        let certified_reader = |call, input, ordinal| {
+        let certified_reader = |producer: Option<CfgPointId>, call, input, ordinal| {
             facts.local_choice_reader_calls.get(&call) == Some(&(input, ordinal))
-                && current_producer.is_none_or(|producer|
+                && producer.is_none_or(|producer|
                     facts.immediate_receipt_reads.get(&call) == Some(&Some((ordinal, input, producer))))
         };
-        if current_producer.is_some() && alias.is_some() { return None; }
         let before_consume = if let Some((BlockItem {
             kind: BlockItemKind::Assignment { group }, ..
         }, rest)) = before_consume.split_first() {
-            if current_producer.is_some() { return None; }
             // Only a direct resolved ordinary field of the exact selected
             // descriptor may be updated. This changes metadata, never backing.
             let group = self.sites.assignments.get(&(group.block, group.item))?;
@@ -2971,14 +2933,59 @@ impl Body<'_> {
         } else {
             before_consume
         };
-        if before_consume.len() > MAX_PRE_TRANSFER_OBSERVATIONS { return None; }
-        let mut saved_observation = None;
-        for (index, step) in before_consume.iter().enumerate() {
-            // Each observation is one immediate certified noescape loan; only
-            // the last may leave an exact ordinary scalar binding.
+        // One bounded walk through authored root steps and the exact linear
+        // CFG corridor. An ordinary saved scalar has no ownership key and can
+        // survive a whole-descriptor handoff; each new loan must independently
+        // prove the holder and receipt actually current at its call.
+        if before_consume.len() > MAX_PRE_TRANSFER_OBSERVATIONS + facts.calls.len() { return None; }
+        const MAX_SAVED_OBSERVATIONS: usize = 2;
+        let mut saved_observations = [None; MAX_SAVED_OBSERVATIONS];
+        let mut saved_count = 0;
+        let mut observations = 0;
+        for step in before_consume {
+            let relay_step = match &step.kind {
+                BlockItemKind::Binding(step) => match step.receivers() {
+                    [next] if next.ty == receiver.ty => Some((step, next)),
+                    _ => None,
+                },
+                _ => None,
+            };
+            if let Some((step, next_receiver)) = relay_step {
+                let BindingInitialization::Outputs(step_init) = &step.initialization else { return None };
+                let signature = self.sites.checked_call_signatures.get(&step_init.primary)?;
+                let [returned] = signature.outputs.outputs.as_slice() else { return None };
+                if !step_init.secondary.is_empty() || returned.ty != receiver.ty
+                    || structure.checked_types.expressions.get(&step_init.primary) != Some(&receiver.ty)
+                { return None; }
+                let (call, slot, moved) = exact_owning_call_arguments(
+                    points, read, scope, self.sites, step_init.primary, &signature.parameters, holder, &receiver.ty,
+                )?;
+                let (relay, relay_slot) = exact_relay(call.id)?;
+                let origins = facts.inputs.get(&(call.id, step_init.primary.0, slot, ArgumentProvenance::WholeMove(moved)))?;
+                let installed = next(call.id)?;
+                let CfgPointKind::Bind { binding } = &installed.kind else { return None };
+                if current_producer.is_some_and(|previous| previous >= call.id)
+                    || slot != relay_slot || call.scope != scope || installed.scope != scope
+                    || facts.calls.get(&call.id) != Some(&step_init.primary)
+                    || facts.unproved_receipt_loans.contains_key(&call.id)
+                    || !origins.iter().copied().eq([current_producer.map(|point| InputOrigin::Owner(OwnerSource::Call(point)))])
+                    || !facts.direct_receipt_bindings.get(&call.id).is_some_and(|(site, holder)|
+                        *site == installed.id && holder == binding)
+                    || binding == holder || binding.declaration_span != next_receiver.span
+                { return None; }
+                read = next(installed.id)?;
+                if read.scope != scope { return None; }
+                holder = binding;
+                current_producer = Some(call.id);
+                recommits.push(LocalChoiceRecommit { relay, slot, point: call.id, ordinal: step_init.primary });
+                continue;
+            }
+            if observations == MAX_PRE_TRANSFER_OBSERVATIONS { return None; }
+            observations += 1;
+            // An immediate noescape loan may leave a scalar, never an alias.
             let (observation, saved) = match &step.kind {
                 BlockItemKind::Evaluation { expression } => (*expression, None),
-                BlockItemKind::Binding(saved) if index + 1 == before_consume.len() => {
+                BlockItemKind::Binding(saved) if saved_count < MAX_SAVED_OBSERVATIONS => {
                     let [receiver] = saved.receivers() else { return None };
                     let BindingInitialization::Outputs(init) = &saved.initialization else { return None };
                     if receiver.ty != output_ty.ty || !init.secondary.is_empty()
@@ -3005,7 +3012,7 @@ impl Body<'_> {
                 || read.source_span.range != self.sites.occurrences.get(argument.0)?.span
                 || reader.source_span.range != self.sites.occurrences.get(observation.0)?.span
                 || reader.scope != scope || !exact_local_choice_shared_borrow(place, loan, holder, descriptor, &receiver.ty, inner)
-                || !certified_reader(reader.id, read.id, observation)
+                || !certified_reader(current_producer, reader.id, read.id, observation)
                 || !matches!(&reader.kind, CfgPointKind::Call { output: 0, target: ResolvedCallTarget::ModuleCallable {
                     concrete: ConcreteCallSelection::Declaration, .. }, argument_points, .. }
                     if argument_points.as_slice() == [read.id])
@@ -3023,7 +3030,8 @@ impl Body<'_> {
                 let transfer = next(after_reader.id)?;
                 if transfer.scope != scope { return None; }
                 read = transfer;
-                saved_observation = Some(binding);
+                saved_observations[saved_count] = Some(binding);
+                saved_count += 1;
             } else {
                 read = after_reader;
             }
@@ -3037,29 +3045,23 @@ impl Body<'_> {
                     if value_point == last.id)
                 && matches!(exit.kind, CfgPointKind::ScopeExit)).then_some(exit.id)
         };
-        let saved_exit = saved_observation.and_then(|saved| {
-            if matches!(self.sites.prepared_plain_name(output.expression),
-                Some(PlainNameIdentity::Lexical(binding)) if binding == saved)
-                && matches!(&read.kind, CfgPointKind::Read { binding } if binding == saved)
-            {
-                return end_use(read);
-            }
-            // A closed ordinary continuation consumes only the saved scalar
-            // and literal operands. Match its exact linear postfix CFG with
-            // a bounded operand-depth counter, not a second ownership walk.
+        // Only the bounded immutable scalars issued by certified observations
+        // and literal operands may enter this exact postfix continuation.
+        let scalar_tail = |start: CfgPointId, expression: OccurrenceOrdinal, terminal: &dyn Fn(&ReferenceFlowPoint) -> bool| {
             const MAX_SAVED_SCALAR_POINTS: usize = 16;
-            let authored = self.sites.occurrences.get(output.expression.0)?.span;
-            let mut cursor = read;
+            let authored = self.sites.occurrences.get(expression.0)?.span;
+            let mut cursor = points.get(start.0)?;
             let mut depth = 0usize;
-            let mut observed = false;
+            let mut observed = 0u8;
             for _ in 0..MAX_SAVED_SCALAR_POINTS {
                 let span = cursor.source_span.range;
                 if cursor.scope != scope || span.start < authored.start || span.end > authored.end {
                     return None;
                 }
                 let arity = match &cursor.kind {
-                    CfgPointKind::Read { binding } if binding == saved => {
-                        observed = true;
+                    CfgPointKind::Read { binding } => {
+                        let slot = saved_observations.iter().position(|saved| *saved == Some(binding))?;
+                        observed |= 1 << slot;
                         0
                     }
                     CfgPointKind::Evaluate(ScalarExpression::Boolean { .. } | ScalarExpression::Char { .. }
@@ -3077,14 +3079,19 @@ impl Body<'_> {
                 };
                 depth = depth.checked_sub(arity)? + 1;
                 let successor = next(cursor.id)?;
-                if matches!(successor.kind, CfgPointKind::ReturnOutput { .. }) {
-                    return (observed && depth == 1).then(|| end_use(cursor)).flatten();
+                if terminal(successor) {
+                    return (observed == (1 << saved_count) - 1 && depth == 1).then_some(cursor.id);
                 }
                 cursor = successor;
             }
             None
-        });
-        let scalar_call = if saved_observation.is_some() && saved_exit.is_none() {
+        };
+        let saved_exit = if saved_count == 0 { None } else {
+            let last = scalar_tail(read.id, output.expression, &|p|
+                matches!(p.kind, CfgPointKind::ReturnOutput { .. }));
+            last.and_then(|id| end_use(&points[id.0]))
+        };
+        let scalar_call = if saved_count > 0 && saved_exit.is_none() {
             let OccurrenceNode::Expression(left) = *structure.edges.get(&(
                 OccurrenceParent::Expression(output.expression), OccurrenceEdge::BinaryLeft,
             ))? else { return None };
@@ -3098,7 +3105,7 @@ impl Body<'_> {
             // caller and is discharged at the existing lexical exit.
             LocalChoiceUse::Observe(exit)
         } else if let Some((observed, field)) = self.sites.prepared_lexical_member(output.expression) {
-            if alias.is_some() || !before_consume.is_empty() || observed != holder || &field.structure != descriptor
+            if alias.is_some() || observations != 0 || observed != holder || &field.structure != descriptor
                 || !matches!(&read.kind, CfgPointKind::ReadPlace { pointer_point: None, reads_origin: false,
                     candidates, .. } if matches!(candidates.as_slice(), [place] if &place.binding == holder &&
                         matches!(place.projections.as_slice(),
@@ -3118,7 +3125,7 @@ impl Body<'_> {
                 ))? else { return None };
                 let argument_span = self.sites.occurrences.get(argument.0)?.span;
                 let CfgPointKind::Borrow { place, loan } = &read.kind else { return None };
-                if !before_consume.is_empty()
+                if observations != 0
                     || structure.checked_types.expressions.get(&argument) != Some(parameter)
                     || !exact_local_choice_shared_borrow(place, loan, holder, descriptor, &receiver.ty, inner)
                 { return None; }
@@ -3144,7 +3151,7 @@ impl Body<'_> {
                 };
                 let reader = next(input.id)?;
                 if read.source_span.range != self.sites.occurrences.get(borrow_expression.0)?.span
-                    || !certified_reader(reader.id, input.id, output.expression)
+                    || !certified_reader(current_producer, reader.id, input.id, output.expression)
                     || !matches!(&reader.kind, CfgPointKind::Call { output: 0, target: ResolvedCallTarget::ModuleCallable {
                         concrete: ConcreteCallSelection::Declaration, .. }, argument_points, .. }
                         if argument_points.as_slice() == [input.id])
@@ -3159,20 +3166,18 @@ impl Body<'_> {
                 if !origins.iter().copied().eq([current_producer.map(|point| InputOrigin::Owner(OwnerSource::Call(point)))]) {
                     return None;
                 }
-                if let Some(binding) = saved_observation {
+                if saved_count > 0 {
                     let OccurrenceNode::Expression(right) = *structure.edges.get(&(
                         OccurrenceParent::Expression(output.expression), OccurrenceEdge::BinaryRight,
                     ))? else { return None };
-                    let saved_read = next(consumer.id)?;
-                    let sum = next(saved_read.id)?;
                     if consumer.scope != scope || consumer.source_span.range != self.sites.occurrences.get(scalar_call.0)?.span
-                        || saved_read.scope != scope || saved_read.source_span.range != self.sites.occurrences.get(right.0)?.span
                         || structure.checked_types.expressions.get(&right) != Some(&output_ty.ty)
-                        || !matches!(self.sites.prepared_plain_name(right),
-                            Some(PlainNameIdentity::Lexical(actual)) if actual == binding)
-                        || !matches!(&saved_read.kind, CfgPointKind::Read { binding: actual } if actual == binding)
-                        || !matches!(sum.kind, CfgPointKind::Evaluate(ScalarExpression::Binary { operator: BinaryOperator::Add, .. }))
                     { return None; }
+                    let output_span = self.sites.occurrences.get(output.expression.0)?.span;
+                    let outer_sum = |point: &ReferenceFlowPoint| point.source_span.range == output_span
+                        && matches!(point.kind, CfgPointKind::Evaluate(ScalarExpression::Binary { operator: BinaryOperator::Add, .. }));
+                    let tail = scalar_tail(next(consumer.id)?.id, right, &outer_sum)?;
+                    let sum = next(tail)?;
                     end_use(sum)?;
                 } else {
                     end_use(consumer)?;
