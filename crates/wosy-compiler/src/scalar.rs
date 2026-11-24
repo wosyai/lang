@@ -3853,6 +3853,16 @@ pub(crate) fn widened_local_literal(binding: &ScalarBinding) -> Option<(&ScalarT
         .then_some((element, elements, *span))
 }
 
+pub(crate) fn widened_fixed_copy<'a>(binding: &ScalarBinding, actual: &'a ScalarType) -> Option<(&'a ScalarType, u64)> {
+    let ScalarType::RuntimeArray { element: target, .. } = &binding.declared_type else { return None };
+    let ScalarType::Array { element, length, .. } = actual else { return None };
+    (!binding.is_allocation && binding.fallible_assignment.is_none()
+        && binding.receivers.len() == 1 && binding.output_origin == ScalarBindingOutputOrigin::SingleExpression
+        && matches!(binding.value, ScalarExpression::Name { .. })
+        && element == target && reference::aggregate::ordinary_value(element))
+        .then_some((element.as_ref(), *length))
+}
+
 fn derive_type(node: &CstNode) -> ScalarType {
     let actual = if matches!(node.kind(), SyntaxKind::TypeSpec | SyntaxKind::Punctuation) {
         node.descendants()

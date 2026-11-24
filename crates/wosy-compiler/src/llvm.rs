@@ -2167,13 +2167,42 @@ fn store_runtime_allocation<'ctx, 'module>(
     Ok(())
 }
 
-fn store_widened_local_literal<'ctx, 'module>(
+fn store_widened_local_array<'ctx, 'module>(
     context: &'ctx Context,
     state: &mut EmitState<'ctx, 'module>,
     binding: &crate::ScalarBinding,
     project: Option<ProjectCallScope<'_>>,
 ) -> Result<bool, String> {
-    let Some((element, values, _)) = crate::scalar::widened_local_literal(binding) else { return Ok(false) };
+    if let Some((source, count)) = state.aggregate.as_ref()
+        .and_then(|aggregate| {
+            let [receiver] = binding.receivers.as_slice() else { return None };
+            aggregate.plan().widened_fixed_copies.get(&(receiver.name_span.start, receiver.name_span.end)).copied()
+        })
+    {
+        let [receiver] = binding.receivers.as_slice() else { unreachable!() };
+        let ScalarExpression::Name { name, .. } = &binding.value else { return Err("widening requires an exact fixed Copy source".into()); };
+        let nodes = state.body_call_nodes.ok_or("missing checked fixed Copy operand")?;
+        if nodes.lexical_expression_declaration(&binding.value) != Some(source) || nodes.binding_position(binding).is_none() {
+            return Err("fixed Copy widening changed its prepared binding".into());
+        }
+        let (source, fixed_ty) = state.storage.get(name).cloned().ok_or("missing fixed Copy storage")?;
+        let (element, actual) = crate::scalar::widened_fixed_copy(binding, &fixed_ty)
+            .ok_or("widened Copy backing must be fixed")?;
+        if actual != count { return Err("fixed Copy widening changed its exact extent".into()); }
+        let count = context.i64_type().const_int(count, false);
+        store_runtime_allocation(context, state, binding, receiver, element, count, true, |state, backing|
+            memory::copy_fixed_aggregate(context, state, backing, source, &fixed_ty))?;
+        return Ok(true);
+    }
+    let Some((element, values, _)) = crate::scalar::widened_local_literal(binding) else {
+        if matches!(binding.declared_type, ScalarType::RuntimeArray { .. })
+            && matches!(&binding.value, ScalarExpression::Name { name, .. }
+                if state.storage.get(name).is_some_and(|(_, ty)| crate::scalar::widened_fixed_copy(binding, ty).is_some()))
+        {
+            return Err("fixed Copy widening requires an exact prepared backing plan".into());
+        }
+        return Ok(false);
+    };
     let [receiver] = binding.receivers.as_slice() else { return Err("invalid widened array receiver".into()) };
     let count = context.i64_type().const_int(values.len() as u64, false);
     store_runtime_allocation(context, state, binding, receiver, element, count, true, |state, backing| {
@@ -3599,7 +3628,7 @@ fn emit_project_block_at<'ctx, 'module>(
                 emit_project_block_item(context, state, item, module, modules)?;
             }
             ScalarBlockItem::LocalBinding(binding) => {
-                if store_widened_local_literal(context, state, binding, Some(ProjectCallScope { module, modules }))? {
+                if store_widened_local_array(context, state, binding, Some(ProjectCallScope { module, modules }))? {
                     continue;
                 }
                 let value = emit_project_binding_value(context, state, binding, module, modules)?;
@@ -5293,7 +5322,7 @@ fn emit_block_item<'ctx, 'module>(
                 ownership::bind_guarded_scalar(context, state, binding, value)?;
                 return Ok(EmitValue::Unit);
             }
-            if store_widened_local_literal(context, state, binding, None)? {
+            if store_widened_local_array(context, state, binding, None)? {
                 return Ok(EmitValue::Unit);
             }
             let value = emit_binding_value(context, state, binding)?;
@@ -5325,7 +5354,7 @@ fn emit_project_block_item<'ctx, 'module>(
                 ownership::bind_guarded_scalar(context, state, binding, value)?;
                 return Ok(EmitValue::Unit);
             }
-            if store_widened_local_literal(context, state, binding, Some(ProjectCallScope { module, modules }))? {
+            if store_widened_local_array(context, state, binding, Some(ProjectCallScope { module, modules }))? {
                 return Ok(EmitValue::Unit);
             }
             if binding.is_allocation {

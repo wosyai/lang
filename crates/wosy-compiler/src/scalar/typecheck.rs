@@ -1252,7 +1252,8 @@ pub(super) fn block_item_type_in_module(
             );
             expect_module_type(
                 module,
-                widening.as_ref().unwrap_or(&binding.declared_type),
+                widening.as_ref().or_else(|| super::widened_fixed_copy(binding, &actual).map(|_| &actual))
+                    .unwrap_or(&binding.declared_type),
                 &actual,
                 binding.span,
                 diagnostics,
@@ -7887,7 +7888,8 @@ fn block_item_type(
             );
             expect_type(
                 program,
-                widening.as_ref().unwrap_or(&binding.declared_type),
+                widening.as_ref().or_else(|| super::widened_fixed_copy(binding, &actual).map(|_| &actual))
+                    .unwrap_or(&binding.declared_type),
                 &actual,
                 binding.span,
                 diagnostics,

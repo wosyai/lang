@@ -4972,7 +4972,24 @@ impl<'a> ReferenceFlowBuilder<'a> {
                                 ReferenceAnalysisErrorReason::UnprovedWidenedArrayTransfer))?;
                         self.aggregate_result.widened_owning_receives.push((point, primary_ordinal, owner, receiver.span, None));
                     }
-                    let widened = widened_join || widened_move || widened_receiver_source.is_some()
+                    let widened_fixed_copy = if let Some((_, count)) = calls.structure.checked_types.expressions.get(&primary_ordinal)
+                        .and_then(|actual| super::widened_fixed_copy(binding, actual))
+                    {
+                        let ScalarExpression::Name { span, .. } = primary else { unreachable!() };
+                        let exact = self.prepared_name_identity(primary_ordinal, *span)?;
+                        let Some(PlainNameIdentity::Lexical(source)) = exact.filter(|identity|
+                            self.generic_parameters.is_empty()
+                                && matches!(identity, PlainNameIdentity::Lexical(source)
+                                    if self.binding_types.get(source).and_then(|ty| super::widened_fixed_copy(binding, ty))
+                                        .is_some_and(|(_, actual)| actual == count)))
+                        else {
+                            return Err(self.missing_context(*span, ReferenceAnalysisErrorReason::UnprovedWidenedArrayTransfer));
+                        };
+                        self.aggregate_result.widened_fixed_copies.insert((receiver.span.start, receiver.span.end),
+                            (source.declaration_span, count));
+                        true
+                    } else { false };
+                    let widened = widened_join || widened_move || widened_receiver_source.is_some() || widened_fixed_copy
                         || super::widened_local_literal(binding).is_some();
                     if widened {
                         self.widened_arrays.get_or_insert_with(HashSet::new).insert(id.clone());

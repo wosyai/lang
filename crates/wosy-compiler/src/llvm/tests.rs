@@ -12493,3 +12493,79 @@ if (replace() != 23) { core.system_panic(); };
         }
     }
 }
+
+#[test]
+fn named_fixed_copy_widens_into_independent_runtime_backing() {
+    use inkwell::{memory_buffer::MemoryBuffer, values::{CallSiteValue, InstructionOpcode}};
+    let source = SourceIdentity::new("project".into(), "package".into(), "src/fixed_copy_widen.w".into(), "r1".into());
+    let text = "%%start
+u64(u64) two = fn(index) {
+    u8[2] fixed = [11, 13];
+    u8[] bytes = fixed;
+    fixed[1] = 19;
+    if (fixed[1] != 19 || bytes[index] != 13) { core.system_panic(); };
+    core.array_len(&bytes)
+};
+u64(u64) three = fn(index) {
+    u8[3] fixed = [3, 5, 7];
+    u8[] bytes = fixed;
+    fixed[1] = 21;
+    if (fixed[1] != 21 || bytes[index] != 5) { core.system_panic(); };
+    core.array_len(&bytes)
+};
+if (two(1) != 2 || three(1) != 3) { core.system_panic(); };
+%%end";
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let parsed = parse_source(source.clone(), text.into(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let prepared = crate::prepare_scalar_project_with_access(
+            vec![(derive_scalar_declarations_from_cst(parsed.result.canonical_cst()), Vec::new())],
+            vec![source.clone()], ScalarPreparationInputs { target_layout: layout },
+            Some(wosy_stdlib_source::CheckedAccessComponent::linked()),
+        ).unwrap_or_else(|error| panic!("{:?}", error.diagnostics));
+        let checked = analyze_scalar_build(&prepared);
+        assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+        let llvm = emit_scalar_build_project_llvm(&checked).unwrap().to_text();
+        let context = Context::create();
+        let buffer = MemoryBuffer::create_from_memory_range_copy(llvm.as_bytes(), "fixed named Copy widening");
+        let module = context.create_module_from_ir(buffer).unwrap();
+        module.verify().unwrap();
+        let alloc = module.get_function("__wosy_core_alloc").unwrap();
+        let free = module.get_function("__wosy_core_free").unwrap();
+        for (name, count) in [("two", 2), ("three", 3)] {
+            let function = module.get_function(&project_function_name(&source, name)).unwrap();
+            let mut original = None;
+            let mut snapshots = Vec::new();
+            let mut releases = Vec::new();
+            for block in function.get_basic_blocks() {
+                for instruction in std::iter::successors(block.get_first_instruction(), |inst| inst.get_next_instruction()) {
+                    let Some(callee) = CallSiteValue::try_from(instruction).ok().and_then(|call| call.get_called_fn_value())
+                    else { continue };
+                    if callee == alloc {
+                        assert!(original.replace(instruction).is_none(), "{llvm}");
+                    } else if callee == free {
+                        releases.push(instruction);
+                    } else if callee.get_name().to_bytes().starts_with(b"llvm.memmove.") {
+                        snapshots.push(instruction);
+                    }
+                }
+            }
+            let original = original.unwrap();
+            assert_eq!(known_field_operand(original, 0).unwrap().into_int_value().get_zero_extended_constant(), Some(count));
+            let copies = snapshots.iter().filter(|&&snapshot|
+                known_field_operand(snapshot, 0).unwrap().as_instruction_value() == Some(original)).copied().collect::<Vec<_>>();
+            let [copy] = copies.as_slice() else { panic!("one independent runtime snapshot: {llvm}") };
+            let fixed = known_field_operand(*copy, 1).unwrap().as_instruction_value().unwrap();
+            assert_eq!(fixed.get_opcode(), InstructionOpcode::Alloca);
+            assert_eq!(known_field_operand(*copy, 2).unwrap().into_int_value().get_zero_extended_constant(), Some(count));
+            let [release] = releases.as_slice() else { panic!("one exact widened owner free: {llvm}") };
+            assert_eq!(known_field_operand(*release, 0).unwrap().as_instruction_value(), Some(original));
+        }
+        if let Some(out) = std::env::var_os("WOSY_FIXED_COPY_WIDEN_IR_DIR") {
+            let layout = if layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
+            let controlled = llvm.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);
+            assert_ne!(controlled, llvm);
+            std::fs::write(std::path::PathBuf::from(out).join(format!("{layout}-project-control.ll")), controlled).unwrap();
+        }
+    }
+}
