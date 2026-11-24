@@ -1486,6 +1486,73 @@ fn checked_scalar_reader_keeps_received_owner_live() {
 }
 
 #[test]
+fn imported_checked_reader_requires_exact_source_and_declaration() {
+    let app = source("workbench", "src/receipt_field_import.w");
+    let imported = source("workbench", "src/reader.w");
+    let decoy = source("workbench", "src/decoy.w");
+    let base = include_str!("fixtures/receipt-field-reader.w");
+    let direct = "u64(*u64) read_length = fn(view) { *view + 1 };";
+    let approved = format!("%%start\n{direct}\n%%end");
+    // Same declaration name, byte offset and signature as the real target.
+    let uncertified = approved.replace("{ *view + 1 }", "{ u64 seen = *view; seen + 1 }");
+    let base = base.replace("%%start", "%%start\nreader = namespace workbench \"src/reader.w\";")
+        .replace(direct, "").replace("read_length(view)", "reader.read_length(view)");
+    let immediate = base.replace("    *u64 view = &packet.length;\n    reader.read_length(view)",
+        "    reader.read_length(&packet.length)");
+    assert_ne!(immediate, base);
+    for (target, target_layout) in [("native64", ScalarTargetLayout::NATIVE64), ("wasm32", ScalarTargetLayout::WASM32)] {
+        for (shape, main) in [("named", &base), ("immediate", &immediate)] {
+            let emit = |reader_text: &str| {
+                let root = declarations(&app, main);
+                let namespace = root.namespaces().next().unwrap();
+                let bindings = vec![ScalarNamespaceBinding { binding: namespace.binding.clone(),
+                    target: imported.clone(), span: namespace.span }];
+                let prepared = prepare_scalar_project(vec![(root, bindings),
+                    (declarations(&imported, reader_text), vec![]), (declarations(&decoy, &approved), vec![])],
+                    vec![app.clone(), imported.clone(), decoy.clone()], ScalarPreparationInputs { target_layout }).unwrap();
+                let build = analyze_scalar_build(&prepared);
+                assert!(build.diagnostics().is_empty(), "{target}/{shape}: {:?}", build.diagnostics());
+                emit_scalar_build_project_llvm(&build).map(|module| module.to_text())
+            };
+            let ir = emit(&approved).unwrap_or_else(|error| panic!("{target}/{shape}: {error}"));
+            let context = Context::create();
+            let module = context.create_module_from_ir(MemoryBuffer::create_from_memory_range_copy(ir.as_bytes(), target)).unwrap();
+            module.verify().unwrap();
+            let drive = module.get_function(&function_with_suffix(&module, "drive")).unwrap();
+            let mut seen = Vec::new();
+            let mut backing = None;
+            for row in drive.get_basic_blocks().into_iter().flat_map(|b| b.get_instructions()) {
+                if row.get_opcode() != InstructionOpcode::Call { continue; }
+                let call = CallSiteValue::try_from(row).unwrap();
+                let Some(callee) = call.get_called_fn_value() else { continue };
+                let name = callee.get_name().to_str().unwrap();
+                if name.ends_with("__6d616b655f7061636b6574") {
+                    backing = call.try_as_basic_value().basic();
+                    seen.push("allocate");
+                } else if name.ends_with("__726561645f6c656e677468") {
+                    assert!(name.contains("__7372632f7265616465722e77__"), "{name}");
+                    seen.push("read");
+                } else if name == "__wosy_core_free" {
+                    assert!(backing.is_some());
+                    assert_eq!(row.get_operand(0).unwrap().value(), backing);
+                    seen.push("release");
+                }
+            }
+            assert_eq!(seen, ["allocate", "read", "release"], "{target}/{shape}: {ir}");
+            if let Some(out) = std::env::var_os("WOSY_RECEIPT_FIELD_IR_DIR") {
+                let out = std::path::PathBuf::from(out).join(format!("imported-{shape}"));
+                std::fs::create_dir_all(&out).unwrap();
+                let mut witness = ir.replace("@main(", "@wosy_authored_main(");
+                witness.push_str(&format!("\ndefine i64 @wosy_field_witness() {{\nentry:\n  %v = call i64 @{}()\n  ret i64 %v\n}}\n", function_with_suffix(&module, "field_witness")));
+                std::fs::write(out.join(format!("{target}.ll")), witness).unwrap();
+            }
+            assert!(emit(&uncertified).expect_err("another source's reader cannot seal this call")
+                .contains("aggregate owning receipt has an unproved checked loan"));
+        }
+    }
+}
+
+#[test]
 fn local_checked_reader_preserves_the_selected_loan_through_recursion() {
     let app = source("workbench", "src/local_checked_reader.w");
     let text = include_str!("fixtures/local-checked-reader.w");

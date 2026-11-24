@@ -2031,7 +2031,14 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 {
                     (|| {
                         let CfgPointKind::Call { target, argument_points, .. } = &call else { return None };
-                        let effect = shared_scalar_read_effect(&self.source, calls, ordinal, target, self.shared_scalar_read_effects)?;
+                        let local_effect = shared_scalar_read_effect(&self.source, calls, ordinal, target, self.shared_scalar_read_effects);
+                        let effect = local_effect.or_else(|| {
+                            let ResolvedCallTarget::ModuleCallable {
+                                source, declaration_span, concrete: ConcreteCallSelection::Declaration,
+                            } = target else { return None };
+                            let (identity, effect) = calls.imported_shared_readers.get(&ordinal)?;
+                            (&identity.source == source && identity.range == *declaration_span).then_some(*effect)
+                        })?;
                         let [parameter] = signature?.parameters.as_slice() else { return None };
                         let ScalarType::CheckedReference { mutability: ScalarReferenceMutability::Shared, inner } = parameter else {
                             return None;
@@ -2050,7 +2057,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             CfgPointKind::Read { binding }
                                 if matches!(calls.prepared_plain_name(argument),
                                     Some(PlainNameIdentity::Lexical(expected)) if expected == binding) =>
-                                Some((point, true)),
+                                Some((point, local_effect.is_some())),
                             CfgPointKind::Borrow { place, loan }
                                 if matches!(target, ResolvedCallTarget::ModuleCallable { .. })
                                     && loan.mode == ScalarReferenceMutability::Shared && loan.parent.is_none()
@@ -10221,6 +10228,7 @@ pub(super) struct FunctionCallSites {
     pub(super) arms: Vec<FunctionCallSites>,
     pub(super) occurrences: Vec<OccurrenceMetadata>,
     pub(super) call_occurrences: Vec<CallOccurrence>,
+    imported_shared_readers: HashMap<OccurrenceOrdinal, (SourceSpan, SharedScalarReadEffect)>,
     pub(super) local_shared_call_families: HashMap<OccurrenceOrdinal, bool>,
     declared_unsafe_calls: BTreeSet<usize>,
     pub(super) callable_escapes: HashSet<SourceSpan>,
@@ -10241,6 +10249,23 @@ pub(super) struct FunctionCallSites {
 }
 
 impl FunctionCallSites {
+    fn attach_imported_shared_readers(
+        &mut self, caller: &SourceIdentity,
+        readers: &HashMap<&SourceIdentity, HashMap<ByteSpan, SharedScalarReadEffect>>,
+    ) {
+        self.imported_shared_readers = self.call_occurrences.iter().filter_map(|call| {
+            let ResolvedCallTarget::ModuleCallable {
+                source, declaration_span, concrete: ConcreteCallSelection::Declaration,
+            } = &self.sites.get(call.site)?.target else { return None };
+            if source == caller || self.declared_unsafe_calls.contains(&call.ordinal.0) { return None }
+            let effect = *readers.get(source)?.get(declaration_span)?;
+            Some((call.ordinal, (SourceSpan::new(source.clone(), *declaration_span), effect)))
+        }).collect();
+        for arm in &mut self.arms {
+            arm.attach_imported_shared_readers(caller, readers);
+        }
+    }
+
     pub(super) fn overload_reservations(&self) -> impl Iterator<Item = &ResolvedCallTarget> {
         self.overload_reservation_sites
             .iter()
@@ -10408,7 +10433,7 @@ fn resolve_project_call_sites_impl(
         .map(CallResolutionModule::module)
         .collect::<Vec<_>>();
     let declarations = CallDeclarationIndex::new(&views);
-    ProjectCallSiteResults {
+    let mut result = ProjectCallSiteResults {
         duplicate_sources: declarations.duplicate_sources.iter().map(|source| (*source).clone()).collect(),
         modules: modules
             .iter()
@@ -10434,7 +10459,21 @@ fn resolve_project_call_sites_impl(
                 )
             })
             .collect(),
+    };
+    // Only successfully prepared module rows may grant an imported reader
+    // certificate. Duplicate full identities are never authority.
+    let readers: HashMap<_, _> = modules.iter().zip(&result.modules).filter_map(|(module, calls)| {
+        (!result.duplicate_sources.contains(&module.source)).then_some(())?;
+        Some((&module.source, calls.as_ref().ok()?.shared_scalar_read_effects.clone()))
+    }).collect();
+    for (module, calls) in modules.iter().zip(&mut result.modules) {
+        if let Ok(calls) = calls {
+            for function in calls.functions.values_mut() {
+                function.attach_imported_shared_readers(&module.source, &readers);
+            }
+        }
     }
+    result
 }
 
 #[derive(Eq, PartialEq)]
@@ -12417,6 +12456,7 @@ fn resolve_function_call_sites(
         arms,
         occurrences: resolver.occurrences,
         call_occurrences: callable.call_occurrences,
+        imported_shared_readers: HashMap::new(),
         local_shared_call_families: HashMap::new(),
         declared_unsafe_calls: callable.declared_unsafe_calls,
         callable_escapes: resolver.callable_escapes,
