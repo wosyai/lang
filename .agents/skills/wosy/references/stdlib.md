@@ -1,10 +1,12 @@
 # Standard library
 
-The standard library consists of two sources: `stdlib/src/bootstrap.w` and `stdlib/src/wasi/preview1.w`. Import them as a path dependency named `std`.
+Add the compiler repository's `stdlib/` directory as the `std` package. Import its public module:
 
 ```wosy
 std = namespace std "bootstrap.w";
 ```
+
+From `stdlib/`, `wosy build` then `wosy run` runs the WASI smoke target and prints `Wosy standard library`.
 
 ## Text
 
