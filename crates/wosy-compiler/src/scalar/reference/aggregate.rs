@@ -2783,25 +2783,14 @@ impl Body<'_> {
         if !ordinary_value(&output_ty.ty) { return None; }
         let structure = &self.sites.structure;
         let root = structure.root;
+        const MAX_PRE_TRANSFER_OBSERVATIONS: usize = 3;
         let (bind, alias, before_consume, result) = match structure.blocks.get(root.0)?.items.as_slice() {
             [result] => return self.immediate_receipt_choice(result, output_ty),
-            [bind, result] => (bind, None, None, result),
-            [bind, BlockItem { kind: BlockItemKind::Evaluation { expression }, .. }, result] =>
-                (bind, None, Some((*expression, None)), result),
-            [bind, saved, result] if matches!(&result.kind,
-                BlockItemKind::FinalOutput(output) if structure.edges.contains_key(&(
-                    OccurrenceParent::Expression(output.expression), OccurrenceEdge::BinaryLeft,
-                ))) =>
-            {
-                let BlockItemKind::Binding(saved) = &saved.kind else { return None };
-                let [receiver] = saved.receivers() else { return None };
-                let BindingInitialization::Outputs(init) = &saved.initialization else { return None };
-                if receiver.ty != output_ty.ty || !init.secondary.is_empty()
-                    || structure.checked_types.expressions.get(&init.primary) != Some(&receiver.ty)
-                { return None; }
-                (bind, None, Some((init.primary, Some(receiver))), result)
-            },
-            [bind, alias, result] => (bind, Some(alias), None, result),
+            [bind, alias, result] if matches!(&alias.kind, BlockItemKind::Binding(view)
+                if matches!(view.receivers(), [receiver] if matches!(receiver.ty, ScalarType::CheckedReference { .. }))) =>
+                (bind, Some(alias), &[][..], result),
+            [bind, before_consume @ .., result] if before_consume.len() <= MAX_PRE_TRANSFER_OBSERVATIONS =>
+                (bind, None, before_consume, result),
             _ => return None,
         };
         let (BlockItemKind::Binding(binding), BlockItemKind::FinalOutput(output)) = (&bind.kind, &result.kind)
@@ -2825,9 +2814,23 @@ impl Body<'_> {
             || holder.declaration_span != receiver.span || !matches!(join.kind, CfgPointKind::Join)
             || join.source_span.range != self.sites.occurrences.get(init.primary.0)?.span
         { return None; }
-        let (read, saved_observation) = if let Some((observation, saved)) = before_consume {
-            // A discarded scalar read can observe the selected lexical owner
-            // before its transfer, only by an immediate, certified noescape loan.
+        let mut read = read;
+        let mut saved_observation = None;
+        for (index, step) in before_consume.iter().enumerate() {
+            // Each observation is one immediate certified noescape loan; only
+            // the last may leave an exact ordinary scalar binding.
+            let (observation, saved) = match &step.kind {
+                BlockItemKind::Evaluation { expression } => (*expression, None),
+                BlockItemKind::Binding(saved) if index + 1 == before_consume.len() => {
+                    let [receiver] = saved.receivers() else { return None };
+                    let BindingInitialization::Outputs(init) = &saved.initialization else { return None };
+                    if receiver.ty != output_ty.ty || !init.secondary.is_empty()
+                        || structure.checked_types.expressions.get(&init.primary) != Some(&receiver.ty)
+                    { return None; }
+                    (init.primary, Some(receiver))
+                }
+                _ => return None,
+            };
             let signature = self.sites.checked_call_signatures.get(&observation)?;
             let [parameter @ ScalarType::CheckedReference {
                 mutability: ScalarReferenceMutability::Shared, inner,
@@ -2862,13 +2865,12 @@ impl Body<'_> {
                 { return None; }
                 let transfer = next(after_reader.id)?;
                 if transfer.scope != scope { return None; }
-                (transfer, Some(binding))
+                read = transfer;
+                saved_observation = Some(binding);
             } else {
-                (after_reader, None)
+                read = after_reader;
             }
-        } else {
-            (read, None)
-        };
+        }
         let end_use = |last: &ReferenceFlowPoint| {
             let returned = next(last.id)?;
             let exit = next(returned.id)?;
@@ -2888,7 +2890,7 @@ impl Body<'_> {
             left
         } else { output.expression };
         let use_site = if let Some((observed, field)) = self.sites.prepared_lexical_member(output.expression) {
-            if alias.is_some() || before_consume.is_some() || observed != holder || &field.structure != descriptor
+            if alias.is_some() || !before_consume.is_empty() || observed != holder || &field.structure != descriptor
                 || !matches!(&read.kind, CfgPointKind::ReadPlace { pointer_point: None, reads_origin: false,
                     candidates, .. } if matches!(candidates.as_slice(), [place] if &place.binding == holder &&
                         matches!(place.projections.as_slice(),
@@ -2908,7 +2910,7 @@ impl Body<'_> {
             let argument_span = self.sites.occurrences.get(argument.0)?.span;
             if let ScalarType::CheckedReference { mutability: ScalarReferenceMutability::Shared, inner } = parameter {
                 let CfgPointKind::Borrow { place, loan } = &read.kind else { return None };
-                if before_consume.is_some()
+                if !before_consume.is_empty()
                     || structure.checked_types.expressions.get(&argument) != Some(parameter)
                     || !exact_local_choice_shared_borrow(place, loan, holder, descriptor, &receiver.ty, inner)
                 { return None; }

@@ -1364,6 +1364,10 @@ fn lexical_conditional_owner_choice_releases_selected_original_after_read() {
         .replace("drive(2, true) }", "if (drive(2, true) == 4) { 2 } else { 0 } }")
         .replace("drive(3, true) }", "if (drive(3, true) == 24) { 12 } else { 0 } }");
     assert_ne!(saved_then_consumed, borrowed_then_consumed);
+    let multiple_then_consumed = saved_then_consumed
+        .replace("u64(*u64) read_selected", "u64(*Packet) read_whole = fn(view) { (*view).length };\nu64(*u64) read_selected")
+        .replace("    u64 observed = read_selected", "    read_whole(&chosen);\n    u64 observed = read_selected");
+    assert_ne!(multiple_then_consumed, saved_then_consumed);
     let temporary = consumed.replace("    Packet chosen = if", "    consume(if")
         .replace("else { make_long(2) };\n    consume(chosen)", "else { make_long(2) })");
     assert_ne!(temporary, consumed);
@@ -1389,13 +1393,15 @@ fn lexical_conditional_owner_choice_releases_selected_original_after_read() {
         (temporary.as_str(), "consume-temporary"), (borrowed.as_str(), "borrow"),
         (borrowed_then_consumed.as_str(), "consume-after-borrow"),
         (saved_then_consumed.as_str(), "consume-after-saved-borrow"),
+        (multiple_then_consumed.as_str(), "consume-after-multiple-borrows"),
         (named_borrow.as_str(), "named-borrow"), (nested_temporary.as_str(), "nested-consume-temporary"),
         (nested_borrow.as_str(), "nested-named-borrow")]
     {
         let nested = use_site.starts_with("nested-");
         let base_use = use_site.strip_prefix("nested-").unwrap_or(use_site);
         let consuming = base_use.starts_with("consume");
-        let borrowing = matches!(base_use, "borrow" | "named-borrow" | "consume-after-borrow" | "consume-after-saved-borrow");
+        let multiple = base_use == "consume-after-multiple-borrows";
+        let borrowing = multiple || matches!(base_use, "borrow" | "named-borrow" | "consume-after-borrow" | "consume-after-saved-borrow");
         for (target, target_layout) in [("native64", ScalarTargetLayout::NATIVE64), ("wasm32", ScalarTargetLayout::WASM32)] {
             for project in [false, true] {
                 let emit = |text: &str| {
@@ -1418,6 +1424,8 @@ fn lexical_conditional_owner_choice_releases_selected_original_after_read() {
                 if nested { producers.push(find("make_later")); }
                 let consumer = consuming.then(|| find("consume"));
                 let reader = borrowing.then(|| find("read_selected"));
+                let whole_reader = multiple.then(|| find("read_whole"));
+                let mut expected_readers = whole_reader.into_iter().chain(reader);
                 let mut reader_seen = false;
                 let mut transfers = Vec::new();
                 let mut writes = Vec::new();
@@ -1442,16 +1450,17 @@ fn lexical_conditional_owner_choice_releases_selected_original_after_read() {
                         assert!(!borrowing || reader_seen, "the certified read precedes sole owner transfer");
                         assert_eq!(call.count_arguments(), 2);
                         transfers.push((arg(0), arg(1)));
-                    } else if Some(callee) == reader {
-                        assert!(!reader_seen);
+                    } else if Some(callee) == reader || Some(callee) == whole_reader {
+                        assert_eq!(expected_readers.next(), Some(callee), "every authored loan is observed in order");
                         assert_eq!(call.count_arguments(), 1, "a reader never receives the owning sidecar");
                         assert_eq!(arg(0).into_int_value().get_type().get_bit_width(), target_layout.pointer_size as u32 * 8);
-                        reader_seen = true;
+                        reader_seen = Some(callee) == reader;
                     } else if callee.get_name().to_str().unwrap() == "__wosy_core_free" {
                         assert!(!borrowing || reader_seen, "the shared loan must end before release");
                         released.push(arg(0));
                     }
                 }
+                assert!(expected_readers.next().is_none(), "all authored observations must be emitted");
                 assert_eq!(writes.len(), producers.len(), "one call per exact leaf");
                 let descriptor = writes[0].1;
                 assert!(writes.iter().all(|&(_, slot, _)| slot == descriptor), "all arms share descriptor storage");
@@ -1521,6 +1530,17 @@ fn lexical_conditional_owner_choice_releases_selected_original_after_read() {
                         let wrong_suffix = text.replace("consume(chosen) + observed", "consume(chosen) - observed");
                         assert_ne!(wrong_suffix, text);
                         assert!(emit(&wrong_suffix).expect_err("only the exact ordinary scalar suffix is in this corridor")
+                            .contains("aggregate owning call has no proved endpoint"));
+                    }
+                    if multiple {
+                        let invalid_first = text.replace("{ (*view).length }", "{ u64 local = (*view).length; local }");
+                        assert_ne!(invalid_first, text);
+                        assert!(emit(&invalid_first).expect_err("all pre-transfer loans require exact authority")
+                            .contains("aggregate owning call has no proved endpoint"));
+                        let excess = text.replace("    read_whole(&chosen);",
+                            &"    read_whole(&chosen);\n".repeat(3));
+                        assert_ne!(excess, text);
+                        assert!(emit(&excess).expect_err("four observations exceed the lexical corridor budget")
                             .contains("aggregate owning call has no proved endpoint"));
                     }
                     let forward = text.replace("u64(Packet) consume = fn(packet) { packet.length };",
