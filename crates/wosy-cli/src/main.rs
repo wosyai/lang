@@ -23,7 +23,7 @@ use wosy_compiler::{
     serialize_publication, ScalarPreparationInputs, ScalarTargetLayout,
 };
 #[cfg(feature = "internal-checker")]
-use wosy_compiler::ScalarNamespaceBinding;
+use wosy_compiler::{ScalarCheckerScope, ScalarNamespaceBinding};
 use wosy_project::{
     artifact_manifest_path, discover_root, load_artifact_manifest,
     publish_artifact, ArtifactIdentity, ContentRevision, PackageRelativePath,
@@ -49,6 +49,7 @@ enum Command {
         #[arg(long, default_value = "dev")]
         profile: String,
     },
+    /// Check the selected target and unused functions in the current package
     #[cfg(feature = "internal-checker")]
     #[command(group(clap::ArgGroup::new("check_scope").args(["main_flow_only", "declared_package"])))]
     Check {
@@ -57,7 +58,7 @@ enum Command {
         profile: String,
         #[arg(long, help = "Check only the selected target's main flow")]
         main_flow_only: bool,
-        #[arg(long, help = "Also check unused functions in the declared package source root")]
+        #[arg(long, help = "Check the current package (the default scope)")]
         declared_package: bool,
     },
     Run {
@@ -93,8 +94,14 @@ fn main() -> ExitCode {
             }
         },
         #[cfg(feature = "internal-checker")]
-        Command::Check { target, profile, main_flow_only, declared_package } => {
-            match check_command(target.as_deref(), &profile, main_flow_only, declared_package) {
+        Command::Check { target, profile, main_flow_only, .. } => {
+            // Clap rejects both scope flags. An omitted scope is exactly the explicit package scope.
+            let scope = if main_flow_only {
+                ScalarCheckerScope::MainFlowOnly
+            } else {
+                ScalarCheckerScope::CurrentPackage
+            };
+            match check_command(target.as_deref(), &profile, scope) {
                 Ok(code) => ExitCode::from(code),
                 Err(error) => {
                     eprintln!("wosy: {error}");
@@ -852,18 +859,17 @@ fn render_project_diagnostics(
 
 #[cfg(feature = "internal-checker")]
 fn check_command(
-    target: Option<&str>, profile: &str, main_flow_only: bool, declared_package: bool,
+    target: Option<&str>, profile: &str, scope: ScalarCheckerScope,
 ) -> Result<u8, String> {
     use configured_check::{CheckPublicationError, CheckPublicationPreflightError, ConfiguredCheckLoadError as LoadError};
     use wosy_compiler::{Diagnostic, DiagnosticLabel, DiagnosticLabelKind, DiagnosticSeverity,
-        ScalarCheckerScope, ScalarOrderedCheckerOutcome};
+        ScalarOrderedCheckerOutcome};
 
     let current = env::current_dir().map_err(|error| error.to_string())?;
     let root = discover_root(&current)?;
-    let receipt = match (main_flow_only, declared_package) {
-        (true, false) => configured_check::check_target(&root, target, profile, ScalarCheckerScope::MainFlowOnly, Vec::new()),
-        (false, _) => configured_check::check_declared_package_target(&root, target, profile),
-        (true, true) => return Err("check scopes are mutually exclusive".to_owned()),
+    let receipt = match scope {
+        ScalarCheckerScope::MainFlowOnly => configured_check::check_target(&root, target, profile, scope, Vec::new()),
+        ScalarCheckerScope::CurrentPackage => configured_check::check_declared_package_target(&root, target, profile),
     }.map_err(|failure| match failure {
             LoadError::Canonical(failure) | LoadError::Dormant(failure) => failure.report("check"),
             LoadError::Root => "check: invalid project root".to_owned(),
@@ -871,7 +877,7 @@ fn check_command(
             LoadError::Target => "check: invalid target".to_owned(),
             LoadError::Profile => "check: invalid target profile".to_owned(),
             LoadError::Layout => "check: unsupported target layout".to_owned(),
-        LoadError::Dependency(error) => format!("check: {error}"),
+            LoadError::Dependency(error) => format!("check: {error}"),
             LoadError::PackageSourceRoot(error) => format!("check: {error}"),
             LoadError::DormantPath => "check: invalid declared source path".to_owned(),
         })?;
@@ -887,7 +893,9 @@ fn check_command(
             return Err(unsupported_output()),
     };
     let report = publication.report;
-    if !declared_package && (report.symbolic_diagnostic.is_some() || !report.additional_symbolic_diagnostics.is_empty()) {
+    if scope == ScalarCheckerScope::MainFlowOnly
+        && (report.symbolic_diagnostic.is_some() || !report.additional_symbolic_diagnostics.is_empty())
+    {
         return Err(unsupported_output());
     }
     let authored = publication.prepare(&receipt.root).map_err(|error| match error {
@@ -2162,7 +2170,7 @@ source_root = "src"
 
     #[cfg(not(feature = "internal-checker"))]
     #[test]
-    fn default_cli_does_not_offer_the_opt_in_checker() {
+    fn build_only_cli_does_not_offer_the_checker() {
         assert!(Arguments::try_parse_from(["wosy", "check", "app", "--main-flow-only"]).is_err());
     }
 

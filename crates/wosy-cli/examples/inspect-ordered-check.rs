@@ -23,6 +23,7 @@ fn load_error(error: ConfiguredCheckLoadError) -> &'static str {
         ConfiguredCheckLoadError::Profile => "invalid target profile",
         ConfiguredCheckLoadError::PackageSourceRoot(_) => "invalid declared package source root",
         ConfiguredCheckLoadError::Layout => "unsupported target layout",
+        ConfiguredCheckLoadError::Dependency(_) => "invalid dependency check target",
         ConfiguredCheckLoadError::Canonical(_) => "canonical source load failed",
         ConfiguredCheckLoadError::DormantPath => "invalid dormant source path",
         ConfiguredCheckLoadError::Dormant(_) => "explicit dormant source load failed",

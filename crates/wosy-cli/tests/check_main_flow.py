@@ -53,7 +53,15 @@ STREAMS = """    core.require(false, { .stdout = "out-a:"; .stderr = "err-a:"; .
 
 
 def main():
+    # Pass the executable from an ordinary `cargo build -p wosy-cli` (no --features).
     binary = Path(sys.argv[1]).resolve(strict=True)
+    for args, expected in [
+        (("--help",), (b"check", b"current package")),
+        (("check", "--help"), (b"--main-flow-only", b"the default scope")),
+    ]:
+        result = subprocess.run([binary, *args], capture_output=True, timeout=15)
+        assert result.returncode == 0 and not result.stderr, result
+        assert all(text in result.stdout for text in expected), result
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory).resolve()
         manifest = root / "wosy.toml"
@@ -73,7 +81,7 @@ def main():
 
         omitted_scope = check("app", "--profile", "dev")
         assert omitted_scope.returncode == 2 and omitted_scope.stdout == b"", omitted_scope
-        assert b"--main-flow-only" in omitted_scope.stderr, omitted_scope
+        assert b"source_root" in omitted_scope.stderr, omitted_scope
 
         rejected = PROGRAM.replace("choose(2, -3);", "choose(4, 8);\n    i16 other = choose(3, 9);")
         source.write_text(rejected, encoding="utf-8")
@@ -163,8 +171,10 @@ def main():
         main_flow = check("--main-flow-only")
         assert (main_flow.returncode, main_flow.stdout, main_flow.stderr) == (0, b"", b""), main_flow
 
-        wider = check("app", "--profile", "dev", "--declared-package")
+        wider = check("app", "--profile", "dev")
         assert wider.returncode == 1 and wider.stdout == b"", wider
+        explicit = check("app", "--profile", "dev", "--declared-package")
+        assert (explicit.returncode, explicit.stdout, explicit.stderr) == (wider.returncode, wider.stdout, wider.stderr), explicit
         assert wider.stderr.count(b"proof obligation failed") == 1, wider
         for label in (
             b"proof declaration", b"out != 7", b"src/fallback.w",
@@ -175,19 +185,47 @@ def main():
         assert b"must not emit" not in wider.stderr, wider
 
         source.write_text(PROGRAM.replace("choose(2, -3)", "choose(4, 8)"), encoding="utf-8")
-        both = check("--declared-package")
+        both = check()
         assert both.returncode == 1 and both.stdout == b"", both
         assert both.stderr.count(b"proof obligation failed") == 2, both
         assert both.stderr.index(b"call returned 8") < both.stderr.index(b"symbolic call can return 7"), both
 
         source.write_text(PROGRAM, encoding="utf-8")
         dormant.write_text(dormant_program.replace("out != 7", "out <= 255"), encoding="utf-8")
-        passed = check("--declared-package")
+        passed = check()
         assert (passed.returncode, passed.stdout, passed.stderr) == (0, b"", b""), passed
+
+        refusing = PROGRAM.replace("%%end", STREAMS + """
+            unit() recurse = fn { recurse(); };
+            recurse();
+        %%end""")
+        source.write_text(refusing, encoding="utf-8")
+        incomplete = check()
+        assert (incomplete.returncode, incomplete.stdout) == (2, b""), incomplete
+        assert incomplete.stderr == b"wosy: check: unsupported analysis; no result published\n", incomplete
+
+        for malformed, expected in [
+            (EFFECT.replace("must-not-create.txt", "nested/must-not-create.txt"),
+                b"result requires unsupported output; no result published"),
+            (STREAMS.replace(".code = 71", ".code = 256") + EFFECT,
+                b"selected exit code is outside 0..=255; no result published"),
+        ]:
+            source.write_text(PROGRAM.replace("%%end", zero_codes + malformed + "%%end"),
+                              encoding="utf-8")
+            rejected = check()
+            assert (rejected.returncode, rejected.stdout) == (2, b""), rejected
+            assert rejected.stderr == b"wosy: check: " + expected + b"\n", rejected
+        source.write_text(PROGRAM, encoding="utf-8")
 
         conflict = check("--main-flow-only", "--declared-package")
         assert conflict.returncode == 2 and conflict.stdout == b"", conflict
         assert b"--main-flow-only" in conflict.stderr and b"--declared-package" in conflict.stderr, conflict
+
+        if sys.platform != "linux":
+            source.write_text(PROGRAM.replace("%%end", STREAMS + EFFECT + "%%end"), encoding="utf-8")
+            unsupported_file = check()
+            assert (unsupported_file.returncode, unsupported_file.stdout) == (2, b""), unsupported_file
+            assert unsupported_file.stderr == b"wosy: check: result requires unsupported output; no result published\n", unsupported_file
 
         manifest.write_text(declared.replace('source_root = "src"\n', ''), encoding="utf-8")
         absent = check("--declared-package")
@@ -205,10 +243,13 @@ def check_file_output(binary):
         root = Path(directory).resolve()
         project = root / "project"
         project.mkdir()
-        (project / "wosy.toml").write_text(MANIFEST, encoding="utf-8")
+        declared = MANIFEST.replace('default_target = "app"', 'default_target = "app"\nsource_root = "src"')
+        declared = declared.replace('root = "main.w"', 'root = "src/main.w"')
+        (project / "wosy.toml").write_text(declared, encoding="utf-8")
         caller = project / "caller"
         caller.mkdir()
-        source = project / "main.w"
+        source = project / "src" / "main.w"
+        source.parent.mkdir()
         output = project / ".wosy" / "outputs" / "check"
         outside = root / "outside"
         outside.mkdir()
@@ -217,10 +258,10 @@ def check_file_output(binary):
         one = EFFECT.replace("must-not-create.txt", "proof.txt").replace("must not write", "proof café")
         two = EFFECT.replace("must-not-create.txt", "empty.txt").replace("must not write", "")
 
-        def check(code):
+        def check(code, scope=("--main-flow-only",)):
             source.write_text("%%start\n" + code + "%%end", encoding="utf-8")
             return subprocess.run(
-                [binary, "check", "--main-flow-only"], cwd=caller,
+                [binary, "check", *scope], cwd=caller,
                 capture_output=True, timeout=15,
             )
 
@@ -240,6 +281,20 @@ def check_file_output(binary):
         assert success.returncode == 71, success
         assert success.stdout == "out-a:out-b café:out-cmust not emitmust not emit".encode(), success
         assert success.stderr == b"err-a:err-b:err-cmust not emitmust not emit", success
+        assert sorted(path.name for path in output.iterdir()) == ["empty.txt", "proof.txt"]
+        assert (output / "proof.txt").read_bytes() == "proof café".encode()
+        assert (output / "empty.txt").read_bytes() == b""
+
+        # Both requests have valid flat paths. The first is absent; the second
+        # is an existing ordinary file reached through Linux file preparation.
+        # Neither the earlier authored streams nor the first file may publish.
+        late = check(STREAMS + one.replace("proof.txt", "not-published.txt")
+                     + two.replace("empty.txt", "proof.txt"), scope=())
+        assert (late.returncode, late.stdout) == (2, b""), late
+        assert late.stderr == (
+            b"wosy: check: could not prepare authored files; no result published: "
+            b"proof.txt already exists\n"
+        ), late
         assert sorted(path.name for path in output.iterdir()) == ["empty.txt", "proof.txt"]
         assert (output / "proof.txt").read_bytes() == "proof café".encode()
         assert (output / "empty.txt").read_bytes() == b""

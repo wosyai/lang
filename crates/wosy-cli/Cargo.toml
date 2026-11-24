@@ -5,6 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 [features]
+# The standard CLI exposes `check`. The opt-out keeps a build-only developer configuration.
+default = ["internal-checker"]
 internal-checker = ["wosy-compiler/internal-checker", "wosy-project/internal-checker", "dep:rustix"]
 
 [dependencies]

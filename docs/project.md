@@ -8,6 +8,7 @@ The project root is the nearest ancestor directory containing `wosy.toml`.
 [package]
 name = "is_even"
 default_target = "app"
+source_root = "src"
 
 [dependencies.std]
 path = "stdlib"
@@ -42,7 +43,7 @@ main_artifact = "main"
 
 Rules:
 
-- `[package] name` and `default_target` are required.
+- `[package] name` and `default_target` are required. For a whole-package `wosy check`, set `source_root` to the package-relative source directory that contains the package's target and library source files.
 - Each `[dependencies.<name>]` table takes exactly one field: `path`, a non-empty relative path to the dependency root. The directory must contain its own `wosy.toml` with a matching `package.name` and a `source_root` directory.
 - `[comments] categories` lists the `# CATEGORY:` comment categories accepted by `wosy parse` and `wosy build`.
 - Each builder needs `command` (argv, first element is the executable), optional `args`, and `toolchain_identity`. The same applies to runners.
@@ -62,6 +63,8 @@ source_root = "src"
 ## Source graph
 
 The entry file plus every file named by a `namespace` declaration forms the source graph. A declaration such as `math = namespace app "src/math.w";` loads `src/math.w` from the `app` package. A declaration such as `std = namespace std "bootstrap.w";` resolves `bootstrap.w` relative to the `std` package `source_root`. Missing files fail with `M0001`; cycles fail with `M0003`.
+
+Package checking discovers additional `.w` files under the declared `source_root` without running their module initializers. It does not sweep separate packages or files outside that tree. `wosy check --main-flow-only` checks only the reachable main flow.
 
 ## Build outputs
 
