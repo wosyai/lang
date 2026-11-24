@@ -2796,7 +2796,55 @@ cases.extend([
         "%%end", "char(u8) relay = fn(value) { u8 kept, char tag = duo(value); kept; tag }; %%end"),
         2, b"unsupported analysis"),
 ])
+joint_result_proof_symbolic = """%%start
+    (u8, bool)(u8) measured = fn(value) {
+        bool accepted = if (value <= 7) { true } else { false };
+        value, accepted
+    };
+    proof agreement for measured(entry) -> (size, ok) where (entry == 3 || entry == 9)
+        ensures ((ok && size <= 7) || (!ok && size > 7))
+        { core.show(!ok || size <= 7); }
+%%end"""
+joint_result_proof_reached = joint_result_proof_symbolic.replace("%%end", """
+    u8 one, bool allowed = measured(3);
+    u8 other, bool rejected = measured(9);
+    u8 again, bool repeated = measured(one);
+    u8 outside, bool not_obligated = measured(2);
+%%end""")
+joint_result_proof_alias = """%%start
+    (u8, u8)(u8) echo = fn(value) { value, value };
+    proof equal_outputs for echo(entry) -> (left, right) where (entry == 3 || entry == 9)
+        ensures (left == right) {}
+%%end"""
+cases.extend([
+    ("exact-startup-joint-result-proof-proved", joint_result_proof_reached, 0, b""),
+    ("exact-startup-joint-result-proof-refuted-show", joint_result_proof_reached
+        .replace("core.show(!ok || size <= 7)", "core.show(!ok || size <= 2)"),
+        1, b"proof obligation failed"),
+    ("ordinary-joint-result-proof-proved", joint_result_proof_symbolic, 0, b""),
+    ("ordinary-joint-result-proof-refuted-show", joint_result_proof_symbolic
+        .replace("core.show(!ok || size <= 7)", "core.show(!ok || size <= 2)"),
+        1, b"proof obligation failed"),
+    ("ordinary-joint-result-proof-refuted-goal", joint_result_proof_symbolic
+        .replace("ensures ((ok && size <= 7)", "ensures ((ok && size <= 2)"),
+        1, b"proof obligation failed"),
+    ("ordinary-joint-result-proof-alias-proved", joint_result_proof_alias, 0, b""),
+    ("ordinary-joint-result-proof-alias-refuted", joint_result_proof_alias.replace("left == right", "left != right"),
+        1, b"proof obligation failed"),
+    ("ordinary-joint-result-proof-mixed-order", joint_result_proof_alias.replace("    proof equal_outputs", """
+    proof earlier for echo(entry) -> (left, right) where (entry == 3 || entry == 9)
+        ensures (right != 3) { core.show(right != 3); }
+    proof equal_outputs""").replace("left == right", "left != right").replace("%%end", """
+    proof later for echo(entry) -> (left, right) where (entry == 3 || entry == 9)
+        ensures (left != 9) {}
+%%end"""), 1, b"proof obligation failed"),
+])
 proof_diagnostic_notes = {
+    "ordinary-joint-result-proof-mixed-order": b"symbolic call can return (output 1 = 3, output 2 = 3)",
+    "exact-startup-joint-result-proof-refuted-show": b"call returned (output 1 = 3, output 2 = true)",
+    "ordinary-joint-result-proof-refuted-show": b"symbolic call can return (output 1 = 3, output 2 = true)",
+    "ordinary-joint-result-proof-refuted-goal": b"symbolic call can return (output 1 = 3, output 2 = true)",
+    "ordinary-joint-result-proof-alias-refuted": b"symbolic call can return (output 1 = 3, output 2 = 3)",
     "exact-startup-result-pair-proof-refuted": b"call returned output 2 = true",
     "ordinary-result-pair-proof-refuted": b"symbolic call entry: value = 5",
     "exact-startup-character-return-proof-refuted": "call entry: argument 1 = '🦀'".encode(),
@@ -3620,6 +3668,25 @@ with tempfile.TemporaryDirectory(prefix="affine-calls-") as path:
                         assert b"COPY-PRIOR-UNPUBLISHED" not in res.stderr and b"COPY-FORMAL-UNPUBLISHED" not in res.stderr,res
                 elif included and name in proof_diagnostic_notes:
                     assert expected_stderr in res.stderr and proof_diagnostic_notes[name] in res.stderr,res
+                    if "-joint-result-proof-" in name:
+                        failures = res.stderr.split(b"error: proof obligation failed")[1:]
+                        if name.startswith("exact-startup-"):
+                            assert len(failures) == 2 and b"symbolic call" not in res.stderr, res
+                            for failure, invocation in zip(failures, (b"measured(3)", b"measured(one)")):
+                                assert invocation in failure and b"core.show(!ok || size <= 2)" in failure, res
+                                assert b"call entry: argument 1 = 3" in failure, res
+                        elif name.endswith("mixed-order"):
+                            assert len(failures) == 3, res
+                            assert b"core.show(right != 3)" in failures[0] and b"symbolic call can return output 2 = 3" in failures[0], res
+                            assert b"proof equal_outputs" in failures[1] and b"other output from this return" in failures[1], res
+                            assert b"proof later" in failures[2] and b"symbolic call can return output 1 = 9" in failures[2], res
+                        else:
+                            assert len(failures) == 1 and b"symbolic call entry: value = 3" in failures[0], res
+                            assert b"other output from this return" in failures[0], res
+                            if name.endswith("refuted-show"):
+                                assert b"proof goal" in failures[0] and b"core.show(!ok || size <= 2)" in failures[0], res
+                            elif name.endswith("refuted-goal"):
+                                assert b"ensures ((ok && size <= 2)" in failures[0] and b"proof goal" not in failures[0], res
                     if "-result-pair-proof-" in name:
                         failures = res.stderr.split(b"error: proof obligation failed")[1:]
                         if name.startswith("exact-startup-"):

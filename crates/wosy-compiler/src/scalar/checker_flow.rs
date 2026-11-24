@@ -455,71 +455,78 @@ impl<'a, 'bound, const STEP_FIRST: bool, const PURE: bool> ScopedAuthoredReturn<
     fn observe_return(
         self, slot: FinalOutputSlot, value: IntegerReturn<'a>, roots: &IntegerRoots<'a>, path: &IntegerInputs,
     ) -> Option<()> {
-        let axis = if PURE {
-            match value {
-                IntegerReturn::Const(_) => None,
-                IntegerReturn::Alias(binding) => Some(roots.lookup(binding)?.0),
-            }
-        } else {
-            symbolic_return_axis(value, roots)?
-        };
-        let mut observed = self.observed.borrow_mut();
-        observed.returned = true;
-        let BatchedLiteralEvidence { pending, checks, work, .. } = &mut *observed;
-        if *pending == 0 {
-            return Some(());
-        }
-        for row in &path.0 {
-            let (domain, low, high) = match value {
-                IntegerReturn::Const(value) => (None, value, value),
-                IntegerReturn::Alias(_) => {
-                    let domain = row.get(axis?)?;
-                    let (low, high) = domain.extremes()?;
-                    (Some(domain), low, high)
-                }
-            };
-            let rejected_point = |relation: IntegerRelation, bound: &'bound BigInt| {
-                let rejected = relation.complement();
-                if rejected.accepts(low.cmp(bound)) {
-                    Some(low)
-                } else if rejected.accepts(high.cmp(bound)) {
-                    Some(high)
-                } else if rejected.accepts(std::cmp::Ordering::Equal) && domain.is_some_and(|domain|
-                    low < bound && bound < high && domain.covers_closed(bound, bound))
-                {
-                    Some(bound)
-                } else {
-                    None
-                }
-            };
-            let checks = if STEP_FIRST {
-                let (step, goals) = checks.split_first_mut()?;
-                if let Some(witness) = rejected_point(step.relation, step.bound) {
-                    step.failure = Some(SymbolicLiteralFailure::from_row(slot, roots, row, axis, Cow::Borrowed(witness), None));
-                    *pending = 0;
-                    return Some(());
-                }
-                goals
-            } else {
-                &mut **checks
-            };
-            if PURE { charge_call_work(work, checks.len())?; }
-            for check in checks.iter_mut().filter(|check| check.failure.is_none()) {
-                if let Some(witness) = rejected_point(check.relation, check.bound) {
-                    check.failure = Some(match axis {
-                        Some(axis) if PURE && axis >= roots.parameters =>
-                            SymbolicLiteralFailure::from_local(slot, roots, row, axis, Cow::Borrowed(witness), work)?,
-                        _ => SymbolicLiteralFailure::from_row(slot, roots, row, axis, Cow::Borrowed(witness), None),
-                    });
-                    *pending -= 1;
-                }
-            }
-            if *pending == 0 || axis.is_none() {
-                break;
-            }
-        }
-        Some(())
+        observe_batched_literal_returns::<STEP_FIRST, PURE>(&mut self.observed.borrow_mut(), slot, value, roots, path)
     }
+}
+
+#[cfg(feature = "internal-checker")]
+fn observe_batched_literal_returns<'a, 'bound, const STEP_FIRST: bool, const PURE: bool>(
+    observed: &mut BatchedLiteralEvidence<'bound, 'a, '_>, slot: FinalOutputSlot, value: IntegerReturn<'a>,
+    roots: &IntegerRoots<'a>, path: &IntegerInputs,
+) -> Option<()> {
+    let axis = if PURE {
+        match value {
+            IntegerReturn::Const(_) => None,
+            IntegerReturn::Alias(binding) => Some(roots.lookup(binding)?.0),
+        }
+    } else {
+        symbolic_return_axis(value, roots)?
+    };
+    observed.returned = true;
+    let BatchedLiteralEvidence { pending, checks, work, .. } = observed;
+    if *pending == 0 {
+        return Some(());
+    }
+    for row in &path.0 {
+        let (domain, low, high) = match value {
+            IntegerReturn::Const(value) => (None, value, value),
+            IntegerReturn::Alias(_) => {
+                let domain = row.get(axis?)?;
+                let (low, high) = domain.extremes()?;
+                (Some(domain), low, high)
+            }
+        };
+        let rejected_point = |relation: IntegerRelation, bound: &'bound BigInt| {
+            let rejected = relation.complement();
+            if rejected.accepts(low.cmp(bound)) {
+                Some(low)
+            } else if rejected.accepts(high.cmp(bound)) {
+                Some(high)
+            } else if rejected.accepts(std::cmp::Ordering::Equal) && domain.is_some_and(|domain|
+                low < bound && bound < high && domain.covers_closed(bound, bound))
+            {
+                Some(bound)
+            } else {
+                None
+            }
+        };
+        let checks = if STEP_FIRST {
+            let (step, goals) = checks.split_first_mut()?;
+            if let Some(witness) = rejected_point(step.relation, step.bound) {
+                step.failure = Some(SymbolicLiteralFailure::from_row(slot, roots, row, axis, Cow::Borrowed(witness), None));
+                *pending = 0;
+                return Some(());
+            }
+            goals
+        } else {
+            &mut **checks
+        };
+        if PURE { charge_call_work(work, checks.len())?; }
+        for check in checks.iter_mut().filter(|check| check.failure.is_none()) {
+            if let Some(witness) = rejected_point(check.relation, check.bound) {
+                check.failure = Some(match axis {
+                    Some(axis) if PURE && axis >= roots.parameters =>
+                        SymbolicLiteralFailure::from_local(slot, roots, row, axis, Cow::Borrowed(witness), work)?,
+                    _ => SymbolicLiteralFailure::from_row(slot, roots, row, axis, Cow::Borrowed(witness), None),
+                });
+                *pending -= 1;
+            }
+        }
+        if *pending == 0 || axis.is_none() {
+            break;
+        }
+    }
+    Some(())
 }
 
 #[cfg(feature = "internal-checker")]
@@ -4242,7 +4249,16 @@ impl RejectedCell<'_> {
 fn array_entry_point(
     original: &IntegerRow, point: Option<&(usize, BigInt)>, parameters: usize, work: &mut usize,
 ) -> Option<IntegerInputs> {
-    charge_call_work(work, original.len().checked_add(parameters)?.checked_add(1)?)?;
+    let mut row = realize_integer_row(original, point, 0..parameters, work)?;
+    row.truncate(parameters);
+    Some(IntegerInputs(vec![row]))
+}
+
+#[cfg(feature = "internal-checker")]
+fn realize_integer_row(
+    original: &IntegerRow, point: Option<&(usize, BigInt)>, axes: impl IntoIterator<Item = usize>, work: &mut usize,
+) -> Option<IntegerRow> {
+    charge_call_work(work, original.len().checked_add(1)?)?;
     let mut row = original.clone();
     let restrict = |row: &mut IntegerRow, axis, value: &BigInt, work: &mut usize| {
         charge_call_work(work, row.equal_axes().len().checked_add(1)?)?;
@@ -4256,15 +4272,15 @@ fn array_entry_point(
     if let Some((axis, point)) = point {
         restrict(&mut row, *axis, point, work)?;
     }
-    for axis in 0..parameters {
+    for axis in axes {
+        charge_call_work(work, 1)?;
         let domain = row.get(axis)?;
         if domain.singleton_value().is_none() {
             let point = domain.extremes()?.0.clone();
             restrict(&mut row, axis, &point, work)?;
         }
     }
-    row.truncate(parameters);
-    Some(IntegerInputs(vec![row]))
+    Some(row)
 }
 
 #[cfg(feature = "internal-checker")]
@@ -4933,10 +4949,243 @@ pub(super) fn direct_result_pair(calls: &FunctionCallSites) -> Option<[(&FinalOu
 }
 
 #[cfg(feature = "internal-checker")]
+pub(super) enum ResultPairTerm {
+    Slot(usize),
+    Literal(BigInt),
+}
+
+#[cfg(feature = "internal-checker")]
+pub(super) enum ResultPairBoolean {
+    Constant(bool),
+    Compare { operands: [ResultPairTerm; 2], relation: IntegerRelation },
+    Not(Box<Self>),
+    Binary { and: bool, operands: Box<[Self; 2]> },
+}
+
+#[cfg(feature = "internal-checker")]
+pub(super) enum ResultPairClause {
+    Literal(ResultSlotLiteral),
+    Joint { predicate: ResultPairBoolean, slot: Option<usize> },
+}
+
+#[cfg(feature = "internal-checker")]
+pub(super) struct ResultSlotLiteral {
+    pub(super) slot: usize,
+    pub(super) relation: IntegerRelation,
+    pub(super) bound: BigInt,
+}
+
+#[cfg(feature = "internal-checker")]
+impl ResultPairClause {
+    fn slot(&self) -> Option<usize> {
+        match self {
+            Self::Literal(literal) => Some(literal.slot),
+            Self::Joint { slot, .. } => *slot,
+        }
+    }
+
+    pub(super) fn literal(&self) -> Option<&ResultSlotLiteral> {
+        let Self::Literal(literal) = self else { return None; };
+        Some(literal)
+    }
+}
+
+#[cfg(feature = "internal-checker")]
+pub(super) struct ResultPairProof {
+    pub(super) terminal: ResultPairClause,
+    pub(super) show: Option<(super::ByteSpan, ResultPairClause)>,
+    pub(super) same_literal: bool,
+}
+
+#[cfg(feature = "internal-checker")]
+impl ResultPairProof {
+    fn legacy(&self) -> Option<(&ResultSlotLiteral, Option<(super::ByteSpan, &ResultSlotLiteral)>)> {
+        let show = match &self.show {
+            Some((span, claim)) => Some((*span, claim.literal()?)),
+            None => None,
+        };
+        Some((self.terminal.literal()?, show))
+    }
+}
+
+#[cfg(feature = "internal-checker")]
+pub(super) struct ResultPairFailure<'a> {
+    pub(super) step: Option<super::ByteSpan>,
+    pub(super) source_slot: Option<usize>,
+    pub(super) witness: Option<SymbolicResultPairWitness<'a>>,
+}
+
+#[cfg(feature = "internal-checker")]
+pub(super) enum SymbolicResultPairWitness<'a> {
+    Literal(SymbolicLiteralFailure<'a>),
+    Joint {
+        spans: [super::ByteSpan; 2],
+        values: [BigInt; 2],
+        entry: IntegerInputs,
+        axes: Vec<(&'a ReferenceBindingId, &'a ScalarType)>,
+    },
+}
+
+#[cfg(feature = "internal-checker")]
+pub(super) struct ResultPairCheck<'a, 'body> {
+    pub(super) proof: &'a ResultPairProof,
+    pub(super) admitted: bool,
+    pub(super) failure: Option<ResultPairFailure<'body>>,
+}
+
+#[cfg(feature = "internal-checker")]
+pub(super) enum ResultPairEntry<'a> {
+    Exact(&'a [&'a BigInt]),
+    Symbolic(&'a [CheckerPredicate]),
+}
+
+#[cfg(feature = "internal-checker")]
+struct ResultPairState<'plan, 'a, 'checks> {
+    checks: &'checks mut [ResultPairCheck<'plan, 'a>],
+    legacy: [Vec<SymbolicLiteralCheck<'plan, 'a>>; 2],
+    exact: bool,
+    returned: Option<[BigInt; 2]>,
+    observed: bool,
+    work: usize,
+}
+
+#[cfg(feature = "internal-checker")]
 #[derive(Clone, Copy)]
-enum ResultPairSink<'a, 'body, 'checks, 'run> {
-    Exact(&'run std::cell::RefCell<Option<[BigInt; 2]>>),
-    Symbolic([OrderedRootLiteralProofs<'body, 'a, 'checks, 'run, false, true>; 2]),
+struct ResultPairSink<'plan, 'body, 'checks, 'run>(&'run std::cell::RefCell<ResultPairState<'plan, 'body, 'checks>>);
+
+#[cfg(feature = "internal-checker")]
+#[derive(Clone, Copy)]
+enum PreparedPairValue<'a> {
+    Axis(usize),
+    Literal(&'a BigInt),
+}
+
+#[cfg(feature = "internal-checker")]
+impl<'a> PreparedPairValue<'a> {
+    fn resolve(term: &'a ResultPairTerm, outputs: &[Self; 2]) -> Option<Self> {
+        match term {
+            ResultPairTerm::Slot(slot) => outputs.get(*slot).copied(),
+            ResultPairTerm::Literal(value) => Some(Self::Literal(value)),
+        }
+    }
+
+    fn point<'row>(&'row self, row: &'row IntegerRow) -> Option<&'row BigInt> {
+        match self {
+            Self::Literal(value) => Some(value),
+            Self::Axis(axis) => row.get(*axis)?.singleton_value(),
+        }
+    }
+}
+
+#[cfg(feature = "internal-checker")]
+impl ResultPairTerm {
+    fn exact<'a>(&'a self, points: &'a [BigInt; 2]) -> Option<&'a BigInt> {
+        match self {
+            Self::Slot(slot) => points.get(*slot),
+            Self::Literal(value) => Some(value),
+        }
+    }
+}
+
+#[cfg(feature = "internal-checker")]
+impl ResultPairBoolean {
+    fn exact(&self, points: &[BigInt; 2], work: &mut usize) -> Option<bool> {
+        charge_call_work(work, 1)?;
+        Some(match self {
+            Self::Constant(value) => *value,
+            Self::Compare { operands, relation } => relation.accepts(operands[0].exact(points)?.cmp(operands[1].exact(points)?)),
+            Self::Not(value) => !value.exact(points, work)?,
+            Self::Binary { and, operands } => {
+                let left = operands[0].exact(points, work)?;
+                if left == *and { operands[1].exact(points, work)? } else { left }
+            }
+        })
+    }
+
+    // A visitor may stop on the first witnessed row. Left and right are
+    // checked on the same narrowed row, never on independent marginals.
+    fn visit(
+        &self, row: &IntegerRow, outputs: &[PreparedPairValue<'_>; 2], selected: [bool; 2], work: &mut usize,
+        accept: &mut dyn FnMut(Cow<'_, IntegerRow>, usize, &mut usize) -> Option<bool>,
+    ) -> Option<bool> {
+        charge_call_work(work, 1)?;
+        match self {
+            Self::Constant(value) => visit_pair_constant(row, *value, selected, work, accept),
+            Self::Compare { operands, relation } => {
+                let [left, right] = [PreparedPairValue::resolve(&operands[0], outputs)?,
+                    PreparedPairValue::resolve(&operands[1], outputs)?];
+                let atom = match (left, right) {
+                    (PreparedPairValue::Literal(left), PreparedPairValue::Literal(right)) =>
+                        return visit_pair_constant(row, relation.accepts(left.cmp(right)), selected, work, accept),
+                    (PreparedPairValue::Axis(axis), PreparedPairValue::Literal(bound)) =>
+                        OrdinaryIntegerAtom::Literal(axis, *relation, bound),
+                    (PreparedPairValue::Literal(bound), PreparedPairValue::Axis(axis)) =>
+                        OrdinaryIntegerAtom::Literal(axis, relation.reversed(), bound),
+                    (PreparedPairValue::Axis(left), PreparedPairValue::Axis(right)) =>
+                        OrdinaryIntegerAtom::Lexical([left, right], *relation),
+                };
+                IntegerInputs::visit_ordinary_atom::<true>(row, &atom, selected, work, &mut |row, lane, work| accept(row, lane, work))
+            }
+            Self::Not(value) => value.visit(row, outputs, [selected[1], selected[0]], work,
+                &mut |row, lane, work| accept(row, 1 - lane, work)),
+            Self::Binary { and, operands } => {
+                let continuing = usize::from(*and);
+                let mut left = selected;
+                left[continuing] = true;
+                operands[0].visit(row, outputs, left, work, &mut |row, lane, work| {
+                    if lane == continuing { operands[1].visit(&row, outputs, selected, work, accept) }
+                    else { accept(row, lane, work) }
+                })
+            }
+        }
+    }
+}
+
+#[cfg(feature = "internal-checker")]
+fn visit_pair_constant(
+    row: &IntegerRow, value: bool, selected: [bool; 2], work: &mut usize,
+    accept: &mut dyn FnMut(Cow<'_, IntegerRow>, usize, &mut usize) -> Option<bool>,
+) -> Option<bool> {
+    if selected[value as usize] { accept(Cow::Borrowed(row), value as usize, work) } else { Some(false) }
+}
+
+#[cfg(feature = "internal-checker")]
+impl ResultPairProof {
+    fn exact_failure(&self, points: &[BigInt; 2], work: &mut usize) -> Option<Option<ResultPairFailure<'static>>> {
+        if let Some((terminal, show)) = self.legacy() {
+            // Legacy exact comparisons were already prepaid by enrollment.
+            let order = if let Some((span, show)) = show {
+                let order = points.get(show.slot)?.cmp(&show.bound);
+                if !show.relation.accepts(order) {
+                    return Some(Some(ResultPairFailure { step: Some(span), source_slot: Some(show.slot), witness: None }));
+                }
+                if self.same_literal { order } else { points.get(terminal.slot)?.cmp(&terminal.bound) }
+            } else {
+                points.get(terminal.slot)?.cmp(&terminal.bound)
+            };
+            return Some((!terminal.relation.accepts(order)).then_some(ResultPairFailure {
+                step: None, source_slot: Some(terminal.slot), witness: None,
+            }));
+        }
+        for (clause, step) in self.clauses() {
+            let valid = match clause {
+                ResultPairClause::Literal(literal) => {
+                    charge_call_work(work, 1)?;
+                    literal.relation.accepts(points.get(literal.slot)?.cmp(&literal.bound))
+                }
+                ResultPairClause::Joint { predicate, .. } => predicate.exact(points, work)?,
+            };
+            if !valid {
+                return Some(Some(ResultPairFailure { step, source_slot: clause.slot(), witness: None }));
+            }
+        }
+        Some(None)
+    }
+
+    fn clauses(&self) -> impl Iterator<Item = (&ResultPairClause, Option<super::ByteSpan>)> {
+        self.show.as_ref().into_iter().map(|(span, claim)| (claim, Some(*span)))
+            .chain(std::iter::once((&self.terminal, None)))
+    }
 }
 
 #[cfg(feature = "internal-checker")]
@@ -4960,60 +5209,176 @@ impl<'body> ScopedAuthoredReturn<'body> for ResultPairSink<'_, 'body, '_, '_> {
         if block != calls.structure.root { return None; }
         let [(first, first_ty), (second, second_ty)] = direct_result_pair(calls)?;
         if *first != slot { return None; }
-        let values = [plain_typed_return(calls, first, first_ty, roots)?,
-            plain_typed_return(calls, second, second_ty, roots)?];
-        match self {
-            Self::Exact(out) => {
-                let [row] = path.0.as_slice() else { return None; };
-                let point = |value| match value {
-                    IntegerReturn::Const(point) => Some(point),
-                    IntegerReturn::Alias(binding) => row.get(roots.lookup(binding)?.0)?.singleton_value(),
-                };
-                if out.borrow().is_some() { return None; }
-                *out.borrow_mut() = Some([point(values[0])?.clone(), point(values[1])?.clone()]);
+        let prepare = |slot, ty| match plain_typed_return(calls, slot, ty, roots)? {
+            IntegerReturn::Const(value) => Some(PreparedPairValue::Literal(value)),
+            IntegerReturn::Alias(binding) => Some(PreparedPairValue::Axis(roots.lookup(binding)?.0)),
+        };
+        let values = [prepare(first, first_ty)?, prepare(second, second_ty)?];
+        let spans = [first.span, second.span];
+        let points = |row: &IntegerRow| Some([values[0].point(row)?.clone(), values[1].point(row)?.clone()]);
+        let mut state = self.0.borrow_mut();
+        let ResultPairState { checks, legacy, exact, returned, observed, work } = &mut *state;
+        if *observed { return None; }
+        *observed = true;
+        if *exact {
+            let [row] = path.0.as_slice() else { return None; };
+            let points = points(row)?;
+            for check in checks.iter_mut().filter(|check| check.admitted) {
+                check.failure = check.proof.exact_failure(&points, work)?;
             }
-            Self::Symbolic([left, right]) => {
-                left.observed.borrow_mut().work = right.observed.borrow().work;
-                left.observe_return(*first, values[0], roots, path)?;
-                right.observed.borrow_mut().work = left.observed.borrow().work;
-                right.observe_return(*second, values[1], roots, path)?;
+            *returned = Some(points);
+            return Some(());
+        }
+        let mut literal_work = 0;
+        for ((slot, value), bucket) in [(*first, values[0]), (*second, values[1])].into_iter().zip(legacy) {
+            if bucket.is_empty() { continue; }
+            // Retain the exact original batched symbolic accounting and
+            // witness selection for every prior single-slot obligation.
+            let value = match value {
+                PreparedPairValue::Literal(value) => IntegerReturn::Const(value),
+                PreparedPairValue::Axis(axis) => IntegerReturn::Alias(roots.axes.get(axis)?.0),
+            };
+            let mut observed = BatchedLiteralEvidence { returned: false, work: literal_work, pending: bucket.len(), checks: bucket };
+            observe_batched_literal_returns::<false, true>(&mut observed, slot, value, roots, path)?;
+            literal_work = observed.work;
+        }
+        for check in checks.iter_mut().filter(|check| check.admitted && check.proof.legacy().is_none()) {
+            for (clause, step) in check.proof.clauses() {
+                let mut found = None;
+                let mut accept = |row: Cow<'_, IntegerRow>, _: usize, work: &mut usize| {
+                    let selected = values.iter().filter_map(|value| match *value {
+                        PreparedPairValue::Axis(axis) => Some(axis),
+                        PreparedPairValue::Literal(_) => None,
+                    });
+                    let mut realized = realize_integer_row(row.as_ref(), None, (0..roots.parameters).chain(selected), work)?;
+                    let returned = points(&realized)?;
+                    realized.truncate(roots.parameters);
+                    found = Some(SymbolicResultPairWitness::Joint { spans, values: returned, entry: IntegerInputs(vec![realized]),
+                        axes: roots.axes[..roots.parameters].to_vec() });
+                    Some(true)
+                };
+                for row in &path.0 {
+                    let stopped = match clause {
+                        ResultPairClause::Joint { predicate, .. } => predicate.visit(row, &values, [true, false], work, &mut accept)?,
+                        ResultPairClause::Literal(literal) => {
+                            charge_call_work(work, 1)?;
+                            match *values.get(literal.slot)? {
+                                PreparedPairValue::Literal(value) => visit_pair_constant(row,
+                                    literal.relation.accepts(value.cmp(&literal.bound)), [true, false], work, &mut accept)?,
+                                PreparedPairValue::Axis(axis) => IntegerInputs::visit_ordinary_atom::<true>(row,
+                                    &OrdinaryIntegerAtom::Literal(axis, literal.relation, &literal.bound),
+                                    [true, false], work, &mut accept)?,
+                            }
+                        }
+                    };
+                    if stopped { break; }
+                }
+                if found.is_some() {
+                    check.failure = Some(ResultPairFailure { step, source_slot: clause.slot(), witness: found });
+                    break;
+                }
             }
         }
         Some(())
     }
 }
 
-#[cfg(feature = "internal-checker")]
-pub(super) fn collect_closed_result_pair_proofs<'a>(
-    calls: &'a FunctionCallSites, body: &'a super::ScalarBlock, filter: &[CheckerPredicate],
-    [left, right]: [&mut [SymbolicLiteralCheck<'_, 'a>]; 2],
-) -> Option<bool> {
-    // Both slot claims consume the same returning symbolic rows. Keep their
-    // existing batched rank/first failure logic, with the second slot starting
-    // from the first slot's consumed work budget.
-    let conditions = OrderedRootConditions(body, false);
-    let left = std::cell::RefCell::new(BatchedLiteralEvidence { returned: false, work: 0, pending: left.len(), checks: left });
-    let right = std::cell::RefCell::new(BatchedLiteralEvidence { returned: false, work: 0, pending: right.len(), checks: right });
-    #[cfg(test)]
-    INTEGER_OBSERVATIONS.with(|count| { let (symbolic, actual) = count.get(); count.set((symbolic + 1, actual)); });
-    let first = &calls.boundary.results.first()?.ty;
-    run_integer_callable::<false, false, _>(calls, Some(first), Some(filter), None, &mut [], None, None, None, false,
-        ResultPairSink::Symbolic([OrderedRootLiteralProofs { conditions, observed: &left },
-            OrderedRootLiteralProofs { conditions, observed: &right }]))?.ok()?;
-    let left = left.into_inner();
-    let right = right.into_inner();
-    Some(left.returned && right.returned)
+#[cfg(all(test, feature = "internal-checker"))]
+#[test]
+fn joint_result_proof_stops_before_budgeting_later_comparison_rows() {
+    let left = IntegerSet::closed_interval(0u8.into(), 7u8.into()).unwrap();
+    let right = IntegerSet::closed_interval(0u8.into(), 200u8.into()).unwrap();
+    let inputs = IntegerInputs::from_cells(vec![vec![Rc::new(left), Rc::new(right)]]);
+    let relation = IntegerRelation::from_operator(&BinaryOperator::NotEqual).unwrap();
+    let mut exhaustive_work = 0;
+    let _ = inputs.ordinary_comparison([0, 1], relation, [true, false], &mut exhaustive_work).unwrap();
+    let mut work = MAX_PARTITION_TRANSFER_WORK - exhaustive_work + 1;
+    let predicate = ResultPairBoolean::Compare {
+        operands: [ResultPairTerm::Slot(0), ResultPairTerm::Slot(1)], relation,
+    };
+    let [row] = inputs.0.as_slice() else { panic!("one independent input row"); };
+    let mut observed = 0;
+    let stopped = predicate.visit(row, &[PreparedPairValue::Axis(0), PreparedPairValue::Axis(1)],
+        [true, false], &mut work, &mut |rejected, lane, _| {
+            observed += 1;
+            assert_eq!(lane, 0);
+            assert_eq!(rejected[0].singleton_value(), Some(&BigInt::ZERO));
+            assert_eq!(rejected[1].singleton_value(), Some(&BigInt::ZERO));
+            Some(true)
+        });
+    assert_eq!(stopped, Some(true));
+    assert_eq!(observed, 1);
+    assert!(work < MAX_PARTITION_TRANSFER_WORK);
+}
+
+#[cfg(all(test, feature = "internal-checker"))]
+#[test]
+fn joint_result_proof_exact_legacy_checks_do_not_charge_symbolic_row_work() {
+    let equal = IntegerRelation::from_operator(&BinaryOperator::Equal).unwrap();
+    let literal = |value: u8| ResultPairClause::Literal(ResultSlotLiteral { slot: 1, relation: equal, bound: value.into() });
+    let span = super::ByteSpan::new(2, 3);
+    let plan = ResultPairProof { terminal: literal(1), show: Some((span, literal(1))), same_literal: true };
+    let mut work = MAX_PARTITION_TRANSFER_WORK;
+    assert!(matches!(plan.exact_failure(&[3u8.into(), 1u8.into()], &mut work), Some(None)));
+    let Some(Some(failed)) = plan.exact_failure(&[9u8.into(), 0u8.into()], &mut work) else { panic!("failed show"); };
+    assert_eq!(failed.step, Some(span));
+    assert_eq!(failed.source_slot, Some(1));
+    assert!(failed.witness.is_none());
+    assert_eq!(work, MAX_PARTITION_TRANSFER_WORK);
 }
 
 #[cfg(feature = "internal-checker")]
-pub(super) fn exact_result_pair(calls: &FunctionCallSites, arguments: &[&BigInt]) -> Option<[BigInt; 2]> {
-    let first = &calls.boundary.results.first()?.ty;
-    let out = std::cell::RefCell::new(None);
+pub(super) fn collect_result_pair_proofs<'a>(
+    calls: &'a FunctionCallSites, entry: ResultPairEntry<'_>, checks: &mut [ResultPairCheck<'_, 'a>], work: &mut usize,
+) -> Option<(bool, Option<[BigInt; 2]>)> {
+    let (exact, filter) = match entry {
+        ResultPairEntry::Exact(arguments) => (Some(arguments), None),
+        ResultPairEntry::Symbolic(filter) => (None, Some(filter)),
+    };
+    let mut legacy = [Vec::new(), Vec::new()];
+    if exact.is_none() {
+        for check in checks.iter().filter(|check| check.admitted) {
+            if let Some((goal, show)) = check.proof.legacy() {
+                for literal in show.into_iter().map(|(_, literal)| literal).chain(std::iter::once(goal)) {
+                    legacy.get_mut(literal.slot)?.push(SymbolicLiteralCheck {
+                        relation: literal.relation, bound: &literal.bound, failure: None,
+                    });
+                }
+            }
+        }
+    }
+    let observed = std::cell::RefCell::new(ResultPairState {
+        checks, legacy, exact: exact.is_some(), returned: None, observed: false, work: *work,
+    });
     #[cfg(test)]
-    INTEGER_OBSERVATIONS.with(|count| { let (symbolic, actual) = count.get(); count.set((symbolic, actual + 1)); });
-    let ProofCoverage::Applicable(_) = run_integer_callable::<false, false, _>(calls, Some(first), None, None, &mut [],
-        Some(arguments), None, None, false, ResultPairSink::Exact(&out))?.ok()? else { return None; };
-    out.into_inner()
+    INTEGER_OBSERVATIONS.with(|count| { let (symbolic, actual) = count.get();
+        count.set((symbolic + usize::from(exact.is_none()), actual + usize::from(exact.is_some()))); });
+    let first = &calls.boundary.results.first()?.ty;
+    let coverage = run_integer_callable::<false, false, _>(calls, Some(first), filter, None, &mut [],
+        exact, None, None, false, ResultPairSink(&observed))?.ok()?;
+    let state = observed.into_inner();
+    *work = state.work;
+    if !state.exact && state.observed {
+        let mut results = state.legacy.map(Vec::into_iter);
+        for check in state.checks.iter_mut().filter(|check| check.admitted) {
+            if let Some((terminal, show)) = check.proof.legacy() {
+                let shown = if let Some((step, show)) = show {
+                    results.get_mut(show.slot)?.next()?.failure.map(|witness| ResultPairFailure {
+                        step: Some(step), source_slot: Some(show.slot), witness: Some(SymbolicResultPairWitness::Literal(witness)),
+                    })
+                } else { None };
+                let terminal_verdict = results.get_mut(terminal.slot)?.next()?.failure;
+                check.failure = shown.or_else(|| terminal_verdict.map(|witness| ResultPairFailure {
+                    step: None, source_slot: Some(terminal.slot), witness: Some(SymbolicResultPairWitness::Literal(witness)),
+                }));
+            }
+        }
+    }
+    match coverage {
+        ProofCoverage::Applicable(_) if state.observed => Some((true, state.returned)),
+        ProofCoverage::NoApplicableInputs if exact.is_none() && !state.observed => Some((false, None)),
+        _ => None,
+    }
 }
 
 #[cfg(all(test, feature = "internal-checker"))]
@@ -5788,49 +6153,54 @@ impl IntegerInputs {
     fn ordinary_atom(&self, atom: OrdinaryIntegerAtom<'_>, selected: [bool; 2], work: &mut usize) -> Option<[Self; 2]> {
         let mut output = [Self::default(), Self::default()];
         for row in &self.0 {
-            let cut = match atom {
-                OrdinaryIntegerAtom::Lexical(axes, relation) => {
-                    // Bound identity/singleton discovery and constant-width
-                    // arithmetic before deriving the checked integer cut.
-                    let lookups = usize::BITS - row.equal_axes().len().leading_zeros();
-                    charge_call_work(work, 8 + 2 * lookups as usize)?;
-                    ordinary_comparison_cut(row, axes, relation)?
+            Self::visit_ordinary_atom::<false>(row, &atom, selected, work, &mut |retained, lane, work| {
+                if matches!(retained, Cow::Borrowed(_)) {
+                    charge_call_work(work, retained.len().checked_add(1)?)?;
                 }
-                OrdinaryIntegerAtom::Literal(axis, relation, bound) => {
-                    charge_call_work(work, 1)?;
-                    OrdinaryComparisonCut::Bound { axis, relation, bound: Cow::Borrowed(bound) }
-                }
-            };
-            match cut {
-                OrdinaryComparisonCut::Constant(result) => {
-                    let lane = result as usize;
-                    if selected[lane] {
-                        charge_call_work(work, row.len().checked_add(1)?)?;
-                        output[lane].0.push(row.clone());
-                    }
-                }
-                OrdinaryComparisonCut::Bound { axis, relation, bound } =>
-                    Self::emit_ordinary_bound(row, axis, relation, &bound, None, selected, work, &mut output)?,
-                OrdinaryComparisonCut::Independent { axes, relation } => {
-                    if let Some(uniform) = independent_uniform(&row[axes[0]], &row[axes[1]], relation, work)? {
-                        let lane = uniform as usize;
-                        if selected[lane] {
-                            charge_call_work(work, row.len().checked_add(1)?)?;
-                            output[lane].0.push(row.clone());
-                        }
-                    } else {
-                        Self::emit_independent_comparison(row, axes, relation, selected, work, &mut output)?;
-                    }
-                }
-            }
+                output[lane].0.push(retained.into_owned());
+                Some(false)
+            })?;
         }
         Some(output)
     }
 
-    fn emit_independent_comparison(
-        row: &IntegerRow, [left, right]: [usize; 2], relation: IntegerRelation,
-        selected: [bool; 2], work: &mut usize, output: &mut [Self; 2],
-    ) -> Option<()> {
+    // true from the visitor stops the search. A constant cut exposes its
+    // original row without copying; materialized bounded cuts are shared with
+    // ordinary branching (which continues until both requested lanes close).
+    fn visit_ordinary_atom<const STOP_EARLY: bool>(
+        row: &IntegerRow, atom: &OrdinaryIntegerAtom<'_>, selected: [bool; 2], work: &mut usize,
+        accept: &mut impl FnMut(Cow<'_, IntegerRow>, usize, &mut usize) -> Option<bool>,
+    ) -> Option<bool> {
+        let cut = match atom {
+            OrdinaryIntegerAtom::Lexical(axes, relation) => {
+                let lookups = usize::BITS - row.equal_axes().len().leading_zeros();
+                charge_call_work(work, 8 + 2 * lookups as usize)?;
+                ordinary_comparison_cut(row, *axes, *relation)?
+            }
+            OrdinaryIntegerAtom::Literal(axis, relation, bound) => {
+                charge_call_work(work, 1)?;
+                OrdinaryComparisonCut::Bound { axis: *axis, relation: *relation, bound: Cow::Borrowed(bound) }
+            }
+        };
+        match cut {
+            OrdinaryComparisonCut::Constant(result) =>
+                if selected[result as usize] { accept(Cow::Borrowed(row), result as usize, work) } else { Some(false) },
+            OrdinaryComparisonCut::Bound { axis, relation, bound } =>
+                Self::visit_ordinary_bound(row, axis, relation, &bound, None, selected, work, accept),
+            OrdinaryComparisonCut::Independent { axes, relation } => {
+                if let Some(uniform) = independent_uniform(&row[axes[0]], &row[axes[1]], relation, work)? {
+                    if selected[uniform as usize] { accept(Cow::Borrowed(row), uniform as usize, work) } else { Some(false) }
+                } else {
+                    Self::visit_independent_comparison::<STOP_EARLY>(row, axes, relation, selected, work, accept)
+                }
+            }
+        }
+    }
+
+    fn visit_independent_comparison<const STOP_EARLY: bool>(
+        row: &IntegerRow, [left, right]: [usize; 2], relation: IntegerRelation, selected: [bool; 2], work: &mut usize,
+        accept: &mut impl FnMut(Cow<'_, IntegerRow>, usize, &mut usize) -> Option<bool>,
+    ) -> Option<bool> {
         let left_size = comparison_domain_size(&row[left], MAX_INDEPENDENT_COMPARISON_POINTS, work)?;
         let right_limit = left_size.map_or(MAX_INDEPENDENT_COMPARISON_POINTS, |size| size.saturating_sub(1));
         let right_size = comparison_domain_size(&row[right], right_limit, work)?;
@@ -5841,22 +6211,27 @@ impl IntegerInputs {
         } else {
             (left, right, relation.reversed(), left_size?)
         };
-        charge_call_work(work, count.checked_add(row[small].interval_count())?)?;
+        if !STOP_EARLY { charge_call_work(work, count.checked_add(row[small].interval_count())?)?; }
         for (first, last) in row[small].intervals() {
+            if STOP_EARLY { charge_call_work(work, 1)?; }
             let mut point = first.clone();
             loop {
-                Self::emit_ordinary_bound(row, broad, relation, &point, Some(small), selected, work, output)?;
+                if STOP_EARLY { charge_call_work(work, 1)?; }
+                if Self::visit_ordinary_bound(row, broad, relation, &point, Some(small), selected, work, accept)? {
+                    return Some(true);
+                }
                 if &point == last { break; }
                 point += 1u8;
             }
         }
-        Some(())
+        Some(false)
     }
 
-    fn emit_ordinary_bound(
+    fn visit_ordinary_bound(
         row: &IntegerRow, axis: usize, relation: IntegerRelation, bound: &BigInt, fixed: Option<usize>,
-        selected: [bool; 2], work: &mut usize, output: &mut [Self; 2],
-    ) -> Option<()> {
+        selected: [bool; 2], work: &mut usize,
+        accept: &mut impl FnMut(Cow<'_, IntegerRow>, usize, &mut usize) -> Option<bool>,
+    ) -> Option<bool> {
         let intervals = row[axis].interval_count();
         charge_call_work(work, intervals.checked_mul(3)?.checked_add(5)?)?;
         let subsets = match selected {
@@ -5889,9 +6264,9 @@ impl IntegerInputs {
                 // the two axes have already been proven independent in this row.
                 retained.replace_domain(fixed, Rc::new(IntegerSet::singleton(bound)));
             }
-            output[lane].0.push(retained);
+            if accept(Cow::Owned(retained), lane, work)? { return Some(true); }
         }
-        Some(())
+        Some(false)
     }
 
     fn ordinary_boolean(

@@ -63,11 +63,11 @@ impl<Scalar: ScalarCatalogEvidence> ActualIntegerObserver for WithArrays<'_, '_,
         self.scalar.enables_character_initializers()
     }
 
-    fn observe_initializer_pair(
-        &mut self, target: PreparedCallable, site: InitializerProofSite<'_>,
-        parameters: &[ScalarType], arguments: &[&BigInt], values: &[BigInt; 2],
-    ) -> Result<(), ProjectCheck> {
-        self.scalar.observe_initializer_pair(target, site, parameters, arguments, values)
+    fn check_initializer_pair(
+        &mut self, target: PreparedCallable, body: &FunctionCallSites, site: InitializerProofSite<'_>,
+        parameters: &[ScalarType], arguments: &[&BigInt],
+    ) -> Result<[BigInt; 2], ProjectCheck> {
+        self.scalar.check_initializer_pair(target, body, site, parameters, arguments)
     }
 
     fn permits_named_pure_affine_return(&self, target: PreparedCallable, arguments: &[&BigInt]) -> bool {

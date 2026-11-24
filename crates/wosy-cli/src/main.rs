@@ -1140,11 +1140,12 @@ fn check_command(
             });
         }
         let value = proof_scalar_text(&failure.invocation.returned, failure.invocation.returned_literal);
-        let mut notes = vec![match failure.invocation.result_slot {
-            Some(slot) => format!("call returned output {} = {value}", slot + 1),
-            None => format!("call returned {value}"),
-        }];
-        if (failure.invocation.result_slot.is_some()
+        let mut notes = vec![if let Some(pair) = &failure.invocation.returned_pair {
+            format!("call returned {}", proof_pair_text(pair))
+        } else if let Some(slot) = failure.invocation.result_slot {
+            format!("call returned output {} = {value}", slot + 1)
+        } else { format!("call returned {value}") }];
+        if (failure.invocation.result_slot.is_some() || failure.invocation.returned_pair.is_some()
             || matches!(failure.invocation.returned_literal, Some(wosy_compiler::ScalarCheckerProofLiteral::Character(_))))
             && !failure.invocation.arguments.is_empty()
         {
@@ -1181,6 +1182,13 @@ fn check_command(
                 message: "return with a counterexample".to_owned(),
             },
         ];
+        if let Some(output) = &failure.other_output {
+            labels.push(DiagnosticLabel {
+                kind: DiagnosticLabelKind::Secondary,
+                span: output.clone(),
+                message: "other output from this return".to_owned(),
+            });
+        }
         if failure.failed_step.is_some() {
             labels.push(DiagnosticLabel {
                 kind: DiagnosticLabelKind::Secondary,
@@ -1189,10 +1197,11 @@ fn check_command(
             });
         }
         let value = proof_scalar_text(&failure.returned, failure.returned_literal);
-        let mut notes = vec![match failure.result_slot {
-            Some(slot) => format!("symbolic call can return output {} = {value}", slot + 1),
-            None => format!("symbolic call can return {value}"),
-        }];
+        let mut notes = vec![if let Some(pair) = &failure.returned_pair {
+            format!("symbolic call can return {}", proof_pair_text(pair))
+        } else if let Some(slot) = failure.result_slot {
+            format!("symbolic call can return output {} = {value}", slot + 1)
+        } else { format!("symbolic call can return {value}") }];
         if let Some(entry) = entry_point_note(&failure.witness, publication.texts, false, failure.returned_literal.is_some()) {
             notes.push(entry);
         }
@@ -1283,6 +1292,13 @@ fn proof_scalar_text(value: impl std::fmt::Display, literal: Option<wosy_compile
         Some(Character(value)) => format!("{value:?}"),
         None => value.to_string(),
     }
+}
+
+#[cfg(feature = "internal-checker")]
+fn proof_pair_text<T: std::fmt::Display>([(left, left_literal), (right, right_literal)]: &[(T, Option<wosy_compiler::ScalarCheckerProofLiteral>); 2])
+    -> String
+{
+    format!("(output 1 = {}, output 2 = {})", proof_scalar_text(left, *left_literal), proof_scalar_text(right, *right_literal))
 }
 
 #[cfg(feature = "internal-checker")]
