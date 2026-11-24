@@ -1,5 +1,5 @@
 use super::*;
-use crate::scalar::{CfgPointId, ReferenceFlowPoint};
+use crate::scalar::{CfgPointId, ReferenceBindingId, ReferenceFlowPoint};
 use wosy_syntax::ByteSpan;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -22,6 +22,9 @@ pub(super) fn fresh_return_outputs(
     let mut result = BTreeSet::new();
     let mut external_outputs = BTreeSet::new();
     let mut projected_returns = BTreeMap::new();
+    let mut branches = BTreeMap::new();
+    let mut named_external_joins = Vec::new();
+    let mut dynamic_count = 0;
     for point in &reference_cfg.points {
         let CfgPointKind::ReturnOutput {
             output,
@@ -36,7 +39,8 @@ pub(super) fn fresh_return_outputs(
             .as_ref()
             .ok_or_else(|| format!("missing validated return origin at {:?}", point.source_span))?;
         let mut local = false;
-        let mut external = false;
+        let mut external_fresh = false;
+        let mut borrowed = false;
         for origin in origins {
             match &reference_cfg.facts[origin.0] {
                 ReferenceOrigin::Fresh { allocation, .. }
@@ -45,9 +49,8 @@ pub(super) fn fresh_return_outputs(
                 {
                     local = true
                 }
-                ReferenceOrigin::Fresh { .. } | ReferenceOrigin::BorrowedFrom { .. } => {
-                    external = true;
-                }
+                ReferenceOrigin::Fresh { .. } => external_fresh = true,
+                ReferenceOrigin::BorrowedFrom { .. } => borrowed = true,
                 ReferenceOrigin::Null { .. } => {}
                 ReferenceOrigin::Invalid { .. } => {
                     return Err(format!(
@@ -60,18 +63,59 @@ pub(super) fn fresh_return_outputs(
         if local {
             result.insert(output);
         }
-        if external {
+        if external_fresh || borrowed {
             external_outputs.insert(output);
+        }
+        dynamic_count += usize::from((local || external_fresh) && borrowed || local && external_fresh);
+        // A named result joining a forwarded allocation and a borrowed
+        // address already has an ABI owner slot. Its lexical slot must track
+        // assignments just like a local-allocation/borrowed join.
+        if external_fresh && borrowed && !local && !projected {
+            if let Some(metadata) = function.body.final_output_values.get(output) {
+                let read = &reference_cfg.points[value_point.0];
+                if let (
+                    ScalarExpression::Name { name, .. },
+                    CfgPointKind::Read { binding },
+                ) = (&metadata.value, &read.kind) {
+                    if function.body.span == binding.block_span
+                        && binding.function_span == function.span
+                        && binding.source == point.source_span.source
+                        && binding.kind == ReferenceBindingKind::Declared
+                        && read.source_span.range == metadata.span
+                        && read.possible_origins.as_ref() == Some(origins)
+                    {
+                        named_external_joins.push((output, name, binding));
+                    }
+                }
+            }
         }
         if projected {
             projected_returns.insert(output, (point.id, value_point));
+        }
+    }
+    if !named_external_joins.is_empty() {
+        let names = exact_null_root_owner_names(function, reference_cfg);
+        let mut seen = BTreeSet::new();
+        // Branch materialization handles this whole sidecar cohort. Do not
+        // suppress legacy forwarding for an unhandled member, or write two
+        // dynamic slots from one current owner.
+        if named_external_joins.len() == dynamic_count
+            && named_external_joins.iter().all(|(_, name, binding)| {
+                names.get(*name) == Some(binding) && seen.insert(*binding)
+            })
+        {
+            let selected = branches.entry((function.body.span.start, function.body.span.end))
+                .or_insert_with(ReturnBranch::default);
+            for (output, name, _) in named_external_joins {
+                selected.covered.insert(output);
+                selected.joined.insert(output, name.clone());
+            }
         }
     }
     let mixed = result
         .intersection(&external_outputs)
         .copied()
         .collect::<BTreeSet<_>>();
-    let mut branches = BTreeMap::new();
     for output in &mixed {
         if projected {
             let &(return_point, value_point) = &projected_returns[output];
@@ -102,6 +146,64 @@ pub(super) fn fresh_return_outputs(
     }
     result.retain(|output| !mixed.contains(output));
     Ok((result, branches))
+}
+
+/// The existing storage/assignment state is keyed by spelling. Only admit
+/// exact root bindings here if no nested declaration can shadow them, the
+/// spelling is unique among root declarations/parameters, and the checked
+/// initializer establishes the false initial sidecar without allocating.
+fn exact_null_root_owner_names<'a>(
+    function: &'a ScalarFunction,
+    cfg: &'a ScalarReferenceCfg,
+) -> BTreeMap<&'a String, &'a ReferenceBindingId> {
+    let mut null_bindings = BTreeMap::new();
+    for point in &cfg.points {
+        let CfgPointKind::Bind { binding } = &point.kind else { continue };
+        if binding.kind != ReferenceBindingKind::Declared
+            || binding.function_span != function.span
+            || binding.block_span != function.body.span
+        {
+            return BTreeMap::new();
+        }
+        if point.possible_origins.as_ref().is_some_and(|origins| {
+            !origins.is_empty() && origins.iter().all(|id| {
+                matches!(cfg.facts.get(id.0), Some(ReferenceOrigin::Null { .. }))
+            })
+        }) {
+            let span = binding.declaration_span;
+            if null_bindings.insert((span.start, span.end), binding).is_some() {
+                return BTreeMap::new();
+            }
+        }
+    }
+    let mut names = BTreeMap::new();
+    for name in &function.parameters {
+        names.insert(name, None);
+    }
+    for item in &function.body.items {
+        let ScalarBlockItem::LocalBinding(binding) = item else { continue };
+        let mut register = |name, span: ByteSpan, eligible| {
+            let owner = if eligible {
+                null_bindings.get(&(span.start, span.end)).copied()
+            } else {
+                None
+            };
+            names.entry(name).and_modify(|slot| *slot = None).or_insert(owner);
+        };
+        let initializer_is_null = !binding.is_allocation
+            && binding.fallible_assignment.is_none()
+            && matches!(&binding.value, ScalarExpression::Name { name, .. } if name == "null");
+        match binding.receivers.as_slice() {
+            [] => register(&binding.name, binding.name_span, initializer_is_null),
+            [receiver] => register(&receiver.name, receiver.name_span, initializer_is_null),
+            receivers => {
+                for receiver in receivers {
+                    register(&receiver.name, receiver.name_span, false);
+                }
+            }
+        }
+    }
+    names.into_iter().filter_map(|(name, binding)| Some((name, binding?))).collect()
 }
 
 fn projected_return_arms(block: &ScalarBlock) -> Option<[&ScalarBlock; 2]> {

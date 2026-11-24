@@ -1665,7 +1665,7 @@ fn joined_local_and_forwarded_checked_assignment_returns_by_runtime_owner() {
         "src/main.w".into(),
         "r1".into(),
     );
-    let text = "%%start\nstruct copy Point { u8 value; }\n*Point(bool) allocate = fn(flag) { Point local = { .value = 22; }; if (flag) { &local } else { null } };\n*Point(bool, bool) choose = fn(local, external) { *Point result = null; if (local) { Point owned = { .value = 11; }; result = &owned; }; if (external) { result = allocate(true); }; result };\n*Point(*Point, bool, bool) choose_borrow = fn(input, local, borrowed) { *Point result = null; if (local) { Point owned = { .value = 44; }; result = &owned; }; if (borrowed) { result = input; }; result };\nunit() caller = fn { *Point first = choose(true, false); Point one = *first; *Point second = choose(false, true); Point two = *second; *Point absent = choose(false, false); Point outside = { .value = 33; }; *Point local = choose_borrow(&outside, true, false); Point three = *local; *Point borrowed = choose_borrow(&outside, false, true); Point four = *borrowed; *Point replaced = choose_borrow(&outside, true, true); Point five = *replaced; *Point empty = choose_borrow(&outside, false, false); if (one.value != 11 || two.value != 22 || absent != null || three.value != 44 || four.value != 33 || five.value != 33 || empty != null || outside.value != 33) { core.system_panic(); }; };\ncaller();\n%%end";
+    let text = "%%start\nstruct copy Point { u8 value; }\n*Point(bool) allocate = fn(flag) { Point local = { .value = 22; }; if (flag) { &local } else { null } };\n*Point(bool, bool) choose = fn(local, external) { *Point result = null; Point owned = { .value = 11; }; if (local) { result = &owned; }; if (external) { result = allocate(true); }; result };\n*Point(*Point, bool, bool) choose_borrow = fn(input, local, borrowed) { *Point result = null; Point owned = { .value = 44; }; if (local) { result = &owned; }; if (borrowed) { result = input; }; result };\nunit() caller = fn { *Point first = choose(true, false); Point one = *first; *Point second = choose(false, true); Point two = *second; *Point absent = choose(false, false); Point outside = { .value = 33; }; *Point local = choose_borrow(&outside, true, false); Point three = *local; *Point borrowed = choose_borrow(&outside, false, true); Point four = *borrowed; *Point replaced = choose_borrow(&outside, true, true); Point five = *replaced; *Point empty = choose_borrow(&outside, false, false); if (one.value != 11 || two.value != 22 || absent != null || three.value != 44 || four.value != 33 || five.value != 33 || empty != null || outside.value != 33) { core.system_panic(); }; };\ncaller();\n%%end";
     for layout in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
         let parsed = parse_source(source.clone(), text.to_owned(), &[]);
         let single = derive_scalar_program_with_layout(&parsed.result, layout);
@@ -1698,7 +1698,7 @@ fn joined_assignment_previous_values_are_captured_before_group_writes_on_both_ta
         "src/main.w".into(),
         "r1".into(),
     );
-    let text = "%%start\nstruct copy Point { u8 value; }\n(*Point, *Point)(*Point, bool, bool) choose = fn(input, local, borrowed) { *Point left = null; *Point right = null; u8 marker = 0; *!u8 marker_writer = &!marker; if (local) { Point first = { .value = 11; }; Point second = { .value = 22; }; left, right, *marker_writer = &first, &second, 3; }; if (borrowed) { left, right, *marker_writer = input, input, 4; }; marker_writer; left, right };\n%%end";
+    let text = "%%start\nstruct copy Point { u8 value; }\n*Point(u8) create = fn(value) { Point backing = { .value = value; }; &backing };\n(*Point, *Point)(*Point, bool, bool) choose = fn(input, local, borrowed) { *Point left = null; *Point right = null; u8 marker = 0; *!u8 marker_writer = &!marker; if (local) { left, right, *marker_writer = create(11), create(22), 3; }; if (borrowed) { left, right, *marker_writer = input, input, 4; }; marker_writer; left, right };\n%%end";
     for (layout, width) in [
         (ScalarTargetLayout::WASM32, "i32"),
         (ScalarTargetLayout::NATIVE64, "i64"),
@@ -1989,7 +1989,7 @@ fn joined_group_transfer_does_not_release_the_address_transferred_to_left() {
         "src/main.w".into(),
         "r1".into(),
     );
-    let text = "%%start\nstruct copy Point { u8 value; }\n(*Point, *Point)(*Point, bool, bool, bool) choose = fn(input, local, borrowed, transfer) { *Point left = null; *Point right = null; if (local) { Point first = { .value = 11; }; Point second = { .value = 22; }; left, right = &first, &second; }; if (borrowed) { left, right = input, input; }; if (transfer) { left, right = right, input; }; left, right };\nunit() caller = fn { Point outside = { .value = 33; }; *Point first, *Point second = choose(&outside, true, false, true); Point one = *first; Point two = *second; one; two; };\ncaller();\n%%end";
+    let text = "%%start\nstruct copy Point { u8 value; }\n*Point(u8) create = fn(value) { Point backing = { .value = value; }; &backing };\n(*Point, *Point)(*Point, bool, bool, bool) choose = fn(input, local, borrowed, transfer) { *Point left = null; *Point right = null; if (local) { left, right = create(11), create(22); }; if (borrowed) { left, right = input, input; }; if (transfer) { left, right = right, input; }; left, right };\nunit() caller = fn { Point outside = { .value = 33; }; *Point first, *Point second = choose(&outside, true, false, true); Point one = *first; Point two = *second; one; two; };\ncaller();\n%%end";
     let mut unsafe_routes = Vec::new();
     for (layout, width) in [
         (ScalarTargetLayout::WASM32, "i32"),
@@ -2318,7 +2318,7 @@ fn joined_group_crossed_self_and_ordinary_replacements_preserve_owner_authority(
             "src/main.w".into(),
             "r1".into(),
         );
-        let text = format!("%%start\nstruct copy Point {{ u8 value; }}\n(*Point, *Point)(*Point, bool, bool, bool) choose = fn(input, local, borrowed, replace) {{ *Point left = null; *Point right = null; if (local) {{ Point first = {{ .value = 11; }}; Point second = {{ .value = 22; }}; left, right = &first, &second; }}; if (borrowed) {{ left, right = input, input; }}; if (replace) {{ {group} }}; left, right }};\n%%end");
+        let text = format!("%%start\nstruct copy Point {{ u8 value; }}\n*Point(u8) create = fn(value) {{ Point backing = {{ .value = value; }}; &backing }};\n(*Point, *Point)(*Point, bool, bool, bool) choose = fn(input, local, borrowed, replace) {{ *Point left = null; *Point right = null; if (local) {{ left, right = create(11), create(22); }}; if (borrowed) {{ left, right = input, input; }}; if (replace) {{ {group} }}; left, right }};\n%%end");
         for (layout, width) in [
             (ScalarTargetLayout::WASM32, "i32"),
             (ScalarTargetLayout::NATIVE64, "i64"),
