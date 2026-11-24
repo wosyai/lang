@@ -2995,7 +2995,7 @@ impl Body<'_> {
                     || structure.checked_types.expressions.get(&step_init.primary) != Some(&returned.ty)
                 { return None; }
                 if signature.parameters.iter().all(ordinary_value) {
-                    if returns_owner || siblings.len() == MAX_SIBLING_RECEIPTS { return None; }
+                    if siblings.len() == MAX_SIBLING_RECEIPTS { return None; }
                     let (call, None) = exact_bounded_call_arguments(
                         points, read, scope, self.sites, step_init.primary, &signature.parameters, None,
                     )? else { return None };
@@ -4778,7 +4778,7 @@ fn closed_aggregates<'a>(
                 let target = target_body(&declarations, body.cfg, point)?;
                 Some((target, *identity_relays.get(&target)?))
             }) {
-                let dependencies: Option<BTreeSet<_>> = choice.leaves.iter().map(|&point| {
+                let dependencies: Option<BTreeSet<_>> = choice.leaves.iter().chain(&choice.sibling_calls).map(|&point| {
                     let target = target_body(&declarations, body.cfg, point)?;
                     (!bodies.get(&target)?.has_mixed_struct_result()).then_some(target)
                 }).collect();
@@ -4834,8 +4834,8 @@ fn closed_aggregates<'a>(
     // Only independently allocated owners seed the two worklists. A wrapper
     // becomes an owning producer when its returned recommit has such a seed.
     // Each observed call edge is consumed once, including through wrapper chains.
-    // A selected returned receipt additionally waits for every distinct factory
-    // target; validation of its body and each factory still happens below.
+    // A selected returned receipt also waits for every distinct branch or
+    // sibling producer; normal body and lexical endpoint checks still follow.
     loop {
         if let Some(target) = pending.pop() {
             if let Some(body_callers) = callers.remove(&target) {
