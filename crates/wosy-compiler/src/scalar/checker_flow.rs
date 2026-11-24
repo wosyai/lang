@@ -103,6 +103,7 @@ pub(super) struct ImportedLocal<'a> {
 pub(super) enum ImportedVerifiedReturn<'a> {
     Constant { values: &'a std::cell::OnceCell<Rc<IntegerSet>>, bound: &'a BigInt },
     EntryAlias(usize),
+    EntryAffine { slot: usize, transform: &'a Rc<IntegerAffineTransform> },
 }
 
 pub(super) enum ImportedIntegerValues<'a> {
@@ -1052,12 +1053,17 @@ enum ProjectedEntry {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-struct IntegerAffineTransform {
+pub(super) struct IntegerAffineTransform {
     reflected: bool,
     offset: BigInt,
 }
 
 impl IntegerAffineTransform {
+    #[cfg(feature = "internal-checker")]
+    pub(super) fn unit(reflected: bool, offset: BigInt) -> Self {
+        Self { reflected, offset }
+    }
+
     fn apply(&self, domain: &IntegerSet, inverse: bool) -> IntegerSet {
         domain.affine_unit(self.reflected, &self.offset, inverse)
     }
@@ -3361,6 +3367,7 @@ pub(super) struct PartitionedCallProof<'a> {
 pub(super) enum PartitionedProofGoal<'a> {
     Literal(IntegerRelation, &'a BigInt),
     EntryEquality(usize),
+    EntryAffineEquality { slot: usize, transform: &'a Rc<IntegerAffineTransform> },
 }
 
 #[cfg(feature = "internal-checker")]
@@ -3503,8 +3510,15 @@ pub(super) fn verify_named_pair_return<'a>(
     let [first, second] = producer.boundary.checker_parameter_bindings.as_deref()? else { return None; };
     let [left, right] = producer.boundary.parameters.as_slice() else { return None; };
     let [result] = producer.boundary.results.as_slice() else { return None; };
-    if let PartitionedProofGoal::EntryEquality(slot) = goal {
+    if let PartitionedProofGoal::EntryEquality(slot) | PartitionedProofGoal::EntryAffineEquality { slot, .. } = goal {
         if producer.boundary.parameters.get(slot)?.ty != result.ty { return None; }
+    }
+    if let PartitionedProofGoal::EntryAffineEquality { slot, transform } = goal {
+        if guards.iter().any(IntegerSet::is_empty) {
+            return Some(PartitionedCallProof { applicable: false, covers_guard: false, failure: None });
+        }
+        let (min, max) = super::typecheck::integer_bounds(&result.ty)?;
+        transform.fits(guards.get(slot)?, &min, &max)?;
     }
     let mut applicable = false;
     'pieces: for piece in &pair.pieces {
@@ -3589,6 +3603,31 @@ pub(super) fn verify_named_pair_return<'a>(
                 *cells.get_mut(*output)? = Rc::new(IntegerSet::singleton(&source));
                 returned
             }
+            (PartitionedProofGoal::EntryAffineEquality { slot, transform }, actual) => {
+                let (actual_transform, constant) = match actual {
+                    IntegerPairPartitionOutput::Singleton(values) => (None, Some(values.singleton_value()?)),
+                    IntegerPairPartitionOutput::InputAlias(axis) if *axis == slot => (None, None),
+                    IntegerPairPartitionOutput::InputAffine(axis, actual) if *axis == slot => (Some(actual), None),
+                    _ => return None,
+                };
+                if let Some(constant) = constant {
+                    let (cut_relation, cut) = transform.pull_back_cut(unequal()?, constant);
+                    if constrain(cells.get_mut(slot)?, cut_relation, &cut, work)?.is_none() { continue; }
+                    constant.clone()
+                } else {
+                    let inverse = transform.inverse();
+                    let relative = if let Some(actual) = actual_transform { inverse.compose(actual) } else { inverse };
+                    if relative.identity_everywhere() { continue; }
+                    let source = cells.get_mut(slot)?;
+                    let example = if let Some(fixed) = relative.integral_reflection_fixed_point() {
+                        let Some(example) = constrain(source, unequal()?, &fixed, work)? else { continue; };
+                        example
+                    } else {
+                        source.extremes()?.0.clone()
+                    };
+                    actual_transform.map_or_else(|| example.clone(), |actual| actual.apply_point(&example))
+                }
+            }
         };
         return Some(PartitionedCallProof { applicable, covers_guard: false, failure: Some(SymbolicLiteralFailure {
             output: piece.span, returned,
@@ -3642,6 +3681,7 @@ pub(super) fn verify_partitioned_call_return<'a>(
         };
         applicable = true;
         let failure = match (&goal, &piece.output) {
+            (PartitionedProofGoal::EntryAffineEquality { .. }, _) => return None,
             (PartitionedProofGoal::Literal(relation, bound), IntegerPartitionOutput::Singleton(output)) => {
                 let value = output.singleton_value()?;
                 (!relation.accepts(value.cmp(bound))).then(|| (Rc::clone(&input), Cow::Borrowed(value)))
@@ -5791,7 +5831,7 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                                 charge_call_work(work, 1usize.checked_add(guards.len())?)?;
                                 for row in &path.0 {
                                     let mut cost = row.len().checked_add(1)?;
-                                    if matches!(result, ImportedVerifiedReturn::EntryAlias(_)) {
+                                    if matches!(result, ImportedVerifiedReturn::EntryAlias(_) | ImportedVerifiedReturn::EntryAffine { .. }) {
                                         cost = cost.checked_add(row.equal_axes().len().checked_mul(2)?)?.checked_add(2)?;
                                     }
                                     for guard in guards {
@@ -5807,7 +5847,7 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                             }
                             let alias = match &result {
                                 ImportedVerifiedReturn::Constant { .. } => None,
-                                ImportedVerifiedReturn::EntryAlias(slot) => {
+                                ImportedVerifiedReturn::EntryAlias(slot) | ImportedVerifiedReturn::EntryAffine { slot, .. } => {
                                     let (argument, _) = origin.arguments.as_slice().get(*slot)?;
                                     if !meter_rectangle || structure.checked_types.expressions.get(argument) != Some(&receiver.ty) {
                                         return None;
@@ -5827,6 +5867,25 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                                     for row in &mut path.0 {
                                         let domain = Rc::clone(row.get(axis)?);
                                         row.append_alias(axis, domain);
+                                    }
+                                }
+                                (ImportedVerifiedReturn::EntryAffine { transform, .. }, Some(argument)) => {
+                                    let (min, max) = super::typecheck::integer_bounds(&receiver.ty)?;
+                                    let work = roots.affine_work.get_or_insert(0);
+                                    match argument {
+                                        Argument::Literal(value) => {
+                                            let result = transform.apply_point(value);
+                                            if result < min || result > max { return None; }
+                                            path.append_local(IntegerSet::singleton(&result));
+                                        }
+                                        Argument::Axis(axis) => {
+                                            for row in &mut path.0 {
+                                                let source = row.get(axis)?;
+                                                transform.fits(source, &min, &max)?;
+                                                let plan = row.prepare_affine(axis, source, transform, work)?;
+                                                row.append_affine(plan);
+                                            }
+                                        }
                                     }
                                 }
                                 _ => return None,

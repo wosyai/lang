@@ -3878,6 +3878,7 @@ struct VerifiedSymbolicEquality<'a> {
 enum VerifiedSymbolicResult<'a> {
     Constant { bound: &'a BigInt, shared: std::cell::OnceCell<Rc<IntegerSet>> },
     EntryAlias(usize),
+    EntryAffine { slot: usize, transform: Rc<super::checker_flow::IntegerAffineTransform> },
 }
 
 #[cfg(feature = "internal-checker")]
@@ -3947,6 +3948,7 @@ impl<'a> VerifiedSymbolicEquality<'a> {
             let result = match &summary.result {
                 VerifiedSymbolicResult::Constant { bound, shared } => ImportedVerifiedReturn::Constant { values: shared, bound },
                 VerifiedSymbolicResult::EntryAlias(slot) => ImportedVerifiedReturn::EntryAlias(*slot),
+                VerifiedSymbolicResult::EntryAffine { slot, transform } => ImportedVerifiedReturn::EntryAffine { slot: *slot, transform },
             };
             let values = ImportedIntegerValues::Shared { result, guards, domain, meter_rectangle };
             Ok(Some(ImportedLocal { position, values, guards: Vec::new() }))
@@ -4147,6 +4149,8 @@ impl<'a> SelectedSymbolicProof<'a, '_> {
                     if body.boundary.parameters.get(slot).is_some_and(|entry| entry.ty == output.ty)
                         && Some(case.relation) == IntegerRelation::from_operator(&BinaryOperator::Equal) =>
                     PartitionedProofGoal::EntryEquality(slot),
+                MainFlowProofBound::EntryAffine { slot, transform } if !mixed =>
+                    PartitionedProofGoal::EntryAffineEquality { slot, transform },
                 _ => return Err(ProjectCheck::Unsupported),
             };
             if case.proof_source != source || case.guard.domain.is_some() || case.guard.comparisons.len() > 2 {
@@ -4198,6 +4202,8 @@ impl<'a> SelectedSymbolicProof<'a, '_> {
                         if Some(relation) == IntegerRelation::from_operator(&BinaryOperator::Equal) =>
                         VerifiedSymbolicResult::Constant { bound, shared: std::cell::OnceCell::new() },
                     PartitionedProofGoal::EntryEquality(slot) => VerifiedSymbolicResult::EntryAlias(slot),
+                    PartitionedProofGoal::EntryAffineEquality { slot, transform } =>
+                        VerifiedSymbolicResult::EntryAffine { slot, transform: Rc::clone(transform) },
                     _ => return Err(ProjectCheck::Unsupported),
                 };
                 // Full pre-guard joint coverage and proof-free execution
@@ -4331,7 +4337,7 @@ impl<'a> SelectedSymbolicProof<'a, '_> {
                 let next = citation.map(|peer| by_declaration.get(&peer).copied().ok_or(ProjectCheck::Unsupported)).transpose()?;
                 let goal = match goal {
                     PartitionedProofGoal::Literal(relation, bound) => Some((*relation, *bound)),
-                    PartitionedProofGoal::EntryEquality(_) => None,
+                    PartitionedProofGoal::EntryEquality(_) | PartitionedProofGoal::EntryAffineEquality { .. } => None,
                 };
                 peer_nodes.push(CallingPeerNode {
                     state: if step.is_none() && shows.is_empty() && goal.is_some() {
@@ -4796,6 +4802,7 @@ impl ShowEqualityIndex {
 enum MainFlowProofBound<'a> {
     Literal(&'a BigInt),
     Entry(usize),
+    EntryAffine { slot: usize, transform: &'a Rc<super::checker_flow::IntegerAffineTransform> },
 }
 
 #[cfg(feature = "internal-checker")]
@@ -4803,7 +4810,7 @@ impl<'a> MainFlowProofBound<'a> {
     fn literal(&self) -> Option<&'a BigInt> {
         match self {
             Self::Literal(value) => Some(value),
-            Self::Entry(_) => None,
+            Self::Entry(_) | Self::EntryAffine { .. } => None,
         }
     }
 
@@ -4813,6 +4820,7 @@ impl<'a> MainFlowProofBound<'a> {
         match self {
             Self::Literal(value) => Some(value),
             Self::Entry(slot) => arguments.get(*slot).copied(),
+            Self::EntryAffine { .. } => None,
         }
     }
 }
@@ -4843,6 +4851,8 @@ impl<'a> MainFlowProofCase<'a> {
             TypedProofGoal::Universal { relation, bound } if plan.steps.items.is_empty() => (relation, MainFlowProofBound::Literal(bound)),
             TypedProofGoal::EntryComparison { slot, relation } if plan.steps.items.is_empty() =>
                 (relation, MainFlowProofBound::Entry(*slot)),
+            TypedProofGoal::EntryAffine { slot, relation, transform } if plan.steps.items.is_empty() =>
+                (relation, MainFlowProofBound::EntryAffine { slot: *slot, transform }),
             _ => return Err(ProjectCheck::Unsupported),
         };
         if &plan.typed.target.source != root {
@@ -4995,7 +5005,10 @@ impl<'a> SymbolicEqualityIssuer<'a> {
         let entry = matches!(&plan.typed.goal, TypedProofGoal::EntryComparison { slot, relation }
             if parameters.get(*slot).is_some_and(|entry| &entry.ty == plan.typed.result_type)
                 && Some(*relation) == IntegerRelation::from_operator(&BinaryOperator::Equal));
-        if rectangular && (literal || entry) {
+        let affine = matches!(&plan.typed.goal, TypedProofGoal::EntryAffine { slot, relation, .. }
+            if parameters.get(*slot).is_some_and(|entry| &entry.ty == plan.typed.result_type)
+                && Some(*relation) == IntegerRelation::from_operator(&BinaryOperator::Equal));
+        if rectangular && (literal || entry || affine) {
             return Some(Self { canonical_target: plan.canonical_target, layout: plan.typed.target.target_layout, body });
         }
         if !literal || !(proof.guard.comparisons.is_empty()
@@ -7799,7 +7812,7 @@ impl SelectedProofObserver<'_> {
                     },
                     TypedProofGoal::ConjunctiveExistential(goal) => goal.holds_at(value, arguments),
                     TypedProofGoal::Disjunction(allowed) => Some(allowed.contains(value)),
-                    TypedProofGoal::DeferredDisjunction(_) => None,
+                    TypedProofGoal::DeferredDisjunction(_) | TypedProofGoal::EntryAffine { .. } => None,
                     TypedProofGoal::MixedEntryConjunction { output, entry } =>
                         holds_actual_mixed_entry(output, entry, value, arguments),
                     TypedProofGoal::Conjunction(atoms) => Some(atoms.iter().all(|(relation, bound)| relation.accepts(value.cmp(bound)))),
@@ -8036,6 +8049,8 @@ enum TypedProofGoal {
     DependentWitness(DependentWitness),
     EntryComparison { slot: usize, relation: IntegerRelation },
     #[cfg(feature = "internal-checker")]
+    EntryAffine { slot: usize, relation: IntegerRelation, transform: Rc<super::checker_flow::IntegerAffineTransform> },
+    #[cfg(feature = "internal-checker")]
     MixedEntryConjunction { output: IntegerShowConstraints<'static>, entry: [Option<IntegerRelation>; 2] },
 }
 
@@ -8043,6 +8058,7 @@ enum TypedProofGoal {
 impl TypedProofGoal {
     fn holds_on_returned_path(&self, path: &super::checker_flow::IntegerReturningPath<'_>) -> Option<bool> {
         match self {
+            Self::EntryAffine { .. } => None,
             Self::Literal { relation, bound, .. } | Self::Universal { relation, bound } =>
                 path.output_satisfies(*relation, bound),
             Self::Existential { relation, witness, witness_in_domain } => {
@@ -9237,6 +9253,38 @@ fn checked_old_output_relation(
     })())
 }
 
+#[cfg(feature = "internal-checker")]
+fn checked_affine_old_output(
+    expression: &ScalarExpression, output: &str, inputs: &[String], body: &FunctionCallSites, result: &ScalarType,
+) -> Option<TypedProofGoal> {
+    let ScalarExpression::Binary { operator: BinaryOperator::Equal, left, right, .. } = expression else { return None; };
+    let ScalarExpression::Name { name, .. } = left.as_ref() else { return None; };
+    if name != output || is_null_literal_name(name) || !is_integer_type(result) { return None; }
+    let ScalarExpression::Binary { operator, left, right, .. } = right.as_ref() else { return None; };
+    let old_slot = |expression: &ScalarExpression| {
+        let ScalarExpression::Call { receiver: Some(core), name, type_arguments, arguments, .. } = expression else { return None; };
+        let [ScalarExpression::Name { name: input, .. }] = arguments.as_slice() else { return None; };
+        if core != "core" || name != "old" || !type_arguments.is_empty() || is_null_literal_name(input) { return None; }
+        let slot = inputs.iter().position(|name| name == input)?;
+        (body.boundary.parameters.get(slot)?.ty == *result).then_some(slot)
+    };
+    let literal = |expression| {
+        let value = concrete_integer_literal(expression)?;
+        integer_literal_fits_type(&value, result).then(|| value.into_owned())
+    };
+    let (slot, reflected, offset) = match (operator, old_slot(left), old_slot(right)) {
+        (BinaryOperator::Add, Some(slot), None) => (slot, false, literal(right)?),
+        (BinaryOperator::Add, None, Some(slot)) => (slot, false, literal(left)?),
+        (BinaryOperator::Subtract, Some(slot), None) => (slot, false, -literal(right)?),
+        (BinaryOperator::Subtract, None, Some(slot)) => (slot, true, literal(left)?),
+        _ => return None,
+    };
+    Some(TypedProofGoal::EntryAffine {
+        slot, relation: IntegerRelation::from_operator(&BinaryOperator::Equal)?,
+        transform: Rc::new(super::checker_flow::IntegerAffineTransform::unit(reflected, offset)),
+    })
+}
+
 fn typed_proof_postcondition<'a, const AUDIT_INDUCTION: bool, const DEFER_OUTPUT_UNION: bool>(
     prepared: &'a PreparedCheckerProject,
     (module, item, function): (usize, usize, &'a ScalarFunction),
@@ -9369,9 +9417,22 @@ fn typed_proof_postcondition<'a, const AUDIT_INDUCTION: bool, const DEFER_OUTPUT
             let (operator, relation, bound) = checked_literal_output_goal(ensures, output, &input_names, &result.ty)?;
             TypedProofGoal::Literal { operator, relation, bound }
         } else {
-            let (slot, relation) = checked_old_output_relation(&ensures, output, &input_names, body, &result.ty)
-                .ok_or(ProjectCheck::Unsupported)??;
-            TypedProofGoal::EntryComparison { slot, relation }
+            #[cfg(feature = "internal-checker")]
+            let affine = if allow_named_entry_facts && steps.items.is_empty() && measure.is_none()
+                && matches!(body.boundary.parameters.as_slice(), [left, right] if is_integer_type(&left.ty) && is_integer_type(&right.ty))
+                && citation_safe_calling_body(body) && !body.structure.checker_integer_call_locals.is_empty()
+            {
+                checked_affine_old_output(&ensures, output, &input_names, body, &result.ty)
+            } else { None };
+            #[cfg(not(feature = "internal-checker"))]
+            let affine = None;
+            if let Some(goal) = affine {
+                goal
+            } else {
+                let (slot, relation) = checked_old_output_relation(&ensures, output, &input_names, body, &result.ty)
+                    .ok_or(ProjectCheck::Unsupported)??;
+                TypedProofGoal::EntryComparison { slot, relation }
+            }
         }
     };
 
@@ -16743,6 +16804,54 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
         let opaque = text.replace("{ 42 }", "{ value * value }");
         assert!(matches!(run(&opaque), Err(ProjectCheck::Unsupported)),
             "the false guard cannot hide an unsupported true-lane return");
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordered_named_rectangular_affine_certificate_transfers_checked_source_relation() {
+        let app = source("src/main.w", "ordered-verified-rectangular-affine");
+        let text = format!(r#"%%start
+            i16(i16, i16) leaf = fn(tag, value) {{ if (tag < 0) {{}}; -1 - value }};
+            i16(i16, i16) producer = fn(tag, value) {{ i16 result = leaf(tag, value); result }};
+            proof canonical for producer(selector, before) -> (out)
+                where (selector >= 0 && before >= 10) ensures (out == -1 - core.old(before)) {{}}
+            unit(i16, i16) consumer = fn(tag, value) {{
+                core.narrow(tag >= 0, {OUTPUT});
+                core.narrow(value >= 10, {OUTPUT});
+                i16 observed = producer(tag, value);
+                if (value == 12) {{ core.require(observed == -13, {OUTPUT}); }};
+            }};
+        %%end"#);
+        let run = |text: &str| {
+            let (_, proof) = crate::parse_proof_source(app.clone(), text.to_owned(), &[]).ok().unwrap();
+            check_loaded_ordered_proof_diagnostics_in_scope::<true>(
+                Vec::new(), vec![(proof, Vec::new())], vec![app.clone()], inputs(),
+                ScalarCheckerScope::CurrentPackage, Vec::new(),
+            )
+        };
+        let report = run(&text).unwrap();
+        assert!(report.active && report.symbolic_diagnostic.is_none() && report.directives.is_empty());
+        let refuted = run(&text.replace("observed == -13", "observed != -13")).unwrap();
+        let [failure] = refuted.directives.as_slice() else { panic!("one ordinary failure from the verified transfer"); };
+        let source = BigInt::from(12);
+        let mapped = BigInt::from(-13);
+        assert!(failure.witness.intervals_at(0, 1).unwrap().eq([(&source, &source)]));
+        assert!(failure.witness.intervals_at(0, 2).unwrap().eq([(&mapped, &mapped)]));
+        for (label, refused) in [
+            ("first guard", text.replace("core.narrow(tag >= 0", "core.narrow(tag < 0")),
+            ("second guard", text.replace("core.narrow(value >= 10", "core.narrow(value >= 0")),
+            ("different claimed map", text.replace("-1 - core.old(before)", "0 - core.old(before)")),
+            ("claim overflows on admissible input", text.replace(" && before >= 10", "").replace("-1 - core.old(before)", "1 - core.old(before)")),
+            ("producer overflows before guard", text.replace("-1 - value", "1 - value")),
+        ] {
+            let result = run(&refused);
+            assert!(matches!(result, Err(ProjectCheck::Unsupported)), "{label}: {:?}", result.err());
+        }
+        let with_no_consumer = text.split_once("unit(i16, i16) consumer").unwrap().0.to_owned() + "%%end";
+        let false_claim = with_no_consumer.replace("-1 - core.old(before)", "0 - core.old(before)");
+        let failure = run(&false_claim).unwrap().symbolic_diagnostic.unwrap();
+        assert_eq!(failure.returned, BigInt::from(-11));
+        assert!(failure.witness.intervals_at(0, 1).unwrap().eq([(&BigInt::from(10), &BigInt::from(32767))]));
     }
 
     #[cfg(feature = "internal-checker")]

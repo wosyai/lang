@@ -1639,6 +1639,28 @@ cases.extend([
         1,b"proof obligation failed"),
 ])
 
+verified_rectangular_affine = f"""%%start
+    i16(i16, i16) leaf = fn(tag, value) {{ if (tag < 0) {{}}; -1 - value }};
+    i16(i16, i16) producer = fn(tag, value) {{ i16 result = leaf(tag, value); result }};
+    proof canonical for producer(selector, before) -> (out)
+        where (selector >= 0 && before >= 10) ensures (out == -1 - core.old(before)) {{}}
+    unit(i16, i16) consumer = fn(tag, value) {{
+        core.narrow(tag >= 0, {report(46,"AFFINE-FIRST-NARROW")});
+        core.narrow(value >= 10, {report(47,"AFFINE-SECOND-NARROW")});
+        i16 observed = producer(tag, value);
+        if (value == 12) {{ core.require(observed == -13, {report(48,"VERIFIED-AFFINE-OUTPUT")}); }};
+    }};
+%%end"""
+cases.extend([
+    ("ordinary-verified-rectangular-affine-consumed",verified_rectangular_affine,0,b""),
+    ("ordinary-verified-rectangular-affine-exact-refutation",verified_rectangular_affine.replace("observed == -13","observed != -13"),
+        48,b"VERIFIED-AFFINE-OUTPUT"),
+    ("ordinary-verified-rectangular-affine-outside-guard",verified_rectangular_affine.replace("core.narrow(value >= 10","core.narrow(value >= 0"),
+        2,b"unsupported analysis"),
+    ("ordinary-verified-rectangular-affine-false-equation",verified_rectangular_affine.replace("-1 - core.old(before)","0 - core.old(before)"),
+        2,b"unsupported analysis"),
+])
+
 verified_rectangular_alias = f"""%%start
     i16(i16, i16) leaf = fn(tag, value) {{ if (tag >= 0) {{ value }} else {{ 4 }} }};
     i16(i16, i16) producer = fn(tag, value) {{ i16 result = leaf(tag, value); result }};
