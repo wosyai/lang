@@ -1306,6 +1306,16 @@ impl IntegerRow {
             && !self.affine.as_ref().is_some_and(|class| class.contains(left) && class.contains(right))).then_some(())
     }
 
+    #[cfg(feature = "internal-checker")]
+    fn require_named_pair_entry(&self, bool_axis: Option<usize>, work: &mut usize) -> Option<()> {
+        self.require_independent_named_pair(work)?;
+        if let Some(axis) = bool_axis {
+            charge_call_work(work, 1)?;
+            bool_result_lane(self.get(axis)?.singleton_value()?)?;
+        }
+        Some(())
+    }
+
     fn replace_pair(&mut self, [first, second]: [usize; 2], [left, right]: [Rc<IntegerSet>; 2]) -> Option<()> {
         self.replace_domain(first, left);
         if self.linked_axes(first, second) {
@@ -1514,6 +1524,8 @@ struct IntegerRoots<'a> {
     affine_work: Option<usize>,
     #[cfg(feature = "internal-checker")]
     named_pair_rectangles: bool,
+    #[cfg(feature = "internal-checker")]
+    named_pair_bool_axis: Option<usize>,
     #[cfg(feature = "internal-checker")]
     named_exact_bool: bool,
     #[cfg(feature = "internal-checker")]
@@ -3391,6 +3403,56 @@ pub(super) fn covers_all_named_pair_inputs(
         if !full[1].is_subset_of(&IntegerSet::union(active.iter().copied())) { return Some(false); }
     }
     Some(true)
+}
+
+#[cfg(feature = "internal-checker")]
+pub(super) fn covers_all_named_mixed_pair_inputs(
+    returned: &ActualCallResult, bool_axis: usize, full_integer: &IntegerSet, work: &mut usize,
+) -> Option<bool> {
+    let ActualCallResult::PartitionedIntegerPair(pair) = returned else { return None; };
+    if pair.caller_axes != [0, 1] || bool_axis >= 2 { return None; }
+    charge_call_work(work, pair.pieces.len().checked_mul(2)?)?;
+    let numeric = 1 - bool_axis;
+    let mut domains = [Vec::new(), Vec::new()];
+    let mut intervals = [0usize; 2];
+    for piece in &pair.pieces {
+        if piece.anchor != 0 || matches!(piece.output, IntegerPairPartitionOutput::InputAffine(..)) { return None; }
+        let lane = bool_result_lane(piece.inputs[bool_axis].singleton_value()?)?;
+        let values = piece.inputs[numeric].as_ref();
+        charge_call_work(work, values.interval_count().checked_add(full_integer.interval_count())?)?;
+        if !values.is_subset_of(full_integer) { return None; }
+        intervals[lane] = intervals[lane].checked_add(values.interval_count())?;
+        domains[lane].push(values);
+    }
+    for (cells, count) in domains.into_iter().zip(intervals) {
+        let depth = (usize::BITS - count.leading_zeros()) as usize;
+        charge_call_work(work, count.checked_mul(depth.checked_mul(2)?.checked_add(4)?)?
+            .checked_add(full_integer.interval_count())?)?;
+        if !full_integer.is_subset_of(&IntegerSet::union(cells)) { return Some(false); }
+    }
+    Some(true)
+}
+
+#[cfg(all(test, feature = "internal-checker"))]
+#[test]
+fn named_mixed_pair_checks_complete_integer_domain_in_each_singleton_tag() {
+    let zero = BigInt::from(0);
+    let one = BigInt::from(1);
+    let integer = IntegerSet::ordinary_bool_domain();
+    let full = || IntegerSet::ordinary_bool_domain();
+    let piece = |tag, values| IntegerPairReturnPartition {
+        span: super::ByteSpan { start: 0, end: 0 }, anchor: 0,
+        inputs: [Rc::new(tag), Rc::new(values)], output: IntegerPairPartitionOutput::InputAlias(1),
+    };
+    let coverage = |pieces| covers_all_named_mixed_pair_inputs(
+        &ActualCallResult::PartitionedIntegerPair(ProjectedIntegerPair { caller_axes: [0, 1], pieces }), 0, &integer, &mut 0,
+    );
+    assert_eq!(coverage(vec![
+        piece(IntegerSet::singleton(&zero), IntegerSet::singleton(&zero)),
+        piece(IntegerSet::singleton(&one), IntegerSet::singleton(&one)),
+    ]), Some(false));
+    assert_eq!(coverage(vec![piece(full(), full())]), None, "merged numeric interval cannot certify two Bool lanes");
+    assert_eq!(coverage(vec![piece(IntegerSet::singleton(&zero), full()), piece(IntegerSet::singleton(&one), full())]), Some(true));
 }
 
 #[cfg(all(test, feature = "internal-checker"))]
@@ -5477,7 +5539,7 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                         });
                         for row in &path.0 {
                             if roots.named_pair_rectangles {
-                                row.require_independent_named_pair(work)?;
+                                row.require_named_pair_entry(roots.named_pair_bool_axis, work)?;
                             }
                             let value = computed_projected_value(row, roots.projected_entry_axis,
                                 operation, left, right, &min, &max)?;
@@ -6319,22 +6381,46 @@ impl<'a> ExactCallCursor<'a> {
     }
 
     #[cfg(feature = "internal-checker")]
-    pub(super) fn named_pair_root(calls: &'a FunctionCallSites, expected: &ScalarType, inputs: [IntegerSet; 2]) -> Option<Self> {
-        let row = IntegerRow::new(Vec::from(inputs.map(Rc::new)));
-        let mut cursor = Self::with_rows(calls, expected, IntegerInputs(vec![row]), None, Some([0, 1]))?;
-        cursor.require_named_pair_rectangles(false)?;
+    pub(super) fn named_pair_root(
+        calls: &'a FunctionCallSites, expected: &ScalarType, inputs: [IntegerSet; 2], bool_axis: Option<usize>,
+    ) -> Option<Self> {
+        let cells = inputs.map(Rc::new);
+        let rows = if let Some(axis) = bool_axis {
+            // Encode categorical false/true with separate singleton rows;
+            // a numeric interval never represents an admitted Bool tag.
+            let mut rows = Vec::with_capacity(2);
+            for lane in [false, true] {
+                let mut inputs = cells.clone();
+                *inputs.get_mut(axis)? = Rc::new(IntegerSet::singleton(&BigInt::from(u8::from(lane))));
+                rows.push(IntegerRow::new(Vec::from(inputs)));
+            }
+            rows
+        } else {
+            vec![IntegerRow::new(Vec::from(cells))]
+        };
+        let mut cursor = Self::with_rows(calls, expected, IntegerInputs(rows), None, Some([0, 1]))?;
+        cursor.require_named_pair_rectangles(false, bool_axis)?;
         Some(cursor)
     }
 
     #[cfg(feature = "internal-checker")]
-    pub(super) fn require_named_pair_rectangles(&mut self, pure_projection_leaf: bool) -> Option<()> {
+    pub(super) fn require_named_pair_rectangles(&mut self, pure_projection_leaf: bool, bool_axis: Option<usize>) -> Option<()> {
         if self.projected_pair.is_none() || self.projected_slot.is_some() || !self.tail.is_some_and(is_integer_type) {
             return None;
         }
+        if let Some(axis) = bool_axis {
+            if axis >= 2 || *self.roots.axes.get(axis)?.1 != ScalarType::Bool
+                || !is_integer_type(self.roots.axes.get(1 - axis)?.1) || pure_projection_leaf
+            {
+                return None;
+            }
+            self.roots.named_exact_bool = true;
+        }
         for row in &self.block.path.0 {
-            row.require_independent_named_pair(&mut self.return_capture_work)?;
+            row.require_named_pair_entry(bool_axis, &mut self.return_capture_work)?;
         }
         self.roots.named_pair_rectangles = true;
+        self.roots.named_pair_bool_axis = bool_axis;
         self.named_pure_projection_leaf = pure_projection_leaf;
         Some(())
     }
@@ -6794,7 +6880,7 @@ impl<'a> ExactCallCursor<'a> {
                     for row in &path.state.0 {
                         #[cfg(feature = "internal-checker")]
                         if self.roots.named_pair_rectangles {
-                            row.require_independent_named_pair(&mut self.return_capture_work)?;
+                            row.require_named_pair_entry(self.roots.named_pair_bool_axis, &mut self.return_capture_work)?;
                         }
                         let output = if let Some(axis) = alias {
                             if row[axis].singleton_value().is_some() {

@@ -466,7 +466,7 @@ impl OrderedRunEvidence for ProofFreeOrderedEvidence {
     type SymbolicReport = ();
 
     fn complete_startup(&self, _: &HashSet<PreparedCallable>) -> Result<bool, ProjectCheck> { Ok(false) }
-    fn symbolic(&self) -> Self::Symbolic<'_> { ProofFreeSymbolic { ordinary_projected_effects: false, citation_only: false, named_pair: false } }
+    fn symbolic(&self) -> Self::Symbolic<'_> { ProofFreeSymbolic { ordinary_projected_effects: false, citation_only: false, named_pair: false, named_mixed_pair: false } }
     fn finish_symbolic<'run>(_: Self::Symbolic<'run>) -> Self::SymbolicReport where Self: 'run {}
 }
 
@@ -802,6 +802,7 @@ struct ProofFreeSymbolic<const ORDINARY_PROJECTIONS: bool = false, const NAMED_P
     ordinary_projected_effects: bool,
     citation_only: bool,
     named_pair: bool,
+    named_mixed_pair: bool,
 }
 
 #[cfg(feature = "internal-checker")]
@@ -821,6 +822,8 @@ impl<const ORDINARY_PROJECTIONS: bool, const NAMED_PARTITIONS: bool> ActualInteg
     const ORDINARY_PROJECTED_PAIR: bool = ORDINARY_PROJECTIONS;
     const NAMED_RELATIONAL_PARTITIONS: bool = NAMED_PARTITIONS;
     const ORDINARY_INTEGER_LOCALS: bool = ORDINARY_PROJECTIONS;
+
+    fn named_mixed_pair(&self) -> bool { self.named_mixed_pair }
 
     fn named_pair(&self) -> bool { self.named_pair }
 
@@ -925,7 +928,7 @@ fn check_unused_module<const COLLECT: bool, const ENTRY_EVIDENCE: bool, Proof: S
             let collection = OrderedCallCollection { failures: &sink, visits: completed_visits, outer: None };
             let mut symbolic = CheckedCalls::<ProofFreeSymbolic<true>, false> {
                 project, calls, active: HashSet::from([(ordinal, item)]), active_depth: 1, reached: HashSet::new(),
-                had_obligations: false, observer: ProofFreeSymbolic { ordinary_projected_effects: !Proof::ENABLED, citation_only: false, named_pair: false }, symbolic_module: ordinal,
+                had_obligations: false, observer: ProofFreeSymbolic { ordinary_projected_effects: !Proof::ENABLED, citation_only: false, named_pair: false, named_mixed_pair: false }, symbolic_module: ordinal,
             };
             let mut cursor = ExactCallCursor::arbitrary_root(body, &body.boundary.results[0].ty)
                 .ok_or(ProjectCheck::Unsupported)?;
@@ -1720,6 +1723,9 @@ trait ActualIntegerObserver {
     fn observe(&mut self, target: (usize, usize), arguments: &[&BigInt], value: &BigInt);
 
     #[cfg(feature = "internal-checker")]
+    fn named_mixed_pair(&self) -> bool { false }
+
+    #[cfg(feature = "internal-checker")]
     fn named_pair(&self) -> bool { false }
 
     #[cfg(feature = "internal-checker")]
@@ -2326,6 +2332,14 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
         let named_pair = !ACTUAL_STARTUP && self.observer.named_pair();
         #[cfg(not(feature = "internal-checker"))]
         let named_pair = false;
+        #[cfg(feature = "internal-checker")]
+        let named_mixed_pair = named_pair && self.observer.named_mixed_pair();
+        #[cfg(not(feature = "internal-checker"))]
+        let named_mixed_pair = false;
+        #[cfg(feature = "internal-checker")]
+        if named_mixed_pair && !named_exact_mixed_pair(&signature.parameters, |ty| ty) {
+            return Err(ProjectCheck::Unsupported);
+        }
         if named_pair && (!matches!(effect, ExactCallEffect::Scalar { binding: Some(_), .. }) || !is_integer_type(expected)) {
             return Err(ProjectCheck::Unsupported);
         }
@@ -2393,7 +2407,7 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             caller, call, signature.parameters.len(), collection.is_some(), Observer::INTEGER_RETURN_PARTITIONS,
             Observer::ORDINARY_PROJECTED_PAIR || named_pair,
             Observer::ORDINARY_PROJECTED_PAIR || named_pair,
-            NAMED || (Observer::ORDINARY_INTEGER_LOCALS && (matches!(*expected, ScalarType::Unit | ScalarType::Bool)
+            NAMED || named_mixed_pair || (Observer::ORDINARY_INTEGER_LOCALS && (matches!(*expected, ScalarType::Unit | ScalarType::Bool)
                 || real_integer_input)),
         )
             .ok_or(ProjectCheck::Unsupported)?;
@@ -2418,7 +2432,7 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                 ExactCallCursor::projected_arguments(body, values, &projection, expected)
             }.ok_or(ProjectCheck::Unsupported)?;
             #[cfg(feature = "internal-checker")]
-            let pure_projection_leaf = (named_pair || named_affine_partitions)
+            let pure_projection_leaf = !named_mixed_pair && (named_pair || named_affine_partitions)
                 && parent.source == &owner.source && body.call_occurrences.is_empty()
                 && citation_safe_calling_body(body)
                 && body.structure.blocks.get(body.structure.root.0).and_then(|block| block.items.last())
@@ -2427,7 +2441,10 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                             Some((BinaryOperator::Add | BinaryOperator::Subtract, _)))));
             #[cfg(feature = "internal-checker")]
             if named_pair && matches!(projection.companion, ProjectedCompanion::Independent { .. }) {
-                cursor.require_named_pair_rectangles(pure_projection_leaf).ok_or(ProjectCheck::Unsupported)?;
+                let bool_axis = if named_mixed_pair {
+                    signature.parameters.iter().position(|ty| *ty == ScalarType::Bool)
+                } else { None };
+                cursor.require_named_pair_rectangles(pure_projection_leaf, bool_axis).ok_or(ProjectCheck::Unsupported)?;
             }
             #[cfg(feature = "internal-checker")]
             if (named_affine_partitions || named_pair) && is_integer_type(expected)
@@ -2517,7 +2534,7 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
         #[allow(unused_mut)]
         let mut cursor = ExactCallCursor::new(body, exact, expected).ok_or(ProjectCheck::Unsupported)?;
         #[cfg(feature = "internal-checker")]
-        if NAMED {
+        if NAMED || named_mixed_pair {
             cursor.allow_named_exact_bool_parameters().ok_or(ProjectCheck::Unsupported)?;
         }
         #[cfg(feature = "internal-checker")]
@@ -3992,19 +4009,19 @@ fn capture_named_calling_partitions<'a>(
     if citation_only && !citation_safe_calling_body(body) { return Err(ProjectCheck::Unsupported); }
     let mut cursor = ExactCallCursor::projected(body, Rc::new(domain), &output.ty).ok_or(ProjectCheck::Unsupported)?;
     cursor.observe_named_affine_partitions(false).ok_or(ProjectCheck::Unsupported)?;
-    run_named_partition_cursor(target, body, source, cursor, effects, runtime, citation_only, false)
+    run_named_partition_cursor(target, body, source, cursor, effects, runtime, citation_only, false, false)
 }
 
 #[cfg(feature = "internal-checker")]
 fn run_named_partition_cursor<'a>(
     target: PreparedCallable, body: &'a FunctionCallSites, source: &'a SourceIdentity,
     cursor: ExactCallCursor<'a>, effects: &mut OrderedFailures, runtime: SymbolicProofRuntime<'a>,
-    citation_only: bool, named_pair: bool,
+    citation_only: bool, named_pair: bool, named_mixed_pair: bool,
 ) -> Result<(ActualCallResult, bool, HashSet<PreparedCallable>), ProjectCheck> {
     let mut evaluator = CheckedCalls::<ProofFreeSymbolic<false, true>, false> {
         project: runtime.project, calls: runtime.calls, active: HashSet::from([target]),
         active_depth: 1, reached: HashSet::new(), had_obligations: false,
-        observer: ProofFreeSymbolic { ordinary_projected_effects: false, citation_only, named_pair }, symbolic_module: target.0,
+        observer: ProofFreeSymbolic { ordinary_projected_effects: false, citation_only, named_pair, named_mixed_pair }, symbolic_module: target.0,
     };
     let sink = RefCell::new(effects);
     let collection = OrderedCallCollection { failures: &sink, visits: runtime.visits, outer: None };
@@ -4069,18 +4086,23 @@ impl SelectedSymbolicProof<'_, '_> {
         source: &SourceIdentity, effects: &mut OrderedFailures, runtime: SymbolicProofRuntime<'_>,
         group: &MainFlowProofTarget<'_>,
     ) -> Result<Option<bool>, ProjectCheck> {
-        use super::checker_flow::{covers_all_named_pair_inputs, verify_named_pair_return, charge_call_work, PartitionedProofGoal};
+        use super::checker_flow::{covers_all_named_pair_inputs, covers_all_named_mixed_pair_inputs, verify_named_pair_return, charge_call_work, PartitionedProofGoal};
         let MainFlowProofCases::Bare { first, rest } = &group.cases else { return Err(ProjectCheck::Unsupported); };
         let [left, right] = body.boundary.parameters.as_slice() else { return Err(ProjectCheck::Unsupported); };
         let [output] = body.boundary.results.as_slice() else { return Err(ProjectCheck::Unsupported); };
+        let mixed = named_exact_mixed_pair(&body.boundary.parameters, |entry| &entry.ty);
+        let bool_axis = if mixed { Some(usize::from(right.ty == ScalarType::Bool)) } else { None };
         if !is_integer_type(&output.ty) || !citation_safe_calling_body(body)
-            || body.structure.checker_integer_call_locals.is_empty()
+            || (!mixed && body.structure.checker_integer_call_locals.is_empty())
         {
             return Err(ProjectCheck::Unsupported);
         }
+        let typed_domain = |slot, ty| {
+            if bool_axis == Some(slot) { Some(IntegerSet::ordinary_bool_domain()) } else { IntegerSet::from_type(ty) }
+        };
         let full = [
-            IntegerSet::from_type(&left.ty).ok_or(ProjectCheck::Unsupported)?,
-            IntegerSet::from_type(&right.ty).ok_or(ProjectCheck::Unsupported)?,
+            typed_domain(0, &left.ty).ok_or(ProjectCheck::Unsupported)?,
+            typed_domain(1, &right.ty).ok_or(ProjectCheck::Unsupported)?,
         ];
         let mut work = 0;
         charge_call_work(&mut work, rest.len().checked_add(1).ok_or(ProjectCheck::Unsupported)?)
@@ -4107,15 +4129,24 @@ impl SelectedSymbolicProof<'_, '_> {
                 *seen = true;
                 domains[guard.slot] = domains[guard.slot].keep_relation(guard.relation, guard.bound);
             }
+            for (slot, guard) in case.guard.boolean.iter().enumerate() {
+                if let Some(value) = guard {
+                    if bool_axis != Some(slot) || clipped[slot] { return Err(ProjectCheck::Unsupported); }
+                    domains[slot] = IntegerSet::singleton(&BigInt::from(u8::from(*value)));
+                }
+            }
             plans.push((case, goal, domains));
         }
-        let cursor = ExactCallCursor::named_pair_root(body, &output.ty, full.clone()).ok_or(ProjectCheck::Unsupported)?;
+        let cursor = ExactCallCursor::named_pair_root(body, &output.ty, full.clone(), bool_axis).ok_or(ProjectCheck::Unsupported)?;
         let mut private_effects = OrderedFailures::default();
         let (returned, active, _) = run_named_partition_cursor(target, body, source, cursor, &mut private_effects,
-            runtime, true, true)?;
-        if active || !private_effects.records.is_empty()
-            || !covers_all_named_pair_inputs(&returned, &full, &mut work).ok_or(ProjectCheck::Unsupported)?
-        {
+            runtime, true, true, mixed)?;
+        let complete = if let Some(axis) = bool_axis {
+            covers_all_named_mixed_pair_inputs(&returned, axis, &full[1 - axis], &mut work)
+        } else {
+            covers_all_named_pair_inputs(&returned, &full, &mut work)
+        }.ok_or(ProjectCheck::Unsupported)?;
+        if active || !private_effects.records.is_empty() || !complete {
             return Err(ProjectCheck::Unsupported);
         }
         let mut applicable = false;
@@ -4351,8 +4382,7 @@ impl SymbolicRootProof for SelectedSymbolicProof<'_, '_> {
             return self.equalities.consume(target, calls, source, effects);
         };
         if named_exact_mixed_pair(&calls.boundary.parameters, |entry| &entry.ty) {
-            // Mixed named guards have exact real entry evidence only.
-            return Err(ProjectCheck::Unsupported);
+            return self.verify_calling_pair(target, calls, function, source, effects, runtime, group);
         }
         if !calls.call_occurrences.is_empty() || !calls.structure.checker_direct_targets.is_empty() {
             return self.verify_calling_producer(target, calls, function, source, effects, runtime);
@@ -16610,6 +16640,44 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
 
     #[cfg(feature = "internal-checker")]
     #[test]
+    fn ordered_named_symbolic_mixed_pair_clips_each_categorical_lane_independently() {
+        let app = source("src/main.w", "ordered-symbolic-named-mixed-pair");
+        let text = r#"%%start
+            i16(bool, i16) leaf = fn(enabled, value) { if (enabled) { 42 } else { value } };
+            i16(bool, i16) producer = fn(enabled, value) { i16 result = leaf(enabled, value); result };
+            proof bounded for producer(enabled, before) -> (out)
+                where (!enabled && before >= 10) ensures (out <= 11) {}
+        %%end"#;
+        let run = |text: &str| {
+            let (_, proof) = crate::parse_proof_source(app.clone(), text.to_owned(), &[]).ok().unwrap();
+            check_loaded_ordered_proof_diagnostics_in_scope::<true>(
+                Vec::new(), vec![(proof, Vec::new())], vec![app.clone()], inputs(),
+                ScalarCheckerScope::CurrentPackage, Vec::new(),
+            )
+        };
+        let failure = run(text).unwrap().symbolic_diagnostic.unwrap();
+        assert_eq!(failure.returned, BigInt::from(12));
+        assert!(failure.witness.intervals_at(0, 0).unwrap().eq([(&BigInt::from(0), &BigInt::from(0))]));
+        assert!(failure.witness.intervals_at(0, 1).unwrap().eq([(&BigInt::from(12), &BigInt::from(32767))]));
+        assert!(run(&text.replace("before >= 10", "before == 10")).unwrap().symbolic_diagnostic.is_none());
+        let true_old = text.replace("!enabled", "enabled").replace("out <= 11", "out == core.old(before)");
+        let failure = run(&true_old).unwrap().symbolic_diagnostic.unwrap();
+        assert_eq!(failure.returned, BigInt::from(42));
+        assert!(failure.witness.intervals_at(0, 0).unwrap().eq([(&BigInt::from(1), &BigInt::from(1))]));
+        assert!(failure.witness.intervals_at(0, 1).unwrap().eq([
+            (&BigInt::from(10), &BigInt::from(41)), (&BigInt::from(43), &BigInt::from(32767)),
+        ]));
+        let reversed = text.replace("bool, i16", "i16, bool")
+            .replace("enabled, value", "value, enabled").replace("enabled, before", "before, enabled");
+        let failure = run(&reversed).unwrap().symbolic_diagnostic.unwrap();
+        assert!(failure.witness.intervals_at(0, 1).unwrap().eq([(&BigInt::from(0), &BigInt::from(0))]));
+        let opaque = text.replace("{ 42 }", "{ value * value }");
+        assert!(matches!(run(&opaque), Err(ProjectCheck::Unsupported)),
+            "the false guard cannot hide an unsupported true-lane return");
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
     fn ordered_named_symbolic_pair_affine_preserves_independent_old_coordinates() {
         let app = source("src/main.w", "ordered-symbolic-proof-exact-pair-affine");
         let text = r#"%%start
@@ -16758,7 +16826,9 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
             assert_eq!(failure.invocation.returned, BigInt::from(9));
         }
         let unused = text.split_once("i16 inactive =").unwrap().0.to_owned() + "%%end";
-        assert!(matches!(run(&unused, ScalarCheckerScope::CurrentPackage), Err(ProjectCheck::Unsupported)));
+        let symbolic = run(&unused, ScalarCheckerScope::CurrentPackage).unwrap().symbolic_diagnostic.unwrap();
+        assert_eq!(symbolic.returned, BigInt::from(42));
+        assert!(symbolic.witness.intervals_at(0, 0).unwrap().eq([(&BigInt::from(1), &BigInt::from(1))]));
     }
 
     #[cfg(feature = "internal-checker")]

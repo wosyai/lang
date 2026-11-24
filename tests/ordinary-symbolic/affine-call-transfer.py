@@ -1672,6 +1672,21 @@ cases.extend([
         1,b"proof obligation failed"),
 ])
 
+symbolic_named_mixed_pair = """%%start
+    i16(bool, i16) leaf = fn(enabled, value) { if (enabled) { 42 } else { value } };
+    i16(bool, i16) producer = fn(enabled, value) { i16 result = leaf(enabled, value); result };
+    proof bounded for producer(enabled, before) -> (out)
+        where (!enabled && before >= 10) ensures (out <= 11) {}
+%%end"""
+cases.extend([
+    ("ordinary-named-symbolic-mixed-false-refuted",symbolic_named_mixed_pair,1,b"proof obligation failed"),
+    ("ordinary-named-symbolic-mixed-false-proved",symbolic_named_mixed_pair.replace("before >= 10","before == 10"),0,b""),
+    ("ordinary-named-symbolic-mixed-true-old",symbolic_named_mixed_pair.replace("!enabled","enabled")
+        .replace("out <= 11","out == core.old(before)"),1,b"proof obligation failed"),
+    ("ordinary-named-symbolic-mixed-refuses-masked-return",symbolic_named_mixed_pair.replace("{ 42 }","{ value * value }"),
+        2,b"unsupported analysis"),
+])
+
 stacked_named_exact_mixed = f"""%%start
     i16(bool, i16) leaf = fn(enabled, value) {{
         if (enabled) {{ 42 }} else {{ if (value == 300) {{ 9 }} else {{ value }} }}
@@ -1810,6 +1825,8 @@ cases.extend([
         b"proof obligation failed"),
 ])
 proof_diagnostic_notes = {
+    "ordinary-named-symbolic-mixed-false-refuted": b"symbolic call can return 12",
+    "ordinary-named-symbolic-mixed-true-old": b"symbolic call can return 42",
     "exact-startup-named-stacked-mixed-old-refuted": b"call returned 42",
     "exact-startup-named-stacked-mixed-false-old": b"call returned 9",
     "ordinary-named-symbolic-pair-affine-refuted": b"symbolic call can return -4",
