@@ -52,7 +52,11 @@ Non-inductive proofs of pure unary integer functions can use check-time
 establish equality to the input. In this profile, `core.rewrite` can use an
 earlier equality from the same branch or an enclosing block to replace one
 occurrence in the current goal. Branch-local equalities and rewrites do not
-carry to siblings or past the join. Proof steps do not execute in artifacts.
+carry to siblings or past the join. A branch can also cite a bare equality
+proof of the same callable with `core.use` if that branch establishes the
+cited precondition. The cited proof is checked independently. Only the
+branch and its descendants can use its equality, including for rewrites.
+Proof steps do not execute in artifacts.
 
 Check diagnostics and stream output work on native CLI hosts. Authored file
 output currently requires a Linux CLI host and a flat filename under

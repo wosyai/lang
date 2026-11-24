@@ -234,7 +234,7 @@ pub(super) fn verify<'a>(
     let mut work = 0;
     let entry = Rectangle::entry(rank, plan.filter.as_deref().unwrap_or_default(), &mut work)?;
     for axis in &entry.0 { charge(&mut work, axis.interval_count())?; }
-    let mut pending = vec![(&plan.steps, &plan.function.body, structure.root, entry.clone())];
+    let mut pending = vec![(plan.steps.as_ref(), &plan.function.body, structure.root, entry.clone())];
     let mut matched_calls = 0;
     let mut has_base = false;
     let mut failure = None;

@@ -2308,7 +2308,49 @@ cases.extend([
         2, b"unsupported analysis"),
 ])
 
+authored_case_citation = """%%start
+    u8(u8) clamp = fn(value) { if (value > 10) { 10 } else { value } };
+    proof clamped for clamp(x) -> (out) ensures (out <= 10) {
+        if (x > 10) {
+            core.use(high(x));
+            core.rewrite(out == 10, _ <= 10);
+            core.show(out >= 10);
+        } else {
+            core.show(out == x);
+        }
+    }
+    proof high for clamp(input) -> (out) where (input > 10) ensures (out == 10) {}
+%%end"""
+authored_case_citation_reached = authored_case_citation.replace("%%end", "u8 selected = clamp(11); u8 uncapped = clamp(6); %%end")
+authored_case_citation_ordered = authored_case_citation.replace("if (value > 10) { 10 }", "if (value > 10) { 9 }").replace(
+    "core.use(high(x));", "core.show(out == 8); core.use(high(x));").replace(
+    "proof high", "proof separate for clamp(input) -> (out) where (input > 10) ensures (out == 8) {}\n    proof high")
+cases.extend([
+    ("ordinary-authored-case-citation-ordered-diagnostics", authored_case_citation_ordered, 1, b"proof obligation failed"),
+    ("exact-startup-authored-case-citation-ordered-diagnostics",
+        authored_case_citation_ordered.replace("%%end", "u8 selected = clamp(11); %%end"), 1, b"proof obligation failed"),
+    ("ordinary-authored-case-citation-proved", authored_case_citation, 0, b""),
+    ("ordinary-authored-case-citation-inapplicable-peer", authored_case_citation.replace("input > 10", "input > 12"),
+        2, b"unsupported analysis"),
+    ("ordinary-authored-case-citation-refuted-premise",
+        authored_case_citation.replace("if (value > 10) { 10 }", "if (value > 10) { 9 }"),
+        1, b"proof obligation failed"),
+    ("exact-startup-authored-case-citation-proved", authored_case_citation_reached, 0, b""),
+    ("exact-startup-authored-case-citation-refuted-premise",
+        authored_case_citation_reached.replace("if (value > 10) { 10 }", "if (value > 10) { 9 }"),
+        1, b"proof obligation failed"),
+    ("exact-startup-authored-case-citation-inapplicable-peer",
+        authored_case_citation_reached.replace("input > 10", "input > 12"), 2, b"unsupported analysis"),
+    ("exact-startup-authored-case-citation-sibling-equality",
+        authored_case_citation_reached.replace("core.show(out == x);", "core.rewrite(out == 10, _ <= 10);"),
+        2, b"unsupported analysis"),
+])
+
 proof_diagnostic_notes = {
+    "ordinary-authored-case-citation-ordered-diagnostics": b"core.show(out == 8)",
+    "exact-startup-authored-case-citation-ordered-diagnostics": b"core.show(out == 8)",
+    "ordinary-authored-case-citation-refuted-premise": b"symbolic call can return 9",
+    "exact-startup-authored-case-citation-refuted-premise": b"call returned 9",
     "ordinary-authored-case-rewrite-refutes-premise": b"symbolic call can return 9",
     "exact-startup-authored-case-rewrite-refutes-premise": b"call returned 9",
     "ordinary-authored-case-proof-refuted-show": b"symbolic call entry: value = 11",
@@ -3101,6 +3143,13 @@ with tempfile.TemporaryDirectory(prefix="affine-calls-") as path:
                         assert b"COPY-PRIOR-UNPUBLISHED" not in res.stderr and b"COPY-FORMAL-UNPUBLISHED" not in res.stderr,res
                 elif included and name in proof_diagnostic_notes:
                     assert expected_stderr in res.stderr and proof_diagnostic_notes[name] in res.stderr,res
+                    if name in ("ordinary-authored-case-citation-ordered-diagnostics", "exact-startup-authored-case-citation-ordered-diagnostics"):
+                        failures = res.stderr.split(b"error: proof obligation failed")[1:]
+                        assert len(failures) == 3 and b"core.show(out == 8)" in failures[0], res
+                        assert b"proof separate" in failures[1] and b"proof high" in failures[2], res
+                    if name in ("ordinary-authored-case-citation-refuted-premise", "exact-startup-authored-case-citation-refuted-premise"):
+                        assert res.stderr.count(b"proof obligation failed") == 1, res
+                        assert b"proof high" in res.stderr and b"proof goal" not in res.stderr, res
                     if name in ("ordinary-authored-case-rewrite-refutes-premise", "exact-startup-authored-case-rewrite-refutes-premise"):
                         assert b"core.show(out == 10)" in res.stderr and b"proof goal" in res.stderr, res
                     if name in ("ordinary-authored-case-proof-refuted-show", "exact-startup-authored-case-proof-wrong-arm"):

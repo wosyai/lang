@@ -1953,6 +1953,7 @@ enum ActualProjectedArguments<'a> {
 struct NamedExactWatch {
     nested_work: usize,
     citation: bool,
+    case_citation: bool,
     qualified_leaf: bool,
 }
 
@@ -2710,7 +2711,7 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
         #[cfg(feature = "internal-checker")]
         let watched = if NAMED || ACTUAL_STARTUP { self.observer.named_exact_watch(target) } else { None };
         #[cfg(feature = "internal-checker")]
-        if watched.is_some_and(|watch| watch.qualified_leaf || (!NAMED && watch.citation)) {
+        if watched.is_some_and(|watch| watch.qualified_leaf || (!NAMED && (watch.citation || watch.case_citation))) {
             // A previously observed call to this target does not authenticate
             // a different activation outside its enrolled exact path.
             return Err(ProjectCheck::Unsupported);
@@ -3050,7 +3051,9 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             && (!body.structure.checker_integer_call_locals.is_empty() || named_exact_mixed_pair(&signature.parameters, |ty| ty))
             && supported_integer_continuation(body, expected) && citation_safe_calling_body(body);
         #[cfg(feature = "internal-checker")]
-        if named_watch.is_some_and(|watch| watch.citation) && !named_reached {
+        if named_watch.is_some_and(|watch| (watch.citation && !named_reached)
+            || (watch.case_citation && proof_site.is_none()))
+        {
             return Err(ProjectCheck::Unsupported);
         }
         #[cfg(feature = "internal-checker")]
@@ -3965,12 +3968,16 @@ struct PreparedProofModule {
     source: SourceIdentity,
     proofs: HashMap<SourceIdentity, ModuleProofs>,
     prepared: PreparedCheckerProject,
+    #[cfg(feature = "internal-checker")]
+    ordered_steps: Vec<Option<PreparedOrderedProofSteps>>,
 }
 
 struct SelectedModuleProof<'a> {
     node: &'a CstNode,
     function: (usize, usize, &'a ScalarFunction),
     target: &'a ResolvedCallTarget,
+    #[cfg(feature = "internal-checker")]
+    ordered_steps: Option<&'a PreparedOrderedProofSteps>,
 }
 
 #[cfg(test)]
@@ -4018,7 +4025,7 @@ impl PreparedProofModule {
             }
             declarations.push((module_declarations, module.namespaces));
         }
-        Self::prepare_declarations(source, declarations, proofs, initialization_order, inputs, Vec::new())
+        Self::prepare_declarations(source, declarations, proofs, initialization_order, inputs, Vec::new(), false)
     }
 
     fn prepare_declarations(
@@ -4028,6 +4035,7 @@ impl PreparedProofModule {
         initialization_order: Vec<SourceIdentity>,
         inputs: ScalarPreparationInputs,
         dormant: Vec<ScalarProofDeclarations>,
+        #[cfg_attr(not(feature = "internal-checker"), allow(unused_variables))] public_ordered: bool,
     ) -> Result<Self, ProjectCheck> {
         let mut graph_sources: HashMap<_, _> = initialization_order.iter().map(|source| (source, false)).collect();
         if graph_sources.len() != initialization_order.len() {
@@ -4074,20 +4082,32 @@ impl PreparedProofModule {
             declarations.push((source, Vec::new()));
         }
         let mut targets = Vec::new();
+        #[cfg(feature = "internal-checker")]
+        let mut ordered_steps = Vec::new();
         for (source, proofs) in &mut proofs {
             proofs.first_query = targets.len();
             for definition in &proofs.definitions {
                 let (receiver, name) = proof_target_tokens(definition)?;
+                #[cfg(feature = "internal-checker")]
+                if public_ordered {
+                    ordered_steps.push(PreparedOrderedProofSteps::prepare(definition)?);
+                }
                 targets.push((source, receiver, name));
             }
         }
-        let queries = targets.iter().map(|(source, receiver, name)| CheckerTargetQuery {
+        let queries = targets.iter().enumerate().map(|(_ordinal, (source, receiver, name))| CheckerTargetQuery {
             source,
             receiver: receiver.as_ref().map(CstToken::text),
             name: name.text(),
+            #[cfg(feature = "internal-checker")]
+            watch_case_nesting: ordered_steps.get(_ordinal).and_then(Option::as_ref)
+                .is_some_and(|proof| matches!(proof.shape, Some(AuthoredShape::Cases))),
         }).collect::<Vec<_>>();
         let prepared = prepared::prepare_checker_project_with_queries(declarations, initialization_order, inputs, &queries)?;
-        Ok(Self { source, proofs, prepared })
+        Ok(Self { source, proofs, prepared,
+            #[cfg(feature = "internal-checker")]
+            ordered_steps,
+        })
     }
 
     fn select(&self, source: &SourceIdentity, proof_name: &str) -> Result<(&CstNode, usize), ProjectCheck> {
@@ -4174,7 +4194,10 @@ impl PreparedProofModule {
         if source != &owner.source || *declaration_span != function.name_span {
             return Err(ProjectCheck::MissingRoot);
         }
-        Ok(SelectedModuleProof { node, function: (*module, *item, function), target })
+        Ok(SelectedModuleProof { node, function: (*module, *item, function), target,
+            #[cfg(feature = "internal-checker")]
+            ordered_steps: self.ordered_steps.get(query).and_then(Option::as_ref),
+        })
     }
 
     #[cfg(test)]
@@ -4269,7 +4292,7 @@ pub fn check_loaded_scalar_module_proof_selections(
     if selections.is_empty() {
         return Ok(Vec::new());
     }
-    let prepared = prepare_loaded_proof_project(declarations, proofs, initialization_order, inputs, Vec::new())
+    let prepared = prepare_loaded_proof_project(declarations, proofs, initialization_order, inputs, Vec::new(), false)
         .map_err(|error| module_proof_outcome(Err(error)))?;
     Ok(prepared.check_module_proof_selections(selections))
 }
@@ -4280,7 +4303,7 @@ fn prepare_loaded_proof_project(
     proofs: Vec<(ScalarProofDeclarations, Vec<ScalarNamespaceBinding>)>,
     initialization_order: Vec<SourceIdentity>,
     inputs: ScalarPreparationInputs,
-    dormant: Vec<ScalarProofDeclarations>,
+    dormant: Vec<ScalarProofDeclarations>, public_ordered: bool,
 ) -> Result<PreparedProofModule, ProjectCheck> {
     let mut catalogs = Vec::with_capacity(proofs.len());
     declarations.reserve(proofs.len());
@@ -4291,7 +4314,7 @@ fn prepare_loaded_proof_project(
         declarations.push((proof_declarations, namespaces));
     }
     let root = initialization_order.first().cloned().ok_or(ProjectCheck::MissingRoot)?;
-    PreparedProofModule::prepare_declarations(root, declarations, catalogs, initialization_order, inputs, dormant)
+    PreparedProofModule::prepare_declarations(root, declarations, catalogs, initialization_order, inputs, dormant, public_ordered)
 }
 
 #[cfg(feature = "internal-checker")]
@@ -4637,39 +4660,115 @@ impl SelectedSymbolicProof<'_, '_> {
 }
 
 #[cfg(feature = "internal-checker")]
+fn case_proof_domain(
+    proof: &MainFlowProofCase<'_>, source: &SourceIdentity, full: &IntegerSet, work: &mut usize,
+) -> Result<IntegerSet, ProjectCheck> {
+    if proof.proof_source != source || proof.guard.domain.is_some() { return Err(ProjectCheck::Unsupported); }
+    if proof.guard.always_rejects { return Ok(IntegerSet::default()); }
+    let mut domain = [full.clone()];
+    clip_proof_entry_domains(&mut domain, &proof.guard.comparisons, work)?;
+    let [domain] = domain;
+    Ok(domain)
+}
+
+#[cfg(feature = "internal-checker")]
 impl<'a> SelectedSymbolicProof<'a, '_> {
     fn verify_case_shows(
         &mut self, target: PreparedCallable, body: &FunctionCallSites, function: &ScalarFunction,
         source: &SourceIdentity, effects: &OrderedFailures, runtime: SymbolicProofRuntime<'_>,
         proof: &MainFlowProofCase<'_>, steps: &case_splits::CaseShows<'_>,
     ) -> Result<Option<bool>, ProjectCheck> {
-        use super::checker_flow::{verify_partitioned_call_return, PartitionedProofGoal};
-        if proof.proof_source != source || proof.guard.domain.is_some() {
-            return Err(ProjectCheck::Unsupported);
-        }
-        if proof.guard.always_rejects { return Ok(Some(false)); }
         let [input] = body.boundary.parameters.as_slice() else { return Err(ProjectCheck::Unsupported); };
+        let full = IntegerSet::from_type(&input.ty).ok_or(ProjectCheck::Unsupported)?;
         let mut work = 0;
-        let mut domain = [IntegerSet::from_type(&input.ty).ok_or(ProjectCheck::Unsupported)?];
-        clip_proof_entry_domains(&mut domain, &proof.guard.comparisons, &mut work)?;
-        let [domain] = domain;
+        let domain = case_proof_domain(proof, source, &full, &mut work)?;
         if domain.is_empty() { return Ok(Some(false)); }
-        // A single independent producer traversal covers the admitted domain.
-        // The authored proof only partitions and tests the returned paths.
         let returned = capture_closed_partitioned_returns(target, body, source, runtime, &domain, &mut work)
             .ok_or(ProjectCheck::Unsupported)?;
-        if let Some((failure, span)) = steps.check_partitions(body, &returned, &domain, &mut work)
-            .ok_or(ProjectCheck::Unsupported)?
-        {
-            self.record(proof, function, source, effects.records.len(), failure, Some(span))?;
-        } else {
-            let bound = proof.bound.literal().ok_or(ProjectCheck::Unsupported)?;
-            let goal = PartitionedProofGoal::Literal(proof.relation, bound);
-            let checked = verify_partitioned_call_return(body, &returned, &domain, false, goal, Some(&mut work))
-                .ok_or(ProjectCheck::Unsupported)?;
-            if let Some(failure) = checked.failure {
-                self.record(proof, function, source, effects.records.len(), failure, None)?;
+        self.verify_case_on_returns(body, function, source, effects.records.len(), proof, steps,
+            &returned, &domain, &mut work, |_, _, _| None)?;
+        Ok(Some(true))
+    }
+
+    fn verify_case_on_returns(
+        &mut self, body: &FunctionCallSites, function: &ScalarFunction, source: &SourceIdentity, position: usize,
+        proof: &MainFlowProofCase<'_>, steps: &case_splits::CaseShows<'_>, returned: &ActualCallResult,
+        domain: &IntegerSet, work: &mut usize, cite: impl FnMut(u32, &IntegerSet, &mut usize) -> Option<bool>,
+    ) -> Result<(), ProjectCheck> {
+        use super::checker_flow::{verify_partitioned_call_return, PartitionedProofGoal};
+        match steps.check_partitions(body, returned, domain, work, cite).ok_or(ProjectCheck::Unsupported)? {
+            case_splits::Verdict::Refuted((failure, span)) => self.record(proof, function, source, position, failure, Some(span))?,
+            case_splits::Verdict::Blocked => {} // The independently refuted premise has its own receipt.
+            case_splits::Verdict::Established => {
+                let bound = proof.bound.literal().ok_or(ProjectCheck::Unsupported)?;
+                let goal = PartitionedProofGoal::Literal(proof.relation, bound);
+                let checked = verify_partitioned_call_return(body, returned, domain, false, goal, Some(work))
+                    .ok_or(ProjectCheck::Unsupported)?;
+                if let Some(failure) = checked.failure {
+                    self.record(proof, function, source, position, failure, None)?;
+                }
             }
+        }
+        Ok(())
+    }
+
+    fn verify_case_citation_cohort(
+        &mut self, target: PreparedCallable, body: &FunctionCallSites, function: &ScalarFunction,
+        source: &SourceIdentity, effects: &OrderedFailures, runtime: SymbolicProofRuntime<'_>,
+        cases: &[MainFlowProofPlan<'_>], cohort: &CaseCitationCohort,
+    ) -> Result<Option<bool>, ProjectCheck> {
+        use super::checker_flow::{charge_call_work, verify_partitioned_call_return, PartitionedProofGoal};
+        let [input] = body.boundary.parameters.as_slice() else { return Err(ProjectCheck::Unsupported); };
+        let full = IntegerSet::from_type(&input.ty).ok_or(ProjectCheck::Unsupported)?;
+        let mut work = 0;
+        charge_call_work(&mut work, cases.len()).ok_or(ProjectCheck::Unsupported)?;
+        let domains = cases.iter().map(|(proof, _)| case_proof_domain(proof, source, &full, &mut work))
+            .collect::<Result<Vec<_>, _>>()?;
+        let intervals = domains.iter().try_fold(0usize, |sum, domain| sum.checked_add(domain.interval_count()))
+            .ok_or(ProjectCheck::Unsupported)?;
+        if intervals == 0 { return Ok(Some(false)); }
+        let depth = (usize::BITS - intervals.leading_zeros()) as usize;
+        let union_cost = intervals.checked_mul(depth.saturating_mul(2).saturating_add(4)).ok_or(ProjectCheck::Unsupported)?;
+        charge_call_work(&mut work, union_cost).ok_or(ProjectCheck::Unsupported)?;
+        let union = IntegerSet::union(domains.iter());
+        // One independent canonical capture, before using any proof
+        // conclusion. Every peer must hold over its own applicable domain.
+        let returned = capture_closed_partitioned_returns(target, body, source, runtime, &union, &mut work)
+            .ok_or(ProjectCheck::Unsupported)?;
+        let position = effects.records.len();
+        struct PeerVerdict<'a> {
+            established: bool,
+            failure: Option<super::checker_flow::SymbolicLiteralFailure<'a>>,
+        }
+        let mut verdicts = (0..cases.len()).map(|_| PeerVerdict { established: false, failure: None })
+            .collect::<Vec<_>>();
+        for (index, (proof, authored)) in cases.iter().enumerate() {
+            if authored.is_some() || domains[index].is_empty() { continue; }
+            let goal = PartitionedProofGoal::Literal(proof.relation, proof.bound.literal().ok_or(ProjectCheck::Unsupported)?);
+            let checked = verify_partitioned_call_return(body, &returned, &domains[index], false, goal, Some(&mut work))
+                .ok_or(ProjectCheck::Unsupported)?;
+            if !checked.applicable { return Err(ProjectCheck::Unsupported); }
+            verdicts[index] = PeerVerdict { established: checked.failure.is_none(), failure: checked.failure };
+        }
+        // Authority is computed before it can be used. Diagnostics, however,
+        // belong to declaration order, just like actual observations.
+        for (index, (proof, authored)) in cases.iter().enumerate() {
+            if index != cohort.consumer {
+                if let Some(failure) = verdicts[index].failure.take() {
+                    self.record(proof, function, source, position, failure, None)?;
+                }
+                continue;
+            }
+            let Some(MainFlowAuthoredShows::Cases(steps)) = authored else { return Err(ProjectCheck::Unsupported); };
+            let domain = &domains[index];
+            if domain.is_empty() { continue; }
+            self.verify_case_on_returns(body, function, source, position, proof, steps, &returned, domain, &mut work,
+                |declaration, active, work| {
+                    let index = *cohort.peers.get(&declaration)?;
+                    let cited = &domains[index];
+                    charge_call_work(work, 1usize.checked_add(active.interval_count())?.checked_add(cited.interval_count())?)?;
+                    active.is_subset_of(cited).then_some(verdicts[index].established)
+                })?;
         }
         Ok(Some(true))
     }
@@ -5109,6 +5208,10 @@ impl SymbolicRootProof for SelectedSymbolicProof<'_, '_> {
         } else {
             return self.equalities.consume(target, calls, source, effects);
         };
+        if let Some(cohort) = &group.case_citations {
+            let MainFlowProofCases::Authored(cases) = &group.cases else { return Err(ProjectCheck::Unsupported); };
+            return self.verify_case_citation_cohort(target, calls, function, source, effects, runtime, cases, cohort);
+        }
         if let MainFlowProofCases::Bare { first, rest } = &group.cases {
             if rest.is_empty() && calls.boundary.parameters.len() == 1
                 && matches!(first.bound, MainFlowProofBound::Entry(0) | MainFlowProofBound::EntryAffine { slot: 0, .. })
@@ -5553,6 +5656,48 @@ struct MainFlowProofCase<'a> {
 }
 
 #[cfg(feature = "internal-checker")]
+#[derive(Clone, Copy)]
+enum AuthoredShape { Cases, Rewrite }
+
+#[cfg(feature = "internal-checker")]
+fn authored_shape(steps: &ScalarBlock) -> Option<AuthoredShape> {
+    // Preserve the legacy fallback for an over-budget flat proof.
+    super::checker_flow::charge_call_work(&mut 0, steps.items.len())?;
+    let mut shape = None;
+    for item in &steps.items {
+        match item {
+            ScalarBlockItem::Expression(ScalarExpression::If { .. } | ScalarExpression::UnitIf { .. }) =>
+                return Some(AuthoredShape::Cases),
+            _ if shape.is_none() && rewrite::arguments(item).is_some() => shape = Some(AuthoredShape::Rewrite),
+            _ => {}
+        }
+    }
+    shape
+}
+
+#[cfg(feature = "internal-checker")]
+struct PreparedOrderedProofSteps {
+    steps: ScalarBlock,
+    shape: Option<AuthoredShape>,
+}
+
+#[cfg(feature = "internal-checker")]
+impl PreparedOrderedProofSteps {
+    fn prepare(declaration: &CstNode) -> Result<Option<Self>, ProjectCheck> {
+        // Quantified/ranked venues have their own AST limits; this early
+        // ordinary ordered classification must not bypass them.
+        if declaration.children().any(|node| matches!(node.kind(), SyntaxKind::ProofForall | SyntaxKind::ProofDecreases))
+            || child(declaration, SyntaxKind::ProofEnsures)?.children().any(|node| node.kind() == SyntaxKind::ProofExists)
+        {
+            return Ok(None);
+        }
+        let steps = derive_block(&child(declaration, SyntaxKind::Block)?);
+        let shape = authored_shape(&steps);
+        Ok(Some(Self { steps, shape }))
+    }
+}
+
+#[cfg(feature = "internal-checker")]
 fn prepare_flat_rewrite_shows<'a>(
     plan: &'a PlannedModuleProof<'a>, original: &BigInt,
 ) -> Result<MainFlowAuthoredShows<'a>, ProjectCheck> {
@@ -5615,12 +5760,13 @@ fn prepare_flat_rewrite_shows<'a>(
 #[cfg(feature = "internal-checker")]
 impl<'a> MainFlowProofCase<'a> {
     fn prepare(plan: &'a PlannedModuleProof<'a>, root: &SourceIdentity) -> Result<MainFlowProofPlan<'a>, ProjectCheck> {
-        Self::prepare_public(plan, root, None, false)
+        Self::prepare_public(plan, root, None, None)
     }
 
     fn prepare_public(
         plan: &'a PlannedModuleProof<'a>, root: &SourceIdentity,
-        citation: Option<(&'a PlannedModuleProof<'a>, Option<&'a ScalarBlockItem>)>, allow_qualified: bool,
+        citation: Option<(&'a PlannedModuleProof<'a>, Option<&'a ScalarBlockItem>)>,
+        catalog: Option<&PublicProofCatalog<'a>>,
     ) -> Result<MainFlowProofPlan<'a>, ProjectCheck> {
         let body = plan.typed.body;
         let rectangular = plan.typed.measure.is_none() && citation.is_none()
@@ -5636,7 +5782,7 @@ impl<'a> MainFlowProofCase<'a> {
         };
         let owner = &plan.typed.target.source;
         let qualified_leaf = owner != root;
-        if qualified_leaf && !(allow_qualified && owner.project == root.project && owner.package == root.package
+        if qualified_leaf && !(catalog.is_some() && owner.project == root.project && owner.package == root.package
             && proof_target_tokens(plan.proof)?.0.is_some()
             && citation.is_none() && plan.typed.measure.is_none() && plan.steps.items.is_empty()
             && matches!(plan.typed.goal, TypedProofGoal::Literal { .. })
@@ -5663,26 +5809,8 @@ impl<'a> MainFlowProofCase<'a> {
             )?;
             Ok((shown, literal))
         };
-        #[derive(Clone, Copy)]
-        enum AuthoredShape { Cases, Rewrite }
-        // Use the existing bounded authored-shape scan for both special
-        // forms. An oversized body stays in the legacy flat path, rather
-        // than acquiring a new scan (or losing legacy flat admission).
-        let shape = if citation.is_none() && super::checker_flow::charge_call_work(&mut 0, plan.steps.items.len()).is_some() {
-            let mut shape = None;
-            for item in &plan.steps.items {
-                match item {
-                    ScalarBlockItem::Expression(ScalarExpression::If { .. } | ScalarExpression::UnitIf { .. }) => {
-                        // A scoped script owns the entire sequence, including
-                        // any rewrites before the first split.
-                        shape = Some(AuthoredShape::Cases);
-                        break;
-                    }
-                    _ if shape.is_none() && rewrite::arguments(item).is_some() => shape = Some(AuthoredShape::Rewrite),
-                    _ => {}
-                }
-            }
-            shape
+        let shape = if citation.is_none() {
+            plan.ordered_shape.unwrap_or_else(|| authored_shape(&plan.steps))
         } else { None };
         let step = if let Some((peer, show)) = citation {
             if peer.peer_literal_goal().is_none() || (!peer.steps.items.is_empty() && peer.direct_peer_use().is_none())
@@ -5700,7 +5828,7 @@ impl<'a> MainFlowProofCase<'a> {
                 peer: wosy_syntax::byte_span(peer.proof).start, show, output_type: plan.typed.result_type,
             })
         } else if matches!(shape, Some(AuthoredShape::Cases)) {
-            Some(MainFlowAuthoredShows::Cases(case_splits::CaseShows::prepare(plan)?))
+            Some(MainFlowAuthoredShows::Cases(case_splits::CaseShows::prepare(plan, catalog)?))
         } else if matches!(shape, Some(AuthoredShape::Rewrite)) {
             Some(prepare_flat_rewrite_shows(plan, bound.literal().ok_or(ProjectCheck::Unsupported)?)?)
         } else if rectangular && !plan.steps.items.is_empty() {
@@ -5869,9 +5997,55 @@ impl<'a> SymbolicEqualityIssuer<'a> {
 }
 
 #[cfg(feature = "internal-checker")]
+struct CaseCitationCohort {
+    consumer: usize,
+    peers: HashMap<u32, usize>,
+}
+
+#[cfg(feature = "internal-checker")]
+struct CaseCitationPoint {
+    admitted: bool,
+    established: bool,
+}
+
+#[cfg(feature = "internal-checker")]
+impl CaseCitationCohort {
+    fn compile(cases: &[MainFlowProofPlan<'_>], work: &mut usize) -> Result<Self, ProjectCheck> {
+        super::checker_flow::charge_call_work(work, cases.len()).ok_or(ProjectCheck::Unsupported)?;
+        let mut consumer = None;
+        let mut peers = HashMap::new();
+        for (index, (proof, authored)) in cases.iter().enumerate() {
+            match authored {
+                Some(MainFlowAuthoredShows::Cases(steps)) if steps.has_citations() && consumer.is_none() => {
+                    consumer = Some(index);
+                }
+                None if proof.bound.literal().is_some() && !proof.qualified_leaf => {
+                    if peers.insert(proof.proof.start, index).is_some() { return Err(ProjectCheck::Unsupported); }
+                }
+                _ => return Err(ProjectCheck::Unsupported),
+            }
+        }
+        Ok(Self { consumer: consumer.ok_or(ProjectCheck::Unsupported)?, peers })
+    }
+
+    fn at_invocation(
+        &self, cases: &[MainFlowProofPlan<'_>], arguments: &[&BigInt], returned: &BigInt,
+    ) -> Option<Vec<CaseCitationPoint>> {
+        cases.iter().enumerate().map(|(index, (proof, _))| {
+            let admitted = proof.guard.accepts(arguments);
+            let established = admitted && index != self.consumer
+                && proof.relation.accepts(returned.cmp(proof.bound.literal()?));
+            Some(CaseCitationPoint { admitted, established })
+        }).collect()
+    }
+}
+
+#[cfg(feature = "internal-checker")]
 struct MainFlowProofTarget<'a> {
     citation_output_type: Option<&'a ScalarType>,
     exact_citations: Option<ExactCallingTopology<'a>>,
+    has_case_citations: bool,
+    case_citations: Option<CaseCitationCohort>,
     qualified_leaf: bool,
     nested_observation_work: usize,
     cases: MainFlowProofCases<'a>,
@@ -5912,12 +6086,14 @@ impl<'a> MainFlowProofTarget<'a> {
         NamedExactWatch {
             nested_work: self.nested_observation_work,
             citation: self.citation_output_type.is_some(),
+            case_citation: self.has_case_citations,
             qualified_leaf: self.qualified_leaf,
         }
     }
 
     fn new((first, step): MainFlowProofPlan<'a>) -> Self {
         let citation_output_type = Self::citation_output_type(step.as_ref());
+        let has_case_citations = matches!(&step, Some(MainFlowAuthoredShows::Cases(steps)) if steps.has_citations());
         let nested_observation_work = Self::nested_case_work(&first, step.as_ref());
         let qualified_leaf = first.qualified_leaf;
         let cases = if let Some(step) = step {
@@ -5925,12 +6101,17 @@ impl<'a> MainFlowProofTarget<'a> {
         } else {
             MainFlowProofCases::Bare { first, rest: Vec::new() }
         };
-        Self { citation_output_type, exact_citations: None, qualified_leaf, nested_observation_work, cases, issuer: None, seen: false }
+        Self { citation_output_type, exact_citations: None, has_case_citations, case_citations: None,
+            qualified_leaf, nested_observation_work, cases, issuer: None, seen: false }
     }
 
     fn compile_exact_citations(&mut self, work: &mut usize) -> Result<(), ProjectCheck> {
         if self.qualified_leaf && !matches!(&self.cases, MainFlowProofCases::Bare { rest, .. } if rest.is_empty()) {
             return Err(ProjectCheck::Unsupported);
+        }
+        if self.has_case_citations {
+            let MainFlowProofCases::Authored(cases) = &self.cases else { return Err(ProjectCheck::Unsupported); };
+            self.case_citations = Some(CaseCitationCohort::compile(cases, work)?);
         }
         if let Some(ty) = self.citation_output_type {
             let MainFlowProofCases::Authored(cases) = &self.cases else { return Err(ProjectCheck::Unsupported); };
@@ -5999,10 +6180,12 @@ impl<'a> MainFlowProofObserver<'a> {
             self.pure_affine_target = None;
         }
         let citation_output_type = MainFlowProofTarget::citation_output_type(proof.1.as_ref());
+        let has_case_citations = matches!(&proof.1, Some(MainFlowAuthoredShows::Cases(steps)) if steps.has_citations());
         let nested_case_work = MainFlowProofTarget::nested_case_work(&proof.0, proof.1.as_ref());
         if self.first.0 == target {
             self.first.1.issuer = None;
             self.first.1.qualified_leaf |= proof.0.qualified_leaf;
+            self.first.1.has_case_citations |= has_case_citations;
             self.first.1.citation_output_type = self.first.1.citation_output_type.or(citation_output_type);
             self.first.1.nested_observation_work = self.first.1.nested_observation_work.saturating_add(nested_case_work);
             self.first.1.cases.push(proof);
@@ -6013,6 +6196,7 @@ impl<'a> MainFlowProofObserver<'a> {
                 let group = entry.get_mut();
                 group.issuer = None;
                 group.qualified_leaf |= proof.0.qualified_leaf;
+                group.has_case_citations |= has_case_citations;
                 group.citation_output_type = group.citation_output_type.or(citation_output_type);
                 group.nested_observation_work = group.nested_observation_work.saturating_add(nested_case_work);
                 group.cases.push(proof);
@@ -6026,7 +6210,7 @@ impl<'a> MainFlowProofObserver<'a> {
 
     fn finish_plans(&mut self, prepared: &PreparedCheckerProject, scope: ScalarCheckerScope) -> Result<(), ProjectCheck> {
         if scope == ScalarCheckerScope::CurrentPackage {
-            self.require_qualified_root_coverage(prepared)?;
+            self.require_named_root_coverage(prepared)?;
         }
         self.first.1.compile_exact_citations(&mut self.named_exact_work)?;
         for group in self.other.values_mut() {
@@ -6035,13 +6219,13 @@ impl<'a> MainFlowProofObserver<'a> {
         Ok(())
     }
 
-    fn require_qualified_root_coverage(&self, prepared: &PreparedCheckerProject) -> Result<(), ProjectCheck> {
+    fn require_named_root_coverage(&self, prepared: &PreparedCheckerProject) -> Result<(), ProjectCheck> {
         let (_, calls) = prepared.parts();
         // The canonical occurrence walk marks this when it resolves a
         // same-package nested edge to the exact proof declaration. An
         // unused-root proof cannot replace such a call context.
         if std::iter::once((&self.first.0, &self.first.1)).chain(&self.other)
-            .any(|(&target, group)| group.qualified_leaf && calls.has_nested_qualified_proof_use(target))
+            .any(|(&target, group)| (group.qualified_leaf || group.has_case_citations) && calls.has_nested_proof_use(target))
         {
             return Err(ProjectCheck::Unsupported);
         }
@@ -6160,6 +6344,21 @@ impl ActualIntegerObserver for MainFlowProofObserver<'_> {
                     self.incomplete = true;
                     return;
                 }
+                let case_points = if let Some(cohort) = &proofs.case_citations {
+                    // Stacked exact observations have already paid the whole
+                    // target's authored observation cost.
+                    if !matches!(&site.call, InitializerProofOrigin::Stacked { .. })
+                        && super::checker_flow::charge_call_work(&mut self.named_exact_work, proofs.nested_observation_work).is_none()
+                    {
+                        self.incomplete = true;
+                        return;
+                    }
+                    let Some(points) = cohort.at_invocation(cases, arguments, value) else {
+                        self.incomplete = true;
+                        return;
+                    };
+                    Some((cohort, points))
+                } else { None };
                 let citations = if let Some(topology) = &proofs.exact_citations {
                     if topology.source != site.source {
                         self.incomplete = true;
@@ -6192,7 +6391,9 @@ impl ActualIntegerObserver for MainFlowProofObserver<'_> {
                         return;
                     };
                     let mut applies = || {
-                        if !citations.as_ref().map_or_else(|| proof.guard.accepts(arguments), |verdicts| verdicts.admitted[index]) {
+                        let admitted = if let Some((_, points)) = &case_points { points[index].admitted }
+                            else { citations.as_ref().map_or_else(|| proof.guard.accepts(arguments), |verdicts| verdicts.admitted[index]) };
+                        if !admitted {
                             return false;
                         }
                         self.active = true;
@@ -6202,7 +6403,7 @@ impl ActualIntegerObserver for MainFlowProofObserver<'_> {
                         Some(MainFlowAuthoredShows::Cases(steps)) => {
                             let [entry] = arguments else { self.incomplete = true; return; };
                             // The named stack already paid this authored cost.
-                            if !matches!(&site.call, InitializerProofOrigin::Stacked { .. })
+                            if case_points.is_none() && !matches!(&site.call, InitializerProofOrigin::Stacked { .. })
                                 && super::checker_flow::charge_call_work(&mut self.named_exact_work,
                                     MainFlowProofTarget::nested_case_work(proof, step.as_ref())).is_none()
                             {
@@ -6210,9 +6411,17 @@ impl ActualIntegerObserver for MainFlowProofObserver<'_> {
                                 return;
                             }
                             if !applies() { continue; }
-                            if let Some(span) = steps.check_actual(entry, value) { Some(span) }
-                            else if proof.relation.accepts(value.cmp(bound.as_ref())) { continue; }
-                            else { None }
+                            match steps.check_actual(entry, value, |declaration| {
+                                let (cohort, points) = case_points.as_ref()?;
+                                let peer = &points[*cohort.peers.get(&declaration)?];
+                                peer.admitted.then_some(peer.established)
+                            }) {
+                                None => { self.incomplete = true; return; }
+                                Some(case_splits::Verdict::Blocked) => continue,
+                                Some(case_splits::Verdict::Refuted(span)) => Some(span),
+                                Some(case_splits::Verdict::Established) if proof.relation.accepts(value.cmp(bound.as_ref())) => continue,
+                                Some(case_splits::Verdict::Established) => None,
+                            }
                         }
                         Some(MainFlowAuthoredShows::Single(step)) => {
                             if !applies() {
@@ -6328,12 +6537,17 @@ impl ActualIntegerObserver for MainFlowProofObserver<'_> {
                         }
                         None => {
                             if !applies() { continue; }
-                            match citations.as_ref().map(|verdicts| verdicts.peer_states[index]) {
-                                Some(LocalPeerState::Terminal(_)) => continue,
-                                Some(LocalPeerState::Refuted(_)) => None,
-                                _ if proof.relation.accepts(value.cmp(bound.as_ref())) => continue,
-                                _ => None,
+                            if let Some((_, points)) = &case_points {
+                                if points[index].established { continue; }
+                            } else {
+                                match citations.as_ref().map(|verdicts| verdicts.peer_states[index]) {
+                                    Some(LocalPeerState::Terminal(_)) => continue,
+                                    Some(LocalPeerState::Refuted(_)) => {}
+                                    _ if proof.relation.accepts(value.cmp(bound.as_ref())) => continue,
+                                    _ => {}
+                                }
                             }
+                            None
                         }
                     };
                     if !emit(proof, failed_step) {
@@ -6766,18 +6980,31 @@ fn check_loaded_ordered_proof_diagnostics(
 }
 
 #[cfg(feature = "internal-checker")]
-fn prepare_ordered_public_observation<'a>(
-    plan: &'a PlannedModuleProof<'a>,
-    catalog: Option<&HashMap<(&'a SourceIdentity, &'a str), &'a PlannedModuleProof<'a>>>,
-    allow_qualified: bool,
-) -> Result<MainFlowProofPlan<'a>, ProjectCheck> {
-    if let Some(catalog) = catalog {
-        if let Some((peer, show)) = plan.public_calling_citation() {
-            let cited = catalog.get(&(plan.proof_source, peer)).copied().ok_or(ProjectCheck::Unsupported)?;
-            return MainFlowProofCase::prepare_public(plan, plan.proof_source, Some((cited, show)), allow_qualified);
-        }
+struct PublicProofCatalog<'a> {
+    first: &'a PlannedModuleProof<'a>,
+    rest: &'a [PlannedModuleProof<'a>],
+    index: std::cell::OnceCell<HashMap<(&'a SourceIdentity, &'a str), &'a PlannedModuleProof<'a>>>,
+}
+
+#[cfg(feature = "internal-checker")]
+impl<'a> PublicProofCatalog<'a> {
+    fn resolve(&self, source: &SourceIdentity, name: &str) -> Option<&'a PlannedModuleProof<'a>> {
+        self.index.get_or_init(|| std::iter::once(self.first).chain(self.rest)
+            .map(|plan| ((plan.proof_source, plan.name), plan)).collect()).get(&(source, name)).copied()
     }
-    MainFlowProofCase::prepare_public(plan, plan.proof_source, None, allow_qualified)
+}
+
+#[cfg(feature = "internal-checker")]
+fn prepare_ordered_public_observation<'a>(
+    plan: &'a PlannedModuleProof<'a>, catalog: Option<&PublicProofCatalog<'a>>,
+) -> Result<MainFlowProofPlan<'a>, ProjectCheck> {
+    let citation = if let Some(catalog) = catalog {
+        plan.public_calling_citation().map(|(name, show)| {
+            let peer = catalog.resolve(plan.proof_source, name).ok_or(ProjectCheck::Unsupported)?;
+            Ok((peer, show))
+        }).transpose()?
+    } else { None };
+    MainFlowProofCase::prepare_public(plan, plan.proof_source, citation, catalog)
 }
 
 #[cfg(feature = "internal-checker")]
@@ -6837,7 +7064,8 @@ fn check_loaded_ordered_proof_diagnostics_in_scope<const LOCAL_CATALOGS: bool>(
             symbolic_diagnostic: None, additional_symbolic_diagnostics: Vec::new(), entry_evidence: None,
         });
     }
-    let prepared = prepare_loaded_proof_project(declarations, proofs, initialization_order, inputs, dormant)?;
+    let prepared = prepare_loaded_proof_project(declarations, proofs, initialization_order, inputs, dormant,
+        LOCAL_CATALOGS && scope == ScalarCheckerScope::CurrentPackage)?;
     let project = prepared.prepared.parts().0;
     let sources = if LOCAL_CATALOGS {
         project.initialization_order.as_slice()
@@ -6912,18 +7140,14 @@ fn check_loaded_ordered_proof_diagnostics_in_scope<const LOCAL_CATALOGS: bool>(
     if first_plan.typed.measure.is_some() || plans.iter().any(|plan| plan.typed.measure.is_some()) {
         return run_closed_ranked_checks::<LOCAL_CATALOGS>(&prepared, scope, startup_count, &first_plan, &plans);
     }
-    let all_plans = || std::iter::once(&first_plan).chain(&plans);
-    let citations = if LOCAL_CATALOGS && all_plans().any(|plan| plan.public_calling_citation().is_some())
-    {
-        Some(all_plans().map(|plan| ((plan.proof_source, plan.name), plan)).collect::<HashMap<_, _>>())
-    } else {
-        None
-    };
+    let citations = LOCAL_CATALOGS.then(|| PublicProofCatalog {
+        first: &first_plan, rest: &plans, index: std::cell::OnceCell::new(),
+    });
     let mut observer = MainFlowProofObserver::from_prepared_plan(
-        scope, &prepared.source, &first_plan, prepare_ordered_public_observation(&first_plan, citations.as_ref(), LOCAL_CATALOGS)?,
+        scope, &prepared.source, &first_plan, prepare_ordered_public_observation(&first_plan, citations.as_ref())?,
     );
     for plan in &plans {
-        observer.insert(scope, plan.proof_source == &prepared.source, plan, prepare_ordered_public_observation(plan, citations.as_ref(), LOCAL_CATALOGS)?);
+        observer.insert(scope, plan.proof_source == &prepared.source, plan, prepare_ordered_public_observation(plan, citations.as_ref())?);
     }
     observer.finish_plans(&prepared.prepared, scope)?;
     let run = run_prepared_ordered_check(
@@ -6990,7 +7214,7 @@ pub fn check_loaded_scalar_module_proof_call(
     initialization_order: Vec<SourceIdentity>,
     inputs: ScalarPreparationInputs,
 ) -> ScalarProofCallOutcome {
-    let result = prepare_loaded_proof_project(declarations, vec![catalog], initialization_order, inputs, Vec::new())
+    let result = prepare_loaded_proof_project(declarations, vec![catalog], initialization_order, inputs, Vec::new(), false)
         .ok()
         .and_then(|prepared| production_bound_reuse::apply(&prepared, proof, caller));
     result.unwrap_or(ScalarProofCallOutcome::Unavailable)
@@ -7228,7 +7452,8 @@ struct PlannedModuleProof<'a> {
     function: &'a ScalarFunction,
     name: &'a str,
     typed: TypedProofPostcondition<'a>,
-    steps: ScalarBlock,
+    steps: Cow<'a, ScalarBlock>,
+    ordered_shape: Option<Option<AuthoredShape>>,
     filter: Option<Vec<CheckerPredicate>>,
 }
 
@@ -7948,7 +8173,11 @@ impl PreparedProofModule {
         &'a self, proof_source: &'a SourceIdentity, proof_name: &'a str, proof: SelectedModuleProof<'a>,
     ) -> Result<PlannedModuleProof<'a>, ProjectCheck> {
         let (module, item, function) = proof.function;
-        let steps = derive_block(&child(proof.node, SyntaxKind::Block)?);
+        let steps = match proof.ordered_steps {
+            Some(prepared) => Cow::Borrowed(&prepared.steps),
+            None => Cow::Owned(derive_block(&child(proof.node, SyntaxKind::Block)?)),
+        };
+        let ordered_shape = proof.ordered_steps.map(|prepared| prepared.shape);
         let typed = typed_proof_postcondition::<ALLOW_INDUCTION, DEFER_OUTPUT_UNION>(&self.prepared, proof.function, proof.node, &steps, !DEFER_OUTPUT_UNION)?;
         let filter = prepare_proof_entry_filter_in_scope(
             proof.node, proof_source, typed.target.target_layout, &typed.input_names, typed.body,
@@ -7956,7 +8185,7 @@ impl PreparedProofModule {
         )?;
         Ok(PlannedModuleProof {
             proof_source, proof: proof.node, canonical_target: proof.target, target: (module, item),
-            function, name: proof_name, typed, steps, filter,
+            function, name: proof_name, typed, steps, ordered_shape, filter,
         })
     }
 
@@ -8685,7 +8914,8 @@ impl PlannedModuleProof<'_> {
     fn public_calling_citation(&self) -> Option<(&str, Option<&ScalarBlockItem>)> {
         match (self.steps.items.as_slice(), self.steps.terminated_items.as_slice()) {
             ([step], [true]) => Some((self.peer_use_step(step)?, None)),
-            ([step, show], [true, true]) => Some((self.peer_use_step(step)?, Some(show))),
+            ([step, show], [true, true]) if proof_show_expression(show, true).is_ok() =>
+                Some((self.peer_use_step(step)?, Some(show))),
             _ => None,
         }
     }
@@ -14398,6 +14628,138 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
 
     #[cfg(feature = "internal-checker")]
     #[test]
+    fn ordered_case_citation_authenticates_bare_premises_without_exporting_branch_facts() {
+        let app = source("src/main.w", "ordered-case-citation");
+        let clamp = r#"%%start
+            u8(u8) clamp = fn(value) { if (value > 10) { 10 } else { value } };
+            proof clamped for clamp(x) -> (out) ensures (out <= 10) {
+                if (x > 10) {
+                    core.use(high(x));
+                    core.rewrite(out == 10, _ <= 10);
+                    core.show(out >= 10);
+                } else {
+                    core.show(out == x);
+                }
+            }
+            proof high for clamp(input) -> (out) where (input > 10) ensures (out == 10) {}
+        %%end"#;
+        let run = |text: &str, scope| {
+            let (_, proof) = crate::parse_proof_source(app.clone(), text.to_owned(), &[]).ok().unwrap();
+            check_loaded_ordered_proof_diagnostics_in_scope::<true>(
+                Vec::new(), vec![(proof, Vec::new())], vec![app.clone()], inputs(), scope, Vec::new(),
+            )
+        };
+        let package = ScalarCheckerScope::CurrentPackage;
+        let main = ScalarCheckerScope::MainFlowOnly;
+        let symbolic = run(clamp, package).unwrap();
+        assert!(symbolic.active && symbolic.symbolic_diagnostic.is_none() && symbolic.directives.is_empty());
+        assert!(!run(clamp, main).unwrap().active);
+        let reached = clamp.replace("%%end", &format!("u8 capped = clamp(11); u8 uncapped = clamp(6);
+            core.require(capped == 10, {OUTPUT}); core.require(uncapped == 6, {OUTPUT}); %%end"));
+        for scope in [main, package] {
+            let actual = run(&reached, scope).unwrap();
+            assert!(actual.active && actual.diagnostics.is_empty() && actual.directives.is_empty());
+            assert!(actual.symbolic_diagnostic.is_none());
+        }
+
+        let failed_peer = clamp.replace("if (value > 10) { 10 }", "if (value > 10) { 9 }");
+        let symbolic = run(&failed_peer, package).unwrap();
+        let failure = symbolic.symbolic_diagnostic.unwrap();
+        let name = failure.proof.range;
+        assert!(failed_peer[name.start as usize..name.end as usize].starts_with("proof high"));
+        assert!(failure.failed_step.is_none() && symbolic.additional_symbolic_diagnostics.is_empty());
+        assert_eq!(failure.returned, BigInt::from(9));
+        let [low, high] = [BigInt::from(11), BigInt::from(255)];
+        assert!(failure.witness.intervals_at(0, 0).unwrap().eq([(&low, &high)]));
+        let failed_reached = failed_peer.replace("%%end", "u8 captured = clamp(11); %%end");
+        let actual = run(&failed_reached, main).unwrap();
+        let [peer] = actual.diagnostics.as_slice() else { panic!("only the false premise should report, not its dependents"); };
+        let at = |span: ByteSpan| &failed_reached[span.start as usize..span.end as usize];
+        assert!(at(peer.proof.range).starts_with("proof high"));
+        assert_eq!(at(peer.invocation.call.range), "clamp(11)");
+        assert_eq!(peer.invocation.arguments, [(ScalarType::U8, low)]);
+        assert_eq!(peer.invocation.returned, BigInt::from(9));
+        assert!(peer.failed_step.is_none() && actual.symbolic_diagnostic.is_none());
+
+        let ordered = failed_peer.replace("core.use(high(x));", "core.show(out == 8); core.use(high(x));")
+            .replace("proof high", "proof separate for clamp(input) -> (out) where (input > 10) ensures (out == 8) {}
+            proof high");
+        let receipt = run(&ordered, package).unwrap();
+        let proof_at = |text: &str, span: ByteSpan| text[span.start as usize..span.end as usize].split_whitespace().nth(1)
+            .expect("proof name").to_owned();
+        let first = receipt.symbolic_diagnostic.unwrap();
+        let [separate, high] = receipt.additional_symbolic_diagnostics.as_slice()
+            else { panic!("the independent and cited bare failures must both report"); };
+        assert_eq!([proof_at(&ordered, first.proof.range), proof_at(&ordered, separate.proof.range),
+            proof_at(&ordered, high.proof.range)], ["clamped", "separate", "high"]);
+        let step = first.failed_step.as_ref().unwrap().range;
+        assert_eq!(&ordered[step.start as usize..step.end as usize], "core.show(out == 8)");
+        assert!(separate.failed_step.is_none() && high.failed_step.is_none());
+        let ordered_reached = ordered.replace("%%end", "u8 captured = clamp(11); %%end");
+        let receipt = run(&ordered_reached, main).unwrap();
+        assert_eq!(receipt.diagnostics.iter().map(|failure| proof_at(&ordered_reached, failure.proof.range))
+            .collect::<Vec<_>>(), ["clamped", "separate", "high"]);
+        let step = receipt.diagnostics[0].failed_step.as_ref().unwrap().range;
+        assert_eq!(&ordered_reached[step.start as usize..step.end as usize], "core.show(out == 8)");
+
+        let weak_caller = clamp.replace("input > 10", "input > 12");
+        assert!(matches!(run(&weak_caller, package), Err(ProjectCheck::Unsupported)));
+        let weak_reached = weak_caller.replace("%%end", "u8 captured = clamp(11); %%end");
+        assert!(matches!(run(&weak_reached, main), Err(ProjectCheck::Unsupported)));
+        let covered = weak_caller.replace("%%end", "u8 captured = clamp(13); %%end");
+        assert!(run(&covered, main).unwrap().diagnostics.is_empty());
+
+        let independent = clamp.replace("input > 10", "input > 8");
+        let wider = run(&independent, package).unwrap();
+        let failure = wider.symbolic_diagnostic.unwrap();
+        // The active citation branch never sees x=9. Nevertheless the bare
+        // premise must be independently proved over its entire own guard.
+        assert_eq!(failure.returned, BigInt::from(9));
+        assert!(wider.additional_symbolic_diagnostics.is_empty());
+
+        for (label, rejected) in [
+            ("sibling premise", clamp.replace("core.show(out == x);", "core.rewrite(out == 10, _ <= 10);")),
+            ("joined premise", clamp.replace("                }
+            }", "                };
+                core.rewrite(out == 10, _ <= 10);
+            }")),
+            ("later premise", clamp.replace("core.use(high(x));
+                    core.rewrite(out == 10, _ <= 10);",
+                "core.rewrite(out == 10, _ <= 10); core.use(high(x));")),
+        ] {
+            assert!(matches!(run(&rejected, package), Err(ProjectCheck::InvalidProof)), "{label}: {rejected}");
+        }
+        assert!(matches!(run(&clamp.replace("high(x)", "high(11)"), package), Err(ProjectCheck::Unsupported)));
+        let unobserved = reached.replace("%%end", "u8(u8) wrapped = fn(n) { u8 found = clamp(n); found }; %%end");
+        assert!(matches!(run(&unobserved, package), Err(ProjectCheck::Unsupported)));
+        assert!(run(&unobserved, main).unwrap().diagnostics.is_empty());
+        let watches_nested = |text: &str, proof_name| {
+            let (_, catalog) = crate::parse_proof_source(app.clone(), text.to_owned(), &[]).ok().unwrap();
+            let project = prepare_loaded_proof_project(Vec::new(), vec![(catalog, Vec::new())],
+                vec![app.clone()], inputs(), Vec::new(), true).unwrap();
+            let (module, item, _) = project.select_resolved(&app, proof_name).unwrap().function;
+            project.prepared.parts().1.has_nested_proof_use((module, item))
+        };
+        assert!(watches_nested(&unobserved, "clamped"));
+        let legacy_bare = r#"%%start
+            u8(u8) direct = fn(arg) { arg };
+            u8(u8) wrapper = fn(arg) { u8 result = direct(arg); result };
+            proof bare for direct(input) -> (out) ensures (out <= 255) {}
+        %%end"#;
+        assert!(!watches_nested(legacy_bare, "bare"));
+
+        let other_flat = clamp.replace("%%end", r#"
+            u8(u8) leaf = fn(value) { if (value == 0) {}; 7 };
+            u8(u8) producer = fn(value) { u8 result = leaf(value); result };
+            proof use_flat for producer(x) -> (out) ensures (out <= 7) { core.use(flat(x)); }
+            proof flat for producer(x) -> (out) ensures (out == 7) {}
+        %%end"#);
+        let combined = run(&other_flat, package).unwrap();
+        assert!(combined.active && combined.symbolic_diagnostic.is_none() && combined.directives.is_empty());
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
     fn ordered_case_rewrite_preserves_scoped_premises_and_the_current_goal() {
         let app = source("src/main.w", "ordered-case-rewrite");
         let clamp = r#"%%start
@@ -20046,7 +20408,10 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
         let lib_text = "%%start\nu8() value = fn { 9 };\nu8() _hidden = fn { 11 };\n%%end";
         let namespace_start = app_text.find("lib =").unwrap() as u32;
         let namespace_end = app_text.find(';').unwrap() as u32 + 1;
-        let query = |source, receiver, name| CheckerTargetQuery { source, receiver, name };
+        let query = |source, receiver, name| CheckerTargetQuery { source, receiver, name,
+            #[cfg(feature = "internal-checker")]
+            watch_case_nesting: false,
+        };
         let prepared = prepared::prepare_checker_project_with_queries(
             vec![
                 (declarations(&app, app_text), vec![ScalarNamespaceBinding {

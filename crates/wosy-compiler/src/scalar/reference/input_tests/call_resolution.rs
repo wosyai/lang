@@ -95,7 +95,7 @@ fn equal_call_spans_in_distinct_arms_keep_callable_owned_targets_without_resolut
         let project_calls = ProjectCallSiteResults {
             checker_targets: Vec::new(),
             #[cfg(feature = "internal-checker")]
-            nested_qualified_proof_targets: Default::default(),
+            nested_proof_targets: Default::default(),
             modules: vec![Ok(calls)],
         };
         let scope = layout::observations::Scope::new();

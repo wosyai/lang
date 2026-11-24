@@ -5796,11 +5796,11 @@ struct CallDeclarationIndex<'a> {
     #[cfg(feature = "internal-checker")]
     checker_proof_targets: HashSet<(&'a SourceIdentity, ByteSpan)>,
     #[cfg(feature = "internal-checker")]
-    checker_qualified_proof_targets: HashMap<(&'a SourceIdentity, ByteSpan), QualifiedProofTargetUse>,
+    nested_proof_watch: HashMap<(&'a SourceIdentity, ByteSpan), ProofTargetUse>,
 }
 
 #[cfg(feature = "internal-checker")]
-struct QualifiedProofTargetUse {
+struct ProofTargetUse {
     declaration: (usize, usize),
     nested: std::cell::Cell<bool>,
 }
@@ -5924,12 +5924,12 @@ impl<'a> CallDeclarationIndex<'a> {
     }
 
     #[cfg(feature = "internal-checker")]
-    fn record_nested_qualified_proof_use(&self, caller: &SourceIdentity, target: &ResolvedCallTarget) {
-        if self.checker_qualified_proof_targets.is_empty() { return; }
+    fn record_nested_proof_use(&self, caller: &SourceIdentity, target: &ResolvedCallTarget) {
+        if self.nested_proof_watch.is_empty() { return; }
         let ResolvedCallTarget::ModuleCallable { source, declaration_span, concrete: ConcreteCallSelection::Declaration } =
             target else { return; };
         if caller.project != source.project || caller.package != source.package { return; }
-        if let Some(watched) = self.checker_qualified_proof_targets.get(&(source, *declaration_span)) {
+        if let Some(watched) = self.nested_proof_watch.get(&(source, *declaration_span)) {
             watched.nested.set(true);
         }
     }
@@ -6811,6 +6811,8 @@ pub(super) struct CheckerTargetQuery<'a> {
     pub(super) source: &'a SourceIdentity,
     pub(super) receiver: Option<&'a str>,
     pub(super) name: &'a str,
+    #[cfg(feature = "internal-checker")]
+    pub(super) watch_case_nesting: bool,
 }
 
 #[cfg(any(test, feature = "internal-checker"))]
@@ -6825,7 +6827,7 @@ pub(super) struct ProjectCallSiteResults {
     #[cfg(any(test, feature = "internal-checker"))]
     pub(super) checker_targets: Vec<Option<ResolvedCheckerTarget>>,
     #[cfg(feature = "internal-checker")]
-    nested_qualified_proof_targets: HashSet<(usize, usize)>,
+    nested_proof_targets: HashSet<(usize, usize)>,
 }
 
 #[cfg(test)]
@@ -6837,8 +6839,8 @@ impl ProjectCallSiteResults {
 
 impl ProjectCallSiteResults {
     #[cfg(feature = "internal-checker")]
-    pub(super) fn has_nested_qualified_proof_use(&self, target: (usize, usize)) -> bool {
-        self.nested_qualified_proof_targets.contains(&target)
+    pub(super) fn has_nested_proof_use(&self, target: (usize, usize)) -> bool {
+        self.nested_proof_targets.contains(&target)
     }
 
     pub(super) fn lookup_errors(&self) -> impl Iterator<Item = &ReferenceAnalysisError> {
@@ -7013,11 +7015,18 @@ fn resolve_project_call_sites_impl(
         #[cfg(feature = "internal-checker")]
         {
             declarations.checker_proof_targets.insert((source, declaration_span));
-            if query.receiver.is_some() && query.source != source
-                && query.source.project == source.project && query.source.package == source.package
-            {
-                declarations.checker_qualified_proof_targets.entry((source, declaration_span))
-                    .or_insert(QualifiedProofTargetUse { declaration, nested: std::cell::Cell::new(false) });
+            let same_package = query.source.project == source.project && query.source.package == source.package;
+            let qualified = query.receiver.is_some() && query.source != source;
+            let case_candidate = query.watch_case_nesting && matches!(
+                &modules[declaration.0].items[declaration.1],
+                ScalarItem::Function(function) if matches!(&function.signature,
+                    ScalarType::Callable { parameters, outputs } if matches!(
+                        (parameters.as_slice(), outputs.outputs.as_slice()),
+                        ([input], [output]) if is_integer_type(input) && input == &output.ty))
+            );
+            if same_package && (qualified || case_candidate) {
+                declarations.nested_proof_watch.entry((source, declaration_span))
+                    .or_insert(ProofTargetUse { declaration, nested: std::cell::Cell::new(false) });
             }
         }
         Some(ResolvedCheckerTarget {
@@ -7058,7 +7067,7 @@ fn resolve_project_call_sites_impl(
         checker_targets,
         modules,
         #[cfg(feature = "internal-checker")]
-        nested_qualified_proof_targets: declarations.checker_qualified_proof_targets.values()
+        nested_proof_targets: declarations.nested_proof_watch.values()
             .filter_map(|target| target.nested.get().then_some(target.declaration)).collect(),
     }
 }
@@ -8428,7 +8437,7 @@ impl CallableWalk<'_> {
             .target_resolver
             .resolve(expression, names, types, signature, #[cfg(any(test, feature = "internal-checker"))] ordinary_origin)?;
         #[cfg(feature = "internal-checker")]
-        self.target_resolver.declarations.record_nested_qualified_proof_use(self.target_resolver.source, &target);
+        self.target_resolver.declarations.record_nested_proof_use(self.target_resolver.source, &target);
         if declared_unsafe {
             self.declared_unsafe_calls.insert(ordinal.0);
         }
@@ -8624,7 +8633,7 @@ impl StructuralWalker<'_, '_> {
                             None,
                         )?;
                         #[cfg(feature = "internal-checker")]
-                        resolver.declarations.record_nested_qualified_proof_use(resolver.source, &target);
+                        resolver.declarations.record_nested_proof_use(resolver.source, &target);
                         self.structural_calls.push(ordinal);
                         assert!(self
                             .allocation_length_call_targets
