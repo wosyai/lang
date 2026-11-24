@@ -993,6 +993,39 @@ namespace_scalar_child = f"""%%start
     }};
     %%end"""
 cases.append((namespace_scalar_key,namespace_scalar_main,210,b"ROOTINITCALLEERETURNEMPTY"))
+conditional_binding_symbolic = f"""%%start
+    unit(i8) check = fn(input) {{
+        i8 selected = if (input < 0) {{ 13 }} else {{ input }};
+        if (selected == 0) {{
+            core.require(input == 0, {report(238,"BIND-UNREASONED")});
+            core.require(input != 0, {state_report(239,"BIND-IDENTITY","input")});
+        }};
+        if (selected == 13) {{
+            core.require(input >= 0, {state_report(240,"BIND-CONSTANT","input").replace("state.json","constant.json")});
+        }};
+    }};
+    %%end"""
+conditional_binding_bool = f"""%%start
+    unit(i8) startup = fn(input) {{
+        bool selected = if (input > 0) {{ true }} else {{ false }};
+        if (selected) {{ core.require(false, {report(241,"WRONG-BOOL-BIND")}); }};
+        core.require(selected, {state_report(242,"FALSE-BIND","selected")});
+    }};
+    startup(0);
+    %%end"""
+conditional_binding_narrowed = f"""%%start
+    unit(i8) check = fn(input) {{
+        core.narrow(input >= 0, {report(243,"BIND-PRIOR-UNPUBLISHED")});
+        i8 selected = if (input < 0) {{ input + 1 }} else {{ input }};
+        core.require(selected < 0, {state_report(244,"BIND-ONLY-REACHED","selected")});
+    }};
+    %%end"""
+cases.extend([
+    ("conditional-scalar-binding-symbolic-preimages",conditional_binding_symbolic,239,b"BIND-IDENTITYBIND-CONSTANT"),
+    ("exact-startup-conditional-bool-binding",conditional_binding_bool,242,b"FALSE-BIND"),
+    ("conditional-scalar-binding-skips-unreached-operand",conditional_binding_narrowed,244,b"BIND-ONLY-REACHED"),
+    ("conditional-scalar-binding-refuses-reached-operand",conditional_binding_narrowed.replace("core.narrow","core.require"),2,b"unsupported analysis"),
+])
 projected_conditional_write = f"""%%start
     i8(i8) transfer = fn(entry) {{
         i8 changed = entry;
@@ -1446,6 +1479,14 @@ nested_array_bytes = state_bytes({
     },
 })
 authored_files = {
+    "conditional-scalar-binding-symbolic-preimages": {
+        "state.json": b'{"type":{"kind":"i8"},"value":0}\n',
+        "constant.json": b'{"type":{"kind":"i8"},"value":{"kind":"range","minimum":-128,"maximum":-1}}\n',
+    },
+    "exact-startup-conditional-bool-binding": {"state.json": b'{"type":{"kind":"bool"},"value":false}\n'},
+    "conditional-scalar-binding-skips-unreached-operand": {
+        "state.json": b'{"type":{"kind":"i8"},"value":{"kind":"range","minimum":0,"maximum":127}}\n',
+    },
     **{name: {"state.json": b'{"type":{"kind":"i8"},"value":3}\n'} for name in (
         "exact-startup-real-integer-tail-transfers-result", "exact-startup-real-integer-tail-propagates-empty",
     )},
@@ -1579,6 +1620,8 @@ with tempfile.TemporaryDirectory(prefix="affine-calls-") as path:
                         assert b"NEVER-SCALAR-WRITE" not in res.stderr,res
                     if name == "exact-startup-conditional-local-write-rejects-reached-effect":
                         assert b"PRIOR" not in res.stderr and b"ARM-EFFECT" not in res.stderr,res
+                    if name == "conditional-scalar-binding-refuses-reached-operand":
+                        assert b"BIND-PRIOR-UNPUBLISHED" not in res.stderr,res
                     if name == "projected-conditional-local-write-rejects-reached-operand":
                         assert b"PROJECTED-PRIOR-UNPUBLISHED" not in res.stderr,res
                     if name == "projected-returning-local-copy-refuses-formal":

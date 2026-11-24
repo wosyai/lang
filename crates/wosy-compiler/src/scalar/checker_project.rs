@@ -451,6 +451,7 @@ impl ActualIntegerObserver for ProofFreeOrderedEvidence {
     const AUTHORED_SINGLETON_CODE: bool = true;
     const REAL_INTEGER_TAIL_CALLS: bool = true;
     const REAL_INTEGER_INPUT_SIGNATURES: bool = true;
+    const REAL_CONDITIONAL_SCALAR_LOCALS: bool = true;
     const ORDINARY_INTEGER_LOCALS: bool = true;
 
     fn observe(&mut self, _: (usize, usize), _: &[&BigInt], _: &BigInt) {}
@@ -905,8 +906,11 @@ fn check_unused_module<const COLLECT: bool, const ENTRY_EVIDENCE: bool, Proof: S
                 project, calls, active: HashSet::from([(ordinal, item)]), active_depth: 1, reached: HashSet::new(),
                 had_obligations: false, observer: ProofFreeSymbolic { ordinary_projected_effects: !Proof::ENABLED }, symbolic_module: ordinal,
             };
-            let cursor = ExactCallCursor::arbitrary_root(body, &body.boundary.results[0].ty)
+            let mut cursor = ExactCallCursor::arbitrary_root(body, &body.boundary.results[0].ty)
                 .ok_or(ProjectCheck::Unsupported)?;
+            if !Proof::ENABLED && body.structure.checker_has_conditional_scalar_local {
+                cursor.allow_conditional_scalar_locals();
+            }
             symbolic.run_call_cursor(body, &module.source, cursor, None, Some(collection))?;
             active |= symbolic.had_obligations;
             continue;
@@ -915,7 +919,7 @@ fn check_unused_module<const COLLECT: bool, const ENTRY_EVIDENCE: bool, Proof: S
             if COLLECT {
                 #[cfg(feature = "internal-checker")]
                 let collected = super::checker_flow::collect_ordered_root_requirement_failures(
-                    body, &function.body, Proof::INTEGER_RETURN_PARTITIONS,
+                    body, &function.body, Proof::INTEGER_RETURN_PARTITIONS, !Proof::ENABLED,
                 );
                 #[cfg(not(feature = "internal-checker"))]
                 let collected = collect_integer_requirement_failures(body);
@@ -1410,6 +1414,8 @@ trait ActualIntegerObserver {
     const REAL_INTEGER_TAIL_CALLS: bool = false;
     #[cfg(feature = "internal-checker")]
     const REAL_INTEGER_INPUT_SIGNATURES: bool = false;
+    #[cfg(feature = "internal-checker")]
+    const REAL_CONDITIONAL_SCALAR_LOCALS: bool = false;
     const INTEGER_RETURN_PARTITIONS: bool = false;
     const PROJECTED_FORMAL_WRITES: bool = false;
     const ORDINARY_PROJECTED_PAIR: bool = false;
@@ -1758,6 +1764,12 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             cursor.allow_exact_contextual_bool();
         }
         #[cfg(feature = "internal-checker")]
+        if ACTUAL_STARTUP && collection.is_some() && Observer::REAL_CONDITIONAL_SCALAR_LOCALS
+            && body.structure.checker_has_conditional_scalar_local
+        {
+            cursor.allow_conditional_scalar_locals();
+        }
+        #[cfg(feature = "internal-checker")]
         if ACTUAL_STARTUP && collection.is_some() && Observer::REAL_INTEGER_TAIL_CALLS && is_integer_type(expected)
             && !body.structure.checker_direct_targets.is_empty()
         {
@@ -2011,6 +2023,12 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             && body.structure.checker_has_bool_contextual_declaration
         {
             cursor.allow_exact_contextual_bool();
+        }
+        #[cfg(feature = "internal-checker")]
+        if ACTUAL_STARTUP && collection.is_some() && Observer::REAL_CONDITIONAL_SCALAR_LOCALS
+            && body.structure.checker_has_conditional_scalar_local
+        {
+            cursor.allow_conditional_scalar_locals();
         }
         #[cfg(feature = "internal-checker")]
         if ACTUAL_STARTUP && collection.is_some() && Observer::REAL_INTEGER_TAIL_CALLS && is_integer_type(expected)
@@ -15074,6 +15092,32 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
             %%end"#);
             assert!(matches!(run("mutual-cycle", &mutual, scope), Err(ProjectCheck::Unsupported)));
         }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn conditional_scalar_binding_preserves_preimages_in_an_unused_ordinary_root() {
+        let zero = OUTPUT.replace(".code = 1", ".code = 108");
+        let negatives = OUTPUT.replace(".code = 1", ".code = 109");
+        let program = format!(r#"%%start
+            unit(i8) check = fn(input) {{
+                i8 selected = if (input < 0) {{ 13 }} else {{ input }};
+                if (selected == 0) {{ core.require(input != 0, {zero}); }};
+                if (selected == 13) {{ core.require(input >= 0, {negatives}); }};
+            }};
+        %%end"#);
+        let root = source("src/main.w", "checked-conditional-scalar-binding");
+        let prepared = prepare_proof_target(&root, &program).unwrap();
+        let main = run_closed_without_named_proofs(&prepared, ScalarCheckerScope::MainFlowOnly, 1).unwrap();
+        assert!(main.directives.is_empty());
+        let receipt = run_closed_without_named_proofs(&prepared, ScalarCheckerScope::CurrentPackage, 1).unwrap();
+        let [identity, constant] = receipt.directives.as_slice() else { panic!("both exact preimages expected"); };
+        assert_eq!(identity.code(), &BigInt::from(108));
+        assert_eq!(constant.code(), &BigInt::from(109));
+        let (zero, min, negative) = (BigInt::from(0), BigInt::from(-128), BigInt::from(-1));
+        assert!(identity.witness.intervals_at(0, 0).unwrap().eq([(&zero, &zero)]));
+        assert_eq!(identity.witness.row_equal_axes(0), Some(&[(1, 0)][..]));
+        assert!(constant.witness.intervals_at(0, 0).unwrap().eq([(&min, &negative)]));
     }
 
     #[cfg(feature = "internal-checker")]

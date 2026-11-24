@@ -6151,6 +6151,7 @@ pub(super) struct CheckerOrdinaryScalarLocal {
 #[derive(Clone, Debug, PartialEq)]
 pub(super) enum CheckerOrdinaryScalarLocalKind {
     Copy,
+    Conditional,
     BoolLiteral(bool),
     BoolCall(OccurrenceOrdinal),
     Arithmetic { operator: BinaryOperator, operands: [CheckerOrdinaryIntegerOperand; 2] },
@@ -6271,6 +6272,8 @@ pub(super) struct OccurrenceStructure {
     checker_snapshot_bindings: HashMap<(ByteSpan, ByteSpan), (BlockOrdinal, usize)>,
     #[cfg(feature = "internal-checker")]
     pub(super) checker_ordinary_scalar_locals: HashMap<(BlockOrdinal, usize), CheckerOrdinaryScalarLocal>,
+    #[cfg(feature = "internal-checker")]
+    pub(super) checker_has_conditional_scalar_local: bool,
     #[cfg(any(test, feature = "internal-checker"))]
     pub(super) checker_contextual_read_locals: HashMap<(BlockOrdinal, usize), ReferenceBindingId>,
     #[cfg(any(test, feature = "internal-checker"))]
@@ -6346,6 +6349,8 @@ impl OccurrenceStructure {
             checker_snapshot_bindings: HashMap::new(),
             #[cfg(feature = "internal-checker")]
             checker_ordinary_scalar_locals: HashMap::new(),
+            #[cfg(feature = "internal-checker")]
+            checker_has_conditional_scalar_local: false,
             #[cfg(feature = "internal-checker")]
             checker_ordinary_bool_literals: HashMap::new(),
             #[cfg(feature = "internal-checker")]
@@ -7821,6 +7826,9 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
         if lexical(source) && (!matches!(expression, ScalarExpression::Contextual { .. }) || *ty == ScalarType::Bool) {
             return Some(CheckerOrdinaryScalarLocalKind::Copy);
         }
+        if matches!(self.conditionals.get(&source), Some(ConditionalRegion::Value { .. })) {
+            return Some(CheckerOrdinaryScalarLocalKind::Conditional);
+        }
         if *ty == ScalarType::Bool {
             if let ScalarExpression::Boolean { value, .. } = expression {
                 return Some(CheckerOrdinaryScalarLocalKind::BoolLiteral(*value));
@@ -8955,6 +8963,7 @@ impl StructuralWalker<'_, '_> {
                 #[cfg(feature = "internal-checker")]
                 if let Some((source, callable, kind)) = ordinary_local.take() {
                     let binding = lexical.reference_id(callable.source, callable.function_span);
+                    self.structure.checker_has_conditional_scalar_local |= matches!(kind, CheckerOrdinaryScalarLocalKind::Conditional);
                     self.structure.checker_ordinary_scalar_locals.insert((position.block, position.item),
                         CheckerOrdinaryScalarLocal { binding, source, kind });
                 }

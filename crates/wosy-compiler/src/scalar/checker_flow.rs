@@ -139,6 +139,8 @@ trait ScopedAuthoredReturn<'a>: Copy {
     const ENABLED: bool;
     #[cfg(feature = "internal-checker")]
     const ALLOW_ORDINARY_INTEGER_LOCALS: bool = false;
+    #[cfg(feature = "internal-checker")]
+    fn allows_conditional_scalar_locals(self) -> bool { false }
     fn at(
         self, calls: &FunctionCallSites, block: BlockOrdinal, slot: FinalOutputSlot, ty: &ScalarType,
         roots: &IntegerRoots<'_>, path: &IntegerInputs,
@@ -191,7 +193,7 @@ impl<'a> ScopedAuthoredReturn<'a> for () {
 
 #[cfg(feature = "internal-checker")]
 #[derive(Clone, Copy)]
-struct OrderedRootConditions<'a, const EXACT_COMPOUND: bool = false, const ORDINARY_LOCALS: bool = false>(&'a super::ScalarBlock);
+struct OrderedRootConditions<'a, const EXACT_COMPOUND: bool = false, const ORDINARY_LOCALS: bool = false>(&'a super::ScalarBlock, bool);
 
 #[cfg(feature = "internal-checker")]
 impl<'a, const EXACT_COMPOUND: bool, const ORDINARY_LOCALS: bool> ScopedAuthoredReturn<'a>
@@ -199,6 +201,7 @@ impl<'a, const EXACT_COMPOUND: bool, const ORDINARY_LOCALS: bool> ScopedAuthored
 {
     const ENABLED: bool = false;
     const ALLOW_ORDINARY_INTEGER_LOCALS: bool = ORDINARY_LOCALS;
+    fn allows_conditional_scalar_locals(self) -> bool { ORDINARY_LOCALS && self.1 }
 
     fn at(
         self, _: &FunctionCallSites, _: BlockOrdinal, _: FinalOutputSlot, _: &ScalarType,
@@ -1445,6 +1448,8 @@ struct IntegerRoots<'a> {
     allow_exact_contextual_bool: bool,
     #[cfg(feature = "internal-checker")]
     allow_real_integer_tail_call: bool,
+    #[cfg(feature = "internal-checker")]
+    allow_conditional_scalar_locals: bool,
     #[cfg(feature = "internal-checker")]
     ordinary_local_work: Option<usize>,
     #[cfg(feature = "internal-checker")]
@@ -2869,17 +2874,18 @@ pub(super) fn collect_integer_requirement_failures_with_calls<'a>(
 #[cfg(feature = "internal-checker")]
 pub(super) fn collect_ordered_root_requirement_failures<'a>(
     calls: &'a FunctionCallSites, body: &'a super::ScalarBlock, allow_ordinary_integer_locals: bool,
+    allow_conditional_scalar_locals: bool,
 ) -> Option<(bool, Vec<IntegerCheckFailure<'a>>)> {
     let mut failures = Vec::new();
     let mut sink = |failure| failures.push(failure);
     let (active, _) = if allow_ordinary_integer_locals && (calls.structure.has_ordinary_integer_operations()
         || ordinary_tail_type(calls, true) == Some(&ScalarType::Bool)) {
         collect_integer_requirement_failures_in_scope(
-            calls, IntegerRequirementEntry::Arbitrary, None, false, false, &mut sink, OrderedRootConditions::<true, true>(body),
+            calls, IntegerRequirementEntry::Arbitrary, None, false, false, &mut sink, OrderedRootConditions::<true, true>(body, allow_conditional_scalar_locals),
         )
     } else {
         collect_integer_requirement_failures_in_scope(
-            calls, IntegerRequirementEntry::Arbitrary, None, false, false, &mut sink, OrderedRootConditions::<true>(body),
+            calls, IntegerRequirementEntry::Arbitrary, None, false, false, &mut sink, OrderedRootConditions::<true>(body, false),
         )
     }?;
     Some((active, failures))
@@ -2904,7 +2910,7 @@ pub(super) fn collect_ordered_root_entry_equality<'a>(
         None
     };
     let observed = std::cell::RefCell::new((false, None));
-    let scope = OrderedRootEntryEquality { conditions: OrderedRootConditions(body), old, guard, observed: &observed };
+    let scope = OrderedRootEntryEquality { conditions: OrderedRootConditions(body, false), old, guard, observed: &observed };
     let mut failures = Vec::new();
     let (active, _) = collect_integer_requirement_failures_in_scope(
         calls, IntegerRequirementEntry::Arbitrary, None, false, false, &mut |failure| failures.push(failure), scope,
@@ -2948,7 +2954,7 @@ pub(super) fn collect_ordered_root_literal_proof<'a, const TOTAL: bool>(
     let mut failures = Vec::new();
     let mut sink = |failure| failures.push(failure);
     let scope = OrderedRootLiteralProof::<TOTAL> {
-        conditions: OrderedRootConditions(body), relation, bound, guard: guard.as_ref(), observed: &observed,
+        conditions: OrderedRootConditions(body, false), relation, bound, guard: guard.as_ref(), observed: &observed,
     };
     let active = if TOTAL {
         let mut collected = IntegerFailureCollection {
@@ -2979,7 +2985,7 @@ pub(super) fn collect_ordered_root_literal_proofs<'a, const STEP_FIRST: bool>(
     let mut sink = |failure| failures.push(failure);
     let (active, _) = collect_integer_requirement_failures_in_scope(
         calls, IntegerRequirementEntry::Arbitrary, None, false, false, &mut sink,
-        OrderedRootLiteralProofs::<STEP_FIRST> { conditions: OrderedRootConditions(body), observed: &observed },
+        OrderedRootLiteralProofs::<STEP_FIRST> { conditions: OrderedRootConditions(body, false), observed: &observed },
     )?;
     Some((active, failures, observed.into_inner().returned))
 }
@@ -2993,7 +2999,7 @@ pub(super) fn collect_ordered_root_multiple_proof<'a, 'check, 'bound>(
     let mut sink = |failure| failures.push(failure);
     let (active, _) = collect_integer_requirement_failures_in_scope(
         calls, IntegerRequirementEntry::Arbitrary, None, false, false, &mut sink,
-        OrderedRootMultipleProof { conditions: OrderedRootConditions(body), observed: &observed },
+        OrderedRootMultipleProof { conditions: OrderedRootConditions(body, false), observed: &observed },
     )?;
     let observed = observed.into_inner();
     Some((active, failures, observed.returned, observed.failure))
@@ -3896,6 +3902,8 @@ fn run_integer_callable<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool,
         proof_reflexive_branches,
         #[cfg(feature = "internal-checker")]
         allow_ordinary_integer_locals: Authored::ALLOW_ORDINARY_INTEGER_LOCALS,
+        #[cfg(feature = "internal-checker")]
+        allow_conditional_scalar_locals: authored_return.allows_conditional_scalar_locals(),
         #[cfg(feature = "internal-checker")]
         allow_ordinary_affine_overwrites: Authored::ALLOW_ORDINARY_INTEGER_LOCALS,
         #[cfg(feature = "internal-checker")]
@@ -5336,6 +5344,10 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                                 // Read the old binding before installing the new one.
                                 path.append_ordinary_copy(axis, roots)?;
                             }
+                            super::reference::CheckerOrdinaryScalarLocalKind::Conditional => {
+                                if !roots.allow_conditional_scalar_locals { return None; }
+                                path = bind_conditional_scalar_local(calls, roots, path, origin.source, &receiver.ty)?;
+                            }
                             super::reference::CheckerOrdinaryScalarLocalKind::BoolCall(call) => {
                                 if receiver.ty != ScalarType::Bool || !SUSPEND_CALL || !suspend_integer { return None; }
                                 *cursor = IntegerBlockCursor { block, next, depth, path, branches, terminal, #[cfg(feature = "internal-checker")] guard };
@@ -5606,6 +5618,12 @@ impl<'a> ExactCallCursor<'a> {
         debug_assert!(self.tail.is_some_and(is_integer_type)
             && self.projected_slot.is_none() && self.projected_pair.is_none());
         self.roots.allow_real_integer_tail_call = true;
+    }
+
+    #[cfg(feature = "internal-checker")]
+    pub(super) fn allow_conditional_scalar_locals(&mut self) {
+        debug_assert!(self.projected_slot.is_none() && self.projected_pair.is_none());
+        self.roots.allow_conditional_scalar_locals = true;
     }
 
     pub(super) fn new(calls: &'a FunctionCallSites, exact: &[&BigInt], expected: &ScalarType) -> Option<Self> {
@@ -6441,15 +6459,33 @@ fn apply_projected_scalar_local_write(
         // entry and the destination's prior aliases retain their own domains.
         path.parallel_overwrite(&changes, work)
     };
-    let Some(ConditionalRegion::Value { condition, then_block, else_block, resume, .. }) =
-        calls.conditionals.get(&write.rhs)
-    else {
+    if !matches!(calls.conditionals.get(&write.rhs), Some(ConditionalRegion::Value { .. })) {
         let value = operand(roots, write.rhs, false)?;
         return overwrite(roots, path, value);
-    };
+    }
 
+    let lanes = ordinary_scalar_conditional_lanes(calls, roots, path, write.rhs)?;
+    let mut joined = IntegerInputs::default();
+    for (arm, block) in lanes {
+        if arm.is_unreachable() { continue; }
+        let leaf = checked_conditional_scalar_leaf(structure, block)?;
+        let value = operand(roots, leaf, true)?;
+        let mut updated = overwrite(roots, arm, value)?;
+        charge_call_work(roots.ordinary_local_work.get_or_insert(0), updated.0.len())?;
+        joined.0.append(&mut updated.0);
+    }
+    Some(joined)
+}
+
+#[cfg(feature = "internal-checker")]
+fn ordinary_scalar_conditional_lanes(
+    calls: &FunctionCallSites, roots: &mut IntegerRoots<'_>, path: IntegerInputs, source: OccurrenceOrdinal,
+) -> Option<[(IntegerInputs, BlockOrdinal); 2]> {
+    let ConditionalRegion::Value { condition, then_block, else_block, resume, .. } =
+        calls.conditionals.get(&source)? else { return None; };
+    let structure = &calls.structure;
     charge_call_work(roots.ordinary_local_work.get_or_insert(0), 8)?;
-    if *resume != write.rhs || structure.checked_types.expressions.get(condition)? != &ScalarType::Bool
+    if *resume != source || structure.checked_types.expressions.get(condition)? != &ScalarType::Bool
         || structure.checker_contextual_occurrences.contains(condition)
     {
         return None;
@@ -6467,14 +6503,40 @@ fn apply_projected_scalar_local_write(
     if path.0.iter().any(|row| row.affine.is_some() || row.entry.is_some()) { return None; }
     path.charge_projected_integer_directive(roots, predicate)?;
     let (passing, failing, _) = path.split(roots, predicate)?;
+    Some([(passing, *then_block), (failing, *else_block)])
+}
+
+#[cfg(feature = "internal-checker")]
+fn bind_conditional_scalar_local(
+    calls: &FunctionCallSites, roots: &mut IntegerRoots<'_>, path: IntegerInputs,
+    source: OccurrenceOrdinal, ty: &ScalarType,
+) -> Option<IntegerInputs> {
+    let structure = &calls.structure;
     let mut joined = IntegerInputs::default();
-    for (arm, block) in [(passing, *then_block), (failing, *else_block)] {
+    for (mut arm, block) in ordinary_scalar_conditional_lanes(calls, roots, path, source)? {
         if arm.is_unreachable() { continue; }
         let leaf = checked_conditional_scalar_leaf(structure, block)?;
-        let value = operand(roots, leaf, true)?;
-        let mut updated = overwrite(roots, arm, value)?;
-        charge_call_work(roots.ordinary_local_work.get_or_insert(0), updated.0.len())?;
-        joined.0.append(&mut updated.0);
+        if structure.checked_types.expressions.get(&leaf)? != ty
+            || structure.checker_contextual_occurrences.contains(&leaf)
+        {
+            return None;
+        }
+        // Appending fresh storage may grow a row's cell vector. Bill
+        // the complete width before copying a domain or equality class.
+        let work = roots.ordinary_local_work.get_or_insert(0);
+        for row in &arm.0 { charge_call_work(work, row.len().checked_add(1)?)?; }
+        if let Some(value) = scalar_call_literal(structure, leaf, ty, true) {
+            arm.append_local(IntegerSet::singleton(value));
+        } else {
+            let PlainNameIdentity::Lexical(binding) = calls.prepared_plain_name(leaf)? else { return None; };
+            let (axis, source_ty) = roots.lookup(binding)?;
+            if source_ty != ty { return None; }
+            arm.append_ordinary_copy(axis, roots)?;
+        }
+        let total = joined.0.len().checked_add(arm.0.len())?;
+        let relocated = if total > joined.0.capacity() { joined.0.len() } else { 0 };
+        charge_call_work(roots.ordinary_local_work.get_or_insert(0), arm.0.len().checked_add(relocated)?)?;
+        joined.0.append(&mut arm.0);
     }
     Some(joined)
 }
