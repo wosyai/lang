@@ -1,7 +1,7 @@
 use inkwell::context::Context;
 use inkwell::memory_buffer::MemoryBuffer;
 use inkwell::module::Module;
-use inkwell::values::{CallSiteValue, InstructionOpcode};
+use inkwell::values::{BasicValue, CallSiteValue, InstructionOpcode};
 use wosy_compiler::{
     analyze_scalar_build, derive_scalar_declarations_from_cst, emit_scalar_build_project_llvm,
     parse_source, prepare_scalar_project, ScalarNamespaceBinding, ScalarPreparationInputs,
@@ -3212,6 +3212,158 @@ if (false) { accept_packet(make_packet(3)); };
         assert!(build.diagnostics().is_empty(), "{:?}", build.diagnostics());
         let failure = emit_scalar_build_project_llvm(&build).err().expect("unproved condition emitted");
         assert!(failure.contains("aggregate owning initializer receiver is not supported"), "{failure}");
+    }
+}
+
+#[test]
+fn selected_recommit_mixed_result_keeps_saved_scalar_and_original_backing() {
+    let app = source("workbench", "src/selected_recommit_mixed.w");
+    let factories = include_str!("fixtures/structured-local-choice.w");
+    let (factories, _) = factories.split_once("u64(u64, bool) drive").unwrap();
+    for (order, owner, output, values, receive) in [
+        ("owner-first", 0, "(Packet, u64)", "moved, saved", "Packet received, u64 saved"),
+        ("scalar-first", 1, "(u64, Packet)", "saved, moved", "u64 saved, Packet received"),
+    ] {
+        let text = format!("{factories}
+Packet(u64) neighbor = fn(length) {{
+    u8[length] bytes; bytes[0] = 39;
+    *?u8 data = null;
+    unsafe {{ data = &?bytes[0]; }};
+    Packet packet = {{ .data = data; .length = length; }};
+    packet
+}};
+Packet(Packet) relay = fn(packet) {{ packet }};
+u64(*Packet) amount = fn(view) {{ (*view).length }};
+{output}(bool) shipment = fn(take) {{
+    Packet selected = if (take) {{ make_short(2) }} else {{ make_long(2) }};
+    Packet sibling = neighbor(7);
+    sibling.length;
+    Packet moved = relay(selected);
+    u64 saved = amount(&moved);
+    {values}
+}};
+u64(bool) driver = fn(take) {{
+    {receive} = shipment(take);
+    received.length + saved
+}};
+u64() short_case = fn {{ driver(true) }};
+u64() long_case = fn {{ driver(false) }};
+short_case();
+long_case();
+%%end");
+        for (target, target_layout) in [("native64", ScalarTargetLayout::NATIVE64), ("wasm32", ScalarTargetLayout::WASM32)] {
+            for (route, project) in [("single", false), ("project", true)] {
+                let prepared = prepare_scalar_project(vec![(declarations(&app, &text), vec![])],
+                    vec![app.clone()], ScalarPreparationInputs { target_layout }).unwrap();
+                let build = analyze_scalar_build(&prepared);
+                assert!(build.diagnostics().is_empty(), "{order}/{target}/{route}: {:?}", build.diagnostics());
+                let ir = if project { emit_scalar_build_project_llvm(&build) }
+                    else { wosy_compiler::emit_scalar_build_single_module_llvm(&build) }
+                    .unwrap_or_else(|error| panic!("{order}/{target}/{route}: {error}")).to_text();
+                let context = Context::create();
+                let module = context.create_module_from_ir(
+                    MemoryBuffer::create_from_memory_range_copy(ir.as_bytes(), target)).unwrap();
+                module.verify().unwrap();
+                let symbol = |name: &str| if project { function_with_suffix(&module, name) } else { name.to_owned() };
+                let find = |name: &str| module.get_function(&symbol(name)).unwrap();
+                let (ship, driver, neighbor, release, reader) = (find("shipment"), find("driver"), find("neighbor"),
+                    module.get_function("__wosy_core_free").unwrap(), find("amount"));
+                let mut sibling = None;
+                let mut releases = Vec::new();
+                let mut base = None;
+                let mut transported = [None; 2];
+                let mut reader_value = None;
+                let mut stores = Vec::new();
+                for row in ship.get_basic_blocks().into_iter().flat_map(|block| block.get_instructions()) {
+                    if row.get_opcode() == InstructionOpcode::Phi && row.to_string().contains("phi ptr") {
+                        assert!(base.replace(inkwell::values::PhiValue::try_from(row).unwrap().as_basic_value()).is_none());
+                    }
+                    if row.get_opcode() == InstructionOpcode::Store {
+                        stores.push((row.get_operand(0).unwrap().value().unwrap(),
+                            row.get_operand(1).unwrap().value().unwrap()));
+                    }
+                    if row.get_opcode() == InstructionOpcode::Return {
+                        assert!(reader_value.is_some());
+                        let mut pair = row.get_operand(0).unwrap().value().unwrap();
+                        while let Some(insert) = pair.as_instruction_value().filter(|inst|
+                            inst.get_opcode() == InstructionOpcode::InsertValue)
+                        {
+                            let indices = insert.get_indices();
+                            let [lane] = indices.as_slice() else { panic!("expected one ordered lane: {ir}") };
+                            let lane = *lane as usize;
+                            assert!(lane < transported.len());
+                            if transported[lane].is_none() {
+                                // Walk newest to oldest; the original descriptor
+                                // insertion may be superseded by its backing.
+                                transported[lane] = insert.get_operand(1).unwrap().value();
+                            }
+                            pair = insert.get_operand(0).unwrap().value().unwrap();
+                        }
+                    }
+                    let Ok(call) = CallSiteValue::try_from(row) else { continue };
+                    match call.get_called_fn_value() {
+                        Some(target) if target == neighbor => assert!(sibling.replace(call.try_as_basic_value().basic().unwrap()).is_none()),
+                        Some(target) if target == release => releases.push(row.get_operand(0).unwrap().value().unwrap()),
+                        Some(target) if target == reader =>
+                            assert!(reader_value.replace(call.try_as_basic_value().basic().unwrap()).is_none()),
+                        _ => {}
+                    }
+                }
+                assert_eq!(transported[owner], base);
+                assert!(base.is_some());
+                let scalar = transported[1 - owner].expect("one ordinary transported scalar");
+                assert_eq!(scalar.into_int_value().get_type().get_bit_width(), 64);
+                let read = reader_value.expect("one certified scalar read");
+                if scalar != read {
+                    let load = scalar.as_instruction_value().expect("saved scalar read instruction");
+                    assert_eq!(load.get_opcode(), InstructionOpcode::Load);
+                    let address = load.get_operand(0).unwrap().value().unwrap();
+                    assert!(stores.iter().filter(|(_, slot)| *slot == address).map(|(value, _)| *value).eq([read]),
+                        "the scalar lane must read the exact slot written by the certified reader");
+                }
+                assert_ne!(sibling, base);
+                assert_eq!(releases, [sibling.expect("one independent local sibling")]);
+                let mut pair = None;
+                let mut released = None;
+                let mut caller_scalar = None;
+                for row in driver.get_basic_blocks().into_iter().flat_map(|block| block.get_instructions()) {
+                    if row.get_opcode() == InstructionOpcode::ExtractValue && row.get_indices() == [(1 - owner) as u32] {
+                        let mut from = row.get_operand(0).unwrap().value().unwrap();
+                        // Caller materialization may install the descriptor in
+                        // the owner lane before unpacking the untouched scalar.
+                        while let Some(insert) = from.as_instruction_value().filter(|inst|
+                            inst.get_opcode() == InstructionOpcode::InsertValue && inst.get_indices() == [owner as u32])
+                        {
+                            from = insert.get_operand(0).unwrap().value().unwrap();
+                        }
+                        if Some(from) == pair {
+                            assert!(caller_scalar.replace(row).is_none());
+                        }
+                    }
+                    let Ok(call) = CallSiteValue::try_from(row) else { continue };
+                    match call.get_called_fn_value() {
+                        Some(target) if target == ship => assert!(pair.replace(call.try_as_basic_value().basic().unwrap()).is_none()),
+                        Some(target) if target == release => assert!(released.replace(row.get_operand(0).unwrap().value().unwrap()).is_none()),
+                        _ => {}
+                    }
+                }
+                let extracted = released.expect("one caller release").as_instruction_value().unwrap();
+                assert_eq!(extracted.get_opcode(), InstructionOpcode::ExtractValue);
+                assert_eq!(extracted.get_indices(), [owner as u32]);
+                assert_eq!(extracted.get_operand(0).unwrap().value(), pair);
+                assert_eq!(caller_scalar.expect("ordinary result extracted independently")
+                    .get_type().into_int_type().get_bit_width(), 64);
+                if let Some(out) = std::env::var_os("WOSY_MIXED_SELECTED_IR_DIR") {
+                    let out = std::path::PathBuf::from(out).join(format!("{order}-{route}"));
+                    std::fs::create_dir_all(&out).unwrap();
+                    let mut witness = ir.replace("@main(", "@wosy_authored_main(");
+                    for case in ["short_case", "long_case"] {
+                        witness.push_str(&format!("\ndefine i64 @wosy_{case}() {{\nentry:\n  %v = call i64 @{}()\n  ret i64 %v\n}}\n", symbol(case)));
+                    }
+                    std::fs::write(out.join(format!("{target}.ll")), witness).unwrap();
+                }
+            }
+        }
     }
 }
 

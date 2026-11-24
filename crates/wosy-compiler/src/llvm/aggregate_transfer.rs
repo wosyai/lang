@@ -1648,6 +1648,22 @@ pub(super) fn commit_return<'ctx>(
         aggregate.committed = true;
         return Ok(());
     }
+    if let Some(ClosedReturn::MixedSelected { lanes, call, outputs: exact_outputs }) = aggregate.plan.returning {
+        let nodes = state.body_call_nodes.ok_or("missing mixed selected output occurrences")?;
+        if aggregate.committed || mixed_owned_struct_result(outputs) != Some(lanes)
+            || !block.final_expressions().map(|(value, _)| nodes.expression_ordinal(value))
+                .eq(exact_outputs.map(Some))
+        {
+            return Err("mixed selected return changed its sealed outputs".into());
+        }
+        let destination = aggregate.destination.ok_or("missing mixed selected result destination")?;
+        let base = aggregate.receipts.remove(&call).ok_or("missing mixed selected original backing")?;
+        let pair = mixed_allocation_pair(context, state, result, outputs, lanes.owner, destination, base)?;
+        let aggregate = state.aggregate.as_mut().expect("mixed selected return frame");
+        aggregate.mixed_return = Some(pair);
+        aggregate.committed = true;
+        return Ok(());
+    }
     if let Some(ClosedReturn::Recommit { call, output } | ClosedReturn::NamedRoot { call, output }) = aggregate.plan.returning {
         let returned = block.final_expressions().next().and_then(|(expression, _)|
             state.body_call_nodes.and_then(|nodes| nodes.expression_ordinal(expression)));
@@ -1745,7 +1761,8 @@ pub(super) fn finish_return<'ctx>(
     let Some(route) = aggregate.plan.returning else {
         return Ok(None);
     };
-    if matches!(route, ClosedReturn::Allocation { .. } | ClosedReturn::Recommit { .. } | ClosedReturn::NamedRoot { .. } | ClosedReturn::Structured { .. }) && !aggregate.committed {
+    if matches!(route, ClosedReturn::Allocation { .. } | ClosedReturn::Recommit { .. } | ClosedReturn::NamedRoot { .. } | ClosedReturn::Structured { .. }
+        | ClosedReturn::MixedSelected { .. }) && !aggregate.committed {
         return Err("closed aggregate return did not commit ownership before cleanup".into());
     }
     if let Some(pair) = aggregate.mixed_return.take() {

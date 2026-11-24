@@ -1192,6 +1192,7 @@ struct MixedBranchReturn {
 pub(super) enum SealedMixedOwner {
     Allocation { lanes: MixedOwnerResultLanes, block: usize, item: usize },
     Branches { lanes: MixedOwnerResultLanes },
+    Selected { lanes: MixedOwnerResultLanes, call: usize, outputs: [usize; 2] },
 }
 
 impl SealedMixedOwner {
@@ -1199,12 +1200,14 @@ impl SealedMixedOwner {
         match self {
             Self::Allocation { block, item, .. } => ClosedReturn::Allocation { block, item },
             Self::Branches { .. } => ClosedReturn::MixedBranch,
+            Self::Selected { lanes, call, outputs } => ClosedReturn::MixedSelected { lanes, call, outputs },
         }
     }
 }
 
 #[derive(Default)]
 pub(super) struct AggregateFlowResult {
+    selected_mixed: Option<LocalReceiptChoice>,
     pub(super) local_choice_reader_calls: BTreeMap<CfgPointId, (CfgPointId, OccurrenceOrdinal)>,
     pub(super) conditional_input_regions: BTreeMap<CfgPointId, ConditionalInputRegion>,
     pub(super) conditional_input_barriers: BTreeSet<CfgPointId>,
@@ -1281,9 +1284,23 @@ impl AggregateFlowResult {
         Some((plan.shape.conditional, plan.shape.outputs, plan.allocations))
     }
 
+    pub(super) fn can_seal_selected_mixed(&self) -> bool {
+        self.calls.len() >= 3 && self.mixed_result_calls.is_empty()
+            && self.unsupported.is_empty() && self.unproved_receipt_loans.is_empty()
+    }
+
+    pub(super) fn install_selected_mixed(&mut self, choice: LocalReceiptChoice) {
+        assert!(self.selected_mixed.replace(choice).is_none(), "duplicate exact mixed owner proof");
+    }
+
     pub(super) fn sealed_mixed_owner(
         &self, cfg: &ScalarReferenceCfg, lanes: MixedOwnerResultLanes,
     ) -> Option<SealedMixedOwner> {
+        if let Some(choice) = &self.selected_mixed {
+            if let LocalChoiceUse::MixedReturn { call, outputs, lanes: sealed } = choice.use_site {
+                return (lanes == sealed).then_some(SealedMixedOwner::Selected { lanes, call: call.0, outputs: outputs.map(|output| output.0) });
+            }
+        }
         if !self.unsupported.is_empty() { return None; }
         if let Some(branch) = &self.mixed_branch_return {
             return (branch.shape.owner_lane == lanes.owner).then_some(SealedMixedOwner::Branches { lanes });
@@ -2536,6 +2553,7 @@ impl AggregateFlowFacts {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ClosedReturn {
     MixedBranch,
+    MixedSelected { lanes: MixedOwnerResultLanes, call: usize, outputs: [usize; 2] },
     Allocation { block: usize, item: usize },
     Forward { call: OccurrenceOrdinal },
     Recommit { call: usize, output: usize },
@@ -2834,11 +2852,12 @@ fn exact_bounded_call_arguments<'a>(
 enum LocalChoiceUse {
     Observe(CfgPointId),
     Return { call: OccurrenceOrdinal, output: OccurrenceOrdinal },
+    MixedReturn { call: OccurrenceOrdinal, outputs: [OccurrenceOrdinal; 2], lanes: MixedOwnerResultLanes },
     Consume { point: CfgPointId, ordinal: OccurrenceOrdinal, slot: usize },
 }
 
+#[derive(Clone)]
 struct LocalChoiceRecommit {
-    relay: BodyKey,
     slot: usize,
     point: CfgPointId,
     ordinal: OccurrenceOrdinal,
@@ -2859,6 +2878,7 @@ struct LocalChoiceConsumer {
     retained_unless: Option<OccurrenceOrdinal>,
 }
 
+#[derive(Clone)]
 struct LocalChoiceSibling {
     conditional: OccurrenceOrdinal,
     item: usize,
@@ -2868,7 +2888,8 @@ struct LocalChoiceSibling {
     alternative_consumer: Option<LocalChoiceConsumer>,
 }
 
-struct LocalReceiptChoice {
+#[derive(Clone)]
+pub(super) struct LocalReceiptChoice {
     block: BlockOrdinal,
     item: Option<usize>,
     conditional: OccurrenceOrdinal,
@@ -2917,16 +2938,52 @@ impl LocalReceiptChoice {
     }
 }
 
-struct Body<'a> {
-    facts: Option<&'a AggregateFlowResult>,
-    cfg: &'a ScalarReferenceCfg,
-    sites: &'a FunctionCallSites,
-    source: &'a SourceIdentity,
-    is_monomorphic: bool,
-    supports_input_result: bool,
+pub(super) fn checked_mixed_local_choice(
+    body: Body<'_>, mut relay: impl FnMut(&ByteSpan) -> Option<usize>, mut factory: impl FnMut(&ByteSpan) -> bool,
+) -> Option<LocalReceiptChoice> {
+    let facts = body.facts?;
+    if !facts.can_seal_selected_mixed() || !body.has_mixed_struct_result() { return None; }
+    let target = |point: CfgPointId| {
+        let CfgPointKind::Call { output: 0, target: ResolvedCallTarget::ModuleCallable {
+            source, declaration_span, concrete: ConcreteCallSelection::Declaration,
+        }, .. } = &body.cfg.points.get(point.0)?.kind else { return None };
+        if source != body.source { return None; }
+        let ordinal = facts.calls.get(&point)?;
+        if body.sites.declared_unsafe_calls.contains(&ordinal.0) { return None; }
+        Some(declaration_span)
+    };
+    let choice = body.local_receipt_choice(|point| relay(target(point)?))?;
+    if !matches!(choice.use_site, LocalChoiceUse::MixedReturn { .. })
+        || !choice.sibling_choices.is_empty()
+        || !choice.all_producers().all(|&point| target(point).is_some_and(&mut factory))
+    {
+        return None;
+    }
+    Some(choice)
+}
+
+pub(super) struct Body<'a> {
+    pub(super) facts: Option<&'a AggregateFlowResult>,
+    pub(super) cfg: &'a ScalarReferenceCfg,
+    pub(super) sites: &'a FunctionCallSites,
+    pub(super) source: &'a SourceIdentity,
+    pub(super) is_monomorphic: bool,
+    pub(super) supports_input_result: bool,
 }
 
 impl Body<'_> {
+    pub(super) fn is_exact_local_owner_factory(&self) -> bool {
+        let Some(facts) = self.facts else { return false };
+        if !self.is_monomorphic || !facts.calls.is_empty() || !facts.mixed_result_calls.is_empty()
+            || !facts.unsupported.is_empty() || !facts.unproved_receipt_loans.is_empty()
+            || !self.sites.boundary.parameters.iter().all(|parameter| ordinary_value(&parameter.ty))
+            || !matches!(self.sites.boundary.root_outputs.as_slice(), [output] if matches!(output.ty, ScalarType::Struct(_)))
+        { return false; }
+        let mut owners = self.return_owners();
+        let Some(Some(owner @ OwnerSource::Allocation(point))) = owners.next() else { return false };
+        facts.allocation_slots.contains_key(&point) && owners.all(|next| next == Some(owner))
+    }
+
     fn mixed_result_lanes(&self) -> Option<MixedOwnerResultLanes> {
         let [RootOutputType { output: 0, ty: first }, RootOutputType { output: 1, ty: second }] =
             self.sites.boundary.root_outputs.as_slice() else { return None };
@@ -2939,23 +2996,30 @@ impl Body<'_> {
 
     fn local_receipt_choice(
         &self,
-        exact_relay: impl Fn(CfgPointId) -> Option<(BodyKey, usize)>,
+        mut exact_relay: impl FnMut(CfgPointId) -> Option<usize>,
     ) -> Option<LocalReceiptChoice> {
         let facts = self.facts?;
         if !self.is_monomorphic || !(2..=MAX_LOCAL_CHOICE_LEAVES).contains(&facts.calls.len()) { return None; }
-        let [output_ty] = self.sites.boundary.root_outputs.as_slice() else { return None };
+        let outputs = &self.sites.boundary.root_outputs;
+        let mixed = self.mixed_result_lanes();
+        let owner_lane = mixed.map_or(0, |lanes| lanes.owner);
+        let output_ty = outputs.get(owner_lane)?;
+        let scalar_ty = &outputs[mixed.map_or(0, |lanes| lanes.scalar)].ty;
+        if mixed.is_none() && outputs.len() != 1 { return None; }
         let returns_owner = matches!(output_ty.ty, ScalarType::Struct(_));
         if !returns_owner && !ordinary_value(&output_ty.ty) { return None; }
         let structure = &self.sites.structure;
         let root = structure.root;
         const MAX_PRE_TRANSFER_OBSERVATIONS: usize = 3;
-        let (bind, alias, before_consume, result) = match structure.blocks.get(root.0)?.items.as_slice() {
-            [result] if !returns_owner => return self.immediate_receipt_choice(result, output_ty),
-            [bind, alias, result] if matches!(&alias.kind, BlockItemKind::Binding(view)
+        let items = &structure.blocks.get(root.0)?.items;
+        let (items, output_items) = items.split_at(items.len().checked_sub(outputs.len())?);
+        let result = &output_items[owner_lane];
+        let (bind, alias, before_consume) = match items {
+            [] if !returns_owner => return self.immediate_receipt_choice(result, output_ty),
+            [bind, alias] if matches!(&alias.kind, BlockItemKind::Binding(view)
                 if matches!(view.receivers(), [receiver] if matches!(receiver.ty, ScalarType::CheckedReference { .. }))) =>
-                (bind, Some(alias), &[][..], result),
-            [bind, before_consume @ .., result] =>
-                (bind, None, before_consume, result),
+                (bind, Some(alias), &[][..]),
+            [bind, before_consume @ ..] => (bind, None, before_consume),
             _ => return None,
         };
         let (BlockItemKind::Binding(binding), BlockItemKind::FinalOutput(output)) = (&bind.kind, &result.kind)
@@ -2964,7 +3028,7 @@ impl Body<'_> {
         let BindingInitialization::Outputs(init) = &binding.initialization else { return None };
         let ScalarType::Struct(descriptor) = &receiver.ty else { return None };
         if (returns_owner && (receiver.ty != output_ty.ty || alias.is_some()))
-            || !init.secondary.is_empty() || output.output != 0
+            || !init.secondary.is_empty() || output.output != owner_lane
             || structure.checked_types.expressions.get(&init.primary) != Some(&receiver.ty)
             || structure.checked_types.expressions.get(&output.expression) != Some(&output_ty.ty)
         { return None; }
@@ -3271,7 +3335,7 @@ impl Body<'_> {
                 let (call, slot, moved) = exact_owning_call_arguments(
                     points, read, scope, self.sites, step_init.primary, &signature.parameters, holder, &receiver.ty,
                 )?;
-                let (relay, relay_slot) = exact_relay(call.id)?;
+                let relay_slot = exact_relay(call.id)?;
                 let origins = facts.inputs.get(&(call.id, step_init.primary.0, slot, ArgumentProvenance::WholeMove(moved)))?;
                 let installed = next(call.id)?;
                 let CfgPointKind::Bind { binding } = &installed.kind else { return None };
@@ -3289,7 +3353,7 @@ impl Body<'_> {
                 if read.scope != scope { return None; }
                 holder = binding;
                 current_producer = Some(call.id);
-                recommits.push(LocalChoiceRecommit { relay, slot, point: call.id, ordinal: step_init.primary });
+                recommits.push(LocalChoiceRecommit { slot, point: call.id, ordinal: step_init.primary });
                 continue;
             }
             if observations == MAX_PRE_TRANSFER_OBSERVATIONS { return None; }
@@ -3300,7 +3364,7 @@ impl Body<'_> {
                 BlockItemKind::Binding(saved) if saved_count < MAX_SAVED_OBSERVATIONS => {
                     let [receiver] = saved.receivers() else { return None };
                     let BindingInitialization::Outputs(init) = &saved.initialization else { return None };
-                    if receiver.ty != output_ty.ty || !init.secondary.is_empty()
+                    if &receiver.ty != scalar_ty || !init.secondary.is_empty()
                         || structure.checked_types.expressions.get(&init.primary) != Some(&receiver.ty)
                     { return None; }
                     (init.primary, Some(receiver))
@@ -3355,27 +3419,54 @@ impl Body<'_> {
         }
         if returns_owner {
             let step = recommits.last()?;
-            let span = self.sites.occurrences.get(output.expression.0)?.span;
-            let moved = next(read.id)?;
-            let returned = next(moved.id)?;
-            let exit = next(returned.id)?;
-            if saved_count != 0
-                || !matches!(self.sites.prepared_plain_name(output.expression),
-                    Some(PlainNameIdentity::Lexical(binding)) if binding == holder)
-                || [read, moved, returned, exit].into_iter().any(|point| point.scope != scope)
-                || read.source_span.range != span || moved.source_span.range != span
-                || !matches!(&read.kind, CfgPointKind::Read { binding } if binding == holder)
-                || !matches!(&moved.kind, CfgPointKind::Move { owner, place, ty } if owner == holder
-                    && &place.binding == holder && place.projections.is_empty() && ty == &receiver.ty)
-                || !matches!(returned.kind, CfgPointKind::ReturnOutput { output: 0, value_point, checked: false }
-                    if value_point == read.id)
-                || !matches!(exit.kind, CfgPointKind::ScopeExit)
+            let mut value_points = [CfgPointId(0); 2];
+            let mut ordinals = [OccurrenceOrdinal(0); 2];
+            let mut cursor = read;
+            for (lane, item) in output_items.iter().enumerate() {
+                let BlockItemKind::FinalOutput(out) = &item.kind else { return None };
+                let span = self.sites.occurrences.get(out.expression.0)?.span;
+                if out.output != lane || cursor.scope != scope || cursor.source_span.range != span
+                    || structure.checked_types.expressions.get(&out.expression) != Some(&outputs[lane].ty)
+                { return None; }
+                value_points[lane] = cursor.id;
+                ordinals[lane] = out.expression;
+                let binding = if lane == owner_lane {
+                    holder
+                } else {
+                    if saved_count != 1 { return None; }
+                    saved_observations[0]?
+                };
+                if !matches!(self.sites.prepared_plain_name(out.expression), Some(PlainNameIdentity::Lexical(found)) if found == binding)
+                    || !matches!(&cursor.kind, CfgPointKind::Read { binding: found } if found == binding)
+                { return None; }
+                cursor = next(cursor.id)?;
+                if lane == owner_lane {
+                    if cursor.scope != scope || cursor.source_span.range != span
+                        || !matches!(&cursor.kind, CfgPointKind::Move { owner, place, ty } if owner == binding
+                            && &place.binding == binding && place.projections.is_empty() && ty == &receiver.ty)
+                    { return None; }
+                    cursor = next(cursor.id)?;
+                }
+            }
+            for (lane, value) in value_points.iter().take(outputs.len()).enumerate() {
+                if cursor.scope != scope || !matches!(cursor.kind,
+                    CfgPointKind::ReturnOutput { output, value_point, checked: false } if output == lane && value_point == *value)
+                { return None; }
+                cursor = next(cursor.id)?;
+            }
+            if (mixed.is_none() && saved_count != 0) || cursor.scope != scope
+                || !matches!(cursor.kind, CfgPointKind::ScopeExit)
                 || !self.return_owners().eq([Some(OwnerSource::Call(step.point))])
             { return None; }
+            let use_site = if let Some(lanes) = mixed {
+                LocalChoiceUse::MixedReturn { call: step.ordinal, outputs: ordinals, lanes }
+            } else {
+                LocalChoiceUse::Return { call: step.ordinal, output: ordinals[0] }
+            };
             return Some(LocalReceiptChoice {
                 block: root, item: Some(bind.position), conditional: init.primary,
-                leaves, use_site: LocalChoiceUse::Return { call: step.ordinal, output: output.expression },
-                guarded_primary, recommits, sibling_calls, sibling_choices, joined_birth: join.id, exit: exit.id,
+                leaves, use_site, guarded_primary, recommits, sibling_calls, sibling_choices,
+                joined_birth: join.id, exit: cursor.id,
             });
         }
         let end_use = |last: &ReferenceFlowPoint| {
@@ -3960,7 +4051,7 @@ impl Body<'_> {
             && self.sites.boundary.parameters.iter().any(|parameter| parameter.span == binding.declaration_span)
     }
 
-    fn exact_identity_relay_slot(&self) -> Option<usize> {
+    pub(super) fn exact_identity_relay_slot(&self) -> Option<usize> {
         let (slot, parameter, formal) = self.exact_identity_formal()?;
         if !self.return_owners().eq([Some(OwnerSource::Formal(slot))]) { return None; }
         let is_companion = |binding: &ReferenceBindingId| binding != formal && self.is_identity_parameter(binding, formal);
@@ -5225,13 +5316,15 @@ fn closed_aggregates<'a>(
                 }
             }
         }
-        if matches!(body.sites.boundary.root_outputs.as_slice(),
+        let sealed_mixed = body.facts.and_then(|facts| facts.selected_mixed.clone());
+        let requires_mixed_route = sealed_mixed.is_some();
+        if requires_mixed_route || matches!(body.sites.boundary.root_outputs.as_slice(),
             [output] if matches!(output.ty, ScalarType::Struct(_)))
         {
-            if let Some(choice) = body.local_receipt_choice(|point| {
+            if let Some(choice) = sealed_mixed.or_else(|| body.local_receipt_choice(|point| {
                 let target = target_body(&declarations, body.cfg, point)?;
-                Some((target, *identity_relays.get(&target)?))
-            }) {
+                identity_relays.get(&target).copied()
+            })) {
                 // Every cyclic component member has an outgoing internal edge.
                 // Check its own signature once, not once per incoming edge.
                 let ordinary_parameters = body.sites.boundary.parameters.iter()
@@ -5252,6 +5345,9 @@ fn closed_aggregates<'a>(
                     continue;
                 }
             }
+        }
+        if requires_mixed_route {
+            return Err("sealed mixed selected return has missing checked dependencies".into());
         }
         if let Some(shape) = body.structured_owner_return().filter(StructuredOwnerReturn::has_owning_leaf) {
             for &leaf in &shape.leaves {
@@ -5610,27 +5706,37 @@ fn closed_aggregates<'a>(
         }
         initializer_users.entry(receiver).or_default().push(index);
     }
+    if selected_returns.iter().any(|(key, choice)|
+        matches!(choice.use_site, LocalChoiceUse::MixedReturn { .. }) && !outgoing.contains(key))
+    {
+        return Err("sealed mixed selected return was not grounded by closed factories".into());
+    }
     selected_returns.retain(|key, _| outgoing.contains(key));
     let mut local_choices = selected_returns;
-    for choice in local_choices.values() {
+    for (&key, choice) in &local_choices {
         for step in &choice.recommits {
-            result.bodies.entry(step.relay).or_default().identity_relay = Some(step.slot);
+            let relay = target_body(&declarations, bodies[&key].cfg, step.point)
+                .filter(|relay| identity_relays.get(relay) == Some(&step.slot))
+                .ok_or("selected recommit changed its proved relay declaration")?;
+            result.bodies.entry(relay).or_default().identity_relay = Some(step.slot);
         }
     }
     let mut local_choice_consumers = BTreeMap::new();
     for (&key, body) in &bodies {
-        if outgoing.contains(&key) || matches!(body.sites.boundary.root_outputs.as_slice(),
+        if outgoing.contains(&key) || body.has_mixed_struct_result() || matches!(body.sites.boundary.root_outputs.as_slice(),
             [output] if matches!(output.ty, ScalarType::Struct(_))) { continue; }
         let Some(choice) = body.local_receipt_choice(|point| {
             let target = target_body(&declarations, body.cfg, point)?;
-            Some((target, *identity_relays.get(&target)?))
+            identity_relays.get(&target).copied()
         }) else { continue };
         if !choice.all_producers().all(|&leaf| target_body(&declarations, body.cfg, leaf)
             .is_some_and(|target| outgoing.contains(&target)
                 && bodies.get(&target).is_some_and(|callee| !callee.has_mixed_struct_result())))
         { continue; }
         for step in &choice.recommits {
-            result.bodies.entry(step.relay).or_default().identity_relay = Some(step.slot);
+            let relay = target_body(&declarations, body.cfg, step.point)
+                .ok_or("missing selected recommit relay declaration")?;
+            result.bodies.entry(relay).or_default().identity_relay = Some(step.slot);
         }
         local_choices.insert(key, choice);
     }
@@ -6273,7 +6379,8 @@ fn closed_aggregates<'a>(
                 continue;
             }
 
-            if matches!(return_route, Some(ClosedReturn::Recommit { call: returned, .. }) if returned == call.0) {
+            if matches!(return_route, Some(ClosedReturn::Recommit { call: returned, .. }
+                | ClosedReturn::MixedSelected { call: returned, .. }) if returned == call.0) {
                 if previous.is_none() || discharged_by_inputs.contains_key(&(key, point)) || endpoints.next().is_some() {
                     return Err(format!("recommitted aggregate return has competing ownership routes in {:?}", body.source));
                 }

@@ -13645,9 +13645,47 @@ struct MixedReceiptCohort {
 
 impl MixedReceiptCohort {
     fn grounds(
-        &self, source: &SourceIdentity, updates: &[(usize, FunctionReferenceResult)], targets: &MixedReceiptTargets,
+        &self, source: &SourceIdentity, items: &[ScalarItem], sites: &ModuleCallSites,
+        updates: &mut [(usize, FunctionReferenceResult)], targets: &MixedReceiptTargets,
     ) -> HashMap<ByteSpan, aggregate::SealedMixedOwner> {
         let Some(targets) = targets.get(source) else { return HashMap::new() };
+        if self.producers.iter().any(|&(position, declaration, _)| targets.contains(&declaration)
+            && updates[position].1.aggregate.can_seal_selected_mixed())
+        {
+            let make_body = |position: usize| {
+                let (index, result) = updates.get(position)?;
+                let ScalarItem::Function(function) = items.get(*index)? else { return None };
+                Some(aggregate::Body {
+                    facts: Some(&result.aggregate), cfg: &result.cfg, sites: sites.functions.get(index)?, source,
+                    is_monomorphic: function.generic_parameters.is_empty() && function.overload_arms.is_empty(),
+                    supports_input_result: false,
+                })
+            };
+            let positions = updates.iter().enumerate().filter_map(|(position, (index, _))| {
+                let ScalarItem::Function(function) = items.get(*index)? else { return None };
+                Some((function.name_span, position))
+            }).collect::<HashMap<_, _>>();
+            let mut relay_slots = HashMap::new();
+            let mut factories = HashMap::new();
+            let lookup = |span: &ByteSpan| positions.get(span).and_then(|&position| make_body(position));
+            let mut choices = Vec::new();
+            for &(position, declaration, _) in &self.producers {
+                if !targets.contains(&declaration) { continue; }
+                let Some(body) = make_body(position) else { continue };
+                if let Some(choice) = aggregate::checked_mixed_local_choice(body, |target| {
+                    *relay_slots.entry(*target).or_insert_with(||
+                        lookup(target).and_then(|body| body.exact_identity_relay_slot()))
+                }, |target| {
+                    *factories.entry(*target).or_insert_with(||
+                        lookup(target).is_some_and(|body| body.is_exact_local_owner_factory()))
+                }) {
+                    choices.push((position, choice));
+                }
+            }
+            for (position, choice) in choices {
+                updates[position].1.aggregate.install_selected_mixed(choice);
+            }
+        }
         self.producers.iter().filter_map(|&(position, declaration, lanes)| {
             if !targets.contains(&declaration) { return None; }
             let result = &updates[position].1;
@@ -13697,7 +13735,7 @@ fn derive_module_reference_origins(
         derive_module_reference_cohort(source, items, call_sites, structs, enums, capture_call_points, &mut targets);
     if errors.is_empty() {
         if let Some(cohort) = cohort {
-            let owners = cohort.grounds(source, &updates, &targets);
+            let owners = cohort.grounds(source, items, call_sites, &mut updates, &targets);
             if !owners.is_empty() {
                 let grounds = HashMap::from([(source.clone(), owners)]);
                 let mut edges = HashMap::new();
@@ -13990,9 +14028,11 @@ fn derive_project_reference_origins(
             return (updates, errors, inventory);
         }
         let grounds = cohorts.iter().filter_map(|(position, cohort)| {
-            let (index, results) = &updates[*position];
-            let source = &modules[*index].source;
-            let owners = cohort.grounds(source, results, &targets);
+            let (index, results) = &mut updates[*position];
+            let module = &modules[*index];
+            let source = &module.source;
+            let sites = call_sites.modules[*index].as_ref().expect("successful mixed receipt cohort");
+            let owners = cohort.grounds(source, &module.items, sites, results, &targets);
             (!owners.is_empty()).then(|| (source.clone(), owners))
         }).collect::<MixedReceiptRoots>();
         if !grounds.is_empty() {
