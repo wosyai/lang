@@ -357,6 +357,20 @@ impl<'a> ScalarInferenceBuilder<'a> {
     }
 
     #[cfg(feature = "internal-checker")]
+    pub(super) fn note_ordinary_snapshot_read(&mut self, expression: &ScalarExpression) {
+        if !self.occurrences.checker_enabled || self.suppress_checked_occurrences
+            || !matches!(expression, ScalarExpression::Member { .. })
+        {
+            return;
+        }
+        let Some(CheckedMember::DirectField(field)) =
+            self.occurrences.members.get(&std::ptr::from_ref(expression)) else { return; };
+        if !self.occurrences.snapshot_types.contains(&field.structure) {
+            self.occurrences.snapshot_types.insert(std::rc::Rc::new(field.structure.clone()));
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
     fn record_snapshot_demand(
         &mut self,
         selection: &mut super::checker_directive::CheckerStateSelection,

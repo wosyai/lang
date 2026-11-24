@@ -1693,6 +1693,33 @@ cases.extend([
     ("authored-state-nominal-move-not-copy",nominal_move,2,b"unsupported analysis"),
     ("authored-state-nominal-copy-mutation-unsupported",nominal_mutated_copy,2,b"unsupported analysis"),
 ])
+ordinary_nominal_read = f"""%%start
+    struct copy Snapshot {{ i8 saved; bool enabled; }}
+    unit(i8) inspect = fn(value) {{
+        core.narrow(value == 1 || value == 3, {report(1,"PRUNE")});
+        Snapshot original = {{ .saved = value; .enabled = true; }};
+        Snapshot copied = original;
+        if (value == 3) {{
+            i8 earlier = copied.saved;
+            core.require(earlier == 3, {report(59,"LOST-RELATION")});
+        }};
+        value = 7;
+        i8 observed = copied.saved;
+        bool enabled = copied.enabled;
+        if (enabled && observed == 3) {{
+            core.require(value != 7, {state_report(61,"SELECTED-MEMBER","observed")});
+        }} else {{
+            core.require(observed == 1, {report(63,"WRONG-LANE")});
+        }};
+    }};
+    %%end"""
+ordinary_nominal_actual = ordinary_nominal_read.replace("%%end","inspect(3); %%end")
+cases.extend([
+    ("ordinary-nominal-member-read-control",ordinary_nominal_read,61,b"SELECTED-MEMBER"),
+    ("exact-startup-ordinary-nominal-member-read-control",ordinary_nominal_actual,61,b"SELECTED-MEMBER"),
+    ("exact-startup-ordinary-nominal-member-rejects-write",ordinary_nominal_actual.replace(
+        "value = 7;","copied.saved = 2; value = 7;"),2,b"unsupported analysis"),
+])
 authored_array_projection = f"""%%start
     unit(i8) check = fn(value) {{
         core.narrow(value == 1 || value == 3, {report(167,"HOLES")});
@@ -1832,6 +1859,9 @@ copied_nominal_bytes = state_bytes({
 })
 copied_array_bytes = state_bytes(array_state({"kind":"i8"}, [copied_alternatives, typed_state("i8", 4)]))
 authored_files = {
+    **{name: {"state.json": state_bytes(typed_state("i8", 3))} for name in (
+        "ordinary-nominal-member-read-control", "exact-startup-ordinary-nominal-member-read-control",
+    )},
     "authored-state-array-projection-code-and-file": {"selected.json": state_bytes(copied_alternatives)},
     "authored-state-nominal-field-only": {
         "saved.json": state_bytes(copied_alternatives),

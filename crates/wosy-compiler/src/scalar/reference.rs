@@ -6151,6 +6151,7 @@ pub(super) struct CheckerOrdinaryScalarLocal {
 #[derive(Clone, Debug, PartialEq)]
 pub(super) enum CheckerOrdinaryScalarLocalKind {
     Copy,
+    SnapshotRead { shape: std::rc::Rc<super::checker_directive::CheckerSnapshotShape>, leaf: usize },
     Conditional,
     BoolLiteral(bool),
     BoolCall(OccurrenceOrdinal),
@@ -6328,18 +6329,38 @@ impl OccurrenceStructure {
         };
         if !same_receiver { return; }
         let Some(key) = self.snapshot_key(names, receiver) else { return; };
-        if let Some((shape, leaf)) = self.select_snapshot(key, |shape| {
-            let slot = match (&*component, &shape.root) {
-                (Projection::Nominal { field, .. }, Node::Nominal { fields, .. }) => &fields.get(*field)?.1,
-                (Projection::FixedArray { length, index }, Node::Array(elements))
-                    if u64::try_from(elements.len()).ok()? == *length => elements.get(*index)?,
-                _ => return None,
-            };
-            let Node::Leaf(leaf) = slot else { return None; };
-            (shape.leaves.get(*leaf)?.ty == *ty).then_some(*leaf)
-        }) {
+        if let Some((shape, leaf)) = match &*component {
+            Projection::Nominal { field, .. } => self.select_nominal_snapshot_leaf(key, *field, ty),
+            Projection::FixedArray { length, index } => self.select_snapshot_leaf(key, ty, |root| {
+                let Node::Array(elements) = root else { return None; };
+                (u64::try_from(elements.len()).ok()? == *length).then(|| elements.get(*index)).flatten()
+            }),
+        } {
             *selection = CheckerStateSelection::AggregateLeaf { shape, leaf };
         }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    fn select_nominal_snapshot_leaf(
+        &mut self, key: (BlockOrdinal, usize), field: usize, ty: &ScalarType,
+    ) -> Option<(std::rc::Rc<super::checker_directive::CheckerSnapshotShape>, usize)> {
+        use super::checker_directive::CheckerSnapshotNode;
+        self.select_snapshot_leaf(key, ty, |root| {
+            let CheckerSnapshotNode::Nominal { fields, .. } = root else { return None; };
+            Some(&fields.get(field)?.1)
+        })
+    }
+
+    #[cfg(feature = "internal-checker")]
+    fn select_snapshot_leaf(
+        &mut self, key: (BlockOrdinal, usize), ty: &ScalarType,
+        slot: impl FnOnce(&super::checker_directive::CheckerSnapshotNode)
+            -> Option<&super::checker_directive::CheckerSnapshotNode>,
+    ) -> Option<(std::rc::Rc<super::checker_directive::CheckerSnapshotShape>, usize)> {
+        self.select_snapshot(key, |shape| {
+            let super::checker_directive::CheckerSnapshotNode::Leaf(leaf) = slot(&shape.root)? else { return None; };
+            (shape.leaves.get(*leaf)?.ty == *ty).then_some(*leaf)
+        })
     }
 
     #[cfg(feature = "internal-checker")]
@@ -9054,6 +9075,14 @@ impl StructuralWalker<'_, '_> {
             {
                 let ScalarBindingOutput::Evaluate(expression) = binding.output_source(0) else { unreachable!() };
                 self.ordinary_integer_local(outputs.primary, expression, &receiver.ty, names)
+                    .or_else(|| {
+                        let MemberFacts::Prepared(members) = &self.members else { return None; };
+                        let PreparedMemberIdentity::Lexical { binding, field } = members.get(&outputs.primary)?
+                            else { return None; };
+                        let key = *self.structure.checker_snapshot_bindings.get(&(binding.declaration_span, binding.block_span))?;
+                        let (shape, leaf) = self.structure.select_nominal_snapshot_leaf(key, field.index, &receiver.ty)?;
+                        Some(CheckerOrdinaryScalarLocalKind::SnapshotRead { shape, leaf })
+                    })
                     .map(|kind| (outputs.primary, callable.target_resolver, kind))
             }
             _ => None,
@@ -9150,7 +9179,8 @@ impl StructuralWalker<'_, '_> {
                 if let Some((source, callable, kind)) = ordinary_local.take() {
                     let binding = lexical.reference_id(callable.source, callable.function_span);
                     self.structure.checker_has_extended_scalar_local |= matches!(kind,
-                        CheckerOrdinaryScalarLocalKind::Conditional | CheckerOrdinaryScalarLocalKind::Arithmetic {
+                        CheckerOrdinaryScalarLocalKind::Conditional | CheckerOrdinaryScalarLocalKind::SnapshotRead { .. }
+                            | CheckerOrdinaryScalarLocalKind::Arithmetic {
                             operator: BinaryOperator::Multiply | BinaryOperator::Divide | BinaryOperator::Remainder, ..
                         });
                     self.structure.checker_ordinary_scalar_locals.insert((position.block, position.item),

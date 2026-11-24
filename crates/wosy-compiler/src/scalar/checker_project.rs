@@ -2157,6 +2157,7 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                 if parent.source != &owner.source || !body.structure.checker_directives.is_empty()
                     || !body.call_occurrences.is_empty() || !body.allocation_length_calls.is_empty()
                     || !body.assignments.is_empty() || !body.arms.is_empty()
+                    || !body.structure.checker_selected_snapshots.is_empty()
                     || !body.structure.checker_contextual_occurrences.is_empty()
                 {
                     return Err(ProjectCheck::Unsupported);
@@ -10531,6 +10532,50 @@ mod tests {
         assert_eq!(failure.witness.axes().len(), 1);
         let nine = BigInt::from(9);
         assert!(failure.witness.intervals_at(0, 0).unwrap().eq([(&nine, &nine)]));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordinary_immutable_member_read_preserves_captured_control_and_public_axes() {
+        let app = source("src/main.w", "ordinary-nominal-member-read");
+        let text = r#"%%start
+            struct copy Snapshot { i8 saved; bool enabled; }
+            unit(i8) inspect = fn(value) {
+                core.narrow(value == 1 || value == 3, { .stdout = ""; .stderr = ""; .code = 1; .files = []; });
+                Snapshot original = { .saved = value; .enabled = true; };
+                Snapshot copied = original;
+                if (value == 3) {
+                    i8 earlier = copied.saved;
+                    core.require(earlier == 3, { .stdout = ""; .stderr = "lost relation"; .code = 59; .files = []; });
+                };
+                value = 7;
+                i8 observed = copied.saved;
+                bool enabled = copied.enabled;
+                if (enabled && observed == 3) {
+                    core.require(value != 7, { .stdout = ""; .stderr = "selected"; .code = 61;
+                        .files = [{ .path = "observed.json"; .state = observed; }]; });
+                } else {
+                    core.require(observed == 1, { .stdout = ""; .stderr = "wrong lane"; .code = 63; .files = []; });
+                };
+            };
+        %%end"#;
+        let actual = text.replace("%%end", "inspect(3); %%end");
+        for (input, scope) in [(text, ScalarCheckerScope::CurrentPackage),
+            (actual.as_str(), ScalarCheckerScope::MainFlowOnly), (actual.as_str(), ScalarCheckerScope::CurrentPackage)]
+        {
+            let prepared = prepare_proof_target(&app, input).unwrap();
+            let receipt = run_closed_without_named_proofs(&prepared, scope, 1).unwrap();
+            let [failure] = receipt.directives.as_slice() else { panic!("only the preserved member selects its branch"); };
+            assert_eq!(failure.code(), &BigInt::from(61));
+            assert_eq!(failure.witness.axes().len(), 3);
+            assert!(failure.witness.axes().all(|(binding, _)| binding.kind == super::super::ReferenceBindingKind::Declared));
+            assert!(failure.witness.equal_axes().is_empty());
+            assert_eq!(failure.files()[0].text.as_ref(), b"{\"type\":{\"kind\":\"i8\"},\"value\":3}\n");
+        }
+        let mutated = actual.replace("value = 7;", "copied.saved = 2; value = 7;");
+        let prepared = prepare_proof_target(&app, &mutated).unwrap();
+        assert!(matches!(run_closed_without_named_proofs(&prepared, ScalarCheckerScope::MainFlowOnly, 1),
+            Err(ProjectCheck::Unsupported)));
     }
 
     #[cfg(feature = "internal-checker")]

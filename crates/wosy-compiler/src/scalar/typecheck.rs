@@ -1245,6 +1245,13 @@ pub(super) fn block_item_type_in_module(
                 overloads,
                 inference,
             );
+            #[cfg(feature = "internal-checker")]
+            if matches!(binding.receivers.as_slice(), [receiver] if receiver.contextual_storage.is_none())
+                && actual == binding.declared_type
+                && (actual == ScalarType::Bool || is_integer_type(&actual))
+            {
+                inference.note_ordinary_snapshot_read(&binding.value);
+            }
             validate_output_receivers_in_module(
                 &binding.value,
                 &binding.receivers,

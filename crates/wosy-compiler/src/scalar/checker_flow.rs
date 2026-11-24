@@ -5347,6 +5347,15 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                                 // Read the old binding before installing the new one.
                                 path.append_ordinary_copy(axis, roots)?;
                             }
+                            super::reference::CheckerOrdinaryScalarLocalKind::SnapshotRead { shape, leaf } => {
+                                if !roots.allow_extended_scalar_locals { return None; }
+                                let field = shape.leaves.get(*leaf)?;
+                                let (axis, ty) = roots.lookup(&field.capture)?;
+                                if ty != &receiver.ty || field.ty != *ty { return None; }
+                                // A scalar read shares the exact captured
+                                // coordinate, including its row correlations.
+                                path.append_ordinary_copy(axis, roots)?;
+                            }
                             super::reference::CheckerOrdinaryScalarLocalKind::Conditional => {
                                 if !roots.allow_extended_scalar_locals { return None; }
                                 path = bind_conditional_scalar_local(calls, roots, path, origin.source, &receiver.ty)?;
