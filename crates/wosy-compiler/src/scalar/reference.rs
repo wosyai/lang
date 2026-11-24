@@ -5826,13 +5826,14 @@ struct NestedScalarCaller {
 struct ProofTargetUse {
     declaration: (usize, usize),
     exact_scalar: bool,
+    qualified_scalar: bool,
     nested: std::cell::RefCell<NestedProofUses>,
 }
 
 #[cfg(feature = "internal-checker")]
 #[derive(Default)]
 struct NestedProofUses {
-    exact_scalar_sites: HashSet<ByteSpan>,
+    exact_scalar_sites: HashSet<SourceSpan>,
     unsupported: bool,
 }
 
@@ -5962,12 +5963,12 @@ impl<'a> CallDeclarationIndex<'a> {
         if caller.project != source.project || caller.package != source.package { return; }
         if let Some(watched) = self.nested_proof_watch.get(&(source, *declaration_span)) {
             let mut nested = watched.nested.borrow_mut();
-            if let Some(span) = ordinary_span.filter(|_| watched.exact_scalar && caller == source) {
+            if let Some(span) = ordinary_span.filter(|_| watched.exact_scalar && (caller == source || watched.qualified_scalar)) {
                 let mut work = self.nested_scalar_work.get();
                 let charged = super::checker_flow::charge_call_work(&mut work, 1).is_some();
                 self.nested_scalar_work.set(work);
                 if charged {
-                    nested.exact_scalar_sites.insert(span);
+                    nested.exact_scalar_sites.insert(SourceSpan::new(caller.clone(), span));
                     return;
                 }
             }
@@ -6930,7 +6931,7 @@ impl ProjectCallSiteResults {
     }
 
     #[cfg(feature = "internal-checker")]
-    pub(super) fn exact_nested_scalar_proof_sites(&self, target: (usize, usize)) -> Option<&HashSet<ByteSpan>> {
+    pub(super) fn exact_nested_scalar_proof_sites(&self, target: (usize, usize)) -> Option<&HashSet<SourceSpan>> {
         Some(&self.nested_proof_targets.get(&target)?.exact_scalar_sites)
     }
 
@@ -7160,9 +7161,15 @@ fn resolve_project_call_sites_impl(
                             if matches!(&output.ty, ScalarType::Array { element, .. } if is_integer_type(element)))));
             if same_package && (qualified || case_candidate || literal_candidate || result_pair_candidate || array_candidate) {
                 let watch = declarations.nested_proof_watch.entry((source, declaration_span))
-                    .or_insert_with(|| ProofTargetUse { declaration, exact_scalar, nested: std::cell::RefCell::default() });
+                    .or_insert_with(|| ProofTargetUse { declaration, exact_scalar, qualified_scalar: false, nested: std::cell::RefCell::default() });
                 watch.exact_scalar |= exact_scalar;
-                if exact_scalar { declarations.nested_scalar_sources.insert(source); }
+                if exact_scalar {
+                    declarations.nested_scalar_sources.insert(source);
+                    if qualified && !literal_candidate {
+                        watch.qualified_scalar = true;
+                        declarations.nested_scalar_sources.insert(query.source);
+                    }
+                }
             }
         }
         Some(ResolvedCheckerTarget {
@@ -8757,8 +8764,15 @@ impl StructuralWalker<'_, '_> {
             return;
         }
         let Some(&callee) = self.structure.checker_direct_targets.get(&call) else { return; };
-        if caller.owner.0 != callee.0 { return; }
         let declarations = walk.target_resolver.declarations;
+        if caller.owner.0 != callee.0 {
+            if unit_call { return; }
+            let Some(site) = walk.call_occurrences.binary_search_by_key(&call.0, |entry| entry.ordinal.0)
+                .ok().and_then(|index| walk.sites.get(walk.call_occurrences[index].site)) else { return; };
+            let ResolvedCallTarget::ModuleCallable { source, declaration_span, .. } = &site.target else { return; };
+            if !declarations.nested_proof_watch.get(&(source, *declaration_span))
+                .is_some_and(|watch| watch.qualified_scalar && watch.declaration == callee) { return; }
+        }
         let mut work = declarations.nested_scalar_work.get();
         if super::checker_flow::charge_call_work(&mut work, 1).is_some() {
             caller.callees.push(callee);

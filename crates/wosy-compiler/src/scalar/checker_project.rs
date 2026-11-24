@@ -2853,7 +2853,7 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                                 NamedStackArguments::Pair([first, second]) => { pair = [first, second]; &pair }
                             };
                             self.observer.observe_initializer(target, Some(InitializerProofSite {
-                                source: completed.source,
+                                source: frames.last().ok_or(ProjectCheck::Unsupported)?.source,
                                 call: InitializerProofOrigin::Stacked { outer, intermediate, inner: site.call, directive_position,
                                     nested_scalar: site.nested_scalar },
                             }), parameters, exact, value);
@@ -2967,15 +2967,21 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             Some(caller.occurrences.get(call.0).ok_or(ProjectCheck::MissingRootOccurrences)?.span)
         } else { None };
         #[cfg(feature = "internal-checker")]
-        let routed_parent = NAMED && ACTUAL_STARTUP && parent.named_nested_scalars && parent.source == &owner.source;
+        let cross_source_leaf = watched.is_some_and(|watch| watch.qualified_leaf && watch.literal_leaf.is_none())
+            && collection.is_some_and(|ordered|
+                completed_namespace_owner(parent.source, &owner.source, target.0, ordered.visits));
         #[cfg(feature = "internal-checker")]
-        let nested_scalar = routed_parent && watched.is_some_and(|watch| watch.supports_nested_scalar())
+        let routed_parent = NAMED && ACTUAL_STARTUP && parent.named_nested_scalars;
+        #[cfg(feature = "internal-checker")]
+        let nested_scalar = routed_parent && (parent.source == &owner.source || cross_source_leaf)
+            && watched.is_some_and(|watch| watch.supports_nested_scalar())
             && named_span.is_some_and(|span| self.calls.exact_nested_scalar_proof_sites(target)
-                .is_some_and(|sites| sites.contains(&span)))
+                .is_some_and(|sites| sites.contains(&wosy_syntax::SourceSpan::new(parent.source.clone(), span))))
             && (if *expected == ScalarType::Bool { pure_literal_proof_leaf(body, ProofLiteralType::Boolean) }
                 else { qualified_integer_proof_leaf(body, expected) });
         #[cfg(feature = "internal-checker")]
-        let ordinary_named = routed_parent && (nested_scalar || routed_unit || self.observer.named_nested_scalar_route(target));
+        let ordinary_named = nested_scalar || (routed_parent && parent.source == &owner.source
+            && (routed_unit || self.observer.named_nested_scalar_route(target)));
         #[cfg(not(feature = "internal-checker"))]
         let ordinary_named = false;
         #[cfg(feature = "internal-checker")]
@@ -2988,7 +2994,7 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             return Err(ProjectCheck::Unsupported);
         }
         #[cfg(feature = "internal-checker")]
-        if NAMED && (parent.source != &owner.source
+        if NAMED && ((parent.source != &owner.source && !nested_scalar)
             || self.active.contains(&target)
             || !(if routed_unit { ordinary_named && *expected == ScalarType::Unit && body.checker_named_route_frame() }
                 else { matches!(effect, ExactCallEffect::Scalar { binding: Some(_), .. })
@@ -3057,7 +3063,11 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                 return Err(ProjectCheck::Unsupported);
             }
         }
-        if collection.is_some_and(|collection| parent.source != &owner.source
+        #[cfg(feature = "internal-checker")]
+        let enrolled_cross_source_leaf = nested_scalar && cross_source_leaf;
+        #[cfg(not(feature = "internal-checker"))]
+        let enrolled_cross_source_leaf = false;
+        if collection.is_some_and(|collection| parent.source != &owner.source && !enrolled_cross_source_leaf
             && !self.completed_namespace_call(parent.source, owner, target.0, body, signature, expected, collection.visits))
         {
             return Err(ProjectCheck::Unsupported);
@@ -6732,7 +6742,7 @@ struct MainFlowProofTarget<'a> {
     issuer: Option<SymbolicSummaryIssuer<'a>>,
     seen: bool,
     required_nested: usize,
-    observed_nested: HashSet<ByteSpan>,
+    observed_nested: HashSet<wosy_syntax::SourceSpan>,
     literal_leaf: Option<ProofLiteralType>,
     result_pair: bool,
 }
@@ -7129,7 +7139,7 @@ impl ActualIntegerObserver for MainFlowProofObserver<'_> {
         }
         if proofs.required_nested != 0 {
             if let InitializerProofOrigin::Stacked { inner, nested_scalar: true, .. } = site.call {
-                proofs.observed_nested.insert(inner);
+                proofs.observed_nested.insert(wosy_syntax::SourceSpan::new(site.source.clone(), inner));
             }
         }
         let mut invocation: Option<Rc<MainFlowProofInvocation>> = None;
@@ -17907,6 +17917,56 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
             assert_eq!(at(origin.call.range), "pick(value)");
             assert_eq!(at(origin.outer_call.as_ref().unwrap().range), "wrap(3)");
             assert!(origin.intermediate_calls.is_empty() && failure.failed_step.is_none());
+            assert!(run(&main.replace("out == 6", "out == 7"), library, scope).unwrap().diagnostics.is_empty());
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordered_completed_namespace_inner_leaf_keeps_real_unit_route_sources() {
+        let app = source("src/main.w", "ordered-qualified-inner-app");
+        let lib = source("src/calc.w", "ordered-qualified-inner-library");
+        let main = format!(r#"%%start
+            imported = namespace demo "src/calc.w";
+            proof checked for imported.pick(entry) -> (out) where (entry >= 0) ensures (out == 6) {{}}
+            unit(i8) worker = fn(value) {{
+                i8 saved = imported.pick(value);
+                core.require(saved == 7, {OUTPUT});
+            }};
+            unit(i8) middle = fn(value) {{ worker(value); }};
+            unit() boot = fn {{ middle(3); middle(3); }};
+            boot();
+        %%end"#);
+        let library = r#"%%start
+            i8(i8) pick = fn(value) { if (value >= 0) { 7 } else { 4 } };
+        %%end"#;
+        let run = |text: &str, provider: &str, scope| {
+            let (_, catalog) = crate::parse_proof_source(app.clone(), text.to_owned(), &[]).ok().unwrap();
+            let import = ScalarNamespaceBinding { binding: "imported".into(), target: lib.clone(), span: ByteSpan::new(0, 0) };
+            check_loaded_scalar_ordered_local_proof_contexts(
+                vec![(declarations(&lib, provider), Vec::new())], [(catalog, vec![import])],
+                vec![app.clone(), lib.clone()], inputs(), scope, Vec::new(),
+            )
+        };
+        let at = |span: &wosy_syntax::SourceSpan| {
+            assert_eq!(span.source, app);
+            &main[span.range.start as usize..span.range.end as usize]
+        };
+        for scope in [ScalarCheckerScope::MainFlowOnly, ScalarCheckerScope::CurrentPackage] {
+            let receipt = run(&main, library, scope).unwrap();
+            assert!(receipt.directives.is_empty() && receipt.symbolic_diagnostic.is_none());
+            let [first, second] = receipt.diagnostics.as_slice() else { panic!("exactly one diagnostic per real activation"); };
+            for failure in [first, second] {
+                let invocation = &failure.invocation;
+                assert_eq!(failure.proof.source, app);
+                assert_eq!(invocation.namespaced_callable.as_ref().unwrap().source, lib);
+                assert_eq!(at(&invocation.call), "imported.pick(value)");
+                assert_eq!(at(invocation.outer_call.as_ref().unwrap()), "boot()");
+                assert!(invocation.intermediate_calls.iter().map(at).eq(["middle(3)", "worker(value)"]));
+                assert_eq!(invocation.arguments, [(ScalarType::I8, BigInt::from(3))]);
+                assert_eq!(invocation.returned, BigInt::from(7));
+            }
+            assert!(first.invocation.intermediate_calls[0].range.start < second.invocation.intermediate_calls[0].range.start);
             assert!(run(&main.replace("out == 6", "out == 7"), library, scope).unwrap().diagnostics.is_empty());
         }
     }
