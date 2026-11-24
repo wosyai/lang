@@ -174,6 +174,7 @@ pub(super) enum CheckerSnapshotNode {
 #[cfg(feature = "internal-checker")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct CheckerSnapshotLeaf {
+    pub(super) span: super::ByteSpan,
     pub(super) ty: ScalarType,
     pub(super) capture: ReferenceBindingId,
     pub(super) operand: CheckerSnapshotOperand,

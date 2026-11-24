@@ -5788,6 +5788,8 @@ impl<'a> CallResolutionModule<'a> {
 struct CallDeclarationIndex<'a> {
     modules: HashMap<&'a SourceIdentity, CallDeclarationHeaders<'a>>,
     structs: BTreeMap<&'a ScalarStructId, &'a ScalarStruct>,
+    #[cfg(feature = "internal-checker")]
+    checker_proof_targets: HashSet<(&'a SourceIdentity, ByteSpan)>,
 }
 
 #[derive(Default)]
@@ -6260,6 +6262,15 @@ pub(super) struct CheckerContextualCounterUpdate {
     pub(super) literal: BigInt,
 }
 
+/// A typed fixed-array return producer, either constructed at the return
+/// point or referring to the ordinary captures of an immutable local copy.
+#[cfg(feature = "internal-checker")]
+#[derive(Clone, Debug, PartialEq)]
+pub(super) enum CheckerArrayReturn {
+    Constructor(super::checker_directive::CheckerSnapshotShape),
+    Local { constructor: (BlockOrdinal, usize) },
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct OccurrenceStructure {
     pub(super) root: BlockOrdinal,
@@ -6320,6 +6331,8 @@ pub(super) struct OccurrenceStructure {
     checker_snapshot_bindings: HashMap<(ByteSpan, ByteSpan), (BlockOrdinal, usize)>,
     #[cfg(feature = "internal-checker")]
     pub(super) checker_snapshot_copies: HashMap<(BlockOrdinal, usize), CheckerSnapshotCopy>,
+    #[cfg(feature = "internal-checker")]
+    pub(super) checker_array_returns: HashMap<OccurrenceOrdinal, CheckerArrayReturn>,
     #[cfg(feature = "internal-checker")]
     pub(super) checker_ordinary_scalar_locals: HashMap<(BlockOrdinal, usize), CheckerOrdinaryScalarLocal>,
     #[cfg(feature = "internal-checker")]
@@ -6493,6 +6506,8 @@ impl OccurrenceStructure {
             checker_snapshot_bindings: HashMap::new(),
             #[cfg(feature = "internal-checker")]
             checker_snapshot_copies: HashMap::new(),
+            #[cfg(feature = "internal-checker")]
+            checker_array_returns: HashMap::new(),
             #[cfg(feature = "internal-checker")]
             checker_ordinary_scalar_locals: HashMap::new(),
             #[cfg(feature = "internal-checker")]
@@ -6952,23 +6967,29 @@ fn resolve_project_call_sites_impl(
         .map(CallResolutionModule::module)
         .collect::<Vec<_>>();
     let declarations = CallDeclarationIndex::new(&views);
+    #[cfg(feature = "internal-checker")]
+    let mut declarations = declarations;
+    #[cfg(any(test, feature = "internal-checker"))]
+    let checker_targets = checker_targets.iter().map(|query| {
+        let CallDeclaration::Function(source, declaration_span, CallFunctionKind::Ordinary, declaration) =
+            declarations.callable(query.source, query.receiver, query.name)?
+        else {
+            return None;
+        };
+        #[cfg(feature = "internal-checker")]
+        declarations.checker_proof_targets.insert((source, declaration_span));
+        Some(ResolvedCheckerTarget {
+            target: ResolvedCallTarget::ModuleCallable {
+                source: source.clone(),
+                declaration_span,
+                concrete: ConcreteCallSelection::Declaration,
+            },
+            declaration,
+        })
+    }).collect::<Vec<_>>();
     ProjectCallSiteResults {
         #[cfg(any(test, feature = "internal-checker"))]
-        checker_targets: checker_targets.iter().map(|query| {
-            let CallDeclaration::Function(source, declaration_span, CallFunctionKind::Ordinary, declaration) =
-                declarations.callable(query.source, query.receiver, query.name)?
-            else {
-                return None;
-            };
-            Some(ResolvedCheckerTarget {
-                target: ResolvedCallTarget::ModuleCallable {
-                    source: source.clone(),
-                    declaration_span,
-                    concrete: ConcreteCallSelection::Declaration,
-                },
-                declaration,
-            })
-        }).collect(),
+        checker_targets,
         modules: modules
             .iter()
             .map(|module| {
@@ -7024,6 +7045,8 @@ struct CallableWalk<'a> {
     target_resolver: CallableTargetResolver<'a>,
     #[cfg(feature = "internal-checker")]
     checker_name_span: ByteSpan,
+    #[cfg(feature = "internal-checker")]
+    checker_fixed_array_output: bool,
     prepared: bool,
     assignment_outputs: &'a HashMap<ResolvedAssignmentOutputId, ScalarType>,
     sites: Vec<ResolvedCallSite>,
@@ -9248,7 +9271,10 @@ impl StructuralWalker<'_, '_> {
             if self.occurrence_typing.checker_directives_enabled() && outputs.secondary.is_empty()
                 && receiver.contextual_storage.is_none()
             {
-                if self.occurrence_typing.checker_demands_snapshot(&binding.declared_type) {
+                if self.occurrence_typing.checker_demands_snapshot(&binding.declared_type)
+                    || (callable.checker_fixed_array_output
+                        && matches!(binding.declared_type, ScalarType::Array { ref element, .. } if is_integer_type(element)))
+                {
                     let key = (position.block, position.item);
                     let declarations = callable.target_resolver.declarations;
                     let source = if let ScalarBindingOutput::Evaluate(ScalarExpression::Name { name, .. }) =
@@ -9264,7 +9290,10 @@ impl StructuralWalker<'_, '_> {
                     } else {
                         let lexical = WalkBinding { declaration_span: receiver.name_span, block_span, introduced_by_assignment: false };
                         let identity = lexical.reference_id(callable.target_resolver.source, callable.target_resolver.function_span);
-                        if let Some(shape) = self.checker_snapshot_shape(binding, outputs.primary, &identity, declarations) {
+                        let ScalarBindingOutput::Evaluate(expression) = binding.output_source(0) else { unreachable!() };
+                        if let Some(shape) = self.checker_snapshot_shape(
+                            expression, outputs.primary, (&binding.declared_type, &identity), declarations, 65,
+                        ) {
                             self.structure.checker_snapshot_locals.insert(key, std::rc::Rc::new(shape));
                             true
                         } else {
@@ -9455,8 +9484,8 @@ impl StructuralWalker<'_, '_> {
 
     #[cfg(feature = "internal-checker")]
     fn checker_snapshot_shape(
-        &self, binding: &ScalarBinding, root: OccurrenceOrdinal, identity: &ReferenceBindingId,
-        declarations: &CallDeclarationIndex<'_>,
+        &self, expression: &ScalarExpression, root: OccurrenceOrdinal,
+        (ty, identity): (&ScalarType, &ReferenceBindingId), declarations: &CallDeclarationIndex<'_>, node_budget: usize,
     ) -> Option<super::checker_directive::CheckerSnapshotShape> {
         use super::checker_directive::{CheckerSnapshotLeaf, CheckerSnapshotNode, CheckerSnapshotOperand, CheckerSnapshotShape};
         struct Builder<'walk, 'input, 'typing> {
@@ -9479,7 +9508,7 @@ impl StructuralWalker<'_, '_> {
                     let ScalarType::Array { length: actual_length, .. } = actual else { return None; };
                     let ScalarExpression::ArrayLiteral { elements, .. } = expression else { return None; };
                     if actual_length != length || u64::try_from(elements.len()).ok()? != *length
-                        || elements.is_empty() || elements.len() > self.remaining
+                        || (elements.is_empty() && depth != 0) || elements.len() > self.remaining
                     {
                         return None;
                     }
@@ -9525,7 +9554,12 @@ impl StructuralWalker<'_, '_> {
                 }
                 if !is_integer_type(ty) && *ty != ScalarType::Bool { return None; }
                 let operand = match expression {
-                    ScalarExpression::Integer { value, .. } => CheckerSnapshotOperand::Literal(value.clone()),
+                    ScalarExpression::Integer { .. }
+                    | ScalarExpression::Unary { operator: super::UnaryOperator::Negate, .. } if is_integer_type(ty) => {
+                        let value = super::checker_flow::concrete_integer_literal(expression)?;
+                        if !super::typecheck::integer_literal_fits_type(&value, ty) { return None; }
+                        CheckerSnapshotOperand::Literal(value.into_owned())
+                    }
                     ScalarExpression::Boolean { value, .. } => CheckerSnapshotOperand::Literal(BigInt::from(u8::from(*value))),
                     ScalarExpression::Contextual { binding, .. } => CheckerSnapshotOperand::Binding(binding.clone()),
                     ScalarExpression::Name { .. } => {
@@ -9553,15 +9587,54 @@ impl StructuralWalker<'_, '_> {
                 let index = self.leaves.len();
                 let mut capture = self.identity.clone();
                 capture.kind = ReferenceBindingKind::CheckerSnapshotField(index);
-                self.leaves.push(CheckerSnapshotLeaf { ty: ty.clone(), capture, operand });
+                self.leaves.push(CheckerSnapshotLeaf { span: expression_span(expression), ty: ty.clone(), capture, operand });
                 Some(CheckerSnapshotNode::Leaf(index))
             }
         }
-        let ScalarBindingOutput::Evaluate(expression) = binding.output_source(0) else { return None; };
-        let mut builder = Builder { walker: self, declarations, identity, remaining: 65, remaining_name_bytes: 4096,
+        let mut builder = Builder { walker: self, declarations, identity, remaining: node_budget, remaining_name_bytes: 4096,
             has_affine_leaf: false, leaves: Vec::new() };
-        let root = builder.node(expression, root, &binding.declared_type, 0)?;
+        let root = builder.node(expression, root, ty, 0)?;
         Some(CheckerSnapshotShape { has_affine_leaf: builder.has_affine_leaf, root, leaves: builder.leaves.into_boxed_slice() })
+    }
+
+    #[cfg(feature = "internal-checker")]
+    fn record_checker_array_return(
+        &mut self, expression: &ScalarExpression, occurrence: OccurrenceOrdinal,
+        names: &BTreeMap<String, WalkBinding>, block_span: ByteSpan,
+    ) {
+        let WalkMode::Callable(callable) = &self.mode else { return; };
+        if !callable.checker_fixed_array_output || !self.occurrence_typing.checker_directives_enabled() { return; }
+        let Some(ty @ ScalarType::Array { element, .. }) = self.structure.checked_types.expressions.get(&occurrence)
+            else { return; };
+        if !is_integer_type(element) { return; }
+        let resolver = callable.target_resolver;
+        let result = match expression {
+            ScalarExpression::Name { name, .. } => {
+                let Some(binding) = names.get(name).filter(|binding| !binding.introduced_by_assignment) else { return; };
+                let identity = binding.reference_id(resolver.source, resolver.function_span);
+                if !matches!(&self.plain_names, PlainNameFacts::Prepared(prepared)
+                    if prepared.get(&occurrence) == Some(&PlainNameIdentity::Lexical(identity)))
+                {
+                    return;
+                }
+                let Some(&key) = self.structure.checker_snapshot_bindings.get(&(binding.declaration_span, binding.block_span))
+                    else { return; };
+                let constructor = self.structure.checker_snapshot_copies.get(&key).map_or(key, |copy| copy.constructor);
+                CheckerArrayReturn::Local { constructor }
+            }
+            ScalarExpression::ArrayLiteral { .. } => {
+                let identity = WalkBinding {
+                    declaration_span: expression_span(expression), block_span, introduced_by_assignment: false,
+                }.reference_id(resolver.source, resolver.function_span);
+                let Some(shape) = self.checker_snapshot_shape(
+                    expression, occurrence, (ty, &identity), resolver.declarations,
+                    super::checker_flow::MAX_FIXED_ARRAY_RETURN_CELLS + 1,
+                ) else { return; };
+                CheckerArrayReturn::Constructor(shape)
+            }
+            _ => return,
+        };
+        self.structure.checker_array_returns.insert(occurrence, result);
     }
 
     fn block_item(
@@ -9605,6 +9678,10 @@ impl StructuralWalker<'_, '_> {
                 )?;
                 match role {
                     ScalarBlockItemRole::FinalOutput { output, metadata } => {
+                        #[cfg(feature = "internal-checker")]
+                        if output == 0 {
+                            self.record_checker_array_return(expression, producer, names, block_span);
+                        }
                         let mut slot = FinalOutputSlot {
                             item: item_index,
                             output,
@@ -10094,6 +10171,11 @@ fn resolve_function_call_sites(
         },
         #[cfg(feature = "internal-checker")]
         checker_name_span: function.name_span,
+        #[cfg(feature = "internal-checker")]
+        checker_fixed_array_output: declarations.checker_proof_targets.contains(&(source, function.name_span))
+            && matches!(&function.signature, ScalarType::Callable { outputs, .. }
+            if matches!(outputs.outputs.as_slice(), [out]
+                if matches!(out.ty, ScalarType::Array { ref element, .. } if is_integer_type(element)))),
         prepared,
         assignment_outputs,
         sites: Vec::new(),

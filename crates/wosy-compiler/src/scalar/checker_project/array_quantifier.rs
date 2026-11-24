@@ -1,6 +1,6 @@
-//! Checked observations of ordinary immutable fixed-array return constructors.
+//! Quantified claims about prepared immutable fixed-array return cells.
 use super::*;
-use super::super::reference::{OccurrenceEdge, OccurrenceNode, OccurrenceParent};
+use super::super::checker_flow::observe_fixed_array_returns;
 
 pub(super) struct ArrayProof<'a> {
     proof: &'a CstNode,
@@ -8,8 +8,10 @@ pub(super) struct ArrayProof<'a> {
     target: PreparedCallable,
     goal: ByteSpan,
     failed_step: Option<ByteSpan>,
+    entry_filter: Option<Vec<CheckerPredicate>>,
     domain: IntegerSet,
     witness: Option<BigInt>,
+    relation: IntegerRelation,
     expected: BigInt,
     result: &'a ScalarType,
 }
@@ -30,24 +32,33 @@ impl<'a> ArrayProof<'a> {
         let body = calls.function_body(target.0, target.1, None).ok_or(ProjectCheck::Unsupported)?;
         let [output] = body.boundary.results.as_slice() else { return Err(ProjectCheck::Unsupported); };
         let ScalarType::Array { element, length, .. } = &output.ty else { return Err(ProjectCheck::Unsupported); };
-        if !body.boundary.parameters.is_empty() || !is_integer_type(element)
+        if !body.boundary.parameters.iter().all(|parameter| is_integer_type(&parameter.ty))
+            || !is_integer_type(element)
             || !matches!(selected.target, ResolvedCallTarget::ModuleCallable { source, declaration_span,
                 concrete: ConcreteCallSelection::Declaration } if source == &owner.source
                     && *declaration_span == selected.function.2.name_span)
             || owner.source.project != source.project || owner.source.package != source.package
-            || proof.children().any(|node| matches!(node.kind(), SyntaxKind::ProofWhere | SyntaxKind::ProofDecreases))
+            || proof.children().any(|node| node.kind() == SyntaxKind::ProofDecreases)
         {
             return Err(ProjectCheck::Unsupported);
         }
         let target_node = child(proof, SyntaxKind::ProofTarget)?;
         let mut parameters = target_node.children_with_tokens().filter(|entry| entry.kind() == SyntaxKind::Parameters);
-        if !parameters.next().is_some_and(|entry| entry.into_token().is_some()) || parameters.next().is_some() {
+        let inputs = match parameters.next() {
+            Some(entry) => entry.into_node().map_or_else(Vec::new, |node| identifiers(&node).collect::<Vec<_>>()),
+            None => return Err(ProjectCheck::InvalidProof),
+        };
+        if parameters.next().is_some() || inputs.len() != body.boundary.parameters.len() {
             return Err(ProjectCheck::InvalidProof);
         }
         let outputs = child(&child(proof, SyntaxKind::ProofOutputs)?, SyntaxKind::Parameters)?;
         let mut result_names = identifiers(&outputs);
         let binding = result_names.next().ok_or(ProjectCheck::InvalidProof)?;
         if result_names.next().is_some() { return Err(ProjectCheck::InvalidProof); }
+        let mut unique = HashSet::new();
+        if !inputs.iter().chain([&binding]).all(|name| !is_null_literal_name(name) && unique.insert(name.as_str())) {
+            return Err(ProjectCheck::InvalidProof);
+        }
 
         let ensures = child(proof, SyntaxKind::ProofEnsures)?;
         let exists = ensures.children().find(|node| node.kind() == SyntaxKind::ProofExists);
@@ -66,7 +77,13 @@ impl<'a> ArrayProof<'a> {
         {
             return Err(ProjectCheck::InvalidProof);
         }
-        let domain = typed_quantifier_domain(&quantifier, &binder, &[], &index_ty)?;
+        let domain = typed_quantifier_domain(&quantifier, &binder, &inputs, &index_ty)?;
+        if proof.children().find(|node| node.kind() == SyntaxKind::ProofWhere).is_some_and(|clause|
+            clause.descendants().take(MAX_ACTUAL_CALL_DEPTH + 1).count() > MAX_ACTUAL_CALL_DEPTH)
+        {
+            return Err(ProjectCheck::Unsupported);
+        }
+        let entry_filter = prepare_proof_entry_filter_in_scope(proof, source, owner.target_layout, &inputs, body, true)?;
         let goal_node = child(if existential { &quantifier } else { &ensures }, SyntaxKind::Expression)?;
         // The ordinary scalar derivation is recursive; reject before handling
         // a deep or oversized language shape outside this narrow proposition.
@@ -76,8 +93,8 @@ impl<'a> ArrayProof<'a> {
             }
             Ok(derive_expression(node))
         };
-        let checked_claim = |expression: &ScalarExpression| -> Result<BigInt, ProjectCheck> {
-            let ScalarExpression::Binary { operator: BinaryOperator::Equal, left, right, .. } = expression else {
+        let checked_claim = |expression: &ScalarExpression| -> Result<(IntegerRelation, BigInt), ProjectCheck> {
+            let ScalarExpression::Binary { operator, left, right, .. } = expression else {
                 return Err(ProjectCheck::Unsupported);
             };
             let ScalarExpression::IndexedRead { place: super::super::ScalarPlace::Index { base, index, .. }, .. } = left.as_ref() else {
@@ -88,11 +105,12 @@ impl<'a> ArrayProof<'a> {
             {
                 return Err(ProjectCheck::InvalidProof);
             }
+            let relation = IntegerRelation::from_operator(operator).ok_or(ProjectCheck::Unsupported)?;
             let literal = concrete_integer_literal(right).ok_or(ProjectCheck::Unsupported)?;
-            integer_literal_fits_type(literal.as_ref(), element).then(|| literal.into_owned())
+            integer_literal_fits_type(literal.as_ref(), element).then(|| (relation, literal.into_owned()))
                 .ok_or(ProjectCheck::InvalidProof)
         };
-        let expected = checked_claim(&claim(&goal_node)?)?;
+        let (relation, expected) = checked_claim(&claim(&goal_node)?)?;
         let block = child(proof, SyntaxKind::Block)?;
         if block.descendants().take(MAX_ACTUAL_CALL_DEPTH + 1).count() > MAX_ACTUAL_CALL_DEPTH {
             return Err(ProjectCheck::Unsupported);
@@ -118,7 +136,8 @@ impl<'a> ArrayProof<'a> {
                     return Err(ProjectCheck::Unsupported);
                 };
                 let shown = proof_show_expression(item, true)?;
-                if checked_claim(shown)? != expected { return Err(ProjectCheck::Unsupported); }
+                let (shown_relation, shown_bound) = checked_claim(shown)?;
+                if shown_relation != relation || shown_bound != expected { return Err(ProjectCheck::Unsupported); }
                 let ScalarBlockItem::Expression(expression) = item else { return Err(ProjectCheck::Unsupported); };
                 failed_step = Some(super::super::typecheck::expression_span(expression));
             }
@@ -130,64 +149,39 @@ impl<'a> ArrayProof<'a> {
             None
         };
         Ok(Self { proof, source, target, goal: wosy_syntax::byte_span(&goal_node), failed_step,
-            domain, witness, expected, result: &output.ty })
+            entry_filter, domain, witness, relation, expected, result: &output.ty })
     }
 
     fn verify_return(
-        &self, body: &FunctionCallSites, function: &ScalarFunction, source: &SourceIdentity,
-    ) -> Result<Option<AggregateProofDiagnostic>, ProjectCheck> {
-        let ScalarType::Array { element, length, .. } = self.result else { return Err(ProjectCheck::Unsupported); };
+        &self, body: &FunctionCallSites, source: &SourceIdentity,
+    ) -> Result<ProofCoverage<Option<AggregateProofDiagnostic>>, ProjectCheck> {
         let structure = &body.structure;
         if !body.call_occurrences.is_empty() || !body.assignments.is_empty() || !body.arms.is_empty()
             || !body.allocation_length_calls.is_empty() || !structure.checker_directives.is_empty()
+            || structure.has_ordinary_contextual_places() || structure.checker_has_bool_contextual_declaration
+            || body.conditionals.values().any(|region| matches!(region, ConditionalRegion::Unit { .. }))
         {
             return Err(ProjectCheck::Unsupported);
         }
-        let [item] = structure.blocks.get(structure.root.0).ok_or(ProjectCheck::Unsupported)?.items.as_slice() else {
-            return Err(ProjectCheck::Unsupported);
-        };
-        let BlockItemKind::FinalOutput(slot) = &item.kind else { return Err(ProjectCheck::Unsupported); };
-        let mut outputs = function.body.final_expressions();
-        let Some((ScalarExpression::ArrayLiteral { elements, span }, _)) = outputs.next() else {
-            return Err(ProjectCheck::Unsupported);
-        };
-        if slot.output != 0 || outputs.next().is_some() || !structure.checked_types.expressions.get(&slot.expression)
-            .is_some_and(|ty| super::super::scalar_type_equal(ty, self.result))
-            || body.occurrences.get(slot.expression.0).map(|producer| producer.span) != Some(*span)
-            || u64::try_from(elements.len()).ok() != Some(*length)
-        {
-            return Err(ProjectCheck::Unsupported);
-        }
-        let mut work = 0;
-        super::super::checker_flow::charge_call_work(&mut work,
-            elements.len().checked_mul(self.domain.interval_count().checked_add(4).ok_or(ProjectCheck::Unsupported)?)
-                .ok_or(ProjectCheck::Unsupported)?).ok_or(ProjectCheck::Unsupported)?;
-        let mut first = None;
-        for (index, value) in elements.iter().enumerate() {
-            let Some(OccurrenceNode::Expression(occurrence)) = structure.edges.get(&(
-                OccurrenceParent::Expression(slot.expression), OccurrenceEdge::AggregateElement(index),
-            )) else { return Err(ProjectCheck::Unsupported); };
-            let span = body.occurrences.get(occurrence.0).ok_or(ProjectCheck::Unsupported)?.span;
-            if structure.checked_types.expressions.get(occurrence) != Some(element)
-                || span != super::super::typecheck::expression_span(value)
-            {
-                return Err(ProjectCheck::Unsupported);
-            }
-            let actual = concrete_integer_literal(value).ok_or(ProjectCheck::Unsupported)?;
-            if !integer_literal_fits_type(actual.as_ref(), element) { return Err(ProjectCheck::Unsupported); }
-            let index = BigInt::from(index);
-            if first.is_none() && (self.witness.as_ref().map_or_else(
-                || self.domain.contains(&index), |chosen| chosen == &index,
-            )) && actual.as_ref() != &self.expected {
+        match observe_fixed_array_returns(
+            body, self.result, self.entry_filter.as_deref(), &self.domain, self.witness.as_ref(), (self.relation, &self.expected),
+        ).ok_or(ProjectCheck::Unsupported)? {
+            ProofCoverage::NoApplicableInputs => Ok(ProofCoverage::NoApplicableInputs),
+            ProofCoverage::Applicable(None) => Ok(ProofCoverage::Applicable(None)),
+            ProofCoverage::Applicable(Some(failure)) => {
                 let at = |span| wosy_syntax::SourceSpan::new(self.source.clone(), span);
-                first = Some(AggregateProofDiagnostic {
-                    proof: at(wosy_syntax::byte_span(self.proof)), goal: at(self.goal),
-                    failed_step: self.failed_step.map(at),
-                    output: wosy_syntax::SourceSpan::new(source.clone(), span), index, value: actual.into_owned(),
-                });
+                let bindings = body.boundary.checker_parameter_bindings.as_deref().ok_or(ProjectCheck::Unsupported)?;
+                let axes = bindings.iter().zip(&body.boundary.parameters)
+                    .map(|(binding, parameter)| (binding.clone(), parameter.ty.clone())).collect();
+                let equal_axes = failure.inputs.row_equal_axes(0).ok_or(ProjectCheck::Unsupported)?.to_vec();
+                Ok(ProofCoverage::Applicable(Some(AggregateProofDiagnostic {
+                    proof: at(wosy_syntax::byte_span(self.proof)), goal: at(self.goal), failed_step: self.failed_step.map(at),
+                    output: wosy_syntax::SourceSpan::new(source.clone(), failure.span),
+                    index: BigInt::from(failure.index), value: failure.value,
+                    witness: ScalarCheckerIntegerWitness { equal_axes, axes, state: failure.inputs },
+                })))
             }
         }
-        Ok(first)
     }
 }
 
@@ -221,13 +215,13 @@ impl SymbolicRootProof for Symbolic<'_> {
         roots.entry(self.plan.target.0).or_default().insert(self.plan.target.1);
     }
 
-    fn try_collect(&mut self, target: PreparedCallable, body: &FunctionCallSites, function: &ScalarFunction,
+    fn try_collect(&mut self, target: PreparedCallable, body: &FunctionCallSites, _: &ScalarFunction,
         source: &SourceIdentity, _: &mut OrderedFailures, _: SymbolicProofRuntime<'_>,
     ) -> Result<Option<bool>, ProjectCheck> {
         if target != self.plan.target { return Ok(None); }
-        let failure = self.plan.verify_return(body, function, source)?;
-        let applicable = !self.plan.domain.is_empty();
-        self.coverage = Some(if applicable { ProofCoverage::Applicable(failure) } else { ProofCoverage::NoApplicableInputs });
+        let coverage = self.plan.verify_return(body, source)?;
+        let applicable = matches!(coverage, ProofCoverage::Applicable(_));
+        self.coverage = Some(coverage);
         Ok(Some(applicable))
     }
 }

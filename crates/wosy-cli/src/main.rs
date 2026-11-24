@@ -1027,9 +1027,24 @@ fn check_command(
             labels.push(DiagnosticLabel { kind: DiagnosticLabelKind::Secondary, span: failure.goal.clone(),
                 message: "proof goal".to_owned() });
         }
+        let mut notes = vec![format!("symbolic call can return cell [{}] = {}", failure.index, failure.value)];
+        let entries = failure.witness.axes().enumerate().map(|(axis, (binding, _))| {
+            let mut points = failure.witness.intervals_at(0, axis)?;
+            let (first, last) = points.next()?;
+            if first != last || points.len() != 0 { return None; }
+            let name = PackageRelativePath::new(binding.source.path.clone().into()).ok()
+                .map(|path| ProjectSourceIdentity::new(binding.source.project.clone(), binding.source.package.clone(), path))
+                .and_then(|source| publication.texts.get(&source))
+                .and_then(|text| text.get(binding.declaration_span.start as usize..binding.declaration_span.end as usize));
+            let name = name.map_or_else(|| format!("argument {}", axis + 1), str::to_owned);
+            Some(format!("{name} = {first}"))
+        }).collect::<Option<Vec<_>>>();
+        if let Some(entries) = entries.filter(|entries| !entries.is_empty()) {
+            notes.push(format!("symbolic call entry: {}", entries.join(", ")));
+        }
         Diagnostic {
-            code: String::new(), severity: DiagnosticSeverity::Error, message: "proof obligation failed".to_owned(),
-            labels, notes: vec![format!("symbolic call can return cell [{}] = {}", failure.index, failure.value)],
+            code: String::new(), severity: DiagnosticSeverity::Error,
+            message: "proof obligation failed".to_owned(), labels, notes,
         }
     });
     let diagnostics = actual.chain(symbolic).chain(contextual).chain(aggregate).collect::<Vec<_>>();

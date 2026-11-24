@@ -4270,6 +4270,7 @@ pub struct AggregateProofDiagnostic {
     pub output: wosy_syntax::SourceSpan,
     pub index: BigInt,
     pub value: BigInt,
+    pub witness: ScalarCheckerIntegerWitness,
 }
 
 #[cfg(feature = "internal-checker")]
@@ -6605,7 +6606,7 @@ fn check_loaded_ordered_proof_diagnostics_in_scope<const LOCAL_CATALOGS: bool>(
             None => return Err(ProjectCheck::Unsupported),
         };
         return Ok(MainFlowProofReceipt {
-            active: run.active, directives: if aggregate_diagnostic.is_some() { Vec::new() } else { run.directives },
+            active: run.active, directives: run.directives,
             diagnostics: Vec::new(), contextual_diagnostic: None, aggregate_diagnostic,
             symbolic_diagnostic: None, additional_symbolic_diagnostics: Vec::new(), entry_evidence: run.entry_evidence,
         });
@@ -15556,6 +15557,8 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
         ] {
             let failure = ordered(&refuted, ScalarCheckerScope::CurrentPackage).unwrap().aggregate_diagnostic.unwrap();
             assert_eq!((failure.index, failure.value), (BigInt::from(index), BigInt::from(value)));
+            assert_eq!(failure.witness.row_count(), 1);
+            assert_eq!(failure.witness.axes().len(), 0);
             assert_eq!(failure.output.source, app);
             let snippet = |span: ByteSpan| &refuted[span.start as usize..span.end as usize];
             assert_eq!(snippet(failure.output.range), value.to_string());
@@ -15573,6 +15576,89 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
         let not_a_pure_constructor = universal.replace("fn { [", "fn { if (true) {}; [");
         assert!(matches!(ordered(&not_a_pure_constructor, ScalarCheckerScope::CurrentPackage),
             Err(ScalarOrderedCheckerOutcome::Unsupported)));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn quantified_cells_share_branch_paths_and_immutable_captures_with_ordinary_checking() {
+        let app = source("src/main.w", "ordinary-array-cell-proof");
+        let program = r#"%%start
+            u8[3](u8) make = fn(value) {
+                if (value < 7) {
+                    [value + 1, 99, value + 1]
+                } else {
+                    u8 adjusted = value - 0;
+                    u8[3] constructed = [adjusted, 99, adjusted];
+                    u8[3] copied = constructed;
+                    copied
+                }
+            };
+            proof cells for make(entry) -> (items)
+                where (entry == 6 || entry == 7)
+                forall (u64 i where i == 0 || i == 2)
+                ensures (items[i] == 7)
+            { core.show(items[i] == 7); }
+        %%end"#;
+        let ordered = |text: &str, scope| {
+            let (_, catalog) = crate::parse_proof_source(app.clone(), text.to_owned(), &[]).ok().unwrap();
+            check_loaded_scalar_ordered_local_proof_contexts(Vec::new(), [(catalog, Vec::new())],
+                vec![app.clone()], inputs(), scope, Vec::new())
+        };
+        let scope = ScalarCheckerScope::CurrentPackage;
+        let proved = ordered(program, scope).unwrap();
+        assert!(proved.active && proved.aggregate_diagnostic.is_none());
+        let broken = program.replace("value - 0", "value + 1");
+        let failure = ordered(&broken, scope).unwrap().aggregate_diagnostic.unwrap();
+        assert_eq!(failure.index, BigInt::from(0));
+        assert_eq!(failure.value, BigInt::from(8));
+        assert!(failure.witness.intervals_at(0, 0).unwrap().eq([(&7.into(), &7.into())]));
+        let at = |span: ByteSpan| &broken[span.start as usize..span.end as usize];
+        assert_eq!(at(failure.output.range), "adjusted");
+        assert_eq!(at(failure.failed_step.unwrap().range), "core.show(items[i] == 7)");
+        let broader = program.replace("entry == 6", "entry == 5");
+        let failure = ordered(&broader, scope).unwrap().aggregate_diagnostic.unwrap();
+        assert_eq!(failure.value, BigInt::from(6));
+        assert!(failure.witness.intervals_at(0, 0).unwrap().eq([(&5.into(), &5.into())]));
+        assert_eq!(&broader[failure.output.range.start as usize..failure.output.range.end as usize], "value + 1");
+        let bounded = program.replace("entry == 6 || entry == 7", "entry >= 5 && entry <= 7")
+            .replace("items[i] == 7", "items[i] <= 7");
+        assert!(ordered(&bounded, scope).unwrap().aggregate_diagnostic.is_none());
+        let holes = program.replace("entry == 6 || entry == 7", "entry == 4 || entry == 6")
+            .replace("items[i] == 7", "items[i] != 6");
+        assert!(ordered(&holes, scope).unwrap().aggregate_diagnostic.is_none());
+        let correlated = r#"%%start
+            u8[1](u8, u8) reflect = fn(left, right) {
+                if (left < right) {
+                    u8 shifted = 10 - right;
+                    u8[1] constructed = [shifted];
+                    u8[1] copied = constructed;
+                    copied
+                } else { [9] }
+            };
+            proof cells for reflect(a, b) -> (items)
+                where (a >= 2 && a <= 4 && b >= 2 && b <= 4)
+                forall (u64 i where i == 0)
+                ensures (items[i] != 6)
+            {}
+        %%end"#;
+        let failure = ordered(correlated, scope).unwrap().aggregate_diagnostic.unwrap();
+        assert_eq!(failure.value, BigInt::from(6));
+        assert_eq!(failure.witness.row_count(), 1);
+        assert_eq!(failure.witness.axes().len(), 2);
+        let [left, right] = [BigInt::from(2), BigInt::from(4)];
+        // The first eligible row also includes right=3; it does not return 6.
+        assert!(failure.witness.intervals_at(0, 0).unwrap().eq([(&left, &left)]));
+        assert!(failure.witness.intervals_at(0, 1).unwrap().eq([(&right, &right)]));
+        let then_overflow = program.replace(", 99, value + 1", ", value + 250, value + 1");
+        assert!(matches!(ordered(&then_overflow, scope), Err(ScalarOrderedCheckerOutcome::Unsupported)));
+        let impossible = program.replace("entry == 6 || entry == 7", "entry < 6 && entry >= 6");
+        let report = ordered(&impossible, scope).unwrap();
+        assert!(!report.active && report.aggregate_diagnostic.is_none());
+        let with_requirement = broken.replace("%%end", &format!("core.require(false, {OUTPUT}); %%end"));
+        let combined = ordered(&with_requirement, scope).unwrap();
+        assert!(combined.aggregate_diagnostic.is_some() && combined.directives.len() == 1);
+        let main = ordered(&broken, ScalarCheckerScope::MainFlowOnly).unwrap();
+        assert!(!main.active && main.aggregate_diagnostic.is_none());
     }
 
     #[cfg(feature = "internal-checker")]

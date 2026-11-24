@@ -174,6 +174,14 @@ trait ScopedAuthoredReturn<'a>: Copy {
     const OBSERVE_RETURN: bool = false;
 
     #[cfg(feature = "internal-checker")]
+    const OBSERVE_FIXED_ARRAY: bool = false;
+
+    #[cfg(feature = "internal-checker")]
+    fn observe_fixed_array(
+        self, _: &'a FunctionCallSites, _: FinalOutputSlot, _: &ScalarType, _: &IntegerRoots<'a>, _: &IntegerInputs,
+    ) -> Option<()> { None }
+
+    #[cfg(feature = "internal-checker")]
     const REQUIRE_TOTAL_RETURN: bool = false;
 
     #[cfg(feature = "internal-checker")]
@@ -4088,6 +4096,196 @@ pub(super) fn observe_integer_returns(
 }
 
 #[cfg(feature = "internal-checker")]
+pub(super) const MAX_FIXED_ARRAY_RETURN_CELLS: usize = MAX_PARTITION_TRANSFER_WORK / 4;
+
+#[cfg(feature = "internal-checker")]
+pub(super) struct FixedArrayCellFailure {
+    pub(super) index: usize,
+    pub(super) span: super::ByteSpan,
+    pub(super) value: BigInt,
+    pub(super) inputs: IntegerInputs,
+}
+
+#[cfg(feature = "internal-checker")]
+struct RejectedCell<'a> {
+    row: &'a IntegerRow,
+    point: Option<(usize, BigInt)>,
+    value: BigInt,
+}
+
+#[cfg(feature = "internal-checker")]
+impl RejectedCell<'_> {
+    fn source_inputs(&self, parameters: usize, work: &mut usize) -> Option<IntegerInputs> {
+        charge_call_work(work, self.row.len().checked_add(parameters)?.checked_add(1)?)?;
+        let mut row = self.row.clone();
+        let restrict = |row: &mut IntegerRow, axis, value: &BigInt, work: &mut usize| {
+            charge_call_work(work, row.equal_axes().len().checked_add(1)?)?;
+            row.charge_affine_replacement(axis, 1, work)?;
+            charge_call_work(work, 0)?;
+            row.replace_domain(axis, Rc::new(IntegerSet::singleton(value)));
+            Some(())
+        };
+        // Fix the actual rejected value while hidden snapshot/affine axes
+        // are still present. Only then choose points for the source parameters.
+        if let Some((axis, point)) = &self.point {
+            restrict(&mut row, *axis, point, work)?;
+        }
+        for axis in 0..parameters {
+            let domain = row.get(axis)?;
+            if domain.singleton_value().is_none() {
+                let point = domain.extremes()?.0.clone();
+                restrict(&mut row, axis, &point, work)?;
+            }
+        }
+        row.truncate(parameters);
+        Some(IntegerInputs(vec![row]))
+    }
+}
+
+#[cfg(feature = "internal-checker")]
+struct FixedArrayObservationState {
+    work: usize,
+    failure: Option<FixedArrayCellFailure>,
+}
+
+#[cfg(feature = "internal-checker")]
+#[derive(Clone, Copy)]
+struct FixedArrayObservation<'a> {
+    domain: &'a IntegerSet,
+    witness: Option<&'a BigInt>,
+    rejected: IntegerRelation,
+    expected: &'a BigInt,
+    state: &'a std::cell::RefCell<FixedArrayObservationState>,
+}
+
+#[cfg(feature = "internal-checker")]
+impl<'body> ScopedAuthoredReturn<'body> for FixedArrayObservation<'_> {
+    const ENABLED: bool = false;
+    const ALLOW_ORDINARY_INTEGER_LOCALS: bool = true;
+    const OBSERVE_FIXED_ARRAY: bool = true;
+    const REQUIRE_TOTAL_RETURN: bool = true;
+
+    fn allows_extended_scalar_locals(self) -> bool { true }
+
+    fn at(
+        self, _: &FunctionCallSites, _: BlockOrdinal, _: FinalOutputSlot, _: &ScalarType,
+        _: &IntegerRoots<'_>, _: &IntegerInputs,
+    ) -> Option<&'body BigInt> { None }
+
+    fn observe_fixed_array(
+        self, calls: &'body FunctionCallSites, slot: FinalOutputSlot, ty: &ScalarType,
+        roots: &IntegerRoots<'body>, path: &IntegerInputs,
+    ) -> Option<()> {
+        use super::checker_directive::{CheckerSnapshotNode, CheckerSnapshotOperand};
+        use super::reference::CheckerArrayReturn;
+        let ScalarType::Array { element, length, .. } = ty else { return None; };
+        let structure = &calls.structure;
+        let (shape, captured) = match structure.checker_array_returns.get(&slot.expression)? {
+            CheckerArrayReturn::Constructor(shape) => (shape, false),
+            CheckerArrayReturn::Local { constructor } => (structure.checker_snapshot_locals.get(constructor)?.as_ref(), true),
+        };
+        let CheckerSnapshotNode::Array(cells) = &shape.root else { return None; };
+        if u64::try_from(cells.len()).ok()? != *length || cells.len() != shape.leaves.len()
+            || cells.len() > MAX_FIXED_ARRAY_RETURN_CELLS || path.is_unreachable()
+        {
+            return None;
+        }
+        let mut state = self.state.borrow_mut();
+        let rejected = self.rejected;
+        charge_call_work(&mut state.work, cells.len().checked_mul(self.domain.interval_count().checked_add(1)?)?)?;
+        for (index, cell) in cells.iter().enumerate() {
+            let CheckerSnapshotNode::Leaf(leaf) = cell else { return None; };
+            let leaf = shape.leaves.get(*leaf)?;
+            if leaf.ty != **element { return None; }
+            let check = state.failure.is_none() && {
+                let index = BigInt::from(index);
+                self.witness.map_or_else(|| self.domain.contains(&index), |chosen| chosen == &index)
+            };
+            let failure = if captured {
+                let (axis, actual) = roots.lookup(&leaf.capture)?;
+                if actual != &leaf.ty { return None; }
+                if check { first_rejected_array_cell(path, axis, rejected, self.expected, &mut state.work)? } else { None }
+            } else {
+                match &leaf.operand {
+                    CheckerSnapshotOperand::Literal(value) => (check && rejected.accepts(value.cmp(self.expected)))
+                        .then(|| RejectedCell { row: &path.0[0], point: None, value: value.clone() }),
+                    CheckerSnapshotOperand::Binding(binding) => {
+                        let (axis, actual) = roots.lookup(binding)?;
+                        if actual != &leaf.ty { return None; }
+                        if check { first_rejected_array_cell(path, axis, rejected, self.expected, &mut state.work)? } else { None }
+                    }
+                    CheckerSnapshotOperand::Affine { source, operator, literal, source_on_left } => {
+                        let (operation, left, right) = checked_snapshot_operation(
+                            roots, &leaf.ty, source, operator, literal, *source_on_left,
+                        )?;
+                        let (min, max) = super::typecheck::integer_bounds(&leaf.ty)?;
+                        charge_call_work(&mut state.work, path.0.len().checked_mul(5)?)?;
+                        let mut failure = None;
+                        for row in &path.0 {
+                            // Use ordinary checked arithmetic and pull the failing cut back
+                            // through its exact affine image without filling domain holes.
+                            let value = compute_row_integer_operation(row, operation, left, right, &min, &max)?;
+                            if check && failure.is_none() {
+                                failure = match value {
+                                    ComputedRowInteger::Singleton(value) => rejected.accepts(value.cmp(self.expected))
+                                        .then_some(RejectedCell { row, point: None, value }),
+                                    ComputedRowInteger::Affine(axis, transform) => {
+                                        let domain = row.get(axis)?;
+                                        charge_call_work(&mut state.work, domain.interval_count())?;
+                                        let (relation, bound) = transform.pull_back_cut(rejected, self.expected);
+                                        domain.first_comparison_point(relation, &bound)
+                                            .map(|point| RejectedCell { row, point: Some((axis, point.clone())), value: transform.apply_point(point) })
+                                    }
+                                };
+                            }
+                        }
+                        failure
+                    }
+                }
+            };
+            if let Some(failure) = failure {
+                let inputs = failure.source_inputs(roots.parameters, &mut state.work)?;
+                state.failure = Some(FixedArrayCellFailure { index, span: leaf.span, value: failure.value, inputs });
+            }
+        }
+        Some(())
+    }
+}
+
+#[cfg(feature = "internal-checker")]
+fn first_rejected_array_cell<'a>(
+    path: &'a IntegerInputs, axis: usize, relation: IntegerRelation, expected: &BigInt, work: &mut usize,
+) -> Option<Option<RejectedCell<'a>>> {
+    charge_call_work(work, path.0.len())?;
+    for row in &path.0 {
+        let domain = row.get(axis)?;
+        charge_call_work(work, domain.interval_count())?;
+        if let Some(value) = domain.first_comparison_point(relation, expected) {
+            return Some(Some(RejectedCell { row, point: Some((axis, value.clone())), value: value.clone() }));
+        }
+    }
+    Some(None)
+}
+
+/// Read-only consumer of the same prepared blocks, local capture axes and
+/// branch partitions as ordinary scalar checking. No aggregate summary is issued.
+#[cfg(feature = "internal-checker")]
+pub(super) fn observe_fixed_array_returns(
+    calls: &FunctionCallSites, result: &ScalarType, entry_filter: Option<&[CheckerPredicate]>,
+    domain: &IntegerSet, witness: Option<&BigInt>, (relation, expected): (IntegerRelation, &BigInt),
+) -> Option<ProofCoverage<Option<FixedArrayCellFailure>>> {
+    if !matches!(result, ScalarType::Array { .. }) { return None; }
+    let state = std::cell::RefCell::new(FixedArrayObservationState { work: 0, failure: None });
+    let observer = FixedArrayObservation { domain, witness, rejected: relation.complement(), expected, state: &state };
+    match run_integer_callable::<false, false, _>(
+        calls, Some(result), entry_filter, None, &mut [], None, None, None, false, observer,
+    )?.ok()? {
+        ProofCoverage::Applicable(_) if !domain.is_empty() => Some(ProofCoverage::Applicable(state.into_inner().failure)),
+        _ => Some(ProofCoverage::NoApplicableInputs),
+    }
+}
+
+#[cfg(feature = "internal-checker")]
 pub(super) fn observe_arbitrary_integer_returns<'a>(
     calls: &'a FunctionCallSites,
     entry_filter: Option<&[CheckerPredicate]>,
@@ -4585,6 +4783,8 @@ fn run_integer_callable<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool,
         #[cfg(feature = "internal-checker")]
         ordinary_comparison_work: (Authored::ALLOW_ORDINARY_INTEGER_LOCALS
             && calls.structure.has_ordinary_predicates()).then_some(0),
+        #[cfg(feature = "internal-checker")]
+        symbolic_context_work: Authored::OBSERVE_FIXED_ARRAY.then_some(0),
         ..IntegerRoots::default()
     };
     for (binding, parameter) in checker_parameters.iter().zip(&boundary.parameters) {
@@ -5543,7 +5743,12 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
             BlockItemKind::FinalOutput(slot) => {
                 let ty = structure.checked_types.expressions.get(&slot.expression)?;
                 if let Some(expected) = tail {
-                    if slot.output != 0 || ty != expected {
+                    #[cfg(feature = "internal-checker")]
+                    let array = Authored::OBSERVE_FIXED_ARRAY && matches!(ty, ScalarType::Array { .. })
+                        && matches!(expected, ScalarType::Array { .. }) && super::scalar_type_equal(ty, expected);
+                    #[cfg(not(feature = "internal-checker"))]
+                    let array = false;
+                    if slot.output != 0 || (ty != expected && !array) {
                         return None;
                     }
                 } else if !is_integer_type(ty) {
@@ -5623,6 +5828,12 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                             IntegerControl::PendingCall(_) => return None,
                         }
                     }
+                    roots.truncate(depth);
+                    return Some(IntegerControl::Returned);
+                }
+                #[cfg(feature = "internal-checker")]
+                if Authored::OBSERVE_FIXED_ARRAY {
+                    authored_return.observe_fixed_array(calls, slot, ty, roots, &path)?;
                     roots.truncate(depth);
                     return Some(IntegerControl::Returned);
                 }
@@ -6121,10 +6332,13 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                     }
                 }
                 #[cfg(feature = "internal-checker")]
-                if structure.checker_selected_snapshots.contains(&(block, item.position)) {
-                    // Legacy early-failure checks do not materialize authored
-                    // state and must never expose internal capture columns.
-                    if !COLLECT { return None; }
+                if structure.checker_selected_snapshots.contains(&(block, item.position))
+                    || (Authored::OBSERVE_FIXED_ARRAY && (structure.checker_snapshot_locals.contains_key(&(block, item.position))
+                        || structure.checker_snapshot_copies.contains_key(&(block, item.position))))
+                {
+                    // Legacy early-failure checks do not materialize authored state.
+                    // Array proof observations borrow the live captures without publishing axes.
+                    if !COLLECT && !Authored::OBSERVE_FIXED_ARRAY { return None; }
                     // Exact typed aggregate copies share the already-live
                     // construction captures. They add no witness columns.
                     if structure.checker_snapshot_copies.contains_key(&(block, item.position)) { continue; }
@@ -6139,12 +6353,10 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                                 path.append_ordinary_copy(axis, roots)?;
                             }
                             CheckerSnapshotOperand::Affine { source, operator, literal, source_on_left } => {
-                                let (axis, ty) = roots.lookup(source)?;
-                                if ty != &field.ty { return None; }
-                                let source = (None, Some(axis));
-                                let literal = (Some(literal), None);
-                                let (left, right) = if *source_on_left { (source, literal) } else { (literal, source) };
-                                path.append_ordinary_calculation(AuthoredIntegerOperation::checked(operator)?, left, right,
+                                let (operation, left, right) = checked_snapshot_operation(
+                                    roots, &field.ty, source, operator, literal, *source_on_left,
+                                )?;
+                                path.append_ordinary_calculation(operation, left, right,
                                     &field.ty, &mut roots.ordinary_local_work, &mut roots.affine_work)?;
                             }
                             CheckerSnapshotOperand::Literal(value) => {
@@ -7234,6 +7446,19 @@ fn ordinary_local_operand<'a>(
                 .then_some((None, Some(axis)))
         }
     }
+}
+
+#[cfg(feature = "internal-checker")]
+fn checked_snapshot_operation<'a>(
+    roots: &IntegerRoots<'_>, ty: &ScalarType, source: &ReferenceBindingId, operator: &BinaryOperator,
+    literal: &'a BigInt, source_on_left: bool,
+) -> Option<(AuthoredIntegerOperation, IntegerCalculationOperand<'a>, IntegerCalculationOperand<'a>)> {
+    let (axis, actual) = roots.lookup(source)?;
+    if actual != ty { return None; }
+    let source = (None, Some(axis));
+    let literal = (Some(literal), None);
+    let (left, right) = if source_on_left { (source, literal) } else { (literal, source) };
+    Some((AuthoredIntegerOperation::checked(operator)?, left, right))
 }
 
 #[cfg(feature = "internal-checker")]

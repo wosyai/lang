@@ -2074,7 +2074,58 @@ cases.extend([
     ("ordinary-fixed-array-witness-verified", witnessed_array, 0, b""),
     ("ordinary-fixed-array-witness-refuted", witnessed_array.replace("witness(1)", "witness(2)"), 1, b"proof obligation failed"),
 ])
+symbolic_array_cells = """%%start
+    u8[3](u8) make = fn(value) {
+        if (value < 7) {
+            [value + 1,99,value + 1]
+        } else {
+            u8 adjusted = value - 0;
+            u8[3] constructed = [adjusted,99,adjusted];
+            u8[3] copied = constructed;
+            copied
+        }
+    };
+    proof cells for make(entry) -> (items)
+        where (entry == 6 || entry == 7)
+        forall (u64 index where index != 1 && index < 3)
+        ensures (items[index] == 7)
+    {}
+%%end"""
+cases.extend([
+    ("ordinary-fixed-array-symbolic-cells-verified", symbolic_array_cells, 0, b""),
+    ("ordinary-fixed-array-symbolic-cells-interval", symbolic_array_cells
+        .replace("entry == 6 || entry == 7", "entry >= 5 && entry <= 7")
+        .replace("items[index] == 7", "items[index] <= 7"), 0, b""),
+    ("ordinary-fixed-array-symbolic-cells-affine-hole", symbolic_array_cells
+        .replace("entry == 6 || entry == 7", "entry == 4 || entry == 6")
+        .replace("items[index] == 7", "items[index] != 6"), 0, b""),
+    ("ordinary-fixed-array-symbolic-cells-copy-refuted", symbolic_array_cells.replace("value - 0", "value + 1"),
+        1, b"proof obligation failed"),
+    ("ordinary-fixed-array-symbolic-cells-branch-refuted", symbolic_array_cells.replace("entry == 6", "entry == 5"),
+        1, b"proof obligation failed"),
+    ("ordinary-fixed-array-symbolic-cells-unsafe-unselected",
+        symbolic_array_cells.replace(",99,value + 1", ",value + 250,value + 1"), 2, b"unsupported analysis"),
+])
+correlated_array_witness = """%%start
+    u8[1](u8,u8) reflect = fn(left,right) {
+        if (left < right) {
+            u8 shifted = 10 - right;
+            u8[1] constructed = [shifted];
+            u8[1] copied = constructed;
+            copied
+        } else { [9] }
+    };
+    proof cells for reflect(a,b) -> (items)
+        where (a >= 2 && a <= 4 && b >= 2 && b <= 4)
+        forall (u64 index where index == 0)
+        ensures (items[index] != 6)
+    {}
+%%end"""
+cases.append(("ordinary-fixed-array-symbolic-cells-correlated", correlated_array_witness, 1, b"proof obligation failed"))
 proof_diagnostic_notes = {
+    "ordinary-fixed-array-symbolic-cells-correlated": b"symbolic call can return cell [0] = 6",
+    "ordinary-fixed-array-symbolic-cells-copy-refuted": b"symbolic call can return cell [0] = 8",
+    "ordinary-fixed-array-symbolic-cells-branch-refuted": b"symbolic call can return cell [0] = 6",
     "ordinary-fixed-array-forall-refuted": b"symbolic call can return cell [1] = 7",
     "ordinary-fixed-array-witness-refuted": b"symbolic call can return cell [2] = 0",
     "ordinary-unused-contextual-refuted": b"contextual value at entry: 11; at exit: 2",
@@ -2846,6 +2897,12 @@ with tempfile.TemporaryDirectory(prefix="affine-calls-") as path:
                         assert b"COPY-PRIOR-UNPUBLISHED" not in res.stderr and b"COPY-FORMAL-UNPUBLISHED" not in res.stderr,res
                 elif included and name in proof_diagnostic_notes:
                     assert expected_stderr in res.stderr and proof_diagnostic_notes[name] in res.stderr,res
+                    if name == "ordinary-fixed-array-symbolic-cells-correlated":
+                        assert b"symbolic call entry: left = 2, right = 4" in res.stderr,res
+                    if name == "ordinary-fixed-array-symbolic-cells-copy-refuted":
+                        assert b"symbolic call entry: value = 7" in res.stderr,res
+                    if name == "ordinary-fixed-array-symbolic-cells-branch-refuted":
+                        assert b"symbolic call entry: value = 5" in res.stderr,res
                     if name == "ordinary-unused-contextual-refuted":
                         assert b"symbolic contextual call" in res.stderr and b"call supplying this context" not in res.stderr,res
                     if name == "exact-startup-public-namespace-contextual-refuted":
