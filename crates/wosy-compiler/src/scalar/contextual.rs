@@ -288,6 +288,7 @@ impl ContextualSupplyAuthority {
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct DormantContextReceipt {
     pub(super) ty: ScalarType,
+    pub(super) name: std::rc::Rc<str>,
     pub(super) edges: Vec<DormantContextEdge>,
 }
 
@@ -322,7 +323,7 @@ pub(super) enum DormantContextRejection {
 pub(super) fn prepare_dormant_context(
     canonical: &CanonicalCstRoot, inputs: ScalarPreparationInputs,
 ) -> Result<DormantContextReceipt, DormantContextRejection> {
-    let (prepared, receipt) = prepare_contextual_transport(canonical, inputs, false)?;
+    let (prepared, receipt) = prepare_contextual_transport(canonical, inputs, false, false)?;
     let build = analyze_scalar_build(&prepared);
     if !build.diagnostics().is_empty() {
         return Err(DormantContextRejection::Unsupported);
@@ -332,7 +333,7 @@ pub(super) fn prepare_dormant_context(
 
 #[cfg(any(test, feature = "internal-checker"))]
 pub(super) fn prepare_contextual_transport(
-    canonical: &CanonicalCstRoot, inputs: ScalarPreparationInputs, checker_directives: bool,
+    canonical: &CanonicalCstRoot, inputs: ScalarPreparationInputs, checker_directives: bool, contextual_proof: bool,
 ) -> Result<(PreparedScalarProject, DormantContextReceipt), DormantContextRejection> {
     use self::DormantContextRejection::{MissingAtRoot, Unsupported};
     use super::control::{ModuleInitializationCallTarget, ModuleInitializationDetail};
@@ -344,7 +345,7 @@ pub(super) fn prepare_contextual_transport(
     };
     // Extraction, type checking and canonical call preparation retain
     // their normal costs. This meter caps work added by the dormant graph.
-    let mut source = derive_scalar_declarations(canonical, true, None);
+    let mut source = derive_scalar_declarations(canonical, true, contextual_proof && checker_directives, None);
     let places = &mut source.contextual_places;
     charge(places.declarations.len().saturating_add(places.inherited.len()).saturating_add(source.items.len()))?;
     if !source.diagnostics.is_empty() || places.dormant_operands.is_empty() {
@@ -507,5 +508,95 @@ pub(super) fn prepare_contextual_transport(
         calls.install_contextual_call(edge.caller, edge.callee, authority).ok_or(Unsupported)?;
         verified.push(DormantContextEdge { occurrence: edge.occurrence, target: edge.target, supplied });
     }
-    Ok((PreparedScalarProject::from_contextual_transport(project, calls), DormantContextReceipt { ty, edges: verified }))
+    Ok((PreparedScalarProject::from_contextual_transport(project, calls), DormantContextReceipt { ty, name, edges: verified }))
+}
+
+/// Admit just `current == core.old(current) +/- literal` from the
+/// existing CST. No general expression derivation or recursive walk.
+#[cfg(feature = "internal-checker")]
+pub(super) fn contextual_proof_delta(goal: &CstNode, name: &str, ty: &ScalarType)
+    -> Option<(bool, BigInt)>
+{
+    type Element = NodeOrToken<CstNode, CstToken>;
+    // The canonical grammar flattens empty operator tiers. Cap both
+    // wrapper depth and per-node examination before making any copies.
+    fn parts(node: &CstNode) -> Option<Vec<Element>> {
+        let mut parts = Vec::new();
+        for (index, element) in node.children_with_tokens().enumerate() {
+            if index == 24 { return None; }
+            if matches!(element, NodeOrToken::Node(_))
+                || matches!(&element, NodeOrToken::Token(token) if matches!(token.kind(),
+                    SyntaxKind::Identifier | SyntaxKind::TypeName | SyntaxKind::Integer | SyntaxKind::Float
+                    | SyntaxKind::Char | SyntaxKind::Boolean | SyntaxKind::String | SyntaxKind::Operator))
+            {
+                if parts.len() == 3 { return None; }
+                parts.push(element);
+            }
+        }
+        Some(parts)
+    }
+    fn exact<const N: usize>(node: &CstNode) -> Option<[Element; N]> {
+        parts(node)?.try_into().ok()
+    }
+    fn unwrap(mut element: Element) -> Option<Element> {
+        for _ in 0..6 {
+            let NodeOrToken::Node(node) = &element else { return Some(element); };
+            if !matches!(node.kind(), SyntaxKind::Expression | SyntaxKind::Primary | SyntaxKind::FieldAccess
+                | SyntaxKind::Parenthesized)
+            {
+                return Some(element);
+            }
+            let mut children = parts(node)?;
+            if children.len() != 1 { return None; }
+            element = children.pop()?;
+        }
+        None
+    }
+    fn binary(element: Element) -> Option<(Element, CstToken, Element)> {
+        let NodeOrToken::Node(node) = unwrap(element)? else { return None; };
+        if node.kind() != SyntaxKind::Binary { return None; }
+        let [left, NodeOrToken::Token(op), right] = exact::<3>(&node)? else { return None; };
+        (op.kind() == SyntaxKind::Operator).then_some((left, op, right))
+    }
+    fn place(element: Element, name: &str) -> Option<()> {
+        let NodeOrToken::Node(node) = unwrap(element)? else { return None; };
+        if node.kind() != SyntaxKind::ContextualPlace { return None; }
+        let [NodeOrToken::Token(identifier)] = exact::<1>(&node)? else { return None; };
+        (identifier.kind() == SyntaxKind::Identifier && identifier.text() == name).then_some(())
+    }
+    fn literal(element: Element) -> Option<BigInt> {
+        let value = unwrap(element)?;
+        let (token, negative) = match value {
+            NodeOrToken::Token(token) => (token, false),
+            NodeOrToken::Node(node) if node.kind() == SyntaxKind::Unary => {
+                let [NodeOrToken::Token(op), operand] = exact::<2>(&node)? else { return None; };
+                if op.kind() != SyntaxKind::Operator || op.text() != "-" { return None; }
+                let NodeOrToken::Token(token) = unwrap(operand)? else { return None; };
+                (token, true)
+            }
+            _ => return None,
+        };
+        if token.kind() != SyntaxKind::Integer || token.text().len() > 260 { return None; }
+        let value = parse_integer(token.text())?;
+        Some(if negative { -value } else { value })
+    }
+
+    let (left, equal, right) = binary(NodeOrToken::Node(goal.clone()))?;
+    if equal.text() != "==" { return None; }
+    place(left, name)?;
+    let (old, operation, amount) = binary(right)?;
+    let add = match operation.text() { "+" => true, "-" => false, _ => return None };
+    let NodeOrToken::Node(call) = unwrap(old)? else { return None; };
+    if call.kind() != SyntaxKind::Call { return None; }
+    let [NodeOrToken::Node(qualified), argument] = exact::<2>(&call)? else { return None; };
+    if qualified.kind() != SyntaxKind::QualifiedCall { return None; }
+    let [NodeOrToken::Token(core), NodeOrToken::Token(old)] = exact::<2>(&qualified)? else { return None; };
+    if core.kind() != SyntaxKind::Identifier || old.kind() != SyntaxKind::Identifier
+        || core.text() != "core" || old.text() != "old"
+    {
+        return None;
+    }
+    place(argument, name)?;
+    let amount = literal(amount)?;
+    typecheck::integer_literal_fits_type(&amount, ty).then_some((add, amount))
 }

@@ -477,6 +477,7 @@ struct PreparedOrderedRun<E: OrderedRunEvidence> {
     actual: E,
     symbolic: E::SymbolicReport,
     entry_evidence: Option<Box<ScalarOrderedEntryEvidence>>,
+    contextual_proof: Option<ReachedContextualProof>,
 }
 
 #[cfg(feature = "internal-checker")]
@@ -484,15 +485,23 @@ fn run_prepared_ordered_check<E: OrderedRunEvidence>(
     prepared: &PreparedCheckerProject, scope: ScalarCheckerScope, startup_count: usize,
     policy: OrderedReachPolicy, evidence: E,
 ) -> Result<PreparedOrderedRun<E>, ProjectCheck> {
+    run_prepared_ordered_check_with_effects(prepared, scope, startup_count, policy, evidence, OrderedFailures::default())
+}
+
+#[cfg(feature = "internal-checker")]
+fn run_prepared_ordered_check_with_effects<E: OrderedRunEvidence>(
+    prepared: &PreparedCheckerProject, scope: ScalarCheckerScope, startup_count: usize,
+    policy: OrderedReachPolicy, evidence: E, mut effects: OrderedFailures,
+) -> Result<PreparedOrderedRun<E>, ProjectCheck> {
     let (project, _) = prepared.parts();
     let (root, ordinals) = package_startup_order(project, &project.modules[..startup_count])?;
-    let mut effects = OrderedFailures::default();
     let authored_roots = if E::CONTEXTUAL && scope == ScalarCheckerScope::MainFlowOnly {
         HashMap::new()
     } else {
         let (potential_obligations, authored_roots) = package_obligation_roots(prepared, scope, startup_count, root)?;
-        if !potential_obligations && !E::CONTEXTUAL {
-            return Ok(PreparedOrderedRun { active: false, directives: effects.records, actual: evidence, symbolic: E::SymbolicReport::default(), entry_evidence: None });
+        if !potential_obligations && !E::CONTEXTUAL && effects.contextual_proof.is_none() {
+            return Ok(PreparedOrderedRun { active: false, directives: effects.records, actual: evidence, symbolic: E::SymbolicReport::default(), entry_evidence: None,
+                contextual_proof: effects.contextual_proof });
         }
         authored_roots
     };
@@ -537,6 +546,7 @@ fn run_prepared_ordered_check<E: OrderedRunEvidence>(
     }
     Ok(PreparedOrderedRun {
         active, directives: effects.records, actual: evidence, symbolic, entry_evidence: effects.entry_evidence,
+        contextual_proof: effects.contextual_proof,
     })
 }
 
@@ -545,7 +555,7 @@ fn run_prepared_ordered_check<E: OrderedRunEvidence>(
 fn check_internal_contextual_calls(
     canonical: &wosy_syntax::CanonicalCstRoot, inputs: ScalarPreparationInputs,
 ) -> Result<PreparedOrderedRun<ProofFreeOrderedEvidence>, ProjectCheck> {
-    let (prepared, _) = super::contextual::prepare_contextual_transport(canonical, inputs, true)
+    let (prepared, _) = super::contextual::prepare_contextual_transport(canonical, inputs, true, false)
         .map_err(|_| ProjectCheck::Unsupported)?;
     // Checker directives are prepared once in checker mode. Context
     // authenticity comes from the same source scope and checked call rows,
@@ -553,6 +563,134 @@ fn check_internal_contextual_calls(
     let prepared = PreparedCheckerProject::from_contextual_transport(prepared);
     run_prepared_ordered_check(&prepared, ScalarCheckerScope::MainFlowOnly, 1,
         OrderedReachPolicy::Closed, ProofFreeOrderedEvidence)
+}
+
+#[cfg(feature = "internal-checker")]
+#[derive(Debug)]
+struct ContextualProofOccurrence {
+    binding: ReferenceBindingId,
+    supplying_call: ByteSpan,
+    call: ByteSpan,
+    entry: BigInt,
+    exit: BigInt,
+}
+
+#[cfg(feature = "internal-checker")]
+struct ReachedContextualProof {
+    target: PreparedCallable,
+    formal: ReferenceBindingId,
+    ty: ScalarType,
+    goal: ByteSpan,
+    add: bool,
+    amount: BigInt,
+    observations: Vec<ContextualProofOccurrence>,
+    refutation: Option<ContextualProofOccurrence>,
+}
+
+#[cfg(feature = "internal-checker")]
+impl ReachedContextualProof {
+    fn observe(
+        &mut self, (formal, formal_type): (&ReferenceBindingId, &ScalarType),
+        binding: &ReferenceBindingId, ty: &ScalarType, supplying_call: ByteSpan, call: ByteSpan,
+        entry: &BigInt, exit: &BigInt,
+    ) -> Result<(), ProjectCheck> {
+        if formal != &self.formal || formal_type != &self.ty || ty != &self.ty
+            || !matches!(binding.kind, super::ReferenceBindingKind::Declared) || binding.source != formal.source
+        {
+            return Err(ProjectCheck::Unsupported);
+        }
+        let expected = if self.add { entry + &self.amount } else { entry - &self.amount };
+        if !integer_literal_fits_type(&expected, ty) { return Err(ProjectCheck::Unsupported); }
+        let occurrence = || ContextualProofOccurrence {
+            binding: binding.clone(), supplying_call, call, entry: entry.clone(), exit: exit.clone(),
+        };
+        if &expected == exit {
+            if self.refutation.is_none() { self.observations.push(occurrence()); }
+        } else if self.refutation.is_none() {
+            self.refutation = Some(occurrence());
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "internal-checker")]
+#[allow(dead_code)]
+#[derive(Debug)]
+enum InternalContextualProofError {
+    Check(ProjectCheck),
+    Refuted { goal: ByteSpan, occurrence: ContextualProofOccurrence },
+}
+
+#[cfg(feature = "internal-checker")]
+impl From<ProjectCheck> for InternalContextualProofError {
+    fn from(value: ProjectCheck) -> Self { Self::Check(value) }
+}
+
+#[cfg(feature = "internal-checker")]
+#[allow(dead_code)]
+fn check_internal_contextual_proof(
+    canonical: &wosy_syntax::CanonicalCstRoot, inputs: ScalarPreparationInputs,
+) -> Result<(Vec<ContextualProofOccurrence>, Vec<ScalarOrderedCheckerFailure>), InternalContextualProofError> {
+    let root = child(&canonical.root, SyntaxKind::Root)?;
+    let mut proofs = root.children().filter(|node| node.kind() == SyntaxKind::ProofDecl);
+    let declaration = proofs.next().ok_or(ProjectCheck::InvalidProof)?;
+    if proofs.next().is_some()
+        || declaration.children().any(|node| matches!(node.kind(), SyntaxKind::ProofWhere | SyntaxKind::ProofForall | SyntaxKind::ProofDecreases))
+        || child(&declaration, SyntaxKind::Block)?.children().next().is_some()
+    {
+        return Err(ProjectCheck::Unsupported.into());
+    }
+    let target_node = child(&declaration, SyntaxKind::ProofTarget)?;
+    let outputs = child(&declaration, SyntaxKind::ProofOutputs)?;
+    let output_parameters = child(&outputs, SyntaxKind::Parameters)?;
+    let mut output_names = identifiers(&output_parameters);
+    // Canonical CST encodes an empty parameters rule as a leaf token,
+    // whereas a named parameter list owns a Parameters node.
+    let mut target_parameters = target_node.children_with_tokens()
+        .filter(|element| element.kind() == SyntaxKind::Parameters);
+    if !target_parameters.next().is_some_and(|parameters| parameters.into_token().is_some())
+        || target_parameters.next().is_some()
+        || output_names.next().is_none_or(|discard| !is_null_literal_name(&discard))
+        || output_names.next().is_some()
+    {
+        return Err(ProjectCheck::Unsupported.into());
+    }
+    let (namespace, name) = proof_target_tokens(&declaration)?;
+    if namespace.is_some() { return Err(ProjectCheck::Unsupported.into()); }
+    let goal = child(&child(&declaration, SyntaxKind::ProofEnsures)?, SyntaxKind::Expression)?;
+    let (prepared, context) = super::contextual::prepare_contextual_transport(canonical, inputs, true, true)
+        .map_err(|_| ProjectCheck::Unsupported)?;
+    let prepared = PreparedCheckerProject::from_contextual_transport(prepared);
+    let (project, calls) = prepared.parts();
+    let [module] = project.modules.as_slice() else { return Err(ProjectCheck::Unsupported.into()); };
+    let (item, function) = module.items.iter().enumerate().find_map(|(item, candidate)| match candidate {
+        super::ScalarItem::Function(function) if function.name == name.text() => Some((item, function)),
+        _ => None,
+    }).ok_or(ProjectCheck::InvalidProof)?;
+    let body = calls.function_body(0, item, None).ok_or(ProjectCheck::MissingRootOccurrences)?;
+    let (formal, ty) = body.contextual_formal().ok_or(ProjectCheck::Unsupported)?;
+    if ty != &context.ty || !body.boundary.parameters.is_empty()
+        || !matches!(body.boundary.results.as_slice(), [output] if output.ty == ScalarType::Unit)
+        || formal.source != canonical.source || formal.function_span != function.span
+    {
+        return Err(ProjectCheck::Unsupported.into());
+    }
+    let (add, amount) = super::contextual::contextual_proof_delta(&goal, &context.name, ty)
+        .ok_or(ProjectCheck::Unsupported)?;
+    let report = run_prepared_ordered_check_with_effects(&prepared, ScalarCheckerScope::MainFlowOnly, 1,
+        OrderedReachPolicy::Closed, ProofFreeOrderedEvidence, OrderedFailures {
+            contextual_proof: Some(ReachedContextualProof {
+                target: (0, item), formal: formal.clone(), ty: ty.clone(), goal: wosy_syntax::byte_span(&goal),
+                add, amount, observations: Vec::new(), refutation: None,
+            }),
+            ..OrderedFailures::default()
+        })?;
+    let proved = report.contextual_proof.ok_or(ProjectCheck::Unsupported)?;
+    if let Some(occurrence) = proved.refutation {
+        return Err(InternalContextualProofError::Refuted { goal: proved.goal, occurrence });
+    }
+    if proved.observations.is_empty() { return Err(ProjectCheck::Unsupported.into()); }
+    Ok((proved.observations, report.directives))
 }
 
 #[cfg(all(test, feature = "internal-checker"))]
@@ -1679,6 +1817,8 @@ struct ExactCallActivation<'a> {
     followed_self_edge: bool,
     #[cfg(feature = "internal-checker")]
     named_site: Option<NamedStackSite<'a>>,
+    #[cfg(feature = "internal-checker")]
+    contextual_origin: Option<(&'a ReferenceBindingId, ByteSpan)>,
     target: Option<((usize, usize), bool, ExactCallEffect<'a>, Option<usize>)>,
 }
 
@@ -2193,6 +2333,8 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
         let mut frames = vec![ExactCallActivation { body, source, cursor, entry, followed_self_edge: false,
             #[cfg(feature = "internal-checker")]
             named_site: None,
+            #[cfg(feature = "internal-checker")]
+            contextual_origin: None,
             target: None }];
         let result = self.drive_exact_calls::<NAMED>(&mut frames, collection, named_outer);
         for frame in frames.into_iter().rev() {
@@ -2293,6 +2435,18 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                         }
                         let (binding, ty) = parent.body.contextual_argument(effect.occurrence())
                             .ok_or(ProjectCheck::Unsupported)?;
+                        if let Some(ordered) = collection {
+                            if let Some(proof) = &mut ordered.failures.borrow_mut().contextual_proof {
+                                if proof.target == target {
+                                    let formal = completed.body.contextual_formal().ok_or(ProjectCheck::Unsupported)?;
+                                    let span = parent.body.occurrences.get(effect.occurrence().0)
+                                        .ok_or(ProjectCheck::Unsupported)?.span;
+                                    let (original_binding, supplying_call) = completed.contextual_origin
+                                        .ok_or(ProjectCheck::Unsupported)?;
+                                    proof.observe(formal, original_binding, ty, supplying_call, span, &entry, &exit)?;
+                                }
+                            }
+                        }
                         parent.cursor.resume_contextual_unit(binding, ty, entry, exit)
                             .ok_or(ProjectCheck::Unsupported)?;
                         continue;
@@ -2358,8 +2512,13 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                     &mut ordered.failures.borrow_mut().contextual_call_work,
                     body.occurrences.len().checked_add(1).ok_or(ProjectCheck::Unsupported)?,
                 ).ok_or(ProjectCheck::Unsupported)?;
+                let origin = if matches!(binding.kind, super::ReferenceBindingKind::ContextualFormal) {
+                    parent.contextual_origin.ok_or(ProjectCheck::Unsupported)?
+                } else {
+                    (binding, caller.occurrences.get(call.0).ok_or(ProjectCheck::Unsupported)?.span)
+                };
                 Some((formal, formal_ty, parent.cursor.contextual_singleton(binding, ty)
-                    .ok_or(ProjectCheck::Unsupported)?.clone()))
+                    .ok_or(ProjectCheck::Unsupported)?.clone(), origin))
             }
             _ => return Err(ProjectCheck::Unsupported),
         };
@@ -2527,6 +2686,8 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                 body, source: &owner.source, cursor, entry: None, followed_self_edge: false,
                 #[cfg(feature = "internal-checker")]
                 named_site: None,
+                #[cfg(feature = "internal-checker")]
+                contextual_origin: None,
                 target: Some((target, true, effect, Some(projection.caller_axis))),
             });
         }
@@ -2594,9 +2755,10 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
         #[allow(unused_mut)]
         let mut cursor = ExactCallCursor::new(body, exact, expected).ok_or(ProjectCheck::Unsupported)?;
         #[cfg(feature = "internal-checker")]
-        if let Some((formal, ty, value)) = contextual_entry {
+        let contextual_origin = if let Some((formal, ty, value, origin)) = contextual_entry {
             cursor.enter_contextual_unit(formal, ty, value).ok_or(ProjectCheck::Unsupported)?;
-        }
+            Some(origin)
+        } else { None };
         #[cfg(feature = "internal-checker")]
         if NAMED || named_mixed_pair {
             cursor.allow_named_exact_bool_parameters().ok_or(ProjectCheck::Unsupported)?;
@@ -2636,6 +2798,8 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             followed_self_edge: false,
             #[cfg(feature = "internal-checker")]
             named_site,
+            #[cfg(feature = "internal-checker")]
+            contextual_origin,
             target: Some((target, first_activation, effect, None)),
         })
     }
@@ -3053,6 +3217,8 @@ struct OrderedFailures {
     startup_output_work: usize,
     #[cfg(feature = "internal-checker")]
     contextual_call_work: usize,
+    #[cfg(feature = "internal-checker")]
+    contextual_proof: Option<ReachedContextualProof>,
     #[cfg(feature = "internal-checker")]
     snapshot_records: Vec<usize>,
     #[cfg(feature = "internal-checker")]
@@ -3531,7 +3697,7 @@ impl ScalarProofDeclarations {
 
 pub(crate) fn derive_scalar_proof_declarations_from_cst(canonical: &CanonicalCstRoot) -> ScalarProofDeclarations {
     let mut definitions = Vec::new();
-    let declarations = super::derive_scalar_declarations(canonical, false, Some(&mut definitions));
+    let declarations = super::derive_scalar_declarations(canonical, false, false, Some(&mut definitions));
     ScalarProofDeclarations { declarations, definitions }
 }
 
@@ -15814,6 +15980,65 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
             assert!(matches!(result, Err(ProjectCheck::Unsupported)));
             assert!(output.records.is_empty());
             assert!(actual.active.is_empty());
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn exact_contextual_nested_proof_uses_old_from_the_same_call_and_binding() {
+        let app = source("src/main.w", "checked-contextual-named-actual-proof");
+        let text = r#"%%start
+            unit() consume = fn { core.context.credit = core.context.credit - 1; };
+            unit() relay = fn { consume(); };
+            unit() entry = fn {
+                u8 core.context.credit = 3;
+                relay();
+                core.require(false, { .stdout = ""; .stderr = "earlier private output"; .code = 70; .files = []; });
+                if (true) {
+                    u8 core.context.credit = 20;
+                    relay();
+                };
+                relay();
+            };
+            proof debit for consume() -> (null)
+                ensures (core.context.credit == core.old(core.context.credit) - 1) {}
+            entry();
+        %%end"#;
+        let run = |program: &str, target_layout| {
+            let parsed = crate::parse_source(app.clone(), program.to_owned(), &[]);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            check_internal_contextual_proof(parsed.result.canonical_cst(), ScalarPreparationInputs { target_layout })
+        };
+        for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let (observations, directives) = run(text, layout).unwrap();
+            let [outer, inner, restored] = observations.as_slice() else { panic!("expected three actual observations"); };
+            let [effect] = directives.as_slice() else { panic!("one reached ordinary effect"); };
+            assert_eq!(effect.code(), &BigInt::from(70));
+            for (observation, (entry, exit)) in [outer, inner, restored].into_iter().zip([(3, 2), (20, 19), (2, 1)]) {
+                assert_eq!((&observation.entry, &observation.exit), (&BigInt::from(entry), &BigInt::from(exit)));
+                let text_at = |span: ByteSpan| &text[span.start as usize..span.end as usize];
+                assert_eq!(text_at(observation.call), "consume()");
+                assert_eq!(text_at(observation.supplying_call), "relay()");
+            }
+            assert_ne!(outer.binding, inner.binding);
+            assert_eq!(outer.binding, restored.binding);
+            assert_ne!(outer.supplying_call, restored.supplying_call);
+            let wrong_effect = text.replace("core.context.credit = core.context.credit - 1;", "core.context.credit = core.context.credit - 0;");
+            let failure = run(&wrong_effect, layout).unwrap_err();
+            let InternalContextualProofError::Refuted { goal, occurrence } = failure else { panic!("{failure:?}"); };
+            let goal_text = "core.context.credit == core.old(core.context.credit) - 1";
+            assert_eq!(wrong_effect[goal.start as usize..goal.end as usize].trim_end(), goal_text);
+            assert_eq!(goal.start as usize, wrong_effect.find(goal_text).unwrap());
+            assert_eq!((occurrence.entry, occurrence.exit), (BigInt::from(3), BigInt::from(3)));
+            for refused in [
+                text.replace("core.old(core.context.credit)", "core.old(core.context.other)"),
+                text.replace("for consume()", "for entry()"),
+                text.replace("credit = 20;", "credit = 0;"),
+                text.replace(" - 1) {}", " - (1 + 0)) {}"),
+                text.replace("core.old(core.context.credit)", "core.old((core.context.credit = 0))"),
+            ] {
+                assert!(matches!(run(&refused, layout), Err(InternalContextualProofError::Check(ProjectCheck::Unsupported))));
+            }
         }
     }
 

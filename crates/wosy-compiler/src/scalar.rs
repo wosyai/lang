@@ -2334,6 +2334,7 @@ pub fn derive_scalar_declarations_from_cst(
     derive_scalar_declarations(
         canonical,
         false,
+        false,
         #[cfg(any(test, feature = "internal-checker"))]
         None,
     )
@@ -2342,6 +2343,7 @@ pub fn derive_scalar_declarations_from_cst(
 fn derive_scalar_declarations(
     canonical: &CanonicalCstRoot,
     dormant_context: bool,
+    contextual_proof_runtime: bool,
     #[cfg(any(test, feature = "internal-checker"))] mut proofs: Option<&mut Vec<CstNode>>,
 ) -> ScalarSourceDeclarations {
     let mut items = Vec::new();
@@ -2381,7 +2383,7 @@ fn derive_scalar_declarations(
         }
     }
     let contextual_places = if contextual {
-        contextual::prepare(canonical, diagnostic_roots, &mut diagnostics, dormant_context && !has_named_proofs)
+        contextual::prepare(canonical, diagnostic_roots, &mut diagnostics, dormant_context && (!has_named_proofs || contextual_proof_runtime))
     } else {
         contextual::ContextualPlaces::default()
     };
@@ -3090,7 +3092,7 @@ fn typecheck_scalar_project_in_mode(
 pub(crate) fn prepare_internal_contextual_runtime(
     canonical: &CanonicalCstRoot, inputs: ScalarPreparationInputs,
 ) -> Result<PreparedScalarProject, String> {
-    contextual::prepare_contextual_transport(canonical, inputs, false)
+    contextual::prepare_contextual_transport(canonical, inputs, false, false)
         .map(|(prepared, _)| prepared)
         .map_err(|reason| format!("unsupported contextual runtime transport: {reason:?}"))
 }
