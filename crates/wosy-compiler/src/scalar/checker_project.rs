@@ -2400,24 +2400,21 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                 ExactCallCursor::projected_arguments(body, values, &projection, expected)
             }.ok_or(ProjectCheck::Unsupported)?;
             #[cfg(feature = "internal-checker")]
+            let pure_projection_leaf = (named_pair || named_affine_partitions)
+                && parent.source == &owner.source && body.call_occurrences.is_empty()
+                && citation_safe_calling_body(body)
+                && body.structure.blocks.get(body.structure.root.0).and_then(|block| block.items.last())
+                    .is_some_and(|item| matches!(&item.kind, BlockItemKind::FinalOutput(slot)
+                        if matches!(body.structure.checker_integer_final_operations.get(&slot.expression),
+                            Some((BinaryOperator::Add | BinaryOperator::Subtract, _)))));
+            #[cfg(feature = "internal-checker")]
             if named_pair && matches!(projection.companion, ProjectedCompanion::Independent { .. }) {
-                cursor.require_named_pair_rectangles().ok_or(ProjectCheck::Unsupported)?;
+                cursor.require_named_pair_rectangles(pure_projection_leaf).ok_or(ProjectCheck::Unsupported)?;
             }
             #[cfg(feature = "internal-checker")]
-            if named_affine_partitions && is_integer_type(expected)
+            if (named_affine_partitions || named_pair) && is_integer_type(expected)
                 && matches!(projection.companion, ProjectedCompanion::Unary)
             {
-                let pure_projection_leaf = parent.source == &owner.source
-                    && body.call_occurrences.is_empty() && body.allocation_length_calls.is_empty()
-                    && body.assignments.is_empty() && body.arms.is_empty()
-                    && body.structure.checker_directives.is_empty()
-                    && !body.structure.has_ordinary_contextual_places()
-                    && !body.structure.checker_has_bool_contextual_declaration
-                    && body.structure.checker_selected_snapshots.is_empty()
-                    && body.structure.blocks.get(body.structure.root.0).and_then(|block| block.items.last())
-                        .is_some_and(|item| matches!(&item.kind, BlockItemKind::FinalOutput(slot)
-                            if matches!(body.structure.checker_integer_final_operations.get(&slot.expression),
-                                Some((BinaryOperator::Add | BinaryOperator::Subtract, _)))));
                 cursor.observe_named_affine_partitions(pure_projection_leaf).ok_or(ProjectCheck::Unsupported)?;
             }
             #[cfg(feature = "internal-checker")]
@@ -16542,6 +16539,41 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
             assert_eq!(combined.diagnostics.len(), 2);
             assert!(combined.diagnostics.iter().all(|diagnostic| diagnostic.invocation.outer_call.is_none()));
         }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordered_named_symbolic_pair_affine_preserves_independent_old_coordinates() {
+        let app = source("src/main.w", "ordered-symbolic-proof-exact-pair-affine");
+        let text = r#"%%start
+            i16(i16, i16) leaf = fn(tag, value) { if (tag < 0) {}; -1 - value };
+            i16(i16, i16) producer = fn(tag, value) { i16 result = leaf(tag, value); result };
+            proof bounded for producer(selector, before) -> (out)
+                where (selector >= 0 && before >= 0) ensures (out >= -3) {}
+        %%end"#;
+        let run = |text: &str| {
+            let (_, proof) = crate::parse_proof_source(app.clone(), text.to_owned(), &[]).ok().unwrap();
+            check_loaded_ordered_proof_diagnostics_in_scope::<true>(
+                Vec::new(), vec![(proof, Vec::new())], vec![app.clone()], inputs(),
+                ScalarCheckerScope::CurrentPackage, Vec::new(),
+            )
+        };
+        let literal = run(text).unwrap().symbolic_diagnostic.unwrap();
+        assert_eq!(literal.returned, BigInt::from(-4));
+        assert!(literal.witness.intervals_at(0, 0).unwrap().eq([(&BigInt::from(0), &BigInt::from(32767))]));
+        assert!(literal.witness.intervals_at(0, 1).unwrap().eq([(&BigInt::from(3), &BigInt::from(32767))]));
+        assert!(run(&text.replace("before >= 0", "before == 2")).unwrap().symbolic_diagnostic.is_none());
+        let own = run(&text.replace("out >= -3", "out == core.old(before)")).unwrap().symbolic_diagnostic.unwrap();
+        assert_eq!(own.returned, BigInt::from(-1));
+        assert!(own.witness.intervals_at(0, 1).unwrap().eq([(&BigInt::from(0), &BigInt::from(32767))]));
+        let cross = run(&text.replace("out >= -3", "out == core.old(selector)")).unwrap().symbolic_diagnostic.unwrap();
+        assert_eq!(cross.returned, BigInt::from(-1));
+        assert!(cross.witness.intervals_at(0, 0).unwrap().eq([(&BigInt::from(0), &BigInt::from(32767))]));
+        assert!(cross.witness.intervals_at(0, 1).unwrap().eq([(&BigInt::from(0), &BigInt::from(0))]));
+        assert!(matches!(run(&text.replace("-1 - value", "1 - value")), Err(ProjectCheck::Unsupported)),
+            "the positive-entry guard must not authorize arithmetic that overflows elsewhere");
+        let coupled = text.replace("i16 result = leaf(tag, value);", "if (tag < 0) {}; i16 result = leaf(value, value);");
+        assert!(matches!(run(&coupled), Err(ProjectCheck::Unsupported)));
     }
 
     #[cfg(feature = "internal-checker")]

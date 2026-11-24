@@ -1639,6 +1639,23 @@ cases.extend([
         1,b"proof obligation failed"),
 ])
 
+symbolic_named_pair_affine = """%%start
+    i16(i16, i16) leaf = fn(tag, value) { if (tag < 0) {}; -1 - value };
+    i16(i16, i16) producer = fn(tag, value) { i16 result = leaf(tag, value); result };
+    proof bounded for producer(selector, before) -> (out)
+        where (selector >= 0 && before >= 0) ensures (out >= -3) {}
+%%end"""
+cases.extend([
+    ("ordinary-named-symbolic-pair-affine-refuted",symbolic_named_pair_affine,1,b"proof obligation failed"),
+    ("ordinary-named-symbolic-pair-affine-proved",symbolic_named_pair_affine.replace("before >= 0","before == 2"),0,b""),
+    ("ordinary-named-symbolic-pair-affine-own-old",symbolic_named_pair_affine.replace("out >= -3","out == core.old(before)"),
+        1,b"proof obligation failed"),
+    ("ordinary-named-symbolic-pair-affine-cross-old",symbolic_named_pair_affine.replace("out >= -3","out == core.old(selector)"),
+        1,b"proof obligation failed"),
+    ("ordinary-named-symbolic-pair-affine-refuses-masked-overflow",symbolic_named_pair_affine.replace("-1 - value","1 - value"),
+        2,b"unsupported analysis"),
+])
+
 symbolic_named_pair_old_slot = """%%start
     i16(i16, i16) leaf = fn(first, second) { if (second < 0) { 7 } else { first } };
     i16(i16, i16) producer = fn(first, second) { i16 result = leaf(first, second); result };
@@ -1771,6 +1788,9 @@ cases.extend([
         b"proof obligation failed"),
 ])
 proof_diagnostic_notes = {
+    "ordinary-named-symbolic-pair-affine-refuted": b"symbolic call can return -4",
+    "ordinary-named-symbolic-pair-affine-own-old": b"symbolic call can return -1",
+    "ordinary-named-symbolic-pair-affine-cross-old": b"symbolic call can return -1",
     "ordinary-named-symbolic-pair-old-cross-refuted": b"symbolic call can return 3",
     "ordinary-named-symbolic-pair-old-constant-refuted": b"symbolic call can return 7",
     "ordinary-named-symbolic-pair-alias-refuted": b"symbolic call can return 12",

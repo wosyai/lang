@@ -1063,6 +1063,20 @@ impl IntegerAffineTransform {
         (self.reflected && !self.offset.bit(0)).then(|| &self.offset >> 1usize)
     }
 
+    #[cfg(feature = "internal-checker")]
+    fn pull_back_cut(&self, relation: IntegerRelation, bound: &BigInt) -> (IntegerRelation, BigInt) {
+        if self.reflected {
+            (relation.reversed(), &self.offset - bound)
+        } else {
+            (relation, bound - &self.offset)
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    fn identity_everywhere(&self) -> bool {
+        !self.reflected && self.offset.sign() == num_bigint::Sign::NoSign
+    }
+
     fn inverse(&self) -> Self {
         Self { reflected: self.reflected, offset: if self.reflected { self.offset.clone() } else { -&self.offset } }
     }
@@ -1280,6 +1294,16 @@ impl IntegerRow {
 
     // The pair receipt is anchored to this caller row. Reconstruct the first
     // restriction, then validate rather than overwrite the second if linked.
+    #[cfg(feature = "internal-checker")]
+    fn require_independent_named_pair(&self, work: &mut usize) -> Option<()> {
+        let lookup = (usize::BITS - self.equal_axes().len().leading_zeros()) as usize;
+        charge_call_work(work, lookup.checked_mul(2)?.checked_add(MAX_AFFINE_MEMBERS + 1)?)?;
+        let left = self.canonical_axis(0);
+        let right = self.canonical_axis(1);
+        (self.entry.is_none() && left != right
+            && !self.affine.as_ref().is_some_and(|class| class.contains(left) && class.contains(right))).then_some(())
+    }
+
     fn replace_pair(&mut self, [first, second]: [usize; 2], [left, right]: [Rc<IntegerSet>; 2]) -> Option<()> {
         self.replace_domain(first, left);
         if self.linked_axes(first, second) {
@@ -1486,6 +1510,8 @@ struct IntegerRoots<'a> {
     projected_entry_axis: Option<usize>,
     unit_pair_work: Option<usize>,
     affine_work: Option<usize>,
+    #[cfg(feature = "internal-checker")]
+    named_pair_rectangles: bool,
     #[cfg(feature = "internal-checker")]
     allow_ordinary_integer_locals: bool,
     #[cfg(feature = "internal-checker")]
@@ -3362,6 +3388,18 @@ pub(super) fn covers_all_named_pair_inputs(
 
 #[cfg(all(test, feature = "internal-checker"))]
 #[test]
+fn named_pair_independence_allows_one_affine_output_but_not_coupled_inputs() {
+    let values = Rc::new(IntegerSet::from_type(&ScalarType::I16).unwrap());
+    let mut row = IntegerRow::new(vec![Rc::clone(&values), Rc::clone(&values), values]);
+    let transform = Rc::new(IntegerAffineTransform { reflected: true, offset: BigInt::from(-1) });
+    row.affine = Some(Rc::new(IntegerAffineAxes { anchor: 1, members: vec![(2, Rc::clone(&transform))] }));
+    assert_eq!(row.require_independent_named_pair(&mut 0), Some(()));
+    row.affine = Some(Rc::new(IntegerAffineAxes { anchor: 0, members: vec![(1, transform)] }));
+    assert_eq!(row.require_independent_named_pair(&mut 0), None);
+}
+
+#[cfg(all(test, feature = "internal-checker"))]
+#[test]
 fn named_pair_coverage_does_not_confuse_marginals_with_rectangular_coverage() {
     let zero = BigInt::from(0);
     let one = BigInt::from(1);
@@ -3395,7 +3433,7 @@ pub(super) fn verify_named_pair_return<'a>(
     let mut applicable = false;
     'pieces: for piece in &pair.pieces {
         if piece.anchor != 0 { return None; }
-        if matches!(&piece.output, IntegerPairPartitionOutput::InputAlias(slot)
+        if matches!(&piece.output, IntegerPairPartitionOutput::InputAlias(slot) | IntegerPairPartitionOutput::InputAffine(slot, _)
             if producer.boundary.parameters.get(*slot).is_none_or(|entry| entry.ty != result.ty))
         {
             return None;
@@ -3430,24 +3468,51 @@ pub(super) fn verify_named_pair_return<'a>(
                 let Some(example) = constrain(cells.get_mut(*slot)?, relation.complement(), bound, work)? else { continue; };
                 example
             }
+            (PartitionedProofGoal::Literal(relation, bound), IntegerPairPartitionOutput::InputAffine(slot, transform)) => {
+                let (relation, cut) = transform.pull_back_cut(relation.complement(), bound);
+                let Some(example) = constrain(cells.get_mut(*slot)?, relation, &cut, work)? else { continue; };
+                transform.apply_point(&example)
+            }
             (PartitionedProofGoal::EntryEquality(slot), IntegerPairPartitionOutput::Singleton(values)) => {
                 let singleton = values.singleton_value()?;
                 if constrain(cells.get_mut(slot)?, unequal()?, singleton, work)?.is_none() { continue; }
                 singleton.clone()
             }
-            (PartitionedProofGoal::EntryEquality(slot), IntegerPairPartitionOutput::InputAlias(output)) => {
+            (PartitionedProofGoal::EntryEquality(slot), IntegerPairPartitionOutput::InputAffine(output, transform))
+                if slot == *output =>
+            {
+                if transform.identity_everywhere() { continue; }
+                let source = cells.get_mut(slot)?;
+                let example = if let Some(fixed) = transform.integral_reflection_fixed_point() {
+                    let Some(example) = constrain(source, unequal()?, &fixed, work)? else { continue; };
+                    example
+                } else {
+                    source.extremes()?.0.clone()
+                };
+                transform.apply_point(&example)
+            }
+            (PartitionedProofGoal::EntryEquality(slot), IntegerPairPartitionOutput::InputAlias(output)
+                | IntegerPairPartitionOutput::InputAffine(output, _)) =>
+            {
                 if slot == *output { continue; }
+                let evaluate = |input: &BigInt| match &piece.output {
+                    IntegerPairPartitionOutput::InputAffine(_, transform) => transform.apply_point(input),
+                    _ => input.clone(),
+                };
                 let (first, last) = cells.get(*output)?.extremes()?;
                 let old = cells.get(slot)?;
-                // Distinct independent axes can agree everywhere only
-                // when they are equal singletons. Fix a realizable result
-                // coordinate before cutting the old coordinate.
-                let returned = if old.singleton_value() == Some(first) { last } else { first }.clone();
+                // Fix a realizable source/result pair on one axis before
+                // excluding it from the independent old coordinate.
+                let first_value = evaluate(first);
+                let (source, returned) = if old.singleton_value() == Some(&first_value) && first != last {
+                    (last.clone(), evaluate(last))
+                } else {
+                    (first.clone(), first_value)
+                };
                 if constrain(cells.get_mut(slot)?, unequal()?, &returned, work)?.is_none() { continue; }
-                *cells.get_mut(*output)? = Rc::new(IntegerSet::singleton(&returned));
+                *cells.get_mut(*output)? = Rc::new(IntegerSet::singleton(&source));
                 returned
             }
-            (_, IntegerPairPartitionOutput::InputAffine(..)) => return None,
         };
         return Some(PartitionedCallProof { applicable, covers_guard: false, failure: Some(SymbolicLiteralFailure {
             output: piece.span, returned,
@@ -3516,7 +3581,7 @@ pub(super) fn verify_partitioned_call_return<'a>(
             (PartitionedProofGoal::EntryEquality(_), IntegerPartitionOutput::InputAffine(transform)) => {
                 let meter = work.as_deref_mut().unwrap_or(&mut relational_work);
                 charge_call_work(meter, 1usize.checked_add(input.interval_count().checked_mul(2)?)?)?;
-                let violating = if !transform.reflected && transform.offset.sign() == num_bigint::Sign::NoSign {
+                let violating = if transform.identity_everywhere() {
                     None
                 } else if let Some(fixed) = transform.integral_reflection_fixed_point() {
                     let unequal = IntegerRelation::from_operator(&BinaryOperator::NotEqual)?;
@@ -3537,11 +3602,7 @@ pub(super) fn verify_partitioned_call_return<'a>(
                 let violating = match output {
                     IntegerPartitionOutput::InputAlias => input.keep_relation(rejected, bound),
                     IntegerPartitionOutput::InputAffine(transform) => {
-                        let (cut, relation) = if transform.reflected {
-                            (&transform.offset - *bound, rejected.reversed())
-                        } else {
-                            (*bound - &transform.offset, rejected)
-                        };
+                        let (relation, cut) = transform.pull_back_cut(rejected, bound);
                         input.keep_relation(relation, &cut)
                     }
                     IntegerPartitionOutput::Singleton(_) => return None,
@@ -5391,6 +5452,9 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                             (structure.checker_integer_literals.get(&operand), axis(operand))
                         });
                         for row in &path.0 {
+                            if roots.named_pair_rectangles {
+                                row.require_independent_named_pair(work)?;
+                            }
                             let value = computed_projected_value(row, roots.projected_entry_axis,
                                 operation, left, right, &min, &max)?;
                             let piece = if let Some(formal) = roots.projected_entry_axis {
@@ -6117,8 +6181,6 @@ pub(super) struct ExactCallCursor<'a> {
     computed_returns: Vec<(usize, ComputedIntegerReturn)>,
     return_capture_work: usize,
     projected_slot: Option<usize>,
-    #[cfg(feature = "internal-checker")]
-    named_pair_rectangles: bool,
     projected_pair: Option<[usize; 2]>,
 }
 
@@ -6224,16 +6286,20 @@ impl<'a> ExactCallCursor<'a> {
     pub(super) fn named_pair_root(calls: &'a FunctionCallSites, expected: &ScalarType, inputs: [IntegerSet; 2]) -> Option<Self> {
         let row = IntegerRow::new(Vec::from(inputs.map(Rc::new)));
         let mut cursor = Self::with_rows(calls, expected, IntegerInputs(vec![row]), None, Some([0, 1]))?;
-        cursor.require_named_pair_rectangles()?;
+        cursor.require_named_pair_rectangles(false)?;
         Some(cursor)
     }
 
     #[cfg(feature = "internal-checker")]
-    pub(super) fn require_named_pair_rectangles(&mut self) -> Option<()> {
+    pub(super) fn require_named_pair_rectangles(&mut self, pure_projection_leaf: bool) -> Option<()> {
         if self.projected_pair.is_none() || self.projected_slot.is_some() || !self.tail.is_some_and(is_integer_type) {
             return None;
         }
-        self.named_pair_rectangles = true;
+        for row in &self.block.path.0 {
+            row.require_independent_named_pair(&mut self.return_capture_work)?;
+        }
+        self.roots.named_pair_rectangles = true;
+        self.named_pure_projection_leaf = pure_projection_leaf;
         Some(())
     }
 
@@ -6341,8 +6407,6 @@ impl<'a> ExactCallCursor<'a> {
             named_affine_partition: false,
             #[cfg(feature = "internal-checker")]
             named_pure_projection_leaf: false,
-            #[cfg(feature = "internal-checker")]
-            named_pair_rectangles: false,
             discarded_return: None, returned: Vec::new(), computed_returns: Vec::new(), return_capture_work: 0, projected_slot, projected_pair })
     }
 
@@ -6648,7 +6712,7 @@ impl<'a> ExactCallCursor<'a> {
         #[cfg(feature = "internal-checker")]
         let (allow_ordinary_computed_returns, serialize_affine) = (
             allow_ordinary_computed_returns || self.named_pure_projection_leaf,
-            allow_ordinary_computed_returns || self.named_affine_partition,
+            allow_ordinary_computed_returns || self.named_affine_partition || self.roots.named_pair_rectangles,
         );
         #[cfg(not(feature = "internal-checker"))]
         let serialize_affine = allow_ordinary_computed_returns;
@@ -6693,10 +6757,8 @@ impl<'a> ExactCallCursor<'a> {
                     };
                     for row in &path.state.0 {
                         #[cfg(feature = "internal-checker")]
-                        if self.named_pair_rectangles && (row.entry.is_some() || row.affine.is_some()
-                            || row.canonical_axis(0) == row.canonical_axis(1))
-                        {
-                            return None;
+                        if self.roots.named_pair_rectangles {
+                            row.require_independent_named_pair(&mut self.return_capture_work)?;
                         }
                         let output = if let Some(axis) = alias {
                             if row[axis].singleton_value().is_some() {
