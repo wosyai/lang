@@ -1375,6 +1375,12 @@ fn lexical_conditional_owner_choice_releases_selected_original_after_read() {
         .replace("if (drive(2, true) == 4) { 2 } else { 0 }", "drive(2, true)")
         .replace("if (drive(3, true) == 24) { 12 } else { 0 }", "drive(3, true)");
     assert_ne!(saved_then_released, multiple_then_consumed);
+    let computed_then_released = saved_then_released
+        .replace("    observed\n", "    (observed + 3) * 2\n")
+        .replace("drive(0, false) }", "if (drive(0, false) == 30) { 12 } else { 0 } }")
+        .replace("drive(2, true) }", "if (drive(2, true) == 10) { 2 } else { 0 } }")
+        .replace("drive(3, true) }", "if (drive(3, true) == 30) { 12 } else { 0 } }");
+    assert_ne!(computed_then_released, saved_then_released);
     let updated_then_consumed = saved_then_consumed
         .replace("    u64 observed = read_selected", "    chosen.length = 5;\n    u64 observed = read_selected")
         .replace("== 24", "== 10").replace("== 4) { 2", "== 10) { 2");
@@ -1406,6 +1412,7 @@ fn lexical_conditional_owner_choice_releases_selected_original_after_read() {
         (saved_then_consumed.as_str(), "consume-after-saved-borrow"),
         (multiple_then_consumed.as_str(), "consume-after-multiple-borrows"),
         (saved_then_released.as_str(), "release-after-saved-borrows"),
+        (computed_then_released.as_str(), "release-after-scalar-continuation"),
         (updated_then_consumed.as_str(), "consume-after-metadata-write"),
         (named_borrow.as_str(), "named-borrow"), (nested_temporary.as_str(), "nested-consume-temporary"),
         (nested_borrow.as_str(), "nested-named-borrow")]
@@ -1413,7 +1420,7 @@ fn lexical_conditional_owner_choice_releases_selected_original_after_read() {
         let nested = use_site.starts_with("nested-");
         let base_use = use_site.strip_prefix("nested-").unwrap_or(use_site);
         let consuming = base_use.starts_with("consume");
-        let releases_saved = base_use == "release-after-saved-borrows";
+        let releases_saved = matches!(base_use, "release-after-saved-borrows" | "release-after-scalar-continuation");
         let multiple = releases_saved || base_use == "consume-after-multiple-borrows";
         let updates_metadata = base_use == "consume-after-metadata-write";
         let borrowing = multiple || updates_metadata
@@ -1572,7 +1579,10 @@ fn lexical_conditional_owner_choice_releases_selected_original_after_read() {
                         .contains("local conditional owner requires a proved terminal consumer"));
                 } else if borrowing {
                     if releases_saved {
-                        let wrong = text.replace("    observed\n", "    chosen.length + observed\n");
+                        let result = if base_use == "release-after-scalar-continuation" {
+                            "    (observed + 3) * 2\n"
+                        } else { "    observed\n" };
+                        let wrong = text.replace(result, "    chosen.length + observed\n");
                         assert_ne!(wrong, text);
                         assert!(emit(&wrong).expect_err("only the exact saved scalar survives the selected owner")
                             .contains("aggregate owning call has no proved endpoint"));

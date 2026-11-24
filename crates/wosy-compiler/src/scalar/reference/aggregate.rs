@@ -2921,12 +2921,54 @@ impl Body<'_> {
                     if value_point == last.id)
                 && matches!(exit.kind, CfgPointKind::ScopeExit)).then_some(exit.id)
         };
-        let returns_saved = saved_observation.is_some_and(|saved| {
-            matches!(self.sites.prepared_plain_name(output.expression),
+        let saved_exit = saved_observation.and_then(|saved| {
+            if matches!(self.sites.prepared_plain_name(output.expression),
                 Some(PlainNameIdentity::Lexical(binding)) if binding == saved)
                 && matches!(&read.kind, CfgPointKind::Read { binding } if binding == saved)
+            {
+                return end_use(read);
+            }
+            // A closed ordinary continuation consumes only the saved scalar
+            // and literal operands. Match its exact linear postfix CFG with
+            // a bounded operand-depth counter, not a second ownership walk.
+            const MAX_SAVED_SCALAR_POINTS: usize = 16;
+            let authored = self.sites.occurrences.get(output.expression.0)?.span;
+            let mut cursor = read;
+            let mut depth = 0usize;
+            let mut observed = false;
+            for _ in 0..MAX_SAVED_SCALAR_POINTS {
+                let span = cursor.source_span.range;
+                if cursor.scope != scope || span.start < authored.start || span.end > authored.end {
+                    return None;
+                }
+                let arity = match &cursor.kind {
+                    CfgPointKind::Read { binding } if binding == saved => {
+                        observed = true;
+                        0
+                    }
+                    CfgPointKind::Evaluate(ScalarExpression::Boolean { .. } | ScalarExpression::Char { .. }
+                        | ScalarExpression::Integer { .. } | ScalarExpression::Float { .. }) => 0,
+                    CfgPointKind::Evaluate(ScalarExpression::Unary {
+                        operator: UnaryOperator::Negate | UnaryOperator::BitwiseNot | UnaryOperator::LogicalNot, ..
+                    }) => 1,
+                    CfgPointKind::Evaluate(ScalarExpression::Binary {
+                        operator: BinaryOperator::Add | BinaryOperator::Subtract | BinaryOperator::Multiply
+                            | BinaryOperator::BitAnd | BinaryOperator::BitOr | BinaryOperator::BitXor
+                            | BinaryOperator::Equal | BinaryOperator::NotEqual | BinaryOperator::Less
+                            | BinaryOperator::LessEqual | BinaryOperator::Greater | BinaryOperator::GreaterEqual, ..
+                    }) => 2,
+                    _ => return None,
+                };
+                depth = depth.checked_sub(arity)? + 1;
+                let successor = next(cursor.id)?;
+                if matches!(successor.kind, CfgPointKind::ReturnOutput { .. }) {
+                    return (observed && depth == 1).then(|| end_use(cursor)).flatten();
+                }
+                cursor = successor;
+            }
+            None
         });
-        let scalar_call = if saved_observation.is_some() && !returns_saved {
+        let scalar_call = if saved_observation.is_some() && saved_exit.is_none() {
             let OccurrenceNode::Expression(left) = *structure.edges.get(&(
                 OccurrenceParent::Expression(output.expression), OccurrenceEdge::BinaryLeft,
             ))? else { return None };
@@ -2935,10 +2977,10 @@ impl Body<'_> {
             }
             left
         } else { output.expression };
-        let use_site = if returns_saved {
-            // Only the ordinary saved scalar survives this lexical owner.
-            // The receipt remains in the caller and is discharged at its exit.
-            LocalChoiceUse::Observe(end_use(read)?)
+        let use_site = if let Some(exit) = saved_exit {
+            // Only the ordinary result survives; the receipt remains with the
+            // caller and is discharged at the existing lexical exit.
+            LocalChoiceUse::Observe(exit)
         } else if let Some((observed, field)) = self.sites.prepared_lexical_member(output.expression) {
             if alias.is_some() || !before_consume.is_empty() || observed != holder || &field.structure != descriptor
                 || !matches!(&read.kind, CfgPointKind::ReadPlace { pointer_point: None, reads_origin: false,
