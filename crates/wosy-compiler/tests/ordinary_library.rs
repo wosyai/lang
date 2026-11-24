@@ -1154,7 +1154,14 @@ fn selected_recommitted_owner_returns_its_backing_to_the_caller() {
         .replace("    returned\n};",
             "    Packet newer = neighbor(7);\n    newer.length;\n    returned\n};");
     assert_ne!(text, with_siblings);
-    for (variant, text) in [("baseline", text.as_str()), ("siblings", with_siblings.as_str())] {
+    let recursive = with_siblings
+        .replace("if (choose != (depth == 3)) { make_short(2) } else { make_long(2) }",
+            "if (depth == 0) { if (choose) { make_short(2) } else { make_long(2) } } else { shipment(depth - 1, choose) }")
+        .replace("drive(3, true)", "drive(3, false)");
+    assert_ne!(recursive, with_siblings);
+    for (variant, text) in [
+        ("baseline", text.as_str()), ("siblings", with_siblings.as_str()), ("recursive", recursive.as_str()),
+    ] {
         for (target, target_layout) in [("native64", ScalarTargetLayout::NATIVE64), ("wasm32", ScalarTargetLayout::WASM32)] {
             for (route, project) in [("single", false), ("project", true)] {
                 let prepared = prepare_scalar_project(
@@ -1177,7 +1184,8 @@ fn selected_recommitted_owner_returns_its_backing_to_the_caller() {
                     module.get_function("__wosy_core_free").unwrap(),
                 );
                 let factories = [find("make_short"), find("make_long")];
-                let sibling_factory = (variant == "siblings").then(|| find("neighbor"));
+                let sibling_factory = (variant != "baseline").then(|| find("neighbor"));
+                let mut recursive_returns = Vec::new();
                 let mut siblings = Vec::new();
                 let mut local_releases = Vec::new();
                 assert_eq!(ship.count_params(), 3, "{ir}");
@@ -1204,6 +1212,9 @@ fn selected_recommitted_owner_returns_its_backing_to_the_caller() {
                     } else if Some(callee) == sibling_factory {
                         assert_eq!(reads_and_handoff.len(), if siblings.is_empty() { 1 } else { 3 });
                         siblings.push(call.try_as_basic_value().basic().unwrap());
+                    } else if callee == ship {
+                        assert_eq!(call.count_arguments(), ship.count_params());
+                        recursive_returns.push(call.try_as_basic_value().basic().unwrap());
                     } else if factories.contains(&callee) {
                         original.push(call.try_as_basic_value().basic().unwrap());
                     } else if callee == reader || callee == relay {
@@ -1213,12 +1224,26 @@ fn selected_recommitted_owner_returns_its_backing_to_the_caller() {
                 }
                 assert_eq!(reads_and_handoff, [reader, relay, reader]);
                 assert_eq!(siblings.len(), if sibling_factory.is_some() { 2 } else { 0 });
-                let [(selected, incoming)] = bases.as_slice() else { panic!("{ir}") };
-                assert_eq!(returned, Some(*selected), "return the actual original-base phi");
-                assert!(!local_releases.contains(selected), "the selected backing survives into the caller");
-                assert_eq!(incoming.len(), 2);
+                assert_eq!(recursive_returns.len(), usize::from(variant == "recursive"));
+                assert_eq!(bases.len(), 1 + recursive_returns.len());
+                let selected = returned.expect("return the actual original-base phi");
+                assert!(!local_releases.contains(&selected), "the selected backing survives into the caller");
+                let mut pending = vec![selected];
+                let mut expanded = Vec::new();
+                let mut leaves = Vec::new();
+                while let Some(value) = pending.pop() {
+                    assert!(!expanded.contains(&value), "same-frame receipt phis are acyclic");
+                    expanded.push(value);
+                    if let Some((_, incoming)) = bases.iter().find(|(phi, _)| *phi == value) {
+                        assert_eq!(incoming.len(), 2);
+                        pending.extend(incoming.iter().copied());
+                    } else {
+                        leaves.push(value);
+                    }
+                }
                 assert_eq!(original.len(), 2);
-                assert!(original.iter().all(|base| incoming.contains(base)));
+                assert_eq!(leaves.len(), original.len() + recursive_returns.len());
+                assert!(original.iter().chain(&recursive_returns).all(|value| leaves.contains(value)));
                 let mut received = None;
                 let mut released = Vec::new();
                 for row in drive.get_basic_blocks().into_iter().flat_map(|block| block.get_instructions()) {
@@ -1232,7 +1257,7 @@ fn selected_recommitted_owner_returns_its_backing_to_the_caller() {
                 assert_eq!(released, [received.expect("one received backing")], "caller releases the transferred original once");
                 if let Some(out) = std::env::var_os("WOSY_SELECTED_RECOMMITTED_RETURN_IR_DIR") {
                     let out = std::path::PathBuf::from(out).join(route);
-                    let out = if variant == "siblings" { out.join(variant) } else { out };
+                    let out = if variant == "baseline" { out } else { out.join(variant) };
                     std::fs::create_dir_all(&out).unwrap();
                     let mut witness = ir.replace("@main(", "@wosy_authored_main(");
                     for name in ["case_zero", "case_two", "case_three"] {

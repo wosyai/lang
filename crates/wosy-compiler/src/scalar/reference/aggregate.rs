@@ -5029,10 +5029,31 @@ fn closed_aggregates<'a>(
                 let target = target_body(&declarations, body.cfg, point)?;
                 Some((target, *identity_relays.get(&target)?))
             }) {
-                let dependencies: Option<BTreeSet<_>> = choice.all_producers().map(|&point| {
-                    let target = target_body(&declarations, body.cfg, point)?;
-                    (!bodies.get(&target)?.has_mixed_struct_result()).then_some(target)
-                }).collect();
+                let dependencies = (|| {
+                    let mut dependencies = BTreeSet::new();
+                    let mut recurs = false;
+                    let mut external_primary = false;
+                    for &point in choice.all_producers() {
+                        let target = target_body(&declarations, body.cfg, point)?;
+                        let primary = choice.leaves.contains(&point);
+                        if bodies.get(&target)?.has_mixed_struct_result() { return None; }
+                        if target == key {
+                            let ordinal = body.facts?.calls.get(&point)?;
+                            if recurs || !primary
+                                || body.sites.declared_unsafe_calls.contains(&ordinal.0)
+                                || !body.sites.boundary.parameters.iter().all(|parameter| ordinary_value(&parameter.ty))
+                            { return None; }
+                            recurs = true;
+                        } else {
+                            external_primary |= primary;
+                            dependencies.insert(target);
+                        }
+                    }
+                    // Only result-producing alternatives can ground the
+                    // recurrence. An independently released sibling never can.
+                    if recurs && !external_primary { return None; }
+                    Some(dependencies)
+                })();
                 if let Some(dependencies) = dependencies {
                     selected_return_dependencies.insert(key, dependencies.len());
                     for dependency in dependencies {
@@ -5085,8 +5106,8 @@ fn closed_aggregates<'a>(
     // Only independently allocated owners seed the two worklists. A wrapper
     // becomes an owning producer when its returned recommit has such a seed.
     // Each observed call edge is consumed once, including through wrapper chains.
-    // A selected returned receipt also waits for every distinct branch or
-    // sibling producer; normal body and lexical endpoint checks still follow.
+    // A selected returned receipt also waits for every distinct non-self
+    // branch or sibling producer; a checked self edge is never a worklist seed.
     loop {
         if let Some(target) = pending.pop() {
             if let Some(body_callers) = callers.remove(&target) {
