@@ -875,6 +875,35 @@ def state_report(code, label, selected, extra=""):
     return ('{ .stdout = ""; .stderr = "'+label+'"; .code = '+str(code)
             +'; .files = [{ .path = "state.json"; .state = '+selected+'; }'+extra+']; }')
 
+projected_scalar_narrow = f"""%%start
+    i8(i8) retain = fn(entry) {{
+        core.narrow(entry >= 2, {report(190,"NARROW-UNEXPECTED")});
+        entry
+    }};
+    unit(i8) check = fn(input) {{
+        i8 output = retain(input);
+        core.require(input >= 2, {report(191,"CALLER-UNPRUNED")});
+        core.require(output < 2, {state_report(192,"SURVIVORS","output")});
+    }};
+    %%end"""
+projected_scalar_empty = f"""%%start
+    i8(i8) retain = fn(entry) {{
+        core.narrow(entry <= 0, {state_report(193,"REACHED-NARROW","entry")});
+        entry
+    }};
+    unit(i8) check = fn(input) {{
+        if (input > 0) {{
+            i8 output = retain(input);
+            core.require(output > 127, {report(194,"DEAD-RETURN")});
+        }} else {{
+            core.require(input > 0, {state_report(195,"SIBLING","input").replace("state.json","branch.json")});
+        }};
+    }};
+    %%end"""
+cases.extend([
+    ("projected-narrowed-integer-return-prunes-parent",projected_scalar_narrow,192,b"SURVIVORS"),
+    ("projected-empty-integer-return-keeps-sibling",projected_scalar_empty,193,b"REACHED-NARROWSIBLING"),
+])
 scalar_local_write = f"""%%start
     i8(i8) revise = fn(entry) {{
         i8 current = 2;
@@ -1126,6 +1155,13 @@ cases.extend([
 ])
 holes_bytes = b'{"type":{"kind":"i8"},"value":{"kind":"alternatives","values":[1,3]}}\n'
 authored_files = {
+    "projected-narrowed-integer-return-prunes-parent": {
+        "state.json": b'{"type":{"kind":"i8"},"value":{"kind":"range","minimum":2,"maximum":127}}\n',
+    },
+    "projected-empty-integer-return-keeps-sibling": {
+        "state.json": b'{"type":{"kind":"i8"},"value":{"kind":"range","minimum":1,"maximum":127}}\n',
+        "branch.json": b'{"type":{"kind":"i8"},"value":{"kind":"range","minimum":-128,"maximum":0}}\n',
+    },
     **{name: {
         "state.json": b'{"type":{"kind":"i8"},"value":2}\n',
         "current.json": b'{"type":{"kind":"i8"},"value":7}\n',

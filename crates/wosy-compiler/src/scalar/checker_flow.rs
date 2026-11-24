@@ -1436,6 +1436,8 @@ struct IntegerRoots<'a> {
     #[cfg(feature = "internal-checker")]
     exact_returning_local_writes: bool,
     #[cfg(feature = "internal-checker")]
+    projected_narrow_integer: bool,
+    #[cfg(feature = "internal-checker")]
     allow_ordinary_contextual_places: bool,
     #[cfg(feature = "internal-checker")]
     ordinary_local_work: Option<usize>,
@@ -1502,6 +1504,25 @@ impl IntegerInputs {
     #[cfg(any(test, feature = "internal-checker"))]
     fn from_cells(rows: Vec<Vec<Rc<IntegerSet>>>) -> Self {
         Self(rows.into_iter().map(IntegerRow::new).collect())
+    }
+
+    #[cfg(feature = "internal-checker")]
+    fn charge_projected_integer_directive(&self, roots: &mut IntegerRoots<'_>, predicate: &CheckerPredicate) -> Option<()> {
+        let axis = match predicate {
+            CheckerPredicate::Integer(predicate) => Some(roots.lookup(&predicate.binding)?.0),
+            CheckerPredicate::Boolean(_) => None,
+            _ => return None,
+        };
+        let work = roots.ordinary_local_work.get_or_insert(0);
+        for row in &self.0 {
+            // Both directive outcomes may own a row; charge columns, equality
+            // copies, and the full interval walk before partitioning.
+            let cost = 1usize.checked_add(row.len().checked_mul(2)?)?
+                .checked_add(row.equal_axes().len().checked_mul(2)?)?
+                .checked_add(axis.map_or(0, |axis| row[axis].interval_count()).checked_mul(2)?)?;
+            charge_call_work(work, cost)?;
+        }
+        Some(())
     }
 
     fn axis_has_alias(&self, axis: usize) -> bool {
@@ -4672,6 +4693,10 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                         }
                     }
                     let predicate = directive.predicate.as_ref()?;
+                    #[cfg(feature = "internal-checker")]
+                    if roots.projected_narrow_integer {
+                        path.charge_projected_integer_directive(roots, predicate)?;
+                    }
                     roots.reached_obligation = true;
                     #[cfg(feature = "internal-checker")]
                     if matches!(predicate, CheckerPredicate::Integer(_) | CheckerPredicate::DirectiveDisjunction { .. }) {
@@ -5464,6 +5489,16 @@ impl<'a> ExactCallCursor<'a> {
     pub(super) fn allow_empty_integer(&mut self) {
         debug_assert!(self.projected_slot.is_none() && self.projected_pair.is_none());
         self.allow_empty_integer = self.tail.is_some_and(is_integer_type);
+    }
+
+    #[cfg(feature = "internal-checker")]
+    pub(super) fn allow_empty_projected_integer(&mut self) -> Option<()> {
+        if self.projected_slot != Some(0) || self.projected_pair.is_some() || !self.tail.is_some_and(is_integer_type) {
+            return None;
+        }
+        self.allow_empty_integer = true;
+        self.roots.projected_narrow_integer = true;
+        Some(())
     }
 
     #[cfg(feature = "internal-checker")]
