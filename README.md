@@ -58,7 +58,7 @@ A project is a directory with `wosy.toml` and `src/main.w`. See [Project layout]
 - [Types](docs/types.md) — scalars, structs, enums, arrays, pointers, callables.
 - [Core operations](docs/core.md) — conversions, allocation, `unsafe` rules.
 - [Standard library](docs/stdlib.md) — `bootstrap.w` and `wasi/preview1.w`.
-- [CLI reference](docs/cli.md) — `parse`, `build`, `run`.
+- [CLI reference](docs/cli.md) — `parse`, `build`, `run`, `dep sync`.
 - [Diagnostics](docs/errors.md) — every code, what triggers it.
 
 ## Status

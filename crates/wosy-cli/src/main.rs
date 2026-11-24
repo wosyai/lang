@@ -9,7 +9,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs;
-use std::io::{BufWriter, Write};
+use std::io::{BufWriter, Read, Write};
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::process::ExitCode;
@@ -40,6 +40,11 @@ struct Arguments {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Manage project dependencies
+    Dep {
+        #[command(subcommand)]
+        command: DepCommand,
+    },
     Parse {
         target: Option<String>,
     },
@@ -57,9 +62,24 @@ enum Command {
     },
 }
 
+#[derive(Subcommand)]
+enum DepCommand {
+    /// Materialize the exact dependencies in wosy.lock
+    Sync,
+}
+
 fn main() -> ExitCode {
     let arguments = Arguments::parse();
     match arguments.command {
+        Command::Dep {
+            command: DepCommand::Sync,
+        } => match dep_sync_command() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("wosy: {error}");
+                ExitCode::from(1)
+            }
+        },
         Command::Parse { target } => match parse_command(target.as_deref()) {
             Ok(valid) => {
                 if valid {
@@ -92,6 +112,12 @@ fn main() -> ExitCode {
             }
         },
     }
+}
+
+fn dep_sync_command() -> Result<(), String> {
+    let current = env::current_dir().map_err(|error| error.to_string())?;
+    let root = discover_root(&current)?;
+    wosy_project::packages::sync_dependencies(&root)
 }
 
 fn parse_command(target: Option<&str>) -> Result<bool, String> {
@@ -150,7 +176,7 @@ fn build_command(target: Option<&str>, profile: &str) -> Result<(), String> {
     let (_target_config, artifact, artifact_profile, target_profile) =
         configuration.artifact_profile(&target_name, profile)?;
     let target_layout = artifact_profile.target_layout().map(scalar_target_layout)?;
-    let configuration_identity = blake3::hash(document.raw().as_bytes()).to_hex().to_string();
+    let configuration_identity = project_configuration_identity(document.raw().as_bytes(), &configuration)?;
     drop(document);
     let (llvm, source_observations) = compile_project(
         &root,
@@ -245,6 +271,36 @@ fn write_llvm_partition(path: &std::path::Path, llvm: &LlvmPartition) -> Result<
     Ok(writer.get_ref().identity.finalize().to_hex().to_string())
 }
 
+fn project_configuration_identity(
+    manifest: &[u8],
+    configuration: &ProjectConfiguration,
+) -> Result<String, String> {
+    let mut resolved_git = None;
+    for name in configuration.dependencies.keys() {
+        let Some((package, _)) = configuration.git_package(name)? else { continue };
+        let pin = package.git_pin_identity.as_deref()
+            .ok_or_else(|| format!("Git dependency {name} has no verified pin identity"))?;
+        let source_root: std::path::PathBuf = package.identity.path.as_path().components()
+            .filter_map(|component| match component {
+                std::path::Component::Normal(name) => Some(name),
+                _ => None,
+            }).collect();
+        let hasher = resolved_git.get_or_insert_with(|| {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(b"wosy-build-git-config-v1\0");
+            hasher.update(blake3::hash(manifest).as_bytes());
+            hasher
+        });
+        for field in [name.as_bytes(), pin.as_bytes(), source_root.as_os_str().as_encoded_bytes()] {
+            hasher.update(&(field.len() as u64).to_le_bytes());
+            hasher.update(field);
+        }
+    }
+    let identity = resolved_git.map(|hasher| hasher.finalize())
+        .unwrap_or_else(|| blake3::hash(manifest));
+    Ok(identity.to_hex().to_string())
+}
+
 fn run_command(target: Option<&str>, profile: &str, arguments: &[String]) -> Result<u8, String> {
     let current = env::current_dir().map_err(|error| error.to_string())?;
     let root = discover_root(&current)?;
@@ -252,20 +308,35 @@ fn run_command(target: Option<&str>, profile: &str, arguments: &[String]) -> Res
     let target_name = configuration.resolve_target(target)?;
     let (_target_config, artifact, artifact_profile, target_profile) =
         configuration.artifact_profile(&target_name, profile)?;
-    let configuration_identity = blake3::hash(document.raw().as_bytes()).to_hex().to_string();
+    let configuration_identity = project_configuration_identity(document.raw().as_bytes(), &configuration)?;
     drop(document);
     let manifest_path =
         artifact_manifest_path(&root, &target_name, profile, &target_profile.main_artifact);
     let manifest = load_artifact_manifest(&manifest_path)
         .map_err(|error| format!("artifact manifest error: {error}"))?;
+    if manifest.identity.configuration_identity != configuration_identity {
+        return Err("artifact manifest is stale".to_owned());
+    }
     let current_observations = manifest
         .source_observations
         .iter()
         .map(|observation| {
-            let path = source_observation_path(observation);
+            let content_revision = if let Some((package, checkout)) =
+                configuration.git_package(&observation.source.package)?
+            {
+                if observation.source.project != package.identity.project {
+                    return Err("artifact manifest is stale".to_owned());
+                }
+                let relative = observation.source.path.as_path();
+                let file = checkout.source(relative)?
+                    .ok_or_else(|| "artifact manifest is stale".to_owned())?;
+                observe_open_source(file, relative)?
+            } else {
+                observe_source_revision(&source_observation_path(observation))?
+            };
             Ok(SourceObservation {
                 source: observation.source.clone(),
-                content_revision: observe_source_revision(&path)?,
+                content_revision,
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
@@ -279,7 +350,6 @@ fn run_command(target: Option<&str>, profile: &str, arguments: &[String]) -> Res
         .ok_or_else(|| format!("runner {} is missing", artifact_profile.run_runner))?;
     let identity = &manifest.identity;
     if identity.source_identity != wosy_project::source_identity(&current_observations)
-        || identity.configuration_identity != configuration_identity
         || identity.artifact_identity != format!("{target_name}:{profile}:{}", artifact.artifact)
         || identity.backend != artifact_profile.backend
         || identity.output != artifact_profile.output
@@ -315,6 +385,11 @@ fn source_observation_path(observation: &SourceObservation) -> std::path::PathBu
 fn observe_source_revision(path: &std::path::Path) -> Result<ContentRevision, String> {
     let read_error = |error| format!("failed to read {}: {error}", path.display());
     let file = fs::File::open(path).map_err(read_error)?;
+    observe_open_source(file, path)
+}
+
+fn observe_open_source(file: fs::File, path: &std::path::Path) -> Result<ContentRevision, String> {
+    let read_error = |error| format!("failed to read {}: {error}", path.display());
     let mut hasher = blake3::Hasher::new();
     hasher.update_reader(file).map_err(read_error)?;
     Ok(ContentRevision(hasher.finalize().to_hex().to_string()))
@@ -353,8 +428,16 @@ fn compile_project(
             )
         };
         let source_path = package_root.join(path.as_path());
-        let text = fs::read_to_string(&source_path)
-            .map_err(|error| format!("failed to read {}: {error}", source_path.display()))?;
+        let read_error = |error| format!("failed to read {}: {error}", source_path.display());
+        let text = if let Some((_, checkout)) = configuration.git_package(package)? {
+            let mut file = checkout.source(path.as_path())?
+                .ok_or_else(|| format!("Git dependency source {} is missing", source_path.display()))?;
+            let mut text = String::new();
+            file.read_to_string(&mut text).map_err(read_error)?;
+            text
+        } else {
+            fs::read_to_string(&source_path).map_err(read_error)?
+        };
         let revision = blake3::hash(text.as_bytes()).to_hex().to_string();
         let source = SourceIdentity::new(
             project_identity,
@@ -398,13 +481,20 @@ fn compile_project(
             let already_discovered = discovered
                 .get(target_package)
                 .is_some_and(|paths| paths.contains(target_path.as_ref()));
-            if !already_discovered && target_root.join(target_path.as_path()).is_file() {
-                let target_path = target_path.into_owned();
-                discovered
-                    .entry(target_package)
-                    .or_default()
-                    .insert(target_path.clone());
-                pending.push_back((target_package, target_path));
+            if !already_discovered {
+                let exists = if let Some((_, checkout)) = configuration.git_package(target_package)? {
+                    checkout.source(target_path.as_path())?.is_some()
+                } else {
+                    target_root.join(target_path.as_path()).is_file()
+                };
+                if exists {
+                    let target_path = target_path.into_owned();
+                    discovered
+                        .entry(target_package)
+                        .or_default()
+                        .insert(target_path.clone());
+                    pending.push_back((target_package, target_path));
+                }
             }
             namespace_edges.push(NamespaceEdgeInput {
                 origin: namespace.package.clone(),

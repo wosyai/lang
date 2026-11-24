@@ -643,6 +643,8 @@ version = "0.1.0"
 name = "wosy-project"
 version = "0.1.0"
 dependencies = [
+ "blake3",
+ "libc",
  "serde",
  "serde_json",
  "toml_edit",

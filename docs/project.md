@@ -43,7 +43,7 @@ main_artifact = "main"
 Rules:
 
 - `[package] name` and `default_target` are required.
-- Each `[dependencies.<name>]` table takes exactly one field: `path`, a non-empty relative path to the dependency root. The directory must contain its own `wosy.toml` with a matching `package.name` and a `source_root` directory.
+- A local `[dependencies.<name>]` table contains only `path`, normally relative to the project root. Local packages stay in place. For Git dependencies, the table instead contains `git` (the repository origin) and optionally `path` (a directory within that repository, defaulting to `"."`). Both sources must supply a `wosy.toml` with a matching `package.name` and a package-relative `source_root` directory.
 - `[comments] categories` lists the `# CATEGORY:` comment categories accepted by `wosy parse` and `wosy build`.
 - Each builder needs `command` (argv, first element is the executable), optional `args`, and `toolchain_identity`. The same applies to runners.
 - Each target needs `root` (entry file relative to the project root), at least one artifact, one artifact profile, and one target profile naming its `main_artifact`.
@@ -68,6 +68,42 @@ The standard library itself is a dependency-style package (`stdlib/wosy.toml`):
 name = "std"
 source_root = "src"
 ```
+
+## `wosy.lock`
+
+Commit `wosy.lock` with the project when it has Git dependencies, and ignore
+`deps/`. Declare only the Git origin and package directory in `wosy.toml`:
+
+```toml
+[dependencies.math]
+git = "https://example.org/math.git"
+path = "packages/math"
+```
+
+The corresponding `wosy.lock` entry is `[packages.math]` under
+`version = 1`. It records `git`, `path` (explicitly `"."` for the repository
+root), `rev` (a full lowercase Git commit ID), and `source_hash` (the lowercase
+hex BLAKE3 hash of the original package content). The version 1 hash is
+BLAKE3 of the domain prefix `wosy-package-source-v1` followed by a zero byte,
+then, for each tracked regular file in package-relative UTF-8 path order: its
+path length in bytes (unsigned 64-bit little endian), its path bytes with
+`/` separators, and the 32 raw bytes of its file-content BLAKE3 hash.
+
+`wosy dep sync` requires those pins to be present. It checks the exact revision,
+package identity and original source hash before placing files at
+`deps/<name>/`, and keeps verification metadata separately under
+`deps/.wosy-pins/`. Each receipt is bound to that project, pin and checkout
+directory identity. It is not reusable by copying or moving a checkout to
+another project. Sync does not copy sibling packages from a repository.
+Normal builds use the current working source, including edits, but do not
+follow symlinks in Git dependency source paths. Changing a Git package's
+effective `source_root` invalidates earlier artifacts, even if the old files
+still exist. Sync does not
+overwrite an edited or unverified directory; move it aside before recreating
+the pinned tree. The initial command supports direct Git packages only, with
+regular tracked files; it rejects submodules, symlinks, transitive Git package
+declarations and project patches for Git dependencies. Pin creation, updates
+and patch replay are not implemented in this version.
 
 ## Source graph
 

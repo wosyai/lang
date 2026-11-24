@@ -120,6 +120,10 @@ pub struct GitSource {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ResolvedPackage {
     pub name: String,
+    #[serde(skip)]
+    pub git_checkout: Option<packages::GitDirectory>,
+    #[serde(skip)]
+    pub git_pin_identity: Option<String>,
     pub project_root: PathBuf,
     pub source_root: PathBuf,
     pub identity: SourceIdentity,
@@ -481,8 +485,7 @@ impl ProjectConfiguration {
             .ok_or_else(|| "package is missing".to_owned())?;
         let package_name = scalar_string(package, "name")?;
         let dependencies = project_dependencies(root, &package_name, &document)?;
-        let resolved_packages = resolve_local_packages(root, &dependencies)
-            .map_err(|error| error.diagnostics[0].message.clone())?;
+        let resolved_packages = packages::resolve_installed(root, &dependencies)?;
         let default_target = scalar_string(package, "default_target")?;
         let builders = named_commands(document.get("builders"), "builder")?;
         let runners = named_runners(document.get("runners"))?;
@@ -522,6 +525,17 @@ impl ProjectConfiguration {
             },
             document,
         ))
+    }
+
+    pub fn git_package(&self, name: &str) -> Result<Option<(&ResolvedPackage, &packages::GitDirectory)>, String> {
+        if !self.dependencies.get(name).is_some_and(|declaration| matches!(declaration.source, DependencySource::Git(_))) {
+            return Ok(None);
+        }
+        let package = self.resolved_packages.get(name)
+            .ok_or_else(|| format!("Git dependency {name} is not resolved"))?;
+        let checkout = package.git_checkout.as_ref()
+            .ok_or_else(|| format!("Git dependency {name} has no verified checkout handle"))?;
+        Ok(Some((package, checkout)))
     }
 
     pub fn resolve_target(&self, target: Option<&str>) -> Result<String, String> {
@@ -683,6 +697,7 @@ pub fn parse_dependencies(
 fn resolve_package(
     package_root: PathBuf,
     declaration: &DependencyDeclaration,
+    git_checkout: Option<packages::GitDirectory>,
 ) -> Result<ResolvedPackage, DependencyResolutionError> {
     let name = &declaration.name;
     let error = |message| DependencyResolutionError {
@@ -692,12 +707,27 @@ fn resolve_package(
             span: declaration.span.clone(),
         }],
     };
-    let manifest_path = package_root.join("wosy.toml");
-    let content = fs::read_to_string(&manifest_path)
-        .map_err(|_| error(format!("dependency {name} package manifest is missing")))?;
+    let content = if let Some(checkout) = &git_checkout {
+        checkout
+            .read_text(Path::new("wosy.toml"))
+            .map_err(error)?
+            .ok_or_else(|| error(format!("dependency {name} package manifest is missing")))?
+    } else {
+        fs::read_to_string(package_root.join("wosy.toml"))
+            .map_err(|_| error(format!("dependency {name} package manifest is missing")))?
+    };
     let document = content
         .parse::<toml_edit::ImDocument<String>>()
         .map_err(|_| error(format!("dependency {name} package manifest is invalid")))?;
+    if matches!(declaration.source, DependencySource::Git(_))
+        && document
+            .get("dependencies")
+            .is_some_and(|item| !item.as_table().is_some_and(toml_edit::Table::is_empty))
+    {
+        return Err(error(format!(
+            "Git dependency {name} declares transitive dependencies, which are not supported yet"
+        )));
+    }
     let package_table = document
         .get("package")
         .and_then(Item::as_table)
@@ -717,11 +747,18 @@ fn resolve_package(
     let source_path = PackageRelativePath::new(source_root.clone()).map_err(|_| {
         error(format!("dependency {name} source root must be package-relative"))
     })?;
-    if !package_root.join(&source_root).is_dir() {
+    let source_exists = if let Some(checkout) = &git_checkout {
+        checkout.directory(&source_root).map_err(error)?.is_some()
+    } else {
+        package_root.join(&source_root).is_dir()
+    };
+    if !source_exists {
         return Err(error(format!("dependency {name} source root is missing")));
     }
     Ok(ResolvedPackage {
         name: resolved_name.clone(),
+        git_checkout,
+        git_pin_identity: None,
         source_root: package_root.join(&source_root),
         identity: SourceIdentity::new(
             package_root.to_string_lossy().into_owned(),
@@ -732,6 +769,7 @@ fn resolve_package(
     })
 }
 
+#[cfg(test)]
 fn resolve_local_packages(
     root: &Path,
     dependencies: &BTreeMap<String, DependencyDeclaration>,
@@ -748,7 +786,7 @@ fn resolve_local_packages(
                     }],
                 });
             };
-            resolve_package(root.join(path), declaration).map(|resolved| (name.clone(), resolved))
+            resolve_package(root.join(path), declaration, None).map(|resolved| (name.clone(), resolved))
         })
         .collect()
 }
@@ -1472,6 +1510,8 @@ mod tests {
         resolved.insert(
             "std".to_owned(),
             ResolvedPackage {
+                git_checkout: None,
+                git_pin_identity: None,
                 name: "std".to_owned(),
                 project_root: PathBuf::from("/stdlib"),
                 source_root: PathBuf::from("/stdlib/src"),
@@ -1624,6 +1664,7 @@ mod tests {
         assert_eq!(sibling.source_root, project.join("../sibling/src/nested"));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn git_project_loading_never_uses_a_matching_lock_to_trust_an_unverified_tree() {
         let project = dependency_test_root();
@@ -1654,7 +1695,14 @@ mod tests {
             }
             assert_eq!(
                 ProjectConfiguration::load(&project).unwrap_err(),
-                "Git dependency vendored cannot yet be materialized",
+                if seeded {
+                    format!(
+                        "dependency vendored is not verified for its wosy.lock pin; move {} aside and run wosy dep sync",
+                        project.join("deps/vendored").display()
+                    )
+                } else {
+                    "dependency vendored is not materialized; run wosy dep sync".to_owned()
+                },
                 "seeded = {seeded}"
             );
         }

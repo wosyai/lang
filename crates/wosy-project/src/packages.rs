@@ -1,11 +1,20 @@
-use super::{DependencyDeclaration, DependencySource, GitSource};
+use super::{
+    resolve_package, DependencyDeclaration, DependencySource, GitSource, ResolvedPackage,
+};
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::Path;
 use toml_edit::{Item, Table};
 
+mod anchored;
+mod git_sync;
+
+pub use anchored::GitDirectory;
+pub use git_sync::sync_dependencies;
+
 const LOCKFILE: &str = "wosy.lock";
+const DEPS: &str = "deps";
 
 #[derive(Debug, Default, Eq, PartialEq)]
 pub struct PackageLock {
@@ -17,6 +26,23 @@ pub(super) struct LockedPackage {
     pub(super) source: GitSource,
     pub(super) revision: String,
     pub(super) source_hash: String,
+}
+
+impl LockedPackage {
+    fn input_identity(&self) -> String {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"wosy-locked-input-v1\0");
+        for field in [
+            &self.source.origin,
+            &self.revision,
+            &self.source.package_path,
+            &self.source_hash,
+        ] {
+            hasher.update(&(field.len() as u64).to_le_bytes());
+            hasher.update(field.as_bytes());
+        }
+        hasher.finalize().to_hex().to_string()
+    }
 }
 
 impl PackageLock {
@@ -132,6 +158,61 @@ impl PackageLock {
         }
         Ok(())
     }
+}
+
+fn git_project(
+    root: &Path,
+    dependencies: &BTreeMap<String, DependencyDeclaration>,
+) -> Result<Option<(std::path::PathBuf, GitDirectory)>, String> {
+    dependencies
+        .values()
+        .any(|declaration| matches!(declaration.source, DependencySource::Git(_)))
+        .then(|| GitDirectory::project(root))
+        .transpose()
+}
+
+fn locked_packages(
+    project: Option<&GitDirectory>,
+    dependencies: &BTreeMap<String, DependencyDeclaration>,
+) -> Result<PackageLock, String> {
+    let Some(project) = project else {
+        return Ok(PackageLock::default());
+    };
+    let content = project
+        .read_text(Path::new(LOCKFILE))?
+        .ok_or_else(|| format!("Git dependencies require {LOCKFILE}; dep sync does not select revisions"))?;
+    let lock = PackageLock::parse(content).map_err(|error| format!("invalid {LOCKFILE}: {error}"))?;
+    lock.check_declarations(dependencies)?;
+    Ok(lock)
+}
+
+pub(super) fn resolve_installed(
+    root: &Path,
+    dependencies: &BTreeMap<String, DependencyDeclaration>,
+) -> Result<BTreeMap<String, ResolvedPackage>, String> {
+    let project = git_project(root, dependencies)?;
+    let lock = locked_packages(project.as_ref().map(|(_, handle)| handle), dependencies)?;
+    dependencies
+        .iter()
+        .map(|(name, declaration)| {
+            let (package_root, checkout) = match &declaration.source {
+                DependencySource::Local { path } => (root.join(path), None),
+                DependencySource::Git(_) => {
+                    let (canonical, project) = project.as_ref().expect("opened Git project");
+                    git_sync::reject_unsupported_patches(project, name)?;
+                    let checkout = git_sync::verify_installed(canonical, project, name, &lock.packages[name])?
+                        .ok_or_else(|| format!("dependency {name} is not materialized; run wosy dep sync"))?;
+                    (root.join(DEPS).join(name), Some(checkout))
+                }
+            };
+            let mut resolved = resolve_package(package_root, declaration, checkout)
+                .map_err(|error| error.diagnostics[0].message.clone())?;
+            if let Some(pin) = lock.packages.get(name) {
+                resolved.git_pin_identity = Some(pin.input_identity());
+            }
+            Ok((name.clone(), resolved))
+        })
+        .collect()
 }
 
 pub(super) fn valid_origin(origin: &str) -> bool {

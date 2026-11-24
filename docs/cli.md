@@ -2,6 +2,15 @@
 
 The binary is named `wosy`. The target argument defaults to `[package] default_target`. Profiles default to `dev`.
 
+## `wosy dep sync`
+
+Git dependencies are supported on Linux (kernel 5.6 or newer, with
+`/proc` available). Uses Git on `PATH` to materialize the exact revisions already recorded in
+[`wosy.lock`](project.md#wosylock). Run it after cloning a project with Git
+dependencies. It never selects a revision or rewrites the lockfile. Local
+dependencies stay where they are. A verified, unmodified dependency works
+offline; if an installed tree differs, sync fails without overwriting it.
+
 ## `wosy parse [TARGET]`
 
 Parses only the target root file. Writes `.wosy/cst/<blake3>.json` and `.wosy/cst/current.json`, prints diagnostics to stderr, and exits 1 when diagnostics are present. Recovery preserves neighboring declarations in the snapshot, but the command still fails.
