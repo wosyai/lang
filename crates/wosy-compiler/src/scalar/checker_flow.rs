@@ -1053,6 +1053,16 @@ impl IntegerAffineTransform {
         domain.affine_unit(self.reflected, &self.offset, inverse)
     }
 
+    #[cfg(feature = "internal-checker")]
+    fn apply_point(&self, input: &BigInt) -> BigInt {
+        if self.reflected { &self.offset - input } else { input + &self.offset }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    fn integral_reflection_fixed_point(&self) -> Option<BigInt> {
+        (self.reflected && !self.offset.bit(0)).then(|| &self.offset >> 1usize)
+    }
+
     fn inverse(&self) -> Self {
         Self { reflected: self.reflected, offset: if self.reflected { self.offset.clone() } else { -&self.offset } }
     }
@@ -1081,6 +1091,20 @@ impl IntegerAffineTransform {
             (first + &self.offset, last + &self.offset)
         };
         (first >= *minimum && last <= *maximum).then_some(())
+    }
+}
+
+#[cfg(all(test, feature = "internal-checker"))]
+#[test]
+fn signed_affine_reflection_has_only_its_integral_fixed_point() {
+    for (offset, fixed) in [(-256, Some(-128)), (-255, None), (-2, Some(-1)), (-1, None),
+        (0, Some(0)), (254, Some(127)), (255, None), (510, Some(255))]
+    {
+        let transform = IntegerAffineTransform { reflected: true, offset: BigInt::from(offset) };
+        assert_eq!(transform.integral_reflection_fixed_point(), fixed.map(BigInt::from));
+        if let Some(fixed) = fixed.map(BigInt::from) {
+            assert_eq!(transform.apply_point(&fixed), fixed);
+        }
     }
 }
 
@@ -3297,11 +3321,6 @@ pub(super) fn verify_partitioned_call_return<'a>(
     let mut covered = Vec::new();
     let mut relational_work = 0;
     for piece in pieces {
-        // Entry-equality does not admit affine pieces, including ones
-        // outside its guard. Do not make a contract gate hide a new operation.
-        if matches!((&goal, &piece.output), (PartitionedProofGoal::EntryEquality, IntegerPartitionOutput::InputAffine(_))) {
-            return None;
-        }
         let relational = !matches!(&piece.output, IntegerPartitionOutput::Singleton(_));
         if relational { can_elide = false; }
         let cost = 1usize.checked_add(piece.input.interval_count())?
@@ -3330,7 +3349,23 @@ pub(super) fn verify_partitioned_call_return<'a>(
                 }
             }
             (PartitionedProofGoal::EntryEquality, IntegerPartitionOutput::InputAlias) => None,
-            (PartitionedProofGoal::EntryEquality, IntegerPartitionOutput::InputAffine(_)) => return None,
+            (PartitionedProofGoal::EntryEquality, IntegerPartitionOutput::InputAffine(transform)) => {
+                let meter = work.as_deref_mut().unwrap_or(&mut relational_work);
+                charge_call_work(meter, 1usize.checked_add(input.interval_count().checked_mul(2)?)?)?;
+                let violating = if !transform.reflected && transform.offset.sign() == num_bigint::Sign::NoSign {
+                    None
+                } else if let Some(fixed) = transform.integral_reflection_fixed_point() {
+                    let unequal = IntegerRelation::from_operator(&BinaryOperator::NotEqual)?;
+                    Some(Rc::new(input.keep_relation(unequal, &fixed)))
+                } else {
+                    Some(Rc::clone(&input))
+                };
+                violating.and_then(|entries| {
+                    let (example, _) = entries.extremes()?;
+                    let returned = transform.apply_point(example);
+                    Some((entries, Cow::Owned(returned)))
+                })
+            }
             (PartitionedProofGoal::Literal(relation, bound), output) => {
                 let meter = work.as_deref_mut().unwrap_or(&mut relational_work);
                 charge_call_work(meter, 1usize.checked_add(input.interval_count().checked_mul(2)?)?)?;
@@ -3350,8 +3385,7 @@ pub(super) fn verify_partitioned_call_return<'a>(
                 if let Some((example, _)) = violating.extremes() {
                     let returned = match output {
                         IntegerPartitionOutput::InputAlias => example.clone(),
-                        IntegerPartitionOutput::InputAffine(transform) if transform.reflected => &transform.offset - example,
-                        IntegerPartitionOutput::InputAffine(transform) => example + &transform.offset,
+                        IntegerPartitionOutput::InputAffine(transform) => transform.apply_point(example),
                         IntegerPartitionOutput::Singleton(_) => return None,
                     };
                     Some((Rc::new(violating), Cow::Owned(returned)))

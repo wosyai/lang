@@ -3879,9 +3879,9 @@ impl SelectedSymbolicProof<'_, '_> {
             }
         }
         let mut cursor = ExactCallCursor::projected(body, Rc::new(domain), &output.ty).ok_or(ProjectCheck::Unsupported)?;
-        if first.bound.literal().is_some() {
-            cursor.observe_named_affine_partitions(false).ok_or(ProjectCheck::Unsupported)?;
-        }
+        // Only the typed literal and unary entry-equality goals admitted
+        // above consume these partitions. Neither relation issues a summary.
+        cursor.observe_named_affine_partitions(false).ok_or(ProjectCheck::Unsupported)?;
         let mut evaluator = CheckedCalls::<ProofFreeSymbolic<false, true>, false> {
             project: runtime.project, calls: runtime.calls, active: HashSet::from([target]),
             active_depth: 1, reached: HashSet::new(), had_obligations: false,
@@ -12835,11 +12835,18 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
             (&BigInt::from(-128), &BigInt::from(-9)), (&BigInt::from(-7), &BigInt::from(-1)),
         ]));
         assert!(run(&affine.replace("entry < 0", "entry == -8")).unwrap().symbolic_diagnostic.is_none());
-        assert!(matches!(run(&affine.replace("out == 7", "out == core.old(entry)")), Err(ProjectCheck::Unsupported)));
-        let equality_outside_affine = affine.replace("entry < 0", "entry < -128")
-            .replace("out == 7", "out == core.old(entry)");
-        assert!(matches!(run(&equality_outside_affine), Err(ProjectCheck::Unsupported)),
-            "a vacuous entry-equality guard does not authorize affine computation");
+        let equality = affine.replace("out == 7", "out == core.old(entry)");
+        let mismatch = run(&equality).unwrap().symbolic_diagnostic.unwrap();
+        assert_eq!(mismatch.returned, BigInt::from(127));
+        assert!(mismatch.witness.intervals_at(0, 0).unwrap().eq([(&BigInt::from(-128), &BigInt::from(-1))]));
+        let unsigned = equality.replace("i8", "u8").replace("-1 - n", "255 - n").replace("entry < 0", "entry >= 0");
+        let mismatch = run(&unsigned).unwrap().symbolic_diagnostic.unwrap();
+        assert_eq!(mismatch.returned, BigInt::from(255));
+        assert!(mismatch.witness.intervals_at(0, 0).unwrap().eq([(&BigInt::from(0), &BigInt::from(255))]));
+        let empty_equality = equality.replace("entry < 0", "entry < -128");
+        assert!(run(&empty_equality).unwrap().symbolic_diagnostic.is_none());
+        assert!(matches!(run(&empty_equality.replace("-1 - n", "1 - n")), Err(ProjectCheck::Unsupported)),
+            "a vacuous entry-equality guard cannot authorize an overflowing computation");
         assert!(matches!(run(&affine.replace("-1 - n", "1 - n")), Err(ProjectCheck::Unsupported)),
             "the proof guard cannot make an overflowing actual computation defined");
     }

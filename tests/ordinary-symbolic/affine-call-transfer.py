@@ -1583,9 +1583,15 @@ cases.extend([
     ("ordinary-named-relational-alias-refuted",relational_named_calling_producer,1,b"proof obligation failed"),
     ("ordinary-named-relational-affine-refuted",reflected_named_calling_producer,1,b"proof obligation failed"),
     ("ordinary-named-relational-affine-proved",reflected_named_calling_producer.replace("entry < 0","entry == -8"),0,b""),
+    ("ordinary-named-relational-entry-equality-affine-refuted",
+        reflected_named_calling_producer.replace("out == 7","out == core.old(entry)"),
+        1,b"proof obligation failed"),
     ("ordinary-named-relational-entry-equality-affine-outside-guard",
         reflected_named_calling_producer.replace("entry < 0","entry < -128").replace("out == 7","out == core.old(entry)"),
-        2,b"unsupported analysis"),
+        0,b""),
+    ("ordinary-named-relational-entry-equality-affine-overflow-outside-guard",
+        reflected_named_calling_producer.replace("entry < 0","entry < -128").replace("out == 7","out == core.old(entry)")
+            .replace("-1 - n","1 - n"),2,b"unsupported analysis"),
     ("ordinary-named-relational-affine-overflow",reflected_named_calling_producer.replace("-1 - n","1 - n"),2,b"unsupported analysis"),
 ])
 
@@ -1625,6 +1631,7 @@ cases.extend([
         b"proof obligation failed"),
 ])
 proof_diagnostic_notes = {
+    "ordinary-named-relational-entry-equality-affine-refuted": b"symbolic call can return 127",
     "ordinary-named-relational-alias-refuted": b"symbolic call can return 0",
     "ordinary-named-relational-affine-refuted": b"symbolic call can return 127",
     "ordinary-batched-named-calling-producer-refuted": b"symbolic call can return -3",
