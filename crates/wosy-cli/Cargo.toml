@@ -13,6 +13,7 @@ serde_json.workspace = true
 wosy-compiler.workspace = true
 wosy-project.workspace = true
 wosy-syntax.workspace = true
+wosy-stdlib-source.workspace = true
 
 [[bin]]
 name = "wosy"

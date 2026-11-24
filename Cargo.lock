@@ -619,6 +619,7 @@ dependencies = [
  "serde_json",
  "wosy-compiler",
  "wosy-project",
+ "wosy-stdlib-source",
  "wosy-syntax",
 ]
 
@@ -650,6 +651,10 @@ dependencies = [
 
 [[package]]
 name = "wosy-protocol"
+version = "0.1.0"
+
+[[package]]
+name = "wosy-stdlib-source"
 version = "0.1.0"
 
 [[package]]

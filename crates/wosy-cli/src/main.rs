@@ -29,6 +29,8 @@ use wosy_project::{
 };
 use wosy_syntax::SourceIdentity;
 
+mod checked_access_component;
+
 #[derive(Parser)]
 #[command(name = "wosy")]
 struct Arguments {
@@ -213,15 +215,7 @@ fn run_command(target: Option<&str>, profile: &str, arguments: &[String]) -> Res
     let current_observations = manifest
         .source_observations
         .iter()
-        .map(|observation| {
-            let path = source_observation_path(observation);
-            let bytes = fs::read(&path)
-                .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
-            Ok(SourceObservation {
-                source: observation.source.clone(),
-                content_revision: ContentRevision(blake3::hash(&bytes).to_hex().to_string()),
-            })
-        })
+        .map(current_source_observation)
         .collect::<Result<Vec<_>, String>>()?;
     let builder = configuration
         .builders
@@ -266,11 +260,36 @@ fn source_observation_path(observation: &SourceObservation) -> std::path::PathBu
     std::path::Path::new(&observation.source.project).join(observation.source.path.as_path())
 }
 
+fn current_source_observation(observation: &SourceObservation) -> Result<SourceObservation, String> {
+    if let Some(component) = checked_access_component::refresh_observation(&observation.source)? {
+        return Ok(component);
+    }
+    let path = source_observation_path(observation);
+    let bytes = fs::read(&path)
+        .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+    Ok(SourceObservation {
+        source: observation.source.clone(),
+        content_revision: ContentRevision(blake3::hash(&bytes).to_hex().to_string()),
+    })
+}
+
 fn compile_project(
     root: &std::path::Path,
     project: &ProjectContext,
     configuration: &ProjectConfiguration,
     target_layout: ScalarTargetLayout,
+) -> Result<(String, Vec<SourceObservation>), String> {
+    // Actual access-site selection is a separate lowering change. Merely
+    // compiling a user's project must not pull in an unrelated module.
+    compile_project_with_component(root, project, configuration, target_layout, None)
+}
+
+fn compile_project_with_component(
+    root: &std::path::Path,
+    project: &ProjectContext,
+    configuration: &ProjectConfiguration,
+    target_layout: ScalarTargetLayout,
+    component: Option<checked_access_component::CheckedAccessComponent>,
 ) -> Result<(String, Vec<SourceObservation>), String> {
     let root_path = PackageRelativePath::new(project.source_root.clone())?;
     let root_project = root.to_string_lossy().into_owned();
@@ -372,7 +391,7 @@ fn compile_project(
             content_revision: ContentRevision(revision),
             namespace_edges,
         });
-        declarations_by_path.insert((package, path), declarations);
+        declarations_by_path.insert(graph_source.clone(), declarations);
         texts.insert(graph_source, output.result.text);
     }
     drop((discovered, pending));
@@ -381,7 +400,7 @@ fn compile_project(
         .first()
         .cloned()
         .ok_or_else(|| "project root source is missing".to_owned())?;
-    let graph = load_reachable_source_graph(
+    let mut graph = load_reachable_source_graph(
         &project.package,
         root_node,
         nodes,
@@ -391,19 +410,22 @@ fn compile_project(
         render_graph_diagnostics(&error, &texts);
         format_graph_error(error)
     })?;
+    if let Some(component) = component {
+        let (node, declarations, text) = component.into_preparation()?;
+        #[cfg(test)]
+        routing_observations::record(|counts| counts.extractions += 1);
+        declarations_by_path.insert(node.source.clone(), declarations);
+        texts.insert(node.source.clone(), text);
+        graph.append_independent_leaf(node)?;
+    }
     let mut project_declarations = Vec::new();
-    let mut source_by_path = BTreeMap::new();
+    let sources: Vec<_> = graph.nodes.iter().map(|node| {
+        compiler_source_identity(&node.source, &node.content_revision)
+    }).collect();
     let mut derivation_diagnostics = Vec::new();
     for node in &graph.nodes {
-        let source = compiler_source_identity(&node.source, &node.content_revision);
-        source_by_path.insert(
-            (node.source.package.clone(), node.source.path.clone()),
-            source,
-        );
-    }
-    for node in &graph.nodes {
         let declarations = declarations_by_path
-            .remove(&(node.source.package.clone(), node.source.path.clone()))
+            .remove(&node.source)
             .ok_or_else(|| {
                 format!(
                     "missing canonical CST for {}",
@@ -417,8 +439,8 @@ fn compile_project(
             .map(|edge| {
                 Ok(ScalarNamespaceBinding {
                     binding: edge.binding.clone(),
-                    target: source_by_path
-                        .get(&(edge.origin.clone(), edge.path.clone()))
+                    target: sources
+                        .get(edge.target.0)
                         .cloned()
                         .ok_or_else(|| {
                             format!("missing module {}", edge.path.as_path().display())
@@ -437,17 +459,11 @@ fn compile_project(
         .initialization_order
         .iter()
         .map(|id| {
-            let node = graph
-                .nodes
-                .get(id.0)
-                .ok_or_else(|| format!("missing initialization node {}", id.0))?;
-            source_by_path
-                .get(&(node.source.package.clone(), node.source.path.clone()))
-                .cloned()
-                .ok_or_else(|| format!("missing module {}", node.source.path.as_path().display()))
+            sources.get(id.0).cloned()
+                .ok_or_else(|| format!("missing initialization node {}", id.0))
         })
         .collect::<Result<Vec<_>, String>>()?;
-    drop(source_by_path);
+    drop(sources);
     drop(declarations_by_path);
     #[cfg(test)]
     routing_observations::record(|counts| counts.preparations += 1);
@@ -924,6 +940,69 @@ mod tests {
             resolved_packages: BTreeMap::new(),
         };
         (project, configuration)
+    }
+
+    #[test]
+    fn release_checked_access_component_is_an_ordinary_independent_graph_leaf() {
+        let user = "%%start\nu64() value = fn { 42 };\nvalue();\n%%end";
+        let (project, configuration) = routing_test_project("release-access", &[("main.w", user)]);
+        for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let (plain, plain_observations) =
+                compile_project(&project.root, &project, &configuration, layout).unwrap();
+            let (linked, observations) = compile_project_with_component(
+                &project.root, &project, &configuration, layout,
+                Some(checked_access_component::CheckedAccessComponent::linked()),
+            ).unwrap();
+            assert_eq!(plain_observations.len(), 1);
+            assert_eq!(observations.len(), 2);
+            assert_eq!(observations[0], plain_observations[0]);
+            assert_eq!(current_source_observation(&observations[1]).unwrap(), observations[1]);
+            assert!(!plain.contains("636865636b5f696e6465785f696e5f657874656e74"));
+            assert!(linked.lines().any(|line| line.starts_with("define void ")
+                && line.contains("636865636b5f696e6465785f696e5f657874656e74")));
+            assert!(linked.contains("ret i64 42"));
+            let mut stale = observations[1].clone();
+            stale.content_revision = ContentRevision("old-source-or-contract".to_owned());
+            assert_ne!(current_source_observation(&stale).unwrap(), stale);
+        }
+        fs::remove_dir_all(&project.root).unwrap();
+    }
+
+    #[test]
+    fn lookalike_user_namespace_cannot_supply_the_release_checked_access_source() {
+        let (mut project, configuration) = routing_test_project(
+            "release-access-lookalike",
+            &[("main.w", "%%start\nuser = namespace wosy_toolchain_stdlib \"src/checked_access.w\";\nuser.check_index_in_extent(2, 3);\n%%end")],
+        );
+        // Even the same package and relative path are not the same qualified
+        // source. Ordinary user resolution continues to call its own function.
+        project.package = "wosy_toolchain_stdlib".to_owned();
+        fs::create_dir_all(project.root.join("src")).unwrap();
+        let fake = "%%start\nunit(u64, u64) check_index_in_extent = fn(index, count) { index; count; };\n%%end";
+        fs::write(project.root.join("src/checked_access.w"), fake).unwrap();
+
+        let (llvm, observations) = compile_project_with_component(
+            &project.root, &project, &configuration, ScalarTargetLayout::NATIVE64,
+            Some(checked_access_component::CheckedAccessComponent::linked()),
+        ).unwrap();
+        let path = PackageRelativePath::new("src/checked_access.w".into()).unwrap();
+        let same_path = observations.iter().filter(|entry| entry.source.path == path).collect::<Vec<_>>();
+        let [user, release] = same_path.as_slice() else { panic!("expected two independently qualified sources") };
+        assert_ne!(user.source, release.source);
+        assert_ne!(user.content_revision, release.content_revision);
+        assert_eq!(user.source.project, project.root.to_string_lossy());
+        assert_eq!(current_source_observation(release).unwrap(), **release);
+        let symbol_suffix = "__636865636b5f696e6465785f696e5f657874656e74";
+        let user_revision = user.content_revision.0.bytes()
+            .map(|byte| format!("{byte:02x}")).collect::<String>();
+        let definitions = llvm.lines().filter(|line| line.starts_with("define void ")
+            && line.contains(symbol_suffix)).count();
+        assert_eq!(definitions, 2);
+        let calls = llvm.lines().filter(|line| line.contains("call void @")
+            && line.contains(symbol_suffix)).collect::<Vec<_>>();
+        let [called] = calls.as_slice() else { panic!("{calls:?}") };
+        assert!(called.contains(&user_revision), "{called}");
+        fs::remove_dir_all(&project.root).unwrap();
     }
 
     #[test]

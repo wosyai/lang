@@ -168,6 +168,29 @@ pub struct SourceGraph {
     pub initialization_order: Vec<SourceNodeId>,
 }
 
+impl SourceGraph {
+    /// Enroll an already selected independent source component. There is no
+    /// user namespace edge; it still receives the graph's ordinary source
+    /// identity, revision, and initialization-order record.
+    pub fn append_independent_leaf(&mut self, component: SourceNodeInput) -> Result<(), String> {
+        if !component.namespace_edges.is_empty()
+            || self.nodes.iter().any(|node| node.source == component.source)
+        {
+            return Err("invalid independent source component".to_owned());
+        }
+        let id = SourceNodeId(self.nodes.len());
+        self.nodes.push(ReachableSourceNode {
+            id,
+            source: component.source,
+            content_revision: component.content_revision,
+            namespace_edges: Vec::new(),
+            dfs_state: DfsState::Complete,
+        });
+        self.initialization_order.push(id);
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct MissingModuleDiagnostic {
     pub code: String,

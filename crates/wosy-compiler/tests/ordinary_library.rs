@@ -4234,3 +4234,82 @@ fn verify_qualified_mixed_result(app_text: &str, owner_text: &str, decoy_text: &
         assert!(receiver[..release].contains("load i8"), "{receiver}");
     }
 }
+
+#[test]
+fn checked_access_stdlib_helpers_use_ordinary_resolved_calls_and_traps() {
+    let app = source("workbench", "src/checked_access.w");
+    let standard = source("std", "src/checked_access.w");
+    let text = r#"%%start
+access = namespace std "checked_access.w";
+unit(*?u8, u64, u64) validate = fn(address, index, count) {
+    access.check_non_null_address(address);
+    access.check_index_in_extent(index, count);
+};
+u8() run = fn {
+    u8 witness = 42;
+    unsafe { validate(&?witness, 1, 2); };
+    witness
+};
+if (run() != 42) { core.system_panic(); };
+%%end"#;
+    for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let prepared = prepare_scalar_project(
+            vec![
+                (declarations(&app, text), vec![namespace("access", &standard)]),
+                (declarations(&standard, include_str!("../../../stdlib/src/checked_access.w")), Vec::new()),
+            ],
+            vec![app.clone(), standard.clone()],
+            ScalarPreparationInputs { target_layout },
+        )
+        .unwrap_or_else(|error| panic!("{target_layout:?}: {:?}", error.diagnostics));
+        let build = analyze_scalar_build(&prepared);
+        assert!(build.diagnostics().is_empty(), "{target_layout:?}: {:?}", build.diagnostics());
+        let ir = emit_scalar_build_project_llvm(&build).unwrap().to_text();
+        let context = Context::create();
+        let buffer = MemoryBuffer::create_from_memory_range_copy(ir.as_bytes(), "checked-access-helpers");
+        let module = context.create_module_from_ir(buffer).unwrap();
+        module.verify().unwrap();
+        let non_null = function_with_suffix(&module, "check_non_null_address");
+        let in_extent = function_with_suffix(&module, "check_index_in_extent");
+        let validate = function_with_suffix(&module, "validate");
+        assert_eq!(direct_calls(&module, &validate), vec![non_null.clone(), in_extent.clone()]);
+        for (symbol, predicate, width) in [
+            (non_null, inkwell::IntPredicate::EQ, u32::try_from(target_layout.pointer_size * 8).unwrap()),
+            (in_extent, inkwell::IntPredicate::UGE, 64),
+        ] {
+            assert_eq!(direct_calls(&module, &symbol), vec!["__wosy_core_system_panic"]);
+            let function = module.get_function(&symbol).unwrap();
+            let comparisons = function.get_basic_blocks().into_iter()
+                .flat_map(|block| block.get_instructions())
+                .filter(|instruction| instruction.get_opcode() == InstructionOpcode::ICmp)
+                .collect::<Vec<_>>();
+            let [comparison] = comparisons.as_slice() else { panic!("{target_layout:?}: missing exact comparison in {symbol}") };
+            assert_eq!(comparison.get_icmp_predicate(), Some(predicate));
+            let blocks = function.get_basic_blocks();
+            let failure = blocks.iter().copied().find(|block| {
+                block.get_instructions().any(|instruction| {
+                    CallSiteValue::try_from(instruction).ok()
+                        .and_then(|call| call.get_called_fn_value())
+                        .is_some_and(|callee| callee.get_name().to_bytes() == b"__wosy_core_system_panic")
+                })
+            }).expect("exact trap block");
+            let branch = comparison.get_parent().unwrap().get_terminator().unwrap();
+            assert_eq!(branch.get_opcode(), InstructionOpcode::Br);
+            let condition = branch.get_operand(0).unwrap().value().unwrap();
+            assert_eq!(condition.into_int_value().as_instruction_value(), Some(*comparison));
+            // LLVM's conditional branch operand layout is condition, false, true.
+            assert_eq!(branch.get_operand(2).unwrap().block(), Some(failure));
+            assert_ne!(branch.get_operand(1).unwrap().block(), Some(failure));
+            if predicate == inkwell::IntPredicate::EQ {
+                assert_eq!(
+                    comparison.get_operand(1).unwrap().value().unwrap().into_int_value().get_zero_extended_constant(),
+                    Some(0)
+                );
+            }
+            for operand in 0..2 {
+                let value = comparison.get_operand(operand).unwrap().value().unwrap();
+                assert_eq!(value.into_int_value().get_type().get_bit_width(), width);
+            }
+        }
+    }
+}
