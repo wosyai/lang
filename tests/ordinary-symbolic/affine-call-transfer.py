@@ -1540,7 +1540,32 @@ cases.extend([
     ("ordinary-pure-affine-proof-shared-guard",grouped_affine_proof,0,b""),
     ("exact-startup-ordinary-pure-affine-proof-shared-guard",grouped_affine_proof_reached,0,b""),
 ])
+branching_affine_proof = """%%start
+    i8(i8) normalize = fn(value) {
+        i8 shifted = value + 2;
+        i8 joined = if (value < 0) { shifted } else { value };
+        if (joined <= 3) { i8 changed = joined + 1; changed }
+        else { i8 reflected = 9 - joined; reflected }
+    };
+    proof bounded for normalize(entry) -> (out) where (entry <= 10) ensures (out <= 5) {}
+    %%end"""
+branching_affine_reached = branching_affine_proof.replace("%%end", f"""
+    i8 first = normalize(-1);
+    i8 second = normalize(4);
+    core.require(first == 2, {report(9,"WRONG-FIRST-BRANCH")});
+    core.require(second == 5, {report(11,"WRONG-SECOND-BRANCH")});
+    %%end""")
+cases.extend([
+    ("ordinary-pure-affine-proof-conditional-proved",branching_affine_proof,0,b""),
+    ("ordinary-pure-affine-proof-conditional-refuted",branching_affine_proof.replace("out <= 5","out <= 4"),1,
+        b"proof obligation failed"),
+    ("exact-startup-ordinary-pure-affine-proof-conditional-proved",branching_affine_reached,0,b""),
+    ("exact-startup-ordinary-pure-affine-proof-conditional-refuted",branching_affine_reached.replace("out <= 5","out <= 4"),1,
+        b"proof obligation failed"),
+])
 proof_diagnostic_notes = {
+    "ordinary-pure-affine-proof-conditional-refuted": b"symbolic call can return 5",
+    "exact-startup-ordinary-pure-affine-proof-conditional-refuted": b"call returned 5",
     "ordinary-pure-affine-proof-symbolic-refuted": b"symbolic call can return 102",
     "exact-startup-ordinary-pure-affine-proof-refuted": b"call returned 102",
 }

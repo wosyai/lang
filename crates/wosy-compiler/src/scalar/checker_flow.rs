@@ -400,6 +400,8 @@ impl<'a, 'bound, const STEP_FIRST: bool, const PURE: bool> ScopedAuthoredReturn<
     const ALLOW_ORDINARY_INTEGER_LOCALS: bool = PURE;
     const REQUIRE_TOTAL_RETURN: bool = PURE;
 
+    fn allows_extended_scalar_locals(self) -> bool { PURE }
+
     fn at(
         self, _: &FunctionCallSites, _: BlockOrdinal, _: FinalOutputSlot, _: &ScalarType,
         _: &IntegerRoots<'_>, _: &IntegerInputs,
@@ -3690,8 +3692,11 @@ pub(super) fn collect_exact_integer_return_requirements<'a>(
 #[cfg(feature = "internal-checker")]
 pub(super) fn pure_affine_proof_body(calls: &FunctionCallSites) -> bool {
     let structure = &calls.structure;
-    structure.checker_has_affine_scalar_local && !structure.checker_has_extended_scalar_local
-        && structure.blocks.len() == 1 && structure.checker_directives.is_empty()
+    // Charge repeated producer activations through a fixed admitted body
+    // size as well as the existing per-path comparison/row work meters.
+    const MAX_PURE_PROOF_OCCURRENCES: usize = 256;
+    structure.checker_has_affine_scalar_local && !structure.checker_has_finite_scalar_local
+        && calls.occurrences.len() <= MAX_PURE_PROOF_OCCURRENCES && structure.checker_directives.is_empty()
         && !structure.has_ordinary_contextual_places() && !structure.checker_has_bool_contextual_declaration
         && structure.checker_selected_snapshots.is_empty()
         && calls.call_occurrences.is_empty() && calls.allocation_length_calls.is_empty() && calls.assignments.is_empty()
@@ -3708,6 +3713,8 @@ impl<'a> ScopedAuthoredReturn<'a> for PureAffineReturn {
     const ENABLED: bool = false;
     const ALLOW_ORDINARY_INTEGER_LOCALS: bool = true;
     const REQUIRE_TOTAL_RETURN: bool = true;
+
+    fn allows_extended_scalar_locals(self) -> bool { true }
 
     fn at(
         self, _: &FunctionCallSites, _: BlockOrdinal, _: FinalOutputSlot, _: &ScalarType,
@@ -6818,7 +6825,7 @@ fn apply_projected_scalar_local_write(
         return overwrite(roots, path, value);
     }
 
-    let lanes = ordinary_scalar_conditional_lanes(calls, roots, path, write.rhs)?;
+    let lanes = ordinary_scalar_conditional_lanes(calls, roots, path, write.rhs, false)?;
     let mut joined = IntegerInputs::default();
     for (arm, block) in lanes {
         if arm.is_unreachable() { continue; }
@@ -6834,6 +6841,7 @@ fn apply_projected_scalar_local_write(
 #[cfg(feature = "internal-checker")]
 fn ordinary_scalar_conditional_lanes(
     calls: &FunctionCallSites, roots: &mut IntegerRoots<'_>, path: IntegerInputs, source: OccurrenceOrdinal,
+    fresh_binding: bool,
 ) -> Option<[(IntegerInputs, BlockOrdinal); 2]> {
     let ConditionalRegion::Value { condition, then_block, else_block, resume, .. } =
         calls.conditionals.get(&source)? else { return None; };
@@ -6850,11 +6858,34 @@ fn ordinary_scalar_conditional_lanes(
         CheckerPredicate::Integer(_) => plain_conditional_integer_operands(structure, *condition)?,
         _ => return None,
     }
-    // Charge full row and interval splitting before cloning either lane.
-    // The row rebuild is not a valid transfer for affine or detached entry
-    // relations; reject these before any splitting.
+    // Detached entries are outside both transfer profiles. The overwrite
+    // path retains its existing ban on any affine relation.
     charge_call_work(roots.ordinary_local_work.get_or_insert(0), path.0.len())?;
-    if path.0.iter().any(|row| row.affine.is_some() || row.entry.is_some()) { return None; }
+    let mut affine = false;
+    for row in &path.0 {
+        if row.entry.is_some() { return None; }
+        affine |= row.affine.is_some();
+    }
+    if affine {
+        if !fresh_binding { return None; }
+        // Fresh storage only appends an axis. The fully metered cut
+        // propagates a restriction to linked members before either arm reads.
+        let work = roots.ordinary_local_work.get_or_insert(0);
+        return match predicate {
+            CheckerPredicate::Boolean(true) => Some([(path, *then_block), (IntegerInputs::default(), *else_block)]),
+            CheckerPredicate::Boolean(false) => Some([(IntegerInputs::default(), *then_block), (path, *else_block)]),
+            CheckerPredicate::Integer(predicate) => {
+                let axis = *roots.by_binding.get(&predicate.binding)?;
+                if roots.axes.get(axis)?.1 != &predicate.ty { return None; }
+                let relation = IntegerRelation::from_operator(&predicate.operator)?;
+                let [failing, passing] = path.ordinary_atom(
+                    OrdinaryIntegerAtom::Literal(axis, relation, &predicate.bound), [true, true], work,
+                )?;
+                Some([(passing, *then_block), (failing, *else_block)])
+            }
+            _ => None,
+        };
+    }
     path.charge_projected_integer_directive(roots, predicate)?;
     let (passing, failing, _) = path.split(roots, predicate)?;
     Some([(passing, *then_block), (failing, *else_block)])
@@ -6867,7 +6898,7 @@ fn bind_conditional_scalar_local(
 ) -> Option<IntegerInputs> {
     let structure = &calls.structure;
     let mut joined = IntegerInputs::default();
-    for (mut arm, block) in ordinary_scalar_conditional_lanes(calls, roots, path, source)? {
+    for (mut arm, block) in ordinary_scalar_conditional_lanes(calls, roots, path, source, true)? {
         if arm.is_unreachable() { continue; }
         let leaf = checked_conditional_scalar_leaf(structure, block)?;
         if structure.checked_types.expressions.get(&leaf)? != ty

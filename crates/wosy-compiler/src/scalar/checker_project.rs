@@ -11919,6 +11919,58 @@ mod tests {
 
     #[cfg(feature = "internal-checker")]
     #[test]
+    fn ordered_pure_affine_proof_observes_typed_conditional_joins_and_returns() {
+        let app = source("src/main.w", "ordinary-branching-pure-proof");
+        let text = r#"%%start
+            i8(i8) normalize = fn(value) {
+                i8 shifted = value + 2;
+                i8 joined = if (value < 0) { shifted } else { value };
+                if (joined <= 3) {
+                    i8 changed = joined + 1;
+                    changed
+                } else {
+                    i8 reflected = 9 - joined;
+                    reflected
+                }
+            };
+            proof bounded for normalize(entry) -> (out) where (entry <= 10) ensures (out <= 5) {}
+        %%end"#;
+        let actual = text.replace("%%end", r#"
+            i8 first = normalize(-1);
+            i8 second = normalize(4);
+            core.require(first == 2, { .stdout = ""; .stderr = "bad first branch"; .code = 9; .files = []; });
+            core.require(second == 5, { .stdout = ""; .stderr = "bad second branch"; .code = 11; .files = []; });
+        %%end"#);
+        let run = |text: &str, scope| {
+            let (_, proof) = crate::parse_proof_source(app.clone(), text.to_owned(), &[])
+                .unwrap_or_else(|_| panic!("valid conditional return proof"));
+            check_loaded_ordered_proof_diagnostics(
+                Vec::new(), vec![(proof, Vec::new())], vec![app.clone()], inputs(), scope,
+            )
+        };
+        let pass = run(text, ScalarCheckerScope::CurrentPackage).unwrap();
+        assert!(pass.active && pass.symbolic_diagnostic.is_none());
+        let failed = run(&text.replace("out <= 5", "out <= 4"), ScalarCheckerScope::CurrentPackage).unwrap();
+        let failed = failed.symbolic_diagnostic.expect("reflected branch counterexample");
+        assert_eq!(failed.returned, BigInt::from(5));
+        let four = BigInt::from(4);
+        assert!(failed.witness.intervals_at(0, 0).unwrap().eq([(&four, &four)]));
+        for scope in [ScalarCheckerScope::MainFlowOnly, ScalarCheckerScope::CurrentPackage] {
+            let pass = run(&actual, scope).unwrap();
+            assert!(pass.active && pass.diagnostics.is_empty() && pass.directives.is_empty());
+            let failure = run(&actual.replace("out <= 5", "out <= 4"), scope).unwrap();
+            let [failure] = failure.diagnostics.as_slice() else { panic!("one actual branch fails"); };
+            assert_eq!(failure.invocation.returned, BigInt::from(5));
+            let span = failure.invocation.call.range;
+            assert_eq!(&actual[span.start as usize..span.end as usize], "normalize(4)");
+        }
+        for declined in [text.replace("entry <= 10", "entry <= 127"), text.replace("joined + 1", "joined * 2")] {
+            assert!(matches!(run(&declined, ScalarCheckerScope::CurrentPackage), Err(ProjectCheck::Unsupported)));
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
     fn ordered_pure_affine_bare_goals_share_guard_and_keep_distinct_preimages() {
         let app = source("src/main.w", "grouped-ordinary-affine-proof");
         let symbolic = r#"%%start

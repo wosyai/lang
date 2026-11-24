@@ -6316,6 +6316,8 @@ pub(super) struct OccurrenceStructure {
     pub(super) checker_has_extended_scalar_local: bool,
     #[cfg(feature = "internal-checker")]
     pub(super) checker_has_affine_scalar_local: bool,
+    #[cfg(feature = "internal-checker")]
+    pub(super) checker_has_finite_scalar_local: bool,
     #[cfg(any(test, feature = "internal-checker"))]
     pub(super) checker_contextual_read_locals: HashMap<(BlockOrdinal, usize), ReferenceBindingId>,
     #[cfg(any(test, feature = "internal-checker"))]
@@ -6487,6 +6489,8 @@ impl OccurrenceStructure {
             checker_has_extended_scalar_local: false,
             #[cfg(feature = "internal-checker")]
             checker_has_affine_scalar_local: false,
+            #[cfg(feature = "internal-checker")]
+            checker_has_finite_scalar_local: false,
             #[cfg(feature = "internal-checker")]
             checker_ordinary_bool_literals: HashMap::new(),
             #[cfg(feature = "internal-checker")]
@@ -9247,11 +9251,12 @@ impl StructuralWalker<'_, '_> {
                             operands: [CheckerOrdinaryIntegerOperand::Literal(_), CheckerOrdinaryIntegerOperand::Lexical(_)]
                                 | [CheckerOrdinaryIntegerOperand::Lexical(_), CheckerOrdinaryIntegerOperand::Literal(_)],
                         });
-                    self.structure.checker_has_extended_scalar_local |= matches!(kind,
-                        CheckerOrdinaryScalarLocalKind::Conditional | CheckerOrdinaryScalarLocalKind::SnapshotRead { .. }
-                            | CheckerOrdinaryScalarLocalKind::Arithmetic {
-                            operator: BinaryOperator::Multiply | BinaryOperator::Divide | BinaryOperator::Remainder, ..
-                        });
+                    let finite = matches!(&kind, CheckerOrdinaryScalarLocalKind::Arithmetic {
+                        operator: BinaryOperator::Multiply | BinaryOperator::Divide | BinaryOperator::Remainder, ..
+                    });
+                    self.structure.checker_has_finite_scalar_local |= finite;
+                    self.structure.checker_has_extended_scalar_local |= finite || matches!(kind,
+                        CheckerOrdinaryScalarLocalKind::Conditional | CheckerOrdinaryScalarLocalKind::SnapshotRead { .. });
                     self.structure.checker_ordinary_scalar_locals.insert((position.block, position.item),
                         CheckerOrdinaryScalarLocal { binding, source, kind });
                 }
