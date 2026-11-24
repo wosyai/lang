@@ -1639,6 +1639,28 @@ cases.extend([
         1,b"proof obligation failed"),
 ])
 
+verified_rectangular_summary = f"""%%start
+    i16(i16, i16) leaf = fn(tag, value) {{ if (tag >= 0) {{ value }} else {{ 4 }} }};
+    i16(i16, i16) producer = fn(tag, value) {{ i16 result = leaf(tag, value); result }};
+    proof canonical for producer(selector, before) -> (out)
+        where (selector >= 0 && before == 7) ensures (out == 7) {{}}
+    unit(i16, i16) consumer = fn(tag, value) {{
+        core.narrow(tag >= 0, {report(46,"PAIR-FIRST-NARROW")});
+        core.narrow(value == 7, {report(47,"PAIR-SECOND-NARROW")});
+        i16 observed = producer(tag, value);
+        core.require(observed != 7, {report(48,"VERIFIED-PAIR-OUTPUT")});
+    }};
+%%end"""
+cases.extend([
+    ("ordinary-verified-rectangular-summary-consumed",verified_rectangular_summary,48,b"VERIFIED-PAIR-OUTPUT"),
+    ("ordinary-verified-rectangular-summary-first-guard",verified_rectangular_summary.replace("core.narrow(tag >= 0", "core.narrow(tag < 0"),
+        2,b"unsupported analysis"),
+    ("ordinary-verified-rectangular-summary-second-guard",verified_rectangular_summary.replace("core.narrow(value == 7", "core.narrow(value == 8"),
+        2,b"unsupported analysis"),
+    ("ordinary-verified-rectangular-summary-refuted-proof",verified_rectangular_summary.replace("ensures (out == 7)", "ensures (out == 8)"),
+        2,b"unsupported analysis"),
+])
+
 symbolic_named_pair_affine = """%%start
     i16(i16, i16) leaf = fn(tag, value) { if (tag < 0) {}; -1 - value };
     i16(i16, i16) producer = fn(tag, value) { i16 result = leaf(tag, value); result };

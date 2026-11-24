@@ -466,7 +466,7 @@ impl OrderedRunEvidence for ProofFreeOrderedEvidence {
     type SymbolicReport = ();
 
     fn complete_startup(&self, _: &HashSet<PreparedCallable>) -> Result<bool, ProjectCheck> { Ok(false) }
-    fn symbolic(&self) -> Self::Symbolic<'_> { ProofFreeSymbolic { ordinary_projected_effects: false, citation_only: false, named_pair: false, named_mixed_pair: false } }
+    fn symbolic(&self) -> Self::Symbolic<'_> { ProofFreeSymbolic { ordinary_projected_effects: false, citation_only: false, named_pair: false, named_mixed_pair: false, named_pair_work: 0 } }
     fn finish_symbolic<'run>(_: Self::Symbolic<'run>) -> Self::SymbolicReport where Self: 'run {}
 }
 
@@ -803,6 +803,7 @@ struct ProofFreeSymbolic<const ORDINARY_PROJECTIONS: bool = false, const NAMED_P
     citation_only: bool,
     named_pair: bool,
     named_mixed_pair: bool,
+    named_pair_work: usize,
 }
 
 #[cfg(feature = "internal-checker")]
@@ -822,6 +823,10 @@ impl<const ORDINARY_PROJECTIONS: bool, const NAMED_PARTITIONS: bool> ActualInteg
     const ORDINARY_PROJECTED_PAIR: bool = ORDINARY_PROJECTIONS;
     const NAMED_RELATIONAL_PARTITIONS: bool = NAMED_PARTITIONS;
     const ORDINARY_INTEGER_LOCALS: bool = ORDINARY_PROJECTIONS;
+
+    fn charge_named_pair_activation(&mut self, body: &FunctionCallSites) -> Option<()> {
+        super::checker_flow::charge_call_work(&mut self.named_pair_work, body.occurrences.len().checked_add(1)?)
+    }
 
     fn named_mixed_pair(&self) -> bool { self.named_mixed_pair }
 
@@ -928,7 +933,7 @@ fn check_unused_module<const COLLECT: bool, const ENTRY_EVIDENCE: bool, Proof: S
             let collection = OrderedCallCollection { failures: &sink, visits: completed_visits, outer: None };
             let mut symbolic = CheckedCalls::<ProofFreeSymbolic<true>, false> {
                 project, calls, active: HashSet::from([(ordinal, item)]), active_depth: 1, reached: HashSet::new(),
-                had_obligations: false, observer: ProofFreeSymbolic { ordinary_projected_effects: !Proof::ENABLED, citation_only: false, named_pair: false, named_mixed_pair: false }, symbolic_module: ordinal,
+                had_obligations: false, observer: ProofFreeSymbolic { ordinary_projected_effects: !Proof::ENABLED, citation_only: false, named_pair: false, named_mixed_pair: false, named_pair_work: 0 }, symbolic_module: ordinal,
             };
             let mut cursor = ExactCallCursor::arbitrary_root(body, &body.boundary.results[0].ty)
                 .ok_or(ProjectCheck::Unsupported)?;
@@ -1723,6 +1728,9 @@ trait ActualIntegerObserver {
     fn observe(&mut self, target: (usize, usize), arguments: &[&BigInt], value: &BigInt);
 
     #[cfg(feature = "internal-checker")]
+    fn charge_named_pair_activation(&mut self, _body: &FunctionCallSites) -> Option<()> { None }
+
+    #[cfg(feature = "internal-checker")]
     fn named_mixed_pair(&self) -> bool { false }
 
     #[cfg(feature = "internal-checker")]
@@ -2342,6 +2350,10 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
         }
         if named_pair && (!matches!(effect, ExactCallEffect::Scalar { binding: Some(_), .. }) || !is_integer_type(expected)) {
             return Err(ProjectCheck::Unsupported);
+        }
+        #[cfg(feature = "internal-checker")]
+        if named_pair {
+            self.observer.charge_named_pair_activation(body).ok_or(ProjectCheck::Unsupported)?;
         }
         #[cfg(feature = "internal-checker")]
         if matches!(effect, ExactCallEffect::TailInteger { .. }) {
@@ -3866,6 +3878,12 @@ struct VerifiedSymbolicEquality<'a> {
 #[cfg(feature = "internal-checker")]
 enum VerifiedSymbolicGuards<'a> {
     Bare(Option<ImportedEntryGuard<'a>>),
+    Rectangle {
+        guards: Vec<ImportedEntryGuard<'a>>,
+        // Ordinals belong to this immutable prepared source/layout; the
+        // dispatch authenticated each reached declaration before executing.
+        _dependency_definitions: HashSet<PreparedCallable>,
+    },
     Ranked(CheckedIntegerGuardSlots<'a>),
 }
 
@@ -3915,11 +3933,14 @@ impl<'a> VerifiedSymbolicEquality<'a> {
             ) {
                 return Ok(None);
             }
-            let (guards, domain) = match &summary.guards {
-                VerifiedSymbolicGuards::Bare(guard) => (guard.as_slice(), None),
-                VerifiedSymbolicGuards::Ranked(guards) => (guards.comparisons.as_slice(), guards.domain),
+            let (guards, domain, meter_rectangle) = match &summary.guards {
+                VerifiedSymbolicGuards::Bare(guard) => (guard.as_slice(), None, false),
+                VerifiedSymbolicGuards::Rectangle { guards, .. } => (guards.as_slice(), None, true),
+                VerifiedSymbolicGuards::Ranked(guards) => (guards.comparisons.as_slice(), guards.domain, false),
             };
-            let values = ImportedIntegerValues::Shared { values: &summary.shared, bound: summary.bound, guards, domain };
+            let values = ImportedIntegerValues::Shared {
+                values: &summary.shared, bound: summary.bound, guards, domain, meter_rectangle,
+            };
             Ok(Some(ImportedLocal { position, values, guards: Vec::new() }))
         };
         let mut emit = |failure| effects.push_callable(calls, source, failure);
@@ -4021,8 +4042,11 @@ fn run_named_partition_cursor<'a>(
     let mut evaluator = CheckedCalls::<ProofFreeSymbolic<false, true>, false> {
         project: runtime.project, calls: runtime.calls, active: HashSet::from([target]),
         active_depth: 1, reached: HashSet::new(), had_obligations: false,
-        observer: ProofFreeSymbolic { ordinary_projected_effects: false, citation_only, named_pair, named_mixed_pair }, symbolic_module: target.0,
+        observer: ProofFreeSymbolic { ordinary_projected_effects: false, citation_only, named_pair, named_mixed_pair, named_pair_work: 0 }, symbolic_module: target.0,
     };
+    if named_pair {
+        evaluator.observer.charge_named_pair_activation(body).ok_or(ProjectCheck::Unsupported)?;
+    }
     let sink = RefCell::new(effects);
     let collection = OrderedCallCollection { failures: &sink, visits: runtime.visits, outer: None };
     let value = evaluator.run_call_cursor::<false>(body, source, cursor, None, Some(collection), None)?;
@@ -4080,11 +4104,11 @@ impl SelectedSymbolicProof<'_, '_> {
 }
 
 #[cfg(feature = "internal-checker")]
-impl SelectedSymbolicProof<'_, '_> {
+impl<'a> SelectedSymbolicProof<'a, '_> {
     fn verify_calling_pair(
         &mut self, target: PreparedCallable, body: &FunctionCallSites, function: &ScalarFunction,
         source: &SourceIdentity, effects: &mut OrderedFailures, runtime: SymbolicProofRuntime<'_>,
-        group: &MainFlowProofTarget<'_>,
+        group: &MainFlowProofTarget<'a>,
     ) -> Result<Option<bool>, ProjectCheck> {
         use super::checker_flow::{covers_all_named_pair_inputs, covers_all_named_mixed_pair_inputs, verify_named_pair_return, charge_call_work, PartitionedProofGoal};
         let MainFlowProofCases::Bare { first, rest } = &group.cases else { return Err(ProjectCheck::Unsupported); };
@@ -4139,7 +4163,7 @@ impl SelectedSymbolicProof<'_, '_> {
         }
         let cursor = ExactCallCursor::named_pair_root(body, &output.ty, full.clone(), bool_axis).ok_or(ProjectCheck::Unsupported)?;
         let mut private_effects = OrderedFailures::default();
-        let (returned, active, _) = run_named_partition_cursor(target, body, source, cursor, &mut private_effects,
+        let (returned, active, reached) = run_named_partition_cursor(target, body, source, cursor, &mut private_effects,
             runtime, true, true, mixed)?;
         let complete = if let Some(axis) = bool_axis {
             covers_all_named_mixed_pair_inputs(&returned, axis, &full[1 - axis], &mut work)
@@ -4149,6 +4173,10 @@ impl SelectedSymbolicProof<'_, '_> {
         if active || !private_effects.records.is_empty() || !complete {
             return Err(ProjectCheck::Unsupported);
         }
+        let issuer = if !mixed && rest.is_empty() {
+            group.issuer.as_ref().filter(|issuer| std::ptr::eq(issuer.body, body))
+        } else { None };
+        let mut dependencies = issuer.map(|_| reached);
         let mut applicable = false;
         for (case, goal, guards) in plans {
             let checked = verify_named_pair_return(body, &returned, &guards, goal, &mut work)
@@ -4156,6 +4184,23 @@ impl SelectedSymbolicProof<'_, '_> {
             applicable |= checked.applicable;
             if let Some(failure) = checked.failure {
                 self.record(case, function, source, effects.records.len(), failure, None)?;
+            } else if let (Some(issuer), true, PartitionedProofGoal::Literal(relation, bound)) =
+                (issuer, checked.applicable, goal)
+            {
+                if Some(relation) != IntegerRelation::from_operator(&BinaryOperator::Equal) {
+                    return Err(ProjectCheck::Unsupported);
+                }
+                // Full pre-guard joint coverage and proof-free execution
+                // were checked above. Every reachable guarded cell now
+                // independently satisfies this exact result equality.
+                self.equalities.insert(VerifiedSymbolicEquality {
+                    target, canonical_target: issuer.canonical_target, layout: issuer.layout,
+                    body: issuer.body, bound, shared: std::cell::OnceCell::new(),
+                    guards: VerifiedSymbolicGuards::Rectangle {
+                        guards: case.guard.comparisons.clone(),
+                        _dependency_definitions: dependencies.take().ok_or(ProjectCheck::Unsupported)?,
+                    },
+                });
             }
         }
         Ok(Some(applicable))
@@ -4928,6 +4973,17 @@ impl<'a> SymbolicEqualityIssuer<'a> {
             || !matches!(&plan.typed.goal, TypedProofGoal::Literal { operator: BinaryOperator::Equal, .. })
         {
             return None;
+        }
+        let body = plan.typed.body;
+        let parameters = &body.boundary.parameters;
+        let rectangular = matches!(parameters.as_slice(), [left, right]
+            if is_integer_type(&left.ty) && is_integer_type(&right.ty))
+            && !body.structure.checker_integer_call_locals.is_empty()
+            && citation_safe_calling_body(body)
+            && proof.filter.len() <= 2
+            && proof.filter.iter().all(|atom| matches!(atom, CheckerPredicate::Integer(_) | CheckerPredicate::Boolean(true)));
+        if rectangular {
+            return Some(Self { canonical_target: plan.canonical_target, layout: plan.typed.target.target_layout, body });
         }
         if !(proof.guard.comparisons.is_empty()
             || proof.guard.comparisons.len() == 1 && matches!(proof.filter, [CheckerPredicate::Integer(_)]))
@@ -16674,6 +16730,44 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
         let opaque = text.replace("{ 42 }", "{ value * value }");
         assert!(matches!(run(&opaque), Err(ProjectCheck::Unsupported)),
             "the false guard cannot hide an unsupported true-lane return");
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordered_named_rectangular_summary_requires_both_guard_coordinates_at_use() {
+        let app = source("src/main.w", "ordered-verified-rectangular-summary");
+        let text = format!(r#"%%start
+            i16(i16, i16) leaf = fn(tag, value) {{ if (tag >= 0) {{ value }} else {{ 4 }} }};
+            i16(i16, i16) producer = fn(tag, value) {{ i16 result = leaf(tag, value); result }};
+            proof canonical for producer(selector, before) -> (out)
+                where (selector >= 0 && before == 7) ensures (out == 7) {{}}
+            unit(i16, i16) consumer = fn(tag, value) {{
+                core.narrow(tag >= 0, {OUTPUT});
+                core.narrow(value == 7, {OUTPUT});
+                i16 observed = producer(tag, value);
+                core.require(observed != 7, {OUTPUT});
+            }};
+        %%end"#);
+        let run = |text: &str| {
+            let (_, proof) = crate::parse_proof_source(app.clone(), text.to_owned(), &[]).ok().unwrap();
+            check_loaded_ordered_proof_diagnostics_in_scope::<true>(
+                Vec::new(), vec![(proof, Vec::new())], vec![app.clone()], inputs(),
+                ScalarCheckerScope::CurrentPackage, Vec::new(),
+            )
+        };
+        let proved = run(&text.replace("observed != 7", "observed == 7")).unwrap();
+        assert!(proved.active && proved.symbolic_diagnostic.is_none() && proved.directives.is_empty());
+        let report = run(&text).unwrap();
+        assert!(report.symbolic_diagnostic.is_none());
+        let [failure] = report.directives.as_slice() else { panic!("the consumed summary must bind the precise return"); };
+        assert!(failure.witness.intervals_at(0, 2).unwrap().eq([(&BigInt::from(7), &BigInt::from(7))]));
+        let wrong_first = text.replace("core.narrow(tag >= 0", "core.narrow(tag < 0");
+        let wrong_second = text.replace("core.narrow(value == 7", "core.narrow(value == 8");
+        let refuted = text.replace("ensures (out == 7)", "ensures (out == 8)");
+        for (label, refused) in [("first guard", wrong_first), ("second guard", wrong_second), ("refuted proof", refuted)] {
+            let receipt = run(&refused);
+            assert!(matches!(receipt, Err(ProjectCheck::Unsupported)), "{label}: {:?}", receipt.err());
+        }
     }
 
     #[cfg(feature = "internal-checker")]

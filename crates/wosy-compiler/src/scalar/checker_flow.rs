@@ -107,6 +107,7 @@ pub(super) enum ImportedIntegerValues<'a> {
         bound: &'a BigInt,
         guards: &'a [ImportedEntryGuard<'a>],
         domain: Option<(usize, &'a IntegerSet)>,
+        meter_rectangle: bool,
     },
     #[cfg(feature = "internal-checker")]
     Deferred {
@@ -122,6 +123,7 @@ impl ImportedIntegerValues<'_> {
     }
 }
 
+#[derive(Clone)]
 pub(super) struct ImportedEntryGuard<'a> {
     pub(super) slot: usize,
     pub(super) relation: IntegerRelation,
@@ -5778,7 +5780,20 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                     let values = match local.values {
                         ImportedIntegerValues::Ready(values, _) => values,
                         #[cfg(feature = "internal-checker")]
-                        ImportedIntegerValues::Shared { values, bound, guards, domain } => {
+                        ImportedIntegerValues::Shared { values, bound, guards, domain, meter_rectangle } => {
+                            if meter_rectangle {
+                                let work = roots.ordinary_local_work.get_or_insert(0);
+                                charge_call_work(work, 1usize.checked_add(guards.len())?)?;
+                                for row in &path.0 {
+                                    let mut cost = row.len().checked_add(1)?;
+                                    for guard in guards {
+                                        if let Some(Argument::Axis(axis)) = arguments.get(guard.slot).copied().flatten() {
+                                            cost = cost.checked_add(row.get(axis)?.interval_count())?;
+                                        }
+                                    }
+                                    charge_call_work(work, cost)?;
+                                }
+                            }
                             if !guards.iter().all(applies) || domain.is_some_and(|domain| !in_domain(domain)) {
                                 return None;
                             }
