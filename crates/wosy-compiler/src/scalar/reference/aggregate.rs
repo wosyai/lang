@@ -1185,6 +1185,24 @@ struct MixedBranchReturn {
     allocations: [BlockPosition; 2],
 }
 
+// A mixed result may nominate a caller-facing owner only after its
+// original backing and exact ordinary/owner lanes have been sealed.
+// This same body-local witness authorizes the corresponding late route.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SealedMixedOwner {
+    Allocation { lanes: MixedOwnerResultLanes, block: usize, item: usize },
+    Branches { lanes: MixedOwnerResultLanes },
+}
+
+impl SealedMixedOwner {
+    fn return_route(self) -> ClosedReturn {
+        match self {
+            Self::Allocation { block, item, .. } => ClosedReturn::Allocation { block, item },
+            Self::Branches { .. } => ClosedReturn::MixedBranch,
+        }
+    }
+}
+
 #[derive(Default)]
 pub(super) struct AggregateFlowResult {
     pub(super) local_choice_reader_calls: BTreeMap<CfgPointId, (CfgPointId, OccurrenceOrdinal)>,
@@ -1263,14 +1281,18 @@ impl AggregateFlowResult {
         Some((plan.shape.conditional, plan.shape.outputs, plan.allocations))
     }
 
-    pub(super) fn admits_mixed_branch_return(&self) -> bool {
-        self.mixed_branch_return.is_some()
-    }
-
-    pub(super) fn proves_mixed_local_owner(&self, cfg: &ScalarReferenceCfg, lanes: MixedOwnerResultLanes) -> bool {
+    pub(super) fn sealed_mixed_owner(
+        &self, cfg: &ScalarReferenceCfg, lanes: MixedOwnerResultLanes,
+    ) -> Option<SealedMixedOwner> {
+        if !self.unsupported.is_empty() { return None; }
+        if let Some(branch) = &self.mixed_branch_return {
+            return (branch.shape.owner_lane == lanes.owner).then_some(SealedMixedOwner::Branches { lanes });
+        }
         let mut owners = self.return_owners(cfg, Some(lanes.owner));
-        let Some(Some(owner @ OwnerSource::Allocation(_))) = owners.next() else { return false };
-        owners.all(|current| current == Some(owner))
+        let Some(Some(owner @ OwnerSource::Allocation(point))) = owners.next() else { return None };
+        if !owners.all(|current| current == Some(owner)) { return None; }
+        let &(block, item) = self.allocation_slots.get(&point)?;
+        Some(SealedMixedOwner::Allocation { lanes, block, item })
     }
 
     fn return_owners<'a>(&'a self, cfg: &'a ScalarReferenceCfg, owner_lane: Option<usize>)
@@ -6030,6 +6052,8 @@ fn closed_aggregates<'a>(
                     return Err(format!("structured aggregate return is not closed on every result path in {:?}", body.source));
                 }
                 ClosedReturn::Structured { output: shape.output.0 }
+            } else if let Some(sealed) = body.mixed_result_lanes().and_then(|lanes| facts.sealed_mixed_owner(body.cfg, lanes)) {
+                sealed.return_route()
             } else {
                 let mut values = body.return_owners();
                 let Some(Some(owner)) = values.next() else {
@@ -6039,17 +6063,16 @@ fn closed_aggregates<'a>(
                     ));
                 };
                 if values.any(|candidate| candidate != Some(owner)) {
-                    if facts.mixed_branch_return.is_none() || body.return_owners().any(|owner| matches!(owner,
-                        Some(OwnerSource::Call(point)) if recommitted.contains_key(&(key, point)))) {
-                        return Err(format!("aggregate return owner has conflicting paths in {:?}", body.source));
-                    }
-                    ClosedReturn::MixedBranch
+                    return Err(format!("aggregate return owner has conflicting paths in {:?}", body.source));
                 } else {
                     match owner {
                         OwnerSource::Formal(_) => {
                             return Err(format!("return of moved formal is not closed in {:?}", body.source));
                         }
                         OwnerSource::Allocation(point) => {
+                            if body.has_mixed_struct_result() {
+                                return Err(format!("mixed aggregate return has no sealed local owner in {:?}", body.source));
+                            }
                             let &(block, item) = facts.allocation_slots.get(&point).ok_or_else(|| {
                                 format!("missing aggregate allocation binding in {:?}", body.source)
                             })?;

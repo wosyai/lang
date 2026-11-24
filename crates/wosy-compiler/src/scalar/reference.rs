@@ -13585,8 +13585,7 @@ impl MixedReceiptCohort {
         self.producers.iter().filter_map(|&(position, declaration, lanes)| {
             let result = &updates[position].1;
             (targets.contains(&declaration)
-                && (result.aggregate.proves_mixed_local_owner(&result.cfg, lanes)
-                    || result.aggregate.admits_mixed_branch_return()))
+                && result.aggregate.sealed_mixed_owner(&result.cfg, lanes).is_some())
                 .then_some(declaration)
         }).collect()
     }

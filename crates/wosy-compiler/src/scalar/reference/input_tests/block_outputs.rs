@@ -925,79 +925,87 @@ fn verify_mixed_tail_branch_route(source: &SourceIdentity, text: &str, forwarded
         assert!(matches!(result.cfg.points[owner_return.0].kind,
             CfgPointKind::ConditionalOutput { then_point, else_point } if [then_point, else_point] == arm_outputs));
         let ScalarType::Callable { outputs, .. } = &function.signature else { panic!("callable") };
-        assert!(!result.aggregate.proves_mixed_local_owner(
-            &result.cfg, aggregate::mixed_owned_struct_result(outputs).unwrap(),
-        ));
+        let lanes = aggregate::mixed_owned_struct_result(outputs).unwrap();
+        assert_eq!(result.aggregate.sealed_mixed_owner(&result.cfg, lanes),
+            Some(aggregate::SealedMixedOwner::Branches { lanes }));
+        let reversed = aggregate::MixedOwnerResultLanes { owner: lanes.scalar, scalar: lanes.owner };
+        assert_eq!(result.aggregate.sealed_mixed_owner(&result.cfg, reversed), None);
         let build = crate::scalar::analyze_scalar_build(&prepared);
-        let llvm = crate::llvm::emit_scalar_build_project_llvm(&build)
-            .unwrap_or_else(|error| panic!("{error}")).to_text();
-        let context = inkwell::context::Context::create();
-        let buffer = inkwell::memory_buffer::MemoryBuffer::create_from_memory_range_copy(llvm.as_bytes(), "mixed-branch");
-        let module = context.create_module_from_ir(buffer).unwrap();
-        module.verify().unwrap();
-        use inkwell::values::AnyValue;
-        let get_function = |name: &[u8]| {
-            let suffix = format!("__{}", name.iter().map(|byte| format!("{byte:02x}")).collect::<String>());
-            module.get_functions().find(|function| function.get_name().to_str().unwrap().ends_with(&suffix)).unwrap()
-        };
-        use inkwell::values::{BasicValue, CallSiteValue, InstructionOpcode, PhiValue};
-        let producer_fn = get_function(b"choose");
-        let producer = producer_fn.print_to_string().to_string();
-        let receiver = get_function(b"receive").print_to_string().to_string();
-        if forwarded {
-            let relay = get_function(b"relay");
-            let relay_ir = relay.print_to_string().to_string();
-            let relay_instructions = relay.get_basic_blocks().into_iter().flat_map(|block| block.get_instructions())
-                .collect::<Vec<_>>();
-            let calls = relay_instructions.iter().copied().filter_map(|inst| {
-                CallSiteValue::try_from(inst).ok().map(|call| (inst, call))
-            }).collect::<Vec<_>>();
-            let [(instruction, call)] = calls.as_slice() else { panic!("{relay_ir}") };
-            assert_eq!(call.get_called_fn_value(), Some(producer_fn));
-            assert_eq!(instruction.get_operand(2).unwrap().value(), relay.get_last_param());
-            let returned = relay_instructions.iter().find(|inst| inst.get_opcode() == InstructionOpcode::Return)
-                .expect("forwarded mixed pair returned directly");
-            assert_eq!(returned.get_operand(0).unwrap().value(), call.try_as_basic_value().basic());
-            assert!(relay_instructions.iter().all(|inst| !matches!(inst.get_opcode(),
-                InstructionOpcode::ExtractValue | InstructionOpcode::InsertValue)), "{relay_ir}");
+        for project in [false, true] {
+            let llvm = if project { crate::llvm::emit_scalar_build_project_llvm(&build) }
+                else { crate::llvm::emit_scalar_build_single_module_llvm(&build) }
+                .unwrap_or_else(|error| panic!("{target_layout:?}/{project}: {error}")).to_text();
+            let context = inkwell::context::Context::create();
+            let buffer = inkwell::memory_buffer::MemoryBuffer::create_from_memory_range_copy(llvm.as_bytes(), "mixed-branch");
+            let module = context.create_module_from_ir(buffer).unwrap();
+            module.verify().unwrap();
+            use inkwell::values::AnyValue;
+            let get_function = |name: &[u8]| {
+                if !project {
+                    return module.get_function(std::str::from_utf8(name).unwrap()).unwrap();
+                }
+                let suffix = format!("__{}", name.iter().map(|byte| format!("{byte:02x}")).collect::<String>());
+                module.get_functions().find(|function| function.get_name().to_str().unwrap().ends_with(&suffix)).unwrap()
+            };
+            use inkwell::values::{BasicValue, CallSiteValue, InstructionOpcode, PhiValue};
+            let producer_fn = get_function(b"choose");
+            let producer = producer_fn.print_to_string().to_string();
+            let receiver = get_function(b"receive").print_to_string().to_string();
+            if forwarded {
+                let relay = get_function(b"relay");
+                let relay_ir = relay.print_to_string().to_string();
+                let relay_instructions = relay.get_basic_blocks().into_iter().flat_map(|block| block.get_instructions())
+                    .collect::<Vec<_>>();
+                let calls = relay_instructions.iter().copied().filter_map(|inst| {
+                    CallSiteValue::try_from(inst).ok().map(|call| (inst, call))
+                }).collect::<Vec<_>>();
+                let [(instruction, call)] = calls.as_slice() else { panic!("{relay_ir}") };
+                assert_eq!(call.get_called_fn_value(), Some(producer_fn));
+                assert_eq!(instruction.get_operand(2).unwrap().value(), relay.get_last_param());
+                let returned = relay_instructions.iter().find(|inst| inst.get_opcode() == InstructionOpcode::Return)
+                    .expect("forwarded mixed pair returned directly");
+                assert_eq!(returned.get_operand(0).unwrap().value(), call.try_as_basic_value().basic());
+                assert!(relay_instructions.iter().all(|inst| !matches!(inst.get_opcode(),
+                    InstructionOpcode::ExtractValue | InstructionOpcode::InsertValue)), "{relay_ir}");
+            }
+            let destination = producer_fn.get_last_param().expect("closed caller destination");
+            let instructions = producer_fn.get_basic_blocks().into_iter().flat_map(|block| block.get_instructions());
+            let phis = instructions.filter_map(|instruction| PhiValue::try_from(instruction).ok()).collect::<Vec<_>>();
+            let [pair] = phis.as_slice() else { panic!("{producer}") };
+            assert_eq!(pair.count_incoming(), 2, "{producer}");
+            let mut allocations = Vec::with_capacity(2);
+            let mut incoming_blocks = Vec::with_capacity(2);
+            for (incoming, block) in pair.get_incomings() {
+                let committed = incoming.as_instruction_value().expect("arm receipt construction");
+                assert_eq!(committed.get_opcode(), InstructionOpcode::InsertValue);
+                assert_eq!(committed.get_parent(), Some(block));
+                let ordered = committed.get_operand(0).unwrap().value().unwrap();
+                let allocation = committed.get_operand(1).unwrap().value().unwrap().as_instruction_value().unwrap();
+                let allocator = CallSiteValue::try_from(allocation).unwrap().get_called_fn_value().unwrap();
+                assert_eq!(allocator.get_name().to_str().unwrap(), "__wosy_core_alloc");
+                allocations.push(allocation);
+                incoming_blocks.push(block);
+                let installs = block.get_instructions()
+                    .filter(|inst| CallSiteValue::try_from(*inst).ok()
+                        .and_then(|call| call.get_called_fn_value())
+                        .is_some_and(|fun| fun.get_name().to_bytes().starts_with(b"llvm.memmove"))
+                        && inst.get_operand(0).and_then(|dest| dest.value()) == Some(destination))
+                    .collect::<Vec<_>>();
+                let [install] = installs.as_slice() else { panic!("{producer}") };
+                assert!(block.get_instructions().take_while(|inst| *inst != committed).any(|inst| inst == *install));
+                let descriptor = install.get_operand(1).unwrap().value().unwrap().as_instruction_value().unwrap();
+                assert_eq!(descriptor.get_opcode(), InstructionOpcode::ExtractValue);
+                assert_eq!(descriptor.get_operand(0).unwrap().value(), Some(ordered));
+                assert!(descriptor.print_to_string().to_string().ends_with(", 1"));
+            }
+            assert_ne!(allocations[0], allocations[1]);
+            assert_ne!(incoming_blocks[0], incoming_blocks[1]);
+            assert!(!producer.contains("call void @__wosy_core_free"), "{producer}");
+            assert_eq!(receiver.matches("call void @__wosy_core_free").count(), 1, "{receiver}");
+            assert!(receiver.contains("extractvalue { i32, ptr } %aggregate_original_base, 1"), "{receiver}");
+            let release = receiver.find("call void @__wosy_core_free(ptr %aggregate_base)").unwrap();
+            assert!(receiver[..release].contains("load i8"), "{receiver}");
         }
-        let destination = producer_fn.get_last_param().expect("closed caller destination");
-        let instructions = producer_fn.get_basic_blocks().into_iter().flat_map(|block| block.get_instructions());
-        let phis = instructions.filter_map(|instruction| PhiValue::try_from(instruction).ok()).collect::<Vec<_>>();
-        let [pair] = phis.as_slice() else { panic!("{producer}") };
-        assert_eq!(pair.count_incoming(), 2, "{producer}");
-        let mut allocations = Vec::with_capacity(2);
-        let mut incoming_blocks = Vec::with_capacity(2);
-        for (incoming, block) in pair.get_incomings() {
-            let committed = incoming.as_instruction_value().expect("arm receipt construction");
-            assert_eq!(committed.get_opcode(), InstructionOpcode::InsertValue);
-            assert_eq!(committed.get_parent(), Some(block));
-            let ordered = committed.get_operand(0).unwrap().value().unwrap();
-            let allocation = committed.get_operand(1).unwrap().value().unwrap().as_instruction_value().unwrap();
-            let allocator = CallSiteValue::try_from(allocation).unwrap().get_called_fn_value().unwrap();
-            assert_eq!(allocator.get_name().to_str().unwrap(), "__wosy_core_alloc");
-            allocations.push(allocation);
-            incoming_blocks.push(block);
-            let installs = block.get_instructions()
-                .filter(|inst| CallSiteValue::try_from(*inst).ok()
-                    .and_then(|call| call.get_called_fn_value())
-                    .is_some_and(|fun| fun.get_name().to_bytes().starts_with(b"llvm.memmove"))
-                    && inst.get_operand(0).and_then(|dest| dest.value()) == Some(destination))
-                .collect::<Vec<_>>();
-            let [install] = installs.as_slice() else { panic!("{producer}") };
-            assert!(block.get_instructions().take_while(|inst| *inst != committed).any(|inst| inst == *install));
-            let descriptor = install.get_operand(1).unwrap().value().unwrap().as_instruction_value().unwrap();
-            assert_eq!(descriptor.get_opcode(), InstructionOpcode::ExtractValue);
-            assert_eq!(descriptor.get_operand(0).unwrap().value(), Some(ordered));
-            assert!(descriptor.print_to_string().to_string().ends_with(", 1"));
-        }
-        assert_ne!(allocations[0], allocations[1]);
-        assert_ne!(incoming_blocks[0], incoming_blocks[1]);
-        assert!(!producer.contains("call void @__wosy_core_free"), "{producer}");
-        assert_eq!(receiver.matches("call void @__wosy_core_free").count(), 1, "{receiver}");
-        assert!(receiver.contains("extractvalue { i32, ptr } %aggregate_original_base, 1"), "{receiver}");
-        let release = receiver.find("call void @__wosy_core_free(ptr %aggregate_base)").unwrap();
-        assert!(receiver[..release].contains("load i8"), "{receiver}");
 
     }
 }
