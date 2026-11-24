@@ -12037,3 +12037,63 @@ if (replace() != 3) { core.system_panic(); };
         }
     }
 }
+
+#[test]
+fn widened_array_borrow_shares_exact_backing_and_existing_private_extent_call() {
+    let source = SourceIdentity::new("project".into(), "package".into(), "src/widened_array_borrow.w".into(), "r1".into());
+    let text = "%%start
+u64(*(u8[])) extent = fn(view) { core.array_len(&(*view)) };
+u64(*(u8[])) relay = fn(view) { extent(view) };
+u64() two = fn() { u8[] bytes = [11, 13]; extent(&bytes) };
+u64() three = fn() { u8[] bytes = [3, 5, 7]; relay(&bytes) };
+if (two() != 2) { core.system_panic(); };
+if (three() != 3) { core.system_panic(); };
+%%end";
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        for access in [true, false] {
+            let parsed = parse_source(source.clone(), text.into(), &[]);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let prepared = crate::prepare_scalar_project_with_access(
+                vec![(crate::derive_scalar_declarations_from_cst(parsed.result.canonical_cst()), vec![])],
+                vec![source.clone()], ScalarPreparationInputs { target_layout: layout },
+                access.then(wosy_stdlib_source::CheckedAccessComponent::linked),
+            ).unwrap_or_else(|error| panic!("{:?}", error.diagnostics));
+            let checked = analyze_scalar_build(&prepared);
+            assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+            let emitted = emit_scalar_build_project_llvm(&checked);
+            if !access {
+                assert!(matches!(emitted, Err(error) if error.contains("widened array borrow requires a closed exact extent reader")));
+                continue;
+            }
+            let llvm = emitted.unwrap().to_text();
+            let word = if layout == ScalarTargetLayout::WASM32 { "i32" } else { "i64" };
+            let pair = format!("{{ {word}, i64 }}");
+            let target = project_function_name(&source, "extent");
+            let relay = project_function_name(&source, "relay");
+            let observer = llvm.split_once(&format!("define internal i64 @{target}({pair} %view)")).unwrap().1.split_once("\n}").unwrap().0;
+            assert_eq!(observer.lines().filter(|line| line.contains("call void @wosy_fn__776f73795f746f6f6c636861696e5f7374646c6962__")
+                && line.contains("__636865636b5f6e6f6e5f6e756c6c5f61646472657373(")).count(), 1, "{observer}");
+            assert!(observer.contains("ret i64 %borrowed_array_extent") && !observer.contains("@__wosy_core_free"), "{observer}");
+            let wrapper = llvm.split_once(&format!("define internal i64 @{relay}({pair} %view)")).unwrap().1.split_once("\n}").unwrap().0;
+            assert_eq!(wrapper.matches(&format!("call i64 @{target}({pair} %view)")).count(), 1, "{wrapper}");
+            assert!(!wrapper.contains("extractvalue") && !wrapper.contains("insertvalue"), "{wrapper}");
+            for (caller, target, count) in [("two", &target, 2), ("three", &relay, 3)] {
+                let body = self_tail_test_body(&llvm, "i64", &project_function_name(&source, caller));
+                assert_eq!(body.matches("call ptr @__wosy_core_alloc(").count(), 1, "{body}");
+                assert_eq!(body.matches("call void @__wosy_core_free(").count(), 1, "{body}");
+                let address = body.lines().find(|line| line.contains("ptrtoint ptr %allocation")).unwrap().trim().split_once(" = ").unwrap().0;
+                assert!(body.contains(&format!("insertvalue {pair} undef, {word} {address}, 0")), "{body}");
+                assert!(body.contains(&format!("insertvalue {pair} %borrowed_array_argument_address, i64 {count}, 1")), "{body}");
+                let call = body.find(&format!("call i64 @{target}({pair} %borrowed_array_argument)")).unwrap();
+                let free = body.find("call void @__wosy_core_free(ptr %allocation)").unwrap();
+                assert!(call < free, "{body}");
+            }
+            if let Some(out) = std::env::var_os("WOSY_WIDENED_BORROW_IR_DIR") {
+                let target = if layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
+                let controlled = llvm.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);
+                assert_ne!(controlled, llvm);
+                std::fs::write(std::path::PathBuf::from(out).join(format!("{target}-project-control.ll")), controlled).unwrap();
+            }
+        }
+    }
+}

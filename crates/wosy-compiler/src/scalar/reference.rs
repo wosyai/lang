@@ -374,6 +374,8 @@ enum ExpressionReadMode {
     FallibleAliasInitializer,
     DereferenceOperand,
     ArrayLengthArgument,
+    WidenedBorrowCall(ByteSpan),
+    WidenedBorrowAddress(ByteSpan),
 }
 
 const MAX_JOINED_REBORROW_PARENTS: usize = 4;
@@ -1933,6 +1935,10 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     let array_length = target == ResolvedCallTarget::Core(CoreOperationId::ArrayLen);
                     if array_length {
                         self.expression_with_read_mode(argument, scope, ordinal, ExpressionReadMode::ArrayLengthArgument)?;
+                    } else if let ExpressionReadMode::WidenedBorrowCall(owner) = read_mode {
+                        self.expression_with_read_mode(
+                            argument, scope, ordinal, ExpressionReadMode::WidenedBorrowAddress(owner),
+                        )?;
                     } else {
                         self.expression(argument, scope, ordinal)?;
                     }
@@ -3076,6 +3082,11 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     collect_reference_projections(proof_place.as_ref(), parent_loan.as_ref(), &mut projections);
                     if self.widened_arrays.as_ref().is_some_and(|owners| owners.contains(&binding))
                         && !matches!(read_mode, ExpressionReadMode::ArrayLengthArgument)
+                        && !matches!(read_mode, ExpressionReadMode::WidenedBorrowAddress(owner)
+                            if owner == binding.declaration_span && parent_loan.is_none()
+                                && projections.is_empty()
+                                && matches!(proof_place.as_ref(), ScalarPlace::Name { .. })
+                                && *mutability == ScalarReferenceMutability::Shared)
                     {
                         return Err(self.missing_context(span, ReferenceAnalysisErrorReason::UnprovedWidenedArrayTransfer));
                     }
@@ -5067,7 +5078,33 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         }
                         _ => unreachable!("expression item region"),
                     };
-                    let mode = if projected_origins && matches!(kind, BlockItemKind::FinalOutput(_)) {
+                    let widened_borrow = (|| {
+                        let owners = self.widened_arrays.as_ref()?;
+                        if scope != ReferenceScopeId(0) || !self.generic_parameters.is_empty()
+                            || !matches!(kind, BlockItemKind::FinalOutput(slot) if slot.output == 0)
+                            || !matches!(calls.boundary.root_outputs.as_slice(), [output] if output.ty == ScalarType::U64)
+                            || calls.declared_unsafe_calls.contains(&ordinal.0)
+                        { return None; }
+                        let [ScalarBlockItem::LocalBinding(root), _] = block.items.as_slice() else { return None };
+                        super::widened_local_literal(root)?;
+                        let [receiver] = root.receivers.as_slice() else { return None };
+                        let ScalarExpression::Call { arguments, .. } = expression else { return None };
+                        let [ScalarExpression::CheckedAddress { mutability: ScalarReferenceMutability::Shared, place, .. }] =
+                            arguments.as_slice() else { return None };
+                        let ScalarPlace::Name { name, .. } = place else { return None };
+                        let binding = self.names.get(name)?;
+                        if binding.declaration_span != receiver.name_span || !owners.contains(binding) { return None; }
+                        let [ScalarType::CheckedReference { mutability: ScalarReferenceMutability::Shared, inner }] =
+                            calls.checked_call_signatures.get(&ordinal)?.parameters.as_slice() else { return None };
+                        if !aggregate::same_runtime_array_type(&receiver.ty, inner)
+                            || !matches!(self.call_target(expression, ordinal),
+                                Ok(ResolvedCallTarget::ModuleCallable { concrete: ConcreteCallSelection::Declaration, .. }))
+                        { return None; }
+                        Some(binding.declaration_span)
+                    })();
+                    let mode = if let Some(owner) = widened_borrow {
+                        ExpressionReadMode::WidenedBorrowCall(owner)
+                    } else if projected_origins && matches!(kind, BlockItemKind::FinalOutput(_)) {
                         ExpressionReadMode::ProjectedOrigins
                     } else {
                         ExpressionReadMode::Ordinary
@@ -5116,7 +5153,8 @@ impl<'a> ReferenceFlowBuilder<'a> {
                                 aliases @ ..,
                                 BlockItem { kind: BlockItemKind::FinalOutput(_), .. },
                             ] = region.items.as_slice() {
-                                if matches!(root.initialization, BindingInitialization::Allocation { .. })
+                                if (widened_borrow.is_some()
+                                    || matches!(root.initialization, BindingInitialization::Allocation { .. }))
                                     && aliases.iter().all(|item| matches!(&item.kind,
                                         BlockItemKind::Binding(binding) if binding.receivers().len() == 1
                                             && matches!(&binding.initialization, BindingInitialization::Outputs(init)
@@ -5133,6 +5171,13 @@ impl<'a> ReferenceFlowBuilder<'a> {
                                     }
                                 }
                             }
+                        }
+                        if let Some(owner) = widened_borrow {
+                            if self.aggregate_facts.borrowed_extent_call != Some((value_point, ordinal, owner, None)) {
+                                return Err(self.missing_context(expression_span(expression),
+                                    ReferenceAnalysisErrorReason::UnprovedWidenedArrayTransfer));
+                            }
+                            self.aggregate_result.widened_borrowed_extent_required = Some(ordinal);
                         }
                         if scope == ReferenceScopeId(0) && slot.output == 0
                             && self.aggregate_facts.literal_array_unit.is_none()

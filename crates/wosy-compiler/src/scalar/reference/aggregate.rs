@@ -1269,6 +1269,7 @@ pub(super) struct AggregateFlowResult {
     pub(super) borrowed_extent_forward: Option<(CfgPointId, OccurrenceOrdinal)>,
     pub(super) borrowed_extent_call: Option<(CfgPointId, OccurrenceOrdinal, ByteSpan, Option<ByteSpan>)>,
     pub(super) array_formal_extent_required: bool,
+    pub(super) widened_borrowed_extent_required: Option<OccurrenceOrdinal>,
     array_conditional_forwarded: bool,
     pub(super) array_calls: BTreeMap<CfgPointId, (OccurrenceOrdinal, CfgPointId, ReferenceBindingId)>,
     pub(super) array_returns: BTreeSet<Option<ArrayReturnPath>>,
@@ -6632,6 +6633,7 @@ fn closed_aggregates<'a>(
     let mut returned_extent_requirements = Vec::new();
     let mut formal_extent_requirements = Vec::new();
     let mut borrowed_extent_requirements = Vec::new();
+    let mut widened_borrowed_extent_requirements = Vec::new();
     let mut borrowed_extent_callers = Vec::new();
     let mut returned_index_requirements = Vec::new();
     let mut array_leaves = BTreeSet::new();
@@ -6649,6 +6651,9 @@ fn closed_aggregates<'a>(
             }
             if facts.array_formal_extent_required {
                 formal_extent_requirements.push((key, body.source));
+            }
+            if let Some(call) = facts.widened_borrowed_extent_required {
+                widened_borrowed_extent_requirements.push((key, body.source, call));
             }
             if facts.borrowed_extent_observer.is_some() {
                 borrowed_extent_requirements.push((key, body.source));
@@ -6999,6 +7004,13 @@ fn closed_aggregates<'a>(
             &declarations, &array_descriptor_identities, &bodies, &mut result);
         seal_borrowed_extent_observers(&ordinary, &borrowed_extent_observers, &borrowed_extent_callers,
             &declarations, &bodies, &mut result, reservations.checked_access);
+        for &(key, source, call) in &widened_borrowed_extent_requirements {
+            if !result.bodies.get(&key).is_some_and(|plan|
+                plan.borrowed_extent_call.is_some_and(|(actual, _, alias)| actual == call.0 && alias.is_none()))
+            {
+                return Err(format!("widened array borrow requires a closed exact extent reader in {source:?}"));
+            }
+        }
         for &(key, source) in &borrowed_extent_requirements {
             if !result.bodies.get(&key).is_some_and(|plan| plan.borrowed_extent_observer.is_some()) {
                 return Err(format!("core.array_len requires a closed checked borrowed runtime extent in {source:?}"));
