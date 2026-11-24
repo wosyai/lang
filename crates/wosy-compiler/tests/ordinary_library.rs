@@ -973,9 +973,12 @@ fn independent_conditioned_owners_keep_separate_receipts_at_one_exit() {
     let app = source("workbench", "src/independent_conditioned_owners.w");
     let factory_fixture = include_str!("fixtures/structured-local-choice.w");
     let (factory_source, _) = factory_fixture.split_once("u64(u64, bool) drive").unwrap();
-    for (variant, transfer) in [("release", false), ("transfer", true)] {
+    for (variant, primary_transfer, secondary_transfer) in [
+        ("release", false, false), ("transfer", true, false),
+        ("transfer-secondary", false, true), ("transfer-both", true, true),
+    ] {
         let mut text = factory_source.to_owned();
-        if transfer {
+        if primary_transfer || secondary_transfer {
             text.push_str("u64(Packet) sink = fn(packet) { packet.length };\n");
         }
         text.push_str(concat!(
@@ -984,7 +987,8 @@ fn independent_conditioned_owners_keep_separate_receipts_at_one_exit() {
             "    Packet second = if (right) { make_short(7) } else { make_long(9) };\n",
             "    second.length;\n",
         ));
-        text.push_str(if transfer { "    sink(first)\n};\n" } else { "    first.length\n};\n" });
+        if secondary_transfer { text.push_str("    sink(second);\n"); }
+        text.push_str(if primary_transfer { "    sink(first)\n};\n" } else { "    first.length\n};\n" });
         let cases = [("ff", "false", "false"), ("ft", "false", "true"), ("tf", "true", "false"), ("tt", "true", "true")];
         for (case, left, right) in cases {
             text.push_str(&format!("u64() case_{case} = fn {{ drive({left}, {right}) }};\ncase_{case}();\n"));
@@ -1007,12 +1011,12 @@ fn independent_conditioned_owners_keep_separate_receipts_at_one_exit() {
                 let find = |name: &str| module.get_function(&symbol(name)).unwrap();
                 let primary = find("drive");
                 let factories = [find("make_short"), find("make_long")];
-                let sink = transfer.then(|| find("sink"));
+                let sink = (primary_transfer || secondary_transfer).then(|| find("sink"));
                 let free = module.get_function("__wosy_core_free").unwrap();
                 let mut produced = [Vec::new(), Vec::new()];
                 let mut merges = Vec::new();
                 let mut released = Vec::new();
-                let mut passed = None;
+                let mut passed = Vec::new();
                 for row in primary.get_basic_blocks().into_iter().flat_map(|block| block.get_instructions()) {
                     let arg = |slot| row.get_operand(slot).unwrap().value().unwrap();
                     if row.get_opcode() == InstructionOpcode::Phi && row.to_string().contains("phi ptr") {
@@ -1025,7 +1029,8 @@ fn independent_conditioned_owners_keep_separate_receipts_at_one_exit() {
                         let choice = usize::from(arg(0).into_int_value().get_zero_extended_constant().unwrap() >= 7);
                         produced[choice].push((call.try_as_basic_value().basic().unwrap(), arg(1)));
                     } else if Some(callee) == sink {
-                        assert!(passed.replace(arg(1)).is_none());
+                        assert_eq!(call.count_arguments(), 2);
+                        passed.push(arg(1));
                     } else if callee == free {
                         released.push(arg(0));
                     }
@@ -1043,16 +1048,17 @@ fn independent_conditioned_owners_keep_separate_receipts_at_one_exit() {
                 });
                 assert_ne!(chosen[0].0, chosen[1].0);
                 assert_ne!(chosen[0].1, chosen[1].1);
+                let expected_transfers = secondary_transfer.then_some(chosen[1].0).into_iter()
+                    .chain(primary_transfer.then_some(chosen[0].0));
+                assert!(passed.iter().copied().eq(expected_transfers), "only the named receipts transfer in source order");
+                let expected_local = (!secondary_transfer).then_some(chosen[1].0).into_iter()
+                    .chain((!primary_transfer).then_some(chosen[0].0));
+                assert!(released.iter().copied().eq(expected_local), "only retained original backings release locally");
                 if let Some(sink) = sink {
-                    assert_eq!(passed, Some(chosen[0].0));
-                    assert_eq!(released, [chosen[1].0]);
                     let releases: Vec<_> = sink.get_basic_blocks().into_iter().flat_map(|block| block.get_instructions())
                         .filter(|row| CallSiteValue::try_from(*row).ok().and_then(|call| call.get_called_fn_value()) == Some(free))
                         .map(|row| row.get_operand(0).unwrap().value().unwrap()).collect();
                     assert_eq!(releases, [sink.get_last_param().unwrap()]);
-                } else {
-                    assert!(passed.is_none());
-                    assert_eq!(released, [chosen[1].0, chosen[0].0], "true original birth order");
                 }
                 if let Some(out) = std::env::var_os("WOSY_INDEPENDENT_CHOICES_IR_DIR") {
                     let out = std::path::PathBuf::from(out).join(format!("{variant}-{route}"));
