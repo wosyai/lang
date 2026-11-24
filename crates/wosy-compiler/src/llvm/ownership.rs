@@ -776,6 +776,7 @@ pub(super) fn transfer_runtime_array_return(
     block: &ScalarBlock,
     expression: &ScalarExpression,
     ty: &ScalarType,
+    retained_ancestor_owners: Option<&BTreeMap<String, bool>>,
 ) {
     if !matches!(ty, ScalarType::RuntimeArray { .. }) {
         if matches!(
@@ -804,6 +805,12 @@ pub(super) fn transfer_runtime_array_return(
         bindings.extend(return_bindings(block));
         let mut visited = BTreeSet::new();
         for name in escaped_runtime_array_owners(expression, &bindings, &mut visited) {
+            // An ordinary block yielding a derived view does not transfer
+            // storage already owned by its enclosing scope. Its caller may
+            // still read the view and must clean up the owner at its own exit.
+            if retained_ancestor_owners.is_some_and(|owners| owners.contains_key(&name)) {
+                continue;
+            }
             if state.runtime_array_owners.contains_key(&name) {
                 state.runtime_array_owners.insert(name, false);
             }

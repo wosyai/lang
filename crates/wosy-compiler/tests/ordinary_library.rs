@@ -991,6 +991,81 @@ fn structured_owner_factory_joins_grounded_recursive_results_in_caller_storage()
 }
 
 #[test]
+fn d0024_recursive_ownership_preserves_live_holders_and_carried_owner() {
+    let app = source("workbench", "src/d0024_recursive_ownership.w");
+    let text = include_str!("fixtures/d0024-recursive-ownership.w");
+    for (target, target_layout) in [
+        ("native64", ScalarTargetLayout::NATIVE64),
+        ("wasm32", ScalarTargetLayout::WASM32),
+    ] {
+        let prepared = prepare_scalar_project(
+            vec![(declarations(&app, text), Vec::new())], vec![app.clone()],
+            ScalarPreparationInputs { target_layout },
+        ).unwrap_or_else(|error| panic!("{target}: {:?}", error.diagnostics));
+        let build = analyze_scalar_build(&prepared);
+        assert!(build.diagnostics().is_empty(), "{target}: {:?}", build.diagnostics());
+        let ir = emit_scalar_build_project_llvm(&build).unwrap_or_else(|error| panic!("{target}: {error}")).to_text();
+        let context = Context::create();
+        let buffer = MemoryBuffer::create_from_memory_range_copy(ir.as_bytes(), target);
+        let module = context.create_module_from_ir(buffer).unwrap();
+        module.verify().unwrap();
+        let frame = function_with_suffix(&module, "frame");
+        let reader = function_with_suffix(&module, "read_selected");
+        let carry = function_with_suffix(&module, "carry");
+        let witness = function_with_suffix(&module, "carry_witness");
+        let frame_calls = direct_calls(&module, &frame);
+        assert!(frame_calls.contains(&frame) && frame_calls.contains(&reader), "{target}: {ir}");
+        let frame_fn = module.get_function(&frame).unwrap();
+        let allocation_call = frame_fn.get_basic_blocks().into_iter()
+            .flat_map(|block| block.get_instructions())
+            .filter(|row| row.get_opcode() == InstructionOpcode::Call)
+            .map(|row| CallSiteValue::try_from(row).unwrap())
+            .find(|call| call.get_called_fn_value().unwrap().get_name().to_bytes() == b"__wosy_core_alloc")
+            .expect("frame allocation");
+        let original_frame = allocation_call.try_as_basic_value().basic().unwrap();
+        let mut checked_order = false;
+        for block in frame_fn.get_basic_blocks() {
+            let mut stage = 0;
+            for row in block.get_instructions().filter(|row| row.get_opcode() == InstructionOpcode::Call) {
+                let call = CallSiteValue::try_from(row).unwrap();
+                let callee = call.get_called_fn_value().unwrap();
+                match callee.get_name().to_str().unwrap() {
+                    name if name == frame => { assert_eq!(stage, 0, "{target}: {ir}"); stage = 1; }
+                    name if name == reader => { assert_eq!(stage, 1, "{target}: {ir}"); stage = 2; }
+                    "__wosy_core_free" => {
+                        assert_eq!(stage, 2, "{target}: {ir}");
+                        assert_eq!(row.get_operand(0).unwrap().value(), Some(original_frame), "{target}: {ir}");
+                        checked_order = true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert!(checked_order, "{target}: {ir}");
+        let owned_calls = |name: &str, runtime: &str| direct_calls(&module, name).iter()
+            .filter(|call| call.as_str() == runtime).count();
+        for runtime in ["__wosy_core_alloc", "__wosy_core_free"] {
+            assert_eq!(owned_calls(&frame, runtime), 1, "{target}: {ir}");
+            assert_eq!(owned_calls(&carry, runtime), 0, "{target}: {ir}");
+            assert_eq!(owned_calls(&witness, runtime), 1, "{target}: {ir}");
+        }
+        assert!(direct_calls(&module, &carry).contains(&carry), "{target}: {ir}");
+        assert!(direct_calls(&module, &witness).contains(&carry), "{target}: {ir}");
+
+        if let Some(out) = std::env::var_os("WOSY_D0024_OWNERSHIP_IR_DIR") {
+            let mut ir = ir.replace("@main(", "@wosy_authored_main(");
+            for name in ["frame_zero", "frame_two", "frame_three", "carry_zero", "carry_two", "carry_three"] {
+                let symbol = function_with_suffix(&module, name);
+                ir.push_str(&format!(
+                    "\ndefine i8 @wosy_{name}() {{\nentry:\n  %result = call i8 @{symbol}()\n  ret i8 %result\n}}\n"
+                ));
+            }
+            std::fs::write(std::path::PathBuf::from(out).join(format!("{target}.ll")), ir).unwrap();
+        }
+    }
+}
+
+#[test]
 fn runtime_array_recommit_keeps_the_owner_until_its_real_end() {
     let recursive = r#"
 (u8[], u64)(u8[], u64, u64) carry = fn(bytes, depth, count) {

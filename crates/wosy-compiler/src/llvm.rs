@@ -2932,7 +2932,9 @@ fn emit_block_at<'ctx, 'module>(
         emit_block_item(context, state, item)?;
     }
     let result = if final_start < block.items.len() || matches!(emission, BlockEmission::TailArm(_)) {
-        emit_final_outputs(context, state, block, emission)?
+        let ancestors = matches!(emission, BlockEmission::Ordinary | BlockEmission::ContextualNumeric(_))
+            .then_some(&runtime_array_owners);
+        emit_final_outputs(context, state, block, emission, ancestors)?
     } else {
         EmitValue::Unit
     };
@@ -3025,7 +3027,9 @@ fn emit_project_block_at<'ctx, 'module>(
         }
     }
     let result = if final_start < block.items.len() || matches!(emission, BlockEmission::TailArm(_)) {
-        emit_project_final_outputs(context, state, block, module, modules, emission)?
+        let ancestors = matches!(emission, BlockEmission::Ordinary | BlockEmission::ContextualNumeric(_))
+            .then_some(&runtime_array_owners);
+        emit_project_final_outputs(context, state, block, module, modules, emission, ancestors)?
     } else {
         EmitValue::Unit
     };
@@ -3079,6 +3083,7 @@ fn emit_final_outputs<'ctx, 'module>(
     state: &mut EmitState<'ctx, 'module>,
     block: &ScalarBlock,
     emission: BlockEmission<'_>,
+    retained_ancestor_owners: Option<&BTreeMap<String, bool>>,
 ) -> Result<EmitValue<'ctx>, String> {
     if matches!(emission, BlockEmission::Return(_)) && aggregate_transfer::forwarded_mixed_return(state) {
         return Ok(EmitValue::Unit);
@@ -3108,7 +3113,7 @@ fn emit_final_outputs<'ctx, 'module>(
         let output = &block.final_output_values[0];
         let expression = final_output_expression(block, 0);
         if matches!(expression, ScalarExpression::Call { .. }) {
-            transfer_runtime_array_return(state, block, expression, &output.ty);
+            transfer_runtime_array_return(state, block, expression, &output.ty, retained_ancestor_owners);
             transfer_automatic_return_result(state, expression);
             let value = emit_expression(context, state, expression)?;
             if !state
@@ -3127,7 +3132,7 @@ fn emit_final_outputs<'ctx, 'module>(
         {
             record_forwarded_return_owner(context, state, expression, output.position)?;
         }
-        transfer_runtime_array_return(state, block, expression, ty);
+        transfer_runtime_array_return(state, block, expression, ty, retained_ancestor_owners);
         transfer_automatic_return_result(state, expression);
         return Ok(value);
     }
@@ -3162,7 +3167,7 @@ fn emit_final_outputs<'ctx, 'module>(
     }
     for (position, output) in block.final_output_values.iter().enumerate() {
         let expression = final_output_expression(block, position);
-        transfer_runtime_array_return(state, block, expression, &output.ty);
+        transfer_runtime_array_return(state, block, expression, &output.ty, retained_ancestor_owners);
         transfer_automatic_return_result(state, expression);
     }
     build_aggregate(context, state, &outputs, values)
@@ -3175,6 +3180,7 @@ fn emit_project_final_outputs<'ctx, 'module>(
     module: &ScalarModule,
     modules: &[&ScalarModule],
     emission: BlockEmission<'_>,
+    retained_ancestor_owners: Option<&BTreeMap<String, bool>>,
 ) -> Result<EmitValue<'ctx>, String> {
     if matches!(emission, BlockEmission::Return(_)) && aggregate_transfer::forwarded_mixed_return(state) {
         return Ok(EmitValue::Unit);
@@ -3217,7 +3223,7 @@ fn emit_project_final_outputs<'ctx, 'module>(
         let output = &block.final_output_values[0];
         let expression = final_output_expression(block, 0);
         if matches!(expression, ScalarExpression::Call { .. }) {
-            transfer_runtime_array_return(state, block, expression, &output.ty);
+            transfer_runtime_array_return(state, block, expression, &output.ty, retained_ancestor_owners);
             transfer_automatic_return_result(state, expression);
             let value = emit_project_expression(context, state, expression, module, modules)?;
             if !state
@@ -3237,7 +3243,7 @@ fn emit_project_final_outputs<'ctx, 'module>(
         {
             record_forwarded_return_owner(context, state, expression, output.position)?;
         }
-        transfer_runtime_array_return(state, block, expression, ty);
+        transfer_runtime_array_return(state, block, expression, ty, retained_ancestor_owners);
         transfer_automatic_return_result(state, expression);
         return Ok(value);
     }
@@ -3272,7 +3278,7 @@ fn emit_project_final_outputs<'ctx, 'module>(
     }
     for (position, output) in block.final_output_values.iter().enumerate() {
         let expression = final_output_expression(block, position);
-        transfer_runtime_array_return(state, block, expression, &output.ty);
+        transfer_runtime_array_return(state, block, expression, &output.ty, retained_ancestor_owners);
         transfer_automatic_return_result(state, expression);
     }
     build_aggregate(context, state, &outputs, values)
@@ -3305,7 +3311,7 @@ fn emit_ordered_final_outputs<'ctx, 'module>(
     }
     record_named_branch_return_owners(context, state, block)?;
     for ((expression, _), output) in block.final_expressions().zip(&outputs.outputs) {
-        transfer_runtime_array_return(state, block, expression, &output.ty);
+        transfer_runtime_array_return(state, block, expression, &output.ty, None);
         transfer_automatic_return_result(state, expression);
     }
     build_aggregate(context, state, outputs, values)
