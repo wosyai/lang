@@ -1121,7 +1121,24 @@ pub(super) fn emit_initializer_binding<'ctx, 'module>(
 pub(super) fn requires_scoped_function_emission(plan: Option<&ClosedBody>) -> bool {
     plan.is_some_and(|plan| !plan.inputs.is_empty() || plan.ordinary_result || !plan.ordinary_calls.is_empty()
         || !plan.multi_receives.is_empty() || plan.multi_return_width() != 0
+        || plan.array_descriptor_observer.is_some()
         || matches!(plan.returning, Some(ClosedReturn::Structured { .. })))
+}
+
+pub(super) fn extract_observing_array_formal<'ctx>(
+    context: &'ctx Context,
+    builder: &inkwell::builder::Builder<'ctx>,
+    parameter: BasicValueEnum<'ctx>,
+) -> Result<(BasicValueEnum<'ctx>, inkwell::values::IntValue<'ctx>), String> {
+    let BasicValueEnum::StructValue(parameter) = parameter else {
+        return Err("missing checked owning array formal".into());
+    };
+    if parameter.get_type() != array_descriptor_type(context) {
+        return Err("invalid checked owning array formal".into());
+    }
+    let backing = builder.build_extract_value(parameter, 0, "array_formal_backing").map_err(builder_error)?;
+    let extent = builder.build_extract_value(parameter, 1, "array_formal_extent").map_err(builder_error)?;
+    Ok((backing, extent.into_int_value()))
 }
 
 pub(super) fn emit_array_descriptor_identity<'ctx>(

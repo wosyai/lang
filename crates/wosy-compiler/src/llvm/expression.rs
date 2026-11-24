@@ -2545,7 +2545,22 @@ fn emit_binary_expression<'ctx, 'module>(
             return emit_binary_values(state, operator, left, EmitValue::Basic(right.into()), false);
         }
     }
-    let unsigned = match prepared_initializer_unsigned(state, left)? {
+    let checked_call_signedness = if matches!(
+        operator, BinaryOperator::Less | BinaryOperator::LessEqual
+            | BinaryOperator::Greater | BinaryOperator::GreaterEqual
+    ) && matches!(left, ScalarExpression::Call { .. }) {
+        // Ordered calls in prepared function bodies have their result type
+        // recorded on the exact expression, independent of source spelling.
+        let ty = state.body_call_nodes.and_then(|nodes| nodes.checked_expression_type(left));
+        match ty {
+            Some(ScalarType::U8 | ScalarType::U16 | ScalarType::U32 | ScalarType::U64 | ScalarType::U128) => Some(true),
+            Some(ScalarType::I8 | ScalarType::I16 | ScalarType::I32 | ScalarType::I64 | ScalarType::I128) => Some(false),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let unsigned = match checked_call_signedness.or(prepared_initializer_unsigned(state, left)?) {
         Some(unsigned) => unsigned,
         None => match path {
             ExpressionPath::Single => expression_is_unsigned(state, left),

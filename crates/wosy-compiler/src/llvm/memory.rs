@@ -494,6 +494,9 @@ fn capture_local_runtime_extent<'ctx>(
         LocalRuntimeExtent::Construction(length)
             if *storage == address && state.runtime_array_allocations.get(name) == Some(&true) =>
                 Ok(Some(*length)),
+        LocalRuntimeExtent::OwningFormal(length)
+            if !for_index && *storage == address && state.runtime_array_allocations.get(name) == Some(&false) =>
+                Ok(Some(*length)),
         LocalRuntimeExtent::ManagedLengthSlot(length_slot)
             if state.runtime_array_allocations.get(name) == Some(&false)
                 && state.runtime_array_lengths.get(name) == Some(length_slot) =>

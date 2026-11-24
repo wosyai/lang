@@ -129,6 +129,7 @@ impl<'ctx, 'module> ProjectNames<'ctx, 'module> {
 #[derive(Clone, Copy)]
 enum LocalRuntimeExtent<'ctx> {
     Construction(inkwell::values::IntValue<'ctx>),
+    OwningFormal(inkwell::values::IntValue<'ctx>),
     ManagedLengthSlot(PointerValue<'ctx>),
 }
 
@@ -2345,7 +2346,8 @@ fn emit_function<'ctx, 'module>(
         .ok_or_else(|| format!("unknown LLVM function {name}"))?;
     let entry = context.append_basic_block(value, "entry");
     builder.position_at_end(entry);
-    if aggregate_plan.is_some_and(|plan| plan.array_descriptor_identity) {
+    let array_descriptor_observer = aggregate_plan.and_then(|plan| plan.array_descriptor_observer);
+    if array_descriptor_observer.is_none() && aggregate_plan.is_some_and(|plan| plan.array_descriptor_identity) {
         return aggregate_transfer::emit_array_descriptor_identity(context, builder, value);
     }
     if let Some(slot) = aggregate_plan.and_then(|plan| plan.identity_relay) {
@@ -2442,6 +2444,15 @@ fn emit_function<'ctx, 'module>(
                 .build_alloca(storage, &function.parameters[index])
                 .map_err(builder_error)?;
             align_storage_alloca(slot, alignment)?;
+            let argument = if let Some(declaration) = array_descriptor_observer.filter(|_| index == 0) {
+                let (backing, extent) = aggregate_transfer::extract_observing_array_formal(
+                    context, builder, argument,
+                )?;
+                state.local_runtime_extents.insert(slot, (declaration, LocalRuntimeExtent::OwningFormal(extent), false));
+                backing
+            } else {
+                argument
+            };
             store_value(
                 context,
                 &mut state,
@@ -2512,6 +2523,9 @@ fn emit_function<'ctx, 'module>(
         }
     }
     release_automatic_return_result_owners(context, &mut state, &BTreeMap::new())?;
+    if array_descriptor_observer.is_some() {
+        return aggregate_transfer::emit_array_descriptor_identity(context, builder, value);
+    }
     if let Some(returned) =
         aggregate_transfer::finish_return(&mut state)?
     {
@@ -2684,7 +2698,8 @@ fn emit_project_function<'ctx, 'module>(
         .ok_or_else(|| format!("unknown LLVM function {name}"))?;
     let entry = context.append_basic_block(value, "entry");
     builder.position_at_end(entry);
-    if aggregate_plan.is_some_and(|plan| plan.array_descriptor_identity) {
+    let array_descriptor_observer = aggregate_plan.and_then(|plan| plan.array_descriptor_observer);
+    if array_descriptor_observer.is_none() && aggregate_plan.is_some_and(|plan| plan.array_descriptor_identity) {
         return aggregate_transfer::emit_array_descriptor_identity(context, builder, value);
     }
     if let Some(slot) = aggregate_plan.and_then(|plan| plan.identity_relay) {
@@ -2781,6 +2796,15 @@ fn emit_project_function<'ctx, 'module>(
                 .build_alloca(storage, &function.parameters[index])
                 .map_err(builder_error)?;
             align_storage_alloca(slot, alignment)?;
+            let argument = if let Some(declaration) = array_descriptor_observer.filter(|_| index == 0) {
+                let (backing, extent) = aggregate_transfer::extract_observing_array_formal(
+                    context, builder, argument,
+                )?;
+                state.local_runtime_extents.insert(slot, (declaration, LocalRuntimeExtent::OwningFormal(extent), false));
+                backing
+            } else {
+                argument
+            };
             store_value(
                 context,
                 &mut state,
@@ -2875,6 +2899,9 @@ fn emit_project_function<'ctx, 'module>(
         }
     }
     release_automatic_return_result_owners(context, &mut state, &BTreeMap::new())?;
+    if array_descriptor_observer.is_some() {
+        return aggregate_transfer::emit_array_descriptor_identity(context, builder, value);
+    }
     if let Some(returned) =
         aggregate_transfer::finish_return(&mut state)?
     {

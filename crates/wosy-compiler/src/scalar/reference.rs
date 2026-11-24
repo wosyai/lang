@@ -1940,6 +1940,16 @@ impl<'a> ReferenceFlowBuilder<'a> {
                                 && self.cfg.allocations.contains(&place.binding) => {
                                 self.proof_points.array_length_owners.insert(place.binding.clone());
                             }
+                            Some(ScalarType::RuntimeArray { .. }) if place.projections.is_empty()
+                                && self.aggregate_facts.array_formal.as_ref() == Some(&place.binding)
+                                && matches!(calls.boundary.parameters.as_slice(), [_])
+                                && matches!(calls.boundary.root_outputs.as_slice(), [output]
+                                    if matches!(output.ty, ScalarType::RuntimeArray { .. })) => {
+                                // The access is safe only as part of an all-use paired
+                                // signature. Carry a provisional exact borrow witness.
+                                self.aggregate_facts.array_formal_extent_borrows
+                                    .insert(self.cursor.expect("checked array extent argument"));
+                            }
                             _ => return Err(self.missing_context(span, ReferenceAnalysisErrorReason::UnprovedArrayLength)),
                         }
                     }
@@ -16438,6 +16448,7 @@ fn build_function_reference_cfg(
         aggregate.local_array_failure_arms.clear();
         aggregate.checked_producer_backing.clear();
     }
+    aggregate.array_formal_extent_required = !builder.aggregate_facts.array_formal_extent_borrows.is_empty();
     aggregate.literal_array_extent_required = builder.aggregate_facts.literal_array_extent_output
         .map(|(_, occurrence)| occurrence);
     aggregate.literal_array_index_required = builder.aggregate_facts.literal_array_index_output;

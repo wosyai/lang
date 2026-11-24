@@ -63,6 +63,7 @@ pub(super) struct AggregateFlowFacts {
     pub(super) array_return: Option<(CfgPointId, CfgPointId)>,
     pub(super) conditional_array_return: Option<ConditionalArrayReturn>,
     pub(super) array_installs: BTreeMap<CfgPointId, OccurrenceOrdinal>,
+    pub(super) array_formal_extent_borrows: BTreeSet<CfgPointId>,
     pub(super) neutral_array_calls: BTreeSet<CfgPointId>,
     pub(super) neutral_array_projections: BTreeMap<CfgPointId, CfgPointId>,
     pub(super) neutral_array_scalars: BTreeSet<ReferenceBindingId>,
@@ -1251,6 +1252,7 @@ pub(super) struct AggregateFlowResult {
     pub(super) checked_producer_authoritative: bool,
     pub(super) array_invalid: bool,
     pub(super) array_neutral: bool,
+    pub(super) array_formal_extent_required: bool,
     array_conditional_forwarded: bool,
     pub(super) array_calls: BTreeMap<CfgPointId, (OccurrenceOrdinal, CfgPointId, ReferenceBindingId)>,
     pub(super) array_returns: BTreeSet<Option<ArrayReturnPath>>,
@@ -1484,7 +1486,7 @@ impl AggregateFlowResult {
     }
 
     pub(super) fn has_observations(&self) -> bool {
-        self.literal_array_index_required.is_some() || self.literal_array_extent_required.is_some() || self.proved_literal_array_route_ref().is_some()
+        self.array_formal_extent_required || self.literal_array_index_required.is_some() || self.literal_array_extent_required.is_some() || self.proved_literal_array_route_ref().is_some()
             || (self.checked_producer_authoritative && !self.checked_producer_backing.is_empty())
             || self.checked_backing_assignment.is_some() || self.checked_backing_forward.is_some()
             || self.scalar_descriptor_assignment.is_some() || self.fresh_recommit_leaf.is_some() || !self.array_returns.is_empty() || !self.array_rebinds.is_empty()
@@ -2026,7 +2028,7 @@ impl AggregateFlowFacts {
             }
             match &point.kind {
                 CfgPointKind::Borrow { place, .. } if &place.binding == formal => {
-                    result.array_invalid = true;
+                    result.array_invalid |= !self.array_formal_extent_borrows.contains(&id);
                 }
                 CfgPointKind::Move { place, owner, .. } if owner == formal => {
                     if state.array_formal_live && place.projections.is_empty() && &place.binding == formal {
@@ -2947,6 +2949,7 @@ pub(crate) struct ClosedBody {
     pub(crate) replacement_extent_observation: Option<usize>,
     pub(crate) array_descriptor_return: bool,
     pub(crate) array_descriptor_identity: bool,
+    pub(crate) array_descriptor_observer: Option<ByteSpan>,
     // Call occurrence -> its sole exact lexical backing declaration and install.
     pub(crate) array_descriptor_rebinds: BTreeMap<usize, (ByteSpan, usize)>,
     pub(crate) replacement_index_observation: Option<usize>,
@@ -5723,11 +5726,12 @@ fn enroll_literal_array_pair(
 
 // This is deliberately an effect-free whole formal identity, not a
 // constructor. Its return is the incoming descriptor bit-for-bit.
-fn array_descriptor_identity(body: &Body<'_>) -> bool {
-    let Some(facts) = body.facts else { return false };
+fn array_descriptor_identity(body: &Body<'_>) -> Option<Option<ByteSpan>> {
+    let facts = body.facts?;
     let ([formal], [output]) = (body.sites.boundary.parameters.as_slice(), body.sites.boundary.results.as_slice())
-    else { return false };
-    body.is_monomorphic && body.cfg.initial_points.len() <= 8
+    else { return None };
+    let observing = facts.array_formal_extent_required;
+    (body.is_monomorphic && body.cfg.initial_points.len() <= if observing { 24 } else { 8 }
         && same_runtime_array_type(&formal.ty, &output.ty)
         && !facts.array_invalid && facts.array_calls.is_empty()
         && facts.array_returns.len() == 1
@@ -5739,15 +5743,29 @@ fn array_descriptor_identity(body: &Body<'_>) -> bool {
             CfgPointKind::Read { binding } => binding.declaration_span == formal.span,
             CfgPointKind::Move { place, owner, .. } =>
                 &place.binding == owner && owner.declaration_span == formal.span && place.projections.is_empty(),
+            CfgPointKind::Borrow { place, loan } if observing => place.binding.declaration_span == formal.span
+                && place.projections.is_empty() && loan.mode == ScalarReferenceMutability::Shared
+                && point.successors.as_slice().first().is_some_and(|next|
+                    matches!(&body.cfg.initial_points[next.0].kind, CfgPointKind::Call {
+                        target: ResolvedCallTarget::Core(CoreOperationId::ArrayLen), argument_points, ..
+                    } if argument_points.as_slice() == [point.id])),
+            CfgPointKind::Call { output: 0, target: ResolvedCallTarget::Core(CoreOperationId::ArrayLen), argument_points, .. }
+                if observing => matches!(argument_points.as_slice(), [borrow]
+                    if matches!(&body.cfg.initial_points[borrow.0].kind, CfgPointKind::Borrow { place, .. }
+                        if place.binding.declaration_span == formal.span && place.projections.is_empty())),
+            CfgPointKind::Call { output: 0, target: ResolvedCallTarget::Core(CoreOperationId::SystemPanic), argument_points, .. }
+                if observing => argument_points.is_empty(),
+            CfgPointKind::Branch { .. } | CfgPointKind::Join if observing => true,
+            CfgPointKind::Evaluate(value) if observing => neutral_scalar_evaluation(value),
             _ => false,
-        })
+        })).then_some(observing.then_some(formal.span))
 }
 
 fn seal_array_descriptor_identities(
     ordinary: &OrdinaryCohorts,
     requests: &[(BodyKey, &Body<'_>, OccurrenceOrdinal)],
     declarations: &HashMap<(&SourceIdentity, ByteSpan), (usize, usize)>,
-    identities: &BTreeSet<BodyKey>,
+    identities: &BTreeMap<BodyKey, Option<ByteSpan>>,
     result: &mut ClosedAggregates,
 ) {
     let mut candidates = HashMap::new();
@@ -5756,7 +5774,7 @@ fn seal_array_descriptor_identities(
         let Some((call, binding, destination)) = facts.array_rebinds.first_key_value()
             .filter(|_| facts.array_rebinds.len() == 1).map(|(_, proof)| proof) else { continue };
         let Some(&(ordinal, _, ref source)) = facts.array_calls.get(call) else { continue };
-        let Some(target) = target_body(declarations, body.cfg, *call).filter(|target| identities.contains(target))
+        let Some(target) = target_body(declarations, body.cfg, *call).filter(|target| identities.contains_key(target))
         else { continue };
         let Some(proof) = result.bodies.get(&caller) else { continue };
         if source != binding || !body.cfg.allocations.contains(binding)
@@ -5770,7 +5788,7 @@ fn seal_array_descriptor_identities(
         }
         candidates.insert((caller, ordinal.0), (target, binding.declaration_span, destination.0, observation.0));
     }
-    for target in identities {
+    for (target, observer) in identities {
         let Some(uses) = ordinary.array_uses.get(target).and_then(Option::as_ref)
             .filter(|uses| !uses.is_empty()) else { continue };
         if !uses.iter().all(|site| candidates.get(site).is_some_and(|(actual, ..)| actual == target)) {
@@ -5779,7 +5797,9 @@ fn seal_array_descriptor_identities(
         if result.bodies.contains_key(target) {
             continue;
         }
-        result.bodies.entry(*target).or_default().array_descriptor_identity = true;
+        let definition = result.bodies.entry(*target).or_default();
+        definition.array_descriptor_identity = true;
+        definition.array_descriptor_observer = *observer;
         for &(caller, call) in uses {
             let (_, binding, destination, observation) = candidates[&(caller, call)];
             let plan = result.bodies.get_mut(&caller).expect("proved array rebind caller");
@@ -6237,7 +6257,7 @@ fn closed_aggregates<'a>(
     let mut bodies = BTreeMap::new();
     let mut declarations = HashMap::new();
     let mut storage_uses = HashMap::<&SourceSpan, usize>::new();
-    let mut array_descriptor_identities = BTreeSet::new();
+    let mut array_descriptor_identities = BTreeMap::new();
     for (&key @ (module, item, arm), &is_monomorphic) in &reservations.bodies {
         let input = module_at(module).ok_or_else(|| format!("missing emitted aggregate module {module}"))?;
         let Some(ScalarItem::Function(function)) = input.items.get(item) else {
@@ -6273,9 +6293,11 @@ fn closed_aggregates<'a>(
                     _ => false,
                 });
             let body = Body { facts, cfg, sites, source: input.source, is_monomorphic, supports_input_result };
-            if arm.is_none() && array_descriptor_identity(&body) {
-                array_descriptor_identities.insert(key);
-                ordinary.array_uses.entry(key).or_insert_with(|| Some(Vec::new()));
+            if arm.is_none() {
+                if let Some(observer) = array_descriptor_identity(&body) {
+                    array_descriptor_identities.insert(key, observer);
+                    ordinary.array_uses.entry(key).or_insert_with(|| Some(Vec::new()));
+                }
             }
             bodies.insert(key, body);
         }
@@ -6339,6 +6361,7 @@ fn closed_aggregates<'a>(
     let mut array_callsites = Vec::new();
     let mut literal_array_callers = Vec::new();
     let mut returned_extent_requirements = Vec::new();
+    let mut formal_extent_requirements = Vec::new();
     let mut returned_index_requirements = Vec::new();
     let mut array_leaves = BTreeSet::new();
     let mut array_neighbors = BTreeMap::<BodyKey, BTreeSet<BodyKey>>::new();
@@ -6349,6 +6372,9 @@ fn closed_aggregates<'a>(
             // BTreeMap order preserves enrollment precedence at finalization.
             if let Some(index) = facts.literal_array_index_required {
                 returned_index_requirements.push((key, body, index));
+            }
+            if facts.array_formal_extent_required {
+                formal_extent_requirements.push((key, body.source));
             }
             if let Some(occurrence) = facts.literal_array_extent_required {
                 returned_extent_requirements.push((key, body, occurrence));
@@ -6675,6 +6701,11 @@ fn closed_aggregates<'a>(
 
         seal_array_descriptor_identities(&ordinary, &returned_extent_requirements,
             &declarations, &array_descriptor_identities, &mut result);
+        for &(key, source) in &formal_extent_requirements {
+            if !result.bodies.get(&key).is_some_and(|plan| plan.array_descriptor_observer.is_some()) {
+                return Err(format!("core.array_len requires a closed exact owning formal extent in {source:?}"));
+            }
+        }
         for &(key, body, occurrence) in &returned_extent_requirements {
             let source = body.source;
             if result.bodies.get(&key).is_some_and(|plan|
