@@ -12,7 +12,7 @@ enum Expected {
     NullParent,
     DynamicProjection,
     OutOfRangeProjection,
-    KnownProjection,
+    KnownAbsentProjection,
     LiveConflict,
     LiveSelectedFieldConflict,
     ExactProjectionConflict { target: &'static str, operand: &'static str, loan: &'static str },
@@ -58,13 +58,13 @@ fn check_case(text: &str, expected: Expected, witness_dir: Option<&str>) {
         ] {
             match expected {
                 Expected::Valid => assert!(diagnostics.is_empty(), "{target}/{route}: {diagnostics:?}"),
-                Expected::NullParent | Expected::DynamicProjection | Expected::OutOfRangeProjection | Expected::KnownProjection => {
+                Expected::NullParent | Expected::DynamicProjection | Expected::OutOfRangeProjection | Expected::KnownAbsentProjection => {
                     let (reborrow, message) = match expected {
                         Expected::DynamicProjection => ("&!(*parent).values[index]",
                             "checked address requires a storage name or direct storage field"),
                         Expected::OutOfRangeProjection => ("&!(*parent).values[2]",
                             "checked projected borrow requires an in-range literal index into a fixed ordinary scalar array"),
-                        Expected::KnownProjection => ("&!(*parent).values[1]", "missing required dereference origin"),
+                        Expected::KnownAbsentProjection => ("&!(*parent).values[1]", "missing required dereference origin"),
                         _ => ("&(*parent)", "missing required dereference origin"),
                     };
                     let start = text.find(reborrow).expect("child reborrow") as u32;
@@ -386,12 +386,7 @@ fn joined_struct_parent_grants_in_range_literal_array_element() {
     let outside = program.replace("&!(*parent).values[1]", "&!(*parent).values[2]");
     assert_ne!(outside, program);
     check(&outside, Expected::OutOfRangeProjection);
-    let known = program.replace(
-        "*!Record parent = null;\n    if (choose) { parent = &!first; } else { parent = &!second; };",
-        "*!Record parent = &!first;",
-    );
-    assert_ne!(known, program);
-    check(&known, Expected::KnownProjection);
+
 }
 
 #[test]
@@ -434,6 +429,34 @@ fn joined_exclusive_field_and_selected_parent_write_disjoint_fields() {
         assert_ne!(live, program);
         check(&live, Expected::ExactProjectionConflict { target, operand, loan: "&!(*parent).value" });
     }
+}
+
+#[test]
+fn known_mutable_parent_grants_in_range_literal_array_element() {
+    let program = r#"%%start
+struct Record { u8[2] values; }
+u8(bool) inspect = fn(choose) {
+    Record first = { .values = [1, 7]; };
+    *!Record parent = &!first;
+    *!u8 child = &!(*parent).values[1];
+    u8 seen = *child;
+    *child = seen + 2;
+    u8 observed = *child;
+    if (observed == 9 && first.values[0] == 1 && first.values[1] == 9) {
+        if (choose) { 7 } else { 9 }
+    } else { 0 }
+};
+if (inspect(true) != 7 || inspect(false) != 9) { core.system_panic(); };
+%%end"#;
+    check_case(program, Expected::Valid, Some("WOSY_KNOWN_INDEXED_PROJECTION_IR_DIR"));
+
+    let live = program.replace("u8 observed = *child;", "first.values[1] = 3; u8 observed = *child;");
+    assert_ne!(live, program);
+    check(&live, Expected::LiveIndexedProjectionConflict);
+
+    let absent = program.replace("*!Record parent = &!first;", "*!Record parent = null;");
+    assert_ne!(absent, program);
+    check(&absent, Expected::KnownAbsentProjection);
 }
 
 #[test]

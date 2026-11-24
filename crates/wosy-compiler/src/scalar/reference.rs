@@ -2607,9 +2607,16 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             OccurrenceParent::Place(root.ordinal),
                             OccurrenceEdge::DereferencePointer,
                         );
-                        let ReferenceValue::Checked(origins) =
-                            self.expression(pointer, scope, pointer_ordinal)?
-                        else {
+                        let value = self.expression(pointer, scope, pointer_ordinal)?;
+                        // A named checked-field literal index always goes through
+                        // exact edge replay, including the one-known-parent case.
+                        let indexed_projection = matches!(place, ScalarPlace::Index { base, .. }
+                            if direct_checked_field_base(base).is_some());
+                        let ordinary_origins = match value {
+                            ReferenceValue::Checked(origins) if !indexed_projection => Some(origins),
+                            _ => None,
+                        };
+                        let Some(origins) = ordinary_origins else {
                             let binding = match pointer.as_ref() {
                                 ScalarExpression::Name { name, span } => {
                                     self.named_expression_binding(name, *span, pointer_ordinal)?
@@ -2746,13 +2753,6 @@ impl<'a> ReferenceFlowBuilder<'a> {
                                 ReferenceAnalysisErrorReason::MissingRequiredDereferenceOrigin,
                             ));
                         };
-                        // A checked-field literal index is authored only by the
-                        // exact joined issuance above, not by the general parent lane.
-                        if matches!(place, ScalarPlace::Index { base, .. } if direct_checked_field_base(base).is_some()) {
-                            return Err(self.missing_context(
-                                span, ReferenceAnalysisErrorReason::MissingRequiredDereferenceOrigin,
-                            ));
-                        }
                         reborrow = self.cursor;
                         if matches!(pointer.as_ref(), ScalarExpression::Name { .. })
                             && origins.len() == 1
@@ -7403,7 +7403,11 @@ fn checked_joined_reborrow_parents(
     states: &[ReferenceEdgeState],
     binding: &ReferenceBindingId,
 ) -> Option<Vec<ReferenceOriginId>> {
-    if !(2..=MAX_JOINED_REBORROW_PARENTS).contains(&states.len()) {
+    let minimum = if states.len() == 1 && matches!(&site.kind,
+        CfgPointKind::ReborrowThrough { place: ScalarPlace::Index { base, .. }, .. }
+            if direct_checked_field_base(base).is_some())
+    { 1 } else { 2 };
+    if !(minimum..=MAX_JOINED_REBORROW_PARENTS).contains(&states.len()) {
         return None;
     }
     let mut selected = Vec::with_capacity(states.len());
@@ -7423,7 +7427,7 @@ fn checked_joined_reborrow_parents(
         selected.push(id);
         owners.push(owner);
     }
-    if selected.len() < 2 {
+    if selected.len() < minimum {
         return None;
     }
     // Check exact same-scope lexical declarations with one shared prefix pass,
@@ -8369,7 +8373,11 @@ fn transfer_reference_facts(
         let named_parent = || cfg.named_reborrow_parents
             .binary_search_by_key(&id, |parent| parent.borrow)
             .ok().map(|index| &cfg.named_reborrow_parents[index]);
-        let joined_reborrow_binding = if strictly_forward && (2..=MAX_JOINED_REBORROW_PARENTS).contains(&incoming_count)
+        let joined_cardinality = (2..=MAX_JOINED_REBORROW_PARENTS).contains(&incoming_count)
+            || (incoming_count == 1 && matches!(&initial_point.kind,
+                CfgPointKind::ReborrowThrough { place: ScalarPlace::Index { base, .. }, .. }
+                    if direct_checked_field_base(base).is_some()));
+        let joined_reborrow_binding = if strictly_forward && joined_cardinality
             && cfg.joined_reborrow_descendants.binary_search(&id).is_err()
             && matches!(initial_point.kind, CfgPointKind::ReborrowThrough { .. })
         {
