@@ -1350,69 +1350,102 @@ fn structured_recursive_base_can_transfer_its_branch_local_allocation() {
 fn lexical_conditional_owner_choice_releases_selected_original_after_read() {
     let app = source("workbench", "src/local_receipt_choice.w");
     let text = include_str!("fixtures/structured-local-choice.w");
-    for (target, target_layout) in [("native64", ScalarTargetLayout::NATIVE64), ("wasm32", ScalarTargetLayout::WASM32)] {
-        for project in [false, true] {
-            let emit = |text: &str| {
-                let prepared = prepare_scalar_project(vec![(declarations(&app, text), vec![])],
-                    vec![app.clone()], ScalarPreparationInputs { target_layout }).unwrap();
-                let build = analyze_scalar_build(&prepared);
-                assert!(build.diagnostics().is_empty(), "{target}: {:?}", build.diagnostics());
-                if project { emit_scalar_build_project_llvm(&build) }
-                else { wosy_compiler::emit_scalar_build_single_module_llvm(&build) }.map(|module| module.to_text())
-            };
-            let ir = emit(text).unwrap_or_else(|error| panic!("{target}/{project}: {error}"));
-            let context = Context::create();
-            let module = context.create_module_from_ir(MemoryBuffer::create_from_memory_range_copy(ir.as_bytes(), target)).unwrap();
-            module.verify().unwrap();
-            let symbol = |name: &str| if project { function_with_suffix(&module, name) } else { name.to_owned() };
-            let find = |name| module.get_function(&symbol(name)).unwrap();
-            let drive = find("drive");
-            assert_eq!(drive.count_params(), 2, "lexical choice introduces no hidden result ABI");
-            let (short, long) = (find("make_short"), find("make_long"));
-            let mut writes = Vec::new();
-            let mut merges = Vec::new();
-            let mut reads = Vec::new();
-            let mut released = Vec::new();
-            for row in drive.get_basic_blocks().into_iter().flat_map(|block| block.get_instructions()) {
-                let arg = |slot| row.get_operand(slot).unwrap().value().unwrap();
-                if row.get_opcode() == InstructionOpcode::Phi && row.to_string().contains("phi ptr") {
-                    let incoming = (0..row.get_num_operands()).filter_map(|n| row.get_operand(n)?.value()).collect::<Vec<_>>();
-                    merges.push((inkwell::values::PhiValue::try_from(row).unwrap().as_basic_value(), incoming));
+    let consumed = text.replace("u64(u64, bool) drive", "u64(Packet) consume = fn(packet) { packet.length };\nu64(u64, bool) drive")
+        .replace("    chosen.length", "    consume(chosen)");
+    assert_ne!(consumed, text);
+    for (text, consuming) in [(text, false), (consumed.as_str(), true)] {
+        for (target, target_layout) in [("native64", ScalarTargetLayout::NATIVE64), ("wasm32", ScalarTargetLayout::WASM32)] {
+            for project in [false, true] {
+                let emit = |text: &str| {
+                    let prepared = prepare_scalar_project(vec![(declarations(&app, text), vec![])],
+                        vec![app.clone()], ScalarPreparationInputs { target_layout }).unwrap();
+                    let build = analyze_scalar_build(&prepared);
+                    assert!(build.diagnostics().is_empty(), "{target}: {:?}", build.diagnostics());
+                    if project { emit_scalar_build_project_llvm(&build) }
+                    else { wosy_compiler::emit_scalar_build_single_module_llvm(&build) }.map(|module| module.to_text())
+                };
+                let ir = emit(text).unwrap_or_else(|error| panic!("{target}/{project}: {error}"));
+                let context = Context::create();
+                let module = context.create_module_from_ir(MemoryBuffer::create_from_memory_range_copy(ir.as_bytes(), target)).unwrap();
+                module.verify().unwrap();
+                let symbol = |name: &str| if project { function_with_suffix(&module, name) } else { name.to_owned() };
+                let find = |name| module.get_function(&symbol(name)).unwrap();
+                let drive = find("drive");
+                assert_eq!(drive.count_params(), 2, "lexical choice introduces no hidden result ABI");
+                let (short, long) = (find("make_short"), find("make_long"));
+                let consumer = consuming.then(|| find("consume"));
+                let mut transfers = Vec::new();
+                let mut writes = Vec::new();
+                let mut merges = Vec::new();
+                let mut reads = Vec::new();
+                let mut released = Vec::new();
+                for row in drive.get_basic_blocks().into_iter().flat_map(|block| block.get_instructions()) {
+                    let arg = |slot| row.get_operand(slot).unwrap().value().unwrap();
+                    if row.get_opcode() == InstructionOpcode::Phi && row.to_string().contains("phi ptr") {
+                        let incoming = (0..row.get_num_operands()).filter_map(|n| row.get_operand(n)?.value()).collect::<Vec<_>>();
+                        merges.push((inkwell::values::PhiValue::try_from(row).unwrap().as_basic_value(), incoming));
+                    }
+                    if row.get_opcode() == InstructionOpcode::GetElementPtr {
+                        reads.push(arg(0));
+                    }
+                    if row.get_opcode() != InstructionOpcode::Call { continue; }
+                    let call = CallSiteValue::try_from(row).unwrap();
+                    let Some(callee) = call.get_called_fn_value() else { continue };
+                    if [short, long].contains(&callee) {
+                        writes.push((callee, arg(call.count_arguments() - 1), call.try_as_basic_value().basic().unwrap()));
+                    } else if Some(callee) == consumer {
+                        assert_eq!(call.count_arguments(), 2);
+                        transfers.push((arg(0), arg(1)));
+                    } else if callee.get_name().to_str().unwrap() == "__wosy_core_free" {
+                        released.push(arg(0));
+                    }
                 }
-                if row.get_opcode() == InstructionOpcode::GetElementPtr {
-                    reads.push(arg(0));
+                let [first, second] = writes.as_slice() else { panic!("one call per arm: {ir}") };
+                assert_ne!(first.0, second.0);
+                assert_eq!(first.1, second.1, "both arms must write one descriptor slot");
+
+                let [(selected, incoming)] = merges.as_slice() else { panic!("one backing join: {ir}") };
+                assert_ne!(*selected, first.1, "descriptor and backing must remain distinct");
+                assert_eq!(incoming.len(), 2);
+                assert!(incoming.contains(&first.2) && incoming.contains(&second.2));
+                if let Some(consumer) = consumer {
+                    assert!(released.is_empty(), "the caller transferred rather than freed the receipt");
+                    assert_eq!(transfers, [(first.1, *selected)], "pass the descriptor and its independent backing");
+                    let frees = consumer.get_basic_blocks().into_iter().flat_map(|block| block.get_instructions())
+                        .filter_map(|row| {
+                            let call = CallSiteValue::try_from(row).ok()?;
+                            (call.get_called_fn_value()?.get_name().to_str().ok()? == "__wosy_core_free")
+                                .then(|| row.get_operand(0).unwrap().value().unwrap())
+                        }).collect::<Vec<_>>();
+                    assert_eq!(frees, [consumer.get_last_param().unwrap()]);
+                } else {
+                    assert!(reads.contains(&first.1), "final field observation must use that slot");
+                    assert_eq!(&released, &[*selected], "free only the selected original backing");
                 }
-                if row.get_opcode() != InstructionOpcode::Call { continue; }
-                let call = CallSiteValue::try_from(row).unwrap();
-                let Some(callee) = call.get_called_fn_value() else { continue };
-                if [short, long].contains(&callee) {
-                    writes.push((callee, arg(call.count_arguments() - 1), call.try_as_basic_value().basic().unwrap()));
-                } else if callee.get_name().to_str().unwrap() == "__wosy_core_free" {
-                    released.push(arg(0));
+                if let Some(out) = std::env::var_os("WOSY_NAMED_FACTORY_IR_DIR") {
+                    let use_site = if consuming { "consume" } else { "choice" };
+                    let route = if project { "project" } else { "single" };
+                    let out = std::path::PathBuf::from(out).join(format!("lexical-{use_site}-{route}"));
+                    std::fs::create_dir_all(&out).unwrap();
+                    let mut witness = ir.replace("@main(", "@wosy_authored_main(");
+                    for name in ["case_zero", "case_two", "case_three"] {
+                        witness.push_str(&format!("\ndefine i64 @wosy_{name}() {{\nentry:\n  %v = call i64 @{}()\n  ret i64 %v\n}}\n", symbol(name)));
+                    }
+                    std::fs::write(out.join(format!("{target}.ll")), witness).unwrap();
+                }
+                if consuming {
+                    let forward = text.replace("u64(Packet) consume = fn(packet) { packet.length };",
+                        "u64(Packet) terminal = fn(packet) { packet.length };\nu64(Packet) consume = fn(packet) { terminal(packet) };");
+                    assert_ne!(forward, text);
+                    assert!(emit(&forward).expect_err("the joined owner must reach a proved terminal consumer")
+                        .contains("local conditional owner requires a proved terminal consumer"));
+                } else {
+                    let extra = text.replace("    chosen.length\n", "    u64 observed = chosen.length;\n    observed\n");
+                    assert_ne!(extra, text);
+                    assert!(emit(&extra).expect_err("the extra binding is outside the exact observation-and-release corridor")
+                        .contains("aggregate owning call has no proved endpoint"));
                 }
             }
-            let [first, second] = writes.as_slice() else { panic!("one call per arm: {ir}") };
-            assert_ne!(first.0, second.0);
-            assert_eq!(first.1, second.1, "both arms must write one descriptor slot");
-            assert!(reads.contains(&first.1), "final field observation must use that slot");
-            let [(selected, incoming)] = merges.as_slice() else { panic!("one backing join: {ir}") };
-            assert_ne!(*selected, first.1, "descriptor and backing must remain distinct");
-            assert_eq!(incoming.len(), 2);
-            assert!(incoming.contains(&first.2) && incoming.contains(&second.2));
-            assert_eq!(&released, &[*selected], "free only the selected original backing");
-            if let Some(out) = std::env::var_os("WOSY_NAMED_FACTORY_IR_DIR") {
-                let out = std::path::PathBuf::from(out).join(if project { "lexical-choice-project" } else { "lexical-choice-single" });
-                std::fs::create_dir_all(&out).unwrap();
-                let mut witness = ir.replace("@main(", "@wosy_authored_main(");
-                for name in ["case_zero", "case_two", "case_three"] {
-                    witness.push_str(&format!("\ndefine i64 @wosy_{name}() {{\nentry:\n  %v = call i64 @{}()\n  ret i64 %v\n}}\n", symbol(name)));
-                }
-                std::fs::write(out.join(format!("{target}.ll")), witness).unwrap();
-            }
-            let extra = text.replace("    chosen.length\n", "    u64 observed = chosen.length;\n    observed\n");
-            assert_ne!(extra, text);
-            assert!(emit(&extra).expect_err("the extra binding is outside the exact observation-and-release corridor")
-                .contains("aggregate owning call has no proved endpoint"));
         }
     }
 }
