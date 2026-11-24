@@ -3822,7 +3822,7 @@ fn closed_aggregates<'a>(
     let mut pending = Vec::new();
     let mut callers = BTreeMap::<BodyKey, Vec<BodyKey>>::new();
     let mut forward_edges = BTreeMap::new();
-    let mut conditional_forward_edges = BTreeMap::new();
+    let mut conditional_forward_edges = BTreeMap::<_, BTreeSet<_>>::new();
     let mut modes = BTreeMap::<(BodyKey, usize), (bool, bool)>::new();
     let mut seed_targets = BTreeMap::<BodyKey, BTreeSet<(BodyKey, usize)>>::new();
     let mut input_users = BTreeMap::<(BodyKey, usize), Vec<(BodyKey, CfgPointId, usize, ArgumentProvenance, &BTreeSet<Option<InputOrigin>>) >>::new();
@@ -3906,7 +3906,7 @@ fn closed_aggregates<'a>(
                         if let Some(&(formal, _, _, _, _)) = facts.conditional_formal_forwards.iter()
                             .find(|&&(_, call, forward_ordinal, forward_slot, _)| (point, ordinal, slot) == (call, forward_ordinal, forward_slot))
                         {
-                            conditional_forward_edges.insert((key, formal), (target, slot));
+                            conditional_forward_edges.entry((key, formal)).or_default().insert((target, slot));
                         }
                     }
                 }
@@ -4257,13 +4257,16 @@ fn closed_aggregates<'a>(
         }
     }
     while let Some(formal) = demand.pop() {
-        let Some(next) = forward_edges.get(&formal).or_else(|| conditional_forward_edges.get(&formal)) else { continue };
         let source = modes[&formal];
-        let dest = modes.get_mut(next).ok_or_else(|| "missing forwarded formal input use".to_owned())?;
-        let combined = (dest.0 || source.0, dest.1 || source.1);
-        if *dest != combined {
-            *dest = combined;
-            demand.push(*next);
+        for next in forward_edges.get(&formal).into_iter()
+            .chain(conditional_forward_edges.get(&formal).into_iter().flatten())
+        {
+            let dest = modes.get_mut(next).ok_or_else(|| "missing forwarded formal input use".to_owned())?;
+            let combined = (dest.0 || source.0, dest.1 || source.1);
+            if *dest != combined {
+                *dest = combined;
+                demand.push(*next);
+            }
         }
     }
     // A body with a conditional formal may also close ordinary local receipts.
@@ -4276,6 +4279,7 @@ fn closed_aggregates<'a>(
     let mut conditional_input_certificates = BTreeMap::new();
     let mut forward_predecessors = BTreeMap::<_, Vec<_>>::new();
     let mut terminal_formals = Vec::new();
+    let mut unproved_successor_counts = BTreeMap::new();
     let mut proven_read_views = BTreeSet::new();
     for ((callee, slot), users) in input_users {
         let (owned, mixed) = modes[&(callee, slot)];
@@ -4312,14 +4316,16 @@ fn closed_aggregates<'a>(
                 return Err(format!("aggregate owning formal has both release and transfer in {:?} at slot {slot}", body.source));
             }
             forward_predecessors.entry(next).or_default().push((callee, slot));
+            unproved_successor_counts.insert((callee, slot), 1);
             None
-        } else if let Some(&next) = conditional_forward_edges.get(&(callee, slot)) {
+        } else if let Some(next) = conditional_forward_edges.get(&(callee, slot)) {
             let unsupported = || format!(
                 "aggregate owning formal conditional transfer has no exact release route in {:?} at slot {slot}",
                 body.source,
             );
-            if mixed || modes[&next].1 || forward_edges.contains_key(&next)
-                || conditional_forward_edges.contains_key(&next) || !facts.raw_uses.is_empty()
+            if mixed || next.iter().any(|target| modes[target] != (true, false)
+                    || forward_edges.contains_key(target) || conditional_forward_edges.contains_key(target))
+                || !facts.raw_uses.is_empty()
                 || !ordinary_formal_outputs(&body.sites.boundary.root_outputs)
             {
                 return Err(unsupported());
@@ -4331,8 +4337,9 @@ fn closed_aggregates<'a>(
                 points, &facts.conditional_input_regions, &facts.conditional_input_barriers,
             );
             let prove_arm = |&(formal, consumer, _, to_slot, moved): &(usize, CfgPointId, usize, usize, CfgPointId)| {
-                if formal != slot || target_body(&declarations, body.cfg, consumer) != Some(next.0)
-                    || to_slot != next.1 || certificate.paths[moved.0] != certificate.paths[consumer.0]
+                let target = target_body(&declarations, body.cfg, consumer)?;
+                if formal != slot || !next.contains(&(target, to_slot))
+                    || certificate.paths[moved.0] != certificate.paths[consumer.0]
                 { return None; }
                 let (fork, side, boundary) = certificate.consuming_arm(
                     points, points[0].id, consumer, endpoint.map(|((exit, _), _)| exit),
@@ -4366,7 +4373,10 @@ fn closed_aggregates<'a>(
                 _ => return Err(unsupported()),
             };
             conditional_input_certificates.insert(callee, certificate);
-            forward_predecessors.entry(next).or_default().push((callee, slot));
+            for &target in next {
+                forward_predecessors.entry(target).or_default().push((callee, slot));
+            }
+            unproved_successor_counts.insert((callee, slot), next.len());
             release
         } else {
             let Some((endpoint, always)) = exits.next() else {
@@ -4395,7 +4405,8 @@ fn closed_aggregates<'a>(
                             && bodies[&caller].facts.is_some_and(|facts| facts.checked_successor_result))) =>
                         ClosedInput::ForwardFormal(*formal),
                 Some(Some(InputOrigin::ConditionalFormal(formal))) if matches!(moved, ArgumentProvenance::WholeMove(_))
-                    && conditional_forward_edges.get(&(caller, *formal)) == Some(&(callee, slot))
+                    && conditional_forward_edges.get(&(caller, *formal))
+                        .is_some_and(|targets| targets.contains(&(callee, slot)))
                     && modes.get(&(caller, *formal)) == Some(&(true, false))
                     && !mixed && release.is_some() && facts.raw_uses.is_empty()
                     && ordinary_formal_outputs(&body.sites.boundary.root_outputs) =>
@@ -4460,10 +4471,17 @@ fn closed_aggregates<'a>(
     }
     while let Some(terminal) = terminal_formals.pop() {
         if let Some(predecessors) = forward_predecessors.remove(&terminal) {
-            terminal_formals.extend(predecessors);
+            for predecessor in predecessors {
+                let count = unproved_successor_counts.get_mut(&predecessor).expect("indexed owning formal predecessor");
+                *count -= 1;
+                if *count == 0 {
+                    unproved_successor_counts.remove(&predecessor);
+                    terminal_formals.push(predecessor);
+                }
+            }
         }
     }
-    if !forward_predecessors.is_empty() {
+    if !unproved_successor_counts.is_empty() || !forward_predecessors.is_empty() {
         return Err("aggregate owning formal transfer does not reach a proved release".into());
     }
     let is_closed_symbol = |source: &SourceIdentity, span| {

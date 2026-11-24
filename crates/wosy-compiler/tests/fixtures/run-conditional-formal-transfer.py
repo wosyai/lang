@@ -55,8 +55,11 @@ int main(void) { return check(); }
 if sys.argv[3:] == ["exhaustive"]:
     runtime = runtime.replace("wosy_case_two() != 33", "wosy_case_two() != 34")
     runtime = runtime.replace("wosy_case_three() != 335", "wosy_case_three() != 345")
+elif sys.argv[3:] == ["two-sinks"]:
+    runtime = runtime.replace("wosy_case_two() != 33", "wosy_case_two() != 42")
+    runtime = runtime.replace("wosy_case_three() != 335", "wosy_case_three() != 425")
 elif sys.argv[3:]:
-    raise SystemExit("optional third argument must be exhaustive")
+    raise SystemExit("optional third argument must be exhaustive or two-sinks")
 
 with tempfile.TemporaryDirectory(prefix="conditional-receipt-", dir=ir_dir) as tmp:
     work = Path(tmp)
