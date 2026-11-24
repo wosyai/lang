@@ -17,6 +17,7 @@ enum Expected {
     LiveFamilyConflict,
     LiveMutableConflict,
     FrozenMutableConflict,
+    LiveExclusiveConflict,
     Declined,
 }
 
@@ -56,9 +57,9 @@ fn check_case(text: &str, expected: Expected, witness_dir: Option<&str>) {
                     }), "{target}/{route}: {diagnostics:?}");
                 }
                 Expected::Declined => assert!(diagnostics.iter().any(|item| item.code == "B0003"), "{target}/{route}: {diagnostics:?}"),
-                Expected::LiveConflict | Expected::LiveSelectedFieldConflict | Expected::LiveSelectedIndexConflict | Expected::LiveDescendantConflict | Expected::LiveFamilyConflict | Expected::LiveMutableConflict | Expected::FrozenMutableConflict => {
+                Expected::LiveConflict | Expected::LiveSelectedFieldConflict | Expected::LiveSelectedIndexConflict | Expected::LiveDescendantConflict | Expected::LiveFamilyConflict | Expected::LiveMutableConflict | Expected::FrozenMutableConflict | Expected::LiveExclusiveConflict => {
                     let write = match expected {
-                        Expected::FrozenMutableConflict => "*child = seen + 4",
+                        Expected::FrozenMutableConflict | Expected::LiveExclusiveConflict => "*child = seen + 4",
                         Expected::LiveSelectedFieldConflict => "owner.left = 3",
                         Expected::LiveSelectedIndexConflict => "bytes[0] = 3",
                         _ => "first = 3",
@@ -67,7 +68,7 @@ fn check_case(text: &str, expected: Expected, witness_dir: Option<&str>) {
                     let exact_operand = match expected {
                         // Indirect stores first read their checked holder; a direct
                         // projected store is diagnosed at its resolved field token.
-                        Expected::FrozenMutableConflict => Some((1, "child".len())),
+                        Expected::FrozenMutableConflict | Expected::LiveExclusiveConflict => Some((1, "child".len())),
                         Expected::LiveSelectedFieldConflict => Some(("owner.".len(), "left".len())),
                         Expected::LiveSelectedIndexConflict => Some((0, "bytes".len())),
                         _ => None,
@@ -78,6 +79,7 @@ fn check_case(text: &str, expected: Expected, witness_dir: Option<&str>) {
                         Expected::LiveFamilyConflict => "&(*left)",
                         Expected::LiveMutableConflict => "&!(*parent)",
                         Expected::FrozenMutableConflict => "&(*child)",
+                        Expected::LiveExclusiveConflict => "&!(*child)",
                         _ => "&(*parent)",
                     };
                     let child = text.find(loan).expect("child reborrow") as u32;
@@ -340,9 +342,26 @@ fn joined_mutable_child_updates_only_its_selected_lexical_owner() {
     assert_ne!(live, program);
     check(&live, Expected::LiveMutableConflict);
 
-    let descendant = program.replace("u8 changed = *child;", "*!u8 nested = &!(*child); u8 changed = *nested;");
-    assert_ne!(descendant, program);
-    check(&descendant, Expected::Declined);
+}
+
+#[test]
+fn joined_exclusive_descendant_transfers_scalar_write_until_last_use() {
+    let program = joined("parent = &!second;", true, "",
+        "*!u8 nested = &!(*child); *nested = seen + 2; u8 during = *nested; *child = seen + 4; \
+         u8 changed = *child; u8 left = first; u8 right = second;")
+        .replace("*u8 child = &(*parent);", "*!u8 child = &!(*parent);")
+        .replace("    seen\n", "    if (choose) { if (during == 9 && changed == 11 && left == 11 && right == 9) { seen } else { 0 } } else { if (during == 11 && changed == 13 && left == 7 && right == 13) { seen } else { 0 } }\n");
+    check_case(&program, Expected::Valid, Some("WOSY_JOINED_EXCLUSIVE_IR_DIR"));
+
+    let live = program.replace("u8 during = *nested; *child = seen + 4;",
+        "*child = seen + 4; u8 during = *nested;");
+    assert_ne!(live, program);
+    check(&live, Expected::LiveExclusiveConflict);
+
+    let second = program.replace("*child = seen + 4; u8 changed = *child;",
+        "*!u8 again = &!(*child); *again = seen + 4; u8 changed = *again;");
+    assert_ne!(second, program);
+    check(&second, Expected::Declined);
 }
 
 #[test]

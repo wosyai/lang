@@ -2650,7 +2650,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             }
                             let joined_mode = if !self.has_joined_root_reborrow {
                                 Some(ScalarReferenceMutability::Mutable)
-                            } else if self.proof_points.joined_shared_descendants.len() < MAX_JOINED_REBORROW_DESCENDANTS {
+                            } else if self.proof_points.joined_reborrow_descendants.len() < MAX_JOINED_REBORROW_DESCENDANTS {
                                 Some(if self.joined_mutable_child.as_ref() == Some(&binding) {
                                     ScalarReferenceMutability::Mutable
                                 } else {
@@ -2659,7 +2659,8 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             } else {
                                 None
                             };
-                            if (*mutability == ScalarReferenceMutability::Shared || !self.has_joined_root_reborrow)
+                            if (*mutability == ScalarReferenceMutability::Shared || !self.has_joined_root_reborrow
+                                || self.joined_mutable_child.as_ref() == Some(&binding))
                                 && matches!(place, ScalarPlace::Dereference { .. })
                                 && matches!(self.binding_types.get(&binding),
                                     Some(ScalarType::CheckedReference { mutability, inner })
@@ -2678,7 +2679,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                                     span, scope, None,
                                 );
                                 if self.has_joined_root_reborrow {
-                                    self.proof_points.joined_shared_descendants.push(point);
+                                    self.proof_points.joined_reborrow_descendants.push(point);
                                 } else {
                                     self.has_joined_root_reborrow = true;
                                 }
@@ -3889,6 +3890,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         {
                             self.proof_points.checked_binding_initializers.push((bind, value));
                             if self.has_joined_root_reborrow && receiver == 0
+                                && self.joined_mutable_child.is_none()
                                 && matches!(ty, ScalarType::CheckedReference {
                                     mutability: ScalarReferenceMutability::Mutable, inner,
                                 } if aggregate::ordinary_value(inner))
@@ -6818,7 +6820,7 @@ struct ReferenceTransferCfg<'a> {
     checked_binding_initializers: &'a [(CfgPointId, CfgPointId)],
     resolved_checked_call_outputs: &'a [CfgPointId],
     checked_pointee_reads: &'a [CfgPointId],
-    joined_shared_descendants: &'a [CfgPointId],
+    joined_reborrow_descendants: &'a [CfgPointId],
     joined_shared_aliases: &'a [(CfgPointId, CfgPointId)],
     shared_scalar_read_calls: &'a [(CfgPointId, CfgPointId)],
     checked_named_scalar_stores: &'a [CfgPointId],
@@ -6849,7 +6851,7 @@ impl<'a> ReferenceTransferCfg<'a> {
             checked_binding_initializers: proof.map_or(&[], |proof| &proof.checked_binding_initializers),
             resolved_checked_call_outputs: proof.map_or(&[], |proof| &proof.resolved_checked_call_outputs),
             checked_pointee_reads: proof.map_or(&[], |proof| &proof.checked_pointee_reads),
-            joined_shared_descendants: proof.map_or(&[], |proof| &proof.joined_shared_descendants),
+            joined_reborrow_descendants: proof.map_or(&[], |proof| &proof.joined_reborrow_descendants),
             joined_shared_aliases: proof.map_or(&[], |proof| &proof.joined_shared_aliases),
             shared_scalar_read_calls: proof.map_or(&[], |proof| &proof.shared_scalar_read_calls),
             checked_named_scalar_stores: proof.map_or(&[], |proof| &proof.checked_named_scalar_stores),
@@ -7118,6 +7120,7 @@ fn joined_root_reborrow_binding<'a>(
     let mut holders = HashMap::from([(child_binding, point.id)]);
     let mut descendants = BTreeMap::new();
     let mut alias_count = 0;
+    let mut exclusive_descendant = false;
     let mut next_pointee = &pointee_reads[pointee_reads.partition_point(|id| *id <= child.id)..];
     for rest in points.get(child.id.0 + 1..)? {
         match &rest.kind {
@@ -7132,11 +7135,21 @@ fn joined_root_reborrow_binding<'a>(
                     return None;
                 }
                 let birth = holders[holder];
-                let writable = mutable && birth == point.id;
+                let writable = matches!(points.get(birth.0)?.kind, CfgPointKind::ReborrowThrough {
+                    mode: ScalarReferenceMutability::Mutable, ..
+                });
                 if let CfgPointKind::ReborrowThrough {
-                    mode: ScalarReferenceMutability::Shared, place: ScalarPlace::Dereference { pointer, .. }, pointer_point,
+                    mode, place: ScalarPlace::Dereference { pointer, .. }, pointer_point,
                 } = &deref.kind
                 {
+                    if *mode == ScalarReferenceMutability::Mutable {
+                        if !mutable || birth != point.id || exclusive_descendant {
+                            return None;
+                        }
+                        exclusive_descendant = true;
+                    } else if writable && birth != point.id {
+                        return None;
+                    }
                     if descendant_sites.binary_search(&deref.id).is_err()
                         || *pointer_point != rest.id || !matches!(pointer.as_ref(), ScalarExpression::Name { span, .. }
                             if *span == rest.source_span.range)
@@ -8207,12 +8220,12 @@ fn transfer_reference_facts(
             .binary_search_by_key(&id, |parent| parent.borrow)
             .ok().map(|index| &cfg.named_reborrow_parents[index]);
         let joined_reborrow_binding = if strictly_forward && incoming_count == 2
-            && cfg.joined_shared_descendants.binary_search(&id).is_err()
+            && cfg.joined_reborrow_descendants.binary_search(&id).is_err()
             && matches!(initial_point.kind, CfgPointKind::ReborrowThrough { .. })
         {
             joined_root_reborrow_binding(
                 original_points, initial_point, cfg.checked_binding_initializers, cfg.checked_pointee_reads,
-                cfg.joined_shared_aliases, cfg.joined_shared_descendants, cfg.shared_scalar_read_calls,
+                cfg.joined_shared_aliases, cfg.joined_reborrow_descendants, cfg.shared_scalar_read_calls,
                 cfg.checked_named_scalar_stores, &grouped_installs, cfg.raw_address_exposures,
             )
         } else {
@@ -13813,7 +13826,7 @@ fn derive_function_specialized_copy_policies<'a>(
                     checked_binding_initializers: &template_result.proof_points.checked_binding_initializers,
                     resolved_checked_call_outputs: &template_result.proof_points.resolved_checked_call_outputs,
                     checked_pointee_reads: &template_result.proof_points.checked_pointee_reads,
-                    joined_shared_descendants: &template_result.proof_points.joined_shared_descendants,
+                    joined_reborrow_descendants: &template_result.proof_points.joined_reborrow_descendants,
                     joined_shared_aliases: &template_result.proof_points.joined_shared_aliases,
                     shared_scalar_read_calls: &template_result.proof_points.shared_scalar_read_calls,
                     checked_named_scalar_stores: &template_result.proof_points.checked_named_scalar_stores,
