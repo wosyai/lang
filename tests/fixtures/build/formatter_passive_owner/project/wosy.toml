@@ -1,0 +1,357 @@
+[package]
+name = "formatter_passive_owner"
+default_target = "nested-native"
+
+[dependencies.std]
+path = "stdlib"
+
+[comments]
+categories = []
+
+[builders.native]
+command = ["python", "scripts/build.py", "native"]
+args = []
+toolchain_identity = "llvm-18.1.4"
+
+[builders.wasm]
+command = ["python", "scripts/build.py", "wasm"]
+args = []
+toolchain_identity = "llvm-18.1.4"
+
+[runners.native]
+command = ["python", "scripts/run.py", "native"]
+args = []
+
+[runners.wasm]
+command = ["python", "scripts/run.py", "wasm"]
+args = []
+
+[targets.nested-native]
+root = "src/nested.w"
+
+[targets.nested-native.artifacts.main]
+artifact = "Main"
+
+[targets.nested-native.artifacts.main.profiles.dev]
+backend = "llvm"
+output = "native"
+builder = "native"
+run_runner = "native"
+
+[targets.nested-native.profiles.dev]
+main_artifact = "main"
+
+[targets.nested-wasm]
+root = "src/nested.w"
+
+[targets.nested-wasm.artifacts.main]
+artifact = "Main"
+
+[targets.nested-wasm.artifacts.main.profiles.dev]
+backend = "llvm"
+output = "wasm-wasip1"
+builder = "wasm"
+run_runner = "wasm"
+
+[targets.nested-wasm.profiles.dev]
+main_artifact = "main"
+
+[targets.named-native]
+root = "src/named.w"
+
+[targets.named-native.artifacts.main]
+artifact = "Main"
+
+[targets.named-native.artifacts.main.profiles.dev]
+backend = "llvm"
+output = "native"
+builder = "native"
+run_runner = "native"
+
+[targets.named-native.profiles.dev]
+main_artifact = "main"
+
+[targets.named-wasm]
+root = "src/named.w"
+
+[targets.named-wasm.artifacts.main]
+artifact = "Main"
+
+[targets.named-wasm.artifacts.main.profiles.dev]
+backend = "llvm"
+output = "wasm-wasip1"
+builder = "wasm"
+run_runner = "wasm"
+
+[targets.named-wasm.profiles.dev]
+main_artifact = "main"
+
+[targets.controls-native]
+root = "src/controls.w"
+
+[targets.controls-native.artifacts.main]
+artifact = "Main"
+
+[targets.controls-native.artifacts.main.profiles.dev]
+backend = "llvm"
+output = "native"
+builder = "native"
+run_runner = "native"
+
+[targets.controls-native.profiles.dev]
+main_artifact = "main"
+
+[targets.controls-wasm]
+root = "src/controls.w"
+
+[targets.controls-wasm.artifacts.main]
+artifact = "Main"
+
+[targets.controls-wasm.artifacts.main.profiles.dev]
+backend = "llvm"
+output = "wasm-wasip1"
+builder = "wasm"
+run_runner = "wasm"
+
+[targets.controls-wasm.profiles.dev]
+main_artifact = "main"
+
+[targets.initializer-native]
+root = "src/initializer.w"
+
+[targets.initializer-native.artifacts.main]
+artifact = "Main"
+
+[targets.initializer-native.artifacts.main.profiles.dev]
+backend = "llvm"
+output = "native"
+builder = "native"
+run_runner = "native"
+
+[targets.initializer-native.profiles.dev]
+main_artifact = "main"
+
+[targets.initializer-wasm]
+root = "src/initializer.w"
+
+[targets.initializer-wasm.artifacts.main]
+artifact = "Main"
+
+[targets.initializer-wasm.artifacts.main.profiles.dev]
+backend = "llvm"
+output = "wasm-wasip1"
+builder = "wasm"
+run_runner = "wasm"
+
+[targets.initializer-wasm.profiles.dev]
+main_artifact = "main"
+
+[targets.checked-parse-native]
+root = "src/checked_parse.w"
+
+[targets.checked-parse-native.artifacts.main]
+artifact = "Main"
+
+[targets.checked-parse-native.artifacts.main.profiles.dev]
+backend = "llvm"
+output = "native"
+builder = "native"
+run_runner = "native"
+
+[targets.checked-parse-native.profiles.dev]
+main_artifact = "main"
+
+[targets.checked-parse-wasm]
+root = "src/checked_parse.w"
+
+[targets.checked-parse-wasm.artifacts.main]
+artifact = "Main"
+
+[targets.checked-parse-wasm.artifacts.main.profiles.dev]
+backend = "llvm"
+output = "wasm-wasip1"
+builder = "wasm"
+run_runner = "wasm"
+
+[targets.checked-parse-wasm.profiles.dev]
+main_artifact = "main"
+
+[targets.forwarded-native]
+root = "src/forwarded.w"
+
+[targets.forwarded-native.artifacts.main]
+artifact = "Main"
+
+[targets.forwarded-native.artifacts.main.profiles.dev]
+backend = "llvm"
+output = "native"
+builder = "native"
+run_runner = "native"
+
+[targets.forwarded-native.profiles.dev]
+main_artifact = "main"
+
+[targets.forwarded-wasm]
+root = "src/forwarded.w"
+
+[targets.forwarded-wasm.artifacts.main]
+artifact = "Main"
+
+[targets.forwarded-wasm.artifacts.main.profiles.dev]
+backend = "llvm"
+output = "wasm-wasip1"
+builder = "wasm"
+run_runner = "wasm"
+
+[targets.forwarded-wasm.profiles.dev]
+main_artifact = "main"
+
+[targets.parameter-native]
+root = "src/parameter.w"
+
+[targets.parameter-native.artifacts.main]
+artifact = "Main"
+
+[targets.parameter-native.artifacts.main.profiles.dev]
+backend = "llvm"
+output = "native"
+builder = "native"
+run_runner = "native"
+
+[targets.parameter-native.profiles.dev]
+main_artifact = "main"
+
+[targets.parameter-wasm]
+root = "src/parameter.w"
+
+[targets.parameter-wasm.artifacts.main]
+artifact = "Main"
+
+[targets.parameter-wasm.artifacts.main.profiles.dev]
+backend = "llvm"
+output = "wasm-wasip1"
+builder = "wasm"
+run_runner = "wasm"
+
+[targets.parameter-wasm.profiles.dev]
+main_artifact = "main"
+
+[targets.parameter-relay-native]
+root = "src/parameter_relay.w"
+
+[targets.parameter-relay-native.artifacts.main]
+artifact = "Main"
+
+[targets.parameter-relay-native.artifacts.main.profiles.dev]
+backend = "llvm"
+output = "native"
+builder = "native"
+run_runner = "native"
+
+[targets.parameter-relay-native.profiles.dev]
+main_artifact = "main"
+
+[targets.parameter-relay-wasm]
+root = "src/parameter_relay.w"
+
+[targets.parameter-relay-wasm.artifacts.main]
+artifact = "Main"
+
+[targets.parameter-relay-wasm.artifacts.main.profiles.dev]
+backend = "llvm"
+output = "wasm-wasip1"
+builder = "wasm"
+run_runner = "wasm"
+
+[targets.parameter-relay-wasm.profiles.dev]
+main_artifact = "main"
+
+[targets.lexical-move-native]
+root = "src/lexical_move.w"
+
+[targets.lexical-move-native.artifacts.main]
+artifact = "Main"
+
+[targets.lexical-move-native.artifacts.main.profiles.dev]
+backend = "llvm"
+output = "native"
+builder = "native"
+run_runner = "native"
+
+[targets.lexical-move-native.profiles.dev]
+main_artifact = "main"
+
+[targets.lexical-move-wasm]
+root = "src/lexical_move.w"
+
+[targets.lexical-move-wasm.artifacts.main]
+artifact = "Main"
+
+[targets.lexical-move-wasm.artifacts.main.profiles.dev]
+backend = "llvm"
+output = "wasm-wasip1"
+builder = "wasm"
+run_runner = "wasm"
+
+[targets.lexical-move-wasm.profiles.dev]
+main_artifact = "main"
+
+[targets.raw-view-native]
+root = "src/raw_view.w"
+
+[targets.raw-view-native.artifacts.main]
+artifact = "Main"
+
+[targets.raw-view-native.artifacts.main.profiles.dev]
+backend = "llvm"
+output = "native"
+builder = "native"
+run_runner = "native"
+
+[targets.raw-view-native.profiles.dev]
+main_artifact = "main"
+
+[targets.raw-view-wasm]
+root = "src/raw_view.w"
+
+[targets.raw-view-wasm.artifacts.main]
+artifact = "Main"
+
+[targets.raw-view-wasm.artifacts.main.profiles.dev]
+backend = "llvm"
+output = "wasm-wasip1"
+builder = "wasm"
+run_runner = "wasm"
+
+[targets.raw-view-wasm.profiles.dev]
+main_artifact = "main"
+
+[targets.lexical-move-stale-native]
+root = "src/lexical_move_stale.w"
+
+[targets.lexical-move-stale-native.artifacts.main]
+artifact = "Main"
+
+[targets.lexical-move-stale-native.artifacts.main.profiles.dev]
+backend = "llvm"
+output = "native"
+builder = "native"
+run_runner = "native"
+
+[targets.lexical-move-stale-native.profiles.dev]
+main_artifact = "main"
+
+[targets.lexical-move-stale-wasm]
+root = "src/lexical_move_stale.w"
+
+[targets.lexical-move-stale-wasm.artifacts.main]
+artifact = "Main"
+
+[targets.lexical-move-stale-wasm.artifacts.main.profiles.dev]
+backend = "llvm"
+output = "wasm-wasip1"
+builder = "wasm"
+run_runner = "wasm"
+
+[targets.lexical-move-stale-wasm.profiles.dev]
+main_artifact = "main"

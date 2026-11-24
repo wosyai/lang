@@ -1,0 +1,21 @@
+#!/usr/bin/env python3
+import json
+import os
+import subprocess
+import sys
+
+manifest_path = sys.argv[1]
+separator = sys.argv.index("--")
+arguments = sys.argv[separator + 1:]
+with open(manifest_path, encoding="utf-8") as file:
+    manifest = json.load(file)
+if sys.platform == "linux":
+    import resource
+
+    stack = (1 << 20, 1 << 20)
+    resource.setrlimit(resource.RLIMIT_STACK, stack)
+    if resource.getrlimit(resource.RLIMIT_STACK) != stack:
+        raise RuntimeError("expected exact 1 MiB soft and hard stack limits")
+    os.execv(manifest["executable"], [manifest["executable"], *arguments])
+result = subprocess.run([manifest["executable"], *arguments])
+sys.exit(result.returncode)

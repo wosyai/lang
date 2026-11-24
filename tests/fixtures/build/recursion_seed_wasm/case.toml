@@ -1,0 +1,19 @@
+[[steps]]
+command = ["wosy", "build", "app"]
+exit = 0
+
+[[assert]]
+command = ["wosy", "run", "app"]
+stdin = [3]
+exit = 0
+stdout = "expected/empty"
+stderr = "expected/empty"
+exact = true
+
+[[assert]]
+command = ["wosy", "run", "app"]
+stdin = [64]
+exit = 0
+stdout = "expected/empty"
+stderr = "expected/empty"
+exact = true

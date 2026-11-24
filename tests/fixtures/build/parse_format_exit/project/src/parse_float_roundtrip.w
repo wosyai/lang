@@ -48,7 +48,7 @@ unit() check_roundtrip_f64 = fn {
 	*f64 v_base = std.parse(t_base);
 	f64 original = *v_base;
 	std.utf8 text = std.format(original);
-	std.print(text);
+	std.print(std.format(original));
 	std.print("\n");
 	*f64 parsed = std.parse(text);
 	f64 value = *parsed;
@@ -64,7 +64,7 @@ unit() check_roundtrip_f64_neg = fn {
 	*f64 v_base = std.parse(t_base);
 	f64 original = *v_base;
 	std.utf8 text = std.format(original);
-	std.print(text);
+	std.print(std.format(original));
 	std.print("\n");
 	*f64 parsed = std.parse(text);
 	f64 value = *parsed;
@@ -80,7 +80,7 @@ unit() check_roundtrip_f32 = fn {
 	*f32 v_base = std.parse(t_base);
 	f32 original = *v_base;
 	std.utf8 text = std.format(original);
-	std.print(text);
+	std.print(std.format(original));
 	std.print("\n");
 	*f32 parsed = std.parse(text);
 	f32 value = *parsed;

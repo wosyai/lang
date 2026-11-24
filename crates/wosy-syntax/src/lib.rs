@@ -1,7 +1,8 @@
 use pest::iterators::Pair;
 use pest::Parser;
 use rowan::{GreenNodeBuilder, Language, SyntaxNode, SyntaxToken};
-use serde::{Deserialize, Serialize};
+use serde::ser::{SerializeSeq, SerializeStruct};
+use serde::{Deserialize, Serialize, Serializer};
 
 #[derive(pest_derive::Parser)]
 #[grammar = "grammar.pest"]
@@ -50,8 +51,7 @@ pub enum SyntaxKind {
     QualifiedMember,
     AssignmentTarget,
     LocalBinding,
-    While,
-    Assignment,
+    Assignment = 41,
     TopLevelItem,
     StructDecl,
     StructField,
@@ -89,6 +89,12 @@ pub enum SyntaxKind {
     EnumVariant,
     ErasedArraySuffix,
     AllocationBinding,
+    ParenthesizedDereferencePlace,
+    CopyModifier,
+    IndexFieldSuffix,
+    DirectFieldChainTail,
+    ValueField,
+    InvalidTemporaryPlace,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -139,7 +145,6 @@ impl Language for WosyLanguage {
             37 => SyntaxKind::QualifiedMember,
             38 => SyntaxKind::AssignmentTarget,
             39 => SyntaxKind::LocalBinding,
-            40 => SyntaxKind::While,
             41 => SyntaxKind::Assignment,
             42 => SyntaxKind::TopLevelItem,
             43 => SyntaxKind::StructDecl,
@@ -178,6 +183,12 @@ impl Language for WosyLanguage {
             76 => SyntaxKind::EnumVariant,
             77 => SyntaxKind::ErasedArraySuffix,
             78 => SyntaxKind::AllocationBinding,
+            79 => SyntaxKind::ParenthesizedDereferencePlace,
+            80 => SyntaxKind::CopyModifier,
+            81 => SyntaxKind::IndexFieldSuffix,
+            82 => SyntaxKind::DirectFieldChainTail,
+            83 => SyntaxKind::ValueField,
+            84 => SyntaxKind::InvalidTemporaryPlace,
             _ => panic!("invalid syntax kind: {}", raw.0),
         }
     }
@@ -208,6 +219,10 @@ impl CanonicalCstRoot {
         }
     }
 
+    pub fn snapshot_json_serializable(&self) -> impl Serialize + '_ {
+        SerializableCstSnapshot(self)
+    }
+
     pub fn from_snapshot(snapshot: CanonicalCstSnapshot) -> Self {
         let mut builder = GreenNodeBuilder::new();
         build_snapshot_node(&mut builder, &snapshot.root);
@@ -232,6 +247,93 @@ pub struct CanonicalCstSnapshotNode {
 pub enum CanonicalCstSnapshotElement {
     Node(CanonicalCstSnapshotNode),
     Token { kind: SyntaxKind, text: String },
+}
+
+struct SerializableCstSnapshot<'a>(&'a CanonicalCstRoot);
+
+impl Serialize for SerializableCstSnapshot<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let text = self.0.root.text().to_string();
+        serialize_cst_snapshot(self.0, &text, serializer)
+    }
+}
+
+fn serialize_cst_snapshot<S: Serializer>(
+    tree: &CanonicalCstRoot,
+    text: &str,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    let root = SerializableCstNode {
+        node: &tree.root,
+        text,
+        offset: tree.root.text_range().start().into(),
+    };
+    let mut snapshot = serializer.serialize_struct("CanonicalCstSnapshot", 2)?;
+    snapshot.serialize_field("source", &tree.source)?;
+    snapshot.serialize_field("root", &root)?;
+    snapshot.end()
+}
+
+struct SerializableParsedCstSnapshot<'a>(&'a FreshParseResult);
+
+impl Serialize for SerializableParsedCstSnapshot<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let result = self.0.result();
+        serialize_cst_snapshot(result.canonical_cst(), &result.text, serializer)
+    }
+}
+
+struct SerializableCstNode<'a> {
+    node: &'a CstNode,
+    text: &'a str,
+    offset: usize,
+}
+
+impl Serialize for SerializableCstNode<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let range = self.node.text_range();
+        let start = usize::from(range.start()) - self.offset;
+        let end = usize::from(range.end()) - self.offset;
+        let mut node = serializer.serialize_struct("CanonicalCstSnapshotNode", 3)?;
+        node.serialize_field("kind", &self.node.kind())?;
+        node.serialize_field("text", &self.text[start..end])?;
+        node.serialize_field("children", &SerializableCstChildren(self))?;
+        node.end()
+    }
+}
+
+struct SerializableCstChildren<'a>(&'a SerializableCstNode<'a>);
+
+impl Serialize for SerializableCstChildren<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        #[serde(rename = "CanonicalCstSnapshotElement")]
+        enum Element<'a> {
+            Node(SerializableCstNode<'a>),
+            Token { kind: SyntaxKind, text: &'a str },
+        }
+
+        let parent = self.0;
+        let mut children = serializer.serialize_seq(None)?;
+        for element in parent.node.children_with_tokens() {
+            match element {
+                rowan::NodeOrToken::Node(child) => {
+                    children.serialize_element(&Element::Node(SerializableCstNode {
+                        node: &child,
+                        text: parent.text,
+                        offset: parent.offset,
+                    }))?;
+                }
+                rowan::NodeOrToken::Token(token) => {
+                    children.serialize_element(&Element::Token {
+                        kind: token.kind(),
+                        text: token.text(),
+                    })?;
+                }
+            }
+        }
+        children.end()
+    }
 }
 
 fn snapshot_node(node: &CstNode) -> CanonicalCstSnapshotNode {
@@ -354,6 +456,30 @@ impl ParseResult {
     }
 }
 
+pub struct FreshParseResult(ParseResult);
+
+impl FreshParseResult {
+    pub fn result(&self) -> &ParseResult {
+        &self.0
+    }
+
+    pub fn into_result(self) -> ParseResult {
+        self.0
+    }
+
+    pub fn snapshot_json_serializable(&self) -> impl Serialize + '_ {
+        SerializableParsedCstSnapshot(self)
+    }
+}
+
+pub fn parse_with_snapshot(
+    source: SourceIdentity,
+    text: String,
+    configured_comments: &[String],
+) -> FreshParseResult {
+    FreshParseResult(parse(source, text, configured_comments))
+}
+
 pub fn parse(source: SourceIdentity, text: String, configured_comments: &[String]) -> ParseResult {
     let mut errors = Vec::new();
     let comments = scan_comments(&text, configured_comments, &mut errors);
@@ -393,10 +519,7 @@ fn build_pair(
     errors: &mut Vec<SyntaxError>,
 ) {
     let span = pair.as_span();
-    if matches!(
-        pair.as_rule(),
-        Rule::error_item | Rule::malformed_generic_decl | Rule::trailing_while_semicolon
-    ) {
+    if matches!(pair.as_rule(), Rule::error_item | Rule::malformed_generic_decl) {
         let range = ByteSpan::new(span.start() as u32, span.end() as u32);
         builder.start_node(WosyLanguage::kind_to_raw(SyntaxKind::Error));
         add_gap(builder, span.as_str(), span.start(), comments);
@@ -414,7 +537,44 @@ fn build_pair(
         );
         return;
     }
-    if is_elided_operator_tier(&pair) {
+    if pair.as_rule() == Rule::conditional_block_entry {
+        build_conditional_block_entry(builder, pair, text, comments, errors);
+        return;
+    }
+    if pair.as_rule() == Rule::dereferenced_field
+        && !pair.clone().into_inner().next().is_some_and(is_dereference_primary)
+    {
+        builder.start_node(WosyLanguage::kind_to_raw(SyntaxKind::InvalidTemporaryPlace));
+        add_gap(builder, span.as_str(), span.start(), comments);
+        builder.finish_node();
+        errors.push(SyntaxError {
+            span: ByteSpan::new(span.start() as u32, span.end() as u32),
+            message: "a field of a temporary is not an assignable or borrowable place".to_owned(),
+        });
+        return;
+    }
+    if pair.as_rule() == Rule::call_primary {
+        let mut children = pair.into_inner();
+        let call = children.next().expect("call primary head");
+        if let Some(field) = children.next() {
+            build_value_field(builder, call, field, None, text, comments, errors);
+        } else {
+            build_pair(builder, call, text, comments, errors);
+        }
+        return;
+    }
+    if pair.as_rule() == Rule::parenthesized_primary {
+        build_parenthesized_primary(builder, pair, text, comments, errors);
+        return;
+    }
+    if matches!(
+        pair.as_rule(),
+        Rule::conditional_head
+            | Rule::conditional_else
+            | Rule::parenthesized_field_suffix
+            | Rule::parenthesized_index_suffix
+    ) || is_elided_operator_tier(&pair)
+    {
         let span = pair.as_span();
         let mut inner = pair.into_inner();
         let Some(first) = inner.next() else {
@@ -434,21 +594,150 @@ fn build_pair(
         add_gap(builder, &text[cursor..span.end()], cursor, comments);
         return;
     }
-    let kind = kind(pair.as_rule());
+    let kind = if pair.as_rule() == Rule::conditional_expr {
+        if pair
+            .clone()
+            .into_inner()
+            .any(|child| child.as_rule() == Rule::conditional_else)
+        {
+            SyntaxKind::IfExpr
+        } else {
+            SyntaxKind::UnitIfExpr
+        }
+    } else {
+        kind(pair.as_rule())
+    };
     let mut inner = pair.into_inner();
-    let Some(first) = inner.next() else {
+    let first = inner.next();
+    if first.is_none() && !matches!(kind, SyntaxKind::Block | SyntaxKind::StructLiteral) {
         builder.token(WosyLanguage::kind_to_raw(kind), span.as_str());
         return;
-    };
+    }
     builder.start_node(WosyLanguage::kind_to_raw(kind));
     let mut cursor = span.start();
-    for child in std::iter::once(first).chain(inner) {
+    for child in first.into_iter().chain(inner) {
         let child_span = child.as_span();
         add_gap(builder, &text[cursor..child_span.start()], cursor, comments);
         build_pair(builder, child, text, comments, errors);
         cursor = child_span.end();
     }
     add_gap(builder, &text[cursor..span.end()], cursor, comments);
+    builder.finish_node();
+}
+
+fn build_conditional_block_entry(
+    builder: &mut GreenNodeBuilder<'_>,
+    pair: Pair<'_, Rule>,
+    text: &str,
+    comments: &[TypedComment],
+    errors: &mut Vec<SyntaxError>,
+) {
+    let span = pair.as_span();
+    let mut children = pair.into_inner();
+    let condition = children.next().expect("leading block conditional");
+    let condition_end = condition.as_span().end();
+    let ending = children
+        .find(|child| {
+            matches!(
+                child.as_rule(),
+                Rule::conditional_terminated | Rule::conditional_tail | Rule::conditional_unterminated
+            )
+        })
+        .expect("block conditional ending");
+    let tail = ending.as_rule() == Rule::conditional_tail;
+    builder.start_node(WosyLanguage::kind_to_raw(if tail {
+        SyntaxKind::FinalOutputList
+    } else {
+        SyntaxKind::BlockItem
+    }));
+    if tail {
+        builder.start_node(WosyLanguage::kind_to_raw(SyntaxKind::OutputList));
+    }
+    builder.start_node(WosyLanguage::kind_to_raw(SyntaxKind::Expression));
+    build_pair(builder, condition, text, comments, errors);
+    if ending.as_rule() == Rule::conditional_unterminated {
+        add_gap(builder, &text[condition_end..span.end()], condition_end, comments);
+    }
+    builder.finish_node();
+    if tail || ending.as_rule() == Rule::conditional_terminated {
+        add_gap(builder, &text[condition_end..span.end()], condition_end, comments);
+    }
+    if tail {
+        builder.finish_node();
+    }
+    builder.finish_node();
+}
+
+fn build_parenthesized_primary(
+    builder: &mut GreenNodeBuilder<'_>,
+    pair: Pair<'_, Rule>,
+    text: &str,
+    comments: &[TypedComment],
+    errors: &mut Vec<SyntaxError>,
+) {
+    let mut children = pair.into_inner();
+    let head = children.next().expect("parenthesized primary head");
+    let Some(suffix) = children.next() else {
+        build_pair(builder, head, text, comments, errors);
+        return;
+    };
+    let mut suffix = suffix.into_inner();
+    let field = suffix.next().expect("parenthesized field suffix");
+    let indices = suffix.next();
+    if !is_dereference_primary(head.clone()) {
+        build_value_field(builder, head, field, indices, text, comments, errors);
+        return;
+    }
+    let outer = if indices.is_some() {
+        SyntaxKind::IndexedPlace
+    } else {
+        SyntaxKind::FieldAccess
+    };
+    builder.start_node(WosyLanguage::kind_to_raw(outer));
+    builder.start_node(WosyLanguage::kind_to_raw(SyntaxKind::DereferencedField));
+    build_pair(builder, head, text, comments, errors);
+    build_pair(builder, field, text, comments, errors);
+    builder.finish_node();
+    if let Some(indices) = indices {
+        build_pair(builder, indices, text, comments, errors);
+    }
+    builder.finish_node();
+}
+
+fn is_dereference_primary(mut pair: Pair<'_, Rule>) -> bool {
+    loop {
+        match pair.as_rule() {
+            Rule::dereference => return true,
+            Rule::parenthesized | Rule::parenthesized_primary | Rule::expression | Rule::primary
+            | Rule::logical_or | Rule::logical_and | Rule::bit_or | Rule::bit_xor | Rule::bit_and
+            | Rule::comparison | Rule::shift | Rule::additive | Rule::multiplicative
+            | Rule::unary => {}
+            _ => return false,
+        }
+        let mut children = pair.into_inner();
+        let Some(child) = children.next() else { return false };
+        if children.next().is_some() {
+            return false;
+        }
+        pair = child;
+    }
+}
+
+fn build_value_field(
+    builder: &mut GreenNodeBuilder<'_>,
+    receiver: Pair<'_, Rule>,
+    field: Pair<'_, Rule>,
+    indices: Option<Pair<'_, Rule>>,
+    text: &str,
+    comments: &[TypedComment],
+    errors: &mut Vec<SyntaxError>,
+) {
+    builder.start_node(WosyLanguage::kind_to_raw(SyntaxKind::ValueField));
+    build_pair(builder, receiver, text, comments, errors);
+    build_pair(builder, field, text, comments, errors);
+    if let Some(indices) = indices {
+        build_pair(builder, indices, text, comments, errors);
+    }
     builder.finish_node();
 }
 
@@ -478,61 +767,28 @@ fn add_gap(
     offset: usize,
     comments: &[TypedComment],
 ) {
-    let mut start = 0;
     let mut index = 0;
     while index < text.len() {
-        let byte = text.as_bytes()[index];
-        let (kind, end) = match byte {
-            b' ' => (Some(SyntaxKind::Whitespace), index + 1),
-            b'\t' => (Some(SyntaxKind::Indentation), index + 1),
+        let (kind, end) = match text.as_bytes()[index] {
+            b' ' => (SyntaxKind::Whitespace, index + 1),
+            b'\t' => (SyntaxKind::Indentation, index + 1),
             b'\r' if text.as_bytes().get(index + 1) == Some(&b'\n') => {
-                (Some(SyntaxKind::LineEnding), index + 2)
+                (SyntaxKind::LineEnding, index + 2)
             }
-            b'\r' | b'\n' => (Some(SyntaxKind::LineEnding), index + 1),
-            _ if comments
-                .iter()
-                .any(|comment| comment.span.start as usize == offset + index) =>
+            b'\r' | b'\n' => (SyntaxKind::LineEnding, index + 1),
+            b'#' => match comments
+                .binary_search_by_key(&(offset + index), |comment| comment.span.start as usize)
             {
-                let end = comments
-                    .iter()
-                    .find(|comment| comment.span.start as usize == offset + index)
-                    .expect("comment span")
-                    .span
-                    .end as usize
-                    - offset;
-                if index > start {
-                    builder.token(
-                        WosyLanguage::kind_to_raw(SyntaxKind::Punctuation),
-                        &text[start..index],
-                    );
-                }
-                builder.token(
-                    WosyLanguage::kind_to_raw(SyntaxKind::TypedComment),
-                    &text[index..end],
-                );
-                start = end;
-                index = end;
-                continue;
-            }
-            _ => (Some(SyntaxKind::Punctuation), next_char_end(text, index)),
+                Ok(ordinal) => (
+                    SyntaxKind::TypedComment,
+                    comments[ordinal].span.end as usize - offset,
+                ),
+                Err(_) => (SyntaxKind::Punctuation, index + 1),
+            },
+            _ => (SyntaxKind::Punctuation, next_char_end(text, index)),
         };
-        if let Some(kind) = kind {
-            if index > start {
-                builder.token(
-                    WosyLanguage::kind_to_raw(SyntaxKind::Punctuation),
-                    &text[start..index],
-                );
-            }
-            builder.token(WosyLanguage::kind_to_raw(kind), &text[index..end]);
-            start = end;
-        }
+        builder.token(WosyLanguage::kind_to_raw(kind), &text[index..end]);
         index = end;
-    }
-    if start < text.len() {
-        builder.token(
-            WosyLanguage::kind_to_raw(SyntaxKind::Punctuation),
-            &text[start..],
-        );
     }
 }
 
@@ -549,6 +805,9 @@ fn scan_comments(
     errors: &mut Vec<SyntaxError>,
 ) -> Vec<TypedComment> {
     let mut comments = Vec::new();
+    if !text.as_bytes().contains(&b'#') {
+        return comments;
+    }
     let Ok(mut pairs) = WosyParser::parse(Rule::comment_scan, text) else {
         return comments;
     };
@@ -632,7 +891,6 @@ fn kind(rule: Rule) -> SyntaxKind {
         Rule::block => SyntaxKind::Block,
         Rule::block_item => SyntaxKind::BlockItem,
         Rule::unsafe_block_item => SyntaxKind::Expression,
-        Rule::if_block_item => SyntaxKind::Expression,
         Rule::final_output_list => SyntaxKind::FinalOutputList,
         Rule::expression => SyntaxKind::Expression,
         Rule::call => SyntaxKind::Call,
@@ -640,15 +898,13 @@ fn kind(rule: Rule) -> SyntaxKind {
         Rule::generic_type_arguments => SyntaxKind::GenericTypeArguments,
         Rule::generic_type_argument => SyntaxKind::GenericTypeArgument,
         Rule::qualified_member => SyntaxKind::QualifiedMember,
-        Rule::assignment_target => SyntaxKind::AssignmentTarget,
-        Rule::if_expr => SyntaxKind::IfExpr,
-        Rule::unit_if_expr => SyntaxKind::UnitIfExpr,
+        Rule::assignment_target | Rule::non_indexed_assignment_target => SyntaxKind::AssignmentTarget,
         Rule::unsafe_expr => SyntaxKind::Unsafe,
-        Rule::while_expr => SyntaxKind::While,
         Rule::assignment => SyntaxKind::Assignment,
         Rule::top_level_item => SyntaxKind::TopLevelItem,
         Rule::struct_decl => SyntaxKind::StructDecl,
         Rule::enum_decl => SyntaxKind::EnumDecl,
+        Rule::copy_modifier => SyntaxKind::CopyModifier,
         Rule::enum_variant => SyntaxKind::EnumVariant,
         Rule::struct_field => SyntaxKind::StructField,
         Rule::callable_output => SyntaxKind::CallableOutput,
@@ -663,8 +919,11 @@ fn kind(rule: Rule) -> SyntaxKind {
         Rule::dereference => SyntaxKind::Dereference,
         Rule::raw_address => SyntaxKind::RawAddress,
         Rule::checked_address => SyntaxKind::CheckedAddress,
-        Rule::indexed_place => SyntaxKind::IndexedPlace,
+        Rule::parenthesized_dereference_place => SyntaxKind::ParenthesizedDereferencePlace,
+        Rule::indexed_place | Rule::indexed_value_place => SyntaxKind::IndexedPlace,
         Rule::index_suffix => SyntaxKind::IndexSuffix,
+        Rule::index_field_suffix => SyntaxKind::IndexFieldSuffix,
+        Rule::direct_field_chain_tail => SyntaxKind::DirectFieldChainTail,
         Rule::place_target => SyntaxKind::PlaceTarget,
         Rule::primary => SyntaxKind::Primary,
         Rule::error_item => SyntaxKind::Error,
@@ -708,6 +967,39 @@ mod tests {
     fn identity() -> SourceIdentity {
         SourceIdentity::new("p".into(), "pkg".into(), "src/main.w".into(), "r1".into())
     }
+    #[test]
+    fn borrowed_snapshot_preserves_pretty_json_bytes() {
+        for (text, valid) in [
+            ("%%start\r\nstr label = \"Olá\\t日本語\";\r\n%%end", true),
+            ("%%start\nsomething ?????;\ni32 value = 4;\n%%end", false),
+        ] {
+            let fresh = parse_with_snapshot(identity(), text.into(), &[]);
+            let result = fresh.result();
+            assert_eq!(result.is_valid(), valid, "{:?}", result.errors);
+            let root = result.canonical_cst();
+            assert_eq!(
+                serde_json::to_vec_pretty(&fresh.snapshot_json_serializable()).unwrap(),
+                serde_json::to_vec_pretty(&root.snapshot()).unwrap(),
+            );
+            let tail = root
+                .root
+                .descendants()
+                .find(|node| {
+                    let range = node.text_range();
+                    usize::from(range.start()) > 0 && !range.is_empty()
+                })
+                .expect("nonempty nested syntax after the root starts");
+            let subtree = CanonicalCstRoot::new(root.source.clone(), tail);
+
+            for tree in [&root, &subtree] {
+                assert_eq!(
+                    serde_json::to_vec_pretty(&tree.snapshot_json_serializable()).unwrap(),
+                    serde_json::to_vec_pretty(&tree.snapshot()).unwrap(),
+                );
+            }
+        }
+    }
+
     #[test]
     fn baseline_and_lossless() {
         let result = parse(identity(), BASE.into(), &["INTENT".into()]);
@@ -761,6 +1053,48 @@ mod tests {
                 .count(),
             8
         );
+    }
+
+    #[test]
+    fn named_field_chains_keep_lossless_suffixes_and_legacy_members() {
+        let text = "%%start\nu8 x = map.finish # note: field\n .center.x;\nmap.home.x = x;\n*u8 v = &map.home.x;\nu8 y = map.home.x[0];\nu8 z = map.home;\nTag t = defs.Tag::up;\n%%end";
+        let parsed = parse(identity(), text.into(), &["note".to_owned()]);
+        assert!(parsed.is_valid(), "{:?}", parsed.errors);
+        assert_eq!(parsed.reconstruct(), text);
+        let tails: Vec<_> = parsed.root.descendants()
+            .filter(|node| node.kind() == SyntaxKind::DirectFieldChainTail)
+            .map(|node| node.text().to_string())
+            .collect();
+        assert_eq!(tails, [".center.x", ".x ", ".x", ".x"]);
+        let members: Vec<_> = parsed.root.descendants()
+            .filter(|node| node.kind() == SyntaxKind::QualifiedMember)
+            .filter(|node| node.children().next().is_none())
+            .map(|node| node.text().to_string())
+            .collect();
+        assert_eq!(members, ["map.home", "defs.Tag::up"]);
+    }
+
+    #[test]
+    fn named_index_then_field_reads_and_writes_keep_lossless_suffixes() {
+        let text = "%%start\nu8 value = actors [ 0 ] # note: field\n . x;\nactors[1].x = value;\nu8 old = actors[1];\nu8 member = holder.actors[0];\n%%end";
+        let parsed = parse(identity(), text.into(), &["note".to_owned()]);
+        assert!(parsed.is_valid(), "{:?}", parsed.errors);
+        assert_eq!(parsed.reconstruct(), text);
+        let places: Vec<_> = parsed.root.descendants()
+            .filter(|node| node.kind() == SyntaxKind::IndexedPlace)
+            .collect();
+        let expected = [
+            vec![SyntaxKind::IndexSuffix, SyntaxKind::IndexFieldSuffix],
+            vec![SyntaxKind::IndexSuffix, SyntaxKind::IndexFieldSuffix],
+            vec![SyntaxKind::IndexSuffix],
+            vec![SyntaxKind::QualifiedMember, SyntaxKind::IndexSuffix],
+        ];
+        assert_eq!(places.len(), expected.len());
+        for (place, expected) in places.iter().zip(expected) {
+            assert_eq!(place.children().map(|child| child.kind()).collect::<Vec<_>>(), expected);
+        }
+        let suffix = places[0].children().last().expect("indexed field suffix");
+        assert_eq!(suffix.text().to_string(), ". x");
     }
 
     #[test]
@@ -835,6 +1169,32 @@ mod tests {
         assert_eq!(result.comments[4].category, "\"quoted # text\"");
         assert_eq!(result.reconstruct(), text);
     }
+    #[test]
+    fn gap_comment_tokens_have_exact_ranges_in_valid_and_recovered_source() {
+        for text in [
+            "%%start\n# NOTE: begin\nu8 value = 1; # NOTE: end\n%%end",
+            "broken Ω \"# not a comment\" # NOTE: begin\r\n# NOTE: end",
+        ] {
+            let result = parse(identity(), text.into(), &["NOTE".to_owned()]);
+            assert_eq!(result.reconstruct(), text);
+            let comments = result
+                .root
+                .descendants_with_tokens()
+                .filter_map(|element| element.into_token())
+                .filter(|token| token.kind() == SyntaxKind::TypedComment)
+                .map(|token| {
+                    let range = token.text_range();
+                    ByteSpan::new(range.start().into(), range.end().into())
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(comments.len(), 2);
+            assert_eq!(
+                comments,
+                result.comments.iter().map(|comment| comment.span).collect::<Vec<_>>()
+            );
+        }
+    }
+
     #[test]
     fn recovery_is_lossless() {
         let text = "%%start\n# nope\n%%end";
@@ -1496,6 +1856,31 @@ mod tests {
     }
 
     #[test]
+    fn empty_blocks_and_struct_literals_are_lossless_nodes() {
+        let text = "%%start\nstruct Empty {}\nEmpty value = {};\nunit() empty = fn {};\nunit() example = fn { if (true) { } else {\r\n\t}; if (false) {}; unsafe {}; };\n%%end";
+        let result = parse(identity(), text.into(), &[]);
+        assert!(result.is_valid(), "{:?}", result.errors);
+        assert_eq!(result.reconstruct(), text);
+
+        let empty = result.root.descendants().filter_map(|node| {
+            (matches!(node.kind(), SyntaxKind::Block | SyntaxKind::StructLiteral)
+                && node.children().next().is_none()).then_some(node)
+        }).map(|node| {
+            let span = byte_span(&node);
+            assert_eq!(&text[span.start as usize..span.end as usize], node.text().to_string());
+            (node.kind(), node.text().to_string())
+        }).collect::<Vec<_>>();
+        assert_eq!(empty, [
+            (SyntaxKind::StructLiteral, "{}".to_owned()),
+            (SyntaxKind::Block, "{}".to_owned()),
+            (SyntaxKind::Block, "{ }".to_owned()),
+            (SyntaxKind::Block, "{\r\n\t}".to_owned()),
+            (SyntaxKind::Block, "{}".to_owned()),
+            (SyntaxKind::Block, "{}".to_owned()),
+        ]);
+    }
+
+    #[test]
     fn unit_if_is_structured_lossless_and_span_exact() {
         let text = "%%start\nunit() main = fn {\n\tif (true) {\n\t\tprint();\n\t}\n};\n%%end";
         let result = parse(identity(), text.into(), &[]);
@@ -1508,6 +1893,68 @@ mod tests {
             .expect("unit if expression");
         assert_eq!(conditional.text(), "if (true) {\n\t\tprint();\n\t}");
         assert_eq!(byte_span(&conditional), ByteSpan::new(28, 53));
+    }
+
+    #[test]
+    fn nested_unit_conditionals_preserve_ordinary_named_calls() {
+        let depth = 20;
+        let mut body = "if(1);".to_owned();
+        for _ in 0..depth {
+            body = format!("if (true) {{ {body} }}\nwhile(2);");
+        }
+        let text = format!("%%start\nunit() main = fn {{\n{body}\n}};\n%%end");
+        let result = parse(identity(), text.clone(), &[]);
+        assert!(result.is_valid(), "{:?}", result.errors);
+        assert_eq!(result.reconstruct(), text);
+        assert_eq!(
+            result
+                .root
+                .descendants()
+                .filter(|node| node.kind() == SyntaxKind::UnitIfExpr)
+                .count(),
+            depth
+        );
+        let calls = result
+            .root
+            .descendants()
+            .filter(|node| node.kind() == SyntaxKind::Call)
+            .map(|node| node.text().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(calls.first().map(String::as_str), Some("if(1)"));
+        assert_eq!(calls.len(), depth + 1);
+        assert!(calls[1..].iter().all(|call| call == "while(2)"));
+    }
+
+    #[test]
+    fn conditional_else_keeps_trivia_and_failed_else_recovers() {
+        let text = "%%start\nunit() f = fn {\nif (true) {} # note: before else\nelse {};\nif (true) {} # note: before next\nif(1);\n};\n%%end";
+        let result = parse(identity(), text.into(), &["note".to_owned()]);
+        assert!(result.is_valid(), "{:?}", result.errors);
+        assert_eq!(result.reconstruct(), text);
+        let conditionals = result
+            .root
+            .descendants()
+            .filter(|node| matches!(node.kind(), SyntaxKind::IfExpr | SyntaxKind::UnitIfExpr))
+            .map(|node| (node.kind(), node.text().to_string()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            conditionals,
+            vec![
+                (
+                    SyntaxKind::IfExpr,
+                    "if (true) {} # note: before else\nelse {}".to_owned()
+                ),
+                (SyntaxKind::UnitIfExpr, "if (true) {}".to_owned())
+            ]
+        );
+
+        let invalid = "%%start\nbroken = if (true) { 0 } else ;\nu8 kept = 1;\n%%end";
+        let recovered = parse(identity(), invalid.into(), &[]);
+        assert!(!recovered.is_valid());
+        assert_eq!(recovered.reconstruct(), invalid);
+        assert!(recovered.root.descendants().any(|node| {
+            node.kind() == SyntaxKind::BindingDecl && node.text().to_string().contains("kept")
+        }));
     }
 
     #[test]
@@ -1621,6 +2068,261 @@ mod tests {
     }
 
     #[test]
+    fn parenthesized_checked_reborrows_preserve_place_structure_and_source() {
+        let text = "%%start\n*!u8 parent = &!value;\n*u8 reader = &value;\n&!(*parent).field;\n&!(*parent);\n&(*reader);\n&( *reader );\n&!*parent;\n&*reader;\n(*reader);\n%%end";
+        let source = identity();
+        let result = parse(source.clone(), text.into(), &[]);
+        assert!(result.is_valid(), "{:?}", result.errors);
+        assert_eq!(result.reconstruct(), text);
+        assert_eq!(result.canonical_cst().source, source);
+        let snapshot = result.canonical_cst().snapshot();
+        let rebuilt = CanonicalCstRoot::from_snapshot(snapshot.clone());
+        assert_eq!(rebuilt.snapshot(), snapshot);
+        assert_eq!(rebuilt.root.text().to_string(), text);
+
+        for (spelling, kind) in [
+            ("&!(*parent).field", SyntaxKind::PlaceTarget),
+            ("&!(*parent)", SyntaxKind::ParenthesizedDereferencePlace),
+            ("&(*reader)", SyntaxKind::ParenthesizedDereferencePlace),
+            ("&( *reader )", SyntaxKind::ParenthesizedDereferencePlace),
+            ("&!*parent", SyntaxKind::PlaceTarget),
+            ("&*reader", SyntaxKind::PlaceTarget),
+        ] {
+            let start = text.rfind(spelling).expect("address") as u32;
+            let address = result
+                .root
+                .descendants()
+                .find(|node| {
+                    node.kind() == SyntaxKind::CheckedAddress
+                        && byte_span(node) == ByteSpan::new(start, start + spelling.len() as u32)
+                })
+                .expect("checked address with exact span");
+            let place = address
+                .children()
+                .find(|node| node.kind() == kind)
+                .expect("place");
+            assert_eq!(place.kind(), kind);
+            assert!(place
+                .descendants()
+                .any(|node| node.kind() == SyntaxKind::Dereference));
+            if spelling == "&!(*parent).field" {
+                assert!(place
+                    .descendants()
+                    .any(|node| node.kind() == SyntaxKind::DereferencedField));
+            }
+            if kind == SyntaxKind::ParenthesizedDereferencePlace {
+                let place_start = start + spelling.find('(').expect("opening parenthesis") as u32;
+                assert_eq!(
+                    byte_span(&place),
+                    ByteSpan::new(place_start, start + spelling.len() as u32)
+                );
+                let tokens: Vec<_> = place
+                    .descendants_with_tokens()
+                    .filter_map(|element| element.into_token())
+                    .map(|token| token.text().to_string())
+                    .collect();
+                assert_eq!(tokens.first().map(String::as_str), Some("("));
+                assert_eq!(tokens.last().map(String::as_str), Some(")"));
+                assert_eq!(tokens.concat(), &spelling[spelling.find('(').unwrap()..]);
+            }
+        }
+        assert!(result
+            .root
+            .descendants()
+            .any(|node| node.kind() == SyntaxKind::Parenthesized
+                && node.text().to_string() == "(*reader)"));
+    }
+
+    #[test]
+    fn value_field_reads_keep_call_and_place_shapes() {
+        let text = "%%start\nmake(2);\nmake(42).value;\n(make(42)).value;\nitem.value;\n(*ptr).value;\n%%end";
+        let parsed = parse(identity(), text.into(), &[]);
+        assert!(parsed.is_valid(), "{:?}", parsed.errors);
+        assert_eq!(parsed.reconstruct(), text);
+        let nodes = parsed.root.descendants().filter(|node| node.kind() == SyntaxKind::ValueField)
+            .collect::<Vec<_>>();
+        assert_eq!(nodes.len(), 2);
+        for (node, receiver) in nodes.iter().zip([SyntaxKind::Call, SyntaxKind::Parenthesized]) {
+            assert_eq!(node.children().next().unwrap().kind(), receiver);
+            assert!(node.children_with_tokens().any(|element|
+                element.kind() == SyntaxKind::Identifier && element.to_string() == "value"));
+        }
+        for (kind, spelling) in [
+            (SyntaxKind::Call, "make(2)"),
+            (SyntaxKind::QualifiedMember, "item.value"),
+            (SyntaxKind::DereferencedField, "(*ptr).value"),
+        ] {
+            assert!(parsed.root.descendants().any(|node| node.kind() == kind && node.text() == spelling));
+        }
+    }
+
+    #[test]
+    fn value_field_reads_keep_exact_trivia_and_receiver_boundaries() {
+        let direct = "make (42) # note: direct\n . value";
+        let grouped = "(make(42)) # note: grouped\r\n .value # note: index\n [1]";
+        let arithmetic = "(*ptr + 1).field";
+        let text = format!("%%start\n{direct};\n{grouped};\n{arithmetic};\n%%end");
+        let parsed = parse(identity(), text.clone(), &["note".to_owned()]);
+        assert!(parsed.is_valid(), "{:?}", parsed.errors);
+        assert_eq!(parsed.reconstruct(), text);
+        for (spelling, receiver, comment_count) in [
+            (direct, "make (42)", 1),
+            (grouped, "(make(42))", 2),
+            (arithmetic, "(*ptr + 1)", 0),
+        ] {
+            let start = text.find(spelling).unwrap() as u32;
+            let projection = parsed.root.descendants().find(|node| {
+                node.kind() == SyntaxKind::ValueField
+                    && byte_span(node) == ByteSpan::new(start, start + spelling.len() as u32)
+            }).expect("lossless projection");
+            let head = projection.children().next().expect("value receiver");
+            assert_eq!(byte_span(&head), ByteSpan::new(start, start + receiver.len() as u32));
+            assert_eq!(projection.descendants_with_tokens().filter(|element|
+                element.kind() == SyntaxKind::TypedComment).count(), comment_count);
+            assert!(!projection.descendants().any(|node| node.kind() == SyntaxKind::DereferencedField));
+        }
+    }
+
+    #[test]
+    fn value_field_temporaries_do_not_parse_as_places() {
+        for statement in [
+            "(make(42)).value = 5;",
+            "(make(42)).value[1] = 5;",
+            "&(make(42)).value;",
+            "&!(make(42)).value;",
+            "&?(make(42)).value[1];",
+            "(*ptr + 1).field = 5;",
+        ] {
+            let text = format!("%%start\n{statement}\n%%end");
+            let parsed = parse(identity(), text.clone(), &[]);
+            assert_eq!(parsed.errors.len(), 1, "{statement}: {:?}", parsed.errors);
+            assert_eq!(parsed.reconstruct(), text);
+            assert!(!parsed.root.descendants().any(|node| node.kind() == SyntaxKind::ValueField));
+        }
+    }
+
+    #[test]
+    fn parenthesized_primaries_keep_field_index_and_trivia_boundaries() {
+        let text = "%%start\n(*base) # note: outer\n + 1;\n(*base) # note: field\n . member # note: index\n [1] [2];\n(*base).member # note: trailing\n ;\n(*base).member[1] = 2;\n&!(*base).member[1];\n%%end";
+        let parsed = parse(identity(), text.into(), &["note".to_owned()]);
+        assert!(parsed.is_valid(), "{:?}", parsed.errors);
+        assert_eq!(parsed.reconstruct(), text);
+        for (spelling, outer, expected_children) in [
+            (
+                "(*base)",
+                SyntaxKind::Parenthesized,
+                &[SyntaxKind::Expression][..],
+            ),
+            (
+                "(*base) # note: field\n . member # note: index\n [1] [2]",
+                SyntaxKind::IndexedPlace,
+                &[
+                    SyntaxKind::DereferencedField,
+                    SyntaxKind::IndexSuffix,
+                    SyntaxKind::IndexSuffix,
+                ],
+            ),
+            (
+                "(*base).member",
+                SyntaxKind::FieldAccess,
+                &[SyntaxKind::DereferencedField],
+            ),
+        ] {
+            let start = text.find(spelling).expect("spelling") as u32;
+            let node = parsed
+                .root
+                .descendants()
+                .find(|node| {
+                    node.kind() == outer
+                        && byte_span(node) == ByteSpan::new(start, start + spelling.len() as u32)
+                })
+                .expect("original primary kind and exact range");
+            assert_eq!(
+                node.children().map(|child| child.kind()).collect::<Vec<_>>(),
+                expected_children
+            );
+        }
+        assert!(parsed.root.descendants().any(|node| {
+            node.kind() == SyntaxKind::AssignmentTarget
+                && node.text() == "(*base).member[1] "
+                && node.descendants().any(|suffix| {
+                    suffix.kind() == SyntaxKind::IndexSuffix && suffix.text() == "[1]"
+                })
+        }));
+        assert!(parsed.root.descendants().any(|node| {
+            node.kind() == SyntaxKind::PlaceTarget && node.text() == "(*base).member[1]"
+        }));
+    }
+
+    #[test]
+    fn incomplete_parenthesized_suffixes_restore_recovery_boundary() {
+        for suffix in [".", ".member[", ".member[1]["] {
+            let text = format!("%%start\n(*base){suffix};\nu8 kept = 1;\n%%end");
+            let parsed = parse(identity(), text.clone(), &[]);
+            assert!(!parsed.is_valid());
+            assert_eq!(parsed.reconstruct(), text);
+            assert!(parsed.root.descendants().any(|node| {
+                node.kind() == SyntaxKind::BindingDecl && node.text() == "u8 kept = 1;"
+            }));
+        }
+    }
+
+    #[test]
+    fn malformed_parenthesized_checked_reborrows_recover_losslessly() {
+        for spelling in [
+            "&!(*parent",
+            "&(*reader",
+            "^&(*reader)",
+            "&^(*reader)",
+            "&(parent + 1)",
+            "&?(*reader)",
+        ] {
+            let text = format!("%%start\n{spelling};\n%%end");
+            let result = parse(identity(), text.clone(), &[]);
+            assert!(!result.is_valid(), "{spelling}");
+            assert_eq!(result.reconstruct(), text);
+        }
+    }
+
+    #[test]
+    fn checked_reborrow_keeps_parenthesized_comments_and_byte_spans() {
+        let text = "%%start\n&!(# INTENT: Inside the reborrow.\n\t*parent );\n%%end";
+        let result = parse(identity(), text.into(), &["INTENT".into()]);
+        assert!(result.is_valid(), "{:?}", result.errors);
+        assert_eq!(result.reconstruct(), text);
+        let address = result
+            .root
+            .descendants()
+            .find(|node| node.kind() == SyntaxKind::CheckedAddress)
+            .expect("checked reborrow");
+        let start = text.find("&!(").unwrap() as u32;
+        assert_eq!(
+            byte_span(&address),
+            ByteSpan::new(start, text.find(");").unwrap() as u32 + 1)
+        );
+        let place = address
+            .children()
+            .find(|node| node.kind() == SyntaxKind::ParenthesizedDereferencePlace)
+            .expect("parenthesized dereference");
+        assert_eq!(byte_span(&place).start, start + 2);
+        let tokens: Vec<_> = place
+            .descendants_with_tokens()
+            .filter_map(|element| element.into_token())
+            .collect();
+        assert!(tokens
+            .iter()
+            .any(|token| token.kind() == SyntaxKind::TypedComment
+                && token.text() == "# INTENT: Inside the reborrow."));
+        assert!(tokens
+            .iter()
+            .any(|token| token.kind() == SyntaxKind::Indentation && token.text() == "\t"));
+        assert_eq!(
+            tokens.iter().map(|token| token.text()).collect::<String>(),
+            place.text().to_string()
+        );
+    }
+
+    #[test]
     fn accepts_indexed_checked_address_formation() {
         let result = parse(
             identity(),
@@ -1651,53 +2353,47 @@ mod tests {
     }
 
     #[test]
-    fn local_binding_assignment_and_direct_block_while_are_structural() {
-        let text = "%%start\ni32(i32) loop = fn(start) {\n\ti32 value = start;\n\twhile (value < 3) {\n\t\tvalue = value + 1;\n\t}\n};\n%%end";
+    fn local_binding_assignment_and_ordinary_while_call_are_structural() {
+        let text = "%%start\ni32(i32) while = fn(start) {\n\ti32 value = start;\n\tvalue = value + 1;\n\tvalue\n};\ni32 result = while(2);\n%%end";
         let result = parse(identity(), text.into(), &[]);
-        assert!(result.is_valid());
+        assert!(result.is_valid(), "{:?}", result.errors);
         assert_eq!(result.reconstruct(), text);
-        assert!(result
+        for kind in [
+            SyntaxKind::LocalBinding,
+            SyntaxKind::Assignment,
+            SyntaxKind::Call,
+        ] {
+            assert!(result.root.descendants().any(|node| node.kind() == kind));
+        }
+        let call = result
             .root
             .descendants()
-            .any(|node| node.kind() == SyntaxKind::LocalBinding));
-        assert!(result
-            .root
-            .descendants()
-            .any(|node| node.kind() == SyntaxKind::Assignment));
-        assert!(result
-            .root
-            .descendants()
-            .any(|node| node.kind() == SyntaxKind::While));
-        let while_node = result
-            .root
-            .descendants()
-            .find(|node| node.kind() == SyntaxKind::While)
-            .expect("while node");
-        assert_eq!(byte_span(&while_node), ByteSpan::new(57, 100));
-        let trailing_semicolon =
-            "%%start\ni32(i32) loop = fn(start) {\n\ti32 value = start;\n\twhile (value < 3) {\n\t\tvalue = value + 1;\n\t};\n};\n%%end";
-        let rejected = parse(identity(), trailing_semicolon.into(), &[]);
-        assert!(!rejected.is_valid());
-        assert_eq!(rejected.errors.len(), 1);
-        let semicolon = trailing_semicolon
-            .find("\n\t};\n")
-            .expect("trailing semicolon") as u32
-            + 3;
+            .find(|node| node.kind() == SyntaxKind::Call)
+            .unwrap();
+        assert_eq!(call.text().to_string(), "while(2)");
+        assert_eq!(WosyLanguage::kind_to_raw(SyntaxKind::LocalBinding).0, 39);
+        assert_eq!(WosyLanguage::kind_to_raw(SyntaxKind::Assignment).0, 41);
         assert_eq!(
-            rejected.errors[0].span,
-            ByteSpan::new(semicolon, semicolon + 1)
+            WosyLanguage::kind_from_raw(rowan::SyntaxKind(41)),
+            SyntaxKind::Assignment
         );
-        assert!(rejected
-            .root
-            .descendants()
-            .any(|node| node.kind() == SyntaxKind::FunctionDecl));
-        assert!(rejected
-            .root
-            .descendants()
-            .any(|node| node.kind() == SyntaxKind::While));
+        assert!(serde_json::from_str::<SyntaxKind>(r#""While""#).is_err());
+    }
 
-        let expression_statement = "%%start\nunit() main = fn {\n\tprint();\n};\n%%end";
-        assert!(parse(identity(), expression_statement.into(), &[]).is_valid());
+    #[test]
+    fn retired_while_block_form_is_rejected_losslessly() {
+        for text in [
+            "%%start\nunit() repeat = fn { while (true) {} };\n%%end",
+            "%%start\nunit() repeat = fn { while (true) {}; };\n%%end",
+        ] {
+            let result = parse(identity(), text.into(), &[]);
+            assert!(!result.is_valid());
+            assert_eq!(result.reconstruct(), text);
+            let start = text.find("while").unwrap() as u32;
+            assert!(result.errors.iter().any(|error| {
+                error.span.start <= start && error.span.end > start
+            }));
+        }
     }
 
     #[test]
@@ -1782,7 +2478,7 @@ mod tests {
 
     #[test]
     fn unterminated_control_flow_precedes_final_output_list() {
-        let text = "%%start\ni32(i32, i32) f = fn(input) {\n\twhile (input < 2) {\n\t\tinput = input + 1;\n\t}\n\tif (input == 2) {\n\t\tinput;\n\t} else {\n\t\tinput;\n\t}\n\tinput, input + 1\n};\n%%end";
+        let text = "%%start\ni32(i32, i32) f = fn(input) {\n\tif (input < 2) {\n\t\tinput = input + 1;\n\t}\n\tif (input == 2) {\n\t\tinput;\n\t} else {\n\t\tinput;\n\t}\n\tinput, input + 1\n};\n%%end";
         let result = parse(identity(), text.into(), &[]);
         assert!(result.is_valid(), "{:?}", result.errors);
         assert_eq!(result.reconstruct(), text);
@@ -1820,6 +2516,125 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["input", "input + 1"]
         );
+    }
+
+    #[test]
+    fn direct_block_conditionals_keep_wrappers_and_delimiter_trivia() {
+        let text = "%%start\nunit() f = fn {\n\tif (true) { 1; } # doc: statement\n\tif (false) { 2; }  ;\n\tif (true) { if (false) { 3 } else { 4 } } else { 5 } # doc: tail\n};\n%%end";
+        let result = parse(identity(), text.into(), &["doc".into()]);
+        assert!(result.is_valid(), "{:?}", result.errors);
+        assert_eq!(result.reconstruct(), text);
+        let block = result
+            .root
+            .descendants()
+            .find(|node| node.kind() == SyntaxKind::Block)
+            .unwrap();
+        let entries: Vec<_> = block.children().collect();
+        assert_eq!(
+            entries.iter().map(CstNode::kind).collect::<Vec<_>>(),
+            [SyntaxKind::BlockItem, SyntaxKind::BlockItem, SyntaxKind::FinalOutputList]
+        );
+        let expression = |node: &CstNode| node.children().next().unwrap();
+        assert_eq!(expression(&entries[0]).kind(), SyntaxKind::Expression);
+        assert!(
+            expression(&entries[0]).text().to_string().contains("# doc: statement")
+        );
+        assert_eq!(expression(&entries[1]).text().to_string(), "if (false) { 2; }");
+        assert_eq!(entries[1].text().to_string(), "if (false) { 2; }  ;");
+        let outputs = expression(&entries[2]);
+        assert_eq!(outputs.kind(), SyntaxKind::OutputList);
+        assert_eq!(expression(&outputs).kind(), SyntaxKind::Expression);
+        assert_eq!(
+            entries[2].text().to_string(),
+            "if (true) { if (false) { 3 } else { 4 } } else { 5 } # doc: tail\n"
+        );
+        assert_eq!(outputs.text().to_string(), entries[2].text().to_string());
+        assert_eq!(
+            expression(&outputs).text().to_string(),
+            "if (true) { if (false) { 3 } else { 4 } } else { 5 }"
+        );
+        assert_eq!(result.comments.len(), 2);
+    }
+
+    #[test]
+    fn direct_conditional_fallback_and_ordered_multi_output_are_unchanged() {
+        let text = "%%start\ni32(i32) if = fn(input) { input };\n(i32, i32)() f = fn {\n\tif(1);\n\tif(2),\n\tif (true) { 3 } else { 4 }\n};\n%%end";
+        let result = parse(identity(), text.into(), &[]);
+        assert!(result.is_valid(), "{:?}", result.errors);
+        assert_eq!(result.reconstruct(), text);
+        let block = result
+            .root
+            .descendants()
+            .filter(|node| node.kind() == SyntaxKind::FunctionDecl)
+            .nth(1)
+            .unwrap()
+            .children()
+            .find(|node| node.kind() == SyntaxKind::Block)
+            .unwrap();
+        assert_eq!(
+            block.children().map(|entry| entry.kind()).collect::<Vec<_>>(),
+            [SyntaxKind::BlockItem, SyntaxKind::FinalOutputList]
+        );
+        let outputs = block
+            .children()
+            .find(|entry| entry.kind() == SyntaxKind::FinalOutputList)
+            .unwrap()
+            .children()
+            .next()
+            .unwrap();
+        assert_eq!(
+            outputs
+                .children()
+                .map(|node| node.children().next().unwrap().kind())
+                .collect::<Vec<_>>(),
+            [SyntaxKind::Primary, SyntaxKind::IfExpr]
+        );
+        assert!(outputs
+            .descendants()
+            .any(|node| node.kind() == SyntaxKind::Call && node.text() == "if(2)"));
+    }
+
+    #[test]
+    fn nested_direct_conditions_keep_identifier_calls_in_their_tails() {
+        let text = "%%start\ni32(i32) if = fn(input) { input };\ni32() f = fn { if (true) { if (false) { if(2) } else { if(3) } } else { if(4) } };\n%%end";
+        let result = parse(identity(), text.into(), &[]);
+        assert!(result.is_valid(), "{:?}", result.errors);
+        assert_eq!(result.reconstruct(), text);
+        let tail_calls = result
+            .root
+            .descendants()
+            .filter(|node| node.kind() == SyntaxKind::Call)
+            .map(|node| node.text().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(tail_calls, ["if(2)", "if(3)", "if(4)"]);
+    }
+
+    #[test]
+    fn direct_conditional_does_not_widen_malformed_block_recovery() {
+        for text in [
+            "%%start\n(i32, i32)() f = fn { if (true) { 1 } else { 2 }, 3 };\n%%end",
+            "%%start\ni32() f = fn { if (true) { 1 } else { };\n%%end",
+        ] {
+            let result = parse(identity(), text.into(), &[]);
+            assert!(!result.is_valid());
+            assert_eq!(result.reconstruct(), text);
+            assert_eq!(result.errors.len(), 1);
+            assert_eq!(
+                result.errors[0].span,
+                ByteSpan::new(
+                    "%%start\n".len() as u32,
+                    (text.rfind(';').unwrap() + 1) as u32,
+                )
+            );
+            assert_eq!(
+                result.errors[0].message,
+                "source does not match the base grammar"
+            );
+            assert!(!result
+                .root
+                .descendants()
+                .any(|node| node.kind() == SyntaxKind::FunctionDecl));
+        }
     }
 
     #[test]
@@ -1881,6 +2696,39 @@ mod tests {
             .root
             .descendants()
             .any(|node| node.kind() == SyntaxKind::AssignmentTarget));
+    }
+
+    #[test]
+    fn aggregate_copy_modifiers_have_canonical_spans() {
+        let text = "%%start\nstruct copy Point { i32 x; }\nenum copy Status { ok; }\nstruct Copycat { i32 x; }\n%%end";
+        let result = parse(identity(), text.into(), &[]);
+        assert!(result.is_valid(), "{:?}", result.errors);
+        assert_eq!(result.reconstruct(), text);
+        let modifiers = result
+            .root
+            .descendants_with_tokens()
+            .filter_map(|element| element.into_token())
+            .filter(|token| token.kind() == SyntaxKind::CopyModifier)
+            .collect::<Vec<_>>();
+        assert_eq!(modifiers.len(), 2);
+        for (index, modifier) in modifiers.iter().enumerate() {
+            let start = text.match_indices("copy").nth(index).unwrap().0 as u32;
+            assert_eq!(
+                ByteSpan::new(
+                    modifier.text_range().start().into(),
+                    modifier.text_range().end().into()
+                ),
+                ByteSpan::new(start, start + 4)
+            );
+            assert_eq!(
+                modifier.parent().unwrap().kind(),
+                if index == 0 {
+                    SyntaxKind::StructDecl
+                } else {
+                    SyntaxKind::EnumDecl
+                }
+            );
+        }
     }
 
     #[test]

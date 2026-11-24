@@ -1,25 +1,33 @@
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 use wosy_syntax::{
-    ByteSpan, CstNode, CstToken, ParseResult, SourceIdentity, SourceSpan, SyntaxKind,
+    ByteSpan, CstNode, CstToken, ParseResult, SourceIdentity, SourceSpan, SyntaxKind, TypedComment,
 };
 
 mod scalar;
 pub use llvm::{
-    emit_scalar_llvm, emit_scalar_llvm_text, emit_scalar_project_llvm, LlvmFunction, LlvmPartition,
+    emit_scalar_build_project_artifact_llvm, emit_scalar_build_project_llvm,
+    emit_scalar_build_project_llvm_text, emit_scalar_build_single_module_artifact_llvm,
+    emit_scalar_build_single_module_llvm, emit_scalar_build_single_module_llvm_text,
+    emit_scalar_build_wasm_root_exports_artifact_llvm, emit_scalar_build_wasm_root_exports_llvm_text, emit_scalar_llvm, emit_scalar_llvm_text, emit_scalar_project_llvm, LlvmFunction, LlvmPartition,
     LlvmValueType,
 };
 pub use scalar::{
-    derive_scalar_diagnostics_from_cst, derive_scalar_program, derive_scalar_program_from_cst,
+    analyze_scalar_build, derive_scalar_declarations_from_cst, derive_scalar_diagnostics_from_cst,
+    derive_scalar_program, derive_scalar_program_from_cst,
     derive_scalar_program_from_cst_with_layout, derive_scalar_program_with_layout,
-    validate_scalar_project, BinaryOperator, ScalarAllocationIdentity, ScalarAssignment,
+    prepare_scalar_project, validate_scalar_project, BinaryOperator, PreparedScalarProject,
+    ResolvedAssignmentOutputId, ScalarAllocationIdentity, ScalarAssignment, ScalarAssignmentTyping,
     ScalarAutomaticReturnResult, ScalarAutomaticReturnResultState, ScalarBinding, ScalarBlock,
-    ScalarBlockItem, ScalarEnum, ScalarEnumId, ScalarEnumVariant, ScalarExpression, ScalarExtern,
-    ScalarExternFunction, ScalarFunction, ScalarInitializationNode, ScalarItem, ScalarLayout,
-    ScalarModule, ScalarNamespaceBinding, ScalarOutput, ScalarOutputReceiver, ScalarOutputSequence,
-    ScalarPlace, ScalarProgram, ScalarProject, ScalarProjectValidation, ScalarStruct,
-    ScalarStructField, ScalarStructFieldId, ScalarStructId, ScalarStructLiteral,
-    ScalarStructLiteralField, ScalarTargetLayout, ScalarType, ScalarValidation, ScalarWhile,
-    UnaryOperator,
+    ScalarBlockItem, ScalarBuildValidation, ScalarEnum, ScalarEnumId, ScalarEnumVariant,
+    ScalarExpression, ScalarExtern, ScalarExternFunction, ScalarFunction, ScalarInitializationNode,
+    ScalarItem, ScalarLayout, ScalarModule, ScalarNamespaceBinding, ScalarOutput,
+    ScalarOutputReceiver, ScalarOutputSequence, ScalarPlace, ScalarPreparationInputs,
+    ScalarProgram, ScalarProject, ScalarProjectPreparationRejection, ScalarProjectValidation,
+    ScalarSourceDeclarations, ScalarStruct, ScalarStructField, ScalarStructFieldId, ScalarStructId,
+    ScalarStructLiteral, ScalarStructLiteralField, ScalarTargetLayout, ScalarType,
+    ScalarValidation, UnaryOperator,
 };
 
 mod llvm;
@@ -29,7 +37,26 @@ pub const COMPILER_IDENTITY: &str = concat!("wosy-compiler-", env!("CARGO_PKG_VE
 pub fn core_runtime(backend: &str, output: &str) -> Result<&'static str, String> {
     match (backend, output) {
         ("llvm", "native") => Ok(include_str!("../runtime/native64.ll")),
-        ("llvm", "wasm-wasip1" | "wasm-wasip2") => Ok(include_str!("../runtime/wasm32.ll")),
+        ("llvm", "wasm-wasip1" | "wasm-wasip2") => Ok(concat!(
+            "target triple = \"wasm32-wasi\"\n",
+            include_str!("../runtime/wasm32-layout.ll"),
+            include_str!("../runtime/wasm32-wasi-imports.ll"),
+            "\n",
+            include_str!("../runtime/wasm32-common.ll"),
+            "\n",
+            include_str!("../runtime/wasm32-wasi-panic.ll"),
+            "\n",
+            include_str!("../runtime/wasm32-wide-int.ll"),
+        )),
+        ("llvm", "wasm-web") => Ok(concat!(
+            "target triple = \"wasm32-unknown-unknown\"\n",
+            include_str!("../runtime/wasm32-layout.ll"),
+            include_str!("../runtime/wasm32-common.ll"),
+            "\n",
+            include_str!("../runtime/wasm32-web-panic.ll"),
+            "\n",
+            include_str!("../runtime/wasm32-wide-int.ll"),
+        )),
         (backend, output) => Err(format!(
             "unsupported core runtime target backend {backend} with output {output}"
         )),
@@ -40,25 +67,77 @@ pub fn core_runtime(backend: &str, output: &str) -> Result<&'static str, String>
 mod tests {
     use super::ScalarNamespaceBinding;
     use super::{
-        core_runtime, derive_scalar_program, derive_scalar_program_from_cst,
-        emit_scalar_project_llvm, parse_source, validate_scalar_project, ScalarModule,
-        ScalarProject,
+        core_runtime, derive_scalar_program, emit_scalar_llvm, emit_scalar_project_llvm,
+        parse_source, validate_scalar_project, ScalarModule, ScalarProject,
     };
     use wosy_syntax::{ByteSpan, CanonicalCstRoot, CanonicalCstSnapshot, SourceIdentity};
+
+    #[test]
+    fn publication_uses_first_comment_with_an_exact_span() {
+        let source = SourceIdentity::new(
+            "project".into(),
+            "package".into(),
+            "src/main.w".into(),
+            "r1".into(),
+        );
+        let mut parsed = parse_source(
+            source,
+            "%%start\n# NOTE: first\nu8 value = 1;\n# NOTE: second\n%%end".to_owned(),
+            &["NOTE".to_owned()],
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        assert_eq!(parsed.result.comments.len(), 2);
+        let before = super::publication(&parsed);
+
+        parsed.result.comments.reverse();
+        let mut duplicate = parsed.result.comments[1].clone();
+        duplicate.raw_payload = "duplicate must not replace the first match".to_owned();
+        parsed.result.comments.push(duplicate);
+
+        let after = super::publication(&parsed);
+        assert_eq!(after.root, before.root);
+        assert_eq!(after.comments, parsed.result.comments);
+    }
 
     #[test]
     fn derives_core_runtime_from_llvm_output() {
         assert!(core_runtime("llvm", "native")
             .expect("native runtime")
             .contains("__wosy_core_alloc"));
-        for output in ["wasm-wasip1", "wasm-wasip2"] {
-            let runtime = core_runtime("llvm", output).expect("Wasm runtime");
-            assert!(runtime.contains("wasm32-wasi"));
-            assert!(runtime.contains("%free_header_end = call { i64, i1 } @llvm.uadd.with.overflow.i64(i64 %free_header64, i64 16)"));
-            assert!(runtime.contains("%reused_pointer_address = and i64 %free_aligned_sum_value, %free_alignment_inverse"));
-            assert!(runtime.contains("%back_pointer = getelementptr i8, ptr %payload, i32 -4"));
-            assert!(!runtime.contains("payload_address_slot"));
+        let preview1 = core_runtime("llvm", "wasm-wasip1").expect("Preview 1 runtime");
+        let preview2 = core_runtime("llvm", "wasm-wasip2").expect("Preview 2 runtime");
+        assert_eq!(preview1, preview2);
+        assert!(preview1.contains("target triple = \"wasm32-wasi\""));
+        assert!(preview1.contains("define ptr @__wosy_core_alloc(i64"));
+        assert!(preview1.contains("define void @__wosy_core_free(ptr"));
+        assert!(preview1.contains("define void @__wosy_core_system_panic()"));
+        assert!(preview1.lines().any(|line| {
+            line.contains("icmp ule i64") && line.ends_with(", 4294967296")
+        }));
+        assert!(preview1.lines().any(|line| {
+            line.contains("icmp ult i64") && line.ends_with(", 4294967296")
+        }));
+    }
+
+    #[test]
+    fn web_runtime_shares_the_allocator_and_traps_without_wasi() {
+        let web = core_runtime("llvm", "wasm-web").expect("web runtime");
+        let wasi = core_runtime("llvm", "wasm-wasip1").expect("WASI runtime");
+        for shared in [
+            include_str!("../runtime/wasm32-layout.ll"),
+            include_str!("../runtime/wasm32-common.ll"),
+            include_str!("../runtime/wasm32-wide-int.ll"),
+        ] {
+            assert_eq!(web.matches(shared).count(), 1);
+            assert_eq!(wasi.matches(shared).count(), 1);
         }
+        assert!(web.starts_with("target triple = \"wasm32-unknown-unknown\"\n"));
+        assert!(web.contains("define void @__wosy_core_system_panic() {\nentry:\n  call void @llvm.trap()\n  unreachable"));
+        assert!(!web.contains("proc_exit"));
+        assert!(!web.contains("wasm-import-module"));
+        assert!(wasi.starts_with("target triple = \"wasm32-wasi\"\n"));
+        assert!(wasi.contains("call void @proc_exit(i32 1)\n  unreachable"));
+        assert!(!wasi.contains("@llvm.trap()"));
     }
 
     #[test]
@@ -70,8 +149,8 @@ mod tests {
     }
 
     #[test]
-    fn reports_only_the_trailing_while_semicolon_syntax_diagnostic() {
-        let text = "%%start\ni32(i32) loop = fn(start) {\n\ti32 value = start;\n\twhile (value < 3) {\n\t\tvalue = value + 1;\n\t};\n};\n%%end";
+    fn rejects_retired_while_block_form_with_a_syntax_diagnostic() {
+        let text = "%%start\nunit() repeat = fn { while (true) {} };\n%%end";
         let output = parse_source(
             SourceIdentity::new(
                 "project".into(),
@@ -84,11 +163,30 @@ mod tests {
         );
 
         assert_eq!(output.diagnostics.len(), 1);
-        let semicolon = text.find("\n\t};\n").expect("trailing semicolon") as u32 + 3;
-        assert_eq!(
-            output.diagnostics[0].labels[0].span.range,
-            ByteSpan::new(semicolon, semicolon + 1)
+        assert_eq!(output.diagnostics[0].code, "S0001");
+        let range = output.diagnostics[0].labels[0].span.range;
+        let start = text.find("while").unwrap() as u32;
+        assert!(range.start <= start && range.end > start);
+        assert_eq!(output.result.reconstruct(), text);
+    }
+
+    #[test]
+    fn validates_an_ordinary_function_named_while() {
+        let text = "%%start\ni32(i32) while = fn(value) { value };\ni32 result = while(2);\n%%end";
+        let output = parse_source(
+            SourceIdentity::new(
+                "project".into(),
+                "package".into(),
+                "src/main.w".into(),
+                "r1".into(),
+            ),
+            text.into(),
+            &[],
         );
+        assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
+        let scalar = derive_scalar_program(&output.result);
+        assert!(scalar.diagnostics.is_empty(), "{:?}", scalar.diagnostics);
+        emit_scalar_llvm(&scalar).expect("ordinary named call LLVM");
     }
 
     #[test]
@@ -99,7 +197,7 @@ mod tests {
             "src/bootstrap.w".into(),
             "r1".into(),
         );
-        let text = "%%start\nstruct utf8 { *?u8 data; u64 length; }\nenum ReadLineStatus { line; eof; }\n(*?utf8, ReadLineStatus)(u64) read_line = fn(max_bytes) {\n\tu8[max_bytes] bytes;\n\tbool reading = true;\n\tReadLineStatus status = ReadLineStatus::line;\n\twhile (reading) {\n\t\tif (reading) { bytes[0] = 13; reading = false; } else { status = ReadLineStatus::eof; };\n\t}\n\tnull, status\n};\n%%end";
+        let text = "%%start\nstruct utf8 { *?u8 data; u64 length; }\nenum ReadLineStatus { line; eof; }\n(*?utf8, ReadLineStatus)(u64) read_line = fn(max_bytes) {\n\tu8[max_bytes] bytes;\n\tbool reading = true;\n\tReadLineStatus status = ReadLineStatus::line;\n\tif (reading) {\n\t\tif (reading) { bytes[0] = 13; reading = false; } else { status = ReadLineStatus::eof; };\n\t};\n\tnull, status\n};\n%%end";
         let output = parse_source(source, text.into(), &[]);
 
         assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
@@ -107,7 +205,7 @@ mod tests {
         assert!(scalar.diagnostics.is_empty(), "{:?}", scalar.diagnostics);
     }
     #[test]
-    fn lowers_a_valid_read_line_loop_shape() {
+    fn lowers_a_valid_read_line_branch_shape() {
         let source = SourceIdentity::new(
             "project".into(),
             "package".into(),
@@ -121,9 +219,9 @@ enum ReadLineStatus { line; eof; }
 	u8[max_bytes] bytes;
 	bool reading = true;
 	ReadLineStatus status = ReadLineStatus::line;
-	while (reading) {
+	if (reading) {
 		if (reading) { bytes[0] = 13; reading = false; } else { status = ReadLineStatus::eof; };
-	}
+	};
 	null, status
 };
 %%end";
@@ -140,11 +238,16 @@ enum ReadLineStatus { line; eof; }
             "{:?}",
             validation.diagnostics
         );
-        emit_scalar_project_llvm(&validation).expect("read_line loop project LLVM");
+        emit_scalar_project_llvm(&validation).expect("read_line branch project LLVM");
     }
 
     #[test]
     fn archived_decomposed_read_line_snapshot_deserializes_and_reaches_project_validation() {
+        use super::{
+            analyze_scalar_build, derive_scalar_declarations_from_cst, prepare_scalar_project,
+            ScalarPreparationInputs, ScalarTargetLayout,
+        };
+
         let source = SourceIdentity::new(
             "project".into(),
             "package".into(),
@@ -160,15 +263,18 @@ enum ReadLineStatus { line; eof; }
 
         let serialized = serde_json::to_vec(&output.result.canonical_cst().snapshot())
             .expect("serialize canonical CST snapshot");
-        let snapshot: CanonicalCstSnapshot =
-            serde_json::from_slice(&serialized).expect("deserialize canonical CST snapshot");
+        let mut deserializer = serde_json::Deserializer::from_slice(&serialized);
+        deserializer.disable_recursion_limit();
+        let snapshot = <CanonicalCstSnapshot as serde::Deserialize>::deserialize(&mut deserializer)
+            .expect("deserialize canonical CST snapshot");
+        deserializer.end().expect("canonical CST snapshot ends");
         let canonical = CanonicalCstRoot::from_snapshot(snapshot);
         assert_eq!(
             canonical.root.text().to_string(),
             output.result.reconstruct()
         );
 
-        let scalar = derive_scalar_program_from_cst(&canonical);
+        let bootstrap_declarations = derive_scalar_declarations_from_cst(&canonical);
         let preview_source = SourceIdentity::new(
             "project".into(),
             "package".into(),
@@ -181,25 +287,31 @@ enum ReadLineStatus { line; eof; }
             &[],
         );
         assert!(preview.diagnostics.is_empty(), "{:?}", preview.diagnostics);
-        let preview_scalar = derive_scalar_program(&preview.result);
-        let validation = validate_scalar_project(ScalarProject::new(
+        let preview_declarations =
+            derive_scalar_declarations_from_cst(preview.result.canonical_cst());
+        let prepared = prepare_scalar_project(
             vec![
-                ScalarModule::from_program(
-                    scalar.program,
+                (
+                    bootstrap_declarations,
                     vec![ScalarNamespaceBinding {
                         binding: "preview1".into(),
                         target: preview_source.clone(),
                         span: ByteSpan::new(0, 0),
                     }],
                 ),
-                ScalarModule::from_program(preview_scalar.program, Vec::new()),
+                (preview_declarations, Vec::new()),
             ],
             vec![source, preview_source],
-        ));
+            ScalarPreparationInputs {
+                target_layout: ScalarTargetLayout::WASM32,
+            },
+        )
+        .unwrap_or_else(|error| panic!("prepare archived project: {:?}", error.diagnostics));
+        let validation = analyze_scalar_build(&prepared);
         assert!(
-            validation.diagnostics.is_empty(),
+            validation.diagnostics().is_empty(),
             "{:?}",
-            validation.diagnostics
+            validation.diagnostics()
         );
     }
 }
@@ -274,7 +386,25 @@ pub fn parse_source(
     configured_comments: &[String],
 ) -> ParseOutput {
     let result = wosy_syntax::parse(source, text, configured_comments);
-    let diagnostics = result
+    let diagnostics = parse_diagnostics(&result);
+    ParseOutput {
+        result,
+        diagnostics,
+    }
+}
+
+pub fn parse_source_with_snapshot(
+    source: SourceIdentity,
+    text: String,
+    configured_comments: &[String],
+) -> (wosy_syntax::FreshParseResult, Vec<Diagnostic>) {
+    let fresh = wosy_syntax::parse_with_snapshot(source, text, configured_comments);
+    let diagnostics = parse_diagnostics(fresh.result());
+    (fresh, diagnostics)
+}
+
+fn parse_diagnostics(result: &ParseResult) -> Vec<Diagnostic> {
+    result
         .errors
         .iter()
         .map(|error| Diagnostic {
@@ -288,18 +418,18 @@ pub fn parse_source(
             }],
             notes: vec!["parse the selected source with the configured project rules".to_owned()],
         })
-        .collect();
-    ParseOutput {
-        result,
-        diagnostics,
-    }
+        .collect()
 }
 
 pub fn publication(output: &ParseOutput) -> CstPublication {
+    let mut comments_by_span = HashMap::with_capacity(output.result.comments.len());
+    for comment in &output.result.comments {
+        comments_by_span.entry(comment.span).or_insert(comment);
+    }
     CstPublication {
         source: output.result.source.clone(),
         source_revision: output.result.source.revision.clone(),
-        root: project_node(&output.result.root, &output.result.comments, "0"),
+        root: project_node(&output.result.root, &comments_by_span, "0"),
         comments: output.result.comments.clone(),
         diagnostics: output.diagnostics.clone(),
     }
@@ -307,7 +437,7 @@ pub fn publication(output: &ParseOutput) -> CstPublication {
 
 fn project_node(
     node: &CstNode,
-    comments: &[wosy_syntax::TypedComment],
+    comments: &HashMap<ByteSpan, &TypedComment>,
     selector: &str,
 ) -> CstElement {
     let span = wosy_syntax::byte_span(node);
@@ -337,12 +467,12 @@ fn project_node(
 
 fn project_token(
     token: &CstToken,
-    comments: &[wosy_syntax::TypedComment],
+    comments: &HashMap<ByteSpan, &TypedComment>,
     selector: &str,
 ) -> CstElement {
     let token_range = token.text_range();
     let exact_span = ByteSpan::new(u32::from(token_range.start()), u32::from(token_range.end()));
-    let comment = comments.iter().find(|comment| comment.span == exact_span);
+    let comment = comments.get(&exact_span);
     CstElement {
         selector: selector.to_owned(),
         kind: format!("{:?}", token.kind()),

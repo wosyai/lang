@@ -1,0 +1,30 @@
+[package]
+name = "checked_reference_return_default"
+default_target = "app"
+
+[comments]
+categories = []
+
+[builders.llvm-wasm]
+command = ["python", "scripts/build-wasm"]
+args = []
+toolchain_identity = "llvm-18.1.4"
+
+[runners.wasmtime-wasip1]
+command = ["python", "scripts/run-wasmtime"]
+args = []
+
+[targets.app]
+root = "src/main.w"
+
+[targets.app.artifacts.main]
+artifact = "CheckedReferenceReturnDefault"
+
+[targets.app.artifacts.main.profiles.dev]
+backend = "llvm"
+output = "wasm-wasip1"
+builder = "llvm-wasm"
+run_runner = "wasmtime-wasip1"
+
+[targets.app.profiles.dev]
+main_artifact = "main"

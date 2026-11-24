@@ -1,0 +1,83 @@
+#!/usr/bin/env python3
+"""Check direct checked dereferences in the emitted project IR and pin its full partition."""
+
+import re
+import shutil
+import sys
+
+PARTITION = ".wosy/artifacts/app/dev/main/partition.ll"
+OUTPUT = "partition.normalized.ll"
+PACKAGE = "706f696e7465722d636173742d6469726563742d6465726566"
+
+
+def require(condition, message):
+    if not condition:
+        raise ValueError(message)
+
+
+def inspect(partition):
+    functions = re.findall(r"(?ms)^define [^\n]+\{\n.*?^\}", partition)
+    project = [body for body in functions if f"@wosy_fn__{PACKAGE}__" in body.splitlines()[0]]
+    require(len(project) == 1 and "__72756e()" in project[0].splitlines()[0], "expected one project run function")
+    body = project[0]
+    blocks = {}
+    for label, instructions in re.findall(r"(?ms)^([\w.]+):[^\n]*\n(.*?)(?=^[\w.]+:|^\})", body):
+        require(label not in blocks, f"duplicate block {label}")
+        blocks[label] = instructions
+
+    require("call ptr @__wosy_core_alloc(i64 1, i64 1)" in body, "missing aligned raw allocation")
+    require(re.search(r"%raw\d* = load i32, ptr %raw, align 4\n  store i32 %raw\d*, ptr %writer", body), "bound mutable cast must pass through the raw pointer")
+    require("bitcast" not in body, "unexpected cast instruction")
+
+    branches = []
+    for label, instructions in blocks.items():
+        match = re.search(
+            r"%deref_is_null\d* = icmp eq i32 (%\w+), 0\n"
+            r"  br i1 %deref_is_null\d*, label %(deref_null_panic\d*), label %(deref_null_continue\d*)",
+            instructions,
+        )
+        if match:
+            branches.append((label, *match.groups()))
+    require(len(branches) == 6, f"expected exactly six checked-use guards, found {len(branches)}")
+
+    destinations = ["writer", "shared_scalar", "mutable_scalar", "writer", "shared_field", "mutable_field"]
+    for (origin, address, panic, continuation), destination in zip(branches, destinations):
+        require(panic in blocks and continuation in blocks, f"missing successors for {origin}")
+        require(f"; preds = %{origin}" in body.split(f"\n{panic}:", 1)[1].split("\n", 1)[0], f"panic predecessor differs for {panic}")
+        require(f"; preds = %{origin}" in body.split(f"\n{continuation}:", 1)[1].split("\n", 1)[0], f"continuation predecessor differs for {continuation}")
+        require(re.fullmatch(r"  call void @__wosy_core_system_panic\(\)\n  unreachable\n\n?", blocks[panic]), f"panic block {panic} must terminate")
+        instructions = blocks[continuation]
+        cast = re.search(r"(%deref\d*) = inttoptr i32 " + re.escape(address) + r" to ptr", instructions)
+        require(cast, f"{continuation} must convert the guarded address")
+        if "scalar" in destination:
+            access = re.search(r"%place\d* = load i8, ptr " + re.escape(cast.group(1)) + r", align 1\n  store i8 %place\d*, ptr %" + destination, instructions)
+            require(access and instructions.index(cast.group(0)) < access.start(), f"scalar load must follow the guard for {destination}")
+        else:
+            field = re.search(r"(%tag\d*) = getelementptr inbounds i8, ptr " + re.escape(cast.group(1)) + r", i8 0", instructions)
+            require(field and instructions.index(cast.group(0)) < field.start(), f"field GEP must follow the guard for {destination}")
+            if destination == "writer":
+                require(re.search(r"store i8 %assignment_value\d*, ptr " + re.escape(field.group(1)), instructions), "writer field store missing")
+            else:
+                access = re.search(r"%place\d* = load i8, ptr " + re.escape(field.group(1)) + r", align 1\n  store i8 %place\d*, ptr %" + destination, instructions)
+                require(access and field.start() < access.start(), f"field load must follow guarded GEP for {destination}")
+        if destination != "writer":
+            require(re.search(r"%raw\d* = load i32, ptr %raw, align 4\n  %deref_is_null\d* = icmp eq i32 " + re.escape(address) + r", 0", blocks[origin]), f"direct cast must flow unchanged into guard for {destination}")
+
+    for index in range(1, len(branches)):
+        require(branches[index][0] == branches[index - 1][3], "checked-use guards must form a single ordered continuation chain")
+
+
+def main():
+    try:
+        with open(PARTITION, encoding="utf-8") as file:
+            inspect(file.read())
+        shutil.copyfile(PARTITION, OUTPUT)
+    except (OSError, ValueError) as error:
+        print(f"check-partition: {error}")
+        return 1
+    print("check-partition: four direct reads guarded before scalar/field access; pure cast and exact guard count")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

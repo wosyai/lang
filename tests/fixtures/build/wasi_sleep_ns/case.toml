@@ -1,0 +1,30 @@
+shared_stdlib = true
+
+[[steps]]
+command = ["wosy", "build", "app"]
+exit = 0
+
+[[steps]]
+source = "project/src/sleep_private.w"
+command = ["wosy", "build", "app"]
+exit = 1
+
+[[assert]]
+source = "project/src/sleep_private.w"
+command = ["wosy", "build", "app"]
+exit = 1
+stderr_contains = ["M0002", "_poll_oneoff", "_Subscription", "_Event"]
+
+[[assert]]
+source = "project/src/sleep_zero.w"
+command = ["wosy", "run", "app"]
+exit = 0
+stdout = "expected/sleep_zero.stdout"
+exact = true
+
+[[assert]]
+source = "project/src/sleep_small.w"
+command = ["wosy", "run", "app"]
+exit = 0
+stdout = "expected/sleep_small.stdout"
+exact = true
