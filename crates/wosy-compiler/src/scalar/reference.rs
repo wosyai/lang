@@ -6129,6 +6129,8 @@ pub(super) enum CheckerIntegerCallArgument {
     Literal(BigInt),
     PlainName,
     ContextualValue,
+    #[cfg(feature = "internal-checker")]
+    RankedSelfDescent,
 }
 
 #[cfg(feature = "internal-checker")]
@@ -6769,6 +6771,8 @@ struct CallableTargetResolver<'a> {
 
 struct CallableWalk<'a> {
     target_resolver: CallableTargetResolver<'a>,
+    #[cfg(feature = "internal-checker")]
+    checker_name_span: ByteSpan,
     prepared: bool,
     assignment_outputs: &'a HashMap<ResolvedAssignmentOutputId, ScalarType>,
     sites: Vec<ResolvedCallSite>,
@@ -7710,14 +7714,20 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
         #[cfg(feature = "internal-checker")]
         if checker_enabled && matches!(self.mode, WalkMode::Callable(_))
             && matches!(edge, OccurrenceEdge::CallArgument(0))
-            && matches!(parent, OccurrenceParent::Expression(call)
-                if self.structure.checker_direct_targets.contains_key(&call)
+        {
+            if let OccurrenceParent::Expression(call) = parent {
+                let unit_or_integer_self = self.structure.checker_direct_targets.contains_key(&call)
                     && self.checked_call_signatures.get(&call).is_some_and(|signature| {
                         matches!(signature.parameters.as_slice(), [parameter] if is_integer_type(parameter))
-                            && matches!(signature.outputs.outputs.as_slice(), [output] if output.ty == ScalarType::Unit)
-                    }))
-        {
-            self.record_integer_call_subtraction(ordinal, expression);
+                            && matches!(signature.outputs.outputs.as_slice(), [output]
+                                if output.ty == ScalarType::Unit || (is_integer_type(&output.ty)
+                                    && matches!(expression, ScalarExpression::Binary { operator: super::BinaryOperator::Subtract, .. })
+                                    && self.is_checked_integer_self_call(call)))
+                    });
+                if unit_or_integer_self {
+                    self.record_integer_call_subtraction(ordinal, expression);
+                }
+            }
         }
         Ok(ordinal)
     }
@@ -7782,6 +7792,17 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
             }
         };
         Some(CheckerOrdinaryScalarLocalKind::Arithmetic { operator, operands: [typed(left)?, typed(right)?] })
+    }
+
+    #[cfg(feature = "internal-checker")]
+    fn is_checked_integer_self_call(&self, call: OccurrenceOrdinal) -> bool {
+        let WalkMode::Callable(callable) = &self.mode else { return false; };
+        let Some(span) = self.occurrences.get(call.0).map(|occurrence| occurrence.span) else { return false; };
+        let Some(site) = callable.site_by_span.get(&CallSiteSpan(span)).and_then(|index| callable.sites.get(*index))
+            else { return false; };
+        matches!(&site.target, ResolvedCallTarget::ModuleCallable {
+            source, declaration_span, concrete: ConcreteCallSelection::Declaration,
+        } if source == callable.target_resolver.source && *declaration_span == callable.checker_name_span)
     }
 
     #[cfg(feature = "internal-checker")]
@@ -8695,6 +8716,10 @@ impl StructuralWalker<'_, '_> {
                 ScalarExpression::Name { .. } => CheckerIntegerCallArgument::PlainName,
                 ScalarExpression::Contextual { .. } if arguments.len() == 1 =>
                     CheckerIntegerCallArgument::ContextualValue,
+                #[cfg(feature = "internal-checker")]
+                ScalarExpression::Binary { operator: super::BinaryOperator::Subtract, .. }
+                    if arguments.len() == 1 && self.structure.checker_integer_call_subtractions.contains_key(argument) =>
+                    CheckerIntegerCallArgument::RankedSelfDescent,
                 _ => return None,
             };
             Some((*argument, origin))
@@ -9475,6 +9500,8 @@ fn resolve_function_call_sites(
             function_span: function.span,
             declarations,
         },
+        #[cfg(feature = "internal-checker")]
+        checker_name_span: function.name_span,
         prepared,
         assignment_outputs,
         sites: Vec::new(),

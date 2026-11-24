@@ -875,6 +875,36 @@ def state_report(code, label, selected, extra=""):
     return ('{ .stdout = ""; .stderr = "'+label+'"; .code = '+str(code)
             +'; .files = [{ .path = "state.json"; .state = '+selected+'; }'+extra+']; }')
 
+ranked_return = f"""%%start
+    u8(u8) descend = fn(value) {{
+        if (value > 0) {{
+            u8 result = descend(value - 1);
+            core.require(result == 7, {report(180,"BAD-INNER-RETURN")});
+            core.require(value >= 3, {report(181,"FRAME")});
+            result
+        }} else {{
+            core.require(value != 0, {report(182,"BASE")});
+            7
+        }}
+    }};
+    unit() startup = fn {{
+        u8 final = descend(2);
+        core.require(final == 7, {report(183,"BAD-FINAL-RETURN")});
+        core.require(final != 7, {state_report(184,"FINAL","final")});
+    }};
+    startup();
+    %%end"""
+ranked_return_same = ranked_return.replace("descend(value - 1)", "descend(value)")
+ranked_return_double = ranked_return.replace(
+    'core.require(result == 7,',
+    'u8 repeated = descend(0); core.require(repeated == 7, '
+    + report(180,"BAD-INNER-RETURN") + '); core.require(result == 7,',
+)
+cases.extend([
+    ("exact-startup-ranked-integer-return",ranked_return,182,b"BASEFRAMEFRAMEFINAL"),
+    ("exact-startup-ranked-integer-return-same-entry",ranked_return_same,2,b"unsupported analysis"),
+    ("exact-startup-ranked-integer-return-second-edge",ranked_return_double,2,b"unsupported analysis"),
+])
 parallel_mixed = f"""%%start
     unit() check = fn {{
         i8 first = 2;
@@ -1036,6 +1066,9 @@ cases.extend([
 ])
 holes_bytes = b'{"type":{"kind":"i8"},"value":{"kind":"alternatives","values":[1,3]}}\n'
 authored_files = {
+    "exact-startup-ranked-integer-return": {
+        "state.json": b'{"type":{"kind":"u8"},"value":7}\n',
+    },
     "parallel-whole-local-mixed-swap": {
         "state.json": b'{"type":{"kind":"bool"},"value":false}\n',
         "first.json": b'{"type":{"kind":"i8"},"value":8}\n',
@@ -1105,6 +1138,8 @@ with tempfile.TemporaryDirectory(prefix="affine-calls-") as path:
                     assert expected_stderr in res.stderr,res
                     if name == "parallel-formal-target-fails-closed":
                         assert b"FORMAL-NEVER-PUBLISHED" not in res.stderr,res
+                    if name.startswith("exact-startup-ranked-integer-return-"):
+                        assert b"BASE" not in res.stderr and b"FRAME" not in res.stderr,res
                 else:
                     assert res.stderr==expected_stderr,res
                 files = authored_files.get(name, {}) if included else {}

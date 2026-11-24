@@ -441,7 +441,7 @@ struct ProofFreeOrderedEvidence;
 impl ActualIntegerObserver for ProofFreeOrderedEvidence {
     const ENABLED: bool = false;
     const PROOF_FREE_CONTEXTUAL_LOCAL_TRANSFERS: bool = true;
-    const EXACT_SELF_UNIT_REENTRY: bool = true;
+    const EXACT_SELF_REENTRY: bool = true;
     const EXACT_INTEGER_CALL_CONTINUATIONS: bool = true;
     const ORDINARY_INTEGER_LOCALS: bool = true;
 
@@ -1348,7 +1348,7 @@ enum InitializerProofOrigin<'a> {
 trait ActualIntegerObserver {
     const ENABLED: bool;
     const PROOF_FREE_CONTEXTUAL_LOCAL_TRANSFERS: bool = false;
-    const EXACT_SELF_UNIT_REENTRY: bool = false;
+    const EXACT_SELF_REENTRY: bool = false;
     const EXACT_INTEGER_CALL_CONTINUATIONS: bool = false;
     const INTEGER_RETURN_PARTITIONS: bool = false;
     const PROJECTED_FORMAL_WRITES: bool = false;
@@ -1559,8 +1559,14 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
         })
     }
 
+    fn exact_self_reentry_allowed(&self, expected: &ScalarType, collecting: bool) -> bool {
+        ACTUAL_STARTUP && Observer::EXACT_SELF_REENTRY
+            && (*expected == ScalarType::Unit
+                || (collecting && Observer::EXACT_INTEGER_CALL_CONTINUATIONS && is_integer_type(expected)))
+    }
+
     fn exact_self_entry<'entry>(&self, exact: Option<&[&'entry BigInt]>) -> Option<&'entry BigInt> {
-        if ACTUAL_STARTUP && Observer::EXACT_SELF_UNIT_REENTRY {
+        if ACTUAL_STARTUP && Observer::EXACT_SELF_REENTRY {
             if let Some([value]) = exact {
                 return Some(*value);
             }
@@ -1760,6 +1766,7 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
         if *expected != ScalarType::Unit && !body.assignments.is_empty() {
             return Err(ProjectCheck::Unsupported);
         }
+        let ranked = self.exact_self_reentry_allowed(expected, collection.is_some());
         let argument;
         let pair;
         #[cfg(feature = "internal-checker")]
@@ -1772,7 +1779,7 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             }
             #[cfg(feature = "internal-checker")]
             ([parameter], [slot], NestedIntegerArgument::Single(None)) if *parameter == slot.ty => {
-                if *expected != ScalarType::Unit || !std::ptr::eq(caller, body) || parent.followed_self_edge {
+                if !ranked || !std::ptr::eq(caller, body) || parent.followed_self_edge {
                     return Err(ProjectCheck::Unsupported);
                 }
                 computed = self.computed_self_descent(caller, call, parameter,
@@ -1792,7 +1799,7 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
         let first_activation = !self.active.contains(&target);
         if !first_activation && !matches!(
             (parent.entry.as_ref(), exact),
-            (Some(previous), [value]) if *expected == ScalarType::Unit && !parent.followed_self_edge && std::ptr::eq(caller, body)
+            (Some(previous), [value]) if ranked && !parent.followed_self_edge && std::ptr::eq(caller, body)
                 && value.sign() != num_bigint::Sign::Minus && *value < previous
         ) {
             return Err(ProjectCheck::Unsupported);
@@ -14599,6 +14606,60 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
                 first(2);
             %%end"#);
             assert!(matches!(run("mutual-cycle", &mutual, scope), Err(ProjectCheck::Unsupported)));
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn exact_ranked_integer_returns_resume_the_parent_and_keep_failure_order() {
+        let base = OUTPUT.replace(".code = 1", ".code = 71");
+        let unwind = OUTPUT.replace(".code = 1", ".code = 72");
+        let final_receipt = OUTPUT.replace(".code = 1", ".code = 73");
+        let text = format!(r#"%%start
+            u8(u8) descend = fn(value) {{
+                if (value > 0) {{
+                    u8 result = descend(value - 1);
+                    core.require(result == 7, {OUTPUT});
+                    core.require(value >= 3, {unwind});
+                    result
+                }} else {{
+                    core.require(value != 0, {base});
+                    7
+                }}
+            }};
+            unit() startup = fn {{
+                u8 final = descend(2);
+                core.require(final == 7, {OUTPUT});
+                core.require(final != 7, {final_receipt});
+            }};
+            startup();
+        %%end"#);
+        let root = source("src/main.w", "ranked-exact-int-return");
+        for scope in [ScalarCheckerScope::MainFlowOnly, ScalarCheckerScope::CurrentPackage] {
+            for code in ["value - 1", "value", "value - 0", "value - 3", "value + 1"] {
+                let candidate = text.replace("value - 1", code);
+                let prepared = prepare_proof_target(&root, &candidate).unwrap();
+                if code == "value - 1" {
+                    let (project, calls) = prepared.parts();
+                    let (module, item, _) = select_checked_root(project, &root, "descend").unwrap();
+                    let body = calls.function_body(module, item, None).unwrap();
+                    assert_eq!(body.structure.checker_integer_call_subtractions.len(), 1);
+                    assert!(body.structure.checker_integer_call_locals.values().any(|origin|
+                        matches!(origin.arguments.as_slice(),
+                            [(_, super::super::reference::CheckerIntegerCallArgument::RankedSelfDescent)])));
+                }
+                let result = run_closed_without_named_proofs(&prepared, scope, 1);
+                if code != "value - 1" {
+                    assert!(matches!(result, Err(ProjectCheck::Unsupported)), "{code}");
+                    continue;
+                }
+                let receipt = result.unwrap();
+                assert!(receipt.directives.iter().map(|failure| failure.code().clone())
+                    .eq([71, 72, 72, 73].map(BigInt::from)));
+                for (failure, exact) in receipt.directives.iter().zip([0, 1, 2, 7].map(BigInt::from)) {
+                    assert!(failure.witness.intervals_at(0, 0).unwrap().eq([(&exact, &exact)]));
+                }
+            }
         }
     }
 

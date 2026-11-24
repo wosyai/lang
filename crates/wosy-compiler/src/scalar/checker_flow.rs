@@ -5040,6 +5040,8 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                         arguments[slot] = Some(match argument {
                             CheckerIntegerCallArgument::Literal(value) => Argument::Literal(value),
                             CheckerIntegerCallArgument::ContextualValue => return None,
+                            #[cfg(feature = "internal-checker")]
+                            CheckerIntegerCallArgument::RankedSelfDescent => return None,
                             CheckerIntegerCallArgument::PlainName => {
                                 let PlainNameIdentity::Lexical(argument) = calls.prepared_plain_name(*ordinal)? else {
                                     return None;
@@ -5103,6 +5105,12 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                         return Some(IntegerControl::PendingCall(ExactCallEffect::Scalar {
                             call: origin.call, binding: Some(&origin.binding), ty: &receiver.ty,
                         }));
+                    }
+                    #[cfg(feature = "internal-checker")]
+                    if matches!(origin.arguments.as_slice(), [(_, CheckerIntegerCallArgument::RankedSelfDescent)]) {
+                        // Only the explicit exact stack can authenticate and
+                        // consume the typed rank receipt.
+                        return None;
                     }
                     let handle = handle_call.as_mut()?;
                     let signature = calls.checked_call_signatures.get(&origin.call)?;
