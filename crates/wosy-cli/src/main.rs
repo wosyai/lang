@@ -1139,8 +1139,13 @@ fn check_command(
                 message: "reached from this call".to_owned(),
             });
         }
-        let mut notes = vec![format!("call returned {}", proof_scalar_text(&failure.invocation.returned, failure.invocation.returned_literal))];
-        if matches!(failure.invocation.returned_literal, Some(wosy_compiler::ScalarCheckerProofLiteral::Character(_)))
+        let value = proof_scalar_text(&failure.invocation.returned, failure.invocation.returned_literal);
+        let mut notes = vec![match failure.invocation.result_slot {
+            Some(slot) => format!("call returned output {} = {value}", slot + 1),
+            None => format!("call returned {value}"),
+        }];
+        if (failure.invocation.result_slot.is_some()
+            || matches!(failure.invocation.returned_literal, Some(wosy_compiler::ScalarCheckerProofLiteral::Character(_))))
             && !failure.invocation.arguments.is_empty()
         {
             let entries = failure.invocation.arguments.iter().enumerate().map(|(index, (ty, value))| {
@@ -1183,7 +1188,11 @@ fn check_command(
                 message: "proof goal".to_owned(),
             });
         }
-        let mut notes = vec![format!("symbolic call can return {}", proof_scalar_text(&failure.returned, failure.returned_literal))];
+        let value = proof_scalar_text(&failure.returned, failure.returned_literal);
+        let mut notes = vec![match failure.result_slot {
+            Some(slot) => format!("symbolic call can return output {} = {value}", slot + 1),
+            None => format!("symbolic call can return {value}"),
+        }];
         if let Some(entry) = entry_point_note(&failure.witness, publication.texts, false, failure.returned_literal.is_some()) {
             notes.push(entry);
         }

@@ -2754,7 +2754,51 @@ cases.extend([
     ("ordinary-character-return-proof-refuses-unanalyzed-nested-call", character_proof_symbolic.replace(
         "%%end", "char(char) relay = fn(letter) { identity(letter) }; %%end"), 2, b"unsupported analysis"),
 ])
+result_pair_proof_reached = f"""%%start
+    (u8, bool)(u8) duo = fn(value) {{ value, true }};
+    u8[1]() make = fn {{ [7] }};
+    proof finished for duo(entry) -> (result, ok) where (entry == 3) ensures (ok)
+        {{ core.show(ok == true); }}
+    proof exact_value for duo(entry) -> (result, ok) where (entry == 3) ensures (result == 3) {{}}
+    proof cells for make() -> (items) forall (u64 i where i == 0) ensures (items[i] == 7) {{}}
+    u8 first, bool accepted = duo(3);
+    u8 outside, bool ignored = duo(5);
+    u8 duplicate, bool again = duo(first);
+    u8[1] unused = make();
+    core.require(accepted, {report(71,"PAIR-STATUS")});
+    core.require(again, {report(72,"PAIR-SECOND-STATUS")});
+    core.require(duplicate == 3, {report(73,"PAIR-VALUE")});
+%%end"""
+result_pair_proof_symbolic = """%%start
+    (u8, char)(u8) duo = fn(value) { value, 'β' };
+    proof letters for duo(entry) -> (number, letter) where (entry == 3 || entry == 5)
+        ensures (letter == 'β') { core.show(letter == 'β'); }
+    proof requested for duo(entry) -> (number, letter) where (entry == 3 || entry == 5)
+        ensures (number <= 5) {}
+%%end"""
+result_pair_proof_nullary = """%%start
+    (char, u8)() sample = fn { 'β', 7 };
+    proof letter for sample() -> (label, code) ensures (label == 'β') {}
+    proof value for sample() -> (label, code) ensures (code == 7) {}
+    char unused_label, u8 unused_code = sample();
+%%end"""
+cases.extend([
+    ("exact-startup-result-pair-proof-proved", result_pair_proof_reached, 0, b""),
+    ("exact-startup-result-pair-proof-refuted", result_pair_proof_reached
+        .replace("core.show(ok == true)", "core.show(!ok)").replace("ensures (result == 3)", "ensures (result != 3)"),
+        1, b"proof obligation failed"),
+    ("exact-startup-result-pair-proof-nullary", result_pair_proof_nullary, 0, b""),
+    ("ordinary-result-pair-proof-proved", result_pair_proof_symbolic, 0, b""),
+    ("ordinary-result-pair-proof-refuted", result_pair_proof_symbolic
+        .replace("core.show(letter == 'β')", "core.show(letter != 'β')").replace("ensures (number <= 5)", "ensures (number != 5)"),
+        1, b"proof obligation failed"),
+    ("ordinary-result-pair-proof-refuses-unanalyzed-nested-call", result_pair_proof_symbolic.replace(
+        "%%end", "char(u8) relay = fn(value) { u8 kept, char tag = duo(value); kept; tag }; %%end"),
+        2, b"unsupported analysis"),
+])
 proof_diagnostic_notes = {
+    "exact-startup-result-pair-proof-refuted": b"call returned output 2 = true",
+    "ordinary-result-pair-proof-refuted": b"symbolic call entry: value = 5",
     "exact-startup-character-return-proof-refuted": "call entry: argument 1 = '🦀'".encode(),
     "ordinary-character-return-proof-refuted": "symbolic call entry: letter = 'β'".encode(),
     "exact-startup-boolean-return-proof-refuted": b"call returned true",
@@ -3576,6 +3620,22 @@ with tempfile.TemporaryDirectory(prefix="affine-calls-") as path:
                         assert b"COPY-PRIOR-UNPUBLISHED" not in res.stderr and b"COPY-FORMAL-UNPUBLISHED" not in res.stderr,res
                 elif included and name in proof_diagnostic_notes:
                     assert expected_stderr in res.stderr and proof_diagnostic_notes[name] in res.stderr,res
+                    if "-result-pair-proof-" in name:
+                        failures = res.stderr.split(b"error: proof obligation failed")[1:]
+                        if name.startswith("exact-startup-"):
+                            assert len(failures) == 4 and b"symbolic call" not in res.stderr, res
+                            for index, invocation in enumerate((b"duo(3)", b"duo(first)")):
+                                status, payload = failures[index * 2:index * 2 + 2]
+                                assert invocation in status and invocation in payload, res
+                                assert all(b"call entry: argument 1 = 3" in failure for failure in (status, payload)), res
+                                assert b"core.show(!ok)" in status and b"call returned output 2 = true" in status, res
+                                assert b"proof exact_value" in payload and b"call returned output 1 = 3" in payload, res
+                        else:
+                            assert len(failures) == 2, res
+                            assert "core.show(letter != 'β')".encode() in failures[0], res
+                            assert "symbolic call can return output 2 = 'β'".encode() in failures[0], res
+                            assert b"proof requested" in failures[1] and b"symbolic call can return output 1 = 5" in failures[1], res
+                            assert b"symbolic call entry: value = 5" in failures[1], res
                     if "-character-return-proof-" in name:
                         failures = res.stderr.split(b"error: proof obligation failed")[1:]
                         assert len(failures) == 2, res

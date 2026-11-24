@@ -185,6 +185,14 @@ trait ScopedAuthoredReturn<'a>: Copy {
     const OBSERVE_FIXED_ARRAY: bool = false;
 
     #[cfg(feature = "internal-checker")]
+    const OBSERVE_RESULT_PAIR: bool = false;
+
+    #[cfg(feature = "internal-checker")]
+    fn observe_result_pair(
+        self, _: &'a FunctionCallSites, _: BlockOrdinal, _: FinalOutputSlot, _: &IntegerRoots<'a>, _: &IntegerInputs,
+    ) -> Option<()> { None }
+
+    #[cfg(feature = "internal-checker")]
     fn take_fixed_array_entries(self) -> Option<(usize, IntegerInputs)> { None }
 
     #[cfg(feature = "internal-checker")]
@@ -3429,6 +3437,8 @@ pub(super) enum ActualCallResult {
     #[cfg(feature = "internal-checker")]
     FixedArray(Vec<BigInt>),
     #[cfg(feature = "internal-checker")]
+    ResultPair([BigInt; 2]),
+    #[cfg(feature = "internal-checker")]
     EmptyScalar,
     PartitionedInteger(Vec<IntegerReturnPartition>),
     PartitionedIntegerPair(ProjectedIntegerPair),
@@ -4893,6 +4903,119 @@ pub(super) fn observe_unused_module_proof_returns<'a>(
     observe_integer_returns_in_scope(calls, entry_filter, None, true, ())
 }
 
+#[cfg(feature = "internal-checker")]
+pub(super) fn is_result_pair_atom(ty: &ScalarType) -> bool {
+    is_integer_type(ty) || matches!(ty, ScalarType::Bool | ScalarType::Char)
+}
+
+// The resolved block contains two separate, positional terminal expressions.
+// A single expression that projects two results does not have this shape.
+#[cfg(feature = "internal-checker")]
+pub(super) fn direct_result_pair(calls: &FunctionCallSites) -> Option<[(&FinalOutputSlot, &ScalarType); 2]> {
+    let structure = &calls.structure;
+    let [first, second] = calls.boundary.results.as_slice() else { return None; };
+    let [first_type, second_type] = calls.boundary.root_outputs.as_slice() else { return None; };
+    let [.., first_item, second_item] = structure.blocks.get(structure.root.0)?.items.as_slice() else { return None; };
+    let (BlockItemKind::FinalOutput(left), BlockItemKind::FinalOutput(right)) = (&first_item.kind, &second_item.kind)
+        else { return None; };
+    let pairs = [(left, &first.ty), (right, &second.ty)];
+    if [first_type, second_type].into_iter().zip(pairs).enumerate().all(|(index, (root, (slot, ty)))|
+        root.output == index && slot.output == index && &root.ty == ty
+            && is_result_pair_atom(ty)
+            && structure.checked_types.expressions.get(&slot.expression) == Some(ty)
+            && !calls.conditionals.contains_key(&slot.expression)
+            && !structure.checker_direct_targets.contains_key(&slot.expression))
+    {
+        Some(pairs)
+    } else {
+        None
+    }
+}
+
+#[cfg(feature = "internal-checker")]
+#[derive(Clone, Copy)]
+enum ResultPairSink<'a, 'body, 'checks, 'run> {
+    Exact(&'run std::cell::RefCell<Option<[BigInt; 2]>>),
+    Symbolic([OrderedRootLiteralProofs<'body, 'a, 'checks, 'run, false, true>; 2]),
+}
+
+#[cfg(feature = "internal-checker")]
+impl<'body> ScopedAuthoredReturn<'body> for ResultPairSink<'_, 'body, '_, '_> {
+    const ENABLED: bool = false;
+    const ALLOW_ORDINARY_INTEGER_LOCALS: bool = true;
+    const OBSERVE_RESULT_PAIR: bool = true;
+    const REQUIRE_TOTAL_RETURN: bool = true;
+
+    fn allows_extended_scalar_locals(self) -> bool { true }
+
+    fn at(
+        self, _: &FunctionCallSites, _: BlockOrdinal, _: FinalOutputSlot, _: &ScalarType,
+        _: &IntegerRoots<'_>, _: &IntegerInputs,
+    ) -> Option<&'body BigInt> { None }
+
+    fn observe_result_pair(
+        self, calls: &'body FunctionCallSites, block: BlockOrdinal, slot: FinalOutputSlot,
+        roots: &IntegerRoots<'body>, path: &IntegerInputs,
+    ) -> Option<()> {
+        if block != calls.structure.root { return None; }
+        let [(first, first_ty), (second, second_ty)] = direct_result_pair(calls)?;
+        if *first != slot { return None; }
+        let values = [plain_typed_return(calls, first, first_ty, roots)?,
+            plain_typed_return(calls, second, second_ty, roots)?];
+        match self {
+            Self::Exact(out) => {
+                let [row] = path.0.as_slice() else { return None; };
+                let point = |value| match value {
+                    IntegerReturn::Const(point) => Some(point),
+                    IntegerReturn::Alias(binding) => row.get(roots.lookup(binding)?.0)?.singleton_value(),
+                };
+                if out.borrow().is_some() { return None; }
+                *out.borrow_mut() = Some([point(values[0])?.clone(), point(values[1])?.clone()]);
+            }
+            Self::Symbolic([left, right]) => {
+                left.observed.borrow_mut().work = right.observed.borrow().work;
+                left.observe_return(*first, values[0], roots, path)?;
+                right.observed.borrow_mut().work = left.observed.borrow().work;
+                right.observe_return(*second, values[1], roots, path)?;
+            }
+        }
+        Some(())
+    }
+}
+
+#[cfg(feature = "internal-checker")]
+pub(super) fn collect_closed_result_pair_proofs<'a>(
+    calls: &'a FunctionCallSites, body: &'a super::ScalarBlock, filter: &[CheckerPredicate],
+    [left, right]: [&mut [SymbolicLiteralCheck<'_, 'a>]; 2],
+) -> Option<bool> {
+    // Both slot claims consume the same returning symbolic rows. Keep their
+    // existing batched rank/first failure logic, with the second slot starting
+    // from the first slot's consumed work budget.
+    let conditions = OrderedRootConditions(body, false);
+    let left = std::cell::RefCell::new(BatchedLiteralEvidence { returned: false, work: 0, pending: left.len(), checks: left });
+    let right = std::cell::RefCell::new(BatchedLiteralEvidence { returned: false, work: 0, pending: right.len(), checks: right });
+    #[cfg(test)]
+    INTEGER_OBSERVATIONS.with(|count| { let (symbolic, actual) = count.get(); count.set((symbolic + 1, actual)); });
+    let first = &calls.boundary.results.first()?.ty;
+    run_integer_callable::<false, false, _>(calls, Some(first), Some(filter), None, &mut [], None, None, None, false,
+        ResultPairSink::Symbolic([OrderedRootLiteralProofs { conditions, observed: &left },
+            OrderedRootLiteralProofs { conditions, observed: &right }]))?.ok()?;
+    let left = left.into_inner();
+    let right = right.into_inner();
+    Some(left.returned && right.returned)
+}
+
+#[cfg(feature = "internal-checker")]
+pub(super) fn exact_result_pair(calls: &FunctionCallSites, arguments: &[&BigInt]) -> Option<[BigInt; 2]> {
+    let first = &calls.boundary.results.first()?.ty;
+    let out = std::cell::RefCell::new(None);
+    #[cfg(test)]
+    INTEGER_OBSERVATIONS.with(|count| { let (symbolic, actual) = count.get(); count.set((symbolic, actual + 1)); });
+    let ProofCoverage::Applicable(_) = run_integer_callable::<false, false, _>(calls, Some(first), None, None, &mut [],
+        Some(arguments), None, None, false, ResultPairSink::Exact(&out))?.ok()? else { return None; };
+    out.into_inner()
+}
+
 #[cfg(all(test, feature = "internal-checker"))]
 thread_local! {
     static INTEGER_OBSERVATIONS: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
@@ -6001,6 +6124,17 @@ impl IntegerBlockCursor {
     }
 }
 
+fn plain_typed_return<'a>(
+    calls: &'a FunctionCallSites, slot: &FinalOutputSlot, ty: &ScalarType, roots: &IntegerRoots<'a>,
+) -> Option<IntegerReturn<'a>> {
+    if let Some(value) = scalar_call_literal(&calls.structure, slot.expression, ty, false) {
+        return Some(IntegerReturn::Const(value));
+    }
+    let PlainNameIdentity::Lexical(binding) = calls.prepared_plain_name(slot.expression)? else { return None; };
+    let (_, binding_type) = roots.lookup(binding)?;
+    (binding_type == ty).then_some(IntegerReturn::Alias(binding))
+}
+
 fn walk_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, Authored: ScopedAuthoredReturn<'a>>(
     calls: &'a FunctionCallSites,
     roots: &mut IntegerRoots<'a>,
@@ -6381,6 +6515,12 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                 }
             }
             BlockItemKind::FinalOutput(slot) => {
+                #[cfg(feature = "internal-checker")]
+                if Authored::OBSERVE_RESULT_PAIR {
+                    authored_return.observe_result_pair(calls, block, slot, roots, &path)?;
+                    roots.truncate(depth);
+                    return Some(IntegerControl::Returned);
+                }
                 let ty = structure.checked_types.expressions.get(&slot.expression)?;
                 if let Some(expected) = tail {
                     #[cfg(feature = "internal-checker")]
@@ -6549,14 +6689,8 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                         continue;
                     }
                 }
-                let value = if let Some(value) = scalar_call_literal(structure, slot.expression, ty, false) {
-                    IntegerReturn::Const(value)
-                } else if let Some(PlainNameIdentity::Lexical(binding)) = calls.prepared_plain_name(slot.expression) {
-                    let (_, binding_type) = roots.lookup(binding)?;
-                    if binding_type != ty {
-                        return None;
-                    }
-                    IntegerReturn::Alias(binding)
+                let value = if let Some(value) = plain_typed_return(calls, &slot, ty, roots) {
+                    value
                 } else if Authored::ENABLED && tail.is_some() {
                     IntegerReturn::Const(authored_return.at(calls, block, slot, ty, roots, &path)?)
                 } else {

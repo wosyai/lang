@@ -7028,7 +7028,14 @@ fn resolve_project_call_sites_impl(
                 ScalarItem::Function(function) if matches!(&function.signature,
                     ScalarType::Callable { parameters, outputs } if matches!(parameters.as_slice(), [] | [_])
                         && matches!(outputs.outputs.as_slice(), [output] if matches!(output.ty, ScalarType::Bool | ScalarType::Char))));
-            if same_package && (qualified || case_candidate || literal_candidate) {
+            let result_pair_candidate = matches!(&modules[declaration.0].items[declaration.1],
+                ScalarItem::Function(function) if matches!(&function.signature,
+                    ScalarType::Callable { parameters, outputs } if matches!(parameters.as_slice(), [] | [_])
+                        && parameters.iter().all(is_integer_type)
+                        && matches!(outputs.outputs.as_slice(), [first, second]
+                            if super::checker_flow::is_result_pair_atom(&first.ty)
+                                && super::checker_flow::is_result_pair_atom(&second.ty))));
+            if same_package && (qualified || case_candidate || literal_candidate || result_pair_candidate) {
                 declarations.nested_proof_watch.entry((source, declaration_span))
                     .or_insert(ProofTargetUse { declaration, nested: std::cell::Cell::new(false) });
             }
@@ -7898,7 +7905,7 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
         #[cfg(any(test, feature = "internal-checker"))]
         let checker_enabled = self.occurrence_typing.checker_directives_enabled();
         #[cfg(feature = "internal-checker")]
-        if checker_enabled && matches!(edge, OccurrenceEdge::CallArgument(0 | 1) | OccurrenceEdge::FinalOutput { output: 0, .. }
+        if checker_enabled && matches!(edge, OccurrenceEdge::CallArgument(0 | 1) | OccurrenceEdge::FinalOutput { output: 0 | 1, .. }
                 | OccurrenceEdge::AssignmentRhs { .. })
         {
             let atom = match expression {
@@ -7906,7 +7913,7 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
                     if self.structure.checked_types.expressions.get(&ordinal) == Some(&ScalarType::Bool) =>
                     Some(BigInt::from(u8::from(*value))),
                 ScalarExpression::Char { value, .. }
-                    if matches!(edge, OccurrenceEdge::FinalOutput { output: 0, .. })
+                    if matches!(edge, OccurrenceEdge::FinalOutput { output: 0 | 1, .. })
                         || initializer_literal_argument =>
                 {
                     (self.structure.checked_types.expressions.get(&ordinal) == Some(&ScalarType::Char))
