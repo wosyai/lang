@@ -1438,7 +1438,7 @@ struct IntegerRoots<'a> {
     #[cfg(feature = "internal-checker")]
     projected_narrow_integer: bool,
     #[cfg(feature = "internal-checker")]
-    projected_scalar_local_copy: bool,
+    projected_scalar_local_write: bool,
     #[cfg(feature = "internal-checker")]
     allow_ordinary_contextual_places: bool,
     #[cfg(feature = "internal-checker")]
@@ -2784,7 +2784,7 @@ impl IntegerReturningPath<'_> {
             CheckerPredicate::EntryDomain { .. } | CheckerPredicate::DirectiveDisjunction { .. } | CheckerPredicate::ProofReflexiveBranch(_) => return None,
             CheckerPredicate::Integer(predicate) => {
                 let index = self.axes.iter().position(|binding| **binding == predicate.binding)?;
-                self.state.split_axis(index, &predicate.operator, &predicate.bound)?
+                self.state.split_equal_axis(index, &predicate.operator, &predicate.bound)?
             }
         };
         Some(
@@ -5003,9 +5003,9 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
             }
             BlockItemKind::Assignment { group } => {
                 #[cfg(feature = "internal-checker")]
-                if roots.projected_scalar_local_copy {
-                    if let Some(copy) = projected_scalar_local_copy(calls, group) {
-                        path = apply_projected_scalar_local_copy(roots, path, copy)?;
+                if roots.projected_scalar_local_write {
+                    if let Some(write) = projected_scalar_local_write(calls, group) {
+                        path = apply_projected_scalar_local_write(calls, roots, path, write)?;
                         continue;
                     }
                 }
@@ -5511,11 +5511,11 @@ impl<'a> ExactCallCursor<'a> {
     }
 
     #[cfg(feature = "internal-checker")]
-    pub(super) fn allow_projected_scalar_local_copy(&mut self) -> Option<()> {
+    pub(super) fn allow_projected_scalar_local_write(&mut self) -> Option<()> {
         if self.projected_slot != Some(0) || self.projected_pair.is_some() || !self.tail.is_some_and(is_integer_type) {
             return None;
         }
-        self.roots.projected_scalar_local_copy = true;
+        self.roots.projected_scalar_local_write = true;
         Some(())
     }
 
@@ -6289,14 +6289,14 @@ impl IntegerInputs {
 }
 
 #[cfg(feature = "internal-checker")]
-struct ProjectedScalarLocalCopy<'a> {
+struct ProjectedScalarLocalWrite<'a> {
     destination: &'a ReferenceBindingId,
-    source: &'a ReferenceBindingId,
+    rhs: OccurrenceOrdinal,
     ty: &'a ScalarType,
 }
 
 #[cfg(feature = "internal-checker")]
-fn projected_scalar_local_copy(calls: &FunctionCallSites, position: BlockPosition) -> Option<ProjectedScalarLocalCopy<'_>> {
+fn projected_scalar_local_write(calls: &FunctionCallSites, position: BlockPosition) -> Option<ProjectedScalarLocalWrite<'_>> {
     let (destination, ty, rhs, place) = checked_scalar_assignment(calls, position)?;
     let structure = &calls.structure;
     if !is_integer_type(ty) && *ty != ScalarType::Bool
@@ -6306,27 +6306,99 @@ fn projected_scalar_local_copy(calls: &FunctionCallSites, position: BlockPositio
     {
         return None;
     }
-    let PlainNameIdentity::Lexical(source) = calls.prepared_plain_name(rhs)? else { return None; };
-    Some(ProjectedScalarLocalCopy { destination, source, ty })
+    // Literal-only writes still use the preexisting assignment path.
+    (matches!(calls.prepared_plain_name(rhs), Some(PlainNameIdentity::Lexical(_)))
+        || matches!(calls.conditionals.get(&rhs), Some(ConditionalRegion::Value { .. })))
+        .then_some(ProjectedScalarLocalWrite { destination, rhs, ty })
 }
 
 #[cfg(feature = "internal-checker")]
-fn apply_projected_scalar_local_copy(
-    roots: &mut IntegerRoots<'_>, path: IntegerInputs, copy: ProjectedScalarLocalCopy<'_>,
+fn apply_projected_scalar_local_write(
+    calls: &FunctionCallSites, roots: &mut IntegerRoots<'_>, path: IntegerInputs, write: ProjectedScalarLocalWrite<'_>,
 ) -> Option<IntegerInputs> {
-    let (destination, destination_ty) = roots.lookup(copy.destination)?;
-    let (source, source_ty) = roots.lookup(copy.source)?;
-    if destination < roots.parameters || destination_ty != copy.ty || source_ty != copy.ty {
+    let (destination, destination_ty) = roots.lookup(write.destination)?;
+    if destination < roots.parameters || destination_ty != write.ty { return None; }
+    let structure = &calls.structure;
+    let operand = |roots: &IntegerRoots<'_>, expression, literal| {
+        if structure.checked_types.expressions.get(&expression)? != write.ty
+            || structure.checker_contextual_occurrences.contains(&expression)
+        {
+            return None;
+        }
+        if literal {
+            if let Some(value) = scalar_call_literal(structure, expression, write.ty, true) {
+                return Some(ParallelScalarSource::Literal(Rc::new(IntegerSet::singleton(value))));
+            }
+        }
+        let PlainNameIdentity::Lexical(source) = calls.prepared_plain_name(expression)? else { return None; };
+        let (axis, ty) = roots.lookup(source)?;
+        (ty == write.ty).then_some(ParallelScalarSource::Copy(axis))
+    };
+    let overwrite = |roots: &mut IntegerRoots<'_>, path: IntegerInputs, value| {
+        let width = roots.axes.len();
+        let work = roots.ordinary_local_work.get_or_insert(0);
+        charge_call_work(work, width.checked_add(1)?)?;
+        let mut changes = (0..width).map(|_| None).collect::<Vec<_>>();
+        changes[destination] = Some(value);
+        // Rebuild equality using the old coordinates; the unchanged formal
+        // entry and the destination's prior aliases retain their own domains.
+        path.parallel_overwrite(&changes, work)
+    };
+    let Some(ConditionalRegion::Value { condition, then_block, else_block, resume, .. }) =
+        calls.conditionals.get(&write.rhs)
+    else {
+        let value = operand(roots, write.rhs, false)?;
+        return overwrite(roots, path, value);
+    };
+
+    charge_call_work(roots.ordinary_local_work.get_or_insert(0), 8)?;
+    if *resume != write.rhs || structure.checked_types.expressions.get(condition)? != &ScalarType::Bool
+        || structure.checker_contextual_occurrences.contains(condition)
+    {
         return None;
     }
-    let width = roots.axes.len();
-    let work = roots.ordinary_local_work.get_or_insert(0);
-    charge_call_work(work, width.checked_add(1)?)?;
-    let mut changes = (0..width).map(|_| None).collect::<Vec<_>>();
-    changes[destination] = Some(ParallelScalarSource::Copy(source));
-    // Rebuild equality from the old coordinates. The formal entry remains
-    // unchanged, and previous aliases of the destination do not get written.
-    path.parallel_overwrite(&changes, work)
+    let predicate = structure.checker_branches.get(condition)?;
+    match predicate {
+        CheckerPredicate::Boolean(_) => {}
+        CheckerPredicate::Integer(_) => plain_conditional_integer_operands(structure, *condition)?,
+        _ => return None,
+    }
+    // Charge full row and interval splitting before cloning either lane.
+    // The row rebuild is not a valid transfer for affine or detached entry
+    // relations; reject these before any splitting.
+    charge_call_work(roots.ordinary_local_work.get_or_insert(0), path.0.len())?;
+    if path.0.iter().any(|row| row.affine.is_some() || row.entry.is_some()) { return None; }
+    path.charge_projected_integer_directive(roots, predicate)?;
+    let (passing, failing, _) = path.split(roots, predicate)?;
+    let mut joined = IntegerInputs::default();
+    for (arm, block) in [(passing, *then_block), (failing, *else_block)] {
+        if arm.is_unreachable() { continue; }
+        let leaf = checked_conditional_scalar_leaf(structure, block)?;
+        let value = operand(roots, leaf, true)?;
+        let mut updated = overwrite(roots, arm, value)?;
+        charge_call_work(roots.ordinary_local_work.get_or_insert(0), updated.0.len())?;
+        joined.0.append(&mut updated.0);
+    }
+    Some(joined)
+}
+
+#[cfg(feature = "internal-checker")]
+fn plain_conditional_integer_operands(structure: &OccurrenceStructure, condition: OccurrenceOrdinal) -> Option<()> {
+    for edge in [OccurrenceEdge::BinaryLeft, OccurrenceEdge::BinaryRight] {
+        let OccurrenceNode::Expression(operand) = structure.edges.get(&(
+            OccurrenceParent::Expression(condition), edge,
+        ))? else { return None; };
+        if structure.checker_contextual_occurrences.contains(operand) { return None; }
+    }
+    Some(())
+}
+
+#[cfg(feature = "internal-checker")]
+fn checked_conditional_scalar_leaf(structure: &OccurrenceStructure, block: BlockOrdinal) -> Option<OccurrenceOrdinal> {
+    let block = structure.blocks.get(block.0)?;
+    let [item] = block.items.as_slice() else { return None; };
+    let BlockItemKind::FinalOutput(slot) = &item.kind else { return None; };
+    (slot.output == 0 && block.final_outputs().nth(1).is_none()).then_some(slot.expression)
 }
 
 #[cfg(feature = "internal-checker")]
@@ -6374,12 +6446,7 @@ fn exact_returning_local_write_value(
         let choose = match structure.checker_branches.get(condition) {
             Some(CheckerPredicate::Boolean(value)) => *value,
             Some(CheckerPredicate::Integer(predicate)) => {
-                for edge in [OccurrenceEdge::BinaryLeft, OccurrenceEdge::BinaryRight] {
-                    let OccurrenceNode::Expression(operand) = structure.edges.get(&(
-                        OccurrenceParent::Expression(*condition), edge,
-                    ))? else { return None; };
-                    if structure.checker_contextual_occurrences.contains(operand) { return None; }
-                }
+                plain_conditional_integer_operands(structure, *condition)?;
                 let (axis, axis_ty) = roots.lookup(&predicate.binding)?;
                 if axis_ty != &predicate.ty { return None; }
                 let value = row.get(axis)?.singleton_value()?;
@@ -6394,13 +6461,7 @@ fn exact_returning_local_write_value(
             }
             _ => return None,
         };
-        let block = structure.blocks.get(if choose { then_block.0 } else { else_block.0 })?;
-        // The reached arm is a leaf expression, not a place to silently
-        // evaluate (or skip) its authored statements or helper calls.
-        let [item] = block.items.as_slice() else { return None; };
-        let BlockItemKind::FinalOutput(slot) = &item.kind else { return None; };
-        if slot.output != 0 || block.final_outputs().nth(1).is_some() { return None; }
-        slot.expression
+        checked_conditional_scalar_leaf(structure, if choose { *then_block } else { *else_block })?
     } else {
         rhs
     };

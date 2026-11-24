@@ -875,6 +875,44 @@ def state_report(code, label, selected, extra=""):
     return ('{ .stdout = ""; .stderr = "'+label+'"; .code = '+str(code)
             +'; .files = [{ .path = "state.json"; .state = '+selected+'; }'+extra+']; }')
 
+projected_conditional_write = f"""%%start
+    i8(i8) transfer = fn(entry) {{
+        i8 changed = entry;
+        i8 previous = changed;
+        changed = if (changed < 0) {{ 13 }} else {{ previous }};
+        changed
+    }};
+    unit(i8) check = fn(input) {{
+        i8 output = transfer(input);
+        if (input < 0) {{
+            core.require(output == 13, {report(204,"NEG-IRRELEVANT")});
+        }};
+        if (output == 0) {{
+            core.require(input == 0, {report(205,"IDENTITY-WIDENED")});
+            core.require(input != 0, {state_report(206,"IDENTITY-INPUT","input")});
+        }};
+        if (output == 13) {{
+            core.require(input >= 0, {state_report(207,"CONSTANT-PREIMAGE","input").replace("state.json","preimage.json")});
+        }};
+    }};
+    %%end"""
+projected_conditional_unreached = f"""%%start
+    i8(i8) transfer = fn(entry) {{
+        i8 changed = 2;
+        changed = if (entry < 0) {{ entry + 1 }} else {{ entry }};
+        changed
+    }};
+    unit(i8) check = fn(input) {{
+        core.narrow(input >= 0, {report(208,"PROJECTED-PRIOR-UNPUBLISHED")});
+        i8 output = transfer(input);
+        core.require(output < 0, {state_report(209,"ONLY-REACHED-ARM","output")});
+    }};
+    %%end"""
+cases.extend([
+    ("projected-conditional-local-write-keeps-input-pieces",projected_conditional_write,206,b"IDENTITY-INPUTCONSTANT-PREIMAGE"),
+    ("projected-conditional-local-write-skips-unreached-operand",projected_conditional_unreached,209,b"ONLY-REACHED-ARM"),
+    ("projected-conditional-local-write-rejects-reached-operand",projected_conditional_unreached.replace("core.narrow","core.require"),2,b"unsupported analysis"),
+])
 projected_local_copy = f"""%%start
     i8(i8) transfer = fn(entry) {{
         i8 changed = 2;
@@ -1216,6 +1254,13 @@ cases.extend([
 ])
 holes_bytes = b'{"type":{"kind":"i8"},"value":{"kind":"alternatives","values":[1,3]}}\n'
 authored_files = {
+    "projected-conditional-local-write-keeps-input-pieces": {
+        "state.json": b'{"type":{"kind":"i8"},"value":0}\n',
+        "preimage.json": b'{"type":{"kind":"i8"},"value":{"kind":"range","minimum":-128,"maximum":-1}}\n',
+    },
+    "projected-conditional-local-write-skips-unreached-operand": {
+        "state.json": b'{"type":{"kind":"i8"},"value":{"kind":"range","minimum":0,"maximum":127}}\n',
+    },
     "projected-returning-local-copy-identity": {
         "state.json": b'{"type":{"kind":"i8"},"value":3}\n',
         "result.json": b'{"type":{"kind":"i8"},"value":3}\n',
@@ -1321,6 +1366,8 @@ with tempfile.TemporaryDirectory(prefix="affine-calls-") as path:
                         assert b"NEVER-SCALAR-WRITE" not in res.stderr,res
                     if name == "exact-startup-conditional-local-write-rejects-reached-effect":
                         assert b"PRIOR" not in res.stderr and b"ARM-EFFECT" not in res.stderr,res
+                    if name == "projected-conditional-local-write-rejects-reached-operand":
+                        assert b"PROJECTED-PRIOR-UNPUBLISHED" not in res.stderr,res
                     if name == "projected-returning-local-copy-refuses-formal":
                         assert b"COPY-PRIOR-UNPUBLISHED" not in res.stderr and b"COPY-FORMAL-UNPUBLISHED" not in res.stderr,res
                 else:

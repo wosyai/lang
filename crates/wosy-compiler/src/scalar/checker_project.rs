@@ -1843,7 +1843,7 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                 && matches!(effect, ExactCallEffect::Scalar { binding: Some(_), ty, .. } if is_integer_type(ty))
                 && matches!(projection.companion, ProjectedCompanion::Unary)
             {
-                cursor.allow_projected_scalar_local_copy().ok_or(ProjectCheck::Unsupported)?;
+                cursor.allow_projected_scalar_local_write().ok_or(ProjectCheck::Unsupported)?;
             }
             self.active.insert(target);
             self.active_depth += 1;
@@ -14707,6 +14707,37 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
             %%end"#);
             assert!(matches!(run("mutual-cycle", &mutual, scope), Err(ProjectCheck::Unsupported)));
         }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn projected_conditional_local_write_preserves_both_preimages() {
+        let identity = OUTPUT.replace(".code = 1", ".code = 89");
+        let constant = OUTPUT.replace(".code = 1", ".code = 90");
+        let program = format!(r#"%%start
+            i8(i8) transfer = fn(entry) {{
+                i8 changed = entry;
+                i8 previous = changed;
+                changed = if (changed < 0) {{ 13 }} else {{ previous }};
+                changed
+            }};
+            unit(i8) check = fn(input) {{
+                i8 output = transfer(input);
+                if (output == 0) {{ core.require(input != 0, {identity}); }};
+                if (output == 13) {{ core.require(input >= 0, {constant}); }};
+            }};
+        %%end"#);
+        let root = source("src/main.w", "projected-conditional-local-write-preimages");
+        let prepared = prepare_proof_target(&root, &program).unwrap();
+        let receipt = run_closed_without_named_proofs(&prepared, ScalarCheckerScope::CurrentPackage, 1).unwrap();
+        let [identity, constant] = receipt.directives.as_slice() else { panic!("both authored preimages must reach"); };
+        assert_eq!(identity.code(), &BigInt::from(89));
+        assert_eq!(constant.code(), &BigInt::from(90));
+        let zero = BigInt::from(0);
+        assert!(identity.witness.intervals_at(0, 0).unwrap().eq([(&zero, &zero)]));
+        assert_eq!(identity.witness.row_equal_axes(0), Some(&[(1, 0)][..]));
+        let (min, max) = (BigInt::from(-128), BigInt::from(-1));
+        assert!(constant.witness.intervals_at(0, 0).unwrap().eq([(&min, &max)]));
     }
 
     #[cfg(feature = "internal-checker")]
