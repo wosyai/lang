@@ -982,20 +982,30 @@ fn emit_project_llvm<'a>(
         match declaration {
             Declaration::Ordinary(index) => {
                 let (module_ordinal, _, function, cfg, ref name, item_ordinal, _) = definitions[index];
+                let aggregate = aggregates.body(module_ordinal, item_ordinal, None);
+                let mut definition_type = aggregate_transfer::definition_type(
+                    &context, function, cfg, target_layout, aggregate,
+                )?;
+                let contextual = generic_input.contextual_formal(module_ordinal, item_ordinal, None).is_some();
+                if contextual {
+                    if !prepared_render || aggregate.is_some()
+                        || definition_type.count_param_types() as usize != function.parameters.len()
+                        || !dynamic_return_outputs(function.span, cfg).is_empty()
+                    {
+                        return Err("contextual ABI cannot share aggregate or ownership sidecars".into());
+                    }
+                    let mut parameters = definition_type.get_param_types().into_iter().map(Into::into)
+                        .collect::<Vec<inkwell::types::BasicMetadataTypeEnum<'_>>>();
+                    parameters.push(context.ptr_type(inkwell::AddressSpace::default()).into());
+                    definition_type = match definition_type.get_return_type() {
+                        Some(ty) => ty.fn_type(&parameters, false),
+                        None => context.void_type().fn_type(&parameters, false),
+                    };
+                }
                 let value = module.add_function(
                     &name,
-                    aggregate_transfer::definition_type(
-                        &context,
-                        function,
-                        cfg,
-                        target_layout,
-                        aggregates.body(module_ordinal, item_ordinal, None),
-                    )?,
-                    aggregate_transfer::linkage(aggregates.body(
-                        module_ordinal,
-                        item_ordinal,
-                        None,
-                    )),
+                    definition_type,
+                    if contextual { Some(Linkage::Internal) } else { aggregate_transfer::linkage(aggregate) },
                 );
                 for (index, parameter) in function.parameters.iter().enumerate() {
                     if let Some(argument) = value.get_nth_param(index as u32) {
@@ -1160,6 +1170,7 @@ fn emit_project_llvm<'a>(
         emit_project_function(
             prepared_render,
             aggregates.body(ordinal, item, arm),
+            generic_input.contextual_formal(ordinal, item, arm),
             &context,
             &builder,
             &functions,
@@ -2321,6 +2332,7 @@ fn emit_main<'ctx, 'module>(
 fn emit_project_function<'ctx, 'module>(
     prepared_render: bool,
     aggregate_plan: Option<&'module crate::scalar::ClosedBody>,
+    contextual_formal: Option<(&crate::scalar::ReferenceBindingId, &ScalarType)>,
     context: &'ctx Context,
     builder: &'ctx Builder<'ctx>,
     functions: &'ctx BTreeMap<String, FunctionValue<'ctx>>,
@@ -2410,6 +2422,19 @@ fn emit_project_function<'ctx, 'module>(
         next_literal: 0,
         next_block: 0,
     };
+    if let Some((binding, ty)) = contextual_formal {
+        if !prepared_render || aggregate_plan.is_some()
+            || value.count_params() as usize != function.parameters.len() + 1
+            || !dynamic_return_outputs(function.span, reference_cfg).is_empty()
+        {
+            return Err("unexpected contextual formal ABI".into());
+        }
+        let Some(BasicValueEnum::PointerValue(pointer)) = value.get_nth_param(function.parameters.len() as u32) else {
+            return Err("missing contextual pointer formal".into());
+        };
+        pointer.set_name("wosy_context");
+        state.contextual_storage.insert(std::rc::Rc::new(binding.clone()), (pointer, ty.clone()));
+    }
     initialize_joined_return_bindings(context, &mut state, joined_bindings)?;
     if let ScalarType::Callable { parameters, .. } = &function.signature {
         for (position, output) in dynamic_return_outputs(function.span, reference_cfg)
@@ -4642,9 +4667,20 @@ enum GenericInitializerInput<'a> {
     PreparedRows(&'a crate::PreparedScalarProject),
 }
 
-impl GenericInitializerInput<'_> {
+impl<'a> GenericInitializerInput<'a> {
     fn prepared_render(self) -> bool {
         matches!(self, Self::PreparedRows(_))
+    }
+
+    fn contextual_formal(self, module: usize, item: usize, arm: Option<usize>)
+        -> Option<(&'a crate::scalar::ReferenceBindingId, &'a ScalarType)>
+    {
+        #[cfg(any(test, feature = "internal-checker"))]
+        if let Self::PreparedRows(prepared) = self {
+            return prepared.contextual_formal(module, item, arm);
+        }
+        let _ = (module, item, arm);
+        None
     }
 
     fn visit_body_overloads(
@@ -4668,13 +4704,13 @@ impl GenericInitializerInput<'_> {
         }
     }
 
-    fn bind_body<'a>(
-        &'a self,
+    fn bind_body<'b>(
+        &'b self,
         module: usize,
         item: usize,
         arm: Option<usize>,
-        body: &'a ScalarBlock,
-    ) -> Result<Option<CallableBodyCallNodes<'a>>, String> {
+        body: &'b ScalarBlock,
+    ) -> Result<Option<CallableBodyCallNodes<'b>>, String> {
         match self {
             Self::RawStandalone(prepared) => prepared.bind_body(item, arm, body).map(Some),
             Self::RawProject(prepared) | Self::PreparedRows(prepared) => prepared

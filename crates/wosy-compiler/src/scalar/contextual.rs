@@ -322,6 +322,18 @@ pub(super) enum DormantContextRejection {
 pub(super) fn prepare_dormant_context(
     canonical: &CanonicalCstRoot, inputs: ScalarPreparationInputs,
 ) -> Result<DormantContextReceipt, DormantContextRejection> {
+    let (prepared, receipt) = prepare_contextual_transport(canonical, inputs)?;
+    let build = analyze_scalar_build(&prepared);
+    if !build.diagnostics().is_empty() {
+        return Err(DormantContextRejection::Unsupported);
+    }
+    Ok(receipt)
+}
+
+#[cfg(any(test, feature = "internal-checker"))]
+pub(super) fn prepare_contextual_transport(
+    canonical: &CanonicalCstRoot, inputs: ScalarPreparationInputs,
+) -> Result<(PreparedScalarProject, DormantContextReceipt), DormantContextRejection> {
     use self::DormantContextRejection::{MissingAtRoot, Unsupported};
     use super::control::{ModuleInitializationCallTarget, ModuleInitializationDetail};
     const MAX_WORK: usize = 4096;
@@ -413,6 +425,12 @@ pub(super) fn prepare_dormant_context(
         ordered.sort_unstable_by_key(|(span, call)| (span.start, call.ordinal.0));
         for (occurrence, call) in ordered {
             let site = body.resolved_call_site(call.ordinal).ok_or(Unsupported)?;
+            // Terminal runtime assertion does not import or mutate a contextual place.
+            if site.target == ResolvedCallTarget::Core(CoreOperationId::SystemPanic)
+                && body.checked_call_signatures.contains_key(&call.ordinal)
+            {
+                continue;
+            }
             let ResolvedCallTarget::ModuleCallable { source, declaration_span, concrete: ConcreteCallSelection::Declaration } = &site.target
                 else { return Err(Unsupported); };
             if source != &canonical.source || !body.checked_call_signatures.contains_key(&call.ordinal) {
@@ -489,9 +507,5 @@ pub(super) fn prepare_dormant_context(
         calls.install_contextual_call(edge.caller, edge.callee, authority).ok_or(Unsupported)?;
         verified.push(DormantContextEdge { occurrence: edge.occurrence, target: edge.target, supplied });
     }
-    let references = super::reference::analyze_project_references(&project.modules, &calls);
-    if !references.errors().is_empty() {
-        return Err(Unsupported);
-    }
-    Ok(DormantContextReceipt { ty, edges: verified })
+    Ok((PreparedScalarProject::from_contextual_transport(project, calls), DormantContextReceipt { ty, edges: verified }))
 }

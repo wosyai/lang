@@ -244,6 +244,7 @@ pub(super) fn emit_expression<'ctx, 'module>(
                         context,
                         state,
                         target,
+                        expression,
                         receiver.as_deref(),
                         name,
                         arguments,
@@ -468,6 +469,7 @@ pub(super) fn emit_project_expression<'ctx, 'module>(
                         context,
                         state,
                         target,
+                        expression,
                         receiver.as_deref(),
                         name,
                         arguments,
@@ -763,6 +765,7 @@ fn emit_prepared_call<'ctx, 'module>(
     context: &'ctx Context,
     state: &mut EmitState<'ctx, 'module>,
     selected: &PreparedCall,
+    expression: &ScalarExpression,
     receiver: Option<&str>,
     name: &str,
     arguments: &[ScalarExpression],
@@ -796,6 +799,17 @@ fn emit_prepared_call<'ctx, 'module>(
         return Err(state.missing_prepared_signature(target));
     };
     let values = emit_contextual_arguments(context, state, arguments, parameters, project)?;
+    #[cfg(any(test, feature = "internal-checker"))]
+    if let Some((binding, ty)) = state.body_call_nodes.and_then(|nodes| nodes.contextual_argument(expression)) {
+        let Some(&(pointer, ref stored)) = state.contextual_storage.get(binding) else {
+            return Err("missing live contextual call binding".into());
+        };
+        if stored != ty {
+            return Err("contextual call binding type mismatch".into());
+        }
+        return emit_call_values_with_context(context, state, target, values, Some(pointer));
+    }
+    let _ = expression;
     emit_call_values(context, state, target, values)
 }
 
@@ -2178,18 +2192,26 @@ fn float_conversion_source_type(
 }
 
 fn emit_call_values<'ctx, 'module>(
+    context: &'ctx Context, state: &mut EmitState<'ctx, 'module>,
+    name: &str, values: Vec<EmitValue<'ctx>>,
+) -> Result<EmitValue<'ctx>, String> {
+    emit_call_values_with_context(context, state, name, values, None)
+}
+
+fn emit_call_values_with_context<'ctx, 'module>(
     context: &'ctx Context,
     state: &mut EmitState<'ctx, 'module>,
     name: &str,
     values: Vec<EmitValue<'ctx>>,
+    contextual_pointer: Option<PointerValue<'ctx>>,
 ) -> Result<EmitValue<'ctx>, String> {
     let function = *state
         .functions
         .get(name)
         .ok_or_else(|| format!("unknown LLVM callable {name}"))?;
-    if function.get_linkage() == Linkage::Internal {
+    if function.get_linkage() == Linkage::Internal && contextual_pointer.is_none() {
         return Err(format!(
-            "closed aggregate callable {name} requires its bound transfer"
+            "internal callable {name} requires its bound transfer"
         ));
     }
     let mut arguments = values
@@ -2207,14 +2229,23 @@ fn emit_call_values<'ctx, 'module>(
     else {
         return Err(format!("LLVM callable {name} has no callable signature"));
     };
-    let owner_outputs = if function.count_params() as usize > parameters.len() {
-        state
-            .dynamic_owner_outputs
-            .get(name)
-            .ok_or_else(|| format!("missing owner signature for {name}"))?
+    let owner_outputs = if let Some(pointer) = contextual_pointer {
+        if function.get_linkage() != Linkage::Internal || function.count_params() as usize != parameters.len() + 1
+            || state.dynamic_owner_outputs.get(name).is_some_and(|outputs| !outputs.is_empty())
+            || !matches!(function.get_nth_param(parameters.len() as u32), Some(BasicValueEnum::PointerValue(_)))
+        {
+            return Err("contextual pointer does not match a scalar ABI".into());
+        }
+        arguments.push(pointer.into());
+        &BTreeSet::new()
+    } else if function.count_params() as usize > parameters.len() {
+        state.dynamic_owner_outputs.get(name).ok_or_else(|| format!("missing owner signature for {name}"))?
     } else {
         &BTreeSet::new()
     };
+    if function.count_params() as usize != arguments.len() + owner_outputs.len() {
+        return Err("call sidecar count does not match prepared arguments".into());
+    }
     let owner_slots = stage_checked_return_sidecars(context, state, owner_outputs, &mut arguments)?;
     let call = state
         .builder

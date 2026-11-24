@@ -3086,6 +3086,15 @@ fn typecheck_scalar_project_in_mode(
     )
 }
 
+#[cfg(any(test, feature = "internal-checker"))]
+pub(crate) fn prepare_internal_contextual_runtime(
+    canonical: &CanonicalCstRoot, inputs: ScalarPreparationInputs,
+) -> Result<PreparedScalarProject, String> {
+    contextual::prepare_contextual_transport(canonical, inputs)
+        .map(|(prepared, _)| prepared)
+        .map_err(|reason| format!("unsupported contextual runtime transport: {reason:?}"))
+}
+
 pub fn prepare_scalar_project(
     declarations: Vec<(ScalarSourceDeclarations, Vec<ScalarNamespaceBinding>)>,
     initialization_order: Vec<SourceIdentity>,

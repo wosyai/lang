@@ -232,6 +232,18 @@ impl PreparedScalarProject {
         Ok(Self { project, calls })
     }
 
+    #[cfg(any(test, feature = "internal-checker"))]
+    pub(super) fn from_contextual_transport(project: ScalarProject, calls: reference::ProjectCallSiteResults) -> Self {
+        Self { project, calls }
+    }
+
+    #[cfg(any(test, feature = "internal-checker"))]
+    pub(crate) fn contextual_formal(&self, module: usize, item: usize, arm: Option<usize>)
+        -> Option<(&ReferenceBindingId, &ScalarType)>
+    {
+        self.calls.function_body(module, item, arm)?.contextual_formal()
+    }
+
     pub fn project(&self) -> &ScalarProject {
         &self.project
     }

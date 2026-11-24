@@ -4308,6 +4308,66 @@ fn retains_core_runtime_declarations_when_serializing_wasm_externs() {
 }
 
 #[test]
+fn emits_internal_contextual_pointer_transport_for_native64_and_wasm32() {
+    let source = SourceIdentity::new("project".into(), "package".into(), "src/main.w".into(), "r1".into());
+    let text = r#"%%start
+        i8(i8) identity = fn(value) { value };
+        unit() consume = fn { core.context.credit = core.context.credit - 1; };
+        unit() relay = fn { consume(); };
+        unit() entry = fn {
+            i8 core.context.credit = 3;
+            relay();
+            if (core.context.credit != 2) { core.system_panic(); };
+            if (true) {
+                i8 core.context.credit = 20;
+                relay();
+                if (core.context.credit != 19) { core.system_panic(); };
+            };
+            relay();
+            i8 count = identity(core.context.credit);
+            if (count != 1) { core.system_panic(); };
+        };
+        entry();
+    %%end"#;
+    for (target, target_layout) in [("native", ScalarTargetLayout::NATIVE64), ("wasm", ScalarTargetLayout::WASM32)] {
+        let parsed = parse_source(source.clone(), text.to_owned(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let prepared = crate::scalar::prepare_internal_contextual_runtime(
+            parsed.result.canonical_cst(), ScalarPreparationInputs { target_layout },
+        ).expect("authenticated contextual graph");
+        let build = analyze_scalar_build(&prepared);
+        assert!(build.diagnostics().is_empty(), "{:?}", build.diagnostics());
+        let ir = super::emit_scalar_build_project_llvm_text(&build).expect("verified contextual LLVM");
+        let name = |name| project_function_name(&source, name);
+        assert!(ir.contains(&format!("define internal void @{}(ptr %wosy_context)", name("consume"))), "{ir}");
+        assert!(ir.contains(&format!("define internal void @{}(ptr %wosy_context)", name("relay"))), "{ir}");
+        assert!(ir.contains(&format!("define void @{}()", name("entry"))), "{ir}");
+        assert!(ir.contains(&format!("call void @{}()", name("entry"))), "{ir}");
+        assert!(ir.contains(&format!("define i8 @{}(i8 %value)", name("identity"))), "{ir}");
+        assert!(ir.contains(&format!("call void @{}(ptr %wosy_context)", name("consume"))), "{ir}");
+        let relay_prefix = format!("call void @{}(ptr ", name("relay"));
+        let pointers = ir.lines().filter_map(|line| line.split_once(&relay_prefix).map(|(_, tail)| tail)).collect::<Vec<_>>();
+        let [outer, inner, restored] = pointers.as_slice() else { panic!("{ir}"); };
+        assert_ne!(outer, inner);
+        assert_eq!(outer, restored);
+        if std::env::var_os("WOSY_CONTEXTUAL_EMIT_TEST_IR").is_some() {
+            eprintln!("WOSY-CONTEXT-IR-START-{target}\n{ir}WOSY-CONTEXT-IR-END-{target}");
+        }
+    }
+
+    for invalid in [
+        text.replace("i8 core.context.credit = 3;", ""),
+        text.replace("i8 core.context.credit = 20", "i16 core.context.credit = 20"),
+    ] {
+        let parsed = parse_source(source.clone(), invalid, &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        assert!(crate::scalar::prepare_internal_contextual_runtime(
+            parsed.result.canonical_cst(), ScalarPreparationInputs { target_layout: ScalarTargetLayout::NATIVE64 },
+        ).is_err());
+    }
+}
+
+#[test]
 fn emits_contextual_scoped_integer_places_for_native64_and_wasm32() {
     let source = SourceIdentity::new("project".into(), "package".into(), "src/main.w".into(), "r1".into());
     let text = r#"%%start

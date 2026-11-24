@@ -680,6 +680,12 @@ impl<'a> CallableBodyCallNodes<'a> {
         self.proof_nodes.blocks.get(&std::ptr::from_ref(block)).map(|ordinal| ordinal.0)
     }
 
+    #[cfg(any(test, feature = "internal-checker"))]
+    pub(crate) fn contextual_argument(&self, expression: &ScalarExpression) -> Option<(&'a crate::scalar::ReferenceBindingId, &'a ScalarType)> {
+        let ordinal = *self.proof_nodes.expressions.get(&std::ptr::from_ref(expression))?;
+        self.proof_nodes.calls?.contextual_argument(ordinal)
+    }
+
     pub(crate) fn expression_ordinal(&self, expression: &ScalarExpression) -> Option<usize> {
         self.proof_nodes
             .expressions

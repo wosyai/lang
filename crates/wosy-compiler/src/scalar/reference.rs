@@ -6685,6 +6685,16 @@ struct ContextualCallPlace {
 }
 
 impl FunctionCallSites {
+    #[cfg(any(test, feature = "internal-checker"))]
+    pub(super) fn contextual_formal(&self) -> Option<(&ReferenceBindingId, &ScalarType)> {
+        self.contextual_formal.as_ref().map(|(binding, ty, _)| (binding, ty))
+    }
+
+    #[cfg(any(test, feature = "internal-checker"))]
+    pub(super) fn contextual_argument(&self, ordinal: OccurrenceOrdinal) -> Option<(&ReferenceBindingId, &ScalarType)> {
+        self.contextual_calls.as_ref()?.get(&ordinal).map(|site| (&site.binding, &site.ty))
+    }
+
     pub(super) fn resolved_call_site(&self, ordinal: OccurrenceOrdinal) -> Option<&ResolvedCallSite> {
         self.call_occurrences
             .binary_search_by_key(&ordinal.0, |association| association.ordinal.0)
