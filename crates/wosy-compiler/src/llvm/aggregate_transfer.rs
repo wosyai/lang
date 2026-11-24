@@ -310,7 +310,8 @@ pub(super) fn capture_borrowed_extent<'ctx>(
     count: inkwell::values::IntValue<'ctx>,
 ) -> Result<(), String> {
     if let Some(aggregate) = &mut state.aggregate {
-        if aggregate.plan.borrowed_extent_call.is_some_and(|(_, owner, _)| owner == declaration)
+        if !aggregate.plan.borrowed_current_widened_extent
+            && aggregate.plan.borrowed_extent_call.is_some_and(|(_, owner, _)| owner == declaration)
             && aggregate.borrowed_extent.replace(count).is_some()
         {
             return Err("duplicate sealed borrowed array allocation".into());
@@ -342,26 +343,47 @@ pub(super) fn emit_borrowed_extent_call<'ctx>(
     expression: &ScalarExpression,
     symbol: &str,
     arguments: &[ScalarExpression],
-    values: &[EmitValue<'ctx>],
+    parameters: &[ScalarType],
+    project: Option<ProjectCallScope<'_>>,
 ) -> Result<Option<EmitValue<'ctx>>, String> {
-    let Some((occurrence, declaration, alias)) = state.aggregate.as_ref().and_then(|aggregate| aggregate.plan.borrowed_extent_call)
-    else { return Ok(None) };
+    let Some(plan) = state.aggregate.as_ref().map(|aggregate| aggregate.plan) else { return Ok(None) };
+    let Some((occurrence, declaration, alias)) = plan.borrowed_extent_call else { return Ok(None) };
     let nodes = state.body_call_nodes.ok_or("missing sealed checked borrow nodes")?;
     if nodes.expression_ordinal(expression) != Some(occurrence) { return Ok(None); }
-    let exact = match (arguments, alias) {
-        ([ScalarExpression::CheckedAddress { place: place @ crate::ScalarPlace::Name { .. }, .. }], None) =>
-            nodes.lexical_place_declaration(place) == Some(declaration),
-        ([argument @ ScalarExpression::Name { .. }], Some(alias)) =>
-            nodes.lexical_expression_declaration(argument) == Some(alias),
-        _ => false,
+    let (address, count) = if plan.borrowed_current_widened_extent {
+        let [ScalarExpression::CheckedAddress { mutability: crate::scalar::ScalarReferenceMutability::Shared,
+            place: place @ ScalarPlace::Name { .. }, .. }] = arguments else {
+            return Err("sealed widened borrow needs one whole shared place".into());
+        };
+        if alias.is_some() || nodes.lexical_place_declaration(place) != Some(declaration) {
+            return Err("sealed widened borrow changed its checked argument identity".into());
+        }
+        // Evaluate the place once. The same qualified backing is the key of
+        // the current extent and the source of the checked address argument.
+        let pointer = memory::place_pointer(context, state, place, project)?;
+        let count = memory::capture_local_runtime_extent(context, state, place, pointer, false)?
+            .ok_or("missing current sealed widened array extent")?;
+        let address = state.builder.build_ptr_to_int(pointer,
+            memory::pointer_integer_type(context, state.target_layout), "address").map_err(builder_error)?;
+        (address, count)
+    } else {
+        let exact = match (arguments, alias) {
+            ([ScalarExpression::CheckedAddress { place: place @ ScalarPlace::Name { .. }, .. }], None) =>
+                nodes.lexical_place_declaration(place) == Some(declaration),
+            ([argument @ ScalarExpression::Name { .. }], Some(alias)) =>
+                nodes.lexical_expression_declaration(argument) == Some(alias),
+            _ => false,
+        };
+        if !exact {
+            return Err("sealed borrowed extent changed its checked argument identity".into());
+        }
+        let values = super::expression::emit_contextual_arguments(context, state, arguments, parameters, project)?;
+        let [EmitValue::Basic(BasicValueEnum::IntValue(address))] = values.as_slice()
+        else { return Err("missing sealed borrowed array address value".into()) };
+        let count = state.aggregate.as_mut().and_then(|aggregate| aggregate.borrowed_extent.take())
+            .ok_or("missing sealed borrowed array extent")?;
+        (*address, count)
     };
-    if !exact {
-        return Err("sealed borrowed extent changed its checked argument identity".into());
-    }
-    let [EmitValue::Basic(BasicValueEnum::IntValue(address))] = values
-    else { return Err("missing sealed borrowed array address value".into()) };
-    let count = state.aggregate.as_mut().and_then(|aggregate| aggregate.borrowed_extent.take())
-        .ok_or("missing sealed borrowed array extent")?;
     let function = *state.functions.get(symbol).ok_or("missing sealed borrowed array observer")?;
     let descriptor = borrowed_extent_type(context, state.target_layout);
     if function.get_linkage() != Linkage::Internal || function.get_type().get_param_types().as_slice() != [descriptor.into()]
@@ -369,7 +391,7 @@ pub(super) fn emit_borrowed_extent_call<'ctx>(
     {
         return Err("sealed borrowed array extent call ABI changed".into());
     }
-    let pair = state.builder.build_insert_value(descriptor.get_undef(), *address, 0, "borrowed_array_argument_address").map_err(builder_error)?.into_struct_value();
+    let pair = state.builder.build_insert_value(descriptor.get_undef(), address, 0, "borrowed_array_argument_address").map_err(builder_error)?.into_struct_value();
     let pair = state.builder.build_insert_value(pair, count, 1, "borrowed_array_argument").map_err(builder_error)?.into_struct_value();
     let value = state.builder.build_call(function, &[pair.into()], "borrowed_extent").map_err(builder_error)?
         .try_as_basic_value().basic().ok_or("missing observed borrowed array extent")?;

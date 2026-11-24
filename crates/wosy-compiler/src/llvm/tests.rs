@@ -12048,6 +12048,20 @@ u64() two = fn() { u8[] bytes = [11, 13]; extent(&bytes) };
 u64() three = fn() { u8[] bytes = [3, 5, 7]; relay(&bytes) };
 if (two() != 2) { core.system_panic(); };
 if (three() != 3) { core.system_panic(); };
+u64(bool) joined = fn(pick) {
+    u8[] bytes = if (pick) { u8[] left = [11, 13]; left }
+        else { u8[] right = [3, 5, 7]; right };
+    relay(&bytes)
+};
+u64() rebound = fn() {
+    u8[] bytes = [11, 13];
+    u8[] incoming = [3, 5, 7];
+    bytes = incoming;
+    relay(&bytes)
+};
+if (joined(true) != 2) { core.system_panic(); };
+if (joined(false) != 3) { core.system_panic(); };
+if (rebound() != 3) { core.system_panic(); };
 %%end";
     for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
         for access in [true, false] {
@@ -12088,7 +12102,24 @@ if (three() != 3) { core.system_panic(); };
                 let free = body.find("call void @__wosy_core_free(ptr %allocation)").unwrap();
                 assert!(call < free, "{body}");
             }
-            if let Some(out) = std::env::var_os("WOSY_WIDENED_BORROW_IR_DIR") {
+            let joined = self_tail_test_body(&llvm, "i64", &project_function_name(&source, "joined"));
+            assert_eq!(joined.matches("phi { ptr, i64 }").count(), 1, "{joined}");
+            assert!(joined.contains("ptrtoint ptr %widened_join_backing")
+                && joined.contains(&format!("insertvalue {pair} %borrowed_array_argument_address, i64 %widened_join_extent, 1")), "{joined}");
+            let call = format!("call i64 @{relay}({pair} %borrowed_array_argument)");
+            assert_eq!(joined.matches("call void @__wosy_core_free(").count(), 1, "{joined}");
+            assert!(joined.find(&call).unwrap() < joined.find("call void @__wosy_core_free(ptr %widened_join_backing)").unwrap(), "{joined}");
+
+            let rebound = self_tail_test_body(&llvm, "i64", &project_function_name(&source, "rebound"));
+            assert_eq!(rebound.matches("call void @__wosy_core_free(").count(), 2, "{rebound}");
+            let incoming = rebound.lines().find(|line| line.contains("call ptr @__wosy_core_alloc(i64 3, i64 1)"))
+                .unwrap().trim().split_once(" = ").unwrap().0;
+            assert!(rebound.contains(&format!("ptrtoint ptr {incoming}"))
+                && rebound.contains(&format!("insertvalue {pair} %borrowed_array_argument_address, i64 3, 1")), "{rebound}");
+            assert!(rebound.find("call void @__wosy_core_free(ptr %allocation)").unwrap()
+                < rebound.find(&call).unwrap() && rebound.find(&call).unwrap()
+                < rebound.find(&format!("call void @__wosy_core_free(ptr {incoming})")).unwrap(), "{rebound}");
+            if let Some(out) = std::env::var_os("WOSY_CURRENT_WIDENED_BORROW_IR_DIR") {
                 let target = if layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
                 let controlled = llvm.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);
                 assert_ne!(controlled, llvm);

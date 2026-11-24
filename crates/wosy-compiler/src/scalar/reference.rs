@@ -5085,18 +5085,15 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             || !matches!(calls.boundary.root_outputs.as_slice(), [output] if output.ty == ScalarType::U64)
                             || calls.declared_unsafe_calls.contains(&ordinal.0)
                         { return None; }
-                        let [ScalarBlockItem::LocalBinding(root), _] = block.items.as_slice() else { return None };
-                        super::widened_local_literal(root)?;
-                        let [receiver] = root.receivers.as_slice() else { return None };
                         let ScalarExpression::Call { arguments, .. } = expression else { return None };
                         let [ScalarExpression::CheckedAddress { mutability: ScalarReferenceMutability::Shared, place, .. }] =
                             arguments.as_slice() else { return None };
                         let ScalarPlace::Name { name, .. } = place else { return None };
                         let binding = self.names.get(name)?;
-                        if binding.declaration_span != receiver.name_span || !owners.contains(binding) { return None; }
+                        if binding.block_span != block.span || !owners.contains(binding) { return None; }
                         let [ScalarType::CheckedReference { mutability: ScalarReferenceMutability::Shared, inner }] =
                             calls.checked_call_signatures.get(&ordinal)?.parameters.as_slice() else { return None };
-                        if !aggregate::same_runtime_array_type(&receiver.ty, inner)
+                        if !self.binding_types.get(binding).is_some_and(|ty| aggregate::same_runtime_array_type(ty, inner))
                             || !matches!(self.call_target(expression, ordinal),
                                 Ok(ResolvedCallTarget::ModuleCallable { concrete: ConcreteCallSelection::Declaration, .. }))
                         { return None; }
@@ -5140,7 +5137,19 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         {
                             self.aggregate_facts.borrowed_extent_forward = Some((value_point, slot.expression));
                         }
-                        if scope == ReferenceScopeId(0) && slot.output == 0
+                        if let Some(owner) = widened_borrow {
+                            let argument = match &self.cfg.points[value_point.0].kind {
+                                CfgPointKind::Call { output: 0, argument_points, .. } =>
+                                    match argument_points.as_slice() { [argument] => Some(*argument), _ => None },
+                                _ => None,
+                            };
+                            if argument.and_then(|point| self.borrowed_extent_argument(point, 0)) != Some((owner, None)) {
+                                return Err(self.missing_context(expression_span(expression),
+                                    ReferenceAnalysisErrorReason::UnprovedWidenedArrayTransfer));
+                            }
+                            self.aggregate_facts.borrowed_extent_call = Some((value_point, ordinal, owner, None));
+                            self.aggregate_result.widened_borrowed_extent_required = Some(ordinal);
+                        } else if scope == ReferenceScopeId(0) && slot.output == 0
                             && matches!(calls.boundary.root_outputs.as_slice(), [output] if output.ty == ScalarType::U64)
                             && !calls.declared_unsafe_calls.contains(&slot.expression.0)
                             && calls.checked_call_signatures.get(&slot.expression).is_some_and(|signature|
@@ -5153,8 +5162,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                                 aliases @ ..,
                                 BlockItem { kind: BlockItemKind::FinalOutput(_), .. },
                             ] = region.items.as_slice() {
-                                if (widened_borrow.is_some()
-                                    || matches!(root.initialization, BindingInitialization::Allocation { .. }))
+                                if matches!(root.initialization, BindingInitialization::Allocation { .. })
                                     && aliases.iter().all(|item| matches!(&item.kind,
                                         BlockItemKind::Binding(binding) if binding.receivers().len() == 1
                                             && matches!(&binding.initialization, BindingInitialization::Outputs(init)
@@ -5171,13 +5179,6 @@ impl<'a> ReferenceFlowBuilder<'a> {
                                     }
                                 }
                             }
-                        }
-                        if let Some(owner) = widened_borrow {
-                            if self.aggregate_facts.borrowed_extent_call != Some((value_point, ordinal, owner, None)) {
-                                return Err(self.missing_context(expression_span(expression),
-                                    ReferenceAnalysisErrorReason::UnprovedWidenedArrayTransfer));
-                            }
-                            self.aggregate_result.widened_borrowed_extent_required = Some(ordinal);
                         }
                         if scope == ReferenceScopeId(0) && slot.output == 0
                             && self.aggregate_facts.literal_array_unit.is_none()

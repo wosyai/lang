@@ -486,7 +486,7 @@ pub(super) fn emit_array_len<'ctx>(
     Ok(EmitValue::Basic(length.into()))
 }
 
-fn capture_local_runtime_extent<'ctx>(
+pub(super) fn capture_local_runtime_extent<'ctx>(
     context: &'ctx Context,
     state: &EmitState<'ctx, '_>,
     base: &crate::ScalarPlace,

@@ -2981,6 +2981,7 @@ pub(crate) struct ClosedBody {
     pub(crate) borrowed_extent_observer: Option<(usize, ByteSpan)>,
     pub(crate) borrowed_extent_forward: Option<usize>,
     pub(crate) borrowed_extent_call: Option<(usize, ByteSpan, Option<ByteSpan>)>,
+    pub(crate) borrowed_current_widened_extent: bool,
     pub(crate) array_descriptor_identity: bool,
     pub(crate) array_descriptor_observer: Option<ByteSpan>,
     pub(crate) array_descriptor_forward: Option<usize>,
@@ -7005,11 +7006,12 @@ fn closed_aggregates<'a>(
         seal_borrowed_extent_observers(&ordinary, &borrowed_extent_observers, &borrowed_extent_callers,
             &declarations, &bodies, &mut result, reservations.checked_access);
         for &(key, source, call) in &widened_borrowed_extent_requirements {
-            if !result.bodies.get(&key).is_some_and(|plan|
+            let Some(plan) = result.bodies.get_mut(&key).filter(|plan|
                 plan.borrowed_extent_call.is_some_and(|(actual, _, alias)| actual == call.0 && alias.is_none()))
-            {
+            else {
                 return Err(format!("widened array borrow requires a closed exact extent reader in {source:?}"));
-            }
+            };
+            plan.borrowed_current_widened_extent = true;
         }
         for &(key, source) in &borrowed_extent_requirements {
             if !result.bodies.get(&key).is_some_and(|plan| plan.borrowed_extent_observer.is_some()) {
