@@ -163,6 +163,22 @@ fn joined_child_reads_both_use_the_selected_owner() {
 }
 
 #[test]
+fn joined_child_observations_in_nested_arms_end_before_owner_reuse() {
+    let program = joined_with_pointer_read(
+        "u8 observed = if (choose) { pointer(child) } else { *child }; first = 3;",
+        "*value",
+    ).replace("    seen\n", "    if (observed == seen && first == 3) { observed } else { 0 }\n");
+    check_case(&program, Expected::Valid, Some("WOSY_JOINED_BRANCH_READ_IR_DIR"));
+
+    let live = program.replace(
+        "if (choose) { pointer(child) } else { *child }; first = 3;",
+        "if (choose) { first = 3; pointer(child) } else { *child };",
+    );
+    assert_ne!(live, program);
+    check(&live, Expected::LiveConflict);
+}
+
+#[test]
 fn joined_child_stays_live_between_typed_reads() {
     let program = joined("parent = &!second;", true, "", "first = 3; u8 again = *child; again;");
     check(&program, Expected::LiveConflict);
