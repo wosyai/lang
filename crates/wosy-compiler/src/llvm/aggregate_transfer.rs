@@ -85,6 +85,7 @@ pub(super) struct AggregateEmitter<'ctx, 'plan> {
     plan: &'plan ClosedBody,
     destination: Option<PointerValue<'ctx>>,
     ordinary_destination: Option<PointerValue<'ctx>>,
+    local_choice_destination: Option<PointerValue<'ctx>>,
     ordinary_committed: bool,
     ordinary_called: bool,
     literal_array_receipt: LiteralArrayReceipt<'ctx>,
@@ -197,6 +198,7 @@ impl<'ctx, 'plan> AggregateEmitter<'ctx, 'plan> {
             input,
             destination,
             ordinary_destination,
+            local_choice_destination: None,
             ordinary_committed: false,
             ordinary_called: false,
             literal_array_receipt: LiteralArrayReceipt::Awaiting,
@@ -772,6 +774,25 @@ pub(super) fn store_received_binding<'ctx>(
     value: &EmitValue<'ctx>,
 ) -> Result<bool, String> {
     if let Some(aggregate) = state.aggregate.as_mut() {
+        if let Some((block, item, conditional)) = aggregate.plan.local_choice_binding {
+            let nodes = state.body_call_nodes.ok_or("missing local conditional ownership occurrences")?;
+            if nodes.binding_position(binding) == Some((block, item)) {
+                let [receiver] = binding.receivers.as_slice() else { return Err("invalid local conditional receiver".into()) };
+                let EmitValue::Basic(BasicValueEnum::PointerValue(base)) = value else { return Err("missing selected original backing".into()) };
+                if nodes.expression_ordinal(&binding.value) != Some(conditional) || aggregate.structured_arms_visited != 2
+                    || aggregate.committed || !matches!(receiver.ty, ScalarType::Struct(_))
+                {
+                    return Err("changed local conditional owner binding".into());
+                }
+                let descriptor = aggregate.local_choice_destination.take().ok_or("missing local conditional descriptor")?;
+                if aggregate.receipts.insert(conditional, *base).is_some() {
+                    return Err("duplicate local conditional owner receipt".into());
+                }
+                aggregate.committed = true;
+                state.storage.insert(receiver.name.clone(), (descriptor, receiver.ty.clone()));
+                return Ok(true);
+            }
+        }
         if let Some((block, item, conditional)) = aggregate.plan.structured_result_binding {
             let nodes = state.body_call_nodes.ok_or("missing structured result binding occurrences")?;
             if nodes.binding_position(binding) == Some((block, item)) {
@@ -1148,6 +1169,20 @@ fn emit_selected_call<'ctx, 'module>(
                 "aggregate_destination",
             )?)
         }
+        Some(CallDestination::Body(ClosedCall::LocalChoiceArm)) => {
+            let [output] = outputs.outputs.as_slice() else { return Err("invalid local conditional output".into()) };
+            if !matches!(output.ty, ScalarType::Struct(_)) {
+                return Err("invalid local conditional descriptor type".into());
+            }
+            let aggregate = state.aggregate.as_ref().expect("local conditional owner frame");
+            if let Some(storage) = aggregate.local_choice_destination {
+                Some(storage)
+            } else {
+                let storage = entry_storage_alloca(context, state, &output.ty, "local_choice_descriptor")?;
+                state.aggregate.as_mut().expect("local conditional owner frame").local_choice_destination = Some(storage);
+                Some(storage)
+            }
+        }
         Some(CallDestination::Body(ClosedCall::Forward | ClosedCall::ResultArm)) => Some(state.aggregate.as_ref().and_then(|aggregate| aggregate.destination)
             .ok_or_else(|| "missing closed aggregate forwarding destination".to_owned())?),
         Some(CallDestination::Initializer(global)) => Some(global),
@@ -1241,6 +1276,16 @@ fn emit_selected_call<'ctx, 'module>(
         }
         return Ok(EmitValue::Unit);
     }
+    if matches!(action, Some(CallDestination::Body(ClosedCall::LocalChoiceArm))) {
+        let aggregate = state.aggregate.as_mut().expect("local conditional owner frame");
+        if aggregate.plan.local_choice_binding.is_none() || mixed.is_some()
+            || !matches!(transport, BasicValueEnum::PointerValue(_))
+        {
+            return Err("invalid local conditional owner transfer".into());
+        }
+        aggregate.structured_arms_visited += 1;
+        return Ok(EmitValue::Basic(transport));
+    }
     if matches!(action, Some(CallDestination::Body(ClosedCall::ResultArm))) {
         let aggregate = state.aggregate.as_mut().expect("structured aggregate arm frame");
         if !matches!(aggregate.plan.returning, Some(ClosedReturn::Structured { .. }))
@@ -1266,7 +1311,7 @@ fn emit_selected_call<'ctx, 'module>(
             let aggregate = state.aggregate.as_mut().expect("closed aggregate call context");
             match action {
                 ClosedCall::Forward => aggregate.set_base(base)?,
-                ClosedCall::ResultArm => unreachable!("structured arms return their base to the result join"),
+                ClosedCall::ResultArm | ClosedCall::LocalChoiceArm => unreachable!("structured arms return their base to the result join"),
                 ClosedCall::Receive => {
                     if aggregate.receipts.insert(ordinal, base).is_some() {
                         return Err("duplicate closed aggregate receipt".into());
@@ -1634,6 +1679,9 @@ pub(super) fn finish_return<'ctx>(
     }
     if aggregate.plan.scalar_descriptor_assignment.is_some() && !aggregate.scalar_descriptor_enrolled {
         return Err("descriptor assignment did not commit ownership".into());
+    }
+    if aggregate.plan.local_choice_binding.is_some() && (!aggregate.committed || aggregate.local_choice_destination.is_some()) {
+        return Err("local conditional owner was not committed to lexical storage".into());
     }
     if !aggregate.receipts.is_empty() || aggregate.receipt_guards.len() != aggregate.plan.conditional_guard_count || aggregate.input.is_some() {
         return Err("unreleased closed aggregate receipt".into());

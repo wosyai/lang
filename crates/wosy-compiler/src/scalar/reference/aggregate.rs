@@ -2508,6 +2508,7 @@ pub(crate) enum ClosedCall {
     Receive,
     Forward,
     ResultArm,
+    LocalChoiceArm,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2612,6 +2613,7 @@ pub(crate) struct ClosedBody {
     pub(crate) checked_backing_optional: bool,
     pub(crate) returning: Option<ClosedReturn>,
     mixed_branch_return: Option<Box<MixedBranchReturn>>,
+    pub(crate) local_choice_binding: Option<(usize, usize, usize)>, // block, item, conditional
     pub(crate) structured_result_binding: Option<(usize, usize, usize)>, // block, item, conditional
     pub(crate) local_result_arms: BTreeMap<usize, (usize, usize)>, // block -> (allocation item, output)
     pub(crate) named_result_arms: BTreeMap<usize, (usize, usize)>, // block -> (output, producer)
@@ -2738,6 +2740,64 @@ impl Body<'_> {
 
     fn has_mixed_struct_result(&self) -> bool {
         self.mixed_result_lanes().is_some()
+    }
+
+    fn local_receipt_choice(&self) -> Option<(BlockOrdinal, usize, OccurrenceOrdinal, CfgPointId, [CfgPointId; 2])> {
+        let facts = self.facts?;
+        if !self.is_monomorphic || facts.calls.len() != 2 { return None; }
+        let [output_ty] = self.sites.boundary.root_outputs.as_slice() else { return None };
+        if !ordinary_value(&output_ty.ty) { return None; }
+        let structure = &self.sites.structure;
+        let root = structure.root;
+        let [bind, result] = structure.blocks.get(root.0)?.items.as_slice() else { return None };
+        let (BlockItemKind::Binding(binding), BlockItemKind::FinalOutput(output)) = (&bind.kind, &result.kind)
+            else { return None };
+        let [receiver] = binding.receivers() else { return None };
+        let BindingInitialization::Outputs(init) = &binding.initialization else { return None };
+        let ScalarType::Struct(descriptor) = &receiver.ty else { return None };
+        let (holder, field) = self.sites.prepared_lexical_member(output.expression)?;
+        if !init.secondary.is_empty() || output.output != 0 || holder.declaration_span != receiver.span
+            || &field.structure != descriptor || structure.checked_types.expressions.get(&init.primary) != Some(&receiver.ty)
+            || structure.checked_types.expressions.get(&output.expression) != Some(&output_ty.ty)
+        { return None; }
+        let Some(ConditionalRegion::Value { then_block, else_block, .. }) = self.sites.conditionals.get(&init.primary)
+            else { return None };
+        let region = facts.conditional_input_regions.values().find(|region| region.expression == init.primary)?;
+        let points = &self.cfg.points;
+        let join = points.get(region.join.0)?;
+        let scope = points.first()?.scope;
+        let next = |point: CfgPointId| linear_successor(points, point).and_then(|p| points.get(p.0));
+        let installed = next(join.id)?;
+        let read = next(installed.id)?;
+        let returned = next(read.id)?;
+        let exit = next(returned.id)?;
+        if [join, installed, read, returned, exit].into_iter().any(|point| point.scope != scope)
+            || !matches!(join.kind, CfgPointKind::Join)
+            || join.source_span.range != self.sites.occurrences.get(init.primary.0)?.span
+            || !matches!(&installed.kind, CfgPointKind::Bind { binding } if binding == holder)
+            || read.source_span.range != self.sites.occurrences.get(output.expression.0)?.span
+            || !matches!(&read.kind, CfgPointKind::ReadPlace { pointer_point: None, reads_origin: false,
+                candidates, .. } if matches!(candidates.as_slice(), [place] if &place.binding == holder &&
+                    matches!(place.projections.as_slice(),
+                        [ReferencePlaceProjection::Field(ScalarFieldReference::Resolved(found))] if found == field)))
+            || !matches!(returned.kind, CfgPointKind::ReturnOutput { output: 0, value_point, checked: false }
+                if value_point == read.id)
+            || !matches!(exit.kind, CfgPointKind::ScopeExit)
+        { return None; }
+        let prove_arm = |block: BlockOrdinal, side: usize| {
+            let [item] = structure.blocks.get(block.0)?.items.as_slice() else { return None };
+            let BlockItemKind::FinalOutput(output) = &item.kind else { return None };
+            let (&id, _) = facts.calls.iter().find(|(_, ordinal)| **ordinal == output.expression)?;
+            let leaf = points.get(id.0)?;
+            let terminal = next(id)?;
+            (output.output == 0 && structure.checked_types.expressions.get(&output.expression) == Some(&receiver.ty)
+                && leaf.scope != scope && leaf.scope == points.get(region.entries[side].0)?.scope
+                && terminal.scope == leaf.scope && terminal.id == region.terminals[side]
+                && matches!(terminal.kind, CfgPointKind::ScopeExit) && next(terminal.id)?.id == join.id)
+                .then_some(id)
+        };
+        let leaves = [prove_arm(*then_block, 0)?, prove_arm(*else_block, 1)?];
+        (leaves[0] != leaves[1]).then_some((root, bind.position, init.primary, exit.id, leaves))
     }
 
     fn structured_owner_return(&self) -> Option<StructuredOwnerReturn> {
@@ -4922,6 +4982,16 @@ fn closed_aggregates<'a>(
             }
             Ok(())
         };
+        let local_choice = (!returning && plan.input.is_none()).then(|| body.local_receipt_choice()).flatten()
+            .filter(|&(_, _, _, _, leaves)| leaves.into_iter().all(|leaf| {
+                target_body(&declarations, body.cfg, leaf).is_some_and(|target|
+                    outgoing.contains(&target) && bodies.get(&target).is_some_and(|callee| !callee.has_mixed_struct_result()))
+            }));
+        if let Some((block, item, conditional, exit, _)) = local_choice {
+            plan.local_choice_binding = Some((block.0, item, conditional.0));
+            plan.scope_exits.insert(block.0, exit);
+            record_release(&mut plan, exit, exit, ClosedOwnerRelease { receipt: conditional.0, guard: None })?;
+        }
         for (&point, &call) in &facts.calls {
             let previous = recommitted.get(&(key, point));
             if let Some(origin) = previous {
@@ -4938,6 +5008,13 @@ fn closed_aggregates<'a>(
             }
             let owner = OwnerSource::Call(point);
             let mut endpoints = call_endpoints.get(&point).into_iter().flatten().copied();
+            if local_choice.is_some_and(|(_, _, _, _, leaves)| leaves.contains(&point)) {
+                if previous.is_some() || discharged_by_inputs.contains_key(&(key, point)) || endpoints.next().is_some() {
+                    return Err(format!("local conditional aggregate has competing owner routes in {:?}", body.source));
+                }
+                plan.calls.insert(call.0, ClosedCall::LocalChoiceArm);
+                continue;
+            }
             if matches!(return_route, Some(ClosedReturn::Structured { .. }))
                 && structured_returns[&key].leaves.contains(&point)
             {
