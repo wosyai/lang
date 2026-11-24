@@ -1049,6 +1049,43 @@ cases.extend([
     ("exact-startup-contextual-bool-restores-symbolic-shape",symbolic_contextual_bool.replace(
         "%%end","inspect(false); inspect(true); %%end"),220,b"INNER-FALSEOUTER-TRUE"),
 ])
+contextual_counter = f"""%%start
+    unit(u8) debit = fn(initial) {{
+        core.narrow(initial == 1 || initial == 3, {report(1,"PRUNE")});
+        u8 core.context.remaining = initial;
+        u8 previous = core.context.remaining;
+        core.context.remaining = core.context.remaining - 1;
+        u8 current = core.context.remaining;
+        if (current == 2) {{
+            core.require(previous == 3 && initial == 3, {report(61,"LOST-PREIMAGE")});
+            core.require(false, {{ .stdout = ""; .stderr = "COUNTER-DEBIT"; .code = 63; .files = [
+                {{ .path = "old.json"; .state = previous; }},
+                {{ .path = "new.json"; .state = core.context.remaining; }}
+            ]; }});
+        }} else {{
+            core.require(current == 0 && previous == 1 && initial == 1, {report(59,"WRONG-DEBIT")});
+        }};
+    }};
+    %%end"""
+returning_contextual_counter = f"""%%start
+    u8(u8) debit = fn(initial) {{
+        u8 core.context.remaining = initial;
+        core.context.remaining = core.context.remaining - 1;
+        u8 current = core.context.remaining;
+        core.require(false, {report(65,"RETURNING-COUNTER-WRITE")});
+        current
+    }};
+    u8 saved = debit(3);
+    core.require(saved != 2, {report(67,"RETURNING-COUNTER-RESULT")});
+    %%end"""
+cases.extend([
+    ("ordinary-contextual-counter-debit",contextual_counter,63,b"COUNTER-DEBIT"),
+    ("exact-startup-contextual-counter-debit",contextual_counter.replace("%%end","debit(1); debit(3); %%end"),63,b"COUNTER-DEBIT"),
+    ("exact-startup-contextual-counter-returning-refused",returning_contextual_counter,2,b"unsupported analysis"),
+    ("ordinary-contextual-counter-underflow",contextual_counter.replace("initial == 1","initial == 0"),2,b"unsupported analysis"),
+    ("ordinary-contextual-counter-domain-cap",contextual_counter.replace("initial == 1 || initial == 3","initial <= 64").replace(
+        "remaining - 1","remaining + 1"),2,b"unsupported analysis"),
+])
 namespace_scalar_key = "exact-startup-completed-namespace-scalar-return"
 namespace_scalar_main = f"""%%start
     core.require(false, {report(210,"ROOT")});
@@ -1969,6 +2006,8 @@ affine_array_bytes = state_bytes(array_state({"kind": "i8"}, [
     typed_state("i8", alternatives(2,4)), typed_state("i8", 7),
 ]))
 authored_files = {
+    **{name: {"old.json": state_bytes(typed_state("u8", 3)), "new.json": state_bytes(typed_state("u8", 2))}
+       for name in ("ordinary-contextual-counter-debit", "exact-startup-contextual-counter-debit")},
     "authored-state-affine-nominal-construction": {
         "state.json": affine_nominal_bytes(alternatives(3,5), alternatives(4,6), alternatives(1,3)),
     },
@@ -2181,6 +2220,8 @@ with tempfile.TemporaryDirectory(prefix="affine-calls-") as path:
                         assert b"PRIOR" not in res.stderr and b"ARM-EFFECT" not in res.stderr,res
                     if name.startswith("exact-startup-finite-ordinary-"):
                         assert b"FINITE-PRIOR-UNPUBLISHED" not in res.stderr,res
+                    if name == "exact-startup-contextual-counter-returning-refused":
+                        assert b"RETURNING-COUNTER-WRITE" not in res.stderr and b"RETURNING-COUNTER-RESULT" not in res.stderr,res
                     if name in namespace_bool_context_children:
                         assert all(label not in res.stderr for label in (b"BOOL-INIT", b"BOOL-CHOOSE", b"BOOL-BRANCH")),res
                     if name == "conditional-scalar-binding-refuses-reached-operand":

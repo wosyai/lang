@@ -6242,6 +6242,14 @@ pub(super) struct CheckerOrdinaryDirectiveCall {
     pub(super) operands: Box<[CheckerDirectiveCallOperand]>,
 }
 
+#[cfg(feature = "internal-checker")]
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct CheckerContextualCounterUpdate {
+    pub(super) rhs: OccurrenceOrdinal,
+    pub(super) operator: BinaryOperator,
+    pub(super) literal: BigInt,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct OccurrenceStructure {
     pub(super) root: BlockOrdinal,
@@ -6250,6 +6258,8 @@ pub(super) struct OccurrenceStructure {
     pub(super) checked_types: CheckedOccurrenceTypes,
     #[cfg(feature = "internal-checker")]
     pub(super) checker_contextual_declarations: HashSet<(BlockOrdinal, usize)>,
+    #[cfg(feature = "internal-checker")]
+    pub(super) checker_contextual_counter_updates: HashMap<(BlockOrdinal, usize), CheckerContextualCounterUpdate>,
     #[cfg(feature = "internal-checker")]
     pub(super) checker_has_bool_contextual_declaration: bool,
     #[cfg(any(test, feature = "internal-checker"))]
@@ -6431,6 +6441,8 @@ impl OccurrenceStructure {
             checker_contextual_occurrences: HashSet::new(),
             #[cfg(feature = "internal-checker")]
             checker_contextual_declarations: HashSet::new(),
+            #[cfg(feature = "internal-checker")]
+            checker_contextual_counter_updates: HashMap::new(),
             #[cfg(feature = "internal-checker")]
             checker_has_bool_contextual_declaration: false,
             #[cfg(any(test, feature = "internal-checker"))]
@@ -7988,6 +8000,14 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
     fn simple_integer_operation<'syntax>(
         &self, ordinal: OccurrenceOrdinal, expression: &'syntax ScalarExpression, allow_finite: bool,
     ) -> Option<(BinaryOperator, [(OccurrenceOrdinal, Option<std::borrow::Cow<'syntax, BigInt>>); 2])> {
+        self.simple_integer_operation_with_context(ordinal, expression, allow_finite, false)
+    }
+
+    #[cfg(feature = "internal-checker")]
+    fn simple_integer_operation_with_context<'syntax>(
+        &self, ordinal: OccurrenceOrdinal, expression: &'syntax ScalarExpression,
+        allow_finite: bool, allow_contextual: bool,
+    ) -> Option<(BinaryOperator, [(OccurrenceOrdinal, Option<std::borrow::Cow<'syntax, BigInt>>); 2])> {
         let ScalarExpression::Binary { operator, left, right, .. } = expression else { return None; };
         if !(matches!(operator, BinaryOperator::Add | BinaryOperator::Subtract)
             || allow_finite && matches!(operator, BinaryOperator::Multiply | BinaryOperator::Divide | BinaryOperator::Remainder))
@@ -8005,7 +8025,9 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
             let literal = super::checker_flow::concrete_integer_literal(value);
             if let Some(literal) = &literal {
                 if !super::typecheck::integer_literal_fits_type(literal, ty) { return None; }
-            } else if !matches!(value, ScalarExpression::Name { .. }) {
+            } else if !matches!(value, ScalarExpression::Name { .. })
+                && !(allow_contextual && matches!(value, ScalarExpression::Contextual { .. }))
+            {
                 return None;
             }
             Some((child, literal))
@@ -9021,6 +9043,19 @@ impl StructuralWalker<'_, '_> {
         }
     }
 
+    #[cfg(feature = "internal-checker")]
+    fn contextual_counter_update(
+        &self, rhs: OccurrenceOrdinal, value: &ScalarExpression,
+        destination: &ReferenceBindingId, ty: &ScalarType,
+    ) -> Option<CheckerContextualCounterUpdate> {
+        let ScalarExpression::Binary { left, .. } = value else { return None; };
+        let ScalarExpression::Contextual { binding, .. } = left.as_ref() else { return None; };
+        if binding != destination || self.structure.checked_types.expressions.get(&rhs)? != ty { return None; }
+        let (operator, [(_, None), (_, Some(literal))]) =
+            self.simple_integer_operation_with_context(rhs, value, false, true)? else { return None; };
+        Some(CheckerContextualCounterUpdate { rhs, operator, literal: literal.into_owned() })
+    }
+
     fn binding_region(
         &mut self,
         binding: &ScalarBinding,
@@ -9574,11 +9609,18 @@ impl StructuralWalker<'_, '_> {
                         assignment.targets.as_slice(), slots.as_slice(),
                         evaluations.as_slice(), assignment.values.as_slice(),
                     ) {
-                        if let (ScalarPlace::Contextual { ty, .. }, AssignmentReplacement::Resolved(replacement)) =
+                        if let (ScalarPlace::Contextual { binding, ty, .. }, AssignmentReplacement::Resolved(replacement)) =
                             (&target.place, &slot.replacement)
                         {
                             if ty == replacement {
                                 self.record_contextual_signed_literal(evaluation.expression, value, replacement);
+                                #[cfg(feature = "internal-checker")]
+                                if let Some(update) = self.contextual_counter_update(evaluation.expression, value, binding, replacement) {
+                                    self.structure.checker_contextual_counter_updates.insert((ordinal, item_index), update);
+                                    self.structure.checker_has_extended_scalar_local = true;
+                                }
+                                #[cfg(not(feature = "internal-checker"))]
+                                let _ = binding;
                             }
                         }
                     }

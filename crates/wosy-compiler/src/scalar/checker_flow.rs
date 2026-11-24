@@ -5117,6 +5117,26 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
             }
             BlockItemKind::Assignment { group } => {
                 #[cfg(feature = "internal-checker")]
+                if roots.allow_extended_scalar_locals && roots.allow_ordinary_contextual_places
+                    && matches!(calls.boundary.results.as_slice(), [result] if result.ty == ScalarType::Unit)
+                {
+                    if let Some(update) = structure.checker_contextual_counter_updates.get(&(group.block, group.item)) {
+                        let (binding, ty, rhs, destination) = checked_scalar_assignment(calls, group)?;
+                        let (axis, active_ty) = roots.lookup(binding)?;
+                        if active_ty != ty || !is_integer_type(ty) || update.rhs != rhs
+                            || !structure.checker_contextual_occurrences.contains(&destination)
+                        {
+                            return None;
+                        }
+                        path = path.finite_ordinary_calculation(
+                            AuthoredIntegerOperation::checked(&update.operator)?, (None, Some(axis)),
+                            (Some(&update.literal), None), ty, FiniteIntegerInstall::OverwriteSource,
+                            roots.ordinary_local_work.get_or_insert(0),
+                        )?;
+                        continue;
+                    }
+                }
+                #[cfg(feature = "internal-checker")]
                 if roots.allow_symbolic_contextual_bool {
                     if let Some((binding, ScalarType::Bool, rhs, destination)) = checked_scalar_assignment(calls, group) {
                         if structure.checker_contextual_occurrences.contains(&destination) {
@@ -5541,7 +5561,7 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                                 {
                                     if !roots.allow_extended_scalar_locals { return None; }
                                     path = path.finite_ordinary_calculation(operation, left, right, &receiver.ty,
-                                        roots.ordinary_local_work.get_or_insert(0))?;
+                                        FiniteIntegerInstall::Append, roots.ordinary_local_work.get_or_insert(0))?;
                                 } else {
                                     path.append_ordinary_calculation(operation, left, right, &receiver.ty,
                                         &mut roots.ordinary_local_work, &mut roots.affine_work)?;
@@ -6415,10 +6435,18 @@ fn compute_row_integer_operation(
 }
 
 #[cfg(feature = "internal-checker")]
+#[derive(Clone, Copy)]
+enum FiniteIntegerInstall {
+    Append,
+    OverwriteSource,
+}
+
+#[cfg(feature = "internal-checker")]
 impl IntegerInputs {
     fn finite_ordinary_calculation(
         self, operation: AuthoredIntegerOperation, left: IntegerCalculationOperand<'_>,
-        right: IntegerCalculationOperand<'_>, ty: &ScalarType, work: &mut usize,
+        right: IntegerCalculationOperand<'_>, ty: &ScalarType,
+        install: FiniteIntegerInstall, work: &mut usize,
     ) -> Option<Self> {
         // Enumerate a small complete preimage, not a sample or a convex hull.
         const MAX_FINITE_ARITHMETIC_ATOMS: usize = 64;
@@ -6435,8 +6463,9 @@ impl IntegerInputs {
             if row.affine.is_some() || row.entry.is_some() { return None; }
             let domain = row.get(axis)?;
             charge_call_work(work, 1usize.checked_add(domain.interval_count())?)?;
+            let alias_passes = match install { FiniteIntegerInstall::Append => 3, FiniteIntegerInstall::OverwriteSource => 7 };
             let copy_cost = row.len().checked_mul(2)?
-                .checked_add(row.equal_axes().len().checked_mul(3)?)?.checked_add(10)?;
+                .checked_add(row.equal_axes().len().checked_mul(alias_passes)?)?.checked_add(10)?;
             for (first, last) in domain.intervals() {
                 let count = usize::try_from(last - first + &one).ok()?;
                 remaining = remaining.checked_sub(count)?;
@@ -6450,7 +6479,15 @@ impl IntegerInputs {
                     // Refining the old source preserves all of its aliases;
                     // the computed value belongs only to this exact preimage.
                     piece.replace_domain(axis, Rc::new(IntegerSet::singleton(&input)));
-                    piece.push(Rc::new(IntegerSet::singleton(&value)));
+                    let value = Rc::new(IntegerSet::singleton(&value));
+                    match install {
+                        FiniteIntegerInstall::Append => piece.push(value),
+                        FiniteIntegerInstall::OverwriteSource => {
+                            // Detach only this binding. Previously read
+                            // aliases retain the exact old preimage.
+                            piece.overwrite(axis, value, false);
+                        }
+                    }
                     output.push(piece);
                     if index + 1 < count { input += &one; }
                 }

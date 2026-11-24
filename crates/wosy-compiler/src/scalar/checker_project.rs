@@ -14286,6 +14286,70 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
 
     #[cfg(feature = "internal-checker")]
     #[test]
+    fn contextual_counter_update_keeps_old_preimages_and_refuses_invalid_width() {
+        let app = source("src/main.w", "checked-contextual-counter");
+        let text = r#"%%start
+            unit(u8) debit = fn(initial) {
+                core.narrow(initial == 1 || initial == 3, { .stdout = ""; .stderr = ""; .code = 1; .files = []; });
+                u8 core.context.remaining = initial;
+                u8 previous = core.context.remaining;
+                core.context.remaining = core.context.remaining - 1;
+                u8 current = core.context.remaining;
+                if (current == 2) {
+                    core.require(previous == 3 && initial == 3, { .stdout = ""; .stderr = "lost preimage"; .code = 61; .files = []; });
+                    core.require(false, { .stdout = ""; .stderr = ""; .code = 63; .files = [
+                        { .path = "old.json"; .state = previous; },
+                        { .path = "new.json"; .state = core.context.remaining; }
+                    ]; });
+                } else {
+                    core.require(current == 0 && previous == 1 && initial == 1,
+                        { .stdout = ""; .stderr = "wrong debit"; .code = 59; .files = []; });
+                };
+            };
+        %%end"#;
+        let actual = text.replace("%%end", "debit(1); debit(3); %%end");
+        let run = |program: &str, scope| {
+            let prepared = prepare_proof_target(&app, program).unwrap();
+            run_closed_without_named_proofs(&prepared, scope, 1)
+        };
+        for (program, scope) in [(text, ScalarCheckerScope::CurrentPackage),
+            (actual.as_str(), ScalarCheckerScope::MainFlowOnly), (actual.as_str(), ScalarCheckerScope::CurrentPackage)]
+        {
+            let receipt = run(program, scope).unwrap();
+            let [failure] = receipt.directives.as_slice() else { panic!("one exact debit receipt"); };
+            assert_eq!(failure.code(), &BigInt::from(63));
+            assert_eq!(failure.files()[0].text.as_ref(), b"{\"type\":{\"kind\":\"u8\"},\"value\":3}\n");
+            assert_eq!(failure.files()[1].text.as_ref(), b"{\"type\":{\"kind\":\"u8\"},\"value\":2}\n");
+        }
+        let underflow = text.replace("initial == 1", "initial == 0");
+        let over_budget = text.replace("initial == 1 || initial == 3", "initial <= 64")
+            .replace("remaining - 1", "remaining + 1");
+        for refusals in [underflow, over_budget] {
+            assert!(matches!(run(&refusals, ScalarCheckerScope::CurrentPackage), Err(ProjectCheck::Unsupported)));
+        }
+        let returning = r#"%%start
+            u8(u8) debit = fn(initial) {
+                u8 core.context.remaining = initial;
+                core.context.remaining = core.context.remaining - 1;
+                u8 current = core.context.remaining;
+                core.require(false, { .stdout = ""; .stderr = "returning write"; .code = 65; .files = []; });
+                current
+            };
+            u8 saved = debit(3);
+            core.require(saved != 2, { .stdout = ""; .stderr = "bad return"; .code = 67; .files = []; });
+        %%end"#;
+        let prepared = prepare_proof_target(&app, returning).unwrap();
+        let (project, calls) = prepared.parts();
+        let (module, item, _) = select_checked_root(project, &app, "debit").unwrap();
+        let body = calls.function_body(module, item, None).unwrap();
+        assert_eq!(body.structure.checker_contextual_counter_updates.len(), 1);
+        for scope in [ScalarCheckerScope::MainFlowOnly, ScalarCheckerScope::CurrentPackage] {
+            assert!(matches!(run_closed_without_named_proofs(&prepared, scope, 1), Err(ProjectCheck::Unsupported)));
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
     fn symbolic_contextual_boolean_writes_preserve_old_aliases_and_restore_outer_scope() {
         let app = source("src/main.w", "symbolic-contextual-bool");
         let program = r#"%%start
