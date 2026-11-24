@@ -4313,3 +4313,82 @@ if (run() != 42) { core.system_panic(); };
         }
     }
 }
+
+#[test]
+fn multi_owning_formals_release_each_exact_original_base() {
+    let app = source("workbench", "src/multi_owning_formals.w");
+    let factory = include_str!("fixtures/conditional-formal-transfer.w")
+        .split_once("u64(Packet) accept_packet")
+        .expect("reuse the existing checked original-backing factory").0;
+    let factory = factory.replace(
+        "Packet packet = { .data = data; .length = length; };\n    packet",
+        "Packet factory_value = { .data = data; .length = length; };\n    factory_value",
+    );
+    assert!(factory.contains("Packet factory_value ="));
+    let text = format!("{factory}{}", include_str!("fixtures/multi-owning-formals.w"));
+    for (target, target_layout) in [
+        ("native64", ScalarTargetLayout::NATIVE64),
+        ("wasm32", ScalarTargetLayout::WASM32),
+    ] {
+        let prepared = prepare_scalar_project(
+            vec![(declarations(&app, &text), Vec::new())], vec![app.clone()],
+            ScalarPreparationInputs { target_layout },
+        ).unwrap_or_else(|error| panic!("{target}: {:?}", error.diagnostics));
+        let build = analyze_scalar_build(&prepared);
+        assert!(build.diagnostics().is_empty(), "{target}: {:?}", build.diagnostics());
+        for (route, ir) in [
+            // Match the CLI's ordinary singleton and project routes: both
+            // consume the same canonical prepared ownership certificate.
+            ("standalone", wosy_compiler::emit_scalar_build_single_module_llvm(&build).unwrap().to_text()),
+            ("project", emit_scalar_build_project_llvm(&build).unwrap().to_text()),
+        ] {
+            let context = Context::create();
+            let module = context.create_module_from_ir(MemoryBuffer::create_from_memory_range_copy(ir.as_bytes(), target)).unwrap();
+            module.verify().unwrap();
+            let name = |name: &str| if route == "standalone" { name.to_owned() } else { function_with_suffix(&module, name) };
+            let combine = module.get_function(&name("combine")).unwrap();
+            let drive = module.get_function(&name("drive")).unwrap();
+            let factory = module.get_function(&name("make_packet")).unwrap();
+            let free = module.get_function("__wosy_core_free").unwrap();
+            assert_eq!(combine.get_linkage(), inkwell::module::Linkage::Internal, "{target}/{route}: {combine}");
+            assert_eq!(combine.count_params(), 7, "{target}/{route}: {ir}");
+            fn calls<'ctx>(function: inkwell::values::FunctionValue<'ctx>)
+                -> Vec<(inkwell::values::InstructionValue<'ctx>, CallSiteValue<'ctx>)>
+            {
+                function.get_basic_blocks().into_iter().flat_map(|block| block.get_instructions())
+                    .filter_map(|row| CallSiteValue::try_from(row).ok().map(|call| (row, call)))
+                    .collect()
+            }
+            let cleanup: Vec<_> = calls(combine).into_iter().filter_map(|(row, call)|
+                (call.get_called_fn_value() == Some(free)).then(|| row.get_operand(0).unwrap().value().unwrap())
+            ).collect();
+            assert_eq!(cleanup, [6, 5, 4].map(|slot| combine.get_nth_param(slot).unwrap()));
+
+            let mut created = Vec::new();
+            let mut transfers = 0;
+            let mut retained_cleanup = 0;
+            for (row, call) in calls(drive) {
+                if call.get_called_fn_value() == Some(factory) {
+                    created.push(call.try_as_basic_value().basic().unwrap());
+                } else if call.get_called_fn_value() == Some(combine) {
+                    assert_eq!(created.len(), 4);
+                    assert_eq!(call.count_arguments(), 7);
+                    for (slot, creation) in [(4, 2), (5, 0), (6, 1)] {
+                        assert_eq!(row.get_operand(slot).unwrap().value().unwrap(), created[creation]);
+                    }
+                    transfers += 1;
+                } else if call.get_called_fn_value() == Some(free) {
+                    assert_eq!(transfers, 1);
+                    assert_eq!(row.get_operand(0).unwrap().value().unwrap(), created[3]);
+                    retained_cleanup += 1;
+                }
+            }
+            assert_eq!((created.len(), transfers, retained_cleanup), (4, 1, 1));
+            if let Some(directory) = std::env::var_os("WOSY_MULTI_OWNER_IR_DIR") {
+                let mut witness = ir.replace("define i32 @main(", "define i32 @wosy_authored_main(");
+                witness.push_str(&format!("\ndefine i64 @wosy_test_multi_owning_formals() {{\nentry:\n  %value = call i64 @{}()\n  ret i64 %value\n}}\n", name("drive")));
+                std::fs::write(std::path::PathBuf::from(directory).join(format!("{target}-{route}.ll")), witness).unwrap();
+            }
+        }
+    }
+}

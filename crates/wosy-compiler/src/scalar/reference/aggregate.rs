@@ -2577,6 +2577,32 @@ pub(crate) enum ClosedInput {
     Plain,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) enum ClosedInputArguments {
+    One((usize, ClosedInput)),
+    Multiple(Vec<(usize, ClosedInput)>),
+}
+
+impl ClosedInputArguments {
+    pub(crate) fn as_slice(&self) -> &[(usize, ClosedInput)] {
+        match self {
+            Self::One(lane) => std::slice::from_ref(lane),
+            Self::Multiple(lanes) => lanes,
+        }
+    }
+
+    fn append(&mut self, lane: (usize, ClosedInput)) -> bool {
+        if self.as_slice().last().is_some_and(|last| last.0 >= lane.0) {
+            return false;
+        }
+        match self {
+            Self::One(first) => *self = Self::Multiple(vec![*first, lane]),
+            Self::Multiple(lanes) => lanes.push(lane),
+        }
+        true
+    }
+}
+
 /// Origin of the existing allocation, not the current value of its binding.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct OriginalArrayReceipt {
@@ -2687,17 +2713,18 @@ pub(crate) struct ClosedBody {
     pub(crate) conditional_inputs: BTreeMap<usize, ClosedConditionalInputs>,
     pub(crate) conditional_guard_count: usize,
     pub(crate) deferred_call_inputs: BTreeMap<usize, usize>,
-    pub(crate) input: Option<usize>,
-    pub(crate) input_mixed: bool,
+    // Exact source formal slot -> mixed (plain or owning) admission.
+    pub(crate) inputs: BTreeMap<usize, bool>,
     // Checked primary call occurrence -> exact destination place occurrence.
     pub(crate) same_array_rebinds: BTreeMap<usize, usize>,
     pub(crate) fresh_array_recommits: BTreeMap<usize, ClosedFreshRecommit>,
     pub(crate) local_array_failure: Option<ClosedLocalArrayRelease>,
     pub(crate) literal_array: Option<ClosedLiteralArray>,
-    pub(crate) input_release: Option<CfgPointId>,
+    // Each exit's owning formals, in ascending declared slot order.
+    pub(crate) input_releases: BTreeMap<CfgPointId, Vec<usize>>,
     pub(crate) input_release_guard: Option<usize>,
     pub(crate) input_exhaustive: Option<usize>,
-    pub(crate) input_calls: BTreeMap<usize, (usize, ClosedInput)>,
+    pub(crate) input_calls: BTreeMap<usize, ClosedInputArguments>,
 }
 
 impl ClosedBody {
@@ -5759,8 +5786,8 @@ fn closed_aggregates<'a>(
             }
         }
     }
-    let mut input_plans = BTreeMap::<BodyKey, (usize, Option<(CfgPointId, usize)>, bool)>::new();
-    let mut input_calls = BTreeMap::<BodyKey, BTreeMap<usize, (usize, ClosedInput)>>::new();
+    let mut input_plans = BTreeMap::<BodyKey, BTreeMap<usize, (Option<(CfgPointId, usize)>, bool)>>::new();
+    let mut input_calls = BTreeMap::<BodyKey, BTreeMap<usize, ClosedInputArguments>>::new();
     // A single direct transfer needs no join. Up to two terminal transfers may
     // defer receipt retirement, but only an exact opposite-arm pair is valid.
     #[derive(Clone, Copy)]
@@ -5820,6 +5847,15 @@ fn closed_aggregates<'a>(
         conditional_forward_edges.contains_key(target) && bodies.get(&target.0)
             .and_then(|body| body.facts).is_some_and(|facts| facts.conditional_formal_forwards.len() == 2)
     };
+    let mut owned_slots = BTreeMap::<BodyKey, usize>::new();
+    for (&(body, _), &(owned, _)) in &modes {
+        if owned {
+            *owned_slots.entry(body).or_default() += 1;
+        }
+    }
+    let mut multi_input_calls = BTreeMap::<(BodyKey, usize), BodyKey>::new();
+    type Endpoint = ((CfgPointId, usize), bool);
+    let mut multi_endpoints = BTreeMap::<BodyKey, BTreeMap<usize, [Option<Endpoint>; 2]>>::new();
     for ((callee, slot), users) in input_users {
         let (owned, mixed) = modes[&(callee, slot)];
         if !owned { continue }
@@ -5830,7 +5866,15 @@ fn closed_aggregates<'a>(
         }
         let body = bodies.get(&callee).ok_or_else(|| format!("missing owning formal reservation {callee:?}"))?;
         let facts = body.facts.ok_or_else(|| format!("missing owning formal facts {callee:?}"))?;
-        if !body.is_monomorphic || !body.supports_input_result || input_plans.contains_key(&callee) || outgoing.contains(&callee)
+        let multiple = owned_slots[&callee] > 1;
+        if multiple && (mixed || forward_edges.contains_key(&(callee, slot))
+            || conditional_forward_edges.contains_key(&(callee, slot))
+            || !ordinary_formal_outputs(&body.sites.boundary.root_outputs)
+            || !facts.raw_uses.is_empty())
+        {
+            return Err(format!("aggregate multiple owning inputs require exact terminal formals in {:?} at slot {slot}", body.source));
+        }
+        if !body.is_monomorphic || !body.supports_input_result || outgoing.contains(&callee)
             || !facts.formals.contains_key(&slot) || facts.formal_unsupported.contains(&slot) || facts.raw_invalid.is_some() {
             return Err(format!("aggregate owning input has no closed formal in {:?} at slot {slot}", body.source));
         }
@@ -5849,9 +5893,31 @@ fn closed_aggregates<'a>(
         if facts.read_active.contains(&read_owner) {
             prove_read_views((callee, read_owner), &bodies, &declarations, &mut proven_read_views)?;
         }
-        let mut exits = facts.owner_endpoints(OwnerSource::Formal(slot));
+        // The single-formal path may stop on its second candidate. With many
+        // formals, index the already-prepared endpoint receipts only once.
+        let [first_exit, second_exit] = if multiple {
+            multi_endpoints.entry(callee).or_insert_with(|| {
+                let mut index = BTreeMap::<_, [Option<Endpoint>; 2]>::new();
+                for (&endpoint, receipts) in &facts.endpoints {
+                    for (&owner, witness) in &receipts.possible {
+                        if let OwnerSource::Formal(slot) = owner {
+                            let visits = index.entry(slot).or_default();
+                            if let Some(empty) = visits.iter_mut().find(|visit| visit.is_none()) {
+                                let valid = witness.as_ref() == facts.formals.get(&slot)
+                                    && receipts.always_retains(owner, witness.as_ref());
+                                *empty = Some((endpoint, valid));
+                            }
+                        }
+                    }
+                }
+                index
+            }).remove(&slot).unwrap_or_default()
+        } else {
+            let mut exits = facts.owner_endpoints(OwnerSource::Formal(slot));
+            [exits.next(), exits.next()]
+        };
         let release = if let Some(&next) = forward_edges.get(&(callee, slot)) {
-            if conditional_forward_edges.contains_key(&(callee, slot)) || exits.next().is_some() {
+            if conditional_forward_edges.contains_key(&(callee, slot)) || first_exit.is_some() {
                 return Err(format!("aggregate owning formal has both release and transfer in {:?} at slot {slot}", body.source));
             }
             forward_predecessors.entry(next).or_default().push((callee, slot));
@@ -5872,8 +5938,8 @@ fn closed_aggregates<'a>(
             {
                 return Err(unsupported());
             }
-            let endpoint = exits.next();
-            if exits.next().is_some() { return Err(unsupported()); }
+            let endpoint = first_exit;
+            if second_exit.is_some() { return Err(unsupported()); }
             let points = &body.cfg.points;
             let certificate = ConditionalInputCertificate::build(
                 points, &facts.conditional_input_regions, &facts.conditional_input_barriers,
@@ -5938,16 +6004,31 @@ fn closed_aggregates<'a>(
             unproved_successor_counts.insert((callee, slot), next.len());
             release
         } else {
-            let Some((endpoint, always)) = exits.next() else {
+            let Some((endpoint, always)) = first_exit else {
                 return Err(format!("aggregate owning input has no proved formal exit in {:?} at slot {slot}", body.source));
             };
-            if !always || exits.next().is_some() {
+            if !always || second_exit.is_some() {
                 return Err(format!("aggregate owning input has ambiguous formal exit in {:?} at slot {slot}", body.source));
             }
             terminal_formals.push((callee, slot));
             Some(endpoint)
         };
         for (caller, consumer, ordinal, moved, origins) in users {
+            if multiple {
+                let caller_body = &bodies[&caller];
+                if caller_body.sites.declared_unsafe_calls.contains(&ordinal)
+                    || !matches!(caller_body.cfg.points.get(consumer.0).map(|point| &point.kind),
+                        Some(CfgPointKind::Call {
+                            target: ResolvedCallTarget::ModuleCallable { concrete: ConcreteCallSelection::Declaration, .. },
+                            ..
+                        }))
+                {
+                    return Err(format!("aggregate multiple owning inputs require a checked direct call in {:?}", caller_body.source));
+                }
+                if multi_input_calls.insert((caller, ordinal), callee).is_some_and(|known| known != callee) {
+                    return Err(format!("aggregate multiple owning input has inconsistent direct target in {:?}", bodies[&caller].source));
+                }
+            }
             if origins.is_empty() && !initializer_owned_formals.contains(&(callee, slot)) {
                 continue;
             }
@@ -6032,11 +6113,38 @@ fn closed_aggregates<'a>(
                 }
                 _ => return Err(format!("aggregate owning input has unproved emitted incoming use in {:?} at call {ordinal} slot {slot}", bodies[&caller].source)),
             }};
-            if input_calls.entry(caller).or_default().insert(ordinal, (slot, action)).is_some() {
-                return Err(format!("aggregate owning input has ambiguous source transfer in {:?} at call {ordinal}", bodies[&caller].source));
+            if multiple && !matches!(action, ClosedInput::Transfer(_)) {
+                return Err(format!("aggregate multiple owning inputs require distinct local owner transfers in {:?} at call {ordinal}", bodies[&caller].source));
+            }
+            match input_calls.entry(caller).or_default().entry(ordinal) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(ClosedInputArguments::One((slot, action)));
+                }
+                std::collections::btree_map::Entry::Occupied(mut entry) => {
+                    if !entry.get_mut().append((slot, action)) {
+                        return Err(format!("aggregate owning input has ambiguous source transfer in {:?} at call {ordinal}", bodies[&caller].source));
+                    }
+                }
             }
         }
-        input_plans.insert(callee, (slot, release, mixed));
+        if input_plans.entry(callee).or_default().insert(slot, (release, mixed)).is_some() {
+            return Err(format!("duplicate aggregate owning formal in {:?} at slot {slot}", body.source));
+        }
+    }
+    for ((caller, ordinal), callee) in multi_input_calls {
+        let formals = &input_plans[&callee];
+        let actions = input_calls.get(&caller).and_then(|calls| calls.get(&ordinal));
+        if !actions.is_some_and(|actions| actions.as_slice().iter().map(|(slot, _)| slot).eq(formals.keys())) {
+            return Err(format!("aggregate multiple owning inputs have incomplete call proof in {:?} at call {ordinal}", bodies[&caller].source));
+        }
+        // Deduplicate by exact original receipt, not descriptor type or
+        // argument spelling. Every simultaneous lane needs a distinct base.
+        let mut receipts = BTreeSet::new();
+        if !actions.expect("exact owning input slots").as_slice().iter().all(|(_, action)|
+            matches!(*action, ClosedInput::Transfer(receipt) if receipts.insert(receipt)))
+        {
+            return Err(format!("aggregate multiple owning inputs share one source receipt in {:?} at call {ordinal}", bodies[&caller].source));
+        }
     }
     while let Some(terminal) = terminal_formals.pop() {
         if let Some(predecessors) = forward_predecessors.remove(&terminal) {
@@ -6076,10 +6184,10 @@ fn closed_aggregates<'a>(
             continue;
         }
         let receive = initializer_receives.get(&(&user.region.source, user.call))
-            .and_then(|(body, slot)| input_plans.get(body).filter(|plan| plan.0 == *slot))
-            .and_then(|plan| plan.1);
-        let consume = input_plans.get(&target).filter(|plan| plan.0 == 0)
-            .and_then(|plan| plan.1.map(|(exit, _)| (exit, plan.2)))
+            .and_then(|(body, slot)| input_plans.get(body).filter(|plan| plan.len() == 1)?.get(slot))
+            .and_then(|plan| plan.0);
+        let consume = input_plans.get(&target).filter(|plan| plan.len() == 1).and_then(|plan| plan.get(&0))
+            .and_then(|plan| plan.0.map(|(exit, _)| (exit, plan.1)))
             .filter(|_| initializer_owned_formals.contains(&(target, 0))
                 && !matches!(user.input, InitializerInput::Unproved)
                 && bodies.get(&target).is_some_and(|body| body.sites.boundary.root_outputs.iter()
@@ -6241,12 +6349,15 @@ fn closed_aggregates<'a>(
             plan.mixed_branch_return = facts.mixed_branch_return.clone();
         }
         plan.input_calls = input_calls.remove(&key).unwrap_or_default();
-        if let Some(&(slot, release, mixed)) = input_plans.get(&key) {
-            plan.input = Some(slot);
-            plan.input_mixed = mixed;
-            if let Some((exit, block)) = release {
-                plan.input_release = Some(exit);
-                plan.scope_exits.insert(block, exit);
+        if let Some(inputs) = input_plans.get(&key) {
+            for (&slot, &(release, mixed)) in inputs {
+                plan.inputs.insert(slot, mixed);
+                if let Some((exit, block)) = release {
+                    plan.input_releases.entry(exit).or_default().push(slot);
+                    if plan.scope_exits.insert(block, exit).is_some_and(|old| old != exit) {
+                        return Err(format!("aggregate owning formals disagree on exact scope exit in {:?}", body.source));
+                    }
+                }
             }
         }
         // Index observed endpoints once. Looking up every owner by scanning all
@@ -6283,7 +6394,7 @@ fn closed_aggregates<'a>(
         };
         if let Some(choice) = local_choice {
             plan.local_choice_arms.push((choice.conditional.0, choice.leaves.len()));
-            if plan.input.is_some() {
+            if !plan.inputs.is_empty() {
                 return Err(format!("local conditional owner overlaps an owning formal in {:?}", body.source));
             }
             if let Some(item) = choice.item {
@@ -6534,17 +6645,17 @@ fn closed_aggregates<'a>(
         }
         plan.releases.extend(ranked_releases.into_iter().map(|(exit, releases)|
             (exit, releases.into_values().collect())));
-        if (returning || !plan.calls.is_empty() || !plan.recommits.is_empty() || plan.input.is_some() || !plan.input_calls.is_empty()) && !body.is_monomorphic {
+        if (returning || !plan.calls.is_empty() || !plan.recommits.is_empty() || !plan.inputs.is_empty() || !plan.input_calls.is_empty()) && !body.is_monomorphic {
             return Err(format!("aggregate ownership in generic reservation {key:?} is not closed in {:?}", body.source));
         }
-        if (returning || !plan.calls.is_empty() || !plan.recommits.is_empty() || plan.input.is_some() || !plan.input_calls.is_empty()) && !facts.unsupported.is_empty() {
+        if (returning || !plan.calls.is_empty() || !plan.recommits.is_empty() || !plan.inputs.is_empty() || !plan.input_calls.is_empty()) && !facts.unsupported.is_empty() {
             return Err(format!(
                 "aggregate transfer has unsupported use in {:?} at point {:?}",
                 body.source,
                 facts.unsupported.first()
             ));
         }
-        if returning || !plan.calls.is_empty() || !plan.recommits.is_empty() || plan.input.is_some() || !plan.input_calls.is_empty()
+        if returning || !plan.calls.is_empty() || !plan.recommits.is_empty() || !plan.inputs.is_empty() || !plan.input_calls.is_empty()
             || plan.identity_relay.is_some() || !plan.same_array_rebinds.is_empty() || !plan.fresh_array_recommits.is_empty() || plan.scalar_descriptor_assignment.is_some()
             || plan.checked_backing_wrapper.is_some()
         {
@@ -6938,7 +7049,7 @@ mod tests {
         assert_eq!(result.bodies[&alternate].literal_array, alternate_plan);
         let caller = &result.bodies[&pair.caller];
         assert_eq!(caller.scope_exits, BTreeMap::from([(pair.block.0, pair.exit)]));
-        assert!(caller.releases.is_empty() && caller.input_release.is_none());
+        assert!(caller.releases.is_empty() && caller.input_releases.is_empty());
     }
 
     #[test]
@@ -6979,7 +7090,7 @@ mod tests {
             extent: ReplacementArrayExtent::Argument { occurrence: 9 }, ..
         })));
         assert_eq!(caller.scope_exits, BTreeMap::from([(pair.block.0, pair.exit)]));
-        assert!(caller.releases.is_empty() && caller.input_release.is_none());
+        assert!(caller.releases.is_empty() && caller.input_releases.is_empty());
 
         let mut conflicting = pair;
         conflicting.caller = (0, 2, None);
@@ -7032,7 +7143,7 @@ mod tests {
             }), ..
         })));
         assert_eq!(caller.scope_exits, BTreeMap::from([(dual.block.0, dual.exit)]));
-        assert!(caller.releases.is_empty() && caller.input_release.is_none());
+        assert!(caller.releases.is_empty() && caller.input_releases.is_empty());
 
         for argument in [None, dual.write.argument] {
             let mut plans = ClosedAggregates::default();
@@ -7137,7 +7248,7 @@ mod tests {
             unit: Some(ClosedLiteralArrayUnit { expression: 4, writer_block: 1, writer_side: ArrayWriterSide::Then, retained_block: None, other_writer: None }), ..
         })));
         assert_eq!(caller.scope_exits, BTreeMap::from([(0, CfgPointId(11))]));
-        assert!(caller.releases.is_empty() && caller.input_release.is_none());
+        assert!(caller.releases.is_empty() && caller.input_releases.is_empty());
 
         // Exercise the same visitor with the two exact operand points.
         let mut formal = binding.clone();
@@ -7229,7 +7340,7 @@ mod tests {
             unit: Some(ClosedLiteralArrayUnit { retained_block: Some(2), .. }), ..
         })));
         assert_eq!(caller.scope_exits, BTreeMap::from([(0, CfgPointId(13))]));
-        assert!(caller.releases.is_empty() && caller.input_release.is_none());
+        assert!(caller.releases.is_empty() && caller.input_releases.is_empty());
 
         explicit[11].kind = CfgPointKind::Read { binding };
         let mut observed = AggregateFlowResult::default();
@@ -7283,7 +7394,7 @@ mod tests {
             }), ..
         })));
         assert_eq!(caller.scope_exits, BTreeMap::from([(0, CfgPointId(13))]));
-        assert!(caller.releases.is_empty() && caller.input_release.is_none());
+        assert!(caller.releases.is_empty() && caller.input_releases.is_empty());
 
         for (id, other_scope) in [
             (4, ReferenceScopeId(1)),
@@ -7358,7 +7469,7 @@ mod tests {
             unit: Some(ClosedLiteralArrayUnit { other_writer: Some(ClosedLiteralArrayWrite { call: 7, destination: 8, .. }), .. }), ..
         })));
         assert_eq!(caller.scope_exits, BTreeMap::from([(0, CfgPointId(15))]));
-        assert!(caller.releases.is_empty() && caller.input_release.is_none());
+        assert!(caller.releases.is_empty() && caller.input_releases.is_empty());
 
         let mut crossed = dual.clone();
         crossed[7].successors = vec![CfgPointId(12)];

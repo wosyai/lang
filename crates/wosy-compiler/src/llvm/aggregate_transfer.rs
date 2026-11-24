@@ -47,8 +47,8 @@ enum CallDestination<'ctx> {
 }
 
 #[derive(Clone, Copy)]
-enum CallInput {
-    Body(ClosedInput),
+enum CallInput<'plan> {
+    Body(&'plan [(usize, ClosedInput)]),
     Initializer(ClosedInitializerInput),
 }
 
@@ -113,7 +113,7 @@ pub(super) struct AggregateEmitter<'ctx, 'plan> {
     receipts: BTreeMap<usize, PointerValue<'ctx>>,
     // SSA join values indexed by the function-local, shared guard plan.
     receipt_guards: BTreeMap<usize, inkwell::values::IntValue<'ctx>>,
-    input: Option<(usize, PointerValue<'ctx>)>,
+    inputs: BTreeMap<usize, PointerValue<'ctx>>,
 }
 
 fn literal_array_write(
@@ -168,7 +168,7 @@ impl<'ctx, 'plan> AggregateEmitter<'ctx, 'plan> {
             return Err("overlapping ordinary and checked aggregate conventions".into());
         }
         let ordinary_destination = if plan.ordinary_result {
-            if destination.is_some() || plan.input.is_some() || definition.count_params() as usize != parameter_count + 1 {
+            if destination.is_some() || !plan.inputs.is_empty() || definition.count_params() as usize != parameter_count + 1 {
                 return Err("overlapping ordinary aggregate destination".into());
             }
             Some(
@@ -179,15 +179,23 @@ impl<'ctx, 'plan> AggregateEmitter<'ctx, 'plan> {
         } else {
             None
         };
-        let input = plan.input.map(|slot| definition.get_nth_param(definition.count_params() - 1)
-            .ok_or_else(|| "missing aggregate formal input base".to_owned())
-            .map(|base| (slot, base.into_pointer_value()))).transpose()?;
+        let inputs = plan.inputs.keys().copied().enumerate().map(|(offset, slot)| {
+            let position = (definition.count_params() as usize).checked_sub(plan.inputs.len())
+                .and_then(|first| u32::try_from(first + offset).ok())
+                .ok_or_else(|| "invalid aggregate formal sidecar position".to_owned())?;
+            if (position as usize) < parameter_count || slot >= parameter_count {
+                return Err("aggregate formal sidecar changed source arity".to_owned());
+            }
+            let base = definition.get_nth_param(position)
+                .ok_or_else(|| "missing aggregate formal input base".to_owned())?;
+            Ok((slot, base.into_pointer_value()))
+        }).collect::<Result<BTreeMap<_, _>, String>>()?;
         let checked_backing_output = (plan.checked_backing_producer.is_some() || plan.checked_backing_wrapper.is_some())
             .then(|| definition.get_nth_param(definition.count_params() - 1)
             .ok_or_else(|| "missing private checked backing output".to_owned())
             .map(|value| value.into_pointer_value())).transpose()?;
         let failure_site = plan.local_array_failure.filter(|_| {
-            plan.returning.is_none() && plan.input.is_none() && plan.calls.is_empty()
+            plan.returning.is_none() && plan.inputs.is_empty() && plan.calls.is_empty()
                 && plan.releases.is_empty() && plan.input_calls.is_empty()
         });
         if let Some(failure) = plan.checked_backing_producer.filter(|backing| backing.failure.is_some()) {
@@ -197,7 +205,7 @@ impl<'ctx, 'plan> AggregateEmitter<'ctx, 'plan> {
         }
         Ok(Some(Self {
             plan,
-            input,
+            inputs,
             destination,
             ordinary_destination,
             local_choice_destination: None,
@@ -239,7 +247,7 @@ impl<'ctx, 'plan> AggregateEmitter<'ctx, 'plan> {
 }
 
 pub(super) fn linkage(plan: Option<&ClosedBody>) -> Option<Linkage> {
-    plan.filter(|body| body.returning.is_some() || body.input.is_some() || body.checked_backing_producer.is_some()
+    plan.filter(|body| body.returning.is_some() || !body.inputs.is_empty() || body.checked_backing_producer.is_some()
         || body.checked_backing_wrapper.is_some() || body.ordinary_result)
         .map(|_| Linkage::Internal)
 }
@@ -272,13 +280,17 @@ pub(super) fn definition_type<'ctx>(
     }
     if plan.and_then(|body| body.returning).is_none() {
         let original = definition_function_type(context, function, cfg, layout)?;
-        if !plan.is_some_and(|body| body.input.is_some() || body.checked_backing_producer.is_some()
+        if !plan.is_some_and(|body| !body.inputs.is_empty() || body.checked_backing_producer.is_some()
             || body.checked_backing_wrapper.is_some()) {
             return Ok(original);
         }
         let mut parameters = original.get_param_types().into_iter().map(Into::into)
             .collect::<Vec<BasicMetadataTypeEnum<'ctx>>>();
-        parameters.push(context.ptr_type(AddressSpace::default()).into());
+        let sidecars = plan.map_or(0, |body| body.inputs.len())
+            + usize::from(plan.is_some_and(|body| body.checked_backing_producer.is_some()
+                || body.checked_backing_wrapper.is_some()));
+        let sidecar = BasicMetadataTypeEnum::from(context.ptr_type(AddressSpace::default()));
+        parameters.extend(std::iter::repeat_n(sidecar, sidecars));
         return Ok(match original.get_return_type() {
             Some(output) => output.fn_type(&parameters, false),
             None => context.void_type().fn_type(&parameters, false),
@@ -411,8 +423,10 @@ pub(super) fn finish_conditional_receipts<'ctx>(
     let expression = state.body_call_nodes.and_then(|nodes| nodes.expression_ordinal(expression))
         .ok_or_else(|| "missing conditional aggregate receipt occurrence".to_owned())?;
     if aggregate.plan.input_exhaustive == Some(expression) {
-        let (formal, _) = aggregate.input.take().ok_or("missing exhaustive formal receipt at conditional merge")?;
-        if Some(formal) != aggregate.plan.input || aggregate.plan.input_release_guard.is_some() {
+        let formal = aggregate.plan.inputs.keys().next().ok_or("missing exhaustive formal plan")?;
+        if aggregate.plan.inputs.len() != 1 || aggregate.plan.input_release_guard.is_some()
+            || aggregate.inputs.remove(formal).is_none()
+        {
             return Err("exhaustive formal receipt identity mismatch".into());
         }
     }
@@ -897,7 +911,7 @@ pub(super) fn emit_initializer_binding<'ctx, 'module>(
 }
 
 pub(super) fn requires_scoped_function_emission(plan: Option<&ClosedBody>) -> bool {
-    plan.is_some_and(|plan| plan.input.is_some() || plan.ordinary_result || !plan.ordinary_calls.is_empty()
+    plan.is_some_and(|plan| !plan.inputs.is_empty() || plan.ordinary_result || !plan.ordinary_calls.is_empty()
         || matches!(plan.returning, Some(ClosedReturn::Structured { .. })))
 }
 
@@ -988,7 +1002,7 @@ pub(super) fn emit_call<'ctx, 'module>(
         return Ok(Some(value));
     }
     let action = aggregate.plan.calls.get(&ordinal).copied().map(CallDestination::Body);
-    let input = aggregate.plan.input_calls.get(&ordinal).map(|&(_, input)| CallInput::Body(input));
+    let input = aggregate.plan.input_calls.get(&ordinal).map(|inputs| CallInput::Body(inputs.as_slice()));
     if action.is_none() && input.is_none() {
         return Ok(None);
     }
@@ -1147,7 +1161,7 @@ fn emit_selected_call<'ctx, 'module>(
     project: Option<(&ScalarModule, &[&ScalarModule])>,
     ordinal: usize,
     action: Option<CallDestination<'ctx>>,
-    input: Option<CallInput>,
+    input: Option<CallInput<'module>>,
     initializer_target: Option<&ModuleInitializationCallTarget>,
 ) -> Result<EmitValue<'ctx>, String> {
     let symbol = state.direct_aggregate_symbol(expression, initializer_target)?;
@@ -1227,7 +1241,7 @@ fn emit_selected_call<'ctx, 'module>(
         let [argument] = arguments else { return Err("invalid local conditional temporary arguments".into()) };
         if !matches!(parameters.as_slice(), [ScalarType::Struct(_)])
             || state.body_call_nodes.and_then(|nodes| nodes.expression_ordinal(argument)) != Some(conditional)
-            || !matches!(input, Some(CallInput::Body(ClosedInput::Transfer(receipt))) if receipt == conditional)
+            || !matches!(input, Some(CallInput::Body(inputs)) if inputs == [(0, ClosedInput::Transfer(conditional))])
         {
             return Err("changed local conditional temporary consumer".into());
         }
@@ -1257,48 +1271,52 @@ fn emit_selected_call<'ctx, 'module>(
         operands.push(destination.into());
     }
     let owner_slots = super::expression::stage_checked_return_sidecars(context, state, owner_outputs, &mut operands)?;
-    if let Some(input) = input {
-        let base = match input {
-            CallInput::Body(ClosedInput::Transfer(receipt)) => {
-                let aggregate = state.aggregate.as_mut().expect("closed aggregate input context");
-                if aggregate.plan.deferred_call_inputs.get(&ordinal) == Some(&receipt) {
-                    aggregate.receipts.get(&receipt).copied()
-                        .ok_or_else(|| "missing deferred owner receipt at committed input call".to_owned())?
-                } else {
-                    aggregate.receipts.remove(&receipt)
-                        .ok_or_else(|| "missing owner receipt at committed input call".to_owned())?
+    match input {
+        Some(CallInput::Body(inputs)) => {
+            let aggregate = state.aggregate.as_mut().expect("closed aggregate input context");
+            for &(slot, input) in inputs {
+                if slot >= arguments.len() {
+                    return Err("closed aggregate input slot exceeds call arity".into());
                 }
-            },
-            CallInput::Body(ClosedInput::ForwardFormal(source)) => {
-                let aggregate = state.aggregate.as_mut().expect("closed aggregate input context");
-                let (formal, base) = aggregate.input.take()
-                    .ok_or_else(|| "missing original formal base at owner transfer".to_owned())?;
-                if formal != source {
-                    return Err("formal owner transfer identity mismatch".to_owned());
-                }
-                base
+                let base = match input {
+                    ClosedInput::Transfer(receipt) => {
+                        if aggregate.plan.deferred_call_inputs.get(&ordinal) == Some(&receipt) {
+                            aggregate.receipts.get(&receipt).copied()
+                                .ok_or_else(|| "missing deferred owner receipt at committed input call".to_owned())?
+                        } else {
+                            aggregate.receipts.remove(&receipt)
+                                .ok_or_else(|| "missing owner receipt at committed input call".to_owned())?
+                        }
+                    }
+                    ClosedInput::ForwardFormal(source) => aggregate.inputs.remove(&source)
+                        .ok_or_else(|| "missing original formal base at owner transfer".to_owned())?,
+                    ClosedInput::ForwardFormalDeferred(source) => {
+                        if aggregate.plan.input_release_guard.is_none() && aggregate.plan.input_exhaustive.is_none() {
+                            return Err("conditional formal owner transfer identity mismatch".to_owned());
+                        }
+                        aggregate.inputs.get(&source).copied()
+                            .ok_or_else(|| "missing deferred formal base at owner transfer".to_owned())?
+                    }
+                    ClosedInput::Plain => context.ptr_type(AddressSpace::default()).const_null(),
+                };
+                operands.push(base.into());
             }
-            CallInput::Body(ClosedInput::ForwardFormalDeferred(source)) => {
-                let aggregate = state.aggregate.as_ref().expect("closed aggregate input context");
-                let (formal, base) = aggregate.input.ok_or_else(|| "missing deferred formal base at owner transfer".to_owned())?;
-                if formal != source || (aggregate.plan.input_release_guard.is_none() && aggregate.plan.input_exhaustive.is_none()) {
-                    return Err("conditional formal owner transfer identity mismatch".to_owned());
-                }
-                base
-            }
-            CallInput::Body(ClosedInput::Plain) => context.ptr_type(AddressSpace::default()).const_null(),
-            CallInput::Initializer(input) => {
-                let frame = state.initializer_aggregate.as_mut().expect("closed initializer input frame");
-                frame.visit(ordinal)?;
-                match (input, frame.receipt.take()) {
-                    (ClosedInitializerInput::Consume(expected) | ClosedInitializerInput::Immediate(expected),
-                        Some((actual, base))) if expected == actual => base,
-                    (ClosedInitializerInput::Plain, None) => context.ptr_type(AddressSpace::default()).const_null(),
-                    _ => return Err("closed initializer original base is not available at its paired input".into()),
-                }
-            }
-        };
-        operands.push(base.into());
+        }
+        Some(CallInput::Initializer(input)) => {
+            let frame = state.initializer_aggregate.as_mut().expect("closed initializer input frame");
+            frame.visit(ordinal)?;
+            let base = match (input, frame.receipt.take()) {
+                (ClosedInitializerInput::Consume(expected) | ClosedInitializerInput::Immediate(expected),
+                    Some((actual, base))) if expected == actual => base,
+                (ClosedInitializerInput::Plain, None) => context.ptr_type(AddressSpace::default()).const_null(),
+                _ => return Err("closed initializer original base is not available at its paired input".into()),
+            };
+            operands.push(base.into());
+        }
+        None => {}
+    }
+    if operands.len() != function.count_params() as usize {
+        return Err("closed aggregate argument sidecars differ from definition".into());
     }
     if action.is_none() {
         let call = state.builder.build_call(function, &operands, "aggregate_input_call").map_err(builder_error)?;
@@ -1415,8 +1433,8 @@ pub(super) fn release_scope<'ctx>(
         return release_literal_array_base(context, state, backing);
     }
     let releases = aggregate.plan.releases.get(&exit);
-    let release_input = aggregate.plan.input_release == Some(exit);
-    if releases.is_none() && !release_input {
+    let release_inputs = aggregate.plan.input_releases.get(&exit);
+    if releases.is_none() && release_inputs.is_none() {
         return Ok(());
     }
     declare_core_runtime(context, state.module);
@@ -1446,15 +1464,13 @@ pub(super) fn release_scope<'ctx>(
             state.builder.build_call(free, &[base.into()], "aggregate_release").map_err(builder_error)?;
         }
     }
-    if release_input {
-        let (slot, base) = aggregate.input.take().ok_or_else(|| "missing original formal base at owner exit".to_owned())?;
-        if aggregate.plan.input != Some(slot) {
-            return Err("formal owner release identity mismatch".to_owned());
-        }
+    for slot in release_inputs.into_iter().flatten().rev() {
+        let base = aggregate.inputs.remove(slot).ok_or_else(|| "missing original formal base at owner exit".to_owned())?;
+        let mixed = *aggregate.plan.inputs.get(slot).ok_or("formal owner release identity mismatch")?;
         let active = if let Some(guard) = aggregate.plan.input_release_guard {
             Some(aggregate.receipt_guards.get(&guard).copied()
                 .ok_or_else(|| "missing guarded formal receipt at scope cleanup".to_owned())?)
-        } else if aggregate.plan.input_mixed {
+        } else if mixed {
             Some(state.builder.build_is_not_null(base, "aggregate_formal_owned").map_err(builder_error)?)
         } else {
             None
@@ -1745,7 +1761,7 @@ pub(super) fn finish_return<'ctx>(
     {
         return Err("local conditional owner was not committed to lexical storage".into());
     }
-    if !aggregate.receipts.is_empty() || aggregate.receipt_guards.len() != aggregate.plan.conditional_guard_count || aggregate.input.is_some() {
+    if !aggregate.receipts.is_empty() || aggregate.receipt_guards.len() != aggregate.plan.conditional_guard_count || !aggregate.inputs.is_empty() {
         return Err("unreleased closed aggregate receipt".into());
     }
     if aggregate.ordinary_called == aggregate.plan.ordinary_calls.is_empty() {
