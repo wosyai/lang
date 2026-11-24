@@ -572,6 +572,11 @@ impl IntegerSet {
         Some(self.partition::<true>(IntegerRelation::from_operator(operator)?, bound))
     }
 
+    #[cfg(feature = "internal-checker")]
+    pub(super) fn split_relation(&self, relation: IntegerRelation, bound: &BigInt) -> (Self, Self) {
+        self.partition::<true>(relation, bound)
+    }
+
     pub(super) fn keep(&self, operator: &BinaryOperator, bound: &BigInt) -> Option<Self> {
         Some(self.keep_relation(IntegerRelation::from_operator(operator)?, bound))
     }

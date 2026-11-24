@@ -1408,6 +1408,8 @@ struct IntegerRoots<'a> {
     allow_ordinary_affine_overwrites: bool,
     #[cfg(feature = "internal-checker")]
     ordinary_local_work: Option<usize>,
+    #[cfg(feature = "internal-checker")]
+    ordinary_comparison_work: Option<usize>,
     reached_obligation: bool,
     proof_reflexive_branches: bool,
 }
@@ -1467,6 +1469,24 @@ impl IntegerInputs {
         first.equal_axes().iter().copied().filter(|&(axis, canonical)|
             rest.iter().all(|row| row.canonical_axis(axis) == row.canonical_axis(canonical))
         ).collect()
+    }
+
+    #[cfg(feature = "internal-checker")]
+    fn common_equal_axes_bounded(&self, work: &mut usize) -> Option<Vec<(usize, usize)>> {
+        let Some((first, rest)) = self.0.split_first() else { return Some(Vec::new()); };
+        let Some(aliases) = &first.equal_axes else { return Some(Vec::new()); };
+        charge_call_work(work, aliases.len().checked_add(1)?)?;
+        let mut common = aliases.as_ref().clone();
+        for row in rest {
+            if common.is_empty() { break; }
+            charge_call_work(work, 1)?;
+            let Some(other) = &row.equal_axes else { common.clear(); break; };
+            if Rc::ptr_eq(aliases, other) { continue; }
+            let lookups = usize::BITS - other.len().leading_zeros();
+            charge_call_work(work, common.len().checked_mul(1 + 2 * lookups as usize)?)?;
+            common.retain(|&(axis, canonical)| row.canonical_axis(axis) == row.canonical_axis(canonical));
+        }
+        Some(common)
     }
 
     #[cfg(feature = "internal-checker")]
@@ -2669,7 +2689,7 @@ pub(super) fn collect_ordered_root_requirement_failures<'a>(
 ) -> Option<(bool, Vec<IntegerCheckFailure<'a>>)> {
     let mut failures = Vec::new();
     let mut sink = |failure| failures.push(failure);
-    let (active, _) = if allow_ordinary_integer_locals && !calls.structure.checker_ordinary_integer_locals.is_empty() {
+    let (active, _) = if allow_ordinary_integer_locals && calls.structure.has_ordinary_integer_operations() {
         collect_integer_requirement_failures_in_scope(
             calls, IntegerRequirementEntry::Arbitrary, None, false, false, &mut sink, OrderedRootConditions::<true, true>(body),
         )
@@ -3641,6 +3661,9 @@ fn run_integer_callable<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool,
         allow_ordinary_integer_locals: Authored::ALLOW_ORDINARY_INTEGER_LOCALS,
         #[cfg(feature = "internal-checker")]
         allow_ordinary_affine_overwrites: Authored::ALLOW_ORDINARY_INTEGER_LOCALS,
+        #[cfg(feature = "internal-checker")]
+        ordinary_comparison_work: (Authored::ALLOW_ORDINARY_INTEGER_LOCALS
+            && !calls.structure.checker_ordinary_integer_comparisons.is_empty()).then_some(0),
         ..IntegerRoots::default()
     };
     for (binding, parameter) in checker_parameters.iter().zip(&boundary.parameters) {
@@ -3745,11 +3768,140 @@ fn directive_disjunction_cuts<'a>(
     Some(IntegerCutUnion::new((*lhs, left), (*rhs, right), (minimum, maximum)))
 }
 
+#[cfg(feature = "internal-checker")]
+enum OrdinaryComparisonCut<'a> {
+    Constant(bool),
+    Bound { axis: usize, relation: IntegerRelation, bound: Cow<'a, BigInt> },
+}
+
+#[cfg(feature = "internal-checker")]
+fn ordinary_comparison_cut(
+    row: &IntegerRow, [left, right]: [usize; 2], relation: IntegerRelation,
+) -> Option<OrdinaryComparisonCut<'_>> {
+    use OrdinaryComparisonCut::{Bound, Constant};
+    use std::cmp::Ordering::{Equal, Greater, Less};
+    let left = row.canonical_axis(left);
+    let right = row.canonical_axis(right);
+    if left == right { return Some(Constant(relation.accepts(Equal))); }
+    match (row[left].singleton_value(), row[right].singleton_value()) {
+        (Some(l), Some(r)) => return Some(Constant(relation.accepts(l.cmp(r)))),
+        (None, Some(r)) => return Some(Bound { axis: left, relation, bound: Cow::Borrowed(r) }),
+        (Some(l), None) => return Some(Bound { axis: right, relation: relation.reversed(), bound: Cow::Borrowed(l) }),
+        (None, None) => {}
+    }
+
+    let class = row.affine.as_deref()?;
+    let zero = BigInt::default();
+    let parts = |axis| {
+        if axis == class.anchor { Some((false, &zero)) }
+        else { let member = class.member(axis)?; Some((member.reflected, &member.offset)) }
+    };
+    let (left_reflected, left_offset) = parts(left)?;
+    let (right_reflected, right_offset) = parts(right)?;
+    if left_reflected == right_reflected {
+        return Some(Constant(relation.accepts(left_offset.cmp(right_offset))));
+    }
+    // Put the positive slope on the left: 2*anchor R difference.
+    let (relation, difference) = if left_reflected {
+        (relation.reversed(), left_offset - right_offset)
+    } else {
+        (relation, right_offset - left_offset)
+    };
+    let mut bound = &difference / 2u8;
+    let odd = (&difference % 2u8).bits() != 0;
+    let relation = if odd {
+        // Floor rather than truncate for a negative odd difference.
+        if difference.sign() == num_bigint::Sign::Minus { bound -= 1u8; }
+        match (relation.accepts(Less), relation.accepts(Greater)) {
+            (same, other) if same == other => return Some(Constant(same)),
+            (true, false) => IntegerRelation::from_operator(&BinaryOperator::LessEqual)?,
+            (false, true) => IntegerRelation::from_operator(&BinaryOperator::Greater)?,
+            _ => return None,
+        }
+    } else { relation };
+    Some(Bound { axis: class.anchor, relation, bound: Cow::Owned(bound) })
+}
+
+#[cfg(feature = "internal-checker")]
+fn prepared_comparison_axes(
+    roots: &IntegerRoots<'_>, comparison: &super::reference::CheckerOrdinaryIntegerComparison,
+) -> Option<[usize; 2]> {
+    let (left, left_ty) = roots.lookup(&comparison.operands[0])?;
+    let (right, right_ty) = roots.lookup(&comparison.operands[1])?;
+    (left_ty == &comparison.ty && right_ty == &comparison.ty).then_some([left, right])
+}
+
+#[cfg(feature = "internal-checker")]
+impl IntegerInputs {
+    fn ordinary_comparison(
+        &self, axes: [usize; 2], relation: IntegerRelation, selected: [bool; 2], work: &mut usize,
+    ) -> Option<[Self; 2]> {
+        let mut output = [Self::default(), Self::default()];
+        for row in &self.0 {
+            // Bound identity/singleton discovery and constant-width arithmetic
+            // before deriving the cut. Typed operands are at most 128 bits.
+            let lookups = usize::BITS - row.equal_axes().len().leading_zeros();
+            charge_call_work(work, 8 + 2 * lookups as usize)?;
+            match ordinary_comparison_cut(row, axes, relation)? {
+                OrdinaryComparisonCut::Constant(result) => {
+                    let lane = result as usize;
+                    if selected[lane] {
+                        charge_call_work(work, row.len().checked_add(1)?)?;
+                        output[lane].0.push(row.clone());
+                    }
+                }
+                OrdinaryComparisonCut::Bound { axis, relation, bound } => {
+                    let intervals = row[axis].interval_count();
+                    charge_call_work(work, intervals.checked_mul(3)?.checked_add(5)?)?;
+                    let subsets = match selected {
+                        [true, true] => {
+                            let (yes, no) = row[axis].split_relation(relation, &bound);
+                            [Some(no), Some(yes)]
+                        }
+                        [true, false] => [Some(row[axis].keep_relation(relation.complement(), &bound)), None],
+                        [false, true] => [None, Some(row[axis].keep_relation(relation, &bound))],
+                        [false, false] => [None, None],
+                    };
+                    for (lane, narrowed) in subsets.into_iter().enumerate() {
+                        let Some(narrowed) = narrowed else { continue; };
+                        if narrowed.is_empty() { continue; }
+                        charge_call_work(work, row.len().checked_add(1)?)?;
+                        let changed = narrowed != *row[axis];
+                        if changed {
+                            charge_call_work(work, row.equal_axes().len())?;
+                            row.charge_affine_replacement(axis, narrowed.interval_count(), work)?;
+                            if *work > MAX_PARTITION_TRANSFER_WORK { return None; }
+                        }
+                        let mut retained = row.clone();
+                        if changed { retained.replace_domain(axis, Rc::new(narrowed)); }
+                        output[lane].0.push(retained);
+                    }
+                }
+            }
+        }
+        Some(output)
+    }
+
+    fn ordinary_branch(
+        &self, structure: &OccurrenceStructure, condition: OccurrenceOrdinal, roots: &mut IntegerRoots<'_>,
+    ) -> Option<Option<[Self; 2]>> {
+        if roots.ordinary_comparison_work.is_none() { return Some(None); }
+        let Some(comparison) = structure.checker_ordinary_integer_comparisons.get(&condition) else {
+            return Some(None);
+        };
+        let axes = prepared_comparison_axes(roots, comparison)?;
+        self.ordinary_comparison(axes, comparison.relation, [true, true], roots.ordinary_comparison_work.as_mut()?)
+            .map(Some)
+    }
+
+}
+
 struct UnitBranchFrame {
     block: BlockOrdinal,
     next: usize,
     depth: usize,
     axis: Option<usize>,
+    keep_arm_rows: bool,
     alternate: Option<(Option<BlockOrdinal>, IntegerInputs)>,
     first: Option<IntegerInputs>,
 }
@@ -3857,18 +4009,27 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                     continue;
                 }
                 #[cfg(feature = "internal-checker")]
-                if !path.is_unreachable() && !alternate_path.is_unreachable() {
+                if !frame.keep_arm_rows && !path.is_unreachable() && !alternate_path.is_unreachable() {
                     path.charge_local_alias_work(&mut roots.ordinary_local_work, 2)?;
                     alternate_path.charge_local_alias_work(&mut roots.ordinary_local_work, 2)?;
                 }
-                path = path.join_equal(alternate_path, frame.axis);
-            } else if let Some(first) = frame.first {
+                if frame.keep_arm_rows {
+                    path.0.extend(alternate_path.0);
+                } else {
+                    path = path.join_equal(alternate_path, frame.axis);
+                }
+            } else if let Some(mut first) = frame.first {
                 #[cfg(feature = "internal-checker")]
-                if !path.is_unreachable() && !first.is_unreachable() {
+                if !frame.keep_arm_rows && !path.is_unreachable() && !first.is_unreachable() {
                     path.charge_local_alias_work(&mut roots.ordinary_local_work, 2)?;
                     first.charge_local_alias_work(&mut roots.ordinary_local_work, 2)?;
                 }
-                path = first.join_equal(path, frame.axis);
+                if frame.keep_arm_rows {
+                    first.0.extend(path.0);
+                    path = first;
+                } else {
+                    path = first.join_equal(path, frame.axis);
+                }
             }
             block = frame.block;
             next = frame.next;
@@ -3880,6 +4041,32 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
         match item.kind {
             BlockItemKind::Evaluation { expression } => {
                 if let Some(directive) = structure.checker_directives.get(&expression) {
+                    #[cfg(feature = "internal-checker")]
+                    if COLLECT && roots.ordinary_comparison_work.is_some() {
+                        if let Some(comparison) = structure.checker_ordinary_integer_comparisons.get(&expression) {
+                            let axes = prepared_comparison_axes(roots, comparison)?;
+                            let require = directive.operation == CheckerOperation::Require;
+                            let work = roots.ordinary_comparison_work.as_mut()?;
+                            let [rejected, accepted] = path.ordinary_comparison(
+                                axes, comparison.relation, [require, !require], work,
+                            )?;
+                            roots.reached_obligation = true;
+                            let failing = if require { rejected } else if accepted.is_unreachable() {
+                                std::mem::take(&mut path)
+                            } else {
+                                path = accepted;
+                                IntegerInputs::default()
+                            };
+                            if !failing.is_unreachable() {
+                                let equal_axes = failing.common_equal_axes_bounded(work)?;
+                                charge_call_work(work, roots.axes.len())?;
+                                (failures.as_deref_mut()?.sink)(IntegerCheckFailure {
+                                    directive: expression, equal_axes, state: failing, axes: roots.axes.clone(),
+                                });
+                            }
+                            continue;
+                        }
+                    }
                     let predicate = directive.predicate.as_ref()?;
                     roots.reached_obligation = true;
                     #[cfg(feature = "internal-checker")]
@@ -3963,10 +4150,21 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                         _ => return None,
                     };
                     #[cfg(feature = "internal-checker")]
-                    if !matches!(structure.checker_branches.get(condition), Some(CheckerPredicate::Boolean(_))) {
-                        path.charge_local_alias_work(&mut roots.ordinary_local_work, 4)?;
-                    }
-                    let (yes, no, axis) = if let Some(predicate) = structure.checker_branches.get(condition) {
+                    let ordinary = {
+                        let comparison = path.ordinary_branch(structure, *condition, roots)?;
+                        if comparison.is_none()
+                            && !matches!(structure.checker_branches.get(condition), Some(CheckerPredicate::Boolean(_)))
+                        {
+                            path.charge_local_alias_work(&mut roots.ordinary_local_work, 4)?;
+                        }
+                        comparison
+                    };
+                    #[cfg(not(feature = "internal-checker"))]
+                    let ordinary: Option<[IntegerInputs; 2]> = None;
+                    let keep_arm_rows = ordinary.is_some();
+                    let (yes, no, axis) = if let Some([no, yes]) = ordinary {
+                        (yes, no, None)
+                    } else if let Some(predicate) = structure.checker_branches.get(condition) {
                         path.split(roots, predicate)?
                     } else {
                         #[cfg(feature = "internal-checker")]
@@ -3987,7 +4185,7 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                     } else {
                         (then_block, yes, (!no.is_unreachable()).then_some((else_block, no)))
                     };
-                    branches.push(UnitBranchFrame { block, next, depth, axis, alternate, first: None });
+                    branches.push(UnitBranchFrame { block, next, depth, axis, keep_arm_rows, alternate, first: None });
                     block = arm;
                     next = 0;
                     depth = roots.axes.len();
@@ -4008,10 +4206,20 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                 {
                     let expected = tail?;
                     #[cfg(feature = "internal-checker")]
-                    if !matches!(structure.checker_branches.get(condition), Some(CheckerPredicate::Boolean(_))) {
-                        path.charge_local_alias_work(&mut roots.ordinary_local_work, 4)?;
-                    }
-                    let (yes, no, _) = if let Some(predicate) = structure.checker_branches.get(condition) {
+                    let ordinary = {
+                        let comparison = path.ordinary_branch(structure, *condition, roots)?;
+                        if comparison.is_none()
+                            && !matches!(structure.checker_branches.get(condition), Some(CheckerPredicate::Boolean(_)))
+                        {
+                            path.charge_local_alias_work(&mut roots.ordinary_local_work, 4)?;
+                        }
+                        comparison
+                    };
+                    #[cfg(not(feature = "internal-checker"))]
+                    let ordinary: Option<[IntegerInputs; 2]> = None;
+                    let (yes, no, _) = if let Some([no, yes]) = ordinary {
+                        (yes, no, None)
+                    } else if let Some(predicate) = structure.checker_branches.get(condition) {
                         path.split(roots, predicate)?
                     } else {
                         #[cfg(feature = "internal-checker")]
@@ -4781,6 +4989,9 @@ impl<'a> ExactCallCursor<'a> {
         {
             self.roots.allow_ordinary_integer_locals = allow_ordinary_integer_locals && !calls.structure.checker_ordinary_integer_locals.is_empty();
             self.roots.allow_ordinary_affine_overwrites = allow_ordinary_integer_locals;
+            if allow_ordinary_integer_locals && !calls.structure.checker_ordinary_integer_comparisons.is_empty() {
+                self.roots.ordinary_comparison_work.get_or_insert(0);
+            }
         }
         #[cfg(not(feature = "internal-checker"))]
         let _ = allow_ordinary_integer_locals;
@@ -5212,6 +5423,55 @@ fn affine_class_cap_allows_identity_alias_and_releases_truncated_members() {
     row.truncate(MAX_AFFINE_MEMBERS);
     assert_eq!(row.affine.as_ref().unwrap().members.len(), MAX_AFFINE_MEMBERS - 1);
     assert_eq!(row.test_append_affine(0, next), Some(()));
+}
+
+#[cfg(feature = "internal-checker")]
+#[test]
+fn bounded_comparison_witness_aliases_respect_shared_and_distinct_rows() {
+    let value = Rc::new(IntegerSet::singleton(&5.into()));
+    let mut common = IntegerRow::new(vec![Rc::clone(&value)]);
+    common.append_alias(0, Rc::clone(&value));
+    common.append_alias(0, Rc::clone(&value));
+    let mut rows = IntegerInputs(vec![common.clone(); 4]);
+    let mut work = MAX_PARTITION_TRANSFER_WORK - 6;
+    assert_eq!(rows.common_equal_axes_bounded(&mut work), Some(vec![(1, 0), (2, 0)]));
+    assert_eq!(work, MAX_PARTITION_TRANSFER_WORK);
+    common.overwrite(2, value, false);
+    rows.0.push(common);
+    assert_eq!(rows.common_equal_axes_bounded(&mut work), None);
+    let mut work = 0;
+    assert_eq!(rows.common_equal_axes_bounded(&mut work), Some(vec![(1, 0)]));
+}
+
+#[cfg(feature = "internal-checker")]
+#[test]
+fn ordinary_lexical_comparison_all_relations_match_odd_even_signed_and_unsigned_points() {
+    let cases = [(ScalarType::I8, -4, 1, -3), (ScalarType::I8, -4, 1, -2),
+        (ScalarType::U8, 0, 5, 5), (ScalarType::U8, 0, 4, 4)];
+    let relations = [BinaryOperator::Less, BinaryOperator::LessEqual, BinaryOperator::Equal,
+        BinaryOperator::NotEqual, BinaryOperator::GreaterEqual, BinaryOperator::Greater];
+    for (ty, min, max, offset) in cases {
+        let domain = IntegerSet::from_type(&ty).unwrap()
+            .keep(&BinaryOperator::GreaterEqual, &min.into()).unwrap()
+            .keep(&BinaryOperator::LessEqual, &max.into()).unwrap();
+        let mut row = IntegerRow::new(vec![Rc::new(domain)]);
+        row.test_append_affine(0, Rc::new(IntegerAffineTransform { reflected: true, offset: offset.into() })).unwrap();
+        let input = IntegerInputs(vec![row]);
+        for operator in &relations {
+            let relation = IntegerRelation::from_operator(operator).unwrap();
+            for (axes, reversed) in [([0, 1], false), ([1, 0], true)] {
+                let mut work = 0;
+                let [not, yes] = input.ordinary_comparison(axes, relation, [true, true], &mut work).unwrap();
+                for x in min..=max {
+                    let y = offset - x;
+                    let pair = [i128::from(x), i128::from(y)];
+                    let expected = relation.accepts(if reversed { y.cmp(&x) } else { x.cmp(&y) });
+                    assert_eq!(yes.includes_signed(&pair), expected);
+                    assert_eq!(not.includes_signed(&pair), !expected);
+                }
+            }
+        }
+    }
 }
 
 #[cfg(feature = "internal-checker")]

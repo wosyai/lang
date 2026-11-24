@@ -646,7 +646,7 @@ fn ordered_symbolic_callers(
             let body = calls.function_body(module, item, None).ok_or(ProjectCheck::MissingRootOccurrences)?;
             #[cfg(feature = "internal-checker")]
             if let Some(seeds) = ordinary_local_seeds.as_deref_mut() {
-                if !body.structure.checker_ordinary_integer_locals.is_empty() {
+                if body.structure.has_ordinary_integer_operations() {
                     seeds.push((module, item));
                 }
             }
@@ -1652,7 +1652,7 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
         let signature = caller.checked_call_signatures.get(&call).ok_or(ProjectCheck::Unsupported)?;
         if !matches!(signature.outputs.outputs.as_slice(), [output] if &output.ty == expected)
             || (*expected != ScalarType::Unit && (!Observer::EXACT_INTEGER_CALL_CONTINUATIONS
-                || !supported_integer_continuation_shape(body, expected)))
+                || !supported_integer_continuation_shape_for(body, expected, Observer::ORDINARY_INTEGER_LOCALS)))
         {
             return Err(ProjectCheck::Unsupported);
         }
@@ -1858,11 +1858,12 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
         } else if ACTUAL_STARTUP && Observer::EXACT_INTEGER_CALL_CONTINUATIONS && collection.is_some()
             && (!body.call_occurrences.is_empty() || {
                 #[cfg(feature = "internal-checker")]
-                { Observer::ORDINARY_INTEGER_LOCALS && !body.structure.checker_ordinary_integer_locals.is_empty() }
+                { Observer::ORDINARY_INTEGER_LOCALS && body.structure.has_ordinary_integer_operations() }
                 #[cfg(not(feature = "internal-checker"))]
                 { false }
             })
-            && supported_integer_continuation(body, expected)
+            && supported_integer_continuation_shape_for(body, expected, Observer::ORDINARY_INTEGER_LOCALS)
+            && body.assignments.is_empty()
         {
             self.run_exact_calls(body, &owner.source, exact, expected, collection)
         } else if is_integer_type(expected)
@@ -1958,6 +1959,23 @@ fn supported_integer_continuation_shape(body: &FunctionCallSites, expected: &Sca
     let exact_requirements = false;
     is_integer_type(expected) && exact_requirements
         && body.allocation_length_calls.is_empty()
+}
+
+fn supported_integer_continuation_shape_for(body: &FunctionCallSites, expected: &ScalarType, ordinary: bool) -> bool {
+    if supported_integer_continuation_shape(body, expected) { return true; }
+    #[cfg(feature = "internal-checker")]
+    if ordinary && is_integer_type(expected) && body.allocation_length_calls.is_empty()
+        && !body.structure.checker_ordinary_integer_comparisons.is_empty()
+    {
+        return body.structure.checker_directives.iter().all(|(occurrence, directive)| {
+            directive.operation == CheckerOperation::Require
+                && (matches!(directive.predicate, Some(CheckerPredicate::Boolean(_) | CheckerPredicate::Integer(_)))
+                    || body.structure.checker_ordinary_integer_comparisons.contains_key(occurrence))
+        });
+    }
+    #[cfg(not(feature = "internal-checker"))]
+    let _ = ordinary;
+    false
 }
 
 #[cfg(test)]

@@ -408,6 +408,67 @@ cases.extend([
         "i8 saved = entry;","").replace("core.require(saved == 3","core.require(flipped == 1"),2,b"unsupported analysis"),
     ("nonliteral-affine-reassignment-remains-unsupported",overwrite_member.replace("first = 7;","first = second;"),2,b"unsupported analysis"),
 ])
+compare_odd = f"""%%start
+    unit(i8) compare = fn(entry) {{
+        {bounds("entry",-4,1)}
+        i8 reflected = -3 - entry;
+        if (reflected > entry) {{ core.require(entry <= -2, {report(85,"THEN")}); }}
+        else {{ core.require(entry >= -1, {report(86,"ELSE")}); }};
+        core.require(reflected != entry, {report(87,"ODD")});
+    }};
+    %%end"""
+compare_unsigned = f"""%%start
+    unit(u8) compare = fn(entry) {{
+        core.narrow(entry <= 4, {report(88,"BOUNDS")});
+        u8 reflected = 4 - entry;
+        core.narrow(reflected == entry, {report(89,"UNSIGNED")});
+        core.require(entry == 2, {report(90,"EQUALITY")});
+    }};
+    %%end"""
+compare_member = f"""%%start
+    unit(i8) compare = fn(entry) {{
+        {bounds("entry",0,4)}
+        i8 elevated = entry + 1;
+        i8 same = elevated;
+        core.require(same >= elevated, {report(91,"ALIAS")});
+        core.require(entry < elevated, {report(92,"SAME-SLOPE")});
+    }};
+    %%end"""
+compare_pair = f"""%%start
+    unit(i8,i8) verify = fn(mapped,base) {{
+        if (mapped < base) {{ core.require(base >= 3, {report(93,"PREPARED-PAIR")}); }};
+    }};
+    unit(i8) caller = fn(entry) {{
+        {bounds("entry",0,4)}
+        i8 reflected = 4 - entry;
+        verify(reflected, entry);
+    }};
+    verify(0,0);
+    %%end"""
+compare_startup = f"""%%start
+    unit(i8,i8) check = fn(left,right) {{
+        core.require(left == right, {report(94,"ACTUAL-COMPARE")});
+    }};
+    check(1,2);
+    %%end"""
+independent_compare = f"""%%start
+    unit(i8,i8) check = fn(left,right) {{
+        core.require(left <= right, {report(95,"INDEPENDENT")});
+    }};
+    %%end"""
+for name,program,correct,incorrect,code,label in [
+    ("odd-negative-comparison",compare_odd,"entry <= -2","entry <= -3",85,b"THEN"),
+    ("unsigned-reflexive-cut",compare_unsigned,"entry == 2","entry == 0",90,b"EQUALITY"),
+    ("same-slope-and-alias-comparison",compare_member,"entry < elevated","entry > elevated",92,b"SAME-SLOPE"),
+    ("related-comparison-inside-pair",compare_pair,"base >= 3","base >= 4",93,b"PREPARED-PAIR"),
+]:
+    cases.extend([(name,program,0,b""),(name+"-witness",program.replace(correct,incorrect),code,label)])
+cases.extend([
+    ("lexical-comparisons-keep-arm-diagnostic-order",compare_odd.replace("entry <= -2","entry <= -3")
+     .replace("entry >= -1","entry >= 0"),85,b"THENELSE"),
+    ("exact-startup-lexical-comparison",compare_startup,94,b"ACTUAL-COMPARE"),
+    ("independent-lexical-comparison-remains-unsupported",independent_compare,2,b"unsupported analysis"),
+])
 with tempfile.TemporaryDirectory(prefix="affine-calls-") as path:
     root=Path(path)
     (root/"src").mkdir()
@@ -415,7 +476,7 @@ with tempfile.TemporaryDirectory(prefix="affine-calls-") as path:
         (root/"wosy.toml").write_text(manifest.format(output=target))
         for scope in ("--main-flow-only","--declared-package"):
             for name,text,expected,stderr in cases:
-                included = scope == "--declared-package" or name in ("exact-startup-lexical-copy", "exact-startup-inline-arithmetic")
+                included = scope == "--declared-package" or name in ("exact-startup-lexical-copy", "exact-startup-inline-arithmetic", "exact-startup-lexical-comparison")
                 code = expected if included else 0
                 expected_stderr = stderr if included else b""
                 (root/"src/main.w").write_text(text.strip()+"\n")
