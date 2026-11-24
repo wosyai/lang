@@ -19,6 +19,8 @@ use super::symbolic_integer::{consecutive_integer_cuts, IntegerShowConstraints};
 pub(super) enum CheckerPredicate {
     Boolean(bool),
     #[cfg_attr(not(feature = "internal-checker"), allow(dead_code))]
+    NamedBoolEntry { binding: ReferenceBindingId, value: bool },
+    #[cfg_attr(not(feature = "internal-checker"), allow(dead_code))]
     ProofReflexiveBranch(bool),
     Integer(IntegerPredicate),
     EntryDomain { binding: ReferenceBindingId, values: IntegerSet },
@@ -1513,6 +1515,8 @@ struct IntegerRoots<'a> {
     #[cfg(feature = "internal-checker")]
     named_pair_rectangles: bool,
     #[cfg(feature = "internal-checker")]
+    named_exact_bool: bool,
+    #[cfg(feature = "internal-checker")]
     allow_ordinary_integer_locals: bool,
     #[cfg(feature = "internal-checker")]
     allow_ordinary_affine_overwrites: bool,
@@ -1930,7 +1934,8 @@ impl IntegerInputs {
                 return Some(if *value { (self, Self::default(), None) } else { (Self::default(), self, None) });
             }
             CheckerPredicate::Integer(predicate) => predicate,
-            CheckerPredicate::EntryDomain { .. } | CheckerPredicate::DirectiveDisjunction { .. } | CheckerPredicate::ProofReflexiveBranch(_) => return None,
+            CheckerPredicate::NamedBoolEntry { .. } | CheckerPredicate::EntryDomain { .. }
+            | CheckerPredicate::DirectiveDisjunction { .. } | CheckerPredicate::ProofReflexiveBranch(_) => return None,
         };
         let (index, ty) = roots.lookup(&predicate.binding)?;
         if ty != &predicate.ty {
@@ -2003,7 +2008,8 @@ impl IntegerInputs {
             CheckerPredicate::Boolean(true) => return Some(Self::default()),
             CheckerPredicate::Boolean(false) => return Some(Self(self.0.clone())),
             CheckerPredicate::Integer(predicate) => predicate,
-            CheckerPredicate::EntryDomain { .. } | CheckerPredicate::DirectiveDisjunction { .. } | CheckerPredicate::ProofReflexiveBranch(_) => return None,
+            CheckerPredicate::NamedBoolEntry { .. } | CheckerPredicate::EntryDomain { .. }
+            | CheckerPredicate::DirectiveDisjunction { .. } | CheckerPredicate::ProofReflexiveBranch(_) => return None,
         };
         let (index, ty) = roots.lookup(&predicate.binding)?;
         if ty != &predicate.ty {
@@ -2947,7 +2953,8 @@ impl IntegerReturningPath<'_> {
         let (yes, no) = match guard {
             CheckerPredicate::Boolean(true) => (self.state, IntegerInputs::default()),
             CheckerPredicate::Boolean(false) => (IntegerInputs::default(), self.state),
-            CheckerPredicate::EntryDomain { .. } | CheckerPredicate::DirectiveDisjunction { .. } | CheckerPredicate::ProofReflexiveBranch(_) => return None,
+            CheckerPredicate::NamedBoolEntry { .. } | CheckerPredicate::EntryDomain { .. }
+            | CheckerPredicate::DirectiveDisjunction { .. } | CheckerPredicate::ProofReflexiveBranch(_) => return None,
             CheckerPredicate::Integer(predicate) => {
                 let index = self.axes.iter().position(|binding| **binding == predicate.binding)?;
                 self.state.split_equal_axis(index, &predicate.operator, &predicate.bound)?
@@ -4422,7 +4429,8 @@ fn run_integer_callable<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool,
         match filter {
             CheckerPredicate::Boolean(true) => {}
             CheckerPredicate::Boolean(false) => return Some(Ok(ProofCoverage::NoApplicableInputs)),
-            CheckerPredicate::DirectiveDisjunction { .. } | CheckerPredicate::ProofReflexiveBranch(_) => return None,
+            CheckerPredicate::NamedBoolEntry { .. } | CheckerPredicate::DirectiveDisjunction { .. }
+            | CheckerPredicate::ProofReflexiveBranch(_) => return None,
             CheckerPredicate::EntryDomain { binding, values } => {
                 let (axis, _) = roots.lookup(binding)?;
                 match row[axis].intersection(values) {
@@ -4809,6 +4817,22 @@ impl IntegerInputs {
         &self, structure: &OccurrenceStructure, condition: OccurrenceOrdinal, roots: &mut IntegerRoots<'_>,
         selected: [bool; 2],
     ) -> Option<Option<[Self; 2]>> {
+        if roots.named_exact_bool {
+            use super::reference::CheckerOrdinaryBoolean as Boolean;
+            let (binding, negated) = match structure.checker_ordinary_booleans.get(&condition) {
+                Some(Boolean::Binding(binding)) => (binding, false),
+                Some(Boolean::Not(operand)) => match operand.as_ref() {
+                    Boolean::Binding(binding) => (binding, true),
+                    _ => return Some(None),
+                },
+                _ => return Some(None),
+            };
+            let (axis, ty) = roots.lookup(binding)?;
+            if *ty != ScalarType::Bool || axis >= roots.parameters { return None; }
+            let relation = IntegerRelation::from_operator(if negated { &BinaryOperator::NotEqual } else { &BinaryOperator::Equal })?;
+            let work = roots.ordinary_comparison_work.get_or_insert(0);
+            return self.ordinary_atom(OrdinaryIntegerAtom::Literal(axis, relation, &BigInt::from(1u8)), selected, work).map(Some);
+        }
         let Some(mut work) = roots.ordinary_comparison_work else { return Some(None); };
         let partitions = if let Some(compound) = structure.checker_ordinary_booleans.get(&condition) {
             self.ordinary_boolean(compound, roots, selected, &mut work)?
@@ -6245,6 +6269,18 @@ impl<'a> ExactCallCursor<'a> {
     pub(super) fn allow_extended_scalar_locals(&mut self) {
         debug_assert!(self.projected_slot.is_none() && self.projected_pair.is_none());
         self.roots.allow_extended_scalar_locals = true;
+    }
+
+    #[cfg(feature = "internal-checker")]
+    pub(super) fn allow_named_exact_bool_parameters(&mut self) -> Option<()> {
+        if self.projected_slot.is_some() || self.projected_pair.is_some() { return None; }
+        for (axis, (_, ty)) in self.roots.axes.iter().enumerate() {
+            if **ty == ScalarType::Bool {
+                bool_result_lane(self.block.path.singleton_at(axis)?)?;
+                self.roots.named_exact_bool = true;
+            }
+        }
+        Some(())
     }
 
     pub(super) fn new(calls: &'a FunctionCallSites, exact: &[&BigInt], expected: &ScalarType) -> Option<Self> {

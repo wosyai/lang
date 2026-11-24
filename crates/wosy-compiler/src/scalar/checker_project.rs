@@ -1474,8 +1474,15 @@ fn run_initializer_call<'a, Observer: ActualIntegerObserver>(
     let module_bool_initializer = actual.real_module_boolean_initializer(expected, collection.is_some());
     if *expected == ScalarType::Bool && !module_bool_initializer { return Err(ProjectCheck::Unsupported); }
     let real_input = module_bool_initializer || actual.real_integer_input_profile(expected, collection.is_some());
-    let allow_bool = (real_input || *expected == ScalarType::Unit)
-        && collection.is_some() && Observer::ORDINARY_INTEGER_LOCALS;
+    #[cfg(feature = "internal-checker")]
+    let named_bool_entry = collection.is_some() && is_integer_type(expected) && proof_site.is_some()
+        && named_exact_mixed_pair(&signature.parameters, |ty| ty)
+        && topology.structure.checker_direct_targets.get(&occurrence).is_some_and(|&target|
+            matches!(actual.observer.named_exact_watch(target), Some(NamedExactWatch::Observe { .. })));
+    #[cfg(not(feature = "internal-checker"))]
+    let named_bool_entry = false;
+    let allow_bool = named_bool_entry || ((real_input || *expected == ScalarType::Unit)
+        && collection.is_some() && Observer::ORDINARY_INTEGER_LOCALS);
     let arguments = if real_input && signature.parameters.is_empty() {
         ActualProjectedArguments::Single(None)
     } else if signature.parameters.len() == 2
@@ -1624,8 +1631,15 @@ enum NamedStackArguments {
 }
 
 #[cfg(feature = "internal-checker")]
-fn named_stack_integer_parameters(parameters: &[ScalarType]) -> bool {
-    matches!(parameters, [_] | [_, _]) && parameters.iter().all(is_integer_type)
+fn named_exact_mixed_pair<T>(parameters: &[T], ty: impl Fn(&T) -> &ScalarType) -> bool {
+    matches!(parameters, [first, second] if matches!((ty(first), ty(second)),
+        (ScalarType::Bool, integer) | (integer, ScalarType::Bool) if is_integer_type(integer)))
+}
+
+#[cfg(feature = "internal-checker")]
+fn named_stack_parameters(parameters: &[ScalarType]) -> bool {
+    (matches!(parameters, [_] | [_, _]) && parameters.iter().all(is_integer_type))
+        || named_exact_mixed_pair(parameters, |ty| ty)
 }
 
 #[cfg(feature = "internal-checker")]
@@ -2102,6 +2116,10 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
         #[allow(unused_mut)]
         let mut cursor = ExactCallCursor::new(body, exact, expected).ok_or(ProjectCheck::Unsupported)?;
         #[cfg(feature = "internal-checker")]
+        if NAMED {
+            cursor.allow_named_exact_bool_parameters().ok_or(ProjectCheck::Unsupported)?;
+        }
+        #[cfg(feature = "internal-checker")]
         if ACTUAL_STARTUP && collection.is_some() && *expected == ScalarType::Unit && Observer::EXACT_CONTEXTUAL_BOOLEAN_UNIT
             && body.structure.checker_has_bool_contextual_declaration
         {
@@ -2289,7 +2307,7 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
         if NAMED && (parent.source != &owner.source || matches!(&watched, Some(NamedExactWatch::Citation))
             || !citation_safe_calling_body(body) || self.active.contains(&target)
             || !matches!(effect, ExactCallEffect::Scalar { binding: Some(_), .. })
-            || !named_stack_integer_parameters(&signature.parameters)
+            || !named_stack_parameters(&signature.parameters)
             || !is_integer_type(expected))
         {
             return Err(ProjectCheck::Unsupported);
@@ -2375,8 +2393,8 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             caller, call, signature.parameters.len(), collection.is_some(), Observer::INTEGER_RETURN_PARTITIONS,
             Observer::ORDINARY_PROJECTED_PAIR || named_pair,
             Observer::ORDINARY_PROJECTED_PAIR || named_pair,
-            Observer::ORDINARY_INTEGER_LOCALS && (matches!(*expected, ScalarType::Unit | ScalarType::Bool)
-                || real_integer_input),
+            NAMED || (Observer::ORDINARY_INTEGER_LOCALS && (matches!(*expected, ScalarType::Unit | ScalarType::Bool)
+                || real_integer_input)),
         )
             .ok_or(ProjectCheck::Unsupported)?;
         if let NestedIntegerArgument::Projected(mut projection) = arguments {
@@ -2499,6 +2517,10 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
         #[allow(unused_mut)]
         let mut cursor = ExactCallCursor::new(body, exact, expected).ok_or(ProjectCheck::Unsupported)?;
         #[cfg(feature = "internal-checker")]
+        if NAMED {
+            cursor.allow_named_exact_bool_parameters().ok_or(ProjectCheck::Unsupported)?;
+        }
+        #[cfg(feature = "internal-checker")]
         if ACTUAL_STARTUP && collection.is_some() && *expected == ScalarType::Unit && Observer::EXACT_CONTEXTUAL_BOOLEAN_UNIT
             && body.structure.checker_has_bool_contextual_declaration
         {
@@ -2566,9 +2588,9 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
         #[cfg(feature = "internal-checker")]
         let named_reached = ACTUAL_STARTUP && matches!(self.observer.named_exact_watch(target), Some(NamedExactWatch::Observe { .. }))
             && collection.is_some_and(|(source, _)| source == &owner.source) && named_outer.is_some()
-            && named_stack_integer_parameters(&signature.parameters)
+            && named_stack_parameters(&signature.parameters)
             && body.boundary.parameters.len() == signature.parameters.len()
-            && !body.structure.checker_integer_call_locals.is_empty()
+            && (!body.structure.checker_integer_call_locals.is_empty() || named_exact_mixed_pair(&signature.parameters, |ty| ty))
             && supported_integer_continuation(body, expected) && citation_safe_calling_body(body);
         #[cfg(not(feature = "internal-checker"))]
         let (named_reached, named_outer) = (false, None);
@@ -4328,6 +4350,10 @@ impl SymbolicRootProof for SelectedSymbolicProof<'_, '_> {
         } else {
             return self.equalities.consume(target, calls, source, effects);
         };
+        if named_exact_mixed_pair(&calls.boundary.parameters, |entry| &entry.ty) {
+            // Mixed named guards have exact real entry evidence only.
+            return Err(ProjectCheck::Unsupported);
+        }
         if !calls.call_occurrences.is_empty() || !calls.structure.checker_direct_targets.is_empty() {
             return self.verify_calling_producer(target, calls, function, source, effects, runtime);
         }
@@ -4815,7 +4841,10 @@ impl<'a> MainFlowProofCase<'a> {
             _ => return Err(ProjectCheck::Unsupported),
         }};
         let filter = plan.filter.as_deref().unwrap_or_default();
-        let guard = checked_integer_guard_slots::<false>(plan.typed.body, filter).ok_or(ProjectCheck::Unsupported)?;
+        let body = plan.typed.body;
+        let named_mixed = named_exact_mixed_pair(&body.boundary.parameters, |entry| &entry.ty)
+            && citation_safe_calling_body(body);
+        let guard = checked_scalar_guard_slots::<false>(body, filter, named_mixed).ok_or(ProjectCheck::Unsupported)?;
         let goal = child(&child(plan.proof, SyntaxKind::ProofEnsures)?, SyntaxKind::Expression)?;
         Ok((Self {
             proof_source: plan.proof_source, proof: wosy_syntax::byte_span(plan.proof),
@@ -6007,6 +6036,10 @@ impl Hash for ExactGuardGroup<'_> {
             std::mem::discriminant(predicate).hash(state);
             match predicate {
                 CheckerPredicate::Boolean(value) => value.hash(state),
+                CheckerPredicate::NamedBoolEntry { binding, value } => {
+                    binding.hash(state);
+                    value.hash(state);
+                }
                 CheckerPredicate::DirectiveDisjunction { .. } | CheckerPredicate::ProofReflexiveBranch(_) => {}
                 CheckerPredicate::EntryDomain { binding, values } => {
                     binding.hash(state);
@@ -7478,6 +7511,7 @@ fn valid_arbitrary_proof_body(body: &FunctionCallSites) -> bool {
 struct CheckedIntegerGuardSlots<'a> {
     arity: usize,
     always_rejects: bool,
+    boolean: [Option<bool>; 2],
     comparisons: Vec<ImportedEntryGuard<'a>>,
     domain: Option<(usize, &'a IntegerSet)>,
 }
@@ -7486,6 +7520,9 @@ struct CheckedIntegerGuardSlots<'a> {
 impl CheckedIntegerGuardSlots<'_> {
     fn accepts(&self, arguments: &[&BigInt]) -> bool {
         self.arity == arguments.len() && !self.always_rejects
+            && self.boolean.iter().enumerate().all(|(slot, required)| required.is_none_or(|required| {
+                arguments.get(slot).and_then(|value| super::checker_flow::bool_result_lane(value)) == Some(usize::from(required))
+            }))
             && self.domain.is_none_or(|(slot, values)| values.contains(arguments[slot]))
             && self.comparisons.iter().all(|comparison| {
                 arguments.get(comparison.slot).is_some_and(|argument| comparison.relation.accepts((*argument).cmp(comparison.bound)))
@@ -7498,17 +7535,32 @@ fn checked_integer_guard_slots<'a, const ALLOW_DOMAIN: bool>(
     body: &FunctionCallSites,
     filter: &'a [CheckerPredicate],
 ) -> Option<CheckedIntegerGuardSlots<'a>> {
+    checked_scalar_guard_slots::<ALLOW_DOMAIN>(body, filter, false)
+}
+
+#[cfg(feature = "internal-checker")]
+fn checked_scalar_guard_slots<'a, const ALLOW_DOMAIN: bool>(
+    body: &FunctionCallSites, filter: &'a [CheckerPredicate], named_mixed: bool,
+) -> Option<CheckedIntegerGuardSlots<'a>> {
     let parameters = body.boundary.parameters.as_slice();
     let bindings = body.boundary.checker_parameter_bindings.as_deref()?;
     if !matches!(parameters.len(), 1 | 2) || parameters.len() != bindings.len()
-        || !parameters.iter().all(|parameter| is_integer_type(&parameter.ty))
+        || (!named_mixed && !parameters.iter().all(|parameter| is_integer_type(&parameter.ty)))
     {
         return None;
     }
-    let mut guard = CheckedIntegerGuardSlots { arity: parameters.len(), always_rejects: false, comparisons: Vec::new(), domain: None };
+    if named_mixed && filter.len() > 2 { return None; }
+    let mut guard = CheckedIntegerGuardSlots { arity: parameters.len(), always_rejects: false, boolean: [None; 2], comparisons: Vec::new(), domain: None };
     for predicate in filter {
         match predicate {
             CheckerPredicate::Boolean(value) => guard.always_rejects |= !value,
+            CheckerPredicate::NamedBoolEntry { binding, value } => {
+                if !named_mixed { return None; }
+                let slot = bindings.iter().position(|known| known == binding)?;
+                if parameters[slot].ty != ScalarType::Bool { return None; }
+                guard.always_rejects |= guard.boolean[slot].is_some_and(|old| old != *value);
+                guard.boolean[slot] = Some(*value);
+            }
             CheckerPredicate::DirectiveDisjunction { .. } | CheckerPredicate::ProofReflexiveBranch(_) => return None,
             CheckerPredicate::EntryDomain { binding, values } => {
                 if !ALLOW_DOMAIN || guard.domain.is_some() {
@@ -7519,6 +7571,7 @@ fn checked_integer_guard_slots<'a, const ALLOW_DOMAIN: bool>(
             }
             CheckerPredicate::Integer(predicate) => {
                 let slot = bindings.iter().position(|binding| binding == &predicate.binding)?;
+                if !is_integer_type(&parameters[slot].ty) || predicate.ty != parameters[slot].ty { return None; }
                 guard.comparisons.push(ImportedEntryGuard {
                     slot,
                     relation: IntegerRelation::from_operator(&predicate.operator)?,
@@ -9309,7 +9362,8 @@ fn issue_return_bound(
     let guards = conditions.unwrap_or_default().iter().map(|condition| {
         match condition {
             CheckerPredicate::Boolean(value) => Some(VerifiedEntryGuard::Boolean(*value)),
-            CheckerPredicate::EntryDomain { .. } | CheckerPredicate::DirectiveDisjunction { .. } | CheckerPredicate::ProofReflexiveBranch(_) => None,
+            CheckerPredicate::NamedBoolEntry { .. } | CheckerPredicate::EntryDomain { .. }
+            | CheckerPredicate::DirectiveDisjunction { .. } | CheckerPredicate::ProofReflexiveBranch(_) => None,
             CheckerPredicate::Integer(predicate) => {
                 let slot = body.boundary.checker_parameter_bindings.as_deref()?
                     .iter().position(|binding| *binding == predicate.binding)?;
@@ -9590,6 +9644,19 @@ fn proof_input_condition<const VERIFY_LITERAL_FIT: bool>(
 ) -> Result<CheckerPredicate, ProjectCheck> {
     if let ScalarExpression::Boolean { value, .. } = expression {
         return Ok(CheckerPredicate::Boolean(*value != negated));
+    }
+    #[cfg(feature = "internal-checker")]
+    if !VERIFY_LITERAL_FIT && named_exact_mixed_pair(&body.boundary.parameters, |entry| &entry.ty) {
+        if let ScalarExpression::Name { name, .. } = expression {
+            if let Some(slot) = inputs.iter().position(|input| input == name) {
+                if body.boundary.parameters.get(slot).is_some_and(|entry| entry.ty == ScalarType::Bool) {
+                    let bindings = body.boundary.checker_parameter_bindings.as_deref().ok_or(ProjectCheck::Unsupported)?;
+                    return Ok(CheckerPredicate::NamedBoolEntry {
+                        binding: bindings.get(slot).ok_or(ProjectCheck::Unsupported)?.clone(), value: !negated,
+                    });
+                }
+            }
+        }
     }
     let mut condition = IntegerComparison::from_expression(expression).ok_or(ProjectCheck::Unsupported)?;
     if negated {
@@ -13068,7 +13135,7 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
         let occurrence = *topology.call_targets.keys().next().unwrap();
         let mut observer = MainFlowProofObserver::new((0, 0), (MainFlowProofCase {
             proof_source: &app, proof: span, goal: span, filter: &[],
-            guard: CheckedIntegerGuardSlots { arity: 1, always_rejects: false, comparisons: Vec::new(), domain: None },
+            guard: CheckedIntegerGuardSlots { arity: 1, always_rejects: false, boolean: [None; 2], comparisons: Vec::new(), domain: None },
             relation: IntegerRelation::from_operator(&BinaryOperator::LessEqual).unwrap(), bound: MainFlowProofBound::Literal(&bound),
         }, None));
         let effects = OrderedFailures::default();
@@ -16643,6 +16710,55 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
         let effectful = text.replace("if (tag < 0)", &format!("core.require(true, {OUTPUT}); if (tag < 0)"));
         assert!(matches!(run(&effectful, scope), Err(ProjectCheck::Unsupported)));
         assert!(run(&text, ScalarCheckerScope::MainFlowOnly).unwrap().symbolic_diagnostic.is_none());
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordered_named_stacked_mixed_proofs_use_bool_guard_and_indexed_integer_old() {
+        let app = source("src/main.w", "ordered-stacked-proof-exact-mixed");
+        let text = format!(r#"%%start
+            i16(bool, i16) leaf = fn(enabled, value) {{
+                if (enabled) {{ 42 }} else {{ if (value == 300) {{ 9 }} else {{ value }} }}
+            }};
+            i16(bool, i16) producer = fn(enabled, value) {{ i16 result = leaf(enabled, value); result }};
+            proof old_when_enabled for leaf(enabled, before) -> (out)
+                where (enabled && before >= 0) ensures (out == core.old(before)) {{}}
+            proof bounded for producer(enabled, before) -> (out)
+                where (enabled && before >= 0) ensures (out <= 42) {{}}
+            i16 inactive = producer(false, 300);
+            i16 saved = producer(true, 300);
+            core.require(inactive == 9, {OUTPUT});
+            core.require(saved == 42, {OUTPUT});
+        %%end"#);
+        let run = |text: &str, scope| {
+            let (_, proof) = crate::parse_proof_source(app.clone(), text.to_owned(), &[]).ok().unwrap();
+            check_loaded_ordered_proof_diagnostics_in_scope::<true>(
+                Vec::new(), vec![(proof, Vec::new())], vec![app.clone()], inputs(), scope, Vec::new(),
+            )
+        };
+        for scope in [ScalarCheckerScope::MainFlowOnly, ScalarCheckerScope::CurrentPackage] {
+            let report = run(&text, scope).unwrap();
+            let [failure] = report.diagnostics.as_slice() else { panic!("only true original entry is applicable"); };
+            assert!(report.directives.is_empty() && report.symbolic_diagnostic.is_none());
+            assert_eq!(failure.invocation.arguments, [(ScalarType::Bool, BigInt::from(1)), (ScalarType::I16, BigInt::from(300))]);
+            assert_eq!(failure.invocation.returned, BigInt::from(42));
+            let reversed = text.replace("bool, i16", "i16, bool")
+                .replace("enabled, value", "value, enabled").replace("enabled, before", "before, enabled")
+                .replace("false, 300", "300, false").replace("true, 300", "300, true");
+            let report = run(&reversed, scope).unwrap();
+            let [failure] = report.diagnostics.as_slice() else { panic!("reversed typed entry tuple"); };
+            assert_eq!(failure.invocation.arguments, [(ScalarType::I16, BigInt::from(300)), (ScalarType::Bool, BigInt::from(1))]);
+            assert_eq!(failure.invocation.returned, BigInt::from(42));
+            let proved = text.replace("producer(true, 300)", "producer(true, 42)");
+            assert!(run(&proved, scope).unwrap().diagnostics.is_empty());
+            let negative = text.replacen("where (enabled", "where (!enabled", 1);
+            let report = run(&negative, scope).unwrap();
+            let [failure] = report.diagnostics.as_slice() else { panic!("only false original entry is applicable"); };
+            assert_eq!(failure.invocation.arguments[0], (ScalarType::Bool, BigInt::from(0)));
+            assert_eq!(failure.invocation.returned, BigInt::from(9));
+        }
+        let unused = text.split_once("i16 inactive =").unwrap().0.to_owned() + "%%end";
+        assert!(matches!(run(&unused, ScalarCheckerScope::CurrentPackage), Err(ProjectCheck::Unsupported)));
     }
 
     #[cfg(feature = "internal-checker")]

@@ -1672,6 +1672,28 @@ cases.extend([
         1,b"proof obligation failed"),
 ])
 
+stacked_named_exact_mixed = f"""%%start
+    i16(bool, i16) leaf = fn(enabled, value) {{
+        if (enabled) {{ 42 }} else {{ if (value == 300) {{ 9 }} else {{ value }} }}
+    }};
+    i16(bool, i16) producer = fn(enabled, value) {{ i16 result = leaf(enabled, value); result }};
+    proof old_when_enabled for leaf(enabled, before) -> (out)
+        where (enabled && before >= 0) ensures (out == core.old(before)) {{}}
+    proof bounded for producer(enabled, before) -> (out)
+        where (enabled && before >= 0) ensures (out <= 42) {{}}
+    i16 inactive = producer(false, 300);
+    i16 saved = producer(true, 300);
+    core.require(inactive == 9, {report(38,"WRONG-INACTIVE-MIXED")});
+    core.require(saved == 42, {report(39,"WRONG-ACTIVE-MIXED")});
+%%end"""
+cases.extend([
+    ("exact-startup-named-stacked-mixed-old-refuted",stacked_named_exact_mixed,1,b"proof obligation failed"),
+    ("exact-startup-named-stacked-mixed-old-proved",stacked_named_exact_mixed.replace("producer(true, 300)","producer(true, 42)"),
+        0,b""),
+    ("exact-startup-named-stacked-mixed-false-old",stacked_named_exact_mixed.replace("where (enabled","where (!enabled",1),
+        1,b"proof obligation failed"),
+])
+
 stacked_named_exact_pair = f"""%%start
     i16(i8, i16) leaf = fn(tag, value) {{ if (tag > 0) {{ 42 }} else {{ if (value == 300) {{ 9 }} else {{ value }} }} }};
     i16(i8, i16) producer = fn(tag, value) {{ i16 result = leaf(tag, value); result }};
@@ -1788,6 +1810,8 @@ cases.extend([
         b"proof obligation failed"),
 ])
 proof_diagnostic_notes = {
+    "exact-startup-named-stacked-mixed-old-refuted": b"call returned 42",
+    "exact-startup-named-stacked-mixed-false-old": b"call returned 9",
     "ordinary-named-symbolic-pair-affine-refuted": b"symbolic call can return -4",
     "ordinary-named-symbolic-pair-affine-own-old": b"symbolic call can return -1",
     "ordinary-named-symbolic-pair-affine-cross-old": b"symbolic call can return -1",
