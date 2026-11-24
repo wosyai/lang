@@ -1932,10 +1932,11 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     { return None; }
                     let [ScalarExpression::CheckedAddress { mutability: ScalarReferenceMutability::Shared,
                         place: ScalarPlace::Name { name, .. }, .. }] = arguments.as_slice() else { return None };
-                    // The binding must belong to an enclosing live root owner;
-                    // nested borrowers do not acquire that allocation's cleanup.
+                    // The existing lexical inventory restores disjoint scopes.
+                    // Normal prepared borrow replay decides whether this exact
+                    // owner is active at the call; a sibling's owner is distinct.
                     let binding = self.names.get(name)?;
-                    if binding.block_span != calls.structure.blocks[calls.structure.root.0].span || !owners.contains(binding) {
+                    if !owners.contains(binding) {
                         return None;
                     }
                     let signature = signature?;

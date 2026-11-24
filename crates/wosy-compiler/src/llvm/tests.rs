@@ -12078,6 +12078,19 @@ u64(bool) nested = fn(pick) {
 };
 if (nested(true) != 16) { core.system_panic(); };
 if (nested(false) != 26) { core.system_panic(); };
+u64(bool) scoped = fn(pick) {
+    u8[] outer = [3, 5, 7];
+    u64 arm = if (pick) {
+        u8[] bytes = [11, 13];
+        relay(&bytes)
+    } else {
+        u8[] bytes = [3, 5, 7];
+        relay(&bytes)
+    };
+    arm * 10 + extent(&outer)
+};
+if (scoped(true) != 23) { core.system_panic(); };
+if (scoped(false) != 33) { core.system_panic(); };
 %%end";
     for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
         for access in [true, false] {
@@ -12210,7 +12223,42 @@ if (nested(false) != 26) { core.system_panic(); };
                 }
             }
             assert_eq!(known_field_operand(cleanup, 0).unwrap().as_instruction_value(), Some(allocation));
-            if let Some(out) = std::env::var_os("WOSY_NESTED_WIDENED_BORROW_IR_DIR") {
+            let scoped = self_tail_test_body(&llvm, "i64", &project_function_name(&source, "scoped"));
+            let function = module.get_function(&project_function_name(&source, "scoped")).unwrap();
+            let mut scoped_bases = Vec::new();
+            for block in function.get_basic_blocks() {
+                let instructions = std::iter::successors(block.get_first_instruction(), |instruction| instruction.get_next_instruction())
+                    .collect::<Vec<_>>();
+                let call_to = |callee| instructions.iter().enumerate().find(|(_, instruction)|
+                    CallSiteValue::try_from(**instruction).ok().is_some_and(|call| call.get_called_fn_value() == Some(callee)));
+                let (expected_callee, reader) = match (call_to(relay), call_to(extent_function)) {
+                    (Some(reader), None) => (relay, reader),
+                    (None, Some(reader)) => (extent_function, reader),
+                    (None, None) => continue,
+                    _ => panic!("{scoped}"),
+                };
+                let (read, &reader) = reader;
+                let (release, &release_instruction) = call_to(free).unwrap_or_else(|| panic!("{scoped}"));
+                assert!(read < release, "{scoped}");
+                let extent = known_field_operand(reader, 0).unwrap().as_instruction_value().unwrap();
+                assert_eq!(extent.get_indices(), vec![1]);
+                let count = known_field_operand(extent, 1).unwrap().into_int_value().get_zero_extended_constant().unwrap();
+                let partial = known_field_operand(extent, 0).unwrap().as_instruction_value().unwrap();
+                assert_eq!(partial.get_indices(), vec![0]);
+                let address = known_field_operand(partial, 1).unwrap().as_instruction_value().unwrap();
+                assert_eq!(address.get_opcode(), InstructionOpcode::PtrToInt);
+                let original = known_field_operand(address, 0).unwrap().as_instruction_value().unwrap();
+                assert_eq!(CallSiteValue::try_from(original).unwrap().get_called_fn_value(), Some(alloc));
+                assert_eq!(known_field_operand(original, 0).unwrap().into_int_value().get_zero_extended_constant(), Some(count));
+                assert_eq!(known_field_operand(release_instruction, 0).unwrap().as_instruction_value(), Some(original));
+                assert!(!scoped_bases.iter().any(|(_, _, previous)| *previous == original), "{scoped}");
+                scoped_bases.push((expected_callee == extent_function, count, original));
+            }
+            let mut types = scoped_bases.iter().map(|&(outer, count, _)| (outer, count)).collect::<Vec<_>>();
+            types.sort_unstable();
+            assert_eq!(types, [(false, 2), (false, 3), (true, 3)], "{scoped}");
+            assert_eq!(scoped.matches("call void @__wosy_core_free(").count(), 3, "{scoped}");
+            if let Some(out) = std::env::var_os("WOSY_BRANCH_OWNER_BORROW_IR_DIR") {
                 let target = if layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
                 let controlled = llvm.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);
                 assert_ne!(controlled, llvm);
