@@ -1947,6 +1947,9 @@ fn store_binding_outputs<'ctx, 'module>(
     if aggregate_transfer::store_received_binding(context, state, binding, &value)? {
         return Ok(());
     }
+    if store_widened_join(state, binding, &value)? {
+        return Ok(());
+    }
     if store_widened_move(state, binding, &value)? {
         return Ok(());
     }
@@ -1970,6 +1973,61 @@ fn store_binding_outputs<'ctx, 'module>(
         )?;
     }
     Ok(())
+}
+
+fn store_widened_join<'ctx>(
+    state: &mut EmitState<'ctx, '_>,
+    binding: &crate::ScalarBinding,
+    value: &EmitValue<'ctx>,
+) -> Result<bool, String> {
+    let Some(plan) = state.aggregate.as_ref().map(|aggregate| aggregate.plan())
+        .filter(|plan| !plan.widened_join_receivers.is_empty()) else { return Ok(false) };
+    let [receiver] = binding.receivers.as_slice() else { return Ok(false) };
+    if !plan.widened_join_receivers.contains(&(receiver.name_span.start, receiver.name_span.end)) {
+        return Ok(false);
+    }
+    let EmitValue::Basic(BasicValueEnum::StructValue(pair)) = value else {
+        return Err("missing checked widened array join descriptor".into());
+    };
+    let backing = state.builder.build_extract_value(*pair, 0, "widened_join_backing")
+        .map_err(builder_error)?.into_pointer_value();
+    let count = state.builder.build_extract_value(*pair, 1, "widened_join_extent")
+        .map_err(builder_error)?.into_int_value();
+    install_runtime_array_binding_owner(state, &receiver.name, true, true, None);
+    state.storage.insert(receiver.name.clone(), (backing, receiver.ty.clone()));
+    state.local_runtime_extents.insert(backing, (receiver.name_span, LocalRuntimeExtent::WidenedLiteral(count), true));
+    Ok(true)
+}
+
+fn pack_widened_join_arm<'ctx>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, '_>,
+    expression: &ScalarExpression,
+    value: &EmitValue<'ctx>,
+) -> Result<Option<EmitValue<'ctx>>, String> {
+    let Some(plan) = state.aggregate.as_ref().map(|aggregate| aggregate.plan())
+        .filter(|plan| !plan.widened_join_arms.is_empty()) else { return Ok(None) };
+    let nodes = state.body_call_nodes.ok_or("missing prepared widened array join")?;
+    let Some(declaration) = nodes.expression_ordinal(expression).and_then(|ordinal| plan.widened_join_arms.get(&ordinal))
+    else { return Ok(None) };
+    let ScalarExpression::Name { name, .. } = expression else { return Err("invalid widened join arm".into()) };
+    let EmitValue::Basic(BasicValueEnum::PointerValue(backing)) = value else {
+        return Err("missing widened join arm backing".into());
+    };
+    let Some(&(owner, LocalRuntimeExtent::WidenedLiteral(count), true)) = state.local_runtime_extents.get(backing)
+    else { return Err("missing widened join arm extent".into()) };
+    if owner != *declaration || nodes.lexical_expression_declaration(expression) != Some(owner)
+        || state.runtime_array_owners.get(name) != Some(&true)
+        || state.runtime_array_allocations.get(name) != Some(&true)
+    { return Err("widened join arm lacks its original owner".into()); }
+    let pair = state.builder.build_insert_value(aggregate_transfer::array_descriptor_type(context).get_undef(),
+        *backing, 0, "widened_arm_backing").map_err(builder_error)?.into_struct_value();
+    let pair = state.builder.build_insert_value(pair, count, 1, "widened_arm_extent").map_err(builder_error)?;
+    // The packed value now carries the sole cleanup obligation. An ordinary
+    // block result's inferred output type is not the transfer authority here.
+    ownership::retire_named_runtime_array_return(state, name);
+    state.local_runtime_extents.remove(backing);
+    Ok(Some(EmitValue::Basic(pair.into_struct_value().into())))
 }
 
 fn store_widened_move<'ctx>(
@@ -3654,6 +3712,9 @@ fn emit_final_outputs<'ctx, 'module>(
         {
             record_forwarded_return_owner(context, state, expression, output.position)?;
         }
+        if let Some(pair) = pack_widened_join_arm(context, state, expression, &value)? {
+            return Ok(pair);
+        }
         transfer_runtime_array_return(state, block, expression, ty, retained_ancestor_owners);
         transfer_automatic_return_result(state, expression);
         return Ok(value);
@@ -3768,6 +3829,9 @@ fn emit_project_final_outputs<'ctx, 'module>(
             .contains_key(&(block.span.start, block.span.end))
         {
             record_forwarded_return_owner(context, state, expression, output.position)?;
+        }
+        if let Some(pair) = pack_widened_join_arm(context, state, expression, &value)? {
+            return Ok(pair);
         }
         transfer_runtime_array_return(state, block, expression, ty, retained_ancestor_owners);
         transfer_automatic_return_result(state, expression);

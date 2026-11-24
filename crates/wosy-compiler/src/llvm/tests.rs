@@ -11929,3 +11929,57 @@ if (observe(1) != 3) { core.system_panic(); };
         }
     }
 }
+
+#[test]
+fn widened_array_join_transfers_one_backing_and_its_extent() {
+    let source = SourceIdentity::new("project".into(), "package".into(), "src/widened_join.w".into(), "r1".into());
+    let text = "%%start
+u64(bool, u64, u8) observe = fn(pick, index, expected) {
+    u8[] selected = if (pick) {
+        u8[] left = [11, 13];
+        left
+    } else {
+        u8[] right = [3, 5, 7];
+        right
+    };
+    if (selected[index] != expected) { core.system_panic(); };
+    core.array_len(&selected)
+};
+if (observe(true, 1, 13) != 2) { core.system_panic(); };
+if (observe(false, 1, 5) != 3) { core.system_panic(); };
+%%end";
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let parsed = parse_source(source.clone(), text.into(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let prepared = crate::prepare_scalar_project_with_access(
+            vec![(crate::derive_scalar_declarations_from_cst(parsed.result.canonical_cst()), vec![])],
+            vec![source.clone()], ScalarPreparationInputs { target_layout: layout },
+            Some(wosy_stdlib_source::CheckedAccessComponent::linked()),
+        ).unwrap_or_else(|error| panic!("{:?}", error.diagnostics));
+        let checked = analyze_scalar_build(&prepared);
+        assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+        let llvm = emit_scalar_build_project_llvm(&checked).unwrap().to_text();
+        let body = self_tail_test_body(&llvm, "i64", &project_function_name(&source, "observe"));
+        let [pair] = body.lines().filter(|line| line.contains("phi { ptr, i64 }")).collect::<Vec<_>>()[..]
+            else { panic!("expected one joined descriptor: {body}") };
+        let pair_value = pair.trim().split_once(" = ").unwrap().0;
+        assert!(body.contains(&format!("%widened_join_backing = extractvalue {{ ptr, i64 }} {pair_value}, 0")), "{body}");
+        assert!(body.contains(&format!("%widened_join_extent = extractvalue {{ ptr, i64 }} {pair_value}, 1")), "{body}");
+        let [guard] = body.lines().filter(|line| line.contains("call void @wosy_fn__776f73795f746f6f6c636861696e5f7374646c6962__")
+            && line.contains("__636865636b5f696e6465785f696e5f657874656e74(")).collect::<Vec<_>>()[..]
+            else { panic!("expected one canonical bounds check: {body}") };
+        assert!(guard.contains(", i64 %widened_join_extent)"), "{body}");
+        assert!(body.lines().any(|line| line.contains("%array_element") && line.contains("getelementptr")
+            && line.contains("ptr %widened_join_backing,")), "{body}");
+        assert_eq!(body.matches("call ptr @__wosy_core_alloc(").count(), 2, "{body}");
+        assert_eq!(body.matches("call void @__wosy_core_free(").count(), 1, "{body}");
+        assert!(body.contains("call void @__wosy_core_free(ptr %widened_join_backing)")
+            && body.contains("ret i64 %widened_join_extent") && !body.contains("alloca ptr"), "{body}");
+        if let Some(out) = std::env::var_os("WOSY_WIDENED_JOIN_IR_DIR") {
+            let target = if layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
+            let controlled = llvm.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);
+            assert_ne!(controlled, llvm);
+            std::fs::write(std::path::PathBuf::from(out).join(format!("{target}-project-control.ll")), controlled).unwrap();
+        }
+    }
+}

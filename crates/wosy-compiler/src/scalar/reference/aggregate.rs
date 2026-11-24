@@ -1255,6 +1255,8 @@ pub(super) struct AggregateFlowResult {
     pub(super) checked_producer_authoritative: bool,
     pub(super) array_invalid: bool,
     pub(super) array_neutral: bool,
+    pub(super) widened_join_arms: BTreeMap<usize, ByteSpan>,
+    pub(super) widened_join_receivers: BTreeSet<(u32, u32)>,
     pub(super) widened_rebinds: BTreeMap<usize, ClosedWidenedRebind>,
     pub(super) borrowed_extent_observer: Option<(CfgPointId, OccurrenceOrdinal, ByteSpan)>,
     pub(super) borrowed_extent_forward: Option<(CfgPointId, OccurrenceOrdinal)>,
@@ -1493,7 +1495,7 @@ impl AggregateFlowResult {
     }
 
     pub(super) fn has_observations(&self) -> bool {
-        !self.widened_rebinds.is_empty() || self.borrowed_extent_observer.is_some() || self.borrowed_extent_call.is_some() || self.borrowed_extent_forward.is_some()
+        !self.widened_join_receivers.is_empty() || !self.widened_rebinds.is_empty() || self.borrowed_extent_observer.is_some() || self.borrowed_extent_call.is_some() || self.borrowed_extent_forward.is_some()
             || self.array_formal_extent_required || self.literal_array_index_required.is_some() || self.literal_array_extent_required.is_some() || self.proved_literal_array_route_ref().is_some()
             || (self.checked_producer_authoritative && !self.checked_producer_backing.is_empty())
             || self.checked_backing_assignment.is_some() || self.checked_backing_forward.is_some()
@@ -2963,6 +2965,8 @@ pub(crate) struct ClosedBody {
     pub(crate) literal_array: Option<ClosedLiteralArray>,
     pub(crate) replacement_extent_observation: Option<usize>,
     pub(crate) array_descriptor_return: bool,
+    pub(crate) widened_join_arms: BTreeMap<usize, ByteSpan>,
+    pub(crate) widened_join_receivers: BTreeSet<(u32, u32)>,
     pub(crate) widened_rebinds: BTreeMap<usize, ClosedWidenedRebind>,
     pub(crate) borrowed_extent_observer: Option<(usize, ByteSpan)>,
     pub(crate) borrowed_extent_forward: Option<usize>,
@@ -6647,6 +6651,11 @@ fn closed_aggregates<'a>(
             }
 
             if body.is_monomorphic {
+                if !facts.widened_join_receivers.is_empty() {
+                    let plan = result.bodies.entry(key).or_default();
+                    plan.widened_join_arms = facts.widened_join_arms.clone();
+                    plan.widened_join_receivers = facts.widened_join_receivers.clone();
+                }
                 if !facts.widened_rebinds.is_empty() {
                     result.bodies.entry(key).or_default().widened_rebinds = facts.widened_rebinds.clone();
                 }

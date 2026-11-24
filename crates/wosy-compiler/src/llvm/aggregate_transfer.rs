@@ -284,7 +284,7 @@ pub(super) fn linkage(plan: Option<&ClosedBody>) -> Option<Linkage> {
         .map(|_| Linkage::Internal)
 }
 
-fn array_descriptor_type<'ctx>(context: &'ctx Context) -> inkwell::types::StructType<'ctx> {
+pub(super) fn array_descriptor_type<'ctx>(context: &'ctx Context) -> inkwell::types::StructType<'ctx> {
     context.struct_type(&[context.ptr_type(AddressSpace::default()).into(), context.i64_type().into()], false)
 }
 

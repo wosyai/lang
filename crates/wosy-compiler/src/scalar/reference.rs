@@ -3749,6 +3749,43 @@ impl<'a> ReferenceFlowBuilder<'a> {
         }
     }
 
+    // Match only a binding whose conditional transfers a freshly created
+    // arm-local owner on each edge. No enclosing owners are merged.
+    fn widened_join_inputs(
+        &self,
+        binding: &ScalarBinding,
+        occurrence: OccurrenceOrdinal,
+        scope: ReferenceScopeId,
+    ) -> Option<[(usize, ByteSpan); 2]> {
+        let [receiver] = binding.receivers.as_slice() else { return None };
+        if scope != ReferenceScopeId(0) || !self.generic_parameters.is_empty()
+            || binding.is_allocation || binding.fallible_assignment.is_some()
+            || binding.output_origin != ScalarBindingOutputOrigin::SingleExpression
+            || !matches!(receiver.ty, ScalarType::RuntimeArray { .. })
+        { return None; }
+        let ScalarExpression::If { then_branch, else_branch, .. } = &binding.value else { return None };
+        let ConditionalRegion::Value { then_block, else_block, .. } =
+            self.call_sites.conditionals.get(&occurrence)? else { return None };
+        let arm = |block: &ScalarBlock, ordinal: BlockOrdinal| {
+            let [ScalarBlockItem::LocalBinding(local), ScalarBlockItem::Expression(ScalarExpression::Name { name, .. })] =
+                block.items.as_slice() else { return None };
+            let [local_receiver] = local.receivers.as_slice() else { return None };
+            if block.unsafe_context || &local_receiver.name != name || self.names.contains_key(name)
+                || !aggregate::same_runtime_array_type(&local_receiver.ty, &receiver.ty)
+            { return None; }
+            let (_, elements, _) = super::widened_local_literal(local)?;
+            // The arm contains no second path or effect on an enclosing owner.
+            if !elements.iter().all(|element| matches!(element,
+                ScalarExpression::Integer { .. } | ScalarExpression::Float { .. }
+                    | ScalarExpression::Boolean { .. } | ScalarExpression::Char { .. }))
+            { return None; }
+            let [_, BlockItem { kind: BlockItemKind::FinalOutput(output), .. }] =
+                self.call_sites.structure.blocks[ordinal.0].items.as_slice() else { return None };
+            (output.output == 0).then_some((output.expression.0, local_receiver.name_span))
+        };
+        Some([arm(then_branch, *then_block)?, arm(else_branch, *else_block)?])
+    }
+
     fn exact_widened_binding_move(
         &self,
         binding: &ScalarBinding,
@@ -4742,6 +4779,12 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         }
                         _ => (false, false),
                     };
+                    let widened_join = outputs.secondary.is_empty()
+                        && self.widened_join_inputs(binding, primary_ordinal, scope).is_some_and(|arms| {
+                            self.aggregate_result.widened_join_arms.extend(arms);
+                            self.aggregate_result.widened_join_receivers.insert((receiver.span.start, receiver.span.end));
+                            true
+                        });
                     let alias_owner = self.prepared_fallible_alias(binding, primary, primary_ordinal, scope, &receiver.ty);
                     let before = self.cursor;
                     let value = if alias_owner.is_some() {
@@ -4839,7 +4882,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     if let Some(owner) = alias_owner {
                         self.proof_points.fallible_aliases.insert(id.clone(), owner);
                     }
-                    let widened = widened_move || super::widened_local_literal(binding).is_some();
+                    let widened = widened_join || widened_move || super::widened_local_literal(binding).is_some();
                     if widened {
                         self.widened_arrays.get_or_insert_with(HashSet::new).insert(id.clone());
                     }
@@ -5003,7 +5046,14 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     };
                     let value = self.expression_with_read_mode(expression, scope, ordinal, mode)?;
                     let value_point = self.cursor.expect("evaluated output expression");
-                    self.move_value(expression, scope, ordinal)?;
+                    let widened_arm = self.aggregate_result.widened_join_arms.get(&ordinal.0)
+                        .is_some_and(|declaration| matches!(expression, ScalarExpression::Name { span, .. }
+                            if matches!(self.prepared_name_identity(ordinal, *span),
+                                Ok(Some(PlainNameIdentity::Lexical(source)))
+                                    if source.block_span == block.span
+                                        && source.declaration_span == *declaration
+                                        && self.widened_arrays.as_ref().is_some_and(|owners| owners.contains(source)))));
+                    self.move_value_with_widened_receipt(expression, scope, ordinal, widened_arm)?;
                     if let BlockItemKind::FinalOutput(slot) = kind {
                         if scope == ReferenceScopeId(0) && slot.output == 0 && region.items.len() == 1
                             && matches!(calls.boundary.root_outputs.as_slice(), [output] if output.ty == ScalarType::U64)

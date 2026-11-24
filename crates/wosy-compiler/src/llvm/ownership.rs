@@ -923,8 +923,12 @@ pub(super) fn transfer_runtime_array_return(
         return;
     }
     if let ScalarExpression::Name { name, .. } = expression {
-        state.runtime_array_owners.insert(name.clone(), false);
+        retire_named_runtime_array_return(state, name);
     }
+}
+
+pub(super) fn retire_named_runtime_array_return(state: &mut EmitState<'_, '_>, name: &str) {
+    state.runtime_array_owners.insert(name.to_owned(), false);
 }
 
 pub(super) fn return_bindings(block: &ScalarBlock) -> BTreeMap<String, ScalarExpression> {
