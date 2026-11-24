@@ -7464,6 +7464,7 @@ struct JoinedReborrowShape<'a> {
     holders: HashMap<&'a ReferenceBindingId, CfgPointId>,
     descendants: BTreeMap<CfgPointId, (CfgPointId, &'a ReferenceBindingId)>,
     returned_aliases: BTreeMap<CfgPointId, (&'a ReferenceBindingId, CfgPointId)>,
+    nested_exit: Option<&'a super::control::ScopeExitBindings>,
 }
 
 fn joined_root_reborrow_binding<'a>(
@@ -7476,6 +7477,7 @@ fn joined_root_reborrow_binding<'a>(
     read_calls: &[(CfgPointId, CfgPointId)],
     return_calls: &[(CfgPointId, CfgPointId)],
     checked_releases: &[CfgPointId],
+    scope_exits: Option<&'a HashMap<CfgPointId, super::control::ScopeExitBindings>>,
     scalar_stores: &[CfgPointId],
     grouped_installs: &BTreeSet<CfgPointId>,
     exposures: &[(CfgPointId, Option<ReferenceBindingId>)],
@@ -7498,7 +7500,7 @@ fn joined_root_reborrow_binding<'a>(
     let ScalarExpression::Name { span, .. } = pointer else { return None };
     if !exact_pending_reborrow_read(&points[pointer_point.0], point, binding)
         || points[pointer_point.0].source_span.range != *span
-        || point.scope != ReferenceScopeId(0) || !exposures.is_empty()
+        || !exposures.is_empty()
     {
         return None;
     }
@@ -7545,9 +7547,17 @@ fn joined_root_reborrow_binding<'a>(
     let mut returned_aliases = BTreeMap::new();
     let mut alias_count = 0;
     let mut exclusive_descendant = false;
+    let nested = point.scope != ReferenceScopeId(0);
+    let mut nested_exit = None;
     let mut next_pointee = &pointee_reads[pointee_reads.partition_point(|id| *id <= child.id)..];
     for rest in points.get(child.id.0 + 1..)? {
         match &rest.kind {
+            CfgPointKind::ScopeExit if nested && rest.scope == point.scope => {
+                let cohort = scope_exits?.get(&rest.id)?;
+                if !cohort.contains(binding) || !cohort.contains(child_binding)
+                    || nested_exit.replace(cohort).is_some()
+                { return None; }
+            }
             CfgPointKind::Read { binding: holder } if holders.contains_key(holder) => {
                 let [deref] = rest.successors.as_slice() else { return None };
                 let deref = points.get(deref.0)?;
@@ -7656,8 +7666,9 @@ fn joined_root_reborrow_binding<'a>(
             _ => (),
         }
     }
-    (observed_root && descendants.keys().copied().eq(descendant_sites.iter().copied()))
-        .then_some(JoinedReborrowShape { parent: binding, holders, descendants, returned_aliases })
+    (observed_root && (!nested || nested_exit.is_some())
+        && descendants.keys().copied().eq(descendant_sites.iter().copied()))
+        .then_some(JoinedReborrowShape { parent: binding, holders, descendants, returned_aliases, nested_exit })
 }
 
 struct JoinedLoanFamily<'a> {
@@ -7768,6 +7779,7 @@ fn checked_joined_reborrow_parents(
     states: &[ReferenceEdgeState],
     binding: &ReferenceBindingId,
     requires_owned: bool,
+    nested_exit: Option<&super::control::ScopeExitBindings>,
 ) -> Option<Vec<ReferenceOriginId>> {
     let minimum = if states.len() == 1 && matches!(&site.kind,
         CfgPointKind::ReborrowThrough { place: ScalarPlace::Index { base, .. }, .. }
@@ -7788,7 +7800,8 @@ fn checked_joined_reborrow_parents(
         let ReferenceOrigin::Fresh { loan, .. } = &facts[id.0] else { return None };
         let owner = &loan.origin_place;
         let allocated = allocations.contains(&owner.binding);
-        if requires_owned && !allocated { return None; }
+        if (requires_owned || nested_exit.is_some()) && !allocated { return None; }
+        if nested_exit.is_some_and(|exit| !exit.contains(&owner.binding)) { return None; }
         if owners.iter().any(|prior| {
             allocated != allocations.contains(&prior.binding)
                 || (allocated && prior.binding == owner.binding)
@@ -8783,7 +8796,7 @@ fn transfer_reference_facts(
             joined_root_reborrow_binding(
                 original_points, initial_point, cfg.checked_binding_initializers, cfg.checked_pointee_reads,
                 cfg.joined_shared_aliases, cfg.joined_reborrow_descendants, cfg.shared_scalar_read_calls,
-                cfg.joined_shared_return_calls, cfg.joined_checked_releases,
+                cfg.joined_shared_return_calls, cfg.joined_checked_releases, cfg.scope_exit_bindings,
                 cfg.checked_named_scalar_stores, &grouped_installs, cfg.raw_address_exposures,
             )
         } else {
@@ -8793,7 +8806,7 @@ fn transfer_reference_facts(
             (CfgPointKind::ReborrowThrough { pointer_point, .. }, Some(shape)) =>
                 checked_joined_reborrow_parents(
                     original_points, initial_point, cfg.facts, cfg.allocations, *pointer_point,
-                    states.as_slice(), shape.parent, !cfg.joined_checked_releases.is_empty(),
+                    states.as_slice(), shape.parent, !cfg.joined_checked_releases.is_empty(), shape.nested_exit,
                 ),
             _ => None,
         };

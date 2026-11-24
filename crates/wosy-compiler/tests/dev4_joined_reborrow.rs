@@ -256,6 +256,36 @@ if (inspect(true) != 7 || inspect(false) != 9) { core.system_panic(); };
 }
 
 #[test]
+fn recursive_frames_preserve_distinct_nested_borrow_and_release_endpoints() {
+    let program = r#"%%start
+u8(*u8) read_selected = fn(view) { *view };
+u8(u64, bool) walk = fn(depth, choose) {
+    if (depth == 0) {
+        0
+    } else {
+        u8[depth] first;
+        u8[depth] second;
+        first[0] = 7;
+        second[0] = 9;
+        *!u8 parent = null;
+        if (choose) { parent = &!first[0]; } else { parent = &!second[0]; };
+        *u8 child = &(*parent);
+        u8 observed = read_selected(child);
+        unsafe { core.free(parent); };
+        u64 step = 1;
+        u8 remaining = walk(depth - step, !choose);
+        observed + remaining
+    }
+};
+u8(bool) inspect = fn(choose) {
+    if (walk(2, choose) == 16) { if (choose) { 7 } else { 9 } } else { 0 }
+};
+if (inspect(true) != 7 || inspect(false) != 9) { core.system_panic(); };
+%%end"#;
+    check_case(program, Expected::Valid, Some("WOSY_RECURSIVE_NESTED_JOINED_RELEASE_IR_DIR"));
+}
+
+#[test]
 fn checked_release_tracks_selected_allocation_and_its_loan_cohort() {
     let program = r#"%%start
 u8(u64, bool) read_other = fn(count, choose) {
