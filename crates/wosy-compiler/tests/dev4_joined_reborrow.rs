@@ -460,6 +460,31 @@ if (inspect(true) != 7 || inspect(false) != 9) { core.system_panic(); };
 }
 
 #[test]
+fn selected_parent_writes_disjoint_literal_array_element_while_child_lives() {
+    let program = joined("parent = &!second;", true, "",
+        "*child = seen + 2; (*parent).values[0] = 4; u8 observed = *child; \
+         u8 left = first.values[0]; u8 right = second.values[0];")
+        .replace("%%start\n", "%%start\nstruct Record { u8[2] values; }\n")
+        .replace("u8 first = 7;\n    u8 second = 9;",
+            "Record first = { .values = [1, 7]; }; Record second = { .values = [2, 9]; };")
+        .replace("*!u8 parent = null;", "*!Record parent = null;")
+        .replace("*u8 child = &(*parent);", "*!u8 child = &!(*parent).values[1];")
+        .replace("    seen\n",
+            "    if (observed == seen + 2) { if (choose) { if (left == 4 && right == 2) { seen } else { 0 } } else { if (left == 1 && right == 4) { seen } else { 0 } } } else { 0 }\n");
+    check_case(&program, Expected::Valid, Some("WOSY_JOINED_PARENT_DISJOINT_INDEX_IR_DIR"));
+
+    for (replacement, target, operand) in [
+        ("(*parent).values[1] = 4", "(*parent).values[1] = 4", "values"),
+        ("first.values[0] = 4", "first.values[0] = 4", "values"),
+        ("u64 index = 0; (*parent).values[index] = 4", "(*parent).values[index] = 4", "index"),
+    ] {
+        let live = program.replace("(*parent).values[0] = 4", replacement);
+        assert_ne!(live, program);
+        check(&live, Expected::ExactProjectionConflict { target, operand, loan: "&!(*parent).values[1]" });
+    }
+}
+
+#[test]
 fn child_blocks_selected_owner_write_until_its_last_use() {
     check(&joined("parent = &!second;", true, "first = 3;", ""), Expected::LiveConflict);
 }
