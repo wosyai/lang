@@ -449,6 +449,7 @@ impl ActualIntegerObserver for ProofFreeOrderedEvidence {
     const EXACT_COMPLETED_NAMESPACE_INTEGER_RETURNS: bool = true;
     const EXACT_CONTEXTUAL_BOOLEAN_UNIT: bool = true;
     const AUTHORED_SINGLETON_CODE: bool = true;
+    const REAL_INTEGER_TAIL_CALLS: bool = true;
     const ORDINARY_INTEGER_LOCALS: bool = true;
 
     fn observe(&mut self, _: (usize, usize), _: &[&BigInt], _: &BigInt) {}
@@ -1380,6 +1381,8 @@ trait ActualIntegerObserver {
     const EXACT_CONTEXTUAL_BOOLEAN_UNIT: bool = false;
     #[cfg(feature = "internal-checker")]
     const AUTHORED_SINGLETON_CODE: bool = false;
+    #[cfg(feature = "internal-checker")]
+    const REAL_INTEGER_TAIL_CALLS: bool = false;
     const INTEGER_RETURN_PARTITIONS: bool = false;
     const PROJECTED_FORMAL_WRITES: bool = false;
     const ORDINARY_PROJECTED_PAIR: bool = false;
@@ -1720,6 +1723,12 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             cursor.allow_exact_contextual_bool();
         }
         #[cfg(feature = "internal-checker")]
+        if ACTUAL_STARTUP && collection.is_some() && Observer::REAL_INTEGER_TAIL_CALLS && is_integer_type(expected)
+            && !body.structure.checker_direct_targets.is_empty()
+        {
+            cursor.allow_real_integer_tail_call();
+        }
+        #[cfg(feature = "internal-checker")]
         if self.exact_integer_narrow_profile(collection.is_some()) { cursor.allow_empty_integer(); }
         #[cfg(feature = "internal-checker")]
         if self.exact_integer_local_write_shape(body, expected, collection.is_some()) {
@@ -1842,6 +1851,13 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             let signature = caller.checked_call_signatures.get(&call).ok_or(ProjectCheck::Unsupported)?;
             (target, owner, body, signature)
         };
+        #[cfg(feature = "internal-checker")]
+        if matches!(effect, ExactCallEffect::TailInteger { .. })
+            && (!ACTUAL_STARTUP || collection.is_none() || !Observer::REAL_INTEGER_TAIL_CALLS
+                || parent.source != &owner.source || self.active.contains(&target))
+        {
+            return Err(ProjectCheck::Unsupported);
+        }
         if collection.is_some_and(|collection| parent.source != &owner.source
             && !self.completed_namespace_call(parent.source, owner, target.0, body, signature, expected, collection.visits))
         {
@@ -1951,6 +1967,12 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             && body.structure.checker_has_bool_contextual_declaration
         {
             cursor.allow_exact_contextual_bool();
+        }
+        #[cfg(feature = "internal-checker")]
+        if ACTUAL_STARTUP && collection.is_some() && Observer::REAL_INTEGER_TAIL_CALLS && is_integer_type(expected)
+            && !body.structure.checker_direct_targets.is_empty()
+        {
+            cursor.allow_real_integer_tail_call();
         }
         #[cfg(feature = "internal-checker")]
         if self.exact_integer_narrow_profile(collection.is_some()) { cursor.allow_empty_integer(); }
@@ -15167,6 +15189,46 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
                         .eq([82, 83].map(BigInt::from)));
                     let three = BigInt::from(3);
                     assert!(receipt.directives[0].witness.intervals_at(0, 1).unwrap().eq([(&three, &three)]));
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn real_integer_tail_call_resumes_return_or_propagates_empty_without_a_local() {
+        let output = |code| OUTPUT.replace(".code = 1", &format!(".code = {code}"));
+        let program = format!(r#"%%start
+            i8(i8) pick = fn(entry) {{
+                core.require(entry != 3, {});
+                entry
+            }};
+            i8(i8) forward = fn(entry) {{
+                core.require(entry != 3, {});
+                if (entry > 0) {{ pick(entry) }} else {{ 9 }}
+            }};
+            i8 saved = forward(3);
+            core.require(saved != 3, {});
+        %%end"#, output(101), output(100), output(102));
+        let empty = program.replace("core.require(entry != 3,", "core.narrow(entry < 3,")
+            .replace(&format!("core.narrow(entry < 3, {}", output(100)),
+                &format!("core.require(entry != 3, {}", output(100)));
+        let inactive = program.replace("forward(3)", "forward(0)").replace("saved != 3", "saved != 9")
+            .replace(&format!("core.require(entry != 3, {});", output(101)), "");
+        let reentry = program.replace("pick(entry)", "forward(entry)");
+        let root = source("src/main.w", "real-integer-tail-continuation");
+        for scope in [ScalarCheckerScope::MainFlowOnly, ScalarCheckerScope::CurrentPackage] {
+            for (text, expected) in [(&program, &[100, 101, 102][..]), (&empty, &[100, 101]),
+                (&inactive, &[102]), (&reentry, &[])]
+            {
+                let prepared = prepare_proof_target(&root, text).unwrap();
+                let receipt = run_closed_without_named_proofs(&prepared, scope, 1);
+                if expected.is_empty() {
+                    assert!(matches!(receipt, Err(ProjectCheck::Unsupported)));
+                } else {
+                    let receipt = receipt.unwrap();
+                    assert!(receipt.directives.iter().map(|failure| failure.code().clone())
+                        .eq(expected.iter().copied().map(BigInt::from)));
                 }
             }
         }

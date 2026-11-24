@@ -1444,6 +1444,8 @@ struct IntegerRoots<'a> {
     #[cfg(feature = "internal-checker")]
     allow_exact_contextual_bool: bool,
     #[cfg(feature = "internal-checker")]
+    allow_real_integer_tail_call: bool,
+    #[cfg(feature = "internal-checker")]
     ordinary_local_work: Option<usize>,
     #[cfg(feature = "internal-checker")]
     ordinary_comparison_work: Option<usize>,
@@ -4921,6 +4923,23 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                     return Some(IntegerControl::Returned);
                 }
                 #[cfg(feature = "internal-checker")]
+                if roots.allow_real_integer_tail_call && COLLECT && SUSPEND_CALL && suspend_integer
+                    && structure.checker_direct_targets.contains_key(&slot.expression)
+                {
+                    if !tail.is_some_and(is_integer_type) || !terminal.is_empty()
+                        || !returns.as_ref().is_some_and(|completed| completed.is_empty())
+                    {
+                        return None;
+                    }
+                    let [row] = path.0.as_slice() else { return None; };
+                    if row.affine.is_some() || row.entry.is_some() { return None; }
+                    charge_call_work(roots.ordinary_local_work.get_or_insert(0), 1)?;
+                    *cursor = IntegerBlockCursor { block, next, depth, path, branches, terminal, guard };
+                    return Some(IntegerControl::PendingCall(ExactCallEffect::TailInteger {
+                        call: slot.expression, ty,
+                    }));
+                }
+                #[cfg(feature = "internal-checker")]
                 if let Some(target) = computed_returns.as_deref_mut() {
                     if let Some((operator, operands)) = structure.checker_integer_final_operations.get(&slot.expression) {
                         let work = return_capture_work.as_deref_mut()?;
@@ -5388,12 +5407,16 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
 pub(super) enum ExactCallEffect<'a> {
     Unit(OccurrenceOrdinal),
     Scalar { call: OccurrenceOrdinal, binding: Option<&'a ReferenceBindingId>, ty: &'a ScalarType },
+    #[cfg(feature = "internal-checker")]
+    TailInteger { call: OccurrenceOrdinal, ty: &'a ScalarType },
 }
 
 impl ExactCallEffect<'_> {
     pub(super) fn occurrence(self) -> OccurrenceOrdinal {
         match self {
             Self::Unit(call) | Self::Scalar { call, .. } => call,
+            #[cfg(feature = "internal-checker")]
+            Self::TailInteger { call, .. } => call,
         }
     }
 
@@ -5401,6 +5424,8 @@ impl ExactCallEffect<'_> {
         match self {
             Self::Unit(_) => &ScalarType::Unit,
             Self::Scalar { ty, .. } => ty,
+            #[cfg(feature = "internal-checker")]
+            Self::TailInteger { ty, .. } => ty,
         }
     }
 }
@@ -5522,6 +5547,8 @@ pub(super) struct ExactCallCursor<'a> {
     tail: Option<&'a ScalarType>,
     #[cfg(feature = "internal-checker")]
     allow_empty_integer: bool,
+    #[cfg(feature = "internal-checker")]
+    tail_call_result: Option<ActualCallResult>,
     discarded_return: Option<bool>,
     returned: Vec<IntegerReturningPath<'a>>,
     computed_returns: Vec<(usize, ComputedIntegerReturn)>,
@@ -5567,6 +5594,13 @@ impl<'a> ExactCallCursor<'a> {
     pub(super) fn allow_exact_contextual_bool(&mut self) {
         debug_assert!(self.tail.is_none() && self.projected_slot.is_none() && self.projected_pair.is_none());
         self.roots.allow_exact_contextual_bool = true;
+    }
+
+    #[cfg(feature = "internal-checker")]
+    pub(super) fn allow_real_integer_tail_call(&mut self) {
+        debug_assert!(self.tail.is_some_and(is_integer_type)
+            && self.projected_slot.is_none() && self.projected_pair.is_none());
+        self.roots.allow_real_integer_tail_call = true;
     }
 
     pub(super) fn new(calls: &'a FunctionCallSites, exact: &[&BigInt], expected: &ScalarType) -> Option<Self> {
@@ -5685,6 +5719,8 @@ impl<'a> ExactCallCursor<'a> {
         Some(Self { roots, block, tail,
             #[cfg(feature = "internal-checker")]
             allow_empty_integer: false,
+            #[cfg(feature = "internal-checker")]
+            tail_call_result: None,
             discarded_return: None, returned: Vec::new(), computed_returns: Vec::new(), return_capture_work: 0, projected_slot, projected_pair })
     }
 
@@ -5761,6 +5797,15 @@ impl<'a> ExactCallCursor<'a> {
 
     pub(super) fn resume(&mut self, effect: ExactCallEffect<'a>, caller_axis: Option<usize>, result: ActualCallResult) -> Option<()> {
         match (effect, result) {
+            #[cfg(feature = "internal-checker")]
+            (ExactCallEffect::TailInteger { ty, .. }, result @ (ActualCallResult::Integer(_) | ActualCallResult::EmptyInteger)) => {
+                if caller_axis.is_some() || self.tail != Some(ty) || !self.roots.allow_real_integer_tail_call
+                    || self.tail_call_result.is_some()
+                {
+                    return None;
+                }
+                self.tail_call_result = Some(result);
+            }
             (ExactCallEffect::Unit(_), ActualCallResult::Unit) => {}
             (ExactCallEffect::Unit(_), ActualCallResult::EmptyUnit) => self.block.path = IntegerInputs::default(),
             #[cfg(feature = "internal-checker")]
@@ -5947,6 +5992,10 @@ impl<'a> ExactCallCursor<'a> {
         allow_ordinary_integer_locals: bool,
         sink: &mut dyn FnMut(IntegerCheckFailure<'a>),
     ) -> Option<ExactCallProgress<'a>> {
+        #[cfg(feature = "internal-checker")]
+        if let Some(result) = self.tail_call_result.take() {
+            return Some(ExactCallProgress::Done { active: self.roots.reached_obligation, result });
+        }
         #[cfg(feature = "internal-checker")]
         {
             self.roots.allow_ordinary_integer_locals = allow_ordinary_integer_locals && !calls.structure.checker_ordinary_scalar_locals.is_empty();

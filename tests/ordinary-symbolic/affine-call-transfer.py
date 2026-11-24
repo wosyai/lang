@@ -875,6 +875,31 @@ def state_report(code, label, selected, extra=""):
     return ('{ .stdout = ""; .stderr = "'+label+'"; .code = '+str(code)
             +'; .files = [{ .path = "state.json"; .state = '+selected+'; }'+extra+']; }')
 
+real_integer_tail = f"""%%start
+    i8(i8) pick = fn(entry) {{
+        core.require(entry != 3, {state_report(231,"TAIL-CHILD","entry")});
+        entry
+    }};
+    i8(i8) forward = fn(entry) {{
+        core.require(entry != 3, {report(230,"BEFORE-TAIL")});
+        if (entry > 0) {{ pick(entry) }} else {{ 9 }}
+    }};
+    i8 saved = forward(3);
+    core.require(saved != 3, {report(232,"AFTER-TAIL")});
+    %%end"""
+real_integer_tail_empty = real_integer_tail.replace(
+    "core.require(entry != 3, " + state_report(231,"TAIL-CHILD","entry"),
+    "core.narrow(entry < 3, " + state_report(233,"TAIL-EMPTY","entry"),
+)
+real_integer_tail_inactive = real_integer_tail.replace("forward(3)","forward(0)").replace("saved != 3","saved != 9").replace(
+    "core.require(entry != 3, " + state_report(231,"TAIL-CHILD","entry") + ");", "",
+)
+cases.extend([
+    ("exact-startup-real-integer-tail-transfers-result",real_integer_tail,230,b"BEFORE-TAILTAIL-CHILDAFTER-TAIL"),
+    ("exact-startup-real-integer-tail-propagates-empty",real_integer_tail_empty,230,b"BEFORE-TAILTAIL-EMPTY"),
+    ("exact-startup-real-integer-tail-ignores-unused-arm",real_integer_tail_inactive,232,b"AFTER-TAIL"),
+    ("exact-startup-real-integer-tail-rejects-reentry",real_integer_tail.replace("pick(entry)","forward(entry)"),2,b"unsupported analysis"),
+])
 contextual_bool_scopes = f"""%%start
     unit() startup = fn {{
         bool initial = true;
@@ -1371,6 +1396,9 @@ nested_array_bytes = state_bytes({
     },
 })
 authored_files = {
+    **{name: {"state.json": b'{"type":{"kind":"i8"},"value":3}\n'} for name in (
+        "exact-startup-real-integer-tail-transfers-result", "exact-startup-real-integer-tail-propagates-empty",
+    )},
     "authored-lexical-code-resolves-failure-witness": {"state.json": b'{"type":{"kind":"i8"},"value":37}\n'},
     "exact-startup-lexical-code-resolves-failed-narrow": {"state.json": b'{"type":{"kind":"i8"},"value":43}\n'},
     "exact-startup-contextual-bool-restores-outer": {
@@ -1489,6 +1517,8 @@ with tempfile.TemporaryDirectory(prefix="affine-calls-") as path:
                 assert not res.stdout,res
                 if code==2:
                     assert expected_stderr in res.stderr,res
+                    if name == "exact-startup-real-integer-tail-rejects-reentry":
+                        assert b"BEFORE-TAIL" not in res.stderr and b"AFTER-TAIL" not in res.stderr,res
                     if name == "authored-lexical-code-nonsingleton-fails-atomically":
                         assert b"LEXICAL-CODE" not in res.stderr,res
                     if name == "parallel-formal-target-fails-closed":
