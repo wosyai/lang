@@ -1747,6 +1747,32 @@ cases.extend([
     ("exact-startup-ordinary-array-read-rejects-out-of-bounds",ordinary_array_read_actual.replace(
         "if (index == 0)","if (index == 2)").replace("inspect(0, 3)","inspect(2, 3)"),2,b"unsupported analysis"),
 ])
+ordinary_nested_array = f"""%%start
+    unit(u64, i8) inspect = fn(index, value) {{
+        core.narrow(value == 1 || value == 3, {report(1,"PRUNE")});
+        i8[2][2] matrix = [[value, 29], [49, 7]];
+        i8[2][2] copied = matrix;
+        value = 9;
+        if (index <= 1) {{
+            i8 observed = copied[index][index];
+            i8 constant = copied[0][1];
+            core.require(constant == 29, {report(58,"WRONG-CONSTANT")});
+            if (observed == 3) {{
+                core.require(index == 0, {report(60,"WRONG-DIAGONAL-INDEX")});
+                core.require(value != 9, {state_report(61,"SELECTED-DIAGONAL","observed")});
+            }} else {{
+                core.require(observed == 1 || (index == 1 && observed == 7), {report(63,"OFF-DIAGONAL")});
+            }};
+        }};
+    }};
+    %%end"""
+cases.extend([
+    ("ordinary-nested-array-exact-diagonal",ordinary_nested_array,61,b"SELECTED-DIAGONAL"),
+    ("exact-startup-ordinary-nested-array-exact-diagonal",ordinary_nested_array.replace("%%end","inspect(0, 3); %%end"),
+        61,b"SELECTED-DIAGONAL"),
+    ("ordinary-nested-array-inner-out-of-bounds",ordinary_nested_array.replace("index <= 1","index <= 2").replace(
+        "copied[index][index]","copied[0][index]"),2,b"unsupported analysis"),
+])
 ordinary_nominal_read = f"""%%start
     struct copy Snapshot {{ i8 saved; bool enabled; }}
     unit(i8) inspect = fn(value) {{
@@ -1932,6 +1958,7 @@ authored_files = {
         "ordinary-nominal-member-read-control", "exact-startup-ordinary-nominal-member-read-control",
         "ordinary-array-read-control", "exact-startup-ordinary-array-read-control",
         "ordinary-array-read-partitions-holed-indices",
+        "ordinary-nested-array-exact-diagonal", "exact-startup-ordinary-nested-array-exact-diagonal",
     )},
     "authored-state-array-projection-code-and-file": {"selected.json": state_bytes(copied_alternatives)},
     "authored-state-nominal-field-only": {

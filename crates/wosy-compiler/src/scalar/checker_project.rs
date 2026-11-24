@@ -10582,6 +10582,51 @@ mod tests {
 
     #[cfg(feature = "internal-checker")]
     #[test]
+    fn ordinary_nested_array_path_preserves_diagonal_and_checks_each_bound() {
+        let app = source("src/main.w", "ordinary-nested-array-path");
+        let text = r#"%%start
+            unit(u64, i8) inspect = fn(index, value) {
+                core.narrow(value == 1 || value == 3, { .stdout = ""; .stderr = ""; .code = 1; .files = []; });
+                i8[2][2] matrix = [[value, 29], [49, 7]];
+                i8[2][2] copied = matrix;
+                value = 9;
+                if (index <= 1) {
+                    i8 observed = copied[index][index];
+                    i8 constant = copied[0][1];
+                    core.require(constant == 29, { .stdout = ""; .stderr = "wrong constant"; .code = 58; .files = []; });
+                    if (observed == 3) {
+                        core.require(index == 0, { .stdout = ""; .stderr = "wrong index"; .code = 60; .files = []; });
+                        core.require(value != 9, { .stdout = ""; .stderr = ""; .code = 61;
+                            .files = [{ .path = "observed.json"; .state = observed; }]; });
+                    } else {
+                        core.require(observed == 1 || (index == 1 && observed == 7),
+                            { .stdout = ""; .stderr = "off diagonal"; .code = 63; .files = []; });
+                    };
+                };
+            };
+        %%end"#;
+        let actual = text.replace("%%end", "inspect(0, 3); %%end");
+        let run = |input: &str, scope| {
+            let prepared = prepare_proof_target(&app, input).unwrap();
+            run_closed_without_named_proofs(&prepared, scope, 1)
+        };
+        for (input, scope) in [(text, ScalarCheckerScope::CurrentPackage),
+            (actual.as_str(), ScalarCheckerScope::MainFlowOnly), (actual.as_str(), ScalarCheckerScope::CurrentPackage)]
+        {
+            let receipt = run(input, scope).unwrap();
+            let [failure] = receipt.directives.as_slice() else { panic!("only the preserved diagonal element fails"); };
+            assert_eq!(failure.code(), &BigInt::from(61));
+            assert_eq!(failure.witness.axes().len(), 4);
+            assert!(failure.witness.axes().all(|(binding, _)| binding.kind == super::super::ReferenceBindingKind::Declared));
+            assert_eq!(failure.files()[0].text.as_ref(), b"{\"type\":{\"kind\":\"i8\"},\"value\":3}\n");
+        }
+        let inner_outside = text.replace("index <= 1", "index <= 2")
+            .replace("copied[index][index]", "copied[0][index]");
+        assert!(matches!(run(&inner_outside, ScalarCheckerScope::CurrentPackage), Err(ProjectCheck::Unsupported)));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
     fn ordinary_fixed_array_read_partitions_only_in_bounds_index_preimages() {
         let app = source("src/main.w", "ordinary-array-read");
         let text = r#"%%start

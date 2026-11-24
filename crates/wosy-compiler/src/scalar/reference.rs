@@ -6159,10 +6159,24 @@ pub(super) enum CheckerOrdinaryScalarLocalKind {
 }
 
 #[cfg(feature = "internal-checker")]
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(super) enum CheckerSnapshotReadIndex {
     Leaf(usize),
-    BoundedArrayIndex(OccurrenceOrdinal),
+    ArrayPath(Box<[CheckerSnapshotArrayStep]>),
+}
+
+#[cfg(feature = "internal-checker")]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct CheckerSnapshotArrayStep {
+    pub(super) length: usize,
+    pub(super) offset: CheckerSnapshotArrayOffset,
+}
+
+#[cfg(feature = "internal-checker")]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) enum CheckerSnapshotArrayOffset {
+    Literal(usize),
+    Lexical(OccurrenceOrdinal),
 }
 
 #[cfg(feature = "internal-checker")]
@@ -9206,47 +9220,65 @@ impl StructuralWalker<'_, '_> {
     fn ordinary_array_read(
         &mut self, expression: OccurrenceOrdinal, ast: &ScalarExpression, ty: &ScalarType,
     ) -> Option<CheckerOrdinaryScalarLocalKind> {
-        use super::checker_directive::{direct_array_index, CheckerSnapshotNode};
-        let (_, index) = direct_array_index(ast)?;
-        let OccurrenceNode::Place(place) = *self.structure.edges.get(&(
+        use super::checker_directive::{array_index_chain, CheckerSnapshotNode};
+        let (_, indices) = array_index_chain(ast)?;
+        let OccurrenceNode::Place(mut place) = *self.structure.edges.get(&(
             OccurrenceParent::Expression(expression), OccurrenceEdge::ExpressionPlace,
         ))? else { return None; };
-        let OccurrenceNode::Place(base) = *self.structure.edges.get(&(
-            OccurrenceParent::Place(place), OccurrenceEdge::PlaceBase,
-        ))? else { return None; };
-        let ScalarType::Array { element, length: length @ 1..=64, .. } =
-            self.structure.checked_types.places.get(&base)? else { return None; };
-        if element.as_ref() != ty { return None; }
-        let length = usize::try_from(*length).ok()?;
-        let NamedPlaceRootFacts::Prepared(roots) = &self.named_place_roots else { return None; };
-        let NamedPlaceRootIdentity::Lexical(binding) = roots.get(&base)? else { return None; };
-        let key = *self.structure.checker_snapshot_bindings.get(&(binding.declaration_span, binding.block_span))?;
-        fn array(root: &CheckerSnapshotNode, length: usize) -> Option<&[CheckerSnapshotNode]> {
-            match root {
-                CheckerSnapshotNode::Array(elements) if elements.len() == length => Some(elements),
-                _ => None,
-            }
-        }
-        let (shape, index) = match index {
-            ScalarExpression::Integer { value, .. } => {
-                let index = usize::try_from(value).ok()?;
-                let (shape, leaf) = self.structure.select_snapshot_leaf(key, ty, |root| array(root, length)?.get(index))?;
-                (shape, CheckerSnapshotReadIndex::Leaf(leaf))
-            }
-            ScalarExpression::Name { .. } => {
-                let OccurrenceNode::Expression(index) = *self.structure.edges.get(&(
-                    OccurrenceParent::Place(place), OccurrenceEdge::PlaceIndex,
-                ))? else { return None; };
-                let PlainNameFacts::Prepared(names) = &self.plain_names else { return None; };
-                if !matches!(names.get(&index), Some(PlainNameIdentity::Lexical(_)))
-                    || self.structure.checked_types.expressions.get(&index) != Some(&ScalarType::U64)
-                {
-                    return None;
+        let mut steps = Vec::with_capacity(indices.len());
+        let mut dynamic = false;
+        for ast_index in indices {
+            let OccurrenceNode::Place(base) = *self.structure.edges.get(&(
+                OccurrenceParent::Place(place), OccurrenceEdge::PlaceBase,
+            ))? else { return None; };
+            let ScalarType::Array { length: length @ 1..=64, .. } =
+                self.structure.checked_types.places.get(&base)? else { return None; };
+            let length = usize::try_from(*length).ok()?;
+            let offset = match ast_index {
+                ScalarExpression::Integer { value, .. } => {
+                    let index = usize::try_from(value).ok()?;
+                    if index >= length { return None; }
+                    CheckerSnapshotArrayOffset::Literal(index)
                 }
-                let (shape, ()) = self.structure.select_snapshot(key, |shape| array(&shape.root, length).map(|_| ()))?;
-                (shape, CheckerSnapshotReadIndex::BoundedArrayIndex(index))
-            }
-            _ => return None,
+                ScalarExpression::Name { .. } => {
+                    let OccurrenceNode::Expression(index) = *self.structure.edges.get(&(
+                        OccurrenceParent::Place(place), OccurrenceEdge::PlaceIndex,
+                    ))? else { return None; };
+                    let PlainNameFacts::Prepared(names) = &self.plain_names else { return None; };
+                    if !matches!(names.get(&index), Some(PlainNameIdentity::Lexical(_)))
+                        || self.structure.checked_types.expressions.get(&index) != Some(&ScalarType::U64)
+                    {
+                        return None;
+                    }
+                    dynamic = true;
+                    CheckerSnapshotArrayOffset::Lexical(index)
+                }
+                _ => return None,
+            };
+            steps.push(CheckerSnapshotArrayStep { length, offset });
+            place = base;
+        }
+        steps.reverse();
+        let NamedPlaceRootFacts::Prepared(roots) = &self.named_place_roots else { return None; };
+        let NamedPlaceRootIdentity::Lexical(binding) = roots.get(&place)? else { return None; };
+        let key = *self.structure.checker_snapshot_bindings.get(&(binding.declaration_span, binding.block_span))?;
+        let (shape, index) = if dynamic {
+            let (shape, ()) = self.structure.select_snapshot(key, |shape| {
+                let CheckerSnapshotNode::Array(elements) = &shape.root else { return None; };
+                (elements.len() == steps.first()?.length).then_some(())
+            })?;
+            (shape, CheckerSnapshotReadIndex::ArrayPath(steps.into_boxed_slice()))
+        } else {
+            let (shape, leaf) = self.structure.select_snapshot_leaf(key, ty, |mut node| {
+                for step in &steps {
+                    let CheckerSnapshotNode::Array(elements) = node else { return None; };
+                    let CheckerSnapshotArrayOffset::Literal(index) = step.offset else { return None; };
+                    if elements.len() != step.length { return None; }
+                    node = elements.get(index)?;
+                }
+                Some(node)
+            })?;
+            (shape, CheckerSnapshotReadIndex::Leaf(leaf))
         };
         Some(CheckerOrdinaryScalarLocalKind::SnapshotRead { shape, index })
     }

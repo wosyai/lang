@@ -210,6 +210,24 @@ pub(super) fn direct_array_index(expression: &ScalarExpression) -> Option<(&str,
     Some((name, index))
 }
 
+#[cfg(feature = "internal-checker")]
+pub(super) fn array_index_chain(expression: &ScalarExpression) -> Option<(&str, Vec<&ScalarExpression>)> {
+    use super::ScalarPlace;
+    let ScalarExpression::IndexedRead { place, .. } = expression else { return None; };
+    let mut place = place;
+    // The syntax tree peels the last bracket first.
+    let mut indices = Vec::new();
+    while let ScalarPlace::Index { base, index, .. } = place {
+        if indices.len() == 8 || !matches!(index.as_ref(), ScalarExpression::Integer { .. } | ScalarExpression::Name { .. }) {
+            return None;
+        }
+        indices.push(index.as_ref());
+        place = base;
+    }
+    let ScalarPlace::Name { name, .. } = place else { return None; };
+    (!indices.is_empty()).then_some((name, indices))
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct CheckerStateFile {
     pub(super) position: usize,

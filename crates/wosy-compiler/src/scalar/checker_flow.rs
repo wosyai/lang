@@ -1480,6 +1480,13 @@ impl<'a> IntegerRoots<'a> {
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(super) struct IntegerInputs(Vec<IntegerRow>);
 
+#[cfg(feature = "internal-checker")]
+#[derive(Clone, Copy)]
+enum SnapshotIndexValue {
+    Literal(usize),
+    Axis(usize),
+}
+
 impl IntegerInputs {
     #[cfg(feature = "internal-checker")]
     fn append_ordinary_copy(&mut self, axis: usize, roots: &mut IntegerRoots<'_>) -> Option<()> {
@@ -1498,52 +1505,69 @@ impl IntegerInputs {
     }
 
     #[cfg(feature = "internal-checker")]
-    fn bounded_snapshot_index(
-        self, index_axis: usize, length: usize, mut field_axis: impl FnMut(usize) -> Option<usize>,
+    fn bounded_snapshot_path(
+        self, root: &super::checker_directive::CheckerSnapshotNode,
+        steps: &[(usize, SnapshotIndexValue)], mut field_axis: impl FnMut(usize) -> Option<usize>,
         work: &mut usize,
     ) -> Option<Self> {
-        if !(1..=64).contains(&length) { return None; }
+        use super::checker_directive::CheckerSnapshotNode as Node;
+        if !(1..=8).contains(&steps.len()) { return None; }
         let mut axes = [None; 64];
-        let mut axis_at = |index: usize| {
-            let slot = axes.get_mut(index)?;
-            if slot.is_none() { *slot = Some(field_axis(index)?); }
+        let mut axis_at = |leaf: usize| {
+            let slot = axes.get_mut(leaf)?;
+            if slot.is_none() { *slot = Some(field_axis(leaf)?); }
             *slot
         };
-        let mut result = Vec::new();
-        for mut row in self.0 {
+        fn visit(
+            mut row: IntegerRow, node: &Node, steps: &[(usize, SnapshotIndexValue)],
+            axis_at: &mut impl FnMut(usize) -> Option<usize>, output: &mut Vec<IntegerRow>,
+            work: &mut usize,
+        ) -> Option<()> {
             charge_call_work(work, 1)?;
-            let indices = row.get(index_axis)?;
+            let Some((&(length, index), rest)) = steps.split_first() else {
+                let Node::Leaf(leaf) = node else { return None; };
+                let growth = if row.len() == row.cells.capacity() { row.len() } else { 0 };
+                charge_call_work(work, row.equal_axes().len().checked_add(growth)?.checked_add(2)?)?;
+                let field = axis_at(*leaf)?;
+                row.append_alias(field, row.get(field)?.clone());
+                output.push(row);
+                return Some(());
+            };
+            let Node::Array(children) = node else { return None; };
+            if !(1..=64).contains(&length) || length != children.len() { return None; }
+            let axis = match index {
+                SnapshotIndexValue::Literal(index) =>
+                    return visit(row, children.get(index)?, rest, axis_at, output, work),
+                SnapshotIndexValue::Axis(axis) => axis,
+            };
+            let indices = row.get(axis)?;
             let (lower, upper) = indices.extremes()?;
             let first = usize::try_from(lower).ok()?;
             let last = usize::try_from(upper).ok()?;
-            // Do not intersect away invalid indices. This entire reached
-            // read is supported only if every input index is in bounds.
+            // Do not intersect away invalid indices: every reachable
+            // coordinate must be in bounds at this dimension.
             if last >= length || first > last { return None; }
             if first == last {
-                let growth = if row.len() == row.cells.capacity() { row.len() } else { 0 };
-                charge_call_work(work, row.equal_axes().len().checked_add(growth)?.checked_add(2)?)?;
-                let field = axis_at(first)?;
-                row.append_alias(field, row.get(field)?.clone());
-                result.push(row);
-                continue;
+                return visit(row, children.get(first)?, rest, axis_at, output, work);
             }
             for (lower, upper) in indices.intervals() {
                 charge_call_work(work, 1)?;
                 for index in usize::try_from(lower).ok()?..=usize::try_from(upper).ok()? {
-                    // Pay for cloning all coordinates, propagating the exact
-                    // index restriction through equal/affine columns, and
-                    // appending the selected alias before doing any of it.
-                    let aliases = row.equal_axes().len();
-                    let mut cost = row.len().checked_mul(2)?.checked_add(aliases.checked_mul(2)?)?.checked_add(5)?;
-                    row.charge_affine_replacement(index_axis, 1, &mut cost)?;
+                    // Charge the copied width and actual equality/affine
+                    // preimage propagation before creating the child row.
+                    let mut cost = row.len().checked_mul(2)?.checked_add(row.equal_axes().len())?.checked_add(5)?;
+                    row.charge_affine_replacement(axis, 1, &mut cost)?;
                     charge_call_work(work, cost)?;
-                    let field = axis_at(index)?;
                     let mut split = row.clone();
-                    split.replace_domain(index_axis, Rc::new(IntegerSet::singleton(&BigInt::from(index))));
-                    split.append_alias(field, split.get(field)?.clone());
-                    result.push(split);
+                    split.replace_domain(axis, Rc::new(IntegerSet::singleton(&BigInt::from(index))));
+                    visit(split, children.get(index)?, rest, axis_at, output, work)?;
                 }
             }
+            Some(())
+        }
+        let mut result = Vec::new();
+        for row in self.0 {
+            visit(row, root, steps, &mut axis_at, &mut result, work)?;
         }
         Some(Self(result))
     }
@@ -5409,7 +5433,7 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                                 path.append_ordinary_copy(axis, roots)?;
                             }
                             super::reference::CheckerOrdinaryScalarLocalKind::SnapshotRead { shape, index } => {
-                                use super::{checker_directive::CheckerSnapshotNode, reference::CheckerSnapshotReadIndex};
+                                use super::reference::{CheckerSnapshotArrayOffset, CheckerSnapshotReadIndex};
                                 if !roots.allow_extended_scalar_locals { return None; }
                                 match index {
                                     CheckerSnapshotReadIndex::Leaf(leaf) => {
@@ -5418,21 +5442,30 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                                         if ty != &receiver.ty || field.ty != *ty { return None; }
                                         path.append_ordinary_copy(axis, roots)?;
                                     }
-                                    CheckerSnapshotReadIndex::BoundedArrayIndex(index) => {
-                                        let PlainNameIdentity::Lexical(binding) = calls.prepared_plain_name(*index)?
-                                            else { return None; };
-                                        let (axis, ty) = roots.lookup(binding)?;
-                                        if *ty != ScalarType::U64 { return None; }
-                                        let CheckerSnapshotNode::Array(elements) = &shape.root else { return None; };
+                                    CheckerSnapshotReadIndex::ArrayPath(prepared) => {
+                                        charge_call_work(roots.ordinary_local_work.get_or_insert(0), prepared.len().checked_add(1)?)?;
+                                        let mut steps = Vec::with_capacity(prepared.len());
+                                        for step in prepared.iter() {
+                                            let index = match step.offset {
+                                                CheckerSnapshotArrayOffset::Literal(index) => SnapshotIndexValue::Literal(index),
+                                                CheckerSnapshotArrayOffset::Lexical(index) => {
+                                                    let PlainNameIdentity::Lexical(binding) = calls.prepared_plain_name(index)?
+                                                        else { return None; };
+                                                    let (axis, ty) = roots.lookup(binding)?;
+                                                    if *ty != ScalarType::U64 { return None; }
+                                                    SnapshotIndexValue::Axis(axis)
+                                                }
+                                            };
+                                            steps.push((step.length, index));
+                                        }
                                         let by_binding = &roots.by_binding;
                                         let axes = &roots.axes;
-                                        let field_axis = |index: usize| {
-                                            let CheckerSnapshotNode::Leaf(leaf) = elements.get(index)? else { return None; };
-                                            let field = shape.leaves.get(*leaf)?;
+                                        let field_axis = |leaf: usize| {
+                                            let field = shape.leaves.get(leaf)?;
                                             let axis = *by_binding.get(&field.capture)?;
                                             (axes.get(axis)?.1 == &receiver.ty && field.ty == receiver.ty).then_some(axis)
                                         };
-                                        path = path.bounded_snapshot_index(axis, elements.len(), field_axis,
+                                        path = path.bounded_snapshot_path(&shape.root, &steps, field_axis,
                                             roots.ordinary_local_work.get_or_insert(0))?;
                                     }
                                 }
@@ -6967,17 +7000,22 @@ fn bounded_snapshot_index_preserves_holes_and_affine_preimages_before_aliasing()
     let domain = Rc::new(IntegerSet::union([singleton(0).as_ref(), singleton(2).as_ref()]));
     let mut row = IntegerRow::new(vec![domain, singleton(42), singleton(99)]);
     assert!(row.test_append_affine(0, Rc::new(IntegerAffineTransform { reflected: true, offset: 6.into() })).is_some());
+    use super::checker_directive::CheckerSnapshotNode as Node;
     let fields = |index| [0, 1, 3].get(index).copied();
+    let array = Node::Array(Box::new([Node::Leaf(0), Node::Leaf(1), Node::Leaf(2)]));
+    let steps = [(3, SnapshotIndexValue::Axis(0))];
     let mut work = 0;
-    let result = IntegerInputs(vec![row.clone()]).bounded_snapshot_index(0, 3, fields, &mut work).unwrap();
+    let result = IntegerInputs(vec![row.clone()]).bounded_snapshot_path(&array, &steps, fields, &mut work).unwrap();
     assert_eq!(result.row_count(), 2);
     assert!(result.includes_signed(&[0, 42, 99, 6, 0]));
     assert!(result.includes_signed(&[2, 42, 99, 4, 4]));
     assert!(!result.includes_signed(&[0, 42, 99, 6, 4]));
     assert!(!result.includes_signed(&[1, 42, 99, 5, 42]));
-    assert!(IntegerInputs(vec![row.clone()]).bounded_snapshot_index(0, 2, fields, &mut 0).is_none());
+    let shorter = Node::Array(Box::new([Node::Leaf(0), Node::Leaf(1)]));
+    assert!(IntegerInputs(vec![row.clone()]).bounded_snapshot_path(&shorter,
+        &[(2, SnapshotIndexValue::Axis(0))], fields, &mut 0).is_none());
     let mut almost_exhausted = MAX_PARTITION_TRANSFER_WORK - 1;
-    assert!(IntegerInputs(vec![row]).bounded_snapshot_index(0, 3, fields, &mut almost_exhausted).is_none());
+    assert!(IntegerInputs(vec![row]).bounded_snapshot_path(&array, &steps, fields, &mut almost_exhausted).is_none());
 }
 
 #[test]
