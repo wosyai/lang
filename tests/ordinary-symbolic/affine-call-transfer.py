@@ -1636,6 +1636,18 @@ cases.extend([
         ordered_calling_citation_chain.replace("core.use(issued(arg))","core.use(top(arg))"),2,b"unsupported analysis"),
 ])
 
+ordered_calling_citation_then_show = ordered_calling_citation.replace(
+    "ensures (out <= 7) { core.use(issued(arg)); }",
+    "ensures (out == 7) { core.use(issued(arg)); core.show(out >= 7); }").replace(
+    "ensures (out == 7) {}", "ensures (out <= 7) {}")
+cases.extend([
+    ("ordered-calling-citation-then-show-verified",ordered_calling_citation_then_show,0,b""),
+    ("ordered-calling-citation-then-show-refuted",
+        ordered_calling_citation_then_show.replace("out >= 7","out > 7"),1,b"proof obligation failed"),
+    ("ordered-calling-citation-then-show-refuses-unverified-peer",
+        ordered_calling_citation_then_show.replace("out <= 7","out <= 6"),2,b"unsupported analysis"),
+])
+
 ordered_shows_calling_producer = authored_named_calling_producer.replace(
     "core.show(out < 7);", "core.show(out <= 7); core.show(out < 7); core.show(out >= 0);")
 cases.extend([
@@ -1682,6 +1694,7 @@ cases.extend([
         b"proof obligation failed"),
 ])
 proof_diagnostic_notes = {
+    "ordered-calling-citation-then-show-refuted": b"symbolic call can return 7",
     "ordinary-named-calling-ordered-shows-earliest": b"symbolic call can return 7",
     "ordinary-named-calling-ordered-shows-later": b"symbolic call can return -3",
     "ordinary-authored-named-calling-step-refuted": b"symbolic call can return 7",

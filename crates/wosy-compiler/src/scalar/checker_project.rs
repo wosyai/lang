@@ -3926,15 +3926,15 @@ impl SelectedSymbolicProof<'_, '_> {
             .map(|case| (case, None)).chain(authored.iter().map(|(case, step)| (case, step.as_ref())));
         let mut plans = Vec::new();
         for (case, step) in cases {
-            let citation = if let Some(MainFlowAuthoredShows::CallingCitation { peer }) = step {
+            let citation = if let Some(MainFlowAuthoredShows::CallingCitation { peer, .. }) = step {
                 has_citation = true;
                 Some(*peer)
             } else {
                 None
             };
             let (step, ordered_steps) = match step {
-                None | Some(MainFlowAuthoredShows::CallingCitation { .. }) => (None, &[][..]),
-                Some(MainFlowAuthoredShows::Single(step)) =>
+                None | Some(MainFlowAuthoredShows::CallingCitation { show: None, .. }) => (None, &[][..]),
+                Some(MainFlowAuthoredShows::Single(step) | MainFlowAuthoredShows::CallingCitation { show: Some(step), .. }) =>
                     (Some((step.span, PartitionedProofGoal::Literal(step.relation, step.bound.as_ref()))), &[][..]),
                 Some(MainFlowAuthoredShows::Entry { span, slot: 0, relation })
                     if parameter.ty == output.ty
@@ -3945,7 +3945,7 @@ impl SelectedSymbolicProof<'_, '_> {
                 Some(_) => return Err(ProjectCheck::Unsupported),
             };
             if metered {
-                let count = ordered_steps.len().checked_add(usize::from(step.is_some() || citation.is_some()))
+                let count = ordered_steps.len().checked_add(usize::from(step.is_some()) + usize::from(citation.is_some()))
                     .ok_or(ProjectCheck::Unsupported)?;
                 super::checker_flow::charge_call_work(&mut proof_work, count).ok_or(ProjectCheck::Unsupported)?;
             }
@@ -4020,8 +4020,11 @@ impl SelectedSymbolicProof<'_, '_> {
         }
         'proofs: for (index, (case, step, ordered_steps, citation, goal, proof_domain)) in plans.iter().enumerate() {
             if citation.is_some() {
+                // A mixed proof verifies the cited dependency first, but
+                // its own goal is not a reusable implication edge.
+                let at = if step.is_some() { peer_nodes[index].next.ok_or(ProjectCheck::Unsupported)? } else { index };
                 let settled = resolve_local_peer_path(
-                    &mut peer_nodes, index, &mut peer_path, |node| &mut node.state, |node| node.next,
+                    &mut peer_nodes, at, &mut peer_path, |node| &mut node.state, |node| node.next,
                     |node, _| {
                         let Some((relation, bound)) = node.goal else { return false; };
                         super::checker_flow::verify_partitioned_call_return(
@@ -4036,7 +4039,7 @@ impl SelectedSymbolicProof<'_, '_> {
                 );
                 if !matches!(settled, LocalPeerState::Terminal(_)) { return Err(ProjectCheck::Unsupported); }
                 applicable = true;
-                continue;
+                if step.is_none() { continue; }
             }
             let bare = step.is_none() && ordered_steps.is_empty();
             if has_citation && bare && matches!(peer_nodes[index].state, LocalPeerState::Terminal(_)) {
@@ -4325,7 +4328,7 @@ struct MainFlowLiteralShow<'a> {
 #[cfg(feature = "internal-checker")]
 enum MainFlowAuthoredShows<'a> {
     Single(MainFlowLiteralShow<'a>),
-    CallingCitation { peer: u32 },
+    CallingCitation { peer: u32, show: Option<MainFlowLiteralShow<'a>> },
     Entry { span: ByteSpan, slot: usize, relation: IntegerRelation },
     Multiple { first_span: ByteSpan, groups: Vec<MainFlowShowBound<'a>> },
     CallingSequence {
@@ -4505,7 +4508,7 @@ impl<'a> MainFlowProofCase<'a> {
 
     fn prepare_with_citation(
         plan: &'a PlannedModuleProof<'a>, root: &SourceIdentity,
-        citation: Option<&'a PlannedModuleProof<'a>>,
+        citation: Option<(&'a PlannedModuleProof<'a>, Option<&'a ScalarBlockItem>)>,
     ) -> Result<MainFlowProofPlan<'a>, ProjectCheck> {
         let (relation, bound) = match &plan.typed.goal {
             TypedProofGoal::Literal { relation, bound, .. } => (relation, MainFlowProofBound::Literal(bound)),
@@ -4536,7 +4539,7 @@ impl<'a> MainFlowProofCase<'a> {
             )?;
             Ok((shown, literal))
         };
-        let step = if let Some(peer) = citation {
+        let step = if let Some((peer, show)) = citation {
             if plan.filter.as_ref().is_some_and(|atoms| atoms.len() > 1)
                 || peer.filter.as_ref().is_some_and(|atoms| atoms.len() > 1)
                 || peer.peer_literal_goal().is_none() || (!peer.steps.items.is_empty() && peer.direct_peer_use().is_none())
@@ -4545,8 +4548,13 @@ impl<'a> MainFlowProofCase<'a> {
             {
                 return Err(ProjectCheck::Unsupported);
             }
+            let show = show.map(|show| {
+                let (span, claim) = show_claim(show, true)?;
+                let (relation, bound) = checked_literal(claim)?;
+                Ok(MainFlowLiteralShow { span, relation, bound, same_bound: false })
+            }).transpose()?;
             Some(MainFlowAuthoredShows::CallingCitation {
-                peer: wosy_syntax::byte_span(peer.proof).start,
+                peer: wosy_syntax::byte_span(peer.proof).start, show,
             })
         } else { match (plan.steps.items.as_slice(), plan.steps.terminated_items.as_slice()) {
             ([], []) => None,
@@ -5354,9 +5362,9 @@ fn prepare_ordered_public_observation<'a>(
     catalog: Option<&HashMap<(&'a SourceIdentity, &'a str), &'a PlannedModuleProof<'a>>>,
 ) -> Result<MainFlowProofPlan<'a>, ProjectCheck> {
     if let Some(catalog) = catalog {
-        if let Some(peer) = plan.direct_peer_use() {
+        if let Some((peer, show)) = plan.public_calling_citation() {
             let cited = catalog.get(&(plan.proof_source, peer)).copied().ok_or(ProjectCheck::Unsupported)?;
-            return MainFlowProofCase::prepare_with_citation(plan, plan.proof_source, Some(cited));
+            return MainFlowProofCase::prepare_with_citation(plan, plan.proof_source, Some((cited, show)));
         }
     }
     MainFlowProofCase::prepare(plan, plan.proof_source)
@@ -5438,7 +5446,7 @@ fn check_loaded_ordered_proof_diagnostics_in_scope<const LOCAL_CATALOGS: bool>(
     }
     let all_plans = || std::iter::once(&first_plan).chain(&plans);
     let citations = if LOCAL_CATALOGS && scope == ScalarCheckerScope::CurrentPackage
-        && all_plans().any(|plan| plan.direct_peer_use().is_some())
+        && all_plans().any(|plan| plan.public_calling_citation().is_some())
     {
         Some(all_plans().map(|plan| ((plan.proof_source, plan.name), plan)).collect::<HashMap<_, _>>())
     } else {
@@ -7051,6 +7059,14 @@ impl PlannedModuleProof<'_> {
             return None;
         }
         self.peer_use_step(item)
+    }
+
+    fn public_calling_citation(&self) -> Option<(&str, Option<&ScalarBlockItem>)> {
+        match (self.steps.items.as_slice(), self.steps.terminated_items.as_slice()) {
+            ([step], [true]) => Some((self.peer_use_step(step)?, None)),
+            ([step, show], [true, true]) => Some((self.peer_use_step(step)?, Some(show))),
+            _ => None,
+        }
     }
 
     fn two_peer_uses(&self) -> Option<[&str; 2]> {
@@ -16204,6 +16220,48 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
             ).unwrap(), expected);
             assert_eq!(take_integer_observations(), (usize::from(selected), 0));
             assert_eq!(UNSELECTED_PEER_PLANS.with(|count| count.replace(0)), usize::from(!selected));
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordered_calling_citation_then_show_checks_both_on_original_returned_states() {
+        let file = source("src/main.w", "ordered-calling-citation-then-show");
+        let text = r#"%%start
+            i8(i8) execute = fn(input) { if (input < 0) { -3 } else { 7 } };
+            i8(i8) producer = fn(input) { i8 result = execute(input); result };
+            proof combined for producer(arg) -> (out) where (arg >= 0) ensures (out == 7) {
+                core.use(issued(arg)); core.show(out >= 7);
+            }
+            proof issued for producer(arg) -> (out) where (arg >= 0) ensures (out <= 7) {}
+        %%end"#;
+        let run = |text: &str| {
+            let (_, proof) = crate::parse_proof_source(file.clone(), text.to_owned(), &[]).ok().unwrap();
+            check_loaded_ordered_proof_diagnostics_in_scope::<true>(
+                Vec::new(), vec![(proof, Vec::new())], vec![file.clone()], inputs(),
+                ScalarCheckerScope::CurrentPackage, Vec::new(),
+            )
+        };
+        let proved = run(text).unwrap();
+        assert!(proved.active && proved.symbolic_diagnostic.is_none());
+        let false_goal = text.replace("out == 7", "out == 6");
+        let refuted = run(&false_goal).unwrap().symbolic_diagnostic.unwrap();
+        assert!(refuted.failed_step.is_none());
+        let false_show = false_goal.replace("out >= 7", "out > 7");
+        let failed_step = run(&false_show).unwrap().symbolic_diagnostic.unwrap();
+        assert!(failed_step.failed_step.is_some());
+        assert_eq!(failed_step.returned, BigInt::from(7));
+        assert!(failed_step.witness.intervals_at(0, 0).unwrap().eq([(&BigInt::from(0), &BigInt::from(127))]));
+        for (label, rejected) in [
+            ("failed dependency precedes show", false_show.replace("out <= 7", "out <= 6")),
+            ("different guard", text.replacen("arg >= 0", "arg == 0", 1)),
+            ("reversed step order", text.replace("core.use(issued(arg)); core.show(out >= 7);",
+                "core.show(out >= 7); core.use(issued(arg));")),
+            ("mixed proof cannot be cited", text.replace("%%end",
+                "proof reuse for producer(arg) -> (out) where (arg >= 0) ensures (out <= 8) { core.use(combined(arg)); }\n%%end")),
+        ] {
+            let result = run(&rejected);
+            assert!(matches!(result, Err(ProjectCheck::Unsupported)), "{label}: {:?}", result.err());
         }
     }
 
