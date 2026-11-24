@@ -1141,6 +1141,38 @@ pub(super) fn extract_observing_array_formal<'ctx>(
     Ok((backing, extent.into_int_value()))
 }
 
+pub(super) fn emit_array_descriptor_forward<'ctx>(
+    context: &'ctx Context,
+    state: &EmitState<'ctx, '_>,
+    definition: FunctionValue<'ctx>,
+    function: &ScalarFunction,
+    call: usize,
+) -> Result<(), String> {
+    let Some((expression, _)) = function.body.final_expressions().next() else {
+        return Err("missing checked owning array forwarding expression".into());
+    };
+    if state.body_call_nodes.and_then(|nodes| nodes.expression_ordinal(expression)) != Some(call) {
+        return Err("checked owning array forwarding occurrence changed".into());
+    }
+    let selected = state.prepared_call(expression)?.ok_or("missing qualified array forwarding target")?;
+    let symbol = selected.symbol().ok_or("checked owning array forwarding lost its declaration")?;
+    let target = *state.functions.get(symbol).ok_or("missing checked owning array forwarding target")?;
+    let descriptor = array_descriptor_type(context);
+    let Some(BasicValueEnum::StructValue(parameter)) = definition.get_first_param() else {
+        return Err("missing checked owning array forwarding parameter".into());
+    };
+    if parameter.get_type() != descriptor || target.get_linkage() != Linkage::Internal
+        || target.get_type().get_param_types().as_slice() != [descriptor.into()]
+        || target.get_type().get_return_type() != Some(descriptor.into())
+    {
+        return Err("checked owning array forwarding types differ from the paired plan".into());
+    }
+    let pair = state.builder.build_call(target, &[parameter.into()], "array_forward")
+        .map_err(builder_error)?.try_as_basic_value().basic().ok_or("missing checked forwarded array pair")?;
+    state.builder.build_return(Some(&pair)).map_err(builder_error)?;
+    Ok(())
+}
+
 pub(super) fn emit_array_descriptor_identity<'ctx>(
     context: &'ctx Context,
     builder: &inkwell::builder::Builder<'ctx>,

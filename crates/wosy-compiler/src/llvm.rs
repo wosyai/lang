@@ -2347,7 +2347,9 @@ fn emit_function<'ctx, 'module>(
     let entry = context.append_basic_block(value, "entry");
     builder.position_at_end(entry);
     let array_descriptor_observer = aggregate_plan.and_then(|plan| plan.array_descriptor_observer);
-    if array_descriptor_observer.is_none() && aggregate_plan.is_some_and(|plan| plan.array_descriptor_identity) {
+    let array_descriptor_forward = aggregate_plan.and_then(|plan| plan.array_descriptor_forward);
+    if array_descriptor_forward.is_none() && array_descriptor_observer.is_none()
+        && aggregate_plan.is_some_and(|plan| plan.array_descriptor_identity) {
         return aggregate_transfer::emit_array_descriptor_identity(context, builder, value);
     }
     if let Some(slot) = aggregate_plan.and_then(|plan| plan.identity_relay) {
@@ -2422,6 +2424,9 @@ fn emit_function<'ctx, 'module>(
         next_literal: 0,
         next_block: 0,
     };
+    if let Some(call) = array_descriptor_forward {
+        return aggregate_transfer::emit_array_descriptor_forward(context, &state, value, function, call);
+    }
     initialize_joined_return_bindings(context, &mut state, joined_bindings)?;
     if let ScalarType::Callable { parameters, .. } = &function.signature {
         for (position, output) in dynamic_return_outputs(function.span, reference_cfg)
@@ -2699,7 +2704,9 @@ fn emit_project_function<'ctx, 'module>(
     let entry = context.append_basic_block(value, "entry");
     builder.position_at_end(entry);
     let array_descriptor_observer = aggregate_plan.and_then(|plan| plan.array_descriptor_observer);
-    if array_descriptor_observer.is_none() && aggregate_plan.is_some_and(|plan| plan.array_descriptor_identity) {
+    let array_descriptor_forward = aggregate_plan.and_then(|plan| plan.array_descriptor_forward);
+    if array_descriptor_forward.is_none() && array_descriptor_observer.is_none()
+        && aggregate_plan.is_some_and(|plan| plan.array_descriptor_identity) {
         return aggregate_transfer::emit_array_descriptor_identity(context, builder, value);
     }
     if let Some(slot) = aggregate_plan.and_then(|plan| plan.identity_relay) {
@@ -2774,6 +2781,9 @@ fn emit_project_function<'ctx, 'module>(
         next_literal: 0,
         next_block: 0,
     };
+    if let Some(call) = array_descriptor_forward {
+        return aggregate_transfer::emit_array_descriptor_forward(context, &state, value, function, call);
+    }
     initialize_joined_return_bindings(context, &mut state, joined_bindings)?;
     if let ScalarType::Callable { parameters, .. } = &function.signature {
         for (position, output) in dynamic_return_outputs(function.span, reference_cfg)

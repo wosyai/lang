@@ -11594,3 +11594,66 @@ if (unsigned_name_lt(9223372036854775808)) { core.system_panic(); };
         }
     }
 }
+
+#[test]
+fn closed_owning_array_forwarders_keep_the_same_full_width_pair_to_cleanup() {
+    let text = "%%start
+u8[](u8[]) inspect = fn(values) {
+    if (core.array_len(&values) < 2) { core.system_panic(); };
+    values
+};
+u8[](u8[]) bridge_one = fn(values) { inspect(values) };
+u8[](u8[]) bridge_two = fn(values) { bridge_one(values) };
+u64(u64) roundtrip = fn(count) {
+    u8[count] bytes;
+    bytes = bridge_two(bytes);
+    core.array_len(&bytes)
+};
+if (roundtrip(2) != 2) { core.system_panic(); };
+if (roundtrip(7) != 7) { core.system_panic(); };
+%%end";
+    let exposed = text.replace("if (roundtrip(2)", "unit(u64) legacy = fn(count) { u8[count] other; other = bridge_one(other); }; legacy(3);
+if (roundtrip(2)");
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        for (closed, text) in [(true, text), (false, exposed.as_str())] {
+            let prepared = prepare_initializer_test(text, layout);
+            let checked = analyze_scalar_build(&prepared);
+            assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+            let source = &prepared.project().modules[0].source;
+            for (project, llvm) in [
+                (false, emit_scalar_build_single_module_llvm(&checked)),
+                (true, emit_scalar_build_project_llvm(&checked)),
+            ] {
+                if !closed {
+                    assert!(matches!(llvm, Err(error) if error.contains("core.array_len requires a closed exact owning formal extent")));
+                    continue;
+                }
+                let llvm = llvm.unwrap().to_text();
+                let symbol = |name| self_tail_test_symbol(source, project, name);
+                for (wrapper, target) in [("bridge_two", "bridge_one"), ("bridge_one", "inspect")] {
+                    let (wrapper, target) = (symbol(wrapper), symbol(target));
+                    let wrapper_body = llvm.split_once(&format!("define internal {{ ptr, i64 }} @{wrapper}({{ ptr, i64 }} %values)"))
+                        .unwrap_or_else(|| panic!("missing sealed wrapper ABI for {wrapper}: {llvm}"))
+                        .1.split_once("\n}").unwrap().0;
+                    assert_eq!(wrapper_body.matches(&format!("%array_forward = call {{ ptr, i64 }} @{target}({{ ptr, i64 }} %values)")).count(), 1, "{wrapper_body}");
+                    assert!(wrapper_body.contains("ret { ptr, i64 } %array_forward"), "{wrapper_body}");
+                    assert!(!wrapper_body.contains("extractvalue") && !wrapper_body.contains("@__wosy_core_free"), "{wrapper_body}");
+                }
+                let inspect = symbol("inspect");
+                let leaf = llvm.split_once(&format!("define internal {{ ptr, i64 }} @{inspect}({{ ptr, i64 }} %values)"))
+                    .expect("sealed observing leaf").1.split_once("\n}").unwrap().0;
+                assert!(leaf.contains("icmp ult i64 %array_formal_extent, 2"), "{leaf}");
+                let caller = self_tail_test_body(&llvm, "i64", &symbol("roundtrip"));
+                assert_eq!(caller.matches("call void @__wosy_core_free(").count(), 1, "{caller}");
+                if let Some(out) = std::env::var_os("WOSY_ARRAY_FORMAL_FORWARD_IR_DIR") {
+                    let target = if layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
+                    let route = if project { "project" } else { "standalone" };
+                    let controlled = llvm.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);
+                    assert_ne!(controlled, llvm);
+                    std::fs::write(std::path::PathBuf::from(out).join(format!("{target}-{route}-control.ll")),
+                        controlled).unwrap();
+                }
+            }
+        }
+    }
+}

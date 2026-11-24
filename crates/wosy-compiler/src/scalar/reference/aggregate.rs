@@ -2950,6 +2950,7 @@ pub(crate) struct ClosedBody {
     pub(crate) array_descriptor_return: bool,
     pub(crate) array_descriptor_identity: bool,
     pub(crate) array_descriptor_observer: Option<ByteSpan>,
+    pub(crate) array_descriptor_forward: Option<usize>,
     // Call occurrence -> its sole exact lexical backing declaration and install.
     pub(crate) array_descriptor_rebinds: BTreeMap<usize, (ByteSpan, usize)>,
     pub(crate) replacement_index_observation: Option<usize>,
@@ -5761,11 +5762,52 @@ fn array_descriptor_identity(body: &Body<'_>) -> Option<Option<ByteSpan>> {
         })).then_some(observing.then_some(formal.span))
 }
 
+#[derive(Clone, Copy)]
+enum ArrayDescriptorRoute {
+    Identity(Option<ByteSpan>),
+    Forward { call: OccurrenceOrdinal, point: CfgPointId },
+}
+
+fn array_descriptor_route(body: &Body<'_>) -> Option<ArrayDescriptorRoute> {
+    if let Some(observer) = array_descriptor_identity(body) {
+        return Some(ArrayDescriptorRoute::Identity(observer));
+    }
+    let facts = body.facts?;
+    let ([formal], [output]) = (body.sites.boundary.parameters.as_slice(), body.sites.boundary.results.as_slice())
+    else { return None };
+    if !body.is_monomorphic || body.cfg.initial_points.len() > 9
+        || facts.array_formal_extent_required || facts.array_invalid
+        || !same_runtime_array_type(&formal.ty, &output.ty) || facts.array_calls.len() != 1
+    {
+        return None;
+    }
+    let (&point, &(call, moved, ref binding)) = facts.array_calls.first_key_value()?;
+    let call_point = body.cfg.initial_points.get(point.0)?;
+    let CfgPointKind::Call { output: 0, target: ResolvedCallTarget::ModuleCallable {
+        concrete: ConcreteCallSelection::Declaration, ..
+    }, argument_points, .. } = &call_point.kind else { return None };
+    let [read] = argument_points.as_slice() else { return None };
+    let [output] = call_point.successors.as_slice() else { return None };
+    let points = &body.cfg.initial_points;
+    (binding.declaration_span == formal.span
+        && matches!(&points[read.0].kind, CfgPointKind::Read { binding: actual } if actual == binding)
+        && points[read.0].successors.as_slice() == [moved]
+        && matches!(&points[moved.0].kind, CfgPointKind::Move { place, owner, .. }
+            if owner == binding && place.binding == *binding && place.projections.is_empty())
+        && points[moved.0].successors.as_slice() == [point]
+        && matches!(&points[output.0].kind, CfgPointKind::ReturnOutput { output: 0, value_point, checked: false } if *value_point == point)
+        && points.iter().all(|node| match &node.kind {
+            CfgPointKind::Entry | CfgPointKind::ScopeEnter | CfgPointKind::ScopeExit | CfgPointKind::Return => true,
+            _ => [*read, moved, point, *output].contains(&node.id),
+        })).then_some(ArrayDescriptorRoute::Forward { call, point })
+}
+
 fn seal_array_descriptor_identities(
     ordinary: &OrdinaryCohorts,
     requests: &[(BodyKey, &Body<'_>, OccurrenceOrdinal)],
     declarations: &HashMap<(&SourceIdentity, ByteSpan), (usize, usize)>,
-    identities: &BTreeMap<BodyKey, Option<ByteSpan>>,
+    routes: &BTreeMap<BodyKey, ArrayDescriptorRoute>,
+    bodies: &BTreeMap<BodyKey, Body<'_>>,
     result: &mut ClosedAggregates,
 ) {
     let mut candidates = HashMap::new();
@@ -5773,39 +5815,104 @@ fn seal_array_descriptor_identities(
         let Some(facts) = body.facts else { continue };
         let Some((call, binding, destination)) = facts.array_rebinds.first_key_value()
             .filter(|_| facts.array_rebinds.len() == 1).map(|(_, proof)| proof) else { continue };
-        let Some(&(ordinal, _, ref source)) = facts.array_calls.get(call) else { continue };
-        let Some(target) = target_body(declarations, body.cfg, *call).filter(|target| identities.contains_key(target))
+        let Some(&(ordinal, moved, ref source)) = facts.array_calls.get(call) else { continue };
+        let points = &body.cfg.initial_points;
+        let Some(target) = target_body(declarations, body.cfg, *call).filter(|target| routes.contains_key(target))
         else { continue };
-        let Some(proof) = result.bodies.get(&caller) else { continue };
-        if source != binding || !body.cfg.allocations.contains(binding)
-            || proof.same_array_rebinds.get(&ordinal.0) != Some(&destination.0)
-            || proof.literal_array.is_some()
-            || !matches!(&body.cfg.initial_points[call.0].kind, CfgPointKind::Call { argument_points, .. }
-                if matches!(argument_points.as_slice(), [read] if matches!(&body.cfg.initial_points[read.0].kind,
-                    CfgPointKind::Read { binding: actual } if actual == binding)))
+        let proved_local = result.bodies.get(&caller).is_some_and(|plan| plan.literal_array.is_some());
+        if source != binding || !body.cfg.allocations.contains(binding) || proved_local
+            || !matches!(&points[call.0].kind, CfgPointKind::Call { argument_points, .. }
+                if matches!(argument_points.as_slice(), [read]
+                    if matches!(&points[read.0].kind, CfgPointKind::Read { binding: actual } if actual == binding)
+                        && points[read.0].successors.as_slice() == [moved]))
+            || !matches!(&points[moved.0].kind, CfgPointKind::Move { place, owner, .. }
+                if owner == binding && place.binding == *binding && place.projections.is_empty())
+            || points[moved.0].successors.as_slice() != [*call]
         {
             continue;
         }
         candidates.insert((caller, ordinal.0), (target, binding.declaration_span, destination.0, observation.0));
     }
-    for (target, observer) in identities {
-        let Some(uses) = ordinary.array_uses.get(target).and_then(Option::as_ref)
-            .filter(|uses| !uses.is_empty()) else { continue };
-        if !uses.iter().all(|site| candidates.get(site).is_some_and(|(actual, ..)| actual == target)) {
-            continue;
+    if candidates.is_empty() { return; }
+    // Each wrapper has at most one outgoing edge. A connected component
+    // with an identity leaf therefore cannot contain a forwarding cycle.
+    // Count exact census admissions while walking incoming edges once, so
+    // many wrappers sharing one leaf do not rescan that leaf's uses.
+    let mut edges = HashMap::new();
+    let mut neighbors = HashMap::<_, Vec<_>>::new();
+    for (&key, route) in routes {
+        if let ArrayDescriptorRoute::Forward { call, point } = route {
+            if let Some(target) = target_body(declarations, bodies[&key].cfg, *point)
+                .filter(|target| routes.contains_key(target))
+            {
+                edges.insert(key, (target, call.0));
+                neighbors.entry(target).or_default().push(key);
+            }
         }
-        if result.bodies.contains_key(target) {
-            continue;
+    }
+    let mut visited = HashSet::new();
+    for &start in routes.keys() {
+        if !visited.insert(start) { continue }
+        let mut component = Vec::new();
+        let mut pending = vec![start];
+        let mut grounded = false;
+        let mut has_local = false;
+        let mut closed = true;
+        let mut expected_forwards = 0;
+        let mut admitted_forwards = HashSet::new();
+        while let Some(key) = pending.pop() {
+            component.push(key);
+            closed &= !result.bodies.contains_key(&key);
+            match routes[&key] {
+                ArrayDescriptorRoute::Identity(_) => grounded = true,
+                ArrayDescriptorRoute::Forward { .. } => {
+                    if let Some(&(target, _)) = edges.get(&key) {
+                        expected_forwards += 1;
+                        if visited.insert(target) { pending.push(target); }
+                    } else {
+                        closed = false;
+                    }
+                }
+            }
+            if let Some(users) = neighbors.get(&key) {
+                for &user in users {
+                    if visited.insert(user) { pending.push(user); }
+                }
+            }
+            if let Some(uses) = ordinary.array_uses.get(&key).and_then(Option::as_ref).filter(|uses| !uses.is_empty()) {
+                for &(caller, call) in uses {
+                    if candidates.get(&(caller, call)).is_some_and(|(target, ..)| *target == key) {
+                        has_local = true;
+                    } else {
+                        if edges.get(&caller) == Some(&(key, call)) {
+                            closed &= admitted_forwards.insert(caller);
+                        } else {
+                            closed = false;
+                        }
+                    }
+                }
+            } else {
+                closed = false;
+            }
         }
-        let definition = result.bodies.entry(*target).or_default();
-        definition.array_descriptor_identity = true;
-        definition.array_descriptor_observer = *observer;
-        for &(caller, call) in uses {
-            let (_, binding, destination, observation) = candidates[&(caller, call)];
-            let plan = result.bodies.get_mut(&caller).expect("proved array rebind caller");
-            plan.array_descriptor_rebinds.insert(call, (binding, destination));
-            plan.array_descriptor_calls.insert(call);
-            plan.replacement_extent_observation = Some(observation);
+        if !(closed && grounded && has_local && admitted_forwards.len() == expected_forwards) { continue }
+        for key in component {
+            let definition = result.bodies.entry(key).or_default();
+            definition.array_descriptor_identity = true;
+            match routes[&key] {
+                ArrayDescriptorRoute::Identity(observer) => definition.array_descriptor_observer = observer,
+                ArrayDescriptorRoute::Forward { call, .. } => definition.array_descriptor_forward = Some(call.0),
+            }
+            let uses = ordinary.array_uses[&key].as_ref().expect("complete descriptor call census");
+            for &(caller, call) in uses {
+                if let Some(&(_, binding, destination, observation)) = candidates.get(&(caller, call)) {
+                    let plan = result.bodies.entry(caller).or_default();
+                    plan.same_array_rebinds.insert(call, destination);
+                    plan.array_descriptor_rebinds.insert(call, (binding, destination));
+                    plan.array_descriptor_calls.insert(call);
+                    plan.replacement_extent_observation = Some(observation);
+                }
+            }
         }
     }
 }
@@ -6294,8 +6401,8 @@ fn closed_aggregates<'a>(
                 });
             let body = Body { facts, cfg, sites, source: input.source, is_monomorphic, supports_input_result };
             if arm.is_none() {
-                if let Some(observer) = array_descriptor_identity(&body) {
-                    array_descriptor_identities.insert(key, observer);
+                if let Some(route) = array_descriptor_route(&body) {
+                    array_descriptor_identities.insert(key, route);
                     ordinary.array_uses.entry(key).or_insert_with(|| Some(Vec::new()));
                 }
             }
@@ -6700,7 +6807,7 @@ fn closed_aggregates<'a>(
         }
 
         seal_array_descriptor_identities(&ordinary, &returned_extent_requirements,
-            &declarations, &array_descriptor_identities, &mut result);
+            &declarations, &array_descriptor_identities, &bodies, &mut result);
         for &(key, source) in &formal_extent_requirements {
             if !result.bodies.get(&key).is_some_and(|plan| plan.array_descriptor_observer.is_some()) {
                 return Err(format!("core.array_len requires a closed exact owning formal extent in {source:?}"));
