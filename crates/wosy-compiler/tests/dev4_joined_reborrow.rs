@@ -11,6 +11,7 @@ enum Expected {
     Valid,
     NullParent,
     LiveConflict,
+    LiveSelectedFieldConflict,
     LiveDescendantConflict,
     LiveFamilyConflict,
     LiveMutableConflict,
@@ -54,13 +55,21 @@ fn check_case(text: &str, expected: Expected, witness_dir: Option<&str>) {
                     }), "{target}/{route}: {diagnostics:?}");
                 }
                 Expected::Declined => assert!(diagnostics.iter().any(|item| item.code == "B0003"), "{target}/{route}: {diagnostics:?}"),
-                Expected::LiveConflict | Expected::LiveDescendantConflict | Expected::LiveFamilyConflict | Expected::LiveMutableConflict | Expected::FrozenMutableConflict => {
-                    let write = if matches!(expected, Expected::FrozenMutableConflict) { "*child = seen + 4" } else { "first = 3" };
+                Expected::LiveConflict | Expected::LiveSelectedFieldConflict | Expected::LiveDescendantConflict | Expected::LiveFamilyConflict | Expected::LiveMutableConflict | Expected::FrozenMutableConflict => {
+                    let write = match expected {
+                        Expected::FrozenMutableConflict => "*child = seen + 4",
+                        Expected::LiveSelectedFieldConflict => "owner.left = 3",
+                        _ => "first = 3",
+                    };
                     let write = text.find(write).expect("conflicting write") as u32;
-                    let frozen = matches!(expected, Expected::FrozenMutableConflict);
-                    // Indirect stores first read the checked holder. The conflict is on
-                    // that operand token, not on the dereference operator or a later read.
-                    let write = write + u32::from(frozen);
+                    let exact_operand = match expected {
+                        // Indirect stores first read their checked holder; a direct
+                        // projected store is diagnosed at its resolved field token.
+                        Expected::FrozenMutableConflict => Some((1, "child".len())),
+                        Expected::LiveSelectedFieldConflict => Some(("owner.".len(), "left".len())),
+                        _ => None,
+                    };
+                    let write = write + exact_operand.map_or(0, |(shift, _)| shift as u32);
                     let loan = match expected {
                         Expected::LiveDescendantConflict => "&(*child)",
                         Expected::LiveFamilyConflict => "&(*left)",
@@ -71,14 +80,14 @@ fn check_case(text: &str, expected: Expected, witness_dir: Option<&str>) {
                     let child = text.find(loan).expect("child reborrow") as u32;
                     assert!(diagnostics.iter().any(|diagnostic| {
                         diagnostic.code == "B0003"
-                            && (!frozen || diagnostic.message == "read or move of unavailable place")
+                            && (exact_operand.is_none() || diagnostic.message == "read or move of unavailable place")
                             && diagnostic.labels.first().is_some_and(|label| {
                                 label.span.range.start == write
-                                    && (!frozen || label.span.range.end == write + "child".len() as u32)
+                                    && exact_operand.is_none_or(|(_, len)| label.span.range.end == write + len as u32)
                             })
                             && diagnostic.labels.iter().skip(1).any(|label| {
                                 label.span.range.start == child
-                                    && (!frozen || label.span.range.end == child + loan.len() as u32)
+                                    && (exact_operand.is_none() || label.span.range.end == child + loan.len() as u32)
                             })
                     }), "{target}/{route}: {diagnostics:?}");
                 }
@@ -125,6 +134,23 @@ fn distinct_joined_shared_child_is_resolved_per_path() {
 #[test]
 fn conditional_null_parent_does_not_issue_a_child_loan() {
     check(&joined("second;", true, "", ""), Expected::NullParent);
+}
+
+#[test]
+fn joined_sibling_scalar_fields_keep_disjoint_place_authority() {
+    let program = joined("parent = &!owner.right;", true, "", "owner.other = 4; u8 observed = *child;")
+        .replace("%%start\n", "%%start\nstruct copy Trio { u8 left; u8 right; u8 other; }\n")
+        .replace("u8 first = 7;\n    u8 second = 9;",
+            "Trio owner = { .left = 7; .right = 9; .other = 0; };")
+        .replace("&!first", "&!owner.left")
+        .replace("    seen\n", "    if (observed == seen && owner.other == 4) { observed } else { 0 }\n");
+    check_case(&program, Expected::Valid, Some("WOSY_JOINED_SIBLING_FIELDS_IR_DIR"));
+    let live = program.replace("owner.other = 4;", "owner.left = 3; owner.other = 4;");
+    assert_ne!(live, program);
+    check(&live, Expected::LiveSelectedFieldConflict);
+    let overlapping = program.replace("&!owner.right", "&!owner.left");
+    assert_ne!(overlapping, program);
+    check(&overlapping, Expected::NullParent);
 }
 
 #[test]

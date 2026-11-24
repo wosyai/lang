@@ -6379,6 +6379,10 @@ fn previous_place_origins(
             .cloned()
             .unwrap_or_default()
     } else {
+        // Retire the same resolved place that the assignment checked for
+        // conflicts. A child's raw dereference projection is not the first
+        // field of the owner, and would overlap every sibling syntactically.
+        let target = available_place_for_check(target);
         state
             .bindings
             .values()
@@ -6386,7 +6390,7 @@ fn previous_place_origins(
             .filter(|origin| match &facts[origin.0] {
                 ReferenceOrigin::Fresh { loan, .. }
                 | ReferenceOrigin::BorrowedFrom { loan, .. } => {
-                    reference_places_overlap(&loan.origin_place, target)
+                    loan_borrows_place(loan, &target, None)
                 }
                 ReferenceOrigin::Null { .. } | ReferenceOrigin::Invalid { .. } => false,
             })
@@ -7239,6 +7243,17 @@ impl JoinedLoanFamily<'_> {
     }
 }
 
+fn joined_direct_lexical_place(place: &ReferencePlaceId) -> bool {
+    match (&place.place, place.projections.as_slice()) {
+        (ScalarPlace::Name { .. }, []) => true,
+        (
+            ScalarPlace::Field { base, field: ScalarFieldReference::Resolved(written), .. },
+            [ReferencePlaceProjection::Field(ScalarFieldReference::Resolved(edge))],
+        ) => matches!(base.as_ref(), ScalarPlace::Name { .. }) && written == edge,
+        _ => false,
+    }
+}
+
 fn checked_joined_reborrow_parent<'a>(
     points: &[ReferenceFlowPoint],
     site: &ReferenceFlowPoint,
@@ -7253,7 +7268,7 @@ fn checked_joined_reborrow_parent<'a>(
     let ReferenceOrigin::Fresh { loan, .. } = facts.get(origin.0)? else { return None };
     let owner = &loan.origin_place;
     if loan.mode != ScalarReferenceMutability::Mutable || loan.parent.is_some()
-        || !owner.projections.is_empty() || !matches!(&owner.place, ScalarPlace::Name { .. })
+        || !joined_direct_lexical_place(owner)
         || owner.binding == *binding || allocations.contains(&owner.binding)
         || !contains_loan_site(&owner.binding, site)
         || !points.get(..pointer.0)?.iter().any(|point|
@@ -8208,7 +8223,7 @@ fn transfer_reference_facts(
                     (Some((left, _)), Some((right, _))) if
                         matches!((&cfg.facts[left.0], &cfg.facts[right.0]),
                             (ReferenceOrigin::Fresh { loan: first, .. }, ReferenceOrigin::Fresh { loan: second, .. })
-                                if first.origin_place.binding != second.origin_place.binding)
+                                if !reference_places_overlap(&first.origin_place, &second.origin_place))
                             => Some([left, right]),
                     _ => None,
                 }
