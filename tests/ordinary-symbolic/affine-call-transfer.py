@@ -902,7 +902,7 @@ state_contextual = f"""%%start
 state_holes = f"""%%start
     unit(i8) check = fn(value) {{
         core.narrow(value == 1 || value == 3, {report(167,"HOLES")});
-        core.require(false, {state_report(168,"UNREPRESENTED","value")});
+        core.require(false, {state_report(168,"ALTERNATIVES","value")});
     }};
     %%end"""
 state_repeated = state_range.replace(
@@ -910,9 +910,9 @@ state_repeated = state_range.replace(
     '.path = "note.txt"; .text = "authored"; }, { .path = "state-copy.json"; .state = value; }',
 )
 state_atomic_report = state_report(
-    169, "NEVER-PUBLISHED", "stable",
+    169, "MULTI-FILE", "stable",
     ', { .path = "note.txt"; .text = "never published"; }, { .path = "later.json"; .state = value; }',
-).replace('.stdout = ""', '.stdout = "NEVER-PUBLISHED"')
+)
 state_atomic = f"""%%start
     unit(i8) check = fn(value) {{
         core.narrow(value == 1 || value == 3, {report(167,"HOLES")});
@@ -922,16 +922,26 @@ state_atomic = f"""%%start
     %%end"""
 cases.extend([
     ("authored-state-repeated-binding",state_repeated,162,b"AUTHORED-RANGE"),
-    ("authored-state-later-unsupported-publishes-nothing",state_atomic,2,b"unsupported analysis"),
+    ("authored-state-multi-file",state_atomic,169,b"MULTI-FILE"),
     ("authored-state-range-and-text",state_range,162,b"AUTHORED-RANGE"),
     ("exact-startup-authored-state-bool",state_bool,163,b"AUTHORED-BOOL"),
     ("exact-startup-authored-state-failed-narrow-prestate",state_narrow,164,b"PRESTATE"),
     ("authored-state-i128-exact",state_i128,165,b"I128"),
     ("authored-state-active-context",state_contextual,166,b"CONTEXT-STATE"),
-    ("authored-state-holes-fail-closed",state_holes,2,b"unsupported analysis"),
+    ("authored-state-mixed",state_holes.replace("value == 1 || value == 3","value == 1 || value >= 3"),168,b"ALTERNATIVES"),
+    ("authored-state-full-bool",state_bool.replace("require(flag,", "require(false,").replace("check(false);", ""),163,b"AUTHORED-BOOL"),
+    ("authored-state-holes",state_holes,168,b"ALTERNATIVES"),
     ("authored-state-accepted-condition-writes-nothing",state_range.replace("value <= 3","value <= 127"),0,b""),
 ])
+holes_bytes = b'{"type":{"kind":"i8"},"value":{"kind":"alternatives","values":[1,3]}}\n'
 authored_files = {
+    "authored-state-holes": {"state.json": holes_bytes},
+    "authored-state-full-bool": {"state.json": b'{"type":{"kind":"bool"},"value":{"kind":"alternatives","values":[false,true]}}\n'},
+    "authored-state-mixed": {"state.json": b'{"type":{"kind":"i8"},"value":{"kind":"alternatives","values":[1,{"kind":"range","minimum":3,"maximum":127}]}}\n'},
+    "authored-state-multi-file": {
+        "state.json": b'{"type":{"kind":"i8"},"value":2}\n',
+        "note.txt": b"never published", "later.json": holes_bytes,
+    },
     "authored-state-range-and-text": {
         "state.json": b'{"type":{"kind":"i8"},"value":{"kind":"range","minimum":4,"maximum":127}}\n',
         "note.txt": b"authored",
@@ -964,8 +974,6 @@ with tempfile.TemporaryDirectory(prefix="affine-calls-") as path:
                 assert not res.stdout,res
                 if code==2:
                     assert expected_stderr in res.stderr,res
-                    if name == "authored-state-later-unsupported-publishes-nothing":
-                        assert b"NEVER-PUBLISHED" not in res.stderr,res
                 else:
                     assert res.stderr==expected_stderr,res
                 files = authored_files.get(name, {}) if included else {}

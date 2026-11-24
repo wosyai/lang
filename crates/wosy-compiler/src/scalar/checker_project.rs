@@ -2279,6 +2279,7 @@ fn render_authored_state(record: &ScalarOrderedCheckerFailure, work: &mut usize)
                     charge_call_work(work, record.witness.axes.len().checked_add(1)?)?;
                     let axis = record.witness.axes.iter().position(|(id, ty)| id == entry.key() && *ty == file.ty)?;
                     let values = record.witness.state.project_axis_bounded(axis, work)?;
+                    charge_call_work(work, values.interval_count())?;
                     let bytes = serialize_scalar_analysis_state(&file.ty, &values)?.into_bytes().into_boxed_slice();
                     entry.insert((file.ty.clone(), bytes))
                 }
@@ -2299,9 +2300,7 @@ fn render_authored_state(record: &ScalarOrderedCheckerFailure, work: &mut usize)
 
 #[cfg(feature = "internal-checker")]
 fn serialize_scalar_analysis_state(ty: &ScalarType, values: &IntegerSet) -> Option<String> {
-    // Do not flatten disjoint or otherwise unrepresented domains into a
-    // wider range. The current vertical emits exact scalars or one interval.
-    if values.interval_count() != 1 { return None; }
+    use std::fmt::Write as _;
     let (min, max) = values.extremes()?;
     let kind = match ty {
         ScalarType::Bool => "bool",
@@ -2313,21 +2312,29 @@ fn serialize_scalar_analysis_state(ty: &ScalarType, values: &IntegerSet) -> Opti
     };
     let mut result = format!(r#"{{"type":{{"kind":"{kind}"}},"value":"#);
     if *ty == ScalarType::Bool {
-        if min != max { return None; }
-        match (min.sign(), min.bits()) {
-            (num_bigint::Sign::NoSign, 0) => result.push_str("false"),
-            (num_bigint::Sign::Plus, 1) => result.push_str("true"),
+        let zero = BigInt::from(0u8);
+        let one = BigInt::from(1u8);
+        if min < &zero || max > &one { return None; }
+        result.push_str(match (min == &zero, max == &one) {
+            (true, true) => r#"{"kind":"alternatives","values":[false,true]}"#,
+            (true, false) => "false",
+            (false, true) => "true",
             _ => return None,
-        }
+        });
     } else {
         let (floor, ceiling) = super::typecheck::integer_bounds(ty)?;
         if min < &floor || max > &ceiling { return None; }
-        if min == max {
-            // Emit the exact decimal JSON number, never round through f64.
-            result.push_str(&min.to_string());
-        } else {
-            result.push_str(&format!(r#"{{"kind":"range","minimum":{min},"maximum":{max}}}"#));
+        let alternatives = values.interval_count() > 1;
+        if alternatives { result.push_str(r#"{"kind":"alternatives","values":["#); }
+        for (i, (lo, hi)) in values.intervals().enumerate() {
+            if i != 0 { result.push(','); }
+            if lo == hi {
+                write!(result, "{lo}").ok()?;
+            } else {
+                write!(result, r#"{{"kind":"range","minimum":{lo},"maximum":{hi}}}"#).ok()?;
+            }
         }
+        if alternatives { result.push_str("]}"); }
     }
     result.push_str("}\n");
     Some(result)
@@ -9428,7 +9435,7 @@ mod tests {
 
     #[cfg(feature = "internal-checker")]
     #[test]
-    fn authored_scalar_state_keeps_exact_types_and_rejects_unrepresented_precision() {
+    fn authored_scalar_state_preserves_exact_types_and_disjoint_alternatives() {
         let maximum = BigInt::from(u128::MAX);
         let singleton = IntegerSet::singleton(&maximum);
         assert_eq!(serialize_scalar_analysis_state(&ScalarType::U128, &singleton).unwrap(),
@@ -9437,8 +9444,11 @@ mod tests {
         assert_eq!(serialize_scalar_analysis_state(&ScalarType::Bool, &boolean).unwrap(),
             "{\"type\":{\"kind\":\"bool\"},\"value\":false}\n");
         let disjoint = boolean.join(IntegerSet::singleton(&BigInt::from(2u8)));
-        assert!(serialize_scalar_analysis_state(&ScalarType::U8, &disjoint).is_none());
-        assert!(serialize_scalar_analysis_state(&ScalarType::Bool, &IntegerSet::ordinary_bool_domain()).is_none());
+        assert_eq!(serialize_scalar_analysis_state(&ScalarType::U8, &disjoint).unwrap().trim_end(),
+            r#"{"type":{"kind":"u8"},"value":{"kind":"alternatives","values":[0,2]}}"#);
+        assert!(serialize_scalar_analysis_state(&ScalarType::Bool, &disjoint).is_none());
+        assert_eq!(serialize_scalar_analysis_state(&ScalarType::Bool, &IntegerSet::ordinary_bool_domain()).unwrap().trim_end(),
+            r#"{"type":{"kind":"bool"},"value":{"kind":"alternatives","values":[false,true]}}"#);
     }
 
     #[cfg(feature = "internal-checker")]
