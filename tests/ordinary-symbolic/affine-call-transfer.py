@@ -875,6 +875,46 @@ def state_report(code, label, selected, extra=""):
     return ('{ .stdout = ""; .stderr = "'+label+'"; .code = '+str(code)
             +'; .files = [{ .path = "state.json"; .state = '+selected+'; }'+extra+']; }')
 
+scalar_local_write = f"""%%start
+    i8(i8) revise = fn(entry) {{
+        i8 current = 2;
+        i8 old = current;
+        current = entry;
+        core.require(old != 2, {state_report(188,"REVISED","old",', { .path = "current.json"; .state = current; }')});
+        current
+    }};
+    i8(i8) forward = fn(entry) {{
+        i8 result = revise(entry);
+        result
+    }};
+    i8 saved = forward(7);
+    core.require(saved != 7, {report(189,"AFTER-WRITE")});
+    %%end"""
+scalar_local_write_direct = scalar_local_write[:scalar_local_write.index("    i8(i8) forward")] + scalar_local_write[
+    scalar_local_write.index("    i8 saved"):].replace("forward(7)","revise(7)")
+scalar_local_write_formal = scalar_local_write.replace(
+    "current = entry;", "core.require(old > 127, " + report(188,"NEVER-SCALAR-WRITE") + "); entry = 7;",
+).replace("i8 current = 2;", "i8 current = entry;")
+scalar_local_write_context = scalar_local_write.replace(
+    "current = entry;", "i8 core.context.count = entry; core.require(old > 127, "
+    + report(188,"NEVER-SCALAR-WRITE") + "); core.context.count = 7;",
+).replace("        current\n", "        core.context.count\n")
+scalar_local_write_bool = f"""%%start
+    i8(i8) revise = fn(entry) {{
+        bool enabled = true;
+        enabled = false;
+        if (enabled) {{ 9 }} else {{ entry }}
+    }};
+    i8 saved = revise(7);
+    core.require(saved != 7, {report(189,"AFTER-BOOL-WRITE")});
+    %%end"""
+cases.extend([
+    ("exact-startup-integer-return-direct-local-write",scalar_local_write_direct,188,b"REVISEDAFTER-WRITE"),
+    ("exact-startup-integer-return-nested-local-write",scalar_local_write,188,b"REVISEDAFTER-WRITE"),
+    ("exact-startup-integer-return-formal-write-refused",scalar_local_write_formal,2,b"unsupported analysis"),
+    ("exact-startup-integer-return-bool-local-write",scalar_local_write_bool,189,b"AFTER-BOOL-WRITE"),
+    ("exact-startup-integer-return-context-write-refused",scalar_local_write_context,2,b"unsupported analysis"),
+])
 scalar_narrow = f"""%%start
     i8(i8) restrict = fn(entry) {{
         core.narrow(entry >= 2, {state_report(185,"NARROW-PRESTATE","entry")});
@@ -1086,6 +1126,10 @@ cases.extend([
 ])
 holes_bytes = b'{"type":{"kind":"i8"},"value":{"kind":"alternatives","values":[1,3]}}\n'
 authored_files = {
+    **{name: {
+        "state.json": b'{"type":{"kind":"i8"},"value":2}\n',
+        "current.json": b'{"type":{"kind":"i8"},"value":7}\n',
+    } for name in ("exact-startup-integer-return-direct-local-write", "exact-startup-integer-return-nested-local-write")},
     "exact-startup-scalar-narrow-leaf-empties-init": {
         "state.json": b'{"type":{"kind":"i8"},"value":1}\n',
     },
@@ -1169,6 +1213,8 @@ with tempfile.TemporaryDirectory(prefix="affine-calls-") as path:
                         assert b"FORMAL-NEVER-PUBLISHED" not in res.stderr,res
                     if name.startswith("exact-startup-ranked-integer-return-"):
                         assert b"BASE" not in res.stderr and b"FRAME" not in res.stderr,res
+                    if name.startswith("exact-startup-integer-return-"):
+                        assert b"NEVER-SCALAR-WRITE" not in res.stderr,res
                 else:
                     assert res.stderr==expected_stderr,res
                 files = authored_files.get(name, {}) if included else {}

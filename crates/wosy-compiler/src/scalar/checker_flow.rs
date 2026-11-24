@@ -1434,6 +1434,8 @@ struct IntegerRoots<'a> {
     #[cfg(feature = "internal-checker")]
     allow_ordinary_affine_overwrites: bool,
     #[cfg(feature = "internal-checker")]
+    exact_returning_local_writes: bool,
+    #[cfg(feature = "internal-checker")]
     allow_ordinary_contextual_places: bool,
     #[cfg(feature = "internal-checker")]
     ordinary_local_work: Option<usize>,
@@ -4974,6 +4976,11 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
             }
             BlockItemKind::Assignment { group } => {
                 #[cfg(feature = "internal-checker")]
+                if roots.exact_returning_local_writes {
+                    path = exact_returning_local_write(calls, roots, group, path)?;
+                    continue;
+                }
+                #[cfg(feature = "internal-checker")]
                 if calls.assignments.get(&(group.block, group.item))?.destinations().len() > 1 {
                     if !COLLECT || USE_IMPORTED_BOUND { return None; }
                     path = ordinary_parallel_assignment(calls, roots, group, path)?;
@@ -5457,6 +5464,13 @@ impl<'a> ExactCallCursor<'a> {
     pub(super) fn allow_empty_integer(&mut self) {
         debug_assert!(self.projected_slot.is_none() && self.projected_pair.is_none());
         self.allow_empty_integer = self.tail.is_some_and(is_integer_type);
+    }
+
+    #[cfg(feature = "internal-checker")]
+    pub(super) fn restrict_returning_writes_to_direct_locals(&mut self) {
+        debug_assert!(self.projected_slot.is_none() && self.projected_pair.is_none());
+        debug_assert!(self.tail.is_some_and(is_integer_type));
+        self.roots.exact_returning_local_writes = true;
     }
 
     pub(super) fn new(calls: &'a FunctionCallSites, exact: &[&BigInt], expected: &ScalarType) -> Option<Self> {
@@ -6219,6 +6233,41 @@ impl IntegerInputs {
         }
         Some(self)
     }
+}
+
+#[cfg(feature = "internal-checker")]
+fn exact_returning_local_write(
+    calls: &FunctionCallSites, roots: &mut IntegerRoots<'_>, position: BlockPosition, mut path: IntegerInputs,
+) -> Option<IntegerInputs> {
+    let (binding, replacement, rhs, destination) = checked_scalar_assignment(calls, position)?;
+    let (axis, ty) = roots.lookup(binding)?;
+    let structure = &calls.structure;
+    if axis < roots.parameters || ty != replacement || !is_integer_type(ty) && *ty != ScalarType::Bool
+        || structure.checked_types.expressions.get(&rhs)? != ty
+        || structure.checker_contextual_occurrences.contains(&destination)
+        || structure.checker_contextual_occurrences.contains(&rhs)
+    {
+        return None;
+    }
+    // This exact startup lane owns a single concrete row. Never fall
+    // through to the general overwrite path's multi-row compaction.
+    let [row] = path.0.as_mut_slice() else { return None; };
+    if row.affine.is_some() || row.entry.is_some() { return None; }
+    row.get(axis)?.singleton_value()?;
+    let work = roots.ordinary_local_work.get_or_insert(0);
+    charge_call_work(work, 4usize.checked_add(row.equal_axes().len().checked_mul(3)?)?)?;
+    let value = if let Some(value) = scalar_call_literal(structure, rhs, ty, true) {
+        Rc::new(IntegerSet::singleton(value))
+    } else {
+        let PlainNameIdentity::Lexical(source) = calls.prepared_plain_name(rhs)? else { return None; };
+        let (source, source_ty) = roots.lookup(source)?;
+        if source_ty != ty { return None; }
+        let value = row.get(source)?;
+        value.singleton_value()?;
+        Rc::clone(value)
+    };
+    row.overwrite(axis, value, false);
+    Some(path)
 }
 
 fn integer_assignment(

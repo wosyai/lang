@@ -444,6 +444,7 @@ impl ActualIntegerObserver for ProofFreeOrderedEvidence {
     const EXACT_SELF_REENTRY: bool = true;
     const EXACT_INTEGER_CALL_CONTINUATIONS: bool = true;
     const EXACT_INTEGER_NARROW_CONTINUATIONS: bool = true;
+    const EXACT_INTEGER_LOCAL_WRITES: bool = true;
     const ORDINARY_INTEGER_LOCALS: bool = true;
 
     fn observe(&mut self, _: (usize, usize), _: &[&BigInt], _: &BigInt) {}
@@ -1355,6 +1356,8 @@ trait ActualIntegerObserver {
     const EXACT_INTEGER_CALL_CONTINUATIONS: bool = false;
     #[cfg(feature = "internal-checker")]
     const EXACT_INTEGER_NARROW_CONTINUATIONS: bool = false;
+    #[cfg(feature = "internal-checker")]
+    const EXACT_INTEGER_LOCAL_WRITES: bool = false;
     const INTEGER_RETURN_PARTITIONS: bool = false;
     const PROJECTED_FORMAL_WRITES: bool = false;
     const ORDINARY_PROJECTED_PAIR: bool = false;
@@ -1589,6 +1592,19 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
         { let _ = (body, expected, collecting); false }
     }
 
+    fn exact_integer_local_write_shape(&self, body: &FunctionCallSites, expected: &ScalarType, collecting: bool) -> bool {
+        #[cfg(feature = "internal-checker")]
+        {
+            ACTUAL_STARTUP && collecting && Observer::EXACT_INTEGER_CALL_CONTINUATIONS
+                && Observer::EXACT_INTEGER_LOCAL_WRITES && is_integer_type(expected)
+                && !body.assignments.is_empty() && body.allocation_length_calls.is_empty()
+                && !body.structure.checker_has_nonsimple_directive
+                && (!body.structure.checker_has_simple_narrow || Observer::EXACT_INTEGER_NARROW_CONTINUATIONS)
+        }
+        #[cfg(not(feature = "internal-checker"))]
+        { let _ = (body, expected, collecting); false }
+    }
+
     fn exact_self_entry<'entry>(&self, exact: Option<&[&'entry BigInt]>) -> Option<&'entry BigInt> {
         if ACTUAL_STARTUP && Observer::EXACT_SELF_REENTRY {
             if let Some([value]) = exact {
@@ -1630,6 +1646,10 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
         let mut cursor = ExactCallCursor::new(body, exact, expected).ok_or(ProjectCheck::Unsupported)?;
         #[cfg(feature = "internal-checker")]
         if self.exact_integer_narrow_profile(collection.is_some()) { cursor.allow_empty_integer(); }
+        #[cfg(feature = "internal-checker")]
+        if self.exact_integer_local_write_shape(body, expected, collection.is_some()) {
+            cursor.restrict_returning_writes_to_direct_locals();
+        }
         self.run_call_cursor(body, source, cursor, self.exact_self_entry(Some(exact)).cloned(), collection)
     }
 
@@ -1756,7 +1776,8 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
         if !matches!(signature.outputs.outputs.as_slice(), [output] if &output.ty == expected)
             || (*expected != ScalarType::Unit && (!Observer::EXACT_INTEGER_CALL_CONTINUATIONS
                 || !(supported_integer_continuation_shape_for(body, expected, Observer::ORDINARY_INTEGER_LOCALS)
-                    || self.exact_integer_narrow_shape(body, expected, collection.is_some()))))
+                    || self.exact_integer_narrow_shape(body, expected, collection.is_some())
+                    || self.exact_integer_local_write_shape(body, expected, collection.is_some()))))
         {
             return Err(ProjectCheck::Unsupported);
         }
@@ -1791,10 +1812,12 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                 target: Some((target, true, effect, Some(projection.caller_axis))),
             });
         }
-        if *expected != ScalarType::Unit && !body.assignments.is_empty() {
+        let restricted_local_writes = self.exact_integer_local_write_shape(body, expected, collection.is_some());
+        if *expected != ScalarType::Unit && !body.assignments.is_empty() && !restricted_local_writes {
             return Err(ProjectCheck::Unsupported);
         }
-        let ranked = self.exact_self_reentry_allowed(expected, collection.is_some());
+        // Mutating integer-return bodies cannot use the ranked self proof.
+        let ranked = !restricted_local_writes && self.exact_self_reentry_allowed(expected, collection.is_some());
         let argument;
         let pair;
         #[cfg(feature = "internal-checker")]
@@ -1836,6 +1859,8 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
         let mut cursor = ExactCallCursor::new(body, exact, expected).ok_or(ProjectCheck::Unsupported)?;
         #[cfg(feature = "internal-checker")]
         if self.exact_integer_narrow_profile(collection.is_some()) { cursor.allow_empty_integer(); }
+        #[cfg(feature = "internal-checker")]
+        if restricted_local_writes { cursor.restrict_returning_writes_to_direct_locals(); }
         if first_activation {
             self.active.insert(target);
         } else {
@@ -1974,6 +1999,7 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             && supported_integer_continuation_shape_for(body, expected, Observer::ORDINARY_INTEGER_LOCALS)
             && body.assignments.is_empty())
             || self.exact_integer_narrow_shape(body, expected, collection.is_some())
+            || self.exact_integer_local_write_shape(body, expected, collection.is_some())
         {
             self.run_exact_calls(body, &owner.source, exact, expected, collection)
         } else if is_integer_type(expected)
@@ -14638,6 +14664,35 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
                 first(2);
             %%end"#);
             assert!(matches!(run("mutual-cycle", &mutual, scope), Err(ProjectCheck::Unsupported)));
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn exact_integer_returns_transfer_local_overwrites_without_mutating_original_aliases() {
+        let original = OUTPUT.replace(".code = 1", ".code = 84");
+        let returned = OUTPUT.replace(".code = 1", ".code = 85");
+        let text = format!(r#"%%start
+            i8(i8) revise = fn(entry) {{
+                i8 current = 2;
+                i8 old = current;
+                current = entry;
+                core.require(old != 2, {original});
+                current
+            }};
+            i8 saved = revise(7);
+            core.require(saved != 7, {returned});
+        %%end"#);
+        let source = source("src/main.w", "exact-scalar-return-local-overwrite");
+        for scope in [ScalarCheckerScope::MainFlowOnly, ScalarCheckerScope::CurrentPackage] {
+            let prepared = prepare_proof_target(&source, &text).unwrap();
+            let receipt = run_closed_without_named_proofs(&prepared, scope, 1).unwrap();
+            let [original, returned] = receipt.directives.as_slice() else { panic!("expected original alias and written return"); };
+            assert_eq!(original.code(), &BigInt::from(84));
+            assert_eq!(returned.code(), &BigInt::from(85));
+            for (axis, value) in [7, 7, 2].map(BigInt::from).iter().enumerate() {
+                assert!(original.witness.intervals_at(0, axis).unwrap().eq([(value, value)]));
+            }
         }
     }
 
