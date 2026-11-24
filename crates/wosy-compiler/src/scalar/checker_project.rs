@@ -1100,6 +1100,15 @@ fn walk_package_initialization<const COLLECT: bool, const PRIVATE_NESTED_SCALAR:
             let value = match (&receiver.ty, &binding.value) {
                 (ScalarType::Bool, ScalarExpression::Boolean { value, .. }) => InitializerValue::Boolean(*value),
                 #[cfg(feature = "internal-checker")]
+                (ty, expression @ ScalarExpression::If { .. }) if (*ty == ScalarType::Bool || is_integer_type(ty))
+                    && COLLECT && actual.permits_authored_startup_scalars() =>
+                {
+                    let Some(value) = selected_startup_scalar(
+                        topology, actual, source, expression, outputs.primary, ty, &storage, failures, visits,
+                    )? else { return Ok(StartupLane::Empty); };
+                    value
+                }
+                #[cfg(feature = "internal-checker")]
                 (ScalarType::Bool, expression) if !matches!(expression, ScalarExpression::Call { .. })
                     && COLLECT && actual.permits_authored_startup_scalars() =>
                 {
@@ -1213,24 +1222,9 @@ fn check_initializer_expression<const COLLECT: bool, const PRIVATE_NESTED_SCALAR
             }
             _ => return Err(ProjectCheck::Unsupported),
         };
-        let value = match topology.initializer_predicates.get(condition) {
-            Some(predicate) => evaluate_initializer_predicate(predicate, storage, allow_authored_startup)
-                .ok_or(ProjectCheck::Unsupported)?,
-            #[cfg(feature = "internal-checker")]
-            None if allow_authored_startup && structure.checked_types.expressions.get(condition) == Some(&ScalarType::Bool)
-                && topology.call_targets.contains_key(condition) =>
-            {
-                match run_scalar_initializer_call(
-                    topology, actual, source, *condition, &ScalarType::Bool, storage, failures, visits,
-                )? {
-                    ActualCallResult::Integer(value) =>
-                        super::checker_flow::bool_result_lane(&value).ok_or(ProjectCheck::Unsupported)? == 1,
-                    ActualCallResult::EmptyScalar => return Ok(StartupLane::Empty),
-                    _ => return Err(ProjectCheck::Unsupported),
-                }
-            }
-            None => return Err(ProjectCheck::Unsupported),
-        };
+        let Some(value) = reached_startup_condition(
+            topology, actual, source, *condition, storage, failures, visits, allow_authored_startup,
+        )? else { return Ok(StartupLane::Empty); };
         let selected = if value { Some(then_block) } else { else_block };
         if let Some(selected) = selected {
             if depth == MAX_INITIALIZER_BRANCH_DEPTH {
@@ -1272,6 +1266,115 @@ fn check_initializer_expression<const COLLECT: bool, const PRIVATE_NESTED_SCALAR
         ActualCallResult::EmptyUnit if COLLECT => Ok(StartupLane::Empty),
         _ => Err(ProjectCheck::Unsupported),
     }
+}
+
+// None is a reached call that pruned the startup lane, not an opaque condition.
+fn reached_startup_condition(
+    topology: &ModuleInitializationTopology,
+    #[cfg_attr(not(feature = "internal-checker"), allow(unused_variables))] actual: &mut CheckedCalls<'_, impl ActualIntegerObserver>,
+    #[cfg_attr(not(feature = "internal-checker"), allow(unused_variables))] source: &SourceIdentity,
+    condition: OccurrenceOrdinal,
+    storage: &HashMap<ByteSpan, InitializerValue<'_>>,
+    #[cfg_attr(not(feature = "internal-checker"), allow(unused_variables))] failures: &mut Option<&mut OrderedFailures>,
+    #[cfg_attr(not(feature = "internal-checker"), allow(unused_variables))] visits: &[InitializationVisit],
+    allow_authored_startup: bool,
+) -> Result<Option<bool>, ProjectCheck> {
+    if let Some(predicate) = topology.initializer_predicates.get(&condition) {
+        return evaluate_initializer_predicate(predicate, storage, allow_authored_startup)
+            .map(Some).ok_or(ProjectCheck::Unsupported);
+    }
+    #[cfg(feature = "internal-checker")]
+    if allow_authored_startup && topology.structure.checked_types.expressions.get(&condition) == Some(&ScalarType::Bool)
+        && topology.call_targets.contains_key(&condition)
+    {
+        return match run_scalar_initializer_call(
+            topology, actual, source, condition, &ScalarType::Bool, storage, failures, visits,
+        )? {
+            ActualCallResult::Integer(value) => super::checker_flow::bool_result_lane(&value)
+                .map(|lane| Some(lane == 1)).ok_or(ProjectCheck::Unsupported),
+            ActualCallResult::EmptyScalar => Ok(None),
+            _ => Err(ProjectCheck::Unsupported),
+        };
+    }
+    Err(ProjectCheck::Unsupported)
+}
+
+#[cfg(feature = "internal-checker")]
+fn selected_startup_scalar<'a>(
+    topology: &ModuleInitializationTopology,
+    actual: &mut CheckedCalls<'_, impl ActualIntegerObserver>,
+    source: &SourceIdentity,
+    mut expression: &'a ScalarExpression,
+    mut occurrence: OccurrenceOrdinal,
+    expected: &'a ScalarType,
+    storage: &HashMap<ByteSpan, InitializerValue<'_>>,
+    failures: &mut Option<&mut OrderedFailures>,
+    visits: &[InitializationVisit],
+) -> Result<Option<InitializerValue<'a>>, ProjectCheck> {
+    // Follow only the reached scalar arm. Do not walk an unselected block,
+    // and never interpret statements or output groups as scalar tails.
+    let mut remaining = MAX_INITIALIZER_BRANCH_DEPTH;
+    while let ScalarExpression::If { then_branch, else_branch, .. } = expression {
+        if remaining == 0 { return Err(ProjectCheck::Unsupported); }
+        remaining -= 1;
+        let Some(ConditionalRegion::Value { condition, then_block, else_block, .. }) =
+            topology.conditionals.get(&occurrence) else { return Err(ProjectCheck::Unsupported); };
+        if topology.structure.conditional_output_projections.get(&occurrence)
+            .is_some_and(|outputs| outputs.types.as_slice() != std::slice::from_ref(expected))
+        {
+            return Err(ProjectCheck::Unsupported);
+        }
+        let Some(taken) = reached_startup_condition(topology, actual, source, *condition,
+            storage, failures, visits, true)? else { return Ok(None); };
+        let (ast, selected) = if taken { (then_branch, then_block) } else { (else_branch, else_block) };
+        let block = topology.structure.blocks.get(selected.0).ok_or(ProjectCheck::MissingRootOccurrences)?;
+        let [item] = block.items.as_slice() else { return Err(ProjectCheck::Unsupported); };
+        let BlockItemKind::FinalOutput(slot) = &item.kind else { return Err(ProjectCheck::Unsupported); };
+        if slot.output != 0 || ast.unsafe_context || ast.items.len() != 1 || ast.final_output_values.len() != 1 {
+            return Err(ProjectCheck::Unsupported);
+        }
+        let (tail, _) = ast.final_expressions().next().ok_or(ProjectCheck::Unsupported)?;
+        expression = tail;
+        occurrence = slot.expression;
+        if topology.structure.checked_types.expressions.get(&occurrence) != Some(expected) {
+            return Err(ProjectCheck::Unsupported);
+        }
+    }
+
+    let value = match expression {
+        ScalarExpression::Boolean { value, .. } if *expected == ScalarType::Bool => InitializerValue::Boolean(*value),
+        ScalarExpression::Name { .. } => {
+            let Some(InitializationName::Storage(InitializationStorage::Module(span))) =
+                topology.identities.names.get(&occurrence) else { return Err(ProjectCheck::Unsupported); };
+            match storage.get(span).ok_or(ProjectCheck::Unsupported)? {
+                InitializerValue::Boolean(value) if *expected == ScalarType::Bool => InitializerValue::Boolean(*value),
+                InitializerValue::Integer { ty, value } if *ty == expected =>
+                    InitializerValue::Integer { ty: expected, value: Cow::Owned(value.as_ref().clone()) },
+                _ => return Err(ProjectCheck::Unsupported),
+            }
+        }
+        ScalarExpression::Call { .. } => {
+            let value = match run_scalar_initializer_call(
+                topology, actual, source, occurrence, expected, storage, failures, visits,
+            )? {
+                ActualCallResult::Integer(value) => value,
+                ActualCallResult::EmptyScalar => return Ok(None),
+                _ => return Err(ProjectCheck::Unsupported),
+            };
+            if *expected == ScalarType::Bool {
+                let lane = super::checker_flow::bool_result_lane(&value).ok_or(ProjectCheck::Unsupported)?;
+                InitializerValue::Boolean(lane == 1)
+            } else {
+                InitializerValue::Integer { ty: expected, value: Cow::Owned(value) }
+            }
+        }
+        _ if is_integer_type(expected) => {
+            let value = concrete_integer_literal(expression).ok_or(ProjectCheck::Unsupported)?;
+            InitializerValue::Integer { ty: expected, value }
+        }
+        _ => return Err(ProjectCheck::Unsupported),
+    };
+    Ok(Some(value))
 }
 
 // A stored scalar and a reached condition consume the same exact call
@@ -10069,6 +10172,41 @@ mod tests {
             &HashMap::new(), narrow, 0, &mut failures, &[InitializationVisit::Started]),
             Err(ProjectCheck::Unsupported)));
         assert!(effects.records.is_empty());
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn startup_conditional_scalar_binding_continues_only_selected_output() {
+        let app = source("src/main.w", "startup-conditional-scalar");
+        let program = r#"%%start
+            i8(i8) step = fn(value) {
+                core.require(value != 37, { .stdout = ""; .stderr = "producer"; .code = 45; .files = []; });
+                value
+            };
+            bool ready = true;
+            bool chosen = if (ready) { ready } else { false };
+            i8 status = if (chosen) { if (ready) { step(37) } else { 8 } } else {
+                core.require(false, { .stdout = ""; .stderr = "opaque arm"; .code = 19; .files = []; });
+                19
+            };
+            core.require(false, { .stdout = ""; .stderr = "after"; .code = status;
+                .files = [{ .path = "status.json"; .state = status; }]; });
+        %%end"#;
+        for scope in [ScalarCheckerScope::MainFlowOnly, ScalarCheckerScope::CurrentPackage] {
+            let run = |text: &str| {
+                let prepared = prepare_proof_target(&app, text).unwrap();
+                run_closed_without_named_proofs(&prepared, scope, 1)
+            };
+            let receipt = run(program).unwrap();
+            let [first, last] = receipt.directives.as_slice() else { panic!("producer then selected result"); };
+            assert_eq!(first.code(), &BigInt::from(45));
+            assert_eq!(last.code(), &BigInt::from(37));
+            assert_eq!(last.files()[0].text.as_ref(), b"{\"type\":{\"kind\":\"i8\"},\"value\":37}\n");
+            let empty = run(&program.replace("core.require(value", "core.narrow(value")).unwrap();
+            let [failure] = empty.directives.as_slice() else { panic!("producer emptied selected output"); };
+            assert_eq!(failure.code(), &BigInt::from(45));
+            assert!(matches!(run(&program.replace("ready = true", "ready = false")), Err(ProjectCheck::Unsupported)));
+        }
     }
 
     #[cfg(feature = "internal-checker")]

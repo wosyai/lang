@@ -1443,6 +1443,25 @@ cases.extend([
     ("exact-startup-module-typed-narrow-prestate",module_authored_output.replace("core.require(status","core.narrow(status"),37,b"MODULE-STATE"),
     ("exact-startup-module-success-skips-state",module_authored_output.replace("core.require(status != 37","core.require(status == 37"),200,b"AFTER-MODULE-STATE"),
 ])
+startup_conditional_scalar = f"""%%start
+    i8(i8) step = fn(value) {{
+        core.require(value != 37, {report(45,"VALUE-PRODUCER")});
+        value
+    }};
+    bool ready = true;
+    bool chosen = if (ready) {{ ready }} else {{ false }};
+    i8 status = if (chosen) {{ if (ready) {{ step(37) }} else {{ 8 }} }} else {{
+        core.require(false, {report(19,"OPAQUE-ARM")});
+        19
+    }};
+    core.require(false, {{ .stdout = ""; .stderr = "VALUE-STORED"; .code = status;
+        .files = [{{ .path = "status.json"; .state = status; }}]; }});
+    %%end"""
+cases.extend([
+    ("exact-startup-conditional-scalar-binding",startup_conditional_scalar,45,b"VALUE-PRODUCERVALUE-STORED"),
+    ("exact-startup-conditional-scalar-binding-empty",startup_conditional_scalar.replace("core.require(value","core.narrow(value"),45,b"VALUE-PRODUCER"),
+    ("exact-startup-conditional-scalar-binding-opaque",startup_conditional_scalar.replace("ready = true","ready = false"),2,b"unsupported analysis"),
+])
 mixed_startup_unit_storage = f"""%%start
     unit(bool, i8) release = fn(enabled, code) {{
         core.narrow(enabled, {{ .stdout = ""; .stderr = "UNIT-EMPTY"; .code = code;
@@ -1679,6 +1698,7 @@ nested_array_bytes = state_bytes({
     },
 })
 authored_files = {
+    "exact-startup-conditional-scalar-binding": {"status.json": b'{"type":{"kind":"i8"},"value":37}\n'},
     "exact-startup-unit-mixed-storage-empty": {"gate.json": b'{"type":{"kind":"bool"},"value":false}\n'},
     "exact-startup-bool-condition-call-empty": {"state.json": b'{"type":{"kind":"bool"},"value":false}\n'},
     "exact-startup-computed-bool-binding-true": {"answer.json": b'{"type":{"kind":"bool"},"value":true}\n'},
