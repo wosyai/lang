@@ -2065,23 +2065,26 @@ impl<'a> ReferenceFlowBuilder<'a> {
                                     Some(PlainNameIdentity::Lexical(expected)) if expected == binding) =>
                                 Some((point, local_effect.is_some())),
                             CfgPointKind::Borrow { place, loan }
-                                if !effect.descriptor && matches!(target, ResolvedCallTarget::ModuleCallable { .. })
+                                if matches!(target, ResolvedCallTarget::ModuleCallable { .. })
                                     && loan.mode == ScalarReferenceMutability::Shared && loan.parent.is_none()
                                     && loan.origin_place == *place =>
                             {
                                 let ScalarExpression::CheckedAddress {
                                     mutability: ScalarReferenceMutability::Shared,
-                                    place: written @ ScalarPlace::Field {
-                                        base, field: ScalarFieldReference::Resolved(_), ..
-                                    }, span: written_span,
+                                    place: written, span: written_span,
                                 } = arguments.get(effect.parameter)? else { return None };
-                                let ScalarPlace::Name { span, .. } = base.as_ref() else { return None };
+                                let (ScalarPlace::Name { span, .. }, projections) = (match written {
+                                    named @ ScalarPlace::Name { .. } if effect.descriptor => (named, 0),
+                                    ScalarPlace::Field { base, field: ScalarFieldReference::Resolved(_), .. }
+                                        if !effect.descriptor => (base.as_ref(), 1),
+                                    _ => return None,
+                                }) else { return None };
                                 let place_ordinal = self.place_ordinal(
                                     OccurrenceParent::Expression(argument), OccurrenceEdge::ExpressionPlace,
                                 );
                                 let root = self.place_root(written, place_ordinal);
                                 (actual.source_span.range == *written_span && place.place == *written
-                                    && place.projections.len() == 1
+                                    && place.projections.len() == projections
                                     && matches!(self.prepared_place_root(root.ordinal, *span).ok().flatten(),
                                         Some(PreparedPlaceRoot::Lexical(binding)) if binding == &place.binding))
                                     .then_some((point, false))

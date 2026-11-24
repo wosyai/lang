@@ -1564,7 +1564,9 @@ fn direct_scalar_descriptor_reader_preserves_backing_without_slot_authority() {
         .replace("*u64 view = &packet.length;", "*Packet view = &packet;")
         .replace("    read_length(view)", "    read_length(view) + 1");
     for (target, target_layout) in [("native64", ScalarTargetLayout::NATIVE64), ("wasm32", ScalarTargetLayout::WASM32)] {
-        for route in ["single", "project", "import"] {
+        for (route, immediate) in ["single", "project", "import"].into_iter()
+            .flat_map(|route| [(route, false), (route, true)])
+        {
             let external = route == "import";
             let emit = |reader: &str, slot: bool| {
                 let reader_text = format!("%%start\n{record}\n{reader}\n%%end");
@@ -1577,6 +1579,15 @@ fn direct_scalar_descriptor_reader_preserves_backing_without_slot_authority() {
                         "    u64(*Packet) slot = read_length;\n    slot(view)")
                 } else {
                     base.replace(direct, reader)
+                };
+                let main = if immediate {
+                    let named = if external { "*reader.Packet" } else { "*Packet" };
+                    let rewritten = main.replace(&format!("    {named} view = &packet;\n"), "")
+                        .replace("read_length(view)", "read_length(&packet)");
+                    assert_ne!(rewritten, main);
+                    rewritten
+                } else {
+                    main
                 };
                 let root = declarations(&app, &main);
                 let (rows, sources) = if external {
@@ -1622,13 +1633,14 @@ fn direct_scalar_descriptor_reader_preserves_backing_without_slot_authority() {
             assert_eq!(seen, ["allocate", "read", "release"], "{target}/{route}: {ir}");
             assert!(emit(fallback, false).expect_err("signature alone cannot authorize a descriptor loan")
                 .contains("aggregate owning receipt has an unproved checked loan"));
-            if !external {
+            if !external && !immediate {
                 let error = emit(direct, true).expect_err("direct descriptor reader certificate cannot authorize a slot");
                 assert!(error.contains("aggregate owning receipt has an unproved checked loan")
                     || error.contains("local callable slot requires a proved direct scalar target"), "{error}");
             }
             if let Some(out) = std::env::var_os("WOSY_RECEIPT_FIELD_IR_DIR") {
-                let out = std::path::PathBuf::from(out).join(format!("descriptor-{route}"));
+                let shape = if immediate { "-immediate" } else { "" };
+                let out = std::path::PathBuf::from(out).join(format!("descriptor-{route}{shape}"));
                 std::fs::create_dir_all(&out).unwrap();
                 let mut witness = ir.replace("@main(", "@wosy_authored_main(");
                 witness.push_str(&format!("\ndefine i64 @wosy_field_witness() {{\nentry:\n  %v = call i64 @{}()\n  ret i64 %v\n}}\n", symbol("field_witness")));
