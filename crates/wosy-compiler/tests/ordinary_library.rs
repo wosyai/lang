@@ -1114,6 +1114,47 @@ fn selected_holder_ends_before_two_independent_owner_recommits() {
 }
 
 #[test]
+fn projected_recursive_holder_retires_only_the_replaced_lane() {
+    let app = source("workbench", "src/projected_recursive_holder.w");
+    let text = include_str!("fixtures/projected-recursive-holder.w");
+    for (target, target_layout) in [
+        ("native64", ScalarTargetLayout::NATIVE64),
+        ("wasm32", ScalarTargetLayout::WASM32),
+    ] {
+        let prepared = prepare_scalar_project(
+            vec![(declarations(&app, text), Vec::new())], vec![app.clone()],
+            ScalarPreparationInputs { target_layout },
+        ).unwrap_or_else(|error| panic!("{target}: {:?}", error.diagnostics));
+        let build = analyze_scalar_build(&prepared);
+        assert!(build.diagnostics().is_empty(), "{target}: {:?}", build.diagnostics());
+        let ir = emit_scalar_build_project_llvm(&build).unwrap_or_else(|error| panic!("{target}: {error}")).to_text();
+        let context = Context::create();
+        let buffer = MemoryBuffer::create_from_memory_range_copy(ir.as_bytes(), target);
+        let module = context.create_module_from_ir(buffer).unwrap();
+        module.verify().unwrap();
+        let frame = function_with_suffix(&module, "frame");
+        let reader = function_with_suffix(&module, "read_selected");
+        let calls = direct_calls(&module, &frame);
+        let selected: Vec<_> = calls.iter().map(String::as_str).filter(|name|
+            [frame.as_str(), reader.as_str(), "__wosy_core_alloc", "__wosy_core_free"].contains(name)
+        ).collect();
+        assert_eq!(selected, ["__wosy_core_alloc", frame.as_str(), reader.as_str(),
+            reader.as_str(), "__wosy_core_free"], "{target}: {ir}");
+
+        if let Some(out) = std::env::var_os("WOSY_PROJECTED_HOLDER_IR_DIR") {
+            let mut ir = ir.replace("@main(", "@wosy_authored_main(");
+            for name in ["frame_zero", "frame_two", "frame_three"] {
+                let symbol = function_with_suffix(&module, name);
+                ir.push_str(&format!(
+                    "\ndefine i8 @wosy_{name}() {{\nentry:\n  %result = call i8 @{symbol}()\n  ret i8 %result\n}}\n"
+                ));
+            }
+            std::fs::write(std::path::PathBuf::from(out).join(format!("{target}.ll")), ir).unwrap();
+        }
+    }
+}
+
+#[test]
 fn runtime_array_recommit_keeps_the_owner_until_its_real_end() {
     let recursive = r#"
 (u8[], u64)(u8[], u64, u64) carry = fn(bytes, depth, count) {
