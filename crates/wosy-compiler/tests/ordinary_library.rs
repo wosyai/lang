@@ -1245,7 +1245,18 @@ fn structured_recursive_base_can_transfer_its_branch_local_allocation() {
     let text = format!("{before}{after}").replace("Packet selected = make_alt(length); selected", local);
     assert!(!text.contains("make_alt"));
     let all_local = include_str!("fixtures/structured-local-factory.w");
-    for (text, all_local) in [(text.as_str(), false), (all_local, true)] {
+    let bind_result = |source: &str, first_condition: &str| {
+        let bound = source.replacen(first_condition, &first_condition.replacen("if", "Packet chosen = if", 1), 1)
+            .replacen("\n    }\n};\nu64(u64, bool) drive", "\n    };\n    chosen\n};\nu64(u64, bool) drive", 1);
+        assert_eq!(bound.matches("Packet chosen = if").count(), 1);
+        assert_eq!(bound.matches("\n    chosen\n").count(), 1);
+        bound
+    };
+    let bound_recursive = bind_result(&text, "    if (depth == 0)");
+    let bound_all_local = bind_result(all_local, "    if (choose");
+    for (text, all_local, bound) in [(text.as_str(), false, false), (all_local, true, false),
+        (bound_recursive.as_str(), false, true), (bound_all_local.as_str(), true, true)]
+    {
         for (target, target_layout) in [("native64", ScalarTargetLayout::NATIVE64), ("wasm32", ScalarTargetLayout::WASM32)] {
             for project in [false, true] {
                 let emit = |text: &str| {
@@ -1305,6 +1316,7 @@ fn structured_recursive_base_can_transfer_its_branch_local_allocation() {
                         (true, true) => "all-local-project", (true, false) => "all-local-single",
                         (false, true) => "local-project", (false, false) => "local-single",
                     };
+                    let route = if bound { format!("bound-{route}") } else { route.to_owned() };
                     let out = std::path::PathBuf::from(out).join(route);
                     std::fs::create_dir_all(&out).unwrap();
                     let mut witness = ir.replace("@main(", "@wosy_authored_main(");
@@ -1312,6 +1324,12 @@ fn structured_recursive_base_can_transfer_its_branch_local_allocation() {
                         witness.push_str(&format!("\ndefine i64 @wosy_{name}() {{\nentry:\n  %v = call i64 @{}()\n  ret i64 %v\n}}\n", symbol(name)));
                     }
                     std::fs::write(out.join(format!("{target}.ll")), witness).unwrap();
+                }
+                if bound {
+                    let interrupted = text.replace("\n    chosen\n", "\n    chosen.length;\n    chosen\n");
+                    assert_ne!(interrupted, text);
+                    assert!(emit(&interrupted).expect_err("the conditional binding must be immediately returned")
+                        .contains("structured aggregate return is not closed on every result path"));
                 }
                 let plain = if all_local {
                     text.replacen("\n        packet\n",

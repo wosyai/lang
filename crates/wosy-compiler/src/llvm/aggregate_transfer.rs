@@ -771,6 +771,24 @@ pub(super) fn store_received_binding<'ctx>(
     binding: &ScalarBinding,
     value: &EmitValue<'ctx>,
 ) -> Result<bool, String> {
+    if let Some(aggregate) = state.aggregate.as_mut() {
+        if let Some((block, item, conditional)) = aggregate.plan.structured_result_binding {
+            let nodes = state.body_call_nodes.ok_or("missing structured result binding occurrences")?;
+            if nodes.binding_position(binding) == Some((block, item)) {
+                let [receiver] = binding.receivers.as_slice() else { return Err("invalid structured result receiver".into()) };
+                let EmitValue::Basic(BasicValueEnum::PointerValue(base)) = value else { return Err("missing joined result backing at binding".into()) };
+                if nodes.expression_ordinal(&binding.value) != Some(conditional) || !matches!(receiver.ty, ScalarType::Struct(_)) {
+                    return Err("changed structured result binding".into());
+                }
+                let destination = aggregate.destination.ok_or("missing structured result destination at binding")?;
+                aggregate.set_base(*base)?;
+                // The conditional arms already wrote the ordinary descriptor.
+                // Bind its storage, not the separate original backing SSA token.
+                state.storage.insert(receiver.name.clone(), (destination, receiver.ty.clone()));
+                return Ok(true);
+            }
+        }
+    }
     match call_action(state, &binding.value) {
         Some((_, ClosedCall::Forward)) if binding.receivers.len() == 2 => {
             if !forwarded_mixed_return(state) || !matches!(value, EmitValue::Unit) {
@@ -1531,7 +1549,13 @@ pub(super) fn commit_return<'ctx>(
         {
             return Err("structured aggregate result changed its proved output tree".into());
         }
-        aggregate.set_base(*base)?;
+        if aggregate.plan.structured_result_binding.is_some() {
+            if aggregate.destination != Some(*base) || aggregate.base.is_none() {
+                return Err("structured result name did not read its bound descriptor".into());
+            }
+        } else {
+            aggregate.set_base(*base)?;
+        }
         aggregate.committed = true;
         return Ok(());
     }

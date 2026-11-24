@@ -2612,6 +2612,7 @@ pub(crate) struct ClosedBody {
     pub(crate) checked_backing_optional: bool,
     pub(crate) returning: Option<ClosedReturn>,
     mixed_branch_return: Option<Box<MixedBranchReturn>>,
+    pub(crate) structured_result_binding: Option<(usize, usize, usize)>, // block, item, conditional
     pub(crate) local_result_arms: BTreeMap<usize, (usize, usize)>, // block -> (allocation item, output)
     pub(crate) named_result_arms: BTreeMap<usize, (usize, usize)>, // block -> (output, producer)
     pub(crate) ordinary_result: bool,
@@ -2708,6 +2709,7 @@ struct StructuredOwnerReturn {
     local: BTreeMap<usize, (usize, OccurrenceOrdinal)>,
     named: BTreeMap<CfgPointId, (BlockOrdinal, OccurrenceOrdinal)>,
     output: OccurrenceOrdinal,
+    binding: Option<(BlockOrdinal, usize, OccurrenceOrdinal)>,
     leaves: BTreeSet<CfgPointId>,
     complete: bool,
 }
@@ -2749,12 +2751,15 @@ impl Body<'_> {
             (output.output == 0 && outputs.next().is_none()).then_some(output.expression)
         };
         let output = output_at(structure.root)?;
-        if !matches!(self.sites.conditionals.get(&output), Some(ConditionalRegion::Value { .. })) {
-            return None;
-        }
-        let mut result = StructuredOwnerReturn { local: BTreeMap::new(), named: BTreeMap::new(), output, leaves: BTreeSet::new(), complete: true };
+        let (conditional, binding, complete) = if matches!(self.sites.conditionals.get(&output), Some(ConditionalRegion::Value { .. })) {
+            (output, None, true)
+        } else {
+            let (conditional, item, exact) = self.structured_root_binding(output, &ty.ty)?;
+            (conditional, Some((structure.root, item, conditional)), exact)
+        };
+        let mut result = StructuredOwnerReturn { local: BTreeMap::new(), named: BTreeMap::new(), output, binding, leaves: BTreeSet::new(), complete };
         let calls: BTreeMap<_, _> = facts.calls.iter().map(|(&point, &ordinal)| (ordinal.0, point)).collect();
-        let mut pending = vec![(structure.root, output, 0)];
+        let mut pending = vec![(structure.root, conditional, 0)];
         while let Some((block, expression, depth)) = pending.pop() {
             if depth > MAX_RECEIPT_FORK_DEPTH { result.complete = false; }
             if let Some(ConditionalRegion::Value { then_block, else_block, .. }) = self.sites.conditionals.get(&expression) {
@@ -2777,6 +2782,47 @@ impl Body<'_> {
             }
         }
         Some(result)
+    }
+
+    fn structured_root_binding(
+        &self, output: OccurrenceOrdinal, ty: &ScalarType,
+    ) -> Option<(OccurrenceOrdinal, usize, bool)> {
+        let structure = &self.sites.structure;
+        let PlainNameIdentity::Lexical(identity) = self.sites.prepared_plain_name(output)? else { return None };
+        let items = &structure.blocks.get(structure.root.0)?.items;
+        let (conditional, item) = items.iter().rev().find_map(|item| {
+            let BlockItemKind::Binding(binding) = &item.kind else { return None };
+            let [receiver] = binding.receivers() else { return None };
+            let BindingInitialization::Outputs(init) = &binding.initialization else { return None };
+            (receiver.span == identity.declaration_span && &receiver.ty == ty && init.secondary.is_empty()
+                && matches!(self.sites.conditionals.get(&init.primary), Some(ConditionalRegion::Value { .. }))
+                && structure.checked_types.expressions.get(&init.primary) == Some(ty))
+                .then_some((init.primary, item.position))
+        })?;
+        let exact = (|| {
+            if items.len().checked_sub(2)? != item { return None; }
+            let points = &self.cfg.points;
+            let scope = points.first()?.scope;
+            let region = self.facts?.conditional_input_regions.values().find(|region| region.expression == conditional)?;
+            let join = points.get(region.join.0)?;
+            let next = |point: &ReferenceFlowPoint| points.get(linear_successor(points, point.id)?.0)
+                .filter(|next| next.scope == scope);
+            let installed = next(join)?;
+            let read = next(installed)?;
+            let moved = next(read)?;
+            let returned = next(moved)?;
+            let span = self.sites.occurrences.get(output.0)?.span;
+            (join.scope == scope && join.source_span.range == self.sites.occurrences.get(conditional.0)?.span
+                && matches!(join.kind, CfgPointKind::Join | CfgPointKind::ConditionalOutput { .. })
+                && matches!(&installed.kind, CfgPointKind::Bind { binding } if binding == identity)
+                && read.source_span.range == span && moved.source_span.range == span
+                && matches!(&read.kind, CfgPointKind::Read { binding } if binding == identity)
+                && matches!(&moved.kind, CfgPointKind::Move { owner, place, ty: moved_ty }
+                    if owner == identity && place.binding == *identity && place.projections.is_empty() && moved_ty == ty)
+                && matches!(returned.kind, CfgPointKind::ReturnOutput { output: 0, value_point, checked: false }
+                    if value_point == read.id)).then_some(())
+        })().is_some();
+        Some((conditional, item, exact))
     }
 
     fn structured_local_allocation(&self, block: BlockOrdinal, terminal: OccurrenceOrdinal, ty: &ScalarType) -> Option<usize> {
@@ -4828,6 +4874,8 @@ fn closed_aggregates<'a>(
         let mut plan = result.bodies.remove(&key).unwrap_or_default();
         plan.returning = return_route;
         if matches!(return_route, Some(ClosedReturn::Structured { .. })) {
+            plan.structured_result_binding = structured_returns[&key].binding
+                .map(|(block, item, conditional)| (block.0, item, conditional.0));
             plan.local_result_arms.extend(structured_returns[&key].local.iter()
                 .map(|(block, (item, output))| (*block, (*item, output.0))));
         }
