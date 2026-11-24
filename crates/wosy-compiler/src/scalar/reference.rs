@@ -373,6 +373,7 @@ enum ExpressionReadMode {
     GuardedStructInitializer,
     FallibleAliasInitializer,
     DereferenceOperand,
+    ArrayLengthArgument,
 }
 
 const MAX_JOINED_REBORROW_PARENTS: usize = 4;
@@ -414,6 +415,7 @@ pub(super) struct ReferenceFlowBuilder<'a> {
     pub(super) dereference_points: HashMap<OccurrenceOrdinal, CfgPointId>,
     origin_index: ReferenceOriginIndex,
     pub(super) cfg: ScalarReferenceCfg,
+    widened_arrays: Option<HashSet<ReferenceBindingId>>,
     pub(super) next_scope: usize,
     pub(super) cursor: Option<CfgPointId>,
 }
@@ -521,6 +523,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
             && call_sites.boundary.parameters.iter().all(|slot| aggregate::ordinary_value(&slot.ty));
         Self {
             capture_call_points: false,
+            widened_arrays: None,
             root_return_points: 0..0,
             mixed_owners: None,
             shared_scalar_read_effects: None,
@@ -1927,9 +1930,14 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 for (position, argument) in arguments.iter().enumerate() {
                     let ordinal =
                         self.expression_ordinal(parent, OccurrenceEdge::CallArgument(position));
-                    self.expression(argument, scope, ordinal)?;
+                    let array_length = target == ResolvedCallTarget::Core(CoreOperationId::ArrayLen);
+                    if array_length {
+                        self.expression_with_read_mode(argument, scope, ordinal, ExpressionReadMode::ArrayLengthArgument)?;
+                    } else {
+                        self.expression(argument, scope, ordinal)?;
+                    }
                     argument_points.push(self.cursor.expect("evaluated call argument"));
-                    if target == ResolvedCallTarget::Core(CoreOperationId::ArrayLen) {
+                    if array_length {
                         let Some(CfgPointKind::Borrow { place, .. }) =
                             self.cursor.map(|id| &self.cfg.points[id.0].kind)
                         else {
@@ -3066,6 +3074,11 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         };
                     let mut projections = Vec::new();
                     collect_reference_projections(proof_place.as_ref(), parent_loan.as_ref(), &mut projections);
+                    if self.widened_arrays.as_ref().is_some_and(|owners| owners.contains(&binding))
+                        && !matches!(read_mode, ExpressionReadMode::ArrayLengthArgument)
+                    {
+                        return Err(self.missing_context(span, ReferenceAnalysisErrorReason::UnprovedWidenedArrayTransfer));
+                    }
                     let loan = ReferenceLoanId {
                         mode: *mutability,
                         origin_place: ReferencePlaceId {
@@ -3958,6 +3971,9 @@ impl<'a> ReferenceFlowBuilder<'a> {
         if policy == CopyPolicy::Copy {
             return Ok(());
         }
+        if self.widened_arrays.as_ref().is_some_and(|owners| owners.contains(binding)) {
+            return Err(self.missing_context(span, ReferenceAnalysisErrorReason::UnprovedWidenedArrayTransfer));
+        }
         let binding = binding.clone();
         let place = self.reference_place(&place, binding.clone(), None);
         self.point(
@@ -4490,6 +4506,11 @@ impl<'a> ReferenceFlowBuilder<'a> {
         span: ByteSpan,
         scope: ReferenceScopeId,
     ) -> Result<FrozenInstall, ReferenceAnalysisError> {
+        if self.widened_arrays.as_ref().is_some_and(|owners| owners.contains(&binding))
+            && matches!(&assign, CfgPointKind::Assign { target, .. } if target.projections.is_empty())
+        {
+            return Err(self.missing_context(span, ReferenceAnalysisErrorReason::UnprovedWidenedArrayTransfer));
+        }
         let possible_origins = match value {
             ReferenceValue::Checked(origins) => {
                 self.checked.insert(binding.clone());
@@ -4794,7 +4815,11 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     if let Some(owner) = alias_owner {
                         self.proof_points.fallible_aliases.insert(id.clone(), owner);
                     }
-                    if binding.is_allocation {
+                    let widened = super::widened_local_literal(binding).is_some();
+                    if widened {
+                        self.widened_arrays.get_or_insert_with(HashSet::new).insert(id.clone());
+                    }
+                    if binding.is_allocation || widened {
                         self.cfg.allocations.insert(id.clone());
                     }
                     if binding.fallible_assignment.is_some()

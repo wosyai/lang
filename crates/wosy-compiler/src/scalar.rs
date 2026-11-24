@@ -726,6 +726,7 @@ pub enum ReferenceAnalysisErrorReason {
     NonLexicalFallibleStructInitializer,
     MissingGuardedAllocationProof,
     UnprovedArrayLength,
+    UnprovedWidenedArrayTransfer,
     UnprovedReturnedArraySelector,
     MissingRequiredDereferenceOrigin,
     UnprovedCheckedArrayIndex,
@@ -749,6 +750,7 @@ impl ReferenceAnalysisErrorReason {
             Self::NonLexicalFallibleStructInitializer => "fallible struct initializer requires a literal or a lexical binding of the field type",
             Self::UnprovedReturnedArraySelector => "returned array index requires an exact bounded selector",
             Self::UnprovedArrayLength => "core.array_len requires an exact local array extent",
+            Self::UnprovedWidenedArrayTransfer => "widened array backing must remain in its original local binding",
             Self::MissingGuardedAllocationProof => "fallible allocation requires an exact proven null guard for its local binding",
             Self::MissingRequiredDereferenceOrigin => "missing required dereference origin",
             Self::UnprovedCheckedArrayIndex => "checked projected borrow requires a proved in-range index",
@@ -3843,6 +3845,14 @@ pub use static_calls::{
     analyze_scalar_build, PreparedScalarProject, ScalarBuildValidation,
     ScalarProjectPreparationRejection,
 };
+pub(crate) fn widened_local_literal(binding: &ScalarBinding) -> Option<(&ScalarType, &[ScalarExpression], ByteSpan)> {
+    let ScalarType::RuntimeArray { element, .. } = &binding.declared_type else { return None };
+    let ScalarExpression::ArrayLiteral { elements, span } = &binding.value else { return None };
+    (!binding.is_allocation && binding.fallible_assignment.is_none() && binding.receivers.len() == 1
+        && reference::aggregate::ordinary_value(element))
+        .then_some((element, elements, *span))
+}
+
 fn derive_type(node: &CstNode) -> ScalarType {
     let actual = if matches!(node.kind(), SyntaxKind::TypeSpec | SyntaxKind::Punctuation) {
         node.descendants()

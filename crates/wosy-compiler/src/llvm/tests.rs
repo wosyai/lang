@@ -11803,3 +11803,64 @@ if (observe(2)");
         }
     }
 }
+
+#[test]
+fn widened_local_array_literal_keeps_one_runtime_backing_and_extent() {
+    let source = SourceIdentity::new("project".into(), "package".into(), "src/widened_array.w".into(), "r1".into());
+    let text = "%%start
+u8(u8) seed = fn(value) { value };
+u64(u8, u64) check = fn(value, index) {
+    u8[] bytes = [3, seed(value), 7];
+    if (bytes[index] != value) { core.system_panic(); };
+    core.array_len(&bytes)
+};
+if (check(5, 1) != 3) { core.system_panic(); };
+%%end";
+    let moved = "%%start
+u64() refused = fn {
+    u8[] bytes = [1, 2];
+    u8[] other = bytes;
+    other;
+    2
+};
+%%end";
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let parsed = parse_source(source.clone(), text.into(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let prepared = crate::prepare_scalar_project_with_access(
+            vec![(crate::derive_scalar_declarations_from_cst(parsed.result.canonical_cst()), vec![])],
+            vec![source.clone()],
+            ScalarPreparationInputs { target_layout: layout },
+            Some(wosy_stdlib_source::CheckedAccessComponent::linked()),
+        ).unwrap_or_else(|error| panic!("{:?}", error.diagnostics));
+        let checked = analyze_scalar_build(&prepared);
+        assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+        let llvm = emit_scalar_build_project_llvm(&checked).unwrap().to_text();
+        let body = self_tail_test_body(&llvm, "i64", &project_function_name(&source, "check"));
+        let seed = format!("call i8 @{}(", project_function_name(&source, "seed"));
+        assert_eq!(body.matches(&seed).count(), 1, "{body}");
+        assert_eq!(body.matches("call ptr @__wosy_core_alloc(i64 3, i64 1)").count(), 1, "{body}");
+        assert_eq!(body.lines().filter(|line| line.contains(" = getelementptr") && line.contains("%widened_array_cell")).count(), 3, "{body}");
+        let [guard] = body.lines().filter(|line| line.contains("call void @wosy_fn__776f73795f746f6f6c636861696e5f7374646c6962__")
+            && line.contains("__636865636b5f696e6465785f696e5f657874656e74(")).collect::<Vec<_>>()[..]
+        else { panic!("one canonical checked bounds call: {body}") };
+        assert!(guard.contains(", i64 3)"), "{body}");
+        let projected = body.lines().find(|line| line.contains("%array_element") && line.contains(" = getelementptr"))
+            .expect("checked element address");
+        assert!(body.find(guard).unwrap() < body.find(projected).unwrap(), "{body}");
+        assert_eq!(body.matches("call void @__wosy_core_free(ptr %allocation)").count(), 1, "{body}");
+        assert!(body.contains("ret i64 3"), "{body}");
+        if let Some(out) = std::env::var_os("WOSY_WIDENED_LOCAL_ARRAY_IR_DIR") {
+            let target = if layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
+            let controlled = llvm.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);
+            assert_ne!(controlled, llvm);
+            std::fs::write(std::path::PathBuf::from(out).join(format!("{target}-project-control.ll")),
+                controlled).unwrap();
+        }
+        let parsed = parse_source(source.clone(), moved.into(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let checked = crate::derive_scalar_program_with_layout(&parsed.result, layout);
+        assert!(checked.diagnostics.iter().any(|diagnostic|
+            diagnostic.message == "widened array backing must remain in its original local binding"), "{:?}", checked.diagnostics);
+    }
+}

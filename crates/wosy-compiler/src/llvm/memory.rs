@@ -390,7 +390,7 @@ pub(super) fn place_pointer<'ctx, 'module>(
             ) {
                 return Err("LLVM indexed place requires an array".to_owned());
             }
-            let runtime_extent = if state.require_release_checked_access
+            let runtime_extent = if (state.require_release_checked_access || !state.local_runtime_extents.is_empty())
                 && matches!(&base_type, ScalarType::RuntimeArray { .. })
             {
                 // Snapshot the extent paired with this base before a selector

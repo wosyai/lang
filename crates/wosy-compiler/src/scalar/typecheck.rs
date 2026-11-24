@@ -1226,9 +1226,10 @@ pub(super) fn block_item_type_in_module(
                 }
                 return ScalarType::Unit;
             }
+            let widening = widened_local_literal_type(binding);
             let actual = expression_type_in_module_expected(
                 &binding.value,
-                Some(&binding.declared_type),
+                Some(widening.as_ref().unwrap_or(&binding.declared_type)),
                 scope,
                 visible_names,
                 folded_names,
@@ -1251,7 +1252,7 @@ pub(super) fn block_item_type_in_module(
             );
             expect_module_type(
                 module,
-                &binding.declared_type,
+                widening.as_ref().unwrap_or(&binding.declared_type),
                 &actual,
                 binding.span,
                 diagnostics,
@@ -1533,6 +1534,14 @@ fn validate_assignment_target_distinctness_in_module(
             }
         }
     }
+}
+
+fn widened_local_literal_type(binding: &ScalarBinding) -> Option<ScalarType> {
+    let (element, values, span) = super::widened_local_literal(binding)?;
+    Some(ScalarType::Array {
+        element: Box::new(element.clone()), length: values.len() as u64,
+        length_span: span, span,
+    })
 }
 
 fn array_len_address<'a>(
@@ -7854,9 +7863,10 @@ fn block_item_type(
                 }
                 return ScalarType::Unit;
             }
+            let widening = widened_local_literal_type(binding);
             let actual = expression_type_expected(
                 &binding.value,
-                &binding.declared_type,
+                widening.as_ref().unwrap_or(&binding.declared_type),
                 scope,
                 visible_names,
                 folded_names,
@@ -7877,7 +7887,7 @@ fn block_item_type(
             );
             expect_type(
                 program,
-                &binding.declared_type,
+                widening.as_ref().unwrap_or(&binding.declared_type),
                 &actual,
                 binding.span,
                 diagnostics,

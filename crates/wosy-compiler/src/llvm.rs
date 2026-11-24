@@ -1933,80 +1933,7 @@ fn store_binding_outputs<'ctx, 'module>(
             None => take_basic(emit_typed_expression(context, state, length, &ScalarType::U64)?)?
                 .into_int_value(),
         };
-        let declaration = (receiver.name_span.start, receiver.name_span.end);
-        let mutable = state.mutable_runtime_allocations.contains(&declaration);
-        let private_literal = aggregate_transfer::has_literal_array_plan(state);
-        let prepared = state.body_call_nodes.is_some_and(|nodes| nodes.binding_position(binding).is_some());
-        let checked_extent = prepared && state.require_release_checked_access
-            && state.indexed_runtime_allocations.contains(&declaration);
-        let tracked_extent = checked_extent || (prepared && state.observed_runtime_allocations.as_deref()
-            .is_some_and(|owners| owners.binary_search(&declaration).is_ok()));
-        aggregate_transfer::capture_borrowed_extent(state, receiver.name_span, length)?;
-        let slot = ownership::emit_runtime_array_allocation_with_domain(
-            context, state, element, length, checked_extent,
-        )?;
-        aggregate_transfer::record_allocation(state, binding, &receiver.name, slot)?;
-        if !mutable {
-            if tracked_extent {
-                state.local_runtime_extents.insert(slot, (receiver.name_span, LocalRuntimeExtent::Construction(length), checked_extent));
-            }
-            state
-                .storage
-                .insert(receiver.name.clone(), (slot, receiver.ty.clone()));
-            if private_literal {
-                aggregate_transfer::enroll_literal_array_allocation(state, binding, slot, length, None)?;
-            } else {
-                state.runtime_array_owners.insert(receiver.name.clone(), true);
-            }
-            state
-                .runtime_array_allocations
-                .insert(receiver.name.clone(), true);
-            return Ok(());
-        }
-        let backing = entry_alloca(
-            state,
-            context.ptr_type(AddressSpace::default()).into(),
-            &format!("{}_backing", receiver.name),
-        )?;
-        state
-            .builder
-            .build_store(backing, slot)
-            .map_err(builder_error)?;
-        let length_slot = entry_alloca(
-            state,
-            context.i64_type().into(),
-            &format!("{}_length", receiver.name),
-        )?;
-        state
-            .builder
-            .build_store(length_slot, length)
-            .map_err(builder_error)?;
-        state
-            .runtime_array_lengths
-            .insert(receiver.name.clone(), length_slot);
-        if private_literal {
-            aggregate_transfer::enroll_literal_array_allocation(state, binding, slot, length, Some((backing, length_slot)))?;
-        } else {
-            let live = entry_alloca(
-                state, context.bool_type().into(), &format!("{}_live", receiver.name),
-            )?;
-            state.builder.build_store(live, context.bool_type().const_int(1, false))
-                .map_err(builder_error)?;
-            aggregate_transfer::record_failure_allocation(state, binding, &receiver.name, slot, live)?;
-            state.runtime_array_live.insert(receiver.name.clone(), live);
-            state.runtime_array_owners.insert(receiver.name.clone(), true);
-        }
-        if tracked_extent {
-            state.local_runtime_extents.insert(backing, (receiver.name_span, LocalRuntimeExtent::ManagedLengthSlot(length_slot), checked_extent));
-        }
-        state
-            .storage
-            .insert(receiver.name.clone(), (backing, receiver.ty.clone()));
-
-        state
-            .runtime_array_allocations
-            .insert(receiver.name.clone(), false);
-        return Ok(());
+        return store_runtime_allocation(context, state, binding, receiver, element, length, false, |_, _| Ok(()));
     }
     if aggregate_transfer::store_received_binding(context, state, binding, &value)? {
         return Ok(());
@@ -2031,6 +1958,126 @@ fn store_binding_outputs<'ctx, 'module>(
         )?;
     }
     Ok(())
+}
+
+fn store_runtime_allocation<'ctx, 'module>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, 'module>,
+    binding: &crate::ScalarBinding,
+    receiver: &crate::ScalarOutputReceiver,
+    element: &ScalarType,
+    length: inkwell::values::IntValue<'ctx>,
+    widened: bool,
+    initialize: impl FnOnce(&mut EmitState<'ctx, 'module>, PointerValue<'ctx>) -> Result<(), String>,
+) -> Result<(), String> {
+    let declaration = (receiver.name_span.start, receiver.name_span.end);
+    let mutable = state.mutable_runtime_allocations.contains(&declaration);
+    if widened && mutable {
+        return Err("widened array backing must remain in its original local binding".into());
+    }
+    let private_literal = aggregate_transfer::has_literal_array_plan(state);
+    let prepared = state.body_call_nodes.is_some_and(|nodes| nodes.binding_position(binding).is_some());
+    let checked_extent = widened || (prepared && state.require_release_checked_access
+        && state.indexed_runtime_allocations.contains(&declaration));
+    let tracked_extent = checked_extent || (prepared && state.observed_runtime_allocations.as_deref()
+        .is_some_and(|owners| owners.binary_search(&declaration).is_ok()));
+    aggregate_transfer::capture_borrowed_extent(state, receiver.name_span, length)?;
+    let slot = ownership::emit_runtime_array_allocation_with_domain(
+        context, state, element, length, checked_extent,
+    )?;
+    initialize(state, slot)?;
+    aggregate_transfer::record_allocation(state, binding, &receiver.name, slot)?;
+    if !mutable {
+        if tracked_extent {
+            state.local_runtime_extents.insert(slot, (receiver.name_span, LocalRuntimeExtent::Construction(length), checked_extent));
+        }
+        state
+            .storage
+            .insert(receiver.name.clone(), (slot, receiver.ty.clone()));
+        if private_literal {
+            aggregate_transfer::enroll_literal_array_allocation(state, binding, slot, length, None)?;
+        } else {
+            state.runtime_array_owners.insert(receiver.name.clone(), true);
+        }
+        state
+            .runtime_array_allocations
+            .insert(receiver.name.clone(), true);
+        return Ok(());
+    }
+    let backing = entry_alloca(
+        state,
+        context.ptr_type(AddressSpace::default()).into(),
+        &format!("{}_backing", receiver.name),
+    )?;
+    state
+        .builder
+        .build_store(backing, slot)
+        .map_err(builder_error)?;
+    let length_slot = entry_alloca(
+        state,
+        context.i64_type().into(),
+        &format!("{}_length", receiver.name),
+    )?;
+    state
+        .builder
+        .build_store(length_slot, length)
+        .map_err(builder_error)?;
+    state
+        .runtime_array_lengths
+        .insert(receiver.name.clone(), length_slot);
+    if private_literal {
+        aggregate_transfer::enroll_literal_array_allocation(state, binding, slot, length, Some((backing, length_slot)))?;
+    } else {
+        let live = entry_alloca(
+            state, context.bool_type().into(), &format!("{}_live", receiver.name),
+        )?;
+        state.builder.build_store(live, context.bool_type().const_int(1, false))
+            .map_err(builder_error)?;
+        aggregate_transfer::record_failure_allocation(state, binding, &receiver.name, slot, live)?;
+        state.runtime_array_live.insert(receiver.name.clone(), live);
+        state.runtime_array_owners.insert(receiver.name.clone(), true);
+    }
+    if tracked_extent {
+        state.local_runtime_extents.insert(backing, (receiver.name_span, LocalRuntimeExtent::ManagedLengthSlot(length_slot), checked_extent));
+    }
+    state
+        .storage
+        .insert(receiver.name.clone(), (backing, receiver.ty.clone()));
+
+    state
+        .runtime_array_allocations
+        .insert(receiver.name.clone(), false);
+    Ok(())
+}
+
+fn store_widened_local_literal<'ctx, 'module>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, 'module>,
+    binding: &crate::ScalarBinding,
+    project: Option<ProjectCallScope<'_>>,
+) -> Result<bool, String> {
+    let Some((element, values, _)) = crate::scalar::widened_local_literal(binding) else { return Ok(false) };
+    let [receiver] = binding.receivers.as_slice() else { return Err("invalid widened array receiver".into()) };
+    let count = context.i64_type().const_int(values.len() as u64, false);
+    store_runtime_allocation(context, state, binding, receiver, element, count, true, |state, backing| {
+        let item = storage_type(context, element, state.layouts, state.target_layout)?;
+        for (position, expression) in values.iter().enumerate() {
+            let value = match project {
+                Some(project) => emit_project_typed_expression(context, state, expression, element,
+                    project.module, project.modules)?,
+                None => emit_typed_expression(context, state, expression, element)?,
+            };
+            // This index comes from the exact same literal count supplied to
+            // the successful allocation, not from an authored index.
+            let destination = unsafe { state.builder.build_in_bounds_gep(
+                item, backing, &[pointer_integer_type(context, state.target_layout).const_int(position as u64, false)],
+                "widened_array_cell",
+            ) }.map_err(builder_error)?;
+            store_value(context, state, destination, element, value)?;
+        }
+        Ok(())
+    })?;
+    Ok(true)
 }
 
 fn transition_automatic_return_result_binding_initialization(
@@ -3426,6 +3473,9 @@ fn emit_project_block_at<'ctx, 'module>(
                 emit_project_block_item(context, state, item, module, modules)?;
             }
             ScalarBlockItem::LocalBinding(binding) => {
+                if store_widened_local_literal(context, state, binding, Some(ProjectCallScope { module, modules }))? {
+                    continue;
+                }
                 let value = emit_project_binding_value(context, state, binding, module, modules)?;
                 store_binding_outputs(context, state, binding, value)?;
             }
@@ -5026,6 +5076,9 @@ fn emit_block_item<'ctx, 'module>(
                 ownership::bind_guarded_scalar(context, state, binding, value)?;
                 return Ok(EmitValue::Unit);
             }
+            if store_widened_local_literal(context, state, binding, None)? {
+                return Ok(EmitValue::Unit);
+            }
             let value = emit_binding_value(context, state, binding)?;
             store_binding_outputs(context, state, binding, value)?;
             Ok(EmitValue::Unit)
@@ -5053,6 +5106,9 @@ fn emit_project_block_item<'ctx, 'module>(
                     )?)?)
                 };
                 ownership::bind_guarded_scalar(context, state, binding, value)?;
+                return Ok(EmitValue::Unit);
+            }
+            if store_widened_local_literal(context, state, binding, Some(ProjectCallScope { module, modules }))? {
                 return Ok(EmitValue::Unit);
             }
             if binding.is_allocation {
