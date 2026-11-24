@@ -1382,6 +1382,16 @@ fn lexical_conditional_owner_choice_releases_selected_original_after_read() {
     ).replace("consume(chosen) + observed", "consume(1, chosen, 2) + observed")
         .replace("== 24", "== 27").replace("== 4) { 2", "== 7) { 2");
     assert_ne!(middle_slot, saved_then_consumed);
+    let nested_relays = middle_slot.replace(
+        "u64(u64, Packet, u64) consume = fn(left, packet, right) { forward(left, packet, right) };",
+        "u64(u64, Packet, u64) dispatch = fn(left, packet, right) {\n\
+            if (left == 1) { terminal(left, packet, right) } else { forward(left, packet, right) }\n\
+         };\n\
+         u64(Packet) consume = fn(packet) {\n\
+            if (packet.length == 2) { dispatch(1, packet, 2) } else { dispatch(2, packet, 1) }\n\
+         };",
+    ).replace("consume(1, chosen, 2)", "consume(chosen)");
+    assert_ne!(nested_relays, middle_slot);
     let multiple_then_consumed = saved_then_consumed
         .replace("u64(*u64) read_selected", "u64(*Packet) read_whole = fn(view) { (*view).length };\nu64(*u64) read_selected")
         .replace("    u64 observed = read_selected", "    read_whole(&chosen);\n    u64 observed = read_selected");
@@ -1431,6 +1441,7 @@ fn lexical_conditional_owner_choice_releases_selected_original_after_read() {
         (through_calls.as_str(), "consume-after-forwarded-borrow"),
         (through_arms.as_str(), "consume-after-exhaustive-borrow"),
         (middle_slot.as_str(), "consume-through-middle-slot"),
+        (nested_relays.as_str(), "consume-through-exhaustive-relays"),
         (multiple_then_consumed.as_str(), "consume-after-multiple-borrows"),
         (saved_then_released.as_str(), "release-after-saved-borrows"),
         (computed_then_released.as_str(), "release-after-scalar-continuation"),
@@ -1446,7 +1457,8 @@ fn lexical_conditional_owner_choice_releases_selected_original_after_read() {
         let updates_metadata = base_use == "consume-after-metadata-write";
         let exhaustive = base_use == "consume-after-exhaustive-borrow";
         let middle_slot = base_use == "consume-through-middle-slot";
-        let forwarding = exhaustive || middle_slot || base_use == "consume-after-forwarded-borrow";
+        let nested_relays = base_use == "consume-through-exhaustive-relays";
+        let forwarding = exhaustive || middle_slot || nested_relays || base_use == "consume-after-forwarded-borrow";
         let borrowing = multiple || updates_metadata || forwarding
             || matches!(base_use, "borrow" | "named-borrow" | "consume-after-borrow" | "consume-after-saved-borrow");
         for (target, target_layout) in [("native64", ScalarTargetLayout::NATIVE64), ("wasm32", ScalarTargetLayout::WASM32)] {
@@ -1556,17 +1568,19 @@ fn lexical_conditional_owner_choice_releases_selected_original_after_read() {
                     if forwarding {
                         let middle = find("forward");
                         let terminal = find("terminal");
+                        let dispatch = nested_relays.then(|| find("dispatch"));
                         let forwarded = |function: inkwell::values::FunctionValue<'_>| {
                             let mut targets = Vec::new();
                             for row in function.get_basic_blocks().into_iter().flat_map(|block| block.get_instructions()) {
                                 if row.get_opcode() != InstructionOpcode::Call { continue; }
                                 let call = CallSiteValue::try_from(row).unwrap();
                                 let target = call.get_called_fn_value().unwrap();
-                                if target == middle || target == terminal {
-                                    assert_eq!(call.count_arguments(), if middle_slot { 4 } else { 2 });
+                                if target == middle || target == terminal || Some(target) == dispatch {
+                                    assert_eq!(call.count_arguments(), if middle_slot || nested_relays { 4 } else { 2 });
                                     assert_eq!(row.get_operand(call.count_arguments() - 1).unwrap().value().unwrap(),
                                         function.get_last_param().unwrap());
-                                    targets.push(if target == middle { "forward" } else { "terminal" });
+                                    targets.push(if target == middle { "forward" }
+                                        else if target == terminal { "terminal" } else { "dispatch" });
                                 } else {
                                     assert!(matches!(target.get_name().to_str().unwrap(),
                                         "llvm.memmove.p0.p0.i32" | "llvm.memmove.p0.p0.i64"));
@@ -1578,7 +1592,13 @@ fn lexical_conditional_owner_choice_releases_selected_original_after_read() {
                         assert_eq!(frees(middle), 0);
                         assert_eq!(frees(terminal), 1);
                         assert_eq!(forwarded(middle), ["terminal"]);
-                        assert_eq!(forwarded(consumer), if exhaustive { vec!["terminal", "forward"] } else { vec!["forward"] });
+                        if let Some(dispatch) = dispatch {
+                            assert_eq!(frees(dispatch), 0);
+                            assert_eq!(forwarded(consumer), ["dispatch", "dispatch"]);
+                            assert_eq!(forwarded(dispatch), ["terminal", "forward"]);
+                        } else {
+                            assert_eq!(forwarded(consumer), if exhaustive { vec!["terminal", "forward"] } else { vec!["forward"] });
+                        }
                     } else {
                         assert_eq!(frees(consumer), 1);
                     }

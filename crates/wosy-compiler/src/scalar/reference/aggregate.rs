@@ -4985,6 +4985,10 @@ fn closed_aggregates<'a>(
     let mut terminal_formals = Vec::new();
     let mut unproved_successor_counts = BTreeMap::new();
     let mut proven_read_views = BTreeSet::new();
+    let exhaustive_conditional_formal = |target: &(BodyKey, usize)| {
+        conditional_forward_edges.contains_key(target) && bodies.get(&target.0)
+            .and_then(|body| body.facts).is_some_and(|facts| facts.conditional_formal_forwards.len() == 2)
+    };
     for ((callee, slot), users) in input_users {
         let (owned, mixed) = modes[&(callee, slot)];
         if !owned { continue }
@@ -5030,7 +5034,8 @@ fn closed_aggregates<'a>(
             let exhaustive = facts.conditional_formal_forwards.len() == 2;
             if mixed || next.iter().any(|target| modes[target] != (true, false)
                     || (!exhaustive && forward_edges.contains_key(target))
-                    || conditional_forward_edges.contains_key(target))
+                    || (conditional_forward_edges.contains_key(target)
+                        && (!exhaustive || !exhaustive_conditional_formal(target))))
                 || !facts.raw_uses.is_empty()
                 || !ordinary_formal_outputs(&body.sites.boundary.root_outputs)
             {
@@ -5042,11 +5047,28 @@ fn closed_aggregates<'a>(
             let certificate = ConditionalInputCertificate::build(
                 points, &facts.conditional_input_regions, &facts.conditional_input_barriers,
             );
-            let prove_arm = |&(formal, consumer, _, to_slot, moved): &(usize, CfgPointId, usize, usize, CfgPointId)| {
+            let prove_arm = |&(formal, consumer, ordinal, to_slot, moved): &(usize, CfgPointId, usize, usize, CfgPointId)| {
                 let target = target_body(&declarations, body.cfg, consumer)?;
                 if formal != slot || !next.contains(&(target, to_slot))
                     || certificate.paths[moved.0] != certificate.paths[consumer.0]
                 { return None; }
+                if exhaustive_conditional_formal(&(target, to_slot)) {
+                    // A relay-to-relay edge crosses two independent control
+                    // proofs; seal the exact source argument corridor once.
+                    let call = points.get(consumer.0)?;
+                    let CfgPointKind::Call { argument_points, .. } = &call.kind else { return None };
+                    let first = points.get(argument_points.first()?.0)?;
+                    let ordinal = OccurrenceOrdinal(ordinal);
+                    let signature = body.sites.checked_call_signatures.get(&ordinal)?;
+                    let holder = facts.formals.get(&formal)?;
+                    let ty = &body.sites.boundary.parameters.get(formal)?.ty;
+                    let (exact, argument_slot, exact_move) = exact_owning_call_arguments(
+                        points, first, call.scope, body.sites, ordinal, &signature.parameters, holder, ty,
+                    )?;
+                    if exact.id != consumer || argument_slot != to_slot || exact_move != moved {
+                        return None;
+                    }
+                }
                 let (fork, side, boundary) = certificate.consuming_arm(
                     points, points[0].id, consumer, endpoint.map(|((exit, _), _)| exit),
                 )?;
@@ -5122,8 +5144,9 @@ fn closed_aggregates<'a>(
                     && conditional_forward_edges.get(&(caller, *formal))
                         .is_some_and(|targets| targets.contains(&(callee, slot)))
                     && modes.get(&(caller, *formal)) == Some(&(true, false))
-                    && !mixed && (release.is_some() || (forward_edges.contains_key(&(callee, slot))
-                        && bodies[&caller].facts.is_some_and(|facts| facts.conditional_formal_forwards.len() == 2)))
+                    && !mixed && (release.is_some() || ((forward_edges.contains_key(&(callee, slot))
+                        || exhaustive_conditional_formal(&(callee, slot)))
+                        && exhaustive_conditional_formal(&(caller, *formal))))
                     && facts.raw_uses.is_empty() && ordinary_formal_outputs(&body.sites.boundary.root_outputs) =>
                         ClosedInput::ForwardFormalDeferred(*formal),
                 Some(Some(InputOrigin::ConditionalFormal(formal))) =>
