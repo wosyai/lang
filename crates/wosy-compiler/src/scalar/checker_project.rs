@@ -3855,8 +3855,6 @@ impl SelectedSymbolicProof<'_, '_> {
         if metered {
             let count = bare.map_or(Some(authored.len()), |(_, rest)| rest.len().checked_add(1))
                 .ok_or(ProjectCheck::Unsupported)?;
-            // An authored case has at most one flat step plus its goal.
-            let count = count.checked_mul(if authored_mode { 2 } else { 1 }).ok_or(ProjectCheck::Unsupported)?;
             super::checker_flow::charge_call_work(&mut proof_work, count).ok_or(ProjectCheck::Unsupported)?;
         }
         if !supported_calling_proof_body(body, &output.ty) { return Err(ProjectCheck::Unsupported); }
@@ -3865,16 +3863,23 @@ impl SelectedSymbolicProof<'_, '_> {
             .map(|case| (case, None)).chain(authored.iter().map(|(case, step)| (case, step.as_ref())));
         let mut plans = Vec::new();
         for (case, step) in cases {
-            let step = match step {
-                None => None,
+            let (step, ordered_steps) = match step {
+                None => (None, &[][..]),
                 Some(MainFlowAuthoredShows::Single(step)) =>
-                    Some((step.span, PartitionedProofGoal::Literal(step.relation, step.bound.as_ref()))),
+                    (Some((step.span, PartitionedProofGoal::Literal(step.relation, step.bound.as_ref()))), &[][..]),
                 Some(MainFlowAuthoredShows::Entry { span, slot: 0, relation })
                     if parameter.ty == output.ty
                         && Some(*relation) == IntegerRelation::from_operator(&BinaryOperator::Equal) =>
-                    Some((*span, PartitionedProofGoal::EntryEquality)),
+                    (Some((*span, PartitionedProofGoal::EntryEquality)), &[][..]),
+                Some(MainFlowAuthoredShows::CallingSequence { steps, .. }) =>
+                    (None, steps.as_slice()),
                 Some(_) => return Err(ProjectCheck::Unsupported),
             };
+            if metered {
+                let count = ordered_steps.len().checked_add(usize::from(step.is_some())).ok_or(ProjectCheck::Unsupported)?;
+                super::checker_flow::charge_call_work(&mut proof_work, count).ok_or(ProjectCheck::Unsupported)?;
+            }
+
             let goal = match case.bound {
                 MainFlowProofBound::Literal(bound) => PartitionedProofGoal::Literal(case.relation, bound),
                 MainFlowProofBound::Entry(0) if !batched && parameter.ty == output.ty
@@ -3894,7 +3899,7 @@ impl SelectedSymbolicProof<'_, '_> {
                     [comparison] if comparison.slot == 0 => domain.keep_relation(comparison.relation, comparison.bound),
                     _ => return Err(ProjectCheck::Unsupported),
                 };
-                plans.push((case, step, goal, applicable));
+                plans.push((case, step, ordered_steps, goal, applicable));
             }
         }
         let mut cursor = ExactCallCursor::projected(body, Rc::new(domain), &output.ty).ok_or(ProjectCheck::Unsupported)?;
@@ -3921,19 +3926,22 @@ impl SelectedSymbolicProof<'_, '_> {
                 runtime.calls.function_body(module, item, None).is_some_and(summary_elision_safe)
             });
         let mut applicable = active;
-        for (case, step, goal, proof_domain) in plans {
-            if let Some((span, step)) = step {
+        'proofs: for (case, step, ordered_steps, goal, proof_domain) in plans {
+            let steps = step.into_iter().chain(ordered_steps.iter().map(|step| {
+                (step.span, PartitionedProofGoal::Literal(step.relation, step.bound.as_ref()))
+            }));
+            for (span, step) in steps {
                 let verified = super::checker_flow::verify_partitioned_call_return(
                     body, &result, &proof_domain, false, step, Some(&mut proof_work),
                 ).ok_or(ProjectCheck::Unsupported)?;
                 applicable |= verified.applicable;
                 if let Some(failure) = verified.failure {
                     self.record(case, function, source, effects.records.len(), failure, Some(span))?;
-                    continue;
+                    continue 'proofs;
                 }
-                // The conclusion sees the original partitions, not a
-                // derivation narrowed by an authored assertion.
             }
+            // Each step and the conclusion sees the original partitions,
+            // not a derivation narrowed by an authored assertion.
             let verified = super::checker_flow::verify_partitioned_call_return(
                 body, &result, &proof_domain, elidable, goal, metered.then_some(&mut proof_work),
             ).ok_or(ProjectCheck::Unsupported)?;
@@ -4001,7 +4009,7 @@ impl SymbolicRootProof for SelectedSymbolicProof<'_, '_> {
                 }
                 let proof_bound = proof.bound.literal().ok_or(ProjectCheck::Unsupported)?;
                 let MainFlowAuthoredShows::Single(step) = shows else {
-                    let MainFlowAuthoredShows::Multiple { first_span, groups } = shows else {
+                    let MainFlowAuthoredShows::Multiple { first_span, groups, .. } = shows else {
                         return Err(ProjectCheck::Unsupported);
                     };
                     let mut failed_step: Option<ByteSpan> = None;
@@ -4200,12 +4208,49 @@ enum MainFlowAuthoredShows<'a> {
     Single(MainFlowLiteralShow<'a>),
     Entry { span: ByteSpan, slot: usize, relation: IntegerRelation },
     Multiple { first_span: ByteSpan, groups: Vec<MainFlowShowBound<'a>> },
+    CallingSequence {
+        steps: Vec<MainFlowLiteralShow<'a>>,
+        concrete_groups: std::cell::OnceCell<Vec<MainFlowShowBound<'a>>>,
+    },
 }
 
 #[cfg(feature = "internal-checker")]
 struct MainFlowShowBound<'a> {
     bound: Cow<'a, BigInt>,
     failures: [Option<ByteSpan>; 3],
+}
+
+#[cfg(feature = "internal-checker")]
+impl<'a> MainFlowShowBound<'a> {
+    fn from_literal(span: ByteSpan, relation: IntegerRelation, bound: Cow<'a, BigInt>) -> Self {
+        use std::cmp::Ordering::{Equal, Greater, Less};
+        let failures = [Less, Equal, Greater].map(|ordering| (!relation.accepts(ordering)).then_some(span));
+        Self { bound, failures }
+    }
+}
+
+#[cfg(feature = "internal-checker")]
+fn index_main_flow_show_bounds(groups: &mut Vec<MainFlowShowBound<'_>>) {
+    groups.sort_unstable_by(|left, right| left.bound.cmp(&right.bound));
+    groups.dedup_by(|later, retained| {
+        if retained.bound != later.bound {
+            return false;
+        }
+        for (retained, later) in retained.failures.iter_mut().zip(later.failures) {
+            *retained = earliest_show_failure(*retained, later);
+        }
+        true
+    });
+    let mut prefix = None;
+    for group in groups.iter_mut() {
+        prefix = earliest_show_failure(prefix, group.failures[2]);
+        group.failures[2] = prefix;
+    }
+    let mut suffix = None;
+    for group in groups.iter_mut().rev() {
+        suffix = earliest_show_failure(suffix, group.failures[0]);
+        group.failures[0] = suffix;
+    }
 }
 
 #[cfg(feature = "internal-checker")]
@@ -4380,39 +4425,28 @@ impl<'a> MainFlowProofCase<'a> {
                 }
             }
             (steps, terminated) if steps.len() >= 2 && steps.len() == terminated.len() => {
-                use std::cmp::Ordering::{Equal, Greater, Less};
-                let mut groups = Vec::with_capacity(steps.len());
-                let mut first_span = None;
-                for (step, &terminated) in steps.iter().zip(terminated) {
-                    let (span, claim) = show_claim(step, terminated)?;
-                    let (relation, bound) = checked_literal(claim)?;
-                    if groups.is_empty() {
-                        first_span = Some(span);
+                let retain_order = supported_calling_proof_body(plan.typed.body, plan.typed.result_type)
+                    && super::checker_flow::charge_call_work(&mut 0, steps.len()).is_some();
+                if retain_order {
+                    let mut ordered = Vec::with_capacity(steps.len());
+                    for (step, &terminated) in steps.iter().zip(terminated) {
+                        let (span, claim) = show_claim(step, terminated)?;
+                        let (relation, bound) = checked_literal(claim)?;
+                        ordered.push(MainFlowLiteralShow { span, relation, bound, same_bound: false });
                     }
-                    let failures = [Less, Equal, Greater].map(|ordering| (!relation.accepts(ordering)).then_some(span));
-                    groups.push(MainFlowShowBound { bound, failures });
-                }
-                groups.sort_unstable_by(|left, right| left.bound.cmp(&right.bound));
-                groups.dedup_by(|later, retained| {
-                    if retained.bound != later.bound {
-                        return false;
+                    Some(MainFlowAuthoredShows::CallingSequence { steps: ordered, concrete_groups: std::cell::OnceCell::new() })
+                } else {
+                    let mut groups = Vec::with_capacity(steps.len());
+                    let mut first_span = None;
+                    for (step, &terminated) in steps.iter().zip(terminated) {
+                        let (span, claim) = show_claim(step, terminated)?;
+                        let (relation, bound) = checked_literal(claim)?;
+                        if groups.is_empty() { first_span = Some(span); }
+                        groups.push(MainFlowShowBound::from_literal(span, relation, bound));
                     }
-                    for (retained, later) in retained.failures.iter_mut().zip(later.failures) {
-                        *retained = earliest_show_failure(*retained, later);
-                    }
-                    true
-                });
-                let mut prefix = None;
-                for group in &mut groups {
-                    prefix = earliest_show_failure(prefix, group.failures[2]);
-                    group.failures[2] = prefix;
+                    index_main_flow_show_bounds(&mut groups);
+                    Some(MainFlowAuthoredShows::Multiple { first_span: first_span.ok_or(ProjectCheck::Unsupported)?, groups })
                 }
-                let mut suffix = None;
-                for group in groups.iter_mut().rev() {
-                    suffix = earliest_show_failure(suffix, group.failures[0]);
-                    group.failures[0] = suffix;
-                }
-                Some(MainFlowAuthoredShows::Multiple { first_span: first_span.ok_or(ProjectCheck::Unsupported)?, groups })
             }
             _ => return Err(ProjectCheck::Unsupported),
         };
@@ -4697,10 +4731,22 @@ impl ActualIntegerObserver for MainFlowProofObserver<'_> {
                                 None
                             }
                         }
-                        Some(MainFlowAuthoredShows::Multiple { groups, .. }) => {
+                        Some(shows @ (MainFlowAuthoredShows::Multiple { .. } | MainFlowAuthoredShows::CallingSequence { .. })) => {
                             if !applies() {
                                 continue;
                             }
+                            let groups = match shows {
+                                MainFlowAuthoredShows::Multiple { groups, .. } => groups,
+                                MainFlowAuthoredShows::CallingSequence { steps, concrete_groups } =>
+                                    concrete_groups.get_or_init(|| {
+                                        let mut groups = steps.iter().map(|step|
+                                            MainFlowShowBound::from_literal(step.span, step.relation, step.bound.clone())
+                                        ).collect();
+                                        index_main_flow_show_bounds(&mut groups);
+                                        groups
+                                    }),
+                                _ => unreachable!(),
+                            };
                             let failed = first_failed_show(groups, value);
                             if failed.is_none() && proof.relation.accepts(value.cmp(bound)) {
                                 continue;
@@ -12838,6 +12884,38 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
         assert!(run(&clean).unwrap().symbolic_diagnostic.is_none());
         let cyclic = text.replace("middle(n); produced", "producer(n); produced");
         assert!(matches!(run(&cyclic), Err(ProjectCheck::Unsupported)));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordered_named_calling_producer_checks_multiple_shows_in_source_order() {
+        let app = source("src/main.w", "ordered-shows-calling-producer");
+        let text = r#"%%start
+            i8(i8) leaf = fn(n) { if (n < 0) { -3 } else { 7 } };
+            i8(i8) producer = fn(n) { i8 observed = leaf(n); observed };
+            proof bounded for producer(entry) -> (out) ensures (out == 7) {
+                core.show(out <= 7);
+                core.show(out < 7);
+                core.show(out >= 0);
+            }
+        %%end"#;
+        let run = |text: &str| {
+            let (_, proof) = crate::parse_proof_source(app.clone(), text.to_owned(), &[]).ok().unwrap();
+            check_loaded_ordered_proof_diagnostics(
+                Vec::new(), vec![(proof, Vec::new())], vec![app.clone()], inputs(), ScalarCheckerScope::CurrentPackage,
+            ).unwrap()
+        };
+        let earliest = run(text).symbolic_diagnostic.unwrap();
+        assert_eq!(earliest.returned, BigInt::from(7));
+        assert!(earliest.witness.intervals_at(0, 0).unwrap().eq([(&BigInt::from(0), &BigInt::from(127))]));
+        let later_step = text.replace("core.show(out < 7)", "core.show(out <= 7)");
+        let later = run(&later_step).symbolic_diagnostic.unwrap();
+        assert_eq!(later.returned, BigInt::from(-3));
+        assert!(later.witness.intervals_at(0, 0).unwrap().eq([(&BigInt::from(-128), &BigInt::from(-1))]));
+        assert!(earliest.failed_step.unwrap().range.start < later.failed_step.unwrap().range.start);
+        let final_goal = later_step.replace("out >= 0", "out >= -3");
+        assert!(run(&final_goal).symbolic_diagnostic.unwrap().failed_step.is_none());
+        assert!(run(&final_goal.replace("out == 7", "out <= 7")).symbolic_diagnostic.is_none());
     }
 
     #[cfg(feature = "internal-checker")]

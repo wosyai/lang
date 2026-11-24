@@ -1608,6 +1608,16 @@ cases.extend([
         .replace("out < 7","out <= 7"),0,b""),
 ])
 
+ordered_shows_calling_producer = authored_named_calling_producer.replace(
+    "core.show(out < 7);", "core.show(out <= 7); core.show(out < 7); core.show(out >= 0);")
+cases.extend([
+    ("ordinary-named-calling-ordered-shows-earliest",ordered_shows_calling_producer,1,b"proof obligation failed"),
+    ("ordinary-named-calling-ordered-shows-later",ordered_shows_calling_producer.replace("out < 7","out <= 7"),
+        1,b"proof obligation failed"),
+    ("ordinary-named-calling-ordered-shows-proved",ordered_shows_calling_producer.replace("out < 7","out <= 7")
+        .replace("out >= 0","out >= -3").replace("out == 7","out <= 7"),0,b""),
+])
+
 batched_named_calling_producer = """%%start
     i8(i8) leaf = fn(n) { if (n < 0) { -3 } else { 7 } };
     i8(i8) producer = fn(n) { i8 produced = leaf(n); produced };
@@ -1644,6 +1654,8 @@ cases.extend([
         b"proof obligation failed"),
 ])
 proof_diagnostic_notes = {
+    "ordinary-named-calling-ordered-shows-earliest": b"symbolic call can return 7",
+    "ordinary-named-calling-ordered-shows-later": b"symbolic call can return -3",
     "ordinary-authored-named-calling-step-refuted": b"symbolic call can return 7",
     "ordinary-authored-named-calling-goal-refuted": b"symbolic call can return -3",
     "ordinary-named-relational-entry-equality-affine-refuted": b"symbolic call can return 127",
