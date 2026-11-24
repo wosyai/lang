@@ -2526,7 +2526,7 @@ pub(crate) enum ClosedCall {
     Receive,
     Forward,
     ResultArm,
-    LocalChoiceArm,
+    LocalChoiceArm(usize),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2631,9 +2631,9 @@ pub(crate) struct ClosedBody {
     pub(crate) checked_backing_optional: bool,
     pub(crate) returning: Option<ClosedReturn>,
     mixed_branch_return: Option<Box<MixedBranchReturn>>,
-    pub(crate) local_choice_arms: usize,
+    pub(crate) local_choice_arms: Vec<(usize, usize)>, // source-ordered conditional, leaf count
     pub(crate) local_choice_immediate: Option<(usize, usize)>, // consumer, conditional
-    pub(crate) local_choice_binding: Option<(usize, usize, usize)>, // block, item, conditional
+    pub(crate) local_choice_bindings: BTreeMap<(usize, usize), usize>, // (block, item) -> conditional
     pub(crate) structured_result_binding: Option<(usize, usize, usize)>, // block, item, conditional
     pub(crate) local_result_arms: BTreeMap<usize, (usize, usize)>, // block -> (allocation item, output)
     pub(crate) named_result_arms: BTreeMap<usize, (usize, usize)>, // block -> (output, producer)
@@ -2822,6 +2822,13 @@ struct LocalChoiceRecommit {
     ordinal: OccurrenceOrdinal,
 }
 
+struct LocalChoiceSibling {
+    conditional: OccurrenceOrdinal,
+    item: usize,
+    join: CfgPointId,
+    leaves: BTreeSet<CfgPointId>,
+}
+
 struct LocalReceiptChoice {
     block: BlockOrdinal,
     item: Option<usize>,
@@ -2830,7 +2837,23 @@ struct LocalReceiptChoice {
     use_site: LocalChoiceUse,
     recommits: Vec<LocalChoiceRecommit>,
     sibling_calls: Vec<CfgPointId>,
+    sibling_choices: Vec<LocalChoiceSibling>,
     joined_birth: CfgPointId,
+    exit: CfgPointId,
+}
+
+impl LocalReceiptChoice {
+    fn all_producers(&self) -> impl Iterator<Item = &CfgPointId> {
+        self.leaves.iter().chain(&self.sibling_calls)
+            .chain(self.sibling_choices.iter().flat_map(|choice| choice.leaves.iter()))
+    }
+
+    fn arm_choice(&self, call: CfgPointId) -> Option<OccurrenceOrdinal> {
+        if self.leaves.contains(&call) {
+            return Some(self.conditional);
+        }
+        self.sibling_choices.iter().find(|choice| choice.leaves.contains(&call)).map(|choice| choice.conditional)
+    }
 }
 
 struct Body<'a> {
@@ -2962,7 +2985,10 @@ impl Body<'_> {
         let mut observations = 0;
         const MAX_SIBLING_RECEIPTS: usize = 2;
         let mut siblings = Vec::<(CfgPointId, &ReferenceBindingId, bool)>::new();
+        let mut sibling_calls = Vec::new();
+        let mut sibling_choices = Vec::new();
         for step in before_consume {
+            let position = step.position;
             if let BlockItemKind::Evaluation { expression } = step.kind {
                 if let Some((identity, field)) = self.sites.prepared_lexical_member(expression) {
                     if let Some((_, _, observed)) = siblings.iter_mut().find(|(_, sibling, _)| *sibling == identity) {
@@ -2989,6 +3015,34 @@ impl Body<'_> {
             };
             if let Some((step, next_receiver)) = relay_step {
                 let BindingInitialization::Outputs(step_init) = &step.initialization else { return None };
+                if let Some(ConditionalRegion::Value { condition, .. }) = self.sites.conditionals.get(&step_init.primary) {
+                    if siblings.len() == MAX_SIBLING_RECEIPTS || !step_init.secondary.is_empty()
+                        || structure.checked_types.expressions.get(&step_init.primary) != Some(&next_receiver.ty)
+                        || structure.checked_types.expressions.get(condition) != Some(&ScalarType::Bool)
+                        || read.source_span.range != self.sites.occurrences.get(condition.0)?.span
+                        || !matches!((self.sites.prepared_plain_name(*condition), &read.kind),
+                            (Some(PlainNameIdentity::Lexical(expected)), CfgPointKind::Read { binding }) if expected == binding)
+                    { return None; }
+                    let branch = next(read.id)?;
+                    let region = facts.conditional_input_regions.get(&branch.id)?;
+                    let sibling_join = points.get(region.join.0)?;
+                    let installed = next(sibling_join.id)?;
+                    let CfgPointKind::Bind { binding } = &installed.kind else { return None };
+                    if region.expression != step_init.primary || region.branch != branch.id || branch.scope != scope
+                        || !matches!(branch.kind, CfgPointKind::Branch { .. })
+                        || sibling_join.id <= join.id || installed.scope != scope
+                        || binding == holder || binding.declaration_span != next_receiver.span
+                        || siblings.iter().any(|(prior, owner, _)| *prior >= sibling_join.id || *owner == binding)
+                    { return None; }
+                    let leaves = self.local_choice_leaves(step_init.primary, &next_receiver.ty, Some(*region))?;
+                    siblings.push((sibling_join.id, binding, false));
+                    sibling_choices.push(LocalChoiceSibling {
+                        conditional: step_init.primary, item: position, join: sibling_join.id, leaves,
+                    });
+                    read = next(installed.id)?;
+                    if read.scope != scope { return None; }
+                    continue;
+                }
                 let signature = self.sites.checked_call_signatures.get(&step_init.primary)?;
                 let [returned] = signature.outputs.outputs.as_slice() else { return None };
                 if !step_init.secondary.is_empty() || returned.ty != next_receiver.ty
@@ -3011,6 +3065,7 @@ impl Body<'_> {
                     read = next(installed.id)?;
                     if read.scope != scope { return None; }
                     siblings.push((call.id, binding, false));
+                    sibling_calls.push(call.id);
                     continue;
                 }
                 if next_receiver.ty != receiver.ty { return None; }
@@ -3095,7 +3150,10 @@ impl Body<'_> {
             }
         }
         if siblings.iter().any(|(_, _, observed)| !observed) { return None; }
-        let sibling_calls: Vec<_> = siblings.into_iter().map(|(call, _, _)| call).collect();
+        let leaves = self.local_choice_leaves(init.primary, &receiver.ty, None)?;
+        if !Self::covers_local_choice_calls(facts, &leaves, &recommits, &sibling_calls, &sibling_choices) {
+            return None;
+        }
         if returns_owner {
             let step = recommits.last()?;
             let span = self.sites.occurrences.get(output.expression.0)?.span;
@@ -3117,9 +3175,8 @@ impl Body<'_> {
             { return None; }
             return Some(LocalReceiptChoice {
                 block: root, item: Some(bind.position), conditional: init.primary,
-                leaves: self.local_choice_leaves(init.primary, &receiver.ty, &recommits, &sibling_calls)?,
-                use_site: LocalChoiceUse::Return { call: step.ordinal, output: output.expression },
-                recommits, sibling_calls, joined_birth: join.id,
+                leaves, use_site: LocalChoiceUse::Return { call: step.ordinal, output: output.expression },
+                recommits, sibling_calls, sibling_choices, joined_birth: join.id, exit: exit.id,
             });
         }
         let end_use = |last: &ReferenceFlowPoint| {
@@ -3186,7 +3243,9 @@ impl Body<'_> {
             }
             left
         } else { output.expression };
-        let use_site = if let Some(exit) = saved_exit {
+        let exit;
+        let use_site = if let Some(saved_exit) = saved_exit {
+            exit = saved_exit;
             // Only the ordinary result survives; the receipt remains with the
             // caller and is discharged at the existing lexical exit.
             LocalChoiceUse::Observe(exit)
@@ -3197,7 +3256,8 @@ impl Body<'_> {
                         matches!(place.projections.as_slice(),
                             [ReferencePlaceProjection::Field(ScalarFieldReference::Resolved(found))] if found == field)))
             { return None; }
-            LocalChoiceUse::Observe(end_use(read)?)
+            exit = end_use(read)?;
+            LocalChoiceUse::Observe(exit)
         } else {
             let signature = self.sites.checked_call_signatures.get(&scalar_call)?;
             let [scalar] = signature.outputs.outputs.as_slice() else { return None };
@@ -3242,7 +3302,8 @@ impl Body<'_> {
                         concrete: ConcreteCallSelection::Declaration, .. }, argument_points, .. }
                         if argument_points.as_slice() == [input.id])
                 { return None; }
-                LocalChoiceUse::Observe(end_use(reader)?)
+                exit = end_use(reader)?;
+                LocalChoiceUse::Observe(exit)
             } else {
                 if alias.is_some() { return None; }
                 let (consumer, owned_slot, moved) = exact_owning_call_arguments(
@@ -3264,16 +3325,16 @@ impl Body<'_> {
                         && matches!(point.kind, CfgPointKind::Evaluate(ScalarExpression::Binary { operator: BinaryOperator::Add, .. }));
                     let tail = scalar_tail(next(consumer.id)?.id, right, &outer_sum)?;
                     let sum = next(tail)?;
-                    end_use(sum)?;
+                    exit = end_use(sum)?;
                 } else {
-                    end_use(consumer)?;
+                    exit = end_use(consumer)?;
                 }
                 LocalChoiceUse::Consume { point: consumer.id, ordinal: scalar_call, slot: owned_slot }
             }
         };
         Some(LocalReceiptChoice {
             block: root, item: Some(bind.position), conditional: init.primary,
-            leaves: self.local_choice_leaves(init.primary, &receiver.ty, &recommits, &sibling_calls)?, use_site, recommits, sibling_calls, joined_birth: join.id,
+            leaves, use_site, recommits, sibling_calls, sibling_choices, joined_birth: join.id, exit,
         })
     }
 
@@ -3313,17 +3374,18 @@ impl Body<'_> {
         { return None; }
         let origins = facts.inputs.get(&(consumer.id, output.expression.0, 0, ArgumentProvenance::Unmoved))?;
         if origins.len() != 1 || !origins.contains(&None) { return None; }
+        let leaves = self.local_choice_leaves(conditional, parameter, None)?;
+        if leaves.len() != facts.calls.len() { return None; }
         Some(LocalReceiptChoice {
-            block: structure.root, item: None, conditional,
-            leaves: self.local_choice_leaves(conditional, parameter, &[], &[])?,
+            block: structure.root, item: None, conditional, leaves,
             use_site: LocalChoiceUse::Consume { point: consumer.id, ordinal: output.expression, slot: 0 },
-            recommits: Vec::new(), sibling_calls: Vec::new(), joined_birth: join.id,
+            recommits: Vec::new(), sibling_calls: Vec::new(), sibling_choices: Vec::new(),
+            joined_birth: join.id, exit: exit.id,
         })
     }
 
     fn local_choice_leaves(
-        &self, conditional: OccurrenceOrdinal, ty: &ScalarType, recommits: &[LocalChoiceRecommit],
-        siblings: &[CfgPointId],
+        &self, conditional: OccurrenceOrdinal, ty: &ScalarType, independent: Option<ConditionalInputRegion>,
     ) -> Option<BTreeSet<CfgPointId>> {
         let facts = self.facts?;
         let structure = &self.sites.structure;
@@ -3344,7 +3406,7 @@ impl Body<'_> {
             if seen.len() >= MAX_LOCAL_CHOICE_LEAVES - 1 || !seen.insert(expression) {
                 return None;
             }
-            let region = find_region(expression)?;
+            let region = independent.or_else(|| find_region(expression).copied())?;
             let join = points.get(region.join.0)?;
             if join.scope != scope || !matches!(join.kind, CfgPointKind::Join)
                 || join.source_span.range != self.sites.occurrences.get(expression.0)?.span
@@ -3362,7 +3424,15 @@ impl Body<'_> {
                     if points.get(id.0)?.scope != entry.scope || next(id)?.id != terminal.id || !leaves.insert(id) {
                         return None;
                     }
+                    if independent.is_some() {
+                        let signature = self.sites.checked_call_signatures.get(&output.expression)?;
+                        let (call, None) = exact_bounded_call_arguments(
+                            points, next(entry.id)?, entry.scope, self.sites, output.expression, &signature.parameters, None,
+                        )? else { return None };
+                        if call.id != id { return None; }
+                    }
                 } else {
+                    if independent.is_some() { return None; }
                     let child = find_region(output.expression)?;
                     if points.get(child.join.0)?.scope != entry.scope || next(child.join)?.id != terminal.id {
                         return None;
@@ -3371,12 +3441,24 @@ impl Body<'_> {
                 }
             }
         }
-        // Every aggregate call is a leaf, a recommit, or an independent
-        // sibling producer. The exact linear root steps are distinct; verify
-        // that both root categories and the nested leaves are disjoint.
-        (leaves.len() + recommits.len() + siblings.len() == facts.calls.len()
-            && recommits.iter().all(|step| !leaves.contains(&step.point) && !siblings.contains(&step.point))
-            && siblings.iter().all(|point| !leaves.contains(point))).then_some(leaves)
+        Some(leaves)
+    }
+
+    fn covers_local_choice_calls(
+        facts: &AggregateFlowResult, primary: &BTreeSet<CfgPointId>, recommits: &[LocalChoiceRecommit],
+        siblings: &[CfgPointId], choices: &[LocalChoiceSibling],
+    ) -> bool {
+        if choices.is_empty() {
+            // The single-choice common path needs no new allocation.
+            return primary.len() + recommits.len() + siblings.len() == facts.calls.len()
+                && recommits.iter().all(|step| !primary.contains(&step.point) && !siblings.contains(&step.point))
+                && siblings.iter().all(|point| !primary.contains(point));
+        }
+        let mut seen = BTreeSet::new();
+        primary.iter().copied().chain(recommits.iter().map(|step| step.point))
+            .chain(siblings.iter().copied()).chain(choices.iter().flat_map(|choice| choice.leaves.iter().copied()))
+            .all(|point| seen.insert(point))
+            && seen.len() == facts.calls.len()
     }
 
     fn structured_owner_return(&self) -> Option<StructuredOwnerReturn> {
@@ -4851,7 +4933,7 @@ fn closed_aggregates<'a>(
                 let target = target_body(&declarations, body.cfg, point)?;
                 Some((target, *identity_relays.get(&target)?))
             }) {
-                let dependencies: Option<BTreeSet<_>> = choice.leaves.iter().chain(&choice.sibling_calls).map(|&point| {
+                let dependencies: Option<BTreeSet<_>> = choice.all_producers().map(|&point| {
                     let target = target_body(&declarations, body.cfg, point)?;
                     (!bodies.get(&target)?.has_mixed_struct_result()).then_some(target)
                 }).collect();
@@ -5223,7 +5305,7 @@ fn closed_aggregates<'a>(
             let target = target_body(&declarations, body.cfg, point)?;
             Some((target, *identity_relays.get(&target)?))
         }) else { continue };
-        if !choice.leaves.iter().chain(&choice.sibling_calls).all(|&leaf| target_body(&declarations, body.cfg, leaf)
+        if !choice.all_producers().all(|&leaf| target_body(&declarations, body.cfg, leaf)
             .is_some_and(|target| outgoing.contains(&target)
                 && bodies.get(&target).is_some_and(|callee| !callee.has_mixed_struct_result())))
         { continue; }
@@ -5747,7 +5829,7 @@ fn closed_aggregates<'a>(
         }).collect::<BTreeMap<_, _>>();
         let mut shared_transfer_coverage = BTreeMap::new();
         let local_choice = local_choices.get(&key);
-        let orders_by_birth = local_choice.is_some_and(|choice| !choice.sibling_calls.is_empty())
+        let orders_by_birth = local_choice.is_some_and(|choice| !choice.sibling_calls.is_empty() || !choice.sibling_choices.is_empty())
             || recommitted.range((key, CfgPointId(0))..=(key, CfgPointId(usize::MAX))).next().is_some();
         let mut ranked_releases = BTreeMap::<CfgPointId, BTreeMap<CfgPointId, ClosedOwnerRelease>>::new();
         let mut record_release = |plan: &mut ClosedBody, exit, birth, release| {
@@ -5761,16 +5843,23 @@ fn closed_aggregates<'a>(
             Ok(())
         };
         if let Some(choice) = local_choice {
-            plan.local_choice_arms = choice.leaves.len();
+            plan.local_choice_arms.push((choice.conditional.0, choice.leaves.len()));
             if plan.input.is_some() {
                 return Err(format!("local conditional owner overlaps an owning formal in {:?}", body.source));
             }
             if let Some(item) = choice.item {
-                plan.local_choice_binding = Some((choice.block.0, item, choice.conditional.0));
+                plan.local_choice_bindings.insert((choice.block.0, item), choice.conditional.0);
             } else if let LocalChoiceUse::Consume { ordinal, .. } = choice.use_site {
                 plan.local_choice_immediate = Some((ordinal.0, choice.conditional.0));
             } else {
                 return Err("local conditional temporary has no consumer".into());
+            }
+            for sibling in &choice.sibling_choices {
+                plan.local_choice_arms.push((sibling.conditional.0, sibling.leaves.len()));
+                plan.local_choice_bindings.insert((choice.block.0, sibling.item), sibling.conditional.0);
+                plan.scope_exits.insert(choice.block.0, choice.exit);
+                record_release(&mut plan, choice.exit, sibling.join,
+                    ClosedOwnerRelease { receipt: sibling.conditional.0, guard: None })?;
             }
             let mut receipt = choice.conditional;
             for step in &choice.recommits {
@@ -5802,11 +5891,11 @@ fn closed_aggregates<'a>(
             }
             let owner = OwnerSource::Call(point);
             let mut endpoints = call_endpoints.get(&point).into_iter().flatten().copied();
-            if local_choice.is_some_and(|choice| choice.leaves.contains(&point)) {
+            if let Some(conditional) = local_choice.and_then(|choice| choice.arm_choice(point)) {
                 if previous.is_some() || discharged_by_inputs.contains_key(&(key, point)) || endpoints.next().is_some() {
                     return Err(format!("local conditional aggregate has competing owner routes in {:?}", body.source));
                 }
-                plan.calls.insert(call.0, ClosedCall::LocalChoiceArm);
+                plan.calls.insert(call.0, ClosedCall::LocalChoiceArm(conditional.0));
                 continue;
             }
             if matches!(return_route, Some(ClosedReturn::Structured { .. }))

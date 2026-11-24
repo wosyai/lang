@@ -969,6 +969,106 @@ fn aggregate_owner_recommit_preserves_the_original_base_across_ordinary_identity
 }
 
 #[test]
+fn independent_conditioned_owners_keep_separate_receipts_at_one_exit() {
+    let app = source("workbench", "src/independent_conditioned_owners.w");
+    let factory_fixture = include_str!("fixtures/structured-local-choice.w");
+    let (factory_source, _) = factory_fixture.split_once("u64(u64, bool) drive").unwrap();
+    for (variant, transfer) in [("release", false), ("transfer", true)] {
+        let mut text = factory_source.to_owned();
+        if transfer {
+            text.push_str("u64(Packet) sink = fn(packet) { packet.length };\n");
+        }
+        text.push_str(concat!(
+            "u64(bool, bool) drive = fn(left, right) {\n",
+            "    Packet first = if (left) { make_short(2) } else { make_long(3) };\n",
+            "    Packet second = if (right) { make_short(7) } else { make_long(9) };\n",
+            "    second.length;\n",
+        ));
+        text.push_str(if transfer { "    sink(first)\n};\n" } else { "    first.length\n};\n" });
+        let cases = [("ff", "false", "false"), ("ft", "false", "true"), ("tf", "true", "false"), ("tt", "true", "true")];
+        for (case, left, right) in cases {
+            text.push_str(&format!("u64() case_{case} = fn {{ drive({left}, {right}) }};\ncase_{case}();\n"));
+        }
+        text.push_str("%%end\n");
+        for (target, target_layout) in [("native64", ScalarTargetLayout::NATIVE64), ("wasm32", ScalarTargetLayout::WASM32)] {
+            for (route, project) in [("single", false), ("project", true)] {
+                let prepared = prepare_scalar_project(vec![(declarations(&app, &text), vec![])],
+                    vec![app.clone()], ScalarPreparationInputs { target_layout }).unwrap();
+                let build = analyze_scalar_build(&prepared);
+                assert!(build.diagnostics().is_empty(), "{variant}/{target}/{route}: {:?}", build.diagnostics());
+                let ir = if project { emit_scalar_build_project_llvm(&build) }
+                    else { wosy_compiler::emit_scalar_build_single_module_llvm(&build) }
+                    .unwrap_or_else(|error| panic!("{variant}/{target}/{route}: {error}")).to_text();
+                let context = Context::create();
+                let module = context.create_module_from_ir(
+                    MemoryBuffer::create_from_memory_range_copy(ir.as_bytes(), target)).unwrap();
+                module.verify().unwrap();
+                let symbol = |name: &str| if project { function_with_suffix(&module, name) } else { name.to_owned() };
+                let find = |name: &str| module.get_function(&symbol(name)).unwrap();
+                let primary = find("drive");
+                let factories = [find("make_short"), find("make_long")];
+                let sink = transfer.then(|| find("sink"));
+                let free = module.get_function("__wosy_core_free").unwrap();
+                let mut produced = [Vec::new(), Vec::new()];
+                let mut merges = Vec::new();
+                let mut released = Vec::new();
+                let mut passed = None;
+                for row in primary.get_basic_blocks().into_iter().flat_map(|block| block.get_instructions()) {
+                    let arg = |slot| row.get_operand(slot).unwrap().value().unwrap();
+                    if row.get_opcode() == InstructionOpcode::Phi && row.to_string().contains("phi ptr") {
+                        let incoming = (0..row.get_num_operands()).filter_map(|n| row.get_operand(n)?.value()).collect::<Vec<_>>();
+                        merges.push((inkwell::values::PhiValue::try_from(row).unwrap().as_basic_value(), incoming));
+                    }
+                    let Ok(call) = CallSiteValue::try_from(row) else { continue };
+                    let callee = call.get_called_fn_value().unwrap();
+                    if factories.contains(&callee) {
+                        let choice = usize::from(arg(0).into_int_value().get_zero_extended_constant().unwrap() >= 7);
+                        produced[choice].push((call.try_as_basic_value().basic().unwrap(), arg(1)));
+                    } else if Some(callee) == sink {
+                        assert!(passed.replace(arg(1)).is_none());
+                    } else if callee == free {
+                        released.push(arg(0));
+                    }
+                }
+                assert_eq!(merges.len(), 2);
+                let chosen = produced.map(|arms| {
+                    let [first, second] = arms.as_slice() else { panic!("{ir}") };
+                    assert_ne!(first.0, second.0);
+                    assert_eq!(first.1, second.1, "each choice uses one dedicated descriptor");
+                    let [(phi, incoming)] = merges.iter().filter(|(_, incoming)|
+                        incoming.contains(&first.0) && incoming.contains(&second.0)).collect::<Vec<_>>()[..]
+                    else { panic!("{ir}") };
+                    assert_eq!(incoming.len(), 2);
+                    (*phi, first.1)
+                });
+                assert_ne!(chosen[0].0, chosen[1].0);
+                assert_ne!(chosen[0].1, chosen[1].1);
+                if let Some(sink) = sink {
+                    assert_eq!(passed, Some(chosen[0].0));
+                    assert_eq!(released, [chosen[1].0]);
+                    let releases: Vec<_> = sink.get_basic_blocks().into_iter().flat_map(|block| block.get_instructions())
+                        .filter(|row| CallSiteValue::try_from(*row).ok().and_then(|call| call.get_called_fn_value()) == Some(free))
+                        .map(|row| row.get_operand(0).unwrap().value().unwrap()).collect();
+                    assert_eq!(releases, [sink.get_last_param().unwrap()]);
+                } else {
+                    assert!(passed.is_none());
+                    assert_eq!(released, [chosen[1].0, chosen[0].0], "true original birth order");
+                }
+                if let Some(out) = std::env::var_os("WOSY_INDEPENDENT_CHOICES_IR_DIR") {
+                    let out = std::path::PathBuf::from(out).join(format!("{variant}-{route}"));
+                    std::fs::create_dir_all(&out).unwrap();
+                    let mut witness = ir.replace("@main(", "@wosy_authored_main(");
+                    for (case, _, _) in cases {
+                        witness.push_str(&format!("\ndefine i64 @wosy_case_{case}() {{\nentry:\n  %v = call i64 @{}()\n  ret i64 %v\n}}\n", symbol(&format!("case_{case}"))));
+                    }
+                    std::fs::write(out.join(format!("{target}.ll")), witness).unwrap();
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn selected_recommitted_owner_returns_its_backing_to_the_caller() {
     let app = source("workbench", "src/selected_recommitted_return.w");
     let text = include_str!("fixtures/structured-local-choice.w")
