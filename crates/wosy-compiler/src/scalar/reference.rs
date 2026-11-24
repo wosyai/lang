@@ -370,6 +370,10 @@ impl<'a> ReferenceFlowBuilder<'a> {
             call_sites,
             origins: HashMap::new(),
             checked: HashSet::new(),
+            #[cfg(any(test, feature = "internal-checker"))]
+            binding_types: call_sites.contextual_formal.iter()
+                .map(|(binding, ty, _)| (binding.clone(), ty.clone())).collect(),
+            #[cfg(not(any(test, feature = "internal-checker")))]
             binding_types: HashMap::new(),
             structs,
             enums,
@@ -1227,6 +1231,12 @@ impl<'a> ReferenceFlowBuilder<'a> {
             }
             ScalarExpression::Call { arguments, .. } => {
                 let target = self.call_target(expression, ordinal)?;
+                #[cfg(any(test, feature = "internal-checker"))]
+                if let Some(context) = calls.contextual_calls.as_ref().and_then(|rows| rows.get(&ordinal)) {
+                    if target != context.target || self.binding_types.get(&context.binding) != Some(&context.ty) {
+                        return Err(self.missing_context(span, ReferenceAnalysisErrorReason::MissingResolvedBinding));
+                    }
+                }
                 let mut address = None;
                 let mut checked_release_address = None;
                 let mut named_release_binding = None;
@@ -6638,6 +6648,12 @@ enum MemberFacts {
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct FunctionCallSites {
     pub(super) boundary: CallableBoundary,
+    #[cfg(any(test, feature = "internal-checker"))]
+    contextual_owner: (ByteSpan, ByteSpan),
+    #[cfg(any(test, feature = "internal-checker"))]
+    contextual_formal: Option<(ReferenceBindingId, ScalarType, std::rc::Rc<str>)>,
+    #[cfg(any(test, feature = "internal-checker"))]
+    contextual_calls: Option<Box<HashMap<OccurrenceOrdinal, ContextualCallPlace>>>,
     pub(super) sites: Vec<ResolvedCallSite>,
     pub(super) arms: Vec<FunctionCallSites>,
     pub(super) occurrences: Vec<OccurrenceMetadata>,
@@ -6658,6 +6674,14 @@ pub(super) struct FunctionCallSites {
     pub(super) assignments: HashMap<(BlockOrdinal, usize), AssignmentGroup>,
     pub(super) conditionals: HashMap<OccurrenceOrdinal, ConditionalRegion>,
     pub(super) short_circuits: HashMap<OccurrenceOrdinal, ShortCircuitRegion>,
+}
+
+#[cfg(any(test, feature = "internal-checker"))]
+#[derive(Clone, Debug, PartialEq)]
+struct ContextualCallPlace {
+    target: ResolvedCallTarget,
+    binding: ReferenceBindingId,
+    ty: ScalarType,
 }
 
 impl FunctionCallSites {
@@ -6802,6 +6826,57 @@ impl ProjectCallSiteResults {
         match arm_index {
             Some(arm) => function.arms.get(arm),
             None => Some(function),
+        }
+    }
+
+    #[cfg(any(test, feature = "internal-checker"))]
+    pub(super) fn install_contextual_formal(
+        &mut self, item: usize, name: std::rc::Rc<str>, ty: ScalarType,
+    ) -> Option<()> {
+        if !is_integer_type(&ty) { return None; }
+        let module = self.modules.first_mut()?.as_mut().ok()?;
+        let body = module.functions.get_mut(&item)?;
+        if body.contextual_formal.is_some() || !body.arms.is_empty() { return None; }
+        let formal = super::contextual::contextual_formal(&module.initialization.source, body.contextual_owner.0);
+        body.contextual_formal = Some((formal, ty, name));
+        Some(())
+    }
+
+    #[cfg(any(test, feature = "internal-checker"))]
+    pub(super) fn install_contextual_call(
+        &mut self, item: usize, callee: usize, supply: super::contextual::ContextualSupplyAuthority,
+    ) -> Option<()> {
+        let (occurrence, span, binding, name, ty) = supply.into_parts();
+        let module = self.modules.first_mut()?.as_mut().ok()?;
+        let receiver = module.functions.get(&callee)?;
+        let (_, expected_type, expected_name) = receiver.contextual_formal.as_ref()?;
+        if &ty != expected_type || &name != expected_name { return None; }
+        let target = ResolvedCallTarget::ModuleCallable {
+            source: module.initialization.source.clone(),
+            declaration_span: receiver.contextual_owner.1,
+            concrete: ConcreteCallSelection::Declaration,
+        };
+        let body = module.functions.get_mut(&item)?;
+        if body.resolved_call_site(occurrence)?.target != target
+            || !body.checked_call_signatures.contains_key(&occurrence)
+            || body.occurrences.get(occurrence.0)?.span != span
+            || binding.source != module.initialization.source || binding.function_span != body.contextual_owner.0
+        {
+            return None;
+        }
+        if matches!(binding.kind, ReferenceBindingKind::ContextualFormal)
+            && body.contextual_formal.as_ref().is_none_or(|(formal, formal_type, formal_name)| {
+                formal != &binding || formal_type != &ty || formal_name != &name
+            })
+        {
+            return None;
+        }
+        match body.contextual_calls.get_or_insert_with(Default::default).entry(occurrence) {
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(ContextualCallPlace { target, binding, ty });
+                Some(())
+            }
+            std::collections::hash_map::Entry::Occupied(_) => None,
         }
     }
 
@@ -10109,6 +10184,12 @@ fn resolve_function_call_sites(
     };
     Ok(FunctionCallSites {
         boundary,
+        #[cfg(any(test, feature = "internal-checker"))]
+        contextual_owner: (function.span, function.name_span),
+        #[cfg(any(test, feature = "internal-checker"))]
+        contextual_formal: None,
+        #[cfg(any(test, feature = "internal-checker"))]
+        contextual_calls: None,
         sites: callable.sites,
         arms,
         occurrences: resolver.occurrences,

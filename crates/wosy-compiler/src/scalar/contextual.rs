@@ -80,6 +80,13 @@ pub(super) fn reported_error(span: SourceSpan, message: &str) -> Diagnostic {
     }
 }
 
+pub(super) fn contextual_formal(source: &SourceIdentity, function: ByteSpan) -> ReferenceBindingId {
+    ReferenceBindingId {
+        source: source.clone(), function_span: function,
+        declaration_span: function, block_span: function, kind: ReferenceBindingKind::ContextualFormal,
+    }
+}
+
 pub(super) fn prepare(
     canonical: &CanonicalCstRoot, roots: &[CstNode], diagnostics: &mut Vec<Diagnostic>, dormant: bool,
 ) -> ContextualPlaces {
@@ -247,17 +254,31 @@ pub(super) fn prepare(
                 !remove
             });
             for (index, occurrence) in result.inherited.iter().enumerate() {
-                result.dormant_operands.insert(occurrence.span, (index, ReferenceBindingId {
-                    source: canonical.source.clone(),
-                    function_span: occurrence.function,
-                    declaration_span: occurrence.function,
-                    block_span: occurrence.function,
-                    kind: ReferenceBindingKind::ContextualFormal,
-                }));
+                result.dormant_operands.insert(occurrence.span, (index, contextual_formal(&canonical.source, occurrence.function)));
             }
         }
     }
     result
+}
+
+/// Opaque, single-use evidence minted at the checked call's lexical sweep
+/// (or at formal propagation). No caller can wrap an arbitrary binding.
+#[cfg(any(test, feature = "internal-checker"))]
+pub(super) struct ContextualSupplyAuthority {
+    occurrence: super::reference::OccurrenceOrdinal,
+    span: ByteSpan,
+    binding: ReferenceBindingId,
+    name: std::rc::Rc<str>,
+    ty: ScalarType,
+}
+
+#[cfg(any(test, feature = "internal-checker"))]
+impl ContextualSupplyAuthority {
+    pub(super) fn into_parts(self) -> (
+        super::reference::OccurrenceOrdinal, ByteSpan, ReferenceBindingId, std::rc::Rc<str>, ScalarType,
+    ) {
+        (self.occurrence, self.span, self.binding, self.name, self.ty)
+    }
 }
 
 /// Closed, dormant call environment. This is not a prepared build project:
@@ -294,7 +315,8 @@ pub(super) enum DormantContextRejection {
 }
 
 /// Side-effect-free same-source, one-integer-name compatibility gate.
-/// Never hands a formal to ownership/reference analysis or the backend.
+/// Validate typed entry and call places with ordinary ownership checking,
+/// but never give the internal project or its formal to a backend.
 #[cfg(any(test, feature = "internal-checker"))]
 #[allow(dead_code)]
 pub(super) fn prepare_dormant_context(
@@ -318,6 +340,7 @@ pub(super) fn prepare_dormant_context(
     }
     let [first] = places.first_declarations.as_slice() else { return Err(Unsupported); };
     let ty = places.declarations[*first].ty.clone();
+    let name: std::rc::Rc<str> = places.declarations[*first].name.as_str().into();
     // Keep only fixed-size lexical activation coordinates for this one type.
     // The owning source retains the declaration catalog for project assembly.
     let mut lexical_by_owner = HashMap::<ByteSpan, Vec<(u32, ByteSpan, ByteSpan)>>::new();
@@ -331,7 +354,7 @@ pub(super) fn prepare_dormant_context(
     let uses = std::mem::take(&mut places.inherited);
     let project = project_from_declarations(vec![(source, Vec::new())], vec![canonical.source.clone()], inputs)
         .map_err(|_| Unsupported)?;
-    let (project, calls) = super::static_calls::prepare_project_occurrences(
+    let (project, mut calls) = super::static_calls::prepare_project_occurrences(
         typecheck_scalar_project_with_occurrences(project), &[],
     ).map_err(|_| Unsupported)?;
     let [module] = project.modules.as_slice() else { return Err(Unsupported); };
@@ -357,11 +380,13 @@ pub(super) fn prepare_dormant_context(
         if !std::mem::replace(&mut needs[index], true) { pending.push(index); }
     }
     struct Edge {
-        caller: ByteSpan,
+        caller: usize,
+        caller_span: ByteSpan,
         occurrence: ByteSpan,
+        ordinal: super::reference::OccurrenceOrdinal,
         target: ByteSpan,
         callee: usize,
-        lexical: Option<ByteSpan>,
+        lexical: Option<(ContextualSupplyAuthority, ByteSpan)>,
     }
     let mut edges = Vec::new();
     let mut parents = vec![Vec::new(); module.items.len()];
@@ -412,12 +437,20 @@ pub(super) fn prepare_dormant_context(
             }
             let binding = match active.last() {
                 None => None,
-                Some(&(scope, binding)) if occurrence.end <= scope.end && scope.start <= occurrence.start => Some(binding),
+                Some(&(scope, declaration)) if occurrence.end <= scope.end && scope.start <= occurrence.start => {
+                    Some((ContextualSupplyAuthority {
+                        occurrence: call.ordinal, span: occurrence, name: std::rc::Rc::clone(&name), ty: ty.clone(),
+                        binding: ReferenceBindingId {
+                            source: canonical.source.clone(), function_span: function.span,
+                            declaration_span: declaration, block_span: scope, kind: ReferenceBindingKind::Declared,
+                        },
+                    }, declaration))
+                }
                 Some(_) => return Err(Unsupported),
             };
             if binding.is_none() { parents[callee].push(caller); }
-            edges.push(Edge { caller: function.span, occurrence, target: *declaration_span,
-                callee, lexical: binding });
+            edges.push(Edge { caller, caller_span: function.span, occurrence, ordinal: call.ordinal,
+                target: *declaration_span, callee, lexical: binding });
         }
     }
     // Propagate a single named demand over authenticated reverse edges.
@@ -440,11 +473,25 @@ pub(super) fn prepare_dormant_context(
     if needs[*by_target.get(&declaration.range).ok_or(Unsupported)?] {
         return Err(MissingAtRoot(topology.occurrences.get(root.0).ok_or(Unsupported)?.span));
     }
-    Ok(DormantContextReceipt {
-        ty,
-        edges: edges.into_iter().filter(|edge| needs[edge.callee]).map(|edge| DormantContextEdge {
-            occurrence: edge.occurrence, target: edge.target,
-            supplied: edge.lexical.map_or(DormantContextSupply::Formal(edge.caller), DormantContextSupply::Lexical),
-        }).collect(),
-    })
+    for (index, needed) in needs.iter().enumerate() {
+        if *needed { calls.install_contextual_formal(index, std::rc::Rc::clone(&name), ty.clone()).ok_or(Unsupported)?; }
+    }
+    let mut verified = Vec::new();
+    for edge in edges.into_iter().filter(|edge| needs[edge.callee]) {
+        let (authority, supplied) = match edge.lexical {
+            Some((authority, declaration)) => (authority, DormantContextSupply::Lexical(declaration)),
+            None if needs[edge.caller] => (ContextualSupplyAuthority {
+                occurrence: edge.ordinal, span: edge.occurrence, name: std::rc::Rc::clone(&name), ty: ty.clone(),
+                binding: contextual_formal(&canonical.source, edge.caller_span),
+            }, DormantContextSupply::Formal(edge.caller_span)),
+            None => return Err(Unsupported),
+        };
+        calls.install_contextual_call(edge.caller, edge.callee, authority).ok_or(Unsupported)?;
+        verified.push(DormantContextEdge { occurrence: edge.occurrence, target: edge.target, supplied });
+    }
+    let references = super::reference::analyze_project_references(&project.modules, &calls);
+    if !references.errors().is_empty() {
+        return Err(Unsupported);
+    }
+    Ok(DormantContextReceipt { ty, edges: verified })
 }
