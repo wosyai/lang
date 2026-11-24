@@ -2020,6 +2020,43 @@ cases.extend([
         2,b"unsupported analysis"),
 ])
 
+ordered_rectangular_citation = """%%start
+    i16(i16,i16) leaf = fn(tag,value) { if (tag >= 0) { value } else { 4 } };
+    i16(i16,i16) producer = fn(tag,value) { i16 result = leaf(tag,value); result };
+    proof top for producer(p,q) -> (out) where (p >= 2 && q == 7) ensures (out <= 9) {
+        core.use(middle(p,q));
+    }
+    proof middle for producer(a,b) -> (out) where (a >= 1 && b >= 7 && b <= 8) ensures (out <= 8) {
+        core.use(issued(a,b));
+    }
+    proof issued for producer(t,v) -> (out) where (t >= 0 && v >= 6 && v <= 8) ensures (out <= 8) {}
+%%end"""
+startup_rectangular_citation = ordered_rectangular_citation.replace("%%end", f"""
+    i16 startup_value = producer(3,7);
+    core.require(startup_value == 7, {report(48,"PAIR-CITATION-STARTUP")});
+%%end""")
+cases.extend([
+    ("exact-startup-rectangular-citation-control", startup_rectangular_citation
+        .replace("core.use(middle(p,q));", "").replace("core.use(issued(a,b));", ""), 0, b""),
+    ("exact-startup-rectangular-citation-refused", startup_rectangular_citation, 2, b"unsupported analysis"),
+])
+cases.extend([
+    ("ordered-calling-citation-unary-stronger-guard", ordered_calling_citation.replace("arg >= 0", "arg >= 1 && arg <= 5", 1),
+        0, b""),
+    ("ordered-calling-citation-pair-guarded", ordered_rectangular_citation, 0, b""),
+    ("ordered-calling-citation-pair-weaker-first", ordered_rectangular_citation.replace("p >= 2", "p >= -1"),
+        2, b"unsupported analysis"),
+    ("ordered-calling-citation-pair-wrong-second", ordered_rectangular_citation.replace("q == 7", "q == 6"),
+        2, b"unsupported analysis"),
+    ("ordered-calling-citation-pair-arguments-swapped", ordered_rectangular_citation.replace("middle(p,q)", "middle(q,p)"),
+        2, b"unsupported analysis"),
+    ("ordered-calling-citation-pair-show-refuted",
+        ordered_rectangular_citation.replace("core.use(middle(p,q));", "core.use(middle(p,q)); core.show(out > 7);"),
+        1, b"proof obligation failed"),
+    ("ordered-calling-citation-pair-refuses-failed-peer",
+        ordered_rectangular_citation.replace("ensures (out <= 8) {}", "ensures (out <= 7) {}"),
+        2, b"unsupported analysis"),
+])
 ordered_calling_citation_chain = ordered_calling_citation.replace(
     "proof uses_issued", "proof top for producer(arg) -> (out) where (arg >= 0) ensures (out <= 8) { core.use(uses_issued(arg)); }\n    proof uses_issued")
 cases.extend([
@@ -2155,6 +2192,7 @@ correlated_array_witness = """%%start
 %%end"""
 cases.append(("ordinary-fixed-array-symbolic-cells-correlated", correlated_array_witness, 1, b"proof obligation failed"))
 proof_diagnostic_notes = {
+    "ordered-calling-citation-pair-show-refuted": b"symbolic call can return 7",
     "ordinary-verified-unary-entry-refuted": b"symbolic call can return 2",
     "exact-startup-verified-unary-entry-refuted": b"call returned 5",
     "ordinary-fixed-array-symbolic-cells-correlated": b"symbolic call can return cell [0] = 6",

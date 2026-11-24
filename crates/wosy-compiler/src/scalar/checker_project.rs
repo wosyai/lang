@@ -4614,11 +4614,13 @@ impl<'a> SelectedSymbolicProof<'a, '_> {
             .ok_or(ProjectCheck::Unsupported)?).ok_or(ProjectCheck::Unsupported)?;
         let cases = bare.into_iter().flat_map(|(first, rest)| std::iter::once(first).chain(rest))
             .map(|case| (case, None)).chain(authored.iter().map(|(case, step)| (case, step.as_ref())));
+        let has_citation = authored.iter().any(|(_, step)| matches!(step, Some(MainFlowAuthoredShows::CallingCitation { .. })));
         let mut plans = Vec::new();
         for (case, step) in cases {
-            let shows = match step {
-                None => &[][..],
-                Some(MainFlowAuthoredShows::Rectangular { shows, .. }) => shows.as_slice(),
+            let (shows, citation, following_show) = match step {
+                None => (&[][..], None, None),
+                Some(MainFlowAuthoredShows::Rectangular { shows, .. }) => (shows.as_slice(), None, None),
+                Some(MainFlowAuthoredShows::CallingCitation { peer, show }) => (&[][..], Some(*peer), show.as_ref()),
                 _ => return Err(ProjectCheck::Unsupported),
             };
             charge_call_work(&mut work, shows.len()).ok_or(ProjectCheck::Unsupported)?;
@@ -4632,17 +4634,24 @@ impl<'a> SelectedSymbolicProof<'a, '_> {
                     PartitionedProofGoal::EntryAffineEquality { slot, transform },
                 _ => return Err(ProjectCheck::Unsupported),
             };
-            if case.proof_source != source || case.guard.domain.is_some() || case.guard.comparisons.len() > 2 {
+            if case.proof_source != source || case.guard.domain.is_some()
+                || (!has_citation && case.guard.comparisons.len() > 2)
+                || (citation.is_some() && case.guard.always_rejects)
+            {
                 return Err(ProjectCheck::Unsupported);
             }
             if case.guard.always_rejects { continue; }
             let mut domains = full.clone();
             let mut clipped = [false; 2];
-            for guard in &case.guard.comparisons {
-                let seen = clipped.get_mut(guard.slot).ok_or(ProjectCheck::Unsupported)?;
-                if *seen { return Err(ProjectCheck::Unsupported); }
-                *seen = true;
-                domains[guard.slot] = domains[guard.slot].keep_relation(guard.relation, guard.bound);
+            if has_citation {
+                clip_calling_proof_domains(&mut domains, &case.guard.comparisons, &mut work)?;
+            } else {
+                for guard in &case.guard.comparisons {
+                    let seen = clipped.get_mut(guard.slot).ok_or(ProjectCheck::Unsupported)?;
+                    if *seen { return Err(ProjectCheck::Unsupported); }
+                    *seen = true;
+                    domains[guard.slot] = domains[guard.slot].keep_relation(guard.relation, guard.bound);
+                }
             }
             for (slot, guard) in case.guard.boolean.iter().enumerate() {
                 if let Some(value) = guard {
@@ -4650,7 +4659,7 @@ impl<'a> SelectedSymbolicProof<'a, '_> {
                     domains[slot] = IntegerSet::singleton(&BigInt::from(u8::from(*value)));
                 }
             }
-            plans.push((case, goal, domains, shows));
+            plans.push((case, goal, domains, shows, citation, following_show));
         }
         let cursor = ExactCallCursor::named_pair_root(body, &output.ty, full.clone(), bool_axis).ok_or(ProjectCheck::Unsupported)?;
         let mut private_effects = OrderedFailures::default();
@@ -4669,23 +4678,53 @@ impl<'a> SelectedSymbolicProof<'a, '_> {
         } else { None };
         let mut dependencies = issuer.map(|_| reached);
         let mut applicable = false;
-        'proofs: for (case, goal, guards, shows) in plans {
-            for (span, show) in shows {
-                let checked = verify_named_pair_return(body, &returned, &guards, show.partitioned(), &mut work)
+        let mut peer_nodes = Vec::new();
+        let mut peer_path = Vec::new();
+        let mut cited_bounds = PeerPredicateBounds::default();
+        if has_citation {
+            peer_nodes = plans.iter().map(|(case, goal, guards, shows, citation, following_show)| {
+                CallingPeerNode::plan(case.proof.start, *citation, *goal, !shows.is_empty() || following_show.is_some(), guards)
+            }).collect();
+            CallingPeerNode::bind_edges(&mut peer_nodes, &mut work)?;
+        }
+        'proofs: for (index, (case, goal, guards, shows, citation, following_show)) in plans.iter().enumerate() {
+            if citation.is_some() {
+                CallingPeerNode::establish(&mut peer_nodes, index, following_show.is_some(), &mut peer_path, &output.ty,
+                    &mut cited_bounds, |node, _| {
+                        let Some((relation, bound)) = node.goal else { return false; };
+                        let Ok(domains) = <&[IntegerSet; 2]>::try_from(node.domains) else { return false; };
+                        verify_named_pair_return(body, &returned, domains, PartitionedProofGoal::Literal(relation, bound), &mut work)
+                            .is_some_and(|verified| verified.applicable && verified.failure.is_none())
+                    })?;
+                applicable = true;
+                if following_show.is_none() { continue; }
+            }
+            let bare = shows.is_empty() && following_show.is_none();
+            if has_citation && bare && matches!(peer_nodes[index].state, LocalPeerState::Terminal(_)) {
+                applicable = true;
+                continue;
+            }
+            let steps = shows.iter().map(|(span, show)| (*span, show.partitioned()))
+                .chain(following_show.iter().map(|show| (show.span, PartitionedProofGoal::Literal(show.relation, &show.bound))));
+            for (span, goal) in steps {
+                let checked = verify_named_pair_return(body, &returned, guards, goal, &mut work)
                     .ok_or(ProjectCheck::Unsupported)?;
                 applicable |= checked.applicable;
                 if let Some(failure) = checked.failure {
-                    self.record(case, function, source, effects.records.len(), failure, Some(*span))?;
+                    self.record(case, function, source, effects.records.len(), failure, Some(span))?;
                     continue 'proofs;
                 }
             }
-            let checked = verify_named_pair_return(body, &returned, &guards, goal, &mut work)
+            let checked = verify_named_pair_return(body, &returned, guards, *goal, &mut work)
                 .ok_or(ProjectCheck::Unsupported)?;
             applicable |= checked.applicable;
             if let Some(failure) = checked.failure {
+                if has_citation && bare { peer_nodes[index].state = LocalPeerState::Rejected; }
                 self.record(case, function, source, effects.records.len(), failure, None)?;
+            } else if has_citation && bare && checked.applicable {
+                peer_nodes[index].state = LocalPeerState::Terminal(index);
             } else if let (Some(issuer), true) = (issuer, checked.applicable) {
-                let result = match goal {
+                let result = match *goal {
                     PartitionedProofGoal::Literal(relation, bound)
                         if Some(relation) == IntegerRelation::from_operator(&BinaryOperator::Equal) =>
                         VerifiedSymbolicResult::Constant { bound, shared: std::cell::OnceCell::new() },
@@ -4787,7 +4826,7 @@ impl<'a> SelectedSymbolicProof<'a, '_> {
             MainFlowProofCases::Authored(cases) => (None, cases.as_slice()),
         };
         let authored_mode = !authored.is_empty();
-        let mut has_citation = false;
+        let has_citation = authored.iter().any(|(_, step)| matches!(step, Some(MainFlowAuthoredShows::CallingCitation { .. })));
         let [parameter] = body.boundary.parameters.as_slice() else { return Err(ProjectCheck::Unsupported); };
         let [output] = body.boundary.results.as_slice() else { return Err(ProjectCheck::Unsupported); };
         use super::checker_flow::PartitionedProofGoal;
@@ -4807,7 +4846,6 @@ impl<'a> SelectedSymbolicProof<'a, '_> {
         let mut plans = Vec::new();
         for (case, step) in cases {
             let citation = if let Some(MainFlowAuthoredShows::CallingCitation { peer, .. }) = step {
-                has_citation = true;
                 Some(*peer)
             } else {
                 None
@@ -4839,7 +4877,7 @@ impl<'a> SelectedSymbolicProof<'a, '_> {
             };
             if case.proof_source != source || case.guard.domain.is_some()
                 || (!metered && case.bound.literal().is_some() && issuer.is_none() && !case.guard.always_rejects)
-                || case.guard.comparisons.len() > 1
+                || (!has_citation && case.guard.comparisons.len() > 1)
             {
                 return Err(ProjectCheck::Unsupported);
             }
@@ -4847,10 +4885,17 @@ impl<'a> SelectedSymbolicProof<'a, '_> {
                 return Err(ProjectCheck::Unsupported);
             }
             if !case.guard.always_rejects {
-                let applicable = match case.guard.comparisons.as_slice() {
-                    [] => domain.clone(),
-                    [comparison] if comparison.slot == 0 => domain.keep_relation(comparison.relation, comparison.bound),
-                    _ => return Err(ProjectCheck::Unsupported),
+                let applicable = if has_citation {
+                    let mut applicable = [domain.clone()];
+                    clip_calling_proof_domains(&mut applicable, &case.guard.comparisons, &mut proof_work)?;
+                    let [applicable] = applicable;
+                    applicable
+                } else {
+                    match case.guard.comparisons.as_slice() {
+                        [] => domain.clone(),
+                        [comparison] if comparison.slot == 0 => domain.keep_relation(comparison.relation, comparison.bound),
+                        _ => return Err(ProjectCheck::Unsupported),
+                    }
                 };
                 if citation.is_some() && applicable.is_empty() {
                     return Err(ProjectCheck::Unsupported);
@@ -4878,46 +4923,21 @@ impl<'a> SelectedSymbolicProof<'a, '_> {
         let mut peer_path = Vec::new();
         let mut cited_bounds = PeerPredicateBounds::default();
         if has_citation {
-            super::checker_flow::charge_call_work(&mut proof_work, plans.len())
-                .ok_or(ProjectCheck::Unsupported)?;
-            let by_declaration: HashMap<_, _> = plans.iter().enumerate()
-                .map(|(slot, plan)| (plan.0.proof.start, slot)).collect();
-            for (_, step, shows, citation, goal, domain) in &plans {
-                let next = citation.map(|peer| by_declaration.get(&peer).copied().ok_or(ProjectCheck::Unsupported)).transpose()?;
-                let goal = match goal {
-                    PartitionedProofGoal::Literal(relation, bound) => Some((*relation, *bound)),
-                    PartitionedProofGoal::EntryEquality(_) | PartitionedProofGoal::EntryAffineEquality { .. } => None,
-                };
-                peer_nodes.push(CallingPeerNode {
-                    state: if step.is_none() && shows.is_empty() && goal.is_some() {
-                        LocalPeerState::Pending
-                    } else {
-                        LocalPeerState::Rejected
-                    },
-                    next, goal, domain,
-                });
-            }
+            peer_nodes = plans.iter().map(|(case, step, shows, citation, goal, domain)| {
+                CallingPeerNode::plan(case.proof.start, *citation, *goal, step.is_some() || !shows.is_empty(),
+                    std::slice::from_ref(domain))
+            }).collect();
+            CallingPeerNode::bind_edges(&mut peer_nodes, &mut proof_work)?;
         }
         'proofs: for (index, (case, step, ordered_steps, citation, goal, proof_domain)) in plans.iter().enumerate() {
             if citation.is_some() {
-                // A mixed proof verifies the cited dependency first, but
-                // its own goal is not a reusable implication edge.
-                let at = if step.is_some() { peer_nodes[index].next.ok_or(ProjectCheck::Unsupported)? } else { index };
-                let settled = resolve_local_peer_path(
-                    &mut peer_nodes, at, &mut peer_path, |node| &mut node.state, |node| node.next,
-                    |node, _| {
-                        let Some((relation, bound)) = node.goal else { return false; };
-                        super::checker_flow::verify_partitioned_call_return(
-                            body, &result, node.domain, false,
+                CallingPeerNode::establish(&mut peer_nodes, index, step.is_some(), &mut peer_path, &output.ty,
+                    &mut cited_bounds, |node, _| {
+                        let (Some((relation, bound)), [domain]) = (node.goal, node.domains) else { return false; };
+                        super::checker_flow::verify_partitioned_call_return(body, &result, domain, false,
                             PartitionedProofGoal::Literal(relation, bound), Some(&mut proof_work),
                         ).is_some_and(|verified| verified.applicable && verified.failure.is_none())
-                    },
-                    |nodes, at, cited, _| match (nodes[cited].goal, nodes[at].goal) {
-                        (Some(premise), Some(conclusion)) => cited_bounds.implies(&output.ty, premise, conclusion),
-                        _ => false,
-                    },
-                );
-                if !matches!(settled, LocalPeerState::Terminal(_)) { return Err(ProjectCheck::Unsupported); }
+                    })?;
                 applicable = true;
                 if step.is_none() { continue; }
             }
@@ -5584,11 +5604,9 @@ impl<'a> MainFlowProofCase<'a> {
             Ok((shown, literal))
         };
         let step = if let Some((peer, show)) = citation {
-            if plan.filter.as_ref().is_some_and(|atoms| atoms.len() > 1)
-                || peer.filter.as_ref().is_some_and(|atoms| atoms.len() > 1)
-                || peer.peer_literal_goal().is_none() || (!peer.steps.items.is_empty() && peer.direct_peer_use().is_none())
-                || !plan.same_peer_context(peer) || plan.peer_literal_goal().is_none()
-                || !supported_calling_proof_body(plan.typed.body, plan.typed.result_type)
+            if peer.peer_literal_goal().is_none() || (!peer.steps.items.is_empty() && peer.direct_peer_use().is_none())
+                || !plan.same_peer_target(peer) || plan.peer_literal_goal().is_none()
+                || !(supported_calling_proof_body(body, plan.typed.result_type) || supports_rectangular_calling_proof(body))
             {
                 return Err(ProjectCheck::Unsupported);
             }
@@ -7120,10 +7138,88 @@ impl<'a> LocalPeerNode<'a> {
 
 #[cfg(feature = "internal-checker")]
 struct CallingPeerNode<'a> {
+    declaration: u32,
+    requested: Option<u32>,
     state: LocalPeerState,
     next: Option<usize>,
     goal: Option<(IntegerRelation, &'a BigInt)>,
-    domain: &'a IntegerSet,
+    domains: &'a [IntegerSet],
+}
+
+#[cfg(feature = "internal-checker")]
+impl<'a> CallingPeerNode<'a> {
+    fn plan(
+        declaration: u32, requested: Option<u32>, goal: super::checker_flow::PartitionedProofGoal<'a>,
+        has_show: bool, domains: &'a [IntegerSet],
+    ) -> Self {
+        let goal = match goal {
+            super::checker_flow::PartitionedProofGoal::Literal(relation, bound) => Some((relation, bound)),
+            _ => None,
+        };
+        Self {
+            declaration, requested, goal, domains, next: None,
+            state: if goal.is_some() && !has_show && domains.iter().all(|domain| !domain.is_empty()) {
+                LocalPeerState::Pending
+            } else {
+                LocalPeerState::Rejected
+            },
+        }
+    }
+
+    fn bind_edges(nodes: &mut [Self], work: &mut usize) -> Result<(), ProjectCheck> {
+        use super::checker_flow::charge_call_work;
+        charge_call_work(work, nodes.len()).ok_or(ProjectCheck::Unsupported)?;
+        let by_declaration = nodes.iter().enumerate().map(|(index, node)| (node.declaration, index))
+            .collect::<HashMap<_, _>>();
+        if by_declaration.len() != nodes.len() { return Err(ProjectCheck::Unsupported); }
+        for node in 0..nodes.len() {
+            let Some(requested) = nodes[node].requested else { continue; };
+            let next = *by_declaration.get(&requested).ok_or(ProjectCheck::Unsupported)?;
+            let (current, cited) = (nodes[node].domains, nodes[next].domains);
+            if current.len() != cited.len() { return Err(ProjectCheck::Unsupported); }
+            for (current, cited) in current.iter().zip(cited) {
+                charge_call_work(work, current.interval_count().checked_add(cited.interval_count())
+                    .and_then(|count| count.checked_add(1)).ok_or(ProjectCheck::Unsupported)?)
+                    .ok_or(ProjectCheck::Unsupported)?;
+                if current.is_empty() || cited.is_empty() || !current.is_subset_of(cited) {
+                    return Err(ProjectCheck::Unsupported);
+                }
+            }
+            nodes[node].next = Some(next);
+        }
+        Ok(())
+    }
+
+    fn establish<'ty>(
+        nodes: &mut [Self], index: usize, has_show: bool, path: &mut Vec<(usize, usize)>,
+        output_type: &'ty ScalarType, bounds: &mut PeerPredicateBounds<'ty>,
+        verify: impl FnMut(&Self, usize) -> bool,
+    ) -> Result<(), ProjectCheck> {
+        // A consumer with its own following show is checked on its original
+        // returns. That mixed derivation is not another reusable edge.
+        let first = if has_show { nodes[index].next.ok_or(ProjectCheck::Unsupported)? } else { index };
+        let resolved = resolve_local_peer_path(nodes, first, path, |node| &mut node.state, |node| node.next, verify,
+            |nodes, node, cited, _| match (nodes[cited].goal, nodes[node].goal) {
+                (Some(premise), Some(conclusion)) => bounds.implies(output_type, premise, conclusion),
+                _ => false,
+            });
+        if matches!(resolved, LocalPeerState::Terminal(_)) { Ok(()) } else { Err(ProjectCheck::Unsupported) }
+    }
+}
+
+#[cfg(feature = "internal-checker")]
+fn clip_calling_proof_domains(
+    mut domains: impl AsMut<[IntegerSet]>, guards: &[ImportedEntryGuard<'_>], work: &mut usize,
+) -> Result<(), ProjectCheck> {
+    use super::checker_flow::charge_call_work;
+    charge_call_work(work, guards.len()).ok_or(ProjectCheck::Unsupported)?;
+    let domains = domains.as_mut();
+    for guard in guards {
+        let domain = domains.get_mut(guard.slot).ok_or(ProjectCheck::Unsupported)?;
+        charge_call_work(work, domain.interval_count()).ok_or(ProjectCheck::Unsupported)?;
+        *domain = domain.keep_relation(guard.relation, guard.bound);
+    }
+    Ok(())
 }
 
 #[cfg(feature = "internal-checker")]
@@ -18465,7 +18561,7 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
         assert!(failed_step.witness.intervals_at(0, 0).unwrap().eq([(&BigInt::from(0), &BigInt::from(127))]));
         for (label, rejected) in [
             ("failed dependency precedes show", false_show.replace("out <= 7", "out <= 6")),
-            ("different guard", text.replacen("arg >= 0", "arg == 0", 1)),
+            ("guard does not imply peer guard", text.replacen("arg >= 0", "arg >= -1", 1)),
             ("reversed step order", text.replace("core.use(issued(arg)); core.show(out >= 7);",
                 "core.show(out >= 7); core.use(issued(arg));")),
             ("mixed proof cannot be cited", text.replace("%%end",
@@ -18499,12 +18595,79 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
         for (label, rejected) in [
             ("later edge does not imply equality", text.replace("out <= 8", "out == 7")),
             ("refuted terminal", text.replace("out == 7", "out == 6")),
-            ("wrong guard", text.replacen("arg >= 0", "arg == 0", 1)),
+            ("guard does not imply peer guard", text.replacen("arg >= 0", "arg >= -1", 1)),
             ("cycle", text.replace("core.use(issued(arg))", "core.use(top(arg))")),
         ] {
             let result = run(&rejected);
             assert!(matches!(result, Err(ProjectCheck::Unsupported)), "{label}: {:?}", result.err());
         }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordered_calling_citation_checks_joint_guard_implication_before_reusing_partitions() {
+        let file = source("src/main.w", "ordered-rectangular-guarded-citation");
+        let text = r#"%%start
+            i16(i16,i16) leaf = fn(tag,value) {
+                if (tag >= 0) { value } else { 4 }
+            };
+            i16(i16,i16) producer = fn(tag,value) { i16 result = leaf(tag,value); result };
+            proof top for producer(p,q) -> (out) where (p >= 2 && q == 7) ensures (out <= 9) {
+                core.use(middle(p,q));
+            }
+            proof middle for producer(a,b) -> (out) where (a >= 1 && b >= 7 && b <= 8) ensures (out <= 8) {
+                core.use(issued(a,b));
+            }
+            proof issued for producer(t,v) -> (out) where (t >= 0 && v >= 6 && v <= 8) ensures (out <= 8) {}
+        %%end"#;
+        let run = |text: &str, scope| {
+            let (_, proof) = crate::parse_proof_source(file.clone(), text.to_owned(), &[]).ok().unwrap();
+            check_loaded_ordered_proof_diagnostics_in_scope::<true>(
+                Vec::new(), vec![(proof, Vec::new())], vec![file.clone()], inputs(), scope, Vec::new(),
+            )
+        };
+        let scope = ScalarCheckerScope::CurrentPackage;
+        let verified = run(text, scope).unwrap();
+        assert!(verified.active && verified.symbolic_diagnostic.is_none() && verified.directives.is_empty());
+        let authored = text.replace("core.use(middle(p,q));", "core.use(middle(p,q)); core.show(out > 7);");
+        let failure = run(&authored, scope).unwrap().symbolic_diagnostic.unwrap();
+        let show = failure.failed_step.unwrap().range;
+        assert_eq!(&authored[show.start as usize..show.end as usize], "core.show(out > 7)");
+        assert_eq!(failure.returned, BigInt::from(7));
+        assert!(failure.witness.intervals_at(0, 1).unwrap().eq([(&7.into(), &7.into())]));
+        let cycle = text.replace("p >= 2 && q == 7", "p >= 0 && q >= 6 && q <= 8")
+            .replace("a >= 1 && b >= 7", "a >= 0 && b >= 6")
+            .replace("core.use(issued(a,b))", "core.use(top(a,b))");
+        for (label, rejected) in [
+            ("weaker first coordinate", text.replace("p >= 2", "p >= -1")),
+            ("wrong second coordinate", text.replace("q == 7", "q == 6")),
+            ("nonimplication", text.replace("out <= 9", "out <= 7")),
+            ("false peer", text.replace("ensures (out <= 8) {}", "ensures (out <= 7) {}")),
+            ("wrong argument order", text.replace("middle(p,q)", "middle(q,p)")),
+            ("acyclic check", cycle),
+        ] {
+            assert!(matches!(run(&rejected, scope), Err(ProjectCheck::Unsupported)), "{label}");
+        }
+        assert!(matches!(run(text, ScalarCheckerScope::MainFlowOnly), Err(ProjectCheck::Unsupported)));
+        // A real, otherwise-supported initializer must not borrow symbolic
+        // citation authority. Keep the module name distinct from the local
+        // producer binding so static shadowing cannot mask the reached path.
+        let reached = text.replace("%%end", &format!(
+            "i16 startup_value = producer(3,7); core.require(startup_value == 7, {OUTPUT}); %%end",
+        ));
+        let control = reached.replace("core.use(middle(p,q));", "").replace("core.use(issued(a,b));", "");
+        let supported = run(&control, scope).unwrap();
+        assert!(supported.active && supported.diagnostics.is_empty() && supported.directives.is_empty());
+        let rejected = run(&reached, scope);
+        assert!(matches!(rejected, Err(ProjectCheck::Unsupported)), "startup citation: {:?}", rejected.err());
+
+        let unary = r#"%%start
+            i8(i8) leaf = fn(n) { if (n >= 0) { 7 } else { 4 } };
+            i8(i8) producer = fn(n) { i8 result = leaf(n); result };
+            proof guarded for producer(a) -> (out) where (a >= 1 && a <= 6) ensures (out <= 7) { core.use(issued(a)); }
+            proof issued for producer(n) -> (out) where (n >= 0) ensures (out == 7) {}
+        %%end"#;
+        assert!(run(unary, scope).unwrap().active);
     }
 
     #[cfg(feature = "internal-checker")]
@@ -18609,7 +18772,7 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
         for (label, rejected) in [
             ("refuted terminal", text.replace("out == 7", "out == 8")),
             ("not implied", text.replace("out <= 7", "out <= 6")),
-            ("different guard", text.replacen("arg >= 0", "arg == 0", 1)),
+            ("guard does not imply peer guard", text.replacen("arg >= 0", "arg >= -1", 1)),
             ("constant-empty guard", text.replace("arg >= 0", "false")),
             ("empty integer guard", text.replace("arg >= 0", "arg < -128")),
             ("self citation", text.replace("core.use(issued(arg))", "core.use(uses_issued(arg))")),
