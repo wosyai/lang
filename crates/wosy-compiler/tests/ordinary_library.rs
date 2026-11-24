@@ -1066,6 +1066,54 @@ fn d0024_recursive_ownership_preserves_live_holders_and_carried_owner() {
 }
 
 #[test]
+fn selected_holder_ends_before_two_independent_owner_recommits() {
+    let app = source("workbench", "src/paired_array_handoff.w");
+    let text = include_str!("fixtures/paired-array-handoff.w");
+    for (target, target_layout) in [
+        ("native64", ScalarTargetLayout::NATIVE64),
+        ("wasm32", ScalarTargetLayout::WASM32),
+    ] {
+        let prepared = prepare_scalar_project(
+            vec![(declarations(&app, text), Vec::new())], vec![app.clone()],
+            ScalarPreparationInputs { target_layout },
+        ).unwrap_or_else(|error| panic!("{target}: {:?}", error.diagnostics));
+        let build = analyze_scalar_build(&prepared);
+        assert!(build.diagnostics().is_empty(), "{target}: {:?}", build.diagnostics());
+        let ir = emit_scalar_build_project_llvm(&build).unwrap_or_else(|error| panic!("{target}: {error}")).to_text();
+        let context = Context::create();
+        let buffer = MemoryBuffer::create_from_memory_range_copy(ir.as_bytes(), target);
+        let module = context.create_module_from_ir(buffer).unwrap();
+        module.verify().unwrap();
+
+        let drive = function_with_suffix(&module, "drive");
+        let descend = function_with_suffix(&module, "descend");
+        let reader = function_with_suffix(&module, "read_selected");
+        let carry = function_with_suffix(&module, "carry");
+        let calls = direct_calls(&module, &drive);
+        let selected: Vec<_> = calls.iter().filter(|name| [descend.as_str(), reader.as_str(), carry.as_str()]
+            .contains(&name.as_str())).map(String::as_str).collect();
+        assert_eq!(selected, [descend.as_str(), reader.as_str(), carry.as_str(), carry.as_str()], "{target}: {ir}");
+        for runtime in ["__wosy_core_alloc", "__wosy_core_free"] {
+            assert_eq!(calls.iter().filter(|name| name.as_str() == runtime).count(), 2, "{target}: {ir}");
+            assert!(!direct_calls(&module, &carry).iter().any(|name| name == runtime));
+        }
+        assert!(direct_calls(&module, &descend).contains(&descend), "{target}: {ir}");
+        assert!(direct_calls(&module, &carry).contains(&carry), "{target}: {ir}");
+
+        if let Some(out) = std::env::var_os("WOSY_PAIRED_HANDOFF_IR_DIR") {
+            let mut ir = ir.replace("@main(", "@wosy_authored_main(");
+            for name in ["choose_left", "choose_right"] {
+                let symbol = function_with_suffix(&module, name);
+                ir.push_str(&format!(
+                    "\ndefine i8 @wosy_{name}() {{\nentry:\n  %result = call i8 @{symbol}()\n  ret i8 %result\n}}\n"
+                ));
+            }
+            std::fs::write(std::path::PathBuf::from(out).join(format!("{target}.ll")), ir).unwrap();
+        }
+    }
+}
+
+#[test]
 fn runtime_array_recommit_keeps_the_owner_until_its_real_end() {
     let recursive = r#"
 (u8[], u64)(u8[], u64, u64) carry = fn(bytes, depth, count) {
