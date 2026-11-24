@@ -61,6 +61,7 @@ pub(crate) struct CallablePointFacts {
     pub(super) checked_pointee_reads: Vec<super::CfgPointId>,
     pub(super) joined_reborrow_descendants: Vec<super::CfgPointId>,
     pub(super) joined_shared_aliases: Vec<(super::CfgPointId, super::CfgPointId)>,
+    pub(super) exclusive_scalar_write_moves: Vec<(super::CfgPointId, super::CfgPointId, super::CfgPointId)>,
     pub(super) shared_scalar_read_calls: Vec<(super::CfgPointId, super::CfgPointId)>,
     pub(super) joined_shared_return_calls: Vec<(super::CfgPointId, super::CfgPointId)>,
     pub(super) joined_checked_releases: Vec<super::CfgPointId>,

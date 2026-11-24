@@ -2114,7 +2114,41 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         }
                     })()
                 } else { None };
+                let exclusive_write = if self.joined_local_reborrow && calls.local_exclusive_scalar_writers.contains(&ordinal) {
+                    (|| {
+                        let CfgPointKind::Call { argument_points, .. } = &call else { return None };
+                        let [value, argument] = argument_points.as_slice() else { return None };
+                        let read = self.cfg.points.get(argument.0)?;
+                        let scalar = self.cfg.points.get(value.0)?;
+                        let CfgPointKind::Read { binding } = &read.kind else { return None };
+                        let moved = self.cursor?;
+                        let moved_point = self.cfg.points.get(moved.0)?;
+                        let parameter = signature?.parameters.get(1)?;
+                        let argument_ordinal = self.expression_ordinal(parent, OccurrenceEdge::CallArgument(1));
+                        let scalar_ordinal = self.expression_ordinal(parent, OccurrenceEdge::CallArgument(0));
+                        let valid_scalar = match &scalar.kind {
+                            CfgPointKind::Read { binding } => matches!(calls.prepared_plain_name(scalar_ordinal),
+                                Some(PlainNameIdentity::Lexical(expected)) if expected == binding),
+                            CfgPointKind::Evaluate(ScalarExpression::Integer { .. } | ScalarExpression::Float { .. }
+                                | ScalarExpression::Boolean { .. } | ScalarExpression::Char { .. }) => true,
+                            _ => false,
+                        };
+                        (valid_scalar && read.scope == scope && scalar.scope == scope && moved_point.scope == scope
+                            && scalar.successors.as_slice() == [read.id]
+                            && read.successors.as_slice() == [moved]
+                            && calls.structure.checked_types.expressions.get(&scalar_ordinal) == signature?.parameters.first()
+                            && calls.structure.checked_types.expressions.get(&argument_ordinal) == Some(parameter)
+                            && matches!(calls.prepared_plain_name(argument_ordinal),
+                                Some(PlainNameIdentity::Lexical(expected)) if expected == binding)
+                            && matches!(&moved_point.kind, CfgPointKind::Move { owner, place, ty } if owner == binding
+                                && &place.binding == binding && place.projections.is_empty() && ty == parameter)
+                        ).then_some((moved, *argument))
+                    })()
+                } else { None };
                 let id = self.point_with_origins(call, span, scope, cast_origins.clone());
+                if let Some((moved, argument)) = exclusive_write {
+                    self.proof_points.exclusive_scalar_write_moves.push((moved, argument, id));
+                }
                 if let Some((argument, joined, receipt, returns_formal)) = read_effect_argument {
                     if receipt {
                         self.aggregate_facts.receipt_loan_read_calls.insert(id, (argument, ordinal));
@@ -7202,6 +7236,7 @@ struct ReferenceTransferCfg<'a> {
     checked_pointee_reads: &'a [CfgPointId],
     joined_reborrow_descendants: &'a [CfgPointId],
     joined_shared_aliases: &'a [(CfgPointId, CfgPointId)],
+    exclusive_scalar_write_moves: &'a [(CfgPointId, CfgPointId, CfgPointId)],
     shared_scalar_read_calls: &'a [(CfgPointId, CfgPointId)],
     joined_shared_return_calls: &'a [(CfgPointId, CfgPointId)],
     joined_checked_releases: &'a [CfgPointId],
@@ -7235,6 +7270,7 @@ impl<'a> ReferenceTransferCfg<'a> {
             checked_pointee_reads: proof.map_or(&[], |proof| &proof.checked_pointee_reads),
             joined_reborrow_descendants: proof.map_or(&[], |proof| &proof.joined_reborrow_descendants),
             joined_shared_aliases: proof.map_or(&[], |proof| &proof.joined_shared_aliases),
+            exclusive_scalar_write_moves: proof.map_or(&[], |proof| &proof.exclusive_scalar_write_moves),
             shared_scalar_read_calls: proof.map_or(&[], |proof| &proof.shared_scalar_read_calls),
             joined_shared_return_calls: proof.map_or(&[], |proof| &proof.joined_shared_return_calls),
             joined_checked_releases: proof.map_or(&[], |proof| &proof.joined_checked_releases),
@@ -7279,6 +7315,50 @@ fn shared_scalar_read_effect(
     (!effect.descriptor).then_some(effect)
 }
 
+fn exact_exclusive_scalar_writer(function: &ScalarFunction, calls: &FunctionCallSites) -> bool {
+    (|| {
+        if !function.generic_parameters.is_empty() || !function.overload_arms.is_empty() { return None; }
+        let [value, pointer] = calls.boundary.parameters.as_slice() else { return None };
+        let ScalarType::CheckedReference { mutability: ScalarReferenceMutability::Mutable, inner } = &pointer.ty
+            else { return None };
+        if !aggregate::ordinary_value(inner) || &value.ty != inner.as_ref()
+            || !calls.boundary.root_outputs.iter().all(|output| output.ty == ScalarType::Unit)
+            || calls.boundary.root_outputs.len() > 1
+        { return None; }
+        let root = calls.structure.root;
+        let [item] = calls.structure.blocks.get(root.0)?.items.as_slice() else { return None };
+        let BlockItemKind::Assignment { group } = item.kind else { return None };
+        let assignment = calls.assignments.get(&(group.block, group.item))?;
+        let evaluations = assignment.rhs_evaluations();
+        let destinations = assignment.destinations();
+        let ([rhs], [target]) = (evaluations.as_slice(), destinations.as_slice()) else { return None };
+        let OccurrenceNode::Expression(address) = *calls.structure.edges.get(&(
+            OccurrenceParent::Place(target.destination), OccurrenceEdge::DereferencePointer,
+        ))? else { return None };
+        let formal = |occurrence, parameter: &ParameterSlot| matches!(calls.prepared_plain_name(occurrence),
+            Some(PlainNameIdentity::Lexical(binding)) if binding.kind == ReferenceBindingKind::Declared
+                && binding.declaration_span == parameter.span);
+        (assignment.projected_outputs().len() == 0
+            && calls.structure.checked_types.places.get(&target.destination) == Some(inner.as_ref())
+            && calls.structure.checked_types.expressions.get(&address) == Some(&pointer.ty)
+            && calls.structure.checked_types.expressions.get(&rhs.expression) == Some(&value.ty)
+            && formal(address, pointer) && formal(rhs.expression, value)).then_some(())
+    })().is_some()
+}
+
+fn attach_local_exclusive_writers(calls: &mut FunctionCallSites, source: &SourceIdentity, writers: &HashSet<ByteSpan>) {
+    if writers.is_empty() { return; }
+    calls.local_exclusive_scalar_writers = calls.call_occurrences.iter().filter_map(|call| {
+        let ResolvedCallTarget::ModuleCallable { source: target, declaration_span, concrete: ConcreteCallSelection::Declaration } =
+            &calls.sites.get(call.site)?.target else { return None };
+        (target == source && writers.contains(declaration_span)
+            && !calls.declared_unsafe_calls.contains(&call.ordinal.0)).then_some(call.ordinal)
+    }).collect();
+    for arm in &mut calls.arms {
+        attach_local_exclusive_writers(arm, source, writers);
+    }
+}
+
 fn joined_reborrow_calls_are_supported(
     source: &SourceIdentity, calls: &FunctionCallSites,
     effects: Option<&HashMap<ByteSpan, SharedScalarReadEffect>>,
@@ -7303,7 +7383,8 @@ fn joined_reborrow_calls_are_supported(
         if calls.declared_unsafe_calls.contains(&call.ordinal.0) {
             return false;
         }
-        if shared_scalar_read_effect(source, calls, call.ordinal, target, effects).is_some() {
+        if calls.local_exclusive_scalar_writers.contains(&call.ordinal)
+            || shared_scalar_read_effect(source, calls, call.ordinal, target, effects).is_some() {
             return true;
         }
         matches!(target,
@@ -7475,6 +7556,7 @@ fn joined_root_reborrow_binding<'a>(
     aliases: &[(CfgPointId, CfgPointId)],
     descendant_sites: &[CfgPointId],
     read_calls: &[(CfgPointId, CfgPointId)],
+    write_moves: &[(CfgPointId, CfgPointId, CfgPointId)],
     return_calls: &[(CfgPointId, CfgPointId)],
     checked_releases: &[CfgPointId],
     scope_exits: Option<&'a HashMap<CfgPointId, super::control::ScopeExitBindings>>,
@@ -7633,6 +7715,15 @@ fn joined_root_reborrow_binding<'a>(
                 {
                     continue;
                 }
+                if writable && birth != point.id && write_moves.binary_search_by_key(&deref.id, |&(moved, _, _)| moved).ok()
+                    .is_some_and(|index| {
+                        let (_, read, call) = write_moves[index];
+                        read == rest.id && deref.successors.as_slice() == [call]
+                            && matches!(&deref.kind, CfgPointKind::Move { owner, .. } if owner == holder)
+                    })
+                {
+                    continue;
+                }
                 if !writable && matches!(&deref.kind, CfgPointKind::Call { output: 0, argument_points, .. }
                     if matches!(argument_points.as_slice(), [read] if *read == rest.id)
                         || matches!(argument_points.as_slice(), [scalar, read] if *scalar < *read && *read == rest.id))
@@ -7660,7 +7751,8 @@ fn joined_root_reborrow_binding<'a>(
             }
             CfgPointKind::Assign { target, .. } | CfgPointKind::Borrow { place: target, .. }
             | CfgPointKind::Move { place: target, .. } | CfgPointKind::DeferredMove { place: target, .. }
-                if holders.contains_key(&target.binding)
+                if (holders.contains_key(&target.binding)
+                    && write_moves.binary_search_by_key(&rest.id, |&(moved, _, _)| moved).is_err())
                     || carrier_move.is_some_and(|moved| &target.binding == binding && moved != rest.id) =>
                 return None,
             _ => (),
@@ -8797,7 +8889,7 @@ fn transfer_reference_facts(
             joined_root_reborrow_binding(
                 original_points, initial_point, cfg.checked_binding_initializers, cfg.checked_pointee_reads,
                 cfg.joined_shared_aliases, cfg.joined_reborrow_descendants, cfg.shared_scalar_read_calls,
-                cfg.joined_shared_return_calls, cfg.joined_checked_releases, cfg.scope_exit_bindings,
+                cfg.exclusive_scalar_write_moves, cfg.joined_shared_return_calls, cfg.joined_checked_releases, cfg.scope_exit_bindings,
                 cfg.checked_named_scalar_stores, &grouped_installs, cfg.raw_address_exposures,
             )
         } else {
@@ -8829,6 +8921,16 @@ fn transfer_reference_facts(
             matches!(original_points[issuance.0].kind, CfgPointKind::ReborrowThrough {
                 mode: ScalarReferenceMutability::Shared, ..
             }).then_some((family, binding, argument))
+        });
+        let joined_write = joined_family.as_ref().and_then(|family| {
+            if !matches!(initial_point.kind, CfgPointKind::Move { .. }) { return None; }
+            let index = cfg.exclusive_scalar_write_moves.binary_search_by_key(&id, |&(moved, _, _)| moved).ok()?;
+            let (_, argument, _) = cfg.exclusive_scalar_write_moves[index];
+            let CfgPointKind::Read { binding } = &original_points[argument.0].kind else { return None };
+            let issuance = *family.shape.holders.get(binding)?;
+            (issuance != family.first_issuance && matches!(original_points[issuance.0].kind, CfgPointKind::ReborrowThrough {
+                mode: ScalarReferenceMutability::Mutable, ..
+            })).then_some((family, binding, argument))
         });
         let joined_return = joined_family.as_ref().and_then(|family| {
             let &(holder, argument) = family.shape.returned_aliases.get(&id)?;
@@ -8936,6 +9038,29 @@ fn transfer_reference_facts(
                         &liveness, &cfg.facts,
                         &state, id, &loan.origin_place, LoanAccess::ReadThrough(loan),
                     );
+                    if !origins.is_empty() {
+                        errors.push(ReferenceAnalysisError::ConflictingPlace {
+                            source_span: initial_point.source_span.clone(), origins,
+                        });
+                    }
+                } else {
+                    errors.push(ReferenceAnalysisError::MissingContext {
+                        source_span: initial_point.source_span.clone(),
+                        reason: ReferenceAnalysisErrorReason::MissingRequiredDereferenceOrigin,
+                    });
+                }
+            }
+            if let Some((family, holder, argument)) = joined_write {
+                let candidate = family.live_authorized_origin(original_points, cfg.facts, &state, holder, argument)
+                    .and_then(|origin| match cfg.facts.get(origin.0)? {
+                        ReferenceOrigin::Fresh { loan, .. } if loan.mode == ScalarReferenceMutability::Mutable =>
+                            Some(InvalidationCandidate { origin, place: loan.origin_place.clone(), loan: loan.clone() }),
+                        _ => None,
+                    });
+                if let Some(candidate) = candidate {
+                    let place = available_place(&candidate.place);
+                    let origins = conflicting_live_loan(&liveness, &cfg.facts, &state, id, &place,
+                        LoanAccess::WriteThrough(&candidate, None));
                     if !origins.is_empty() {
                         errors.push(ReferenceAnalysisError::ConflictingPlace {
                             source_span: initial_point.source_span.clone(), origins,
@@ -11192,6 +11317,7 @@ pub(super) struct FunctionCallSites {
     pub(super) call_occurrences: Vec<CallOccurrence>,
     imported_shared_readers: HashMap<OccurrenceOrdinal, (SourceSpan, SharedScalarReadEffect)>,
     pub(super) local_shared_call_families: HashMap<OccurrenceOrdinal, bool>,
+    local_exclusive_scalar_writers: HashSet<OccurrenceOrdinal>,
     declared_unsafe_calls: BTreeSet<usize>,
     pub(super) callable_escapes: HashSet<SourceSpan>,
     overload_reservation_sites: Vec<CallOccurrence>,
@@ -13195,6 +13321,7 @@ fn resolve_module_call_sites(
     stage_observations::record_call_sites();
     let mut functions = BTreeMap::new();
     let mut shared_scalar_read_effects = HashMap::new();
+    let mut exclusive_scalar_writers = HashSet::new();
     let mut shared_reader_forwarders = Vec::new();
     for (index, item) in items.iter().enumerate() {
         if let ScalarItem::Function(function) = item {
@@ -13208,6 +13335,9 @@ fn resolve_module_call_sites(
             )?;
             if select_executable_calls {
                 calls.self_tail_candidates = self_tail::select(source, function, &calls);
+                if exact_exclusive_scalar_writer(function, &calls) {
+                    exclusive_scalar_writers.insert(function.name_span);
+                }
                 if let Some(effect) = SharedScalarReadEffect::prepare(source, function, &calls) {
                     shared_scalar_read_effects.insert(function.name_span, effect);
                 } else if let Some((target, kind)) = shared_scalar_reader_forward_target(source, function, &calls) {
@@ -13220,6 +13350,7 @@ fn resolve_module_call_sites(
     if select_executable_calls {
         for calls in functions.values_mut() {
             close_local_shared_call_families(source, calls, &shared_scalar_read_effects);
+            attach_local_exclusive_writers(calls, source, &exclusive_scalar_writers);
         }
     }
     let mut initialization = module_initialization_region(source, items, namespace_bindings);
@@ -13516,6 +13647,7 @@ fn resolve_function_call_sites(
         occurrences: resolver.occurrences,
         call_occurrences: callable.call_occurrences,
         imported_shared_readers: HashMap::new(),
+        local_exclusive_scalar_writers: HashSet::new(),
         local_shared_call_families: HashMap::new(),
         declared_unsafe_calls: callable.declared_unsafe_calls,
         callable_escapes: resolver.callable_escapes,
@@ -14724,6 +14856,7 @@ fn derive_function_specialized_copy_policies<'a>(
                     checked_pointee_reads: &template_result.proof_points.checked_pointee_reads,
                     joined_reborrow_descendants: &template_result.proof_points.joined_reborrow_descendants,
                     joined_shared_aliases: &template_result.proof_points.joined_shared_aliases,
+                    exclusive_scalar_write_moves: &template_result.proof_points.exclusive_scalar_write_moves,
                     shared_scalar_read_calls: &template_result.proof_points.shared_scalar_read_calls,
                     joined_shared_return_calls: &template_result.proof_points.joined_shared_return_calls,
                     joined_checked_releases: &template_result.proof_points.joined_checked_releases,

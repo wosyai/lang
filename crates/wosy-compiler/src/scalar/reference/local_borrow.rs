@@ -724,6 +724,7 @@ pub(super) mod tests {
             sites: vec![], arms: vec![], occurrences: vec![], call_occurrences: vec![],
             imported_shared_readers: HashMap::new(),
             local_shared_call_families: HashMap::new(),
+            local_exclusive_scalar_writers: HashSet::new(),
             declared_unsafe_calls: BTreeSet::new(), callable_escapes: HashSet::new(),
             overload_reservation_sites: vec![], self_tail_candidates: vec![], allocation_length_calls: vec![],
             allocation_length_call_targets: HashMap::new(), checked_call_signatures: HashMap::new(),

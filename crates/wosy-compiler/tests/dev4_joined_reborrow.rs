@@ -858,6 +858,20 @@ fn joined_exclusive_descendant_transfers_scalar_write_until_last_use() {
 }
 
 #[test]
+fn joined_exclusive_descendant_can_transfer_one_checked_scalar_write_to_local_callee() {
+    let program = joined_with_pointer_read(
+        "*u8 frozen = &(*child); u8 during = pointer(frozen); *!u8 nested = &!(*child); \
+         u8 value = seen + 2; change(value, nested); u8 via_call = *child; \
+         *child = seen + 4; u8 changed = *child; u8 left = first; u8 right = second;",
+        "*value",
+    ).replace("%%start\n", "%%start\nunit(u8, *!u8) change = fn(value, target) { *target = value; };\n")
+        .replace("*u8 child = &(*parent);", "*!u8 child = &!(*parent);")
+        .replace("    seen\n", "    if (during != seen || via_call != seen + 2) { 0 } else { if (choose) { if (changed == 11 && left == 11 && right == 9) { seen } else { 0 } } else { if (changed == 13 && left == 7 && right == 13) { seen } else { 0 } } }\n");
+    assert!(program.contains("change(value, nested)"));
+    check_case(&program, Expected::Valid, Some("WOSY_JOINED_EXCLUSIVE_CALLEE_IR_DIR"));
+}
+
+#[test]
 fn joined_mutable_child_writes_in_separate_arms_after_edge_local_freeze() {
     let program = joined_with_pointer_read(
         "u8 observed = if (choose) { *u8 frozen = &(*child); u8 read = pointer(frozen); *child = seen + 4; read } \
