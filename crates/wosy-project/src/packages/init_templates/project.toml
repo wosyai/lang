@@ -25,6 +25,7 @@ command = ["python3", "scripts/run-wasmtime"]
 
 [targets.app]
 root = "src/main.w"
+default_profile = "dev"
 
 [targets.app.artifacts.main]
 artifact = "Main"

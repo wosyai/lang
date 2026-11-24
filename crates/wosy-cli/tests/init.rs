@@ -68,6 +68,15 @@ fn init_creates_a_parseable_package_with_empty_lock_and_named_profiles() {
         pass(wosy(package, &["init"]));
         pass(wosy(package, &["parse"]));
         assert!(package.join(".wosy/cst/current.json").is_file());
+        let manifest = fs::read_to_string(package.join("wosy.toml"))
+            .unwrap()
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap();
+        assert_eq!(manifest["package"]["default_target"].as_str(), Some("app"));
+        assert_eq!(
+            manifest["targets"]["app"]["default_profile"].as_str(),
+            Some("dev"),
+        );
         assert_eq!(
             ProjectContext::load_parse_target(package, None).unwrap().comment_categories,
             [

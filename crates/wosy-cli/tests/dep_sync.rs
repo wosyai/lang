@@ -1271,6 +1271,10 @@ fn stdlib_resolves_the_same_modules_in_selected_local_and_locked_packages() {
     let std_manifest_bytes = fs::read(&std_manifest_path).unwrap();
     let mut std_manifest = read_toml(&std_manifest_path);
     assert_eq!(std_manifest["package"]["default_target"].as_str(), Some("smoke"));
+    assert_eq!(
+        std_manifest["targets"]["smoke"]["default_profile"].as_str(),
+        Some("dev"),
+    );
     assert_eq!(std_manifest["targets"]["smoke"]["root"].as_str(), Some("tests/smoke.w"));
     assert_eq!(fs::read(stdlib.join("wosy.lock")).unwrap(), b"version = 1\n");
     assert_eq!(fs::read(stdlib.join("wosy.meta.json")).unwrap(), b"{}\n");

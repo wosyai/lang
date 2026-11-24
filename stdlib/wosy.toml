@@ -18,6 +18,7 @@ command = ["python3", "scripts/run-wasmtime"]
 
 [targets.smoke]
 root = "tests/smoke.w"
+default_profile = "dev"
 
 [targets.smoke.artifacts.main]
 artifact = "Main"
