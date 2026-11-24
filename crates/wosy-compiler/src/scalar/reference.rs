@@ -3822,21 +3822,18 @@ impl<'a> ReferenceFlowBuilder<'a> {
             .then(|| u64::try_from(elements.len()).ok()).flatten()
     }
 
-    // Match only a binding whose conditional transfers a freshly created
-    // arm-local owner on each edge. No enclosing owners are merged.
+    // Each complete edge transfers a freshly created arm-local owner.
     fn widened_join_inputs(
         &self,
-        binding: &ScalarBinding,
+        value: &ScalarExpression,
+        destination: &ScalarType,
         occurrence: OccurrenceOrdinal,
         scope: ReferenceScopeId,
     ) -> Option<[(usize, ByteSpan); 2]> {
-        let [receiver] = binding.receivers.as_slice() else { return None };
         if scope != ReferenceScopeId(0) || !self.generic_parameters.is_empty()
-            || binding.is_allocation || binding.fallible_assignment.is_some()
-            || binding.output_origin != ScalarBindingOutputOrigin::SingleExpression
-            || !matches!(receiver.ty, ScalarType::RuntimeArray { .. })
+            || !matches!(destination, ScalarType::RuntimeArray { .. })
         { return None; }
-        let ScalarExpression::If { then_branch, else_branch, .. } = &binding.value else { return None };
+        let ScalarExpression::If { then_branch, else_branch, .. } = value else { return None; };
         let ConditionalRegion::Value { then_block, else_block, .. } =
             self.call_sites.conditionals.get(&occurrence)? else { return None };
         let arm = |block: &ScalarBlock, ordinal: BlockOrdinal| {
@@ -3844,7 +3841,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 block.items.as_slice() else { return None };
             let [local_receiver] = local.receivers.as_slice() else { return None };
             if block.unsafe_context || &local_receiver.name != name || self.names.contains_key(name)
-                || !aggregate::same_runtime_array_type(&local_receiver.ty, &receiver.ty)
+                || !aggregate::same_runtime_array_type(&local_receiver.ty, destination)
             { return None; }
             // The arm has no effect on an enclosing owner.
             Self::pure_widened_literal_count(local)?;
@@ -4869,8 +4866,10 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         }
                         _ => (false, false),
                     };
-                    let widened_join = outputs.secondary.is_empty()
-                        && self.widened_join_inputs(binding, primary_ordinal, scope).is_some_and(|arms| {
+                    let widened_join = outputs.secondary.is_empty() && !binding.is_allocation
+                        && binding.fallible_assignment.is_none() && binding_region.receivers().len() == 1
+                        && binding.output_origin == ScalarBindingOutputOrigin::SingleExpression
+                        && self.widened_join_inputs(primary, &receiver.ty, primary_ordinal, scope).is_some_and(|arms| {
                             self.aggregate_result.widened_join_arms.extend(arms);
                             self.aggregate_result.widened_join_receivers.insert((receiver.span.start, receiver.span.end));
                             true
@@ -5442,6 +5441,23 @@ impl<'a> ReferenceFlowBuilder<'a> {
                                 .is_some_and(|(a, b)| aggregate::same_runtime_array_type(a, b)))
                             .then_some((call, destination, source.declaration_span, target.declaration_span))
                     })();
+                    let widened_join_replace = (|| {
+                        let owners = self.widened_arrays.as_ref()?;
+                        let ([target], [value @ ScalarExpression::If { .. }]) =
+                            (assignment.targets.as_slice(), assignment.values.as_slice()) else { return None; };
+                        if !matches!(target.place, ScalarPlace::Name { .. }) { return None; }
+                        let evaluation = group.rhs_evaluations().next()?.expression;
+                        let destination = group.destinations().next()?.destination;
+                        let DirectDestinationIdentity::Existing(target) = calls.prepared_direct_destination(destination)?
+                        else { return None; };
+                        if target.block_span != block.span || !owners.contains(target) { return None; }
+                        let ty = self.binding_types.get(target)?;
+                        let arms = self.widened_join_inputs(value, ty, evaluation, scope)?;
+                        Some((destination, evaluation, target.declaration_span, arms))
+                    })();
+                    if let Some((_, _, _, arms)) = widened_join_replace {
+                        self.aggregate_result.widened_join_arms.extend(arms);
+                    }
                     let mut values = Vec::new();
                     for evaluation in group.rhs_evaluations() {
                         let value = &assignment.values[evaluation.position];
@@ -5597,7 +5613,10 @@ impl<'a> ReferenceFlowBuilder<'a> {
                                 *destination == slot.destination && *owner == id.declaration_span);
                             let widened_owning_replace = widened_owning_replace.filter(|(_, destination, _, target)|
                                 *destination == slot.destination && *target == id.declaration_span);
+                            let widened_join_replace = widened_join_replace.filter(|(destination, _, target, _)|
+                                *destination == slot.destination && *target == id.declaration_span && capture.is_none());
                             if widened_rebind.is_none() && widened_roundtrip.is_none() && widened_owning_replace.is_none()
+                                && widened_join_replace.is_none()
                                 && self.widened_arrays.as_ref().is_some_and(|owners| owners.contains(&id))
                                 && matches!(&assign, CfgPointKind::Assign { target, .. } if target.projections.is_empty())
                             {
@@ -5621,6 +5640,10 @@ impl<'a> ReferenceFlowBuilder<'a> {
                                 self.proof_points.widened_rebind_points.get_or_insert_with(HashSet::new).insert(emitted.install);
                                 self.aggregate_result.widened_owning_receives.push((emitted.rhs, call, source, target,
                                     Some((emitted.install, destination.0))));
+                            }
+                            if let Some((destination, rhs, target, _)) = widened_join_replace {
+                                self.proof_points.widened_rebind_points.get_or_insert_with(HashSet::new).insert(emitted.install);
+                                self.aggregate_result.widened_join_replacements.insert(destination.0, (rhs.0, emitted.install, target));
                             }
                             self.author_direct_assignment(emitted, existing_prepared && capture.is_none()
                                 && assignment.targets.len() == 1 && assignment.values.len() == 1);

@@ -1264,6 +1264,7 @@ pub(super) struct AggregateFlowResult {
     pub(super) widened_literal_factory: Option<(ByteSpan, OccurrenceOrdinal)>,
     pub(super) widened_join_arms: BTreeMap<usize, ByteSpan>,
     pub(super) widened_fixed_copies: BTreeMap<(u32, u32), (ByteSpan, u64)>,
+    pub(super) widened_join_replacements: BTreeMap<usize, (usize, CfgPointId, ByteSpan)>,
     pub(super) widened_join_receivers: BTreeSet<(u32, u32)>,
     pub(super) widened_rebinds: BTreeMap<usize, ClosedWidenedRebind>,
     pub(super) borrowed_extent_observer: Option<(CfgPointId, OccurrenceOrdinal, ByteSpan)>,
@@ -1507,7 +1508,7 @@ impl AggregateFlowResult {
     }
 
     pub(super) fn has_observations(&self) -> bool {
-        !self.widened_fixed_copies.is_empty() || !self.widened_owning_receives.is_empty() || self.widened_literal_factory.is_some() || !self.widened_join_receivers.is_empty() || !self.widened_rebinds.is_empty() || self.borrowed_extent_observer.is_some() || self.borrowed_extent_call.is_some() || !self.widened_borrowed_extent_calls.is_empty() || self.borrowed_extent_forward.is_some()
+        !self.widened_fixed_copies.is_empty() || !self.widened_owning_receives.is_empty() || self.widened_literal_factory.is_some() || !self.widened_join_receivers.is_empty() || !self.widened_join_replacements.is_empty() || !self.widened_rebinds.is_empty() || self.borrowed_extent_observer.is_some() || self.borrowed_extent_call.is_some() || !self.widened_borrowed_extent_calls.is_empty() || self.borrowed_extent_forward.is_some()
             || self.array_formal_extent_required || self.literal_array_index_required.is_some() || self.literal_array_extent_required.is_some() || self.proved_literal_array_route_ref().is_some()
             || (self.checked_producer_authoritative && !self.checked_producer_backing.is_empty())
             || self.checked_backing_assignment.is_some() || self.checked_backing_forward.is_some()
@@ -2981,6 +2982,7 @@ pub(crate) struct ClosedBody {
     pub(crate) array_descriptor_return: bool,
     pub(crate) widened_join_arms: BTreeMap<usize, ByteSpan>,
     pub(crate) widened_fixed_copies: BTreeMap<(u32, u32), (ByteSpan, u64)>,
+    pub(crate) widened_join_replacements: BTreeMap<usize, (usize, CfgPointId, ByteSpan)>,
     pub(crate) widened_join_receivers: BTreeSet<(u32, u32)>,
     pub(crate) widened_rebinds: BTreeMap<usize, ClosedWidenedRebind>,
     pub(crate) borrowed_extent_observer: Option<(usize, ByteSpan)>,
@@ -6724,10 +6726,11 @@ fn closed_aggregates<'a>(
                 if !facts.widened_fixed_copies.is_empty() {
                     result.bodies.entry(key).or_default().widened_fixed_copies = facts.widened_fixed_copies.clone();
                 }
-                if !facts.widened_join_receivers.is_empty() {
+                if !facts.widened_join_receivers.is_empty() || !facts.widened_join_replacements.is_empty() {
                     let plan = result.bodies.entry(key).or_default();
                     plan.widened_join_arms = facts.widened_join_arms.clone();
                     plan.widened_join_receivers = facts.widened_join_receivers.clone();
+                    plan.widened_join_replacements = facts.widened_join_replacements.clone();
                 }
                 if !facts.widened_rebinds.is_empty() {
                     result.bodies.entry(key).or_default().widened_rebinds = facts.widened_rebinds.clone();

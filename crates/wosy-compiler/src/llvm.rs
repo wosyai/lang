@@ -274,6 +274,9 @@ fn runtime_allocation_access(
     let widened_rebind_points = plan.filter(|plan| !plan.widened_rebinds.is_empty())
         .map(|plan| plan.widened_rebinds.values().map(|rebind| rebind.point).collect::<std::collections::HashSet<_>>());
     let widened_owning_install = plan.and_then(|plan| plan.widened_owning_roundtrip).map(|(_, install, _)| install);
+    let widened_join_replacements = plan.filter(|plan| !plan.widened_join_replacements.is_empty())
+        .map(|plan| plan.widened_join_replacements.values().map(|(_, install, _)| *install)
+            .collect::<std::collections::HashSet<_>>());
     let widened_owning_replacements = plan.filter(|plan| !plan.widened_owning_receives.is_empty())
         .map(|plan| plan.widened_owning_receives.values()
             .filter_map(|(_, _, replace)| replace.map(|(install, _)| install))
@@ -309,6 +312,7 @@ fn runtime_allocation_access(
             CfgPointKind::Assign { target, rhs_point, .. } if target.projections.is_empty() => {
                 if widened_rebind_points.as_ref().is_some_and(|points| points.contains(&point.id))
                     || widened_owning_install == Some(point.id)
+                    || widened_join_replacements.as_ref().is_some_and(|points| points.contains(&point.id))
                     || widened_owning_replacements.as_ref().is_some_and(|points| points.contains(&point.id))
                 {
                     // This dominating existing-owner transfer re-keys the
@@ -1958,7 +1962,7 @@ fn store_binding_outputs<'ctx, 'module>(
     if aggregate_transfer::install_widened_owning_receiver(context, state, binding, &value)? {
         return Ok(());
     }
-    if store_widened_join(state, binding, &value)? {
+    if store_widened_join(context, state, binding, &value)? {
         return Ok(());
     }
     if store_widened_move(state, binding, &value)? {
@@ -1987,6 +1991,7 @@ fn store_binding_outputs<'ctx, 'module>(
 }
 
 fn store_widened_join<'ctx>(
+    context: &'ctx Context,
     state: &mut EmitState<'ctx, '_>,
     binding: &crate::ScalarBinding,
     value: &EmitValue<'ctx>,
@@ -1997,17 +2002,42 @@ fn store_widened_join<'ctx>(
     if !plan.widened_join_receivers.contains(&(receiver.name_span.start, receiver.name_span.end)) {
         return Ok(false);
     }
+    install_widened_join(context, state, (&receiver.name, receiver.name_span, &receiver.ty), false, value)?;
+    Ok(true)
+}
+
+fn install_widened_join<'ctx>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, '_>,
+    (name, declaration, ty): (&str, wosy_syntax::ByteSpan, &ScalarType),
+    replace: bool,
+    value: &EmitValue<'ctx>,
+) -> Result<(), String> {
     let EmitValue::Basic(BasicValueEnum::StructValue(pair)) = value else {
         return Err("missing checked widened array join descriptor".into());
     };
+    if pair.get_type() != aggregate_transfer::array_descriptor_type(context) {
+        return Err("invalid checked widened array join descriptor".into());
+    }
     let backing = state.builder.build_extract_value(*pair, 0, "widened_join_backing")
         .map_err(builder_error)?.into_pointer_value();
     let count = state.builder.build_extract_value(*pair, 1, "widened_join_extent")
         .map_err(builder_error)?.into_int_value();
-    install_runtime_array_binding_owner(state, &receiver.name, true, true, None);
-    state.storage.insert(receiver.name.clone(), (backing, receiver.ty.clone()));
-    state.local_runtime_extents.insert(backing, (receiver.name_span, LocalRuntimeExtent::WidenedLiteral(count), true));
-    Ok(true)
+    if replace {
+        let (previous, _) = state.storage.get(name).cloned().ok_or("missing widened join predecessor")?;
+        if state.runtime_array_owners.get(name) != Some(&true)
+            || state.runtime_array_allocations.get(name) != Some(&true)
+            || !matches!(state.local_runtime_extents.get(&previous),
+                Some((owner, LocalRuntimeExtent::WidenedLiteral(_), true)) if *owner == declaration)
+        { return Err("widened join predecessor lost its exact owner".into()); }
+        ownership::consume_runtime_array_release(context, state,
+            ownership::RuntimeArrayRelease { pointer: previous.into(), live: None })?;
+        state.local_runtime_extents.remove(&previous);
+    }
+    install_runtime_array_binding_owner(state, name, true, true, None);
+    state.storage.insert(name.to_owned(), (backing, ty.clone()));
+    state.local_runtime_extents.insert(backing, (declaration, LocalRuntimeExtent::WidenedLiteral(count), true));
+    Ok(())
 }
 
 fn pack_widened_join_arm<'ctx>(
@@ -4333,6 +4363,34 @@ fn install_assignment_destination<'ctx>(
     }
 }
 
+fn emit_widened_join_replace<'ctx>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, '_>,
+    assignment: &ScalarAssignment,
+    project: Option<ProjectCallScope<'_>>,
+) -> Result<bool, String> {
+    let Some(plan) = state.aggregate.as_ref().map(|aggregate| aggregate.plan())
+        .filter(|plan| !plan.widened_join_replacements.is_empty()) else { return Ok(false) };
+    let ([target], [rhs @ ScalarExpression::If { .. }]) =
+        (assignment.targets.as_slice(), assignment.values.as_slice()) else { return Ok(false) };
+    let nodes = state.body_call_nodes.ok_or("missing prepared widened join replacement")?;
+    let Some((expected, _, owner)) = nodes.place_ordinal(&target.place)
+        .and_then(|ordinal| plan.widened_join_replacements.get(&ordinal)).copied()
+    else { return Ok(false) };
+    let crate::ScalarPlace::Name { name, .. } = &target.place
+    else { return Err("widened join replacement requires a lexical owner".into()); };
+    if nodes.expression_ordinal(rhs) != Some(expected)
+        || nodes.lexical_existing_destination_span(&target.place) != Some(owner)
+    { return Err("widened join replacement changed its prepared operands".into()); }
+    let (_, ty) = state.storage.get(name).cloned().ok_or("missing widened join target declaration")?;
+    let pair = match project {
+        Some(project) => emit_project_typed_expression(context, state, rhs, &ty, project.module, project.modules)?,
+        None => emit_typed_expression(context, state, rhs, &ty)?,
+    };
+    install_widened_join(context, state, (name, owner, &ty), true, &pair)?;
+    Ok(true)
+}
+
 fn emit_widened_owning_replace<'ctx>(
     context: &'ctx Context,
     state: &mut EmitState<'ctx, '_>,
@@ -4415,7 +4473,8 @@ fn emit_assignment<'ctx, 'module>(
     state: &mut EmitState<'ctx, 'module>,
     assignment: &ScalarAssignment,
 ) -> Result<EmitValue<'ctx>, String> {
-    if emit_widened_owning_replace(context, state, assignment, None)?
+    if emit_widened_join_replace(context, state, assignment, None)?
+        || emit_widened_owning_replace(context, state, assignment, None)?
         || emit_widened_rebind(context, state, assignment, None)? {
         return Ok(EmitValue::Unit);
     }
@@ -4514,7 +4573,8 @@ fn emit_project_assignment<'ctx, 'module>(
     module: &ScalarModule,
     modules: &[&ScalarModule],
 ) -> Result<EmitValue<'ctx>, String> {
-    if emit_widened_owning_replace(context, state, assignment, Some(ProjectCallScope { module, modules }))?
+    if emit_widened_join_replace(context, state, assignment, Some(ProjectCallScope { module, modules }))?
+        || emit_widened_owning_replace(context, state, assignment, Some(ProjectCallScope { module, modules }))?
         || emit_widened_rebind(context, state, assignment, Some(ProjectCallScope { module, modules }))? {
         return Ok(EmitValue::Unit);
     }

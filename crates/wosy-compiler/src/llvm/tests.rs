@@ -12656,3 +12656,85 @@ if (two() != 2 || three() != 3) { core.system_panic(); };
         }
     }
 }
+
+#[test]
+fn widened_join_replaces_only_after_selected_pair_is_constructed() {
+    use inkwell::{memory_buffer::MemoryBuffer, values::{CallSiteValue, InstructionOpcode, PhiValue}};
+    let text = "%%start
+u64(bool) replace = fn(pick) {
+    u8[] target = [11, 13];
+    u64 previous = core.array_len(&target);
+    target = if (pick) {
+        u8[] left = [3, 5, 7];
+        left
+    } else {
+        u8[] right = [17, 19, 23, 29];
+        right
+    };
+    previous * 10 + core.array_len(&target)
+};
+if (replace(true) != 23 || replace(false) != 24) { core.system_panic(); };
+%%end";
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let prepared = prepare_initializer_test(text, layout);
+        let checked = analyze_scalar_build(&prepared);
+        assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+        let source = &prepared.project().modules[0].source;
+        for (project, emitted) in [(false, emit_scalar_build_single_module_llvm(&checked)),
+            (true, emit_scalar_build_project_llvm(&checked))]
+        {
+            let llvm = emitted.unwrap().to_text();
+            let context = Context::create();
+            let buffer = MemoryBuffer::create_from_memory_range_copy(llvm.as_bytes(), "exact widened conditional replacement");
+            let module = context.create_module_from_ir(buffer).unwrap();
+            module.verify().unwrap();
+            let alloc = module.get_function("__wosy_core_alloc").unwrap();
+            let free = module.get_function("__wosy_core_free").unwrap();
+            let function = module.get_function(&self_tail_test_symbol(source, project, "replace")).unwrap();
+            let instructions = function.get_basic_blocks().into_iter().flat_map(|block|
+                std::iter::successors(block.get_first_instruction(), |instruction| instruction.get_next_instruction()))
+                .collect::<Vec<_>>();
+            let calls_to = |callee| instructions.iter().enumerate().filter_map(|(position, &instruction)|
+                CallSiteValue::try_from(instruction).ok().filter(|call| call.get_called_fn_value() == Some(callee))
+                    .map(|_| (position, instruction))).collect::<Vec<_>>();
+            let allocs = calls_to(alloc);
+            assert_eq!(allocs.len(), 3, "{llvm}");
+            let [(release_old, predecessor), (_, selected)] = calls_to(free)[..]
+                else { panic!("predecessor plus exact selected cleanup only: {llvm}") };
+            let operand = |inst, index| known_field_operand(inst, index).unwrap();
+            assert_eq!(operand(predecessor, 0).as_instruction_value(), Some(allocs[0].1));
+            assert_eq!(operand(allocs[0].1, 0).into_int_value().get_zero_extended_constant(), Some(2));
+            let joined_backing = operand(selected, 0).as_instruction_value().unwrap();
+            assert_eq!(joined_backing.get_indices(), vec![0]);
+            let joined = operand(joined_backing, 0).as_instruction_value().unwrap();
+            let phi = PhiValue::try_from(joined).unwrap();
+            assert_eq!(phi.count_incoming(), 2);
+            assert_eq!(predecessor.get_parent(), joined.get_parent());
+            assert!(instructions.iter().position(|&instruction| instruction == joined).unwrap() < release_old);
+            let mut origins = Vec::new();
+            for index in 0..2 {
+                let (result, block) = phi.get_incoming(index).unwrap();
+                let extent = result.as_instruction_value().unwrap();
+                assert_eq!(extent.get_opcode(), InstructionOpcode::InsertValue);
+                assert_eq!(extent.get_indices(), vec![1]);
+                assert_eq!(extent.get_parent(), Some(block));
+                let count = operand(extent, 1).into_int_value().get_zero_extended_constant().unwrap();
+                let pointer = operand(extent, 0).as_instruction_value().unwrap();
+                assert_eq!(pointer.get_indices(), vec![0]);
+                let original = operand(pointer, 1).as_instruction_value().unwrap();
+                assert!(allocs[1..].iter().any(|&(_, allocation)| allocation == original));
+                assert_eq!(operand(original, 0).into_int_value().get_zero_extended_constant(), Some(count));
+                origins.push(count);
+            }
+            origins.sort_unstable();
+            assert_eq!(origins, [3, 4]);
+            if let Some(out) = std::env::var_os("WOSY_WIDENED_JOIN_REPLACE_IR_DIR") {
+                let target = if layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
+                let route = if project { "project" } else { "standalone" };
+                let controlled = llvm.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);
+                assert_ne!(controlled, llvm);
+                std::fs::write(std::path::PathBuf::from(out).join(format!("{target}-{route}-control.ll")), controlled).unwrap();
+            }
+        }
+    }
+}
