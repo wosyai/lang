@@ -143,6 +143,10 @@ fn literal_array_write(
 }
 
 impl<'ctx, 'plan> AggregateEmitter<'ctx, 'plan> {
+    pub(super) fn plan(&self) -> &ClosedBody {
+        self.plan
+    }
+
     pub(super) fn rebound_array_destination(&self, call: usize) -> Option<usize> {
         self.plan.array_descriptor_rebinds.get(&call).map(|(_, destination)| *destination)
     }

@@ -271,6 +271,8 @@ fn runtime_allocation_access(
     let mut indexed = BTreeSet::new();
     let mut unproved_writes = BTreeSet::new();
     let key = |span: wosy_syntax::ByteSpan| (span.start, span.end);
+    let widened_rebind_points = plan.filter(|plan| !plan.widened_rebinds.is_empty())
+        .map(|plan| plan.widened_rebinds.values().map(|rebind| rebind.point).collect::<std::collections::HashSet<_>>());
     let mut proved_extent_writes = HashMap::new();
     if let (true, Some(nodes), Some(plan)) = (checked_access, body_nodes, plan) {
         // This exact install updates pointer and returned extent together.
@@ -300,6 +302,12 @@ fn runtime_allocation_access(
     for point in &reference_cfg.points {
         match &point.kind {
             CfgPointKind::Assign { target, rhs_point, .. } if target.projections.is_empty() => {
+                if widened_rebind_points.as_ref().is_some_and(|points| points.contains(&point.id)) {
+                    // This dominating existing-owner transfer re-keys the
+                    // original pointer and extent, rather than storing either
+                    // into an independently mutable slot.
+                    continue;
+                }
                 let id = key(target.declaration_span);
                 mutable.insert(id);
                 if checked_access && reference_cfg.allocations.contains(&target.binding)
@@ -1992,9 +2000,8 @@ fn store_widened_move<'ctx>(
     // The ordinary ownership transition retires the source. Re-key the
     // existing extent under the sole receiving declaration, with no load,
     // store, new backing, or independent runtime owner.
-    transition_runtime_array_binding_initialization(state, &receiver.name, &receiver.ty, &binding.value)?;
+    install_runtime_array_binding_owner(state, &receiver.name, true, true, Some(source));
     state.storage.insert(receiver.name.clone(), (backing, receiver.ty.clone()));
-    state.runtime_array_allocations.insert(receiver.name.clone(), true);
     state.local_runtime_extents.insert(backing, (receiver.name_span, extent, checked));
     Ok(true)
 }
@@ -2273,15 +2280,24 @@ fn transition_runtime_array_binding_initialization(
         return Ok(());
     }
     let provenance = runtime_array_assignment_provenance(state, value)?;
-    let owns = provenance.result.owns();
+    install_runtime_array_binding_owner(state, name, provenance.result.owns(), false, provenance.source_name.as_deref());
+    Ok(())
+}
+
+fn install_runtime_array_binding_owner(
+    state: &mut EmitState<'_, '_>,
+    name: &str,
+    owns: bool,
+    direct_backing: bool,
+    source: Option<&str>,
+) {
     state.runtime_array_owners.insert(name.into(), owns);
-    state.runtime_array_allocations.insert(name.into(), false);
+    state.runtime_array_allocations.insert(name.into(), direct_backing);
     if owns {
-        if let Some(source) = provenance.source_name.filter(|source| source != name) {
-            state.runtime_array_owners.insert(source, false);
+        if let Some(source) = source.filter(|source| *source != name) {
+            state.runtime_array_owners.insert(source.into(), false);
         }
     }
-    Ok(())
 }
 
 fn runtime_array_assignment_provenance(
@@ -4213,11 +4229,61 @@ fn install_assignment_destination<'ctx>(
     }
 }
 
+fn emit_widened_rebind<'ctx>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, '_>,
+    assignment: &ScalarAssignment,
+    project: Option<ProjectCallScope<'_>>,
+) -> Result<bool, String> {
+    let Some(plan) = state.aggregate.as_ref().map(|aggregate| aggregate.plan())
+        .filter(|plan| !plan.widened_rebinds.is_empty()) else { return Ok(false) };
+    let ([target], [value @ ScalarExpression::Name { name: source, .. }]) =
+        (assignment.targets.as_slice(), assignment.values.as_slice()) else { return Ok(false) };
+    let nodes = state.body_call_nodes.ok_or("missing prepared widened array rebind")?;
+    let Some(proof) = nodes.place_ordinal(&target.place).and_then(|ordinal| plan.widened_rebinds.get(&ordinal)).copied()
+    else { return Ok(false) };
+    let crate::ScalarPlace::Name { name: target, .. } = &target.place
+    else { return Err("widened rebind requires an exact lexical destination".into()) };
+    if nodes.lexical_expression_declaration(value) != Some(proof.source) || source == target {
+        return Err("widened rebind differs from its checked source".into());
+    }
+    let (backing, ty) = state.storage.get(source).cloned().ok_or("missing widened rebind source")?;
+    let (previous, target_ty) = state.storage.get(target).cloned().ok_or("missing widened rebind destination")?;
+    let Some(&(declaration, extent @ LocalRuntimeExtent::WidenedLiteral(_), checked)) =
+        state.local_runtime_extents.get(&backing)
+    else { return Err("missing exact widened rebind extent".into()) };
+    if declaration != proof.source || backing == previous
+        || !state.local_runtime_extents.get(&previous).is_some_and(|(declaration, extent, _)|
+            *declaration == proof.target && matches!(extent, LocalRuntimeExtent::WidenedLiteral(_)))
+        || [source, target].into_iter().any(|name| state.runtime_array_allocations.get(name) != Some(&true)
+            || state.runtime_array_owners.get(name) != Some(&true))
+    {
+        return Err("widened rebind lacks two original live backing receipts".into());
+    }
+    let rhs = match project {
+        Some(project) => emit_project_typed_expression(context, state, value, &ty, project.module, project.modules)?,
+        None => emit_typed_expression(context, state, value, &ty)?,
+    };
+    if !matches!(rhs, EmitValue::Basic(BasicValueEnum::PointerValue(actual)) if actual == backing) {
+        return Err("widened rebind changed the original source pointer".into());
+    }
+    ownership::consume_runtime_array_release(context, state,
+        ownership::RuntimeArrayRelease { pointer: previous.into(), live: None })?;
+    install_runtime_array_binding_owner(state, target, true, true, Some(source));
+    state.storage.insert(target.clone(), (backing, target_ty));
+    state.local_runtime_extents.remove(&previous);
+    state.local_runtime_extents.insert(backing, (proof.target, extent, checked));
+    Ok(true)
+}
+
 fn emit_assignment<'ctx, 'module>(
     context: &'ctx Context,
     state: &mut EmitState<'ctx, 'module>,
     assignment: &ScalarAssignment,
 ) -> Result<EmitValue<'ctx>, String> {
+    if emit_widened_rebind(context, state, assignment, None)? {
+        return Ok(EmitValue::Unit);
+    }
     if let Some(value) = local_callable::replace(state, assignment)? {
         return Ok(value);
     }
@@ -4313,6 +4379,9 @@ fn emit_project_assignment<'ctx, 'module>(
     module: &ScalarModule,
     modules: &[&ScalarModule],
 ) -> Result<EmitValue<'ctx>, String> {
+    if emit_widened_rebind(context, state, assignment, Some(ProjectCallScope { module, modules }))? {
+        return Ok(EmitValue::Unit);
+    }
     if let Some(value) = local_callable::replace(state, assignment)? {
         return Ok(value);
     }

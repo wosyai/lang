@@ -1255,6 +1255,7 @@ pub(super) struct AggregateFlowResult {
     pub(super) checked_producer_authoritative: bool,
     pub(super) array_invalid: bool,
     pub(super) array_neutral: bool,
+    pub(super) widened_rebinds: BTreeMap<usize, ClosedWidenedRebind>,
     pub(super) borrowed_extent_observer: Option<(CfgPointId, OccurrenceOrdinal, ByteSpan)>,
     pub(super) borrowed_extent_forward: Option<(CfgPointId, OccurrenceOrdinal)>,
     pub(super) borrowed_extent_call: Option<(CfgPointId, OccurrenceOrdinal, ByteSpan, Option<ByteSpan>)>,
@@ -1492,7 +1493,7 @@ impl AggregateFlowResult {
     }
 
     pub(super) fn has_observations(&self) -> bool {
-        self.borrowed_extent_observer.is_some() || self.borrowed_extent_call.is_some() || self.borrowed_extent_forward.is_some()
+        !self.widened_rebinds.is_empty() || self.borrowed_extent_observer.is_some() || self.borrowed_extent_call.is_some() || self.borrowed_extent_forward.is_some()
             || self.array_formal_extent_required || self.literal_array_index_required.is_some() || self.literal_array_extent_required.is_some() || self.proved_literal_array_route_ref().is_some()
             || (self.checked_producer_authoritative && !self.checked_producer_backing.is_empty())
             || self.checked_backing_assignment.is_some() || self.checked_backing_forward.is_some()
@@ -2915,6 +2916,13 @@ impl ClosedIndexedSnapshot<&SourceSpan> {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ClosedWidenedRebind {
+    pub(crate) point: CfgPointId,
+    pub(crate) source: ByteSpan,
+    pub(crate) target: ByteSpan,
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct ClosedBody {
     pub(crate) scalar_descriptor_assignment: Option<(usize, usize, usize)>,
@@ -2955,6 +2963,7 @@ pub(crate) struct ClosedBody {
     pub(crate) literal_array: Option<ClosedLiteralArray>,
     pub(crate) replacement_extent_observation: Option<usize>,
     pub(crate) array_descriptor_return: bool,
+    pub(crate) widened_rebinds: BTreeMap<usize, ClosedWidenedRebind>,
     pub(crate) borrowed_extent_observer: Option<(usize, ByteSpan)>,
     pub(crate) borrowed_extent_forward: Option<usize>,
     pub(crate) borrowed_extent_call: Option<(usize, ByteSpan, Option<ByteSpan>)>,
@@ -6638,6 +6647,9 @@ fn closed_aggregates<'a>(
             }
 
             if body.is_monomorphic {
+                if !facts.widened_rebinds.is_empty() {
+                    result.bodies.entry(key).or_default().widened_rebinds = facts.widened_rebinds.clone();
+                }
                 if let Some(proof) = facts.scalar_descriptor_assignment {
                     result.bodies.entry(key).or_default().scalar_descriptor_assignment = Some(proof);
                 }

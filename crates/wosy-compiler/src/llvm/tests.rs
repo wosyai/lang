@@ -11819,10 +11819,10 @@ if (check(5, 1) != 3) { core.system_panic(); };
     let moved = text.replace("u8[] bytes = [3, seed(value), 7];",
         "u8[] original = [3, seed(value), 7]; u8[] handoff = original; u8[] bytes = handoff;");
     let rebound = "%%start
-u64() refused = fn {
+u64(bool) refused = fn(take) {
     u8[] bytes = [1, 2];
     u8[] other = [3, 4];
-    bytes = other;
+    if (take) { bytes = other; };
     core.array_len(&bytes)
 };
 %%end";
@@ -11869,5 +11869,63 @@ u64() refused = fn {
         let checked = crate::derive_scalar_program_with_layout(&parsed.result, layout);
         assert!(checked.diagnostics.iter().any(|diagnostic|
             diagnostic.message == "widened array backing must remain in its original local binding"), "{:?}", checked.diagnostics);
+    }
+}
+
+#[test]
+fn widened_local_array_rebind_retires_the_predecessor_and_adopts_the_exact_extent() {
+    let source = SourceIdentity::new("project".into(), "package".into(), "src/widened_array_rebind.w".into(), "r1".into());
+    let text = "%%start
+u64(u64) observe = fn(index) {
+    u8[] target = [11, 13];
+    if (core.array_len(&target) != 2) { core.system_panic(); };
+    u8[] source = [3, 5, 7];
+    target = source;
+    if (target[index] != 5) { core.system_panic(); };
+    core.array_len(&target)
+};
+if (observe(1) != 3) { core.system_panic(); };
+%%end";
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let parsed = parse_source(source.clone(), text.into(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let prepared = crate::prepare_scalar_project_with_access(
+            vec![(crate::derive_scalar_declarations_from_cst(parsed.result.canonical_cst()), vec![])],
+            vec![source.clone()],
+            ScalarPreparationInputs { target_layout: layout },
+            Some(wosy_stdlib_source::CheckedAccessComponent::linked()),
+        ).unwrap_or_else(|error| panic!("{:?}", error.diagnostics));
+        let checked = analyze_scalar_build(&prepared);
+        assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+        let llvm = emit_scalar_build_project_llvm(&checked).unwrap().to_text();
+        let body = self_tail_test_body(&llvm, "i64", &project_function_name(&source, "observe"));
+        let allocation = |bytes| {
+            let label = format!("call ptr @__wosy_core_alloc(i64 {bytes}, i64 1)");
+            let line = body.lines().find(|line| line.contains(&label)).unwrap_or_else(|| panic!("{body}"));
+            (body.find(line).unwrap(), line.trim().split_once(" = ").unwrap().0)
+        };
+        let (previous, previous_ptr) = allocation(2);
+        let (incoming, incoming_ptr) = allocation(3);
+        assert_ne!(previous_ptr, incoming_ptr);
+        assert_eq!(body.matches("call ptr @__wosy_core_alloc(").count(), 2, "{body}");
+        let release = |pointer| body.find(&format!("call void @__wosy_core_free(ptr {pointer})"))
+            .unwrap_or_else(|| panic!("{body}"));
+        let [guard] = body.lines().filter(|line| line.contains("call void @wosy_fn__776f73795f746f6f6c636861696e5f7374646c6962__")
+            && line.contains("__636865636b5f696e6465785f696e5f657874656e74(")).collect::<Vec<_>>()[..]
+        else { panic!("one canonical checked bounds call: {body}") };
+        let gep = body.lines().find(|line| line.contains("%array_element") && line.contains(" = getelementptr"))
+            .unwrap_or_else(|| panic!("one checked indexed access: {body}"));
+        assert!(guard.contains(", i64 3)") && gep.contains(&format!("ptr {incoming_ptr},")), "{body}");
+        assert!(previous < incoming && incoming < release(previous_ptr)
+            && release(previous_ptr) < body.find(guard).unwrap() && body.find(guard).unwrap() < body.find(gep).unwrap()
+            && body.find(gep).unwrap() < release(incoming_ptr), "{body}");
+        assert_eq!(body.matches("call void @__wosy_core_free(").count(), 2, "{body}");
+        assert!(!body.contains("alloca ptr") && body.contains("ret i64 3"), "{body}");
+        if let Some(out) = std::env::var_os("WOSY_WIDENED_REBIND_IR_DIR") {
+            let target = if layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
+            let controlled = llvm.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);
+            assert_ne!(controlled, llvm);
+            std::fs::write(std::path::PathBuf::from(out).join(format!("{target}-project-control.ll")), controlled).unwrap();
+        }
     }
 }

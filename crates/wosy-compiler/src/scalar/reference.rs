@@ -4533,11 +4533,6 @@ impl<'a> ReferenceFlowBuilder<'a> {
         span: ByteSpan,
         scope: ReferenceScopeId,
     ) -> Result<FrozenInstall, ReferenceAnalysisError> {
-        if self.widened_arrays.as_ref().is_some_and(|owners| owners.contains(&binding))
-            && matches!(&assign, CfgPointKind::Assign { target, .. } if target.projections.is_empty())
-        {
-            return Err(self.missing_context(span, ReferenceAnalysisErrorReason::UnprovedWidenedArrayTransfer));
-        }
         let possible_origins = match value {
             ReferenceValue::Checked(origins) => {
                 self.checked.insert(binding.clone());
@@ -5141,12 +5136,32 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     let calls = self.call_sites;
                     let group = &calls.assignments[&(key.block, key.item)];
                     let output_types = self.assignment_output_types(group)?;
+                    let widened_rebind = (|| {
+                        let owners = self.widened_arrays.as_ref()?;
+                        if scope != ReferenceScopeId(0) || !self.generic_parameters.is_empty() { return None; }
+                        let ([target], [ScalarExpression::Name { span, .. }]) =
+                            (assignment.targets.as_slice(), assignment.values.as_slice())
+                        else { return None };
+                        if !matches!(target.place, ScalarPlace::Name { .. }) { return None; }
+                        let evaluation = group.rhs_evaluations().next()?;
+                        let destination = group.destinations().next()?.destination;
+                        let Some(PlainNameIdentity::Lexical(source)) =
+                            self.prepared_name_identity(evaluation.expression, *span).ok().flatten()
+                        else { return None };
+                        let Some(DirectDestinationIdentity::Existing(target)) = calls.prepared_direct_destination(destination)
+                        else { return None };
+                        (source != target && source.block_span == block.span && target.block_span == block.span
+                            && owners.contains(source) && owners.contains(target)
+                            && self.binding_types.get(source).zip(self.binding_types.get(target))
+                                .is_some_and(|(source, target)| aggregate::same_runtime_array_type(source, target)))
+                            .then_some((destination, source.declaration_span, target.declaration_span))
+                    })();
                     let mut values = Vec::new();
                     for evaluation in group.rhs_evaluations() {
                         let value = &assignment.values[evaluation.position];
                         let result = self.expression(value, scope, evaluation.expression)?;
                         let rhs_point = self.cursor.expect("evaluated assignment output");
-                        self.move_value(value, scope, evaluation.expression)?;
+                        self.move_value_with_widened_receipt(value, scope, evaluation.expression, widened_rebind.is_some())?;
                         values.push((result, rhs_point));
                     }
                     for projection in group.projected_outputs() {
@@ -5284,7 +5299,19 @@ impl<'a> ReferenceFlowBuilder<'a> {
                                 previous_origins,
                                 previous_loans,
                             };
+                            let widened_rebind = widened_rebind.filter(|(destination, _, target)|
+                                *destination == slot.destination && *target == id.declaration_span);
+                            if widened_rebind.is_none() && self.widened_arrays.as_ref().is_some_and(|owners| owners.contains(&id))
+                                && matches!(&assign, CfgPointKind::Assign { target, .. } if target.projections.is_empty())
+                            {
+                                return Err(self.missing_context(*span, ReferenceAnalysisErrorReason::UnprovedWidenedArrayTransfer));
+                            }
                             let emitted = self.emit_direct_assignment(id, assign, rhs_point, value, *span, scope)?;
+                            if let Some((destination, source, target)) = widened_rebind {
+                                self.proof_points.widened_rebind_points.get_or_insert_with(HashSet::new).insert(emitted.install);
+                                self.aggregate_result.widened_rebinds.insert(destination.0,
+                                    aggregate::ClosedWidenedRebind { point: emitted.install, source, target });
+                            }
                             self.author_direct_assignment(emitted, existing_prepared && capture.is_none()
                                 && assignment.targets.len() == 1 && assignment.values.len() == 1);
                             emitted
@@ -7743,6 +7770,7 @@ struct ReferenceTransferCfg<'a> {
     checked_block_values: &'a [(CfgPointId, CfgPointId)],
     array_length_owners: Option<&'a HashSet<ReferenceBindingId>>,
     pending_returned_extent: Option<CfgPointId>,
+    widened_rebind_points: Option<&'a HashSet<CfgPointId>>,
     fallible_allocation_bindings: Option<&'a HashMap<ReferenceBindingId, super::control::GuardedAllocationBinding>>,
     fallible_aliases: Option<&'a HashMap<ReferenceBindingId, ReferenceBindingId>>,
     guarded_allocation_edges: Option<&'a BTreeMap<CfgPointId, super::control::GuardedAllocationEdge>>,
@@ -7779,6 +7807,7 @@ impl<'a> ReferenceTransferCfg<'a> {
             checked_join_values: proof.map_or(&[], |proof| &proof.checked_join_values),
             checked_block_values: proof.map_or(&[], |proof| &proof.checked_block_values),
             pending_returned_extent: proof.and_then(|proof| proof.pending_returned_extent),
+            widened_rebind_points: proof.and_then(|proof| proof.widened_rebind_points.as_ref()),
             array_length_owners: proof.map(|proof| &proof.array_length_owners).filter(|owners| !owners.is_empty()),
             fallible_allocation_bindings: proof.and_then(|proof| proof.fallible_allocation_bindings.as_ref()),
             fallible_aliases: proof.map(|proof| &proof.fallible_aliases).filter(|aliases| !aliases.is_empty()),
@@ -10346,7 +10375,17 @@ fn transfer_reference_facts(
                 }
                 CfgPointKind::Assign { target, .. } => {
                     let target = available_place(target);
-                    if target.projections.is_empty()
+                    let widened_rebind = cfg.widened_rebind_points.is_some_and(|points| points.contains(&id));
+                    if widened_rebind && (state.released.contains(&target.binding)
+                        || state.invalidated.contains(&target.binding) || state.uninitialized.contains(&target.binding)
+                        || state.moved.iter().any(|(place, _)| place.binding == target.binding))
+                    {
+                        errors.push(ReferenceAnalysisError::MissingContext {
+                            source_span: point.source_span.clone(),
+                            reason: ReferenceAnalysisErrorReason::UnprovedWidenedArrayTransfer,
+                        });
+                    }
+                    if !widened_rebind && target.projections.is_empty()
                         && cfg.array_length_owners.is_some_and(|owners| owners.contains(&target.binding))
                     {
                         state.replaced_array_extents.insert(target.binding.clone());
@@ -15711,6 +15750,7 @@ fn derive_function_specialized_copy_policies<'a>(
                     checked_join_values: &template_result.proof_points.checked_join_values,
                     checked_block_values: &template_result.proof_points.checked_block_values,
                     pending_returned_extent: template_result.proof_points.pending_returned_extent,
+                    widened_rebind_points: template_result.proof_points.widened_rebind_points.as_ref(),
                     array_length_owners: Some(&template_result.proof_points.array_length_owners).filter(|owners| !owners.is_empty()),
                     fallible_allocation_bindings: template_result.proof_points.fallible_allocation_bindings.as_ref(),
                     fallible_aliases: Some(&template_result.proof_points.fallible_aliases).filter(|aliases| !aliases.is_empty()),
@@ -16508,7 +16548,8 @@ fn build_function_reference_cfg(
         } else {
             errors.extend(provisional.iter().filter(|error| matches!(error,
                 ReferenceAnalysisError::MissingContext {
-                    reason: ReferenceAnalysisErrorReason::UnprovedArrayLength, ..
+                    reason: ReferenceAnalysisErrorReason::UnprovedArrayLength
+                        | ReferenceAnalysisErrorReason::UnprovedWidenedArrayTransfer, ..
                 }
             )).cloned());
         }
