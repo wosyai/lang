@@ -1608,6 +1608,23 @@ cases.extend([
         .replace("out < 7","out <= 7"),0,b""),
 ])
 
+reached_named_calling_producer = f"""%%start
+    i8(i8) leaf = fn(input) {{ if (input < 0) {{ -3 }} else {{ 7 }} }};
+    i8(i8) producer = fn(input) {{ i8 result = leaf(input); result }};
+    proof bounded for producer(entry) -> (out) where (entry >= 0) ensures (out <= 6) {{}}
+    i8 inactive = producer(-4);
+    i8 saved = producer(3);
+    core.require(inactive == -3, {report(38,"WRONG-INACTIVE-OUTPUT")});
+    core.require(saved == 7, {report(39,"WRONG-ACTIVE-OUTPUT")});
+%%end"""
+cases.extend([
+    ("exact-startup-named-calling-producer-refuted",reached_named_calling_producer,1,b"proof obligation failed"),
+    ("exact-startup-named-calling-producer-proved",reached_named_calling_producer.replace("out <= 6","out <= 7"),0,b""),
+    ("exact-startup-named-calling-producer-refuses-nested-watch",reached_named_calling_producer.replace(
+        "i8 inactive =", "proof leaf_checked for leaf(entry) -> (out) ensures (out <= 7) {}\n    i8 inactive ="),
+        2,b"unsupported analysis"),
+])
+
 ordered_calling_citation = """%%start
     i8(i8) execute = fn(input) { if (input < 0) { -3 } else { 7 } };
     i8(i8) producer = fn(input) { i8 result = execute(input); result };
@@ -1694,6 +1711,7 @@ cases.extend([
         b"proof obligation failed"),
 ])
 proof_diagnostic_notes = {
+    "exact-startup-named-calling-producer-refuted": b"call returned 7",
     "ordered-calling-citation-then-show-refuted": b"symbolic call can return 7",
     "ordinary-named-calling-ordered-shows-earliest": b"symbolic call can return 7",
     "ordinary-named-calling-ordered-shows-later": b"symbolic call can return -3",
