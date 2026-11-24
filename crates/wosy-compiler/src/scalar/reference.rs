@@ -4237,6 +4237,80 @@ impl<'a> ReferenceFlowBuilder<'a> {
         }
     }
 
+    fn returned_array_index_selector_syntax(index: &ScalarExpression) -> bool {
+        match index {
+            ScalarExpression::Integer { .. } => true,
+            ScalarExpression::Binary { operator: BinaryOperator::BitAnd, left, right, .. } =>
+                matches!((left.as_ref(), right.as_ref()),
+                    (ScalarExpression::Name { .. }, ScalarExpression::Integer { .. })
+                    | (ScalarExpression::Integer { .. }, ScalarExpression::Name { .. })),
+            _ => false,
+        }
+    }
+
+    fn names_literal_array_owner_at_index(&self, read: CfgPointId) -> bool {
+        matches!(&self.cfg.points[read.0].kind, CfgPointKind::ReadPlace {
+            pointer_point: None, candidates, reads_origin: false, ..
+        } if matches!(candidates.as_slice(), [candidate]
+            if self.aggregate_facts.allocations.get(&candidate.binding).copied()
+                .is_some_and(|bind| self.aggregate_facts.literal_array_bind.is_some_and(|allocation| allocation.bind == bind))
+                && matches!(candidate.projections.as_slice(), [ReferencePlaceProjection::Index(_)])))
+    }
+
+    fn returned_array_index_observation(
+        &self,
+        expression: &ScalarExpression,
+        output: OccurrenceOrdinal,
+        read: CfgPointId,
+    ) -> Option<aggregate::ReturnedArrayIndex> {
+        let ScalarExpression::IndexedRead { place: ScalarPlace::Index { base, index, .. }, .. } = expression
+        else { return None };
+        if !matches!(base.as_ref(), ScalarPlace::Name { .. }) {
+            return None;
+        }
+        let (first, upper_bound) = match index.as_ref() {
+            ScalarExpression::Integer { value, .. } => {
+                let first = CfgPointId(read.0.checked_sub(1)?);
+                if !matches!(&self.cfg.points.get(first.0)?.kind,
+                    CfgPointKind::Evaluate(ScalarExpression::Integer { value: actual, .. }) if actual == value)
+                {
+                    return None;
+                }
+                (first, u64::try_from(value.clone()).ok()?)
+            }
+            ScalarExpression::Binary { operator: BinaryOperator::BitAnd, left, right, .. } => {
+                use OccurrenceEdge::*;
+                let place = self.place_ordinal(OccurrenceParent::Expression(output), ExpressionPlace);
+                let selector = self.expression_ordinal(OccurrenceParent::Place(place), PlaceIndex);
+                let parent = OccurrenceParent::Expression(selector);
+                let (name_edge, mask_payload, name_offset, mask_offset) = match (left.as_ref(), right.as_ref()) {
+                    (ScalarExpression::Name { .. }, ScalarExpression::Integer { value, .. }) =>
+                        (BinaryLeft, value, 0, 1),
+                    (ScalarExpression::Integer { value, .. }, ScalarExpression::Name { .. }) =>
+                        (BinaryRight, value, 1, 0),
+                    _ => return None,
+                };
+                if self.call_sites.structure.checked_types.expressions.get(&selector) != Some(&ScalarType::U64) {
+                    return None;
+                }
+                let formal = self.literal_array_formal_binding(self.expression_ordinal(parent, name_edge), &ScalarType::U64)?;
+                let first = CfgPointId(read.0.checked_sub(3)?);
+                if !matches!(&self.cfg.points.get(first.0 + name_offset)?.kind,
+                    CfgPointKind::Read { binding } if binding == formal)
+                    || !matches!(&self.cfg.points.get(first.0 + mask_offset)?.kind,
+                        CfgPointKind::Evaluate(ScalarExpression::Integer { value, .. }) if value == mask_payload)
+                    || !matches!(&self.cfg.points.get(first.0 + 2)?.kind,
+                        CfgPointKind::Evaluate(actual) if actual == index.as_ref())
+                {
+                    return None;
+                }
+                (first, u64::try_from(mask_payload.clone()).ok()?)
+            }
+            _ => return None,
+        };
+        Some(aggregate::ReturnedArrayIndex { first, read, output, upper_bound })
+    }
+
     fn observe_literal_array_bind(
         &mut self,
         position: BlockPosition,
@@ -4770,7 +4844,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                              [_, _, ScalarBlockItem::Expression(ScalarExpression::IndexedRead { place, .. })])
                                 if slot.output == 0 && matches!(place, ScalarPlace::Index { base, index, .. }
                                     if matches!(base.as_ref(), ScalarPlace::Name { .. })
-                                        && matches!(index.as_ref(), ScalarExpression::Integer { .. })));
+                                        && Self::returned_array_index_selector_syntax(index)));
                     if binding.is_allocation
                         && (returned_extent_tail || returned_index_tail || (region.items.len() == 2
                             && matches!(calls.boundary.root_outputs.as_slice(),
@@ -4843,17 +4917,14 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             && self.aggregate_facts.literal_array_unit.is_none()
                             && self.aggregate_facts.literal_array_write.is_some()
                             && matches!(calls.boundary.root_outputs.as_slice(), [output] if aggregate::ordinary_value(&output.ty))
-                            && matches!(expression, ScalarExpression::IndexedRead { place, .. }
-                                if matches!(place, ScalarPlace::Index { base, index, .. }
-                                    if matches!(base.as_ref(), ScalarPlace::Name { .. })
-                                        && matches!(index.as_ref(), ScalarExpression::Integer { .. })))
-                            && matches!(&self.cfg.points[value_point.0].kind,
-                                CfgPointKind::ReadPlace { pointer_point: None, candidates, .. }
-                                    if matches!(candidates.as_slice(), [place]
-                                        if self.aggregate_facts.allocations.get(&place.binding)
-                                            .is_some_and(|bind| self.aggregate_facts.literal_array_bind.is_some_and(|allocation| allocation.bind == *bind))))
+                            && matches!(expression, ScalarExpression::IndexedRead { place: ScalarPlace::Index { base, index, .. }, .. }
+                                if matches!(base.as_ref(), ScalarPlace::Name { .. }) && Self::returned_array_index_selector_syntax(index))
+                            && self.names_literal_array_owner_at_index(value_point)
                         {
-                            self.aggregate_facts.literal_array_index_output = Some((value_point, slot.expression));
+                            let pending = self.returned_array_index_observation(expression, slot.expression, value_point)
+                                .ok_or_else(|| self.missing_context(expression_span(expression),
+                                    ReferenceAnalysisErrorReason::UnprovedReturnedArraySelector))?;
+                            self.aggregate_facts.literal_array_index_output = Some(pending);
                         }
                         if scope == ReferenceScopeId(0) && slot.output == 0
                             && self.aggregate_facts.literal_array_bind.is_some()

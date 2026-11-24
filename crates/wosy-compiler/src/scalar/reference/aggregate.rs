@@ -17,7 +17,7 @@ pub(super) struct AggregateFlowFacts {
     pub(super) literal_array_other_write: Option<LiteralArrayWrite>,
     pub(super) literal_array_unit: Option<LiteralArrayUnit>,
     pub(super) literal_array_value: Option<(CfgPointId, OccurrenceOrdinal)>,
-    pub(super) literal_array_index_output: Option<(CfgPointId, OccurrenceOrdinal)>,
+    pub(super) literal_array_index_output: Option<ReturnedArrayIndex>,
     pub(super) literal_array_extent_output: Option<(CfgPointId, OccurrenceOrdinal)>,
     pub(super) views: BTreeMap<CfgPointId, CfgPointId>,
     pub(super) plain_literals: BTreeSet<CfgPointId>,
@@ -671,6 +671,14 @@ pub(super) struct LiteralArrayUnit {
     pub(super) join: CfgPointId,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct ReturnedArrayIndex {
+    pub(super) first: CfgPointId,
+    pub(super) read: CfgPointId,
+    pub(super) output: OccurrenceOrdinal,
+    pub(super) upper_bound: u64,
+}
+
 #[derive(Clone, Copy, Default, PartialEq)]
 enum LiteralArrayPhase {
     #[default]
@@ -694,7 +702,7 @@ enum LiteralArrayPhase {
     ArgumentRead(CfgPointId),
     Call(CfgPointId),
     Replaced,
-    IndexSelector,
+    IndexSelector(CfgPointId),
     ExtentBorrow(CfgPointId),
     ExtentValue(CfgPointId),
     ExtentOutput,
@@ -1229,7 +1237,7 @@ pub(super) struct AggregateFlowResult {
     immediate_receipt_reads: BTreeMap<CfgPointId, Option<(OccurrenceOrdinal, CfgPointId, CfgPointId)>>,
     literal_array_route: Option<LiteralArrayRoute>,
     literal_array_unknown: bool,
-    pub(super) literal_array_index_required: Option<(CfgPointId, OccurrenceOrdinal)>,
+    pub(super) literal_array_index_required: Option<ReturnedArrayIndex>,
     pub(super) literal_array_extent_required: Option<OccurrenceOrdinal>,
     literal_array_join: LiteralArrayJoin,
     pub(super) checked_backing_forward_candidate: Option<(OccurrenceOrdinal, CfgPointId, CfgPointId)>,
@@ -1721,15 +1729,20 @@ impl AggregateFlowFacts {
                     if call == *rhs_point && &target.binding == binding && target.projections.is_empty()
                         && active_write.is_some_and(|write|
                             write.rhs == *rhs_point && write.writer == point.id) => Replaced,
-                (Replaced, CfgPointKind::Evaluate(ScalarExpression::Integer { .. }))
-                    if root && unit.is_none()
-                        && self.literal_array_index_output.is_some_and(|(read, _)| point.successors.as_slice() == [read]) =>
-                    IndexSelector,
-                (IndexSelector, CfgPointKind::ReadPlace { place: ScalarPlace::Index { base, index, .. },
+                (Replaced | IndexSelector(_), CfgPointKind::Evaluate(_) | CfgPointKind::Read { .. })
+                    if root && unit.is_none() && self.literal_array_index_output.is_some_and(|index|
+                        point.id < index.read
+                            && match state.literal_array_phase {
+                                Replaced => point.id == index.first,
+                                IndexSelector(expected) => point.id == expected,
+                                _ => false,
+                            }
+                            && point.successors.as_slice() == [CfgPointId(point.id.0 + 1)]) =>
+                    IndexSelector(CfgPointId(point.id.0 + 1)),
+                (IndexSelector(expected), CfgPointKind::ReadPlace { place: ScalarPlace::Index { base, .. },
                     pointer_point: None, candidates, reads_origin: false })
-                    if self.literal_array_index_output.is_some_and(|(read, _)| point.id == read)
+                    if point.id == expected && self.literal_array_index_output.is_some_and(|index| point.id == index.read)
                         && matches!(base.as_ref(), ScalarPlace::Name { .. })
-                        && matches!(index.as_ref(), ScalarExpression::Integer { .. })
                         && matches!(candidates.as_slice(), [place] if &place.binding == binding
                             && matches!(place.projections.as_slice(), [ReferencePlaceProjection::Index(_)])) =>
                     ExtentValue(point.id),
@@ -6256,8 +6269,8 @@ fn closed_aggregates<'a>(
         if let Some(facts) = body.facts {
             // Borrow only completed caller proofs during this existing pass.
             // BTreeMap order preserves enrollment precedence at finalization.
-            if let Some((point, occurrence)) = facts.literal_array_index_required {
-                returned_index_requirements.push((key, body, point, occurrence));
+            if let Some(index) = facts.literal_array_index_required {
+                returned_index_requirements.push((key, body, index));
             }
             if let Some(occurrence) = facts.literal_array_extent_required {
                 returned_extent_requirements.push((key, body.source, occurrence));
@@ -6557,15 +6570,11 @@ fn closed_aggregates<'a>(
         if !returned_index_requirements.is_empty() && !reservations.checked_access {
             return Err("returned array index requires the authenticated checked-access helper".into());
         }
-        for &(key, body, point, occurrence) in &returned_index_requirements {
+        for &(key, body, index) in &returned_index_requirements {
             let source = body.source;
             let representable_offset = (|| {
-                let CfgPointKind::ReadPlace { place: ScalarPlace::Index { index, .. }, .. } =
-                    &body.cfg.initial_points.get(point.0)?.kind else { return None };
-                let ScalarExpression::Integer { value, .. } = index.as_ref() else { return None };
-                let ty = body.sites.structure.checked_types.expressions.get(&occurrence)?;
-                let index = u64::try_from(value.clone()).ok()?;
-                Some(returned_array_index_fits_offset(index, ty, reservations.target_layout?))
+                let ty = body.sites.structure.checked_types.expressions.get(&index.output)?;
+                Some(returned_array_index_fits_offset(index.upper_bound, ty, reservations.target_layout?))
             })();
             if representable_offset != Some(true) {
                 return Err(format!("returned array index byte offset is not representable in {source:?}"));
@@ -6573,10 +6582,10 @@ fn closed_aggregates<'a>(
             let Some(plan) = result.bodies.get_mut(&key).filter(|plan|
                 matches!(plan.literal_array, Some(ClosedLiteralArray::Replacement { unit: None, .. })))
             else { return Err(format!("returned array index requires an exact replacement in {source:?}")); };
-            plan.replacement_index_observation = Some(occurrence.0);
+            plan.replacement_index_observation = Some(index.output.0);
         }
         ordinary.seal_array_descriptors(&mut result);
-        for &(key, body, _, _) in &returned_index_requirements {
+        for &(key, body, _) in &returned_index_requirements {
             let source = body.source;
             if !result.bodies.get(&key).is_some_and(|plan|
                 matches!(plan.literal_array, Some(ClosedLiteralArray::Replacement { call, .. })
