@@ -3749,11 +3749,38 @@ impl<'a> ReferenceFlowBuilder<'a> {
         }
     }
 
+    fn exact_widened_binding_move(
+        &self,
+        binding: &ScalarBinding,
+        value: &ScalarExpression,
+        ordinal: OccurrenceOrdinal,
+        block: ByteSpan,
+    ) -> bool {
+        let Some(owners) = &self.widened_arrays else { return false };
+        let ScalarExpression::Name { span, .. } = value else { return false };
+        let [receiver] = binding.receivers.as_slice() else { return false };
+        let Ok(Some(PlainNameIdentity::Lexical(source))) = self.prepared_name_identity(ordinal, *span)
+        else { return false };
+        !binding.is_allocation && binding.fallible_assignment.is_none()
+            && source.block_span == block && owners.contains(source)
+            && self.binding_types.get(source).is_some_and(|ty| aggregate::same_runtime_array_type(ty, &receiver.ty))
+    }
+
     fn move_value(
         &mut self,
         value: &ScalarExpression,
         scope: ReferenceScopeId,
         ordinal: OccurrenceOrdinal,
+    ) -> Result<(), ReferenceAnalysisError> {
+        self.move_value_with_widened_receipt(value, scope, ordinal, false)
+    }
+
+    fn move_value_with_widened_receipt(
+        &mut self,
+        value: &ScalarExpression,
+        scope: ReferenceScopeId,
+        ordinal: OccurrenceOrdinal,
+        exact_widened_destination: bool,
     ) -> Result<(), ReferenceAnalysisError> {
         let (binding, place, ty, span) = match value {
             ScalarExpression::Name { name, span } => {
@@ -3971,7 +3998,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
         if policy == CopyPolicy::Copy {
             return Ok(());
         }
-        if self.widened_arrays.as_ref().is_some_and(|owners| owners.contains(binding)) {
+        if !exact_widened_destination && self.widened_arrays.as_ref().is_some_and(|owners| owners.contains(binding)) {
             return Err(self.missing_context(span, ReferenceAnalysisErrorReason::UnprovedWidenedArrayTransfer));
         }
         let binding = binding.clone();
@@ -4803,7 +4830,9 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             .evaluations
                             .insert(primary_ordinal, initializer.expect("raw null evaluation"));
                     }
-                    self.move_value(primary, scope, primary_ordinal)?;
+                    let widened_move = outputs.secondary.is_empty()
+                        && self.exact_widened_binding_move(binding, primary, primary_ordinal, block.span);
+                    self.move_value_with_widened_receipt(primary, scope, primary_ordinal, widened_move)?;
                     let id = ReferenceBindingId {
                         source: self.source.clone(),
                         function_span: self.function_span,
@@ -4815,7 +4844,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     if let Some(owner) = alias_owner {
                         self.proof_points.fallible_aliases.insert(id.clone(), owner);
                     }
-                    let widened = super::widened_local_literal(binding).is_some();
+                    let widened = widened_move || super::widened_local_literal(binding).is_some();
                     if widened {
                         self.widened_arrays.get_or_insert_with(HashSet::new).insert(id.clone());
                     }

@@ -129,6 +129,7 @@ impl<'ctx, 'module> ProjectNames<'ctx, 'module> {
 #[derive(Clone, Copy)]
 enum LocalRuntimeExtent<'ctx> {
     Construction(inkwell::values::IntValue<'ctx>),
+    WidenedLiteral(inkwell::values::IntValue<'ctx>),
     OwningFormal(inkwell::values::IntValue<'ctx>),
     ManagedLengthSlot(PointerValue<'ctx>),
 }
@@ -1938,6 +1939,9 @@ fn store_binding_outputs<'ctx, 'module>(
     if aggregate_transfer::store_received_binding(context, state, binding, &value)? {
         return Ok(());
     }
+    if store_widened_move(state, binding, &value)? {
+        return Ok(());
+    }
     let receivers = binding_receivers(binding);
     for (position, (name, ty)) in receivers.iter().enumerate() {
         let value = extract_output(state, &value, position)?;
@@ -1958,6 +1962,41 @@ fn store_binding_outputs<'ctx, 'module>(
         )?;
     }
     Ok(())
+}
+
+fn store_widened_move<'ctx>(
+    state: &mut EmitState<'ctx, '_>,
+    binding: &crate::ScalarBinding,
+    value: &EmitValue<'ctx>,
+) -> Result<bool, String> {
+    if !matches!(binding.declared_type, ScalarType::RuntimeArray { .. }) { return Ok(false); }
+    let ScalarExpression::Name { name: source, .. } = &binding.value else { return Ok(false) };
+    let Some((backing, _)) = state.storage.get(source) else { return Ok(false) };
+    let backing = *backing;
+    let Some(&(declaration, extent @ LocalRuntimeExtent::WidenedLiteral(_), checked)) =
+        state.local_runtime_extents.get(&backing)
+    else { return Ok(false) };
+    let [receiver] = binding.receivers.as_slice() else {
+        return Err("widened array move requires one exact destination".into());
+    };
+    let Some(nodes) = state.body_call_nodes else { return Err("missing prepared widened array move".into()) };
+    if nodes.lexical_expression_declaration(&binding.value) != Some(declaration)
+        || nodes.binding_position(binding).is_none()
+        || !matches!(receiver.ty, ScalarType::RuntimeArray { .. })
+        || !matches!(value, EmitValue::Basic(BasicValueEnum::PointerValue(actual)) if *actual == backing)
+        || state.runtime_array_owners.get(source) != Some(&true)
+        || state.runtime_array_allocations.get(source) != Some(&true)
+    {
+        return Err("widened array move changed its prepared owner".into());
+    }
+    // The ordinary ownership transition retires the source. Re-key the
+    // existing extent under the sole receiving declaration, with no load,
+    // store, new backing, or independent runtime owner.
+    transition_runtime_array_binding_initialization(state, &receiver.name, &receiver.ty, &binding.value)?;
+    state.storage.insert(receiver.name.clone(), (backing, receiver.ty.clone()));
+    state.runtime_array_allocations.insert(receiver.name.clone(), true);
+    state.local_runtime_extents.insert(backing, (receiver.name_span, extent, checked));
+    Ok(true)
 }
 
 fn store_runtime_allocation<'ctx, 'module>(
@@ -1989,7 +2028,9 @@ fn store_runtime_allocation<'ctx, 'module>(
     aggregate_transfer::record_allocation(state, binding, &receiver.name, slot)?;
     if !mutable {
         if tracked_extent {
-            state.local_runtime_extents.insert(slot, (receiver.name_span, LocalRuntimeExtent::Construction(length), checked_extent));
+            let extent = if widened { LocalRuntimeExtent::WidenedLiteral(length) }
+                else { LocalRuntimeExtent::Construction(length) };
+            state.local_runtime_extents.insert(slot, (receiver.name_span, extent, checked_extent));
         }
         state
             .storage

@@ -508,7 +508,7 @@ fn capture_local_runtime_extent<'ctx>(
         return Err("runtime-array index differs from its qualified local declaration".to_owned());
     }
     match extent {
-        LocalRuntimeExtent::Construction(length)
+        LocalRuntimeExtent::Construction(length) | LocalRuntimeExtent::WidenedLiteral(length)
             if *storage == address && state.runtime_array_allocations.get(name) == Some(&true) =>
                 Ok(Some(*length)),
         LocalRuntimeExtent::OwningFormal(length)
