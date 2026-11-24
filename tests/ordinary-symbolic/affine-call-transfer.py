@@ -1639,6 +1639,37 @@ cases.extend([
         1,b"proof obligation failed"),
 ])
 
+rectangular_authored_show = """%%start
+    u8(u8, u8) leaf = fn(tag, value) { if (tag < 1) {}; 255 - value };
+    u8(u8, u8) producer = fn(tag, value) { u8 result = leaf(tag, value); result };
+    proof checked for producer(selector, before) -> (out)
+        where (selector >= 1 && before >= 10) ensures (out == 255 - core.old(before)) {
+            core.show(out <= 245);
+            core.show(out == 255 - core.old(before));
+            core.show(out <= 250);
+        }
+%%end"""
+rectangular_authored_translation = """%%start
+    i16(i16, i16) leaf = fn(tag, value) { if (tag < 0) {}; value + 1 };
+    i16(i16, i16) producer = fn(tag, value) {
+        if (value == 32767) { value } else { i16 result = leaf(tag, value); result }
+    };
+    proof checked for producer(selector, before) -> (out)
+        where (selector >= 0 && before < 32767) ensures (out == core.old(before) + 1) {
+            core.show(out > -32768);
+            core.show(out == core.old(before) + 1);
+        }
+%%end"""
+cases.extend([
+    ("ordinary-rectangular-authored-show-signed-translation", rectangular_authored_translation, 0, b""),
+    ("ordinary-rectangular-authored-show-unsigned-reflection", rectangular_authored_show, 0, b""),
+    ("ordinary-rectangular-authored-show-goal-failure", rectangular_authored_show.replace(
+        "ensures (out == 255 - core.old(before))","ensures (out == 246)"), 1, b"proof obligation failed"),
+    ("ordinary-rectangular-authored-show-first-step-failure", rectangular_authored_show.replace(
+        "core.show(out == 255 - core.old(before))", "core.show(out == core.old(before) - 1)").replace(
+        "core.show(out <= 250)", "core.show(out < 1)"), 1, b"proof obligation failed"),
+])
+
 verified_rectangular_affine = f"""%%start
     i16(i16, i16) leaf = fn(tag, value) {{ if (tag < 0) {{}}; -1 - value }};
     i16(i16, i16) producer = fn(tag, value) {{ i16 result = leaf(tag, value); result }};
@@ -1893,6 +1924,8 @@ cases.extend([
         b"proof obligation failed"),
 ])
 proof_diagnostic_notes = {
+    "ordinary-rectangular-authored-show-goal-failure": b"symbolic call can return 245",
+    "ordinary-rectangular-authored-show-first-step-failure": b"symbolic call can return 245",
     "ordinary-named-symbolic-mixed-false-refuted": b"symbolic call can return 12",
     "ordinary-named-symbolic-mixed-true-old": b"symbolic call can return 42",
     "exact-startup-named-stacked-mixed-old-refuted": b"call returned 42",
@@ -2655,6 +2688,14 @@ with tempfile.TemporaryDirectory(prefix="affine-calls-") as path:
                         assert b"COPY-PRIOR-UNPUBLISHED" not in res.stderr and b"COPY-FORMAL-UNPUBLISHED" not in res.stderr,res
                 elif included and name in proof_diagnostic_notes:
                     assert expected_stderr in res.stderr and proof_diagnostic_notes[name] in res.stderr,res
+                    if name.startswith("ordinary-rectangular-authored-show-"):
+                        primary, separator, secondary = res.stderr.partition(b"not satisfied by this symbolic call")
+                        assert separator,res
+                        if name.endswith("-goal-failure"):
+                            assert b"ensures (out == 246)" in primary and b"proof goal" not in secondary,res
+                        elif name.endswith("-first-step-failure"):
+                            assert b"core.show(out == core.old(before) - 1);" in primary and b"proof goal" in secondary,res
+                            assert b"core.show(out < 1);" not in primary,res
                 else:
                     assert res.stderr==expected_stderr,res
                 files = authored_files.get(name, {}) if included else {}

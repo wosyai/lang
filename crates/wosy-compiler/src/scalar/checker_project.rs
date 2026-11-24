@@ -4121,13 +4121,17 @@ impl<'a> SelectedSymbolicProof<'a, '_> {
         group: &MainFlowProofTarget<'a>,
     ) -> Result<Option<bool>, ProjectCheck> {
         use super::checker_flow::{covers_all_named_pair_inputs, covers_all_named_mixed_pair_inputs, verify_named_pair_return, charge_call_work, PartitionedProofGoal};
-        let MainFlowProofCases::Bare { first, rest } = &group.cases else { return Err(ProjectCheck::Unsupported); };
+        let (bare, authored) = match &group.cases {
+            MainFlowProofCases::Bare { first, rest } => (Some((first, rest.as_slice())), &[][..]),
+            MainFlowProofCases::Authored(cases) => (None, cases.as_slice()),
+        };
         let [left, right] = body.boundary.parameters.as_slice() else { return Err(ProjectCheck::Unsupported); };
         let [output] = body.boundary.results.as_slice() else { return Err(ProjectCheck::Unsupported); };
         let mixed = named_exact_mixed_pair(&body.boundary.parameters, |entry| &entry.ty);
         let bool_axis = if mixed { Some(usize::from(right.ty == ScalarType::Bool)) } else { None };
         if !is_integer_type(&output.ty) || !citation_safe_calling_body(body)
             || (!mixed && body.structure.checker_integer_call_locals.is_empty())
+            || (mixed && !authored.is_empty())
         {
             return Err(ProjectCheck::Unsupported);
         }
@@ -4139,10 +4143,18 @@ impl<'a> SelectedSymbolicProof<'a, '_> {
             typed_domain(1, &right.ty).ok_or(ProjectCheck::Unsupported)?,
         ];
         let mut work = 0;
-        charge_call_work(&mut work, rest.len().checked_add(1).ok_or(ProjectCheck::Unsupported)?)
-            .ok_or(ProjectCheck::Unsupported)?;
+        charge_call_work(&mut work, bare.map_or(Some(authored.len()), |(_, rest)| rest.len().checked_add(1))
+            .ok_or(ProjectCheck::Unsupported)?).ok_or(ProjectCheck::Unsupported)?;
+        let cases = bare.into_iter().flat_map(|(first, rest)| std::iter::once(first).chain(rest))
+            .map(|case| (case, None)).chain(authored.iter().map(|(case, step)| (case, step.as_ref())));
         let mut plans = Vec::new();
-        for case in std::iter::once(first).chain(rest) {
+        for (case, step) in cases {
+            let shows = match step {
+                None => &[][..],
+                Some(MainFlowAuthoredShows::Rectangular { shows, .. }) => shows.as_slice(),
+                _ => return Err(ProjectCheck::Unsupported),
+            };
+            charge_call_work(&mut work, shows.len()).ok_or(ProjectCheck::Unsupported)?;
             let goal = match case.bound {
                 MainFlowProofBound::Literal(bound) => PartitionedProofGoal::Literal(case.relation, bound),
                 MainFlowProofBound::Entry(slot)
@@ -4171,7 +4183,7 @@ impl<'a> SelectedSymbolicProof<'a, '_> {
                     domains[slot] = IntegerSet::singleton(&BigInt::from(u8::from(*value)));
                 }
             }
-            plans.push((case, goal, domains));
+            plans.push((case, goal, domains, shows));
         }
         let cursor = ExactCallCursor::named_pair_root(body, &output.ty, full.clone(), bool_axis).ok_or(ProjectCheck::Unsupported)?;
         let mut private_effects = OrderedFailures::default();
@@ -4185,12 +4197,21 @@ impl<'a> SelectedSymbolicProof<'a, '_> {
         if active || !private_effects.records.is_empty() || !complete {
             return Err(ProjectCheck::Unsupported);
         }
-        let issuer = if !mixed && rest.is_empty() {
+        let issuer = if !mixed && bare.is_some_and(|(_, rest)| rest.is_empty()) {
             group.issuer.as_ref().filter(|issuer| std::ptr::eq(issuer.body, body))
         } else { None };
         let mut dependencies = issuer.map(|_| reached);
         let mut applicable = false;
-        for (case, goal, guards) in plans {
+        'proofs: for (case, goal, guards, shows) in plans {
+            for (span, show) in shows {
+                let checked = verify_named_pair_return(body, &returned, &guards, show.partitioned(), &mut work)
+                    .ok_or(ProjectCheck::Unsupported)?;
+                applicable |= checked.applicable;
+                if let Some(failure) = checked.failure {
+                    self.record(case, function, source, effects.records.len(), failure, Some(*span))?;
+                    continue 'proofs;
+                }
+            }
             let checked = verify_named_pair_return(body, &returned, &guards, goal, &mut work)
                 .ok_or(ProjectCheck::Unsupported)?;
             applicable |= checked.applicable;
@@ -4664,11 +4685,35 @@ enum MainFlowAuthoredShows<'a> {
     Single(MainFlowLiteralShow<'a>),
     CallingCitation { peer: u32, show: Option<MainFlowLiteralShow<'a>> },
     Entry { span: ByteSpan, slot: usize, relation: IntegerRelation },
+    Rectangular {
+        shows: Vec<(ByteSpan, RectangularProofShow<'a>)>,
+        all_literal: bool,
+        concrete_groups: std::cell::OnceCell<Vec<MainFlowShowBound<'a>>>,
+    },
     Multiple { first_span: ByteSpan, groups: Vec<MainFlowShowBound<'a>> },
     CallingSequence {
         steps: Vec<MainFlowLiteralShow<'a>>,
         concrete_groups: std::cell::OnceCell<Vec<MainFlowShowBound<'a>>>,
     },
+}
+
+#[cfg(feature = "internal-checker")]
+enum RectangularProofShow<'a> {
+    Literal(IntegerRelation, Cow<'a, BigInt>),
+    Entry(usize),
+    Affine(usize, Rc<super::checker_flow::IntegerAffineTransform>),
+}
+
+#[cfg(feature = "internal-checker")]
+impl RectangularProofShow<'_> {
+    fn partitioned(&self) -> super::checker_flow::PartitionedProofGoal<'_> {
+        use super::checker_flow::PartitionedProofGoal;
+        match self {
+            Self::Literal(relation, bound) => PartitionedProofGoal::Literal(*relation, bound),
+            Self::Entry(slot) => PartitionedProofGoal::EntryEquality(*slot),
+            Self::Affine(slot, transform) => PartitionedProofGoal::EntryAffineEquality { slot: *slot, transform },
+        }
+    }
 }
 
 #[cfg(feature = "internal-checker")]
@@ -4846,12 +4891,15 @@ impl<'a> MainFlowProofCase<'a> {
         plan: &'a PlannedModuleProof<'a>, root: &SourceIdentity,
         citation: Option<(&'a PlannedModuleProof<'a>, Option<&'a ScalarBlockItem>)>,
     ) -> Result<MainFlowProofPlan<'a>, ProjectCheck> {
+        let body = plan.typed.body;
+        let rectangular = plan.typed.measure.is_none() && citation.is_none()
+            && supports_rectangular_calling_proof(body);
         let (relation, bound) = match &plan.typed.goal {
             TypedProofGoal::Literal { relation, bound, .. } => (relation, MainFlowProofBound::Literal(bound)),
             TypedProofGoal::Universal { relation, bound } if plan.steps.items.is_empty() => (relation, MainFlowProofBound::Literal(bound)),
-            TypedProofGoal::EntryComparison { slot, relation } if plan.steps.items.is_empty() =>
+            TypedProofGoal::EntryComparison { slot, relation } if plan.steps.items.is_empty() || rectangular =>
                 (relation, MainFlowProofBound::Entry(*slot)),
-            TypedProofGoal::EntryAffine { slot, relation, transform } if plan.steps.items.is_empty() =>
+            TypedProofGoal::EntryAffine { slot, relation, transform } if plan.steps.items.is_empty() || rectangular =>
                 (relation, MainFlowProofBound::EntryAffine { slot: *slot, transform }),
             _ => return Err(ProjectCheck::Unsupported),
         };
@@ -4894,6 +4942,41 @@ impl<'a> MainFlowProofCase<'a> {
             Some(MainFlowAuthoredShows::CallingCitation {
                 peer: wosy_syntax::byte_span(peer.proof).start, show,
             })
+        } else if rectangular && !plan.steps.items.is_empty() {
+            let steps = &plan.steps.items;
+            if steps.len() != plan.steps.terminated_items.len() {
+                return Err(ProjectCheck::Unsupported);
+            }
+            super::checker_flow::charge_call_work(&mut 0, steps.len()).ok_or(ProjectCheck::Unsupported)?;
+            let mut shows = Vec::with_capacity(steps.len());
+            let mut all_literal = true;
+            let mut legacy_entry = None;
+            for (step, &terminated) in steps.iter().zip(&plan.steps.terminated_items) {
+                let (span, claim) = show_claim(step, terminated)?;
+                let show = if let Some(TypedProofGoal::EntryAffine { slot, transform, .. }) = checked_affine_old_output(
+                    claim, &plan.typed.output, &plan.typed.input_names, body, plan.typed.result_type,
+                ) {
+                    RectangularProofShow::Affine(slot, transform)
+                } else if let Some(checked) = checked_old_output_relation(
+                    claim, &plan.typed.output, &plan.typed.input_names, body, plan.typed.result_type,
+                ) {
+                    let (slot, relation) = checked?;
+                    if Some(relation) != IntegerRelation::from_operator(&BinaryOperator::Equal) {
+                        if steps.len() != 1 { return Err(ProjectCheck::Unsupported); }
+                        legacy_entry = Some(MainFlowAuthoredShows::Entry { span, slot, relation });
+                        break;
+                    }
+                    RectangularProofShow::Entry(slot)
+                } else {
+                    let (relation, bound) = checked_literal(claim)?;
+                    RectangularProofShow::Literal(relation, bound)
+                };
+                all_literal &= matches!(show, RectangularProofShow::Literal(..));
+                shows.push((span, show));
+            }
+            Some(legacy_entry.unwrap_or_else(|| MainFlowAuthoredShows::Rectangular {
+                shows, all_literal, concrete_groups: std::cell::OnceCell::new(),
+            }))
         } else { match (plan.steps.items.as_slice(), plan.steps.terminated_items.as_slice()) {
             ([], []) => None,
             ([step], [true]) => {
@@ -5040,14 +5123,15 @@ impl<'a> MainFlowProofTarget<'a> {
             proof.guard.domain.map_or(0, |(_, values)| values.interval_count()),
         );
         let depth = |len: usize| (usize::BITS - len.leading_zeros()) as usize;
+        let indexed_show_work = |len: usize| {
+            // The concrete observer may lazily materialize its index.
+            let depth = depth(len);
+            len.saturating_mul(depth.saturating_mul(2).saturating_add(4)).saturating_add(depth)
+        };
         let step_work = match step {
             Some(MainFlowAuthoredShows::Multiple { groups, .. }) => depth(groups.len()).saturating_add(4),
-            Some(MainFlowAuthoredShows::CallingSequence { steps, .. }) => {
-                // The concrete observer may lazily materialize its index.
-                let depth = depth(steps.len());
-                steps.len().saturating_mul(depth.saturating_mul(2).saturating_add(4))
-                    .saturating_add(depth)
-            }
+            Some(MainFlowAuthoredShows::Rectangular { shows, .. }) => indexed_show_work(shows.len()),
+            Some(MainFlowAuthoredShows::CallingSequence { steps, .. }) => indexed_show_work(steps.len()),
             _ => 2,
         };
         4usize.saturating_add(guard).saturating_add(step_work)
@@ -5313,6 +5397,42 @@ impl ActualIntegerObserver for MainFlowProofObserver<'_> {
                             if failed.is_none() && proof.relation.accepts(value.cmp(bound)) {
                                 continue;
                             }
+                            failed
+                        }
+                        Some(MainFlowAuthoredShows::Rectangular { shows, all_literal, concrete_groups }) => {
+                            // Preserve the old concrete single old-read and literal index;
+                            // no new concrete relational-sequence authority.
+                            let failed = match shows.as_slice() {
+                                [(span, RectangularProofShow::Entry(slot))] => {
+                                    let Some(argument) = arguments.get(*slot) else {
+                                        self.incomplete = true;
+                                        return;
+                                    };
+                                    if !applies() { continue; }
+                                    (value != *argument).then_some(*span)
+                                }
+                                [(span, RectangularProofShow::Literal(relation, literal))] => {
+                                    if !applies() { continue; }
+                                    (!relation.accepts(value.cmp(literal))).then_some(*span)
+                                }
+                                _ if *all_literal => {
+                                    if !applies() { continue; }
+                                    let groups = concrete_groups.get_or_init(|| {
+                                        let mut groups = shows.iter().map(|(span, show)| {
+                                            let RectangularProofShow::Literal(relation, bound) = show else { unreachable!(); };
+                                            MainFlowShowBound::from_literal(*span, *relation, bound.clone())
+                                        }).collect();
+                                        index_main_flow_show_bounds(&mut groups);
+                                        groups
+                                    });
+                                    first_failed_show(groups, value)
+                                }
+                                _ => {
+                                    self.incomplete = true;
+                                    return;
+                                }
+                            };
+                            if failed.is_none() && proof.relation.accepts(value.cmp(bound)) { continue; }
                             failed
                         }
                         Some(MainFlowAuthoredShows::CallingCitation { .. }) => {
@@ -9254,6 +9374,12 @@ fn checked_old_output_relation(
 }
 
 #[cfg(feature = "internal-checker")]
+fn supports_rectangular_calling_proof(body: &FunctionCallSites) -> bool {
+    matches!(body.boundary.parameters.as_slice(), [left, right] if is_integer_type(&left.ty) && is_integer_type(&right.ty))
+        && citation_safe_calling_body(body) && !body.structure.checker_integer_call_locals.is_empty()
+}
+
+#[cfg(feature = "internal-checker")]
 fn checked_affine_old_output(
     expression: &ScalarExpression, output: &str, inputs: &[String], body: &FunctionCallSites, result: &ScalarType,
 ) -> Option<TypedProofGoal> {
@@ -9418,9 +9544,7 @@ fn typed_proof_postcondition<'a, const AUDIT_INDUCTION: bool, const DEFER_OUTPUT
             TypedProofGoal::Literal { operator, relation, bound }
         } else {
             #[cfg(feature = "internal-checker")]
-            let affine = if allow_named_entry_facts && steps.items.is_empty() && measure.is_none()
-                && matches!(body.boundary.parameters.as_slice(), [left, right] if is_integer_type(&left.ty) && is_integer_type(&right.ty))
-                && citation_safe_calling_body(body) && !body.structure.checker_integer_call_locals.is_empty()
+            let affine = if allow_named_entry_facts && measure.is_none() && supports_rectangular_calling_proof(body)
             {
                 checked_affine_old_output(&ensures, output, &input_names, body, &result.ty)
             } else { None };
@@ -16804,6 +16928,45 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
         let opaque = text.replace("{ 42 }", "{ value * value }");
         assert!(matches!(run(&opaque), Err(ProjectCheck::Unsupported)),
             "the false guard cannot hide an unsupported true-lane return");
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordered_named_rectangular_shows_observe_the_same_guarded_return() {
+        let app = source("src/main.w", "ordered-rectangular-authored-shows");
+        let text = r#"%%start
+            u8(u8, u8) leaf = fn(tag, value) { if (tag < 1) {}; 255 - value };
+            u8(u8, u8) producer = fn(tag, value) { u8 result = leaf(tag, value); result };
+            proof checked for producer(selector, before) -> (out)
+                where (selector >= 1 && before >= 10) ensures (out == 255 - core.old(before)) {
+                    core.show(out <= 245);
+                    core.show(out == 255 - core.old(before));
+                    core.show(out <= 250);
+                }
+        %%end"#;
+        let run = |text: &str| {
+            let (_, proof) = crate::parse_proof_source(app.clone(), text.to_owned(), &[]).ok().unwrap();
+            check_loaded_ordered_proof_diagnostics_in_scope::<true>(
+                Vec::new(), vec![(proof, Vec::new())], vec![app.clone()], inputs(),
+                ScalarCheckerScope::CurrentPackage, Vec::new(),
+            )
+        };
+        let report = run(text).unwrap();
+        assert!(report.active && report.symbolic_diagnostic.is_none() && report.directives.is_empty());
+        let false_goal = text.replace("ensures (out == 255 - core.old(before))", "ensures (out == 246)");
+        let failed = run(&false_goal).unwrap().symbolic_diagnostic.unwrap();
+        assert!(failed.failed_step.is_none());
+        let false_show = false_goal.replace("core.show(out == 255 - core.old(before))", "core.show(out == core.old(before) - 1)")
+            .replace("core.show(out <= 250)", "core.show(out < 1)");
+        let failure = run(&false_show).unwrap().symbolic_diagnostic.unwrap();
+        let step = failure.failed_step.unwrap().range;
+        assert_eq!(&false_show[step.start as usize..step.end as usize], "core.show(out == core.old(before) - 1)");
+        assert_eq!(failure.returned, BigInt::from(245));
+        assert!(failure.witness.intervals_at(0, 1).unwrap().eq([(&BigInt::from(10), &BigInt::from(127)), (&BigInt::from(129), &BigInt::from(255))]));
+        let fanout = format!("{}\n proof fanout for producer(selector, before) -> (out) where (selector >= 1 && before >= 10) ensures (out <= 245) {{ {} }} %%end",
+            false_show.split_once("%%end").unwrap().0, "core.show(out <= 245);".repeat(1024));
+        assert!(matches!(run(&fanout), Err(ProjectCheck::Unsupported)),
+            "a later exhausted proof cannot publish an earlier step failure as a partial result");
     }
 
     #[cfg(feature = "internal-checker")]
