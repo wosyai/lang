@@ -39,6 +39,8 @@ pub(super) struct AggregateFlowFacts {
     pub(super) installations: BTreeMap<CfgPointId, (CfgPointId, BlockPosition)>,
     receipt_aliases: BTreeSet<CfgPointId>,
     pub(super) calls: BTreeMap<CfgPointId, OccurrenceOrdinal>,
+    pub(super) multi_owner_calls: BTreeMap<CfgPointId, (OccurrenceOrdinal, usize)>,
+    pub(super) multi_owner_projections: BTreeMap<CfgPointId, (CfgPointId, usize)>,
     pub(super) secondary_owner_calls: BTreeSet<CfgPointId>,
     mixed_arm_projection: Option<MixedArmProjection>,
     pub(super) secondary_owner_outputs: BTreeMap<CfgPointId, CfgPointId>,
@@ -748,6 +750,7 @@ pub(super) struct ConditionalArrayArm {
 pub(super) enum OwnerSource {
     Allocation(CfgPointId),
     Call(CfgPointId),
+    CallOutput(CfgPointId, usize),
     Formal(usize),
 }
 
@@ -1239,6 +1242,11 @@ pub(super) struct AggregateFlowResult {
     pub(super) allocation_slots: BTreeMap<CfgPointId, (usize, usize)>,
     pub(super) calls: BTreeMap<CfgPointId, OccurrenceOrdinal>,
     pub(super) mixed_result_calls: BTreeSet<CfgPointId>,
+    multi_disqualifying_effect: bool,
+    pub(super) sealed_multi_result: Option<Vec<((usize, usize), usize)>>,
+    pub(super) multi_selected_calls: BTreeMap<CfgPointId, (OccurrenceOrdinal, usize)>,
+    pub(super) multi_result_calls: BTreeSet<CfgPointId>,
+    pub(super) multi_result_bindings: BTreeMap<CfgPointId, Vec<ReferenceBindingId>>,
     pub(super) mixed_result_bindings: BTreeSet<CfgPointId>,
     pub(super) mixed_forward: Option<CfgPointId>,
     pub(super) mixed_arm_backings: [MixedArmBacking; 2],
@@ -1314,6 +1322,46 @@ impl AggregateFlowResult {
         Some(SealedMixedOwner::Allocation { lanes, block, item })
     }
 
+    fn has_local_multi_allocation_census(&self, width: usize) -> bool {
+        !self.multi_disqualifying_effect && self.unsupported.is_empty()
+            && self.returns.len() == width && self.allocation_slots.len() == width
+            && self.calls.is_empty() && self.multi_result_calls.is_empty()
+    }
+
+    pub(super) fn multi_local_result(&self, cfg: &ScalarReferenceCfg, sites: &FunctionCallSites)
+        -> Option<Vec<((usize, usize), usize)>>
+    {
+        let outputs = &sites.boundary.root_outputs;
+        if outputs.len() < 2 || !outputs.iter().all(|slot| matches!(slot.ty, ScalarType::Struct(_)))
+            || !sites.boundary.parameters.iter().all(|parameter| ordinary_value(&parameter.ty))
+            || !self.has_local_multi_allocation_census(outputs.len())
+        { return None; }
+        let occurrences = sites.structure.blocks.get(sites.structure.root.0)?.final_outputs();
+        let mut seen = BTreeSet::new();
+        let mut lanes = Vec::with_capacity(outputs.len());
+        for ((&returned, origins), authored) in self.returns.iter().zip(occurrences) {
+            let CfgPointKind::ReturnOutput { output, value_point, checked: false } = cfg.initial_points.get(returned.0)?.kind
+                else { return None };
+            if output != lanes.len() || authored.output != output || origins.len() != 1 { return None; }
+            let OwnerSource::Allocation(original) = origins.first().copied().flatten()? else { return None };
+            if !seen.insert(original) { return None; }
+            let &(block, item) = self.allocation_slots.get(&original)?;
+            let Some(PlainNameIdentity::Lexical(binding)) = sites.prepared_plain_name(authored.expression) else { return None };
+            let read = cfg.initial_points.get(value_point.0)?;
+            let moved = cfg.initial_points.get(linear_successor(&cfg.initial_points, value_point)?.0)?;
+            if block != sites.structure.root.0
+                || !matches!(&read.kind, CfgPointKind::Read { binding: observed } if observed == binding)
+                || !matches!(&moved.kind, CfgPointKind::Move { owner, place, ty }
+                    if owner == binding && &place.binding == binding && place.projections.is_empty() && ty == &outputs[output].ty)
+            { return None; }
+            if lanes.last().is_some_and(|&(_, previous)| previous >= authored.expression.0) {
+                return None;
+            }
+            lanes.push(((block, item), authored.expression.0));
+        }
+        (lanes.len() == outputs.len()).then_some(lanes)
+    }
+
     fn return_owners<'a>(&'a self, cfg: &'a ScalarReferenceCfg, owner_lane: Option<usize>)
         -> impl Iterator<Item = Option<OwnerSource>> + 'a
     {
@@ -1346,6 +1394,10 @@ impl AggregateFlowResult {
             self.read_invalid.entry(source).or_insert(point);
         }
         match value {
+            Some(Value::View(OwnerSource::CallOutput(..)) |
+                Value::Aggregate { backing: OwnerSource::CallOutput(..), .. }) => {
+                self.unsupported.insert(point);
+            }
             Some(Value::RawFormal(_) | Value::RawCell { owner: None, .. }) => {
                 self.invalidate_raw(point);
             }
@@ -1383,7 +1435,7 @@ impl AggregateFlowResult {
             || (self.checked_producer_authoritative && !self.checked_producer_backing.is_empty())
             || self.checked_backing_assignment.is_some() || self.checked_backing_forward.is_some()
             || self.scalar_descriptor_assignment.is_some() || self.fresh_recommit_leaf.is_some() || !self.array_returns.is_empty() || !self.array_rebinds.is_empty()
-            || self.returning_leaf || !self.calls.is_empty() || !self.mixed_result_calls.is_empty() || !self.returns.is_empty() || !self.formals.is_empty() || !self.inputs.is_empty() || !self.raw_terminals.is_empty() || !self.read_formals.is_empty()
+            || self.returning_leaf || !self.calls.is_empty() || !self.mixed_result_calls.is_empty() || !self.multi_result_calls.is_empty() || !self.returns.is_empty() || !self.formals.is_empty() || !self.inputs.is_empty() || !self.raw_terminals.is_empty() || !self.read_formals.is_empty()
     }
 }
 
@@ -1457,6 +1509,14 @@ impl AggregateFlowFacts {
         state
     }
 
+    fn exact_multi_initializer(&self, rhs: CfgPointId, call: CfgPointId, lane: usize) -> bool {
+        if lane == 0 {
+            rhs == call && self.multi_owner_calls.contains_key(&call)
+        } else {
+            self.multi_owner_projections.get(&rhs) == Some(&(call, lane))
+        }
+    }
+
     pub(super) fn tracks_read_sources(&self) -> bool {
         !self.formals.is_empty() || !self.raw_formals.is_empty()
     }
@@ -1470,7 +1530,7 @@ impl AggregateFlowFacts {
     fn observes_legacy_values(&self) -> bool {
         self.array_formal.is_some() || !self.array_calls.is_empty()
             || self.mixed_arm_projection.is_some()
-            || !self.checked_producer_arms.is_empty() || !self.views.is_empty() || !self.calls.is_empty() || !self.formals.is_empty() || !self.input_moves.is_empty() || !self.raw_formals.is_empty()
+            || !self.checked_producer_arms.is_empty() || !self.views.is_empty() || !self.calls.is_empty() || !self.multi_owner_calls.is_empty() || !self.formals.is_empty() || !self.input_moves.is_empty() || !self.raw_formals.is_empty()
     }
 
     // Select observers after CFG construction; this is only a demand gate,
@@ -2048,12 +2108,20 @@ impl AggregateFlowFacts {
             member
         } else {
             match &point.kind {
+                CfgPointKind::Release { .. } | CfgPointKind::Invalidate { .. } => {
+                    result.multi_disqualifying_effect = true;
+                    None
+                }
                 CfgPointKind::Borrow { place, .. } => {
                     state.forget_plain(&place.binding);
                     let value = state.bindings.get(&place.binding).and_then(|(value, _, _)| value.as_ref());
                     result.account_raw(id, value);
                     let (call, root) = match value {
                         Some(Value::Aggregate { backing: OwnerSource::Call(call), .. }) => (Some(*call), id),
+                        Some(Value::Aggregate { backing: OwnerSource::CallOutput(..), .. }) => {
+                            result.unsupported.insert(id);
+                            (None, id)
+                        },
                         Some(Value::ReceiptLoan { call, root }) => (Some(*call), *root),
                         _ => (None, id),
                     };
@@ -2129,6 +2197,9 @@ impl AggregateFlowFacts {
                     if let Some(&(rhs, position)) = self.installations.get(&id) {
                         match state.values.get(&rhs) {
                             Some(Value::Aggregate { backing: OwnerSource::Formal(_), field: Some(_) }) if self.carrier_literals.contains(&rhs) => {}
+                            Some(Value::Aggregate { backing: OwnerSource::CallOutput(call, lane), field: None })
+                                if self.exact_multi_initializer(rhs, *call, *lane)
+                                    && result.multi_result_bindings.get(call).and_then(|receivers| receivers.get(*lane)) == Some(binding) => {}
                             value => result.account_raw(id, value),
                         }
                         let value = if !self.checked_producer_arms.is_empty() && self.checked_raw_bindings.contains(&id) {
@@ -2247,12 +2318,17 @@ impl AggregateFlowFacts {
                     None
                 }
                 CfgPointKind::AssignThrough { rhs_point, .. } => {
+                    result.multi_disqualifying_effect = true;
                     let value = state.values.get(rhs_point);
                     result.account_raw(id, value);
                     if !result.reject_receipt_loan(id, value) && value.is_some() {
                         result.unsupported.insert(id);
                     }
                     None
+                }
+                CfgPointKind::Call { output, .. } if *output != 0 && self.multi_owner_projections.contains_key(&id) => {
+                    let &(call, lane) = self.multi_owner_projections.get(&id).expect("selected output");
+                    (*output == lane).then_some(Value::Aggregate { backing: OwnerSource::CallOutput(call, lane), field: None })
                 }
                 CfgPointKind::Call { output: 1, .. } => self.secondary_owner_outputs.get(&id)
                     .map(|&producer| Value::Aggregate { backing: OwnerSource::Call(producer), field: None }),
@@ -2443,7 +2519,9 @@ impl AggregateFlowFacts {
                     if self.temporary_arguments.contains(&id) {
                         state.pending_temporaries.insert(id, point.scope);
                     }
-                    offset.or_else(|| (self.calls.contains_key(&id) && !self.secondary_owner_calls.contains(&id)).then_some(Value::Aggregate {
+                    offset.or_else(|| self.multi_owner_calls.contains_key(&id).then_some(Value::Aggregate {
+                        backing: OwnerSource::CallOutput(id, 0), field: None,
+                    })).or_else(|| (self.calls.contains_key(&id) && !self.secondary_owner_calls.contains(&id)).then_some(Value::Aggregate {
                         backing: OwnerSource::Call(id),
                         field: None,
                     }))
@@ -2525,7 +2603,7 @@ impl AggregateFlowFacts {
                         if let Some(Value::Aggregate { backing, field: None }) = value {
                             let installed = match backing {
                                 OwnerSource::Formal(_) => true,
-                                OwnerSource::Call(_) => position.is_some(),
+                                OwnerSource::Call(_) | OwnerSource::CallOutput(..) => position.is_some(),
                                 OwnerSource::Allocation(_) => false,
                             };
                             if exit.is_some() && installed && !state.moved.contains(backing) {
@@ -2567,6 +2645,7 @@ impl AggregateFlowFacts {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ClosedReturn {
     MixedBranch,
+    MultipleAllocations,
     MixedSelected { lanes: MixedOwnerResultLanes, call: usize, outputs: [usize; 2] },
     Allocation { block: usize, item: usize },
     Forward { call: OccurrenceOrdinal },
@@ -2685,6 +2764,7 @@ pub(crate) struct ClosedFreshRecommit {
 #[derive(Debug)]
 pub(crate) struct ClosedOwnerRelease {
     pub(crate) receipt: usize,
+    pub(crate) output_lane: Option<usize>,
     pub(crate) guard: Option<usize>,
 }
 
@@ -2741,6 +2821,9 @@ pub(crate) struct ClosedBody {
     pub(crate) terminal_indexed: Option<Box<[ClosedIndexedSnapshot; 2]>>,
     pub(crate) ordinary_calls: BTreeMap<usize, SourceSpan>,
     pub(crate) calls: BTreeMap<usize, ClosedCall>,
+    // Source output order and strictly increasing prepared output occurrence.
+    pub(crate) multi_returns: Vec<((usize, usize), usize)>,
+    pub(crate) multi_receives: BTreeMap<usize, Vec<ByteSpan>>,
     pub(crate) recommits: BTreeMap<usize, usize>,
     pub(crate) identity_relay: Option<usize>,
     pub(crate) scope_exits: BTreeMap<usize, CfgPointId>,
@@ -5946,6 +6029,10 @@ fn closed_aggregates<'a>(
             bodies.insert(key, Body { facts, cfg, sites, source: input.source, is_monomorphic, supports_input_result });
         }
     }
+    let multi_producers: BTreeMap<_, _> = bodies.iter().filter_map(|(&key, body)| {
+        if !body.is_monomorphic || key.2.is_some() { return None; }
+        Some((key, body.facts?.sealed_multi_result.as_ref()?))
+    }).collect();
     let mut identity_relays = BTreeMap::<BodyKey, usize>::new();
     let mut identity_waiters = BTreeMap::<(BodyKey, usize), Vec<(BodyKey, usize)>>::new();
     let mut identity_pending = Vec::new();
@@ -5985,6 +6072,7 @@ fn closed_aggregates<'a>(
     ordinary.census(reservations, &module_at, &declarations);
     let mut outgoing = BTreeSet::new();
     let mut pending = Vec::new();
+    outgoing.extend(multi_producers.keys().copied());
     let mut callers = BTreeMap::<BodyKey, Vec<BodyKey>>::new();
     let mut forward_edges = BTreeMap::new();
     let mut conditional_forward_edges = BTreeMap::<_, BTreeSet<_>>::new();
@@ -6126,7 +6214,7 @@ fn closed_aggregates<'a>(
         }
         for source in body.return_owners().flatten() {
             match source {
-                OwnerSource::Formal(_) => {}
+                OwnerSource::Formal(_) | OwnerSource::CallOutput(..) => {}
                 OwnerSource::Allocation(_) => {
                     if outgoing.insert(key) {
                         pending.push(key);
@@ -7010,7 +7098,9 @@ fn closed_aggregates<'a>(
                     body.source
                 ));
             }
-            let route = if let Some(LocalChoiceUse::Return { call, output }) = local_choices.get(&key).map(|choice| choice.use_site) {
+            let route = if multi_producers.contains_key(&key) {
+                ClosedReturn::MultipleAllocations
+            } else if let Some(LocalChoiceUse::Return { call, output }) = local_choices.get(&key).map(|choice| choice.use_site) {
                 ClosedReturn::Recommit { call: call.0, output: output.0 }
             } else if let Some(shape) = structured_returns.get(&key) {
                 if !shape.complete || !shape.has_owning_leaf() || shape.leaves.iter().any(|&leaf| {
@@ -7034,6 +7124,9 @@ fn closed_aggregates<'a>(
                     return Err(format!("aggregate return owner has conflicting paths in {:?}", body.source));
                 } else {
                     match owner {
+                        OwnerSource::CallOutput(..) => {
+                            return Err(format!("forwarding a multiple owning result is not closed in {:?}", body.source));
+                        }
                         OwnerSource::Formal(_) => {
                             return Err(format!("return of moved formal is not closed in {:?}", body.source));
                         }
@@ -7093,6 +7186,9 @@ fn closed_aggregates<'a>(
         };
         let mut plan = result.bodies.remove(&key).unwrap_or_default();
         plan.returning = return_route;
+        if let Some(lanes) = multi_producers.get(&key) {
+            plan.multi_returns.clone_from(*lanes);
+        }
         if matches!(return_route, Some(ClosedReturn::Structured { .. })) {
             plan.structured_result_binding = structured_returns[&key].binding
                 .map(|(block, item, conditional)| (block.0, item, conditional.0));
@@ -7117,15 +7213,46 @@ fn closed_aggregates<'a>(
         // Index observed endpoints once. Looking up every owner by scanning all
         // scopes would make a chain of otherwise linear certificates quadratic.
         let mut call_endpoints = BTreeMap::<_, Vec<_>>::new();
-        if !facts.calls.is_empty() {
+        let unsupported_multi = || format!("multiple owning outputs require an exact full local binding and lexical cleanup in {:?}", body.source);
+        let mut lane_exits = BTreeMap::new();
+        if !facts.calls.is_empty() || !facts.multi_selected_calls.is_empty() {
             for (&endpoint, receipts) in &facts.endpoints {
                 for (&owner, witness) in &receipts.possible {
-                    if let OwnerSource::Call(point) = owner {
-                        call_endpoints.entry(point).or_default()
-                            .push((endpoint, receipts.always_retains(owner, witness.as_ref())));
+                    match owner {
+                        OwnerSource::Call(point) => call_endpoints.entry(point).or_default()
+                            .push((endpoint, receipts.always_retains(owner, witness.as_ref()))),
+                        OwnerSource::CallOutput(call, lane) => {
+                            if lane_exits.insert((call, lane), (endpoint, witness.as_ref(),
+                                receipts.always_retains(owner, witness.as_ref()))).is_some()
+                            { return Err(unsupported_multi()); }
+                        }
+                        _ => {}
                     }
                 }
             }
+        }
+        let mut multi_at_exit = BTreeMap::<(CfgPointId, usize), Vec<(CfgPointId, usize, usize)>>::new();
+        if !facts.multi_result_calls.is_empty() {
+            for &point in &facts.multi_result_calls {
+                let Some(target) = target_body(&declarations, body.cfg, point) else { continue };
+                let Some(lanes) = multi_producers.get(&target) else { continue };
+                let &(call, width) = facts.multi_selected_calls.get(&point).ok_or_else(unsupported_multi)?;
+                let receivers = facts.multi_result_bindings.get(&point).ok_or_else(unsupported_multi)?;
+                if width != lanes.len() || width != receivers.len() || !facts.unsupported.is_empty()
+                    || !body.is_monomorphic
+                {
+                    return Err(unsupported_multi());
+                }
+                for (lane, receiver) in receivers.iter().enumerate() {
+                    let (endpoint, witness, always) = lane_exits.remove(&(point, lane)).ok_or_else(unsupported_multi)?;
+                    if !always || witness != Some(receiver) {
+                        return Err(unsupported_multi());
+                    }
+                    multi_at_exit.entry(endpoint).or_default().push((point, lane, call.0));
+                }
+                plan.multi_receives.insert(call.0, receivers.iter().map(|receiver| receiver.declaration_span).collect());
+            }
+            if !lane_exits.is_empty() { return Err(unsupported_multi()); }
         }
         let mut conditional_certificate = conditional_input_certificates.remove(&key);
         let mut shared_conditional_guards = plan.conditional_inputs.iter().flat_map(|(&expression, inputs)| {
@@ -7179,7 +7306,7 @@ fn closed_aggregates<'a>(
                 if let Some(guard) = release_guard {
                     plan.scope_exits.insert(choice.block.0, choice.exit);
                     record_release(&mut plan, choice.exit, sibling.join,
-                        ClosedOwnerRelease { receipt: sibling.conditional.0, guard })?;
+                        ClosedOwnerRelease { receipt: sibling.conditional.0, output_lane: None, guard })?;
                 }
             }
             let mut receipt = choice.conditional;
@@ -7193,7 +7320,7 @@ fn closed_aggregates<'a>(
                 plan.scope_exits.insert(choice.block.0, exit);
                 let guard = plan.selected_receipt_release(receipt, choice.guarded_primary)?
                     .ok_or("observed primary receipt has no lexical release path")?;
-                record_release(&mut plan, exit, choice.joined_birth, ClosedOwnerRelease { receipt: receipt.0, guard })?;
+                record_release(&mut plan, exit, choice.joined_birth, ClosedOwnerRelease { receipt: receipt.0, output_lane: None, guard })?;
             }
         }
         for (&point, &call) in &facts.calls {
@@ -7356,7 +7483,7 @@ fn closed_aggregates<'a>(
                                 return Err(format!("aggregate release has conflicting scope exits in {:?}", body.source));
                             }
                             let birth = previous.map_or(point, |origin| origin.birth);
-                            record_release(&mut plan, exit, birth, ClosedOwnerRelease { receipt: call.0, guard: Some(guard) })?;
+                            record_release(&mut plan, exit, birth, ClosedOwnerRelease { receipt: call.0, output_lane: None, guard: Some(guard) })?;
                         }
                         (None, ReceiptGate::Transferred) => {
                             plan.conditional_inputs.entry(expression).or_default().consumed_on_both_arms.push(call.0);
@@ -7395,7 +7522,17 @@ fn closed_aggregates<'a>(
                 return Err(format!("aggregate release has conflicting scope exits in {:?}", body.source));
             }
             let birth = previous.map_or(point, |origin| origin.birth);
-            record_release(&mut plan, exit, birth, ClosedOwnerRelease { receipt: call.0, guard: None })?;
+            record_release(&mut plan, exit, birth, ClosedOwnerRelease { receipt: call.0, output_lane: None, guard: None })?;
+        }
+        for ((exit, block), mut lanes) in multi_at_exit {
+            if plan.releases.contains_key(&exit) || ranked_releases.contains_key(&exit)
+                || plan.input_releases.contains_key(&exit) || plan.scope_exits.insert(block, exit).is_some_and(|old| old != exit)
+            {
+                return Err(format!("multiple owning outputs overlap a different release cohort in {:?}", body.source));
+            }
+            lanes.sort_unstable();
+            plan.releases.insert(exit, lanes.into_iter().map(|(_, lane, receipt)|
+                ClosedOwnerRelease { receipt, output_lane: Some(lane), guard: None }).collect());
         }
         plan.releases.extend(ranked_releases.into_iter().map(|(exit, releases)|
             (exit, releases.into_values().collect())));
@@ -7410,7 +7547,7 @@ fn closed_aggregates<'a>(
             ));
         }
         if returning || !plan.calls.is_empty() || !plan.recommits.is_empty() || !plan.inputs.is_empty() || !plan.input_calls.is_empty()
-            || plan.identity_relay.is_some() || !plan.same_array_rebinds.is_empty() || !plan.fresh_array_recommits.is_empty() || plan.scalar_descriptor_assignment.is_some()
+            || !plan.multi_receives.is_empty() || plan.identity_relay.is_some() || !plan.same_array_rebinds.is_empty() || !plan.fresh_array_recommits.is_empty() || plan.scalar_descriptor_assignment.is_some()
             || plan.checked_backing_wrapper.is_some()
         {
             result.bodies.insert(key, plan);
@@ -8580,4 +8717,66 @@ Reading(u64) make_reading = fn(length) {
         assert!(state.values.is_empty());
         assert_eq!(state.pending_temporaries.get(&CfgPointId(0)), Some(&ReferenceScopeId(0)));
     }
+}
+
+#[cfg(test)]
+#[test]
+fn output_receipts_of_one_call_keep_independent_exact_scope_bindings() {
+    let source = SourceIdentity::new("project".into(), "tests".into(), "src/main.w".into(), "r1".into());
+    let binding = |index| ReferenceBindingId {
+        source: source.clone(), function_span: ByteSpan::new(0, 200),
+        declaration_span: ByteSpan::new(index, index + 1), block_span: ByteSpan::new(1, 199),
+        kind: ReferenceBindingKind::Declared,
+    };
+    let front = binding(18);
+    let back = binding(25);
+    let first = OwnerSource::CallOutput(CfgPointId(4), 0);
+    let second = OwnerSource::CallOutput(CfgPointId(4), 1);
+    let live = BTreeSet::from([(first, front.clone()), (second, back.clone())]);
+    let mut endpoint = ScopeEndpoint::default();
+    endpoint.observe(live.clone());
+    assert!(endpoint.always_retains(first, Some(&front)));
+    assert!(endpoint.always_retains(second, Some(&back)));
+    assert!(!endpoint.always_retains(first, Some(&back)));
+    // With one receipt missing on an incoming edge, the other lane cannot
+    // fill its role. This is abstract receipt accounting only, not Wosy code.
+    endpoint.observe(BTreeSet::from([(first, front.clone())]));
+    assert!(endpoint.always_retains(first, Some(&front)));
+    assert!(!endpoint.always_retains(second, Some(&back)));
+    let mut duplicate = ScopeEndpoint::default();
+    duplicate.observe(live);
+    duplicate.observe(BTreeSet::from([(first, back.clone()), (second, front.clone())]));
+    assert!(!duplicate.always_retains(first, Some(&front)));
+    assert!(!duplicate.always_retains(second, Some(&back)));
+}
+
+
+#[cfg(test)]
+#[test]
+fn local_multi_result_rejects_a_nonempty_owning_call_census() {
+    let mut facts = AggregateFlowResult::default();
+    for (lane, point) in [CfgPointId(3), CfgPointId(7)].into_iter().enumerate() {
+        facts.allocation_slots.insert(point, (0, lane));
+        facts.returns.insert(CfgPointId(9 + lane), BTreeSet::from([Some(OwnerSource::Allocation(point))]));
+    }
+    assert!(facts.has_local_multi_allocation_census(2));
+    facts.calls.insert(CfgPointId(8), OccurrenceOrdinal(12));
+    assert!(!facts.has_local_multi_allocation_census(2));
+}
+
+
+#[cfg(test)]
+#[test]
+fn ordered_result_initializers_accept_only_their_exact_primary_or_projection() {
+    let mut facts = AggregateFlowFacts::default();
+    let call = CfgPointId(4);
+    let projection = CfgPointId(6);
+    facts.multi_owner_calls.insert(call, (OccurrenceOrdinal(3), 2));
+    facts.multi_owner_projections.insert(projection, (call, 1));
+    assert!(facts.exact_multi_initializer(call, call, 0));
+    assert!(facts.exact_multi_initializer(projection, call, 1));
+    assert!(!facts.exact_multi_initializer(call, call, 1));
+    assert!(!facts.exact_multi_initializer(projection, call, 0));
+    assert!(!facts.exact_multi_initializer(projection, CfgPointId(5), 1));
+    assert!(!facts.exact_multi_initializer(CfgPointId(7), call, 1));
 }

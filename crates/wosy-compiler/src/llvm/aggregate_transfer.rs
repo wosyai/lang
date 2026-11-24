@@ -116,7 +116,9 @@ pub(super) struct AggregateEmitter<'ctx, 'plan> {
     checked_backing_receiver: Option<PointerValue<'ctx>>,
     checked_backing_released: bool,
     checked_backing_forwarded: bool,
-    receipts: BTreeMap<usize, PointerValue<'ctx>>,
+    receipts: BTreeMap<(usize, Option<usize>), PointerValue<'ctx>>,
+    multi_destinations: Vec<PointerValue<'ctx>>,
+    multi_allocations: BTreeMap<(usize, usize), Option<(PointerValue<'ctx>, String)>>,
     // SSA join values indexed by the function-local, shared guard plan.
     receipt_guards: BTreeMap<usize, inkwell::values::IntValue<'ctx>>,
     inputs: BTreeMap<usize, PointerValue<'ctx>>,
@@ -157,7 +159,7 @@ impl<'ctx, 'plan> AggregateEmitter<'ctx, 'plan> {
         let Some(plan) = plan else {
             return Ok(None);
         };
-        let destination = if plan.returning.is_some() {
+        let destination = if plan.returning.is_some() && plan.multi_returns.is_empty() {
             Some(
                 definition
                     .get_nth_param(parameter_count as u32)
@@ -209,6 +211,11 @@ impl<'ctx, 'plan> AggregateEmitter<'ctx, 'plan> {
                 return Err("mixed checked backing producer has no matching local release".into());
             }
         }
+        let multi_destinations = (0..plan.multi_returns.len()).map(|lane| {
+            let index = u32::try_from(parameter_count + lane).map_err(|_| "owning return destination index overflow")?;
+            definition.get_nth_param(index).map(|value| value.into_pointer_value())
+                .ok_or_else(|| "missing ordered owning return destination".to_owned())
+        }).collect::<Result<Vec<_>, _>>()?;
         Ok(Some(Self {
             plan,
             inputs,
@@ -241,6 +248,8 @@ impl<'ctx, 'plan> AggregateEmitter<'ctx, 'plan> {
             checked_backing_released: false,
             checked_backing_forwarded: false,
             receipts: BTreeMap::new(),
+            multi_destinations,
+            multi_allocations: plan.multi_returns.iter().map(|&(position, _)| (position, None)).collect(),
             receipt_guards: BTreeMap::new(),
         }))
     }
@@ -310,6 +319,20 @@ pub(super) fn definition_type<'ctx>(
     else {
         return Err("invalid closed aggregate declaration".into());
     };
+    if let Some(plan) = plan.filter(|plan| !plan.multi_returns.is_empty()) {
+        if plan.multi_returns.len() != outputs.outputs.len() || !plan.inputs.is_empty()
+            || !outputs.outputs.iter().all(|output| matches!(output.ty, ScalarType::Struct(_)))
+        {
+            return Err("invalid ordered owning return declaration".into());
+        }
+        let pointer = context.ptr_type(AddressSpace::default());
+        let arity = plan.multi_returns.len();
+        let mut arguments = parameters.iter().map(|ty| basic_type(context, ty, layout).map(Into::into))
+            .collect::<Result<Vec<BasicMetadataTypeEnum<'ctx>>, _>>()?;
+        arguments.extend(std::iter::repeat_n(BasicMetadataTypeEnum::from(pointer), arity));
+        let returned = context.struct_type(&vec![pointer.into(); arity], false);
+        return Ok(returned.fn_type(&arguments, false));
+    }
     let mixed = mixed_owned_struct_result(outputs);
     if mixed.is_none() && !matches!(outputs.outputs.as_slice(),
         [crate::ScalarOutput { ty: ScalarType::Struct(_), .. }])
@@ -454,7 +477,7 @@ pub(super) fn finish_conditional_receipts<'ctx>(
         }
     }
     for receipt in &plan.consumed_on_both_arms {
-        aggregate.receipts.remove(receipt)
+        aggregate.receipts.remove(&(*receipt, None))
             .ok_or_else(|| "missing exhaustive aggregate receipt at conditional merge".to_owned())?;
     }
     Ok(())
@@ -644,6 +667,15 @@ pub(super) fn record_allocation<'ctx>(
         return Err("duplicate private checked backing allocation".into());
     }
     let binding_position = || state.body_call_nodes.and_then(|nodes| nodes.binding_position(binding));
+    if !aggregate.plan.multi_returns.is_empty() {
+        if let Some(position) = binding_position() {
+            if let Some(slot) = aggregate.multi_allocations.get_mut(&position) {
+                if slot.replace((base, name.to_owned())).is_some() {
+                    return Err("duplicate ordered original allocation".into());
+                }
+            }
+        }
+    }
     let registered = match aggregate.plan.returning {
         Some(ClosedReturn::Allocation { block, item }) => binding_position() == Some((block, item)),
         Some(ClosedReturn::Structured { .. }) => binding_position().is_some_and(|(block, item)|
@@ -802,7 +834,7 @@ fn commit_local_choice<'ctx>(
         return Err("invalid local conditional owner commit".into());
     }
     let descriptor = aggregate.local_choice_destination.take().ok_or("missing local conditional descriptor")?;
-    if aggregate.receipts.insert(conditional, base).is_some() {
+    if aggregate.receipts.insert((conditional, None), base).is_some() {
         return Err("duplicate local conditional owner receipt".into());
     }
     aggregate.local_choice_committed += 1;
@@ -849,6 +881,19 @@ pub(super) fn store_received_binding<'ctx>(
                 return Ok(true);
             }
         }
+    }
+    if let Some(receivers) = state.body_call_nodes.and_then(|nodes| nodes.expression_ordinal(&binding.value))
+        .and_then(|call| state.aggregate.as_ref()?.plan.multi_receives.get(&call))
+    {
+        if !binding.receivers.iter().map(|receiver| receiver.name_span).eq(receivers.iter().copied()) {
+            return Err("ordered owning call has changed its prepared receivers".into());
+        }
+        for (lane, receiver) in binding.receivers.iter().enumerate() {
+            let EmitValue::Basic(BasicValueEnum::PointerValue(destination)) = extract_output(state, value, lane)?
+                else { return Err("missing ordered descriptor destination".into()) };
+            state.storage.insert(receiver.name.clone(), (destination, receiver.ty.clone()));
+        }
+        return Ok(true);
     }
     match call_action(state, &binding.value) {
         Some((_, ClosedCall::Forward)) if binding.receivers.len() == 2 => {
@@ -919,6 +964,7 @@ pub(super) fn emit_initializer_binding<'ctx, 'module>(
 
 pub(super) fn requires_scoped_function_emission(plan: Option<&ClosedBody>) -> bool {
     plan.is_some_and(|plan| !plan.inputs.is_empty() || plan.ordinary_result || !plan.ordinary_calls.is_empty()
+        || !plan.multi_receives.is_empty() || !plan.multi_returns.is_empty()
         || matches!(plan.returning, Some(ClosedReturn::Structured { .. })))
 }
 
@@ -1006,6 +1052,9 @@ pub(super) fn emit_call<'ctx, 'module>(
     }
     let Some(aggregate) = &state.aggregate else { return Ok(None) };
     let Some(ordinal) = state.body_call_nodes.and_then(|nodes| nodes.expression_ordinal(expression)) else { return Ok(None) };
+    if aggregate.plan.multi_receives.contains_key(&ordinal) {
+        return emit_multiple_owner_call(context, state, expression, arguments, project, ordinal).map(Some);
+    }
     let forwards = aggregate.plan.checked_backing_wrapper == Some(ordinal);
     if forwards || aggregate.plan.checked_backing_consumer.is_some_and(|(_, call)| ordinal == call) {
         return emit_checked_backing_call(context, state, expression, arguments, project, forwards).map(Some);
@@ -1029,9 +1078,9 @@ pub(super) fn emit_call<'ctx, 'module>(
             return Err("same-owner recommit has no whole ordinary value".into());
         }
         let aggregate = state.aggregate.as_mut().expect("same-owner recommit context");
-        let base = aggregate.receipts.remove(&previous)
+        let base = aggregate.receipts.remove(&(previous, None))
             .ok_or_else(|| "same-owner recommit lost its original backing".to_owned())?;
-        if aggregate.receipts.insert(ordinal, base).is_some() {
+        if aggregate.receipts.insert((ordinal, None), base).is_some() {
             return Err("duplicate same-owner recommit receipt".into());
         }
         return Ok(Some(value));
@@ -1234,6 +1283,53 @@ fn emit_ordinary_result_call<'ctx, 'module>(
     Ok(EmitValue::Basic(destination.into()))
 }
 
+fn emit_multiple_owner_call<'ctx, 'module>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, 'module>,
+    expression: &ScalarExpression,
+    arguments: &[ScalarExpression],
+    project: Option<(&ScalarModule, &[&ScalarModule])>,
+    ordinal: usize,
+) -> Result<EmitValue<'ctx>, String> {
+    let symbol = state.direct_aggregate_symbol(expression, None)?;
+    let function = *state.functions.get(symbol).ok_or("missing ordered owning call definition")?;
+    let Some(ScalarType::Callable { parameters, outputs }) = state.signatures.get(symbol) else {
+        return Err("missing ordered owning call signature".into());
+    };
+    let width = state.aggregate.as_ref().expect("owning call frame").plan.multi_receives[&ordinal].len();
+    if parameters.len() != arguments.len() || width != outputs.outputs.len()
+        || function.get_linkage() != Linkage::Internal || function.count_params() as usize != parameters.len() + width
+    {
+        return Err("ordered owning call differs from its private convention".into());
+    }
+    let mut operands = Vec::with_capacity(parameters.len() + width);
+    for (argument, parameter) in arguments.iter().zip(parameters) {
+        let value = match project {
+            Some((module, modules)) => emit_project_typed_expression(context, state, argument, parameter, module, modules)?,
+            None => emit_typed_expression(context, state, argument, parameter)?,
+        };
+        operands.push(take_basic(value)?.into());
+    }
+    let mut values = Vec::with_capacity(width);
+    for output in &outputs.outputs {
+        let destination = entry_storage_alloca(context, state, &output.ty, "owning_output_destination")?;
+        operands.push(destination.into());
+        values.push(EmitValue::Basic(destination.into()));
+    }
+    let returned = state.builder.build_call(function, &operands, "owning_output_bases")
+        .map_err(builder_error)?.try_as_basic_value().basic().ok_or("missing ordered backing result")?.into_struct_value();
+    let aggregate = state.aggregate.as_mut().expect("owning call frame");
+    for lane in 0..width {
+        let index = u32::try_from(lane).map_err(|_| "owning call lane overflow")?;
+        let base = state.builder.build_extract_value(returned, index, "owning_output_base").map_err(builder_error)?
+            .into_pointer_value();
+        if aggregate.receipts.insert((ordinal, Some(lane)), base).is_some() {
+            return Err("duplicate ordered call receipt".into());
+        }
+    }
+    build_aggregate(context, state, outputs, values)
+}
+
 fn emit_selected_call<'ctx, 'module>(
     context: &'ctx Context,
     state: &mut EmitState<'ctx, 'module>,
@@ -1362,10 +1458,10 @@ fn emit_selected_call<'ctx, 'module>(
                 let base = match input {
                     ClosedInput::Transfer(receipt) => {
                         if aggregate.plan.deferred_call_inputs.get(&ordinal) == Some(&receipt) {
-                            aggregate.receipts.get(&receipt).copied()
+                            aggregate.receipts.get(&(receipt, None)).copied()
                                 .ok_or_else(|| "missing deferred owner receipt at committed input call".to_owned())?
                         } else {
-                            aggregate.receipts.remove(&receipt)
+                            aggregate.receipts.remove(&(receipt, None))
                                 .ok_or_else(|| "missing owner receipt at committed input call".to_owned())?
                         }
                     }
@@ -1456,7 +1552,7 @@ fn emit_selected_call<'ctx, 'module>(
                 ClosedCall::Forward => aggregate.set_base(base)?,
                 ClosedCall::ResultArm | ClosedCall::LocalChoiceArm(_) => unreachable!("structured arms return their base to the result join"),
                 ClosedCall::Receive => {
-                    if aggregate.receipts.insert(ordinal, base).is_some() {
+                    if aggregate.receipts.insert((ordinal, None), base).is_some() {
                         return Err("duplicate closed aggregate receipt".into());
                     }
                 }
@@ -1527,7 +1623,7 @@ pub(super) fn release_scope<'ctx>(
         let ordinal = &planned.receipt;
         let base = aggregate
             .receipts
-            .remove(ordinal)
+            .remove(&(*ordinal, planned.output_lane))
             .ok_or_else(|| "missing closed aggregate scope receipt".to_owned())?;
         if let Some(guard) = planned.guard {
             let live = aggregate.receipt_guards.get(&guard).copied()
@@ -1579,8 +1675,22 @@ pub(super) fn forwarded_mixed_return(state: &EmitState<'_, '_>) -> bool {
             && aggregate.mixed_return.is_some())
 }
 
-pub(super) fn holds_registered_return(state: &EmitState<'_, '_>) -> bool {
-    state.aggregate.as_ref().is_some_and(|aggregate| aggregate.registered_allocation.is_some())
+pub(super) fn holds_registered_return(state: &EmitState<'_, '_>, output: &ScalarExpression) -> bool {
+    let Some(aggregate) = state.aggregate.as_ref() else { return false };
+    if aggregate.registered_allocation.is_some() {
+        return true;
+    }
+    let lanes = &aggregate.plan.multi_returns;
+    if lanes.is_empty() {
+        return false;
+    }
+    let Some(occurrence) = state.body_call_nodes.and_then(|nodes| nodes.expression_ordinal(output))
+        else { return false };
+    let Ok(lane) = lanes.binary_search_by_key(&occurrence, |&(_, expression)| expression)
+        else { return false };
+    // Leave the original live allocation for the exact ordered commit. No
+    // inference-based transfer for a different or as-yet-unregistered output.
+    aggregate.multi_allocations.get(&lanes[lane].0).is_some_and(Option::is_some)
 }
 
 pub(super) fn match_mixed_branch_conditional(
@@ -1641,7 +1751,7 @@ pub(super) fn commit_named_result_arm<'ctx>(
     let (_, ty) = state.storage.get(name).ok_or("missing named descriptor storage")?;
     let ty = ty.clone();
     let destination = aggregate.destination.ok_or("missing named result destination")?;
-    let base = aggregate.receipts.remove(&producer).ok_or("missing named result backing")?;
+    let base = aggregate.receipts.remove(&(producer, None)).ok_or("missing named result backing")?;
     aggregate.structured_arms_visited += 1;
     store_value(context, state, destination, &ty, result)?;
     Ok(EmitValue::Basic(base.into()))
@@ -1699,6 +1809,38 @@ pub(super) fn commit_return<'ctx>(
         }
         return Ok(());
     }
+    if aggregate.plan.returning == Some(ClosedReturn::MultipleAllocations) {
+        let nodes = state.body_call_nodes.ok_or("missing ordered owning return occurrences")?;
+        let lanes = &aggregate.plan.multi_returns;
+        if aggregate.committed || lanes.len() != outputs.outputs.len()
+            || !block.final_expressions().map(|(expression, _)| nodes.expression_ordinal(expression))
+                .eq(lanes.iter().map(|&(_, expression)| Some(expression)))
+        {
+            return Err("ordered owning return changed its sealed outputs".into());
+        }
+        let pointer = context.ptr_type(AddressSpace::default());
+        let mut returned = context.struct_type(&vec![pointer.into(); lanes.len()], false).const_zero();
+        let mut selected = Vec::with_capacity(lanes.len());
+        for ((allocation, _), destination) in lanes.iter().zip(&aggregate.multi_destinations) {
+            let (base, name) = aggregate.multi_allocations.remove(allocation).flatten().ok_or("missing ordered original allocation")?;
+            if state.runtime_array_owners.get(&name) != Some(&true) {
+                return Err("ordered owning return has no live original allocation".into());
+            }
+            selected.push((*destination, base, name));
+        }
+        for (lane, (destination, base, name)) in selected.into_iter().enumerate() {
+            let descriptor = extract_output(state, result, lane)?;
+            store_value(context, state, destination, &outputs.outputs[lane].ty, descriptor)?;
+            let index = u32::try_from(lane).map_err(|_| "owning return lane overflow")?;
+            returned = state.builder.build_insert_value(returned, base, index, "owning_return_base")
+                .map_err(builder_error)?.into_struct_value();
+            state.runtime_array_owners.insert(name, false);
+        }
+        let aggregate = state.aggregate.as_mut().expect("ordered owning return frame");
+        aggregate.mixed_return = Some(returned);
+        aggregate.committed = true;
+        return Ok(());
+    }
     if let Some(destination) = aggregate.ordinary_destination {
         let [output] = outputs.outputs.as_slice() else {
             return Err("invalid ordinary aggregate returned value".into());
@@ -1754,7 +1896,7 @@ pub(super) fn commit_return<'ctx>(
             return Err("mixed selected return changed its sealed outputs".into());
         }
         let destination = aggregate.destination.ok_or("missing mixed selected result destination")?;
-        let base = aggregate.receipts.remove(&call).ok_or("missing mixed selected original backing")?;
+        let base = aggregate.receipts.remove(&(call, None)).ok_or("missing mixed selected original backing")?;
         let pair = mixed_allocation_pair(context, state, result, outputs, lanes.owner, destination, base)?;
         let aggregate = state.aggregate.as_mut().expect("mixed selected return frame");
         aggregate.mixed_return = Some(pair);
@@ -1771,7 +1913,7 @@ pub(super) fn commit_return<'ctx>(
             return Err("named aggregate return changed its proved root output".into());
         }
         let destination = aggregate.destination.ok_or_else(|| "missing named aggregate destination".to_owned())?;
-        let base = aggregate.receipts.remove(&call)
+        let base = aggregate.receipts.remove(&(call, None))
             .ok_or_else(|| "missing original backing at named aggregate return".to_owned())?;
         store_value(context, state, destination, &descriptor.ty, result.clone())?;
         let aggregate = state.aggregate.as_mut().expect("recommitted aggregate return frame");
@@ -1901,7 +2043,7 @@ pub(super) fn finish_return<'ctx>(
     {
         return Err("local conditional owner was not committed to lexical storage".into());
     }
-    if !aggregate.receipts.is_empty() || aggregate.receipt_guards.len() != aggregate.plan.conditional_guard_count || !aggregate.inputs.is_empty() {
+    if !aggregate.receipts.is_empty() || !aggregate.multi_allocations.is_empty() || aggregate.receipt_guards.len() != aggregate.plan.conditional_guard_count || !aggregate.inputs.is_empty() {
         return Err("unreleased closed aggregate receipt".into());
     }
     if aggregate.ordinary_visited.len() != aggregate.plan.ordinary_calls.len() {
@@ -1925,7 +2067,7 @@ pub(super) fn finish_return<'ctx>(
     let Some(route) = aggregate.plan.returning else {
         return Ok(None);
     };
-    if matches!(route, ClosedReturn::Allocation { .. } | ClosedReturn::Recommit { .. } | ClosedReturn::NamedRoot { .. } | ClosedReturn::Structured { .. }
+    if matches!(route, ClosedReturn::MultipleAllocations | ClosedReturn::Allocation { .. } | ClosedReturn::Recommit { .. } | ClosedReturn::NamedRoot { .. } | ClosedReturn::Structured { .. }
         | ClosedReturn::MixedSelected { .. }) && !aggregate.committed {
         return Err("closed aggregate return did not commit ownership before cleanup".into());
     }

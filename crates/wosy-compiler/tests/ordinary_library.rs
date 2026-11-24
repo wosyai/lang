@@ -4443,3 +4443,94 @@ fn assert_multi_owning_formals(forwarded: bool) {
         }
     }
 }
+
+#[test]
+fn multiple_returned_owners_preserve_ordered_original_bases() {
+    let app = source("workbench", "src/multi_returned_owners.w");
+    let text = include_str!("fixtures/multi-returned-owners.w");
+    for (target, target_layout) in [("native64", ScalarTargetLayout::NATIVE64), ("wasm32", ScalarTargetLayout::WASM32)] {
+        let prepared = prepare_scalar_project(
+            vec![(declarations(&app, text), Vec::new())], vec![app.clone()],
+            ScalarPreparationInputs { target_layout },
+        ).unwrap_or_else(|error| panic!("{target}: {:?}", error.diagnostics));
+        let build = analyze_scalar_build(&prepared);
+        assert!(build.diagnostics().is_empty(), "{target}: {:?}", build.diagnostics());
+        for (route, ir) in [
+            ("standalone", wosy_compiler::emit_scalar_build_single_module_llvm(&build).unwrap_or_else(|e| panic!("{target}/standalone: {e}")).to_text()),
+            ("project", emit_scalar_build_project_llvm(&build).unwrap_or_else(|e| panic!("{target}/project: {e}")).to_text()),
+        ] {
+            let context = Context::create();
+            let module = context.create_module_from_ir(MemoryBuffer::create_from_memory_range_copy(ir.as_bytes(), target)).unwrap();
+            module.verify().unwrap();
+            let name = |name: &str| if route == "standalone" { name.to_owned() } else { function_with_suffix(&module, name) };
+            let producer = module.get_function(&name("pair")).unwrap();
+            let consumer = module.get_function(&name("drive")).unwrap();
+            let alloc = module.get_function("__wosy_core_alloc").unwrap();
+            let free = module.get_function("__wosy_core_free").unwrap();
+            assert_eq!(producer.get_linkage(), inkwell::module::Linkage::Internal);
+            assert_eq!(producer.count_params(), 4);
+            let mut allocations = Vec::new();
+            let mut lanes = Vec::new();
+            for row in producer.get_basic_blocks().into_iter().flat_map(|block| block.get_instructions()) {
+                if let Ok(call) = CallSiteValue::try_from(row) {
+                    assert_ne!(call.get_called_fn_value(), Some(free), "{target}/{route}: producer must not free");
+                    if call.get_called_fn_value() == Some(alloc) {
+                        allocations.push(call.try_as_basic_value().basic().unwrap());
+                    }
+                } else if row.get_opcode() == InstructionOpcode::InsertValue && row.get_name().is_some_and(|name| name.to_string_lossy().starts_with("owning_return_base")) {
+                    lanes.push((row.get_indices(), row.get_operand(1).unwrap().value().unwrap()));
+                }
+            }
+            assert_eq!(allocations.len(), 2);
+            assert_eq!(lanes, [(vec![0], allocations[1]), (vec![1], allocations[0])]);
+            let mut transport = None;
+            let mut received = Vec::new();
+            let mut releases = Vec::new();
+            for row in consumer.get_basic_blocks().into_iter().flat_map(|block| block.get_instructions()) {
+                if let Ok(call) = CallSiteValue::try_from(row) {
+                    if call.get_called_fn_value() == Some(producer) {
+                        assert_eq!(call.count_arguments(), 4);
+                        assert!(transport.replace(call.try_as_basic_value().basic().unwrap()).is_none());
+                    } else if call.get_called_fn_value() == Some(free) {
+                        releases.push(row.get_operand(0).unwrap().value().unwrap().into_pointer_value().as_instruction_value().unwrap());
+                    }
+                } else if row.get_opcode() == InstructionOpcode::ExtractValue && row.get_operand(0).unwrap().value() == transport {
+                    assert_eq!(row.get_indices(), [received.len() as u32]);
+                    received.push(row);
+                }
+            }
+            assert_eq!(received.len(), 2);
+            assert_eq!(releases, [received[1], received[0]], "{target}/{route}: {ir}");
+            if let Some(directory) = std::env::var_os("WOSY_MULTI_RETURNED_OWNERS_IR_DIR") {
+                let mut witness = ir.replace("define i32 @main(", "define i32 @wosy_authored_main(");
+                witness.push_str(&format!("\ndefine i64 @wosy_test_multi_returned_owners() {{\nentry:\n  %value = call i64 @{}()\n  ret i64 %value\n}}\n", name("drive")));
+                std::fs::write(std::path::PathBuf::from(directory).join(format!("{target}-{route}.ll")), witness).unwrap();
+            }
+        }
+    }
+}
+
+#[test]
+fn multiple_returned_owners_leave_unproved_discard_and_forwarding_closed() {
+    let app = source("workbench", "src/multi_returned_owners.w");
+    let valid = include_str!("fixtures/multi-returned-owners.w");
+    let discard = valid.replace("Packet front, Packet back = pair(2, 5);", "Packet front = pair(2, 5);")
+        .replace("front.length * 100 + back.length", "front.length * 100");
+    let forward = valid.replace("u64() drive = fn {", r#"(Packet, Packet)(u64, u64) relay = fn(left_size, right_size) {
+    Packet earlier, Packet later = pair(left_size, right_size);
+    earlier, later
+};
+u64() drive = fn {"#).replace("front, Packet back = pair(2, 5)", "front, Packet back = relay(2, 5)");
+    for (case, text) in [("discard", discard), ("forward", forward)] {
+        assert_ne!(text, valid, "{case}");
+        let prepared = prepare_scalar_project(
+            vec![(declarations(&app, &text), Vec::new())], vec![app.clone()],
+            ScalarPreparationInputs { target_layout: ScalarTargetLayout::NATIVE64 },
+        ).unwrap_or_else(|error| panic!("{case}: {:?}", error.diagnostics));
+        let build = analyze_scalar_build(&prepared);
+        assert!(build.diagnostics().is_empty(), "{case}: {:?}", build.diagnostics());
+        let error = emit_scalar_build_project_llvm(&build).expect_err("unproved ownership route must stay closed");
+        assert!(error.contains("multiple owning outputs require an exact full local binding and lexical cleanup"),
+            "{case}: {error}");
+    }
+}

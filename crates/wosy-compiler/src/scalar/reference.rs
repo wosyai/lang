@@ -2296,6 +2296,19 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         }
                     }
                 }
+                if let Some(signature) = signature {
+                    if signature.outputs.outputs.len() > 1 && signature.outputs.outputs.iter().all(|output|
+                        matches!(output.ty, ScalarType::Struct(_)))
+                    {
+                        self.aggregate_result.multi_result_calls.insert(id);
+                        if !calls.declared_unsafe_calls.contains(&ordinal.0) && matches!(&self.cfg.points[id.0].kind, CfgPointKind::Call {
+                            target: ResolvedCallTarget::ModuleCallable { source, declaration_span, concrete: ConcreteCallSelection::Declaration }, ..
+                        } if self.mixed_owners.is_some_and(|owners| owners.is_multi(source, declaration_span))) {
+                            self.aggregate_facts.multi_owner_calls.insert(id, (ordinal, signature.outputs.outputs.len()));
+                            self.aggregate_result.multi_selected_calls.insert(id, (ordinal, signature.outputs.outputs.len()));
+                        }
+                    }
+                }
                 if !aggregate_arguments.is_empty() {
                     for (&slot, &provenance) in &aggregate_arguments {
                         self.aggregate_result.inputs.entry((id, ordinal.0, slot, provenance)).or_default();
@@ -3977,6 +3990,9 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 BindingOutput::ProjectPrimary { output } => {
                     if let Some(producer) = call_producer {
                         let projection = self.project_call_output(producer, primary, *output);
+                        if self.aggregate_result.multi_result_bindings.contains_key(&producer) {
+                            self.aggregate_facts.multi_owner_projections.insert(projection, (producer, *output));
+                        }
                         if *output == 1 && self.aggregate_facts.secondary_owner_calls.contains(&producer)
                             && self.aggregate_result.mixed_result_bindings.contains(&producer)
                         {
@@ -4572,6 +4588,24 @@ impl<'a> ReferenceFlowBuilder<'a> {
                                     if first.ty == head.ty && second.ty == tail.ty))
                         {
                             self.aggregate_result.mixed_result_bindings.insert(point);
+                        }
+                    }
+                    if let Some(point) = call_producer {
+                        let receivers = binding_region.receivers();
+                        if let Some(&(ordinal, width)) = self.aggregate_facts.multi_owner_calls.get(&point) {
+                            let signature = &calls.checked_call_signatures[&ordinal];
+                            if width == receivers.len() && outputs.secondary.len() + 1 == width
+                                && receivers.iter().zip(&signature.outputs.outputs).all(|(receiver, output)| receiver.ty == output.ty)
+                                && outputs.secondary.iter().enumerate().all(|(index, output)|
+                                    *output == (BindingOutput::ProjectPrimary { output: index + 1 }))
+                            {
+                                self.aggregate_result.multi_result_bindings.insert(point,
+                                    receivers.iter().map(|receiver| ReferenceBindingId {
+                                        source: self.source.clone(), function_span: self.function_span,
+                                        declaration_span: receiver.span, block_span: block.span,
+                                        kind: ReferenceBindingKind::Declared,
+                                    }).collect());
+                            }
                         }
                     }
                     let initializer = self.cursor.filter(|_| self.cursor != before);
@@ -14026,13 +14060,14 @@ type MixedReceiptEdges<'a> = HashMap<MixedReceiptKey<'a>, Vec<MixedReceiptKey<'a
 enum MixedReceiptProof {
     Local(aggregate::SealedMixedOwner),
     Forwarded,
+    Multiple,
 }
 
-type MixedReceiptRoots = HashMap<SourceIdentity, HashMap<ByteSpan, aggregate::SealedMixedOwner>>;
+type MixedReceiptRoots = HashMap<SourceIdentity, HashMap<ByteSpan, MixedReceiptProof>>;
 
 #[derive(Default)]
 struct MixedReceiptModuleProofs {
-    local: HashMap<ByteSpan, aggregate::SealedMixedOwner>,
+    local: HashMap<ByteSpan, MixedReceiptProof>,
     forwarded: HashSet<ByteSpan>,
 }
 
@@ -14043,12 +14078,16 @@ struct MixedReceiptAuthority(HashMap<SourceIdentity, MixedReceiptModuleProofs>);
 impl MixedReceiptAuthority {
     fn proof(&self, source: &SourceIdentity, span: &ByteSpan) -> Option<MixedReceiptProof> {
         let module = self.0.get(source)?;
-        module.local.get(span).copied().map(MixedReceiptProof::Local)
+        module.local.get(span).copied()
             .or_else(|| module.forwarded.contains(span).then_some(MixedReceiptProof::Forwarded))
     }
 
     fn contains(&self, source: &SourceIdentity, span: &ByteSpan) -> bool {
-        self.proof(source, span).is_some()
+        matches!(self.proof(source, span), Some(MixedReceiptProof::Local(_) | MixedReceiptProof::Forwarded))
+    }
+
+    fn is_multi(&self, source: &SourceIdentity, span: &ByteSpan) -> bool {
+        self.proof(source, span) == Some(MixedReceiptProof::Multiple)
     }
 
     fn is_forwarder(&self, source: &SourceIdentity, span: &ByteSpan) -> bool {
@@ -14071,7 +14110,8 @@ impl MixedReceiptPlan<'_> {
         fn rooted_forwarders<'a>(roots: &'a MixedReceiptRoots, mut users: MixedReceiptEdges<'a>) -> MixedReceiptTargets {
             if users.is_empty() { return HashMap::new(); }
             let mut pending: Vec<_> = roots.iter()
-                .flat_map(|(source, proofs)| proofs.keys().map(move |span| (source, *span))).collect();
+                .flat_map(|(source, proofs)| proofs.iter().filter_map(move |(span, proof)|
+                    matches!(proof, MixedReceiptProof::Local(_)).then_some((source, *span)))).collect();
             let mut reached = HashSet::new();
             while let Some(callee) = pending.pop() {
                 let Some(callers) = users.remove(&callee) else { continue };
@@ -14109,13 +14149,14 @@ struct MixedReceiptCohort {
     module_names: HashSet<String>,
     callers: Vec<usize>,
     producers: Vec<(usize, ByteSpan, aggregate::MixedOwnerResultLanes)>,
+    multi_producers: Vec<(usize, ByteSpan)>,
 }
 
 impl MixedReceiptCohort {
     fn grounds(
         &self, source: &SourceIdentity, items: &[ScalarItem], sites: &ModuleCallSites,
         updates: &mut [(usize, FunctionReferenceResult)], targets: &MixedReceiptTargets,
-    ) -> HashMap<ByteSpan, aggregate::SealedMixedOwner> {
+    ) -> HashMap<ByteSpan, MixedReceiptProof> {
         let Some(targets) = targets.get(source) else { return HashMap::new() };
         if self.producers.iter().any(|&(position, declaration, _)| targets.contains(&declaration)
             && updates[position].1.aggregate.can_seal_selected_mixed())
@@ -14158,8 +14199,12 @@ impl MixedReceiptCohort {
             if !targets.contains(&declaration) { return None; }
             let result = &updates[position].1;
             let proof = result.aggregate.sealed_mixed_owner(&result.cfg, lanes)?;
-            Some((declaration, proof))
-        }).collect()
+            Some((declaration, MixedReceiptProof::Local(proof)))
+        }).chain(self.multi_producers.iter().filter_map(|&(position, declaration)| {
+            if !targets.contains(&declaration) { return None; }
+            updates[position].1.aggregate.sealed_multi_result.as_ref()?;
+            Some((declaration, MixedReceiptProof::Multiple))
+        })).collect()
     }
 
     fn index_forwarders<'a>(
@@ -14237,6 +14282,7 @@ fn derive_module_reference_cohort(
     let mut updates = Vec::new();
     let mut mixed_callers = Vec::new();
     let mut mixed_producers = Vec::new();
+    let mut multi_producers = Vec::new();
     for (index, item) in items.iter().enumerate() {
         if let ScalarItem::Function(function) = item {
             let result = derive_function_reference_result(
@@ -14251,14 +14297,16 @@ fn derive_module_reference_cohort(
                 if let ScalarType::Callable { outputs, .. } = &function.signature {
                     if let Some(lanes) = aggregate::mixed_owned_struct_result(outputs) {
                         mixed_producers.push((position, function.name_span, lanes));
+                    } else if outputs.outputs.len() > 1 && outputs.outputs.iter().all(|output| matches!(output.ty, ScalarType::Struct(_))) {
+                        multi_producers.push((position, function.name_span));
                     }
                 }
             }
             updates.push((index, result));
         }
     }
-    let cohort = (!mixed_callers.is_empty() || !mixed_producers.is_empty()).then_some(MixedReceiptCohort {
-        module_names, callers: mixed_callers, producers: mixed_producers,
+    let cohort = (!mixed_callers.is_empty() || !mixed_producers.is_empty() || !multi_producers.is_empty()).then_some(MixedReceiptCohort {
+        module_names, callers: mixed_callers, producers: mixed_producers, multi_producers,
     });
     (updates, errors, cohort)
 }
@@ -14276,7 +14324,7 @@ fn mixed_wrapper_reachability_requires_an_allocation_grounded_predecessor() {
     let decoy = source("owner.w", "2");
     let lanes = aggregate::MixedOwnerResultLanes { owner: 1, scalar: 0 };
     let local = aggregate::SealedMixedOwner::Allocation { lanes, block: 2, item: 3 };
-    let roots = HashMap::from([(origin.clone(), HashMap::from([(span(0), local)]))]);
+    let roots = HashMap::from([(origin.clone(), HashMap::from([(span(0), MixedReceiptProof::Local(local))]))]);
     let users = HashMap::from([
         ((&origin, span(0)), vec![(&first, span(0))]),
         ((&first, span(0)), vec![(&second, span(0)), (&second, span(1))]),
@@ -15310,9 +15358,17 @@ impl FunctionReferenceResult {
         })
     }
 
+    fn multi_targets(&self) -> impl Iterator<Item = (&SourceIdentity, ByteSpan)> {
+        self.aggregate.multi_result_calls.iter().filter_map(|point| match &self.cfg.initial_points.get(point.0)?.kind {
+            CfgPointKind::Call { target: ResolvedCallTarget::ModuleCallable { source, declaration_span, concrete: ConcreteCallSelection::Declaration }, .. } =>
+                Some((source, *declaration_span)),
+            _ => None,
+        })
+    }
+
     fn collect_mixed_targets(&self, targets: &mut MixedReceiptTargets) -> bool {
         let mut found = false;
-        for (source, declaration) in self.mixed_targets() {
+        for (source, declaration) in self.mixed_targets().chain(self.multi_targets()) {
             if let Some(known) = targets.get_mut(source) {
                 known.insert(declaration);
             } else {
@@ -15376,7 +15432,9 @@ impl FunctionReferenceResult {
             result.observe_selected_mixed_receipts(function, sites, module_names, structs, enums, source, effects, owners,
                 false, capture_call_points, errors);
         }
-        if !self.mixed_targets().any(|(target, declaration)| owners.contains(target, &declaration)) {
+        if !self.mixed_targets().any(|(target, declaration)| owners.contains(target, &declaration))
+            && !self.multi_targets().any(|(target, declaration)| owners.is_multi(target, &declaration))
+        {
             return;
         }
         let mut builder = ReferenceFlowBuilder::new(source, function, module_names, sites, structs, enums);
@@ -16046,7 +16104,11 @@ fn build_function_reference_cfg(
         }
     }
     aggregate.allocation_slots = builder.aggregate_facts.allocation_slots;
+    // Install the canonical owning-call census before sealing local results.
     aggregate.calls = builder.aggregate_facts.calls;
+    if errors.is_empty() {
+        aggregate.sealed_multi_result = aggregate.multi_local_result(&builder.cfg, call_sites);
+    }
     aggregate.formals = builder.aggregate_facts.formals;
     aggregate.read_formals = builder.aggregate_facts.raw_formals.into_keys().collect();
     aggregate.read_formal_fields = builder.aggregate_facts.read_fields;

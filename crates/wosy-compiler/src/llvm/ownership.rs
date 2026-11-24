@@ -899,7 +899,7 @@ pub(super) fn transfer_runtime_array_return(
                 | ScalarType::F64
                 | ScalarType::Char
                 | ScalarType::Enum(_)
-        ) || super::aggregate_transfer::holds_registered_return(state)
+        ) || super::aggregate_transfer::holds_registered_return(state, expression)
         {
             return;
         }
