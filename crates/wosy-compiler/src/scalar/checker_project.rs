@@ -3843,6 +3843,23 @@ fn capture_named_calling_partitions<'a>(
 }
 
 #[cfg(feature = "internal-checker")]
+fn capture_citation_partitions<'a>(
+    target: PreparedCallable, body: &'a FunctionCallSites, source: &'a SourceIdentity,
+    runtime: SymbolicProofRuntime<'a>, full: &IntegerSet, work: &mut usize,
+) -> Option<ActualCallResult> {
+    let mut effects = OrderedFailures::default();
+    let (returned, active, _) = capture_named_calling_partitions(
+        target, body, source, &mut effects, runtime, full.clone(), true,
+    ).ok()?;
+    if active || !effects.records.is_empty()
+        || !super::checker_flow::covers_all_partitioned_call_inputs(&returned, full, work)?
+    {
+        return None;
+    }
+    Some(returned)
+}
+
+#[cfg(feature = "internal-checker")]
 impl SelectedSymbolicProof<'_, '_> {
     fn record(
         &mut self, proof: &MainFlowProofCase<'_>, function: &ScalarFunction, source: &SourceIdentity,
@@ -3890,6 +3907,7 @@ impl SelectedSymbolicProof<'_, '_> {
             MainFlowProofCases::Authored(cases) => (None, cases.as_slice()),
         };
         let authored_mode = !authored.is_empty();
+        let mut has_citation = false;
         let [parameter] = body.boundary.parameters.as_slice() else { return Err(ProjectCheck::Unsupported); };
         let [output] = body.boundary.results.as_slice() else { return Err(ProjectCheck::Unsupported); };
         use super::checker_flow::PartitionedProofGoal;
@@ -3908,8 +3926,14 @@ impl SelectedSymbolicProof<'_, '_> {
             .map(|case| (case, None)).chain(authored.iter().map(|(case, step)| (case, step.as_ref())));
         let mut plans = Vec::new();
         for (case, step) in cases {
+            let citation = if let Some(MainFlowAuthoredShows::CallingCitation { terminal, relation, bound }) = step {
+                has_citation = true;
+                Some((*terminal, *relation, *bound))
+            } else {
+                None
+            };
             let (step, ordered_steps) = match step {
-                None => (None, &[][..]),
+                None | Some(MainFlowAuthoredShows::CallingCitation { .. }) => (None, &[][..]),
                 Some(MainFlowAuthoredShows::Single(step)) =>
                     (Some((step.span, PartitionedProofGoal::Literal(step.relation, step.bound.as_ref()))), &[][..]),
                 Some(MainFlowAuthoredShows::Entry { span, slot: 0, relation })
@@ -3921,7 +3945,8 @@ impl SelectedSymbolicProof<'_, '_> {
                 Some(_) => return Err(ProjectCheck::Unsupported),
             };
             if metered {
-                let count = ordered_steps.len().checked_add(usize::from(step.is_some())).ok_or(ProjectCheck::Unsupported)?;
+                let count = ordered_steps.len().checked_add(usize::from(step.is_some() || citation.is_some()))
+                    .ok_or(ProjectCheck::Unsupported)?;
                 super::checker_flow::charge_call_work(&mut proof_work, count).ok_or(ProjectCheck::Unsupported)?;
             }
 
@@ -3938,18 +3963,29 @@ impl SelectedSymbolicProof<'_, '_> {
             {
                 return Err(ProjectCheck::Unsupported);
             }
+            if citation.is_some() && case.guard.always_rejects {
+                return Err(ProjectCheck::Unsupported);
+            }
             if !case.guard.always_rejects {
                 let applicable = match case.guard.comparisons.as_slice() {
                     [] => domain.clone(),
                     [comparison] if comparison.slot == 0 => domain.keep_relation(comparison.relation, comparison.bound),
                     _ => return Err(ProjectCheck::Unsupported),
                 };
-                plans.push((case, step, ordered_steps, goal, applicable));
+                if citation.is_some() && applicable.is_empty() {
+                    return Err(ProjectCheck::Unsupported);
+                }
+                plans.push((case, step, ordered_steps, citation, goal, applicable));
             }
         }
         let first_directive = effects.records.len();
-        let (result, active, reached) =
-            capture_named_calling_partitions(target, body, source, effects, runtime, domain, false)?;
+        let (result, active, reached) = if has_citation {
+            let result = capture_citation_partitions(target, body, source, runtime, &domain, &mut proof_work)
+                .ok_or(ProjectCheck::Unsupported)?;
+            (result, false, HashSet::new())
+        } else {
+            capture_named_calling_partitions(target, body, source, effects, runtime, domain, false)?
+        };
         let elidable = !metered && !plans.is_empty()
             && bare.is_some_and(|(first, _)| first.bound.literal().is_some())
             && effects.records.len() == first_directive
@@ -3958,7 +3994,34 @@ impl SelectedSymbolicProof<'_, '_> {
                 runtime.calls.function_body(module, item, None).is_some_and(summary_elision_safe)
             });
         let mut applicable = active;
-        'proofs: for (case, step, ordered_steps, goal, proof_domain) in plans {
+        let mut verified_terminals = HashSet::new();
+        let mut cited_bounds = PeerPredicateBounds::default();
+        'proofs: for (case, step, ordered_steps, citation, goal, proof_domain) in plans {
+            if let Some((terminal, relation, bound)) = citation {
+                if !verified_terminals.contains(&terminal) {
+                    let verified = super::checker_flow::verify_partitioned_call_return(
+                        body, &result, &proof_domain, false,
+                        PartitionedProofGoal::Literal(relation, bound), Some(&mut proof_work),
+                    ).ok_or(ProjectCheck::Unsupported)?;
+                    if !verified.applicable || verified.failure.is_some() { return Err(ProjectCheck::Unsupported); }
+                    verified_terminals.insert(terminal);
+                }
+                let PartitionedProofGoal::Literal(requested_relation, requested) = goal else {
+                    return Err(ProjectCheck::Unsupported);
+                };
+                if !cited_bounds.implies(&output.ty, (relation, bound), (requested_relation, requested)) {
+                    return Err(ProjectCheck::Unsupported);
+                }
+                applicable = true;
+                continue;
+            }
+            let bare = step.is_none() && ordered_steps.is_empty();
+            if has_citation && bare && verified_terminals.contains(&case.proof.start) {
+                // A matching typed citation already independently checked
+                // this declaration on this exact same guard.
+                applicable = true;
+                continue;
+            }
             let steps = step.into_iter().chain(ordered_steps.iter().map(|step| {
                 (step.span, PartitionedProofGoal::Literal(step.relation, step.bound.as_ref()))
             }));
@@ -3980,6 +4043,8 @@ impl SelectedSymbolicProof<'_, '_> {
             applicable |= verified.applicable;
             if let Some(failure) = verified.failure {
                 self.record(case, function, source, effects.records.len(), failure, None)?;
+            } else if has_citation && bare && verified.applicable {
+                verified_terminals.insert(case.proof.start);
             } else if verified.covers_guard {
                 let bound = case.bound.literal().ok_or(ProjectCheck::Unsupported)?;
                 let issuer = issuer.ok_or(ProjectCheck::Unsupported)?;
@@ -4238,6 +4303,7 @@ struct MainFlowLiteralShow<'a> {
 #[cfg(feature = "internal-checker")]
 enum MainFlowAuthoredShows<'a> {
     Single(MainFlowLiteralShow<'a>),
+    CallingCitation { terminal: u32, relation: IntegerRelation, bound: &'a BigInt },
     Entry { span: ByteSpan, slot: usize, relation: IntegerRelation },
     Multiple { first_span: ByteSpan, groups: Vec<MainFlowShowBound<'a>> },
     CallingSequence {
@@ -4412,6 +4478,13 @@ struct MainFlowProofCase<'a> {
 #[cfg(feature = "internal-checker")]
 impl<'a> MainFlowProofCase<'a> {
     fn prepare(plan: &'a PlannedModuleProof<'a>, root: &SourceIdentity) -> Result<MainFlowProofPlan<'a>, ProjectCheck> {
+        Self::prepare_with_citation(plan, root, None)
+    }
+
+    fn prepare_with_citation(
+        plan: &'a PlannedModuleProof<'a>, root: &SourceIdentity,
+        citation: Option<&'a PlannedModuleProof<'a>>,
+    ) -> Result<MainFlowProofPlan<'a>, ProjectCheck> {
         let (relation, bound) = match &plan.typed.goal {
             TypedProofGoal::Literal { relation, bound, .. } => (relation, MainFlowProofBound::Literal(bound)),
             TypedProofGoal::Universal { relation, bound } if plan.steps.items.is_empty() => (relation, MainFlowProofBound::Literal(bound)),
@@ -4441,7 +4514,18 @@ impl<'a> MainFlowProofCase<'a> {
             )?;
             Ok((shown, literal))
         };
-        let step = match (plan.steps.items.as_slice(), plan.steps.terminated_items.as_slice()) {
+        let step = if let Some(peer) = citation {
+            let (relation, cited_bound) = peer.peer_literal_goal().ok_or(ProjectCheck::Unsupported)?;
+            if !peer.steps.items.is_empty() || !plan.same_peer_context(peer) || plan.peer_literal_goal().is_none()
+                || !supported_calling_proof_body(plan.typed.body, plan.typed.result_type)
+            {
+                return Err(ProjectCheck::Unsupported);
+            }
+            Some(MainFlowAuthoredShows::CallingCitation {
+                terminal: wosy_syntax::byte_span(peer.proof).start,
+                relation, bound: cited_bound,
+            })
+        } else { match (plan.steps.items.as_slice(), plan.steps.terminated_items.as_slice()) {
             ([], []) => None,
             ([step], [true]) => {
                 let (span, claim) = show_claim(step, true)?;
@@ -4481,7 +4565,7 @@ impl<'a> MainFlowProofCase<'a> {
                 }
             }
             _ => return Err(ProjectCheck::Unsupported),
-        };
+        }};
         let filter = plan.filter.as_deref().unwrap_or_default();
         let guard = checked_integer_guard_slots::<false>(plan.typed.body, filter).ok_or(ProjectCheck::Unsupported)?;
         let goal = child(&child(plan.proof, SyntaxKind::ProofEnsures)?, SyntaxKind::Expression)?;
@@ -4591,6 +4675,13 @@ impl<'a> MainFlowProofObserver<'a> {
         scope: ScalarCheckerScope, root_source: &SourceIdentity, plan: &'a PlannedModuleProof<'a>,
     ) -> Result<Self, ProjectCheck> {
         let proof = MainFlowProofCase::prepare(plan, plan.proof_source)?;
+        Ok(Self::from_prepared_plan(scope, root_source, plan, proof))
+    }
+
+    fn from_prepared_plan(
+        scope: ScalarCheckerScope, root_source: &SourceIdentity, plan: &'a PlannedModuleProof<'a>,
+        proof: MainFlowProofPlan<'a>,
+    ) -> Self {
         let issuer = if plan.proof_source == root_source {
             SymbolicEqualityIssuer::for_symbolic_case(scope, plan, &proof)
         } else {
@@ -4600,7 +4691,7 @@ impl<'a> MainFlowProofObserver<'a> {
         let mut observer = Self::new(plan.target, proof);
         observer.pure_affine_target = pure_affine.then_some(plan.target);
         observer.first.1.issuer = issuer;
-        Ok(observer)
+        observer
     }
 
     fn eligible_pure_affine_case(plan: &PlannedModuleProof<'_>, proof: &MainFlowProofPlan<'_>) -> bool {
@@ -4784,6 +4875,11 @@ impl ActualIntegerObserver for MainFlowProofObserver<'_> {
                                 continue;
                             }
                             failed
+                        }
+                        Some(MainFlowAuthoredShows::CallingCitation { .. }) => {
+                            // This capability only verifies unused symbolic partitions.
+                            self.incomplete = true;
+                            return;
                         }
                         Some(MainFlowAuthoredShows::Entry { span, slot, relation }) => {
                             let Some(argument) = arguments.get(*slot) else {
@@ -5230,6 +5326,20 @@ fn check_loaded_ordered_proof_diagnostics(
 }
 
 #[cfg(feature = "internal-checker")]
+fn prepare_ordered_public_observation<'a>(
+    plan: &'a PlannedModuleProof<'a>,
+    catalog: Option<&HashMap<(&'a SourceIdentity, &'a str), &'a PlannedModuleProof<'a>>>,
+) -> Result<MainFlowProofPlan<'a>, ProjectCheck> {
+    if let Some(catalog) = catalog {
+        if let Some(peer) = plan.direct_peer_use() {
+            let cited = catalog.get(&(plan.proof_source, peer)).copied().ok_or(ProjectCheck::Unsupported)?;
+            return MainFlowProofCase::prepare_with_citation(plan, plan.proof_source, Some(cited));
+        }
+    }
+    MainFlowProofCase::prepare(plan, plan.proof_source)
+}
+
+#[cfg(feature = "internal-checker")]
 fn check_loaded_ordered_proof_diagnostics_in_scope<const LOCAL_CATALOGS: bool>(
     declarations: Vec<(ScalarSourceDeclarations, Vec<ScalarNamespaceBinding>)>,
     proofs: Vec<(ScalarProofDeclarations, Vec<ScalarNamespaceBinding>)>,
@@ -5303,9 +5413,19 @@ fn check_loaded_ordered_proof_diagnostics_in_scope<const LOCAL_CATALOGS: bool>(
     if first_plan.typed.measure.is_some() || plans.iter().any(|plan| plan.typed.measure.is_some()) {
         return run_closed_ranked_checks::<LOCAL_CATALOGS>(&prepared, scope, startup_count, &first_plan, &plans);
     }
-    let mut observer = MainFlowProofObserver::from_first_plan(scope, &prepared.source, &first_plan)?;
+    let all_plans = || std::iter::once(&first_plan).chain(&plans);
+    let citations = if LOCAL_CATALOGS && scope == ScalarCheckerScope::CurrentPackage
+        && all_plans().any(|plan| plan.direct_peer_use().is_some())
+    {
+        Some(all_plans().map(|plan| ((plan.proof_source, plan.name), plan)).collect::<HashMap<_, _>>())
+    } else {
+        None
+    };
+    let mut observer = MainFlowProofObserver::from_prepared_plan(
+        scope, &prepared.source, &first_plan, prepare_ordered_public_observation(&first_plan, citations.as_ref())?,
+    );
     for plan in &plans {
-        observer.insert(scope, plan.proof_source == &prepared.source, plan, MainFlowProofCase::prepare(plan, plan.proof_source)?);
+        observer.insert(scope, plan.proof_source == &prepared.source, plan, prepare_ordered_public_observation(plan, citations.as_ref())?);
     }
     let run = run_prepared_ordered_check(
         &prepared.prepared, scope, startup_count, OrderedReachPolicy::Closed,
@@ -6662,7 +6782,7 @@ impl PreparedProofModule {
         capture: &mut Option<Option<(ActualCallResult, usize)>>,
         cited_bounds: &mut PeerPredicateBounds<'project>, outcomes: &mut [ScalarModuleProofOutcome],
     ) {
-        use super::checker_flow::{covers_all_partitioned_call_inputs, verify_partitioned_call_return, PartitionedProofGoal};
+        use super::checker_flow::{verify_partitioned_call_return, PartitionedProofGoal};
         let Some(owner) = runtime.project.modules.get(target.0) else { return; };
         let [parameter] = body.boundary.parameters.as_slice() else { return; };
         let Some(full) = IntegerSet::from_type(&parameter.ty) else { return; };
@@ -6680,14 +6800,8 @@ impl PreparedProofModule {
             }
         };
         let Some((returned, work)) = capture.get_or_insert_with(|| {
-            let mut effects = OrderedFailures::default();
-            let (returned, active, _) = capture_named_calling_partitions(
-                target, body, &owner.source, &mut effects, runtime, full.clone(), true,
-            ).ok()?;
             let mut work = 0;
-            if active || !effects.records.is_empty() || !covers_all_partitioned_call_inputs(&returned, &full, &mut work)? {
-                return None;
-            }
+            let returned = capture_citation_partitions(target, body, &owner.source, runtime, &full, &mut work)?;
             Some((returned, work))
         }) else { return; };
         let Some(count) = group.direct.len().checked_add(group.peer_uses.len()) else { return; };
@@ -16037,6 +16151,44 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
             assert_eq!(take_integer_observations(), (usize::from(selected), 0));
             assert_eq!(UNSELECTED_PEER_PLANS.with(|count| count.replace(0)), usize::from(!selected));
         }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordered_calling_citation_checks_terminal_before_implication_without_new_summary() {
+        let file = source("src/main.w", "ordered-calling-citation");
+        let text = r#"%%start
+            i8(i8) execute = fn(input) { if (input < 0) { -3 } else { 7 } };
+            i8(i8) producer = fn(input) { i8 result = execute(input); result };
+            proof uses_issued for producer(arg) -> (out) where (arg >= 0) ensures (out <= 7) { core.use(issued(arg)); }
+            proof issued for producer(arg) -> (out) where (arg >= 0) ensures (out == 7) {}
+        %%end"#;
+        let run = |text: &str, scope| {
+            let (_, proof) = crate::parse_proof_source(file.clone(), text.to_owned(), &[]).ok().unwrap();
+            check_loaded_ordered_proof_diagnostics_in_scope::<true>(
+                Vec::new(), vec![(proof, Vec::new())], vec![file.clone()], inputs(), scope, Vec::new(),
+            )
+        };
+        let scope = ScalarCheckerScope::CurrentPackage;
+        let verified = run(text, scope).unwrap();
+        assert!(verified.active && verified.directives.is_empty());
+        assert!(verified.symbolic_diagnostic.is_none() && verified.additional_symbolic_diagnostics.is_empty());
+        let reached = text.replace("%%end", &format!(
+            "i8 saved = producer(3); core.require(saved == 7, {OUTPUT}); %%end",
+        ));
+        for (label, rejected) in [
+            ("refuted terminal", text.replace("out == 7", "out == 8")),
+            ("not implied", text.replace("out <= 7", "out <= 6")),
+            ("different guard", text.replacen("arg >= 0", "arg == 0", 1)),
+            ("constant-empty guard", text.replace("arg >= 0", "false")),
+            ("empty integer guard", text.replace("arg >= 0", "arg < -128")),
+            ("self citation", text.replace("core.use(issued(arg))", "core.use(uses_issued(arg))")),
+            ("startup-reached producer", reached),
+        ] {
+            let outcome = run(&rejected, scope);
+            assert!(matches!(outcome, Err(ProjectCheck::Unsupported)), "{label}: {:?}", outcome.err());
+        }
+        assert!(matches!(run(text, ScalarCheckerScope::MainFlowOnly), Err(ProjectCheck::Unsupported)));
     }
 
     #[cfg(feature = "internal-checker")]

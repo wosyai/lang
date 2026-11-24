@@ -1608,6 +1608,24 @@ cases.extend([
         .replace("out < 7","out <= 7"),0,b""),
 ])
 
+ordered_calling_citation = """%%start
+    i8(i8) execute = fn(input) { if (input < 0) { -3 } else { 7 } };
+    i8(i8) producer = fn(input) { i8 result = execute(input); result };
+    proof uses_issued for producer(arg) -> (out) where (arg >= 0) ensures (out <= 7) { core.use(issued(arg)); }
+    proof issued for producer(arg) -> (out) where (arg >= 0) ensures (out == 7) {}
+%%end"""
+cases.extend([
+    ("ordered-calling-citation-verified-peer",ordered_calling_citation,0,b""),
+    ("ordered-calling-citation-refuses-refuted-peer",ordered_calling_citation.replace("out == 7","out == 8"),
+        2,b"unsupported analysis"),
+    ("ordered-calling-citation-refuses-vacuous-peer",ordered_calling_citation.replace("arg >= 0","false"),
+        2,b"unsupported analysis"),
+    ("ordered-calling-citation-refuses-empty-entry",ordered_calling_citation.replace("arg >= 0","arg < -128"),
+        2,b"unsupported analysis"),
+    ("ordered-calling-citation-refuses-stronger-goal",ordered_calling_citation.replace("out <= 7","out <= 6"),
+        2,b"unsupported analysis"),
+])
+
 ordered_shows_calling_producer = authored_named_calling_producer.replace(
     "core.show(out < 7);", "core.show(out <= 7); core.show(out < 7); core.show(out >= 0);")
 cases.extend([
@@ -2360,8 +2378,9 @@ with tempfile.TemporaryDirectory(prefix="affine-calls-") as path:
         for scope in ("--main-flow-only","--declared-package"):
             for name,text,expected,stderr in cases:
                 included = scope == "--declared-package" or name.startswith("exact-startup-")
-                code = expected if included else 0
-                expected_stderr = stderr if included else b""
+                main_flow_citation_refusal = scope == "--main-flow-only" and name.startswith("ordered-calling-citation-")
+                code = 2 if main_flow_citation_refusal else (expected if included else 0)
+                expected_stderr = b"unsupported analysis" if main_flow_citation_refusal else (stderr if included else b"")
                 (root/"src/main.w").write_text(text.strip()+"\n")
                 if name in namespace_children:
                     (root/"src/calc.w").write_text(namespace_children[name].strip()+"\n")
