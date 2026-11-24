@@ -466,7 +466,7 @@ impl OrderedRunEvidence for ProofFreeOrderedEvidence {
     type SymbolicReport = ();
 
     fn complete_startup(&self, _: &HashSet<PreparedCallable>) -> Result<bool, ProjectCheck> { Ok(false) }
-    fn symbolic(&self) -> Self::Symbolic<'_> { ProofFreeSymbolic { ordinary_projected_effects: false } }
+    fn symbolic(&self) -> Self::Symbolic<'_> { ProofFreeSymbolic { ordinary_projected_effects: false, citation_only: false } }
     fn finish_symbolic<'run>(_: Self::Symbolic<'run>) -> Self::SymbolicReport where Self: 'run {}
 }
 
@@ -800,6 +800,7 @@ fn symbolic_obligation_roots(
 #[cfg(feature = "internal-checker")]
 struct ProofFreeSymbolic<const ORDINARY_PROJECTIONS: bool = false, const NAMED_PARTITIONS: bool = false> {
     ordinary_projected_effects: bool,
+    citation_only: bool,
 }
 
 #[cfg(feature = "internal-checker")]
@@ -819,6 +820,8 @@ impl<const ORDINARY_PROJECTIONS: bool, const NAMED_PARTITIONS: bool> ActualInteg
     const ORDINARY_PROJECTED_PAIR: bool = ORDINARY_PROJECTIONS;
     const NAMED_RELATIONAL_PARTITIONS: bool = NAMED_PARTITIONS;
     const ORDINARY_INTEGER_LOCALS: bool = ORDINARY_PROJECTIONS;
+
+    fn citation_only(&self) -> bool { self.citation_only }
 
     fn permits_ordinary_projected_effects(&self) -> bool {
         ORDINARY_PROJECTIONS && self.ordinary_projected_effects
@@ -919,7 +922,7 @@ fn check_unused_module<const COLLECT: bool, const ENTRY_EVIDENCE: bool, Proof: S
             let collection = OrderedCallCollection { failures: &sink, visits: completed_visits, outer: None };
             let mut symbolic = CheckedCalls::<ProofFreeSymbolic<true>, false> {
                 project, calls, active: HashSet::from([(ordinal, item)]), active_depth: 1, reached: HashSet::new(),
-                had_obligations: false, observer: ProofFreeSymbolic { ordinary_projected_effects: !Proof::ENABLED }, symbolic_module: ordinal,
+                had_obligations: false, observer: ProofFreeSymbolic { ordinary_projected_effects: !Proof::ENABLED, citation_only: false }, symbolic_module: ordinal,
             };
             let mut cursor = ExactCallCursor::arbitrary_root(body, &body.boundary.results[0].ty)
                 .ok_or(ProjectCheck::Unsupported)?;
@@ -1674,6 +1677,9 @@ trait ActualIntegerObserver {
     fn observe(&mut self, target: (usize, usize), arguments: &[&BigInt], value: &BigInt);
 
     #[cfg(feature = "internal-checker")]
+    fn citation_only(&self) -> bool { false }
+
+    #[cfg(feature = "internal-checker")]
     fn permits_ordinary_projected_effects(&self) -> bool { false }
 
     const CONTEXTUAL: bool = false;
@@ -2203,6 +2209,10 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             (target, owner, body, signature)
         };
         #[cfg(feature = "internal-checker")]
+        if self.observer.citation_only() && (parent.source != &owner.source || !citation_safe_calling_body(body)) {
+            return Err(ProjectCheck::Unsupported);
+        }
+        #[cfg(feature = "internal-checker")]
         if matches!(effect, ExactCallEffect::TailInteger { .. }) {
             if collection.is_none() || parent.source != &owner.source || self.active.contains(&target) {
                 return Err(ProjectCheck::Unsupported);
@@ -2420,6 +2430,12 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
         #[cfg(feature = "internal-checker")] proof_site: Option<InitializerProofSite<'_>>,
     ) -> Result<ActualCallResult, ProjectCheck> {
         let (target, owner, function, body) = self.validated_direct_body(structure, call, target_source, target_span)?;
+        #[cfg(feature = "internal-checker")]
+        if self.observer.citation_only() && !collection.is_some_and(|(caller_source, _)|
+            caller_source == &owner.source && citation_safe_calling_body(body))
+        {
+            return Err(ProjectCheck::Unsupported);
+        }
         let target_module = target.0;
         if !ACTUAL_STARTUP && (*expected != ScalarType::Unit
             || (collection.is_none() && target_module != self.symbolic_module))
@@ -3798,6 +3814,35 @@ impl<'a> SymbolicEqualityIndex<'a> {
 }
 
 #[cfg(feature = "internal-checker")]
+fn citation_safe_calling_body(body: &FunctionCallSites) -> bool {
+    body.assignments.is_empty() && body.allocation_length_calls.is_empty()
+        && body.arms.is_empty() && body.structure.checker_directives.is_empty()
+        && !body.structure.has_ordinary_contextual_places()
+        && !body.structure.checker_has_bool_contextual_declaration
+        && body.structure.checker_selected_snapshots.is_empty()
+}
+
+#[cfg(feature = "internal-checker")]
+fn capture_named_calling_partitions<'a>(
+    target: PreparedCallable, body: &'a FunctionCallSites, source: &'a SourceIdentity,
+    effects: &mut OrderedFailures, runtime: SymbolicProofRuntime<'a>, domain: IntegerSet, citation_only: bool,
+) -> Result<(ActualCallResult, bool, HashSet<PreparedCallable>), ProjectCheck> {
+    let [output] = body.boundary.results.as_slice() else { return Err(ProjectCheck::Unsupported); };
+    if citation_only && !citation_safe_calling_body(body) { return Err(ProjectCheck::Unsupported); }
+    let mut cursor = ExactCallCursor::projected(body, Rc::new(domain), &output.ty).ok_or(ProjectCheck::Unsupported)?;
+    cursor.observe_named_affine_partitions(false).ok_or(ProjectCheck::Unsupported)?;
+    let mut evaluator = CheckedCalls::<ProofFreeSymbolic<false, true>, false> {
+        project: runtime.project, calls: runtime.calls, active: HashSet::from([target]),
+        active_depth: 1, reached: HashSet::new(), had_obligations: false,
+        observer: ProofFreeSymbolic { ordinary_projected_effects: false, citation_only }, symbolic_module: target.0,
+    };
+    let sink = RefCell::new(effects);
+    let collection = OrderedCallCollection { failures: &sink, visits: runtime.visits, outer: None };
+    let value = evaluator.run_call_cursor(body, source, cursor, None, Some(collection))?;
+    Ok((value, evaluator.had_obligations, evaluator.reached))
+}
+
+#[cfg(feature = "internal-checker")]
 impl SelectedSymbolicProof<'_, '_> {
     fn record(
         &mut self, proof: &MainFlowProofCase<'_>, function: &ScalarFunction, source: &SourceIdentity,
@@ -3902,27 +3947,14 @@ impl SelectedSymbolicProof<'_, '_> {
                 plans.push((case, step, ordered_steps, goal, applicable));
             }
         }
-        let mut cursor = ExactCallCursor::projected(body, Rc::new(domain), &output.ty).ok_or(ProjectCheck::Unsupported)?;
-        // Only the typed literal and unary entry-equality goals admitted
-        // above consume these partitions. Neither relation issues a summary.
-        cursor.observe_named_affine_partitions(false).ok_or(ProjectCheck::Unsupported)?;
-        let mut evaluator = CheckedCalls::<ProofFreeSymbolic<false, true>, false> {
-            project: runtime.project, calls: runtime.calls, active: HashSet::from([target]),
-            active_depth: 1, reached: HashSet::new(), had_obligations: false,
-            observer: ProofFreeSymbolic { ordinary_projected_effects: false }, symbolic_module: target.0,
-        };
         let first_directive = effects.records.len();
-        let (result, active) = {
-            let sink = RefCell::new(&mut *effects);
-            let collection = OrderedCallCollection { failures: &sink, visits: runtime.visits, outer: None };
-            let result = evaluator.run_call_cursor(body, source, cursor, None, Some(collection))?;
-            (result, evaluator.had_obligations)
-        };
+        let (result, active, reached) =
+            capture_named_calling_partitions(target, body, source, effects, runtime, domain, false)?;
         let elidable = !metered && !plans.is_empty()
             && bare.is_some_and(|(first, _)| first.bound.literal().is_some())
             && effects.records.len() == first_directive
             && summary_elision_safe(body)
-            && evaluator.reached.iter().all(|&(module, item)| {
+            && reached.iter().all(|&(module, item)| {
                 runtime.calls.function_body(module, item, None).is_some_and(summary_elision_safe)
             });
         let mut applicable = active;
@@ -6320,6 +6352,13 @@ impl PreparedProofModule {
                 } else {
                     continue;
                 };
+                // A calling citation has one independently verified bare
+                // terminal, not a composed, strict-entry or mixed citation.
+                if supported_calling_proof_body(plan.typed.body, plan.typed.result_type)
+                    && (!immediate.steps.items.is_empty() || strict_entry.is_some() || claim.is_some())
+                {
+                    continue;
+                }
                 graph.activate(requested);
                 admitted_roots.push((index, plan, requested, strict_entry, claim));
             }
@@ -6439,11 +6478,22 @@ impl PreparedProofModule {
                 };
             }
         }
-        for ((_, guard), group) in arbitrary_groups {
-            let body = group.direct.first().map(|entry| entry.1)
+        let mut calling_groups = Vec::new();
+        let (project, call_sites) = self.prepared.parts();
+        for ((target, guard), group) in arbitrary_groups {
+            let plan = group.direct.first().map(|entry| entry.1)
                 .or_else(|| group.peer_uses.first().map(|entry| entry.consumer))
                 .or_else(|| group.paired_uses.first().map(|entry| entry.consumer))
-                .expect("nonempty unused proof group").typed.body;
+                .expect("nonempty unused proof group");
+            let body = plan.typed.body;
+            if supported_calling_proof_body(body, plan.typed.result_type) {
+                let first = group.direct.first().map(|(index, _)| *index)
+                    .into_iter().chain(group.peer_uses.first().map(|peer| peer.index)).min();
+                if let Some(first) = first {
+                    calling_groups.push(((target, first), body, guard, group));
+                }
+                continue;
+            }
             if !valid_arbitrary_proof_body(body) {
                 continue;
             }
@@ -6588,6 +6638,95 @@ impl PreparedProofModule {
                     }
                 }
                 _ => (),
+            }
+        }
+        // Group order must not depend on HashMap iteration: exhaustion of
+        // the shared meter may refuse later groups. Keep one target resident.
+        calling_groups.sort_unstable_by_key(|(key, ..)| *key);
+        let runtime = SymbolicProofRuntime { project, calls: call_sites, visits: Some(&initialization.visits) };
+        let mut current = None;
+        let mut capture = None;
+        for ((target, _), body, guard, group) in calling_groups {
+            if current != Some(target) {
+                capture = None;
+                current = Some(target);
+            }
+            Self::check_unused_calling_citations(target, body, guard, group, runtime,
+                &mut capture, &mut cited_bounds, outcomes);
+        }
+    }
+
+    fn check_unused_calling_citations<'project>(
+        target: PreparedCallable, body: &FunctionCallSites, guard: ExactGuardGroup<'_>,
+        group: UnusedModuleProofGroup<'_, 'project>, runtime: SymbolicProofRuntime<'_>,
+        capture: &mut Option<Option<(ActualCallResult, usize)>>,
+        cited_bounds: &mut PeerPredicateBounds<'project>, outcomes: &mut [ScalarModuleProofOutcome],
+    ) {
+        use super::checker_flow::{covers_all_partitioned_call_inputs, verify_partitioned_call_return, PartitionedProofGoal};
+        let Some(owner) = runtime.project.modules.get(target.0) else { return; };
+        let [parameter] = body.boundary.parameters.as_slice() else { return; };
+        let Some(full) = IntegerSet::from_type(&parameter.ty) else { return; };
+        let atoms = guard.0.unwrap_or_default();
+        if atoms.len() > 1 || (group.direct.is_empty() && group.peer_uses.is_empty()) { return; }
+        let Some(guard) = checked_integer_guard_slots::<false>(body, atoms) else { return; };
+        if guard.comparisons.len() > 1 || guard.domain.is_some() { return; }
+        let domain = if guard.always_rejects {
+            IntegerSet::default()
+        } else {
+            match guard.comparisons.as_slice() {
+                [] => full.clone(),
+                [atom] if atom.slot == 0 => full.keep_relation(atom.relation, atom.bound),
+                _ => return,
+            }
+        };
+        let Some((returned, work)) = capture.get_or_insert_with(|| {
+            let mut effects = OrderedFailures::default();
+            let (returned, active, _) = capture_named_calling_partitions(
+                target, body, &owner.source, &mut effects, runtime, full.clone(), true,
+            ).ok()?;
+            let mut work = 0;
+            if active || !effects.records.is_empty() || !covers_all_partitioned_call_inputs(&returned, &full, &mut work)? {
+                return None;
+            }
+            Some((returned, work))
+        }) else { return; };
+        let Some(count) = group.direct.len().checked_add(group.peer_uses.len()) else { return; };
+        if super::checker_flow::charge_call_work(work, count).is_none() { return; }
+        let mut checked = HashMap::new();
+        let mut observe = |proof_identity, relation, bound| {
+            checked.entry(proof_identity).or_insert_with(|| {
+                match verify_partitioned_call_return(body, returned, &domain, false,
+                    PartitionedProofGoal::Literal(relation, bound), Some(work))
+                {
+                    Some(result) if result.failure.is_some() => ScalarModuleProofOutcome::Refuted,
+                    Some(result) if result.applicable => ScalarModuleProofOutcome::Proved,
+                    Some(_) => ScalarModuleProofOutcome::NoApplicableInputs,
+                    None => ScalarModuleProofOutcome::Unsupported,
+                }
+            }).clone()
+        };
+        let mut direct = group.direct.into_iter().peekable();
+        let mut peers = group.peer_uses.into_iter().peekable();
+        while direct.peek().is_some() || peers.peek().is_some() {
+            if direct.peek().is_some_and(|(index, _)| peers.peek().is_none_or(|peer| *index < peer.index)) {
+                let (index, plan) = direct.next().expect("peeked direct goal");
+                if plan.proof_source == &owner.source {
+                    if let Some((relation, bound)) = plan.peer_literal_goal() {
+                        outcomes[index] = observe((plan.proof_source, plan.name), relation, bound);
+                    }
+                }
+                continue;
+            }
+            let peer = peers.next().expect("peeked citation");
+            if peer.consumer.proof_source != &owner.source || peer.strict_entry.is_some() || peer.mixed_implies_claims.is_some() {
+                continue;
+            }
+            let Some((requested_relation, requested)) = peer.consumer.peer_literal_goal() else { continue; };
+            if observe((peer.consumer.proof_source, peer.name), peer.relation, peer.bound) == ScalarModuleProofOutcome::Proved
+                && cited_bounds.implies(peer.consumer.typed.result_type, (peer.relation, peer.bound),
+                    (requested_relation, requested))
+            {
+                outcomes[peer.index] = ScalarModuleProofOutcome::Proved;
             }
         }
     }
@@ -15898,6 +16037,39 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
             assert_eq!(take_integer_observations(), (usize::from(selected), 0));
             assert_eq!(UNSELECTED_PEER_PLANS.with(|count| count.replace(0)), usize::from(!selected));
         }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn selected_calling_proof_citation_requires_independent_full_partition_coverage() {
+        use ScalarModuleProofOutcome::{NoApplicableInputs, Proved, Refuted, Unsupported};
+        let file = source("src/main.w", "selected-calling-citation");
+        let text = format!(r#"%%start
+            i8(i8) execute = fn(input) {{ if (input < 0) {{ -3 }} else {{ 7 }} }};
+            i8(i8) producer = fn(input) {{ i8 result = execute(input); result }};
+            proof issued for producer(arg) -> (out) where (arg >= 0) ensures (out == 7) {{}}
+            proof uses_issued for producer(arg) -> (out) where (arg >= 0) ensures (out <= 7) {{ core.use(issued(arg)); }}
+            proof stronger for producer(arg) -> (out) where (arg >= 0) ensures (out <= 6) {{ core.use(issued(arg)); }}
+            proof other_guard for producer(arg) -> (out) where (arg == 0) ensures (out <= 7) {{ core.use(issued(arg)); }}
+            proof failed for producer(arg) -> (out) where (arg >= 0) ensures (out == 8) {{}}
+            proof uses_failed for producer(arg) -> (out) where (arg >= 0) ensures (out <= 9) {{ core.use(failed(arg)); }}
+            proof composed for producer(arg) -> (out) where (arg >= 0) ensures (out <= 7) {{ core.use(uses_issued(arg)); }}
+            proof circular for producer(arg) -> (out) where (arg >= 0) ensures (out <= 7) {{ core.use(circular(arg)); }}
+            proof empty for producer(arg) -> (out) where (false) ensures (out == 8) {{}}
+            proof uses_empty for producer(arg) -> (out) where (false) ensures (out <= 9) {{ core.use(empty(arg)); }}
+        %%end"#);
+        let run = |text: &str, names: &[&str]| check_scalar_module_proofs(
+            file.clone(), names,
+            vec![ScalarProofModuleInput { source: file.clone(), text: text.into(), namespaces: Vec::new() }],
+            vec![file.clone()], inputs(),
+        ).unwrap();
+        assert_eq!(run(&text, &["uses_issued"]), [Proved]);
+        assert_eq!(run(&text, &["uses_issued", "issued", "stronger", "other_guard", "failed", "uses_failed",
+            "composed", "circular", "empty", "uses_empty"]),
+            [Proved, Proved, Unsupported, Unsupported, Refuted, Unsupported, Unsupported, Unsupported,
+                NoApplicableInputs, Unsupported]);
+        let effectful = text.replace("if (input < 0)", &format!("core.require(true, {OUTPUT}); if (input < 0)"));
+        assert_eq!(run(&effectful, &["uses_issued", "issued"]), [Unsupported, Unsupported]);
     }
 
     #[cfg(feature = "internal-checker")]

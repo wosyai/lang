@@ -3309,6 +3309,19 @@ pub(super) enum PartitionedProofGoal<'a> {
 }
 
 #[cfg(feature = "internal-checker")]
+pub(super) fn covers_all_partitioned_call_inputs(
+    returned: &ActualCallResult, domain: &IntegerSet, work: &mut usize,
+) -> Option<bool> {
+    let ActualCallResult::PartitionedInteger(pieces) = returned else { return None; };
+    charge_call_work(work, pieces.len())?;
+    let intervals = pieces.iter().try_fold(0usize, |total, piece| total.checked_add(piece.input.interval_count()))?;
+    let sort_depth = (usize::BITS - intervals.leading_zeros()) as usize;
+    charge_call_work(work, intervals.checked_mul(sort_depth.checked_mul(2)?.checked_add(4)?)?
+        .checked_add(domain.interval_count())?)?;
+    Some(domain.is_subset_of(&IntegerSet::union(pieces.iter().map(|piece| piece.input.as_ref()))))
+}
+
+#[cfg(feature = "internal-checker")]
 pub(super) fn verify_partitioned_call_return<'a>(
     producer: &'a FunctionCallSites, returned: &ActualCallResult, domain: &IntegerSet,
     eligible_for_elision: bool, goal: PartitionedProofGoal<'_>, mut work: Option<&mut usize>,
