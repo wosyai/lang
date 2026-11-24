@@ -382,11 +382,24 @@ fn project_contextual_formal_type_materializes_before_namespace_call_preparation
     let Err(error) = foreign_only else { panic!("foreign type cannot substitute for a same-package provider"); };
     assert!(error.diagnostics.iter().any(|item| item.message.contains("no unambiguous checked project type")));
 
-    let (_, catalog) = crate::parse_proof_source(leaf.clone(), leaf_text.to_owned(), &[]).ok().unwrap();
-    assert!(matches!(crate::check_loaded_scalar_ordered_local_proof_contexts(
-        vec![(source(&app, app_text, false), bindings())], [(catalog, Vec::new())], vec![app.clone(), leaf.clone()],
-        inputs(), ScalarCheckerScope::MainFlowOnly, Vec::new(),
-    ), Err(ScalarOrderedCheckerOutcome::Unsupported)));
+    let (prepared, _) = contextual::prepare_contextual_transport_graph(
+        vec![(source(&leaf, leaf_text, true), Vec::new()), (source(&app, app_text, false), bindings())],
+        vec![app.clone(), leaf.clone()], inputs(), true,
+    ).expect("canonical namespace graph supplies a real lexical binding");
+    let leaf_call = prepared.function_calls(0, 0);
+    let (formal, formal_type) = leaf_call.contextual_formal().unwrap();
+    let root_call = prepared.function_calls(1, caller_item);
+    let [call] = root_call.call_occurrences.as_slice() else { panic!("one namespace call"); };
+    let (supplier, supplier_type) = root_call.contextual_argument(call.ordinal).unwrap();
+    assert_eq!((formal_type, supplier_type), (&ScalarType::U8, &ScalarType::U8));
+    assert_eq!((&formal.source, &supplier.source), (&leaf, &app));
+    assert_ne!(formal, supplier);
+    assert_eq!(supplier.kind, ReferenceBindingKind::Declared);
+    let initializer = leaf_text.replace("%%end", "consume(); %%end");
+    assert!(contextual::prepare_contextual_transport_graph(
+        vec![(source(&app, app_text, false), bindings()), (source(&leaf, &initializer, true), Vec::new())],
+        vec![app.clone(), leaf.clone()], inputs(), true,
+    ).is_err(), "imported initializer must remain inert in this profile");
 
     for declarations in [
         vec![(source(&app, &app_text.replace("u8 core.context.credit = 3;", ""), false), bindings()),

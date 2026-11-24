@@ -1470,6 +1470,32 @@ cases.extend([
         2, b"unsupported analysis"),
 ])
 
+public_namespace_contextual_root = """%%start
+    lib = namespace app "src/calc.w";
+    unit() entry = fn {
+        u8 core.context.credit = 3;
+        lib.relay();
+        core.require(core.context.credit == 2, """ + report(76,"WRONG-NAMESPACE-CONTEXT-EXIT") + """);
+    };
+    entry();
+%%end"""
+public_namespace_contextual_child = """%%start
+    unit() consume = fn { core.context.credit = core.context.credit - 1; };
+    unit() relay = fn { consume(); };
+    proof debit for consume() -> (null)
+        ensures (core.context.credit == core.old(core.context.credit) - 1) {}
+%%end"""
+for suffix, child, code, stderr in [
+    ("verified", public_namespace_contextual_child, 0, b""),
+    ("refuted", public_namespace_contextual_child.replace("credit = core.context.credit - 1", "credit = core.context.credit - 0"),
+        1, b"proof obligation failed"),
+    ("initializer-refused", public_namespace_contextual_child.replace("%%end", "relay(); %%end"),
+        2, b"unsupported analysis"),
+]:
+    name = "exact-startup-public-namespace-contextual-" + suffix
+    namespace_children[name] = child
+    cases.append((name, public_namespace_contextual_root, code, stderr))
+
 two_edge_ranked = """%%start
     u16(i8, u8) descend = fn(page, slot) {
         if (slot == 0) {
@@ -1972,6 +1998,7 @@ cases.extend([
         b"proof obligation failed"),
 ])
 proof_diagnostic_notes = {
+    "exact-startup-public-namespace-contextual-refuted": b"contextual value at entry: 3; at exit: 3",
     "exact-startup-public-contextual-proof-refuted": b"contextual value at entry: 3; at exit: 3",
     "ordinary-ranked-two-edge-base-refuted": b"symbolic call can return 8",
     "ordinary-rectangular-authored-show-goal-failure": b"symbolic call can return 245",
@@ -2738,6 +2765,9 @@ with tempfile.TemporaryDirectory(prefix="affine-calls-") as path:
                         assert b"COPY-PRIOR-UNPUBLISHED" not in res.stderr and b"COPY-FORMAL-UNPUBLISHED" not in res.stderr,res
                 elif included and name in proof_diagnostic_notes:
                     assert expected_stderr in res.stderr and proof_diagnostic_notes[name] in res.stderr,res
+                    if name == "exact-startup-public-namespace-contextual-refuted":
+                        assert b"src/main.w" in res.stderr and b"src/calc.w" in res.stderr,res
+                        assert b"WRONG-NAMESPACE-CONTEXT-EXIT" not in res.stderr.splitlines(),res
                     if name == "exact-startup-public-contextual-proof-refuted":
                         assert b"PRIVATE-CONTEXT-OUTPUT" not in res.stderr.splitlines() and b"active contextual binding" in res.stderr,res
                     if name.startswith("ordinary-rectangular-authored-show-"):

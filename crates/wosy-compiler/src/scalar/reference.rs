@@ -6841,10 +6841,10 @@ impl ProjectCallSiteResults {
 
     #[cfg(any(test, feature = "internal-checker"))]
     pub(super) fn install_contextual_formal(
-        &mut self, item: usize, name: std::rc::Rc<str>, ty: ScalarType,
+        &mut self, (module, item): (usize, usize), name: std::rc::Rc<str>, ty: ScalarType,
     ) -> Option<()> {
         if !is_integer_type(&ty) { return None; }
-        let module = self.modules.first_mut()?.as_mut().ok()?;
+        let module = self.modules.get_mut(module)?.as_mut().ok()?;
         let body = module.functions.get_mut(&item)?;
         if body.contextual_formal.is_some() || !body.arms.is_empty() { return None; }
         let formal = super::contextual::contextual_formal(&module.initialization.source, body.contextual_owner.0);
@@ -6854,10 +6854,11 @@ impl ProjectCallSiteResults {
 
     #[cfg(any(test, feature = "internal-checker"))]
     pub(super) fn install_contextual_call(
-        &mut self, item: usize, callee: usize, supply: super::contextual::ContextualSupplyAuthority,
+        &mut self, (caller_module, item): (usize, usize), (callee_module, callee): (usize, usize),
+        supply: super::contextual::ContextualSupplyAuthority,
     ) -> Option<()> {
         let (occurrence, span, binding, name, ty) = supply.into_parts();
-        let module = self.modules.first_mut()?.as_mut().ok()?;
+        let module = self.modules.get(callee_module)?.as_ref().ok()?;
         let receiver = module.functions.get(&callee)?;
         let (_, expected_type, expected_name) = receiver.contextual_formal.as_ref()?;
         if &ty != expected_type || &name != expected_name { return None; }
@@ -6866,6 +6867,7 @@ impl ProjectCallSiteResults {
             declaration_span: receiver.contextual_owner.1,
             concrete: ConcreteCallSelection::Declaration,
         };
+        let module = self.modules.get_mut(caller_module)?.as_mut().ok()?;
         let body = module.functions.get_mut(&item)?;
         if body.resolved_call_site(occurrence)?.target != target
             || !body.checked_call_signatures.contains_key(&occurrence)

@@ -571,6 +571,7 @@ struct ContextualProofOccurrence {
     binding: ReferenceBindingId,
     supplying_call: ByteSpan,
     call: ByteSpan,
+    call_source: SourceIdentity,
     entry: BigInt,
     exit: BigInt,
     reused: bool,
@@ -580,8 +581,17 @@ struct ContextualProofOccurrence {
 struct VerifiedContextualOutcome {
     exact_binding: ReferenceBindingId,
     leaf_call: ByteSpan,
+    caller_source: SourceIdentity,
+    occurrence: OccurrenceOrdinal,
     entry: BigInt,
     exit: BigInt,
+}
+
+#[cfg(feature = "internal-checker")]
+impl VerifiedContextualOutcome {
+    fn matches_call(&self, source: &SourceIdentity, occurrence: OccurrenceOrdinal, span: ByteSpan) -> bool {
+        &self.caller_source == source && self.occurrence == occurrence && self.leaf_call == span
+    }
 }
 
 #[cfg(feature = "internal-checker")]
@@ -604,12 +614,13 @@ struct ReachedContextualProof {
 impl ReachedContextualProof {
     fn reusable_exit(
         &self, target: PreparedCallable, body: &FunctionCallSites, binding: &ReferenceBindingId,
-        ty: &ScalarType, leaf_call: ByteSpan, entry: &BigInt,
+        ty: &ScalarType, call: (&SourceIdentity, OccurrenceOrdinal, ByteSpan), entry: &BigInt,
     ) -> Option<&BigInt> {
         let receipt = self.verified.as_ref()?;
         if self.refutation.is_some() || self.reusable_body != Some(std::ptr::from_ref(body))
             || self.target != target || body.contextual_formal() != Some((&self.formal, &self.ty))
-            || &self.ty != ty || &receipt.exact_binding != binding || receipt.leaf_call != leaf_call
+            || &self.ty != ty || &receipt.exact_binding != binding || call.0 != &self.formal.source
+            || !receipt.matches_call(call.0, call.1, call.2)
             || &receipt.entry != entry
         {
             return None;
@@ -619,16 +630,18 @@ impl ReachedContextualProof {
 
     fn observe(
         &mut self, body: &FunctionCallSites, (formal, formal_type): (&ReferenceBindingId, &ScalarType),
-        binding: &ReferenceBindingId, ty: &ScalarType, supplying_call: ByteSpan, call: ByteSpan,
+        binding: &ReferenceBindingId, ty: &ScalarType, supplying_call: ByteSpan,
+        site @ (call_source, occurrence_id, call): (&SourceIdentity, OccurrenceOrdinal, ByteSpan),
         entry: &BigInt, exit: &BigInt, reused: bool,
     ) -> Result<(), ProjectCheck> {
         if formal != &self.formal || formal_type != &self.ty || ty != &self.ty
-            || !matches!(binding.kind, super::ReferenceBindingKind::Declared) || binding.source != formal.source
+            || !matches!(binding.kind, super::ReferenceBindingKind::Declared)
+            || binding.source.project != formal.source.project || binding.source.package != formal.source.package
         {
             return Err(ProjectCheck::Unsupported);
         }
         let proved = if reused {
-            if self.reusable_exit(self.target, body, binding, ty, call, entry) != Some(exit) {
+            if self.reusable_exit(self.target, body, binding, ty, site, entry) != Some(exit) {
                 return Err(ProjectCheck::Unsupported);
             }
             true
@@ -639,13 +652,17 @@ impl ReachedContextualProof {
         };
         if self.refutation.is_none() {
             let occurrence = || ContextualProofOccurrence {
-                binding: binding.clone(), supplying_call, call, entry: entry.clone(), exit: exit.clone(), reused,
+                binding: binding.clone(), supplying_call, call, call_source: call_source.clone(),
+                entry: entry.clone(), exit: exit.clone(), reused,
             };
             if proved {
                 self.saw_proved_occurrence = true;
-                if !reused && self.verified.is_none() && self.reusable_body == Some(std::ptr::from_ref(body)) {
+                if !reused && self.verified.is_none() && call_source == &formal.source
+                    && self.reusable_body == Some(std::ptr::from_ref(body))
+                {
                     self.verified = Some(VerifiedContextualOutcome {
-                        exact_binding: binding.clone(), leaf_call: call, entry: entry.clone(), exit: exit.clone(),
+                        exact_binding: binding.clone(), leaf_call: call, caller_source: call_source.clone(),
+                        occurrence: occurrence_id, entry: entry.clone(), exit: exit.clone(),
                     });
                 }
                 if self.retain_observations { self.observations.push(occurrence()); }
@@ -721,24 +738,29 @@ fn check_internal_contextual_proof(
 ) -> Result<(Vec<ContextualProofOccurrence>, Vec<ScalarOrderedCheckerFailure>), InternalContextualProofError> {
     let source = derive_scalar_proof_declarations_from_cst(canonical);
     let header = source.contextual_proof.ok_or(ProjectCheck::Unsupported)?;
-    check_prepared_contextual_proof(source.declarations, header, inputs, ScalarCheckerScope::MainFlowOnly, true)
+    let identity = source.declarations.source().clone();
+    check_prepared_contextual_proof(vec![(source.declarations, Vec::new())], vec![identity.clone()],
+        &identity, header, inputs, ScalarCheckerScope::MainFlowOnly, true)
 }
 
 #[cfg(feature = "internal-checker")]
 fn check_prepared_contextual_proof(
-    source: ScalarSourceDeclarations, header: ContextualProofHeader,
+    sources: Vec<(ScalarSourceDeclarations, Vec<ScalarNamespaceBinding>)>,
+    initialization_order: Vec<SourceIdentity>, proof_source: &SourceIdentity, header: ContextualProofHeader,
     inputs: ScalarPreparationInputs, scope: ScalarCheckerScope, retain_observations: bool,
 ) -> Result<(Vec<ContextualProofOccurrence>, Vec<ScalarOrderedCheckerFailure>), InternalContextualProofError> {
-    let (prepared, context) = super::contextual::prepare_contextual_transport_from_source(source, inputs, true)
+    let startup_count = initialization_order.len();
+    let (prepared, context) = super::contextual::prepare_contextual_transport_graph(sources, initialization_order, inputs, true)
         .map_err(|_| ProjectCheck::Unsupported)?;
     let prepared = PreparedCheckerProject::from_contextual_transport(prepared);
     let (project, calls) = prepared.parts();
-    let [module] = project.modules.as_slice() else { return Err(ProjectCheck::Unsupported.into()); };
+    let (module_index, module) = project.modules.iter().enumerate().find(|(_, module)| &module.source == proof_source)
+        .ok_or(ProjectCheck::MissingRoot)?;
     let (item, function) = module.items.iter().enumerate().find_map(|(item, candidate)| match candidate {
         super::ScalarItem::Function(function) if function.name == header.name.text() => Some((item, function)),
         _ => None,
     }).ok_or(ProjectCheck::InvalidProof)?;
-    let body = calls.function_body(0, item, None).ok_or(ProjectCheck::MissingRootOccurrences)?;
+    let body = calls.function_body(module_index, item, None).ok_or(ProjectCheck::MissingRootOccurrences)?;
     let (formal, ty) = body.contextual_formal().ok_or(ProjectCheck::Unsupported)?;
     if ty != &context.ty || !body.boundary.parameters.is_empty()
         || !matches!(body.boundary.results.as_slice(), [output] if output.ty == ScalarType::Unit)
@@ -749,13 +771,13 @@ fn check_prepared_contextual_proof(
     if header.place.text() != context.name.as_ref() || !integer_literal_fits_type(&header.amount, ty) {
         return Err(ProjectCheck::Unsupported.into());
     }
-    let report = run_prepared_ordered_check_with_effects(&prepared, scope, 1,
+    let report = run_prepared_ordered_check_with_effects(&prepared, scope, startup_count,
         OrderedReachPolicy::Closed, ProofFreeOrderedEvidence, OrderedFailures {
             contextual_proof: Some(ReachedContextualProof {
-                target: (0, item), formal: formal.clone(), ty: ty.clone(), goal: header.goal,
+                target: (module_index, item), formal: formal.clone(), ty: ty.clone(), goal: header.goal,
                 add: header.add, amount: header.amount, observations: Vec::new(),
                 retain_observations, saw_proved_occurrence: false, refutation: None,
-                reusable_body: super::checker_flow::exact_contextual_summary_leaf(body)
+                reusable_body: (startup_count == 1 && super::checker_flow::exact_contextual_summary_leaf(body))
                     .then_some(std::ptr::from_ref(body)),
                 verified: None,
             }),
@@ -2534,7 +2556,8 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                                         .ok_or(ProjectCheck::Unsupported)?.span;
                                     let (original_binding, supplying_call) = completed.contextual_origin
                                         .ok_or(ProjectCheck::Unsupported)?;
-                                    proof.observe(completed.body, formal, original_binding, ty, supplying_call, span, &entry, &exit, reused)?;
+                                    proof.observe(completed.body, formal, original_binding, ty, supplying_call,
+                                        (parent.source, effect.occurrence(), span), &entry, &exit, reused)?;
                                 }
                             }
                         }
@@ -2593,7 +2616,9 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             (None, None) => None,
             (Some((binding, ty)), Some((formal, formal_ty)))
                 if ACTUAL_STARTUP && !NAMED && Observer::PROOF_FREE_CONTEXTUAL_LOCAL_TRANSFERS
-                    && collection.is_some() && parent.source == &owner.source && ty == formal_ty
+                    && collection.is_some_and(|ordered| parent.source == &owner.source
+                        || self.completed_namespace_call(parent.source, owner, target.0, body, signature, expected, ordered.visits))
+                    && ty == formal_ty
                     && matches!(effect, ExactCallEffect::Unit(_)) && signature.parameters.is_empty()
                     && body.boundary.parameters.is_empty() && !self.active.contains(&target)
                     && matches!(signature.outputs.outputs.as_slice(), [out] if out.ty == ScalarType::Unit) =>
@@ -2852,7 +2877,7 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             let span = caller.occurrences.get(call.0).ok_or(ProjectCheck::Unsupported)?.span;
             let verified_exit = collection.and_then(|ordered| {
                 let effects = ordered.failures.borrow();
-                effects.contextual_proof.as_ref()?.reusable_exit(target, body, origin.0, ty, span, &value).cloned()
+                effects.contextual_proof.as_ref()?.reusable_exit(target, body, origin.0, ty, (parent.source, call, span), &value).cloned()
             });
             let verified_result = if let Some(exit) = verified_exit {
                 Some((value, exit))
@@ -6289,24 +6314,37 @@ fn check_loaded_ordered_proof_diagnostics_in_scope<const LOCAL_CATALOGS: bool>(
         return run_closed_without_named_proofs(&prepared, scope, startup_count);
     }
     let startup_count = initialization_order.len();
-    if LOCAL_CATALOGS && proofs.len() == 1 && proofs[0].0.contextual_proof.is_some() {
-        if !declarations.is_empty() || !dormant.is_empty() || !proofs[0].1.is_empty()
-            || initialization_order.as_slice() != [proofs[0].0.declarations.source().clone()]
-        {
+    if LOCAL_CATALOGS && proofs.iter().any(|(proof, _)| proof.contextual_proof.is_some()) {
+        // A single contextual obligation owns this closed local profile.
+        // Other authored proof declarations and dormant providers remain
+        // unsupported rather than being silently omitted.
+        if !(1..=2).contains(&startup_count) || !dormant.is_empty() {
             return Err(ProjectCheck::Unsupported);
         }
-        let (proof, _) = proofs.into_iter().next().ok_or(ProjectCheck::InvalidProof)?;
-        let header = proof.contextual_proof.ok_or(ProjectCheck::InvalidProof)?;
+        let mut sources = declarations;
+        let mut selected = None;
+        for (proof, namespaces) in proofs {
+            if let Some(header) = proof.contextual_proof {
+                if selected.replace((proof.declarations.source().clone(), header)).is_some() {
+                    return Err(ProjectCheck::Unsupported);
+                }
+            } else if !proof.definitions.is_empty() {
+                return Err(ProjectCheck::Unsupported);
+            }
+            sources.push((proof.declarations, namespaces));
+        }
+        let (source, header) = selected.ok_or(ProjectCheck::InvalidProof)?;
         let proof_span = header.proof;
-        let source = proof.declarations.source().clone();
-        let (directives, contextual_diagnostic) = match check_prepared_contextual_proof(proof.declarations, header, inputs, scope, false) {
+        let (directives, contextual_diagnostic) = match check_prepared_contextual_proof(sources, initialization_order, &source, header, inputs, scope, false) {
             Ok((_, directives)) => (directives, None),
             Err(InternalContextualProofError::Check(error)) => return Err(error),
             Err(InternalContextualProofError::Refuted { goal, occurrence }) => {
                 let at = |range| wosy_syntax::SourceSpan::new(source.clone(), range);
                 (Vec::new(), Some(ContextualProofDiagnostic {
-                    proof: at(proof_span), goal: at(goal), supplying_call: at(occurrence.supplying_call),
-                    call: at(occurrence.call), binding: at(occurrence.binding.declaration_span),
+                    proof: at(proof_span), goal: at(goal),
+                    supplying_call: wosy_syntax::SourceSpan::new(occurrence.binding.source.clone(), occurrence.supplying_call),
+                    call: wosy_syntax::SourceSpan::new(occurrence.call_source, occurrence.call),
+                    binding: wosy_syntax::SourceSpan::new(occurrence.binding.source, occurrence.binding.declaration_span),
                     entry: occurrence.entry, exit: occurrence.exit,
                 }))
             }
@@ -16398,6 +16436,82 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
             assert!(matches!(result, Err(ProjectCheck::Unsupported)));
             assert!(output.records.is_empty());
             assert!(actual.active.is_empty());
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn contextual_verified_outcome_distinguishes_identical_offsets_in_two_sources() {
+        let app = source("src/main.w", "namespace-contextual-root");
+        let leaf = source("src/calc.w", "namespace-contextual-leaf");
+        let call = ByteSpan::new(42, 51);
+        let occurrence = OccurrenceOrdinal(3);
+        let outcome = VerifiedContextualOutcome {
+            exact_binding: ReferenceBindingId {
+                source: app.clone(), kind: super::super::ReferenceBindingKind::Declared,
+                declaration_span: ByteSpan::new(7, 26), block_span: ByteSpan::new(0, 60),
+                function_span: ByteSpan::new(0, 60),
+            },
+            leaf_call: call, caller_source: app.clone(), occurrence,
+            entry: BigInt::from(3), exit: BigInt::from(2),
+        };
+        assert!(outcome.matches_call(&app, occurrence, call));
+        assert!(!outcome.matches_call(&leaf, occurrence, call));
+        assert!(!outcome.matches_call(&app, OccurrenceOrdinal(4), call));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn public_ordered_namespace_contextual_proof_preserves_actual_source_and_scope() {
+        let app = source("src/main.w", "namespace-contextual-root");
+        let leaf = source("src/calc.w", "namespace-contextual-leaf");
+        let root = r#"%%start
+            lib = namespace app "src/calc.w";
+            unit() entry = fn {
+                u8 core.context.credit = 3;
+                lib.relay();
+                core.require(false, { .stdout = ""; .stderr = "earlier root effect"; .code = 76; .files = []; });
+            };
+            entry();
+        %%end"#;
+        let child = r#"%%start
+            unit() consume = fn { core.context.credit = core.context.credit - 1; };
+            unit() relay = fn { consume(); };
+            unit(u8) unused = fn(value) {
+                core.require(value == 0, { .stdout = ""; .stderr = "unused child requirement"; .code = 77; .files = []; });
+            };
+            proof debit for consume() -> (null)
+                ensures (core.context.credit == core.old(core.context.credit) - 1) {}
+        %%end"#;
+        let run = |root: &str, child: &str, scope| {
+            let (_, root) = crate::parse_proof_source(app.clone(), root.to_owned(), &[]).ok().unwrap();
+            let (_, child) = crate::parse_proof_source(leaf.clone(), child.to_owned(), &[]).ok().unwrap();
+            let bindings = vec![ScalarNamespaceBinding { binding: "lib".to_owned(), target: leaf.clone(), span: ByteSpan::new(0, 0) }];
+            check_loaded_scalar_ordered_local_proof_contexts(Vec::new(), [(child, Vec::new()), (root, bindings)],
+                vec![app.clone(), leaf.clone()], inputs(), scope, Vec::new())
+        };
+        for (scope, expected) in [(ScalarCheckerScope::MainFlowOnly, vec![76]),
+            (ScalarCheckerScope::CurrentPackage, vec![76, 77])]
+        {
+            let report = run(root, child, scope).unwrap();
+            assert!(report.active && report.contextual_diagnostic.is_none());
+            assert_eq!(report.directives.iter().map(|record| record.code().clone()).collect::<Vec<_>>(),
+                expected.into_iter().map(BigInt::from).collect::<Vec<_>>());
+            let false_proof = child.replace("credit = core.context.credit - 1", "credit = core.context.credit - 0");
+            let refusal = run(root, &false_proof, scope).unwrap();
+            assert!(refusal.directives.is_empty());
+            let diagnostic = refusal.contextual_diagnostic.unwrap();
+            assert_eq!((&diagnostic.entry, &diagnostic.exit), (&BigInt::from(3), &BigInt::from(3)));
+            assert_eq!(diagnostic.goal.source, leaf);
+            assert_eq!(diagnostic.call.source, leaf);
+            assert_eq!(diagnostic.supplying_call.source, app);
+            assert_eq!(diagnostic.binding.source, app);
+            let at = |text: &str, span: ByteSpan| text[span.start as usize..span.end as usize].to_owned();
+            assert_eq!(at(&false_proof, diagnostic.call.range), "consume()");
+            assert_eq!(at(root, diagnostic.supplying_call.range), "lib.relay()");
+            assert_eq!(at(root, diagnostic.binding.range).trim_end(), "core.context.credit");
+            let nonempty_initializer = child.replace("%%end", "relay(); %%end");
+            assert!(matches!(run(root, &nonempty_initializer, scope), Err(ScalarOrderedCheckerOutcome::Unsupported)));
         }
     }
 

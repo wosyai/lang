@@ -350,7 +350,16 @@ pub(super) fn prepare_contextual_transport(
 
 #[cfg(any(test, feature = "internal-checker"))]
 pub(super) fn prepare_contextual_transport_from_source(
-    mut source: ScalarSourceDeclarations, inputs: ScalarPreparationInputs, checker_directives: bool,
+    source: ScalarSourceDeclarations, inputs: ScalarPreparationInputs, checker_directives: bool,
+) -> Result<(PreparedScalarProject, DormantContextReceipt), DormantContextRejection> {
+    let root = source.source().clone();
+    prepare_contextual_transport_graph(vec![(source, Vec::new())], vec![root], inputs, checker_directives)
+}
+
+#[cfg(any(test, feature = "internal-checker"))]
+pub(super) fn prepare_contextual_transport_graph(
+    mut sources: Vec<(ScalarSourceDeclarations, Vec<ScalarNamespaceBinding>)>,
+    initialization_order: Vec<SourceIdentity>, inputs: ScalarPreparationInputs, checker_directives: bool,
 ) -> Result<(PreparedScalarProject, DormantContextReceipt), DormantContextRejection> {
     use self::DormantContextRejection::{MissingAtRoot, Unsupported};
     use super::control::{ModuleInitializationCallTarget, ModuleInitializationDetail};
@@ -360,51 +369,79 @@ pub(super) fn prepare_contextual_transport_from_source(
         work = work.checked_add(amount).filter(|&cost| cost <= MAX_WORK).ok_or(Unsupported)?;
         Ok(())
     };
-    let canonical_source = source.source().clone();
-    let places = &mut source.contextual_places;
-    charge(places.declarations.len().saturating_add(places.inherited.len()).saturating_add(source.items.len()))?;
-    if !source.diagnostics.is_empty() || places.dormant_operands.is_empty() {
-        return Err(Unsupported);
+    let root = initialization_order.first().ok_or(Unsupported)?;
+    if sources.len() != initialization_order.len() { return Err(Unsupported); }
+    charge(sources.len())?;
+    let allowed: HashSet<_> = initialization_order.iter().collect();
+    if allowed.len() != sources.len() { return Err(Unsupported); }
+    let root_module = sources.iter().position(|(source, _)| source.source() == root).ok_or(Unsupported)?;
+    let mut catalog: Option<(std::rc::Rc<str>, ScalarType)> = None;
+    let mut lexical = Vec::with_capacity(sources.len());
+    let mut seen = HashSet::new();
+    for (source, namespaces) in &mut sources {
+        let identity = source.source();
+        if identity.project != root.project || identity.package != root.package
+            || !allowed.contains(identity) || !seen.insert(identity.clone()) || !source.diagnostics.is_empty()
+            || namespaces.iter().any(|edge| !allowed.contains(&edge.target))
+        { return Err(Unsupported); }
+        let places = &mut source.contextual_places;
+        charge(places.declarations.len().saturating_add(places.inherited.len())
+            .saturating_add(source.items.len()).saturating_add(namespaces.len()))?;
+        let mut lexical_by_owner = HashMap::<ByteSpan, Vec<(u32, ByteSpan, ByteSpan)>>::new();
+        for storage in &places.declarations {
+            if !typecheck::is_integer_type(&storage.ty) { return Err(Unsupported); }
+            match &catalog {
+                Some((name, ty)) if name.as_ref() != storage.name || ty != &storage.ty => return Err(Unsupported),
+                None => catalog = Some((storage.name.as_str().into(), storage.ty.clone())),
+                _ => {}
+            }
+            lexical_by_owner.entry(storage.binding.function_span).or_default()
+                .push((storage.active_after, storage.scope, storage.declaration.range));
+        }
+        // Project type preparation still owns pending names and diagnostics.
+        let uses = places.inherited.iter().map(|occurrence| occurrence.function).collect::<Vec<_>>();
+        lexical.push((lexical_by_owner, uses));
     }
-    let [first] = places.first_declarations.as_slice() else { return Err(Unsupported); };
-    let ty = places.declarations[*first].ty.clone();
-    let name: std::rc::Rc<str> = places.declarations[*first].name.as_str().into();
-    // Keep only fixed-size lexical activation coordinates for this one type.
-    // The owning source retains the declaration catalog for project assembly.
-    let mut lexical_by_owner = HashMap::<ByteSpan, Vec<(u32, ByteSpan, ByteSpan)>>::new();
-    for storage in &places.declarations {
-        if storage.ty != ty {
+    let (name, ty) = catalog.ok_or(Unsupported)?;
+    for (source, _) in &sources {
+        if source.contextual_places.inherited.iter().any(|occurrence| occurrence.name != name.as_ref()) {
             return Err(Unsupported);
         }
-        lexical_by_owner.entry(storage.binding.function_span).or_default()
-            .push((storage.active_after, storage.scope, storage.declaration.range));
     }
-    let uses = std::mem::take(&mut places.inherited);
-    let (project, mut calls) = prepare_project_contextual_types(
-        vec![(source, Vec::new())], vec![canonical_source.clone()], inputs, checker_directives,
-    ).map_err(|_| Unsupported)?;
-    let [module] = project.modules.as_slice() else { return Err(Unsupported); };
-    let mut by_body = HashMap::new();
-    let mut by_target = HashMap::new();
-    for (index, item) in module.items.iter().enumerate() {
-        match item {
-            ScalarItem::Function(function) if function.generic_parameters.is_empty() && function.overload_arms.is_empty() => {
-                if by_body.insert(function.span, index).is_some()
-                    || by_target.insert(function.name_span, index).is_some()
-                {
-                    return Err(Unsupported);
-                }
-            }
-            ScalarItem::Executable(_) => {}
-            _ => return Err(Unsupported),
+    for (source, _) in &mut sources {
+        if !source.contextual_places.has_pending_formals {
+            source.contextual_places.inherited.clear();
         }
     }
-    let mut needs = vec![false; module.items.len()];
+    let (project, mut calls) = prepare_project_contextual_types(sources, initialization_order, inputs, checker_directives)
+        .map_err(|_| Unsupported)?;
+    let mut by_target = HashMap::new();
+    let mut callables = Vec::new();
     let mut pending = Vec::new();
-    for occurrence in uses {
-        let index = *by_body.get(&occurrence.function).ok_or(Unsupported)?;
-        if !std::mem::replace(&mut needs[index], true) { pending.push(index); }
+    let mut needs = Vec::new();
+    for (module_index, module) in project.modules.iter().enumerate() {
+        let mut by_body = HashMap::new();
+        for (item, row) in module.items.iter().enumerate() {
+            match row {
+                ScalarItem::Function(function) if function.generic_parameters.is_empty() && function.overload_arms.is_empty() => {
+                    let index = callables.len();
+                    if by_body.insert(function.span, index).is_some()
+                        || by_target.insert((&module.source, function.name_span), index).is_some()
+                    { return Err(Unsupported); }
+                    callables.push((module_index, item, function));
+                    needs.push(false);
+                }
+                ScalarItem::Namespace(_) => {}
+                ScalarItem::Executable(_) if module_index == root_module => {}
+                _ => return Err(Unsupported),
+            }
+        }
+        for span in std::mem::take(&mut lexical[module_index].1) {
+            let index = *by_body.get(&span).ok_or(Unsupported)?;
+            if !std::mem::replace(&mut needs[index], true) { pending.push(index); }
+        }
     }
+    if pending.is_empty() { return Err(Unsupported); }
     struct Edge {
         caller: usize,
         caller_span: ByteSpan,
@@ -415,14 +452,14 @@ pub(super) fn prepare_contextual_transport_from_source(
         lexical: Option<(ContextualSupplyAuthority, ByteSpan)>,
     }
     let mut edges = Vec::new();
-    let mut parents = vec![Vec::new(); module.items.len()];
-    for (caller, item) in module.items.iter().enumerate() {
-        let ScalarItem::Function(function) = item else { continue; };
-        let body = calls.function_body(0, caller, None).ok_or(Unsupported)?;
+    let mut parents = vec![Vec::new(); callables.len()];
+    for (caller, &(module_index, item, function)) in callables.iter().enumerate() {
+        let module = &project.modules[module_index];
+        let body = calls.function_body(module_index, item, None).ok_or(Unsupported)?;
         if !body.arms.is_empty() || !body.callable_escapes.is_empty() || !body.allocation_length_calls.is_empty() {
             return Err(Unsupported);
         }
-        let mut lexical = lexical_by_owner.remove(&function.span).unwrap_or_default();
+        let mut lexical = lexical[module_index].0.remove(&function.span).unwrap_or_default();
         // Activation order differs from declaration-entry order when a
         // declaration initializer contains another lexical block.
         let sort_work = |len: usize| len.saturating_mul((usize::BITS - len.leading_zeros()) as usize + 1);
@@ -447,10 +484,10 @@ pub(super) fn prepare_contextual_transport_from_source(
             }
             let ResolvedCallTarget::ModuleCallable { source, declaration_span, concrete: ConcreteCallSelection::Declaration } = &site.target
                 else { return Err(Unsupported); };
-            if source != &canonical_source || !body.checked_call_signatures.contains_key(&call.ordinal) {
+            if !body.checked_call_signatures.contains_key(&call.ordinal) {
                 return Err(Unsupported);
             }
-            let callee = *by_target.get(declaration_span).ok_or(Unsupported)?;
+            let callee = *by_target.get(&(source, *declaration_span)).ok_or(Unsupported)?;
             while activation.peek().is_some_and(|&(start, _, _)| start <= occurrence.start) {
                 charge(1)?;
                 let (start, scope, binding) = activation.next().ok_or(Unsupported)?;
@@ -473,7 +510,7 @@ pub(super) fn prepare_contextual_transport_from_source(
                     Some((ContextualSupplyAuthority {
                         occurrence: call.ordinal, span: occurrence, name: std::rc::Rc::clone(&name), ty: ty.clone(),
                         binding: ReferenceBindingId {
-                            source: canonical_source.clone(), function_span: function.span,
+                            source: module.source.clone(), function_span: function.span,
                             declaration_span: declaration, block_span: scope, kind: ReferenceBindingKind::Declared,
                         },
                     }, declaration))
@@ -493,20 +530,28 @@ pub(super) fn prepare_contextual_transport_from_source(
             if !std::mem::replace(&mut needs[caller], true) { pending.push(caller); }
         }
     }
-    let init = calls.initialization_region(0).ok_or(Unsupported)?;
+    for index in 0..project.modules.len() {
+        if index != root_module {
+            let region = calls.initialization_region(index).ok_or(Unsupported)?;
+            let ModuleInitializationDetail::Occurrences(topology) = &region.detail else { return Err(Unsupported); };
+            if !topology.calls.is_empty() || !topology.callable_escapes.is_empty() { return Err(Unsupported); }
+        }
+    }
+    let init = calls.initialization_region(root_module).ok_or(Unsupported)?;
     let ModuleInitializationDetail::Occurrences(topology) = &init.detail else { return Err(Unsupported); };
     if !topology.callable_escapes.is_empty() { return Err(Unsupported); }
     let [root] = topology.calls.as_slice() else { return Err(Unsupported); };
     let ModuleInitializationCallTarget::Direct { declaration, concrete: ConcreteCallSelection::Declaration }
         = topology.call_targets.get(root).ok_or(Unsupported)? else { return Err(Unsupported); };
-    if declaration.source != canonical_source || !topology.checked_call_signatures.contains_key(root) {
+    if declaration.source != project.modules[root_module].source || !topology.checked_call_signatures.contains_key(root) {
         return Err(Unsupported);
     }
-    if needs[*by_target.get(&declaration.range).ok_or(Unsupported)?] {
+    if needs[*by_target.get(&(&declaration.source, declaration.range)).ok_or(Unsupported)?] {
         return Err(MissingAtRoot(topology.occurrences.get(root.0).ok_or(Unsupported)?.span));
     }
     for (index, needed) in needs.iter().enumerate() {
-        if *needed { calls.install_contextual_formal(index, std::rc::Rc::clone(&name), ty.clone()).ok_or(Unsupported)?; }
+        let (module, item, _) = callables[index];
+        if *needed { calls.install_contextual_formal((module, item), std::rc::Rc::clone(&name), ty.clone()).ok_or(Unsupported)?; }
     }
     let mut verified = Vec::new();
     for edge in edges.into_iter().filter(|edge| needs[edge.callee]) {
@@ -514,11 +559,14 @@ pub(super) fn prepare_contextual_transport_from_source(
             Some((authority, declaration)) => (authority, DormantContextSupply::Lexical(declaration)),
             None if needs[edge.caller] => (ContextualSupplyAuthority {
                 occurrence: edge.ordinal, span: edge.occurrence, name: std::rc::Rc::clone(&name), ty: ty.clone(),
-                binding: contextual_formal(&canonical_source, edge.caller_span),
+                binding: contextual_formal(&project.modules[callables[edge.caller].0].source, edge.caller_span),
             }, DormantContextSupply::Formal(edge.caller_span)),
             None => return Err(Unsupported),
         };
-        calls.install_contextual_call(edge.caller, edge.callee, authority).ok_or(Unsupported)?;
+        let (caller_module, caller_item, _) = callables[edge.caller];
+        let (callee_module, callee_item, _) = callables[edge.callee];
+        calls.install_contextual_call((caller_module, caller_item), (callee_module, callee_item), authority)
+            .ok_or(Unsupported)?;
         verified.push(DormantContextEdge { occurrence: edge.occurrence, target: edge.target, supplied });
     }
     Ok((PreparedScalarProject::from_contextual_transport(project, calls), DormantContextReceipt { ty, name, edges: verified }))
