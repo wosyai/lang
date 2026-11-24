@@ -205,7 +205,7 @@ mod tests {
         for (body, expected) in [
             ("result", "fallible allocation is not known to be available"),
             ("if (&result == null) { result } else { 7 }", "fallible allocation is not known to be available"),
-            ("i32 observed = if (&result == null) { 7 } else { result };\n\tobserved;\n\tif (&result == null) { 9 } else { result }", "fallible allocation requires one proven null guard for its local binding"),
+            ("7", "fallible allocation requires an exact proven null guard for its local binding"),
             ("result = 19;\n\t7", "fallible allocation access is not a supported whole Copy overwrite or direct guarded read"),
             ("*i32 alias = &result;\n\talias;\n\t7", "fallible allocation access is not a supported whole Copy overwrite or direct guarded read"),
         ] {

@@ -9847,7 +9847,7 @@ i32() overlap = fn {
         let rejected = crate::derive_scalar_program_with_layout(&rejected.result, layout);
         let [diagnostic] = rejected.diagnostics.as_slice() else { panic!("{:?}", rejected.diagnostics) };
         assert_eq!(diagnostic.code, "B0003");
-        assert!(diagnostic.message.contains("fallible allocation requires one proven null guard for its local binding"), "{diagnostic:?}");
+        assert!(diagnostic.message.contains("fallible allocation requires an exact proven null guard for its local binding"), "{diagnostic:?}");
     }
 }
 
@@ -9917,7 +9917,7 @@ i32() nested = fn {
         let rejected = crate::derive_scalar_program_with_layout(&parsed.result, layout);
         let [diagnostic] = rejected.diagnostics.as_slice() else { panic!("{:?}", rejected.diagnostics) };
         assert_eq!(diagnostic.code, "B0003");
-        assert!(diagnostic.message.contains("fallible allocation requires one proven null guard for its local binding"), "{diagnostic:?}");
+        assert!(diagnostic.message.contains("fallible allocation requires an exact proven null guard for its local binding"), "{diagnostic:?}");
     }
 }
 
@@ -10435,6 +10435,63 @@ fn guarded_fallible_named_aliases_keep_one_backing_and_one_presence_guard() {
                     ));
                 }
                 std::fs::write(directory.join(format!("{target}-{route}-control.ll")), controlled).unwrap();
+            }
+        }
+    }
+}
+
+#[test]
+fn guarded_fallible_composed_conditions_keep_one_presence_and_one_cleanup() {
+    let source = SourceIdentity::new("project".into(), "package".into(), "src/main.w".into(), "r1".into());
+    let text = include_str!("../../tests/fixtures/guarded-fallible-composed.w");
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let parsed = parse_source(source.clone(), text.into(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let single = crate::derive_scalar_program_with_layout(&parsed.result, layout);
+        assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+        for function in single.program.items.iter().filter_map(|item| match item {
+            ScalarItem::Function(function) => Some(function),
+            _ => None,
+        }) {
+            let proof = function.reference_cfg.guarded_scalar_allocation().expect("one exact allocation");
+            let [first, second, nested] = proof.guards() else { panic!("three guarded occurrences"); };
+            assert_eq!([first.present_on_then, second.present_on_then, nested.present_on_then], [true, false, true]);
+            let points = &function.reference_cfg.points;
+            assert_eq!(points[first.branch.0].scope, points[second.branch.0].scope);
+            assert_ne!(points[second.branch.0].scope, points[nested.branch.0].scope);
+            assert_eq!(proof.alias_accesses().len(), if function.name == "shared" { 1 } else { 3 });
+        }
+        let project = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::from_program(single.program.clone(), Vec::new())],
+            vec![source.clone()],
+        ));
+        assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+        for (project_route, llvm) in [
+            (false, emit_scalar_llvm(&single).expect("single LLVM").to_text()),
+            (true, emit_scalar_project_llvm(&project).expect("project LLVM").to_text()),
+        ] {
+            for name in ["shared", "exclusive"] {
+                let body = self_tail_test_body(&llvm, "i64", &self_tail_test_symbol(&source, project_route, name));
+                assert_eq!(body.matches("call ptr @__wosy_core_alloc(i64 8, i64 8)").count(), 1, "{body}");
+                assert_eq!(body.matches("call void @__wosy_core_free(ptr %allocation)").count(), 1, "{body}");
+                assert_eq!(body.matches("icmp ne ptr %allocation, null").count(), 1, "{body}");
+                assert_eq!(body.matches("br i1 %fallible.present, label %if.then").count(), 2, "{body}");
+                assert_eq!(body.matches("br i1 %fallible.absent, label %if.then").count(), 1, "{body}");
+                assert!(body.contains("br i1 %fallible.present, label %fallible.release, label %fallible.released"), "{body}");
+                assert!(!body.contains("deref_is_null") && !body.contains("deref_null_panic")
+                    && !body.contains("__636865636b5f6e6f6e5f6e756c6c5f61646472657373("), "{body}");
+            }
+            if let Some(directory) = std::env::var_os("WOSY_FALLIBLE_COMPOSED_IR_DIR") {
+                let target = if layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
+                let route = if project_route { "project" } else { "standalone" };
+                let mut controlled = llvm.replace("define i32 @main(", "define i32 @wosy_authored_main(");
+                for name in ["shared", "exclusive"] {
+                    let callee = self_tail_test_symbol(&source, project_route, name);
+                    controlled.push_str(&format!(
+                        "\ndefine i64 @wosy_test_{name}(i64 %input) {{\nentry:\n  %result = call i64 @{callee}(i64 %input)\n  ret i64 %result\n}}\n"
+                    ));
+                }
+                std::fs::write(std::path::PathBuf::from(directory).join(format!("{target}-{route}-control.ll")), controlled).unwrap();
             }
         }
     }

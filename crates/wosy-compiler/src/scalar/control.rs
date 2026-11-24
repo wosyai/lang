@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::reference::{BlockOrdinal, OccurrenceMetadata, OccurrenceOrdinal, OccurrenceStructure};
 use super::{
@@ -24,6 +24,7 @@ pub(super) enum ForwardInitialGraph {
 }
 
 pub(super) struct GuardedAllocationEdge {
+    pub(super) condition: OccurrenceOrdinal,
     pub(super) binding: super::ReferenceBindingId,
     pub(super) present: super::CfgPointId,
     pub(super) absent: super::CfgPointId,
@@ -60,9 +61,8 @@ pub(crate) struct CallablePointFacts {
     pub(super) fallible_allocation_bindings: Option<HashMap<super::ReferenceBindingId, GuardedAllocationBinding>>,
     pub(super) fallible_aliases: HashMap<super::ReferenceBindingId, super::ReferenceBindingId>,
     pub(super) fallible_alias_accesses: Vec<(OccurrenceOrdinal, super::ReferenceBindingId)>,
-    pub(super) guarded_scalar_conditions: Vec<(super::CfgPointId, OccurrenceOrdinal)>,
     pub(super) guarded_allocation_scopes: [Option<GuardedAllocationScope>; 2],
-    pub(super) guarded_allocation_edges: Vec<(super::CfgPointId, GuardedAllocationEdge)>,
+    pub(super) guarded_allocation_edges: BTreeMap<super::CfgPointId, GuardedAllocationEdge>,
     pub(super) checked_binding_initializers: Vec<(super::CfgPointId, super::CfgPointId)>,
     pub(super) resolved_checked_call_outputs: Vec<super::CfgPointId>,
     pub(super) checked_named_scalar_stores: Vec<super::CfgPointId>,
@@ -84,6 +84,7 @@ impl CallablePointFacts {
     pub(super) fn record_guarded_allocation(
         &mut self,
         branch: super::CfgPointId,
+        condition: OccurrenceOrdinal,
         binding: super::ReferenceBindingId,
         [then, otherwise]: [super::CfgPointId; 2],
         present_on_then: bool,
@@ -92,13 +93,12 @@ impl CallablePointFacts {
             return;
         }
         let (present, absent) = if present_on_then { (then, otherwise) } else { (otherwise, then) };
-        if let Err(position) = self.guarded_allocation_edges.binary_search_by_key(&branch, |(point, _)| *point) {
-            self.guarded_allocation_edges.insert(position, (branch, GuardedAllocationEdge {
-                binding,
-                present,
-                absent,
-            }));
-        }
+        self.guarded_allocation_edges.entry(branch).or_insert(GuardedAllocationEdge {
+            condition,
+            binding,
+            present,
+            absent,
+        });
     }
 }
 

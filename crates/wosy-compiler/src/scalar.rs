@@ -740,7 +740,7 @@ impl ReferenceAnalysisErrorReason {
             Self::UnsupportedFallibleAllocationAccess => "fallible allocation access is not a supported whole Copy overwrite or direct guarded read",
             Self::UnsupportedFallibleWholeAggregateRead => "whole fallible struct read requires a proven Copy type",
             Self::NonLexicalFallibleStructInitializer => "fallible struct initializer requires a literal or a lexical binding of the field type",
-            Self::MissingGuardedAllocationProof => "fallible allocation requires one proven null guard for its local binding",
+            Self::MissingGuardedAllocationProof => "fallible allocation requires an exact proven null guard for its local binding",
             Self::MissingRequiredDereferenceOrigin => "missing required dereference origin",
             Self::UnprovedCheckedArrayIndex => "checked projected borrow requires a proved in-range index",
             Self::MoveFromArrayElement => "array elements cannot be moved individually",

@@ -342,18 +342,27 @@ fn prepared_direct_local_reborrow_owner_requires_the_exact_declared_scope() {
 pub(crate) struct GuardedScalarAllocation {
     binding: ReferenceBindingId,
     ty: ScalarType,
-    condition: usize,
-    branch: CfgPointId,
-    present_on_then: bool,
+    guards: Box<[GuardedScalarBranch]>,
     alias_accesses: Box<[usize]>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct GuardedScalarBranch {
+    pub(crate) condition: usize,
+    pub(crate) branch: CfgPointId,
+    pub(crate) present_on_then: bool,
 }
 
 impl GuardedScalarAllocation {
     pub(crate) fn binding(&self) -> &ReferenceBindingId { &self.binding }
     pub(crate) fn ty(&self) -> &ScalarType { &self.ty }
-    pub(crate) fn condition(&self) -> usize { self.condition }
-    pub(crate) fn branch(&self) -> CfgPointId { self.branch }
-    pub(crate) fn present_on_then(&self) -> bool { self.present_on_then }
+    #[cfg(test)]
+    pub(crate) fn condition(&self) -> usize { self.guards[0].condition }
+    #[cfg(test)]
+    pub(crate) fn branch(&self) -> CfgPointId { self.guards[0].branch }
+    #[cfg(test)]
+    pub(crate) fn present_on_then(&self) -> bool { self.guards[0].present_on_then }
+    pub(crate) fn guards(&self) -> &[GuardedScalarBranch] { &self.guards }
     pub(crate) fn alias_accesses(&self) -> &[usize] { &self.alias_accesses }
 }
 
@@ -1173,7 +1182,6 @@ impl<'a> ReferenceFlowBuilder<'a> {
         &self,
         condition: &ScalarExpression,
         ordinal: OccurrenceOrdinal,
-        scope: ReferenceScopeId,
     ) -> Result<Option<(ReferenceBindingId, bool)>, ReferenceAnalysisError> {
         let Some(fallible_bindings) = &self.proof_points.fallible_allocation_bindings else {
             return Ok(None);
@@ -1203,7 +1211,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 let alias = self.expression_ordinal(parent, address_edge);
                 if let Some(PlainNameIdentity::Lexical(alias)) = self.prepared_name_identity(alias, *span)? {
                     if let Some(owner) = self.proof_points.fallible_aliases.get(alias) {
-                        if fallible_bindings.get(owner).is_some_and(|site| site.scope == scope) {
+                        if fallible_bindings.contains_key(owner) {
                             return Ok(Some((owner.clone(), present_on_then)));
                         }
                     }
@@ -1217,7 +1225,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
             let address = self.expression_ordinal(parent, address_edge);
             let place = self.place_ordinal(OccurrenceParent::Expression(address), OccurrenceEdge::ExpressionPlace);
             if let Some(PreparedPlaceRoot::Lexical(binding)) = self.prepared_place_root(place, *place_span)? {
-                if fallible_bindings.get(binding).is_some_and(|site| site.scope == scope) {
+                if fallible_bindings.contains_key(binding) {
                     return Ok(Some((binding.clone(), present_on_then)));
                 }
             }
@@ -1249,7 +1257,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
             } => (*condition, *then_block, None),
         };
         let guarded = if observe_fallible {
-            self.guarded_fallible_binding(condition, condition_ordinal, scope)?
+            self.guarded_fallible_binding(condition, condition_ordinal)?
         } else {
             None
         };
@@ -1417,11 +1425,10 @@ impl<'a> ReferenceFlowBuilder<'a> {
         self.record_conditional_inputs(&edges, expression);
         if let Some((binding, present_on_then)) = guarded {
             if let Some([then, otherwise]) = edges.entries(&self.cfg.points) {
-                self.proof_points.record_guarded_allocation(branch, binding, [*then, *otherwise], present_on_then);
                 let condition = match region {
                     ConditionalRegion::Value { condition, .. } | ConditionalRegion::Unit { condition, .. } => *condition,
                 };
-                self.proof_points.guarded_scalar_conditions.push((branch, condition));
+                self.proof_points.record_guarded_allocation(branch, condition, binding, [*then, *otherwise], present_on_then);
             }
         }
         if let (Some((expression, writer_side, formal)), Some(condition), Some([then_entry, else_entry])) =
@@ -5468,11 +5475,11 @@ fn guarded_allocation_facts_seal_distinct_polarities_in_branch_order() {
     };
     let mut facts = CallablePointFacts::default();
     let [outer, inner] = [CfgPointId(1), CfgPointId(3)];
-    facts.record_guarded_allocation(inner, binding.clone(), [CfgPointId(4), CfgPointId(6)], false);
-    facts.record_guarded_allocation(outer, binding.clone(), [CfgPointId(2), CfgPointId(8)], true);
-    facts.record_guarded_allocation(inner, binding.clone(), [CfgPointId(4), CfgPointId(6)], true);
-    facts.record_guarded_allocation(CfgPointId(9), binding.clone(), [CfgPointId(10); 2], true);
-    let [(first, first_edges), (second, second_edges)] = facts.guarded_allocation_edges.as_slice() else {
+    facts.record_guarded_allocation(inner, OccurrenceOrdinal(0), binding.clone(), [CfgPointId(4), CfgPointId(6)], false);
+    facts.record_guarded_allocation(outer, OccurrenceOrdinal(0), binding.clone(), [CfgPointId(2), CfgPointId(8)], true);
+    facts.record_guarded_allocation(inner, OccurrenceOrdinal(0), binding.clone(), [CfgPointId(4), CfgPointId(6)], true);
+    facts.record_guarded_allocation(CfgPointId(9), OccurrenceOrdinal(0), binding.clone(), [CfgPointId(10); 2], true);
+    let [(first, first_edges), (second, second_edges)] = facts.guarded_allocation_edges.iter().collect::<Vec<_>>()[..] else {
         panic!("expected two distinct branch facts");
     };
     assert_eq!((*first, first_edges.present, first_edges.absent), (outer, CfgPointId(2), CfgPointId(8)));
@@ -5492,6 +5499,7 @@ fn guarded_allocation_availability_refines_only_the_exact_successor_binding() {
     let target = binding(10);
     let unrelated = binding(20);
     let edge = super::control::GuardedAllocationEdge {
+        condition: OccurrenceOrdinal(0),
         binding: target.clone(), present: CfgPointId(3), absent: CfgPointId(2),
     };
     let mut entry = ReferenceEdgeState::default();
@@ -7420,7 +7428,7 @@ struct ReferenceTransferCfg<'a> {
     checked_block_values: &'a [(CfgPointId, CfgPointId)],
     fallible_allocation_bindings: Option<&'a HashMap<ReferenceBindingId, super::control::GuardedAllocationBinding>>,
     fallible_aliases: Option<&'a HashMap<ReferenceBindingId, ReferenceBindingId>>,
-    guarded_allocation_edges: &'a [(CfgPointId, super::control::GuardedAllocationEdge)],
+    guarded_allocation_edges: Option<&'a BTreeMap<CfgPointId, super::control::GuardedAllocationEdge>>,
     checked_binding_initializers: &'a [(CfgPointId, CfgPointId)],
     resolved_checked_call_outputs: &'a [CfgPointId],
     checked_pointee_reads: &'a [CfgPointId],
@@ -7455,7 +7463,7 @@ impl<'a> ReferenceTransferCfg<'a> {
             checked_block_values: proof.map_or(&[], |proof| &proof.checked_block_values),
             fallible_allocation_bindings: proof.and_then(|proof| proof.fallible_allocation_bindings.as_ref()),
             fallible_aliases: proof.map(|proof| &proof.fallible_aliases).filter(|aliases| !aliases.is_empty()),
-            guarded_allocation_edges: proof.map_or(&[], |proof| &proof.guarded_allocation_edges),
+            guarded_allocation_edges: proof.map(|proof| &proof.guarded_allocation_edges),
             checked_binding_initializers: proof.map_or(&[], |proof| &proof.checked_binding_initializers),
             resolved_checked_call_outputs: proof.map_or(&[], |proof| &proof.resolved_checked_call_outputs),
             checked_pointee_reads: proof.map_or(&[], |proof| &proof.checked_pointee_reads),
@@ -8949,18 +8957,13 @@ fn transfer_reference_facts(
         };
         let common_aggregate_cutoff = aggregate_deadlines.as_ref()
             .and_then(|_| original_points[id.0].successors.iter().copied().min());
-        let guarded_allocation_edge = if cfg.guarded_allocation_edges.is_empty() {
-            None
-        } else {
-            cfg.guarded_allocation_edges.binary_search_by_key(&id, |(branch, _)| *branch)
-                .ok()
-                .map(|index| &cfg.guarded_allocation_edges[index].1)
-                .filter(|edge| matches!(original_points[id.0].kind, CfgPointKind::Branch { .. })
+        let guarded_allocation_edge = cfg.guarded_allocation_edges
+            .and_then(|edges| edges.get(&id))
+            .filter(|edge| matches!(original_points[id.0].kind, CfgPointKind::Branch { .. })
                     && edge.present != edge.absent
                     && matches!(original_points[id.0].successors.as_slice(), [first, second]
                         if (*first, *second) == (edge.present, edge.absent)
-                            || (*first, *second) == (edge.absent, edge.present)))
-        };
+                            || (*first, *second) == (edge.absent, edge.present)));
         let states = incoming.take(id);
         let incoming_count = states.as_slice().len();
         let mut local_access_conflicts = None;
@@ -15335,7 +15338,7 @@ fn derive_function_specialized_copy_policies<'a>(
                     checked_block_values: &template_result.proof_points.checked_block_values,
                     fallible_allocation_bindings: template_result.proof_points.fallible_allocation_bindings.as_ref(),
                     fallible_aliases: Some(&template_result.proof_points.fallible_aliases).filter(|aliases| !aliases.is_empty()),
-                    guarded_allocation_edges: &template_result.proof_points.guarded_allocation_edges,
+                    guarded_allocation_edges: Some(&template_result.proof_points.guarded_allocation_edges),
                     checked_binding_initializers: &template_result.proof_points.checked_binding_initializers,
                     resolved_checked_call_outputs: &template_result.proof_points.resolved_checked_call_outputs,
                     checked_pointee_reads: &template_result.proof_points.checked_pointee_reads,
@@ -15599,52 +15602,63 @@ fn seal_guarded_scalar_allocations(
     cfg: &ScalarReferenceCfg, points: &CallablePointFacts,
 ) -> Option<Box<[GuardedScalarAllocation]>> {
     let bindings = points.fallible_allocation_bindings.as_ref()?;
-    let edges = &points.guarded_allocation_edges;
-    let conditions = &points.guarded_scalar_conditions;
-    if edges.len() != bindings.len() || conditions.len() != bindings.len() {
+    if !(1..=2).contains(&bindings.len()) {
         return None;
     }
-    match edges.as_slice() {
-        [_] => {}
-        [(_, left), (_, right)] => {
-            let [Some(first), Some(second)] = points.guarded_allocation_scopes else { return None };
-            if first.exit >= second.entry
-                || !matches!(cfg.points[first.entry.0].kind, CfgPointKind::ScopeEnter)
-                || !matches!(cfg.points[first.exit.0].kind, CfgPointKind::ScopeExit)
-                || !matches!(cfg.points[second.entry.0].kind, CfgPointKind::ScopeEnter)
-                || !matches!(cfg.points[second.exit.0].kind, CfgPointKind::ScopeExit)
-            {
-                return None;
-            }
-            let left = bindings.get(&left.binding)?.scope;
-            let right = bindings.get(&right.binding)?.scope;
-            if left == right || ![first.scope, second.scope].contains(&left)
-                || ![first.scope, second.scope].contains(&right)
-            {
-                return None;
-            }
-        }
-        _ => return None,
-    }
-    edges.iter().map(|(branch, edge)| {
-        let condition = conditions.iter().find_map(|(point, condition)| (*point == *branch).then_some(*condition))?;
-        let site = bindings.get(&edge.binding)?;
+    // Lexical use identities and successor facts are prepared by the same walk.
+    // Keep conditions per owner, not owners per condition: the backing is immutable
+    // for the entire lexical lifetime, including nested observations.
+    let mut owners: Vec<(&ReferenceBindingId, Vec<GuardedScalarBranch>)> = Vec::new();
+    for (branch, edge) in &points.guarded_allocation_edges {
         let point = cfg.points.get(branch.0)?;
-        let then = point.successors.first()?;
-        if point.scope != site.scope || !matches!(point.kind, CfgPointKind::Branch { .. }) {
+        let [then, otherwise] = point.successors.as_slice() else { return None };
+        if !matches!(point.kind, CfgPointKind::Branch { .. })
+            || !((*then == edge.present && *otherwise == edge.absent)
+                || (*then == edge.absent && *otherwise == edge.present))
+        {
             return None;
         }
+        bindings.get(&edge.binding)?;
+        let index = match owners.iter().position(|(binding, _)| *binding == &edge.binding) {
+            Some(index) => index,
+            None => {
+                owners.push((&edge.binding, Vec::new()));
+                owners.len() - 1
+            }
+        };
+        owners[index].1.push(GuardedScalarBranch {
+            condition: edge.condition.0, branch: *branch, present_on_then: *then == edge.present,
+        });
+    }
+    if owners.len() != bindings.len() {
+        return None;
+    }
+    if let [(left, _), (right, _)] = owners.as_slice() {
+        let [Some(first), Some(second)] = points.guarded_allocation_scopes else { return None };
+        if first.exit >= second.entry
+            || !matches!(cfg.points[first.entry.0].kind, CfgPointKind::ScopeEnter)
+            || !matches!(cfg.points[first.exit.0].kind, CfgPointKind::ScopeExit)
+            || !matches!(cfg.points[second.entry.0].kind, CfgPointKind::ScopeEnter)
+            || !matches!(cfg.points[second.exit.0].kind, CfgPointKind::ScopeExit)
+            || bindings.get(*left)?.scope != first.scope
+            || bindings.get(*right)?.scope != second.scope
+        {
+            return None;
+        }
+    }
+    owners.into_iter().map(|(binding, mut guards)| {
+        guards.sort_unstable_by_key(|guard| guard.condition);
+        if guards.windows(2).any(|pair| pair[0].condition == pair[1].condition) {
+            return None;
+        }
+        let mut accesses = points.fallible_alias_accesses.iter()
+            .filter_map(|(ordinal, owner)| (owner == binding).then_some(ordinal.0))
+            .collect::<Vec<_>>();
+        accesses.sort_unstable();
+        accesses.dedup();
         Some(GuardedScalarAllocation {
-            binding: edge.binding.clone(), ty: site.ty.clone(), condition: condition.0,
-            branch: *branch, present_on_then: *then == edge.present,
-            alias_accesses: {
-                let mut accesses = points.fallible_alias_accesses.iter()
-                    .filter_map(|(ordinal, owner)| (owner == &edge.binding).then_some(ordinal.0))
-                    .collect::<Vec<_>>();
-                accesses.sort_unstable();
-                accesses.dedup();
-                accesses.into_boxed_slice()
-            },
+            binding: binding.clone(), ty: bindings.get(binding)?.ty.clone(),
+            guards: guards.into_boxed_slice(), alias_accesses: accesses.into_boxed_slice(),
         })
     }).collect()
 }

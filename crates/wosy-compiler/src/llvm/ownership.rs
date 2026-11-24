@@ -1157,8 +1157,7 @@ pub(super) struct GuardedScalarSite {
     declaration: ByteSpan,
     scope: ByteSpan,
     ty: ScalarType,
-    condition: usize,
-    present_on_then: bool,
+    guards: Box<[(usize, bool)]>,
     alias_accesses: Box<[usize]>,
 }
 
@@ -1169,16 +1168,11 @@ impl GuardedScalarSite {
             return None;
         }
         proofs.iter().map(|proof| {
-            let point = cfg.points.get(proof.branch().0)?;
-            if !matches!(point.kind, crate::scalar::CfgPointKind::Branch { .. }) {
-                return None;
-            }
             Some(Self {
                 declaration: proof.binding().declaration_span,
                 scope: proof.binding().block_span,
                 ty: proof.ty().clone(),
-                condition: proof.condition(),
-                present_on_then: proof.present_on_then(),
+                guards: proof.guards().iter().map(|guard| (guard.condition, guard.present_on_then)).collect(),
                 alias_accesses: proof.alias_accesses().into(),
             })
         }).collect()
@@ -1256,13 +1250,16 @@ pub(super) fn guarded_scalar_condition<'ctx>(
     expression: &ScalarExpression,
 ) -> Result<Option<EmitValue<'ctx>>, String> {
     let Some(sites) = &state.guarded_scalar else { return Ok(None) };
-    let condition = state.body_call_nodes.and_then(|nodes| nodes.expression_ordinal(expression));
-    let Some((index, site)) = sites.iter().enumerate().find(|(_, site)| condition == Some(site.condition))
+    let Some(condition) = state.body_call_nodes.and_then(|nodes| nodes.expression_ordinal(expression))
         else { return Ok(None) };
+    let Some((index, present_on_then)) = sites.iter().enumerate().find_map(|(index, site)| {
+        let position = site.guards.binary_search_by_key(&condition, |&(ordinal, _)| ordinal).ok()?;
+        Some((index, site.guards[position].1))
+    }) else { return Ok(None) };
     let owner = state.guarded_scalar_owner.as_ref()
         .filter(|owner| owner.site == index)
         .ok_or_else(|| "guarded scalar condition precedes its allocation".to_owned())?;
-    let condition = if site.present_on_then {
+    let condition = if present_on_then {
         owner.present
     } else {
         state.builder.build_not(owner.present, "fallible.absent").map_err(builder_error)?

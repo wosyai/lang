@@ -421,7 +421,7 @@ fn prepared_fallible_guard_producer_uses_resolved_binding_and_null_polarity() {
         );
         assert!(errors.is_empty(), "{errors:?}");
         let [(0, result)] = results.as_slice() else { panic!("example reference result") };
-        let [(branch, edge)] = result.proof_points.guarded_allocation_edges.as_slice() else {
+        let [(branch, edge)] = result.proof_points.guarded_allocation_edges.iter().collect::<Vec<_>>()[..] else {
             panic!("one typed guard");
         };
         let [then, otherwise] = result.cfg.points[branch.0].successors.as_slice() else {
