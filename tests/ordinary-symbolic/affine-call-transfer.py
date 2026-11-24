@@ -1595,6 +1595,19 @@ cases.extend([
     ("ordinary-named-relational-affine-overflow",reflected_named_calling_producer.replace("-1 - n","1 - n"),2,b"unsupported analysis"),
 ])
 
+authored_named_calling_producer = """%%start
+    i8(i8) leaf = fn(n) { if (n < 0) { -3 } else { 7 } };
+    i8(i8) producer = fn(n) { i8 observed = leaf(n); observed };
+    proof bounded for producer(entry) -> (out) ensures (out == 7) { core.show(out < 7); }
+%%end"""
+cases.extend([
+    ("ordinary-authored-named-calling-step-refuted",authored_named_calling_producer,1,b"proof obligation failed"),
+    ("ordinary-authored-named-calling-goal-refuted",authored_named_calling_producer.replace("out < 7","out <= 7"),
+        1,b"proof obligation failed"),
+    ("ordinary-authored-named-calling-proved",authored_named_calling_producer.replace("out == 7","out <= 7")
+        .replace("out < 7","out <= 7"),0,b""),
+])
+
 batched_named_calling_producer = """%%start
     i8(i8) leaf = fn(n) { if (n < 0) { -3 } else { 7 } };
     i8(i8) producer = fn(n) { i8 produced = leaf(n); produced };
@@ -1631,6 +1644,8 @@ cases.extend([
         b"proof obligation failed"),
 ])
 proof_diagnostic_notes = {
+    "ordinary-authored-named-calling-step-refuted": b"symbolic call can return 7",
+    "ordinary-authored-named-calling-goal-refuted": b"symbolic call can return -3",
     "ordinary-named-relational-entry-equality-affine-refuted": b"symbolic call can return 127",
     "ordinary-named-relational-alias-refuted": b"symbolic call can return 0",
     "ordinary-named-relational-affine-refuted": b"symbolic call can return 127",

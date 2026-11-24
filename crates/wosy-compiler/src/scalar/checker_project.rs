@@ -3840,22 +3840,41 @@ impl SelectedSymbolicProof<'_, '_> {
         let group = if watched.first.0 == target { &watched.first.1 } else {
             watched.other.get(&target).ok_or(ProjectCheck::Unsupported)?
         };
-        let MainFlowProofCases::Bare { first, rest } = &group.cases else { return Err(ProjectCheck::Unsupported); };
+        let (bare, authored) = match &group.cases {
+            MainFlowProofCases::Bare { first, rest } => (Some((first, rest.as_slice())), &[][..]),
+            MainFlowProofCases::Authored(cases) => (None, cases.as_slice()),
+        };
+        let authored_mode = !authored.is_empty();
         let [parameter] = body.boundary.parameters.as_slice() else { return Err(ProjectCheck::Unsupported); };
         let [output] = body.boundary.results.as_slice() else { return Err(ProjectCheck::Unsupported); };
         use super::checker_flow::PartitionedProofGoal;
         let issuer = group.issuer.as_ref().filter(|issuer| std::ptr::eq(issuer.body, body));
-        let batched = !rest.is_empty();
+        let batched = bare.map_or(authored.len() > 1, |(_, rest)| !rest.is_empty());
+        let metered = batched || authored_mode;
         let mut proof_work = 0;
-        if batched {
-            super::checker_flow::charge_call_work(&mut proof_work,
-                rest.len().checked_add(1).ok_or(ProjectCheck::Unsupported)?).ok_or(ProjectCheck::Unsupported)?;
+        if metered {
+            let count = bare.map_or(Some(authored.len()), |(_, rest)| rest.len().checked_add(1))
+                .ok_or(ProjectCheck::Unsupported)?;
+            // An authored case has at most one flat step plus its goal.
+            let count = count.checked_mul(if authored_mode { 2 } else { 1 }).ok_or(ProjectCheck::Unsupported)?;
+            super::checker_flow::charge_call_work(&mut proof_work, count).ok_or(ProjectCheck::Unsupported)?;
         }
         if !supported_calling_proof_body(body, &output.ty) { return Err(ProjectCheck::Unsupported); }
         let domain = IntegerSet::from_type(&parameter.ty).ok_or(ProjectCheck::Unsupported)?;
-        let cases = std::iter::once(first).chain(rest);
+        let cases = bare.into_iter().flat_map(|(first, rest)| std::iter::once(first).chain(rest))
+            .map(|case| (case, None)).chain(authored.iter().map(|(case, step)| (case, step.as_ref())));
         let mut plans = Vec::new();
-        for case in cases {
+        for (case, step) in cases {
+            let step = match step {
+                None => None,
+                Some(MainFlowAuthoredShows::Single(step)) =>
+                    Some((step.span, PartitionedProofGoal::Literal(step.relation, step.bound.as_ref()))),
+                Some(MainFlowAuthoredShows::Entry { span, slot: 0, relation })
+                    if parameter.ty == output.ty
+                        && Some(*relation) == IntegerRelation::from_operator(&BinaryOperator::Equal) =>
+                    Some((*span, PartitionedProofGoal::EntryEquality)),
+                Some(_) => return Err(ProjectCheck::Unsupported),
+            };
             let goal = match case.bound {
                 MainFlowProofBound::Literal(bound) => PartitionedProofGoal::Literal(case.relation, bound),
                 MainFlowProofBound::Entry(0) if !batched && parameter.ty == output.ty
@@ -3864,7 +3883,7 @@ impl SelectedSymbolicProof<'_, '_> {
                 _ => return Err(ProjectCheck::Unsupported),
             };
             if case.proof_source != source || case.guard.domain.is_some()
-                || (!batched && case.bound.literal().is_some() && issuer.is_none() && !case.guard.always_rejects)
+                || (!metered && case.bound.literal().is_some() && issuer.is_none() && !case.guard.always_rejects)
                 || case.guard.comparisons.len() > 1
             {
                 return Err(ProjectCheck::Unsupported);
@@ -3875,7 +3894,7 @@ impl SelectedSymbolicProof<'_, '_> {
                     [comparison] if comparison.slot == 0 => domain.keep_relation(comparison.relation, comparison.bound),
                     _ => return Err(ProjectCheck::Unsupported),
                 };
-                plans.push((case, goal, applicable));
+                plans.push((case, step, goal, applicable));
             }
         }
         let mut cursor = ExactCallCursor::projected(body, Rc::new(domain), &output.ty).ok_or(ProjectCheck::Unsupported)?;
@@ -3894,16 +3913,29 @@ impl SelectedSymbolicProof<'_, '_> {
             let result = evaluator.run_call_cursor(body, source, cursor, None, Some(collection))?;
             (result, evaluator.had_obligations)
         };
-        let elidable = !batched && !plans.is_empty() && first.bound.literal().is_some()
+        let elidable = !metered && !plans.is_empty()
+            && bare.is_some_and(|(first, _)| first.bound.literal().is_some())
             && effects.records.len() == first_directive
             && summary_elision_safe(body)
             && evaluator.reached.iter().all(|&(module, item)| {
                 runtime.calls.function_body(module, item, None).is_some_and(summary_elision_safe)
             });
         let mut applicable = active;
-        for (case, goal, proof_domain) in plans {
+        for (case, step, goal, proof_domain) in plans {
+            if let Some((span, step)) = step {
+                let verified = super::checker_flow::verify_partitioned_call_return(
+                    body, &result, &proof_domain, false, step, Some(&mut proof_work),
+                ).ok_or(ProjectCheck::Unsupported)?;
+                applicable |= verified.applicable;
+                if let Some(failure) = verified.failure {
+                    self.record(case, function, source, effects.records.len(), failure, Some(span))?;
+                    continue;
+                }
+                // The conclusion sees the original partitions, not a
+                // derivation narrowed by an authored assertion.
+            }
             let verified = super::checker_flow::verify_partitioned_call_return(
-                body, &result, &proof_domain, elidable, goal, batched.then_some(&mut proof_work),
+                body, &result, &proof_domain, elidable, goal, metered.then_some(&mut proof_work),
             ).ok_or(ProjectCheck::Unsupported)?;
             applicable |= verified.applicable;
             if let Some(failure) = verified.failure {
@@ -12806,6 +12838,42 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
         assert!(run(&clean).unwrap().symbolic_diagnostic.is_none());
         let cyclic = text.replace("middle(n); produced", "producer(n); produced");
         assert!(matches!(run(&cyclic), Err(ProjectCheck::Unsupported)));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordered_named_calling_producer_checks_authored_step_before_goal_on_all_returns() {
+        let app = source("src/main.w", "authored-named-calling-producer");
+        let text = format!(r#"%%start
+            unit() checked_step = fn {{ core.require(false, {OUTPUT}); }};
+            i8(i8) leaf = fn(n) {{ if (n < 0) {{ -3 }} else {{ 7 }} }};
+            i8(i8) producer = fn(n) {{ checked_step(); i8 observed = leaf(n); observed }};
+            proof bounded for producer(entry) -> (out) ensures (out == 7) {{ core.show(out < 7); }}
+        %%end"#);
+        let run = |text: &str| {
+            let (_, proof) = crate::parse_proof_source(app.clone(), text.to_owned(), &[]).ok().unwrap();
+            check_loaded_ordered_proof_diagnostics(
+                Vec::new(), vec![(proof, Vec::new())], vec![app.clone()], inputs(), ScalarCheckerScope::CurrentPackage,
+            ).unwrap()
+        };
+        let passing_step = text.replace("core.show(out < 7)", "core.show(out <= 7)");
+        let report = run(&passing_step);
+        let goal = report.symbolic_diagnostic.unwrap();
+        assert!(goal.failed_step.is_none());
+        assert_eq!(goal.returned, BigInt::from(-3));
+        assert!(goal.witness.intervals_at(0, 0).unwrap().eq([(&BigInt::from(-128), &BigInt::from(-1))]));
+        let report = run(&text);
+        let step = report.symbolic_diagnostic.unwrap();
+        assert!(step.failed_step.is_some());
+        assert_eq!(step.returned, BigInt::from(7));
+        assert!(step.witness.intervals_at(0, 0).unwrap().eq([(&BigInt::from(0), &BigInt::from(127))]));
+        assert_eq!(goal.directive_position, step.directive_position);
+        assert!(step.directive_position > 0);
+        assert!(report.additional_symbolic_diagnostics.is_empty());
+
+        let entry_step = text.replace("if (n < 0) { -3 } else { 7 }", "n")
+            .replace("out == 7", "out <= 127").replace("out < 7", "out == core.old(entry)");
+        assert!(run(&entry_step).symbolic_diagnostic.is_none());
     }
 
     #[cfg(feature = "internal-checker")]
