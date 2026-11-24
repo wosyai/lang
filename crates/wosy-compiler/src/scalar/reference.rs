@@ -7516,9 +7516,9 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
             #[cfg(feature = "internal-checker")]
             if let WalkMode::Callable(callable) = &self.mode {
                 use super::checker_directive::{CheckerCode, CheckerStateSelection, CheckerStateType};
-                if let CheckerCode::Lexical(name, ty) = &output.code_value {
+                if let CheckerCode::Lexical(name, ty, transform) = &output.code_value {
                     if let Some(PlainNameIdentity::Lexical(binding)) = callable.target_resolver.plain_name(name, names) {
-                        output.code_value = CheckerCode::Binding(std::rc::Rc::new(binding), ty.clone());
+                        output.code_value = CheckerCode::Binding(std::rc::Rc::new(binding), ty.clone(), *transform);
                     }
                 }
                 for file in output.state_files.iter_mut() {
@@ -7549,9 +7549,9 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
                     InitializationStorage::Module(span) => Some(span),
                     _ => None,
                 };
-                if let CheckerCode::Lexical(name, ty) = &output.code_value {
+                if let CheckerCode::Lexical(name, ty, transform) = &output.code_value {
                     if let Some(span) = resolve(name) {
-                        output.code_value = CheckerCode::Module(span, ty.clone());
+                        output.code_value = CheckerCode::Module(span, ty.clone(), *transform);
                         output.has_module_values = true;
                     }
                 }

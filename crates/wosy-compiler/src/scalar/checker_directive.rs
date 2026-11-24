@@ -71,14 +71,51 @@ pub(super) struct CheckedLiteralOutput {
     pub(super) has_module_values: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(super) enum CheckerScalarTransform {
+    Identity,
+    #[cfg(feature = "internal-checker")]
+    LogicalNot,
+    #[cfg(feature = "internal-checker")]
+    Negate,
+}
+
+impl CheckerScalarTransform {
+    fn select(expression: &ScalarExpression) -> (&ScalarExpression, Self) {
+        #[cfg(feature = "internal-checker")]
+        if let ScalarExpression::Unary { operator, operand, .. } = expression {
+            if matches!(operand.as_ref(), ScalarExpression::Name { .. } | ScalarExpression::Contextual { .. }) {
+                let transform = match operator {
+                    super::UnaryOperator::LogicalNot => Self::LogicalNot,
+                    super::UnaryOperator::Negate => Self::Negate,
+                    _ => return (expression, Self::Identity),
+                };
+                return (operand, transform);
+            }
+        }
+        (expression, Self::Identity)
+    }
+
+    fn accepts(self, #[cfg_attr(not(feature = "internal-checker"), allow(unused_variables))] ty: &CheckerStateType) -> bool {
+        match self {
+            Self::Identity => true,
+            #[cfg(feature = "internal-checker")]
+            Self::LogicalNot => matches!(ty, CheckerStateType::Scalar(ScalarType::Bool)),
+            #[cfg(feature = "internal-checker")]
+            Self::Negate => matches!(ty, CheckerStateType::Scalar(
+                ScalarType::I8 | ScalarType::I16 | ScalarType::I32 | ScalarType::I64 | ScalarType::I128)),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum CheckerCode {
     Literal(BigInt),
-    Lexical(std::rc::Rc<str>, ScalarType),
+    Lexical(std::rc::Rc<str>, ScalarType, CheckerScalarTransform),
     #[cfg(feature = "internal-checker")]
-    Binding(std::rc::Rc<ReferenceBindingId>, ScalarType),
+    Binding(std::rc::Rc<ReferenceBindingId>, ScalarType, CheckerScalarTransform),
     #[cfg(feature = "internal-checker")]
-    Module(ByteSpan, ScalarType),
+    Module(ByteSpan, ScalarType, CheckerScalarTransform),
 }
 
 impl CheckerCode {
@@ -151,6 +188,7 @@ pub(super) struct CheckerStateFile {
     pub(super) path_span: ByteSpan,
     pub(super) state_span: ByteSpan,
     pub(super) selection: CheckerStateSelection,
+    pub(super) transform: CheckerScalarTransform,
     pub(super) ty: CheckerStateType,
 }
 
@@ -307,13 +345,15 @@ impl CheckerOutput<'_> {
         let code = self.code?;
         let code_value = match code {
             ScalarExpression::Integer { value, .. } => CheckerCode::Literal(value.clone()),
-            ScalarExpression::Name { .. } => {
-                let (CheckerStateSelection::Lexical(name), CheckerStateType::Scalar(ty)) = select(code)?
+            _ => {
+                let (operand, transform) = CheckerScalarTransform::select(code);
+                let (selection, state_ty) = select(operand)?;
+                if !transform.accepts(&state_ty) { return None; }
+                let (CheckerStateSelection::Lexical(name), CheckerStateType::Scalar(ty)) = (selection, state_ty)
                     else { return None; };
                 if !super::typecheck::is_integer_type(&ty) { return None; }
-                CheckerCode::Lexical(name, ty)
+                CheckerCode::Lexical(name, ty, transform)
             }
-            _ => return None,
         };
         let mut targets = CheckedOutputTargets::default();
         let mut text_files = Vec::new();
@@ -330,10 +370,12 @@ impl CheckerOutput<'_> {
                     });
                 }
                 CheckerFileContent::State(expression) => {
-                    let (selection, ty) = select(expression)?;
+                    let (operand, transform) = CheckerScalarTransform::select(expression);
+                    let (selection, ty) = select(operand)?;
+                    if !transform.accepts(&ty) { return None; }
                     state_files.push(CheckerStateFile {
                         position, path: path.into(), path_span: *path_span,
-                        state_span: expression_span(expression), selection, ty,
+                        state_span: expression_span(expression), selection, transform, ty,
                     });
                 }
                 _ => return None,

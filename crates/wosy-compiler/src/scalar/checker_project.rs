@@ -2821,32 +2821,61 @@ fn render_authored_output(
     prepared: &CheckedLiteralOutput, witness: &ScalarCheckerIntegerWitness,
     startup: Option<&HashMap<ByteSpan, InitializerValue<'_>>>, work: &mut usize,
 ) -> Option<CheckedLiteralOutput> {
-    use super::{checker_directive::{CheckerStateSelection, CheckerStateType, ScalarCheckerTextFile}, checker_flow::charge_call_work};
-    let scalar = |origin, ty, work: &mut usize| match origin {
-        AuthoredScalarOrigin::Binding(binding) => project_authored_scalar(witness, binding, ty, work),
-        AuthoredScalarOrigin::Module(span) => {
-            charge_call_work(work, 1)?;
-            let value = match startup?.get(&span)? {
-                InitializerValue::Boolean(value) if *ty == ScalarType::Bool => {
-                    return Some(Rc::new(IntegerSet::singleton(&BigInt::from(u8::from(*value)))));
-                }
-                InitializerValue::Integer { ty: actual, value } if *actual == ty => value,
-                _ => return None,
-            };
-            Some(Rc::new(IntegerSet::singleton(value)))
-        }
+    use super::{checker_directive::{CheckerScalarTransform, CheckerStateSelection, CheckerStateType, ScalarCheckerTextFile}, checker_flow::charge_call_work};
+    let mut raw = HashMap::new();
+    let mut scalar = |origin, ty, transform, work: &mut usize| {
+        let (known_ty, values) = match raw.entry(origin) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let values = match origin {
+                    AuthoredScalarOrigin::Binding(binding) => project_authored_scalar(witness, binding, ty, work)?,
+                    AuthoredScalarOrigin::Module(span) => {
+                        charge_call_work(work, 1)?;
+                        let values = match startup?.get(&span)? {
+                            InitializerValue::Boolean(value) if *ty == ScalarType::Bool =>
+                                IntegerSet::singleton(&BigInt::from(u8::from(*value))),
+                            InitializerValue::Integer { ty: actual, value } if *actual == ty =>
+                                IntegerSet::singleton(value),
+                            _ => return None,
+                        };
+                        Rc::new(values)
+                    }
+                };
+                entry.insert((ty, values))
+            }
+        };
+        if *known_ty != ty { return None; }
+        if transform == CheckerScalarTransform::Identity { return Some(Rc::clone(values)); }
+        // Both admitted unary operators are order-reversing unit affine
+        // transformations. Check representability before allocating a result.
+        let (lower, upper) = values.extremes()?;
+        let offset = match transform {
+            CheckerScalarTransform::LogicalNot if *ty == ScalarType::Bool => {
+                let one = BigInt::from(1u8);
+                if lower < &BigInt::ZERO || upper > &one { return None; }
+                one
+            }
+            CheckerScalarTransform::Negate => {
+                let (minimum, maximum) = integer_bounds(ty)?;
+                if -upper < minimum || -lower > maximum { return None; }
+                BigInt::ZERO
+            }
+            _ => return None,
+        };
+        charge_call_work(work, values.interval_count().checked_add(1)?)?;
+        Some(Rc::new(values.affine_unit(true, &offset, false)))
     };
     let selected_code = match &prepared.code_value {
         CheckerCode::Literal(_) => None,
-        CheckerCode::Binding(binding, ty) => Some((AuthoredScalarOrigin::Binding(binding.as_ref()), ty)),
-        CheckerCode::Module(span, ty) => Some((AuthoredScalarOrigin::Module(*span), ty)),
+        CheckerCode::Binding(binding, ty, transform) => Some((AuthoredScalarOrigin::Binding(binding.as_ref()), ty, *transform)),
+        CheckerCode::Module(span, ty, transform) => Some((AuthoredScalarOrigin::Module(*span), ty, *transform)),
         CheckerCode::Lexical(..) => return None,
     };
     let projected_code = match selected_code {
-        Some((origin, ty)) => {
-            let values = scalar(origin, ty, work)?;
+        Some((origin, ty, transform)) => {
+            let values = scalar(origin, ty, transform, work)?;
             values.singleton_value()?;
-            Some((origin, ty, values))
+            Some((origin, ty, transform, values))
         }
         None => None,
     };
@@ -2889,13 +2918,13 @@ fn render_authored_output(
                         CheckerStateSelection::Module(span) => AuthoredScalarOrigin::Module(*span),
                         _ => return None,
                     };
-                    let (ty, bytes) = match encoded.entry(origin) {
+                    let (ty, bytes) = match encoded.entry((origin, file.transform)) {
                         std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
                         std::collections::hash_map::Entry::Vacant(entry) => {
                             let values = match &projected_code {
-                                Some((code_origin, code_ty, values)) if *code_origin == origin && *code_ty == file_ty =>
-                                    Rc::clone(values),
-                                _ => scalar(origin, file_ty, work)?,
+                                Some((code_origin, code_ty, transform, values)) if *code_origin == origin
+                                    && *code_ty == file_ty && *transform == file.transform => Rc::clone(values),
+                                _ => scalar(origin, file_ty, file.transform, work)?,
                             };
                             let json = serialize_scalar_analysis_state(file_ty, &values)?;
                             entry.insert((file_ty, json.into_bytes().into_boxed_slice()))
@@ -2916,7 +2945,7 @@ fn render_authored_output(
         }
     }
     let code_value = match projected_code {
-        Some((_, _, values)) => CheckerCode::Literal(values.singleton_value()?.clone()),
+        Some((_, _, _, values)) => CheckerCode::Literal(values.singleton_value()?.clone()),
         None => prepared.code_value.clone(),
     };
     Some(CheckedLiteralOutput {
@@ -10160,6 +10189,56 @@ mod tests {
             assert_eq!(body.structure.checker_integer_locals.contains_key(&key), allowed);
             assert_eq!(body.structure.checker_contextual_read_locals.contains_key(&key), !allowed);
             assert_eq!(root_local_import_requirement(body).map(|(position, _)| position), allowed.then_some(2));
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn authored_unary_output_transforms_only_the_failing_witness() {
+        let app = source("src/main.w", "authored-unary-output");
+        let lexical = r#"%%start
+            unit(i8) observe = fn(value) {
+                core.narrow(value == -7 || value == 2, { .stdout = ""; .stderr = ""; .code = 1; .files = []; });
+                core.require(false, { .stdout = ""; .stderr = ""; .code = 71;
+                    .files = [{ .path = "before.json"; .state = value; },
+                              { .path = "reflected.json"; .state = -value; }]; });
+            };
+        %%end"#;
+        let run = |text: &str, scope| {
+            let prepared = prepare_proof_target(&app, text).unwrap();
+            run_closed_without_named_proofs(&prepared, scope, 1)
+        };
+        let receipt = run(lexical, ScalarCheckerScope::CurrentPackage).unwrap();
+        let [failure] = receipt.directives.as_slice() else { panic!("one lexical receipt"); };
+        assert_eq!(failure.witness.axes().len(), 1);
+        assert_eq!(failure.files()[0].text.as_ref(),
+            b"{\"type\":{\"kind\":\"i8\"},\"value\":{\"kind\":\"alternatives\",\"values\":[-7,2]}}\n");
+        assert_eq!(failure.files()[1].text.as_ref(),
+            b"{\"type\":{\"kind\":\"i8\"},\"value\":{\"kind\":\"alternatives\",\"values\":[-2,7]}}\n");
+        let code = lexical.replace("require(false,", "require(value != -7,").replace(".code = 71", ".code = -value");
+        let receipt = run(&code, ScalarCheckerScope::CurrentPackage).unwrap();
+        assert_eq!(receipt.directives[0].code(), &BigInt::from(7));
+        for unsupported in [
+            lexical.replace(".code = 71", ".code = -value"),
+            lexical.replace("value == -7", "value == -128"),
+        ] {
+            assert!(matches!(run(&unsupported, ScalarCheckerScope::CurrentPackage), Err(ProjectCheck::Unsupported)));
+        }
+
+        let startup = r#"%%start
+            i8 status = -37;
+            bool ready = true;
+            core.narrow(false, { .stdout = ""; .stderr = ""; .code = -status;
+                .files = [{ .path = "code.json"; .state = -status; },
+                          { .path = "inverted.json"; .state = !ready; }]; });
+        %%end"#;
+        for scope in [ScalarCheckerScope::MainFlowOnly, ScalarCheckerScope::CurrentPackage] {
+            let receipt = run(startup, scope).unwrap();
+            let [failure] = receipt.directives.as_slice() else { panic!("one startup receipt"); };
+            assert_eq!(failure.code(), &BigInt::from(37));
+            assert_eq!(failure.witness.axes().len(), 0);
+            assert_eq!(failure.files()[0].text.as_ref(), b"{\"type\":{\"kind\":\"i8\"},\"value\":37}\n");
+            assert_eq!(failure.files()[1].text.as_ref(), b"{\"type\":{\"kind\":\"bool\"},\"value\":false}\n");
         }
     }
 

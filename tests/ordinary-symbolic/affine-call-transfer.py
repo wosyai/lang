@@ -1461,6 +1461,29 @@ state_holes = f"""%%start
         core.require(false, {state_report(168,"ALTERNATIVES","value")});
     }};
     %%end"""
+authored_unary = f"""%%start
+    unit(i8) observe = fn(value) {{
+        core.narrow(value == -7 || value == 2, {report(1,"UNREACHED-CUT")});
+        core.require(false, {{ .stdout = ""; .stderr = "UNARY"; .code = 71;
+            .files = [{{ .path = "before.json"; .state = value; }},
+                      {{ .path = "reflected.json"; .state = -value; }}]; }});
+    }};
+    %%end"""
+startup_unary = """%%start
+    i8 status = -37;
+    bool ready = true;
+    core.narrow(false, { .stdout = ""; .stderr = "UNARY-STARTUP"; .code = -status;
+        .files = [{ .path = "code.json"; .state = -status; },
+                  { .path = "inverted.json"; .state = !ready; }]; });
+    %%end"""
+cases.extend([
+    ("authored-unary-state-preserves-holes",authored_unary,71,b"UNARY"),
+    ("authored-unary-code-is-failure-singleton",
+     authored_unary.replace("require(false,","require(value != -7,").replace(".code = 71",".code = -value"),7,b"UNARY"),
+    ("authored-unary-code-refuses-non-singleton",authored_unary.replace(".code = 71",".code = -value"),2,b"unsupported analysis"),
+    ("authored-unary-state-refuses-overflow",authored_unary.replace("value == -7","value == -128"),2,b"unsupported analysis"),
+    ("exact-startup-authored-unary-state-and-code",startup_unary,37,b"UNARY-STARTUP"),
+])
 module_authored_output = f"""%%start
     i8(i8) identity = fn(value) {{ value }};
     bool(bool) truth = fn(value) {{ value }};
@@ -1742,6 +1765,18 @@ nested_array_bytes = state_bytes({
     },
 })
 authored_files = {
+    "authored-unary-state-preserves-holes": {
+        "before.json": b'{"type":{"kind":"i8"},"value":{"kind":"alternatives","values":[-7,2]}}\n',
+        "reflected.json": b'{"type":{"kind":"i8"},"value":{"kind":"alternatives","values":[-2,7]}}\n',
+    },
+    "authored-unary-code-is-failure-singleton": {
+        "before.json": b'{"type":{"kind":"i8"},"value":-7}\n',
+        "reflected.json": b'{"type":{"kind":"i8"},"value":7}\n',
+    },
+    "exact-startup-authored-unary-state-and-code": {
+        "code.json": b'{"type":{"kind":"i8"},"value":37}\n',
+        "inverted.json": b'{"type":{"kind":"bool"},"value":false}\n',
+    },
     namespace_bool_key: {
         "chosen.json": b'{"type":{"kind":"bool"},"value":true}\n',
         "rejected.json": b'{"type":{"kind":"bool"},"value":false}\n',
