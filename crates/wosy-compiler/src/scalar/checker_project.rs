@@ -573,6 +573,15 @@ struct ContextualProofOccurrence {
     call: ByteSpan,
     entry: BigInt,
     exit: BigInt,
+    reused: bool,
+}
+
+#[cfg(feature = "internal-checker")]
+struct VerifiedContextualOutcome {
+    exact_binding: ReferenceBindingId,
+    leaf_call: ByteSpan,
+    entry: BigInt,
+    exit: BigInt,
 }
 
 #[cfg(feature = "internal-checker")]
@@ -585,29 +594,62 @@ struct ReachedContextualProof {
     amount: BigInt,
     observations: Vec<ContextualProofOccurrence>,
     refutation: Option<ContextualProofOccurrence>,
+    reusable_body: Option<*const FunctionCallSites>,
+    verified: Option<VerifiedContextualOutcome>,
 }
 
 #[cfg(feature = "internal-checker")]
 impl ReachedContextualProof {
+    fn reusable_exit(
+        &self, target: PreparedCallable, body: &FunctionCallSites, binding: &ReferenceBindingId,
+        ty: &ScalarType, leaf_call: ByteSpan, entry: &BigInt,
+    ) -> Option<&BigInt> {
+        let receipt = self.verified.as_ref()?;
+        if self.refutation.is_some() || self.reusable_body != Some(std::ptr::from_ref(body))
+            || self.target != target || body.contextual_formal() != Some((&self.formal, &self.ty))
+            || &self.ty != ty || &receipt.exact_binding != binding || receipt.leaf_call != leaf_call
+            || &receipt.entry != entry
+        {
+            return None;
+        }
+        Some(&receipt.exit)
+    }
+
     fn observe(
-        &mut self, (formal, formal_type): (&ReferenceBindingId, &ScalarType),
+        &mut self, body: &FunctionCallSites, (formal, formal_type): (&ReferenceBindingId, &ScalarType),
         binding: &ReferenceBindingId, ty: &ScalarType, supplying_call: ByteSpan, call: ByteSpan,
-        entry: &BigInt, exit: &BigInt,
+        entry: &BigInt, exit: &BigInt, reused: bool,
     ) -> Result<(), ProjectCheck> {
         if formal != &self.formal || formal_type != &self.ty || ty != &self.ty
             || !matches!(binding.kind, super::ReferenceBindingKind::Declared) || binding.source != formal.source
         {
             return Err(ProjectCheck::Unsupported);
         }
-        let expected = if self.add { entry + &self.amount } else { entry - &self.amount };
-        if !integer_literal_fits_type(&expected, ty) { return Err(ProjectCheck::Unsupported); }
-        let occurrence = || ContextualProofOccurrence {
-            binding: binding.clone(), supplying_call, call, entry: entry.clone(), exit: exit.clone(),
+        let proved = if reused {
+            if self.reusable_exit(self.target, body, binding, ty, call, entry) != Some(exit) {
+                return Err(ProjectCheck::Unsupported);
+            }
+            true
+        } else {
+            let expected = if self.add { entry + &self.amount } else { entry - &self.amount };
+            if !integer_literal_fits_type(&expected, ty) { return Err(ProjectCheck::Unsupported); }
+            &expected == exit
         };
-        if &expected == exit {
-            if self.refutation.is_none() { self.observations.push(occurrence()); }
-        } else if self.refutation.is_none() {
-            self.refutation = Some(occurrence());
+        if self.refutation.is_none() {
+            let occurrence = ContextualProofOccurrence {
+                binding: binding.clone(), supplying_call, call, entry: entry.clone(), exit: exit.clone(), reused,
+            };
+            if proved {
+                if !reused && self.verified.is_none() && self.reusable_body == Some(std::ptr::from_ref(body)) {
+                    self.verified = Some(VerifiedContextualOutcome {
+                        exact_binding: binding.clone(), leaf_call: call, entry: entry.clone(), exit: exit.clone(),
+                    });
+                }
+                self.observations.push(occurrence);
+            } else {
+                self.verified = None;
+                self.refutation = Some(occurrence);
+            }
         }
         Ok(())
     }
@@ -682,6 +724,9 @@ fn check_internal_contextual_proof(
             contextual_proof: Some(ReachedContextualProof {
                 target: (0, item), formal: formal.clone(), ty: ty.clone(), goal: wosy_syntax::byte_span(&goal),
                 add, amount, observations: Vec::new(), refutation: None,
+                reusable_body: super::checker_flow::exact_contextual_summary_leaf(body)
+                    .then_some(std::ptr::from_ref(body)),
+                verified: None,
             }),
             ..OrderedFailures::default()
         })?;
@@ -1819,6 +1864,8 @@ struct ExactCallActivation<'a> {
     named_site: Option<NamedStackSite<'a>>,
     #[cfg(feature = "internal-checker")]
     contextual_origin: Option<(&'a ReferenceBindingId, ByteSpan)>,
+    #[cfg(feature = "internal-checker")]
+    verified_contextual_result: Option<(BigInt, BigInt)>,
     target: Option<((usize, usize), bool, ExactCallEffect<'a>, Option<usize>)>,
 }
 
@@ -2335,6 +2382,8 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             named_site: None,
             #[cfg(feature = "internal-checker")]
             contextual_origin: None,
+            #[cfg(feature = "internal-checker")]
+            verified_contextual_result: None,
             target: None }];
         let result = self.drive_exact_calls::<NAMED>(&mut frames, collection, named_outer);
         for frame in frames.into_iter().rev() {
@@ -2375,7 +2424,18 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                 }
             };
             let handler = (!NAMED).then_some(&mut nested_value as &mut super::checker_flow::ActualCallHandler<'_, '_>);
-            let progress = if active_collection.is_some() {
+            #[cfg(feature = "internal-checker")]
+            let verified = frame.verified_contextual_result.take();
+            #[cfg(not(feature = "internal-checker"))]
+            let verified = Option::<(BigInt, BigInt)>::None;
+            #[cfg(feature = "internal-checker")]
+            let reused = verified.is_some();
+            let progress = if let Some((entry, exit)) = verified {
+                #[cfg(feature = "internal-checker")]
+                { Some(ExactCallProgress::Done { active: false, result: ActualCallResult::ContextualUnit { entry, exit } }) }
+                #[cfg(not(feature = "internal-checker"))]
+                { let _ = (entry, exit); unreachable!() }
+            } else if active_collection.is_some() {
                 frame.cursor.advance::<true>(body, handler, Observer::PROOF_FREE_CONTEXTUAL_LOCAL_TRANSFERS,
                     NAMED || Observer::EXACT_INTEGER_CALL_CONTINUATIONS, Observer::ORDINARY_PROJECTED_PAIR,
                     Observer::ORDINARY_INTEGER_LOCALS, &mut sink)
@@ -2443,7 +2503,7 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                                         .ok_or(ProjectCheck::Unsupported)?.span;
                                     let (original_binding, supplying_call) = completed.contextual_origin
                                         .ok_or(ProjectCheck::Unsupported)?;
-                                    proof.observe(formal, original_binding, ty, supplying_call, span, &entry, &exit)?;
+                                    proof.observe(completed.body, formal, original_binding, ty, supplying_call, span, &entry, &exit, reused)?;
                                 }
                             }
                         }
@@ -2688,6 +2748,8 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                 named_site: None,
                 #[cfg(feature = "internal-checker")]
                 contextual_origin: None,
+                #[cfg(feature = "internal-checker")]
+                verified_contextual_result: None,
                 target: Some((target, true, effect, Some(projection.caller_axis))),
             });
         }
@@ -2755,10 +2817,20 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
         #[allow(unused_mut)]
         let mut cursor = ExactCallCursor::new(body, exact, expected).ok_or(ProjectCheck::Unsupported)?;
         #[cfg(feature = "internal-checker")]
-        let contextual_origin = if let Some((formal, ty, value, origin)) = contextual_entry {
-            cursor.enter_contextual_unit(formal, ty, value).ok_or(ProjectCheck::Unsupported)?;
-            Some(origin)
-        } else { None };
+        let (contextual_origin, verified_contextual_result) = if let Some((formal, ty, value, origin)) = contextual_entry {
+            let span = caller.occurrences.get(call.0).ok_or(ProjectCheck::Unsupported)?.span;
+            let verified_exit = collection.and_then(|ordered| {
+                let effects = ordered.failures.borrow();
+                effects.contextual_proof.as_ref()?.reusable_exit(target, body, origin.0, ty, span, &value).cloned()
+            });
+            let verified_result = if let Some(exit) = verified_exit {
+                Some((value, exit))
+            } else {
+                cursor.enter_contextual_unit(formal, ty, value).ok_or(ProjectCheck::Unsupported)?;
+                None
+            };
+            (Some(origin), verified_result)
+        } else { (None, None) };
         #[cfg(feature = "internal-checker")]
         if NAMED || named_mixed_pair {
             cursor.allow_named_exact_bool_parameters().ok_or(ProjectCheck::Unsupported)?;
@@ -2800,6 +2872,8 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             named_site,
             #[cfg(feature = "internal-checker")]
             contextual_origin,
+            #[cfg(feature = "internal-checker")]
+            verified_contextual_result,
             target: Some((target, first_activation, effect, None)),
         })
     }
@@ -15999,6 +16073,11 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
                     relay();
                 };
                 relay();
+                core.context.credit = 3;
+                relay();
+                core.require(core.context.credit == 2, { .stdout = ""; .stderr = ""; .code = 71; .files = []; });
+                core.context.credit = 3;
+                consume();
             };
             proof debit for consume() -> (null)
                 ensures (core.context.credit == core.old(core.context.credit) - 1) {}
@@ -16011,7 +16090,8 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
         };
         for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
             let (observations, directives) = run(text, layout).unwrap();
-            let [outer, inner, restored] = observations.as_slice() else { panic!("expected three actual observations"); };
+            let [outer, inner, restored, reused, different_site] = observations.as_slice()
+                else { panic!("expected five source-ordered actual occurrences"); };
             let [effect] = directives.as_slice() else { panic!("one reached ordinary effect"); };
             assert_eq!(effect.code(), &BigInt::from(70));
             for (observation, (entry, exit)) in [outer, inner, restored].into_iter().zip([(3, 2), (20, 19), (2, 1)]) {
@@ -16023,6 +16103,24 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
             assert_ne!(outer.binding, inner.binding);
             assert_eq!(outer.binding, restored.binding);
             assert_ne!(outer.supplying_call, restored.supplying_call);
+            assert!(!outer.reused && !inner.reused && !restored.reused && reused.reused && !different_site.reused);
+            assert_eq!((&reused.binding, &reused.entry, &reused.exit), (&outer.binding, &outer.entry, &outer.exit));
+            assert_eq!(reused.call, outer.call);
+            assert_ne!(reused.supplying_call, outer.supplying_call);
+            assert_ne!(different_site.call, outer.call);
+            assert_eq!(different_site.binding, outer.binding);
+            let equal_shadow = text.replace("credit = 20;", "credit = 3;");
+            let (records, _) = run(&equal_shadow, layout).unwrap();
+            assert_eq!(records[1].entry, records[0].entry);
+            assert_ne!(records[1].binding, records[0].binding);
+            assert!(!records[1].reused && records[3].reused);
+            let with_effect = text.replace("core.context.credit = core.context.credit - 1;", concat!(
+                "core.context.credit = core.context.credit - 1; ",
+                r#"core.require(false, { .stdout = ""; .stderr = ""; .code = 72; .files = []; });"#
+            ));
+            let (records, directives) = run(&with_effect, layout).unwrap();
+            assert!(records.iter().all(|record| !record.reused));
+            assert_eq!(directives.iter().filter(|report| report.code() == &BigInt::from(72)).count(), 5);
             let wrong_effect = text.replace("core.context.credit = core.context.credit - 1;", "core.context.credit = core.context.credit - 0;");
             let failure = run(&wrong_effect, layout).unwrap_err();
             let InternalContextualProofError::Refuted { goal, occurrence } = failure else { panic!("{failure:?}"); };

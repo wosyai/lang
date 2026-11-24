@@ -7776,6 +7776,30 @@ fn checked_scalar_assignment(
 }
 
 #[cfg(feature = "internal-checker")]
+pub(super) fn exact_contextual_summary_leaf(calls: &FunctionCallSites) -> bool {
+    fn eligible(calls: &FunctionCallSites) -> Option<()> {
+        let (formal, ty) = calls.contextual_formal()?;
+        let structure = &calls.structure;
+        if !calls.boundary.parameters.is_empty()
+            || !matches!(calls.boundary.results.as_slice(), [out] if out.ty == ScalarType::Unit)
+            || structure.blocks.len() != 1 || calls.assignments.len() != 1
+            || !calls.arms.is_empty() || !calls.call_occurrences.is_empty()
+            || !calls.allocation_length_calls.is_empty() || !structure.checker_directives.is_empty()
+        {
+            return None;
+        }
+        let [item] = structure.blocks.get(structure.root.0)?.items.as_slice() else { return None; };
+        let BlockItemKind::Assignment { group } = item.kind else { return None; };
+        let update = structure.checker_contextual_counter_updates.get(&(group.block, group.item))?;
+        let (binding, target_type, rhs, destination) = checked_scalar_assignment(calls, group)?;
+        (binding == formal && target_type == ty && rhs == update.rhs
+            && matches!(update.operator, BinaryOperator::Add | BinaryOperator::Subtract)
+            && structure.checker_contextual_occurrences.contains(&destination)).then_some(())
+    }
+    eligible(calls).is_some()
+}
+
+#[cfg(feature = "internal-checker")]
 pub(super) fn backward_literal_overwrite_failure(
     calls: &FunctionCallSites, failure: &IntegerCheckFailure<'_>,
 ) -> Option<(ScalarType, BigInt, BigInt, BigInt)> {
