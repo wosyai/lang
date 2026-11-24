@@ -1368,6 +1368,13 @@ fn lexical_conditional_owner_choice_releases_selected_original_after_read() {
         .replace("u64(*u64) read_selected", "u64(*Packet) read_whole = fn(view) { (*view).length };\nu64(*u64) read_selected")
         .replace("    u64 observed = read_selected", "    read_whole(&chosen);\n    u64 observed = read_selected");
     assert_ne!(multiple_then_consumed, saved_then_consumed);
+    let saved_then_released = multiple_then_consumed
+        .replace("u64(Packet) consume = fn(packet) { packet.length };\n", "")
+        .replace("consume(chosen) + observed", "observed")
+        .replace("if (drive(0, false) == 24) { 12 } else { 0 }", "drive(0, false)")
+        .replace("if (drive(2, true) == 4) { 2 } else { 0 }", "drive(2, true)")
+        .replace("if (drive(3, true) == 24) { 12 } else { 0 }", "drive(3, true)");
+    assert_ne!(saved_then_released, multiple_then_consumed);
     let temporary = consumed.replace("    Packet chosen = if", "    consume(if")
         .replace("else { make_long(2) };\n    consume(chosen)", "else { make_long(2) })");
     assert_ne!(temporary, consumed);
@@ -1394,13 +1401,15 @@ fn lexical_conditional_owner_choice_releases_selected_original_after_read() {
         (borrowed_then_consumed.as_str(), "consume-after-borrow"),
         (saved_then_consumed.as_str(), "consume-after-saved-borrow"),
         (multiple_then_consumed.as_str(), "consume-after-multiple-borrows"),
+        (saved_then_released.as_str(), "release-after-saved-borrows"),
         (named_borrow.as_str(), "named-borrow"), (nested_temporary.as_str(), "nested-consume-temporary"),
         (nested_borrow.as_str(), "nested-named-borrow")]
     {
         let nested = use_site.starts_with("nested-");
         let base_use = use_site.strip_prefix("nested-").unwrap_or(use_site);
         let consuming = base_use.starts_with("consume");
-        let multiple = base_use == "consume-after-multiple-borrows";
+        let releases_saved = base_use == "release-after-saved-borrows";
+        let multiple = releases_saved || base_use == "consume-after-multiple-borrows";
         let borrowing = multiple || matches!(base_use, "borrow" | "named-borrow" | "consume-after-borrow" | "consume-after-saved-borrow");
         for (target, target_layout) in [("native64", ScalarTargetLayout::NATIVE64), ("wasm32", ScalarTargetLayout::WASM32)] {
             for project in [false, true] {
@@ -1501,7 +1510,7 @@ fn lexical_conditional_owner_choice_releases_selected_original_after_read() {
                 } else {
                     if borrowing {
                         assert!(reader_seen);
-                        if base_use == "borrow" {
+                        if base_use == "borrow" || releases_saved {
                             assert!(reads.contains(&descriptor), "field loan must borrow from the joined descriptor slot");
                         }
                     } else {
@@ -1549,6 +1558,12 @@ fn lexical_conditional_owner_choice_releases_selected_original_after_read() {
                     assert!(emit(&forward).expect_err("the joined owner must reach a proved terminal consumer")
                         .contains("local conditional owner requires a proved terminal consumer"));
                 } else if borrowing {
+                    if releases_saved {
+                        let wrong = text.replace("    observed\n", "    chosen.length + observed\n");
+                        assert_ne!(wrong, text);
+                        assert!(emit(&wrong).expect_err("only the exact saved scalar survives the selected owner")
+                            .contains("aggregate owning call has no proved endpoint"));
+                    }
                     let uncertified = text.replace("{ *view }", "{ u64 seen = *view; seen }")
                         .replace("{ (*view).length }", "{ u64 seen = (*view).length; seen }");
                     assert_ne!(uncertified, text);

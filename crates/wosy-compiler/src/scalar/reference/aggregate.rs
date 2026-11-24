@@ -2880,7 +2880,12 @@ impl Body<'_> {
                     if value_point == last.id)
                 && matches!(exit.kind, CfgPointKind::ScopeExit)).then_some(exit.id)
         };
-        let scalar_call = if saved_observation.is_some() {
+        let returns_saved = saved_observation.is_some_and(|saved| {
+            matches!(self.sites.prepared_plain_name(output.expression),
+                Some(PlainNameIdentity::Lexical(binding)) if binding == saved)
+                && matches!(&read.kind, CfgPointKind::Read { binding } if binding == saved)
+        });
+        let scalar_call = if saved_observation.is_some() && !returns_saved {
             let OccurrenceNode::Expression(left) = *structure.edges.get(&(
                 OccurrenceParent::Expression(output.expression), OccurrenceEdge::BinaryLeft,
             ))? else { return None };
@@ -2889,7 +2894,11 @@ impl Body<'_> {
             }
             left
         } else { output.expression };
-        let use_site = if let Some((observed, field)) = self.sites.prepared_lexical_member(output.expression) {
+        let use_site = if returns_saved {
+            // Only the ordinary saved scalar survives this lexical owner.
+            // The receipt remains in the caller and is discharged at its exit.
+            LocalChoiceUse::Observe(end_use(read)?)
+        } else if let Some((observed, field)) = self.sites.prepared_lexical_member(output.expression) {
             if alias.is_some() || !before_consume.is_empty() || observed != holder || &field.structure != descriptor
                 || !matches!(&read.kind, CfgPointKind::ReadPlace { pointer_point: None, reads_origin: false,
                     candidates, .. } if matches!(candidates.as_slice(), [place] if &place.binding == holder &&
