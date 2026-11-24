@@ -5038,6 +5038,43 @@ fn permits_named_checked_field_borrow(
         && matches!(inner.as_ref(), ScalarType::Struct(_)))
 }
 
+fn named_checked_field_literal_index<'a>(
+    place: &'a ScalarPlace,
+    mode: ScalarReferenceMutability,
+    scope: &BTreeMap<String, ScalarType>,
+) -> Option<(&'a ScalarPlace, &'a ScalarExpression, &'a BigInt)> {
+    let ScalarPlace::Index { base, index, .. } = place else { return None };
+    let ScalarExpression::Integer { value, .. } = index.as_ref() else { return None };
+    permits_named_checked_field_borrow(base, mode, scope).then_some((base, index, value))
+}
+
+fn checked_projected_literal_element(
+    place: &ScalarPlace,
+    index: &ScalarExpression,
+    value: &BigInt,
+    base: ScalarType,
+    mutability: ScalarReferenceMutability,
+    inference: &mut ScalarInferenceBuilder<'_>,
+    diagnose: impl FnOnce(&str),
+) -> ScalarType {
+    match base {
+        ScalarType::Array { element, length, .. }
+            if super::reference::aggregate::ordinary_value(&element)
+                && value >= &0.into() && value < &length.into() =>
+        {
+            // The exact nonnegative literal fits u64 by the fixed-length bound.
+            inference.record_expression_type(index, &ScalarType::U64, true);
+            inference.record_place_type(place, &element);
+            ScalarType::CheckedReference { mutability, inner: element }
+        }
+        ScalarType::Error => ScalarType::Error,
+        _ => {
+            diagnose("checked projected borrow requires an in-range literal index into a fixed ordinary scalar array");
+            ScalarType::Error
+        }
+    }
+}
+
 fn is_addressable_checked_reference_type(ty: &ScalarType) -> bool {
     !matches!(
         ty,
@@ -5055,6 +5092,11 @@ fn checked_address_type(
     overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
+    if let Some((base, index, value)) = named_checked_field_literal_index(place, mutability, scope) {
+        let array = checked_dereference_type(base, span, scope, program, diagnostics, false, overloads, inference);
+        return checked_projected_literal_element(place, index, value, array, mutability, inference,
+            |message| diagnostics.push(diagnostic(program, "B0003", message, span)));
+    }
     if permits_named_checked_field_borrow(place, mutability, scope) {
         let inner = checked_dereference_type(place, span, scope, program, diagnostics, false, overloads, inference);
         if super::reference::aggregate::ordinary_value(&inner) {
@@ -5146,6 +5188,12 @@ fn checked_address_type_in_module(
     overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
+    if let Some((base, index, value)) = named_checked_field_literal_index(place, mutability, scope) {
+        let array = checked_dereference_type_in_module(base, span, scope, module, modules,
+            diagnostics, false, overloads, inference);
+        return checked_projected_literal_element(place, index, value, array, mutability, inference,
+            |message| diagnostics.push(module_diagnostic(module, "B0003", message, span)));
+    }
     if permits_named_checked_field_borrow(place, mutability, scope) {
         let inner = checked_dereference_type_in_module(place, span, scope, module, modules, diagnostics, false, overloads, inference);
         if super::reference::aggregate::ordinary_value(&inner) {

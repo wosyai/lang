@@ -10,11 +10,15 @@ use wosy_syntax::SourceIdentity;
 enum Expected {
     Valid,
     NullParent,
+    DynamicProjection,
+    OutOfRangeProjection,
+    KnownProjection,
     LiveConflict,
     LiveSelectedFieldConflict,
     LiveNestedFieldConflict,
     LiveJoinedProjectionConflict,
     LiveMutableProjectionConflict,
+    LiveIndexedProjectionConflict,
     LiveSelectedIndexConflict,
     LiveDescendantConflict,
     LiveFamilyConflict,
@@ -51,22 +55,31 @@ fn check_case(text: &str, expected: Expected, witness_dir: Option<&str>) {
         ] {
             match expected {
                 Expected::Valid => assert!(diagnostics.is_empty(), "{target}/{route}: {diagnostics:?}"),
-                Expected::NullParent => {
-                    let start = text.find("&(*parent)").expect("child reborrow") as u32;
+                Expected::NullParent | Expected::DynamicProjection | Expected::OutOfRangeProjection | Expected::KnownProjection => {
+                    let (reborrow, message) = match expected {
+                        Expected::DynamicProjection => ("&!(*parent).values[index]",
+                            "checked address requires a storage name or direct storage field"),
+                        Expected::OutOfRangeProjection => ("&!(*parent).values[2]",
+                            "checked projected borrow requires an in-range literal index into a fixed ordinary scalar array"),
+                        Expected::KnownProjection => ("&!(*parent).values[1]", "missing required dereference origin"),
+                        _ => ("&(*parent)", "missing required dereference origin"),
+                    };
+                    let start = text.find(reborrow).expect("child reborrow") as u32;
                     assert!(diagnostics.iter().any(|diagnostic| {
                         diagnostic.code == "B0003"
-                            && diagnostic.message == "missing required dereference origin"
+                            && diagnostic.message == message
                             && diagnostic.labels.first().is_some_and(|label| label.span.range.start == start)
                     }), "{target}/{route}: {diagnostics:?}");
                 }
                 Expected::Declined => assert!(diagnostics.iter().any(|item| item.code == "B0003"), "{target}/{route}: {diagnostics:?}"),
-                Expected::LiveConflict | Expected::LiveSelectedFieldConflict | Expected::LiveNestedFieldConflict | Expected::LiveJoinedProjectionConflict | Expected::LiveMutableProjectionConflict | Expected::LiveSelectedIndexConflict | Expected::LiveDescendantConflict | Expected::LiveFamilyConflict | Expected::LiveMutableConflict | Expected::FrozenMutableConflict | Expected::LiveExclusiveConflict => {
+                Expected::LiveConflict | Expected::LiveSelectedFieldConflict | Expected::LiveNestedFieldConflict | Expected::LiveJoinedProjectionConflict | Expected::LiveMutableProjectionConflict | Expected::LiveIndexedProjectionConflict | Expected::LiveSelectedIndexConflict | Expected::LiveDescendantConflict | Expected::LiveFamilyConflict | Expected::LiveMutableConflict | Expected::FrozenMutableConflict | Expected::LiveExclusiveConflict => {
                     let write = match expected {
                         Expected::FrozenMutableConflict | Expected::LiveExclusiveConflict => "*child = seen + 4",
                         Expected::LiveSelectedFieldConflict => "owner.left = 3",
                         Expected::LiveNestedFieldConflict => "owner.values[0] = 3",
                         Expected::LiveJoinedProjectionConflict | Expected::LiveMutableProjectionConflict => "first.value = 3",
                         Expected::LiveSelectedIndexConflict => "bytes[0] = 3",
+                        Expected::LiveIndexedProjectionConflict => "first.values[1] = 3",
                         _ => "first = 3",
                     };
                     let write = text.find(write).expect("conflicting write") as u32;
@@ -78,6 +91,7 @@ fn check_case(text: &str, expected: Expected, witness_dir: Option<&str>) {
                         Expected::LiveNestedFieldConflict => Some(("owner.".len(), "values".len())),
                         Expected::LiveJoinedProjectionConflict | Expected::LiveMutableProjectionConflict => Some(("first.".len(), "value".len())),
                         Expected::LiveSelectedIndexConflict => Some((0, "bytes".len())),
+                        Expected::LiveIndexedProjectionConflict => Some(("first.".len(), "values".len())),
                         _ => None,
                     };
                     let write = write + exact_operand.map_or(0, |(shift, _)| shift as u32);
@@ -89,6 +103,7 @@ fn check_case(text: &str, expected: Expected, witness_dir: Option<&str>) {
                         Expected::LiveExclusiveConflict => "&!(*child)",
                         Expected::LiveJoinedProjectionConflict => "&(*parent).value",
                         Expected::LiveMutableProjectionConflict => "&!(*parent).value",
+                        Expected::LiveIndexedProjectionConflict => "&!(*parent).values[1]",
                         _ => "&(*parent)",
                     };
                     let child = text.find(loan).expect("child reborrow") as u32;
@@ -327,6 +342,37 @@ fn joined_struct_parent_grants_one_exclusive_scalar_field() {
         "*child = seen + 4; u8 read = pointer(frozen);");
     assert_ne!(frozen, program);
     check(&frozen, Expected::FrozenMutableConflict);
+}
+
+#[test]
+fn joined_struct_parent_grants_in_range_literal_array_element() {
+    let program = joined("parent = &!second;", true, "",
+        "*child = seen + 2; u8 changed = *child; u8 left = first.values[1]; u8 right = second.values[1];")
+        .replace("%%start\n", "%%start\nstruct Record { u8[2] values; }\n")
+        .replace("u8 first = 7;\n    u8 second = 9;",
+            "Record first = { .values = [1, 7]; }; Record second = { .values = [2, 9]; };")
+        .replace("*!u8 parent = null;", "*!Record parent = null;")
+        .replace("*u8 child = &(*parent);", "*!u8 child = &!(*parent).values[1];")
+        .replace("    seen\n",
+            "    if (first.values[0] == 1 && second.values[0] == 2 && changed == seen + 2) { if (choose) { if (left == 9 && right == 9) { seen } else { 0 } } else { if (left == 7 && right == 11) { seen } else { 0 } } } else { 0 }\n");
+    check_case(&program, Expected::Valid, Some("WOSY_JOINED_INDEXED_PROJECTION_IR_DIR"));
+
+    let live = program.replace("u8 seen = *child;", "first.values[1] = 3; u8 seen = *child;");
+    assert_ne!(live, program);
+    check(&live, Expected::LiveIndexedProjectionConflict);
+    let dynamic = program.replace("*!u8 child = &!(*parent).values[1];",
+        "u64 index = 1; *!u8 child = &!(*parent).values[index];");
+    assert_ne!(dynamic, program);
+    check(&dynamic, Expected::DynamicProjection);
+    let outside = program.replace("&!(*parent).values[1]", "&!(*parent).values[2]");
+    assert_ne!(outside, program);
+    check(&outside, Expected::OutOfRangeProjection);
+    let known = program.replace(
+        "*!Record parent = null;\n    if (choose) { parent = &!first; } else { parent = &!second; };",
+        "*!Record parent = &!first;",
+    );
+    assert_ne!(known, program);
+    check(&known, Expected::KnownProjection);
 }
 
 #[test]

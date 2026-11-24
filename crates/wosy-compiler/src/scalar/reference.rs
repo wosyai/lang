@@ -2683,16 +2683,32 @@ impl<'a> ReferenceFlowBuilder<'a> {
                                 if matches!(place, ScalarPlace::Dereference { .. }) {
                                     return aggregate::ordinary_value(inner);
                                 }
-                                if self.has_joined_root_reborrow
-                                    || !matches!(direct_checked_field_base(place),
-                                        Some((written, ScalarFieldReference::Resolved(field)))
-                                            if written == pointer.as_ref()
-                                                && matches!(inner.as_ref(), ScalarType::Struct(id) if id == &field.structure))
+                                if self.has_joined_root_reborrow {
+                                    return false;
+                                }
+                                let checked_types = &self.call_sites.structure.checked_types;
+                                let Some(field_type) = checked_types.places.get(&place_ordinal)
+                                    .filter(|ty| aggregate::ordinary_value(ty)) else { return false; };
+                                let (field_place, index) = joined_projection_field(place);
+                                if !matches!(direct_checked_field_base(field_place),
+                                    Some((written, ScalarFieldReference::Resolved(field)))
+                                        if written == pointer.as_ref()
+                                            && matches!(inner.as_ref(), ScalarType::Struct(id) if id == &field.structure))
                                 {
                                     return false;
                                 }
-                                let Some(field_type) = self.call_sites.structure.checked_types.places.get(&place_ordinal)
-                                    .filter(|ty| aggregate::ordinary_value(ty)) else { return false; };
+                                if let Some(ScalarExpression::Integer { value, .. }) = index {
+                                    let field_occurrence = self.place_ordinal(
+                                        OccurrenceParent::Place(place_ordinal), OccurrenceEdge::PlaceBase,
+                                    );
+                                    let Some(ScalarType::Array { element, length, .. }) = checked_types.places.get(&field_occurrence)
+                                        else { return false; };
+                                    if element.as_ref() != field_type || value < &0.into() || value >= &(*length).into() {
+                                        return false;
+                                    }
+                                } else if index.is_some() {
+                                    return false;
+                                }
                                 matches!(self.call_sites.prepared_plain_name(pointer_ordinal),
                                     Some(PlainNameIdentity::Lexical(expected)) if expected == &binding)
                                     && self.call_sites.structure.checked_types.expressions.get(&pointer_ordinal) == Some(ty)
@@ -2729,6 +2745,13 @@ impl<'a> ReferenceFlowBuilder<'a> {
                                 ReferenceAnalysisErrorReason::MissingRequiredDereferenceOrigin,
                             ));
                         };
+                        // A checked-field literal index is authored only by the
+                        // exact joined issuance above, not by the general parent lane.
+                        if matches!(place, ScalarPlace::Index { base, .. } if direct_checked_field_base(base).is_some()) {
+                            return Err(self.missing_context(
+                                span, ReferenceAnalysisErrorReason::MissingRequiredDereferenceOrigin,
+                            ));
+                        }
                         reborrow = self.cursor;
                         if matches!(pointer.as_ref(), ScalarExpression::Name { .. })
                             && origins.len() == 1
@@ -7122,9 +7145,15 @@ fn joined_root_reborrow_binding<'a>(
     let CfgPointKind::ReborrowThrough { mode, place, pointer_point } = &point.kind else { return None };
     let pointer = match place {
         ScalarPlace::Dereference { pointer, .. } => pointer.as_ref(),
-        _ => match direct_checked_field_base(place)? {
-            (pointer, ScalarFieldReference::Resolved(_)) => pointer,
-            _ => return None,
+        _ => {
+            let (field, index) = joined_projection_field(place);
+            if index.is_some_and(|index| !matches!(index, ScalarExpression::Integer { .. })) {
+                return None;
+            }
+            match direct_checked_field_base(field)? {
+                (pointer, ScalarFieldReference::Resolved(_)) => pointer,
+                _ => return None,
+            }
         },
     };
     let CfgPointKind::Read { binding } = &points.get(pointer_point.0)?.kind else { return None };
@@ -7401,6 +7430,13 @@ fn checked_joined_reborrow_parents(
         }
     }
     None
+}
+
+fn joined_projection_field(place: &ScalarPlace) -> (&ScalarPlace, Option<&ScalarExpression>) {
+    match place {
+        ScalarPlace::Index { base, index, .. } => (base.as_ref(), Some(index.as_ref())),
+        _ => (place, None),
+    }
 }
 
 fn direct_checked_field_base(place: &ScalarPlace) -> Option<(&ScalarExpression, &ScalarFieldReference)> {
