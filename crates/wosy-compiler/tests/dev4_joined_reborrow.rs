@@ -688,6 +688,26 @@ fn joined_child_returned_by_exact_identity_keeps_loan_live() {
 }
 
 #[test]
+fn joined_child_returned_through_grounded_alias_chain_remains_exact() {
+    let program = joined("parent = &!second;", true, "",
+        "*u8 echoed = identity(child); u8 observed = *echoed; first = 3;")
+        .replace("%%start\n", "%%start\n*u8(*u8) identity = fn(value) { middle(value) };\n\
+            *u8(*u8) middle = fn(value) { terminal(value) };\n\
+            *u8(*u8) terminal = fn(value) { value };\n")
+        .replace("    seen\n", "    if (observed == seen && first == 3) { observed } else { 0 }\n");
+    check_case(&program, Expected::Valid, Some("WOSY_JOINED_RETURNED_CHAIN_IR_DIR"));
+
+    let live = program.replace("u8 observed = *echoed; first = 3;",
+        "first = 3; u8 observed = *echoed;");
+    assert_ne!(live, program);
+    check(&live, Expected::LiveConflict);
+
+    let cycle = program.replace("{ value };", "{ identity(value) };");
+    assert_ne!(cycle, program);
+    check(&cycle, Expected::NullParent);
+}
+
+#[test]
 fn joined_child_crosses_grounded_forward_reader_chain() {
     let program = joined_with_pointer_read("u8 observed = pointer(child); first = 3;", "*value")
         .replace("u8(*u8) pointer = fn(value) { *value };",
@@ -773,6 +793,10 @@ fn returned_joined_alias_cannot_escape_its_lexical_owners() {
 };
 %%end"#;
     check(program, Expected::NullParent);
+    let wrapper = program.replace("*u8(*u8) identity = fn(value) { value };",
+        "*u8(*u8) identity = fn(value) { terminal(value) };\n*u8(*u8) terminal = fn(value) { value };");
+    assert_ne!(wrapper, program);
+    check(&wrapper, Expected::NullParent);
 }
 
 #[test]

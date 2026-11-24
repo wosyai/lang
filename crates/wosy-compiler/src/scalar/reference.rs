@@ -10397,7 +10397,7 @@ impl SharedScalarReadEffect {
 pub(super) struct ModuleCallSites {
     functions: BTreeMap<usize, FunctionCallSites>,
     shared_scalar_read_effects: HashMap<ByteSpan, SharedScalarReadEffect>,
-    shared_reader_forwarders: Vec<(ByteSpan, SourceSpan)>,
+    shared_reader_forwarders: Vec<(ByteSpan, SourceSpan, SharedForwardKind)>,
     pub(super) initialization: ModuleInitializationRegion,
 }
 
@@ -12566,22 +12566,29 @@ fn close_local_shared_call_families(
     }));
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum SharedForwardKind {
+    ScalarRead,
+    ReturnedFormal,
+}
+
 fn ground_shared_reader_forwarders<'a>(
     rows: impl Iterator<Item = (&'a SourceIdentity, &'a mut ModuleCallSites)>,
 ) {
     let mut rows: Vec<_> = rows.collect();
     let source_ids: HashMap<_, _> = rows.iter().enumerate().map(|(index, (source, _))| (*source, index)).collect();
-    let mut reverse = HashMap::<(usize, ByteSpan), Vec<(usize, ByteSpan)>>::new();
+    let mut reverse = HashMap::<(usize, ByteSpan, SharedForwardKind), Vec<(usize, ByteSpan)>>::new();
     let mut grounded = Vec::new();
     for (index, (_, calls)) in rows.iter_mut().enumerate() {
-        for (declaration, target) in std::mem::take(&mut calls.shared_reader_forwarders) {
+        for (declaration, target, kind) in std::mem::take(&mut calls.shared_reader_forwarders) {
             if let Some(&target_module) = source_ids.get(&target.source) {
-                reverse.entry((target_module, target.range)).or_default().push((index, declaration));
+                reverse.entry((target_module, target.range, kind)).or_default().push((index, declaration));
             }
         }
-        grounded.extend(calls.shared_scalar_read_effects.iter().filter_map(|(&declaration, effect)|
-            (effect.parameter == 0 && !effect.descriptor && !effect.returns_formal)
-                .then_some((index, declaration))));
+        grounded.extend(calls.shared_scalar_read_effects.iter().filter_map(|(&declaration, effect)| {
+            (effect.parameter == 0 && !effect.descriptor).then_some((index, declaration,
+                if effect.returns_formal { SharedForwardKind::ReturnedFormal } else { SharedForwardKind::ScalarRead }))
+        }));
     }
     // Seed only exact unary leaves so cycles, failed rows and same-offset
     // declarations from another source cannot grant forwarding authority.
@@ -12589,9 +12596,10 @@ fn ground_shared_reader_forwarders<'a>(
         if let Some(callers) = reverse.remove(&target) {
             for (index, declaration) in callers {
                 rows[index].1.shared_scalar_read_effects.insert(declaration, SharedScalarReadEffect {
-                    parameter: 0, descriptor: false, forwarded: true, returns_formal: false,
+                    parameter: 0, descriptor: false, forwarded: true,
+                    returns_formal: target.2 == SharedForwardKind::ReturnedFormal,
                 });
-                grounded.push((index, declaration));
+                grounded.push((index, declaration, target.2));
             }
         }
     }
@@ -12599,17 +12607,24 @@ fn ground_shared_reader_forwarders<'a>(
 
 fn shared_scalar_reader_forward_target(
     source: &SourceIdentity, function: &ScalarFunction, calls: &FunctionCallSites,
-) -> Option<SourceSpan> {
+) -> Option<(SourceSpan, SharedForwardKind)> {
     let [parameter] = calls.boundary.parameters.as_slice() else { return None };
     let ScalarType::CheckedReference { mutability: ScalarReferenceMutability::Shared, inner } =
         &parameter.ty else { return None };
     let [result] = calls.boundary.results.as_slice() else { return None };
     if !function.generic_parameters.is_empty() || !function.overload_arms.is_empty()
-        || !aggregate::ordinary_value(inner) || result.ty != **inner
+        || !aggregate::ordinary_value(inner)
         || !matches!(function.body.items.as_slice(), [ScalarBlockItem::Expression(ScalarExpression::Call { .. })])
     {
         return None;
     }
+    let kind = if result.ty == **inner {
+        SharedForwardKind::ScalarRead
+    } else if result.ty == parameter.ty {
+        SharedForwardKind::ReturnedFormal
+    } else {
+        return None;
+    };
     let [call] = calls.call_occurrences.as_slice() else { return None };
     let structure = &calls.structure;
     let OccurrenceNode::Expression(output) = *structure.edges.get(&(
@@ -12636,7 +12651,7 @@ fn shared_scalar_reader_forward_target(
         && binding.block_span == function.body.span && binding.declaration_span == parameter.span
         && binding.kind == ReferenceBindingKind::Declared
         && structure.checked_types.expressions.get(&argument) == Some(&parameter.ty))
-        .then(|| SourceSpan::new(target.clone(), *declaration_span))
+        .then(|| (SourceSpan::new(target.clone(), *declaration_span), kind))
 }
 
 fn resolve_module_call_sites(
@@ -12667,8 +12682,8 @@ fn resolve_module_call_sites(
                 calls.self_tail_candidates = self_tail::select(source, function, &calls);
                 if let Some(effect) = SharedScalarReadEffect::prepare(source, function, &calls) {
                     shared_scalar_read_effects.insert(function.name_span, effect);
-                } else if let Some(target) = shared_scalar_reader_forward_target(source, function, &calls) {
-                    shared_reader_forwarders.push((function.name_span, target));
+                } else if let Some((target, kind)) = shared_scalar_reader_forward_target(source, function, &calls) {
+                    shared_reader_forwarders.push((function.name_span, target, kind));
                 }
             }
             functions.insert(index, calls);
