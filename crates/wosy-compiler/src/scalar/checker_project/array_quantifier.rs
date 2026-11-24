@@ -1,6 +1,9 @@
 //! Quantified claims about prepared immutable fixed-array return cells.
 use super::*;
-use super::super::checker_flow::{observe_fixed_array_returns, FixedArrayQuantifier};
+use super::super::checker_flow::{
+    charge_call_work, collect_exact_fixed_array_return, observe_fixed_array_returns,
+    FixedArrayCheck, FixedArrayQuantifier, FixedArrayReturnFailure,
+};
 
 pub(super) struct ArrayProof<'a> {
     proof: &'a CstNode,
@@ -13,6 +16,8 @@ pub(super) struct ArrayProof<'a> {
     quantifier: FixedArrayQuantifier<BigInt>,
     relation: IntegerRelation,
     expected: BigInt,
+    body: &'a FunctionCallSites,
+    supported_body: std::cell::OnceCell<bool>,
     result: &'a ScalarType,
 }
 
@@ -153,59 +158,120 @@ impl<'a> ArrayProof<'a> {
         }
         let goal = if matches!(quantifier_kind, FixedArrayQuantifier::FindWitness) { &quantifier } else { &goal_node };
         Ok(Self { proof, source, target, goal: wosy_syntax::byte_span(goal), failed_step,
-            entry_filter, domain, quantifier: quantifier_kind, relation, expected, result: &output.ty })
+            entry_filter, domain, quantifier: quantifier_kind, relation, expected, body,
+            supported_body: std::cell::OnceCell::new(), result: &output.ty })
+    }
+
+    fn check(&self) -> FixedArrayCheck<'_> {
+        FixedArrayCheck {
+            domain: &self.domain, quantifier: self.quantifier.as_ref(),
+            relation: self.relation, expected: &self.expected,
+        }
+    }
+
+    fn validate_body(&self, body: &FunctionCallSites) -> Result<(), ProjectCheck> {
+        if !std::ptr::eq(body, self.body) { return Err(ProjectCheck::Unsupported); }
+        let supported = self.supported_body.get_or_init(|| {
+            let structure = &body.structure;
+            body.call_occurrences.is_empty() && body.assignments.is_empty() && body.arms.is_empty()
+                && body.allocation_length_calls.is_empty() && structure.checker_directives.is_empty()
+                && !structure.has_ordinary_contextual_places() && !structure.checker_has_bool_contextual_declaration
+                && !body.conditionals.values().any(|region| matches!(region, ConditionalRegion::Unit { .. }))
+        });
+        supported.then_some(()).ok_or(ProjectCheck::Unsupported)
+    }
+
+    fn diagnostic(
+        &self, failure: FixedArrayReturnFailure, source: &SourceIdentity, call: Option<wosy_syntax::SourceSpan>,
+    ) -> Result<AggregateProofDiagnostic, ProjectCheck> {
+        let at = |span| wosy_syntax::SourceSpan::new(self.source.clone(), span);
+        let bindings = self.body.boundary.checker_parameter_bindings.as_deref().ok_or(ProjectCheck::Unsupported)?;
+        let axes = bindings.iter().zip(&self.body.boundary.parameters)
+            .map(|(binding, parameter)| (binding.clone(), parameter.ty.clone())).collect();
+        let equal_axes = failure.inputs.row_equal_axes(0).ok_or(ProjectCheck::Unsupported)?.to_vec();
+        Ok(AggregateProofDiagnostic {
+            proof: at(wosy_syntax::byte_span(self.proof)), goal: at(self.goal), failed_step: self.failed_step.map(at),
+            output: wosy_syntax::SourceSpan::new(source.clone(), failure.span), call,
+            cell: failure.cell.map(|(index, value)| AggregateProofCell { index: BigInt::from(index), value }),
+            witness: ScalarCheckerIntegerWitness { equal_axes, axes, state: failure.inputs },
+        })
     }
 
     fn verify_return(
         &self, body: &FunctionCallSites, source: &SourceIdentity,
     ) -> Result<ProofCoverage<Option<AggregateProofDiagnostic>>, ProjectCheck> {
-        let structure = &body.structure;
-        if !body.call_occurrences.is_empty() || !body.assignments.is_empty() || !body.arms.is_empty()
-            || !body.allocation_length_calls.is_empty() || !structure.checker_directives.is_empty()
-            || structure.has_ordinary_contextual_places() || structure.checker_has_bool_contextual_declaration
-            || body.conditionals.values().any(|region| matches!(region, ConditionalRegion::Unit { .. }))
+        self.validate_body(body)?;
+        match observe_fixed_array_returns(body, self.result, self.entry_filter.as_deref(), self.check())
+            .ok_or(ProjectCheck::Unsupported)?
         {
-            return Err(ProjectCheck::Unsupported);
-        }
-        match observe_fixed_array_returns(
-            body, self.result, self.entry_filter.as_deref(), &self.domain, self.quantifier.as_ref(), (self.relation, &self.expected),
-        ).ok_or(ProjectCheck::Unsupported)? {
             ProofCoverage::NoApplicableInputs => Ok(ProofCoverage::NoApplicableInputs),
             ProofCoverage::Applicable(None) => Ok(ProofCoverage::Applicable(None)),
-            ProofCoverage::Applicable(Some(failure)) => {
-                let at = |span| wosy_syntax::SourceSpan::new(self.source.clone(), span);
-                let bindings = body.boundary.checker_parameter_bindings.as_deref().ok_or(ProjectCheck::Unsupported)?;
-                let axes = bindings.iter().zip(&body.boundary.parameters)
-                    .map(|(binding, parameter)| (binding.clone(), parameter.ty.clone())).collect();
-                let equal_axes = failure.inputs.row_equal_axes(0).ok_or(ProjectCheck::Unsupported)?.to_vec();
-                Ok(ProofCoverage::Applicable(Some(AggregateProofDiagnostic {
-                    proof: at(wosy_syntax::byte_span(self.proof)), goal: at(self.goal), failed_step: self.failed_step.map(at),
-                    output: wosy_syntax::SourceSpan::new(source.clone(), failure.span),
-                    cell: failure.cell.map(|(index, value)| AggregateProofCell { index: BigInt::from(index), value }),
-                    witness: ScalarCheckerIntegerWitness { equal_axes, axes, state: failure.inputs },
-                })))
-            }
+            ProofCoverage::Applicable(Some(failure)) =>
+                Ok(ProofCoverage::Applicable(Some(self.diagnostic(failure, source, None)?))),
         }
     }
 }
 
-pub(super) struct Evidence<'a> { pub(super) plan: ArrayProof<'a> }
-
-impl ActualIntegerObserver for Evidence<'_> {
-    const ENABLED: bool = false;
-    fn observe(&mut self, _: PreparedCallable, _: &[&BigInt], _: &BigInt) {}
+pub(super) struct Evidence<'plan, 'proof> {
+    plan: &'plan ArrayProof<'proof>,
+    guard: Option<CheckedIntegerGuardSlots<'plan>>,
+    pub(super) seen: bool,
+    pub(super) applicable: bool,
+    pub(super) failures: Vec<AggregateProofDiagnostic>,
+    work: usize,
 }
 
-impl OrderedRunEvidence for Evidence<'_> {
+impl<'plan, 'proof> Evidence<'plan, 'proof> {
+    pub(super) fn new(plan: &'plan ArrayProof<'proof>) -> Self {
+        let guard = checked_scalar_guard_slots::<true>(plan.body, plan.entry_filter.as_deref().unwrap_or_default(), false, true);
+        Self { plan, guard, seen: false, applicable: false, failures: Vec::new(), work: 0 }
+    }
+}
+
+impl ActualIntegerObserver for Evidence<'_, '_> {
+    const ENABLED: bool = false;
+    const FIXED_ARRAY_INITIALIZERS: bool = true;
+    fn observe(&mut self, _: PreparedCallable, _: &[&BigInt], _: &BigInt) {}
+
+    fn watches_fixed_array(&self, target: PreparedCallable) -> bool { target == self.plan.target }
+
+    fn observe_fixed_array_initializer(
+        &mut self, target: PreparedCallable, body: &FunctionCallSites, args: &[&BigInt], call: wosy_syntax::SourceSpan,
+    ) -> Result<Vec<BigInt>, ProjectCheck> {
+        if !self.watches_fixed_array(target) || &call.source != self.plan.source {
+            return Err(ProjectCheck::Unsupported);
+        }
+        let guard = self.guard.as_ref().ok_or(ProjectCheck::Unsupported)?;
+        let cost = body.occurrences.len().checked_add(guard.comparisons.len())
+            .and_then(|cost| cost.checked_add(guard.domain.map_or(0, |(_, domain)| domain.interval_count())))
+            .and_then(|cost| cost.checked_add(1)).ok_or(ProjectCheck::Unsupported)?;
+        charge_call_work(&mut self.work, cost).ok_or(ProjectCheck::Unsupported)?;
+        self.plan.validate_body(body)?;
+        let check = self.plan.check();
+        let applicable = guard.accepts(args) && check.applicable();
+        let (returned, failure) = collect_exact_fixed_array_return(
+            body, self.plan.result, args, applicable.then_some(check), &mut self.work,
+        ).ok_or(ProjectCheck::Unsupported)?;
+        self.seen = true;
+        self.applicable |= applicable;
+        if let Some(failure) = failure {
+            let source = self.plan.source;
+            self.failures.push(self.plan.diagnostic(failure, source, Some(call))?);
+        }
+        Ok(returned)
+    }
+}
+
+impl OrderedRunEvidence for Evidence<'_, '_> {
     type Symbolic<'a> = Symbolic<'a> where Self: 'a;
     type SymbolicReport = Option<ProofCoverage<Option<AggregateProofDiagnostic>>>;
     const HAS_NAMED_ROOT: bool = true;
 
     fn complete_startup(&self, reached: &HashSet<PreparedCallable>) -> Result<bool, ProjectCheck> {
-        if reached.contains(&self.plan.target) { return Err(ProjectCheck::Unsupported); }
-        Ok(false)
+        if reached.contains(&self.plan.target) != self.seen { return Err(ProjectCheck::Unsupported); }
+        Ok(self.applicable)
     }
-    fn symbolic(&self) -> Self::Symbolic<'_> { Symbolic { plan: &self.plan, coverage: None } }
+    fn symbolic(&self) -> Self::Symbolic<'_> { Symbolic { plan: self.plan, coverage: None } }
     fn finish_symbolic<'run>(proof: Self::Symbolic<'run>) -> Self::SymbolicReport where Self: 'run { proof.coverage }
 }
 
@@ -215,8 +281,10 @@ impl SymbolicRootProof for Symbolic<'_> {
     const ENABLED: bool = true;
     const FIXED_ARRAY_RETURN: bool = true;
 
-    fn seed(&self, roots: &mut HashMap<usize, HashSet<usize>>, _: &HashSet<PreparedCallable>) {
-        roots.entry(self.plan.target.0).or_default().insert(self.plan.target.1);
+    fn seed(&self, roots: &mut HashMap<usize, HashSet<usize>>, reached: &HashSet<PreparedCallable>) {
+        if !reached.contains(&self.plan.target) {
+            roots.entry(self.plan.target.0).or_default().insert(self.plan.target.1);
+        }
     }
 
     fn try_collect(&mut self, target: PreparedCallable, body: &FunctionCallSites, _: &ScalarFunction,

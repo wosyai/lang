@@ -2474,7 +2474,75 @@ cases.extend([
         2, b"unsupported analysis"),
 ])
 
+reached_fixed_array_exists = f"""%%start
+    i8[3](i8) reflect = fn(value) {{
+        i8 inverse = -1 - value;
+        i8[3] made = [value, 127, inverse];
+        i8[3] copied = made;
+        copied
+    }};
+    proof covered for reflect(entry) -> (items)
+        where (entry >= 0 && entry <= 6)
+        ensures (exists (u64 i where i == 0 || i == 2) {{ items[i] >= 0 }}) {{}}
+    i8[3] first = reflect(3);
+    i8[3] second = reflect(5);
+    i8[3] duplicate = reflect(3);
+    i8[3] outside = reflect(9);
+    u64 index = 2;
+    i8 first_cell = first[0];
+    i8 second_cell = second[0];
+    i8 duplicate_cell = duplicate[0];
+    i8 outside_cell = outside[index];
+    core.require(first_cell == 3, {report(41,"WRONG-FIRST-ARRAY-CELL")});
+    core.require(second_cell == 5, {report(42,"WRONG-SECOND-ARRAY-CELL")});
+    core.require(duplicate_cell == 3, {report(43,"WRONG-DUPLICATE-ARRAY-CELL")});
+    core.require(outside_cell == -10, {report(44,"WRONG-OUTSIDE-ARRAY-CELL")});
+%%end"""
+reached_fixed_array_pair = f"""%%start
+    u8[2](u8,u8) make = fn(tag, value) {{
+        if (tag == 1) {{ [value, 7] }} else {{ [9, value] }}
+    }};
+    proof covered for make(selector, before) -> (items)
+        where (selector == 1 && before <= 5) forall (u64 i where i == 0)
+        ensures (items[i] <= 5) {{}}
+    u8[2] chosen = make(1, 3);
+    u8[2] outside = make(2, 9);
+    u8 observed = chosen[0];
+    u8 outside_cell = outside[0];
+    core.require(observed == 3, {report(41,"WRONG-PAIR-ARRAY-CELL")});
+    core.require(outside_cell == 9, {report(42,"WRONG-OUTSIDE-PAIR-CELL")});
+%%end"""
+reached_fixed_array_witness = """%%start
+    u8[2]() make = fn { [7, 8] };
+    proof covered for make() -> (items)
+        ensures (exists (u64 i where i < 2) { items[i] == 7 })
+    { core.witness(0); }
+    u8[2] picked = make();
+    u8 observed = picked[0];
+%%end"""
+cases.extend([
+    ("exact-startup-fixed-array-exists-proved", reached_fixed_array_exists, 0, b""),
+    ("exact-startup-fixed-array-exists-refuted", reached_fixed_array_exists.replace("items[i] >= 0", "items[i] > 3"),
+        1, b"proof obligation failed"),
+    ("exact-startup-fixed-array-exists-output", reached_fixed_array_exists.replace("outside_cell == -10", "outside_cell == 0"),
+        44, b"WRONG-OUTSIDE-ARRAY-CELL"),
+    ("exact-startup-fixed-array-refuses-outside-index", reached_fixed_array_exists.replace("u64 index = 2", "u64 index = 3"),
+        2, b"unsupported analysis"),
+    ("exact-startup-fixed-array-refuses-unverified-target", reached_fixed_array_exists.replace(
+        "%%end", "i8[1]() absent = fn { [4] }; i8[1] hidden = absent(); %%end"),
+        2, b"unsupported analysis"),
+    ("exact-startup-fixed-array-pair-proved", reached_fixed_array_pair, 0, b""),
+    ("exact-startup-fixed-array-pair-refuted", reached_fixed_array_pair.replace("items[i] <= 5", "items[i] < 3"),
+        1, b"proof obligation failed"),
+    ("exact-startup-fixed-array-nullary-witness-proved", reached_fixed_array_witness, 0, b""),
+    ("exact-startup-fixed-array-nullary-witness-refuted", reached_fixed_array_witness.replace("core.witness(0)", "core.witness(1)"),
+        1, b"proof obligation failed"),
+])
+
 proof_diagnostic_notes = {
+    "exact-startup-fixed-array-exists-refuted": b"call returned an array with no matching index",
+    "exact-startup-fixed-array-pair-refuted": b"call returned cell [0] = 3",
+    "exact-startup-fixed-array-nullary-witness-refuted": b"call returned cell [1] = 8",
     "ordinary-inferred-array-exists-hole-refuted": b"symbolic call entry: value = -1",
     "ordinary-inferred-array-exists-empty-refuted": b"symbolic call can return an array with no matching index",
     "ordinary-inferred-array-exists-branch-refuted": b"symbolic call entry: value = 0",
@@ -3305,6 +3373,12 @@ with tempfile.TemporaryDirectory(prefix="affine-calls-") as path:
                         assert b"proof issued" in res.stderr and b"producer(3,7)" in res.stderr, res
                     if name == "ordinary-verified-unary-entry-refuted":
                         assert b"symbolic call entry: value = 1" in res.stderr,res
+                    if name == "exact-startup-fixed-array-exists-refuted":
+                        assert res.stderr.count(b"error: proof obligation failed") == 2, res
+                        assert res.stderr.count(b"applicable call") == 2 and res.stderr.count(b"call entry: value = 3") == 2, res
+                        assert b"symbolic call" not in res.stderr, res
+                    if name == "exact-startup-fixed-array-pair-refuted":
+                        assert b"applicable call" in res.stderr and b"call entry: tag = 1, value = 3" in res.stderr, res
                     if name.startswith("ordinary-inferred-array-exists-"):
                         assert b"returned array" in res.stderr and b"no matching index" in res.stderr, res
                         assert b"symbolic call can return cell" not in res.stderr, res

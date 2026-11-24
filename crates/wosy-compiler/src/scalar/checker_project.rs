@@ -1439,9 +1439,13 @@ fn walk_package_initialization<const COLLECT: bool, const PRIVATE_NESTED_SCALAR:
                 (checked.receivers(), &checked.initialization) else {
                     return Err(ProjectCheck::Unsupported);
                 };
-            if !outputs.secondary.is_empty()
-                || structure.checked_types.expressions.get(&outputs.primary) != Some(&receiver.ty)
-            {
+            if !outputs.secondary.is_empty() || structure.checked_types.expressions.get(&outputs.primary).is_none_or(|actual| {
+                if matches!(&receiver.ty, ScalarType::Array { .. }) {
+                    !super::scalar_type_equal(actual, &receiver.ty)
+                } else {
+                    actual != &receiver.ty
+                }
+            }) {
                 return Err(ProjectCheck::Unsupported);
             }
             let value = match (&receiver.ty, &binding.value) {
@@ -1463,6 +1467,23 @@ fn walk_package_initialization<const COLLECT: bool, const PRIVATE_NESTED_SCALAR:
                         .and_then(|predicate| evaluate_initializer_predicate(predicate, &storage, true))
                         .ok_or(ProjectCheck::Unsupported)?;
                     InitializerValue::Boolean(value)
+                }
+                #[cfg(feature = "internal-checker")]
+                (ty @ ScalarType::Array { .. }, ScalarExpression::Call { .. })
+                    if COLLECT && actual.can_initialize_fixed_arrays() =>
+                {
+                    let ActualCallResult::FixedArray(cells) = run_scalar_initializer_call(
+                        topology, actual, source, outputs.primary, ty, &storage, failures, visits,
+                    )? else { return Err(ProjectCheck::Unsupported); };
+                    InitializerValue::FixedArray { ty, cells }
+                }
+                #[cfg(feature = "internal-checker")]
+                (ty, ScalarExpression::IndexedRead { place: super::ScalarPlace::Index { index, .. }, .. })
+                    if COLLECT && is_integer_type(ty) && actual.can_initialize_fixed_arrays() =>
+                {
+                    let value = initialized_fixed_array_cell(topology, &storage, outputs.primary, index, ty)
+                        .ok_or(ProjectCheck::Unsupported)?;
+                    InitializerValue::Integer { ty, value: Cow::Owned(value.clone()) }
                 }
                 (ty, expression) if is_integer_type(ty)
                     || (*ty == ScalarType::Bool && matches!(expression, ScalarExpression::Call { .. })
@@ -1813,10 +1834,15 @@ fn run_initializer_call<'a, Observer: ActualIntegerObserver>(
     let named_bool_entry = false;
     let allow_bool = named_bool_entry || ((real_input || *expected == ScalarType::Unit)
         && collection.is_some() && Observer::ORDINARY_INTEGER_LOCALS);
-    let arguments = if real_input && signature.parameters.is_empty() {
+    #[cfg(feature = "internal-checker")]
+    let fixed_array = actual.can_initialize_fixed_arrays() && collection.is_some() && proof_site.is_some()
+        && matches!(expected, ScalarType::Array { .. });
+    #[cfg(not(feature = "internal-checker"))]
+    let fixed_array = false;
+    let arguments = if (real_input || fixed_array) && signature.parameters.is_empty() {
         ActualProjectedArguments::Single(None)
     } else if signature.parameters.len() == 2
-        && (module_bool_initializer || is_integer_type(expected) || (*expected == ScalarType::Unit && collection.is_some()))
+        && (fixed_array || module_bool_initializer || is_integer_type(expected) || (*expected == ScalarType::Unit && collection.is_some()))
     {
         let first = exact_typed_call_argument_at(&topology.structure, occurrence, 0, allow_bool, &initialized_argument)
             .ok_or(ProjectCheck::Unsupported)?;
@@ -1839,6 +1865,46 @@ fn run_initializer_call<'a, Observer: ActualIntegerObserver>(
 enum InitializerValue<'a> {
     Boolean(bool),
     Integer { ty: &'a ScalarType, value: Cow<'a, BigInt> },
+    #[cfg(feature = "internal-checker")]
+    FixedArray { ty: &'a ScalarType, cells: Vec<BigInt> },
+}
+
+#[cfg(feature = "internal-checker")]
+fn initialized_fixed_array_cell<'a>(
+    topology: &ModuleInitializationTopology, storage: &'a HashMap<ByteSpan, InitializerValue<'_>>,
+    expression: OccurrenceOrdinal, index_expression: &ScalarExpression, expected: &ScalarType,
+) -> Option<&'a BigInt> {
+    use super::reference::{OccurrenceEdge, OccurrenceNode, OccurrenceParent};
+    let structure = &topology.structure;
+    let OccurrenceNode::Place(place) = *structure.edges.get(&(
+        OccurrenceParent::Expression(expression), OccurrenceEdge::ExpressionPlace,
+    ))? else { return None; };
+    let OccurrenceNode::Place(base) = *structure.edges.get(&(
+        OccurrenceParent::Place(place), OccurrenceEdge::PlaceBase,
+    ))? else { return None; };
+    let InitializationStorage::Module(binding) = topology.identities.roots.get(&base)? else { return None; };
+    let InitializerValue::FixedArray { ty, cells } = storage.get(binding)? else { return None; };
+    let ScalarType::Array { element, length, .. } = ty else { return None; };
+    if element.as_ref() != expected || !super::scalar_type_equal(structure.checked_types.places.get(&base)?, ty)
+        || structure.checked_types.places.get(&place)? != expected || u64::try_from(cells.len()).ok()? != *length
+    {
+        return None;
+    }
+    let OccurrenceNode::Expression(index) = *structure.edges.get(&(
+        OccurrenceParent::Place(place), OccurrenceEdge::PlaceIndex,
+    ))? else { return None; };
+    if structure.checked_types.expressions.get(&index)? != &ScalarType::U64
+        || topology.occurrences.get(index.0)?.span != super::typecheck::expression_span(index_expression)
+    {
+        return None;
+    }
+    // Place indices are not call-argument or binding-root literals.
+    let value = match index_expression {
+        ScalarExpression::Integer { value, .. } => value,
+        ScalarExpression::Name { .. } => initialized_integer_argument(topology, storage, index, &ScalarType::U64)?,
+        _ => return None,
+    };
+    cells.get(usize::try_from(value).ok()?)
 }
 
 fn initialized_scalar_initializer_argument<'a>(
@@ -1904,7 +1970,7 @@ fn evaluate_initializer_predicate(
         InitializerPredicate::Boolean(value) => Some(*value),
         InitializerPredicate::BooleanStorage(span) => match storage.get(span)? {
             InitializerValue::Boolean(value) => Some(*value),
-            InitializerValue::Integer { .. } => None,
+            _ => None,
         },
         InitializerPredicate::IntegerComparison { relation, operands } => {
             fn integer<'a>(
@@ -1915,7 +1981,7 @@ fn evaluate_initializer_predicate(
                     InitializerIntegerOperand::Literal(value) => Some(value),
                     InitializerIntegerOperand::Storage(span) => match storage.get(span)? {
                         InitializerValue::Integer { value, .. } => Some(value.as_ref()),
-                        InitializerValue::Boolean(_) => None,
+                        _ => None,
                     },
                 }
             }
@@ -2044,6 +2110,8 @@ trait ActualIntegerObserver {
     #[cfg(feature = "internal-checker")]
     const REAL_MODULE_BOOLEAN_INITIALIZERS: bool = false;
     #[cfg(feature = "internal-checker")]
+    const FIXED_ARRAY_INITIALIZERS: bool = false;
+    #[cfg(feature = "internal-checker")]
     const REAL_BOOLEAN_NARROW_CONTINUATIONS: bool = false;
     #[cfg(feature = "internal-checker")]
     const AUTHORED_STARTUP_SCALARS: bool = false;
@@ -2055,6 +2123,15 @@ trait ActualIntegerObserver {
     const ORDINARY_INTEGER_LOCALS: bool = false;
 
     fn observe(&mut self, target: (usize, usize), arguments: &[&BigInt], value: &BigInt);
+
+    #[cfg(feature = "internal-checker")]
+    fn watches_fixed_array(&self, _: PreparedCallable) -> bool { false }
+
+    #[cfg(feature = "internal-checker")]
+    fn observe_fixed_array_initializer(
+        &mut self, _: PreparedCallable, _: &FunctionCallSites,
+        _: &[&BigInt], _: wosy_syntax::SourceSpan,
+    ) -> Result<Vec<BigInt>, ProjectCheck> { Err(ProjectCheck::Unsupported) }
 
     #[cfg(feature = "internal-checker")]
     fn charge_named_pair_activation(&mut self, _body: &FunctionCallSites) -> Option<()> { None }
@@ -2111,10 +2188,18 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
         &self, topology: &'a ModuleInitializationTopology, source: &'a SourceIdentity,
         occurrence: OccurrenceOrdinal, failures: Option<&OrderedFailures>,
     ) -> Option<InitializerProofSite<'a>> {
-        if !ACTUAL_STARTUP || !Observer::CONTEXTUAL {
+        if !ACTUAL_STARTUP || (!Observer::CONTEXTUAL
+            && !(Observer::FIXED_ARRAY_INITIALIZERS && topology.structure.checker_direct_targets.get(&occurrence)
+                .is_some_and(|&target| self.observer.watches_fixed_array(target))))
+        {
             return None;
         }
         Some(InitializerProofSite { source, call: InitializerProofOrigin::Direct { topology, occurrence, directive_position: failures?.records.len() } })
+    }
+
+    #[cfg(feature = "internal-checker")]
+    fn can_initialize_fixed_arrays(&self) -> bool {
+        ACTUAL_STARTUP && Observer::FIXED_ARRAY_INITIALIZERS
     }
 
     fn nested(
@@ -3078,13 +3163,36 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
         let qualified_entry = false;
         #[cfg(not(feature = "internal-checker"))]
         let (named_reached, named_outer) = (false, None);
+        #[cfg(feature = "internal-checker")]
+        let array_site = if matches!(expected, ScalarType::Array { .. }) {
+            if !self.can_initialize_fixed_arrays() || !self.observer.watches_fixed_array(target) {
+                return Err(ProjectCheck::Unsupported);
+            }
+            let Some(InitializerProofSite {
+                source, call: InitializerProofOrigin::Direct { topology, occurrence, .. },
+            }) = proof_site.as_ref() else { return Err(ProjectCheck::Unsupported); };
+            if *source != &owner.source || !std::ptr::eq(&topology.structure, structure)
+                || *occurrence != call || !collection.is_some_and(|(caller, _)| caller == *source)
+            {
+                return Err(ProjectCheck::Unsupported);
+            }
+            let span = topology.occurrences.get(call.0).ok_or(ProjectCheck::MissingRootOccurrences)?.span;
+            Some(wosy_syntax::SourceSpan::new(owner.source.clone(), span))
+        } else {
+            None
+        };
+        #[cfg(feature = "internal-checker")]
+        let fixed_array = array_site.is_some();
+        #[cfg(not(feature = "internal-checker"))]
+        let fixed_array = false;
         let target_module = target.0;
         if !ACTUAL_STARTUP && (*expected != ScalarType::Unit
             || (collection.is_none() && target_module != self.symbolic_module))
         {
             return Err(ProjectCheck::Unsupported);
         }
-        if !matches!(signature.outputs.outputs.as_slice(), [output] if &output.ty == expected) {
+        if !matches!(signature.outputs.outputs.as_slice(), [output]
+            if &output.ty == expected || (fixed_array && super::scalar_type_equal(&output.ty, expected))) {
             return Err(ProjectCheck::Unsupported);
         }
         let collection = if let Some((caller_source, collection)) = collection {
@@ -3149,7 +3257,7 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             }
             ([first, second], [first_slot, second_slot],
                 ActualProjectedArguments::ExactPair((first_ty, first_value), (second_ty, second_value)))
-                if (module_bool_initializer || is_integer_type(expected) || (*expected == ScalarType::Unit && collection.is_some()))
+                if (fixed_array || module_bool_initializer || is_integer_type(expected) || (*expected == ScalarType::Unit && collection.is_some()))
                     && *first == first_slot.ty && first == first_ty
                     && *second == second_slot.ty && second == second_ty =>
             {
@@ -3165,7 +3273,16 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             return Err(ProjectCheck::Unsupported);
         }
         self.active_depth += 1;
-        let result = if named_reached {
+        let result = if fixed_array {
+            #[cfg(feature = "internal-checker")]
+            {
+                self.observer.observe_fixed_array_initializer(
+                    target, body, exact, array_site.expect("authenticated fixed-array call site"),
+                ).map(ActualCallResult::FixedArray)
+            }
+            #[cfg(not(feature = "internal-checker"))]
+            unreachable!()
+        } else if named_reached {
             self.run_exact_calls::<true>(body, &owner.source, exact, expected, collection, named_outer)
         } else if *expected == ScalarType::Unit {
             if ACTUAL_STARTUP && !Observer::ENABLED && !Observer::CONTEXTUAL {
@@ -4326,6 +4443,7 @@ pub struct MainFlowProofReceipt {
     pub diagnostics: Vec<MainFlowProofDiagnostic>,
     pub contextual_diagnostic: Option<ContextualProofDiagnostic>,
     pub aggregate_diagnostic: Option<AggregateProofDiagnostic>,
+    pub actual_aggregate_diagnostics: Vec<AggregateProofDiagnostic>,
     pub symbolic_diagnostic: Option<SymbolicProofDiagnostic>,
     pub additional_symbolic_diagnostics: Vec<SymbolicProofDiagnostic>,
     pub entry_evidence: Option<Box<ScalarOrderedEntryEvidence>>,
@@ -4338,6 +4456,7 @@ pub struct AggregateProofDiagnostic {
     pub goal: wosy_syntax::SourceSpan,
     pub failed_step: Option<wosy_syntax::SourceSpan>,
     pub output: wosy_syntax::SourceSpan,
+    pub call: Option<wosy_syntax::SourceSpan>,
     // An inferred existential refutes the array as a whole, not one cell.
     pub cell: Option<AggregateProofCell>,
     pub witness: ScalarCheckerIntegerWitness,
@@ -5984,7 +6103,7 @@ impl<'a> MainFlowProofCase<'a> {
         let body = plan.typed.body;
         let named_mixed = named_exact_mixed_pair(&body.boundary.parameters, |entry| &entry.ty)
             && citation_safe_calling_body(body);
-        let guard = checked_scalar_guard_slots::<false>(body, filter, named_mixed).ok_or(ProjectCheck::Unsupported)?;
+        let guard = checked_scalar_guard_slots::<false>(body, filter, named_mixed, false).ok_or(ProjectCheck::Unsupported)?;
         let goal = child(&child(plan.proof, SyntaxKind::ProofEnsures)?, SyntaxKind::Expression)?;
         Ok((Self {
             proof_source: plan.proof_source, proof: wosy_syntax::byte_span(plan.proof),
@@ -6985,7 +7104,7 @@ fn run_closed_ranked_checks<'a, 'proof, const LOCAL_CATALOGS: bool>(
             &prepared.prepared, scope, startup_count, OrderedReachPolicy::Closed, ranked,
         )?;
         return Ok(MainFlowProofReceipt {
-            active: run.active, directives: run.directives, diagnostics: Vec::new(), contextual_diagnostic: None, aggregate_diagnostic: None,
+            active: run.active, directives: run.directives, diagnostics: Vec::new(), contextual_diagnostic: None, aggregate_diagnostic: None, actual_aggregate_diagnostics: Vec::new(),
             symbolic_diagnostic: run.symbolic, additional_symbolic_diagnostics: Vec::new(),
             entry_evidence: run.entry_evidence,
         });
@@ -7022,7 +7141,7 @@ fn run_closed_ranked_checks<'a, 'proof, const LOCAL_CATALOGS: bool>(
     let (symbolic_diagnostic, additional_symbolic_diagnostics) = run.symbolic;
     Ok(MainFlowProofReceipt {
         active: run.active, directives: run.directives,
-        diagnostics: run.actual.bare.map_or_else(Vec::new, |bare| bare.observed.diagnostics), contextual_diagnostic: None, aggregate_diagnostic: None,
+        diagnostics: run.actual.bare.map_or_else(Vec::new, |bare| bare.observed.diagnostics), contextual_diagnostic: None, aggregate_diagnostic: None, actual_aggregate_diagnostics: Vec::new(),
         symbolic_diagnostic, additional_symbolic_diagnostics, entry_evidence: run.entry_evidence,
     })
 }
@@ -7033,7 +7152,7 @@ fn run_closed_without_named_proofs(
 ) -> Result<MainFlowProofReceipt, ProjectCheck> {
     let run = run_prepared_ordered_check(prepared, scope, startup_count, OrderedReachPolicy::Closed, ProofFreeOrderedEvidence)?;
     Ok(MainFlowProofReceipt {
-        active: run.active, directives: run.directives, diagnostics: Vec::new(), contextual_diagnostic: None, aggregate_diagnostic: None,
+        active: run.active, directives: run.directives, diagnostics: Vec::new(), contextual_diagnostic: None, aggregate_diagnostic: None, actual_aggregate_diagnostics: Vec::new(),
         symbolic_diagnostic: None, additional_symbolic_diagnostics: Vec::new(),
         entry_evidence: run.entry_evidence,
     })
@@ -7142,7 +7261,7 @@ fn check_loaded_ordered_proof_diagnostics_in_scope<const LOCAL_CATALOGS: bool>(
             }
         };
         return Ok(MainFlowProofReceipt {
-            active, directives, diagnostics: Vec::new(), contextual_diagnostic, aggregate_diagnostic: None,
+            active, directives, diagnostics: Vec::new(), contextual_diagnostic, aggregate_diagnostic: None, actual_aggregate_diagnostics: Vec::new(),
             symbolic_diagnostic: None, additional_symbolic_diagnostics: Vec::new(), entry_evidence: None,
         });
     }
@@ -7200,17 +7319,18 @@ fn check_loaded_ordered_proof_diagnostics_in_scope<const LOCAL_CATALOGS: bool>(
         let proof = array_quantifier::ArrayProof::prepare(&prepared, source, selected)?;
         let run = run_prepared_ordered_check(
             &prepared.prepared, scope, startup_count, OrderedReachPolicy::Closed,
-            array_quantifier::Evidence { plan: proof },
+            array_quantifier::Evidence::new(&proof),
         )?;
         let aggregate_diagnostic = match run.symbolic {
             Some(ProofCoverage::Applicable(failure)) => failure,
             Some(ProofCoverage::NoApplicableInputs) => None,
-            None if scope == ScalarCheckerScope::MainFlowOnly => None,
+            None if scope == ScalarCheckerScope::MainFlowOnly || run.actual.seen => None,
             None => return Err(ProjectCheck::Unsupported),
         };
         return Ok(MainFlowProofReceipt {
             active: run.active, directives: run.directives,
             diagnostics: Vec::new(), contextual_diagnostic: None, aggregate_diagnostic,
+            actual_aggregate_diagnostics: run.actual.failures,
             symbolic_diagnostic: None, additional_symbolic_diagnostics: Vec::new(), entry_evidence: run.entry_evidence,
         });
     }
@@ -7238,7 +7358,7 @@ fn check_loaded_ordered_proof_diagnostics_in_scope<const LOCAL_CATALOGS: bool>(
     )?;
     let (symbolic_diagnostic, additional_symbolic_diagnostics) = run.symbolic;
     Ok(MainFlowProofReceipt {
-        active: run.active, directives: run.directives, diagnostics: run.actual.observed.diagnostics, contextual_diagnostic: None, aggregate_diagnostic: None,
+        active: run.active, directives: run.directives, diagnostics: run.actual.observed.diagnostics, contextual_diagnostic: None, aggregate_diagnostic: None, actual_aggregate_diagnostics: Vec::new(),
         symbolic_diagnostic, additional_symbolic_diagnostics, entry_evidence: run.entry_evidence,
     })
 }
@@ -8311,13 +8431,16 @@ impl PreparedProofModule {
                     let startup_count = self.prepared.parts().0.initialization_order.len();
                     let run = run_prepared_ordered_check(
                         &self.prepared, ScalarCheckerScope::CurrentPackage, startup_count, OrderedReachPolicy::Closed,
-                        array_quantifier::Evidence { plan },
+                        array_quantifier::Evidence::new(&plan),
                     )?;
                     if !run.directives.is_empty() { return Err(ProjectCheck::Unsupported); }
                     match run.symbolic {
                         Some(ProofCoverage::Applicable(Some(_))) => Ok(ProjectCheck::Refuted),
                         Some(ProofCoverage::Applicable(None)) => Ok(ProjectCheck::Proved),
                         Some(ProofCoverage::NoApplicableInputs) => Ok(ProjectCheck::NoApplicableInputs),
+                        None if !run.actual.failures.is_empty() => Ok(ProjectCheck::Refuted),
+                        None if run.actual.applicable => Ok(ProjectCheck::Proved),
+                        None if run.actual.seen => Ok(ProjectCheck::NoApplicableInputs),
                         None => Err(ProjectCheck::Unsupported),
                     }
                 });
@@ -9160,16 +9283,17 @@ fn checked_integer_guard_slots<'a, const ALLOW_DOMAIN: bool>(
     body: &FunctionCallSites,
     filter: &'a [CheckerPredicate],
 ) -> Option<CheckedIntegerGuardSlots<'a>> {
-    checked_scalar_guard_slots::<ALLOW_DOMAIN>(body, filter, false)
+    checked_scalar_guard_slots::<ALLOW_DOMAIN>(body, filter, false, false)
 }
 
 #[cfg(feature = "internal-checker")]
 fn checked_scalar_guard_slots<'a, const ALLOW_DOMAIN: bool>(
-    body: &FunctionCallSites, filter: &'a [CheckerPredicate], named_mixed: bool,
+    body: &FunctionCallSites, filter: &'a [CheckerPredicate], named_mixed: bool, allow_nullary: bool,
 ) -> Option<CheckedIntegerGuardSlots<'a>> {
     let parameters = body.boundary.parameters.as_slice();
     let bindings = body.boundary.checker_parameter_bindings.as_deref()?;
-    if !matches!(parameters.len(), 1 | 2) || parameters.len() != bindings.len()
+    if (!matches!(parameters.len(), 1 | 2) && !(allow_nullary && parameters.is_empty()))
+        || parameters.len() != bindings.len()
         || (!named_mixed && !parameters.iter().all(|parameter| is_integer_type(&parameter.ty)))
     {
         return None;
@@ -16837,6 +16961,135 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
         assert!(combined.aggregate_diagnostic.is_some() && combined.directives.len() == 1);
         let main = ordered(&broken, ScalarCheckerScope::MainFlowOnly).unwrap();
         assert!(!main.active && main.aggregate_diagnostic.is_none());
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn reached_fixed_array_proofs_keep_separate_calls_and_feed_later_requirements() {
+        let app = source("src/main.w", "reached-fixed-array-input");
+        let text = format!(r#"%%start
+            i8[3](i8) reflect = fn(value) {{
+                i8 inverse = -1 - value;
+                i8[3] made = [value, 127, inverse];
+                i8[3] copied = made;
+                copied
+            }};
+            proof covered for reflect(entry) -> (items)
+                where (entry >= 0 && entry <= 6)
+                ensures (exists (u64 i where i == 0 || i == 2) {{ items[i] >= 0 }})
+            {{}}
+            i8[3] first = reflect(3);
+            i8[3] second = reflect(5);
+            i8[3] duplicate = reflect(3);
+            i8[3] outside = reflect(9);
+            u64 index = 2;
+            i8 first_cell = first[0];
+            i8 second_cell = second[0];
+            i8 duplicate_cell = duplicate[0];
+            i8 outside_cell = outside[index];
+            core.require(first_cell == 3, {OUTPUT});
+            core.require(second_cell == 5, {OUTPUT});
+            core.require(duplicate_cell == 3, {OUTPUT});
+            core.require(outside_cell == -10, {OUTPUT});
+        %%end"#);
+        let run = |text: &str, scope| {
+            let (_, catalog) = crate::parse_proof_source(app.clone(), text.to_owned(), &[]).ok().unwrap();
+            check_loaded_scalar_ordered_local_proof_contexts(
+                Vec::new(), [(catalog, Vec::new())], vec![app.clone()], inputs(), scope, Vec::new(),
+            )
+        };
+        for scope in [ScalarCheckerScope::MainFlowOnly, ScalarCheckerScope::CurrentPackage] {
+            let proved = run(&text, scope).unwrap();
+            assert!(proved.active && proved.actual_aggregate_diagnostics.is_empty());
+            assert!(proved.aggregate_diagnostic.is_none() && proved.directives.is_empty());
+
+            let false_goal = text.replace("items[i] >= 0", "items[i] > 3");
+            let refuted = run(&false_goal, scope).unwrap();
+            assert!(refuted.active && refuted.aggregate_diagnostic.is_none() && refuted.directives.is_empty());
+            let [first, second] = refuted.actual_aggregate_diagnostics.as_slice() else {
+                panic!("both calls with value 3 must be checked, and separately");
+            };
+            let call = |span: &wosy_syntax::SourceSpan| {
+                assert_eq!(span.source, app);
+                (&false_goal[span.range.start as usize..span.range.end as usize], span.range.start)
+            };
+            let first_call = call(first.call.as_ref().unwrap());
+            let second_call = call(second.call.as_ref().unwrap());
+            assert_eq!((first_call.0, second_call.0), ("reflect(3)", "reflect(3)"));
+            assert!(first_call.1 < second_call.1);
+            for failure in [first, second] {
+                assert!(failure.cell.is_none() && failure.failed_step.is_none());
+                let three = BigInt::from(3);
+                assert!(failure.witness.intervals_at(0, 0).unwrap().eq([(&three, &three)]));
+            }
+            let both = run(&false_goal.replace("outside_cell == -10", "outside_cell == 0"), scope).unwrap();
+            assert_eq!(both.actual_aggregate_diagnostics.len(), 2);
+            assert_eq!(both.directives.len(), 1);
+            for invalid_index in [
+                text.replace("u64 index = 2", "u64 index = 3"),
+                text.replace("first[0]", "first[3]"),
+            ] {
+                assert!(matches!(run(&invalid_index, scope), Err(ScalarOrderedCheckerOutcome::Unsupported)));
+            }
+            let unrelated = text.replace("%%end", "i8[1]() absent = fn { [4] }; i8[1] hidden = absent(); %%end");
+            assert!(matches!(run(&unrelated, scope), Err(ScalarOrderedCheckerOutcome::Unsupported)));
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn reached_fixed_array_proofs_admit_nullary_witness_and_guarded_pair() {
+        let app = source("src/main.w", "reached-fixed-array-formals");
+        let run = |text: &str, scope| {
+            let (_, catalog) = crate::parse_proof_source(app.clone(), text.to_owned(), &[]).ok().unwrap();
+            check_loaded_scalar_ordered_local_proof_contexts(
+                Vec::new(), [(catalog, Vec::new())], vec![app.clone()], inputs(), scope, Vec::new(),
+            )
+        };
+        let nullary = r#"%%start
+            u8[2]() make = fn { [7, 8] };
+            proof covered for make() -> (items)
+                ensures (exists (u64 i where i < 2) { items[i] == 7 })
+            { core.witness(1); }
+            u8[2] picked = make();
+            u8 observed = picked[0];
+        %%end"#;
+        let pair = format!(r#"%%start
+            u8[2](u8,u8) make = fn(tag, value) {{
+                if (tag == 1) {{ [value, 7] }} else {{ [9, value] }}
+            }};
+            proof covered for make(selector, before) -> (items)
+                where (selector == 1 && before <= 5) forall (u64 i where i == 0)
+                ensures (items[i] <= 5)
+            {{}}
+            u8[2] chosen = make(1, 3);
+            u8[2] outside = make(2, 9);
+            u8 observed = chosen[0];
+            u8 outside_cell = outside[0];
+            core.require(observed == 3, {OUTPUT});
+            core.require(outside_cell == 9, {OUTPUT});
+        %%end"#);
+        for scope in [ScalarCheckerScope::MainFlowOnly, ScalarCheckerScope::CurrentPackage] {
+            let receipt = run(nullary, scope).unwrap();
+            let [failure] = receipt.actual_aggregate_diagnostics.as_slice() else { panic!("reached explicit witness"); };
+            let cell = failure.cell.as_ref().unwrap();
+            assert_eq!((cell.index.clone(), cell.value.clone()), (BigInt::from(1), BigInt::from(8)));
+            assert!(failure.call.is_some() && failure.failed_step.is_some());
+            assert!(failure.witness.axes().next().is_none());
+            let passed = run(&nullary.replace("core.witness(1)", "core.witness(0)"), scope).unwrap();
+            assert!(passed.active && passed.actual_aggregate_diagnostics.is_empty());
+
+            let proved = run(&pair, scope).unwrap();
+            assert!(proved.active && proved.actual_aggregate_diagnostics.is_empty() && proved.directives.is_empty());
+            let receipt = run(&pair.replace("items[i] <= 5", "items[i] < 3"), scope).unwrap();
+            let [failure] = receipt.actual_aggregate_diagnostics.as_slice() else { panic!("only applicable pair"); };
+            assert!(failure.call.is_some() && failure.failed_step.is_none() && receipt.directives.is_empty());
+            let cell = failure.cell.as_ref().unwrap();
+            assert_eq!((cell.index.clone(), cell.value.clone()), (BigInt::from(0), BigInt::from(3)));
+            for (axis, actual) in [BigInt::from(1), BigInt::from(3)].iter().enumerate() {
+                assert!(failure.witness.intervals_at(0, axis).unwrap().eq([(actual, actual)]));
+            }
+        }
     }
 
     #[cfg(feature = "internal-checker")]

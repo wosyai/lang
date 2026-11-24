@@ -1176,7 +1176,7 @@ fn check_command(
             });
         }
         let mut notes = vec![format!("symbolic call can return {}", failure.returned)];
-        if let Some(entry) = symbolic_entry_point_note(&failure.witness, publication.texts) {
+        if let Some(entry) = entry_point_note(&failure.witness, publication.texts, false) {
             notes.push(entry);
         }
         Diagnostic {
@@ -1212,13 +1212,16 @@ fn check_command(
             notes: vec![format!("contextual value at entry: {}; at exit: {}", failure.entry, failure.exit)],
         }
     });
-    let aggregate = report.aggregate_diagnostic.iter().map(|failure| {
+    let aggregate = report.actual_aggregate_diagnostics.iter().chain(&report.aggregate_diagnostic).map(|failure| {
+        let actual = failure.call.is_some();
         let (primary, output, note) = if let Some(cell) = &failure.cell {
             ("not satisfied by this returned array cell", "returned cell",
-                format!("symbolic call can return cell [{}] = {}", cell.index, cell.value))
+                if actual { format!("call returned cell [{}] = {}", cell.index, cell.value) }
+                else { format!("symbolic call can return cell [{}] = {}", cell.index, cell.value) })
         } else {
             ("no index satisfies this existential goal", "returned array",
-                "symbolic call can return an array with no matching index".to_owned())
+                if actual { "call returned an array with no matching index".to_owned() }
+                else { "symbolic call can return an array with no matching index".to_owned() })
         };
         let mut labels = vec![
             DiagnosticLabel {
@@ -1235,8 +1238,12 @@ fn check_command(
             labels.push(DiagnosticLabel { kind: DiagnosticLabelKind::Secondary, span: failure.goal.clone(),
                 message: "proof goal".to_owned() });
         }
+        if let Some(call) = &failure.call {
+            labels.push(DiagnosticLabel { kind: DiagnosticLabelKind::Secondary, span: call.clone(),
+                message: "applicable call".to_owned() });
+        }
         let mut notes = vec![note];
-        if let Some(entry) = symbolic_entry_point_note(&failure.witness, publication.texts) {
+        if let Some(entry) = entry_point_note(&failure.witness, publication.texts, actual) {
             notes.push(entry);
         }
         Diagnostic {
@@ -1252,9 +1259,10 @@ fn check_command(
 }
 
 #[cfg(feature = "internal-checker")]
-fn symbolic_entry_point_note(
+fn entry_point_note(
     witness: &wosy_compiler::ScalarCheckerIntegerWitness,
     texts: &BTreeMap<ProjectSourceIdentity, String>,
+    actual: bool,
 ) -> Option<String> {
     if witness.row_count() != 1 || witness.axes().len() == 0 { return None; }
     let entries = witness.axes().enumerate().map(|(axis, (binding, _))| {
@@ -1268,7 +1276,8 @@ fn symbolic_entry_point_note(
         let name = name.map_or_else(|| format!("argument {}", axis + 1), str::to_owned);
         Some(format!("{name} = {first}"))
     }).collect::<Option<Vec<_>>>()?;
-    Some(format!("symbolic call entry: {}", entries.join(", ")))
+    let origin = if actual { "call entry" } else { "symbolic call entry" };
+    Some(format!("{origin}: {}", entries.join(", ")))
 }
 
 fn artifact_identity(
