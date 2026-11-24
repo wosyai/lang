@@ -11222,3 +11222,55 @@ fn array_len_does_not_invent_missing_extent_or_accept_nonarrays() {
         }
     }
 }
+
+#[test]
+fn grounded_array_descriptor_uses_returned_extent_and_preserves_unclosed_callers() {
+    let source_text = "%%start
+u8[](u64) fabricate = fn(count) { u8[count] fresh; fresh };
+unit(u64) replace = fn(count) { u8[2] bytes; bytes = fabricate(count); };
+replace(7);
+%%end";
+    let ordinary_use = source_text.replace("replace(7);",
+        "u8[] ordinary = fabricate(5);\nordinary;\nreplace(7);");
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        for (closed, text) in [(true, source_text), (false, ordinary_use.as_str())] {
+            let prepared = prepare_initializer_test(text, layout);
+            let checked = analyze_scalar_build(&prepared);
+            assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+            let source = &prepared.project().modules[0].source;
+            for (project, llvm) in [
+                (false, emit_scalar_build_single_module_llvm(&checked).unwrap().to_text()),
+                (true, emit_scalar_build_project_llvm(&checked).unwrap().to_text()),
+            ] {
+                let producer = self_tail_test_symbol(source, project, "fabricate");
+                let caller = self_tail_test_symbol(source, project, "replace");
+                let caller = self_tail_test_body(&llvm, "void", &caller);
+                if closed {
+                    let body = llvm.split_once(&format!("define internal {{ ptr, i64 }} @{producer}("))
+                        .expect("sealed producer ABI").1.split_once("\n}").unwrap().0;
+                    assert!(body.contains("insertvalue { ptr, i64 } undef, ptr %allocation, 0"), "{body}");
+                    assert!(body.contains("insertvalue { ptr, i64 } %array_return_backing, i64 %count, 1"), "{body}");
+                    assert!(body.contains("ret { ptr, i64 } %array_return_extent"), "{body}");
+                    assert_eq!(caller.matches(&format!("call {{ ptr, i64 }} @{producer}(")).count(), 1, "{caller}");
+                    assert!(caller.contains("extractvalue { ptr, i64 } %array_descriptor, 0"), "{caller}");
+                    assert!(caller.contains("extractvalue { ptr, i64 } %array_descriptor, 1"), "{caller}");
+                    assert!(caller.contains("store ptr %array_descriptor_backing, ptr %bytes_backing"), "{caller}");
+                    assert!(caller.contains("store i64 %array_descriptor_extent, ptr %bytes_length"), "{caller}");
+                    assert_eq!(caller.matches("call void @__wosy_core_free(").count(), 2, "{caller}");
+                    if let Some(out) = std::env::var_os("WOSY_ARRAY_DESCRIPTOR_IR_DIR") {
+                        let target = if layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
+                        let route = if project { "project" } else { "standalone" };
+                        let controlled = llvm.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);
+                        assert_ne!(controlled, llvm);
+                        std::fs::write(std::path::PathBuf::from(out).join(format!("{target}-{route}-control.ll")),
+                            controlled).unwrap();
+                    }
+                } else {
+                    assert!(llvm.contains(&format!("define ptr @{producer}(")), "{llvm}");
+                    assert!(caller.contains(&format!("call ptr @{producer}(")), "{caller}");
+                    assert!(!caller.contains("%array_descriptor_extent"), "{caller}");
+                }
+            }
+        }
+    }
+}

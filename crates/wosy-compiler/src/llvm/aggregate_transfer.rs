@@ -97,6 +97,8 @@ pub(super) struct AggregateEmitter<'ctx, 'plan> {
     ordinary_indexed_emitted: u8,
     ordinary_visited: BTreeSet<usize>,
     literal_array_receipt: LiteralArrayReceipt<'ctx>,
+    array_descriptor_extent: Option<inkwell::values::IntValue<'ctx>>,
+    array_descriptor_result: Option<inkwell::values::StructValue<'ctx>>,
     pub(super) fresh_recommit_extent: Option<(usize, inkwell::values::IntValue<'ctx>)>,
     literal_array_branch_original: Option<LiteralArrayBranchOriginal<'ctx>>,
     base: Option<PointerValue<'ctx>>,
@@ -228,6 +230,8 @@ impl<'ctx, 'plan> AggregateEmitter<'ctx, 'plan> {
             ordinary_indexed_emitted: 0,
             ordinary_visited: BTreeSet::new(),
             literal_array_receipt: LiteralArrayReceipt::Awaiting,
+            array_descriptor_extent: None,
+            array_descriptor_result: None,
             fresh_recommit_extent: None,
             literal_array_branch_original: None,
             base: None,
@@ -264,8 +268,42 @@ impl<'ctx, 'plan> AggregateEmitter<'ctx, 'plan> {
 
 pub(super) fn linkage(plan: Option<&ClosedBody>) -> Option<Linkage> {
     plan.filter(|body| body.returning.is_some() || !body.inputs.is_empty() || body.checked_backing_producer.is_some()
-        || body.checked_backing_wrapper.is_some() || body.ordinary_result)
+        || body.checked_backing_wrapper.is_some() || body.ordinary_result || body.array_descriptor_return)
         .map(|_| Linkage::Internal)
+}
+
+fn array_descriptor_type<'ctx>(context: &'ctx Context) -> inkwell::types::StructType<'ctx> {
+    context.struct_type(&[context.ptr_type(AddressSpace::default()).into(), context.i64_type().into()], false)
+}
+
+pub(super) fn emit_array_descriptor_call<'ctx>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, '_>,
+    expression: &ScalarExpression,
+    symbol: &str,
+    values: &[EmitValue<'ctx>],
+) -> Result<Option<EmitValue<'ctx>>, String> {
+    let Some(calls) = state.aggregate.as_ref().map(|aggregate| &aggregate.plan.array_descriptor_calls)
+        .filter(|calls| !calls.is_empty()) else { return Ok(None) };
+    let Some(ordinal) = state.body_call_nodes.and_then(|nodes| nodes.expression_ordinal(expression)) else {
+        return Ok(None);
+    };
+    if !calls.contains(&ordinal) {
+        return Ok(None);
+    }
+    let function = *state.functions.get(symbol).ok_or("missing checked array descriptor producer")?;
+    let args = values.iter().map(|value| match value {
+        EmitValue::Basic(value) => Ok((*value).into()),
+        _ => Err("unsupported checked array descriptor argument"),
+    }).collect::<Result<Vec<BasicMetadataValueEnum<'ctx>>, _>>()?;
+    if function.get_linkage() != Linkage::Internal || function.count_params() as usize != args.len()
+        || function.get_type().get_return_type() != Some(array_descriptor_type(context).into())
+    {
+        return Err("checked array descriptor transport differs from prepared call".into());
+    }
+    let value = state.builder.build_call(function, &args, "array_descriptor").map_err(builder_error)?
+        .try_as_basic_value().basic().ok_or("missing checked array descriptor result")?;
+    Ok(Some(EmitValue::Basic(value)))
 }
 
 pub(super) fn definition_type<'ctx>(
@@ -275,6 +313,20 @@ pub(super) fn definition_type<'ctx>(
     layout: ScalarTargetLayout,
     plan: Option<&ClosedBody>,
 ) -> Result<FunctionType<'ctx>, String> {
+    if let Some(plan) = plan.filter(|body| body.array_descriptor_return) {
+        let ScalarType::Callable { parameters, outputs } = &function.signature else {
+            return Err("invalid array descriptor declaration".into());
+        };
+        if !matches!(plan.literal_array, Some(ClosedLiteralArray::FreshLeaf { .. }))
+            || !matches!(outputs.outputs.as_slice(), [crate::ScalarOutput { ty: ScalarType::RuntimeArray { .. }, .. }])
+            || !dynamic_return_outputs(function.span, cfg).is_empty()
+        {
+            return Err("invalid sealed array descriptor producer".into());
+        }
+        let args = parameters.iter().map(|ty| basic_type(context, ty, layout).map(Into::into))
+            .collect::<Result<Vec<BasicMetadataTypeEnum<'ctx>>, _>>()?;
+        return Ok(array_descriptor_type(context).fn_type(&args, false));
+    }
     if plan.is_some_and(|body| body.ordinary_result) {
         let ScalarType::Callable { parameters, outputs } = &function.signature else {
             return Err("invalid ordinary aggregate declaration".into());
@@ -420,6 +472,9 @@ pub(super) fn enroll_literal_array_allocation<'ctx>(
         || !matches!(aggregate.literal_array_receipt, LiteralArrayReceipt::Awaiting)
     {
         return Err("checked literal array allocation does not match its receipt".into());
+    }
+    if aggregate.plan.array_descriptor_return {
+        aggregate.array_descriptor_extent = Some(length);
     }
     aggregate.literal_array_receipt = LiteralArrayReceipt::Original { base, storage, argument_extent: None, in_writer: None };
     Ok(())
@@ -628,8 +683,17 @@ pub(super) fn install_literal_array_replacement<'ctx>(
         else { return Err("missing checked literal array replacement".into()) };
     let Some((_, extent, expected_arm)) = literal_array_write(aggregate.plan.literal_array, call)
         else { return Err("checked array writer does not match its call".into()) };
-    let EmitValue::Basic(BasicValueEnum::PointerValue(fresh)) = value else {
-        return Err("checked literal array replacement has no backing".into());
+    let descriptor = aggregate.plan.array_descriptor_calls.contains(&call);
+    let (fresh, transported_extent) = match (descriptor, value) {
+        (false, EmitValue::Basic(BasicValueEnum::PointerValue(fresh))) => (*fresh, None),
+        (true, EmitValue::Basic(BasicValueEnum::StructValue(pair))) if pair.get_type() == array_descriptor_type(context) => {
+            let fresh = state.builder.build_extract_value(*pair, 0, "array_descriptor_backing")
+                .map_err(builder_error)?.into_pointer_value();
+            let length = state.builder.build_extract_value(*pair, 1, "array_descriptor_extent")
+                .map_err(builder_error)?.into_int_value();
+            (fresh, Some(length))
+        }
+        _ => return Err("checked literal array replacement has no matching backing transport".into()),
     };
     let LiteralArrayReceipt::Original {
         base: original, storage: Some((destination, length_slot)), argument_extent, in_writer,
@@ -639,16 +703,17 @@ pub(super) fn install_literal_array_replacement<'ctx>(
     if in_writer != expected_arm {
         return Err("checked array writer does not match its branch and call".into());
     }
-    let length = match (extent, argument_extent) {
-        (ReplacementArrayExtent::Literal(elements), None) => context.i64_type().const_int(elements, false),
-        (ReplacementArrayExtent::Argument { .. }, Some(length)) => length,
+    let length = match (transported_extent, extent, argument_extent) {
+        (Some(length), _, None) => length,
+        (None, ReplacementArrayExtent::Literal(elements), None) => context.i64_type().const_int(elements, false),
+        (None, ReplacementArrayExtent::Argument { .. }, Some(length)) => length,
         _ => return Err("checked array replacement has no matching extent".into()),
     };
     release_literal_array_base(context, state, original)?;
-    state.builder.build_store(destination, *fresh).map_err(builder_error)?;
+    state.builder.build_store(destination, fresh).map_err(builder_error)?;
     state.builder.build_store(length_slot, length).map_err(builder_error)?;
     state.aggregate.as_mut().expect("checked literal array replacement").literal_array_receipt =
-        LiteralArrayReceipt::Fresh { base: *fresh, joined_storage: unit.map(|_| destination) };
+        LiteralArrayReceipt::Fresh { base: fresh, joined_storage: unit.map(|_| destination) };
     Ok(())
 }
 
@@ -1844,6 +1909,14 @@ pub(super) fn commit_return<'ctx>(
         if !matches!(result, EmitValue::Basic(BasicValueEnum::PointerValue(returned)) if *returned == base) {
             return Err("checked fresh literal array return did not carry its allocation".into());
         }
+        if aggregate.plan.array_descriptor_return {
+            let extent = aggregate.array_descriptor_extent.take().ok_or("missing original array descriptor extent")?;
+            let pair = state.builder.build_insert_value(array_descriptor_type(context).get_undef(), base, 0, "array_return_backing")
+                .map_err(builder_error)?.into_struct_value();
+            let pair = state.builder.build_insert_value(pair, extent, 1, "array_return_extent")
+                .map_err(builder_error)?.into_struct_value();
+            aggregate.array_descriptor_result = Some(pair);
+        }
         return Ok(());
     }
     if let Some((call, expected)) = &aggregate.plan.multi_forward {
@@ -2113,6 +2186,11 @@ pub(super) fn finish_return<'ctx>(
             return Err("ordinary aggregate result did not materialize before cleanup".into());
         }
         state.builder.build_return(None).map_err(builder_error)?;
+        return Ok(Some(()));
+    }
+    if aggregate.plan.array_descriptor_return {
+        let pair = aggregate.array_descriptor_result.take().ok_or("missing committed array descriptor return")?;
+        state.builder.build_return(Some(&pair)).map_err(builder_error)?;
         return Ok(Some(()));
     }
     let Some(route) = aggregate.plan.returning else {

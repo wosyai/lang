@@ -4867,21 +4867,29 @@ fn materialize_assignment_values<'ctx, 'module, 'expected>(
                 position += 1;
                 continue;
             }
-            let temporary = entry_storage_alloca(context, state, &ty, "assignment_value")?;
-            store_value(context, state, temporary, &ty, value)?;
-            let value = if matches!(ty, ScalarType::Struct(_) | ScalarType::Array { .. }) {
-                EmitValue::Basic(temporary.into())
+            let value = if literal_array_replacement.is_some()
+                && matches!(&value, EmitValue::Basic(BasicValueEnum::StructValue(_)))
+            {
+                // The sealed call result is an already evaluated paired SSA
+                // value. Do not materialize it through a legacy pointer slot.
+                value
             } else {
-                EmitValue::Basic(
-                    state
-                        .builder
-                        .build_load(
-                            basic_type(context, &ty, state.target_layout)?,
-                            temporary,
-                            "assignment_value",
-                        )
-                        .map_err(builder_error)?,
-                )
+                let temporary = entry_storage_alloca(context, state, &ty, "assignment_value")?;
+                store_value(context, state, temporary, &ty, value)?;
+                if matches!(ty, ScalarType::Struct(_) | ScalarType::Array { .. }) {
+                    EmitValue::Basic(temporary.into())
+                } else {
+                    EmitValue::Basic(
+                        state
+                            .builder
+                            .build_load(
+                                basic_type(context, &ty, state.target_layout)?,
+                                temporary,
+                                "assignment_value",
+                            )
+                            .map_err(builder_error)?,
+                    )
+                }
             };
             values.push(AssignmentValue {
                 value,

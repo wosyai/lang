@@ -2886,6 +2886,8 @@ pub(crate) struct ClosedBody {
     pub(crate) fresh_array_recommits: BTreeMap<usize, ClosedFreshRecommit>,
     pub(crate) local_array_failure: Option<ClosedLocalArrayRelease>,
     pub(crate) literal_array: Option<ClosedLiteralArray>,
+    pub(crate) array_descriptor_return: bool,
+    pub(crate) array_descriptor_calls: BTreeSet<usize>,
     // Each exit's owning formals, in ascending declared slot order.
     pub(crate) input_releases: BTreeMap<CfgPointId, Vec<usize>>,
     pub(crate) input_release_guard: Option<usize>,
@@ -5071,6 +5073,7 @@ enum SnapshotUse {
 #[derive(Default)]
 struct OrdinaryCohorts {
     private: BTreeMap<BodyKey, (OrdinaryResultCandidate, bool)>,
+    array_uses: HashMap<BodyKey, Option<Vec<(BodyKey, usize)>>>,
     namespace: BTreeMap<BodyKey, Vec<SnapshotUse>>,
     indexed: BTreeMap<BodyKey, ClosedIndexedSnapshot>,
     terminal_indexed: BTreeMap<BodyKey, [ClosedIndexedSnapshot; 2]>,
@@ -5123,6 +5126,36 @@ impl OrdinaryCohorts {
         }
     }
 
+    fn record_array_use(&mut self, target: BodyKey, use_site: Option<(BodyKey, usize)>) {
+        if let Some(record) = self.array_uses.get_mut(&target) {
+            match (record.as_mut(), use_site) {
+                (Some(uses), Some(site)) => uses.push(site),
+                (_, None) => *record = None,
+                (None, Some(_)) => {}
+            }
+        }
+    }
+
+    fn seal_array_descriptors(&self, result: &mut ClosedAggregates) {
+        for (&target, uses) in &self.array_uses {
+            let Some(uses) = uses.as_ref().filter(|uses| !uses.is_empty()) else { continue };
+            if !matches!(result.bodies.get(&target).and_then(|plan| plan.literal_array),
+                Some(ClosedLiteralArray::FreshLeaf { .. }))
+                || uses.iter().any(|&(caller, ordinal)| !result.bodies.get(&caller)
+                    .and_then(|plan| plan.literal_array)
+                    .is_some_and(|route| matches!(route, ClosedLiteralArray::Replacement { call, unit, .. }
+                        if call == ordinal || unit.and_then(|unit| unit.other_writer)
+                            .is_some_and(|writer| writer.call == ordinal))))
+            {
+                continue;
+            }
+            result.bodies.get_mut(&target).expect("proved descriptor producer").array_descriptor_return = true;
+            for &(caller, ordinal) in uses {
+                result.bodies.get_mut(&caller).expect("proved descriptor receiver").array_descriptor_calls.insert(ordinal);
+            }
+        }
+    }
+
     fn record(&mut self, target: BodyKey, site: Option<OrdinaryResultSite>) {
         if let Some((candidate, copy)) = self.private.get_mut(&target) {
             candidate.record(site, *copy);
@@ -5138,9 +5171,10 @@ impl OrdinaryCohorts {
         module_at: &impl Fn(usize) -> Option<ModuleInput<'a>>,
         declarations: &HashMap<(&SourceIdentity, ByteSpan), (usize, usize)>,
     ) {
-        if (!self.private.is_empty() || !self.namespace.is_empty())
+        if (!self.private.is_empty() || !self.namespace.is_empty() || !self.array_uses.is_empty())
             && self.collect_uses(reservations, module_at, declarations).is_none()
         {
+            self.array_uses.clear();
             self.private.clear();
             self.namespace.clear();
             self.indexed.clear();
@@ -5164,12 +5198,12 @@ impl OrdinaryCohorts {
                 return None;
             }
             for escape in &sites.callable_escapes {
-                if let Some(target) = selected(&escape.source, escape.range) { self.record(target, None); }
+                if let Some(target) = selected(&escape.source, escape.range) { self.record(target, None); self.record_array_use(target, None); }
             }
             for target in sites.allocation_length_call_targets.values() {
                 match target {
                     ResolvedCallTarget::ModuleCallable { source, declaration_span, .. } => {
-                        if let Some(target) = selected(source, *declaration_span) { self.record(target, None); }
+                        if let Some(target) = selected(source, *declaration_span) { self.record(target, None); self.record_array_use(target, None); }
                     }
                     ResolvedCallTarget::LocalCallable(_) | ResolvedCallTarget::CallableField { .. } => return None,
                     _ => {}
@@ -5182,6 +5216,10 @@ impl OrdinaryCohorts {
                 match &site.target {
                     ResolvedCallTarget::ModuleCallable { source, declaration_span, concrete } => {
                         let Some(target) = selected(source, *declaration_span) else { continue };
+                        self.record_array_use(target,
+                            (monomorphic && arm.is_none() && matches!(concrete, ConcreteCallSelection::Declaration)
+                                && !sites.declared_unsafe_calls.contains(&occurrence.ordinal.0))
+                            .then_some((caller, occurrence.ordinal.0)));
                         if let Some((candidate, copy)) = self.private.get_mut(&target) {
                             let allowed = monomorphic && arm.is_none()
                                 && function.generic_parameters.is_empty() && function.overload_arms.is_empty()
@@ -5228,13 +5266,14 @@ impl OrdinaryCohorts {
             let region = &input.calls.initialization;
             let ModuleInitializationDetail::Occurrences(topology) = &region.detail else { return None };
             for escape in &topology.callable_escapes {
-                if let Some(target) = selected(&escape.source, escape.range) { self.record(target, None); }
+                if let Some(target) = selected(&escape.source, escape.range) { self.record(target, None); self.record_array_use(target, None); }
             }
             let mut allowed = None;
             for &ordinal in &topology.calls {
                 match region.call_target(ordinal) {
                     Some(ModuleInitializationCallTarget::Direct { declaration, concrete }) => {
                         let Some(target) = selected(&declaration.source, declaration.range) else { continue };
+                        self.record_array_use(target, None);
                         if let Some((candidate, copy)) = self.private.get_mut(&target) { candidate.record(None, *copy); }
                         if let Some(uses) = self.namespace.get_mut(&target) {
                             let storage = (matches!(concrete, ConcreteCallSelection::Declaration)
@@ -5247,7 +5286,7 @@ impl OrdinaryCohorts {
                         }
                     }
                     Some(ModuleInitializationCallTarget::Generic { declaration, .. }) => {
-                        if let Some(target) = selected(&declaration.source, declaration.range) { self.record(target, None); }
+                        if let Some(target) = selected(&declaration.source, declaration.range) { self.record(target, None); self.record_array_use(target, None); }
                     }
                     Some(ModuleInitializationCallTarget::CallableBinding(_) | ModuleInitializationCallTarget::CallableField { .. })
                     | None => return None,
@@ -6061,6 +6100,11 @@ fn closed_aggregates<'a>(
         let (facts, cfg) = result_at(key, body)
             .ok_or_else(|| format!("missing emitted aggregate result {key:?}"))?;
         declarations.insert((input.source, function.name_span), (module, item));
+        if is_monomorphic && arm.is_none() && facts.is_some_and(|facts|
+            matches!(facts.proved_literal_array_route(), Some(LiteralArrayRoute::FreshLeaf { .. })))
+        {
+            ordinary.array_uses.entry(key).or_insert_with(|| Some(Vec::new()));
+        }
         ordinary.seed(
             key, is_monomorphic, input.source, function, input.structs, sites, reservations.snapshot_struct,
         );
@@ -6438,6 +6482,7 @@ fn closed_aggregates<'a>(
     }
     let finalize_cohorts = |mut result: ClosedAggregates| -> Result<ClosedAggregates, String> {
         install_literal_array_plans(&literal_array_callers, &bodies, &declarations, &mut result);
+        ordinary.seal_array_descriptors(&mut result);
         install_fresh_recursive_recommits(reservations, &module_at, &bodies, &declarations, &mut result)?;
         ordinary.install(&module_at, &mut result)?;
         Ok(result)
@@ -7873,6 +7918,27 @@ mod tests {
         facts.literal_array_write = None;
         facts.literal_array_value = Some((pair.write.rhs, pair.final_output));
         assert_eq!(facts.observation_mode(), Some(AggregateObservationMode { literal: true, legacy: false }));
+    }
+
+    #[test]
+    fn array_descriptor_activation_requires_every_qualified_use_to_match() {
+        let pair = synthetic_literal_array_pair();
+        for unsupported in [None, Some(Some((pair.caller, pair.write.producer.0 + 1))), Some(None)] {
+            let mut plans = ClosedAggregates::default();
+            enroll_literal_array_pair(&mut plans, pair, LiteralArrayParameters::default());
+            let mut census = OrdinaryCohorts::default();
+            census.array_uses.insert(pair.callee, Some(Vec::new()));
+            census.record_array_use(pair.callee, Some((pair.caller, pair.write.producer.0)));
+            if let Some(unsupported) = unsupported {
+                census.record_array_use(pair.callee, unsupported);
+                // A later valid use cannot reverse refusal.
+                census.record_array_use(pair.callee, Some((pair.caller, pair.write.producer.0)));
+            }
+            census.seal_array_descriptors(&mut plans);
+            assert_eq!(plans.bodies[&pair.callee].array_descriptor_return, unsupported.is_none());
+            assert_eq!(plans.bodies[&pair.caller].array_descriptor_calls.contains(&pair.write.producer.0),
+                unsupported.is_none());
+        }
     }
 
     #[test]
