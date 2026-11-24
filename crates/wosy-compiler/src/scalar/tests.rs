@@ -260,6 +260,21 @@ fn generic_template_copy_policy_resolves_at_concrete_call_points_in_both_validat
             assert_eq!(specialized.template_point, deferred.id);
             assert_eq!(specialized.policy, expected);
             assert_eq!(selection.substitutions.get("T"), Some(&specialized.ty));
+            if let ScalarType::CheckedReference { mutability, .. } = &specialized.ty {
+                let CfgPointKind::Call { argument_points, .. } = &call.kind else { unreachable!() };
+                let [argument] = argument_points.as_slice() else { panic!("exact unary formal") };
+                let roots = call.possible_origins.as_ref().expect("concrete compared checked origin");
+                assert_eq!(roots.len(), 1);
+                assert_eq!(Some(roots), function.reference_cfg.points[argument.0].possible_origins.as_ref());
+                assert!(matches!(&function.reference_cfg.facts[roots.first().unwrap().0],
+                    ReferenceOrigin::BorrowedFrom { parameter: 0, loan } if &loan.mode == mutability));
+                let returned = function.reference_cfg.points.iter().find(|point| matches!(point.kind,
+                    CfgPointKind::ReturnOutput { value_point, output: 0, checked: true } if value_point == call.id))
+                    .expect("checked return remains that exact call");
+                assert_eq!(returned.possible_origins.as_ref(), Some(roots));
+            } else {
+                assert!(call.possible_origins.as_ref().is_none_or(BTreeSet::is_empty));
+            }
             let moves = function.reference_cfg.points.iter().filter(|point| matches!(&point.kind, CfgPointKind::Move { owner, .. } if owner.declaration_span == function.parameter_spans[0])).collect::<Vec<_>>();
             assert_eq!(
                 moves.len(),

@@ -1029,7 +1029,7 @@ pub(super) mod tests {
         builder.cfg.initial_points = builder.cfg.points.clone();
         FunctionReferenceResult {
             cfg: builder.cfg, proof_points: builder.proof_points,
-            checked_contract_returns: vec![], aggregate: aggregate::AggregateFlowResult::default(), arms: vec![],
+            checked_contract_returns: vec![], whole_generic_formal: None, aggregate: aggregate::AggregateFlowResult::default(), arms: vec![],
         }
     }
 
@@ -1434,7 +1434,7 @@ pub(super) mod tests {
             }
             let mut result = FunctionReferenceResult {
                 cfg: builder.cfg, proof_points: builder.proof_points,
-                checked_contract_returns: vec![], aggregate: aggregate::AggregateFlowResult::default(), arms: vec![],
+                checked_contract_returns: vec![], whole_generic_formal: None, aggregate: aggregate::AggregateFlowResult::default(), arms: vec![],
             };
             Some(definitive(&mut result))
         };

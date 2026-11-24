@@ -8350,10 +8350,16 @@ fn require_available_fallible_read(
     });
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CallOriginTransfer<'a> {
+    Explicit(&'a [ReferenceOrigin]),
+    WholeFormal(usize),
+}
+
 fn transfer_reference_facts(
     mut cfg: ReferenceTransferCfg<'_>,
     deferred_policies: &BTreeMap<usize, CopyPolicy>,
-    contracts: &HashMap<CfgPointId, &[ReferenceOrigin]>,
+    contracts: &HashMap<CfgPointId, CallOriginTransfer<'_>>,
     mut aggregate: Option<(
         &aggregate::AggregateFlowFacts,
         aggregate::AggregateObservationMode,
@@ -9085,7 +9091,20 @@ fn transfer_reference_facts(
             } else if let CfgPointKind::Call { output, argument_points, .. } =
                 &cfg.points[id.0].kind
             {
-                contracts.get(&id).map(|&origins| {
+                contracts.get(&id).map(|&transfer| {
+                    let origins = match transfer {
+                        CallOriginTransfer::Explicit(origins) => origins,
+                        CallOriginTransfer::WholeFormal(parameter) => {
+                            return argument_points.get(parameter).and_then(|argument| state.point_values.get(*argument))
+                                .filter(|origins| !origins.is_empty()).cloned().unwrap_or_else(|| {
+                                    errors.push(ReferenceAnalysisError::MissingContext {
+                                        source_span: cfg.points[id.0].source_span.clone(),
+                                        reason: ReferenceAnalysisErrorReason::MissingCheckedReferenceOrigin,
+                                    });
+                                    BTreeSet::new()
+                                });
+                        }
+                    };
                     let mut results = BTreeSet::new();
                     for origin in origins {
                         let actual = match origin {
@@ -14202,13 +14221,40 @@ enum ReferenceCallableBody {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+enum ReferenceOutputOrigins {
+    Explicit(Vec<ReferenceOrigin>),
+    WholeGenericFormal { generic: String, parameter: usize },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct ReferenceOutputContract<'a> {
     source: &'a SourceIdentity,
     declaration_span: ByteSpan,
     body: ReferenceCallableBody,
     output: usize,
-    origins: Vec<ReferenceOrigin>,
+    origins: ReferenceOutputOrigins,
     independent_static: bool,
+}
+
+impl ReferenceOutputContract<'_> {
+    fn instantiate(
+        &self, concrete: &ConcreteCallSelection, type_arguments: &[ScalarTypeArgument], unique: bool,
+    ) -> Option<CallOriginTransfer<'_>> {
+        match &self.origins {
+            ReferenceOutputOrigins::Explicit(origins) => Some(CallOriginTransfer::Explicit(origins)),
+            ReferenceOutputOrigins::WholeGenericFormal { generic, parameter } if unique => {
+                let ty = match concrete {
+                    ConcreteCallSelection::Overload(selected) => selected.substitutions.get(generic)?,
+                    ConcreteCallSelection::Declaration => match type_arguments {
+                        [argument] => &argument.ty,
+                        _ => return None,
+                    },
+                };
+                matches!(ty, ScalarType::CheckedReference { .. }).then_some(CallOriginTransfer::WholeFormal(*parameter))
+            }
+            ReferenceOutputOrigins::WholeGenericFormal { .. } => None,
+        }
+    }
 }
 
 struct ReferenceOutputContractMatch {
@@ -14292,13 +14338,20 @@ fn collect_function_output_contracts<'a>(
             declaration_span,
             body,
             output,
-            origins: origins
+            origins: ReferenceOutputOrigins::Explicit(origins
                 .iter()
                 .map(|id| {
                     independent = independent && result.aggregate.checked_result_origins.contains(id);
                     result.cfg.facts[id.0].clone()
                 })
-                .collect(),
+                .collect()),
+            independent_static: false,
+        });
+    }
+    if let Some(generic) = &result.whole_generic_formal {
+        contracts.push(ReferenceOutputContract {
+            source, declaration_span, body, output: 0,
+            origins: ReferenceOutputOrigins::WholeGenericFormal { generic: generic.clone(), parameter: 0 },
             independent_static: false,
         });
     }
@@ -14458,7 +14511,7 @@ fn transfer_function_output_contracts<'a>(
     result: &mut FunctionReferenceResult,
     previous: &ReferenceOutputContracts<'_>,
     contracts: &'a ReferenceOutputContracts<'_>,
-    inputs: &mut HashMap<CfgPointId, &'a [ReferenceOrigin]>,
+    inputs: &mut HashMap<CfgPointId, CallOriginTransfer<'a>>,
     replays: &mut Vec<ReferenceContractReplay>,
     cursor: &mut usize,
 ) {
@@ -14494,13 +14547,15 @@ fn transfer_function_output_contracts<'a>(
         } = &result.cfg.initial_points[id.0].kind else {
             unreachable!("recorded module call point")
         };
-        let current = contracts.find(source, *declaration_span, concrete, *output);
+        let current = contracts.find(source, *declaration_span, concrete, *output)
+            .and_then(|(row, unique)| Some((row, unique, row.instantiate(concrete, type_arguments, unique)?)));
         if !changed {
-            let prior = previous.find(source, *declaration_span, concrete, *output);
-            changed = current.map(|(row, _)| &row.origins) != prior.map(|(row, _)| &row.origins);
+            let prior = previous.find(source, *declaration_span, concrete, *output)
+                .and_then(|(row, unique)| row.instantiate(concrete, type_arguments, unique));
+            changed = current.map(|(_, _, transfer)| transfer) != prior;
         }
-        if let Some((row, unique)) = current {
-            inputs.insert(id, row.origins.as_slice());
+        if let Some((row, unique, transfer)) = current {
+            inputs.insert(id, transfer);
             if *output == 0 && type_arguments.is_empty() && row.independent_static && unique {
                 result.aggregate.checked_successor_contract |= result.aggregate.checked_successor_candidate == Some(id);
                 result.aggregate.raw_read_forward_contract |= result.aggregate.raw_read_forward_candidate == Some(id)
@@ -14909,6 +14964,7 @@ impl CheckedContractReturn {
 struct FunctionReferenceResult {
     cfg: ScalarReferenceCfg,
     checked_contract_returns: Vec<CheckedContractReturn>,
+    whole_generic_formal: Option<String>,
     proof_points: CallablePointFacts,
     aggregate: aggregate::AggregateFlowResult,
     arms: Vec<FunctionReferenceResult>,
@@ -15100,6 +15156,45 @@ fn seal_guarded_scalar_allocations(
     }).collect()
 }
 
+// Record only a prepared exact unary template identity. Generic output
+// types have no abstract loan, and no origin is invented for the template.
+fn prepared_whole_generic_formal(calls: &FunctionCallSites, cfg: &ScalarReferenceCfg) -> Option<String> {
+    let [generic] = calls.boundary.generics.as_slice() else { return None };
+    let [parameter] = calls.boundary.parameters.as_slice() else { return None };
+    let [output] = calls.boundary.root_outputs.as_slice() else { return None };
+    let generic_type = |ty: &ScalarType| matches!(ty, ScalarType::Named { name, .. } if name == &generic.name);
+    let [item] = calls.structure.blocks.get(calls.structure.root.0)?.items.as_slice() else { return None };
+    let BlockItemKind::FinalOutput(final_value) = &item.kind else { return None };
+    let PlainNameIdentity::Lexical(formal) = calls.prepared_plain_name(final_value.expression)? else { return None };
+    if parameter.ordinal != 0 || output.output != 0 || final_value.output != 0
+        || !generic_type(&parameter.ty) || !generic_type(&output.ty)
+        || !calls.structure.checked_types.expressions.get(&final_value.expression).is_some_and(generic_type)
+        || formal.declaration_span != parameter.span || formal.kind != ReferenceBindingKind::Declared
+        || !cfg.allocations.is_empty()
+    { return None; }
+    let points = &cfg.initial_points;
+    let mut saw_read = None;
+    let mut saw_move = false;
+    let mut saw_return = false;
+    for (index, point) in points.iter().enumerate() {
+        if points.get(index + 1).map_or(!point.successors.is_empty(), |next| point.successors.as_slice() != [next.id]) {
+            return None;
+        }
+        match &point.kind {
+            CfgPointKind::Entry | CfgPointKind::ScopeEnter | CfgPointKind::ScopeExit | CfgPointKind::Return => {},
+            CfgPointKind::Bind { binding } if binding == formal => {},
+            CfgPointKind::Read { binding } if binding == formal && saw_read.is_none() => saw_read = Some(point.id),
+            CfgPointKind::DeferredMove { place, owner, ty } if saw_read.is_some() && !saw_move
+                && owner == formal && &place.binding == formal && place.projections.is_empty() && generic_type(ty) =>
+                    saw_move = true,
+            CfgPointKind::ReturnOutput { output: 0, value_point, checked: false }
+                if saw_move && !saw_return && Some(*value_point) == saw_read => saw_return = true,
+            _ => return None,
+        }
+    }
+    saw_return.then(|| generic.name.clone())
+}
+
 fn derive_function_reference_result(
     source: &SourceIdentity,
     function: &ScalarFunction,
@@ -15133,9 +15228,11 @@ fn derive_function_reference_result(
     builder.shared_scalar_read_effects = effects;
     let (cfg, current_errors, proof_points, aggregate, checked_contract_returns) =
         build_function_reference_cfg(builder, function, errors.len() == entry_errors);
+    let whole_generic_formal = current_errors.is_empty().then(|| prepared_whole_generic_formal(call_sites, &cfg)).flatten();
     errors.extend(current_errors);
     FunctionReferenceResult {
         checked_contract_returns,
+        whole_generic_formal,
         cfg,
         arms,
         proof_points,

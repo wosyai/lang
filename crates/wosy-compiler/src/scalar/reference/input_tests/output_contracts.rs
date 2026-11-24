@@ -267,7 +267,7 @@ fn replay_observes_only_consumed_first_output_contract_origins() {
             declaration_span,
             body: ReferenceCallableBody::Declaration,
             output,
-            origins,
+            origins: ReferenceOutputOrigins::Explicit(origins),
             independent_static: true,
         };
         let previous = ReferenceOutputContracts::new(vec![
@@ -284,12 +284,12 @@ fn replay_observes_only_consumed_first_output_contract_origins() {
             &program.source, span(0), &ConcreteCallSelection::Declaration, 0,
         ).unwrap();
         assert!(!unique);
-        assert_eq!(left.origins, origins);
+        assert_eq!(left.origins, ReferenceOutputOrigins::Explicit(origins.clone()));
         let (right_other_output, unique) = current.find(
             &program.source, span(1), &ConcreteCallSelection::Declaration, 1,
         ).unwrap();
         assert!(unique);
-        assert!(right_other_output.origins.is_empty());
+        assert_eq!(right_other_output.origins, ReferenceOutputOrigins::Explicit(Vec::new()));
 
         let mut replays = Vec::new();
         let marker = ByteSpan::new(text.len() as u32 + 1, text.len() as u32 + 2);
