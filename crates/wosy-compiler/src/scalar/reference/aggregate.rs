@@ -4323,8 +4323,10 @@ fn closed_aggregates<'a>(
                 "aggregate owning formal conditional transfer has no exact release route in {:?} at slot {slot}",
                 body.source,
             );
+            let exhaustive = facts.conditional_formal_forwards.len() == 2;
             if mixed || next.iter().any(|target| modes[target] != (true, false)
-                    || forward_edges.contains_key(target) || conditional_forward_edges.contains_key(target))
+                    || (!exhaustive && forward_edges.contains_key(target))
+                    || conditional_forward_edges.contains_key(target))
                 || !facts.raw_uses.is_empty()
                 || !ordinary_formal_outputs(&body.sites.boundary.root_outputs)
             {
@@ -4408,8 +4410,9 @@ fn closed_aggregates<'a>(
                     && conditional_forward_edges.get(&(caller, *formal))
                         .is_some_and(|targets| targets.contains(&(callee, slot)))
                     && modes.get(&(caller, *formal)) == Some(&(true, false))
-                    && !mixed && release.is_some() && facts.raw_uses.is_empty()
-                    && ordinary_formal_outputs(&body.sites.boundary.root_outputs) =>
+                    && !mixed && (release.is_some() || (forward_edges.contains_key(&(callee, slot))
+                        && bodies[&caller].facts.is_some_and(|facts| facts.conditional_formal_forwards.len() == 2)))
+                    && facts.raw_uses.is_empty() && ordinary_formal_outputs(&body.sites.boundary.root_outputs) =>
                         ClosedInput::ForwardFormalDeferred(*formal),
                 Some(Some(InputOrigin::ConditionalFormal(formal))) =>
                     return Err(format!("aggregate owning formal conditional transfer has no exact release route in {:?} at slot {formal}",

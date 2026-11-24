@@ -730,15 +730,36 @@ fn conditional_formal_transfer_uses_original_hidden_base_in_recursive_frames() {
         let two_sinks = exhaustive.replace("u64(Packet, bool) relay",
             "u64(u64, Packet) alternative = fn(delta, packet) { packet.length + delta };\nu64(Packet, bool) relay")
             .replace("else { accept_packet(packet) }", "else { alternative(9, packet) }");
-        for (route, candidate) in [("exhaustive", &exhaustive), ("two-sinks", &two_sinks)] {
+        let through_forwarder = exhaustive.replace("u64(Packet, bool) relay",
+            "u64(Packet) forward = fn(packet) { accept_packet(packet) };\nu64(Packet, bool) relay")
+            .replace("else { accept_packet(packet) }", "else { forward(packet) }");
+        for (route, candidate) in [("exhaustive", &exhaustive), ("two-sinks", &two_sinks),
+            ("through-forwarder", &through_forwarder)]
+        {
             let ir = emit(candidate).unwrap_or_else(|error| panic!("{target}: {error}"));
             let module = context.create_module_from_ir(MemoryBuffer::create_from_memory_range_copy(ir.as_bytes(), target)).unwrap();
             module.verify().unwrap();
             let relay = module.get_function(&function_with_suffix(&module, "relay")).unwrap();
             let consumer = module.get_function(&function_with_suffix(&module, "accept_packet")).unwrap();
-            let second = if route == "two-sinks" {
-                module.get_function(&function_with_suffix(&module, "alternative")).unwrap()
-            } else { consumer };
+            let second = match route {
+                "two-sinks" => module.get_function(&function_with_suffix(&module, "alternative")).unwrap(),
+                "through-forwarder" => module.get_function(&function_with_suffix(&module, "forward")).unwrap(),
+                _ => consumer,
+            };
+            if route == "through-forwarder" {
+                let mut forwarded = Vec::new();
+                for row in second.get_basic_blocks().into_iter().flat_map(|block| block.get_instructions()) {
+                    if row.get_opcode() != InstructionOpcode::Call { continue; }
+                    let call = CallSiteValue::try_from(row).unwrap();
+                    let callee = call.get_called_fn_value().unwrap();
+                    if callee == consumer {
+                        forwarded.push(row.get_operand(call.count_arguments() - 1).unwrap().value().unwrap());
+                    } else {
+                        assert!(callee.get_name().to_str().unwrap().starts_with("llvm.memmove."));
+                    }
+                }
+                assert_eq!(forwarded, [second.get_last_param().unwrap()], "{target}: {ir}");
+            }
             let rows: Vec<_> = relay.get_basic_blocks().into_iter().flat_map(|block| block.get_instructions()).collect();
             let mut transfers = Vec::new();
             let mut sinks = Vec::new();
@@ -761,7 +782,7 @@ fn conditional_formal_transfer_uses_original_hidden_base_in_recursive_frames() {
                 }
                 let base = row.get_operand(call.count_arguments() - 1).unwrap().value().unwrap();
                 assert_eq!(base, relay.get_last_param().unwrap(), "{target}: {ir}");
-                if second != consumer && callee == second {
+                if route == "two-sinks" && callee == second {
                     assert_eq!(call.count_arguments(), 3);
                     assert_eq!(row.get_operand(0).unwrap().value().unwrap().into_int_value()
                         .get_zero_extended_constant(), Some(9));
@@ -784,9 +805,11 @@ fn conditional_formal_transfer_uses_original_hidden_base_in_recursive_frames() {
                 std::fs::write(out.join(format!("{target}.ll")), witness).unwrap();
             }
         }
-        let nonterminal_second = two_sinks.replace("packet.length + delta", "accept_packet(packet) + delta");
-        assert!(emit(&nonterminal_second).expect_err("both destinations must be proved terminal consumers")
-            .contains("aggregate owning formal conditional transfer"));
+        let cycle = through_forwarder.replace("forward = fn(packet) { accept_packet(packet) }",
+            "forward = fn(packet) { forward(packet) }");
+        assert_ne!(cycle, through_forwarder);
+        assert!(emit(&cycle).expect_err("one grounded sibling cannot authorize the other sibling's cycle")
+            .contains("aggregate owning formal transfer does not reach a proved release"));
 
         let overflow = exhaustive.replace("else { accept_packet(packet) }",
             "else { if (packet.length == 0) { accept_packet(packet) } else { accept_packet(packet) } }");
