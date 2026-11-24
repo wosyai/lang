@@ -209,6 +209,30 @@ if (inspect(true) != 7 || inspect(false) != 9) { core.system_panic(); };
 }
 
 #[test]
+fn checked_release_tracks_selected_allocation_and_its_loan_cohort() {
+    let program = r#"%%start
+u8(u64, bool) read_other = fn(count, choose) {
+    u8[count] first;
+    u8[count] second;
+    first[0] = 7;
+    second[0] = 9;
+    *u8 selected = &first[1];
+    *u8 child = &second[0];
+    if (choose) {
+        selected = &second[1];
+        child = &first[0];
+    };
+    unsafe { core.free(selected); };
+    *child
+};
+u8(bool) inspect = fn(choose) { read_other(2, choose) };
+if (inspect(true) != 7 || inspect(false) != 9) { core.system_panic(); };
+%%end"#;
+    check_case(program, Expected::Valid, Some("WOSY_CHECKED_RELEASE_COHORT_IR_DIR"));
+
+}
+
+#[test]
 fn distinct_joined_shared_child_is_resolved_per_path() {
     check(&joined("parent = &!second;", false, "", ""), Expected::Valid);
     check(&joined("parent = &!second;", true, "", "first = 3;"), Expected::Valid);

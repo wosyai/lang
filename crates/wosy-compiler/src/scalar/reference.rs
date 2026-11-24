@@ -6133,6 +6133,81 @@ fn conflicting_loan<'a>(
     }).then_some(loan)
 }
 
+fn retire_allocation_loans(
+    state: &mut ReferenceEdgeState, facts: &[ReferenceOrigin], owns: impl Fn(&ReferenceBindingId) -> bool,
+) {
+    for origins in state.bindings.values_mut() {
+        origins.retain(|origin| match &facts[origin.0] {
+            ReferenceOrigin::Fresh { loan, .. } | ReferenceOrigin::BorrowedFrom { loan, .. } =>
+                !owns(&loan.origin_place.binding),
+            ReferenceOrigin::Null { .. } | ReferenceOrigin::Invalid { .. } => true,
+        });
+    }
+    state.projected.retain(|known| !owns(&known.place.binding)
+        && !known.refers_to_owner(facts, &owns));
+}
+
+#[cfg(test)]
+#[test]
+fn release_uses_the_exact_allocation_loan_cohort() {
+    let source = SourceIdentity::new("project".into(), "package".into(), "cfg.w".into(), "r1".into());
+    let block = ByteSpan::new(0, 100);
+    let binding = |start| ReferenceBindingId {
+        source: source.clone(), function_span: block, block_span: block,
+        declaration_span: ByteSpan::new(start, start + 1), kind: ReferenceBindingKind::Declared,
+    };
+    let first = binding(1);
+    let second = binding(2);
+    let retained = binding(3);
+    let unaffected = binding(4);
+    let place = |owner: &ReferenceBindingId| ReferencePlaceId {
+        source: source.clone(), function_span: block, block_span: block,
+        declaration_span: owner.declaration_span, binding: owner.clone(),
+        place: ScalarPlace::Name { name: String::new(), span: owner.declaration_span },
+        projections: Vec::new(),
+    };
+    let origin = |owner: &ReferenceBindingId, index: u32, start| {
+        let span = ByteSpan::new(start, start + 1);
+        let mut origin_place = place(owner);
+        let offset = ScalarExpression::Integer { value: index.into(), span };
+        origin_place.place = ScalarPlace::Index {
+            base: Box::new(origin_place.place), index: Box::new(offset.clone()), span, index_span: span,
+        };
+        origin_place.projections.push(ReferencePlaceProjection::Index(offset));
+        ReferenceOrigin::Fresh {
+            allocation: ReturnedAllocationId {
+                source: source.clone(), function_span: block,
+                declaration_span: owner.declaration_span, creation_span: owner.declaration_span,
+            },
+            loan: ReferenceLoanId {
+                mode: ScalarReferenceMutability::Shared, origin_place, creation_span: span, parent: None,
+            },
+        }
+    };
+    let facts = [origin(&first, 0, 10), origin(&first, 1, 11), origin(&second, 1, 12)];
+    let point = |id, kind, successors| ReferenceFlowPoint {
+        id: CfgPointId(id), kind, source_span: SourceSpan::new(source.clone(), block),
+        scope: ReferenceScopeId(0), possible_origins: None, successors,
+    };
+    let points = [
+        point(0, CfgPointKind::Entry, vec![CfgPointId(1)]),
+        point(1, CfgPointKind::Read { binding: retained.clone() }, vec![CfgPointId(2)]),
+        point(2, CfgPointKind::Read { binding: unaffected.clone() }, Vec::new()),
+    ];
+    let mut state = ReferenceEdgeState::default();
+    state.bindings.insert(retained.clone(), BTreeSet::from([ReferenceOriginId(0), ReferenceOriginId(1)]));
+    state.bindings.insert(unaffected.clone(), BTreeSet::from([ReferenceOriginId(2)]));
+    let live = ConflictLiveness::new(&points, None, true, false);
+    let conflicts = conflicting_live_loan(&live, &facts, &state, CfgPointId(0), &place(&first), LoanAccess::Direct);
+    assert_eq!(conflicts, [
+        SourceSpan::new(source.clone(), ByteSpan::new(10, 11)),
+        SourceSpan::new(source, ByteSpan::new(11, 12)),
+    ]);
+    retire_allocation_loans(&mut state, &facts, |owner| owner == &first);
+    assert!(state.bindings[&retained].is_empty());
+    assert_eq!(state.bindings[&unaffected], BTreeSet::from([ReferenceOriginId(2)]));
+}
+
 fn conflicting_live_loan(
     liveness: &ConflictLiveness<'_>,
     facts: &[ReferenceOrigin],
@@ -9064,14 +9139,7 @@ fn transfer_reference_facts(
                     });
                 }
             }
-            let affected = match &point.kind {
-                CfgPointKind::Invalidate { candidates, .. } => Some(candidates.as_slice()),
-                CfgPointKind::Release {
-                    target: ReleaseTarget::Checked { candidates, .. },
-                } => Some(candidates.as_slice()),
-                _ => None,
-            };
-            if let Some(candidates) = affected {
+            if let CfgPointKind::Invalidate { operation, candidates, .. } = &point.kind {
                 for candidate in candidates {
                     let origins = conflicting_live_loan(
                         &liveness, &cfg.facts,
@@ -9087,40 +9155,15 @@ fn transfer_reference_facts(
                         });
                     }
                 }
-                if let CfgPointKind::Invalidate { operation, .. } = &point.kind {
-                    for binding in candidates.iter().map(|candidate| &candidate.place.binding) {
-                        match operation {
-                            CoreOperationId::Invalidate => {
-                                state.invalidated.insert(binding.clone());
-                            }
-                            CoreOperationId::Rebind => {
-                                state.invalidated.remove(binding);
-                            }
-                            _ => unreachable!("resolved invalidation operation"),
+                for binding in candidates.iter().map(|candidate| &candidate.place.binding) {
+                    match operation {
+                        CoreOperationId::Invalidate => {
+                            state.invalidated.insert(binding.clone());
                         }
-                    }
-                }
-                if let CfgPointKind::Release {
-                    target: ReleaseTarget::Checked { address_span, .. },
-                } = &point.kind
-                {
-                    for binding in candidates
-                        .iter()
-                        .map(|candidate| &candidate.place.binding)
-                        .collect::<BTreeSet<_>>()
-                    {
-                        if !cfg.allocations.contains(binding) {
-                            errors.push(ReferenceAnalysisError::MissingContext {
-                                source_span: address_span.clone(),
-                                reason:
-                                    ReferenceAnalysisErrorReason::MissingRequiredDereferenceOrigin,
-                            });
-                        } else if !state.released.insert(binding.clone()) {
-                            errors.push(ReferenceAnalysisError::MissingContext {
-                                source_span: point.source_span.clone(),
-                                reason: ReferenceAnalysisErrorReason::MissingCheckedReferenceOrigin,
-                            });
+                        CoreOperationId::Rebind => {
+                            state.invalidated.remove(binding);
                         }
+                        _ => unreachable!("resolved invalidation operation"),
                     }
                 }
                 for origins in state.bindings.values_mut() {
@@ -9148,6 +9191,43 @@ fn transfer_reference_facts(
                 });
             }
             if let CfgPointKind::Release {
+                target: ReleaseTarget::Checked { address_span, candidates, .. },
+            } = &point.kind {
+                // A checked address can select the allocation through an
+                // element. LLVM frees the recorded owner backing, not the
+                // element address, so every loan of that owner must end here.
+                let owners: BTreeMap<_, _> = candidates.iter().map(|candidate|
+                    (&candidate.place.binding, &candidate.place)).collect();
+                for (&binding, &selection) in &owners {
+                    if !cfg.allocations.contains(binding) {
+                        errors.push(ReferenceAnalysisError::MissingContext {
+                            source_span: address_span.clone(),
+                            reason: ReferenceAnalysisErrorReason::MissingRequiredDereferenceOrigin,
+                        });
+                        continue;
+                    }
+                    let mut owner = selection.clone();
+                    owner.projections.clear();
+                    let origins = conflicting_live_loan(
+                        &liveness, &cfg.facts, &state, id, &owner, LoanAccess::Direct,
+                    );
+                    if !origins.is_empty() {
+                        errors.push(ReferenceAnalysisError::ConflictingPlace {
+                            source_span: point.source_span.clone(), origins,
+                        });
+                    }
+                    if !state.released.insert(binding.clone()) {
+                        errors.push(ReferenceAnalysisError::MissingContext {
+                            source_span: point.source_span.clone(),
+                            reason: ReferenceAnalysisErrorReason::MissingCheckedReferenceOrigin,
+                        });
+                    }
+                }
+                if !owners.is_empty() {
+                    retire_allocation_loans(&mut state, &cfg.facts, |binding| owners.contains_key(binding));
+                }
+            }
+            if let CfgPointKind::Release {
                 target: ReleaseTarget::Raw { binding },
             } = &point.kind
             {
@@ -9157,19 +9237,7 @@ fn transfer_reference_facts(
                         reason: ReferenceAnalysisErrorReason::MissingCheckedReferenceOrigin,
                     });
                 }
-                for origins in state.bindings.values_mut() {
-                    origins.retain(|origin| match &cfg.facts[origin.0] {
-                        ReferenceOrigin::Fresh { loan, .. }
-                        | ReferenceOrigin::BorrowedFrom { loan, .. } => {
-                            &loan.origin_place.binding != binding
-                        }
-                        ReferenceOrigin::Null { .. } | ReferenceOrigin::Invalid { .. } => true,
-                    });
-                }
-                state.projected.retain(|known| {
-                    &known.place.binding != binding
-                        && !known.refers_to_owner(&cfg.facts, |owner| owner == binding)
-                });
+                retire_allocation_loans(&mut state, &cfg.facts, |owner| owner == binding);
             }
             if let CfgPointKind::CaptureAssignmentPrevious { writes } = &point.kind {
                 for write in writes {
