@@ -6314,6 +6314,8 @@ pub(super) struct OccurrenceStructure {
     pub(super) checker_ordinary_scalar_locals: HashMap<(BlockOrdinal, usize), CheckerOrdinaryScalarLocal>,
     #[cfg(feature = "internal-checker")]
     pub(super) checker_has_extended_scalar_local: bool,
+    #[cfg(feature = "internal-checker")]
+    pub(super) checker_has_affine_scalar_local: bool,
     #[cfg(any(test, feature = "internal-checker"))]
     pub(super) checker_contextual_read_locals: HashMap<(BlockOrdinal, usize), ReferenceBindingId>,
     #[cfg(any(test, feature = "internal-checker"))]
@@ -6483,6 +6485,8 @@ impl OccurrenceStructure {
             checker_ordinary_scalar_locals: HashMap::new(),
             #[cfg(feature = "internal-checker")]
             checker_has_extended_scalar_local: false,
+            #[cfg(feature = "internal-checker")]
+            checker_has_affine_scalar_local: false,
             #[cfg(feature = "internal-checker")]
             checker_ordinary_bool_literals: HashMap::new(),
             #[cfg(feature = "internal-checker")]
@@ -9237,6 +9241,12 @@ impl StructuralWalker<'_, '_> {
                 #[cfg(feature = "internal-checker")]
                 if let Some((source, callable, kind)) = ordinary_local.take() {
                     let binding = lexical.reference_id(callable.source, callable.function_span);
+                    self.structure.checker_has_affine_scalar_local |= matches!(&kind,
+                        CheckerOrdinaryScalarLocalKind::Arithmetic {
+                            operator: BinaryOperator::Add | BinaryOperator::Subtract,
+                            operands: [CheckerOrdinaryIntegerOperand::Literal(_), CheckerOrdinaryIntegerOperand::Lexical(_)]
+                                | [CheckerOrdinaryIntegerOperand::Lexical(_), CheckerOrdinaryIntegerOperand::Literal(_)],
+                        });
                     self.structure.checker_has_extended_scalar_local |= matches!(kind,
                         CheckerOrdinaryScalarLocalKind::Conditional | CheckerOrdinaryScalarLocalKind::SnapshotRead { .. }
                             | CheckerOrdinaryScalarLocalKind::Arithmetic {

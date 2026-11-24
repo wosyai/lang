@@ -539,8 +539,8 @@ struct LiteralGuardAtReturn<'a> {
 
 #[cfg(feature = "internal-checker")]
 #[derive(Clone, Copy)]
-struct OrderedRootLiteralProof<'a, 'observation, const TOTAL: bool> {
-    conditions: OrderedRootConditions<'a, TOTAL>,
+struct OrderedRootLiteralProof<'a, 'observation, const TOTAL: bool, const PURE: bool> {
+    conditions: OrderedRootConditions<'a, TOTAL, PURE>,
     relation: IntegerRelation,
     bound: &'observation BigInt,
     guard: Option<&'observation LiteralGuardAtReturn<'observation>>,
@@ -548,8 +548,9 @@ struct OrderedRootLiteralProof<'a, 'observation, const TOTAL: bool> {
 }
 
 #[cfg(feature = "internal-checker")]
-impl<'a, const TOTAL: bool> ScopedAuthoredReturn<'a> for OrderedRootLiteralProof<'a, '_, TOTAL> {
+impl<'a, const TOTAL: bool, const PURE: bool> ScopedAuthoredReturn<'a> for OrderedRootLiteralProof<'a, '_, TOTAL, PURE> {
     const ENABLED: bool = false;
+    const ALLOW_ORDINARY_INTEGER_LOCALS: bool = PURE;
     const OBSERVE_RETURN: bool = true;
     const REQUIRE_TOTAL_RETURN: bool = TOTAL;
 
@@ -569,7 +570,14 @@ impl<'a, const TOTAL: bool> ScopedAuthoredReturn<'a> for OrderedRootLiteralProof
     fn observe_return(
         self, slot: FinalOutputSlot, value: IntegerReturn<'a>, roots: &IntegerRoots<'a>, path: &IntegerInputs,
     ) -> Option<()> {
-        let axis = symbolic_return_axis(value, roots)?;
+        let axis = if PURE {
+            match value {
+                IntegerReturn::Const(_) => None,
+                IntegerReturn::Alias(binding) => Some(roots.lookup(binding)?.0),
+            }
+        } else {
+            symbolic_return_axis(value, roots)?
+        };
         let mut observed = self.observed.borrow_mut();
         if observed.1.is_some() {
             return Some(());
@@ -612,7 +620,19 @@ impl<'a, const TOTAL: bool> ScopedAuthoredReturn<'a> for OrderedRootLiteralProof
         }
         observed.0 |= applicable;
         if let Some((row, returned, entry)) = failing {
-            observed.1 = Some(SymbolicLiteralFailure::from_row(slot, roots, row, axis, returned, entry));
+            observed.1 = Some(match axis {
+                Some(axis) if PURE && axis >= roots.parameters => {
+                    if entry.is_some() { return None; }
+                    let mut work = 0;
+                    charge_call_work(&mut work, row.len().checked_add(row.equal_axes().len())?.checked_add(2)?)?;
+                    row.charge_affine_replacement(axis, 1, &mut work)?;
+                    charge_call_work(&mut work, 0)?;
+                    let mut preimage = row.clone();
+                    preimage.replace_domain(axis, Rc::new(IntegerSet::singleton(returned.as_ref())));
+                    SymbolicLiteralFailure::from_row(slot, roots, &preimage, None, returned, None)
+                }
+                _ => SymbolicLiteralFailure::from_row(slot, roots, row, axis, returned, entry),
+            });
         }
         Some(())
     }
@@ -3001,6 +3021,24 @@ pub(super) fn collect_ordered_root_literal_proof<'a, const TOTAL: bool>(
     calls: &'a FunctionCallSites, body: &'a super::ScalarBlock, relation: IntegerRelation, bound: &BigInt,
     predicate: Option<&IntegerPredicate>, entry_filter: Option<&[CheckerPredicate]>,
 ) -> Option<(bool, Vec<IntegerCheckFailure<'a>>, bool, Option<SymbolicLiteralFailure<'a>>)> {
+    collect_ordered_root_literal_proof_mode::<TOTAL, false>(calls, body, relation, bound, predicate, entry_filter)
+}
+
+#[cfg(feature = "internal-checker")]
+pub(super) fn collect_ordered_pure_affine_literal_proof<'a>(
+    calls: &'a FunctionCallSites, body: &'a super::ScalarBlock, relation: IntegerRelation,
+    bound: &BigInt, entry_filter: &[CheckerPredicate],
+) -> Option<(bool, Vec<IntegerCheckFailure<'a>>, bool, Option<SymbolicLiteralFailure<'a>>)> {
+    // The caller has checked the side-effect-free profile, so filtering
+    // the entry domain cannot hide ordinary obligations.
+    collect_ordered_root_literal_proof_mode::<true, true>(calls, body, relation, bound, None, Some(entry_filter))
+}
+
+#[cfg(feature = "internal-checker")]
+fn collect_ordered_root_literal_proof_mode<'a, const TOTAL: bool, const PURE: bool>(
+    calls: &'a FunctionCallSites, body: &'a super::ScalarBlock, relation: IntegerRelation, bound: &BigInt,
+    predicate: Option<&IntegerPredicate>, entry_filter: Option<&[CheckerPredicate]>,
+) -> Option<(bool, Vec<IntegerCheckFailure<'a>>, bool, Option<SymbolicLiteralFailure<'a>>)> {
     let bounds;
     let guard = if let Some(predicate) = predicate {
         let bindings = calls.boundary.checker_parameter_bindings.as_deref()?;
@@ -3030,7 +3068,7 @@ pub(super) fn collect_ordered_root_literal_proof<'a, const TOTAL: bool>(
     let observed = std::cell::RefCell::new((false, None));
     let mut failures = Vec::new();
     let mut sink = |failure| failures.push(failure);
-    let scope = OrderedRootLiteralProof::<TOTAL> {
+    let scope = OrderedRootLiteralProof::<TOTAL, PURE> {
         conditions: OrderedRootConditions(body, false), relation, bound, guard: guard.as_ref(), observed: &observed,
     };
     let active = if TOTAL {
@@ -3639,17 +3677,59 @@ pub(super) fn collect_exact_integer_return_requirements<'a>(
     Some((active, returned.into_inner()?))
 }
 
+#[cfg(feature = "internal-checker")]
+pub(super) fn pure_affine_proof_body(calls: &FunctionCallSites) -> bool {
+    let structure = &calls.structure;
+    structure.checker_has_affine_scalar_local && !structure.checker_has_extended_scalar_local
+        && structure.blocks.len() == 1 && structure.checker_directives.is_empty()
+        && !structure.has_ordinary_contextual_places() && !structure.checker_has_bool_contextual_declaration
+        && structure.checker_selected_snapshots.is_empty()
+        && calls.call_occurrences.is_empty() && calls.allocation_length_calls.is_empty() && calls.assignments.is_empty()
+        && matches!(calls.boundary.parameters.as_slice(), [parameter]
+            if integer_tail_type(calls) == Some(&parameter.ty))
+}
+
+#[cfg(feature = "internal-checker")]
+#[derive(Clone, Copy)]
+struct PureAffineReturn;
+
+#[cfg(feature = "internal-checker")]
+impl<'a> ScopedAuthoredReturn<'a> for PureAffineReturn {
+    const ENABLED: bool = false;
+    const ALLOW_ORDINARY_INTEGER_LOCALS: bool = true;
+    const REQUIRE_TOTAL_RETURN: bool = true;
+
+    fn at(
+        self, _: &FunctionCallSites, _: BlockOrdinal, _: FinalOutputSlot, _: &ScalarType,
+        _: &IntegerRoots<'_>, _: &IntegerInputs,
+    ) -> Option<&'a BigInt> {
+        None
+    }
+}
+
 pub(super) fn exact_integer_return_at_entry(
     calls: &FunctionCallSites,
     expected: &ScalarType,
     arguments: &[&BigInt],
 ) -> Option<BigInt> {
+    exact_integer_return_at_entry_mode(calls, expected, arguments, ())
+}
+
+#[cfg(feature = "internal-checker")]
+pub(super) fn exact_named_pure_affine_return_at_entry(
+    calls: &FunctionCallSites, expected: &ScalarType, arguments: &[&BigInt],
+) -> Option<BigInt> {
+    exact_integer_return_at_entry_mode(calls, expected, arguments, PureAffineReturn)
+}
+
+fn exact_integer_return_at_entry_mode<'a, Authored: ScopedAuthoredReturn<'a>>(
+    calls: &'a FunctionCallSites, expected: &ScalarType, arguments: &[&BigInt], mode: Authored,
+) -> Option<BigInt> {
     if integer_tail_type(calls)? != expected {
         return None;
     }
-    let ProofCoverage::Applicable(paths) = observe_integer_returns_in_scope(calls, None, Some(arguments), false, ())?.ok()? else {
-        return None;
-    };
+    let ProofCoverage::Applicable(paths) = observe_integer_returns_in_scope(calls, None, Some(arguments), false, mode)?.ok()?
+        else { return None; };
     let (first, rest) = paths.split_first()?;
     let value = first.singleton_return()?;
     rest.iter().all(|path| path.singleton_return() == Some(value)).then(|| value.clone())

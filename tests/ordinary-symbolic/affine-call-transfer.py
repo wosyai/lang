@@ -1518,6 +1518,36 @@ state_holes = f"""%%start
         core.require(false, {state_report(168,"ALTERNATIVES","value")});
     }};
     %%end"""
+ordinary_pure_affine_proof = """%%start
+    i8(i8) advance = fn(value) {
+        i8 shifted = value + 2;
+        i8 copied = shifted;
+        copied
+    };
+    proof bounded for advance(entry) -> (out) where (entry <= 100) ensures (out <= 102) {}
+    %%end"""
+ordinary_pure_affine_proof_reached = ordinary_pure_affine_proof.replace("%%end", f"""
+    i8 first = advance(99);
+    i8 second = advance(100);
+    core.require(first == 101, {report(57,"BAD-FIRST")});
+    core.require(second == 102, {report(59,"BAD-SECOND")});
+    %%end""")
+proof_diagnostic_notes = {
+    "ordinary-pure-affine-proof-symbolic-refuted": b"symbolic call can return 102",
+    "exact-startup-ordinary-pure-affine-proof-refuted": b"call returned 102",
+}
+cases.extend([
+    ("ordinary-pure-affine-proof-symbolic-proved",ordinary_pure_affine_proof,0,b""),
+    ("ordinary-pure-affine-proof-symbolic-refuted",ordinary_pure_affine_proof.replace("out <= 102","out <= 101"),1,
+        b"proof obligation failed"),
+    ("exact-startup-ordinary-pure-affine-proof-proved",ordinary_pure_affine_proof_reached,0,b""),
+    ("exact-startup-ordinary-pure-affine-proof-no-authority-outside-where",
+        ordinary_pure_affine_proof_reached.replace("advance(100)","advance(101)"),2,b"unsupported analysis"),
+    ("exact-startup-ordinary-pure-affine-proof-no-entry-equality-authority",
+        ordinary_pure_affine_proof_reached.replace("out <= 102","out == core.old(entry)"),2,b"unsupported analysis"),
+    ("exact-startup-ordinary-pure-affine-proof-refuted",ordinary_pure_affine_proof_reached.replace("out <= 102","out <= 101"),1,
+        b"proof obligation failed"),
+])
 authored_unary = f"""%%start
     unit(i8) observe = fn(value) {{
         core.narrow(value == -7 || value == 2, {report(1,"UNREACHED-CUT")});
@@ -2230,6 +2260,8 @@ with tempfile.TemporaryDirectory(prefix="affine-calls-") as path:
                         assert b"PROJECTED-PRIOR-UNPUBLISHED" not in res.stderr,res
                     if name == "projected-returning-local-copy-refuses-formal":
                         assert b"COPY-PRIOR-UNPUBLISHED" not in res.stderr and b"COPY-FORMAL-UNPUBLISHED" not in res.stderr,res
+                elif included and name in proof_diagnostic_notes:
+                    assert expected_stderr in res.stderr and proof_diagnostic_notes[name] in res.stderr,res
                 else:
                     assert res.stderr==expected_stderr,res
                 files = authored_files.get(name, {}) if included else {}

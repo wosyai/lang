@@ -1664,6 +1664,11 @@ trait ActualIntegerObserver {
     const CONTEXTUAL: bool = false;
 
     #[cfg(feature = "internal-checker")]
+    fn permits_named_pure_affine_return(&self, _target: PreparedCallable, _arguments: &[&BigInt]) -> bool {
+        false
+    }
+
+    #[cfg(feature = "internal-checker")]
     fn observe_initializer(
         &mut self, _target: (usize, usize), _site: Option<InitializerProofSite<'_>>,
         _parameters: &[ScalarType], _arguments: &[&BigInt], _value: &BigInt,
@@ -2478,8 +2483,18 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             && body.allocation_length_calls.is_empty()
             && body.assignments.is_empty()
         {
-            exact_integer_return_at_entry(body, expected, exact).map(ActualCallResult::Integer)
-                .ok_or(ProjectCheck::Unsupported)
+            #[cfg(feature = "internal-checker")]
+            let observed = if ACTUAL_STARTUP && proof_site.is_some()
+                && self.observer.permits_named_pure_affine_return(target, exact)
+                && super::checker_flow::pure_affine_proof_body(body)
+            {
+                super::checker_flow::exact_named_pure_affine_return_at_entry(body, expected, exact)
+            } else {
+                exact_integer_return_at_entry(body, expected, exact)
+            };
+            #[cfg(not(feature = "internal-checker"))]
+            let observed = exact_integer_return_at_entry(body, expected, exact);
+            observed.map(ActualCallResult::Integer).ok_or(ProjectCheck::Unsupported)
         } else {
             #[cfg(feature = "internal-checker")]
             let collected = collection.filter(|_| ACTUAL_STARTUP && is_integer_type(expected)
@@ -3994,6 +4009,19 @@ impl SymbolicRootProof for SelectedSymbolicProof<'_, '_> {
                 return Ok(Some(active || returned));
             }
             let first_bound = first.bound.literal().ok_or(ProjectCheck::Unsupported)?;
+            if watched.pure_affine_target == Some(target) && super::checker_flow::pure_affine_proof_body(calls) {
+                // This lane checks an observed value, but does not issue a
+                // reusable summary or authorize imports from it.
+                let (active, directives, returned, failure) =
+                    super::checker_flow::collect_ordered_pure_affine_literal_proof(
+                        calls, &function.body, first.relation, first_bound, first.filter,
+                    ).ok_or(ProjectCheck::Unsupported)?;
+                debug_assert!(directives.is_empty());
+                if let Some(failure) = failure {
+                    self.record(first, function, source, effects.records.len(), failure, None)?;
+                }
+                return Ok(Some(active || returned));
+            }
             let candidate = group.issuer.as_ref().filter(|_| first.proof_source == source);
             let (active, directives, returned, failure) = if candidate.is_some() {
                 super::checker_flow::collect_ordered_root_literal_proof::<true>(
@@ -4364,6 +4392,7 @@ impl<'a> MainFlowProofTarget<'a> {
 struct MainFlowProofObserver<'a> {
     first: ((usize, usize), MainFlowProofTarget<'a>),
     other: HashMap<(usize, usize), MainFlowProofTarget<'a>>,
+    pure_affine_target: Option<PreparedCallable>,
     active: bool,
     incomplete: bool,
     diagnostics: Vec<MainFlowProofDiagnostic>,
@@ -4374,7 +4403,7 @@ impl<'a> MainFlowProofObserver<'a> {
     fn new(target: (usize, usize), first: MainFlowProofPlan<'a>) -> Self {
         Self {
             first: (target, MainFlowProofTarget::new(first)), other: HashMap::new(),
-            active: false, incomplete: false, diagnostics: Vec::new(),
+            pure_affine_target: None, active: false, incomplete: false, diagnostics: Vec::new(),
         }
     }
 
@@ -4387,12 +4416,17 @@ impl<'a> MainFlowProofObserver<'a> {
         } else {
             None
         };
+        let pure_affine = plan.steps.items.is_empty() && plan.typed.measure.is_none()
+            && matches!(&plan.typed.goal, TypedProofGoal::Literal { .. })
+            && matches!(proof.0.filter, [] | [CheckerPredicate::Boolean(true) | CheckerPredicate::Integer(_)]);
         let mut observer = Self::new(plan.target, proof);
+        observer.pure_affine_target = pure_affine.then_some(plan.target);
         observer.first.1.issuer = issuer;
         Ok(observer)
     }
 
     fn insert(&mut self, scope: ScalarCheckerScope, allow_issuer: bool, plan: &PlannedModuleProof<'a>, proof: MainFlowProofPlan<'a>) {
+        self.pure_affine_target = None;
         let target = plan.target;
         if self.first.0 == target {
             self.first.1.issuer = None;
@@ -4425,6 +4459,12 @@ impl ActualIntegerObserver for MainFlowProofObserver<'_> {
     const CONTEXTUAL: bool = true;
 
     fn observe(&mut self, _: (usize, usize), _: &[&BigInt], _: &BigInt) {}
+
+    fn permits_named_pure_affine_return(&self, target: PreparedCallable, arguments: &[&BigInt]) -> bool {
+        if self.pure_affine_target != Some(target) { return false; }
+        let MainFlowProofCases::Bare { first, rest } = &self.first.1.cases else { return false; };
+        rest.is_empty() && first.guard.accepts(arguments)
+    }
 
     fn observe_initializer(
         &mut self, target: (usize, usize), site: Option<InitializerProofSite<'_>>,
@@ -4589,6 +4629,10 @@ impl ActualIntegerObserver for NamedOrderedEvidence<'_> {
     const CONTEXTUAL: bool = true;
 
     fn observe(&mut self, _: PreparedCallable, _: &[&BigInt], _: &BigInt) {}
+
+    fn permits_named_pure_affine_return(&self, target: PreparedCallable, arguments: &[&BigInt]) -> bool {
+        self.observed.permits_named_pure_affine_return(target, arguments)
+    }
 
     fn observe_initializer(
         &mut self, target: PreparedCallable, site: Option<InitializerProofSite<'_>>,
@@ -11857,6 +11901,66 @@ mod tests {
         assert!(run(unused, ScalarCheckerScope::CurrentPackage).unwrap().symbolic_diagnostic.is_some());
         let invalid = unused.replace("ensures", "where (false) ensures").replace("out >= 7", "out >= 128");
         assert!(matches!(run(&invalid, ScalarCheckerScope::MainFlowOnly), Err(ProjectCheck::InvalidProof)));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordered_named_pure_affine_locals_refine_where_and_report_actual_preimage() {
+        let source = source("src/main.w", "ordered-pure-affine-proof");
+        let symbolic = r#"%%start
+            i8(i8) advance = fn(value) {
+                i8 shifted = value + 2;
+                i8 copied = shifted;
+                copied
+            };
+            proof bounded for advance(entry) -> (out) where (entry <= 100) ensures (out <= 102) {}
+        %%end"#;
+        let actual = symbolic.replace("%%end", r#"
+            i8 first = advance(99);
+            i8 second = advance(100);
+            core.require(first == 101, { .stdout = ""; .stderr = "bad first"; .code = 57; .files = []; });
+            core.require(second == 102, { .stdout = ""; .stderr = "bad second"; .code = 59; .files = []; });
+        %%end"#);
+        let run = |text: &str, scope| {
+            let (_, proof) = crate::parse_proof_source(source.clone(), text.to_owned(), &[])
+                .unwrap_or_else(|_| panic!("valid ordinary affine proof"));
+            check_loaded_ordered_proof_diagnostics(
+                Vec::new(), vec![(proof, Vec::new())], vec![source.clone()], inputs(), scope,
+            )
+        };
+        let pass = run(symbolic, ScalarCheckerScope::CurrentPackage).unwrap();
+        assert!(pass.active && pass.symbolic_diagnostic.is_none() && pass.diagnostics.is_empty());
+        let fail = run(&symbolic.replace("out <= 102", "out <= 101"), ScalarCheckerScope::CurrentPackage).unwrap();
+        let failure = fail.symbolic_diagnostic.expect("affine return counterexample");
+        assert_eq!(failure.returned, BigInt::from(102));
+        assert_eq!(failure.witness.axes().len(), 1);
+        let entry = BigInt::from(100);
+        assert!(failure.witness.intervals_at(0, 0).unwrap().eq([(&entry, &entry)]));
+        for scope in [ScalarCheckerScope::MainFlowOnly, ScalarCheckerScope::CurrentPackage] {
+            let pass = run(&actual, scope).unwrap();
+            assert!(pass.active && pass.diagnostics.is_empty() && pass.directives.is_empty());
+            let fail = run(&actual.replace("out <= 102", "out <= 101"), scope).unwrap();
+            let [failure] = fail.diagnostics.as_slice() else { panic!("only the second actual call fails"); };
+            assert_eq!(failure.invocation.returned, BigInt::from(102));
+            let span = failure.invocation.call.range;
+            assert_eq!(&actual[(span.start as usize)..(span.end as usize)], "advance(100)");
+        }
+        let multiple = actual.replace("i8 first = advance(99);",
+            "proof another for advance(entry) -> (out) ensures (out <= 110) {} i8 first = advance(99);");
+        let unrelated = actual.replace("i8 second = advance(100);", "i8 second = unwatched(100);")
+            .replace("proof bounded", "i8(i8) unwatched = fn(value) { i8 shifted = value + 2; shifted }; proof bounded");
+        for outside_scope in [
+            actual.replace("advance(100)", "advance(101)"),
+            actual.replace("out <= 102", "out == core.old(entry)"),
+            multiple, unrelated,
+        ] {
+            assert!(matches!(run(&outside_scope, ScalarCheckerScope::MainFlowOnly), Err(ProjectCheck::Unsupported)));
+        }
+        assert!(matches!(run(&symbolic.replace("where (entry <= 100) ", ""), ScalarCheckerScope::CurrentPackage),
+            Err(ProjectCheck::Unsupported)));
+        let effectful = symbolic.replace("i8 copied = shifted;",
+            r#"core.require(false, { .stdout = ""; .stderr = "effect"; .code = 91; .files = []; }); i8 copied = shifted;"#);
+        assert!(matches!(run(&effectful, ScalarCheckerScope::CurrentPackage), Err(ProjectCheck::Unsupported)));
     }
 
     #[cfg(feature = "internal-checker")]
