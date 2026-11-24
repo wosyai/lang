@@ -1443,6 +1443,27 @@ cases.extend([
     ("exact-startup-module-typed-narrow-prestate",module_authored_output.replace("core.require(status","core.narrow(status"),37,b"MODULE-STATE"),
     ("exact-startup-module-success-skips-state",module_authored_output.replace("core.require(status != 37","core.require(status == 37"),200,b"AFTER-MODULE-STATE"),
 ])
+startup_condition_producer = f"""%%start
+    bool(bool) gate = fn(value) {{
+        core.require(false, {report(47,"CALL")});
+        value
+    }};
+    bool input = true;
+    if (gate(input)) {{
+        core.require(false, {report(51,"THEN")});
+    }} else {{
+        core.require(false, {report(53,"ELSE")});
+    }};
+    core.require(false, {report(55,"AFTER")});
+    %%end"""
+startup_condition_empty = startup_condition_producer.replace("bool input = true","bool input = false").replace(
+    "core.require(false, " + report(47,"CALL") + ")",
+    "core.narrow(value, " + state_report(49,"EMPTY","value") + ")")
+cases.extend([
+    ("exact-startup-bool-condition-call-then",startup_condition_producer,47,b"CALLTHENAFTER"),
+    ("exact-startup-bool-condition-call-else",startup_condition_producer.replace("bool input = true","bool input = false"),47,b"CALLELSEAFTER"),
+    ("exact-startup-bool-condition-call-empty",startup_condition_empty,49,b"EMPTY"),
+])
 startup_bool_binding = f"""%%start
     i8(i8) identity = fn(value) {{ value }};
     bool(bool) truth = fn(value) {{ value }};
@@ -1644,6 +1665,7 @@ nested_array_bytes = state_bytes({
     },
 })
 authored_files = {
+    "exact-startup-bool-condition-call-empty": {"state.json": b'{"type":{"kind":"bool"},"value":false}\n'},
     "exact-startup-computed-bool-binding-true": {"answer.json": b'{"type":{"kind":"bool"},"value":true}\n'},
     "exact-startup-computed-bool-binding-false": {"answer.json": b'{"type":{"kind":"bool"},"value":false}\n'},
     "exact-startup-composed-logic": {"startup-logic.json": b'{"type":{"kind":"bool"},"value":true}\n'},
