@@ -7098,25 +7098,10 @@ fn joined_root_reborrow_binding<'a>(
     {
         return None;
     }
-    let [read] = child.successors.as_slice() else { return None };
-    let mut read = points.get(read.0)?;
-    while matches!(read.kind, CfgPointKind::Evaluate(ScalarExpression::Integer { .. })) {
-        let literal = read;
-        let [assign] = literal.successors.as_slice() else { return None };
-        let assign = points.get(assign.0)?;
-        if !matches!(&assign.kind, CfgPointKind::Assign { target, rhs_point, .. }
-            if *rhs_point == literal.id && target.binding != *binding && target.binding != *child_binding
-                && matches!(target.place, ScalarPlace::Name { .. }))
-            || literal.scope != child.scope || assign.scope != child.scope
-        {
-            return None;
-        }
-        let [next] = assign.successors.as_slice() else { return None };
-        read = points.get(next.0)?;
-    }
-    if !matches!(&read.kind, CfgPointKind::Read { binding } if binding == child_binding) {
-        return None;
-    }
+    // The forward shape pass checks every lexical holder use, including
+    // a first use in a branch. Do not require the Bind to be followed by
+    // a straight-line first observation before those facts can be used.
+    let mut observed_root = false;
     let mut holders = HashMap::from([(child_binding, point.id)]);
     let mut descendants = BTreeMap::new();
     let mut alias_count = 0;
@@ -7135,6 +7120,7 @@ fn joined_root_reborrow_binding<'a>(
                     return None;
                 }
                 let birth = holders[holder];
+                observed_root |= holder == child_binding;
                 let writable = matches!(points.get(birth.0)?.kind, CfgPointKind::ReborrowThrough {
                     mode: ScalarReferenceMutability::Mutable, ..
                 });
@@ -7211,7 +7197,7 @@ fn joined_root_reborrow_binding<'a>(
             _ => (),
         }
     }
-    descendants.keys().copied().eq(descendant_sites.iter().copied())
+    (observed_root && descendants.keys().copied().eq(descendant_sites.iter().copied()))
         .then_some(JoinedReborrowShape { parent: binding, holders, descendants })
 }
 
