@@ -2036,8 +2036,8 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 {
                     (|| {
                         let CfgPointKind::Call { target, argument_points, .. } = &call else { return None };
-                        let local_effect = shared_scalar_read_effect(&self.source, calls, ordinal, target, self.shared_scalar_read_effects);
-                        let effect = local_effect.or_else(|| {
+                        let joined_effect = shared_scalar_read_effect(&self.source, calls, ordinal, target, self.shared_scalar_read_effects);
+                        let effect = joined_effect.or_else(|| {
                             let ResolvedCallTarget::ModuleCallable {
                                 source, declaration_span, concrete: ConcreteCallSelection::Declaration,
                             } = target else { return None };
@@ -2068,7 +2068,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             CfgPointKind::Read { binding }
                                 if matches!(calls.prepared_plain_name(argument),
                                     Some(PlainNameIdentity::Lexical(expected)) if expected == binding) =>
-                                Some((point, local_effect.is_some())),
+                                Some((point, joined_effect.is_some())),
                             CfgPointKind::Borrow { place, loan }
                                 if matches!(target, ResolvedCallTarget::ModuleCallable { .. })
                                     && loan.mode == ScalarReferenceMutability::Shared && loan.parent.is_none()
@@ -6877,8 +6877,16 @@ fn shared_scalar_read_effect(
     let ResolvedCallTarget::ModuleCallable {
         source: callee, declaration_span, concrete: ConcreteCallSelection::Declaration,
     } = target else { return None };
-    (callee == source).then_some(())?;
-    effects?.get(declaration_span).copied().filter(|effect| !effect.descriptor)
+    let effect = if callee == source {
+        *effects?.get(declaration_span)?
+    } else {
+        let (identity, effect) = calls.imported_shared_readers.get(&ordinal)?;
+        if &identity.source != callee || identity.range != *declaration_span {
+            return None;
+        }
+        *effect
+    };
+    (!effect.descriptor).then_some(effect)
 }
 
 fn joined_reborrow_calls_are_supported(

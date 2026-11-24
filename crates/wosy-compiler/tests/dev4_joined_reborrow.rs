@@ -1,6 +1,8 @@
 use wosy_compiler::{
-    derive_scalar_program_with_layout, emit_scalar_llvm, emit_scalar_project_llvm, parse_source,
-    validate_scalar_project, ScalarModule, ScalarProject, ScalarTargetLayout,
+    analyze_scalar_build, derive_scalar_declarations_from_cst, derive_scalar_program_with_layout,
+    emit_scalar_build_project_llvm, emit_scalar_llvm, emit_scalar_project_llvm, parse_source,
+    prepare_scalar_project, validate_scalar_project, ScalarModule, ScalarNamespaceBinding,
+    ScalarPreparationInputs, ScalarProject, ScalarTargetLayout,
 };
 use wosy_syntax::SourceIdentity;
 
@@ -421,4 +423,57 @@ fn joined_child_cannot_escape_in_a_callee_return() {
     let program = joined("parent = &!second;", true, "", "*u8 escaped = pointer(child); *escaped;");
     let program = program.replace("%%start\n", "%%start\n*u8(*u8) pointer = fn(value) { value };\n");
     check(&program, Expected::NullParent);
+}
+
+#[test]
+fn joined_child_uses_only_the_certified_imported_reader() {
+    let app = SourceIdentity::new("project".into(), "package".into(), "src/main.w".into(), "r1".into());
+    let imported = SourceIdentity::new("project".into(), "package".into(), "src/reader.w".into(), "r1".into());
+    let decoy = SourceIdentity::new("project".into(), "package".into(), "src/decoy.w".into(), "r1".into());
+    let certified = "%%start\nu8(*u8) read = fn(view) { *view };\n%%end";
+    let uncertified = certified.replace("{ *view }", "{ u8 observed = *view; observed }");
+    let program = joined("parent = &!second;", true, "",
+        "u8 observed = reader.read(child); first = 3;")
+        .replace("%%start", "%%start\nreader = namespace package \"src/reader.w\";")
+        .replace("    seen\n", "    if (observed == seen && first == 3) { observed } else { 0 }\n");
+    let live = program.replace("u8 observed = reader.read(child); first = 3;",
+        "first = 3; u8 observed = reader.read(child);");
+    assert_ne!(live, program);
+    let declarations = |source: &SourceIdentity, text: &str| {
+        let parsed = parse_source(source.clone(), text.to_owned(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        derive_scalar_declarations_from_cst(parsed.result.canonical_cst())
+    };
+    for (target, target_layout) in [("native64", ScalarTargetLayout::NATIVE64), ("wasm32", ScalarTargetLayout::WASM32)] {
+        let prepare = |main: &str, reader: &str| {
+            let root = declarations(&app, main);
+            let namespace = root.namespaces().next().unwrap();
+            let bindings = vec![ScalarNamespaceBinding { binding: namespace.binding.clone(),
+                target: imported.clone(), span: namespace.span }];
+            prepare_scalar_project(vec![(root, bindings),
+                (declarations(&imported, reader), vec![]), (declarations(&decoy, certified), vec![])],
+                vec![app.clone(), imported.clone(), decoy.clone()], ScalarPreparationInputs { target_layout }).unwrap()
+        };
+        let prepared = prepare(&program, certified);
+        let build = analyze_scalar_build(&prepared);
+        assert!(build.diagnostics().is_empty(), "{target}: {:?}", build.diagnostics());
+        let ir = emit_scalar_build_project_llvm(&build).expect("imported joined read LLVM").to_text();
+        if let Some(out) = std::env::var_os("WOSY_JOINED_IMPORTED_READ_IR_DIR") {
+            let path = std::path::PathBuf::from(out).join(format!("{target}-project.ll"));
+            std::fs::write(path, ir).unwrap();
+        }
+        let prepared = prepare(&program, &uncertified);
+        let build = analyze_scalar_build(&prepared);
+        let reborrow = program.find("&(*parent)").unwrap() as u32;
+        assert!(build.diagnostics().iter().any(|d| d.code == "B0003" && d.labels.first()
+            .is_some_and(|label| label.span.range.start == reborrow)), "{target}: {:?}", build.diagnostics());
+
+        let prepared = prepare(&live, certified);
+        let build = analyze_scalar_build(&prepared);
+        let write = live.find("first = 3").unwrap() as u32;
+        assert!(build.diagnostics().iter().any(|d| d.code == "B0003"
+            && d.labels.first().is_some_and(|label| label.span.range.start == write)
+            && d.labels.iter().skip(1).any(|label| label.span.range.start == reborrow)),
+            "{target}: {:?}", build.diagnostics());
+    }
 }
