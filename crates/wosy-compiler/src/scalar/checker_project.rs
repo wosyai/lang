@@ -10,6 +10,8 @@ mod array_quantifier;
 mod case_splits;
 #[cfg(feature = "internal-checker")]
 mod ranked;
+#[cfg(feature = "internal-checker")]
+mod rewrite;
 
 use super::{
     checker_directive::{CheckerCode, CheckedLiteralOutput, CheckerOperation, InitializerIntegerOperand, InitializerPredicate, PreparedCheckerDirective},
@@ -5551,23 +5553,6 @@ struct MainFlowProofCase<'a> {
 }
 
 #[cfg(feature = "internal-checker")]
-fn flat_rewrite_arguments(item: &ScalarBlockItem) -> Option<(&ScalarExpression, &ScalarExpression)> {
-    let ScalarBlockItem::Expression(ScalarExpression::Call {
-        receiver: Some(core), name, arguments, type_arguments, ..
-    }) = item else { return None; };
-    if core != "core" || name != "rewrite" || !type_arguments.is_empty() { return None; }
-    let [equality, context] = arguments.as_slice() else { return None; };
-    Some((equality, context))
-}
-
-#[cfg(feature = "internal-checker")]
-#[derive(Clone, Eq, PartialEq)]
-enum FlatRewriteTerm<'a> {
-    Output,
-    Literal(Cow<'a, BigInt>),
-}
-
-#[cfg(feature = "internal-checker")]
 fn prepare_flat_rewrite_shows<'a>(
     plan: &'a PlannedModuleProof<'a>, original: &BigInt,
 ) -> Result<MainFlowAuthoredShows<'a>, ProjectCheck> {
@@ -5589,47 +5574,14 @@ fn prepare_flat_rewrite_shows<'a>(
     }
     let equality_relation = IntegerRelation::from_operator(&BinaryOperator::Equal)
         .ok_or(ProjectCheck::Unsupported)?;
-    let term = |expression: &'a ScalarExpression| {
-        if matches!(expression, ScalarExpression::Name { name, .. } if name == &plan.typed.output) {
-            Some(FlatRewriteTerm::Output)
-        } else {
-            let literal = concrete_integer_literal(expression)?;
-            integer_literal_fits_type(literal.as_ref(), plan.typed.result_type)
-                .then_some(FlatRewriteTerm::Literal(literal))
-        }
-    };
-    let hole = |expression: &ScalarExpression| matches!(expression, ScalarExpression::Name { name, .. } if name == "_");
-    let mut current = [FlatRewriteTerm::Output, FlatRewriteTerm::Literal(Cow::Borrowed(bound))];
+    let mut current = rewrite::Goal::new(operator, bound);
     let mut preceding_equalities = HashSet::new();
     let mut shows = Vec::new();
     for item in items {
-        if let Some((equality, context)) = flat_rewrite_arguments(item) {
-            let ScalarExpression::Binary { operator: BinaryOperator::Equal, left, right, .. } = equality else {
-                return Err(ProjectCheck::InvalidProof);
-            };
-            let before = term(left).ok_or(ProjectCheck::Unsupported)?;
-            let after = term(right).ok_or(ProjectCheck::Unsupported)?;
-            let literal = match (&before, &after) {
-                (FlatRewriteTerm::Output, FlatRewriteTerm::Literal(value))
-                    | (FlatRewriteTerm::Literal(value), FlatRewriteTerm::Output) => value,
-                _ => return Err(ProjectCheck::Unsupported),
-            };
-            if !preceding_equalities.contains(literal.as_ref()) { return Err(ProjectCheck::InvalidProof); }
-            let ScalarExpression::Binary { operator: context_operator, left, right, .. } = context else {
-                return Err(ProjectCheck::InvalidProof);
-            };
-            if context_operator != operator { return Err(ProjectCheck::InvalidProof); }
-            let (slot, other) = match (hole(left), hole(right)) {
-                (true, false) => (0, term(right)),
-                (false, true) => (1, term(left)),
-                _ => return Err(ProjectCheck::InvalidProof),
-            };
-            if other.as_ref() != Some(&current[1 - slot]) { return Err(ProjectCheck::InvalidProof); }
-            current[slot] = match (current[slot] == before, current[slot] == after) {
-                (true, false) => after,
-                (false, true) => before,
-                _ => return Err(ProjectCheck::InvalidProof),
-            };
+        if let Some((equality, context)) = rewrite::arguments(item) {
+            current.apply(equality, context, &plan.typed.output, plan.typed.result_type, None, |premise| {
+                Ok(matches!(premise, rewrite::Premise::Literal(value) if preceding_equalities.contains(value)))
+            })?;
         } else {
             let claim = proof_show_expression(item, true)?;
             let comparison = IntegerComparison::from_expression(claim).ok_or(ProjectCheck::Unsupported)?;
@@ -5717,12 +5669,20 @@ impl<'a> MainFlowProofCase<'a> {
         // forms. An oversized body stays in the legacy flat path, rather
         // than acquiring a new scan (or losing legacy flat admission).
         let shape = if citation.is_none() && super::checker_flow::charge_call_work(&mut 0, plan.steps.items.len()).is_some() {
-            plan.steps.items.iter().find_map(|item| match item {
-                ScalarBlockItem::Expression(ScalarExpression::If { .. } | ScalarExpression::UnitIf { .. }) =>
-                    Some(AuthoredShape::Cases),
-                _ if flat_rewrite_arguments(item).is_some() => Some(AuthoredShape::Rewrite),
-                _ => None,
-            })
+            let mut shape = None;
+            for item in &plan.steps.items {
+                match item {
+                    ScalarBlockItem::Expression(ScalarExpression::If { .. } | ScalarExpression::UnitIf { .. }) => {
+                        // A scoped script owns the entire sequence, including
+                        // any rewrites before the first split.
+                        shape = Some(AuthoredShape::Cases);
+                        break;
+                    }
+                    _ if shape.is_none() && rewrite::arguments(item).is_some() => shape = Some(AuthoredShape::Rewrite),
+                    _ => {}
+                }
+            }
+            shape
         } else { None };
         let step = if let Some((peer, show)) = citation {
             if peer.peer_literal_goal().is_none() || (!peer.steps.items.is_empty() && peer.direct_peer_use().is_none())
@@ -14434,6 +14394,88 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
         assert!(matches!(run(&unsupported_tail, ScalarCheckerScope::CurrentPackage), Err(ProjectCheck::Unsupported)));
         let restricted = proof_only.replace("ensures", "where (entry >= 1 && entry <= 2) ensures");
         assert!(matches!(run(&restricted, ScalarCheckerScope::CurrentPackage), Err(ProjectCheck::Unsupported)));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordered_case_rewrite_preserves_scoped_premises_and_the_current_goal() {
+        let app = source("src/main.w", "ordered-case-rewrite");
+        let clamp = r#"%%start
+            u8(u8) clamp = fn(value) { if (value > 10) { 10 } else { value } };
+            proof clamped for clamp(x) -> (out) ensures (out <= 10) {
+                if (x > 10) {
+                    core.show(out == 10);
+                    core.rewrite(out == 10, _ <= 10);
+                } else {
+                    core.show(out == core.old(x));
+                    core.rewrite(core.old(x) == out, _ <= 10);
+                }
+            }
+        %%end"#;
+        let inherited = r#"%%start
+            u8(u8) fixed = fn(input) { if (input == 0) {}; 7 };
+            proof scoped for fixed(x) -> (out) ensures (out == 7) {
+                core.show(out == 7);
+                core.rewrite(out == 7, _ == 7);
+                if (x > 0) {
+                    core.rewrite(7 == out, _ == 7);
+                    if (x > 1) { core.rewrite(out == 7, _ == 7); }
+                } else {
+                    core.rewrite(7 == out, _ == 7);
+                };
+                core.rewrite(out == 7, 7 == _);
+            }
+        %%end"#;
+        let run = |text: &str, scope| {
+            let (_, proof) = crate::parse_proof_source(app.clone(), text.to_owned(), &[]).ok().unwrap();
+            check_loaded_ordered_proof_diagnostics_in_scope::<true>(
+                Vec::new(), vec![(proof, Vec::new())], vec![app.clone()], inputs(), scope, Vec::new(),
+            )
+        };
+        let package = ScalarCheckerScope::CurrentPackage;
+        for proof in [clamp, inherited] {
+            let checked = run(proof, package).unwrap();
+            assert!(checked.active && checked.directives.is_empty()
+                && checked.diagnostics.is_empty() && checked.symbolic_diagnostic.is_none());
+        }
+        let false_show = clamp.replace("if (value > 10) { 10 }", "if (value > 10) { 9 }");
+        let diagnosed = run(&false_show, package).unwrap().symbolic_diagnostic.unwrap();
+        let step = diagnosed.failed_step.as_ref().unwrap().range;
+        assert_eq!(&false_show[step.start as usize..step.end as usize], "core.show(out == 10)");
+        assert_eq!(diagnosed.returned, BigInt::from(9));
+        let false_goal = clamp.replace("<= 10", "< 10");
+        let diagnosed = run(&false_goal, package).unwrap().symbolic_diagnostic.unwrap();
+        assert!(diagnosed.failed_step.is_none());
+        assert_eq!(diagnosed.returned, BigInt::from(10));
+
+        let main = ScalarCheckerScope::MainFlowOnly;
+        for (proof, call) in [(clamp, "clamp(11)"), (clamp, "clamp(6)"), (inherited, "fixed(3)"), (inherited, "fixed(0)")] {
+            let reached = proof.replace("%%end", &format!("u8 reached = {call}; %%end"));
+            let checked = run(&reached, main).unwrap();
+            assert!(checked.active && checked.diagnostics.is_empty() && checked.symbolic_diagnostic.is_none());
+        }
+        let reached_false = false_show.replace("%%end", "u8 reached = clamp(11); %%end");
+        let checked = run(&reached_false, main).unwrap();
+        let [failed] = checked.diagnostics.as_slice() else { panic!("the selected actual show must report"); };
+        let step = failed.failed_step.as_ref().unwrap().range;
+        assert_eq!(&reached_false[step.start as usize..step.end as usize], "core.show(out == 10)");
+        assert_eq!(failed.invocation.arguments, [(ScalarType::U8, BigInt::from(11))]);
+        assert_eq!(failed.invocation.returned, BigInt::from(9));
+
+        for (label, rejected) in [
+            ("sibling premise", clamp.replace("core.show(out == core.old(x));", "")
+                .replace("core.old(x) == out, _ <= 10", "out == 10, _ <= 10")),
+            ("join premise", clamp.replace("                }
+            }", "                };
+                core.rewrite(out == 10, _ <= 10);
+            }")),
+            ("later premise", clamp.replace("core.show(out == 10);
+                    core.rewrite(out == 10, _ <= 10);",
+                "core.rewrite(out == 10, _ <= 10); core.show(out == 10);")),
+            ("stale goal", inherited.replace("core.rewrite(out == 7, 7 == _);", "core.rewrite(out == 7, out == _);")),
+        ] {
+            assert!(matches!(run(&rejected, package), Err(ProjectCheck::InvalidProof)), "{label}: {rejected}");
+        }
     }
 
     #[cfg(feature = "internal-checker")]

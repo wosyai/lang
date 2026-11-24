@@ -49,7 +49,10 @@ qualified target or publish an ordinary call summary for it.
 Non-inductive proofs of pure unary integer functions can use check-time
 `if` case splits on the input, including nested splits and ordered
 `core.show` steps that compare the returned value with a literal or
-establish equality to the input. These steps do not execute in artifacts.
+establish equality to the input. In this profile, `core.rewrite` can use an
+earlier equality from the same branch or an enclosing block to replace one
+occurrence in the current goal. Branch-local equalities and rewrites do not
+carry to siblings or past the join. Proof steps do not execute in artifacts.
 
 Check diagnostics and stream output work on native CLI hosts. Authored file
 output currently requires a Linux CLI host and a flat filename under
