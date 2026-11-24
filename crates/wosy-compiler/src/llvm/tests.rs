@@ -9842,12 +9842,14 @@ i32() overlap = fn {
                 std::fs::write(std::path::PathBuf::from(output_dir).join(path), &ir).unwrap();
             }
         }
-        let rejected = parse_source(source.clone(), overlapping.into(), &[]);
-        assert!(rejected.diagnostics.is_empty(), "{:?}", rejected.diagnostics);
-        let rejected = crate::derive_scalar_program_with_layout(&rejected.result, layout);
-        let [diagnostic] = rejected.diagnostics.as_slice() else { panic!("{:?}", rejected.diagnostics) };
-        assert_eq!(diagnostic.code, "B0003");
-        assert!(diagnostic.message.contains("fallible allocation requires an exact proven null guard for its local binding"), "{diagnostic:?}");
+        let parsed = parse_source(source.clone(), overlapping.into(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let overlap = crate::derive_scalar_program_with_layout(&parsed.result, layout);
+        assert!(overlap.diagnostics.is_empty(), "{:?}", overlap.diagnostics);
+        let ir = emit_scalar_llvm(&overlap).unwrap().to_text();
+        let body = self_tail_test_body(&ir, "i32", &self_tail_test_symbol(&source, false, "overlap"));
+        assert_eq!(body.matches("call ptr @__wosy_core_alloc(").count(), 2, "{body}");
+        assert_eq!(body.matches("call void @__wosy_core_free(").count(), 2, "{body}");
     }
 }
 
@@ -9914,10 +9916,12 @@ i32() nested = fn {
         }
         let parsed = parse_source(source.clone(), nested.into(), &[]);
         assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
-        let rejected = crate::derive_scalar_program_with_layout(&parsed.result, layout);
-        let [diagnostic] = rejected.diagnostics.as_slice() else { panic!("{:?}", rejected.diagnostics) };
-        assert_eq!(diagnostic.code, "B0003");
-        assert!(diagnostic.message.contains("fallible allocation requires an exact proven null guard for its local binding"), "{diagnostic:?}");
+        let nested = crate::derive_scalar_program_with_layout(&parsed.result, layout);
+        assert!(nested.diagnostics.is_empty(), "{:?}", nested.diagnostics);
+        let ir = emit_scalar_llvm(&nested).unwrap().to_text();
+        let body = self_tail_test_body(&ir, "i32", &self_tail_test_symbol(&source, false, "nested"));
+        assert_eq!(body.matches("call ptr @__wosy_core_alloc(").count(), 2, "{body}");
+        assert_eq!(body.matches("call void @__wosy_core_free(").count(), 2, "{body}");
     }
 }
 
@@ -12731,6 +12735,72 @@ if (replace(true) != 23 || replace(false) != 24) { core.system_panic(); };
             if let Some(out) = std::env::var_os("WOSY_WIDENED_JOIN_REPLACE_IR_DIR") {
                 let target = if layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
                 let route = if project { "project" } else { "standalone" };
+                let controlled = llvm.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);
+                assert_ne!(controlled, llvm);
+                std::fs::write(std::path::PathBuf::from(out).join(format!("{target}-{route}-control.ll")), controlled).unwrap();
+            }
+        }
+    }
+}
+
+#[test]
+fn guarded_fallible_coexisting_allocations_keep_independent_presence_and_cleanup() {
+    use inkwell::{memory_buffer::MemoryBuffer, values::{CallSiteValue, InstructionOpcode}};
+    let source = SourceIdentity::new("project".into(), "package".into(), "src/coexisting_fallible.w".into(), "r1".into());
+    let text = "%%start
+i32() observed = fn {
+    i32 first =? 11;
+    i32 second =? 22;
+    i32 one = if (&first != null) { first } else { 1 };
+    i32 other = if (&second != null) {
+        i32 third =? 33;
+        if (&third != null) { second + third } else { second + 3 }
+    } else { 2 };
+    one * 100 + other
+};
+if (observed() != 1155 || observed() != 155 || observed() != 1102
+    || observed() != 1125 || observed() != 102) { core.system_panic(); };
+%%end";
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let parsed = parse_source(source.clone(), text.into(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let single = crate::derive_scalar_program_with_layout(&parsed.result, layout);
+        assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+        let project = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::from_program(single.program.clone(), Vec::new())], vec![source.clone()],
+        ));
+        assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+        for (in_project, llvm) in [(false, emit_scalar_llvm(&single).unwrap().to_text()),
+            (true, emit_scalar_project_llvm(&project).unwrap().to_text())]
+        {
+            let context = Context::create();
+            let buffer = MemoryBuffer::create_from_memory_range_copy(llvm.as_bytes(), "coexisting fallible owners");
+            let module = context.create_module_from_ir(buffer).unwrap();
+            module.verify().unwrap();
+            let alloc = module.get_function("__wosy_core_alloc").unwrap();
+            let free = module.get_function("__wosy_core_free").unwrap();
+            let function = module.get_function(&self_tail_test_symbol(&source, in_project, "observed")).unwrap();
+            let instructions = function.get_basic_blocks().into_iter().flat_map(|block|
+                std::iter::successors(block.get_first_instruction(), |instruction| instruction.get_next_instruction()))
+                .collect::<Vec<_>>();
+            let calls_to = |callee| instructions.iter().copied().filter(|instruction|
+                CallSiteValue::try_from(*instruction).ok().is_some_and(|call| call.get_called_fn_value() == Some(callee)))
+                .collect::<Vec<_>>();
+            let births = calls_to(alloc);
+            let deaths = calls_to(free);
+            assert_eq!(births.len(), 3, "{llvm}");
+            assert_eq!(deaths.len(), 3, "{llvm}");
+            let tests = instructions.iter().copied().filter(|instruction| instruction.get_opcode() == InstructionOpcode::ICmp)
+                .collect::<Vec<_>>();
+            assert_eq!(tests.len(), 3, "one presence test per allocation: {llvm}");
+            for owner in births {
+                let uses = |inst| known_field_operand(inst, 0).and_then(|value| value.as_instruction_value()) == Some(owner);
+                assert_eq!(tests.iter().filter(|&&test| uses(test)).count(), 1, "{llvm}");
+                assert_eq!(deaths.iter().filter(|&&free| uses(free)).count(), 1, "{llvm}");
+            }
+            if let Some(out) = std::env::var_os("WOSY_FALLIBLE_COEXISTING_IR_DIR") {
+                let target = if layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
+                let route = if in_project { "project" } else { "standalone" };
                 let controlled = llvm.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);
                 assert_ne!(controlled, llvm);
                 std::fs::write(std::path::PathBuf::from(out).join(format!("{target}-{route}-control.ll")), controlled).unwrap();

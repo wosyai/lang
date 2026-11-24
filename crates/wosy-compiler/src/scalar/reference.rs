@@ -5943,9 +5943,8 @@ impl<'a> ReferenceFlowBuilder<'a> {
         }
         let scope_exit = self.point(CfgPointKind::ScopeExit, region.span, scope, BTreeSet::new());
         if declares_fallible {
-            if let Some(slot) = self.proof_points.guarded_allocation_scopes.iter_mut().find(|slot| slot.is_none()) {
-                *slot = Some(super::control::GuardedAllocationScope { scope, entry: scope_entry, exit: scope_exit });
-            }
+            self.proof_points.guarded_allocation_scopes.insert(scope.0,
+                super::control::GuardedAllocationScope { scope, entry: scope_entry, exit: scope_exit });
         }
         if self.aggregate_facts.needs_scope_exit_metadata() {
             self.aggregate_facts.scope_exits.insert(scope_exit, ordinal);
@@ -16351,13 +16350,11 @@ fn seal_guarded_scalar_allocations(
     cfg: &ScalarReferenceCfg, points: &CallablePointFacts,
 ) -> Option<Box<[GuardedScalarAllocation]>> {
     let bindings = points.fallible_allocation_bindings.as_ref()?;
-    if !(1..=2).contains(&bindings.len()) {
-        return None;
-    }
-    // Lexical use identities and successor facts are prepared by the same walk.
-    // Keep conditions per owner, not owners per condition: the backing is immutable
-    // for the entire lexical lifetime, including nested observations.
-    let mut owners: Vec<(&ReferenceBindingId, Vec<GuardedScalarBranch>)> = Vec::new();
+    if bindings.is_empty() { return None; }
+    // Index each qualified owner once; neither guards nor alias accesses
+    // scan the set of live fallible allocations.
+    let mut owners: Vec<(&ReferenceBindingId, Vec<GuardedScalarBranch>, Vec<usize>)> = Vec::new();
+    let mut owner_indices = HashMap::with_capacity(bindings.len());
     for (branch, edge) in &points.guarded_allocation_edges {
         let point = cfg.points.get(branch.0)?;
         let [then, otherwise] = point.successors.as_slice() else { return None };
@@ -16368,13 +16365,11 @@ fn seal_guarded_scalar_allocations(
             return None;
         }
         bindings.get(&edge.binding)?;
-        let index = match owners.iter().position(|(binding, _)| *binding == &edge.binding) {
-            Some(index) => index,
-            None => {
-                owners.push((&edge.binding, Vec::new()));
-                owners.len() - 1
-            }
-        };
+        let index = *owner_indices.entry(&edge.binding).or_insert_with(|| {
+            let index = owners.len();
+            owners.push((&edge.binding, Vec::new(), Vec::new()));
+            index
+        });
         owners[index].1.push(GuardedScalarBranch {
             condition: edge.condition.0, branch: *branch, present_on_then: *then == edge.present,
         });
@@ -16382,27 +16377,24 @@ fn seal_guarded_scalar_allocations(
     if owners.len() != bindings.len() {
         return None;
     }
-    if let [(left, _), (right, _)] = owners.as_slice() {
-        let [Some(first), Some(second)] = points.guarded_allocation_scopes else { return None };
-        if first.exit >= second.entry
-            || !matches!(cfg.points[first.entry.0].kind, CfgPointKind::ScopeEnter)
-            || !matches!(cfg.points[first.exit.0].kind, CfgPointKind::ScopeExit)
-            || !matches!(cfg.points[second.entry.0].kind, CfgPointKind::ScopeEnter)
-            || !matches!(cfg.points[second.exit.0].kind, CfgPointKind::ScopeExit)
-            || bindings.get(*left)?.scope != first.scope
-            || bindings.get(*right)?.scope != second.scope
-        {
-            return None;
-        }
+    for (ordinal, owner) in &points.fallible_alias_accesses {
+        owners[*owner_indices.get(owner)?].2.push(ordinal.0);
     }
-    owners.into_iter().map(|(binding, mut guards)| {
+    owners.into_iter().map(|(binding, mut guards, mut accesses)| {
+        let declared = bindings.get(binding)?;
+        let scope = points.guarded_allocation_scopes.get(&declared.scope.0)?;
+        let (entry, exit) = (cfg.points.get(scope.entry.0)?, cfg.points.get(scope.exit.0)?);
+        if scope.scope != declared.scope || entry.scope != declared.scope || exit.scope != declared.scope
+            || scope.entry >= scope.exit || entry.source_span.range != binding.block_span
+            || exit.source_span.range != binding.block_span
+            || !matches!(entry.kind, CfgPointKind::ScopeEnter)
+            || !matches!(exit.kind, CfgPointKind::ScopeExit)
+            || !points.scope_exit_bindings.as_ref()?.get(&scope.exit)?.contains(binding)
+        { return None; }
         guards.sort_unstable_by_key(|guard| guard.condition);
         if guards.windows(2).any(|pair| pair[0].condition == pair[1].condition) {
             return None;
         }
-        let mut accesses = points.fallible_alias_accesses.iter()
-            .filter_map(|(ordinal, owner)| (owner == binding).then_some(ordinal.0))
-            .collect::<Vec<_>>();
         accesses.sort_unstable();
         accesses.dedup();
         Some(GuardedScalarAllocation {
