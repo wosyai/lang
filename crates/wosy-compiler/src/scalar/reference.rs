@@ -6109,6 +6109,8 @@ type CheckerIntegerArgumentSite = (OccurrenceOrdinal, CheckerIntegerCallArgument
 #[cfg(any(test, feature = "internal-checker"))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum CheckerIntegerCallArguments {
+    #[cfg(feature = "internal-checker")]
+    Nullary,
     Single(CheckerIntegerArgumentSite),
     Pair(Box<[CheckerIntegerArgumentSite; 2]>),
 }
@@ -6117,6 +6119,8 @@ pub(super) enum CheckerIntegerCallArguments {
 impl CheckerIntegerCallArguments {
     pub(super) fn as_slice(&self) -> &[CheckerIntegerArgumentSite] {
         match self {
+            #[cfg(feature = "internal-checker")]
+            Self::Nullary => &[],
             Self::Single(site) => std::slice::from_ref(site),
             Self::Pair(sites) => sites.as_ref(),
         }
@@ -6131,6 +6135,8 @@ pub(super) enum CheckerIntegerCallArgument {
     ContextualValue,
     #[cfg(feature = "internal-checker")]
     RankedSelfDescent,
+    #[cfg(feature = "internal-checker")]
+    ExactBoolean,
 }
 
 #[cfg(feature = "internal-checker")]
@@ -8744,11 +8750,13 @@ impl StructuralWalker<'_, '_> {
             ))? else {
                 return None;
             };
-            if !is_integer_type(parameter)
-                || self.structure.checked_types.expressions.get(argument)? != parameter
-            {
-                return None;
+            if self.structure.checked_types.expressions.get(argument)? != parameter { return None; }
+            #[cfg(feature = "internal-checker")]
+            if *parameter == ScalarType::Bool {
+                return matches!(expression, ScalarExpression::Name { .. } | ScalarExpression::Boolean { .. })
+                    .then_some((*argument, CheckerIntegerCallArgument::ExactBoolean));
             }
+            if !is_integer_type(parameter) { return None; }
             let origin = match expression {
                 ScalarExpression::Integer { value, .. } => CheckerIntegerCallArgument::Literal(value.clone()),
                 ScalarExpression::Name { .. } => CheckerIntegerCallArgument::PlainName,
@@ -8763,6 +8771,8 @@ impl StructuralWalker<'_, '_> {
             Some((*argument, origin))
         };
         match (arguments.as_slice(), signature.parameters.as_slice()) {
+            #[cfg(feature = "internal-checker")]
+            ([], []) if self.structure.checker_direct_targets.contains_key(&call) => Some(CheckerIntegerCallArguments::Nullary),
             ([argument], [parameter]) => Some(CheckerIntegerCallArguments::Single(describe(0, argument, parameter)?)),
             ([first, second], [first_ty, second_ty]) => Some(CheckerIntegerCallArguments::Pair(Box::new([
                 describe(0, first, first_ty)?, describe(1, second, second_ty)?,

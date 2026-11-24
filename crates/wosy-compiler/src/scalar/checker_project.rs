@@ -450,6 +450,7 @@ impl ActualIntegerObserver for ProofFreeOrderedEvidence {
     const EXACT_CONTEXTUAL_BOOLEAN_UNIT: bool = true;
     const AUTHORED_SINGLETON_CODE: bool = true;
     const REAL_INTEGER_TAIL_CALLS: bool = true;
+    const REAL_INTEGER_INPUT_SIGNATURES: bool = true;
     const ORDINARY_INTEGER_LOCALS: bool = true;
 
     fn observe(&mut self, _: (usize, usize), _: &[&BigInt], _: &BigInt) {}
@@ -1107,7 +1108,7 @@ fn walk_package_initialization<const COLLECT: bool, const PRIVATE_NESTED_SCALAR:
                         let collection = None;
                         match run_initializer_call(
                             topology, actual, outputs.primary, ty,
-                            |argument, argument_type| initialized_integer_argument(topology, &storage, argument, argument_type),
+                            |argument, argument_type| initialized_scalar_initializer_argument(topology, &storage, argument, argument_type),
                             collection,
                             #[cfg(feature = "internal-checker")]
                             proof_site,
@@ -1239,8 +1240,12 @@ fn run_initializer_call<'a, Observer: ActualIntegerObserver>(
     let check_completed_integer_namespace = false;
     let collection = collection.filter(|(source, _)|
         check_completed_integer_namespace || !is_integer_type(expected) || *source == &declaration.source);
-    let allow_bool = *expected == ScalarType::Unit && collection.is_some() && Observer::ORDINARY_INTEGER_LOCALS;
-    let arguments = if signature.parameters.len() == 2
+    let real_integer_input = actual.real_integer_input_profile(expected, collection.is_some());
+    let allow_bool = (real_integer_input || *expected == ScalarType::Unit)
+        && collection.is_some() && Observer::ORDINARY_INTEGER_LOCALS;
+    let arguments = if real_integer_input && signature.parameters.is_empty() {
+        ActualProjectedArguments::Single(None)
+    } else if signature.parameters.len() == 2
         && (is_integer_type(expected) || (*expected == ScalarType::Unit && collection.is_some()))
     {
         let first = exact_typed_call_argument_at(&topology.structure, occurrence, 0, allow_bool, &initialized_argument)
@@ -1264,6 +1269,26 @@ fn run_initializer_call<'a, Observer: ActualIntegerObserver>(
 enum InitializerValue<'a> {
     Boolean(bool),
     Integer { ty: &'a ScalarType, value: Cow<'a, BigInt> },
+}
+
+fn initialized_scalar_initializer_argument<'a>(
+    topology: &ModuleInitializationTopology,
+    storage: &'a HashMap<ByteSpan, InitializerValue<'_>>,
+    argument: OccurrenceOrdinal,
+    argument_type: &ScalarType,
+) -> Option<&'a BigInt> {
+    #[cfg(feature = "internal-checker")]
+    if *argument_type == ScalarType::Bool {
+        let InitializationName::Storage(InitializationStorage::Module(span)) =
+            topology.identities.names.get(&argument)? else { return None; };
+        let InitializerValue::Boolean(value) = storage.get(span)? else { return None; };
+        // Prepared exact argument rows use these two numeric Boolean atoms.
+        // Share them rather than allocating a BigInt per read or declaration.
+        static BOOL_VALUES: std::sync::LazyLock<[BigInt; 2]> =
+            std::sync::LazyLock::new(|| [BigInt::from(0u8), BigInt::from(1u8)]);
+        return BOOL_VALUES.get(usize::from(*value));
+    }
+    initialized_integer_argument(topology, storage, argument, argument_type)
 }
 
 fn initialized_integer_argument<'a>(
@@ -1383,6 +1408,8 @@ trait ActualIntegerObserver {
     const AUTHORED_SINGLETON_CODE: bool = false;
     #[cfg(feature = "internal-checker")]
     const REAL_INTEGER_TAIL_CALLS: bool = false;
+    #[cfg(feature = "internal-checker")]
+    const REAL_INTEGER_INPUT_SIGNATURES: bool = false;
     const INTEGER_RETURN_PARTITIONS: bool = false;
     const PROJECTED_FORMAL_WRITES: bool = false;
     const ORDINARY_PROJECTED_PAIR: bool = false;
@@ -1593,6 +1620,14 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             IntegerRequirementContinuation::Empty => ActualCallResult::EmptyUnit,
             IntegerRequirementContinuation::Projected(values) => ActualCallResult::ProjectedUnit(values),
         })
+    }
+
+    fn real_integer_input_profile(&self, expected: &ScalarType, collecting: bool) -> bool {
+        #[cfg(feature = "internal-checker")]
+        { ACTUAL_STARTUP && collecting && Observer::EXACT_INTEGER_CALL_CONTINUATIONS
+            && Observer::REAL_INTEGER_INPUT_SIGNATURES && is_integer_type(expected) }
+        #[cfg(not(feature = "internal-checker"))]
+        { let _ = (expected, collecting); false }
     }
 
     fn exact_self_reentry_allowed(&self, expected: &ScalarType, collecting: bool) -> bool {
@@ -1873,11 +1908,19 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
         {
             return Err(ProjectCheck::Unsupported);
         }
+        let real_integer_input = self.real_integer_input_profile(expected, collection.is_some());
+        if signature.parameters.is_empty()
+            && matches!(effect, ExactCallEffect::Scalar { binding: Some(_), ty, .. } if is_integer_type(ty))
+            && !real_integer_input
+        {
+            return Err(ProjectCheck::Unsupported);
+        }
         let arguments = parent.cursor.arguments(
             caller, call, signature.parameters.len(), collection.is_some(), Observer::INTEGER_RETURN_PARTITIONS,
             Observer::ORDINARY_PROJECTED_PAIR,
             Observer::ORDINARY_PROJECTED_PAIR,
-            Observer::ORDINARY_INTEGER_LOCALS && matches!(*expected, ScalarType::Unit | ScalarType::Bool),
+            Observer::ORDINARY_INTEGER_LOCALS && (matches!(*expected, ScalarType::Unit | ScalarType::Bool)
+                || real_integer_input),
         )
             .ok_or(ProjectCheck::Unsupported)?;
         if let NestedIntegerArgument::Projected(mut projection) = arguments {
@@ -1922,7 +1965,8 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             return Err(ProjectCheck::Unsupported);
         }
         // Mutating integer-return bodies cannot use the ranked self proof.
-        let ranked = !restricted_local_writes && self.exact_self_reentry_allowed(expected, collection.is_some());
+        let ranked = !restricted_local_writes && self.exact_self_reentry_allowed(expected, collection.is_some())
+            && (*expected == ScalarType::Unit || matches!(signature.parameters.as_slice(), [ty] if is_integer_type(ty)));
         let argument;
         let pair;
         #[cfg(feature = "internal-checker")]
@@ -15190,6 +15234,49 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
                     let three = BigInt::from(3);
                     assert!(receipt.directives[0].witness.intervals_at(0, 1).unwrap().eq([(&three, &three)]));
                 }
+            }
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn real_integer_startup_signatures_use_zero_slots_and_initialized_boolean_slots() {
+        let ordered = |code| OUTPUT.replace(".code = 1", &format!(".code = {code}"));
+        let nullary = format!(r#"%%start
+            i8() pick = fn {{
+                core.require(false, {});
+                7
+            }};
+            i8 saved = pick();
+            core.require(saved != 7, {});
+        %%end"#, ordered(103), ordered(104));
+        let local_nullary = format!(r#"%%start
+            i8() pick = fn {{
+                core.require(false, {});
+                7
+            }};
+            unit() startup = fn {{
+                i8 local = pick();
+                core.require(local != 7, {});
+            }};
+            startup();
+        %%end"#, ordered(106), ordered(107));
+        let bool_argument = format!(r#"%%start
+            i8(bool,i8) pick = fn(flag, value) {{ if (flag) {{ value }} else {{ 5 }} }};
+            bool selected = false;
+            i8 saved = pick(selected, 8);
+            core.require(saved != 5, {});
+        %%end"#, ordered(105));
+        let app = source("src/main.w", "real-integer-startup-signatures");
+        for scope in [ScalarCheckerScope::MainFlowOnly, ScalarCheckerScope::CurrentPackage] {
+            for (text, expected) in [(&nullary, &[103, 104][..]), (&nullary.replace("core.require(false", "core.narrow(false"), &[103]),
+                (&local_nullary, &[106, 107]), (&local_nullary.replace("core.require(false", "core.narrow(false"), &[106]),
+                (&bool_argument, &[105])]
+            {
+                let prepared = prepare_proof_target(&app, text).unwrap();
+                let outcome = run_closed_without_named_proofs(&prepared, scope, 1).unwrap();
+                assert!(outcome.directives.iter().map(|failure| failure.code().clone())
+                    .eq(expected.iter().copied().map(BigInt::from)));
             }
         }
     }

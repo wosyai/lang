@@ -875,6 +875,56 @@ def state_report(code, label, selected, extra=""):
     return ('{ .stdout = ""; .stderr = "'+label+'"; .code = '+str(code)
             +'; .files = [{ .path = "state.json"; .state = '+selected+'; }'+extra+']; }')
 
+real_nullary_initializer = f"""%%start
+    i8() pick = fn {{
+        core.require(false, {report(234,"NULLARY-CALLEE")});
+        7
+    }};
+    i8 saved = pick();
+    core.require(saved != 7, {report(235,"NULLARY-CALLER")});
+    %%end"""
+real_nullary_local = f"""%%start
+    i8() pick = fn {{
+        core.require(false, {report(234,"NULLARY-CALLEE")});
+        7
+    }};
+    unit() startup = fn {{
+        i8 local = pick();
+        core.require(local != 7, {report(235,"NULLARY-LOCAL-CALLER")});
+    }};
+    startup();
+    %%end"""
+real_bool_initializer = f"""%%start
+    i8(bool,i8) choose = fn(flag, entry) {{
+        if (flag) {{ entry }} else {{ 5 }}
+    }};
+    bool selected = false;
+    i8 saved = choose(selected, 8);
+    core.require(saved != 5, {report(236,"BOOL-ARG-FALSE")});
+    %%end"""
+real_bool_nested_local = f"""%%start
+    i8(bool,i8) choose = fn(flag, entry) {{
+        if (flag) {{ entry }} else {{ 5 }}
+    }};
+    i8(i8) forward = fn(entry) {{
+        bool selected = true;
+        i8 local = choose(selected, entry);
+        local
+    }};
+    i8 saved = forward(8);
+    core.require(saved != 8, {report(237,"BOOL-ARG-TRUE")});
+    %%end"""
+cases.extend([
+    ("exact-startup-nullary-int-return",real_nullary_initializer,234,b"NULLARY-CALLEENULLARY-CALLER"),
+    ("exact-startup-nullary-int-narrow-does-not-return",real_nullary_initializer.replace("core.require(false","core.narrow(false"),234,b"NULLARY-CALLEE"),
+    ("exact-startup-nullary-int-local",real_nullary_local,234,b"NULLARY-CALLEENULLARY-LOCAL-CALLER"),
+    ("exact-startup-nullary-int-local-narrow-prunes",real_nullary_local.replace("core.require(false","core.narrow(false"),234,b"NULLARY-CALLEE"),
+    ("exact-startup-bool-module-argument-int-return",real_bool_initializer,236,b"BOOL-ARG-FALSE"),
+    ("exact-startup-bool-nested-argument-int-local",real_bool_nested_local,237,b"BOOL-ARG-TRUE"),
+    ("exact-startup-bool-nested-argument-int-tail",real_bool_nested_local.replace(
+        "i8 local = choose(selected, entry);\n        local","choose(selected, entry)"
+    ),237,b"BOOL-ARG-TRUE"),
+])
 real_integer_tail = f"""%%start
     i8(i8) pick = fn(entry) {{
         core.require(entry != 3, {state_report(231,"TAIL-CHILD","entry")});

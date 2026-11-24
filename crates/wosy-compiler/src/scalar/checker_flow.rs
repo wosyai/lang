@@ -5111,6 +5111,8 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                     *imports = rest;
                     let local = local.take()?;
                     let origin = structure.checker_integer_call_locals.get(&(block, item.position))?;
+                    #[cfg(feature = "internal-checker")]
+                    if origin.arguments.as_slice().is_empty() { return None; }
                     let [receiver] = binding.receivers() else {
                         return None;
                     };
@@ -5125,7 +5127,7 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                             CheckerIntegerCallArgument::Literal(value) => Argument::Literal(value),
                             CheckerIntegerCallArgument::ContextualValue => return None,
                             #[cfg(feature = "internal-checker")]
-                            CheckerIntegerCallArgument::RankedSelfDescent => return None,
+                            CheckerIntegerCallArgument::RankedSelfDescent | CheckerIntegerCallArgument::ExactBoolean => return None,
                             CheckerIntegerCallArgument::PlainName => {
                                 let PlainNameIdentity::Lexical(argument) = calls.prepared_plain_name(*ordinal)? else {
                                     return None;
@@ -5191,9 +5193,12 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                         }));
                     }
                     #[cfg(feature = "internal-checker")]
-                    if matches!(origin.arguments.as_slice(), [(_, CheckerIntegerCallArgument::RankedSelfDescent)]) {
-                        // Only the explicit exact stack can authenticate and
-                        // consume the typed rank receipt.
+                    if origin.arguments.as_slice().is_empty()
+                        || origin.arguments.as_slice().iter().any(|(_, argument)| matches!(argument,
+                            CheckerIntegerCallArgument::RankedSelfDescent | CheckerIntegerCallArgument::ExactBoolean))
+                    {
+                        // Nullary, ranked and Bool typed origins are consumed
+                        // only by the explicitly gated exact stack.
                         return None;
                     }
                     let handle = handle_call.as_mut()?;
