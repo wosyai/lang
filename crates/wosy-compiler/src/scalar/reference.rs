@@ -7114,7 +7114,9 @@ fn joined_root_reborrow_binding<'a>(
                 let deref = points.get(deref.0)?;
                 // A typed observation may execute in a nested branch, but its
                 // holder evaluation and operation must share one lexical scope.
-                if rest.scope != deref.scope {
+                if rest.scope != deref.scope || !contains_loan_site(holder, rest)
+                    || !contains_loan_site(holder, deref)
+                {
                     return None;
                 }
                 let birth = holders[holder];
@@ -7123,14 +7125,15 @@ fn joined_root_reborrow_binding<'a>(
                     mode: ScalarReferenceMutability::Shared, place: ScalarPlace::Dereference { pointer, .. }, pointer_point,
                 } = &deref.kind
                 {
-                    if rest.scope != child.scope || descendant_sites.binary_search(&deref.id).is_err()
+                    if descendant_sites.binary_search(&deref.id).is_err()
                         || *pointer_point != rest.id || !matches!(pointer.as_ref(), ScalarExpression::Name { span, .. }
                             if *span == rest.source_span.range)
                     { return None; }
                     let [bind] = deref.successors.as_slice() else { return None };
                     let bound = points.get(bind.0)?;
                     let CfgPointKind::Bind { binding: grandchild } = &bound.kind else { return None };
-                    if bound.scope != child.scope || grandchild == binding || holders.contains_key(grandchild)
+                    if bound.scope != deref.scope || !contains_loan_site(grandchild, bound)
+                        || grandchild == binding || holders.contains_key(grandchild)
                         || initializers.binary_search(&(*bind, deref.id)).is_err()
                     { return None; }
                     if descendants.insert(deref.id, (birth, holder)).is_some() { return None; }

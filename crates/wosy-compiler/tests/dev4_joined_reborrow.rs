@@ -297,6 +297,24 @@ fn joined_mutable_child_updates_only_its_selected_lexical_owner() {
 }
 
 #[test]
+fn joined_mutable_child_releases_branch_local_freeze_before_merge() {
+    let program = joined_with_pointer_read(
+        "u8 observed = if (choose) { *u8 frozen = &(*child); pointer(frozen) } else { *child }; \
+         *child = seen + 4; u8 changed = *child; u8 left = first; u8 right = second;",
+        "*value",
+    ).replace("*u8 child = &(*parent);", "*!u8 child = &!(*parent);")
+        .replace("    seen\n", "    if (choose) { if (observed == 7 && changed == 11 && left == 11 && right == 9) { seen } else { 0 } } else { if (observed == 9 && changed == 13 && left == 7 && right == 13) { seen } else { 0 } }\n");
+    check_case(&program, Expected::Valid, Some("WOSY_JOINED_BRANCH_FREEZE_IR_DIR"));
+
+    let live = program.replace(
+        "*u8 frozen = &(*child); pointer(frozen)",
+        "*u8 frozen = &(*child); first = 3; pointer(frozen)",
+    );
+    assert_ne!(live, program);
+    check(&live, Expected::LiveDescendantConflict);
+}
+
+#[test]
 fn joined_mutable_child_resumes_writes_after_shared_descendant_last_use() {
     let program = joined_with_pointer_read(
         "*child = seen + 2; *u8 frozen = &(*child); *u8 alias = frozen; u8 observed = pointer(alias); \
