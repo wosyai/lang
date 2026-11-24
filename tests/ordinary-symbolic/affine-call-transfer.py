@@ -1626,6 +1626,16 @@ cases.extend([
         2,b"unsupported analysis"),
 ])
 
+ordered_calling_citation_chain = ordered_calling_citation.replace(
+    "proof uses_issued", "proof top for producer(arg) -> (out) where (arg >= 0) ensures (out <= 8) { core.use(uses_issued(arg)); }\n    proof uses_issued")
+cases.extend([
+    ("ordered-calling-citation-chain-verified",ordered_calling_citation_chain,0,b""),
+    ("ordered-calling-citation-chain-refuses-middle-without-implication",
+        ordered_calling_citation_chain.replace("out <= 8","out == 7"),2,b"unsupported analysis"),
+    ("ordered-calling-citation-chain-refuses-cycle",
+        ordered_calling_citation_chain.replace("core.use(issued(arg))","core.use(top(arg))"),2,b"unsupported analysis"),
+])
+
 ordered_shows_calling_producer = authored_named_calling_producer.replace(
     "core.show(out < 7);", "core.show(out <= 7); core.show(out < 7); core.show(out >= 0);")
 cases.extend([

@@ -3926,9 +3926,9 @@ impl SelectedSymbolicProof<'_, '_> {
             .map(|case| (case, None)).chain(authored.iter().map(|(case, step)| (case, step.as_ref())));
         let mut plans = Vec::new();
         for (case, step) in cases {
-            let citation = if let Some(MainFlowAuthoredShows::CallingCitation { terminal, relation, bound }) = step {
+            let citation = if let Some(MainFlowAuthoredShows::CallingCitation { peer }) = step {
                 has_citation = true;
-                Some((*terminal, *relation, *bound))
+                Some(*peer)
             } else {
                 None
             };
@@ -3994,40 +3994,61 @@ impl SelectedSymbolicProof<'_, '_> {
                 runtime.calls.function_body(module, item, None).is_some_and(summary_elision_safe)
             });
         let mut applicable = active;
-        let mut verified_terminals = HashSet::new();
+        let mut peer_nodes = Vec::new();
+        let mut peer_path = Vec::new();
         let mut cited_bounds = PeerPredicateBounds::default();
-        'proofs: for (case, step, ordered_steps, citation, goal, proof_domain) in plans {
-            if let Some((terminal, relation, bound)) = citation {
-                if !verified_terminals.contains(&terminal) {
-                    let verified = super::checker_flow::verify_partitioned_call_return(
-                        body, &result, &proof_domain, false,
-                        PartitionedProofGoal::Literal(relation, bound), Some(&mut proof_work),
-                    ).ok_or(ProjectCheck::Unsupported)?;
-                    if !verified.applicable || verified.failure.is_some() { return Err(ProjectCheck::Unsupported); }
-                    verified_terminals.insert(terminal);
-                }
-                let PartitionedProofGoal::Literal(requested_relation, requested) = goal else {
-                    return Err(ProjectCheck::Unsupported);
+        if has_citation {
+            super::checker_flow::charge_call_work(&mut proof_work, plans.len())
+                .ok_or(ProjectCheck::Unsupported)?;
+            let by_declaration: HashMap<_, _> = plans.iter().enumerate()
+                .map(|(slot, plan)| (plan.0.proof.start, slot)).collect();
+            for (_, step, shows, citation, goal, domain) in &plans {
+                let next = citation.map(|peer| by_declaration.get(&peer).copied().ok_or(ProjectCheck::Unsupported)).transpose()?;
+                let goal = match goal {
+                    PartitionedProofGoal::Literal(relation, bound) => Some((*relation, *bound)),
+                    PartitionedProofGoal::EntryEquality => None,
                 };
-                if !cited_bounds.implies(&output.ty, (relation, bound), (requested_relation, requested)) {
-                    return Err(ProjectCheck::Unsupported);
-                }
+                peer_nodes.push(CallingPeerNode {
+                    state: if step.is_none() && shows.is_empty() && goal.is_some() {
+                        LocalPeerState::Pending
+                    } else {
+                        LocalPeerState::Rejected
+                    },
+                    next, goal, domain,
+                });
+            }
+        }
+        'proofs: for (index, (case, step, ordered_steps, citation, goal, proof_domain)) in plans.iter().enumerate() {
+            if citation.is_some() {
+                let settled = resolve_local_peer_path(
+                    &mut peer_nodes, index, &mut peer_path, |node| &mut node.state, |node| node.next,
+                    |node, _| {
+                        let Some((relation, bound)) = node.goal else { return false; };
+                        super::checker_flow::verify_partitioned_call_return(
+                            body, &result, node.domain, false,
+                            PartitionedProofGoal::Literal(relation, bound), Some(&mut proof_work),
+                        ).is_some_and(|verified| verified.applicable && verified.failure.is_none())
+                    },
+                    |nodes, at, cited, _| match (nodes[cited].goal, nodes[at].goal) {
+                        (Some(premise), Some(conclusion)) => cited_bounds.implies(&output.ty, premise, conclusion),
+                        _ => false,
+                    },
+                );
+                if !matches!(settled, LocalPeerState::Terminal(_)) { return Err(ProjectCheck::Unsupported); }
                 applicable = true;
                 continue;
             }
             let bare = step.is_none() && ordered_steps.is_empty();
-            if has_citation && bare && verified_terminals.contains(&case.proof.start) {
-                // A matching typed citation already independently checked
-                // this declaration on this exact same guard.
+            if has_citation && bare && matches!(peer_nodes[index].state, LocalPeerState::Terminal(_)) {
                 applicable = true;
                 continue;
             }
-            let steps = step.into_iter().chain(ordered_steps.iter().map(|step| {
+            let steps = (*step).into_iter().chain(ordered_steps.iter().map(|step| {
                 (step.span, PartitionedProofGoal::Literal(step.relation, step.bound.as_ref()))
             }));
             for (span, step) in steps {
                 let verified = super::checker_flow::verify_partitioned_call_return(
-                    body, &result, &proof_domain, false, step, Some(&mut proof_work),
+                    body, &result, proof_domain, false, step, Some(&mut proof_work),
                 ).ok_or(ProjectCheck::Unsupported)?;
                 applicable |= verified.applicable;
                 if let Some(failure) = verified.failure {
@@ -4038,13 +4059,14 @@ impl SelectedSymbolicProof<'_, '_> {
             // Each step and the conclusion sees the original partitions,
             // not a derivation narrowed by an authored assertion.
             let verified = super::checker_flow::verify_partitioned_call_return(
-                body, &result, &proof_domain, elidable, goal, metered.then_some(&mut proof_work),
+                body, &result, proof_domain, elidable, *goal, metered.then_some(&mut proof_work),
             ).ok_or(ProjectCheck::Unsupported)?;
             applicable |= verified.applicable;
             if let Some(failure) = verified.failure {
+                if has_citation && bare { peer_nodes[index].state = LocalPeerState::Rejected; }
                 self.record(case, function, source, effects.records.len(), failure, None)?;
             } else if has_citation && bare && verified.applicable {
-                verified_terminals.insert(case.proof.start);
+                peer_nodes[index].state = LocalPeerState::Terminal(index);
             } else if verified.covers_guard {
                 let bound = case.bound.literal().ok_or(ProjectCheck::Unsupported)?;
                 let issuer = issuer.ok_or(ProjectCheck::Unsupported)?;
@@ -4303,7 +4325,7 @@ struct MainFlowLiteralShow<'a> {
 #[cfg(feature = "internal-checker")]
 enum MainFlowAuthoredShows<'a> {
     Single(MainFlowLiteralShow<'a>),
-    CallingCitation { terminal: u32, relation: IntegerRelation, bound: &'a BigInt },
+    CallingCitation { peer: u32 },
     Entry { span: ByteSpan, slot: usize, relation: IntegerRelation },
     Multiple { first_span: ByteSpan, groups: Vec<MainFlowShowBound<'a>> },
     CallingSequence {
@@ -4515,15 +4537,16 @@ impl<'a> MainFlowProofCase<'a> {
             Ok((shown, literal))
         };
         let step = if let Some(peer) = citation {
-            let (relation, cited_bound) = peer.peer_literal_goal().ok_or(ProjectCheck::Unsupported)?;
-            if !peer.steps.items.is_empty() || !plan.same_peer_context(peer) || plan.peer_literal_goal().is_none()
+            if plan.filter.as_ref().is_some_and(|atoms| atoms.len() > 1)
+                || peer.filter.as_ref().is_some_and(|atoms| atoms.len() > 1)
+                || peer.peer_literal_goal().is_none() || (!peer.steps.items.is_empty() && peer.direct_peer_use().is_none())
+                || !plan.same_peer_context(peer) || plan.peer_literal_goal().is_none()
                 || !supported_calling_proof_body(plan.typed.body, plan.typed.result_type)
             {
                 return Err(ProjectCheck::Unsupported);
             }
             Some(MainFlowAuthoredShows::CallingCitation {
-                terminal: wosy_syntax::byte_span(peer.proof).start,
-                relation, bound: cited_bound,
+                peer: wosy_syntax::byte_span(peer.proof).start,
             })
         } else { match (plan.steps.items.as_slice(), plan.steps.terminated_items.as_slice()) {
             ([], []) => None,
@@ -5823,6 +5846,53 @@ impl<'a> LocalPeerNode<'a> {
 }
 
 #[cfg(feature = "internal-checker")]
+struct CallingPeerNode<'a> {
+    state: LocalPeerState,
+    next: Option<usize>,
+    goal: Option<(IntegerRelation, &'a BigInt)>,
+    domain: &'a IntegerSet,
+}
+
+#[cfg(feature = "internal-checker")]
+fn resolve_local_peer_path<Node>(
+    nodes: &mut [Node], first: usize, path: &mut Vec<(usize, usize)>,
+    state: fn(&mut Node) -> &mut LocalPeerState, next: fn(&Node) -> Option<usize>,
+    mut verify_terminal: impl FnMut(&Node, usize) -> bool,
+    mut accepts_edge: impl FnMut(&[Node], usize, usize, usize) -> bool,
+) -> LocalPeerState {
+    let mut node = first;
+    let mut resolved = loop {
+        match *state(&mut nodes[node]) {
+            LocalPeerState::Pending => {
+                let Some(following) = next(&nodes[node]) else {
+                    let outcome = if verify_terminal(&nodes[node], node) {
+                        LocalPeerState::Terminal(node)
+                    } else {
+                        LocalPeerState::Rejected
+                    };
+                    *state(&mut nodes[node]) = outcome;
+                    break outcome;
+                };
+                *state(&mut nodes[node]) = LocalPeerState::Visiting;
+                path.push((node, following));
+                node = following;
+            }
+            LocalPeerState::Visiting | LocalPeerState::Dormant => break LocalPeerState::Rejected,
+            established => break established,
+        }
+    };
+    while let Some((node, following)) = path.pop() {
+        if let LocalPeerState::Terminal(terminal) = resolved {
+            if !accepts_edge(nodes, node, following, terminal) {
+                resolved = LocalPeerState::Rejected;
+            }
+        }
+        *state(&mut nodes[node]) = resolved;
+    }
+    resolved
+}
+
+#[cfg(feature = "internal-checker")]
 #[derive(Default)]
 struct LocalPeerGraph<'a> {
     by_declaration: HashMap<usize, usize>,
@@ -5899,31 +5969,15 @@ impl<'a> LocalPeerGraph<'a> {
     fn resolve_terminals(&mut self) {
         let mut path = Vec::new();
         for first in 0..self.nodes.len() {
-            if self.nodes[first].state != LocalPeerState::Pending {
-                continue;
-            }
-            let mut node = first;
-            let mut resolved = loop {
-                match self.nodes[node].state {
-                    LocalPeerState::Pending => {
-                        self.nodes[node].state = LocalPeerState::Visiting;
-                        path.push(node);
-                        let Some(next) = self.nodes[node].next else { break LocalPeerState::Rejected; };
-                        node = next;
-                    }
-                    LocalPeerState::Visiting | LocalPeerState::Dormant => break LocalPeerState::Rejected,
-                    state => break state,
-                }
-            };
-            while let Some(node) = path.pop() {
-                if let LocalPeerState::Terminal(terminal) = resolved {
-                    let goal = |index: usize| self.nodes[index].plan().and_then(PlannedModuleProof::peer_literal_goal);
-                    if goal(node) != goal(terminal) {
-                        resolved = LocalPeerState::Rejected;
-                    }
-                }
-                self.nodes[node].state = resolved;
-            }
+            if self.nodes[first].state != LocalPeerState::Pending { continue; }
+            resolve_local_peer_path(
+                &mut self.nodes, first, &mut path, |node| &mut node.state, |node| node.next,
+                |_, _| false,
+                |nodes, node, _, terminal| {
+                    let goal = |index: usize| nodes[index].plan().and_then(PlannedModuleProof::peer_literal_goal);
+                    goal(node) == goal(terminal)
+                },
+            );
         }
     }
 
@@ -16150,6 +16204,37 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
             ).unwrap(), expected);
             assert_eq!(take_integer_observations(), (usize::from(selected), 0));
             assert_eq!(UNSELECTED_PEER_PLANS.with(|count| count.replace(0)), usize::from(!selected));
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordered_calling_citation_chain_requires_each_typed_edge_and_a_bare_terminal() {
+        let file = source("src/main.w", "ordered-calling-citation-chain");
+        let text = r#"%%start
+            i8(i8) execute = fn(input) { if (input < 0) { -3 } else { 7 } };
+            i8(i8) producer = fn(input) { i8 result = execute(input); result };
+            proof top for producer(arg) -> (out) where (arg >= 0) ensures (out <= 8) { core.use(middle(arg)); }
+            proof middle for producer(arg) -> (out) where (arg >= 0) ensures (out <= 7) { core.use(issued(arg)); }
+            proof issued for producer(arg) -> (out) where (arg >= 0) ensures (out == 7) {}
+        %%end"#;
+        let run = |text: &str| {
+            let (_, proof) = crate::parse_proof_source(file.clone(), text.to_owned(), &[]).ok().unwrap();
+            check_loaded_ordered_proof_diagnostics_in_scope::<true>(
+                Vec::new(), vec![(proof, Vec::new())], vec![file.clone()], inputs(),
+                ScalarCheckerScope::CurrentPackage, Vec::new(),
+            )
+        };
+        let verified = run(text).unwrap();
+        assert!(verified.active && verified.symbolic_diagnostic.is_none());
+        for (label, rejected) in [
+            ("later edge does not imply equality", text.replace("out <= 8", "out == 7")),
+            ("refuted terminal", text.replace("out == 7", "out == 6")),
+            ("wrong guard", text.replacen("arg >= 0", "arg == 0", 1)),
+            ("cycle", text.replace("core.use(issued(arg))", "core.use(top(arg))")),
+        ] {
+            let result = run(&rejected);
+            assert!(matches!(result, Err(ProjectCheck::Unsupported)), "{label}: {:?}", result.err());
         }
     }
 

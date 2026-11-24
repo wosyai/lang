@@ -3303,6 +3303,7 @@ pub(super) struct PartitionedCallProof<'a> {
 }
 
 #[cfg(feature = "internal-checker")]
+#[derive(Clone, Copy)]
 pub(super) enum PartitionedProofGoal<'a> {
     Literal(IntegerRelation, &'a BigInt),
     EntryEquality,
