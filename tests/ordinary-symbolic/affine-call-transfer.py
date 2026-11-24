@@ -884,6 +884,14 @@ state_bool = f"""%%start
     unit(bool) check = fn(flag) {{ core.require(flag, {state_report(163,"AUTHORED-BOOL","flag")}); }};
     check(false);
     %%end"""
+# A Bool return selects the ordinary Boolean root evaluator. A unit root
+# without ordinary operations takes the intentionally integer-only root path.
+state_full_bool = f"""%%start
+    bool(bool) check = fn(flag) {{
+        core.require(false, {state_report(163,"AUTHORED-BOOL","flag")});
+        flag
+    }};
+    %%end"""
 state_narrow = f"""%%start
     unit(i8) check = fn(value) {{ core.narrow(value >= 2, {state_report(164,"PRESTATE","value")}); }};
     check(1);
@@ -929,7 +937,7 @@ cases.extend([
     ("authored-state-i128-exact",state_i128,165,b"I128"),
     ("authored-state-active-context",state_contextual,166,b"CONTEXT-STATE"),
     ("authored-state-mixed",state_holes.replace("value == 1 || value == 3","value == 1 || value >= 3"),168,b"ALTERNATIVES"),
-    ("authored-state-full-bool",state_bool.replace("require(flag,", "require(false,").replace("check(false);", ""),163,b"AUTHORED-BOOL"),
+    ("authored-state-full-bool",state_full_bool,163,b"AUTHORED-BOOL"),
     ("authored-state-holes",state_holes,168,b"ALTERNATIVES"),
     ("authored-state-accepted-condition-writes-nothing",state_range.replace("value <= 3","value <= 127"),0,b""),
 ])
