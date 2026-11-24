@@ -577,6 +577,24 @@ fn joined_child_is_read_by_exact_callee_with_scalar_prefix_argument() {
 }
 
 #[test]
+fn joined_child_returned_by_exact_identity_keeps_loan_live() {
+    let program = joined("parent = &!second;", true, "",
+        "*u8 echoed = identity(child); u8 observed = *echoed; first = 3;")
+        .replace("%%start\n", "%%start\n*u8(*u8) identity = fn(value) { value };\n")
+        .replace("    seen\n", "    if (observed == seen && first == 3) { observed } else { 0 }\n");
+    check_case(&program, Expected::Valid, Some("WOSY_JOINED_RETURNED_ALIAS_IR_DIR"));
+
+    let live = program.replace("u8 observed = *echoed; first = 3;",
+        "first = 3; u8 observed = *echoed;");
+    assert_ne!(live, program);
+    check(&live, Expected::LiveConflict);
+
+    let rebound = program.replace("u8 observed = *echoed;", "echoed = &second; u8 observed = *echoed;");
+    assert_ne!(rebound, program);
+    check(&rebound, Expected::NullParent);
+}
+
+#[test]
 fn joined_child_crosses_grounded_forward_reader_chain() {
     let program = joined_with_pointer_read("u8 observed = pointer(child); first = 3;", "*value")
         .replace("u8(*u8) pointer = fn(value) { *value };",
@@ -648,10 +666,20 @@ fn joined_child_declines_a_callee_without_a_prepared_read_effect() {
 }
 
 #[test]
-fn joined_child_cannot_escape_in_a_callee_return() {
-    let program = joined("parent = &!second;", true, "", "*u8 escaped = pointer(child); *escaped;");
-    let program = program.replace("%%start\n", "%%start\n*u8(*u8) pointer = fn(value) { value };\n");
-    check(&program, Expected::NullParent);
+fn returned_joined_alias_cannot_escape_its_lexical_owners() {
+    let program = r#"%%start
+*u8(*u8) identity = fn(value) { value };
+*u8(bool) escape = fn(choose) {
+    u8 first = 7;
+    u8 second = 9;
+    *!u8 parent = null;
+    if (choose) { parent = &!first; } else { parent = &!second; };
+    *u8 child = &(*parent);
+    *u8 echoed = identity(child);
+    echoed
+};
+%%end"#;
+    check(program, Expected::NullParent);
 }
 
 #[test]

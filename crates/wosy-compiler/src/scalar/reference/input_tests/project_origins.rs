@@ -884,17 +884,24 @@ fn prepared_shared_scalar_read_effect_is_exact_to_declaration_and_formal() {
     let calls = resolve_project_call_sites_with_occurrences(modules, occurrences);
     let reader_call_sites = calls.module(0);
     let other_call_sites = calls.module(1);
-    let find_sample = |module: &ScalarModule| {
+    let declaration = |module: &ScalarModule, name: &str| {
         module.items.iter().find_map(|item| match item {
-            ScalarItem::Function(function) if function.name == "sample" => Some(function.name_span),
+            ScalarItem::Function(function) if function.name == name => Some(function.name_span),
             _ => None,
         }).unwrap()
     };
-    let reader_span = find_sample(&modules[0]);
-    assert_eq!(reader_span, find_sample(&modules[1]));
+    let reader_span = declaration(&modules[0], "sample");
+    let identity_span = declaration(&modules[0], "escape");
+    assert_eq!(reader_span, declaration(&modules[1], "sample"));
     assert_eq!(
         reader_call_sites.shared_scalar_read_effects,
-        HashMap::from([(reader_span, SharedScalarReadEffect { parameter: 0, descriptor: false, forwarded: false })]),
+        HashMap::from([
+            (reader_span, SharedScalarReadEffect { parameter: 0, descriptor: false, forwarded: false, returns_formal: false }),
+            (identity_span, SharedScalarReadEffect { parameter: 0, descriptor: false, forwarded: false, returns_formal: true }),
+        ]),
     );
+    assert!(calls.has_closed_shared_scalar_reader(0, reader_span));
+    assert!(!calls.has_closed_shared_scalar_reader(0, identity_span));
+    assert!(!calls.has_closed_shared_scalar_reader(1, reader_span));
     assert!(other_call_sites.shared_scalar_read_effects.is_empty());
 }
