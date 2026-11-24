@@ -1089,8 +1089,8 @@ cases.extend([
 namespace_scalar_key = "exact-startup-completed-namespace-scalar-return"
 namespace_scalar_main = f"""%%start
     core.require(false, {report(210,"ROOT")});
-    lib = namespace app "src/calc.w";
-    alias = namespace app "src/calc.w";
+    lib = namespace app "calc.w";
+    alias = namespace app "calc.w";
     i8 saved = lib.choose(7);
     core.require(saved != 42, {report(213,"RETURN")});
     unit() startup = fn {{
@@ -1114,8 +1114,8 @@ namespace_scalar_child = f"""%%start
 cases.append((namespace_scalar_key,namespace_scalar_main,210,b"ROOTINITCALLEERETURNEMPTY"))
 namespace_bool_key = "exact-startup-completed-namespace-bool-return"
 namespace_bool_main = f"""%%start
-    lib = namespace app "src/calc.w";
-    alias = namespace app "src/calc.w";
+    lib = namespace app "calc.w";
+    alias = namespace app "calc.w";
     if (lib.choose(true)) {{
         core.require(false, {report(53,"BOOL-BRANCH")});
     }};
@@ -1490,7 +1490,7 @@ cases.extend([
     ("ordinary-unused-contextual-proof-underflow", unused_contextual_refuted.replace("+ 0", "- 1"), 2, b"unsupported analysis"),
 ])
 public_namespace_contextual_root = """%%start
-    lib = namespace app "src/calc.w";
+    lib = namespace app "calc.w";
     unit() entry = fn {
         u8 core.context.credit = 3;
         lib.relay();
@@ -2218,7 +2218,7 @@ qualified_scalar_library = """%%start
     i8(i8) value = fn(x) { if (x < 0) { -3 } else { 7 } };
 %%end"""
 qualified_scalar_proof = """%%start
-    imported = namespace app "src/calc.w";
+    imported = namespace app "calc.w";
     i8(i8) value = fn(local_input) { local_input };
     proof qualified for imported.value(entry) -> (out) where (entry >= 0) ensures (out == 7) {}
 %%end"""
@@ -2241,6 +2241,72 @@ for name, text, child, code, why in [
         2, b"unsupported analysis"),
     ("ordinary-qualified-scalar-proof-unused-refuted", qualified_scalar_proof.replace("out == 7", "out == 6"),
         qualified_scalar_library, 1, b"proof obligation failed"),
+]:
+    namespace_children[name] = child
+    cases.append((name, text, code, why))
+
+qualified_value_library = """%%start
+    bool(bool) ready = fn(flag) { flag };
+    char(char) glyph = fn(letter) { letter };
+    (u8, bool)(u8) pair = fn(value) { value, true };
+    u8[2](u8) cells = fn(value) { [value, 7] };
+    proof local_cell for cells(entry) -> (items) where (entry == 3)
+        forall (u64 index where index == 1) ensures (items[index] == 7) {}
+%%end"""
+qualified_value_symbolic = """%%start
+    imported = namespace app "calc.w";
+    proof ready_value for imported.ready(entry) -> (out) where (entry) ensures (out)
+        { core.show(out == true); }
+    proof glyph_value for imported.glyph(entry) -> (out) where (entry == 'β') ensures (out == 'β') {}
+    proof pair_value for imported.pair(entry) -> (number, ok) where (entry == 3)
+        ensures (ok && number == 3) {}
+    proof imported_cell for imported.cells(entry) -> (items) where (entry == 3)
+        forall (u64 index where index == 0) ensures (items[index] == 3) {}
+%%end"""
+qualified_value_reached = qualified_value_symbolic.replace("%%end", f"""
+    bool yes = imported.ready(true);
+    bool no = imported.ready(false);
+    char selected = imported.glyph('β');
+    char other = imported.glyph('a');
+    u8 count, bool good = imported.pair(3);
+    u8[2] values = imported.cells(count);
+    u8[2] repeated = imported.cells(count);
+    u8 cell = values[0];
+    core.require(yes, {report(81,"WRONG-QUALIFIED-BOOL")});
+    core.require(good, {report(82,"WRONG-QUALIFIED-PAIR-STATUS")});
+    core.require(cell == 3, {report(83,"WRONG-QUALIFIED-ARRAY")});
+%%end""")
+def refute_qualified_value(text):
+    return text.replace("core.show(out == true)", "core.show(!out)") \
+        .replace("out == 'β'", "out != 'β'").replace("ok && number == 3", "ok && number == 2") \
+        .replace("items[index] == 3", "items[index] == 4")
+qualified_value_library_refuted = qualified_value_library.replace("items[index] == 7", "items[index] == 8")
+qualified_value_library_nested = qualified_value_library.replace("%%end",
+    "unit(u8) wrap = fn(value) { u8[2] captured = cells(value); captured; }; %%end")
+for name, text, child, code, why in [
+    ("exact-startup-qualified-value-proof-proved", qualified_value_reached, qualified_value_library, 0, b""),
+    ("exact-startup-qualified-value-proof-refuted", refute_qualified_value(qualified_value_reached),
+        qualified_value_library_refuted, 1, b"proof obligation failed"),
+    ("ordinary-qualified-value-proof-proved", qualified_value_symbolic, qualified_value_library, 0, b""),
+    ("ordinary-qualified-value-proof-refuted", refute_qualified_value(qualified_value_symbolic),
+        qualified_value_library_refuted, 1, b"proof obligation failed"),
+    ("ordinary-qualified-value-proof-refuses-nested-array", qualified_value_symbolic, qualified_value_library_nested,
+        2, b"unsupported analysis"),
+    ("exact-startup-qualified-value-proof-refuses-reached-nested-array",
+        qualified_value_reached.replace("%%end", "imported.wrap(3); %%end"),
+        qualified_value_library_nested, 2, b"unsupported analysis"),
+    ("exact-startup-qualified-value-proof-refuses-effectful-body", qualified_value_reached,
+        qualified_value_library.replace("{ value, true }",
+            "{ core.require(false, " + report(84,"NAMESPACE-EFFECT-NOT-PUBLISHED") + "); value, true }"),
+        2, b"unsupported analysis"),
+    ("exact-startup-qualified-value-proof-owner-authored", """%%start
+        imported = namespace app "calc.w";
+        u8 count, bool status = imported.pair(3);
+    %%end""", """%%start
+        (u8, bool)(u8) pair = fn(value) { value, true };
+        proof local_pair for pair(entry) -> (number, ok) where (entry == 3)
+            ensures (number == 2 && ok) {}
+    %%end""", 1, b"proof obligation failed"),
 ]:
     namespace_children[name] = child
     cases.append((name, text, code, why))
@@ -2840,6 +2906,9 @@ cases.extend([
 %%end"""), 1, b"proof obligation failed"),
 ])
 proof_diagnostic_notes = {
+    "exact-startup-qualified-value-proof-refuted": b"call returned (output 1 = 3, output 2 = true)",
+    "exact-startup-qualified-value-proof-owner-authored": b"call returned (output 1 = 3, output 2 = true)",
+    "ordinary-qualified-value-proof-refuted": b"symbolic call can return (output 1 = 3, output 2 = true)",
     "ordinary-joint-result-proof-mixed-order": b"symbolic call can return (output 1 = 3, output 2 = 3)",
     "exact-startup-joint-result-proof-refuted-show": b"call returned (output 1 = 3, output 2 = true)",
     "ordinary-joint-result-proof-refuted-show": b"symbolic call can return (output 1 = 3, output 2 = true)",
@@ -3640,6 +3709,8 @@ with tempfile.TemporaryDirectory(prefix="affine-calls-") as path:
                         assert b"MIXED-ONCE" not in res.stderr and b"proof obligation failed" not in res.stderr, res
                     if name == "exact-startup-qualified-scalar-proof-effect-refused":
                         assert b"UNPUBLISHED-LEAF" not in res.stderr.splitlines(), res
+                    if name == "exact-startup-qualified-value-proof-refuses-effectful-body":
+                        assert b"NAMESPACE-EFFECT-NOT-PUBLISHED" not in res.stderr and b"proof obligation failed" not in res.stderr, res
                     if name == "exact-startup-real-integer-tail-rejects-reentry":
                         assert b"BEFORE-TAIL" not in res.stderr and b"AFTER-TAIL" not in res.stderr,res
                     if name == "authored-lexical-code-nonsingleton-fails-atomically":
@@ -3753,6 +3824,22 @@ with tempfile.TemporaryDirectory(prefix="affine-calls-") as path:
                         assert b"core.show(out < 10)" in primary, res
                     if name == "ordinary-authored-case-proof-refuted-goal":
                         assert b"ensures (out <= 9)" in res.stderr and b"proof goal" not in res.stderr, res
+                    if name == "exact-startup-qualified-value-proof-refuted":
+                        failures = res.stderr.split(b"error: proof obligation failed")[1:]
+                        assert len(failures) == 7 and b"symbolic call" not in res.stderr, res
+                        assert all(b"src/main.w" in failure and b"src/calc.w" in failure for failure in failures), res
+                        assert res.stderr.count(b"proved callable declared here") == 3, res
+                        assert res.stderr.count(b"imported.cells(count)") == 4, res
+                        assert res.stderr.count(b"proof imported_cell") == 2 and res.stderr.count(b"proof local_cell") == 2, res
+                    if name == "exact-startup-qualified-value-proof-owner-authored":
+                        assert res.stderr.count(b"error: proof obligation failed") == 1, res
+                        assert b"proof local_pair" in res.stderr and b"imported.pair(3)" in res.stderr, res
+                        assert b"src/calc.w" in res.stderr and b"src/main.w" in res.stderr and b"symbolic call" not in res.stderr, res
+                    if name == "ordinary-qualified-value-proof-refuted":
+                        failures = res.stderr.split(b"error: proof obligation failed")[1:]
+                        assert len(failures) == 5 and b"applicable call" not in res.stderr, res
+                        assert sum(b"src/main.w" in failure and b"src/calc.w" in failure for failure in failures) == 4, res
+                        assert sum(b"symbolic call entry: value = 3" in failure for failure in failures) == 3, res
                     if name == "exact-startup-qualified-scalar-proof-refuted":
                         assert res.stderr.count(b"proof obligation failed") == 1, res
                         assert b"src/main.w" in res.stderr and b"imported.value(3)" in res.stderr, res

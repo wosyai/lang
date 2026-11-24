@@ -8,6 +8,7 @@ use super::super::checker_flow::{
 pub(super) struct ArrayProof<'a> {
     proof: &'a CstNode,
     source: &'a SourceIdentity,
+    owner: &'a SourceIdentity,
     target: PreparedCallable,
     goal: ByteSpan,
     failed_step: Option<ByteSpan>,
@@ -40,6 +41,7 @@ impl<'a> ArrayProof<'a> {
                 concrete: ConcreteCallSelection::Declaration } if source == &owner.source
                     && *declaration_span == selected.function.2.name_span)
             || owner.source.project != source.project || owner.source.package != source.package
+            || (&owner.source != source && proof_target_tokens(proof)?.0.is_none())
             || proof.children().any(|node| node.kind() == SyntaxKind::ProofDecreases)
         {
             return Err(ProjectCheck::Unsupported);
@@ -150,7 +152,7 @@ impl<'a> ArrayProof<'a> {
             return Err(ProjectCheck::Unsupported);
         }
         let goal = if matches!(quantifier_kind, FixedArrayQuantifier::FindWitness) { &quantifier } else { &goal_node };
-        Ok(Self { proof, source, target, goal: wosy_syntax::byte_span(goal), failed_step,
+        Ok(Self { proof, source, owner: &owner.source, target, goal: wosy_syntax::byte_span(goal), failed_step,
             entry_filter, domain, quantifier: quantifier_kind, relation, expected, body,
             result: &output.ty })
     }
@@ -207,18 +209,31 @@ impl Group {
 }
 
 impl<'a> Cohort<'a> {
-    pub(super) fn new(plans: Vec<ArrayProof<'a>>) -> Result<Self, ProjectCheck> {
+    pub(super) fn new(plans: Vec<ArrayProof<'a>>, roots: Option<&ProjectCallSiteResults>) -> Result<Self, ProjectCheck> {
         let mut groups = HashMap::<PreparedCallable, Group>::new();
         let mut work = 0;
         charge_call_work(&mut work, plans.len()).ok_or(ProjectCheck::Unsupported)?;
         for (id, plan) in plans.iter().enumerate() {
-            let group = groups.entry(plan.target).or_insert_with(|| Group {
-                ids: Vec::new(), supported_body: std::cell::OnceCell::new(),
-            });
-            if group.ids.first().is_some_and(|&prior| !std::ptr::eq(plan.body, plans[prior].body)) {
-                return Err(ProjectCheck::Unsupported);
+            use std::collections::hash_map::Entry;
+            match groups.entry(plan.target) {
+                Entry::Vacant(group) => {
+                    // The existing resolved-edge walk marks nested uses.
+                    // Such a use has no direct array initializer receipt and
+                    // must not turn into a symbolic unused root.
+                    if roots.is_some_and(|calls| calls.has_nested_proof_use(plan.target)) {
+                        return Err(ProjectCheck::Unsupported);
+                    }
+                    group.insert(Group { ids: vec![id], supported_body: std::cell::OnceCell::new() });
+                }
+                Entry::Occupied(mut entry) => {
+                    let group = entry.get_mut();
+                    let prior = &plans[group.ids[0]];
+                    if prior.owner != plan.owner || !std::ptr::eq(prior.body, plan.body) {
+                        return Err(ProjectCheck::Unsupported);
+                    }
+                    group.ids.push(id);
+                }
             }
-            group.ids.push(id);
         }
         Ok(Self { plans, groups })
     }
@@ -279,7 +294,6 @@ impl ActualIntegerObserver for Evidence<'_, '_> {
     ) -> Result<Vec<BigInt>, ProjectCheck> {
         let group = self.cohort.groups.get(&target).ok_or(ProjectCheck::Unsupported)?;
         let first = &self.cohort.plans[group.ids[0]];
-        if &call.source != first.source { return Err(ProjectCheck::Unsupported); }
         charge_call_work(&mut self.work, body.occurrences.len().checked_add(group.ids.len())
             .ok_or(ProjectCheck::Unsupported)?).ok_or(ProjectCheck::Unsupported)?;
         group.validate(first, body)?;
@@ -287,7 +301,6 @@ impl ActualIntegerObserver for Evidence<'_, '_> {
         let mut applicable = false;
         for &id in &group.ids {
             let plan = &self.cohort.plans[id];
-            if &call.source != plan.source { return Err(ProjectCheck::Unsupported); }
             let guard = self.guards[id].as_ref().ok_or(ProjectCheck::Unsupported)?;
             let cost = guard.comparisons.len().checked_add(guard.domain.map_or(0, |(_, domain)| domain.interval_count()))
                 .and_then(|cost| cost.checked_add(1)).ok_or(ProjectCheck::Unsupported)?;
@@ -305,7 +318,7 @@ impl ActualIntegerObserver for Evidence<'_, '_> {
         for (id, failed) in group.ids.iter().copied().zip(failures) {
             if let Some(failed) = failed {
                 let plan = &self.cohort.plans[id];
-                self.failures.push(plan.diagnostic(failed, plan.source, Some(call.clone()))?);
+                self.failures.push(plan.diagnostic(failed, plan.owner, Some(call.clone()))?);
             }
         }
         Ok(returned)
@@ -354,6 +367,7 @@ impl SymbolicRootProof for Symbolic<'_, '_, '_> {
     ) -> Result<Option<bool>, ProjectCheck> {
         let Some(group) = self.cohort.groups.get(&target) else { return Ok(None); };
         let first = &self.cohort.plans[group.ids[0]];
+        if source != first.owner { return Err(ProjectCheck::Unsupported); }
         charge_call_work(&mut self.work, body.occurrences.len().checked_add(group.ids.len())
             .ok_or(ProjectCheck::Unsupported)?).ok_or(ProjectCheck::Unsupported)?;
         group.validate(first, body)?;

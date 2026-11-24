@@ -1846,12 +1846,13 @@ fn run_initializer_call<'a, Observer: ActualIntegerObserver>(
     #[cfg(not(feature = "internal-checker"))]
     let check_completed_scalar_namespace = false;
     #[cfg(feature = "internal-checker")]
-    let qualified_proof = topology.structure.checker_direct_targets.get(&occurrence).is_some_and(|&target|
-        actual.observer.named_exact_watch(target).is_some_and(|watch| watch.qualified_leaf));
+    let qualified_proof = || topology.structure.checker_direct_targets.get(&occurrence).is_some_and(|&target|
+        actual.observer.named_exact_watch(target).is_some_and(|watch|
+            watch.qualified_leaf || (watch.result_pair && pair_receivers.is_some())));
     #[cfg(not(feature = "internal-checker"))]
-    let qualified_proof = false;
+    let qualified_proof = || false;
     let collection = collection.filter(|(source, _)|
-        check_completed_scalar_namespace || qualified_proof || !is_integer_type(expected) || *source == &declaration.source);
+        check_completed_scalar_namespace || !is_integer_type(expected) || *source == &declaration.source || qualified_proof());
     let named_literal = matches!(expected, ScalarType::Bool | ScalarType::Char)
         && actual.named_literal_initializer(topology, occurrence, expected, collection.is_some());
     let named_character = *expected == ScalarType::Char && named_literal;
@@ -2886,7 +2887,10 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
         #[cfg(feature = "internal-checker")]
         let watched = if NAMED || ACTUAL_STARTUP { self.observer.named_exact_watch(target) } else { None };
         #[cfg(feature = "internal-checker")]
-        if watched.is_some_and(|watch| watch.qualified_leaf || (!NAMED && (watch.citation || watch.case_citation))) {
+        if watched.is_some_and(|watch| watch.qualified_leaf || watch.literal_leaf.is_some() || watch.result_pair
+            || (!NAMED && (watch.citation || watch.case_citation)))
+            || (Observer::FIXED_ARRAY_INITIALIZERS && self.observer.watches_fixed_array(target))
+        {
             // A previously observed call to this target does not authenticate
             // a different activation outside its enrolled exact path.
             return Err(ProjectCheck::Unsupported);
@@ -3212,31 +3216,17 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             return Err(ProjectCheck::Unsupported);
         }
         #[cfg(feature = "internal-checker")]
-        let named_outer = proof_site.as_ref().and_then(|site| match &site.call {
+        let named_watch = if ACTUAL_STARTUP { self.observer.named_exact_watch(target) } else { None };
+        #[cfg(feature = "internal-checker")]
+        let named_literal = named_watch.filter(|watch|
+            watch.literal_leaf.is_some_and(|leaf| leaf.ty() == expected)
+                || (watch.result_pair && pair_receivers.is_some()));
+        #[cfg(feature = "internal-checker")]
+        let named_outer = proof_site.as_ref().filter(|_| named_literal.is_none()).and_then(|site| match &site.call {
             InitializerProofOrigin::Direct { topology, occurrence, .. } if site.source == &owner.source =>
                 topology.occurrences.get(occurrence.0).map(|node| node.span),
             _ => None,
         });
-        #[cfg(feature = "internal-checker")]
-        let named_watch = if ACTUAL_STARTUP { self.observer.named_exact_watch(target) } else { None };
-        #[cfg(feature = "internal-checker")]
-        let named_literal = if let Some(watch) = named_watch.filter(|watch|
-            watch.literal_leaf.is_some_and(|leaf| leaf.ty() == expected)
-                || (watch.result_pair && pair_receivers.is_some()))
-        {
-            let Some(InitializerProofSite {
-                source, call: InitializerProofOrigin::Direct { topology, occurrence, .. },
-            }) = proof_site.as_ref() else { return Err(ProjectCheck::Unsupported); };
-            if *source != &owner.source || !std::ptr::eq(&topology.structure, structure)
-                || *occurrence != call || !collection.is_some_and(|(caller, _)| caller == *source)
-            {
-                return Err(ProjectCheck::Unsupported);
-            }
-            let work = body.occurrences.len().checked_add(watch.nested_work)
-                .and_then(|work| work.checked_add(1)).ok_or(ProjectCheck::Unsupported)?;
-            self.observer.charge_named_exact_work(work).ok_or(ProjectCheck::Unsupported)?;
-            Some(watch)
-        } else { None };
         #[cfg(feature = "internal-checker")]
         let named_reached = named_watch.is_some()
             && collection.is_some_and(|(source, _)| source == &owner.source) && named_outer.is_some()
@@ -3251,49 +3241,36 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             return Err(ProjectCheck::Unsupported);
         }
         #[cfg(feature = "internal-checker")]
-        let qualified_entry = if let Some(watch) = named_watch.filter(|watch| watch.qualified_leaf) {
-            // The proof target is the prepared declaration, but its call
-            // receipt belongs to the module that actually initialized it.
-            let Some(InitializerProofSite { source, call: InitializerProofOrigin::Direct { topology, occurrence, .. } }) =
-                proof_site.as_ref() else { return Err(ProjectCheck::Unsupported); };
-            if !std::ptr::eq(&topology.structure, structure) || *occurrence != call
-                || topology.occurrences.get(call.0).is_none() || !qualified_integer_proof_leaf(body, expected)
-                || !collection.is_some_and(|(caller, ordered)| caller == *source
-                    && (caller == &owner.source || completed_namespace_owner(caller, &owner.source, target.0, ordered.visits)))
-            {
+        let qualified_integer = named_watch.filter(|watch| watch.qualified_leaf
+            && watch.literal_leaf.is_none() && !watch.result_pair);
+        #[cfg(feature = "internal-checker")]
+        let fixed_array = if matches!(expected, ScalarType::Array { .. }) {
+            if !self.can_initialize_fixed_arrays() || !self.observer.watches_fixed_array(target) {
+                return Err(ProjectCheck::Unsupported);
+            }
+            true
+        } else { false };
+        #[cfg(not(feature = "internal-checker"))]
+        let fixed_array = false;
+        #[cfg(feature = "internal-checker")]
+        let proof_call = if named_literal.is_some() || qualified_integer.is_some() || fixed_array {
+            Some(authorize_direct_proof_initializer(proof_site.as_ref(), structure, call, &owner.source, target.0, collection)?)
+        } else { None };
+        #[cfg(feature = "internal-checker")]
+        if let Some(watch) = named_literal.or(qualified_integer) {
+            if qualified_integer.is_some() && !qualified_integer_proof_leaf(body, expected) {
                 return Err(ProjectCheck::Unsupported);
             }
             let cost = body.occurrences.len().checked_add(1).and_then(|cost| cost.checked_add(watch.nested_work))
                 .ok_or(ProjectCheck::Unsupported)?;
             self.observer.charge_named_exact_work(cost).ok_or(ProjectCheck::Unsupported)?;
-            true
-        } else { false };
+        }
+        #[cfg(feature = "internal-checker")]
+        let enrolled_direct_proof = proof_call.is_some();
         #[cfg(not(feature = "internal-checker"))]
-        let qualified_entry = false;
+        let enrolled_direct_proof = false;
         #[cfg(not(feature = "internal-checker"))]
         let (named_reached, named_outer) = (false, None);
-        #[cfg(feature = "internal-checker")]
-        let array_site = if matches!(expected, ScalarType::Array { .. }) {
-            if !self.can_initialize_fixed_arrays() || !self.observer.watches_fixed_array(target) {
-                return Err(ProjectCheck::Unsupported);
-            }
-            let Some(InitializerProofSite {
-                source, call: InitializerProofOrigin::Direct { topology, occurrence, .. },
-            }) = proof_site.as_ref() else { return Err(ProjectCheck::Unsupported); };
-            if *source != &owner.source || !std::ptr::eq(&topology.structure, structure)
-                || *occurrence != call || !collection.is_some_and(|(caller, _)| caller == *source)
-            {
-                return Err(ProjectCheck::Unsupported);
-            }
-            let span = topology.occurrences.get(call.0).ok_or(ProjectCheck::MissingRootOccurrences)?.span;
-            Some(wosy_syntax::SourceSpan::new(owner.source.clone(), span))
-        } else {
-            None
-        };
-        #[cfg(feature = "internal-checker")]
-        let fixed_array = array_site.is_some();
-        #[cfg(not(feature = "internal-checker"))]
-        let fixed_array = false;
         let target_module = target.0;
         if !ACTUAL_STARTUP && (*expected != ScalarType::Unit
             || (collection.is_none() && target_module != self.symbolic_module))
@@ -3325,7 +3302,7 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
         let collection = if let Some((caller_source, collection)) = collection {
             if caller_source != &owner.source
                 && (matches!(&projected, ActualProjectedArguments::SymbolicAxis(..))
-                    || (!qualified_entry
+                    || (!enrolled_direct_proof
                         && !self.completed_namespace_call(caller_source, owner, target_module, body, signature, expected, collection.visits)))
             {
                 return Err(ProjectCheck::Unsupported);
@@ -3418,9 +3395,11 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
         let result = if fixed_array {
             #[cfg(feature = "internal-checker")]
             {
-                self.observer.observe_fixed_array_initializer(
-                    target, body, exact, array_site.expect("authenticated fixed-array call site"),
-                ).map(ActualCallResult::FixedArray)
+                proof_call.ok_or(ProjectCheck::Unsupported).and_then(|(caller, span)| {
+                    self.observer.observe_fixed_array_initializer(
+                        target, body, exact, wosy_syntax::SourceSpan::new(caller.clone(), span),
+                    )
+                }).map(ActualCallResult::FixedArray)
             }
             #[cfg(not(feature = "internal-checker"))]
             unreachable!()
@@ -3532,6 +3511,23 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
         }
         result
     }
+}
+
+#[cfg(feature = "internal-checker")]
+fn authorize_direct_proof_initializer<'a>(
+    site: Option<&InitializerProofSite<'a>>, structure: &OccurrenceStructure, call: OccurrenceOrdinal,
+    owner: &SourceIdentity, target_module: usize, collection: Option<(&SourceIdentity, OrderedCallCollection<'_, '_>)>,
+) -> Result<(&'a SourceIdentity, ByteSpan), ProjectCheck> {
+    let Some(InitializerProofSite { source, call: InitializerProofOrigin::Direct { topology, occurrence, .. } }) = site
+        else { return Err(ProjectCheck::Unsupported); };
+    if !std::ptr::eq(&topology.structure, structure) || *occurrence != call
+        || !collection.is_some_and(|(caller, ordered)| caller == *source
+            && (caller == owner || completed_namespace_owner(caller, owner, target_module, ordered.visits)))
+    {
+        return Err(ProjectCheck::Unsupported);
+    }
+    let span = topology.occurrences.get(call.0).ok_or(ProjectCheck::MissingRootOccurrences)?.span;
+    Ok((source, span))
 }
 
 fn completed_namespace_owner(
@@ -4643,6 +4639,7 @@ pub struct MainFlowProofInvocation {
     pub outer_call: Option<wosy_syntax::SourceSpan>,
     pub intermediate_calls: Vec<wosy_syntax::SourceSpan>,
     pub call: wosy_syntax::SourceSpan,
+    pub namespaced_callable: Option<wosy_syntax::SourceSpan>,
     pub directive_position: usize,
     pub arguments: Vec<(ScalarType, BigInt)>,
     pub returned: BigInt,
@@ -5071,7 +5068,7 @@ fn same_literal_proof_guard(
         })
     }).ok_or(ProjectCheck::Unsupported)?;
     super::checker_flow::charge_call_work(work, guard_work).ok_or(ProjectCheck::Unsupported)?;
-    if proof.proof_source != source || proof.filter != common { return Err(ProjectCheck::Unsupported); }
+    if proof.owner != source || proof.filter != common { return Err(ProjectCheck::Unsupported); }
     Ok(())
 }
 
@@ -6143,6 +6140,8 @@ impl<'a> MainFlowProofBound<'a> {
 #[cfg(feature = "internal-checker")]
 struct MainFlowProofCase<'a> {
     proof_source: &'a SourceIdentity,
+    owner: &'a SourceIdentity,
+    definition: ByteSpan,
     proof: ByteSpan,
     goal: ByteSpan,
     guard: CheckedIntegerGuardSlots<'a>,
@@ -6279,18 +6278,23 @@ impl<'a> MainFlowProofCase<'a> {
         catalog: Option<&PublicProofCatalog<'a>>,
     ) -> Result<MainFlowProofPlan<'a>, ProjectCheck> {
         let body = plan.typed.body;
+        let owner = &plan.typed.target.source;
+        let qualified_leaf = owner != root;
+        if qualified_leaf && !(catalog.is_some() && owner.project == root.project && owner.package == root.package
+            && proof_target_tokens(plan.proof)?.0.is_some() && citation.is_none() && plan.typed.measure.is_none())
+        {
+            return Err(ProjectCheck::Unsupported);
+        }
         if let TypedProofGoal::ResultPair(pair) = &plan.typed.goal {
-            if citation.is_some() || &plan.typed.target.source != root {
-                return Err(ProjectCheck::Unsupported);
-            }
+            if citation.is_some() { return Err(ProjectCheck::Unsupported); }
             let filter = plan.filter.as_deref().unwrap_or_default();
             let guard = checked_scalar_guard_slots::<true>(body, filter, false, true)
                 .ok_or(ProjectCheck::Unsupported)?;
             let goal = child(&child(plan.proof, SyntaxKind::ProofEnsures)?, SyntaxKind::Expression)?;
             return Ok((Self {
-                proof_source: plan.proof_source, proof: wosy_syntax::byte_span(plan.proof),
+                proof_source: plan.proof_source, owner, definition: plan.function.name_span, proof: wosy_syntax::byte_span(plan.proof),
                 goal: wosy_syntax::byte_span(&goal), guard, filter, relation: None,
-                bound: MainFlowProofBound::ResultPair(pair), qualified_leaf: false, literal_leaf: None,
+                bound: MainFlowProofBound::ResultPair(pair), qualified_leaf, literal_leaf: None,
             }, None));
         }
         let literal_leaf = ProofLiteralType::of(plan.typed.result_type);
@@ -6313,11 +6317,7 @@ impl<'a> MainFlowProofCase<'a> {
                 (relation, MainFlowProofBound::EntryAffine { slot: *slot, transform }),
             _ => return Err(ProjectCheck::Unsupported),
         };
-        let owner = &plan.typed.target.source;
-        let qualified_leaf = owner != root;
-        if qualified_leaf && !(catalog.is_some() && owner.project == root.project && owner.package == root.package
-            && proof_target_tokens(plan.proof)?.0.is_some()
-            && citation.is_none() && plan.typed.measure.is_none() && plan.steps.items.is_empty()
+        if qualified_leaf && literal_leaf.is_none() && !(plan.steps.items.is_empty()
             && matches!(plan.typed.goal, TypedProofGoal::Literal { .. })
             && qualified_integer_proof_leaf(body, plan.typed.result_type))
         {
@@ -6457,7 +6457,7 @@ impl<'a> MainFlowProofCase<'a> {
             .ok_or(ProjectCheck::Unsupported)?;
         let goal = child(&child(plan.proof, SyntaxKind::ProofEnsures)?, SyntaxKind::Expression)?;
         Ok((Self {
-            proof_source: plan.proof_source, proof: wosy_syntax::byte_span(plan.proof),
+            proof_source: plan.proof_source, owner, definition: plan.function.name_span, proof: wosy_syntax::byte_span(plan.proof),
             goal: wosy_syntax::byte_span(&goal), guard, filter, relation: Some(*relation), bound, qualified_leaf, literal_leaf,
         }, step))
     }
@@ -6665,7 +6665,8 @@ impl<'a> MainFlowProofTarget<'a> {
     }
 
     fn compile_exact_citations(&mut self, work: &mut usize) -> Result<(), ProjectCheck> {
-        if self.qualified_leaf && !matches!(&self.cases, MainFlowProofCases::Bare { rest, .. } if rest.is_empty()) {
+        if self.qualified_leaf && self.literal_leaf.is_none() && !self.result_pair
+            && !matches!(&self.cases, MainFlowProofCases::Bare { rest, .. } if rest.is_empty()) {
             return Err(ProjectCheck::Unsupported);
         }
         if self.has_case_citations {
@@ -6840,7 +6841,8 @@ impl ReturnedProofValue {
 
 #[cfg(feature = "internal-checker")]
 fn proof_invocation(
-    site: &InitializerProofSite<'_>, parameters: &[ScalarType], arguments: &[&BigInt], returned: ReturnedProofValue,
+    site: &InitializerProofSite<'_>, proof: &MainFlowProofCase<'_>,
+    parameters: &[ScalarType], arguments: &[&BigInt], returned: ReturnedProofValue,
 ) -> Option<Rc<MainFlowProofInvocation>> {
     let (outer, intermediate, inner, directive_position) = match &site.call {
         InitializerProofOrigin::Direct { topology, occurrence, directive_position } => {
@@ -6862,6 +6864,8 @@ fn proof_invocation(
             source: site.source.clone(), range,
         }).collect(),
         call: wosy_syntax::SourceSpan { source: site.source.clone(), range: inner },
+        namespaced_callable: (site.source != proof.owner)
+            .then(|| wosy_syntax::SourceSpan::new(proof.owner.clone(), proof.definition)),
         directive_position,
         arguments: parameters.iter().cloned().zip(arguments.iter().map(|value| (**value).clone())).collect(),
         returned: returned.value,
@@ -6943,7 +6947,7 @@ impl ActualIntegerObserver for MainFlowProofObserver<'_> {
                 Some(known) => Rc::clone(known),
                 None => {
                     let value = ReturnedProofValue::pair(body, failure.source_slot, returned.clone())?;
-                    let created = proof_invocation(&site, parameters, arguments, value).ok_or(ProjectCheck::Unsupported)?;
+                    let created = proof_invocation(&site, proof, parameters, arguments, value).ok_or(ProjectCheck::Unsupported)?;
                     *lane = Some(Rc::clone(&created));
                     created
                 }
@@ -6979,7 +6983,7 @@ impl ActualIntegerObserver for MainFlowProofObserver<'_> {
                 Rc::clone(invoked)
             } else {
                 let Some(invoked) = ReturnedProofValue::scalar(proof, value)
-                    .and_then(|value| proof_invocation(&site, parameters, arguments, value)) else { return false; };
+                    .and_then(|value| proof_invocation(&site, proof, parameters, arguments, value)) else { return false; };
                 invocation = Some(Rc::clone(&invoked));
                 invoked
             };
@@ -7823,7 +7827,10 @@ fn check_loaded_ordered_proof_diagnostics_in_scope<const LOCAL_CATALOGS: bool>(
             if first_plan.is_none() { first_plan = Some(plan); } else { plans.push(plan); }
         }
     }
-    let cohort = (!arrays.is_empty()).then(|| array_quantifier::Cohort::new(arrays)).transpose()?;
+    let cohort = (!arrays.is_empty()).then(|| {
+        let coverage = (scope == ScalarCheckerScope::CurrentPackage).then(|| prepared.prepared.parts().1);
+        array_quantifier::Cohort::new(arrays, coverage)
+    }).transpose()?;
     let Some(first_plan) = first_plan else {
         return catalog_composition::run(&prepared, scope, startup_count, (), cohort.as_ref());
     };
@@ -8920,7 +8927,7 @@ impl PreparedProofModule {
                 .and_then(|(source, resolved)| array_quantifier::ArrayProof::prepare(source, resolved))
                 .and_then(|plan| {
                     let startup_count = self.prepared.parts().0.initialization_order.len();
-                    let cohort = array_quantifier::Cohort::new(vec![plan])?;
+                    let cohort = array_quantifier::Cohort::new(vec![plan], Some(self.prepared.parts().1))?;
                     let mut run = run_prepared_ordered_check(
                         &self.prepared, ScalarCheckerScope::CurrentPackage, startup_count, OrderedReachPolicy::Closed,
                         array_quantifier::Evidence::new(&cohort)?,
@@ -15577,7 +15584,7 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
         let ModuleInitializationDetail::Occurrences(topology) = &region.detail else { unreachable!(); };
         let occurrence = *topology.call_targets.keys().next().unwrap();
         let mut observer = MainFlowProofObserver::new((0, 0), (MainFlowProofCase {
-            proof_source: &app, proof: span, goal: span, filter: &[],
+            proof_source: &app, owner: &app, definition: ByteSpan::new(0, 0), proof: span, goal: span, filter: &[],
             guard: CheckedIntegerGuardSlots { arity: 1, always_rejects: false, boolean: [None; 2], comparisons: Vec::new(), domain: None },
             relation: IntegerRelation::from_operator(&BinaryOperator::LessEqual), bound: MainFlowProofBound::Literal(&bound),
             qualified_leaf: false, literal_leaf: None,
@@ -17269,6 +17276,164 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
             Err(ScalarOrderedCheckerOutcome::Unsupported)));
         let unrelated = reached.replace("%%end", "i8(i8) via_local = fn(n) { i8 result = value(n); result }; %%end");
         assert!(run(&unrelated, library, &lib, ScalarCheckerScope::CurrentPackage).unwrap().diagnostics.is_empty());
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn qualified_value_proofs_share_canonical_reached_and_unused_namespace_coverage() {
+        use super::super::checker_flow::{take_array_return_observations, take_integer_observations};
+        let app = source("src/main.w", "qualified-value-app");
+        let lib = source("src/calc.w", "qualified-value-library");
+        let library = r#"%%start
+            bool(bool) ready = fn(flag) { flag };
+            char(char) glyph = fn(letter) { letter };
+            (u8, bool)(u8) pair = fn(value) { value, true };
+            u8[2](u8) cells = fn(value) { [value, 7] };
+            proof local_cell for cells(entry) -> (items) where (entry == 3)
+                forall (u64 index where index == 1) ensures (items[index] == 7) {}
+        %%end"#;
+        let main = r#"%%start
+            lib = namespace demo "src/calc.w";
+            proof ready_value for lib.ready(entry) -> (out) where (entry) ensures (out)
+                { core.show(out == true); }
+            proof glyph_value for lib.glyph(entry) -> (out) where (entry == 'β') ensures (out == 'β') {}
+            proof pair_value for lib.pair(entry) -> (number, ok) where (entry == 3)
+                ensures (ok && number == 3) {}
+            proof imported_cell for lib.cells(entry) -> (items) where (entry == 3)
+                forall (u64 index where index == 0) ensures (items[index] == 3) {}
+        %%end"#;
+        let reached = main.replace("%%end", &format!(r#"
+            bool yes = lib.ready(true);
+            bool no = lib.ready(false);
+            char selected = lib.glyph('β');
+            char other = lib.glyph('a');
+            u8 count, bool good = lib.pair(3);
+            u8[2] values = lib.cells(count);
+            u8[2] repeated = lib.cells(count);
+            u8 cell = values[0];
+            core.require(yes, {OUTPUT});
+            core.require(good, {OUTPUT});
+            core.require(cell == 3, {OUTPUT});
+        %%end"#));
+        let refute = |text: &str| text.replace("core.show(out == true)", "core.show(!out)")
+            .replace("out == 'β'", "out != 'β'").replace("ok && number == 3", "ok && number == 2")
+            .replace("items[index] == 3", "items[index] == 4");
+        let false_library = library.replace("items[index] == 7", "items[index] == 8");
+        let run = |main: &str, library: &str, owner: &SourceIdentity, scope| {
+            let (_, catalog) = crate::parse_proof_source(app.clone(), main.to_owned(), &[]).ok().unwrap();
+            let (_, provider) = crate::parse_proof_source(owner.clone(), library.to_owned(), &[]).ok().unwrap();
+            let import = ScalarNamespaceBinding { binding: "lib".into(), target: owner.clone(), span: ByteSpan::new(0, 0) };
+            check_loaded_scalar_ordered_local_proof_contexts(
+                Vec::new(), [(catalog, vec![import]), (provider, Vec::new())],
+                vec![app.clone(), owner.clone()], inputs(), scope, Vec::new(),
+            )
+        };
+        let _ = take_array_return_observations();
+        let _ = take_integer_observations();
+        for scope in [ScalarCheckerScope::MainFlowOnly, ScalarCheckerScope::CurrentPackage] {
+            let passed = run(&reached, library, &lib, scope).unwrap();
+            assert!(passed.active && passed.diagnostics.is_empty() && passed.aggregate_diagnostics.is_empty());
+            assert!(passed.symbolic_diagnostic.is_none() && passed.directives.is_empty());
+            assert_eq!(take_integer_observations(), (0, 5));
+            assert_eq!(take_array_return_observations(), (0, 2));
+
+            let text = refute(&reached);
+            let failed = run(&text, &false_library, &lib, scope).unwrap();
+            assert_eq!(take_integer_observations(), (0, 5));
+            assert_eq!(take_array_return_observations(), (0, 2));
+            assert!(failed.symbolic_diagnostic.is_none() && failed.directives.is_empty());
+            let [ready, glyph, pair] = failed.diagnostics.as_slice() else { panic!("three selected namespace calls"); };
+            for (failure, call) in [(ready, "lib.ready(true)"), (glyph, "lib.glyph('β')"), (pair, "lib.pair(3)")] {
+                assert_eq!(failure.proof.source, app);
+                assert_eq!(failure.invocation.call.source, app);
+                assert_eq!(failure.invocation.namespaced_callable.as_ref().unwrap().source, lib);
+                let span = failure.invocation.call.range;
+                assert_eq!(&text[span.start as usize..span.end as usize], call);
+            }
+            assert!(ready.failed_step.is_some() && pair.invocation.returned_pair.is_some());
+            assert_eq!(glyph.invocation.returned_literal, Some(ScalarCheckerProofLiteral::Character('β')));
+            assert_eq!(failed.aggregate_diagnostics.len(), 4);
+            for failures in failed.aggregate_diagnostics.chunks_exact(2) {
+                assert_eq!(failures[0].proof.source, app);
+                assert_eq!(failures[1].proof.source, lib);
+                for failure in failures {
+                    assert_eq!(failure.output.source, lib);
+                    assert_eq!(failure.call.as_ref().unwrap().source, app);
+                }
+            }
+
+            let foreign = SourceIdentity { package: "another-package".into(), ..lib.clone() };
+            assert!(matches!(run(&reached, &false_library, &foreign, scope), Err(ScalarOrderedCheckerOutcome::Unsupported)));
+        }
+        let unused = run(&refute(main), &false_library, &lib, ScalarCheckerScope::CurrentPackage).unwrap();
+        assert_eq!(take_integer_observations(), (1, 0)); // The pair observer owns this counter; Bool/Char batch in place.
+        assert_eq!(take_array_return_observations(), (1, 0));
+        assert!(unused.diagnostics.is_empty());
+        for failure in unused.symbolic_diagnostic.iter().chain(&unused.additional_symbolic_diagnostics) {
+            assert_eq!(failure.proof.source, app);
+            assert_eq!(failure.callable.source, lib);
+            assert_eq!(failure.output.source, lib);
+        }
+        assert_eq!(unused.additional_symbolic_diagnostics.len(), 2);
+        assert_eq!(unused.aggregate_diagnostics.len(), 2);
+        assert!(unused.aggregate_diagnostics.iter().all(|failure| failure.call.is_none()));
+        assert!(!run(&refute(main), &false_library, &lib, ScalarCheckerScope::MainFlowOnly).unwrap().active);
+
+        let nested = library.replace("%%end", "unit(u8) wrap = fn(value) { u8[2] captured = cells(value); captured; }; %%end");
+        assert!(matches!(run(&reached, &nested, &lib, ScalarCheckerScope::CurrentPackage), Err(ScalarOrderedCheckerOutcome::Unsupported)));
+        assert!(run(&reached, &nested, &lib, ScalarCheckerScope::MainFlowOnly).unwrap().diagnostics.is_empty());
+        let forced = reached.replace("%%end", "lib.wrap(3); %%end");
+        assert!(matches!(run(&forced, &nested, &lib, ScalarCheckerScope::MainFlowOnly), Err(ScalarOrderedCheckerOutcome::Unsupported)));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn qualified_value_proofs_distinguish_author_body_and_sibling_caller() {
+        let app = source("src/main.w", "qualified-value-author");
+        let lib = source("src/calc.w", "qualified-value-body");
+        let caller = source("src/caller.w", "qualified-value-caller");
+        let main = r#"%%start
+            lib = namespace demo "src/calc.w";
+            caller = namespace demo "src/caller.w";
+            proof owner for lib.make(entry) -> (number, ok) where (entry == 3)
+                ensures (ok && number == 2) {}
+        %%end"#;
+        let reader = r#"%%start
+            lib = namespace demo "src/calc.w";
+            u8 count, bool status = lib.make(3);
+        %%end"#;
+        let body = "%%start (u8, bool)(u8) make = fn(value) { value, true }; %%end";
+        let (_, catalog) = crate::parse_proof_source(app.clone(), main.to_owned(), &[]).ok().unwrap();
+        let import = |binding: &str, target: &SourceIdentity| ScalarNamespaceBinding {
+            binding: binding.into(), target: target.clone(), span: ByteSpan::new(0, 0),
+        };
+        let receipt = check_loaded_scalar_ordered_local_proof_contexts(
+            vec![(declarations(&lib, body), Vec::new()),
+                (declarations(&caller, reader), vec![import("lib", &lib)])],
+            [(catalog, vec![import("lib", &lib), import("caller", &caller)])],
+            vec![app.clone(), lib.clone(), caller.clone()], inputs(), ScalarCheckerScope::MainFlowOnly, Vec::new(),
+        ).unwrap();
+        let [failure] = receipt.diagnostics.as_slice() else { panic!("the reached sibling call refutes the qualified proof"); };
+        assert_eq!(failure.proof.source, app);
+        assert_eq!(failure.invocation.call.source, caller);
+        assert_eq!(failure.invocation.namespaced_callable.as_ref().unwrap().source, lib);
+        let span = failure.invocation.call.range;
+        assert_eq!(&reader[span.start as usize..span.end as usize], "lib.make(3)");
+
+        let local_main = main.split("proof owner").next().unwrap().to_owned() + "%%end";
+        let local_body = body.replace("%%end", "proof owner for make(entry) -> (number, ok) where (entry == 3)
+            ensures (ok && number == 2) {} %%end");
+        let (_, author) = crate::parse_proof_source(app.clone(), local_main, &[]).ok().unwrap();
+        let (_, provider) = crate::parse_proof_source(lib.clone(), local_body, &[]).ok().unwrap();
+        let receipt = check_loaded_scalar_ordered_local_proof_contexts(
+            vec![(declarations(&caller, reader), vec![import("lib", &lib)])],
+            [(author, vec![import("lib", &lib), import("caller", &caller)]), (provider, Vec::new())],
+            vec![app, lib.clone(), caller.clone()], inputs(), ScalarCheckerScope::MainFlowOnly, Vec::new(),
+        ).unwrap();
+        let [failure] = receipt.diagnostics.as_slice() else { panic!("the owner-authored proof sees the same real sibling call"); };
+        assert_eq!(failure.proof.source, lib);
+        assert_eq!(failure.invocation.call.source, caller);
+        assert!(receipt.symbolic_diagnostic.is_none());
     }
 
     #[cfg(feature = "internal-checker")]

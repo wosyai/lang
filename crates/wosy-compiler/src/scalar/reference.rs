@@ -7035,7 +7035,13 @@ fn resolve_project_call_sites_impl(
                         && matches!(outputs.outputs.as_slice(), [first, second]
                             if super::checker_flow::is_result_pair_atom(&first.ty)
                                 && super::checker_flow::is_result_pair_atom(&second.ty))));
-            if same_package && (qualified || case_candidate || literal_candidate || result_pair_candidate) {
+            let array_candidate = matches!(&modules[declaration.0].items[declaration.1],
+                ScalarItem::Function(function) if matches!(&function.signature,
+                    ScalarType::Callable { parameters, outputs } if matches!(parameters.as_slice(), [] | [_] | [_, _])
+                        && parameters.iter().all(is_integer_type)
+                        && matches!(outputs.outputs.as_slice(), [output]
+                            if matches!(&output.ty, ScalarType::Array { element, .. } if is_integer_type(element)))));
+            if same_package && (qualified || case_candidate || literal_candidate || result_pair_candidate || array_candidate) {
                 declarations.nested_proof_watch.entry((source, declaration_span))
                     .or_insert(ProofTargetUse { declaration, nested: std::cell::Cell::new(false) });
             }

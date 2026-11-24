@@ -1139,6 +1139,12 @@ fn check_command(
                 message: "reached from this call".to_owned(),
             });
         }
+        if let Some(owner) = &failure.invocation.namespaced_callable {
+            labels.push(DiagnosticLabel {
+                kind: DiagnosticLabelKind::Secondary, span: owner.clone(),
+                message: "proved callable declared here".to_owned(),
+            });
+        }
         let value = proof_scalar_text(&failure.invocation.returned, failure.invocation.returned_literal);
         let mut notes = vec![if let Some(pair) = &failure.invocation.returned_pair {
             format!("call returned {}", proof_pair_text(pair))
