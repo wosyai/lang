@@ -1,8 +1,8 @@
 use super::*;
 
 const DRIVER: &str = "%%start
-i32(*!u8) step = fn(view) { if (*view == 10) { 1 } else { 0 } };
-i32(*!u8, i32) drive = fn(view, outcome) {
+i32(*u8) step = fn(view) { if (*view == 10) { 1 } else { 0 } };
+i32(*u8, i32) drive = fn(view, outcome) {
     if (outcome == 0) { drive(view, step(view)) } else { outcome }
 };
 %%end";
@@ -29,14 +29,20 @@ fn detached_checked_forwarding_admits_only_the_returned_occurrence() {
 #[test]
 fn detached_checked_forwarding_rejects_local_projection_and_extra_work() {
     for body in [
-        "u8 local = 0; if (outcome == 0) { drive(view, step(&!local)) } else { outcome }",
-        "u8[1] local = [0]; if (outcome == 0) { drive(view, step(&!local[0])) } else { outcome }",
+        "u8 local = 0; if (outcome == 0) { drive(view, step(&local)) } else { outcome }",
+        "Cell local = { .value = 0; }; if (outcome == 0) { drive(view, step(&local.value)) } else { outcome }",
         "if (outcome == 0) { step(view); drive(view, step(view)) } else { outcome }",
     ] {
+        let projection_type = if body.contains("Cell local") {
+            "struct copy Cell { u8 value; }"
+        } else {
+            ""
+        };
         let source = parsed(&format!(
             "%%start
-i32(*!u8) step = fn(view) {{ if (*view == 10) {{ 1 }} else {{ 0 }} }};
-i32(*!u8, i32) drive = fn(view, outcome) {{ {body} }};
+{projection_type}
+i32(*u8) step = fn(view) {{ if (*view == 10) {{ 1 }} else {{ 0 }} }};
+i32(*u8, i32) drive = fn(view, outcome) {{ {body} }};
 %%end"
         ));
         for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
@@ -78,7 +84,7 @@ fn detached_checked_forwarding_rejects_missing_or_inconsistent_build_evidence() 
             panic!("recursive call")
         };
         let read = argument_points[0];
-        let movement = cfg.points[read.0].successors[0];
+        let step_read = cfg.points[read.0].successors[0];
         let mut broken = cfg.clone();
         broken.primary_call_points.remove(&ordinal);
         assert_eq!(prove(&broken), None);
@@ -92,9 +98,19 @@ fn detached_checked_forwarding_rejects_missing_or_inconsistent_build_evidence() 
         *parameter = 1;
         assert_eq!(prove(&broken), None);
         let mut broken = cfg.clone();
+        let ReferenceOrigin::BorrowedFrom { loan, .. } = &mut broken.facts[0] else {
+            panic!("parameter origin")
+        };
+        loan.mode = ScalarReferenceMutability::Mutable;
+        assert_eq!(prove(&broken), None);
+        let mut broken = cfg.clone();
         for graph in [&mut broken.points, &mut broken.initial_points] {
-            graph[movement.0].kind = CfgPointKind::ScopeExit;
+            graph[step_read.0].kind = CfgPointKind::ScopeExit;
         }
+        assert_eq!(prove(&broken), None);
+        let mut broken = cfg.clone();
+        broken.points[read.0].successors = cfg.points[step_read.0].successors.clone();
+        broken.initial_points[read.0].successors = cfg.initial_points[step_read.0].successors.clone();
         assert_eq!(prove(&broken), None);
         let mut broken = cfg.clone();
         let CfgPointKind::Call {

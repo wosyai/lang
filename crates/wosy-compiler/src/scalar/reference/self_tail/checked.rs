@@ -32,7 +32,7 @@ pub(in crate::scalar) fn prove(
     let [result] = calls.boundary.results.as_slice() else {
         return None;
     };
-    if !matches!(&view.ty, ScalarType::CheckedReference { mutability: ScalarReferenceMutability::Mutable, inner } if **inner == ScalarType::U8)
+    if !matches!(&view.ty, ScalarType::CheckedReference { mutability: ScalarReferenceMutability::Shared, inner } if **inner == ScalarType::U8)
         || view.ordinal != 0
         || state.ordinal != 1
         || state.ty != ScalarType::I32
@@ -117,7 +117,7 @@ pub(in crate::scalar) fn prove(
     let [ReferenceOrigin::BorrowedFrom { parameter: 0, loan }] = cfg.facts.as_slice() else {
         return None;
     };
-    if loan.mode != ScalarReferenceMutability::Mutable
+    if loan.mode != ScalarReferenceMutability::Shared
         || loan.parent.is_some()
         || loan.origin_place.binding != formal
         || !loan.origin_place.projections.is_empty()
@@ -173,12 +173,7 @@ pub(in crate::scalar) fn prove(
         || ![&cfg.points, &cfg.initial_points]
             .into_iter()
             .all(|points| {
-                check_graph(
-                    points,
-                    &formal,
-                    &view.ty,
-                    [self_read, step_read, step_call, self_call],
-                )
+                check_graph(points, &formal, [self_read, step_read, step_call, self_call])
             })
     {
         return None;
@@ -199,7 +194,6 @@ fn incoming_origin(point: &ReferenceFlowPoint) -> bool {
 fn check_graph(
     points: &[ReferenceFlowPoint],
     formal: &ReferenceBindingId,
-    ty: &ScalarType,
     [self_read, step_read, step_call, self_call]: [CfgPointId; 4],
 ) -> bool {
     let successor = |id: CfgPointId| {
@@ -208,17 +202,13 @@ fn check_graph(
         };
         Some(next)
     };
-    let Some(self_move) = successor(self_read) else {
-        return false;
-    };
-    let Some(step_move) = successor(step_read) else {
-        return false;
-    };
+    // The two source-ordered arguments copy the same incoming shared loan.
+    // Even one intervening affine move or write invalidates this proof.
     let Some(bind) = successor(CfgPointId(0)) else {
         return false;
     };
-    if successor(self_move) != Some(step_read)
-        || successor(step_move) != Some(step_call)
+    if successor(self_read) != Some(step_read)
+        || successor(step_read) != Some(step_call)
         || successor(step_call) != Some(self_call)
         || !matches!(points.get(bind.0), Some(ReferenceFlowPoint { kind: CfgPointKind::Bind { binding }, .. }) if binding == formal)
         || !matches!(points[0].kind, CfgPointKind::Entry)
@@ -256,18 +246,6 @@ fn check_graph(
                 binding == formal && incoming_origin(point)
             }
             CfgPointKind::Read { binding } => binding != formal,
-            CfgPointKind::Move {
-                place,
-                ty: actual,
-                owner,
-            } => {
-                (id == self_move || id == step_move)
-                    && actual == ty
-                    && owner == formal
-                    && place.binding == *formal
-                    && place.projections.is_empty()
-                    && matches!(place.place, ScalarPlace::Name { .. })
-            }
             CfgPointKind::Call { output: 0, .. } => {
                 (id == step_call || id == self_call)
                     && (point
@@ -289,10 +267,7 @@ fn check_graph(
             | CfgPointKind::Return => true,
             _ => false,
         }
-    }) || ![self_move, step_move]
-        .into_iter()
-        .all(|id| matches!(points[id.0].kind, CfgPointKind::Move { .. }))
-    {
+    }) {
         return false;
     }
     let Some(mut next) = successor(self_call) else {

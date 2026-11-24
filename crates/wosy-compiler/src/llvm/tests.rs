@@ -454,11 +454,11 @@ fn self_tail_test_body<'a>(ir: &'a str, ty: &str, symbol: &str) -> &'a str {
 #[test]
 fn prepared_project_checked_forwarding_stages_the_complete_backedge() {
     let text = "%%start
-i32(*!u8) step = fn(view) { if (*view == 10) { 1 } else { 0 } };
-i32(*!u8, i32) drive = fn(view, outcome) {
+i32(*u8) step = fn(view) { if (*view == 10) { 1 } else { 0 } };
+i32(*u8, i32) drive = fn(view, outcome) {
     if (outcome == 0) { drive(view, step(view)) } else { outcome }
 };
-i32(*!u8, i32) ordinary = fn(view, outcome) {
+i32(*u8, i32) ordinary = fn(view, outcome) {
     if (outcome == 0) { step(view); ordinary(view, step(view)) } else { outcome }
 };
 %%end";
@@ -558,8 +558,8 @@ i32(*!u8, i32) ordinary = fn(view, outcome) {
 #[test]
 fn checked_forwarding_reports_primitive_call_owner_gate_evidence() {
     let text = "%%start
-i32(*!u8) step = fn(view) { if (*view == 10) { 1 } else { 0 } };
-i32(*!u8, i32) drive = fn(view, outcome) {
+i32(*u8) step = fn(view) { if (*view == 10) { 1 } else { 0 } };
+i32(*u8, i32) drive = fn(view, outcome) {
     if (outcome == 0) { drive(view, step(view)) } else { outcome }
 };
 %%end";
