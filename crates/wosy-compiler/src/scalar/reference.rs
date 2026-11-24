@@ -2036,6 +2036,10 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             let ResolvedCallTarget::ModuleCallable {
                                 source, declaration_span, concrete: ConcreteCallSelection::Declaration,
                             } = target else { return None };
+                            if source == &self.source {
+                                return self.shared_scalar_read_effects?.get(declaration_span).copied()
+                                    .filter(|effect| effect.descriptor);
+                            }
                             let (identity, effect) = calls.imported_shared_readers.get(&ordinal)?;
                             (&identity.source == source && identity.range == *declaration_span).then_some(*effect)
                         })?;
@@ -2044,7 +2048,9 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             return None;
                         };
                         let [output] = signature?.outputs.outputs.as_slice() else { return None };
-                        if &output.ty != inner.as_ref() || !aggregate::ordinary_value(inner) {
+                        if if effect.descriptor {
+                            !matches!(inner.as_ref(), ScalarType::Struct(_)) || !aggregate::ordinary_value(&output.ty)
+                        } else { &output.ty != inner.as_ref() || !aggregate::ordinary_value(inner) } {
                             return None;
                         }
                         let argument = self.expression_ordinal(parent, OccurrenceEdge::CallArgument(effect.parameter));
@@ -2059,7 +2065,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                                     Some(PlainNameIdentity::Lexical(expected)) if expected == binding) =>
                                 Some((point, local_effect.is_some())),
                             CfgPointKind::Borrow { place, loan }
-                                if matches!(target, ResolvedCallTarget::ModuleCallable { .. })
+                                if !effect.descriptor && matches!(target, ResolvedCallTarget::ModuleCallable { .. })
                                     && loan.mode == ScalarReferenceMutability::Shared && loan.parent.is_none()
                                     && loan.origin_place == *place =>
                             {
@@ -6774,13 +6780,13 @@ fn shared_scalar_read_effect(
 ) -> Option<SharedScalarReadEffect> {
     if matches!(target, ResolvedCallTarget::LocalCallable(_)) {
         return (calls.local_shared_call_families.get(&ordinal) == Some(&true))
-            .then_some(SharedScalarReadEffect { parameter: 0 });
+            .then_some(SharedScalarReadEffect { parameter: 0, descriptor: false });
     }
     let ResolvedCallTarget::ModuleCallable {
         source: callee, declaration_span, concrete: ConcreteCallSelection::Declaration,
     } = target else { return None };
     (callee == source).then_some(())?;
-    effects?.get(declaration_span).copied()
+    effects?.get(declaration_span).copied().filter(|effect| !effect.descriptor)
 }
 
 fn joined_reborrow_calls_are_supported(
@@ -9888,6 +9894,8 @@ fn resolve_program_call_sites_impl(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct SharedScalarReadEffect {
     parameter: usize,
+    // Descriptor projections authorize only this exact direct receipt read.
+    descriptor: bool,
 }
 
 impl SharedScalarReadEffect {
@@ -9898,13 +9906,14 @@ impl SharedScalarReadEffect {
         let ScalarType::CheckedReference {
             mutability: ScalarReferenceMutability::Shared, inner,
         } = &parameter.ty else { return None };
-        if !aggregate::ordinary_value(inner)
-            || !function.generic_parameters.is_empty() || !function.overload_arms.is_empty()
+        if !function.generic_parameters.is_empty() || !function.overload_arms.is_empty()
         {
             return None;
         }
         let [result] = calls.boundary.results.as_slice() else { return None };
-        if &result.ty != inner.as_ref() {
+        let descriptor = matches!(inner.as_ref(), ScalarType::Struct(_));
+        if if descriptor { !aggregate::ordinary_value(&result.ty) || !calls.call_occurrences.is_empty() }
+            else { &result.ty != inner.as_ref() || !aggregate::ordinary_value(inner) } {
             return None;
         }
         let [ScalarBlockItem::Expression(expression)] = function.body.items.as_slice() else {
@@ -9919,7 +9928,7 @@ impl SharedScalarReadEffect {
             ScalarExpression::Binary {
                 operator: BinaryOperator::Add | BinaryOperator::Subtract | BinaryOperator::Multiply,
                 left, right, ..
-            } if calls.call_occurrences.is_empty()
+            } if !descriptor && calls.call_occurrences.is_empty()
                 && structure.checked_types.expressions.get(&output) == Some(inner.as_ref()) =>
             {
                 let (operand, edge) = match (left.as_ref(), right.as_ref()) {
@@ -9936,15 +9945,23 @@ impl SharedScalarReadEffect {
             }
             _ => (expression, output),
         };
-        let ScalarExpression::Dereference {
-            place: ScalarPlace::Dereference { pointer, .. }, ..
-        } = expression else { return None };
-        if !matches!(pointer.as_ref(), ScalarExpression::Name { .. }) {
-            return None;
-        }
+        let ScalarExpression::Dereference { place: written, .. } = expression else { return None };
         let OccurrenceNode::Place(place) = *structure.edges.get(&(
             OccurrenceParent::Expression(read), OccurrenceEdge::ExpressionPlace,
         ))? else { return None };
+        let (dereference, place) = if descriptor {
+            let ScalarType::Struct(expected) = inner.as_ref() else { return None };
+            let ScalarPlace::Field { base, field: ScalarFieldReference::Resolved(field), .. } = written else { return None };
+            if &field.structure != expected { return None }
+            let OccurrenceNode::Place(base_ordinal) = *structure.edges.get(&(
+                OccurrenceParent::Place(place), OccurrenceEdge::PlaceBase,
+            ))? else { return None };
+            (base.as_ref(), base_ordinal)
+        } else {
+            (written, place)
+        };
+        let ScalarPlace::Dereference { pointer, .. } = dereference else { return None };
+        if !matches!(pointer.as_ref(), ScalarExpression::Name { .. }) { return None }
         let OccurrenceNode::Expression(pointer) = *structure.edges.get(&(
             OccurrenceParent::Place(place), OccurrenceEdge::DereferencePointer,
         ))? else { return None };
@@ -9955,8 +9972,8 @@ impl SharedScalarReadEffect {
             && binding.block_span == function.body.span && binding.declaration_span == parameter.span
             && binding.kind == ReferenceBindingKind::Declared
             && structure.checked_types.expressions.get(&pointer) == Some(&parameter.ty)
-            && structure.checked_types.expressions.get(&read) == Some(inner.as_ref()))
-            .then_some(Self { parameter: parameter.ordinal })
+            && structure.checked_types.expressions.get(&read) == Some(&result.ty))
+            .then_some(Self { parameter: parameter.ordinal, descriptor })
     }
 }
 
@@ -10343,7 +10360,7 @@ impl ProjectCallSiteResults {
 impl ProjectCallSiteResults {
     pub(super) fn has_closed_shared_scalar_reader(&self, module: usize, declaration: ByteSpan) -> bool {
         self.modules.get(module).and_then(|row| row.as_ref().ok())
-            .is_some_and(|calls| calls.shared_scalar_read_effects.contains_key(&declaration))
+            .is_some_and(|calls| calls.shared_scalar_read_effects.get(&declaration).is_some_and(|effect| !effect.descriptor))
     }
 
     pub(super) fn lookup_errors(&self) -> impl Iterator<Item = &ReferenceAnalysisError> {
@@ -12072,7 +12089,7 @@ fn close_local_shared_call_families(
     let is_reader = |expression| {
         matches!(calls.prepared_plain_name(expression), Some(PlainNameIdentity::ModuleValue(declaration))
             if declaration.source == *source && readers.get(&declaration.range)
-                .is_some_and(|effect| effect.parameter == 0))
+                .is_some_and(|effect| effect.parameter == 0 && !effect.descriptor))
     };
     for block in &calls.structure.blocks {
         for item in &block.items {

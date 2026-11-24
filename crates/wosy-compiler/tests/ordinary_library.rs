@@ -1553,6 +1553,92 @@ fn imported_checked_reader_requires_exact_source_and_declaration() {
 }
 
 #[test]
+fn direct_scalar_descriptor_reader_preserves_backing_without_slot_authority() {
+    let app = source("workbench", "src/receipt_descriptor.w");
+    let imported = source("workbench", "src/reader.w");
+    let base = include_str!("fixtures/receipt-field-reader.w");
+    let record = "struct Packet { *?u8 data; u64 length; }";
+    let direct = "u64(*Packet) read_length = fn(view) { (*view).length };";
+    let fallback = "u64(*Packet) read_length = fn(view) { u64 seen = (*view).length; seen };";
+    let base = base.replace("u64(*u64) read_length = fn(view) { *view + 1 };", direct)
+        .replace("*u64 view = &packet.length;", "*Packet view = &packet;")
+        .replace("    read_length(view)", "    read_length(view) + 1");
+    for (target, target_layout) in [("native64", ScalarTargetLayout::NATIVE64), ("wasm32", ScalarTargetLayout::WASM32)] {
+        for route in ["single", "project", "import"] {
+            let external = route == "import";
+            let emit = |reader: &str, slot: bool| {
+                let reader_text = format!("%%start\n{record}\n{reader}\n%%end");
+                let main = if external {
+                    base.replace("%%start", "%%start\nreader = namespace workbench \"src/reader.w\";")
+                        .replace(record, "").replace(direct, "")
+                        .replace("Packet", "reader.Packet").replace("read_length(view)", "reader.read_length(view)")
+                } else if slot {
+                    base.replace(direct, reader).replace("    read_length(view)",
+                        "    u64(*Packet) slot = read_length;\n    slot(view)")
+                } else {
+                    base.replace(direct, reader)
+                };
+                let root = declarations(&app, &main);
+                let (rows, sources) = if external {
+                    let namespace = root.namespaces().next().unwrap();
+                    let bindings = vec![ScalarNamespaceBinding { binding: namespace.binding.clone(),
+                        target: imported.clone(), span: namespace.span }];
+                    (vec![(root, bindings), (declarations(&imported, &reader_text), vec![])],
+                        vec![app.clone(), imported.clone()])
+                } else {
+                    (vec![(root, vec![])], vec![app.clone()])
+                };
+                let prepared = prepare_scalar_project(rows, sources, ScalarPreparationInputs { target_layout }).unwrap();
+                let build = analyze_scalar_build(&prepared);
+                if !build.diagnostics().is_empty() { return Err(format!("{:?}", build.diagnostics())); }
+                if route == "single" { wosy_compiler::emit_scalar_build_single_module_llvm(&build) }
+                else { emit_scalar_build_project_llvm(&build) }.map(|module| module.to_text())
+            };
+            let ir = emit(direct, false).unwrap_or_else(|error| panic!("{target}/{route}: {error}"));
+            let context = Context::create();
+            let module = context.create_module_from_ir(MemoryBuffer::create_from_memory_range_copy(ir.as_bytes(), target)).unwrap();
+            module.verify().unwrap();
+            let symbol = |name: &str| if route == "single" { name.to_owned() } else { function_with_suffix(&module, name) };
+            let drive = module.get_function(&symbol("drive")).unwrap();
+            let mut seen = Vec::new();
+            let mut original = None;
+            for row in drive.get_basic_blocks().into_iter().flat_map(|b| b.get_instructions()) {
+                if row.get_opcode() != InstructionOpcode::Call { continue; }
+                let call = CallSiteValue::try_from(row).unwrap();
+                let Some(callee) = call.get_called_fn_value() else { continue };
+                let name = callee.get_name().to_str().unwrap();
+                if name == symbol("make_packet") {
+                    original = call.try_as_basic_value().basic();
+                    seen.push("allocate");
+                } else if name == symbol("read_length") {
+                    assert_eq!(call.count_arguments(), 1);
+                    seen.push("read");
+                } else if name == "__wosy_core_free" {
+                    assert!(original.is_some());
+                    assert_eq!(row.get_operand(0).unwrap().value(), original);
+                    seen.push("release");
+                }
+            }
+            assert_eq!(seen, ["allocate", "read", "release"], "{target}/{route}: {ir}");
+            assert!(emit(fallback, false).expect_err("signature alone cannot authorize a descriptor loan")
+                .contains("aggregate owning receipt has an unproved checked loan"));
+            if !external {
+                let error = emit(direct, true).expect_err("direct descriptor reader certificate cannot authorize a slot");
+                assert!(error.contains("aggregate owning receipt has an unproved checked loan")
+                    || error.contains("local callable slot requires a proved direct scalar target"), "{error}");
+            }
+            if let Some(out) = std::env::var_os("WOSY_RECEIPT_FIELD_IR_DIR") {
+                let out = std::path::PathBuf::from(out).join(format!("descriptor-{route}"));
+                std::fs::create_dir_all(&out).unwrap();
+                let mut witness = ir.replace("@main(", "@wosy_authored_main(");
+                witness.push_str(&format!("\ndefine i64 @wosy_field_witness() {{\nentry:\n  %v = call i64 @{}()\n  ret i64 %v\n}}\n", symbol("field_witness")));
+                std::fs::write(out.join(format!("{target}.ll")), witness).unwrap();
+            }
+        }
+    }
+}
+
+#[test]
 fn local_checked_reader_preserves_the_selected_loan_through_recursion() {
     let app = source("workbench", "src/local_checked_reader.w");
     let text = include_str!("fixtures/local-checked-reader.w");

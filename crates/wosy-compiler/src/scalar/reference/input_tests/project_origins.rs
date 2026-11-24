@@ -894,7 +894,7 @@ fn prepared_shared_scalar_read_effect_is_exact_to_declaration_and_formal() {
     assert_eq!(reader_span, find_sample(&modules[1]));
     assert_eq!(
         reader_call_sites.shared_scalar_read_effects,
-        HashMap::from([(reader_span, SharedScalarReadEffect { parameter: 0 })]),
+        HashMap::from([(reader_span, SharedScalarReadEffect { parameter: 0, descriptor: false })]),
     );
     assert!(other_call_sites.shared_scalar_read_effects.is_empty());
 }
