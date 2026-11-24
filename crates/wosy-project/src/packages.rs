@@ -10,6 +10,7 @@ mod anchored;
 mod git_sync;
 mod git_wire;
 mod graph;
+mod init;
 mod lifecycle;
 mod patches;
 mod snapshot;
@@ -18,6 +19,7 @@ pub(crate) use snapshot::ProjectSnapshot;
 
 pub use add::add_dependency;
 pub use anchored::GitDirectory;
+pub use init::init_project;
 pub use lifecycle::{snapshot_dependencies, update_dependencies};
 pub use patches::PatchStackId;
 pub use git_sync::sync_dependencies;

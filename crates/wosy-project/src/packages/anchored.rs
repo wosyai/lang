@@ -80,6 +80,13 @@ impl GitDirectory {
         platform::entries(&self.file)
     }
 
+    #[cfg(target_os = "linux")]
+    pub(super) fn entry_names(
+        &self,
+    ) -> io::Result<impl Iterator<Item = io::Result<std::ffi::OsString>>> {
+        platform::entry_names(&self.file)
+    }
+
     pub(super) fn mkdir(&self, name: &Path) -> io::Result<()> {
         one_component(name)?;
         platform::mkdir(&self.file, name, 0o777)
@@ -223,12 +230,17 @@ mod platform {
         Ok(())
     }
 
-    pub(super) fn entries(dir: &File) -> io::Result<Vec<OsString>> {
+    pub(super) fn entry_names(
+        dir: &File,
+    ) -> io::Result<impl Iterator<Item = io::Result<OsString>>> {
         // /proc supplies names from the held descriptor, not from the original
         // checkout path. Actual file opens use openat2 relative to that handle.
-        std::fs::read_dir(descriptor_path(dir)?)?
-            .map(|entry| entry.map(|entry| entry.file_name()))
-            .collect()
+        Ok(std::fs::read_dir(descriptor_path(dir)?)?
+            .map(|entry| entry.map(|entry| entry.file_name())))
+    }
+
+    pub(super) fn entries(dir: &File) -> io::Result<Vec<OsString>> {
+        entry_names(dir)?.collect()
     }
 
     pub(super) fn mkdir(dir: &File, name: &Path, mode: u32) -> io::Result<()> {

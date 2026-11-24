@@ -42,7 +42,11 @@ main_artifact = "main"
 
 Rules:
 
-- `[package] name` and `default_target` are required.
+- `[package] name` and `default_target` are required for a buildable project.
+  `source_root` is a package-relative directory used by namespace paths.
+  For older root manifests without it, self-qualified namespace paths start
+  at the project root. Target entry paths are always relative to the project
+  root, regardless of `source_root`.
 - A local `[dependencies.<name>]` table contains only `path`, normally relative to the project root. Local packages stay in place. For Git dependencies, the table instead contains `git` (the repository origin) and optionally `path` (a directory within that repository, defaulting to `"."`). Both sources must supply a `wosy.toml` with a matching `package.name` and a package-relative `source_root` directory.
 - `[comments] categories` lists the `# CATEGORY:` comment categories accepted by `wosy parse` and `wosy build`.
 - Each builder needs `command` (argv, first element is the executable), optional `args`, and `toolchain_identity`. The same applies to runners.
@@ -123,6 +127,12 @@ and the 32 raw bytes of its file-content BLAKE3 hash. Symlinks and submodules ar
 Sync does not overwrite an edited or unverified directory. Moving the same
 project with its checkouts preserves their provenance; copying them to a
 different project does not.
+
+## `wosy.meta.json`
+
+The package owns this file for mechanical metadata such as refactor mappings.
+`wosy init` starts it as an empty JSON object. The base-language build does
+not need metadata entries.
 
 ## Dependency patches
 

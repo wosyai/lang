@@ -1,0 +1,48 @@
+[package]
+name = "@package@"
+source_root = "src"
+default_target = "app"
+
+[comments]
+categories = [
+    "INTENT", "WHY", "ASSUMPTION", "RISK", "SOURCE", "WORKAROUND", "TODO",
+    "CONSTRAINT", "SECURITY", "AUDIT", "OWNERSHIP", "TYPE", "REPLAY", "NOISE",
+]
+
+[builders.native]
+command = ["python3", "scripts/build-native"]
+toolchain_identity = "llvm-18.1.x"
+
+[builders.llvm_wasm]
+command = ["python3", "scripts/build-wasm"]
+toolchain_identity = "llvm-18.1.x"
+
+[runners.native]
+command = ["python3", "scripts/run-native"]
+
+[runners.wasmtime]
+command = ["python3", "scripts/run-wasmtime"]
+
+[targets.app]
+root = "src/main.w"
+
+[targets.app.artifacts.main]
+artifact = "Main"
+
+[targets.app.artifacts.main.profiles.dev]
+backend = "llvm"
+output = "native"
+builder = "native"
+run_runner = "native"
+
+[targets.app.artifacts.main.profiles.wasm]
+backend = "llvm"
+output = "wasm-wasip1"
+builder = "llvm_wasm"
+run_runner = "wasmtime"
+
+[targets.app.profiles.dev]
+main_artifact = "main"
+
+[targets.app.profiles.wasm]
+main_artifact = "main"

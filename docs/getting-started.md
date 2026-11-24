@@ -8,7 +8,21 @@
 
 ## Create a project
 
-A project is a directory containing `wosy.toml` and a `src/main.w` entry point. The minimal `wosy.toml` names the package, the default target, the entry file, one builder, one runner, and one artifact profile. See [Project layout](project.md) for the full schema.
+On Linux, start a base-language project in a new directory:
+
+```sh
+mkdir my_app
+cd my_app
+wosy init
+```
+
+The generated `wosy.toml` declares a native `dev` profile and a WASI Preview 1
+`wasm` profile for `src/main.w`. Use `--profile wasm` on both build and run
+to select the latter. The starter needs no dependencies; add them explicitly
+when needed. See [CLI reference](cli.md#wosy-init) for the generated files and
+[Project layout](project.md) for the manifest schema.
+
+You can also create the manifest and entry file manually.
 
 ## Write source
 

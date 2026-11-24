@@ -12,6 +12,26 @@ on non-Unix platforms. Reading local dependencies does not require Git or
 create package metadata. With no Git dependencies, `dep sync` only reads local
 declarations and does not write a manifest, lockfile, or checkout.
 
+## `wosy init`
+
+Creates a base-language package in the current directory on Linux (kernel 5.6
+or newer and `/proc` available). The directory name must start with a
+lowercase ASCII letter and contain only lowercase ASCII letters, digits or
+underscores. All scaffold paths must be absent: `src/`, `scripts/`,
+`wosy.toml`, `wosy.lock`, `wosy.meta.json`, and `.gitignore`. Init does
+not overwrite files or links, invoke Git, build the program, or add
+dependencies. Other files in the directory are not modified. If publication
+fails after some files were created, unmodified scaffold entries are moved to a
+recovery directory shown in the diagnostic. External replacements and edits are
+not discarded.
+
+The scaffold has a starter `src/main.w`, an empty version 1 dependency lock,
+empty mechanical metadata, and project-local build and run scripts. It selects
+the native `dev` profile by default and provides a `wasm` profile for WASI
+Preview 1. Building needs Python 3 and Clang 18.1.x on `PATH`; the Wasm profile
+also needs `wasm-ld` from LLVM and Wasmtime to run. This base-language scaffold
+does not generate compiler references or configure high-language tooling.
+
 ## `wosy dep add SOURCE [--path PACKAGE_PATH]`
 
 Adds a local project-relative package path or a Git origin, with an optional

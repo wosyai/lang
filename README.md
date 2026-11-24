@@ -45,6 +45,8 @@ std.utf8 line = { .data = content; .length = size; };
 Prerequisites: the `wosy` binary on `PATH`, LLVM 18.1.x reachable through the builder scripts, and Python 3 for the reference `scripts/build-*` / `scripts/run-*` helpers.
 
 ```sh
+mkdir my_app && cd my_app
+wosy init
 wosy build app --profile dev
 wosy run app --profile dev -- <program-args>
 ```
@@ -58,7 +60,7 @@ A project is a directory with `wosy.toml` and `src/main.w`. See [Project layout]
 - [Types](docs/types.md) — scalars, structs, enums, arrays, pointers, callables.
 - [Core operations](docs/core.md) — conversions, allocation, `unsafe` rules.
 - [Standard library](docs/stdlib.md) — `bootstrap.w` and `wasi/preview1.w`.
-- [CLI reference](docs/cli.md) — `parse`, `build`, `run`, `dep add`, `dep sync`, `dep snapshot`, `dep update`.
+- [CLI reference](docs/cli.md) — `init`, `parse`, `build`, `run`, `dep add`, `dep sync`, `dep snapshot`, `dep update`.
 - [Diagnostics](docs/errors.md) — every code, what triggers it.
 
 ## Status

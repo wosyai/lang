@@ -40,6 +40,8 @@ struct Arguments {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Create a base-language project in the current directory
+    Init,
     /// Manage project dependencies
     Dep {
         #[command(subcommand)]
@@ -81,6 +83,16 @@ enum DepCommand {
 fn main() -> ExitCode {
     let arguments = Arguments::parse();
     match arguments.command {
+        Command::Init => match env::current_dir()
+            .map_err(|error| error.to_string())
+            .and_then(|root| wosy_project::packages::init_project(&root))
+        {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("wosy: {error}");
+                ExitCode::from(1)
+            }
+        },
         Command::Dep { command } => {
             let result = match command {
                 DepCommand::Add { source, path } => dep_command(|root| {
