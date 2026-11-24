@@ -101,6 +101,51 @@ fn contextual_storage_preparation_resolves_prior_rhs_and_restores_outer_storage(
 }
 
 #[test]
+fn inherited_contextual_requirements_keep_checked_type_evidence_separate_from_local_storage() {
+    let text = r#"%%start
+        i8() needed = fn {
+            core.context.credit = 1;
+            core.context.credit
+        };
+        bool() unknown = fn { core.context.external };
+        i8() provider = fn {
+            i8 core.context.credit = 2;
+            if (core.context.credit == 2) {
+                i8 core.context.credit = 3;
+                core.context.credit = 4;
+            };
+            core.context.credit
+        };
+    %%end"#;
+    let parsed = parse_source(source(), text.to_owned(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let canonical = parsed.result.canonical_cst();
+    let declaration = derive_scalar_declarations_from_cst(canonical);
+    let plan = &declaration.contextual_places;
+    assert!(declaration.items.is_empty(), "metadata must not admit unsupported implicit arguments");
+    assert_eq!(declaration.diagnostics().len(), 3);
+    assert!(declaration.diagnostics().iter().all(|diagnostic| diagnostic.message.contains("inherited contextual")));
+    let [write, read, unknown] = plan.inherited.as_slice() else { panic!("{:?}", plan.inherited); };
+    use contextual::ContextualRole::{Assign, Read};
+    assert_eq!((&*write.name, write.role, &*read.name, read.role), ("credit", Assign, "credit", Read));
+    assert_eq!(write.function, read.function);
+    assert_ne!(write.function, unknown.function);
+    let functions = canonical.root.descendants().filter(|node| node.kind() == SyntaxKind::FunctionDecl)
+        .map(|node| wosy_syntax::byte_span(&node)).collect::<Vec<_>>();
+    assert_eq!([write.function, unknown.function], [functions[0], functions[1]]);
+    assert_eq!((&*unknown.name, unknown.role, unknown.local_type_declaration), ("external", Read, None));
+    assert_eq!(write.local_type_declaration, read.local_type_declaration);
+    let evidence = &plan.declarations[write.local_type_declaration.unwrap()];
+    assert_eq!(evidence.ty, ScalarType::I8);
+    assert_eq!(evidence.binding.function_span, functions[2]);
+    assert_eq!(plan.declarations.len(), 2);
+    assert_ne!(plan.declarations[0].binding, plan.declarations[1].binding);
+    for occurrence in &plan.inherited {
+        assert!(!plan.resolved.contains_key(&occurrence.span));
+    }
+}
+
+#[test]
 fn project_contextual_type_authority_preserves_distinct_same_body_storage() {
     let first = module_source("src/first.w");
     let second = module_source("src/second.w");

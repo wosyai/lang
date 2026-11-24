@@ -12155,7 +12155,21 @@ mod tests {
             assert!(caller.witness.intervals_at(0, 2).unwrap().eq([(&result, &result)]));
 
             let narrowing = program.replace("core.require(input < 0", "core.narrow(input < 0");
-            assert!(matches!(run(&narrowing, scope), Err(ScalarOrderedCheckerOutcome::Unsupported)));
+            let pruned = run(&narrowing, scope)
+                .unwrap_or_else(|error| panic!("exact contextual argument narrowed in {scope:?}: {error:?}"));
+            assert!(pruned.active && pruned.diagnostics.is_empty() && pruned.symbolic_diagnostic.is_none());
+            let [failure] = pruned.directives.as_slice() else { panic!("only the callee narrowing failure should be reached"); };
+            assert_eq!(&narrowing[failure.condition.start as usize..failure.condition.end as usize], "input < 0");
+            assert_eq!(failure.code(), &BigInt::from(7));
+            assert!(failure.witness.intervals_at(0, 0).unwrap().eq([(&input, &input)]));
+
+            let surviving = narrowing.replace("core.narrow(input < 0", "core.narrow(input > 0");
+            let resumed = run(&surviving, scope)
+                .unwrap_or_else(|error| panic!("exact contextual argument survived narrowing in {scope:?}: {error:?}"));
+            let [failure] = resumed.directives.as_slice() else { panic!("only the caller requirement should fail"); };
+            assert_eq!(failure.code(), &BigInt::from(13));
+            assert!(failure.witness.intervals_at(0, 1).unwrap().eq([(&input, &input)]));
+            assert!(failure.witness.intervals_at(0, 2).unwrap().eq([(&result, &result)]));
             let ordinary = program.replace("core.context.count", "count");
             let receipt = run(&ordinary, scope)
                 .unwrap_or_else(|error| panic!("proof-free lexical argument in {scope:?}: {error:?}"));

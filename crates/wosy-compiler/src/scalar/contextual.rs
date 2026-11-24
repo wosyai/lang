@@ -15,6 +15,9 @@ pub(super) struct ContextualPlaces {
     pub(super) declarations: Vec<ContextualStorage>,
     pub(super) first_declarations: Vec<usize>,
     pub(super) resolved: HashMap<ByteSpan, ContextualOccurrence>,
+    // In source order. A requirement is never entered in `resolved`: its
+    // place identity belongs to a caller and no ABI currently supplies it.
+    pub(super) inherited: Vec<InheritedContextualOccurrence>,
 }
 
 impl ContextualPlaces {
@@ -23,6 +26,17 @@ impl ContextualPlaces {
         (occurrence.role == role).then_some(())?;
         self.declarations.get(occurrence.storage)
     }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(super) struct InheritedContextualOccurrence {
+    pub(super) function: ByteSpan,
+    pub(super) span: ByteSpan,
+    pub(super) name: String,
+    pub(super) role: ContextualRole,
+    // Same-source type evidence only, not caller storage or completion of
+    // project-wide type unification. Unknown names remain unresolved.
+    pub(super) local_type_declaration: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -57,6 +71,7 @@ pub(super) fn prepare(
 ) -> ContextualPlaces {
     let mut result = ContextualPlaces::default();
     let mut scopes = Vec::<(ByteSpan, HashMap<String, usize>)>::new();
+    let mut functions = Vec::<(ByteSpan, usize)>::new();
     let mut pending = HashMap::<ByteSpan, Vec<(String, usize)>>::new();
     let mut declared_types = HashMap::<String, usize>::new();
     let mut report = |span, message: &str| diagnostics.push(reported_error(
@@ -64,6 +79,12 @@ pub(super) fn prepare(
     ));
     for event in roots.iter().flat_map(CstNode::preorder) {
         match event {
+            WalkEvent::Enter(node) if node.kind() == SyntaxKind::FunctionDecl => {
+                functions.push((wosy_syntax::byte_span(&node), scopes.len()));
+            }
+            WalkEvent::Leave(node) if node.kind() == SyntaxKind::FunctionDecl => {
+                functions.pop();
+            }
             WalkEvent::Enter(node) if node.kind() == SyntaxKind::Block => {
                 scopes.push((wosy_syntax::byte_span(&node), HashMap::new()));
             }
@@ -100,7 +121,7 @@ pub(super) fn prepare(
                         report(span, "contextual declaration requires an active callable block");
                         continue;
                     };
-                    let Some(function) = binding.ancestors().find(|ancestor| ancestor.kind() == SyntaxKind::FunctionDecl) else {
+                    let Some(&(function, _)) = functions.last() else {
                         report(span, "contextual storage requires a direct function body");
                         continue;
                     };
@@ -138,7 +159,7 @@ pub(super) fn prepare(
                         ty,
                         binding: ReferenceBindingId {
                             source: canonical.source.clone(),
-                            function_span: wosy_syntax::byte_span(&function),
+                            function_span: function,
                             declaration_span: span,
                             block_span: *scope,
                             kind: ReferenceBindingKind::Declared,
@@ -146,7 +167,7 @@ pub(super) fn prepare(
                     });
                     waiting.push((name.text().to_owned(), id));
                     result.resolved.insert(span, ContextualOccurrence { storage: id, role: ContextualRole::Declare });
-                } else if let Some(&storage) = scopes.iter().rev().find_map(|(_, active)| active.get(name.text())) {
+                } else {
                     let role = if parent.kind() == SyntaxKind::AssignmentTarget {
                         let Some(targets) = parent.parent().filter(|node| node.kind() == SyntaxKind::AssignmentTargets) else {
                             report(span, "contextual write requires a direct assignment target");
@@ -168,13 +189,24 @@ pub(super) fn prepare(
                     } else {
                         ContextualRole::Read
                     };
-                    result.resolved.insert(span, ContextualOccurrence { storage, role });
-                } else {
-                    report(span, "inherited contextual bindings are not supported by scalar preparation yet");
+                    let floor = functions.last().map_or(0, |&(_, floor)| floor);
+                    if let Some(&storage) = scopes[floor..].iter().rev().find_map(|(_, active)| active.get(name.text())) {
+                        result.resolved.insert(span, ContextualOccurrence { storage, role });
+                    } else {
+                        if let Some(&(function, _)) = functions.last() {
+                            result.inherited.push(InheritedContextualOccurrence {
+                                function, span, name: name.text().to_owned(), role, local_type_declaration: None,
+                            });
+                        }
+                        report(span, "inherited contextual bindings are not supported by scalar preparation yet");
+                    }
                 }
             }
             _ => {}
         }
+    }
+    for occurrence in &mut result.inherited {
+        occurrence.local_type_declaration = declared_types.get(&occurrence.name).copied();
     }
     result
 }
