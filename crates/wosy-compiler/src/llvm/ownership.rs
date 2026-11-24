@@ -1285,6 +1285,16 @@ pub(super) fn emit_runtime_array_allocation<'ctx, 'module>(
     element: &ScalarType,
     length: inkwell::values::IntValue<'ctx>,
 ) -> Result<PointerValue<'ctx>, String> {
+    emit_runtime_array_allocation_with_domain(context, state, element, length, false)
+}
+
+pub(super) fn emit_runtime_array_allocation_with_domain<'ctx, 'module>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, 'module>,
+    element: &ScalarType,
+    length: inkwell::values::IntValue<'ctx>,
+    checked_extent: bool,
+) -> Result<PointerValue<'ctx>, String> {
     declare_core_runtime(context, state.module);
     let (element_size, alignment) = allocation_layout(element, state.layouts, state.target_layout)?;
     let function = state
@@ -1294,40 +1304,36 @@ pub(super) fn emit_runtime_array_allocation<'ctx, 'module>(
         .ok_or_else(|| "runtime allocation has no containing function".to_owned())?;
     let panic_block = context.append_basic_block(function, "allocation_panic");
     let integer = context.i64_type();
+    // The checked extent also guarantees the target's signed LLVM pointer
+    // index domain. Reuse the constructor's existing size-overflow branch
+    // rather than repeating a size/range check at each access.
+    let max_bytes = if checked_extent {
+        match state.target_layout.pointer_size {
+            4 => i32::MAX as u64,
+            8 => i64::MAX as u64,
+            _ => return Err("unsupported runtime-array pointer index width".to_owned()),
+        }
+    } else {
+        u64::MAX
+    };
+    if element_size != 0 {
+        let limit = max_bytes / element_size;
+        if limit != u64::MAX && !length.get_zero_extended_constant().is_some_and(|constant| constant <= limit) {
+            let overflow = state.builder.build_int_compare(
+                IntPredicate::UGT, length, integer.const_int(limit, false), "allocation_size_overflow",
+            ).map_err(builder_error)?;
+            let allocate = context.append_basic_block(function, "allocation_size_valid");
+            state.builder.build_conditional_branch(overflow, panic_block, allocate)
+                .map_err(builder_error)?;
+            state.builder.position_at_end(allocate);
+        }
+    }
     let size = match element_size {
         0 => integer.const_zero(),
         1 => length,
-        _ => {
-            let limit = u64::MAX / element_size;
-            if !length
-                .get_zero_extended_constant()
-                .is_some_and(|constant| constant <= limit)
-            {
-                let overflow = state
-                    .builder
-                    .build_int_compare(
-                        IntPredicate::UGT,
-                        length,
-                        integer.const_int(limit, false),
-                        "allocation_size_overflow",
-                    )
-                    .map_err(builder_error)?;
-                let allocate = context.append_basic_block(function, "allocation_size_valid");
-                state
-                    .builder
-                    .build_conditional_branch(overflow, panic_block, allocate)
-                    .map_err(builder_error)?;
-                state.builder.position_at_end(allocate);
-            }
-            state
-                .builder
-                .build_int_nuw_mul(
-                    length,
-                    integer.const_int(element_size, false),
-                    "allocation_size",
-                )
-                .map_err(builder_error)?
-        }
+        _ => state.builder.build_int_nuw_mul(
+            length, integer.const_int(element_size, false), "allocation_size",
+        ).map_err(builder_error)?,
     };
     let continue_block = context.append_basic_block(function, "allocation_continue");
     let allocation = emit_managed_allocation_branch(

@@ -791,7 +791,7 @@ fn artifact_identity(
 }
 
 fn compiler_identity() -> String {
-    format!("{}+checked-access-fixed-v1", wosy_compiler::COMPILER_IDENTITY)
+    format!("{}+checked-access-fixed-runtime-local-v1", wosy_compiler::COMPILER_IDENTITY)
 }
 
 fn llvm_identity() -> String {
@@ -1081,6 +1081,85 @@ if (scalar_index(2, 23) != 23 || witness() != 42 || read_explicit_raw(1) != 5) {
             assert!(!raw.contains(&non_null) && !raw.contains(&bounds), "{raw}");
         }
         fs::remove_dir_all(&project.root).unwrap();
+    }
+
+    #[test]
+    fn default_build_preserves_original_runtime_extent_in_local_and_same_backing_routes() {
+        let fixtures = [
+            (
+                "runtime-local-extent",
+                include_str!("../../../tests/fixtures/build/checked_access_release/project/src/main.w"),
+                "runtime_update",
+                false,
+            ),
+            (
+                "runtime-closed-rebind",
+                include_str!("../../../tests/fixtures/build/checked_access_release/project/src/runtime_rebound.w"),
+                "drive",
+                true,
+            ),
+        ];
+        let hex = |name: &str| name.bytes().map(|byte| format!("{byte:02x}")).collect::<String>();
+        for (name, text, function, rebound) in fixtures {
+            let (project, configuration) = routing_test_project(name, &[("main.w", text)]);
+            for target in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+                let (llvm, observations) = compile_project(&project.root, &project, &configuration, target).unwrap();
+                let [_, access] = observations.as_slice() else { panic!("{name}: missing release bounds source") };
+                let guard = format!("__{}__{}", hex(&access.content_revision.0), hex("check_index_in_extent"));
+                let fn_suffix = format!("__{}(", hex(function));
+                let definition = llvm.lines().find(|line| line.starts_with("define ") && line.contains(&fn_suffix))
+                    .unwrap_or_else(|| panic!("{name}: missing {function}"));
+                let body = llvm.split_once(definition).unwrap().1.split_once("\n}").unwrap().0;
+                if rebound {
+                    let after_rebind = body.rsplit_once(&format!("__{}(", hex("carry"))).unwrap().1;
+                    for (owner, index) in [("left", "1"), ("right", "0")] {
+                        let extent_ssa = after_rebind.lines().find_map(|line| line
+                            .split_once(&format!(" = load i64, ptr %{owner}_length,"))
+                            .map(|(value, _)| value.trim()))
+                            .unwrap_or_else(|| panic!("{name}: missing {owner} extent snapshot"));
+                        let call = format!("{guard}(i64 {index}, i64 {extent_ssa})");
+                        let location = after_rebind.find(&call).expect("check uses actual retained length slot");
+                        assert!(after_rebind[location..].contains("getelementptr inbounds i8"));
+                    }
+                } else {
+                    let count_symbol = format!("__{}(", hex("construction_count"));
+                    assert_eq!(body.matches(&count_symbol).count(), 1);
+                    let original_count = body.lines().find(|line| line.contains(&count_symbol))
+                        .unwrap().split_once(" = call i64 ").unwrap().0.trim();
+                    let lines = body.lines().map(str::trim).collect::<Vec<_>>();
+                    let unique_line = |message, predicate: &dyn Fn(&str) -> bool| {
+                        let matches = lines.iter().enumerate().filter(|(_, line)| predicate(line))
+                            .collect::<Vec<_>>();
+                        assert_eq!(matches.len(), 1, "{message}: {body}");
+                        (matches[0].0, *matches[0].1)
+                    };
+                    let (count_at, _) = unique_line("construction count", &|line| line.contains(&count_symbol));
+                    let alloc = format!(" = call ptr @__wosy_core_alloc(i64 {original_count}, i64 1)");
+                    let (backing_at, allocation) = unique_line("allocation of original count", &|line| line.ends_with(&alloc));
+                    let backing = allocation.strip_suffix(&alloc).unwrap();
+                    let selector_symbol = format!("__{}(", hex("select_index"));
+                    let (selector_at, selector) = unique_line("effectful selector", &|line| {
+                        line.contains(" = call i64 @") && line.contains(&selector_symbol)
+                    });
+                    let selection = selector.split_once(" = call i64 @").unwrap().0;
+                    let guard_call = format!("{guard}(i64 {selection}, i64 {original_count})");
+                    let (guard_at, _) = unique_line("full-width guard of selector result", &|line| {
+                        line.starts_with("call void @") && line.ends_with(&guard_call)
+                    });
+                    let gep_operands = format!(" = getelementptr inbounds i8, ptr {backing}, i64 {selection}");
+                    let (gep_at, _) = unique_line("indexed GEP from same backing and selector result", &|line| {
+                        line.ends_with(&gep_operands)
+                    });
+                    assert!(count_at < backing_at && backing_at < selector_at && selector_at < guard_at
+                        && guard_at < gep_at, "{name}: {body}");
+                    let checks = body.lines().filter(|line| line.contains(&guard)).collect::<Vec<_>>();
+                    assert_eq!(checks.len(), 2);
+                    assert!(checks.iter().all(|line| line.ends_with(&format!(", i64 {original_count})"))));
+                    assert_eq!(body.matches("call void @__wosy_core_free(").count(), 1);
+                }
+            }
+            fs::remove_dir_all(&project.root).unwrap();
+        }
     }
 
     #[test]

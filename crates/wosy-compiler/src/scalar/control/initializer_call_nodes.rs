@@ -707,6 +707,26 @@ impl<'a> CallableBodyCallNodes<'a> {
         }
     }
 
+    pub(crate) fn lexical_place_declaration(&self, place: &ScalarPlace) -> Option<ByteSpan> {
+        let NamedPlaceRootIdentity::Lexical(binding) = self.named_place_root(place)? else {
+            return None;
+        };
+        Some(binding.declaration_span)
+    }
+
+    pub(crate) fn existing_array_rebind_event(
+        &self,
+        cfg: &ScalarReferenceCfg,
+        call: usize,
+        destination: usize,
+    ) -> Option<(CfgPointId, &'a super::super::ReferenceBindingId)> {
+        let calls = self.proof_nodes.calls?;
+        let DirectDestinationIdentity::Existing(binding) =
+            calls.prepared_direct_destination(OccurrenceOrdinal(destination))?
+        else { return None };
+        Some((cfg.primary_call_point(OccurrenceOrdinal(call))?, binding))
+    }
+
     pub(crate) fn place_ordinal(&self, place: &ScalarPlace) -> Option<usize> {
         self.proof_nodes.places.get(&std::ptr::from_ref(place)).map(|ordinal| ordinal.0)
     }

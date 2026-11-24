@@ -351,6 +351,8 @@ impl<'a> ScalarInferenceBuilder<'a> {
                             !self.index_root_is_raw(base)
                                 && !matches!(index.as_ref(), ScalarExpression::Integer { value, .. }
                                     if value >= &0.into() && value < &(*length).into()),
+                        Some(ScalarType::RuntimeArray { .. }) =>
+                            matches!(base.as_ref(), ScalarPlace::Name { .. }),
                         _ => false,
                     },
                     ScalarPlace::Dereference { pointer, .. } => self.occurrences.expressions

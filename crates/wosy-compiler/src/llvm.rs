@@ -126,6 +126,12 @@ impl<'ctx, 'module> ProjectNames<'ctx, 'module> {
     }
 }
 
+#[derive(Clone, Copy)]
+enum LocalRuntimeExtent<'ctx> {
+    Construction(inkwell::values::IntValue<'ctx>),
+    ManagedLengthSlot(PointerValue<'ctx>),
+}
+
 struct EmitState<'ctx, 'module> {
     prepared_render: bool,
     require_release_checked_access: bool,
@@ -161,6 +167,12 @@ struct EmitState<'ctx, 'module> {
     runtime_array_owners: BTreeMap<String, bool>,
     runtime_array_allocations: BTreeMap<String, bool>,
     runtime_array_lengths: BTreeMap<String, PointerValue<'ctx>>,
+    // Exact emitted storage identity: shadowed/unproved bindings cannot
+    // reuse this extent by name, and scoped restoration naturally selects
+    // only the backing (or paired replacement slot) still installed.
+    local_runtime_extents: HashMap<PointerValue<'ctx>, (wosy_syntax::ByteSpan, LocalRuntimeExtent<'ctx>)>,
+    indexed_runtime_allocations: BTreeSet<(u32, u32)>,
+
     runtime_array_live: BTreeMap<String, PointerValue<'ctx>>,
     mutable_runtime_allocations: BTreeSet<(u32, u32)>,
     invalidations: BTreeMap<
@@ -197,28 +209,65 @@ enum CheckedAssignmentOwner {
     Borrowed,
 }
 
-fn mutable_runtime_allocations(reference_cfg: &ScalarReferenceCfg) -> BTreeSet<(u32, u32)> {
-    let mut result = BTreeSet::new();
+fn runtime_allocation_access(
+    reference_cfg: &ScalarReferenceCfg,
+    body_nodes: Option<&CallableBodyCallNodes<'_>>,
+    plan: Option<&crate::scalar::ClosedBody>,
+    checked_access: bool,
+) -> (BTreeSet<(u32, u32)>, BTreeSet<(u32, u32)>) {
+    let mut mutable = BTreeSet::new();
+    let mut indexed = BTreeSet::new();
+    let mut unproved_writes = BTreeSet::new();
+    let key = |span: wosy_syntax::ByteSpan| (span.start, span.end);
+    let mut same_backing_writes = HashMap::new();
+    if let (true, Some(nodes), Some(plan)) = (checked_access, body_nodes, plan) {
+        for (&call, &destination) in &plan.same_array_rebinds {
+            if let Some((producer, binding)) = nodes.existing_array_rebind_event(reference_cfg, call, destination) {
+                same_backing_writes.insert(producer, binding);
+            }
+        }
+    }
+    let mut record_index = |place: &crate::scalar::ReferencePlaceId| {
+        if checked_access && matches!(&place.place, crate::ScalarPlace::Index { base, .. }
+            if matches!(base.as_ref(), crate::ScalarPlace::Name { .. }))
+            && reference_cfg.allocations.contains(&place.binding)
+        {
+            indexed.insert(key(place.declaration_span));
+        }
+    };
     for point in &reference_cfg.points {
         match &point.kind {
-            CfgPointKind::Assign { target, .. } if target.projections.is_empty() => {
-                result.insert((target.declaration_span.start, target.declaration_span.end));
+            CfgPointKind::Assign { target, rhs_point, .. } if target.projections.is_empty() => {
+                let id = key(target.declaration_span);
+                mutable.insert(id);
+                if checked_access && reference_cfg.allocations.contains(&target.binding)
+                    && same_backing_writes.get(rhs_point) != Some(&&target.binding)
+                {
+                    unproved_writes.insert(id);
+                }
             }
             CfgPointKind::Release {
                 target: ReleaseTarget::Checked { candidates, .. },
             }
             | CfgPointKind::Invalidate { candidates, .. } => {
                 for candidate in candidates {
-                    result.insert((
-                        candidate.place.declaration_span.start,
-                        candidate.place.declaration_span.end,
-                    ));
+                    let id = key(candidate.place.declaration_span);
+                    mutable.insert(id);
+                    if checked_access && reference_cfg.allocations.contains(&candidate.place.binding) {
+                        unproved_writes.insert(id);
+                    }
                 }
+            }
+            CfgPointKind::Assign { target, .. } => record_index(target),
+            CfgPointKind::Borrow { place, .. } => record_index(place),
+            CfgPointKind::ReadPlace { pointer_point: None, candidates, .. } => {
+                for place in candidates { record_index(place); }
             }
             _ => {}
         }
     }
-    result
+    indexed.retain(|id| !unproved_writes.contains(id));
+    (mutable, indexed)
 }
 
 fn resolved_invalidations(
@@ -1650,13 +1699,20 @@ fn store_binding_outputs<'ctx, 'module>(
             None => take_basic(emit_typed_expression(context, state, length, &ScalarType::U64)?)?
                 .into_int_value(),
         };
-        let slot = emit_runtime_array_allocation(context, state, element, length)?;
-        aggregate_transfer::record_allocation(state, binding, &receiver.name, slot)?;
+        let declaration = (receiver.name_span.start, receiver.name_span.end);
+        let mutable = state.mutable_runtime_allocations.contains(&declaration);
         let private_literal = aggregate_transfer::has_literal_array_plan(state);
-        if !state
-            .mutable_runtime_allocations
-            .contains(&(receiver.name_span.start, receiver.name_span.end))
-        {
+        let checked_extent = state.require_release_checked_access
+            && state.body_call_nodes.is_some_and(|nodes| nodes.binding_position(binding).is_some())
+            && state.indexed_runtime_allocations.contains(&declaration);
+        let slot = ownership::emit_runtime_array_allocation_with_domain(
+            context, state, element, length, checked_extent,
+        )?;
+        aggregate_transfer::record_allocation(state, binding, &receiver.name, slot)?;
+        if !mutable {
+            if checked_extent {
+                state.local_runtime_extents.insert(slot, (receiver.name_span, LocalRuntimeExtent::Construction(length)));
+            }
             state
                 .storage
                 .insert(receiver.name.clone(), (slot, receiver.ty.clone()));
@@ -1702,6 +1758,9 @@ fn store_binding_outputs<'ctx, 'module>(
             aggregate_transfer::record_failure_allocation(state, binding, &receiver.name, slot, live)?;
             state.runtime_array_live.insert(receiver.name.clone(), live);
             state.runtime_array_owners.insert(receiver.name.clone(), true);
+        }
+        if checked_extent {
+            state.local_runtime_extents.insert(backing, (receiver.name_span, LocalRuntimeExtent::ManagedLengthSlot(length_slot)));
         }
         state
             .storage
@@ -2059,6 +2118,8 @@ fn emit_function<'ctx, 'module>(
     let joined_bindings = joined_return_binding_types(function, &branch_return_outputs)?;
     let joined_assignment_owners =
         joined_assignment_owners(function.span, reference_cfg, &joined_bindings)?;
+    let (mutable_runtime_allocations, indexed_runtime_allocations) =
+        runtime_allocation_access(reference_cfg, body_call_nodes, aggregate_plan, require_release_checked_access);
     let mut state = EmitState {
         prepared_render,
         require_release_checked_access,
@@ -2104,8 +2165,10 @@ fn emit_function<'ctx, 'module>(
         runtime_array_owners: BTreeMap::new(),
         runtime_array_allocations: BTreeMap::new(),
         runtime_array_lengths: BTreeMap::new(),
+        local_runtime_extents: HashMap::new(),
+        indexed_runtime_allocations,
         runtime_array_live: BTreeMap::new(),
-        mutable_runtime_allocations: mutable_runtime_allocations(reference_cfg),
+        mutable_runtime_allocations,
         invalidations: resolved_invalidations(reference_cfg)?,
         automatic_return_result_owners: BTreeMap::new(),
         globals: &names.globals,
@@ -2279,6 +2342,8 @@ fn emit_main<'ctx, 'module>(
         runtime_array_owners: BTreeMap::new(),
         runtime_array_allocations: BTreeMap::new(),
         runtime_array_lengths: BTreeMap::new(),
+        local_runtime_extents: HashMap::new(),
+        indexed_runtime_allocations: BTreeSet::new(),
         runtime_array_live: BTreeMap::new(),
         mutable_runtime_allocations: BTreeSet::new(),
         invalidations: BTreeMap::new(),
@@ -2387,6 +2452,8 @@ fn emit_project_function<'ctx, 'module>(
     let joined_bindings = joined_return_binding_types(function, &branch_return_outputs)?;
     let joined_assignment_owners =
         joined_assignment_owners(function.span, reference_cfg, &joined_bindings)?;
+    let (mutable_runtime_allocations, indexed_runtime_allocations) =
+        runtime_allocation_access(reference_cfg, body_call_nodes, aggregate_plan, project_names.require_release_checked_access);
     let mut state = EmitState {
         prepared_render,
         require_release_checked_access: project_names.require_release_checked_access,
@@ -2432,8 +2499,10 @@ fn emit_project_function<'ctx, 'module>(
         runtime_array_owners: BTreeMap::new(),
         runtime_array_allocations: BTreeMap::new(),
         runtime_array_lengths: BTreeMap::new(),
+        local_runtime_extents: HashMap::new(),
+        indexed_runtime_allocations,
         runtime_array_live: BTreeMap::new(),
-        mutable_runtime_allocations: mutable_runtime_allocations(reference_cfg),
+        mutable_runtime_allocations,
         invalidations: resolved_invalidations(reference_cfg)?,
         automatic_return_result_owners: BTreeMap::new(),
         globals: &names.globals,
@@ -2632,6 +2701,8 @@ fn emit_project_main<'ctx, 'module>(
         runtime_array_owners: BTreeMap::new(),
         runtime_array_allocations: BTreeMap::new(),
         runtime_array_lengths: BTreeMap::new(),
+        local_runtime_extents: HashMap::new(),
+        indexed_runtime_allocations: BTreeSet::new(),
         runtime_array_live: BTreeMap::new(),
         mutable_runtime_allocations: BTreeSet::new(),
         invalidations: BTreeMap::new(),

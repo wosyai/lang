@@ -405,8 +405,18 @@ pub(super) fn place_pointer<'ctx, 'module>(
             ) {
                 return Err("LLVM indexed place requires an array".to_owned());
             }
+            let runtime_extent = if matches!(&base_type, ScalarType::RuntimeArray { .. }) {
+                // Snapshot the extent paired with this base before a selector
+                // expression may evaluate arbitrary calls or local assignments.
+                capture_local_runtime_extent(context, state, base, base_pointer)?
+            } else {
+                None
+            };
             let index = emit_place_index(context, state, index, project)?;
             if let ScalarType::RuntimeArray { element, .. } = base_type {
+                if let Some(extent) = runtime_extent {
+                    check_release_index(state, index, extent)?;
+                }
                 let element = storage_type(context, &element, state.layouts, state.target_layout)?;
                 return unsafe {
                     state.builder.build_in_bounds_gep(
@@ -426,6 +436,51 @@ pub(super) fn place_pointer<'ctx, 'module>(
             fixed_array_element_pointer(context, state, &base_type, base_pointer, index, checked)
         }
     }
+}
+
+fn capture_local_runtime_extent<'ctx>(
+    context: &'ctx Context,
+    state: &EmitState<'ctx, '_>,
+    base: &crate::ScalarPlace,
+    address: PointerValue<'ctx>,
+) -> Result<Option<inkwell::values::IntValue<'ctx>>, String> {
+    let crate::ScalarPlace::Name { name, .. } = base else { return Ok(None) };
+    let Some((storage, ScalarType::RuntimeArray { .. })) = state.storage.get(name) else {
+        return Ok(None);
+    };
+    let Some((declaration, extent)) = state.local_runtime_extents.get(storage) else {
+        // Incoming, forwarded and other unresolved extents use their existing path.
+        return Ok(None);
+    };
+    if state.body_call_nodes.and_then(|nodes| nodes.lexical_place_declaration(base)) != Some(*declaration) {
+        return Err("runtime-array index differs from its qualified local declaration".to_owned());
+    }
+    match extent {
+        LocalRuntimeExtent::Construction(length)
+            if *storage == address && state.runtime_array_allocations.get(name) == Some(&true) =>
+                Ok(Some(*length)),
+        LocalRuntimeExtent::ManagedLengthSlot(length_slot)
+            if state.runtime_array_allocations.get(name) == Some(&false)
+                && state.runtime_array_lengths.get(name) == Some(length_slot) =>
+            state.builder.build_load(context.i64_type(), *length_slot, "runtime_extent")
+                .map(|length| Some(length.into_int_value())).map_err(builder_error),
+        _ => Err("indexed runtime allocation lost its sealed extent identity".to_owned()),
+    }
+}
+
+fn check_release_index<'ctx>(
+    state: &EmitState<'ctx, '_>,
+    index: inkwell::values::IntValue<'ctx>,
+    count: inkwell::values::IntValue<'ctx>,
+) -> Result<(), String> {
+    if index.get_zero_extended_constant().zip(count.get_zero_extended_constant())
+        .is_some_and(|(index, count)| index < count)
+    {
+        return Ok(());
+    }
+    let access = state.project_names.and_then(|names| names.checked_access.as_ref())
+        .ok_or_else(|| "index lacks its prepared release bounds helper".to_owned())?;
+    emit_checked_access_call(state, &access.in_extent, &[index.into(), count.into()])
 }
 
 fn fixed_index_has_raw_root(state: &EmitState<'_, '_>, mut place: &crate::ScalarPlace) -> bool {
@@ -520,8 +575,8 @@ fn check_fixed_index<'ctx>(
         return Ok(());
     }
     let count = context.i64_type().const_int(length, false);
-    if let Some(access) = state.project_names.and_then(|names| names.checked_access.as_ref()) {
-        return emit_checked_access_call(state, &access.in_extent, &[index.into(), count.into()]);
+    if state.project_names.and_then(|names| names.checked_access.as_ref()).is_some() {
+        return check_release_index(state, index, count);
     }
     if state.require_release_checked_access {
         return Err("fixed-array index lacks its prepared release helper".to_owned());
