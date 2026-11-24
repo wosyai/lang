@@ -11209,6 +11209,8 @@ fn array_len_does_not_invent_missing_extent_or_accept_nonarrays() {
             "core.array_len requires an exact local array extent"),
         ("u64(u8) observed = fn(value) { core.array_len(&value) };",
             "core.array_len requires the shared address of a named array place"),
+        ("u64() observed = fn { core.array_len(null) };",
+            "core.array_len requires the shared address of a named array place"),
         ("u64(u64) observed = fn(count) { u8[count] bytes; u8[] carried = bytes; carried; core.array_len(&bytes) };",
             "core.array_len requires an exact local array extent"),
     ] {
@@ -11269,6 +11271,57 @@ replace(7);
                     assert!(llvm.contains(&format!("define ptr @{producer}(")), "{llvm}");
                     assert!(caller.contains(&format!("call ptr @{producer}(")), "{caller}");
                     assert!(!caller.contains("%array_descriptor_extent"), "{caller}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn returned_array_extent_is_observed_only_after_closed_grounded_replacement() {
+    let text = "%%start
+u8[](u64) fabricate = fn(count) { u8[count] fresh; fresh };
+u64(u64) replace = fn(count) {
+    u8[2] bytes;
+    bytes = fabricate(count);
+    core.array_len(&bytes)
+};
+if (replace(7) != 7) { core.system_panic(); };
+%%end";
+    let exposed = text.replace("if (replace(7)", "u8[] ordinary = fabricate(5); ordinary;
+if (replace(7)");
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        for (closed, text) in [(true, text), (false, exposed.as_str())] {
+            let prepared = prepare_initializer_test(text, layout);
+            let checked = analyze_scalar_build(&prepared);
+            assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+            let source = &prepared.project().modules[0].source;
+            for (project, llvm) in [
+                (false, emit_scalar_build_single_module_llvm(&checked)),
+                (true, emit_scalar_build_project_llvm(&checked)),
+            ] {
+                if !closed {
+                    assert!(matches!(llvm, Err(error) if error.contains("core.array_len requires a closed exact returned array extent")));
+                    continue;
+                }
+                let llvm = llvm.unwrap().to_text();
+                let caller = self_tail_test_body(&llvm, "i64", &self_tail_test_symbol(source, project, "replace"));
+                let paired = caller.find("%array_descriptor_extent = extractvalue { ptr, i64 } %array_descriptor, 1")
+                    .expect("exact returned extent");
+                let install = caller.find("store i64 %array_descriptor_extent, ptr %bytes_length")
+                    .expect("install returned extent");
+                let observe = caller.find("%runtime_extent = load i64, ptr %bytes_length")
+                    .expect("observe exact installed extent");
+                let release_returned = caller.find("call void @__wosy_core_free(ptr %array_descriptor_backing)")
+                    .expect("release returned original backing");
+                assert!(paired < install && install < observe && observe < release_returned, "{caller}");
+                assert!(caller.contains("ret i64 %runtime_extent"), "{caller}");
+                if let Some(out) = std::env::var_os("WOSY_RETURNED_ARRAY_LEN_IR_DIR") {
+                    let target = if layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
+                    let route = if project { "project" } else { "standalone" };
+                    let controlled = llvm.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);
+                    assert_ne!(controlled, llvm);
+                    std::fs::write(std::path::PathBuf::from(out).join(format!("{target}-{route}-control.ll")), controlled).unwrap();
                 }
             }
         }

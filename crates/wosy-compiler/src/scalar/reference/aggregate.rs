@@ -17,6 +17,7 @@ pub(super) struct AggregateFlowFacts {
     pub(super) literal_array_other_write: Option<LiteralArrayWrite>,
     pub(super) literal_array_unit: Option<LiteralArrayUnit>,
     pub(super) literal_array_value: Option<(CfgPointId, OccurrenceOrdinal)>,
+    pub(super) literal_array_extent_output: Option<(CfgPointId, OccurrenceOrdinal)>,
     pub(super) views: BTreeMap<CfgPointId, CfgPointId>,
     pub(super) plain_literals: BTreeSet<CfgPointId>,
     pub(super) carrier_literals: BTreeSet<CfgPointId>,
@@ -692,6 +693,10 @@ enum LiteralArrayPhase {
     ArgumentRead(CfgPointId),
     Call(CfgPointId),
     Replaced,
+    ExtentBorrow(CfgPointId),
+    ExtentValue(CfgPointId),
+    ExtentOutput,
+    ExtentExit(CfgPointId),
     Finished,
     Unknown,
 }
@@ -1222,6 +1227,7 @@ pub(super) struct AggregateFlowResult {
     immediate_receipt_reads: BTreeMap<CfgPointId, Option<(OccurrenceOrdinal, CfgPointId, CfgPointId)>>,
     literal_array_route: Option<LiteralArrayRoute>,
     literal_array_unknown: bool,
+    pub(super) literal_array_extent_required: Option<OccurrenceOrdinal>,
     literal_array_join: LiteralArrayJoin,
     pub(super) checked_backing_forward_candidate: Option<(OccurrenceOrdinal, CfgPointId, CfgPointId)>,
     pub(super) checked_backing_forward: Option<(OccurrenceOrdinal, CfgPointId)>,
@@ -1467,7 +1473,7 @@ impl AggregateFlowResult {
     }
 
     pub(super) fn has_observations(&self) -> bool {
-        self.proved_literal_array_route_ref().is_some()
+        self.literal_array_extent_required.is_some() || self.proved_literal_array_route_ref().is_some()
             || (self.checked_producer_authoritative && !self.checked_producer_backing.is_empty())
             || self.checked_backing_assignment.is_some() || self.checked_backing_forward.is_some()
             || self.scalar_descriptor_assignment.is_some() || self.fresh_recommit_leaf.is_some() || !self.array_returns.is_empty() || !self.array_rebinds.is_empty()
@@ -1712,6 +1718,30 @@ impl AggregateFlowFacts {
                     if call == *rhs_point && &target.binding == binding && target.projections.is_empty()
                         && active_write.is_some_and(|write|
                             write.rhs == *rhs_point && write.writer == point.id) => Replaced,
+                (Replaced, CfgPointKind::Borrow { place, loan })
+                    if root && unit.is_none() && &place.binding == binding && place.projections.is_empty()
+                        && loan.mode == ScalarReferenceMutability::Shared
+                        && self.literal_array_extent_output.is_some_and(|(call, _)| point.successors.as_slice() == [call]) =>
+                    ExtentBorrow(point.id),
+                (ExtentBorrow(borrow), CfgPointKind::Call { output: 0,
+                    target: ResolvedCallTarget::Core(CoreOperationId::ArrayLen), argument_points, .. })
+                    if argument_points.as_slice() == [borrow]
+                        && self.literal_array_extent_output.is_some_and(|(call, _)| point.id == call) =>
+                    ExtentValue(point.id),
+                (ExtentValue(call), CfgPointKind::ReturnOutput { output: 0, value_point, checked: false })
+                    if *value_point == call => ExtentOutput,
+                (ExtentOutput, CfgPointKind::ScopeExit) if root => ExtentExit(point.id),
+                (ExtentExit(exit), CfgPointKind::Return) if point.successors.is_empty() => {
+                    if let (Some(write), Some(&block)) =
+                        (self.literal_array_write, self.scope_exits.get(&exit))
+                    {
+                        completed = Some(LiteralArrayRoute::Replacement { original: allocation,
+                            write, exit, block, unit: None });
+                        Finished
+                    } else {
+                        Unknown
+                    }
+                }
                 (phase @ (Replaced | JoinedOriginal | JoinedFresh | JoinedOtherFresh), CfgPointKind::ScopeExit)
                     if root && point.successors.is_empty()
                         && (unit.is_none() == (phase == Replaced)) =>
@@ -2886,6 +2916,7 @@ pub(crate) struct ClosedBody {
     pub(crate) fresh_array_recommits: BTreeMap<usize, ClosedFreshRecommit>,
     pub(crate) local_array_failure: Option<ClosedLocalArrayRelease>,
     pub(crate) literal_array: Option<ClosedLiteralArray>,
+    pub(crate) replacement_extent_observation: Option<usize>,
     pub(crate) array_descriptor_return: bool,
     pub(crate) array_descriptor_calls: BTreeSet<usize>,
     // Each exit's owning formals, in ascending declared slot order.
@@ -6183,6 +6214,7 @@ fn closed_aggregates<'a>(
     let mut input_users = BTreeMap::<(BodyKey, usize), Vec<(BodyKey, CfgPointId, usize, ArgumentProvenance, &BTreeSet<Option<InputOrigin>>) >>::new();
     let mut array_callsites = Vec::new();
     let mut literal_array_callers = Vec::new();
+    let mut returned_extent_requirements = Vec::new();
     let mut array_leaves = BTreeSet::new();
     let mut array_neighbors = BTreeMap::<BodyKey, BTreeSet<BodyKey>>::new();
     let mut result = ClosedAggregates::default();
@@ -6190,6 +6222,9 @@ fn closed_aggregates<'a>(
         if let Some(facts) = body.facts {
             // Borrow only completed caller proofs during this existing pass.
             // BTreeMap order preserves enrollment precedence at finalization.
+            if let Some(occurrence) = facts.literal_array_extent_required {
+                returned_extent_requirements.push((key, body.source, occurrence));
+            }
             if let Some(route) = facts.proved_literal_array_caller(key, body.is_monomorphic) {
                 literal_array_callers.push((key, body, route));
             }
@@ -6483,6 +6518,15 @@ fn closed_aggregates<'a>(
     let finalize_cohorts = |mut result: ClosedAggregates| -> Result<ClosedAggregates, String> {
         install_literal_array_plans(&literal_array_callers, &bodies, &declarations, &mut result);
         ordinary.seal_array_descriptors(&mut result);
+        for &(key, source, occurrence) in &returned_extent_requirements {
+            let closed = result.bodies.get_mut(&key).filter(|plan|
+                matches!(plan.literal_array, Some(ClosedLiteralArray::Replacement { call, unit: None, .. })
+                    if plan.array_descriptor_calls.contains(&call)));
+            let Some(plan) = closed else {
+                return Err(format!("core.array_len requires a closed exact returned array extent in {source:?}"));
+            };
+            plan.replacement_extent_observation = Some(occurrence.0);
+        }
         install_fresh_recursive_recommits(reservations, &module_at, &bodies, &declarations, &mut result)?;
         ordinary.install(&module_at, &mut result)?;
         Ok(result)

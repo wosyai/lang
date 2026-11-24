@@ -445,8 +445,10 @@ pub(super) fn place_pointer<'ctx, 'module>(
 pub(super) fn emit_array_len<'ctx>(
     context: &'ctx Context,
     state: &mut EmitState<'ctx, '_>,
+    expression: &ScalarExpression,
     arguments: &[ScalarExpression],
 ) -> Result<EmitValue<'ctx>, String> {
+    super::aggregate_transfer::check_replacement_extent_observation(state, expression)?;
     let [ScalarExpression::CheckedAddress { place, .. }] = arguments else {
         return Err("core.array_len lacks a prepared named array address".into());
     };

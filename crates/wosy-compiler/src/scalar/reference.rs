@@ -4747,9 +4747,25 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         );
                     }
                     self.record_binding_definition(position, 0, binding.is_allocation, initializer);
-                    if binding.is_allocation && region.items.len() == 2
+                    // The existing birth observer is selected while still at
+                    // the allocation, before the write or final result is visited.
+                    // Use the prepared final-output role to opt in only the new
+                    // exact three-item scalar observation corridor.
+                    let returned_extent_tail = scope == ReferenceScopeId(0)
                         && matches!(calls.boundary.root_outputs.as_slice(),
-                            [] | [RootOutputType { output: 0, ty: ScalarType::RuntimeArray { .. } }])
+                            [RootOutputType { output: 0, ty: ScalarType::U64 }])
+                        && matches!((region.items.as_slice(), block.items.as_slice()),
+                            ([_, BlockItem { kind: BlockItemKind::Assignment { .. }, .. },
+                                BlockItem { kind: BlockItemKind::FinalOutput(slot), .. }],
+                             [_, _, ScalarBlockItem::Expression(expression)])
+                                if slot.output == 0
+                                    && matches!(expression, ScalarExpression::Call { .. })
+                                    && matches!(self.call_target(expression, slot.expression),
+                                        Ok(ResolvedCallTarget::Core(CoreOperationId::ArrayLen))));
+                    if binding.is_allocation
+                        && (returned_extent_tail || (region.items.len() == 2
+                            && matches!(calls.boundary.root_outputs.as_slice(),
+                                [] | [RootOutputType { output: 0, ty: ScalarType::RuntimeArray { .. } }])))
                     {
                         self.observe_literal_array_bind(
                             position, scope, binding, &binding_region.initialization, initializer,
@@ -4797,6 +4813,23 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     let value_point = self.cursor.expect("evaluated output expression");
                     self.move_value(expression, scope, ordinal)?;
                     if let BlockItemKind::FinalOutput(slot) = kind {
+                        if scope == ReferenceScopeId(0) && slot.output == 0
+                            && self.aggregate_facts.literal_array_unit.is_none()
+                            && self.aggregate_facts.literal_array_write.is_some()
+                            && matches!(calls.boundary.root_outputs.as_slice(), [output] if output.ty == ScalarType::U64)
+                            && matches!(&self.cfg.points[value_point.0].kind, CfgPointKind::Call {
+                                target: ResolvedCallTarget::Core(CoreOperationId::ArrayLen), argument_points, ..
+                            } if matches!(argument_points.as_slice(), [borrow] if
+                                matches!(&self.cfg.points[borrow.0].kind, CfgPointKind::Borrow { place, .. }
+                                    if place.projections.is_empty() && self.aggregate_facts.allocations.get(&place.binding)
+                                        .is_some_and(|bind| self.aggregate_facts.literal_array_bind.is_some_and(|allocation| allocation.bind == *bind)))))
+                        {
+                            // Only pending authority: exact receipt replay and the
+                            // all-use transported ABI must close this occurrence
+                            // before any LLVM declaration can be emitted.
+                            self.aggregate_facts.literal_array_extent_output = Some((value_point, slot.expression));
+                            self.proof_points.pending_returned_extent = Some(value_point);
+                        }
                         if scope == ReferenceScopeId(0) && slot.output == 0
                             && self.aggregate_facts.literal_array_bind.is_some()
                             && matches!(&self.cfg.points[value_point.0].kind, CfgPointKind::Read { binding }
@@ -7446,6 +7479,7 @@ struct ReferenceTransferCfg<'a> {
     checked_join_values: &'a [(CfgPointId, [Option<CfgPointId>; 2])],
     checked_block_values: &'a [(CfgPointId, CfgPointId)],
     array_length_owners: Option<&'a HashSet<ReferenceBindingId>>,
+    pending_returned_extent: Option<CfgPointId>,
     fallible_allocation_bindings: Option<&'a HashMap<ReferenceBindingId, super::control::GuardedAllocationBinding>>,
     fallible_aliases: Option<&'a HashMap<ReferenceBindingId, ReferenceBindingId>>,
     guarded_allocation_edges: Option<&'a BTreeMap<CfgPointId, super::control::GuardedAllocationEdge>>,
@@ -7481,6 +7515,7 @@ impl<'a> ReferenceTransferCfg<'a> {
             allocations: &cfg.allocations,
             checked_join_values: proof.map_or(&[], |proof| &proof.checked_join_values),
             checked_block_values: proof.map_or(&[], |proof| &proof.checked_block_values),
+            pending_returned_extent: proof.and_then(|proof| proof.pending_returned_extent),
             array_length_owners: proof.map(|proof| &proof.array_length_owners).filter(|owners| !owners.is_empty()),
             fallible_allocation_bindings: proof.and_then(|proof| proof.fallible_allocation_bindings.as_ref()),
             fallible_aliases: proof.map(|proof| &proof.fallible_aliases).filter(|aliases| !aliases.is_empty()),
@@ -10518,7 +10553,8 @@ fn transfer_reference_facts(
                                 if !state.released.contains(&place.binding)
                                     && !state.invalidated.contains(&place.binding)
                                     && !state.uninitialized.contains(&place.binding)
-                                    && !state.replaced_array_extents.contains(&place.binding)
+                                    && (!state.replaced_array_extents.contains(&place.binding)
+                                        || cfg.pending_returned_extent == Some(id))
                                     && !state.moved.iter().any(|(moved, _)| moved.binding == place.binding
                                         && moved.projections.is_empty())));
                         if !live {
@@ -15411,6 +15447,7 @@ fn derive_function_specialized_copy_policies<'a>(
                     allocations: &template_cfg.allocations,
                     checked_join_values: &template_result.proof_points.checked_join_values,
                     checked_block_values: &template_result.proof_points.checked_block_values,
+                    pending_returned_extent: template_result.proof_points.pending_returned_extent,
                     array_length_owners: Some(&template_result.proof_points.array_length_owners).filter(|owners| !owners.is_empty()),
                     fallible_allocation_bindings: template_result.proof_points.fallible_allocation_bindings.as_ref(),
                     fallible_aliases: Some(&template_result.proof_points.fallible_aliases).filter(|aliases| !aliases.is_empty()),
@@ -16295,6 +16332,8 @@ fn build_function_reference_cfg(
         aggregate.local_array_failure_arms.clear();
         aggregate.checked_producer_backing.clear();
     }
+    aggregate.literal_array_extent_required = builder.aggregate_facts.literal_array_extent_output
+        .map(|(_, occurrence)| occurrence);
     aggregate.array_calls = builder.aggregate_facts.array_calls;
     aggregate.checked_result_origins = builder.checked_result_origins;
     if (2..=aggregate::MAX_LOCAL_CHOICE_LEAVES).contains(&builder.aggregate_facts.calls.len()) {

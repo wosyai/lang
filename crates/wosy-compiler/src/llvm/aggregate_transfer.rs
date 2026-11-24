@@ -672,6 +672,20 @@ pub(super) fn capture_checked_array_argument_extent<'ctx>(
     Ok(())
 }
 
+pub(super) fn check_replacement_extent_observation(
+    state: &EmitState<'_, '_>,
+    expression: &ScalarExpression,
+) -> Result<(), String> {
+    let Some(aggregate) = &state.aggregate else { return Ok(()) };
+    let Some(expected) = aggregate.plan.replacement_extent_observation else { return Ok(()) };
+    if state.body_call_nodes.and_then(|nodes| nodes.expression_ordinal(expression)) == Some(expected)
+        && !matches!(aggregate.literal_array_receipt, LiteralArrayReceipt::Fresh { joined_storage: None, .. })
+    {
+        return Err("returned extent observation must follow its sealed replacement".into());
+    }
+    Ok(())
+}
+
 pub(super) fn install_literal_array_replacement<'ctx>(
     context: &'ctx Context,
     state: &mut EmitState<'ctx, '_>,
