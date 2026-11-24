@@ -875,6 +875,37 @@ def state_report(code, label, selected, extra=""):
     return ('{ .stdout = ""; .stderr = "'+label+'"; .code = '+str(code)
             +'; .files = [{ .path = "state.json"; .state = '+selected+'; }'+extra+']; }')
 
+projected_local_copy = f"""%%start
+    i8(i8) transfer = fn(entry) {{
+        i8 changed = 2;
+        i8 previous = changed;
+        changed = entry;
+        if (previous == 2) {{ changed }} else {{ 0 }}
+    }};
+    unit(i8) check = fn(input) {{
+        i8 output = transfer(input);
+        if (output == 3) {{
+            core.require(input == 3, {report(200,"WRONG-INPUT")});
+            core.require(input != 3, {state_report(201,"COPY-IDENTITY","input",', { .path = "result.json"; .state = output; }')});
+        }};
+    }};
+    %%end"""
+projected_local_copy_formal = f"""%%start
+    i8(i8) transfer = fn(entry) {{
+        i8 ordinary = 2;
+        entry = ordinary;
+        entry
+    }};
+    unit(i8) check = fn(input) {{
+        core.require(input > 127, {report(202,"COPY-PRIOR-UNPUBLISHED")});
+        i8 output = transfer(input);
+        core.require(output != 2, {report(203,"COPY-FORMAL-UNPUBLISHED")});
+    }};
+    %%end"""
+cases.extend([
+    ("projected-returning-local-copy-identity",projected_local_copy,201,b"COPY-IDENTITY"),
+    ("projected-returning-local-copy-refuses-formal",projected_local_copy_formal,2,b"unsupported analysis"),
+])
 projected_scalar_narrow = f"""%%start
     i8(i8) retain = fn(entry) {{
         core.narrow(entry >= 2, {report(190,"NARROW-UNEXPECTED")});
@@ -1185,6 +1216,10 @@ cases.extend([
 ])
 holes_bytes = b'{"type":{"kind":"i8"},"value":{"kind":"alternatives","values":[1,3]}}\n'
 authored_files = {
+    "projected-returning-local-copy-identity": {
+        "state.json": b'{"type":{"kind":"i8"},"value":3}\n',
+        "result.json": b'{"type":{"kind":"i8"},"value":3}\n',
+    },
     "exact-startup-conditional-local-write-ignores-unreached-arm": {
         "state.json": b'{"type":{"kind":"i8"},"value":2}\n',
     },
@@ -1286,6 +1321,8 @@ with tempfile.TemporaryDirectory(prefix="affine-calls-") as path:
                         assert b"NEVER-SCALAR-WRITE" not in res.stderr,res
                     if name == "exact-startup-conditional-local-write-rejects-reached-effect":
                         assert b"PRIOR" not in res.stderr and b"ARM-EFFECT" not in res.stderr,res
+                    if name == "projected-returning-local-copy-refuses-formal":
+                        assert b"COPY-PRIOR-UNPUBLISHED" not in res.stderr and b"COPY-FORMAL-UNPUBLISHED" not in res.stderr,res
                 else:
                     assert res.stderr==expected_stderr,res
                 files = authored_files.get(name, {}) if included else {}

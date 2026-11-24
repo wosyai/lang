@@ -1438,6 +1438,8 @@ struct IntegerRoots<'a> {
     #[cfg(feature = "internal-checker")]
     projected_narrow_integer: bool,
     #[cfg(feature = "internal-checker")]
+    projected_scalar_local_copy: bool,
+    #[cfg(feature = "internal-checker")]
     allow_ordinary_contextual_places: bool,
     #[cfg(feature = "internal-checker")]
     ordinary_local_work: Option<usize>,
@@ -5001,6 +5003,13 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
             }
             BlockItemKind::Assignment { group } => {
                 #[cfg(feature = "internal-checker")]
+                if roots.projected_scalar_local_copy {
+                    if let Some(copy) = projected_scalar_local_copy(calls, group) {
+                        path = apply_projected_scalar_local_copy(roots, path, copy)?;
+                        continue;
+                    }
+                }
+                #[cfg(feature = "internal-checker")]
                 if roots.exact_returning_local_writes {
                     path = exact_returning_local_write(calls, roots, group, path)?;
                     continue;
@@ -5498,6 +5507,15 @@ impl<'a> ExactCallCursor<'a> {
         }
         self.allow_empty_integer = true;
         self.roots.projected_narrow_integer = true;
+        Some(())
+    }
+
+    #[cfg(feature = "internal-checker")]
+    pub(super) fn allow_projected_scalar_local_copy(&mut self) -> Option<()> {
+        if self.projected_slot != Some(0) || self.projected_pair.is_some() || !self.tail.is_some_and(is_integer_type) {
+            return None;
+        }
+        self.roots.projected_scalar_local_copy = true;
         Some(())
     }
 
@@ -6268,6 +6286,47 @@ impl IntegerInputs {
         }
         Some(self)
     }
+}
+
+#[cfg(feature = "internal-checker")]
+struct ProjectedScalarLocalCopy<'a> {
+    destination: &'a ReferenceBindingId,
+    source: &'a ReferenceBindingId,
+    ty: &'a ScalarType,
+}
+
+#[cfg(feature = "internal-checker")]
+fn projected_scalar_local_copy(calls: &FunctionCallSites, position: BlockPosition) -> Option<ProjectedScalarLocalCopy<'_>> {
+    let (destination, ty, rhs, place) = checked_scalar_assignment(calls, position)?;
+    let structure = &calls.structure;
+    if !is_integer_type(ty) && *ty != ScalarType::Bool
+        || structure.checked_types.expressions.get(&rhs)? != ty
+        || structure.checker_contextual_occurrences.contains(&place)
+        || structure.checker_contextual_occurrences.contains(&rhs)
+    {
+        return None;
+    }
+    let PlainNameIdentity::Lexical(source) = calls.prepared_plain_name(rhs)? else { return None; };
+    Some(ProjectedScalarLocalCopy { destination, source, ty })
+}
+
+#[cfg(feature = "internal-checker")]
+fn apply_projected_scalar_local_copy(
+    roots: &mut IntegerRoots<'_>, path: IntegerInputs, copy: ProjectedScalarLocalCopy<'_>,
+) -> Option<IntegerInputs> {
+    let (destination, destination_ty) = roots.lookup(copy.destination)?;
+    let (source, source_ty) = roots.lookup(copy.source)?;
+    if destination < roots.parameters || destination_ty != copy.ty || source_ty != copy.ty {
+        return None;
+    }
+    let width = roots.axes.len();
+    let work = roots.ordinary_local_work.get_or_insert(0);
+    charge_call_work(work, width.checked_add(1)?)?;
+    let mut changes = (0..width).map(|_| None).collect::<Vec<_>>();
+    changes[destination] = Some(ParallelScalarSource::Copy(source));
+    // Rebuild equality from the old coordinates. The formal entry remains
+    // unchanged, and previous aliases of the destination do not get written.
+    path.parallel_overwrite(&changes, work)
 }
 
 #[cfg(feature = "internal-checker")]

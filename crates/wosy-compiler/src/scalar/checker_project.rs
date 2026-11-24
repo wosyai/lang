@@ -456,7 +456,7 @@ impl OrderedRunEvidence for ProofFreeOrderedEvidence {
     type SymbolicReport = ();
 
     fn complete_startup(&self, _: &HashSet<PreparedCallable>) -> Result<bool, ProjectCheck> { Ok(false) }
-    fn symbolic(&self) -> Self::Symbolic<'_> { ProofFreeSymbolic { projected_narrow: false } }
+    fn symbolic(&self) -> Self::Symbolic<'_> { ProofFreeSymbolic { ordinary_projected_effects: false } }
     fn finish_symbolic<'run>(_: Self::Symbolic<'run>) -> Self::SymbolicReport where Self: 'run {}
 }
 
@@ -788,7 +788,7 @@ fn symbolic_obligation_roots(
 
 #[cfg(feature = "internal-checker")]
 struct ProofFreeSymbolic<const ORDINARY_PROJECTIONS: bool = false> {
-    projected_narrow: bool,
+    ordinary_projected_effects: bool,
 }
 
 #[cfg(feature = "internal-checker")]
@@ -807,8 +807,8 @@ impl<const ORDINARY_PROJECTIONS: bool> ActualIntegerObserver for ProofFreeSymbol
     const ORDINARY_PROJECTED_PAIR: bool = ORDINARY_PROJECTIONS;
     const ORDINARY_INTEGER_LOCALS: bool = ORDINARY_PROJECTIONS;
 
-    fn permits_projected_integer_narrow(&self) -> bool {
-        ORDINARY_PROJECTIONS && self.projected_narrow
+    fn permits_ordinary_projected_effects(&self) -> bool {
+        ORDINARY_PROJECTIONS && self.ordinary_projected_effects
     }
 
     fn observe(&mut self, _: (usize, usize), _: &[&BigInt], _: &BigInt) {}
@@ -896,7 +896,7 @@ fn check_unused_module<const COLLECT: bool, const ENTRY_EVIDENCE: bool, Proof: S
             let collection = OrderedCallCollection { failures: &sink, visits: completed_visits, outer: None };
             let mut symbolic = CheckedCalls::<ProofFreeSymbolic<true>, false> {
                 project, calls, active: HashSet::from([(ordinal, item)]), active_depth: 1, reached: HashSet::new(),
-                had_obligations: false, observer: ProofFreeSymbolic { projected_narrow: !Proof::ENABLED }, symbolic_module: ordinal,
+                had_obligations: false, observer: ProofFreeSymbolic { ordinary_projected_effects: !Proof::ENABLED }, symbolic_module: ordinal,
             };
             let cursor = ExactCallCursor::arbitrary_root(body, &body.boundary.results[0].ty)
                 .ok_or(ProjectCheck::Unsupported)?;
@@ -1372,7 +1372,7 @@ trait ActualIntegerObserver {
     fn observe(&mut self, target: (usize, usize), arguments: &[&BigInt], value: &BigInt);
 
     #[cfg(feature = "internal-checker")]
-    fn permits_projected_integer_narrow(&self) -> bool { false }
+    fn permits_ordinary_projected_effects(&self) -> bool { false }
 
     const CONTEXTUAL: bool = false;
 
@@ -1596,7 +1596,7 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
         #[cfg(feature = "internal-checker")]
         {
             !ACTUAL_STARTUP && collecting && Observer::INTEGER_RETURN_PARTITIONS
-                && self.observer.permits_projected_integer_narrow()
+                && self.observer.permits_ordinary_projected_effects()
                 && matches!(effect, ExactCallEffect::Scalar { binding: Some(_), ty, .. } if is_integer_type(ty))
                 && body.structure.checker_has_simple_narrow && !body.structure.checker_has_nonsimple_directive
                 && body.structure.blocks.len() == 1 && body.boundary.parameters.len() == 1
@@ -1838,6 +1838,13 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             }.ok_or(ProjectCheck::Unsupported)?;
             #[cfg(feature = "internal-checker")]
             if projected_narrow { cursor.allow_empty_projected_integer().ok_or(ProjectCheck::Unsupported)?; }
+            #[cfg(feature = "internal-checker")]
+            if !ACTUAL_STARTUP && collection.is_some() && self.observer.permits_ordinary_projected_effects()
+                && matches!(effect, ExactCallEffect::Scalar { binding: Some(_), ty, .. } if is_integer_type(ty))
+                && matches!(projection.companion, ProjectedCompanion::Unary)
+            {
+                cursor.allow_projected_scalar_local_copy().ok_or(ProjectCheck::Unsupported)?;
+            }
             self.active.insert(target);
             self.active_depth += 1;
             return Ok(ExactCallActivation {
@@ -3213,7 +3220,7 @@ impl SelectedSymbolicProof<'_, '_> {
         let mut evaluator = CheckedCalls::<ProofFreeSymbolic, false> {
             project: runtime.project, calls: runtime.calls, active: HashSet::from([target]),
             active_depth: 1, reached: HashSet::new(), had_obligations: false,
-            observer: ProofFreeSymbolic { projected_narrow: false }, symbolic_module: target.0,
+            observer: ProofFreeSymbolic { ordinary_projected_effects: false }, symbolic_module: target.0,
         };
         let first_directive = effects.records.len();
         let (result, active) = {
@@ -14700,6 +14707,37 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
             %%end"#);
             assert!(matches!(run("mutual-cycle", &mutual, scope), Err(ProjectCheck::Unsupported)));
         }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn projected_returning_local_copy_keeps_its_entry_relation_and_the_old_alias() {
+        let failure_output = OUTPUT.replace(".code = 1", ".code = 88");
+        let program = format!(r#"%%start
+            i8(i8) transfer = fn(entry) {{
+                i8 changed = 2;
+                i8 previous = changed;
+                changed = entry;
+                if (previous == 2) {{ changed }} else {{ 0 }}
+            }};
+            unit(i8) check = fn(input) {{
+                i8 output = transfer(input);
+                if (output == 3) {{
+                    core.require(input == 3, {OUTPUT});
+                    core.require(input != 3, {failure_output});
+                }};
+            }};
+        %%end"#);
+        let root = source("src/main.w", "projected-local-copy-relation");
+        let prepared = prepare_proof_target(&root, &program).unwrap();
+        let report = run_closed_without_named_proofs(&prepared, ScalarCheckerScope::CurrentPackage, 1).unwrap();
+        let [failure] = report.directives.as_slice() else { panic!("reaching output == 3 must identify only the third input"); };
+        assert_eq!(failure.code(), &BigInt::from(88));
+        let three = BigInt::from(3);
+        for axis in [0, 1] {
+            assert!(failure.witness.intervals_at(0, axis).unwrap().eq([(&three, &three)]));
+        }
+        assert_eq!(failure.witness.row_equal_axes(0), Some(&[(1, 0)][..]));
     }
 
     #[cfg(feature = "internal-checker")]
