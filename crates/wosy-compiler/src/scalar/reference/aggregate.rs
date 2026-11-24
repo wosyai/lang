@@ -39,6 +39,7 @@ pub(super) struct AggregateFlowFacts {
     pub(super) installations: BTreeMap<CfgPointId, (CfgPointId, BlockPosition)>,
     receipt_aliases: BTreeSet<CfgPointId>,
     pub(super) calls: BTreeMap<CfgPointId, OccurrenceOrdinal>,
+    pub(super) multi_forwarder: bool,
     pub(super) multi_owner_calls: BTreeMap<CfgPointId, (OccurrenceOrdinal, usize)>,
     pub(super) multi_owner_projections: BTreeMap<CfgPointId, (CfgPointId, usize)>,
     pub(super) secondary_owner_calls: BTreeSet<CfgPointId>,
@@ -1243,6 +1244,7 @@ pub(super) struct AggregateFlowResult {
     pub(super) calls: BTreeMap<CfgPointId, OccurrenceOrdinal>,
     pub(super) mixed_result_calls: BTreeSet<CfgPointId>,
     multi_disqualifying_effect: bool,
+    pub(super) sealed_multi_forward: Option<(CfgPointId, Vec<usize>)>,
     pub(super) sealed_multi_result: Option<Vec<((usize, usize), usize)>>,
     pub(super) multi_selected_calls: BTreeMap<CfgPointId, (OccurrenceOrdinal, usize)>,
     pub(super) multi_result_calls: BTreeSet<CfgPointId>,
@@ -1360,6 +1362,40 @@ impl AggregateFlowResult {
             lanes.push(((block, item), authored.expression.0));
         }
         (lanes.len() == outputs.len()).then_some(lanes)
+    }
+
+    pub(super) fn multi_forward_result(&self, cfg: &ScalarReferenceCfg, sites: &FunctionCallSites)
+        -> Option<(CfgPointId, Vec<usize>)>
+    {
+        let (&call, &(_, width)) = self.multi_selected_calls.first_key_value()?;
+        let receivers = self.multi_result_bindings.get(&call)?;
+        let outputs = &sites.boundary.root_outputs;
+        if self.multi_selected_calls.len() != 1 || self.multi_result_calls.len() != 1
+            || width != receivers.len() || width != outputs.len() || width != self.returns.len()
+            || !self.allocation_slots.is_empty() || !self.calls.is_empty() || !self.unsupported.is_empty()
+            || self.multi_disqualifying_effect
+        { return None; }
+        let roots = sites.structure.blocks.get(sites.structure.root.0)?.final_outputs();
+        let mut expressions = Vec::with_capacity(width);
+        for ((&point, origins), authored) in self.returns.iter().zip(roots) {
+            let lane = expressions.len();
+            let expected = receivers.get(lane)?;
+            let CfgPointKind::ReturnOutput { output, value_point, checked: false } = cfg.initial_points.get(point.0)?.kind
+                else { return None };
+            let read = cfg.initial_points.get(value_point.0)?;
+            let moved = cfg.initial_points.get(linear_successor(&cfg.initial_points, value_point)?.0)?;
+            if output != lane || authored.output != lane
+                || !origins.iter().copied().eq([Some(OwnerSource::CallOutput(call, lane))])
+                || !matches!(&read.kind, CfgPointKind::Read { binding } if binding == expected)
+                || !matches!(&moved.kind, CfgPointKind::Move { owner, place, ty }
+                    if owner == expected && &place.binding == expected && place.projections.is_empty() && ty == &outputs[lane].ty)
+            { return None; }
+            if expressions.last().is_some_and(|&previous| previous >= authored.expression.0) {
+                return None;
+            }
+            expressions.push(authored.expression.0);
+        }
+        (expressions.len() == width).then_some((call, expressions))
     }
 
     fn return_owners<'a>(&'a self, cfg: &'a ScalarReferenceCfg, owner_lane: Option<usize>)
@@ -2566,9 +2602,13 @@ impl AggregateFlowFacts {
                         }
                     }
                 }
-                CfgPointKind::ReturnOutput { value_point, .. } => {
+                CfgPointKind::ReturnOutput { value_point, output, .. } => {
                     let return_value = state.values.get(value_point);
-                    result.account_raw(id, return_value);
+                    if !self.multi_forwarder || !matches!(return_value,
+                        Some(Value::Aggregate { backing: OwnerSource::CallOutput(_, lane), field: None }) if lane == output)
+                    {
+                        result.account_raw(id, return_value);
+                    }
                     let returning = match return_value {
                         Some(Value::Aggregate { backing, .. }) => {
                             if let OwnerSource::Formal(slot) = backing {
@@ -2646,6 +2686,7 @@ impl AggregateFlowFacts {
 pub(crate) enum ClosedReturn {
     MixedBranch,
     MultipleAllocations,
+    MultipleForward,
     MixedSelected { lanes: MixedOwnerResultLanes, call: usize, outputs: [usize; 2] },
     Allocation { block: usize, item: usize },
     Forward { call: OccurrenceOrdinal },
@@ -2830,6 +2871,7 @@ pub(crate) struct ClosedBody {
     // Source output order and strictly increasing prepared output occurrence.
     pub(crate) multi_returns: Vec<((usize, usize), usize)>,
     pub(crate) multi_receives: BTreeMap<usize, ClosedMultiReceive>,
+    pub(crate) multi_forward: Option<(usize, Vec<usize>)>,
     pub(crate) recommits: BTreeMap<usize, usize>,
     pub(crate) identity_relay: Option<usize>,
     pub(crate) scope_exits: BTreeMap<usize, CfgPointId>,
@@ -2852,6 +2894,10 @@ pub(crate) struct ClosedBody {
 }
 
 impl ClosedBody {
+    pub(crate) fn multi_return_width(&self) -> usize {
+        self.multi_forward.as_ref().map_or(self.multi_returns.len(), |(_, outputs)| outputs.len())
+    }
+
     pub(crate) fn mixed_branch_conditional(&self) -> Option<usize> {
         self.mixed_branch_return.as_ref().map(|plan| plan.shape.conditional.0)
     }
@@ -6039,6 +6085,12 @@ fn closed_aggregates<'a>(
         if !body.is_monomorphic || key.2.is_some() { return None; }
         Some((key, body.facts?.sealed_multi_result.as_ref()?))
     }).collect();
+    let multi_forwarders: BTreeMap<_, _> = bodies.iter().filter_map(|(&key, body)| {
+        if !body.is_monomorphic || key.2.is_some() { return None; }
+        let (call, lanes) = body.facts?.sealed_multi_forward.as_ref()?;
+        let target = target_body(&declarations, body.cfg, *call)?;
+        (multi_producers.get(&target)?.len() == lanes.len()).then_some((key, (*call, lanes)))
+    }).collect();
     let mut identity_relays = BTreeMap::<BodyKey, usize>::new();
     let mut identity_waiters = BTreeMap::<(BodyKey, usize), Vec<(BodyKey, usize)>>::new();
     let mut identity_pending = Vec::new();
@@ -6078,7 +6130,7 @@ fn closed_aggregates<'a>(
     ordinary.census(reservations, &module_at, &declarations);
     let mut outgoing = BTreeSet::new();
     let mut pending = Vec::new();
-    outgoing.extend(multi_producers.keys().copied());
+    outgoing.extend(multi_producers.keys().chain(multi_forwarders.keys()).copied());
     let mut callers = BTreeMap::<BodyKey, Vec<BodyKey>>::new();
     let mut forward_edges = BTreeMap::new();
     let mut conditional_forward_edges = BTreeMap::<_, BTreeSet<_>>::new();
@@ -7106,6 +7158,8 @@ fn closed_aggregates<'a>(
             }
             let route = if multi_producers.contains_key(&key) {
                 ClosedReturn::MultipleAllocations
+            } else if multi_forwarders.contains_key(&key) {
+                ClosedReturn::MultipleForward
             } else if let Some(LocalChoiceUse::Return { call, output }) = local_choices.get(&key).map(|choice| choice.use_site) {
                 ClosedReturn::Recommit { call: call.0, output: output.0 }
             } else if let Some(shape) = structured_returns.get(&key) {
@@ -7195,6 +7249,11 @@ fn closed_aggregates<'a>(
         if let Some(lanes) = multi_producers.get(&key) {
             plan.multi_returns.clone_from(*lanes);
         }
+        if let Some(&(call, lanes)) = multi_forwarders.get(&key) {
+            let &(ordinal, _) = facts.multi_selected_calls.get(&call)
+                .ok_or("closed multi-output relay missing its selected call")?;
+            plan.multi_forward = Some((ordinal.0, lanes.clone()));
+        }
         if matches!(return_route, Some(ClosedReturn::Structured { .. })) {
             plan.structured_result_binding = structured_returns[&key].binding
                 .map(|(block, item, conditional)| (block.0, item, conditional.0));
@@ -7241,20 +7300,30 @@ fn closed_aggregates<'a>(
         if !facts.multi_result_calls.is_empty() {
             for &point in &facts.multi_result_calls {
                 let Some(target) = target_body(&declarations, body.cfg, point) else { continue };
-                let Some(lanes) = multi_producers.get(&target) else { continue };
+                let Some(target_width) = multi_producers.get(&target).map(|lanes| lanes.len())
+                    .or_else(|| multi_forwarders.get(&target).map(|(_, lanes)| lanes.len()))
+                    else { continue };
                 let &(call, width) = facts.multi_selected_calls.get(&point).ok_or_else(unsupported_multi)?;
                 let receivers = facts.multi_result_bindings.get(&point).ok_or_else(unsupported_multi)?;
-                if width != lanes.len() || receivers.is_empty() || receivers.len() > width || !facts.unsupported.is_empty()
+                if width != target_width || receivers.is_empty() || receivers.len() > width || !facts.unsupported.is_empty()
                     || !body.is_monomorphic
                 {
                     return Err(unsupported_multi());
                 }
-                for (lane, receiver) in receivers.iter().enumerate() {
-                    let (endpoint, witness, always) = lane_exits.remove(&(point, lane)).ok_or_else(unsupported_multi)?;
-                    if !always || witness != Some(receiver) {
+                if multi_forwarders.get(&key).is_some_and(|(forwarded, _)| *forwarded == point) {
+                    if width != receivers.len() {
                         return Err(unsupported_multi());
                     }
-                    multi_at_exit.entry(endpoint).or_default().push((point, lane, call.0));
+                    // The exact complete return proof spent these receipts,
+                    // so nothing from this call is scheduled for release here.
+                } else {
+                    for (lane, receiver) in receivers.iter().enumerate() {
+                        let (endpoint, witness, always) = lane_exits.remove(&(point, lane)).ok_or_else(unsupported_multi)?;
+                        if !always || witness != Some(receiver) {
+                            return Err(unsupported_multi());
+                        }
+                        multi_at_exit.entry(endpoint).or_default().push((point, lane, call.0));
+                    }
                 }
                 plan.multi_receives.insert(call.0, ClosedMultiReceive {
                     width,

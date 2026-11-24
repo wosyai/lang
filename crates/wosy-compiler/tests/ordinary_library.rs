@@ -4446,25 +4446,36 @@ fn assert_multi_owning_formals(forwarded: bool) {
 
 #[test]
 fn multiple_returned_owners_preserve_ordered_original_bases() {
-    check_multiple_returned_owners(false);
+    check_multiple_returned_owners(false, false);
 }
 
 #[test]
 fn multiple_returned_owners_discard_the_unbound_lane_at_its_binding() {
-    check_multiple_returned_owners(true);
+    check_multiple_returned_owners(true, false);
 }
 
-fn check_multiple_returned_owners(discard: bool) {
+#[test]
+fn multiple_returned_owners_relay_directly_to_the_original_caller_destinations() {
+    check_multiple_returned_owners(false, true);
+}
+
+fn check_multiple_returned_owners(discard: bool, forward: bool) {
     let app = source("workbench", "src/multi_returned_owners.w");
     let authored = include_str!("fixtures/multi-returned-owners.w");
-    let digit = if discard {
+    let program = if forward {
+        authored.replace("u64() drive = fn {", r#"(Packet, Packet)(u64, u64) relay = fn(left_size, right_size) {
+    Packet earlier, Packet later = pair(left_size, right_size);
+    earlier, later
+};
+u64() drive = fn {"#).replace("front, Packet back = pair(2, 5)", "front, Packet back = relay(2, 5)")
+    } else if discard {
         authored.replace("Packet front, Packet back = pair(2, 5);", "Packet front = pair(2, 5);")
             .replace("front.length * 100 + back.length", "front.length * 100")
             .replace("drive() != 502", "drive() != 500")
     } else {
         authored.to_owned()
     };
-    let text = digit.as_str();
+    let text = program.as_str();
     for (target, target_layout) in [("native64", ScalarTargetLayout::NATIVE64), ("wasm32", ScalarTargetLayout::WASM32)] {
         let prepared = prepare_scalar_project(
             vec![(declarations(&app, text), Vec::new())], vec![app.clone()],
@@ -4500,13 +4511,37 @@ fn check_multiple_returned_owners(discard: bool) {
             }
             assert_eq!(allocations.len(), 2);
             assert_eq!(lanes, [(vec![0], allocations[1]), (vec![1], allocations[0])]);
+            let direct = if forward {
+                let relay = module.get_function(&name("relay")).unwrap();
+                assert_eq!(relay.get_linkage(), inkwell::module::Linkage::Internal);
+                assert_eq!(relay.get_type(), producer.get_type());
+                let mut transport = None;
+                let mut returned = None;
+                for row in relay.get_basic_blocks().into_iter().flat_map(|block| block.get_instructions()) {
+                    if let Ok(call) = CallSiteValue::try_from(row) {
+                        assert_eq!(call.get_called_fn_value(), Some(producer),
+                            "{target}/{route}: relay must not allocate, copy or release: {row}");
+                        for slot in 2..4 {
+                            assert_eq!(row.get_operand(slot).unwrap().value(), relay.get_nth_param(slot));
+                        }
+                        assert!(transport.replace(call.try_as_basic_value().basic().unwrap()).is_none());
+                    } else if row.get_opcode() == InstructionOpcode::Return {
+                        returned = row.get_operand(0).unwrap().value();
+                    }
+                }
+                assert!(transport.is_some());
+                assert_eq!(returned, transport, "{target}/{route}: relay must return unchanged backing transport");
+                relay
+            } else {
+                producer
+            };
             let mut transport = None;
             let mut received = Vec::new();
             let mut releases = Vec::new();
             let mut cleanup_order = Vec::new();
             for row in consumer.get_basic_blocks().into_iter().flat_map(|block| block.get_instructions()) {
                 if let Ok(call) = CallSiteValue::try_from(row) {
-                    if call.get_called_fn_value() == Some(producer) {
+                    if call.get_called_fn_value() == Some(direct) {
                         assert_eq!(call.count_arguments(), 4);
                         assert!(transport.replace(call.try_as_basic_value().basic().unwrap()).is_none());
                     } else if call.get_called_fn_value() == Some(free) {
@@ -4528,7 +4563,7 @@ fn check_multiple_returned_owners(discard: bool) {
             if let Some(directory) = std::env::var_os("WOSY_MULTI_RETURNED_OWNERS_IR_DIR") {
                 let mut witness = ir.replace("define i32 @main(", "define i32 @wosy_authored_main(");
                 witness.push_str(&format!("\ndefine i64 @wosy_test_multi_returned_owners() {{\nentry:\n  %value = call i64 @{}()\n  ret i64 %value\n}}\n", name("drive")));
-                let variant = if discard { "-discard" } else { "" };
+                let variant = if discard { "-discard" } else if forward { "-forward" } else { "" };
                 std::fs::write(std::path::PathBuf::from(directory).join(format!("{target}-{route}{variant}.ll")), witness).unwrap();
             }
         }
@@ -4543,7 +4578,7 @@ fn multiple_returned_owners_leave_unproved_bare_results_and_forwarding_closed() 
         .replace("front.length * 100 + back.length", "0");
     let forward = valid.replace("u64() drive = fn {", r#"(Packet, Packet)(u64, u64) relay = fn(left_size, right_size) {
     Packet earlier, Packet later = pair(left_size, right_size);
-    earlier, later
+    later, earlier
 };
 u64() drive = fn {"#).replace("front, Packet back = pair(2, 5)", "front, Packet back = relay(2, 5)");
     for (case, text) in [("discard", discard), ("forward", forward)] {

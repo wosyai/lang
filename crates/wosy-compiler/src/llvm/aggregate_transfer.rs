@@ -159,7 +159,7 @@ impl<'ctx, 'plan> AggregateEmitter<'ctx, 'plan> {
         let Some(plan) = plan else {
             return Ok(None);
         };
-        let destination = if plan.returning.is_some() && plan.multi_returns.is_empty() {
+        let destination = if plan.returning.is_some() && plan.multi_return_width() == 0 {
             Some(
                 definition
                     .get_nth_param(parameter_count as u32)
@@ -211,7 +211,7 @@ impl<'ctx, 'plan> AggregateEmitter<'ctx, 'plan> {
                 return Err("mixed checked backing producer has no matching local release".into());
             }
         }
-        let multi_destinations = (0..plan.multi_returns.len()).map(|lane| {
+        let multi_destinations = (0..plan.multi_return_width()).map(|lane| {
             let index = u32::try_from(parameter_count + lane).map_err(|_| "owning return destination index overflow")?;
             definition.get_nth_param(index).map(|value| value.into_pointer_value())
                 .ok_or_else(|| "missing ordered owning return destination".to_owned())
@@ -319,14 +319,14 @@ pub(super) fn definition_type<'ctx>(
     else {
         return Err("invalid closed aggregate declaration".into());
     };
-    if let Some(plan) = plan.filter(|plan| !plan.multi_returns.is_empty()) {
-        if plan.multi_returns.len() != outputs.outputs.len() || !plan.inputs.is_empty()
+    if let Some(plan) = plan.filter(|plan| plan.multi_return_width() != 0) {
+        if plan.multi_return_width() != outputs.outputs.len() || !plan.inputs.is_empty()
             || !outputs.outputs.iter().all(|output| matches!(output.ty, ScalarType::Struct(_)))
         {
             return Err("invalid ordered owning return declaration".into());
         }
         let pointer = context.ptr_type(AddressSpace::default());
-        let arity = plan.multi_returns.len();
+        let arity = plan.multi_return_width();
         let mut arguments = parameters.iter().map(|ty| basic_type(context, ty, layout).map(Into::into))
             .collect::<Result<Vec<BasicMetadataTypeEnum<'ctx>>, _>>()?;
         arguments.extend(std::iter::repeat_n(BasicMetadataTypeEnum::from(pointer), arity));
@@ -977,7 +977,7 @@ pub(super) fn emit_initializer_binding<'ctx, 'module>(
 
 pub(super) fn requires_scoped_function_emission(plan: Option<&ClosedBody>) -> bool {
     plan.is_some_and(|plan| !plan.inputs.is_empty() || plan.ordinary_result || !plan.ordinary_calls.is_empty()
-        || !plan.multi_receives.is_empty() || !plan.multi_returns.is_empty()
+        || !plan.multi_receives.is_empty() || plan.multi_return_width() != 0
         || matches!(plan.returning, Some(ClosedReturn::Structured { .. })))
 }
 
@@ -1323,15 +1323,34 @@ fn emit_multiple_owner_call<'ctx, 'module>(
         };
         operands.push(take_basic(value)?.into());
     }
+    let forwarded = state.aggregate.as_ref().filter(|aggregate|
+        aggregate.plan.multi_forward.as_ref().is_some_and(|(call, _)| *call == ordinal));
+    let forwarding = forwarded.is_some();
     let mut values = Vec::with_capacity(width);
-    for output in &outputs.outputs {
-        let destination = entry_storage_alloca(context, state, &output.ty, "owning_output_destination")?;
-        operands.push(destination.into());
-        values.push(EmitValue::Basic(destination.into()));
+    if let Some(aggregate) = forwarded {
+        if aggregate.multi_destinations.len() != width {
+            return Err("missing exact owning relay destinations".into());
+        }
+        for &destination in &aggregate.multi_destinations {
+            operands.push(destination.into());
+            values.push(EmitValue::Basic(destination.into()));
+        }
+    } else {
+        for output in &outputs.outputs {
+            let destination = entry_storage_alloca(context, state, &output.ty, "owning_output_destination")?;
+            operands.push(destination.into());
+            values.push(EmitValue::Basic(destination.into()));
+        }
     }
     let returned = state.builder.build_call(function, &operands, "owning_output_bases")
         .map_err(builder_error)?.try_as_basic_value().basic().ok_or("missing ordered backing result")?.into_struct_value();
     let aggregate = state.aggregate.as_mut().expect("owning call frame");
+    if forwarding {
+        if aggregate.mixed_return.replace(returned).is_some() {
+            return Err("ordered owning relay emitted more than one transport".into());
+        }
+        return build_aggregate(context, state, outputs, values);
+    }
     for lane in 0..width {
         let index = u32::try_from(lane).map_err(|_| "owning call lane overflow")?;
         let base = state.builder.build_extract_value(returned, index, "owning_output_base").map_err(builder_error)?
@@ -1693,6 +1712,11 @@ pub(super) fn holds_registered_return(state: &EmitState<'_, '_>, output: &Scalar
     if aggregate.registered_allocation.is_some() {
         return true;
     }
+    if let Some((_, outputs)) = &aggregate.plan.multi_forward {
+        return aggregate.mixed_return.is_some() && state.body_call_nodes
+            .and_then(|nodes| nodes.expression_ordinal(output))
+            .is_some_and(|occurrence| outputs.binary_search(&occurrence).is_ok());
+    }
     let lanes = &aggregate.plan.multi_returns;
     if lanes.is_empty() {
         return false;
@@ -1820,6 +1844,20 @@ pub(super) fn commit_return<'ctx>(
         if !matches!(result, EmitValue::Basic(BasicValueEnum::PointerValue(returned)) if *returned == base) {
             return Err("checked fresh literal array return did not carry its allocation".into());
         }
+        return Ok(());
+    }
+    if let Some((call, expected)) = &aggregate.plan.multi_forward {
+        let nodes = state.body_call_nodes.ok_or("missing ordered owning relay occurrences")?;
+        if aggregate.plan.returning != Some(ClosedReturn::MultipleForward)
+            || aggregate.committed || aggregate.mixed_return.is_none()
+            || aggregate.plan.multi_receives.get(call).is_none_or(|receive| receive.retained.len() != expected.len())
+            || expected.len() != outputs.outputs.len()
+            || !block.final_expressions().map(|(expression, _)| nodes.expression_ordinal(expression))
+                .eq(expected.iter().copied().map(Some))
+        {
+            return Err("ordered owning relay changed its sealed outputs".into());
+        }
+        aggregate.committed = true;
         return Ok(());
     }
     if aggregate.plan.returning == Some(ClosedReturn::MultipleAllocations) {
@@ -2080,7 +2118,7 @@ pub(super) fn finish_return<'ctx>(
     let Some(route) = aggregate.plan.returning else {
         return Ok(None);
     };
-    if matches!(route, ClosedReturn::MultipleAllocations | ClosedReturn::Allocation { .. } | ClosedReturn::Recommit { .. } | ClosedReturn::NamedRoot { .. } | ClosedReturn::Structured { .. }
+    if matches!(route, ClosedReturn::MultipleAllocations | ClosedReturn::MultipleForward | ClosedReturn::Allocation { .. } | ClosedReturn::Recommit { .. } | ClosedReturn::NamedRoot { .. } | ClosedReturn::Structured { .. }
         | ClosedReturn::MixedSelected { .. }) && !aggregate.committed {
         return Err("closed aggregate return did not commit ownership before cleanup".into());
     }

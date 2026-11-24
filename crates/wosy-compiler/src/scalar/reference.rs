@@ -14062,6 +14062,7 @@ enum MixedReceiptProof {
     Local(aggregate::SealedMixedOwner),
     Forwarded,
     Multiple,
+    MultipleForwarded,
 }
 
 type MixedReceiptRoots = HashMap<SourceIdentity, HashMap<ByteSpan, MixedReceiptProof>>;
@@ -14088,7 +14089,11 @@ impl MixedReceiptAuthority {
     }
 
     fn is_multi(&self, source: &SourceIdentity, span: &ByteSpan) -> bool {
-        self.proof(source, span) == Some(MixedReceiptProof::Multiple)
+        matches!(self.proof(source, span), Some(MixedReceiptProof::Multiple | MixedReceiptProof::MultipleForwarded))
+    }
+
+    fn is_multi_forwarder(&self, source: &SourceIdentity, span: &ByteSpan) -> bool {
+        self.proof(source, span) == Some(MixedReceiptProof::MultipleForwarded)
     }
 
     fn is_forwarder(&self, source: &SourceIdentity, span: &ByteSpan) -> bool {
@@ -14135,6 +14140,17 @@ impl MixedReceiptPlan<'_> {
             forwarders
         }
 
+        // Only a relay directly grounded in a sealed local allocation result.
+        let mut multiple = Vec::new();
+        for (source, proofs) in &roots {
+            for (declaration, proof) in proofs {
+                if *proof == MixedReceiptProof::Multiple {
+                    if let Some(callers) = users.get(&(source, *declaration)) {
+                        multiple.extend(callers.iter().copied());
+                    }
+                }
+            }
+        }
         let mut forwarders = rooted_forwarders(&roots, users);
         let mut modules: HashMap<_, _> = roots.into_iter().map(|(source, local)| {
             let forwarded = forwarders.remove(&source).unwrap_or_default();
@@ -14142,6 +14158,10 @@ impl MixedReceiptPlan<'_> {
         }).collect();
         modules.extend(forwarders.into_iter().map(|(source, forwarded)| (source,
             MixedReceiptModuleProofs { forwarded, ..Default::default() })));
+        for (source, declaration) in multiple {
+            modules.entry(source.clone()).or_default().local.entry(declaration)
+                .or_insert(MixedReceiptProof::MultipleForwarded);
+        }
         MixedReceiptAuthority(modules)
     }
 }
@@ -14219,6 +14239,13 @@ impl MixedReceiptCohort {
             let (index, result) = &updates[position];
             let ScalarItem::Function(function) = &items[*index] else { unreachable!("function result ordinal") };
             if let Some(callee) = result.mixed_forwarded_callee(function, &sites.functions[index]) {
+                edges.entry(callee).or_default().push((source, declaration));
+            }
+        }
+        for &(position, declaration) in &self.multi_producers {
+            let (index, result) = &updates[position];
+            let ScalarItem::Function(function) = &items[*index] else { unreachable!("function result ordinal") };
+            if let Some(callee) = result.multi_forwarded_callee(function, &sites.functions[index]) {
                 edges.entry(callee).or_default().push((source, declaration));
             }
         }
@@ -14356,6 +14383,32 @@ fn install_module_reference_results(
         };
         result.install(function);
     }
+}
+
+
+#[cfg(test)]
+#[test]
+fn multiple_receipt_relay_authority_is_qualified_and_single_hop() {
+    let source = |path: &str, revision: &str| SourceIdentity::new(
+        "project".into(), "payload".into(), path.into(), revision.into(),
+    );
+    let factory = source("factory.w", "1");
+    let relay = source("relay.w", "1");
+    let next = source("next.w", "1");
+    let stale = source("factory.w", "0");
+    let declaration = ByteSpan::new(1, 2);
+    let roots = HashMap::from([(factory.clone(), HashMap::from([(declaration, MixedReceiptProof::Multiple)]))]);
+    let users = HashMap::from([
+        ((&factory, declaration), vec![(&relay, declaration)]),
+        ((&relay, declaration), vec![(&next, declaration)]),
+        ((&stale, declaration), vec![(&next, declaration)]),
+    ]);
+    let authority = MixedReceiptPlan { roots, users }.resolve();
+    assert!(authority.is_multi(&factory, &declaration));
+    assert!(authority.is_multi_forwarder(&relay, &declaration));
+    assert!(!authority.contains(&relay, &declaration));
+    assert!(!authority.is_multi(&next, &declaration));
+    assert!(!authority.is_multi(&stale, &declaration));
 }
 
 #[cfg(test)]
@@ -15423,6 +15476,50 @@ impl FunctionReferenceResult {
             && row.parameters.iter().all(aggregate::ordinary_value)).then_some((actual, *declaration_span))
     }
 
+    fn multi_forwarded_callee(
+        &self, function: &ScalarFunction, sites: &FunctionCallSites,
+    ) -> Option<(&SourceIdentity, ByteSpan)> {
+        let root = sites.structure.blocks.get(sites.structure.root.0)?;
+        let (first, rest) = root.items.split_first()?;
+        let BlockItemKind::Binding(region) = &first.kind else { return None };
+        let ScalarBlockItem::LocalBinding(binding) = function.body.items.first()? else { return None };
+        let ScalarExpression::Call { arguments, .. } = &binding.value else { return None };
+        let receivers = region.receivers();
+        let outputs = &sites.boundary.root_outputs;
+        if outputs.len() < 2 || rest.len() != outputs.len() || receivers.len() != outputs.len()
+            || binding.is_allocation || binding.output_origin != ScalarBindingOutputOrigin::SingleExpression
+            || !sites.boundary.parameters.iter().all(|parameter| aggregate::ordinary_value(&parameter.ty))
+            || !arguments.iter().all(|argument| matches!(argument, ScalarExpression::Name { .. }
+                | ScalarExpression::Integer { .. } | ScalarExpression::Boolean { .. }
+                | ScalarExpression::Char { .. } | ScalarExpression::Float { .. }))
+            || self.aggregate.multi_result_calls.len() != 1
+        { return None; }
+        let OccurrenceNode::Expression(ordinal) = *sites.structure.edges.get(&(
+            OccurrenceParent::Block(sites.structure.root), OccurrenceEdge::BindingRoot { item: 0, output: 0 },
+        ))? else { return None };
+        if sites.declared_unsafe_calls.contains(&ordinal.0) { return None; }
+        let signature = sites.checked_call_signatures.get(&ordinal)?;
+        if !signature.parameters.iter().all(aggregate::ordinary_value)
+            || !signature.outputs.outputs.iter().map(|output| &output.ty).eq(outputs.iter().map(|output| &output.ty))
+        { return None; }
+        for (lane, ((item, receiver), ty)) in rest.iter().zip(receivers).zip(outputs).enumerate() {
+            let BlockItemKind::FinalOutput(output) = &item.kind else { return None };
+            if output.output != lane || receiver.position != lane || receiver.ty != ty.ty
+                || !matches!(ty.ty, ScalarType::Struct(_))
+                || !matches!(sites.prepared_plain_name(output.expression), Some(PlainNameIdentity::Lexical(id))
+                    if id.declaration_span == receiver.span && id.block_span == root.span
+                        && id.kind == ReferenceBindingKind::Declared)
+            { return None; }
+        }
+        let point = self.cfg.initial_points.get(self.aggregate.multi_result_calls.first()?.0)?;
+        if point.source_span.range != sites.occurrences.get(ordinal.0)?.span { return None; }
+        match &point.kind {
+            CfgPointKind::Call { target: ResolvedCallTarget::ModuleCallable {
+                source, declaration_span, concrete: ConcreteCallSelection::Declaration }, .. } => Some((source, *declaration_span)),
+            _ => None,
+        }
+    }
+
     fn observe_selected_mixed_receipts(
         &mut self, function: &ScalarFunction, sites: &FunctionCallSites, module_names: &HashSet<String>,
         structs: &[ScalarStruct], enums: &[ScalarEnum], source: &SourceIdentity,
@@ -15441,6 +15538,7 @@ impl FunctionReferenceResult {
         let mut builder = ReferenceFlowBuilder::new(source, function, module_names, sites, structs, enums);
         builder.capture_call_points = capture_call_points;
         builder.mixed_owners = Some(owners);
+        builder.aggregate_facts.multi_forwarder = owners.is_multi_forwarder(source, &function.name_span);
         builder.shared_scalar_read_effects = Some(effects);
         let (cfg, emitted_errors, proof_points, mut aggregate, checked_contract_returns) =
             build_function_reference_cfg(builder, function, true);
@@ -16108,7 +16206,11 @@ fn build_function_reference_cfg(
     // Install the canonical owning-call census before sealing local results.
     aggregate.calls = builder.aggregate_facts.calls;
     if errors.is_empty() {
-        aggregate.sealed_multi_result = aggregate.multi_local_result(&builder.cfg, call_sites);
+        if builder.aggregate_facts.multi_forwarder {
+            aggregate.sealed_multi_forward = aggregate.multi_forward_result(&builder.cfg, call_sites);
+        } else {
+            aggregate.sealed_multi_result = aggregate.multi_local_result(&builder.cfg, call_sites);
+        }
     }
     aggregate.formals = builder.aggregate_facts.formals;
     aggregate.read_formals = builder.aggregate_facts.raw_formals.into_keys().collect();
