@@ -2049,10 +2049,17 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             let (identity, effect) = calls.imported_shared_readers.get(&ordinal)?;
                             (&identity.source == source && identity.range == *declaration_span).then_some(*effect)
                         })?;
-                        let [parameter] = signature?.parameters.as_slice() else { return None };
+                        let parameters = &signature?.parameters;
+                        let parameter = parameters.get(effect.parameter)?;
                         let ScalarType::CheckedReference { mutability: ScalarReferenceMutability::Shared, inner } = parameter else {
                             return None;
                         };
+                        if parameters.len() != effect.parameter + 1
+                            || (effect.parameter == 1 && (effect.descriptor || parameters.first() != Some(inner.as_ref())))
+                            || effect.parameter > 1
+                        {
+                            return None;
+                        }
                         let [output] = signature?.outputs.outputs.as_slice() else { return None };
                         if if effect.descriptor {
                             !matches!(inner.as_ref(), ScalarType::Struct(_)) || !aggregate::ordinary_value(&output.ty)
@@ -2069,9 +2076,9 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             CfgPointKind::Read { binding }
                                 if matches!(calls.prepared_plain_name(argument),
                                     Some(PlainNameIdentity::Lexical(expected)) if expected == binding) =>
-                                Some((point, joined_effect.is_some())),
+                                Some((point, joined_effect.is_some(), effect.parameter == 0)),
                             CfgPointKind::Borrow { place, loan }
-                                if matches!(target, ResolvedCallTarget::ModuleCallable { .. })
+                                if effect.parameter == 0 && matches!(target, ResolvedCallTarget::ModuleCallable { .. })
                                     && loan.mode == ScalarReferenceMutability::Shared && loan.parent.is_none()
                                     && loan.origin_place == *place =>
                             {
@@ -2093,16 +2100,18 @@ impl<'a> ReferenceFlowBuilder<'a> {
                                     && place.projections.len() == projections
                                     && matches!(self.prepared_place_root(root.ordinal, *span).ok().flatten(),
                                         Some(PreparedPlaceRoot::Lexical(binding)) if binding == &place.binding))
-                                    .then_some((point, false))
+                                    .then_some((point, false, true))
                             }
                             _ => None,
                         }
                     })()
                 } else { None };
                 let id = self.point_with_origins(call, span, scope, cast_origins.clone());
-                if let Some((argument, named)) = read_effect_argument {
-                    self.aggregate_facts.receipt_loan_read_calls.insert(id, (argument, ordinal));
-                    if named && self.joined_local_reborrow {
+                if let Some((argument, joined, receipt)) = read_effect_argument {
+                    if receipt {
+                        self.aggregate_facts.receipt_loan_read_calls.insert(id, (argument, ordinal));
+                    }
+                    if joined && self.joined_local_reborrow {
                         self.proof_points.shared_scalar_read_calls.push((id, argument));
                     }
                 }
@@ -7169,7 +7178,8 @@ fn joined_root_reborrow_binding<'a>(
                     continue;
                 }
                 if !writable && matches!(&deref.kind, CfgPointKind::Call { output: 0, argument_points, .. }
-                    if argument_points.as_slice() == [rest.id])
+                    if matches!(argument_points.as_slice(), [read] if *read == rest.id)
+                        || matches!(argument_points.as_slice(), [scalar, read] if *scalar < *read && *read == rest.id))
                     && read_calls.binary_search(&(deref.id, rest.id)).is_ok()
                 {
                     continue;
@@ -10160,10 +10170,17 @@ impl SharedScalarReadEffect {
     fn prepare(
         source: &SourceIdentity, function: &ScalarFunction, calls: &FunctionCallSites,
     ) -> Option<Self> {
-        let [parameter] = calls.boundary.parameters.as_slice() else { return None };
+        let (scalar, parameter) = match calls.boundary.parameters.as_slice() {
+            [parameter] => (None, parameter),
+            [scalar, parameter] => (Some(scalar), parameter),
+            _ => return None,
+        };
         let ScalarType::CheckedReference {
             mutability: ScalarReferenceMutability::Shared, inner,
         } = &parameter.ty else { return None };
+        if scalar.is_some_and(|scalar| &scalar.ty != inner.as_ref() || !aggregate::ordinary_value(&scalar.ty)) {
+            return None;
+        }
         if !function.generic_parameters.is_empty() || !function.overload_arms.is_empty()
         {
             return None;
@@ -10182,11 +10199,41 @@ impl SharedScalarReadEffect {
             OccurrenceParent::Block(structure.root),
             OccurrenceEdge::FinalOutput { item: 0, output: result.ordinal },
         ))? else { return None };
-        let (expression, read) = match expression {
-            ScalarExpression::Binary {
+        let formal_name = |occurrence, span| {
+            matches!(calls.prepared_plain_name(occurrence), Some(PlainNameIdentity::Lexical(binding))
+                if binding.source == *source && binding.function_span == function.span
+                    && binding.block_span == function.body.span && binding.declaration_span == span
+                    && binding.kind == ReferenceBindingKind::Declared)
+        };
+        let (expression, read) = match (scalar, expression) {
+            (Some(scalar), ScalarExpression::Binary { operator: BinaryOperator::Add, left, right, .. })
+                if !descriptor && calls.call_occurrences.is_empty() =>
+            {
+                let (operand, dereference, ordinary) = match (left.as_ref(), right.as_ref()) {
+                    (ScalarExpression::Name { .. }, operand @ ScalarExpression::Dereference { .. }) =>
+                        (operand, OccurrenceEdge::BinaryRight, OccurrenceEdge::BinaryLeft),
+                    (operand @ ScalarExpression::Dereference { .. }, ScalarExpression::Name { .. }) =>
+                        (operand, OccurrenceEdge::BinaryLeft, OccurrenceEdge::BinaryRight),
+                    _ => return None,
+                };
+                let child = |edge| match structure.edges.get(&(OccurrenceParent::Expression(output), edge))? {
+                    OccurrenceNode::Expression(child) => Some(*child),
+                    _ => None,
+                };
+                let ordinary = child(ordinary)?;
+                if !formal_name(ordinary, scalar.span)
+                    || structure.checked_types.expressions.get(&ordinary) != Some(&scalar.ty)
+                    || structure.checked_types.expressions.get(&output) != Some(&result.ty)
+                {
+                    return None;
+                }
+                (operand, child(dereference)?)
+            }
+            (Some(_), _) => return None,
+            (None, ScalarExpression::Binary {
                 operator: BinaryOperator::Add | BinaryOperator::Subtract | BinaryOperator::Multiply,
                 left, right, ..
-            } if !descriptor && calls.call_occurrences.is_empty()
+            }) if !descriptor && calls.call_occurrences.is_empty()
                 && structure.checked_types.expressions.get(&output) == Some(inner.as_ref()) =>
             {
                 let (operand, edge) = match (left.as_ref(), right.as_ref()) {
@@ -10201,7 +10248,7 @@ impl SharedScalarReadEffect {
                 ))? else { return None };
                 (operand, read)
             }
-            _ => (expression, output),
+            (None, _) => (expression, output),
         };
         let ScalarExpression::Dereference { place: written, .. } = expression else { return None };
         let OccurrenceNode::Place(place) = *structure.edges.get(&(
@@ -10223,12 +10270,7 @@ impl SharedScalarReadEffect {
         let OccurrenceNode::Expression(pointer) = *structure.edges.get(&(
             OccurrenceParent::Place(place), OccurrenceEdge::DereferencePointer,
         ))? else { return None };
-        let PlainNameIdentity::Lexical(binding) = calls.prepared_plain_name(pointer)? else {
-            return None;
-        };
-        (binding.source == *source && binding.function_span == function.span
-            && binding.block_span == function.body.span && binding.declaration_span == parameter.span
-            && binding.kind == ReferenceBindingKind::Declared
+        (formal_name(pointer, parameter.span)
             && structure.checked_types.expressions.get(&pointer) == Some(&parameter.ty)
             && structure.checked_types.expressions.get(&read) == Some(&result.ty))
             .then_some(Self { parameter: parameter.ordinal, descriptor })
@@ -10618,7 +10660,8 @@ impl ProjectCallSiteResults {
 impl ProjectCallSiteResults {
     pub(super) fn has_closed_shared_scalar_reader(&self, module: usize, declaration: ByteSpan) -> bool {
         self.modules.get(module).and_then(|row| row.as_ref().ok())
-            .is_some_and(|calls| calls.shared_scalar_read_effects.get(&declaration).is_some_and(|effect| !effect.descriptor))
+            .is_some_and(|calls| calls.shared_scalar_read_effects.get(&declaration)
+                .is_some_and(|effect| effect.parameter == 0 && !effect.descriptor))
     }
 
     pub(super) fn lookup_errors(&self) -> impl Iterator<Item = &ReferenceAnalysisError> {

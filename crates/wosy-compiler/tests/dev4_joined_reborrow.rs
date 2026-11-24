@@ -558,6 +558,25 @@ fn joined_with_pointer_read(after_read: &str, behavior: &str) -> String {
 }
 
 #[test]
+fn joined_child_is_read_by_exact_callee_with_scalar_prefix_argument() {
+    let program = joined_with_pointer_read(
+        "u8 bias = 2; u8 observed = pointer(bias, child); first = 3;", "*value",
+    ).replace("u8(*u8) pointer = fn(value) { *value };",
+        "u8(u8, *u8) pointer = fn(bias, value) { bias + *value };")
+        .replace("    seen\n", "    if (observed == seen + bias && first == 3) { seen } else { 0 }\n");
+    check_case(&program, Expected::Valid, Some("WOSY_JOINED_SCALAR_PREFIX_IR_DIR"));
+
+    let live = program.replace("u8 observed = pointer(bias, child); first = 3;",
+        "first = 3; u8 observed = pointer(bias, child);");
+    assert_ne!(live, program);
+    check(&live, Expected::LiveConflict);
+
+    let uncertified = program.replace("bias + *value", "bias + *value + *value");
+    assert_ne!(uncertified, program);
+    check(&uncertified, Expected::NullParent);
+}
+
+#[test]
 fn joined_child_is_read_by_checked_callee_before_selected_owner_is_reusable() {
     let program = joined_with_pointer_read(
         "u8 through_call = pointer(child); first = 3;", "*value",
