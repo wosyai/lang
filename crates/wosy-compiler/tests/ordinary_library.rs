@@ -1022,7 +1022,7 @@ fn recommitted_wrapper_return_preserves_one_base_across_two_owning_returns() {
             std::fs::write(std::path::PathBuf::from(out).join(format!("{target}.ll")), witness).unwrap();
         }
 
-        let interrupted = text.replace("    moved.length;", "    length;");
+        let interrupted = text.replace("    read_amount(&moved);", "    length;");
         let error = emit(&interrupted).expect_err("an interrupted chain lacks a root handoff certificate");
         assert!(error.contains("recommitted aggregate return has no exact root binding"), "{target}: {error}");
     }
@@ -1111,7 +1111,7 @@ fn structured_named_terminal_moves_descriptor_and_keeps_original_backing() {
     let text = include_str!("fixtures/structured-named-factory.w");
     let mutual = text.replace("Packet incoming = factory(depth - 1, length, !choose);",
         "Packet incoming = peer(depth - 1, length, !choose);")
-        .replace("u64(u64, bool) drive", "Packet(u64, u64, bool) peer = fn(depth, length, choose) {\n    Packet incoming = factory(depth, length, choose);\n    incoming.length;\n    Packet intermediate = incoming;\n    intermediate.length;\n    Packet selected = intermediate;\n    selected\n};\nu64(u64, bool) drive");
+        .replace("u64(u64, bool) drive", "Packet(u64, u64, bool) peer = fn(depth, length, choose) {\n    Packet incoming = factory(depth, length, choose);\n    read_amount(&incoming.length);\n    Packet intermediate = incoming;\n    intermediate.length;\n    Packet selected = intermediate;\n    selected\n};\nu64(u64, bool) drive");
     for (text, mutual) in [(text, false), (mutual.as_str(), true)] {
         for (target, target_layout) in [("native64", ScalarTargetLayout::NATIVE64), ("wasm32", ScalarTargetLayout::WASM32)] {
             for project in [false, true] {
@@ -1206,6 +1206,10 @@ fn structured_named_terminal_moves_descriptor_and_keeps_original_backing() {
                 assert_ne!(unrelated, text);
                 assert!(emit(&unrelated).expect_err("another live descriptor cannot certify this observation corridor")
                     .contains("structured aggregate return is not closed on every result path"));
+                let uncertified = text.replace("fn(value) { *value }", "fn(value) { u64 copy = *value; copy }");
+                assert_ne!(uncertified, text);
+                assert!(emit(&uncertified).expect_err("an uncertified call cannot borrow and forward the receipt")
+                    .contains("aggregate owning receipt has an unproved checked loan"));
             }
         }
     }

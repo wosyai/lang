@@ -2095,7 +2095,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 } else { None };
                 let id = self.point_with_origins(call, span, scope, cast_origins.clone());
                 if let Some((argument, named)) = read_effect_argument {
-                    self.aggregate_facts.receipt_loan_read_calls.insert(id, argument);
+                    self.aggregate_facts.receipt_loan_read_calls.insert(id, (argument, ordinal));
                     if named && self.joined_local_reborrow {
                         self.proof_points.shared_scalar_read_calls.push((id, argument));
                     }

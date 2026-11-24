@@ -16,6 +16,7 @@ Packet(u64) make_alt = fn(length) {
     Packet packet = { .data = data; .length = length + 10; };
     packet
 };
+u64(*u64) read_amount = fn(value) { *value };
 Packet(u64, u64, bool) factory = fn(depth, length, choose) {
     if (depth == 0) {
         if (choose) { make_packet(length) } else { Packet selected = make_alt(length); selected }
@@ -24,7 +25,7 @@ Packet(u64, u64, bool) factory = fn(depth, length, choose) {
         Packet frame = make_packet(extent);
         frame.length;
         Packet incoming = factory(depth - 1, length, !choose);
-        incoming.length;
+        read_amount(&incoming.length);
         Packet intermediate = incoming;
         intermediate.length;
         Packet selected = intermediate;

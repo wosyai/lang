@@ -23,7 +23,7 @@ pub(super) struct AggregateFlowFacts {
     pub(super) scalar_cells: BTreeSet<CfgPointId>,
     pub(super) raw_addresses: BTreeMap<CfgPointId, (ReferenceBindingId, bool)>,
     pub(super) opaque_container_inputs: BTreeMap<CfgPointId, Vec<CfgPointId>>,
-    pub(super) receipt_loan_read_calls: BTreeMap<CfgPointId, CfgPointId>,
+    pub(super) receipt_loan_read_calls: BTreeMap<CfgPointId, (CfgPointId, OccurrenceOrdinal)>,
     pub(super) receipt_loan_sinks: BTreeMap<CfgPointId, Vec<CfgPointId>>,
     pub(super) receipt_loan_address_sinks: BTreeMap<CfgPointId, ReferenceBindingId>,
     pub(super) receipt_loan_forwarding: BTreeMap<CfgPointId, Vec<CfgPointId>>,
@@ -1171,6 +1171,7 @@ pub(super) struct AggregateFlowResult {
     pub(super) conditional_input_regions: BTreeMap<CfgPointId, ConditionalInputRegion>,
     pub(super) conditional_input_barriers: BTreeSet<CfgPointId>,
     direct_receipt_bindings: BTreeMap<CfgPointId, (CfgPointId, ReferenceBindingId)>,
+    immediate_receipt_reads: BTreeMap<CfgPointId, Option<(OccurrenceOrdinal, CfgPointId, CfgPointId)>>,
     literal_array_route: Option<LiteralArrayRoute>,
     literal_array_unknown: bool,
     literal_array_join: LiteralArrayJoin,
@@ -2209,12 +2210,22 @@ impl AggregateFlowFacts {
                     let mut offset = None;
                     for (slot, argument) in argument_points.iter().enumerate() {
                         let value = state.values.get(argument);
-                        if slot == 0 && self.receipt_loan_read_calls.get(&id) == Some(argument)
-                            && matches!(value, Some(Value::ReceiptLoan { call, root }) if state.holds_receipt(points, *call, *root))
+                        if let (0, Some(&(checked_argument, ordinal)), Some(Value::ReceiptLoan { call, root })) =
+                            (slot, self.receipt_loan_read_calls.get(&id), value)
                         {
-                            // The checked input is proven read-only and cannot
-                            // escape; the caller retains its exact live receipt.
-                            continue;
+                            if checked_argument == *argument && state.holds_receipt(points, *call, *root) {
+                                // Keep the checked loan transient, but retain exact evidence
+                                // for a linear borrow→call owning return corridor.
+                                if root == argument && matches!(target,
+                                    ResolvedCallTarget::ModuleCallable { concrete: ConcreteCallSelection::Declaration, .. })
+                                {
+                                    let receipt = Some((ordinal, *root, *call));
+                                    result.immediate_receipt_reads.entry(id).and_modify(|known| {
+                                        if *known != receipt { *known = None; }
+                                    }).or_insert(receipt);
+                                }
+                                continue;
+                            }
                         }
                         if result.reject_receipt_loan(id, value) {
                             continue;
@@ -2724,8 +2735,8 @@ impl Body<'_> {
     }
 
     // Single-receiver, same-scope whole moves preserve the original receipt.
-    // A linear observation corridor may read ordinary scalar fields of the
-    // current holder without transferring, borrowing, or altering its receipt.
+    // A linear observation corridor may read an ordinary scalar field or
+    // pass an immediate checked loan to a sealed reader of the current holder.
     fn named_terminal_producer(
         &self, block: BlockOrdinal, terminal: OccurrenceOrdinal, calls: &BTreeMap<usize, CfgPointId>,
         ty: &ScalarType,
@@ -2734,18 +2745,29 @@ impl Body<'_> {
         let BlockItemKind::FinalOutput(output) = &last.kind else { return None };
         if output.expression != terminal { return None }
         let mut use_ordinal = terminal;
+        enum Observation<'a> {
+            Field(&'a ReferenceBindingId, &'a ScalarStructFieldId, ByteSpan),
+            Reader(OccurrenceOrdinal),
+        }
+        let facts = self.facts?;
         let mut links = Vec::new();
         let mut observations = Vec::new();
         let (producer, installed) = 'producer: {
             for item in statements.iter().rev() {
                 if let BlockItemKind::Evaluation { expression } = &item.kind {
-                    let (holder, field) = self.sites.prepared_lexical_member(*expression)?;
-                    if !self.sites.structure.checked_types.expressions.get(expression).is_some_and(ordinary_value)
-                        || !matches!(ty, ScalarType::Struct(descriptor) if *descriptor == field.structure)
-                    {
+                    if !self.sites.structure.checked_types.expressions.get(expression).is_some_and(ordinary_value) {
                         return None;
                     }
-                    observations.push((holder, field, self.sites.occurrences.get(expression.0)?.span));
+                    if let Some((holder, field)) = self.sites.prepared_lexical_member(*expression) {
+                        if !matches!(ty, ScalarType::Struct(descriptor) if *descriptor == field.structure) {
+                            return None;
+                        }
+                        observations.push(Observation::Field(holder, field, self.sites.occurrences.get(expression.0)?.span));
+                    } else if self.sites.checked_call_signatures.contains_key(expression) {
+                        observations.push(Observation::Reader(*expression));
+                    } else {
+                        return None;
+                    }
                     continue;
                 }
                 let BlockItemKind::Binding(bind) = &item.kind else { return None };
@@ -2758,7 +2780,7 @@ impl Body<'_> {
                 links.push((identity, self.sites.occurrences.get(use_ordinal.0)?.span,
                     std::mem::take(&mut observations)));
                 if let Some(&producer) = calls.get(&init.primary.0) {
-                    let (bound, original) = self.facts?.direct_receipt_bindings.get(&producer)?;
+                    let (bound, original) = facts.direct_receipt_bindings.get(&producer)?;
                     if original != identity { return None }
                     break 'producer (producer, *bound);
                 }
@@ -2776,21 +2798,35 @@ impl Body<'_> {
         let mut links = links.into_iter().rev().peekable();
         while let Some((identity, span, observations)) = links.next() {
             let mut cursor = bind;
-            for (holder, field, observation_span) in observations.into_iter().rev() {
+            for observation in observations.into_iter().rev() {
                 let observed = next(cursor)?;
-                let CfgPointKind::ReadPlace {
-                    place: ScalarPlace::Field { base, field: ScalarFieldReference::Resolved(written), .. },
-                    pointer_point: None, candidates, reads_origin: false,
-                } = &observed.kind else { return None };
-                let [candidate] = candidates.as_slice() else { return None };
-                if holder != identity || written != field || observed.source_span.range != observation_span
-                    || !matches!(base.as_ref(), ScalarPlace::Name { .. }) || candidate.binding != *identity
-                    || !matches!(candidate.projections.as_slice(),
-                        [ReferencePlaceProjection::Field(ScalarFieldReference::Resolved(field_id))] if field_id == field)
-                {
-                    return None;
+                match observation {
+                    Observation::Field(holder, field, observation_span) => {
+                        let CfgPointKind::ReadPlace {
+                            place: ScalarPlace::Field { base, field: ScalarFieldReference::Resolved(written), .. },
+                            pointer_point: None, candidates, reads_origin: false,
+                        } = &observed.kind else { return None };
+                        let [candidate] = candidates.as_slice() else { return None };
+                        if holder != identity || written != field || observed.source_span.range != observation_span
+                            || !matches!(base.as_ref(), ScalarPlace::Name { .. }) || candidate.binding != *identity
+                            || !matches!(candidate.projections.as_slice(),
+                                [ReferencePlaceProjection::Field(ScalarFieldReference::Resolved(field_id))] if field_id == field)
+                        {
+                            return None;
+                        }
+                        cursor = observed;
+                    }
+                    Observation::Reader(ordinal) => {
+                        let CfgPointKind::Borrow { place, .. } = &observed.kind else { return None };
+                        let call = next(observed)?;
+                        if &place.binding != identity
+                            || facts.immediate_receipt_reads.get(&call.id) != Some(&Some((ordinal, observed.id, producer)))
+                        {
+                            return None;
+                        }
+                        cursor = call;
+                    }
                 }
-                cursor = observed;
             }
             let read = next(cursor)?;
             let moved = next(read)?;

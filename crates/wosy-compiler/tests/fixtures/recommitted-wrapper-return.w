@@ -18,11 +18,12 @@ Packet(u64) inner_owner = fn(length) {
     independent.length;
     shipped
 };
+u64(*Packet) read_amount = fn(view) { (*view).length };
 Packet(u64) outer_owner = fn(length) {
     Packet incoming = inner_owner(length);
     Packet outgoing = second_identity(incoming);
     Packet moved = outgoing;
-    moved.length;
+    read_amount(&moved);
     Packet returned = moved;
     returned
 };
