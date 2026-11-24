@@ -1507,18 +1507,18 @@ pub(super) fn commit_return<'ctx>(
         aggregate.committed = true;
         return Ok(());
     }
-    if let Some(ClosedReturn::Recommit { call, output }) = aggregate.plan.returning {
+    if let Some(ClosedReturn::Recommit { call, output } | ClosedReturn::NamedRoot { call, output }) = aggregate.plan.returning {
         let returned = block.final_expressions().next().and_then(|(expression, _)|
             state.body_call_nodes.and_then(|nodes| nodes.expression_ordinal(expression)));
         let [descriptor] = outputs.outputs.as_slice() else {
-            return Err("recommitted aggregate return is not a single descriptor".into());
+            return Err("named aggregate return is not a single descriptor".into());
         };
         if returned != Some(output) || !matches!(descriptor.ty, ScalarType::Struct(_)) || aggregate.committed {
-            return Err("recommitted aggregate return changed its proved root output".into());
+            return Err("named aggregate return changed its proved root output".into());
         }
-        let destination = aggregate.destination.ok_or_else(|| "missing recommitted aggregate destination".to_owned())?;
+        let destination = aggregate.destination.ok_or_else(|| "missing named aggregate destination".to_owned())?;
         let base = aggregate.receipts.remove(&call)
-            .ok_or_else(|| "missing original backing at recommitted aggregate return".to_owned())?;
+            .ok_or_else(|| "missing original backing at named aggregate return".to_owned())?;
         store_value(context, state, destination, &descriptor.ty, result.clone())?;
         let aggregate = state.aggregate.as_mut().expect("recommitted aggregate return frame");
         aggregate.set_base(base)?;
@@ -1599,7 +1599,7 @@ pub(super) fn finish_return<'ctx>(
     let Some(route) = aggregate.plan.returning else {
         return Ok(None);
     };
-    if matches!(route, ClosedReturn::Allocation { .. } | ClosedReturn::Recommit { .. } | ClosedReturn::Structured { .. }) && !aggregate.committed {
+    if matches!(route, ClosedReturn::Allocation { .. } | ClosedReturn::Recommit { .. } | ClosedReturn::NamedRoot { .. } | ClosedReturn::Structured { .. }) && !aggregate.committed {
         return Err("closed aggregate return did not commit ownership before cleanup".into());
     }
     if let Some(pair) = aggregate.mixed_return.take() {

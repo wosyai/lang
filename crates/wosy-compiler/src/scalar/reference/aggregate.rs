@@ -2428,6 +2428,7 @@ pub(crate) enum ClosedReturn {
     Allocation { block: usize, item: usize },
     Forward { call: OccurrenceOrdinal },
     Recommit { call: usize, output: usize },
+    NamedRoot { call: usize, output: usize },
     Structured { output: usize },
 }
 
@@ -4543,7 +4544,23 @@ fn closed_aggregates<'a>(
                                     body.source
                                 )
                             })?;
-                            ClosedReturn::Forward { call }
+                            if !body.has_mixed_struct_result() && !target_mixed {
+                                let root = body.sites.structure.root;
+                                let mut outputs = body.sites.structure.blocks[root.0].final_outputs();
+                                let output = outputs.next().filter(|output| output.output == 0 && outputs.next().is_none())
+                                    .ok_or_else(|| format!("aggregate forwarding has no single root output in {:?}", body.source))?;
+                                if output.expression == call {
+                                    ClosedReturn::Forward { call }
+                                } else if body.named_terminal_producer(root, output.expression,
+                                    &BTreeMap::from([(call.0, point)]), &body.sites.boundary.root_outputs[0].ty) == Some(point)
+                                {
+                                    ClosedReturn::NamedRoot { call: call.0, output: output.expression.0 }
+                                } else {
+                                    return Err(format!("aggregate forwarding has no exact root binding in {:?}", body.source));
+                                }
+                            } else {
+                                ClosedReturn::Forward { call }
+                            }
                         }
                     }
                 }
@@ -4625,6 +4642,14 @@ fn closed_aggregates<'a>(
                 } else {
                     plan.calls.insert(call.0, ClosedCall::ResultArm);
                 }
+                continue;
+            }
+
+            if matches!(return_route, Some(ClosedReturn::NamedRoot { call: returned, .. }) if returned == call.0) {
+                if previous.is_some() || discharged_by_inputs.contains_key(&(key, point)) || endpoints.next().is_some() {
+                    return Err(format!("named root aggregate result has competing ownership routes in {:?}", body.source));
+                }
+                plan.calls.insert(call.0, ClosedCall::Receive);
                 continue;
             }
 
