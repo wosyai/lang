@@ -7382,6 +7382,19 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
             {
                 self.structure.checker_ordinary_directive_calls.insert(ordinal, receipt);
             }
+            #[allow(unused_mut)]
+            let mut output = marker.output;
+            #[cfg(feature = "internal-checker")]
+            if let WalkMode::Callable(callable) = &self.mode {
+                use super::checker_directive::CheckerStateSelection;
+                for file in output.state_files.iter_mut() {
+                    if let CheckerStateSelection::Lexical(name) = &file.selection {
+                        if let Some(PlainNameIdentity::Lexical(binding)) = callable.target_resolver.plain_name(name, names) {
+                            file.selection = CheckerStateSelection::Binding(binding);
+                        }
+                    }
+                }
+            }
             self.structure.checker_directives.insert(
                 ordinal,
                 PreparedCheckerDirective {
@@ -7390,7 +7403,7 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
                     predicate,
                     initializer_predicate,
                     call_signature,
-                    output: marker.output,
+                    output,
                 },
             );
             return Ok(ordinal);

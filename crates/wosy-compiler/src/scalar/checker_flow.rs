@@ -1582,6 +1582,37 @@ impl IntegerInputs {
         self.project_domain(|row| &row[axis])
     }
 
+    pub(super) fn project_axis_bounded(&self, axis: usize, work: &mut usize) -> Option<Rc<IntegerSet>> {
+        let (first, rest) = self.0.split_first()?;
+        let first = &first[axis];
+        charge_call_work(work, 1)?;
+        let mut remaining = rest.iter().map(|row| &row[axis]);
+        while let Some(domain) = remaining.next() {
+            charge_call_work(work, 1)?;
+            if Rc::ptr_eq(first, domain) { continue; }
+
+            // Only allocate the distinct-set table once the shared-domain fast
+            // path fails. Prefix rows all point to `first`; don't rescan them.
+            let mut seen = std::collections::HashSet::new();
+            let mut unique = Vec::new();
+            let mut intervals = 0usize;
+            for domain in [first, domain].into_iter().chain(remaining) {
+                charge_call_work(work, 1)?;
+                if seen.insert(Rc::as_ptr(domain)) {
+                    let count = domain.interval_count();
+                    charge_call_work(work, count)?;
+                    intervals = intervals.checked_add(count)?;
+                    unique.push(domain.as_ref());
+                }
+            }
+            // IntegerSet::union gathers, sorts and normalizes intervals.
+            let levels = usize::BITS - intervals.leading_zeros();
+            charge_call_work(work, intervals.checked_mul(1 + levels as usize)?)?;
+            return Some(Rc::new(IntegerSet::union(unique)));
+        }
+        Some(Rc::clone(first))
+    }
+
     fn project_entry(&self, formal: usize) -> Option<Rc<IntegerSet>> {
         self.project_domain(|row| row.entry_domain(formal))
     }
@@ -3085,34 +3116,7 @@ impl ProjectedIntegerArgument<'_> {
         let Some(work) = self.affine_work.as_deref_mut() else { return self.materialize(); };
         #[cfg(test)]
         PROJECTED_ARGUMENT_MATERIALIZATIONS.with(|count| count.set(count.get() + 1));
-        let (first, rest) = self.path.0.split_first()?;
-        let first = &first[self.caller_axis];
-        charge_call_work(work, 1)?;
-        let mut remaining = rest.iter().map(|row| &row[self.caller_axis]);
-        while let Some(domain) = remaining.next() {
-            charge_call_work(work, 1)?;
-            if Rc::ptr_eq(first, domain) { continue; }
-
-            // Only allocate the distinct-set table once the shared-domain fast
-            // path fails. Prefix rows all point to `first`; don't rescan them.
-            let mut seen = std::collections::HashSet::new();
-            let mut unique = Vec::new();
-            let mut intervals = 0usize;
-            for domain in [first, domain].into_iter().chain(remaining) {
-                charge_call_work(work, 1)?;
-                if seen.insert(Rc::as_ptr(domain)) {
-                    let count = domain.interval_count();
-                    charge_call_work(work, count)?;
-                    intervals = intervals.checked_add(count)?;
-                    unique.push(domain.as_ref());
-                }
-            }
-            // IntegerSet::union gathers, sorts and normalizes intervals.
-            let levels = usize::BITS - intervals.leading_zeros();
-            charge_call_work(work, intervals.checked_mul(1 + levels as usize)?)?;
-            return Some(Rc::new(IntegerSet::union(unique)));
-        }
-        Some(Rc::clone(first))
+        self.path.project_axis_bounded(self.caller_axis, work)
     }
 
     pub(super) fn materialize(&self) -> Option<Rc<IntegerSet>> {
@@ -3166,7 +3170,7 @@ enum NestedIntegerOperand<'a> {
 
 // Hold a sticky exhausted value so argument discovery can distinguish a
 // missing operand from a refused scan even on the unary fallback route.
-fn charge_call_work(work: &mut usize, cost: usize) -> Option<()> {
+pub(super) fn charge_call_work(work: &mut usize, cost: usize) -> Option<()> {
     *work = work.saturating_add(cost);
     (*work <= MAX_PARTITION_TRANSFER_WORK).then_some(())
 }

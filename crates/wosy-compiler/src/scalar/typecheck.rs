@@ -3345,7 +3345,23 @@ fn check_expression_type_in_module(
                 expression_span(directive.condition),
                 diagnostics,
             );
-            let Some(output) = directive.output.explicit_literal() else {
+            #[cfg(feature = "internal-checker")]
+            let configured_output = directive.output.explicit_with_state(|expression| {
+                use super::checker_directive::CheckerStateSelection;
+                let selection = match expression {
+                    ScalarExpression::Name { name, .. } => CheckerStateSelection::Lexical(name.as_str().into()),
+                    ScalarExpression::Contextual { binding, .. } => CheckerStateSelection::Binding(binding.clone()),
+                    _ => return None,
+                };
+                let ty = expression_type_in_module_expected(
+                    expression, None, scope, visible_names, folded_names, module, modules, diagnostics,
+                    unsafe_context, overloads, inference,
+                );
+                (ty == ScalarType::Bool || is_integer_type(&ty)).then_some((selection, ty))
+            });
+            #[cfg(not(feature = "internal-checker"))]
+            let configured_output = directive.output.explicit_literal();
+            let Some(output) = configured_output else {
                 diagnostics.push(module_diagnostic(
                     module,
                     "B0003",

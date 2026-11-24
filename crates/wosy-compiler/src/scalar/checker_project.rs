@@ -492,6 +492,16 @@ fn run_prepared_ordered_check<E: OrderedRunEvidence>(
     } else {
         E::SymbolicReport::default()
     };
+    // Materialize authored state only for a completed check, before any
+    // client-visible stream/file effect can be planned.
+    if effects.has_authored_state {
+        let mut work = 0;
+        for record in &mut effects.records {
+            if !record.output.state_files.is_empty() {
+                record.output = Rc::new(render_authored_state(record, &mut work).ok_or(ProjectCheck::Unsupported)?);
+            }
+        }
+    }
     Ok(PreparedOrderedRun {
         active, directives: effects.records, actual: evidence, symbolic, entry_evidence: effects.entry_evidence,
     })
@@ -2144,6 +2154,8 @@ struct OrderedFailures {
     records: Vec<ScalarOrderedCheckerFailure>,
     payloads: OrderedFailurePayloads,
     #[cfg(feature = "internal-checker")]
+    has_authored_state: bool,
+    #[cfg(feature = "internal-checker")]
     entry_evidence: Option<Box<ScalarOrderedEntryEvidence>>,
 }
 
@@ -2196,6 +2208,8 @@ impl OrderedFailures {
         axes: Vec<(ReferenceBindingId, ScalarType)>,
         equal_axes: Vec<(usize, usize)>,
     ) {
+        #[cfg(feature = "internal-checker")]
+        { self.has_authored_state |= !directive.output.state_files.is_empty(); }
         self.records.push(ScalarOrderedCheckerFailure {
             source: source.clone(),
             operation: directive.operation.into(),
@@ -2231,6 +2245,92 @@ impl OrderedFailures {
             failure.equal_axes,
         );
     }
+}
+
+#[cfg(feature = "internal-checker")]
+fn render_authored_state(record: &ScalarOrderedCheckerFailure, work: &mut usize) -> Option<CheckedLiteralOutput> {
+    use super::{checker_directive::{CheckerStateSelection, ScalarCheckerTextFile}, checker_flow::charge_call_work};
+    let prepared = &record.output;
+    let count = prepared.text_files.len().checked_add(prepared.state_files.len())?;
+    let mut copied_bytes = prepared.stdout_bytes.len().checked_add(prepared.stderr_bytes.len())?;
+    for file in prepared.text_files.iter() {
+        charge_call_work(work, 1)?;
+        copied_bytes = copied_bytes.checked_add(file.path.len())?.checked_add(file.text.len())?;
+    }
+    for file in prepared.state_files.iter() {
+        charge_call_work(work, 1)?;
+        copied_bytes = copied_bytes.checked_add(file.path.len())?;
+    }
+    charge_call_work(work, count.checked_add(copied_bytes.div_ceil(32))?)?;
+    let mut output = (**prepared).clone();
+    let mut text = std::mem::take(&mut output.text_files).into_vec().into_iter();
+    let mut selected = std::mem::take(&mut output.state_files).into_vec().into_iter().peekable();
+    let mut files = Vec::with_capacity(count);
+    // Output paths may select the same authored binding. Reuse the exact
+    // projection and encoding only within this one immutable witness.
+    let mut encoded = HashMap::new();
+    for position in 0..count {
+        if selected.peek().is_some_and(|file| file.position == position) {
+            let file = selected.next()?;
+            let CheckerStateSelection::Binding(binding) = file.selection else { return None; };
+            let (ty, bytes) = match encoded.entry(binding) {
+                std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    charge_call_work(work, record.witness.axes.len().checked_add(1)?)?;
+                    let axis = record.witness.axes.iter().position(|(id, ty)| id == entry.key() && *ty == file.ty)?;
+                    let values = record.witness.state.project_axis_bounded(axis, work)?;
+                    let bytes = serialize_scalar_analysis_state(&file.ty, &values)?.into_bytes().into_boxed_slice();
+                    entry.insert((file.ty.clone(), bytes))
+                }
+            };
+            if *ty != file.ty { return None; }
+            // Each file owns its bytes; meter both copying and publication.
+            charge_call_work(work, bytes.len().div_ceil(32).checked_mul(2)?)?;
+            files.push(ScalarCheckerTextFile {
+                path: file.path, path_span: file.path_span, text_span: file.state_span, text: bytes.clone(),
+            });
+        } else {
+            files.push(text.next()?);
+        }
+    }
+    output.text_files = files.into_boxed_slice();
+    Some(output)
+}
+
+#[cfg(feature = "internal-checker")]
+fn serialize_scalar_analysis_state(ty: &ScalarType, values: &IntegerSet) -> Option<String> {
+    // Do not flatten disjoint or otherwise unrepresented domains into a
+    // wider range. The current vertical emits exact scalars or one interval.
+    if values.interval_count() != 1 { return None; }
+    let (min, max) = values.extremes()?;
+    let kind = match ty {
+        ScalarType::Bool => "bool",
+        ScalarType::I8 => "i8", ScalarType::I16 => "i16", ScalarType::I32 => "i32",
+        ScalarType::I64 => "i64", ScalarType::I128 => "i128",
+        ScalarType::U8 => "u8", ScalarType::U16 => "u16", ScalarType::U32 => "u32",
+        ScalarType::U64 => "u64", ScalarType::U128 => "u128",
+        _ => return None,
+    };
+    let mut result = format!(r#"{{"type":{{"kind":"{kind}"}},"value":"#);
+    if *ty == ScalarType::Bool {
+        if min != max { return None; }
+        match (min.sign(), min.bits()) {
+            (num_bigint::Sign::NoSign, 0) => result.push_str("false"),
+            (num_bigint::Sign::Plus, 1) => result.push_str("true"),
+            _ => return None,
+        }
+    } else {
+        let (floor, ceiling) = super::typecheck::integer_bounds(ty)?;
+        if min < &floor || max > &ceiling { return None; }
+        if min == max {
+            // Emit the exact decimal JSON number, never round through f64.
+            result.push_str(&min.to_string());
+        } else {
+            result.push_str(&format!(r#"{{"kind":"range","minimum":{min},"maximum":{max}}}"#));
+        }
+    }
+    result.push_str("}\n");
+    Some(result)
 }
 
 #[cfg(all(test, feature = "internal-checker"))]
@@ -9324,6 +9424,21 @@ mod tests {
             assert_eq!(body.structure.checker_contextual_read_locals.contains_key(&key), !allowed);
             assert_eq!(root_local_import_requirement(body).map(|(position, _)| position), allowed.then_some(2));
         }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn authored_scalar_state_keeps_exact_types_and_rejects_unrepresented_precision() {
+        let maximum = BigInt::from(u128::MAX);
+        let singleton = IntegerSet::singleton(&maximum);
+        assert_eq!(serialize_scalar_analysis_state(&ScalarType::U128, &singleton).unwrap(),
+            "{\"type\":{\"kind\":\"u128\"},\"value\":340282366920938463463374607431768211455}\n");
+        let boolean = IntegerSet::singleton(&BigInt::from(0u8));
+        assert_eq!(serialize_scalar_analysis_state(&ScalarType::Bool, &boolean).unwrap(),
+            "{\"type\":{\"kind\":\"bool\"},\"value\":false}\n");
+        let disjoint = boolean.join(IntegerSet::singleton(&BigInt::from(2u8)));
+        assert!(serialize_scalar_analysis_state(&ScalarType::U8, &disjoint).is_none());
+        assert!(serialize_scalar_analysis_state(&ScalarType::Bool, &IntegerSet::ordinary_bool_domain()).is_none());
     }
 
     #[cfg(feature = "internal-checker")]

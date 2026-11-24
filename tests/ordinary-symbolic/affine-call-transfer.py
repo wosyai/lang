@@ -871,6 +871,82 @@ cases.extend([
     ("ordinary-context-declaration-only-still-reports",
      context_declaration_only.replace("require(input == 2","require(input == 7"),161,b"CONTEXT-DECLARATION-ONLY"),
 ])
+def state_report(code, label, selected, extra=""):
+    return ('{ .stdout = ""; .stderr = "'+label+'"; .code = '+str(code)
+            +'; .files = [{ .path = "state.json"; .state = '+selected+'; }'+extra+']; }')
+
+state_range = f"""%%start
+    unit(i8) check = fn(value) {{
+        core.require(value <= 3, {state_report(162,"AUTHORED-RANGE","value",', { .path = "note.txt"; .text = "authored"; }')});
+    }};
+    %%end"""
+state_bool = f"""%%start
+    unit(bool) check = fn(flag) {{ core.require(flag, {state_report(163,"AUTHORED-BOOL","flag")}); }};
+    check(false);
+    %%end"""
+state_narrow = f"""%%start
+    unit(i8) check = fn(value) {{ core.narrow(value >= 2, {state_report(164,"PRESTATE","value")}); }};
+    check(1);
+    %%end"""
+state_i128 = f"""%%start
+    unit(i128) check = fn(value) {{
+        core.require(value != 170141183460469231731687303715884105727, {state_report(165,"I128","value")});
+    }};
+    %%end"""
+state_contextual = f"""%%start
+    unit(i8) check = fn(value) {{
+        i8 core.context.count = value;
+        core.require(core.context.count != 3, {state_report(166,"CONTEXT-STATE","core.context.count")});
+    }};
+    %%end"""
+state_holes = f"""%%start
+    unit(i8) check = fn(value) {{
+        core.narrow(value == 1 || value == 3, {report(167,"HOLES")});
+        core.require(false, {state_report(168,"UNREPRESENTED","value")});
+    }};
+    %%end"""
+state_repeated = state_range.replace(
+    '.path = "note.txt"; .text = "authored"; }',
+    '.path = "note.txt"; .text = "authored"; }, { .path = "state-copy.json"; .state = value; }',
+)
+state_atomic_report = state_report(
+    169, "NEVER-PUBLISHED", "stable",
+    ', { .path = "note.txt"; .text = "never published"; }, { .path = "later.json"; .state = value; }',
+).replace('.stdout = ""', '.stdout = "NEVER-PUBLISHED"')
+state_atomic = f"""%%start
+    unit(i8) check = fn(value) {{
+        core.narrow(value == 1 || value == 3, {report(167,"HOLES")});
+        i8 stable = 2;
+        core.require(stable != 2, {state_atomic_report});
+    }};
+    %%end"""
+cases.extend([
+    ("authored-state-repeated-binding",state_repeated,162,b"AUTHORED-RANGE"),
+    ("authored-state-later-unsupported-publishes-nothing",state_atomic,2,b"unsupported analysis"),
+    ("authored-state-range-and-text",state_range,162,b"AUTHORED-RANGE"),
+    ("exact-startup-authored-state-bool",state_bool,163,b"AUTHORED-BOOL"),
+    ("exact-startup-authored-state-failed-narrow-prestate",state_narrow,164,b"PRESTATE"),
+    ("authored-state-i128-exact",state_i128,165,b"I128"),
+    ("authored-state-active-context",state_contextual,166,b"CONTEXT-STATE"),
+    ("authored-state-holes-fail-closed",state_holes,2,b"unsupported analysis"),
+    ("authored-state-accepted-condition-writes-nothing",state_range.replace("value <= 3","value <= 127"),0,b""),
+])
+authored_files = {
+    "authored-state-range-and-text": {
+        "state.json": b'{"type":{"kind":"i8"},"value":{"kind":"range","minimum":4,"maximum":127}}\n',
+        "note.txt": b"authored",
+    },
+    "exact-startup-authored-state-bool": {"state.json": b'{"type":{"kind":"bool"},"value":false}\n'},
+    "exact-startup-authored-state-failed-narrow-prestate": {"state.json": b'{"type":{"kind":"i8"},"value":1}\n'},
+    "authored-state-i128-exact": {
+        "state.json": b'{"type":{"kind":"i128"},"value":170141183460469231731687303715884105727}\n',
+    },
+    "authored-state-active-context": {"state.json": b'{"type":{"kind":"i8"},"value":3}\n'},
+}
+authored_files["authored-state-repeated-binding"] = {
+    **authored_files["authored-state-range-and-text"],
+    "state-copy.json": authored_files["authored-state-range-and-text"]["state.json"],
+}
 with tempfile.TemporaryDirectory(prefix="affine-calls-") as path:
     root=Path(path)
     (root/"src").mkdir()
@@ -878,7 +954,7 @@ with tempfile.TemporaryDirectory(prefix="affine-calls-") as path:
         (root/"wosy.toml").write_text(manifest.format(output=target))
         for scope in ("--main-flow-only","--declared-package"):
             for name,text,expected,stderr in cases:
-                included = scope == "--declared-package" or name in ("exact-startup-lexical-copy", "exact-startup-inline-arithmetic", "exact-startup-lexical-comparison", "exact-startup-bool-argument", "exact-startup-staged-bool-result", "exact-startup-direct-guard-skips-dead-call", "exact-startup-direct-guard-reached-call-reports", "exact-startup-bare-directive-reports-empty-narrow", "exact-startup-contextual-input-to-bool-result")
+                included = scope == "--declared-package" or name.startswith("exact-startup-")
                 code = expected if included else 0
                 expected_stderr = stderr if included else b""
                 (root/"src/main.w").write_text(text.strip()+"\n")
@@ -888,6 +964,26 @@ with tempfile.TemporaryDirectory(prefix="affine-calls-") as path:
                 assert not res.stdout,res
                 if code==2:
                     assert expected_stderr in res.stderr,res
+                    if name == "authored-state-later-unsupported-publishes-nothing":
+                        assert b"NEVER-PUBLISHED" not in res.stderr,res
                 else:
                     assert res.stderr==expected_stderr,res
-                assert sorted(str(p.relative_to(root)) for p in root.rglob("*")) == ["src","src/main.w","wosy.toml"]
+                files = authored_files.get(name, {}) if included else {}
+                check_outputs = Path(".wosy/outputs/check")
+                expected_paths = {"src", "src/main.w", "wosy.toml"}
+                if files:
+                    expected_paths.update(str(path) for path in (check_outputs, *check_outputs.parents) if path != Path("."))
+                    expected_paths.update(str(check_outputs / filename) for filename in files)
+                observed_paths = {str(p.relative_to(root)) for p in root.rglob("*")}
+                assert observed_paths == expected_paths, {
+                    "case": name, "missing": sorted(expected_paths - observed_paths),
+                    "unexpected": sorted(observed_paths - expected_paths),
+                }
+                for filename, expected_bytes in files.items():
+                    artifact = root / check_outputs / filename
+                    assert artifact.read_bytes() == expected_bytes, artifact
+                    artifact.unlink()
+                if files:
+                    for path in (check_outputs, *check_outputs.parents):
+                        if path != Path("."):
+                            (root / path).rmdir()

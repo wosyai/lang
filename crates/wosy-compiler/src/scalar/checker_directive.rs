@@ -4,7 +4,7 @@ use num_bigint::BigInt;
 
 use super::{
     checker_flow::CheckerPredicate, control::CheckedCallSignature, symbolic_integer::IntegerRelation, typecheck::expression_span,
-    ByteSpan, ScalarExpression,
+    ByteSpan, ReferenceBindingId, ScalarExpression, ScalarType,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -58,6 +58,24 @@ pub(super) struct CheckedLiteralOutput {
     pub(super) stderr_bytes: Box<[u8]>,
     pub(super) code_value: BigInt,
     pub(super) text_files: Box<[ScalarCheckerTextFile]>,
+    pub(super) state_files: Box<[CheckerStateFile]>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(not(feature = "internal-checker"), allow(dead_code))]
+pub(super) enum CheckerStateSelection {
+    Lexical(Box<str>),
+    Binding(ReferenceBindingId),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct CheckerStateFile {
+    pub(super) position: usize,
+    pub(super) path: Box<str>,
+    pub(super) path_span: ByteSpan,
+    pub(super) state_span: ByteSpan,
+    pub(super) selection: CheckerStateSelection,
+    pub(super) ty: ScalarType,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -198,6 +216,12 @@ impl<'a> CheckedOutputTargets<'a> {
 
 impl CheckerOutput<'_> {
     pub(super) fn explicit_literal(&self) -> Option<CheckedLiteralOutput> {
+        self.explicit_with_state(|_| None)
+    }
+
+    pub(super) fn explicit_with_state(
+        &self, mut select: impl FnMut(&ScalarExpression) -> Option<(CheckerStateSelection, ScalarType)>,
+    ) -> Option<CheckedLiteralOutput> {
         let ScalarExpression::Utf8 { span: stdout, value: stdout_bytes } = self.stdout? else {
             return None;
         };
@@ -207,21 +231,30 @@ impl CheckerOutput<'_> {
         let ScalarExpression::Integer { span: code, value: code_value } = self.code? else {
             return None;
         };
-        let files = self.files.as_ref()?.iter()
-            .map(CheckerFileOutput::explicit_text)
-            .collect::<Option<Vec<_>>>()?;
         let mut targets = CheckedOutputTargets::default();
-        for file in &files {
-            if !targets.insert(file.path) {
-                return None;
+        let mut text_files = Vec::new();
+        let mut state_files = Vec::new();
+        for (position, file) in self.files.as_ref()?.iter().enumerate() {
+            let ScalarExpression::Utf8 { span: path_span, value: path_text } = file.path else { return None; };
+            let path = std::str::from_utf8(path_text).ok()?;
+            if !portable_relative_output_path(path) || !targets.insert(path) { return None; }
+            match &file.content {
+                CheckerFileContent::Text(ScalarExpression::Utf8 { span: text_span, value: text }) => {
+                    std::str::from_utf8(text).ok()?;
+                    text_files.push(ScalarCheckerTextFile {
+                        path: path.into(), path_span: *path_span, text_span: *text_span, text: text.as_slice().into(),
+                    });
+                }
+                CheckerFileContent::State(expression) => {
+                    let (selection, ty) = select(expression)?;
+                    state_files.push(CheckerStateFile {
+                        position, path: path.into(), path_span: *path_span,
+                        state_span: expression_span(expression), selection, ty,
+                    });
+                }
+                _ => return None,
             }
         }
-        let text_files = files.into_iter().map(|file| ScalarCheckerTextFile {
-            path: file.path.into(),
-            path_span: file.path_span,
-            text_span: file.text_span,
-            text: file.text.into(),
-        }).collect();
         Some(CheckedLiteralOutput {
             stdout: *stdout,
             stderr: *stderr,
@@ -230,7 +263,8 @@ impl CheckerOutput<'_> {
             stdout_bytes: stdout_bytes.as_slice().into(),
             stderr_bytes: stderr_bytes.as_slice().into(),
             code_value: code_value.clone(),
-            text_files,
+            text_files: text_files.into_boxed_slice(),
+            state_files: state_files.into_boxed_slice(),
         })
     }
 }
@@ -253,13 +287,6 @@ impl<'a> CheckerOutput<'a> {
             .transpose()?;
         Ok(Self { stdout, stderr, code, files, files_literal })
     }
-}
-
-struct BorrowedCheckerTextFile<'a> {
-    path: &'a str,
-    path_span: ByteSpan,
-    text_span: ByteSpan,
-    text: &'a [u8],
 }
 
 const MAX_PORTABLE_OUTPUT_PATH_BYTES: usize = 4096;
@@ -292,26 +319,6 @@ fn portable_relative_output_path(path: &str) -> bool {
 }
 
 impl<'a> CheckerFileOutput<'a> {
-    fn explicit_text(&self) -> Option<BorrowedCheckerTextFile<'a>> {
-        let ScalarExpression::Utf8 { span: path_span, value: path_text } = self.path else {
-            return None;
-        };
-        let CheckerFileContent::Text(ScalarExpression::Utf8 { span: text_span, value: text }) = &self.content else {
-            return None;
-        };
-        let path = std::str::from_utf8(path_text).ok()?;
-        if !portable_relative_output_path(path) {
-            return None;
-        }
-        std::str::from_utf8(text).ok()?;
-        Some(BorrowedCheckerTextFile {
-            path,
-            path_span: *path_span,
-            text_span: *text_span,
-            text,
-        })
-    }
-
     fn from_expression(expression: &'a ScalarExpression) -> Result<Self, CheckerDirectiveShapeError> {
         let [path, state, text] = record_fields(expression, ["path", "state", "text"])?;
         let span = expression_span(expression);
