@@ -978,10 +978,20 @@ fn independent_conditioned_owners_keep_separate_receipts_at_one_exit() {
         ("transfer-secondary", false, true, false, false), ("transfer-both", true, true, false, false),
         ("guard-secondary", false, true, true, false), ("guard-secondary-transfer-primary", true, true, true, false),
         ("guard-secondary-return-primary", false, true, true, true),
+        ("guard-primary-after-read", false, false, true, false),
+        ("guard-primary-after-recommit", false, false, true, false),
     ] {
+        let guard_primary = variant.starts_with("guard-primary-");
+        let migrate_primary = variant == "guard-primary-after-recommit";
         let mut text = factory_source.to_owned();
-        if primary_transfer || secondary_transfer {
+        if primary_transfer || secondary_transfer || guard_primary {
             text.push_str("u64(Packet) sink = fn(packet) { packet.length };\n");
+        }
+        if migrate_primary {
+            text.push_str("Packet(Packet) relay = fn(packet) { packet };\n");
+        }
+        if guard_primary {
+            text.push_str("u64(*Packet) read_amount = fn(view) { (*view).length };\n");
         }
         text.push_str(if primary_return { concat!(
             "Packet(Packet) relay = fn(packet) { packet };\n",
@@ -993,7 +1003,13 @@ fn independent_conditioned_owners_keep_separate_receipts_at_one_exit() {
             "    Packet second = if (right) { make_short(7) } else { make_long(9) };\n",
             "    second.length;\n",
         ));
-        if guarded { text.push_str("    if (take) { sink(second); };\n"); }
+        if guard_primary {
+            if migrate_primary {
+                text.push_str("    Packet current = relay(first);\n");
+            }
+            let holder = if migrate_primary { "current" } else { "first" };
+            text.push_str(&format!("    u64 saved = read_amount(&{holder});\n    if (take) {{ sink({holder}); }};\n"));
+        } else if guarded { text.push_str("    if (take) { sink(second); };\n"); }
         else if secondary_transfer { text.push_str("    sink(second);\n"); }
         text.push_str(if primary_return { concat!(
             "    Packet outgoing = relay(first);\n",
@@ -1001,7 +1017,8 @@ fn independent_conditioned_owners_keep_separate_receipts_at_one_exit() {
             "u64(bool, bool, bool) drive = fn(left, right, take) {\n",
             "    Packet received = shipment(left, right, take);\n",
             "    received.length\n};\n",
-        ) } else if primary_transfer { "    sink(first)\n};\n" } else { "    first.length\n};\n" });
+        ) } else if guard_primary { "    saved\n};\n" }
+            else if primary_transfer { "    sink(first)\n};\n" } else { "    first.length\n};\n" });
         let mut cases = Vec::new();
         for (case, left, right) in [("ff", "false", "false"), ("ft", "false", "true"), ("tf", "true", "false"), ("tt", "true", "true")] {
             if guarded {
@@ -1032,11 +1049,13 @@ fn independent_conditioned_owners_keep_separate_receipts_at_one_exit() {
                 let symbol = |name: &str| if project { function_with_suffix(&module, name) } else { name.to_owned() };
                 let find = |name: &str| module.get_function(&symbol(name)).unwrap();
                 let primary = find(if primary_return { "shipment" } else { "drive" });
-                let relay = primary_return.then(|| find("relay"));
+                let relay = (primary_return || migrate_primary).then(|| find("relay"));
+                let reader = guard_primary.then(|| find("read_amount"));
                 let mut relay_calls = 0;
+                let mut read_amounts = 0;
                 let mut returned = None;
                 let factories = [find("make_short"), find("make_long")];
-                let sink = (primary_transfer || secondary_transfer).then(|| find("sink"));
+                let sink = (primary_transfer || secondary_transfer || guard_primary).then(|| find("sink"));
                 let free = module.get_function("__wosy_core_free").unwrap();
                 let mut produced = [Vec::new(), Vec::new()];
                 let mut merges = Vec::new();
@@ -1065,7 +1084,12 @@ fn independent_conditioned_owners_keep_separate_receipts_at_one_exit() {
                         produced[choice].push((call.try_as_basic_value().basic().unwrap(), arg(1)));
                     } else if Some(callee) == sink {
                         assert_eq!(call.count_arguments(), 2);
+                        assert!(!guard_primary || read_amounts == 1, "guarded handoff follows the author's certified read");
                         passed.push(arg(1));
+                    } else if Some(callee) == reader {
+                        assert_eq!(relay_calls, usize::from(migrate_primary));
+                        assert_eq!(call.count_arguments(), 1);
+                        read_amounts += 1;
                     } else if Some(callee) == relay {
                         assert_eq!(call.count_arguments(), 1);
                         relay_calls += 1;
@@ -1087,13 +1111,14 @@ fn independent_conditioned_owners_keep_separate_receipts_at_one_exit() {
                 assert_ne!(chosen[0].0, chosen[1].0);
                 assert_ne!(chosen[0].1, chosen[1].1);
                 let expected_transfers = secondary_transfer.then_some(chosen[1].0).into_iter()
-                    .chain(primary_transfer.then_some(chosen[0].0));
+                    .chain((primary_transfer || guard_primary).then_some(chosen[0].0));
                 assert!(passed.iter().copied().eq(expected_transfers), "only the named receipts transfer in source order");
                 assert_eq!(guards, if guarded { vec![vec![0, 1]] } else { vec![] });
                 let expected_local = (!secondary_transfer || guarded).then_some(chosen[1].0).into_iter()
                     .chain((!primary_transfer && !primary_return).then_some(chosen[0].0));
                 assert!(released.iter().copied().eq(expected_local), "only retained original backings release locally");
-                assert_eq!(relay_calls, usize::from(primary_return));
+                assert_eq!(relay_calls, usize::from(primary_return || migrate_primary));
+                assert_eq!(read_amounts, usize::from(guard_primary));
                 assert_eq!(returned, primary_return.then_some(chosen[0].0), "only the primary backing may be returned");
                 if primary_return {
                     assert_eq!(primary.count_params(), 4, "one ordinary hidden result destination");
