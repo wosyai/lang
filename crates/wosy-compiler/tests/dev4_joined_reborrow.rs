@@ -827,3 +827,56 @@ fn joined_child_uses_only_the_certified_imported_reader() {
             "{target}: {:?}", build.diagnostics());
     }
 }
+
+#[test]
+fn joined_reader_wrapper_is_grounded_across_exact_module_declarations() {
+    let source = |path: &str| SourceIdentity::new("project".into(), "package".into(), path.into(), "r1".into());
+    let app = source("src/main.w");
+    let relay = source("src/relay.w");
+    let terminal = source("src/terminal.w");
+    let decoy = source("src/decoy.w");
+    let certified = "%%start\nu8(*u8) read = fn(view) { *view };\n%%end";
+    let uncertified = certified.replace("{ *view }", "{ *view + *view }");
+    let wrapper = "%%start\nend_reader = namespace package \"src/terminal.w\";\n\
+        u8(*u8) read = fn(view) { end_reader.read(view) };\n%%end";
+    let program = joined("parent = &!second;", true, "",
+        "u8 observed = relay.read(child); first = 3;")
+        .replace("%%start", "%%start\nrelay = namespace package \"src/relay.w\";")
+        .replace("    seen\n", "    if (observed == seen && first == 3) { observed } else { 0 }\n");
+    let declarations = |source: &SourceIdentity, text: &str| {
+        let parsed = parse_source(source.clone(), text.to_owned(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        derive_scalar_declarations_from_cst(parsed.result.canonical_cst())
+    };
+    for (target, target_layout) in [("native64", ScalarTargetLayout::NATIVE64), ("wasm32", ScalarTargetLayout::WASM32)] {
+        let prepare = |terminal_body: &str| {
+            let root = declarations(&app, &program);
+            let relay_module = declarations(&relay, wrapper);
+            let ns = root.namespaces().next().unwrap();
+            let root_bindings = vec![ScalarNamespaceBinding {
+                binding: ns.binding.clone(), target: relay.clone(), span: ns.span,
+            }];
+            let ns = relay_module.namespaces().next().unwrap();
+            let relay_bindings = vec![ScalarNamespaceBinding {
+                binding: ns.binding.clone(), target: terminal.clone(), span: ns.span,
+            }];
+            prepare_scalar_project(vec![(root, root_bindings), (relay_module, relay_bindings),
+                (declarations(&terminal, terminal_body), vec![]), (declarations(&decoy, certified), vec![])],
+                vec![app.clone(), relay.clone(), terminal.clone(), decoy.clone()],
+                ScalarPreparationInputs { target_layout }).unwrap()
+        };
+        let prepared = prepare(certified);
+        let build = analyze_scalar_build(&prepared);
+        assert!(build.diagnostics().is_empty(), "{target}: {:?}", build.diagnostics());
+        let ir = emit_scalar_build_project_llvm(&build).expect("cross-module joined reader LLVM").to_text();
+        if let Some(out) = std::env::var_os("WOSY_JOINED_MODULE_WRAPPER_IR_DIR") {
+            std::fs::write(std::path::PathBuf::from(out).join(format!("{target}-project.ll")), ir).unwrap();
+        }
+        let prepared = prepare(&uncertified);
+        let build = analyze_scalar_build(&prepared);
+        let reborrow = program.find("&(*parent)").unwrap() as u32;
+        assert!(build.diagnostics().iter().any(|d| d.code == "B0003"
+            && d.message == "missing required dereference origin" && d.labels.first()
+                .is_some_and(|label| label.span.range.start == reborrow)), "{target}: {:?}", build.diagnostics());
+    }
+}

@@ -10252,7 +10252,7 @@ fn resolve_program_call_sites_impl(
     occurrence_typing: PreparationOccurrenceTyping,
 ) -> Result<ModuleCallSites, ReferenceAnalysisError> {
     let declarations = CallDeclarationIndex::new(&[CallResolutionModule::program(program)]);
-    resolve_module_call_sites(
+    let mut calls = resolve_module_call_sites(
         &program.source,
         &program.items,
         &[],
@@ -10260,7 +10260,9 @@ fn resolve_program_call_sites_impl(
         program.resolved_assignment_outputs.as_map(),
         select_executable_calls,
         occurrence_typing,
-    )
+    )?;
+    ground_shared_reader_forwarders(std::iter::once((&program.source, &mut calls)));
+    Ok(calls)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -10395,6 +10397,7 @@ impl SharedScalarReadEffect {
 pub(super) struct ModuleCallSites {
     functions: BTreeMap<usize, FunctionCallSites>,
     shared_scalar_read_effects: HashMap<ByteSpan, SharedScalarReadEffect>,
+    shared_reader_forwarders: Vec<(ByteSpan, SourceSpan)>,
     pub(super) initialization: ModuleInitializationRegion,
 }
 
@@ -10892,6 +10895,10 @@ fn resolve_project_call_sites_impl(
             })
             .collect(),
     };
+    ground_shared_reader_forwarders(modules.iter().zip(&mut result.modules).filter_map(|(module, calls)| {
+        (!result.duplicate_sources.contains(&module.source)).then_some(())?;
+        Some((&module.source, calls.as_mut().ok()?))
+    }));
     // Only successfully prepared module rows may grant an imported reader
     // certificate. Duplicate full identities are never authority.
     let readers: HashMap<_, _> = modules.iter().zip(&result.modules).filter_map(|(module, calls)| {
@@ -12559,9 +12566,40 @@ fn close_local_shared_call_families(
     }));
 }
 
+fn ground_shared_reader_forwarders<'a>(
+    rows: impl Iterator<Item = (&'a SourceIdentity, &'a mut ModuleCallSites)>,
+) {
+    let mut rows: Vec<_> = rows.collect();
+    let source_ids: HashMap<_, _> = rows.iter().enumerate().map(|(index, (source, _))| (*source, index)).collect();
+    let mut reverse = HashMap::<(usize, ByteSpan), Vec<(usize, ByteSpan)>>::new();
+    let mut grounded = Vec::new();
+    for (index, (_, calls)) in rows.iter_mut().enumerate() {
+        for (declaration, target) in std::mem::take(&mut calls.shared_reader_forwarders) {
+            if let Some(&target_module) = source_ids.get(&target.source) {
+                reverse.entry((target_module, target.range)).or_default().push((index, declaration));
+            }
+        }
+        grounded.extend(calls.shared_scalar_read_effects.iter().filter_map(|(&declaration, effect)|
+            (effect.parameter == 0 && !effect.descriptor && !effect.returns_formal)
+                .then_some((index, declaration))));
+    }
+    // Seed only exact unary leaves so cycles, failed rows and same-offset
+    // declarations from another source cannot grant forwarding authority.
+    while let Some(target) = grounded.pop() {
+        if let Some(callers) = reverse.remove(&target) {
+            for (index, declaration) in callers {
+                rows[index].1.shared_scalar_read_effects.insert(declaration, SharedScalarReadEffect {
+                    parameter: 0, descriptor: false, forwarded: true, returns_formal: false,
+                });
+                grounded.push((index, declaration));
+            }
+        }
+    }
+}
+
 fn shared_scalar_reader_forward_target(
     source: &SourceIdentity, function: &ScalarFunction, calls: &FunctionCallSites,
-) -> Option<ByteSpan> {
+) -> Option<SourceSpan> {
     let [parameter] = calls.boundary.parameters.as_slice() else { return None };
     let ScalarType::CheckedReference { mutability: ScalarReferenceMutability::Shared, inner } =
         &parameter.ty else { return None };
@@ -12583,9 +12621,6 @@ fn shared_scalar_reader_forward_target(
     }
     let ResolvedCallTarget::ModuleCallable { source: target, declaration_span,
         concrete: ConcreteCallSelection::Declaration } = &calls.sites.get(call.site)?.target else { return None };
-    if target != source {
-        return None;
-    }
     let signature = calls.checked_call_signatures.get(&output)?;
     let [result_output] = signature.outputs.outputs.as_slice() else { return None };
     if signature.parameters.as_slice() != std::slice::from_ref(&parameter.ty) || result_output.ty != result.ty
@@ -12601,7 +12636,7 @@ fn shared_scalar_reader_forward_target(
         && binding.block_span == function.body.span && binding.declaration_span == parameter.span
         && binding.kind == ReferenceBindingKind::Declared
         && structure.checked_types.expressions.get(&argument) == Some(&parameter.ty))
-        .then_some(*declaration_span)
+        .then(|| SourceSpan::new(target.clone(), *declaration_span))
 }
 
 fn resolve_module_call_sites(
@@ -12617,7 +12652,7 @@ fn resolve_module_call_sites(
     stage_observations::record_call_sites();
     let mut functions = BTreeMap::new();
     let mut shared_scalar_read_effects = HashMap::new();
-    let mut reader_forwarders = HashMap::<ByteSpan, Vec<ByteSpan>>::new();
+    let mut shared_reader_forwarders = Vec::new();
     for (index, item) in items.iter().enumerate() {
         if let ScalarItem::Function(function) = item {
             let mut calls = resolve_function_call_sites(
@@ -12633,27 +12668,13 @@ fn resolve_module_call_sites(
                 if let Some(effect) = SharedScalarReadEffect::prepare(source, function, &calls) {
                     shared_scalar_read_effects.insert(function.name_span, effect);
                 } else if let Some(target) = shared_scalar_reader_forward_target(source, function, &calls) {
-                    reader_forwarders.entry(target).or_default().push(function.name_span);
+                    shared_reader_forwarders.push((function.name_span, target));
                 }
             }
             functions.insert(index, calls);
         }
     }
     if select_executable_calls {
-        // Propagate only outward from exact unary terminals. Each wrapper has
-        // one target and cannot nominate itself as authority; cycles have no seed.
-        let mut grounded: Vec<_> = shared_scalar_read_effects.iter().filter_map(|(&declaration, effect)|
-            (effect.parameter == 0 && !effect.descriptor && !effect.returns_formal).then_some(declaration)).collect();
-        while let Some(target) = grounded.pop() {
-            if let Some(callers) = reader_forwarders.remove(&target) {
-                for caller in callers {
-                    shared_scalar_read_effects.insert(caller, SharedScalarReadEffect {
-                        parameter: 0, descriptor: false, forwarded: true, returns_formal: false,
-                    });
-                    grounded.push(caller);
-                }
-            }
-        }
         for calls in functions.values_mut() {
             close_local_shared_call_families(source, calls, &shared_scalar_read_effects);
         }
@@ -12677,6 +12698,7 @@ fn resolve_module_call_sites(
     let calls = ModuleCallSites {
         functions,
         shared_scalar_read_effects,
+        shared_reader_forwarders,
         initialization,
     };
     if select_executable_calls {

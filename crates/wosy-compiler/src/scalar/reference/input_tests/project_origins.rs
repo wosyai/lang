@@ -489,6 +489,7 @@ fn actual_empty_module_keeps_its_successful_ordinal_slot() {
         vec![Ok(ModuleCallSites {
             functions: BTreeMap::new(),
             shared_scalar_read_effects: HashMap::new(),
+            shared_reader_forwarders: Vec::new(),
             initialization: ModuleInitializationRegion {
                 source: modules[0].source.clone(),
                 steps: Vec::new(),
