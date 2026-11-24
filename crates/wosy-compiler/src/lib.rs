@@ -205,7 +205,7 @@ mod tests {
         for (body, expected) in [
             ("result", "fallible allocation is not known to be available"),
             ("if (&result == null) { result } else { 7 }", "fallible allocation is not known to be available"),
-            ("7", "fallible allocation requires an exact proven null guard for its local binding"),
+            ("7", "local binding or parameter has no required static use"),
             ("result = 19;\n\t7", "fallible allocation access is not a supported whole Copy overwrite or direct guarded read"),
             ("*i32 alias = &result;\n\talias;\n\t7", "fallible allocation access is not a supported whole Copy overwrite or direct guarded read"),
         ] {
@@ -213,8 +213,15 @@ mod tests {
             let parsed = parse_source(source.clone(), text, &[]);
             assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
             let mut checked = derive_scalar_program(&parsed.result);
-            assert!(checked.diagnostics.iter().any(|diagnostic| diagnostic.message == expected),
-                "{body}: {:?}", checked.diagnostics);
+            let diagnostic = checked.diagnostics.iter().find(|diagnostic| diagnostic.message == expected)
+                .unwrap_or_else(|| panic!("{body}: {:?}", checked.diagnostics));
+            if body == "7" {
+                // An unused declaration is rejected by static-use validation
+                // before reference analysis can diagnose its missing guard.
+                assert_eq!(diagnostic.code, "B0009");
+                let span = diagnostic.labels[0].span.range;
+                assert_eq!(&parsed.result.text[span.start as usize..span.end as usize], "i32 result =? 3;");
+            }
             assert!(emit_scalar_llvm(&checked).is_err());
             checked.diagnostics.clear();
             assert!(emit_scalar_llvm(&checked).is_err());
