@@ -3433,6 +3433,24 @@ fn ordinary_parameter_set(ty: &ScalarType, allow_bool: bool) -> Option<IntegerSe
     IntegerSet::from_type(ty)
 }
 
+#[cfg(feature = "internal-checker")]
+pub(super) fn named_exact_mixed_pair<T>(parameters: &[T], ty: impl Fn(&T) -> &ScalarType) -> bool {
+    matches!(parameters, [first, second] if matches!((ty(first), ty(second)),
+        (ScalarType::Bool, integer) | (integer, ScalarType::Bool) if is_integer_type(integer)))
+}
+
+#[cfg(feature = "internal-checker")]
+pub(super) fn named_stack_parameters(parameters: &[ScalarType]) -> bool {
+    (matches!(parameters, [_] | [_, _]) && parameters.iter().all(is_integer_type))
+        || named_exact_mixed_pair(parameters, |ty| ty)
+}
+
+#[cfg(feature = "internal-checker")]
+pub(super) fn named_nested_scalar_parameters(parameters: &[ScalarType], result: &ScalarType) -> bool {
+    if *result == ScalarType::Bool && matches!(parameters, [] | [ScalarType::Bool]) { return true; }
+    (is_integer_type(result) || *result == ScalarType::Bool) && named_stack_parameters(parameters)
+}
+
 pub(super) enum ActualCallResult {
     Unit,
     EmptyUnit,

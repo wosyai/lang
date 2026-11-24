@@ -96,6 +96,8 @@ fn equal_call_spans_in_distinct_arms_keep_callable_owned_targets_without_resolut
             checker_targets: Vec::new(),
             #[cfg(feature = "internal-checker")]
             nested_proof_targets: Default::default(),
+            #[cfg(feature = "internal-checker")]
+            nested_scalar_routes: Default::default(),
             modules: vec![Ok(calls)],
         };
         let scope = layout::observations::Scope::new();

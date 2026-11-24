@@ -1151,7 +1151,8 @@ fn check_command(
         } else if let Some(slot) = failure.invocation.result_slot {
             format!("call returned output {} = {value}", slot + 1)
         } else { format!("call returned {value}") }];
-        if (failure.invocation.result_slot.is_some() || failure.invocation.returned_pair.is_some()
+        if (failure.invocation.outer_call.is_some()
+            || failure.invocation.result_slot.is_some() || failure.invocation.returned_pair.is_some()
             || matches!(failure.invocation.returned_literal, Some(wosy_compiler::ScalarCheckerProofLiteral::Character(_))))
             && !failure.invocation.arguments.is_empty()
         {

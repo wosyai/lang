@@ -5797,12 +5797,36 @@ struct CallDeclarationIndex<'a> {
     checker_proof_targets: HashSet<(&'a SourceIdentity, ByteSpan)>,
     #[cfg(feature = "internal-checker")]
     nested_proof_watch: HashMap<(&'a SourceIdentity, ByteSpan), ProofTargetUse>,
+    #[cfg(feature = "internal-checker")]
+    nested_scalar_work: std::cell::Cell<usize>,
+    #[cfg(feature = "internal-checker")]
+    nested_scalar_sources: HashSet<&'a SourceIdentity>,
+    #[cfg(feature = "internal-checker")]
+    nested_scalar_routes: std::cell::RefCell<NestedScalarRoutes>,
+}
+
+#[cfg(feature = "internal-checker")]
+type NestedScalarCallable = (usize, usize);
+
+#[cfg(feature = "internal-checker")]
+#[derive(Default)]
+struct NestedScalarRoutes {
+    callers: HashMap<NestedScalarCallable, Vec<NestedScalarCallable>>,
+    exhausted: bool,
 }
 
 #[cfg(feature = "internal-checker")]
 struct ProofTargetUse {
     declaration: (usize, usize),
-    nested: std::cell::Cell<bool>,
+    exact_scalar: bool,
+    nested: std::cell::RefCell<NestedProofUses>,
+}
+
+#[cfg(feature = "internal-checker")]
+#[derive(Default)]
+struct NestedProofUses {
+    exact_scalar_sites: HashSet<ByteSpan>,
+    unsupported: bool,
 }
 
 #[derive(Default)]
@@ -5924,14 +5948,35 @@ impl<'a> CallDeclarationIndex<'a> {
     }
 
     #[cfg(feature = "internal-checker")]
-    fn record_nested_proof_use(&self, caller: &SourceIdentity, target: &ResolvedCallTarget) {
+    fn record_nested_proof_use(&self, caller: &SourceIdentity, target: &ResolvedCallTarget, ordinary_span: Option<ByteSpan>) {
         if self.nested_proof_watch.is_empty() { return; }
         let ResolvedCallTarget::ModuleCallable { source, declaration_span, concrete: ConcreteCallSelection::Declaration } =
             target else { return; };
         if caller.project != source.project || caller.package != source.package { return; }
         if let Some(watched) = self.nested_proof_watch.get(&(source, *declaration_span)) {
-            watched.nested.set(true);
+            let mut nested = watched.nested.borrow_mut();
+            if let Some(span) = ordinary_span.filter(|_| watched.exact_scalar && caller == source) {
+                let mut work = self.nested_scalar_work.get();
+                let charged = super::checker_flow::charge_call_work(&mut work, 1).is_some();
+                self.nested_scalar_work.set(work);
+                if charged {
+                    nested.exact_scalar_sites.insert(span);
+                    return;
+                }
+            }
+            nested.unsupported = true;
         }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    fn nested_scalar_caller(&self, source: &SourceIdentity, function: &ScalarFunction) -> Option<NestedScalarCallable> {
+        if !self.nested_scalar_sources.contains(source) { return None; }
+        let ScalarType::Callable { outputs, parameters } = &function.signature else { return None; };
+        let [out] = outputs.outputs.as_slice() else { return None; };
+        if !super::checker_flow::named_nested_scalar_parameters(parameters, &out.ty) { return None; }
+        let &(span, CallFunctionKind::Ordinary, owner) = self.modules.get(source)?.functions.get(function.name.as_str())?
+            else { return None; };
+        (span == function.name_span).then_some(owner)
     }
 
     fn callable(
@@ -6727,6 +6772,15 @@ struct ContextualCallPlace {
 }
 
 impl FunctionCallSites {
+    #[cfg(feature = "internal-checker")]
+    pub(super) fn checker_pure_calling_frame(&self) -> bool {
+        self.assignments.is_empty() && self.allocation_length_calls.is_empty()
+            && self.arms.is_empty() && self.structure.checker_directives.is_empty()
+            && !self.structure.has_ordinary_contextual_places()
+            && !self.structure.checker_has_bool_contextual_declaration
+            && self.structure.checker_selected_snapshots.is_empty()
+    }
+
     #[cfg(any(test, feature = "internal-checker"))]
     pub(super) fn contextual_formal(&self) -> Option<(&ReferenceBindingId, &ScalarType)> {
         self.contextual_formal.as_ref().map(|(binding, ty, _)| (binding, ty))
@@ -6827,7 +6881,9 @@ pub(super) struct ProjectCallSiteResults {
     #[cfg(any(test, feature = "internal-checker"))]
     pub(super) checker_targets: Vec<Option<ResolvedCheckerTarget>>,
     #[cfg(feature = "internal-checker")]
-    nested_proof_targets: HashSet<(usize, usize)>,
+    nested_proof_targets: HashMap<(usize, usize), NestedProofUses>,
+    #[cfg(feature = "internal-checker")]
+    nested_scalar_routes: NestedScalarRoutes,
 }
 
 #[cfg(test)]
@@ -6840,7 +6896,32 @@ impl ProjectCallSiteResults {
 impl ProjectCallSiteResults {
     #[cfg(feature = "internal-checker")]
     pub(super) fn has_nested_proof_use(&self, target: (usize, usize)) -> bool {
-        self.nested_proof_targets.contains(&target)
+        self.nested_proof_targets.contains_key(&target)
+    }
+
+    #[cfg(feature = "internal-checker")]
+    pub(super) fn exact_nested_scalar_proof_sites(&self, target: (usize, usize)) -> Option<&HashSet<ByteSpan>> {
+        Some(&self.nested_proof_targets.get(&target)?.exact_scalar_sites)
+    }
+
+    #[cfg(feature = "internal-checker")]
+    pub(super) fn nested_proof_coverage(&self, target: (usize, usize)) -> Option<(usize, bool)> {
+        let uses = self.nested_proof_targets.get(&target)?;
+        Some((uses.exact_scalar_sites.len(), uses.unsupported))
+    }
+
+    #[cfg(feature = "internal-checker")]
+    pub(super) fn close_nested_scalar_routes(
+        &self, mut pending: Vec<NestedScalarCallable>, work: &mut usize,
+    ) -> Option<HashSet<NestedScalarCallable>> {
+        let mut routed = HashSet::new();
+        if !pending.is_empty() && self.nested_scalar_routes.exhausted { return None; }
+        while let Some(target) = pending.pop() {
+            let callers = self.nested_scalar_routes.callers.get(&target).map_or(&[][..], Vec::as_slice);
+            super::checker_flow::charge_call_work(work, callers.len().checked_add(1)?)?;
+            pending.extend(callers.iter().copied().filter(|&caller| routed.insert(caller)));
+        }
+        Some(routed)
     }
 
     pub(super) fn lookup_errors(&self) -> impl Iterator<Item = &ReferenceAnalysisError> {
@@ -7028,6 +7109,12 @@ fn resolve_project_call_sites_impl(
                 ScalarItem::Function(function) if matches!(&function.signature,
                     ScalarType::Callable { parameters, outputs } if matches!(parameters.as_slice(), [] | [_])
                         && matches!(outputs.outputs.as_slice(), [output] if matches!(output.ty, ScalarType::Bool | ScalarType::Char))));
+            let exact_scalar = matches!(&modules[declaration.0].items[declaration.1],
+                ScalarItem::Function(function) if matches!(&function.signature,
+                    ScalarType::Callable { parameters, outputs } if matches!(outputs.outputs.as_slice(), [output]
+                        if (output.ty == ScalarType::Bool && matches!(parameters.as_slice(), [] | [_]))
+                            || (qualified && is_integer_type(&output.ty)
+                                && matches!(parameters.as_slice(), [input] if is_integer_type(input))))));
             let result_pair_candidate = matches!(&modules[declaration.0].items[declaration.1],
                 ScalarItem::Function(function) if matches!(&function.signature,
                     ScalarType::Callable { parameters, outputs } if matches!(parameters.as_slice(), [] | [_])
@@ -7042,8 +7129,10 @@ fn resolve_project_call_sites_impl(
                         && matches!(outputs.outputs.as_slice(), [output]
                             if matches!(&output.ty, ScalarType::Array { element, .. } if is_integer_type(element)))));
             if same_package && (qualified || case_candidate || literal_candidate || result_pair_candidate || array_candidate) {
-                declarations.nested_proof_watch.entry((source, declaration_span))
-                    .or_insert(ProofTargetUse { declaration, nested: std::cell::Cell::new(false) });
+                let watch = declarations.nested_proof_watch.entry((source, declaration_span))
+                    .or_insert_with(|| ProofTargetUse { declaration, exact_scalar, nested: std::cell::RefCell::default() });
+                watch.exact_scalar |= exact_scalar;
+                if exact_scalar { declarations.nested_scalar_sources.insert(source); }
             }
         }
         Some(ResolvedCheckerTarget {
@@ -7084,8 +7173,13 @@ fn resolve_project_call_sites_impl(
         checker_targets,
         modules,
         #[cfg(feature = "internal-checker")]
-        nested_proof_targets: declarations.nested_proof_watch.values()
-            .filter_map(|target| target.nested.get().then_some(target.declaration)).collect(),
+        nested_proof_targets: declarations.nested_proof_watch.into_values()
+            .filter_map(|target| {
+                let uses = target.nested.into_inner();
+                (uses.unsupported || !uses.exact_scalar_sites.is_empty()).then_some((target.declaration, uses))
+            }).collect(),
+        #[cfg(feature = "internal-checker")]
+        nested_scalar_routes: declarations.nested_scalar_routes.into_inner(),
     }
 }
 
@@ -7117,6 +7211,8 @@ struct CallableWalk<'a> {
     target_resolver: CallableTargetResolver<'a>,
     #[cfg(feature = "internal-checker")]
     checker_name_span: ByteSpan,
+    #[cfg(feature = "internal-checker")]
+    checker_scalar_route: Option<(NestedScalarCallable, Vec<NestedScalarCallable>)>,
     #[cfg(feature = "internal-checker")]
     checker_fixed_array_output: bool,
     prepared: bool,
@@ -8465,13 +8561,13 @@ impl CallableWalk<'_> {
         let (target, declared_unsafe) = self
             .target_resolver
             .resolve(expression, names, types, signature, #[cfg(any(test, feature = "internal-checker"))] ordinary_origin)?;
-        #[cfg(feature = "internal-checker")]
-        self.target_resolver.declarations.record_nested_proof_use(self.target_resolver.source, &target);
         if declared_unsafe {
             self.declared_unsafe_calls.insert(ordinal.0);
         }
         let span = expression_span(expression);
         let source = self.target_resolver.source;
+        #[cfg(feature = "internal-checker")]
+        self.target_resolver.declarations.record_nested_proof_use(source, &target, Some(span));
         let site_index = match self.site_by_span.entry(CallSiteSpan(span)) {
             Entry::Occupied(entry) => {
                 let index = *entry.get();
@@ -8619,6 +8715,22 @@ fn initialization_call_target(
 }
 
 impl StructuralWalker<'_, '_> {
+    #[cfg(feature = "internal-checker")]
+    fn record_named_nested_scalar_route(&mut self, call: OccurrenceOrdinal) {
+        let WalkMode::Callable(walk) = &mut self.mode else { return; };
+        let Some((caller, callees)) = &mut walk.checker_scalar_route else { return; };
+        let Some(&callee) = self.structure.checker_direct_targets.get(&call) else { return; };
+        if caller.0 != callee.0 { return; }
+        let declarations = walk.target_resolver.declarations;
+        let mut work = declarations.nested_scalar_work.get();
+        if super::checker_flow::charge_call_work(&mut work, 1).is_some() {
+            callees.push(callee);
+        } else {
+            declarations.nested_scalar_routes.borrow_mut().exhausted = true;
+        }
+        declarations.nested_scalar_work.set(work);
+    }
+
     fn expression_children(
         &mut self,
         expression: &ScalarExpression,
@@ -8662,7 +8774,7 @@ impl StructuralWalker<'_, '_> {
                             None,
                         )?;
                         #[cfg(feature = "internal-checker")]
-                        resolver.declarations.record_nested_proof_use(resolver.source, &target);
+                        resolver.declarations.record_nested_proof_use(resolver.source, &target, None);
                         self.structural_calls.push(ordinal);
                         assert!(self
                             .allocation_length_call_targets
@@ -9438,6 +9550,8 @@ impl StructuralWalker<'_, '_> {
                     let binding = lexical.reference_id(callable.source, callable.function_span);
                     let key = (position.block, position.item);
                     if let Some((call, arguments)) = from_call {
+                        #[cfg(feature = "internal-checker")]
+                        self.record_named_nested_scalar_route(call);
                         self.structure.checker_integer_call_locals.insert(
                             key,
                             CheckerIntegerCallOrigin {
@@ -9455,6 +9569,9 @@ impl StructuralWalker<'_, '_> {
                 #[cfg(feature = "internal-checker")]
                 if let Some((source, callable, kind)) = ordinary_local.take() {
                     let binding = lexical.reference_id(callable.source, callable.function_span);
+                    if let CheckerOrdinaryScalarLocalKind::BoolCall(call) = &kind {
+                        self.record_named_nested_scalar_route(*call);
+                    }
                     self.structure.checker_has_affine_scalar_local |= matches!(&kind,
                         CheckerOrdinaryScalarLocalKind::Arithmetic {
                             operator: BinaryOperator::Add | BinaryOperator::Subtract,
@@ -10266,6 +10383,8 @@ fn resolve_function_call_sites(
         #[cfg(feature = "internal-checker")]
         checker_name_span: function.name_span,
         #[cfg(feature = "internal-checker")]
+        checker_scalar_route: declarations.nested_scalar_caller(source, function).map(|owner| (owner, Vec::new())),
+        #[cfg(feature = "internal-checker")]
         checker_fixed_array_output: declarations.checker_proof_targets.contains(&(source, function.name_span))
             && matches!(&function.signature, ScalarType::Callable { outputs, .. }
             if matches!(outputs.outputs.as_slice(), [out]
@@ -10370,7 +10489,7 @@ fn resolve_function_call_sites(
     let WalkMode::Callable(callable) = resolver.mode else {
         unreachable!("callable structural traversal")
     };
-    Ok(FunctionCallSites {
+    let calls = FunctionCallSites {
         boundary,
         #[cfg(any(test, feature = "internal-checker"))]
         contextual_owner: (function.span, function.name_span),
@@ -10398,7 +10517,19 @@ fn resolve_function_call_sites(
         assignments: resolver.assignments,
         conditionals: resolver.conditionals,
         short_circuits: resolver.short_circuits,
-    })
+    };
+    #[cfg(feature = "internal-checker")]
+    if let Some((owner, callees)) = callable.checker_scalar_route {
+        if !callees.is_empty() && calls.checker_pure_calling_frame() {
+            // These are the same typed bound call receipts consumed by the
+            // exact cursor, not a second walk of syntax or call occurrences.
+            let mut routes = declarations.nested_scalar_routes.borrow_mut();
+            for callee in callees {
+                routes.callers.entry(callee).or_default().push(owner);
+            }
+        }
+    }
+    Ok(calls)
 }
 
 #[cfg(test)]

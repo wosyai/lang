@@ -59,6 +59,10 @@ impl<Scalar: ScalarCatalogEvidence> ActualIntegerObserver for WithArrays<'_, '_,
         self.scalar.named_exact_watch(target)
     }
 
+    fn named_nested_scalar_route(&self, target: PreparedCallable) -> bool {
+        self.scalar.named_nested_scalar_route(target)
+    }
+
     fn enables_character_initializers(&self) -> bool {
         self.scalar.enables_character_initializers()
     }

@@ -2311,6 +2311,67 @@ for name, text, child, code, why in [
     namespace_children[name] = child
     cases.append((name, text, code, why))
 
+exact_nested_scalar_bool_leaf = "bool(i8) positive = fn(value) { if (value >= 0) { true } else { false } };"
+exact_nested_scalar_bool_proof = """proof scoped for positive(entry) -> (out) where (entry >= 0)
+    ensures (!out) { core.show(!out); }"""
+exact_nested_scalar_bool = f"""%%start
+    {exact_nested_scalar_bool_leaf}
+    i8(bool, i8) legacy = fn(enabled, value) {{ if (enabled) {{ value }} else {{ 4 }} }};
+    i8(i8) middle = fn(value) {{
+        i8 forwarded = legacy(true, value);
+        bool selected = positive(forwarded);
+        if (selected) {{ 7 }} else {{ 4 }}
+    }};
+    i8(i8) outer = fn(value) {{
+        i8 first = middle(value);
+        i8 second = middle(value);
+        if (first == 7) {{ second }} else {{ first }}
+    }};
+    {exact_nested_scalar_bool_proof}
+    i8 skipped = outer(-3);
+    i8 saved = outer(3);
+    core.require(saved == 7, {report(85,"WRONG-NESTED-RESULT")});
+    core.require(skipped == 4, {report(85,"WRONG-NESTED-GUARDED-RESULT")});
+%%end"""
+exact_nested_scalar_qualified = """%%start
+    imported = namespace app "calc.w";
+    proof bound for imported.pick(entry) -> (out) where (entry >= 0) ensures (out == 6) {}
+%%end"""
+exact_nested_scalar_library = """%%start
+    i8(i8) pick = fn(value) { if (value >= 0) { 7 } else { 4 } };
+    i8(i8) wrap = fn(value) { i8 result = pick(value); result };
+    i8 saved = wrap(3);
+%%end"""
+for name, text, code, why in [
+    ("exact-startup-nested-scalar-proof-bool-proved", exact_nested_scalar_bool.replace("!out", "out"), 0, b""),
+    ("exact-startup-nested-scalar-proof-bool-refuted", exact_nested_scalar_bool, 1, b"proof obligation failed"),
+    ("exact-startup-nested-scalar-proof-bool-guards-not-applicable",
+        exact_nested_scalar_bool.replace("outer(3)", "outer(-4)").replace("saved == 7", "saved == 4"), 0, b""),
+    ("ordinary-nested-scalar-proof-default-refuses-unobserved-site",
+        exact_nested_scalar_bool.replace("!out", "out").replace("%%end",
+            "i8(i8) dormant = fn(value) { bool selected = positive(value); if (selected) { 2 } else { 1 } }; %%end"),
+        2, b"unsupported analysis"),
+    ("ordinary-nested-scalar-proof-bool-symbolic",
+        f"%%start {exact_nested_scalar_bool_leaf} {exact_nested_scalar_bool_proof} %%end",
+        1, b"proof obligation failed"),
+    ("exact-startup-nested-scalar-proof-refuses-later-unobserved-effect",
+        exact_nested_scalar_bool.replace("%%end", "i8(i8) effectful = fn(value) { core.require(false, "
+            + report(86,"UNPUBLISHED-NESTED-AUTHORED-RESULT")
+            + "); bool selected = positive(value); if (selected) { 2 } else { 1 } }; i8 extra = effectful(3); %%end"),
+        2, b"unsupported analysis"),
+    ("exact-startup-nested-scalar-proof-refuses-unrelated-wrapper",
+        exact_nested_scalar_bool.replace("!out", "out").replace("%%end",
+            "i8(i8) plain = fn(value) { value }; i8(i8) isolated = fn(value) { i8 result = plain(value); result };"
+            "i8 unrelated = isolated(6); %%end"),
+        2, b"unsupported analysis"),
+    ("exact-startup-nested-scalar-proof-qualified-proved", exact_nested_scalar_qualified.replace("out == 6", "out == 7"),
+        0, b""),
+    ("exact-startup-nested-scalar-proof-qualified-refuted", exact_nested_scalar_qualified, 1, b"proof obligation failed"),
+]:
+    if "-qualified-" in name:
+        namespace_children[name] = exact_nested_scalar_library
+    cases.append((name, text, code, why))
+
 authored_case_proof = """%%start
     u8(u8) clamp = fn(value) { if (value > 10) { 10 } else { value } };
     proof clamped for clamp(x) -> (out) ensures (out <= 10) {
@@ -2906,6 +2967,9 @@ cases.extend([
 %%end"""), 1, b"proof obligation failed"),
 ])
 proof_diagnostic_notes = {
+    "exact-startup-nested-scalar-proof-bool-refuted": b"call entry: argument 1 = 3",
+    "exact-startup-nested-scalar-proof-qualified-refuted": b"call returned 7",
+    "ordinary-nested-scalar-proof-bool-symbolic": b"symbolic call can return true",
     "exact-startup-qualified-value-proof-refuted": b"call returned (output 1 = 3, output 2 = true)",
     "exact-startup-qualified-value-proof-owner-authored": b"call returned (output 1 = 3, output 2 = true)",
     "ordinary-qualified-value-proof-refuted": b"symbolic call can return (output 1 = 3, output 2 = true)",
@@ -3711,6 +3775,8 @@ with tempfile.TemporaryDirectory(prefix="affine-calls-") as path:
                         assert b"UNPUBLISHED-LEAF" not in res.stderr.splitlines(), res
                     if name == "exact-startup-qualified-value-proof-refuses-effectful-body":
                         assert b"NAMESPACE-EFFECT-NOT-PUBLISHED" not in res.stderr and b"proof obligation failed" not in res.stderr, res
+                    if name == "exact-startup-nested-scalar-proof-refuses-later-unobserved-effect":
+                        assert b"UNPUBLISHED-NESTED-AUTHORED-RESULT" not in res.stderr and b"proof obligation failed" not in res.stderr, res
                     if name == "exact-startup-real-integer-tail-rejects-reentry":
                         assert b"BEFORE-TAIL" not in res.stderr and b"AFTER-TAIL" not in res.stderr,res
                     if name == "authored-lexical-code-nonsingleton-fails-atomically":
@@ -3831,6 +3897,15 @@ with tempfile.TemporaryDirectory(prefix="affine-calls-") as path:
                         assert res.stderr.count(b"proved callable declared here") == 3, res
                         assert res.stderr.count(b"imported.cells(count)") == 4, res
                         assert res.stderr.count(b"proof imported_cell") == 2 and res.stderr.count(b"proof local_cell") == 2, res
+                    if name == "exact-startup-nested-scalar-proof-bool-refuted":
+                        failures = res.stderr.split(b"error: proof obligation failed")[1:]
+                        assert len(failures) == 2 and b"symbolic call" not in res.stderr, res
+                        assert all(b"through this call" in failure and b"reached from this call" in failure
+                            and b"positive(forwarded)" in failure and b"outer(3)" in failure and b"call returned true" in failure
+                            and b"call entry: argument 1 = 3" in failure for failure in failures), res
+                    if name == "exact-startup-nested-scalar-proof-qualified-refuted":
+                        assert b"src/main.w" in res.stderr and b"src/calc.w" in res.stderr and b"symbolic call" not in res.stderr, res
+                        assert b"pick(value)" in res.stderr and b"wrap(3)" in res.stderr and b"call entry: argument 1 = 3" in res.stderr, res
                     if name == "exact-startup-qualified-value-proof-owner-authored":
                         assert res.stderr.count(b"error: proof obligation failed") == 1, res
                         assert b"proof local_pair" in res.stderr and b"imported.pair(3)" in res.stderr, res
