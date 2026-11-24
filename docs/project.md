@@ -49,18 +49,28 @@ Rules:
 - Each builder needs `command` (argv, first element is the executable), optional `args`, and `toolchain_identity`. The same applies to runners.
 - Each target needs `root` (entry file relative to the project root), at least one artifact, one artifact profile, and one target profile naming its `main_artifact`.
 - Supported backend/output pairs are `llvm/native`, `llvm/wasm-wasip1`, `llvm/wasm-wasip2`, and `llvm/wasm-web`.
-- Select `output = "wasm-web"` for a browser-hosted artifact. Its builder should compile for `wasm32-unknown-unknown`. The runtime terminates on system panic with a Wasm trap and adds no WASI imports. The application can still declare host imports explicitly.
 
-An LLVM Wasm artifact profile can opt into stable root-function labels for its builder:
+## WebAssembly artifacts
+
+For browser hosting, set `output = "wasm-web"` and target
+`wasm32-unknown-unknown` in the builder. The runtime adds no WASI imports and
+traps on system panic. Declare any host imports in the source.
+
+Wasm builders link `runtime.ll` and need a linker that defines `__heap_base`
+after static storage and the reserved stack, such as `wasm-ld`. Fixed-size
+aggregate copies enable `memory.copy` per function, even with
+`-mno-bulk-memory`. Use a runner with Wasm bulk-memory support.
+
+To export a function from the target's entry file:
 
 ```toml
 [targets.app.artifacts.main.profiles.dev.exports]
 demo_score = "score"
 ```
 
-The optional table maps portable external labels to concrete functions in the selected target's entry file. It supports direct `i32`, `u32`, `i64`, `u64`, `f32`, and `f64` parameters and one such result or `unit`. The builder still selects labels to export (for example, `wasm-ld --export=demo_score`); its arguments do not change.
-
-Wasm builders must link `runtime.ll` with a linker that provides `__heap_base` after static storage and the reserved stack, as `wasm-ld` does. The generated LLVM IR enables Wasm bulk memory for functions that copy fixed-size aggregates. This per-function setting overrides Clang’s `-mno-bulk-memory` for those functions. Use a Wasm runner that supports `memory.copy`.
+Each label names a concrete function with `i32`, `u32`, `i64`, `u64`, `f32`,
+or `f64` parameters and one such result or `unit`. The builder must still
+export the label, for example with `wasm-ld --export=demo_score`.
 
 ## `wosy.lock`
 
