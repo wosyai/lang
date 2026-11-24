@@ -2,18 +2,37 @@
 
 The binary is named `wosy`. The target argument defaults to `[package] default_target`. Profiles default to `dev`.
 
+## Package command platforms
+
+Linux is the validated platform for package commands. Resolving or
+materializing Git packages requires Linux kernel 5.6 or newer, `/proc`,
+and Git on `PATH`. A local-only `dep add` does not use Git, but requires
+the Unix directory lock used for project metadata writes and is unavailable
+on non-Unix platforms. Reading local dependencies does not require Git or
+create package metadata. With no Git dependencies, `dep sync` only reads local
+declarations and does not write a manifest, lockfile, or checkout.
+
+## `wosy dep add SOURCE [--path PACKAGE_PATH]`
+
+Adds a local project-relative package path or a Git origin, with an optional
+repository-relative package directory or `wosy.toml` path. Existing pins are
+preserved; newly reached Git packages are resolved to exact commits. The
+command validates the complete graph and updates the project manifest and lock
+without installing checkouts. Run `wosy dep sync` to install them.
+
 ## `wosy dep sync`
 
-Git dependencies are supported on Linux (kernel 5.6 or newer, with
-`/proc` available). Uses Git on `PATH` to materialize the exact revisions already recorded in
+Materializes the exact Git revisions already recorded in
 [`wosy.lock`](project.md#wosylock). Run it after cloning a project with Git
 dependencies. It never selects a revision or rewrites the lockfile. Local
-dependencies stay where they are. A verified, unmodified dependency works
-offline; if an installed tree differs, sync fails without overwriting it.
+dependencies stay where they are. Sync reads their declarations to find
+transitive Git pins but does not load or check local source files. A verified,
+unmodified dependency works offline; if an installed tree differs, sync fails
+without overwriting it.
 
 ## `wosy parse [TARGET]`
 
-Parses only the target root file. Writes `.wosy/cst/<blake3>.json` and `.wosy/cst/current.json`, prints diagnostics to stderr, and exits 1 when diagnostics are present. Recovery preserves neighboring declarations in the snapshot, but the command still fails.
+Parses only the target root file, without loading its dependency graph. Writes `.wosy/cst/<blake3>.json` and `.wosy/cst/current.json`, prints diagnostics to stderr, and exits 1 when diagnostics are present. Recovery preserves neighboring declarations in the snapshot, but the command still fails.
 
 ## `wosy build [TARGET] --profile dev`
 

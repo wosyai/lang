@@ -71,8 +71,8 @@ source_root = "src"
 
 ## `wosy.lock`
 
-Commit `wosy.lock` with the project when it has Git dependencies, and ignore
-`deps/`. Declare only the Git origin and package directory in `wosy.toml`:
+Commit `wosy.lock` with the project when it has Git dependencies and ignore
+`deps/`. Only direct declarations belong in the consuming `wosy.toml`:
 
 ```toml
 [dependencies.math]
@@ -80,30 +80,50 @@ git = "https://example.org/math.git"
 path = "packages/math"
 ```
 
-The corresponding `wosy.lock` entry is `[packages.math]` under
-`version = 1`. It records `git`, `path` (explicitly `"."` for the repository
-root), `rev` (a full lowercase Git commit ID), and `source_hash` (the lowercase
-hex BLAKE3 hash of the original package content). The version 1 hash is
-BLAKE3 of the domain prefix `wosy-package-source-v1` followed by a zero byte,
-then, for each tracked regular file in package-relative UTF-8 path order: its
-path length in bytes (unsigned 64-bit little endian), its path bytes with
-`/` separators, and the 32 raw bytes of its file-content BLAKE3 hash.
+The lock includes all reached Git packages, including transitive packages.
+Each `[packages.<name>]` entry under `version = 1` records the origin (`git`),
+package directory (`path`, `"."` for a repository root), exact Git `rev`, and
+`source_hash` of the original tracked package bytes. Relative Git origins
+are interpreted from the consuming project root. In a Git package, a `path`-only
+declaration is relative to that package's directory in its Git repository. It
+selects the same origin and exact revision as the declaring package, with its
+own lock entry and original source hash. For example, `../support` in
+`packages/math` selects `packages/support` in that commit. Paths that leave the
+repository are rejected; these declarations never fall back to host paths.
+An explicit Git declaration names its origin and repository path as usual.
+A local manifest's `path` declarations are relative to that local package;
+local packages stay in place and are not in the lock. In a wholly local graph,
+an unrelated file that is not a managed Wosy lock is left untouched. Reaching
+a Git dependency requires a valid lock, except when adding a new Git pin.
+A valid Wosy lock must not contain unreachable pins.
 
-`wosy dep sync` requires those pins to be present. It checks the exact revision,
-package identity and original source hash before placing files at
-`deps/<name>/`, and keeps verification metadata separately under
-`deps/.wosy-pins/`. Each receipt is bound to that project, pin and checkout
-directory identity. It is not reusable by copying or moving a checkout to
-another project. Sync does not copy sibling packages from a repository.
-Normal builds use the current working source, including edits, but do not
-follow symlinks in Git dependency source paths. Changing a Git package's
-effective `source_root` invalidates earlier artifacts, even if the old files
-still exist. Sync does not
-overwrite an edited or unverified directory; move it aside before recreating
-the pinned tree. The initial command supports direct Git packages only, with
-regular tracked files; it rejects submodules, symlinks, transitive Git package
-declarations and project patches for Git dependencies. Pin creation, updates
-and patch replay are not implemented in this version.
+The dependency graph allows one binding per package name. Multiple paths to
+the same binding share one package; conflicting bindings, cycles, missing
+pins, and pins outside the reached Git graph are errors. There is no automatic
+version fallback. Builds and runs use the locked graph and the effective
+source roots, and never fetch or resolve versions. Sources stay editable;
+changing a reachable file or its routing makes an existing artifact stale.
+`wosy parse` reads only the selected root source and does not need the package
+graph installed.
+
+Use `wosy dep add <local-path>` or
+`wosy dep add <git-origin> --path <package-path>` to add a direct dependency.
+For Git, the package path may name a directory or the `wosy.toml` inside it.
+Add preserves existing pins and records the exact selected Git commit for
+each newly reached package. It updates the manifest and lock after verifying
+the complete graph; it does not publish a checkout. Run `wosy dep sync` to
+materialize the locked packages. See the [package command platforms](cli.md#package-command-platforms) for the write and Git requirements.
+
+Sync validates the exact original bytes of a staged package before installing
+anything from the graph. The version 1 source hash is BLAKE3 of
+`wosy-package-source-v1` followed by a zero byte, then, for each tracked
+regular file in sorted UTF-8 path order: its package-relative path length in
+bytes (unsigned 64-bit little endian), its path bytes with `/` separators,
+and the 32 raw bytes of its file-content BLAKE3 hash. Symlinks, submodules and
+patches for a Git dependency are not supported by this version. Sync does not
+overwrite an edited or unverified directory. Moving the same project with
+its checkouts preserves their provenance; copying them to a different project
+does not. Patch replay, snapshots and revision updates are not implemented.
 
 ## Source graph
 

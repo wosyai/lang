@@ -1,66 +1,65 @@
 use super::{
-    resolve_package, DependencyDeclaration, DependencySource, GitSource, ResolvedPackage,
+    dependency_document, dependency_package_table, load_dependency_package, parse_dependencies, DependencyDeclaration, DependencySource, GitSource, ResolvedPackage,
 };
-use std::collections::BTreeMap;
-use std::fs;
-use std::io::ErrorKind;
-use std::path::Path;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
 use toml_edit::{Item, Table};
 
+mod add;
 mod anchored;
 mod git_sync;
+mod git_wire;
+mod graph;
+mod snapshot;
 
+pub(crate) use snapshot::ProjectSnapshot;
+
+pub use add::add_dependency;
 pub use anchored::GitDirectory;
 pub use git_sync::sync_dependencies;
 
 const LOCKFILE: &str = "wosy.lock";
 const DEPS: &str = "deps";
 
-#[derive(Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PackageLock {
     pub(super) packages: BTreeMap<String, LockedPackage>,
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct LockedPackage {
-    pub(super) source: GitSource,
-    pub(super) revision: String,
-    pub(super) source_hash: String,
+    source: GitSource,
+    revision: git_wire::GitOid,
+    source_hash: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct LockedInputId([u8; 32]);
+
+impl LockedInputId {
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
 }
 
 impl LockedPackage {
-    fn input_identity(&self) -> String {
+    fn input_identity(&self) -> LockedInputId {
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"wosy-locked-input-v1\0");
         for field in [
-            &self.source.origin,
-            &self.revision,
-            &self.source.package_path,
-            &self.source_hash,
+            self.source.origin.as_str(),
+            self.revision.as_str(),
+            self.source.package_path.as_str(),
+            self.source_hash.as_str(),
         ] {
             hasher.update(&(field.len() as u64).to_le_bytes());
             hasher.update(field.as_bytes());
         }
-        hasher.finalize().to_hex().to_string()
+        LockedInputId(*hasher.finalize().as_bytes())
     }
 }
 
 impl PackageLock {
-    pub fn read(root: &Path) -> Result<Option<Self>, String> {
-        let path = root.join(LOCKFILE);
-        match fs::symlink_metadata(&path) {
-            Ok(metadata) if metadata.is_file() => {}
-            Ok(_) => return Err(format!("{LOCKFILE} must be a regular file")),
-            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(format!("cannot inspect {LOCKFILE}: {error}")),
-        }
-        let content = fs::read_to_string(path)
-            .map_err(|error| format!("cannot read {LOCKFILE}: {error}"))?;
-        Self::parse(content)
-            .map(Some)
-            .map_err(|error| format!("invalid {LOCKFILE}: {error}"))
-    }
-
     pub fn parse(content: String) -> Result<Self, String> {
         let document = toml_edit::ImDocument::parse(content).map_err(|error| error.to_string())?;
         if document.get("version").and_then(Item::as_integer) != Some(1) {
@@ -102,9 +101,14 @@ impl PackageLock {
                 LockedPackage {
                     source: GitSource {
                         origin: field("git", valid_origin)?,
-                        package_path: field("path", valid_package_path)?,
+                        package_path: normalize_package_path(
+                            table.get("path").and_then(Item::as_str)
+                                .ok_or_else(|| format!("package {name} has invalid path"))?,
+                        ).map_err(|_| format!("package {name} has invalid path"))?,
                     },
-                    revision: field("rev", valid_git_revision)?,
+                    revision: table.get("rev").and_then(Item::as_str)
+                        .and_then(|text| git_wire::GitOid::parse(text).ok())
+                        .ok_or_else(|| format!("package {name} has invalid rev"))?,
                     source_hash: field("source_hash", |hash| hash.len() == 64 && is_lower_hex(hash))?,
                 },
             );
@@ -121,7 +125,7 @@ impl PackageLock {
         for (name, pin) in &self.packages {
             let mut entry = Table::new();
             entry["git"] = value(&pin.source.origin);
-            entry["rev"] = value(&pin.revision);
+            entry["rev"] = value(pin.revision.as_str());
             entry["path"] = value(&pin.source.package_path);
             entry["source_hash"] = value(&pin.source_hash);
             packages.insert(name, Item::Table(entry));
@@ -132,127 +136,142 @@ impl PackageLock {
         document.to_string()
     }
 
-    pub fn check_declarations(
-        &self,
-        dependencies: &BTreeMap<String, DependencyDeclaration>,
-    ) -> Result<(), String> {
-        for (name, declaration) in dependencies {
-            let DependencySource::Git(source) = &declaration.source else {
-                continue;
-            };
-            let pin = self
-                .packages
-                .get(name)
-                .ok_or_else(|| format!("dependency {name} has no entry in {LOCKFILE}"))?;
-            if pin.source != *source {
-                return Err(format!("dependency {name} disagrees with {LOCKFILE}"));
-            }
+    fn pin_for(&self, name: &str, source: &GitSource) -> Result<&LockedPackage, String> {
+        let pin = self.packages.get(name)
+            .ok_or_else(|| format!("dependency {name} has no entry in {LOCKFILE}"))?;
+        if pin.source != *source {
+            return Err(format!("dependency {name} disagrees with {LOCKFILE}"));
         }
-        for name in self.packages.keys() {
-            if !dependencies
-                .get(name)
-                .is_some_and(|declaration| matches!(declaration.source, DependencySource::Git(_)))
-            {
-                return Err(format!("{LOCKFILE} contains undeclared Git dependency {name}"));
-            }
+        Ok(pin)
+    }
+
+    fn pin_for_requirement(&self, name: &str, requirement: &graph::GitRequirement) -> Result<&LockedPackage, String> {
+        let pin = self.pin_for(name, &requirement.source)?;
+        requirement.require_revision(name, &pin.revision)?;
+        Ok(pin)
+    }
+
+    fn check_reached(&self, reached: &BTreeSet<String>) -> Result<(), String> {
+        if let Some(name) = self.packages.keys().find(|name| !reached.contains(*name)) {
+            return Err(format!("{LOCKFILE} contains undeclared Git dependency {name}"));
         }
         Ok(())
     }
+
+
 }
 
-fn git_project(
-    root: &Path,
-    dependencies: &BTreeMap<String, DependencyDeclaration>,
-) -> Result<Option<(std::path::PathBuf, GitDirectory)>, String> {
-    dependencies
-        .values()
-        .any(|declaration| matches!(declaration.source, DependencySource::Git(_)))
-        .then(|| GitDirectory::project(root))
-        .transpose()
+struct GitProject {
+    root: PathBuf,
+    directory: GitDirectory,
 }
 
-fn locked_packages(
-    project: Option<&GitDirectory>,
-    dependencies: &BTreeMap<String, DependencyDeclaration>,
-) -> Result<PackageLock, String> {
-    let Some(project) = project else {
-        return Ok(PackageLock::default());
-    };
-    let content = project
-        .read_text(Path::new(LOCKFILE))?
-        .ok_or_else(|| format!("Git dependencies require {LOCKFILE}; dep sync does not select revisions"))?;
-    let lock = PackageLock::parse(content).map_err(|error| format!("invalid {LOCKFILE}: {error}"))?;
-    lock.check_declarations(dependencies)?;
-    Ok(lock)
+impl GitProject {
+    fn installed(&self, name: &str, pin: &LockedPackage) -> Result<Option<GitDirectory>, String> {
+        git_sync::reject_unsupported_patches(&self.directory, name)?;
+        git_sync::verify_installed(&self.root, &self.directory, name, pin)
+    }
 }
 
 pub(super) fn resolve_installed(
+    snapshot: &ProjectSnapshot,
     root: &Path,
+    package: &str,
     dependencies: &BTreeMap<String, DependencyDeclaration>,
 ) -> Result<BTreeMap<String, ResolvedPackage>, String> {
-    let project = git_project(root, dependencies)?;
-    let lock = locked_packages(project.as_ref().map(|(_, handle)| handle), dependencies)?;
-    dependencies
-        .iter()
-        .map(|(name, declaration)| {
-            let (package_root, checkout) = match &declaration.source {
-                DependencySource::Local { path } => (root.join(path), None),
-                DependencySource::Git(_) => {
-                    let (canonical, project) = project.as_ref().expect("opened Git project");
-                    git_sync::reject_unsupported_patches(project, name)?;
-                    let checkout = git_sync::verify_installed(canonical, project, name, &lock.packages[name])?
-                        .ok_or_else(|| format!("dependency {name} is not materialized; run wosy dep sync"))?;
-                    (root.join(DEPS).join(name), Some(checkout))
+    let mut git = None;
+    let resolution = graph::resolve(root, package, dependencies, |binding, parent, declaration| {
+        let name = declaration.name.as_str();
+        match binding {
+            graph::Binding::Local(_) => load_local(parent, declaration, None),
+            graph::Binding::Git(requirement) => {
+                let pin = snapshot.pin_for(name, requirement)?;
+                if git.is_none() {
+                    git = Some(snapshot.git_project()?);
                 }
-            };
-            let mut resolved = resolve_package(package_root, declaration, checkout)
-                .map_err(|error| error.diagnostics[0].message.clone())?;
-            if let Some(pin) = lock.packages.get(name) {
-                resolved.git_pin_identity = Some(pin.input_identity());
+                let git = git.as_ref().expect("opened Git project");
+                let checkout = git.installed(name, pin)?
+                    .ok_or_else(|| format!("dependency {name} is not materialized; run wosy dep sync"))?;
+                load_git(root, declaration, checkout, pin, None)
             }
-            Ok((name.clone(), resolved))
-        })
-        .collect()
+        }
+    })?;
+    snapshot.check_reached(&resolution.git_packages)?;
+    Ok(resolution.packages)
+}
+
+fn load_local(
+    parent: &Path,
+    declaration: &DependencyDeclaration,
+    inspected: Option<toml_edit::ImDocument<String>>,
+) -> Result<graph::LoadedPackage, String> {
+    let DependencySource::Local { path } = &declaration.source else {
+        return Err("expected a local package declaration".to_owned());
+    };
+    load_dependency_package(parent.join(path), declaration, None, inspected)
+        .map(Into::into)
+        .map_err(|error| error.diagnostics[0].message.clone())
+}
+
+fn load_local_declarations(
+    parent: &Path,
+    declaration: &DependencyDeclaration,
+) -> Result<graph::LoadedPackage, String> {
+    let DependencySource::Local { path } = &declaration.source else {
+        return Err("expected a local package declaration".to_owned());
+    };
+    let root = parent.join(path);
+    let error = |error: crate::DependencyResolutionError| error.diagnostics[0].message.clone();
+    let document = dependency_document(&root, declaration, None, None).map_err(error)?;
+    dependency_package_table(&document, declaration).map_err(error)?;
+    let dependencies = parse_dependencies(&root, &declaration.name, document.get("dependencies"))
+        .map_err(error)?;
+    Ok(graph::LoadedPackage { root, source: None, dependencies, revision: None })
+}
+
+fn load_git(
+    consuming_project: &Path,
+    declaration: &DependencyDeclaration,
+    checkout: GitDirectory,
+    pin: &LockedPackage,
+    inspected: Option<toml_edit::ImDocument<String>>,
+) -> Result<graph::LoadedPackage, String> {
+    let path = consuming_project.join(DEPS).join(&declaration.name);
+    let (mut package, dependencies) = load_dependency_package(path, declaration, Some(checkout), inspected)
+        .map_err(|error| error.diagnostics[0].message.clone())?;
+    package.git_pin_identity = Some(pin.input_identity());
+    let mut loaded: graph::LoadedPackage = (package, dependencies).into();
+    loaded.revision = Some(pin.revision.clone());
+    Ok(loaded)
 }
 
 pub(super) fn valid_origin(origin: &str) -> bool {
-    !origin.is_empty() && origin == origin.trim() && !origin.chars().any(char::is_control)
+    !origin.is_empty() && !origin.as_bytes().contains(&0)
 }
 
 pub(super) fn valid_package_name(name: &str) -> bool {
     let mut bytes = name.bytes();
     bytes.next().is_some_and(|first| first.is_ascii_lowercase())
         && bytes.all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
-        && valid_path_component(name)
-}
-
-pub(super) fn valid_git_revision(revision: &str) -> bool {
-    matches!(revision.len(), 40 | 64) && is_lower_hex(revision)
 }
 
 fn is_lower_hex(value: &str) -> bool {
     value.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
 }
 
-pub(super) fn valid_package_path(path: &str) -> bool {
-    path == "." || path.split('/').all(valid_path_component)
-}
-
-fn valid_path_component(component: &str) -> bool {
-    // Treat manifest paths the same on Unix and Windows. Git-internal names and
-    // DOS device names must not become package checkout paths.
-    let stem = component.split('.').next().unwrap_or_default().to_ascii_lowercase();
-    let dos_device = matches!(stem.as_str(), "con" | "prn" | "aux" | "nul")
-        || (["com", "lpt"].iter().any(|prefix| stem.starts_with(prefix))
-            && stem[3..].chars().count() == 1
-            && stem[3..].chars().all(|c| matches!(c, '0'..='9' | '¹' | '²' | '³')));
-    !component.is_empty()
-        && !component.ends_with(['.', ' '])
-        && !component.eq_ignore_ascii_case(".git")
-        && !dos_device
-        && !component
-            .chars()
-            .any(|c| c.is_control() || "\\:\"<>|?*".contains(c))
+pub(super) fn normalize_package_path(path: &str) -> Result<String, String> {
+    let relative = crate::PackageRelativePath::new(PathBuf::from(path))?;
+    let normalized: PathBuf = relative.as_path().components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(name) => Some(name),
+            _ => None,
+        }).collect();
+    if normalized.as_os_str().is_empty() {
+        Ok(".".to_owned())
+    } else {
+        normalized.into_os_string().into_string()
+            .map_err(|_| "Git package path is not UTF-8".to_owned())
+    }
 }
 
 #[cfg(test)]
@@ -303,8 +322,6 @@ mod tests {
         for (name, path) in [
             ("git_lib", "packages/../git_lib"),
             ("git_lib", "/packages/git_lib"),
-            ("git_lib", "packages/.Git/git_lib"),
-            ("git_lib", "packages/CON/git_lib"),
             ("../git_lib", "."),
             ("app", "."),
         ] {
@@ -326,17 +343,14 @@ mod tests {
         let lock = PackageLock::parse(unsorted).unwrap();
         assert_eq!(lock.render(), sorted);
         assert_eq!(PackageLock::parse(lock.render()).unwrap(), lock);
-        let graph = |origin| declarations(&format!(
-            "[dependencies.zulu]\ngit = \"../upstream\"\n[dependencies.alpha]\ngit = \"{origin}\"\n[dependencies.local_lib]\npath = \"../local_lib\"\n"
-        )).unwrap();
-        assert!(lock.check_declarations(&graph("../upstream")).is_ok());
+        let source = |origin: &str| GitSource { origin: origin.to_owned(), package_path: ".".to_owned() };
+        assert!(lock.pin_for("alpha", &source("../upstream")).is_ok());
         assert_eq!(
-            lock.check_declarations(&graph("../another")).unwrap_err(),
+            lock.pin_for("alpha", &source("../another")).unwrap_err(),
             "dependency alpha disagrees with wosy.lock"
         );
-        let empty = declarations("").unwrap();
         assert_eq!(
-            lock.check_declarations(&empty).unwrap_err(),
+            lock.check_reached(&BTreeSet::new()).unwrap_err(),
             "wosy.lock contains undeclared Git dependency alpha"
         );
         for bad_rev in ["main", "0123456"] {

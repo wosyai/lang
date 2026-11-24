@@ -17,3 +17,6 @@ wosy-syntax.workspace = true
 [[bin]]
 name = "wosy"
 path = "src/main.rs"
+
+[dev-dependencies]
+toml_edit.workspace = true

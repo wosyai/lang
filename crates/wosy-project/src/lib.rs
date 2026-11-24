@@ -3,7 +3,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
-use toml_edit::{DocumentMut, Item};
+use toml_edit::Item;
+#[cfg(test)]
+use toml_edit::DocumentMut;
 
 pub mod packages;
 
@@ -122,8 +124,9 @@ pub struct ResolvedPackage {
     pub name: String,
     #[serde(skip)]
     pub git_checkout: Option<packages::GitDirectory>,
-    #[serde(skip)]
-    pub git_pin_identity: Option<String>,
+    pub git_pin_identity: Option<packages::LockedInputId>,
+    pub local_root_identity: Option<PathBuf>,
+    pub dependencies: Vec<String>,
     pub project_root: PathBuf,
     pub source_root: PathBuf,
     pub identity: SourceIdentity,
@@ -475,17 +478,16 @@ impl ProjectConfiguration {
     }
 
     pub fn load_with_manifest(root: &Path) -> Result<(Self, toml_edit::ImDocument<String>), String> {
-        let path = root.join("wosy.toml");
-        let content = fs::read_to_string(&path).map_err(|error| error.to_string())?;
+        let snapshot = packages::ProjectSnapshot::reader(root)?;
         let document =
-            toml_edit::ImDocument::parse(content).map_err(|error| error.to_string())?;
+            toml_edit::ImDocument::parse(snapshot.manifest()?).map_err(|error| error.to_string())?;
         let package = document
             .get("package")
             .and_then(Item::as_table)
             .ok_or_else(|| "package is missing".to_owned())?;
         let package_name = scalar_string(package, "name")?;
         let dependencies = project_dependencies(root, &package_name, &document)?;
-        let resolved_packages = packages::resolve_installed(root, &dependencies)?;
+        let resolved_packages = packages::resolve_installed(&snapshot, root, &package_name, &dependencies)?;
         let default_target = scalar_string(package, "default_target")?;
         let builders = named_commands(document.get("builders"), "builder")?;
         let runners = named_runners(document.get("runners"))?;
@@ -528,11 +530,10 @@ impl ProjectConfiguration {
     }
 
     pub fn git_package(&self, name: &str) -> Result<Option<(&ResolvedPackage, &packages::GitDirectory)>, String> {
-        if !self.dependencies.get(name).is_some_and(|declaration| matches!(declaration.source, DependencySource::Git(_))) {
+        let Some(package) = self.resolved_packages.get(name) else { return Ok(None) };
+        if package.git_pin_identity.is_none() {
             return Ok(None);
         }
-        let package = self.resolved_packages.get(name)
-            .ok_or_else(|| format!("Git dependency {name} is not resolved"))?;
         let checkout = package.git_checkout.as_ref()
             .ok_or_else(|| format!("Git dependency {name} has no verified checkout handle"))?;
         Ok(Some((package, checkout)))
@@ -649,15 +650,18 @@ pub fn parse_dependencies(
                 )));
             }
             let package_path = match dependency.get("path") {
-                None => ".",
-                Some(path) => path
-                    .as_str()
-                    .filter(|path| packages::valid_package_path(path))
-                    .ok_or_else(|| invalid(format!("dependency {name} path must be a repository-relative package directory")))?,
+                None => ".".to_owned(),
+                Some(path) => packages::normalize_package_path(
+                    path.as_str().ok_or_else(|| invalid(format!(
+                        "dependency {name} path must be a repository-relative package directory"
+                    )))?,
+                ).map_err(|_| invalid(format!(
+                    "dependency {name} path must be a repository-relative package directory"
+                )))?,
             };
             DependencySource::Git(GitSource {
                 origin: origin.to_owned(),
-                package_path: package_path.to_owned(),
+                package_path,
             })
         } else {
             if dependency.iter().any(|(key, _)| key != "path") {
@@ -694,40 +698,58 @@ pub fn parse_dependencies(
     Ok(dependencies)
 }
 
+#[cfg(test)]
 fn resolve_package(
     package_root: PathBuf,
     declaration: &DependencyDeclaration,
     git_checkout: Option<packages::GitDirectory>,
 ) -> Result<ResolvedPackage, DependencyResolutionError> {
-    let name = &declaration.name;
-    let error = |message| DependencyResolutionError {
+    load_dependency_package(package_root, declaration, git_checkout, None).map(|(package, _)| package)
+}
+
+fn dependency_manifest_error(
+    declaration: &DependencyDeclaration,
+    message: String,
+) -> DependencyResolutionError {
+    DependencyResolutionError {
         diagnostics: vec![DependencyDiagnostic {
             code: "P0002".to_owned(),
             message,
             span: declaration.span.clone(),
         }],
-    };
-    let content = if let Some(checkout) = &git_checkout {
-        checkout
-            .read_text(Path::new("wosy.toml"))
-            .map_err(error)?
-            .ok_or_else(|| error(format!("dependency {name} package manifest is missing")))?
-    } else {
-        fs::read_to_string(package_root.join("wosy.toml"))
-            .map_err(|_| error(format!("dependency {name} package manifest is missing")))?
-    };
-    let document = content
-        .parse::<toml_edit::ImDocument<String>>()
-        .map_err(|_| error(format!("dependency {name} package manifest is invalid")))?;
-    if matches!(declaration.source, DependencySource::Git(_))
-        && document
-            .get("dependencies")
-            .is_some_and(|item| !item.as_table().is_some_and(toml_edit::Table::is_empty))
-    {
-        return Err(error(format!(
-            "Git dependency {name} declares transitive dependencies, which are not supported yet"
-        )));
     }
+}
+
+fn dependency_document(
+    package_root: &Path,
+    declaration: &DependencyDeclaration,
+    git_checkout: Option<&packages::GitDirectory>,
+    inspected: Option<toml_edit::ImDocument<String>>,
+) -> Result<toml_edit::ImDocument<String>, DependencyResolutionError> {
+    let name = &declaration.name;
+    let error = |message| dependency_manifest_error(declaration, message);
+    if let Some(inspected) = inspected {
+        return Ok(inspected);
+    }
+    let content = if let Some(checkout) = git_checkout {
+            checkout
+                .read_text(Path::new("wosy.toml"))
+                .map_err(error)?
+                .ok_or_else(|| error(format!("dependency {name} package manifest is missing")))?
+        } else {
+            fs::read_to_string(package_root.join("wosy.toml"))
+                .map_err(|_| error(format!("dependency {name} package manifest is missing")))?
+        };
+    toml_edit::ImDocument::parse(content)
+        .map_err(|_| error(format!("dependency {name} package manifest is invalid")))
+}
+
+fn dependency_package_table<'a>(
+    document: &'a toml_edit::ImDocument<String>,
+    declaration: &DependencyDeclaration,
+) -> Result<&'a toml_edit::Table, DependencyResolutionError> {
+    let name = &declaration.name;
+    let error = |message| dependency_manifest_error(declaration, message);
     let package_table = document
         .get("package")
         .and_then(Item::as_table)
@@ -739,6 +761,20 @@ fn resolve_package(
             "dependency {name} package name is {resolved_name}"
         )));
     }
+    Ok(package_table)
+}
+
+fn load_dependency_package(
+    package_root: PathBuf,
+    declaration: &DependencyDeclaration,
+    git_checkout: Option<packages::GitDirectory>,
+    inspected: Option<toml_edit::ImDocument<String>>,
+) -> Result<(ResolvedPackage, BTreeMap<String, DependencyDeclaration>), DependencyResolutionError> {
+    let name = &declaration.name;
+    let error = |message| dependency_manifest_error(declaration, message);
+    let document = dependency_document(&package_root, declaration, git_checkout.as_ref(), inspected)?;
+    let package_table = dependency_package_table(&document, declaration)?;
+    let resolved_name = name.clone();
     let source_root = package_table
         .get("source_root")
         .and_then(Item::as_str)
@@ -755,10 +791,13 @@ fn resolve_package(
     if !source_exists {
         return Err(error(format!("dependency {name} source root is missing")));
     }
-    Ok(ResolvedPackage {
+    let dependencies = parse_dependencies(&package_root, &resolved_name, document.get("dependencies"))?;
+    Ok((ResolvedPackage {
         name: resolved_name.clone(),
         git_checkout,
         git_pin_identity: None,
+        local_root_identity: None,
+        dependencies: Vec::new(),
         source_root: package_root.join(&source_root),
         identity: SourceIdentity::new(
             package_root.to_string_lossy().into_owned(),
@@ -766,7 +805,7 @@ fn resolve_package(
             source_path,
         ),
         project_root: package_root,
-    })
+    }, dependencies))
 }
 
 #[cfg(test)]
@@ -1049,13 +1088,24 @@ impl ProjectContext {
     }
 
     pub fn load(root: &Path, target: &str) -> Result<Self, String> {
-        let config_path = root.join("wosy.toml");
-        let content = fs::read_to_string(&config_path)
-            .map_err(|error| format!("failed to read {}: {error}", config_path.display()))?;
-        let document = content
-            .parse::<DocumentMut>()
-            .map_err(|error| format!("failed to parse {}: {error}", config_path.display()))?;
-        Self::from_manifest(root, target, document.as_table())
+        Self::load_parse_target(root, Some(target))
+    }
+
+    /// Root-only parsing does not load package bindings or build profiles.
+    pub fn load_parse_target(root: &Path, target: Option<&str>) -> Result<Self, String> {
+        let path = root.join("wosy.toml");
+        let content = fs::read_to_string(&path)
+            .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+        let document = toml_edit::ImDocument::parse(content).map_err(|error| error.to_string())?;
+        let selected = match target {
+            Some(name) => name.to_owned(),
+            None => {
+                let package = document.get("package").and_then(Item::as_table)
+                    .ok_or_else(|| "package is missing".to_owned())?;
+                scalar_string(package, "default_target")?
+            }
+        };
+        Self::from_manifest(root, &selected, document.as_table())
     }
 
     pub fn from_manifest(
@@ -1512,6 +1562,8 @@ mod tests {
             ResolvedPackage {
                 git_checkout: None,
                 git_pin_identity: None,
+                local_root_identity: None,
+                dependencies: Vec::new(),
                 name: "std".to_owned(),
                 project_root: PathBuf::from("/stdlib"),
                 source_root: PathBuf::from("/stdlib/src"),
@@ -1639,7 +1691,7 @@ mod tests {
     }
 
     #[test]
-    fn local_project_loading_preserves_nested_sibling_root_without_reading_the_lock() {
+    fn local_project_loading_preserves_nested_sibling_root_with_legacy_lock() {
         let fixture = dependency_test_root();
         let project = fixture.join("project");
         let sibling_root = fixture.join("sibling");
@@ -1655,7 +1707,7 @@ mod tests {
             dependency_project_manifest("[dependencies.sibling]\npath = \"../sibling\""),
         )
         .expect("project manifest");
-        fs::write(project.join("wosy.lock"), "intentionally invalid lock")
+        fs::write(project.join("wosy.lock"), b"not a managed Wosy lock")
             .expect("legacy lock contents");
 
         let configuration = ProjectConfiguration::load(&project).expect("local package loads");
@@ -1681,7 +1733,6 @@ mod tests {
             "0".repeat(64)
         );
         fs::write(project.join("wosy.lock"), lock).expect("valid lockfile");
-        assert!(packages::PackageLock::read(&project).unwrap().is_some());
 
         for seeded in [false, true] {
             if seeded {
@@ -1697,11 +1748,11 @@ mod tests {
                 ProjectConfiguration::load(&project).unwrap_err(),
                 if seeded {
                     format!(
-                        "dependency vendored is not verified for its wosy.lock pin; move {} aside and run wosy dep sync",
+                        "app -> vendored: dependency vendored is not verified for its wosy.lock pin; move {} aside and run wosy dep sync",
                         project.join("deps/vendored").display()
                     )
                 } else {
-                    "dependency vendored is not materialized; run wosy dep sync".to_owned()
+                    "app -> vendored: dependency vendored is not materialized; run wosy dep sync".to_owned()
                 },
                 "seeded = {seeded}"
             );

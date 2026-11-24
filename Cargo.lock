@@ -617,6 +617,7 @@ dependencies = [
  "codespan-reporting",
  "serde",
  "serde_json",
+ "toml_edit",
  "wosy-compiler",
  "wosy-project",
  "wosy-syntax",

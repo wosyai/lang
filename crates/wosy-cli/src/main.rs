@@ -64,6 +64,12 @@ enum Command {
 
 #[derive(Subcommand)]
 enum DepCommand {
+    /// Add a local package or resolve and lock a Git package
+    Add {
+        source: String,
+        #[arg(long)]
+        path: Option<String>,
+    },
     /// Materialize the exact dependencies in wosy.lock
     Sync,
 }
@@ -71,15 +77,21 @@ enum DepCommand {
 fn main() -> ExitCode {
     let arguments = Arguments::parse();
     match arguments.command {
-        Command::Dep {
-            command: DepCommand::Sync,
-        } => match dep_sync_command() {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(error) => {
-                eprintln!("wosy: {error}");
-                ExitCode::from(1)
+        Command::Dep { command } => {
+            let result = match command {
+                DepCommand::Add { source, path } => dep_command(|root| {
+                    wosy_project::packages::add_dependency(root, &source, path.as_deref())
+                }),
+                DepCommand::Sync => dep_command(wosy_project::packages::sync_dependencies),
+            };
+            match result {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("wosy: {error}");
+                    ExitCode::from(1)
+                }
             }
-        },
+        }
         Command::Parse { target } => match parse_command(target.as_deref()) {
             Ok(valid) => {
                 if valid {
@@ -114,19 +126,16 @@ fn main() -> ExitCode {
     }
 }
 
-fn dep_sync_command() -> Result<(), String> {
+fn dep_command(action: impl FnOnce(&std::path::Path) -> Result<(), String>) -> Result<(), String> {
     let current = env::current_dir().map_err(|error| error.to_string())?;
     let root = discover_root(&current)?;
-    wosy_project::packages::sync_dependencies(&root)
+    action(&root)
 }
 
 fn parse_command(target: Option<&str>) -> Result<bool, String> {
     let current = env::current_dir().map_err(|error| error.to_string())?;
     let root = discover_root(&current)?;
-    let (configuration, document) = ProjectConfiguration::load_with_manifest(&root)?;
-    let target_name = configuration.resolve_target(target)?;
-    let project = ProjectContext::from_manifest(&root, &target_name, document.as_table())?;
-    drop(document);
+    let project = ProjectContext::load_parse_target(&root, target)?;
     let source_path = project.source_path();
     let text = fs::read_to_string(&source_path)
         .map_err(|error| format!("failed to read {}: {error}", source_path.display()))?;
@@ -275,29 +284,40 @@ fn project_configuration_identity(
     manifest: &[u8],
     configuration: &ProjectConfiguration,
 ) -> Result<String, String> {
-    let mut resolved_git = None;
-    for name in configuration.dependencies.keys() {
-        let Some((package, _)) = configuration.git_package(name)? else { continue };
-        let pin = package.git_pin_identity.as_deref()
-            .ok_or_else(|| format!("Git dependency {name} has no verified pin identity"))?;
+    if configuration.resolved_packages.is_empty() {
+        return Ok(blake3::hash(manifest).to_hex().to_string());
+    }
+    fn field(hasher: &mut blake3::Hasher, bytes: &[u8]) {
+        hasher.update(&(bytes.len() as u64).to_le_bytes());
+        hasher.update(bytes);
+    }
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"wosy-package-closure-v1\0");
+    hasher.update(blake3::hash(manifest).as_bytes());
+    hasher.update(&(configuration.resolved_packages.len() as u64).to_le_bytes());
+    for (name, package) in &configuration.resolved_packages {
         let source_root: std::path::PathBuf = package.identity.path.as_path().components()
             .filter_map(|component| match component {
                 std::path::Component::Normal(name) => Some(name),
                 _ => None,
             }).collect();
-        let hasher = resolved_git.get_or_insert_with(|| {
-            let mut hasher = blake3::Hasher::new();
-            hasher.update(b"wosy-build-git-config-v1\0");
-            hasher.update(blake3::hash(manifest).as_bytes());
-            hasher
-        });
-        for field in [name.as_bytes(), pin.as_bytes(), source_root.as_os_str().as_encoded_bytes()] {
-            hasher.update(&(field.len() as u64).to_le_bytes());
-            hasher.update(field);
+        field(&mut hasher, name.as_bytes());
+        field(&mut hasher, source_root.as_os_str().as_encoded_bytes());
+        if let Some(pin) = &package.git_pin_identity {
+            field(&mut hasher, b"git");
+            field(&mut hasher, pin.as_bytes());
+        } else {
+            field(&mut hasher, b"local");
+            let local = package.local_root_identity.as_ref()
+                .ok_or_else(|| format!("local dependency {name} has no canonical path"))?;
+            field(&mut hasher, local.as_os_str().as_encoded_bytes());
+        }
+        hasher.update(&(package.dependencies.len() as u64).to_le_bytes());
+        for dependency in &package.dependencies {
+            field(&mut hasher, dependency.as_bytes());
         }
     }
-    let identity = resolved_git.map(|hasher| hasher.finalize())
-        .unwrap_or_else(|| blake3::hash(manifest));
+    let identity = hasher.finalize();
     Ok(identity.to_hex().to_string())
 }
 
@@ -408,13 +428,13 @@ fn compile_project(
         project.package.as_str(),
         HashSet::from([root_path.clone()]),
     )]);
-    let mut pending = VecDeque::from([(project.package.as_str(), root_path)]);
+    let mut pending = VecDeque::from([(project.package.as_str(), root_path, None::<fs::File>)]);
     let mut root_node = None;
     let mut nodes = Vec::new();
     let mut declarations_by_path = BTreeMap::new();
     let mut texts = BTreeMap::new();
 
-    while let Some((package, path)) = pending.pop_front() {
+    while let Some((package, path, checked_git_source)) = pending.pop_front() {
         let (package_root, project_identity) = if package == project.package {
             (root, root_project.clone())
         } else {
@@ -429,9 +449,7 @@ fn compile_project(
         };
         let source_path = package_root.join(path.as_path());
         let read_error = |error| format!("failed to read {}: {error}", source_path.display());
-        let text = if let Some((_, checkout)) = configuration.git_package(package)? {
-            let mut file = checkout.source(path.as_path())?
-                .ok_or_else(|| format!("Git dependency source {} is missing", source_path.display()))?;
+        let text = if let Some(mut file) = checked_git_source {
             let mut text = String::new();
             file.read_to_string(&mut text).map_err(read_error)?;
             text
@@ -482,18 +500,18 @@ fn compile_project(
                 .get(target_package)
                 .is_some_and(|paths| paths.contains(target_path.as_ref()));
             if !already_discovered {
-                let exists = if let Some((_, checkout)) = configuration.git_package(target_package)? {
-                    checkout.source(target_path.as_path())?.is_some()
+                let available = if let Some((_, checkout)) = configuration.git_package(target_package)? {
+                    checkout.source(target_path.as_path())?.map(Some)
                 } else {
-                    target_root.join(target_path.as_path()).is_file()
+                    target_root.join(target_path.as_path()).is_file().then_some(None)
                 };
-                if exists {
+                if let Some(checked_git_source) = available {
                     let target_path = target_path.into_owned();
                     discovered
                         .entry(target_package)
                         .or_default()
                         .insert(target_path.clone());
-                    pending.push_back((target_package, target_path));
+                    pending.push_back((target_package, target_path, checked_git_source));
                 }
             }
             namespace_edges.push(NamespaceEdgeInput {

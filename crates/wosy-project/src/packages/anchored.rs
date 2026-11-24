@@ -20,6 +20,7 @@ impl PartialEq for GitDirectory {
 impl Eq for GitDirectory {}
 
 impl GitDirectory {
+    #[cfg(all(test, target_os = "linux"))]
     pub(super) fn project(root: &Path) -> Result<(PathBuf, Self), String> {
         let canonical = root
             .canonicalize()
@@ -67,7 +68,7 @@ impl GitDirectory {
     }
 
     pub(super) fn open(&self, relative: &Path) -> Result<Option<File>, String> {
-        portable_path(relative)?;
+        crate::PackageRelativePath::new(relative.to_path_buf())?;
         match platform::open_relative(&self.file, relative) {
             Ok(file) => Ok(Some(file)),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
@@ -98,56 +99,26 @@ impl GitDirectory {
         platform::descriptor_path(&self.file)
     }
 
-    pub(super) fn require_location(&self, expected: &Path) -> Result<(), String> {
-        let actual = self.descriptor_path().and_then(std::fs::read_link)
-            .map_err(|error| format!("cannot confirm current Git project location: {error}"))?;
-        if actual != expected {
-            return Err("project moved during dep sync; retry from its current directory".to_owned());
-        }
-        Ok(())
-    }
-
     pub(super) fn inherit_in(&self, command: &mut Command) -> io::Result<()> {
         platform::inherit_in(&self.file, command)
     }
 
-    pub(super) fn try_sync_lock(&self) -> io::Result<SyncLock> {
-        platform::lock(&self.file)?;
-        Ok(SyncLock(Arc::clone(&self.file)))
-    }
 
     pub(super) fn rename(&self, from: &Path, into: &Self, name: &Path) -> io::Result<()> {
         one_component(from)?;
         one_component(name)?;
-        platform::rename(&self.file, from, &into.file, name)
+        platform::rename(&self.file, from, &into.file, name, false)
     }
-}
 
-pub(super) struct SyncLock(Arc<File>);
-
-impl Drop for SyncLock {
-    fn drop(&mut self) {
-        platform::unlock(&self.0);
-    }
-}
-
-pub(super) fn portable_path(path: &Path) -> Result<(), String> {
-    if !path.as_os_str().is_empty()
-        && path.components().all(|component| match component {
-            Component::CurDir => true,
-            Component::Normal(name) => name.to_str().is_some_and(super::valid_path_component),
-            _ => false,
-        })
-    {
-        Ok(())
-    } else {
-        Err(format!("invalid portable Git package path {}", path.display()))
+    pub(super) fn exchange(&self, from: &Path, into: &Self, name: &Path) -> io::Result<()> {
+        one_component(from)?;
+        one_component(name)?;
+        platform::rename(&self.file, from, &into.file, name, true)
     }
 }
 
 fn one_component(path: &Path) -> io::Result<()> {
     if matches!(path.components().next(), Some(Component::Normal(name)) if name == path.as_os_str())
-        && portable_path(path).is_ok()
     {
         Ok(())
     } else {
@@ -206,6 +177,7 @@ mod platform {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn open_absolute_directory(path: &Path) -> io::Result<File> {
         openat2(libc::AT_FDCWD, path, FILE_FLAGS | libc::O_DIRECTORY, NO_LINKS)
     }
@@ -274,25 +246,15 @@ mod platform {
         if result == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
     }
 
-    pub(super) fn lock(dir: &File) -> io::Result<()> {
-        // SAFETY: dir is an owned live descriptor.
-        let result = unsafe { libc::flock(dir.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        if result == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
-    }
-
-    pub(super) fn unlock(dir: &File) {
-        // SAFETY: dir is an owned live descriptor.
-        unsafe { libc::flock(dir.as_raw_fd(), libc::LOCK_UN) };
-    }
-
-    pub(super) fn rename(from: &File, path: &Path, into: &File, name: &Path) -> io::Result<()> {
+    pub(super) fn rename(from: &File, path: &Path, into: &File, name: &Path, exchange: bool) -> io::Result<()> {
         let path = c_path(path)?;
         let name = c_path(name)?;
         // SAFETY: descriptors and both NUL-terminated components are valid.
         let result = unsafe {
             libc::syscall(
                 libc::SYS_renameat2, from.as_raw_fd(), path.as_ptr(),
-                into.as_raw_fd(), name.as_ptr(), libc::RENAME_NOREPLACE,
+                into.as_raw_fd(), name.as_ptr(),
+                if exchange { libc::RENAME_EXCHANGE } else { libc::RENAME_NOREPLACE },
             )
         };
         if result == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
@@ -305,7 +267,6 @@ mod platform {
     fn unsupported<T>() -> io::Result<T> {
         Err(io::Error::new(io::ErrorKind::Unsupported, "Git dependency sync and loading are currently supported only on Linux"))
     }
-    pub(super) fn open_absolute_directory(_: &Path) -> io::Result<File> { unsupported() }
     pub(super) fn open_relative(_: &File, _: &Path) -> io::Result<File> { unsupported() }
     pub(super) fn identity(_: &File) -> io::Result<Vec<u8>> { unsupported() }
     pub(super) fn entries(_: &File) -> io::Result<Vec<std::ffi::OsString>> { unsupported() }
@@ -313,9 +274,7 @@ mod platform {
     pub(super) fn remove_directory(_: &File, _: &Path) -> io::Result<()> { unsupported() }
     pub(super) fn descriptor_path(_: &File) -> io::Result<PathBuf> { unsupported() }
     pub(super) fn inherit_in(_: &File, _: &mut Command) -> io::Result<()> { unsupported() }
-    pub(super) fn lock(_: &File) -> io::Result<()> { unsupported() }
-    pub(super) fn unlock(_: &File) {}
-    pub(super) fn rename(_: &File, _: &Path, _: &File, _: &Path) -> io::Result<()> { unsupported() }
+    pub(super) fn rename(_: &File, _: &Path, _: &File, _: &Path, _: bool) -> io::Result<()> { unsupported() }
 }
 
 
@@ -344,10 +303,4 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    #[test]
-    fn portable_path_rejects_nested_drive_names() {
-        assert!(portable_path(Path::new("src/C:/example.w")).is_err());
-        assert!(portable_path(Path::new("src/../example.w")).is_err());
-        assert!(portable_path(Path::new("src/nested/example.w")).is_ok());
-    }
 }
