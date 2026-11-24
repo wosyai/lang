@@ -3357,7 +3357,9 @@ fn check_expression_type_in_module(
                     expression, None, scope, visible_names, folded_names, module, modules, diagnostics,
                     unsafe_context, overloads, inference,
                 );
-                (ty == ScalarType::Bool || is_integer_type(&ty)).then_some((selection, ty))
+                (ty == ScalarType::Bool || is_integer_type(&ty)
+                    || matches!((&selection, &ty), (CheckerStateSelection::Lexical(_), ScalarType::Struct(_))))
+                    .then_some((selection, ty))
             });
             #[cfg(not(feature = "internal-checker"))]
             let configured_output = directive.output.explicit_literal();

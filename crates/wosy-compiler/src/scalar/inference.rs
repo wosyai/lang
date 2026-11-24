@@ -91,6 +91,8 @@ pub(super) struct PreparationOccurrenceTyping {
     checker_directives: HashMap<*const ScalarExpression, super::checker_directive::CheckedDirectiveMarker>,
     #[cfg(any(test, feature = "internal-checker"))]
     checker_enabled: bool,
+    #[cfg(feature = "internal-checker")]
+    snapshot_types: std::collections::BTreeSet<super::ScalarStructId>,
 }
 
 struct CheckedExpressionType {
@@ -109,6 +111,11 @@ impl PreparationOccurrenceTyping {
     #[cfg(any(test, feature = "internal-checker"))]
     pub(super) fn checker_directives_enabled(&self) -> bool {
         self.checker_enabled
+    }
+
+    #[cfg(feature = "internal-checker")]
+    pub(super) fn checker_demands_snapshot(&self, id: &super::ScalarStructId) -> bool {
+        self.snapshot_types.contains(id)
     }
 
     #[cfg(any(test, feature = "internal-checker"))]
@@ -322,6 +329,12 @@ impl<'a> ScalarInferenceBuilder<'a> {
         marker: super::checker_directive::CheckedDirectiveMarker,
     ) {
         if !self.suppress_checked_occurrences {
+            #[cfg(feature = "internal-checker")]
+            for file in marker.output.state_files.iter() {
+                if let ScalarType::Struct(id) = &file.ty {
+                    self.occurrences.snapshot_types.insert(id.clone());
+                }
+            }
             self.occurrences
                 .checker_directives
                 .insert(std::ptr::from_ref(expression), marker);

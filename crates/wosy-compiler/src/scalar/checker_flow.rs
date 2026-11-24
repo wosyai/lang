@@ -1509,6 +1509,21 @@ impl IntegerInputs {
         })
     }
 
+    #[cfg(feature = "internal-checker")]
+    fn axis_has_visible_alias(&self, axis: usize, roots: &mut IntegerRoots<'_>) -> Option<bool> {
+        let work = roots.ordinary_local_work.get_or_insert(0);
+        for row in &self.0 {
+            charge_call_work(work, row.equal_axes().len().checked_add(1)?)?;
+            let canonical = row.canonical_axis(axis);
+            if row.equal_axes().iter().any(|&(alias, root)| root == canonical
+                && !matches!(roots.axes[alias].0.kind, super::ReferenceBindingKind::CheckerSnapshotField(_)))
+            {
+                return Some(true);
+            }
+        }
+        Some(false)
+    }
+
     fn common_equal_axes(&self) -> Vec<(usize, usize)> {
         let Some((first, rest)) = self.0.split_first() else { return Vec::new(); };
         first.equal_axes().iter().copied().filter(|&(axis, canonical)|
@@ -1927,6 +1942,69 @@ impl IntegerInputs {
     #[cfg(any(test, feature = "internal-checker"))]
     pub(super) fn row_count(&self) -> usize {
         self.0.len()
+    }
+
+    #[cfg(feature = "internal-checker")]
+    pub(super) fn remove_snapshot_axes(
+        &mut self, axes: &[Option<usize>], equal_axes: &mut Vec<(usize, usize)>, work: &mut usize,
+    ) -> Option<()> {
+        fn visible_eq(
+            equal: &[(usize, usize)], axes: &[Option<usize>], work: &mut usize,
+        ) -> Option<Vec<(usize, usize)>> {
+            charge_call_work(work, equal.len().checked_mul(3)?)?;
+            let mut promoted = HashMap::new();
+            let mut output = Vec::new();
+            for &(alias, root) in equal {
+                let Some(alias) = axes[alias] else { continue; };
+                if let Some(root) = axes[root] { output.push((alias, root)); }
+                else if let Some(&root) = promoted.get(&root) { output.push((alias, root)); }
+                else { promoted.insert(root, alias); }
+            }
+            Some(output)
+        }
+        *equal_axes = visible_eq(equal_axes, axes, work)?;
+        for row in &mut self.0 {
+            charge_call_work(work, axes.len().checked_add(1)?)?;
+            let eq = visible_eq(row.equal_axes(), axes, work)?;
+            if let Some(affine) = &row.affine {
+                let count = affine.members.len().checked_add(1)?;
+                charge_call_work(work, count.checked_mul(row.equal_axes().len().checked_add(count)?)?)?;
+                let visible = |old: usize| axes[old].or_else(|| {
+                    row.equal_axes().iter().find_map(|&(alias, root)| (root == old).then_some(axes[alias]).flatten())
+                });
+                let mut endpoints: Vec<_> = std::iter::once((affine.anchor, None))
+                    .chain(affine.members.iter().map(|(axis, transform)| (*axis, Some(transform))))
+                    .filter_map(|(old, transform)| visible(old).map(|new| (new, transform)))
+                    .collect();
+                endpoints.sort_unstable_by_key(|&(new, _)| new);
+                row.affine = match endpoints.split_first() {
+                    Some((&(anchor, anchor_transform), others)) if !others.is_empty() => {
+                        let inverse = anchor_transform.map(|transform| Rc::new(transform.inverse()));
+                        let members = others.iter().map(|&(axis, transform)| {
+                            let transform = match (&inverse, transform) {
+                                (None, Some(transform)) => Rc::clone(transform),
+                                (Some(inverse), None) => Rc::clone(inverse),
+                                (Some(inverse), Some(transform)) => Rc::new(transform.compose(inverse)),
+                                (None, None) => unreachable!("affine class has one identity anchor"),
+                            };
+                            (axis, transform)
+                        }).collect();
+                        Some(Rc::new(IntegerAffineAxes { anchor, members }))
+                    }
+                    _ => None,
+                };
+            }
+            if let Some(ProjectedEntry::Linked(old)) = row.entry.as_deref() {
+                row.entry = Some(Rc::new(match axes[*old] {
+                    Some(axis) => ProjectedEntry::Linked(axis),
+                    None => ProjectedEntry::Detached(Rc::clone(&row.cells[*old])),
+                }));
+            }
+            let mut index = 0;
+            row.cells.retain(|_| { let keep = axes[index].is_some(); index += 1; keep });
+            row.equal_axes = (!eq.is_empty()).then(|| Rc::new(eq));
+        }
+        Some(())
     }
 
     #[cfg(feature = "internal-checker")]
@@ -4918,8 +4996,18 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                         { let _ = work; return None; }
                     }
                 }
-                if axis < roots.parameters && !preserve_entry && path.axis_has_alias(axis) {
-                    return None;
+                if axis < roots.parameters && !preserve_entry {
+                    #[cfg(feature = "internal-checker")]
+                    let has_blocking_alias = if structure.checker_selected_snapshots.is_empty() {
+                        path.axis_has_alias(axis)
+                    } else {
+                        // Hidden aliases preserve a construction-time capture,
+                        // not a second authored view of the input formal.
+                        path.axis_has_visible_alias(axis, roots)?
+                    };
+                    #[cfg(not(feature = "internal-checker"))]
+                    let has_blocking_alias = path.axis_has_alias(axis);
+                    if has_blocking_alias { return None; }
                 }
                 #[cfg(feature = "internal-checker")]
                 path.charge_local_alias_work(&mut roots.ordinary_local_work, 2)?;
@@ -5086,6 +5174,30 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                         path.append_shared_local(&value);
                         continue;
                     }
+                }
+                #[cfg(feature = "internal-checker")]
+                if structure.checker_selected_snapshots.contains(&(block, item.position)) {
+                    // Legacy early-failure checks do not materialize authored
+                    // state and must never expose internal capture columns.
+                    if !COLLECT { return None; }
+                    let fields = structure.checker_snapshot_locals.get(&(block, item.position))?;
+                    use super::checker_directive::CheckerSnapshotOperand;
+                    for field in fields.iter() {
+                        match &field.operand {
+                            CheckerSnapshotOperand::Binding(binding) => {
+                                let (axis, ty) = roots.lookup(binding)?;
+                                if ty != &field.ty { return None; }
+                                path.append_ordinary_copy(axis, roots)?;
+                            }
+                            CheckerSnapshotOperand::Literal(value) => {
+                                let work = roots.ordinary_local_work.get_or_insert(0);
+                                charge_call_work(work, path.0.len().checked_add(1)?)?;
+                                path.append_local(IntegerSet::singleton(value));
+                            }
+                        }
+                        roots.add(&field.capture, &field.ty);
+                    }
+                    continue;
                 }
                 #[cfg(feature = "internal-checker")]
                 if roots.allow_ordinary_integer_locals {
@@ -6097,6 +6209,22 @@ fn integer_local<'a>(
     Some((identity, &receiver.ty, value))
 }
 
+
+#[cfg(feature = "internal-checker")]
+#[test]
+fn nominal_hidden_affine_anchor_reanchors_to_exact_visible_endpoints() {
+    let domain = IntegerSet::from_type(&ScalarType::I8).unwrap()
+        .keep(&BinaryOperator::GreaterEqual, &1.into()).unwrap()
+        .keep(&BinaryOperator::LessEqual, &3.into()).unwrap();
+    let mut row = IntegerRow::new(vec![Rc::new(domain)]);
+    row.test_append_affine(0, Rc::new(IntegerAffineTransform { reflected: true, offset: 6.into() })).unwrap();
+    row.test_append_affine(0, Rc::new(IntegerAffineTransform { reflected: false, offset: 1.into() })).unwrap();
+    let mut state = IntegerInputs(vec![row]);
+    state.remove_snapshot_axes(&[None, Some(0), Some(1)], &mut Vec::new(), &mut 0).unwrap();
+    assert!(state.includes_signed(&[5, 2]));
+    assert!(state.includes_signed(&[3, 4]));
+    assert!(!state.includes_signed(&[5, 4]));
+}
 
 #[test]
 fn affine_class_composes_and_refines_from_non_anchor_members() {

@@ -913,6 +913,33 @@ state_holes = f"""%%start
         core.require(false, {state_report(168,"ALTERNATIVES","value")});
     }};
     %%end"""
+state_nominal = f"""%%start
+    struct Snapshot {{
+        i8 saved;
+        bool ready;
+    }}
+    unit(i8) check = fn(value) {{
+        core.narrow(value == 1 || value == 3, {report(167,"HOLES")});
+        Snapshot snapshot = {{ .ready = true; .saved = value; }};
+        value = 7;
+        core.require(value != 7, {state_report(170,"SNAPSHOT","snapshot",', { .path = "copy.json"; .state = snapshot; }')});
+    }};
+    %%end"""
+state_nominal_nested_scope = f"""%%start
+    struct Snapshot {{ i8 saved; }}
+    unit(i8) check = fn(value) {{
+        Snapshot snapshot = {{ .saved = value; }};
+        if (value == 1) {{
+            i8 inner_value = 7;
+            Snapshot inner_snapshot = {{ .saved = inner_value; }};
+            core.require(inner_value != 7, {state_report(171,"NESTED-SNAPSHOT","snapshot",', { .path = "inner.json"; .state = inner_snapshot; }')});
+        }};
+    }};
+    %%end"""
+state_nominal_visible_alias = state_nominal.replace(
+    'value = 7;', 'i8 ordinary = value; value = 7;',
+).replace('core.require(value != 7,', 'core.require(ordinary != 1,')
+state_nominal_unsupported_operand = state_nominal.replace('.saved = value;', '.saved = value + 1;')
 state_repeated = state_range.replace(
     '.path = "note.txt"; .text = "authored"; }',
     '.path = "note.txt"; .text = "authored"; }, { .path = "state-copy.json"; .state = value; }',
@@ -929,6 +956,10 @@ state_atomic = f"""%%start
     }};
     %%end"""
 cases.extend([
+    ("authored-state-nominal-construction-snapshot",state_nominal,170,b"SNAPSHOT"),
+    ("authored-state-nominal-nested-scope",state_nominal_nested_scope,171,b"NESTED-SNAPSHOT"),
+    ("authored-state-nominal-mixed-visible-alias-still-unsupported",state_nominal_visible_alias,2,b"unsupported analysis"),
+    ("authored-state-nominal-unsupported-operand",state_nominal_unsupported_operand,2,b"unsupported analysis"),
     ("authored-state-repeated-binding",state_repeated,162,b"AUTHORED-RANGE"),
     ("authored-state-multi-file",state_atomic,169,b"MULTI-FILE"),
     ("authored-state-range-and-text",state_range,162,b"AUTHORED-RANGE"),
@@ -960,6 +991,15 @@ authored_files = {
         "state.json": b'{"type":{"kind":"i128"},"value":170141183460469231731687303715884105727}\n',
     },
     "authored-state-active-context": {"state.json": b'{"type":{"kind":"i8"},"value":3}\n'},
+}
+nominal_bytes = (b'{"type":{"kind":"struct","name":"Snapshot"},"value":{"saved":{"type":{"kind":"i8"},'
+    b'"value":{"kind":"alternatives","values":[1,3]}},"ready":{"type":{"kind":"bool"},"value":true}}}\n')
+authored_files["authored-state-nominal-construction-snapshot"] = {
+    "state.json": nominal_bytes, "copy.json": nominal_bytes,
+}
+authored_files["authored-state-nominal-nested-scope"] = {
+    "state.json": b'{"type":{"kind":"struct","name":"Snapshot"},"value":{"saved":{"type":{"kind":"i8"},"value":1}}}\n',
+    "inner.json": b'{"type":{"kind":"struct","name":"Snapshot"},"value":{"saved":{"type":{"kind":"i8"},"value":7}}}\n',
 }
 authored_files["authored-state-repeated-binding"] = {
     **authored_files["authored-state-range-and-text"],

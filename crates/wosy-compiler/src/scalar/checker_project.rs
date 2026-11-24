@@ -77,6 +77,21 @@ pub struct ScalarCheckerIntegerWitness {
 
 #[cfg(feature = "internal-checker")]
 impl ScalarCheckerIntegerWitness {
+    fn remove_snapshot_axes(&mut self, work: &mut usize) -> Option<()> {
+        let hidden = |id: &ReferenceBindingId| matches!(id.kind, super::ReferenceBindingKind::CheckerSnapshotField(_));
+        super::checker_flow::charge_call_work(work, self.axes.len().checked_mul(2)?)?;
+        if !self.axes.iter().any(|(id, _)| hidden(id)) { return Some(()); }
+        let mut next = 0;
+        let mapping = self.axes.iter().map(|(id, _)| (!hidden(id)).then(|| {
+            let index = next;
+            next += 1;
+            index
+        })).collect::<Vec<_>>();
+        self.state.remove_snapshot_axes(&mapping, &mut self.equal_axes, work)?;
+        self.axes.retain(|(id, _)| !hidden(id));
+        Some(())
+    }
+
     pub fn axes(&self) -> impl ExactSizeIterator<Item = (&ReferenceBindingId, &ScalarType)> {
         self.axes.iter().map(|(binding, ty)| (binding, ty))
     }
@@ -494,11 +509,16 @@ fn run_prepared_ordered_check<E: OrderedRunEvidence>(
     };
     // Materialize authored state only for a completed check, before any
     // client-visible stream/file effect can be planned.
-    if effects.has_authored_state {
+    if effects.has_authored_state || !effects.snapshot_records.is_empty() {
         let mut work = 0;
-        for record in &mut effects.records {
-            if !record.output.state_files.is_empty() {
+        let mut hidden = effects.snapshot_records.into_iter().peekable();
+        for (index, record) in effects.records.iter_mut().enumerate() {
+            if effects.has_authored_state && !record.output.state_files.is_empty() {
                 record.output = Rc::new(render_authored_state(record, &mut work).ok_or(ProjectCheck::Unsupported)?);
+            }
+            if hidden.peek() == Some(&index) {
+                hidden.next();
+                record.witness.remove_snapshot_axes(&mut work).ok_or(ProjectCheck::Unsupported)?;
             }
         }
     }
@@ -2156,6 +2176,8 @@ struct OrderedFailures {
     #[cfg(feature = "internal-checker")]
     has_authored_state: bool,
     #[cfg(feature = "internal-checker")]
+    snapshot_records: Vec<usize>,
+    #[cfg(feature = "internal-checker")]
     entry_evidence: Option<Box<ScalarOrderedEntryEvidence>>,
 }
 
@@ -2236,6 +2258,10 @@ impl OrderedFailures {
     }
 
     fn push_callable(&mut self, body: &FunctionCallSites, source: &SourceIdentity, failure: IntegerCheckFailure<'_>) {
+        #[cfg(feature = "internal-checker")]
+        if !body.structure.checker_selected_snapshots.is_empty() {
+            self.snapshot_records.push(self.records.len());
+        }
         self.push(
             source,
             &body.structure.checker_directives[&failure.directive],
@@ -2272,16 +2298,43 @@ fn render_authored_state(record: &ScalarOrderedCheckerFailure, work: &mut usize)
     for position in 0..count {
         if selected.peek().is_some_and(|file| file.position == position) {
             let file = selected.next()?;
-            let CheckerStateSelection::Binding(binding) = file.selection else { return None; };
-            let (ty, bytes) = match encoded.entry(binding) {
+            let binding = match &file.selection {
+                CheckerStateSelection::Binding(binding) | CheckerStateSelection::Nominal { binding, .. } => binding,
+                _ => return None,
+            };
+            let (ty, bytes) = match encoded.entry(binding.clone()) {
                 std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
                 std::collections::hash_map::Entry::Vacant(entry) => {
-                    charge_call_work(work, record.witness.axes.len().checked_add(1)?)?;
-                    let axis = record.witness.axes.iter().position(|(id, ty)| id == entry.key() && *ty == file.ty)?;
-                    let values = record.witness.state.project_axis_bounded(axis, work)?;
-                    charge_call_work(work, values.interval_count())?;
-                    let bytes = serialize_scalar_analysis_state(&file.ty, &values)?.into_bytes().into_boxed_slice();
-                    entry.insert((file.ty.clone(), bytes))
+                    if let CheckerStateSelection::Nominal { name, fields, .. } = &file.selection {
+                        charge_call_work(work, name.len().div_ceil(32).checked_mul(6)?)?;
+                        for field in fields.iter() {
+                            charge_call_work(work, 1usize.checked_add(field.name.len().div_ceil(32).checked_mul(6)?)?)?;
+                        }
+                    }
+                    let mut scalar_node = |binding: &ReferenceBindingId, ty: &ScalarType| {
+                        charge_call_work(work, record.witness.axes.len().checked_add(1)?)?;
+                        let axis = record.witness.axes.iter().position(|(id, axis_ty)| id == binding && axis_ty == ty)?;
+                        let values = record.witness.state.project_axis_bounded(axis, work)?;
+                        charge_call_work(work, values.interval_count())?;
+                        serialize_scalar_analysis_state(ty, &values)
+                    };
+                    let json = match &file.selection {
+                        CheckerStateSelection::Nominal { name, fields, .. } => {
+                            let name = serde_json::to_string(name.as_ref()).ok()?;
+                            let mut json = format!(r#"{{"type":{{"kind":"struct","name":{name}}},"value":{{"#);
+                            for (i, field) in fields.iter().enumerate() {
+                                if i != 0 { json.push(','); }
+                                json.push_str(&serde_json::to_string(field.name.as_ref()).ok()?);
+                                json.push(':');
+                                let node = scalar_node(&field.capture, &field.ty)?;
+                                json.push_str(node.strip_suffix('\n')?);
+                            }
+                            json.push_str("}}\n");
+                            json
+                        }
+                        _ => scalar_node(binding, &file.ty)?,
+                    };
+                    entry.insert((file.ty.clone(), json.into_bytes().into_boxed_slice()))
                 }
             };
             if *ty != file.ty { return None; }
@@ -2811,6 +2864,7 @@ struct SelectedSymbolicProof<'a, 'case> {
     equalities: SymbolicEqualityIndex<'a>,
     failure: Option<SymbolicProofDiagnostic>,
     additional_failures: Vec<SymbolicProofDiagnostic>,
+    snapshot_work: usize,
 }
 
 #[cfg(feature = "internal-checker")]
@@ -2957,25 +3011,31 @@ impl SelectedSymbolicProof<'_, '_> {
     fn record(
         &mut self, proof: &MainFlowProofCase<'_>, function: &ScalarFunction, source: &SourceIdentity,
         position: usize, failure: super::checker_flow::SymbolicLiteralFailure<'_>, failed_step: Option<ByteSpan>,
-    ) {
+    ) -> Result<(), ProjectCheck> {
         let proof_span = |range| wosy_syntax::SourceSpan { source: proof.proof_source.clone(), range };
         let callable_span = |range| wosy_syntax::SourceSpan { source: source.clone(), range };
-        let diagnostic = SymbolicProofDiagnostic {
+        let mut hidden = false;
+        let mut diagnostic = SymbolicProofDiagnostic {
             proof: proof_span(proof.proof), goal: proof_span(proof.goal), failed_step: failed_step.map(proof_span),
             callable: callable_span(function.name_span), output: callable_span(failure.output),
             directive_position: position,
             witness: ScalarCheckerIntegerWitness {
                 equal_axes: Vec::new(),
-                axes: failure.axes.into_iter().map(|(binding, ty)| (binding.clone(), ty.clone())).collect(),
+                axes: failure.axes.into_iter().map(|(binding, ty)| {
+                    hidden |= matches!(binding.kind, super::ReferenceBindingKind::CheckerSnapshotField(_));
+                    (binding.clone(), ty.clone())
+                }).collect(),
                 state: failure.state,
             },
             returned: failure.returned,
         };
+        if hidden { diagnostic.witness.remove_snapshot_axes(&mut self.snapshot_work).ok_or(ProjectCheck::Unsupported)?; }
         if self.failure.is_none() {
             self.failure = Some(diagnostic);
         } else {
             self.additional_failures.push(diagnostic);
         }
+        Ok(())
     }
 }
 
@@ -3041,7 +3101,7 @@ impl SelectedSymbolicProof<'_, '_> {
             body, &result, &proof_domain, elidable, goal,
         ).ok_or(ProjectCheck::Unsupported)?;
         if let Some(failure) = verified.failure {
-            self.record(first, function, source, effects.records.len(), failure, None);
+            self.record(first, function, source, effects.records.len(), failure, None)?;
         } else if verified.covers_guard {
             let bound = literal_bound.ok_or(ProjectCheck::Unsupported)?;
             let issuer = issuer.ok_or(ProjectCheck::Unsupported)?;
@@ -3167,7 +3227,7 @@ impl SymbolicRootProof for SelectedSymbolicProof<'_, '_> {
                         effects.push_callable(calls, source, directive);
                     }
                     if let Some(failure) = failure {
-                        self.record(proof, function, source, effects.records.len(), failure, failed_step);
+                        self.record(proof, function, source, effects.records.len(), failure, failed_step)?;
                     }
                     return Ok(Some(active || returned));
                 };
@@ -3189,9 +3249,9 @@ impl SymbolicRootProof for SelectedSymbolicProof<'_, '_> {
                 let [step_check, goal_check] = checks;
                 let position = effects.records.len();
                 if let Some(failure) = step_check.failure {
-                    self.record(proof, function, source, position, failure, Some(step.span));
+                    self.record(proof, function, source, position, failure, Some(step.span))?;
                 } else if let Some(failure) = goal_check.failure {
-                    self.record(proof, function, source, position, failure, None);
+                    self.record(proof, function, source, position, failure, None)?;
                 }
                 return Ok(Some(active || returned));
             }
@@ -3213,7 +3273,7 @@ impl SymbolicRootProof for SelectedSymbolicProof<'_, '_> {
                     effects.push_callable(calls, source, directive);
                 }
                 if let Some(failure) = failure {
-                    self.record(first, function, source, effects.records.len(), failure, None);
+                    self.record(first, function, source, effects.records.len(), failure, None)?;
                 }
                 return Ok(Some(active || returned));
             }
@@ -3244,7 +3304,7 @@ impl SymbolicRootProof for SelectedSymbolicProof<'_, '_> {
                 effects.push_callable(calls, source, directive);
             }
             if let Some(failure) = failure {
-                self.record(first, function, source, effects.records.len(), failure, None);
+                self.record(first, function, source, effects.records.len(), failure, None)?;
             }
             return Ok(Some(active || returned));
         }
@@ -3262,7 +3322,7 @@ impl SymbolicRootProof for SelectedSymbolicProof<'_, '_> {
         let position = effects.records.len();
         for (proof, check) in proofs.zip(checks) {
             if let Some(failure) = check.failure {
-                self.record(proof, function, source, position, failure, None);
+                self.record(proof, function, source, position, failure, None)?;
             }
         }
         Ok(Some(active || returned))
@@ -3838,7 +3898,7 @@ impl<'a> OrderedRunEvidence for NamedOrderedEvidence<'a> {
         SelectedSymbolicProof {
             watched: &self.observed,
             equalities: SymbolicEqualityIndex::default(),
-            failure: None, additional_failures: Vec::new(),
+            failure: None, additional_failures: Vec::new(), snapshot_work: 0,
         }
     }
 
@@ -9431,6 +9491,33 @@ mod tests {
             assert_eq!(body.structure.checker_contextual_read_locals.contains_key(&key), !allowed);
             assert_eq!(root_local_import_requirement(body).map(|(position, _)| position), allowed.then_some(2));
         }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn nominal_state_capture_leaves_only_lexical_coordinates_in_public_witness() {
+        let app = source("src/main.w", "nominal-state-public-witness");
+        let program = r#"%%start
+            struct Snapshot { i8 saved; }
+            unit(i8) check = fn(value) {
+                Snapshot snapshot = { .saved = value; };
+                value = 7;
+                core.require(value != 7, { .stdout = ""; .stderr = "failure"; .code = 1; .files = [
+                    { .path = "state.json"; .state = snapshot; }
+                ]; });
+            };
+        %%end"#;
+        let receipt = check_loaded_scalar_ordered_local_proof_contexts(
+            vec![(declarations(&app, program), Vec::new())], Vec::new(), vec![app.clone()],
+            inputs(), ScalarCheckerScope::CurrentPackage, Vec::new(),
+        ).unwrap();
+        let [failure] = receipt.directives.as_slice() else { panic!("expected one failure"); };
+        assert_eq!(failure.witness.axes().len(), 1);
+        let seven = BigInt::from(7u8);
+        assert!(failure.witness.intervals_at(0, 0).unwrap().eq([(&seven, &seven)]));
+        assert!(failure.witness.intervals_at(0, 1).is_none());
+        assert!(failure.witness.equal_axes().is_empty());
+        assert!(failure.witness.row_equal_axes(0).unwrap().is_empty());
     }
 
     #[cfg(feature = "internal-checker")]

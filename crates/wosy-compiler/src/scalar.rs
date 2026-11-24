@@ -316,6 +316,7 @@ pub struct ReferenceBindingId {
 pub enum ReferenceBindingKind {
     Declared,
     CallOutput { point: CfgPointId, output: usize },
+    CheckerSnapshotField(usize),
 }
 
 impl Ord for ReferenceBindingId {

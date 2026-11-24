@@ -66,6 +66,28 @@ pub(super) struct CheckedLiteralOutput {
 pub(super) enum CheckerStateSelection {
     Lexical(Box<str>),
     Binding(ReferenceBindingId),
+    #[cfg(feature = "internal-checker")]
+    Nominal {
+        binding: ReferenceBindingId,
+        name: std::rc::Rc<str>,
+        fields: std::rc::Rc<[CheckerSnapshotField]>,
+    },
+}
+
+#[cfg(feature = "internal-checker")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct CheckerSnapshotField {
+    pub(super) name: Box<str>,
+    pub(super) ty: ScalarType,
+    pub(super) capture: ReferenceBindingId,
+    pub(super) operand: CheckerSnapshotOperand,
+}
+
+#[cfg(feature = "internal-checker")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum CheckerSnapshotOperand {
+    Binding(ReferenceBindingId),
+    Literal(BigInt),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
