@@ -12892,13 +12892,15 @@ fn guarded_fallible_allocating_call_skips_outer_materialization_on_absence() {
     use inkwell::{memory_buffer::MemoryBuffer, values::{CallSiteValue, InstructionOpcode}};
     let text = "%%start
 u64(u64) _measure = fn(count) { u8[count] scratch; core.array_len(&scratch) };
+u64(u64) _middle = fn(count) { _measure(count) };
+u64(u64) _entry = fn(count) { _middle(count) };
 u64(u64) observed = fn(count) {
-    u64 result =? _measure(count);
+    u64 result =? _entry(count);
     if (&result == null) { 0 } else { result }
 };
 if (observed(7) != 0 || observed(7) != 0 || observed(7) != 7) { core.system_panic(); };
 %%end";
-    let mixed = text.replace("u64 result =?", "u64 ordinary = _measure(count); ordinary; u64 result =?");
+    let mixed = text.replace("u64 result =?", "u64 ordinary = _middle(count); ordinary; u64 result =?");
     for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
         for (closed, text) in [(true, text), (false, mixed.as_str())] {
             let prepared = prepare_initializer_test(text, layout);
@@ -12937,7 +12939,23 @@ if (observed(7) != 0 || observed(7) != 0 || observed(7) != 7) { core.system_pani
                     .find(|block| block.get_name().to_bytes() == b"allocation_absent").unwrap();
                 assert!(absence.get_first_instruction().is_some_and(|instruction| instruction == absence.get_terminator().unwrap()
                     && instruction.get_opcode() == InstructionOpcode::Return));
-                let [rhs] = calls_to(caller, leaf)[..] else { panic!("{llvm}") };
+                let mut previous = leaf;
+                for name in ["_middle", "_entry"] {
+                    let relay = module.get_function(&self_tail_test_symbol(source, in_project, name)).unwrap();
+                    assert_eq!(relay.get_linkage(), inkwell::module::Linkage::Internal);
+                    assert_eq!(relay.get_type(), previous.get_type());
+                    assert!(calls_to(relay, alloc).is_empty() && calls_to(relay, free).is_empty());
+                    let [forwarded] = calls_to(relay, previous)[..] else { panic!("{llvm}") };
+                    assert!(relay.get_basic_blocks().into_iter().all(|block|
+                        block.get_terminator().is_none_or(|term| term.get_opcode() != InstructionOpcode::Br
+                            || term.get_num_operands() == 1)));
+                    let returned = relay.get_basic_blocks().into_iter()
+                        .filter_map(|block| block.get_terminator())
+                        .find(|instruction| instruction.get_opcode() == InstructionOpcode::Return).unwrap();
+                    assert_eq!(known_field_operand(returned, 0).unwrap().as_instruction_value(), Some(forwarded));
+                    previous = relay;
+                }
+                let [rhs] = calls_to(caller, previous)[..] else { panic!("{llvm}") };
                 let [dest] = calls_to(caller, alloc)[..] else { panic!("{llvm}") };
                 assert_eq!(calls_to(caller, free).len(), 1);
                 assert_eq!(dest.get_parent().unwrap().get_name().to_bytes(), b"fallible.destination");

@@ -279,7 +279,7 @@ impl<'ctx, 'plan> AggregateEmitter<'ctx, 'plan> {
 }
 
 pub(super) fn linkage(plan: Option<&ClosedBody>) -> Option<Linkage> {
-    plan.filter(|body| body.fallible_allocation_leaf || body.returning.is_some() || !body.inputs.is_empty() || body.checked_backing_producer.is_some()
+    plan.filter(|body| body.fallible_allocation_leaf || body.fallible_allocation_relay || body.returning.is_some() || !body.inputs.is_empty() || body.checked_backing_producer.is_some()
         || body.checked_backing_wrapper.is_some() || body.ordinary_result || body.array_descriptor_return || body.array_descriptor_identity || body.borrowed_extent_observer.is_some() || body.borrowed_extent_forward.is_some())
         .map(|_| Linkage::Internal)
 }
@@ -583,7 +583,7 @@ pub(super) fn definition_type<'ctx>(
     layout: ScalarTargetLayout,
     plan: Option<&ClosedBody>,
 ) -> Result<FunctionType<'ctx>, String> {
-    if plan.is_some_and(|body| body.fallible_allocation_leaf) {
+    if plan.is_some_and(|body| body.fallible_allocation_leaf || body.fallible_allocation_relay) {
         return Ok(fallible_allocation_result_type(context).fn_type(&[context.i64_type().into()], false));
     }
     if plan.is_some_and(|body| body.borrowed_extent_observer.is_some() || body.borrowed_extent_forward.is_some()) {
@@ -1397,7 +1397,7 @@ pub(super) fn emit_initializer_binding<'ctx, 'module>(
 }
 
 pub(super) fn requires_scoped_function_emission(plan: Option<&ClosedBody>) -> bool {
-    plan.is_some_and(|plan| plan.fallible_allocation_leaf || !plan.inputs.is_empty() || plan.ordinary_result || !plan.ordinary_calls.is_empty()
+    plan.is_some_and(|plan| plan.fallible_allocation_leaf || plan.fallible_allocation_relay || !plan.inputs.is_empty() || plan.ordinary_result || !plan.ordinary_calls.is_empty()
         || !plan.multi_receives.is_empty() || plan.multi_return_width() != 0
         || plan.array_descriptor_observer.is_some()
         || matches!(plan.returning, Some(ClosedReturn::Structured { .. })))

@@ -2944,6 +2944,7 @@ pub(crate) struct ClosedWidenedRebind {
 #[derive(Debug, Default)]
 pub(crate) struct ClosedBody {
     pub(crate) fallible_allocation_leaf: bool,
+    pub(crate) fallible_allocation_relay: bool,
     pub(crate) fallible_allocating_calls: BTreeSet<usize>,
     pub(crate) scalar_descriptor_assignment: Option<(usize, usize, usize)>,
     pub(crate) checked_backing_producer: Option<ClosedCheckedBacking>,
@@ -6699,6 +6700,7 @@ fn closed_aggregates<'a>(
     let mut recommit_edges = BTreeMap::<(BodyKey, CfgPointId), Vec<(CfgPointId, Option<CfgPointId>)>>::new();
     let mut structured_returns = BTreeMap::new();
     let mut recommit_returns = BTreeSet::new();
+    let mut fallible_allocation_relays = BTreeSet::new();
     let mut fallible_allocating_targets = BTreeMap::<BodyKey, BTreeSet<(BodyKey, usize)>>::new();
     if !fallible_call_requests.is_empty() {
         let allocation_leaf = |key: BodyKey| -> Option<()> {
@@ -6796,17 +6798,83 @@ fn closed_aggregates<'a>(
             }
             has_output.then_some(callees)
         };
+        let relay = |key: BodyKey| -> Option<(BodyKey, OccurrenceOrdinal)> {
+            if key.2.is_some() || reservations.bodies.get(&key) != Some(&true) { return None; }
+            let input = module_at(key.0)?;
+            let ScalarItem::Function(function) = input.items.get(key.1)? else { return None; };
+            if !crate::scalar::typecheck::is_module_private_name(&function.name)
+                || !function.generic_parameters.is_empty() || !function.overload_arms.is_empty()
+                || function.body.unsafe_context
+                || !matches!(function.body.items.as_slice(), [ScalarBlockItem::Expression(ScalarExpression::Call { .. })])
+            { return None; }
+            let sites = input.calls.function_body(key.1, None)?;
+            let [formal] = sites.boundary.parameters.as_slice() else { return None; };
+            let [occurrence] = sites.call_occurrences.as_slice() else { return None; };
+            let signature = sites.checked_call_signatures.get(&occurrence.ordinal)?;
+            if formal.ty != ScalarType::U64
+                || !matches!(sites.boundary.root_outputs.as_slice(), [output] if output.ty == ScalarType::U64)
+                || signature.parameters.as_slice() != [ScalarType::U64]
+                || !matches!(signature.outputs.outputs.as_slice(), [output] if output.ty == ScalarType::U64)
+                || !sites.declared_unsafe_calls.is_empty()
+            { return None; }
+            let (_, cfg) = result_at(key, function)?;
+            if !cfg.allocations.is_empty() || !cfg.guarded_scalar_allocations().is_empty() { return None; }
+            let root = sites.structure.blocks.get(sites.structure.root.0)?;
+            let formal = parameter_binding_identity(input.source, function.span, root.span, formal);
+            let points = &cfg.initial_points;
+            let point = points.iter().find(|point| matches!(point.kind, CfgPointKind::Call { .. }))?;
+            let CfgPointKind::Call { output: 0, target: target @ ResolvedCallTarget::ModuleCallable {
+                concrete: ConcreteCallSelection::Declaration, ..
+            }, argument_points, .. } = &point.kind else { return None; };
+            if target != &sites.sites.get(occurrence.site)?.target { return None; }
+            let ([read], [output]) = (argument_points.as_slice(), point.successors.as_slice()) else { return None; };
+            let read = points.get(read.0)?;
+            let output = points.get(output.0)?;
+            if !matches!(&read.kind, CfgPointKind::Read { binding } if binding == &formal)
+                || read.successors.as_slice() != [point.id]
+                || !matches!(output.kind, CfgPointKind::ReturnOutput { output: 0, checked: false, value_point, .. } if value_point == point.id)
+                || !points.iter().all(|candidate| match &candidate.kind {
+                    CfgPointKind::Entry | CfgPointKind::ScopeEnter | CfgPointKind::ScopeExit | CfgPointKind::Return => true,
+                    CfgPointKind::Bind { binding } => binding == &formal,
+                    _ => [read.id, point.id, output.id].contains(&candidate.id),
+                })
+            { return None; }
+            Some((target_body(&declarations, cfg, point.id)?, occurrence.ordinal))
+        };
         let mut memo = HashMap::new();
-        let mut leaf_memo = HashMap::new();
+        let mut complete_suffixes = BTreeSet::new();
         for (caller, source, cfg, call, ordinal) in fallible_call_requests {
             let target = target_body(&declarations, cfg, call)
                 .ok_or_else(|| format!("fallible call initializer requires a checked allocation-free scalar callable in {source:?}"))?;
             if allocation_free_integer_graph(target, &mut memo, dependencies) { continue; }
-            if !*leaf_memo.entry(target).or_insert_with(|| allocation_leaf(target).is_some()) {
-                return Err(format!("fallible call initializer requires a checked allocation-free scalar callable in {source:?}"));
+            let mut visited = BTreeSet::new();
+            let mut current = target;
+            let mut incoming = (caller, ordinal.0);
+            loop {
+                ordinary.transport_uses.entry(current).or_insert_with(|| Some(Vec::new()));
+                fallible_allocating_targets.entry(current).or_default().insert(incoming);
+                // Reusing a proven suffix still records its new incoming use.
+                // Every downstream edge has already been recorded once.
+                if complete_suffixes.contains(&current) {
+                    break;
+                }
+                if !visited.insert(current) {
+                    return Err("fallible allocating callable relay cycle requires an allocation leaf".into());
+                }
+                if allocation_leaf(current).is_some() {
+                    break;
+                }
+                let Some((next, ordinal)) = relay(current) else {
+                    return Err(format!("fallible call initializer requires a checked allocation-free scalar callable in {source:?}"));
+                };
+                fallible_allocation_relays.insert(current);
+                incoming = (current, ordinal.0);
+                current = next;
             }
-            ordinary.transport_uses.entry(target).or_insert_with(|| Some(Vec::new()));
-            fallible_allocating_targets.entry(target).or_default().insert((caller, ordinal.0));
+            // Publish only paths that reached an authenticated allocation
+            // leaf (directly or through a previously completed suffix).
+            // The all-use check below still applies globally to every node.
+            complete_suffixes.extend(visited);
         }
     }
     ordinary.census(reservations, &module_at, &declarations);
@@ -7178,7 +7246,9 @@ fn closed_aggregates<'a>(
     }
     let finalize_cohorts = |mut result: ClosedAggregates| -> Result<ClosedAggregates, String> {
         for (&target, sites) in &fallible_allocating_targets {
-            result.bodies.entry(target).or_default().fallible_allocation_leaf = true;
+            let body = result.bodies.entry(target).or_default();
+            body.fallible_allocation_relay = fallible_allocation_relays.contains(&target);
+            body.fallible_allocation_leaf = !body.fallible_allocation_relay;
             for &(caller, ordinal) in sites {
                 result.bodies.entry(caller).or_default().fallible_allocating_calls.insert(ordinal);
             }
