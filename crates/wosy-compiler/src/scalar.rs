@@ -317,6 +317,7 @@ pub enum ReferenceBindingKind {
     Declared,
     CallOutput { point: CfgPointId, output: usize },
     CheckerSnapshotField(usize),
+    ContextualFormal,
 }
 
 impl Ord for ReferenceBindingId {
@@ -2332,6 +2333,7 @@ pub fn derive_scalar_declarations_from_cst(
 ) -> ScalarSourceDeclarations {
     derive_scalar_declarations(
         canonical,
+        false,
         #[cfg(any(test, feature = "internal-checker"))]
         None,
     )
@@ -2339,6 +2341,7 @@ pub fn derive_scalar_declarations_from_cst(
 
 fn derive_scalar_declarations(
     canonical: &CanonicalCstRoot,
+    dormant_context: bool,
     #[cfg(any(test, feature = "internal-checker"))] mut proofs: Option<&mut Vec<CstNode>>,
 ) -> ScalarSourceDeclarations {
     let mut items = Vec::new();
@@ -2378,7 +2381,7 @@ fn derive_scalar_declarations(
         }
     }
     let contextual_places = if contextual {
-        contextual::prepare(canonical, diagnostic_roots, &mut diagnostics)
+        contextual::prepare(canonical, diagnostic_roots, &mut diagnostics, dormant_context && !has_named_proofs)
     } else {
         contextual::ContextualPlaces::default()
     };
@@ -4698,9 +4701,9 @@ fn derive_expression_with_places(node: &CstNode, places: &contextual::Contextual
         }
         SyntaxKind::ContextualPlace => {
             let span = wosy_syntax::byte_span(&actual);
-            let storage = places.storage(span, contextual::ContextualRole::Read)
+            let (binding, ty) = places.operand(span, contextual::ContextualRole::Read)
                 .expect("prepared contextual read");
-            ScalarExpression::Contextual { binding: storage.binding.clone(), ty: storage.ty.clone(), span }
+            ScalarExpression::Contextual { binding: binding.clone(), ty: ty.clone(), span }
         }
         SyntaxKind::IndexedPlace => ScalarExpression::IndexedRead {
             place: derive_place(&actual, places),
@@ -4808,9 +4811,9 @@ fn derive_place(node: &CstNode, places: &contextual::ContextualPlaces) -> Scalar
         SyntaxKind::QualifiedMember => derive_qualified_member_place(node, node.children().next()),
         SyntaxKind::ContextualPlace => {
             let span = wosy_syntax::byte_span(node);
-            let storage = places.storage(span, contextual::ContextualRole::Assign)
+            let (binding, ty) = places.operand(span, contextual::ContextualRole::Assign)
                 .expect("prepared contextual assignment");
-            ScalarPlace::Contextual { binding: storage.binding.clone(), ty: storage.ty.clone(), span }
+            ScalarPlace::Contextual { binding: binding.clone(), ty: ty.clone(), span }
         }
         SyntaxKind::DereferencedField => {
             let field = direct_token(node, SyntaxKind::Identifier).expect("field name");

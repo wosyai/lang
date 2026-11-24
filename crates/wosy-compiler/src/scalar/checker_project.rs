@@ -3466,7 +3466,7 @@ impl ScalarProofDeclarations {
 
 pub(crate) fn derive_scalar_proof_declarations_from_cst(canonical: &CanonicalCstRoot) -> ScalarProofDeclarations {
     let mut definitions = Vec::new();
-    let declarations = super::derive_scalar_declarations(canonical, Some(&mut definitions));
+    let declarations = super::derive_scalar_declarations(canonical, false, Some(&mut definitions));
     ScalarProofDeclarations { declarations, definitions }
 }
 

@@ -234,6 +234,69 @@ fn rejected_contextual_project_resolves_type_evidence_but_not_storage() {
 }
 
 #[test]
+fn dormant_contextual_call_receipt_authenticates_transitive_requirements_and_shadowing() {
+    use contextual::{DormantContextRejection, DormantContextSupply};
+    let text = r#"%%start
+        unit() consume = fn { core.context.credit = core.context.credit - 1; };
+        unit() relay = fn { consume(); };
+        unit() entry = fn {
+            i8 core.context.credit = 3;
+            relay();
+            if (true) {
+                i8 core.context.credit = 2;
+                relay();
+            };
+            relay();
+        };
+        entry();
+    %%end"#;
+    let parse = |text: &str| {
+        let parsed = parse_source(source(), text.to_owned(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        parsed.result
+    };
+    let inputs = || ScalarPreparationInputs { target_layout: ScalarTargetLayout::NATIVE64 };
+    let parsed = parse(text);
+    let receipt = contextual::prepare_dormant_context(parsed.canonical_cst(), inputs()).unwrap();
+    assert_eq!(receipt.ty, ScalarType::I8);
+    let [forward, enter, shadow, restore] = receipt.edges.as_slice() else { panic!("{:?}", receipt.edges); };
+    let snippet = |span: ByteSpan| &text[span.start as usize..span.end as usize];
+    assert_eq!((snippet(forward.occurrence), snippet(forward.target)), ("consume()", "consume"));
+    let DormantContextSupply::Formal(relay) = forward.supplied else { panic!("expected inferred relay formal"); };
+    assert!(snippet(relay).starts_with("unit() relay"));
+    let DormantContextSupply::Lexical(outer) = enter.supplied else { panic!("expected outer binding"); };
+    let DormantContextSupply::Lexical(inner) = shadow.supplied else { panic!("expected inner binding"); };
+    assert_eq!(snippet(enter.occurrence), "relay()");
+    assert_eq!(snippet(shadow.occurrence), "relay()");
+    assert_eq!(snippet(restore.occurrence), "relay()");
+    assert_eq!(snippet(enter.target), "relay");
+    // The ContextualPlace CST node owns the trivia immediately before `=`.
+    assert_eq!(snippet(outer), "core.context.credit ");
+    assert_eq!(snippet(inner), "core.context.credit ");
+    assert_eq!(outer.start as usize, text.find("core.context.credit = 3").unwrap());
+    assert_eq!(inner.start as usize, text.find("core.context.credit = 2").unwrap());
+    assert_ne!(outer, inner);
+    assert_eq!(restore.supplied, DormantContextSupply::Lexical(outer));
+    for (layout, variant) in [
+        (ScalarTargetLayout::NATIVE64, text.to_owned()),
+        (ScalarTargetLayout::WASM32, text.to_owned()),
+    ] {
+        let parsed = parse(&variant);
+        let ordinary = derive_scalar_declarations_from_cst(parsed.canonical_cst());
+        assert!(prepare_scalar_project(vec![(ordinary, Vec::new())], vec![source()],
+            ScalarPreparationInputs { target_layout: layout }).is_err());
+    }
+    let missing = text.replace("i8 core.context.credit = 3;", "");
+    let parsed = parse(&missing);
+    let missing_root = contextual::prepare_dormant_context(parsed.canonical_cst(), inputs()).unwrap_err();
+    let DormantContextRejection::MissingAtRoot(call) = missing_root else { panic!("{missing_root:?}"); };
+    assert_eq!(&missing[call.start as usize..call.end as usize], "entry()");
+    let wrong = text.replace("i8 core.context.credit = 2", "i16 core.context.credit = 2");
+    let parsed = parse(&wrong);
+    assert_eq!(contextual::prepare_dormant_context(parsed.canonical_cst(), inputs()).unwrap_err(), DormantContextRejection::Unsupported);
+}
+
+#[test]
 fn qualified_old_does_not_become_contextual_storage() {
     let text = "%%start\ni8(i8) identity = fn(value) { value };\nproof entry for identity(input) -> (out) ensures (out == core.old(input)) {}\n%%end";
     let parsed = parse_source(source(), text.to_owned(), &[]);
