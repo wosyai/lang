@@ -5831,7 +5831,7 @@ fn exact_projected_field_of_mutable_parent(loan: &ReferenceLoanId) -> Option<(&R
 #[derive(Clone, Copy)]
 enum ProjectedWriteAdmission<'a> {
     Known(&'a BTreeSet<ReferenceOriginId>),
-    JoinedShared { issuance: ByteSpan },
+    Joined { issuance: ByteSpan, mode: ScalarReferenceMutability },
 }
 
 #[derive(Clone, Copy)]
@@ -5845,8 +5845,8 @@ impl DisjointProjectedWrite<'_> {
     fn excludes(self, origin: ReferenceOriginId, loan: &ReferenceLoanId) -> bool {
         let admitted = match self.admission {
             ProjectedWriteAdmission::Known(origins) => origins.contains(&origin),
-            ProjectedWriteAdmission::JoinedShared { issuance } =>
-                loan.mode == ScalarReferenceMutability::Shared && loan.creation_span == issuance,
+            ProjectedWriteAdmission::Joined { issuance, mode } =>
+                loan.mode == mode && loan.creation_span == issuance,
         };
         admitted && exact_projected_field_of_mutable_parent(loan).is_some_and(|(parent, field)|
             parent == self.parent && field.structure == self.field.structure && field.index != self.field.index)
@@ -8391,7 +8391,8 @@ fn transfer_reference_facts(
         };
         if let (Some(shape), Some(parents)) = (joined_reborrow_binding, joined_reborrow_parents.as_ref()) {
             if !shape.descendants.is_empty()
-                || matches!(initial_point.kind, CfgPointKind::ReborrowThrough { mode: ScalarReferenceMutability::Shared, .. })
+                || matches!(&initial_point.kind, CfgPointKind::ReborrowThrough { mode, place, .. }
+                    if *mode == ScalarReferenceMutability::Shared || direct_checked_field_base(place).is_some())
             {
                 joined_family = Some(JoinedLoanFamily { shape, first_issuance: id, selected_parents: parents.clone() });
             }
@@ -8965,14 +8966,13 @@ fn transfer_reference_facts(
                 else { return None };
                 let joined = joined_family.as_ref().and_then(|family| {
                     let issuance = original_points.get(family.first_issuance.0)?;
-                    let CfgPointKind::ReborrowThrough { mode: ScalarReferenceMutability::Shared, place, .. } =
-                        &issuance.kind else { return None };
+                    let CfgPointKind::ReborrowThrough { mode, place, .. } = &issuance.kind else { return None };
                     if family.shape.parent != binding || !family.shape.descendants.is_empty()
                         || !family.selected_parents.contains(&candidate.origin) || direct_checked_field_base(place).is_none()
                     {
                         return None;
                     }
-                    Some(ProjectedWriteAdmission::JoinedShared { issuance: issuance.source_span.range })
+                    Some(ProjectedWriteAdmission::Joined { issuance: issuance.source_span.range, mode: *mode })
                 });
                 let admission = joined.or_else(|| projected_store_facts.as_ref()
                     .map(|(admitted, _)| ProjectedWriteAdmission::Known(admitted)))?;

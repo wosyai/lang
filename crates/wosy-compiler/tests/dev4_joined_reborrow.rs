@@ -15,6 +15,7 @@ enum Expected {
     KnownProjection,
     LiveConflict,
     LiveSelectedFieldConflict,
+    ExactProjectionConflict { target: &'static str, operand: &'static str, loan: &'static str },
     LiveNestedFieldConflict,
     LiveJoinedProjectionConflict,
     LiveParentProjectionConflict,
@@ -74,6 +75,17 @@ fn check_case(text: &str, expected: Expected, witness_dir: Option<&str>) {
                     }), "{target}/{route}: {diagnostics:?}");
                 }
                 Expected::Declined => assert!(diagnostics.iter().any(|item| item.code == "B0003"), "{target}/{route}: {diagnostics:?}"),
+                Expected::ExactProjectionConflict { target: write, operand, loan } => {
+                    let start = (text.find(write).expect("conflicting projection") + write.find(operand).unwrap()) as u32;
+                    let end = start + operand.len() as u32;
+                    let issued = text.find(loan).expect("exact loan") as u32;
+                    assert!(diagnostics.iter().any(|d| d.code == "B0003"
+                        && d.message == "read or move of unavailable place"
+                        && d.labels.first().is_some_and(|label| label.span.range.start == start && label.span.range.end == end)
+                        && d.labels.iter().skip(1).any(|label| label.span.range.start == issued
+                            && label.span.range.end == issued + loan.len() as u32)),
+                        "{target}/{route}: {diagnostics:?}");
+                }
                 Expected::LiveConflict | Expected::LiveSelectedFieldConflict | Expected::LiveNestedFieldConflict | Expected::LiveJoinedProjectionConflict | Expected::LiveParentProjectionConflict | Expected::LiveLexicalSiblingConflict | Expected::LiveMutableProjectionConflict | Expected::LiveIndexedProjectionConflict | Expected::LiveSelectedIndexConflict | Expected::LiveDescendantConflict | Expected::LiveFamilyConflict | Expected::LiveMutableConflict | Expected::FrozenMutableConflict | Expected::LiveExclusiveConflict => {
                     let write = match expected {
                         Expected::FrozenMutableConflict | Expected::LiveExclusiveConflict => "*child = seen + 4",
@@ -401,6 +413,27 @@ fn joined_shared_field_permits_sibling_write_only_through_selected_parent() {
     let lexical = program.replace("(*parent).other = 4;", "first.other = 4;");
     assert_ne!(lexical, program);
     check(&lexical, Expected::LiveLexicalSiblingConflict);
+}
+
+#[test]
+fn joined_exclusive_field_and_selected_parent_write_disjoint_fields() {
+    let program = joined("parent = &!second;", true, "",
+        "*child = seen + 2; (*parent).other = 4; u8 observed = *child; \
+         u8 left = first.other; u8 right = second.other; u8 left_value = first.value; u8 right_value = second.value;")
+        .replace("%%start\n", "%%start\nstruct copy Pair { u8 value; u8 other; }\n")
+        .replace("u8 first = 7;\n    u8 second = 9;",
+            "Pair first = { .value = 7; .other = 1; }; Pair second = { .value = 9; .other = 2; };")
+        .replace("*!u8 parent = null;", "*!Pair parent = null;")
+        .replace("*u8 child = &(*parent);", "*!u8 child = &!(*parent).value;")
+        .replace("    seen\n",
+            "    if (observed == seen + 2) { if (choose) { if (left == 4 && right == 2 && left_value == 9 && right_value == 9) { seen } else { 0 } } else { if (left == 1 && right == 4 && left_value == 7 && right_value == 11) { seen } else { 0 } } } else { 0 }\n");
+    check_case(&program, Expected::Valid, Some("WOSY_JOINED_PARENT_EXCLUSIVE_SIBLING_IR_DIR"));
+
+    for (target, operand) in [("(*parent).value = 4", "value"), ("first.other = 4", "other")] {
+        let live = program.replace("(*parent).other = 4", target);
+        assert_ne!(live, program);
+        check(&live, Expected::ExactProjectionConflict { target, operand, loan: "&!(*parent).value" });
+    }
 }
 
 #[test]
