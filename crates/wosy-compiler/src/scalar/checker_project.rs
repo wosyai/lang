@@ -451,7 +451,7 @@ impl ActualIntegerObserver for ProofFreeOrderedEvidence {
     const AUTHORED_SINGLETON_CODE: bool = true;
     const REAL_INTEGER_TAIL_CALLS: bool = true;
     const REAL_INTEGER_INPUT_SIGNATURES: bool = true;
-    const REAL_CONDITIONAL_SCALAR_LOCALS: bool = true;
+    const REAL_EXTENDED_SCALAR_LOCALS: bool = true;
     const ORDINARY_INTEGER_LOCALS: bool = true;
 
     fn observe(&mut self, _: (usize, usize), _: &[&BigInt], _: &BigInt) {}
@@ -908,8 +908,8 @@ fn check_unused_module<const COLLECT: bool, const ENTRY_EVIDENCE: bool, Proof: S
             };
             let mut cursor = ExactCallCursor::arbitrary_root(body, &body.boundary.results[0].ty)
                 .ok_or(ProjectCheck::Unsupported)?;
-            if !Proof::ENABLED && body.structure.checker_has_conditional_scalar_local {
-                cursor.allow_conditional_scalar_locals();
+            if !Proof::ENABLED && body.structure.checker_has_extended_scalar_local {
+                cursor.allow_extended_scalar_locals();
             }
             symbolic.run_call_cursor(body, &module.source, cursor, None, Some(collection))?;
             active |= symbolic.had_obligations;
@@ -1415,7 +1415,7 @@ trait ActualIntegerObserver {
     #[cfg(feature = "internal-checker")]
     const REAL_INTEGER_INPUT_SIGNATURES: bool = false;
     #[cfg(feature = "internal-checker")]
-    const REAL_CONDITIONAL_SCALAR_LOCALS: bool = false;
+    const REAL_EXTENDED_SCALAR_LOCALS: bool = false;
     const INTEGER_RETURN_PARTITIONS: bool = false;
     const PROJECTED_FORMAL_WRITES: bool = false;
     const ORDINARY_PROJECTED_PAIR: bool = false;
@@ -1764,10 +1764,10 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             cursor.allow_exact_contextual_bool();
         }
         #[cfg(feature = "internal-checker")]
-        if ACTUAL_STARTUP && collection.is_some() && Observer::REAL_CONDITIONAL_SCALAR_LOCALS
-            && body.structure.checker_has_conditional_scalar_local
+        if ACTUAL_STARTUP && collection.is_some() && Observer::REAL_EXTENDED_SCALAR_LOCALS
+            && body.structure.checker_has_extended_scalar_local
         {
-            cursor.allow_conditional_scalar_locals();
+            cursor.allow_extended_scalar_locals();
         }
         #[cfg(feature = "internal-checker")]
         if ACTUAL_STARTUP && collection.is_some() && Observer::REAL_INTEGER_TAIL_CALLS && is_integer_type(expected)
@@ -2025,10 +2025,10 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             cursor.allow_exact_contextual_bool();
         }
         #[cfg(feature = "internal-checker")]
-        if ACTUAL_STARTUP && collection.is_some() && Observer::REAL_CONDITIONAL_SCALAR_LOCALS
-            && body.structure.checker_has_conditional_scalar_local
+        if ACTUAL_STARTUP && collection.is_some() && Observer::REAL_EXTENDED_SCALAR_LOCALS
+            && body.structure.checker_has_extended_scalar_local
         {
-            cursor.allow_conditional_scalar_locals();
+            cursor.allow_extended_scalar_locals();
         }
         #[cfg(feature = "internal-checker")]
         if ACTUAL_STARTUP && collection.is_some() && Observer::REAL_INTEGER_TAIL_CALLS && is_integer_type(expected)
@@ -15092,6 +15092,33 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
             %%end"#);
             assert!(matches!(run("mutual-cycle", &mutual, scope), Err(ProjectCheck::Unsupported)));
         }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn finite_ordinary_local_arithmetic_keeps_stride_and_inverse_input() {
+        let preimage = OUTPUT.replace(".code = 1", ".code = 110");
+        let stride = OUTPUT.replace(".code = 1", ".code = 111");
+        let program = format!(r#"%%start
+            unit(i8) check = fn(entry) {{
+                core.narrow(entry >= 0, {OUTPUT});
+                core.narrow(entry <= 3, {OUTPUT});
+                i8 product = entry * 3;
+                if (product == 6) {{ core.require(entry != 2, {preimage}); }};
+                core.require(product < 0, {stride});
+            }};
+        %%end"#);
+        let root = source("src/main.w", "finite-local-arithmetic");
+        let prepared = prepare_proof_target(&root, &program).unwrap();
+        let receipt = run_closed_without_named_proofs(&prepared, ScalarCheckerScope::CurrentPackage, 1).unwrap();
+        let [inverse, stride] = receipt.directives.as_slice() else { panic!("inverse and full exact stride"); };
+        assert_eq!(inverse.code(), &BigInt::from(110));
+        assert_eq!(stride.code(), &BigInt::from(111));
+        let two = BigInt::from(2);
+        assert!(inverse.witness.intervals_at(0, 0).unwrap().eq([(&two, &two)]));
+        let stride_values = stride.witness.state.project_axis_bounded(1, &mut 0).unwrap();
+        let expected = [0, 3, 6, 9].map(BigInt::from);
+        assert!(stride_values.intervals().eq(expected.iter().map(|value| (value, value))));
     }
 
     #[cfg(feature = "internal-checker")]

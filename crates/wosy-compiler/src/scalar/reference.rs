@@ -6273,7 +6273,7 @@ pub(super) struct OccurrenceStructure {
     #[cfg(feature = "internal-checker")]
     pub(super) checker_ordinary_scalar_locals: HashMap<(BlockOrdinal, usize), CheckerOrdinaryScalarLocal>,
     #[cfg(feature = "internal-checker")]
-    pub(super) checker_has_conditional_scalar_local: bool,
+    pub(super) checker_has_extended_scalar_local: bool,
     #[cfg(any(test, feature = "internal-checker"))]
     pub(super) checker_contextual_read_locals: HashMap<(BlockOrdinal, usize), ReferenceBindingId>,
     #[cfg(any(test, feature = "internal-checker"))]
@@ -6350,7 +6350,7 @@ impl OccurrenceStructure {
             #[cfg(feature = "internal-checker")]
             checker_ordinary_scalar_locals: HashMap::new(),
             #[cfg(feature = "internal-checker")]
-            checker_has_conditional_scalar_local: false,
+            checker_has_extended_scalar_local: false,
             #[cfg(feature = "internal-checker")]
             checker_ordinary_bool_literals: HashMap::new(),
             #[cfg(feature = "internal-checker")]
@@ -7782,10 +7782,14 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
     }
     #[cfg(feature = "internal-checker")]
     fn simple_integer_operation<'syntax>(
-        &self, ordinal: OccurrenceOrdinal, expression: &'syntax ScalarExpression,
+        &self, ordinal: OccurrenceOrdinal, expression: &'syntax ScalarExpression, allow_finite: bool,
     ) -> Option<(BinaryOperator, [(OccurrenceOrdinal, Option<std::borrow::Cow<'syntax, BigInt>>); 2])> {
-        let ScalarExpression::Binary { operator: operator @ (BinaryOperator::Add | BinaryOperator::Subtract),
-            left, right, .. } = expression else { return None; };
+        let ScalarExpression::Binary { operator, left, right, .. } = expression else { return None; };
+        if !(matches!(operator, BinaryOperator::Add | BinaryOperator::Subtract)
+            || allow_finite && matches!(operator, BinaryOperator::Multiply | BinaryOperator::Divide | BinaryOperator::Remainder))
+        {
+            return None;
+        }
         let parent = OccurrenceParent::Expression(ordinal);
         let OccurrenceNode::Expression(left_ordinal) = self.structure.edges.get(&(parent, OccurrenceEdge::BinaryLeft))?
             else { return None; };
@@ -7807,7 +7811,7 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
 
     #[cfg(feature = "internal-checker")]
     fn record_integer_final_operation(&mut self, ordinal: OccurrenceOrdinal, expression: &ScalarExpression) {
-        let Some((operator, [left, right])) = self.simple_integer_operation(ordinal, expression) else { return; };
+        let Some((operator, [left, right])) = self.simple_integer_operation(ordinal, expression, false) else { return; };
         let ordinals = [left.0, right.0];
         for (child, literal) in [left, right] {
             if let Some(literal) = literal {
@@ -7835,7 +7839,12 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
             }
             return self.ordinary_bool_call(expression, source).map(CheckerOrdinaryScalarLocalKind::BoolCall);
         }
-        let (operator, [left, right]) = self.simple_integer_operation(source, expression)?;
+        let (operator, [left, right]) = self.simple_integer_operation(source, expression, true)?;
+        if matches!(operator, BinaryOperator::Multiply | BinaryOperator::Divide | BinaryOperator::Remainder)
+            && left.1.is_some() == right.1.is_some()
+        {
+            return None;
+        };
         let typed = |(ordinal, literal): (_, Option<std::borrow::Cow<'_, BigInt>>)| {
             if let Some(literal) = literal {
                 Some(CheckerOrdinaryIntegerOperand::Literal(literal.into_owned()))
@@ -8963,7 +8972,10 @@ impl StructuralWalker<'_, '_> {
                 #[cfg(feature = "internal-checker")]
                 if let Some((source, callable, kind)) = ordinary_local.take() {
                     let binding = lexical.reference_id(callable.source, callable.function_span);
-                    self.structure.checker_has_conditional_scalar_local |= matches!(kind, CheckerOrdinaryScalarLocalKind::Conditional);
+                    self.structure.checker_has_extended_scalar_local |= matches!(kind,
+                        CheckerOrdinaryScalarLocalKind::Conditional | CheckerOrdinaryScalarLocalKind::Arithmetic {
+                            operator: BinaryOperator::Multiply | BinaryOperator::Divide | BinaryOperator::Remainder, ..
+                        });
                     self.structure.checker_ordinary_scalar_locals.insert((position.block, position.item),
                         CheckerOrdinaryScalarLocal { binding, source, kind });
                 }

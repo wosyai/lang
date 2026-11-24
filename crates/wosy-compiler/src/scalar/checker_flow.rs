@@ -140,7 +140,7 @@ trait ScopedAuthoredReturn<'a>: Copy {
     #[cfg(feature = "internal-checker")]
     const ALLOW_ORDINARY_INTEGER_LOCALS: bool = false;
     #[cfg(feature = "internal-checker")]
-    fn allows_conditional_scalar_locals(self) -> bool { false }
+    fn allows_extended_scalar_locals(self) -> bool { false }
     fn at(
         self, calls: &FunctionCallSites, block: BlockOrdinal, slot: FinalOutputSlot, ty: &ScalarType,
         roots: &IntegerRoots<'_>, path: &IntegerInputs,
@@ -201,7 +201,7 @@ impl<'a, const EXACT_COMPOUND: bool, const ORDINARY_LOCALS: bool> ScopedAuthored
 {
     const ENABLED: bool = false;
     const ALLOW_ORDINARY_INTEGER_LOCALS: bool = ORDINARY_LOCALS;
-    fn allows_conditional_scalar_locals(self) -> bool { ORDINARY_LOCALS && self.1 }
+    fn allows_extended_scalar_locals(self) -> bool { ORDINARY_LOCALS && self.1 }
 
     fn at(
         self, _: &FunctionCallSites, _: BlockOrdinal, _: FinalOutputSlot, _: &ScalarType,
@@ -1449,7 +1449,7 @@ struct IntegerRoots<'a> {
     #[cfg(feature = "internal-checker")]
     allow_real_integer_tail_call: bool,
     #[cfg(feature = "internal-checker")]
-    allow_conditional_scalar_locals: bool,
+    allow_extended_scalar_locals: bool,
     #[cfg(feature = "internal-checker")]
     ordinary_local_work: Option<usize>,
     #[cfg(feature = "internal-checker")]
@@ -2874,14 +2874,14 @@ pub(super) fn collect_integer_requirement_failures_with_calls<'a>(
 #[cfg(feature = "internal-checker")]
 pub(super) fn collect_ordered_root_requirement_failures<'a>(
     calls: &'a FunctionCallSites, body: &'a super::ScalarBlock, allow_ordinary_integer_locals: bool,
-    allow_conditional_scalar_locals: bool,
+    allow_extended_scalar_locals: bool,
 ) -> Option<(bool, Vec<IntegerCheckFailure<'a>>)> {
     let mut failures = Vec::new();
     let mut sink = |failure| failures.push(failure);
     let (active, _) = if allow_ordinary_integer_locals && (calls.structure.has_ordinary_integer_operations()
         || ordinary_tail_type(calls, true) == Some(&ScalarType::Bool)) {
         collect_integer_requirement_failures_in_scope(
-            calls, IntegerRequirementEntry::Arbitrary, None, false, false, &mut sink, OrderedRootConditions::<true, true>(body, allow_conditional_scalar_locals),
+            calls, IntegerRequirementEntry::Arbitrary, None, false, false, &mut sink, OrderedRootConditions::<true, true>(body, allow_extended_scalar_locals),
         )
     } else {
         collect_integer_requirement_failures_in_scope(
@@ -3903,7 +3903,7 @@ fn run_integer_callable<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool,
         #[cfg(feature = "internal-checker")]
         allow_ordinary_integer_locals: Authored::ALLOW_ORDINARY_INTEGER_LOCALS,
         #[cfg(feature = "internal-checker")]
-        allow_conditional_scalar_locals: authored_return.allows_conditional_scalar_locals(),
+        allow_extended_scalar_locals: authored_return.allows_extended_scalar_locals(),
         #[cfg(feature = "internal-checker")]
         allow_ordinary_affine_overwrites: Authored::ALLOW_ORDINARY_INTEGER_LOCALS,
         #[cfg(feature = "internal-checker")]
@@ -5345,7 +5345,7 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                                 path.append_ordinary_copy(axis, roots)?;
                             }
                             super::reference::CheckerOrdinaryScalarLocalKind::Conditional => {
-                                if !roots.allow_conditional_scalar_locals { return None; }
+                                if !roots.allow_extended_scalar_locals { return None; }
                                 path = bind_conditional_scalar_local(calls, roots, path, origin.source, &receiver.ty)?;
                             }
                             super::reference::CheckerOrdinaryScalarLocalKind::BoolCall(call) => {
@@ -5366,8 +5366,16 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                                 let operand = |operand| ordinary_local_operand(calls, roots, &receiver.ty, operand);
                                 let left = operand(&operands[0])?;
                                 let right = operand(&operands[1])?;
-                                path.append_ordinary_calculation(operation, left, right, &receiver.ty,
-                                    &mut roots.ordinary_local_work, &mut roots.affine_work)?;
+                                if matches!(operation, AuthoredIntegerOperation::Multiply | AuthoredIntegerOperation::Divide
+                                    | AuthoredIntegerOperation::Remainder)
+                                {
+                                    if !roots.allow_extended_scalar_locals { return None; }
+                                    path = path.finite_ordinary_calculation(operation, left, right, &receiver.ty,
+                                        roots.ordinary_local_work.get_or_insert(0))?;
+                                } else {
+                                    path.append_ordinary_calculation(operation, left, right, &receiver.ty,
+                                        &mut roots.ordinary_local_work, &mut roots.affine_work)?;
+                                }
                             }
                         }
                         roots.add(&origin.binding, &receiver.ty);
@@ -5621,9 +5629,9 @@ impl<'a> ExactCallCursor<'a> {
     }
 
     #[cfg(feature = "internal-checker")]
-    pub(super) fn allow_conditional_scalar_locals(&mut self) {
+    pub(super) fn allow_extended_scalar_locals(&mut self) {
         debug_assert!(self.projected_slot.is_none() && self.projected_pair.is_none());
-        self.roots.allow_conditional_scalar_locals = true;
+        self.roots.allow_extended_scalar_locals = true;
     }
 
     pub(super) fn new(calls: &'a FunctionCallSites, exact: &[&BigInt], expected: &ScalarType) -> Option<Self> {
@@ -6232,6 +6240,49 @@ fn compute_row_integer_operation(
 
 #[cfg(feature = "internal-checker")]
 impl IntegerInputs {
+    fn finite_ordinary_calculation(
+        self, operation: AuthoredIntegerOperation, left: IntegerCalculationOperand<'_>,
+        right: IntegerCalculationOperand<'_>, ty: &ScalarType, work: &mut usize,
+    ) -> Option<Self> {
+        // Enumerate a small complete preimage, not a sample or a convex hull.
+        const MAX_FINITE_ARITHMETIC_ATOMS: usize = 64;
+        let (axis, literal, lexical_on_left) = match (left, right) {
+            ((None, Some(axis)), (Some(literal), None)) => (axis, literal, true),
+            ((Some(literal), None), (None, Some(axis))) => (axis, literal, false),
+            _ => return None,
+        };
+        let (min, max) = super::typecheck::integer_bounds(ty)?;
+        let one = BigInt::from(1u8);
+        let mut remaining = MAX_FINITE_ARITHMETIC_ATOMS;
+        let mut output = Vec::new();
+        for row in self.0 {
+            if row.affine.is_some() || row.entry.is_some() { return None; }
+            let domain = row.get(axis)?;
+            charge_call_work(work, 1usize.checked_add(domain.interval_count())?)?;
+            let copy_cost = row.len().checked_mul(2)?
+                .checked_add(row.equal_axes().len().checked_mul(3)?)?.checked_add(10)?;
+            for (first, last) in domain.intervals() {
+                let count = usize::try_from(last - first + &one).ok()?;
+                remaining = remaining.checked_sub(count)?;
+                charge_call_work(work, copy_cost.checked_mul(count)?)?;
+                let mut input = first.clone();
+                for index in 0..count {
+                    let (left, right) = if lexical_on_left { (&input, literal) } else { (literal, &input) };
+                    let value = operation.apply(Cow::Borrowed(left), Cow::Borrowed(right), &min)?;
+                    if value < min || value > max { return None; }
+                    let mut piece = row.clone();
+                    // Refining the old source preserves all of its aliases;
+                    // the computed value belongs only to this exact preimage.
+                    piece.replace_domain(axis, Rc::new(IntegerSet::singleton(&input)));
+                    piece.push(Rc::new(IntegerSet::singleton(&value)));
+                    output.push(piece);
+                    if index + 1 < count { input += &one; }
+                }
+            }
+        }
+        Some(Self(output))
+    }
+
     fn append_ordinary_calculation(
         &mut self, operation: AuthoredIntegerOperation,
         left: IntegerCalculationOperand<'_>, right: IntegerCalculationOperand<'_>, ty: &ScalarType,

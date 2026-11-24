@@ -343,7 +343,10 @@ for name,program,correct,incorrect,code,label in [
     cases.extend([(name,program,0,b""),(name+"-witness",program.replace(correct,incorrect),code,label)])
 cases.extend([
     ("exact-startup-inline-arithmetic",inline_startup,72,b"INLINE-STARTUP"),
-    ("inline-nonlinear-remains-unsupported",inline_return.replace("entry - 1","entry * 1"),2,b"unsupported analysis"),
+    ("inline-finite-multiplication-refines-integer-root",inline_return.replace("entry - 1","entry * 1").replace(
+        report(70,"INLINE-RETURN"), report(70,"INLINE-RETURN").replace(".files = []", '.files = [{ .path = "state.json"; .state = entry; }]'),
+    ),70,b"INLINE-RETURN"),
+    ("inline-two-lexical-multiplication-remains-unsupported",inline_return.replace("entry - 1","entry * entry"),2,b"unsupported analysis"),
     ("inline-two-broad-operands-remain-unsupported",inline_two_broad,2,b"unsupported analysis"),
     ("inline-unrelated-second-class-remains-unsupported",inline_second_class,2,b"unsupported analysis"),
 ])
@@ -993,6 +996,49 @@ namespace_scalar_child = f"""%%start
     }};
     %%end"""
 cases.append((namespace_scalar_key,namespace_scalar_main,210,b"ROOTINITCALLEERETURNEMPTY"))
+finite_scalar_stride = f"""%%start
+    unit(i8) check = fn(entry) {{
+        core.narrow(entry >= 0, {report(245,"FINITE-CUT")});
+        core.narrow(entry <= 3, {report(245,"FINITE-CUT")});
+        i8 product = entry * 3;
+        if (product == 6) {{
+            core.require(entry != 2, {state_report(246,"MULTIPLY-PREIMAGE","entry").replace("state.json","preimage.json")});
+        }};
+        core.require(product < 0, {state_report(247,"EXACT-STRIDE","product")});
+    }};
+    %%end"""
+finite_scalar_signed = f"""%%start
+    unit(i8) check = fn(entry) {{
+        i8 quotient = entry / 3;
+        i8 remainder = entry % 3;
+        core.require(quotient == -2, {report(248,"WRONG-QUOTIENT")});
+        core.require(remainder != -1, {state_report(249,"SIGNED-REMAINDER","remainder")});
+    }};
+    check(-7);
+    %%end"""
+finite_scalar_zero = f"""%%start
+    unit(i8) check = fn(entry) {{
+        core.require(false, {report(250,"FINITE-PRIOR-UNPUBLISHED")});
+        i8 quotient = 42 / entry;
+        core.require(quotient < 0, {report(251,"UNDEFINED-OUTCOME")});
+    }};
+    check(0);
+    %%end"""
+finite_scalar_width = f"""%%start
+    unit(u8) check = fn(entry) {{
+        core.narrow(entry <= 63, {report(245,"FINITE-CUT")});
+        u8 output = entry / 1;
+        core.require(output <= 255, {report(245,"FINITE-BOUND")});
+    }};
+    %%end"""
+cases.extend([
+    ("finite-ordinary-multiplication-has-exact-stride",finite_scalar_stride,246,b"MULTIPLY-PREIMAGEEXACT-STRIDE"),
+    ("exact-startup-finite-ordinary-signed-quotient-remainder",finite_scalar_signed,249,b"SIGNED-REMAINDER"),
+    ("exact-startup-finite-ordinary-zero-divisor-refused",finite_scalar_zero,2,b"unsupported analysis"),
+    ("exact-startup-finite-ordinary-overflow-refused",finite_scalar_zero.replace("42 / entry","entry * 2").replace("check(0)","check(100)"),2,b"unsupported analysis"),
+    ("finite-ordinary-accepts-sixty-four-atoms",finite_scalar_width,0,b""),
+    ("finite-ordinary-refuses-sixty-five-atoms",finite_scalar_width.replace("entry <= 63","entry <= 64"),2,b"unsupported analysis"),
+])
 conditional_binding_symbolic = f"""%%start
     unit(i8) check = fn(input) {{
         i8 selected = if (input < 0) {{ 13 }} else {{ input }};
@@ -1479,6 +1525,14 @@ nested_array_bytes = state_bytes({
     },
 })
 authored_files = {
+    "inline-finite-multiplication-refines-integer-root": {"state.json": b'{"type":{"kind":"i8"},"value":2}\n'},
+    "finite-ordinary-multiplication-has-exact-stride": {
+        "state.json": b'{"type":{"kind":"i8"},"value":{"kind":"alternatives","values":[0,3,6,9]}}\n',
+        "preimage.json": b'{"type":{"kind":"i8"},"value":2}\n',
+    },
+    "exact-startup-finite-ordinary-signed-quotient-remainder": {
+        "state.json": b'{"type":{"kind":"i8"},"value":-1}\n',
+    },
     "conditional-scalar-binding-symbolic-preimages": {
         "state.json": b'{"type":{"kind":"i8"},"value":0}\n',
         "constant.json": b'{"type":{"kind":"i8"},"value":{"kind":"range","minimum":-128,"maximum":-1}}\n',
@@ -1620,6 +1674,8 @@ with tempfile.TemporaryDirectory(prefix="affine-calls-") as path:
                         assert b"NEVER-SCALAR-WRITE" not in res.stderr,res
                     if name == "exact-startup-conditional-local-write-rejects-reached-effect":
                         assert b"PRIOR" not in res.stderr and b"ARM-EFFECT" not in res.stderr,res
+                    if name.startswith("exact-startup-finite-ordinary-"):
+                        assert b"FINITE-PRIOR-UNPUBLISHED" not in res.stderr,res
                     if name == "conditional-scalar-binding-refuses-reached-operand":
                         assert b"BIND-PRIOR-UNPUBLISHED" not in res.stderr,res
                     if name == "projected-conditional-local-write-rejects-reached-operand":
