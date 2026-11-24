@@ -1,6 +1,6 @@
 ---
 name: wosy
-description: Write, build, and repair Wosy programs. Use for .w files, wosy.toml projects, wosy parse/build/run, and B/M/P/S diagnostics.
+description: Write, build, and repair Wosy programs and packages. Use for .w files, wosy.toml, wosy.lock, wosy init/dep/parse/build/run, and Wosy diagnostics.
 ---
 
 # Wosy
@@ -9,11 +9,10 @@ Wosy is a statically typed ahead-of-time compiled language. Source files are `.w
 
 ## Workflow
 
-1. Locate the project root by searching upward for `wosy.toml`.
-2. Read `wosy.toml` for the target, profile, backend, builder, and runner.
-3. Write or edit `.w` sources inside `%%start` / `%%end`.
-4. Run `wosy build <target> --profile dev`, then `wosy run <target> --profile dev`.
-5. On failure, read the diagnostic code on stderr and fix the named file and span. Rebuild before rerunning.
+1. Locate the project root by searching upward for `wosy.toml`. For a new base-language package on Linux, run `wosy init` in the new package directory; it will not overwrite scaffold paths.
+2. Read `wosy.toml` for the target, profile, source root, builder, and runner. After cloning a project with locked Git dependencies, run `wosy dep sync` before building.
+3. Write or edit `.w` sources inside `%%start` / `%%end`. Use `wosy parse` for target-root syntax only, not to check dependencies.
+4. Run `wosy build <target> --profile <profile>`, then `wosy run <target> --profile <profile>`. Rebuild after changing sources, dependency routing, or configuration. Use the diagnostic's file and span to fix failures.
 
 Done when `wosy build` exits 0 and `wosy run` produces the expected stdout.
 
@@ -23,6 +22,7 @@ Done when `wosy build` exits 0 and `wosy run` produces the expected stdout.
 [package]
 name = "is_even"
 default_target = "app"
+source_root = "src"
 
 [dependencies.std]
 path = "stdlib"
@@ -41,6 +41,7 @@ args = []
 
 [targets.app]
 root = "src/main.w"
+default_profile = "dev"
 
 [targets.app.artifacts.main]
 artifact = "Main"
@@ -55,7 +56,13 @@ run_runner = "wasm"
 main_artifact = "main"
 ```
 
-Rules: one table per dependency with only `path`. Builders and runners are external commands. Supported outputs are `llvm/native` and `llvm/wasm-wasip1|wasm-wasip2`. `wosy run` fails with `artifact manifest is stale` after any source or config change until the next `wosy build`.
+Builders and runners are external commands. Supported outputs are `llvm/native` and `llvm/wasm-wasip1|wasm-wasip2`. Target roots are relative to the project; namespace paths are relative to the named package's `source_root`.
+
+### Dependencies
+
+- Local: `wosy dep add <local-path>` uses that local package in place. Git: `wosy dep add <git-origin> --path <package-directory>` records exact revisions in `wosy.lock`; `wosy dep sync` materializes those revisions. Build and run neither fetch nor change the lock. Commit the lock, not the managed `deps/` directory.
+- Use `wosy dep snapshot` to turn edits to a Git checkout into project patches. Use `wosy dep update` only when intentionally advancing the pins. Do not replace these steps with manual edits inside `deps/`. See [package commands](../../../docs/cli.md) and [project configuration](../../../docs/project.md) for platform requirements and details.
+- `dep sync` does not check proofs. Don't assume `wosy check --dependencies` is available; use it only if the installed CLI exposes it.
 
 ## Source shape
 
@@ -72,7 +79,7 @@ Comments start with `#`. A `# CATEGORY: payload` comment is valid only when `CAT
 Modules and foreign functions:
 
 ```wosy
-math = namespace app "src/math.w";
+math = namespace is_even "math.w";
 std = namespace std "bootstrap.w";
 env = extern wasm "env" {
   unit(i32) print_i32;
