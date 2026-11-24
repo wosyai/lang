@@ -92,7 +92,7 @@ pub(super) struct PreparationOccurrenceTyping {
     #[cfg(any(test, feature = "internal-checker"))]
     checker_enabled: bool,
     #[cfg(feature = "internal-checker")]
-    snapshot_types: std::collections::BTreeSet<super::ScalarStructId>,
+    snapshot_types: std::collections::BTreeSet<std::rc::Rc<super::ScalarStructId>>,
 }
 
 struct CheckedExpressionType {
@@ -322,17 +322,26 @@ impl<'a> ScalarInferenceBuilder<'a> {
         self.occurrences.checker_enabled
     }
 
+    #[cfg(feature = "internal-checker")]
+    pub(super) fn shared_snapshot_type(&self, id: super::ScalarStructId) -> std::rc::Rc<super::ScalarStructId> {
+        self.occurrences.snapshot_types.get(&id).cloned().unwrap_or_else(|| std::rc::Rc::new(id))
+    }
+
     #[cfg(any(test, feature = "internal-checker"))]
     pub(super) fn record_checker_directive(
         &mut self,
         expression: &ScalarExpression,
-        marker: super::checker_directive::CheckedDirectiveMarker,
+        #[allow(unused_mut)] mut marker: super::checker_directive::CheckedDirectiveMarker,
     ) {
         if !self.suppress_checked_occurrences {
             #[cfg(feature = "internal-checker")]
-            for file in marker.output.state_files.iter() {
-                if let ScalarType::Struct(id) = &file.ty {
-                    self.occurrences.snapshot_types.insert(id.clone());
+            for file in marker.output.state_files.iter_mut() {
+                if let super::checker_directive::CheckerStateType::Nominal(id) = &mut file.ty {
+                    if let Some(shared) = self.occurrences.snapshot_types.get(id.as_ref()) {
+                        if !std::rc::Rc::ptr_eq(id, shared) { *id = shared.clone(); }
+                    } else {
+                        self.occurrences.snapshot_types.insert(id.clone());
+                    }
                 }
             }
             self.occurrences

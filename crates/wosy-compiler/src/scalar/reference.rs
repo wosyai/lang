@@ -6249,13 +6249,11 @@ pub(super) struct OccurrenceStructure {
     #[cfg(feature = "internal-checker")]
     pub(super) checker_ordinary_bool_literals: HashMap<OccurrenceOrdinal, BigInt>,
     #[cfg(feature = "internal-checker")]
-    pub(super) checker_snapshot_locals: HashMap<(BlockOrdinal, usize), std::rc::Rc<[super::checker_directive::CheckerSnapshotField]>>,
-    #[cfg(feature = "internal-checker")]
-    checker_snapshot_names: HashMap<(BlockOrdinal, usize), std::rc::Rc<str>>,
+    pub(super) checker_snapshot_locals: HashMap<(BlockOrdinal, usize), std::rc::Rc<super::checker_directive::CheckerSnapshotShape>>,
     #[cfg(feature = "internal-checker")]
     pub(super) checker_selected_snapshots: HashSet<(BlockOrdinal, usize)>,
     #[cfg(feature = "internal-checker")]
-    checker_snapshot_bindings: HashMap<ReferenceBindingId, (BlockOrdinal, usize)>,
+    checker_snapshot_bindings: HashMap<(ByteSpan, ByteSpan), (BlockOrdinal, usize)>,
     #[cfg(feature = "internal-checker")]
     pub(super) checker_ordinary_scalar_locals: HashMap<(BlockOrdinal, usize), CheckerOrdinaryScalarLocal>,
     #[cfg(any(test, feature = "internal-checker"))]
@@ -6321,8 +6319,6 @@ impl OccurrenceStructure {
             checker_integer_locals: HashMap::new(),
             #[cfg(feature = "internal-checker")]
             checker_snapshot_locals: HashMap::new(),
-            #[cfg(feature = "internal-checker")]
-            checker_snapshot_names: HashMap::new(),
             #[cfg(feature = "internal-checker")]
             checker_selected_snapshots: HashSet::new(),
             #[cfg(feature = "internal-checker")]
@@ -7402,21 +7398,25 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
             let mut output = marker.output;
             #[cfg(feature = "internal-checker")]
             if let WalkMode::Callable(callable) = &self.mode {
-                use super::checker_directive::CheckerStateSelection;
+                use super::checker_directive::{CheckerStateSelection, CheckerStateType};
                 for file in output.state_files.iter_mut() {
                     let CheckerStateSelection::Lexical(lexical) = &file.selection else { continue; };
-                    if let Some(PlainNameIdentity::Lexical(binding)) = callable.target_resolver.plain_name(lexical, names) {
-                        if matches!(file.ty, ScalarType::Struct(_)) {
-                            if let Some(key) = self.structure.checker_snapshot_bindings.get(&binding) {
+                    if matches!(&file.ty, CheckerStateType::Nominal(_)) {
+                        // A snapshot is keyed by a declared lexical occurrence
+                        // in this callable. Do not allocate a fresh source ID
+                        // for each authored output path that names it.
+                        if let Some(declaration) = names.get(lexical.as_ref()).filter(|slot|
+                            !slot.introduced_by_assignment && lexical.as_ref() != "null")
+                        {
+                            if let Some(key) = self.structure.checker_snapshot_bindings.get(&(
+                                declaration.declaration_span, declaration.block_span,
+                            )) {
                                 self.structure.checker_selected_snapshots.insert(*key);
-                                file.selection = CheckerStateSelection::Nominal {
-                                    binding, name: self.structure.checker_snapshot_names[key].clone(),
-                                    fields: self.structure.checker_snapshot_locals[key].clone(),
-                                };
+                                file.selection = CheckerStateSelection::Nominal(self.structure.checker_snapshot_locals[key].clone());
                             }
-                        } else {
-                            file.selection = CheckerStateSelection::Binding(binding);
                         }
+                    } else if let Some(PlainNameIdentity::Lexical(binding)) = callable.target_resolver.plain_name(lexical, names) {
+                        file.selection = CheckerStateSelection::Binding(binding);
                     }
                 }
             }
@@ -8808,14 +8808,12 @@ impl StructuralWalker<'_, '_> {
                 let identity = lexical.reference_id(callable.target_resolver.source, callable.target_resolver.function_span);
                 if let ScalarType::Struct(id) = &binding.declared_type {
                     if self.occurrence_typing.checker_demands_snapshot(id) {
-                        if let Some((structure, fields)) = callable.target_resolver.declarations.structs.get(id)
-                            .and_then(|structure| self.checker_snapshot_fields(binding, outputs.primary, &identity, structure)
-                                .map(|fields| (structure, fields)))
+                        if let Some(shape) = self.checker_snapshot_shape(binding, outputs.primary, &identity,
+                            callable.target_resolver.declarations)
                         {
                             let key = (position.block, position.item);
-                            self.structure.checker_snapshot_locals.insert(key, fields.into());
-                            self.structure.checker_snapshot_names.insert(key, structure.name.as_str().into());
-                            self.structure.checker_snapshot_bindings.insert(identity, key);
+                            self.structure.checker_snapshot_locals.insert(key, std::rc::Rc::new(shape));
+                            self.structure.checker_snapshot_bindings.insert((receiver.name_span, block_span), key);
                         }
                     }
                 }
@@ -8884,45 +8882,75 @@ impl StructuralWalker<'_, '_> {
     }
 
     #[cfg(feature = "internal-checker")]
-    fn checker_snapshot_fields(
-        &self, binding: &ScalarBinding, root: OccurrenceOrdinal, identity: &ReferenceBindingId, structure: &ScalarStruct,
-    ) -> Option<Vec<super::checker_directive::CheckerSnapshotField>> {
-        use super::checker_directive::{CheckerSnapshotField, CheckerSnapshotOperand};
-        let ScalarType::Struct(id) = &binding.declared_type else { return None; };
-        let ScalarBindingOutput::Evaluate(ScalarExpression::StructLiteral { fields, .. }) = binding.output_source(0)
-            else { return None; };
-        if fields.is_empty() || fields.len() != structure.fields.len() || fields.len() > 64 { return None; }
-        let mut captured = Vec::with_capacity(fields.len());
-        for (position, field) in fields.iter().enumerate() {
-            let OccurrenceNode::Expression(ordinal) = self.structure.edges.get(&(
-                OccurrenceParent::Expression(root), OccurrenceEdge::AggregateField(position),
-            ))? else { return None; };
-            let field_id = self.structure.literal_fields.get(ordinal)?;
-            if &field_id.structure != id { return None; }
-            let declared = structure.fields.get(field_id.index)?;
-            let ty = self.structure.checked_types.expressions.get(ordinal)?;
-            if ty != &declared.ty || field.name != declared.name { return None; }
-            if !is_integer_type(ty) && *ty != ScalarType::Bool { return None; }
-            let operand = match &field.value {
-                ScalarExpression::Integer { value, .. } => CheckerSnapshotOperand::Literal(value.clone()),
-                ScalarExpression::Boolean { value, .. } => CheckerSnapshotOperand::Literal(BigInt::from(u8::from(*value))),
-                ScalarExpression::Contextual { binding, .. } => CheckerSnapshotOperand::Binding(binding.clone()),
-                ScalarExpression::Name { .. } => {
-                    let PlainNameFacts::Prepared(names) = &self.plain_names else { return None; };
-                    let PlainNameIdentity::Lexical(source) = names.get(ordinal)? else { return None; };
-                    CheckerSnapshotOperand::Binding(source.clone())
-                }
-                _ => return None,
-            };
-            let mut capture = identity.clone();
-            capture.kind = ReferenceBindingKind::CheckerSnapshotField(field_id.index);
-            captured.push((field_id.index, CheckerSnapshotField {
-                name: declared.name.as_str().into(), ty: ty.clone(), capture, operand,
-            }));
+    fn checker_snapshot_shape(
+        &self, binding: &ScalarBinding, root: OccurrenceOrdinal, identity: &ReferenceBindingId,
+        declarations: &CallDeclarationIndex<'_>,
+    ) -> Option<super::checker_directive::CheckerSnapshotShape> {
+        use super::checker_directive::{CheckerSnapshotLeaf, CheckerSnapshotNode, CheckerSnapshotOperand, CheckerSnapshotShape};
+        struct Builder<'walk, 'input, 'typing> {
+            walker: &'walk StructuralWalker<'input, 'typing>,
+            declarations: &'walk CallDeclarationIndex<'input>,
+            identity: &'walk ReferenceBindingId,
+            remaining: usize,
+            remaining_name_bytes: usize,
+            leaves: Vec<CheckerSnapshotLeaf>,
         }
-        captured.sort_unstable_by_key(|(index, _)| *index);
-        if captured.iter().enumerate().any(|(position, (index, _))| position != *index) { return None; }
-        Some(captured.into_iter().map(|(_, field)| field).collect())
+        impl Builder<'_, '_, '_> {
+            fn node(
+                &mut self, expression: &ScalarExpression, root: OccurrenceOrdinal, ty: &ScalarType, depth: usize,
+            ) -> Option<CheckerSnapshotNode> {
+                if depth > 8 || self.walker.structure.checked_types.expressions.get(&root)? != ty { return None; }
+                self.remaining = self.remaining.checked_sub(1)?;
+                if let ScalarType::Struct(id) = ty {
+                    let ScalarExpression::StructLiteral { fields, .. } = expression else { return None; };
+                    let structure = *self.declarations.structs.get(id)?;
+                    if fields.is_empty() || fields.len() != structure.fields.len() || fields.len() > self.remaining {
+                        return None;
+                    }
+                    self.remaining_name_bytes = self.remaining_name_bytes.checked_sub(structure.name.len())?;
+                    let mut nodes = Vec::with_capacity(fields.len());
+                    for (position, field) in fields.iter().enumerate() {
+                        let OccurrenceNode::Expression(ordinal) = *self.walker.structure.edges.get(&(
+                            OccurrenceParent::Expression(root), OccurrenceEdge::AggregateField(position),
+                        ))? else { return None; };
+                        let field_id = self.walker.structure.literal_fields.get(&ordinal)?;
+                        if &field_id.structure != id { return None; }
+                        let declared = structure.fields.get(field_id.index)?;
+                        if field.name != declared.name { return None; }
+                        self.remaining_name_bytes = self.remaining_name_bytes.checked_sub(declared.name.len())?;
+                        nodes.push((field_id.index, (declared.name.as_str().into(),
+                            self.node(&field.value, ordinal, &declared.ty, depth + 1)?)));
+                    }
+                    nodes.sort_unstable_by_key(|(index, _)| *index);
+                    if nodes.iter().enumerate().any(|(position, (index, _))| position != *index) { return None; }
+                    return Some(CheckerSnapshotNode::Nominal {
+                        name: structure.name.as_str().into(),
+                        fields: nodes.into_iter().map(|(_, field)| field).collect(),
+                    });
+                }
+                if !is_integer_type(ty) && *ty != ScalarType::Bool { return None; }
+                let operand = match expression {
+                    ScalarExpression::Integer { value, .. } => CheckerSnapshotOperand::Literal(value.clone()),
+                    ScalarExpression::Boolean { value, .. } => CheckerSnapshotOperand::Literal(BigInt::from(u8::from(*value))),
+                    ScalarExpression::Contextual { binding, .. } => CheckerSnapshotOperand::Binding(binding.clone()),
+                    ScalarExpression::Name { .. } => {
+                        let PlainNameFacts::Prepared(names) = &self.walker.plain_names else { return None; };
+                        let PlainNameIdentity::Lexical(source) = names.get(&root)? else { return None; };
+                        CheckerSnapshotOperand::Binding(source.clone())
+                    }
+                    _ => return None,
+                };
+                let index = self.leaves.len();
+                let mut capture = self.identity.clone();
+                capture.kind = ReferenceBindingKind::CheckerSnapshotField(index);
+                self.leaves.push(CheckerSnapshotLeaf { ty: ty.clone(), capture, operand });
+                Some(CheckerSnapshotNode::Leaf(index))
+            }
+        }
+        let ScalarBindingOutput::Evaluate(expression) = binding.output_source(0) else { return None; };
+        let mut builder = Builder { walker: self, declarations, identity, remaining: 65, remaining_name_bytes: 4096, leaves: Vec::new() };
+        let root = builder.node(expression, root, &binding.declared_type, 0)?;
+        Some(CheckerSnapshotShape { root, leaves: builder.leaves.into_boxed_slice() })
     }
 
     fn block_item(

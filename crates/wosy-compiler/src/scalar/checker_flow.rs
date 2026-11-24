@@ -5180,9 +5180,9 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                     // Legacy early-failure checks do not materialize authored
                     // state and must never expose internal capture columns.
                     if !COLLECT { return None; }
-                    let fields = structure.checker_snapshot_locals.get(&(block, item.position))?;
+                    let shape = structure.checker_snapshot_locals.get(&(block, item.position))?;
                     use super::checker_directive::CheckerSnapshotOperand;
-                    for field in fields.iter() {
+                    for field in shape.leaves.iter() {
                         match &field.operand {
                             CheckerSnapshotOperand::Binding(binding) => {
                                 let (axis, ty) = roots.lookup(binding)?;

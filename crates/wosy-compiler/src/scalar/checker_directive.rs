@@ -64,20 +64,32 @@ pub(super) struct CheckedLiteralOutput {
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[cfg_attr(not(feature = "internal-checker"), allow(dead_code))]
 pub(super) enum CheckerStateSelection {
-    Lexical(Box<str>),
+    Lexical(std::rc::Rc<str>),
     Binding(ReferenceBindingId),
     #[cfg(feature = "internal-checker")]
-    Nominal {
-        binding: ReferenceBindingId,
-        name: std::rc::Rc<str>,
-        fields: std::rc::Rc<[CheckerSnapshotField]>,
-    },
+    Nominal(std::rc::Rc<CheckerSnapshotShape>),
 }
 
 #[cfg(feature = "internal-checker")]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct CheckerSnapshotField {
-    pub(super) name: Box<str>,
+pub(super) struct CheckerSnapshotShape {
+    pub(super) root: CheckerSnapshotNode,
+    pub(super) leaves: Box<[CheckerSnapshotLeaf]>,
+}
+
+#[cfg(feature = "internal-checker")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum CheckerSnapshotNode {
+    Nominal {
+        name: Box<str>,
+        fields: Box<[(Box<str>, CheckerSnapshotNode)]>,
+    },
+    Leaf(usize),
+}
+
+#[cfg(feature = "internal-checker")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct CheckerSnapshotLeaf {
     pub(super) ty: ScalarType,
     pub(super) capture: ReferenceBindingId,
     pub(super) operand: CheckerSnapshotOperand,
@@ -91,13 +103,20 @@ pub(super) enum CheckerSnapshotOperand {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum CheckerStateType {
+    Scalar(ScalarType),
+    #[cfg(feature = "internal-checker")]
+    Nominal(std::rc::Rc<super::ScalarStructId>),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct CheckerStateFile {
     pub(super) position: usize,
     pub(super) path: Box<str>,
     pub(super) path_span: ByteSpan,
     pub(super) state_span: ByteSpan,
     pub(super) selection: CheckerStateSelection,
-    pub(super) ty: ScalarType,
+    pub(super) ty: CheckerStateType,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -242,7 +261,7 @@ impl CheckerOutput<'_> {
     }
 
     pub(super) fn explicit_with_state(
-        &self, mut select: impl FnMut(&ScalarExpression) -> Option<(CheckerStateSelection, ScalarType)>,
+        &self, mut select: impl FnMut(&ScalarExpression) -> Option<(CheckerStateSelection, CheckerStateType)>,
     ) -> Option<CheckedLiteralOutput> {
         let ScalarExpression::Utf8 { span: stdout, value: stdout_bytes } = self.stdout? else {
             return None;

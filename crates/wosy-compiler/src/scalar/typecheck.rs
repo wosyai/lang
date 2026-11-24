@@ -3347,7 +3347,7 @@ fn check_expression_type_in_module(
             );
             #[cfg(feature = "internal-checker")]
             let configured_output = directive.output.explicit_with_state(|expression| {
-                use super::checker_directive::CheckerStateSelection;
+                use super::checker_directive::{CheckerStateSelection, CheckerStateType};
                 let selection = match expression {
                     ScalarExpression::Name { name, .. } => CheckerStateSelection::Lexical(name.as_str().into()),
                     ScalarExpression::Contextual { binding, .. } => CheckerStateSelection::Binding(binding.clone()),
@@ -3357,9 +3357,13 @@ fn check_expression_type_in_module(
                     expression, None, scope, visible_names, folded_names, module, modules, diagnostics,
                     unsafe_context, overloads, inference,
                 );
-                (ty == ScalarType::Bool || is_integer_type(&ty)
-                    || matches!((&selection, &ty), (CheckerStateSelection::Lexical(_), ScalarType::Struct(_))))
-                    .then_some((selection, ty))
+                match ty {
+                    ScalarType::Struct(id) if matches!(&selection, CheckerStateSelection::Lexical(_)) =>
+                        Some((selection, CheckerStateType::Nominal(inference.shared_snapshot_type(id)))),
+                    ty if ty == ScalarType::Bool || is_integer_type(&ty) =>
+                        Some((selection, CheckerStateType::Scalar(ty))),
+                    _ => None,
+                }
             });
             #[cfg(not(feature = "internal-checker"))]
             let configured_output = directive.output.explicit_literal();

@@ -936,6 +936,31 @@ state_nominal_nested_scope = f"""%%start
         }};
     }};
     %%end"""
+state_nominal_recursive = f"""%%start
+    struct Child {{ i8 saved; bool ready; }}
+    struct Snapshot {{ Child earlier; Child later; }}
+    unit(i8) check = fn(value) {{
+        core.narrow(value == 1 || value == 3, {report(167,"HOLES")});
+        Snapshot snapshot = {{
+            .later = {{ .ready = false; .saved = 7; }};
+            .earlier = {{ .ready = true; .saved = value; }};
+        }};
+        value = 9;
+        core.require(value != 9, {state_report(172,"NESTED-NOMINAL","snapshot",', { .path = "copy.json"; .state = snapshot; }')});
+    }};
+    %%end"""
+depth_declarations = "struct Level0 { i8 saved; }\n"
+depth_value = "{ .saved = 7; }"
+for level in range(1, 9):
+    depth_declarations += f"struct Level{level} {{ Level{level - 1} child; }}\n"
+    depth_value = "{ .child = " + depth_value + "; }"
+state_nominal_depth_limit = f"""%%start
+    {depth_declarations}
+    unit() check = fn {{
+        Level8 snapshot = {depth_value};
+        core.require(false, {state_report(173,"TOO-DEEP","snapshot")});
+    }};
+    %%end"""
 state_nominal_visible_alias = state_nominal.replace(
     'value = 7;', 'i8 ordinary = value; value = 7;',
 ).replace('core.require(value != 7,', 'core.require(ordinary != 1,')
@@ -957,6 +982,8 @@ state_atomic = f"""%%start
     %%end"""
 cases.extend([
     ("authored-state-nominal-construction-snapshot",state_nominal,170,b"SNAPSHOT"),
+    ("authored-state-nominal-recursive-literals",state_nominal_recursive,172,b"NESTED-NOMINAL"),
+    ("authored-state-nominal-depth-fails-closed",state_nominal_depth_limit,2,b"unsupported analysis"),
     ("authored-state-nominal-nested-scope",state_nominal_nested_scope,171,b"NESTED-SNAPSHOT"),
     ("authored-state-nominal-mixed-visible-alias-still-unsupported",state_nominal_visible_alias,2,b"unsupported analysis"),
     ("authored-state-nominal-unsupported-operand",state_nominal_unsupported_operand,2,b"unsupported analysis"),
@@ -996,6 +1023,18 @@ nominal_bytes = (b'{"type":{"kind":"struct","name":"Snapshot"},"value":{"saved":
     b'"value":{"kind":"alternatives","values":[1,3]}},"ready":{"type":{"kind":"bool"},"value":true}}}\n')
 authored_files["authored-state-nominal-construction-snapshot"] = {
     "state.json": nominal_bytes, "copy.json": nominal_bytes,
+}
+recursive_nominal_bytes = (
+    b'{"type":{"kind":"struct","name":"Snapshot"},"value":{'
+    b'"earlier":{"type":{"kind":"struct","name":"Child"},"value":{'
+    b'"saved":{"type":{"kind":"i8"},"value":{"kind":"alternatives","values":[1,3]}},'
+    b'"ready":{"type":{"kind":"bool"},"value":true}}},'
+    b'"later":{"type":{"kind":"struct","name":"Child"},"value":{'
+    b'"saved":{"type":{"kind":"i8"},"value":7},'
+    b'"ready":{"type":{"kind":"bool"},"value":false}}}}}\n'
+)
+authored_files["authored-state-nominal-recursive-literals"] = {
+    "state.json": recursive_nominal_bytes, "copy.json": recursive_nominal_bytes,
 }
 authored_files["authored-state-nominal-nested-scope"] = {
     "state.json": b'{"type":{"kind":"struct","name":"Snapshot"},"value":{"saved":{"type":{"kind":"i8"},"value":1}}}\n',

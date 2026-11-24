@@ -2275,7 +2275,7 @@ impl OrderedFailures {
 
 #[cfg(feature = "internal-checker")]
 fn render_authored_state(record: &ScalarOrderedCheckerFailure, work: &mut usize) -> Option<CheckedLiteralOutput> {
-    use super::{checker_directive::{CheckerStateSelection, ScalarCheckerTextFile}, checker_flow::charge_call_work};
+    use super::{checker_directive::{CheckerStateSelection, CheckerStateType, ScalarCheckerTextFile}, checker_flow::charge_call_work};
     let prepared = &record.output;
     let count = prepared.text_files.len().checked_add(prepared.state_files.len())?;
     let mut copied_bytes = prepared.stdout_bytes.len().checked_add(prepared.stderr_bytes.len())?;
@@ -2295,49 +2295,37 @@ fn render_authored_state(record: &ScalarOrderedCheckerFailure, work: &mut usize)
     // Output paths may select the same authored binding. Reuse the exact
     // projection and encoding only within this one immutable witness.
     let mut encoded = HashMap::new();
+    let mut encoded_shapes = HashMap::new();
     for position in 0..count {
         if selected.peek().is_some_and(|file| file.position == position) {
             let file = selected.next()?;
-            let binding = match &file.selection {
-                CheckerStateSelection::Binding(binding) | CheckerStateSelection::Nominal { binding, .. } => binding,
-                _ => return None,
-            };
-            let (ty, bytes) = match encoded.entry(binding.clone()) {
-                std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
-                std::collections::hash_map::Entry::Vacant(entry) => {
-                    if let CheckerStateSelection::Nominal { name, fields, .. } = &file.selection {
-                        charge_call_work(work, name.len().div_ceil(32).checked_mul(6)?)?;
-                        for field in fields.iter() {
-                            charge_call_work(work, 1usize.checked_add(field.name.len().div_ceil(32).checked_mul(6)?)?)?;
+            let bytes: &Box<[u8]> = match (&file.selection, &file.ty) {
+                (CheckerStateSelection::Nominal(shape), CheckerStateType::Nominal(_)) => {
+                    // Shape addresses are stable: the prepared directive owns
+                    // every shape for this entire materialization.
+                    match encoded_shapes.entry(Rc::as_ptr(shape)) {
+                        std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                        std::collections::hash_map::Entry::Vacant(entry) => {
+                            let mut json = String::new();
+                            encode_nominal_state_node(&shape.root, shape, record, work, &mut json)?;
+                            json.push('\n');
+                            entry.insert(json.into_bytes().into_boxed_slice())
                         }
                     }
-                    let mut scalar_node = |binding: &ReferenceBindingId, ty: &ScalarType| {
-                        charge_call_work(work, record.witness.axes.len().checked_add(1)?)?;
-                        let axis = record.witness.axes.iter().position(|(id, axis_ty)| id == binding && axis_ty == ty)?;
-                        let values = record.witness.state.project_axis_bounded(axis, work)?;
-                        charge_call_work(work, values.interval_count())?;
-                        serialize_scalar_analysis_state(ty, &values)
-                    };
-                    let json = match &file.selection {
-                        CheckerStateSelection::Nominal { name, fields, .. } => {
-                            let name = serde_json::to_string(name.as_ref()).ok()?;
-                            let mut json = format!(r#"{{"type":{{"kind":"struct","name":{name}}},"value":{{"#);
-                            for (i, field) in fields.iter().enumerate() {
-                                if i != 0 { json.push(','); }
-                                json.push_str(&serde_json::to_string(field.name.as_ref()).ok()?);
-                                json.push(':');
-                                let node = scalar_node(&field.capture, &field.ty)?;
-                                json.push_str(node.strip_suffix('\n')?);
-                            }
-                            json.push_str("}}\n");
-                            json
-                        }
-                        _ => scalar_node(binding, &file.ty)?,
-                    };
-                    entry.insert((file.ty.clone(), json.into_bytes().into_boxed_slice()))
                 }
+                (CheckerStateSelection::Binding(binding), CheckerStateType::Scalar(file_ty)) => {
+                    let (ty, bytes) = match encoded.entry(binding.clone()) {
+                        std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                        std::collections::hash_map::Entry::Vacant(entry) => {
+                            let json = encode_authored_scalar(record, binding, file_ty, work)?;
+                            entry.insert((file_ty.clone(), json.into_bytes().into_boxed_slice()))
+                        }
+                    };
+                    if ty != file_ty { return None; }
+                    bytes
+                }
+                _ => return None,
             };
-            if *ty != file.ty { return None; }
             // Each file owns its bytes; meter both copying and publication.
             charge_call_work(work, bytes.len().div_ceil(32).checked_mul(2)?)?;
             files.push(ScalarCheckerTextFile {
@@ -2349,6 +2337,49 @@ fn render_authored_state(record: &ScalarOrderedCheckerFailure, work: &mut usize)
     }
     output.text_files = files.into_boxed_slice();
     Some(output)
+}
+
+#[cfg(feature = "internal-checker")]
+fn encode_authored_scalar(
+    record: &ScalarOrderedCheckerFailure, binding: &ReferenceBindingId, ty: &ScalarType, work: &mut usize,
+) -> Option<String> {
+    use super::checker_flow::charge_call_work;
+    charge_call_work(work, record.witness.axes.len().checked_add(1)?)?;
+    let axis = record.witness.axes.iter().position(|(id, axis_ty)| id == binding && axis_ty == ty)?;
+    let values = record.witness.state.project_axis_bounded(axis, work)?;
+    charge_call_work(work, values.interval_count())?;
+    serialize_scalar_analysis_state(ty, &values)
+}
+
+#[cfg(feature = "internal-checker")]
+fn encode_nominal_state_node(
+    node: &super::checker_directive::CheckerSnapshotNode,
+    shape: &super::checker_directive::CheckerSnapshotShape,
+    record: &ScalarOrderedCheckerFailure, work: &mut usize, json: &mut String,
+) -> Option<()> {
+    use super::{checker_directive::CheckerSnapshotNode, checker_flow::charge_call_work};
+    match node {
+        CheckerSnapshotNode::Leaf(index) => {
+            let leaf = shape.leaves.get(*index)?;
+            let node = encode_authored_scalar(record, &leaf.capture, &leaf.ty, work)?;
+            json.push_str(node.strip_suffix('\n')?);
+        }
+        CheckerSnapshotNode::Nominal { name, fields } => {
+            charge_call_work(work, 1usize.checked_add(name.len().div_ceil(32).checked_mul(6)?)?)?;
+            json.push_str(r#"{"type":{"kind":"struct","name":"#);
+            json.push_str(&serde_json::to_string(name.as_ref()).ok()?);
+            json.push_str(r#"},"value":{"#);
+            for (index, (name, child)) in fields.iter().enumerate() {
+                charge_call_work(work, 1usize.checked_add(name.len().div_ceil(32).checked_mul(6)?)?)?;
+                if index != 0 { json.push(','); }
+                json.push_str(&serde_json::to_string(name.as_ref()).ok()?);
+                json.push(':');
+                encode_nominal_state_node(child, shape, record, work, json)?;
+            }
+            json.push_str("}}");
+        }
+    }
+    Some(())
 }
 
 #[cfg(feature = "internal-checker")]
