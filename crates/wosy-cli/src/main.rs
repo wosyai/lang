@@ -50,7 +50,7 @@ enum Command {
         profile: String,
     },
     #[cfg(feature = "internal-checker")]
-    #[command(group(clap::ArgGroup::new("check_scope").required(true).args(["main_flow_only", "declared_package"])))]
+    #[command(group(clap::ArgGroup::new("check_scope").args(["main_flow_only", "declared_package"])))]
     Check {
         target: Option<String>,
         #[arg(long, default_value = "dev")]
@@ -862,8 +862,8 @@ fn check_command(
     let root = discover_root(&current)?;
     let receipt = match (main_flow_only, declared_package) {
         (true, false) => configured_check::check_target(&root, target, profile, ScalarCheckerScope::MainFlowOnly, Vec::new()),
-        (false, true) => configured_check::check_declared_package_target(&root, target, profile),
-        _ => return Err("check requires exactly one scope".to_owned()),
+        (false, _) => configured_check::check_declared_package_target(&root, target, profile),
+        (true, true) => return Err("check scopes are mutually exclusive".to_owned()),
     }.map_err(|failure| match failure {
             LoadError::Canonical(failure) | LoadError::Dormant(failure) => failure.report("check"),
             LoadError::Root => "check: invalid project root".to_owned(),
@@ -976,22 +976,32 @@ fn check_command(
             notes: vec![format!("symbolic call can return {}", failure.returned)],
         }
     });
-    let contextual = report.contextual_diagnostic.iter().map(|failure| Diagnostic {
-        code: String::new(), severity: DiagnosticSeverity::Error,
-        message: "proof obligation failed".to_owned(),
-        labels: vec![
+    let contextual = report.contextual_diagnostic.iter().map(|failure| {
+        let mut labels = vec![
             DiagnosticLabel { kind: DiagnosticLabelKind::Primary, span: failure.goal.clone(),
-                message: "not satisfied by this contextual call".to_owned() },
+                message: if failure.symbolic { "not satisfied by this symbolic contextual call" }
+                    else { "not satisfied by this contextual call" }.to_owned() },
             DiagnosticLabel { kind: DiagnosticLabelKind::Secondary, span: failure.proof.clone(),
                 message: "proof declaration".to_owned() },
-            DiagnosticLabel { kind: DiagnosticLabelKind::Secondary, span: failure.supplying_call.clone(),
-                message: "call supplying this context".to_owned() },
-            DiagnosticLabel { kind: DiagnosticLabelKind::Secondary, span: failure.call.clone(),
-                message: "checked call".to_owned() },
-            DiagnosticLabel { kind: DiagnosticLabelKind::Secondary, span: failure.binding.clone(),
-                message: "active contextual binding".to_owned() },
-        ],
-        notes: vec![format!("contextual value at entry: {}; at exit: {}", failure.entry, failure.exit)],
+        ];
+        if failure.symbolic {
+            labels.push(DiagnosticLabel { kind: DiagnosticLabelKind::Secondary, span: failure.call.clone(),
+                message: "unused callable checked with an arbitrary contextual entry".to_owned() });
+        } else {
+            labels.extend([
+                DiagnosticLabel { kind: DiagnosticLabelKind::Secondary, span: failure.supplying_call.clone(),
+                    message: "call supplying this context".to_owned() },
+                DiagnosticLabel { kind: DiagnosticLabelKind::Secondary, span: failure.call.clone(),
+                    message: "checked call".to_owned() },
+                DiagnosticLabel { kind: DiagnosticLabelKind::Secondary, span: failure.binding.clone(),
+                    message: "active contextual binding".to_owned() },
+            ]);
+        }
+        Diagnostic {
+            code: String::new(), severity: DiagnosticSeverity::Error,
+            message: "proof obligation failed".to_owned(), labels,
+            notes: vec![format!("contextual value at entry: {}; at exit: {}", failure.entry, failure.exit)],
+        }
     });
     let diagnostics = actual.chain(symbolic).chain(contextual).collect::<Vec<_>>();
     let authored_status = authored.publish(&mut std::io::stdout().lock(), &mut std::io::stderr().lock())
@@ -1844,7 +1854,11 @@ unit(u8) unused = fn(value) {{ core.require(value < 1, {{ .stdout = \"unused dep
             assert!(!project.root.join(".wosy").exists());
             assert!(!project.root.join("report.txt").exists());
         }
-        assert!(Arguments::try_parse_from(["wosy", "check"]).is_err());
+        let default = Arguments::try_parse_from(["wosy", "check"]).unwrap();
+        assert!(matches!(default.command, Command::Check {
+            target: None, main_flow_only: false, declared_package: false, ..
+        }));
+        assert!(Arguments::try_parse_from(["wosy", "check", "--main-flow-only", "--declared-package"]).is_err());
     }
 
     #[cfg(feature = "internal-checker")]

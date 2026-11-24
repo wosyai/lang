@@ -1470,6 +1470,25 @@ cases.extend([
         2, b"unsupported analysis"),
 ])
 
+unused_contextual_proof = """%%start
+    unit() type_provider = fn {
+        u8 core.context.credit = 3;
+        if (core.context.credit == 3) {};
+    };
+    unit() unchanged = fn {
+        if (core.context.credit == 3) { core.context.credit = 3; };
+    };
+    proof preserved for unchanged() -> (null)
+        ensures (core.context.credit == core.old(core.context.credit) + 0) {}
+%%end"""
+unused_contextual_refuted = unused_contextual_proof.replace(
+    "credit == 3) { core.context.credit = 3", "credit == 11) { core.context.credit = 2")
+cases.extend([
+    ("ordinary-unused-contextual-verified", unused_contextual_proof, 0, b""),
+    ("ordinary-unused-contextual-refuted", unused_contextual_refuted, 1, b"proof obligation failed"),
+    ("ordinary-unused-contextual-proof-overflow", unused_contextual_refuted.replace("+ 0", "+ 1"), 2, b"unsupported analysis"),
+    ("ordinary-unused-contextual-proof-underflow", unused_contextual_refuted.replace("+ 0", "- 1"), 2, b"unsupported analysis"),
+])
 public_namespace_contextual_root = """%%start
     lib = namespace app "src/calc.w";
     unit() entry = fn {
@@ -1998,6 +2017,7 @@ cases.extend([
         b"proof obligation failed"),
 ])
 proof_diagnostic_notes = {
+    "ordinary-unused-contextual-refuted": b"contextual value at entry: 11; at exit: 2",
     "exact-startup-public-namespace-contextual-refuted": b"contextual value at entry: 3; at exit: 3",
     "exact-startup-public-contextual-proof-refuted": b"contextual value at entry: 3; at exit: 3",
     "ordinary-ranked-two-edge-base-refuted": b"symbolic call can return 8",
@@ -2765,6 +2785,8 @@ with tempfile.TemporaryDirectory(prefix="affine-calls-") as path:
                         assert b"COPY-PRIOR-UNPUBLISHED" not in res.stderr and b"COPY-FORMAL-UNPUBLISHED" not in res.stderr,res
                 elif included and name in proof_diagnostic_notes:
                     assert expected_stderr in res.stderr and proof_diagnostic_notes[name] in res.stderr,res
+                    if name == "ordinary-unused-contextual-refuted":
+                        assert b"symbolic contextual call" in res.stderr and b"call supplying this context" not in res.stderr,res
                     if name == "exact-startup-public-namespace-contextual-refuted":
                         assert b"src/main.w" in res.stderr and b"src/calc.w" in res.stderr,res
                         assert b"WRONG-NAMESPACE-CONTEXT-EXIT" not in res.stderr.splitlines(),res

@@ -358,8 +358,17 @@ pub(super) fn prepare_contextual_transport_from_source(
 
 #[cfg(any(test, feature = "internal-checker"))]
 pub(super) fn prepare_contextual_transport_graph(
-    mut sources: Vec<(ScalarSourceDeclarations, Vec<ScalarNamespaceBinding>)>,
+    sources: Vec<(ScalarSourceDeclarations, Vec<ScalarNamespaceBinding>)>,
     initialization_order: Vec<SourceIdentity>, inputs: ScalarPreparationInputs, checker_directives: bool,
+) -> Result<(PreparedScalarProject, DormantContextReceipt), DormantContextRejection> {
+    prepare_contextual_transport_graph_with_proof_root(sources, initialization_order, inputs, checker_directives, false)
+}
+
+#[cfg(any(test, feature = "internal-checker"))]
+pub(super) fn prepare_contextual_transport_graph_with_proof_root(
+    mut sources: Vec<(ScalarSourceDeclarations, Vec<ScalarNamespaceBinding>)>,
+    initialization_order: Vec<SourceIdentity>, inputs: ScalarPreparationInputs,
+    checker_directives: bool, allow_empty_startup: bool,
 ) -> Result<(PreparedScalarProject, DormantContextReceipt), DormantContextRejection> {
     use self::DormantContextRejection::{MissingAtRoot, Unsupported};
     use super::control::{ModuleInitializationCallTarget, ModuleInitializationDetail};
@@ -540,14 +549,19 @@ pub(super) fn prepare_contextual_transport_graph(
     let init = calls.initialization_region(root_module).ok_or(Unsupported)?;
     let ModuleInitializationDetail::Occurrences(topology) = &init.detail else { return Err(Unsupported); };
     if !topology.callable_escapes.is_empty() { return Err(Unsupported); }
-    let [root] = topology.calls.as_slice() else { return Err(Unsupported); };
-    let ModuleInitializationCallTarget::Direct { declaration, concrete: ConcreteCallSelection::Declaration }
-        = topology.call_targets.get(root).ok_or(Unsupported)? else { return Err(Unsupported); };
-    if declaration.source != project.modules[root_module].source || !topology.checked_call_signatures.contains_key(root) {
-        return Err(Unsupported);
-    }
-    if needs[*by_target.get(&(&declaration.source, declaration.range)).ok_or(Unsupported)?] {
-        return Err(MissingAtRoot(topology.occurrences.get(root.0).ok_or(Unsupported)?.span));
+    match topology.calls.as_slice() {
+        [] if checker_directives && allow_empty_startup => {}
+        [root] => {
+            let ModuleInitializationCallTarget::Direct { declaration, concrete: ConcreteCallSelection::Declaration }
+                = topology.call_targets.get(root).ok_or(Unsupported)? else { return Err(Unsupported); };
+            if declaration.source != project.modules[root_module].source || !topology.checked_call_signatures.contains_key(root) {
+                return Err(Unsupported);
+            }
+            if needs[*by_target.get(&(&declaration.source, declaration.range)).ok_or(Unsupported)?] {
+                return Err(MissingAtRoot(topology.occurrences.get(root.0).ok_or(Unsupported)?.span));
+            }
+        }
+        _ => return Err(Unsupported),
     }
     for (index, needed) in needs.iter().enumerate() {
         let (module, item, _) = callables[index];

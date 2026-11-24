@@ -1534,6 +1534,8 @@ struct IntegerRoots<'a> {
     parameters: usize,
     projected_entry_axis: Option<usize>,
     unit_pair_work: Option<usize>,
+    #[cfg(feature = "internal-checker")]
+    symbolic_context_work: Option<usize>,
     affine_work: Option<usize>,
     #[cfg(feature = "internal-checker")]
     named_pair_rectangles: bool,
@@ -2991,6 +2993,79 @@ impl IntegerReturningPath<'_> {
         )
     }
 
+}
+
+/// Checks one arbitrary typed contextual Unit root in the ordinary symbolic
+/// row evaluator. The hidden axis preserves the entry of this exact binding.
+#[cfg(feature = "internal-checker")]
+pub(super) fn check_symbolic_contextual_unit(
+    calls: &FunctionCallSites, amount: &BigInt, add: bool,
+    sink: &mut dyn for<'row> FnMut(IntegerCheckFailure<'row>),
+) -> Option<(bool, Option<(BigInt, BigInt)>)> {
+    let (formal, ty) = calls.contextual_formal()?;
+    if !calls.boundary.parameters.is_empty()
+        || !matches!(calls.boundary.results.as_slice(), [out] if out.ty == ScalarType::Unit)
+        || !calls.call_occurrences.is_empty() || !calls.allocation_length_calls.is_empty()
+    {
+        return None;
+    }
+    let snapshots = ReferenceBindingId {
+        kind: super::ReferenceBindingKind::CheckerSnapshotField(0), ..formal.clone()
+    };
+    let mut roots = IntegerRoots {
+        allow_ordinary_contextual_places: true,
+        allow_extended_scalar_locals: true,
+        symbolic_context_work: Some(0),
+        ..IntegerRoots::default()
+    };
+    let mut rows = IntegerInputs(vec![IntegerRow::new(vec![Rc::new(IntegerSet::from_type(ty)?)])]);
+    roots.add(formal, ty);
+    rows.append_ordinary_copy(0, &mut roots)?;
+    roots.add(&snapshots, ty);
+    let mut checked = IntegerFailureCollection {
+        continuation: IntegerRequirementContinuation::Empty,
+        projected: None, allow_projected_calls: false, allow_contextual_local_transfers: false,
+        sink: &mut |failure| sink(failure),
+    };
+    let mut imports: &mut [Option<ImportedLocal<'_>>] = &mut [];
+    let IntegerControl::Continue(rows) = walk_integer_block::<false, true, _>(
+        calls, &mut roots, calls.structure.root, rows, None, None, &mut None, &mut Some(&mut checked),
+        &mut imports, (),
+    )? else { return None; };
+    let active = roots.reached_obligation || !rows.is_unreachable();
+    let work = roots.symbolic_context_work.as_mut()?;
+    let (type_min, type_max) = super::typecheck::integer_bounds(ty)?;
+    let expected_at = |entry: &BigInt| if add { entry + amount } else { entry - amount };
+    let mut first_refutation = None;
+    for row in rows.0 {
+        charge_call_work(work, 7)?;
+        // This profile retains only equality copies and independent cells;
+        // refusing unmodeled relations avoids comparing loose marginals.
+        if row.len() != 2 || row.affine.is_some() || row.entry.is_some() { return None; }
+        let (old_min, old_max) = row.get(1)?.extremes()?;
+        // Translation is monotone, even for a disconnected row. Check both
+        // extrema of every surviving entry domain before exposing a result.
+        let expected_min = expected_at(old_min);
+        let expected_max = expected_at(old_max);
+        if expected_min < type_min || expected_max > type_max { return None; }
+        if first_refutation.is_some() { continue; }
+        let (new_min, new_max) = row.first()?.extremes()?;
+        if row.canonical_axis(0) == row.canonical_axis(1) {
+            if &expected_min != old_min {
+                first_refutation = Some((old_min.clone(), old_min.clone()));
+            }
+        } else {
+            for (entry, exit, expected) in [
+                (old_min, new_min, &expected_min), (old_min, new_max, &expected_min), (old_max, new_min, &expected_max),
+            ] {
+                if expected != exit {
+                    first_refutation = Some((entry.clone(), exit.clone()));
+                    break;
+                }
+            }
+        }
+    }
+    Some((active, first_refutation))
 }
 
 enum IntegerControl<'a> {
@@ -5126,6 +5201,10 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
         std::mem::replace(cursor, IntegerBlockCursor::new(calls.structure.root, 0, IntegerInputs::default()));
     let structure = &calls.structure;
     loop {
+        #[cfg(feature = "internal-checker")]
+        if let Some(work) = &mut roots.symbolic_context_work {
+            charge_partition_capture(work, &path, roots.axes.len())?;
+        }
         if let Some(work) = &mut roots.unit_pair_work {
             let axes = roots.axes.len().checked_add(1)?;
             *work = work.checked_add(1)?.checked_add(path.0.len().checked_mul(axes)?)?;
