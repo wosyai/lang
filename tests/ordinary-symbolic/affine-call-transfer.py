@@ -1625,6 +1625,24 @@ cases.extend([
         1,b"proof obligation failed"),
 ])
 
+stacked_named_exact_pair = f"""%%start
+    i16(i8, i16) leaf = fn(tag, value) {{ if (tag > 0) {{ 42 }} else {{ if (value == 300) {{ 9 }} else {{ value }} }} }};
+    i16(i8, i16) producer = fn(tag, value) {{ i16 result = leaf(tag, value); result }};
+    proof old_second for leaf(selector, before) -> (out)
+        where (selector > 0) ensures (out == core.old(before)) {{}}
+    proof bounded for producer(selector, before) -> (out)
+        where (selector > 0) ensures (out <= 42) {{}}
+    i16 inactive = producer(-1, 300);
+    i16 saved = producer(1, 300);
+    core.require(inactive == 9, {report(38,"WRONG-INACTIVE-PAIR")});
+    core.require(saved == 42, {report(39,"WRONG-ACTIVE-PAIR")});
+%%end"""
+cases.extend([
+    ("exact-startup-named-stacked-pair-old-second-refuted",stacked_named_exact_pair,1,b"proof obligation failed"),
+    ("exact-startup-named-stacked-pair-old-second-proved",stacked_named_exact_pair.replace("producer(1, 300)","producer(1, 42)"),
+        0,b""),
+])
+
 stacked_named_calling_producer = f"""%%start
     i8(i8) leaf = fn(input) {{ if (input < 0) {{ -3 }} else {{ 7 }} }};
     i8(i8) bridge = fn(input) {{ i8 result = leaf(input); result }};
@@ -1723,6 +1741,7 @@ cases.extend([
         b"proof obligation failed"),
 ])
 proof_diagnostic_notes = {
+    "exact-startup-named-stacked-pair-old-second-refuted": b"call returned 42",
     "exact-startup-named-calling-producer-observes-nested-watch": b"reached from this call",
     "exact-startup-named-stacked-calling-producer-refuted": b"through this call",
     "exact-startup-named-calling-producer-refuted": b"call returned 7",

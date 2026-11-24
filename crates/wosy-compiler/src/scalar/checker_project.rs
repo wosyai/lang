@@ -1615,9 +1615,20 @@ enum NamedExactWatch {
 }
 
 #[cfg(feature = "internal-checker")]
+enum NamedStackArguments {
+    Unary(BigInt),
+    Pair([BigInt; 2]),
+}
+
+#[cfg(feature = "internal-checker")]
+fn named_stack_integer_parameters(parameters: &[ScalarType]) -> bool {
+    matches!(parameters, [_] | [_, _]) && parameters.iter().all(is_integer_type)
+}
+
+#[cfg(feature = "internal-checker")]
 struct NamedStackSite<'a> {
     call: ByteSpan,
-    observed_entry: Option<(&'a [ScalarType], BigInt, usize)>,
+    observed_entry: Option<(&'a [ScalarType], NamedStackArguments, usize)>,
 }
 
 struct ExactCallActivation<'a> {
@@ -2122,7 +2133,8 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
     ) -> Result<ActualCallResult, ProjectCheck> {
         #[cfg(feature = "internal-checker")]
         if NAMED {
-            let cost = body.occurrences.len().checked_add(1).ok_or(ProjectCheck::Unsupported)?;
+            let cost = body.occurrences.len().checked_add(1)
+                .and_then(|cost| cost.checked_add(body.boundary.parameters.len())).ok_or(ProjectCheck::Unsupported)?;
             self.observer.charge_named_exact_work(cost).ok_or(ProjectCheck::Unsupported)?;
         }
         let mut frames = vec![ExactCallActivation { body, source, cursor, entry, followed_self_edge: false,
@@ -2206,10 +2218,16 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                                 .map(|frame| frame.named_site.as_ref().map(|site| site.call))
                                 .collect::<Option<Vec<_>>>().ok_or(ProjectCheck::Unsupported)?;
                             let directive_position = ordered.failures.borrow().records.len();
+                            let unary;
+                            let pair;
+                            let exact: &[&BigInt] = match &entry {
+                                NamedStackArguments::Unary(value) => { unary = [value]; &unary }
+                                NamedStackArguments::Pair([first, second]) => { pair = [first, second]; &pair }
+                            };
                             self.observer.observe_initializer(target, Some(InitializerProofSite {
                                 source: completed.source,
                                 call: InitializerProofOrigin::Stacked { outer, intermediate, inner: site.call, directive_position },
-                            }), parameters, &[&entry], value);
+                            }), parameters, exact, value);
                         }
                     }
                     frames.last_mut().ok_or(ProjectCheck::Unsupported)?.cursor.resume(effect, caller_axis, result)
@@ -2265,14 +2283,15 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
         if NAMED && (parent.source != &owner.source || matches!(&watched, Some(NamedExactWatch::Citation))
             || !citation_safe_calling_body(body) || self.active.contains(&target)
             || !matches!(effect, ExactCallEffect::Scalar { binding: Some(_), .. })
-            || !matches!(signature.parameters.as_slice(), [ty] if is_integer_type(ty))
+            || !named_stack_integer_parameters(&signature.parameters)
             || !is_integer_type(expected))
         {
             return Err(ProjectCheck::Unsupported);
         }
         #[cfg(feature = "internal-checker")]
         if NAMED {
-            let cost = body.occurrences.len().checked_add(1).ok_or(ProjectCheck::Unsupported)?;
+            let cost = body.occurrences.len().checked_add(1)
+                .and_then(|cost| cost.checked_add(body.boundary.parameters.len())).ok_or(ProjectCheck::Unsupported)?;
             self.observer.charge_named_exact_work(cost).ok_or(ProjectCheck::Unsupported)?;
         }
         #[cfg(feature = "internal-checker")]
@@ -2443,8 +2462,12 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
         let named_site = if NAMED {
             let occurrence = caller.occurrences.get(call.0).ok_or(ProjectCheck::MissingRootOccurrences)?;
             let observed_entry = if let Some(NamedExactWatch::Observe { nested_work }) = watched {
-                let [value] = exact else { return Err(ProjectCheck::Unsupported); };
-                Some((signature.parameters.as_slice(), (*value).clone(), nested_work))
+                let values = match exact {
+                    [value] => NamedStackArguments::Unary((*value).clone()),
+                    [first, second] => NamedStackArguments::Pair([(*first).clone(), (*second).clone()]),
+                    _ => return Err(ProjectCheck::Unsupported),
+                };
+                Some((signature.parameters.as_slice(), values, nested_work))
             } else {
                 None
             };
@@ -2528,8 +2551,10 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
         #[cfg(feature = "internal-checker")]
         let named_reached = ACTUAL_STARTUP && matches!(self.observer.named_exact_watch(target), Some(NamedExactWatch::Observe { .. }))
             && collection.is_some_and(|(source, _)| source == &owner.source) && named_outer.is_some()
-            && matches!(signature.parameters.as_slice(), [ty] if is_integer_type(ty))
-            && supported_calling_proof_body(body, expected) && citation_safe_calling_body(body);
+            && named_stack_integer_parameters(&signature.parameters)
+            && body.boundary.parameters.len() == signature.parameters.len()
+            && !body.structure.checker_integer_call_locals.is_empty()
+            && supported_integer_continuation(body, expected) && citation_safe_calling_body(body);
         #[cfg(not(feature = "internal-checker"))]
         let (named_reached, named_outer) = (false, None);
         let target_module = target.0;
@@ -16420,6 +16445,43 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
             let combined = run(&also_watches_leaf, scope).unwrap();
             assert_eq!(combined.diagnostics.len(), 2);
             assert!(combined.diagnostics.iter().all(|diagnostic| diagnostic.invocation.outer_call.is_none()));
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordered_named_stacked_proofs_keep_two_typed_formals_in_order() {
+        let app = source("src/main.w", "ordered-stacked-proof-exact-pair");
+        let text = format!(r#"%%start
+            i16(i8, i16) leaf = fn(tag, value) {{ if (tag > 0) {{ 42 }} else {{ if (value == 300) {{ 9 }} else {{ value }} }} }};
+            i16(i8, i16) producer = fn(tag, value) {{ i16 result = leaf(tag, value); result }};
+            proof old_second for leaf(selector, before) -> (out)
+                where (selector > 0) ensures (out == core.old(before)) {{}}
+            proof bounded for producer(selector, before) -> (out)
+                where (selector > 0) ensures (out <= 42) {{}}
+            i16 inactive = producer(-1, 300);
+            i16 saved = producer(1, 300);
+            core.require(inactive == 9, {OUTPUT});
+            core.require(saved == 42, {OUTPUT});
+        %%end"#);
+        let run = |text: &str, scope| {
+            let (_, proof) = crate::parse_proof_source(app.clone(), text.to_owned(), &[]).ok().unwrap();
+            check_loaded_ordered_proof_diagnostics_in_scope::<true>(
+                Vec::new(), vec![(proof, Vec::new())], vec![app.clone()], inputs(), scope, Vec::new(),
+            )
+        };
+        for scope in [ScalarCheckerScope::MainFlowOnly, ScalarCheckerScope::CurrentPackage] {
+            let report = run(&text, scope).unwrap();
+            let [failure] = report.diagnostics.as_slice() else { panic!("only the guard's positive exact pair is applicable"); };
+            assert!(report.symbolic_diagnostic.is_none() && report.directives.is_empty());
+            let site = &failure.invocation;
+            assert_eq!(site.arguments, [(ScalarType::I8, BigInt::from(1)), (ScalarType::I16, BigInt::from(300))]);
+            assert_eq!(site.returned, BigInt::from(42));
+            let snippet = |span: ByteSpan| &text[span.start as usize..span.end as usize];
+            assert_eq!(snippet(site.call.range), "leaf(tag, value)");
+            assert_eq!(snippet(site.outer_call.as_ref().unwrap().range), "producer(1, 300)");
+            let proved = text.replace("producer(1, 300)", "producer(1, 42)");
+            assert!(run(&proved, scope).unwrap().diagnostics.is_empty());
         }
     }
 
