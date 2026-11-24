@@ -1210,6 +1210,62 @@ fn recursive_fallible_owner_keeps_successful_ancestors_until_their_actual_exit()
 }
 
 #[test]
+fn local_callable_replacement_selects_only_proved_ordinary_scalar_targets() {
+    let app = source("workbench", "src/local_callable_replacement.w");
+    let text = include_str!("fixtures/local-callable-replacement.w");
+    for (target, target_layout) in [
+        ("native64", ScalarTargetLayout::NATIVE64),
+        ("wasm32", ScalarTargetLayout::WASM32),
+    ] {
+        let emit = |text: &str| {
+            let prepared = prepare_scalar_project(
+                vec![(declarations(&app, text), Vec::new())], vec![app.clone()],
+                ScalarPreparationInputs { target_layout },
+            ).unwrap_or_else(|error| panic!("{target}: {:?}", error.diagnostics));
+            let build = analyze_scalar_build(&prepared);
+            assert!(build.diagnostics().is_empty(), "{target}: {:?}", build.diagnostics());
+            emit_scalar_build_project_llvm(&build).map(|module| module.to_text())
+        };
+        let ir = emit(text).unwrap_or_else(|error| panic!("{target}: {error}"));
+        let context = Context::create();
+        let buffer = MemoryBuffer::create_from_memory_range_copy(ir.as_bytes(), target);
+        let module = context.create_module_from_ir(buffer).unwrap();
+        module.verify().unwrap();
+        let apply = module.get_function(&function_with_suffix(&module, "apply")).unwrap();
+        let mut calls = 0;
+        let mut writes = 0;
+        for row in apply.get_basic_blocks().into_iter().flat_map(|block| block.get_instructions()) {
+            match row.get_opcode() {
+                InstructionOpcode::Call => {
+                    let call = CallSiteValue::try_from(row).unwrap();
+                    assert!(call.get_called_fn_value().is_none(), "{target}: {ir}");
+                    assert_eq!(call.count_arguments(), 1);
+                    calls += 1;
+                }
+                InstructionOpcode::Store if row.to_string().contains("store ptr @wosy_fn__") => writes += 1,
+                _ => {}
+            }
+        }
+        assert_eq!((calls, writes), (2, 2), "{target}: {ir}");
+        if let Some(out) = std::env::var_os("WOSY_LOCAL_CALLABLE_IR_DIR") {
+            let mut ir = ir.replace("@main(", "@wosy_authored_main(");
+            for name in ["keep", "replace"] {
+                let symbol = function_with_suffix(&module, name);
+                ir.push_str(&format!(
+                    "\ndefine i32 @wosy_{name}() {{\nentry:\n  %result = call i32 @{symbol}()\n  ret i32 %result\n}}\n"
+                ));
+            }
+            std::fs::write(std::path::PathBuf::from(out).join(format!("{target}.ll")), ir).unwrap();
+        }
+
+        let effectful = text.replace("i32(i32) add_nine", "i32 observed_delta = 9;\ni32(i32) add_nine")
+            .replace("input + 9", "input + observed_delta");
+        let error = emit(&effectful).expect_err("an unclosed call target may not be stored");
+        assert!(error.contains("local callable slot requires a proved direct scalar target"), "{target}: {error}");
+    }
+}
+
+#[test]
 fn runtime_array_recommit_keeps_the_owner_until_its_real_end() {
     let recursive = r#"
 (u8[], u64)(u8[], u64, u64) carry = fn(bytes, depth, count) {

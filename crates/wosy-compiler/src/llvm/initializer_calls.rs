@@ -2,28 +2,45 @@ use super::*;
 use crate::scalar::ConcreteCallSelection;
 use wosy_syntax::{ByteSpan, SourceIdentity, SourceSpan};
 
+struct FunctionSymbol<'input> {
+    identity: (String, String),
+    ordinary_body: Option<(&'input ScalarFunction, &'input ScalarReferenceCfg)>,
+    local_purity: std::cell::Cell<Option<bool>>,
+}
+
 #[derive(Default)]
-pub(super) struct InitializerSymbols {
-    functions: HashMap<SourceIdentity, HashMap<ByteSpan, (String, String)>>,
+pub(super) struct InitializerSymbols<'input> {
+    functions: HashMap<SourceIdentity, HashMap<ByteSpan, FunctionSymbol<'input>>>,
     externs: HashMap<SourceSpan, String>,
     callable_bindings: std::collections::HashSet<SourceSpan>,
 }
 
-impl InitializerSymbols {
+impl<'input> InitializerSymbols<'input> {
     pub(super) fn function(
         &mut self,
         source: &SourceIdentity,
         function: &ScalarFunction,
         symbol: String,
     ) {
+        let entry = FunctionSymbol {
+            identity: (function.name.clone(), symbol),
+            ordinary_body: None,
+            local_purity: std::cell::Cell::new(None),
+        };
         if let Some(functions) = self.functions.get_mut(source) {
-            functions.insert(function.name_span, (function.name.clone(), symbol));
+            functions.insert(function.name_span, entry);
         } else {
-            self.functions.insert(
-                source.clone(),
-                HashMap::from([(function.name_span, (function.name.clone(), symbol))]),
-            );
+            self.functions.insert(source.clone(), HashMap::from([(function.name_span, entry)]));
         }
+    }
+
+    pub(super) fn scalar_local_target(
+        &mut self, source: &SourceIdentity, function: &'input ScalarFunction, cfg: &'input ScalarReferenceCfg,
+    ) {
+        // No CFG analysis until a prepared initializer or replacement resolves
+        // this exact declaration as a local callable value.
+        self.functions.get_mut(source).and_then(|functions| functions.get_mut(&function.name_span))
+            .expect("registered ordinary callable declaration").ordinary_body = Some((function, cfg));
     }
 
     pub(super) fn external(&mut self, source: &SourceIdentity, span: ByteSpan, symbol: &str) {
@@ -60,6 +77,7 @@ impl InitializerSymbols {
         self.functions
             .get(source)
             .and_then(|functions| functions.get(&range))
+            .map(|entry| &entry.identity)
             .ok_or_else(|| {
                 format!(
                     "internal error: missing LLVM initializer declaration {:?}",
@@ -71,7 +89,7 @@ impl InitializerSymbols {
 
 pub(super) fn prepared_initializer_overloads<'a>(
     regions: impl Iterator<Item = &'a ModuleInitializationRegion>,
-    symbols: &InitializerSymbols,
+    symbols: &InitializerSymbols<'_>,
 ) -> Result<HashMap<SourceIdentity, Vec<(String, ScalarOverloadSelection)>>, String> {
     let mut selections = HashMap::<_, Vec<_>>::new();
     for region in regions {
@@ -97,7 +115,7 @@ pub(super) fn collect_body_overload_reservations(
     module: usize,
     items: &[ScalarItem],
     region: &ModuleInitializationRegion,
-    symbols: &InitializerSymbols,
+    symbols: &InitializerSymbols<'_>,
     selections: &mut HashMap<SourceIdentity, Vec<(String, ScalarOverloadSelection)>>,
 ) -> Result<(), String> {
     let mut initializer = if input.prepared_render() {
@@ -152,6 +170,7 @@ pub(super) fn collect_body_overload_reservations(
 pub(super) enum PreparedCall {
     Core(CoreOperationId),
     Symbol(String),
+    Local((u32, u32)),
     Indirect,
 }
 
@@ -159,7 +178,7 @@ impl PreparedCall {
     pub(super) fn symbol(&self) -> Option<&str> {
         match self {
             Self::Symbol(symbol) => Some(symbol),
-            Self::Core(_) | Self::Indirect => None,
+            Self::Core(_) | Self::Local(_) | Self::Indirect => None,
         }
     }
 }
@@ -211,9 +230,15 @@ impl<'ctx, 'module> EmitState<'ctx, 'module> {
                 } => PreparedCall::Symbol(
                     self.external_symbol(&SourceSpan::new(source.clone(), *declaration_span))?,
                 ),
-                ResolvedCallTarget::LocalCallable(_) | ResolvedCallTarget::CallableField { .. } => {
-                    PreparedCall::Indirect
+                ResolvedCallTarget::LocalCallable(binding) => {
+                    let key = (binding.declaration_span.start, binding.declaration_span.end);
+                    if self.local_callable_slots.contains_key(&key) {
+                        PreparedCall::Local(key)
+                    } else {
+                        PreparedCall::Indirect
+                    }
                 }
+                ResolvedCallTarget::CallableField { .. } => PreparedCall::Indirect,
             }
         } else if let Some(nodes) = self.initializer_nodes {
             match nodes.target(expression)? {
@@ -317,7 +342,20 @@ impl<'ctx, 'module> EmitState<'ctx, 'module> {
         }
     }
 
-    fn symbols(&self) -> &InitializerSymbols {
+    pub(super) fn pure_local_callable_symbol(&self, expression: &ScalarExpression) -> Option<&str> {
+        let declaration = self.body_call_nodes?.callable_value_declaration(expression)?;
+        let entry = self.symbols().functions.get(&declaration.source)?.get(&declaration.range)?;
+        let closed = entry.local_purity.get().unwrap_or_else(|| {
+            let closed = entry.ordinary_body.is_some_and(|(function, cfg)| {
+                super::local_callable::closed_scalar_target(function, cfg)
+            });
+            entry.local_purity.set(Some(closed));
+            closed
+        });
+        closed.then_some(entry.identity.1.as_str())
+    }
+
+    fn symbols(&self) -> &InitializerSymbols<'module> {
         self.initializer_symbols
             .expect("prepared LLVM symbol table")
     }
@@ -407,6 +445,8 @@ impl<'ctx, 'module> EmitState<'ctx, 'module> {
                 })
             }
             PreparedCall::Indirect => Ok(None),
+            PreparedCall::Local(key) => Ok(self.local_callable_slots.get(&key)
+                .and_then(|slot| slot.outputs.outputs.first()).map(|output| output.ty.clone())),
             PreparedCall::Symbol(symbol) => {
                 let Some(ScalarType::Callable { outputs, .. }) = self.signatures.get(&symbol)
                 else {

@@ -764,6 +764,9 @@ fn emit_prepared_call<'ctx, 'module>(
     arguments: &[ScalarExpression],
     project: Option<ProjectCallScope<'_>>,
 ) -> Result<EmitValue<'ctx>, String> {
+    if let PreparedCall::Local(key) = selected {
+        return super::local_callable::invoke(context, state, *key, arguments, project);
+    }
     let Some(target) = selected.symbol() else {
         return Err(match (project, receiver) {
             (Some(project), Some(receiver)) => {

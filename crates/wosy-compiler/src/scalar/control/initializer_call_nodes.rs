@@ -687,6 +687,21 @@ impl<'a> CallableBodyCallNodes<'a> {
             .map(|ordinal| ordinal.0)
     }
 
+    pub(crate) fn local_callable_destination_span(&self, place: &ScalarPlace) -> Option<ByteSpan> {
+        match self.direct_destination(place)? {
+            DirectDestinationIdentity::Existing(binding) => Some(binding.declaration_span),
+            DirectDestinationIdentity::Module(_) | DirectDestinationIdentity::Introduce { .. } => None,
+        }
+    }
+
+    pub(crate) fn callable_value_declaration(&self, expression: &ScalarExpression) -> Option<&'a SourceSpan> {
+        let ordinal = *self.proof_nodes.expressions.get(&std::ptr::from_ref(expression))?;
+        match self.proof_nodes.calls?.prepared_plain_name(ordinal)? {
+            super::super::reference::PlainNameIdentity::ModuleValue(declaration) => Some(declaration),
+            _ => None,
+        }
+    }
+
     pub(crate) fn place_ordinal(&self, place: &ScalarPlace) -> Option<usize> {
         self.proof_nodes.places.get(&std::ptr::from_ref(place)).map(|ordinal| ordinal.0)
     }

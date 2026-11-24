@@ -123,9 +123,10 @@ struct EmitState<'ctx, 'module> {
     initializer_aggregate: Option<aggregate_transfer::InitializerEmitter<'ctx, 'module>>,
     initializer_nodes: Option<&'module InitializerCallNodes<'module>>,
     body_call_nodes: Option<&'module CallableBodyCallNodes<'module>>,
+    local_callable_slots: HashMap<(u32, u32), local_callable::LocalCallableSlot<'ctx>>,
     guarded_scalar: Option<Box<[ownership::GuardedScalarSite]>>,
     guarded_scalar_owner: Option<ownership::GuardedScalarOwner<'ctx>>,
-    initializer_symbols: Option<&'module InitializerSymbols>,
+    initializer_symbols: Option<&'module InitializerSymbols<'module>>,
     builder: &'ctx Builder<'ctx>,
     module: &'module Module<'ctx>,
     functions: &'ctx BTreeMap<String, FunctionValue<'ctx>>,
@@ -477,6 +478,7 @@ fn emit_single_module_llvm<'a>(
             continue;
         }
         let cfg = require_cfg(item_ordinal, None, function)?;
+        if prepared_render { initializer_symbols.scalar_local_target(source, function, cfg); }
         definitions.push((function, cfg, function.name.as_str(), item_ordinal, None));
     }
     let ordinary_count = definitions.len();
@@ -887,6 +889,7 @@ fn emit_project_llvm<'a>(
                     continue;
                 }
                 let cfg = require_cfg(module_ordinal, item_ordinal, None, function)?;
+                if prepared_render { initializer_symbols.scalar_local_target(&source_module.source, function, cfg); }
                 declarations.push(Declaration::Ordinary(definitions.len()));
                 definitions.push((
                     module_ordinal,
@@ -1556,6 +1559,7 @@ fn definition_function_type<'ctx>(
 }
 
 mod aggregate_transfer;
+mod local_callable;
 mod memory;
 use memory::{
     aggregate_type, align_storage_alloca, allocation_layout, basic_type, build_aggregate, builder_error,
@@ -1570,6 +1574,9 @@ fn emit_binding_value<'ctx, 'module>(
     state: &mut EmitState<'ctx, 'module>,
     binding: &crate::ScalarBinding,
 ) -> Result<EmitValue<'ctx>, String> {
+    if let Some(value) = local_callable::binding_value(state, binding)? {
+        return Ok(value);
+    }
     if binding.output_sequence.outputs.len() == 1 {
         return emit_typed_expression(context, state, &binding.value, &binding.declared_type);
     }
@@ -1601,6 +1608,9 @@ fn store_binding_outputs<'ctx, 'module>(
     binding: &crate::ScalarBinding,
     value: EmitValue<'ctx>,
 ) -> Result<(), String> {
+    if local_callable::store_binding(context, state, binding, &value)? {
+        return Ok(());
+    }
     if binding.is_allocation {
         let receiver = binding
             .receivers
@@ -1954,6 +1964,9 @@ fn emit_project_binding_value<'ctx, 'module>(
     module: &ScalarModule,
     modules: &[&ScalarModule],
 ) -> Result<EmitValue<'ctx>, String> {
+    if let Some(value) = local_callable::binding_value(state, binding)? {
+        return Ok(value);
+    }
     if binding.output_sequence.outputs.len() == 1 {
         return emit_project_typed_expression(
             context,
@@ -2002,7 +2015,7 @@ fn emit_function<'ctx, 'module>(
     function: &ScalarFunction,
     reference_cfg: &ScalarReferenceCfg,
     body_call_nodes: Option<&'module CallableBodyCallNodes<'module>>,
-    initializer_symbols: &'module InitializerSymbols,
+    initializer_symbols: &'module InitializerSymbols<'module>,
     name: &str,
     names: &'module ModuleNames<'ctx, 'module>,
     module: &'module Module<'ctx>,
@@ -2033,6 +2046,7 @@ fn emit_function<'ctx, 'module>(
         initializer_aggregate: None,
         initializer_nodes: None,
         body_call_nodes,
+        local_callable_slots: HashMap::new(),
         guarded_scalar: ownership::GuardedScalarSite::all_from_cfg(reference_cfg),
         guarded_scalar_owner: None,
         initializer_symbols: Some(initializer_symbols),
@@ -2195,7 +2209,7 @@ fn emit_main<'ctx, 'module>(
     items: &[ScalarItem],
     initialization_region: &ModuleInitializationRegion,
     initializer_nodes: Option<&'module InitializerCallNodes<'module>>,
-    initializer_symbols: &'module InitializerSymbols,
+    initializer_symbols: &'module InitializerSymbols<'module>,
     module: &'module Module<'ctx>,
     structs: &'module [&'module ScalarStruct],
     layouts: &'module crate::scalar::layout::ScalarLayoutIndex<'module>,
@@ -2212,6 +2226,7 @@ fn emit_main<'ctx, 'module>(
         initializer_aggregate: initializer_plan.map(aggregate_transfer::InitializerEmitter::new),
         initializer_nodes,
         body_call_nodes: None,
+        local_callable_slots: HashMap::new(),
         guarded_scalar: None,
         guarded_scalar_owner: None,
         initializer_symbols: Some(initializer_symbols),
@@ -2321,7 +2336,7 @@ fn emit_project_function<'ctx, 'module>(
     function: &ScalarFunction,
     reference_cfg: &ScalarReferenceCfg,
     body_call_nodes: Option<&'module CallableBodyCallNodes<'module>>,
-    initializer_symbols: &'module InitializerSymbols,
+    initializer_symbols: &'module InitializerSymbols<'module>,
     source_module: &ScalarModule,
     modules: &[&'module ScalarModule],
     globals: &'module BTreeMap<String, GlobalStorage<'ctx>>,
@@ -2356,6 +2371,7 @@ fn emit_project_function<'ctx, 'module>(
         initializer_aggregate: None,
         initializer_nodes: None,
         body_call_nodes,
+        local_callable_slots: HashMap::new(),
         guarded_scalar: ownership::GuardedScalarSite::all_from_cfg(reference_cfg),
         guarded_scalar_owner: None,
         initializer_symbols: Some(initializer_symbols),
@@ -2541,7 +2557,7 @@ fn emit_project_main<'ctx, 'module>(
     regions: &[&ModuleInitializationRegion],
     names: &'module ProjectNames<'ctx, 'module>,
     initializer_nodes: Option<&'module [InitializerCallNodes<'module>]>,
-    initializer_symbols: &'module InitializerSymbols,
+    initializer_symbols: &'module InitializerSymbols<'module>,
     globals: &'module BTreeMap<String, GlobalStorage<'ctx>>,
     module: &'module Module<'ctx>,
     structs: &'module [&'module ScalarStruct],
@@ -2561,6 +2577,7 @@ fn emit_project_main<'ctx, 'module>(
         initializer_aggregate: None,
         initializer_nodes: None,
         body_call_nodes: None,
+        local_callable_slots: HashMap::new(),
         guarded_scalar: None,
         guarded_scalar_owner: None,
         initializer_symbols: Some(initializer_symbols),
@@ -3706,6 +3723,9 @@ fn emit_assignment<'ctx, 'module>(
     state: &mut EmitState<'ctx, 'module>,
     assignment: &ScalarAssignment,
 ) -> Result<EmitValue<'ctx>, String> {
+    if let Some(value) = local_callable::replace(state, assignment)? {
+        return Ok(value);
+    }
     let expected = assignment
         .targets
         .iter()
@@ -3797,6 +3817,9 @@ fn emit_project_assignment<'ctx, 'module>(
     module: &ScalarModule,
     modules: &[&ScalarModule],
 ) -> Result<EmitValue<'ctx>, String> {
+    if let Some(value) = local_callable::replace(state, assignment)? {
+        return Ok(value);
+    }
     let names = state.project_names.expect("project emission names");
     let scope = names.for_module(module);
     let expected = assignment
