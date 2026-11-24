@@ -44,8 +44,7 @@ fn assert_conditional_types(
         structs: &[],
         enums: &[],
         target_layout: ScalarTargetLayout::NATIVE64,
-        #[cfg(feature = "internal-checker")]
-        authored_field_index: Default::default(),
+        struct_index: Default::default(),
     };
     for typing in [
         TailConditionalTyping::Program(&program),

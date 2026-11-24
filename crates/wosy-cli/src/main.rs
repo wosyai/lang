@@ -10,7 +10,6 @@ use std::collections::BTreeMap;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
-#[cfg(target_os = "linux")]
 use std::io::{BufWriter, Write};
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
@@ -18,9 +17,10 @@ use std::process::ExitCode;
 #[cfg(target_os = "linux")]
 use std::sync::atomic::{AtomicU64, Ordering};
 use wosy_compiler::{
-    analyze_scalar_build, emit_scalar_build_project_llvm_text,
-    emit_scalar_build_single_module_llvm_text, parse_source, prepare_scalar_project, publication,
-    serialize_publication, ScalarPreparationInputs, ScalarTargetLayout,
+    analyze_scalar_build, emit_scalar_build_project_artifact_llvm,
+    emit_scalar_build_single_module_artifact_llvm, emit_scalar_build_wasm_root_exports_artifact_llvm,
+    parse_source_with_snapshot, prepare_scalar_project, publication, serialize_publication, LlvmPartition, ParseOutput,
+    ScalarPreparationInputs, ScalarTargetLayout,
 };
 #[cfg(feature = "internal-checker")]
 use wosy_compiler::{ScalarCheckerScope, ScalarNamespaceBinding};
@@ -30,6 +30,8 @@ use wosy_project::{
     ProjectConfiguration, ProjectContext, SourceIdentity as ProjectSourceIdentity,
     SourceObservation,
 };
+#[cfg(test)]
+use wosy_compiler::parse_source;
 use wosy_syntax::SourceIdentity;
 
 #[derive(Parser)]
@@ -145,8 +147,16 @@ fn parse_command(target: Option<&str>) -> Result<bool, String> {
         relative,
         revision,
     );
-    let output = parse_source(source, text, &project.comment_categories);
-    persist_cst(&root, &output)?;
+    let (fresh, diagnostics) = parse_source_with_snapshot(source, text, &project.comment_categories);
+    persist_cst(
+        &root,
+        &fresh.result().source.revision,
+        &fresh.snapshot_json_serializable(),
+    )?;
+    let output = ParseOutput {
+        result: fresh.into_result(),
+        diagnostics,
+    };
     let view = publication(&output);
     let json = serialize_publication(&view).map_err(|error| error.to_string())?;
     let output_path = root.join(".wosy/cst/current.json");
@@ -173,8 +183,13 @@ fn build_command(target: Option<&str>, profile: &str) -> Result<(), String> {
     let target_layout = artifact_profile.target_layout().map(scalar_target_layout)?;
     let configuration_identity = blake3::hash(document.raw().as_bytes()).to_hex().to_string();
     drop(document);
-    let (llvm, source_observations) =
-        compile_project(&root, &project, &configuration, target_layout)?;
+    let (llvm, source_observations) = compile_project(
+        &root,
+        &project,
+        &configuration,
+        target_layout,
+        artifact_profile.exports.as_ref(),
+    )?;
     let source_identity = wosy_project::source_identity(&source_observations);
     let artifact_name = &target_profile.main_artifact;
     let output_dir = root
@@ -184,7 +199,8 @@ fn build_command(target: Option<&str>, profile: &str) -> Result<(), String> {
         .join(artifact_name);
     fs::create_dir_all(&output_dir).map_err(|error| error.to_string())?;
     let partition_path = output_dir.join("partition.ll");
-    fs::write(&partition_path, &llvm).map_err(|error| error.to_string())?;
+    let llvm_input_identity = write_llvm_partition(&partition_path, &llvm)?;
+    drop(llvm);
     let runtime_path = output_dir.join("runtime.ll");
     let runtime = wosy_compiler::core_runtime(&artifact_profile.backend, &artifact_profile.output)?;
     fs::write(&runtime_path, runtime).map_err(|error| error.to_string())?;
@@ -195,16 +211,15 @@ fn build_command(target: Option<&str>, profile: &str) -> Result<(), String> {
         profile,
         artifact,
         artifact_profile,
-        &source_identity,
-        &llvm,
+        source_identity,
+        llvm_input_identity,
     )?;
-    drop(llvm);
     let executable = output_dir.join("main");
     let pending_manifest = output_dir.join("artifact-manifest.pending.json");
     let pending = wosy_project::ArtifactManifest {
-        identity: identity.clone(),
-        executable: executable.clone(),
-        source_observations: source_observations.clone(),
+        identity,
+        executable,
+        source_observations,
     };
     let pending_bytes = serde_json::to_vec_pretty(&pending).map_err(|error| error.to_string())?;
     fs::write(&pending_manifest, pending_bytes).map_err(|error| error.to_string())?;
@@ -223,9 +238,42 @@ fn build_command(target: Option<&str>, profile: &str) -> Result<(), String> {
             runtime_path.to_string_lossy().as_ref(),
         ],
     )?;
+    let wosy_project::ArtifactManifest {
+        identity,
+        executable,
+        source_observations,
+    } = pending;
     publish_artifact(&output_dir, executable, identity, source_observations)?;
     fs::remove_file(pending_manifest).map_err(|error| error.to_string())?;
     Ok(())
+}
+
+struct HashingWriter<W> {
+    output: W,
+    identity: blake3::Hasher,
+}
+
+impl<W: Write> Write for HashingWriter<W> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let written = self.output.write(bytes)?;
+        self.identity.update(&bytes[..written]);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.output.flush()
+    }
+}
+
+fn write_llvm_partition(path: &std::path::Path, llvm: &LlvmPartition) -> Result<String, String> {
+    let file = fs::File::create(path).map_err(|error| error.to_string())?;
+    let mut writer = BufWriter::new(HashingWriter {
+        output: file,
+        identity: blake3::Hasher::new(),
+    });
+    llvm.write_text(&mut writer).map_err(|error| error.to_string())?;
+    writer.flush().map_err(|error| error.to_string())?;
+    Ok(writer.get_ref().identity.finalize().to_hex().to_string())
 }
 
 fn run_command(target: Option<&str>, profile: &str, arguments: &[String]) -> Result<u8, String> {
@@ -246,11 +294,9 @@ fn run_command(target: Option<&str>, profile: &str, arguments: &[String]) -> Res
         .iter()
         .map(|observation| {
             let path = source_observation_path(observation);
-            let bytes = fs::read(&path)
-                .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
             Ok(SourceObservation {
                 source: observation.source.clone(),
-                content_revision: ContentRevision(blake3::hash(&bytes).to_hex().to_string()),
+                content_revision: observe_source_revision(&path)?,
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
@@ -297,6 +343,14 @@ fn source_observation_path(observation: &SourceObservation) -> std::path::PathBu
     std::path::Path::new(&observation.source.project).join(observation.source.path.as_path())
 }
 
+fn observe_source_revision(path: &std::path::Path) -> Result<ContentRevision, String> {
+    let read_error = |error| format!("failed to read {}: {error}", path.display());
+    let file = fs::File::open(path).map_err(read_error)?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update_reader(file).map_err(read_error)?;
+    Ok(ContentRevision(hasher.finalize().to_hex().to_string()))
+}
+
 mod canonical_loader;
 #[cfg(feature = "internal-checker")]
 #[allow(dead_code)]
@@ -309,7 +363,6 @@ use canonical_loader::{
 };
 #[cfg(feature = "internal-checker")]
 use canonical_loader::{canonical_source_identity, parse_canonical_ordinary_source};
-#[cfg(any(test, feature = "internal-checker"))]
 use canonical_loader::compiler_source_identity;
 
 fn load_canonical_project_inputs(
@@ -596,8 +649,11 @@ fn compile_project(
     project: &ProjectContext,
     configuration: &ProjectConfiguration,
     target_layout: ScalarTargetLayout,
-) -> Result<(String, Vec<SourceObservation>), String> {
-    compile_project_with_persistence(root, project, configuration, target_layout, Some(persist_cst))
+    root_exports: Option<&BTreeMap<String, String>>,
+) -> Result<(LlvmPartition, Vec<SourceObservation>), String> {
+    compile_project_with_persistence(
+        root, project, configuration, target_layout, Some(persist_fresh_cst), root_exports,
+    )
 }
 
 fn compile_project_with_persistence(
@@ -606,7 +662,8 @@ fn compile_project_with_persistence(
     configuration: &ProjectConfiguration,
     target_layout: ScalarTargetLayout,
     persist: Option<canonical_loader::PersistCst>,
-) -> Result<(String, Vec<SourceObservation>), String> {
+    root_exports: Option<&BTreeMap<String, String>>,
+) -> Result<(LlvmPartition, Vec<SourceObservation>), String> {
     let CanonicalProjectInputs {
         declarations,
         initialization_order,
@@ -634,14 +691,18 @@ fn compile_project_with_persistence(
         return Err("build rejected by semantic diagnostics".to_owned());
     }
     drop(texts);
-    let llvm = if graph.nodes.len() == 1 {
+    let llvm = if let Some(exports) = root_exports {
+        let entry = graph.nodes.first().ok_or_else(|| "project root source is missing".to_owned())?;
+        let source = compiler_source_identity(&entry.source, &entry.content_revision);
+        emit_scalar_build_wasm_root_exports_artifact_llvm(&validation, &source, exports)?
+    } else if graph.nodes.len() == 1 {
         #[cfg(test)]
         routing_observations::record(|counts| counts.single_module_emissions += 1);
-        emit_scalar_build_single_module_llvm_text(&validation)?
+        emit_scalar_build_single_module_artifact_llvm(&validation)?
     } else {
         #[cfg(test)]
         routing_observations::record(|counts| counts.project_emissions += 1);
-        emit_scalar_build_project_llvm_text(&validation)?
+        emit_scalar_build_project_artifact_llvm(&validation)?
     };
     let source_observations = graph
         .nodes
@@ -662,24 +723,32 @@ fn scalar_target_layout(layout: wosy_project::TargetLayout) -> ScalarTargetLayou
     }
 }
 
-fn persist_cst(root: &std::path::Path, output: &wosy_compiler::ParseOutput) -> Result<(), String> {
-    let path = root
-        .join(".wosy/cst")
-        .join(format!("{}.json", output.result.source.revision));
+fn persist_fresh_cst(
+    root: &std::path::Path,
+    fresh: &wosy_syntax::FreshParseResult,
+) -> Result<(), String> {
+    persist_cst(root, &fresh.result().source.revision, &fresh.snapshot_json_serializable())
+}
+
+fn persist_cst(
+    root: &std::path::Path,
+    revision: &str,
+    snapshot: &impl serde::Serialize,
+) -> Result<(), String> {
+    let path = root.join(".wosy/cst").join(format!("{revision}.json"));
     let create_parent = || {
         path.parent().map_or(Ok(()), |parent| {
             fs::create_dir_all(parent).map_err(|error| error.to_string())
         })
     };
-    let snapshot = output.result.canonical_cst().snapshot_json_serializable();
     #[cfg(target_os = "linux")]
     {
         create_parent()?;
-        publish_cst_snapshot(&path, &snapshot)
+        publish_cst_snapshot(&path, snapshot)
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let bytes = serde_json::to_vec_pretty(&snapshot).map_err(|error| error.to_string())?;
+        let bytes = serde_json::to_vec_pretty(snapshot).map_err(|error| error.to_string())?;
         create_parent()?;
         fs::write(&path, bytes).map_err(|error| error.to_string())
     }
@@ -1074,8 +1143,8 @@ fn artifact_identity(
     profile: &str,
     artifact: &wosy_project::ArtifactConfig,
     artifact_profile: &wosy_project::ArtifactProfile,
-    source_identity: &str,
-    llvm: &str,
+    source_identity: String,
+    llvm_input_identity: String,
 ) -> Result<ArtifactIdentity, String> {
     let builder = configuration
         .builders
@@ -1086,14 +1155,14 @@ fn artifact_identity(
         .get(&artifact_profile.run_runner)
         .ok_or_else(|| format!("runner {} is missing", artifact_profile.run_runner))?;
     Ok(ArtifactIdentity {
-        source_identity: source_identity.to_owned(),
+        source_identity,
         configuration_identity,
         artifact_identity: format!("{target}:{profile}:{}", artifact.artifact),
         backend: artifact_profile.backend.clone(),
         output: artifact_profile.output.clone(),
         builder_identity: serde_json::to_string(builder).map_err(|error| error.to_string())?,
         runner_identity: serde_json::to_string(runner).map_err(|error| error.to_string())?,
-        llvm_input_identity: blake3::hash(llvm.as_bytes()).to_hex().to_string(),
+        llvm_input_identity,
         compiler_identity: compiler_identity(),
         llvm_identity: llvm_identity(),
         builder_toolchain_identity: builder.toolchain_identity.clone(),
@@ -1238,7 +1307,10 @@ mod routing_observations {
         project: &ProjectContext,
         configuration: &ProjectConfiguration,
     ) -> (Result<(String, Vec<SourceObservation>), String>, Counts) {
-        observe(|| compile_project(&project.root, project, configuration, ScalarTargetLayout::NATIVE64))
+        observe(|| {
+            compile_project(&project.root, project, configuration, ScalarTargetLayout::NATIVE64, None)
+                .map(|(llvm, sources)| (llvm.to_text(), sources))
+        })
     }
 }
 
@@ -1290,6 +1362,29 @@ mod tests {
             resolved_packages: BTreeMap::new(),
         };
         (project, configuration)
+    }
+
+    fn compile_project_text(
+        root: &std::path::Path,
+        project: &ProjectContext,
+        configuration: &ProjectConfiguration,
+        target_layout: ScalarTargetLayout,
+        root_exports: Option<&BTreeMap<String, String>>,
+    ) -> Result<(String, Vec<SourceObservation>), String> {
+        compile_project(root, project, configuration, target_layout, root_exports)
+            .map(|(llvm, sources)| (llvm.to_text(), sources))
+    }
+
+    fn compile_project_text_with_persistence(
+        root: &std::path::Path,
+        project: &ProjectContext,
+        configuration: &ProjectConfiguration,
+        target_layout: ScalarTargetLayout,
+        persist: Option<canonical_loader::PersistCst>,
+        root_exports: Option<&BTreeMap<String, String>>,
+    ) -> Result<(String, Vec<SourceObservation>), String> {
+        compile_project_with_persistence(root, project, configuration, target_layout, persist, root_exports)
+            .map(|(llvm, sources)| (llvm.to_text(), sources))
     }
 
     #[cfg(feature = "internal-checker")]
@@ -1485,10 +1580,10 @@ mod tests {
         %%end"#;
         let (project, configuration) = routing_test_project("build-statically-types-proofs", &[("main.w", erased)]);
         for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
-            let build_without_persistence = || compile_project_with_persistence(
-                &project.root, &project, &configuration, layout, None,
+            let build_without_persistence = || compile_project_text_with_persistence(
+                &project.root, &project, &configuration, layout, None, None,
             );
-            let build = || compile_project(&project.root, &project, &configuration, layout);
+            let build = || compile_project_text(&project.root, &project, &configuration, layout, None);
             std::fs::write(project.root.join("main.w"), erased).unwrap();
             let (baseline, _) = build().expect("runtime-only baseline");
             let with_proof = |proof: &str| erased.replace("%%end", &format!("{proof}\n%%end"));
@@ -1522,6 +1617,31 @@ mod tests {
                 assert_eq!(counts, routing_observations::Counts { extractions: 1, preparations: 1, ..Default::default() });
             }
         }
+    }
+
+    #[test]
+    fn configured_wasm_root_exports_keep_canonical_static_proof_boundary() {
+        let root = "%%start\ni32(i32) score = fn(points) { points };\n";
+        let proof = "proof impossible for score(points) -> (out) ensures (false) {}";
+        let source = format!("{root}{proof}\n%%end");
+        let (project, configuration) =
+            routing_test_project("wasm-root-exports-keep-proof-boundary", &[("main.w", &source)]);
+        let exports = BTreeMap::from([("demo_score".into(), "score".into())]);
+        let compile = || {
+            compile_project_text(
+                &project.root, &project, &configuration, ScalarTargetLayout::WASM32, Some(&exports),
+            )
+        };
+        let (with_proof, _) = compile().expect("well-typed proof is erased");
+        assert!(with_proof.contains("define i32 @demo_score("));
+        fs::write(project.root.join("main.w"), format!("{root}%%end")).unwrap();
+        assert_eq!(compile().unwrap().0, with_proof);
+        fs::write(
+            project.root.join("main.w"),
+            format!("{root}{}\n%%end", proof.replace("false", "unknown_name")),
+        ).unwrap();
+        assert_eq!(compile().unwrap_err(), "build rejected by semantic diagnostics");
+        fs::remove_dir_all(&project.root).unwrap();
     }
 
     #[test]
@@ -1568,7 +1688,7 @@ mod tests {
         assert_eq!(outcomes.unwrap(), [wosy_compiler::ScalarModuleProofOutcome::Refuted]);
         assert!(!project.root.join(".wosy").exists());
         let (built, counts) = routing_observations::observe(|| {
-            compile_project(&project.root, &project, &configuration, ScalarTargetLayout::NATIVE64)
+            compile_project_text(&project.root, &project, &configuration, ScalarTargetLayout::NATIVE64, None)
         });
         let (llvm, observations) = built.expect("ordinary Build ignores the proof");
         assert_eq!(observations.len(), 1);
@@ -2287,6 +2407,135 @@ source_root = "src"
         assert!(!project.root.join(".wosy").exists());
     }
 
+    fn assert_wasm_root_forwarder(llvm: &str, label: &str, result: &str, types: &[&str]) {
+        let header = format!("define {result} @{label}(");
+        let body = llvm
+            .split_once(header.as_str())
+            .unwrap_or_else(|| panic!("missing wrapper {label}: {llvm}"))
+            .1;
+        let (args, body) = body.split_once(')').expect("wrapper argument list");
+        let parameters = args.split(',').map(str::trim).collect::<Vec<_>>();
+        assert_eq!(parameters.len(), types.len(), "{label}: {args}");
+        for (parameter, ty) in parameters.iter().zip(types) {
+            let (actual, name) = parameter.split_once(' ').expect("typed wrapper parameter");
+            assert_eq!(&actual, ty, "{label}: {parameter}");
+            assert!(name.starts_with('%'), "{label}: {parameter}");
+        }
+        let body = body.split_once("\n}").expect("wrapper body").0;
+        let call_start = format!("call {result} @wosy_fn__");
+        let call = body.split_once(call_start.as_str()).expect("qualified root call").1;
+        let forwarded = call.split_once('(').expect("call arguments").1;
+        let forwarded = forwarded.split_once(')').expect("end of call arguments").0;
+        assert_eq!(
+            forwarded.split(',').map(str::trim).collect::<Vec<_>>(),
+            parameters,
+            "{label}: {body}",
+        );
+    }
+
+    #[test]
+    fn writes_partition_and_hashes_exact_canonical_bytes() {
+        let sources = [(
+            "main.w",
+            "%%start\nenv = extern wasm \"host\" { unit() log; };\nenv.log();\n%%end\n",
+        )];
+        let (project, configuration) = routing_test_project("streamed-partition", &sources);
+        let (partition, observations) = compile_project(
+            &project.root,
+            &project,
+            &configuration,
+            ScalarTargetLayout::WASM32,
+            None,
+        )
+        .expect("compile actual extern partition");
+        let path = project.root.join("partition.ll");
+        let expected = partition.to_text();
+        let identity = write_llvm_partition(&path, &partition).expect("stream partition");
+        assert_eq!(fs::read(&path).expect("partition bytes"), expected.as_bytes());
+        assert_eq!(identity, blake3::hash(expected.as_bytes()).to_hex().as_str());
+        assert!(expected.contains(r#"wasm-import-module"="host""#));
+        assert_eq!(observations.len(), 1);
+        fs::remove_dir_all(&project.root).expect("remove routing fixture");
+    }
+
+    #[test]
+    fn partition_writer_hashes_only_bytes_accepted_by_output() {
+        let mut storage = [0; 3];
+        let mut writer = HashingWriter {
+            output: &mut storage[..],
+            identity: blake3::Hasher::new(),
+        };
+        assert_eq!(writer.write(b"abcdef").expect("short write"), 3);
+        assert!(writer.write_all(b"def").is_err());
+        assert_eq!(writer.identity.finalize(), blake3::hash(b"abc"));
+        assert_eq!(storage, *b"abc");
+    }
+
+    #[test]
+    fn selected_wasm_root_exports_keep_mixed_abi_and_exact_root_identity() {
+        let sources = [
+            (
+                "main.w",
+                "%%start\nmath = namespace app \"math.w\";\ni32(f32,i32,f32) score = fn(left,points,right) { if (left < right) { math.score() + points } else { points } };\nunit(f32,f32,f32,i32,f32) step = fn(a,b,c,n,d) { if (a + b + c > d) { if (n > 0) {}; }; };\n%%end\n",
+            ),
+            ("math.w", "%%start\ni32() score = fn { 42 };\ni32() hidden = fn { 7 };\n%%end\n"),
+        ];
+        let (project, configuration) = routing_test_project("explicit-wasm-root-exports", &sources);
+        let compile = |exports| {
+            compile_project_text(
+                &project.root,
+                &project,
+                &configuration,
+                ScalarTargetLayout::WASM32,
+                exports,
+            )
+        };
+        let exports = BTreeMap::from([
+            ("demo_score".into(), "score".into()),
+            ("tick".into(), "step".into()),
+        ]);
+        let (llvm, _) = compile(Some(&exports)).expect("emit selected root exports");
+        assert_wasm_root_forwarder(&llvm, "demo_score", "i32", &["float", "i32", "float"]);
+        assert_wasm_root_forwarder(&llvm, "tick", "void", &["float", "float", "float", "i32", "float"]);
+        let (default_llvm, _) = compile(None).expect("emit the unchanged implicit partition");
+        assert!(!default_llvm.contains("@demo_score"), "{default_llvm}");
+        assert!(!default_llvm.contains("@tick"), "{default_llvm}");
+        let absent = BTreeMap::from([("demo_score".into(), "hidden".into())]);
+        assert!(compile(Some(&absent)).expect_err("dependency is not the root").contains("no root function"));
+        let reserved = BTreeMap::from([("_start".into(), "score".into())]);
+        assert!(compile(Some(&reserved)).expect_err("runtime label is reserved").contains("reserved"));
+        fs::remove_dir_all(&project.root).expect("remove routing fixture");
+    }
+
+    #[test]
+    fn singleton_wasm_root_export_keeps_identity_and_rejects_symbol_collision() {
+        let sources = [(
+            "main.w",
+            "%%start\ni32() score = fn { 42 };\ni32() occupied = fn { 7 };\n%%end\n",
+        )];
+        let (project, configuration) = routing_test_project("singleton-root-export", &sources);
+        let compile = |exports| {
+            compile_project_text(
+                &project.root,
+                &project,
+                &configuration,
+                ScalarTargetLayout::WASM32,
+                exports,
+            )
+        };
+        let same = BTreeMap::from([("score".into(), "score".into())]);
+        let (llvm, _) = compile(Some(&same)).expect("use emitted score symbol");
+        let (default_llvm, _) = compile(None).expect("ordinary singleton");
+        assert_eq!(llvm, default_llvm);
+        let collision = BTreeMap::from([("occupied".into(), "score".into())]);
+        assert!(
+            compile(Some(&collision))
+                .expect_err("cannot reuse another function's emitted symbol")
+                .contains("collides with an emitted symbol")
+        );
+        fs::remove_dir_all(&project.root).expect("remove singleton routing fixture");
+    }
+
     #[test]
     fn static_boundary_routes_single_and_multi_module_build_once() {
         let single = [(
@@ -2409,21 +2658,26 @@ source_root = "src"
             "src/bootstrap.w".into(),
             "r1".into(),
         );
-        let output = parse_source(
+        let (fresh, diagnostics) = parse_source_with_snapshot(
             source,
             include_str!("../../../stdlib/src/bootstrap.w").into(),
             &[],
         );
-        assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
         let root = snapshot_test_path("deep").with_extension("");
         let path = root.join(".wosy/cst/r1.json");
-        let tree = output.result.canonical_cst();
+        let tree = fresh.result().canonical_cst();
         let borrowed = serde_json::to_vec_pretty(&tree.snapshot_json_serializable())
             .expect("serialize borrowed CST snapshot");
         let owned = serde_json::to_vec_pretty(&tree.snapshot())
             .expect("serialize owned CST snapshot");
         assert!(borrowed == owned, "borrowed CST snapshot changed bytes");
-        persist_cst(&root, &output).expect("publish archived snapshot");
+        persist_cst(
+            &root,
+            &fresh.result().source.revision,
+            &fresh.snapshot_json_serializable(),
+        )
+        .expect("publish archived snapshot");
         assert!(fs::read(&path).unwrap() == borrowed, "streamed CST snapshot changed bytes");
 
         let canonical = load_canonical_cst(&path).expect("load deep canonical CST snapshot");
@@ -2536,6 +2790,27 @@ source_root = "src"
         assert_eq!(target.package, "std");
         assert_eq!(target.path, "src/math.w");
         assert_eq!(target.revision, "rev");
+    }
+
+    #[test]
+    fn streamed_source_revision_preserves_raw_bytes_and_read_errors() {
+        let path = snapshot_test_path("streamed-source-revision");
+        let bytes: Vec<u8> = (0..=u8::MAX).cycle().take(147_459).collect();
+        fs::write(&path, &bytes).expect("write multichunk non-UTF-8 source");
+        assert_eq!(
+            observe_source_revision(&path).expect("read source revision"),
+            ContentRevision(blake3::hash(&bytes).to_hex().to_string()),
+        );
+
+        fs::write(&path, []).expect("empty source");
+        assert_eq!(
+            observe_source_revision(&path).expect("read empty source revision"),
+            ContentRevision(blake3::hash(&[]).to_hex().to_string()),
+        );
+
+        fs::remove_file(&path).expect("remove fixture");
+        let error = observe_source_revision(&path).expect_err("report missing file");
+        assert!(error.starts_with(&format!("failed to read {}: ", path.display())));
     }
 
     #[test]

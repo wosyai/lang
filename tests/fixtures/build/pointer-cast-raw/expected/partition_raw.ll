@@ -1043,7 +1043,7 @@ entry:
   %array_element = getelementptr inbounds [1 x i8], ptr %array_literal, i32 0, i32 0
   store i8 0, ptr %array_element, align 1
   call void @llvm.memmove.p0.p0.i32(ptr align 1 %scratch, ptr align 1 %array_literal, i32 1, i1 false)
-  %array_element2 = getelementptr inbounds [1 x i8], ptr %scratch, i32 0, i64 0
+  %array_element2 = getelementptr inbounds [1 x i8], ptr %scratch, i32 0, i32 0
   %address = ptrtoint ptr %array_element2 to i32
   store i32 %address, ptr %view, align 4
   store i32 4, ptr %status, align 4
@@ -1689,7 +1689,7 @@ if.then:                                          ; preds = %allocation_continue
 
 if.merge:                                         ; preds = %if.then, %allocation_continue
   store i64 2, ptr %two, align 4
-  %array_element15 = getelementptr inbounds [1 x i8], ptr %scratch, i32 0, i64 0
+  %array_element15 = getelementptr inbounds [1 x i8], ptr %scratch, i32 0, i32 0
   %address = ptrtoint ptr %array_element15 to i32
   store i32 %address, ptr %view, align 4
   %bytes16 = load ptr, ptr %bytes_backing, align 8
@@ -1976,7 +1976,7 @@ if.else:                                          ; preds = %entry
   %zero5 = load i64, ptr %zero, align 4
   store i64 %zero5, ptr %count, align 4
   store i1 false, ptr %complete, align 1
-  %array_element6 = getelementptr inbounds [1 x i8], ptr %scratch, i32 0, i64 0
+  %array_element6 = getelementptr inbounds [1 x i8], ptr %scratch, i32 0, i32 0
   %address = ptrtoint ptr %array_element6 to i32
   %one7 = load i64, ptr %one, align 4
   %call = call { i64, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__30643738343437646232646231366337653262356133636335663033363661663832653038373961383933643038643565393364633837333964353261303761__726561645f696e746f(i32 %address, i64 %one7)
@@ -2016,7 +2016,7 @@ if.then18:                                        ; preds = %if.else14
   br label %if.merge20
 
 if.else19:                                        ; preds = %if.else14
-  %array_element21 = getelementptr inbounds [1 x i8], ptr %scratch, i32 0, i64 0
+  %array_element21 = getelementptr inbounds [1 x i8], ptr %scratch, i32 0, i32 0
   %place = load i8, ptr %array_element21, align 1
   store i8 %place, ptr %first, align 1
   %first22 = load i8, ptr %first, align 1

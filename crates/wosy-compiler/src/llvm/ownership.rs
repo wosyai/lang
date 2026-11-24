@@ -878,6 +878,7 @@ fn extend_return_bindings_from_expression(
         | ScalarExpression::CheckedAddress { .. }
         | ScalarExpression::Dereference { .. }
         | ScalarExpression::IndexedRead { .. }
+        | ScalarExpression::ValueField { .. }
         | ScalarExpression::StructLiteral { .. }
         | ScalarExpression::ArrayLiteral { .. }
         | ScalarExpression::Binary { .. }
@@ -957,6 +958,7 @@ fn escaped_runtime_array_owners(
         | ScalarExpression::Binary { .. }
         | ScalarExpression::Unary { .. }
         | ScalarExpression::Call { .. }
+        | ScalarExpression::ValueField { .. }
         | ScalarExpression::UnitIf { .. } => BTreeSet::new(),
     }
 }

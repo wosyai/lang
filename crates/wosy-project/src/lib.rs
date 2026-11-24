@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use toml_edit::{DocumentMut, Item};
@@ -31,18 +32,21 @@ pub struct SourceObservation {
 }
 
 pub fn source_identity(observations: &[SourceObservation]) -> String {
-    observations
-        .iter()
-        .map(|observation| {
-            format!(
-                "{}:{}:{}",
-                observation.source.package,
-                observation.source.path.as_path().display(),
-                observation.content_revision.0
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(",")
+    let mut identity = String::new();
+    for (index, observation) in observations.iter().enumerate() {
+        if index != 0 {
+            identity.push(',');
+        }
+        write!(
+            &mut identity,
+            "{}:{}:{}",
+            observation.source.package,
+            observation.source.path.as_path().display(),
+            observation.content_revision.0
+        )
+        .expect("formatting source identity into a String");
+    }
+    identity
 }
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -223,8 +227,13 @@ pub fn load_reachable_source_graph(
     available: Vec<SourceNodeInput>,
     resolved_packages: &BTreeMap<String, ResolvedPackage>,
 ) -> Result<SourceGraph, GraphLoadError> {
+    let root_key = source_key(&root.source);
+    let root_span = SourceSpan {
+        source: root.source.clone(),
+        range: ByteSpan::new(0, 0),
+    };
     let mut sources = BTreeMap::new();
-    sources.insert(source_key(&root.source), root.clone());
+    sources.insert(root_key.clone(), root);
     for source in available {
         sources.insert(source_key(&source.source), source);
     }
@@ -237,17 +246,14 @@ pub fn load_reachable_source_graph(
     let mut stack = Vec::new();
     visit_source(
         package,
-        &source_key(&root.source),
+        &root_key,
         &sources,
         resolved_packages,
         &mut graph,
         &mut node_by_path,
         &mut stack,
-        &SourceSpan {
-            source: root.source.clone(),
-            range: ByteSpan::new(0, 0),
-        },
-        root.source.path.clone(),
+        &root_span,
+        &root_key.2,
     )?;
     Ok(graph)
 }
@@ -261,7 +267,7 @@ fn visit_source(
     node_by_path: &mut HashMap<(String, String, PackageRelativePath), SourceNodeId>,
     stack: &mut Vec<SourceNodeId>,
     incoming: &SourceSpan,
-    requested_path: PackageRelativePath,
+    requested_path: &PackageRelativePath,
 ) -> Result<SourceNodeId, GraphLoadError> {
     if let Some(id) = node_by_path.get(key) {
         if graph.nodes[id.0].dfs_state == DfsState::Visiting {
@@ -294,7 +300,7 @@ fn visit_source(
                 binding: String::new(),
                 span: incoming.clone(),
             },
-            requested_path,
+            requested_path.clone(),
         )
     })?;
     let id = SourceNodeId(graph.nodes.len());
@@ -311,7 +317,7 @@ fn visit_source(
 
     for edge in &source.namespace_edges {
         let (target_project, target_path) = if edge.origin == package {
-            (source.source.project.clone(), edge.path.clone())
+            (source.source.project.as_str(), edge.path.clone())
         } else {
             let resolved = resolved_packages
                 .get(&edge.origin)
@@ -320,9 +326,9 @@ fn visit_source(
                 resolved.identity.path.as_path().join(edge.path.as_path()),
             )
             .map_err(|_| GraphLoadError::missing(edge, edge.path.clone()))?;
-            (resolved.identity.project.clone(), target_path)
+            (resolved.identity.project.as_str(), target_path)
         };
-        let target_key = source_key_parts(&target_project, &edge.origin, target_path);
+        let target_key = source_key_parts(target_project, &edge.origin, target_path);
         let target = visit_source(
             package,
             &target_key,
@@ -332,11 +338,11 @@ fn visit_source(
             node_by_path,
             stack,
             &edge.span,
-            edge.path.clone(),
+            &edge.path,
         )?;
         graph.nodes[id.0].namespace_edges.push(NamespaceEdge {
             origin: edge.origin.clone(),
-            path: target_key.2.clone(),
+            path: target_key.2,
             binding: edge.binding.clone(),
             span: edge.span.clone(),
             target,
@@ -386,6 +392,8 @@ pub struct ArtifactProfile {
     pub output: String,
     pub builder: String,
     pub run_runner: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exports: Option<std::collections::BTreeMap<String, String>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -397,10 +405,13 @@ pub struct TargetLayout {
 impl ArtifactProfile {
     pub fn target_layout(&self) -> Result<TargetLayout, String> {
         match (self.backend.as_str(), self.output.as_str()) {
-            ("llvm", "wasm-wasip1" | "wasm-wasip2") => Ok(TargetLayout {
+            ("llvm", "wasm-wasip1" | "wasm-wasip2" | "wasm-web") => Ok(TargetLayout {
                 pointer_size: 4,
                 pointer_alignment: 4,
             }),
+            _ if self.exports.is_some() => {
+                Err("root exports require a selected LLVM Wasm artifact profile".to_owned())
+            }
             ("llvm", "native") => Ok(TargetLayout {
                 pointer_size: 8,
                 pointer_alignment: 8,
@@ -939,6 +950,7 @@ fn parse_artifacts(
                     output: scalar_string(profile, "output")?,
                     builder: scalar_string(profile, "builder")?,
                     run_runner: scalar_string(profile, "run_runner")?,
+                    exports: profile.get("exports").map(parse_root_exports).transpose()?,
                 },
             );
         }
@@ -951,6 +963,24 @@ fn parse_artifacts(
         );
     }
     Ok(artifacts)
+}
+
+fn parse_root_exports(item: &Item) -> Result<std::collections::BTreeMap<String, String>, String> {
+    let table = item
+        .as_table()
+        .ok_or_else(|| "artifact profile exports must be a table".to_owned())?;
+    if table.iter().next().is_none() {
+        return Err("artifact profile exports must not be empty".to_owned());
+    }
+    table
+        .iter()
+        .map(|(label, source)| {
+            let source = source
+                .as_str()
+                .ok_or_else(|| format!("artifact profile export {label:?} must name a root function"))?;
+            Ok((label.to_owned(), source.to_owned()))
+        })
+        .collect()
 }
 
 fn parse_target_profiles(
@@ -1206,6 +1236,24 @@ mod tests {
         assert_eq!(value["comment_categories"][0], "INTENT");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn source_identity_preserves_lossy_path_display() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let path = PathBuf::from(OsString::from_vec(b"src/\xff.w".to_vec()));
+        let observation = SourceObservation {
+            source: SourceIdentity::new(
+                "project".into(),
+                "app".into(),
+                PackageRelativePath::new(path).expect("relative non-UTF path"),
+            ),
+            content_revision: ContentRevision("revision".into()),
+        };
+        assert_eq!(source_identity(&[observation]), "app:src/\u{fffd}.w:revision");
+    }
+
     #[test]
     fn source_identity_preserves_observation_order_and_revisions() {
         let observations = vec![
@@ -1227,6 +1275,11 @@ mod tests {
             },
         ];
 
+        assert_eq!(source_identity(&[]), "");
+        assert_eq!(
+            source_identity(&observations[..1]),
+            "app:src/main.w:main-revision"
+        );
         assert_eq!(
             source_identity(&observations),
             "app:src/main.w:main-revision,app:src/math.w:math-revision"
@@ -1317,13 +1370,49 @@ mod tests {
     }
 
     #[test]
+    fn artifact_root_exports_parse_optional_nonempty_tables() {
+        let document = r#"
+            [artifacts.main]
+            artifact = "runtime"
+            [artifacts.main.profiles.dev]
+            backend = "llvm"
+            output = "wasm-wasip1"
+            builder = "wasm"
+            run_runner = "wasm"
+            [artifacts.main.profiles.dev.exports]
+            demo_score = "score"
+            tick = "step"
+        "#;
+        let parse = |source: &str| {
+            let doc = source.parse::<DocumentMut>().expect("fixture TOML");
+            parse_artifacts(doc.get("artifacts"))
+        };
+        for output in ["wasm-wasip1", "wasm-wasip2", "wasm-web"] {
+            let artifacts = parse(&document.replace("wasm-wasip1", output)).expect("root exports");
+            let profile = &artifacts["main"].profiles["dev"];
+            assert_eq!(profile.exports.as_ref().unwrap()["demo_score"], "score");
+            assert_eq!(profile.target_layout(), Ok(TargetLayout { pointer_size: 4, pointer_alignment: 4 }));
+        }
+        let native = parse(&document.replace("wasm-wasip1", "native")).expect("parse native profile");
+        assert!(native["main"].profiles["dev"].target_layout().is_err());
+        let empty = document.replace("demo_score = \"score\"", "").replace("tick = \"step\"", "");
+        assert!(
+            parse(&empty)
+                .expect_err("empty export table")
+                .contains("must not be empty")
+        );
+        assert!(parse(&document.replace("tick = \"step\"", "tick = 1")).is_err());
+    }
+
+    #[test]
     fn artifact_profile_derives_documented_llvm_target_layouts() {
-        for output in ["wasm-wasip1", "wasm-wasip2"] {
+        for output in ["wasm-wasip1", "wasm-wasip2", "wasm-web"] {
             let profile = ArtifactProfile {
                 backend: "llvm".to_owned(),
                 output: output.to_owned(),
                 builder: "builder".to_owned(),
                 run_runner: "runner".to_owned(),
+                exports: None,
             };
             assert_eq!(
                 profile.target_layout(),
@@ -1338,6 +1427,7 @@ mod tests {
             output: "native".to_owned(),
             builder: "builder".to_owned(),
             run_runner: "runner".to_owned(),
+            exports: None,
         };
         assert_eq!(
             native.target_layout(),
@@ -1351,6 +1441,7 @@ mod tests {
             output: "custom".to_owned(),
             builder: "builder".to_owned(),
             run_runner: "runner".to_owned(),
+            exports: None,
         };
         assert_eq!(
             unsupported.target_layout(),
@@ -1402,6 +1493,32 @@ mod tests {
             .nodes
             .iter()
             .all(|node| node.dfs_state == DfsState::Complete));
+    }
+
+    #[test]
+    fn later_available_root_replaces_supplied_root() {
+        let root = source("src/main.w", vec![edge("src/main.w", "src/missing.w", "old")]);
+        let mut first = source(
+            "src/main.w",
+            vec![edge("src/main.w", "src/missing.w", "first")],
+        );
+        first.content_revision = ContentRevision("first".to_owned());
+        let mut last = source("src/main.w", vec![edge("src/main.w", "src/math.w", "last")]);
+        last.content_revision = ContentRevision("last".to_owned());
+        let graph = load_reachable_source_graph(
+            "app",
+            root,
+            vec![first, source("src/math.w", Vec::new()), last],
+            &BTreeMap::new(),
+        )
+        .expect("later root supplies reachable edges");
+
+        assert_eq!(
+            graph.nodes[0].content_revision,
+            ContentRevision("last".to_owned())
+        );
+        assert_eq!(graph.nodes[0].namespace_edges[0].binding, "last");
+        assert_eq!(graph.nodes[0].namespace_edges[0].target, SourceNodeId(1));
     }
 
     #[test]

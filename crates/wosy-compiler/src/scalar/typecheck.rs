@@ -21,8 +21,7 @@ impl ScalarProgramTyping<'_> {
     }
 }
 
-#[cfg(feature = "internal-checker")]
-type AuthoredFieldIndex = std::rc::Rc<std::cell::OnceCell<
+type ProjectStructIndex = std::rc::Rc<std::cell::OnceCell<
     BTreeMap<std::rc::Rc<ScalarStructId>, (usize, usize)>,
 >>;
 
@@ -33,15 +32,13 @@ pub(super) struct ScalarModuleTyping<'a> {
     pub structs: &'a [ScalarStruct],
     pub enums: &'a [ScalarEnum],
     pub target_layout: ScalarTargetLayout,
-    #[cfg(feature = "internal-checker")]
-    pub authored_field_index: AuthoredFieldIndex,
+    pub struct_index: ProjectStructIndex,
 }
 
 pub(super) fn split_module_typing(
     modules: &mut [ScalarModule],
 ) -> (Vec<ScalarModuleTyping<'_>>, Vec<&mut [ScalarItem]>) {
-    #[cfg(feature = "internal-checker")]
-    let authored_field_index = AuthoredFieldIndex::default();
+    let struct_index = ProjectStructIndex::default();
     modules
         .iter_mut()
         .map(|module| {
@@ -53,8 +50,7 @@ pub(super) fn split_module_typing(
                     structs: &module.structs,
                     enums: &module.enums,
                     target_layout: module.target_layout,
-                    #[cfg(feature = "internal-checker")]
-                    authored_field_index: authored_field_index.clone(),
+                    struct_index: struct_index.clone(),
                 },
                 module.items.as_mut_slice(),
             )
@@ -416,6 +412,7 @@ pub(super) fn expression_span(expression: &ScalarExpression) -> ByteSpan {
         | ScalarExpression::CheckedAddress { span, .. }
         | ScalarExpression::Dereference { span, .. }
         | ScalarExpression::IndexedRead { span, .. }
+        | ScalarExpression::ValueField { span, .. }
         | ScalarExpression::StructLiteral { span, .. }
         | ScalarExpression::ArrayLiteral { span, .. }
         | ScalarExpression::Binary { span, .. }
@@ -3133,6 +3130,50 @@ fn is_float_arithmetic_operator(operator: &BinaryOperator) -> bool {
 // Leaves and obvious non-float shapes need no cache access. Check both
 // children shallowly before following a composite, so ordinary arithmetic
 // spines with a named or integer operand have no recursive shape walk.
+fn is_homogeneous_bitwise(operator: &BinaryOperator) -> bool {
+    matches!(
+        operator,
+        BinaryOperator::BitAnd
+            | BinaryOperator::BitOr
+            | BinaryOperator::BitXor
+            | BinaryOperator::ShiftLeft
+            | BinaryOperator::ShiftRight
+    )
+}
+
+fn is_integer_literal_operand(expression: &ScalarExpression) -> bool {
+    match expression {
+        ScalarExpression::Integer { .. } => true,
+        ScalarExpression::Unary {
+            operator: UnaryOperator::Negate | UnaryOperator::BitwiseNot,
+            operand,
+            ..
+        } => matches!(operand.as_ref(), ScalarExpression::Integer { .. }),
+        _ => false,
+    }
+}
+
+fn infer_bitwise_operands(
+    left: &ScalarExpression,
+    right: &ScalarExpression,
+    mut check: impl FnMut(&ScalarExpression, Option<&ScalarType>) -> ScalarType,
+) -> (ScalarType, ScalarType) {
+    let left_literal = is_integer_literal_operand(left);
+    let right_literal = is_integer_literal_operand(right);
+    if left_literal && !right_literal {
+        let right_type = check(right, None);
+        let left_type = check(left, is_integer_type(&right_type).then_some(&right_type));
+        (left_type, right_type)
+    } else {
+        let left_type = check(left, None);
+        let right_type = check(
+            right,
+            (!left_literal && right_literal && is_integer_type(&left_type)).then_some(&left_type),
+        );
+        (left_type, right_type)
+    }
+}
+
 fn float_literal_leaf(expression: &ScalarExpression) -> Option<bool> {
     match expression {
         ScalarExpression::Float { .. } => Some(true),
@@ -3440,6 +3481,29 @@ fn check_expression_type_in_module(
         }
     }
     match expression {
+        ScalarExpression::ValueField { receiver, name, name_span, span } => {
+            if !matches!(receiver.as_ref(), ScalarExpression::Call { .. }) {
+                diagnostics.push(module_diagnostic(module, "B0003", "field value receiver must be a call result", *span));
+                return ScalarType::Error;
+            }
+            let ty = expression_type_in_module(
+                receiver, scope, visible_names, folded_names,
+                module, modules, diagnostics, unsafe_context, overloads, inference,
+            );
+            if is_error_type(&ty) {
+                return ScalarType::Error;
+            }
+            match checked_value_field(&ty, name, |id| checked_project_struct(id, modules).map(|(_, structure)| structure)) {
+                Ok(field) => {
+                    inference.record_value_field(expression, &field.id);
+                    field.ty.clone()
+                }
+                Err(message) => {
+                    diagnostics.push(module_diagnostic(module, "B0003", message, *name_span));
+                    ScalarType::Error
+                }
+            }
+        }
         ScalarExpression::Name { name, span } if is_null_literal_name(name) => {
             diagnostics.push(module_diagnostic(
                 module,
@@ -3688,6 +3752,12 @@ fn check_expression_type_in_module(
             right,
             span,
         } => {
+            if is_homogeneous_bitwise(operator) {
+                return check_expression_type_in_module_expected(
+                    expression, None, scope, visible_names, folded_names, module, modules,
+                    diagnostics, unsafe_context, overloads, inference,
+                );
+            }
             let literal_operands = float_literal_arithmetic_operands(operator, left, right, inference);
             if let Some(inferred) = infer_float_literal_arithmetic(literal_operands, left, right, |operand, expected| {
                 expression_type_in_module_expected(
@@ -4387,8 +4457,7 @@ pub(super) fn typecheck_proof_where(
     let members = BTreeMap::new();
     let module = ScalarModuleTyping {
         source, members: &members, namespace_bindings: &[], structs: &[], enums: &[], target_layout,
-        #[cfg(feature = "internal-checker")]
-        authored_field_index: Default::default(),
+        struct_index: Default::default(),
     };
     let scope = inputs.collect::<BTreeMap<_, _>>();
     let visible = scope.keys().cloned().collect::<BTreeSet<_>>();
@@ -4940,7 +5009,14 @@ fn check_expression_type_in_module_expected(
             );
         }
         let bool_context = ScalarType::Bool;
-        let (left_type, right_type) = if comparison && is_null_expression(left) {
+        let (left_type, right_type) = if bitwise && arithmetic_context.is_none() {
+            infer_bitwise_operands(left, right, |operand, expected| {
+                expression_type_in_module_expected(
+                    operand, expected, scope, visible_names, folded_names, module, modules,
+                    diagnostics, unsafe_context, overloads, inference,
+                )
+            })
+        } else if comparison && is_null_expression(left) {
             let right_type = expression_type_in_module_expected(
                 right,
                 None,
@@ -5152,13 +5228,11 @@ fn utf8_type_from_context(
         .map(|structure| ScalarType::Struct(structure.id.clone()))
 }
 
-#[cfg(feature = "internal-checker")]
-fn checked_authored_snapshot_field<'a>(
-    owner: &ScalarStructId, name: &str, modules: &[ScalarModuleTyping<'a>],
-) -> Option<(std::rc::Rc<ScalarStructId>, &'a ScalarStructField)> {
-    // Built once for the entire preparation, and only when an authored
-    // projection asks for it. Do not scan modules × structs per output.
-    let index = modules.first()?.authored_field_index.get_or_init(|| {
+fn checked_project_struct<'a, 'm>(
+    owner: &ScalarStructId,
+    modules: &'m [ScalarModuleTyping<'a>],
+) -> Option<(&'m std::rc::Rc<ScalarStructId>, &'a ScalarStruct)> {
+    let index = modules.first()?.struct_index.get_or_init(|| {
         let mut index = BTreeMap::new();
         for (module, typing) in modules.iter().enumerate() {
             for (slot, structure) in typing.structs.iter().enumerate() {
@@ -5168,12 +5242,39 @@ fn checked_authored_snapshot_field<'a>(
         index
     });
     let (shared_owner, &(module, slot)) = index.get_key_value(owner)?;
-    let structure = modules.get(module)?.structs.get(slot)?;
+    Some((shared_owner, modules.get(module)?.structs.get(slot)?))
+}
+
+#[cfg(feature = "internal-checker")]
+fn checked_authored_snapshot_field<'a>(
+    owner: &ScalarStructId, name: &str, modules: &[ScalarModuleTyping<'a>],
+) -> Option<(std::rc::Rc<ScalarStructId>, &'a ScalarStructField)> {
+    let (shared_owner, structure) = checked_project_struct(owner, modules)?;
     // A shape with more than 64 fields cannot pass the corresponding
     // snapshot node budget regardless of what this selection names.
     if structure.fields.len() > 64 { return None; }
     let field = structure.fields.iter().find(|field| field.name == name)?;
     Some((shared_owner.clone(), field))
+}
+
+fn checked_value_field<'a>(
+    receiver: &ScalarType,
+    name: &str,
+    lookup: impl FnOnce(&ScalarStructId) -> Option<&'a ScalarStruct>,
+) -> Result<&'a ScalarStructField, &'static str> {
+    let ScalarType::Struct(id) = receiver else {
+        return Err("field value receiver must be a copy struct");
+    };
+    let structure = lookup(id)
+        .filter(|structure| structure.copy_policy == CopyPolicy::Copy)
+        .ok_or("field value receiver must be a copy struct")?;
+    let field = structure.fields.iter().find(|field| field.name == name)
+        .ok_or("unknown struct field")?;
+    if super::reference::aggregate::ordinary_value(&field.ty) {
+        Ok(field)
+    } else {
+        Err("field value must be an ordinary copy scalar")
+    }
 }
 
 fn member_field_in_module<'a>(
@@ -6861,7 +6962,7 @@ fn validate_unit_if_position(
             validate_unit_if_position(left, false, source, diagnostics);
             validate_unit_if_position(right, false, source, diagnostics);
         }
-        ScalarExpression::Unary { operand, .. } => {
+        ScalarExpression::Unary { operand, .. } | ScalarExpression::ValueField { receiver: operand, .. } => {
             validate_unit_if_position(operand, false, source, diagnostics);
         }
         ScalarExpression::Call { arguments, .. } => {
@@ -7185,38 +7286,44 @@ pub(super) fn validate(
                             function.span,
                         ));
                     }
-                    let mut scope = declarations.clone();
-                    let mut visible_names = declaration_names.clone();
-                    let mut folded_names = folded_declarations.clone();
-                    typing.declare_parameters(
-                        function,
-                        parameters,
-                        &mut scope,
-                        &mut visible_names,
-                        &mut folded_names,
-                        &mut diagnostics,
+                    let mut scope = BlockLexicalScope::new(
+                        &declarations,
+                        &declaration_names,
+                        &folded_declarations,
                     );
+                    if !function.parameters.is_empty() {
+                        typing.declare_parameters(
+                            function,
+                            parameters,
+                            scope.types.to_mut(),
+                            scope.names.to_mut(),
+                            scope.folded_names.to_mut(),
+                            &mut diagnostics,
+                        );
+                    }
                     if outputs.outputs.len() > 1 && !function.body.final_output_values.is_empty() {
                         let tail = function.body.tail_conditional();
                         let unsafe_context = tail.is_some() && function.body.unsafe_context;
-                        check_final_output_prefix(
-                            &function.body,
-                            &mut scope,
-                            &mut visible_names,
-                            &mut folded_names,
-                            typing,
-                            &mut diagnostics,
-                            unsafe_context,
-                            overloads,
-                            inference,
-                        );
+                        if function.body.items.len() != function.body.final_output_values.len() {
+                            check_final_output_prefix(
+                                &function.body,
+                                scope.types.to_mut(),
+                                scope.names.to_mut(),
+                                scope.folded_names.to_mut(),
+                                typing,
+                                &mut diagnostics,
+                                unsafe_context,
+                                overloads,
+                                inference,
+                            );
+                        }
                         if let Some(tail) = tail {
                             validate_tail_conditional_return(
                                 tail,
                                 &outputs.outputs,
-                                &scope,
-                                &visible_names,
-                                &folded_names,
+                                &scope.types,
+                                &scope.names,
+                                &scope.folded_names,
                                 typing,
                                 &mut diagnostics,
                                 unsafe_context,
@@ -7243,9 +7350,9 @@ pub(super) fn validate(
                                 expression,
                                 value.span,
                                 outputs,
-                                &scope,
-                                &visible_names,
-                                &folded_names,
+                                &scope.types,
+                                &scope.names,
+                                &scope.folded_names,
                                 &mut diagnostics,
                                 overloads,
                                 inference,
@@ -7267,9 +7374,9 @@ pub(super) fn validate(
                                 let actual = expression_type_expected(
                                     expression,
                                     &output.ty,
-                                    &scope,
-                                    &visible_names,
-                                    &folded_names,
+                                    &scope.types,
+                                    &scope.names,
+                                    &scope.folded_names,
                                     program,
                                     &mut diagnostics,
                                     false,
@@ -7289,9 +7396,9 @@ pub(super) fn validate(
                         let actual = block_type_expected(
                             &function.body,
                             &output.ty,
-                            &scope,
-                            &visible_names,
-                            &folded_names,
+                            &scope.types,
+                            &scope.names,
+                            &scope.folded_names,
                             program,
                             &mut diagnostics,
                             false,
@@ -7308,9 +7415,9 @@ pub(super) fn validate(
                     } else {
                         let actual = block_type(
                             &function.body,
-                            &scope,
-                            &visible_names,
-                            &folded_names,
+                            &scope.types,
+                            &scope.names,
+                            &scope.folded_names,
                             program,
                             &mut diagnostics,
                             false,
@@ -7363,77 +7470,90 @@ pub(super) fn validate(
     diagnostics
 }
 
-struct StaticUseAnalyzer {
-    visible: BTreeMap<String, usize>,
+struct StaticUseAnalyzer<'tree> {
+    visible: BTreeMap<&'tree str, ByteSpan>,
+    scope_changes: Vec<(&'tree str, Option<ByteSpan>)>,
     declarations: Vec<ByteSpan>,
-    uses: BTreeSet<usize>,
+    used_spans: HashSet<ByteSpan>,
 }
 
-impl StaticUseAnalyzer {
-    fn new(function: &ScalarFunction) -> Self {
+impl<'tree> StaticUseAnalyzer<'tree> {
+    fn new(function: &'tree ScalarFunction) -> Self {
         let mut analyzer = Self {
             visible: BTreeMap::new(),
+            scope_changes: Vec::new(),
             declarations: Vec::new(),
-            uses: BTreeSet::new(),
+            used_spans: HashSet::new(),
         };
         for (index, name) in function.parameters.iter().enumerate() {
             if let Some(span) = function.parameter_spans.get(index) {
-                let id = analyzer.declarations.len();
-                analyzer.visible.insert(name.clone(), id);
+                analyzer.visible.insert(name.as_str(), *span);
                 analyzer.declarations.push(*span);
             }
         }
         analyzer
     }
 
-    fn block(&mut self, block: &ScalarBlock, visible: &BTreeMap<String, usize>) {
-        let mut visible = visible.clone();
+    fn block(&mut self, block: &'tree ScalarBlock) {
+        let checkpoint = self.scope_changes.len();
         for item in &block.items {
-            self.item(item, &mut visible);
+            self.item(item, true);
+        }
+        while self.scope_changes.len() > checkpoint {
+            let (name, previous) = self.scope_changes.pop().unwrap();
+            if let Some(span) = previous {
+                self.visible.insert(name, span);
+            } else {
+                self.visible.remove(name);
+            }
         }
     }
 
-    fn item(&mut self, item: &ScalarBlockItem, visible: &mut BTreeMap<String, usize>) {
+    fn item(&mut self, item: &'tree ScalarBlockItem, nested: bool) {
         match item {
             ScalarBlockItem::LocalBinding(binding) => {
                 if binding.is_allocation {
                     for receiver in &binding.receivers {
                         if let Some(length) = &receiver.allocation_length {
-                            self.expression(length, visible);
+                            self.expression(length);
                         }
                     }
                 } else {
-                    self.expression(&binding.value, visible);
+                    self.expression(&binding.value);
                 }
                 if binding.contextual_storage().is_none() {
-                    let id = self.declarations.len();
-                    visible.insert(binding.name.clone(), id);
+                    let name = binding.name.as_str();
+                    let previous = self.visible.insert(name, binding.span);
+                    if nested {
+                        self.scope_changes.push((name, previous));
+                    }
                     self.declarations.push(binding.span);
                 }
             }
-            ScalarBlockItem::Expression(expression) => self.expression(expression, visible),
+            ScalarBlockItem::Expression(expression) => self.expression(expression),
             ScalarBlockItem::Assignment(assignment) => {
                 for (_, value) in assignment.rhs().evaluations() {
-                    self.expression(value, visible);
+                    self.expression(value);
                 }
                 for (position, target) in assignment.targets.iter().enumerate() {
                     if position == 0 || !matches!(&target.place, ScalarPlace::Name { .. }) {
-                        self.place(&target.place, visible);
+                        self.place(&target.place);
                     }
                 }
             }
         }
     }
 
-    fn expression(&mut self, expression: &ScalarExpression, visible: &BTreeMap<String, usize>) {
+    fn expression(&mut self, expression: &'tree ScalarExpression) {
         match expression {
             ScalarExpression::Contextual { .. } => {},
-            ScalarExpression::Name { name, .. } => self.use_name(name, visible),
-            ScalarExpression::Member { receiver, .. } => self.use_name(receiver, visible),
-            ScalarExpression::Unary { operand, .. } => self.expression(operand, visible),
+            ScalarExpression::Name { name, .. } => self.use_name(name),
+            ScalarExpression::Member { receiver, .. } => self.use_name(receiver),
+            ScalarExpression::Unary { operand, .. } | ScalarExpression::ValueField { receiver: operand, .. } =>
+                self.expression(operand),
             ScalarExpression::Binary { left, right, .. } => {
-                self.expression(left, visible);
-                self.expression(right, visible);
+                self.expression(left);
+                self.expression(right);
             }
             ScalarExpression::Call {
                 receiver,
@@ -7442,12 +7562,12 @@ impl StaticUseAnalyzer {
                 ..
             } => {
                 if let Some(receiver) = receiver {
-                    self.use_name(receiver, visible);
+                    self.use_name(receiver);
                 } else {
-                    self.use_name(name, visible);
+                    self.use_name(name);
                 }
                 for argument in arguments {
-                    self.expression(argument, visible);
+                    self.expression(argument);
                 }
             }
             ScalarExpression::If {
@@ -7456,31 +7576,31 @@ impl StaticUseAnalyzer {
                 else_branch,
                 ..
             } => {
-                self.expression(condition, visible);
-                self.block(then_branch, visible);
-                self.block(else_branch, visible);
+                self.expression(condition);
+                self.block(then_branch);
+                self.block(else_branch);
             }
             ScalarExpression::UnitIf {
                 condition,
                 then_branch,
                 ..
             } => {
-                self.expression(condition, visible);
-                self.block(then_branch, visible);
+                self.expression(condition);
+                self.block(then_branch);
             }
-            ScalarExpression::Block(block) => self.block(block, visible),
+            ScalarExpression::Block(block) => self.block(block),
             ScalarExpression::RawAddress { place, .. }
             | ScalarExpression::CheckedAddress { place, .. }
-            | ScalarExpression::Dereference { place, .. } => self.place(place, visible),
-            ScalarExpression::IndexedRead { place, .. } => self.place(place, visible),
+            | ScalarExpression::Dereference { place, .. } => self.place(place),
+            ScalarExpression::IndexedRead { place, .. } => self.place(place),
             ScalarExpression::StructLiteral { fields, .. } => {
                 for field in fields {
-                    self.expression(&field.value, visible);
+                    self.expression(&field.value);
                 }
             }
             ScalarExpression::ArrayLiteral { elements, .. } => {
                 for element in elements {
-                    self.expression(element, visible);
+                    self.expression(element);
                 }
             }
             ScalarExpression::Integer { .. }
@@ -7493,38 +7613,29 @@ impl StaticUseAnalyzer {
         }
     }
 
-    fn place(&mut self, place: &ScalarPlace, visible: &BTreeMap<String, usize>) {
+    fn place(&mut self, place: &'tree ScalarPlace) {
         match place {
             ScalarPlace::Contextual { .. } => {},
-            ScalarPlace::Name { name, .. } => self.use_name(name, visible),
-            ScalarPlace::Field { base, .. } => self.place(base, visible),
-            ScalarPlace::Dereference { pointer, .. } => self.expression(pointer, visible),
+            ScalarPlace::Name { name, .. } => self.use_name(name),
+            ScalarPlace::Field { base, .. } => self.place(base),
+            ScalarPlace::Dereference { pointer, .. } => self.expression(pointer),
             ScalarPlace::Index { base, index, .. } => {
-                self.place(base, visible);
-                self.expression(index, visible);
+                self.place(base);
+                self.expression(index);
             }
         }
     }
 
-    fn use_name(&mut self, name: &str, visible: &BTreeMap<String, usize>) {
-        if let Some(id) = visible.get(name) {
-            self.uses.insert(*id);
+    fn use_name(&mut self, name: &str) {
+        if let Some(span) = self.visible.get(name) {
+            self.used_spans.insert(*span);
         }
     }
 
     fn unused(self) -> Vec<ByteSpan> {
         self.declarations
-            .iter()
-            .enumerate()
-            .filter_map(|(id, span)| {
-                let used = self.uses.contains(&id)
-                    || self
-                        .declarations
-                        .iter()
-                        .enumerate()
-                        .any(|(other_id, other)| other == span && self.uses.contains(&other_id));
-                (!used).then_some(*span)
-            })
+            .into_iter()
+            .filter(|span| !self.used_spans.contains(span))
             .collect()
     }
 }
@@ -7535,8 +7646,9 @@ pub(super) fn unused_binding_spans(items: &[ScalarItem]) -> Vec<ByteSpan> {
         .filter_map(|item| match item {
             ScalarItem::Function(function) => {
                 let mut analyzer = StaticUseAnalyzer::new(function);
-                let visible = analyzer.visible.clone();
-                analyzer.block(&function.body, &visible);
+                for item in &function.body.items {
+                    analyzer.item(item, false);
+                }
                 Some(analyzer.unused())
             }
             ScalarItem::Namespace(_)
@@ -8091,6 +8203,29 @@ fn check_expression_type(
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
     match expression {
+        ScalarExpression::ValueField { receiver, name, name_span, span } => {
+            if !matches!(receiver.as_ref(), ScalarExpression::Call { .. }) {
+                diagnostics.push(diagnostic(program, "B0003", "field value receiver must be a call result", *span));
+                return ScalarType::Error;
+            }
+            let ty = expression_type(
+                receiver, scope, visible_names, folded_names,
+                program, diagnostics, unsafe_context, overloads, inference,
+            );
+            if is_error_type(&ty) {
+                return ScalarType::Error;
+            }
+            match checked_value_field(&ty, name, |id| program.structs.get(id.index).filter(|structure| &structure.id == id)) {
+                Ok(field) => {
+                    inference.record_value_field(expression, &field.id);
+                    field.ty.clone()
+                }
+                Err(message) => {
+                    diagnostics.push(diagnostic(program, "B0003", message, *name_span));
+                    ScalarType::Error
+                }
+            }
+        }
         ScalarExpression::RawAddress { place, span } => {
             if !unsafe_context {
                 diagnostics.push(diagnostic(
@@ -8338,33 +8473,23 @@ fn check_expression_type(
                     inference,
                 );
             }
-            let left_type = expression_type(
-                left,
-                scope,
-                visible_names,
-                folded_names,
-                program,
-                diagnostics,
-                unsafe_context,
-                overloads,
-                inference,
-            );
-            let right_type = if comparison {
-                expression_type_expected(
-                    right,
-                    &left_type,
-                    scope,
-                    visible_names,
-                    folded_names,
-                    program,
-                    diagnostics,
-                    unsafe_context,
-                    overloads,
-                    inference,
-                )
+            let (left_type, right_type) = if is_homogeneous_bitwise(operator) {
+                infer_bitwise_operands(left, right, |operand, expected| {
+                    if let Some(expected) = expected {
+                        expression_type_expected(
+                            operand, expected, scope, visible_names, folded_names, program,
+                            diagnostics, unsafe_context, overloads, inference,
+                        )
+                    } else {
+                        expression_type(
+                            operand, scope, visible_names, folded_names, program, diagnostics,
+                            unsafe_context, overloads, inference,
+                        )
+                    }
+                })
             } else {
-                expression_type(
-                    right,
+                let left_type = expression_type(
+                    left,
                     scope,
                     visible_names,
                     folded_names,
@@ -8373,7 +8498,34 @@ fn check_expression_type(
                     unsafe_context,
                     overloads,
                     inference,
-                )
+                );
+                let right_type = if comparison {
+                    expression_type_expected(
+                        right,
+                        &left_type,
+                        scope,
+                        visible_names,
+                        folded_names,
+                        program,
+                        diagnostics,
+                        unsafe_context,
+                        overloads,
+                        inference,
+                    )
+                } else {
+                    expression_type(
+                        right,
+                        scope,
+                        visible_names,
+                        folded_names,
+                        program,
+                        diagnostics,
+                        unsafe_context,
+                        overloads,
+                        inference,
+                    )
+                };
+                (left_type, right_type)
             };
             if is_error_type(&left_type) || is_error_type(&right_type) {
                 return ScalarType::Error;

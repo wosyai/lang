@@ -117,6 +117,55 @@ impl<'ctx, 'module> ProjectNames<'ctx, 'module> {
     }
 }
 
+type StorageBinding<'ctx> = (PointerValue<'ctx>, ScalarType);
+
+#[derive(Default)]
+struct StorageBindings<'ctx> {
+    entries: BTreeMap<String, StorageBinding<'ctx>>,
+    undo: Vec<(String, Option<StorageBinding<'ctx>>)>,
+    scoped: bool,
+}
+
+struct StorageScope {
+    undo_start: usize,
+    previously_scoped: bool,
+}
+
+impl<'ctx> StorageBindings<'ctx> {
+    fn get(&self, name: &str) -> Option<&StorageBinding<'ctx>> {
+        self.entries.get(name)
+    }
+
+    fn insert(&mut self, name: String, binding: StorageBinding<'ctx>) {
+        if self.scoped {
+            let undo_name = name.clone();
+            let previous = self.entries.insert(name, binding);
+            self.undo.push((undo_name, previous));
+        } else {
+            self.entries.insert(name, binding);
+        }
+    }
+
+    fn enter_scope(&mut self) -> StorageScope {
+        StorageScope {
+            undo_start: self.undo.len(),
+            previously_scoped: std::mem::replace(&mut self.scoped, true),
+        }
+    }
+
+    fn leave_scope(&mut self, scope: StorageScope) {
+        while self.undo.len() > scope.undo_start {
+            let (name, previous) = self.undo.pop().expect("pending storage change");
+            if let Some(binding) = previous {
+                self.entries.insert(name, binding);
+            } else {
+                self.entries.remove(&name);
+            }
+        }
+        self.scoped = scope.previously_scoped;
+    }
+}
+
 struct EmitState<'ctx, 'module> {
     prepared_render: bool,
     aggregate: Option<aggregate_transfer::AggregateEmitter<'ctx, 'module>>,
@@ -132,7 +181,7 @@ struct EmitState<'ctx, 'module> {
     runtime_array_results: &'ctx BTreeMap<String, RuntimeArrayResultProvenance>,
     dynamic_owner_outputs: &'ctx BTreeMap<String, BTreeSet<usize>>,
     values: BTreeMap<String, EmitValue<'ctx>>,
-    storage: BTreeMap<String, (PointerValue<'ctx>, ScalarType)>,
+    storage: StorageBindings<'ctx>,
     contextual_storage: BTreeMap<std::rc::Rc<crate::scalar::ReferenceBindingId>, (PointerValue<'ctx>, ScalarType)>,
     contextual_installs: Vec<std::rc::Rc<crate::scalar::ReferenceBindingId>>,
     return_bindings: BTreeMap<String, ScalarExpression>,
@@ -341,27 +390,160 @@ fn emit_scalar_llvm_with_metadata(
         &|reservations| prepared.aggregate(reservations),
         &|_, _, function| Some(&function.reference_cfg),
         metadata,
+        &[],
     )
 }
 
 pub fn emit_scalar_build_single_module_llvm(
     validation: &ScalarBuildValidation<'_>,
 ) -> Result<LlvmPartition, String> {
-    emit_scalar_build_single_module_with_metadata(validation, PartitionMetadata::Full)
+    emit_scalar_build_single_module_with_metadata(validation, PartitionMetadata::Full, &[])
 }
 
 pub fn emit_scalar_build_single_module_llvm_text(
     validation: &ScalarBuildValidation<'_>,
 ) -> Result<String, String> {
-    Ok(
-        emit_scalar_build_single_module_with_metadata(validation, PartitionMetadata::ExternsOnly)?
-            .into_text(),
-    )
+    Ok(emit_scalar_build_single_module_artifact_llvm(validation)?.into_text())
+}
+
+pub fn emit_scalar_build_single_module_artifact_llvm(
+    validation: &ScalarBuildValidation<'_>,
+) -> Result<LlvmPartition, String> {
+    emit_scalar_build_single_module_with_metadata(validation, PartitionMetadata::ExternsOnly, &[])
+}
+
+struct WasmRootExport<'a> {
+    label: &'a str,
+    symbol: String,
+    signature: &'a ScalarType,
+}
+
+pub fn emit_scalar_build_wasm_root_exports_llvm_text(
+    validation: &ScalarBuildValidation<'_>,
+    root: &wosy_syntax::SourceIdentity,
+    requested: &BTreeMap<String, String>,
+) -> Result<String, String> {
+    Ok(emit_scalar_build_wasm_root_exports_artifact_llvm(validation, root, requested)?.into_text())
+}
+
+pub fn emit_scalar_build_wasm_root_exports_artifact_llvm(
+    validation: &ScalarBuildValidation<'_>,
+    root: &wosy_syntax::SourceIdentity,
+    requested: &BTreeMap<String, String>,
+) -> Result<LlvmPartition, String> {
+    let modules = &validation.prepared().project().modules;
+    let singleton = modules.len() == 1;
+    let root_module = modules.iter().find(|module| &module.source == root)
+        .ok_or_else(|| format!("missing selected Wasm export root {}", root.path))?;
+    if root_module.target_layout != ScalarTargetLayout::WASM32 {
+        return Err("Wasm root exports require a Wasm artifact".into());
+    }
+    let direct = |ty: &ScalarType| matches!(
+        ty, ScalarType::I32 | ScalarType::U32 | ScalarType::I64 | ScalarType::U64
+            | ScalarType::F32 | ScalarType::F64
+    );
+    let mut root_functions = requested
+        .values()
+        .map(|name| (name.as_str(), None))
+        .collect::<BTreeMap<_, _>>();
+    for item in &root_module.items {
+        if let ScalarItem::Function(function) = item {
+            if let Some(entry) = root_functions.get_mut(function.name.as_str()) {
+                match entry {
+                    Some((_, ambiguous)) => *ambiguous = true,
+                    None => *entry = Some((function, false)),
+                }
+            }
+        }
+    }
+    let mut exports = Vec::with_capacity(requested.len());
+    for (label, authored) in requested {
+        let mut bytes = label.bytes();
+        if !bytes.next().is_some_and(|c| c.is_ascii_alphabetic() || c == b'_')
+            || !bytes.all(|c| c.is_ascii_alphanumeric() || c == b'_')
+            || matches!(label.as_str(), "main" | "_start" | "memory")
+            || label.starts_with("__") || label.starts_with("wosy_")
+        {
+            return Err(format!("invalid or reserved Wasm root export label {label:?}"));
+        }
+        let (function, ambiguous) = root_functions[authored.as_str()].ok_or_else(|| {
+            format!("Wasm root export {label:?} names no root function {authored:?}")
+        })?;
+        if ambiguous || !function.generic_parameters.is_empty()
+            || !function.overload_arms.is_empty()
+        {
+            return Err(format!("Wasm root export {label:?} needs an unambiguous concrete declaration"));
+        }
+        let ScalarType::Callable { outputs, parameters } = &function.signature else {
+            return Err(format!("Wasm root export {label:?} is not callable"));
+        };
+        if !parameters.iter().all(direct) || !match outputs.outputs.as_slice() {
+            [] => true,
+            [output] => output.ty == ScalarType::Unit || direct(&output.ty),
+            _ => false,
+        } {
+            return Err(format!("Wasm root export {label:?} needs only direct scalar ABI values"));
+        }
+        exports.push(WasmRootExport {
+            label,
+            symbol: if singleton { authored.clone() } else { project_function_name(root, authored) },
+            signature: &function.signature,
+        });
+    }
+    if singleton {
+        emit_scalar_build_single_module_with_metadata(validation, PartitionMetadata::ExternsOnly, &exports)
+    } else {
+        emit_scalar_build_project_with_policy(
+            validation, EmissionPolicy::Prepared, PartitionMetadata::ExternsOnly, &exports,
+        )
+    }
+}
+
+fn emit_wasm_root_export_wrappers<'ctx>(
+    context: &'ctx Context,
+    module: &Module<'ctx>,
+    functions: &BTreeMap<String, FunctionValue<'ctx>>,
+    exports: &[WasmRootExport<'_>],
+) -> Result<(), String> {
+    for export in exports {
+        let implementation = functions.get(&export.symbol).copied().ok_or_else(|| {
+            format!("missing emitted implementation of Wasm root export {:?}", export.label)
+        })?;
+        let expected = function_type(context, export.signature, ScalarTargetLayout::WASM32)?;
+        if implementation.get_type() != expected || implementation.get_call_conventions() != 0 {
+            return Err(format!("Wasm root export {:?} has a non-direct ABI", export.label));
+        }
+        if module.get_global(export.label).is_some()
+            || (export.label != export.symbol && module.get_function(export.label).is_some())
+        {
+            return Err(format!("Wasm root export {:?} collides with an emitted symbol", export.label));
+        }
+    }
+    if exports.is_empty() {
+        return Ok(());
+    }
+    let builder = context.create_builder();
+    for export in exports {
+        if export.label == export.symbol {
+            continue;
+        }
+        let implementation = functions[&export.symbol];
+        let wrapper = module.add_function(export.label, implementation.get_type(), Some(Linkage::External));
+        builder.position_at_end(context.append_basic_block(wrapper, "entry"));
+        let arguments = wrapper.get_param_iter().map(Into::into).collect::<Vec<BasicMetadataValueEnum<'ctx>>>();
+        let call = builder.build_call(implementation, &arguments, "root_export_call")
+            .map_err(builder_error)?;
+        let result = call.try_as_basic_value().basic();
+        builder.build_return(result.as_ref().map(|v| v as &dyn inkwell::values::BasicValue))
+            .map_err(builder_error)?;
+    }
+    Ok(())
 }
 
 fn emit_scalar_build_single_module_with_metadata(
     validation: &ScalarBuildValidation<'_>,
     metadata: PartitionMetadata,
+    exports: &[WasmRootExport<'_>],
 ) -> Result<LlvmPartition, String> {
     if !validation.diagnostics().is_empty() {
         return Err("cannot emit LLVM for an invalid scalar program".into());
@@ -391,6 +573,7 @@ fn emit_scalar_build_single_module_with_metadata(
         &|reservations| validation.aggregate(reservations),
         &|item, arm, _| validation.reference_cfg(0, item, arm),
         metadata,
+        exports,
     )
 }
 
@@ -409,6 +592,7 @@ fn emit_single_module_llvm<'a>(
         &'a ScalarFunction,
     ) -> Option<&'a ScalarReferenceCfg>,
     metadata: PartitionMetadata,
+    exports: &[WasmRootExport<'_>],
 ) -> Result<LlvmPartition, String> {
     let prepared_render = generic_input.prepared_render();
     let initializer_nodes = Some(initialization_region.bind_call_nodes(items)?);
@@ -691,6 +875,9 @@ fn emit_single_module_llvm<'a>(
         &layouts,
         target_layout,
     )?;
+    if !exports.is_empty() {
+        emit_wasm_root_export_wrappers(&context, &module, &functions, exports)?;
+    }
     finish_partition(
         ManuallyDrop::into_inner(module),
         source.path.clone(),
@@ -714,6 +901,7 @@ pub fn emit_scalar_project_llvm(
         &build,
         EmissionPolicy::RawCompatibility,
         PartitionMetadata::Full,
+        &[],
     )
 }
 
@@ -724,24 +912,32 @@ pub fn emit_scalar_build_project_llvm(
         validation,
         EmissionPolicy::Prepared,
         PartitionMetadata::Full,
+        &[],
     )
 }
 
 pub fn emit_scalar_build_project_llvm_text(
     validation: &ScalarBuildValidation<'_>,
 ) -> Result<String, String> {
-    Ok(emit_scalar_build_project_with_policy(
+    Ok(emit_scalar_build_project_artifact_llvm(validation)?.into_text())
+}
+
+pub fn emit_scalar_build_project_artifact_llvm(
+    validation: &ScalarBuildValidation<'_>,
+) -> Result<LlvmPartition, String> {
+    emit_scalar_build_project_with_policy(
         validation,
         EmissionPolicy::Prepared,
         PartitionMetadata::ExternsOnly,
-    )?
-    .into_text())
+        &[],
+    )
 }
 
 fn emit_scalar_build_project_with_policy(
     validation: &ScalarBuildValidation<'_>,
     policy: EmissionPolicy,
     metadata: PartitionMetadata,
+    exports: &[WasmRootExport<'_>],
 ) -> Result<LlvmPartition, String> {
     if !validation.diagnostics().is_empty() {
         return Err("cannot emit LLVM for an invalid scalar project".into());
@@ -761,6 +957,7 @@ fn emit_scalar_build_project_with_policy(
             EmissionPolicy::Prepared => Some(validation),
         },
         metadata,
+        exports,
     )
 }
 
@@ -777,6 +974,7 @@ fn emit_project_llvm<'a>(
     ) -> Option<&'a ScalarReferenceCfg>,
     project_build: Option<&'a ScalarBuildValidation<'a>>,
     metadata: PartitionMetadata,
+    exports: &[WasmRootExport<'_>],
 ) -> Result<LlvmPartition, String> {
     let mut module_ordinals = HashMap::with_capacity(project.modules.len());
     for (ordinal, module) in project.modules.iter().enumerate() {
@@ -792,7 +990,6 @@ fn emit_project_llvm<'a>(
                 .ok_or_else(|| format!("missing module {}", source.path))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    drop(module_ordinals);
     let modules = ordered_modules
         .iter()
         .map(|&(_, module)| module)
@@ -976,6 +1173,14 @@ fn emit_project_llvm<'a>(
         for specialization in rows.values() {
             reservations.bodies.insert((ordinal, specialization.item_ordinal, specialization.arm_index), matches!(specialization.function, Cow::Borrowed(_)));
         }
+    }
+    let snapshot_struct = |id: &crate::scalar::ScalarStructId| {
+        let &module = module_ordinals.get(&id.source)?;
+        let definition = project.modules.get(module)?.structs.get(id.index)?;
+        (&definition.id == id && layouts.aggregate(id).is_some()).then_some(definition)
+    };
+    if prepared_render && reservations.modules.len() > 1 {
+        reservations.snapshot_struct = Some(&snapshot_struct);
     }
     let aggregates = close_aggregates(&reservations)?;
     for declaration in declarations {
@@ -1215,6 +1420,9 @@ fn emit_project_llvm<'a>(
         &layouts,
         target_layout,
     )?;
+    if !exports.is_empty() {
+        emit_wasm_root_export_wrappers(&context, &module, &functions, exports)?;
+    }
     finish_partition(
         ManuallyDrop::into_inner(module),
         module_name,
@@ -1243,6 +1451,13 @@ impl LlvmPartition {
     }
 
     pub fn to_text(&self) -> String {
+        let mut bytes = Vec::with_capacity(self.text.len());
+        self.write_text(&mut bytes)
+            .expect("writing to a Vec cannot fail");
+        String::from_utf8(bytes).expect("LLVM partition text is UTF-8")
+    }
+
+    pub fn write_text(&self, output: &mut impl std::io::Write) -> std::io::Result<()> {
         if !self.declarations.is_empty() {
             let mut declarations = self
                 .declarations
@@ -1251,7 +1466,6 @@ impl LlvmPartition {
                 .collect::<HashMap<_, _>>();
             let simple_names = declarations.keys().all(|name| !name.contains('('));
             let mut excluded = Vec::with_capacity(declarations.len());
-            let mut excluded_bytes = 0;
             for (index, line) in self.text.lines().enumerate() {
                 let mut matched = false;
                 if let Some((_, after_at)) = line
@@ -1277,39 +1491,32 @@ impl LlvmPartition {
                 }
                 if index >= 2 && matched {
                     excluded.push(index);
-                    excluded_bytes += line.len();
                 }
             }
-            let mut serialized = String::new();
             let mut lines = self.text.lines();
             if let Some(first) = lines.next() {
-                serialized.push_str(first);
+                output.write_all(first.as_bytes())?;
             }
             if let Some(second) = lines.next() {
-                serialized.push('\n');
-                serialized.push_str(second);
+                output.write_all(b"\n")?;
+                output.write_all(second.as_bytes())?;
             }
-            serialized.push_str("\n\n");
+            output.write_all(b"\n\n")?;
             for declaration in &self.declarations {
                 let line = declarations[declaration.name.as_str()]
                     .expect("LLVM extern declaration is present in module text");
-                serialized.push_str(line);
-                write!(serialized, " #{}", declaration.attributes[0].group,)
-                    .expect("writing to a String cannot fail");
-                serialized.push('\n');
+                writeln!(output, "{line} #{}", declaration.attributes[0].group)?;
             }
-            serialized.push('\n');
+            output.write_all(b"\n")?;
             for attributes in declaration_attributes(&self.declarations) {
                 writeln!(
-                    serialized,
+                    output,
                     "attributes #{} = {{ \"wasm-import-module\"=\"{}\" \"wasm-import-name\"=\"{}\" }}",
                     attributes.group,
                     LlvmQuotedAttribute(&attributes.wasm_import_module),
                     LlvmQuotedAttribute(&attributes.wasm_import_name)
-                )
-                .expect("writing to a String cannot fail");
+                )?;
             }
-            serialized.reserve_exact(self.text.len() - excluded_bytes);
             let mut excluded = excluded.into_iter().peekable();
             let mut first = true;
             for (index, line) in lines.enumerate() {
@@ -1318,32 +1525,36 @@ impl LlvmPartition {
                     continue;
                 }
                 if !std::mem::replace(&mut first, false) {
-                    serialized.push('\n');
+                    output.write_all(b"\n")?;
                 }
-                serialized.push_str(line);
+                output.write_all(line.as_bytes())?;
             }
-            serialized
         } else {
             let excluded = extra_source_filename_blank(&self.text);
-            if excluded.is_none() && !self.text.contains("\r\n") {
-                return self.text.clone();
+            if !self.text.contains("\r\n") {
+                if let Some(index) = excluded {
+                    let offset = self.text.match_indices('\n').nth(index)
+                        .expect("blank LLVM header line has a newline").0;
+                    output.write_all(&self.text.as_bytes()[..offset])?;
+                    return output.write_all(&self.text.as_bytes()[offset + 1..]);
+                }
+                return output.write_all(self.text.as_bytes());
             }
-            let mut serialized = String::with_capacity(self.text.len());
             let mut first = true;
             for (index, line) in self.text.lines().enumerate() {
                 if excluded == Some(index) {
                     continue;
                 }
                 if !std::mem::replace(&mut first, false) {
-                    serialized.push('\n');
+                    output.write_all(b"\n")?;
                 }
-                serialized.push_str(line);
+                output.write_all(line.as_bytes())?;
             }
             if self.text.ends_with('\n') {
-                serialized.push('\n');
+                output.write_all(b"\n")?;
             }
-            serialized
         }
+        Ok(())
     }
 }
 
@@ -2063,7 +2274,7 @@ fn emit_function<'ctx, 'module>(
         runtime_array_results,
         dynamic_owner_outputs,
         values: BTreeMap::new(),
-        storage: BTreeMap::new(),
+        storage: StorageBindings::default(),
         contextual_storage: BTreeMap::new(),
         contextual_installs: Vec::new(),
         return_bindings: return_bindings(&function.body),
@@ -2242,7 +2453,7 @@ fn emit_main<'ctx, 'module>(
         runtime_array_results,
         dynamic_owner_outputs,
         values: BTreeMap::new(),
-        storage: BTreeMap::new(),
+        storage: StorageBindings::default(),
         contextual_storage: BTreeMap::new(),
         contextual_installs: Vec::new(),
         return_bindings: BTreeMap::new(),
@@ -2384,7 +2595,7 @@ fn emit_project_function<'ctx, 'module>(
         runtime_array_results,
         dynamic_owner_outputs,
         values: BTreeMap::new(),
-        storage: BTreeMap::new(),
+        storage: StorageBindings::default(),
         contextual_storage: BTreeMap::new(),
         contextual_installs: Vec::new(),
         return_bindings: return_bindings(&function.body),
@@ -2602,7 +2813,7 @@ fn emit_project_main<'ctx, 'module>(
         runtime_array_results,
         dynamic_owner_outputs,
         values: BTreeMap::new(),
-        storage: BTreeMap::new(),
+        storage: StorageBindings::default(),
         contextual_storage: BTreeMap::new(),
         contextual_installs: Vec::new(),
         return_bindings: BTreeMap::new(),
@@ -2764,6 +2975,7 @@ fn initialize_project_module<'ctx, 'module>(
                     })?;
                     continue;
                 }
+                aggregate_transfer::prepare_ordinary_initializer_binding(state, binding, &module.source)?;
                 let value = emit_project_binding_value(context, state, binding, module, modules)?;
                 for (position, (name, ty)) in binding_receivers(binding).iter().enumerate() {
                     if *ty == ScalarType::Unit {
@@ -2805,8 +3017,8 @@ fn initialize_project_module<'ctx, 'module>(
     state.unit_values = current_unit_values;
     state.values = values;
     let mut retained_storage = storage;
-    retained_storage.extend(
-        std::mem::take(&mut state.storage)
+    retained_storage.entries.extend(
+        std::mem::take(&mut state.storage.entries)
             .into_iter()
             .map(|(name, storage)| (project_runtime_array_name(&module.source, &name), storage)),
     );
@@ -2949,7 +3161,7 @@ fn emit_block_at<'ctx, 'module>(
     block: &ScalarBlock,
     emission: BlockEmission<'_>,
 ) -> Result<EmitValue<'ctx>, String> {
-    let storage = state.storage.clone();
+    let storage_scope = state.storage.enter_scope();
     let contextual_depth = state.contextual_installs.len();
     let values = state.values.clone();
     let runtime_array_owners = state.runtime_array_owners.clone();
@@ -2981,7 +3193,7 @@ fn emit_block_at<'ctx, 'module>(
         aggregate_transfer::release_failure_allocation(context, state, block)?;
         aggregate_transfer::publish_checked_backing_arm(state, block)?;
     }
-    state.storage = storage;
+    state.storage.leave_scope(storage_scope);
     for id in state.contextual_installs.drain(contextual_depth..) {
         state.contextual_storage.remove(id.as_ref());
     }
@@ -3026,7 +3238,7 @@ fn emit_project_block_at<'ctx, 'module>(
     modules: &[&ScalarModule],
     emission: BlockEmission<'_>,
 ) -> Result<EmitValue<'ctx>, String> {
-    let storage = state.storage.clone();
+    let storage_scope = state.storage.enter_scope();
     let contextual_depth = state.contextual_installs.len();
     let values = state.values.clone();
     let runtime_array_owners = state.runtime_array_owners.clone();
@@ -3069,7 +3281,7 @@ fn emit_project_block_at<'ctx, 'module>(
         aggregate_transfer::release_failure_allocation(context, state, block)?;
         aggregate_transfer::publish_checked_backing_arm(state, block)?;
     }
-    state.storage = storage;
+    state.storage.leave_scope(storage_scope);
     for id in state.contextual_installs.drain(contextual_depth..) {
         state.contextual_storage.remove(id.as_ref());
     }
@@ -3136,7 +3348,15 @@ fn emit_final_outputs<'ctx, 'module>(
             return Ok(value);
         }
         let ty = emission.expected_numeric().unwrap_or(&output.ty);
-        let value = emit_typed_expression(context, state, expression, ty)?;
+        let snapshot = if matches!(expression, ScalarExpression::IndexedRead { .. }) {
+            aggregate_transfer::emit_checked_ordinary_snapshot(context, state, expression, None)?
+        } else {
+            None
+        };
+        let value = match snapshot {
+            Some(value) => value,
+            None => emit_typed_expression(context, state, expression, ty)?,
+        };
         if !state
             .branch_return_outputs
             .contains_key(&(block.span.start, block.span.end))
@@ -3238,8 +3458,12 @@ fn emit_project_final_outputs<'ctx, 'module>(
             return Ok(value);
         }
         let ty = emission.expected_numeric().unwrap_or(&output.ty);
-        let value =
-            emit_project_typed_expression(context, state, expression, ty, module, modules)?;
+        let value = match aggregate_transfer::emit_checked_ordinary_snapshot(
+            context, state, expression, Some(ProjectCallScope { module, modules }),
+        )? {
+            Some(value) => value,
+            None => emit_project_typed_expression(context, state, expression, ty, module, modules)?,
+        };
         if !state
             .branch_return_outputs
             .contains_key(&(block.span.start, block.span.end))

@@ -103,6 +103,8 @@ pub enum SyntaxKind {
     IndexFieldSuffix = 90,
     DirectFieldChainTail = 91,
     ContextualPlace = 92,
+    ValueField = 93,
+    InvalidTemporaryPlace = 94,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -205,6 +207,8 @@ impl Language for WosyLanguage {
             90 => SyntaxKind::IndexFieldSuffix,
             91 => SyntaxKind::DirectFieldChainTail,
             92 => SyntaxKind::ContextualPlace,
+            93 => SyntaxKind::ValueField,
+            94 => SyntaxKind::InvalidTemporaryPlace,
             _ => panic!("invalid syntax kind: {}", raw.0),
         }
     }
@@ -270,15 +274,32 @@ struct SerializableCstSnapshot<'a>(&'a CanonicalCstRoot);
 impl Serialize for SerializableCstSnapshot<'_> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let text = self.0.root.text().to_string();
-        let root = SerializableCstNode {
-            node: &self.0.root,
-            text: &text,
-            offset: self.0.root.text_range().start().into(),
-        };
-        let mut snapshot = serializer.serialize_struct("CanonicalCstSnapshot", 2)?;
-        snapshot.serialize_field("source", &self.0.source)?;
-        snapshot.serialize_field("root", &root)?;
-        snapshot.end()
+        serialize_cst_snapshot(self.0, &text, serializer)
+    }
+}
+
+fn serialize_cst_snapshot<S: Serializer>(
+    tree: &CanonicalCstRoot,
+    text: &str,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    let root = SerializableCstNode {
+        node: &tree.root,
+        text,
+        offset: tree.root.text_range().start().into(),
+    };
+    let mut snapshot = serializer.serialize_struct("CanonicalCstSnapshot", 2)?;
+    snapshot.serialize_field("source", &tree.source)?;
+    snapshot.serialize_field("root", &root)?;
+    snapshot.end()
+}
+
+struct SerializableParsedCstSnapshot<'a>(&'a FreshParseResult);
+
+impl Serialize for SerializableParsedCstSnapshot<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let result = self.0.result();
+        serialize_cst_snapshot(result.canonical_cst(), &result.text, serializer)
     }
 }
 
@@ -455,6 +476,30 @@ impl ParseResult {
     }
 }
 
+pub struct FreshParseResult(ParseResult);
+
+impl FreshParseResult {
+    pub fn result(&self) -> &ParseResult {
+        &self.0
+    }
+
+    pub fn into_result(self) -> ParseResult {
+        self.0
+    }
+
+    pub fn snapshot_json_serializable(&self) -> impl Serialize + '_ {
+        SerializableParsedCstSnapshot(self)
+    }
+}
+
+pub fn parse_with_snapshot(
+    source: SourceIdentity,
+    text: String,
+    configured_comments: &[String],
+) -> FreshParseResult {
+    FreshParseResult(parse(source, text, configured_comments))
+}
+
 pub fn parse(source: SourceIdentity, text: String, configured_comments: &[String]) -> ParseResult {
     parse_entry(source, text, configured_comments, Rule::source)
 }
@@ -566,6 +611,32 @@ fn build_pair(
         );
         return;
     }
+    if pair.as_rule() == Rule::conditional_block_entry {
+        build_conditional_block_entry(builder, pair, text, comments, errors);
+        return;
+    }
+    if pair.as_rule() == Rule::dereferenced_field
+        && !pair.clone().into_inner().next().is_some_and(is_dereference_primary)
+    {
+        builder.start_node(WosyLanguage::kind_to_raw(SyntaxKind::InvalidTemporaryPlace));
+        add_gap(builder, span.as_str(), span.start(), comments);
+        builder.finish_node();
+        errors.push(SyntaxError {
+            span: ByteSpan::new(span.start() as u32, span.end() as u32),
+            message: "a field of a temporary is not an assignable or borrowable place".to_owned(),
+        });
+        return;
+    }
+    if pair.as_rule() == Rule::call_primary {
+        let mut children = pair.into_inner();
+        let call = children.next().expect("call primary head");
+        if let Some(field) = children.next() {
+            build_value_field(builder, call, field, None, text, comments, errors);
+        } else {
+            build_pair(builder, call, text, comments, errors);
+        }
+        return;
+    }
     if pair.as_rule() == Rule::parenthesized_primary {
         build_parenthesized_primary(builder, pair, text, comments, errors);
         return;
@@ -628,6 +699,49 @@ fn build_pair(
     builder.finish_node();
 }
 
+fn build_conditional_block_entry(
+    builder: &mut GreenNodeBuilder<'_>,
+    pair: Pair<'_, Rule>,
+    text: &str,
+    comments: &[TypedComment],
+    errors: &mut Vec<SyntaxError>,
+) {
+    let span = pair.as_span();
+    let mut children = pair.into_inner();
+    let condition = children.next().expect("leading block conditional");
+    let condition_end = condition.as_span().end();
+    let ending = children
+        .find(|child| {
+            matches!(
+                child.as_rule(),
+                Rule::conditional_terminated | Rule::conditional_tail | Rule::conditional_unterminated
+            )
+        })
+        .expect("block conditional ending");
+    let tail = ending.as_rule() == Rule::conditional_tail;
+    builder.start_node(WosyLanguage::kind_to_raw(if tail {
+        SyntaxKind::FinalOutputList
+    } else {
+        SyntaxKind::BlockItem
+    }));
+    if tail {
+        builder.start_node(WosyLanguage::kind_to_raw(SyntaxKind::OutputList));
+    }
+    builder.start_node(WosyLanguage::kind_to_raw(SyntaxKind::Expression));
+    build_pair(builder, condition, text, comments, errors);
+    if ending.as_rule() == Rule::conditional_unterminated {
+        add_gap(builder, &text[condition_end..span.end()], condition_end, comments);
+    }
+    builder.finish_node();
+    if tail || ending.as_rule() == Rule::conditional_terminated {
+        add_gap(builder, &text[condition_end..span.end()], condition_end, comments);
+    }
+    if tail {
+        builder.finish_node();
+    }
+    builder.finish_node();
+}
+
 fn build_parenthesized_primary(
     builder: &mut GreenNodeBuilder<'_>,
     pair: Pair<'_, Rule>,
@@ -644,6 +758,10 @@ fn build_parenthesized_primary(
     let mut suffix = suffix.into_inner();
     let field = suffix.next().expect("parenthesized field suffix");
     let indices = suffix.next();
+    if !is_dereference_primary(head.clone()) {
+        build_value_field(builder, head, field, indices, text, comments, errors);
+        return;
+    }
     let outer = if indices.is_some() {
         SyntaxKind::IndexedPlace
     } else {
@@ -654,6 +772,43 @@ fn build_parenthesized_primary(
     build_pair(builder, head, text, comments, errors);
     build_pair(builder, field, text, comments, errors);
     builder.finish_node();
+    if let Some(indices) = indices {
+        build_pair(builder, indices, text, comments, errors);
+    }
+    builder.finish_node();
+}
+
+fn is_dereference_primary(mut pair: Pair<'_, Rule>) -> bool {
+    loop {
+        match pair.as_rule() {
+            Rule::dereference => return true,
+            Rule::parenthesized | Rule::parenthesized_primary | Rule::expression | Rule::primary
+            | Rule::logical_or | Rule::logical_and | Rule::bit_or | Rule::bit_xor | Rule::bit_and
+            | Rule::comparison | Rule::shift | Rule::additive | Rule::multiplicative
+            | Rule::unary => {}
+            _ => return false,
+        }
+        let mut children = pair.into_inner();
+        let Some(child) = children.next() else { return false };
+        if children.next().is_some() {
+            return false;
+        }
+        pair = child;
+    }
+}
+
+fn build_value_field(
+    builder: &mut GreenNodeBuilder<'_>,
+    receiver: Pair<'_, Rule>,
+    field: Pair<'_, Rule>,
+    indices: Option<Pair<'_, Rule>>,
+    text: &str,
+    comments: &[TypedComment],
+    errors: &mut Vec<SyntaxError>,
+) {
+    builder.start_node(WosyLanguage::kind_to_raw(SyntaxKind::ValueField));
+    build_pair(builder, receiver, text, comments, errors);
+    build_pair(builder, field, text, comments, errors);
     if let Some(indices) = indices {
         build_pair(builder, indices, text, comments, errors);
     }
@@ -821,7 +976,6 @@ fn kind(rule: Rule) -> SyntaxKind {
         Rule::block => SyntaxKind::Block,
         Rule::block_item => SyntaxKind::BlockItem,
         Rule::unsafe_block_item => SyntaxKind::Expression,
-        Rule::if_block_item => SyntaxKind::Expression,
         Rule::final_output_list => SyntaxKind::FinalOutputList,
         Rule::expression => SyntaxKind::Expression,
         Rule::call => SyntaxKind::Call,
@@ -905,9 +1059,14 @@ mod tests {
             ("%%start\r\nstr label = \"Olá\\t日本語\";\r\n%%end", true),
             ("%%start\nsomething ?????;\ni32 value = 4;\n%%end", false),
         ] {
-            let result = parse(identity(), text.into(), &[]);
+            let fresh = parse_with_snapshot(identity(), text.into(), &[]);
+            let result = fresh.result();
             assert_eq!(result.is_valid(), valid, "{:?}", result.errors);
             let root = result.canonical_cst();
+            assert_eq!(
+                serde_json::to_vec_pretty(&fresh.snapshot_json_serializable()).unwrap(),
+                serde_json::to_vec_pretty(&root.snapshot()).unwrap(),
+            );
             let tail = root
                 .root
                 .descendants()
@@ -2061,6 +2220,74 @@ mod tests {
     }
 
     #[test]
+    fn value_field_reads_keep_call_and_place_shapes() {
+        let text = "%%start\nmake(2);\nmake(42).value;\n(make(42)).value;\nitem.value;\n(*ptr).value;\n%%end";
+        let parsed = parse(identity(), text.into(), &[]);
+        assert!(parsed.is_valid(), "{:?}", parsed.errors);
+        assert_eq!(parsed.reconstruct(), text);
+        let nodes = parsed.root.descendants().filter(|node| node.kind() == SyntaxKind::ValueField)
+            .collect::<Vec<_>>();
+        assert_eq!(nodes.len(), 2);
+        for (node, receiver) in nodes.iter().zip([SyntaxKind::Call, SyntaxKind::Parenthesized]) {
+            assert_eq!(node.children().next().unwrap().kind(), receiver);
+            assert!(node.children_with_tokens().any(|element|
+                element.kind() == SyntaxKind::Identifier && element.to_string() == "value"));
+        }
+        for (kind, spelling) in [
+            (SyntaxKind::Call, "make(2)"),
+            (SyntaxKind::QualifiedMember, "item.value"),
+            (SyntaxKind::DereferencedField, "(*ptr).value"),
+        ] {
+            assert!(parsed.root.descendants().any(|node| node.kind() == kind && node.text() == spelling));
+        }
+    }
+
+    #[test]
+    fn value_field_reads_keep_exact_trivia_and_receiver_boundaries() {
+        let direct = "make (42) # note: direct\n . value";
+        let grouped = "(make(42)) # note: grouped\r\n .value # note: index\n [1]";
+        let arithmetic = "(*ptr + 1).field";
+        let text = format!("%%start\n{direct};\n{grouped};\n{arithmetic};\n%%end");
+        let parsed = parse(identity(), text.clone(), &["note".to_owned()]);
+        assert!(parsed.is_valid(), "{:?}", parsed.errors);
+        assert_eq!(parsed.reconstruct(), text);
+        for (spelling, receiver, comment_count) in [
+            (direct, "make (42)", 1),
+            (grouped, "(make(42))", 2),
+            (arithmetic, "(*ptr + 1)", 0),
+        ] {
+            let start = text.find(spelling).unwrap() as u32;
+            let projection = parsed.root.descendants().find(|node| {
+                node.kind() == SyntaxKind::ValueField
+                    && byte_span(node) == ByteSpan::new(start, start + spelling.len() as u32)
+            }).expect("lossless projection");
+            let head = projection.children().next().expect("value receiver");
+            assert_eq!(byte_span(&head), ByteSpan::new(start, start + receiver.len() as u32));
+            assert_eq!(projection.descendants_with_tokens().filter(|element|
+                element.kind() == SyntaxKind::TypedComment).count(), comment_count);
+            assert!(!projection.descendants().any(|node| node.kind() == SyntaxKind::DereferencedField));
+        }
+    }
+
+    #[test]
+    fn value_field_temporaries_do_not_parse_as_places() {
+        for statement in [
+            "(make(42)).value = 5;",
+            "(make(42)).value[1] = 5;",
+            "&(make(42)).value;",
+            "&!(make(42)).value;",
+            "&?(make(42)).value[1];",
+            "(*ptr + 1).field = 5;",
+        ] {
+            let text = format!("%%start\n{statement}\n%%end");
+            let parsed = parse(identity(), text.clone(), &[]);
+            assert_eq!(parsed.errors.len(), 1, "{statement}: {:?}", parsed.errors);
+            assert_eq!(parsed.reconstruct(), text);
+            assert!(!parsed.root.descendants().any(|node| node.kind() == SyntaxKind::ValueField));
+        }
+    }
+
+    #[test]
     fn parenthesized_primaries_keep_field_index_and_trivia_boundaries() {
         let text = "%%start\n(*base) # note: outer\n + 1;\n(*base) # note: field\n . member # note: index\n [1] [2];\n(*base).member # note: trailing\n ;\n(*base).member[1] = 2;\n&!(*base).member[1];\n%%end";
         let parsed = parse(identity(), text.into(), &["note".to_owned()]);
@@ -2375,6 +2602,125 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["input", "input + 1"]
         );
+    }
+
+    #[test]
+    fn direct_block_conditionals_keep_wrappers_and_delimiter_trivia() {
+        let text = "%%start\nunit() f = fn {\n\tif (true) { 1; } # doc: statement\n\tif (false) { 2; }  ;\n\tif (true) { if (false) { 3 } else { 4 } } else { 5 } # doc: tail\n};\n%%end";
+        let result = parse(identity(), text.into(), &["doc".into()]);
+        assert!(result.is_valid(), "{:?}", result.errors);
+        assert_eq!(result.reconstruct(), text);
+        let block = result
+            .root
+            .descendants()
+            .find(|node| node.kind() == SyntaxKind::Block)
+            .unwrap();
+        let entries: Vec<_> = block.children().collect();
+        assert_eq!(
+            entries.iter().map(CstNode::kind).collect::<Vec<_>>(),
+            [SyntaxKind::BlockItem, SyntaxKind::BlockItem, SyntaxKind::FinalOutputList]
+        );
+        let expression = |node: &CstNode| node.children().next().unwrap();
+        assert_eq!(expression(&entries[0]).kind(), SyntaxKind::Expression);
+        assert!(
+            expression(&entries[0]).text().to_string().contains("# doc: statement")
+        );
+        assert_eq!(expression(&entries[1]).text().to_string(), "if (false) { 2; }");
+        assert_eq!(entries[1].text().to_string(), "if (false) { 2; }  ;");
+        let outputs = expression(&entries[2]);
+        assert_eq!(outputs.kind(), SyntaxKind::OutputList);
+        assert_eq!(expression(&outputs).kind(), SyntaxKind::Expression);
+        assert_eq!(
+            entries[2].text().to_string(),
+            "if (true) { if (false) { 3 } else { 4 } } else { 5 } # doc: tail\n"
+        );
+        assert_eq!(outputs.text().to_string(), entries[2].text().to_string());
+        assert_eq!(
+            expression(&outputs).text().to_string(),
+            "if (true) { if (false) { 3 } else { 4 } } else { 5 }"
+        );
+        assert_eq!(result.comments.len(), 2);
+    }
+
+    #[test]
+    fn direct_conditional_fallback_and_ordered_multi_output_are_unchanged() {
+        let text = "%%start\ni32(i32) if = fn(input) { input };\n(i32, i32)() f = fn {\n\tif(1);\n\tif(2),\n\tif (true) { 3 } else { 4 }\n};\n%%end";
+        let result = parse(identity(), text.into(), &[]);
+        assert!(result.is_valid(), "{:?}", result.errors);
+        assert_eq!(result.reconstruct(), text);
+        let block = result
+            .root
+            .descendants()
+            .filter(|node| node.kind() == SyntaxKind::FunctionDecl)
+            .nth(1)
+            .unwrap()
+            .children()
+            .find(|node| node.kind() == SyntaxKind::Block)
+            .unwrap();
+        assert_eq!(
+            block.children().map(|entry| entry.kind()).collect::<Vec<_>>(),
+            [SyntaxKind::BlockItem, SyntaxKind::FinalOutputList]
+        );
+        let outputs = block
+            .children()
+            .find(|entry| entry.kind() == SyntaxKind::FinalOutputList)
+            .unwrap()
+            .children()
+            .next()
+            .unwrap();
+        assert_eq!(
+            outputs
+                .children()
+                .map(|node| node.children().next().unwrap().kind())
+                .collect::<Vec<_>>(),
+            [SyntaxKind::Primary, SyntaxKind::IfExpr]
+        );
+        assert!(outputs
+            .descendants()
+            .any(|node| node.kind() == SyntaxKind::Call && node.text() == "if(2)"));
+    }
+
+    #[test]
+    fn nested_direct_conditions_keep_identifier_calls_in_their_tails() {
+        let text = "%%start\ni32(i32) if = fn(input) { input };\ni32() f = fn { if (true) { if (false) { if(2) } else { if(3) } } else { if(4) } };\n%%end";
+        let result = parse(identity(), text.into(), &[]);
+        assert!(result.is_valid(), "{:?}", result.errors);
+        assert_eq!(result.reconstruct(), text);
+        let tail_calls = result
+            .root
+            .descendants()
+            .filter(|node| node.kind() == SyntaxKind::Call)
+            .map(|node| node.text().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(tail_calls, ["if(2)", "if(3)", "if(4)"]);
+    }
+
+    #[test]
+    fn direct_conditional_does_not_widen_malformed_block_recovery() {
+        for text in [
+            "%%start\n(i32, i32)() f = fn { if (true) { 1 } else { 2 }, 3 };\n%%end",
+            "%%start\ni32() f = fn { if (true) { 1 } else { };\n%%end",
+        ] {
+            let result = parse(identity(), text.into(), &[]);
+            assert!(!result.is_valid());
+            assert_eq!(result.reconstruct(), text);
+            assert_eq!(result.errors.len(), 1);
+            assert_eq!(
+                result.errors[0].span,
+                ByteSpan::new(
+                    "%%start\n".len() as u32,
+                    (text.rfind(';').unwrap() + 1) as u32,
+                )
+            );
+            assert_eq!(
+                result.errors[0].message,
+                "source does not match the base grammar"
+            );
+            assert!(!result
+                .root
+                .descendants()
+                .any(|node| node.kind() == SyntaxKind::FunctionDecl));
+        }
     }
 
     #[test]

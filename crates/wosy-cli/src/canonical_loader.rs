@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs;
-use wosy_compiler::{derive_scalar_declarations_from_cst, parse_source, ScalarNamespaceBinding};
+use wosy_compiler::{derive_scalar_declarations_from_cst, parse_source_with_snapshot, ScalarNamespaceBinding};
 use wosy_project::{
     load_reachable_source_graph, ContentRevision, NamespaceEdgeInput, PackageRelativePath,
     ProjectConfiguration, ProjectContext, SourceIdentity as ProjectSourceIdentity, SourceNodeInput,
@@ -9,7 +9,7 @@ use wosy_project::{
 };
 use wosy_syntax::SourceIdentity;
 
-pub(crate) type PersistCst = fn(&std::path::Path, &wosy_compiler::ParseOutput) -> Result<(), String>;
+pub(crate) type PersistCst = fn(&std::path::Path, &wosy_syntax::FreshParseResult) -> Result<(), String>;
 
 pub(crate) struct CanonicalProjectInputs {
     pub(crate) declarations: Vec<(wosy_compiler::ScalarSourceDeclarations, Vec<ScalarNamespaceBinding>)>,
@@ -102,19 +102,22 @@ pub(crate) fn parse_canonical_ordinary_source(
     build_typing: bool,
     persist_in: Option<(&std::path::Path, PersistCst)>,
 ) -> Result<(String, wosy_compiler::ScalarSourceDeclarations), CanonicalLoadFailure> {
-    let output = parse_source(source, text, comment_categories);
-    if !output.diagnostics.is_empty() {
-        return Err(canonical_syntax_failure(output));
+    let (fresh, diagnostics) = parse_source_with_snapshot(source, text, comment_categories);
+    if !diagnostics.is_empty() {
+        return Err(canonical_syntax_failure(wosy_compiler::ParseOutput {
+            result: fresh.into_result(), diagnostics,
+        }));
     }
     if let Some((root, persist_cst)) = persist_in {
-        persist_cst(root, &output)?;
+        persist_cst(root, &fresh)?;
     }
+    let result = fresh.into_result();
     let declarations = if build_typing {
-        wosy_compiler::derive_scalar_build_declarations_from_cst(output.result.canonical_cst())
+        wosy_compiler::derive_scalar_build_declarations_from_cst(result.canonical_cst())
     } else {
-        derive_scalar_declarations_from_cst(output.result.canonical_cst())
+        derive_scalar_declarations_from_cst(result.canonical_cst())
     };
-    Ok((output.result.text, declarations))
+    Ok((result.text, declarations))
 }
 
 #[cfg(feature = "internal-checker")]
@@ -287,22 +290,23 @@ pub(crate) fn load_canonical_project_inputs(
         project.package.as_str(),
         HashSet::from([root_path.clone()]),
     )]);
-    let mut pending = VecDeque::from([(project.package.clone(), root_path)]);
+    let mut pending = VecDeque::from([(project.package.as_str(), root_path)]);
+    let mut root_node = None;
     let mut nodes = Vec::new();
     let mut declarations_by_path = BTreeMap::new();
     let mut texts = BTreeMap::new();
 
     while let Some((package, path)) = pending.pop_front() {
         let (package_root, project_identity) = if package == project.package {
-            (root.to_path_buf(), root_project.clone())
+            (root, root_project.as_str())
         } else {
             let resolved = configuration
                 .resolved_packages
-                .get(&package)
+                .get(package)
                 .ok_or_else(|| format!("dependency package {package} is missing"))?;
             (
-                resolved.project_root.clone(),
-                resolved.identity.project.clone(),
+                resolved.project_root.as_path(),
+                resolved.identity.project.as_str(),
             )
         };
         let source_path = package_root.join(path.as_path());
@@ -318,7 +322,7 @@ pub(crate) fn load_canonical_project_inputs(
         }
         let text = fs::read_to_string(&source_path)
             .map_err(|error| format!("failed to read {}: {error}", source_path.display()))?;
-        let source = canonical_source_identity(project_identity, &package, &path, &text);
+        let source = canonical_source_identity(project_identity.to_owned(), package, &path, &text);
         #[cfg(feature = "internal-checker")]
         let parse_proofs = match &purpose {
             CanonicalLoadPurpose::LocalProofs | CanonicalLoadPurpose::PackageProofs(_) => package == project.package,
@@ -378,7 +382,7 @@ pub(crate) fn load_canonical_project_inputs(
                     .entry(target_package)
                     .or_default()
                     .insert(target_path.clone());
-                pending.push_back((target_package.to_owned(), target_path));
+                pending.push_back((target_package, target_path));
             }
             namespace_edges.push(NamespaceEdgeInput {
                 origin: namespace.package.clone(),
@@ -399,20 +403,22 @@ pub(crate) fn load_canonical_project_inputs(
             source.package.clone(),
             path.clone(),
         );
-        nodes.push(SourceNodeInput {
+        let node = SourceNodeInput {
             source: graph_source.clone(),
             content_revision: ContentRevision(source.revision.clone()),
             namespace_edges,
-        });
+        };
+        if root_node.is_none() {
+            root_node = Some(node);
+        } else {
+            nodes.push(node);
+        }
         declarations_by_path.insert((package, path), declarations);
         texts.insert(graph_source, text);
     }
     drop((discovered, pending));
 
-    let root_node = nodes
-        .first()
-        .cloned()
-        .ok_or_else(|| "project root source is missing".to_owned())?;
+    let root_node = root_node.ok_or_else(|| "project root source is missing".to_owned())?;
     let graph = match load_reachable_source_graph(
         &project.package,
         root_node,
@@ -422,21 +428,16 @@ pub(crate) fn load_canonical_project_inputs(
         Ok(graph) => graph,
         Err(error) => return Err(CanonicalLoadFailure::Graph { error, texts }),
     };
-    let mut project_declarations = Vec::new();
+    let source_identities: Vec<_> = graph.nodes.iter()
+        .map(|node| compiler_source_identity(&node.source, &node.content_revision))
+        .collect();
+    let mut project_declarations = Vec::with_capacity(graph.nodes.len());
     #[cfg(feature = "internal-checker")]
     let mut proofs = BTreeMap::new();
-    let mut source_by_path = BTreeMap::new();
     let mut derivation_diagnostics = Vec::new();
     for node in &graph.nodes {
-        let source = compiler_source_identity(&node.source, &node.content_revision);
-        source_by_path.insert(
-            (node.source.package.clone(), node.source.path.clone()),
-            source,
-        );
-    }
-    for node in &graph.nodes {
         let declarations = declarations_by_path
-            .remove(&(node.source.package.clone(), node.source.path.clone()))
+            .remove(&(node.source.package.as_str(), node.source.path.clone()))
             .ok_or_else(|| {
                 format!(
                     "missing canonical CST for {}",
@@ -447,19 +448,12 @@ pub(crate) fn load_canonical_project_inputs(
         let namespace_bindings = node
             .namespace_edges
             .iter()
-            .map(|edge| {
-                Ok(ScalarNamespaceBinding {
-                    binding: edge.binding.clone(),
-                    target: source_by_path
-                        .get(&(edge.origin.clone(), edge.path.clone()))
-                        .cloned()
-                        .ok_or_else(|| {
-                            format!("missing module {}", edge.path.as_path().display())
-                        })?,
-                    span: wosy_syntax::ByteSpan::new(edge.span.range.start, edge.span.range.end),
-                })
+            .map(|edge| ScalarNamespaceBinding {
+                binding: edge.binding.clone(),
+                target: source_identities[edge.target.0].clone(),
+                span: wosy_syntax::ByteSpan::new(edge.span.range.start, edge.span.range.end),
             })
-            .collect::<Result<Vec<_>, String>>()?;
+            .collect();
         match declarations {
             CanonicalSourceDeclarations::Ordinary(declarations) => project_declarations.push((declarations, namespace_bindings)),
             #[cfg(feature = "internal-checker")]
@@ -474,17 +468,8 @@ pub(crate) fn load_canonical_project_inputs(
     let initialization_order = graph
         .initialization_order
         .iter()
-        .map(|id| {
-            let node = graph
-                .nodes
-                .get(id.0)
-                .ok_or_else(|| format!("missing initialization node {}", id.0))?;
-            source_by_path
-                .get(&(node.source.package.clone(), node.source.path.clone()))
-                .cloned()
-                .ok_or_else(|| format!("missing module {}", node.source.path.as_path().display()))
-        })
-        .collect::<Result<Vec<_>, String>>()?;
+        .map(|id| source_identities[id.0].clone())
+        .collect();
     Ok(CanonicalProjectInputs {
         declarations: project_declarations,
         initialization_order,
