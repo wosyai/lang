@@ -5038,20 +5038,19 @@ fn permits_named_checked_field_borrow(
         && matches!(inner.as_ref(), ScalarType::Struct(_)))
 }
 
-fn named_checked_field_literal_index<'a>(
+fn named_checked_field_index<'a>(
     place: &'a ScalarPlace,
     mode: ScalarReferenceMutability,
     scope: &BTreeMap<String, ScalarType>,
-) -> Option<(&'a ScalarPlace, &'a ScalarExpression, &'a BigInt)> {
+) -> Option<(&'a ScalarPlace, &'a ScalarExpression)> {
     let ScalarPlace::Index { base, index, .. } = place else { return None };
-    let ScalarExpression::Integer { value, .. } = index.as_ref() else { return None };
-    permits_named_checked_field_borrow(base, mode, scope).then_some((base, index, value))
+    permits_named_checked_field_borrow(base, mode, scope).then_some((base, index))
 }
 
-fn checked_projected_literal_element(
+fn checked_projected_element(
     place: &ScalarPlace,
     index: &ScalarExpression,
-    value: &BigInt,
+    index_type: ScalarType,
     base: ScalarType,
     mutability: ScalarReferenceMutability,
     inference: &mut ScalarInferenceBuilder<'_>,
@@ -5060,16 +5059,18 @@ fn checked_projected_literal_element(
     match base {
         ScalarType::Array { element, length, .. }
             if super::reference::aggregate::ordinary_value(&element)
-                && value >= &0.into() && value < &length.into() =>
+                && index_type == ScalarType::U64
+                && match index {
+                    ScalarExpression::Integer { value, .. } => value >= &0.into() && value < &length.into(),
+                    _ => true, // The prepared borrow checker must prove a concrete in-range value.
+                } =>
         {
-            // The exact nonnegative literal fits u64 by the fixed-length bound.
-            inference.record_expression_type(index, &ScalarType::U64, true);
             inference.record_place_type(place, &element);
             ScalarType::CheckedReference { mutability, inner: element }
         }
         ScalarType::Error => ScalarType::Error,
         _ => {
-            diagnose("checked projected borrow requires an in-range literal index into a fixed ordinary scalar array");
+            diagnose("checked projected borrow requires an in-range index into a fixed ordinary scalar array");
             ScalarType::Error
         }
     }
@@ -5092,9 +5093,11 @@ fn checked_address_type(
     overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
-    if let Some((base, index, value)) = named_checked_field_literal_index(place, mutability, scope) {
+    if let Some((base, index)) = named_checked_field_index(place, mutability, scope) {
         let array = checked_dereference_type(base, span, scope, program, diagnostics, false, overloads, inference);
-        return checked_projected_literal_element(place, index, value, array, mutability, inference,
+        let index_type = expression_type_expected(index, &ScalarType::U64, scope,
+            &BTreeSet::new(), &BTreeMap::new(), program, diagnostics, false, overloads, inference);
+        return checked_projected_element(place, index, index_type, array, mutability, inference,
             |message| diagnostics.push(diagnostic(program, "B0003", message, span)));
     }
     if permits_named_checked_field_borrow(place, mutability, scope) {
@@ -5188,10 +5191,12 @@ fn checked_address_type_in_module(
     overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
-    if let Some((base, index, value)) = named_checked_field_literal_index(place, mutability, scope) {
+    if let Some((base, index)) = named_checked_field_index(place, mutability, scope) {
         let array = checked_dereference_type_in_module(base, span, scope, module, modules,
             diagnostics, false, overloads, inference);
-        return checked_projected_literal_element(place, index, value, array, mutability, inference,
+        let index_type = expression_type_in_module_expected(index, Some(&ScalarType::U64), scope,
+            &BTreeSet::new(), &BTreeMap::new(), module, modules, diagnostics, false, overloads, inference);
+        return checked_projected_element(place, index, index_type, array, mutability, inference,
             |message| diagnostics.push(module_diagnostic(module, "B0003", message, span)));
     }
     if permits_named_checked_field_borrow(place, mutability, scope) {

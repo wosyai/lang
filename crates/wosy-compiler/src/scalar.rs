@@ -721,6 +721,7 @@ pub enum ReferenceAnalysisErrorReason {
     NonLexicalFallibleStructInitializer,
     MissingGuardedAllocationProof,
     MissingRequiredDereferenceOrigin,
+    UnprovedCheckedArrayIndex,
     MoveFromArrayElement,
     MovedPlace,
 }
@@ -741,6 +742,7 @@ impl ReferenceAnalysisErrorReason {
             Self::NonLexicalFallibleStructInitializer => "fallible struct initializer requires a literal or a lexical binding of the field type",
             Self::MissingGuardedAllocationProof => "fallible allocation requires one proven null guard for its local binding",
             Self::MissingRequiredDereferenceOrigin => "missing required dereference origin",
+            Self::UnprovedCheckedArrayIndex => "checked projected borrow requires a proved in-range index",
             Self::MoveFromArrayElement => "array elements cannot be moved individually",
             Self::MovedPlace => "read or move of unavailable place",
         }

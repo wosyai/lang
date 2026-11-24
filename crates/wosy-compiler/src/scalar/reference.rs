@@ -919,6 +919,63 @@ impl<'a> ReferenceFlowBuilder<'a> {
         Ok(self.reference_place(place, binding, parent))
     }
 
+    // The original authored expressions still execute and still lower as
+    // written. A cloned proof place captures a sealed occurrence value for
+    // overlap/availability only, without retaining a lookup into mutable state.
+    fn proof_place<'p>(&self, place: &'p ScalarPlace, mut ordinal: OccurrenceOrdinal) -> std::borrow::Cow<'p, ScalarPlace> {
+        use std::borrow::Cow;
+        let structure = &self.call_sites.structure;
+        if structure.proven_index_values.is_empty() {
+            return Cow::Borrowed(place);
+        }
+        let mut current = place;
+        let mut depth = 0;
+        let mut replacements = Vec::new();
+        loop {
+            let (base, index) = match current {
+                ScalarPlace::Field { base, .. } => (base, None),
+                ScalarPlace::Index { base, index, .. } => (base, Some(index)),
+                _ => break,
+            };
+            let parent = OccurrenceParent::Place(ordinal);
+            ordinal = self.place_ordinal(parent, OccurrenceEdge::PlaceBase);
+            if let Some(index) = index {
+                let key = self.expression_ordinal(parent, OccurrenceEdge::PlaceIndex);
+                if let (Some(&value), Some(ScalarType::Array { element, length, .. })) =
+                    (structure.proven_index_values.get(&key), structure.checked_types.places.get(&ordinal))
+                {
+                    if aggregate::ordinary_value(element) && value < *length {
+                        replacements.push((depth, value, expression_span(index)));
+                    }
+                }
+            }
+            current = base;
+            depth += 1;
+        }
+        if replacements.is_empty() {
+            return Cow::Borrowed(place);
+        }
+        let mut result = place.clone();
+        let mut current = &mut result;
+        let mut replacements = replacements.into_iter().peekable();
+        let mut depth = 0;
+        while let Some(&(replace_depth, value, span)) = replacements.peek() {
+            current = match current {
+                ScalarPlace::Field { base, .. } => base,
+                ScalarPlace::Index { base, index, .. } => {
+                    if depth == replace_depth {
+                        **index = ScalarExpression::Integer { value: value.into(), span };
+                        replacements.next();
+                    }
+                    base
+                }
+                _ => unreachable!("proved index was collected from this exact place"),
+            };
+            depth += 1;
+        }
+        Cow::Owned(result)
+    }
+
     fn reference_place(
         &self,
         place: &ScalarPlace,
@@ -2637,6 +2694,18 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 let place_ordinal = self.place_ordinal(parent, OccurrenceEdge::ExpressionPlace);
                 self.reject_fallible_address(place, place_ordinal, span)?;
                 let root = self.place_root(place, place_ordinal);
+                let proof_place = self.proof_place(place, place_ordinal);
+                if let ScalarPlace::Index { base, index, .. } = proof_place.as_ref() {
+                    if direct_checked_field_base(base).is_some()
+                        && !matches!(index.as_ref(), ScalarExpression::Integer { .. })
+                    {
+                        return Err(self.missing_context(
+                            span,
+                            ReferenceAnalysisErrorReason::UnprovedCheckedArrayIndex,
+                        ));
+                    }
+                }
+
                 let mut named_parent_point = None;
                 let mut reborrow = None;
                 let parents = match root.place {
@@ -2734,7 +2803,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                                 let checked_types = &self.call_sites.structure.checked_types;
                                 let Some(field_type) = checked_types.places.get(&place_ordinal)
                                     .filter(|ty| aggregate::ordinary_value(ty)) else { return false; };
-                                let (field_place, index) = joined_projection_field(place);
+                                let (field_place, index) = joined_projection_field(proof_place.as_ref());
                                 if !matches!(direct_checked_field_base(field_place),
                                     Some((written, ScalarFieldReference::Resolved(field)))
                                         if written == pointer.as_ref()
@@ -2774,7 +2843,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                                 let pointer_point = self.cursor.expect("named checked read");
                                 self.has_projected_child |= direct_checked_field_base(place).is_some();
                                 let point = self.point_with_origins(
-                                    CfgPointKind::ReborrowThrough { mode: *mutability, place: place.clone(), pointer_point },
+                                    CfgPointKind::ReborrowThrough { mode: *mutability, place: proof_place.clone().into_owned(), pointer_point },
                                     span, scope, None,
                                 );
                                 if self.has_joined_root_reborrow {
@@ -2865,7 +2934,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             }
                         };
                     let mut projections = Vec::new();
-                    collect_reference_projections(place, parent_loan.as_ref(), &mut projections);
+                    collect_reference_projections(proof_place.as_ref(), parent_loan.as_ref(), &mut projections);
                     let loan = ReferenceLoanId {
                         mode: *mutability,
                         origin_place: ReferencePlaceId {
@@ -2875,7 +2944,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             block_span: declaration_block,
                             binding,
                             projections,
-                            place: place.clone(),
+                            place: proof_place.clone().into_owned(),
                         },
                         creation_span: span,
                         parent: parent_loan.map(Box::new),
@@ -3289,15 +3358,19 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 ScalarPlace::Field { .. } | ScalarPlace::Index { .. } => unreachable!(),
             },
         };
+        let proof_place = match source {
+            CheckedReadSource::Place(ordinal) => self.proof_place(place, ordinal),
+            _ => std::borrow::Cow::Borrowed(place),
+        };
         let candidates = match (source, root_binding) {
             (CheckedReadSource::PreparedMember { binding, .. }, _) | (_, Some(binding)) => {
-                vec![self.reference_place(place, binding.clone(), None)]
+                vec![self.reference_place(proof_place.as_ref(), binding.clone(), None)]
             }
-            _ if pointer_point.is_none() => vec![self.assignment_place(place, span)?],
+            _ if pointer_point.is_none() => vec![self.assignment_place(proof_place.as_ref(), span)?],
             _ => Vec::new(),
         };
         let event = CfgPointKind::ReadPlace {
-            place: place.clone(),
+            place: proof_place.into_owned(),
             pointer_point,
             candidates,
             reads_origin: reads_checked_value,
@@ -4220,7 +4293,8 @@ impl<'a> ReferenceFlowBuilder<'a> {
     fn exact_indexed_store_type(
         &self, place: &ScalarPlace, destination: OccurrenceOrdinal, parent_type: &ScalarType, value_type: &ScalarType,
     ) -> bool {
-        let ScalarPlace::Index { base, index, .. } = place else { return false };
+        let normalized = self.proof_place(place, destination);
+        let ScalarPlace::Index { base, index, .. } = normalized.as_ref() else { return false };
         let ScalarExpression::Integer { value, .. } = index.as_ref() else { return false };
         if !matches!(direct_checked_field_base(base),
             Some((ScalarExpression::Name { .. }, ScalarFieldReference::Resolved(field)))
@@ -4287,7 +4361,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
             if let Some(binding) = binding {
                 self.place_expressions_with_binding(&target.place, scope, ordinal, Some(&binding))?;
                 return Ok(ReferenceAssignmentDestination::Resolved(
-                    self.reference_place(&target.place, binding, None),
+                    self.reference_place(self.proof_place(&target.place, ordinal).as_ref(), binding, None),
                 ));
             }
             self.point(
@@ -4785,7 +4859,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                                 destination
                             {
                                 let assign = CfgPointKind::AssignThrough {
-                                    place: target.place.clone(),
+                                    place: self.proof_place(&target.place, slot.destination).into_owned(),
                                     pointer_point,
                                     rhs_point,
                                     candidates: Vec::new(),
@@ -8056,12 +8130,37 @@ fn exact_named_indexed_store_pointer<'a>(
     }
     let read = points.get(pointer_point.0)?;
     let CfgPointKind::Read { binding } = &read.kind else { return None };
-    let [literal] = read.successors.as_slice() else { return None };
-    let literal = points.get(literal.0)?;
-    (read.id < literal.id && literal.id < write.id && read.scope == write.scope && literal.scope == write.scope
-        && &read.source_span.range == span && literal.successors.as_slice() == [write.id]
-        && matches!(&literal.kind, CfgPointKind::Evaluate(expression) if expression == index.as_ref()))
-        .then_some((*pointer_point, binding, field, index.as_ref()))
+    // The prepared store certificate matched this fixed array and index.
+    // Keep the actual evaluated corridor (including a lexical Read or
+    // literal arithmetic), and require it to end at the same source span as
+    // the captured proof value. Never treat a call or write as index syntax.
+    if read.scope != write.scope || &read.source_span.range != span { return None; }
+    let index_span = expression_span(index);
+    let mut cursor = read;
+    for _ in 0..15 {
+        let [next] = cursor.successors.as_slice() else { return None };
+        let next = points.get(next.0)?;
+        if cursor.id >= next.id || next.id >= write.id || next.scope != write.scope {
+            return None;
+        }
+        let actual = next.source_span.range;
+        if actual.start < index_span.start || actual.end > index_span.end
+            || !matches!(&next.kind,
+                CfgPointKind::Read { .. }
+                | CfgPointKind::Evaluate(ScalarExpression::Integer { .. })
+                | CfgPointKind::Evaluate(ScalarExpression::Binary {
+                    operator: BinaryOperator::Add | BinaryOperator::Subtract | BinaryOperator::Multiply,
+                    ..
+                }))
+        {
+            return None;
+        }
+        if next.successors.as_slice() == [write.id] {
+            return (actual == index_span).then_some((*pointer_point, binding, field, index.as_ref()));
+        }
+        cursor = next;
+    }
+    None
 }
 
 fn point_last_use_dependencies<'a>(
@@ -11182,6 +11281,7 @@ pub(super) struct OccurrenceStructure {
     pub(super) blocks: Vec<BlockRegion>,
     pub(super) edges: HashMap<(OccurrenceParent, OccurrenceEdge), OccurrenceNode>,
     pub(super) checked_types: CheckedOccurrenceTypes,
+    proven_index_values: HashMap<OccurrenceOrdinal, u64>,
     pub(super) literal_fields: HashMap<OccurrenceOrdinal, ScalarStructFieldId>,
     pub(super) module_storage_uses: HashMap<SourceSpan, Vec<(OccurrenceOrdinal, ModuleStorageRole)>>,
     pub(super) module_storage_installs: BTreeMap<usize, ModuleStorageInstall>,
@@ -11201,6 +11301,7 @@ impl OccurrenceStructure {
             blocks: vec![BlockRegion::new(span, Vec::new())],
             edges: HashMap::new(),
             checked_types: CheckedOccurrenceTypes::default(),
+            proven_index_values: HashMap::new(),
             literal_fields: HashMap::new(),
             module_storage_uses: HashMap::new(),
             module_storage_installs: BTreeMap::new(),
@@ -11681,6 +11782,45 @@ struct WalkScope {
     types: BTreeMap<String, ScalarType>,
 }
 
+// Deliberately tiny and total: no host overflow, no runtime effect or
+// width conversion, and no cost proportional to large arithmetic trees.
+fn closed_u64_constant(
+    structure: &OccurrenceStructure,
+    expression: &ScalarExpression,
+    occurrence: OccurrenceOrdinal,
+) -> Option<u64> {
+    fn evaluate(
+        structure: &OccurrenceStructure,
+        expression: &ScalarExpression,
+        occurrence: OccurrenceOrdinal,
+        remaining: &mut u8,
+    ) -> Option<u64> {
+        *remaining = remaining.checked_sub(1)?;
+        if structure.checked_types.expressions.get(&occurrence) != Some(&ScalarType::U64) {
+            return None;
+        }
+        match expression {
+            ScalarExpression::Integer { value, .. } => value.try_into().ok(),
+            ScalarExpression::Binary { operator, left, right, .. } => {
+                let child = |edge| match structure.edges.get(&(OccurrenceParent::Expression(occurrence), edge)) {
+                    Some(OccurrenceNode::Expression(child)) => Some(*child),
+                    _ => None,
+                };
+                let left = evaluate(structure, left, child(OccurrenceEdge::BinaryLeft)?, remaining)?;
+                let right = evaluate(structure, right, child(OccurrenceEdge::BinaryRight)?, remaining)?;
+                match operator {
+                    BinaryOperator::Add => left.checked_add(right),
+                    BinaryOperator::Subtract => left.checked_sub(right),
+                    BinaryOperator::Multiply => left.checked_mul(right),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+    evaluate(structure, expression, occurrence, &mut 15)
+}
+
 struct StructuralWalker<'a, 'typing> {
     mode: WalkMode<'a>,
     occurrence_typing: &'typing mut PreparationOccurrenceTyping,
@@ -11703,6 +11843,9 @@ struct StructuralWalker<'a, 'typing> {
     assignments: HashMap<(BlockOrdinal, usize), AssignmentGroup>,
     conditionals: HashMap<OccurrenceOrdinal, ConditionalRegion>,
     short_circuits: HashMap<OccurrenceOrdinal, ShortCircuitRegion>,
+    known_u64_locals: HashMap<(u32, u32), u64>,
+    index_uses: Vec<(OccurrenceOrdinal, (u32, u32), u64)>,
+
 }
 
 impl<'a, 'typing> StructuralWalker<'a, 'typing> {
@@ -11750,6 +11893,9 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
             assignments: HashMap::new(),
             conditionals: HashMap::new(),
             short_circuits: HashMap::new(),
+            known_u64_locals: HashMap::new(),
+            index_uses: Vec::new(),
+
         }
     }
 
@@ -12576,6 +12722,13 @@ impl StructuralWalker<'_, '_> {
         let parent = OccurrenceParent::Place(ordinal);
         match place {
             ScalarPlace::Name { name, .. } => {
+                if matches!(storage_role, ModuleStorageRole::Address | ModuleStorageRole::Replace) {
+                    if let Some(local) = names.get(name) {
+                        let span = local.declaration_span;
+                        self.known_u64_locals.remove(&(span.start, span.end));
+                    }
+                }
+
                 if !self.structure.resolved_namespace_places.contains_key(&ordinal) {
                     let context = match &self.mode {
                         WalkMode::ModuleInitialization { source, declarations } => Some((*source, *declarations, false)),
@@ -12667,7 +12820,25 @@ impl StructuralWalker<'_, '_> {
             }
             ScalarPlace::Index { base, index, .. } => {
                 self.place_at(base, names, types, parent, OccurrenceEdge::PlaceBase, storage_role)?;
-                self.expression(index, names, types, parent, OccurrenceEdge::PlaceIndex)?;
+                let index_ordinal =
+                    self.expression_at(index, names, types, parent, OccurrenceEdge::PlaceIndex)?;
+                if matches!(self.mode, WalkMode::Callable(ref callable) if callable.prepared)
+                    && self.structure.checked_types.expressions.get(&index_ordinal) == Some(&ScalarType::U64)
+                {
+                    if let ScalarExpression::Name { name, .. } = index.as_ref() {
+                        if let Some(local) = names.get(name) {
+                            let span = local.declaration_span;
+                            let key = (span.start, span.end);
+                            if let Some(&value) = self.known_u64_locals.get(&key) {
+                                self.index_uses.push((index_ordinal, key, value));
+                            }
+                        }
+                    } else if !matches!(index.as_ref(), ScalarExpression::Integer { .. }) {
+                        if let Some(value) = closed_u64_constant(&self.structure, index, index_ordinal) {
+                            self.structure.proven_index_values.insert(index_ordinal, value);
+                        }
+                    }
+                }
             }
             ScalarPlace::Dereference { pointer, .. } => self.expression(
                 pointer,
@@ -12865,6 +13036,22 @@ impl StructuralWalker<'_, '_> {
         } else {
             BindingInitialization::Outputs(self.binding_outputs(binding, position, scope)?)
         };
+        if !binding.is_allocation && binding.fallible_assignment.is_none()
+            && matches!(self.mode, WalkMode::Callable(ref callable) if callable.prepared)
+        {
+            if let [receiver] = binding.receivers.as_slice() {
+                if receiver.ty == ScalarType::U64 {
+                    if let BindingInitialization::Outputs(outputs) = &initialization {
+                        if self.structure.checked_types.expressions.get(&outputs.primary) == Some(&ScalarType::U64) {
+                            if let Some(value) = closed_u64_constant(&self.structure, &binding.value, outputs.primary) {
+                                let span = receiver.name_span;
+                                self.known_u64_locals.insert((span.start, span.end), value);
+                            }
+                        }
+                    }
+                }
+            }
+        }
         if matches!(
             self.mode,
             WalkMode::Callable(_)
@@ -13616,6 +13803,11 @@ fn resolve_function_call_sites(
     }
     let root = resolver.structure.root;
     resolver.block_items(&function.body, &parameter_names, &parameter_types, root, false)?;
+    for (occurrence, binding, value) in resolver.index_uses {
+        if resolver.known_u64_locals.get(&binding) == Some(&value) {
+            resolver.structure.proven_index_values.insert(occurrence, value);
+        }
+    }
     let root_conditional = resolver.structure.blocks[root.0]
         .items
         .last()

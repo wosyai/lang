@@ -61,9 +61,9 @@ fn check_case(text: &str, expected: Expected, witness_dir: Option<&str>) {
                 Expected::NullParent | Expected::DynamicProjection | Expected::OutOfRangeProjection | Expected::KnownAbsentProjection => {
                     let (reborrow, message) = match expected {
                         Expected::DynamicProjection => ("&!(*parent).values[index]",
-                            "checked address requires a storage name or direct storage field"),
+                            "checked projected borrow requires a proved in-range index"),
                         Expected::OutOfRangeProjection => ("&!(*parent).values[2]",
-                            "checked projected borrow requires an in-range literal index into a fixed ordinary scalar array"),
+                            "checked projected borrow requires an in-range index into a fixed ordinary scalar array"),
                         Expected::KnownAbsentProjection => ("&!(*parent).values[1]", "missing required dereference origin"),
                         _ => ("&(*parent)", "missing required dereference origin"),
                     };
@@ -372,6 +372,15 @@ fn joined_sibling_scalar_fields_keep_disjoint_place_authority() {
     check(&overlapping, Expected::NullParent);
 }
 
+fn independent_index_parameter(program: &str) -> String {
+    let result = program
+        .replace("u8(bool) inspect = fn(choose)", "u8(bool, u64) inspect = fn(choose, index)")
+        .replace("inspect(true)", "inspect(true, 0)")
+        .replace("inspect(false)", "inspect(false, 1)");
+    assert_ne!(result, program);
+    result
+}
+
 #[test]
 fn joined_constant_array_elements_keep_disjoint_place_authority() {
     let program = joined("parent = &!bytes[1];", true, "", "bytes[2] = 4; u8 observed = *child;")
@@ -385,9 +394,12 @@ fn joined_constant_array_elements_keep_disjoint_place_authority() {
     let overlapping = program.replace("&!bytes[1]", "&!bytes[0]");
     assert_ne!(overlapping, program);
     check(&overlapping, Expected::NullParent);
-    let dynamic = program.replace("parent = &!bytes[1];", "u64 slot = 1; parent = &!bytes[slot];");
+    let calculated = program.replace("parent = &!bytes[1];", "u64 slot = 0 + 1; parent = &!bytes[slot];");
+    assert_ne!(calculated, program);
+    check_case(&calculated, Expected::Valid, Some("WOSY_JOINED_CALCULATED_ELEMENTS_IR_DIR"));
+    let dynamic = program.replace("parent = &!bytes[1];", "parent = &!bytes[index];");
     assert_ne!(dynamic, program);
-    check(&dynamic, Expected::NullParent);
+    check(&independent_index_parameter(&dynamic), Expected::NullParent);
 }
 
 #[test]
@@ -405,10 +417,12 @@ fn joined_composite_places_preserve_index_and_field_disjointness() {
     let overlapping = program.replace("&!owner.values[1]", "&!owner.values[0]");
     assert_ne!(overlapping, program);
     check(&overlapping, Expected::NullParent);
-    let dynamic = program.replace("parent = &!owner.values[1];",
-        "u64 index = 1; parent = &!owner.values[index];");
+    let calculated = program.replace("parent = &!owner.values[1];", "parent = &!owner.values[1 + 0];");
+    assert_ne!(calculated, program);
+    check_case(&calculated, Expected::Valid, Some("WOSY_JOINED_CALCULATED_COMPOSITE_IR_DIR"));
+    let dynamic = program.replace("parent = &!owner.values[1];", "parent = &!owner.values[index];");
     assert_ne!(dynamic, program);
-    check(&dynamic, Expected::NullParent);
+    check(&independent_index_parameter(&dynamic), Expected::NullParent);
 }
 
 #[test]
@@ -550,10 +564,14 @@ fn joined_struct_parent_grants_in_range_literal_array_element() {
     let live = program.replace("u8 seen = *child;", "first.values[1] = 3; u8 seen = *child;");
     assert_ne!(live, program);
     check(&live, Expected::LiveIndexedProjectionConflict);
-    let dynamic = program.replace("*!u8 child = &!(*parent).values[1];",
+    let calculated = program.replace("*!u8 child = &!(*parent).values[1];",
         "u64 index = 1; *!u8 child = &!(*parent).values[index];");
+    assert_ne!(calculated, program);
+    check_case(&calculated, Expected::Valid, Some("WOSY_JOINED_CALCULATED_PROJECTION_IR_DIR"));
+    let dynamic = program.replace("*!u8 child = &!(*parent).values[1];",
+        "*!u8 child = &!(*parent).values[index];");
     assert_ne!(dynamic, program);
-    check(&dynamic, Expected::DynamicProjection);
+    check(&independent_index_parameter(&dynamic), Expected::DynamicProjection);
     let outside = program.replace("&!(*parent).values[1]", "&!(*parent).values[2]");
     assert_ne!(outside, program);
     check(&outside, Expected::OutOfRangeProjection);
@@ -644,14 +662,20 @@ fn selected_parent_writes_disjoint_literal_array_element_while_child_lives() {
             "    if (observed == seen + 2) { if (choose) { if (left == 4 && right == 2) { seen } else { 0 } } else { if (left == 1 && right == 4) { seen } else { 0 } } } else { 0 }\n");
     check_case(&program, Expected::Valid, Some("WOSY_JOINED_PARENT_DISJOINT_INDEX_IR_DIR"));
 
+    let calculated = program.replace("(*parent).values[0] = 4",
+        "u64 slot = 1 - 1; (*parent).values[slot] = 4");
+    assert_ne!(calculated, program);
+    check_case(&calculated, Expected::Valid, Some("WOSY_JOINED_CALCULATED_STORE_IR_DIR"));
+
     for (replacement, target, operand) in [
         ("(*parent).values[1] = 4", "(*parent).values[1] = 4", "values"),
         ("first.values[0] = 4", "first.values[0] = 4", "values"),
-        ("u64 index = 0; (*parent).values[index] = 4", "(*parent).values[index] = 4", "index"),
+        ("(*parent).values[index] = 4", "(*parent).values[index] = 4", "index"),
     ] {
         let live = program.replace("(*parent).values[0] = 4", replacement);
         assert_ne!(live, program);
-        check(&live, Expected::ExactProjectionConflict { target, operand, loan: "&!(*parent).values[1]" });
+        let input = if operand == "index" { independent_index_parameter(&live) } else { live };
+        check(&input, Expected::ExactProjectionConflict { target, operand, loan: "&!(*parent).values[1]" });
     }
 }
 
