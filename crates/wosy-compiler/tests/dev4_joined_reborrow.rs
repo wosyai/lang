@@ -174,6 +174,41 @@ if (inspect(true) != 7 || inspect(false) != 9) {{ core.system_panic(); }};
 }
 
 #[test]
+fn nested_holder_liveness_respects_exact_overwrite_and_last_use() {
+    let program = r#"%%start
+u8(bool, bool) select_value = fn(outer, inner) {
+    u8 first = 7;
+    u8 second = 9;
+    *u8 child = &first;
+    if (outer) {
+        if (inner) { child = &second; first = 3; } else { second = 11; };
+    } else {
+        child = &second;
+        first = 5;
+    };
+    u8 value = *child;
+    first = 1;
+    if (first == 1) { value } else { 0 }
+};
+u8(bool) inspect = fn(choose) {
+    if (choose) {
+        if (select_value(true, true) == 9 && select_value(true, false) == 7) { 7 } else { 0 }
+    } else {
+        if (select_value(false, true) == 9 && select_value(false, false) == 9) { 9 } else { 0 }
+    }
+};
+if (inspect(true) != 7 || inspect(false) != 9) { core.system_panic(); };
+%%end"#;
+    check_case(program, Expected::Valid, Some("WOSY_NESTED_HOLDER_LIVENESS_IR_DIR"));
+
+    let live = program.replace("second = 11;", "first = 4; second = 11;");
+    assert_ne!(live, program);
+    check(&live, Expected::ExactProjectionConflict {
+        target: "first = 4", operand: "first", loan: "&first",
+    });
+}
+
+#[test]
 fn distinct_joined_shared_child_is_resolved_per_path() {
     check(&joined("parent = &!second;", false, "", ""), Expected::Valid);
     check(&joined("parent = &!second;", true, "", "first = 3;"), Expected::Valid);

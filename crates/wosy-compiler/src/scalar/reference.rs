@@ -5725,6 +5725,205 @@ fn defer_read_search_siblings(successors: &[CfgPointId], pending: &mut Vec<CfgPo
     Some(*last)
 }
 
+fn lexical_read_kills(
+    point: &ReferenceFlowPoint,
+    scope_exits: Option<&HashMap<CfgPointId, super::control::ScopeExitBindings>>,
+    binding: &ReferenceBindingId,
+) -> bool {
+    matches!(&point.kind, CfgPointKind::Assign { target, .. } if target.binding == *binding && target.projections.is_empty())
+        || matches!(&point.kind, CfgPointKind::Bind { binding: bound } if bound == binding)
+        || (matches!(&point.kind, CfgPointKind::ScopeExit) && match scope_exits {
+            Some(exits) => exits.get(&point.id).is_some_and(|cohort| cohort.contains(binding)),
+            None => point.source_span.range == binding.block_span,
+        })
+}
+
+// The place/mode filter nominates candidates first. A forward branched body
+// then resolves only the lexical holders actually queried, memoizing only CFG
+// points reached by those queries. Each exact lexical identity has its own
+// Read/Bind/overwrite/scope-exit cutoffs in this immutable graph.
+#[derive(Default)]
+struct LexicalConflictMemo {
+    rows: HashMap<ReferenceBindingId, HashMap<CfgPointId, bool>>,
+    retained: usize,
+}
+
+struct ConflictLiveness<'a> {
+    points: &'a [ReferenceFlowPoint],
+    scope_exits: Option<&'a HashMap<CfgPointId, super::control::ScopeExitBindings>>,
+    strictly_forward: bool,
+    lexical: Option<std::cell::RefCell<LexicalConflictMemo>>,
+}
+
+impl<'a> ConflictLiveness<'a> {
+    fn new(
+        points: &'a [ReferenceFlowPoint],
+        scope_exits: Option<&'a HashMap<CfgPointId, super::control::ScopeExitBindings>>,
+        strictly_forward: bool,
+        branched: bool,
+    ) -> Self {
+        Self { points, scope_exits, strictly_forward,
+            lexical: (strictly_forward && branched).then(Default::default) }
+    }
+
+    fn lexical_after(&self, from: CfgPointId, binding: &ReferenceBindingId) -> bool {
+        let Some(lexical) = &self.lexical else {
+            return reference_read_reachable(self.points, self.scope_exits, self.strictly_forward, from, binding);
+        };
+        let successors = &self.points[from.0].successors;
+        if successors.is_empty() { return false; }
+        // Keep enough room for a complete holder even on a wide graph, but
+        // never retain the full holder × point relation.
+        let limit = self.points.len().saturating_mul(2);
+        let mut lexical = lexical.borrow_mut();
+        let LexicalConflictMemo { rows, retained } = &mut *lexical;
+        if !rows.contains_key(binding) {
+            if *retained == limit {
+                return reference_read_reachable(self.points, self.scope_exits, self.strictly_forward, from, binding);
+            }
+            rows.insert(binding.clone(), HashMap::new());
+        }
+        let known = rows.get_mut(binding).expect("indexed queried lexical holder");
+        // A query which crosses the retention limit finishes the same walk.
+        // Its remaining facts stay transient, so no visited suffix is rewalked.
+        let mut transient = HashMap::new();
+        // Keep the legacy traversal's last-successor-first preference.
+        successors.iter().rev().any(|&start| {
+            // Inclusive reachability for successors; the access itself is
+            // never a use or a kill of the incoming holder value.
+            if let Some(&live) = known.get(&start).or_else(|| transient.get(&start)) { return live; }
+            let mut pending = vec![(start, 0usize)];
+            while let Some(&(id, child)) = pending.last() {
+                let point = &self.points[id.0];
+                let live = if matches!(&point.kind, CfgPointKind::Read { binding: read } if read == binding) {
+                    true
+                } else if lexical_read_kills(point, self.scope_exits, binding) {
+                    false
+                } else if let Some(&successor) = point.successors.iter().rev().nth(child) {
+                    debug_assert!(successor > id, "only strictly forward graphs use this refinement");
+                    match known.get(&successor).or_else(|| transient.get(&successor)) {
+                        Some(true) => true,
+                        Some(false) => {
+                            pending.last_mut().expect("current refinement frame").1 += 1;
+                            continue;
+                        }
+                        None => {
+                            pending.push((successor, 0));
+                            continue;
+                        }
+                    }
+                } else {
+                    false
+                };
+                if *retained < limit {
+                    known.insert(id, live);
+                    *retained += 1;
+                } else {
+                    transient.insert(id, live);
+                }
+                pending.pop();
+            }
+            known.get(&start).or_else(|| transient.get(&start)).copied()
+                .expect("refined successor fact")
+        })
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn forward_conflict_liveness_memoizes_exact_holder_cutoffs() {
+    let source = SourceIdentity::new("project".into(), "package".into(), "liveness.w".into(), "r1".into());
+    let block = ByteSpan::new(0, 100);
+    let binding = |start| ReferenceBindingId {
+        source: source.clone(), function_span: block, block_span: block,
+        declaration_span: ByteSpan::new(start, start + 1), kind: ReferenceBindingKind::Declared,
+    };
+    let holder = binding(1);
+    let other = binding(2);
+    let make = |index, kind, successors: &[usize]| ReferenceFlowPoint {
+        id: CfgPointId(index), kind, source_span: SourceSpan::new(source.clone(), block),
+        scope: ReferenceScopeId(0), possible_origins: None,
+        successors: successors.iter().map(|&next| CfgPointId(next)).collect(),
+    };
+    let points = [
+        make(0, CfgPointKind::Entry, &[1, 2]),
+        make(1, CfgPointKind::ScopeExit, &[3]),
+        make(2, CfgPointKind::Bind { binding: holder.clone() }, &[3]),
+        make(3, CfgPointKind::Read { binding: holder.clone() }, &[4]),
+        make(4, CfgPointKind::Read { binding: other.clone() }, &[]),
+    ];
+    let mut exiting = super::control::ScopeExitBindings::default();
+    exiting.insert(holder.clone());
+    let exits = HashMap::from([(CfgPointId(1), exiting)]);
+    let liveness = ConflictLiveness::new(&points, Some(&exits), true, true);
+    let cache = liveness.lexical.as_ref().unwrap();
+    assert!(cache.borrow().rows.is_empty(), "no work without a lexical conflict candidate");
+    assert!(!liveness.lexical_after(CfgPointId(0), &holder));
+    assert_eq!(cache.borrow().rows[&holder].len(), 2, "both kills stop the refinement");
+    assert!(!liveness.lexical_after(CfgPointId(0), &holder));
+    assert_eq!(cache.borrow().rows[&holder].len(), 2, "repeated query reuses exactly the prior facts");
+    assert!(liveness.lexical_after(CfgPointId(1), &holder), "query starts after the site itself");
+    assert!(liveness.lexical_after(CfgPointId(0), &other), "a different lexical identity is not killed");
+    for id in 0..points.len() {
+        for binding in [&holder, &other] {
+            assert_eq!(liveness.lexical_after(CfgPointId(id), binding),
+                reference_read_reachable(&points, Some(&exits), true, CfgPointId(id), binding));
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn forward_conflict_liveness_retains_only_a_linear_budget_across_holders() {
+    let source = SourceIdentity::new("project".into(), "package".into(), "budget.w".into(), "r1".into());
+    let block = ByteSpan::new(0, 40);
+    let holders: Vec<_> = (0..6).map(|index| ReferenceBindingId {
+        source: source.clone(), function_span: block, block_span: block,
+        declaration_span: ByteSpan::new(index, index + 1), kind: ReferenceBindingKind::Declared,
+    }).collect();
+    let points: Vec<_> = (0usize..16).map(|id| ReferenceFlowPoint {
+        id: CfgPointId(id),
+        kind: match id {
+            5 => CfgPointKind::Read { binding: holders[4].clone() },
+            9 => CfgPointKind::Read { binding: holders[2].clone() },
+            _ => CfgPointKind::Entry,
+        },
+        source_span: SourceSpan::new(source.clone(), block), scope: ReferenceScopeId(0),
+        possible_origins: None,
+        successors: match id {
+            0 => vec![CfgPointId(1), CfgPointId(2)],
+            1 => vec![CfgPointId(3)],
+            3 => vec![CfgPointId(4), CfgPointId(5)],
+            15 => Vec::new(),
+            id => vec![CfgPointId(id + 1)],
+        },
+    }).collect();
+    let liveness = ConflictLiveness::new(&points, None, true, true);
+    let cache = liveness.lexical.as_ref().unwrap();
+    for binding in &holders {
+        for id in [0, 4, 9, 12] {
+            assert_eq!(liveness.lexical_after(CfgPointId(id), binding),
+                reference_read_reachable(&points, None, true, CfgPointId(id), binding));
+        }
+    }
+    let memo = cache.borrow();
+    assert_eq!(memo.retained, points.len() * 2);
+    assert_eq!(memo.retained, memo.rows.values().map(HashMap::len).sum::<usize>());
+    assert_eq!(memo.rows.len(), 3, "later unrelated holders do not get retained rows");
+    assert_eq!(memo.rows[&holders[0]].len(), points.len() - 1, "first holder keeps its whole useful suffix");
+    assert!(!memo.rows[&holders[2]].contains_key(&CfgPointId(1)), "over-budget tail is not retained");
+    drop(memo);
+    assert!(!liveness.lexical_after(CfgPointId(0), &holders[0]));
+    assert_eq!(cache.borrow().retained, points.len() * 2);
+
+    let ordered = ConflictLiveness::new(&points, None, true, true);
+    assert!(ordered.lexical_after(CfgPointId(0), &holders[4]));
+    let memo = ordered.lexical.as_ref().unwrap().borrow();
+    assert_eq!(memo.rows[&holders[4]], HashMap::from([
+        (CfgPointId(2), true), (CfgPointId(3), true), (CfgPointId(5), true),
+    ]), "last successor is explored first at both the seed and nested fork");
+}
+
 fn reference_read_reachable(
     points: &[ReferenceFlowPoint],
     scope_exits: Option<&HashMap<CfgPointId, super::control::ScopeExitBindings>>,
@@ -5777,13 +5976,7 @@ fn reference_holder_read_reachable(
                 _ => {}
             }
         }
-        if matches!(&points[id.0].kind, CfgPointKind::Assign { target, .. } if target.binding == *binding && target.projections.is_empty())
-            || matches!(&points[id.0].kind, CfgPointKind::Bind { binding: bound } if bound == binding)
-            || (matches!(&points[id.0].kind, CfgPointKind::ScopeExit) && match scope_exits {
-                Some(exits) => exits.get(&id).is_some_and(|cohort| cohort.contains(binding)),
-                None => points[id.0].source_span.range == binding.block_span,
-            })
-        {
+        if lexical_read_kills(&points[id.0], scope_exits, binding) {
             continue;
         }
         let successors = &points[id.0].successors;
@@ -5941,9 +6134,7 @@ fn conflicting_loan<'a>(
 }
 
 fn conflicting_live_loan(
-    points: &[ReferenceFlowPoint],
-    scope_exits: Option<&HashMap<CfgPointId, super::control::ScopeExitBindings>>,
-    strictly_forward: bool,
+    liveness: &ConflictLiveness<'_>,
     facts: &[ReferenceOrigin],
     state: &ReferenceEdgeState,
     point: CfgPointId,
@@ -5959,7 +6150,7 @@ fn conflicting_live_loan(
                 continue;
             };
             if !reachable {
-                if !reference_read_reachable(points, scope_exits, strictly_forward, point, binding) {
+                if !liveness.lexical_after(point, binding) {
                     break;
                 }
                 reachable = true;
@@ -5979,7 +6170,8 @@ fn conflicting_live_loan(
             if let Some(loan) = conflicting_loan(facts, *origin, &place, access) {
                 if declared_local_loan(&facts[origin.0]).is_some()
                     && !*reachable.get_or_insert_with(|| reference_holder_read_reachable(
-                        points, scope_exits, strictly_forward, point, &row.place.binding, Some(&row.place),
+                        liveness.points, liveness.scope_exits, liveness.strictly_forward,
+                        point, &row.place.binding, Some(&row.place),
                     ))
                 {
                     continue;
@@ -6032,7 +6224,8 @@ fn selected_holder_keeps_projected_only_shared_loan_live_until_replaced() {
     holder.write(&mut state, &slot, &BTreeSet::from([ReferenceOriginId(0)]), &facts);
     assert!(state.bindings.is_empty());
     let conflicts = |state: &ReferenceEdgeState, place: &ReferencePlaceId, access: LoanAccess<'_>| {
-        conflicting_live_loan(&[], None, true, &facts, state, CfgPointId(0), place, access)
+        conflicting_live_loan(&ConflictLiveness::new(&[], None, true, false),
+            &facts, state, CfgPointId(0), place, access)
     };
     assert_eq!(conflicts(&state, &referent, LoanAccess::Direct),
         vec![SourceSpan::new(source, creation_span)]);
@@ -8256,6 +8449,7 @@ fn transfer_reference_facts(
             std::collections::VecDeque::from([CfgPointId(0)]),
         )
     });
+    let liveness = ConflictLiveness::new(original_points, cfg.scope_exit_bindings, strictly_forward, !unbranched);
     let mut forward_cursor = 0;
     let mut joined_family = None;
     let mut forward_single_observation = None;
@@ -8583,7 +8777,7 @@ fn transfer_reference_facts(
                     });
                 if let Some(loan) = valid {
                     let origins = conflicting_live_loan(
-                        original_points, cfg.scope_exit_bindings, strictly_forward, &cfg.facts,
+                        &liveness, &cfg.facts,
                         &state, id, &loan.origin_place, LoanAccess::ReadThrough(loan),
                     );
                     if !origins.is_empty() {
@@ -8708,10 +8902,7 @@ fn transfer_reference_facts(
                                     );
                                     if checked_pointee {
                                         let origins = conflicting_live_loan(
-                                            original_points,
-                                            cfg.scope_exit_bindings,
-                                            strictly_forward,
-                                            &cfg.facts,
+                                            &liveness, &cfg.facts,
                                             &state,
                                             id,
                                             &resolved,
@@ -8883,10 +9074,7 @@ fn transfer_reference_facts(
             if let Some(candidates) = affected {
                 for candidate in candidates {
                     let origins = conflicting_live_loan(
-                        original_points,
-                        cfg.scope_exit_bindings,
-                        strictly_forward,
-                        &cfg.facts,
+                        &liveness, &cfg.facts,
                         &state,
                         id,
                         &candidate.place,
@@ -9177,7 +9365,7 @@ fn transfer_reference_facts(
                         local_borrow::tests::observe(4);
                     }
                     let origins = staged.unwrap_or_else(|| conflicting_live_loan(
-                        original_points, cfg.scope_exit_bindings, strictly_forward, &cfg.facts, &state,
+                        &liveness, &cfg.facts, &state,
                         id, place, LoanAccess::DirectShared,
                     ));
                     if !origins.is_empty() {
@@ -9256,10 +9444,7 @@ fn transfer_reference_facts(
                     let place = available_place(place);
                     let mut origins = unavailable_origins_for_normalized_place(&state, &place);
                     origins.extend(conflicting_live_loan(
-                        original_points,
-                        cfg.scope_exit_bindings,
-                        strictly_forward,
-                        &cfg.facts,
+                        &liveness, &cfg.facts,
                         &state,
                         id,
                         &place,
@@ -9285,10 +9470,7 @@ fn transfer_reference_facts(
                         let place = available_place(&candidate.place);
                         let mut origins = unavailable_origins_for_normalized_place(&state, &place);
                         origins.extend(conflicting_live_loan(
-                            original_points,
-                            cfg.scope_exit_bindings,
-                            strictly_forward,
-                            &cfg.facts,
+                            &liveness, &cfg.facts,
                             &state,
                             id,
                             &place,
@@ -9333,7 +9515,7 @@ fn transfer_reference_facts(
                             else { local_access_conflicts.get_or_insert_with(verdict).clone() }
                         });
                         let origins = staged.unwrap_or_else(|| conflicting_live_loan(
-                            original_points, cfg.scope_exit_bindings, strictly_forward, &cfg.facts,
+                            &liveness, &cfg.facts,
                             &state, id, &target, LoanAccess::Direct,
                         ));
                         if !origins.is_empty() {
@@ -9352,10 +9534,7 @@ fn transfer_reference_facts(
                     for candidate in candidates {
                         let target = available_place(&candidate.place);
                         let origins = conflicting_live_loan(
-                            original_points,
-                            cfg.scope_exit_bindings,
-                            strictly_forward,
-                            &cfg.facts,
+                            &liveness, &cfg.facts,
                             &state,
                             id,
                             &target,
@@ -9654,7 +9833,7 @@ fn transfer_reference_facts(
                         parent: Some(Box::new(parent.clone())),
                     };
                     let origins = conflicting_live_loan(
-                        original_points, cfg.scope_exit_bindings, strictly_forward, &cfg.facts,
+                        &liveness, &cfg.facts,
                         &state, id, &loan.origin_place, LoanAccess::Borrow(&loan),
                     );
                     if !origins.is_empty() {
@@ -9737,7 +9916,7 @@ fn transfer_reference_facts(
                                 else { local_access_conflicts.get_or_insert_with(verdict).clone() }
                             });
                             let origins = staged.unwrap_or_else(|| conflicting_live_loan(
-                                original_points, cfg.scope_exit_bindings, strictly_forward, &cfg.facts,
+                                &liveness, &cfg.facts,
                                 &state, id, place, access,
                             ));
                             if !origins.is_empty() {
