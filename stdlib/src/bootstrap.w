@@ -1229,6 +1229,7 @@ f64(f64, i32) _parse_scale_float_down = fn(scaled, steps) {
 	u64 zero = core.int_extend<u64>(0);
 	u64 one = core.int_extend<u64>(1);
 	f64 f64_max = 1.7976931348623157e308;
+	f32 out = 0.0;
 	*f32 result = null;
 	if (text.data == null || text.length == zero) {
 		result = null;
@@ -1256,7 +1257,7 @@ f64(f64, i32) _parse_scale_float_down = fn(scaled, steps) {
 						f32 neg_one = zero_single - one_single;
 						value = narrowed * neg_one;
 					};
-					f32 out = value;
+					out = value;
 					result = &out;
 				};
 			};
@@ -1270,6 +1271,7 @@ f64(f64, i32) _parse_scale_float_down = fn(scaled, steps) {
 	u64 one = core.int_extend<u64>(1);
 	f64 zero_value = 0.0;
 	f64 one_value = 1.0;
+	f64 out = zero_value;
 	*f64 result = null;
 	if (text.data == null || text.length == zero) {
 		result = null;
@@ -1290,7 +1292,7 @@ f64(f64, i32) _parse_scale_float_down = fn(scaled, steps) {
 					f64 neg_one = zero_value - one_value;
 					value = magnitude * neg_one;
 				};
-				f64 out = value;
+				out = value;
 				result = &out;
 			};
 		};
