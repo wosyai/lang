@@ -20,20 +20,18 @@ pub(super) struct ArrayProof<'a> {
     result: &'a ScalarType,
 }
 
-pub(super) fn is_array_target(project: &PreparedProofModule, proof: &SelectedModuleProof<'_>) -> bool {
-    project.prepared.parts().1.function_body(proof.function.0, proof.function.1, None)
-        .is_some_and(|body| matches!(body.boundary.results.as_slice(), [out] if matches!(out.ty, ScalarType::Array { .. })))
+pub(super) fn is_array_target(proof: &SelectedModuleProof<'_>) -> bool {
+    matches!(proof.body.boundary.results.as_slice(), [out] if matches!(out.ty, ScalarType::Array { .. }))
 }
 
 impl<'a> ArrayProof<'a> {
     pub(super) fn prepare(
-        project: &'a PreparedProofModule, source: &'a SourceIdentity, selected: SelectedModuleProof<'a>,
+        source: &'a SourceIdentity, selected: SelectedModuleProof<'a>,
     ) -> Result<Self, ProjectCheck> {
         let proof = selected.node;
         let target = (selected.function.0, selected.function.1);
-        let (project, calls) = project.prepared.parts();
-        let owner = &project.modules[target.0];
-        let body = calls.function_body(target.0, target.1, None).ok_or(ProjectCheck::Unsupported)?;
+        let owner = selected.owner;
+        let body = selected.body;
         let [output] = body.boundary.results.as_slice() else { return Err(ProjectCheck::Unsupported); };
         let ScalarType::Array { element, length, .. } = &output.ty else { return Err(ProjectCheck::Unsupported); };
         if !body.boundary.parameters.iter().all(|parameter| is_integer_type(&parameter.ty))

@@ -9,6 +9,8 @@ mod array_quantifier;
 #[cfg(feature = "internal-checker")]
 mod case_splits;
 #[cfg(feature = "internal-checker")]
+mod catalog_composition;
+#[cfg(feature = "internal-checker")]
 mod ranked;
 #[cfg(feature = "internal-checker")]
 mod rewrite;
@@ -4092,6 +4094,8 @@ struct PreparedProofModule {
 struct SelectedModuleProof<'a> {
     node: &'a CstNode,
     function: (usize, usize, &'a ScalarFunction),
+    owner: &'a ScalarModule,
+    body: &'a FunctionCallSites,
     target: &'a ResolvedCallTarget,
     #[cfg(feature = "internal-checker")]
     ordered_steps: Option<&'a PreparedOrderedProofSteps>,
@@ -4254,12 +4258,10 @@ impl PreparedProofModule {
     #[cfg(test)]
     fn type_where(&self, proof_name: &str) -> Result<(), ProjectCheck> {
         let proof = self.select_resolved(&self.source, proof_name)?;
-        let (module, item, _) = proof.function;
-        let (project, calls) = self.prepared.parts();
-        let body = calls.function_body(module, item, None).ok_or(ProjectCheck::MissingRootOccurrences)?;
+        let body = proof.body;
         let target = child(proof.node, SyntaxKind::ProofTarget)?;
         let inputs = identifiers(&child(&target, SyntaxKind::Parameters)?).collect::<Vec<_>>();
-        let layout = project.modules[module].target_layout;
+        let layout = proof.owner.target_layout;
         if inputs.len() != body.boundary.parameters.len()
             || inputs.iter().collect::<HashSet<_>>().len() != inputs.len()
         {
@@ -4311,7 +4313,8 @@ impl PreparedProofModule {
         if source != &owner.source || *declaration_span != function.name_span {
             return Err(ProjectCheck::MissingRoot);
         }
-        Ok(SelectedModuleProof { node, function: (*module, *item, function), target,
+        let body = calls.function_body(*module, *item, None).ok_or(ProjectCheck::MissingRootOccurrences)?;
+        Ok(SelectedModuleProof { node, function: (*module, *item, function), owner, body, target,
             #[cfg(feature = "internal-checker")]
             ordered_steps: self.ordered_steps.get(query).and_then(Option::as_ref),
         })
@@ -7095,18 +7098,12 @@ fn closed_ranked_evidence<'a, 'proof, const LOCAL_CATALOGS: bool>(
 fn run_closed_ranked_checks<'a, 'proof, const LOCAL_CATALOGS: bool>(
     prepared: &PreparedProofModule, scope: ScalarCheckerScope, startup_count: usize,
     first: &'proof PlannedModuleProof<'a>, others: &'proof [PlannedModuleProof<'a>],
+    arrays: Option<&array_quantifier::Cohort<'_>>,
 ) -> Result<MainFlowProofReceipt, ProjectCheck> {
     if others.is_empty() {
         let rank = first.typed.measure.ok_or(ProjectCheck::Unsupported)?;
         let ranked = closed_ranked_evidence::<LOCAL_CATALOGS>(&prepared.source, startup_count, first, rank)?;
-        let run = run_prepared_ordered_check(
-            &prepared.prepared, scope, startup_count, OrderedReachPolicy::Closed, ranked,
-        )?;
-        return Ok(MainFlowProofReceipt {
-            active: run.active, directives: run.directives, diagnostics: Vec::new(), contextual_diagnostic: None, aggregate_diagnostics: Vec::new(),
-            symbolic_diagnostic: run.symbolic, additional_symbolic_diagnostics: Vec::new(),
-            entry_evidence: run.entry_evidence,
-        });
+        return catalog_composition::run(prepared, scope, startup_count, ranked, arrays);
     }
 
     let plans = || std::iter::once(first).chain(others);
@@ -7133,16 +7130,11 @@ fn run_closed_ranked_checks<'a, 'proof, const LOCAL_CATALOGS: bool>(
             observed = Some(MainFlowProofObserver::from_first_plan(scope, &prepared.source, plan)?);
         }
     }
-    let run = run_prepared_ordered_check(
-        &prepared.prepared, scope, startup_count, OrderedReachPolicy::Closed,
+    catalog_composition::run(
+        prepared, scope, startup_count,
         MixedOrderedEvidence { ranked, bare: observed.map(|observed| NamedOrderedEvidence { observed }) },
-    )?;
-    let (symbolic_diagnostic, additional_symbolic_diagnostics) = run.symbolic;
-    Ok(MainFlowProofReceipt {
-        active: run.active, directives: run.directives,
-        diagnostics: run.actual.bare.map_or_else(Vec::new, |bare| bare.observed.diagnostics), contextual_diagnostic: None, aggregate_diagnostics: Vec::new(),
-        symbolic_diagnostic, additional_symbolic_diagnostics, entry_evidence: run.entry_evidence,
-    })
+        arrays,
+    )
 }
 
 #[cfg(feature = "internal-checker")]
@@ -7309,40 +7301,29 @@ fn check_loaded_ordered_proof_diagnostics_in_scope<const LOCAL_CATALOGS: bool>(
             }
         }
     }
-    let Some((source, name, definition, query)) = first.as_ref() else {
+    let Some(first) = first else {
         return run_closed_without_named_proofs(&prepared.prepared, scope, startup_count);
     };
-    let selected = prepared.resolve_selected_proof(definition, *query)?;
-    if array_quantifier::is_array_target(&prepared, &selected) {
-        let mut work = 0;
-        super::checker_flow::charge_call_work(&mut work, others.len().checked_add(1).ok_or(ProjectCheck::Unsupported)?)
-            .ok_or(ProjectCheck::Unsupported)?;
-        let first = array_quantifier::ArrayProof::prepare(&prepared, source, selected)?;
-        let mut plans = vec![first];
-        for (source, _name, definition, query) in &others {
-            let selected = prepared.resolve_selected_proof(definition, *query)?;
-            if !array_quantifier::is_array_target(&prepared, &selected) { return Err(ProjectCheck::Unsupported); }
-            plans.push(array_quantifier::ArrayProof::prepare(&prepared, source, selected)?);
-        }
-        let cohort = array_quantifier::Cohort::new(plans)?;
-        let run = run_prepared_ordered_check(
-            &prepared.prepared, scope, startup_count, OrderedReachPolicy::Closed,
-            array_quantifier::Evidence::new(&cohort)?,
-        )?;
-        let aggregate_diagnostics = run.actual.into_diagnostics(scope, run.symbolic)?;
-        return Ok(MainFlowProofReceipt {
-            active: run.active, directives: run.directives,
-            diagnostics: Vec::new(), contextual_diagnostic: None, aggregate_diagnostics,
-            symbolic_diagnostic: None, additional_symbolic_diagnostics: Vec::new(), entry_evidence: run.entry_evidence,
-        });
-    }
-    let first_plan = prepared.plan_resolved_module_proof::<true, false, false>(source, name.text(), selected)?;
-    let plans = others.iter().map(|(source, name, definition, query)| {
+    let mut array_work = 0;
+    let mut arrays = Vec::new();
+    let mut first_plan = None;
+    let mut plans = Vec::new();
+    for (source, name, definition, query) in std::iter::once(&first).chain(&others) {
         let selected = prepared.resolve_selected_proof(definition, *query)?;
-        prepared.plan_resolved_module_proof::<true, false, false>(source, name.text(), selected)
-    }).collect::<Result<Vec<_>, _>>()?;
+        if array_quantifier::is_array_target(&selected) {
+            super::checker_flow::charge_call_work(&mut array_work, 1).ok_or(ProjectCheck::Unsupported)?;
+            arrays.push(array_quantifier::ArrayProof::prepare(source, selected)?);
+        } else {
+            let plan = prepared.plan_resolved_module_proof::<true, false, false>(source, name.text(), selected)?;
+            if first_plan.is_none() { first_plan = Some(plan); } else { plans.push(plan); }
+        }
+    }
+    let cohort = (!arrays.is_empty()).then(|| array_quantifier::Cohort::new(arrays)).transpose()?;
+    let Some(first_plan) = first_plan else {
+        return catalog_composition::run(&prepared, scope, startup_count, (), cohort.as_ref());
+    };
     if first_plan.typed.measure.is_some() || plans.iter().any(|plan| plan.typed.measure.is_some()) {
-        return run_closed_ranked_checks::<LOCAL_CATALOGS>(&prepared, scope, startup_count, &first_plan, &plans);
+        return run_closed_ranked_checks::<LOCAL_CATALOGS>(&prepared, scope, startup_count, &first_plan, &plans, cohort.as_ref());
     }
     let citations = LOCAL_CATALOGS.then(|| PublicProofCatalog {
         first: &first_plan, rest: &plans, index: std::cell::OnceCell::new(),
@@ -7354,15 +7335,9 @@ fn check_loaded_ordered_proof_diagnostics_in_scope<const LOCAL_CATALOGS: bool>(
         observer.insert(scope, plan.proof_source == &prepared.source, plan, prepare_ordered_public_observation(plan, citations.as_ref())?);
     }
     observer.finish_plans(&prepared.prepared, scope)?;
-    let run = run_prepared_ordered_check(
-        &prepared.prepared, scope, startup_count, OrderedReachPolicy::Closed,
-        NamedOrderedEvidence { observed: observer },
-    )?;
-    let (symbolic_diagnostic, additional_symbolic_diagnostics) = run.symbolic;
-    Ok(MainFlowProofReceipt {
-        active: run.active, directives: run.directives, diagnostics: run.actual.observed.diagnostics, contextual_diagnostic: None, aggregate_diagnostics: Vec::new(),
-        symbolic_diagnostic, additional_symbolic_diagnostics, entry_evidence: run.entry_evidence,
-    })
+    catalog_composition::run(
+        &prepared, scope, startup_count, NamedOrderedEvidence { observed: observer }, cohort.as_ref(),
+    )
 }
 
 #[cfg(feature = "internal-checker")]
@@ -8382,7 +8357,9 @@ impl PreparedProofModule {
             None => Cow::Owned(derive_block(&child(proof.node, SyntaxKind::Block)?)),
         };
         let ordered_shape = proof.ordered_steps.map(|prepared| prepared.shape);
-        let typed = typed_proof_postcondition::<ALLOW_INDUCTION, DEFER_OUTPUT_UNION>(&self.prepared, proof.function, proof.node, &steps, !DEFER_OUTPUT_UNION)?;
+        let typed = typed_proof_postcondition::<ALLOW_INDUCTION, DEFER_OUTPUT_UNION>(
+            proof.owner, function, proof.body, proof.node, &steps, !DEFER_OUTPUT_UNION,
+        )?;
         let filter = prepare_proof_entry_filter_in_scope(
             proof.node, proof_source, typed.target.target_layout, &typed.input_names, typed.body,
             typed.measure.is_some() || (ALLOW_DOMAIN && steps.items.is_empty()),
@@ -8425,10 +8402,10 @@ impl PreparedProofModule {
                 .and_then(|(source, _)| self.select_resolved(source, name).map(|resolved| (source, resolved))))
         } else { None };
         if single.as_ref().and_then(|checked| checked.as_ref().ok())
-            .is_some_and(|(_, resolved)| array_quantifier::is_array_target(self, resolved))
+            .is_some_and(|(_, resolved)| array_quantifier::is_array_target(resolved))
         {
             let checked = single.take().ok_or(ProjectCheck::Unsupported).and_then(|result| result)
-                .and_then(|(source, resolved)| array_quantifier::ArrayProof::prepare(self, source, resolved))
+                .and_then(|(source, resolved)| array_quantifier::ArrayProof::prepare(source, resolved))
                 .and_then(|plan| {
                     let startup_count = self.prepared.parts().0.initialization_order.len();
                     let cohort = array_quantifier::Cohort::new(vec![plan])?;
@@ -10671,14 +10648,15 @@ fn checked_affine_old_output(
 }
 
 fn typed_proof_postcondition<'a, const AUDIT_INDUCTION: bool, const DEFER_OUTPUT_UNION: bool>(
-    prepared: &'a PreparedCheckerProject,
-    (module, item, function): (usize, usize, &'a ScalarFunction),
+    target: &'a ScalarModule,
+    function: &'a ScalarFunction,
+    body: &'a FunctionCallSites,
     declaration: &CstNode,
     steps: &ScalarBlock,
     #[cfg_attr(not(feature = "internal-checker"), allow(unused_variables))] allow_named_entry_facts: bool,
 ) -> Result<TypedProofPostcondition<'a>, ProjectCheck> {
-    let target = child(declaration, SyntaxKind::ProofTarget)?;
-    let input_names = identifiers(&child(&target, SyntaxKind::Parameters)?).collect::<Vec<_>>();
+    let pattern = child(declaration, SyntaxKind::ProofTarget)?;
+    let input_names = identifiers(&child(&pattern, SyntaxKind::Parameters)?).collect::<Vec<_>>();
     let outputs = child(declaration, SyntaxKind::ProofOutputs)?;
     let output_names = identifiers(&child(&outputs, SyntaxKind::Parameters)?).collect::<Vec<_>>();
     let mut unique = HashSet::new();
@@ -10688,12 +10666,9 @@ fn typed_proof_postcondition<'a, const AUDIT_INDUCTION: bool, const DEFER_OUTPUT
     let ensures_node = child(declaration, SyntaxKind::ProofEnsures)?;
     let exists = ensures_node.children().find(|node| node.kind() == SyntaxKind::ProofExists);
 
-    let (project, calls) = prepared.parts();
-    let target = &project.modules[module];
     if !function.generic_parameters.is_empty() || !function.overload_arms.is_empty() {
         return Err(ProjectCheck::Unsupported);
     }
-    let body = calls.function_body(module, item, None).ok_or(ProjectCheck::MissingRootOccurrences)?;
     let boundary = &body.boundary;
     if input_names.len() != boundary.parameters.len() || output_names.len() != boundary.results.len() {
         return Err(ProjectCheck::InvalidProof);
@@ -10841,8 +10816,11 @@ fn check_selected_proof(
     summary_source: Option<ProofSummaryOrigin<'_>>,
 ) -> Result<(ProjectCheck, Option<VerifiedReturnBound>), ProjectCheck> {
     let steps = derive_block(&child(declaration, SyntaxKind::Block)?);
+    let (project, calls) = prepared.parts();
+    let target = &project.modules[module];
+    let body = calls.function_body(module, item, None).ok_or(ProjectCheck::MissingRootOccurrences)?;
     let TypedProofPostcondition { target, body, result_type, input_names, output, goal, .. } =
-        typed_proof_postcondition::<false, false>(prepared, (module, item, function), declaration, &steps, false)?;
+        typed_proof_postcondition::<false, false>(target, function, body, declaration, &steps, false)?;
     let TypedProofGoal::Literal { operator, bound, .. } = goal else {
         return Err(ProjectCheck::Unsupported);
     };
@@ -17240,6 +17218,137 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
         assert!(proved.active && proved.aggregate_diagnostics.is_empty());
         assert!(matches!(check_array_proof_cohort(&text.replace("x == 1 && y == 2", "x == 2 && y == 1"), declared),
             Err(ScalarOrderedCheckerOutcome::Unsupported)));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn mixed_array_catalog_publishes_one_startup_receipt_in_either_declaration_order() {
+        use crate::scalar::checker_flow::take_array_return_observations;
+        let scalar = "proof scalar_limited for scale(entry) -> (out) where (entry == 3) ensures (out == 3) {}";
+        let array = "proof sample_claim for make(entry) -> (items) where (entry == 3)
+            forall (u64 i where i == 0) ensures (items[i] == 3) {}";
+        let program = |[first, second]: [&str; 2]| format!(r#"%%start
+            u8(u8) scale = fn(value) {{ value }};
+            u8[2](u8) make = fn(value) {{ [value, 7] }};
+            {first}
+            {second}
+            u8 prepared = scale(3);
+            u8[2] sampled = make(prepared);
+            u8 checked = sampled[0];
+            core.require(checked == 3, {{ .stdout = ""; .stderr = "printed once"; .code = 41;
+                .files = [{{ .path = "once.txt"; .text = "one receipt"; }}]; }});
+        %%end"#);
+        for ordered in [[scalar, array], [array, scalar]] {
+            let text = program(ordered);
+            for scope in [ScalarCheckerScope::MainFlowOnly, ScalarCheckerScope::CurrentPackage] {
+                take_array_return_observations();
+                let passed = check_array_proof_cohort(&text, scope).unwrap();
+                assert!(passed.active && passed.directives.is_empty() && passed.diagnostics.is_empty());
+                assert!(passed.aggregate_diagnostics.is_empty() && passed.symbolic_diagnostic.is_none());
+                assert_eq!(take_array_return_observations(), (0, 1));
+
+                let broken = text.replace("ensures (out == 3)", "ensures (out == 4)")
+                    .replace("ensures (items[i] == 3)", "ensures (items[i] == 4)")
+                    .replace("checked == 3", "checked == 4");
+                let failed = check_array_proof_cohort(&broken, scope).unwrap();
+                assert_eq!(take_array_return_observations(), (0, 1));
+                let [directive] = failed.directives.as_slice() else { panic!("one startup requirement result"); };
+                assert_eq!(directive.stderr(), b"printed once");
+                assert_eq!(*directive.code(), BigInt::from(41));
+                let [file] = directive.files() else { panic!("one authored file in the same receipt"); };
+                assert_eq!(file.text.as_ref(), b"one receipt");
+                let [scalar] = failed.diagnostics.as_slice() else { panic!("one scalar proof failure"); };
+                let [array] = failed.aggregate_diagnostics.as_slice() else { panic!("one array proof failure"); };
+                let text_at = |span: &wosy_syntax::SourceSpan| &broken[span.range.start as usize..span.range.end as usize];
+                assert_eq!(text_at(&scalar.invocation.call), "scale(3)");
+                assert_eq!(text_at(array.call.as_ref().unwrap()), "make(prepared)");
+                assert_eq!(scalar.invocation.returned, BigInt::from(3));
+                assert_eq!(array.cell.as_ref().unwrap().value, BigInt::from(3));
+                assert!(failed.symbolic_diagnostic.is_none() && failed.additional_symbolic_diagnostics.is_empty());
+            }
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn mixed_array_catalog_preserves_symbolic_citations_without_cross_kind_authority() {
+        let text = r#"%%start
+            u8[2](u8) make = fn(value) { [value, 7] };
+            i8(i8) execute = fn(input) { if (input < 0) { -3 } else { 7 } };
+            i8(i8) producer = fn(input) { i8 result = execute(input); result };
+            proof combined for producer(arg) -> (out) where (arg >= 0) ensures (out == 7) {
+                core.use(issued(arg)); core.show(out >= 7);
+            }
+            proof cells for make(entry) -> (items) where (entry == 3)
+                forall (u64 i where i == 0) ensures (items[i] == 3) {}
+            proof issued for producer(arg) -> (out) where (arg >= 0) ensures (out <= 7) {}
+        %%end"#;
+        let scope = ScalarCheckerScope::CurrentPackage;
+        let passed = check_array_proof_cohort(text, scope).unwrap();
+        assert!(passed.active && passed.symbolic_diagnostic.is_none() && passed.aggregate_diagnostics.is_empty());
+        let broken = text.replace("ensures (out == 7)", "ensures (out == 6)")
+            .replace("items[i] == 3", "items[i] == 4");
+        let failed = check_array_proof_cohort(&broken, scope).unwrap();
+        assert!(failed.diagnostics.is_empty() && failed.directives.is_empty());
+        let scalar = failed.symbolic_diagnostic.unwrap();
+        assert_eq!(scalar.returned, BigInt::from(7));
+        assert!(scalar.failed_step.is_none());
+        let [array] = failed.aggregate_diagnostics.as_slice() else { panic!("one symbolic array proof failure"); };
+        assert!(array.call.is_none());
+        assert_eq!(array.cell.as_ref().unwrap().value, BigInt::from(3));
+        let main = check_array_proof_cohort(&broken, ScalarCheckerScope::MainFlowOnly).unwrap();
+        assert!(!main.active && main.symbolic_diagnostic.is_none() && main.aggregate_diagnostics.is_empty());
+
+        // Even an array proof with the same typed explicit argument cannot
+        // supply a scalar proof conclusion through the ordered citation lane.
+        let cross_kind = text.replace("u8[2](u8)", "i8[2](i8)")
+            .replace("core.use(issued(arg))", "core.use(cells(arg))");
+        assert!(matches!(check_array_proof_cohort(&cross_kind, scope), Err(ScalarOrderedCheckerOutcome::Unsupported)));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn mixed_array_catalog_preserves_ranked_authority_at_actual_and_unused_roots() {
+        let program = |extra_scalar: &str| format!(r#"%%start
+            u8(u8) descend = fn(value) {{ if (value < 3) {{ 4 }} else {{ descend(value - 3) }} }};
+            u8[2](u8) make = fn(value) {{ [value, 7] }};
+            u8(u8) leaf = fn(value) {{ value }};
+            proof cells for make(entry) -> (items) where (entry == 4)
+                ensures (exists (u64 i where i < 2) {{ items[i] == 7 }}) {{ core.witness(1); }}
+            proof rank for descend(entry) -> (out) where (entry <= 8) ensures (out == 4) decreases (entry) {{
+                if (entry < 3) {{ core.show(out == 4); }} else {{ core.use(rank(entry - 3)); }}
+            }}
+            {extra_scalar}
+        %%end"#);
+        for bare in ["", "proof copied for leaf(entry) -> (out) where (entry == 4) ensures (out == 4) {}"] {
+            let text = program(bare);
+            let actual = text.replace("%%end", &format!(r#"
+                u8 descended = descend(8);
+                u8 prepared = leaf(descended);
+                u8[2] grouped = make(prepared);
+                u8 checked = grouped[0];
+                core.require(checked == 4, {OUTPUT});
+            %%end"#));
+            for scope in [ScalarCheckerScope::MainFlowOnly, ScalarCheckerScope::CurrentPackage] {
+                let reached = check_array_proof_cohort(&actual, scope).unwrap();
+                assert!(reached.active && reached.directives.is_empty() && reached.diagnostics.is_empty());
+                assert!(reached.aggregate_diagnostics.is_empty() && reached.symbolic_diagnostic.is_none());
+                let outside = actual.replace("descend(8)", "descend(9)");
+                assert!(matches!(check_array_proof_cohort(&outside, scope), Err(ScalarOrderedCheckerOutcome::Unsupported)));
+            }
+            let symbolic = text.replace("%%end", &format!(r#"
+                unit(u8) client = fn(input) {{
+                    core.narrow(input <= 8, {OUTPUT});
+                    u8 result = descend(input);
+                    core.require(result == 4, {OUTPUT});
+                    core.require(result == 5, {OUTPUT});
+                }};
+            %%end"#));
+            let checked = check_array_proof_cohort(&symbolic, ScalarCheckerScope::CurrentPackage).unwrap();
+            assert!(checked.active && checked.symbolic_diagnostic.is_none() && checked.aggregate_diagnostics.is_empty());
+            let [failure] = checked.directives.as_slice() else { panic!("ranked summary discharges only the true goal"); };
+            assert_eq!(&symbolic[failure.condition.start as usize..failure.condition.end as usize], "result == 5");
+        }
     }
 
     #[cfg(feature = "internal-checker")]

@@ -2591,7 +2591,67 @@ cases.extend([
     ("exact-startup-array-proof-cohort-output", array_cohort_actual.replace("outside == 5", "outside == 0"),
         42, b"WRONG-COHORT-MIDDLE"),
 ])
+mixed_array_scalar_proof = "proof scalar_limited for scale(entry) -> (out) where (entry == 3) ensures (out == 3) {}"
+mixed_array_cells_proof = """proof sample_claim for make(entry) -> (items) where (entry == 3)
+        forall (u64 i where i == 0) ensures (items[i] == 3) {}"""
+def mixed_array_actual(first, second):
+    return f"""%%start
+        u8(u8) scale = fn(value) {{ value }};
+        u8[2](u8) make = fn(value) {{ [value, 7] }};
+        {first}
+        {second}
+        u8 prepared = scale(3);
+        u8[2] sampled = make(prepared);
+        u8 checked = sampled[0];
+        core.require(checked == 3, {{ .stdout = ""; .stderr = "MIXED-ONCE"; .code = 41;
+            .files = [{{ .path = "once.txt"; .text = "one receipt"; }}]; }});
+    %%end"""
+mixed_array_reached = mixed_array_actual(mixed_array_scalar_proof, mixed_array_cells_proof)
+mixed_array_dual_refutation = mixed_array_actual(mixed_array_cells_proof, mixed_array_scalar_proof).replace(
+    "ensures (out == 3)", "ensures (out == 4)").replace("items[i] == 3", "items[i] == 4")
+mixed_array_symbolic = """%%start
+    u8[2](u8) make = fn(value) { [value, 7] };
+    i8(i8) execute = fn(input) { if (input < 0) { -3 } else { 7 } };
+    i8(i8) producer = fn(input) { i8 result = execute(input); result };
+    proof combined for producer(arg) -> (out) where (arg >= 0) ensures (out == 7) {
+        core.use(issued(arg)); core.show(out >= 7);
+    }
+    proof cells for make(entry) -> (items) where (entry == 3)
+        forall (u64 i where i == 0) ensures (items[i] == 3) {}
+    proof issued for producer(arg) -> (out) where (arg >= 0) ensures (out <= 7) {}
+%%end"""
+mixed_array_ranked = f"""%%start
+    u8(u8) descend = fn(value) {{ if (value < 3) {{ 4 }} else {{ descend(value - 3) }} }};
+    u8[2](u8) make = fn(value) {{ [value, 7] }};
+    proof cells for make(entry) -> (items) where (entry == 4)
+        ensures (exists (u64 i where i < 2) {{ items[i] == 7 }}) {{ core.witness(1); }}
+    proof rank for descend(entry) -> (out) where (entry <= 8) ensures (out == 4) decreases (entry) {{
+        if (entry < 3) {{ core.show(out == 4); }} else {{ core.use(rank(entry - 3)); }}
+    }}
+    u8 descended = descend(8);
+    u8[2] grouped = make(descended);
+    u8 checked = grouped[0];
+    core.require(checked == 4, {report(44,"WRONG-MIXED-RANK")});
+%%end"""
+cases.extend([
+    ("exact-startup-mixed-array-catalog-proved", mixed_array_reached, 0, b""),
+    ("exact-startup-mixed-array-catalog-two-failures", mixed_array_dual_refutation, 1, b"proof obligation failed"),
+    ("exact-startup-mixed-array-catalog-output-once", mixed_array_dual_refutation.replace("checked == 3", "checked == 4"),
+        41, b"MIXED-ONCE"),
+    ("exact-startup-mixed-array-catalog-unsupported-atomic", mixed_array_dual_refutation.replace("checked == 3", "checked == 4")
+        .replace("%%end", "u8[1]() unrelated = fn { [1] }; u8[1] omitted = unrelated(); %%end"),
+        2, b"unsupported analysis"),
+    ("ordinary-mixed-array-catalog-citation-proved", mixed_array_symbolic, 0, b""),
+    ("ordinary-mixed-array-catalog-citation-refuted", mixed_array_symbolic.replace("out == 7", "out == 6")
+        .replace("items[i] == 3", "items[i] == 4"), 1, b"proof obligation failed"),
+    ("exact-startup-mixed-array-catalog-ranked-proved", mixed_array_ranked, 0, b""),
+    ("exact-startup-mixed-array-catalog-ranked-guard-refuses", mixed_array_ranked.replace("descend(8)", "descend(9)"),
+        2, b"unsupported analysis"),
+])
 proof_diagnostic_notes = {
+    "exact-startup-mixed-array-catalog-two-failures": b"call returned cell [0] = 3",
+    "exact-startup-mixed-array-catalog-output-once": b"call returned cell [0] = 3",
+    "ordinary-mixed-array-catalog-citation-refuted": b"symbolic call can return cell [0] = 3",
     "ordinary-array-proof-cohort-union-refuted": b"symbolic call entry: value = 0",
     "exact-startup-array-proof-cohort-refuted": b"call entry: tag = 1, value = 3",
     "exact-startup-fixed-array-exists-refuted": b"call returned an array with no matching index",
@@ -3163,6 +3223,7 @@ affine_array_bytes = state_bytes(array_state({"kind": "i8"}, [
     typed_state("i8", alternatives(2,4)), typed_state("i8", 7),
 ]))
 authored_files = {
+    "exact-startup-mixed-array-catalog-output-once": {"once.txt": b"one receipt"},
     **{name: {"old.json": state_bytes(typed_state("u8", 3)), "new.json": state_bytes(typed_state("u8", 2))}
        for name in ("ordinary-contextual-counter-debit", "exact-startup-contextual-counter-debit")},
     "authored-state-affine-nominal-construction": {
@@ -3370,6 +3431,8 @@ with tempfile.TemporaryDirectory(prefix="affine-calls-") as path:
                 assert not res.stdout,res
                 if code==2:
                     assert expected_stderr in res.stderr,res
+                    if name == "exact-startup-mixed-array-catalog-unsupported-atomic":
+                        assert b"MIXED-ONCE" not in res.stderr and b"proof obligation failed" not in res.stderr, res
                     if name == "exact-startup-qualified-scalar-proof-effect-refused":
                         assert b"UNPUBLISHED-LEAF" not in res.stderr.splitlines(), res
                     if name == "exact-startup-real-integer-tail-rejects-reentry":
@@ -3400,6 +3463,17 @@ with tempfile.TemporaryDirectory(prefix="affine-calls-") as path:
                         assert b"COPY-PRIOR-UNPUBLISHED" not in res.stderr and b"COPY-FORMAL-UNPUBLISHED" not in res.stderr,res
                 elif included and name in proof_diagnostic_notes:
                     assert expected_stderr in res.stderr and proof_diagnostic_notes[name] in res.stderr,res
+                    if "-mixed-array-catalog-" in name:
+                        failures = res.stderr.split(b"error: proof obligation failed")[1:]
+                        assert len(failures) == 2, res
+                        if name.startswith("exact-startup-"):
+                            assert b"proof scalar_limited" in failures[0] and b"scale(3)" in failures[0], res
+                            assert b"proof sample_claim" in failures[1] and b"make(prepared)" in failures[1], res
+                            assert b"call entry: value = 3" in failures[1] and b"symbolic call" not in res.stderr, res
+                            assert res.stderr.count(b"MIXED-ONCE") == (name.endswith("output-once")), res
+                        else:
+                            assert b"proof combined" in failures[0] and b"symbolic call can return 7" in failures[0], res
+                            assert b"proof cells" in failures[1] and b"symbolic call entry: value = 3" in failures[1], res
                     if name in ("ordinary-authored-case-citation-ordered-diagnostics", "exact-startup-authored-case-citation-ordered-diagnostics"):
                         failures = res.stderr.split(b"error: proof obligation failed")[1:]
                         assert len(failures) == 3 and b"core.show(out == 8)" in failures[0], res
