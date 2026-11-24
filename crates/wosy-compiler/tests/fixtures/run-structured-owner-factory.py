@@ -23,14 +23,14 @@ static const unsigned marker[] = {29, 19, 19, 19, 19, 19, 19, 29};
 static const unsigned release_order[] = {0, 2, 1, 3, 6, 5, 4, 7};
 
 void *__wosy_core_alloc(u64 size, u64 alignment) {
-    if (allocated == 8 || size != sizes[allocated] || !alignment || alignment > 64 || 64 % alignment)
+    if (allocated == sizeof(sizes) / sizeof(*sizes) || size != sizes[allocated] || !alignment || alignment > 64 || 64 % alignment)
         __builtin_trap();
     if (++live > peak)
         peak = live;
     return pool[allocated++];
 }
 void __wosy_core_free(void *pointer) {
-    if (!live || released == 8 || release_order[released] >= allocated ||
+    if (!live || released == sizeof(release_order) / sizeof(*release_order) || release_order[released] >= allocated ||
         pointer != pool[release_order[released]] || pool[release_order[released]][0] != marker[release_order[released]])
         __builtin_trap();
     ++released;
@@ -55,11 +55,19 @@ int main(void) { return check(); }
 
 # The named variant deliberately puts a different length in the alternate
 # descriptor without changing its backing size or the allocation trace.
-if sys.argv[3:] == ["named"]:
+label = "alternate selected bases and eight exact receipts released in order"
+if sys.argv[3:] in (["named"], ["all-local"]):
     runtime = runtime.replace("wosy_case_zero() != 2", "wosy_case_zero() != 12")
     runtime = runtime.replace("wosy_case_three() != 2", "wosy_case_three() != 12")
-elif sys.argv[3:]:
-    raise SystemExit("optional third argument must be named")
+if sys.argv[3:] == ["all-local"]:
+    runtime = runtime.replace("{2, 4, 3, 2, 5, 4, 3, 2}", "{2, 2, 2}")
+    runtime = runtime.replace("{29, 19, 19, 19, 19, 19, 19, 29}", "{29, 19, 29}")
+    runtime = runtime.replace("{0, 2, 1, 3, 6, 5, 4, 7}", "{0, 1, 2}")
+    runtime = runtime.replace("allocated != 4 || released != 4 || peak != 3", "allocated != 2 || released != 2 || peak != 1")
+    runtime = runtime.replace("allocated != 8 || released != 8 || peak != 4", "allocated != 3 || released != 3 || peak != 1")
+    label = "branch-local bases, three allocations and three exact caller releases"
+elif sys.argv[3:] not in ([], ["named"]):
+    raise SystemExit("optional third argument must be named or all-local")
 
 with tempfile.TemporaryDirectory(prefix="conditional-receipt-", dir=ir_dir) as tmp:
     work = Path(tmp)
@@ -68,7 +76,7 @@ with tempfile.TemporaryDirectory(prefix="conditional-receipt-", dir=ir_dir) as t
     native = work / "check-native"
     run(clang, "-O0", trace, ir_dir / "native64.ll", "-o", native)
     run(native)
-    print("Native64: alternate selected bases and eight exact receipts released in order", flush=True)
+    print(f"Native64: {label}", flush=True)
 
     triple = "--target=wasm32-unknown-wasi"
     wosy, stub, wasm = work / "wosy.o", work / "trace.o", work / "check.wasm"
@@ -80,4 +88,4 @@ import fs from "node:fs";
 const {instance:{exports:e}} = await WebAssembly.instantiate(fs.readFileSync(process.argv[1]));
 if (e.check() !== 0) throw new Error("conditional receipt trace failed");
 """, wasm)
-    print("Wasm32: alternate selected bases and eight exact receipts released in order", flush=True)
+    print(f"Wasm32: {label}", flush=True)

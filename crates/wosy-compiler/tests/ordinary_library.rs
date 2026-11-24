@@ -1225,60 +1225,86 @@ fn structured_recursive_base_can_transfer_its_branch_local_allocation() {
     let after = rest.split_once("\n};").unwrap().1;
     let text = format!("{before}{after}").replace("Packet selected = make_alt(length); selected", local);
     assert!(!text.contains("make_alt"));
-    for (target, target_layout) in [("native64", ScalarTargetLayout::NATIVE64), ("wasm32", ScalarTargetLayout::WASM32)] {
-        for project in [false, true] {
-            let emit = |text: &str| {
-                let prepared = prepare_scalar_project(vec![(declarations(&app, text), vec![])],
-                    vec![app.clone()], ScalarPreparationInputs { target_layout }).unwrap();
-                let build = analyze_scalar_build(&prepared);
-                assert!(build.diagnostics().is_empty(), "{target}: {:?}", build.diagnostics());
-                if project { emit_scalar_build_project_llvm(&build) }
-                else { wosy_compiler::emit_scalar_build_single_module_llvm(&build) }.map(|module| module.to_text())
-            };
-            let ir = emit(&text).unwrap_or_else(|error| panic!("{target}/{project}: {error}"));
-            let context = Context::create();
-            let module = context.create_module_from_ir(MemoryBuffer::create_from_memory_range_copy(ir.as_bytes(), target)).unwrap();
-            module.verify().unwrap();
-            let symbol = |name: &str| if project { function_with_suffix(&module, name) } else { name.to_owned() };
-            let factory = module.get_function(&symbol("factory")).unwrap();
-            let mut base = None;
-            let mut released = Vec::new();
-            let mut merged = Vec::new();
-            let mut committed = 0;
-            for row in factory.get_basic_blocks().into_iter().flat_map(|block| block.get_instructions()) {
-                let arg = |slot| row.get_operand(slot).unwrap().value().unwrap();
-                if row.get_opcode() == InstructionOpcode::Phi {
-                    merged.extend((0..row.get_num_operands()).filter_map(|n| row.get_operand(n)?.value()));
+    let all_local = include_str!("fixtures/structured-local-factory.w");
+    for (text, all_local) in [(text.as_str(), false), (all_local, true)] {
+        for (target, target_layout) in [("native64", ScalarTargetLayout::NATIVE64), ("wasm32", ScalarTargetLayout::WASM32)] {
+            for project in [false, true] {
+                let emit = |text: &str| {
+                    let prepared = prepare_scalar_project(vec![(declarations(&app, text), vec![])],
+                        vec![app.clone()], ScalarPreparationInputs { target_layout }).unwrap();
+                    let build = analyze_scalar_build(&prepared);
+                    assert!(build.diagnostics().is_empty(), "{target}: {:?}", build.diagnostics());
+                    if project { emit_scalar_build_project_llvm(&build) }
+                    else { wosy_compiler::emit_scalar_build_single_module_llvm(&build) }.map(|module| module.to_text())
+                };
+                let ir = emit(text).unwrap_or_else(|error| panic!("{target}/{project}: {error}"));
+                let context = Context::create();
+                let module = context.create_module_from_ir(MemoryBuffer::create_from_memory_range_copy(ir.as_bytes(), target)).unwrap();
+                module.verify().unwrap();
+                let symbol = |name: &str| if project { function_with_suffix(&module, name) } else { name.to_owned() };
+                let factory = module.get_function(&symbol("factory")).unwrap();
+                let mut bases = Vec::new();
+                let mut released = Vec::new();
+                let mut merged = Vec::new();
+                let mut committed = 0;
+                for row in factory.get_basic_blocks().into_iter().flat_map(|block| block.get_instructions()) {
+                    let arg = |slot| row.get_operand(slot).unwrap().value().unwrap();
+                    if row.get_opcode() == InstructionOpcode::Phi {
+                        merged.extend((0..row.get_num_operands()).filter_map(|n| row.get_operand(n)?.value()));
+                    }
+                    if row.get_opcode() != InstructionOpcode::Call { continue; }
+                    let call = CallSiteValue::try_from(row).unwrap();
+                    let Some(callee) = call.get_called_fn_value() else { continue };
+                    assert!(!all_local || callee != factory, "all-local case must not use a recursive call");
+                    match callee.get_name().to_str().unwrap() {
+                        "__wosy_core_alloc" => bases.push(call.try_as_basic_value().basic().unwrap()),
+                        "__wosy_core_free" => released.push(arg(0)),
+                        name if name.starts_with("llvm.memmove.") && arg(0) == factory.get_last_param().unwrap() => committed += 1,
+                        _ => {}
+                    }
                 }
-                if row.get_opcode() != InstructionOpcode::Call { continue; }
-                let call = CallSiteValue::try_from(row).unwrap();
-                let Some(callee) = call.get_called_fn_value() else { continue };
-                match callee.get_name().to_str().unwrap() {
-                    "__wosy_core_alloc" => assert!(base.replace(call.try_as_basic_value().basic().unwrap()).is_none()),
-                    "__wosy_core_free" => released.push(arg(0)),
-                    name if name.starts_with("llvm.memmove.") && arg(0) == factory.get_last_param().unwrap() => committed += 1,
-                    _ => {}
+                assert_eq!(bases.len(), if all_local { 2 } else { 1 }, "{target}/{project}: {ir}");
+                assert_eq!(released.len(), if all_local { 0 } else { 1 }, "{target}/{project}: {ir}");
+                assert!(bases.iter().all(|base| merged.contains(base) && !released.contains(base)));
+                assert_eq!(committed, 2, "{target}/{project}: both named arms write the destination");
+                let drive = module.get_function(&symbol("drive")).unwrap();
+                let mut received = None;
+                let mut caller_frees = Vec::new();
+                for row in drive.get_basic_blocks().into_iter().flat_map(|block| block.get_instructions()) {
+                    if row.get_opcode() != InstructionOpcode::Call { continue; }
+                    let call = CallSiteValue::try_from(row).unwrap();
+                    let Some(callee) = call.get_called_fn_value() else { continue };
+                    if callee == factory {
+                        assert!(received.replace(call.try_as_basic_value().basic().unwrap()).is_none());
+                    } else if callee.get_name().to_str().unwrap() == "__wosy_core_free" {
+                        caller_frees.push(row.get_operand(0).unwrap().value().unwrap());
+                    }
                 }
+                assert_eq!(caller_frees, [received.expect("caller receives factory result")], "{target}/{project}: {ir}");
+                if let Some(out) = std::env::var_os("WOSY_NAMED_FACTORY_IR_DIR") {
+                    let route = match (all_local, project) {
+                        (true, true) => "all-local-project", (true, false) => "all-local-single",
+                        (false, true) => "local-project", (false, false) => "local-single",
+                    };
+                    let out = std::path::PathBuf::from(out).join(route);
+                    std::fs::create_dir_all(&out).unwrap();
+                    let mut witness = ir.replace("@main(", "@wosy_authored_main(");
+                    for name in ["case_zero", "case_two", "case_three"] {
+                        witness.push_str(&format!("\ndefine i64 @wosy_{name}() {{\nentry:\n  %v = call i64 @{}()\n  ret i64 %v\n}}\n", symbol(name)));
+                    }
+                    std::fs::write(out.join(format!("{target}.ll")), witness).unwrap();
+                }
+                let plain = if all_local {
+                    text.replacen("\n        packet\n",
+                        "\n        Packet plain = { .data = null; .length = packet.length; };\n        plain\n", 1)
+                } else {
+                    text.replace(local, &local.replace("    packet",
+                        "    Packet plain = { .data = null; .length = packet.length; };\n    plain"))
+                };
+                assert_ne!(plain, text);
+                assert!(emit(&plain).expect_err("plain descriptor cannot claim the branch allocation")
+                    .contains("structured aggregate return is not closed on every result path"));
             }
-            let base = base.expect("branch-local allocation");
-            assert!(merged.contains(&base));
-            assert_eq!(released.len(), 1, "{target}/{project}: {ir}");
-            assert!(!released.contains(&base));
-            assert_eq!(committed, 2, "{target}/{project}: both local and named recursive arms write the destination");
-            if let Some(out) = std::env::var_os("WOSY_NAMED_FACTORY_IR_DIR") {
-                let out = std::path::PathBuf::from(out).join(if project { "local-project" } else { "local-single" });
-                std::fs::create_dir_all(&out).unwrap();
-                let mut witness = ir.replace("@main(", "@wosy_authored_main(");
-                for name in ["case_zero", "case_two", "case_three"] {
-                    witness.push_str(&format!("\ndefine i64 @wosy_{name}() {{\nentry:\n  %v = call i64 @{}()\n  ret i64 %v\n}}\n", symbol(name)));
-                }
-                std::fs::write(out.join(format!("{target}.ll")), witness).unwrap();
-            }
-            let plain = text.replace(local, &local.replace("    packet",
-                "    Packet plain = { .data = null; .length = packet.length; };\n    plain"));
-            assert_ne!(plain, text);
-            assert!(emit(&plain).expect_err("plain descriptor cannot claim the branch allocation")
-                .contains("structured aggregate return is not closed on every result path"));
         }
     }
 }

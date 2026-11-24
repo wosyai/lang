@@ -2690,6 +2690,12 @@ struct StructuredOwnerReturn {
     complete: bool,
 }
 
+impl StructuredOwnerReturn {
+    fn has_owning_leaf(&self) -> bool {
+        !self.leaves.is_empty() || !self.local.is_empty()
+    }
+}
+
 struct Body<'a> {
     facts: Option<&'a AggregateFlowResult>,
     cfg: &'a ScalarReferenceCfg,
@@ -4015,7 +4021,7 @@ fn closed_aggregates<'a>(
                 }
             }
         }
-        if let Some(shape) = body.structured_owner_return().filter(|shape| !shape.leaves.is_empty()) {
+        if let Some(shape) = body.structured_owner_return().filter(StructuredOwnerReturn::has_owning_leaf) {
             for &leaf in &shape.leaves {
                 if let Some(target) = target_body(&declarations, body.cfg, leaf) {
                     callers.entry(target).or_default().push(key);
@@ -4689,7 +4695,7 @@ fn closed_aggregates<'a>(
                 ));
             }
             let route = if let Some(shape) = structured_returns.get(&key) {
-                if !shape.complete || shape.leaves.is_empty() || shape.leaves.iter().any(|&leaf| {
+                if !shape.complete || !shape.has_owning_leaf() || shape.leaves.iter().any(|&leaf| {
                     target_body(&declarations, body.cfg, leaf).is_none_or(|target|
                         !outgoing.contains(&target) || bodies.get(&target).is_none_or(Body::has_mixed_struct_result))
                 }) {
