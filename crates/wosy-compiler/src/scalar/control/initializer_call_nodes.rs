@@ -692,7 +692,7 @@ impl<'a> CallableBodyCallNodes<'a> {
         self.proof_nodes.calls.is_some_and(|calls| calls.local_shared_call_families.get(&ordinal) == Some(&true))
     }
 
-    pub(crate) fn local_callable_destination_span(&self, place: &ScalarPlace) -> Option<ByteSpan> {
+    pub(crate) fn lexical_existing_destination_span(&self, place: &ScalarPlace) -> Option<ByteSpan> {
         match self.direct_destination(place)? {
             DirectDestinationIdentity::Existing(binding) => Some(binding.declaration_span),
             DirectDestinationIdentity::Module(_) | DirectDestinationIdentity::Introduce { .. } => None,

@@ -12422,3 +12422,74 @@ if (three() != 3) { core.system_panic(); };
         }
     }
 }
+
+#[test]
+fn widened_owning_array_replaces_distinct_live_target_after_call() {
+    use inkwell::{memory_buffer::MemoryBuffer, values::{CallSiteValue, InstructionOpcode}};
+    let text = "%%start
+u8[](u8[]) identity = fn(values) { values };
+u8[](u8[]) relay = fn(values) { identity(values) };
+u64() replace = fn() {
+    u8[] target = [11, 13];
+    u64 before = core.array_len(&target);
+    u8[] source = [3, 5, 7];
+    target = relay(source);
+    before * 10 + core.array_len(&target)
+};
+if (replace() != 23) { core.system_panic(); };
+%%end";
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let prepared = prepare_initializer_test(text, layout);
+        let checked = analyze_scalar_build(&prepared);
+        assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+        let source = &prepared.project().modules[0].source;
+        for (project, emitted) in [(false, emit_scalar_build_single_module_llvm(&checked)),
+            (true, emit_scalar_build_project_llvm(&checked))]
+        {
+            let llvm = emitted.unwrap().to_text();
+            let context = Context::create();
+            let buffer = MemoryBuffer::create_from_memory_range_copy(llvm.as_bytes(), "exact widened owning replacement");
+            let module = context.create_module_from_ir(buffer).unwrap();
+            module.verify().unwrap();
+            let relay = module.get_function(&self_tail_test_symbol(source, project, "relay")).unwrap();
+            let alloc = module.get_function("__wosy_core_alloc").unwrap();
+            let free = module.get_function("__wosy_core_free").unwrap();
+            let function = module.get_function(&self_tail_test_symbol(source, project, "replace")).unwrap();
+            let instructions = function.get_basic_blocks().into_iter().flat_map(|block|
+                std::iter::successors(block.get_first_instruction(), |instruction| instruction.get_next_instruction()))
+                .collect::<Vec<_>>();
+            let calls_to = |callee| instructions.iter().enumerate().filter_map(|(position, &instruction)|
+                CallSiteValue::try_from(instruction).ok().filter(|call| call.get_called_fn_value() == Some(callee))
+                    .map(|_| (position, instruction))).collect::<Vec<_>>();
+            let [(previous_position, previous), (source_position, incoming)] = calls_to(alloc)[..]
+                else { panic!("expected two exact original allocations: {llvm}") };
+            let [(called, call)] = calls_to(relay)[..] else { panic!("one owning call: {llvm}") };
+            let [(release_previous, predecessor_free), (release_result, result_free)] = calls_to(free)[..]
+                else { panic!("one free per original backing: {llvm}") };
+            let operand = |inst, index| known_field_operand(inst, index).unwrap();
+            assert_eq!(operand(previous, 0).into_int_value().get_zero_extended_constant(), Some(2));
+            assert_eq!(operand(incoming, 0).into_int_value().get_zero_extended_constant(), Some(3));
+            let count_lane = operand(call, 0).as_instruction_value().unwrap();
+            assert_eq!(count_lane.get_opcode(), InstructionOpcode::InsertValue);
+            assert_eq!(count_lane.get_indices(), vec![1]);
+            assert_eq!(operand(count_lane, 1).into_int_value().get_zero_extended_constant(), Some(3));
+            let address_lane = operand(count_lane, 0).as_instruction_value().unwrap();
+            assert_eq!(address_lane.get_indices(), vec![0]);
+            assert_eq!(operand(address_lane, 1).as_instruction_value(), Some(incoming));
+            assert_eq!(operand(predecessor_free, 0).as_instruction_value(), Some(previous));
+            let returned = operand(result_free, 0).as_instruction_value().unwrap();
+            assert_eq!(returned.get_opcode(), InstructionOpcode::ExtractValue);
+            assert_eq!(returned.get_indices(), vec![0]);
+            assert_eq!(operand(returned, 0).as_instruction_value(), Some(call));
+            assert!(previous_position < source_position && source_position < called
+                && called < release_previous && release_previous < release_result, "{llvm}");
+            if let Some(out) = std::env::var_os("WOSY_WIDENED_OWNING_REPLACE_IR_DIR") {
+                let target = if layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
+                let route = if project { "project" } else { "standalone" };
+                let controlled = llvm.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);
+                assert_ne!(controlled, llvm);
+                std::fs::write(std::path::PathBuf::from(out).join(format!("{target}-{route}-control.ll")), controlled).unwrap();
+            }
+        }
+    }
+}

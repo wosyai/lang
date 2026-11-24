@@ -274,6 +274,10 @@ fn runtime_allocation_access(
     let widened_rebind_points = plan.filter(|plan| !plan.widened_rebinds.is_empty())
         .map(|plan| plan.widened_rebinds.values().map(|rebind| rebind.point).collect::<std::collections::HashSet<_>>());
     let widened_owning_install = plan.and_then(|plan| plan.widened_owning_roundtrip).map(|(_, install, _)| install);
+    let widened_owning_replacements = plan.filter(|plan| !plan.widened_owning_receives.is_empty())
+        .map(|plan| plan.widened_owning_receives.values()
+            .filter_map(|(_, _, replace)| replace.map(|(install, _)| install))
+            .collect::<std::collections::HashSet<_>>());
     let mut proved_extent_writes = HashMap::new();
     if let (true, Some(nodes), Some(plan)) = (checked_access, body_nodes, plan) {
         // This exact install updates pointer and returned extent together.
@@ -305,6 +309,7 @@ fn runtime_allocation_access(
             CfgPointKind::Assign { target, rhs_point, .. } if target.projections.is_empty() => {
                 if widened_rebind_points.as_ref().is_some_and(|points| points.contains(&point.id))
                     || widened_owning_install == Some(point.id)
+                    || widened_owning_replacements.as_ref().is_some_and(|points| points.contains(&point.id))
                 {
                     // This dominating existing-owner transfer re-keys the
                     // original pointer and extent, rather than storing either
@@ -4299,6 +4304,36 @@ fn install_assignment_destination<'ctx>(
     }
 }
 
+fn emit_widened_owning_replace<'ctx>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, '_>,
+    assignment: &ScalarAssignment,
+    project: Option<ProjectCallScope<'_>>,
+) -> Result<bool, String> {
+    let Some(plan) = state.aggregate.as_ref().map(|aggregate| aggregate.plan())
+        .filter(|plan| !plan.widened_owning_receives.is_empty()) else { return Ok(false) };
+    let ([target], [call @ ScalarExpression::Call { arguments, .. }]) =
+        (assignment.targets.as_slice(), assignment.values.as_slice()) else { return Ok(false) };
+    let nodes = state.body_call_nodes.ok_or("missing prepared widened owning replacement")?;
+    let Some((source, receiver, Some((_, destination)))) = nodes.expression_ordinal(call)
+        .and_then(|call| plan.widened_owning_receives.get(&call)).copied()
+    else { return Ok(false) };
+    let (crate::ScalarPlace::Name { name: target_name, .. }, [source_arg @ ScalarExpression::Name { name: source_name, .. }]) =
+        (&target.place, arguments.as_slice()) else { return Err("invalid widened owning replacement".into()); };
+    if nodes.place_ordinal(&target.place) != Some(destination)
+        || nodes.lexical_existing_destination_span(&target.place) != Some(receiver)
+        || nodes.lexical_expression_declaration(source_arg) != Some(source)
+    { return Err("widened owning replacement changed its prepared operands".into()); }
+    let (_, ty) = state.storage.get(target_name).cloned().ok_or("missing widened target declaration")?;
+    let value = match project {
+        Some(project) => emit_project_typed_expression(context, state, call, &ty, project.module, project.modules)?,
+        None => emit_typed_expression(context, state, call, &ty)?,
+    };
+    aggregate_transfer::install_widened_owning_local(context, state, (source_name, source),
+        (target_name, receiver, &ty), true, &value)?;
+    Ok(true)
+}
+
 fn emit_widened_rebind<'ctx>(
     context: &'ctx Context,
     state: &mut EmitState<'ctx, '_>,
@@ -4351,7 +4386,8 @@ fn emit_assignment<'ctx, 'module>(
     state: &mut EmitState<'ctx, 'module>,
     assignment: &ScalarAssignment,
 ) -> Result<EmitValue<'ctx>, String> {
-    if emit_widened_rebind(context, state, assignment, None)? {
+    if emit_widened_owning_replace(context, state, assignment, None)?
+        || emit_widened_rebind(context, state, assignment, None)? {
         return Ok(EmitValue::Unit);
     }
     if let Some(value) = local_callable::replace(state, assignment)? {
@@ -4449,7 +4485,8 @@ fn emit_project_assignment<'ctx, 'module>(
     module: &ScalarModule,
     modules: &[&ScalarModule],
 ) -> Result<EmitValue<'ctx>, String> {
-    if emit_widened_rebind(context, state, assignment, Some(ProjectCallScope { module, modules }))? {
+    if emit_widened_owning_replace(context, state, assignment, Some(ProjectCallScope { module, modules }))?
+        || emit_widened_rebind(context, state, assignment, Some(ProjectCallScope { module, modules }))? {
         return Ok(EmitValue::Unit);
     }
     if let Some(value) = local_callable::replace(state, assignment)? {

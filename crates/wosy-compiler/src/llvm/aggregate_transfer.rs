@@ -420,7 +420,7 @@ pub(super) fn emit_array_descriptor_call<'ctx>(
     let function = *state.functions.get(symbol).ok_or("missing checked array descriptor producer")?;
     let plan = state.aggregate.as_ref().expect("sealed array descriptor call").plan;
     let rebind = plan.array_descriptor_rebinds.get(&ordinal).map(|&(declaration, _)| declaration);
-    let fresh = plan.widened_owning_receives.get(&ordinal).map(|&(declaration, _)| declaration);
+    let fresh = plan.widened_owning_receives.get(&ordinal).map(|&(declaration, _, _)| declaration);
     let owning = rebind.or(fresh);
     let args = if let Some(declaration) = owning {
         let [argument @ ScalarExpression::Name { name, .. }] = arguments else {
@@ -475,7 +475,7 @@ pub(super) fn install_widened_owning_receiver<'ctx>(
     let Some(plan) = state.aggregate.as_ref().map(|aggregate| aggregate.plan)
         .filter(|plan| !plan.widened_owning_receives.is_empty()) else { return Ok(false) };
     let nodes = state.body_call_nodes.ok_or("missing checked owning array receiver nodes")?;
-    let Some((source, receiver)) = nodes.expression_ordinal(&binding.value)
+    let Some((source, receiver, None)) = nodes.expression_ordinal(&binding.value)
         .and_then(|call| plan.widened_owning_receives.get(&call)).copied()
     else { return Ok(false) };
     let ([receiver_slot], ScalarExpression::Call { arguments, .. }) =
@@ -484,11 +484,28 @@ pub(super) fn install_widened_owning_receiver<'ctx>(
     let [argument @ ScalarExpression::Name { name, .. }] = arguments.as_slice()
     else { return Err("missing exact widened array source".into()); };
     if receiver_slot.name_span != receiver || nodes.binding_position(binding).is_none()
-        || nodes.lexical_expression_declaration(argument) != Some(source) || name == &receiver_slot.name
-        || state.runtime_array_owners.get(name) != Some(&true)
-        || state.runtime_array_allocations.get(name) != Some(&true)
+        || nodes.lexical_expression_declaration(argument) != Some(source)
     { return Err("widened owning receiver changed its exact lexical move".into()); }
-    let (previous, _) = state.storage.get(name).ok_or("missing original widened array backing")?;
+    install_widened_owning_local(context, state, (name, source), (&receiver_slot.name, receiver, &receiver_slot.ty),
+        false, value)?;
+    Ok(true)
+}
+
+pub(super) fn install_widened_owning_local<'ctx>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, '_>,
+    (source_name, source): (&str, wosy_syntax::ByteSpan),
+    (target_name, receiver, target_ty): (&str, wosy_syntax::ByteSpan, &ScalarType),
+    replace: bool,
+    value: &EmitValue<'ctx>,
+) -> Result<(), String> {
+    if source_name == target_name
+        || state.runtime_array_owners.get(source_name) != Some(&true)
+        || state.runtime_array_allocations.get(source_name) != Some(&true)
+    {
+        return Err("widened owning install lost its active source".into());
+    }
+    let (previous, _) = state.storage.get(source_name).ok_or("missing original widened array backing")?;
     if !matches!(state.local_runtime_extents.get(previous),
         Some((declaration, LocalRuntimeExtent::WidenedLiteral(_), true)) if *declaration == source)
     { return Err("widened owning receiver lost its active source extent".into()); }
@@ -500,11 +517,23 @@ pub(super) fn install_widened_owning_receiver<'ctx>(
     }
     let base = state.builder.build_extract_value(*pair, 0, "array_descriptor_backing").map_err(builder_error)?.into_pointer_value();
     let count = state.builder.build_extract_value(*pair, 1, "array_descriptor_extent").map_err(builder_error)?.into_int_value();
-    install_runtime_array_binding_owner(state, &receiver_slot.name, true, true, Some(name));
-    state.storage.insert(receiver_slot.name.clone(), (base, receiver_slot.ty.clone()));
+    if replace {
+        let (target, _) = state.storage.get(target_name).ok_or("missing widened predecessor")?;
+        if *target == previous || state.runtime_array_owners.get(target_name) != Some(&true)
+            || state.runtime_array_allocations.get(target_name) != Some(&true)
+            || !matches!(state.local_runtime_extents.get(target),
+                Some((declaration, LocalRuntimeExtent::WidenedLiteral(_), true)) if *declaration == receiver)
+        { return Err("widened owning install lost its distinct active target".into()); }
+        let target = *target;
+        ownership::consume_runtime_array_release(context, state,
+            ownership::RuntimeArrayRelease { pointer: target.into(), live: None })?;
+        state.local_runtime_extents.remove(&target);
+    }
+    install_runtime_array_binding_owner(state, target_name, true, true, Some(source_name));
+    state.storage.insert(target_name.to_owned(), (base, target_ty.clone()));
     state.local_runtime_extents.remove(&previous);
     state.local_runtime_extents.insert(base, (receiver, LocalRuntimeExtent::WidenedLiteral(count), true));
-    Ok(true)
+    Ok(())
 }
 
 pub(super) fn definition_type<'ctx>(

@@ -122,7 +122,7 @@ pub(super) fn replace<'ctx>(
         return Ok(None);
     };
     let selected = assignment.targets.iter().find_map(|target| {
-        let span = nodes.local_callable_destination_span(&target.place)?;
+        let span = nodes.lexical_existing_destination_span(&target.place)?;
         state.local_callable_slots.get(&(span.start, span.end))
     });
     let Some(slot) = selected else { return Ok(None) };

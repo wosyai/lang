@@ -4970,7 +4970,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             .is_some_and(|(actual, _, source)| *actual == primary_ordinal && source.declaration_span == owner))
                             .ok_or_else(|| self.missing_context(expression_span(primary),
                                 ReferenceAnalysisErrorReason::UnprovedWidenedArrayTransfer))?;
-                        self.aggregate_result.widened_owning_receives.push((point, primary_ordinal, owner, receiver.span));
+                        self.aggregate_result.widened_owning_receives.push((point, primary_ordinal, owner, receiver.span, None));
                     }
                     let widened = widened_join || widened_move || widened_receiver_source.is_some()
                         || super::widened_local_literal(binding).is_some();
@@ -5353,11 +5353,29 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         else { return None; };
                         (source == binding).then_some((occurrence, destination, binding.declaration_span))
                     })();
+                    let widened_owning_replace = (|| {
+                        if scope != ReferenceScopeId(0) { return None; }
+                        let owners = self.widened_arrays.as_ref()?;
+                        let ([target], [value]) = (assignment.targets.as_slice(), assignment.values.as_slice())
+                        else { return None; };
+                        if !matches!(target.place, ScalarPlace::Name { .. }) { return None; }
+                        let call = group.rhs_evaluations().next()?.expression;
+                        let source = self.widened_owning_argument(value, call, block.span)?;
+                        let destination = group.destinations().next()?.destination;
+                        let DirectDestinationIdentity::Existing(target) = calls.prepared_direct_destination(destination)?
+                        else { return None; };
+                        (source != target && owners.contains(target) && target.block_span == block.span
+                            && self.binding_types.get(source).zip(self.binding_types.get(target))
+                                .is_some_and(|(a, b)| aggregate::same_runtime_array_type(a, b)))
+                            .then_some((call, destination, source.declaration_span, target.declaration_span))
+                    })();
                     let mut values = Vec::new();
                     for evaluation in group.rhs_evaluations() {
                         let value = &assignment.values[evaluation.position];
-                        let mode = match widened_roundtrip {
-                            Some((call, _, owner)) if call == evaluation.expression => ExpressionReadMode::WidenedOwningRoundtrip(owner),
+                        let exact_move = widened_roundtrip.map(|(call, _, owner)| (call, owner))
+                            .or(widened_owning_replace.map(|(call, _, owner, _)| (call, owner)));
+                        let mode = match exact_move {
+                            Some((call, owner)) if call == evaluation.expression => ExpressionReadMode::WidenedOwningRoundtrip(owner),
                             _ => ExpressionReadMode::Ordinary,
                         };
                         let result = self.expression_with_read_mode(value, scope, evaluation.expression, mode)?;
@@ -5504,7 +5522,9 @@ impl<'a> ReferenceFlowBuilder<'a> {
                                 *destination == slot.destination && *target == id.declaration_span);
                             let widened_roundtrip = widened_roundtrip.filter(|(_, destination, owner)|
                                 *destination == slot.destination && *owner == id.declaration_span);
-                            if widened_rebind.is_none() && widened_roundtrip.is_none()
+                            let widened_owning_replace = widened_owning_replace.filter(|(_, destination, _, target)|
+                                *destination == slot.destination && *target == id.declaration_span);
+                            if widened_rebind.is_none() && widened_roundtrip.is_none() && widened_owning_replace.is_none()
                                 && self.widened_arrays.as_ref().is_some_and(|owners| owners.contains(&id))
                                 && matches!(&assign, CfgPointKind::Assign { target, .. } if target.projections.is_empty())
                             {
@@ -5518,6 +5538,16 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             }
                             if let Some((call, _, owner)) = widened_roundtrip {
                                 self.aggregate_result.widened_owning_roundtrip = Some((call, emitted.install, owner));
+                            }
+                            if let Some((call, destination, source, target)) = widened_owning_replace {
+                                if !self.aggregate_facts.array_calls.get(&emitted.rhs)
+                                    .is_some_and(|(actual, _, binding)| *actual == call && binding.declaration_span == source)
+                                {
+                                    return Err(self.missing_context(*span, ReferenceAnalysisErrorReason::UnprovedWidenedArrayTransfer));
+                                }
+                                self.proof_points.widened_rebind_points.get_or_insert_with(HashSet::new).insert(emitted.install);
+                                self.aggregate_result.widened_owning_receives.push((emitted.rhs, call, source, target,
+                                    Some((emitted.install, destination.0))));
                             }
                             self.author_direct_assignment(emitted, existing_prepared && capture.is_none()
                                 && assignment.targets.len() == 1 && assignment.values.len() == 1);
