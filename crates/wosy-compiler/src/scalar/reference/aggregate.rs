@@ -4837,6 +4837,106 @@ fn install_fresh_recursive_recommits<'a>(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+struct SelectedReturnDependency {
+    target: BodyKey,
+    primary: bool,
+    recursive_allowed: bool,
+}
+
+// Only exact selected-return bodies enter this condensed graph. Both walks
+// are iterative; each indexed edge is visited a fixed number of times.
+fn selected_return_components(
+    graph: &[(BodyKey, Vec<SelectedReturnDependency>)],
+) -> Vec<(Vec<BodyKey>, Vec<BodyKey>)> {
+    let count = graph.len();
+    // Assign selected body IDs in the existing declaration order, then
+    // assign external target IDs on first occurrence. The index is queried
+    // only while building adjacency; hash iteration does not set ordering.
+    let mut keys: Vec<_> = graph.iter().map(|(key, _)| *key).collect();
+    let mut index: HashMap<_, _> = keys.iter().copied().enumerate().map(|(id, key)| (key, id)).collect();
+    let mut reverse = vec![Vec::new(); count];
+    let edges: Vec<Vec<_>> = graph.iter().enumerate().map(|(caller, (_, edges))| edges.iter().map(|edge| {
+        let target = *index.entry(edge.target).or_insert_with(|| {
+            let id = keys.len();
+            keys.push(edge.target);
+            id
+        });
+        if target < count {
+            reverse[target].push(caller);
+        }
+        (target, edge.primary, edge.recursive_allowed)
+    }).collect()).collect();
+
+    let mut ordered = Vec::with_capacity(count);
+    let mut visited = vec![false; count];
+    let mut stack = Vec::new();
+    for start in 0..count {
+        if visited[start] { continue; }
+        stack.push((start, false));
+        while let Some((node, done)) = stack.pop() {
+            if done {
+                ordered.push(node);
+            } else if !std::mem::replace(&mut visited[node], true) {
+                stack.push((node, true));
+                stack.extend(edges[node].iter().filter(|(target, _, _)| *target < count)
+                    .map(|&(target, _, _)| (target, false)));
+            }
+        }
+    }
+
+    let unassigned = usize::MAX;
+    let mut group = vec![unassigned; count];
+    let mut dependency_seen = vec![unassigned; keys.len()];
+    let mut stamp = 0;
+    let mut pending = Vec::new();
+    let mut members = Vec::new();
+    let mut result = Vec::new();
+    while let Some(start) = ordered.pop() {
+        if group[start] != unassigned { continue; }
+        group[start] = stamp;
+        pending.push(start);
+        members.clear();
+        while let Some(node) = pending.pop() {
+            members.push(node);
+            for &caller in &reverse[node] {
+                if group[caller] == unassigned {
+                    group[caller] = stamp;
+                    pending.push(caller);
+                }
+            }
+        }
+
+        let mut external = Vec::new();
+        let mut external_primary = false;
+        let mut valid = true;
+        for &member in &members {
+            let mut self_edges = 0;
+            for &(target, primary, recursive_allowed) in &edges[member] {
+                if target < count && group[target] == stamp {
+                    self_edges += usize::from(target == member);
+                    if !recursive_allowed || !primary || self_edges > 1 {
+                        valid = false;
+                    }
+                } else {
+                    external_primary |= primary;
+                    if dependency_seen[target] != stamp {
+                        dependency_seen[target] = stamp;
+                        external.push(keys[target]);
+                    }
+                }
+            }
+        }
+        // An SCC cannot seed itself. In particular, an independently
+        // released sibling never supplies the result that roots recurrence.
+        if valid && external_primary {
+            result.push((members.iter().map(|&id| keys[id]).collect(), external));
+        }
+        stamp += 1;
+    }
+    result
+}
+
 fn closed_aggregates<'a>(
     reservations: &AggregateReservations,
     module_at: impl Fn(usize) -> Option<ModuleInput<'a>>,
@@ -4922,8 +5022,7 @@ fn closed_aggregates<'a>(
         birth: CfgPointId,
     }
     let mut selected_returns = BTreeMap::<BodyKey, LocalReceiptChoice>::new();
-    let mut selected_return_waiters = BTreeMap::<BodyKey, Vec<BodyKey>>::new();
-    let mut selected_return_dependencies = BTreeMap::<BodyKey, usize>::new();
+    let mut selected_return_graph = Vec::<(BodyKey, Vec<SelectedReturnDependency>)>::new();
     let mut recommit_observers = BTreeMap::<(BodyKey, CfgPointId), BTreeSet<(BodyKey, usize)>>::new();
     let mut recommit_edges = BTreeMap::<(BodyKey, CfgPointId), Vec<(CfgPointId, Option<CfgPointId>)>>::new();
     let mut structured_returns = BTreeMap::new();
@@ -5029,36 +5128,22 @@ fn closed_aggregates<'a>(
                 let target = target_body(&declarations, body.cfg, point)?;
                 Some((target, *identity_relays.get(&target)?))
             }) {
-                let dependencies = (|| {
-                    let mut dependencies = BTreeSet::new();
-                    let mut recurs = false;
-                    let mut external_primary = false;
-                    for &point in choice.all_producers() {
-                        let target = target_body(&declarations, body.cfg, point)?;
-                        let primary = choice.leaves.contains(&point);
-                        if bodies.get(&target)?.has_mixed_struct_result() { return None; }
-                        if target == key {
-                            let ordinal = body.facts?.calls.get(&point)?;
-                            if recurs || !primary
-                                || body.sites.declared_unsafe_calls.contains(&ordinal.0)
-                                || !body.sites.boundary.parameters.iter().all(|parameter| ordinary_value(&parameter.ty))
-                            { return None; }
-                            recurs = true;
-                        } else {
-                            external_primary |= primary;
-                            dependencies.insert(target);
-                        }
-                    }
-                    // Only result-producing alternatives can ground the
-                    // recurrence. An independently released sibling never can.
-                    if recurs && !external_primary { return None; }
-                    Some(dependencies)
-                })();
+                // Every cyclic component member has an outgoing internal edge.
+                // Check its own signature once, not once per incoming edge.
+                let ordinary_parameters = body.sites.boundary.parameters.iter()
+                    .all(|parameter| ordinary_value(&parameter.ty));
+                let dependencies: Option<Vec<_>> = choice.all_producers().map(|&point| {
+                    let target = target_body(&declarations, body.cfg, point)?;
+                    let callee = bodies.get(&target)?;
+                    if callee.has_mixed_struct_result() { return None; }
+                    let primary = choice.leaves.contains(&point);
+                    let ordinal = body.facts?.calls.get(&point)?;
+                    let recursive_allowed = primary && !body.sites.declared_unsafe_calls.contains(&ordinal.0)
+                        && ordinary_parameters;
+                    Some(SelectedReturnDependency { target, primary, recursive_allowed })
+                }).collect();
                 if let Some(dependencies) = dependencies {
-                    selected_return_dependencies.insert(key, dependencies.len());
-                    for dependency in dependencies {
-                        selected_return_waiters.entry(dependency).or_default().push(key);
-                    }
+                    selected_return_graph.push((key, dependencies));
                     selected_returns.insert(key, choice);
                     continue;
                 }
@@ -5095,6 +5180,16 @@ fn closed_aggregates<'a>(
             }
         }
     }
+    let mut selected_return_waiters = HashMap::<BodyKey, Vec<usize>>::new();
+    let mut selected_return_groups = Vec::new();
+    for (members, dependencies) in selected_return_components(&selected_return_graph) {
+        let group = selected_return_groups.len();
+        selected_return_groups.push((members, dependencies.len()));
+        for dependency in dependencies {
+            selected_return_waiters.entry(dependency).or_default().push(group);
+        }
+    }
+    drop(selected_return_graph);
     let mut recommitted = BTreeMap::<(BodyKey, CfgPointId), RecommitOrigin>::new();
     let mut recommit_waiting = BTreeMap::<BodyKey, Vec<_>>::new();
     for &(caller, producer) in recommit_edges.keys() {
@@ -5106,8 +5201,8 @@ fn closed_aggregates<'a>(
     // Only independently allocated owners seed the two worklists. A wrapper
     // becomes an owning producer when its returned recommit has such a seed.
     // Each observed call edge is consumed once, including through wrapper chains.
-    // A selected returned receipt also waits for every distinct non-self
-    // branch or sibling producer; a checked self edge is never a worklist seed.
+    // A selected return group waits for every distinct external branch or
+    // sibling producer; internal checked recursive edges never seed a group.
     loop {
         if let Some(target) = pending.pop() {
             if let Some(body_callers) = callers.remove(&target) {
@@ -5118,11 +5213,15 @@ fn closed_aggregates<'a>(
                 }
             }
             if let Some(waiters) = selected_return_waiters.remove(&target) {
-                for waiter in waiters {
-                    let remaining = selected_return_dependencies.get_mut(&waiter).expect("indexed selected owner return");
+                for group in waiters {
+                    let (members, remaining) = &mut selected_return_groups[group];
                     *remaining -= 1;
-                    if *remaining == 0 && outgoing.insert(waiter) {
-                        pending.push(waiter);
+                    if *remaining == 0 {
+                        for &member in members.iter() {
+                            if outgoing.insert(member) {
+                                pending.push(member);
+                            }
+                        }
                     }
                 }
             }
@@ -6283,6 +6382,32 @@ impl ProjectReferenceResults {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selected_return_components_require_external_primary_and_exact_internal_edges() {
+        let key = |item| (0, item, None);
+        let (a, b, c, base, sibling) = (key(0), key(1), key(2), key(3), key(4));
+        let edge = |target, primary, recursive_allowed| SelectedReturnDependency { target, primary, recursive_allowed };
+        let mut graph = vec![
+            (a, vec![edge(b, true, true), edge(sibling, false, false)]),
+            (b, vec![edge(c, true, true), edge(base, true, true)]),
+            (c, vec![edge(a, true, true), edge(sibling, false, false)]),
+        ];
+        let accepted = selected_return_components(&graph);
+        let [(members, dependencies)] = accepted.as_slice() else { panic!("expected one grounded component") };
+        assert_eq!(members.iter().copied().collect::<BTreeSet<_>>(), BTreeSet::from([a, b, c]));
+        assert_eq!(dependencies.len(), 2, "duplicate external target enters the wait list once");
+        assert_eq!(dependencies.iter().copied().collect::<BTreeSet<_>>(), BTreeSet::from([base, sibling]));
+        assert_eq!(accepted, selected_return_components(&graph), "dense traversal order is stable");
+
+        graph[1].1.pop();
+        assert!(selected_return_components(&graph).is_empty(), "a sibling is not a result ground");
+        graph[1].1.push(edge(base, true, true));
+        graph[2].1[0] = edge(a, false, false);
+        assert!(selected_return_components(&graph).is_empty(), "sibling recursion cannot close a result cycle");
+        graph[2].1[0] = edge(a, true, false);
+        assert!(selected_return_components(&graph).is_empty(), "an unchecked primary edge cannot close a result cycle");
+    }
 
     #[test]
     fn indirect_fresh_array_use_requires_the_same_normalized_signature() {

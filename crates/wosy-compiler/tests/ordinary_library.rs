@@ -1159,8 +1159,18 @@ fn selected_recommitted_owner_returns_its_backing_to_the_caller() {
             "if (depth == 0) { if (choose) { make_short(2) } else { make_long(2) } } else { shipment(depth - 1, choose) }")
         .replace("drive(3, true)", "drive(3, false)");
     assert_ne!(recursive, with_siblings);
+    let (_, bodies_and_caller) = recursive.split_once("Packet(u64, bool) shipment").unwrap();
+    let (shipment_body, _) = bodies_and_caller.split_once("u64(u64, bool) drive").unwrap();
+    let seed_choice = "if (depth == 0) { if (choose) { make_short(2) } else { make_long(2) } } else { shipment(depth - 1, choose) }";
+    let alternate = shipment_body.replace(seed_choice,
+        "if (depth == 0) { shipment(0, choose) } else { shipment(depth - 1, choose) }");
+    assert_ne!(shipment_body, alternate);
+    let mutual = recursive.replace("shipment(depth - 1, choose) }", "alternate(depth - 1, choose) }")
+        .replace("u64(u64, bool) drive", &format!("Packet(u64, bool) alternate{alternate}u64(u64, bool) drive"));
+    assert_ne!(recursive, mutual);
     for (variant, text) in [
-        ("baseline", text.as_str()), ("siblings", with_siblings.as_str()), ("recursive", recursive.as_str()),
+        ("baseline", text.as_str()), ("siblings", with_siblings.as_str()),
+        ("recursive", recursive.as_str()), ("mutual", mutual.as_str()),
     ] {
         for (target, target_layout) in [("native64", ScalarTargetLayout::NATIVE64), ("wasm32", ScalarTargetLayout::WASM32)] {
             for (route, project) in [("single", false), ("project", true)] {
@@ -1185,65 +1195,75 @@ fn selected_recommitted_owner_returns_its_backing_to_the_caller() {
                 );
                 let factories = [find("make_short"), find("make_long")];
                 let sibling_factory = (variant != "baseline").then(|| find("neighbor"));
-                let mut recursive_returns = Vec::new();
-                let mut siblings = Vec::new();
-                let mut local_releases = Vec::new();
-                assert_eq!(ship.count_params(), 3, "{ir}");
-                assert_eq!(relay.count_params(), 1, "{ir}");
-                assert_eq!(drive.count_params(), 2, "{ir}");
-                let mut original = Vec::new();
-                let mut reads_and_handoff = Vec::new();
-                let mut returned = None;
-                let mut bases = Vec::new();
-                for row in ship.get_basic_blocks().into_iter().flat_map(|block| block.get_instructions()) {
-                    if row.get_opcode() == InstructionOpcode::Phi && row.to_string().contains("phi ptr") {
-                        let incoming = (0..row.get_num_operands()).filter_map(|n| row.get_operand(n)?.value()).collect::<Vec<_>>();
-                        bases.push((inkwell::values::PhiValue::try_from(row).unwrap().as_basic_value(), incoming));
+                let frames = match variant {
+                    "mutual" => {
+                        let alternate = find("alternate");
+                        vec![(ship, Some(alternate), 2, 1), (alternate, Some(ship), 0, 2)]
                     }
-                    if row.get_opcode() == InstructionOpcode::Return {
-                        assert!(returned.replace(row.get_operand(0).unwrap().value().unwrap()).is_none());
-                        assert!(local_releases.iter().copied().eq(siblings.iter().rev().copied()),
-                            "release only local siblings, in reverse birth order before returning");
+                    "recursive" => vec![(ship, Some(ship), 2, 1)],
+                    _ => vec![(ship, None, 2, 0)],
+                };
+                for (frame, recursive_target, local_leaves, recursive_leaves) in frames {
+                    let mut recursive_returns = Vec::new();
+                    let mut siblings = Vec::new();
+                    let mut local_releases = Vec::new();
+                    assert_eq!(frame.count_params(), 3, "{ir}");
+                    assert_eq!(relay.count_params(), 1, "{ir}");
+                    assert_eq!(drive.count_params(), 2, "{ir}");
+                    let mut original = Vec::new();
+                    let mut reads_and_handoff = Vec::new();
+                    let mut returned = None;
+                    let mut bases = Vec::new();
+                    for row in frame.get_basic_blocks().into_iter().flat_map(|block| block.get_instructions()) {
+                        if row.get_opcode() == InstructionOpcode::Phi && row.to_string().contains("phi ptr") {
+                            let incoming = (0..row.get_num_operands()).filter_map(|n| row.get_operand(n)?.value()).collect::<Vec<_>>();
+                            bases.push((inkwell::values::PhiValue::try_from(row).unwrap().as_basic_value(), incoming));
+                        }
+                        if row.get_opcode() == InstructionOpcode::Return {
+                            assert!(returned.replace(row.get_operand(0).unwrap().value().unwrap()).is_none());
+                            assert!(local_releases.iter().copied().eq(siblings.iter().rev().copied()),
+                                "release only local siblings, in reverse birth order before returning");
+                        }
+                        let Ok(call) = CallSiteValue::try_from(row) else { continue };
+                        let callee = call.get_called_fn_value().unwrap();
+                        if callee == free {
+                            local_releases.push(row.get_operand(0).unwrap().value().unwrap());
+                        } else if Some(callee) == sibling_factory {
+                            assert_eq!(reads_and_handoff.len(), if siblings.is_empty() { 1 } else { 3 });
+                            siblings.push(call.try_as_basic_value().basic().unwrap());
+                        } else if Some(callee) == recursive_target {
+                            assert_eq!(call.count_arguments(), callee.count_params());
+                            recursive_returns.push(call.try_as_basic_value().basic().unwrap());
+                        } else if factories.contains(&callee) {
+                            original.push(call.try_as_basic_value().basic().unwrap());
+                        } else if callee == reader || callee == relay {
+                            assert_eq!(call.count_arguments(), 1);
+                            reads_and_handoff.push(callee);
+                        }
                     }
-                    let Ok(call) = CallSiteValue::try_from(row) else { continue };
-                    let callee = call.get_called_fn_value().unwrap();
-                    if callee == free {
-                        local_releases.push(row.get_operand(0).unwrap().value().unwrap());
-                    } else if Some(callee) == sibling_factory {
-                        assert_eq!(reads_and_handoff.len(), if siblings.is_empty() { 1 } else { 3 });
-                        siblings.push(call.try_as_basic_value().basic().unwrap());
-                    } else if callee == ship {
-                        assert_eq!(call.count_arguments(), ship.count_params());
-                        recursive_returns.push(call.try_as_basic_value().basic().unwrap());
-                    } else if factories.contains(&callee) {
-                        original.push(call.try_as_basic_value().basic().unwrap());
-                    } else if callee == reader || callee == relay {
-                        assert_eq!(call.count_arguments(), 1);
-                        reads_and_handoff.push(callee);
+                    assert_eq!(reads_and_handoff, [reader, relay, reader]);
+                    assert_eq!(siblings.len(), if sibling_factory.is_some() { 2 } else { 0 });
+                    assert_eq!(recursive_returns.len(), recursive_leaves);
+                    assert_eq!(bases.len(), local_leaves + recursive_leaves - 1);
+                    let selected = returned.expect("return the actual original-base phi");
+                    assert!(!local_releases.contains(&selected), "the selected backing survives into the caller");
+                    let mut pending = vec![selected];
+                    let mut expanded = Vec::new();
+                    let mut leaves = Vec::new();
+                    while let Some(value) = pending.pop() {
+                        assert!(!expanded.contains(&value), "same-frame receipt phis are acyclic");
+                        expanded.push(value);
+                        if let Some((_, incoming)) = bases.iter().find(|(phi, _)| *phi == value) {
+                            assert_eq!(incoming.len(), 2);
+                            pending.extend(incoming.iter().copied());
+                        } else {
+                            leaves.push(value);
+                        }
                     }
+                    assert_eq!(original.len(), local_leaves);
+                    assert_eq!(leaves.len(), original.len() + recursive_returns.len());
+                    assert!(original.iter().chain(&recursive_returns).all(|value| leaves.contains(value)));
                 }
-                assert_eq!(reads_and_handoff, [reader, relay, reader]);
-                assert_eq!(siblings.len(), if sibling_factory.is_some() { 2 } else { 0 });
-                assert_eq!(recursive_returns.len(), usize::from(variant == "recursive"));
-                assert_eq!(bases.len(), 1 + recursive_returns.len());
-                let selected = returned.expect("return the actual original-base phi");
-                assert!(!local_releases.contains(&selected), "the selected backing survives into the caller");
-                let mut pending = vec![selected];
-                let mut expanded = Vec::new();
-                let mut leaves = Vec::new();
-                while let Some(value) = pending.pop() {
-                    assert!(!expanded.contains(&value), "same-frame receipt phis are acyclic");
-                    expanded.push(value);
-                    if let Some((_, incoming)) = bases.iter().find(|(phi, _)| *phi == value) {
-                        assert_eq!(incoming.len(), 2);
-                        pending.extend(incoming.iter().copied());
-                    } else {
-                        leaves.push(value);
-                    }
-                }
-                assert_eq!(original.len(), 2);
-                assert_eq!(leaves.len(), original.len() + recursive_returns.len());
-                assert!(original.iter().chain(&recursive_returns).all(|value| leaves.contains(value)));
                 let mut received = None;
                 let mut released = Vec::new();
                 for row in drive.get_basic_blocks().into_iter().flat_map(|block| block.get_instructions()) {
