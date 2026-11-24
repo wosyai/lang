@@ -1535,6 +1535,22 @@ fn validate_assignment_target_distinctness_in_module(
     }
 }
 
+fn array_len_address<'a>(
+    expression: &ScalarExpression,
+    arguments: &'a [ScalarExpression],
+) -> Option<&'a ScalarExpression> {
+    let ScalarExpression::Call { type_arguments, .. } = expression else { return None };
+    let [address @ ScalarExpression::CheckedAddress {
+        mutability: ScalarReferenceMutability::Shared, place: ScalarPlace::Name { .. }, ..
+    }] = arguments else { return None };
+    type_arguments.is_empty().then_some(address)
+}
+
+fn is_array_len_operand(ty: &ScalarType) -> bool {
+    matches!(ty, ScalarType::CheckedReference { inner, .. }
+        if matches!(inner.as_ref(), ScalarType::Array { .. } | ScalarType::RuntimeArray { .. }))
+}
+
 fn type_core_memory_in_module(
     expression: &ScalarExpression,
     operation: &str,
@@ -1727,6 +1743,22 @@ fn type_core_memory_in_module(
                 vec![actual]
             };
             (parameters, ScalarType::Unit)
+        }
+        "array_len" => {
+            let Some(address) = array_len_address(expression, arguments) else {
+                diagnostics.push(module_diagnostic(module, "B0003",
+                    "core.array_len requires the shared address of a named array place", span));
+                return ScalarType::Error;
+            };
+            let actual = expression_type_in_module(address, scope, visible_names, folded_names, module, modules, diagnostics, unsafe_context, overloads, inference);
+            if !is_array_len_operand(&actual) {
+                if !is_error_type(&actual) {
+                    diagnostics.push(module_diagnostic(module, "B0003",
+                        "core.array_len requires the shared address of a named array place", span));
+                }
+                return ScalarType::Error;
+            }
+            (vec![actual], ScalarType::U64)
         }
         "system_panic" => {
             if !arguments.is_empty() {
@@ -1934,6 +1966,22 @@ fn type_core_memory(
                 vec![actual]
             };
             (parameters, ScalarType::Unit)
+        }
+        "array_len" => {
+            let Some(address) = array_len_address(expression, arguments) else {
+                diagnostics.push(diagnostic(program, "B0003",
+                    "core.array_len requires the shared address of a named array place", span));
+                return ScalarType::Error;
+            };
+            let actual = expression_type(address, scope, visible_names, folded_names, program, diagnostics, unsafe_context, overloads, inference);
+            if !is_array_len_operand(&actual) {
+                if !is_error_type(&actual) {
+                    diagnostics.push(diagnostic(program, "B0003",
+                        "core.array_len requires the shared address of a named array place", span));
+                }
+                return ScalarType::Error;
+            }
+            (vec![actual], ScalarType::U64)
         }
         "system_panic" => {
             if !arguments.is_empty() {
@@ -3828,7 +3876,7 @@ fn check_expression_type_in_module(
             if receiver.as_deref() == Some("core")
                 && matches!(
                     name.as_str(),
-                    "alloc" | "free" | "invalidate" | "rebind" | "system_panic"
+                    "alloc" | "free" | "invalidate" | "rebind" | "array_len" | "system_panic"
                 )
             {
                 return type_core_memory_in_module(
@@ -8534,7 +8582,7 @@ fn check_expression_type(
             if receiver.as_deref() == Some("core")
                 && matches!(
                     name.as_str(),
-                    "alloc" | "free" | "invalidate" | "rebind" | "system_panic"
+                    "alloc" | "free" | "invalidate" | "rebind" | "array_len" | "system_panic"
                 )
             {
                 return type_core_memory(

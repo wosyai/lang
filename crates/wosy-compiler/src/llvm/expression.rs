@@ -245,6 +245,9 @@ pub(super) fn emit_expression<'ctx, 'module>(
                 }
                 None => (receiver.as_deref(), name.as_str()),
             };
+            if matches!(selected, Some(PreparedCall::Core(CoreOperationId::ArrayLen))) {
+                return super::memory::emit_array_len(context, state, arguments);
+            }
             if uses_invalidation_event(state, &selected, *span)? {
                 return emit_core_invalidation(context, state, *span, arguments, None);
             }
@@ -472,6 +475,9 @@ pub(super) fn emit_project_expression<'ctx, 'module>(
                 }
                 None => (receiver.as_deref(), name.as_str()),
             };
+            if matches!(selected, Some(PreparedCall::Core(CoreOperationId::ArrayLen))) {
+                return super::memory::emit_array_len(context, state, arguments);
+            }
             if uses_invalidation_event(state, &selected, *span)? {
                 return emit_core_invalidation(
                     context,
@@ -740,6 +746,7 @@ fn initializer_core_name(operation: CoreOperationId) -> &'static str {
         Free => "free",
         Invalidate => "invalidate",
         Rebind => "rebind",
+        ArrayLen => "array_len",
         SystemPanic => "system_panic",
         ThisArtifactId => "this_artifact_id",
         DeclareArtifact => "declare_artifact",

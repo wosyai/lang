@@ -572,6 +572,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
             origin_index: ReferenceOriginIndex::default(),
             cfg: ScalarReferenceCfg {
                 primary_call_points: HashMap::new(),
+                observed_runtime_allocations: None,
                 guarded_scalar_allocation: None,
                 facts: Vec::new(),
                 points: Vec::new(),
@@ -1927,6 +1928,21 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         self.expression_ordinal(parent, OccurrenceEdge::CallArgument(position));
                     self.expression(argument, scope, ordinal)?;
                     argument_points.push(self.cursor.expect("evaluated call argument"));
+                    if target == ResolvedCallTarget::Core(CoreOperationId::ArrayLen) {
+                        let Some(CfgPointKind::Borrow { place, .. }) =
+                            self.cursor.map(|id| &self.cfg.points[id.0].kind)
+                        else {
+                            return Err(self.missing_context(span, ReferenceAnalysisErrorReason::UnprovedArrayLength));
+                        };
+                        match self.binding_types.get(&place.binding) {
+                            Some(ScalarType::Array { .. }) if place.projections.is_empty() => {}
+                            Some(ScalarType::RuntimeArray { .. }) if place.projections.is_empty()
+                                && self.cfg.allocations.contains(&place.binding) => {
+                                self.proof_points.array_length_owners.insert(place.binding.clone());
+                            }
+                            _ => return Err(self.missing_context(span, ReferenceAnalysisErrorReason::UnprovedArrayLength)),
+                        }
+                    }
                     if position == 0 && target == ResolvedCallTarget::Core(CoreOperationId::Free) {
                         match argument {
                             ScalarExpression::CheckedAddress { .. } => {
@@ -5336,6 +5352,7 @@ struct ReferenceEdgeState {
     value: Option<BTreeSet<ReferenceOriginId>>,
     released: BTreeSet<ReferenceBindingId>,
     invalidated: BTreeSet<ReferenceBindingId>,
+    replaced_array_extents: HashSet<ReferenceBindingId>,
     point_values: ReferencePointValues,
     return_outputs: BTreeMap<usize, BTreeSet<ReferenceOriginId>>,
     moved: Vec<(ReferencePlaceId, SourceSpan)>,
@@ -5376,6 +5393,7 @@ impl ReferenceEdgeState {
             self.moved_checked_handles.remove(binding);
             self.released.remove(binding);
             self.invalidated.remove(binding);
+            self.replaced_array_extents.remove(binding);
             self.moved.retain(|(place, _)| &place.binding != binding);
             self.projected.retain(|known| known.survives_scope(facts, |owner| owner != binding));
             return;
@@ -5390,6 +5408,7 @@ impl ReferenceEdgeState {
         self.moved_checked_handles.retain(|binding, _| live(binding));
         self.released.retain(&live);
         self.invalidated.retain(&live);
+        self.replaced_array_extents.retain(&live);
         self.projected.retain(|known| known.survives_scope(facts, &live));
     }
 }
@@ -7426,6 +7445,7 @@ struct ReferenceTransferCfg<'a> {
     allocations: &'a BTreeSet<ReferenceBindingId>,
     checked_join_values: &'a [(CfgPointId, [Option<CfgPointId>; 2])],
     checked_block_values: &'a [(CfgPointId, CfgPointId)],
+    array_length_owners: Option<&'a HashSet<ReferenceBindingId>>,
     fallible_allocation_bindings: Option<&'a HashMap<ReferenceBindingId, super::control::GuardedAllocationBinding>>,
     fallible_aliases: Option<&'a HashMap<ReferenceBindingId, ReferenceBindingId>>,
     guarded_allocation_edges: Option<&'a BTreeMap<CfgPointId, super::control::GuardedAllocationEdge>>,
@@ -7461,6 +7481,7 @@ impl<'a> ReferenceTransferCfg<'a> {
             allocations: &cfg.allocations,
             checked_join_values: proof.map_or(&[], |proof| &proof.checked_join_values),
             checked_block_values: proof.map_or(&[], |proof| &proof.checked_block_values),
+            array_length_owners: proof.map(|proof| &proof.array_length_owners).filter(|owners| !owners.is_empty()),
             fallible_allocation_bindings: proof.and_then(|proof| proof.fallible_allocation_bindings.as_ref()),
             fallible_aliases: proof.map(|proof| &proof.fallible_aliases).filter(|aliases| !aliases.is_empty()),
             guarded_allocation_edges: proof.map(|proof| &proof.guarded_allocation_edges),
@@ -9612,6 +9633,9 @@ fn transfer_reference_facts(
                     }
                 }
                 for binding in candidates.iter().map(|candidate| &candidate.place.binding) {
+                    if cfg.array_length_owners.is_some_and(|owners| owners.contains(binding)) {
+                        state.replaced_array_extents.insert(binding.clone());
+                    }
                     match operation {
                         CoreOperationId::Invalidate => {
                             state.invalidated.insert(binding.clone());
@@ -10024,6 +10048,11 @@ fn transfer_reference_facts(
                 }
                 CfgPointKind::Assign { target, .. } => {
                     let target = available_place(target);
+                    if target.projections.is_empty()
+                        && cfg.array_length_owners.is_some_and(|owners| owners.contains(&target.binding))
+                    {
+                        state.replaced_array_extents.insert(target.binding.clone());
+                    }
                     if !target.projections.is_empty()
                         || (matches!(target.place, ScalarPlace::Name { .. }) && known_lexical_owners.as_ref()
                             .is_some_and(|owners| owners.contains_key(&target.binding)))
@@ -10057,6 +10086,11 @@ fn transfer_reference_facts(
                 CfgPointKind::AssignThrough { candidates, .. } => {
                     for candidate in candidates {
                         let target = available_place(&candidate.place);
+                        if target.projections.is_empty()
+                            && cfg.array_length_owners.is_some_and(|owners| owners.contains(&target.binding))
+                        {
+                            state.replaced_array_extents.insert(target.binding.clone());
+                        }
                         let origins = conflicting_live_loan(
                             &liveness, &cfg.facts,
                             &state,
@@ -10471,6 +10505,27 @@ fn transfer_reference_facts(
                                     origins,
                                 });
                             }
+                        }
+                    }
+                    if let CfgPointKind::Call {
+                        target: ResolvedCallTarget::Core(CoreOperationId::ArrayLen), argument_points, ..
+                    } = &point.kind {
+                        // The address is the already-authored shared Borrow, not a
+                        // reconstructed name. Observing metadata requires the
+                        // original whole backing to remain live on this edge.
+                        let live = matches!(argument_points.as_slice(), [argument]
+                            if matches!(&original_points[argument.0].kind, CfgPointKind::Borrow { place, .. }
+                                if !state.released.contains(&place.binding)
+                                    && !state.invalidated.contains(&place.binding)
+                                    && !state.uninitialized.contains(&place.binding)
+                                    && !state.replaced_array_extents.contains(&place.binding)
+                                    && !state.moved.iter().any(|(moved, _)| moved.binding == place.binding
+                                        && moved.projections.is_empty())));
+                        if !live {
+                            errors.push(ReferenceAnalysisError::MissingContext {
+                                source_span: point.source_span.clone(),
+                                reason: ReferenceAnalysisErrorReason::UnprovedArrayLength,
+                            });
                         }
                     }
                     if !isolated_call_output && point.possible_origins.is_none() {
@@ -15089,6 +15144,7 @@ fn transfer_function_output_contracts<'a>(
             .map(|(destination, marker)| (destination.0, marker.call.0, marker.frozen.rhs));
         if !transferred.is_empty() {
             result.cfg.guarded_scalar_allocation = None;
+            result.cfg.observed_runtime_allocations = None;
         }
         replay.errors = transferred;
     }
@@ -15355,6 +15411,7 @@ fn derive_function_specialized_copy_policies<'a>(
                     allocations: &template_cfg.allocations,
                     checked_join_values: &template_result.proof_points.checked_join_values,
                     checked_block_values: &template_result.proof_points.checked_block_values,
+                    array_length_owners: Some(&template_result.proof_points.array_length_owners).filter(|owners| !owners.is_empty()),
                     fallible_allocation_bindings: template_result.proof_points.fallible_allocation_bindings.as_ref(),
                     fallible_aliases: Some(&template_result.proof_points.fallible_aliases).filter(|aliases| !aliases.is_empty()),
                     guarded_allocation_edges: Some(&template_result.proof_points.guarded_allocation_edges),
@@ -16148,6 +16205,12 @@ fn build_function_reference_cfg(
         }
         if builder.has_joined_root_reborrow {
             errors.extend(provisional.iter().cloned());
+        } else {
+            errors.extend(provisional.iter().filter(|error| matches!(error,
+                ReferenceAnalysisError::MissingContext {
+                    reason: ReferenceAnalysisErrorReason::UnprovedArrayLength, ..
+                }
+            )).cloned());
         }
         if builder.proof_points.fallible_allocation_bindings.is_some() {
             errors.extend(provisional.iter().filter(|error| matches!(error,
@@ -16216,6 +16279,15 @@ fn build_function_reference_cfg(
                     CfgPointKind::Call { output: 0, target: ResolvedCallTarget::ModuleCallable { .. }, .. })
             });
         }
+    }
+    if has_flow && errors.is_empty() && prior_children_succeeded
+        && !builder.proof_points.array_length_owners.is_empty()
+    {
+        let mut declarations = builder.proof_points.array_length_owners.iter()
+            .map(|owner| (owner.declaration_span.start, owner.declaration_span.end))
+            .collect::<Vec<_>>();
+        declarations.sort_unstable();
+        builder.cfg.observed_runtime_allocations = Some(declarations.into_boxed_slice());
     }
     if !errors.is_empty() || !prior_children_succeeded {
         aggregate.array_returns.clear();

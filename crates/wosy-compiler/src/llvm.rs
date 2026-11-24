@@ -219,8 +219,9 @@ struct EmitState<'ctx, 'module> {
     // Exact emitted storage identity: shadowed/unproved bindings cannot
     // reuse this extent by name, and scoped restoration naturally selects
     // only the backing (or paired replacement slot) still installed.
-    local_runtime_extents: HashMap<PointerValue<'ctx>, (wosy_syntax::ByteSpan, LocalRuntimeExtent<'ctx>)>,
+    local_runtime_extents: HashMap<PointerValue<'ctx>, (wosy_syntax::ByteSpan, LocalRuntimeExtent<'ctx>, bool)>,
     indexed_runtime_allocations: BTreeSet<(u32, u32)>,
+    observed_runtime_allocations: Option<Box<[(u32, u32)]>>,
 
     runtime_array_live: BTreeMap<String, PointerValue<'ctx>>,
     mutable_runtime_allocations: BTreeSet<(u32, u32)>,
@@ -276,7 +277,7 @@ fn runtime_allocation_access(
             }
         }
     }
-    let mut record_index = |place: &crate::scalar::ReferencePlaceId| {
+    let record_index = |indexed: &mut BTreeSet<_>, place: &crate::scalar::ReferencePlaceId| {
         if checked_access && matches!(&place.place, crate::ScalarPlace::Index { base, .. }
             if matches!(base.as_ref(), crate::ScalarPlace::Name { .. }))
             && reference_cfg.allocations.contains(&place.binding)
@@ -307,10 +308,10 @@ fn runtime_allocation_access(
                     }
                 }
             }
-            CfgPointKind::Assign { target, .. } => record_index(target),
-            CfgPointKind::Borrow { place, .. } => record_index(place),
+            CfgPointKind::Assign { target, .. } => record_index(&mut indexed, target),
+            CfgPointKind::Borrow { place, .. } => record_index(&mut indexed, place),
             CfgPointKind::ReadPlace { pointer_point: None, candidates, .. } => {
-                for place in candidates { record_index(place); }
+                for place in candidates { record_index(&mut indexed, place); }
             }
             _ => {}
         }
@@ -1916,16 +1917,18 @@ fn store_binding_outputs<'ctx, 'module>(
         let declaration = (receiver.name_span.start, receiver.name_span.end);
         let mutable = state.mutable_runtime_allocations.contains(&declaration);
         let private_literal = aggregate_transfer::has_literal_array_plan(state);
-        let checked_extent = state.require_release_checked_access
-            && state.body_call_nodes.is_some_and(|nodes| nodes.binding_position(binding).is_some())
+        let prepared = state.body_call_nodes.is_some_and(|nodes| nodes.binding_position(binding).is_some());
+        let checked_extent = prepared && state.require_release_checked_access
             && state.indexed_runtime_allocations.contains(&declaration);
+        let tracked_extent = checked_extent || (prepared && state.observed_runtime_allocations.as_deref()
+            .is_some_and(|owners| owners.binary_search(&declaration).is_ok()));
         let slot = ownership::emit_runtime_array_allocation_with_domain(
             context, state, element, length, checked_extent,
         )?;
         aggregate_transfer::record_allocation(state, binding, &receiver.name, slot)?;
         if !mutable {
-            if checked_extent {
-                state.local_runtime_extents.insert(slot, (receiver.name_span, LocalRuntimeExtent::Construction(length)));
+            if tracked_extent {
+                state.local_runtime_extents.insert(slot, (receiver.name_span, LocalRuntimeExtent::Construction(length), checked_extent));
             }
             state
                 .storage
@@ -1973,8 +1976,8 @@ fn store_binding_outputs<'ctx, 'module>(
             state.runtime_array_live.insert(receiver.name.clone(), live);
             state.runtime_array_owners.insert(receiver.name.clone(), true);
         }
-        if checked_extent {
-            state.local_runtime_extents.insert(backing, (receiver.name_span, LocalRuntimeExtent::ManagedLengthSlot(length_slot)));
+        if tracked_extent {
+            state.local_runtime_extents.insert(backing, (receiver.name_span, LocalRuntimeExtent::ManagedLengthSlot(length_slot), checked_extent));
         }
         state
             .storage
@@ -2381,6 +2384,7 @@ fn emit_function<'ctx, 'module>(
         runtime_array_lengths: BTreeMap::new(),
         local_runtime_extents: HashMap::new(),
         indexed_runtime_allocations,
+        observed_runtime_allocations: reference_cfg.observed_runtime_allocations.clone(),
         runtime_array_live: BTreeMap::new(),
         mutable_runtime_allocations,
         invalidations: resolved_invalidations(reference_cfg)?,
@@ -2558,6 +2562,7 @@ fn emit_main<'ctx, 'module>(
         runtime_array_lengths: BTreeMap::new(),
         local_runtime_extents: HashMap::new(),
         indexed_runtime_allocations: BTreeSet::new(),
+        observed_runtime_allocations: None,
         runtime_array_live: BTreeMap::new(),
         mutable_runtime_allocations: BTreeSet::new(),
         invalidations: BTreeMap::new(),
@@ -2715,6 +2720,7 @@ fn emit_project_function<'ctx, 'module>(
         runtime_array_lengths: BTreeMap::new(),
         local_runtime_extents: HashMap::new(),
         indexed_runtime_allocations,
+        observed_runtime_allocations: reference_cfg.observed_runtime_allocations.clone(),
         runtime_array_live: BTreeMap::new(),
         mutable_runtime_allocations,
         invalidations: resolved_invalidations(reference_cfg)?,
@@ -2917,6 +2923,7 @@ fn emit_project_main<'ctx, 'module>(
         runtime_array_lengths: BTreeMap::new(),
         local_runtime_extents: HashMap::new(),
         indexed_runtime_allocations: BTreeSet::new(),
+        observed_runtime_allocations: None,
         runtime_array_live: BTreeMap::new(),
         mutable_runtime_allocations: BTreeSet::new(),
         invalidations: BTreeMap::new(),

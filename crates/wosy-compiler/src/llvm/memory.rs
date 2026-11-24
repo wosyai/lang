@@ -407,10 +407,12 @@ pub(super) fn place_pointer<'ctx, 'module>(
             ) {
                 return Err("LLVM indexed place requires an array".to_owned());
             }
-            let runtime_extent = if matches!(&base_type, ScalarType::RuntimeArray { .. }) {
+            let runtime_extent = if state.require_release_checked_access
+                && matches!(&base_type, ScalarType::RuntimeArray { .. })
+            {
                 // Snapshot the extent paired with this base before a selector
                 // expression may evaluate arbitrary calls or local assignments.
-                capture_local_runtime_extent(context, state, base, base_pointer)?
+                capture_local_runtime_extent(context, state, base, base_pointer, true)?
             } else {
                 None
             };
@@ -440,20 +442,47 @@ pub(super) fn place_pointer<'ctx, 'module>(
     }
 }
 
+pub(super) fn emit_array_len<'ctx>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, '_>,
+    arguments: &[ScalarExpression],
+) -> Result<EmitValue<'ctx>, String> {
+    let [ScalarExpression::CheckedAddress { place, .. }] = arguments else {
+        return Err("core.array_len lacks a prepared named array address".into());
+    };
+    let crate::ScalarPlace::Name { name, .. } = place else {
+        return Err("core.array_len lacks a prepared named array address".into());
+    };
+    let Some((storage, ty)) = state.storage.get(name) else {
+        return Err("core.array_len has no prepared local array".into());
+    };
+    let length = match ty {
+        ScalarType::Array { length, .. } => context.i64_type().const_int(*length, false),
+        ScalarType::RuntimeArray { .. } => capture_local_runtime_extent(context, state, place, *storage, false)?
+            .ok_or_else(|| "core.array_len requires the sealed extent of a local runtime allocation".to_owned())?,
+        _ => return Err("core.array_len requires an array".into()),
+    };
+    Ok(EmitValue::Basic(length.into()))
+}
+
 fn capture_local_runtime_extent<'ctx>(
     context: &'ctx Context,
     state: &EmitState<'ctx, '_>,
     base: &crate::ScalarPlace,
     address: PointerValue<'ctx>,
+    for_index: bool,
 ) -> Result<Option<inkwell::values::IntValue<'ctx>>, String> {
     let crate::ScalarPlace::Name { name, .. } = base else { return Ok(None) };
     let Some((storage, ScalarType::RuntimeArray { .. })) = state.storage.get(name) else {
         return Ok(None);
     };
-    let Some((declaration, extent)) = state.local_runtime_extents.get(storage) else {
+    let Some((declaration, extent, checked_extent)) = state.local_runtime_extents.get(storage) else {
         // Incoming, forwarded and other unresolved extents use their existing path.
         return Ok(None);
     };
+    if for_index && !checked_extent {
+        return Ok(None);
+    }
     if state.body_call_nodes.and_then(|nodes| nodes.lexical_place_declaration(base)) != Some(*declaration) {
         return Err("runtime-array index differs from its qualified local declaration".to_owned());
     }

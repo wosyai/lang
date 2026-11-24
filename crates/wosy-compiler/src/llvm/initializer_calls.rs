@@ -450,6 +450,7 @@ impl<'ctx, 'module> EmitState<'ctx, 'module> {
                 };
                 use CoreOperationId::*;
                 Ok(match operation {
+                    ArrayLen => Some(ScalarType::U64),
                     IntTrunc | IntExtend | UintToFloat | SintToFloat | FloatToSintTrunc
                     | FloatToUintTrunc | FloatTrunc | FloatExtend | Bitcast | PointerCast => {
                         type_arguments.first().map(|argument| argument.ty.clone())

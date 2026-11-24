@@ -59,6 +59,7 @@ pub(crate) struct CallablePointFacts {
     pub(super) checked_join_values: Vec<(super::CfgPointId, [Option<super::CfgPointId>; 2])>,
     pub(super) checked_block_values: Vec<(super::CfgPointId, super::CfgPointId)>,
     pub(super) fallible_allocation_bindings: Option<HashMap<super::ReferenceBindingId, GuardedAllocationBinding>>,
+    pub(super) array_length_owners: HashSet<super::ReferenceBindingId>,
     pub(super) fallible_aliases: HashMap<super::ReferenceBindingId, super::ReferenceBindingId>,
     pub(super) fallible_alias_accesses: Vec<(OccurrenceOrdinal, super::ReferenceBindingId)>,
     pub(super) guarded_allocation_scopes: [Option<GuardedAllocationScope>; 2],

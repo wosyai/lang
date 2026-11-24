@@ -422,6 +422,7 @@ pub enum CoreOperationId {
     Free,
     Invalidate,
     Rebind,
+    ArrayLen,
     SystemPanic,
     ThisArtifactId,
     DeclareArtifact,
@@ -446,6 +447,7 @@ impl CoreOperationId {
             "free" => Self::Free,
             "invalidate" => Self::Invalidate,
             "rebind" => Self::Rebind,
+            "array_len" => Self::ArrayLen,
             "system_panic" => Self::SystemPanic,
             "this_artifact_id" => Self::ThisArtifactId,
             "declare_artifact" => Self::DeclareArtifact,
@@ -642,6 +644,8 @@ pub struct ScalarReferenceCfg {
     #[serde(skip)]
     guarded_scalar_allocation: Option<Box<[reference::GuardedScalarAllocation]>>,
     #[serde(skip)]
+    pub(crate) observed_runtime_allocations: Option<Box<[(u32, u32)]>>,
+    #[serde(skip)]
     pub(crate) primary_call_points: HashMap<reference::OccurrenceOrdinal, CfgPointId>,
 }
 
@@ -675,6 +679,7 @@ impl ScalarReferenceCfg {
             initial_points: Vec::new(),
             allocations: BTreeSet::new(),
             specialized_policies: Vec::new(),
+            observed_runtime_allocations: None,
             guarded_scalar_allocation: None,
             primary_call_points: HashMap::new(),
         }
@@ -720,6 +725,7 @@ pub enum ReferenceAnalysisErrorReason {
     UnsupportedFallibleWholeAggregateRead,
     NonLexicalFallibleStructInitializer,
     MissingGuardedAllocationProof,
+    UnprovedArrayLength,
     MissingRequiredDereferenceOrigin,
     UnprovedCheckedArrayIndex,
     MoveFromArrayElement,
@@ -740,6 +746,7 @@ impl ReferenceAnalysisErrorReason {
             Self::UnsupportedFallibleAllocationAccess => "fallible allocation access is not a supported whole Copy overwrite or direct guarded read",
             Self::UnsupportedFallibleWholeAggregateRead => "whole fallible struct read requires a proven Copy type",
             Self::NonLexicalFallibleStructInitializer => "fallible struct initializer requires a literal or a lexical binding of the field type",
+            Self::UnprovedArrayLength => "core.array_len requires an exact local array extent",
             Self::MissingGuardedAllocationProof => "fallible allocation requires an exact proven null guard for its local binding",
             Self::MissingRequiredDereferenceOrigin => "missing required dereference origin",
             Self::UnprovedCheckedArrayIndex => "checked projected borrow requires a proved in-range index",
@@ -3678,6 +3685,7 @@ fn derive_function(node: &CstNode) -> ScalarFunction {
         overload_arms: Vec::new(),
         reference_cfg: ScalarReferenceCfg {
             primary_call_points: HashMap::new(),
+            observed_runtime_allocations: None,
             guarded_scalar_allocation: None,
             facts: Vec::new(),
             points: Vec::new(),
@@ -3781,6 +3789,7 @@ fn derive_overload(node: &CstNode) -> ScalarFunction {
                 overload_arms: Vec::new(),
                 reference_cfg: ScalarReferenceCfg {
                     primary_call_points: HashMap::new(),
+                    observed_runtime_allocations: None,
                     guarded_scalar_allocation: None,
                     facts: Vec::new(),
                     points: Vec::new(),
@@ -3811,6 +3820,7 @@ fn derive_overload(node: &CstNode) -> ScalarFunction {
         overload_arms: arms,
         reference_cfg: ScalarReferenceCfg {
             primary_call_points: HashMap::new(),
+            observed_runtime_allocations: None,
             guarded_scalar_allocation: None,
             facts: Vec::new(),
             points: Vec::new(),

@@ -665,6 +665,7 @@ fn grouped_projected_writes_consume_saved_previous_origins_including_empty_sets(
             );
             let mut grouped = ScalarReferenceCfg {
                 primary_call_points: HashMap::new(),
+                observed_runtime_allocations: None,
                 guarded_scalar_allocation: None,
                 facts: facts.clone(),
                 points,

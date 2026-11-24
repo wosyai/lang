@@ -11132,3 +11132,93 @@ u64(u64) both = fn(seed) { _make_left(seed).value + _make_right(seed).value };
         }
     }
 }
+
+#[test]
+fn local_array_len_observes_the_original_construction_count() {
+    let text = "%%start
+u64(u64) construction = fn(seed) { seed + 1 };
+u64(u64) observed = fn(seed) {
+    u8[construction(seed)] bytes;
+    core.array_len(&bytes)
+};
+u64() fixed = fn { u8[2] bytes = [7, 9]; core.array_len(&bytes) };
+u64(u64) observed_before_release = fn(seed) {
+    u8[construction(seed)] bytes;
+    u64 extent = core.array_len(&bytes);
+    unsafe { core.free(&bytes); }
+    extent
+};
+if (observed(4) != 5 || observed(8) != 9 || fixed() != 2 || observed_before_release(6) != 7) { core.system_panic(); };
+%%end";
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let prepared = prepare_initializer_test(text, layout);
+        let checked = analyze_scalar_build(&prepared);
+        assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+        let source = &prepared.project().modules[0].source;
+        for (project, llvm) in [
+            (false, emit_scalar_build_single_module_llvm(&checked).unwrap().to_text()),
+            (true, emit_scalar_build_project_llvm(&checked).unwrap().to_text()),
+        ] {
+            let body = self_tail_test_body(&llvm, "i64", &self_tail_test_symbol(source, project, "observed"));
+            let symbol = self_tail_test_symbol(source, project, "construction");
+            let call_match = format!("call i64 @{symbol}(");
+            let [evaluation] = body.lines().filter(|line| line.contains(&call_match)).collect::<Vec<_>>()[..]
+                else { panic!("one construction count evaluation: {body}") };
+            let count = evaluation.trim().split_once(" = ").unwrap().0;
+            assert!(body.contains(&format!("call ptr @__wosy_core_alloc(i64 {count}, i64 1)")), "{body}");
+            assert!(body.contains(&format!("ret i64 {count}")), "{body}");
+            assert_eq!(body.matches("call void @__wosy_core_free(").count(), 1, "{body}");
+            let released = self_tail_test_body(&llvm, "i64",
+                &self_tail_test_symbol(source, project, "observed_before_release"));
+            assert_eq!(released.matches(&call_match).count(), 1, "{released}");
+            // Same live-bit cleanup contract as the baseline checked-free path:
+            // the lexical fallback exists in IR, but cannot execute on this edge.
+            let observation = released.find("load i64, ptr %bytes_length").expect("live extent observation");
+            let release = "call void @__wosy_core_free(ptr %checked_release_backing)";
+            let fallback = "call void @__wosy_core_free(ptr %runtime_array_owner)";
+            assert_eq!(released.matches(release).count(), 1, "{released}");
+            assert_eq!(released.matches(fallback).count(), 1, "{released}");
+            assert_eq!(released.matches("call void @__wosy_core_free(").count(), 2, "{released}");
+            let release = released.find(release).unwrap();
+            let cleared = released.find("store i1 false, ptr %bytes_live").unwrap();
+            let read = released.find("%allocation_live = load i1, ptr %bytes_live").unwrap();
+            let branch = released.find("br i1 %allocation_live, label %release.live, label %release.next").unwrap();
+            let (live_block, after_cleanup) = released.split_once("\nrelease.live:").unwrap().1
+                .split_once("\nrelease.next:").unwrap();
+            assert!(live_block.contains(fallback) && !after_cleanup.contains("@__wosy_core_free"), "{released}");
+            assert!(observation < release && release < cleared && cleared < read && read < branch, "{released}");
+            let fixed = self_tail_test_body(&llvm, "i64", &self_tail_test_symbol(source, project, "fixed"));
+            assert!(fixed.contains("ret i64 2"), "{fixed}");
+            if let Some(directory) = std::env::var_os("WOSY_LOCAL_ARRAY_LEN_IR_DIR") {
+                let target = if layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
+                let route = if project { "project" } else { "standalone" };
+                let output = std::path::PathBuf::from(directory);
+                let controlled = llvm.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);
+                assert_ne!(controlled, llvm, "authored main entry");
+                std::fs::write(output.join(format!("{target}-{route}.ll")), llvm).unwrap();
+                std::fs::write(output.join(format!("{target}-{route}-control.ll")), controlled).unwrap();
+            }
+        }
+    }
+}
+
+#[test]
+fn array_len_does_not_invent_missing_extent_or_accept_nonarrays() {
+    for (source, message) in [
+        ("u64(u8[]) observed = fn(bytes) { core.array_len(&bytes) };",
+            "core.array_len requires an exact local array extent"),
+        ("u64(u8) observed = fn(value) { core.array_len(&value) };",
+            "core.array_len requires the shared address of a named array place"),
+        ("u64(u64) observed = fn(count) { u8[count] bytes; u8[] carried = bytes; carried; core.array_len(&bytes) };",
+            "core.array_len requires an exact local array extent"),
+    ] {
+        let text = format!("%%start\n{source}\n%%end");
+        for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let parsed = parse_source(SourceIdentity::new("project".into(), "package".into(), "src/main.w".into(), "r1".into()),
+                text.clone(), &[]);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let checked = crate::derive_scalar_program_with_layout(&parsed.result, layout);
+            assert!(checked.diagnostics.iter().any(|d| d.message == message), "{:?}", checked.diagnostics);
+        }
+    }
+}
