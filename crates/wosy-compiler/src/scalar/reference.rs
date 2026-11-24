@@ -2076,9 +2076,10 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             CfgPointKind::Read { binding }
                                 if matches!(calls.prepared_plain_name(argument),
                                     Some(PlainNameIdentity::Lexical(expected)) if expected == binding) =>
-                                Some((point, joined_effect.is_some(), effect.parameter == 0)),
+                                Some((point, joined_effect.is_some(), effect.parameter == 0 && !effect.forwarded)),
                             CfgPointKind::Borrow { place, loan }
-                                if effect.parameter == 0 && matches!(target, ResolvedCallTarget::ModuleCallable { .. })
+                                if effect.parameter == 0 && !effect.forwarded
+                                    && matches!(target, ResolvedCallTarget::ModuleCallable { .. })
                                     && loan.mode == ScalarReferenceMutability::Shared && loan.parent.is_none()
                                     && loan.origin_place == *place =>
                             {
@@ -6888,7 +6889,7 @@ fn shared_scalar_read_effect(
 ) -> Option<SharedScalarReadEffect> {
     if matches!(target, ResolvedCallTarget::LocalCallable(_)) {
         return (calls.local_shared_call_families.get(&ordinal) == Some(&true))
-            .then_some(SharedScalarReadEffect { parameter: 0, descriptor: false });
+            .then_some(SharedScalarReadEffect { parameter: 0, descriptor: false, forwarded: false });
     }
     let ResolvedCallTarget::ModuleCallable {
         source: callee, declaration_span, concrete: ConcreteCallSelection::Declaration,
@@ -10164,6 +10165,8 @@ struct SharedScalarReadEffect {
     parameter: usize,
     // Descriptor projections authorize only this exact direct receipt read.
     descriptor: bool,
+    // Transitive wrappers authorize only exact joined call observations.
+    forwarded: bool,
 }
 
 impl SharedScalarReadEffect {
@@ -10273,7 +10276,7 @@ impl SharedScalarReadEffect {
         (formal_name(pointer, parameter.span)
             && structure.checked_types.expressions.get(&pointer) == Some(&parameter.ty)
             && structure.checked_types.expressions.get(&read) == Some(&result.ty))
-            .then_some(Self { parameter: parameter.ordinal, descriptor })
+            .then_some(Self { parameter: parameter.ordinal, descriptor, forwarded: false })
     }
 }
 
@@ -10661,7 +10664,7 @@ impl ProjectCallSiteResults {
     pub(super) fn has_closed_shared_scalar_reader(&self, module: usize, declaration: ByteSpan) -> bool {
         self.modules.get(module).and_then(|row| row.as_ref().ok())
             .is_some_and(|calls| calls.shared_scalar_read_effects.get(&declaration)
-                .is_some_and(|effect| effect.parameter == 0 && !effect.descriptor))
+                .is_some_and(|effect| effect.parameter == 0 && !effect.descriptor && !effect.forwarded))
     }
 
     pub(super) fn lookup_errors(&self) -> impl Iterator<Item = &ReferenceAnalysisError> {
@@ -12390,7 +12393,7 @@ fn close_local_shared_call_families(
     let is_reader = |expression| {
         matches!(calls.prepared_plain_name(expression), Some(PlainNameIdentity::ModuleValue(declaration))
             if declaration.source == *source && readers.get(&declaration.range)
-                .is_some_and(|effect| effect.parameter == 0 && !effect.descriptor))
+                .is_some_and(|effect| effect.parameter == 0 && !effect.descriptor && !effect.forwarded))
     };
     for block in &calls.structure.blocks {
         for item in &block.items {
@@ -12445,6 +12448,51 @@ fn close_local_shared_call_families(
     }));
 }
 
+fn shared_scalar_reader_forward_target(
+    source: &SourceIdentity, function: &ScalarFunction, calls: &FunctionCallSites,
+) -> Option<ByteSpan> {
+    let [parameter] = calls.boundary.parameters.as_slice() else { return None };
+    let ScalarType::CheckedReference { mutability: ScalarReferenceMutability::Shared, inner } =
+        &parameter.ty else { return None };
+    let [result] = calls.boundary.results.as_slice() else { return None };
+    if !function.generic_parameters.is_empty() || !function.overload_arms.is_empty()
+        || !aggregate::ordinary_value(inner) || result.ty != **inner
+        || !matches!(function.body.items.as_slice(), [ScalarBlockItem::Expression(ScalarExpression::Call { .. })])
+    {
+        return None;
+    }
+    let [call] = calls.call_occurrences.as_slice() else { return None };
+    let structure = &calls.structure;
+    let OccurrenceNode::Expression(output) = *structure.edges.get(&(
+        OccurrenceParent::Block(structure.root),
+        OccurrenceEdge::FinalOutput { item: 0, output: result.ordinal },
+    ))? else { return None };
+    if output != call.ordinal || calls.declared_unsafe_calls.contains(&output.0) {
+        return None;
+    }
+    let ResolvedCallTarget::ModuleCallable { source: target, declaration_span,
+        concrete: ConcreteCallSelection::Declaration } = &calls.sites.get(call.site)?.target else { return None };
+    if target != source {
+        return None;
+    }
+    let signature = calls.checked_call_signatures.get(&output)?;
+    let [result_output] = signature.outputs.outputs.as_slice() else { return None };
+    if signature.parameters.as_slice() != std::slice::from_ref(&parameter.ty) || result_output.ty != result.ty
+        || structure.checked_types.expressions.get(&output) != Some(&result.ty)
+    {
+        return None;
+    }
+    let OccurrenceNode::Expression(argument) = *structure.edges.get(&(
+        OccurrenceParent::Expression(output), OccurrenceEdge::CallArgument(0),
+    ))? else { return None };
+    let PlainNameIdentity::Lexical(binding) = calls.prepared_plain_name(argument)? else { return None };
+    (binding.source == *source && binding.function_span == function.span
+        && binding.block_span == function.body.span && binding.declaration_span == parameter.span
+        && binding.kind == ReferenceBindingKind::Declared
+        && structure.checked_types.expressions.get(&argument) == Some(&parameter.ty))
+        .then_some(*declaration_span)
+}
+
 fn resolve_module_call_sites(
     source: &SourceIdentity,
     items: &[ScalarItem],
@@ -12458,6 +12506,7 @@ fn resolve_module_call_sites(
     stage_observations::record_call_sites();
     let mut functions = BTreeMap::new();
     let mut shared_scalar_read_effects = HashMap::new();
+    let mut reader_forwarders = HashMap::<ByteSpan, Vec<ByteSpan>>::new();
     for (index, item) in items.iter().enumerate() {
         if let ScalarItem::Function(function) = item {
             let mut calls = resolve_function_call_sites(
@@ -12472,12 +12521,28 @@ fn resolve_module_call_sites(
                 calls.self_tail_candidates = self_tail::select(source, function, &calls);
                 if let Some(effect) = SharedScalarReadEffect::prepare(source, function, &calls) {
                     shared_scalar_read_effects.insert(function.name_span, effect);
+                } else if let Some(target) = shared_scalar_reader_forward_target(source, function, &calls) {
+                    reader_forwarders.entry(target).or_default().push(function.name_span);
                 }
             }
             functions.insert(index, calls);
         }
     }
     if select_executable_calls {
+        // Propagate only outward from exact unary terminals. Each wrapper has
+        // one target and cannot nominate itself as authority; cycles have no seed.
+        let mut grounded: Vec<_> = shared_scalar_read_effects.iter().filter_map(|(&declaration, effect)|
+            (effect.parameter == 0 && !effect.descriptor).then_some(declaration)).collect();
+        while let Some(target) = grounded.pop() {
+            if let Some(callers) = reader_forwarders.remove(&target) {
+                for caller in callers {
+                    shared_scalar_read_effects.insert(caller, SharedScalarReadEffect {
+                        parameter: 0, descriptor: false, forwarded: true,
+                    });
+                    grounded.push(caller);
+                }
+            }
+        }
         for calls in functions.values_mut() {
             close_local_shared_call_families(source, calls, &shared_scalar_read_effects);
         }

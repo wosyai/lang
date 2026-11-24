@@ -577,6 +577,30 @@ fn joined_child_is_read_by_exact_callee_with_scalar_prefix_argument() {
 }
 
 #[test]
+fn joined_child_crosses_grounded_forward_reader_chain() {
+    let program = joined_with_pointer_read("u8 observed = pointer(child); first = 3;", "*value")
+        .replace("u8(*u8) pointer = fn(value) { *value };",
+            "u8(*u8) pointer = fn(value) { middle(value) };\n\
+             u8(*u8) middle = fn(value) { terminal(value) };\n\
+             u8(*u8) terminal = fn(value) { *value };")
+        .replace("    seen\n", "    if (observed == seen && first == 3) { observed } else { 0 }\n");
+    check_case(&program, Expected::Valid, Some("WOSY_JOINED_FORWARD_READER_IR_DIR"));
+
+    let live = program.replace("u8 observed = pointer(child); first = 3;",
+        "first = 3; u8 observed = pointer(child);");
+    assert_ne!(live, program);
+    check(&live, Expected::LiveConflict);
+
+    let ungrounded = program.replace("{ *value };", "{ *value + *value };");
+    assert_ne!(ungrounded, program);
+    check(&ungrounded, Expected::NullParent);
+
+    let cycle = program.replace("{ *value };", "{ pointer(value) };");
+    assert_ne!(cycle, program);
+    check(&cycle, Expected::NullParent);
+}
+
+#[test]
 fn joined_child_is_read_by_checked_callee_before_selected_owner_is_reusable() {
     let program = joined_with_pointer_read(
         "u8 through_call = pointer(child); first = 3;", "*value",
