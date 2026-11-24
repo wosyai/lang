@@ -4468,9 +4468,8 @@ impl<'a> ReferenceFlowBuilder<'a> {
         match index {
             ScalarExpression::Integer { .. } => true,
             ScalarExpression::Binary { operator: BinaryOperator::BitAnd, left, right, .. } =>
-                matches!((left.as_ref(), right.as_ref()),
-                    (ScalarExpression::Name { .. }, ScalarExpression::Integer { .. })
-                    | (ScalarExpression::Integer { .. }, ScalarExpression::Name { .. })),
+                matches!(left.as_ref(), ScalarExpression::Integer { .. })
+                    || matches!(right.as_ref(), ScalarExpression::Integer { .. }),
             _ => false,
         }
     }
@@ -4509,29 +4508,53 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 use OccurrenceEdge::*;
                 let place = self.place_ordinal(OccurrenceParent::Expression(output), ExpressionPlace);
                 let selector = self.expression_ordinal(OccurrenceParent::Place(place), PlaceIndex);
-                let parent = OccurrenceParent::Expression(selector);
-                let (name_edge, mask_payload, name_offset, mask_offset) = match (left.as_ref(), right.as_ref()) {
-                    (ScalarExpression::Name { .. }, ScalarExpression::Integer { value, .. }) =>
-                        (BinaryLeft, value, 0, 1),
-                    (ScalarExpression::Integer { value, .. }, ScalarExpression::Name { .. }) =>
-                        (BinaryRight, value, 1, 0),
+                let mask = match (left.as_ref(), right.as_ref()) {
+                    (ScalarExpression::Integer { value, .. }, _)
+                    | (_, ScalarExpression::Integer { value, .. }) => u64::try_from(value.clone()).ok()?,
                     _ => return None,
                 };
-                if self.call_sites.structure.checked_types.expressions.get(&selector) != Some(&ScalarType::U64) {
-                    return None;
+                // The final mask bounds the computed selector for offset
+                // representability, not for the actual installed array extent.
+                // Pair every operand with its already-checked CFG event in
+                // reverse evaluation order. No calls or storage projections
+                // are admitted here.
+                let mut next = read.0;
+                let mut pending = vec![(selector, index.as_ref())];
+                while let Some((ordinal, operand)) = pending.pop() {
+                    if self.call_sites.structure.checked_types.expressions.get(&ordinal) != Some(&ScalarType::U64) {
+                        return None;
+                    }
+                    next = next.checked_sub(1)?;
+                    let point = self.cfg.points.get(next)?;
+                    match operand {
+                        ScalarExpression::Name { .. } => {
+                            let formal = self.literal_array_formal_binding(ordinal, &ScalarType::U64)?;
+                            if !matches!(&point.kind, CfgPointKind::Read { binding } if binding == formal) {
+                                return None;
+                            }
+                        }
+                        ScalarExpression::Integer { .. } => {
+                            if !matches!(&point.kind, CfgPointKind::Evaluate(actual) if actual == operand) {
+                                return None;
+                            }
+                        }
+                        ScalarExpression::Binary { operator: operator @ (BinaryOperator::Add
+                            | BinaryOperator::Subtract | BinaryOperator::Multiply | BinaryOperator::BitAnd
+                            | BinaryOperator::BitOr | BinaryOperator::BitXor), left, right, span } => {
+                            if !matches!(&point.kind, CfgPointKind::Evaluate(ScalarExpression::Binary {
+                                operator: actual_operator, span: actual_span, ..
+                            }) if operator == actual_operator && span == actual_span)
+                            {
+                                return None;
+                            }
+                            let parent = OccurrenceParent::Expression(ordinal);
+                            pending.push((self.expression_ordinal(parent, BinaryLeft), left.as_ref()));
+                            pending.push((self.expression_ordinal(parent, BinaryRight), right.as_ref()));
+                        }
+                        _ => return None,
+                    }
                 }
-                let formal = self.literal_array_formal_binding(self.expression_ordinal(parent, name_edge), &ScalarType::U64)?;
-                let first = CfgPointId(read.0.checked_sub(3)?);
-                if !matches!(&self.cfg.points.get(first.0 + name_offset)?.kind,
-                    CfgPointKind::Read { binding } if binding == formal)
-                    || !matches!(&self.cfg.points.get(first.0 + mask_offset)?.kind,
-                        CfgPointKind::Evaluate(ScalarExpression::Integer { value, .. }) if value == mask_payload)
-                    || !matches!(&self.cfg.points.get(first.0 + 2)?.kind,
-                        CfgPointKind::Evaluate(actual) if actual == index.as_ref())
-                {
-                    return None;
-                }
-                (first, u64::try_from(mask_payload.clone()).ok()?)
+                (CfgPointId(next), mask)
             }
             _ => return None,
         };

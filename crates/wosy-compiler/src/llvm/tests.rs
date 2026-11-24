@@ -11415,8 +11415,11 @@ u8(u64) replace = fn(count) {
 if (replace(7) != 37) { core.system_panic(); };
 %%end";
     let mask_first = text.replace("count & 3", "3 & count");
+    let computed = text.replace("count & 3", "(count * 2 + 5) & 3");
+    let computed_mask_first = text.replace("count & 3", "3 & (count * 2 + 5)");
     for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
-        for (form, text) in [("value-first", text), ("mask-first", mask_first.as_str())] {
+        for (form, text) in [("value-first", text), ("mask-first", mask_first.as_str()),
+            ("computed-value-first", computed.as_str()), ("computed-mask-first", computed_mask_first.as_str())] {
             let source = SourceIdentity::new("project".into(), "package".into(), "src/main.w".into(), "r1".into());
             let parsed = parse_source(source.clone(), text.into(), &[]);
             assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
@@ -11433,6 +11436,13 @@ if (replace(7) != 37) { core.system_panic(); };
             let extent = body.find("%runtime_extent = load i64, ptr %bytes_length").expect("paired extent");
             let selectors = body.lines().filter(|line| line.contains(" = and i64 ") && line.contains('3')).collect::<Vec<_>>();
             let [selector] = selectors.as_slice() else { panic!("one computed mask: {body}") };
+            if form.starts_with("computed-") {
+                let operations = body.lines().filter(|line|
+                    line.contains(" = mul i64 ") || line.contains(" = add i64 ")).collect::<Vec<_>>();
+                let [multiply, add] = operations.as_slice() else { panic!("one input computation: {body}") };
+                assert!(multiply.contains(" = mul i64 ") && add.contains(" = add i64 "), "{body}");
+                assert!(body.find(add).unwrap() < body.find(selector).unwrap(), "{body}");
+            }
             let value = selector.trim().split_once(" = ").unwrap().0;
             let guards = body.lines().filter(|line| line.contains("call void @wosy_fn__776f73795f746f6f6c636861696e5f7374646c6962__")
                 && line.contains("__636865636b5f696e6465785f696e5f657874656e74(")).collect::<Vec<_>>();
