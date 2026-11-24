@@ -6656,6 +6656,8 @@ fn pending_fallible_operator(
     match (&receiver.ty, &binding.value) {
         (ty, ScalarExpression::Integer { .. } | ScalarExpression::Name { .. })
             if is_integer_type(ty) => None,
+        (ty, ScalarExpression::Call { type_arguments, .. })
+            if is_integer_type(ty) && type_arguments.is_empty() => None,
         (ScalarType::Struct(id), ScalarExpression::StructLiteral { fields, .. })
             if !fields.is_empty()
                 && fields.iter().all(|field| match &field.value {

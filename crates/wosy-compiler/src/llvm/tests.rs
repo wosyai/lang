@@ -12808,3 +12808,71 @@ if (observed() != 1155 || observed() != 155 || observed() != 1102
         }
     }
 }
+
+#[test]
+fn guarded_fallible_direct_call_initializer_evaluates_once_before_one_allocation() {
+    use inkwell::{memory_buffer::MemoryBuffer, values::{CallSiteValue, InstructionOpcode}};
+    let source = SourceIdentity::new("project".into(), "package".into(), "src/fallible_direct.w".into(), "r1".into());
+    let text = "%%start
+i32(i32) compute = fn(input) { input * 2 + 1 };
+i32(i32) wrapper = fn(input) { compute(input) };
+i32(i32) observed = fn(input) {
+    i32 result =? wrapper(input);
+    if (&result == null) { -1 } else { result }
+};
+if (observed(7) != 15 || observed(7) != -1) { core.system_panic(); };
+%%end";
+    let effectful = text.replace("input * 2 + 1", "u8[1] buffer; if (core.array_len(&buffer) == 1) { input } else { 0 }");
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        for (closed, text) in [(true, text), (false, effectful.as_str())] {
+            let parsed = parse_source(source.clone(), text.into(), &[]);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let single = crate::derive_scalar_program_with_layout(&parsed.result, layout);
+            assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+            let project = validate_scalar_project(ScalarProject::new(
+                vec![ScalarModule::from_program(single.program.clone(), Vec::new())], vec![source.clone()],
+            ));
+            assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+            for (in_project, emitted) in [(false, emit_scalar_llvm(&single)), (true, emit_scalar_project_llvm(&project))] {
+                if !closed {
+                    assert!(matches!(emitted, Err(error) if error.contains("fallible call initializer requires a checked allocation-free scalar callable")));
+                    continue;
+                }
+                let llvm = emitted.unwrap().to_text();
+                let context = Context::create();
+                let buffer = MemoryBuffer::create_from_memory_range_copy(llvm.as_bytes(), "fallible direct initializer");
+                let module = context.create_module_from_ir(buffer).unwrap();
+                module.verify().unwrap();
+                let alloc = module.get_function("__wosy_core_alloc").unwrap();
+                let free = module.get_function("__wosy_core_free").unwrap();
+                let function = module.get_function(&self_tail_test_symbol(&source, in_project, "observed")).unwrap();
+                let wrapper = module.get_function(&self_tail_test_symbol(&source, in_project, "wrapper")).unwrap();
+                let instructions = function.get_basic_blocks().into_iter().flat_map(|block|
+                    std::iter::successors(block.get_first_instruction(), |instruction| instruction.get_next_instruction()))
+                    .collect::<Vec<_>>();
+                let calls_to = |callee| instructions.iter().enumerate().filter_map(|(position, &instruction)|
+                    CallSiteValue::try_from(instruction).ok().filter(|call| call.get_called_fn_value() == Some(callee))
+                        .map(|_| (position, instruction))).collect::<Vec<_>>();
+                let [(computed, value)] = calls_to(wrapper)[..] else { panic!("{llvm}") };
+                let [(allocated, backing)] = calls_to(alloc)[..] else { panic!("{llvm}") };
+                let [(released, cleanup)] = calls_to(free)[..] else { panic!("{llvm}") };
+                let operand = |inst, index| known_field_operand(inst, index).unwrap();
+                assert!(computed < allocated && allocated < released);
+                assert_eq!(operand(cleanup, 0).as_instruction_value(), Some(backing));
+                let tests = instructions.iter().filter(|&&instruction| instruction.get_opcode() == InstructionOpcode::ICmp
+                    && operand(instruction, 0).as_instruction_value() == Some(backing)).count();
+                assert_eq!(tests, 1, "one presence test: {llvm}");
+                assert_eq!(instructions.iter().filter(|&&instruction| instruction.get_opcode() == InstructionOpcode::Store
+                    && operand(instruction, 0).as_instruction_value() == Some(value)
+                    && operand(instruction, 1).as_instruction_value() == Some(backing)).count(), 1, "{llvm}");
+                if let Some(out) = std::env::var_os("WOSY_FALLIBLE_DIRECT_IR_DIR") {
+                    let target = if layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
+                    let route = if in_project { "project" } else { "standalone" };
+                    let controlled = llvm.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);
+                    assert_ne!(controlled, llvm);
+                    std::fs::write(std::path::PathBuf::from(out).join(format!("{target}-{route}-control.ll")), controlled).unwrap();
+                }
+            }
+        }
+    }
+}

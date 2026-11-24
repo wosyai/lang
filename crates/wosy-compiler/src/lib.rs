@@ -257,7 +257,7 @@ mod tests {
         );
         for (parameter, rhs, expected) in [
             ("i64", "input", "expression type does not match expected type"),
-            ("i32", "produce(input)", "fallible allocation requires a local integer initialized by a literal or a same-type integer binding, or a local struct of integer, bool, char, or float fields initialized by literals or same-type lexical bindings"),
+            ("i32", "produce(produce(input))", "fallible call initializer requires a checked allocation-free scalar callable"),
         ] {
             let text = format!("%%start\ni32(i32) produce = fn(item) {{ item }};\ni32({parameter}) example = fn(input) {{\n\ti32 result =? {rhs};\n\tif (&result == null) {{ 3 }} else {{ result }}\n}};\n%%end");
             let parsed = parse_source(source.clone(), text, &[]);

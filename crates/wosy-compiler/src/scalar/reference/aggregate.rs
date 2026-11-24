@@ -1272,6 +1272,7 @@ pub(super) struct AggregateFlowResult {
     pub(super) borrowed_extent_call: Option<(CfgPointId, OccurrenceOrdinal, ByteSpan, Option<ByteSpan>)>,
     pub(super) array_formal_extent_required: bool,
     pub(super) fixed_copy_owning_arguments: BTreeMap<usize, u64>,
+    pub(super) fallible_call_initializers: Vec<CfgPointId>,
     pub(super) widened_owning_receives: Vec<(CfgPointId, OccurrenceOrdinal, ByteSpan, ByteSpan, Option<(CfgPointId, usize)>)>,
     pub(super) widened_owning_roundtrip: Option<(OccurrenceOrdinal, CfgPointId, ByteSpan)>,
     pub(super) widened_borrowed_extent_calls: Vec<(CfgPointId, OccurrenceOrdinal, ByteSpan)>,
@@ -1508,7 +1509,7 @@ impl AggregateFlowResult {
     }
 
     pub(super) fn has_observations(&self) -> bool {
-        !self.widened_fixed_copies.is_empty() || !self.widened_owning_receives.is_empty() || self.widened_literal_factory.is_some() || !self.widened_join_receivers.is_empty() || !self.widened_join_replacements.is_empty() || !self.widened_rebinds.is_empty() || self.borrowed_extent_observer.is_some() || self.borrowed_extent_call.is_some() || !self.widened_borrowed_extent_calls.is_empty() || self.borrowed_extent_forward.is_some()
+        !self.fallible_call_initializers.is_empty() || !self.widened_fixed_copies.is_empty() || !self.widened_owning_receives.is_empty() || self.widened_literal_factory.is_some() || !self.widened_join_receivers.is_empty() || !self.widened_join_replacements.is_empty() || !self.widened_rebinds.is_empty() || self.borrowed_extent_observer.is_some() || self.borrowed_extent_call.is_some() || !self.widened_borrowed_extent_calls.is_empty() || self.borrowed_extent_forward.is_some()
             || self.array_formal_extent_required || self.literal_array_index_required.is_some() || self.literal_array_extent_required.is_some() || self.proved_literal_array_route_ref().is_some()
             || (self.checked_producer_authoritative && !self.checked_producer_backing.is_empty())
             || self.checked_backing_assignment.is_some() || self.checked_backing_forward.is_some()
@@ -6548,6 +6549,36 @@ fn returned_array_index_fits_offset(index: u64, ty: &ScalarType, target: ScalarT
     index.checked_mul(layout.size).is_some_and(|offset| offset <= maximum)
 }
 
+/// Borrow only call-reachable CFGs and compute each result once. A gray
+/// dependency is a cycle, not evidence of an allocation-free value.
+fn allocation_free_integer_graph(
+    root: BodyKey,
+    memo: &mut HashMap<BodyKey, bool>,
+    mut dependencies: impl FnMut(BodyKey) -> Option<Vec<BodyKey>>,
+) -> bool {
+    if let Some(&known) = memo.get(&root) { return known; }
+    let mut in_progress = HashMap::<BodyKey, Vec<BodyKey>>::new();
+    let mut stack = vec![(root, false)];
+    while let Some((key, exit)) = stack.pop() {
+        if memo.contains_key(&key) { continue; }
+        if exit {
+            let children = in_progress.remove(&key).expect("entered scalar initializer callable");
+            memo.insert(key, children.into_iter().all(|child| memo.get(&child) == Some(&true)));
+        } else if in_progress.contains_key(&key) {
+            // No partially validated body can authorize a call.
+            memo.insert(key, false);
+            in_progress.remove(&key);
+        } else if let Some(children) = dependencies(key) {
+            stack.push((key, true));
+            stack.extend(children.iter().rev().map(|&child| (child, false)));
+            in_progress.insert(key, children);
+        } else {
+            memo.insert(key, false);
+        }
+    }
+    memo.get(&root) == Some(&true)
+}
+
 fn closed_aggregates<'a>(
     reservations: &AggregateReservations,
     module_at: impl Fn(usize) -> Option<ModuleInput<'a>>,
@@ -6560,6 +6591,7 @@ fn closed_aggregates<'a>(
     let mut storage_uses = HashMap::<&SourceSpan, usize>::new();
     let mut array_descriptor_identities = BTreeMap::new();
     let mut borrowed_extent_observers = BTreeMap::new();
+    let mut fallible_call_requests = Vec::new();
     for (&key @ (module, item, arm), &is_monomorphic) in &reservations.bodies {
         let input = module_at(module).ok_or_else(|| format!("missing emitted aggregate module {module}"))?;
         let Some(ScalarItem::Function(function)) = input.items.get(item) else {
@@ -6572,6 +6604,10 @@ fn closed_aggregates<'a>(
         let (facts, cfg) = result_at(key, body)
             .ok_or_else(|| format!("missing emitted aggregate result {key:?}"))?;
         declarations.insert((input.source, function.name_span), (module, item));
+        if let Some(facts) = facts {
+            fallible_call_requests.extend(facts.fallible_call_initializers.iter()
+                .map(|&call| (input.source, cfg, call)));
+        }
         if is_monomorphic && arm.is_none() && facts.is_some_and(|facts|
             matches!(facts.proved_literal_array_route(), Some(LiteralArrayRoute::FreshLeaf { .. })))
         {
@@ -6661,6 +6697,48 @@ fn closed_aggregates<'a>(
     let mut recommit_edges = BTreeMap::<(BodyKey, CfgPointId), Vec<(CfgPointId, Option<CfgPointId>)>>::new();
     let mut structured_returns = BTreeMap::new();
     let mut recommit_returns = BTreeSet::new();
+    if !fallible_call_requests.is_empty() {
+        let dependencies = |key: BodyKey| -> Option<Vec<BodyKey>> {
+            if key.2.is_some() || reservations.bodies.get(&key) != Some(&true) { return None; }
+            let input = module_at(key.0)?;
+            let ScalarItem::Function(function) = input.items.get(key.1)? else { return None; };
+            let sites = input.calls.function_body(key.1, None)?;
+            let (_, cfg) = result_at(key, function)?;
+            if !cfg.allocations.is_empty() || !cfg.guarded_scalar_allocations().is_empty()
+                || !sites.declared_unsafe_calls.is_empty()
+                || !sites.boundary.parameters.iter().all(|formal| ordinary_value(&formal.ty))
+                || !matches!(sites.boundary.root_outputs.as_slice(), [output] if is_integer_type(&output.ty))
+            { return None; }
+            let root = sites.structure.blocks[sites.structure.root.0].span;
+            let formals = sites.boundary.parameters.iter().map(|formal|
+                parameter_binding_identity(input.source, function.span, root, formal)).collect::<HashSet<_>>();
+            let mut callees = Vec::new();
+            let mut has_output = false;
+            for point in &cfg.initial_points {
+                match &point.kind {
+                    CfgPointKind::Entry | CfgPointKind::ScopeEnter | CfgPointKind::ScopeExit
+                    | CfgPointKind::Branch { .. } | CfgPointKind::Join | CfgPointKind::Return => {}
+                    CfgPointKind::ReturnOutput { output: 0, checked: false, .. } => has_output = true,
+                    CfgPointKind::Read { binding } | CfgPointKind::Bind { binding } if formals.contains(binding) => {}
+                    CfgPointKind::Evaluate(value) if neutral_scalar_evaluation(value) => {}
+                    CfgPointKind::Call { output: 0,
+                        target: ResolvedCallTarget::ModuleCallable { concrete: ConcreteCallSelection::Declaration, .. }, .. } => {
+                        callees.push(target_body(&declarations, cfg, point.id)?);
+                    }
+                    _ => return None,
+                }
+            }
+            has_output.then_some(callees)
+        };
+        let mut memo = HashMap::new();
+        for (source, cfg, call) in fallible_call_requests {
+            if !target_body(&declarations, cfg, call).is_some_and(|target|
+                allocation_free_integer_graph(target, &mut memo, dependencies))
+            {
+                return Err(format!("fallible call initializer requires a checked allocation-free scalar callable in {source:?}"));
+            }
+        }
+    }
     ordinary.census(reservations, &module_at, &declarations);
     let mut outgoing = BTreeSet::new();
     let mut pending = Vec::new();

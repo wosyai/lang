@@ -4943,6 +4943,27 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     } else {
                         None
                     };
+                    if let (Some(_), ScalarExpression::Call { arguments, .. }) = (binding.fallible_assignment, primary)
+                    {
+                        // Allocation-free callee evidence does not cover its
+                        // caller-side argument evaluation.
+                        let eligible = call_producer.filter(|point| self.generic_parameters.is_empty()
+                            && arguments.iter().all(|argument| matches!(argument, ScalarExpression::Name { .. })
+                                || aggregate::pure_widened_element(argument))
+                            && is_integer_type(&receiver.ty) && binding_region.receivers().len() == 1
+                            && outputs.secondary.is_empty()
+                            && !calls.declared_unsafe_calls.contains(&primary_ordinal.0)
+                            && calls.checked_call_signatures.get(&primary_ordinal).is_some_and(|signature|
+                                signature.parameters.iter().all(aggregate::ordinary_value)
+                                    && matches!(signature.outputs.outputs.as_slice(), [output] if output.ty == receiver.ty))
+                            && matches!(&self.cfg.points[point.0].kind, CfgPointKind::Call { output: 0,
+                                target: ResolvedCallTarget::ModuleCallable { concrete: ConcreteCallSelection::Declaration, .. }, .. }));
+                        let Some(point) = eligible else {
+                            return Err(self.missing_context(expression_span(primary),
+                                ReferenceAnalysisErrorReason::UnprovedFallibleCallInitializer));
+                        };
+                        self.aggregate_result.fallible_call_initializers.push(point);
+                    }
                     if let ([head, tail], Some(point)) = (binding_region.receivers(), call_producer) {
                         if aggregate::mixed_owner_result_lanes(&head.ty, &tail.ty).is_some()
                             && outputs.secondary.as_slice() == [BindingOutput::ProjectPrimary { output: 1 }]
