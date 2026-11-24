@@ -6133,16 +6133,17 @@ pub(super) enum CheckerIntegerCallArgument {
 
 #[cfg(feature = "internal-checker")]
 #[derive(Clone, Debug, PartialEq)]
-pub(super) struct CheckerOrdinaryIntegerLocal {
+pub(super) struct CheckerOrdinaryScalarLocal {
     pub(super) binding: ReferenceBindingId,
     pub(super) source: OccurrenceOrdinal,
-    pub(super) kind: CheckerOrdinaryIntegerLocalKind,
+    pub(super) kind: CheckerOrdinaryScalarLocalKind,
 }
 
 #[cfg(feature = "internal-checker")]
 #[derive(Clone, Debug, PartialEq)]
-pub(super) enum CheckerOrdinaryIntegerLocalKind {
+pub(super) enum CheckerOrdinaryScalarLocalKind {
     Copy,
+    BoolLiteral(bool),
     Arithmetic { operator: BinaryOperator, operands: [CheckerOrdinaryIntegerOperand; 2] },
 }
 
@@ -6165,6 +6166,7 @@ pub(super) struct CheckerOrdinaryIntegerComparison {
 #[derive(Clone, Debug, PartialEq)]
 pub(super) enum CheckerOrdinaryBoolean {
     Constant(bool),
+    Binding(ReferenceBindingId),
     Integer(super::checker_flow::IntegerPredicate),
     Lexical(CheckerOrdinaryIntegerComparison),
     And(Box<[Self; 2]>),
@@ -6203,7 +6205,9 @@ pub(super) struct OccurrenceStructure {
     #[cfg(feature = "internal-checker")]
     pub(super) checker_ordinary_integer_comparisons: HashMap<OccurrenceOrdinal, CheckerOrdinaryIntegerComparison>,
     #[cfg(feature = "internal-checker")]
-    pub(super) checker_ordinary_integer_locals: HashMap<(BlockOrdinal, usize), CheckerOrdinaryIntegerLocal>,
+    pub(super) checker_ordinary_bool_arguments: HashMap<OccurrenceOrdinal, BigInt>,
+    #[cfg(feature = "internal-checker")]
+    pub(super) checker_ordinary_scalar_locals: HashMap<(BlockOrdinal, usize), CheckerOrdinaryScalarLocal>,
     #[cfg(any(test, feature = "internal-checker"))]
     pub(super) checker_contextual_read_locals: HashMap<(BlockOrdinal, usize), ReferenceBindingId>,
     #[cfg(any(test, feature = "internal-checker"))]
@@ -6223,7 +6227,7 @@ pub(super) struct OccurrenceStructure {
 impl OccurrenceStructure {
     #[cfg(feature = "internal-checker")]
     pub(super) fn has_ordinary_integer_operations(&self) -> bool {
-        !self.checker_ordinary_integer_locals.is_empty() || self.has_ordinary_predicates()
+        !self.checker_ordinary_scalar_locals.is_empty() || self.has_ordinary_predicates()
     }
 
     #[cfg(feature = "internal-checker")]
@@ -6256,7 +6260,9 @@ impl OccurrenceStructure {
             #[cfg(any(test, feature = "internal-checker"))]
             checker_integer_locals: HashMap::new(),
             #[cfg(feature = "internal-checker")]
-            checker_ordinary_integer_locals: HashMap::new(),
+            checker_ordinary_scalar_locals: HashMap::new(),
+            #[cfg(feature = "internal-checker")]
+            checker_ordinary_bool_arguments: HashMap::new(),
             #[cfg(feature = "internal-checker")]
             checker_ordinary_integer_comparisons: HashMap::new(),
             #[cfg(feature = "internal-checker")]
@@ -7069,9 +7075,30 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
     }
 
     #[cfg(feature = "internal-checker")]
+    fn ordinary_bool_binding(
+        &self, expression: &ScalarExpression, names: &BTreeMap<String, WalkBinding>, occurrence: Option<OccurrenceOrdinal>,
+    ) -> Option<ReferenceBindingId> {
+        let ScalarExpression::Name { name, .. } = expression else { return None; };
+        let WalkMode::Callable(callable) = &self.mode else { return None; };
+        let binding = if let Some(occurrence) = occurrence {
+            if self.structure.checked_types.expressions.get(&occurrence) != Some(&ScalarType::Bool) { return None; }
+            let PlainNameFacts::Prepared(identities) = &self.plain_names else { return None; };
+            identities.get(&occurrence)?.clone()
+        } else {
+            if self.occurrence_typing.checked_expression_type(expression) != Some(&ScalarType::Bool) { return None; }
+            callable.target_resolver.plain_name(name, names)?
+        };
+        let PlainNameIdentity::Lexical(binding) = binding else { return None; };
+        Some(binding)
+    }
+
+    #[cfg(feature = "internal-checker")]
     fn ordinary_compound(
         &self, expression: &ScalarExpression, names: &BTreeMap<String, WalkBinding>, occurrence: Option<OccurrenceOrdinal>,
     ) -> Option<CheckerOrdinaryBoolean> {
+        if let Some(binding) = self.ordinary_bool_binding(expression, names, occurrence) {
+            return Some(CheckerOrdinaryBoolean::Binding(binding));
+        }
         if !matches!(self.mode, WalkMode::Callable(_)) || !matches!(expression,
             ScalarExpression::Binary { operator: BinaryOperator::And | BinaryOperator::Or, .. }
                 | ScalarExpression::Unary { operator: super::UnaryOperator::LogicalNot, .. })
@@ -7110,7 +7137,9 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
             ScalarExpression::Unary { operator: super::UnaryOperator::LogicalNot, operand, .. } =>
                 Boolean::Not(Box::new(self.prepare_ordinary_boolean(operand, names, child(OccurrenceEdge::UnaryOperand)?, remaining)?)),
             _ => {
-                if let Some(comparison) = self.ordinary_integer_comparison(expression, names, occurrence) {
+                if let Some(binding) = self.ordinary_bool_binding(expression, names, occurrence) {
+                    Boolean::Binding(binding)
+                } else if let Some(comparison) = self.ordinary_integer_comparison(expression, names, occurrence) {
                     Boolean::Lexical(comparison)
                 } else if let Some(predicate) = self.ordinary_literal_predicate(expression, names, occurrence) {
                     Boolean::Integer(predicate)
@@ -7265,6 +7294,14 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
             && matches!(self.mode, WalkMode::ModuleInitialization { .. });
         #[cfg(any(test, feature = "internal-checker"))]
         let checker_enabled = self.occurrence_typing.checker_directives_enabled();
+        #[cfg(feature = "internal-checker")]
+        if checker_enabled && matches!(edge, OccurrenceEdge::CallArgument(0 | 1))
+            && self.structure.checked_types.expressions.get(&ordinal) == Some(&ScalarType::Bool)
+        {
+            if let ScalarExpression::Boolean { value, .. } = expression {
+                self.structure.checker_ordinary_bool_arguments.insert(ordinal, BigInt::from(u8::from(*value)));
+            }
+        }
         #[cfg(any(test, feature = "internal-checker"))]
         let checked_scalar_pair_argument = checker_enabled
             && matches!(self.mode, WalkMode::Callable(_))
@@ -7547,11 +7584,15 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
 
     #[cfg(feature = "internal-checker")]
     fn ordinary_integer_local(
-        &self, source: OccurrenceOrdinal, expression: &ScalarExpression,
+        &self, source: OccurrenceOrdinal, expression: &ScalarExpression, ty: &ScalarType,
         names: &HashMap<OccurrenceOrdinal, PlainNameIdentity>,
-    ) -> Option<CheckerOrdinaryIntegerLocalKind> {
+    ) -> Option<CheckerOrdinaryScalarLocalKind> {
         let lexical = |ordinal| matches!(names.get(&ordinal), Some(PlainNameIdentity::Lexical(_)));
-        if lexical(source) { return Some(CheckerOrdinaryIntegerLocalKind::Copy); }
+        if lexical(source) { return Some(CheckerOrdinaryScalarLocalKind::Copy); }
+        if *ty == ScalarType::Bool {
+            let ScalarExpression::Boolean { value, .. } = expression else { return None; };
+            return Some(CheckerOrdinaryScalarLocalKind::BoolLiteral(*value));
+        }
         let (operator, [left, right]) = self.simple_integer_operation(source, expression)?;
         let typed = |(ordinal, literal): (_, Option<std::borrow::Cow<'_, BigInt>>)| {
             if let Some(literal) = literal {
@@ -7560,7 +7601,7 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
                 lexical(ordinal).then_some(CheckerOrdinaryIntegerOperand::Lexical(ordinal))
             }
         };
-        Some(CheckerOrdinaryIntegerLocalKind::Arithmetic { operator, operands: [typed(left)?, typed(right)?] })
+        Some(CheckerOrdinaryScalarLocalKind::Arithmetic { operator, operands: [typed(left)?, typed(right)?] })
     }
 
     #[cfg(feature = "internal-checker")]
@@ -8568,11 +8609,11 @@ impl StructuralWalker<'_, '_> {
         let mut ordinary_local = match (&initialization, &self.mode, &self.plain_names, binding.receivers.as_slice()) {
             (BindingInitialization::Outputs(outputs), WalkMode::Callable(callable), PlainNameFacts::Prepared(names), [receiver])
                 if self.occurrence_typing.checker_directives_enabled() && outputs.secondary.is_empty()
-                    && receiver.contextual_storage.is_none() && is_integer_type(&receiver.ty)
+                    && receiver.contextual_storage.is_none() && (is_integer_type(&receiver.ty) || receiver.ty == ScalarType::Bool)
                     && self.structure.checked_types.expressions.get(&outputs.primary) == Some(&receiver.ty) =>
             {
                 let ScalarBindingOutput::Evaluate(expression) = binding.output_source(0) else { unreachable!() };
-                self.ordinary_integer_local(outputs.primary, expression, names)
+                self.ordinary_integer_local(outputs.primary, expression, &receiver.ty, names)
                     .map(|kind| (outputs.primary, callable.target_resolver, kind))
             }
             _ => None,
@@ -8623,8 +8664,8 @@ impl StructuralWalker<'_, '_> {
                 #[cfg(feature = "internal-checker")]
                 if let Some((source, callable, kind)) = ordinary_local.take() {
                     let binding = lexical.reference_id(callable.source, callable.function_span);
-                    self.structure.checker_ordinary_integer_locals.insert((position.block, position.item),
-                        CheckerOrdinaryIntegerLocal { binding, source, kind });
+                    self.structure.checker_ordinary_scalar_locals.insert((position.block, position.item),
+                        CheckerOrdinaryScalarLocal { binding, source, kind });
                 }
                 scope.names.insert(receiver.name.clone(), lexical);
             }

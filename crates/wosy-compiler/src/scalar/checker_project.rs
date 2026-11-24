@@ -7,7 +7,7 @@ use std::hash::{Hash, Hasher};
 use super::{
     checker_directive::{CheckedLiteralOutput, CheckerOperation, InitializerIntegerOperand, InitializerPredicate, PreparedCheckerDirective},
     checker_flow::{
-        check_integer_requirement_activity, check_integer_requirements_with_calls, check_integer_return_bound_with_shows, collect_integer_requirement_failures_with_calls, MAX_ACTUAL_CALL_DEPTH, ExactCallCursor, ExactCallEffect, ExactCallProgress, concrete_integer_literal, exact_integer_call_argument, exact_integer_call_argument_at,
+        check_integer_requirement_activity, check_integer_requirements_with_calls, check_integer_return_bound_with_shows, collect_integer_requirement_failures_with_calls, MAX_ACTUAL_CALL_DEPTH, ExactCallCursor, ExactCallEffect, ExactCallProgress, concrete_integer_literal, exact_typed_call_argument_at,
         exact_integer_return_at_entry, ActualCallResult, CheckerPredicate, ExactIntegerArgument, IntegerRequirementContinuation, IntegerRequirementEntry, NestedIntegerArgument, ProjectedCompanion, ProjectedIntegerArgument,
         proves_requirement_with_imported_root_local, ImportedEntryGuard, ImportedIntegerValues, ImportedLocal, IntegerShowProof, IntegerCheckFailure, IntegerComparison, IntegerInputs, IntegerReturn, ProofCoverage,
     },
@@ -1169,9 +1169,9 @@ fn check_initializer_expression<const COLLECT: bool, const PRIVATE_NESTED_SCALAR
     }
 }
 
-fn run_initializer_call<'a>(
+fn run_initializer_call<'a, Observer: ActualIntegerObserver>(
     topology: &'a ModuleInitializationTopology,
-    actual: &mut CheckedCalls<'_, impl ActualIntegerObserver>,
+    actual: &mut CheckedCalls<'_, Observer>,
     occurrence: OccurrenceOrdinal,
     expected: &ScalarType,
     initialized_argument: impl Fn(OccurrenceOrdinal, &ScalarType) -> Option<&'a BigInt>,
@@ -1186,16 +1186,17 @@ fn run_initializer_call<'a>(
     };
     let signature = topology.checked_call_signatures.get(&occurrence).ok_or(ProjectCheck::MissingRootOccurrences)?;
     let collection = collection.filter(|(source, _)| !is_integer_type(expected) || *source == &declaration.source);
+    let allow_bool = *expected == ScalarType::Unit && collection.is_some() && Observer::ORDINARY_INTEGER_LOCALS;
     let arguments = if signature.parameters.len() == 2
         && (is_integer_type(expected) || (*expected == ScalarType::Unit && collection.is_some()))
     {
-        let first = exact_integer_call_argument_at(&topology.structure, occurrence, 0, &initialized_argument)
+        let first = exact_typed_call_argument_at(&topology.structure, occurrence, 0, allow_bool, &initialized_argument)
             .ok_or(ProjectCheck::Unsupported)?;
-        let second = exact_integer_call_argument_at(&topology.structure, occurrence, 1, &initialized_argument)
+        let second = exact_typed_call_argument_at(&topology.structure, occurrence, 1, allow_bool, &initialized_argument)
             .ok_or(ProjectCheck::Unsupported)?;
         ActualProjectedArguments::ExactPair(first, second)
     } else {
-        let argument = exact_integer_call_argument(&topology.structure, occurrence, initialized_argument);
+        let argument = exact_typed_call_argument_at(&topology.structure, occurrence, 0, allow_bool, initialized_argument);
         if *expected != ScalarType::Unit && argument.is_none() {
             return Err(ProjectCheck::Unsupported);
         }
@@ -1660,6 +1661,7 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             caller, call, signature.parameters.len(), collection.is_some(), Observer::INTEGER_RETURN_PARTITIONS,
             Observer::ORDINARY_PROJECTED_PAIR,
             Observer::ORDINARY_PROJECTED_PAIR,
+            Observer::ORDINARY_INTEGER_LOCALS && *expected == ScalarType::Unit,
         )
             .ok_or(ProjectCheck::Unsupported)?;
         if let NestedIntegerArgument::Projected(mut projection) = arguments {
@@ -9175,7 +9177,7 @@ mod tests {
         let (module, item, _) = select_checked_root(project, &app, "snapshot").unwrap();
         let body = calls.function_body(module, item, None).unwrap();
         let key = |index| (body.structure.root, index);
-        let copies = &body.structure.checker_ordinary_integer_locals;
+        let copies = &body.structure.checker_ordinary_scalar_locals;
         let first = &copies[&key(0)];
         let second = &copies[&key(1)];
         assert_eq!(body.prepared_plain_name(first.source),
@@ -9189,7 +9191,7 @@ mod tests {
     #[cfg(feature = "internal-checker")]
     #[test]
     fn prepared_inline_arithmetic_isolated_from_named_integer_evidence() {
-        use super::super::reference::{CheckerOrdinaryIntegerLocalKind, CheckerOrdinaryIntegerOperand, PlainNameIdentity};
+        use super::super::reference::{CheckerOrdinaryScalarLocalKind, CheckerOrdinaryIntegerOperand, PlainNameIdentity};
         let app = source("src/main.w", "inline-arithmetic-origin");
         let program = format!(r#"%%start
             unit(i8) use_math = fn(entry) {{
@@ -9205,14 +9207,14 @@ mod tests {
         let (module, item, _) = select_checked_root(project, &app, "use_math").unwrap();
         let body = calls.function_body(module, item, None).unwrap();
         let key = |index| (body.structure.root, index);
-        let locals = &body.structure.checker_ordinary_integer_locals;
+        let locals = &body.structure.checker_ordinary_scalar_locals;
         let first = &locals[&key(0)];
         let second = &locals[&key(1)];
-        let CheckerOrdinaryIntegerLocalKind::Arithmetic {
+        let CheckerOrdinaryScalarLocalKind::Arithmetic {
             operator: super::super::BinaryOperator::Subtract,
             operands: [CheckerOrdinaryIntegerOperand::Literal(first_literal), CheckerOrdinaryIntegerOperand::Lexical(entry)],
         } = &first.kind else { panic!("missing checked signed subtraction"); };
-        let CheckerOrdinaryIntegerLocalKind::Arithmetic {
+        let CheckerOrdinaryScalarLocalKind::Arithmetic {
             operator: super::super::BinaryOperator::Add,
             operands: [CheckerOrdinaryIntegerOperand::Lexical(flipped), CheckerOrdinaryIntegerOperand::Literal(second_literal)],
         } = &second.kind else { panic!("missing checked signed addition"); };

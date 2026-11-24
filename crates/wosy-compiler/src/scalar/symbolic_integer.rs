@@ -406,6 +406,11 @@ impl<'a> IntegerShowConstraints<'a> {
 }
 
 impl IntegerSet {
+    #[cfg(feature = "internal-checker")]
+    pub(super) fn ordinary_bool_domain() -> Self {
+        Self(vec![Interval { first: 0u8.into(), last: 1u8.into() }])
+    }
+
     pub(super) fn from_type(ty: &ScalarType) -> Option<Self> {
         let (first, last) = integer_bounds(ty)?;
         Some(Self(vec![Interval { first, last }]))

@@ -581,6 +581,63 @@ for name,program,correct,incorrect,code,label in [
     ("anchored-independent-comparison-plus-live-affine",independent_anchored,"other >= 1","other >= 2",115,b"ANCHORED-INVERSE"),
 ]:
     cases.extend([(name,program,0,b""),(name+"-witness",program.replace(correct,incorrect),code,label)])
+bool_local = f"""%%start
+    unit(bool) check = fn(enabled) {{
+        bool copied = enabled;
+        bool valid = true;
+        if (copied) {{
+            core.require(enabled && valid, {report(116,"COPIED-TRUE")});
+        }} else {{
+            core.require(!enabled, {report(117,"COPIED-FALSE")});
+        }};
+    }};
+    %%end"""
+bool_startup = f"""%%start
+    unit(bool) check = fn(enabled) {{
+        if (enabled) {{ core.require(false, {report(118,"ACTUAL-TRUE")}); }};
+    }};
+    check(false);
+    check(true);
+    %%end"""
+bool_unary = f"""%%start
+    unit(bool) gate = fn(enabled) {{
+        core.narrow(enabled, {report(119,"BOOL-CUT")});
+    }};
+    unit(bool) caller = fn(enabled) {{
+        gate(enabled);
+        core.require(enabled, {report(120,"BOOL-UNARY")});
+    }};
+    gate(true);
+    %%end"""
+bool_pair = f"""%%start
+    unit(bool,i8) prune = fn(enabled, number) {{
+        if (enabled) {{ core.narrow(number <= 0, {report(121,"BOOL-PAIR-CUT")}); }}
+        else {{ core.narrow(number >= 1, {report(121,"BOOL-PAIR-CUT")}); }};
+    }};
+    unit(bool,i8) caller = fn(enabled, number) {{
+        prune(enabled, number);
+        if (number > 0) {{ core.require(!enabled, {report(122,"BOOL-PAIR")}); }};
+        if (enabled) {{ core.require(number <= 0, {report(123,"BOOL-FORWARD")}); }};
+    }};
+    prune(true,0);
+    %%end"""
+bool_fixed = f"""%%start
+    unit(bool,i8) prune = fn(enabled, number) {{
+        if (enabled) {{ core.narrow(number <= 0, {report(124,"FIXED-CUT")}); }};
+    }};
+    unit(i8) caller = fn(number) {{
+        prune(true, number);
+        core.require(number <= 0, {report(125,"BOOL-FIXED")});
+    }};
+    %%end"""
+for name,program,correct,incorrect,code,label in [
+    ("bool-symbolic-local-copy",bool_local,"!enabled,","enabled,",117,b"COPIED-FALSE"),
+    ("bool-projected-unary",bool_unary,"require(enabled,","require(!enabled,",120,b"BOOL-UNARY"),
+    ("mixed-bool-integer-anchored-pair",bool_pair,"require(!enabled,","require(enabled,",122,b"BOOL-PAIR"),
+    ("fixed-bool-literal-with-symbolic-integer",bool_fixed,"require(number <= 0","require(number >= 0",125,b"BOOL-FIXED"),
+]:
+    cases.extend([(name,program,0,b""),(name+"-witness",program.replace(correct,incorrect),code,label)])
+cases.append(("exact-startup-bool-argument",bool_startup,118,b"ACTUAL-TRUE"))
 with tempfile.TemporaryDirectory(prefix="affine-calls-") as path:
     root=Path(path)
     (root/"src").mkdir()
@@ -588,7 +645,7 @@ with tempfile.TemporaryDirectory(prefix="affine-calls-") as path:
         (root/"wosy.toml").write_text(manifest.format(output=target))
         for scope in ("--main-flow-only","--declared-package"):
             for name,text,expected,stderr in cases:
-                included = scope == "--declared-package" or name in ("exact-startup-lexical-copy", "exact-startup-inline-arithmetic", "exact-startup-lexical-comparison")
+                included = scope == "--declared-package" or name in ("exact-startup-lexical-copy", "exact-startup-inline-arithmetic", "exact-startup-lexical-comparison", "exact-startup-bool-argument")
                 code = expected if included else 0
                 expected_stderr = stderr if included else b""
                 (root/"src/main.w").write_text(text.strip()+"\n")

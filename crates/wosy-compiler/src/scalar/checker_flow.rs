@@ -2875,30 +2875,17 @@ fn collect_integer_requirement_failures_in_scope<'a, Scoped: ScopedAuthoredRetur
 
 pub(super) type ExactIntegerArgument<'a> = (&'a ScalarType, &'a BigInt);
 
-pub(super) fn exact_integer_call_argument<'a>(
-    structure: &'a OccurrenceStructure,
-    call: OccurrenceOrdinal,
+pub(super) fn exact_typed_call_argument_at<'a>(
+    structure: &'a OccurrenceStructure, call: OccurrenceOrdinal, slot: usize, allow_bool: bool,
     lexical: impl FnOnce(OccurrenceOrdinal, &ScalarType) -> Option<&'a BigInt>,
 ) -> Option<ExactIntegerArgument<'a>> {
-    exact_integer_call_argument_at(structure, call, 0, lexical)
-}
-
-pub(super) fn exact_integer_call_argument_at<'a>(
-    structure: &'a OccurrenceStructure,
-    call: OccurrenceOrdinal,
-    slot: usize,
-    lexical: impl FnOnce(OccurrenceOrdinal, &ScalarType) -> Option<&'a BigInt>,
-) -> Option<ExactIntegerArgument<'a>> {
-    let (argument, ty) = checked_integer_call_argument_at(structure, call, slot)?;
-    let value = match structure.checker_integer_literals.get(&argument) {
-        Some(value) => value,
-        None => lexical(argument, ty)?,
-    };
+    let (argument, ty) = checked_scalar_call_argument_at(structure, call, slot, allow_bool)?;
+    let value = scalar_call_literal(structure, argument, ty).or_else(|| lexical(argument, ty))?;
     Some((ty, value))
 }
 
-fn checked_integer_call_argument_at(
-    structure: &OccurrenceStructure, call: OccurrenceOrdinal, slot: usize,
+fn checked_scalar_call_argument_at(
+    structure: &OccurrenceStructure, call: OccurrenceOrdinal, slot: usize, allow_bool: bool,
 ) -> Option<(OccurrenceOrdinal, &ScalarType)> {
     let OccurrenceNode::Expression(argument) = structure.edges.get(&(
         OccurrenceParent::Expression(call), OccurrenceEdge::CallArgument(slot),
@@ -2906,7 +2893,29 @@ fn checked_integer_call_argument_at(
         return None;
     };
     let ty = structure.checked_types.expressions.get(argument)?;
-    is_integer_type(ty).then_some((*argument, ty))
+    (is_integer_type(ty) || (allow_bool && *ty == ScalarType::Bool)).then_some((*argument, ty))
+}
+
+fn scalar_call_literal<'a>(structure: &'a OccurrenceStructure, argument: OccurrenceOrdinal, ty: &ScalarType)
+    -> Option<&'a BigInt>
+{
+    #[cfg(feature = "internal-checker")]
+    if *ty == ScalarType::Bool {
+        return structure.checker_ordinary_bool_arguments.get(&argument);
+    }
+    #[cfg(not(feature = "internal-checker"))]
+    let _ = ty;
+    structure.checker_integer_literals.get(&argument)
+}
+
+fn ordinary_parameter_set(ty: &ScalarType, allow_bool: bool) -> Option<IntegerSet> {
+    #[cfg(feature = "internal-checker")]
+    if allow_bool && *ty == ScalarType::Bool {
+        return Some(IntegerSet::ordinary_bool_domain());
+    }
+    #[cfg(not(feature = "internal-checker"))]
+    let _ = allow_bool;
+    IntegerSet::from_type(ty)
 }
 
 pub(super) enum ActualCallResult {
@@ -3136,10 +3145,10 @@ fn charge_call_work(work: &mut usize, cost: usize) -> Option<()> {
 
 fn nested_integer_operand<'a>(
     calls: &'a FunctionCallSites, expression: OccurrenceOrdinal, slot: usize,
-    roots: &IntegerRoots<'_>, path: &'a IntegerInputs, work: Option<&mut usize>,
+    roots: &IntegerRoots<'_>, path: &'a IntegerInputs, allow_bool: bool, work: Option<&mut usize>,
 ) -> Option<NestedIntegerOperand<'a>> {
-    let (argument, ty) = checked_integer_call_argument_at(&calls.structure, expression, slot)?;
-    if let Some(value) = calls.structure.checker_integer_literals.get(&argument) {
+    let (argument, ty) = checked_scalar_call_argument_at(&calls.structure, expression, slot, allow_bool)?;
+    if let Some(value) = scalar_call_literal(&calls.structure, argument, ty) {
         return Some(NestedIntegerOperand::Exact((ty, value)));
     }
     let PlainNameIdentity::Lexical(binding) = calls.prepared_plain_name(argument)? else { return None; };
@@ -3160,10 +3169,10 @@ fn nested_integer_operand<'a>(
 
 fn nested_pair_argument<'a>(
     calls: &'a FunctionCallSites, expression: OccurrenceOrdinal, roots: &IntegerRoots<'_>, path: &'a IntegerInputs,
-    allow_projection: bool, allow_equal: bool, allow_independent: bool, mut work: Option<&mut usize>,
+    allow_projection: bool, allow_equal: bool, allow_independent: bool, allow_bool: bool, mut work: Option<&mut usize>,
 ) -> Option<NestedIntegerArgument<'a>> {
-    let first = nested_integer_operand(calls, expression, 0, roots, path, work.as_deref_mut())?;
-    let second = nested_integer_operand(calls, expression, 1, roots, path, work.as_deref_mut())?;
+    let first = nested_integer_operand(calls, expression, 0, roots, path, allow_bool, work.as_deref_mut())?;
+    let second = nested_integer_operand(calls, expression, 1, roots, path, allow_bool, work.as_deref_mut())?;
     let mut equal_axes = |left, right| {
         left == right || path.0.iter().all(|row| {
             if let Some(work) = work.as_deref_mut() {
@@ -3196,9 +3205,9 @@ fn actual_nested_argument<'a>(
     expression: OccurrenceOrdinal,
     roots: &IntegerRoots<'_>,
     path: &'a IntegerInputs,
-    allow_projection: bool, work: Option<&mut usize>,
+    allow_projection: bool, allow_bool: bool, work: Option<&mut usize>,
 ) -> NestedIntegerArgument<'a> {
-    match nested_integer_operand(calls, expression, 0, roots, path, work) {
+    match nested_integer_operand(calls, expression, 0, roots, path, allow_bool, work) {
         Some(NestedIntegerOperand::Exact(argument)) => NestedIntegerArgument::Single(Some(argument)),
         Some(NestedIntegerOperand::Axis(ty, caller_axis)) if allow_projection =>
             NestedIntegerArgument::Projected(ProjectedIntegerArgument {
@@ -3709,8 +3718,12 @@ fn run_integer_callable<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool,
         }
         exact_integer_entry_row(arguments)
     } else {
+        #[cfg(feature = "internal-checker")]
+        let allow_bool = Authored::ALLOW_ORDINARY_INTEGER_LOCALS;
+        #[cfg(not(feature = "internal-checker"))]
+        let allow_bool = false;
         boundary.parameters.iter()
-            .map(|parameter| IntegerSet::from_type(&parameter.ty).map(Rc::new))
+            .map(|parameter| ordinary_parameter_set(&parameter.ty, allow_bool).map(Rc::new))
             .collect::<Option<IntegerRow>>()?
     };
     for filter in entry_filter.into_iter().flatten() {
@@ -4051,6 +4064,13 @@ impl IntegerInputs {
                     output[lane].0 = self.0.clone();
                 }
             }
+            Boolean::Binding(binding) => {
+                let (axis, ty) = roots.lookup(binding)?;
+                if *ty != ScalarType::Bool { return None; }
+                let one = BigInt::from(1u8);
+                let relation = IntegerRelation::from_operator(&BinaryOperator::Equal)?;
+                return self.ordinary_atom(OrdinaryIntegerAtom::Literal(axis, relation, &one), selected, work);
+            }
             Boolean::Integer(predicate) => {
                 let (axis, ty) = roots.lookup(&predicate.binding)?;
                 if ty != &predicate.ty { return None; }
@@ -4333,9 +4353,9 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                     let signature = calls.checked_call_signatures.get(&expression)?;
                     let project = COLLECT && failures.as_ref().is_some_and(|collection| collection.allow_projected_calls);
                     let argument = if COLLECT && signature.parameters.len() == 2 {
-                        nested_pair_argument(calls, expression, roots, &path, project, false, false, None)?
+                        nested_pair_argument(calls, expression, roots, &path, project, false, false, false, None)?
                     } else {
-                        actual_nested_argument(calls, expression, roots, &path, project, None)
+                        actual_nested_argument(calls, expression, roots, &path, project, false, None)
                     };
                     let projected = match &argument {
                         NestedIntegerArgument::Projected(projection) => Some(projection.caller_axis),
@@ -4688,7 +4708,7 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                     }
                     let handle = handle_call.as_mut()?;
                     let signature = calls.checked_call_signatures.get(&origin.call)?;
-                    let argument = actual_nested_argument(calls, origin.call, roots, &path, false, None);
+                    let argument = actual_nested_argument(calls, origin.call, roots, &path, false, false, None);
                     #[cfg(feature = "internal-checker")]
                     let argument = if matches!(origin.arguments.as_slice(), [(_, CheckerIntegerCallArgument::ContextualValue)]) {
                         let NestedIntegerArgument::Single(Some(exact)) = argument else { return None; };
@@ -4745,7 +4765,7 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                 }
                 #[cfg(feature = "internal-checker")]
                 if roots.allow_ordinary_integer_locals {
-                    if let Some(origin) = structure.checker_ordinary_integer_locals.get(&(block, item.position)) {
+                    if let Some(origin) = structure.checker_ordinary_scalar_locals.get(&(block, item.position)) {
                         let [receiver] = binding.receivers() else { return None; };
                         let BindingInitialization::Outputs(outputs) = &binding.initialization else { return None; };
                         if origin.source != outputs.primary || !outputs.secondary.is_empty()
@@ -4755,7 +4775,7 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                             return None;
                         }
                         match &origin.kind {
-                            super::reference::CheckerOrdinaryIntegerLocalKind::Copy => {
+                            super::reference::CheckerOrdinaryScalarLocalKind::Copy => {
                                 let PlainNameIdentity::Lexical(source) = calls.prepared_plain_name(origin.source)? else { return None; };
                                 let (axis, ty) = roots.lookup(source)?;
                                 if ty != &receiver.ty { return None; }
@@ -4772,7 +4792,13 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                                     row.append_alias(axis, Rc::clone(&row[axis]));
                                 }
                             }
-                            super::reference::CheckerOrdinaryIntegerLocalKind::Arithmetic { operator, operands } => {
+                            super::reference::CheckerOrdinaryScalarLocalKind::BoolLiteral(value) => {
+                                if receiver.ty != ScalarType::Bool { return None; }
+                                let work = roots.ordinary_local_work.get_or_insert(0);
+                                charge_call_work(work, path.0.len().checked_add(1)?)?;
+                                path.append_local(IntegerSet::singleton(&BigInt::from(u8::from(*value))));
+                            }
+                            super::reference::CheckerOrdinaryScalarLocalKind::Arithmetic { operator, operands } => {
                                 let operation = AuthoredIntegerOperation::checked(operator)?;
                                 let operand = |operand| ordinary_local_operand(calls, roots, &receiver.ty, operand);
                                 let left = operand(&operands[0])?;
@@ -4891,7 +4917,7 @@ impl<'a> ExactCallCursor<'a> {
 
     pub(super) fn arbitrary_unit(calls: &'a FunctionCallSites) -> Option<Self> {
         let row = calls.boundary.parameters.iter()
-            .map(|parameter| IntegerSet::from_type(&parameter.ty).map(Rc::new))
+            .map(|parameter| ordinary_parameter_set(&parameter.ty, true).map(Rc::new))
             .collect::<Option<IntegerRow>>()?;
         Self::with_row(calls, &ScalarType::Unit, row, None)
     }
@@ -5000,14 +5026,14 @@ impl<'a> ExactCallCursor<'a> {
 
     pub(super) fn arguments<'borrow>(
         &'borrow mut self, calls: &'borrow FunctionCallSites, call: OccurrenceOrdinal, parameters: usize,
-        collect: bool, project: bool, project_pair: bool, project_independent: bool,
+        collect: bool, project: bool, project_pair: bool, project_independent: bool, allow_bool: bool,
     ) -> Option<NestedIntegerArgument<'borrow>> {
         let mut work = self.roots.affine_work;
         let mut argument = if collect && parameters == 2 {
             nested_pair_argument(calls, call, &self.roots, &self.block.path,
-                project_pair, project_pair, project_independent, work.as_mut())?
+                project_pair, project_pair, project_independent, allow_bool, work.as_mut())?
         } else {
-            actual_nested_argument(calls, call, &self.roots, &self.block.path, project, work.as_mut())
+            actual_nested_argument(calls, call, &self.roots, &self.block.path, project, allow_bool, work.as_mut())
         };
         self.roots.affine_work = work;
         if let Some(work) = &mut self.roots.affine_work {
@@ -5204,7 +5230,7 @@ impl<'a> ExactCallCursor<'a> {
     ) -> Option<ExactCallProgress<'a>> {
         #[cfg(feature = "internal-checker")]
         {
-            self.roots.allow_ordinary_integer_locals = allow_ordinary_integer_locals && !calls.structure.checker_ordinary_integer_locals.is_empty();
+            self.roots.allow_ordinary_integer_locals = allow_ordinary_integer_locals && !calls.structure.checker_ordinary_scalar_locals.is_empty();
             self.roots.allow_ordinary_affine_overwrites = allow_ordinary_integer_locals;
             if allow_ordinary_integer_locals && calls.structure.has_ordinary_predicates() {
                 self.roots.ordinary_comparison_work.get_or_insert(0);
@@ -5640,6 +5666,16 @@ fn affine_class_cap_allows_identity_alias_and_releases_truncated_members() {
     row.truncate(MAX_AFFINE_MEMBERS);
     assert_eq!(row.affine.as_ref().unwrap().members.len(), MAX_AFFINE_MEMBERS - 1);
     assert_eq!(row.test_append_affine(0, next), Some(()));
+}
+
+#[cfg(feature = "internal-checker")]
+#[test]
+fn typed_bool_domain_is_exact_and_only_available_to_ordinary_ingress() {
+    assert!(IntegerSet::from_type(&ScalarType::Bool).is_none());
+    assert!(ordinary_parameter_set(&ScalarType::Bool, false).is_none());
+    let ordinary = ordinary_parameter_set(&ScalarType::Bool, true).unwrap();
+    assert_eq!(ordinary.extremes(), Some((&BigInt::from(0u8), &BigInt::from(1u8))));
+    assert!(!ordinary.contains(&BigInt::from(2u8)));
 }
 
 #[cfg(feature = "internal-checker")]
