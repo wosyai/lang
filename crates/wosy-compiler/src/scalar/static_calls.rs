@@ -244,6 +244,11 @@ impl PreparedScalarProject {
         self.calls.function_body(module, item, arm)?.contextual_formal()
     }
 
+    #[cfg(feature = "internal-checker")]
+    pub(super) fn into_contextual_parts(self) -> (ScalarProject, reference::ProjectCallSiteResults) {
+        (self.project, self.calls)
+    }
+
     pub fn project(&self) -> &ScalarProject {
         &self.project
     }

@@ -3302,6 +3302,8 @@ fn ordinary_parameter_set(ty: &ScalarType, allow_bool: bool) -> Option<IntegerSe
 pub(super) enum ActualCallResult {
     Unit,
     EmptyUnit,
+    #[cfg(feature = "internal-checker")]
+    ContextualUnit { entry: BigInt, exit: BigInt },
     ProjectedUnit(Rc<IntegerSet>),
     ProjectedUnitPair(ProjectedUnitPair),
     Integer(BigInt),
@@ -6364,6 +6366,8 @@ pub(super) struct ExactCallCursor<'a> {
     #[cfg(feature = "internal-checker")]
     tail_call_result: Option<ActualCallResult>,
     #[cfg(feature = "internal-checker")]
+    contextual_entry: Option<(usize, BigInt)>,
+    #[cfg(feature = "internal-checker")]
     named_affine_partition: bool,
     #[cfg(feature = "internal-checker")]
     named_pure_projection_leaf: bool,
@@ -6631,10 +6635,58 @@ impl<'a> ExactCallCursor<'a> {
             #[cfg(feature = "internal-checker")]
             tail_call_result: None,
             #[cfg(feature = "internal-checker")]
+            contextual_entry: None,
+            #[cfg(feature = "internal-checker")]
             named_affine_partition: false,
             #[cfg(feature = "internal-checker")]
             named_pure_projection_leaf: false,
             discarded_return: None, returned: Vec::new(), computed_returns: Vec::new(), return_capture_work: 0, projected_slot, projected_pair })
+    }
+
+    #[cfg(feature = "internal-checker")]
+    pub(super) fn contextual_singleton(&self, binding: &ReferenceBindingId, ty: &ScalarType) -> Option<&BigInt> {
+        let (axis, active_ty) = self.roots.lookup(binding)?;
+        let [row] = self.block.path.0.as_slice() else { return None; };
+        if active_ty != ty || row.affine.is_some() { return None; }
+        row.get(axis)?.singleton_value()
+    }
+
+    #[cfg(feature = "internal-checker")]
+    pub(super) fn enter_contextual_unit(
+        &mut self, binding: &'a ReferenceBindingId, ty: &'a ScalarType, entry: BigInt,
+    ) -> Option<()> {
+        if !self.roots.axes.is_empty() || self.tail.is_some() || self.contextual_entry.is_some()
+            || self.projected_slot.is_some() || self.projected_pair.is_some() || !is_integer_type(ty)
+            || !super::typecheck::integer_literal_fits_type(&entry, ty)
+        {
+            return None;
+        }
+        let [row] = self.block.path.0.as_slice() else { return None; };
+        if !row.is_empty() { return None; }
+        self.block.path.append_local(IntegerSet::singleton(&entry));
+        self.roots.add(binding, ty);
+        self.block.depth = self.roots.axes.len();
+        self.contextual_entry = Some((0, entry));
+        Some(())
+    }
+
+    #[cfg(feature = "internal-checker")]
+    pub(super) fn resume_contextual_unit(
+        &mut self, binding: &ReferenceBindingId, ty: &ScalarType, entry: BigInt, exit: BigInt,
+    ) -> Option<()> {
+        if self.contextual_singleton(binding, ty)? != &entry
+            || !super::typecheck::integer_literal_fits_type(&exit, ty)
+        {
+            return None;
+        }
+        if entry != exit {
+            let axis = self.roots.lookup(binding)?.0;
+            self.roots.ordinary_local_work.get_or_insert(0);
+            self.block.path.charge_local_alias_work(&mut self.roots.ordinary_local_work, 2)?;
+            let [row] = self.block.path.0.as_mut_slice() else { return None; };
+            row.overwrite(axis, Rc::new(IntegerSet::singleton(&exit)), false);
+        }
+        Some(())
     }
 
     pub(super) fn arguments<'borrow>(
@@ -6956,6 +7008,15 @@ impl<'a> ExactCallCursor<'a> {
             (_, IntegerControl::PendingCall(effect)) => return Some(ExactCallProgress::Pending(effect)),
             (_, IntegerControl::Fail(failure)) => return Some(ExactCallProgress::Failed(failure)),
             (None, IntegerControl::Continue(path)) if COLLECT && path.is_unreachable() => ActualCallResult::EmptyUnit,
+            #[cfg(feature = "internal-checker")]
+            (None, IntegerControl::Continue(path)) if self.contextual_entry.is_some() => {
+                let (axis, entry) = self.contextual_entry.take()?;
+                let [row] = path.0.as_slice() else { return None; };
+                let exit = row.get(axis)?.singleton_value()?.clone();
+                ActualCallResult::ContextualUnit { entry, exit }
+            }
+            #[cfg(feature = "internal-checker")]
+            (None, IntegerControl::Returned) if self.contextual_entry.is_some() => return None,
             (None, IntegerControl::Continue(survivors)) if self.projected_pair.is_some() =>
                 ActualCallResult::ProjectedUnitPair(ProjectedUnitPair { caller_axes: self.projected_pair?, survivors }),
             (None, IntegerControl::Continue(path)) if self.projected_slot.is_some() =>

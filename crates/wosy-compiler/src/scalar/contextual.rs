@@ -322,7 +322,7 @@ pub(super) enum DormantContextRejection {
 pub(super) fn prepare_dormant_context(
     canonical: &CanonicalCstRoot, inputs: ScalarPreparationInputs,
 ) -> Result<DormantContextReceipt, DormantContextRejection> {
-    let (prepared, receipt) = prepare_contextual_transport(canonical, inputs)?;
+    let (prepared, receipt) = prepare_contextual_transport(canonical, inputs, false)?;
     let build = analyze_scalar_build(&prepared);
     if !build.diagnostics().is_empty() {
         return Err(DormantContextRejection::Unsupported);
@@ -332,7 +332,7 @@ pub(super) fn prepare_dormant_context(
 
 #[cfg(any(test, feature = "internal-checker"))]
 pub(super) fn prepare_contextual_transport(
-    canonical: &CanonicalCstRoot, inputs: ScalarPreparationInputs,
+    canonical: &CanonicalCstRoot, inputs: ScalarPreparationInputs, checker_directives: bool,
 ) -> Result<(PreparedScalarProject, DormantContextReceipt), DormantContextRejection> {
     use self::DormantContextRejection::{MissingAtRoot, Unsupported};
     use super::control::{ModuleInitializationCallTarget, ModuleInitializationDetail};
@@ -367,7 +367,7 @@ pub(super) fn prepare_contextual_transport(
     let project = project_from_declarations(vec![(source, Vec::new())], vec![canonical.source.clone()], inputs)
         .map_err(|_| Unsupported)?;
     let (project, mut calls) = super::static_calls::prepare_project_occurrences(
-        typecheck_scalar_project_with_occurrences(project), &[],
+        typecheck_scalar_project_in_mode(project, checker_directives), &[],
     ).map_err(|_| Unsupported)?;
     let [module] = project.modules.as_slice() else { return Err(Unsupported); };
     let mut by_body = HashMap::new();

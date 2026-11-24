@@ -540,6 +540,21 @@ fn run_prepared_ordered_check<E: OrderedRunEvidence>(
     })
 }
 
+#[cfg(feature = "internal-checker")]
+#[allow(dead_code)]
+fn check_internal_contextual_calls(
+    canonical: &wosy_syntax::CanonicalCstRoot, inputs: ScalarPreparationInputs,
+) -> Result<PreparedOrderedRun<ProofFreeOrderedEvidence>, ProjectCheck> {
+    let (prepared, _) = super::contextual::prepare_contextual_transport(canonical, inputs, true)
+        .map_err(|_| ProjectCheck::Unsupported)?;
+    // Checker directives are prepared once in checker mode. Context
+    // authenticity comes from the same source scope and checked call rows,
+    // not a second preparation or a proof-free runtime execution.
+    let prepared = PreparedCheckerProject::from_contextual_transport(prepared);
+    run_prepared_ordered_check(&prepared, ScalarCheckerScope::MainFlowOnly, 1,
+        OrderedReachPolicy::Closed, ProofFreeOrderedEvidence)
+}
+
 #[cfg(all(test, feature = "internal-checker"))]
 fn collect_ordered_package_failures(
     prepared: &PreparedCheckerProject, scope: ScalarCheckerScope, startup_count: usize,
@@ -2268,8 +2283,21 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                             }), parameters, exact, value);
                         }
                     }
-                    frames.last_mut().ok_or(ProjectCheck::Unsupported)?.cursor.resume(effect, caller_axis, result)
-                        .ok_or(ProjectCheck::Unsupported)?;
+                    let parent = frames.last_mut().ok_or(ProjectCheck::Unsupported)?;
+                    #[cfg(feature = "internal-checker")]
+                    if let ActualCallResult::ContextualUnit { entry, exit } = result {
+                        if !ACTUAL_STARTUP || NAMED || !matches!(effect, ExactCallEffect::Unit(_))
+                            || caller_axis.is_some()
+                        {
+                            return Err(ProjectCheck::Unsupported);
+                        }
+                        let (binding, ty) = parent.body.contextual_argument(effect.occurrence())
+                            .ok_or(ProjectCheck::Unsupported)?;
+                        parent.cursor.resume_contextual_unit(binding, ty, entry, exit)
+                            .ok_or(ProjectCheck::Unsupported)?;
+                        continue;
+                    }
+                    parent.cursor.resume(effect, caller_axis, result).ok_or(ProjectCheck::Unsupported)?;
                 }
             }
         }
@@ -2314,6 +2342,26 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             let (target, owner, _, body) = self.validated_direct_body(&caller.structure, call, source, *declaration_span)?;
             let signature = caller.checked_call_signatures.get(&call).ok_or(ProjectCheck::Unsupported)?;
             (target, owner, body, signature)
+        };
+        #[cfg(feature = "internal-checker")]
+        let contextual_entry = match (caller.contextual_argument(call), body.contextual_formal()) {
+            (None, None) => None,
+            (Some((binding, ty)), Some((formal, formal_ty)))
+                if ACTUAL_STARTUP && !NAMED && Observer::PROOF_FREE_CONTEXTUAL_LOCAL_TRANSFERS
+                    && collection.is_some() && parent.source == &owner.source && ty == formal_ty
+                    && matches!(effect, ExactCallEffect::Unit(_)) && signature.parameters.is_empty()
+                    && body.boundary.parameters.is_empty() && !self.active.contains(&target)
+                    && matches!(signature.outputs.outputs.as_slice(), [out] if out.ty == ScalarType::Unit) =>
+            {
+                let ordered = collection.ok_or(ProjectCheck::Unsupported)?;
+                super::checker_flow::charge_call_work(
+                    &mut ordered.failures.borrow_mut().contextual_call_work,
+                    body.occurrences.len().checked_add(1).ok_or(ProjectCheck::Unsupported)?,
+                ).ok_or(ProjectCheck::Unsupported)?;
+                Some((formal, formal_ty, parent.cursor.contextual_singleton(binding, ty)
+                    .ok_or(ProjectCheck::Unsupported)?.clone()))
+            }
+            _ => return Err(ProjectCheck::Unsupported),
         };
         #[cfg(feature = "internal-checker")]
         let watched = if NAMED { self.observer.named_exact_watch(target) } else { None };
@@ -2546,6 +2594,10 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
         #[allow(unused_mut)]
         let mut cursor = ExactCallCursor::new(body, exact, expected).ok_or(ProjectCheck::Unsupported)?;
         #[cfg(feature = "internal-checker")]
+        if let Some((formal, ty, value)) = contextual_entry {
+            cursor.enter_contextual_unit(formal, ty, value).ok_or(ProjectCheck::Unsupported)?;
+        }
+        #[cfg(feature = "internal-checker")]
         if NAMED || named_mixed_pair {
             cursor.allow_named_exact_bool_parameters().ok_or(ProjectCheck::Unsupported)?;
         }
@@ -2602,6 +2654,11 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
         #[cfg(feature = "internal-checker")] proof_site: Option<InitializerProofSite<'_>>,
     ) -> Result<ActualCallResult, ProjectCheck> {
         let (target, owner, function, body) = self.validated_direct_body(structure, call, target_source, target_span)?;
+        #[cfg(feature = "internal-checker")]
+        if body.contextual_formal().is_some() {
+            // Only the exact child activation path can install a formal.
+            return Err(ProjectCheck::Unsupported);
+        }
         #[cfg(feature = "internal-checker")]
         if self.observer.citation_only() && !collection.is_some_and(|(caller_source, _)|
             caller_source == &owner.source && citation_safe_calling_body(body))
@@ -2910,6 +2967,12 @@ mod prepared {
     }
 
     impl PreparedCheckerProject {
+        #[cfg(feature = "internal-checker")]
+        pub(super) fn from_contextual_transport(prepared: super::super::PreparedScalarProject) -> Self {
+            let (project, calls) = prepared.into_contextual_parts();
+            Self { project, calls }
+        }
+
         pub(super) fn parts(&self) -> (&ScalarProject, &ProjectCallSiteResults) {
             (&self.project, &self.calls)
         }
@@ -2988,6 +3051,8 @@ struct OrderedFailures {
     has_selected_code: bool,
     #[cfg(feature = "internal-checker")]
     startup_output_work: usize,
+    #[cfg(feature = "internal-checker")]
+    contextual_call_work: usize,
     #[cfg(feature = "internal-checker")]
     snapshot_records: Vec<usize>,
     #[cfg(feature = "internal-checker")]
@@ -15749,6 +15814,64 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
             assert!(matches!(result, Err(ProjectCheck::Unsupported)));
             assert!(output.records.is_empty());
             assert!(actual.active.is_empty());
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn exact_contextual_nested_unit_calls_preserve_entry_snapshots_and_shadow_identity() {
+        let app = source("src/main.w", "checked-contextual-call-state");
+        let text = r#"%%start
+            unit() consume = fn { core.context.credit = core.context.credit - 1; };
+            unit() relay = fn { consume(); };
+            unit() entry = fn {
+                u8 core.context.credit = 3;
+                u8 old_outer = core.context.credit;
+                relay();
+                core.require(false, { .stdout = ""; .stderr = ""; .code = 46; .files = [
+                    { .path = "old.json"; .state = old_outer; },
+                    { .path = "new.json"; .state = core.context.credit; }
+                ]; });
+                if (true) {
+                    u8 core.context.credit = 20;
+                    u8 old_inner = core.context.credit;
+                    relay();
+                    core.require(false, { .stdout = ""; .stderr = ""; .code = 47; .files = [
+                        { .path = "old.json"; .state = old_inner; },
+                        { .path = "new.json"; .state = core.context.credit; }
+                    ]; });
+                };
+                relay();
+                core.require(false, { .stdout = ""; .stderr = ""; .code = 48; .files = [
+                    { .path = "old.json"; .state = old_outer; },
+                    { .path = "new.json"; .state = core.context.credit; }
+                ]; });
+            };
+            entry();
+        %%end"#;
+        let run = |text: &str, target_layout| {
+            let parsed = crate::parse_source(app.clone(), text.to_owned(), &[]);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            check_internal_contextual_calls(parsed.result.canonical_cst(), ScalarPreparationInputs { target_layout })
+        };
+        for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let report = run(text, layout).unwrap();
+            let [outer, inner, restored] = report.directives.as_slice() else { panic!("expected three reached receipts"); };
+            for (record, (code, before, after)) in [outer, inner, restored].into_iter().zip([(46, 3, 2), (47, 20, 19), (48, 3, 1)]) {
+                assert_eq!(record.code(), &BigInt::from(code));
+                let state = |value| format!("{{\"type\":{{\"kind\":\"u8\"}},\"value\":{value}}}\n");
+                assert_eq!(record.files()[0].text.as_ref(), state(before).as_bytes());
+                assert_eq!(record.files()[1].text.as_ref(), state(after).as_bytes());
+            }
+            let outer_axes = outer.witness.axes().collect::<Vec<_>>();
+            let inner_axes = inner.witness.axes().collect::<Vec<_>>();
+            assert_eq!(outer_axes[0], inner_axes[0]);
+            assert_ne!(outer_axes[0], inner_axes[2]);
+            assert_eq!(outer_axes, restored.witness.axes().collect::<Vec<_>>());
+            // The outer receipt was already reached when inner overflow is found;
+            // no partial report may escape the failed transfer.
+            let overflow = text.replace("credit = 20;", "credit = 0;");
+            assert!(matches!(run(&overflow, layout), Err(ProjectCheck::Unsupported)));
         }
     }
 

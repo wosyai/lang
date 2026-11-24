@@ -3090,7 +3090,7 @@ fn typecheck_scalar_project_in_mode(
 pub(crate) fn prepare_internal_contextual_runtime(
     canonical: &CanonicalCstRoot, inputs: ScalarPreparationInputs,
 ) -> Result<PreparedScalarProject, String> {
-    contextual::prepare_contextual_transport(canonical, inputs)
+    contextual::prepare_contextual_transport(canonical, inputs, false)
         .map(|(prepared, _)| prepared)
         .map_err(|reason| format!("unsupported contextual runtime transport: {reason:?}"))
 }
