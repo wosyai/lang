@@ -2697,37 +2697,60 @@ impl Body<'_> {
         Some(result)
     }
 
-    // The immediately preceding statement must install exactly the owning call
-    // whose unprojected lexical value this terminal consumes. A matching name or
-    // type alone is not evidence of backing identity.
+    // Only a contiguous, single-receiver chain of same-scope whole moves
+    // may carry an owning call's original receipt to a named terminal.
     fn named_terminal_producer(
         &self, block: BlockOrdinal, terminal: OccurrenceOrdinal, calls: &BTreeMap<usize, CfgPointId>,
         ty: &ScalarType,
     ) -> Option<CfgPointId> {
-        let [.., prior, last] = self.sites.structure.blocks.get(block.0)?.items.as_slice() else { return None };
+        let (last, statements) = self.sites.structure.blocks.get(block.0)?.items.split_last()?;
         let BlockItemKind::FinalOutput(output) = &last.kind else { return None };
-        let BlockItemKind::Binding(bind) = &prior.kind else { return None };
-        let BindingInitialization::Outputs(init) = &bind.initialization else { return None };
-        let [receiver] = bind.receivers() else { return None };
-        let PlainNameIdentity::Lexical(identity) = self.sites.prepared_plain_name(terminal)? else { return None };
-        let producer = *calls.get(&init.primary.0)?;
-        let (bound, actual) = self.facts?.direct_receipt_bindings.get(&producer)?;
+        if output.expression != terminal { return None }
+        let mut use_ordinal = terminal;
+        let mut links = Vec::new();
+        let (producer, installed) = 'producer: {
+            for item in statements.iter().rev() {
+                let BlockItemKind::Binding(bind) = &item.kind else { return None };
+                let BindingInitialization::Outputs(init) = &bind.initialization else { return None };
+                let [receiver] = bind.receivers() else { return None };
+                let PlainNameIdentity::Lexical(identity) = self.sites.prepared_plain_name(use_ordinal)? else { return None };
+                if &receiver.ty != ty || !init.secondary.is_empty() || receiver.span != identity.declaration_span {
+                    return None;
+                }
+                links.push((identity, self.sites.occurrences.get(use_ordinal.0)?.span));
+                if let Some(&producer) = calls.get(&init.primary.0) {
+                    let (bound, original) = self.facts?.direct_receipt_bindings.get(&producer)?;
+                    if original != identity { return None }
+                    break 'producer (producer, *bound);
+                }
+                use_ordinal = init.primary;
+            }
+            return None;
+        };
         let points = &self.cfg.points;
-        let bind_point = points.get(bound.0)?;
-        let [read] = bind_point.successors.as_slice() else { return None };
-        let read = points.get(read.0)?;
-        let [moved] = read.successors.as_slice() else { return None };
-        let moved = points.get(moved.0)?;
-        let span = self.sites.occurrences.get(terminal.0)?.span;
-        (output.expression == terminal && init.secondary.is_empty() && &receiver.ty == ty
-            && actual == identity && identity.declaration_span == receiver.span
-            && points.get(producer.0)?.scope == bind_point.scope
-            && bind_point.scope == read.scope && read.scope == moved.scope
-            && read.source_span.range == span && moved.source_span.range == span
-            && matches!(&read.kind, CfgPointKind::Read { binding } if binding == identity)
-            && matches!(&moved.kind, CfgPointKind::Move { owner, place, ty: moved_ty }
-                if owner == identity && place.binding == *identity && place.projections.is_empty() && moved_ty == ty))
-            .then_some(producer)
+        let scope = points.get(producer.0)?.scope;
+        let next = |point: &ReferenceFlowPoint| {
+            let [id] = point.successors.as_slice() else { return None };
+            points.get(id.0).filter(|next| next.scope == scope)
+        };
+        let mut bind = points.get(installed.0)?;
+        let mut links = links.into_iter().rev().peekable();
+        while let Some((identity, span)) = links.next() {
+            let read = next(bind)?;
+            let moved = next(read)?;
+            if bind.scope != scope || !matches!(&bind.kind, CfgPointKind::Bind { binding } if binding == identity)
+                || read.source_span.range != span || moved.source_span.range != span
+                || !matches!(&read.kind, CfgPointKind::Read { binding } if binding == identity)
+                || !matches!(&moved.kind, CfgPointKind::Move { owner, place, ty: moved_ty }
+                    if owner == identity && place.binding == *identity && place.projections.is_empty() && moved_ty == ty)
+            {
+                return None;
+            }
+            if links.peek().is_some() {
+                bind = next(moved)?;
+            }
+        }
+        Some(producer)
     }
 
     fn recommitted_root_output(&self, producer: CfgPointId) -> Option<(OccurrenceOrdinal, OccurrenceOrdinal)> {

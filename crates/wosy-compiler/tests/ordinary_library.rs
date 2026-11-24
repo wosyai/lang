@@ -994,9 +994,9 @@ fn structured_owner_factory_joins_grounded_recursive_results_in_caller_storage()
 fn structured_named_terminal_moves_descriptor_and_keeps_original_backing() {
     let app = source("workbench", "src/structured_named_factory.w");
     let text = include_str!("fixtures/structured-named-factory.w");
-    let mutual = text.replace("Packet selected = factory(depth - 1, length, !choose);",
-        "Packet selected = peer(depth - 1, length, !choose);")
-        .replace("u64(u64, bool) drive", "Packet(u64, u64, bool) peer = fn(depth, length, choose) {\n    Packet selected = factory(depth, length, choose);\n    selected\n};\nu64(u64, bool) drive");
+    let mutual = text.replace("Packet incoming = factory(depth - 1, length, !choose);",
+        "Packet incoming = peer(depth - 1, length, !choose);")
+        .replace("u64(u64, bool) drive", "Packet(u64, u64, bool) peer = fn(depth, length, choose) {\n    Packet incoming = factory(depth, length, choose);\n    Packet intermediate = incoming;\n    Packet selected = intermediate;\n    selected\n};\nu64(u64, bool) drive");
     for (text, mutual) in [(text, false), (mutual.as_str(), true)] {
         for (target, target_layout) in [("native64", ScalarTargetLayout::NATIVE64), ("wasm32", ScalarTargetLayout::WASM32)] {
             for project in [false, true] {
@@ -1082,13 +1082,13 @@ fn structured_named_terminal_moves_descriptor_and_keeps_original_backing() {
                     std::fs::write(out.join(format!("{target}.ll")), witness).unwrap();
                 }
                 if mutual {
-                    let indirect_root = text.replace("Packet selected = factory(depth, length, choose);\n    selected",
-                        "Packet original = factory(depth, length, choose); Packet selected = original;\n    selected");
+                    let indirect_root = text.replace("Packet intermediate = incoming;\n    Packet selected = intermediate;",
+                        "Packet intermediate = incoming;\n    intermediate.length;\n    Packet selected = intermediate;");
                     assert!(emit(&indirect_root).expect_err("alias is not the exact root binding")
                         .contains("aggregate forwarding has no exact root binding"));
                 }
                 let indirect = text.replace("Packet selected = make_alt(length); selected",
-                    "Packet original = make_alt(length); Packet selected = original; selected");
+                    "Packet original = make_alt(length); original.length; Packet selected = original; selected");
                 assert!(emit(&indirect).expect_err("alias is not the direct produced descriptor")
                     .contains("structured aggregate return is not closed on every result path"));
             }
