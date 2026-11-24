@@ -923,6 +923,22 @@ fn mixed_owner_lanes_do_not_admit_other_result_shapes() {
     assert!(mixed_owner_result_lanes(&scalar, &scalar).is_none());
 }
 
+fn exact_local_choice_shared_borrow(
+    place: &ReferencePlaceId, loan: &ReferenceLoanId, holder: &ReferenceBindingId,
+    descriptor: &ScalarStructId, holder_type: &ScalarType, inner: &ScalarType,
+) -> bool {
+    &place.binding == holder && loan.parent.is_none() && loan.origin_place == *place
+        && loan.mode == ScalarReferenceMutability::Shared
+        && match (&place.place, place.projections.as_slice()) {
+            (ScalarPlace::Name { .. }, []) => inner == holder_type,
+            (ScalarPlace::Field { base, field: ScalarFieldReference::Resolved(field), .. },
+                [ReferencePlaceProjection::Field(ScalarFieldReference::Resolved(projection))]) =>
+                matches!(base.as_ref(), ScalarPlace::Name { .. }) && &field.structure == descriptor
+                    && field == projection && ordinary_value(inner),
+            _ => false,
+        }
+}
+
 pub(in crate::scalar) fn ordinary_value(ty: &ScalarType) -> bool {
     matches!(ty, ScalarType::Bool | ScalarType::Char | ScalarType::I8 | ScalarType::I16 | ScalarType::I32 |
         ScalarType::I64 | ScalarType::I128 | ScalarType::U8 | ScalarType::U16 | ScalarType::U32 |
@@ -2767,10 +2783,12 @@ impl Body<'_> {
         if !ordinary_value(&output_ty.ty) { return None; }
         let structure = &self.sites.structure;
         let root = structure.root;
-        let (bind, alias, result) = match structure.blocks.get(root.0)?.items.as_slice() {
+        let (bind, alias, before_consume, result) = match structure.blocks.get(root.0)?.items.as_slice() {
             [result] => return self.immediate_receipt_choice(result, output_ty),
-            [bind, result] => (bind, None, result),
-            [bind, alias, result] => (bind, Some(alias), result),
+            [bind, result] => (bind, None, None, result),
+            [bind, BlockItem { kind: BlockItemKind::Evaluation { expression }, .. }, result] =>
+                (bind, None, Some(*expression), result),
+            [bind, alias, result] => (bind, Some(alias), None, result),
             _ => return None,
         };
         let (BlockItemKind::Binding(binding), BlockItemKind::FinalOutput(output)) = (&bind.kind, &result.kind)
@@ -2794,6 +2812,37 @@ impl Body<'_> {
             || holder.declaration_span != receiver.span || !matches!(join.kind, CfgPointKind::Join)
             || join.source_span.range != self.sites.occurrences.get(init.primary.0)?.span
         { return None; }
+        let read = if let Some(observation) = before_consume {
+            // A discarded scalar read can observe the selected lexical owner
+            // before its transfer, only by an immediate, certified noescape loan.
+            let signature = self.sites.checked_call_signatures.get(&observation)?;
+            let [parameter @ ScalarType::CheckedReference {
+                mutability: ScalarReferenceMutability::Shared, inner,
+            }] = signature.parameters.as_slice() else { return None };
+            let [result] = signature.outputs.outputs.as_slice() else { return None };
+            if !ordinary_value(&result.ty) || self.sites.declared_unsafe_calls.contains(&observation.0)
+                || structure.checked_types.expressions.get(&observation) != Some(&result.ty)
+            { return None; }
+            let OccurrenceNode::Expression(argument) = *structure.edges.get(&(
+                OccurrenceParent::Expression(observation), OccurrenceEdge::CallArgument(0),
+            ))? else { return None };
+            let CfgPointKind::Borrow { place, loan } = &read.kind else { return None };
+            let reader = next(read.id)?;
+            if structure.checked_types.expressions.get(&argument) != Some(parameter)
+                || read.source_span.range != self.sites.occurrences.get(argument.0)?.span
+                || reader.source_span.range != self.sites.occurrences.get(observation.0)?.span
+                || reader.scope != scope || !exact_local_choice_shared_borrow(place, loan, holder, descriptor, &receiver.ty, inner)
+                || facts.local_choice_reader_calls.get(&reader.id) != Some(&(read.id, observation))
+                || !matches!(&reader.kind, CfgPointKind::Call { output: 0, target: ResolvedCallTarget::ModuleCallable {
+                    concrete: ConcreteCallSelection::Declaration, .. }, argument_points, .. }
+                    if argument_points.as_slice() == [read.id])
+            { return None; }
+            let transfer = next(reader.id)?;
+            if transfer.scope != scope { return None; }
+            transfer
+        } else {
+            read
+        };
         let end_use = |last: &ReferenceFlowPoint| {
             let returned = next(last.id)?;
             let exit = next(returned.id)?;
@@ -2804,7 +2853,7 @@ impl Body<'_> {
                 && matches!(exit.kind, CfgPointKind::ScopeExit)).then_some(exit.id)
         };
         let use_site = if let Some((observed, field)) = self.sites.prepared_lexical_member(output.expression) {
-            if alias.is_some() || observed != holder || &field.structure != descriptor
+            if alias.is_some() || before_consume.is_some() || observed != holder || &field.structure != descriptor
                 || !matches!(&read.kind, CfgPointKind::ReadPlace { pointer_point: None, reads_origin: false,
                     candidates, .. } if matches!(candidates.as_slice(), [place] if &place.binding == holder &&
                         matches!(place.projections.as_slice(),
@@ -2824,17 +2873,9 @@ impl Body<'_> {
             let argument_span = self.sites.occurrences.get(argument.0)?.span;
             if let ScalarType::CheckedReference { mutability: ScalarReferenceMutability::Shared, inner } = parameter {
                 let CfgPointKind::Borrow { place, loan } = &read.kind else { return None };
-                if &place.binding != holder || loan.parent.is_some() || loan.origin_place != *place
-                    || loan.mode != ScalarReferenceMutability::Shared
+                if before_consume.is_some()
                     || structure.checked_types.expressions.get(&argument) != Some(parameter)
-                    || !match (&place.place, place.projections.as_slice()) {
-                        (ScalarPlace::Name { .. }, []) => inner.as_ref() == &receiver.ty,
-                        (ScalarPlace::Field { base, field: ScalarFieldReference::Resolved(field), .. },
-                            [ReferencePlaceProjection::Field(ScalarFieldReference::Resolved(projection))]) =>
-                            matches!(base.as_ref(), ScalarPlace::Name { .. }) && &field.structure == descriptor
-                                && field == projection && ordinary_value(inner),
-                        _ => false,
-                    }
+                    || !exact_local_choice_shared_borrow(place, loan, holder, descriptor, &receiver.ty, inner)
                 { return None; }
                 let (input, borrow_expression) = if let Some(alias) = alias {
                     let BlockItemKind::Binding(view) = &alias.kind else { return None };

@@ -1353,6 +1353,10 @@ fn lexical_conditional_owner_choice_releases_selected_original_after_read() {
     let consumed = text.replace("u64(u64, bool) drive", "u64(Packet) consume = fn(packet) { packet.length };\nu64(u64, bool) drive")
         .replace("    chosen.length", "    consume(chosen)");
     assert_ne!(consumed, text);
+    let borrowed_then_consumed = consumed.replace("u64(Packet) consume",
+        "u64(*u64) read_selected = fn(view) { *view };\nu64(Packet) consume")
+        .replace("    consume(chosen)", "    read_selected(&chosen.length);\n    consume(chosen)");
+    assert_ne!(borrowed_then_consumed, consumed);
     let temporary = consumed.replace("    Packet chosen = if", "    consume(if")
         .replace("else { make_long(2) };\n    consume(chosen)", "else { make_long(2) })");
     assert_ne!(temporary, consumed);
@@ -1376,13 +1380,14 @@ fn lexical_conditional_owner_choice_releases_selected_original_after_read() {
     let nested_borrow = nested(&named_borrow);
     for (text, use_site) in [(text, "choice"), (consumed.as_str(), "consume"),
         (temporary.as_str(), "consume-temporary"), (borrowed.as_str(), "borrow"),
+        (borrowed_then_consumed.as_str(), "consume-after-borrow"),
         (named_borrow.as_str(), "named-borrow"), (nested_temporary.as_str(), "nested-consume-temporary"),
         (nested_borrow.as_str(), "nested-named-borrow")]
     {
         let nested = use_site.starts_with("nested-");
         let base_use = use_site.strip_prefix("nested-").unwrap_or(use_site);
         let consuming = base_use.starts_with("consume");
-        let borrowing = matches!(base_use, "borrow" | "named-borrow");
+        let borrowing = matches!(base_use, "borrow" | "named-borrow" | "consume-after-borrow");
         for (target, target_layout) in [("native64", ScalarTargetLayout::NATIVE64), ("wasm32", ScalarTargetLayout::WASM32)] {
             for project in [false, true] {
                 let emit = |text: &str| {
@@ -1426,6 +1431,7 @@ fn lexical_conditional_owner_choice_releases_selected_original_after_read() {
                     if producers.contains(&callee) {
                         writes.push((callee, arg(call.count_arguments() - 1), call.try_as_basic_value().basic().unwrap()));
                     } else if Some(callee) == consumer {
+                        assert!(!borrowing || reader_seen, "the certified read precedes sole owner transfer");
                         assert_eq!(call.count_arguments(), 2);
                         transfers.push((arg(0), arg(1)));
                     } else if Some(callee) == reader {
@@ -1462,6 +1468,10 @@ fn lexical_conditional_owner_choice_releases_selected_original_after_read() {
                 assert_eq!(leaf_bases.len(), writes.len());
                 assert!(writes.iter().all(|&(_, _, base)| leaf_bases.contains(&base)));
                 if let Some(consumer) = consumer {
+                    if borrowing {
+                        assert!(reader_seen);
+                        assert!(reads.contains(&descriptor), "the read must borrow the descriptor handed to consumer");
+                    }
                     assert!(released.is_empty(), "the caller transferred rather than freed the receipt");
                     assert_eq!(transfers, [(descriptor, selected)], "pass the descriptor and its independent backing");
                     let frees = consumer.get_basic_blocks().into_iter().flat_map(|block| block.get_instructions())
@@ -1493,6 +1503,12 @@ fn lexical_conditional_owner_choice_releases_selected_original_after_read() {
                     std::fs::write(out.join(format!("{target}.ll")), witness).unwrap();
                 }
                 if consuming {
+                    if borrowing {
+                        let uncertified = text.replace("{ *view }", "{ u64 observed = *view; observed }");
+                        assert_ne!(uncertified, text);
+                        assert!(emit(&uncertified).expect_err("the pre-transfer loan needs exact nonescape authority")
+                            .contains("aggregate owning call has no proved endpoint"));
+                    }
                     let forward = text.replace("u64(Packet) consume = fn(packet) { packet.length };",
                         "u64(Packet) terminal = fn(packet) { packet.length };\nu64(Packet) consume = fn(packet) { terminal(packet) };");
                     assert_ne!(forward, text);
