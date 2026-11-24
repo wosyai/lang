@@ -521,7 +521,10 @@ cases.extend([
     ("compound-skips-unreachable-independent-rhs",compound_short,0,b""),
     # The RHS compares two independent broad inputs only when at least two
     # left values survive. A singleton left value is an admissible literal cut.
-    ("compound-reachable-independent-rhs-refused",compound_short.replace("entry > 4 &&","entry >= 3 &&"),2,b"unsupported analysis"),
+    ("compound-reachable-small-independent-rhs",compound_short.replace("entry > 4 &&","entry >= 3 &&"),102,b"DEAD-RHS"),
+    ("compound-reachable-large-independent-rhs-refused",compound_short.replace(
+        "core.narrow(entry <= 4","core.narrow(entry <= 30").replace("entry > 4 &&","entry >= 3 &&"),
+     2,b"unsupported analysis"),
     ("compound-reached-singleton-rhs-can-report",compound_short.replace("entry > 4 &&","entry >= 4 &&"),102,b"DEAD-RHS"),
     ("compound-contradiction-reports-narrow",compound_narrow_empty,105,b"EMPTY-COMPOUND"),
 ])
@@ -544,6 +547,40 @@ cases.extend([
     ("compound-dead-oversized-rhs-is-not-analyzed",short_oversized,0,b""),
     ("compound-reached-oversized-rhs-is-unrepresentable",short_oversized.replace("entry <= 4 ||","entry < 4 ||"),2,b"unsupported analysis"),
 ])
+independent_rectangle = f"""%%start
+    unit(i8,i8) check = fn(left,right) {{
+        {bounds("left",0,4)}
+        core.narrow(left < right, {report(108,"RELATIVE-CUT")});
+        core.require(left < right, {report(109,"NO-FALSE-PAIR")});
+        if (left == 3) {{ core.require(right >= 4, {report(110,"RECTANGLE")}); }};
+    }};
+    %%end"""
+independent_holes = f"""%%start
+    unit(i16,i16) check = fn(left,right) {{
+        core.narrow(left <= -100 || left >= 100, {report(111,"HOLES")});
+        {bounds("right",-64,64)}
+        core.require(left != right, {report(112,"DISJOINT-HOLES")});
+    }};
+    %%end"""
+independent_anchored = f"""%%start
+    unit(i8,i8) clip = fn(left,right) {{
+        core.narrow(left < right, {report(113,"CHILD-CUT")});
+    }};
+    unit(i8,i8) caller = fn(entry,other) {{
+        {bounds("entry",0,4)}
+        i8 reflected = 4 - entry;
+        clip(reflected,other);
+        core.require(reflected < other, {report(114,"ANCHORED-RELATIVE")});
+        if (entry == 4) {{ core.require(other >= 1, {report(115,"ANCHORED-INVERSE")}); }};
+    }};
+    clip(0,1);
+    %%end"""
+for name,program,correct,incorrect,code,label in [
+    ("bounded-independent-relative-narrow",independent_rectangle,"right >= 4","right >= 5",110,b"RECTANGLE"),
+    ("large-independent-holed-disjoint-shortcut",independent_holes,"left != right","left == right",112,b"DISJOINT-HOLES"),
+    ("anchored-independent-comparison-plus-live-affine",independent_anchored,"other >= 1","other >= 2",115,b"ANCHORED-INVERSE"),
+]:
+    cases.extend([(name,program,0,b""),(name+"-witness",program.replace(correct,incorrect),code,label)])
 with tempfile.TemporaryDirectory(prefix="affine-calls-") as path:
     root=Path(path)
     (root/"src").mkdir()

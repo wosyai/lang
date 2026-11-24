@@ -3798,6 +3798,7 @@ fn directive_disjunction_cuts<'a>(
 #[cfg(feature = "internal-checker")]
 enum OrdinaryComparisonCut<'a> {
     Constant(bool),
+    Independent { axes: [usize; 2], relation: IntegerRelation },
     Bound { axis: usize, relation: IntegerRelation, bound: Cow<'a, BigInt> },
 }
 
@@ -3817,7 +3818,9 @@ fn ordinary_comparison_cut(
         (None, None) => {}
     }
 
-    let class = row.affine.as_deref()?;
+    let Some(class) = row.affine.as_deref().filter(|class| class.contains(left) && class.contains(right)) else {
+        return Some(OrdinaryComparisonCut::Independent { axes: [left, right], relation });
+    };
     let zero = BigInt::default();
     let parts = |axis| {
         if axis == class.anchor { Some((false, &zero)) }
@@ -3847,6 +3850,54 @@ fn ordinary_comparison_cut(
         }
     } else { relation };
     Some(Bound { axis: class.anchor, relation, bound: Cow::Owned(bound) })
+}
+
+#[cfg(feature = "internal-checker")]
+const MAX_INDEPENDENT_COMPARISON_POINTS: usize = 16;
+
+#[cfg(feature = "internal-checker")]
+fn comparison_domain_size(values: &IntegerSet, max: usize, work: &mut usize) -> Option<Option<usize>> {
+    let mut size = 0usize;
+    for (first, last) in values.intervals() {
+        charge_call_work(work, 1)?;
+        let width = (last - first) + 1u8;
+        if width > BigInt::from(max.checked_sub(size)?) { return Some(None); }
+        size = size.checked_add(usize::try_from(width).ok()?)?;
+    }
+    Some(Some(size))
+}
+
+#[cfg(feature = "internal-checker")]
+fn independent_uniform(
+    left: &IntegerSet, right: &IntegerSet, relation: IntegerRelation, work: &mut usize,
+) -> Option<Option<bool>> {
+    use std::cmp::Ordering::{Equal, Greater, Less};
+    let (left_min, left_max) = left.extremes()?;
+    let (right_min, right_max) = right.extremes()?;
+    let less = left_min < right_max;
+    let greater = left_max > right_min;
+    let unequal = match (less, greater) {
+        (true, true) if relation.accepts(Less) != relation.accepts(Greater) => return Some(None),
+        (true, _) => relation.accepts(Less),
+        (_, true) => relation.accepts(Greater),
+        (false, false) => return Some(Some(relation.accepts(Equal))),
+    };
+    if unequal == relation.accepts(Equal) || left_max < right_min || right_max < left_min {
+        return Some(Some(unequal));
+    }
+
+    // Equality can still be impossible inside overlapping extrema, for
+    // instance when each input occupies different points of a hole.
+    let mut lhs = left.intervals();
+    let mut rhs = right.intervals();
+    let (mut a, mut b) = (lhs.next(), rhs.next());
+    while let (Some((af, al)), Some((bf, bl))) = (a, b) {
+        charge_call_work(work, 1)?;
+        if al < bf { a = lhs.next(); }
+        else if bl < af { b = rhs.next(); }
+        else { return Some(None); }
+    }
+    Some(Some(unequal))
 }
 
 #[cfg(feature = "internal-checker")]
@@ -3896,36 +3947,89 @@ impl IntegerInputs {
                         output[lane].0.push(row.clone());
                     }
                 }
-                OrdinaryComparisonCut::Bound { axis, relation, bound } => {
-                    let intervals = row[axis].interval_count();
-                    charge_call_work(work, intervals.checked_mul(3)?.checked_add(5)?)?;
-                    let subsets = match selected {
-                        [true, true] => {
-                            let (yes, no) = row[axis].split_relation(relation, &bound);
-                            [Some(no), Some(yes)]
+                OrdinaryComparisonCut::Bound { axis, relation, bound } =>
+                    Self::emit_ordinary_bound(row, axis, relation, &bound, None, selected, work, &mut output)?,
+                OrdinaryComparisonCut::Independent { axes, relation } => {
+                    if let Some(uniform) = independent_uniform(&row[axes[0]], &row[axes[1]], relation, work)? {
+                        let lane = uniform as usize;
+                        if selected[lane] {
+                            charge_call_work(work, row.len().checked_add(1)?)?;
+                            output[lane].0.push(row.clone());
                         }
-                        [true, false] => [Some(row[axis].keep_relation(relation.complement(), &bound)), None],
-                        [false, true] => [None, Some(row[axis].keep_relation(relation, &bound))],
-                        [false, false] => [None, None],
-                    };
-                    for (lane, narrowed) in subsets.into_iter().enumerate() {
-                        let Some(narrowed) = narrowed else { continue; };
-                        if narrowed.is_empty() { continue; }
-                        charge_call_work(work, row.len().checked_add(1)?)?;
-                        let changed = narrowed != *row[axis];
-                        if changed {
-                            charge_call_work(work, row.equal_axes().len())?;
-                            row.charge_affine_replacement(axis, narrowed.interval_count(), work)?;
-                            if *work > MAX_PARTITION_TRANSFER_WORK { return None; }
-                        }
-                        let mut retained = row.clone();
-                        if changed { retained.replace_domain(axis, Rc::new(narrowed)); }
-                        output[lane].0.push(retained);
+                    } else {
+                        Self::emit_independent_comparison(row, axes, relation, selected, work, &mut output)?;
                     }
                 }
             }
         }
         Some(output)
+    }
+
+    fn emit_independent_comparison(
+        row: &IntegerRow, [left, right]: [usize; 2], relation: IntegerRelation,
+        selected: [bool; 2], work: &mut usize, output: &mut [Self; 2],
+    ) -> Option<()> {
+        let left_size = comparison_domain_size(&row[left], MAX_INDEPENDENT_COMPARISON_POINTS, work)?;
+        let right_limit = left_size.map_or(MAX_INDEPENDENT_COMPARISON_POINTS, |size| size.saturating_sub(1));
+        let right_size = comparison_domain_size(&row[right], right_limit, work)?;
+        // Prefer source-left on a tie; enumerate only the smaller axis,
+        // in ascending order and never over unproved or oversized ranges.
+        let (small, broad, relation, count) = if let Some(size) = right_size {
+            (right, left, relation, size)
+        } else {
+            (left, right, relation.reversed(), left_size?)
+        };
+        charge_call_work(work, count.checked_add(row[small].interval_count())?)?;
+        for (first, last) in row[small].intervals() {
+            let mut point = first.clone();
+            loop {
+                Self::emit_ordinary_bound(row, broad, relation, &point, Some(small), selected, work, output)?;
+                if &point == last { break; }
+                point += 1u8;
+            }
+        }
+        Some(())
+    }
+
+    fn emit_ordinary_bound(
+        row: &IntegerRow, axis: usize, relation: IntegerRelation, bound: &BigInt, fixed: Option<usize>,
+        selected: [bool; 2], work: &mut usize, output: &mut [Self; 2],
+    ) -> Option<()> {
+        let intervals = row[axis].interval_count();
+        charge_call_work(work, intervals.checked_mul(3)?.checked_add(5)?)?;
+        let subsets = match selected {
+            [true, true] => {
+                let (yes, no) = row[axis].split_relation(relation, bound);
+                [Some(no), Some(yes)]
+            }
+            [true, false] => [Some(row[axis].keep_relation(relation.complement(), bound)), None],
+            [false, true] => [None, Some(row[axis].keep_relation(relation, bound))],
+            [false, false] => [None, None],
+        };
+        for (lane, narrowed) in subsets.into_iter().enumerate() {
+            let Some(narrowed) = narrowed else { continue; };
+            if narrowed.is_empty() { continue; }
+            charge_call_work(work, row.len().checked_add(1)?)?;
+            let changed = narrowed != *row[axis];
+            if changed {
+                charge_call_work(work, row.equal_axes().len())?;
+                row.charge_affine_replacement(axis, narrowed.interval_count(), work)?;
+            }
+            if let Some(fixed) = fixed {
+                charge_call_work(work, row.equal_axes().len().checked_add(1)?)?;
+                row.charge_affine_replacement(fixed, 1, work)?;
+            }
+            if *work > MAX_PARTITION_TRANSFER_WORK { return None; }
+            let mut retained = row.clone();
+            if changed { retained.replace_domain(axis, Rc::new(narrowed)); }
+            if let Some(fixed) = fixed {
+                // The selected singleton belongs to the incoming typed cell;
+                // the two axes have already been proven independent in this row.
+                retained.replace_domain(fixed, Rc::new(IntegerSet::singleton(bound)));
+            }
+            output[lane].0.push(retained);
+        }
+        Some(())
     }
 
     fn ordinary_boolean(
@@ -5536,6 +5640,48 @@ fn affine_class_cap_allows_identity_alias_and_releases_truncated_members() {
     row.truncate(MAX_AFFINE_MEMBERS);
     assert_eq!(row.affine.as_ref().unwrap().members.len(), MAX_AFFINE_MEMBERS - 1);
     assert_eq!(row.test_append_affine(0, next), Some(()));
+}
+
+#[cfg(feature = "internal-checker")]
+#[test]
+fn independent_layout_splits_exactly_at_signed_and_unsigned_extrema() {
+    let relations = [BinaryOperator::Less, BinaryOperator::LessEqual, BinaryOperator::Equal,
+        BinaryOperator::NotEqual, BinaryOperator::GreaterEqual, BinaryOperator::Greater];
+    for (ty, min, max, small_min, small_max) in [
+        (ScalarType::I8, -128, 127, -128, -127), (ScalarType::U8, 0, 255, 254, 255),
+    ] {
+        let broad = IntegerSet::from_type(&ty).unwrap();
+        let small = broad.keep(&BinaryOperator::GreaterEqual, &small_min.into()).unwrap()
+            .keep(&BinaryOperator::LessEqual, &small_max.into()).unwrap();
+        let paths = IntegerInputs(vec![IntegerRow::new(vec![Rc::new(small), Rc::new(broad)])]);
+        for op in &relations {
+            let relation = IntegerRelation::from_operator(op).unwrap();
+            let mut work = 0;
+            let [no, yes] = paths.ordinary_comparison([0, 1], relation, [true, true], &mut work).unwrap();
+            for a in small_min..=small_max {
+                for b in min..=max {
+                    let values = [i128::from(a), i128::from(b)];
+                    let expected = relation.accepts(a.cmp(&b));
+                    assert_eq!(yes.includes_signed(&values), expected);
+                    assert_eq!(no.includes_signed(&values), !expected);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(feature = "internal-checker")]
+#[test]
+fn independent_domain_cardinality_short_circuits_at_the_admission_cap() {
+    let broad = IntegerSet::from_type(&ScalarType::I128).unwrap();
+    let safe = broad.keep(&BinaryOperator::GreaterEqual, &(-8).into()).unwrap()
+        .keep(&BinaryOperator::LessEqual, &7.into()).unwrap();
+    let oversized = broad.keep(&BinaryOperator::GreaterEqual, &(-8).into()).unwrap()
+        .keep(&BinaryOperator::LessEqual, &8.into()).unwrap();
+    let mut work = 0;
+    assert_eq!(comparison_domain_size(&safe, MAX_INDEPENDENT_COMPARISON_POINTS, &mut work), Some(Some(16)));
+    assert_eq!(comparison_domain_size(&oversized, MAX_INDEPENDENT_COMPARISON_POINTS, &mut work), Some(None));
+    assert_eq!(comparison_domain_size(&broad, MAX_INDEPENDENT_COMPARISON_POINTS, &mut work), Some(None));
 }
 
 #[cfg(feature = "internal-checker")]
