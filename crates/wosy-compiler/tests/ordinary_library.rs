@@ -1386,38 +1386,50 @@ fn checked_scalar_reader_keeps_received_owner_live() {
                 else { wosy_compiler::emit_scalar_build_single_module_llvm(&build) }
                     .map(|module| module.to_text())
             };
-            let ir = emit(text).unwrap_or_else(|error| panic!("{target}/{project}: {error}"));
             let context = Context::create();
-            let module = context.create_module_from_ir(MemoryBuffer::create_from_memory_range_copy(ir.as_bytes(), target)).unwrap();
-            module.verify().unwrap();
-            let symbol = |name: &str| if project { function_with_suffix(&module, name) } else { name.to_owned() };
-            let drive = module.get_function(&symbol("drive")).unwrap();
-            let mut seen = Vec::new();
-            let mut owner = None;
-            for row in drive.get_basic_blocks().into_iter().flat_map(|b| b.get_instructions()) {
-                if row.get_opcode() != InstructionOpcode::Call { continue; }
-                let call = CallSiteValue::try_from(row).unwrap();
-                let Some(callee) = call.get_called_fn_value() else { continue };
-                let name = callee.get_name().to_str().unwrap();
-                if name == symbol("make_packet") {
-                    owner = call.try_as_basic_value().basic();
-                    seen.push("allocate");
-                } else if name == symbol("read_length") {
-                    assert_eq!(call.count_arguments(), 1);
-                    seen.push("read");
-                } else if name == "__wosy_core_free" {
-                    assert!(owner.is_some());
-                    assert_eq!(row.get_operand(0).unwrap().value(), owner);
-                    seen.push("release");
+            let immediate = text.replace("    *u64 view = &packet.length;\n    read_length(view)", "    read_length(&packet.length)");
+            assert_ne!(immediate, text);
+            let symbol = |module: &Module<'_>, name: &str| {
+                if project { function_with_suffix(module, name) } else { name.to_owned() }
+            };
+            for (text, immediate) in [(text, false), (immediate.as_str(), true)] {
+                let ir = emit(text).unwrap_or_else(|error| panic!("{target}/{project}: {error}"));
+                let module = context.create_module_from_ir(MemoryBuffer::create_from_memory_range_copy(ir.as_bytes(), target)).unwrap();
+                module.verify().unwrap();
+                let drive = module.get_function(&symbol(&module, "drive")).unwrap();
+                let mut seen = Vec::new();
+                let mut owner = None;
+                for row in drive.get_basic_blocks().into_iter().flat_map(|b| b.get_instructions()) {
+                    if row.get_opcode() != InstructionOpcode::Call { continue; }
+                    let call = CallSiteValue::try_from(row).unwrap();
+                    let Some(callee) = call.get_called_fn_value() else { continue };
+                    let name = callee.get_name().to_str().unwrap();
+                    if name == symbol(&module, "make_packet") {
+                        owner = call.try_as_basic_value().basic();
+                        seen.push("allocate");
+                    } else if name == symbol(&module, "read_length") {
+                        assert_eq!(call.count_arguments(), 1);
+                        seen.push("read");
+                    } else if name == "__wosy_core_free" {
+                        assert!(owner.is_some());
+                        assert_eq!(row.get_operand(0).unwrap().value(), owner);
+                        seen.push("release");
+                    }
                 }
-            }
-            assert_eq!(seen, ["allocate", "read", "release"], "{target}/{project}: {ir}");
-            if let Some(out) = std::env::var_os("WOSY_RECEIPT_FIELD_IR_DIR") {
-                let out = std::path::PathBuf::from(out).join(if project { "project" } else { "single" });
-                std::fs::create_dir_all(&out).unwrap();
-                let mut witness = ir.replace("@main(", "@wosy_authored_main(");
-                witness.push_str(&format!("\ndefine i64 @wosy_field_witness() {{\nentry:\n  %v = call i64 @{}()\n  ret i64 %v\n}}\n", symbol("field_witness")));
-                std::fs::write(out.join(format!("{target}.ll")), witness).unwrap();
+                assert_eq!(seen, ["allocate", "read", "release"], "{target}/{project}: {ir}");
+                if let Some(out) = std::env::var_os("WOSY_RECEIPT_FIELD_IR_DIR") {
+                    let out = std::path::PathBuf::from(out).join(match (immediate, project) {
+                        (true, true) => "immediate-project", (true, false) => "immediate-single",
+                        (false, true) => "project", (false, false) => "single",
+                    });
+                    std::fs::create_dir_all(&out).unwrap();
+                    let mut witness = ir.replace("@main(", "@wosy_authored_main(");
+                    witness.push_str(&format!("\ndefine i64 @wosy_field_witness() {{\nentry:\n  %v = call i64 @{}()\n  ret i64 %v\n}}\n", symbol(&module, "field_witness")));
+                    std::fs::write(out.join(format!("{target}.ll")), witness).unwrap();
+                }
+                let uncertified = text.replace("{ *view + 1 }", "{ u64 observed = *view; observed + 1 }");
+                assert!(emit(&uncertified).expect_err("signature alone cannot certify a checked reader")
+                    .contains("aggregate owning receipt has an unproved checked loan"));
             }
             for width in [8, 64] {
                 let unrelated: String = (0..width).map(|i| format!("    Packet other_{i} = make_packet(length);\n")).collect();
@@ -1428,7 +1440,7 @@ fn checked_scalar_reader_keeps_received_owner_live() {
                 let wide = emit(&wide).unwrap_or_else(|error| panic!("{target}/{project}/{width}: {error}"));
                 let verified = context.create_module_from_ir(MemoryBuffer::create_from_memory_range_copy(wide.as_bytes(), target)).unwrap();
                 verified.verify().unwrap();
-                let drive = verified.get_function(&symbol("drive")).unwrap();
+                let drive = verified.get_function(&symbol(&verified, "drive")).unwrap();
                 let (mut owned, mut released) = (Vec::new(), Vec::new());
                 let mut called = false;
                 let mut post_call_loads = 0;
@@ -1440,10 +1452,10 @@ fn checked_scalar_reader_keeps_received_owner_live() {
                     let call = CallSiteValue::try_from(row).unwrap();
                     let Some(callee) = call.get_called_fn_value() else { continue };
                     let name = callee.get_name().to_str().unwrap();
-                    if name == symbol("make_packet") {
+                    if name == symbol(&verified, "make_packet") {
                         assert!(!called);
                         owned.push(call.try_as_basic_value().basic().unwrap());
-                    } else if name == symbol("read_length") {
+                    } else if name == symbol(&verified, "read_length") {
                         assert!(!called);
                         called = true;
                     } else if name == "__wosy_core_free" {
@@ -1456,9 +1468,7 @@ fn checked_scalar_reader_keeps_received_owner_live() {
                 owned.reverse();
                 assert_eq!(released, owned, "{target}/{project}/{width}: released wrong backing");
             }
-            let uncertified = text.replace("{ *view + 1 }", "{ u64 observed = *view; observed + 1 }");
-            assert!(emit(&uncertified).expect_err("signature alone cannot certify a checked reader")
-                .contains("aggregate owning receipt has an unproved checked loan"));
+
         }
     }
 }

@@ -2040,19 +2040,46 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             return None;
                         }
                         let argument = self.expression_ordinal(parent, OccurrenceEdge::CallArgument(effect.parameter));
-                        let PlainNameIdentity::Lexical(binding) = calls.prepared_plain_name(argument)? else {
-                            return None;
-                        };
                         let point = *argument_points.get(effect.parameter)?;
-                        (calls.structure.checked_types.expressions.get(&argument) == Some(parameter)
-                            && matches!(&self.cfg.points[point.0].kind, CfgPointKind::Read { binding: read } if read == binding))
-                            .then_some(point)
+                        if calls.structure.checked_types.expressions.get(&argument) != Some(parameter) {
+                            return None;
+                        }
+                        let actual = self.cfg.points.get(point.0)?;
+                        match &actual.kind {
+                            CfgPointKind::Read { binding }
+                                if matches!(calls.prepared_plain_name(argument),
+                                    Some(PlainNameIdentity::Lexical(expected)) if expected == binding) =>
+                                Some((point, true)),
+                            CfgPointKind::Borrow { place, loan }
+                                if matches!(target, ResolvedCallTarget::ModuleCallable { .. })
+                                    && loan.mode == ScalarReferenceMutability::Shared && loan.parent.is_none()
+                                    && loan.origin_place == *place =>
+                            {
+                                let ScalarExpression::CheckedAddress {
+                                    mutability: ScalarReferenceMutability::Shared,
+                                    place: written @ ScalarPlace::Field {
+                                        base, field: ScalarFieldReference::Resolved(_), ..
+                                    }, span: written_span,
+                                } = arguments.get(effect.parameter)? else { return None };
+                                let ScalarPlace::Name { span, .. } = base.as_ref() else { return None };
+                                let place_ordinal = self.place_ordinal(
+                                    OccurrenceParent::Expression(argument), OccurrenceEdge::ExpressionPlace,
+                                );
+                                let root = self.place_root(written, place_ordinal);
+                                (actual.source_span.range == *written_span && place.place == *written
+                                    && place.projections.len() == 1
+                                    && matches!(self.prepared_place_root(root.ordinal, *span).ok().flatten(),
+                                        Some(PreparedPlaceRoot::Lexical(binding)) if binding == &place.binding))
+                                    .then_some((point, false))
+                            }
+                            _ => None,
+                        }
                     })()
                 } else { None };
                 let id = self.point_with_origins(call, span, scope, cast_origins.clone());
-                if let Some(argument) = read_effect_argument {
+                if let Some((argument, named)) = read_effect_argument {
                     self.aggregate_facts.receipt_loan_read_calls.insert(id, argument);
-                    if self.joined_local_reborrow {
+                    if named && self.joined_local_reborrow {
                         self.proof_points.shared_scalar_read_calls.push((id, argument));
                     }
                 }
