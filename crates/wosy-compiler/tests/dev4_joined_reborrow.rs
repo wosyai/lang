@@ -146,8 +146,50 @@ fn joined_child_stays_live_between_typed_reads() {
 }
 
 #[test]
-fn joined_child_still_declines_reference_aliases() {
-    let program = joined("parent = &!second;", true, "", "*u8 alias = child; u8 again = *alias; again;");
+fn joined_child_alias_keeps_its_selected_predecessor_until_last_use() {
+    let program = joined("parent = &!second;", true, "",
+        "*u8 alias = child; u8 again = *alias; first = 3;");
+    let program = program.replace("    seen\n", "    if (again == seen) { again } else { 0 }\n");
+    check_case(&program, Expected::Valid, Some("WOSY_REBORROW_ALIAS_IR_DIR"));
+
+    let live = program.replace("u8 again = *alias; first = 3;", "first = 3; u8 again = *alias;");
+    assert_ne!(live, program);
+    check(&live, Expected::LiveConflict);
+}
+
+#[test]
+fn joined_child_alias_retains_its_origin_through_a_certified_reader() {
+    let program = joined_with_pointer_read(
+        "*u8 alias = child; *u8 copied = alias; u8 again = pointer(copied); first = 3;", "*value",
+    );
+    let program = program.replace("    seen\n", "    if (again == seen) { again } else { 0 }\n");
+    check_case(&program, Expected::Valid, Some("WOSY_REBORROW_ALIAS_CALL_IR_DIR"));
+    let live = program.replace("u8 again = pointer(copied); first = 3;", "first = 3; u8 again = pointer(copied);");
+    assert_ne!(live, program);
+    check(&live, Expected::LiveConflict);
+}
+
+#[test]
+fn joined_child_alias_chain_is_bounded_with_no_fallback_authority() {
+    for (size, expected) in [(8, Expected::Valid), (9, Expected::Declined)] {
+        let mut body = String::new();
+        let mut from = "child".to_owned();
+        for i in 0..size {
+            let name = format!("alias_{i}");
+            body.push_str(&format!("*u8 {name} = {from}; "));
+            from = name;
+        }
+        body.push_str(&format!("u8 again = *{from}; first = 3;"));
+        let program = joined("parent = &!second;", true, "", &body)
+            .replace("    seen\n", "    if (again == seen) { again } else { 0 }\n");
+        check(&program, expected);
+    }
+}
+
+#[test]
+fn joined_child_alias_does_not_authorize_rebinding() {
+    let program = joined("parent = &!second;", true, "",
+        "*u8 alias = child; alias = null; u8 again = *alias; again;");
     check(&program, Expected::Declined);
 }
 
