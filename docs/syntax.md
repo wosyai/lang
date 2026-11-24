@@ -63,7 +63,11 @@ value = 1;
 value;
 ```
 
-## Blocks and local bindings
+## Blocks and control flow
+
+A block holds local bindings, `if` and `unsafe` items, and expressions.
+Bindings end with `;`. A trailing value list without `;` is the block result.
+Use recursion for repetition:
 
 ```wosy
 i32(i32) advance_to_three = fn(value) {
@@ -74,10 +78,6 @@ i32(i32) advance_to_three = fn(value) {
   }
 };
 ```
-
-A block holds local bindings, `if` and `unsafe` items, and expressions. Bindings ending with `;` are statements. The trailing value list without `;` is the block result. The base language expresses repetition with recursion, as above.
-
-## Control flow
 
 ```wosy
 if (input == 2) {
@@ -104,6 +104,11 @@ i32 flags = 1 | 2 ^ 3 & 4 << 1 + 2 * 3;
 bool ok = !!!ready && waiting || done;
 i32 negated = -value;
 ```
+
+In `&`, `|`, `^`, `<<`, and `>>` expressions, a typed integer operand can
+set the type of untyped literals, including in nested groups. Typed operands
+must agree. With no typed operand, give the expression a type before passing
+it to a conversion such as `core.int_trunc`.
 
 Calls use dots and optional type arguments:
 
