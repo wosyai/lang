@@ -875,6 +875,41 @@ def state_report(code, label, selected, extra=""):
     return ('{ .stdout = ""; .stderr = "'+label+'"; .code = '+str(code)
             +'; .files = [{ .path = "state.json"; .state = '+selected+'; }'+extra+']; }')
 
+parallel_mixed = f"""%%start
+    unit() check = fn {{
+        i8 first = 2;
+        i8 second = 8;
+        bool enabled = true;
+        bool disabled = false;
+        first, second, enabled, disabled = second, first, disabled, enabled;
+        core.require(first == 8, {report(174,"FIRST")});
+        core.require(second == 2, {report(175,"SECOND")});
+        core.require(disabled, {report(176,"DISABLED")});
+        core.require(enabled, {state_report(177,"PARALLEL-MIXED","enabled",', { .path = "first.json"; .state = first; }')});
+    }};
+    %%end"""
+parallel_literals = f"""%%start
+    unit() check = fn {{
+        i8 count = 2;
+        bool enabled = true;
+        count, enabled = 7, false;
+        core.require(count == 7, {report(174,"COUNT")});
+        core.require(enabled, {state_report(178,"PARALLEL-LITERALS","enabled")});
+    }};
+    %%end"""
+parallel_formal_unsupported = f"""%%start
+    unit(i8) check = fn(formal) {{
+        i8 local = 2;
+        core.require(local != 2, {state_report(179,"FORMAL-NEVER-PUBLISHED","local")});
+        formal, local = local, formal;
+        core.require(formal != 2, {state_report(179,"FORMAL-NEVER-PUBLISHED","local")});
+    }};
+    %%end"""
+cases.extend([
+    ("parallel-whole-local-mixed-swap",parallel_mixed,177,b"PARALLEL-MIXED"),
+    ("parallel-whole-local-mixed-literals",parallel_literals,178,b"PARALLEL-LITERALS"),
+    ("parallel-formal-target-fails-closed",parallel_formal_unsupported,2,b"unsupported analysis"),
+])
 state_range = f"""%%start
     unit(i8) check = fn(value) {{
         core.require(value <= 3, {state_report(162,"AUTHORED-RANGE","value",', { .path = "note.txt"; .text = "authored"; }')});
@@ -1001,6 +1036,13 @@ cases.extend([
 ])
 holes_bytes = b'{"type":{"kind":"i8"},"value":{"kind":"alternatives","values":[1,3]}}\n'
 authored_files = {
+    "parallel-whole-local-mixed-swap": {
+        "state.json": b'{"type":{"kind":"bool"},"value":false}\n',
+        "first.json": b'{"type":{"kind":"i8"},"value":8}\n',
+    },
+    "parallel-whole-local-mixed-literals": {
+        "state.json": b'{"type":{"kind":"bool"},"value":false}\n',
+    },
     "authored-state-holes": {"state.json": holes_bytes},
     "authored-state-full-bool": {"state.json": b'{"type":{"kind":"bool"},"value":{"kind":"alternatives","values":[false,true]}}\n'},
     "authored-state-mixed": {"state.json": b'{"type":{"kind":"i8"},"value":{"kind":"alternatives","values":[1,{"kind":"range","minimum":3,"maximum":127}]}}\n'},
@@ -1061,6 +1103,8 @@ with tempfile.TemporaryDirectory(prefix="affine-calls-") as path:
                 assert not res.stdout,res
                 if code==2:
                     assert expected_stderr in res.stderr,res
+                    if name == "parallel-formal-target-fails-closed":
+                        assert b"FORMAL-NEVER-PUBLISHED" not in res.stderr,res
                 else:
                     assert res.stderr==expected_stderr,res
                 files = authored_files.get(name, {}) if included else {}

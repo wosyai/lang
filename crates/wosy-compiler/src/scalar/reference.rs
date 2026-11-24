@@ -7452,7 +7452,8 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
         #[cfg(any(test, feature = "internal-checker"))]
         let checker_enabled = self.occurrence_typing.checker_directives_enabled();
         #[cfg(feature = "internal-checker")]
-        if checker_enabled && matches!(edge, OccurrenceEdge::CallArgument(0 | 1) | OccurrenceEdge::FinalOutput { output: 0, .. })
+        if checker_enabled && matches!(edge, OccurrenceEdge::CallArgument(0 | 1) | OccurrenceEdge::FinalOutput { output: 0, .. }
+                | OccurrenceEdge::AssignmentRhs { .. })
             && self.structure.checked_types.expressions.get(&ordinal) == Some(&ScalarType::Bool)
         {
             if let ScalarExpression::Boolean { value, .. } = expression {

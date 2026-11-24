@@ -4971,6 +4971,12 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                 }
             }
             BlockItemKind::Assignment { group } => {
+                #[cfg(feature = "internal-checker")]
+                if calls.assignments.get(&(group.block, group.item))?.destinations().len() > 1 {
+                    if !COLLECT || USE_IMPORTED_BOUND { return None; }
+                    path = ordinary_parallel_assignment(calls, roots, group, path)?;
+                    continue;
+                }
                 let allow_contextual_local_transfers = || COLLECT && !USE_IMPORTED_BOUND
                     && failures.as_deref().is_some_and(|failure| failure.allow_contextual_local_transfers);
                 let (axis, value, rhs, destination) = integer_assignment(calls, roots, group, &path, allow_contextual_local_transfers)?;
@@ -6093,6 +6099,101 @@ fn exact_integer_entry_row(exact: &[&BigInt]) -> IntegerRow {
     exact.iter().map(|value| Rc::new(IntegerSet::singleton(value))).collect()
 }
 
+#[cfg(feature = "internal-checker")]
+enum ParallelScalarSource {
+    Copy(usize),
+    Literal(Rc<IntegerSet>),
+}
+
+#[cfg(feature = "internal-checker")]
+fn ordinary_parallel_assignment(
+    calls: &FunctionCallSites, roots: &mut IntegerRoots<'_>, position: BlockPosition, state: IntegerInputs,
+) -> Option<IntegerInputs> {
+    const MAX_PARALLEL_SCALARS: usize = 16;
+    let group = calls.assignments.get(&(position.block, position.item))?;
+    let count = group.destinations().len();
+    if !(2..=MAX_PARALLEL_SCALARS).contains(&count) || group.rhs_evaluations().len() != count
+        || group.projected_outputs().len() != 0 || roots.projected_entry_axis.is_some()
+    {
+        return None;
+    }
+    let structure = &calls.structure;
+    let width = roots.axes.len();
+    let mut work = roots.ordinary_local_work.take().unwrap_or_default();
+    charge_call_work(&mut work, width.checked_add(count.checked_mul(8)?)?)?;
+    let mut changes = (0..width).map(|_| None).collect::<Vec<_>>();
+    for (index, (destination, rhs)) in group.destinations().zip(group.rhs_evaluations()).enumerate() {
+        if destination.position != index || rhs.position != index
+            || structure.checker_contextual_occurrences.contains(&destination.destination)
+            || structure.checker_contextual_occurrences.contains(&rhs.expression)
+        {
+            return None;
+        }
+        let DirectDestinationIdentity::Existing(binding) = calls.prepared_direct_destination(destination.destination)?
+            else { return None; };
+        let (axis, ty) = roots.lookup(binding)?;
+        if axis < roots.parameters || changes[axis].is_some()
+            || (!is_integer_type(ty) && *ty != ScalarType::Bool)
+            || !matches!(&destination.replacement, AssignmentReplacement::Resolved(resolved) if resolved == ty)
+            || structure.checked_types.expressions.get(&rhs.expression)? != ty
+        {
+            return None;
+        }
+        let operand = if let Some(value) = scalar_call_literal(structure, rhs.expression, ty, true) {
+            ParallelScalarSource::Literal(Rc::new(IntegerSet::singleton(value)))
+        } else {
+            let PlainNameIdentity::Lexical(source) = calls.prepared_plain_name(rhs.expression)? else { return None; };
+            let (source, source_ty) = roots.lookup(source)?;
+            if source_ty != ty { return None; }
+            ParallelScalarSource::Copy(source)
+        };
+        changes[axis] = Some(operand);
+    }
+    let state = state.parallel_overwrite(&changes, &mut work)?;
+    roots.ordinary_local_work = Some(work);
+    Some(state)
+}
+
+#[cfg(feature = "internal-checker")]
+impl IntegerInputs {
+    fn parallel_overwrite(mut self, changes: &[Option<ParallelScalarSource>], work: &mut usize) -> Option<Self> {
+        for row in &mut self.0 {
+            if row.affine.is_some() || row.entry.is_some() || row.len() != changes.len() { return None; }
+            let levels = (usize::BITS - row.equal_axes().len().leading_zeros()) as usize;
+            let width = row.len();
+            charge_call_work(work, 1usize.checked_add(width.checked_mul(5usize.checked_add(levels)?)?)?)?;
+            // Build all new cells and equality classes from the complete
+            // pre-write row. No destination changes until all RHS origins
+            // for this row (including reused old destinations) are resolved.
+            let mut representatives = vec![None; width];
+            let mut replacement = IntegerRow::new(Vec::with_capacity(width));
+            replacement.projected_from = row.projected_from;
+            let mut aliases = Vec::new();
+            for (axis, source) in changes.iter().enumerate() {
+                let old = match source {
+                    Some(ParallelScalarSource::Literal(value)) => {
+                        replacement.cells.push(value.clone());
+                        continue;
+                    }
+                    Some(ParallelScalarSource::Copy(source)) => *source,
+                    None => axis,
+                };
+                let origin = row.canonical_axis(old);
+                let domain = Rc::clone(&row[old]);
+                if let Some(representative) = representatives[origin] {
+                    aliases.push((axis, representative));
+                } else {
+                    representatives[origin] = Some(axis);
+                }
+                replacement.cells.push(domain);
+            }
+            replacement.equal_axes = (!aliases.is_empty()).then(|| Rc::new(aliases));
+            *row = replacement;
+        }
+        Some(self)
+    }
+}
+
 fn integer_assignment(
     calls: &FunctionCallSites,
     roots: &IntegerRoots<'_>,
@@ -6224,6 +6325,32 @@ fn nominal_hidden_affine_anchor_reanchors_to_exact_visible_endpoints() {
     assert!(state.includes_signed(&[5, 2]));
     assert!(state.includes_signed(&[3, 4]));
     assert!(!state.includes_signed(&[5, 4]));
+}
+
+#[cfg(feature = "internal-checker")]
+#[test]
+fn simultaneous_parallel_rows_keep_old_origins_and_relations() {
+    let domain = |lo, hi| Rc::new(IntegerSet::from_type(&ScalarType::I8).unwrap()
+        .keep(&BinaryOperator::GreaterEqual, &BigInt::from(lo)).unwrap()
+        .keep(&BinaryOperator::LessEqual, &BigInt::from(hi)).unwrap());
+    let old_first = domain(1, 3);
+    let old_second = domain(7, 9);
+    let mut row = IntegerRow::new(vec![old_first.clone(), old_second]);
+    row.append_alias(0, old_first);
+    let changes = [
+        Some(ParallelScalarSource::Copy(1)),
+        Some(ParallelScalarSource::Copy(0)),
+        None,
+    ];
+    let mut work = 0;
+    let updated = IntegerInputs(vec![row.clone()]).parallel_overwrite(&changes, &mut work).unwrap();
+    assert!(updated.includes_signed(&[8, 2, 2]));
+    assert!(!updated.includes_signed(&[2, 8, 2]));
+    assert!(!updated.includes_signed(&[8, 2, 3]));
+    assert_eq!(updated.row_equal_axes(0).unwrap(), [(2, 1)]);
+    assert!(work > 0);
+    let mut exhausted = MAX_PARTITION_TRANSFER_WORK;
+    assert!(IntegerInputs(vec![row]).parallel_overwrite(&changes, &mut exhausted).is_none());
 }
 
 #[test]
