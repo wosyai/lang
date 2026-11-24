@@ -3447,6 +3447,9 @@ pub(super) fn named_stack_parameters(parameters: &[ScalarType]) -> bool {
 
 #[cfg(feature = "internal-checker")]
 pub(super) fn named_nested_scalar_parameters(parameters: &[ScalarType], result: &ScalarType) -> bool {
+    if *result == ScalarType::Unit {
+        return matches!(parameters, [] | [_] | [_, _]) && parameters.iter().all(is_integer_type);
+    }
     if *result == ScalarType::Bool && matches!(parameters, [] | [ScalarType::Bool]) { return true; }
     (is_integer_type(result) || *result == ScalarType::Bool) && named_stack_parameters(parameters)
 }
@@ -3499,7 +3502,7 @@ enum IntegerPairPartitionOutput {
 }
 
 pub(super) const MAX_ACTUAL_CALL_DEPTH: usize = 64;
-const MAX_PARTITION_TRANSFER_WORK: usize = MAX_ACTUAL_CALL_DEPTH * MAX_ACTUAL_CALL_DEPTH;
+pub(super) const MAX_PARTITION_TRANSFER_WORK: usize = MAX_ACTUAL_CALL_DEPTH * MAX_ACTUAL_CALL_DEPTH;
 
 pub(super) struct IntegerReturnPartition {
     span: super::ByteSpan,

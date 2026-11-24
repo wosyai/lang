@@ -5816,6 +5816,13 @@ struct NestedScalarRoutes {
 }
 
 #[cfg(feature = "internal-checker")]
+struct NestedScalarCaller {
+    owner: NestedScalarCallable,
+    unit: bool,
+    callees: Vec<NestedScalarCallable>,
+}
+
+#[cfg(feature = "internal-checker")]
 struct ProofTargetUse {
     declaration: (usize, usize),
     exact_scalar: bool,
@@ -5969,14 +5976,16 @@ impl<'a> CallDeclarationIndex<'a> {
     }
 
     #[cfg(feature = "internal-checker")]
-    fn nested_scalar_caller(&self, source: &SourceIdentity, function: &ScalarFunction) -> Option<NestedScalarCallable> {
+    fn nested_scalar_caller(&self, source: &SourceIdentity, function: &ScalarFunction) -> Option<NestedScalarCaller> {
         if !self.nested_scalar_sources.contains(source) { return None; }
         let ScalarType::Callable { outputs, parameters } = &function.signature else { return None; };
         let [out] = outputs.outputs.as_slice() else { return None; };
         if !super::checker_flow::named_nested_scalar_parameters(parameters, &out.ty) { return None; }
         let &(span, CallFunctionKind::Ordinary, owner) = self.modules.get(source)?.functions.get(function.name.as_str())?
             else { return None; };
-        (span == function.name_span).then_some(owner)
+        (span == function.name_span).then_some(NestedScalarCaller {
+            owner, unit: out.ty == ScalarType::Unit, callees: Vec::new(),
+        })
     }
 
     fn callable(
@@ -6773,12 +6782,33 @@ struct ContextualCallPlace {
 
 impl FunctionCallSites {
     #[cfg(feature = "internal-checker")]
-    pub(super) fn checker_pure_calling_frame(&self) -> bool {
+    fn checker_closed_calling_frame(&self) -> bool {
         self.assignments.is_empty() && self.allocation_length_calls.is_empty()
-            && self.arms.is_empty() && self.structure.checker_directives.is_empty()
+            && self.arms.is_empty()
             && !self.structure.has_ordinary_contextual_places()
             && !self.structure.checker_has_bool_contextual_declaration
             && self.structure.checker_selected_snapshots.is_empty()
+    }
+
+    #[cfg(feature = "internal-checker")]
+    pub(super) fn checker_pure_calling_frame(&self) -> bool {
+        self.checker_closed_calling_frame() && self.structure.checker_directives.is_empty()
+    }
+
+    #[cfg(feature = "internal-checker")]
+    pub(super) fn checker_returns_unit(&self) -> bool {
+        matches!(self.boundary.results.as_slice(), [result] if result.ty == ScalarType::Unit)
+    }
+
+    #[cfg(feature = "internal-checker")]
+    pub(super) fn checker_named_route_frame(&self) -> bool {
+        if self.checker_returns_unit() {
+            // An ordinary closed Unit frame may check obligations, but a
+            // predicate's hypothetical call isn't a real delegated call.
+            self.checker_closed_calling_frame() && self.structure.checker_ordinary_directive_calls.is_empty()
+        } else {
+            self.checker_pure_calling_frame()
+        }
     }
 
     #[cfg(any(test, feature = "internal-checker"))]
@@ -7212,7 +7242,7 @@ struct CallableWalk<'a> {
     #[cfg(feature = "internal-checker")]
     checker_name_span: ByteSpan,
     #[cfg(feature = "internal-checker")]
-    checker_scalar_route: Option<(NestedScalarCallable, Vec<NestedScalarCallable>)>,
+    checker_scalar_route: Option<NestedScalarCaller>,
     #[cfg(feature = "internal-checker")]
     checker_fixed_array_output: bool,
     prepared: bool,
@@ -8716,15 +8746,22 @@ fn initialization_call_target(
 
 impl StructuralWalker<'_, '_> {
     #[cfg(feature = "internal-checker")]
-    fn record_named_nested_scalar_route(&mut self, call: OccurrenceOrdinal) {
+    fn record_named_nested_scalar_route(&mut self, call: OccurrenceOrdinal, unit_call: bool) {
         let WalkMode::Callable(walk) = &mut self.mode else { return; };
-        let Some((caller, callees)) = &mut walk.checker_scalar_route else { return; };
+        let Some(caller) = &mut walk.checker_scalar_route else { return; };
+        // Scalar frames still transfer only bound scalar results. Ordinary
+        // executable Unit delegation belongs to closed Unit frames.
+        if unit_call && (!caller.unit
+            || self.structure.checked_types.expressions.get(&call) != Some(&ScalarType::Unit))
+        {
+            return;
+        }
         let Some(&callee) = self.structure.checker_direct_targets.get(&call) else { return; };
-        if caller.0 != callee.0 { return; }
+        if caller.owner.0 != callee.0 { return; }
         let declarations = walk.target_resolver.declarations;
         let mut work = declarations.nested_scalar_work.get();
         if super::checker_flow::charge_call_work(&mut work, 1).is_some() {
-            callees.push(callee);
+            caller.callees.push(callee);
         } else {
             declarations.nested_scalar_routes.borrow_mut().exhausted = true;
         }
@@ -9551,7 +9588,7 @@ impl StructuralWalker<'_, '_> {
                     let key = (position.block, position.item);
                     if let Some((call, arguments)) = from_call {
                         #[cfg(feature = "internal-checker")]
-                        self.record_named_nested_scalar_route(call);
+                        self.record_named_nested_scalar_route(call, false);
                         self.structure.checker_integer_call_locals.insert(
                             key,
                             CheckerIntegerCallOrigin {
@@ -9570,7 +9607,7 @@ impl StructuralWalker<'_, '_> {
                 if let Some((source, callable, kind)) = ordinary_local.take() {
                     let binding = lexical.reference_id(callable.source, callable.function_span);
                     if let CheckerOrdinaryScalarLocalKind::BoolCall(call) = &kind {
-                        self.record_named_nested_scalar_route(*call);
+                        self.record_named_nested_scalar_route(*call, false);
                     }
                     self.structure.checker_has_affine_scalar_local |= matches!(&kind,
                         CheckerOrdinaryScalarLocalKind::Arithmetic {
@@ -9914,9 +9951,11 @@ impl StructuralWalker<'_, '_> {
                         }
                         BlockItemKind::FinalOutput(slot)
                     }
-                    ScalarBlockItemRole::Ordinary => BlockItemKind::Evaluation {
-                        expression: producer,
-                    },
+                    ScalarBlockItemRole::Ordinary => {
+                        #[cfg(feature = "internal-checker")]
+                        self.record_named_nested_scalar_route(producer, true);
+                        BlockItemKind::Evaluation { expression: producer }
+                    }
                 }
             }
             ScalarBlockItem::Assignment(assignment) => {
@@ -10383,7 +10422,7 @@ fn resolve_function_call_sites(
         #[cfg(feature = "internal-checker")]
         checker_name_span: function.name_span,
         #[cfg(feature = "internal-checker")]
-        checker_scalar_route: declarations.nested_scalar_caller(source, function).map(|owner| (owner, Vec::new())),
+        checker_scalar_route: declarations.nested_scalar_caller(source, function),
         #[cfg(feature = "internal-checker")]
         checker_fixed_array_output: declarations.checker_proof_targets.contains(&(source, function.name_span))
             && matches!(&function.signature, ScalarType::Callable { outputs, .. }
@@ -10519,10 +10558,10 @@ fn resolve_function_call_sites(
         short_circuits: resolver.short_circuits,
     };
     #[cfg(feature = "internal-checker")]
-    if let Some((owner, callees)) = callable.checker_scalar_route {
-        if !callees.is_empty() && calls.checker_pure_calling_frame() {
-            // These are the same typed bound call receipts consumed by the
-            // exact cursor, not a second walk of syntax or call occurrences.
+    if let Some(NestedScalarCaller { owner, callees, .. }) = callable.checker_scalar_route {
+        if !callees.is_empty() && calls.checker_named_route_frame() {
+            // The exact cursor consumes these bound or executable call
+            // receipts; no second syntax or call occurrence walk.
             let mut routes = declarations.nested_scalar_routes.borrow_mut();
             for callee in callees {
                 routes.callers.entry(callee).or_default().push(owner);

@@ -2372,6 +2372,43 @@ for name, text, code, why in [
         namespace_children[name] = exact_nested_scalar_library
     cases.append((name, text, code, why))
 
+unit_startup_proof = f"""%%start
+    bool(i8) positive = fn(value) {{ if (value > 0) {{ true }} else {{ false }} }};
+    proof scoped for positive(entry) -> (out) where (entry > 0) ensures (out) {{ core.show(out); }}
+    unit(i8, i8) worker = fn(value, expected) {{
+        bool seen = positive(value);
+        core.require(seen, {report(91,"UNEXPECTED-UNIT-RESULT")});
+        core.require(expected == 7, {report(92,"UNEXPECTED-UNIT-ARGUMENT")});
+    }};
+    unit() boot = fn {{ worker(3, 7); worker(5, 7); }};
+    boot();
+%%end"""
+unit_startup_refuted = unit_startup_proof.replace(
+    "ensures (out) { core.show(out); }", "ensures (!out) { core.show(!out); }")
+unit_startup_cut = unit_startup_refuted.replace(
+    f'core.require(expected == 7, {report(92,"UNEXPECTED-UNIT-ARGUMENT")});',
+    f'core.narrow(expected != 7, {report(93,"UNIT-NARROW-REPORT")});'
+).replace("worker(5, 7); };", f'worker(5, 7);\n        core.require(false, {report(94,"UNREACHED-UNIT-REPORT")});\n    }};')
+unit_startup_hypothetical = unit_startup_proof.replace(
+    "core.require(seen,", f'core.require(positive(value), {report(95,"UNPUBLISHED-PREDICATE")}); core.require(seen,'
+).replace("    boot();", f'    core.require(false, {report(96,"UNPUBLISHED-UNIT-PREFIX")}); boot();')
+cases.extend([
+    ("exact-startup-unit-proof-route-proved", unit_startup_proof, 0, b""),
+    ("exact-startup-unit-proof-route-refuted", unit_startup_refuted, 1, b"proof obligation failed"),
+    ("exact-startup-unit-proof-route-direct", unit_startup_refuted.replace(
+        "unit() boot = fn { worker(3, 7); worker(5, 7); };\n    boot();", "if (true) { worker(3, 7); };"),
+        1, b"proof obligation failed"),
+    ("exact-startup-unit-proof-route-narrow", unit_startup_cut, 93, b"UNIT-NARROW-REPORT"),
+    ("exact-startup-unit-proof-route-legacy-sibling", unit_startup_proof.replace("unit() boot = fn { worker",
+        f'unit() independent = fn {{ core.require(false, {report(97,"INDEPENDENT-UNIT")}); }};\n'
+        '    unit() boot = fn { independent(); worker'), 97, b"INDEPENDENT-UNIT"),
+    ("exact-startup-unit-proof-route-refuses-hypothetical", unit_startup_hypothetical, 2, b"unsupported analysis"),
+    ("ordinary-unit-proof-route-default-refuses-unobserved-site", unit_startup_proof.replace("%%end",
+        "unit(i8) dormant = fn(value) { bool another = positive(value); "
+        f'core.require(another, {report(96,"UNREACHED-DORMANT-UNIT")}); }}; %%end'),
+        2, b"unsupported analysis"),
+])
+
 authored_case_proof = """%%start
     u8(u8) clamp = fn(value) { if (value > 10) { 10 } else { value } };
     proof clamped for clamp(x) -> (out) ensures (out <= 10) {
@@ -2967,6 +3004,9 @@ cases.extend([
 %%end"""), 1, b"proof obligation failed"),
 ])
 proof_diagnostic_notes = {
+    "exact-startup-unit-proof-route-refuted": b"call entry: argument 1 = 5",
+    "exact-startup-unit-proof-route-direct": b"call entry: argument 1 = 3",
+    "exact-startup-unit-proof-route-narrow": b"call entry: argument 1 = 3",
     "exact-startup-nested-scalar-proof-bool-refuted": b"call entry: argument 1 = 3",
     "exact-startup-nested-scalar-proof-qualified-refuted": b"call returned 7",
     "ordinary-nested-scalar-proof-bool-symbolic": b"symbolic call can return true",
@@ -3777,6 +3817,8 @@ with tempfile.TemporaryDirectory(prefix="affine-calls-") as path:
                         assert b"NAMESPACE-EFFECT-NOT-PUBLISHED" not in res.stderr and b"proof obligation failed" not in res.stderr, res
                     if name == "exact-startup-nested-scalar-proof-refuses-later-unobserved-effect":
                         assert b"UNPUBLISHED-NESTED-AUTHORED-RESULT" not in res.stderr and b"proof obligation failed" not in res.stderr, res
+                    if name == "exact-startup-unit-proof-route-refuses-hypothetical":
+                        assert b"UNPUBLISHED-" not in res.stderr and b"proof obligation failed" not in res.stderr, res
                     if name == "exact-startup-real-integer-tail-rejects-reentry":
                         assert b"BEFORE-TAIL" not in res.stderr and b"AFTER-TAIL" not in res.stderr,res
                     if name == "authored-lexical-code-nonsingleton-fails-atomically":
@@ -3805,6 +3847,18 @@ with tempfile.TemporaryDirectory(prefix="affine-calls-") as path:
                         assert b"COPY-PRIOR-UNPUBLISHED" not in res.stderr and b"COPY-FORMAL-UNPUBLISHED" not in res.stderr,res
                 elif included and name in proof_diagnostic_notes:
                     assert expected_stderr in res.stderr and proof_diagnostic_notes[name] in res.stderr,res
+                    if name == "exact-startup-unit-proof-route-refuted":
+                        failures = res.stderr.split(b"error: proof obligation failed")[1:]
+                        assert len(failures) == 2 and b"symbolic call" not in res.stderr, res
+                        for entry, failure in zip((3, 5), failures):
+                            assert b"boot()" in failure and f"worker({entry}, 7)".encode() in failure, res
+                            assert f"call entry: argument 1 = {entry}".encode() in failure and b"call returned true" in failure, res
+                    if name == "exact-startup-unit-proof-route-direct":
+                        assert b"worker(3, 7)" in res.stderr and b"through this call" not in res.stderr, res
+                    if name == "exact-startup-unit-proof-route-narrow":
+                        assert res.stderr.count(b"error: proof obligation failed") == 1, res
+                        assert b"UNIT-NARROW-REPORT" in res.stderr and b"UNREACHED-UNIT-REPORT" not in res.stderr, res
+                        assert b"call entry: argument 1 = 5" not in res.stderr, res
                     if "-joint-result-proof-" in name:
                         failures = res.stderr.split(b"error: proof obligation failed")[1:]
                         if name.startswith("exact-startup-"):
