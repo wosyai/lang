@@ -1573,6 +1573,18 @@ cases.extend([
     ("ordinary-pure-affine-proof-shared-guard",grouped_affine_proof,0,b""),
     ("exact-startup-ordinary-pure-affine-proof-shared-guard",grouped_affine_proof_reached,0,b""),
 ])
+batched_named_calling_producer = """%%start
+    i8(i8) leaf = fn(n) { if (n < 0) { -3 } else { 7 } };
+    i8(i8) producer = fn(n) { i8 produced = leaf(n); produced };
+    proof positive for producer(entry) -> (out) where (entry >= 0) ensures (out == 7) {}
+    proof negative for producer(entry) -> (out) where (entry < 0) ensures (out == -3) {}
+%%end"""
+cases.extend([
+    ("ordinary-batched-named-calling-producer-proved",batched_named_calling_producer,0,b""),
+    ("ordinary-batched-named-calling-producer-refuted",batched_named_calling_producer.replace("out == -3","out == -4"),
+        1,b"proof obligation failed"),
+])
+
 branching_affine_proof = """%%start
     i8(i8) normalize = fn(value) {
         i8 shifted = value + 2;
@@ -1597,6 +1609,7 @@ cases.extend([
         b"proof obligation failed"),
 ])
 proof_diagnostic_notes = {
+    "ordinary-batched-named-calling-producer-refuted": b"symbolic call can return -3",
     "ordinary-pure-affine-proof-conditional-refuted": b"symbolic call can return 5",
     "exact-startup-ordinary-pure-affine-proof-conditional-refuted": b"call returned 5",
     "ordinary-pure-affine-proof-symbolic-refuted": b"symbolic call can return 102",

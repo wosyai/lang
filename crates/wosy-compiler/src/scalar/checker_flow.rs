@@ -3287,7 +3287,7 @@ pub(super) enum PartitionedProofGoal<'a> {
 #[cfg(feature = "internal-checker")]
 pub(super) fn verify_partitioned_call_return<'a>(
     producer: &'a FunctionCallSites, returned: &ActualCallResult, domain: &IntegerSet,
-    eligible_for_elision: bool, goal: PartitionedProofGoal<'_>,
+    eligible_for_elision: bool, goal: PartitionedProofGoal<'_>, mut work: Option<&mut usize>,
 ) -> Option<PartitionedCallProof<'a>> {
     let ActualCallResult::PartitionedInteger(pieces) = returned else { return None; };
     let [binding] = producer.boundary.checker_parameter_bindings.as_deref()? else { return None; };
@@ -3295,6 +3295,10 @@ pub(super) fn verify_partitioned_call_return<'a>(
     let mut applicable = false;
     let mut covered = Vec::new();
     for piece in pieces {
+        if let Some(work) = work.as_deref_mut() {
+            charge_call_work(work, 1usize.checked_add(piece.input.interval_count())?
+                .checked_add(domain.interval_count())?)?;
+        }
         let output = match (&goal, &piece.output) {
             (_, IntegerPartitionOutput::InputAffine(_))
             | (PartitionedProofGoal::Literal(..), IntegerPartitionOutput::InputAlias) => return None,

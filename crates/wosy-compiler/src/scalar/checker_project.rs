@@ -3821,30 +3821,39 @@ impl SelectedSymbolicProof<'_, '_> {
         let [output] = body.boundary.results.as_slice() else { return Err(ProjectCheck::Unsupported); };
         use super::checker_flow::PartitionedProofGoal;
         let issuer = group.issuer.as_ref().filter(|issuer| std::ptr::eq(issuer.body, body));
-        let goal = match first.bound {
-            MainFlowProofBound::Literal(bound) => PartitionedProofGoal::Literal(first.relation, bound),
-            MainFlowProofBound::Entry(0) if parameter.ty == output.ty
-                && Some(first.relation) == IntegerRelation::from_operator(&BinaryOperator::Equal) =>
-                    PartitionedProofGoal::EntryEquality,
-            _ => return Err(ProjectCheck::Unsupported),
-        };
-        let literal_bound = first.bound.literal();
-        if first.proof_source != source || (literal_bound.is_some() && issuer.is_none() && !first.guard.always_rejects)
-            || !rest.is_empty() || !supported_calling_proof_body(body, &output.ty)
-            || first.guard.domain.is_some() || first.guard.comparisons.len() > 1
-        {
-            return Err(ProjectCheck::Unsupported);
+        let batched = !rest.is_empty();
+        let mut proof_work = 0;
+        if batched {
+            super::checker_flow::charge_call_work(&mut proof_work,
+                rest.len().checked_add(1).ok_or(ProjectCheck::Unsupported)?).ok_or(ProjectCheck::Unsupported)?;
         }
+        if !supported_calling_proof_body(body, &output.ty) { return Err(ProjectCheck::Unsupported); }
         let domain = IntegerSet::from_type(&parameter.ty).ok_or(ProjectCheck::Unsupported)?;
-        let proof_domain = if first.guard.always_rejects {
-            None
-        } else {
-            Some(match first.guard.comparisons.as_slice() {
-                [] => domain.clone(),
-                [comparison] if comparison.slot == 0 => domain.keep_relation(comparison.relation, comparison.bound),
+        let cases = std::iter::once(first).chain(rest);
+        let mut plans = Vec::new();
+        for case in cases {
+            let goal = match case.bound {
+                MainFlowProofBound::Literal(bound) => PartitionedProofGoal::Literal(case.relation, bound),
+                MainFlowProofBound::Entry(0) if !batched && parameter.ty == output.ty
+                    && Some(case.relation) == IntegerRelation::from_operator(&BinaryOperator::Equal) =>
+                        PartitionedProofGoal::EntryEquality,
                 _ => return Err(ProjectCheck::Unsupported),
-            })
-        };
+            };
+            if case.proof_source != source || case.guard.domain.is_some()
+                || (!batched && case.bound.literal().is_some() && issuer.is_none() && !case.guard.always_rejects)
+                || case.guard.comparisons.len() > 1
+            {
+                return Err(ProjectCheck::Unsupported);
+            }
+            if !case.guard.always_rejects {
+                let applicable = match case.guard.comparisons.as_slice() {
+                    [] => domain.clone(),
+                    [comparison] if comparison.slot == 0 => domain.keep_relation(comparison.relation, comparison.bound),
+                    _ => return Err(ProjectCheck::Unsupported),
+                };
+                plans.push((case, goal, applicable));
+            }
+        }
         let cursor = ExactCallCursor::projected(body, Rc::new(domain), &output.ty).ok_or(ProjectCheck::Unsupported)?;
         let mut evaluator = CheckedCalls::<ProofFreeSymbolic, false> {
             project: runtime.project, calls: runtime.calls, active: HashSet::from([target]),
@@ -3858,29 +3867,33 @@ impl SelectedSymbolicProof<'_, '_> {
             let result = evaluator.run_call_cursor(body, source, cursor, None, Some(collection))?;
             (result, evaluator.had_obligations)
         };
-        let Some(proof_domain) = proof_domain else { return Ok(Some(active)); };
-        let elidable = literal_bound.is_some() && effects.records.len() == first_directive
+        let elidable = !batched && !plans.is_empty() && first.bound.literal().is_some()
+            && effects.records.len() == first_directive
             && summary_elision_safe(body)
             && evaluator.reached.iter().all(|&(module, item)| {
                 runtime.calls.function_body(module, item, None).is_some_and(summary_elision_safe)
             });
-        let verified = super::checker_flow::verify_partitioned_call_return(
-            body, &result, &proof_domain, elidable, goal,
-        ).ok_or(ProjectCheck::Unsupported)?;
-        if let Some(failure) = verified.failure {
-            self.record(first, function, source, effects.records.len(), failure, None)?;
-        } else if verified.covers_guard {
-            let bound = literal_bound.ok_or(ProjectCheck::Unsupported)?;
-            let issuer = issuer.ok_or(ProjectCheck::Unsupported)?;
-            self.equalities.insert(VerifiedSymbolicEquality {
-                target, canonical_target: issuer.canonical_target, layout: issuer.layout,
-                body: issuer.body, bound, shared: std::cell::OnceCell::new(),
-                guards: VerifiedSymbolicGuards::Bare(first.guard.comparisons.first().map(|guard| ImportedEntryGuard {
-                    slot: guard.slot, relation: guard.relation, bound: guard.bound,
-                })),
-            });
+        let mut applicable = active;
+        for (case, goal, proof_domain) in plans {
+            let verified = super::checker_flow::verify_partitioned_call_return(
+                body, &result, &proof_domain, elidable, goal, batched.then_some(&mut proof_work),
+            ).ok_or(ProjectCheck::Unsupported)?;
+            applicable |= verified.applicable;
+            if let Some(failure) = verified.failure {
+                self.record(case, function, source, effects.records.len(), failure, None)?;
+            } else if verified.covers_guard {
+                let bound = case.bound.literal().ok_or(ProjectCheck::Unsupported)?;
+                let issuer = issuer.ok_or(ProjectCheck::Unsupported)?;
+                self.equalities.insert(VerifiedSymbolicEquality {
+                    target, canonical_target: issuer.canonical_target, layout: issuer.layout,
+                    body: issuer.body, bound, shared: std::cell::OnceCell::new(),
+                    guards: VerifiedSymbolicGuards::Bare(case.guard.comparisons.first().map(|guard| ImportedEntryGuard {
+                        slot: guard.slot, relation: guard.relation, bound: guard.bound,
+                    })),
+                });
+            }
         }
-        Ok(Some(active || verified.applicable))
+        Ok(Some(applicable))
     }
 }
 
@@ -12766,6 +12779,39 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
         assert!(run(&clean).unwrap().symbolic_diagnostic.is_none());
         let cyclic = text.replace("middle(n); produced", "producer(n); produced");
         assert!(matches!(run(&cyclic), Err(ProjectCheck::Unsupported)));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordered_named_calling_producer_reuses_return_provenance_for_distinct_guards() {
+        let app = source("src/main.w", "batch-named-calling-producer");
+        let text = format!(r#"%%start
+            unit() checked_step = fn {{ core.require(false, {OUTPUT}); }};
+            i8(i8) leaf = fn(n) {{ if (n < 0) {{ -3 }} else {{ 7 }} }};
+            i8(i8) producer = fn(n) {{ checked_step(); i8 produced = leaf(n); produced }};
+            proof positive for producer(entry) -> (out) where (entry >= 0) ensures (out == 7) {{}}
+            proof negative for producer(entry) -> (out) where (entry < 0) ensures (out == -3) {{}}
+        %%end"#);
+        let run = |text: &str| {
+            let (_, proof) = crate::parse_proof_source(app.clone(), text.to_owned(), &[]).ok().unwrap();
+            check_loaded_ordered_proof_diagnostics(
+                Vec::new(), vec![(proof, Vec::new())], vec![app.clone()], inputs(), ScalarCheckerScope::CurrentPackage,
+            ).unwrap()
+        };
+        let baseline = run(&text.lines().filter(|line| !line.contains("proof negative")).collect::<Vec<_>>().join("\n"));
+        let verified = run(&text);
+        assert_eq!(verified.directives.len(), baseline.directives.len(), "one producer capture for both goals");
+        assert!(verified.symbolic_diagnostic.is_none() && verified.additional_symbolic_diagnostics.is_empty());
+        let failed = run(&text.replace("out == 7", "out == 8").replace("out == -3", "out == -4"));
+        assert_eq!(failed.directives.len(), baseline.directives.len());
+        let first = failed.symbolic_diagnostic.unwrap();
+        let [second] = failed.additional_symbolic_diagnostics.as_slice() else { panic!("separate ordered proof failures"); };
+        assert_eq!(first.returned, BigInt::from(7));
+        assert_eq!(second.returned, BigInt::from(-3));
+        assert!(first.witness.intervals_at(0, 0).unwrap().eq([(&BigInt::from(0), &BigInt::from(127))]));
+        assert!(second.witness.intervals_at(0, 0).unwrap().eq([(&BigInt::from(-128), &BigInt::from(-1))]));
+        assert!(first.directive_position > 0);
+        assert_eq!(first.directive_position, second.directive_position);
     }
 
     #[cfg(feature = "internal-checker")]
