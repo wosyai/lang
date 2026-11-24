@@ -2055,7 +2055,8 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             return None;
                         };
                         if parameters.len() != effect.parameter + 1
-                            || (effect.parameter == 1 && (effect.descriptor || parameters.first() != Some(inner.as_ref())))
+                            || (effect.parameter == 1 && (effect.descriptor || parameters.first() !=
+                                Some(if effect.bool_prefix { &ScalarType::Bool } else { inner.as_ref() })))
                             || effect.parameter > 1
                         {
                             return None;
@@ -6988,7 +6989,7 @@ fn shared_scalar_read_effect(
 ) -> Option<SharedScalarReadEffect> {
     if matches!(target, ResolvedCallTarget::LocalCallable(_)) {
         return (calls.local_shared_call_families.get(&ordinal) == Some(&true))
-            .then_some(SharedScalarReadEffect { parameter: 0, descriptor: false, joined_only: false, returns_formal: false });
+            .then_some(SharedScalarReadEffect { parameter: 0, descriptor: false, joined_only: false, bool_prefix: false, returns_formal: false });
     }
     let ResolvedCallTarget::ModuleCallable {
         source: callee, declaration_span, concrete: ConcreteCallSelection::Declaration,
@@ -10388,6 +10389,7 @@ struct SharedScalarReadEffect {
     descriptor: bool,
     // Structured bodies and transitive wrappers authorize only exact joined observations.
     joined_only: bool,
+    bool_prefix: bool,
     returns_formal: bool,
 }
 
@@ -10398,6 +10400,7 @@ fn exact_joined_conditional_reader(
     ordinal: OccurrenceOrdinal,
     structure: &OccurrenceStructure,
     parameter: &ParameterSlot,
+    ordinary_formal: Option<&ParameterSlot>,
     inner: &ScalarType,
     formal_name: &impl Fn(OccurrenceOrdinal, ByteSpan) -> bool,
     mut remaining: usize,
@@ -10415,6 +10418,8 @@ fn exact_joined_conditional_reader(
         match expression {
             ScalarExpression::Integer { .. } if ty == inner => {},
             ScalarExpression::Boolean { .. } if *ty == ScalarType::Bool => {},
+            ScalarExpression::Name { .. } if *ty == ScalarType::Bool
+                && ordinary_formal.is_some_and(|formal| formal_name(ordinal, formal.span)) => {},
             ScalarExpression::Dereference { place: ScalarPlace::Dereference { pointer, .. }, .. }
                 if ty == inner && matches!(pointer.as_ref(), ScalarExpression::Name { .. }) =>
             {
@@ -10472,9 +10477,6 @@ impl SharedScalarReadEffect {
         let ScalarType::CheckedReference {
             mutability: ScalarReferenceMutability::Shared, inner,
         } = &parameter.ty else { return None };
-        if scalar.is_some_and(|scalar| &scalar.ty != inner.as_ref() || !aggregate::ordinary_value(&scalar.ty)) {
-            return None;
-        }
         if !function.generic_parameters.is_empty() || !function.overload_arms.is_empty()
         {
             return None;
@@ -10500,20 +10502,24 @@ impl SharedScalarReadEffect {
             && formal_name(output, parameter.span)
             && structure.checked_types.expressions.get(&output) == Some(&result.ty)
         {
-            return Some(Self { parameter: parameter.ordinal, descriptor: false, joined_only: false, returns_formal: true });
+            return Some(Self { parameter: parameter.ordinal, descriptor: false, joined_only: false, bool_prefix: false, returns_formal: true });
         }
         if if descriptor { !aggregate::ordinary_value(&result.ty) || !calls.call_occurrences.is_empty() }
             else { &result.ty != inner.as_ref() || !aggregate::ordinary_value(inner) } {
             return None;
         }
-        if scalar.is_none() && !descriptor && matches!(expression, ScalarExpression::If { .. })
+        if scalar.is_none_or(|formal| formal.ty == ScalarType::Bool)
+            && !descriptor && matches!(expression, ScalarExpression::If { .. })
             && calls.call_occurrences.is_empty()
         {
             const MAX_CONDITIONAL_READER_NODES: usize = 32;
-            exact_joined_conditional_reader(expression, output, structure, parameter,
+            exact_joined_conditional_reader(expression, output, structure, parameter, scalar,
                 inner, &formal_name, MAX_CONDITIONAL_READER_NODES)?;
             return Some(Self { parameter: parameter.ordinal, descriptor: false,
-                joined_only: true, returns_formal: false });
+                joined_only: true, bool_prefix: scalar.is_some(), returns_formal: false });
+        }
+        if scalar.is_some_and(|scalar| &scalar.ty != inner.as_ref() || !aggregate::ordinary_value(&scalar.ty)) {
+            return None;
         }
         let (expression, read) = match (scalar, expression) {
             (Some(scalar), ScalarExpression::Binary { operator: BinaryOperator::Add, left, right, .. })
@@ -10583,7 +10589,7 @@ impl SharedScalarReadEffect {
         (formal_name(pointer, parameter.span)
             && structure.checked_types.expressions.get(&pointer) == Some(&parameter.ty)
             && structure.checked_types.expressions.get(&read) == Some(&result.ty))
-            .then_some(Self { parameter: parameter.ordinal, descriptor, joined_only: false, returns_formal: false })
+            .then_some(Self { parameter: parameter.ordinal, descriptor, joined_only: false, bool_prefix: false, returns_formal: false })
     }
 }
 
@@ -12790,7 +12796,7 @@ fn ground_shared_reader_forwarders<'a>(
         if let Some(callers) = reverse.remove(&target) {
             for (index, declaration) in callers {
                 rows[index].1.shared_scalar_read_effects.insert(declaration, SharedScalarReadEffect {
-                    parameter: 0, descriptor: false, joined_only: true,
+                    parameter: 0, descriptor: false, joined_only: true, bool_prefix: false,
                     returns_formal: target.2 == SharedForwardKind::ReturnedFormal,
                 });
                 grounded.push((index, declaration, target.2));

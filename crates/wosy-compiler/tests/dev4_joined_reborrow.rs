@@ -865,6 +865,25 @@ fn joined_child_is_read_by_bounded_pure_conditional_callee() {
 }
 
 #[test]
+fn selected_loan_reader_uses_exact_independent_boolean_formal() {
+    let program = joined_with_pointer_read(
+        "u8 low = pointer(true, child); u8 high = pointer(false, child); first = 3;", "*value",
+    ).replace("u8(*u8) pointer = fn(value) { *value };",
+        "u8(bool, *u8) pointer = fn(use_low, value) { if (use_low) { *value + 1 } else { *value + 2 } };")
+        .replace("    seen\n",
+            "    if (first == 3 && low == seen + 1 && high == seen + 2) { seen } else { 0 }\n");
+    check_case(&program, Expected::Valid, Some("WOSY_JOINED_CONDITIONAL_BOOL_IR_DIR"));
+
+    let live = program.replace("u8 high = pointer(false, child); first = 3;",
+        "first = 3; u8 high = pointer(false, child);");
+    assert_ne!(live, program);
+    check(&live, Expected::LiveConflict);
+    let uncertified = program.replace("{ *value + 2 }", "{ u8 local = *value; local + 2 }");
+    assert_ne!(uncertified, program);
+    check(&uncertified, Expected::NullParent);
+}
+
+#[test]
 fn joined_child_is_read_by_checked_callee_before_selected_owner_is_reusable() {
     let program = joined_with_pointer_read(
         "u8 through_call = pointer(child); first = 3;", "*value",
