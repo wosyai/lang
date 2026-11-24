@@ -1,5 +1,7 @@
 # Getting started
 
+Wosy compiles statically typed `.w` programs to native and WebAssembly targets.
+
 ## Prerequisites
 
 - The `wosy` binary on `PATH`.
