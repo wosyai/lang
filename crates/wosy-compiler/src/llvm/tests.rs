@@ -11983,3 +11983,57 @@ if (observe(false, 1, 5) != 3) { core.system_panic(); };
         }
     }
 }
+
+#[test]
+fn widened_array_return_transfers_original_initialized_backing_to_closed_receiver() {
+    let text = "%%start
+u8[]() fabricate = fn() { u8[] fresh = [3, 5, 7]; fresh };
+u64() replace = fn() {
+    u8[2] bytes;
+    bytes = fabricate();
+    core.array_len(&bytes)
+};
+if (replace() != 3) { core.system_panic(); };
+%%end";
+    let mixed = text.replace("if (replace()", "u8[] ordinary = fabricate(); ordinary;\nif (replace()");
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        for (closed, text) in [(true, text), (false, mixed.as_str())] {
+            let prepared = prepare_initializer_test(text, layout);
+            let checked = analyze_scalar_build(&prepared);
+            assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+            let source = &prepared.project().modules[0].source;
+            for (project, emitted) in [
+                (false, emit_scalar_build_single_module_llvm(&checked)),
+                (true, emit_scalar_build_project_llvm(&checked)),
+            ] {
+                if !closed {
+                    assert!(matches!(emitted, Err(error) if error.contains("widened array return requires a closed exact owning receiver")));
+                    continue;
+                }
+                let llvm = emitted.unwrap().to_text();
+                let producer = self_tail_test_symbol(source, project, "fabricate");
+                let body = llvm.split_once(&format!("define internal {{ ptr, i64 }} @{producer}()"))
+                    .unwrap_or_else(|| panic!("missing sealed array factory: {llvm}")).1.split_once("\n}").unwrap().0;
+                assert_eq!(body.matches("call ptr @__wosy_core_alloc(").count(), 1, "{body}");
+                assert!(!body.contains("call void @__wosy_core_free("), "{body}");
+                assert!(body.contains("insertvalue { ptr, i64 } undef, ptr %allocation, 0")
+                    && body.contains("insertvalue { ptr, i64 } %array_return_backing, i64 3, 1")
+                    && body.contains("ret { ptr, i64 } %array_return_extent"), "{body}");
+                let caller = self_tail_test_body(&llvm, "i64", &self_tail_test_symbol(source, project, "replace"));
+                assert_eq!(caller.matches(&format!("call {{ ptr, i64 }} @{producer}()")).count(), 1, "{caller}");
+                assert_eq!(caller.matches("call void @__wosy_core_free(").count(), 2, "{caller}");
+                assert!(caller.contains("store ptr %array_descriptor_backing, ptr %bytes_backing")
+                    && caller.contains("store i64 %array_descriptor_extent, ptr %bytes_length")
+                    && caller.contains("call void @__wosy_core_free(ptr %array_descriptor_backing)")
+                    && caller.contains("ret i64 %runtime_extent"), "{caller}");
+                if let Some(out) = std::env::var_os("WOSY_WIDENED_RETURN_IR_DIR") {
+                    let target = if layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
+                    let route = if project { "project" } else { "standalone" };
+                    let controlled = llvm.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);
+                    assert_ne!(controlled, llvm);
+                    std::fs::write(std::path::PathBuf::from(out).join(format!("{target}-{route}-control.ll")), controlled).unwrap();
+                }
+            }
+        }
+    }
+}

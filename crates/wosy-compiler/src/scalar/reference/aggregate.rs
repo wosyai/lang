@@ -11,6 +11,7 @@ pub(super) struct AggregateFlowFacts {
     pub(super) allocations: BTreeMap<ReferenceBindingId, CfgPointId>,
     pub(super) allocation_slots: BTreeMap<CfgPointId, (usize, usize)>,
     pub(super) literal_array_bind: Option<LiteralArrayBind>,
+    pub(super) widened_literal_factory: bool,
     pub(super) literal_array_write: Option<LiteralArrayWrite>,
     pub(super) literal_array_writer: Option<BlockOrdinal>,
     pub(super) literal_array_other_writer: Option<BlockOrdinal>,
@@ -890,6 +891,11 @@ pub(super) fn neutral_array_signature(parameters: &[ScalarType], outputs: &Scala
         && parameters[1..].iter().all(array_neutral_scalar)
 }
 
+pub(super) fn pure_widened_element(value: &ScalarExpression) -> bool {
+    matches!(value, ScalarExpression::Integer { .. } | ScalarExpression::Float { .. }
+        | ScalarExpression::Boolean { .. } | ScalarExpression::Char { .. })
+}
+
 fn neutral_scalar_evaluation(value: &ScalarExpression) -> bool {
     matches!(value, ScalarExpression::Boolean { .. } | ScalarExpression::Char { .. }
         | ScalarExpression::Integer { .. } | ScalarExpression::Float { .. }
@@ -1255,6 +1261,7 @@ pub(super) struct AggregateFlowResult {
     pub(super) checked_producer_authoritative: bool,
     pub(super) array_invalid: bool,
     pub(super) array_neutral: bool,
+    pub(super) widened_literal_factory: Option<(ByteSpan, OccurrenceOrdinal)>,
     pub(super) widened_join_arms: BTreeMap<usize, ByteSpan>,
     pub(super) widened_join_receivers: BTreeSet<(u32, u32)>,
     pub(super) widened_rebinds: BTreeMap<usize, ClosedWidenedRebind>,
@@ -1495,7 +1502,7 @@ impl AggregateFlowResult {
     }
 
     pub(super) fn has_observations(&self) -> bool {
-        !self.widened_join_receivers.is_empty() || !self.widened_rebinds.is_empty() || self.borrowed_extent_observer.is_some() || self.borrowed_extent_call.is_some() || self.borrowed_extent_forward.is_some()
+        self.widened_literal_factory.is_some() || !self.widened_join_receivers.is_empty() || !self.widened_rebinds.is_empty() || self.borrowed_extent_observer.is_some() || self.borrowed_extent_call.is_some() || self.borrowed_extent_forward.is_some()
             || self.array_formal_extent_required || self.literal_array_index_required.is_some() || self.literal_array_extent_required.is_some() || self.proved_literal_array_route_ref().is_some()
             || (self.checked_producer_authoritative && !self.checked_producer_backing.is_empty())
             || self.checked_backing_assignment.is_some() || self.checked_backing_forward.is_some()
@@ -1649,6 +1656,8 @@ impl AggregateFlowFacts {
             match (state.literal_array_phase, &point.kind) {
                 (BeforeBind, CfgPointKind::Entry | CfgPointKind::ScopeEnter) => BeforeBind,
                 (BeforeBind, CfgPointKind::Evaluate(_)) if point.id == allocation.placeholder => BeforeBind,
+                (BeforeBind, CfgPointKind::Evaluate(value))
+                    if self.widened_literal_factory && pure_widened_element(value) => BeforeBind,
                 (BeforeBind, CfgPointKind::Bind { binding: actual })
                     if point.id == allocation.bind && actual == binding => Original,
                 (Original, CfgPointKind::Read { .. }) if root && unit.is_some_and(|unit|
@@ -6619,6 +6628,7 @@ fn closed_aggregates<'a>(
     let mut input_users = BTreeMap::<(BodyKey, usize), Vec<(BodyKey, CfgPointId, usize, ArgumentProvenance, &BTreeSet<Option<InputOrigin>>) >>::new();
     let mut array_callsites = Vec::new();
     let mut literal_array_callers = Vec::new();
+    let mut widened_return_requirements = Vec::new();
     let mut returned_extent_requirements = Vec::new();
     let mut formal_extent_requirements = Vec::new();
     let mut borrowed_extent_requirements = Vec::new();
@@ -6631,6 +6641,9 @@ fn closed_aggregates<'a>(
         if let Some(facts) = body.facts {
             // Borrow only completed caller proofs during this existing pass.
             // BTreeMap order preserves enrollment precedence at finalization.
+            if let Some((_, output)) = facts.widened_literal_factory {
+                widened_return_requirements.push((key, body.source, output));
+            }
             if let Some(index) = facts.literal_array_index_required {
                 returned_index_requirements.push((key, body, index));
             }
@@ -6964,6 +6977,14 @@ fn closed_aggregates<'a>(
             plan.replacement_index_observation = Some(index.output.0);
         }
         ordinary.seal_array_descriptors(&mut result);
+        for &(key, source, output) in &widened_return_requirements {
+            if !result.bodies.get(&key).is_some_and(|plan| plan.array_descriptor_return
+                && matches!(plan.literal_array, Some(ClosedLiteralArray::FreshLeaf { output: actual, .. })
+                    if actual == output.0))
+            {
+                return Err(format!("widened array return requires a closed exact owning receiver in {source:?}"));
+            }
+        }
         for &(key, body, _) in &returned_index_requirements {
             let source = body.source;
             if !result.bodies.get(&key).is_some_and(|plan|

@@ -613,8 +613,15 @@ pub(super) fn enroll_literal_array_allocation<'ctx>(
         FreshArrayExtent::Literal(elements) => length.get_zero_extended_constant() == Some(elements),
         FreshArrayExtent::Formal => length == literal_array_u64_formal(&state.builder)?,
     };
-    let actual_extent = binding.receivers.first().and_then(|receiver| receiver.allocation_length.as_ref())
-        .and_then(|expression| state.body_call_nodes.and_then(|nodes| nodes.expression_ordinal(expression)));
+    let origin = if matches!(plan, ClosedLiteralArray::FreshLeaf { .. })
+        && crate::scalar::widened_local_literal(binding).is_some()
+    {
+        Some(&binding.value)
+    } else {
+        binding.receivers.first().and_then(|receiver| receiver.allocation_length.as_ref())
+    };
+    let actual_extent = origin.and_then(|expression|
+        state.body_call_nodes.and_then(|nodes| nodes.expression_ordinal(expression)));
     if state.body_call_nodes.and_then(|nodes| nodes.binding_position(binding)) != Some(receipt.allocation)
         || actual_extent != Some(occurrence)
         || !extent_matches

@@ -3749,6 +3749,12 @@ impl<'a> ReferenceFlowBuilder<'a> {
         }
     }
 
+    fn pure_widened_literal_count(binding: &ScalarBinding) -> Option<u64> {
+        let (_, elements, _) = super::widened_local_literal(binding)?;
+        elements.iter().all(aggregate::pure_widened_element)
+            .then(|| u64::try_from(elements.len()).ok()).flatten()
+    }
+
     // Match only a binding whose conditional transfers a freshly created
     // arm-local owner on each edge. No enclosing owners are merged.
     fn widened_join_inputs(
@@ -3773,12 +3779,8 @@ impl<'a> ReferenceFlowBuilder<'a> {
             if block.unsafe_context || &local_receiver.name != name || self.names.contains_key(name)
                 || !aggregate::same_runtime_array_type(&local_receiver.ty, &receiver.ty)
             { return None; }
-            let (_, elements, _) = super::widened_local_literal(local)?;
-            // The arm contains no second path or effect on an enclosing owner.
-            if !elements.iter().all(|element| matches!(element,
-                ScalarExpression::Integer { .. } | ScalarExpression::Float { .. }
-                    | ScalarExpression::Boolean { .. } | ScalarExpression::Char { .. }))
-            { return None; }
+            // The arm has no effect on an enclosing owner.
+            Self::pure_widened_literal_count(local)?;
             let [_, BlockItem { kind: BlockItemKind::FinalOutput(output), .. }] =
                 self.call_sites.structure.blocks[ordinal.0].items.as_slice() else { return None };
             (output.output == 0).then_some((output.expression.0, local_receiver.name_span))
@@ -4972,7 +4974,33 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             BTreeSet::new(),
                         );
                     }
-                    self.record_binding_definition(position, 0, binding.is_allocation, initializer);
+                    let widened_factory = (|| {
+                        if scope != ReferenceScopeId(0) || !self.generic_parameters.is_empty()
+                            || item_index != 0 || !calls.boundary.parameters.is_empty()
+                            || !outputs.secondary.is_empty() || block.unsafe_context
+                            || !matches!(&calls.named_place_roots, NamedPlaceRootFacts::Prepared(_))
+                        { return None; }
+                        let [RootOutputType { output: 0, ty }] = calls.boundary.root_outputs.as_slice()
+                        else { return None };
+                        let [_, BlockItem { kind: BlockItemKind::FinalOutput(output), .. }] =
+                            region.items.as_slice() else { return None };
+                        let [_, ScalarBlockItem::Expression(ScalarExpression::Name { name, .. })] =
+                            block.items.as_slice() else { return None };
+                        if output.output != 0 || *name != receiver.name
+                            || !aggregate::same_runtime_array_type(&receiver.ty, ty)
+                        { return None; }
+                        Some((output.expression, Self::pure_widened_literal_count(binding)?, initializer?))
+                    })();
+                    self.record_binding_definition(position, 0, binding.is_allocation || widened_factory.is_some(), initializer);
+                    if let Some((output, count, placeholder)) = widened_factory {
+                        let bind = self.cursor.expect("widened array definition");
+                        self.aggregate_facts.literal_array_bind = Some(aggregate::LiteralArrayBind {
+                            bind, placeholder, position, length_occurrence: primary_ordinal,
+                            extent: aggregate::FreshArrayExtent::Literal(count),
+                        });
+                        self.aggregate_facts.widened_literal_factory = true;
+                        self.aggregate_result.widened_literal_factory = Some((receiver.span, output));
+                    }
                     // The existing birth observer is selected while still at
                     // the allocation, before the write or final result is visited.
                     // Use the prepared final-output role to opt in only the new
@@ -5053,7 +5081,15 @@ impl<'a> ReferenceFlowBuilder<'a> {
                                     if source.block_span == block.span
                                         && source.declaration_span == *declaration
                                         && self.widened_arrays.as_ref().is_some_and(|owners| owners.contains(source)))));
-                    self.move_value_with_widened_receipt(expression, scope, ordinal, widened_arm)?;
+                    let widened_factory = self.aggregate_result.widened_literal_factory
+                        .is_some_and(|(declaration, output)| output == ordinal
+                            && matches!(expression, ScalarExpression::Name { span, .. }
+                                if matches!(self.prepared_name_identity(ordinal, *span),
+                                    Ok(Some(PlainNameIdentity::Lexical(source)))
+                                        if source.block_span == block.span
+                                            && source.declaration_span == declaration
+                                            && self.widened_arrays.as_ref().is_some_and(|owners| owners.contains(source)))));
+                    self.move_value_with_widened_receipt(expression, scope, ordinal, widened_arm || widened_factory)?;
                     if let BlockItemKind::FinalOutput(slot) = kind {
                         if scope == ReferenceScopeId(0) && slot.output == 0 && region.items.len() == 1
                             && matches!(calls.boundary.root_outputs.as_slice(), [output] if output.ty == ScalarType::U64)
