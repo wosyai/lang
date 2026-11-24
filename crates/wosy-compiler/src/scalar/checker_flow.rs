@@ -3061,6 +3061,8 @@ pub(super) enum ActualCallResult {
     ProjectedUnit(Rc<IntegerSet>),
     ProjectedUnitPair(ProjectedUnitPair),
     Integer(BigInt),
+    #[cfg(feature = "internal-checker")]
+    EmptyInteger,
     PartitionedInteger(Vec<IntegerReturnPartition>),
     PartitionedIntegerPair(ProjectedIntegerPair),
 }
@@ -5440,6 +5442,8 @@ pub(super) struct ExactCallCursor<'a> {
     roots: IntegerRoots<'a>,
     block: IntegerBlockCursor,
     tail: Option<&'a ScalarType>,
+    #[cfg(feature = "internal-checker")]
+    allow_empty_integer: bool,
     discarded_return: Option<bool>,
     returned: Vec<IntegerReturningPath<'a>>,
     computed_returns: Vec<(usize, ComputedIntegerReturn)>,
@@ -5449,6 +5453,12 @@ pub(super) struct ExactCallCursor<'a> {
 }
 
 impl<'a> ExactCallCursor<'a> {
+    #[cfg(feature = "internal-checker")]
+    pub(super) fn allow_empty_integer(&mut self) {
+        debug_assert!(self.projected_slot.is_none() && self.projected_pair.is_none());
+        self.allow_empty_integer = self.tail.is_some_and(is_integer_type);
+    }
+
     pub(super) fn new(calls: &'a FunctionCallSites, exact: &[&BigInt], expected: &ScalarType) -> Option<Self> {
         Self::with_row(calls, expected, exact_integer_entry_row(exact), None)
     }
@@ -5562,7 +5572,10 @@ impl<'a> ExactCallCursor<'a> {
             roots.add(binding, &parameter.ty);
         }
         let block = IntegerBlockCursor::new(calls.structure.root, roots.axes.len(), rows);
-        Some(Self { roots, block, tail, discarded_return: None, returned: Vec::new(), computed_returns: Vec::new(), return_capture_work: 0, projected_slot, projected_pair })
+        Some(Self { roots, block, tail,
+            #[cfg(feature = "internal-checker")]
+            allow_empty_integer: false,
+            discarded_return: None, returned: Vec::new(), computed_returns: Vec::new(), return_capture_work: 0, projected_slot, projected_pair })
     }
 
     pub(super) fn arguments<'borrow>(
@@ -5640,6 +5653,9 @@ impl<'a> ExactCallCursor<'a> {
         match (effect, result) {
             (ExactCallEffect::Unit(_), ActualCallResult::Unit) => {}
             (ExactCallEffect::Unit(_), ActualCallResult::EmptyUnit) => self.block.path = IntegerInputs::default(),
+            #[cfg(feature = "internal-checker")]
+            (ExactCallEffect::Scalar { binding: Some(_), ty, .. }, ActualCallResult::EmptyInteger) if is_integer_type(ty) =>
+                self.block.path = IntegerInputs::default(),
             (ExactCallEffect::Scalar { binding, ty, .. }, ActualCallResult::Integer(value)) => {
                 if let Some(binding) = binding {
                     self.roots.add(binding, ty);
@@ -5958,6 +5974,9 @@ impl<'a> ExactCallCursor<'a> {
                 let [path] = self.returned.as_slice() else { return None; };
                 ActualCallResult::Integer(path.singleton_return()?.clone())
             }
+            #[cfg(feature = "internal-checker")]
+            (Some(_), IntegerControl::Continue(path)) if COLLECT && self.allow_empty_integer && path.is_unreachable() =>
+                ActualCallResult::EmptyInteger,
             (Some(_), IntegerControl::Continue(_)) => return None,
         };
         Some(ExactCallProgress::Done { active: self.roots.reached_obligation, result })

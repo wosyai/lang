@@ -6226,6 +6226,10 @@ pub(super) struct OccurrenceStructure {
     pub(super) checker_directives: HashMap<OccurrenceOrdinal, super::checker_directive::PreparedCheckerDirective>,
     #[cfg(feature = "internal-checker")]
     pub(super) checker_has_nonexact_require: bool,
+    #[cfg(feature = "internal-checker")]
+    pub(super) checker_has_simple_narrow: bool,
+    #[cfg(feature = "internal-checker")]
+    pub(super) checker_has_nonsimple_directive: bool,
     #[cfg(any(test, feature = "internal-checker"))]
     pub(super) checker_branches: HashMap<OccurrenceOrdinal, super::checker_flow::CheckerPredicate>,
     #[cfg(any(test, feature = "internal-checker"))]
@@ -6307,6 +6311,10 @@ impl OccurrenceStructure {
             checker_directives: HashMap::new(),
             #[cfg(feature = "internal-checker")]
             checker_has_nonexact_require: false,
+            #[cfg(feature = "internal-checker")]
+            checker_has_simple_narrow: false,
+            #[cfg(feature = "internal-checker")]
+            checker_has_nonsimple_directive: false,
             #[cfg(any(test, feature = "internal-checker"))]
             checker_branches: HashMap::new(),
             #[cfg(any(test, feature = "internal-checker"))]
@@ -7388,8 +7396,10 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
                         self.structure.checker_ordinary_integer_comparisons.insert(ordinal, comparison);
                     }
                 }
-                self.structure.checker_has_nonexact_require |= marker.operation != CheckerOperation::Require
-                    || !matches!(predicate, Some(CheckerPredicate::Boolean(_) | CheckerPredicate::Integer(_)));
+                let simple = matches!(predicate, Some(CheckerPredicate::Boolean(_) | CheckerPredicate::Integer(_)));
+                self.structure.checker_has_simple_narrow |= marker.operation == CheckerOperation::Narrow && simple;
+                self.structure.checker_has_nonsimple_directive |= !simple;
+                self.structure.checker_has_nonexact_require |= marker.operation != CheckerOperation::Require || !simple;
             }
             let call_signature = self.occurrence_typing.take_call(condition);
             #[cfg(feature = "internal-checker")]

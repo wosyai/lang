@@ -875,6 +875,26 @@ def state_report(code, label, selected, extra=""):
     return ('{ .stdout = ""; .stderr = "'+label+'"; .code = '+str(code)
             +'; .files = [{ .path = "state.json"; .state = '+selected+'; }'+extra+']; }')
 
+scalar_narrow = f"""%%start
+    i8(i8) restrict = fn(entry) {{
+        core.narrow(entry >= 2, {state_report(185,"NARROW-PRESTATE","entry")});
+        entry
+    }};
+    i8(i8) forward = fn(entry) {{
+        i8 result = restrict(entry);
+        core.require(result > 127, {state_report(186,"AFTER-RETURN","result")});
+        result
+    }};
+    i8 saved = forward(1);
+    core.require(saved > 127, {report(187,"AFTER-INIT")});
+    %%end"""
+scalar_narrow_direct = scalar_narrow[0:scalar_narrow.index("    i8(i8) forward")] + scalar_narrow[
+    scalar_narrow.index("    i8 saved"):].replace("forward(1)","restrict(1)")
+cases.extend([
+    ("exact-startup-scalar-narrow-leaf-empties-init",scalar_narrow_direct,185,b"NARROW-PRESTATE"),
+    ("exact-startup-scalar-narrow-prunes-return-chain",scalar_narrow,185,b"NARROW-PRESTATE"),
+    ("exact-startup-scalar-narrow-surviving-return",scalar_narrow.replace("forward(1)","forward(3)"),186,b"AFTER-RETURNAFTER-INIT"),
+])
 ranked_return = f"""%%start
     u8(u8) descend = fn(value) {{
         if (value > 0) {{
@@ -1066,6 +1086,15 @@ cases.extend([
 ])
 holes_bytes = b'{"type":{"kind":"i8"},"value":{"kind":"alternatives","values":[1,3]}}\n'
 authored_files = {
+    "exact-startup-scalar-narrow-leaf-empties-init": {
+        "state.json": b'{"type":{"kind":"i8"},"value":1}\n',
+    },
+    "exact-startup-scalar-narrow-prunes-return-chain": {
+        "state.json": b'{"type":{"kind":"i8"},"value":1}\n',
+    },
+    "exact-startup-scalar-narrow-surviving-return": {
+        "state.json": b'{"type":{"kind":"i8"},"value":3}\n',
+    },
     "exact-startup-ranked-integer-return": {
         "state.json": b'{"type":{"kind":"u8"},"value":7}\n',
     },

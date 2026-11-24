@@ -443,6 +443,7 @@ impl ActualIntegerObserver for ProofFreeOrderedEvidence {
     const PROOF_FREE_CONTEXTUAL_LOCAL_TRANSFERS: bool = true;
     const EXACT_SELF_REENTRY: bool = true;
     const EXACT_INTEGER_CALL_CONTINUATIONS: bool = true;
+    const EXACT_INTEGER_NARROW_CONTINUATIONS: bool = true;
     const ORDINARY_INTEGER_LOCALS: bool = true;
 
     fn observe(&mut self, _: (usize, usize), _: &[&BigInt], _: &BigInt) {}
@@ -1091,16 +1092,18 @@ fn walk_package_initialization<const COLLECT: bool, const PRIVATE_NESTED_SCALAR:
                         }));
                         #[cfg(not(feature = "internal-checker"))]
                         let collection = None;
-                        let ActualCallResult::Integer(value) = run_initializer_call(
+                        match run_initializer_call(
                             topology, actual, outputs.primary, ty,
                             |argument, argument_type| initialized_integer_argument(topology, &storage, argument, argument_type),
                             collection,
                             #[cfg(feature = "internal-checker")]
                             proof_site,
-                        )? else {
-                            return Err(ProjectCheck::Unsupported);
-                        };
-                        Cow::Owned(value)
+                        )? {
+                            ActualCallResult::Integer(value) => Cow::Owned(value),
+                            #[cfg(feature = "internal-checker")]
+                            ActualCallResult::EmptyInteger if COLLECT => return Ok(StartupLane::Empty),
+                            _ => return Err(ProjectCheck::Unsupported),
+                        }
                     } else {
                         return Err(ProjectCheck::Unsupported);
                     };
@@ -1350,6 +1353,8 @@ trait ActualIntegerObserver {
     const PROOF_FREE_CONTEXTUAL_LOCAL_TRANSFERS: bool = false;
     const EXACT_SELF_REENTRY: bool = false;
     const EXACT_INTEGER_CALL_CONTINUATIONS: bool = false;
+    #[cfg(feature = "internal-checker")]
+    const EXACT_INTEGER_NARROW_CONTINUATIONS: bool = false;
     const INTEGER_RETURN_PARTITIONS: bool = false;
     const PROJECTED_FORMAL_WRITES: bool = false;
     const ORDINARY_PROJECTED_PAIR: bool = false;
@@ -1565,6 +1570,25 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                 || (collecting && Observer::EXACT_INTEGER_CALL_CONTINUATIONS && is_integer_type(expected)))
     }
 
+    fn exact_integer_narrow_profile(&self, collecting: bool) -> bool {
+        #[cfg(feature = "internal-checker")]
+        { ACTUAL_STARTUP && collecting && Observer::EXACT_INTEGER_CALL_CONTINUATIONS
+            && Observer::EXACT_INTEGER_NARROW_CONTINUATIONS }
+        #[cfg(not(feature = "internal-checker"))]
+        { let _ = collecting; false }
+    }
+
+    fn exact_integer_narrow_shape(&self, body: &FunctionCallSites, expected: &ScalarType, collecting: bool) -> bool {
+        #[cfg(feature = "internal-checker")]
+        {
+            self.exact_integer_narrow_profile(collecting) && is_integer_type(expected)
+                && body.structure.checker_has_simple_narrow && !body.structure.checker_has_nonsimple_directive
+                && body.allocation_length_calls.is_empty() && body.assignments.is_empty()
+        }
+        #[cfg(not(feature = "internal-checker"))]
+        { let _ = (body, expected, collecting); false }
+    }
+
     fn exact_self_entry<'entry>(&self, exact: Option<&[&'entry BigInt]>) -> Option<&'entry BigInt> {
         if ACTUAL_STARTUP && Observer::EXACT_SELF_REENTRY {
             if let Some([value]) = exact {
@@ -1602,7 +1626,10 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
         &mut self, body: &'project FunctionCallSites, source: &'project SourceIdentity,
         exact: &[&BigInt], expected: &ScalarType, collection: Option<OrderedCallCollection<'_, '_>>,
     ) -> Result<ActualCallResult, ProjectCheck> {
-        let cursor = ExactCallCursor::new(body, exact, expected).ok_or(ProjectCheck::Unsupported)?;
+        #[allow(unused_mut)]
+        let mut cursor = ExactCallCursor::new(body, exact, expected).ok_or(ProjectCheck::Unsupported)?;
+        #[cfg(feature = "internal-checker")]
+        if self.exact_integer_narrow_profile(collection.is_some()) { cursor.allow_empty_integer(); }
         self.run_call_cursor(body, source, cursor, self.exact_self_entry(Some(exact)).cloned(), collection)
     }
 
@@ -1728,7 +1755,8 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
         }
         if !matches!(signature.outputs.outputs.as_slice(), [output] if &output.ty == expected)
             || (*expected != ScalarType::Unit && (!Observer::EXACT_INTEGER_CALL_CONTINUATIONS
-                || !supported_integer_continuation_shape_for(body, expected, Observer::ORDINARY_INTEGER_LOCALS)))
+                || !(supported_integer_continuation_shape_for(body, expected, Observer::ORDINARY_INTEGER_LOCALS)
+                    || self.exact_integer_narrow_shape(body, expected, collection.is_some()))))
         {
             return Err(ProjectCheck::Unsupported);
         }
@@ -1804,7 +1832,10 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
         ) {
             return Err(ProjectCheck::Unsupported);
         }
-        let cursor = ExactCallCursor::new(body, exact, expected).ok_or(ProjectCheck::Unsupported)?;
+        #[allow(unused_mut)]
+        let mut cursor = ExactCallCursor::new(body, exact, expected).ok_or(ProjectCheck::Unsupported)?;
+        #[cfg(feature = "internal-checker")]
+        if self.exact_integer_narrow_profile(collection.is_some()) { cursor.allow_empty_integer(); }
         if first_activation {
             self.active.insert(target);
         } else {
@@ -1933,7 +1964,7 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                     ActualCallResult::Unit
                 })
             }
-        } else if ACTUAL_STARTUP && Observer::EXACT_INTEGER_CALL_CONTINUATIONS && collection.is_some()
+        } else if (ACTUAL_STARTUP && Observer::EXACT_INTEGER_CALL_CONTINUATIONS && collection.is_some()
             && (!body.call_occurrences.is_empty() || {
                 #[cfg(feature = "internal-checker")]
                 { Observer::ORDINARY_INTEGER_LOCALS && body.structure.has_ordinary_integer_operations() }
@@ -1941,7 +1972,8 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                 { false }
             })
             && supported_integer_continuation_shape_for(body, expected, Observer::ORDINARY_INTEGER_LOCALS)
-            && body.assignments.is_empty()
+            && body.assignments.is_empty())
+            || self.exact_integer_narrow_shape(body, expected, collection.is_some())
         {
             self.run_exact_calls(body, &owner.source, exact, expected, collection)
         } else if is_integer_type(expected)
@@ -14606,6 +14638,45 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
                 first(2);
             %%end"#);
             assert!(matches!(run("mutual-cycle", &mutual, scope), Err(ProjectCheck::Unsupported)));
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn exact_scalar_narrow_runs_only_real_surviving_return_continuations() {
+        let narrow = OUTPUT.replace(".code = 1", ".code = 81");
+        let after = OUTPUT.replace(".code = 1", ".code = 82");
+        let startup_after = OUTPUT.replace(".code = 1", ".code = 83");
+        for scope in [ScalarCheckerScope::MainFlowOnly, ScalarCheckerScope::CurrentPackage] {
+            for input in [1i16, 3] {
+                let text = format!(r#"%%start
+                    i8(i8) restrict = fn(entry) {{
+                        core.narrow(entry >= 2, {narrow});
+                        entry
+                    }};
+                    i8(i8) forward = fn(entry) {{
+                        i8 result = restrict(entry);
+                        core.require(result > 127, {after});
+                        result
+                    }};
+                    i8 saved = forward({input});
+                    core.require(saved > 127, {startup_after});
+                %%end"#);
+                let root = source("src/main.w", &format!("exact-scalar-narrow-{input}"));
+                let prepared = prepare_proof_target(&root, &text).unwrap();
+                let receipt = run_closed_without_named_proofs(&prepared, scope, 1).unwrap();
+                if input == 1 {
+                    let [failure] = receipt.directives.as_slice() else { panic!("only the failed narrow may produce output"); };
+                    assert_eq!(failure.code(), &BigInt::from(81));
+                    let one = BigInt::from(1);
+                    assert!(failure.witness.intervals_at(0, 0).unwrap().eq([(&one, &one)]));
+                } else {
+                    assert!(receipt.directives.iter().map(|failure| failure.code().clone())
+                        .eq([82, 83].map(BigInt::from)));
+                    let three = BigInt::from(3);
+                    assert!(receipt.directives[0].witness.intervals_at(0, 1).unwrap().eq([(&three, &three)]));
+                }
+            }
         }
     }
 
