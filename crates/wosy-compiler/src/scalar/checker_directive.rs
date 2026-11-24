@@ -84,7 +84,7 @@ impl CheckerScalarTransform {
     fn select(expression: &ScalarExpression) -> (&ScalarExpression, Self) {
         #[cfg(feature = "internal-checker")]
         if let ScalarExpression::Unary { operator, operand, .. } = expression {
-            if matches!(operand.as_ref(), ScalarExpression::Name { .. } | ScalarExpression::Contextual { .. }) {
+            if matches!(operand.as_ref(), ScalarExpression::Name { .. } | ScalarExpression::Contextual { .. } | ScalarExpression::Member { .. }) {
                 let transform = match operator {
                     super::UnaryOperator::LogicalNot => Self::LogicalNot,
                     super::UnaryOperator::Negate => Self::Negate,
@@ -135,6 +135,10 @@ pub(super) enum CheckerStateSelection {
     Binding(ReferenceBindingId),
     #[cfg(feature = "internal-checker")]
     Aggregate(std::rc::Rc<CheckerSnapshotShape>),
+    #[cfg(feature = "internal-checker")]
+    LexicalField { receiver: std::rc::Rc<str>, owner: std::rc::Rc<super::ScalarStructId>, field: usize },
+    #[cfg(feature = "internal-checker")]
+    AggregateLeaf { shape: std::rc::Rc<CheckerSnapshotShape>, leaf: usize },
     #[cfg(feature = "internal-checker")]
     Module(ByteSpan),
 }

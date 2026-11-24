@@ -2916,6 +2916,11 @@ fn render_authored_output(
                     let origin = match selection {
                         CheckerStateSelection::Binding(binding) => AuthoredScalarOrigin::Binding(binding),
                         CheckerStateSelection::Module(span) => AuthoredScalarOrigin::Module(*span),
+                        CheckerStateSelection::AggregateLeaf { shape, leaf } => {
+                            let capture = shape.leaves.get(*leaf)?;
+                            if capture.ty != *file_ty { return None; }
+                            AuthoredScalarOrigin::Binding(&capture.capture)
+                        }
                         _ => return None,
                     };
                     let (ty, bytes) = match encoded.entry((origin, file.transform)) {
@@ -10518,6 +10523,38 @@ mod tests {
         assert_eq!(failure.witness.axes().len(), 1);
         let nine = BigInt::from(9);
         assert!(failure.witness.intervals_at(0, 0).unwrap().eq([(&nine, &nine)]));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn authored_nominal_field_state_omits_siblings_and_aggregate_identity() {
+        let app = source("src/main.w", "authored-field-state");
+        let text = r#"%%start
+            struct copy Snapshot { i8 saved; bool ready; i8 omitted; }
+            unit(i8) check = fn(value) {
+                core.narrow(value == 1 || value == 3, { .stdout = ""; .stderr = ""; .code = 1; .files = []; });
+                Snapshot original = { .omitted = 44; .ready = true; .saved = value; };
+                Snapshot copied = original;
+                value = 7;
+                core.require(value != 7, { .stdout = ""; .stderr = ""; .code = 57; .files = [
+                    { .path = "saved.json"; .state = copied.saved; },
+                    { .path = "inverted.json"; .state = !copied.ready; },
+                    { .path = "same.json"; .state = copied.saved; }
+                ]; });
+            };
+        %%end"#;
+        let prepared = prepare_proof_target(&app, text).unwrap();
+        let receipt = run_closed_without_named_proofs(&prepared, ScalarCheckerScope::CurrentPackage, 1).unwrap();
+        let [failure] = receipt.directives.as_slice() else { panic!("one field projection witness"); };
+        assert_eq!(failure.witness.axes().len(), 1);
+        assert!(failure.witness.equal_axes().is_empty());
+        let [saved, inverted, same] = failure.files() else { panic!("only the authored scalar projections"); };
+        assert_eq!(saved.text.as_ref(),
+            b"{\"type\":{\"kind\":\"i8\"},\"value\":{\"kind\":\"alternatives\",\"values\":[1,3]}}\n");
+        assert_eq!(inverted.text.as_ref(), b"{\"type\":{\"kind\":\"bool\"},\"value\":false}\n");
+        assert_eq!(same.text, saved.text);
+        assert!(matches!(prepare_proof_target(&app, &text.replace("copied.saved", "copied.unknown")),
+            Err(ProjectCheck::Invalid(_))));
     }
 
     #[cfg(feature = "internal-checker")]

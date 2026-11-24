@@ -342,7 +342,13 @@ impl<'a> ScalarInferenceBuilder<'a> {
         if !self.suppress_checked_occurrences {
             #[cfg(feature = "internal-checker")]
             for file in marker.output.state_files.iter_mut() {
-                if let super::checker_directive::CheckerStateType::Nominal(id) = &mut file.ty {
+                use super::checker_directive::{CheckerStateSelection, CheckerStateType};
+                let nominal = match (&mut file.ty, &mut file.selection) {
+                    (CheckerStateType::Nominal(id), _) => Some(id),
+                    (_, CheckerStateSelection::LexicalField { owner, .. }) => Some(owner),
+                    _ => None,
+                };
+                if let Some(id) = nominal {
                     if let Some(shared) = self.occurrences.snapshot_types.get(id.as_ref()) {
                         if !std::rc::Rc::ptr_eq(id, shared) { *id = shared.clone(); }
                     } else {

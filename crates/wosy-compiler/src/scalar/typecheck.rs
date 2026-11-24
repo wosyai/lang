@@ -21,6 +21,11 @@ impl ScalarProgramTyping<'_> {
     }
 }
 
+#[cfg(feature = "internal-checker")]
+type AuthoredFieldIndex = std::rc::Rc<std::cell::OnceCell<
+    BTreeMap<std::rc::Rc<ScalarStructId>, (usize, usize)>,
+>>;
+
 pub(super) struct ScalarModuleTyping<'a> {
     pub source: &'a SourceIdentity,
     pub members: &'a BTreeMap<String, ScalarType>,
@@ -28,11 +33,15 @@ pub(super) struct ScalarModuleTyping<'a> {
     pub structs: &'a [ScalarStruct],
     pub enums: &'a [ScalarEnum],
     pub target_layout: ScalarTargetLayout,
+    #[cfg(feature = "internal-checker")]
+    pub authored_field_index: AuthoredFieldIndex,
 }
 
 pub(super) fn split_module_typing(
     modules: &mut [ScalarModule],
 ) -> (Vec<ScalarModuleTyping<'_>>, Vec<&mut [ScalarItem]>) {
+    #[cfg(feature = "internal-checker")]
+    let authored_field_index = AuthoredFieldIndex::default();
     modules
         .iter_mut()
         .map(|module| {
@@ -44,6 +53,8 @@ pub(super) fn split_module_typing(
                     structs: &module.structs,
                     enums: &module.enums,
                     target_layout: module.target_layout,
+                    #[cfg(feature = "internal-checker")]
+                    authored_field_index: authored_field_index.clone(),
                 },
                 module.items.as_mut_slice(),
             )
@@ -3348,15 +3359,29 @@ fn check_expression_type_in_module(
             #[cfg(feature = "internal-checker")]
             let configured_output = directive.output.explicit_with_state(|expression| {
                 use super::checker_directive::{CheckerStateSelection, CheckerStateType};
+                if let ScalarExpression::Member { receiver, name, enum_tag: None, .. } = expression {
+                    let ScalarType::Struct(owner) = scope.get(receiver)? else { return None; };
+                    let (owner, field) = checked_authored_snapshot_field(owner, name, modules)?;
+                    let ty = &field.ty;
+                    if *ty != ScalarType::Bool && !is_integer_type(ty) { return None; }
+                    let selection = CheckerStateSelection::LexicalField {
+                        receiver: receiver.as_str().into(), owner, field: field.id.index,
+                    };
+                    return Some((selection, CheckerStateType::Scalar(ty.clone())));
+                }
+                if !matches!(expression, ScalarExpression::Name { .. } | ScalarExpression::Contextual { .. })
+                {
+                    return None;
+                }
+                let ty = expression_type_in_module_expected(
+                    expression, None, scope, visible_names, folded_names, module, modules, diagnostics,
+                    unsafe_context, overloads, inference,
+                );
                 let selection = match expression {
                     ScalarExpression::Name { name, .. } => CheckerStateSelection::Lexical(name.as_str().into()),
                     ScalarExpression::Contextual { binding, .. } => CheckerStateSelection::Binding(binding.clone()),
                     _ => return None,
                 };
-                let ty = expression_type_in_module_expected(
-                    expression, None, scope, visible_names, folded_names, module, modules, diagnostics,
-                    unsafe_context, overloads, inference,
-                );
                 match ty {
                     ScalarType::Struct(id) if matches!(&selection, CheckerStateSelection::Lexical(_)) =>
                         Some((selection, CheckerStateType::Nominal(inference.shared_snapshot_type(id)))),
@@ -4339,6 +4364,8 @@ pub(super) fn typecheck_proof_where(
     let members = BTreeMap::new();
     let module = ScalarModuleTyping {
         source, members: &members, namespace_bindings: &[], structs: &[], enums: &[], target_layout,
+        #[cfg(feature = "internal-checker")]
+        authored_field_index: Default::default(),
     };
     let scope = inputs.collect::<BTreeMap<_, _>>();
     let visible = scope.keys().cloned().collect::<BTreeSet<_>>();
@@ -5073,6 +5100,30 @@ fn utf8_type_from_context(
         .flat_map(|target| target.structs.iter())
         .find(|structure| structure.id == *expected_id && structure.name == "utf8")
         .map(|structure| ScalarType::Struct(structure.id.clone()))
+}
+
+#[cfg(feature = "internal-checker")]
+fn checked_authored_snapshot_field<'a>(
+    owner: &ScalarStructId, name: &str, modules: &[ScalarModuleTyping<'a>],
+) -> Option<(std::rc::Rc<ScalarStructId>, &'a ScalarStructField)> {
+    // Built once for the entire preparation, and only when an authored
+    // projection asks for it. Do not scan modules × structs per output.
+    let index = modules.first()?.authored_field_index.get_or_init(|| {
+        let mut index = BTreeMap::new();
+        for (module, typing) in modules.iter().enumerate() {
+            for (slot, structure) in typing.structs.iter().enumerate() {
+                index.entry(std::rc::Rc::new(structure.id.clone())).or_insert((module, slot));
+            }
+        }
+        index
+    });
+    let (shared_owner, &(module, slot)) = index.get_key_value(owner)?;
+    let structure = modules.get(module)?.structs.get(slot)?;
+    // A shape with more than 64 fields cannot pass the corresponding
+    // snapshot node budget regardless of what this selection names.
+    if structure.fields.len() > 64 { return None; }
+    let field = structure.fields.iter().find(|field| field.name == name)?;
+    Some((shared_owner.clone(), field))
 }
 
 fn member_field_in_module<'a>(

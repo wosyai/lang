@@ -6307,18 +6307,21 @@ pub(super) struct CheckerSnapshotCopy {
 
 impl OccurrenceStructure {
     #[cfg(feature = "internal-checker")]
-    fn select_snapshot(&mut self, mut key: (BlockOrdinal, usize))
-        -> Option<std::rc::Rc<super::checker_directive::CheckerSnapshotShape>>
-    {
+    fn select_snapshot<T>(
+        &mut self, mut key: (BlockOrdinal, usize),
+        admit: impl FnOnce(&super::checker_directive::CheckerSnapshotShape) -> Option<T>,
+    ) -> Option<(std::rc::Rc<super::checker_directive::CheckerSnapshotShape>, T)> {
         // Each new copy edge becomes demanded once. A shared ancestry need
         // not be walked again for each file/path that selects the same value.
         let constructor = self.checker_snapshot_copies.get(&key).map_or(key, |copy| copy.constructor);
-        let shape = self.checker_snapshot_locals.get(&constructor)?.clone();
+        let shape = self.checker_snapshot_locals.get(&constructor)?;
+        let selected = admit(shape)?;
+        let shape = shape.clone();
         while self.checker_selected_snapshots.insert(key) {
             let Some(copy) = self.checker_snapshot_copies.get(&key) else { break; };
             key = copy.source;
         }
-        Some(shape)
+        Some((shape, selected))
     }
 
     #[cfg(feature = "internal-checker")]
@@ -7547,21 +7550,33 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
                         output.code_value = CheckerCode::Binding(std::rc::Rc::new(binding), ty.clone(), *transform);
                     }
                 }
+                let snapshot_key = |structure: &OccurrenceStructure, lexical: &str| {
+                    let declaration = names.get(lexical).filter(|slot| !slot.introduced_by_assignment && lexical != "null")?;
+                    structure.checker_snapshot_bindings.get(&(declaration.declaration_span, declaration.block_span)).copied()
+                };
                 for file in output.state_files.iter_mut() {
+                    if let (CheckerStateSelection::LexicalField { receiver, owner, field }, CheckerStateType::Scalar(ty)) =
+                        (&file.selection, &file.ty)
+                    {
+                        if matches!(types.get(receiver.as_ref()), Some(ScalarType::Struct(id)) if id == owner.as_ref()) {
+                            if let Some(key) = snapshot_key(&self.structure, receiver) {
+                                use super::checker_directive::CheckerSnapshotNode as Node;
+                                if let Some((shape, leaf)) = self.structure.select_snapshot(key, |shape| {
+                                    let Node::Nominal { fields, .. } = &shape.root else { return None; };
+                                    let (_, Node::Leaf(leaf)) = fields.get(*field)? else { return None; };
+                                    (shape.leaves.get(*leaf)?.ty == *ty).then_some(*leaf)
+                                }) {
+                                    file.selection = CheckerStateSelection::AggregateLeaf { shape, leaf };
+                                }
+                            }
+                        }
+                        continue;
+                    }
                     let CheckerStateSelection::Lexical(lexical) = &file.selection else { continue; };
                     if matches!(&file.ty, CheckerStateType::Nominal(_) | CheckerStateType::FixedArray) {
-                        // A snapshot is keyed by a declared lexical occurrence
-                        // in this callable. Do not allocate a fresh source ID
-                        // for each authored output path that names it.
-                        if let Some(declaration) = names.get(lexical.as_ref()).filter(|slot|
-                            !slot.introduced_by_assignment && lexical.as_ref() != "null")
-                        {
-                            if let Some(key) = self.structure.checker_snapshot_bindings.get(&(
-                                declaration.declaration_span, declaration.block_span,
-                            )) {
-                                if let Some(shape) = self.structure.select_snapshot(*key) {
-                                    file.selection = CheckerStateSelection::Aggregate(shape);
-                                }
+                        if let Some(key) = snapshot_key(&self.structure, lexical) {
+                            if let Some((shape, ())) = self.structure.select_snapshot(key, |_| Some(())) {
+                                file.selection = CheckerStateSelection::Aggregate(shape);
                             }
                         }
                     } else if let Some(PlainNameIdentity::Lexical(binding)) = callable.target_resolver.plain_name(lexical, names) {

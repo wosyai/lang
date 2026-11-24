@@ -1693,6 +1693,21 @@ cases.extend([
     ("authored-state-nominal-move-not-copy",nominal_move,2,b"unsupported analysis"),
     ("authored-state-nominal-copy-mutation-unsupported",nominal_mutated_copy,2,b"unsupported analysis"),
 ])
+authored_nominal_field = f"""%%start
+    struct copy Snapshot {{ i8 saved; bool ready; i8 omitted; }}
+    unit(i8) check = fn(value) {{
+        core.narrow(value == 1 || value == 3, {report(167,"HOLES")});
+        Snapshot original = {{ .omitted = 44; .ready = true; .saved = value; }};
+        Snapshot copied = original;
+        value = 7;
+        core.require(value != 7, {{ .stdout = ""; .stderr = "FIELD-ONLY"; .code = 58; .files = [
+            {{ .path = "saved.json"; .state = copied.saved; }},
+            {{ .path = "inverted.json"; .state = !copied.ready; }},
+            {{ .path = "same.json"; .state = copied.saved; }}
+        ]; }});
+    }};
+    %%end"""
+cases.append(("authored-state-nominal-field-only",authored_nominal_field,58,b"FIELD-ONLY"))
 state_nominal_nested_scope = f"""%%start
     struct Snapshot {{ i8 saved; }}
     unit(i8) check = fn(value) {{
@@ -1795,6 +1810,11 @@ copied_nominal_bytes = state_bytes({
 })
 copied_array_bytes = state_bytes(array_state({"kind":"i8"}, [copied_alternatives, typed_state("i8", 4)]))
 authored_files = {
+    "authored-state-nominal-field-only": {
+        "saved.json": state_bytes(copied_alternatives),
+        "inverted.json": state_bytes(typed_state("bool", False)),
+        "same.json": state_bytes(copied_alternatives),
+    },
     "authored-state-nominal-copy-chain": {"state.json": copied_nominal_bytes, "copy.json": copied_nominal_bytes},
     "authored-state-array-copy-chain": {"state.json": copied_array_bytes, "copy.json": copied_array_bytes},
     "authored-unary-state-preserves-holes": {
