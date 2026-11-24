@@ -2539,7 +2539,61 @@ cases.extend([
         1, b"proof obligation failed"),
 ])
 
+array_cohort_symbolic = """%%start
+    i8[2](i8) reflect = fn(value) { [value, -1 - value] };
+    proof has_nonnegative for reflect(entry) -> (items) where (entry >= 0 || entry == -2)
+        ensures (exists (u64 i where i < 2) { items[i] >= 0 }) {}
+    u8[1]() unavailable = fn { [6] };
+    proof independent for unavailable() -> (items)
+        forall (u64 i where i == 0) ensures (items[i] == 6) {}
+    proof never for unavailable() -> (items) where (false)
+        forall (u64 i where i == 0) ensures (items[i] == 99) {}
+    proof first_bounded for reflect(which) -> (items) where (which == 2 || which == -2)
+        forall (u64 i where i == 0) ensures (items[i] <= 2) {}
+%%end"""
+array_cohort_actual = f"""%%start
+    u8[2](u8,u8) make = fn(tag, value) {{
+        if (tag == 1) {{ [value, 7] }} else {{ [9, value] }}
+    }};
+    proof first for make(tag, entry) -> (items) where (tag == 1 && entry == 3)
+        forall (u64 i where i == 0) ensures (items[i] == 3) {{}}
+    proof different for make(other, entry) -> (items) where (other == 2 && entry == 5)
+        ensures (exists (u64 i where i < 2) {{ items[i] == 5 }}) {{}}
+    proof again for make(mark, entry) -> (items) where (mark == 1 && entry == 3)
+        ensures (exists (u64 i where i < 2) {{ items[i] == 7 }}) {{ core.witness(1); }}
+    u8[2] pick = make(1, 3);
+    u8[2] middle = make(2, 5);
+    u8[2] repeat = make(1, 3);
+    u8 chosen = pick[0];
+    u8 outside = middle[1];
+    u8 repeated = repeat[0];
+    core.require(chosen == 3, {report(41,"WRONG-COHORT-FIRST")});
+    core.require(outside == 5, {report(42,"WRONG-COHORT-MIDDLE")});
+    core.require(repeated == 3, {report(43,"WRONG-COHORT-REPEAT")});
+%%end"""
+array_cohort_rectangles = """%%start
+    u8[2](u8,u8) make = fn(tag, value) { [tag, value] };
+    proof first for make(a, b) -> (items) where (a == 1 && b == 2)
+        forall (u64 i where i == 0) ensures (items[i] == 1) {}
+    proof second for make(x, y) -> (items) where (x == 1 && y == 2)
+        forall (u64 i where i == 1) ensures (items[i] == 2) {}
+%%end"""
+cases.extend([
+    ("ordinary-array-proof-cohort-union-proved", array_cohort_symbolic, 0, b""),
+    ("ordinary-array-proof-cohort-union-refuted", array_cohort_symbolic.replace("items[i] >= 0", "items[i] > 0")
+        .replace("items[i] == 6", "items[i] == 8").replace("items[i] <= 2", "items[i] < 2"), 1, b"proof obligation failed"),
+    ("ordinary-array-proof-cohort-shared-rectangle", array_cohort_rectangles, 0, b""),
+    ("ordinary-array-proof-cohort-rejects-cross-product", array_cohort_rectangles.replace("x == 1 && y == 2", "x == 2 && y == 1"),
+        2, b"unsupported analysis"),
+    ("exact-startup-array-proof-cohort-proved", array_cohort_actual, 0, b""),
+    ("exact-startup-array-proof-cohort-refuted", array_cohort_actual.replace("items[i] == 3", "items[i] == 8")
+        .replace("core.witness(1)", "core.witness(0)"), 1, b"proof obligation failed"),
+    ("exact-startup-array-proof-cohort-output", array_cohort_actual.replace("outside == 5", "outside == 0"),
+        42, b"WRONG-COHORT-MIDDLE"),
+])
 proof_diagnostic_notes = {
+    "ordinary-array-proof-cohort-union-refuted": b"symbolic call entry: value = 0",
+    "exact-startup-array-proof-cohort-refuted": b"call entry: tag = 1, value = 3",
     "exact-startup-fixed-array-exists-refuted": b"call returned an array with no matching index",
     "exact-startup-fixed-array-pair-refuted": b"call returned cell [0] = 3",
     "exact-startup-fixed-array-nullary-witness-refuted": b"call returned cell [1] = 8",
@@ -3379,6 +3433,18 @@ with tempfile.TemporaryDirectory(prefix="affine-calls-") as path:
                         assert b"symbolic call" not in res.stderr, res
                     if name == "exact-startup-fixed-array-pair-refuted":
                         assert b"applicable call" in res.stderr and b"call entry: tag = 1, value = 3" in res.stderr, res
+                    if name == "ordinary-array-proof-cohort-union-refuted":
+                        failures = res.stderr.split(b"error: proof obligation failed")[1:]
+                        assert len(failures) == 3, res
+                        assert b"proof has_nonnegative" in failures[0] and b"value = 0" in failures[0], res
+                        assert b"proof independent" in failures[1] and b"return cell [0] = 6" in failures[1], res
+                        assert b"proof first_bounded" in failures[2] and b"value = 2" in failures[2], res
+                    if name == "exact-startup-array-proof-cohort-refuted":
+                        failures = res.stderr.split(b"error: proof obligation failed")[1:]
+                        assert len(failures) == 4 and b"symbolic call" not in res.stderr, res
+                        for index, failure in enumerate(failures):
+                            assert (b"proof first" if index % 2 == 0 else b"proof again") in failure, res
+                            assert b"applicable call" in failure and b"call entry: tag = 1, value = 3" in failure, res
                     if name.startswith("ordinary-inferred-array-exists-"):
                         assert b"returned array" in res.stderr and b"no matching index" in res.stderr, res
                         assert b"symbolic call can return cell" not in res.stderr, res

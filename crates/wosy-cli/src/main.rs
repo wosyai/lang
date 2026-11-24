@@ -1212,7 +1212,7 @@ fn check_command(
             notes: vec![format!("contextual value at entry: {}; at exit: {}", failure.entry, failure.exit)],
         }
     });
-    let aggregate = report.actual_aggregate_diagnostics.iter().chain(&report.aggregate_diagnostic).map(|failure| {
+    let aggregate = report.aggregate_diagnostics.iter().map(|failure| {
         let actual = failure.call.is_some();
         let (primary, output, note) = if let Some(cell) = &failure.cell {
             ("not satisfied by this returned array cell", "returned cell",

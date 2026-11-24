@@ -4230,10 +4230,12 @@ fn array_entry_point(
 }
 
 #[cfg(feature = "internal-checker")]
-struct FixedArrayObservationState {
+struct FixedArrayObservationState<'cursor, 'claims> {
     work: usize,
-    failure: Option<FixedArrayReturnFailure>,
+    failures: Vec<Option<FixedArrayReturnFailure>>,
+    applied: Vec<bool>,
     returned: Option<Vec<BigInt>>,
+    exact_checks: Option<&'cursor mut [Option<FixedArrayCheck<'claims>>]>,
 }
 
 #[cfg(feature = "internal-checker")]
@@ -4247,11 +4249,10 @@ pub(super) struct FixedArrayCheck<'a> {
 
 #[cfg(feature = "internal-checker")]
 impl FixedArrayCheck<'_> {
-    fn selects(self, index: usize) -> bool {
-        let index = BigInt::from(index);
+    fn selects(self, index: &BigInt) -> bool {
         match self.quantifier {
-            FixedArrayQuantifier::ExplicitWitness(chosen) => chosen == &index,
-            FixedArrayQuantifier::All | FixedArrayQuantifier::FindWitness => self.domain.contains(&index),
+            FixedArrayQuantifier::ExplicitWitness(chosen) => chosen == index,
+            FixedArrayQuantifier::All | FixedArrayQuantifier::FindWitness => self.domain.contains(index),
         }
     }
 
@@ -4262,20 +4263,30 @@ impl FixedArrayCheck<'_> {
 
 #[cfg(feature = "internal-checker")]
 #[derive(Clone, Copy)]
-enum FixedArrayObservationMode<'a> {
-    Symbolic(FixedArrayCheck<'a>),
-    Exact(Option<FixedArrayCheck<'a>>),
+pub(super) struct FixedArraySymbolicCheck<'a> {
+    pub(super) check: FixedArrayCheck<'a>,
+    pub(super) enabled: bool,
+    // A distinct unary where domain, when the canonical walk starts in
+    // the union of several proof domains. None uses the common entry.
+    pub(super) entry: Option<&'a IntegerSet>,
 }
 
 #[cfg(feature = "internal-checker")]
 #[derive(Clone, Copy)]
-struct FixedArrayObservation<'a> {
-    mode: FixedArrayObservationMode<'a>,
-    state: &'a std::cell::RefCell<FixedArrayObservationState>,
+enum FixedArrayObservationMode<'a> {
+    Symbolic(&'a [FixedArraySymbolicCheck<'a>]),
+    Exact,
 }
 
 #[cfg(feature = "internal-checker")]
-impl<'body> ScopedAuthoredReturn<'body> for FixedArrayObservation<'_> {
+#[derive(Clone, Copy)]
+struct FixedArrayObservation<'a, 'cursor, 'claims> {
+    mode: FixedArrayObservationMode<'a>,
+    state: &'a std::cell::RefCell<FixedArrayObservationState<'cursor, 'claims>>,
+}
+
+#[cfg(feature = "internal-checker")]
+impl<'body> ScopedAuthoredReturn<'body> for FixedArrayObservation<'_, '_, '_> {
     const ENABLED: bool = false;
     const ALLOW_ORDINARY_INTEGER_LOCALS: bool = true;
     const OBSERVE_FIXED_ARRAY: bool = true;
@@ -4307,103 +4318,12 @@ impl<'body> ScopedAuthoredReturn<'body> for FixedArrayObservation<'_> {
             return None;
         }
         let mut state = self.state.borrow_mut();
-        let check = match self.mode {
-            FixedArrayObservationMode::Exact(check) =>
-                return state.observe_exact(slot, check, path, roots, shape, cells, captured, element),
-            FixedArrayObservationMode::Symbolic(check) => check,
-        };
-        let rejected = check.relation.complement();
-        charge_call_work(&mut state.work, cells.len().checked_mul(check.domain.interval_count().checked_add(1)?)?)?;
-        let mut unwitnessed = if matches!(check.quantifier, FixedArrayQuantifier::FindWitness) && state.failure.is_none() {
-            charge_call_work(&mut state.work, path.0.len())?;
-            Some(UnwitnessedArrayRows {
-                left: path.0.len(),
-                rows: path.0.iter().map(|row| Some(Cow::Borrowed(row))).collect(),
-            })
-        } else {
-            None
-        };
-        for (index, cell) in cells.iter().enumerate() {
-            let CheckerSnapshotNode::Leaf(leaf) = cell else { return None; };
-            let leaf = shape.leaves.get(*leaf)?;
-            let selected = state.failure.is_none() && unwitnessed.as_ref().is_none_or(|rows| rows.left != 0)
-                && check.selects(index);
-            let read = FixedArrayRead::prepare(roots, leaf, captured, element)?;
-            let failure = match read {
-                FixedArrayRead::Literal(value) if selected => {
-                    if let Some(rows) = &mut unwitnessed {
-                        if !rejected.accepts(value.cmp(check.expected)) { rows.left = 0; }
-                        None
-                    } else {
-                        rejected.accepts(value.cmp(check.expected))
-                            .then(|| RejectedCell { row: &path.0[0], point: None, value: value.clone() })
-                    }
-                }
-                FixedArrayRead::Axis(axis) if selected => {
-                    let cut = FixedArrayCut { axis, relation: rejected, bound: Cow::Borrowed(check.expected), transform: None };
-                    charge_call_work(&mut state.work, path.0.len())?;
-                    if let Some(rows) = &mut unwitnessed {
-                        for index in 0..path.0.len() {
-                            rows.retain_rejected(index, &cut, &mut state.work)?;
-                        }
-                        None
-                    } else {
-                        let mut failure = None;
-                        for row in &path.0 {
-                            failure = cut.first_rejected(row, &mut state.work)?;
-                            if failure.is_some() { break; }
-                        }
-                        failure
-                    }
-                }
-                FixedArrayRead::Arithmetic(operation, left, right) => {
-                    let (min, max) = super::typecheck::integer_bounds(&leaf.ty)?;
-                    charge_call_work(&mut state.work, path.0.len().checked_mul(5)?)?;
-                    let mut failure = None;
-                    for (index, row) in path.0.iter().enumerate() {
-                        // Always validate the real calculation on the original row,
-                        // not on the smaller set of entries still without a witness.
-                        let value = compute_row_integer_operation(row, operation, left, right, &min, &max)?;
-                        if selected && failure.is_none() {
-                            let pending = unwitnessed.as_ref().is_none_or(|rows| rows.contains(index));
-                            if !pending { continue; }
-                            match value {
-                                ComputedRowInteger::Singleton(value) => {
-                                    let fails = rejected.accepts(value.cmp(check.expected));
-                                    if let Some(rows) = &mut unwitnessed {
-                                        if !fails { rows.remove(index); }
-                                    } else if fails {
-                                        failure = Some(RejectedCell { row, point: None, value });
-                                    }
-                                }
-                                ComputedRowInteger::Affine(axis, transform) => {
-                                    let (relation, bound) = transform.pull_back_cut(rejected, check.expected);
-                                    let cut = FixedArrayCut { axis, relation, bound: Cow::Owned(bound), transform: Some(transform) };
-                                    if let Some(rows) = &mut unwitnessed {
-                                        rows.retain_rejected(index, &cut, &mut state.work)?;
-                                    } else {
-                                        failure = cut.first_rejected(row, &mut state.work)?;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    failure
-                }
-                FixedArrayRead::Literal(_) | FixedArrayRead::Axis(_) => None,
-            };
-            if let Some(failure) = failure {
-                let inputs = failure.source_inputs(roots.parameters, &mut state.work)?;
-                state.failure = Some(FixedArrayReturnFailure { cell: Some((index, failure.value)), span: leaf.span, inputs });
-            }
+        match self.mode {
+            FixedArrayObservationMode::Exact =>
+                state.observe_exact(slot, path, roots, shape, cells, captured, element),
+            FixedArrayObservationMode::Symbolic(checks) =>
+                state.observe_symbolic(slot, checks, path, roots, shape, cells, captured, element),
         }
-        if let Some(rows) = unwitnessed.filter(|rows| rows.left != 0) {
-            charge_call_work(&mut state.work, rows.rows.len())?;
-            let row = rows.rows.iter().flatten().next()?.as_ref();
-            let inputs = array_entry_point(row, None, roots.parameters, &mut state.work)?;
-            state.failure = Some(FixedArrayReturnFailure { cell: None, span: slot.span, inputs });
-        }
-        Some(())
     }
 }
 
@@ -4455,49 +4375,216 @@ impl<'a> FixedArrayRead<'a> {
 }
 
 #[cfg(feature = "internal-checker")]
-impl FixedArrayObservationState {
+impl FixedArrayObservationState<'_, '_> {
     fn observe_exact(
-        &mut self, slot: FinalOutputSlot, check: Option<FixedArrayCheck<'_>>, path: &IntegerInputs,
+        &mut self, slot: FinalOutputSlot, path: &IntegerInputs,
         roots: &IntegerRoots<'_>, shape: &super::checker_directive::CheckerSnapshotShape,
         cells: &[super::checker_directive::CheckerSnapshotNode], captured: bool, element: &ScalarType,
     ) -> Option<()> {
         use super::checker_directive::CheckerSnapshotNode;
         let [row] = path.0.as_slice() else { return None; };
-        if self.returned.is_some() { return None; }
-        let per_cell = 6usize.checked_add(check.map_or(0, |check| check.domain.interval_count()))?;
-        charge_call_work(&mut self.work, cells.len().checked_mul(per_cell)?)?;
+        let checks = self.exact_checks.take()?; // at most one real return
+        let per_cell = checks.iter().try_fold(6usize, |cost, check| {
+            cost.checked_add(1)?.checked_add(check.map_or(0, |check| check.domain.interval_count()))
+        })?;
+        charge_call_work(&mut self.work, cells.len().checked_mul(per_cell)?.checked_add(checks.len())?)?;
         let mut returned = Vec::with_capacity(cells.len());
-        let mut rejected = None;
-        let mut found = false;
-        let find_witness = check.is_some_and(|check| matches!(check.quantifier, FixedArrayQuantifier::FindWitness));
         for (index, cell) in cells.iter().enumerate() {
             let CheckerSnapshotNode::Leaf(leaf) = cell else { return None; };
             let leaf = shape.leaves.get(*leaf)?;
             let value = FixedArrayRead::prepare(roots, leaf, captured, element)?.exact_value(row, element)?;
-            if let Some(check) = check.filter(|check| !found && rejected.is_none() && check.selects(index)) {
+            let proof_index = std::cell::OnceCell::new();
+            for (open, failure) in checks.iter_mut().zip(&mut self.failures) {
+                let Some(check) = open.filter(|check| check.selects(proof_index.get_or_init(|| BigInt::from(index))))
+                    else { continue; };
                 let passes = check.relation.accepts(value.cmp(check.expected));
-                if find_witness {
-                    found = passes;
+                if matches!(check.quantifier, FixedArrayQuantifier::FindWitness) {
+                    if passes { *open = None; }
                 } else if !passes {
-                    rejected = Some((index, leaf.span));
+                    *failure = Some(FixedArrayReturnFailure {
+                        cell: Some((index, value.clone())), span: leaf.span,
+                        inputs: array_entry_point(row, None, roots.parameters, &mut self.work)?,
+                    });
+                    *open = None;
                 }
             }
-            // This is also the caller's return. Keep checking representability
-            // of every cell after a proof verdict, including out-of-domain cells.
+            // Materialize every cell for the caller, regardless of proof coverage.
             returned.push(value);
         }
-        if let Some((index, span)) = rejected {
-            self.failure = Some(FixedArrayReturnFailure {
-                cell: Some((index, returned.get(index)?.clone())), span,
-                inputs: array_entry_point(row, None, roots.parameters, &mut self.work)?,
-            });
-        } else if find_witness && !found {
-            self.failure = Some(FixedArrayReturnFailure {
-                cell: None, span: slot.span,
-                inputs: array_entry_point(row, None, roots.parameters, &mut self.work)?,
-            });
+        for (check, failure) in checks.iter().zip(&mut self.failures) {
+            if check.is_some_and(|check| matches!(check.quantifier, FixedArrayQuantifier::FindWitness)) {
+                *failure = Some(FixedArrayReturnFailure {
+                    cell: None, span: slot.span,
+                    inputs: array_entry_point(row, None, roots.parameters, &mut self.work)?,
+                });
+            }
         }
         self.returned = Some(returned);
+        Some(())
+    }
+
+    fn observe_symbolic<'a>(
+        &mut self, slot: FinalOutputSlot, checks: &[FixedArraySymbolicCheck<'_>], path: &IntegerInputs,
+        roots: &IntegerRoots<'a>, shape: &'a super::checker_directive::CheckerSnapshotShape,
+        cells: &[super::checker_directive::CheckerSnapshotNode], captured: bool, element: &ScalarType,
+    ) -> Option<()> {
+        use super::checker_directive::CheckerSnapshotNode;
+        charge_call_work(&mut self.work, checks.len())?;
+        let per_cell = checks.iter().try_fold(1usize, |cost, claim| {
+            cost.checked_add(1)?.checked_add(claim.check.domain.interval_count())
+        })?;
+        charge_call_work(&mut self.work, cells.len().checked_mul(per_cell)?)?;
+        let mut claims = Vec::with_capacity(checks.len());
+        for ((claim, prior), applied) in checks.iter().zip(&self.failures).zip(&mut self.applied) {
+            let open = prior.is_none() && claim.enabled && claim.check.applicable();
+            let inferred = matches!(claim.check.quantifier, FixedArrayQuantifier::FindWitness);
+            let rows = if open && (inferred || claim.entry.is_some()) {
+                Some(UnwitnessedArrayRows::new(&path.0, claim.entry, &mut self.work)?)
+            } else { None };
+            let open = open && rows.as_ref().is_none_or(|set| set.left != 0);
+            *applied |= open;
+            claims.push(FixedArraySymbolicClaim { check: claim.check, open, inferred, selected: false, rows });
+        }
+        for (index, cell) in cells.iter().enumerate() {
+            let CheckerSnapshotNode::Leaf(leaf) = cell else { return None; };
+            let leaf = shape.leaves.get(*leaf)?;
+            let read = FixedArrayRead::prepare(roots, leaf, captured, element)?;
+            let mut selected = 0usize;
+            let proof_index = std::cell::OnceCell::new();
+            for claim in &mut claims {
+                claim.selected = claim.open && (!claim.inferred || claim.rows.as_ref()?.left != 0)
+                    && claim.check.selects(proof_index.get_or_init(|| BigInt::from(index)));
+                selected += usize::from(claim.selected);
+            }
+            match read {
+                FixedArrayRead::Literal(value) if selected != 0 => {
+                    for (claim, failure) in claims.iter_mut().zip(&mut self.failures) {
+                        if !claim.selected { continue; }
+                        if claim.check.relation.accepts(value.cmp(claim.check.expected)) {
+                            if claim.inferred { claim.rows.as_mut()?.left = 0; }
+                        } else if !claim.inferred {
+                            if let Some(rows) = &claim.rows { charge_call_work(&mut self.work, rows.rows.len())?; }
+                            let inputs = array_entry_point(claim.first_row(&path.0)?, None, roots.parameters, &mut self.work)?;
+                            *failure = Some(FixedArrayReturnFailure { cell: Some((index, value.clone())), span: leaf.span, inputs });
+                            claim.open = false;
+                        }
+                    }
+                }
+                FixedArrayRead::Axis(axis) if selected != 0 => {
+                    charge_call_work(&mut self.work, path.0.len().checked_mul(claims.len())?)?;
+                    for (row_index, row) in path.0.iter().enumerate() {
+                        self.check_symbolic_row(&mut claims, (row_index, row), FixedArrayCellValue::Axis(axis, None),
+                            (index, leaf.span), roots.parameters)?;
+                    }
+                }
+                FixedArrayRead::Arithmetic(operation, left, right) => {
+                    let (min, max) = super::typecheck::integer_bounds(&leaf.ty)?;
+                    charge_call_work(&mut self.work, path.0.len().checked_mul(5usize.checked_add(
+                        if selected == 0 { 0 } else { claims.len() }
+                    )?)?)?;
+                    for (row_index, row) in path.0.iter().enumerate() {
+                        // Validate on the canonical union row even if no active
+                        // goal selects this cell. One computation feeds all claims.
+                        let value = compute_row_integer_operation(row, operation, left, right, &min, &max)?;
+                        if selected != 0 {
+                            let evidence = match &value {
+                                ComputedRowInteger::Singleton(value) => FixedArrayCellValue::Point(value),
+                                ComputedRowInteger::Affine(axis, transform) => FixedArrayCellValue::Axis(*axis, Some(transform)),
+                            };
+                            self.check_symbolic_row(&mut claims, (row_index, row), evidence, (index, leaf.span), roots.parameters)?;
+                        }
+                    }
+                }
+                FixedArrayRead::Literal(_) | FixedArrayRead::Axis(_) => {}
+            }
+        }
+        for (claim, failure) in claims.into_iter().zip(&mut self.failures) {
+            if claim.open && claim.inferred {
+                let rows = claim.rows.as_ref()?;
+                if rows.left != 0 {
+                    charge_call_work(&mut self.work, rows.rows.len())?;
+                    let inputs = array_entry_point(claim.first_row(&path.0)?, None, roots.parameters, &mut self.work)?;
+                    *failure = Some(FixedArrayReturnFailure { cell: None, span: slot.span, inputs });
+                }
+            }
+        }
+        Some(())
+    }
+
+    fn check_symbolic_row<'row>(
+        &mut self, claims: &mut [FixedArraySymbolicClaim<'_, 'row>], (index, row): (usize, &'row IntegerRow),
+        value: FixedArrayCellValue<'_>, cell: (usize, super::ByteSpan), parameters: usize,
+    ) -> Option<()> {
+        for (claim, failure) in claims.iter_mut().zip(&mut self.failures) {
+            if claim.selected && claim.open {
+                claim.observe(index, row, value, cell, failure, parameters, &mut self.work)?;
+            }
+        }
+        Some(())
+    }
+}
+
+#[cfg(feature = "internal-checker")]
+#[derive(Clone, Copy)]
+enum FixedArrayCellValue<'a> {
+    Point(&'a BigInt),
+    Axis(usize, Option<&'a IntegerAffineTransform>),
+}
+
+#[cfg(feature = "internal-checker")]
+struct FixedArraySymbolicClaim<'claim, 'row> {
+    check: FixedArrayCheck<'claim>,
+    open: bool,
+    inferred: bool,
+    selected: bool,
+    rows: Option<UnwitnessedArrayRows<'row>>,
+}
+
+#[cfg(feature = "internal-checker")]
+impl<'row> FixedArraySymbolicClaim<'_, 'row> {
+    fn first_row<'a>(&'a self, path: &'row [IntegerRow]) -> Option<&'a IntegerRow> where 'row: 'a {
+        match &self.rows {
+            Some(rows) => rows.rows.iter().flatten().next().map(Cow::as_ref),
+            None => path.first(),
+        }
+    }
+
+    fn observe(
+        &mut self, row_index: usize, canonical: &'row IntegerRow, value: FixedArrayCellValue<'_>,
+        (index, span): (usize, super::ByteSpan), failure: &mut Option<FixedArrayReturnFailure>,
+        parameters: usize, work: &mut usize,
+    ) -> Option<()> {
+        let row = if let Some(rows) = &self.rows {
+            let Some(row) = rows.rows.get(row_index)?.as_ref() else { return Some(()); };
+            row.as_ref()
+        } else { canonical };
+        let rejected = self.check.relation.complement();
+        let rejected = match value {
+            FixedArrayCellValue::Point(value) => {
+                if self.inferred {
+                    if !rejected.accepts(value.cmp(self.check.expected)) { self.rows.as_mut()?.remove(row_index); }
+                    return Some(());
+                }
+                rejected.accepts(value.cmp(self.check.expected)).then(|| RejectedCell { row, point: None, value: value.clone() })
+            }
+            FixedArrayCellValue::Axis(axis, transform) => {
+                let (relation, bound) = transform.map_or_else(
+                    || (rejected, Cow::Borrowed(self.check.expected)), |transform| {
+                        let (relation, bound) = transform.pull_back_cut(rejected, self.check.expected);
+                        (relation, Cow::Owned(bound))
+                    });
+                let cut = FixedArrayCut { axis, relation, bound, transform };
+                if self.inferred {
+                    return self.rows.as_mut()?.retain_rejected(row_index, &cut, work);
+                }
+                cut.first_rejected(row, work)?
+            }
+        };
+        if let Some(rejected) = rejected {
+            let inputs = rejected.source_inputs(parameters, work)?;
+            *failure = Some(FixedArrayReturnFailure { cell: Some((index, rejected.value)), span, inputs });
+            self.open = false;
+        }
         Some(())
     }
 }
@@ -4507,7 +4594,7 @@ struct FixedArrayCut<'a> {
     axis: usize,
     relation: IntegerRelation,
     bound: Cow<'a, BigInt>,
-    transform: Option<IntegerAffineTransform>,
+    transform: Option<&'a IntegerAffineTransform>,
 }
 
 #[cfg(feature = "internal-checker")]
@@ -4532,11 +4619,36 @@ struct UnwitnessedArrayRows<'a> {
 }
 
 #[cfg(feature = "internal-checker")]
-impl UnwitnessedArrayRows<'_> {
-    fn contains(&self, index: usize) -> bool { self.left != 0 && self.rows[index].is_some() }
+impl<'a> UnwitnessedArrayRows<'a> {
+    fn new(path: &'a [IntegerRow], entry: Option<&IntegerSet>, work: &mut usize) -> Option<Self> {
+        charge_call_work(work, path.len())?;
+        let mut rows = Vec::with_capacity(path.len());
+        let mut left = 0;
+        for original in path {
+            let row = if let Some(entry) = entry {
+                let domain = original.get(0)?;
+                charge_call_work(work, domain.interval_count().checked_add(entry.interval_count())?)?;
+                match domain.intersection(entry) {
+                    IntegerIntersection::Unchanged => Some(Cow::Borrowed(original)),
+                    IntegerIntersection::Empty => None,
+                    IntegerIntersection::Changed(set) => {
+                        charge_call_work(work, original.len().checked_add(original.equal_axes().len())?)?;
+                        original.charge_affine_replacement(0, set.interval_count(), work)?;
+                        charge_call_work(work, 0)?;
+                        let mut row = original.clone();
+                        row.replace_domain(0, Rc::new(set));
+                        Some(Cow::Owned(row))
+                    }
+                }
+            } else { Some(Cow::Borrowed(original)) };
+            left += usize::from(row.is_some());
+            rows.push(row);
+        }
+        Some(Self { rows, left })
+    }
 
     fn remove(&mut self, index: usize) {
-        debug_assert!(self.contains(index));
+        debug_assert!(self.rows[index].is_some());
         self.rows[index] = None;
         self.left -= 1;
     }
@@ -4560,39 +4672,62 @@ impl UnwitnessedArrayRows<'_> {
     }
 }
 
+#[cfg(all(test, feature = "internal-checker"))]
+thread_local! {
+    static ARRAY_RETURN_OBSERVATIONS: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+#[cfg(all(test, feature = "internal-checker"))]
+pub(super) fn take_array_return_observations() -> (usize, usize) {
+    ARRAY_RETURN_OBSERVATIONS.with(|observations| observations.replace((0, 0)))
+}
+
 /// Read-only consumer of the same prepared blocks, local capture axes and
 /// branch partitions as ordinary scalar checking. No aggregate summary is issued.
 #[cfg(feature = "internal-checker")]
 pub(super) fn observe_fixed_array_returns(
     calls: &FunctionCallSites, result: &ScalarType, entry_filter: Option<&[CheckerPredicate]>,
-    check: FixedArrayCheck<'_>,
-) -> Option<ProofCoverage<Option<FixedArrayReturnFailure>>> {
+    checks: &[FixedArraySymbolicCheck<'_>], work: &mut usize,
+) -> Option<Vec<ProofCoverage<Option<FixedArrayReturnFailure>>>> {
     if !matches!(result, ScalarType::Array { .. }) { return None; }
-    let state = std::cell::RefCell::new(FixedArrayObservationState { work: 0, failure: None, returned: None });
-    let observer = FixedArrayObservation { mode: FixedArrayObservationMode::Symbolic(check), state: &state };
-    match run_integer_callable::<false, false, _>(
+    charge_call_work(work, checks.len())?;
+    let fresh = || (0..checks.len()).map(|_| None).collect();
+    let state = std::cell::RefCell::new(FixedArrayObservationState {
+        work: *work, failures: fresh(), applied: vec![false; checks.len()], returned: None, exact_checks: None,
+    });
+    let observer = FixedArrayObservation { mode: FixedArrayObservationMode::Symbolic(checks), state: &state };
+    #[cfg(test)]
+    ARRAY_RETURN_OBSERVATIONS.with(|count| { let (symbolic, actual) = count.get(); count.set((symbolic + 1, actual)); });
+    run_integer_callable::<false, false, _>(
         calls, Some(result), entry_filter, None, &mut [], None, None, None, false, observer,
-    )?.ok()? {
-        ProofCoverage::Applicable(_) if check.applicable() =>
-            Some(ProofCoverage::Applicable(state.into_inner().failure)),
-        _ => Some(ProofCoverage::NoApplicableInputs),
-    }
+    )?.ok()?;
+    let state = state.into_inner();
+    *work = state.work;
+    Some(state.applied.into_iter().zip(state.failures).map(|(applied, failure)| {
+        if applied { ProofCoverage::Applicable(failure) } else { ProofCoverage::NoApplicableInputs }
+    }).collect())
 }
 
-/// One real entry, one canonical walk, one returned value for both proof
-/// observation and the caller. A false precondition disables just the proof.
+/// One real entry and one canonical walk. The materialized value feeds the
+/// caller and every applicable proof; failed proofs supply no authority.
 #[cfg(feature = "internal-checker")]
-pub(super) fn collect_exact_fixed_array_return(
-    calls: &FunctionCallSites, result: &ScalarType, arguments: &[&BigInt], check: Option<FixedArrayCheck<'_>>, work: &mut usize,
-) -> Option<(Vec<BigInt>, Option<FixedArrayReturnFailure>)> {
-    let state = std::cell::RefCell::new(FixedArrayObservationState { work: *work, failure: None, returned: None });
-    let observer = FixedArrayObservation { mode: FixedArrayObservationMode::Exact(check), state: &state };
+pub(super) fn collect_exact_fixed_array_return<'claims>(
+    calls: &FunctionCallSites, result: &ScalarType, arguments: &[&BigInt], checks: &mut [Option<FixedArrayCheck<'claims>>],
+    work: &mut usize,
+) -> Option<(Vec<BigInt>, Vec<Option<FixedArrayReturnFailure>>)> {
+    let state = std::cell::RefCell::new(FixedArrayObservationState {
+        work: *work, failures: (0..checks.len()).map(|_| None).collect(), applied: Vec::new(),
+        returned: None, exact_checks: Some(checks),
+    });
+    let observer = FixedArrayObservation { mode: FixedArrayObservationMode::Exact, state: &state };
+    #[cfg(test)]
+    ARRAY_RETURN_OBSERVATIONS.with(|count| { let (symbolic, actual) = count.get(); count.set((symbolic, actual + 1)); });
     let ProofCoverage::Applicable(_) = run_integer_callable::<false, false, _>(
         calls, Some(result), None, None, &mut [], Some(arguments), None, None, false, observer,
     )?.ok()? else { return None; };
     let state = state.into_inner();
     *work = state.work;
-    Some((state.returned?, state.failure))
+    Some((state.returned?, state.failures))
 }
 
 #[cfg(feature = "internal-checker")]

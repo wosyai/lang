@@ -4442,8 +4442,7 @@ pub struct MainFlowProofReceipt {
     pub directives: Vec<ScalarOrderedCheckerFailure>,
     pub diagnostics: Vec<MainFlowProofDiagnostic>,
     pub contextual_diagnostic: Option<ContextualProofDiagnostic>,
-    pub aggregate_diagnostic: Option<AggregateProofDiagnostic>,
-    pub actual_aggregate_diagnostics: Vec<AggregateProofDiagnostic>,
+    pub aggregate_diagnostics: Vec<AggregateProofDiagnostic>,
     pub symbolic_diagnostic: Option<SymbolicProofDiagnostic>,
     pub additional_symbolic_diagnostics: Vec<SymbolicProofDiagnostic>,
     pub entry_evidence: Option<Box<ScalarOrderedEntryEvidence>>,
@@ -7104,7 +7103,7 @@ fn run_closed_ranked_checks<'a, 'proof, const LOCAL_CATALOGS: bool>(
             &prepared.prepared, scope, startup_count, OrderedReachPolicy::Closed, ranked,
         )?;
         return Ok(MainFlowProofReceipt {
-            active: run.active, directives: run.directives, diagnostics: Vec::new(), contextual_diagnostic: None, aggregate_diagnostic: None, actual_aggregate_diagnostics: Vec::new(),
+            active: run.active, directives: run.directives, diagnostics: Vec::new(), contextual_diagnostic: None, aggregate_diagnostics: Vec::new(),
             symbolic_diagnostic: run.symbolic, additional_symbolic_diagnostics: Vec::new(),
             entry_evidence: run.entry_evidence,
         });
@@ -7141,7 +7140,7 @@ fn run_closed_ranked_checks<'a, 'proof, const LOCAL_CATALOGS: bool>(
     let (symbolic_diagnostic, additional_symbolic_diagnostics) = run.symbolic;
     Ok(MainFlowProofReceipt {
         active: run.active, directives: run.directives,
-        diagnostics: run.actual.bare.map_or_else(Vec::new, |bare| bare.observed.diagnostics), contextual_diagnostic: None, aggregate_diagnostic: None, actual_aggregate_diagnostics: Vec::new(),
+        diagnostics: run.actual.bare.map_or_else(Vec::new, |bare| bare.observed.diagnostics), contextual_diagnostic: None, aggregate_diagnostics: Vec::new(),
         symbolic_diagnostic, additional_symbolic_diagnostics, entry_evidence: run.entry_evidence,
     })
 }
@@ -7152,7 +7151,7 @@ fn run_closed_without_named_proofs(
 ) -> Result<MainFlowProofReceipt, ProjectCheck> {
     let run = run_prepared_ordered_check(prepared, scope, startup_count, OrderedReachPolicy::Closed, ProofFreeOrderedEvidence)?;
     Ok(MainFlowProofReceipt {
-        active: run.active, directives: run.directives, diagnostics: Vec::new(), contextual_diagnostic: None, aggregate_diagnostic: None, actual_aggregate_diagnostics: Vec::new(),
+        active: run.active, directives: run.directives, diagnostics: Vec::new(), contextual_diagnostic: None, aggregate_diagnostics: Vec::new(),
         symbolic_diagnostic: None, additional_symbolic_diagnostics: Vec::new(),
         entry_evidence: run.entry_evidence,
     })
@@ -7261,7 +7260,7 @@ fn check_loaded_ordered_proof_diagnostics_in_scope<const LOCAL_CATALOGS: bool>(
             }
         };
         return Ok(MainFlowProofReceipt {
-            active, directives, diagnostics: Vec::new(), contextual_diagnostic, aggregate_diagnostic: None, actual_aggregate_diagnostics: Vec::new(),
+            active, directives, diagnostics: Vec::new(), contextual_diagnostic, aggregate_diagnostics: Vec::new(),
             symbolic_diagnostic: None, additional_symbolic_diagnostics: Vec::new(), entry_evidence: None,
         });
     }
@@ -7315,22 +7314,25 @@ fn check_loaded_ordered_proof_diagnostics_in_scope<const LOCAL_CATALOGS: bool>(
     };
     let selected = prepared.resolve_selected_proof(definition, *query)?;
     if array_quantifier::is_array_target(&prepared, &selected) {
-        if !others.is_empty() { return Err(ProjectCheck::Unsupported); }
-        let proof = array_quantifier::ArrayProof::prepare(&prepared, source, selected)?;
+        let mut work = 0;
+        super::checker_flow::charge_call_work(&mut work, others.len().checked_add(1).ok_or(ProjectCheck::Unsupported)?)
+            .ok_or(ProjectCheck::Unsupported)?;
+        let first = array_quantifier::ArrayProof::prepare(&prepared, source, selected)?;
+        let mut plans = vec![first];
+        for (source, _name, definition, query) in &others {
+            let selected = prepared.resolve_selected_proof(definition, *query)?;
+            if !array_quantifier::is_array_target(&prepared, &selected) { return Err(ProjectCheck::Unsupported); }
+            plans.push(array_quantifier::ArrayProof::prepare(&prepared, source, selected)?);
+        }
+        let cohort = array_quantifier::Cohort::new(plans)?;
         let run = run_prepared_ordered_check(
             &prepared.prepared, scope, startup_count, OrderedReachPolicy::Closed,
-            array_quantifier::Evidence::new(&proof),
+            array_quantifier::Evidence::new(&cohort)?,
         )?;
-        let aggregate_diagnostic = match run.symbolic {
-            Some(ProofCoverage::Applicable(failure)) => failure,
-            Some(ProofCoverage::NoApplicableInputs) => None,
-            None if scope == ScalarCheckerScope::MainFlowOnly || run.actual.seen => None,
-            None => return Err(ProjectCheck::Unsupported),
-        };
+        let aggregate_diagnostics = run.actual.into_diagnostics(scope, run.symbolic)?;
         return Ok(MainFlowProofReceipt {
             active: run.active, directives: run.directives,
-            diagnostics: Vec::new(), contextual_diagnostic: None, aggregate_diagnostic,
-            actual_aggregate_diagnostics: run.actual.failures,
+            diagnostics: Vec::new(), contextual_diagnostic: None, aggregate_diagnostics,
             symbolic_diagnostic: None, additional_symbolic_diagnostics: Vec::new(), entry_evidence: run.entry_evidence,
         });
     }
@@ -7358,7 +7360,7 @@ fn check_loaded_ordered_proof_diagnostics_in_scope<const LOCAL_CATALOGS: bool>(
     )?;
     let (symbolic_diagnostic, additional_symbolic_diagnostics) = run.symbolic;
     Ok(MainFlowProofReceipt {
-        active: run.active, directives: run.directives, diagnostics: run.actual.observed.diagnostics, contextual_diagnostic: None, aggregate_diagnostic: None, actual_aggregate_diagnostics: Vec::new(),
+        active: run.active, directives: run.directives, diagnostics: run.actual.observed.diagnostics, contextual_diagnostic: None, aggregate_diagnostics: Vec::new(),
         symbolic_diagnostic, additional_symbolic_diagnostics, entry_evidence: run.entry_evidence,
     })
 }
@@ -8429,18 +8431,19 @@ impl PreparedProofModule {
                 .and_then(|(source, resolved)| array_quantifier::ArrayProof::prepare(self, source, resolved))
                 .and_then(|plan| {
                     let startup_count = self.prepared.parts().0.initialization_order.len();
-                    let run = run_prepared_ordered_check(
+                    let cohort = array_quantifier::Cohort::new(vec![plan])?;
+                    let mut run = run_prepared_ordered_check(
                         &self.prepared, ScalarCheckerScope::CurrentPackage, startup_count, OrderedReachPolicy::Closed,
-                        array_quantifier::Evidence::new(&plan),
+                        array_quantifier::Evidence::new(&cohort)?,
                     )?;
                     if !run.directives.is_empty() { return Err(ProjectCheck::Unsupported); }
-                    match run.symbolic {
+                    match run.symbolic.pop().flatten() {
                         Some(ProofCoverage::Applicable(Some(_))) => Ok(ProjectCheck::Refuted),
                         Some(ProofCoverage::Applicable(None)) => Ok(ProjectCheck::Proved),
                         Some(ProofCoverage::NoApplicableInputs) => Ok(ProjectCheck::NoApplicableInputs),
                         None if !run.actual.failures.is_empty() => Ok(ProjectCheck::Refuted),
                         None if run.actual.applicable => Ok(ProjectCheck::Proved),
-                        None if run.actual.seen => Ok(ProjectCheck::NoApplicableInputs),
+                        None if run.actual.saw_single_target() => Ok(ProjectCheck::NoApplicableInputs),
                         None => Err(ProjectCheck::Unsupported),
                     }
                 });
@@ -9266,6 +9269,29 @@ struct CheckedIntegerGuardSlots<'a> {
 
 #[cfg(feature = "internal-checker")]
 impl CheckedIntegerGuardSlots<'_> {
+    fn unary_domain(&self, ty: &ScalarType, work: &mut usize) -> Option<IntegerSet> {
+        use super::checker_flow::charge_call_work;
+        if self.arity != 1 || self.boolean.iter().any(Option::is_some) { return None; }
+        if self.always_rejects { return Some(IntegerSet::default()); }
+        let mut domain = IntegerSet::from_type(ty)?;
+        if let Some((slot, actual)) = self.domain {
+            if slot != 0 { return None; }
+            charge_call_work(work, actual.interval_count().checked_add(1)?)?;
+            match domain.intersection(actual) {
+                IntegerIntersection::Unchanged => {}
+                IntegerIntersection::Empty => return Some(IntegerSet::default()),
+                IntegerIntersection::Changed(kept) => domain = kept,
+            }
+        }
+        for cmp in &self.comparisons {
+            if cmp.slot != 0 { return None; }
+            charge_call_work(work, domain.interval_count().checked_add(1)?)?;
+            domain = domain.keep_relation(cmp.relation, cmp.bound);
+            if domain.is_empty() { break; }
+        }
+        Some(domain)
+    }
+
     fn accepts(&self, arguments: &[&BigInt]) -> bool {
         self.arity == arguments.len() && !self.always_rejects
             && self.boolean.iter().enumerate().all(|(slot, required)| required.is_none_or(|required| {
@@ -16848,14 +16874,14 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
         %%end"#;
         for passing in [universal, existential] {
             let report = ordered(passing, ScalarCheckerScope::CurrentPackage).unwrap();
-            assert!(report.active && report.aggregate_diagnostic.is_none());
+            assert!(report.active && report.aggregate_diagnostics.is_empty());
             assert_eq!(selected(passing), [ScalarModuleProofOutcome::Proved]);
         }
         for (refuted, index, value, step) in [
             (universal.replace("i == 0", "i == 1"), 1, 7, "core.show(items[i] == 0)"),
             (existential.replace("witness(1)", "witness(2)"), 2, 0, "core.witness(2)"),
         ] {
-            let failure = ordered(&refuted, ScalarCheckerScope::CurrentPackage).unwrap().aggregate_diagnostic.unwrap();
+            let failure = ordered(&refuted, ScalarCheckerScope::CurrentPackage).unwrap().aggregate_diagnostics.pop().unwrap();
             let cell = failure.cell.as_ref().expect("single rejected array cell");
             assert_eq!((&cell.index, &cell.value), (&BigInt::from(index), &BigInt::from(value)));
             assert_eq!(failure.witness.row_count(), 1);
@@ -16866,7 +16892,7 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
             assert_eq!(snippet(failure.failed_step.unwrap().range), step);
             assert_eq!(selected(&refuted), [ScalarModuleProofOutcome::Refuted]);
             let main = ordered(&refuted, ScalarCheckerScope::MainFlowOnly).unwrap();
-            assert!(!main.active && main.aggregate_diagnostic.is_none());
+            assert!(!main.active && main.aggregate_diagnostics.is_empty());
         }
         let out_of_bounds = universal.replace("i < 4", "i < 5");
         assert!(matches!(ordered(&out_of_bounds, ScalarCheckerScope::CurrentPackage),
@@ -16907,9 +16933,9 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
         };
         let scope = ScalarCheckerScope::CurrentPackage;
         let proved = ordered(program, scope).unwrap();
-        assert!(proved.active && proved.aggregate_diagnostic.is_none());
+        assert!(proved.active && proved.aggregate_diagnostics.is_empty());
         let broken = program.replace("value - 0", "value + 1");
-        let failure = ordered(&broken, scope).unwrap().aggregate_diagnostic.unwrap();
+        let failure = ordered(&broken, scope).unwrap().aggregate_diagnostics.pop().unwrap();
         let cell = failure.cell.as_ref().expect("single rejected array cell");
         assert_eq!(cell.index, BigInt::from(0));
         assert_eq!(cell.value, BigInt::from(8));
@@ -16918,16 +16944,16 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
         assert_eq!(at(failure.output.range), "adjusted");
         assert_eq!(at(failure.failed_step.unwrap().range), "core.show(items[i] == 7)");
         let broader = program.replace("entry == 6", "entry == 5");
-        let failure = ordered(&broader, scope).unwrap().aggregate_diagnostic.unwrap();
+        let failure = ordered(&broader, scope).unwrap().aggregate_diagnostics.pop().unwrap();
         assert_eq!(failure.cell.as_ref().expect("single rejected array cell").value, BigInt::from(6));
         assert!(failure.witness.intervals_at(0, 0).unwrap().eq([(&5.into(), &5.into())]));
         assert_eq!(&broader[failure.output.range.start as usize..failure.output.range.end as usize], "value + 1");
         let bounded = program.replace("entry == 6 || entry == 7", "entry >= 5 && entry <= 7")
             .replace("items[i] == 7", "items[i] <= 7");
-        assert!(ordered(&bounded, scope).unwrap().aggregate_diagnostic.is_none());
+        assert!(ordered(&bounded, scope).unwrap().aggregate_diagnostics.is_empty());
         let holes = program.replace("entry == 6 || entry == 7", "entry == 4 || entry == 6")
             .replace("items[i] == 7", "items[i] != 6");
-        assert!(ordered(&holes, scope).unwrap().aggregate_diagnostic.is_none());
+        assert!(ordered(&holes, scope).unwrap().aggregate_diagnostics.is_empty());
         let correlated = r#"%%start
             u8[1](u8, u8) reflect = fn(left, right) {
                 if (left < right) {
@@ -16943,7 +16969,7 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
                 ensures (items[i] != 6)
             {}
         %%end"#;
-        let failure = ordered(correlated, scope).unwrap().aggregate_diagnostic.unwrap();
+        let failure = ordered(correlated, scope).unwrap().aggregate_diagnostics.pop().unwrap();
         assert_eq!(failure.cell.as_ref().expect("single rejected array cell").value, BigInt::from(6));
         assert_eq!(failure.witness.row_count(), 1);
         assert_eq!(failure.witness.axes().len(), 2);
@@ -16955,12 +16981,12 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
         assert!(matches!(ordered(&then_overflow, scope), Err(ScalarOrderedCheckerOutcome::Unsupported)));
         let impossible = program.replace("entry == 6 || entry == 7", "entry < 6 && entry >= 6");
         let report = ordered(&impossible, scope).unwrap();
-        assert!(!report.active && report.aggregate_diagnostic.is_none());
+        assert!(!report.active && report.aggregate_diagnostics.is_empty());
         let with_requirement = broken.replace("%%end", &format!("core.require(false, {OUTPUT}); %%end"));
         let combined = ordered(&with_requirement, scope).unwrap();
-        assert!(combined.aggregate_diagnostic.is_some() && combined.directives.len() == 1);
+        assert!(combined.aggregate_diagnostics.len() == 1 && combined.directives.len() == 1);
         let main = ordered(&broken, ScalarCheckerScope::MainFlowOnly).unwrap();
-        assert!(!main.active && main.aggregate_diagnostic.is_none());
+        assert!(!main.active && main.aggregate_diagnostics.is_empty());
     }
 
     #[cfg(feature = "internal-checker")]
@@ -17000,13 +17026,13 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
         };
         for scope in [ScalarCheckerScope::MainFlowOnly, ScalarCheckerScope::CurrentPackage] {
             let proved = run(&text, scope).unwrap();
-            assert!(proved.active && proved.actual_aggregate_diagnostics.is_empty());
-            assert!(proved.aggregate_diagnostic.is_none() && proved.directives.is_empty());
+            assert!(proved.active && proved.aggregate_diagnostics.is_empty());
+            assert!(proved.directives.is_empty());
 
             let false_goal = text.replace("items[i] >= 0", "items[i] > 3");
             let refuted = run(&false_goal, scope).unwrap();
-            assert!(refuted.active && refuted.aggregate_diagnostic.is_none() && refuted.directives.is_empty());
-            let [first, second] = refuted.actual_aggregate_diagnostics.as_slice() else {
+            assert!(refuted.active && refuted.directives.is_empty());
+            let [first, second] = refuted.aggregate_diagnostics.as_slice() else {
                 panic!("both calls with value 3 must be checked, and separately");
             };
             let call = |span: &wosy_syntax::SourceSpan| {
@@ -17023,7 +17049,7 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
                 assert!(failure.witness.intervals_at(0, 0).unwrap().eq([(&three, &three)]));
             }
             let both = run(&false_goal.replace("outside_cell == -10", "outside_cell == 0"), scope).unwrap();
-            assert_eq!(both.actual_aggregate_diagnostics.len(), 2);
+            assert_eq!(both.aggregate_diagnostics.len(), 2);
             assert_eq!(both.directives.len(), 1);
             for invalid_index in [
                 text.replace("u64 index = 2", "u64 index = 3"),
@@ -17071,18 +17097,18 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
         %%end"#);
         for scope in [ScalarCheckerScope::MainFlowOnly, ScalarCheckerScope::CurrentPackage] {
             let receipt = run(nullary, scope).unwrap();
-            let [failure] = receipt.actual_aggregate_diagnostics.as_slice() else { panic!("reached explicit witness"); };
+            let [failure] = receipt.aggregate_diagnostics.as_slice() else { panic!("reached explicit witness"); };
             let cell = failure.cell.as_ref().unwrap();
             assert_eq!((cell.index.clone(), cell.value.clone()), (BigInt::from(1), BigInt::from(8)));
             assert!(failure.call.is_some() && failure.failed_step.is_some());
             assert!(failure.witness.axes().next().is_none());
             let passed = run(&nullary.replace("core.witness(1)", "core.witness(0)"), scope).unwrap();
-            assert!(passed.active && passed.actual_aggregate_diagnostics.is_empty());
+            assert!(passed.active && passed.aggregate_diagnostics.is_empty());
 
             let proved = run(&pair, scope).unwrap();
-            assert!(proved.active && proved.actual_aggregate_diagnostics.is_empty() && proved.directives.is_empty());
+            assert!(proved.active && proved.aggregate_diagnostics.is_empty() && proved.directives.is_empty());
             let receipt = run(&pair.replace("items[i] <= 5", "items[i] < 3"), scope).unwrap();
-            let [failure] = receipt.actual_aggregate_diagnostics.as_slice() else { panic!("only applicable pair"); };
+            let [failure] = receipt.aggregate_diagnostics.as_slice() else { panic!("only applicable pair"); };
             assert!(failure.call.is_some() && failure.failed_step.is_none() && receipt.directives.is_empty());
             let cell = failure.cell.as_ref().unwrap();
             assert_eq!((cell.index.clone(), cell.value.clone()), (BigInt::from(0), BigInt::from(3)));
@@ -17090,6 +17116,130 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
                 assert!(failure.witness.intervals_at(0, axis).unwrap().eq([(actual, actual)]));
             }
         }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    fn check_array_proof_cohort(
+        text: &str, scope: ScalarCheckerScope,
+    ) -> Result<MainFlowProofReceipt, ScalarOrderedCheckerOutcome> {
+        let src = source("src/main.w", "array-proof-cohort");
+        let (_, catalog) = crate::parse_proof_source(src.clone(), text.to_owned(), &[]).ok().unwrap();
+        check_loaded_scalar_ordered_local_proof_contexts(
+            Vec::new(), [(catalog, Vec::new())], vec![src], inputs(), scope, Vec::new(),
+        )
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn array_proof_cohort_shares_unused_union_and_publishes_real_declaration_witnesses() {
+        use crate::scalar::checker_flow::take_array_return_observations;
+        let text = r#"%%start
+            i8[2](i8) reflect = fn(value) { [value, -1 - value] };
+            proof has_nonnegative for reflect(entry) -> (items) where (entry >= 0 || entry == -2)
+                ensures (exists (u64 i where i < 2) { items[i] >= 0 }) {}
+            u8[1]() unavailable = fn { [6] };
+            proof independent for unavailable() -> (items)
+                forall (u64 i where i == 0) ensures (items[i] == 6) {}
+            proof never for unavailable() -> (items) where (false)
+                forall (u64 i where i == 0) ensures (items[i] == 99) {}
+            proof first_bounded for reflect(which) -> (items) where (which == 2 || which == -2)
+                forall (u64 i where i == 0) ensures (items[i] <= 2) {}
+        %%end"#;
+        let declared = ScalarCheckerScope::CurrentPackage;
+        take_array_return_observations();
+        let proved = check_array_proof_cohort(text, declared).unwrap();
+        assert!(proved.active && proved.aggregate_diagnostics.is_empty());
+        assert_eq!(take_array_return_observations(), (2, 0));
+
+        let false_goals = text.replace("items[i] >= 0", "items[i] > 0")
+            .replace("items[i] == 6", "items[i] == 8")
+            .replace("items[i] <= 2", "items[i] < 2");
+        let refuted = check_array_proof_cohort(&false_goals, declared).unwrap();
+        assert_eq!(take_array_return_observations(), (2, 0));
+        let [first, independent, third] = refuted.aggregate_diagnostics.as_slice()
+            else { panic!("all three declarations in authored order"); };
+        assert!(first.proof.range.start < independent.proof.range.start
+            && independent.proof.range.start < third.proof.range.start);
+        assert!(first.cell.is_none() && first.call.is_none());
+        let zero = BigInt::from(0);
+        assert!(first.witness.intervals_at(0, 0).unwrap().eq([(&zero, &zero)]));
+        assert_eq!(independent.cell.as_ref().unwrap().value, BigInt::from(6));
+        assert!(independent.witness.axes().next().is_none());
+        assert_eq!(third.cell.as_ref().unwrap().value, BigInt::from(2));
+        let two = BigInt::from(2);
+        assert!(third.witness.intervals_at(0, 0).unwrap().eq([(&two, &two)]));
+
+        let main = check_array_proof_cohort(&false_goals, ScalarCheckerScope::MainFlowOnly).unwrap();
+        assert!(!main.active && main.aggregate_diagnostics.is_empty());
+        assert_eq!(take_array_return_observations(), (0, 0));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn array_proof_cohort_keeps_actual_calls_separate_and_guards_independent() {
+        use crate::scalar::checker_flow::take_array_return_observations;
+        let text = format!(r#"%%start
+            u8[2](u8,u8) make = fn(tag, value) {{
+                if (tag == 1) {{ [value, 7] }} else {{ [9, value] }}
+            }};
+            proof first for make(tag, entry) -> (items) where (tag == 1 && entry == 3)
+                forall (u64 i where i == 0) ensures (items[i] == 3) {{}}
+            proof different for make(other, entry) -> (items) where (other == 2 && entry == 5)
+                ensures (exists (u64 i where i < 2) {{ items[i] == 5 }}) {{}}
+            proof again for make(mark, entry) -> (items) where (mark == 1 && entry == 3)
+                ensures (exists (u64 i where i < 2) {{ items[i] == 7 }}) {{ core.witness(1); }}
+            u8[2] pick = make(1, 3);
+            u8[2] middle = make(2, 5);
+            u8[2] repeat = make(1, 3);
+            u8 chosen = pick[0];
+            u8 outside = middle[1];
+            u8 repeated = repeat[0];
+            core.require(chosen == 3, {OUTPUT});
+            core.require(outside == 5, {OUTPUT});
+            core.require(repeated == 3, {OUTPUT});
+        %%end"#);
+        for scope in [ScalarCheckerScope::MainFlowOnly, ScalarCheckerScope::CurrentPackage] {
+            take_array_return_observations();
+            let proved = check_array_proof_cohort(&text, scope).unwrap();
+            assert!(proved.active && proved.aggregate_diagnostics.is_empty() && proved.directives.is_empty());
+            assert_eq!(take_array_return_observations(), (0, 3));
+            let refuted = check_array_proof_cohort(
+                &text.replace("items[i] == 3", "items[i] == 8").replace("core.witness(1)", "core.witness(0)"), scope,
+            ).unwrap();
+            let failures = &refuted.aggregate_diagnostics;
+            assert_eq!(failures.len(), 4);
+            assert!(refuted.directives.is_empty());
+            assert_eq!(take_array_return_observations(), (0, 3));
+            assert_eq!(failures[0].call, failures[1].call);
+            assert_eq!(failures[2].call, failures[3].call);
+            assert!(failures[0].call.as_ref().unwrap().range.start < failures[2].call.as_ref().unwrap().range.start);
+            assert!(failures[0].proof.range.start < failures[1].proof.range.start);
+            assert_eq!(failures[0].proof, failures[2].proof);
+            assert_eq!(failures[1].proof, failures[3].proof);
+            let [one, three] = [BigInt::from(1), BigInt::from(3)];
+            for failure in failures {
+                assert_eq!(failure.cell.as_ref().unwrap().value, three);
+                assert!(failure.witness.intervals_at(0, 0).unwrap().eq([(&one, &one)]));
+                assert!(failure.witness.intervals_at(0, 1).unwrap().eq([(&three, &three)]));
+            }
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn array_proof_cohort_requires_shared_unused_rectangles_without_cross_products() {
+        let text = r#"%%start
+            u8[2](u8,u8) make = fn(tag, value) { [tag, value] };
+            proof first for make(a, b) -> (items) where (a == 1 && b == 2)
+                forall (u64 i where i == 0) ensures (items[i] == 1) {}
+            proof second for make(x, y) -> (items) where (x == 1 && y == 2)
+                forall (u64 i where i == 1) ensures (items[i] == 2) {}
+        %%end"#;
+        let declared = ScalarCheckerScope::CurrentPackage;
+        let proved = check_array_proof_cohort(text, declared).unwrap();
+        assert!(proved.active && proved.aggregate_diagnostics.is_empty());
+        assert!(matches!(check_array_proof_cohort(&text.replace("x == 1 && y == 2", "x == 2 && y == 1"), declared),
+            Err(ScalarOrderedCheckerOutcome::Unsupported)));
     }
 
     #[cfg(feature = "internal-checker")]
@@ -17118,10 +17268,10 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
         let scope = ScalarCheckerScope::CurrentPackage;
         for program in [direct, captured.as_str()] {
             let proved = run(program, scope).unwrap();
-            assert!(proved.active && proved.aggregate_diagnostic.is_none());
+            assert!(proved.active && proved.aggregate_diagnostics.is_empty());
             assert_eq!(selected(program), [ScalarModuleProofOutcome::Proved]);
             let refuted = program.replace("items[i] >= 0", "items[i] > 0");
-            let failure = run(&refuted, scope).unwrap().aggregate_diagnostic.unwrap();
+            let failure = run(&refuted, scope).unwrap().aggregate_diagnostics.pop().unwrap();
             assert!(failure.cell.is_none() && failure.failed_step.is_none());
             assert_eq!(failure.witness.row_count(), 1);
             assert_eq!(failure.witness.axes().len(), 1);
@@ -17130,19 +17280,19 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
             assert!(failure.witness.intervals_at(0, 0).unwrap().eq([(&negative_one, &negative_one)]));
             assert_eq!(selected(&refuted), [ScalarModuleProofOutcome::Refuted]);
             let main = run(&refuted, ScalarCheckerScope::MainFlowOnly).unwrap();
-            assert!(!main.active && main.aggregate_diagnostic.is_none());
+            assert!(!main.active && main.aggregate_diagnostics.is_empty());
             // The cell at index 1 would mask the counterexample if the
             // quantified domain were treated as one contiguous interval.
             let all_cells = refuted.replace("i == 0 || i == 2", "i < 3");
-            assert!(run(&all_cells, scope).unwrap().aggregate_diagnostic.is_none());
+            assert!(run(&all_cells, scope).unwrap().aggregate_diagnostics.is_empty());
         }
 
         let empty = direct.replace("i == 0 || i == 2", "i < 0");
-        assert!(run(&empty, scope).unwrap().aggregate_diagnostic.unwrap().cell.is_none());
+        assert!(run(&empty, scope).unwrap().aggregate_diagnostics.pop().unwrap().cell.is_none());
         assert_eq!(selected(&empty), [ScalarModuleProofOutcome::Refuted]);
         let no_call = empty.replace("ensures (exists", "where (false) ensures (exists");
         let inactive = run(&no_call, scope).unwrap();
-        assert!(!inactive.active && inactive.aggregate_diagnostic.is_none());
+        assert!(!inactive.active && inactive.aggregate_diagnostics.is_empty());
         let out_of_range = direct.replace("i == 0 || i == 2", "i < 4");
         assert!(matches!(run(&out_of_range, scope), Err(ScalarOrderedCheckerOutcome::Unsupported)));
         let overflow = direct.replace("[value, 127, -1 - value]", "[7, 127, value + 1]")
@@ -17168,9 +17318,9 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
             check_loaded_scalar_ordered_local_proof_contexts(Vec::new(), [(catalog, Vec::new())],
                 vec![app.clone()], inputs(), ScalarCheckerScope::CurrentPackage, Vec::new())
         };
-        assert!(run(program).unwrap().aggregate_diagnostic.is_none());
+        assert!(run(program).unwrap().aggregate_diagnostics.is_empty());
         let wrong_arm = program.replace("[0, -1 - value]", "[-1, -1 - value]");
-        let failure = run(&wrong_arm).unwrap().aggregate_diagnostic.unwrap();
+        let failure = run(&wrong_arm).unwrap().aggregate_diagnostics.pop().unwrap();
         assert!(failure.cell.is_none());
         let zero = BigInt::from(0);
         assert!(failure.witness.intervals_at(0, 0).unwrap().eq([(&zero, &zero)]));
