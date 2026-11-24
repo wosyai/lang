@@ -19,8 +19,11 @@ void __wosy_core_free(void *base) {
 void __wosy_core_system_panic(void) { __builtin_trap(); }
 extern u64 wosy_test_multi_returned_owners(void);
 
+#ifndef EXPECTED
+#define EXPECTED 502
+#endif
 int check(void) {
-    return wosy_test_multi_returned_owners() != 502 || allocations != 2 || releases != 2;
+    return wosy_test_multi_returned_owners() != EXPECTED || allocations != 2 || releases != 2;
 }
 #ifndef WASI
 int main(void) { return check(); }

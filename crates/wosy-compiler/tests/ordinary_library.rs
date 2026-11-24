@@ -4446,8 +4446,25 @@ fn assert_multi_owning_formals(forwarded: bool) {
 
 #[test]
 fn multiple_returned_owners_preserve_ordered_original_bases() {
+    check_multiple_returned_owners(false);
+}
+
+#[test]
+fn multiple_returned_owners_discard_the_unbound_lane_at_its_binding() {
+    check_multiple_returned_owners(true);
+}
+
+fn check_multiple_returned_owners(discard: bool) {
     let app = source("workbench", "src/multi_returned_owners.w");
-    let text = include_str!("fixtures/multi-returned-owners.w");
+    let authored = include_str!("fixtures/multi-returned-owners.w");
+    let digit = if discard {
+        authored.replace("Packet front, Packet back = pair(2, 5);", "Packet front = pair(2, 5);")
+            .replace("front.length * 100 + back.length", "front.length * 100")
+            .replace("drive() != 502", "drive() != 500")
+    } else {
+        authored.to_owned()
+    };
+    let text = digit.as_str();
     for (target, target_layout) in [("native64", ScalarTargetLayout::NATIVE64), ("wasm32", ScalarTargetLayout::WASM32)] {
         let prepared = prepare_scalar_project(
             vec![(declarations(&app, text), Vec::new())], vec![app.clone()],
@@ -4486,36 +4503,44 @@ fn multiple_returned_owners_preserve_ordered_original_bases() {
             let mut transport = None;
             let mut received = Vec::new();
             let mut releases = Vec::new();
+            let mut cleanup_order = Vec::new();
             for row in consumer.get_basic_blocks().into_iter().flat_map(|block| block.get_instructions()) {
                 if let Ok(call) = CallSiteValue::try_from(row) {
                     if call.get_called_fn_value() == Some(producer) {
                         assert_eq!(call.count_arguments(), 4);
                         assert!(transport.replace(call.try_as_basic_value().basic().unwrap()).is_none());
                     } else if call.get_called_fn_value() == Some(free) {
+                        cleanup_order.push("release");
                         releases.push(row.get_operand(0).unwrap().value().unwrap().into_pointer_value().as_instruction_value().unwrap());
                     }
                 } else if row.get_opcode() == InstructionOpcode::ExtractValue && row.get_operand(0).unwrap().value() == transport {
                     assert_eq!(row.get_indices(), [received.len() as u32]);
                     received.push(row);
+                } else if row.get_opcode() == InstructionOpcode::Load && row.to_string().contains("load i64") {
+                    cleanup_order.push("read");
                 }
             }
             assert_eq!(received.len(), 2);
+            if discard {
+                assert_eq!(cleanup_order, ["release", "read", "release"], "{target}/{route}: {ir}");
+            }
             assert_eq!(releases, [received[1], received[0]], "{target}/{route}: {ir}");
             if let Some(directory) = std::env::var_os("WOSY_MULTI_RETURNED_OWNERS_IR_DIR") {
                 let mut witness = ir.replace("define i32 @main(", "define i32 @wosy_authored_main(");
                 witness.push_str(&format!("\ndefine i64 @wosy_test_multi_returned_owners() {{\nentry:\n  %value = call i64 @{}()\n  ret i64 %value\n}}\n", name("drive")));
-                std::fs::write(std::path::PathBuf::from(directory).join(format!("{target}-{route}.ll")), witness).unwrap();
+                let variant = if discard { "-discard" } else { "" };
+                std::fs::write(std::path::PathBuf::from(directory).join(format!("{target}-{route}{variant}.ll")), witness).unwrap();
             }
         }
     }
 }
 
 #[test]
-fn multiple_returned_owners_leave_unproved_discard_and_forwarding_closed() {
+fn multiple_returned_owners_leave_unproved_bare_results_and_forwarding_closed() {
     let app = source("workbench", "src/multi_returned_owners.w");
     let valid = include_str!("fixtures/multi-returned-owners.w");
-    let discard = valid.replace("Packet front, Packet back = pair(2, 5);", "Packet front = pair(2, 5);")
-        .replace("front.length * 100 + back.length", "front.length * 100");
+    let discard = valid.replace("Packet front, Packet back = pair(2, 5);", "pair(2, 5);")
+        .replace("front.length * 100 + back.length", "0");
     let forward = valid.replace("u64() drive = fn {", r#"(Packet, Packet)(u64, u64) relay = fn(left_size, right_size) {
     Packet earlier, Packet later = pair(left_size, right_size);
     earlier, later

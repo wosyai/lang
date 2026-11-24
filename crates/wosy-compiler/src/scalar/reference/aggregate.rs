@@ -2762,6 +2762,12 @@ pub(crate) struct ClosedFreshRecommit {
 }
 
 #[derive(Debug)]
+pub(crate) struct ClosedMultiReceive {
+    pub(crate) width: usize,
+    pub(crate) retained: Vec<ByteSpan>,
+}
+
+#[derive(Debug)]
 pub(crate) struct ClosedOwnerRelease {
     pub(crate) receipt: usize,
     pub(crate) output_lane: Option<usize>,
@@ -2823,7 +2829,7 @@ pub(crate) struct ClosedBody {
     pub(crate) calls: BTreeMap<usize, ClosedCall>,
     // Source output order and strictly increasing prepared output occurrence.
     pub(crate) multi_returns: Vec<((usize, usize), usize)>,
-    pub(crate) multi_receives: BTreeMap<usize, Vec<ByteSpan>>,
+    pub(crate) multi_receives: BTreeMap<usize, ClosedMultiReceive>,
     pub(crate) recommits: BTreeMap<usize, usize>,
     pub(crate) identity_relay: Option<usize>,
     pub(crate) scope_exits: BTreeMap<usize, CfgPointId>,
@@ -7238,7 +7244,7 @@ fn closed_aggregates<'a>(
                 let Some(lanes) = multi_producers.get(&target) else { continue };
                 let &(call, width) = facts.multi_selected_calls.get(&point).ok_or_else(unsupported_multi)?;
                 let receivers = facts.multi_result_bindings.get(&point).ok_or_else(unsupported_multi)?;
-                if width != lanes.len() || width != receivers.len() || !facts.unsupported.is_empty()
+                if width != lanes.len() || receivers.is_empty() || receivers.len() > width || !facts.unsupported.is_empty()
                     || !body.is_monomorphic
                 {
                     return Err(unsupported_multi());
@@ -7250,7 +7256,10 @@ fn closed_aggregates<'a>(
                     }
                     multi_at_exit.entry(endpoint).or_default().push((point, lane, call.0));
                 }
-                plan.multi_receives.insert(call.0, receivers.iter().map(|receiver| receiver.declaration_span).collect());
+                plan.multi_receives.insert(call.0, ClosedMultiReceive {
+                    width,
+                    retained: receivers.iter().map(|receiver| receiver.declaration_span).collect(),
+                });
             }
             if !lane_exits.is_empty() { return Err(unsupported_multi()); }
         }

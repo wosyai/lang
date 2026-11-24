@@ -882,16 +882,29 @@ pub(super) fn store_received_binding<'ctx>(
             }
         }
     }
-    if let Some(receivers) = state.body_call_nodes.and_then(|nodes| nodes.expression_ordinal(&binding.value))
-        .and_then(|call| state.aggregate.as_ref()?.plan.multi_receives.get(&call))
+    if let Some((call, receive)) = state.body_call_nodes.and_then(|nodes| nodes.expression_ordinal(&binding.value))
+        .and_then(|call| state.aggregate.as_ref()?.plan.multi_receives.get(&call).map(|receive| (call, receive)))
     {
-        if !binding.receivers.iter().map(|receiver| receiver.name_span).eq(receivers.iter().copied()) {
+        if !binding.receivers.iter().map(|receiver| receiver.name_span).eq(receive.retained.iter().copied()) {
             return Err("ordered owning call has changed its prepared receivers".into());
         }
         for (lane, receiver) in binding.receivers.iter().enumerate() {
             let EmitValue::Basic(BasicValueEnum::PointerValue(destination)) = extract_output(state, value, lane)?
                 else { return Err("missing ordered descriptor destination".into()) };
             state.storage.insert(receiver.name.clone(), (destination, receiver.ty.clone()));
+        }
+        if receive.retained.len() != receive.width {
+            declare_core_runtime(context, state.module);
+            let free = state.module.get_function(CORE_FREE_SYMBOL).ok_or("missing ordered output discard release")?;
+            let aggregate = state.aggregate.as_mut().expect("ordered output discard frame");
+            // Retained slots are now installed. Spend just the unbound suffix
+            // at this checked binding boundary, never at a later lexical exit.
+            for lane in (receive.retained.len()..receive.width).rev() {
+                let original = aggregate.receipts.remove(&(call, Some(lane)))
+                    .ok_or("discarded owning output lacks its original backing")?;
+                state.builder.build_call(free, &[original.into()], "owning_output_discard")
+                    .map_err(builder_error)?;
+            }
         }
         return Ok(true);
     }
@@ -1296,7 +1309,7 @@ fn emit_multiple_owner_call<'ctx, 'module>(
     let Some(ScalarType::Callable { parameters, outputs }) = state.signatures.get(symbol) else {
         return Err("missing ordered owning call signature".into());
     };
-    let width = state.aggregate.as_ref().expect("owning call frame").plan.multi_receives[&ordinal].len();
+    let width = state.aggregate.as_ref().expect("owning call frame").plan.multi_receives[&ordinal].width;
     if parameters.len() != arguments.len() || width != outputs.outputs.len()
         || function.get_linkage() != Linkage::Internal || function.count_params() as usize != parameters.len() + width
     {

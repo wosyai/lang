@@ -4594,7 +4594,8 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         let receivers = binding_region.receivers();
                         if let Some(&(ordinal, width)) = self.aggregate_facts.multi_owner_calls.get(&point) {
                             let signature = &calls.checked_call_signatures[&ordinal];
-                            if width == receivers.len() && outputs.secondary.len() + 1 == width
+                            if !receivers.is_empty() && receivers.len() <= width
+                                && outputs.secondary.len() + 1 == receivers.len()
                                 && receivers.iter().zip(&signature.outputs.outputs).all(|(receiver, output)| receiver.ty == output.ty)
                                 && outputs.secondary.iter().enumerate().all(|(index, output)|
                                     *output == (BindingOutput::ProjectPrimary { output: index + 1 }))
