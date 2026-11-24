@@ -2787,7 +2787,20 @@ impl Body<'_> {
             [result] => return self.immediate_receipt_choice(result, output_ty),
             [bind, result] => (bind, None, None, result),
             [bind, BlockItem { kind: BlockItemKind::Evaluation { expression }, .. }, result] =>
-                (bind, None, Some(*expression), result),
+                (bind, None, Some((*expression, None)), result),
+            [bind, saved, result] if matches!(&result.kind,
+                BlockItemKind::FinalOutput(output) if structure.edges.contains_key(&(
+                    OccurrenceParent::Expression(output.expression), OccurrenceEdge::BinaryLeft,
+                ))) =>
+            {
+                let BlockItemKind::Binding(saved) = &saved.kind else { return None };
+                let [receiver] = saved.receivers() else { return None };
+                let BindingInitialization::Outputs(init) = &saved.initialization else { return None };
+                if receiver.ty != output_ty.ty || !init.secondary.is_empty()
+                    || structure.checked_types.expressions.get(&init.primary) != Some(&receiver.ty)
+                { return None; }
+                (bind, None, Some((init.primary, Some(receiver))), result)
+            },
             [bind, alias, result] => (bind, Some(alias), None, result),
             _ => return None,
         };
@@ -2812,7 +2825,7 @@ impl Body<'_> {
             || holder.declaration_span != receiver.span || !matches!(join.kind, CfgPointKind::Join)
             || join.source_span.range != self.sites.occurrences.get(init.primary.0)?.span
         { return None; }
-        let read = if let Some(observation) = before_consume {
+        let (read, saved_observation) = if let Some((observation, saved)) = before_consume {
             // A discarded scalar read can observe the selected lexical owner
             // before its transfer, only by an immediate, certified noescape loan.
             let signature = self.sites.checked_call_signatures.get(&observation)?;
@@ -2837,11 +2850,24 @@ impl Body<'_> {
                     concrete: ConcreteCallSelection::Declaration, .. }, argument_points, .. }
                     if argument_points.as_slice() == [read.id])
             { return None; }
-            let transfer = next(reader.id)?;
-            if transfer.scope != scope { return None; }
-            transfer
+            let after_reader = next(reader.id)?;
+            if after_reader.scope != scope { return None; }
+            if let Some(saved) = saved {
+                let CfgPointKind::Bind { binding } = &after_reader.kind else { return None };
+                if &saved.ty != &result.ty || binding == holder || binding.declaration_span != saved.span
+                    // The provisional scalar call/bind can have no frozen origin
+                    // row yet; its prepared ordinary signature and receiver prove
+                    // that no checked or owning output is installed here.
+                    || !after_reader.possible_origins.as_ref().is_none_or(BTreeSet::is_empty)
+                { return None; }
+                let transfer = next(after_reader.id)?;
+                if transfer.scope != scope { return None; }
+                (transfer, Some(binding))
+            } else {
+                (after_reader, None)
+            }
         } else {
-            read
+            (read, None)
         };
         let end_use = |last: &ReferenceFlowPoint| {
             let returned = next(last.id)?;
@@ -2852,6 +2878,15 @@ impl Body<'_> {
                     if value_point == last.id)
                 && matches!(exit.kind, CfgPointKind::ScopeExit)).then_some(exit.id)
         };
+        let scalar_call = if saved_observation.is_some() {
+            let OccurrenceNode::Expression(left) = *structure.edges.get(&(
+                OccurrenceParent::Expression(output.expression), OccurrenceEdge::BinaryLeft,
+            ))? else { return None };
+            if structure.checked_types.expressions.get(&left) != Some(&output_ty.ty) {
+                return None;
+            }
+            left
+        } else { output.expression };
         let use_site = if let Some((observed, field)) = self.sites.prepared_lexical_member(output.expression) {
             if alias.is_some() || before_consume.is_some() || observed != holder || &field.structure != descriptor
                 || !matches!(&read.kind, CfgPointKind::ReadPlace { pointer_point: None, reads_origin: false,
@@ -2861,14 +2896,14 @@ impl Body<'_> {
             { return None; }
             LocalChoiceUse::Observe(end_use(read)?)
         } else {
-            let signature = self.sites.checked_call_signatures.get(&output.expression)?;
+            let signature = self.sites.checked_call_signatures.get(&scalar_call)?;
             let [parameter] = signature.parameters.as_slice() else { return None };
             let [scalar] = signature.outputs.outputs.as_slice() else { return None };
             if scalar.ty != output_ty.ty
-                || self.sites.declared_unsafe_calls.contains(&output.expression.0)
+                || self.sites.declared_unsafe_calls.contains(&scalar_call.0)
             { return None; }
             let OccurrenceNode::Expression(argument) = *structure.edges.get(&(
-                OccurrenceParent::Expression(output.expression), OccurrenceEdge::CallArgument(0),
+                OccurrenceParent::Expression(scalar_call), OccurrenceEdge::CallArgument(0),
             ))? else { return None };
             let argument_span = self.sites.occurrences.get(argument.0)?.span;
             if let ScalarType::CheckedReference { mutability: ScalarReferenceMutability::Shared, inner } = parameter {
@@ -2918,10 +2953,27 @@ impl Body<'_> {
                         concrete: ConcreteCallSelection::Declaration, .. }, argument_points, .. }
                         if argument_points.as_slice() == [read.id])
                 { return None; }
-                let origins = facts.inputs.get(&(consumer.id, output.expression.0, 0, ArgumentProvenance::WholeMove(moved.id)))?;
+                let origins = facts.inputs.get(&(consumer.id, scalar_call.0, 0, ArgumentProvenance::WholeMove(moved.id)))?;
                 if origins.len() != 1 || !origins.contains(&None) { return None; }
-                end_use(consumer)?;
-                LocalChoiceUse::Consume { point: consumer.id, ordinal: output.expression }
+                if let Some(binding) = saved_observation {
+                    let OccurrenceNode::Expression(right) = *structure.edges.get(&(
+                        OccurrenceParent::Expression(output.expression), OccurrenceEdge::BinaryRight,
+                    ))? else { return None };
+                    let saved_read = next(consumer.id)?;
+                    let sum = next(saved_read.id)?;
+                    if consumer.scope != scope || consumer.source_span.range != self.sites.occurrences.get(scalar_call.0)?.span
+                        || saved_read.scope != scope || saved_read.source_span.range != self.sites.occurrences.get(right.0)?.span
+                        || structure.checked_types.expressions.get(&right) != Some(&output_ty.ty)
+                        || !matches!(self.sites.prepared_plain_name(right),
+                            Some(PlainNameIdentity::Lexical(actual)) if actual == binding)
+                        || !matches!(&saved_read.kind, CfgPointKind::Read { binding: actual } if actual == binding)
+                        || !matches!(sum.kind, CfgPointKind::Evaluate(ScalarExpression::Binary { operator: BinaryOperator::Add, .. }))
+                    { return None; }
+                    end_use(sum)?;
+                } else {
+                    end_use(consumer)?;
+                }
+                LocalChoiceUse::Consume { point: consumer.id, ordinal: scalar_call }
             }
         };
         Some(LocalReceiptChoice {
