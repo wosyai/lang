@@ -1364,6 +1364,16 @@ fn lexical_conditional_owner_choice_releases_selected_original_after_read() {
         .replace("drive(2, true) }", "if (drive(2, true) == 4) { 2 } else { 0 } }")
         .replace("drive(3, true) }", "if (drive(3, true) == 24) { 12 } else { 0 } }");
     assert_ne!(saved_then_consumed, borrowed_then_consumed);
+    let forwarding = |consume: &str| saved_then_consumed.replace(
+        "u64(Packet) consume = fn(packet) { packet.length };",
+        &format!("u64(Packet) terminal = fn(packet) {{ packet.length }};\n\
+                  u64(Packet) forward = fn(packet) {{ terminal(packet) }};\n\
+                  u64(Packet) consume = fn(packet) {{ {consume} }};"),
+    );
+    let through_calls = forwarding("forward(packet)");
+    let through_arms = forwarding("if (packet.length == 2) { terminal(packet) } else { forward(packet) }");
+    assert_ne!(through_calls, saved_then_consumed);
+    assert_ne!(through_arms, saved_then_consumed);
     let multiple_then_consumed = saved_then_consumed
         .replace("u64(*u64) read_selected", "u64(*Packet) read_whole = fn(view) { (*view).length };\nu64(*u64) read_selected")
         .replace("    u64 observed = read_selected", "    read_whole(&chosen);\n    u64 observed = read_selected");
@@ -1410,6 +1420,8 @@ fn lexical_conditional_owner_choice_releases_selected_original_after_read() {
         (temporary.as_str(), "consume-temporary"), (borrowed.as_str(), "borrow"),
         (borrowed_then_consumed.as_str(), "consume-after-borrow"),
         (saved_then_consumed.as_str(), "consume-after-saved-borrow"),
+        (through_calls.as_str(), "consume-after-forwarded-borrow"),
+        (through_arms.as_str(), "consume-after-exhaustive-borrow"),
         (multiple_then_consumed.as_str(), "consume-after-multiple-borrows"),
         (saved_then_released.as_str(), "release-after-saved-borrows"),
         (computed_then_released.as_str(), "release-after-scalar-continuation"),
@@ -1423,7 +1435,9 @@ fn lexical_conditional_owner_choice_releases_selected_original_after_read() {
         let releases_saved = matches!(base_use, "release-after-saved-borrows" | "release-after-scalar-continuation");
         let multiple = releases_saved || base_use == "consume-after-multiple-borrows";
         let updates_metadata = base_use == "consume-after-metadata-write";
-        let borrowing = multiple || updates_metadata
+        let exhaustive = base_use == "consume-after-exhaustive-borrow";
+        let forwarding = exhaustive || base_use == "consume-after-forwarded-borrow";
+        let borrowing = multiple || updates_metadata || forwarding
             || matches!(base_use, "borrow" | "named-borrow" | "consume-after-borrow" | "consume-after-saved-borrow");
         for (target, target_layout) in [("native64", ScalarTargetLayout::NATIVE64), ("wasm32", ScalarTargetLayout::WASM32)] {
             for project in [false, true] {
@@ -1514,13 +1528,42 @@ fn lexical_conditional_owner_choice_releases_selected_original_after_read() {
                     }
                     assert!(released.is_empty(), "the caller transferred rather than freed the receipt");
                     assert_eq!(transfers, [(descriptor, selected)], "pass the descriptor and its independent backing");
-                    let frees = consumer.get_basic_blocks().into_iter().flat_map(|block| block.get_instructions())
-                        .filter_map(|row| {
-                            let call = CallSiteValue::try_from(row).ok()?;
-                            (call.get_called_fn_value()?.get_name().to_str().ok()? == "__wosy_core_free")
-                                .then(|| row.get_operand(0).unwrap().value().unwrap())
-                        }).collect::<Vec<_>>();
-                    assert_eq!(frees, [consumer.get_last_param().unwrap()]);
+                    let frees = |function: inkwell::values::FunctionValue<'_>| function.get_basic_blocks()
+                        .into_iter().flat_map(|block| block.get_instructions()).filter(|row| {
+                            let Ok(call) = CallSiteValue::try_from(*row) else { return false };
+                            let Some(target) = call.get_called_fn_value() else { return false };
+                            if target.get_name().to_str().unwrap() != "__wosy_core_free" { return false; }
+                            assert_eq!(row.get_operand(0).unwrap().value().unwrap(), function.get_last_param().unwrap());
+                            true
+                        }).count();
+                    if forwarding {
+                        let middle = find("forward");
+                        let terminal = find("terminal");
+                        let forwarded = |function: inkwell::values::FunctionValue<'_>| {
+                            let mut targets = Vec::new();
+                            for row in function.get_basic_blocks().into_iter().flat_map(|block| block.get_instructions()) {
+                                if row.get_opcode() != InstructionOpcode::Call { continue; }
+                                let call = CallSiteValue::try_from(row).unwrap();
+                                let target = call.get_called_fn_value().unwrap();
+                                if target == middle || target == terminal {
+                                    assert_eq!(call.count_arguments(), 2);
+                                    assert_eq!(row.get_operand(1).unwrap().value().unwrap(), function.get_last_param().unwrap());
+                                    targets.push(if target == middle { "forward" } else { "terminal" });
+                                } else {
+                                    assert!(matches!(target.get_name().to_str().unwrap(),
+                                        "llvm.memmove.p0.p0.i32" | "llvm.memmove.p0.p0.i64"));
+                                }
+                            }
+                            targets
+                        };
+                        assert_eq!(frees(consumer), 0);
+                        assert_eq!(frees(middle), 0);
+                        assert_eq!(frees(terminal), 1);
+                        assert_eq!(forwarded(middle), ["terminal"]);
+                        assert_eq!(forwarded(consumer), if exhaustive { vec!["terminal", "forward"] } else { vec!["forward"] });
+                    } else {
+                        assert_eq!(frees(consumer), 1);
+                    }
                 } else {
                     if borrowing {
                         assert!(reader_seen);
@@ -1572,11 +1615,13 @@ fn lexical_conditional_owner_choice_releases_selected_original_after_read() {
                         assert!(emit(&excess).expect_err("four observations exceed the lexical corridor budget")
                             .contains("aggregate owning call has no proved endpoint"));
                     }
-                    let forward = text.replace("u64(Packet) consume = fn(packet) { packet.length };",
-                        "u64(Packet) terminal = fn(packet) { packet.length };\nu64(Packet) consume = fn(packet) { terminal(packet) };");
-                    assert_ne!(forward, text);
-                    assert!(emit(&forward).expect_err("the joined owner must reach a proved terminal consumer")
-                        .contains("local conditional owner requires a proved terminal consumer"));
+                    if use_site == "consume" {
+                        let cycle = text.replace("u64(Packet) consume = fn(packet) { packet.length };",
+                            "u64(Packet) terminal = fn(packet) { consume(packet) };\nu64(Packet) consume = fn(packet) { terminal(packet) };");
+                        assert_ne!(cycle, text);
+                        assert!(emit(&cycle).expect_err("the joined owner must ground in a terminal release")
+                            .contains("aggregate owning formal transfer does not reach a proved release"));
+                    }
                 } else if borrowing {
                     if releases_saved {
                         let result = if base_use == "release-after-scalar-continuation" {

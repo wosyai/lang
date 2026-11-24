@@ -5052,11 +5052,12 @@ fn closed_aggregates<'a>(
                 continue;
             }
             let action = if let Some(&receipt) = local_choice_consumers.get(&(caller, consumer, ordinal)) {
-                if slot != 0 || mixed || release.is_none() || forward_edges.contains_key(&(callee, slot))
-                    || conditional_forward_edges.contains_key(&(callee, slot))
-                {
-                    return Err(format!("local conditional owner requires a proved terminal consumer in {:?}", bodies[&caller].source));
+                if slot != 0 || mixed {
+                    return Err(format!("local conditional owner requires an exact owning formal in {:?}", bodies[&caller].source));
                 }
+                // This binding transfers its single selected backing to the
+                // same proved formal graph as other owning arguments. The
+                // worklist below requires a grounded terminal on every route.
                 ClosedInput::Transfer(receipt)
             } else { match origins.iter().next().filter(|_| origins.len() == 1) {
                 Some(Some(InputOrigin::Plain(_))) => ClosedInput::Plain,
