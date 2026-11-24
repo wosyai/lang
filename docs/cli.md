@@ -18,59 +18,29 @@ Compiles the full reachable source graph:
 
 Fails with `build rejected by syntax diagnostics`, `build rejected by CST derivation diagnostics`, or `build rejected by semantic diagnostics`. Missing imports fail as `M0001: missing module <package>::<path>`; cycles fail as `M0003: import cycle`.
 
-## `wosy check [TARGET] --profile dev [--main-flow-only]`
+## `wosy check`
 
-Checks the selected main flow and checks unused functions symbolically in the
-current package. The default scope needs a declared `[package].source_root`;
-`--main-flow-only` selects only the reachable main flow and does not require
-that field. `--declared-package` explicitly selects the default scope and
-cannot be combined with `--main-flow-only`.
+Analyze the selected target without building or running it.
 
-Check does not build, run, or generate an artifact. It reports refuted proof
-obligations and publishes supported authored `core.require` and `core.narrow`
-outputs. The first nonzero authored status takes precedence; otherwise a
-refuted proof exits 1 and a successful check exits 0. An invalid or unsupported
-analysis or rejected output preflight exits 2 without writing authored stdout
-or stderr or publishing any requested file. The checker does not yet support
-all language and proof constructs.
+- **Default (`--declared-package`):** Check the main flow and symbolically check
+  unused functions in the current package. Set `[package].source_root` to a
+  package-relative source directory containing the target entry and library
+  sources. Use real directories and regular `.w` files, not symlinks. The
+  scan skips nested packages; unimported module initializers do not run.
+- **`--main-flow-only`:** Check only the reachable main flow. This scope does
+  not require `source_root` and cannot be combined with `--declared-package`.
 
-In the supported scalar calling proofs, a named `core.use` on a reached
-startup call checks the cited precondition at that call's actual entry and
-the cited proof against that same return. It does not evaluate a second call
-or substitute a symbolic summary for the reached result. Unused functions
-are checked only in the declared-package scope.
+On completion, the first nonzero code from a failing `core.require` or
+`core.narrow` sets the exit status. With no such code, a refuted proof exits 1;
+otherwise the check exits 0. Invalid input, unsupported analysis, or output
+errors exit 2. The selected authored code must fit in `0..=255`.
 
-A bare literal comparison can also target a qualified, pure unary integer
-function in the same package. The checker observes direct startup calls after
-the imported module has initialized, or an unused symbolic root in the
-declared-package scope. This profile does not support nested calls through the
-qualified target or publish an ordinary call summary for it.
-
-Non-inductive proofs of pure unary integer functions can use check-time
-`if` case splits on the input, including nested splits and ordered
-`core.show` steps that compare the returned value with a literal or
-establish equality to the input. In this profile, `core.rewrite` can use an
-earlier equality from the same branch or an enclosing block to replace one
-occurrence in the current goal. Branch-local equalities and rewrites do not
-carry to siblings or past the join. A branch can also cite a bare equality
-proof of the same callable with `core.use` if that branch establishes the
-cited precondition. The cited proof is checked independently. Only the
-branch and its descendants can use its equality, including for rewrites.
-Proof steps do not execute in artifacts.
-
-Supported bare integer comparison proofs can refine ordinary unary calls
-in the declared-package scope. For a pure local producer, the checker
-retains the verified return partitions under the proof's precondition, so
-reuse preserves the connection between each argument and its return.
-Calls outside the verified precondition cannot borrow that result.
-
-Check diagnostics and stream output work on native CLI hosts. Authored file
-output currently requires a Linux CLI host and a flat filename under
-`.wosy/outputs/check/`; other file requests are refused before authored output
-is published. This is independent of the selected artifact's target platform.
-File preparation can create empty output directories even if it fails. After
-preparation succeeds, records are published in order; a later I/O error can
-leave earlier records published.
+Directives can write to stdout, stderr, or files. File output requires a
+Linux host, regardless of target. Request distinct unused filenames
+directly under `.wosy/outputs/check/`.
+No authored output is published before preparation succeeds, though failed
+preparation can leave empty directories. Output is then published in order;
+a later I/O failure can leave earlier output in place.
 
 ## `wosy run [TARGET] --profile dev [-- ARGS...]`
 

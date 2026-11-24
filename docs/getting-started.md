@@ -23,15 +23,14 @@ i32 result = add_one(41);
 %%end
 ```
 
-## Check, build and run
+## Build and run
 
 ```sh
-wosy check app --profile dev
 wosy build app --profile dev
 wosy run app --profile dev -- <program-args>
 ```
 
-`check` can run before a build and checks the main flow and unused functions in the declared package. Use `--main-flow-only` to restrict it to the main flow.
+To verify proofs or checker directives, see [`wosy check`](cli.md#wosy-check).
 
 `build` type-checks every reachable module, emits `partition.ll` plus `runtime.ll`, invokes the configured builder, and writes `artifact-manifest.json`. `run` verifies the manifest is fresh and invokes the configured runner. Any source or `wosy.toml` change requires a rebuild; otherwise `run` reports `artifact manifest is stale`.
 
