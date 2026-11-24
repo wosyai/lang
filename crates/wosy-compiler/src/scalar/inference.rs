@@ -341,26 +341,44 @@ impl<'a> ScalarInferenceBuilder<'a> {
     ) {
         if !self.suppress_checked_occurrences {
             #[cfg(feature = "internal-checker")]
-            for file in marker.output.state_files.iter_mut() {
-                use super::checker_directive::{CheckerStateSelection, CheckerStateType};
-                let nominal = match (&mut file.ty, &mut file.selection) {
-                    (CheckerStateType::Nominal(id), _) => Some(id),
-                    (_, CheckerStateSelection::LexicalField { owner, .. }) => Some(owner),
-                    _ => None,
-                };
-                if let Some(id) = nominal {
-                    if let Some(shared) = self.occurrences.snapshot_types.get(id.as_ref()) {
-                        if !std::rc::Rc::ptr_eq(id, shared) { *id = shared.clone(); }
-                    } else {
-                        self.occurrences.snapshot_types.insert(id.clone());
-                    }
-                } else if matches!(file.ty, super::checker_directive::CheckerStateType::FixedArray) {
-                    self.occurrences.snapshot_array_demand = true;
+            {
+                use super::checker_directive::CheckerCode;
+                if let CheckerCode::Projection(selection, ..) = &mut marker.output.code_value {
+                    self.record_snapshot_demand(selection, None);
+                }
+                for file in marker.output.state_files.iter_mut() {
+                    self.record_snapshot_demand(&mut file.selection, Some(&mut file.ty));
                 }
             }
             self.occurrences
                 .checker_directives
                 .insert(std::ptr::from_ref(expression), marker);
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    fn record_snapshot_demand(
+        &mut self,
+        selection: &mut super::checker_directive::CheckerStateSelection,
+        ty: Option<&mut super::checker_directive::CheckerStateType>,
+    ) {
+        use super::checker_directive::{CheckerAggregateProjection, CheckerStateSelection, CheckerStateType};
+        let nominal = match (selection, ty) {
+            (CheckerStateSelection::LexicalProjection {
+                component: CheckerAggregateProjection::Nominal { owner, .. }, ..
+            }, _) | (_, Some(CheckerStateType::Nominal(owner))) => owner,
+            (CheckerStateSelection::LexicalProjection {
+                component: CheckerAggregateProjection::FixedArray { .. }, ..
+            }, _) | (_, Some(CheckerStateType::FixedArray)) => {
+                self.occurrences.snapshot_array_demand = true;
+                return;
+            }
+            _ => return,
+        };
+        if let Some(shared) = self.occurrences.snapshot_types.get(nominal.as_ref()) {
+            if !std::rc::Rc::ptr_eq(nominal, shared) { *nominal = shared.clone(); }
+        } else {
+            self.occurrences.snapshot_types.insert(nominal.clone());
         }
     }
 

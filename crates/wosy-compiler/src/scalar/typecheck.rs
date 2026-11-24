@@ -3358,16 +3358,34 @@ fn check_expression_type_in_module(
             );
             #[cfg(feature = "internal-checker")]
             let configured_output = directive.output.explicit_with_state(|expression| {
-                use super::checker_directive::{CheckerStateSelection, CheckerStateType};
+                use super::checker_directive::{CheckerAggregateProjection, CheckerStateSelection, CheckerStateType};
                 if let ScalarExpression::Member { receiver, name, enum_tag: None, .. } = expression {
                     let ScalarType::Struct(owner) = scope.get(receiver)? else { return None; };
                     let (owner, field) = checked_authored_snapshot_field(owner, name, modules)?;
                     let ty = &field.ty;
                     if *ty != ScalarType::Bool && !is_integer_type(ty) { return None; }
-                    let selection = CheckerStateSelection::LexicalField {
-                        receiver: receiver.as_str().into(), owner, field: field.id.index,
+                    let selection = CheckerStateSelection::LexicalProjection {
+                        receiver: receiver.as_str().into(),
+                        component: CheckerAggregateProjection::Nominal { owner, field: field.id.index },
                     };
                     return Some((selection, CheckerStateType::Scalar(ty.clone())));
+                }
+                if let ScalarExpression::IndexedRead { place, .. } = expression {
+                    let ScalarPlace::Index { base, index, .. } = place else { return None; };
+                    let ScalarPlace::Name { name, .. } = base.as_ref() else { return None; };
+                    let ScalarType::Array { element, length, .. } = scope.get(name)? else { return None; };
+                    let ScalarExpression::Integer { value, .. } = index.as_ref() else { return None; };
+                    let index = usize::try_from(value).ok()?;
+                    if index >= 64 || u64::try_from(index).ok()? >= *length || *length > 64
+                        || (element.as_ref() != &ScalarType::Bool && !is_integer_type(element))
+                    {
+                        return None;
+                    }
+                    let selection = CheckerStateSelection::LexicalProjection {
+                        receiver: name.as_str().into(),
+                        component: CheckerAggregateProjection::FixedArray { length: *length, index },
+                    };
+                    return Some((selection, CheckerStateType::Scalar(element.as_ref().clone())));
                 }
                 if !matches!(expression, ScalarExpression::Name { .. } | ScalarExpression::Contextual { .. })
                 {

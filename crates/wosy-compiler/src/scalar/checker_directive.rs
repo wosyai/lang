@@ -84,7 +84,7 @@ impl CheckerScalarTransform {
     fn select(expression: &ScalarExpression) -> (&ScalarExpression, Self) {
         #[cfg(feature = "internal-checker")]
         if let ScalarExpression::Unary { operator, operand, .. } = expression {
-            if matches!(operand.as_ref(), ScalarExpression::Name { .. } | ScalarExpression::Contextual { .. } | ScalarExpression::Member { .. }) {
+            if matches!(operand.as_ref(), ScalarExpression::Name { .. } | ScalarExpression::Contextual { .. } | ScalarExpression::Member { .. } | ScalarExpression::IndexedRead { .. }) {
                 let transform = match operator {
                     super::UnaryOperator::LogicalNot => Self::LogicalNot,
                     super::UnaryOperator::Negate => Self::Negate,
@@ -116,6 +116,8 @@ pub(super) enum CheckerCode {
     Binding(std::rc::Rc<ReferenceBindingId>, ScalarType, CheckerScalarTransform),
     #[cfg(feature = "internal-checker")]
     Module(ByteSpan, ScalarType, CheckerScalarTransform),
+    #[cfg(feature = "internal-checker")]
+    Projection(CheckerStateSelection, ScalarType, CheckerScalarTransform),
 }
 
 impl CheckerCode {
@@ -136,11 +138,18 @@ pub(super) enum CheckerStateSelection {
     #[cfg(feature = "internal-checker")]
     Aggregate(std::rc::Rc<CheckerSnapshotShape>),
     #[cfg(feature = "internal-checker")]
-    LexicalField { receiver: std::rc::Rc<str>, owner: std::rc::Rc<super::ScalarStructId>, field: usize },
+    LexicalProjection { receiver: std::rc::Rc<str>, component: CheckerAggregateProjection },
     #[cfg(feature = "internal-checker")]
     AggregateLeaf { shape: std::rc::Rc<CheckerSnapshotShape>, leaf: usize },
     #[cfg(feature = "internal-checker")]
     Module(ByteSpan),
+}
+
+#[cfg(feature = "internal-checker")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum CheckerAggregateProjection {
+    Nominal { owner: std::rc::Rc<super::ScalarStructId>, field: usize },
+    FixedArray { length: u64, index: usize },
 }
 
 #[cfg(feature = "internal-checker")]
@@ -353,10 +362,17 @@ impl CheckerOutput<'_> {
                 let (operand, transform) = CheckerScalarTransform::select(code);
                 let (selection, state_ty) = select(operand)?;
                 if !transform.accepts(&state_ty) { return None; }
-                let (CheckerStateSelection::Lexical(name), CheckerStateType::Scalar(ty)) = (selection, state_ty)
-                    else { return None; };
-                if !super::typecheck::is_integer_type(&ty) { return None; }
-                CheckerCode::Lexical(name, ty, transform)
+                let ty = match state_ty {
+                    CheckerStateType::Scalar(ty) if super::typecheck::is_integer_type(&ty) => ty,
+                    _ => return None,
+                };
+                match selection {
+                    CheckerStateSelection::Lexical(name) => CheckerCode::Lexical(name, ty, transform),
+                    #[cfg(feature = "internal-checker")]
+                    selection @ CheckerStateSelection::LexicalProjection { .. } =>
+                        CheckerCode::Projection(selection, ty, transform),
+                    _ => return None,
+                }
             }
         };
         let mut targets = CheckedOutputTargets::default();

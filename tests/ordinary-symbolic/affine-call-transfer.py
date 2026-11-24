@@ -1693,6 +1693,28 @@ cases.extend([
     ("authored-state-nominal-move-not-copy",nominal_move,2,b"unsupported analysis"),
     ("authored-state-nominal-copy-mutation-unsupported",nominal_mutated_copy,2,b"unsupported analysis"),
 ])
+authored_array_projection = f"""%%start
+    unit(i8) check = fn(value) {{
+        core.narrow(value == 1 || value == 3, {report(167,"HOLES")});
+        i8[3] original = [value, 57, 99];
+        i8[3] copied = original;
+        value = 7;
+        core.require(value != 7, {{ .stdout = ""; .stderr = "ARRAY-PROJECTION"; .code = copied[1];
+            .files = [{{ .path = "selected.json"; .state = copied[0]; }}]; }});
+    }};
+    %%end"""
+authored_projection_code_only = """%%start
+    struct Snapshot { i8 status; }
+    unit(i8) check = fn(value) {
+        Snapshot saved = { .status = value; };
+        core.require(value != 7, { .stdout = ""; .stderr = "PROJECTED-CODE"; .code = saved.status; .files = []; });
+    };
+    %%end"""
+cases.extend([
+    ("authored-state-array-projection-code-and-file",authored_array_projection,57,b"ARRAY-PROJECTION"),
+    ("authored-state-array-projection-nonsingleton-code",authored_array_projection.replace(".code = copied[1]",".code = copied[0]"),2,b"unsupported analysis"),
+    ("authored-state-nominal-projection-code-only",authored_projection_code_only,7,b"PROJECTED-CODE"),
+])
 authored_nominal_field = f"""%%start
     struct copy Snapshot {{ i8 saved; bool ready; i8 omitted; }}
     unit(i8) check = fn(value) {{
@@ -1810,6 +1832,7 @@ copied_nominal_bytes = state_bytes({
 })
 copied_array_bytes = state_bytes(array_state({"kind":"i8"}, [copied_alternatives, typed_state("i8", 4)]))
 authored_files = {
+    "authored-state-array-projection-code-and-file": {"selected.json": state_bytes(copied_alternatives)},
     "authored-state-nominal-field-only": {
         "saved.json": state_bytes(copied_alternatives),
         "inverted.json": state_bytes(typed_state("bool", False)),
@@ -1996,6 +2019,8 @@ with tempfile.TemporaryDirectory(prefix="affine-calls-") as path:
                         assert b"BEFORE-TAIL" not in res.stderr and b"AFTER-TAIL" not in res.stderr,res
                     if name == "authored-lexical-code-nonsingleton-fails-atomically":
                         assert b"LEXICAL-CODE" not in res.stderr,res
+                    if name == "authored-state-array-projection-nonsingleton-code":
+                        assert b"ARRAY-PROJECTION" not in res.stderr,res
                     if name == "parallel-formal-target-fails-closed":
                         assert b"FORMAL-NEVER-PUBLISHED" not in res.stderr,res
                     if name.startswith("exact-startup-ranked-integer-return-"):

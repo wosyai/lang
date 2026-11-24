@@ -2817,6 +2817,22 @@ enum AuthoredScalarOrigin<'a> {
 }
 
 #[cfg(feature = "internal-checker")]
+fn authored_scalar_origin<'a>(
+    selection: &'a super::checker_directive::CheckerStateSelection, ty: &ScalarType,
+) -> Option<AuthoredScalarOrigin<'a>> {
+    use super::checker_directive::CheckerStateSelection;
+    match selection {
+        CheckerStateSelection::Binding(binding) => Some(AuthoredScalarOrigin::Binding(binding)),
+        CheckerStateSelection::Module(span) => Some(AuthoredScalarOrigin::Module(*span)),
+        CheckerStateSelection::AggregateLeaf { shape, leaf } => {
+            let capture = shape.leaves.get(*leaf)?;
+            (capture.ty == *ty).then_some(AuthoredScalarOrigin::Binding(&capture.capture))
+        }
+        _ => None,
+    }
+}
+
+#[cfg(feature = "internal-checker")]
 fn render_authored_output(
     prepared: &CheckedLiteralOutput, witness: &ScalarCheckerIntegerWitness,
     startup: Option<&HashMap<ByteSpan, InitializerValue<'_>>>, work: &mut usize,
@@ -2869,6 +2885,7 @@ fn render_authored_output(
         CheckerCode::Literal(_) => None,
         CheckerCode::Binding(binding, ty, transform) => Some((AuthoredScalarOrigin::Binding(binding.as_ref()), ty, *transform)),
         CheckerCode::Module(span, ty, transform) => Some((AuthoredScalarOrigin::Module(*span), ty, *transform)),
+        CheckerCode::Projection(selection, ty, transform) => Some((authored_scalar_origin(selection, ty)?, ty, *transform)),
         CheckerCode::Lexical(..) => return None,
     };
     let projected_code = match selected_code {
@@ -2913,16 +2930,7 @@ fn render_authored_output(
                     }
                 }
                 (selection, CheckerStateType::Scalar(file_ty)) => {
-                    let origin = match selection {
-                        CheckerStateSelection::Binding(binding) => AuthoredScalarOrigin::Binding(binding),
-                        CheckerStateSelection::Module(span) => AuthoredScalarOrigin::Module(*span),
-                        CheckerStateSelection::AggregateLeaf { shape, leaf } => {
-                            let capture = shape.leaves.get(*leaf)?;
-                            if capture.ty != *file_ty { return None; }
-                            AuthoredScalarOrigin::Binding(&capture.capture)
-                        }
-                        _ => return None,
-                    };
+                    let origin = authored_scalar_origin(selection, file_ty)?;
                     let (ty, bytes) = match encoded.entry((origin, file.transform)) {
                         std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
                         std::collections::hash_map::Entry::Vacant(entry) => {
@@ -10523,6 +10531,50 @@ mod tests {
         assert_eq!(failure.witness.axes().len(), 1);
         let nine = BigInt::from(9);
         assert!(failure.witness.intervals_at(0, 0).unwrap().eq([(&nine, &nine)]));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn authored_aggregate_projection_can_select_exact_code_and_state() {
+        let app = source("src/main.w", "authored-aggregate-projected-output");
+        let array = r#"%%start
+            unit(i8) check = fn(value) {
+                core.narrow(value == 1 || value == 3, { .stdout = ""; .stderr = ""; .code = 1; .files = []; });
+                i8[3] original = [value, 57, 99];
+                i8[3] copied = original;
+                value = 7;
+                core.require(value != 7, { .stdout = ""; .stderr = ""; .code = copied[1];
+                    .files = [{ .path = "selected.json"; .state = copied[0]; }]; });
+            };
+        %%end"#;
+        let prepared = prepare_proof_target(&app, array).unwrap();
+        let receipt = run_closed_without_named_proofs(&prepared, ScalarCheckerScope::CurrentPackage, 1).unwrap();
+        let [failure] = receipt.directives.as_slice() else { panic!("one projected failure"); };
+        assert_eq!(failure.code(), &BigInt::from(57));
+        assert_eq!(failure.witness.axes().len(), 1);
+        assert_eq!(failure.files()[0].text.as_ref(),
+            b"{\"type\":{\"kind\":\"i8\"},\"value\":{\"kind\":\"alternatives\",\"values\":[1,3]}}\n");
+        let prepared = prepare_proof_target(&app, &array.replace(".code = copied[1]", ".code = copied[0]")).unwrap();
+        assert!(matches!(run_closed_without_named_proofs(&prepared, ScalarCheckerScope::CurrentPackage, 1),
+            Err(ProjectCheck::Unsupported)));
+        assert!(matches!(prepare_proof_target(&app, &array.replace("copied[0]", "copied[3]")),
+            Err(ProjectCheck::Invalid(_))));
+        assert!(matches!(prepare_proof_target(&app, &array.replace("copied[0]", "copied[value]")),
+            Err(ProjectCheck::Invalid(_))));
+
+        let member_code_only = r#"%%start
+            struct Snapshot { i8 status; }
+            unit(i8) check = fn(value) {
+                Snapshot saved = { .status = value; };
+                core.require(value != 7, { .stdout = ""; .stderr = ""; .code = saved.status; .files = []; });
+            };
+        %%end"#;
+        let prepared = prepare_proof_target(&app, member_code_only).unwrap();
+        let receipt = run_closed_without_named_proofs(&prepared, ScalarCheckerScope::CurrentPackage, 1).unwrap();
+        let [failure] = receipt.directives.as_slice() else { panic!("code-only projection demands snapshot"); };
+        assert_eq!(failure.code(), &BigInt::from(7));
+        assert_eq!(failure.witness.axes().len(), 1);
+        assert!(failure.files().is_empty());
     }
 
     #[cfg(feature = "internal-checker")]

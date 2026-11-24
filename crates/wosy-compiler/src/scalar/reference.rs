@@ -6307,6 +6307,42 @@ pub(super) struct CheckerSnapshotCopy {
 
 impl OccurrenceStructure {
     #[cfg(feature = "internal-checker")]
+    fn snapshot_key(&self, names: &BTreeMap<String, WalkBinding>, lexical: &str) -> Option<(BlockOrdinal, usize)> {
+        let declaration = names.get(lexical).filter(|slot| !slot.introduced_by_assignment && lexical != "null")?;
+        self.checker_snapshot_bindings.get(&(declaration.declaration_span, declaration.block_span)).copied()
+    }
+
+    #[cfg(feature = "internal-checker")]
+    fn resolve_snapshot_projection(
+        &mut self, selection: &mut super::checker_directive::CheckerStateSelection, ty: &ScalarType,
+        names: &BTreeMap<String, WalkBinding>, types: &BTreeMap<String, ScalarType>,
+    ) {
+        use super::checker_directive::{CheckerAggregateProjection as Projection, CheckerSnapshotNode as Node, CheckerStateSelection};
+        let CheckerStateSelection::LexicalProjection { receiver, component } = selection else { return; };
+        let Some(receiver_ty) = types.get(receiver.as_ref()) else { return; };
+        let same_receiver = match (&*component, receiver_ty) {
+            (Projection::Nominal { owner, .. }, ScalarType::Struct(id)) => id == owner.as_ref(),
+            (Projection::FixedArray { length, .. }, ScalarType::Array { length: actual, element, .. }) =>
+                *length == *actual && element.as_ref() == ty,
+            _ => false,
+        };
+        if !same_receiver { return; }
+        let Some(key) = self.snapshot_key(names, receiver) else { return; };
+        if let Some((shape, leaf)) = self.select_snapshot(key, |shape| {
+            let slot = match (&*component, &shape.root) {
+                (Projection::Nominal { field, .. }, Node::Nominal { fields, .. }) => &fields.get(*field)?.1,
+                (Projection::FixedArray { length, index }, Node::Array(elements))
+                    if u64::try_from(elements.len()).ok()? == *length => elements.get(*index)?,
+                _ => return None,
+            };
+            let Node::Leaf(leaf) = slot else { return None; };
+            (shape.leaves.get(*leaf)?.ty == *ty).then_some(*leaf)
+        }) {
+            *selection = CheckerStateSelection::AggregateLeaf { shape, leaf };
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
     fn select_snapshot<T>(
         &mut self, mut key: (BlockOrdinal, usize),
         admit: impl FnOnce(&super::checker_directive::CheckerSnapshotShape) -> Option<T>,
@@ -7550,31 +7586,16 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
                         output.code_value = CheckerCode::Binding(std::rc::Rc::new(binding), ty.clone(), *transform);
                     }
                 }
-                let snapshot_key = |structure: &OccurrenceStructure, lexical: &str| {
-                    let declaration = names.get(lexical).filter(|slot| !slot.introduced_by_assignment && lexical != "null")?;
-                    structure.checker_snapshot_bindings.get(&(declaration.declaration_span, declaration.block_span)).copied()
-                };
+                if let CheckerCode::Projection(selection, ty, _) = &mut output.code_value {
+                    self.structure.resolve_snapshot_projection(selection, ty, names, types);
+                }
                 for file in output.state_files.iter_mut() {
-                    if let (CheckerStateSelection::LexicalField { receiver, owner, field }, CheckerStateType::Scalar(ty)) =
-                        (&file.selection, &file.ty)
-                    {
-                        if matches!(types.get(receiver.as_ref()), Some(ScalarType::Struct(id)) if id == owner.as_ref()) {
-                            if let Some(key) = snapshot_key(&self.structure, receiver) {
-                                use super::checker_directive::CheckerSnapshotNode as Node;
-                                if let Some((shape, leaf)) = self.structure.select_snapshot(key, |shape| {
-                                    let Node::Nominal { fields, .. } = &shape.root else { return None; };
-                                    let (_, Node::Leaf(leaf)) = fields.get(*field)? else { return None; };
-                                    (shape.leaves.get(*leaf)?.ty == *ty).then_some(*leaf)
-                                }) {
-                                    file.selection = CheckerStateSelection::AggregateLeaf { shape, leaf };
-                                }
-                            }
-                        }
-                        continue;
+                    if let CheckerStateType::Scalar(ty) = &file.ty {
+                        self.structure.resolve_snapshot_projection(&mut file.selection, ty, names, types);
                     }
                     let CheckerStateSelection::Lexical(lexical) = &file.selection else { continue; };
                     if matches!(&file.ty, CheckerStateType::Nominal(_) | CheckerStateType::FixedArray) {
-                        if let Some(key) = snapshot_key(&self.structure, lexical) {
+                        if let Some(key) = self.structure.snapshot_key(names, lexical) {
                             if let Some((shape, ())) = self.structure.select_snapshot(key, |_| Some(())) {
                                 file.selection = CheckerStateSelection::Aggregate(shape);
                             }
