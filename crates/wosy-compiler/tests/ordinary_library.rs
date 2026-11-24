@@ -1392,7 +1392,12 @@ fn checked_scalar_reader_keeps_received_owner_live() {
             let symbol = |module: &Module<'_>, name: &str| {
                 if project { function_with_suffix(module, name) } else { name.to_owned() }
             };
-            for (text, immediate) in [(text, false), (immediate.as_str(), true)] {
+            let inline_named = text.replace("    read_length(view)", "    *view + 1");
+            assert_ne!(inline_named, text);
+            for (text, route) in [(text, "named"), (&immediate, "immediate"),
+                (&inline_named, "inline-named")]
+            {
+                let inline = route.starts_with("inline-");
                 let ir = emit(text).unwrap_or_else(|error| panic!("{target}/{project}: {error}"));
                 let module = context.create_module_from_ir(MemoryBuffer::create_from_memory_range_copy(ir.as_bytes(), target)).unwrap();
                 module.verify().unwrap();
@@ -1400,6 +1405,11 @@ fn checked_scalar_reader_keeps_received_owner_live() {
                 let mut seen = Vec::new();
                 let mut owner = None;
                 for row in drive.get_basic_blocks().into_iter().flat_map(|b| b.get_instructions()) {
+                    if inline && row.get_opcode() == InstructionOpcode::Load
+                        && seen == ["allocate"] && row.to_string().contains("load i64,")
+                    {
+                        seen.push("read");
+                    }
                     if row.get_opcode() != InstructionOpcode::Call { continue; }
                     let call = CallSiteValue::try_from(row).unwrap();
                     let Some(callee) = call.get_called_fn_value() else { continue };
@@ -1408,6 +1418,7 @@ fn checked_scalar_reader_keeps_received_owner_live() {
                         owner = call.try_as_basic_value().basic();
                         seen.push("allocate");
                     } else if name == symbol(&module, "read_length") {
+                        assert!(!inline);
                         assert_eq!(call.count_arguments(), 1);
                         seen.push("read");
                     } else if name == "__wosy_core_free" {
@@ -1418,18 +1429,19 @@ fn checked_scalar_reader_keeps_received_owner_live() {
                 }
                 assert_eq!(seen, ["allocate", "read", "release"], "{target}/{project}: {ir}");
                 if let Some(out) = std::env::var_os("WOSY_RECEIPT_FIELD_IR_DIR") {
-                    let out = std::path::PathBuf::from(out).join(match (immediate, project) {
-                        (true, true) => "immediate-project", (true, false) => "immediate-single",
-                        (false, true) => "project", (false, false) => "single",
-                    });
+                    let base = if project { "project" } else { "single" };
+                    let out = std::path::PathBuf::from(out).join(
+                        if route == "named" { base.to_owned() } else { format!("{route}-{base}") });
                     std::fs::create_dir_all(&out).unwrap();
                     let mut witness = ir.replace("@main(", "@wosy_authored_main(");
                     witness.push_str(&format!("\ndefine i64 @wosy_field_witness() {{\nentry:\n  %v = call i64 @{}()\n  ret i64 %v\n}}\n", symbol(&module, "field_witness")));
                     std::fs::write(out.join(format!("{target}.ll")), witness).unwrap();
                 }
-                let uncertified = text.replace("{ *view + 1 }", "{ u64 observed = *view; observed + 1 }");
-                assert!(emit(&uncertified).expect_err("signature alone cannot certify a checked reader")
-                    .contains("aggregate owning receipt has an unproved checked loan"));
+                if !inline {
+                    let uncertified = text.replace("{ *view + 1 }", "{ u64 observed = *view; observed + 1 }");
+                    assert!(emit(&uncertified).expect_err("signature alone cannot certify a checked reader")
+                        .contains("aggregate owning receipt has an unproved checked loan"));
+                }
             }
             for width in [8, 64] {
                 let unrelated: String = (0..width).map(|i| format!("    Packet other_{i} = make_packet(length);\n")).collect();

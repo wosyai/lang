@@ -1572,9 +1572,10 @@ impl<'a> ReferenceFlowBuilder<'a> {
             }
         }
         if let Some(point) = self.cursor.filter(|point| Some(*point) != before) {
-            if matches!(&self.cfg.points[point.0].kind,
+            let existing_field = matches!(&self.cfg.points[point.0].kind,
                 CfgPointKind::ReadPlace { place: ScalarPlace::Field { base, .. }, pointer_point: Some(_), .. }
-                    if matches!(base.as_ref(), ScalarPlace::Dereference { .. }))
+                    if matches!(base.as_ref(), ScalarPlace::Dereference { .. }));
+            if (existing_field || self.exact_scalar_receipt_dereference(point, ordinal))
                 && self.call_sites.structure.checked_types.expressions.get(&ordinal)
                     .is_some_and(aggregate::ordinary_value)
             {
@@ -3025,6 +3026,27 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 }
                 Ok(())
             }
+        }
+    }
+
+    fn exact_scalar_receipt_dereference(&self, point: CfgPointId, ordinal: OccurrenceOrdinal) -> bool {
+        let calls = self.call_sites;
+        let CfgPointKind::ReadPlace { place: ScalarPlace::Dereference { .. },
+            pointer_point: Some(input), reads_origin: false, .. } = &self.cfg.points[point.0].kind
+        else { return false };
+        let place = self.place_ordinal(OccurrenceParent::Expression(ordinal), OccurrenceEdge::ExpressionPlace);
+        let pointer_ordinal = self.expression_ordinal(OccurrenceParent::Place(place), OccurrenceEdge::DereferencePointer);
+        let Some(ScalarType::CheckedReference { mutability: ScalarReferenceMutability::Shared, inner }) =
+            calls.structure.checked_types.expressions.get(&pointer_ordinal) else { return false };
+        if !aggregate::ordinary_value(inner)
+            || calls.structure.checked_types.expressions.get(&ordinal) != Some(inner.as_ref())
+        {
+            return false;
+        }
+        match &self.cfg.points[input.0].kind {
+            CfgPointKind::Read { binding } => matches!(calls.prepared_plain_name(pointer_ordinal),
+                Some(PlainNameIdentity::Lexical(expected)) if expected == binding),
+            _ => false,
         }
     }
 
