@@ -1466,6 +1466,15 @@ fn lexical_conditional_owner_choice_releases_selected_original_after_read() {
     let recommitted_consume = recommit(&consumed, "consume(chosen)");
     assert_ne!(recommitted_release, text);
     assert_ne!(recommitted_consume, consumed);
+    let coexisting = |source: &str| source
+        .replace("u64(u64, bool) drive",
+            "Packet(u64) make_neighbor = fn(length) { u8[length] backing; backing[0] = 39; *?u8 data = null; unsafe { data = &?backing[0]; }; Packet packet = { .data = data; .length = length; }; packet };\nu64(u64, bool) drive")
+        .replace("    Packet moved = first_relay",
+            "    Packet neighbor = make_neighbor(7);\n    neighbor.length;\n    Packet moved = first_relay");
+    let sibling_released = coexisting(&recommitted_release);
+    let sibling_and_transferred = coexisting(&recommitted_consume);
+    assert_ne!(sibling_released, recommitted_release);
+    assert_ne!(sibling_and_transferred, recommitted_consume);
     let borrowed_then_consumed = consumed.replace("u64(Packet) consume",
         "u64(*u64) read_selected = fn(view) { *view };\nu64(Packet) consume")
         .replace("    consume(chosen)", "    read_selected(&chosen.length);\n    consume(chosen)");
@@ -1570,6 +1579,8 @@ fn lexical_conditional_owner_choice_releases_selected_original_after_read() {
         (temporary.as_str(), "consume-temporary"), (borrowed.as_str(), "borrow"),
         (recommitted_release.as_str(), "release-after-recommit"),
         (recommitted_consume.as_str(), "consume-after-recommit"),
+        (sibling_released.as_str(), "release-with-sibling-recommit"),
+        (sibling_and_transferred.as_str(), "consume-with-sibling-recommit"),
         (read_recommitted_release.as_str(), "release-after-read-recommit"),
         (read_recommitted_consume.as_str(), "consume-after-read-recommit"),
         (interleaved_release.as_str(), "release-interleaved-read-recommit"),
@@ -1591,6 +1602,7 @@ fn lexical_conditional_owner_choice_releases_selected_original_after_read() {
         let base_use = use_site.strip_prefix("nested-").unwrap_or(use_site);
         let consuming = base_use.starts_with("consume");
         let recommitting = base_use.ends_with("-recommit");
+        let sibling = base_use.contains("-with-sibling-");
         let reading_recommit = base_use.ends_with("-read-recommit");
         let interleaved = base_use.contains("-interleaved-");
         let releases_saved = matches!(base_use, "release-after-saved-borrows" | "release-after-scalar-continuation");
@@ -1623,6 +1635,8 @@ fn lexical_conditional_owner_choice_releases_selected_original_after_read() {
                 let mut producers = vec![find("make_short"), find("make_long")];
                 if nested { producers.push(find("make_later")); }
                 let consumer = consuming.then(|| find("consume"));
+                let sibling_factory = sibling.then(|| find("make_neighbor"));
+                let mut sibling_receipt = None;
                 let relays = recommitting.then(|| [find("first_relay"), find("last_relay")]);
                 if let Some([first, last]) = relays {
                     for (relay, slot) in [(first, 1), (last, 0)] {
@@ -1658,6 +1672,10 @@ fn lexical_conditional_owner_choice_releases_selected_original_after_read() {
                     let Some(callee) = call.get_called_fn_value() else { continue };
                     if producers.contains(&callee) {
                         writes.push((callee, arg(call.count_arguments() - 1), call.try_as_basic_value().basic().unwrap()));
+                    } else if Some(callee) == sibling_factory {
+                        let base = call.try_as_basic_value().basic().unwrap();
+                        assert!(sibling_receipt.replace(base).is_none());
+                        assert!(recommitted.is_empty(), "sibling is born before receipt migration");
                     } else if relays.is_some_and(|relays| relays.contains(&callee)) {
                         assert_eq!(call.count_arguments(), if Some(callee) == relays.map(|[first, _]| first) { 3 } else { 1 });
                         recommitted.push(callee);
@@ -1695,8 +1713,10 @@ fn lexical_conditional_owner_choice_releases_selected_original_after_read() {
                 assert!(writes.iter().all(|&(_, slot, _)| slot == descriptor), "all arms share descriptor storage");
                 assert!(producers.iter().all(|producer| writes.iter().any(|(callee, _, _)| callee == producer)));
                 let selected = if consuming { transfers.first().expect("owner transfer").1 }
-                    else { *released.first().expect("lexical release") };
+                    else { *released.last().expect("lexical release") };
                 assert_ne!(selected, descriptor, "descriptor and backing must remain distinct");
+                assert_eq!(sibling_receipt.is_some(), sibling);
+                assert_ne!(sibling_receipt, Some(selected), "sibling and selected receipts are independent");
                 assert_eq!(merges.len(), producers.len() - 1);
                 let mut pending = vec![selected];
                 let mut leaf_bases = Vec::new();
@@ -1720,7 +1740,8 @@ fn lexical_conditional_owner_choice_releases_selected_original_after_read() {
                             assert!(reads.contains(&descriptor), "the read must borrow the descriptor handed to consumer");
                         }
                     }
-                    assert!(released.is_empty(), "the caller transferred rather than freed the receipt");
+                    assert!(released.iter().copied().eq(sibling_receipt),
+                        "the caller releases only the coexisting receipt when the selected owner transfers");
                     if recommitting {
                         assert_eq!(transfers.len(), 1, "only the final receipt may transfer");
                         assert_ne!(transfers[0].0, selected, "the returned descriptor remains distinct from its backing");
@@ -1783,7 +1804,8 @@ fn lexical_conditional_owner_choice_releases_selected_original_after_read() {
                     } else {
                         assert!(reads.contains(&descriptor), "final field observation must use that slot");
                     }
-                    assert_eq!(&released, &[selected], "free only the selected original backing");
+                    let ordered = sibling_receipt.into_iter().chain([selected]);
+                    assert!(released.iter().copied().eq(ordered), "release original backings in reverse birth order");
                 }
                 if let Some(out) = std::env::var_os("WOSY_NAMED_FACTORY_IR_DIR") {
                     let route = if project { "project" } else { "single" };

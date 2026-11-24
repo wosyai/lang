@@ -2751,6 +2751,17 @@ pub(super) fn exact_owning_call_arguments<'a>(
     sites: &FunctionCallSites, ordinal: OccurrenceOrdinal, parameters: &[ScalarType],
     holder: &ReferenceBindingId, holder_type: &ScalarType,
 ) -> Option<(&'a ReferenceFlowPoint, usize, CfgPointId)> {
+    let (call, Some((slot, moved))) = exact_bounded_call_arguments(
+        points, first, scope, sites, ordinal, parameters, Some((holder, holder_type)),
+    )? else { return None };
+    Some((call, slot, moved))
+}
+
+fn exact_bounded_call_arguments<'a>(
+    points: &'a [ReferenceFlowPoint], first: &'a ReferenceFlowPoint, scope: ReferenceScopeId,
+    sites: &FunctionCallSites, ordinal: OccurrenceOrdinal, parameters: &[ScalarType],
+    owner: Option<(&ReferenceBindingId, &ScalarType)>,
+) -> Option<(&'a ReferenceFlowPoint, Option<(usize, CfgPointId)>)> {
     let structure = &sites.structure;
     let next = |id| linear_successor(points, id).and_then(|next| points.get(next.0));
     if parameters.len() > MAX_OWNING_CALL_ARGUMENTS || sites.declared_unsafe_calls.contains(&ordinal.0) {
@@ -2769,7 +2780,7 @@ pub(super) fn exact_owning_call_arguments<'a>(
         { return None; }
         argument_points[slot] = consumer.id;
         let plain = sites.prepared_plain_name(argument);
-        if parameter == holder_type {
+        if let Some((holder, _)) = owner.filter(|(_, holder_type)| parameter == *holder_type) {
             let moved = next(consumer.id)?;
             if owned.is_some() || moved.scope != scope || moved.source_span.range != span
                 || !matches!(plain, Some(PlainNameIdentity::Lexical(binding)) if binding == holder)
@@ -2782,7 +2793,7 @@ pub(super) fn exact_owning_call_arguments<'a>(
         } else {
             if !ordinary_value(parameter) || !match (&consumer.kind, plain) {
                 (CfgPointKind::Read { binding }, Some(PlainNameIdentity::Lexical(expected))) =>
-                    binding == expected && binding != holder,
+                    binding == expected && owner.is_none_or(|(holder, _)| binding != holder),
                 (CfgPointKind::Evaluate(ScalarExpression::Boolean { .. } | ScalarExpression::Char { .. }
                     | ScalarExpression::Integer { .. } | ScalarExpression::Float { .. }), None) => true,
                 _ => false,
@@ -2790,12 +2801,11 @@ pub(super) fn exact_owning_call_arguments<'a>(
             consumer = next(consumer.id)?;
         }
     }
-    let (owned_slot, moved) = owned?;
     if !matches!(&consumer.kind, CfgPointKind::Call { output: 0, target: ResolvedCallTarget::ModuleCallable {
         concrete: ConcreteCallSelection::Declaration, .. }, argument_points: actual, .. }
         if actual.as_slice() == &argument_points[..parameters.len()])
     { return None; }
-    Some((consumer, owned_slot, moved))
+    Some((consumer, owned))
 }
 
 #[derive(Clone, Copy)]
@@ -2819,6 +2829,8 @@ struct LocalReceiptChoice {
     leaves: BTreeSet<CfgPointId>,
     use_site: LocalChoiceUse,
     recommits: Vec<LocalChoiceRecommit>,
+    sibling_calls: Vec<CfgPointId>,
+    joined_birth: CfgPointId,
 }
 
 struct Body<'a> {
@@ -2948,10 +2960,29 @@ impl Body<'_> {
         let mut saved_observations = [None; MAX_SAVED_OBSERVATIONS];
         let mut saved_count = 0;
         let mut observations = 0;
+        const MAX_SIBLING_RECEIPTS: usize = 2;
+        let mut siblings = Vec::<(CfgPointId, &ReferenceBindingId, bool)>::new();
         for step in before_consume {
+            if let BlockItemKind::Evaluation { expression } = step.kind {
+                if let Some((identity, field)) = self.sites.prepared_lexical_member(expression) {
+                    if let Some((_, _, observed)) = siblings.iter_mut().find(|(_, sibling, _)| *sibling == identity) {
+                        if !structure.checked_types.expressions.get(&expression).is_some_and(ordinary_value)
+                            || read.source_span.range != self.sites.occurrences.get(expression.0)?.span
+                            || !matches!(&read.kind, CfgPointKind::ReadPlace { pointer_point: None, reads_origin: false,
+                                candidates, .. } if matches!(candidates.as_slice(), [place] if &place.binding == identity &&
+                                matches!(place.projections.as_slice(),
+                                    [ReferencePlaceProjection::Field(ScalarFieldReference::Resolved(found))] if found == field)))
+                        { return None; }
+                        read = next(read.id)?;
+                        if read.scope != scope { return None; }
+                        *observed = true;
+                        continue;
+                    }
+                }
+            }
             let relay_step = match &step.kind {
                 BlockItemKind::Binding(step) => match step.receivers() {
-                    [next] if next.ty == receiver.ty => Some((step, next)),
+                    [next] if matches!(next.ty, ScalarType::Struct(_)) => Some((step, next)),
                     _ => None,
                 },
                 _ => None,
@@ -2960,9 +2991,29 @@ impl Body<'_> {
                 let BindingInitialization::Outputs(step_init) = &step.initialization else { return None };
                 let signature = self.sites.checked_call_signatures.get(&step_init.primary)?;
                 let [returned] = signature.outputs.outputs.as_slice() else { return None };
-                if !step_init.secondary.is_empty() || returned.ty != receiver.ty
-                    || structure.checked_types.expressions.get(&step_init.primary) != Some(&receiver.ty)
+                if !step_init.secondary.is_empty() || returned.ty != next_receiver.ty
+                    || structure.checked_types.expressions.get(&step_init.primary) != Some(&returned.ty)
                 { return None; }
+                if signature.parameters.iter().all(ordinary_value) {
+                    if returns_owner || siblings.len() == MAX_SIBLING_RECEIPTS { return None; }
+                    let (call, None) = exact_bounded_call_arguments(
+                        points, read, scope, self.sites, step_init.primary, &signature.parameters, None,
+                    )? else { return None };
+                    let installed = next(call.id)?;
+                    let CfgPointKind::Bind { binding } = &installed.kind else { return None };
+                    if call.scope != scope || installed.scope != scope || call.id <= join.id
+                        || facts.calls.get(&call.id) != Some(&step_init.primary)
+                        || !facts.direct_receipt_bindings.get(&call.id).is_some_and(|(site, owner)|
+                            *site == installed.id && owner == binding)
+                        || binding == holder || binding.declaration_span != next_receiver.span
+                        || siblings.iter().any(|(prior, owner, _)| *prior >= call.id || *owner == binding)
+                    { return None; }
+                    read = next(installed.id)?;
+                    if read.scope != scope { return None; }
+                    siblings.push((call.id, binding, false));
+                    continue;
+                }
+                if next_receiver.ty != receiver.ty { return None; }
                 let (call, slot, moved) = exact_owning_call_arguments(
                     points, read, scope, self.sites, step_init.primary, &signature.parameters, holder, &receiver.ty,
                 )?;
@@ -2978,6 +3029,7 @@ impl Body<'_> {
                     || !facts.direct_receipt_bindings.get(&call.id).is_some_and(|(site, holder)|
                         *site == installed.id && holder == binding)
                     || binding == holder || binding.declaration_span != next_receiver.span
+                    || siblings.iter().any(|(_, owner, _)| *owner == binding)
                 { return None; }
                 read = next(installed.id)?;
                 if read.scope != scope { return None; }
@@ -3042,6 +3094,8 @@ impl Body<'_> {
                 read = after_reader;
             }
         }
+        if siblings.iter().any(|(_, _, observed)| !observed) { return None; }
+        let sibling_calls: Vec<_> = siblings.into_iter().map(|(call, _, _)| call).collect();
         if returns_owner {
             let step = recommits.last()?;
             let span = self.sites.occurrences.get(output.expression.0)?.span;
@@ -3063,9 +3117,9 @@ impl Body<'_> {
             { return None; }
             return Some(LocalReceiptChoice {
                 block: root, item: Some(bind.position), conditional: init.primary,
-                leaves: self.local_choice_leaves(init.primary, &receiver.ty, &recommits)?,
+                leaves: self.local_choice_leaves(init.primary, &receiver.ty, &recommits, &sibling_calls)?,
                 use_site: LocalChoiceUse::Return { call: step.ordinal, output: output.expression },
-                recommits,
+                recommits, sibling_calls, joined_birth: join.id,
             });
         }
         let end_use = |last: &ReferenceFlowPoint| {
@@ -3219,7 +3273,7 @@ impl Body<'_> {
         };
         Some(LocalReceiptChoice {
             block: root, item: Some(bind.position), conditional: init.primary,
-            leaves: self.local_choice_leaves(init.primary, &receiver.ty, &recommits)?, use_site, recommits,
+            leaves: self.local_choice_leaves(init.primary, &receiver.ty, &recommits, &sibling_calls)?, use_site, recommits, sibling_calls, joined_birth: join.id,
         })
     }
 
@@ -3261,14 +3315,15 @@ impl Body<'_> {
         if origins.len() != 1 || !origins.contains(&None) { return None; }
         Some(LocalReceiptChoice {
             block: structure.root, item: None, conditional,
-            leaves: self.local_choice_leaves(conditional, parameter, &[])?,
+            leaves: self.local_choice_leaves(conditional, parameter, &[], &[])?,
             use_site: LocalChoiceUse::Consume { point: consumer.id, ordinal: output.expression, slot: 0 },
-            recommits: Vec::new(),
+            recommits: Vec::new(), sibling_calls: Vec::new(), joined_birth: join.id,
         })
     }
 
     fn local_choice_leaves(
         &self, conditional: OccurrenceOrdinal, ty: &ScalarType, recommits: &[LocalChoiceRecommit],
+        siblings: &[CfgPointId],
     ) -> Option<BTreeSet<CfgPointId>> {
         let facts = self.facts?;
         let structure = &self.sites.structure;
@@ -3316,11 +3371,12 @@ impl Body<'_> {
                 }
             }
         }
-        // Every call is either a factory leaf or one predetermined prefix
-        // call. The bounded prefix is linear and strictly ordered; verify
-        // its exact call IDs are disjoint from the factory leaves.
-        (leaves.len() + recommits.len() == facts.calls.len()
-            && recommits.iter().all(|step| !leaves.contains(&step.point))).then_some(leaves)
+        // Every aggregate call is a leaf, a recommit, or an independent
+        // sibling producer. The exact linear root steps are distinct; verify
+        // that both root categories and the nested leaves are disjoint.
+        (leaves.len() + recommits.len() + siblings.len() == facts.calls.len()
+            && recommits.iter().all(|step| !leaves.contains(&step.point) && !siblings.contains(&step.point))
+            && siblings.iter().all(|point| !leaves.contains(point))).then_some(leaves)
     }
 
     fn structured_owner_return(&self) -> Option<StructuredOwnerReturn> {
@@ -5094,7 +5150,7 @@ fn closed_aggregates<'a>(
             let target = target_body(&declarations, body.cfg, point)?;
             Some((target, *identity_relays.get(&target)?))
         }) else { continue };
-        if !choice.leaves.iter().all(|&leaf| target_body(&declarations, body.cfg, leaf)
+        if !choice.leaves.iter().chain(&choice.sibling_calls).all(|&leaf| target_body(&declarations, body.cfg, leaf)
             .is_some_and(|target| outgoing.contains(&target)
                 && bodies.get(&target).is_some_and(|callee| !callee.has_mixed_struct_result())))
         { continue; }
@@ -5617,8 +5673,9 @@ fn closed_aggregates<'a>(
             inputs.guards.iter().map(move |&(guard, arms)| ((expression, arms), guard))
         }).collect::<BTreeMap<_, _>>();
         let mut shared_transfer_coverage = BTreeMap::new();
-        let orders_by_birth = recommitted.range((key, CfgPointId(0))..=(key, CfgPointId(usize::MAX)))
-            .next().is_some();
+        let local_choice = local_choices.get(&key);
+        let orders_by_birth = local_choice.is_some_and(|choice| !choice.sibling_calls.is_empty())
+            || recommitted.range((key, CfgPointId(0))..=(key, CfgPointId(usize::MAX))).next().is_some();
         let mut ranked_releases = BTreeMap::<CfgPointId, BTreeMap<CfgPointId, ClosedOwnerRelease>>::new();
         let mut record_release = |plan: &mut ClosedBody, exit, birth, release| {
             if orders_by_birth {
@@ -5630,7 +5687,6 @@ fn closed_aggregates<'a>(
             }
             Ok(())
         };
-        let local_choice = local_choices.get(&key);
         if let Some(choice) = local_choice {
             plan.local_choice_arms = choice.leaves.len();
             if plan.input.is_some() {
@@ -5652,7 +5708,7 @@ fn closed_aggregates<'a>(
             }
             if let LocalChoiceUse::Observe(exit) = choice.use_site {
                 plan.scope_exits.insert(choice.block.0, exit);
-                record_release(&mut plan, exit, exit, ClosedOwnerRelease { receipt: receipt.0, guard: None })?;
+                record_release(&mut plan, exit, choice.joined_birth, ClosedOwnerRelease { receipt: receipt.0, guard: None })?;
             }
         }
         for (&point, &call) in &facts.calls {
@@ -5710,7 +5766,11 @@ fn closed_aggregates<'a>(
                 continue;
             }
 
+            let is_sibling = local_choice.is_some_and(|choice| choice.sibling_calls.contains(&point));
             if let Some(&[first, second]) = discharged_by_inputs.get(&(key, point)) {
+                if is_sibling {
+                    return Err("selected sibling receipt must remain with its lexical binding".into());
+                }
                 let endpoint = endpoints.next();
                 if endpoint.is_some() || second.is_some() {
                     let ordinary_producer = target_body(&declarations, body.cfg, point)
@@ -5836,6 +5896,13 @@ fn closed_aggregates<'a>(
                     "aggregate owning call has ambiguous endpoint in {:?}",
                     body.source
                 ));
+            }
+            if let Some(choice) = local_choice.filter(|_| is_sibling) {
+                let proved = facts.direct_receipt_bindings.get(&point).is_some_and(|(_, binding)|
+                    facts.endpoints.get(&(exit, block)).is_some_and(|receipts| receipts.always_retains(owner, Some(binding))));
+                if !proved || block != choice.block.0 || body.cfg.points[exit.0].scope != body.cfg.points[point.0].scope {
+                    return Err("selected sibling receipt changed its proved lexical endpoint".into());
+                }
             }
             if previous.is_none() { plan.calls.insert(call.0, ClosedCall::Receive); }
             if plan.scope_exits.insert(block, exit).is_some_and(|old| old != exit) {
