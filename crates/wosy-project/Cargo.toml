@@ -5,6 +5,11 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+blake3.workspace = true
+uuid = { version = "1", features = ["v7"] }
 serde_json.workspace = true
 serde.workspace = true
 toml_edit.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"

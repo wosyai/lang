@@ -1,9 +1,14 @@
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
-use toml_edit::{DocumentMut, Item};
+use toml_edit::Item;
+#[cfg(test)]
+use toml_edit::DocumentMut;
+
+pub mod packages;
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct SourceIdentity {
@@ -99,13 +104,31 @@ pub struct SourceSpan {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DependencyDeclaration {
     pub name: String,
-    pub path: PathBuf,
+    pub source: DependencySource,
     pub span: SourceSpan,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum DependencySource {
+    Local { path: PathBuf },
+    Git(GitSource),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GitSource {
+    pub origin: String,
+    pub package_path: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ResolvedPackage {
     pub name: String,
+    #[serde(skip)]
+    pub git_checkout: Option<packages::GitDirectory>,
+    pub git_pin_identity: Option<packages::LockedInputId>,
+    pub patch_stack_id: Option<packages::PatchStackId>,
+    pub local_root_identity: Option<PathBuf>,
+    pub dependencies: Vec<String>,
     pub project_root: PathBuf,
     pub source_root: PathBuf,
     pub identity: SourceIdentity,
@@ -221,11 +244,52 @@ impl GraphLoadError {
     }
 }
 
+/// Maps a base namespace path to a package-relative module path. Discovery and
+/// graph construction use the same mapping, including for the selected package.
+pub struct NamespacePackages<'a> {
+    pub root_name: &'a str,
+    pub root_source: Option<&'a PackageRelativePath>,
+    pub dependencies: &'a BTreeMap<String, ResolvedPackage>,
+}
+
+pub struct NamespaceModule<'a, 'p> {
+    pub package: &'a str,
+    pub dependency: Option<&'a ResolvedPackage>,
+    pub path: Cow<'p, PackageRelativePath>,
+}
+
+impl<'a> NamespacePackages<'a> {
+    pub fn resolve<'p>(
+        &self,
+        origin: &str,
+        path: &'p PackageRelativePath,
+    ) -> Option<NamespaceModule<'a, 'p>> {
+        let (package, dependency, source_root) = if origin == self.root_name {
+            (
+                self.root_name,
+                None,
+                self.root_source.filter(|root| root.as_path() != Path::new(".")),
+            )
+        } else {
+            let (name, resolved) = self.dependencies.get_key_value(origin)?;
+            (name.as_str(), Some(resolved), Some(&resolved.identity.path))
+        };
+        let path = match source_root.map(PackageRelativePath::as_path) {
+            Some(root) => Cow::Owned(PackageRelativePath::new(root.join(path.as_path())).ok()?),
+            _ => Cow::Borrowed(path),
+        };
+        Some(NamespaceModule {
+            package,
+            dependency,
+            path,
+        })
+    }
+}
+
 pub fn load_reachable_source_graph(
-    package: &str,
+    packages: &NamespacePackages<'_>,
     root: SourceNodeInput,
     available: Vec<SourceNodeInput>,
-    resolved_packages: &BTreeMap<String, ResolvedPackage>,
 ) -> Result<SourceGraph, GraphLoadError> {
     let root_key = source_key(&root.source);
     let root_span = SourceSpan {
@@ -245,10 +309,9 @@ pub fn load_reachable_source_graph(
     let mut node_by_path = HashMap::new();
     let mut stack = Vec::new();
     visit_source(
-        package,
+        packages,
         &root_key,
         &sources,
-        resolved_packages,
         &mut graph,
         &mut node_by_path,
         &mut stack,
@@ -259,10 +322,9 @@ pub fn load_reachable_source_graph(
 }
 
 fn visit_source(
-    package: &str,
+    packages: &NamespacePackages<'_>,
     key: &(String, String, PackageRelativePath),
     sources: &BTreeMap<(String, String, PackageRelativePath), SourceNodeInput>,
-    resolved_packages: &BTreeMap<String, ResolvedPackage>,
     graph: &mut SourceGraph,
     node_by_path: &mut HashMap<(String, String, PackageRelativePath), SourceNodeId>,
     stack: &mut Vec<SourceNodeId>,
@@ -316,24 +378,21 @@ fn visit_source(
     stack.push(id);
 
     for edge in &source.namespace_edges {
-        let (target_project, target_path) = if edge.origin == package {
-            (source.source.project.as_str(), edge.path.clone())
-        } else {
-            let resolved = resolved_packages
-                .get(&edge.origin)
-                .ok_or_else(|| GraphLoadError::missing(edge, edge.path.clone()))?;
-            let target_path = PackageRelativePath::new(
-                resolved.identity.path.as_path().join(edge.path.as_path()),
-            )
-            .map_err(|_| GraphLoadError::missing(edge, edge.path.clone()))?;
-            (resolved.identity.project.as_str(), target_path)
-        };
-        let target_key = source_key_parts(target_project, &edge.origin, target_path);
+        let module = packages
+            .resolve(&edge.origin, &edge.path)
+            .ok_or_else(|| GraphLoadError::missing(edge, edge.path.clone()))?;
+        // A root qualifier belongs only to the root project's own sources.
+        // Do not make an importing dependency's use of it reach back into the
+        // consumer; retain the importer's project identity in that case.
+        let target_project = module.dependency.map_or(
+            source.source.project.as_str(),
+            |resolved| resolved.identity.project.as_str(),
+        );
+        let target_key = source_key_parts(target_project, module.package, module.path.into_owned());
         let target = visit_source(
-            package,
+            packages,
             &target_key,
             sources,
-            resolved_packages,
             graph,
             node_by_path,
             stack,
@@ -444,6 +503,10 @@ pub struct TargetConfig {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ProjectConfiguration {
     pub default_target: String,
+    /// Base namespace paths for this package use this directory. Old root
+    /// manifests without [package].source_root use paths from the project root.
+    #[serde(default)]
+    pub module_source_root: Option<PackageRelativePath>,
     pub builders: std::collections::BTreeMap<String, BuilderConfig>,
     pub runners: std::collections::BTreeMap<String, RunnerConfig>,
     pub targets: std::collections::BTreeMap<String, TargetConfig>,
@@ -457,27 +520,26 @@ impl ProjectConfiguration {
     }
 
     pub fn load_with_manifest(root: &Path) -> Result<(Self, toml_edit::ImDocument<String>), String> {
-        let path = root.join("wosy.toml");
-        let content = fs::read_to_string(&path).map_err(|error| error.to_string())?;
+        let snapshot = packages::ProjectSnapshot::reader(root)?;
         let document =
-            toml_edit::ImDocument::parse(content).map_err(|error| error.to_string())?;
+            toml_edit::ImDocument::parse(snapshot.manifest()?).map_err(|error| error.to_string())?;
         let package = document
             .get("package")
             .and_then(Item::as_table)
             .ok_or_else(|| "package is missing".to_owned())?;
         let package_name = scalar_string(package, "name")?;
-        let dependencies =
-            parse_local_dependencies(root, &package_name, document.get("dependencies")).map_err(
-                |error| {
-                    let diagnostic = &error.diagnostics[0];
-                    format!(
-                        "{} at {}..{}",
-                        diagnostic.message, diagnostic.span.range.start, diagnostic.span.range.end
-                    )
-                },
-            )?;
-        let resolved_packages = resolve_local_packages(root, &package_name, &dependencies)
-            .map_err(|error| error.diagnostics[0].message.clone())?;
+        let module_source_root = package
+            .get("source_root")
+            .map(|root| {
+                let root = root
+                    .as_str()
+                    .ok_or_else(|| "package.source_root must be a string".to_owned())?;
+                PackageRelativePath::new(root.into())
+                    .map_err(|error| format!("invalid package.source_root: {error}"))
+            })
+            .transpose()?;
+        let dependencies = project_dependencies(root, &package_name, &document)?;
+        let resolved_packages = packages::resolve_installed(&snapshot, root, &package_name, &dependencies)?;
         let default_target = scalar_string(package, "default_target")?;
         let builders = named_commands(document.get("builders"), "builder")?;
         let runners = named_runners(document.get("runners"))?;
@@ -509,6 +571,7 @@ impl ProjectConfiguration {
         Ok((
             Self {
                 default_target,
+                module_source_root,
                 builders,
                 runners,
                 targets,
@@ -517,6 +580,16 @@ impl ProjectConfiguration {
             },
             document,
         ))
+    }
+
+    pub fn git_package(&self, name: &str) -> Result<Option<(&ResolvedPackage, &packages::GitDirectory)>, String> {
+        let Some(package) = self.resolved_packages.get(name) else { return Ok(None) };
+        if package.git_pin_identity.is_none() {
+            return Ok(None);
+        }
+        let checkout = package.git_checkout.as_ref()
+            .ok_or_else(|| format!("Git dependency {name} has no verified checkout handle"))?;
+        Ok(Some((package, checkout)))
     }
 
     pub fn resolve_target(&self, target: Option<&str>) -> Result<String, String> {
@@ -561,7 +634,21 @@ impl ProjectConfiguration {
     }
 }
 
-pub fn parse_local_dependencies(
+fn project_dependencies(
+    root: &Path,
+    package: &str,
+    document: &toml_edit::ImDocument<String>,
+) -> Result<BTreeMap<String, DependencyDeclaration>, String> {
+    parse_dependencies(root, package, document.get("dependencies")).map_err(|error| {
+        let diagnostic = &error.diagnostics[0];
+        format!(
+            "{} at {}..{}",
+            diagnostic.message, diagnostic.span.range.start, diagnostic.span.range.end
+        )
+    })
+}
+
+pub fn parse_dependencies(
     root: &Path,
     package: &str,
     item: Option<&Item>,
@@ -569,87 +656,93 @@ pub fn parse_local_dependencies(
     let Some(item) = item else {
         return Ok(BTreeMap::new());
     };
-    let table = item.as_table().ok_or_else(|| DependencyResolutionError {
+    let error = |message, span: Option<std::ops::Range<usize>>| DependencyResolutionError {
         diagnostics: vec![dependency_diagnostic(
             root,
             package,
             "P0001",
-            "dependencies must be a table",
-            item.span().expect("dependencies item span"),
+            message,
+            span.unwrap_or(0..0),
         )],
-    })?;
+    };
+    let table = item
+        .as_table()
+        .ok_or_else(|| error("dependencies must be a table".to_owned(), item.span()))?;
     let mut dependencies = BTreeMap::new();
     for (name, item) in table {
-        let dependency = item.as_table().ok_or_else(|| DependencyResolutionError {
-            diagnostics: vec![dependency_diagnostic(
-                root,
-                package,
-                "P0001",
-                format!("dependency {name} must be a table"),
-                item.span().expect("dependency item span"),
-            )],
-        })?;
-        if dependency.iter().any(|(key, _)| key != "path") {
-            return Err(DependencyResolutionError {
-                diagnostics: vec![dependency_diagnostic(
-                    root,
-                    package,
-                    "P0001",
-                    format!("dependency {name} contains an unsupported field"),
-                    item.span().expect("dependency item span"),
-                )],
-            });
-        }
-        let path_item = dependency
-            .get("path")
-            .ok_or_else(|| DependencyResolutionError {
-                diagnostics: vec![dependency_diagnostic(
-                    root,
-                    package,
-                    "P0001",
-                    format!("dependency {name} must declare path"),
-                    table
-                        .key(name)
-                        .expect("dependency key")
-                        .span()
-                        .expect("dependency key span"),
-                )],
-            })?;
-        let path = path_item
-            .as_value()
-            .and_then(|value| value.as_str())
-            .map(PathBuf::from)
-            .ok_or_else(|| DependencyResolutionError {
-                diagnostics: vec![dependency_diagnostic(
-                    root,
-                    package,
-                    "P0001",
-                    format!("dependency {name} path must be a string"),
-                    item.span().expect("dependency item span"),
-                )],
-            })?;
-        if path.as_os_str().is_empty() {
-            return Err(DependencyResolutionError {
-                diagnostics: vec![dependency_diagnostic(
-                    root,
-                    package,
-                    "P0001",
-                    format!("dependency {name} path must be non-empty"),
-                    item.span().expect("dependency item span"),
-                )],
-            });
-        }
+        let invalid = |message| error(message, item.span());
+        let dependency = item
+            .as_table()
+            .ok_or_else(|| invalid(format!("dependency {name} must be a table")))?;
+        let source = if let Some(git) = dependency.get("git") {
+            if name == package {
+                return Err(invalid(format!(
+                    "dependency {name} has the project package name"
+                )));
+            }
+            if dependency.get("rev").is_some() {
+                return Err(invalid(format!(
+                    "dependency {name} rev belongs in wosy.lock, not wosy.toml"
+                )));
+            }
+            if dependency
+                .iter()
+                .any(|(key, _)| !matches!(key, "git" | "path"))
+            {
+                return Err(invalid(format!(
+                    "dependency {name} contains an unsupported field"
+                )));
+            }
+            let origin = git
+                .as_str()
+                .filter(|origin| packages::valid_origin(origin))
+                .ok_or_else(|| invalid(format!("dependency {name} git must be a non-empty origin")))?;
+            if !packages::valid_package_name(name) {
+                return Err(invalid(format!(
+                    "Git dependency {name} must use a snake_case package name"
+                )));
+            }
+            let package_path = match dependency.get("path") {
+                None => ".".to_owned(),
+                Some(path) => packages::normalize_package_path(
+                    path.as_str().ok_or_else(|| invalid(format!(
+                        "dependency {name} path must be a repository-relative package directory"
+                    )))?,
+                ).map_err(|_| invalid(format!(
+                    "dependency {name} path must be a repository-relative package directory"
+                )))?,
+            };
+            DependencySource::Git(GitSource {
+                origin: origin.to_owned(),
+                package_path,
+            })
+        } else {
+            if dependency.iter().any(|(key, _)| key != "path") {
+                return Err(invalid(format!(
+                    "dependency {name} contains an unsupported field"
+                )));
+            }
+            let path = dependency
+                .get("path")
+                .ok_or_else(|| invalid(format!("dependency {name} must declare path")))?
+                .as_str()
+                .ok_or_else(|| invalid(format!("dependency {name} path must be a string")))?;
+            if path.is_empty() {
+                return Err(invalid(format!("dependency {name} path must be non-empty")));
+            }
+            DependencySource::Local { path: path.into() }
+        };
         dependencies.insert(
             name.to_owned(),
             DependencyDeclaration {
                 name: name.to_owned(),
-                path,
+                source,
                 span: dependency_diagnostic(
                     root,
                     package,
                     "P0001",
                     String::new(),
-                    item.span().expect("dependency item span"),
+                    item.span().unwrap_or(0..0),
                 )
                 .span,
             },
@@ -658,104 +751,137 @@ pub fn parse_local_dependencies(
     Ok(dependencies)
 }
 
-pub fn resolve_local_packages(
+#[cfg(test)]
+fn resolve_package(
+    package_root: PathBuf,
+    declaration: &DependencyDeclaration,
+    git_checkout: Option<packages::GitDirectory>,
+) -> Result<ResolvedPackage, DependencyResolutionError> {
+    load_dependency_package(package_root, declaration, git_checkout, None).map(|(package, _)| package)
+}
+
+fn dependency_manifest_error(
+    declaration: &DependencyDeclaration,
+    message: String,
+) -> DependencyResolutionError {
+    DependencyResolutionError {
+        diagnostics: vec![DependencyDiagnostic {
+            code: "P0002".to_owned(),
+            message,
+            span: declaration.span.clone(),
+        }],
+    }
+}
+
+fn dependency_document(
+    package_root: &Path,
+    declaration: &DependencyDeclaration,
+    git_checkout: Option<&packages::GitDirectory>,
+    inspected: Option<toml_edit::ImDocument<String>>,
+) -> Result<toml_edit::ImDocument<String>, DependencyResolutionError> {
+    let name = &declaration.name;
+    let error = |message| dependency_manifest_error(declaration, message);
+    if let Some(inspected) = inspected {
+        return Ok(inspected);
+    }
+    let content = if let Some(checkout) = git_checkout {
+            checkout
+                .read_text(Path::new("wosy.toml"))
+                .map_err(error)?
+                .ok_or_else(|| error(format!("dependency {name} package manifest is missing")))?
+        } else {
+            fs::read_to_string(package_root.join("wosy.toml"))
+                .map_err(|_| error(format!("dependency {name} package manifest is missing")))?
+        };
+    toml_edit::ImDocument::parse(content)
+        .map_err(|_| error(format!("dependency {name} package manifest is invalid")))
+}
+
+fn dependency_package_table<'a>(
+    document: &'a toml_edit::ImDocument<String>,
+    declaration: &DependencyDeclaration,
+) -> Result<&'a toml_edit::Table, DependencyResolutionError> {
+    let name = &declaration.name;
+    let error = |message| dependency_manifest_error(declaration, message);
+    let package_table = document
+        .get("package")
+        .and_then(Item::as_table)
+        .ok_or_else(|| error(format!("dependency {name} package manifest has no package table")))?;
+    let resolved_name = scalar_string(package_table, "name")
+        .map_err(|_| error(format!("dependency {name} package manifest has no package name")))?;
+    if resolved_name != *name {
+        return Err(error(format!(
+            "dependency {name} package name is {resolved_name}"
+        )));
+    }
+    Ok(package_table)
+}
+
+fn load_dependency_package(
+    package_root: PathBuf,
+    declaration: &DependencyDeclaration,
+    git_checkout: Option<packages::GitDirectory>,
+    inspected: Option<toml_edit::ImDocument<String>>,
+) -> Result<(ResolvedPackage, BTreeMap<String, DependencyDeclaration>), DependencyResolutionError> {
+    let name = &declaration.name;
+    let error = |message| dependency_manifest_error(declaration, message);
+    let document = dependency_document(&package_root, declaration, git_checkout.as_ref(), inspected)?;
+    let package_table = dependency_package_table(&document, declaration)?;
+    let resolved_name = name.clone();
+    let source_root = package_table
+        .get("source_root")
+        .and_then(Item::as_str)
+        .map(PathBuf::from)
+        .ok_or_else(|| error(format!("dependency {name} package manifest has no source root")))?;
+    let source_path = PackageRelativePath::new(source_root.clone()).map_err(|_| {
+        error(format!("dependency {name} source root must be package-relative"))
+    })?;
+    let source_exists = if let Some(checkout) = &git_checkout {
+        checkout.directory(&source_root).map_err(error)?.is_some()
+    } else {
+        package_root.join(&source_root).is_dir()
+    };
+    if !source_exists {
+        return Err(error(format!("dependency {name} source root is missing")));
+    }
+    let dependencies = parse_dependencies(&package_root, &resolved_name, document.get("dependencies"))?;
+    Ok((ResolvedPackage {
+        name: resolved_name.clone(),
+        git_checkout,
+        git_pin_identity: None,
+        patch_stack_id: None,
+        local_root_identity: None,
+        dependencies: Vec::new(),
+        source_root: package_root.join(&source_root),
+        identity: SourceIdentity::new(
+            package_root.to_string_lossy().into_owned(),
+            resolved_name,
+            source_path,
+        ),
+        project_root: package_root,
+    }, dependencies))
+}
+
+#[cfg(test)]
+fn resolve_local_packages(
     root: &Path,
-    _package: &str,
     dependencies: &BTreeMap<String, DependencyDeclaration>,
 ) -> Result<BTreeMap<String, ResolvedPackage>, DependencyResolutionError> {
-    let mut resolved = BTreeMap::new();
-    for (name, declaration) in dependencies {
-        let package_root = root.join(&declaration.path);
-        let manifest_path = package_root.join("wosy.toml");
-        let content =
-            fs::read_to_string(&manifest_path).map_err(|_| DependencyResolutionError {
-                diagnostics: vec![DependencyDiagnostic {
-                    code: "P0002".to_owned(),
-                    message: format!("dependency {name} package manifest is missing"),
-                    span: declaration.span.clone(),
-                }],
-            })?;
-        let document = content
-            .parse::<toml_edit::ImDocument<String>>()
-            .map_err(|_| DependencyResolutionError {
-                diagnostics: vec![DependencyDiagnostic {
-                    code: "P0002".to_owned(),
-                    message: format!("dependency {name} package manifest is invalid"),
-                    span: declaration.span.clone(),
-                }],
-            })?;
-        let package_table = document
-            .get("package")
-            .and_then(Item::as_table)
-            .ok_or_else(|| DependencyResolutionError {
-                diagnostics: vec![DependencyDiagnostic {
-                    code: "P0002".to_owned(),
-                    message: format!("dependency {name} package manifest has no package table"),
-                    span: declaration.span.clone(),
-                }],
-            })?;
-        let resolved_name =
-            scalar_string(package_table, "name").map_err(|_| DependencyResolutionError {
-                diagnostics: vec![DependencyDiagnostic {
-                    code: "P0002".to_owned(),
-                    message: format!("dependency {name} package manifest has no package name"),
-                    span: declaration.span.clone(),
-                }],
-            })?;
-        if resolved_name != *name {
-            return Err(DependencyResolutionError {
-                diagnostics: vec![DependencyDiagnostic {
-                    code: "P0002".to_owned(),
-                    message: format!("dependency {name} package name is {resolved_name}"),
-                    span: declaration.span.clone(),
-                }],
-            });
-        }
-        let source_root = package_table
-            .get("source_root")
-            .and_then(Item::as_value)
-            .and_then(|value| value.as_str())
-            .map(PathBuf::from)
-            .ok_or_else(|| DependencyResolutionError {
-                diagnostics: vec![DependencyDiagnostic {
-                    code: "P0002".to_owned(),
-                    message: format!("dependency {name} package manifest has no source root"),
-                    span: declaration.span.clone(),
-                }],
-            })?;
-        let source_path = PackageRelativePath::new(source_root.clone()).map_err(|_| {
-            DependencyResolutionError {
-                diagnostics: vec![DependencyDiagnostic {
-                    code: "P0002".to_owned(),
-                    message: format!("dependency {name} source root must be package-relative"),
-                    span: declaration.span.clone(),
-                }],
-            }
-        })?;
-        if !package_root.join(&source_root).is_dir() {
-            return Err(DependencyResolutionError {
-                diagnostics: vec![DependencyDiagnostic {
-                    code: "P0002".to_owned(),
-                    message: format!("dependency {name} source root is missing"),
-                    span: declaration.span.clone(),
-                }],
-            });
-        }
-        resolved.insert(
-            name.to_owned(),
-            ResolvedPackage {
-                name: resolved_name.clone(),
-                project_root: package_root.clone(),
-                source_root: package_root.join(&source_root),
-                identity: SourceIdentity::new(
-                    package_root.to_string_lossy().into_owned(),
-                    resolved_name,
-                    source_path,
-                ),
-            },
-        );
-    }
-    Ok(resolved)
+    dependencies
+        .iter()
+        .map(|(name, declaration)| {
+            let DependencySource::Local { path } = &declaration.source else {
+                return Err(DependencyResolutionError {
+                    diagnostics: vec![DependencyDiagnostic {
+                        code: "P0002".to_owned(),
+                        message: format!("Git dependency {name} cannot yet be materialized"),
+                        span: declaration.span.clone(),
+                    }],
+                });
+            };
+            resolve_package(root.join(path), declaration, None).map(|resolved| (name.clone(), resolved))
+        })
+        .collect()
 }
 
 fn dependency_diagnostic(
@@ -1016,13 +1142,24 @@ impl ProjectContext {
     }
 
     pub fn load(root: &Path, target: &str) -> Result<Self, String> {
-        let config_path = root.join("wosy.toml");
-        let content = fs::read_to_string(&config_path)
-            .map_err(|error| format!("failed to read {}: {error}", config_path.display()))?;
-        let document = content
-            .parse::<DocumentMut>()
-            .map_err(|error| format!("failed to parse {}: {error}", config_path.display()))?;
-        Self::from_manifest(root, target, document.as_table())
+        Self::load_parse_target(root, Some(target))
+    }
+
+    /// Root-only parsing does not load package bindings or build profiles.
+    pub fn load_parse_target(root: &Path, target: Option<&str>) -> Result<Self, String> {
+        let path = root.join("wosy.toml");
+        let content = fs::read_to_string(&path)
+            .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+        let document = toml_edit::ImDocument::parse(content).map_err(|error| error.to_string())?;
+        let selected = match target {
+            Some(name) => name.to_owned(),
+            None => {
+                let package = document.get("package").and_then(Item::as_table)
+                    .ok_or_else(|| "package is missing".to_owned())?;
+                scalar_string(package, "default_target")?
+            }
+        };
+        Self::from_manifest(root, &selected, document.as_table())
     }
 
     pub fn from_manifest(
@@ -1236,6 +1373,7 @@ mod tests {
         );
         let invalid = ProjectConfiguration {
             default_target: "missing".to_owned(),
+            module_source_root: None,
             builders: BTreeMap::new(),
             runners: BTreeMap::new(),
             targets: BTreeMap::new(),
@@ -1371,6 +1509,22 @@ mod tests {
         }
     }
 
+    fn app_graph(
+        root: SourceNodeInput,
+        available: Vec<SourceNodeInput>,
+        dependencies: &BTreeMap<String, ResolvedPackage>,
+    ) -> Result<SourceGraph, GraphLoadError> {
+        load_reachable_source_graph(
+            &NamespacePackages {
+                root_name: "app",
+                root_source: None,
+                dependencies,
+            },
+            root,
+            available,
+        )
+    }
+
     #[test]
     fn reachable_graph_visits_edges_in_source_order_once() {
         let root = source(
@@ -1380,8 +1534,7 @@ mod tests {
                 edge("src/main.w", "src/math.w", "again"),
             ],
         );
-        let graph = load_reachable_source_graph(
-            "app",
+        let graph = app_graph(
             root,
             vec![source("src/math.w", Vec::new())],
             &BTreeMap::new(),
@@ -1411,8 +1564,7 @@ mod tests {
         first.content_revision = ContentRevision("first".to_owned());
         let mut last = source("src/main.w", vec![edge("src/main.w", "src/math.w", "last")]);
         last.content_revision = ContentRevision("last".to_owned());
-        let graph = load_reachable_source_graph(
-            "app",
+        let graph = app_graph(
             root,
             vec![first, source("src/math.w", Vec::new()), last],
             &BTreeMap::new(),
@@ -1430,8 +1582,7 @@ mod tests {
     #[test]
     fn missing_module_has_typed_m0001_requesting_span() {
         let root = source("src/main.w", vec![edge("src/main.w", "src/math.w", "math")]);
-        let error = load_reachable_source_graph("app", root, Vec::new(), &BTreeMap::new())
-            .expect_err("missing");
+        let error = app_graph(root, Vec::new(), &BTreeMap::new()).expect_err("missing");
 
         assert_eq!(error.diagnostics.len(), 1);
         match &error.diagnostics[0] {
@@ -1477,6 +1628,11 @@ mod tests {
         resolved.insert(
             "std".to_owned(),
             ResolvedPackage {
+                git_checkout: None,
+                git_pin_identity: None,
+        patch_stack_id: None,
+                local_root_identity: None,
+                dependencies: Vec::new(),
                 name: "std".to_owned(),
                 project_root: PathBuf::from("/stdlib"),
                 source_root: PathBuf::from("/stdlib/src"),
@@ -1488,8 +1644,7 @@ mod tests {
             },
         );
 
-        let graph = load_reachable_source_graph("app", root, vec![dependency], &resolved)
-            .expect("package-qualified graph");
+        let graph = app_graph(root, vec![dependency], &resolved).expect("package-qualified graph");
 
         assert_eq!(graph.nodes.len(), 2);
         assert_eq!(graph.nodes[0].namespace_edges[0].target, SourceNodeId(1));
@@ -1501,8 +1656,7 @@ mod tests {
     fn cycle_has_typed_m0003_participating_sources() {
         let root = source("src/main.w", vec![edge("src/main.w", "src/math.w", "math")]);
         let math = source("src/math.w", vec![edge("src/math.w", "src/main.w", "main")]);
-        let error = load_reachable_source_graph("app", root, vec![math], &BTreeMap::new())
-            .expect_err("cycle");
+        let error = app_graph(root, vec![math], &BTreeMap::new()).expect_err("cycle");
 
         match &error.diagnostics[0] {
             GraphDiagnostic::Cycle(diagnostic) => {
@@ -1551,14 +1705,19 @@ mod tests {
         )
         .expect("package manifest");
         let document = dependency_document("[dependencies.std]\npath = \"../stdlib\"\n");
-        let dependencies = parse_local_dependencies(&root, "app", document.get("dependencies"))
+        let dependencies = parse_dependencies(&root, "app", document.get("dependencies"))
             .expect("local dependency");
         let declaration = dependencies.get("std").expect("std declaration");
         assert_eq!(declaration.name, "std");
-        assert_eq!(declaration.path, PathBuf::from("../stdlib"));
+        assert_eq!(
+            declaration.source,
+            DependencySource::Local {
+                path: PathBuf::from("../stdlib"),
+            }
+        );
         assert!(declaration.span.range.end > declaration.span.range.start);
         let resolved =
-            resolve_local_packages(&root, "app", &dependencies).expect("resolved package");
+            resolve_local_packages(&root, &dependencies).expect("resolved package");
         let package = resolved.get("std").expect("resolved std package");
         assert_eq!(package.name, "std");
         assert_eq!(package.project_root, package_root);
@@ -1571,7 +1730,7 @@ mod tests {
     fn malformed_local_dependency_has_structured_diagnostic() {
         let root = dependency_test_root().join("malformed");
         let document = dependency_document("[dependencies]\nstd = \"../stdlib\"\n");
-        let error = parse_local_dependencies(&root, "app", document.get("dependencies"))
+        let error = parse_dependencies(&root, "app", document.get("dependencies"))
             .expect_err("malformed dependency");
         assert_eq!(error.diagnostics[0].code, "P0001");
         assert_eq!(error.diagnostics[0].span.source.path, path("wosy.toml"));
@@ -1590,14 +1749,91 @@ mod tests {
         assert_eq!(error, "dependency std must be a table at 45..47");
     }
 
+    fn dependency_project_manifest(dependencies: &str) -> String {
+        format!(
+            "[package]\nname = \"app\"\ndefault_target = \"app\"\n\n{dependencies}\n\n\
+             [builders]\n[runners]\n[targets.app]\nroot = \"src/main.w\"\n\
+             [targets.app.artifacts]\n[targets.app.profiles]\n"
+        )
+    }
+
+    #[test]
+    fn local_project_loading_preserves_nested_sibling_root_with_legacy_lock() {
+        let fixture = dependency_test_root();
+        let project = fixture.join("project");
+        let sibling_root = fixture.join("sibling");
+        fs::create_dir_all(&project).expect("project directory");
+        fs::create_dir_all(sibling_root.join("src/nested")).expect("sibling source directory");
+        fs::write(
+            sibling_root.join("wosy.toml"),
+            "[package]\nname = \"sibling\"\nsource_root = \"src/nested\"\n",
+        )
+        .expect("sibling manifest");
+        fs::write(
+            project.join("wosy.toml"),
+            dependency_project_manifest("[dependencies.sibling]\npath = \"../sibling\""),
+        )
+        .expect("project manifest");
+        fs::write(project.join("wosy.lock"), b"not a managed Wosy lock")
+            .expect("legacy lock contents");
+
+        let configuration = ProjectConfiguration::load(&project).expect("local package loads");
+        let sibling = &configuration.resolved_packages["sibling"];
+        assert_eq!(sibling.project_root, project.join("../sibling"));
+        assert_eq!(sibling.source_root, project.join("../sibling/src/nested"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn git_project_loading_never_uses_a_matching_lock_to_trust_an_unverified_tree() {
+        let project = dependency_test_root();
+        let revision = "0123456789abcdef0123456789abcdef01234567";
+        fs::create_dir_all(&project).expect("project directory");
+        fs::write(
+            project.join("wosy.toml"),
+            dependency_project_manifest("[dependencies.vendored]\ngit = \"../origin\""),
+        )
+        .expect("project manifest");
+        let lock = format!(
+            "version = 1\n[packages.vendored]\ngit = \"../origin\"\nrev = \"{revision}\"\n\
+             path = \".\"\nsource_hash = \"{}\"\n",
+            "0".repeat(64)
+        );
+        fs::write(project.join("wosy.lock"), lock).expect("valid lockfile");
+
+        for seeded in [false, true] {
+            if seeded {
+                let installed = project.join("deps/vendored");
+                fs::create_dir_all(installed.join("src")).expect("seeded sources");
+                fs::write(
+                    installed.join("wosy.toml"),
+                    "[package]\nname = \"vendored\"\nsource_root = \"src\"\n",
+                )
+                .expect("matching but unverified installed manifest");
+            }
+            assert_eq!(
+                ProjectConfiguration::load(&project).unwrap_err(),
+                if seeded {
+                    format!(
+                        "app -> vendored: dependency vendored is not verified for its wosy.lock pin; move {} aside and run wosy dep sync",
+                        project.join("deps/vendored").display()
+                    )
+                } else {
+                    "app -> vendored: dependency vendored is not materialized; run wosy dep sync".to_owned()
+                },
+                "seeded = {seeded}"
+            );
+        }
+    }
+
     #[test]
     fn missing_local_dependency_manifest_has_structured_diagnostic() {
         let root = dependency_test_root().join("missing");
         fs::create_dir_all(&root).expect("project root");
         let document = dependency_document("[dependencies.std]\npath = \"../stdlib\"\n");
-        let dependencies = parse_local_dependencies(&root, "app", document.get("dependencies"))
+        let dependencies = parse_dependencies(&root, "app", document.get("dependencies"))
             .expect("local dependency");
-        let error = resolve_local_packages(&root, "app", &dependencies)
+        let error = resolve_local_packages(&root, &dependencies)
             .expect_err("missing package manifest");
         assert_eq!(error.diagnostics[0].code, "P0002");
         assert!(error.diagnostics[0].message.contains("manifest is missing"));
@@ -1611,11 +1847,11 @@ mod tests {
         fs::create_dir_all(&package_root).expect("package root");
         fs::write(package_root.join("wosy.toml"), "[package").expect("invalid manifest");
         let document = dependency_document("[dependencies.std]\npath = \"../stdlib\"\n");
-        let dependencies = parse_local_dependencies(&root, "app", document.get("dependencies"))
+        let dependencies = parse_dependencies(&root, "app", document.get("dependencies"))
             .expect("local dependency");
 
         let error =
-            resolve_local_packages(&root, "app", &dependencies).expect_err("invalid manifest");
+            resolve_local_packages(&root, &dependencies).expect_err("invalid manifest");
 
         assert_eq!(error.diagnostics[0].code, "P0002");
         assert!(error.diagnostics[0].message.contains("manifest is invalid"));
@@ -1633,11 +1869,11 @@ mod tests {
         )
         .expect("package manifest");
         let document = dependency_document("[dependencies.std]\npath = \"../stdlib\"\n");
-        let dependencies = parse_local_dependencies(&root, "app", document.get("dependencies"))
+        let dependencies = parse_dependencies(&root, "app", document.get("dependencies"))
             .expect("local dependency");
 
         let error =
-            resolve_local_packages(&root, "app", &dependencies).expect_err("identity mismatch");
+            resolve_local_packages(&root, &dependencies).expect_err("identity mismatch");
 
         assert_eq!(error.diagnostics[0].code, "P0002");
         assert!(error.diagnostics[0]

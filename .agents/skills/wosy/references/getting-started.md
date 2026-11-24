@@ -10,7 +10,14 @@ Wosy compiles statically typed `.w` programs to native and WebAssembly targets.
 
 ## Create a project
 
-A project is a directory containing `wosy.toml` and a `src/main.w` entry point. The minimal `wosy.toml` names the package, the default target, the entry file, one builder, one runner, and one artifact profile. See [Project layout](project.md) for the full schema.
+On Linux:
+
+```sh
+mkdir my_app && cd my_app
+wosy init
+```
+
+Use `--profile wasm` on both build and run for WASI Preview 1.
 
 ## Write source
 
