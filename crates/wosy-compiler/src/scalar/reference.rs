@@ -369,7 +369,7 @@ const MAX_JOINED_REBORROW_ALIASES: usize = 8;
 pub(super) struct ReferenceFlowBuilder<'a> {
     capture_call_points: bool,
     root_return_points: std::ops::Range<usize>,
-    mixed_owners: Option<MixedReceiptSelection<'a>>,
+    mixed_owners: Option<&'a MixedReceiptAuthority>,
     shared_scalar_read_effects: Option<&'a HashMap<ByteSpan, SharedScalarReadEffect>>,
     local_borrow: Option<local_borrow::Author>,
     aggregate_facts: aggregate::AggregateFlowFacts,
@@ -13554,20 +13554,86 @@ type MixedReceiptTargets = HashMap<SourceIdentity, HashSet<ByteSpan>>;
 type MixedReceiptKey<'a> = (&'a SourceIdentity, ByteSpan);
 type MixedReceiptEdges<'a> = HashMap<MixedReceiptKey<'a>, Vec<MixedReceiptKey<'a>>>;
 
-#[derive(Clone, Copy)]
-struct MixedReceiptSelection<'a> {
-    grounds: &'a MixedReceiptTargets,
-    forwarders: &'a MixedReceiptTargets,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MixedReceiptProof {
+    Local(aggregate::SealedMixedOwner),
+    Forwarded,
 }
 
-impl MixedReceiptSelection<'_> {
-    fn contains(self, target: &SourceIdentity, span: &ByteSpan) -> bool {
-        self.grounds.get(target).is_some_and(|points| points.contains(span))
-            || self.is_forwarder(target, span)
+type MixedReceiptRoots = HashMap<SourceIdentity, HashMap<ByteSpan, aggregate::SealedMixedOwner>>;
+
+#[derive(Default)]
+struct MixedReceiptModuleProofs {
+    local: HashMap<ByteSpan, aggregate::SealedMixedOwner>,
+    forwarded: HashSet<ByteSpan>,
+}
+
+// This is the only index caller replay accepts. Ordinary qualified edges
+// cannot be used as receipt authority until resolve proves reachability.
+struct MixedReceiptAuthority(HashMap<SourceIdentity, MixedReceiptModuleProofs>);
+
+impl MixedReceiptAuthority {
+    fn proof(&self, source: &SourceIdentity, span: &ByteSpan) -> Option<MixedReceiptProof> {
+        let module = self.0.get(source)?;
+        module.local.get(span).copied().map(MixedReceiptProof::Local)
+            .or_else(|| module.forwarded.contains(span).then_some(MixedReceiptProof::Forwarded))
     }
 
-    fn is_forwarder(self, source: &SourceIdentity, declaration: &ByteSpan) -> bool {
-        self.forwarders.get(source).is_some_and(|points| points.contains(declaration))
+    fn contains(&self, source: &SourceIdentity, span: &ByteSpan) -> bool {
+        self.proof(source, span).is_some()
+    }
+
+    fn is_forwarder(&self, source: &SourceIdentity, span: &ByteSpan) -> bool {
+        self.proof(source, span) == Some(MixedReceiptProof::Forwarded)
+    }
+}
+
+struct MixedReceiptPlan<'a> {
+    // Nominate only already sealed body-local allocation or branch proofs.
+    // Dependency edges themselves do not carry authority.
+    roots: MixedReceiptRoots,
+    users: MixedReceiptEdges<'a>,
+}
+
+impl MixedReceiptPlan<'_> {
+    fn resolve(self) -> MixedReceiptAuthority {
+        let Self { roots, users } = self;
+        // Keep qualified edges borrowed while walking; only the final
+        // per-module forwarding index needs owned source identities.
+        fn rooted_forwarders<'a>(roots: &'a MixedReceiptRoots, mut users: MixedReceiptEdges<'a>) -> MixedReceiptTargets {
+            if users.is_empty() { return HashMap::new(); }
+            let mut pending: Vec<_> = roots.iter()
+                .flat_map(|(source, proofs)| proofs.keys().map(move |span| (source, *span))).collect();
+            let mut reached = HashSet::new();
+            while let Some(callee) = pending.pop() {
+                let Some(callers) = users.remove(&callee) else { continue };
+                for caller in callers {
+                    if !roots.get(caller.0).is_some_and(|proofs| proofs.contains_key(&caller.1))
+                        && reached.insert(caller)
+                    {
+                        pending.push(caller);
+                    }
+                }
+            }
+            let mut forwarders = MixedReceiptTargets::new();
+            for (source, span) in reached {
+                if let Some(spans) = forwarders.get_mut(source) {
+                    spans.insert(span);
+                } else {
+                    forwarders.insert(source.clone(), HashSet::from([span]));
+                }
+            }
+            forwarders
+        }
+
+        let mut forwarders = rooted_forwarders(&roots, users);
+        let mut modules: HashMap<_, _> = roots.into_iter().map(|(source, local)| {
+            let forwarded = forwarders.remove(&source).unwrap_or_default();
+            (source, MixedReceiptModuleProofs { local, forwarded })
+        }).collect();
+        modules.extend(forwarders.into_iter().map(|(source, forwarded)| (source,
+            MixedReceiptModuleProofs { forwarded, ..Default::default() })));
+        MixedReceiptAuthority(modules)
     }
 }
 
@@ -13580,13 +13646,13 @@ struct MixedReceiptCohort {
 impl MixedReceiptCohort {
     fn grounds(
         &self, source: &SourceIdentity, updates: &[(usize, FunctionReferenceResult)], targets: &MixedReceiptTargets,
-    ) -> HashSet<ByteSpan> {
-        let Some(targets) = targets.get(source) else { return HashSet::new() };
+    ) -> HashMap<ByteSpan, aggregate::SealedMixedOwner> {
+        let Some(targets) = targets.get(source) else { return HashMap::new() };
         self.producers.iter().filter_map(|&(position, declaration, lanes)| {
+            if !targets.contains(&declaration) { return None; }
             let result = &updates[position].1;
-            (targets.contains(&declaration)
-                && result.aggregate.sealed_mixed_owner(&result.cfg, lanes).is_some())
-                .then_some(declaration)
+            let proof = result.aggregate.sealed_mixed_owner(&result.cfg, lanes)?;
+            Some((declaration, proof))
         }).collect()
     }
 
@@ -13608,7 +13674,7 @@ impl MixedReceiptCohort {
 
     fn select(
         self, source: &SourceIdentity, items: &[ScalarItem], call_sites: &ModuleCallSites,
-        updates: &mut [(usize, FunctionReferenceResult)], owners: MixedReceiptSelection<'_>,
+        updates: &mut [(usize, FunctionReferenceResult)], owners: &MixedReceiptAuthority,
         structs: &[ScalarStruct], enums: &[ScalarEnum], capture_call_points: bool,
         errors: &mut Vec<ReferenceAnalysisError>,
     ) {
@@ -13636,9 +13702,8 @@ fn derive_module_reference_origins(
                 let grounds = HashMap::from([(source.clone(), owners)]);
                 let mut edges = HashMap::new();
                 cohort.index_forwarders(source, items, call_sites, &updates, &mut edges);
-                let forwarders = reachable_mixed_forwarders(&grounds, edges);
-                let selection = MixedReceiptSelection { grounds: &grounds, forwarders: &forwarders };
-                cohort.select(source, items, call_sites, &mut updates, selection, structs, enums, capture_call_points, &mut errors);
+                let authority = MixedReceiptPlan { roots: grounds, users: edges }.resolve();
+                cohort.select(source, items, call_sites, &mut updates, &authority, structs, enums, capture_call_points, &mut errors);
             }
         }
     }
@@ -13692,35 +13757,6 @@ fn derive_module_reference_cohort(
     (updates, errors, cohort)
 }
 
-fn reachable_mixed_forwarders<'a>(
-    grounds: &'a MixedReceiptTargets, mut users: MixedReceiptEdges<'a>,
-) -> MixedReceiptTargets {
-    if users.is_empty() {
-        return HashMap::new();
-    }
-    let mut pending = grounds.iter().flat_map(|(source, spans)| spans.iter().map(move |span| (source, *span))).collect::<Vec<_>>();
-    let mut reached = HashSet::new();
-    while let Some(callee) = pending.pop() {
-        let Some(callers) = users.remove(&callee) else { continue };
-        for caller in callers {
-            if !grounds.get(caller.0).is_some_and(|spans| spans.contains(&caller.1))
-                && reached.insert(caller)
-            {
-                pending.push(caller);
-            }
-        }
-    }
-    let mut forwarders = MixedReceiptTargets::new();
-    for (source, span) in reached {
-        if let Some(spans) = forwarders.get_mut(source) {
-            spans.insert(span);
-        } else {
-            forwarders.insert(source.clone(), HashSet::from([span]));
-        }
-    }
-    forwarders
-}
-
 #[cfg(test)]
 #[test]
 fn mixed_wrapper_reachability_requires_an_allocation_grounded_predecessor() {
@@ -13732,19 +13768,27 @@ fn mixed_wrapper_reachability_requires_an_allocation_grounded_predecessor() {
     let first = source("first.w", "1");
     let second = source("second.w", "1");
     let decoy = source("owner.w", "2");
-    let grounds = HashMap::from([(origin.clone(), HashSet::from([span(0)]))]);
-    let actual = reachable_mixed_forwarders(&grounds, HashMap::from([
+    let lanes = aggregate::MixedOwnerResultLanes { owner: 1, scalar: 0 };
+    let local = aggregate::SealedMixedOwner::Allocation { lanes, block: 2, item: 3 };
+    let roots = HashMap::from([(origin.clone(), HashMap::from([(span(0), local)]))]);
+    let users = HashMap::from([
         ((&origin, span(0)), vec![(&first, span(0))]),
         ((&first, span(0)), vec![(&second, span(0)), (&second, span(1))]),
         ((&decoy, span(0)), vec![(&first, span(1))]),
         ((&first, span(4)), vec![(&second, span(4))]),
         ((&second, span(4)), vec![(&first, span(4))]),
         ((&second, span(5)), vec![(&second, span(5))]),
-    ]));
-    assert_eq!(actual, HashMap::from([
-        (first, HashSet::from([span(0)])),
-        (second, HashSet::from([span(0), span(1)])),
-    ]));
+    ]);
+    let actual = MixedReceiptPlan { roots, users }.resolve();
+    assert_eq!(actual.0.values().map(|module| module.local.len() + module.forwarded.len()).sum::<usize>(), 4);
+    assert_eq!(actual.proof(&origin, &span(0)), Some(MixedReceiptProof::Local(local)));
+    assert!(!actual.is_forwarder(&origin, &span(0)));
+    assert!(actual.is_forwarder(&first, &span(0)));
+    assert!(actual.is_forwarder(&second, &span(0)));
+    assert!(actual.is_forwarder(&second, &span(1)));
+    for (source, rejected) in [(&decoy, 0), (&first, 1), (&first, 4), (&second, 4), (&second, 5)] {
+        assert!(!actual.contains(source, &span(rejected)), "unseeded candidate has no authority");
+    }
 }
 
 fn install_module_reference_results(
@@ -13950,7 +13994,7 @@ fn derive_project_reference_origins(
             let source = &modules[*index].source;
             let owners = cohort.grounds(source, results, &targets);
             (!owners.is_empty()).then(|| (source.clone(), owners))
-        }).collect::<MixedReceiptTargets>();
+        }).collect::<MixedReceiptRoots>();
         if !grounds.is_empty() {
             let (structs, enums) = inventory.as_ref().expect("mixed project cohorts have declared inventory");
             let mut edges = HashMap::new();
@@ -13960,13 +14004,12 @@ fn derive_project_reference_origins(
                 let sites = call_sites.modules[*index].as_ref().expect("successful mixed receipt cohort");
                 cohort.index_forwarders(&module.source, &module.items, sites, results, &mut edges);
             }
-            let forwarders = reachable_mixed_forwarders(&grounds, edges);
-            let selection = MixedReceiptSelection { grounds: &grounds, forwarders: &forwarders };
+            let authority = MixedReceiptPlan { roots: grounds, users: edges }.resolve();
             for (position, cohort) in cohorts {
                 let (index, results) = &mut updates[position];
                 let module = &modules[*index];
                 let sites = call_sites.modules[*index].as_ref().expect("successful mixed receipt cohort");
-                cohort.select(&module.source, &module.items, sites, results, selection,
+                cohort.select(&module.source, &module.items, sites, results, &authority,
                     structs, enums, capture_call_points, &mut errors);
             }
         }
@@ -14769,7 +14812,7 @@ impl FunctionReferenceResult {
     fn observe_selected_mixed_receipts(
         &mut self, function: &ScalarFunction, sites: &FunctionCallSites, module_names: &HashSet<String>,
         structs: &[ScalarStruct], enums: &[ScalarEnum], source: &SourceIdentity,
-        effects: &HashMap<ByteSpan, SharedScalarReadEffect>, owners: MixedReceiptSelection<'_>,
+        effects: &HashMap<ByteSpan, SharedScalarReadEffect>, owners: &MixedReceiptAuthority,
         forwards: bool, capture_call_points: bool, errors: &mut Vec<ReferenceAnalysisError>,
     ) {
         for ((result, function), sites) in self.arms.iter_mut().zip(&function.overload_arms).zip(&sites.arms) {
