@@ -7435,7 +7435,12 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
             let mut output = marker.output;
             #[cfg(feature = "internal-checker")]
             if let WalkMode::Callable(callable) = &self.mode {
-                use super::checker_directive::{CheckerStateSelection, CheckerStateType};
+                use super::checker_directive::{CheckerCode, CheckerStateSelection, CheckerStateType};
+                if let CheckerCode::Lexical(name, ty) = &output.code_value {
+                    if let Some(PlainNameIdentity::Lexical(binding)) = callable.target_resolver.plain_name(name, names) {
+                        output.code_value = CheckerCode::Binding(std::rc::Rc::new(binding), ty.clone());
+                    }
+                }
                 for file in output.state_files.iter_mut() {
                     let CheckerStateSelection::Lexical(lexical) = &file.selection else { continue; };
                     if matches!(&file.ty, CheckerStateType::Nominal(_) | CheckerStateType::FixedArray) {

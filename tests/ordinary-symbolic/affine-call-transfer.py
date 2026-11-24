@@ -1209,6 +1209,29 @@ state_holes = f"""%%start
         core.require(false, {state_report(168,"ALTERNATIVES","value")});
     }};
     %%end"""
+lexical_code_report = state_report(0,"LEXICAL-CODE","status").replace(".code = 0",".code = status")
+lexical_code = f"""%%start
+    unit(i8) check = fn(status) {{
+        core.require(status != 37, {lexical_code_report});
+    }};
+    %%end"""
+lexical_narrow_code = f"""%%start
+    unit(i8) check = fn(status) {{
+        core.narrow(status >= 45, {lexical_code_report});
+    }};
+    check(43);
+    %%end"""
+lexical_code_non_singleton = lexical_code.replace(
+    f"core.require(status != 37, {lexical_code_report});",
+    "core.require(false, " + report(44,"LEXICAL-CODE-PRIOR") + "); "
+    + f"core.require(false, {lexical_code_report});",
+)
+cases.extend([
+    ("authored-lexical-code-resolves-failure-witness",lexical_code,37,b"LEXICAL-CODE"),
+    ("exact-startup-lexical-code-resolves-failed-narrow",lexical_narrow_code,43,b"LEXICAL-CODE"),
+    ("authored-lexical-code-nonsingleton-fails-atomically",lexical_code_non_singleton,2,b"unsupported analysis"),
+    ("authored-lexical-code-success-does-not-resolve",lexical_code.replace("status != 37","status <= 127"),0,b""),
+])
 state_fixed_array = f"""%%start
     unit(i8) check = fn(value) {{
         core.narrow(value == 1 || value == 3, {report(167,"HOLES")});
@@ -1348,6 +1371,8 @@ nested_array_bytes = state_bytes({
     },
 })
 authored_files = {
+    "authored-lexical-code-resolves-failure-witness": {"state.json": b'{"type":{"kind":"i8"},"value":37}\n'},
+    "exact-startup-lexical-code-resolves-failed-narrow": {"state.json": b'{"type":{"kind":"i8"},"value":43}\n'},
     "exact-startup-contextual-bool-restores-outer": {
         "inner.json": b'{"type":{"kind":"bool"},"value":false}\n',
         "outer.json": b'{"type":{"kind":"bool"},"value":true}\n',
@@ -1464,6 +1489,8 @@ with tempfile.TemporaryDirectory(prefix="affine-calls-") as path:
                 assert not res.stdout,res
                 if code==2:
                     assert expected_stderr in res.stderr,res
+                    if name == "authored-lexical-code-nonsingleton-fails-atomically":
+                        assert b"LEXICAL-CODE" not in res.stderr,res
                     if name == "parallel-formal-target-fails-closed":
                         assert b"FORMAL-NEVER-PUBLISHED" not in res.stderr,res
                     if name.startswith("exact-startup-ranked-integer-return-"):

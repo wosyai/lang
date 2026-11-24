@@ -56,9 +56,27 @@ pub(super) struct CheckedLiteralOutput {
     pub(super) files: ByteSpan,
     pub(super) stdout_bytes: Box<[u8]>,
     pub(super) stderr_bytes: Box<[u8]>,
-    pub(super) code_value: BigInt,
+    pub(super) code_value: CheckerCode,
     pub(super) text_files: Box<[ScalarCheckerTextFile]>,
     pub(super) state_files: Box<[CheckerStateFile]>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum CheckerCode {
+    Literal(BigInt),
+    Lexical(std::rc::Rc<str>, ScalarType),
+    #[cfg(feature = "internal-checker")]
+    Binding(std::rc::Rc<ReferenceBindingId>, ScalarType),
+}
+
+impl CheckerCode {
+    #[cfg(any(test, feature = "internal-checker"))]
+    pub(super) fn literal(&self) -> Option<&BigInt> {
+        match self {
+            Self::Literal(value) => Some(value),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -272,8 +290,16 @@ impl CheckerOutput<'_> {
         let ScalarExpression::Utf8 { span: stderr, value: stderr_bytes } = self.stderr? else {
             return None;
         };
-        let ScalarExpression::Integer { span: code, value: code_value } = self.code? else {
-            return None;
+        let code = self.code?;
+        let code_value = match code {
+            ScalarExpression::Integer { value, .. } => CheckerCode::Literal(value.clone()),
+            ScalarExpression::Name { .. } => {
+                let (CheckerStateSelection::Lexical(name), CheckerStateType::Scalar(ty)) = select(code)?
+                    else { return None; };
+                if !super::typecheck::is_integer_type(&ty) { return None; }
+                CheckerCode::Lexical(name, ty)
+            }
+            _ => return None,
         };
         let mut targets = CheckedOutputTargets::default();
         let mut text_files = Vec::new();
@@ -302,11 +328,11 @@ impl CheckerOutput<'_> {
         Some(CheckedLiteralOutput {
             stdout: *stdout,
             stderr: *stderr,
-            code: *code,
+            code: expression_span(code),
             files: self.files_literal?,
             stdout_bytes: stdout_bytes.as_slice().into(),
             stderr_bytes: stderr_bytes.as_slice().into(),
-            code_value: code_value.clone(),
+            code_value,
             text_files: text_files.into_boxed_slice(),
             state_files: state_files.into_boxed_slice(),
         })
@@ -1136,7 +1162,7 @@ mod tests {
             let payload = &body.structure.checker_directives[&failure.directive].output;
             assert_eq!(payload.stdout_bytes.as_ref(), "café\n☕".as_bytes());
             assert_eq!(payload.stderr_bytes.as_ref(), b"erro\t\"");
-            assert_eq!(payload.code_value, BigInt::from(u128::MAX) + 1);
+            assert_eq!(payload.code_value.literal(), Some(&(BigInt::from(u128::MAX) + 1)));
             let offset = "%%start\n".len();
             let spelling = |span: ByteSpan| {
                 &source[span.start as usize - offset..span.end as usize - offset]

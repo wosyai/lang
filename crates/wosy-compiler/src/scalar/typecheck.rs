@@ -3373,7 +3373,7 @@ fn check_expression_type_in_module(
                 diagnostics.push(module_diagnostic(
                     module,
                     "B0003",
-                    "checker directive preparation currently requires explicit literal output",
+                    "checker directive requires supported concrete output selections",
                     expression_span(expression),
                 ));
                 return ScalarType::Error;

@@ -5,7 +5,7 @@ use num_bigint::BigInt;
 use std::hash::{Hash, Hasher};
 
 use super::{
-    checker_directive::{CheckedLiteralOutput, CheckerOperation, InitializerIntegerOperand, InitializerPredicate, PreparedCheckerDirective},
+    checker_directive::{CheckerCode, CheckedLiteralOutput, CheckerOperation, InitializerIntegerOperand, InitializerPredicate, PreparedCheckerDirective},
     checker_flow::{
         check_integer_requirement_activity, check_integer_requirements_with_calls, check_integer_return_bound_with_shows, collect_integer_requirement_failures_with_calls, MAX_ACTUAL_CALL_DEPTH, ExactCallCursor, ExactCallEffect, ExactCallProgress, concrete_integer_literal, exact_typed_call_argument_at,
         exact_integer_return_at_entry, ActualCallResult, CheckerPredicate, ExactIntegerArgument, IntegerRequirementContinuation, IntegerRequirementEntry, NestedIntegerArgument, ProjectedCompanion, ProjectedIntegerArgument,
@@ -142,7 +142,7 @@ pub struct ScalarOrderedCheckerFailure {
 impl ScalarOrderedCheckerFailure {
     pub fn stdout(&self) -> &[u8] { &self.output.stdout_bytes }
     pub fn stderr(&self) -> &[u8] { &self.output.stderr_bytes }
-    pub fn code(&self) -> &BigInt { &self.output.code_value }
+    pub fn code(&self) -> &BigInt { self.output.code_value.literal().expect("published checker code is concrete") }
     pub fn files(&self) -> &[super::checker_directive::ScalarCheckerTextFile] { &self.output.text_files }
     pub fn stdout_span(&self) -> ByteSpan { self.output.stdout }
     pub fn stderr_span(&self) -> ByteSpan { self.output.stderr }
@@ -283,6 +283,7 @@ fn materialize_checker_failure(error: ProjectCheck) -> Option<ScalarCheckerFailu
     let ProjectCheck::Failed { source, operation, directive, condition, output, axes, state } = error else {
         return None;
     };
+    let CheckerCode::Literal(code) = output.code_value else { return None; };
     Some(ScalarCheckerFailure {
         source,
         operation: operation.into(),
@@ -295,7 +296,7 @@ fn materialize_checker_failure(error: ProjectCheck) -> Option<ScalarCheckerFailu
         files: output.text_files,
         stdout: output.stdout_bytes,
         stderr: output.stderr_bytes,
-        code: output.code_value,
+        code,
         witness: ScalarCheckerIntegerWitness { axes, state, equal_axes: Vec::new() },
     })
 }
@@ -447,6 +448,7 @@ impl ActualIntegerObserver for ProofFreeOrderedEvidence {
     const EXACT_INTEGER_LOCAL_WRITES: bool = true;
     const EXACT_COMPLETED_NAMESPACE_INTEGER_RETURNS: bool = true;
     const EXACT_CONTEXTUAL_BOOLEAN_UNIT: bool = true;
+    const AUTHORED_SINGLETON_CODE: bool = true;
     const ORDINARY_INTEGER_LOCALS: bool = true;
 
     fn observe(&mut self, _: (usize, usize), _: &[&BigInt], _: &BigInt) {}
@@ -511,14 +513,15 @@ fn run_prepared_ordered_check<E: OrderedRunEvidence>(
     } else {
         E::SymbolicReport::default()
     };
-    // Materialize authored state only for a completed check, before any
-    // client-visible stream/file effect can be planned.
-    if effects.has_authored_state || !effects.snapshot_records.is_empty() {
+    // Resolve authored outputs only for a completed check, before planning
+    // any client-visible code, stream, or file effect.
+    if effects.has_selected_code && !E::AUTHORED_SINGLETON_CODE { return Err(ProjectCheck::Unsupported); }
+    if effects.has_authored_state || effects.has_selected_code || !effects.snapshot_records.is_empty() {
         let mut work = 0;
         let mut hidden = effects.snapshot_records.into_iter().peekable();
         for (index, record) in effects.records.iter_mut().enumerate() {
-            if effects.has_authored_state && !record.output.state_files.is_empty() {
-                record.output = Rc::new(render_authored_state(record, &mut work).ok_or(ProjectCheck::Unsupported)?);
+            if !record.output.state_files.is_empty() || !matches!(record.output.code_value, CheckerCode::Literal(_)) {
+                record.output = Rc::new(render_authored_output(record, &mut work).ok_or(ProjectCheck::Unsupported)?);
             }
             if hidden.peek() == Some(&index) {
                 hidden.next();
@@ -1375,6 +1378,8 @@ trait ActualIntegerObserver {
     const EXACT_COMPLETED_NAMESPACE_INTEGER_RETURNS: bool = false;
     #[cfg(feature = "internal-checker")]
     const EXACT_CONTEXTUAL_BOOLEAN_UNIT: bool = false;
+    #[cfg(feature = "internal-checker")]
+    const AUTHORED_SINGLETON_CODE: bool = false;
     const INTEGER_RETURN_PARTITIONS: bool = false;
     const PROJECTED_FORMAL_WRITES: bool = false;
     const ORDINARY_PROJECTED_PAIR: bool = false;
@@ -2330,6 +2335,8 @@ struct OrderedFailures {
     #[cfg(feature = "internal-checker")]
     has_authored_state: bool,
     #[cfg(feature = "internal-checker")]
+    has_selected_code: bool,
+    #[cfg(feature = "internal-checker")]
     snapshot_records: Vec<usize>,
     #[cfg(feature = "internal-checker")]
     entry_evidence: Option<Box<ScalarOrderedEntryEvidence>>,
@@ -2385,7 +2392,10 @@ impl OrderedFailures {
         equal_axes: Vec<(usize, usize)>,
     ) {
         #[cfg(feature = "internal-checker")]
-        { self.has_authored_state |= !directive.output.state_files.is_empty(); }
+        {
+            self.has_authored_state |= !directive.output.state_files.is_empty();
+            self.has_selected_code |= !matches!(directive.output.code_value, CheckerCode::Literal(_));
+        }
         self.records.push(ScalarOrderedCheckerFailure {
             source: source.clone(),
             operation: directive.operation.into(),
@@ -2428,9 +2438,18 @@ impl OrderedFailures {
 }
 
 #[cfg(feature = "internal-checker")]
-fn render_authored_state(record: &ScalarOrderedCheckerFailure, work: &mut usize) -> Option<CheckedLiteralOutput> {
+fn render_authored_output(record: &ScalarOrderedCheckerFailure, work: &mut usize) -> Option<CheckedLiteralOutput> {
     use super::{checker_directive::{CheckerStateSelection, CheckerStateType, ScalarCheckerTextFile}, checker_flow::charge_call_work};
     let prepared = &record.output;
+    let projected_code = match &prepared.code_value {
+        CheckerCode::Literal(_) => None,
+        CheckerCode::Binding(binding, ty) => {
+            let values = project_authored_scalar(record, binding, ty, work)?;
+            values.singleton_value()?;
+            Some((binding.as_ref(), ty, values))
+        }
+        CheckerCode::Lexical(..) => return None,
+    };
     let count = prepared.text_files.len().checked_add(prepared.state_files.len())?;
     let mut copied_bytes = prepared.stdout_bytes.len().checked_add(prepared.stderr_bytes.len())?;
     for file in prepared.text_files.iter() {
@@ -2443,6 +2462,9 @@ fn render_authored_state(record: &ScalarOrderedCheckerFailure, work: &mut usize)
     }
     charge_call_work(work, count.checked_add(copied_bytes.div_ceil(32))?)?;
     let mut output = (**prepared).clone();
+    if let Some((_, _, values)) = &projected_code {
+        output.code_value = CheckerCode::Literal(values.singleton_value()?.clone());
+    }
     let mut text = std::mem::take(&mut output.text_files).into_vec().into_iter();
     let mut selected = std::mem::take(&mut output.state_files).into_vec().into_iter().peekable();
     let mut files = Vec::with_capacity(count);
@@ -2471,7 +2493,11 @@ fn render_authored_state(record: &ScalarOrderedCheckerFailure, work: &mut usize)
                     let (ty, bytes) = match encoded.entry(binding.clone()) {
                         std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
                         std::collections::hash_map::Entry::Vacant(entry) => {
-                            let json = encode_authored_scalar(record, binding, file_ty, work)?;
+                            let json = match &projected_code {
+                                Some((code_binding, code_ty, values)) if *code_binding == binding && *code_ty == file_ty =>
+                                    serialize_scalar_analysis_state(file_ty, values)?,
+                                _ => encode_authored_scalar(record, binding, file_ty, work)?,
+                            };
                             entry.insert((file_ty.clone(), json.into_bytes().into_boxed_slice()))
                         }
                     };
@@ -2494,14 +2520,22 @@ fn render_authored_state(record: &ScalarOrderedCheckerFailure, work: &mut usize)
 }
 
 #[cfg(feature = "internal-checker")]
-fn encode_authored_scalar(
+fn project_authored_scalar(
     record: &ScalarOrderedCheckerFailure, binding: &ReferenceBindingId, ty: &ScalarType, work: &mut usize,
-) -> Option<String> {
+) -> Option<Rc<IntegerSet>> {
     use super::checker_flow::charge_call_work;
     charge_call_work(work, record.witness.axes.len().checked_add(1)?)?;
     let axis = record.witness.axes.iter().position(|(id, axis_ty)| id == binding && axis_ty == ty)?;
     let values = record.witness.state.project_axis_bounded(axis, work)?;
     charge_call_work(work, values.interval_count())?;
+    Some(values)
+}
+
+#[cfg(feature = "internal-checker")]
+fn encode_authored_scalar(
+    record: &ScalarOrderedCheckerFailure, binding: &ReferenceBindingId, ty: &ScalarType, work: &mut usize,
+) -> Option<String> {
+    let values = project_authored_scalar(record, binding, ty, work)?;
     serialize_scalar_analysis_state(ty, &values)
 }
 
@@ -8616,7 +8650,7 @@ mod tests {
                 assert_eq!(source, &app);
                 let intervals = state.intervals_at(0, 0).unwrap().map(|(lo, hi)| (lo.clone(), hi.clone()))
                     .collect::<Vec<_>>();
-                (&text[condition.start as usize..condition.end as usize], &output.code_value, intervals)
+                (&text[condition.start as usize..condition.end as usize], output.code_value.literal().unwrap(), intervals)
             }).collect::<Vec<_>>();
             assert_eq!(data.iter().map(|(condition, _, _)| *condition).collect::<Vec<_>>(), headings);
             assert_eq!(data.iter().map(|(_, code, _)| (*code).clone()).collect::<Vec<_>>(), codes.map(BigInt::from));
@@ -9720,6 +9754,29 @@ mod tests {
             assert_eq!(body.structure.checker_contextual_read_locals.contains_key(&key), !allowed);
             assert_eq!(root_local_import_requirement(body).map(|(position, _)| position), allowed.then_some(2));
         }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn lexical_checker_code_is_exact_in_the_failure_not_the_incoming_domain() {
+        let app = source("src/main.w", "lexical-checker-code");
+        let program = r#"%%start
+            unit(i8) check = fn(status) {
+                core.require(status != 37, { .stdout = ""; .stderr = ""; .code = status; .files = [
+                    { .path = "status.json"; .state = status; }
+                ]; });
+            };
+        %%end"#;
+        let run = |text: &str| {
+            let prepared = prepare_proof_target(&app, text).unwrap();
+            run_closed_without_named_proofs(&prepared, ScalarCheckerScope::CurrentPackage, 1)
+        };
+        let receipt = run(program).unwrap();
+        let [failure] = receipt.directives.as_slice() else { panic!("expected a concrete failure"); };
+        assert_eq!(failure.code(), &BigInt::from(37));
+        assert_eq!(failure.files()[0].text.as_ref(), b"{\"type\":{\"kind\":\"i8\"},\"value\":37}\n");
+        assert!(matches!(run(&program.replace("status != 37", "false")), Err(ProjectCheck::Unsupported)));
+        assert!(run(&program.replace("status != 37", "status <= 127")).unwrap().directives.is_empty());
     }
 
     #[cfg(feature = "internal-checker")]
@@ -13154,7 +13211,7 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
                 assert!(values.next().is_none());
                 Some(lo.clone())
             };
-            (source, output.code_value.clone(), value)
+            (source, output.code_value.literal().unwrap().clone(), value)
         }).collect::<Vec<_>>();
         assert_eq!(records, [
             (&app, 11.into(), None),
@@ -14345,7 +14402,7 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
                 let authored = |span: ByteSpan| &failing[span.start as usize..span.end as usize];
                 assert_eq!(output.stdout_bytes.as_ref(), "saída\n".as_bytes());
                 assert_eq!(output.stderr_bytes.as_ref(), "erro\t☕".as_bytes());
-                assert_eq!(output.code_value, BigInt::from(u128::MAX) + 1);
+                assert_eq!(output.code_value.literal(), Some(&(BigInt::from(u128::MAX) + 1)));
                 assert_eq!(authored(output.stdout), r#""saída\n""#);
                 assert_eq!(authored(output.stderr), r#""erro\t☕""#);
                 assert_eq!(authored(output.code), "340282366920938463463374607431768211456");
