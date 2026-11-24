@@ -490,6 +490,7 @@ fn actual_empty_module_keeps_its_successful_ordinal_slot() {
             functions: BTreeMap::new(),
             shared_scalar_read_effects: HashMap::new(),
             shared_reader_forwarders: Vec::new(),
+            exclusive_writer_declarations: HashSet::new(),
             initialization: ModuleInitializationRegion {
                 source: modules[0].source.clone(),
                 steps: Vec::new(),

@@ -881,18 +881,74 @@ fn joined_exclusive_descendant_transfers_scalar_write_until_last_use() {
     check(&second, Expected::Declined);
 }
 
-#[test]
-fn joined_exclusive_descendant_can_transfer_one_checked_scalar_write_to_local_callee() {
-    let program = joined_with_pointer_read(
+fn joined_exclusive_write_program() -> String {
+    joined_with_pointer_read(
         "*u8 frozen = &(*child); u8 during = pointer(frozen); *!u8 nested = &!(*child); \
          u8 value = seen + 2; change(value, nested); u8 via_call = *child; \
          *child = seen + 4; u8 changed = *child; u8 left = first; u8 right = second;",
         "*value",
-    ).replace("%%start\n", "%%start\nunit(u8, *!u8) change = fn(value, target) { *target = value; };\n")
+    )
         .replace("*u8 child = &(*parent);", "*!u8 child = &!(*parent);")
-        .replace("    seen\n", "    if (during != seen || via_call != seen + 2) { 0 } else { if (choose) { if (changed == 11 && left == 11 && right == 9) { seen } else { 0 } } else { if (changed == 13 && left == 7 && right == 13) { seen } else { 0 } } }\n");
+        .replace("    seen\n", "    if (during != seen || via_call != seen + 2) { 0 } else { if (choose) { if (changed == 11 && left == 11 && right == 9) { seen } else { 0 } } else { if (changed == 13 && left == 7 && right == 13) { seen } else { 0 } } }\n")
+}
+
+#[test]
+fn joined_exclusive_descendant_can_transfer_one_checked_scalar_write_to_local_callee() {
+    let program = joined_exclusive_write_program()
+        .replace("%%start\n", "%%start\nunit(u8, *!u8) change = fn(value, target) { *target = value; };\n");
     assert!(program.contains("change(value, nested)"));
     check_case(&program, Expected::Valid, Some("WOSY_JOINED_EXCLUSIVE_CALLEE_IR_DIR"));
+}
+
+#[test]
+fn joined_exclusive_descendant_only_accepts_exact_imported_scalar_writer() {
+    let source = |path: &str| SourceIdentity::new("project".into(), "package".into(), path.into(), "r1".into());
+    let app = source("src/main.w");
+    let writer = source("src/writer.w");
+    let decoy = source("src/decoy.w");
+    let program = joined_exclusive_write_program()
+        .replace("%%start\n", "%%start\nwriter = namespace package \"src/writer.w\";\n")
+        .replace("change(value, nested)", "writer.change(value, nested)");
+    assert!(program.contains("writer.change(value, nested)"));
+    let exact = "%%start\nunit(u8, *!u8) change = fn(value, target) { *target = value; };\n%%end";
+    // Same call signature and same single legal store, but this body is not
+    // the exact prepared assignment shape. A decoy certificate does not help.
+    let unsupported = exact.replace("*target = value;", "u8 copied = value; *target = copied;");
+    let declarations = |source: &SourceIdentity, text: &str| {
+        let parsed = parse_source(source.clone(), text.to_owned(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        derive_scalar_declarations_from_cst(parsed.result.canonical_cst())
+    };
+    for (target, target_layout) in [("native64", ScalarTargetLayout::NATIVE64), ("wasm32", ScalarTargetLayout::WASM32)] {
+        let prepare = |body: &str| {
+            let root = declarations(&app, &program);
+            let namespace = root.namespaces().next().unwrap();
+            let bindings = vec![ScalarNamespaceBinding { binding: namespace.binding.clone(),
+                target: writer.clone(), span: namespace.span }];
+            prepare_scalar_project(vec![(root, bindings),
+                (declarations(&writer, body), vec![]), (declarations(&decoy, exact), vec![])],
+                vec![app.clone(), writer.clone(), decoy.clone()], ScalarPreparationInputs { target_layout }).unwrap()
+        };
+        let prepared = prepare(exact);
+        let build = analyze_scalar_build(&prepared);
+        assert!(build.diagnostics().is_empty(), "{target}: {:?}", build.diagnostics());
+        let ir = emit_scalar_build_project_llvm(&build).expect("imported joined write LLVM").to_text();
+        let writer_prefix = "wosy_fn__7061636b616765__7372632f7772697465722e77__7231__";
+        let decoy_prefix = "wosy_fn__7061636b616765__7372632f6465636f792e77__7231__";
+        let calls = |prefix: &str| ir.lines().filter(|line| line.trim_start().starts_with("call void @")
+            && line.contains(prefix) && line.contains("6368616e6765(")).count();
+        assert_eq!(calls(writer_prefix), 1, "{target}: {ir}");
+        assert_eq!(calls(decoy_prefix), 0, "{target}: {ir}");
+        if let Some(out) = std::env::var_os("WOSY_JOINED_IMPORTED_WRITE_IR_DIR") {
+            let path = std::path::PathBuf::from(out).join(format!("{target}-project.ll"));
+            std::fs::write(path, ir).unwrap();
+        }
+        let prepared = prepare(&unsupported);
+        let build = analyze_scalar_build(&prepared);
+        let reborrow = program.find("&!(*parent)").unwrap() as u32;
+        assert!(build.diagnostics().iter().any(|d| d.code == "B0003" && d.labels.first()
+            .is_some_and(|label| label.span.range.start == reborrow)), "{target}: {:?}", build.diagnostics());
+    }
 }
 
 #[test]

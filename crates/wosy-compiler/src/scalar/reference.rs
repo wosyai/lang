@@ -2231,7 +2231,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         }
                     })()
                 } else { None };
-                let exclusive_write = if self.joined_local_reborrow && calls.local_exclusive_scalar_writers.contains(&ordinal) {
+                let exclusive_write = if self.joined_local_reborrow && calls.exclusive_scalar_writers.contains(&ordinal) {
                     (|| {
                         let CfgPointKind::Call { argument_points, .. } = &call else { return None };
                         let [value, argument] = argument_points.as_slice() else { return None };
@@ -7547,7 +7547,7 @@ fn exact_exclusive_scalar_writer(function: &ScalarFunction, calls: &FunctionCall
 
 fn attach_local_exclusive_writers(calls: &mut FunctionCallSites, source: &SourceIdentity, writers: &HashSet<ByteSpan>) {
     if writers.is_empty() { return; }
-    calls.local_exclusive_scalar_writers = calls.call_occurrences.iter().filter_map(|call| {
+    calls.exclusive_scalar_writers = calls.call_occurrences.iter().filter_map(|call| {
         let ResolvedCallTarget::ModuleCallable { source: target, declaration_span, concrete: ConcreteCallSelection::Declaration } =
             &calls.sites.get(call.site)?.target else { return None };
         (target == source && writers.contains(declaration_span)
@@ -7582,7 +7582,7 @@ fn joined_reborrow_calls_are_supported(
         if calls.declared_unsafe_calls.contains(&call.ordinal.0) {
             return false;
         }
-        if calls.local_exclusive_scalar_writers.contains(&call.ordinal)
+        if calls.exclusive_scalar_writers.contains(&call.ordinal)
             || shared_scalar_read_effect(source, calls, call.ordinal, target, effects).is_some() {
             return true;
         }
@@ -11323,6 +11323,7 @@ pub(super) struct ModuleCallSites {
     functions: BTreeMap<usize, FunctionCallSites>,
     shared_scalar_read_effects: HashMap<ByteSpan, SharedScalarReadEffect>,
     shared_reader_forwarders: Vec<(ByteSpan, SourceSpan, SharedForwardKind)>,
+    exclusive_writer_declarations: HashSet<ByteSpan>,
     pub(super) initialization: ModuleInitializationRegion,
 }
 
@@ -11594,7 +11595,7 @@ pub(super) struct FunctionCallSites {
     pub(super) call_occurrences: Vec<CallOccurrence>,
     imported_shared_readers: HashMap<OccurrenceOrdinal, (SourceSpan, SharedScalarReadEffect)>,
     pub(super) local_shared_call_families: HashMap<OccurrenceOrdinal, bool>,
-    local_exclusive_scalar_writers: HashSet<OccurrenceOrdinal>,
+    exclusive_scalar_writers: HashSet<OccurrenceOrdinal>,
     declared_unsafe_calls: BTreeSet<usize>,
     pub(super) callable_escapes: HashSet<SourceSpan>,
     overload_reservation_sites: Vec<CallOccurrence>,
@@ -11614,20 +11615,29 @@ pub(super) struct FunctionCallSites {
 }
 
 impl FunctionCallSites {
-    fn attach_imported_shared_readers(
+    fn attach_imported_reference_effects(
         &mut self, caller: &SourceIdentity,
         readers: &HashMap<&SourceIdentity, HashMap<ByteSpan, SharedScalarReadEffect>>,
+        writers: &HashMap<&SourceIdentity, HashSet<ByteSpan>>,
     ) {
-        self.imported_shared_readers = self.call_occurrences.iter().filter_map(|call| {
-            let ResolvedCallTarget::ModuleCallable {
+        for call in &self.call_occurrences {
+            let Some(ResolvedCallTarget::ModuleCallable {
                 source, declaration_span, concrete: ConcreteCallSelection::Declaration,
-            } = &self.sites.get(call.site)?.target else { return None };
-            if source == caller || self.declared_unsafe_calls.contains(&call.ordinal.0) { return None }
-            let effect = *readers.get(source)?.get(declaration_span)?;
-            Some((call.ordinal, (SourceSpan::new(source.clone(), *declaration_span), effect)))
-        }).collect();
+            }) = self.sites.get(call.site).map(|site| &site.target) else { continue };
+            if source == caller || self.declared_unsafe_calls.contains(&call.ordinal.0) {
+                continue;
+            }
+            if let Some(&effect) = readers.get(source).and_then(|readers| readers.get(declaration_span)) {
+                self.imported_shared_readers.insert(
+                    call.ordinal, (SourceSpan::new(source.clone(), *declaration_span), effect),
+                );
+            }
+            if writers.get(source).is_some_and(|writers| writers.contains(declaration_span)) {
+                self.exclusive_scalar_writers.insert(call.ordinal);
+            }
+        }
         for arm in &mut self.arms {
-            arm.attach_imported_shared_readers(caller, readers);
+            arm.attach_imported_reference_effects(caller, readers, writers);
         }
     }
 
@@ -11830,16 +11840,24 @@ fn resolve_project_call_sites_impl(
         (!result.duplicate_sources.contains(&module.source)).then_some(())?;
         Some((&module.source, calls.as_mut().ok()?))
     }));
-    // Only successfully prepared module rows may grant an imported reader
-    // certificate. Duplicate full identities are never authority.
-    let readers: HashMap<_, _> = modules.iter().zip(&result.modules).filter_map(|(module, calls)| {
-        (!result.duplicate_sources.contains(&module.source)).then_some(())?;
-        Some((&module.source, calls.as_ref().ok()?.shared_scalar_read_effects.clone()))
-    }).collect();
+    // Only successfully prepared module rows may grant an imported exact
+    // effect certificate. Duplicate full identities are never authority.
+    let mut readers = HashMap::new();
+    let mut writers = HashMap::new();
+    for (module, calls) in modules.iter().zip(&mut result.modules) {
+        if result.duplicate_sources.contains(&module.source) {
+            continue;
+        }
+        let Ok(calls) = calls else { continue };
+        readers.insert(&module.source, calls.shared_scalar_read_effects.clone());
+        if !calls.exclusive_writer_declarations.is_empty() {
+            writers.insert(&module.source, std::mem::take(&mut calls.exclusive_writer_declarations));
+        }
+    }
     for (module, calls) in modules.iter().zip(&mut result.modules) {
         if let Ok(calls) = calls {
             for function in calls.functions.values_mut() {
-                function.attach_imported_shared_readers(&module.source, &readers);
+                function.attach_imported_reference_effects(&module.source, &readers, &writers);
             }
         }
     }
@@ -13742,6 +13760,7 @@ fn resolve_module_call_sites(
         functions,
         shared_scalar_read_effects,
         shared_reader_forwarders,
+        exclusive_writer_declarations: exclusive_scalar_writers,
         initialization,
     };
     if select_executable_calls {
@@ -14021,7 +14040,7 @@ fn resolve_function_call_sites(
         occurrences: resolver.occurrences,
         call_occurrences: callable.call_occurrences,
         imported_shared_readers: HashMap::new(),
-        local_exclusive_scalar_writers: HashSet::new(),
+        exclusive_scalar_writers: HashSet::new(),
         local_shared_call_families: HashMap::new(),
         declared_unsafe_calls: callable.declared_unsafe_calls,
         callable_escapes: resolver.callable_escapes,
