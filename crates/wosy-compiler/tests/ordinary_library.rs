@@ -1375,6 +1375,10 @@ fn lexical_conditional_owner_choice_releases_selected_original_after_read() {
         .replace("if (drive(2, true) == 4) { 2 } else { 0 }", "drive(2, true)")
         .replace("if (drive(3, true) == 24) { 12 } else { 0 }", "drive(3, true)");
     assert_ne!(saved_then_released, multiple_then_consumed);
+    let updated_then_consumed = saved_then_consumed
+        .replace("    u64 observed = read_selected", "    chosen.length = 5;\n    u64 observed = read_selected")
+        .replace("== 24", "== 10").replace("== 4) { 2", "== 10) { 2");
+    assert_ne!(updated_then_consumed, saved_then_consumed);
     let temporary = consumed.replace("    Packet chosen = if", "    consume(if")
         .replace("else { make_long(2) };\n    consume(chosen)", "else { make_long(2) })");
     assert_ne!(temporary, consumed);
@@ -1402,6 +1406,7 @@ fn lexical_conditional_owner_choice_releases_selected_original_after_read() {
         (saved_then_consumed.as_str(), "consume-after-saved-borrow"),
         (multiple_then_consumed.as_str(), "consume-after-multiple-borrows"),
         (saved_then_released.as_str(), "release-after-saved-borrows"),
+        (updated_then_consumed.as_str(), "consume-after-metadata-write"),
         (named_borrow.as_str(), "named-borrow"), (nested_temporary.as_str(), "nested-consume-temporary"),
         (nested_borrow.as_str(), "nested-named-borrow")]
     {
@@ -1410,7 +1415,9 @@ fn lexical_conditional_owner_choice_releases_selected_original_after_read() {
         let consuming = base_use.starts_with("consume");
         let releases_saved = base_use == "release-after-saved-borrows";
         let multiple = releases_saved || base_use == "consume-after-multiple-borrows";
-        let borrowing = multiple || matches!(base_use, "borrow" | "named-borrow" | "consume-after-borrow" | "consume-after-saved-borrow");
+        let updates_metadata = base_use == "consume-after-metadata-write";
+        let borrowing = multiple || updates_metadata
+            || matches!(base_use, "borrow" | "named-borrow" | "consume-after-borrow" | "consume-after-saved-borrow");
         for (target, target_layout) in [("native64", ScalarTargetLayout::NATIVE64), ("wasm32", ScalarTargetLayout::WASM32)] {
             for project in [false, true] {
                 let emit = |text: &str| {
@@ -1533,6 +1540,12 @@ fn lexical_conditional_owner_choice_releases_selected_original_after_read() {
                         let uncertified = text.replace("{ *view }", "{ u64 observed = *view; observed }");
                         assert_ne!(uncertified, text);
                         assert!(emit(&uncertified).expect_err("the pre-transfer loan needs exact nonescape authority")
+                            .contains("aggregate owning call has no proved endpoint"));
+                    }
+                    if updates_metadata {
+                        let wrong_target = text.replace("chosen.length = 5;", "chosen.data = null;");
+                        assert_ne!(wrong_target, text);
+                        assert!(emit(&wrong_target).expect_err("backing address rewrites cannot preserve the owning corridor")
                             .contains("aggregate owning call has no proved endpoint"));
                     }
                     if base_use == "consume-after-saved-borrow" {

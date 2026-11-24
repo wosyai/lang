@@ -2789,7 +2789,7 @@ impl Body<'_> {
             [bind, alias, result] if matches!(&alias.kind, BlockItemKind::Binding(view)
                 if matches!(view.receivers(), [receiver] if matches!(receiver.ty, ScalarType::CheckedReference { .. }))) =>
                 (bind, Some(alias), &[][..], result),
-            [bind, before_consume @ .., result] if before_consume.len() <= MAX_PRE_TRANSFER_OBSERVATIONS =>
+            [bind, before_consume @ .., result] if before_consume.len() <= MAX_PRE_TRANSFER_OBSERVATIONS + 1 =>
                 (bind, None, before_consume, result),
             _ => return None,
         };
@@ -2815,6 +2815,47 @@ impl Body<'_> {
             || join.source_span.range != self.sites.occurrences.get(init.primary.0)?.span
         { return None; }
         let mut read = read;
+        let before_consume = if let Some((BlockItem {
+            kind: BlockItemKind::Assignment { group }, ..
+        }, rest)) = before_consume.split_first() {
+            // Only a direct resolved ordinary field of the exact selected
+            // descriptor may be updated. This changes metadata, never backing.
+            let group = self.sites.assignments.get(&(group.block, group.item))?;
+            let evaluations = group.rhs_evaluations();
+            let [rhs] = evaluations.as_slice() else { return None };
+            let destinations = group.destinations();
+            let [slot] = destinations.as_slice() else { return None };
+            let AssignmentReplacement::Resolved(ty) = &slot.replacement else { return None };
+            if !ordinary_value(ty) || group.projected_outputs().len() != 0
+                || structure.checked_types.expressions.get(&rhs.expression) != Some(ty)
+                || structure.checked_types.places.get(&slot.destination) != Some(ty)
+                || !matches!(read.kind, CfgPointKind::Evaluate(
+                    ScalarExpression::Boolean { .. } | ScalarExpression::Char { .. } |
+                    ScalarExpression::Integer { .. } | ScalarExpression::Float { .. }))
+                || read.source_span.range != self.sites.occurrences.get(rhs.expression.0)?.span
+            { return None; }
+            let OccurrenceNode::Place(base) = *structure.edges.get(&(
+                OccurrenceParent::Place(slot.destination), OccurrenceEdge::PlaceBase,
+            ))? else { return None };
+            let write = next(read.id)?;
+            let CfgPointKind::Assign { target, rhs_point, .. } = &write.kind else { return None };
+            let ScalarPlace::Field { base: written, field: ScalarFieldReference::Resolved(field), .. } =
+                &target.place else { return None };
+            if !matches!(written.as_ref(), ScalarPlace::Name { .. }) || &field.structure != descriptor
+                || &target.binding != holder || *rhs_point != read.id || write.scope != scope
+                || write.source_span.range != slot.target_span
+                || !matches!(target.projections.as_slice(),
+                    [ReferencePlaceProjection::Field(ScalarFieldReference::Resolved(projection))] if projection == field)
+                || !matches!(self.sites.prepared_named_place_root(base),
+                    Some(NamedPlaceRootIdentity::Lexical(binding)) if binding == holder)
+            { return None; }
+            read = next(write.id)?;
+            if read.scope != scope { return None; }
+            rest
+        } else {
+            before_consume
+        };
+        if before_consume.len() > MAX_PRE_TRANSFER_OBSERVATIONS { return None; }
         let mut saved_observation = None;
         for (index, step) in before_consume.iter().enumerate() {
             // Each observation is one immediate certified noescape loan; only
