@@ -973,25 +973,37 @@ fn independent_conditioned_owners_keep_separate_receipts_at_one_exit() {
     let app = source("workbench", "src/independent_conditioned_owners.w");
     let factory_fixture = include_str!("fixtures/structured-local-choice.w");
     let (factory_source, _) = factory_fixture.split_once("u64(u64, bool) drive").unwrap();
-    for (variant, primary_transfer, secondary_transfer) in [
-        ("release", false, false), ("transfer", true, false),
-        ("transfer-secondary", false, true), ("transfer-both", true, true),
+    for (variant, primary_transfer, secondary_transfer, guarded) in [
+        ("release", false, false, false), ("transfer", true, false, false),
+        ("transfer-secondary", false, true, false), ("transfer-both", true, true, false),
+        ("guard-secondary", false, true, true), ("guard-secondary-transfer-primary", true, true, true),
     ] {
         let mut text = factory_source.to_owned();
         if primary_transfer || secondary_transfer {
             text.push_str("u64(Packet) sink = fn(packet) { packet.length };\n");
         }
+        text.push_str(if guarded { "u64(bool, bool, bool) drive = fn(left, right, take) {\n" }
+            else { "u64(bool, bool) drive = fn(left, right) {\n" });
         text.push_str(concat!(
-            "u64(bool, bool) drive = fn(left, right) {\n",
             "    Packet first = if (left) { make_short(2) } else { make_long(3) };\n",
             "    Packet second = if (right) { make_short(7) } else { make_long(9) };\n",
             "    second.length;\n",
         ));
-        if secondary_transfer { text.push_str("    sink(second);\n"); }
+        if guarded { text.push_str("    if (take) { sink(second); };\n"); }
+        else if secondary_transfer { text.push_str("    sink(second);\n"); }
         text.push_str(if primary_transfer { "    sink(first)\n};\n" } else { "    first.length\n};\n" });
-        let cases = [("ff", "false", "false"), ("ft", "false", "true"), ("tf", "true", "false"), ("tt", "true", "true")];
-        for (case, left, right) in cases {
-            text.push_str(&format!("u64() case_{case} = fn {{ drive({left}, {right}) }};\ncase_{case}();\n"));
+        let mut cases = Vec::new();
+        for (case, left, right) in [("ff", "false", "false"), ("ft", "false", "true"), ("tf", "true", "false"), ("tt", "true", "true")] {
+            if guarded {
+                for (suffix, take) in [("keep", "false"), ("send", "true")] {
+                    let case = format!("{case}_{suffix}");
+                    text.push_str(&format!("u64() case_{case} = fn {{ drive({left}, {right}, {take}) }};\ncase_{case}();\n"));
+                    cases.push(case);
+                }
+            } else {
+                text.push_str(&format!("u64() case_{case} = fn {{ drive({left}, {right}) }};\ncase_{case}();\n"));
+                cases.push(case.to_owned());
+            }
         }
         text.push_str("%%end\n");
         for (target, target_layout) in [("native64", ScalarTargetLayout::NATIVE64), ("wasm32", ScalarTargetLayout::WASM32)] {
@@ -1017,11 +1029,18 @@ fn independent_conditioned_owners_keep_separate_receipts_at_one_exit() {
                 let mut merges = Vec::new();
                 let mut released = Vec::new();
                 let mut passed = Vec::new();
+                let mut guards = Vec::new();
                 for row in primary.get_basic_blocks().into_iter().flat_map(|block| block.get_instructions()) {
                     let arg = |slot| row.get_operand(slot).unwrap().value().unwrap();
                     if row.get_opcode() == InstructionOpcode::Phi && row.to_string().contains("phi ptr") {
                         let incoming = (0..row.get_num_operands()).filter_map(|n| row.get_operand(n)?.value()).collect::<Vec<_>>();
                         merges.push((inkwell::values::PhiValue::try_from(row).unwrap().as_basic_value(), incoming));
+                    }
+                    if row.get_opcode() == InstructionOpcode::Phi && row.to_string().contains("aggregate_receipt_active") {
+                        let mut flags = (0..row.get_num_operands()).filter_map(|n| row.get_operand(n)?.value())
+                            .map(|value| value.into_int_value().get_zero_extended_constant().unwrap()).collect::<Vec<_>>();
+                        flags.sort_unstable();
+                        guards.push(flags);
                     }
                     let Ok(call) = CallSiteValue::try_from(row) else { continue };
                     let callee = call.get_called_fn_value().unwrap();
@@ -1051,7 +1070,8 @@ fn independent_conditioned_owners_keep_separate_receipts_at_one_exit() {
                 let expected_transfers = secondary_transfer.then_some(chosen[1].0).into_iter()
                     .chain(primary_transfer.then_some(chosen[0].0));
                 assert!(passed.iter().copied().eq(expected_transfers), "only the named receipts transfer in source order");
-                let expected_local = (!secondary_transfer).then_some(chosen[1].0).into_iter()
+                assert_eq!(guards, if guarded { vec![vec![0, 1]] } else { vec![] });
+                let expected_local = (!secondary_transfer || guarded).then_some(chosen[1].0).into_iter()
                     .chain((!primary_transfer).then_some(chosen[0].0));
                 assert!(released.iter().copied().eq(expected_local), "only retained original backings release locally");
                 if let Some(sink) = sink {
@@ -1064,7 +1084,7 @@ fn independent_conditioned_owners_keep_separate_receipts_at_one_exit() {
                     let out = std::path::PathBuf::from(out).join(format!("{variant}-{route}"));
                     std::fs::create_dir_all(&out).unwrap();
                     let mut witness = ir.replace("@main(", "@wosy_authored_main(");
-                    for (case, _, _) in cases {
+                    for case in &cases {
                         witness.push_str(&format!("\ndefine i64 @wosy_case_{case}() {{\nentry:\n  %v = call i64 @{}()\n  ret i64 %v\n}}\n", symbol(&format!("case_{case}"))));
                     }
                     std::fs::write(out.join(format!("{target}.ll")), witness).unwrap();

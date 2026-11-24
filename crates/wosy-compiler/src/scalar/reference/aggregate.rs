@@ -2829,12 +2829,20 @@ enum LocalSiblingState {
     Retired,
 }
 
+#[derive(Clone, Copy)]
+struct LocalChoiceConsumer {
+    point: CfgPointId,
+    ordinal: OccurrenceOrdinal,
+    slot: usize,
+    retained_unless: Option<OccurrenceOrdinal>,
+}
+
 struct LocalChoiceSibling {
     conditional: OccurrenceOrdinal,
     item: usize,
     join: CfgPointId,
     leaves: BTreeSet<CfgPointId>,
-    consumer: Option<(CfgPointId, OccurrenceOrdinal, usize)>,
+    consumer: Option<LocalChoiceConsumer>,
 }
 
 struct LocalReceiptChoice {
@@ -3017,14 +3025,42 @@ impl Body<'_> {
                 // usual closed owning-formal graph before the primary exits.
                 // Find its exact lexical owning argument; never search calls
                 // or flow points for a substitute after a failed proof.
+                let (call_expression, first, call_scope, conditional) =
+                    if let Some(ConditionalRegion::Unit { condition, then_block, .. }) =
+                        self.sites.conditionals.get(&expression).filter(|_| !sibling_choices.is_empty())
+                    {
+                        let [item] = structure.blocks.get(then_block.0)?.items.as_slice() else { return None };
+                        let BlockItemKind::Evaluation { expression: call_expression } = item.kind else { return None };
+                        let branch = next(read.id)?;
+                        let region = facts.conditional_input_regions.get(&branch.id)?;
+                        let join = points.get(region.join.0)?;
+                        let entry = points.get(region.entries[0].0)?;
+                        let first = next(entry.id)?;
+                        if region.expression != expression || region.branch != branch.id
+                            || structure.checked_types.expressions.get(condition) != Some(&ScalarType::Bool)
+                            || read.source_span.range != self.sites.occurrences.get(condition.0)?.span
+                            || !matches!((self.sites.prepared_plain_name(*condition), &read.kind),
+                                (Some(PlainNameIdentity::Lexical(expected)), CfgPointKind::Read { binding }) if expected == binding)
+                            || branch.scope != scope || join.scope != scope || branch.id >= join.id
+                            || !matches!(branch.kind, CfgPointKind::Branch { .. })
+                            || !matches!(join.kind, CfgPointKind::Join)
+                            || branch.successors.as_slice() != region.entries
+                            || region.entries[1] != join.id || region.terminals[1] != branch.id
+                            || !matches!(entry.kind, CfgPointKind::ScopeEnter) || entry.scope == scope
+                            || first.scope != entry.scope
+                        { return None; }
+                        (call_expression, first, entry.scope, Some((expression, region)))
+                    } else {
+                        (expression, read, scope, None)
+                    };
                 let sibling_consumer = (|| {
                     if sibling_choices.is_empty() { return None; }
-                    let signature = self.sites.checked_call_signatures.get(&expression)?;
+                    let signature = self.sites.checked_call_signatures.get(&call_expression)?;
                     if signature.parameters.len() > MAX_OWNING_CALL_ARGUMENTS { return None; }
                     let (slot, ty) = signature.parameters.iter().enumerate()
                         .find(|(_, ty)| matches!(ty, ScalarType::Struct(_)))?;
                     let OccurrenceNode::Expression(argument) = *structure.edges.get(&(
-                        OccurrenceParent::Expression(expression), OccurrenceEdge::CallArgument(slot),
+                        OccurrenceParent::Expression(call_expression), OccurrenceEdge::CallArgument(slot),
                     ))? else { return None };
                     let PlainNameIdentity::Lexical(identity) = self.sites.prepared_plain_name(argument)? else { return None };
                     let index = siblings.iter().position(|(_, binding, _)| *binding == identity)?;
@@ -3035,22 +3071,36 @@ impl Body<'_> {
                     let sibling = sibling_choices.iter_mut().find(|choice| choice.join == *birth)?;
                     let [result] = signature.outputs.outputs.as_slice() else { return None };
                     if *state == LocalSiblingState::Retired || sibling.consumer.is_some() || !ordinary_value(&result.ty)
-                        || structure.checked_types.expressions.get(&expression) != Some(&result.ty)
+                        || structure.checked_types.expressions.get(&call_expression) != Some(&result.ty)
                     { return None; }
                     let (call, exact_slot, moved) = exact_owning_call_arguments(
-                        points, read, scope, self.sites, expression, &signature.parameters, binding, ty,
+                        points, first, call_scope, self.sites, call_expression, &signature.parameters, binding, ty,
                     )?;
-                    let origins = facts.inputs.get(&(call.id, expression.0, slot, ArgumentProvenance::WholeMove(moved)))?;
-                    if exact_slot != slot || call.scope != scope
-                        || call.source_span.range != self.sites.occurrences.get(expression.0)?.span
+                    let origins = facts.inputs.get(&(call.id, call_expression.0, slot, ArgumentProvenance::WholeMove(moved)))?;
+                    if exact_slot != slot || call.scope != call_scope
+                        || call.source_span.range != self.sites.occurrences.get(call_expression.0)?.span
                         || !origins.iter().copied().eq([None])
                     { return None; }
-                    read = next(call.id)?;
+                    read = if let Some((_, region)) = conditional {
+                        let exit = next(call.id)?;
+                        if exit.id != region.terminals[0] || exit.scope != call_scope
+                            || !matches!(exit.kind, CfgPointKind::ScopeExit) || next(exit.id)?.id != region.join
+                        { return None; }
+                        next(region.join)?
+                    } else {
+                        next(call.id)?
+                    };
                     if read.scope != scope { return None; }
-                    sibling.consumer = Some((call.id, expression, slot));
+                    sibling.consumer = Some(LocalChoiceConsumer {
+                        point: call.id, ordinal: call_expression, slot,
+                        retained_unless: conditional.map(|(condition, _)| condition),
+                    });
+                    // Even with a bypass, only cleanup may see the receipt
+                    // again: its lexical holder is no longer usable here.
                     *state = LocalSiblingState::Retired;
                     continue;
                 }
+                if conditional.is_some() { return None; }
             }
             let relay_step = match &step.kind {
                 BlockItemKind::Binding(step) => match step.receivers() {
@@ -5367,7 +5417,7 @@ fn closed_aggregates<'a>(
             _ => None,
         };
         let secondary = choice.sibling_choices.iter().filter_map(|sibling|
-            sibling.consumer.map(|(point, ordinal, slot)| (point, ordinal, slot, sibling.conditional)));
+            sibling.consumer.map(|consumer| (consumer.point, consumer.ordinal, consumer.slot, sibling.conditional)));
         for (point, ordinal, slot, receipt) in primary.into_iter().chain(secondary) {
             let callee = target_body(&declarations, bodies[&key].cfg, point)
                 .ok_or("missing local conditional owner consumer")?;
@@ -5914,10 +5964,24 @@ fn closed_aggregates<'a>(
             for sibling in &choice.sibling_choices {
                 plan.local_choice_arms.push((sibling.conditional.0, sibling.leaves.len()));
                 plan.local_choice_bindings.insert((choice.block.0, sibling.item), sibling.conditional.0);
-                if sibling.consumer.is_none() {
+                let release_guard = match sibling.consumer {
+                    None => Some(None),
+                    Some(LocalChoiceConsumer { ordinal, retained_unless: Some(condition), .. }) => {
+                        let guard = plan.conditional_guard_count;
+                        plan.conditional_guard_count += 1;
+                        plan.conditional_inputs.entry(condition.0).or_default().guards
+                            .push((guard, [ReceiptGate::Transferred, ReceiptGate::Retained]));
+                        if plan.deferred_call_inputs.insert(ordinal.0, sibling.conditional.0).is_some() {
+                            return Err("duplicate conditional sibling receipt transfer".into());
+                        }
+                        Some(Some(guard))
+                    }
+                    Some(_) => None,
+                };
+                if let Some(guard) = release_guard {
                     plan.scope_exits.insert(choice.block.0, choice.exit);
                     record_release(&mut plan, choice.exit, sibling.join,
-                        ClosedOwnerRelease { receipt: sibling.conditional.0, guard: None })?;
+                        ClosedOwnerRelease { receipt: sibling.conditional.0, guard })?;
                 }
             }
             let mut receipt = choice.conditional;
