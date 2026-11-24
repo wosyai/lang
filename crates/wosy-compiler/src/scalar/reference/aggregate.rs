@@ -1272,7 +1272,7 @@ pub(super) struct AggregateFlowResult {
     pub(super) borrowed_extent_call: Option<(CfgPointId, OccurrenceOrdinal, ByteSpan, Option<ByteSpan>)>,
     pub(super) array_formal_extent_required: bool,
     pub(super) fixed_copy_owning_arguments: BTreeMap<usize, u64>,
-    pub(super) fallible_call_initializers: Vec<CfgPointId>,
+    pub(super) fallible_call_initializers: Vec<(CfgPointId, OccurrenceOrdinal)>,
     pub(super) widened_owning_receives: Vec<(CfgPointId, OccurrenceOrdinal, ByteSpan, ByteSpan, Option<(CfgPointId, usize)>)>,
     pub(super) widened_owning_roundtrip: Option<(OccurrenceOrdinal, CfgPointId, ByteSpan)>,
     pub(super) widened_borrowed_extent_calls: Vec<(CfgPointId, OccurrenceOrdinal, ByteSpan)>,
@@ -2943,6 +2943,8 @@ pub(crate) struct ClosedWidenedRebind {
 
 #[derive(Debug, Default)]
 pub(crate) struct ClosedBody {
+    pub(crate) fallible_allocation_leaf: bool,
+    pub(crate) fallible_allocating_calls: BTreeSet<usize>,
     pub(crate) scalar_descriptor_assignment: Option<(usize, usize, usize)>,
     pub(crate) checked_backing_producer: Option<ClosedCheckedBacking>,
     pub(crate) checked_backing_wrapper: Option<usize>,
@@ -5187,7 +5189,7 @@ enum SnapshotUse {
 #[derive(Default)]
 struct OrdinaryCohorts {
     private: BTreeMap<BodyKey, (OrdinaryResultCandidate, bool)>,
-    array_uses: HashMap<BodyKey, Option<Vec<(BodyKey, usize)>>>,
+    transport_uses: HashMap<BodyKey, Option<Vec<(BodyKey, usize)>>>,
     namespace: BTreeMap<BodyKey, Vec<SnapshotUse>>,
     indexed: BTreeMap<BodyKey, ClosedIndexedSnapshot>,
     terminal_indexed: BTreeMap<BodyKey, [ClosedIndexedSnapshot; 2]>,
@@ -5240,8 +5242,8 @@ impl OrdinaryCohorts {
         }
     }
 
-    fn record_array_use(&mut self, target: BodyKey, use_site: Option<(BodyKey, usize)>) {
-        if let Some(record) = self.array_uses.get_mut(&target) {
+    fn record_transport_use(&mut self, target: BodyKey, use_site: Option<(BodyKey, usize)>) {
+        if let Some(record) = self.transport_uses.get_mut(&target) {
             match (record.as_mut(), use_site) {
                 (Some(uses), Some(site)) => uses.push(site),
                 (_, None) => *record = None,
@@ -5251,7 +5253,7 @@ impl OrdinaryCohorts {
     }
 
     fn seal_array_descriptors(&self, result: &mut ClosedAggregates) {
-        for (&target, uses) in &self.array_uses {
+        for (&target, uses) in &self.transport_uses {
             let Some(uses) = uses.as_ref().filter(|uses| !uses.is_empty()) else { continue };
             if !matches!(result.bodies.get(&target).and_then(|plan| plan.literal_array),
                 Some(ClosedLiteralArray::FreshLeaf { .. }))
@@ -5285,10 +5287,10 @@ impl OrdinaryCohorts {
         module_at: &impl Fn(usize) -> Option<ModuleInput<'a>>,
         declarations: &HashMap<(&SourceIdentity, ByteSpan), (usize, usize)>,
     ) {
-        if (!self.private.is_empty() || !self.namespace.is_empty() || !self.array_uses.is_empty())
+        if (!self.private.is_empty() || !self.namespace.is_empty() || !self.transport_uses.is_empty())
             && self.collect_uses(reservations, module_at, declarations).is_none()
         {
-            self.array_uses.clear();
+            self.transport_uses.clear();
             self.private.clear();
             self.namespace.clear();
             self.indexed.clear();
@@ -5312,12 +5314,12 @@ impl OrdinaryCohorts {
                 return None;
             }
             for escape in &sites.callable_escapes {
-                if let Some(target) = selected(&escape.source, escape.range) { self.record(target, None); self.record_array_use(target, None); }
+                if let Some(target) = selected(&escape.source, escape.range) { self.record(target, None); self.record_transport_use(target, None); }
             }
             for target in sites.allocation_length_call_targets.values() {
                 match target {
                     ResolvedCallTarget::ModuleCallable { source, declaration_span, .. } => {
-                        if let Some(target) = selected(source, *declaration_span) { self.record(target, None); self.record_array_use(target, None); }
+                        if let Some(target) = selected(source, *declaration_span) { self.record(target, None); self.record_transport_use(target, None); }
                     }
                     ResolvedCallTarget::LocalCallable(_) | ResolvedCallTarget::CallableField { .. } => return None,
                     _ => {}
@@ -5330,7 +5332,7 @@ impl OrdinaryCohorts {
                 match &site.target {
                     ResolvedCallTarget::ModuleCallable { source, declaration_span, concrete } => {
                         let Some(target) = selected(source, *declaration_span) else { continue };
-                        self.record_array_use(target,
+                        self.record_transport_use(target,
                             (monomorphic && arm.is_none() && matches!(concrete, ConcreteCallSelection::Declaration)
                                 && !sites.declared_unsafe_calls.contains(&occurrence.ordinal.0))
                             .then_some((caller, occurrence.ordinal.0)));
@@ -5380,14 +5382,14 @@ impl OrdinaryCohorts {
             let region = &input.calls.initialization;
             let ModuleInitializationDetail::Occurrences(topology) = &region.detail else { return None };
             for escape in &topology.callable_escapes {
-                if let Some(target) = selected(&escape.source, escape.range) { self.record(target, None); self.record_array_use(target, None); }
+                if let Some(target) = selected(&escape.source, escape.range) { self.record(target, None); self.record_transport_use(target, None); }
             }
             let mut allowed = None;
             for &ordinal in &topology.calls {
                 match region.call_target(ordinal) {
                     Some(ModuleInitializationCallTarget::Direct { declaration, concrete }) => {
                         let Some(target) = selected(&declaration.source, declaration.range) else { continue };
-                        self.record_array_use(target, None);
+                        self.record_transport_use(target, None);
                         if let Some((candidate, copy)) = self.private.get_mut(&target) { candidate.record(None, *copy); }
                         if let Some(uses) = self.namespace.get_mut(&target) {
                             let storage = (matches!(concrete, ConcreteCallSelection::Declaration)
@@ -5400,7 +5402,7 @@ impl OrdinaryCohorts {
                         }
                     }
                     Some(ModuleInitializationCallTarget::Generic { declaration, .. }) => {
-                        if let Some(target) = selected(&declaration.source, declaration.range) { self.record(target, None); self.record_array_use(target, None); }
+                        if let Some(target) = selected(&declaration.source, declaration.range) { self.record(target, None); self.record_transport_use(target, None); }
                     }
                     Some(ModuleInitializationCallTarget::CallableBinding(_) | ModuleInitializationCallTarget::CallableField { .. })
                     | None => return None,
@@ -5904,7 +5906,7 @@ fn seal_array_descriptor_identities(
             ArrayDescriptorRoute::Identity(observer) => definition.array_descriptor_observer = observer,
             ArrayDescriptorRoute::Forward { call, .. } => definition.array_descriptor_forward = Some(call.0),
         }
-        let uses = ordinary.array_uses[&key].as_ref().expect("complete descriptor call census");
+        let uses = ordinary.transport_uses[&key].as_ref().expect("complete descriptor call census");
         for &(caller, call) in uses {
             if let Some(&(_, binding, destination)) = candidates.get(&(caller, call)) {
                 let plan = result.bodies.entry(caller).or_default();
@@ -5979,7 +5981,7 @@ fn closed_descriptor_routes<Route>(
                     if visited.insert(user) { pending.push(user); }
                 }
             }
-            if let Some(uses) = ordinary.array_uses.get(&key).and_then(Option::as_ref).filter(|uses| !uses.is_empty()) {
+            if let Some(uses) = ordinary.transport_uses.get(&key).and_then(Option::as_ref).filter(|uses| !uses.is_empty()) {
                 for &(caller, call) in uses {
                     if caller_target(caller, call) == Some(key) {
                         has_local = true;
@@ -6042,7 +6044,7 @@ fn seal_borrowed_extent_observers(
             BorrowedExtentRoute::Forward(call, _) =>
                 definition.borrowed_extent_forward = Some(call.0),
         }
-        for &(caller, call) in ordinary.array_uses[&target].as_ref().expect("complete borrowed extent census") {
+        for &(caller, call) in ordinary.transport_uses[&target].as_ref().expect("complete borrowed extent census") {
             if let Some(&(_, owner, source)) = sites.get(&(caller, call)) {
                 let plan = result.bodies.entry(caller).or_default();
                 match source {
@@ -6606,12 +6608,12 @@ fn closed_aggregates<'a>(
         declarations.insert((input.source, function.name_span), (module, item));
         if let Some(facts) = facts {
             fallible_call_requests.extend(facts.fallible_call_initializers.iter()
-                .map(|&call| (input.source, cfg, call)));
+                .map(|&(call, ordinal)| (key, input.source, cfg, call, ordinal)));
         }
         if is_monomorphic && arm.is_none() && facts.is_some_and(|facts|
             matches!(facts.proved_literal_array_route(), Some(LiteralArrayRoute::FreshLeaf { .. })))
         {
-            ordinary.array_uses.entry(key).or_insert_with(|| Some(Vec::new()));
+            ordinary.transport_uses.entry(key).or_insert_with(|| Some(Vec::new()));
         }
         ordinary.seed(
             key, is_monomorphic, input.source, function, input.structs, sites, reservations.snapshot_struct,
@@ -6636,16 +6638,16 @@ fn closed_aggregates<'a>(
                     .filter(|(point, call, _)| exact_borrowed_extent_observer(&body, *point, *call))
                 {
                     borrowed_extent_observers.insert(key, BorrowedExtentRoute::Observer(observation, formal));
-                    ordinary.array_uses.entry(key).or_insert_with(|| Some(Vec::new()));
+                    ordinary.transport_uses.entry(key).or_insert_with(|| Some(Vec::new()));
                 } else if let Some((point, call)) = facts.and_then(|facts| facts.borrowed_extent_forward)
                     .filter(|(point, call)| exact_borrowed_extent_forward(&body, *point, *call))
                 {
                     borrowed_extent_observers.insert(key, BorrowedExtentRoute::Forward(call, point));
-                    ordinary.array_uses.entry(key).or_insert_with(|| Some(Vec::new()));
+                    ordinary.transport_uses.entry(key).or_insert_with(|| Some(Vec::new()));
                 }
                 if let Some(route) = array_descriptor_route(&body) {
                     array_descriptor_identities.insert(key, route);
-                    ordinary.array_uses.entry(key).or_insert_with(|| Some(Vec::new()));
+                    ordinary.transport_uses.entry(key).or_insert_with(|| Some(Vec::new()));
                 }
             }
             bodies.insert(key, body);
@@ -6697,7 +6699,71 @@ fn closed_aggregates<'a>(
     let mut recommit_edges = BTreeMap::<(BodyKey, CfgPointId), Vec<(CfgPointId, Option<CfgPointId>)>>::new();
     let mut structured_returns = BTreeMap::new();
     let mut recommit_returns = BTreeSet::new();
+    let mut fallible_allocating_targets = BTreeMap::<BodyKey, BTreeSet<(BodyKey, usize)>>::new();
     if !fallible_call_requests.is_empty() {
+        let allocation_leaf = |key: BodyKey| -> Option<()> {
+            if key.2.is_some() || reservations.bodies.get(&key) != Some(&true) { return None; }
+            let input = module_at(key.0)?;
+            let ScalarItem::Function(function) = input.items.get(key.1)? else { return None; };
+            if !crate::scalar::typecheck::is_module_private_name(&function.name)
+                || !function.generic_parameters.is_empty() || !function.overload_arms.is_empty()
+                || function.body.unsafe_context
+            { return None; }
+            let sites = input.calls.function_body(key.1, None)?;
+            if !sites.declared_unsafe_calls.is_empty()
+                || !matches!(sites.boundary.parameters.as_slice(), [parameter] if parameter.ty == ScalarType::U64)
+                || !matches!(sites.boundary.root_outputs.as_slice(), [output] if output.ty == ScalarType::U64)
+            { return None; }
+            let [ScalarBlockItem::LocalBinding(allocation), ScalarBlockItem::Expression(_)] =
+                function.body.items.as_slice() else { return None; };
+            let [receiver] = allocation.receivers.as_slice() else { return None; };
+            if !allocation.is_allocation || allocation.fallible_assignment.is_some()
+                || !matches!(allocation.value, ScalarExpression::Integer { ref value, span }
+                    if *value == 0.into() && span == allocation.span)
+                || !matches!(&receiver.ty, ScalarType::RuntimeArray { element, .. } if element.as_ref() == &ScalarType::U8)
+            { return None; }
+            let (_, cfg) = result_at(key, function)?;
+            if cfg.allocations.len() != 1 || !cfg.guarded_scalar_allocations().is_empty() { return None; }
+            let owner = cfg.allocations.first()?;
+            if owner.declaration_span != receiver.name_span
+                || cfg.observed_runtime_allocations.as_deref()? != [(receiver.name_span.start, receiver.name_span.end)]
+            { return None; }
+            let root = &sites.structure.blocks[sites.structure.root.0];
+            let formal = parameter_binding_identity(input.source, function.span,
+                root.span, &sites.boundary.parameters[0]);
+            let BlockItemKind::Binding(region) = &root.items.first()?.kind else { return None; };
+            let BindingInitialization::Allocation { lengths } = &region.initialization else { return None; };
+            let [length] = lengths.as_slice() else { return None; };
+            if length.position != 0
+                || sites.structure.checked_types.expressions.get(&length.expression) != Some(&ScalarType::U64)
+                || !matches!(sites.prepared_plain_name(length.expression)?,
+                    PlainNameIdentity::Lexical(binding) if binding == &formal)
+            { return None; }
+            let mut extent = None;
+            let mut returned = false;
+            let mut placeholder = false;
+            for point in &cfg.initial_points {
+                match &point.kind {
+                    CfgPointKind::Entry | CfgPointKind::ScopeEnter | CfgPointKind::ScopeExit
+                    | CfgPointKind::Return => {}
+                    CfgPointKind::Read { binding } if binding == &formal => {}
+                    // The canonical CFG evaluates derive_binding's synthetic
+                    // zero for an uninitialized runtime-allocation declaration.
+                    CfgPointKind::Evaluate(value) if !placeholder && value == &allocation.value => placeholder = true,
+                    CfgPointKind::Bind { binding } if binding == &formal || binding == owner => {}
+                    CfgPointKind::Borrow { place, loan } if place.binding == *owner
+                        && place.projections.is_empty() && loan.mode == ScalarReferenceMutability::Shared => {}
+                    CfgPointKind::Call { output: 0, target: ResolvedCallTarget::Core(CoreOperationId::ArrayLen),
+                        argument_points, .. } if extent.is_none() && matches!(argument_points.as_slice(), [borrow]
+                            if matches!(&cfg.initial_points[borrow.0].kind, CfgPointKind::Borrow { place, .. }
+                                if place.binding == *owner)) => extent = Some(point.id),
+                    CfgPointKind::ReturnOutput { output: 0, checked: false, value_point, .. }
+                        if !returned && extent == Some(*value_point) => returned = true,
+                    _ => return None,
+                }
+            }
+            (returned && placeholder).then_some(())
+        };
         let dependencies = |key: BodyKey| -> Option<Vec<BodyKey>> {
             if key.2.is_some() || reservations.bodies.get(&key) != Some(&true) { return None; }
             let input = module_at(key.0)?;
@@ -6731,15 +6797,26 @@ fn closed_aggregates<'a>(
             has_output.then_some(callees)
         };
         let mut memo = HashMap::new();
-        for (source, cfg, call) in fallible_call_requests {
-            if !target_body(&declarations, cfg, call).is_some_and(|target|
-                allocation_free_integer_graph(target, &mut memo, dependencies))
-            {
+        let mut leaf_memo = HashMap::new();
+        for (caller, source, cfg, call, ordinal) in fallible_call_requests {
+            let target = target_body(&declarations, cfg, call)
+                .ok_or_else(|| format!("fallible call initializer requires a checked allocation-free scalar callable in {source:?}"))?;
+            if allocation_free_integer_graph(target, &mut memo, dependencies) { continue; }
+            if !*leaf_memo.entry(target).or_insert_with(|| allocation_leaf(target).is_some()) {
                 return Err(format!("fallible call initializer requires a checked allocation-free scalar callable in {source:?}"));
             }
+            ordinary.transport_uses.entry(target).or_insert_with(|| Some(Vec::new()));
+            fallible_allocating_targets.entry(target).or_default().insert((caller, ordinal.0));
         }
     }
     ordinary.census(reservations, &module_at, &declarations);
+    for (target, calls) in &fallible_allocating_targets {
+        if !ordinary.transport_uses.get(target).and_then(Option::as_ref).is_some_and(|observed|
+            observed.len() == calls.len() && observed.iter().all(|site| calls.contains(site)))
+        {
+            return Err("fallible allocating callable requires exclusively checked fallible initializer uses".into());
+        }
+    }
     let mut outgoing = BTreeSet::new();
     let mut pending = Vec::new();
     outgoing.extend(multi_producers.keys().chain(multi_forwarders.keys()).copied());
@@ -6763,6 +6840,7 @@ fn closed_aggregates<'a>(
     let mut array_leaves = BTreeSet::new();
     let mut array_neighbors = BTreeMap::<BodyKey, BTreeSet<BodyKey>>::new();
     let mut result = ClosedAggregates::default();
+
     for (&key, body) in &bodies {
         if let Some(facts) = body.facts {
             // Borrow only completed caller proofs during this existing pass.
@@ -7099,6 +7177,12 @@ fn closed_aggregates<'a>(
         });
     }
     let finalize_cohorts = |mut result: ClosedAggregates| -> Result<ClosedAggregates, String> {
+        for (&target, sites) in &fallible_allocating_targets {
+            result.bodies.entry(target).or_default().fallible_allocation_leaf = true;
+            for &(caller, ordinal) in sites {
+                result.bodies.entry(caller).or_default().fallible_allocating_calls.insert(ordinal);
+            }
+        }
         install_literal_array_plans(&literal_array_callers, &bodies, &declarations, &mut result);
         if !returned_index_requirements.is_empty() && !reservations.checked_access {
             return Err("returned array index requires the authenticated checked-access helper".into());
@@ -8648,12 +8732,12 @@ mod tests {
             let mut plans = ClosedAggregates::default();
             enroll_literal_array_pair(&mut plans, pair, LiteralArrayParameters::default());
             let mut census = OrdinaryCohorts::default();
-            census.array_uses.insert(pair.callee, Some(Vec::new()));
-            census.record_array_use(pair.callee, Some((pair.caller, pair.write.producer.0)));
+            census.transport_uses.insert(pair.callee, Some(Vec::new()));
+            census.record_transport_use(pair.callee, Some((pair.caller, pair.write.producer.0)));
             if let Some(unsupported) = unsupported {
-                census.record_array_use(pair.callee, unsupported);
+                census.record_transport_use(pair.callee, unsupported);
                 // A later valid use cannot reverse refusal.
-                census.record_array_use(pair.callee, Some((pair.caller, pair.write.producer.0)));
+                census.record_transport_use(pair.callee, Some((pair.caller, pair.write.producer.0)));
             }
             census.seal_array_descriptors(&mut plans);
             assert_eq!(plans.bodies[&pair.callee].array_descriptor_return, unsupported.is_none());

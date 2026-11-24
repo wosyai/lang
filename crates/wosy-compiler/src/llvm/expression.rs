@@ -812,6 +812,21 @@ fn emit_prepared_call<'ctx, 'module>(
         return Ok(value);
     }
     let values = emit_contextual_arguments(context, state, arguments, parameters, project)?;
+    if aggregate_transfer::fallible_allocation_call_at(state, expression) {
+        let [EmitValue::Basic(BasicValueEnum::IntValue(count))] = values.as_slice() else {
+            return Err("invalid sealed fallible allocation call argument".into());
+        };
+        let callee = state.functions.get(target).ok_or("missing sealed fallible allocation callable")?;
+        let pair = aggregate_transfer::fallible_allocation_result_type(context);
+        if callee.get_linkage() != Linkage::Internal
+            || callee.get_type() != pair.fn_type(&[context.i64_type().into()], false)
+        {
+            return Err("invalid sealed fallible allocation callable ABI".into());
+        }
+        let call = state.builder.build_call(*callee, &[(*count).into()], "fallible.rhs").map_err(builder_error)?;
+        return call.try_as_basic_value().basic().map(EmitValue::Basic)
+            .ok_or_else(|| "missing sealed fallible allocation result".into());
+    }
     if let Some(value) = aggregate_transfer::emit_array_descriptor_call(context, state, expression, target, arguments, &values)? {
         return Ok(value);
     }

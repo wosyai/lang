@@ -180,6 +180,17 @@ pub(super) fn emit_return<'ctx, 'module>(
     value: EmitValue<'ctx>,
     outputs: &crate::ScalarOutputSequence,
 ) -> Result<(), String> {
+    if state.aggregate.as_ref().is_some_and(|aggregate| aggregate.plan().fallible_allocation_leaf) {
+        let payload = take_basic(value)?;
+        if !matches!(payload, BasicValueEnum::IntValue(integer) if integer.get_type() == context.i64_type()) {
+            return Err("invalid sealed fallible allocation return payload".into());
+        }
+        let pair = super::aggregate_transfer::fallible_allocation_result_type(context);
+        let tagged = pair.const_named_struct(&[context.bool_type().const_all_ones().into(), context.i64_type().const_zero().into()]);
+        let value = state.builder.build_insert_value(tagged, payload, 1, "fallible.payload").map_err(builder_error)?;
+        state.builder.build_return(Some(&value)).map_err(builder_error)?;
+        return Ok(());
+    }
     let value = materialize_fresh_return_outputs(context, state, value, outputs)?;
     for (output, slot) in &state.return_owner_slots {
         let owned = state

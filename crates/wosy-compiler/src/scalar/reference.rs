@@ -4985,7 +4985,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             return Err(self.missing_context(expression_span(primary),
                                 ReferenceAnalysisErrorReason::UnprovedFallibleCallInitializer));
                         };
-                        self.aggregate_result.fallible_call_initializers.push(point);
+                        self.aggregate_result.fallible_call_initializers.push((point, primary_ordinal));
                     }
                     if let ([head, tail], Some(point)) = (binding_region.receivers(), call_producer) {
                         if aggregate::mixed_owner_result_lanes(&head.ty, &tail.ty).is_some()

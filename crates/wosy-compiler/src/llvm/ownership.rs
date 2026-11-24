@@ -1223,9 +1223,19 @@ pub(super) fn bind_guarded_scalar<'ctx>(
     {
         return Err("invalid guarded scalar allocation binding".into());
     }
+    let rhs = if super::aggregate_transfer::fallible_allocation_call_at(state, &binding.value) {
+        let Some(BasicValueEnum::StructValue(pair)) = value else {
+            return Err("missing sealed fallible RHS result".into());
+        };
+        if receiver.ty != ScalarType::U64 || pair.get_type() != super::aggregate_transfer::fallible_allocation_result_type(context) {
+            return Err("invalid sealed fallible RHS result".into());
+        }
+        Some(pair)
+    } else { None };
     let aggregate = match (&receiver.ty, &binding.value, value) {
         (ScalarType::Struct(id), ScalarExpression::StructLiteral { fields, .. }, None) =>
             Some(memory::prepare_struct_literal(context, state, id, fields)?),
+        (_, _, Some(BasicValueEnum::StructValue(_))) if rhs.is_some() => None,
         (ty, _, Some(BasicValueEnum::IntValue(value)))
             if memory::integer_width(ty) == Some(value.get_type().get_bit_width()) => None,
         _ => return Err("invalid guarded allocation initializer".into()),
@@ -1236,6 +1246,16 @@ pub(super) fn bind_guarded_scalar<'ctx>(
         .ok_or_else(|| "missing guarded scalar allocation function".to_owned())?;
     let initialized = context.append_basic_block(parent, "fallible.initialize");
     let continuation = context.append_basic_block(parent, "fallible.continue");
+    let skipped = if let Some(rhs) = rhs {
+        let here = state.builder.get_insert_block().ok_or("missing fallible RHS block")?;
+        let succeeded = state.builder.build_extract_value(rhs, 0, "fallible.rhs_succeeded")
+            .map_err(builder_error)?.into_int_value();
+        let allocate = context.append_basic_block(parent, "fallible.destination");
+        state.builder.build_conditional_branch(succeeded, allocate, continuation).map_err(builder_error)?;
+        state.builder.position_at_end(allocate);
+        Some((rhs, here))
+    } else { None };
+    let allocation_end = state.builder.get_insert_block().ok_or("missing fallible allocation block")?;
     let backing = emit_standard_allocation_call(
         state, context.i64_type().const_int(size, false).into(),
         context.i64_type().const_int(align, false).into(),
@@ -1246,10 +1266,24 @@ pub(super) fn bind_guarded_scalar<'ctx>(
     if let Some(values) = aggregate {
         memory::write_struct_literal(context, state, values, backing)?;
     } else {
-        state.builder.build_store(backing, value.expect("checked integer initializer")).map_err(builder_error)?;
+        let value = if let Some((rhs, _)) = skipped {
+            state.builder.build_extract_value(rhs, 1, "fallible.rhs_payload").map_err(builder_error)?
+        } else {
+            value.expect("checked integer initializer")
+        };
+        state.builder.build_store(backing, value).map_err(builder_error)?;
     }
     state.builder.build_unconditional_branch(continuation).map_err(builder_error)?;
     state.builder.position_at_end(continuation);
+    let (backing, present) = if let Some((_, skipped)) = skipped {
+        let address = state.builder.build_phi(backing.get_type(), "fallible.backing").map_err(builder_error)?;
+        address.add_incoming(&[(&backing, allocation_end), (&backing, initialized),
+            (&backing.get_type().const_null(), skipped)]);
+        let availability = state.builder.build_phi(context.bool_type(), "fallible.available").map_err(builder_error)?;
+        availability.add_incoming(&[(&context.bool_type().const_zero(), allocation_end),
+            (&context.bool_type().const_all_ones(), initialized), (&context.bool_type().const_zero(), skipped)]);
+        (address.as_basic_value().into_pointer_value(), availability.as_basic_value().into_int_value())
+    } else { (backing, present) };
     state.storage.insert(receiver.name.clone(), (backing, receiver.ty.clone()));
     let sites = state.guarded_scalar.as_mut().expect("prepared guarded sites");
     sites.active[index] = Some(GuardedScalarOwner { backing, present });
@@ -1344,7 +1378,7 @@ pub(super) fn emit_runtime_array_allocation_with_domain<'ctx, 'module>(
         .get_insert_block()
         .and_then(|block| block.get_parent())
         .ok_or_else(|| "runtime allocation has no containing function".to_owned())?;
-    let panic_block = context.append_basic_block(function, "allocation_panic");
+    let recover = state.aggregate.as_ref().is_some_and(|aggregate| aggregate.plan().fallible_allocation_leaf);
     let integer = context.i64_type();
     // The checked extent also guarantees the target's signed LLVM pointer
     // index domain. Reuse the constructor's existing size-overflow branch
@@ -1358,17 +1392,17 @@ pub(super) fn emit_runtime_array_allocation_with_domain<'ctx, 'module>(
     } else {
         u64::MAX
     };
-    if element_size != 0 {
-        let limit = max_bytes / element_size;
-        if limit != u64::MAX && !length.get_zero_extended_constant().is_some_and(|constant| constant <= limit) {
-            let overflow = state.builder.build_int_compare(
-                IntPredicate::UGT, length, integer.const_int(limit, false), "allocation_size_overflow",
-            ).map_err(builder_error)?;
-            let allocate = context.append_basic_block(function, "allocation_size_valid");
-            state.builder.build_conditional_branch(overflow, panic_block, allocate)
-                .map_err(builder_error)?;
-            state.builder.position_at_end(allocate);
-        }
+    let limit = (element_size != 0).then(|| max_bytes / element_size).filter(|&limit|
+        limit != u64::MAX && !length.get_zero_extended_constant().is_some_and(|constant| constant <= limit));
+    let panic_block = (!recover || limit.is_some()).then(|| context.append_basic_block(function, "allocation_panic"));
+    if let Some(limit) = limit {
+        let overflow = state.builder.build_int_compare(
+            IntPredicate::UGT, length, integer.const_int(limit, false), "allocation_size_overflow",
+        ).map_err(builder_error)?;
+        let allocate = context.append_basic_block(function, "allocation_size_valid");
+        state.builder.build_conditional_branch(overflow, panic_block.expect("overflow panic block"), allocate)
+            .map_err(builder_error)?;
+        state.builder.position_at_end(allocate);
     }
     let size = match element_size {
         0 => integer.const_zero(),
@@ -1378,19 +1412,26 @@ pub(super) fn emit_runtime_array_allocation_with_domain<'ctx, 'module>(
         ).map_err(builder_error)?,
     };
     let continue_block = context.append_basic_block(function, "allocation_continue");
+    let allocation_failure = if recover {
+        context.append_basic_block(function, "allocation_absent")
+    } else {
+        panic_block.expect("ordinary allocation panic block")
+    };
     let allocation = emit_managed_allocation_branch(
-        context, state, size, alignment, panic_block, continue_block,
+        context, state, size, alignment, allocation_failure, continue_block,
     )?;
-    state.builder.position_at_end(panic_block);
-    let panic = state
-        .module
-        .get_function(CORE_SYSTEM_PANIC_SYMBOL)
-        .ok_or_else(|| "core system-panic runtime declaration is missing".to_owned())?;
-    state
-        .builder
-        .build_call(panic, &[], "system_panic")
-        .map_err(builder_error)?;
-    state.builder.build_unreachable().map_err(builder_error)?;
+    if recover {
+        state.builder.position_at_end(allocation_failure);
+        let absent = super::aggregate_transfer::fallible_allocation_result_type(context).const_zero();
+        state.builder.build_return(Some(&absent)).map_err(builder_error)?;
+    }
+    if let Some(panic_block) = panic_block {
+        state.builder.position_at_end(panic_block);
+        let panic = state.module.get_function(CORE_SYSTEM_PANIC_SYMBOL)
+            .ok_or_else(|| "core system-panic runtime declaration is missing".to_owned())?;
+        state.builder.build_call(panic, &[], "system_panic").map_err(builder_error)?;
+        state.builder.build_unreachable().map_err(builder_error)?;
+    }
     state.builder.position_at_end(continue_block);
     Ok(allocation)
 }
