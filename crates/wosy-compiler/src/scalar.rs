@@ -709,6 +709,7 @@ pub struct SpecializedCopyPolicy {
 pub enum ReferenceAnalysisErrorReason {
     MissingResolvedBinding,
     MissingResolvedCallTarget,
+    UnprovedLocalSharedCallableFamily,
     MissingCheckedExpressionResult { ordinal: usize },
     MissingCheckedPlaceType { ordinal: usize },
     MissingCheckedCallSignature { ordinal: usize },
@@ -728,6 +729,7 @@ impl ReferenceAnalysisErrorReason {
         match self {
             Self::MissingResolvedBinding => "missing resolved binding",
             Self::MissingResolvedCallTarget => "missing resolved call target",
+            Self::UnprovedLocalSharedCallableFamily => "local shared callable family has no closed checked-read authority",
             Self::MissingCheckedExpressionResult { .. } => "missing checked expression result",
             Self::MissingCheckedPlaceType { .. } => "missing checked place type",
             Self::MissingCheckedCallSignature { .. } => "missing checked call signature",

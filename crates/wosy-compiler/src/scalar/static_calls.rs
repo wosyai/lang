@@ -222,6 +222,10 @@ impl PreparedScalarProject {
         &self.project
     }
 
+    pub(crate) fn has_closed_shared_scalar_reader(&self, module: usize, declaration: ByteSpan) -> bool {
+        self.calls.has_closed_shared_scalar_reader(module, declaration)
+    }
+
     pub(crate) fn body_overload_reservations(
         &self,
         module: usize,

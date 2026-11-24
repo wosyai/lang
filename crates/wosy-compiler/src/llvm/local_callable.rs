@@ -3,7 +3,7 @@ use crate::ScalarBinding;
 
 pub(super) struct LocalCallableSlot<'ctx> {
     storage: PointerValue<'ctx>,
-    parameters: Vec<ScalarType>,
+    pub(super) parameters: Vec<ScalarType>,
     pub(super) outputs: crate::ScalarOutputSequence,
 }
 
@@ -16,11 +16,16 @@ fn scalar(ty: &ScalarType) -> bool {
 fn signature(ty: &ScalarType) -> Option<(&[ScalarType], &crate::ScalarOutputSequence)> {
     let ScalarType::Callable { parameters, outputs } = ty else { return None };
     let [output] = outputs.outputs.as_slice() else { return None };
-    (scalar(&output.ty) && parameters.iter().all(scalar)).then_some((parameters, outputs))
+    let scalar_parameters = parameters.iter().all(scalar);
+    let shared_reader = matches!(parameters.as_slice(), [ScalarType::CheckedReference {
+        mutability: crate::scalar::ScalarReferenceMutability::Shared, inner,
+    }] if scalar(inner) && &output.ty == inner.as_ref());
+    (scalar(&output.ty) && (scalar_parameters || shared_reader)).then_some((parameters, outputs))
 }
 
 pub(super) fn closed_scalar_target(function: &ScalarFunction, cfg: &ScalarReferenceCfg) -> bool {
-    if signature(&function.signature).is_none() || !cfg.allocations.is_empty()
+    if signature(&function.signature).is_none_or(|(parameters, _)| !parameters.iter().all(scalar))
+        || !cfg.allocations.is_empty()
         || !matches!(cfg.points.first().map(|point| &point.kind), Some(CfgPointKind::Entry))
     {
         return false;
@@ -54,7 +59,7 @@ fn target<'ctx>(
     state: &EmitState<'ctx, '_>, expression: &ScalarExpression,
     parameters: &[ScalarType], outputs: &crate::ScalarOutputSequence,
 ) -> Result<PointerValue<'ctx>, String> {
-    let symbol = state.pure_local_callable_symbol(expression)
+    let symbol = state.closed_local_callable_symbol(expression)
         .ok_or_else(|| "local callable slot requires a proved direct scalar target".to_owned())?;
     let definition = state.functions.get(symbol).ok_or_else(|| state.missing_prepared_signature(symbol))?;
     let (actual_parameters, actual_outputs) = state.signatures.get(symbol).and_then(signature)

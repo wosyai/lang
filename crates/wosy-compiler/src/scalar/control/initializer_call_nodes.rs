@@ -687,6 +687,11 @@ impl<'a> CallableBodyCallNodes<'a> {
             .map(|ordinal| ordinal.0)
     }
 
+    pub(crate) fn local_shared_call_closed(&self, expression: &ScalarExpression) -> bool {
+        let Some(&ordinal) = self.proof_nodes.expressions.get(&std::ptr::from_ref(expression)) else { return false };
+        self.proof_nodes.calls.is_some_and(|calls| calls.local_shared_call_families.get(&ordinal) == Some(&true))
+    }
+
     pub(crate) fn local_callable_destination_span(&self, place: &ScalarPlace) -> Option<ByteSpan> {
         match self.direct_destination(place)? {
             DirectDestinationIdentity::Existing(binding) => Some(binding.declaration_span),

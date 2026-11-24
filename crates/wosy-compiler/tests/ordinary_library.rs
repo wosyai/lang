@@ -1266,6 +1266,102 @@ fn local_callable_replacement_selects_only_proved_ordinary_scalar_targets() {
 }
 
 #[test]
+fn local_checked_reader_preserves_the_selected_loan_through_recursion() {
+    let app = source("workbench", "src/local_checked_reader.w");
+    let text = include_str!("fixtures/local-checked-reader.w");
+    for (target, target_layout) in [
+        ("native64", ScalarTargetLayout::NATIVE64),
+        ("wasm32", ScalarTargetLayout::WASM32),
+    ] {
+        let prepare = |text: &str| prepare_scalar_project(
+            vec![(declarations(&app, text), Vec::new())], vec![app.clone()],
+            ScalarPreparationInputs { target_layout },
+        ).unwrap_or_else(|error| panic!("{target}: {:?}", error.diagnostics));
+        let emit = |text: &str| {
+            let prepared = prepare(text);
+            let build = analyze_scalar_build(&prepared);
+            assert!(build.diagnostics().is_empty(), "{target}: {:?}", build.diagnostics());
+            emit_scalar_build_project_llvm(&build).map(|module| module.to_text())
+        };
+        let ir = emit(text).unwrap_or_else(|error| panic!("{target}: {error}"));
+        let context = Context::create();
+        let buffer = MemoryBuffer::create_from_memory_range_copy(ir.as_bytes(), target);
+        let module = context.create_module_from_ir(buffer).unwrap();
+        module.verify().unwrap();
+        let frame = module.get_function(&function_with_suffix(&module, "frame")).unwrap();
+        let alloc = module.get_function("__wosy_core_alloc").unwrap();
+        let free = module.get_function("__wosy_core_free").unwrap();
+        let mut found = Vec::new();
+        let mut allocated = None;
+        let mut freed = None;
+        let mut writes = 0;
+        for row in frame.get_basic_blocks().into_iter().flat_map(|block| block.get_instructions()) {
+            if row.get_opcode() == InstructionOpcode::Store && row.to_string().contains("store ptr @wosy_fn__") {
+                writes += 1;
+            }
+            if row.get_opcode() != InstructionOpcode::Call { continue; }
+            let call = CallSiteValue::try_from(row).unwrap();
+            match call.get_called_fn_value() {
+                Some(callee) if callee == alloc => {
+                    assert!(allocated.replace(call.try_as_basic_value().basic().unwrap()).is_none());
+                    found.push("allocate");
+                }
+                Some(callee) if callee == frame => found.push("descend"),
+                Some(callee) if callee == free => {
+                    assert!(freed.replace(row.get_operand(0).unwrap().value().unwrap()).is_none());
+                    found.push("release");
+                }
+                None => {
+                    assert_eq!(call.count_arguments(), 1, "{target}: {ir}");
+                    let argument = row.get_operand(0).unwrap().value().unwrap().into_int_value();
+                    assert_eq!(argument.get_type().get_bit_width(), if target == "native64" { 64 } else { 32 });
+                    found.push("checked read");
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(found, ["allocate", "descend", "checked read", "release"], "{target}: {ir}");
+        assert_eq!(writes, 2, "{target}: {ir}");
+        assert_eq!(allocated, freed, "{target}: {ir}");
+
+        if let Some(out) = std::env::var_os("WOSY_LOCAL_CHECKED_READER_IR_DIR") {
+            let mut ir = ir.replace("@main(", "@wosy_authored_main(");
+            for name in ["frame_zero", "frame_two", "frame_three", "joined_left", "joined_right"] {
+                let symbol = function_with_suffix(&module, name);
+                ir.push_str(&format!(
+                    "\ndefine i8 @wosy_{name}() {{\nentry:\n  %result = call i8 @{symbol}()\n  ret i8 %result\n}}\n"
+                ));
+            }
+            std::fs::write(std::path::PathBuf::from(out).join(format!("{target}.ll")), ir).unwrap();
+        }
+
+        let effectful = text.replace("u8(*u8) read_bonus", "u8 extra = 1;\nu8(*u8) read_bonus")
+            .replace("*reader + 1", "*reader + extra");
+        let requires_family = |text: &str| {
+            let prepared = prepare(text);
+            let build = analyze_scalar_build(&prepared);
+            assert!(build.diagnostics().iter().any(|diagnostic| diagnostic.code == "B0003"
+                && diagnostic.message == "local shared callable family has no closed checked-read authority"),
+                "{target}: expected closed-family diagnostic, got {:?}", build.diagnostics());
+        };
+        requires_family(&effectful);
+        let unknown_replacement = text.replacen(
+            "        if (choose) { read_slot = read_bonus; };",
+            "        u8(*u8) unknown = read_bonus; if (choose) { read_slot = unknown; };",
+            1,
+        );
+        requires_family(&unknown_replacement);
+
+        let conflict = text.replace("        u8 observed = read_slot(selected);\n        bytes[0] = tag + 20;",
+            "        bytes[0] = tag + 20;\n        u8 observed = read_slot(selected);");
+        let prepared = prepare(&conflict);
+        let build = analyze_scalar_build(&prepared);
+        assert!(build.diagnostics().iter().any(|diagnostic| diagnostic.code == "B0003"),
+            "{target}: expected a Build loan conflict, got {:?}", build.diagnostics());
+    }
+}
+
+#[test]
 fn runtime_array_recommit_keeps_the_owner_until_its_real_end() {
     let recursive = r#"
 (u8[], u64)(u8[], u64, u64) carry = fn(bytes, depth, count) {

@@ -5,6 +5,7 @@ use wosy_syntax::{ByteSpan, SourceIdentity, SourceSpan};
 struct FunctionSymbol<'input> {
     identity: (String, String),
     ordinary_body: Option<(&'input ScalarFunction, &'input ScalarReferenceCfg)>,
+    closed_shared_reader: bool,
     local_purity: std::cell::Cell<Option<bool>>,
 }
 
@@ -25,6 +26,7 @@ impl<'input> InitializerSymbols<'input> {
         let entry = FunctionSymbol {
             identity: (function.name.clone(), symbol),
             ordinary_body: None,
+            closed_shared_reader: false,
             local_purity: std::cell::Cell::new(None),
         };
         if let Some(functions) = self.functions.get_mut(source) {
@@ -36,11 +38,14 @@ impl<'input> InitializerSymbols<'input> {
 
     pub(super) fn scalar_local_target(
         &mut self, source: &SourceIdentity, function: &'input ScalarFunction, cfg: &'input ScalarReferenceCfg,
+        closed_shared_reader: bool,
     ) {
         // No CFG analysis until a prepared initializer or replacement resolves
         // this exact declaration as a local callable value.
-        self.functions.get_mut(source).and_then(|functions| functions.get_mut(&function.name_span))
-            .expect("registered ordinary callable declaration").ordinary_body = Some((function, cfg));
+        let entry = self.functions.get_mut(source).and_then(|functions| functions.get_mut(&function.name_span))
+            .expect("registered ordinary callable declaration");
+        entry.ordinary_body = Some((function, cfg));
+        entry.closed_shared_reader = closed_shared_reader;
     }
 
     pub(super) fn external(&mut self, source: &SourceIdentity, span: ByteSpan, symbol: &str) {
@@ -232,7 +237,12 @@ impl<'ctx, 'module> EmitState<'ctx, 'module> {
                 ),
                 ResolvedCallTarget::LocalCallable(binding) => {
                     let key = (binding.declaration_span.start, binding.declaration_span.end);
-                    if self.local_callable_slots.contains_key(&key) {
+                    if let Some(slot) = self.local_callable_slots.get(&key) {
+                        if slot.parameters.iter().any(|ty| matches!(ty, ScalarType::CheckedReference { .. }))
+                            && !nodes.local_shared_call_closed(expression)
+                        {
+                            return Err("local shared callable family has no closed checked-read authority".into());
+                        }
                         PreparedCall::Local(key)
                     } else {
                         PreparedCall::Indirect
@@ -342,11 +352,11 @@ impl<'ctx, 'module> EmitState<'ctx, 'module> {
         }
     }
 
-    pub(super) fn pure_local_callable_symbol(&self, expression: &ScalarExpression) -> Option<&str> {
+    pub(super) fn closed_local_callable_symbol(&self, expression: &ScalarExpression) -> Option<&str> {
         let declaration = self.body_call_nodes?.callable_value_declaration(expression)?;
         let entry = self.symbols().functions.get(&declaration.source)?.get(&declaration.range)?;
         let closed = entry.local_purity.get().unwrap_or_else(|| {
-            let closed = entry.ordinary_body.is_some_and(|(function, cfg)| {
+            let closed = entry.closed_shared_reader || entry.ordinary_body.is_some_and(|(function, cfg)| {
                 super::local_callable::closed_scalar_target(function, cfg)
             });
             entry.local_purity.set(Some(closed));

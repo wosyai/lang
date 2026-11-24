@@ -1787,6 +1787,9 @@ impl<'a> ReferenceFlowBuilder<'a> {
             }
             ScalarExpression::Call { arguments, .. } => {
                 let target = self.call_target(expression, ordinal)?;
+                if !self.independent_checked_query && calls.local_shared_call_families.get(&ordinal) == Some(&false) {
+                    return Err(self.missing_context(span, ReferenceAnalysisErrorReason::UnprovedLocalSharedCallableFamily));
+                }
                 let mut address = None;
                 let mut checked_release_address = None;
                 let mut named_release_binding = None;
@@ -2024,12 +2027,11 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 }) && matches!(signature.and_then(|signature| signature.outputs.outputs.first()),
                     Some(ScalarOutput { ty: ScalarType::CheckedReference { .. }, .. }));
                 let read_effect_argument = if self.joined_local_reborrow
-                    && self.shared_scalar_read_effects.is_some_and(|effects| !effects.is_empty())
                     && !calls.declared_unsafe_calls.contains(&ordinal.0)
                 {
                     (|| {
                         let CfgPointKind::Call { target, argument_points, .. } = &call else { return None };
-                        let effect = shared_scalar_read_effect(&self.source, target, self.shared_scalar_read_effects)?;
+                        let effect = shared_scalar_read_effect(&self.source, calls, ordinal, target, self.shared_scalar_read_effects)?;
                         let [parameter] = signature?.parameters.as_slice() else { return None };
                         let ScalarType::CheckedReference { mutability: ScalarReferenceMutability::Shared, inner } = parameter else {
                             return None;
@@ -6709,9 +6711,13 @@ fn deferred_named_reborrow_allowed(function: &ScalarFunction, calls: &FunctionCa
 }
 
 fn shared_scalar_read_effect(
-    source: &SourceIdentity, target: &ResolvedCallTarget,
-    effects: Option<&HashMap<ByteSpan, SharedScalarReadEffect>>,
+    source: &SourceIdentity, calls: &FunctionCallSites, ordinal: OccurrenceOrdinal,
+    target: &ResolvedCallTarget, effects: Option<&HashMap<ByteSpan, SharedScalarReadEffect>>,
 ) -> Option<SharedScalarReadEffect> {
+    if matches!(target, ResolvedCallTarget::LocalCallable(_)) {
+        return (calls.local_shared_call_families.get(&ordinal) == Some(&true))
+            .then_some(SharedScalarReadEffect { parameter: 0 });
+    }
     let ResolvedCallTarget::ModuleCallable {
         source: callee, declaration_span, concrete: ConcreteCallSelection::Declaration,
     } = target else { return None };
@@ -6728,7 +6734,7 @@ fn joined_reborrow_calls_are_supported(
         if calls.declared_unsafe_calls.contains(&call.ordinal.0) {
             return false;
         }
-        if shared_scalar_read_effect(source, target, effects).is_some() {
+        if shared_scalar_read_effect(source, calls, call.ordinal, target, effects).is_some() {
             return true;
         }
         matches!(target,
@@ -10164,6 +10170,7 @@ pub(super) struct FunctionCallSites {
     pub(super) arms: Vec<FunctionCallSites>,
     pub(super) occurrences: Vec<OccurrenceMetadata>,
     pub(super) call_occurrences: Vec<CallOccurrence>,
+    pub(super) local_shared_call_families: HashMap<OccurrenceOrdinal, bool>,
     declared_unsafe_calls: BTreeSet<usize>,
     pub(super) callable_escapes: HashSet<SourceSpan>,
     overload_reservation_sites: Vec<CallOccurrence>,
@@ -10258,6 +10265,11 @@ impl ProjectCallSiteResults {
 }
 
 impl ProjectCallSiteResults {
+    pub(super) fn has_closed_shared_scalar_reader(&self, module: usize, declaration: ByteSpan) -> bool {
+        self.modules.get(module).and_then(|row| row.as_ref().ok())
+            .is_some_and(|calls| calls.shared_scalar_read_effects.contains_key(&declaration))
+    }
+
     pub(super) fn lookup_errors(&self) -> impl Iterator<Item = &ReferenceAnalysisError> {
         self.modules
             .iter()
@@ -11949,6 +11961,82 @@ impl StructuralWalker<'_, '_> {
     }
 }
 
+fn close_local_shared_call_families(
+    source: &SourceIdentity, calls: &mut FunctionCallSites,
+    readers: &HashMap<ByteSpan, SharedScalarReadEffect>,
+) {
+    let mut slots = HashMap::<&ReferenceBindingId, (bool, bool)>::new();
+    let checked_calls: Vec<_> = calls.call_occurrences.iter().filter_map(|call| {
+        let ResolvedCallTarget::LocalCallable(binding) = &calls.sites[call.site].target else { return None };
+        let signature = calls.checked_call_signatures.get(&call.ordinal)?;
+        let [ScalarType::CheckedReference { mutability: ScalarReferenceMutability::Shared, inner }] =
+            signature.parameters.as_slice() else { return None };
+        let [output] = signature.outputs.outputs.as_slice() else { return None };
+        (output.ty == **inner && aggregate::ordinary_value(inner)
+            && !calls.declared_unsafe_calls.contains(&call.ordinal.0))
+            .then_some((call.ordinal, binding))
+    }).collect();
+    if checked_calls.is_empty() { return; }
+    for &(_, binding) in &checked_calls { slots.entry(binding).or_default(); }
+    let by_declaration: HashMap<_, _> = slots.keys().map(|&binding| ((binding.block_span, binding.declaration_span), binding)).collect();
+    let is_reader = |expression| {
+        matches!(calls.prepared_plain_name(expression), Some(PlainNameIdentity::ModuleValue(declaration))
+            if declaration.source == *source && readers.get(&declaration.range)
+                .is_some_and(|effect| effect.parameter == 0))
+    };
+    for block in &calls.structure.blocks {
+        for item in &block.items {
+            let BlockItemKind::Binding(binding) = &item.kind else { continue; };
+            for receiver in binding.receivers() {
+                let Some(&identity) = by_declaration.get(&(block.span, receiver.span)) else { continue; };
+                let state = slots.get_mut(identity).expect("indexed local shared slot");
+                if state.0 || binding.receivers().len() != 1
+                    || !matches!(&binding.initialization, BindingInitialization::Outputs(outputs)
+                        if outputs.secondary.is_empty() && is_reader(outputs.primary))
+                {
+                    state.1 = true;
+                }
+                state.0 = true;
+            }
+        }
+    }
+    // Every possible writer is closed, so at any reachable call the selected
+    // definition is a member of this proved family. We do not infer a target
+    // from the condition, nor model general callable values or aliases.
+    for group in calls.assignments.values() {
+        let mut destinations = group.destinations();
+        let single = destinations.len() == 1 && group.projected_outputs().len() == 0;
+        let mut rhs = group.rhs_evaluations();
+        let accepted = single && rhs.len() == 1 && rhs.next().is_some_and(|value| is_reader(value.expression));
+        for slot in &mut destinations {
+            let Some(DirectDestinationIdentity::Existing(binding)) = calls.prepared_direct_destination(slot.destination)
+                else { continue; };
+            if let Some(state) = slots.get_mut(binding) { state.1 |= !accepted; }
+        }
+    }
+    if let PlainNameFacts::Prepared(names) = &calls.plain_names {
+        for identity in names.values() {
+            if let PlainNameIdentity::Lexical(binding) = identity {
+                if let Some(state) = slots.get_mut(binding) { state.1 = true; }
+            }
+        }
+    }
+    if let NamedPlaceRootFacts::Prepared(roots) = &calls.named_place_roots {
+        for (&occurrence, identity) in roots {
+            if let NamedPlaceRootIdentity::Lexical(binding) = identity {
+                if let Some(state) = slots.get_mut(binding) {
+                    state.1 |= !matches!(calls.prepared_direct_destination(occurrence),
+                        Some(DirectDestinationIdentity::Existing(destination)) if destination == binding);
+                }
+            }
+        }
+    }
+    calls.local_shared_call_families.extend(checked_calls.into_iter().filter_map(|(ordinal, binding)| {
+        let &(initialized, rejected) = slots.get(binding)?;
+        initialized.then_some((ordinal, !rejected))
+    }));
+}
+
 fn resolve_module_call_sites(
     source: &SourceIdentity,
     items: &[ScalarItem],
@@ -11979,6 +12067,11 @@ fn resolve_module_call_sites(
                 }
             }
             functions.insert(index, calls);
+        }
+    }
+    if select_executable_calls {
+        for calls in functions.values_mut() {
+            close_local_shared_call_families(source, calls, &shared_scalar_read_effects);
         }
     }
     let mut initialization = module_initialization_region(source, items, namespace_bindings);
@@ -12273,6 +12366,7 @@ fn resolve_function_call_sites(
         arms,
         occurrences: resolver.occurrences,
         call_occurrences: callable.call_occurrences,
+        local_shared_call_families: HashMap::new(),
         declared_unsafe_calls: callable.declared_unsafe_calls,
         callable_escapes: resolver.callable_escapes,
         overload_reservation_sites: callable.overload_reservation_sites,

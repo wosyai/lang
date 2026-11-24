@@ -722,6 +722,7 @@ pub(super) mod tests {
         FunctionCallSites {
             boundary: CallableBoundary { parameters: vec![], results: vec![], root_outputs: vec![], generics: vec![] },
             sites: vec![], arms: vec![], occurrences: vec![], call_occurrences: vec![],
+            local_shared_call_families: HashMap::new(),
             declared_unsafe_calls: BTreeSet::new(), callable_escapes: HashSet::new(),
             overload_reservation_sites: vec![], self_tail_candidates: vec![], allocation_length_calls: vec![],
             allocation_length_call_targets: HashMap::new(), checked_call_signatures: HashMap::new(),

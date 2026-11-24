@@ -478,7 +478,8 @@ fn emit_single_module_llvm<'a>(
             continue;
         }
         let cfg = require_cfg(item_ordinal, None, function)?;
-        if prepared_render { initializer_symbols.scalar_local_target(source, function, cfg); }
+        if prepared_render { initializer_symbols.scalar_local_target(source, function, cfg,
+            generic_input.has_closed_shared_scalar_reader(0, function.name_span)); }
         definitions.push((function, cfg, function.name.as_str(), item_ordinal, None));
     }
     let ordinary_count = definitions.len();
@@ -889,7 +890,8 @@ fn emit_project_llvm<'a>(
                     continue;
                 }
                 let cfg = require_cfg(module_ordinal, item_ordinal, None, function)?;
-                if prepared_render { initializer_symbols.scalar_local_target(&source_module.source, function, cfg); }
+                if prepared_render { initializer_symbols.scalar_local_target(&source_module.source, function, cfg,
+                    generic_input.has_closed_shared_scalar_reader(module_ordinal, function.name_span)); }
                 declarations.push(Declaration::Ordinary(definitions.len()));
                 definitions.push((
                     module_ordinal,
@@ -4817,6 +4819,10 @@ enum GenericInitializerInput<'a> {
 impl GenericInitializerInput<'_> {
     fn prepared_render(self) -> bool {
         matches!(self, Self::PreparedRows(_))
+    }
+
+    fn has_closed_shared_scalar_reader(self, module: usize, declaration: wosy_syntax::ByteSpan) -> bool {
+        matches!(self, Self::PreparedRows(prepared) if prepared.has_closed_shared_scalar_reader(module, declaration))
     }
 
     fn visit_body_overloads(
