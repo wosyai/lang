@@ -1653,7 +1653,7 @@ state_array_too_wide = f"""%%start
 cases.extend([
     ("authored-state-fixed-array-precision",state_fixed_array,217,b"FIXED-ARRAY"),
     ("authored-state-array-inside-nominal",state_nested_array,218,b"NESTED-ARRAY"),
-    ("authored-state-array-unsupported-element",state_fixed_array.replace("[value, 7]","[value + 1, 7]"),2,b"unsupported analysis"),
+    ("authored-state-array-unsupported-element",state_fixed_array.replace("[value, 7]","[value * 2, 7]"),2,b"unsupported analysis"),
     ("authored-state-array-shape-cap",state_array_too_wide,2,b"unsupported analysis"),
 ])
 state_nominal = f"""%%start
@@ -1692,6 +1692,28 @@ cases.extend([
     ("authored-state-array-copy-chain",fixed_array_copy,57,b"COPIED-STATE"),
     ("authored-state-nominal-move-not-copy",nominal_move,2,b"unsupported analysis"),
     ("authored-state-nominal-copy-mutation-unsupported",nominal_mutated_copy,2,b"unsupported analysis"),
+])
+affine_snapshot = f"""%%start
+    struct Snapshot {{ i8 raised; i8 reflected; i8 plain; }}
+    unit(i8) inspect = fn(value) {{
+        core.narrow(value == 1 || value == 3, {report(1,"PRUNE")});
+        Snapshot snapshot = {{ .raised = value + 2; .reflected = 7 - value; .plain = value; }};
+        if (value == 1) {{
+            i8 read = snapshot.raised;
+            core.require(read == 3, {report(58,"LOST-PREIMAGE")});
+        }};
+        value = 7;
+        core.require(value != 7, {state_report(59,"AFFINE-SNAPSHOT","snapshot")});
+    }};
+    %%end"""
+affine_snapshot_actual = affine_snapshot.replace("%%end","inspect(1); %%end")
+affine_snapshot_overflow = affine_snapshot.replace("value == 1 || value == 3","value >= 125").replace("value + 2","value + 3")
+affine_array_snapshot = state_fixed_array.replace("[value, 7]","[value + 1, 7]")
+cases.extend([
+    ("authored-state-affine-nominal-construction",affine_snapshot,59,b"AFFINE-SNAPSHOT"),
+    ("exact-startup-authored-state-affine-nominal-construction",affine_snapshot_actual,59,b"AFFINE-SNAPSHOT"),
+    ("authored-state-affine-nominal-overflow",affine_snapshot_overflow,2,b"unsupported analysis"),
+    ("authored-state-affine-array-construction",affine_array_snapshot,217,b"FIXED-ARRAY"),
 ])
 ordinary_array_read = f"""%%start
     unit(u64, i8) inspect = fn(index, value) {{
@@ -1828,7 +1850,7 @@ state_nominal_depth_limit = f"""%%start
 state_nominal_visible_alias = state_nominal.replace(
     'value = 7;', 'i8 ordinary = value; value = 7;',
 ).replace('core.require(value != 7,', 'core.require(ordinary != 1,')
-state_nominal_unsupported_operand = state_nominal.replace('.saved = value;', '.saved = value + 1;')
+state_nominal_unsupported_operand = state_nominal.replace('.saved = value;', '.saved = value * 2;')
 state_repeated = state_range.replace(
     '.path = "note.txt"; .text = "authored"; }',
     '.path = "note.txt"; .text = "authored"; }, { .path = "state-copy.json"; .state = value; }',
@@ -1890,7 +1912,22 @@ copied_nominal_bytes = state_bytes({
     "type": {"kind": "struct", "name": "Snapshot"}, "value": {"saved": copied_alternatives}
 })
 copied_array_bytes = state_bytes(array_state({"kind":"i8"}, [copied_alternatives, typed_state("i8", 4)]))
+def affine_nominal_bytes(raised, reflected, plain):
+    return state_bytes({"type": {"kind": "struct", "name": "Snapshot"}, "value": {
+        "raised": typed_state("i8", raised), "reflected": typed_state("i8", reflected),
+        "plain": typed_state("i8", plain),
+    }})
+def alternatives(*values):
+    return {"kind": "alternatives", "values": list(values)}
+affine_array_bytes = state_bytes(array_state({"kind": "i8"}, [
+    typed_state("i8", alternatives(2,4)), typed_state("i8", 7),
+]))
 authored_files = {
+    "authored-state-affine-nominal-construction": {
+        "state.json": affine_nominal_bytes(alternatives(3,5), alternatives(4,6), alternatives(1,3)),
+    },
+    "exact-startup-authored-state-affine-nominal-construction": {"state.json": affine_nominal_bytes(3,6,1)},
+    "authored-state-affine-array-construction": {"state.json": affine_array_bytes, "copy.json": affine_array_bytes},
     **{name: {"state.json": state_bytes(typed_state("i8", 3))} for name in (
         "ordinary-nominal-member-read-control", "exact-startup-ordinary-nominal-member-read-control",
         "ordinary-array-read-control", "exact-startup-ordinary-array-read-control",

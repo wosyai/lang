@@ -10536,6 +10536,52 @@ mod tests {
 
     #[cfg(feature = "internal-checker")]
     #[test]
+    fn authored_affine_snapshot_construction_preserves_width_and_preimage() {
+        let app = source("src/main.w", "authored-affine-snapshot");
+        let text = r#"%%start
+            struct Snapshot { i8 raised; i8 reflected; i8 plain; }
+            unit(i8) inspect = fn(value) {
+                core.narrow(value == 1 || value == 3, { .stdout = ""; .stderr = ""; .code = 1; .files = []; });
+                Snapshot snapshot = { .raised = value + 2; .reflected = 7 - value; .plain = value; };
+                if (value == 1) {
+                    i8 read = snapshot.raised;
+                    core.require(read == 3, { .stdout = ""; .stderr = "lost preimage"; .code = 58; .files = []; });
+                };
+                value = 7;
+                core.require(value != 7, { .stdout = ""; .stderr = ""; .code = 59;
+                    .files = [{ .path = "state.json"; .state = snapshot; }]; });
+            };
+        %%end"#;
+        let run = |input: &str, scope| {
+            let prepared = prepare_proof_target(&app, input).unwrap();
+            run_closed_without_named_proofs(&prepared, scope, 1)
+        };
+        let symbolic = run(text, ScalarCheckerScope::CurrentPackage).unwrap();
+        let [failure] = symbolic.directives.as_slice() else { panic!("one file from construction"); };
+        assert_eq!(failure.code(), &BigInt::from(59));
+        assert_eq!(failure.witness.axes().len(), 1);
+        assert_eq!(failure.files()[0].text.as_ref(),
+            concat!(
+                "{\"type\":{\"kind\":\"struct\",\"name\":\"Snapshot\"},\"value\":{",
+                "\"raised\":{\"type\":{\"kind\":\"i8\"},\"value\":{\"kind\":\"alternatives\",\"values\":[3,5]}},",
+                "\"reflected\":{\"type\":{\"kind\":\"i8\"},\"value\":{\"kind\":\"alternatives\",\"values\":[4,6]}},",
+                "\"plain\":{\"type\":{\"kind\":\"i8\"},\"value\":{\"kind\":\"alternatives\",\"values\":[1,3]}}}}\n"
+            ).as_bytes());
+        let actual = text.replace("%%end", "inspect(1); %%end");
+        let receipt = run(&actual, ScalarCheckerScope::MainFlowOnly).unwrap();
+        let [failure] = receipt.directives.as_slice() else { panic!("one actual construction"); };
+        assert_eq!(failure.code(), &BigInt::from(59));
+        let output = std::str::from_utf8(&failure.files()[0].text).unwrap();
+        assert!(output.contains(r#""reflected":{"type":{"kind":"i8"},"value":6}"#));
+        let overflow = text.replace("value == 1 || value == 3", "value >= 125")
+            .replace("value + 2", "value + 3");
+        for invalid in [overflow, text.replace("value + 2", "value * 2")] {
+            assert!(matches!(run(&invalid, ScalarCheckerScope::CurrentPackage), Err(ProjectCheck::Unsupported)));
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
     fn ordinary_fixed_array_read_partitions_only_in_bounds_index_preimages() {
         let app = source("src/main.w", "ordinary-array-read");
         let text = r#"%%start

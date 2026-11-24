@@ -5361,6 +5361,7 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                     // construction captures. They add no witness columns.
                     if structure.checker_snapshot_copies.contains_key(&(block, item.position)) { continue; }
                     let shape = structure.checker_snapshot_locals.get(&(block, item.position))?;
+                    if shape.has_affine_leaf && !roots.allow_extended_scalar_locals { return None; }
                     use super::checker_directive::CheckerSnapshotOperand;
                     for field in shape.leaves.iter() {
                         match &field.operand {
@@ -5368,6 +5369,15 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                                 let (axis, ty) = roots.lookup(binding)?;
                                 if ty != &field.ty { return None; }
                                 path.append_ordinary_copy(axis, roots)?;
+                            }
+                            CheckerSnapshotOperand::Affine { source, operator, literal, source_on_left } => {
+                                let (axis, ty) = roots.lookup(source)?;
+                                if ty != &field.ty { return None; }
+                                let source = (None, Some(axis));
+                                let literal = (Some(literal), None);
+                                let (left, right) = if *source_on_left { (source, literal) } else { (literal, source) };
+                                path.append_ordinary_calculation(AuthoredIntegerOperation::checked(operator)?, left, right,
+                                    &field.ty, &mut roots.ordinary_local_work, &mut roots.affine_work)?;
                             }
                             CheckerSnapshotOperand::Literal(value) => {
                                 let work = roots.ordinary_local_work.get_or_insert(0);

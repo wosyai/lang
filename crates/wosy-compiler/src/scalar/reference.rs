@@ -6381,6 +6381,7 @@ impl OccurrenceStructure {
         let shape = self.checker_snapshot_locals.get(&constructor)?;
         let selected = admit(shape)?;
         let shape = shape.clone();
+        self.checker_has_extended_scalar_local |= shape.has_affine_leaf;
         while self.checker_selected_snapshots.insert(key) {
             let Some(copy) = self.checker_snapshot_copies.get(&key) else { break; };
             key = copy.source;
@@ -9295,6 +9296,7 @@ impl StructuralWalker<'_, '_> {
             identity: &'walk ReferenceBindingId,
             remaining: usize,
             remaining_name_bytes: usize,
+            has_affine_leaf: bool,
             leaves: Vec<CheckerSnapshotLeaf>,
         }
         impl Builder<'_, '_, '_> {
@@ -9362,6 +9364,21 @@ impl StructuralWalker<'_, '_> {
                         let PlainNameIdentity::Lexical(source) = names.get(&root)? else { return None; };
                         CheckerSnapshotOperand::Binding(source.clone())
                     }
+                    ScalarExpression::Binary { .. } if is_integer_type(ty) => {
+                        let (operator, [(left, left_literal), (right, right_literal)]) =
+                            self.walker.simple_integer_operation(root, expression, false)?;
+                        let (source, literal, source_on_left) = match (left_literal, right_literal) {
+                            (None, Some(literal)) => (left, literal, true),
+                            (Some(literal), None) => (right, literal, false),
+                            _ => return None,
+                        };
+                        let PlainNameFacts::Prepared(names) = &self.walker.plain_names else { return None; };
+                        let PlainNameIdentity::Lexical(source) = names.get(&source)? else { return None; };
+                        self.has_affine_leaf = true;
+                        CheckerSnapshotOperand::Affine {
+                            source: source.clone(), operator, literal: literal.into_owned(), source_on_left,
+                        }
+                    }
                     _ => return None,
                 };
                 let index = self.leaves.len();
@@ -9372,9 +9389,10 @@ impl StructuralWalker<'_, '_> {
             }
         }
         let ScalarBindingOutput::Evaluate(expression) = binding.output_source(0) else { return None; };
-        let mut builder = Builder { walker: self, declarations, identity, remaining: 65, remaining_name_bytes: 4096, leaves: Vec::new() };
+        let mut builder = Builder { walker: self, declarations, identity, remaining: 65, remaining_name_bytes: 4096,
+            has_affine_leaf: false, leaves: Vec::new() };
         let root = builder.node(expression, root, &binding.declared_type, 0)?;
-        Some(CheckerSnapshotShape { root, leaves: builder.leaves.into_boxed_slice() })
+        Some(CheckerSnapshotShape { has_affine_leaf: builder.has_affine_leaf, root, leaves: builder.leaves.into_boxed_slice() })
     }
 
     fn block_item(

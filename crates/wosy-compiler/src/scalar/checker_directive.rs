@@ -155,6 +155,7 @@ pub(super) enum CheckerAggregateProjection {
 #[cfg(feature = "internal-checker")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct CheckerSnapshotShape {
+    pub(super) has_affine_leaf: bool,
     pub(super) root: CheckerSnapshotNode,
     pub(super) leaves: Box<[CheckerSnapshotLeaf]>,
 }
@@ -183,6 +184,12 @@ pub(super) struct CheckerSnapshotLeaf {
 pub(super) enum CheckerSnapshotOperand {
     Binding(ReferenceBindingId),
     Literal(BigInt),
+    Affine {
+        source: ReferenceBindingId,
+        operator: super::BinaryOperator,
+        literal: BigInt,
+        source_on_left: bool,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
