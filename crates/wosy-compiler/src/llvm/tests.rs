@@ -12267,3 +12267,56 @@ if (scoped(false) != 33) { core.system_panic(); };
         }
     }
 }
+
+#[test]
+fn widened_owning_array_roundtrip_preserves_qualified_original_pair() {
+    let text = "%%start
+u8[](u8[]) identity = fn(values) { values };
+u8[](u8[]) relay = fn(values) { identity(values) };
+u64() two = fn() { u8[] bytes = [11, 13]; bytes = relay(bytes); core.array_len(&bytes) };
+u64() three = fn() { u8[] bytes = [3, 5, 7]; bytes = relay(bytes); core.array_len(&bytes) };
+if (two() != 2) { core.system_panic(); };
+if (three() != 3) { core.system_panic(); };
+%%end";
+    let exposed = text.replace("if (two()", "unit(u64) ordinary = fn(count) { u8[count] array; array = relay(array); }; ordinary(1);\nif (two()");
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        for (closed, text) in [(true, text), (false, exposed.as_str())] {
+            let prepared = prepare_initializer_test(text, layout);
+            let checked = analyze_scalar_build(&prepared);
+            assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+            let source = &prepared.project().modules[0].source;
+            for (project, emitted) in [(false, emit_scalar_build_single_module_llvm(&checked)),
+                (true, emit_scalar_build_project_llvm(&checked))]
+            {
+                if !closed {
+                    assert!(matches!(emitted, Err(error) if error.contains("widened array move requires a closed exact owning roundtrip")));
+                    continue;
+                }
+                let llvm = emitted.unwrap().to_text();
+                let relay = self_tail_test_symbol(source, project, "relay");
+                let identity = self_tail_test_symbol(source, project, "identity");
+                let callee = |symbol| llvm.split_once(&format!("define internal {{ ptr, i64 }} @{symbol}({{ ptr, i64 }} %values)"))
+                    .unwrap_or_else(|| panic!("missing closed owning signature: {llvm}")).1.split_once("\n}").unwrap().0;
+                assert!(callee(&identity).contains("ret { ptr, i64 } %values"));
+                assert!(callee(&relay).contains(&format!("call {{ ptr, i64 }} @{identity}({{ ptr, i64 }} %values)")));
+                for (name, length) in [("two", 2), ("three", 3)] {
+                    let body = self_tail_test_body(&llvm, "i64", &self_tail_test_symbol(source, project, name));
+                    assert_eq!(body.matches("call ptr @__wosy_core_alloc(").count(), 1, "{body}");
+                    assert_eq!(body.matches("call void @__wosy_core_free(").count(), 1, "{body}");
+                    assert!(body.contains("insertvalue { ptr, i64 } undef, ptr %allocation, 0")
+                        && body.contains(&format!("insertvalue {{ ptr, i64 }} %array_argument_backing, i64 {length}, 1"))
+                        && body.contains(&format!("call {{ ptr, i64 }} @{relay}({{ ptr, i64 }} %array_argument)"))
+                        && body.contains("call void @__wosy_core_free(ptr %array_descriptor_backing)")
+                        && body.contains("ret i64 %array_descriptor_extent") && !body.contains("alloca ptr"), "{body}");
+                }
+                if let Some(out) = std::env::var_os("WOSY_WIDENED_OWNING_ROUNDTRIP_IR_DIR") {
+                    let target = if layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
+                    let route = if project { "project" } else { "standalone" };
+                    let controlled = llvm.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);
+                    assert_ne!(controlled, llvm);
+                    std::fs::write(std::path::PathBuf::from(out).join(format!("{target}-{route}-control.ll")), controlled).unwrap();
+                }
+            }
+        }
+    }
+}

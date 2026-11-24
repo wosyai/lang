@@ -429,9 +429,20 @@ pub(super) fn emit_array_descriptor_call<'ctx>(
         let [EmitValue::Basic(BasicValueEnum::PointerValue(base))] = values else {
             return Err("checked array rebind requires one backing pointer".into());
         };
-        let length_slot = *state.runtime_array_lengths.get(name).ok_or("missing checked array rebind extent slot")?;
-        let length = state.builder.build_load(context.i64_type(), length_slot, "array_argument_extent")
-            .map_err(builder_error)?;
+        let length = if state.aggregate.as_ref().and_then(|aggregate| aggregate.plan.widened_owning_roundtrip)
+            .is_some_and(|(call, _, owner)| call == ordinal && owner == declaration)
+        {
+            let Some(&(owner, LocalRuntimeExtent::WidenedLiteral(length), true)) = state.local_runtime_extents.get(base)
+            else { return Err("widened roundtrip argument has no current extent".into()); };
+            if owner != declaration || state.storage.get(name).is_none_or(|(backing, _)| backing != base)
+                || state.runtime_array_owners.get(name) != Some(&true)
+                || state.runtime_array_allocations.get(name) != Some(&true)
+            { return Err("widened roundtrip argument changed its exact live owner".into()); }
+            length.into()
+        } else {
+            let length_slot = *state.runtime_array_lengths.get(name).ok_or("missing checked array rebind extent slot")?;
+            state.builder.build_load(context.i64_type(), length_slot, "array_argument_extent").map_err(builder_error)?
+        };
         let pair = state.builder.build_insert_value(array_descriptor_type(context).get_undef(), *base,
             0, "array_argument_backing").map_err(builder_error)?.into_struct_value();
         let pair = state.builder.build_insert_value(pair, length, 1, "array_argument").map_err(builder_error)?
@@ -887,6 +898,18 @@ pub(super) fn install_literal_array_replacement<'ctx>(
         };
         if pair.get_type() != array_descriptor_type(context) {
             return Err("invalid returned checked array descriptor".into());
+        }
+        if let Some((_, _, owner)) = aggregate.plan.widened_owning_roundtrip.filter(|(ordinal, _, _)| *ordinal == call) {
+            let (previous, ty) = state.storage.get(name).cloned().ok_or("missing widened roundtrip backing")?;
+            if !matches!(state.local_runtime_extents.get(&previous),
+                Some((declaration, LocalRuntimeExtent::WidenedLiteral(_), true)) if *declaration == owner)
+            { return Err("widened roundtrip installation changed its owner".into()); }
+            let base = state.builder.build_extract_value(*pair, 0, "array_descriptor_backing").map_err(builder_error)?.into_pointer_value();
+            let count = state.builder.build_extract_value(*pair, 1, "array_descriptor_extent").map_err(builder_error)?.into_int_value();
+            state.local_runtime_extents.remove(&previous);
+            state.local_runtime_extents.insert(base, (owner, LocalRuntimeExtent::WidenedLiteral(count), true));
+            state.storage.insert(name.to_owned(), (base, ty));
+            return Ok(());
         }
         let (backing, _) = state.storage.get(name).ok_or("missing checked array rebind backing slot")?;
         let length = *state.runtime_array_lengths.get(name).ok_or("missing checked array rebind length slot")?;

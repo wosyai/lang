@@ -375,6 +375,7 @@ enum ExpressionReadMode {
     DereferenceOperand,
     ArrayLengthArgument,
     WidenedBorrowAddress(ByteSpan),
+    WidenedOwningRoundtrip(ByteSpan),
 }
 
 const MAX_JOINED_REBORROW_PARENTS: usize = 4;
@@ -2043,7 +2044,11 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         address = self.cursor;
                     }
                     let read = self.cursor;
-                    self.move_value(argument, scope, ordinal)?;
+                    let exact_widened_move = matches!(read_mode, ExpressionReadMode::WidenedOwningRoundtrip(owner)
+                        if matches!(argument, ScalarExpression::Name { span, .. }
+                            if matches!(self.prepared_name_identity(ordinal, *span),
+                                Ok(Some(PlainNameIdentity::Lexical(binding))) if binding.declaration_span == owner)));
+                    self.move_value_with_widened_receipt(argument, scope, ordinal, exact_widened_move)?;
                     let parameter = signature.and_then(|signature| signature.parameters.get(position));
                     if matches!(parameter, Some(ScalarType::RawPointer(_))) {
                         raw_arguments.push(position);
@@ -5184,7 +5189,9 @@ impl<'a> ReferenceFlowBuilder<'a> {
                                 target: ResolvedCallTarget::Core(CoreOperationId::ArrayLen), argument_points, ..
                             } if matches!(argument_points.as_slice(), [borrow] if
                                 matches!(&self.cfg.points[borrow.0].kind, CfgPointKind::Borrow { place, .. }
-                                    if place.projections.is_empty() && self.aggregate_facts.allocations.get(&place.binding)
+                                    if place.projections.is_empty() && (self.aggregate_result.widened_owning_roundtrip.is_some_and(|(_, _, owner)|
+                                        owner == place.binding.declaration_span)
+                                    || self.aggregate_facts.allocations.get(&place.binding)
                                         .is_some_and(|bind| {
                                             (self.aggregate_facts.literal_array_write.is_some()
                                                 && self.aggregate_facts.literal_array_bind.is_some_and(|allocation| allocation.bind == *bind))
@@ -5196,7 +5203,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                                                 && self.aggregate_facts.array_installs.first_key_value().is_some_and(|(install, _)|
                                                     matches!(&self.cfg.points[install.0].kind, CfgPointKind::Assign { target, .. }
                                                         if target.binding == place.binding)))
-                                        }))))
+                                        })))))
                         {
                             // Only pending authority: exact receipt replay and the
                             // all-use transported ABI must close this occurrence
@@ -5285,10 +5292,46 @@ impl<'a> ReferenceFlowBuilder<'a> {
                                 .is_some_and(|(source, target)| aggregate::same_runtime_array_type(source, target)))
                             .then_some((destination, source.declaration_span, target.declaration_span))
                     })();
+                    let widened_roundtrip = (|| {
+                        let owners = self.widened_arrays.as_ref()?;
+                        if scope != ReferenceScopeId(0) || !self.generic_parameters.is_empty()
+                            || item_index != 1 || region.items.len() != 3
+                            || !matches!(calls.boundary.root_outputs.as_slice(), [output] if output.ty == ScalarType::U64)
+                        { return None; }
+                        let [_, _, BlockItem { kind: BlockItemKind::FinalOutput(observe), .. }] =
+                            region.items.as_slice() else { return None };
+                        let [_, _, ScalarBlockItem::Expression(observation)] = block.items.as_slice() else { return None };
+                        if !matches!(self.call_target(observation, observe.expression),
+                            Ok(ResolvedCallTarget::Core(CoreOperationId::ArrayLen))) { return None; }
+                        let ([target], [value @ ScalarExpression::Call { arguments, .. }]) =
+                            (assignment.targets.as_slice(), assignment.values.as_slice()) else { return None };
+                        if !matches!(target.place, ScalarPlace::Name { .. }) { return None; }
+                        let [ScalarExpression::Name { span, .. }] = arguments.as_slice() else { return None };
+                        let occurrence = group.rhs_evaluations().next()?.expression;
+                        if calls.declared_unsafe_calls.contains(&occurrence.0)
+                            || !matches!(self.call_target(value, occurrence),
+                                Ok(ResolvedCallTarget::ModuleCallable { concrete: ConcreteCallSelection::Declaration, .. }))
+                        { return None; }
+                        let signature = calls.checked_call_signatures.get(&occurrence)?;
+                        if !aggregate::neutral_array_signature(&signature.parameters, &signature.outputs) { return None; }
+                        let destination = group.destinations().next()?.destination;
+                        let DirectDestinationIdentity::Existing(binding) = calls.prepared_direct_destination(destination)?
+                        else { return None; };
+                        let OccurrenceNode::Expression(argument) = calls.structure.edges.get(&(
+                            OccurrenceParent::Expression(occurrence), OccurrenceEdge::CallArgument(0)))? else { return None };
+                        (owners.contains(binding) && binding.block_span == block.span
+                            && matches!(self.prepared_name_identity(*argument, *span),
+                                Ok(Some(PlainNameIdentity::Lexical(source))) if source == binding))
+                            .then_some((occurrence, destination, binding.declaration_span))
+                    })();
                     let mut values = Vec::new();
                     for evaluation in group.rhs_evaluations() {
                         let value = &assignment.values[evaluation.position];
-                        let result = self.expression(value, scope, evaluation.expression)?;
+                        let mode = match widened_roundtrip {
+                            Some((call, _, owner)) if call == evaluation.expression => ExpressionReadMode::WidenedOwningRoundtrip(owner),
+                            _ => ExpressionReadMode::Ordinary,
+                        };
+                        let result = self.expression_with_read_mode(value, scope, evaluation.expression, mode)?;
                         let rhs_point = self.cursor.expect("evaluated assignment output");
                         self.move_value_with_widened_receipt(value, scope, evaluation.expression, widened_rebind.is_some())?;
                         values.push((result, rhs_point));
@@ -5430,7 +5473,10 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             };
                             let widened_rebind = widened_rebind.filter(|(destination, _, target)|
                                 *destination == slot.destination && *target == id.declaration_span);
-                            if widened_rebind.is_none() && self.widened_arrays.as_ref().is_some_and(|owners| owners.contains(&id))
+                            let widened_roundtrip = widened_roundtrip.filter(|(_, destination, owner)|
+                                *destination == slot.destination && *owner == id.declaration_span);
+                            if widened_rebind.is_none() && widened_roundtrip.is_none()
+                                && self.widened_arrays.as_ref().is_some_and(|owners| owners.contains(&id))
                                 && matches!(&assign, CfgPointKind::Assign { target, .. } if target.projections.is_empty())
                             {
                                 return Err(self.missing_context(*span, ReferenceAnalysisErrorReason::UnprovedWidenedArrayTransfer));
@@ -5440,6 +5486,9 @@ impl<'a> ReferenceFlowBuilder<'a> {
                                 self.proof_points.widened_rebind_points.get_or_insert_with(HashSet::new).insert(emitted.install);
                                 self.aggregate_result.widened_rebinds.insert(destination.0,
                                     aggregate::ClosedWidenedRebind { point: emitted.install, source, target });
+                            }
+                            if let Some((call, _, owner)) = widened_roundtrip {
+                                self.aggregate_result.widened_owning_roundtrip = Some((call, emitted.install, owner));
                             }
                             self.author_direct_assignment(emitted, existing_prepared && capture.is_none()
                                 && assignment.targets.len() == 1 && assignment.values.len() == 1);

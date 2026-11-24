@@ -1269,6 +1269,7 @@ pub(super) struct AggregateFlowResult {
     pub(super) borrowed_extent_forward: Option<(CfgPointId, OccurrenceOrdinal)>,
     pub(super) borrowed_extent_call: Option<(CfgPointId, OccurrenceOrdinal, ByteSpan, Option<ByteSpan>)>,
     pub(super) array_formal_extent_required: bool,
+    pub(super) widened_owning_roundtrip: Option<(OccurrenceOrdinal, CfgPointId, ByteSpan)>,
     pub(super) widened_borrowed_extent_calls: Vec<(CfgPointId, OccurrenceOrdinal, ByteSpan)>,
     array_conditional_forwarded: bool,
     pub(super) array_calls: BTreeMap<CfgPointId, (OccurrenceOrdinal, CfgPointId, ReferenceBindingId)>,
@@ -2986,6 +2987,7 @@ pub(crate) struct ClosedBody {
     pub(crate) array_descriptor_observer: Option<ByteSpan>,
     pub(crate) array_descriptor_forward: Option<usize>,
     // Call occurrence -> its sole exact lexical backing declaration and install.
+    pub(crate) widened_owning_roundtrip: Option<(usize, CfgPointId, ByteSpan)>,
     pub(crate) array_descriptor_rebinds: BTreeMap<usize, (ByteSpan, usize)>,
     pub(crate) replacement_index_observation: Option<usize>,
     pub(crate) array_descriptor_calls: BTreeSet<usize>,
@@ -6643,6 +6645,7 @@ fn closed_aggregates<'a>(
     let mut array_callsites = Vec::new();
     let mut literal_array_callers = Vec::new();
     let mut widened_return_requirements = Vec::new();
+    let mut widened_owning_roundtrips = Vec::new();
     let mut returned_extent_requirements = Vec::new();
     let mut formal_extent_requirements = Vec::new();
     let mut borrowed_extent_requirements = Vec::new();
@@ -6656,6 +6659,9 @@ fn closed_aggregates<'a>(
         if let Some(facts) = body.facts {
             // Borrow only completed caller proofs during this existing pass.
             // BTreeMap order preserves enrollment precedence at finalization.
+            if let Some((call, install, owner)) = facts.widened_owning_roundtrip {
+                widened_owning_roundtrips.push((key, body.source, call.0, install, owner));
+            }
             if let Some((_, output)) = facts.widened_literal_factory {
                 widened_return_requirements.push((key, body.source, output));
             }
@@ -7018,6 +7024,12 @@ fn closed_aggregates<'a>(
 
         seal_array_descriptor_identities(&ordinary, &returned_extent_requirements,
             &declarations, &array_descriptor_identities, &bodies, &mut result);
+        for &(key, source, call, install, owner) in &widened_owning_roundtrips {
+            let Some(plan) = result.bodies.get_mut(&key).filter(|plan|
+                plan.array_descriptor_rebinds.get(&call).is_some_and(|(actual, _)| *actual == owner))
+            else { return Err(format!("widened array move requires a closed exact owning roundtrip in {source:?}")); };
+            plan.widened_owning_roundtrip = Some((call, install, owner));
+        }
         seal_borrowed_extent_observers(&ordinary, &borrowed_extent_observers, &borrowed_extent_callers,
             &declarations, &bodies, &mut result, reservations.checked_access);
         for &(key, source, call, owner) in &widened_borrowed_extent_requirements {

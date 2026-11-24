@@ -273,6 +273,7 @@ fn runtime_allocation_access(
     let key = |span: wosy_syntax::ByteSpan| (span.start, span.end);
     let widened_rebind_points = plan.filter(|plan| !plan.widened_rebinds.is_empty())
         .map(|plan| plan.widened_rebinds.values().map(|rebind| rebind.point).collect::<std::collections::HashSet<_>>());
+    let widened_owning_install = plan.and_then(|plan| plan.widened_owning_roundtrip).map(|(_, install, _)| install);
     let mut proved_extent_writes = HashMap::new();
     if let (true, Some(nodes), Some(plan)) = (checked_access, body_nodes, plan) {
         // This exact install updates pointer and returned extent together.
@@ -302,7 +303,9 @@ fn runtime_allocation_access(
     for point in &reference_cfg.points {
         match &point.kind {
             CfgPointKind::Assign { target, rhs_point, .. } if target.projections.is_empty() => {
-                if widened_rebind_points.as_ref().is_some_and(|points| points.contains(&point.id)) {
+                if widened_rebind_points.as_ref().is_some_and(|points| points.contains(&point.id))
+                    || widened_owning_install == Some(point.id)
+                {
                     // This dominating existing-owner transfer re-keys the
                     // original pointer and extent, rather than storing either
                     // into an independently mutable slot.
