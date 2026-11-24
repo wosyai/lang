@@ -3308,7 +3308,7 @@ pub(super) struct PartitionedCallProof<'a> {
 #[derive(Clone, Copy)]
 pub(super) enum PartitionedProofGoal<'a> {
     Literal(IntegerRelation, &'a BigInt),
-    EntryEquality,
+    EntryEquality(usize),
 }
 
 #[cfg(feature = "internal-checker")]
@@ -3380,17 +3380,26 @@ fn named_pair_coverage_does_not_confuse_marginals_with_rectangular_coverage() {
 }
 
 #[cfg(feature = "internal-checker")]
-pub(super) fn verify_named_pair_literal_return<'a>(
+pub(super) fn verify_named_pair_return<'a>(
     producer: &'a FunctionCallSites, returned: &ActualCallResult, guards: &[IntegerSet; 2],
-    relation: IntegerRelation, bound: &BigInt, work: &mut usize,
+    goal: PartitionedProofGoal<'_>, work: &mut usize,
 ) -> Option<PartitionedCallProof<'a>> {
     let ActualCallResult::PartitionedIntegerPair(pair) = returned else { return None; };
     if pair.caller_axes != [0, 1] { return None; }
     let [first, second] = producer.boundary.checker_parameter_bindings.as_deref()? else { return None; };
     let [left, right] = producer.boundary.parameters.as_slice() else { return None; };
+    let [result] = producer.boundary.results.as_slice() else { return None; };
+    if let PartitionedProofGoal::EntryEquality(slot) = goal {
+        if producer.boundary.parameters.get(slot)?.ty != result.ty { return None; }
+    }
     let mut applicable = false;
     'pieces: for piece in &pair.pieces {
         if piece.anchor != 0 { return None; }
+        if matches!(&piece.output, IntegerPairPartitionOutput::InputAlias(slot)
+            if producer.boundary.parameters.get(*slot).is_none_or(|entry| entry.ty != result.ty))
+        {
+            return None;
+        }
         let mut cells = [Rc::clone(&piece.inputs[0]), Rc::clone(&piece.inputs[1])];
         let cost = |axis: usize| cells[axis].interval_count().checked_add(guards[axis].interval_count());
         charge_call_work(work, 4usize.checked_add(cost(0)?)?.checked_add(cost(1)?)?)?;
@@ -3402,22 +3411,43 @@ pub(super) fn verify_named_pair_literal_return<'a>(
             }
         }
         applicable = true;
-        let returned = match &piece.output {
-            IntegerPairPartitionOutput::Singleton(values) => {
+        let constrain = |selected: &mut Rc<IntegerSet>, relation: IntegerRelation, bound: &BigInt, work: &mut usize| {
+            charge_call_work(work, selected.interval_count().checked_mul(2)?.checked_add(1)?)?;
+            let rejected = selected.keep_relation(relation, bound);
+            let Some((first, _)) = rejected.extremes() else { return Some(None); };
+            let example = first.clone();
+            *selected = Rc::new(rejected);
+            Some(Some(example))
+        };
+        let unequal = || IntegerRelation::from_operator(&BinaryOperator::NotEqual);
+        let returned = match (goal, &piece.output) {
+            (PartitionedProofGoal::Literal(relation, bound), IntegerPairPartitionOutput::Singleton(values)) => {
                 let singleton = values.singleton_value()?;
                 if relation.accepts(singleton.cmp(bound)) { continue; }
                 singleton.clone()
             }
-            IntegerPairPartitionOutput::InputAlias(slot) => {
-                let selected = cells.get_mut(*slot)?;
-                charge_call_work(work, selected.interval_count().checked_mul(2)?.checked_add(1)?)?;
-                let rejected = selected.keep_relation(relation.complement(), bound);
-                let Some((example, _)) = rejected.extremes() else { continue; };
-                let returned = example.clone();
-                *selected = Rc::new(rejected);
+            (PartitionedProofGoal::Literal(relation, bound), IntegerPairPartitionOutput::InputAlias(slot)) => {
+                let Some(example) = constrain(cells.get_mut(*slot)?, relation.complement(), bound, work)? else { continue; };
+                example
+            }
+            (PartitionedProofGoal::EntryEquality(slot), IntegerPairPartitionOutput::Singleton(values)) => {
+                let singleton = values.singleton_value()?;
+                if constrain(cells.get_mut(slot)?, unequal()?, singleton, work)?.is_none() { continue; }
+                singleton.clone()
+            }
+            (PartitionedProofGoal::EntryEquality(slot), IntegerPairPartitionOutput::InputAlias(output)) => {
+                if slot == *output { continue; }
+                let (first, last) = cells.get(*output)?.extremes()?;
+                let old = cells.get(slot)?;
+                // Distinct independent axes can agree everywhere only
+                // when they are equal singletons. Fix a realizable result
+                // coordinate before cutting the old coordinate.
+                let returned = if old.singleton_value() == Some(first) { last } else { first }.clone();
+                if constrain(cells.get_mut(slot)?, unequal()?, &returned, work)?.is_none() { continue; }
+                *cells.get_mut(*output)? = Rc::new(IntegerSet::singleton(&returned));
                 returned
             }
-            IntegerPairPartitionOutput::InputAffine(..) => return None,
+            (_, IntegerPairPartitionOutput::InputAffine(..)) => return None,
         };
         return Some(PartitionedCallProof { applicable, covers_guard: false, failure: Some(SymbolicLiteralFailure {
             output: piece.span, returned,
@@ -3446,6 +3476,7 @@ pub(super) fn verify_partitioned_call_return<'a>(
     producer: &'a FunctionCallSites, returned: &ActualCallResult, domain: &IntegerSet,
     eligible_for_elision: bool, goal: PartitionedProofGoal<'_>, mut work: Option<&mut usize>,
 ) -> Option<PartitionedCallProof<'a>> {
+    if matches!(goal, PartitionedProofGoal::EntryEquality(slot) if slot != 0) { return None; }
     let ActualCallResult::PartitionedInteger(pieces) = returned else { return None; };
     let [binding] = producer.boundary.checker_parameter_bindings.as_deref()? else { return None; };
     let [parameter] = producer.boundary.parameters.as_slice() else { return None; };
@@ -3474,15 +3505,15 @@ pub(super) fn verify_partitioned_call_return<'a>(
                 let value = output.singleton_value()?;
                 (!relation.accepts(value.cmp(bound))).then(|| (Rc::clone(&input), Cow::Borrowed(value)))
             }
-            (PartitionedProofGoal::EntryEquality, IntegerPartitionOutput::Singleton(output)) => {
+            (PartitionedProofGoal::EntryEquality(_), IntegerPartitionOutput::Singleton(output)) => {
                 let value = output.singleton_value()?;
                 if input.singleton_value() == Some(value) { None } else {
                     let unequal = IntegerRelation::from_operator(&BinaryOperator::NotEqual)?;
                     Some((Rc::new(input.keep_relation(unequal, value)), Cow::Borrowed(value)))
                 }
             }
-            (PartitionedProofGoal::EntryEquality, IntegerPartitionOutput::InputAlias) => None,
-            (PartitionedProofGoal::EntryEquality, IntegerPartitionOutput::InputAffine(transform)) => {
+            (PartitionedProofGoal::EntryEquality(_), IntegerPartitionOutput::InputAlias) => None,
+            (PartitionedProofGoal::EntryEquality(_), IntegerPartitionOutput::InputAffine(transform)) => {
                 let meter = work.as_deref_mut().unwrap_or(&mut relational_work);
                 charge_call_work(meter, 1usize.checked_add(input.interval_count().checked_mul(2)?)?)?;
                 let violating = if !transform.reflected && transform.offset.sign() == num_bigint::Sign::NoSign {

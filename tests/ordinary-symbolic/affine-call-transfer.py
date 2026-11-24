@@ -1639,6 +1639,22 @@ cases.extend([
         1,b"proof obligation failed"),
 ])
 
+symbolic_named_pair_old_slot = """%%start
+    i16(i16, i16) leaf = fn(first, second) { if (second < 0) { 7 } else { first } };
+    i16(i16, i16) producer = fn(first, second) { i16 result = leaf(first, second); result };
+    proof bounded for producer(selected, before) -> (out)
+        where (selected == 3 && before >= 0) ensures (out == core.old(before)) {}
+%%end"""
+cases.extend([
+    ("ordinary-named-symbolic-pair-old-cross-refuted",symbolic_named_pair_old_slot,1,b"proof obligation failed"),
+    ("ordinary-named-symbolic-pair-old-cross-proved",symbolic_named_pair_old_slot.replace("before >= 0","before == 3"),
+        0,b""),
+    ("ordinary-named-symbolic-pair-old-own-proved",symbolic_named_pair_old_slot.replace("core.old(before)","core.old(selected)"),
+        0,b""),
+    ("ordinary-named-symbolic-pair-old-constant-refuted",symbolic_named_pair_old_slot.replace("before >= 0","before < 0"),
+        1,b"proof obligation failed"),
+])
+
 stacked_named_exact_pair = f"""%%start
     i16(i8, i16) leaf = fn(tag, value) {{ if (tag > 0) {{ 42 }} else {{ if (value == 300) {{ 9 }} else {{ value }} }} }};
     i16(i8, i16) producer = fn(tag, value) {{ i16 result = leaf(tag, value); result }};
@@ -1755,6 +1771,8 @@ cases.extend([
         b"proof obligation failed"),
 ])
 proof_diagnostic_notes = {
+    "ordinary-named-symbolic-pair-old-cross-refuted": b"symbolic call can return 3",
+    "ordinary-named-symbolic-pair-old-constant-refuted": b"symbolic call can return 7",
     "ordinary-named-symbolic-pair-alias-refuted": b"symbolic call can return 12",
     "ordinary-named-symbolic-pair-constant-refuted": b"symbolic call can return 300",
     "exact-startup-named-stacked-pair-old-second-refuted": b"call returned 42",

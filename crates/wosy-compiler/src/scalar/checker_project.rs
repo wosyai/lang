@@ -4050,7 +4050,7 @@ impl SelectedSymbolicProof<'_, '_> {
         source: &SourceIdentity, effects: &mut OrderedFailures, runtime: SymbolicProofRuntime<'_>,
         group: &MainFlowProofTarget<'_>,
     ) -> Result<Option<bool>, ProjectCheck> {
-        use super::checker_flow::{covers_all_named_pair_inputs, verify_named_pair_literal_return, charge_call_work};
+        use super::checker_flow::{covers_all_named_pair_inputs, verify_named_pair_return, charge_call_work, PartitionedProofGoal};
         let MainFlowProofCases::Bare { first, rest } = &group.cases else { return Err(ProjectCheck::Unsupported); };
         let [left, right] = body.boundary.parameters.as_slice() else { return Err(ProjectCheck::Unsupported); };
         let [output] = body.boundary.results.as_slice() else { return Err(ProjectCheck::Unsupported); };
@@ -4068,7 +4068,14 @@ impl SelectedSymbolicProof<'_, '_> {
             .ok_or(ProjectCheck::Unsupported)?;
         let mut plans = Vec::new();
         for case in std::iter::once(first).chain(rest) {
-            let bound = case.bound.literal().ok_or(ProjectCheck::Unsupported)?;
+            let goal = match case.bound {
+                MainFlowProofBound::Literal(bound) => PartitionedProofGoal::Literal(case.relation, bound),
+                MainFlowProofBound::Entry(slot)
+                    if body.boundary.parameters.get(slot).is_some_and(|entry| entry.ty == output.ty)
+                        && Some(case.relation) == IntegerRelation::from_operator(&BinaryOperator::Equal) =>
+                    PartitionedProofGoal::EntryEquality(slot),
+                _ => return Err(ProjectCheck::Unsupported),
+            };
             if case.proof_source != source || case.guard.domain.is_some() || case.guard.comparisons.len() > 2 {
                 return Err(ProjectCheck::Unsupported);
             }
@@ -4081,7 +4088,7 @@ impl SelectedSymbolicProof<'_, '_> {
                 *seen = true;
                 domains[guard.slot] = domains[guard.slot].keep_relation(guard.relation, guard.bound);
             }
-            plans.push((case, bound, domains));
+            plans.push((case, goal, domains));
         }
         let cursor = ExactCallCursor::named_pair_root(body, &output.ty, full.clone()).ok_or(ProjectCheck::Unsupported)?;
         let mut private_effects = OrderedFailures::default();
@@ -4093,8 +4100,8 @@ impl SelectedSymbolicProof<'_, '_> {
             return Err(ProjectCheck::Unsupported);
         }
         let mut applicable = false;
-        for (case, bound, guards) in plans {
-            let checked = verify_named_pair_literal_return(body, &returned, &guards, case.relation, bound, &mut work)
+        for (case, goal, guards) in plans {
+            let checked = verify_named_pair_return(body, &returned, &guards, goal, &mut work)
                 .ok_or(ProjectCheck::Unsupported)?;
             applicable |= checked.applicable;
             if let Some(failure) = checked.failure {
@@ -4152,7 +4159,7 @@ impl SelectedSymbolicProof<'_, '_> {
                 Some(MainFlowAuthoredShows::Entry { span, slot: 0, relation })
                     if parameter.ty == output.ty
                         && Some(*relation) == IntegerRelation::from_operator(&BinaryOperator::Equal) =>
-                    (Some((*span, PartitionedProofGoal::EntryEquality)), &[][..]),
+                    (Some((*span, PartitionedProofGoal::EntryEquality(0))), &[][..]),
                 Some(MainFlowAuthoredShows::CallingSequence { steps, .. }) =>
                     (None, steps.as_slice()),
                 Some(_) => return Err(ProjectCheck::Unsupported),
@@ -4167,7 +4174,7 @@ impl SelectedSymbolicProof<'_, '_> {
                 MainFlowProofBound::Literal(bound) => PartitionedProofGoal::Literal(case.relation, bound),
                 MainFlowProofBound::Entry(0) if !batched && parameter.ty == output.ty
                     && Some(case.relation) == IntegerRelation::from_operator(&BinaryOperator::Equal) =>
-                        PartitionedProofGoal::EntryEquality,
+                        PartitionedProofGoal::EntryEquality(0),
                 _ => return Err(ProjectCheck::Unsupported),
             };
             if case.proof_source != source || case.guard.domain.is_some()
@@ -4219,7 +4226,7 @@ impl SelectedSymbolicProof<'_, '_> {
                 let next = citation.map(|peer| by_declaration.get(&peer).copied().ok_or(ProjectCheck::Unsupported)).transpose()?;
                 let goal = match goal {
                     PartitionedProofGoal::Literal(relation, bound) => Some((*relation, *bound)),
-                    PartitionedProofGoal::EntryEquality => None,
+                    PartitionedProofGoal::EntryEquality(_) => None,
                 };
                 peer_nodes.push(CallingPeerNode {
                     state: if step.is_none() && shows.is_empty() && goal.is_some() {
@@ -16535,6 +16542,41 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
             assert_eq!(combined.diagnostics.len(), 2);
             assert!(combined.diagnostics.iter().all(|diagnostic| diagnostic.invocation.outer_call.is_none()));
         }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordered_named_symbolic_pair_old_slot_distinguishes_independent_coordinates() {
+        let app = source("src/main.w", "ordered-symbolic-proof-exact-pair-old-slot");
+        let text = r#"%%start
+            i16(i16, i16) leaf = fn(first, second) { if (second < 0) { 7 } else { first } };
+            i16(i16, i16) producer = fn(first, second) { i16 result = leaf(first, second); result };
+            proof bounded for producer(selected, before) -> (out)
+                where (selected == 3 && before >= 0) ensures (out == core.old(before)) {}
+        %%end"#;
+        let run = |text: &str| {
+            let (_, proof) = crate::parse_proof_source(app.clone(), text.to_owned(), &[]).ok().unwrap();
+            check_loaded_ordered_proof_diagnostics_in_scope::<true>(
+                Vec::new(), vec![(proof, Vec::new())], vec![app.clone()], inputs(),
+                ScalarCheckerScope::CurrentPackage, Vec::new(),
+            ).unwrap()
+        };
+        let result = run(text).symbolic_diagnostic.unwrap();
+        assert_eq!(result.returned, BigInt::from(3));
+        assert!(result.witness.intervals_at(0, 0).unwrap().eq([(&BigInt::from(3), &BigInt::from(3))]));
+        assert!(result.witness.intervals_at(0, 1).unwrap().eq([
+            (&BigInt::from(0), &BigInt::from(2)), (&BigInt::from(4), &BigInt::from(32767)),
+        ]));
+        assert!(run(&text.replace("before >= 0", "before == 3")).symbolic_diagnostic.is_none());
+        assert!(run(&text.replace("core.old(before)", "core.old(selected)")).symbolic_diagnostic.is_none());
+        let constant = run(&text.replace("before >= 0", "before < 0")).symbolic_diagnostic.unwrap();
+        assert_eq!(constant.returned, BigInt::from(7));
+        assert!(constant.witness.intervals_at(0, 1).unwrap().eq([(&BigInt::from(-32768), &BigInt::from(-1))]));
+        let alternate = run(&text.replace("selected == 3 && before >= 0", "selected >= 3 && before == 3"))
+            .symbolic_diagnostic.unwrap();
+        assert_eq!(alternate.returned, BigInt::from(32767));
+        assert!(alternate.witness.intervals_at(0, 0).unwrap().eq([(&BigInt::from(32767), &BigInt::from(32767))]));
+        assert!(alternate.witness.intervals_at(0, 1).unwrap().eq([(&BigInt::from(3), &BigInt::from(3))]));
     }
 
     #[cfg(feature = "internal-checker")]
