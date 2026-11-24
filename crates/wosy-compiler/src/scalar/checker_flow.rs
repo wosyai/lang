@@ -1434,6 +1434,8 @@ struct IntegerRoots<'a> {
     #[cfg(feature = "internal-checker")]
     allow_ordinary_affine_overwrites: bool,
     #[cfg(feature = "internal-checker")]
+    allow_ordinary_contextual_places: bool,
+    #[cfg(feature = "internal-checker")]
     ordinary_local_work: Option<usize>,
     #[cfg(feature = "internal-checker")]
     ordinary_comparison_work: Option<usize>,
@@ -1464,6 +1466,22 @@ impl<'a> IntegerRoots<'a> {
 pub(super) struct IntegerInputs(Vec<IntegerRow>);
 
 impl IntegerInputs {
+    #[cfg(feature = "internal-checker")]
+    fn append_ordinary_copy(&mut self, axis: usize, roots: &mut IntegerRoots<'_>) -> Option<()> {
+        for row in &self.0 {
+            let work = if row.affine.is_some() {
+                roots.affine_work.as_mut()?
+            } else {
+                roots.ordinary_local_work.get_or_insert(0)
+            };
+            charge_call_work(work, row.equal_axes().len().checked_add(2)?)?;
+        }
+        for row in &mut self.0 {
+            row.append_alias(axis, Rc::clone(&row[axis]));
+        }
+        Some(())
+    }
+
     // Only visited from actual copy/relational transfer sites, never from the
     // generic drive loop. Affine rows are already metered by that lane.
     #[cfg(feature = "internal-checker")]
@@ -3768,6 +3786,9 @@ fn run_integer_callable<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool,
         #[cfg(feature = "internal-checker")]
         allow_ordinary_affine_overwrites: Authored::ALLOW_ORDINARY_INTEGER_LOCALS,
         #[cfg(feature = "internal-checker")]
+        allow_ordinary_contextual_places: Authored::ALLOW_ORDINARY_INTEGER_LOCALS
+            && calls.structure.has_ordinary_contextual_places(),
+        #[cfg(feature = "internal-checker")]
         ordinary_comparison_work: (Authored::ALLOW_ORDINARY_INTEGER_LOCALS
             && calls.structure.has_ordinary_predicates()).then_some(0),
         ..IntegerRoots::default()
@@ -4881,7 +4902,8 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                             if !roots.allow_ordinary_affine_overwrites
                                 || (axis < roots.parameters && roots.unit_pair_work.is_some())
                                 || !structure.checker_integer_literals.contains_key(&rhs)
-                                || structure.checker_contextual_occurrences.contains(&destination)
+                                || (structure.checker_contextual_occurrences.contains(&destination)
+                                    && !roots.allow_ordinary_contextual_places)
                             {
                                 return None;
                             }
@@ -4973,7 +4995,12 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                 }
                 if let Some(origin) = structure.checker_integer_call_locals.get(&(block, item.position)) {
                     let [receiver] = binding.receivers() else { return None; };
-                    if SUSPEND_CALL && suspend_integer && !matches!(origin.arguments.as_slice(), [(_, CheckerIntegerCallArgument::ContextualValue)]) {
+                    let contextual = matches!(origin.arguments.as_slice(), [(_, CheckerIntegerCallArgument::ContextualValue)]);
+                    #[cfg(feature = "internal-checker")]
+                    let ordinary_contextual = roots.allow_ordinary_contextual_places;
+                    #[cfg(not(feature = "internal-checker"))]
+                    let ordinary_contextual = false;
+                    if SUSPEND_CALL && suspend_integer && (!contextual || ordinary_contextual) {
                         *cursor = IntegerBlockCursor { block, next, depth, path, branches, terminal, #[cfg(feature = "internal-checker")] guard };
                         return Some(IntegerControl::PendingCall(ExactCallEffect::Scalar {
                             call: origin.call, binding: Some(&origin.binding), ty: &receiver.ty,
@@ -4983,14 +5010,14 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                     let signature = calls.checked_call_signatures.get(&origin.call)?;
                     let argument = actual_nested_argument(calls, origin.call, roots, &path, false, false, None);
                     #[cfg(feature = "internal-checker")]
-                    let argument = if matches!(origin.arguments.as_slice(), [(_, CheckerIntegerCallArgument::ContextualValue)]) {
+                    let argument = if contextual {
                         let NestedIntegerArgument::Single(Some(exact)) = argument else { return None; };
                         NestedIntegerArgument::ContextualValue(exact)
                     } else {
                         argument
                     };
                     #[cfg(not(feature = "internal-checker"))]
-                    if matches!(origin.arguments.as_slice(), [(_, CheckerIntegerCallArgument::ContextualValue)]) {
+                    if contextual {
                         return None;
                     }
                     #[cfg(feature = "internal-checker")]
@@ -5016,6 +5043,26 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                             return None;
                         }
                         let BindingInitialization::Outputs(outputs) = &binding.initialization else { return None; };
+                        #[cfg(feature = "internal-checker")]
+                        if roots.allow_ordinary_contextual_places
+                            && structure.checker_contextual_declarations.contains(&(block, item.position))
+                            && !structure.checker_integer_literals.contains_key(&outputs.primary)
+                        {
+                            let PlainNameIdentity::Lexical(source) = calls.prepared_plain_name(outputs.primary)? else { return None; };
+                            let (axis, ty) = roots.lookup(source)?;
+                            if ty != &receiver.ty || !outputs.secondary.is_empty()
+                                || structure.checked_types.expressions.get(&outputs.primary)? != ty
+                            {
+                                return None;
+                            }
+                            let identity = structure.checker_integer_locals.get(&(block, item.position))
+                                .filter(|prepared| *prepared == identity)?;
+                            // The prepared source denotes the still-active outer
+                            // place (or lexical value) before this declaration.
+                            path.append_ordinary_copy(axis, roots)?;
+                            roots.add(identity, &receiver.ty);
+                            continue;
+                        }
                         let value = if let Some(literal) = structure.checker_integer_literals.get(&outputs.primary) {
                             Rc::new(IntegerSet::singleton(literal))
                         } else {
@@ -5053,17 +5100,7 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                                 let (axis, ty) = roots.lookup(source)?;
                                 if ty != &receiver.ty { return None; }
                                 // Read the old binding before installing the new one.
-                                for row in &path.0 {
-                                    let work = if row.affine.is_some() {
-                                        roots.affine_work.as_mut()?
-                                    } else {
-                                        roots.ordinary_local_work.get_or_insert(0)
-                                    };
-                                    charge_call_work(work, row.equal_axes().len().checked_add(2)?)?;
-                                }
-                                for row in &mut path.0 {
-                                    row.append_alias(axis, Rc::clone(&row[axis]));
-                                }
+                                path.append_ordinary_copy(axis, roots)?;
                             }
                             super::reference::CheckerOrdinaryScalarLocalKind::BoolCall(call) => {
                                 if receiver.ty != ScalarType::Bool || !SUSPEND_CALL || !suspend_integer { return None; }
@@ -5088,6 +5125,26 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                             }
                         }
                         roots.add(&origin.binding, &receiver.ty);
+                        continue;
+                    }
+                }
+                #[cfg(feature = "internal-checker")]
+                if roots.allow_ordinary_contextual_places {
+                    if let Some(identity) = structure.checker_contextual_read_locals.get(&(block, item.position)) {
+                        let [receiver] = binding.receivers() else { return None; };
+                        let BindingInitialization::Outputs(outputs) = &binding.initialization else { return None; };
+                        if receiver.contextual_storage.is_some() || !outputs.secondary.is_empty()
+                            || !structure.checker_contextual_occurrences.contains(&outputs.primary)
+                        {
+                            return None;
+                        }
+                        let PlainNameIdentity::Lexical(source) = calls.prepared_plain_name(outputs.primary)? else { return None; };
+                        let (axis, ty) = roots.lookup(source)?;
+                        if ty != &receiver.ty || structure.checked_types.expressions.get(&outputs.primary)? != ty {
+                            return None;
+                        }
+                        path.append_ordinary_copy(axis, roots)?;
+                        roots.add(identity, &receiver.ty);
                         continue;
                     }
                 }
@@ -5638,6 +5695,8 @@ impl<'a> ExactCallCursor<'a> {
         {
             self.roots.allow_ordinary_integer_locals = allow_ordinary_integer_locals && !calls.structure.checker_ordinary_scalar_locals.is_empty();
             self.roots.allow_ordinary_affine_overwrites = allow_ordinary_integer_locals;
+            self.roots.allow_ordinary_contextual_places =
+                allow_ordinary_integer_locals && calls.structure.has_ordinary_contextual_places();
             if allow_ordinary_integer_locals && calls.structure.has_ordinary_predicates() {
                 self.roots.ordinary_comparison_work.get_or_insert(0);
             }

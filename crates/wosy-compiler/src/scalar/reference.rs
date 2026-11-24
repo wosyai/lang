@@ -6216,6 +6216,8 @@ pub(super) struct OccurrenceStructure {
     pub(super) blocks: Vec<BlockRegion>,
     pub(super) edges: HashMap<(OccurrenceParent, OccurrenceEdge), OccurrenceNode>,
     pub(super) checked_types: CheckedOccurrenceTypes,
+    #[cfg(feature = "internal-checker")]
+    pub(super) checker_contextual_declarations: HashSet<(BlockOrdinal, usize)>,
     #[cfg(any(test, feature = "internal-checker"))]
     pub(super) checker_contextual_occurrences: HashSet<OccurrenceOrdinal>,
     #[cfg(any(test, feature = "internal-checker"))]
@@ -6268,6 +6270,13 @@ impl OccurrenceStructure {
     #[cfg(feature = "internal-checker")]
     pub(super) fn has_ordinary_integer_operations(&self) -> bool {
         !self.checker_ordinary_scalar_locals.is_empty() || self.has_ordinary_predicates()
+            || self.has_ordinary_contextual_places()
+    }
+
+    #[cfg(feature = "internal-checker")]
+    pub(super) fn has_ordinary_contextual_places(&self) -> bool {
+        !self.checker_contextual_declarations.is_empty()
+            || !self.checker_contextual_occurrences.is_empty() || !self.checker_contextual_read_locals.is_empty()
     }
 
     #[cfg(feature = "internal-checker")]
@@ -6284,6 +6293,8 @@ impl OccurrenceStructure {
             checked_types: CheckedOccurrenceTypes::default(),
             #[cfg(any(test, feature = "internal-checker"))]
             checker_contextual_occurrences: HashSet::new(),
+            #[cfg(feature = "internal-checker")]
+            checker_contextual_declarations: HashSet::new(),
             #[cfg(any(test, feature = "internal-checker"))]
             checker_directives: HashMap::new(),
             #[cfg(feature = "internal-checker")]
@@ -7714,7 +7725,9 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
         names: &HashMap<OccurrenceOrdinal, PlainNameIdentity>,
     ) -> Option<CheckerOrdinaryScalarLocalKind> {
         let lexical = |ordinal| matches!(names.get(&ordinal), Some(PlainNameIdentity::Lexical(_)));
-        if lexical(source) { return Some(CheckerOrdinaryScalarLocalKind::Copy); }
+        if lexical(source) && (!matches!(expression, ScalarExpression::Contextual { .. }) || *ty == ScalarType::Bool) {
+            return Some(CheckerOrdinaryScalarLocalKind::Copy);
+        }
         if *ty == ScalarType::Bool {
             if let ScalarExpression::Boolean { value, .. } = expression {
                 return Some(CheckerOrdinaryScalarLocalKind::BoolLiteral(*value));
@@ -8757,6 +8770,13 @@ impl StructuralWalker<'_, '_> {
                     #[cfg(any(test, feature = "internal-checker"))]
                     if self.occurrence_typing.checker_directives_enabled() {
                         self.structure.checker_integer_locals.insert((position.block, position.item), id.clone());
+                        #[cfg(feature = "internal-checker")]
+                        if is_integer_type(&receiver.ty) && matches!(&initialization,
+                            BindingInitialization::Outputs(outputs) if outputs.secondary.is_empty()
+                                && self.structure.checked_types.expressions.get(&outputs.primary) == Some(&receiver.ty))
+                        {
+                            self.structure.checker_contextual_declarations.insert((position.block, position.item));
+                        }
                     }
                     #[cfg(not(any(test, feature = "internal-checker")))]
                     let _ = id;

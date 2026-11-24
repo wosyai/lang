@@ -811,6 +811,66 @@ cases.extend([
     ("exact-startup-bare-directive-reports-empty-narrow",directive_actual,145,b"DIRECT-NARROW"),
     ("hypothetical-directive-callee-require-refused",directive_impure,2,b"unsupported analysis"),
 ])
+context_unit = f"""%%start
+    unit(i8) keep = fn(entry) {{ core.narrow(entry >= 0, {report(152,"CONTEXT-UNIT-CUT")}); }};
+    unit(i8) check = fn(input) {{
+        i8 core.context.count = input;
+        keep(core.context.count);
+        core.require(input >= 0, {report(153,"CONTEXT-ALIAS-CUT")});
+        if (input == 2) {{
+            i8 core.context.count = core.context.count;
+            i8 saved = core.context.count;
+            core.context.count = 7;
+            core.require(saved == 2, {report(154,"CONTEXT-SNAPSHOT")});
+            core.require(core.context.count == 7, {report(155,"CONTEXT-INNER")});
+        }};
+        if (input == 2) {{ core.require(core.context.count == 2, {report(156,"CONTEXT-RESTORED")}); }};
+    }};
+    keep(0);
+    %%end"""
+context_integer = make(f"""
+    i8 core.context.count = input;
+    i8 other = affine(core.context.count);
+    if (other == 1) {{ core.require(core.context.count == 3, {report(157,"CONTEXT-INT-RESULT")}); }};
+""").replace("i8 value = affine(input);", "")
+context_affine_write = f"""%%start
+    unit(i8) check = fn(input) {{
+        {bounds("input",0,4)}
+        i8 mapped = 4 - input;
+        i8 core.context.count = mapped;
+        i8 saved = core.context.count;
+        core.context.count = 7;
+        if (input == 3) {{ core.require(saved == 1, {report(158,"CONTEXT-AFFINE-SNAPSHOT")}); }};
+        core.require(core.context.count == 7, {report(159,"CONTEXT-AFFINE-WRITE")});
+    }};
+    %%end"""
+context_bool_actual = f"""%%start
+    bool(i8) exactly = fn(entry) {{ if (entry == 3) {{ true }} else {{ false }} }};
+    unit(i8) check = fn(input) {{
+        i8 core.context.count = input;
+        bool matches = exactly(core.context.count);
+        core.require(matches, {report(160,"CONTEXT-BOOL-RESULT")});
+    }};
+    check(4);
+    %%end"""
+for name,program,correct,incorrect,code,label in [
+    ("context-symbolic-unit-projects-and-restores",context_unit,"core.context.count == 2,","core.context.count == 7,",156,b"CONTEXT-RESTORED"),
+    ("context-symbolic-integer-return",context_integer,"core.context.count == 3","core.context.count == 2",157,b"CONTEXT-INT-RESULT"),
+    ("context-affine-write-detaches-snapshot",context_affine_write,"saved == 1","saved == 7",158,b"CONTEXT-AFFINE-SNAPSHOT"),
+]:
+    cases.extend([(name,program,0,b""),(name+"-witness",program.replace(correct,incorrect),code,label)])
+cases.append(("exact-startup-contextual-input-to-bool-result",context_bool_actual,160,b"CONTEXT-BOOL-RESULT"))
+context_declaration_only = f"""%%start
+    unit(i8) check = fn(input) {{
+        i8 core.context.count = input;
+        if (input == 2) {{ core.require(input == 2, {report(161,"CONTEXT-DECLARATION-ONLY")}); }};
+    }};
+    %%end"""
+cases.extend([
+    ("ordinary-context-declaration-only-keeps-context",context_declaration_only,0,b""),
+    ("ordinary-context-declaration-only-still-reports",
+     context_declaration_only.replace("require(input == 2","require(input == 7"),161,b"CONTEXT-DECLARATION-ONLY"),
+])
 with tempfile.TemporaryDirectory(prefix="affine-calls-") as path:
     root=Path(path)
     (root/"src").mkdir()
@@ -818,7 +878,7 @@ with tempfile.TemporaryDirectory(prefix="affine-calls-") as path:
         (root/"wosy.toml").write_text(manifest.format(output=target))
         for scope in ("--main-flow-only","--declared-package"):
             for name,text,expected,stderr in cases:
-                included = scope == "--declared-package" or name in ("exact-startup-lexical-copy", "exact-startup-inline-arithmetic", "exact-startup-lexical-comparison", "exact-startup-bool-argument", "exact-startup-staged-bool-result", "exact-startup-direct-guard-skips-dead-call", "exact-startup-direct-guard-reached-call-reports", "exact-startup-bare-directive-reports-empty-narrow")
+                included = scope == "--declared-package" or name in ("exact-startup-lexical-copy", "exact-startup-inline-arithmetic", "exact-startup-lexical-comparison", "exact-startup-bool-argument", "exact-startup-staged-bool-result", "exact-startup-direct-guard-skips-dead-call", "exact-startup-direct-guard-reached-call-reports", "exact-startup-bare-directive-reports-empty-narrow", "exact-startup-contextual-input-to-bool-result")
                 code = expected if included else 0
                 expected_stderr = stderr if included else b""
                 (root/"src/main.w").write_text(text.strip()+"\n")

@@ -9328,6 +9328,70 @@ mod tests {
 
     #[cfg(feature = "internal-checker")]
     #[test]
+    fn scoped_context_declaration_is_prepared_without_a_context_read() {
+        let app = source("src/main.w", "context-declaration-only");
+        let program = format!(r#"%%start
+            unit(i8) check = fn(input) {{
+                i8 core.context.count = input;
+                core.require(input >= 0, {OUTPUT});
+            }};
+        %%end"#);
+        let prepared = prepare_checker_project(
+            vec![(declarations(&app, &program), Vec::new())], vec![app.clone()], inputs(),
+        ).unwrap();
+        let (project, calls) = prepared.parts();
+        let (module, item, _) = select_checked_root(project, &app, "check").unwrap();
+        let body = calls.function_body(module, item, None).unwrap();
+        let structure = &body.structure;
+        assert!(structure.checker_contextual_occurrences.is_empty());
+        assert!(structure.checker_contextual_read_locals.is_empty());
+        assert!(structure.checker_integer_call_locals.is_empty());
+        assert!(structure.checker_ordinary_scalar_locals.is_empty());
+        assert!(structure.checker_contextual_declarations.contains(&(structure.root, 0)));
+        assert!(structure.has_ordinary_contextual_places());
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordinary_contextual_projection_preserves_active_scope_and_witness_identity() {
+        let app = source("src/main.w", "ordinary-context-projection");
+        let inner = OUTPUT.replace(".code = 1", ".code = 51");
+        let outer = OUTPUT.replace(".code = 1", ".code = 52");
+        let program = format!(r#"%%start
+            unit(i8) keep = fn(entry) {{ core.narrow(entry >= 0, {OUTPUT}); }};
+            unit(i8) caller = fn(input) {{
+                i8 core.context.count = input;
+                keep(core.context.count);
+                core.require(input >= 0, {OUTPUT});
+                if (input == 2) {{
+                    i8 core.context.count = core.context.count;
+                    core.context.count = 7;
+                    core.require(core.context.count == 2, {inner});
+                }};
+                if (input == 2) {{ core.require(core.context.count == 7, {outer}); }};
+            }};
+            keep(0);
+        %%end"#);
+        let receipt = check_loaded_scalar_ordered_local_proof_contexts(
+            vec![(declarations(&app, &program), Vec::new())], Vec::new(), vec![app.clone()],
+            inputs(), ScalarCheckerScope::CurrentPackage, Vec::new(),
+        ).unwrap();
+        let [first, second] = receipt.directives.as_slice() else { panic!("expected the inner and restored outer witnesses"); };
+        assert_eq!(first.code(), &BigInt::from(51));
+        assert_eq!(second.code(), &BigInt::from(52));
+        let inner_axes = first.witness.axes().collect::<Vec<_>>();
+        let outer_axes = second.witness.axes().collect::<Vec<_>>();
+        assert_eq!((inner_axes.len(), outer_axes.len()), (3, 2));
+        assert_ne!(inner_axes[1], inner_axes[2]);
+        assert_eq!(inner_axes[1], outer_axes[1]);
+        let two = BigInt::from(2);
+        let seven = BigInt::from(7);
+        assert!(first.witness.intervals_at(0, 2).unwrap().eq([(&seven, &seven)]));
+        assert!(second.witness.intervals_at(0, 1).unwrap().eq([(&two, &two)]));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
     fn ordered_base_call_copies_exact_contextual_integer_into_callee_parameter() {
         let app = source("src/main.w", "ordered-contextual-call-argument");
         let report = |code: i32| OUTPUT.replace(".code = 1", &format!(".code = {code}"));
@@ -9368,7 +9432,15 @@ mod tests {
             let narrowing = program.replace("core.require(input < 0", "core.narrow(input < 0");
             assert!(matches!(run(&narrowing, scope), Err(ScalarOrderedCheckerOutcome::Unsupported)));
             let ordinary = program.replace("core.context.count", "count");
-            assert!(matches!(run(&ordinary, scope), Err(ScalarOrderedCheckerOutcome::Unsupported)));
+            let receipt = run(&ordinary, scope)
+                .unwrap_or_else(|error| panic!("proof-free lexical argument in {scope:?}: {error:?}"));
+            assert!(receipt.active && receipt.diagnostics.is_empty() && receipt.symbolic_diagnostic.is_none());
+            let [callee, caller] = receipt.directives.as_slice() else { panic!("expected lexical callee then caller"); };
+            assert_eq!(callee.code(), &BigInt::from(7));
+            assert_eq!(caller.code(), &BigInt::from(13));
+            assert!(callee.witness.intervals_at(0, 0).unwrap().eq([(&input, &input)]));
+            assert!(caller.witness.intervals_at(0, 1).unwrap().eq([(&input, &input)]));
+            assert!(caller.witness.intervals_at(0, 2).unwrap().eq([(&result, &result)]));
         }
     }
 
