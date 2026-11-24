@@ -18,12 +18,13 @@ unit() run = fn {
 	Record record = { .field = 9; };
 
 	*u32 shared = &value;
-	*!u32 mutable = &!value;
-	*Record record_shared = &record;
-	*!Record record_mutable = &!record;
 	transport_shared(*shared);
-	transport_mutable(*mutable);
+	*Record record_shared = &record;
 	transport_shared((*record_shared).field);
+
+	*!u32 mutable = &!value;
+	transport_mutable(*mutable);
+	*!Record record_mutable = &!record;
 	transport_mutable((*record_mutable).field);
 	std.print("checked reference dereference\n");
 };
