@@ -17,6 +17,7 @@ pub(super) struct AggregateFlowFacts {
     pub(super) literal_array_other_write: Option<LiteralArrayWrite>,
     pub(super) literal_array_unit: Option<LiteralArrayUnit>,
     pub(super) literal_array_value: Option<(CfgPointId, OccurrenceOrdinal)>,
+    pub(super) literal_array_index_output: Option<(CfgPointId, OccurrenceOrdinal)>,
     pub(super) literal_array_extent_output: Option<(CfgPointId, OccurrenceOrdinal)>,
     pub(super) views: BTreeMap<CfgPointId, CfgPointId>,
     pub(super) plain_literals: BTreeSet<CfgPointId>,
@@ -693,6 +694,7 @@ enum LiteralArrayPhase {
     ArgumentRead(CfgPointId),
     Call(CfgPointId),
     Replaced,
+    IndexSelector,
     ExtentBorrow(CfgPointId),
     ExtentValue(CfgPointId),
     ExtentOutput,
@@ -1227,6 +1229,7 @@ pub(super) struct AggregateFlowResult {
     immediate_receipt_reads: BTreeMap<CfgPointId, Option<(OccurrenceOrdinal, CfgPointId, CfgPointId)>>,
     literal_array_route: Option<LiteralArrayRoute>,
     literal_array_unknown: bool,
+    pub(super) literal_array_index_required: Option<(CfgPointId, OccurrenceOrdinal)>,
     pub(super) literal_array_extent_required: Option<OccurrenceOrdinal>,
     literal_array_join: LiteralArrayJoin,
     pub(super) checked_backing_forward_candidate: Option<(OccurrenceOrdinal, CfgPointId, CfgPointId)>,
@@ -1473,7 +1476,7 @@ impl AggregateFlowResult {
     }
 
     pub(super) fn has_observations(&self) -> bool {
-        self.literal_array_extent_required.is_some() || self.proved_literal_array_route_ref().is_some()
+        self.literal_array_index_required.is_some() || self.literal_array_extent_required.is_some() || self.proved_literal_array_route_ref().is_some()
             || (self.checked_producer_authoritative && !self.checked_producer_backing.is_empty())
             || self.checked_backing_assignment.is_some() || self.checked_backing_forward.is_some()
             || self.scalar_descriptor_assignment.is_some() || self.fresh_recommit_leaf.is_some() || !self.array_returns.is_empty() || !self.array_rebinds.is_empty()
@@ -1718,6 +1721,18 @@ impl AggregateFlowFacts {
                     if call == *rhs_point && &target.binding == binding && target.projections.is_empty()
                         && active_write.is_some_and(|write|
                             write.rhs == *rhs_point && write.writer == point.id) => Replaced,
+                (Replaced, CfgPointKind::Evaluate(ScalarExpression::Integer { .. }))
+                    if root && unit.is_none()
+                        && self.literal_array_index_output.is_some_and(|(read, _)| point.successors.as_slice() == [read]) =>
+                    IndexSelector,
+                (IndexSelector, CfgPointKind::ReadPlace { place: ScalarPlace::Index { base, index, .. },
+                    pointer_point: None, candidates, reads_origin: false })
+                    if self.literal_array_index_output.is_some_and(|(read, _)| point.id == read)
+                        && matches!(base.as_ref(), ScalarPlace::Name { .. })
+                        && matches!(index.as_ref(), ScalarExpression::Integer { .. })
+                        && matches!(candidates.as_slice(), [place] if &place.binding == binding
+                            && matches!(place.projections.as_slice(), [ReferencePlaceProjection::Index(_)])) =>
+                    ExtentValue(point.id),
                 (Replaced, CfgPointKind::Borrow { place, loan })
                     if root && unit.is_none() && &place.binding == binding && place.projections.is_empty()
                         && loan.mode == ScalarReferenceMutability::Shared
@@ -2918,6 +2933,7 @@ pub(crate) struct ClosedBody {
     pub(crate) literal_array: Option<ClosedLiteralArray>,
     pub(crate) replacement_extent_observation: Option<usize>,
     pub(crate) array_descriptor_return: bool,
+    pub(crate) replacement_index_observation: Option<usize>,
     pub(crate) array_descriptor_calls: BTreeSet<usize>,
     // Each exit's owning formals, in ascending declared slot order.
     pub(crate) input_releases: BTreeMap<CfgPointId, Vec<usize>>,
@@ -2987,6 +3003,8 @@ impl ClosedAggregates {
 pub(crate) struct AggregateReservations<'a> {
     pub(crate) snapshot_struct: Option<&'a dyn Fn(&ScalarStructId) -> Option<&'a ScalarStruct>>,
     pub(crate) bodies: BTreeMap<BodyKey, bool>,
+    pub(crate) checked_access: bool,
+    pub(crate) target_layout: Option<ScalarTargetLayout>,
     pub(crate) modules: Vec<usize>,
 }
 
@@ -6109,6 +6127,21 @@ fn selected_return_components(
     result
 }
 
+// A bounded literal access only needs its own byte offset to be
+// representable. Never restrict a shared producer's allocation size for it.
+fn returned_array_index_fits_offset(index: u64, ty: &ScalarType, target: ScalarTargetLayout) -> bool {
+    if !ordinary_value(ty) {
+        return false;
+    }
+    let Ok(layout) = crate::scalar::layout_for_type(ty, target) else { return false };
+    let maximum = match target.pointer_size {
+        4 => i32::MAX as u64,
+        8 => i64::MAX as u64,
+        _ => return false,
+    };
+    index.checked_mul(layout.size).is_some_and(|offset| offset <= maximum)
+}
+
 fn closed_aggregates<'a>(
     reservations: &AggregateReservations,
     module_at: impl Fn(usize) -> Option<ModuleInput<'a>>,
@@ -6215,6 +6248,7 @@ fn closed_aggregates<'a>(
     let mut array_callsites = Vec::new();
     let mut literal_array_callers = Vec::new();
     let mut returned_extent_requirements = Vec::new();
+    let mut returned_index_requirements = Vec::new();
     let mut array_leaves = BTreeSet::new();
     let mut array_neighbors = BTreeMap::<BodyKey, BTreeSet<BodyKey>>::new();
     let mut result = ClosedAggregates::default();
@@ -6222,6 +6256,9 @@ fn closed_aggregates<'a>(
         if let Some(facts) = body.facts {
             // Borrow only completed caller proofs during this existing pass.
             // BTreeMap order preserves enrollment precedence at finalization.
+            if let Some((point, occurrence)) = facts.literal_array_index_required {
+                returned_index_requirements.push((key, body, point, occurrence));
+            }
             if let Some(occurrence) = facts.literal_array_extent_required {
                 returned_extent_requirements.push((key, body.source, occurrence));
             }
@@ -6517,7 +6554,38 @@ fn closed_aggregates<'a>(
     }
     let finalize_cohorts = |mut result: ClosedAggregates| -> Result<ClosedAggregates, String> {
         install_literal_array_plans(&literal_array_callers, &bodies, &declarations, &mut result);
+        if !returned_index_requirements.is_empty() && !reservations.checked_access {
+            return Err("returned array index requires the authenticated checked-access helper".into());
+        }
+        for &(key, body, point, occurrence) in &returned_index_requirements {
+            let source = body.source;
+            let representable_offset = (|| {
+                let CfgPointKind::ReadPlace { place: ScalarPlace::Index { index, .. }, .. } =
+                    &body.cfg.initial_points.get(point.0)?.kind else { return None };
+                let ScalarExpression::Integer { value, .. } = index.as_ref() else { return None };
+                let ty = body.sites.structure.checked_types.expressions.get(&occurrence)?;
+                let index = u64::try_from(value.clone()).ok()?;
+                Some(returned_array_index_fits_offset(index, ty, reservations.target_layout?))
+            })();
+            if representable_offset != Some(true) {
+                return Err(format!("returned array index byte offset is not representable in {source:?}"));
+            }
+            let Some(plan) = result.bodies.get_mut(&key).filter(|plan|
+                matches!(plan.literal_array, Some(ClosedLiteralArray::Replacement { unit: None, .. })))
+            else { return Err(format!("returned array index requires an exact replacement in {source:?}")); };
+            plan.replacement_index_observation = Some(occurrence.0);
+        }
         ordinary.seal_array_descriptors(&mut result);
+        for &(key, body, _, _) in &returned_index_requirements {
+            let source = body.source;
+            if !result.bodies.get(&key).is_some_and(|plan|
+                matches!(plan.literal_array, Some(ClosedLiteralArray::Replacement { call, .. })
+                    if plan.array_descriptor_calls.contains(&call)))
+            {
+                return Err(format!("returned array index requires a closed returned extent in {source:?}"));
+            }
+        }
+
         for &(key, source, occurrence) in &returned_extent_requirements {
             let closed = result.bodies.get_mut(&key).filter(|plan|
                 matches!(plan.literal_array, Some(ClosedLiteralArray::Replacement { call, unit: None, .. })
@@ -7875,6 +7943,8 @@ mod tests {
             bodies: lookup.values().copied().map(|key| (key, true)).collect(),
             modules: vec![0],
             snapshot_struct: None,
+            checked_access: false,
+            target_layout: None,
         };
         let plans = build.aggregate(&reservations).expect("actual build ownership plans");
         let forwards = &plans.bodies[&key].fresh_array_recommits;
@@ -7962,6 +8032,19 @@ mod tests {
         facts.literal_array_write = None;
         facts.literal_array_value = Some((pair.write.rhs, pair.final_output));
         assert_eq!(facts.observation_mode(), Some(AggregateObservationMode { literal: true, legacy: false }));
+    }
+
+    #[test]
+    fn returned_array_index_static_offset_respects_target_signed_domain_and_stride() {
+        for (target, maximum) in [(ScalarTargetLayout::NATIVE64, i64::MAX as u64),
+            (ScalarTargetLayout::WASM32, i32::MAX as u64)]
+        {
+            assert!(returned_array_index_fits_offset(maximum, &ScalarType::U8, target));
+            assert!(!returned_array_index_fits_offset(maximum + 1, &ScalarType::U8, target));
+            assert!(returned_array_index_fits_offset(maximum / 16, &ScalarType::U128, target));
+            assert!(!returned_array_index_fits_offset(maximum / 16 + 1, &ScalarType::U128, target));
+            assert!(!returned_array_index_fits_offset(u64::MAX, &ScalarType::U128, target));
+        }
     }
 
     #[test]
@@ -8838,6 +8921,8 @@ Reading(u64) make_reading = fn(length) {
                     }).collect(),
                     modules: vec![0],
                     snapshot_struct: None,
+                    checked_access: false,
+                    target_layout: None,
                 };
                 let error = build.aggregate(&reservations).err().expect("escaped receipt loan");
                 assert!(error.contains("aggregate owning receipt has an unproved checked loan"), "{error}");

@@ -4762,8 +4762,17 @@ impl<'a> ReferenceFlowBuilder<'a> {
                                     && matches!(expression, ScalarExpression::Call { .. })
                                     && matches!(self.call_target(expression, slot.expression),
                                         Ok(ResolvedCallTarget::Core(CoreOperationId::ArrayLen))));
+                    let returned_index_tail = scope == ReferenceScopeId(0)
+                        && matches!(calls.boundary.root_outputs.as_slice(), [output] if aggregate::ordinary_value(&output.ty))
+                        && matches!((region.items.as_slice(), block.items.as_slice()),
+                            ([_, BlockItem { kind: BlockItemKind::Assignment { .. }, .. },
+                                BlockItem { kind: BlockItemKind::FinalOutput(slot), .. }],
+                             [_, _, ScalarBlockItem::Expression(ScalarExpression::IndexedRead { place, .. })])
+                                if slot.output == 0 && matches!(place, ScalarPlace::Index { base, index, .. }
+                                    if matches!(base.as_ref(), ScalarPlace::Name { .. })
+                                        && matches!(index.as_ref(), ScalarExpression::Integer { .. })));
                     if binding.is_allocation
-                        && (returned_extent_tail || (region.items.len() == 2
+                        && (returned_extent_tail || returned_index_tail || (region.items.len() == 2
                             && matches!(calls.boundary.root_outputs.as_slice(),
                                 [] | [RootOutputType { output: 0, ty: ScalarType::RuntimeArray { .. } }])))
                     {
@@ -4829,6 +4838,22 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             // before any LLVM declaration can be emitted.
                             self.aggregate_facts.literal_array_extent_output = Some((value_point, slot.expression));
                             self.proof_points.pending_returned_extent = Some(value_point);
+                        }
+                        if scope == ReferenceScopeId(0) && slot.output == 0
+                            && self.aggregate_facts.literal_array_unit.is_none()
+                            && self.aggregate_facts.literal_array_write.is_some()
+                            && matches!(calls.boundary.root_outputs.as_slice(), [output] if aggregate::ordinary_value(&output.ty))
+                            && matches!(expression, ScalarExpression::IndexedRead { place, .. }
+                                if matches!(place, ScalarPlace::Index { base, index, .. }
+                                    if matches!(base.as_ref(), ScalarPlace::Name { .. })
+                                        && matches!(index.as_ref(), ScalarExpression::Integer { .. })))
+                            && matches!(&self.cfg.points[value_point.0].kind,
+                                CfgPointKind::ReadPlace { pointer_point: None, candidates, .. }
+                                    if matches!(candidates.as_slice(), [place]
+                                        if self.aggregate_facts.allocations.get(&place.binding)
+                                            .is_some_and(|bind| self.aggregate_facts.literal_array_bind.is_some_and(|allocation| allocation.bind == *bind))))
+                        {
+                            self.aggregate_facts.literal_array_index_output = Some((value_point, slot.expression));
                         }
                         if scope == ReferenceScopeId(0) && slot.output == 0
                             && self.aggregate_facts.literal_array_bind.is_some()
@@ -16334,6 +16359,7 @@ fn build_function_reference_cfg(
     }
     aggregate.literal_array_extent_required = builder.aggregate_facts.literal_array_extent_output
         .map(|(_, occurrence)| occurrence);
+    aggregate.literal_array_index_required = builder.aggregate_facts.literal_array_index_output;
     aggregate.array_calls = builder.aggregate_facts.array_calls;
     aggregate.checked_result_origins = builder.checked_result_origins;
     if (2..=aggregate::MAX_LOCAL_CHOICE_LEAVES).contains(&builder.aggregate_facts.calls.len()) {

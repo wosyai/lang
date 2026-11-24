@@ -1,7 +1,7 @@
 typedef unsigned long long u64;
 extern int wosy_authored_main(void);
 
-static unsigned char original[2], replacement[7];
+static unsigned char original[2], replacement[7] = {[3] = 37};
 static unsigned issued, released;
 
 void *__wosy_core_alloc(u64 size, u64 alignment) {

@@ -11327,3 +11327,74 @@ if (replace(7)");
         }
     }
 }
+
+#[test]
+fn returned_array_index_checks_installed_extent_before_addressing() {
+    let text = "%%start
+u8[](u64) fabricate = fn(count) { u8[count] fresh; fresh };
+u8(u64) replace = fn(count) {
+    u8[2] bytes;
+    bytes = fabricate(count);
+    bytes[3]
+};
+if (replace(7) != 37) { core.system_panic(); };
+%%end";
+    let mixed = text.replace("if (replace(7) != 37)", "u64(u64) measure = fn(count) { u8[2] bytes; bytes = fabricate(count); core.array_len(&bytes) };\nif (replace(7) != 37 || measure(7) != 7)");
+    let other_use = text.replace("if (replace(7)", "u8[] ordinary = fabricate(5); ordinary;
+if (replace(7)");
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let source = SourceIdentity::new("project".into(), "package".into(), "src/main.w".into(), "r1".into());
+        for (access, closed, mixed_uses, text) in [(true, true, false, text),
+            (true, true, true, mixed.as_str()), (true, false, false, other_use.as_str()), (false, true, false, text)]
+        {
+            let parsed = parse_source(source.clone(), text.into(), &[]);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let prepared = crate::prepare_scalar_project_with_access(
+                vec![(crate::derive_scalar_declarations_from_cst(parsed.result.canonical_cst()), vec![])],
+                vec![source.clone()],
+                ScalarPreparationInputs { target_layout: layout },
+                access.then(wosy_stdlib_source::CheckedAccessComponent::linked),
+            ).unwrap();
+            let checked = analyze_scalar_build(&prepared);
+            assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+            let result = emit_scalar_build_project_llvm(&checked);
+            if !access {
+                assert!(matches!(result, Err(error) if error.contains("authenticated checked-access helper")));
+                continue;
+            }
+            if !closed {
+                assert!(matches!(result, Err(error) if error.contains("closed returned extent")));
+                continue;
+            }
+            let llvm = result.unwrap().to_text();
+            let body = self_tail_test_body(&llvm, "i8", &project_function_name(&source, "replace"));
+            let extent = body.find("%runtime_extent = load i64, ptr %bytes_length").expect("paired extent");
+            let transported = body.find("store i64 %array_descriptor_extent, ptr %bytes_length").expect("transported extent");
+            let guards = body.lines().filter(|line| line.contains("call void @wosy_fn__776f73795f746f6f6c636861696e5f7374646c6962__")
+                && line.contains("__636865636b5f696e6465785f696e5f657874656e74(")).collect::<Vec<_>>();
+            let [guard] = guards.as_slice() else { panic!("one canonical bounds helper call: {body}") };
+            assert!(guard.contains("(i64 3, i64 %runtime_extent)"), "{body}");
+            let guard = body.find(guard).unwrap();
+            let indexed = body.find("getelementptr inbounds i8, ptr %bytes, i64 3").expect("index paired backing");
+            let release = body.find("call void @__wosy_core_free(ptr %array_descriptor_backing)").expect("returned backing free");
+            assert!(transported < extent && extent < guard && guard < indexed && indexed < release, "{body}");
+            let producer = project_function_name(&source, "fabricate");
+            let factory = llvm.split_once(&format!("define internal {{ ptr, i64 }} @{producer}(")).unwrap().1
+                .split_once("
+}").unwrap().0;
+            assert!(!factory.contains("allocation_size_overflow"), "shared factory must keep its existing count domain: {factory}");
+            if mixed_uses {
+                let measure = self_tail_test_body(&llvm, "i64", &project_function_name(&source, "measure"));
+                assert!(measure.contains(&format!("call {{ ptr, i64 }} @{producer}(")), "{measure}");
+                assert!(measure.contains("ret i64 %runtime_extent"), "{measure}");
+                assert!(!measure.contains("__636865636b5f696e6465785f696e5f657874656e74("), "{measure}");
+            }
+            if let Some(out) = std::env::var_os("WOSY_RETURNED_ARRAY_INDEX_IR_DIR").filter(|_| !mixed_uses) {
+                let target = if layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
+                let controlled = llvm.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);
+                assert_ne!(controlled, llvm);
+                std::fs::write(std::path::PathBuf::from(out).join(format!("{target}-project-control.ll")), controlled).unwrap();
+            }
+        }
+    }
+}

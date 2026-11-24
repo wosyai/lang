@@ -407,6 +407,10 @@ pub(super) fn definition_type<'ctx>(
     })
 }
 
+pub(super) fn requires_returned_array_index(state: &EmitState<'_, '_>) -> bool {
+    state.aggregate.as_ref().is_some_and(|aggregate| aggregate.plan.replacement_index_observation.is_some())
+}
+
 pub(super) fn has_literal_array_plan(state: &EmitState<'_, '_>) -> bool {
     state.aggregate.as_ref().is_some_and(|aggregate| aggregate.plan.literal_array.is_some())
 }

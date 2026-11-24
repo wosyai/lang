@@ -420,6 +420,8 @@ pub(super) fn place_pointer<'ctx, 'module>(
             if let ScalarType::RuntimeArray { element, .. } = base_type {
                 if let Some(extent) = runtime_extent {
                     check_release_index(state, index, extent)?;
+                } else if super::aggregate_transfer::requires_returned_array_index(state) {
+                    return Err("sealed returned array index lost its paired extent".into());
                 }
                 let element = storage_type(context, &element, state.layouts, state.target_layout)?;
                 return unsafe {

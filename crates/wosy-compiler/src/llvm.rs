@@ -269,11 +269,21 @@ fn runtime_allocation_access(
     let mut indexed = BTreeSet::new();
     let mut unproved_writes = BTreeSet::new();
     let key = |span: wosy_syntax::ByteSpan| (span.start, span.end);
-    let mut same_backing_writes = HashMap::new();
+    let mut proved_extent_writes = HashMap::new();
     if let (true, Some(nodes), Some(plan)) = (checked_access, body_nodes, plan) {
+        // This exact install updates pointer and returned extent together.
+        if plan.replacement_index_observation.is_some() {
+            if let Some(crate::scalar::ClosedLiteralArray::Replacement { call, destination, .. }) = plan.literal_array {
+                if plan.array_descriptor_calls.contains(&call) {
+                    if let Some((producer, binding)) = nodes.existing_array_rebind_event(reference_cfg, call, destination) {
+                        proved_extent_writes.insert(producer, binding);
+                    }
+                }
+            }
+        }
         for (&call, &destination) in &plan.same_array_rebinds {
             if let Some((producer, binding)) = nodes.existing_array_rebind_event(reference_cfg, call, destination) {
-                same_backing_writes.insert(producer, binding);
+                proved_extent_writes.insert(producer, binding);
             }
         }
     }
@@ -291,7 +301,7 @@ fn runtime_allocation_access(
                 let id = key(target.declaration_span);
                 mutable.insert(id);
                 if checked_access && reference_cfg.allocations.contains(&target.binding)
-                    && same_backing_writes.get(rhs_point) != Some(&&target.binding)
+                    && proved_extent_writes.get(rhs_point) != Some(&&target.binding)
                 {
                     unproved_writes.insert(id);
                 }
@@ -758,7 +768,11 @@ fn emit_single_module_llvm<'a>(
         str::to_owned,
         prepared_overloads.remove(source).into_iter().flatten(),
     );
-    let mut reservations = crate::scalar::AggregateReservations::default();
+    let mut reservations = crate::scalar::AggregateReservations {
+        checked_access: matches!(generic_input, GenericInitializerInput::PreparedRows(prepared) if prepared.checked_access().is_some()),
+        target_layout: Some(target_layout),
+        ..Default::default()
+    };
     reservations.modules.push(0);
     for &(_, _, _, item, arm) in &definitions {
         reservations.bodies.insert((0, item, arm), true);
@@ -1236,7 +1250,11 @@ fn emit_project_llvm<'a>(
                 .flatten(),
         ));
     }
-    let mut reservations = crate::scalar::AggregateReservations::default();
+    let mut reservations = crate::scalar::AggregateReservations {
+        checked_access: matches!(generic_input, GenericInitializerInput::PreparedRows(prepared) if prepared.checked_access().is_some()),
+        target_layout: Some(target_layout),
+        ..Default::default()
+    };
     reservations.modules.extend(ordered_modules.iter().map(|&(ordinal, _)| ordinal));
     for &(ordinal, _, _, _, _, item, arm) in &definitions {
         reservations.bodies.insert((ordinal, item, arm), true);
