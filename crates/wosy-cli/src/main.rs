@@ -966,7 +966,24 @@ fn check_command(
             notes: vec![format!("symbolic call can return {}", failure.returned)],
         }
     });
-    let diagnostics = actual.chain(symbolic).collect::<Vec<_>>();
+    let contextual = report.contextual_diagnostic.iter().map(|failure| Diagnostic {
+        code: String::new(), severity: DiagnosticSeverity::Error,
+        message: "proof obligation failed".to_owned(),
+        labels: vec![
+            DiagnosticLabel { kind: DiagnosticLabelKind::Primary, span: failure.goal.clone(),
+                message: "not satisfied by this contextual call".to_owned() },
+            DiagnosticLabel { kind: DiagnosticLabelKind::Secondary, span: failure.proof.clone(),
+                message: "proof declaration".to_owned() },
+            DiagnosticLabel { kind: DiagnosticLabelKind::Secondary, span: failure.supplying_call.clone(),
+                message: "call supplying this context".to_owned() },
+            DiagnosticLabel { kind: DiagnosticLabelKind::Secondary, span: failure.call.clone(),
+                message: "checked call".to_owned() },
+            DiagnosticLabel { kind: DiagnosticLabelKind::Secondary, span: failure.binding.clone(),
+                message: "active contextual binding".to_owned() },
+        ],
+        notes: vec![format!("contextual value at entry: {}; at exit: {}", failure.entry, failure.exit)],
+    });
+    let diagnostics = actual.chain(symbolic).chain(contextual).collect::<Vec<_>>();
     let authored_status = authored.publish(&mut std::io::stdout().lock(), &mut std::io::stderr().lock())
         .map_err(|error| format!("check: could not complete authored output; earlier records may already be published: {error}"))?;
     render_project_diagnostics(&diagnostics, publication.texts);

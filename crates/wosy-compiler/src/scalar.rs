@@ -2356,7 +2356,7 @@ fn derive_scalar_declarations(
     let pruned = has_named_proofs.then(|| runtime_module_roots(&source_root));
     let runtime_roots = pruned.as_deref().unwrap_or_else(|| std::slice::from_ref(&source_root));
     #[cfg(any(test, feature = "internal-checker"))]
-    let include_proof_diagnostics = proofs.is_some();
+    let include_proof_diagnostics = proofs.is_some() && !contextual_proof_runtime;
     #[cfg(not(any(test, feature = "internal-checker")))]
     let include_proof_diagnostics = false;
     let diagnostic_roots = if has_named_proofs && !include_proof_diagnostics {
@@ -3838,7 +3838,7 @@ mod symbolic_integer;
 #[cfg(feature = "internal-checker")]
 pub use checker_directive::{CheckedOutputTargets, ScalarCheckerTextFile};
 #[cfg(feature = "internal-checker")]
-pub use checker_project::{check_loaded_scalar_module_proof_call, check_loaded_scalar_ordered_proof_contexts, check_loaded_scalar_ordered_local_proof_contexts, MainFlowProofReceipt, MainFlowProofDiagnostic, MainFlowProofInvocation, SymbolicProofDiagnostic, ScalarOrderedEntryEvidence, check_loaded_scalar_module_proof_selections, check_loaded_scalar_module_proofs, check_scalar_module_proof, check_scalar_module_proofs, ScalarProofDeclarations, ScalarProofCallOutcome, check_scalar_package, check_scalar_package_with_dormant_sources, check_scalar_package_ordered_with_dormant_sources, ScalarOrderedCheckerOutcome, ScalarOrderedCheckerFailure, ScalarProofModuleInput, ScalarModuleProofOutcome, ScalarCheckerFailure, ScalarCheckerIntegerWitness, ScalarCheckerOperation, ScalarCheckerOutcome, ScalarCheckerScope};
+pub use checker_project::{check_loaded_scalar_module_proof_call, check_loaded_scalar_ordered_proof_contexts, check_loaded_scalar_ordered_local_proof_contexts, MainFlowProofReceipt, ContextualProofDiagnostic, MainFlowProofDiagnostic, MainFlowProofInvocation, SymbolicProofDiagnostic, ScalarOrderedEntryEvidence, check_loaded_scalar_module_proof_selections, check_loaded_scalar_module_proofs, check_scalar_module_proof, check_scalar_module_proofs, ScalarProofDeclarations, ScalarProofCallOutcome, check_scalar_package, check_scalar_package_with_dormant_sources, check_scalar_package_ordered_with_dormant_sources, ScalarOrderedCheckerOutcome, ScalarOrderedCheckerFailure, ScalarProofModuleInput, ScalarModuleProofOutcome, ScalarCheckerFailure, ScalarCheckerIntegerWitness, ScalarCheckerOperation, ScalarCheckerOutcome, ScalarCheckerScope};
 #[cfg(feature = "internal-checker")]
 pub(crate) use checker_project::derive_scalar_proof_declarations_from_cst;
 pub(crate) use reference::aggregate::{AggregateReservations, ClosedAggregates, ClosedBody, ClosedCall, ClosedInitializer, ClosedInitializerInput, ClosedInput, ClosedReturn};

@@ -335,6 +335,14 @@ pub(super) fn prepare_dormant_context(
 pub(super) fn prepare_contextual_transport(
     canonical: &CanonicalCstRoot, inputs: ScalarPreparationInputs, checker_directives: bool, contextual_proof: bool,
 ) -> Result<(PreparedScalarProject, DormantContextReceipt), DormantContextRejection> {
+    let source = derive_scalar_declarations(canonical, true, contextual_proof && checker_directives, None);
+    prepare_contextual_transport_from_source(source, inputs, checker_directives)
+}
+
+#[cfg(any(test, feature = "internal-checker"))]
+pub(super) fn prepare_contextual_transport_from_source(
+    mut source: ScalarSourceDeclarations, inputs: ScalarPreparationInputs, checker_directives: bool,
+) -> Result<(PreparedScalarProject, DormantContextReceipt), DormantContextRejection> {
     use self::DormantContextRejection::{MissingAtRoot, Unsupported};
     use super::control::{ModuleInitializationCallTarget, ModuleInitializationDetail};
     const MAX_WORK: usize = 4096;
@@ -343,9 +351,7 @@ pub(super) fn prepare_contextual_transport(
         work = work.checked_add(amount).filter(|&cost| cost <= MAX_WORK).ok_or(Unsupported)?;
         Ok(())
     };
-    // Extraction, type checking and canonical call preparation retain
-    // their normal costs. This meter caps work added by the dormant graph.
-    let mut source = derive_scalar_declarations(canonical, true, contextual_proof && checker_directives, None);
+    let canonical_source = source.source().clone();
     let places = &mut source.contextual_places;
     charge(places.declarations.len().saturating_add(places.inherited.len()).saturating_add(source.items.len()))?;
     if !source.diagnostics.is_empty() || places.dormant_operands.is_empty() {
@@ -365,7 +371,7 @@ pub(super) fn prepare_contextual_transport(
             .push((storage.active_after, storage.scope, storage.declaration.range));
     }
     let uses = std::mem::take(&mut places.inherited);
-    let project = project_from_declarations(vec![(source, Vec::new())], vec![canonical.source.clone()], inputs)
+    let project = project_from_declarations(vec![(source, Vec::new())], vec![canonical_source.clone()], inputs)
         .map_err(|_| Unsupported)?;
     let (project, mut calls) = super::static_calls::prepare_project_occurrences(
         typecheck_scalar_project_in_mode(project, checker_directives), &[],
@@ -434,7 +440,7 @@ pub(super) fn prepare_contextual_transport(
             }
             let ResolvedCallTarget::ModuleCallable { source, declaration_span, concrete: ConcreteCallSelection::Declaration } = &site.target
                 else { return Err(Unsupported); };
-            if source != &canonical.source || !body.checked_call_signatures.contains_key(&call.ordinal) {
+            if source != &canonical_source || !body.checked_call_signatures.contains_key(&call.ordinal) {
                 return Err(Unsupported);
             }
             let callee = *by_target.get(declaration_span).ok_or(Unsupported)?;
@@ -460,7 +466,7 @@ pub(super) fn prepare_contextual_transport(
                     Some((ContextualSupplyAuthority {
                         occurrence: call.ordinal, span: occurrence, name: std::rc::Rc::clone(&name), ty: ty.clone(),
                         binding: ReferenceBindingId {
-                            source: canonical.source.clone(), function_span: function.span,
+                            source: canonical_source.clone(), function_span: function.span,
                             declaration_span: declaration, block_span: scope, kind: ReferenceBindingKind::Declared,
                         },
                     }, declaration))
@@ -486,7 +492,7 @@ pub(super) fn prepare_contextual_transport(
     let [root] = topology.calls.as_slice() else { return Err(Unsupported); };
     let ModuleInitializationCallTarget::Direct { declaration, concrete: ConcreteCallSelection::Declaration }
         = topology.call_targets.get(root).ok_or(Unsupported)? else { return Err(Unsupported); };
-    if declaration.source != canonical.source || !topology.checked_call_signatures.contains_key(root) {
+    if declaration.source != canonical_source || !topology.checked_call_signatures.contains_key(root) {
         return Err(Unsupported);
     }
     if needs[*by_target.get(&declaration.range).ok_or(Unsupported)?] {
@@ -501,7 +507,7 @@ pub(super) fn prepare_contextual_transport(
             Some((authority, declaration)) => (authority, DormantContextSupply::Lexical(declaration)),
             None if needs[edge.caller] => (ContextualSupplyAuthority {
                 occurrence: edge.ordinal, span: edge.occurrence, name: std::rc::Rc::clone(&name), ty: ty.clone(),
-                binding: contextual_formal(&canonical.source, edge.caller_span),
+                binding: contextual_formal(&canonical_source, edge.caller_span),
             }, DormantContextSupply::Formal(edge.caller_span)),
             None => return Err(Unsupported),
         };
@@ -514,8 +520,7 @@ pub(super) fn prepare_contextual_transport(
 /// Admit just `current == core.old(current) +/- literal` from the
 /// existing CST. No general expression derivation or recursive walk.
 #[cfg(feature = "internal-checker")]
-pub(super) fn contextual_proof_delta(goal: &CstNode, name: &str, ty: &ScalarType)
-    -> Option<(bool, BigInt)>
+pub(super) fn contextual_proof_delta(goal: &CstNode) -> Option<(CstToken, bool, BigInt)>
 {
     type Element = NodeOrToken<CstNode, CstToken>;
     // The canonical grammar flattens empty operator tiers. Cap both
@@ -558,11 +563,11 @@ pub(super) fn contextual_proof_delta(goal: &CstNode, name: &str, ty: &ScalarType
         let [left, NodeOrToken::Token(op), right] = exact::<3>(&node)? else { return None; };
         (op.kind() == SyntaxKind::Operator).then_some((left, op, right))
     }
-    fn place(element: Element, name: &str) -> Option<()> {
+    fn place(element: Element) -> Option<CstToken> {
         let NodeOrToken::Node(node) = unwrap(element)? else { return None; };
         if node.kind() != SyntaxKind::ContextualPlace { return None; }
         let [NodeOrToken::Token(identifier)] = exact::<1>(&node)? else { return None; };
-        (identifier.kind() == SyntaxKind::Identifier && identifier.text() == name).then_some(())
+        (identifier.kind() == SyntaxKind::Identifier).then_some(identifier)
     }
     fn literal(element: Element) -> Option<BigInt> {
         let value = unwrap(element)?;
@@ -583,7 +588,7 @@ pub(super) fn contextual_proof_delta(goal: &CstNode, name: &str, ty: &ScalarType
 
     let (left, equal, right) = binary(NodeOrToken::Node(goal.clone()))?;
     if equal.text() != "==" { return None; }
-    place(left, name)?;
+    let name = place(left)?;
     let (old, operation, amount) = binary(right)?;
     let add = match operation.text() { "+" => true, "-" => false, _ => return None };
     let NodeOrToken::Node(call) = unwrap(old)? else { return None; };
@@ -596,7 +601,6 @@ pub(super) fn contextual_proof_delta(goal: &CstNode, name: &str, ty: &ScalarType
     {
         return None;
     }
-    place(argument, name)?;
-    let amount = literal(amount)?;
-    typecheck::integer_literal_fits_type(&amount, ty).then_some((add, amount))
+    if place(argument)?.text() != name.text() { return None; }
+    Some((name, add, literal(amount)?))
 }
