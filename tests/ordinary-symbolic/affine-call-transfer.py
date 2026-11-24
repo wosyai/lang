@@ -1541,6 +1541,45 @@ cases.extend([
         1, b"proof obligation failed"),
 ])
 
+# Three different recursive leaves; the positive suffix offset is legal only
+# under the checked prefix decrease and its local upper cut.
+ranked_tree = """%%start
+    u16(i8,u8) descend = fn(page,slot) {
+        if (page > 0) {
+            if (slot < 3) { descend(page - 1,slot + 1) } else { descend(page - 1,0) }
+        } else {
+            if (slot > 1) { descend(0,slot - 2) } else {
+                if (slot == 1) { 7 } else { 7 }
+            }
+        }
+    };
+    proof rank for descend(p,s) -> (out)
+        where (p >= 0 && p <= 4 && s <= 3) ensures (out == 7) decreases (p,s) {
+            if (p > 0) {
+                if (s < 3) { core.use(rank(p - 1,s + 1)); } else { core.use(rank(p - 1,0)); }
+            } else {
+                if (s > 1) { core.use(rank(0,s - 2)); } else { core.show(out == 7); }
+            }
+        }
+%%end"""
+ranked_tree_reached = ranked_tree.replace("%%end", "u16 result = descend(4,2); core.require(result == 7, "
+    + report(233,"TREE-RETURN") + "); %%end")
+cases.extend([
+    ("exact-startup-ranked-tree-verified", ranked_tree_reached, 0, b""),
+    ("exact-startup-ranked-tree-actual-result", ranked_tree_reached.replace("result == 7", "result == 8"), 233, b"TREE-RETURN"),
+    ("exact-startup-ranked-tree-citation-mismatch", ranked_tree_reached.replace("rank(p - 1,s + 1)", "rank(p - 1,s)"),
+        2, b"unsupported analysis"),
+    ("exact-startup-ranked-tree-hidden-wrong-base", ranked_tree_reached.replace("if (slot == 1) { 7 }", "if (slot == 1) { 9 }"),
+        2, b"unsupported analysis"),
+    ("ordinary-ranked-tree-symbolic", ranked_tree, 0, b""),
+    ("ordinary-ranked-tree-base-refuted", ranked_tree.replace("if (slot == 1) { 7 }", "if (slot == 1) { 9 }"),
+        1, b"proof obligation failed"),
+    ("ordinary-ranked-tree-suffix-not-closed", ranked_tree.replace(" < 3)", " <= 3)"), 2, b"unsupported analysis"),
+    ("ordinary-ranked-tree-increasing-prefix", ranked_tree.replace("descend(0,slot", "descend(1,slot")
+        .replace("rank(0,s", "rank(1,s"), 2, b"unsupported analysis"),
+    ("ordinary-ranked-tree-equal-self-use", ranked_tree.replace(" - 2)", " - 0)"), 2, b"unsupported analysis"),
+])
+
 ranked_return = f"""%%start
     u8(u8) descend = fn(value) {{
         if (value > 0) {{
@@ -2041,6 +2080,7 @@ proof_diagnostic_notes = {
     "ordinary-unused-contextual-refuted": b"contextual value at entry: 11; at exit: 2",
     "exact-startup-public-namespace-contextual-refuted": b"contextual value at entry: 3; at exit: 3",
     "exact-startup-public-contextual-proof-refuted": b"contextual value at entry: 3; at exit: 3",
+    "ordinary-ranked-tree-base-refuted": b"symbolic call can return 9",
     "ordinary-ranked-two-edge-base-refuted": b"symbolic call can return 8",
     "ordinary-rectangular-authored-show-goal-failure": b"symbolic call can return 245",
     "ordinary-rectangular-authored-show-first-step-failure": b"symbolic call can return 245",
