@@ -61,7 +61,11 @@ if (text != null) {
 };
 ```
 
-Direct array values and checked references are rejected in `extern` signatures. The current raw pointer types in a foreign signature are `*?u8` and `*?Name` for a resolved struct type. To pass a numeric buffer, declare a byte pointer and an explicit count. Take the buffer's address and cast it inside `unsafe`:
+### Foreign buffers
+
+`extern` signatures reject array values and checked references. Use `*?u8` for
+a byte address or `*?StructName` for a pointer to a resolved struct. For a
+numeric buffer, pass the raw address and the element count:
 
 ```wosy
 host = extern wasm "preview" {
@@ -73,7 +77,7 @@ unsafe {
 };
 ```
 
-The count above is in elements. The host and Wosy code must agree on the element type, count units, and how long the buffer stays valid.
+Agree with the host on the element type, count units, and buffer lifetime.
 
 ## Callables
 
