@@ -52,6 +52,12 @@ int main(void) { return check(); }
 #endif
 """
 
+if sys.argv[3:] == ["exhaustive"]:
+    runtime = runtime.replace("wosy_case_two() != 33", "wosy_case_two() != 34")
+    runtime = runtime.replace("wosy_case_three() != 335", "wosy_case_three() != 345")
+elif sys.argv[3:]:
+    raise SystemExit("optional third argument must be exhaustive")
+
 with tempfile.TemporaryDirectory(prefix="conditional-receipt-", dir=ir_dir) as tmp:
     work = Path(tmp)
     trace = work / "trace.c"

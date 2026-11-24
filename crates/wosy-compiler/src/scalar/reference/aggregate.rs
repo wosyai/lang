@@ -1213,7 +1213,8 @@ pub(super) struct AggregateFlowResult {
     pub(super) formals: BTreeMap<usize, ReferenceBindingId>,
     pub(super) formal_unsupported: BTreeSet<usize>,
     pub(super) formal_forward: Option<(usize, CfgPointId, usize, usize)>,
-    conditional_formal_forward: Option<(usize, CfgPointId, usize, usize, CfgPointId)>,
+    conditional_formal_overflow: bool,
+    conditional_formal_forwards: BTreeSet<(usize, CfgPointId, usize, usize, CfgPointId)>,
     pub(super) checked_successor_candidate: Option<CfgPointId>,
     pub(super) checked_successor_contract: bool,
     pub(super) checked_successor_result: bool,
@@ -2301,10 +2302,18 @@ impl AggregateFlowFacts {
                                 }
                                 if let (Some(InputOrigin::ConditionalFormal(formal)), ArgumentProvenance::WholeMove(moved)) = (source, moved) {
                                     let transfer = (formal, id, ordinal.0, slot, moved);
-                                    if result.conditional_formal_forward.is_some_and(|old| old != transfer) {
-                                        result.formal_unsupported.insert(formal);
+                                    // Retain at most two exact observations. A third distinct
+                                    // site disables the lane permanently, not just this path.
+                                    if !result.conditional_formal_overflow
+                                        && !result.conditional_formal_forwards.contains(&transfer)
+                                    {
+                                        if result.conditional_formal_forwards.len() == 2 {
+                                            result.conditional_formal_overflow = true;
+                                            result.formal_unsupported.insert(formal);
+                                        } else {
+                                            result.conditional_formal_forwards.insert(transfer);
+                                        }
                                     }
-                                    result.conditional_formal_forward = Some(transfer);
                                     continue;
                                 }
                                 if matches!(source, Some(InputOrigin::Owner(OwnerSource::Call(_)) | InputOrigin::Immediate(_) | InputOrigin::Plain(_))) && matches!(target, ResolvedCallTarget::ModuleCallable { .. }) {
@@ -2577,6 +2586,7 @@ pub(crate) struct ClosedBody {
     pub(crate) literal_array: Option<ClosedLiteralArray>,
     pub(crate) input_release: Option<CfgPointId>,
     pub(crate) input_release_guard: Option<usize>,
+    pub(crate) input_exhaustive: Option<usize>,
     pub(crate) input_calls: BTreeMap<usize, (usize, ClosedInput)>,
 }
 
@@ -3892,8 +3902,10 @@ fn closed_aggregates<'a>(
                             forward_edges.insert((key, formal), (target, slot));
                         }
                     }
-                    if let Some((formal, call, forward_ordinal, forward_slot, _)) = facts.conditional_formal_forward {
-                        if (point, ordinal, slot) == (call, forward_ordinal, forward_slot) {
+                    if !facts.conditional_formal_overflow {
+                        if let Some(&(formal, _, _, _, _)) = facts.conditional_formal_forwards.iter()
+                            .find(|&&(_, call, forward_ordinal, forward_slot, _)| (point, ordinal, slot) == (call, forward_ordinal, forward_slot))
+                        {
                             conditional_forward_edges.insert((key, formal), (target, slot));
                         }
                     }
@@ -4306,40 +4318,56 @@ fn closed_aggregates<'a>(
                 "aggregate owning formal conditional transfer has no exact release route in {:?} at slot {slot}",
                 body.source,
             );
-            let Some((endpoint @ (exit, _), false)) = exits.next() else { return Err(unsupported()); };
-            if exits.next().is_some() || mixed || modes[&next].1
-                || forward_edges.contains_key(&next) || conditional_forward_edges.contains_key(&next)
-                || !facts.raw_uses.is_empty() || !ordinary_formal_outputs(&body.sites.boundary.root_outputs)
-                || !facts.endpoints.get(&endpoint).is_some_and(|endpoint| {
-                    endpoint.has_conditional_unique_receipt(OwnerSource::Formal(slot))
-                        && endpoint.possible.get(&OwnerSource::Formal(slot)).and_then(Option::as_ref) == facts.formals.get(&slot)
-                })
+            if mixed || modes[&next].1 || forward_edges.contains_key(&next)
+                || conditional_forward_edges.contains_key(&next) || !facts.raw_uses.is_empty()
+                || !ordinary_formal_outputs(&body.sites.boundary.root_outputs)
             {
                 return Err(unsupported());
             }
-            let Some((_, consumer, _, _, moved)) = facts.conditional_formal_forward else { return Err(unsupported()); };
+            let endpoint = exits.next();
+            if exits.next().is_some() { return Err(unsupported()); }
             let points = &body.cfg.points;
             let certificate = ConditionalInputCertificate::build(
                 points, &facts.conditional_input_regions, &facts.conditional_input_barriers,
             );
-            let (fork, side, boundary) = certificate.consuming_arm(points, points[0].id, consumer, Some(exit))
-                .ok_or_else(unsupported)?;
-            if fork != boundary || certificate.paths[moved.0] != certificate.paths[consumer.0]
-                || !matches!(points[exit.0].kind, CfgPointKind::ScopeExit)
-            {
-                return Err(unsupported());
-            }
-            let plan = result.bodies.entry(callee).or_default();
+            let prove_arm = |&(formal, consumer, _, to_slot, moved): &(usize, CfgPointId, usize, usize, CfgPointId)| {
+                if formal != slot || target_body(&declarations, body.cfg, consumer) != Some(next.0)
+                    || to_slot != next.1 || certificate.paths[moved.0] != certificate.paths[consumer.0]
+                { return None; }
+                let (fork, side, boundary) = certificate.consuming_arm(
+                    points, points[0].id, consumer, endpoint.map(|((exit, _), _)| exit),
+                )?;
+                (fork == boundary).then_some((fork, side))
+            };
+            let mut transfers = facts.conditional_formal_forwards.iter();
+            let (fork, side) = prove_arm(transfers.next().ok_or_else(unsupported)?).ok_or_else(unsupported)?;
             let expression = certificate.forks[fork].region.expression.0;
-            let mut arms = [ReceiptGate::Retained; 2];
-            arms[side] = ReceiptGate::Transferred;
-            let guard = plan.conditional_guard_count;
-            plan.conditional_guard_count += 1;
-            plan.input_release_guard = Some(guard);
-            plan.conditional_inputs.entry(expression).or_default().guards.push((guard, arms));
+            let plan = result.bodies.entry(callee).or_default();
+            let release = match (endpoint, transfers.next(), transfers.next()) {
+                (None, Some(other), None) if prove_arm(other) == Some((fork, 1 - side)) => {
+                    plan.input_exhaustive = Some(expression);
+                    None
+                }
+                (Some((endpoint @ (exit, _), false)), None, None)
+                    if matches!(points[exit.0].kind, CfgPointKind::ScopeExit)
+                        && facts.endpoints.get(&endpoint).is_some_and(|endpoint| {
+                            endpoint.has_conditional_unique_receipt(OwnerSource::Formal(slot))
+                                && endpoint.possible.get(&OwnerSource::Formal(slot)).and_then(Option::as_ref) == facts.formals.get(&slot)
+                        }) =>
+                {
+                    let mut arms = [ReceiptGate::Retained; 2];
+                    arms[side] = ReceiptGate::Transferred;
+                    let guard = plan.conditional_guard_count;
+                    plan.conditional_guard_count += 1;
+                    plan.input_release_guard = Some(guard);
+                    plan.conditional_inputs.entry(expression).or_default().guards.push((guard, arms));
+                    Some(endpoint)
+                }
+                _ => return Err(unsupported()),
+            };
             conditional_input_certificates.insert(callee, certificate);
             forward_predecessors.entry(next).or_default().push((callee, slot));
-            Some(endpoint)
+            release
         } else {
             let Some((endpoint, always)) = exits.next() else {
                 return Err(format!("aggregate owning input has no proved formal exit in {:?} at slot {slot}", body.source));

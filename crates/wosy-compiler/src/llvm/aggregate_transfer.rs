@@ -399,11 +399,17 @@ pub(super) fn finish_conditional_receipts<'ctx>(
     else_end: inkwell::basic_block::BasicBlock<'ctx>,
 ) -> Result<(), String> {
     let Some(aggregate) = &mut state.aggregate else { return Ok(()) };
-    if aggregate.plan.conditional_inputs.is_empty() {
+    if aggregate.plan.conditional_inputs.is_empty() && aggregate.plan.input_exhaustive.is_none() {
         return Ok(());
     }
     let expression = state.body_call_nodes.and_then(|nodes| nodes.expression_ordinal(expression))
         .ok_or_else(|| "missing conditional aggregate receipt occurrence".to_owned())?;
+    if aggregate.plan.input_exhaustive == Some(expression) {
+        let (formal, _) = aggregate.input.take().ok_or("missing exhaustive formal receipt at conditional merge")?;
+        if Some(formal) != aggregate.plan.input || aggregate.plan.input_release_guard.is_some() {
+            return Err("exhaustive formal receipt identity mismatch".into());
+        }
+    }
     let Some(plan) = aggregate.plan.conditional_inputs.get(&expression) else { return Ok(()) };
     for &(guard, arms) in &plan.guards {
         let incoming = |gate| match gate {
@@ -1176,7 +1182,7 @@ fn emit_selected_call<'ctx, 'module>(
             CallInput::Body(ClosedInput::ForwardFormalDeferred(source)) => {
                 let aggregate = state.aggregate.as_ref().expect("closed aggregate input context");
                 let (formal, base) = aggregate.input.ok_or_else(|| "missing deferred formal base at owner transfer".to_owned())?;
-                if formal != source || aggregate.plan.input_release_guard.is_none() {
+                if formal != source || (aggregate.plan.input_release_guard.is_none() && aggregate.plan.input_exhaustive.is_none()) {
                     return Err("conditional formal owner transfer identity mismatch".to_owned());
                 }
                 base
