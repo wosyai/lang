@@ -806,7 +806,7 @@ fn emit_prepared_call<'ctx, 'module>(
         return Err(state.missing_prepared_signature(target));
     };
     let values = emit_contextual_arguments(context, state, arguments, parameters, project)?;
-    if let Some(value) = aggregate_transfer::emit_array_descriptor_call(context, state, expression, target, &values)? {
+    if let Some(value) = aggregate_transfer::emit_array_descriptor_call(context, state, expression, target, arguments, &values)? {
         return Ok(value);
     }
     aggregate_transfer::capture_checked_array_argument_extent(state, expression, arguments, &values)?;

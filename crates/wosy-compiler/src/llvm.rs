@@ -2345,6 +2345,9 @@ fn emit_function<'ctx, 'module>(
         .ok_or_else(|| format!("unknown LLVM function {name}"))?;
     let entry = context.append_basic_block(value, "entry");
     builder.position_at_end(entry);
+    if aggregate_plan.is_some_and(|plan| plan.array_descriptor_identity) {
+        return aggregate_transfer::emit_array_descriptor_identity(context, builder, value);
+    }
     if let Some(slot) = aggregate_plan.and_then(|plan| plan.identity_relay) {
         return aggregate_transfer::emit_identity_relay(builder, value, slot);
     }
@@ -2681,6 +2684,9 @@ fn emit_project_function<'ctx, 'module>(
         .ok_or_else(|| format!("unknown LLVM function {name}"))?;
     let entry = context.append_basic_block(value, "entry");
     builder.position_at_end(entry);
+    if aggregate_plan.is_some_and(|plan| plan.array_descriptor_identity) {
+        return aggregate_transfer::emit_array_descriptor_identity(context, builder, value);
+    }
     if let Some(slot) = aggregate_plan.and_then(|plan| plan.identity_relay) {
         return aggregate_transfer::emit_identity_relay(builder, value, slot);
     }
@@ -4459,7 +4465,7 @@ fn transition_runtime_array_assignment<'ctx, 'module>(
         return Ok(true);
     };
     if let Some(call) = staged.literal_array_call {
-        aggregate_transfer::install_literal_array_replacement(context, state, call, value)?;
+        aggregate_transfer::install_literal_array_replacement(context, state, call, name, value)?;
         return Ok(false);
     }
     if staged.same_array_rebind {
@@ -4787,7 +4793,9 @@ fn materialize_assignment_values<'ctx, 'module, 'expected>(
                 let call = state.body_call_nodes.and_then(|nodes| nodes.expression_ordinal(expression))?;
                 Some((
                     aggregate.same_array_rebind_destination(call),
-                    aggregate.literal_array_replacement(call).map(|destination| (call, destination)),
+                    aggregate.literal_array_replacement(call)
+                        .or_else(|| aggregate.rebound_array_destination(call))
+                        .map(|destination| (call, destination)),
                     aggregate.fresh_array_recommit(call).map(|proof| (call, proof)),
                 ))
             })

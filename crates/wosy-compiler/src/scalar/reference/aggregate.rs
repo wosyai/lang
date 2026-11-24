@@ -2946,6 +2946,9 @@ pub(crate) struct ClosedBody {
     pub(crate) literal_array: Option<ClosedLiteralArray>,
     pub(crate) replacement_extent_observation: Option<usize>,
     pub(crate) array_descriptor_return: bool,
+    pub(crate) array_descriptor_identity: bool,
+    // Call occurrence -> its sole exact lexical backing declaration and install.
+    pub(crate) array_descriptor_rebinds: BTreeMap<usize, (ByteSpan, usize)>,
     pub(crate) replacement_index_observation: Option<usize>,
     pub(crate) array_descriptor_calls: BTreeSet<usize>,
     // Each exit's owning formals, in ascending declared slot order.
@@ -5718,6 +5721,75 @@ fn enroll_literal_array_pair(
     plan.literal_array = Some(replacement);
 }
 
+// This is deliberately an effect-free whole formal identity, not a
+// constructor. Its return is the incoming descriptor bit-for-bit.
+fn array_descriptor_identity(body: &Body<'_>) -> bool {
+    let Some(facts) = body.facts else { return false };
+    let ([formal], [output]) = (body.sites.boundary.parameters.as_slice(), body.sites.boundary.results.as_slice())
+    else { return false };
+    body.is_monomorphic && body.cfg.initial_points.len() <= 8
+        && same_runtime_array_type(&formal.ty, &output.ty)
+        && !facts.array_invalid && facts.array_calls.is_empty()
+        && facts.array_returns.len() == 1
+        && facts.array_returns.first().and_then(Option::as_ref).is_some_and(|path|
+            path.dependencies.is_empty() && path.tail_call.is_none() && path.last_producer.is_none())
+        && body.cfg.initial_points.iter().all(|point| match &point.kind {
+            CfgPointKind::Entry | CfgPointKind::ScopeEnter | CfgPointKind::ScopeExit | CfgPointKind::Return
+            | CfgPointKind::ReturnOutput { output: 0, checked: false, .. } => true,
+            CfgPointKind::Read { binding } => binding.declaration_span == formal.span,
+            CfgPointKind::Move { place, owner, .. } =>
+                &place.binding == owner && owner.declaration_span == formal.span && place.projections.is_empty(),
+            _ => false,
+        })
+}
+
+fn seal_array_descriptor_identities(
+    ordinary: &OrdinaryCohorts,
+    requests: &[(BodyKey, &Body<'_>, OccurrenceOrdinal)],
+    declarations: &HashMap<(&SourceIdentity, ByteSpan), (usize, usize)>,
+    identities: &BTreeSet<BodyKey>,
+    result: &mut ClosedAggregates,
+) {
+    let mut candidates = HashMap::new();
+    for &(caller, body, observation) in requests {
+        let Some(facts) = body.facts else { continue };
+        let Some((call, binding, destination)) = facts.array_rebinds.first_key_value()
+            .filter(|_| facts.array_rebinds.len() == 1).map(|(_, proof)| proof) else { continue };
+        let Some(&(ordinal, _, ref source)) = facts.array_calls.get(call) else { continue };
+        let Some(target) = target_body(declarations, body.cfg, *call).filter(|target| identities.contains(target))
+        else { continue };
+        let Some(proof) = result.bodies.get(&caller) else { continue };
+        if source != binding || !body.cfg.allocations.contains(binding)
+            || proof.same_array_rebinds.get(&ordinal.0) != Some(&destination.0)
+            || proof.literal_array.is_some()
+            || !matches!(&body.cfg.initial_points[call.0].kind, CfgPointKind::Call { argument_points, .. }
+                if matches!(argument_points.as_slice(), [read] if matches!(&body.cfg.initial_points[read.0].kind,
+                    CfgPointKind::Read { binding: actual } if actual == binding)))
+        {
+            continue;
+        }
+        candidates.insert((caller, ordinal.0), (target, binding.declaration_span, destination.0, observation.0));
+    }
+    for target in identities {
+        let Some(uses) = ordinary.array_uses.get(target).and_then(Option::as_ref)
+            .filter(|uses| !uses.is_empty()) else { continue };
+        if !uses.iter().all(|site| candidates.get(site).is_some_and(|(actual, ..)| actual == target)) {
+            continue;
+        }
+        if result.bodies.contains_key(target) {
+            continue;
+        }
+        result.bodies.entry(*target).or_default().array_descriptor_identity = true;
+        for &(caller, call) in uses {
+            let (_, binding, destination, observation) = candidates[&(caller, call)];
+            let plan = result.bodies.get_mut(&caller).expect("proved array rebind caller");
+            plan.array_descriptor_rebinds.insert(call, (binding, destination));
+            plan.array_descriptor_calls.insert(call);
+            plan.replacement_extent_observation = Some(observation);
+        }
+    }
+}
+
 fn install_literal_array_plans(
     callers: &[(BodyKey, &Body<'_>, &LiteralArrayRoute)],
     bodies: &BTreeMap<BodyKey, Body<'_>>,
@@ -6165,6 +6237,7 @@ fn closed_aggregates<'a>(
     let mut bodies = BTreeMap::new();
     let mut declarations = HashMap::new();
     let mut storage_uses = HashMap::<&SourceSpan, usize>::new();
+    let mut array_descriptor_identities = BTreeSet::new();
     for (&key @ (module, item, arm), &is_monomorphic) in &reservations.bodies {
         let input = module_at(module).ok_or_else(|| format!("missing emitted aggregate module {module}"))?;
         let Some(ScalarItem::Function(function)) = input.items.get(item) else {
@@ -6199,7 +6272,12 @@ fn closed_aggregates<'a>(
                     [left, right] => ordinary_value(&left.ty) && ordinary_value(&right.ty),
                     _ => false,
                 });
-            bodies.insert(key, Body { facts, cfg, sites, source: input.source, is_monomorphic, supports_input_result });
+            let body = Body { facts, cfg, sites, source: input.source, is_monomorphic, supports_input_result };
+            if arm.is_none() && array_descriptor_identity(&body) {
+                array_descriptor_identities.insert(key);
+                ordinary.array_uses.entry(key).or_insert_with(|| Some(Vec::new()));
+            }
+            bodies.insert(key, body);
         }
     }
     let multi_producers: BTreeMap<_, _> = bodies.iter().filter_map(|(&key, body)| {
@@ -6273,7 +6351,7 @@ fn closed_aggregates<'a>(
                 returned_index_requirements.push((key, body, index));
             }
             if let Some(occurrence) = facts.literal_array_extent_required {
-                returned_extent_requirements.push((key, body.source, occurrence));
+                returned_extent_requirements.push((key, body, occurrence));
             }
             if let Some(route) = facts.proved_literal_array_caller(key, body.is_monomorphic) {
                 literal_array_callers.push((key, body, route));
@@ -6595,7 +6673,16 @@ fn closed_aggregates<'a>(
             }
         }
 
-        for &(key, source, occurrence) in &returned_extent_requirements {
+        seal_array_descriptor_identities(&ordinary, &returned_extent_requirements,
+            &declarations, &array_descriptor_identities, &mut result);
+        for &(key, body, occurrence) in &returned_extent_requirements {
+            let source = body.source;
+            if result.bodies.get(&key).is_some_and(|plan|
+                !plan.array_descriptor_rebinds.is_empty()
+                    && plan.replacement_extent_observation == Some(occurrence.0))
+            {
+                continue;
+            }
             let closed = result.bodies.get_mut(&key).filter(|plan|
                 matches!(plan.literal_array, Some(ClosedLiteralArray::Replacement { call, unit: None, .. })
                     if plan.array_descriptor_calls.contains(&call)));

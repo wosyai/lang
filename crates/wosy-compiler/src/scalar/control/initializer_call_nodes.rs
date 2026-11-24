@@ -707,6 +707,14 @@ impl<'a> CallableBodyCallNodes<'a> {
         }
     }
 
+    pub(crate) fn lexical_expression_declaration(&self, expression: &ScalarExpression) -> Option<ByteSpan> {
+        let ordinal = *self.proof_nodes.expressions.get(&std::ptr::from_ref(expression))?;
+        match self.proof_nodes.calls?.prepared_plain_name(ordinal)? {
+            super::super::reference::PlainNameIdentity::Lexical(binding) => Some(binding.declaration_span),
+            _ => None,
+        }
+    }
+
     pub(crate) fn lexical_place_declaration(&self, place: &ScalarPlace) -> Option<ByteSpan> {
         let NamedPlaceRootIdentity::Lexical(binding) = self.named_place_root(place)? else {
             return None;

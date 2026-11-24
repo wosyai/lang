@@ -4898,14 +4898,24 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     if let BlockItemKind::FinalOutput(slot) = kind {
                         if scope == ReferenceScopeId(0) && slot.output == 0
                             && self.aggregate_facts.literal_array_unit.is_none()
-                            && self.aggregate_facts.literal_array_write.is_some()
                             && matches!(calls.boundary.root_outputs.as_slice(), [output] if output.ty == ScalarType::U64)
                             && matches!(&self.cfg.points[value_point.0].kind, CfgPointKind::Call {
                                 target: ResolvedCallTarget::Core(CoreOperationId::ArrayLen), argument_points, ..
                             } if matches!(argument_points.as_slice(), [borrow] if
                                 matches!(&self.cfg.points[borrow.0].kind, CfgPointKind::Borrow { place, .. }
                                     if place.projections.is_empty() && self.aggregate_facts.allocations.get(&place.binding)
-                                        .is_some_and(|bind| self.aggregate_facts.literal_array_bind.is_some_and(|allocation| allocation.bind == *bind)))))
+                                        .is_some_and(|bind| {
+                                            (self.aggregate_facts.literal_array_write.is_some()
+                                                && self.aggregate_facts.literal_array_bind.is_some_and(|allocation| allocation.bind == *bind))
+                                            || (matches!(region.items.as_slice(),
+                                                [BlockItem { kind: BlockItemKind::Binding(_), .. },
+                                                 BlockItem { kind: BlockItemKind::Assignment { .. }, .. },
+                                                 BlockItem { kind: BlockItemKind::FinalOutput(_), .. }])
+                                                && self.aggregate_facts.array_installs.len() == 1
+                                                && self.aggregate_facts.array_installs.first_key_value().is_some_and(|(install, _)|
+                                                    matches!(&self.cfg.points[install.0].kind, CfgPointKind::Assign { target, .. }
+                                                        if target.binding == place.binding)))
+                                        }))))
                         {
                             // Only pending authority: exact receipt replay and the
                             // all-use transported ABI must close this occurrence

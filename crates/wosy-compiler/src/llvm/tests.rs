@@ -11448,3 +11448,60 @@ if (replace(7) != 37) { core.system_panic(); };
         }
     }
 }
+
+#[test]
+fn owning_array_identity_rebind_preserves_the_full_extent() {
+    let text = "%%start
+u8[](u8[]) relay = fn(values) { values };
+u64(u64) roundtrip = fn(count) {
+    u8[count] bytes;
+    bytes = relay(bytes);
+    core.array_len(&bytes)
+};
+if (roundtrip(2) != 2) { core.system_panic(); };
+if (roundtrip(7) != 7) { core.system_panic(); };
+%%end";
+    let exposed = text.replace("if (roundtrip(2)", "unit(u64) legacy = fn(count) { u8[count] other; other = relay(other); }; legacy(1);
+if (roundtrip(2)");
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        for (closed, text) in [(true, text), (false, exposed.as_str())] {
+            let prepared = prepare_initializer_test(text, layout);
+            let checked = analyze_scalar_build(&prepared);
+            assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+            let source = &prepared.project().modules[0].source;
+            for (project, llvm) in [
+                (false, emit_scalar_build_single_module_llvm(&checked)),
+                (true, emit_scalar_build_project_llvm(&checked)),
+            ] {
+                if !closed {
+                    assert!(matches!(llvm, Err(error) if error.contains("core.array_len requires a closed exact returned array extent")));
+                    continue;
+                }
+                let llvm = llvm.unwrap().to_text();
+                let relay = self_tail_test_symbol(source, project, "relay");
+                let caller = self_tail_test_body(&llvm, "i64", &self_tail_test_symbol(source, project, "roundtrip"));
+                let definition = llvm.split_once(&format!("define internal {{ ptr, i64 }} @{relay}({{ ptr, i64 }} %values)"))
+                    .unwrap_or_else(|| panic!("missing sealed paired formal and return ABI for {relay}: {llvm}")).1.split_once("\n}").unwrap().0;
+                assert!(definition.contains("ret { ptr, i64 } %values"), "{definition}");
+                assert!(!definition.contains("@__wosy_core_free"), "{definition}");
+                let taking = caller.find(&format!("call {{ ptr, i64 }} @{relay}({{ ptr, i64 }} %array_argument)"))
+                    .expect("one exact paired invocation");
+                let storing = caller.find("store i64 %array_descriptor_extent, ptr %bytes_length")
+                    .expect("install the returned extent");
+                let observing = caller.find("%runtime_extent = load i64, ptr %bytes_length")
+                    .expect("observe the installed extent");
+                let releasing = caller.find("call void @__wosy_core_free(").expect("lexical cleanup");
+                assert!(taking < storing && storing < observing && observing < releasing, "{caller}");
+                assert_eq!(caller.matches("call void @__wosy_core_free(").count(), 1, "{caller}");
+                if let Some(out) = std::env::var_os("WOSY_ARRAY_IDENTITY_IR_DIR") {
+                    let target = if layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
+                    let route = if project { "project" } else { "standalone" };
+                    let controlled = llvm.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);
+                    assert_ne!(controlled, llvm);
+                    std::fs::write(std::path::PathBuf::from(out).join(format!("{target}-{route}-control.ll")),
+                        controlled).unwrap();
+                }
+            }
+        }
+    }
+}
