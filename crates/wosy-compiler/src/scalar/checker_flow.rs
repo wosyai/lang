@@ -99,12 +99,17 @@ pub(super) struct ImportedLocal<'a> {
     pub(super) guards: Vec<ImportedEntryGuard<'a>>,
 }
 
+#[cfg(feature = "internal-checker")]
+pub(super) enum ImportedVerifiedReturn<'a> {
+    Constant { values: &'a std::cell::OnceCell<Rc<IntegerSet>>, bound: &'a BigInt },
+    EntryAlias(usize),
+}
+
 pub(super) enum ImportedIntegerValues<'a> {
     Ready(IntegerSet, std::marker::PhantomData<&'a ()>),
     #[cfg(feature = "internal-checker")]
     Shared {
-        values: &'a std::cell::OnceCell<Rc<IntegerSet>>,
-        bound: &'a BigInt,
+        result: ImportedVerifiedReturn<'a>,
         guards: &'a [ImportedEntryGuard<'a>],
         domain: Option<(usize, &'a IntegerSet)>,
         meter_rectangle: bool,
@@ -5780,12 +5785,15 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                     let values = match local.values {
                         ImportedIntegerValues::Ready(values, _) => values,
                         #[cfg(feature = "internal-checker")]
-                        ImportedIntegerValues::Shared { values, bound, guards, domain, meter_rectangle } => {
+                        ImportedIntegerValues::Shared { result, guards, domain, meter_rectangle } => {
                             if meter_rectangle {
                                 let work = roots.ordinary_local_work.get_or_insert(0);
                                 charge_call_work(work, 1usize.checked_add(guards.len())?)?;
                                 for row in &path.0 {
                                     let mut cost = row.len().checked_add(1)?;
+                                    if matches!(result, ImportedVerifiedReturn::EntryAlias(_)) {
+                                        cost = cost.checked_add(row.equal_axes().len().checked_mul(2)?)?.checked_add(2)?;
+                                    }
                                     for guard in guards {
                                         if let Some(Argument::Axis(axis)) = arguments.get(guard.slot).copied().flatten() {
                                             cost = cost.checked_add(row.get(axis)?.interval_count())?;
@@ -5797,9 +5805,32 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                             if !guards.iter().all(applies) || domain.is_some_and(|domain| !in_domain(domain)) {
                                 return None;
                             }
+                            let alias = match &result {
+                                ImportedVerifiedReturn::Constant { .. } => None,
+                                ImportedVerifiedReturn::EntryAlias(slot) => {
+                                    let (argument, _) = origin.arguments.as_slice().get(*slot)?;
+                                    if !meter_rectangle || structure.checked_types.expressions.get(argument) != Some(&receiver.ty) {
+                                        return None;
+                                    }
+                                    Some(arguments.get(*slot).copied().flatten()?)
+                                }
+                            };
                             roots.add(&origin.binding, &receiver.ty);
-                            let values = values.get_or_init(|| Rc::new(IntegerSet::singleton(bound)));
-                            path.append_shared_local(values);
+                            match (result, alias) {
+                                (ImportedVerifiedReturn::Constant { values, bound }, None) => {
+                                    let values = values.get_or_init(|| Rc::new(IntegerSet::singleton(bound)));
+                                    path.append_shared_local(values);
+                                }
+                                (ImportedVerifiedReturn::EntryAlias(_), Some(Argument::Literal(value))) =>
+                                    path.append_local(IntegerSet::singleton(value)),
+                                (ImportedVerifiedReturn::EntryAlias(_), Some(Argument::Axis(axis))) => {
+                                    for row in &mut path.0 {
+                                        let domain = Rc::clone(row.get(axis)?);
+                                        row.append_alias(axis, domain);
+                                    }
+                                }
+                                _ => return None,
+                            }
                             continue;
                         }
                         #[cfg(feature = "internal-checker")]

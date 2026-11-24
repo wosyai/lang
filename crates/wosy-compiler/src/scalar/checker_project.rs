@@ -3870,9 +3870,14 @@ struct VerifiedSymbolicEquality<'a> {
     canonical_target: &'a ResolvedCallTarget,
     layout: ScalarTargetLayout,
     body: &'a FunctionCallSites,
-    bound: &'a BigInt,
-    shared: std::cell::OnceCell<Rc<IntegerSet>>,
+    result: VerifiedSymbolicResult<'a>,
     guards: VerifiedSymbolicGuards<'a>,
+}
+
+#[cfg(feature = "internal-checker")]
+enum VerifiedSymbolicResult<'a> {
+    Constant { bound: &'a BigInt, shared: std::cell::OnceCell<Rc<IntegerSet>> },
+    EntryAlias(usize),
 }
 
 #[cfg(feature = "internal-checker")]
@@ -3938,9 +3943,12 @@ impl<'a> VerifiedSymbolicEquality<'a> {
                 VerifiedSymbolicGuards::Rectangle { guards, .. } => (guards.as_slice(), None, true),
                 VerifiedSymbolicGuards::Ranked(guards) => (guards.comparisons.as_slice(), guards.domain, false),
             };
-            let values = ImportedIntegerValues::Shared {
-                values: &summary.shared, bound: summary.bound, guards, domain, meter_rectangle,
+            use super::checker_flow::ImportedVerifiedReturn;
+            let result = match &summary.result {
+                VerifiedSymbolicResult::Constant { bound, shared } => ImportedVerifiedReturn::Constant { values: shared, bound },
+                VerifiedSymbolicResult::EntryAlias(slot) => ImportedVerifiedReturn::EntryAlias(*slot),
             };
+            let values = ImportedIntegerValues::Shared { result, guards, domain, meter_rectangle };
             Ok(Some(ImportedLocal { position, values, guards: Vec::new() }))
         };
         let mut emit = |failure| effects.push_callable(calls, source, failure);
@@ -4184,18 +4192,20 @@ impl<'a> SelectedSymbolicProof<'a, '_> {
             applicable |= checked.applicable;
             if let Some(failure) = checked.failure {
                 self.record(case, function, source, effects.records.len(), failure, None)?;
-            } else if let (Some(issuer), true, PartitionedProofGoal::Literal(relation, bound)) =
-                (issuer, checked.applicable, goal)
-            {
-                if Some(relation) != IntegerRelation::from_operator(&BinaryOperator::Equal) {
-                    return Err(ProjectCheck::Unsupported);
-                }
+            } else if let (Some(issuer), true) = (issuer, checked.applicable) {
+                let result = match goal {
+                    PartitionedProofGoal::Literal(relation, bound)
+                        if Some(relation) == IntegerRelation::from_operator(&BinaryOperator::Equal) =>
+                        VerifiedSymbolicResult::Constant { bound, shared: std::cell::OnceCell::new() },
+                    PartitionedProofGoal::EntryEquality(slot) => VerifiedSymbolicResult::EntryAlias(slot),
+                    _ => return Err(ProjectCheck::Unsupported),
+                };
                 // Full pre-guard joint coverage and proof-free execution
-                // were checked above. Every reachable guarded cell now
-                // independently satisfies this exact result equality.
+                // were checked above. All guarded returns satisfy the
+                // certified constant or exact entry-alias relation.
                 self.equalities.insert(VerifiedSymbolicEquality {
                     target, canonical_target: issuer.canonical_target, layout: issuer.layout,
-                    body: issuer.body, bound, shared: std::cell::OnceCell::new(),
+                    body: issuer.body, result,
                     guards: VerifiedSymbolicGuards::Rectangle {
                         guards: case.guard.comparisons.clone(),
                         _dependency_definitions: dependencies.take().ok_or(ProjectCheck::Unsupported)?,
@@ -4390,7 +4400,7 @@ impl<'a> SelectedSymbolicProof<'a, '_> {
                 let issuer = issuer.ok_or(ProjectCheck::Unsupported)?;
                 self.equalities.insert(VerifiedSymbolicEquality {
                     target, canonical_target: issuer.canonical_target, layout: issuer.layout,
-                    body: issuer.body, bound, shared: std::cell::OnceCell::new(),
+                    body: issuer.body, result: VerifiedSymbolicResult::Constant { bound, shared: std::cell::OnceCell::new() },
                     guards: VerifiedSymbolicGuards::Bare(case.guard.comparisons.first().map(|guard| ImportedEntryGuard {
                         slot: guard.slot, relation: guard.relation, bound: guard.bound,
                     })),
@@ -4598,7 +4608,7 @@ impl SymbolicRootProof for SelectedSymbolicProof<'_, '_> {
                 if let Some(plan) = candidate {
                     let summary = VerifiedSymbolicEquality {
                         target, canonical_target: plan.canonical_target, layout: plan.layout,
-                        body: plan.body, bound: first_bound, shared: std::cell::OnceCell::new(),
+                        body: plan.body, result: VerifiedSymbolicResult::Constant { bound: first_bound, shared: std::cell::OnceCell::new() },
                         guards: VerifiedSymbolicGuards::Bare(first.guard.comparisons.first().map(|guard| ImportedEntryGuard {
                             slot: guard.slot, relation: guard.relation, bound: guard.bound,
                         })),
@@ -4970,7 +4980,6 @@ impl<'a> SymbolicEqualityIssuer<'a> {
     ) -> Option<Self> {
         if scope == ScalarCheckerScope::MainFlowOnly || authored.is_some() || proof.guard.always_rejects
             || proof.guard.domain.is_some()
-            || !matches!(&plan.typed.goal, TypedProofGoal::Literal { operator: BinaryOperator::Equal, .. })
         {
             return None;
         }
@@ -4982,10 +4991,14 @@ impl<'a> SymbolicEqualityIssuer<'a> {
             && citation_safe_calling_body(body)
             && proof.filter.len() <= 2
             && proof.filter.iter().all(|atom| matches!(atom, CheckerPredicate::Integer(_) | CheckerPredicate::Boolean(true)));
-        if rectangular {
+        let literal = matches!(&plan.typed.goal, TypedProofGoal::Literal { operator: BinaryOperator::Equal, .. });
+        let entry = matches!(&plan.typed.goal, TypedProofGoal::EntryComparison { slot, relation }
+            if parameters.get(*slot).is_some_and(|entry| &entry.ty == plan.typed.result_type)
+                && Some(*relation) == IntegerRelation::from_operator(&BinaryOperator::Equal));
+        if rectangular && (literal || entry) {
             return Some(Self { canonical_target: plan.canonical_target, layout: plan.typed.target.target_layout, body });
         }
-        if !(proof.guard.comparisons.is_empty()
+        if !literal || !(proof.guard.comparisons.is_empty()
             || proof.guard.comparisons.len() == 1 && matches!(proof.filter, [CheckerPredicate::Integer(_)]))
             || (!valid_arbitrary_proof_body(plan.typed.body)
                 && !supported_calling_proof_body(plan.typed.body, plan.typed.result_type))
@@ -5527,7 +5540,7 @@ fn ranked_symbolic_equality<'proof>(
     }
     Some(VerifiedSymbolicEquality {
         target: plan.target, canonical_target: plan.canonical_target, layout: plan.typed.target.target_layout,
-        body: plan.typed.body, bound, shared: std::cell::OnceCell::new(),
+        body: plan.typed.body, result: VerifiedSymbolicResult::Constant { bound, shared: std::cell::OnceCell::new() },
         guards: VerifiedSymbolicGuards::Ranked(guards),
     })
 }
@@ -16730,6 +16743,48 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
         let opaque = text.replace("{ 42 }", "{ value * value }");
         assert!(matches!(run(&opaque), Err(ProjectCheck::Unsupported)),
             "the false guard cannot hide an unsupported true-lane return");
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordered_named_rectangular_alias_summary_tracks_current_checked_entry_after_call() {
+        let app = source("src/main.w", "ordered-verified-rectangular-alias");
+        let text = format!(r#"%%start
+            i16(i16, i16) leaf = fn(tag, value) {{ if (tag >= 0) {{ value }} else {{ 4 }} }};
+            i16(i16, i16) producer = fn(tag, value) {{ i16 result = leaf(tag, value); result }};
+            proof canonical for producer(selector, before) -> (out)
+                where (selector >= 0 && before >= 10) ensures (out == core.old(before)) {{}}
+            unit(i16, i16) consumer = fn(tag, value) {{
+                core.narrow(tag >= 0, {OUTPUT});
+                core.narrow(value >= 10, {OUTPUT});
+                i16 observed = producer(tag, value);
+                if (value == 12) {{ core.require(observed == 12, {OUTPUT}); }};
+            }};
+        %%end"#);
+        let run = |text: &str| {
+            let (_, proof) = crate::parse_proof_source(app.clone(), text.to_owned(), &[]).ok().unwrap();
+            check_loaded_ordered_proof_diagnostics_in_scope::<true>(
+                Vec::new(), vec![(proof, Vec::new())], vec![app.clone()], inputs(),
+                ScalarCheckerScope::CurrentPackage, Vec::new(),
+            )
+        };
+        let report = run(&text).unwrap();
+        assert!(report.active && report.symbolic_diagnostic.is_none() && report.directives.is_empty());
+        let failed = run(&text.replace("observed == 12", "observed != 12")).unwrap();
+        let [failure] = failed.directives.as_slice() else { panic!("the exact imported alias must remain visible"); };
+        let twelve = BigInt::from(12);
+        assert!(failure.witness.intervals_at(0, 1).unwrap().eq([(&twelve, &twelve)]));
+        assert!(failure.witness.intervals_at(0, 2).unwrap().eq([(&twelve, &twelve)]));
+        assert_eq!(failure.witness.row_equal_axes(0), Some(&[(2, 1)][..]));
+        for (label, refused) in [
+            ("first guard", text.replace("core.narrow(tag >= 0", "core.narrow(tag < 0")),
+            ("second guard", text.replace("core.narrow(value >= 10", "core.narrow(value >= 0")),
+            ("incompatible old formal", text.replace("core.old(before)", "core.old(selector)")),
+            ("no shared identity after an authored write", text.replace("if (value == 12)", "value = 12; if (value == 12)")),
+        ] {
+            let report = run(&refused);
+            assert!(matches!(report, Err(ProjectCheck::Unsupported)), "{label}: {:?}", report.err());
+        }
     }
 
     #[cfg(feature = "internal-checker")]

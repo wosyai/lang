@@ -1639,6 +1639,30 @@ cases.extend([
         1,b"proof obligation failed"),
 ])
 
+verified_rectangular_alias = f"""%%start
+    i16(i16, i16) leaf = fn(tag, value) {{ if (tag >= 0) {{ value }} else {{ 4 }} }};
+    i16(i16, i16) producer = fn(tag, value) {{ i16 result = leaf(tag, value); result }};
+    proof canonical for producer(selector, before) -> (out)
+        where (selector >= 0 && before >= 10) ensures (out == core.old(before)) {{}}
+    unit(i16, i16) consumer = fn(tag, value) {{
+        core.narrow(tag >= 0, {report(46,"ALIAS-FIRST-NARROW")});
+        core.narrow(value >= 10, {report(47,"ALIAS-SECOND-NARROW")});
+        i16 observed = producer(tag, value);
+        if (value == 12) {{ core.require(observed == 12, {report(48,"VERIFIED-ALIAS-OUTPUT")}); }};
+    }};
+%%end"""
+cases.extend([
+    ("ordinary-verified-rectangular-alias-consumed",verified_rectangular_alias,0,b""),
+    ("ordinary-verified-rectangular-alias-exact-refutation",verified_rectangular_alias.replace("observed == 12", "observed != 12"),
+        48,b"VERIFIED-ALIAS-OUTPUT"),
+    ("ordinary-verified-rectangular-alias-first-guard",verified_rectangular_alias.replace("core.narrow(tag >= 0", "core.narrow(tag < 0"),
+        2,b"unsupported analysis"),
+    ("ordinary-verified-rectangular-alias-second-guard",verified_rectangular_alias.replace("core.narrow(value >= 10", "core.narrow(value >= 0"),
+        2,b"unsupported analysis"),
+    ("ordinary-verified-rectangular-alias-unproved-formal",verified_rectangular_alias.replace("core.old(before)", "core.old(selector)"),
+        2,b"unsupported analysis"),
+])
+
 verified_rectangular_summary = f"""%%start
     i16(i16, i16) leaf = fn(tag, value) {{ if (tag >= 0) {{ value }} else {{ 4 }} }};
     i16(i16, i16) producer = fn(tag, value) {{ i16 result = leaf(tag, value); result }};
