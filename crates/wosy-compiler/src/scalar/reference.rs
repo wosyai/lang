@@ -374,7 +374,6 @@ enum ExpressionReadMode {
     FallibleAliasInitializer,
     DereferenceOperand,
     ArrayLengthArgument,
-    WidenedBorrowCall(ByteSpan),
     WidenedBorrowAddress(ByteSpan),
 }
 
@@ -1925,6 +1924,26 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 let mut named_release_binding = None;
                 let mut argument_points = Vec::new();
                 let signature = calls.checked_call_signatures.get(&ordinal);
+                let widened_borrow = (|| {
+                    let owners = self.widened_arrays.as_ref()?;
+                    if scope != ReferenceScopeId(0) || !self.generic_parameters.is_empty()
+                        || calls.declared_unsafe_calls.contains(&ordinal.0)
+                        || !matches!(target, ResolvedCallTarget::ModuleCallable { concrete: ConcreteCallSelection::Declaration, .. })
+                    { return None; }
+                    let [ScalarExpression::CheckedAddress { mutability: ScalarReferenceMutability::Shared,
+                        place: ScalarPlace::Name { name, .. }, .. }] = arguments.as_slice() else { return None };
+                    let binding = self.names.get(name)?;
+                    if binding.block_span != calls.structure.blocks[calls.structure.root.0].span || !owners.contains(binding) {
+                        return None;
+                    }
+                    let signature = signature?;
+                    let [ScalarType::CheckedReference { mutability: ScalarReferenceMutability::Shared, inner }] =
+                        signature.parameters.as_slice() else { return None };
+                    let [output] = signature.outputs.outputs.as_slice() else { return None };
+                    (output.ty == ScalarType::U64
+                        && self.binding_types.get(binding).is_some_and(|ty| aggregate::same_runtime_array_type(ty, inner)))
+                        .then_some(binding.declaration_span)
+                })();
                 let mut borrowed_extent_formal = None;
                 let mut aggregate_arguments = BTreeMap::new();
                 let mut array_argument = None;
@@ -1935,7 +1954,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     let array_length = target == ResolvedCallTarget::Core(CoreOperationId::ArrayLen);
                     if array_length {
                         self.expression_with_read_mode(argument, scope, ordinal, ExpressionReadMode::ArrayLengthArgument)?;
-                    } else if let ExpressionReadMode::WidenedBorrowCall(owner) = read_mode {
+                    } else if let Some(owner) = widened_borrow {
                         self.expression_with_read_mode(
                             argument, scope, ordinal, ExpressionReadMode::WidenedBorrowAddress(owner),
                         )?;
@@ -2173,6 +2192,13 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 if read_call.is_some() {
                     self.aggregate_facts.read_consumers.extend(raw_arguments.iter().map(|&slot| argument_points[slot]));
                 }
+                if let Some(owner) = widened_borrow {
+                    if !matches!(argument_points.as_slice(), [argument]
+                        if self.borrowed_extent_argument(*argument, 0) == Some((owner, None)))
+                    {
+                        return Err(self.missing_context(span, ReferenceAnalysisErrorReason::UnprovedWidenedArrayTransfer));
+                    }
+                }
                 let call = CfgPointKind::Call {
                     expression: expression.clone(),
                     output: 0,
@@ -2319,6 +2345,9 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     })()
                 } else { None };
                 let id = self.point_with_origins(call, span, scope, cast_origins.clone());
+                if let Some(owner) = widened_borrow {
+                    self.aggregate_result.widened_borrowed_extent_calls.push((id, ordinal, owner));
+                }
                 if let Some(formal) = borrowed_extent_formal {
                     self.aggregate_facts.borrowed_extent_observer = Some((id, ordinal, formal));
                 }
@@ -5078,30 +5107,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         }
                         _ => unreachable!("expression item region"),
                     };
-                    let widened_borrow = (|| {
-                        let owners = self.widened_arrays.as_ref()?;
-                        if scope != ReferenceScopeId(0) || !self.generic_parameters.is_empty()
-                            || !matches!(kind, BlockItemKind::FinalOutput(slot) if slot.output == 0)
-                            || !matches!(calls.boundary.root_outputs.as_slice(), [output] if output.ty == ScalarType::U64)
-                            || calls.declared_unsafe_calls.contains(&ordinal.0)
-                        { return None; }
-                        let ScalarExpression::Call { arguments, .. } = expression else { return None };
-                        let [ScalarExpression::CheckedAddress { mutability: ScalarReferenceMutability::Shared, place, .. }] =
-                            arguments.as_slice() else { return None };
-                        let ScalarPlace::Name { name, .. } = place else { return None };
-                        let binding = self.names.get(name)?;
-                        if binding.block_span != block.span || !owners.contains(binding) { return None; }
-                        let [ScalarType::CheckedReference { mutability: ScalarReferenceMutability::Shared, inner }] =
-                            calls.checked_call_signatures.get(&ordinal)?.parameters.as_slice() else { return None };
-                        if !self.binding_types.get(binding).is_some_and(|ty| aggregate::same_runtime_array_type(ty, inner))
-                            || !matches!(self.call_target(expression, ordinal),
-                                Ok(ResolvedCallTarget::ModuleCallable { concrete: ConcreteCallSelection::Declaration, .. }))
-                        { return None; }
-                        Some(binding.declaration_span)
-                    })();
-                    let mode = if let Some(owner) = widened_borrow {
-                        ExpressionReadMode::WidenedBorrowCall(owner)
-                    } else if projected_origins && matches!(kind, BlockItemKind::FinalOutput(_)) {
+                    let mode = if projected_origins && matches!(kind, BlockItemKind::FinalOutput(_)) {
                         ExpressionReadMode::ProjectedOrigins
                     } else {
                         ExpressionReadMode::Ordinary
@@ -5137,19 +5143,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         {
                             self.aggregate_facts.borrowed_extent_forward = Some((value_point, slot.expression));
                         }
-                        if let Some(owner) = widened_borrow {
-                            let argument = match &self.cfg.points[value_point.0].kind {
-                                CfgPointKind::Call { output: 0, argument_points, .. } =>
-                                    match argument_points.as_slice() { [argument] => Some(*argument), _ => None },
-                                _ => None,
-                            };
-                            if argument.and_then(|point| self.borrowed_extent_argument(point, 0)) != Some((owner, None)) {
-                                return Err(self.missing_context(expression_span(expression),
-                                    ReferenceAnalysisErrorReason::UnprovedWidenedArrayTransfer));
-                            }
-                            self.aggregate_facts.borrowed_extent_call = Some((value_point, ordinal, owner, None));
-                            self.aggregate_result.widened_borrowed_extent_required = Some(ordinal);
-                        } else if scope == ReferenceScopeId(0) && slot.output == 0
+                        if scope == ReferenceScopeId(0) && slot.output == 0
                             && matches!(calls.boundary.root_outputs.as_slice(), [output] if output.ty == ScalarType::U64)
                             && !calls.declared_unsafe_calls.contains(&slot.expression.0)
                             && calls.checked_call_signatures.get(&slot.expression).is_some_and(|signature|

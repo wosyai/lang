@@ -12040,6 +12040,8 @@ if (replace() != 3) { core.system_panic(); };
 
 #[test]
 fn widened_array_borrow_shares_exact_backing_and_existing_private_extent_call() {
+    use inkwell::{memory_buffer::MemoryBuffer, values::{CallSiteValue, InstructionOpcode}};
+
     let source = SourceIdentity::new("project".into(), "package".into(), "src/widened_array_borrow.w".into(), "r1".into());
     let text = "%%start
 u64(*(u8[])) extent = fn(view) { core.array_len(&(*view)) };
@@ -12055,13 +12057,15 @@ u64(bool) joined = fn(pick) {
 };
 u64() rebound = fn() {
     u8[] bytes = [11, 13];
+    u64 before = relay(&bytes);
     u8[] incoming = [3, 5, 7];
     bytes = incoming;
-    relay(&bytes)
+    u64 after = relay(&bytes);
+    before * 10 + after
 };
 if (joined(true) != 2) { core.system_panic(); };
 if (joined(false) != 3) { core.system_panic(); };
-if (rebound() != 3) { core.system_panic(); };
+if (rebound() != 23) { core.system_panic(); };
 %%end";
     for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
         for access in [true, false] {
@@ -12112,14 +12116,45 @@ if (rebound() != 3) { core.system_panic(); };
 
             let rebound = self_tail_test_body(&llvm, "i64", &project_function_name(&source, "rebound"));
             assert_eq!(rebound.matches("call void @__wosy_core_free(").count(), 2, "{rebound}");
-            let incoming = rebound.lines().find(|line| line.contains("call ptr @__wosy_core_alloc(i64 3, i64 1)"))
-                .unwrap().trim().split_once(" = ").unwrap().0;
-            assert!(rebound.contains(&format!("ptrtoint ptr {incoming}"))
-                && rebound.contains(&format!("insertvalue {pair} %borrowed_array_argument_address, i64 3, 1")), "{rebound}");
-            assert!(rebound.find("call void @__wosy_core_free(ptr %allocation)").unwrap()
-                < rebound.find(&call).unwrap() && rebound.find(&call).unwrap()
-                < rebound.find(&format!("call void @__wosy_core_free(ptr {incoming})")).unwrap(), "{rebound}");
-            if let Some(out) = std::env::var_os("WOSY_CURRENT_WIDENED_BORROW_IR_DIR") {
+            let context = Context::create();
+            let buffer = MemoryBuffer::create_from_memory_range_copy(llvm.as_bytes(), "exact widened extent calls");
+            let module = context.create_module_from_ir(buffer).expect("parse widened extent LLVM");
+            module.verify().expect("verify widened extent LLVM");
+            let function = module.get_function(&project_function_name(&source, "rebound")).unwrap();
+            let relay = module.get_function(&relay).unwrap();
+            let alloc = module.get_function("__wosy_core_alloc").unwrap();
+            let free = module.get_function("__wosy_core_free").unwrap();
+            let instructions = function.get_basic_blocks().into_iter().flat_map(|block|
+                std::iter::successors(block.get_first_instruction(), |instruction| instruction.get_next_instruction()))
+                .collect::<Vec<_>>();
+            let calls_to = |callee| instructions.iter().enumerate().filter_map(|(position, &instruction)|
+                CallSiteValue::try_from(instruction).ok().filter(|call| call.get_called_fn_value() == Some(callee))
+                    .map(|_| (position, instruction))).collect::<Vec<_>>();
+            let [(before, first_call), (after, second_call)] = calls_to(relay)[..]
+                else { panic!("expected exactly two sealed calls: {rebound}") };
+            let [(_, first_alloc), (_, second_alloc)] = calls_to(alloc)[..]
+                else { panic!("expected exactly two original bases: {rebound}") };
+            let [(free_old, first_free), (free_new, second_free)] = calls_to(free)[..]
+                else { panic!("expected exactly two lexical frees: {rebound}") };
+            for (call, backing, cleanup, count) in [(first_call, first_alloc, first_free, 2),
+                (second_call, second_alloc, second_free, 3)]
+            {
+                let operand = |instruction, index| known_field_operand(instruction, index).unwrap();
+                assert_eq!(operand(backing, 0).into_int_value().get_zero_extended_constant(), Some(count));
+                let extent = operand(call, 0).as_instruction_value().unwrap();
+                assert_eq!(extent.get_opcode(), InstructionOpcode::InsertValue);
+                assert_eq!(extent.get_indices(), vec![1]);
+                assert_eq!(operand(extent, 1).into_int_value().get_zero_extended_constant(), Some(count));
+                let address_lane = operand(extent, 0).as_instruction_value().unwrap();
+                assert_eq!(address_lane.get_opcode(), InstructionOpcode::InsertValue);
+                assert_eq!(address_lane.get_indices(), vec![0]);
+                let address = operand(address_lane, 1).as_instruction_value().unwrap();
+                assert_eq!(address.get_opcode(), InstructionOpcode::PtrToInt);
+                assert_eq!(operand(address, 0).as_instruction_value(), Some(backing));
+                assert_eq!(operand(cleanup, 0).as_instruction_value(), Some(backing));
+            }
+            assert!(before < free_old && free_old < after && after < free_new, "{rebound}");
+            if let Some(out) = std::env::var_os("WOSY_REPEAT_WIDENED_BORROW_IR_DIR") {
                 let target = if layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
                 let controlled = llvm.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);
                 assert_ne!(controlled, llvm);

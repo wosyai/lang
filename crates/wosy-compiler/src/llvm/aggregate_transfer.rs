@@ -310,8 +310,7 @@ pub(super) fn capture_borrowed_extent<'ctx>(
     count: inkwell::values::IntValue<'ctx>,
 ) -> Result<(), String> {
     if let Some(aggregate) = &mut state.aggregate {
-        if !aggregate.plan.borrowed_current_widened_extent
-            && aggregate.plan.borrowed_extent_call.is_some_and(|(_, owner, _)| owner == declaration)
+        if aggregate.plan.borrowed_extent_call.is_some_and(|(_, owner, _)| owner == declaration)
             && aggregate.borrowed_extent.replace(count).is_some()
         {
             return Err("duplicate sealed borrowed array allocation".into());
@@ -347,15 +346,17 @@ pub(super) fn emit_borrowed_extent_call<'ctx>(
     project: Option<ProjectCallScope<'_>>,
 ) -> Result<Option<EmitValue<'ctx>>, String> {
     let Some(plan) = state.aggregate.as_ref().map(|aggregate| aggregate.plan) else { return Ok(None) };
-    let Some((occurrence, declaration, alias)) = plan.borrowed_extent_call else { return Ok(None) };
+    if plan.borrowed_extent_call.is_none() && plan.borrowed_current_widened_extents.is_empty() {
+        return Ok(None);
+    }
     let nodes = state.body_call_nodes.ok_or("missing sealed checked borrow nodes")?;
-    if nodes.expression_ordinal(expression) != Some(occurrence) { return Ok(None); }
-    let (address, count) = if plan.borrowed_current_widened_extent {
+    let Some(occurrence) = nodes.expression_ordinal(expression) else { return Ok(None) };
+    let (address, count) = if let Some(&declaration) = plan.borrowed_current_widened_extents.get(&occurrence) {
         let [ScalarExpression::CheckedAddress { mutability: crate::scalar::ScalarReferenceMutability::Shared,
             place: place @ ScalarPlace::Name { .. }, .. }] = arguments else {
             return Err("sealed widened borrow needs one whole shared place".into());
         };
-        if alias.is_some() || nodes.lexical_place_declaration(place) != Some(declaration) {
+        if nodes.lexical_place_declaration(place) != Some(declaration) {
             return Err("sealed widened borrow changed its checked argument identity".into());
         }
         // Evaluate the place once. The same qualified backing is the key of
@@ -367,6 +368,8 @@ pub(super) fn emit_borrowed_extent_call<'ctx>(
             memory::pointer_integer_type(context, state.target_layout), "address").map_err(builder_error)?;
         (address, count)
     } else {
+        let Some((legacy, declaration, alias)) = plan.borrowed_extent_call else { return Ok(None) };
+        if legacy != occurrence { return Ok(None); }
         let exact = match (arguments, alias) {
             ([ScalarExpression::CheckedAddress { place: place @ ScalarPlace::Name { .. }, .. }], None) =>
                 nodes.lexical_place_declaration(place) == Some(declaration),

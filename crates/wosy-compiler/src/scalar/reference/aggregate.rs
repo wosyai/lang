@@ -1269,7 +1269,7 @@ pub(super) struct AggregateFlowResult {
     pub(super) borrowed_extent_forward: Option<(CfgPointId, OccurrenceOrdinal)>,
     pub(super) borrowed_extent_call: Option<(CfgPointId, OccurrenceOrdinal, ByteSpan, Option<ByteSpan>)>,
     pub(super) array_formal_extent_required: bool,
-    pub(super) widened_borrowed_extent_required: Option<OccurrenceOrdinal>,
+    pub(super) widened_borrowed_extent_calls: Vec<(CfgPointId, OccurrenceOrdinal, ByteSpan)>,
     array_conditional_forwarded: bool,
     pub(super) array_calls: BTreeMap<CfgPointId, (OccurrenceOrdinal, CfgPointId, ReferenceBindingId)>,
     pub(super) array_returns: BTreeSet<Option<ArrayReturnPath>>,
@@ -1503,7 +1503,7 @@ impl AggregateFlowResult {
     }
 
     pub(super) fn has_observations(&self) -> bool {
-        self.widened_literal_factory.is_some() || !self.widened_join_receivers.is_empty() || !self.widened_rebinds.is_empty() || self.borrowed_extent_observer.is_some() || self.borrowed_extent_call.is_some() || self.borrowed_extent_forward.is_some()
+        self.widened_literal_factory.is_some() || !self.widened_join_receivers.is_empty() || !self.widened_rebinds.is_empty() || self.borrowed_extent_observer.is_some() || self.borrowed_extent_call.is_some() || !self.widened_borrowed_extent_calls.is_empty() || self.borrowed_extent_forward.is_some()
             || self.array_formal_extent_required || self.literal_array_index_required.is_some() || self.literal_array_extent_required.is_some() || self.proved_literal_array_route_ref().is_some()
             || (self.checked_producer_authoritative && !self.checked_producer_backing.is_empty())
             || self.checked_backing_assignment.is_some() || self.checked_backing_forward.is_some()
@@ -2981,7 +2981,7 @@ pub(crate) struct ClosedBody {
     pub(crate) borrowed_extent_observer: Option<(usize, ByteSpan)>,
     pub(crate) borrowed_extent_forward: Option<usize>,
     pub(crate) borrowed_extent_call: Option<(usize, ByteSpan, Option<ByteSpan>)>,
-    pub(crate) borrowed_current_widened_extent: bool,
+    pub(crate) borrowed_current_widened_extents: BTreeMap<usize, ByteSpan>,
     pub(crate) array_descriptor_identity: bool,
     pub(crate) array_descriptor_observer: Option<ByteSpan>,
     pub(crate) array_descriptor_forward: Option<usize>,
@@ -5975,10 +5975,16 @@ enum BorrowedExtentRoute {
     Forward(OccurrenceOrdinal, CfgPointId),
 }
 
+#[derive(Clone, Copy)]
+enum BorrowedExtentSource {
+    Allocation(Option<ByteSpan>),
+    WidenedCurrent,
+}
+
 fn seal_borrowed_extent_observers(
     ordinary: &OrdinaryCohorts,
     observations: &BTreeMap<BodyKey, BorrowedExtentRoute>,
-    callers: &[(BodyKey, &Body<'_>, (CfgPointId, OccurrenceOrdinal, ByteSpan, Option<ByteSpan>))],
+    callers: &[(BodyKey, &Body<'_>, CfgPointId, OccurrenceOrdinal, ByteSpan, BorrowedExtentSource)],
     declarations: &HashMap<(&SourceIdentity, ByteSpan), (usize, usize)>,
     bodies: &BTreeMap<BodyKey, Body<'_>>,
     result: &mut ClosedAggregates,
@@ -5986,9 +5992,9 @@ fn seal_borrowed_extent_observers(
 ) {
     if !checked_access || observations.is_empty() { return; }
     let mut sites = HashMap::new();
-    for &(caller, body, (point, occurrence, declaration, alias)) in callers {
+    for &(caller, body, point, occurrence, declaration, source) in callers {
         if let Some(target) = target_body(declarations, body.cfg, point).filter(|target| observations.contains_key(target)) {
-            sites.insert((caller, occurrence.0), (target, declaration, alias));
+            sites.insert((caller, occurrence.0), (target, declaration, source));
         }
     }
     if sites.is_empty() { return; }
@@ -6005,8 +6011,14 @@ fn seal_borrowed_extent_observers(
                 definition.borrowed_extent_forward = Some(call.0),
         }
         for &(caller, call) in ordinary.array_uses[&target].as_ref().expect("complete borrowed extent census") {
-            if let Some(&(_, owner, alias)) = sites.get(&(caller, call)) {
-                result.bodies.entry(caller).or_default().borrowed_extent_call = Some((call, owner, alias));
+            if let Some(&(_, owner, source)) = sites.get(&(caller, call)) {
+                let plan = result.bodies.entry(caller).or_default();
+                match source {
+                    BorrowedExtentSource::Allocation(alias) => plan.borrowed_extent_call = Some((call, owner, alias)),
+                    BorrowedExtentSource::WidenedCurrent => {
+                        plan.borrowed_current_widened_extents.insert(call, owner);
+                    }
+                }
             }
         }
     }
@@ -6653,14 +6665,17 @@ fn closed_aggregates<'a>(
             if facts.array_formal_extent_required {
                 formal_extent_requirements.push((key, body.source));
             }
-            if let Some(call) = facts.widened_borrowed_extent_required {
-                widened_borrowed_extent_requirements.push((key, body.source, call));
+            for &(point, call, owner) in &facts.widened_borrowed_extent_calls {
+                widened_borrowed_extent_requirements.push((key, body.source, call, owner));
+                if body.is_monomorphic && key.2.is_none() {
+                    borrowed_extent_callers.push((key, body, point, call, owner, BorrowedExtentSource::WidenedCurrent));
+                }
             }
             if facts.borrowed_extent_observer.is_some() {
                 borrowed_extent_requirements.push((key, body.source));
             }
-            if let Some(call) = facts.borrowed_extent_call.filter(|_| body.is_monomorphic && key.2.is_none()) {
-                borrowed_extent_callers.push((key, body, call));
+            if let Some((point, call, owner, alias)) = facts.borrowed_extent_call.filter(|_| body.is_monomorphic && key.2.is_none()) {
+                borrowed_extent_callers.push((key, body, point, call, owner, BorrowedExtentSource::Allocation(alias)));
             }
             if let Some(occurrence) = facts.literal_array_extent_required {
                 returned_extent_requirements.push((key, body, occurrence));
@@ -7005,13 +7020,12 @@ fn closed_aggregates<'a>(
             &declarations, &array_descriptor_identities, &bodies, &mut result);
         seal_borrowed_extent_observers(&ordinary, &borrowed_extent_observers, &borrowed_extent_callers,
             &declarations, &bodies, &mut result, reservations.checked_access);
-        for &(key, source, call) in &widened_borrowed_extent_requirements {
-            let Some(plan) = result.bodies.get_mut(&key).filter(|plan|
-                plan.borrowed_extent_call.is_some_and(|(actual, _, alias)| actual == call.0 && alias.is_none()))
-            else {
+        for &(key, source, call, owner) in &widened_borrowed_extent_requirements {
+            if !result.bodies.get(&key).is_some_and(|plan|
+                plan.borrowed_current_widened_extents.get(&call.0) == Some(&owner))
+            {
                 return Err(format!("widened array borrow requires a closed exact extent reader in {source:?}"));
-            };
-            plan.borrowed_current_widened_extent = true;
+            }
         }
         for &(key, source) in &borrowed_extent_requirements {
             if !result.bodies.get(&key).is_some_and(|plan| plan.borrowed_extent_observer.is_some()) {
