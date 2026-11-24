@@ -1799,7 +1799,7 @@ fn run_initializer_call<'a, Observer: ActualIntegerObserver>(
     let named_bool_entry = collection.is_some() && is_integer_type(expected) && proof_site.is_some()
         && named_exact_mixed_pair(&signature.parameters, |ty| ty)
         && topology.structure.checker_direct_targets.get(&occurrence).is_some_and(|&target|
-            matches!(actual.observer.named_exact_watch(target), Some(NamedExactWatch::Observe { .. })));
+            actual.observer.named_exact_watch(target).is_some_and(|watch| !watch.citation));
     #[cfg(not(feature = "internal-checker"))]
     let named_bool_entry = false;
     let allow_bool = named_bool_entry || ((real_input || *expected == ScalarType::Unit)
@@ -1940,9 +1940,10 @@ enum ActualProjectedArguments<'a> {
 }
 
 #[cfg(feature = "internal-checker")]
-enum NamedExactWatch {
-    Observe { nested_work: usize },
-    Citation,
+#[derive(Clone, Copy)]
+struct NamedExactWatch {
+    nested_work: usize,
+    citation: bool,
 }
 
 #[cfg(feature = "internal-checker")]
@@ -2701,9 +2702,15 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             _ => return Err(ProjectCheck::Unsupported),
         };
         #[cfg(feature = "internal-checker")]
-        let watched = if NAMED { self.observer.named_exact_watch(target) } else { None };
+        let watched = if NAMED || ACTUAL_STARTUP { self.observer.named_exact_watch(target) } else { None };
         #[cfg(feature = "internal-checker")]
-        if NAMED && (parent.source != &owner.source || matches!(&watched, Some(NamedExactWatch::Citation))
+        if !NAMED && watched.is_some_and(|watch| watch.citation) {
+            // A previously observed call to this target does not authenticate
+            // another activation on the ordinary, unobserved stack.
+            return Err(ProjectCheck::Unsupported);
+        }
+        #[cfg(feature = "internal-checker")]
+        if NAMED && (parent.source != &owner.source
             || !citation_safe_calling_body(body) || self.active.contains(&target)
             || !matches!(effect, ExactCallEffect::Scalar { binding: Some(_), .. })
             || !named_stack_parameters(&signature.parameters)
@@ -2912,7 +2919,7 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
         #[cfg(feature = "internal-checker")]
         let named_site = if NAMED {
             let occurrence = caller.occurrences.get(call.0).ok_or(ProjectCheck::MissingRootOccurrences)?;
-            let observed_entry = if let Some(NamedExactWatch::Observe { nested_work }) = watched {
+            let observed_entry = if let Some(NamedExactWatch { nested_work, .. }) = watched {
                 let values = match exact {
                     [value] => NamedStackArguments::Unary((*value).clone()),
                     [first, second] => NamedStackArguments::Pair([(*first).clone(), (*second).clone()]),
@@ -3028,12 +3035,18 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             _ => None,
         });
         #[cfg(feature = "internal-checker")]
-        let named_reached = ACTUAL_STARTUP && matches!(self.observer.named_exact_watch(target), Some(NamedExactWatch::Observe { .. }))
+        let named_watch = if ACTUAL_STARTUP { self.observer.named_exact_watch(target) } else { None };
+        #[cfg(feature = "internal-checker")]
+        let named_reached = named_watch.is_some()
             && collection.is_some_and(|(source, _)| source == &owner.source) && named_outer.is_some()
             && named_stack_parameters(&signature.parameters)
             && body.boundary.parameters.len() == signature.parameters.len()
             && (!body.structure.checker_integer_call_locals.is_empty() || named_exact_mixed_pair(&signature.parameters, |ty| ty))
             && supported_integer_continuation(body, expected) && citation_safe_calling_body(body);
+        #[cfg(feature = "internal-checker")]
+        if named_watch.is_some_and(|watch| watch.citation) && !named_reached {
+            return Err(ProjectCheck::Unsupported);
+        }
         #[cfg(not(feature = "internal-checker"))]
         let (named_reached, named_outer) = (false, None);
         let target_module = target.0;
@@ -4620,7 +4633,7 @@ impl<'a> SelectedSymbolicProof<'a, '_> {
             let (shows, citation, following_show) = match step {
                 None => (&[][..], None, None),
                 Some(MainFlowAuthoredShows::Rectangular { shows, .. }) => (shows.as_slice(), None, None),
-                Some(MainFlowAuthoredShows::CallingCitation { peer, show }) => (&[][..], Some(*peer), show.as_ref()),
+                Some(MainFlowAuthoredShows::CallingCitation { peer, show, .. }) => (&[][..], Some(*peer), show.as_ref()),
                 _ => return Err(ProjectCheck::Unsupported),
             };
             charge_call_work(&mut work, shows.len()).ok_or(ProjectCheck::Unsupported)?;
@@ -4679,28 +4692,31 @@ impl<'a> SelectedSymbolicProof<'a, '_> {
         let mut dependencies = issuer.map(|_| reached);
         let mut applicable = false;
         let mut peer_nodes = Vec::new();
+        let mut peer_states = Vec::new();
         let mut peer_path = Vec::new();
-        let mut cited_bounds = PeerPredicateBounds::default();
         if has_citation {
-            peer_nodes = plans.iter().map(|(case, goal, guards, shows, citation, following_show)| {
-                CallingPeerNode::plan(case.proof.start, *citation, *goal, !shows.is_empty() || following_show.is_some(), guards)
-            }).collect();
-            CallingPeerNode::bind_edges(&mut peer_nodes, &mut work)?;
+            for (case, goal, guards, shows, citation, following_show) in &plans {
+                let node = CallingPeerNode::partitioned(case.proof.start, *citation, *goal, !shows.is_empty() || following_show.is_some());
+                peer_states.push(node.entry_state(guards.iter().all(|axis| !axis.is_empty())));
+                peer_nodes.push(node);
+            }
+            CallingPeerNode::bind_edges(&mut peer_nodes, &output.ty, &mut work, |from, to, work|
+                admits_partitioned_citation(&plans[from].2, &plans[to].2, work))?;
         }
         'proofs: for (index, (case, goal, guards, shows, citation, following_show)) in plans.iter().enumerate() {
             if citation.is_some() {
-                CallingPeerNode::establish(&mut peer_nodes, index, following_show.is_some(), &mut peer_path, &output.ty,
-                    &mut cited_bounds, |node, _| {
-                        let Some((relation, bound)) = node.goal else { return false; };
-                        let Ok(domains) = <&[IntegerSet; 2]>::try_from(node.domains) else { return false; };
-                        verify_named_pair_return(body, &returned, domains, PartitionedProofGoal::Literal(relation, bound), &mut work)
+                let resolution = CallingPeerNode::establish(&peer_nodes, &mut peer_states, index, &mut peer_path, |node, terminal| {
+                        let Some((relation, bound)) = node.goal else { return LocalPeerState::Rejected; };
+                        if verify_named_pair_return(body, &returned, &plans[terminal].2, PartitionedProofGoal::Literal(relation, bound), &mut work)
                             .is_some_and(|verified| verified.applicable && verified.failure.is_none())
+                        { LocalPeerState::Terminal(terminal) } else { LocalPeerState::Rejected }
                     })?;
+                if !matches!(resolution, LocalPeerState::Terminal(_)) { return Err(ProjectCheck::Unsupported); }
                 applicable = true;
                 if following_show.is_none() { continue; }
             }
             let bare = shows.is_empty() && following_show.is_none();
-            if has_citation && bare && matches!(peer_nodes[index].state, LocalPeerState::Terminal(_)) {
+            if has_citation && bare && matches!(peer_states[index], LocalPeerState::Terminal(_)) {
                 applicable = true;
                 continue;
             }
@@ -4719,10 +4735,10 @@ impl<'a> SelectedSymbolicProof<'a, '_> {
                 .ok_or(ProjectCheck::Unsupported)?;
             applicable |= checked.applicable;
             if let Some(failure) = checked.failure {
-                if has_citation && bare { peer_nodes[index].state = LocalPeerState::Rejected; }
+                if has_citation && bare { peer_states[index] = LocalPeerState::Rejected; }
                 self.record(case, function, source, effects.records.len(), failure, None)?;
             } else if has_citation && bare && checked.applicable {
-                peer_nodes[index].state = LocalPeerState::Terminal(index);
+                peer_states[index] = LocalPeerState::Terminal(index);
             } else if let (Some(issuer), true) = (issuer, checked.applicable) {
                 let result = match *goal {
                     PartitionedProofGoal::Literal(relation, bound)
@@ -4920,29 +4936,32 @@ impl<'a> SelectedSymbolicProof<'a, '_> {
             });
         let mut applicable = active;
         let mut peer_nodes = Vec::new();
+        let mut peer_states = Vec::new();
         let mut peer_path = Vec::new();
-        let mut cited_bounds = PeerPredicateBounds::default();
         if has_citation {
-            peer_nodes = plans.iter().map(|(case, step, shows, citation, goal, domain)| {
-                CallingPeerNode::plan(case.proof.start, *citation, *goal, step.is_some() || !shows.is_empty(),
-                    std::slice::from_ref(domain))
-            }).collect();
-            CallingPeerNode::bind_edges(&mut peer_nodes, &mut proof_work)?;
+            for (case, step, shows, citation, goal, domain) in &plans {
+                let node = CallingPeerNode::partitioned(case.proof.start, *citation, *goal, step.is_some() || !shows.is_empty());
+                peer_states.push(node.entry_state(!domain.is_empty()));
+                peer_nodes.push(node);
+            }
+            CallingPeerNode::bind_edges(&mut peer_nodes, &output.ty, &mut proof_work, |from, to, work|
+                admits_partitioned_citation(std::slice::from_ref(&plans[from].5), std::slice::from_ref(&plans[to].5), work))?;
         }
         'proofs: for (index, (case, step, ordered_steps, citation, goal, proof_domain)) in plans.iter().enumerate() {
             if citation.is_some() {
-                CallingPeerNode::establish(&mut peer_nodes, index, step.is_some(), &mut peer_path, &output.ty,
-                    &mut cited_bounds, |node, _| {
-                        let (Some((relation, bound)), [domain]) = (node.goal, node.domains) else { return false; };
-                        super::checker_flow::verify_partitioned_call_return(body, &result, domain, false,
+                let resolution = CallingPeerNode::establish(&peer_nodes, &mut peer_states, index, &mut peer_path, |node, terminal| {
+                        let Some((relation, bound)) = node.goal else { return LocalPeerState::Rejected; };
+                        if super::checker_flow::verify_partitioned_call_return(body, &result, &plans[terminal].5, false,
                             PartitionedProofGoal::Literal(relation, bound), Some(&mut proof_work),
                         ).is_some_and(|verified| verified.applicable && verified.failure.is_none())
+                        { LocalPeerState::Terminal(terminal) } else { LocalPeerState::Rejected }
                     })?;
+                if !matches!(resolution, LocalPeerState::Terminal(_)) { return Err(ProjectCheck::Unsupported); }
                 applicable = true;
                 if step.is_none() { continue; }
             }
             let bare = step.is_none() && ordered_steps.is_empty();
-            if has_citation && bare && matches!(peer_nodes[index].state, LocalPeerState::Terminal(_)) {
+            if has_citation && bare && matches!(peer_states[index], LocalPeerState::Terminal(_)) {
                 applicable = true;
                 continue;
             }
@@ -4966,10 +4985,10 @@ impl<'a> SelectedSymbolicProof<'a, '_> {
             ).ok_or(ProjectCheck::Unsupported)?;
             applicable |= verified.applicable;
             if let Some(failure) = verified.failure {
-                if has_citation && bare { peer_nodes[index].state = LocalPeerState::Rejected; }
+                if has_citation && bare { peer_states[index] = LocalPeerState::Rejected; }
                 self.record(case, function, source, effects.records.len(), failure, None)?;
             } else if has_citation && bare && verified.applicable {
-                peer_nodes[index].state = LocalPeerState::Terminal(index);
+                peer_states[index] = LocalPeerState::Terminal(index);
             } else if verified.covers_guard {
                 let bound = case.bound.literal().ok_or(ProjectCheck::Unsupported)?;
                 let issuer = issuer.ok_or(ProjectCheck::Unsupported)?;
@@ -5240,7 +5259,7 @@ struct MainFlowLiteralShow<'a> {
 #[cfg(feature = "internal-checker")]
 enum MainFlowAuthoredShows<'a> {
     Single(MainFlowLiteralShow<'a>),
-    CallingCitation { peer: u32, show: Option<MainFlowLiteralShow<'a>> },
+    CallingCitation { peer: u32, show: Option<MainFlowLiteralShow<'a>>, output_type: &'a ScalarType },
     Entry { span: ByteSpan, slot: usize, relation: IntegerRelation },
     Rectangular {
         shows: Vec<(ByteSpan, RectangularProofShow<'a>)>,
@@ -5616,7 +5635,7 @@ impl<'a> MainFlowProofCase<'a> {
                 Ok(MainFlowLiteralShow { span, relation, bound, same_bound: false })
             }).transpose()?;
             Some(MainFlowAuthoredShows::CallingCitation {
-                peer: wosy_syntax::byte_span(peer.proof).start, show,
+                peer: wosy_syntax::byte_span(peer.proof).start, show, output_type: plan.typed.result_type,
             })
         } else if super::checker_flow::charge_call_work(&mut 0, plan.steps.items.len()).is_some()
             && plan.steps.items.iter().any(|item| flat_rewrite_arguments(item).is_some())
@@ -5789,7 +5808,8 @@ impl<'a> SymbolicEqualityIssuer<'a> {
 
 #[cfg(feature = "internal-checker")]
 struct MainFlowProofTarget<'a> {
-    permits_exact_calling: bool,
+    citation_output_type: Option<&'a ScalarType>,
+    exact_citations: Option<ExactCallingTopology<'a>>,
     nested_observation_work: usize,
     cases: MainFlowProofCases<'a>,
     issuer: Option<SymbolicEqualityIssuer<'a>>,
@@ -5819,23 +5839,32 @@ impl<'a> MainFlowProofTarget<'a> {
         4usize.saturating_add(guard).saturating_add(step_work)
     }
 
+    fn citation_output_type(step: Option<&MainFlowAuthoredShows<'a>>) -> Option<&'a ScalarType> {
+        let Some(MainFlowAuthoredShows::CallingCitation { output_type, .. }) = step else { return None; };
+        Some(output_type)
+    }
+
     fn exact_watch(&self) -> NamedExactWatch {
-        if self.permits_exact_calling {
-            NamedExactWatch::Observe { nested_work: self.nested_observation_work }
-        } else {
-            NamedExactWatch::Citation
-        }
+        NamedExactWatch { nested_work: self.nested_observation_work, citation: self.citation_output_type.is_some() }
     }
 
     fn new((first, step): MainFlowProofPlan<'a>) -> Self {
-        let permits_exact_calling = !matches!(&step, Some(MainFlowAuthoredShows::CallingCitation { .. }));
+        let citation_output_type = Self::citation_output_type(step.as_ref());
         let nested_observation_work = Self::nested_case_work(&first, step.as_ref());
         let cases = if let Some(step) = step {
             MainFlowProofCases::Authored(vec![(first, Some(step))])
         } else {
             MainFlowProofCases::Bare { first, rest: Vec::new() }
         };
-        Self { permits_exact_calling, nested_observation_work, cases, issuer: None, seen: false }
+        Self { citation_output_type, exact_citations: None, nested_observation_work, cases, issuer: None, seen: false }
+    }
+
+    fn compile_exact_citations(&mut self, work: &mut usize) -> Result<(), ProjectCheck> {
+        if let Some(ty) = self.citation_output_type {
+            let MainFlowProofCases::Authored(cases) = &self.cases else { return Err(ProjectCheck::Unsupported); };
+            self.exact_citations = Some(ExactCallingTopology::compile(cases, ty, work)?);
+        }
+        Ok(())
     }
 }
 
@@ -5897,11 +5926,11 @@ impl<'a> MainFlowProofObserver<'a> {
         {
             self.pure_affine_target = None;
         }
-        let permits_exact_calling = !matches!(&proof.1, Some(MainFlowAuthoredShows::CallingCitation { .. }));
+        let citation_output_type = MainFlowProofTarget::citation_output_type(proof.1.as_ref());
         let nested_case_work = MainFlowProofTarget::nested_case_work(&proof.0, proof.1.as_ref());
         if self.first.0 == target {
             self.first.1.issuer = None;
-            self.first.1.permits_exact_calling &= permits_exact_calling;
+            self.first.1.citation_output_type = self.first.1.citation_output_type.or(citation_output_type);
             self.first.1.nested_observation_work = self.first.1.nested_observation_work.saturating_add(nested_case_work);
             self.first.1.cases.push(proof);
             return;
@@ -5910,7 +5939,7 @@ impl<'a> MainFlowProofObserver<'a> {
             std::collections::hash_map::Entry::Occupied(mut entry) => {
                 let group = entry.get_mut();
                 group.issuer = None;
-                group.permits_exact_calling &= permits_exact_calling;
+                group.citation_output_type = group.citation_output_type.or(citation_output_type);
                 group.nested_observation_work = group.nested_observation_work.saturating_add(nested_case_work);
                 group.cases.push(proof);
             }
@@ -5919,6 +5948,14 @@ impl<'a> MainFlowProofObserver<'a> {
                 entry.insert(MainFlowProofTarget { issuer, ..MainFlowProofTarget::new(proof) });
             }
         }
+    }
+
+    fn compile_exact_citations(&mut self) -> Result<(), ProjectCheck> {
+        self.first.1.compile_exact_citations(&mut self.named_exact_work)?;
+        for group in self.other.values_mut() {
+            group.compile_exact_citations(&mut self.named_exact_work)?;
+        }
+        Ok(())
     }
 
     fn complete(&self, reached: &HashSet<(usize, usize)>) -> bool {
@@ -6033,14 +6070,39 @@ impl ActualIntegerObserver for MainFlowProofObserver<'_> {
                     self.incomplete = true;
                     return;
                 }
+                let citations = if let Some(topology) = &proofs.exact_citations {
+                    if topology.source != site.source {
+                        self.incomplete = true;
+                        return;
+                    }
+                    match &site.call {
+                        InitializerProofOrigin::Direct { .. } => {
+                            if super::checker_flow::charge_call_work(&mut self.named_exact_work, proofs.nested_observation_work).is_none() {
+                                self.incomplete = true;
+                                return;
+                            }
+                        }
+                        // The exact stack paid the authored observation charge
+                        // before supplying this occurrence receipt.
+                        InitializerProofOrigin::Stacked { .. } => {}
+                        InitializerProofOrigin::Nested { .. } => { self.incomplete = true; return; }
+                    }
+                    match topology.resolve(cases, arguments, value, &mut self.named_exact_work) {
+                        Ok(states) => Some(states),
+                        Err(_) => {
+                            self.incomplete = true;
+                            return;
+                        }
+                    }
+                } else { None };
                 proofs.seen = true;
-                for (proof, step) in cases {
+                for (index, (proof, step)) in cases.iter().enumerate() {
                     let Some(bound) = proof.bound.for_actual(arguments, parameters) else {
                         self.incomplete = true;
                         return;
                     };
                     let mut applies = || {
-                        if !proof.guard.accepts(arguments) {
+                        if !citations.as_ref().map_or_else(|| proof.guard.accepts(arguments), |verdicts| verdicts.admitted[index]) {
                             return false;
                         }
                         self.active = true;
@@ -6120,10 +6182,28 @@ impl ActualIntegerObserver for MainFlowProofObserver<'_> {
                             if failed.is_none() && proof.relation.accepts(value.cmp(bound.as_ref())) { continue; }
                             failed
                         }
-                        Some(MainFlowAuthoredShows::CallingCitation { .. }) => {
-                            // This capability only verifies unused symbolic partitions.
-                            self.incomplete = true;
-                            return;
+                        Some(MainFlowAuthoredShows::CallingCitation { show, .. }) => {
+                            match citations.as_ref().map(|verdicts| verdicts.citations[index]) {
+                                Some(LocalPeerState::Dormant) => continue,
+                                Some(LocalPeerState::Refuted(_)) => {
+                                    // No dependent fact is available. The bare
+                                    // terminal reports its own actual failure.
+                                    continue;
+                                }
+                                Some(LocalPeerState::Terminal(_)) => self.active = true,
+                                _ => {
+                                    self.incomplete = true;
+                                    return;
+                                }
+                            }
+                            let Some(show) = show else { continue; };
+                            if !show.relation.accepts(value.cmp(show.bound.as_ref())) {
+                                Some(show.span)
+                            } else if proof.relation.accepts(value.cmp(bound.as_ref())) {
+                                continue;
+                            } else {
+                                None
+                            }
                         }
                         Some(MainFlowAuthoredShows::Entry { span, slot, relation }) => {
                             let Some(argument) = arguments.get(*slot) else {
@@ -6142,10 +6222,13 @@ impl ActualIntegerObserver for MainFlowProofObserver<'_> {
                             }
                         }
                         None => {
-                            if !applies() || proof.relation.accepts(value.cmp(bound.as_ref())) {
-                                continue;
+                            if !applies() { continue; }
+                            match citations.as_ref().map(|verdicts| verdicts.peer_states[index]) {
+                                Some(LocalPeerState::Terminal(_)) => continue,
+                                Some(LocalPeerState::Refuted(_)) => None,
+                                _ if proof.relation.accepts(value.cmp(bound.as_ref())) => continue,
+                                _ => None,
                             }
-                            None
                         }
                     };
                     if !emit(proof, failed_step) {
@@ -6724,8 +6807,7 @@ fn check_loaded_ordered_proof_diagnostics_in_scope<const LOCAL_CATALOGS: bool>(
         return run_closed_ranked_checks::<LOCAL_CATALOGS>(&prepared, scope, startup_count, &first_plan, &plans);
     }
     let all_plans = || std::iter::once(&first_plan).chain(&plans);
-    let citations = if LOCAL_CATALOGS && scope == ScalarCheckerScope::CurrentPackage
-        && all_plans().any(|plan| plan.public_calling_citation().is_some())
+    let citations = if LOCAL_CATALOGS && all_plans().any(|plan| plan.public_calling_citation().is_some())
     {
         Some(all_plans().map(|plan| ((plan.proof_source, plan.name), plan)).collect::<HashMap<_, _>>())
     } else {
@@ -6737,6 +6819,7 @@ fn check_loaded_ordered_proof_diagnostics_in_scope<const LOCAL_CATALOGS: bool>(
     for plan in &plans {
         observer.insert(scope, plan.proof_source == &prepared.source, plan, prepare_ordered_public_observation(plan, citations.as_ref())?);
     }
+    observer.compile_exact_citations()?;
     let run = run_prepared_ordered_check(
         &prepared.prepared, scope, startup_count, OrderedReachPolicy::Closed,
         NamedOrderedEvidence { observed: observer },
@@ -7116,6 +7199,7 @@ enum LocalPeerState {
     Pending,
     Visiting,
     Rejected,
+    Refuted(usize),
     Terminal(usize),
 }
 
@@ -7140,71 +7224,157 @@ impl<'a> LocalPeerNode<'a> {
 struct CallingPeerNode<'a> {
     declaration: u32,
     requested: Option<u32>,
-    state: LocalPeerState,
+    has_show: bool,
     next: Option<usize>,
+    immediate_implication: bool,
     goal: Option<(IntegerRelation, &'a BigInt)>,
-    domains: &'a [IntegerSet],
 }
 
 #[cfg(feature = "internal-checker")]
 impl<'a> CallingPeerNode<'a> {
-    fn plan(
+    fn partitioned(
         declaration: u32, requested: Option<u32>, goal: super::checker_flow::PartitionedProofGoal<'a>,
-        has_show: bool, domains: &'a [IntegerSet],
+        has_show: bool,
     ) -> Self {
         let goal = match goal {
             super::checker_flow::PartitionedProofGoal::Literal(relation, bound) => Some((relation, bound)),
             _ => None,
         };
-        Self {
-            declaration, requested, goal, domains, next: None,
-            state: if goal.is_some() && !has_show && domains.iter().all(|domain| !domain.is_empty()) {
-                LocalPeerState::Pending
-            } else {
-                LocalPeerState::Rejected
-            },
-        }
+        Self::plan(declaration, requested, goal, has_show)
     }
 
-    fn bind_edges(nodes: &mut [Self], work: &mut usize) -> Result<(), ProjectCheck> {
+    fn plan(
+        declaration: u32, requested: Option<u32>, goal: Option<(IntegerRelation, &'a BigInt)>,
+        has_show: bool,
+    ) -> Self {
+        Self { declaration, requested, has_show, next: None, immediate_implication: false, goal }
+    }
+
+    fn entry_state(&self, admitted: bool) -> LocalPeerState {
+        if self.goal.is_some() && !self.has_show && admitted { LocalPeerState::Pending }
+        else { LocalPeerState::Rejected }
+    }
+
+    fn bind_edges(
+        nodes: &mut [Self], output_type: &ScalarType, work: &mut usize,
+        mut admits: impl FnMut(usize, usize, &mut usize) -> Result<bool, ProjectCheck>,
+    ) -> Result<(), ProjectCheck> {
         use super::checker_flow::charge_call_work;
-        charge_call_work(work, nodes.len()).ok_or(ProjectCheck::Unsupported)?;
+        // This covers indexing, edge binding, and typed implication.
+        charge_call_work(work, nodes.len().checked_mul(2).ok_or(ProjectCheck::Unsupported)?)
+            .ok_or(ProjectCheck::Unsupported)?;
         let by_declaration = nodes.iter().enumerate().map(|(index, node)| (node.declaration, index))
             .collect::<HashMap<_, _>>();
         if by_declaration.len() != nodes.len() { return Err(ProjectCheck::Unsupported); }
+        let mut bounds = PeerPredicateBounds::default();
         for node in 0..nodes.len() {
             let Some(requested) = nodes[node].requested else { continue; };
             let next = *by_declaration.get(&requested).ok_or(ProjectCheck::Unsupported)?;
-            let (current, cited) = (nodes[node].domains, nodes[next].domains);
-            if current.len() != cited.len() { return Err(ProjectCheck::Unsupported); }
-            for (current, cited) in current.iter().zip(cited) {
-                charge_call_work(work, current.interval_count().checked_add(cited.interval_count())
-                    .and_then(|count| count.checked_add(1)).ok_or(ProjectCheck::Unsupported)?)
-                    .ok_or(ProjectCheck::Unsupported)?;
-                if current.is_empty() || cited.is_empty() || !current.is_subset_of(cited) {
-                    return Err(ProjectCheck::Unsupported);
-                }
-            }
+            if !admits(node, next, work)? { return Err(ProjectCheck::Unsupported); }
             nodes[node].next = Some(next);
+            if !nodes[node].has_show {
+                nodes[node].immediate_implication = match (nodes[next].goal, nodes[node].goal) {
+                    (Some(premise), Some(conclusion)) => bounds.implies(output_type, premise, conclusion),
+                    _ => false,
+                };
+            }
         }
         Ok(())
     }
 
-    fn establish<'ty>(
-        nodes: &mut [Self], index: usize, has_show: bool, path: &mut Vec<(usize, usize)>,
-        output_type: &'ty ScalarType, bounds: &mut PeerPredicateBounds<'ty>,
-        verify: impl FnMut(&Self, usize) -> bool,
-    ) -> Result<(), ProjectCheck> {
+    fn establish(
+        nodes: &[Self], states: &mut [LocalPeerState], index: usize, path: &mut Vec<(usize, usize)>,
+        mut verify: impl FnMut(&Self, usize) -> LocalPeerState,
+    ) -> Result<LocalPeerState, ProjectCheck> {
         // A consumer with its own following show is checked on its original
         // returns. That mixed derivation is not another reusable edge.
-        let first = if has_show { nodes[index].next.ok_or(ProjectCheck::Unsupported)? } else { index };
-        let resolved = resolve_local_peer_path(nodes, first, path, |node| &mut node.state, |node| node.next, verify,
-            |nodes, node, cited, _| match (nodes[cited].goal, nodes[node].goal) {
-                (Some(premise), Some(conclusion)) => bounds.implies(output_type, premise, conclusion),
-                _ => false,
-            });
-        if matches!(resolved, LocalPeerState::Terminal(_)) { Ok(()) } else { Err(ProjectCheck::Unsupported) }
+        let first = if nodes[index].has_show { nodes[index].next.ok_or(ProjectCheck::Unsupported)? } else { index };
+        Ok(resolve_local_peer_path(states, first, path, |state| state, |_, node| nodes[node].next,
+            |_, terminal| verify(&nodes[terminal], terminal),
+            |_, node, _, _| nodes[node].immediate_implication))
     }
+}
+
+#[cfg(feature = "internal-checker")]
+struct ExactCallingTopology<'a> {
+    source: &'a SourceIdentity,
+    nodes: Vec<CallingPeerNode<'a>>,
+}
+
+#[cfg(feature = "internal-checker")]
+struct ExactCallingVerdicts {
+    admitted: Vec<bool>,
+    peer_states: Vec<LocalPeerState>,
+    citations: Vec<LocalPeerState>,
+}
+
+#[cfg(feature = "internal-checker")]
+impl<'a> ExactCallingTopology<'a> {
+    fn compile(
+        cases: &[MainFlowProofPlan<'a>], output_type: &ScalarType, work: &mut usize,
+    ) -> Result<Self, ProjectCheck> {
+        use super::checker_flow::charge_call_work;
+        charge_call_work(work, cases.len()).ok_or(ProjectCheck::Unsupported)?;
+        let source = cases.first().ok_or(ProjectCheck::Unsupported)?.0.proof_source;
+        let mut nodes = Vec::with_capacity(cases.len());
+        for (proof, step) in cases {
+            if proof.proof_source != source { return Err(ProjectCheck::Unsupported); }
+            let (requested, has_show) = match step {
+                Some(MainFlowAuthoredShows::CallingCitation { peer, show, .. }) => (Some(*peer), show.is_some()),
+                None => (None, false),
+                _ => (None, true),
+            };
+            let goal = proof.bound.literal().map(|bound| (proof.relation, bound));
+            nodes.push(CallingPeerNode::plan(proof.proof.start, requested, goal, has_show));
+        }
+        CallingPeerNode::bind_edges(&mut nodes, output_type, work, |_, _, _| Ok(true))?;
+        Ok(Self { source, nodes })
+    }
+
+    fn resolve(
+        &self, cases: &[MainFlowProofPlan<'_>], arguments: &[&BigInt], returned: &BigInt, work: &mut usize,
+    ) -> Result<ExactCallingVerdicts, ProjectCheck> {
+        use super::checker_flow::charge_call_work;
+        // Fresh invocation state and a linear acyclic-path walk only. The
+        // observer separately charges the authored guards and goal/show checks.
+        charge_call_work(work, cases.len().checked_mul(4).ok_or(ProjectCheck::Unsupported)?)
+            .ok_or(ProjectCheck::Unsupported)?;
+        let admitted = cases.iter().map(|(proof, _)| proof.guard.accepts(arguments)).collect::<Vec<_>>();
+        let mut peer_states = self.nodes.iter().zip(&admitted).map(|(node, &admitted)| node.entry_state(admitted))
+            .collect::<Vec<_>>();
+        let mut citations = vec![LocalPeerState::Dormant; cases.len()];
+        let mut path = Vec::new();
+        for (index, node) in self.nodes.iter().enumerate() {
+            let Some(cited) = node.next else { continue; };
+            if !admitted[index] { continue; }
+            if !admitted[cited] { return Err(ProjectCheck::Unsupported); }
+            citations[index] = CallingPeerNode::establish(&self.nodes, &mut peer_states, index, &mut path,
+                |node, terminal| {
+                    let Some((relation, bound)) = node.goal else { return LocalPeerState::Rejected; };
+                    if relation.accepts(returned.cmp(bound)) { LocalPeerState::Terminal(terminal) }
+                    else { LocalPeerState::Refuted(terminal) }
+                })?;
+            if !matches!(citations[index], LocalPeerState::Terminal(_) | LocalPeerState::Refuted(_)) {
+                return Err(ProjectCheck::Unsupported);
+            }
+        }
+        Ok(ExactCallingVerdicts { admitted, peer_states, citations })
+    }
+}
+
+#[cfg(feature = "internal-checker")]
+fn admits_partitioned_citation(
+    current: &[IntegerSet], cited: &[IntegerSet], work: &mut usize,
+) -> Result<bool, ProjectCheck> {
+    use super::checker_flow::charge_call_work;
+    if current.len() != cited.len() { return Ok(false); }
+    for (current, cited) in current.iter().zip(cited) {
+        charge_call_work(work, current.interval_count().checked_add(cited.interval_count())
+            .and_then(|count| count.checked_add(1)).ok_or(ProjectCheck::Unsupported)?)
+            .ok_or(ProjectCheck::Unsupported)?;
+        if current.is_empty() || cited.is_empty() || !current.is_subset_of(cited) { return Ok(false); }
+    }
+    Ok(true)
 }
 
 #[cfg(feature = "internal-checker")]
@@ -7225,20 +7395,16 @@ fn clip_calling_proof_domains(
 #[cfg(feature = "internal-checker")]
 fn resolve_local_peer_path<Node>(
     nodes: &mut [Node], first: usize, path: &mut Vec<(usize, usize)>,
-    state: fn(&mut Node) -> &mut LocalPeerState, next: fn(&Node) -> Option<usize>,
-    mut verify_terminal: impl FnMut(&Node, usize) -> bool,
+    state: fn(&mut Node) -> &mut LocalPeerState, mut next: impl FnMut(&Node, usize) -> Option<usize>,
+    mut verify_terminal: impl FnMut(&Node, usize) -> LocalPeerState,
     mut accepts_edge: impl FnMut(&[Node], usize, usize, usize) -> bool,
 ) -> LocalPeerState {
     let mut node = first;
     let mut resolved = loop {
         match *state(&mut nodes[node]) {
             LocalPeerState::Pending => {
-                let Some(following) = next(&nodes[node]) else {
-                    let outcome = if verify_terminal(&nodes[node], node) {
-                        LocalPeerState::Terminal(node)
-                    } else {
-                        LocalPeerState::Rejected
-                    };
+                let Some(following) = next(&nodes[node], node) else {
+                    let outcome = verify_terminal(&nodes[node], node);
                     *state(&mut nodes[node]) = outcome;
                     break outcome;
                 };
@@ -7251,7 +7417,7 @@ fn resolve_local_peer_path<Node>(
         }
     };
     while let Some((node, following)) = path.pop() {
-        if let LocalPeerState::Terminal(terminal) = resolved {
+        if let LocalPeerState::Terminal(terminal) | LocalPeerState::Refuted(terminal) = resolved {
             if !accepts_edge(nodes, node, following, terminal) {
                 resolved = LocalPeerState::Rejected;
             }
@@ -7340,8 +7506,8 @@ impl<'a> LocalPeerGraph<'a> {
         for first in 0..self.nodes.len() {
             if self.nodes[first].state != LocalPeerState::Pending { continue; }
             resolve_local_peer_path(
-                &mut self.nodes, first, &mut path, |node| &mut node.state, |node| node.next,
-                |_, _| false,
+                &mut self.nodes, first, &mut path, |node| &mut node.state, |node, _| node.next,
+                |_, _| LocalPeerState::Rejected,
                 |nodes, node, _, terminal| {
                     let goal = |index: usize| nodes[index].plan().and_then(PlannedModuleProof::peer_literal_goal);
                     goal(node) == goal(terminal)
@@ -18526,8 +18692,26 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
         let cited_bridge = text.replace("proof outer", r#"proof bridge_base for bridge(entry) -> (out) ensures (out == 7) {}
             proof bridge_citing for bridge(entry) -> (out) ensures (out <= 7) { core.use(bridge_base(entry)); }
             proof outer"#);
-        assert!(matches!(run(&cited_bridge, ScalarCheckerScope::CurrentPackage), Err(ProjectCheck::Unsupported)),
-            "a symbolic-only citation must not borrow actual nested proof authority");
+        for scope in [ScalarCheckerScope::MainFlowOnly, ScalarCheckerScope::CurrentPackage] {
+            assert_eq!(run(&cited_bridge, scope).unwrap().diagnostics.len(), 2);
+            let refuted_bridge = cited_bridge.replace("ensures (out == 7) {}", "ensures (out == 6) {}")
+                .replace("for leaf(entry) -> (out) where (entry >= 0) ensures (out <= 6)",
+                         "for leaf(entry) -> (out) where (entry >= 0) ensures (out <= 7)");
+            let report = run(&refuted_bridge, scope).unwrap();
+            let [first, second] = report.diagnostics.as_slice() else { panic!("both cited calls must report their own premise"); };
+            let snippet = |span: ByteSpan| &refuted_bridge[span.start as usize..span.end as usize];
+            for failure in [first, second] {
+                assert!(snippet(failure.proof.range).starts_with("proof bridge_base"));
+                let site = &failure.invocation;
+                assert_eq!(site.arguments, [(ScalarType::I8, BigInt::from(3))]);
+                assert_eq!(site.returned, BigInt::from(7));
+                assert_eq!(snippet(site.outer_call.as_ref().unwrap().range), "producer(3)");
+                assert_eq!(snippet(site.call.range), "bridge(input)");
+                assert!(site.intermediate_calls.is_empty());
+                assert!(failure.failed_step.is_none());
+            }
+            assert!(first.invocation.call.range.start < second.invocation.call.range.start);
+        }
     }
 
     #[cfg(feature = "internal-checker")]
@@ -18644,22 +18828,62 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
             ("nonimplication", text.replace("out <= 9", "out <= 7")),
             ("false peer", text.replace("ensures (out <= 8) {}", "ensures (out <= 7) {}")),
             ("wrong argument order", text.replace("middle(p,q)", "middle(q,p)")),
-            ("acyclic check", cycle),
+            ("acyclic check", cycle.clone()),
         ] {
             assert!(matches!(run(&rejected, scope), Err(ProjectCheck::Unsupported)), "{label}");
         }
-        assert!(matches!(run(text, ScalarCheckerScope::MainFlowOnly), Err(ProjectCheck::Unsupported)));
-        // A real, otherwise-supported initializer must not borrow symbolic
-        // citation authority. Keep the module name distinct from the local
-        // producer binding so static shadowing cannot mask the reached path.
+        let dormant = run(text, ScalarCheckerScope::MainFlowOnly).unwrap();
+        assert!(!dormant.active && dormant.diagnostics.is_empty() && dormant.symbolic_diagnostic.is_none());
+        // Keep the startup storage distinct from the producer's local binding
+        // so the real initializer, not the static shadowing rule, is checked.
         let reached = text.replace("%%end", &format!(
             "i16 startup_value = producer(3,7); core.require(startup_value == 7, {OUTPUT}); %%end",
         ));
         let control = reached.replace("core.use(middle(p,q));", "").replace("core.use(issued(a,b));", "");
         let supported = run(&control, scope).unwrap();
         assert!(supported.active && supported.diagnostics.is_empty() && supported.directives.is_empty());
-        let rejected = run(&reached, scope);
-        assert!(matches!(rejected, Err(ProjectCheck::Unsupported)), "startup citation: {:?}", rejected.err());
+        for scope in [ScalarCheckerScope::MainFlowOnly, ScalarCheckerScope::CurrentPackage] {
+            let completed = run(&reached, scope).unwrap();
+            assert!(completed.active && completed.diagnostics.is_empty() && completed.directives.is_empty());
+            // The weakened domain fails for an unused symbolic call, but this
+            // actual entry (3,7) establishes every cited guard immediately.
+            let weaker = reached.replace("p >= 2", "p >= -1");
+            assert!(run(&weaker, scope).unwrap().diagnostics.is_empty());
+            let missed = weaker.replace("producer(3,7)", "producer(0,7)");
+            assert!(matches!(run(&missed, scope), Err(ProjectCheck::Unsupported)));
+            let vacuous = reached.replace("p >= 2 && q == 7", "false")
+                .replace("a >= 1 && b >= 7 && b <= 8", "false")
+                .replace("t >= 0 && v >= 6 && v <= 8", "false");
+            assert!(run(&vacuous, scope).unwrap().diagnostics.is_empty());
+            let reached_cycle = cycle.replace("%%end", "i16 startup_value = producer(3,7); %%end");
+            assert!(matches!(run(&reached_cycle, scope), Err(ProjectCheck::Unsupported)));
+            let false_premise = reached.replace("ensures (out <= 8) {}", "ensures (out <= 6) {}");
+            // Keep the immediate predicate implication valid even though
+            // the bare cited proof is actually false at this invocation.
+            let proof_failure = run(&false_premise, scope).unwrap();
+            let [failure] = proof_failure.diagnostics.as_slice() else { panic!("only the false premise should report"); };
+            let snippet = |span: ByteSpan| &false_premise[span.start as usize..span.end as usize];
+            assert!(snippet(failure.proof.range).starts_with("proof issued"));
+            assert!(failure.failed_step.is_none());
+            assert_eq!(snippet(failure.invocation.call.range), "producer(3,7)");
+            assert_eq!(failure.invocation.arguments, [(ScalarType::I16, 3.into()), (ScalarType::I16, 7.into())]);
+            assert_eq!(failure.invocation.returned, BigInt::from(7));
+            let next_call = reached.replace("ensures (out <= 8) {}", "ensures (out == 7) {}")
+                .replace("%%end", "i16 second_value = producer(3,8); %%end");
+            let repeated = run(&next_call, scope).unwrap();
+            let [second_failure] = repeated.diagnostics.as_slice() else { panic!("the first invocation's verdict must not authorize the second"); };
+            let call = second_failure.invocation.call.range;
+            assert_eq!(&next_call[call.start as usize..call.end as usize], "producer(3,8)");
+            assert_eq!(second_failure.invocation.returned, BigInt::from(8));
+            let false_show = reached.replace("core.use(middle(p,q));", "core.use(middle(p,q)); core.show(out > 7);");
+            let failed = run(&false_show, scope).unwrap();
+            let [diagnostic] = failed.diagnostics.as_slice() else { panic!("actual show failure must report"); };
+            let span = diagnostic.failed_step.as_ref().unwrap().range;
+            assert_eq!(&false_show[span.start as usize..span.end as usize], "core.show(out > 7)");
+            assert_eq!(diagnostic.invocation.returned, BigInt::from(7));
+            let no_implication = reached.replace("out <= 9", "out == 7");
+            assert!(matches!(run(&no_implication, scope), Err(ProjectCheck::Unsupported)));
+        }
 
         let unary = r#"%%start
             i8(i8) leaf = fn(n) { if (n >= 0) { 7 } else { 4 } };
@@ -18776,12 +19000,38 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
             ("constant-empty guard", text.replace("arg >= 0", "false")),
             ("empty integer guard", text.replace("arg >= 0", "arg < -128")),
             ("self citation", text.replace("core.use(issued(arg))", "core.use(uses_issued(arg))")),
-            ("startup-reached producer", reached),
         ] {
             let outcome = run(&rejected, scope);
             assert!(matches!(outcome, Err(ProjectCheck::Unsupported)), "{label}: {:?}", outcome.err());
         }
-        assert!(matches!(run(text, ScalarCheckerScope::MainFlowOnly), Err(ProjectCheck::Unsupported)));
+        let dormant = run(text, ScalarCheckerScope::MainFlowOnly).unwrap();
+        assert!(!dormant.active && dormant.directives.is_empty() && dormant.diagnostics.is_empty());
+        assert!(dormant.symbolic_diagnostic.is_none() && dormant.additional_symbolic_diagnostics.is_empty());
+        for scope in [ScalarCheckerScope::MainFlowOnly, ScalarCheckerScope::CurrentPackage] {
+            let actual = run(&reached, scope).unwrap();
+            assert!(actual.active && actual.directives.is_empty() && actual.diagnostics.is_empty());
+            assert!(actual.symbolic_diagnostic.is_none() && actual.additional_symbolic_diagnostics.is_empty());
+
+            // The successful check above must have used the real stored
+            // return, rather than skipping the initializer or requirement.
+            let wrong_storage = reached.replace("saved == 7", "saved == 6");
+            let executed = run(&wrong_storage, scope).unwrap();
+            let [requirement] = executed.directives.as_slice() else { panic!("the reached requirement must report"); };
+            assert_eq!(requirement.operation, ScalarCheckerOperation::Require);
+            assert!(executed.diagnostics.is_empty() && executed.symbolic_diagnostic.is_none());
+
+            // out == 6 still implies the consumer's out <= 7, but the bare
+            // premise fails exactly where this producer actually returned 7.
+            let failed_premise = reached.replace("out == 7", "out == 6");
+            let refuted = run(&failed_premise, scope).unwrap();
+            let [failure] = refuted.diagnostics.as_slice() else { panic!("the reached premise must report"); };
+            let snippet = |span: ByteSpan| &failed_premise[span.start as usize..span.end as usize];
+            assert!(snippet(failure.proof.range).starts_with("proof issued"));
+            assert_eq!(snippet(failure.invocation.call.range), "producer(3)");
+            assert_eq!(failure.invocation.arguments, [(ScalarType::I8, BigInt::from(3))]);
+            assert_eq!(failure.invocation.returned, BigInt::from(7));
+            assert!(failure.failed_step.is_none() && refuted.directives.is_empty() && refuted.symbolic_diagnostic.is_none());
+        }
     }
 
     #[cfg(feature = "internal-checker")]

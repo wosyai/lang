@@ -2038,7 +2038,30 @@ startup_rectangular_citation = ordered_rectangular_citation.replace("%%end", f""
 cases.extend([
     ("exact-startup-rectangular-citation-control", startup_rectangular_citation
         .replace("core.use(middle(p,q));", "").replace("core.use(issued(a,b));", ""), 0, b""),
-    ("exact-startup-rectangular-citation-refused", startup_rectangular_citation, 2, b"unsupported analysis"),
+    ("exact-startup-rectangular-citation-proved", startup_rectangular_citation, 0, b""),
+    ("exact-startup-rectangular-citation-guard-at-actual-point",
+        startup_rectangular_citation.replace("p >= 2", "p >= -1"), 0, b""),
+    ("exact-startup-rectangular-citation-inapplicable-peer",
+        startup_rectangular_citation.replace("p >= 2", "p >= -1").replace("producer(3,7)", "producer(0,7)"),
+        2, b"unsupported analysis"),
+    ("exact-startup-rectangular-citation-refuted-premise",
+        startup_rectangular_citation.replace("ensures (out <= 8) {}", "ensures (out <= 6) {}"),
+        1, b"proof obligation failed"),
+    ("exact-startup-rectangular-citation-refuted-show",
+        startup_rectangular_citation.replace("core.use(middle(p,q));", "core.use(middle(p,q)); core.show(out > 7);"),
+        1, b"proof obligation failed"),
+    ("exact-startup-rectangular-citation-no-implication",
+        startup_rectangular_citation.replace("out <= 9", "out == 7"), 2, b"unsupported analysis"),
+])
+stacked_startup_citation = stacked_named_calling_producer.replace(
+    "proof inner for leaf(entry) -> (out) where (entry >= 0) ensures (out <= 6) {}",
+    """proof premise for bridge(entry) -> (out) ensures (out == 7) {}
+    proof conclusion for bridge(entry) -> (out) ensures (out <= 8) { core.use(premise(entry)); }""")
+cases.extend([
+    ("exact-startup-citation-stacked-call-proved", stacked_startup_citation, 0, b""),
+    ("exact-startup-citation-stacked-call-refuted",
+        stacked_startup_citation.replace("ensures (out == 7) {}", "ensures (out == 6) {}"),
+        1, b"proof obligation failed"),
 ])
 cases.extend([
     ("ordered-calling-citation-unary-stronger-guard", ordered_calling_citation.replace("arg >= 0", "arg >= 1 && arg <= 5", 1),
@@ -2193,6 +2216,9 @@ correlated_array_witness = """%%start
 cases.append(("ordinary-fixed-array-symbolic-cells-correlated", correlated_array_witness, 1, b"proof obligation failed"))
 proof_diagnostic_notes = {
     "ordered-calling-citation-pair-show-refuted": b"symbolic call can return 7",
+    "exact-startup-rectangular-citation-refuted-premise": b"call returned 7",
+    "exact-startup-rectangular-citation-refuted-show": b"core.show(out > 7)",
+    "exact-startup-citation-stacked-call-refuted": b"reached from this call",
     "ordinary-verified-unary-entry-refuted": b"symbolic call can return 2",
     "exact-startup-verified-unary-entry-refuted": b"call returned 5",
     "ordinary-fixed-array-symbolic-cells-correlated": b"symbolic call can return cell [0] = 6",
@@ -2929,7 +2955,9 @@ with tempfile.TemporaryDirectory(prefix="affine-calls-") as path:
         for scope in ("--main-flow-only","--declared-package"):
             for name,text,expected,stderr in cases:
                 included = scope == "--declared-package" or name.startswith("exact-startup-")
-                main_flow_citation_refusal = scope == "--main-flow-only" and name.startswith("ordered-calling-citation-")
+                # Root scope skips unused valid citation declarations. Static
+                # plan/shape refusal remains independent of authored reach.
+                main_flow_citation_refusal = scope == "--main-flow-only" and name == "ordered-calling-citation-pair-arguments-swapped"
                 code = 2 if main_flow_citation_refusal else (expected if included else 0)
                 expected_stderr = b"unsupported analysis" if main_flow_citation_refusal else (stderr if included else b"")
                 (root/"src/main.w").write_text(text.strip()+"\n")
@@ -2969,6 +2997,9 @@ with tempfile.TemporaryDirectory(prefix="affine-calls-") as path:
                         assert b"COPY-PRIOR-UNPUBLISHED" not in res.stderr and b"COPY-FORMAL-UNPUBLISHED" not in res.stderr,res
                 elif included and name in proof_diagnostic_notes:
                     assert expected_stderr in res.stderr and proof_diagnostic_notes[name] in res.stderr,res
+                    if name == "exact-startup-rectangular-citation-refuted-premise":
+                        assert res.stderr.count(b"proof obligation failed") == 1, res
+                        assert b"proof issued" in res.stderr and b"producer(3,7)" in res.stderr, res
                     if name == "ordinary-verified-unary-entry-refuted":
                         assert b"symbolic call entry: value = 1" in res.stderr,res
                     if name == "ordinary-fixed-array-symbolic-cells-correlated":

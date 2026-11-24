@@ -34,6 +34,12 @@ analysis or rejected output preflight exits 2 without writing authored stdout
 or stderr or publishing any requested file. The checker does not yet support
 all language and proof constructs.
 
+In the supported scalar calling proofs, a named `core.use` on a reached
+startup call checks the cited precondition at that call's actual entry and
+the cited proof against that same return. It does not evaluate a second call
+or substitute a symbolic summary for the reached result. Unused functions
+are checked only in the declared-package scope.
+
 Check diagnostics and stream output work on native CLI hosts. Authored file
 output currently requires a Linux CLI host and a flat filename under
 `.wosy/outputs/check/`; other file requests are refused before authored output
