@@ -185,6 +185,9 @@ trait ScopedAuthoredReturn<'a>: Copy {
     const OBSERVE_FIXED_ARRAY: bool = false;
 
     #[cfg(feature = "internal-checker")]
+    fn take_fixed_array_entries(self) -> Option<(usize, IntegerInputs)> { None }
+
+    #[cfg(feature = "internal-checker")]
     fn observe_fixed_array(
         self, _: &'a FunctionCallSites, _: FinalOutputSlot, _: &ScalarType, _: &IntegerRoots<'a>, _: &IntegerInputs,
     ) -> Option<()> { None }
@@ -4236,6 +4239,7 @@ struct FixedArrayObservationState<'cursor, 'claims> {
     applied: Vec<bool>,
     returned: Option<Vec<BigInt>>,
     exact_checks: Option<&'cursor mut [Option<FixedArrayCheck<'claims>>]>,
+    symbolic_entries: Option<(usize, IntegerInputs)>,
 }
 
 #[cfg(feature = "internal-checker")]
@@ -4266,9 +4270,9 @@ impl FixedArrayCheck<'_> {
 pub(super) struct FixedArraySymbolicCheck<'a> {
     pub(super) check: FixedArrayCheck<'a>,
     pub(super) enabled: bool,
-    // A distinct unary where domain, when the canonical walk starts in
-    // the union of several proof domains. None uses the common entry.
-    pub(super) entry: Option<&'a IntegerSet>,
+    // A claim's original parameter domains, not the marginals of the
+    // shared row union. None means the common entry applies as-is.
+    pub(super) entry: Option<&'a [IntegerSet]>,
 }
 
 #[cfg(feature = "internal-checker")]
@@ -4293,6 +4297,13 @@ impl<'body> ScopedAuthoredReturn<'body> for FixedArrayObservation<'_, '_, '_> {
     const REQUIRE_TOTAL_RETURN: bool = true;
 
     fn allows_extended_scalar_locals(self) -> bool { true }
+
+    fn take_fixed_array_entries(self) -> Option<(usize, IntegerInputs)> {
+        match self.mode {
+            FixedArrayObservationMode::Symbolic(_) => self.state.borrow_mut().symbolic_entries.take(),
+            FixedArrayObservationMode::Exact => None,
+        }
+    }
 
     fn at(
         self, _: &FunctionCallSites, _: BlockOrdinal, _: FinalOutputSlot, _: &ScalarType,
@@ -4620,29 +4631,29 @@ struct UnwitnessedArrayRows<'a> {
 
 #[cfg(feature = "internal-checker")]
 impl<'a> UnwitnessedArrayRows<'a> {
-    fn new(path: &'a [IntegerRow], entry: Option<&IntegerSet>, work: &mut usize) -> Option<Self> {
+    fn new(path: &'a [IntegerRow], entry: Option<&[IntegerSet]>, work: &mut usize) -> Option<Self> {
         charge_call_work(work, path.len())?;
         let mut rows = Vec::with_capacity(path.len());
         let mut left = 0;
-        for original in path {
-            let row = if let Some(entry) = entry {
-                let domain = original.get(0)?;
-                charge_call_work(work, domain.interval_count().checked_add(entry.interval_count())?)?;
+        'sources: for original in path {
+            let mut row = Cow::Borrowed(original);
+            for (axis, entry) in entry.into_iter().flatten().enumerate() {
+                let domain = row.get(axis)?;
+                charge_call_work(work, domain.interval_count().checked_add(entry.interval_count())?.checked_add(1)?)?;
                 match domain.intersection(entry) {
-                    IntegerIntersection::Unchanged => Some(Cow::Borrowed(original)),
-                    IntegerIntersection::Empty => None,
+                    IntegerIntersection::Unchanged => {}
+                    IntegerIntersection::Empty => { rows.push(None); continue 'sources; }
                     IntegerIntersection::Changed(set) => {
-                        charge_call_work(work, original.len().checked_add(original.equal_axes().len())?)?;
-                        original.charge_affine_replacement(0, set.interval_count(), work)?;
+                        let copy = if matches!(row, Cow::Borrowed(_)) { row.len() } else { 0 };
+                        charge_call_work(work, copy.checked_add(row.equal_axes().len())?)?;
+                        row.charge_affine_replacement(axis, set.interval_count(), work)?;
                         charge_call_work(work, 0)?;
-                        let mut row = original.clone();
-                        row.replace_domain(0, Rc::new(set));
-                        Some(Cow::Owned(row))
+                        row.to_mut().replace_domain(axis, Rc::new(set));
                     }
                 }
-            } else { Some(Cow::Borrowed(original)) };
-            left += usize::from(row.is_some());
-            rows.push(row);
+            }
+            left += 1;
+            rows.push(Some(row));
         }
         Some(Self { rows, left })
     }
@@ -4682,18 +4693,129 @@ pub(super) fn take_array_return_observations() -> (usize, usize) {
     ARRAY_RETURN_OBSERVATIONS.with(|observations| observations.replace((0, 0)))
 }
 
+#[cfg(feature = "internal-checker")]
+pub(super) enum FixedArrayEntries<'a> {
+    Common(&'a [CheckerPredicate]),
+    Guarded { arity: usize, rectangles: &'a [[IntegerSet; 2]] },
+}
+
+/// The exact union of the authored entry rectangles. A first-axis edge
+/// changes which guards are active, so each slice can use only the second
+/// axes of those active rectangles. Emitted slices do not overlap.
+#[cfg(feature = "internal-checker")]
+fn fixed_array_entry_rows(arity: usize, rectangles: &[[IntegerSet; 2]], work: &mut usize) -> Option<IntegerInputs> {
+    let sorted_work = |count: usize| {
+        let order = (usize::BITS - count.leading_zeros()) as usize;
+        count.checked_mul(order + 2)
+    };
+    charge_call_work(work, rectangles.len())?;
+    if arity == 1 {
+        let intervals = rectangles.iter().try_fold(0usize, |total, domains| total.checked_add(domains[0].interval_count()))?;
+        charge_call_work(work, sorted_work(intervals)?)?;
+        let domain = IntegerSet::union(rectangles.iter().map(|domains| &domains[0]));
+        return Some(if domain.is_empty() { IntegerInputs::default() }
+            else { IntegerInputs(vec![IntegerRow::new(vec![Rc::new(domain)])]) });
+    }
+    if arity != 2 { return None; }
+    let edges = rectangles.iter().filter(|domains| !domains[1].is_empty())
+        .try_fold(0usize, |total, domains| total.checked_add(domains[0].interval_count().checked_mul(2)?))?;
+    charge_call_work(work, sorted_work(edges)?.checked_mul(2)?)?;
+    let mut events = Vec::with_capacity(edges);
+    for (id, [first, second]) in rectangles.iter().enumerate() {
+        if second.is_empty() { continue; }
+        for (low, high) in first.intervals() {
+            events.push((low.clone(), id, true));
+            // This is only the open upper edge, never a value in a row.
+            events.push((high + 1, id, false));
+        }
+    }
+    events.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    let mut events = events.into_iter().peekable();
+    let mut active = std::collections::BTreeSet::<usize>::new();
+    let mut start = None;
+    let mut slices: Vec<[IntegerSet; 2]> = Vec::new();
+    while let Some((edge, id, add)) = events.next() {
+        if let Some(first) = start.replace(edge.clone()).filter(|_| !active.is_empty()) {
+            charge_call_work(work, active.len())?;
+            let intervals = active.iter().try_fold(0usize, |total, &id| {
+                total.checked_add(rectangles.get(id)?[1].interval_count())
+            })?;
+            charge_call_work(work, sorted_work(intervals)?.checked_add(2)?)?;
+            let second = IntegerSet::union(active.iter().map(|&id| &rectangles[id][1]));
+            let first = IntegerSet::closed_interval(first, &edge - 1)?;
+            if let Some([prior_first, prior_second]) = slices.last_mut() {
+                charge_call_work(work, prior_second.interval_count().checked_add(second.interval_count())?)?;
+                if *prior_second == second {
+                    charge_call_work(work, prior_first.interval_count().checked_add(1)?)?;
+                    *prior_first = std::mem::take(prior_first).join(first);
+                } else {
+                    slices.push([first, second]);
+                }
+            } else {
+                slices.push([first, second]);
+            }
+        }
+        let mut record = |id, add| if add { active.insert(id) } else { active.remove(&id) };
+        if !record(id, add) { return None; }
+        while events.peek().is_some_and(|event| event.0 == edge) {
+            let (_, id, add) = events.next()?;
+            if !record(id, add) { return None; }
+        }
+    }
+    if !active.is_empty() { return None; }
+    charge_call_work(work, slices.len().checked_mul(3)?)?;
+    Some(IntegerInputs(slices.into_iter().map(|row|
+        IntegerRow::new(row.into_iter().map(Rc::new).collect())).collect()))
+}
+
+#[cfg(all(test, feature = "internal-checker"))]
+#[test]
+fn fixed_array_rectangle_union_has_exactly_one_row_for_each_covered_point() {
+    let closed = |first: i16, last: i16| IntegerSet::closed_interval(first.into(), last.into()).unwrap();
+    let first = closed(-2, 1).join(closed(5, 5));
+    let second = closed(-1, 0).join(closed(2, 2));
+    let rectangles = [
+        [first, second],
+        [closed(0, 4), closed(1, 2)],
+        [closed(4, 7), closed(-2, 0)],
+        [closed(1, 3), IntegerSet::default()],
+        [closed(3, 4), closed(1, 2)],
+        [closed(255, 255), closed(4, 4)],
+    ];
+    let mut work = 0;
+    let rows = fixed_array_entry_rows(2, &rectangles, &mut work).unwrap();
+    for x in -3..=256i16 {
+        for y in -3..=5i16 {
+            let [x, y] = [BigInt::from(x), BigInt::from(y)];
+            let expected = rectangles.iter().any(|[a, b]| a.contains(&x) && b.contains(&y));
+            let times = rows.0.iter().filter(|row| row[0].contains(&x) && row[1].contains(&y)).count();
+            assert_eq!(times, usize::from(expected), "coverage at ({x}, {y})");
+        }
+    }
+    assert!(fixed_array_entry_rows(2, &[[closed(1, 2), IntegerSet::default()]], &mut 0)
+        .unwrap().is_unreachable());
+    let mut almost_exhausted = MAX_PARTITION_TRANSFER_WORK - 3;
+    assert!(fixed_array_entry_rows(2, &rectangles, &mut almost_exhausted).is_none());
+}
+
 /// Read-only consumer of the same prepared blocks, local capture axes and
 /// branch partitions as ordinary scalar checking. No aggregate summary is issued.
 #[cfg(feature = "internal-checker")]
 pub(super) fn observe_fixed_array_returns(
-    calls: &FunctionCallSites, result: &ScalarType, entry_filter: Option<&[CheckerPredicate]>,
+    calls: &FunctionCallSites, result: &ScalarType, entry: FixedArrayEntries<'_>,
     checks: &[FixedArraySymbolicCheck<'_>], work: &mut usize,
 ) -> Option<Vec<ProofCoverage<Option<FixedArrayReturnFailure>>>> {
     if !matches!(result, ScalarType::Array { .. }) { return None; }
     charge_call_work(work, checks.len())?;
+    let (entry_filter, symbolic_entries) = match entry {
+        FixedArrayEntries::Common(filter) => (Some(filter), None),
+        FixedArrayEntries::Guarded { arity, rectangles } =>
+            (None, Some((arity, fixed_array_entry_rows(arity, rectangles, work)?))),
+    };
     let fresh = || (0..checks.len()).map(|_| None).collect();
     let state = std::cell::RefCell::new(FixedArrayObservationState {
-        work: *work, failures: fresh(), applied: vec![false; checks.len()], returned: None, exact_checks: None,
+        work: *work, failures: fresh(), applied: vec![false; checks.len()], returned: None,
+        exact_checks: None, symbolic_entries,
     });
     let observer = FixedArrayObservation { mode: FixedArrayObservationMode::Symbolic(checks), state: &state };
     #[cfg(test)]
@@ -4717,7 +4839,7 @@ pub(super) fn collect_exact_fixed_array_return<'claims>(
 ) -> Option<(Vec<BigInt>, Vec<Option<FixedArrayReturnFailure>>)> {
     let state = std::cell::RefCell::new(FixedArrayObservationState {
         work: *work, failures: (0..checks.len()).map(|_| None).collect(), applied: Vec::new(),
-        returned: None, exact_checks: Some(checks),
+        returned: None, exact_checks: Some(checks), symbolic_entries: None,
     });
     let observer = FixedArrayObservation { mode: FixedArrayObservationMode::Exact, state: &state };
     #[cfg(test)]
@@ -5237,53 +5359,66 @@ fn run_integer_callable<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool,
     }
     let projected = if COLLECT { failures.as_deref_mut()?.projected.take() } else { None };
     let projected_slot = projected.as_ref().map(|(slot, _)| *slot);
-    let mut row: IntegerRow = if let Some((slot, row)) = projected {
-        if row.len() != boundary.parameters.len() || row.get(slot)?.is_empty() {
+    #[cfg(feature = "internal-checker")]
+    let fixed_array_entries = Authored::OBSERVE_FIXED_ARRAY.then(|| authored_return.take_fixed_array_entries()).flatten();
+    #[cfg(not(feature = "internal-checker"))]
+    let fixed_array_entries: Option<(usize, IntegerInputs)> = None;
+    let entry = if let Some((arity, entries)) = fixed_array_entries {
+        if entry_filter.is_some() || exact_arguments.is_some() || projected.is_some() || arity != roots.parameters {
             return None;
         }
-        row
-    } else if let Some(arguments) = exact_arguments {
-        if arguments.len() != boundary.parameters.len() {
-            return None;
-        }
-        exact_integer_entry_row(arguments)
+        if entries.is_unreachable() { return Some(Ok(ProofCoverage::NoApplicableInputs)); }
+        entries
     } else {
-        #[cfg(feature = "internal-checker")]
-        let allow_bool = Authored::ALLOW_ORDINARY_INTEGER_LOCALS;
-        #[cfg(not(feature = "internal-checker"))]
-        let allow_bool = false;
-        boundary.parameters.iter()
-            .map(|parameter| ordinary_parameter_set(&parameter.ty, allow_bool).map(Rc::new))
-            .collect::<Option<IntegerRow>>()?
-    };
-    for filter in entry_filter.into_iter().flatten() {
-        match filter {
-            CheckerPredicate::Boolean(true) => {}
-            CheckerPredicate::Boolean(false) => return Some(Ok(ProofCoverage::NoApplicableInputs)),
-            CheckerPredicate::NamedBoolEntry { .. } | CheckerPredicate::DirectiveDisjunction { .. }
-            | CheckerPredicate::ProofReflexiveBranch(_) => return None,
-            CheckerPredicate::EntryDomain { binding, values } => {
-                let (axis, _) = roots.lookup(binding)?;
-                match row[axis].intersection(values) {
-                    IntegerIntersection::Unchanged => {}
-                    IntegerIntersection::Empty => return Some(Ok(ProofCoverage::NoApplicableInputs)),
-                    IntegerIntersection::Changed(filtered) => row[axis] = Rc::new(filtered),
-                }
+        let mut row: IntegerRow = if let Some((slot, row)) = projected {
+            if row.len() != boundary.parameters.len() || row.get(slot)?.is_empty() {
+                return None;
             }
-            CheckerPredicate::Integer(predicate) => {
-                let (axis, ty) = roots.lookup(&predicate.binding)?;
-                if ty != &predicate.ty {
-                    return None;
+            row
+        } else if let Some(arguments) = exact_arguments {
+            if arguments.len() != boundary.parameters.len() {
+                return None;
+            }
+            exact_integer_entry_row(arguments)
+        } else {
+            #[cfg(feature = "internal-checker")]
+            let allow_bool = Authored::ALLOW_ORDINARY_INTEGER_LOCALS;
+            #[cfg(not(feature = "internal-checker"))]
+            let allow_bool = false;
+            boundary.parameters.iter()
+                .map(|parameter| ordinary_parameter_set(&parameter.ty, allow_bool).map(Rc::new))
+                .collect::<Option<IntegerRow>>()?
+        };
+        for filter in entry_filter.into_iter().flatten() {
+            match filter {
+                CheckerPredicate::Boolean(true) => {}
+                CheckerPredicate::Boolean(false) => return Some(Ok(ProofCoverage::NoApplicableInputs)),
+                CheckerPredicate::NamedBoolEntry { .. } | CheckerPredicate::DirectiveDisjunction { .. }
+                | CheckerPredicate::ProofReflexiveBranch(_) => return None,
+                CheckerPredicate::EntryDomain { binding, values } => {
+                    let (axis, _) = roots.lookup(binding)?;
+                    match row[axis].intersection(values) {
+                        IntegerIntersection::Unchanged => {}
+                        IntegerIntersection::Empty => return Some(Ok(ProofCoverage::NoApplicableInputs)),
+                        IntegerIntersection::Changed(filtered) => row[axis] = Rc::new(filtered),
+                    }
                 }
-                let kept = row[axis].keep(&predicate.operator, &predicate.bound)?;
-                if kept.is_empty() {
-                    return Some(Ok(ProofCoverage::NoApplicableInputs));
+                CheckerPredicate::Integer(predicate) => {
+                    let (axis, ty) = roots.lookup(&predicate.binding)?;
+                    if ty != &predicate.ty {
+                        return None;
+                    }
+                    let kept = row[axis].keep(&predicate.operator, &predicate.bound)?;
+                    if kept.is_empty() {
+                        return Some(Ok(ProofCoverage::NoApplicableInputs));
+                    }
+                    row[axis] = Rc::new(kept);
                 }
-                row[axis] = Rc::new(kept);
             }
         }
-    }
-    let result = walk_integer_block::<USE_IMPORTED_BOUND, COLLECT, _>(calls, &mut roots, calls.structure.root, IntegerInputs(vec![row]), tail, returns, &mut handle_call, &mut failures, &mut imports, authored_return)?;
+        IntegerInputs(vec![row])
+    };
+    let result = walk_integer_block::<USE_IMPORTED_BOUND, COLLECT, _>(calls, &mut roots, calls.structure.root, entry, tail, returns, &mut handle_call, &mut failures, &mut imports, authored_return)?;
     #[cfg(feature = "internal-checker")]
     if Authored::REQUIRE_TOTAL_RETURN && !matches!(result, IntegerControl::Returned) {
         return None;

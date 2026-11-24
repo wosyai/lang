@@ -2578,13 +2578,42 @@ array_cohort_rectangles = """%%start
     proof second for make(x, y) -> (items) where (x == 1 && y == 2)
         forall (u64 i where i == 1) ensures (items[i] == 2) {}
 %%end"""
+array_cohort_overlap = """%%start
+    u8[2](u8,u8) make = fn(key, value) { [value, key] };
+    proof first for make(a, b) -> (items)
+        where (a <= 6 && (b == 0 || b == 5))
+        forall (u64 i where i == 0) ensures (items[i] <= 5) {}
+    proof second for make(x, y) -> (items)
+        where (x >= 3 && x <= 8 && (y == 5 || y == 9))
+        ensures (exists (u64 i where i == 0) { items[i] >= 5 }) {}
+    proof third for make(t, u) -> (items)
+        where (t >= 3 && t <= 8 && (u == 5 || u == 9))
+        forall (u64 i where i == 1) ensures (items[i] <= 8) {}
+%%end"""
+array_cohort_split_arithmetic = """%%start
+    u8[2](u8,u8) make = fn(tag, value) {
+        if (tag == 0) { [value + 1, tag] } else { [value, tag] }
+    };
+    proof low for make(a,b) -> (items) where (a == 0 && b < 255)
+        forall (u64 i where i == 0) ensures (items[i] >= 1) {}
+    proof high for make(x,y) -> (items) where (x == 255 && y == 255)
+        forall (u64 i where i == 0) ensures (items[i] == 255) {}
+%%end"""
 cases.extend([
+    ("ordinary-array-proof-rectangles-overlap-proved", array_cohort_overlap, 0, b""),
+    ("ordinary-array-proof-rectangles-overlap-refuted", array_cohort_overlap.replace("items[i] <= 8", "items[i] != 4"),
+        1, b"proof obligation failed"),
+    ("ordinary-array-proof-rectangles-no-cross-product", array_cohort_split_arithmetic, 0, b""),
+    ("ordinary-array-proof-rectangles-minmax-witness", array_cohort_split_arithmetic.replace("items[i] == 255", "items[i] == 254"),
+        1, b"proof obligation failed"),
+    ("ordinary-array-proof-rectangles-refuses-actual-overflow", array_cohort_split_arithmetic.replace("b < 255", "b <= 255"),
+        2, b"unsupported analysis"),
     ("ordinary-array-proof-cohort-union-proved", array_cohort_symbolic, 0, b""),
     ("ordinary-array-proof-cohort-union-refuted", array_cohort_symbolic.replace("items[i] >= 0", "items[i] > 0")
         .replace("items[i] == 6", "items[i] == 8").replace("items[i] <= 2", "items[i] < 2"), 1, b"proof obligation failed"),
     ("ordinary-array-proof-cohort-shared-rectangle", array_cohort_rectangles, 0, b""),
-    ("ordinary-array-proof-cohort-rejects-cross-product", array_cohort_rectangles.replace("x == 1 && y == 2", "x == 2 && y == 1"),
-        2, b"unsupported analysis"),
+    ("ordinary-array-proof-cohort-distinct-rectangle-refuted", array_cohort_rectangles.replace("x == 1 && y == 2", "x == 2 && y == 1"),
+        1, b"proof obligation failed"),
     ("exact-startup-array-proof-cohort-proved", array_cohort_actual, 0, b""),
     ("exact-startup-array-proof-cohort-refuted", array_cohort_actual.replace("items[i] == 3", "items[i] == 8")
         .replace("core.witness(1)", "core.witness(0)"), 1, b"proof obligation failed"),
@@ -2652,6 +2681,9 @@ proof_diagnostic_notes = {
     "exact-startup-mixed-array-catalog-two-failures": b"call returned cell [0] = 3",
     "exact-startup-mixed-array-catalog-output-once": b"call returned cell [0] = 3",
     "ordinary-mixed-array-catalog-citation-refuted": b"symbolic call can return cell [0] = 3",
+    "ordinary-array-proof-rectangles-overlap-refuted": b"symbolic call entry: key = 4, value = 5",
+    "ordinary-array-proof-rectangles-minmax-witness": b"symbolic call entry: tag = 255, value = 255",
+    "ordinary-array-proof-cohort-distinct-rectangle-refuted": b"symbolic call entry: tag = 2, value = 1",
     "ordinary-array-proof-cohort-union-refuted": b"symbolic call entry: value = 0",
     "exact-startup-array-proof-cohort-refuted": b"call entry: tag = 1, value = 3",
     "exact-startup-fixed-array-exists-refuted": b"call returned an array with no matching index",

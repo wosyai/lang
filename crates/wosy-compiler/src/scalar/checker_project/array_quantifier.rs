@@ -2,7 +2,7 @@
 use super::*;
 use super::super::checker_flow::{
     charge_call_work, collect_exact_fixed_array_return, observe_fixed_array_returns,
-    FixedArrayCheck, FixedArrayQuantifier, FixedArrayReturnFailure, FixedArraySymbolicCheck,
+    FixedArrayCheck, FixedArrayEntries, FixedArrayQuantifier, FixedArrayReturnFailure, FixedArraySymbolicCheck,
 };
 
 pub(super) struct ArrayProof<'a> {
@@ -367,19 +367,19 @@ impl SymbolicRootProof for Symbolic<'_, '_, '_> {
             let enabled = !matches!(&entry, SymbolicEntry::Nullary)
                 || self.guards[id].as_ref().ok_or(ProjectCheck::Unsupported)?.accepts(&[]);
             let domain = match &entry {
-                SymbolicEntry::Unary { domains, .. } => domains.get(index),
+                SymbolicEntry::Guarded { arity, rectangles } => Some(&rectangles[index][..*arity]),
                 _ => None,
             };
             checks.push(FixedArraySymbolicCheck { check: self.cohort.plans[id].check(), enabled, entry: domain });
         }
         let no_nullary_claims = [CheckerPredicate::Boolean(false)];
-        let filter = match &entry {
-            SymbolicEntry::Shared(filter) => *filter,
-            SymbolicEntry::Unary { filter, .. } => filter,
-            SymbolicEntry::Nullary if checks.iter().any(|check| check.enabled) => &[],
-            SymbolicEntry::Nullary => &no_nullary_claims,
+        let entries = match &entry {
+            SymbolicEntry::Shared(filter) => FixedArrayEntries::Common(filter),
+            SymbolicEntry::Guarded { arity, rectangles } => FixedArrayEntries::Guarded { arity: *arity, rectangles },
+            SymbolicEntry::Nullary if checks.iter().any(|check| check.enabled) => FixedArrayEntries::Common(&[]),
+            SymbolicEntry::Nullary => FixedArrayEntries::Common(&no_nullary_claims),
         };
-        let coverage = observe_fixed_array_returns(body, first.result, Some(filter), &checks, &mut self.work)
+        let coverage = observe_fixed_array_returns(body, first.result, entries, &checks, &mut self.work)
             .ok_or(ProjectCheck::Unsupported)?;
         let mut applicable = false;
         for (id, verdict) in group.ids.iter().copied().zip(coverage) {
@@ -399,7 +399,7 @@ impl SymbolicRootProof for Symbolic<'_, '_, '_> {
 enum SymbolicEntry<'a> {
     Shared(&'a [CheckerPredicate]),
     Nullary,
-    Unary { filter: [CheckerPredicate; 1], domains: Vec<IntegerSet> },
+    Guarded { arity: usize, rectangles: Vec<[IntegerSet; 2]> },
 }
 
 impl Symbolic<'_, '_, '_> {
@@ -423,21 +423,12 @@ impl Symbolic<'_, '_, '_> {
         if same { return Ok(SymbolicEntry::Shared(common)); }
         if first.body.boundary.parameters.is_empty() { return Ok(SymbolicEntry::Nullary); }
 
-        // Different guards on one immutable entry slot form one exact sparse
-        // union, not a Cartesian over-approximation. Recover each obligation's
-        // own domain from the original entry axis at its shared return.
-        let [parameter] = first.body.boundary.parameters.as_slice() else { return Err(ProjectCheck::Unsupported); };
-        let Some([binding]) = first.body.boundary.checker_parameter_bindings.as_deref() else { return Err(ProjectCheck::Unsupported); };
-        let domains = group.ids.iter().map(|&id| {
-            self.guards[id].as_ref().and_then(|guard| guard.unary_domain(&parameter.ty, &mut self.work))
+        let arity = first.body.boundary.parameters.len();
+        if !matches!(arity, 1 | 2) { return Err(ProjectCheck::Unsupported); }
+        let rectangles = group.ids.iter().map(|&id| {
+            self.guards[id].as_ref().and_then(|guard| guard.integer_rectangle(first.body, &mut self.work))
                 .ok_or(ProjectCheck::Unsupported)
         }).collect::<Result<Vec<_>, _>>()?;
-        let intervals = domains.iter().try_fold(0usize, |cost, domain| cost.checked_add(domain.interval_count()))
-            .ok_or(ProjectCheck::Unsupported)?;
-        let order = (usize::BITS - intervals.leading_zeros()) as usize;
-        charge_call_work(&mut self.work, intervals.checked_mul(order + 2).ok_or(ProjectCheck::Unsupported)?)
-            .ok_or(ProjectCheck::Unsupported)?;
-        let values = IntegerSet::union(&domains);
-        Ok(SymbolicEntry::Unary { filter: [CheckerPredicate::EntryDomain { binding: binding.clone(), values }], domains })
+        Ok(SymbolicEntry::Guarded { arity, rectangles })
     }
 }

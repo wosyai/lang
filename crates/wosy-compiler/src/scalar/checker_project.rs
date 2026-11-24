@@ -9246,27 +9246,36 @@ struct CheckedIntegerGuardSlots<'a> {
 
 #[cfg(feature = "internal-checker")]
 impl CheckedIntegerGuardSlots<'_> {
-    fn unary_domain(&self, ty: &ScalarType, work: &mut usize) -> Option<IntegerSet> {
+    fn integer_rectangle(&self, body: &FunctionCallSites, work: &mut usize) -> Option<[IntegerSet; 2]> {
         use super::checker_flow::charge_call_work;
-        if self.arity != 1 || self.boolean.iter().any(Option::is_some) { return None; }
-        if self.always_rejects { return Some(IntegerSet::default()); }
-        let mut domain = IntegerSet::from_type(ty)?;
-        if let Some((slot, actual)) = self.domain {
-            if slot != 0 { return None; }
+        let parameters = &body.boundary.parameters;
+        if !matches!(self.arity, 1 | 2) || self.arity != parameters.len() || self.boolean.iter().any(Option::is_some) {
+            return None;
+        }
+        let mut domains = [IntegerSet::default(), IntegerSet::default()];
+        if self.always_rejects { return Some(domains); }
+        for (slot, parameter) in domains.iter_mut().zip(parameters) {
+            *slot = IntegerSet::from_type(&parameter.ty)?;
+        }
+        if let Some((index, actual)) = self.domain {
+            let slot = domains.get_mut(index)?;
             charge_call_work(work, actual.interval_count().checked_add(1)?)?;
-            match domain.intersection(actual) {
+            match slot.intersection(actual) {
                 IntegerIntersection::Unchanged => {}
-                IntegerIntersection::Empty => return Some(IntegerSet::default()),
-                IntegerIntersection::Changed(kept) => domain = kept,
+                IntegerIntersection::Empty => {
+                    *slot = IntegerSet::default();
+                    return Some(domains);
+                }
+                IntegerIntersection::Changed(kept) => *slot = kept,
             }
         }
         for cmp in &self.comparisons {
-            if cmp.slot != 0 { return None; }
-            charge_call_work(work, domain.interval_count().checked_add(1)?)?;
-            domain = domain.keep_relation(cmp.relation, cmp.bound);
-            if domain.is_empty() { break; }
+            let slot = domains.get_mut(cmp.slot)?;
+            charge_call_work(work, slot.interval_count().checked_add(1)?)?;
+            *slot = slot.keep_relation(cmp.relation, cmp.bound);
+            if slot.is_empty() { break; }
         }
-        Some(domain)
+        Some(domains)
     }
 
     fn accepts(&self, arguments: &[&BigInt]) -> bool {
@@ -17205,19 +17214,70 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
 
     #[cfg(feature = "internal-checker")]
     #[test]
-    fn array_proof_cohort_requires_shared_unused_rectangles_without_cross_products() {
+    fn array_proof_cohort_restricts_overlapping_rectangles_to_each_authored_guard() {
+        use crate::scalar::checker_flow::take_array_return_observations;
         let text = r#"%%start
-            u8[2](u8,u8) make = fn(tag, value) { [tag, value] };
-            proof first for make(a, b) -> (items) where (a == 1 && b == 2)
-                forall (u64 i where i == 0) ensures (items[i] == 1) {}
-            proof second for make(x, y) -> (items) where (x == 1 && y == 2)
-                forall (u64 i where i == 1) ensures (items[i] == 2) {}
+            u8[2](u8,u8) make = fn(key, value) { [value, key] };
+            proof first for make(a, b) -> (items)
+                where (a <= 6 && (b == 0 || b == 5))
+                forall (u64 i where i == 0) ensures (items[i] <= 5) {}
+            proof second for make(x, y) -> (items)
+                where (x >= 3 && x <= 8 && (y == 5 || y == 9))
+                ensures (exists (u64 i where i == 0) { items[i] >= 5 }) {}
+            proof third for make(t, u) -> (items)
+                where (t >= 3 && t <= 8 && (u == 5 || u == 9))
+                forall (u64 i where i == 1) ensures (items[i] <= 8) {}
         %%end"#;
         let declared = ScalarCheckerScope::CurrentPackage;
+        take_array_return_observations();
         let proved = check_array_proof_cohort(text, declared).unwrap();
         assert!(proved.active && proved.aggregate_diagnostics.is_empty());
-        assert!(matches!(check_array_proof_cohort(&text.replace("x == 1 && y == 2", "x == 2 && y == 1"), declared),
+        assert_eq!(take_array_return_observations(), (1, 0));
+
+        // The proof sees the overlapping first axis, but a real counterexample
+        // has to choose y=5, never y=0 from a sibling's guard.
+        let refuted = check_array_proof_cohort(&text.replace("items[i] <= 8", "items[i] != 4"), declared).unwrap();
+        assert_eq!(take_array_return_observations(), (1, 0));
+        let [failure] = refuted.aggregate_diagnostics.as_slice() else { panic!("third proof only"); };
+        let cell = failure.cell.as_ref().unwrap();
+        assert_eq!((cell.index.clone(), cell.value.clone()), (BigInt::from(1), BigInt::from(4)));
+        let [four, five] = [BigInt::from(4), BigInt::from(5)];
+        assert!(failure.witness.intervals_at(0, 0).unwrap().eq([(&four, &four)]));
+        assert!(failure.witness.intervals_at(0, 1).unwrap().eq([(&five, &five)]));
+        assert!(failure.call.is_none());
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn array_proof_cohort_does_not_execute_unadmitted_cartesian_inputs() {
+        use crate::scalar::checker_flow::take_array_return_observations;
+        let text = r#"%%start
+            u8[2](u8,u8) make = fn(tag, value) {
+                if (tag == 0) { [value + 1, tag] } else { [value, tag] }
+            };
+            proof low for make(a,b) -> (items) where (a == 0 && b < 255)
+                forall (u64 i where i == 0) ensures (items[i] >= 1) {}
+            proof high for make(x,y) -> (items) where (x == 255 && y == 255)
+                forall (u64 i where i == 0) ensures (items[i] == 255) {}
+        %%end"#;
+        let declared = ScalarCheckerScope::CurrentPackage;
+        take_array_return_observations();
+        let proved = check_array_proof_cohort(text, declared).unwrap();
+        assert!(proved.active && proved.aggregate_diagnostics.is_empty());
+        assert_eq!(take_array_return_observations(), (1, 0));
+        // Make the previously impossible overflow genuinely applicable.
+        assert!(matches!(check_array_proof_cohort(&text.replace("b < 255", "b <= 255"), declared),
             Err(ScalarOrderedCheckerOutcome::Unsupported)));
+
+        let refuted = check_array_proof_cohort(&text.replace("items[i] == 255", "items[i] == 254"), declared).unwrap();
+        let [failure] = refuted.aggregate_diagnostics.as_slice() else { panic!("high proof only"); };
+        let max = BigInt::from(255);
+        assert_eq!(failure.cell.as_ref().unwrap().value, max);
+        for axis in 0..2 {
+            assert!(failure.witness.intervals_at(0, axis).unwrap().eq([(&max, &max)]));
+        }
+        let main = check_array_proof_cohort(text, ScalarCheckerScope::MainFlowOnly).unwrap();
+        assert!(!main.active && main.aggregate_diagnostics.is_empty());
     }
 
     #[cfg(feature = "internal-checker")]

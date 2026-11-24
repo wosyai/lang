@@ -416,6 +416,11 @@ impl IntegerSet {
         Some(Self(vec![Interval { first, last }]))
     }
 
+    #[cfg(feature = "internal-checker")]
+    pub(super) fn closed_interval(first: BigInt, last: BigInt) -> Option<Self> {
+        (first <= last).then(|| Self(vec![Interval { first, last }]))
+    }
+
     pub(super) fn singleton(value: &BigInt) -> Self {
         Self(vec![Interval { first: value.clone(), last: value.clone() }])
     }
