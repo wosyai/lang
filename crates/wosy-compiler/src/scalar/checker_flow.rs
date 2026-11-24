@@ -3097,7 +3097,7 @@ pub(super) enum ActualCallResult {
     ProjectedUnitPair(ProjectedUnitPair),
     Integer(BigInt),
     #[cfg(feature = "internal-checker")]
-    EmptyInteger,
+    EmptyScalar,
     PartitionedInteger(Vec<IntegerReturnPartition>),
     PartitionedIntegerPair(ProjectedIntegerPair),
 }
@@ -5571,7 +5571,7 @@ pub(super) struct ExactCallCursor<'a> {
     block: IntegerBlockCursor,
     tail: Option<&'a ScalarType>,
     #[cfg(feature = "internal-checker")]
-    allow_empty_integer: bool,
+    allow_empty_scalar_return: bool,
     #[cfg(feature = "internal-checker")]
     tail_call_result: Option<ActualCallResult>,
     discarded_return: Option<bool>,
@@ -5584,9 +5584,9 @@ pub(super) struct ExactCallCursor<'a> {
 
 impl<'a> ExactCallCursor<'a> {
     #[cfg(feature = "internal-checker")]
-    pub(super) fn allow_empty_integer(&mut self) {
+    pub(super) fn allow_empty_scalar_return(&mut self) {
         debug_assert!(self.projected_slot.is_none() && self.projected_pair.is_none());
-        self.allow_empty_integer = self.tail.is_some_and(is_integer_type);
+        self.allow_empty_scalar_return = self.tail.is_some_and(|ty| is_integer_type(ty) || *ty == ScalarType::Bool);
     }
 
     #[cfg(feature = "internal-checker")]
@@ -5594,7 +5594,7 @@ impl<'a> ExactCallCursor<'a> {
         if self.projected_slot != Some(0) || self.projected_pair.is_some() || !self.tail.is_some_and(is_integer_type) {
             return None;
         }
-        self.allow_empty_integer = true;
+        self.allow_empty_scalar_return = true;
         self.roots.projected_narrow_integer = true;
         Some(())
     }
@@ -5749,7 +5749,7 @@ impl<'a> ExactCallCursor<'a> {
         let block = IntegerBlockCursor::new(calls.structure.root, roots.axes.len(), rows);
         Some(Self { roots, block, tail,
             #[cfg(feature = "internal-checker")]
-            allow_empty_integer: false,
+            allow_empty_scalar_return: false,
             #[cfg(feature = "internal-checker")]
             tail_call_result: None,
             discarded_return: None, returned: Vec::new(), computed_returns: Vec::new(), return_capture_work: 0, projected_slot, projected_pair })
@@ -5829,7 +5829,7 @@ impl<'a> ExactCallCursor<'a> {
     pub(super) fn resume(&mut self, effect: ExactCallEffect<'a>, caller_axis: Option<usize>, result: ActualCallResult) -> Option<()> {
         match (effect, result) {
             #[cfg(feature = "internal-checker")]
-            (ExactCallEffect::TailInteger { ty, .. }, result @ (ActualCallResult::Integer(_) | ActualCallResult::EmptyInteger)) => {
+            (ExactCallEffect::TailInteger { ty, .. }, result @ (ActualCallResult::Integer(_) | ActualCallResult::EmptyScalar)) => {
                 if caller_axis.is_some() || self.tail != Some(ty) || !self.roots.allow_real_integer_tail_call
                     || self.tail_call_result.is_some()
                 {
@@ -5840,7 +5840,7 @@ impl<'a> ExactCallCursor<'a> {
             (ExactCallEffect::Unit(_), ActualCallResult::Unit) => {}
             (ExactCallEffect::Unit(_), ActualCallResult::EmptyUnit) => self.block.path = IntegerInputs::default(),
             #[cfg(feature = "internal-checker")]
-            (ExactCallEffect::Scalar { binding: Some(_), ty, .. }, ActualCallResult::EmptyInteger) if is_integer_type(ty) =>
+            (ExactCallEffect::Scalar { binding: Some(_), ty, .. }, ActualCallResult::EmptyScalar) if is_integer_type(ty) || *ty == ScalarType::Bool =>
                 self.block.path = IntegerInputs::default(),
             (ExactCallEffect::Scalar { binding, ty, .. }, ActualCallResult::Integer(value)) => {
                 if let Some(binding) = binding {
@@ -6165,8 +6165,8 @@ impl<'a> ExactCallCursor<'a> {
                 ActualCallResult::Integer(path.singleton_return()?.clone())
             }
             #[cfg(feature = "internal-checker")]
-            (Some(_), IntegerControl::Continue(path)) if COLLECT && self.allow_empty_integer && path.is_unreachable() =>
-                ActualCallResult::EmptyInteger,
+            (Some(_), IntegerControl::Continue(path)) if COLLECT && self.allow_empty_scalar_return && path.is_unreachable() =>
+                ActualCallResult::EmptyScalar,
             (Some(_), IntegerControl::Continue(_)) => return None,
         };
         Some(ExactCallProgress::Done { active: self.roots.reached_obligation, result })

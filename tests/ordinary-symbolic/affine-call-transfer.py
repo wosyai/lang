@@ -897,8 +897,45 @@ cases.extend([
     ("exact-startup-bool-return-initializes-false-module-value",real_boolean_initializer,201,b"BOOL-CALLEEFALSE-STARTUP-ARM"),
     ("exact-startup-bool-return-initializes-true-module-value",real_boolean_initializer.replace("initialized = false","initialized = true"),201,b"BOOL-CALLEETRUE-STARTUP-ARM"),
     ("exact-startup-nullary-bool-return-selects-arm",real_boolean_initializer_nullary,204,b"NULLARY-BOOL-TRUE"),
-    ("exact-startup-bool-narrow-initializer-still-unsupported",
-     real_boolean_initializer.replace("core.require(entry != 3,","core.narrow(entry != 3,"),2,b"unsupported analysis"),
+    ("exact-startup-bool-integer-narrow-prunes-initializer",
+     real_boolean_initializer.replace("core.require(entry != 3,","core.narrow(entry != 3,"),201,b"BOOL-CALLEE"),
+])
+real_boolean_narrow_helper = f"""
+    bool(bool) gate = fn(flag) {{
+        core.narrow(flag, {state_report(205,"BOOL-NARROW-PRESTATE","flag")});
+        flag
+    }};
+"""
+real_boolean_narrow_initializer = f"""%%start
+    {real_boolean_narrow_helper}
+    bool selected = gate(false);
+    if (selected) {{ core.require(false, {report(206,"BOOL-NARROW-TRUE")}); }}
+    else {{ core.require(false, {report(207,"BOOL-NARROW-FALSE")}); }};
+    %%end"""
+real_boolean_narrow_local = f"""%%start
+    {real_boolean_narrow_helper}
+    unit() startup = fn {{
+        bool selected = gate(false);
+        if (selected) {{ core.require(false, {report(206,"BOOL-NARROW-TRUE")}); }}
+        else {{ core.require(false, {report(207,"BOOL-NARROW-FALSE")}); }};
+    }};
+    startup();
+    %%end"""
+real_boolean_narrow_nested = real_boolean_narrow_local.replace(
+    "unit() startup", "bool(bool) forward = fn(flag) { bool value = gate(flag); value };\n    unit() startup",
+).replace("bool selected = gate(false);", "bool selected = forward(false);")
+hypothetical_boolean_narrow = f"""%%start
+    {real_boolean_narrow_helper}
+    unit() startup = fn {{ core.require(gate(true), {report(208,"HYPOTHETICAL-NARROW")}); }};
+    startup();
+    %%end"""
+cases.extend([
+    ("exact-startup-lexical-bool-narrow-empties-initializer",real_boolean_narrow_initializer,205,b"BOOL-NARROW-PRESTATE"),
+    ("exact-startup-lexical-bool-narrow-empties-bound-local",real_boolean_narrow_local,205,b"BOOL-NARROW-PRESTATE"),
+    ("exact-startup-lexical-bool-narrow-empties-bound-chain",real_boolean_narrow_nested,205,b"BOOL-NARROW-PRESTATE"),
+    ("exact-startup-lexical-bool-narrow-survives-bound-chain",real_boolean_narrow_nested.replace("forward(false)","forward(true)"),206,b"BOOL-NARROW-TRUE"),
+    ("exact-startup-lexical-bool-narrow-survives",real_boolean_narrow_initializer.replace("gate(false)","gate(true)"),206,b"BOOL-NARROW-TRUE"),
+    ("exact-startup-hypothetical-bool-narrow-remains-refused",hypothetical_boolean_narrow,2,b"unsupported analysis"),
 ])
 real_nullary_initializer = f"""%%start
     i8() pick = fn {{
@@ -1547,6 +1584,12 @@ nested_array_bytes = state_bytes({
     },
 })
 authored_files = {
+    **{name: {"state.json": b'{"type":{"kind":"bool"},"value":false}\n'} for name in (
+        "exact-startup-lexical-bool-narrow-empties-initializer",
+        "exact-startup-lexical-bool-narrow-empties-bound-local",
+        "exact-startup-lexical-bool-narrow-empties-bound-chain",
+    )},
+    "exact-startup-bool-integer-narrow-prunes-initializer": {"state.json": b'{"type":{"kind":"i8"},"value":3}\n'},
     **{name: {"state.json": b'{"type":{"kind":"i8"},"value":3}\n'} for name in (
         "exact-startup-bool-return-initializes-false-module-value",
         "exact-startup-bool-return-initializes-true-module-value",

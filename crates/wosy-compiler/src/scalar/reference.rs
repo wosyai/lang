@@ -6242,6 +6242,10 @@ pub(super) struct OccurrenceStructure {
     pub(super) checker_has_nonsimple_directive: bool,
     #[cfg(feature = "internal-checker")]
     pub(super) checker_has_unsupported_ordinary_require: bool,
+    #[cfg(feature = "internal-checker")]
+    pub(super) checker_has_exact_boolean_narrow: bool,
+    #[cfg(feature = "internal-checker")]
+    pub(super) checker_has_unsupported_boolean_narrow_body: bool,
     #[cfg(any(test, feature = "internal-checker"))]
     pub(super) checker_branches: HashMap<OccurrenceOrdinal, super::checker_flow::CheckerPredicate>,
     #[cfg(any(test, feature = "internal-checker"))]
@@ -6333,6 +6337,10 @@ impl OccurrenceStructure {
             checker_has_nonsimple_directive: false,
             #[cfg(feature = "internal-checker")]
             checker_has_unsupported_ordinary_require: false,
+            #[cfg(feature = "internal-checker")]
+            checker_has_exact_boolean_narrow: false,
+            #[cfg(feature = "internal-checker")]
+            checker_has_unsupported_boolean_narrow_body: false,
             #[cfg(any(test, feature = "internal-checker"))]
             checker_branches: HashMap::new(),
             #[cfg(any(test, feature = "internal-checker"))]
@@ -7425,35 +7433,39 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
                 (self.checked_callable_directive_predicate(condition, names), None)
             };
             #[cfg(feature = "internal-checker")]
-            let ordinary_predicate = {
+            let (ordinary_predicate, exact_narrow_predicate) = {
                 use super::{checker_directive::CheckerOperation, checker_flow::CheckerPredicate};
-                let ordinary = if predicate.is_none() {
+                let (ordinary, boolean_binding) = if predicate.is_none() {
                     if let Some(compound) = self.ordinary_compound(condition, names, None) {
+                        let boolean_binding = matches!(compound, CheckerOrdinaryBoolean::Binding(_));
                         self.structure.checker_ordinary_booleans.insert(ordinal, compound);
-                        true
+                        (true, boolean_binding)
                     } else if let Some(comparison) = self.ordinary_integer_comparison(condition, names, None) {
                         self.structure.checker_ordinary_integer_comparisons.insert(ordinal, comparison);
-                        true
+                        (true, false)
                     } else {
-                        false
+                        (false, false)
                     }
                 } else {
-                    false
+                    (false, false)
                 };
                 let simple = matches!(predicate, Some(CheckerPredicate::Boolean(_) | CheckerPredicate::Integer(_)));
                 self.structure.checker_has_simple_narrow |= marker.operation == CheckerOperation::Narrow && simple;
                 self.structure.checker_has_nonsimple_directive |= !simple;
                 self.structure.checker_has_nonexact_require |= marker.operation != CheckerOperation::Require || !simple;
-                simple || ordinary
+                (simple || ordinary, simple || boolean_binding)
             };
             let call_signature = self.occurrence_typing.take_call(condition);
             #[cfg(feature = "internal-checker")]
             {
                 let ordinary_call = call_signature.as_ref()
                     .and_then(|signature| self.ordinary_directive_call(condition, names, types, signature));
-                self.structure.checker_has_unsupported_ordinary_require |=
-                    marker.operation != super::checker_directive::CheckerOperation::Require
-                        || (!ordinary_predicate && ordinary_call.is_none());
+                let require = marker.operation == super::checker_directive::CheckerOperation::Require;
+                let ordinary = ordinary_predicate || ordinary_call.is_some();
+                self.structure.checker_has_unsupported_ordinary_require |= !require || !ordinary;
+                self.structure.checker_has_exact_boolean_narrow |= !require && exact_narrow_predicate;
+                self.structure.checker_has_unsupported_boolean_narrow_body |=
+                    if require { !ordinary } else { !exact_narrow_predicate };
                 if let Some(receipt) = ordinary_call {
                     self.structure.checker_ordinary_directive_calls.insert(ordinal, receipt);
                 }

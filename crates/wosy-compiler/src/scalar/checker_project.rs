@@ -453,6 +453,7 @@ impl ActualIntegerObserver for ProofFreeOrderedEvidence {
     const REAL_INTEGER_INPUT_SIGNATURES: bool = true;
     const REAL_EXTENDED_SCALAR_LOCALS: bool = true;
     const REAL_MODULE_BOOLEAN_INITIALIZERS: bool = true;
+    const REAL_BOOLEAN_NARROW_CONTINUATIONS: bool = true;
     const ORDINARY_INTEGER_LOCALS: bool = true;
 
     fn observe(&mut self, _: (usize, usize), _: &[&BigInt], _: &BigInt) {}
@@ -1123,7 +1124,7 @@ fn walk_package_initialization<const COLLECT: bool, const PRIVATE_NESTED_SCALAR:
                         )? {
                             ActualCallResult::Integer(value) => Cow::Owned(value),
                             #[cfg(feature = "internal-checker")]
-                            ActualCallResult::EmptyInteger if COLLECT => return Ok(StartupLane::Empty),
+                            ActualCallResult::EmptyScalar if COLLECT => return Ok(StartupLane::Empty),
                             _ => return Err(ProjectCheck::Unsupported),
                         }
                     } else {
@@ -1431,6 +1432,8 @@ trait ActualIntegerObserver {
     const REAL_EXTENDED_SCALAR_LOCALS: bool = false;
     #[cfg(feature = "internal-checker")]
     const REAL_MODULE_BOOLEAN_INITIALIZERS: bool = false;
+    #[cfg(feature = "internal-checker")]
+    const REAL_BOOLEAN_NARROW_CONTINUATIONS: bool = false;
     const INTEGER_RETURN_PARTITIONS: bool = false;
     const PROJECTED_FORMAL_WRITES: bool = false;
     const ORDINARY_PROJECTED_PAIR: bool = false;
@@ -1666,6 +1669,26 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                 || (collecting && Observer::EXACT_INTEGER_CALL_CONTINUATIONS && is_integer_type(expected)))
     }
 
+    fn exact_boolean_narrow_profile(&self, expected: &ScalarType, collecting: bool) -> bool {
+        #[cfg(feature = "internal-checker")]
+        { ACTUAL_STARTUP && collecting && *expected == ScalarType::Bool
+            && Observer::EXACT_INTEGER_CALL_CONTINUATIONS && Observer::ORDINARY_INTEGER_LOCALS
+            && Observer::REAL_BOOLEAN_NARROW_CONTINUATIONS }
+        #[cfg(not(feature = "internal-checker"))]
+        { let _ = (expected, collecting); false }
+    }
+
+    fn exact_boolean_narrow_body_has_supported_shape(body: &FunctionCallSites) -> bool {
+        #[cfg(feature = "internal-checker")]
+        {
+            body.structure.checker_has_exact_boolean_narrow
+                && !body.structure.checker_has_unsupported_boolean_narrow_body
+                && body.allocation_length_calls.is_empty() && body.assignments.is_empty()
+        }
+        #[cfg(not(feature = "internal-checker"))]
+        { let _ = body; false }
+    }
+
     fn exact_integer_narrow_profile(&self, collecting: bool) -> bool {
         #[cfg(feature = "internal-checker")]
         { ACTUAL_STARTUP && collecting && Observer::EXACT_INTEGER_CALL_CONTINUATIONS
@@ -1800,7 +1823,11 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             cursor.allow_real_integer_tail_call();
         }
         #[cfg(feature = "internal-checker")]
-        if self.exact_integer_narrow_profile(collection.is_some()) { cursor.allow_empty_integer(); }
+        if (is_integer_type(expected) && self.exact_integer_narrow_profile(collection.is_some()))
+            || self.exact_boolean_narrow_profile(expected, collection.is_some())
+        {
+            cursor.allow_empty_scalar_return();
+        }
         #[cfg(feature = "internal-checker")]
         if self.exact_integer_local_write_shape(body, expected, collection.is_some()) {
             cursor.restrict_returning_writes_to_direct_locals();
@@ -1934,11 +1961,14 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
         {
             return Err(ProjectCheck::Unsupported);
         }
+        let real_bound_boolean = matches!(effect, ExactCallEffect::Scalar { binding: Some(_), .. })
+            && self.exact_boolean_narrow_profile(expected, collection.is_some());
+        let boolean_narrow = real_bound_boolean && Self::exact_boolean_narrow_body_has_supported_shape(body);
         let projected_narrow = self.projected_integer_narrow_shape(body, effect, collection.is_some());
         if !matches!(signature.outputs.outputs.as_slice(), [output] if &output.ty == expected)
             || (*expected != ScalarType::Unit && (!Observer::EXACT_INTEGER_CALL_CONTINUATIONS
                 || !(supported_integer_continuation_shape_for(body, expected, Observer::ORDINARY_INTEGER_LOCALS)
-                    || self.exact_integer_narrow_shape(body, expected, collection.is_some())
+                    || boolean_narrow || self.exact_integer_narrow_shape(body, expected, collection.is_some())
                     || self.exact_integer_local_write_shape(body, expected, collection.is_some())
                     || projected_narrow)))
         {
@@ -2061,7 +2091,9 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             cursor.allow_real_integer_tail_call();
         }
         #[cfg(feature = "internal-checker")]
-        if self.exact_integer_narrow_profile(collection.is_some()) { cursor.allow_empty_integer(); }
+        if (is_integer_type(expected) && self.exact_integer_narrow_profile(collection.is_some())) || real_bound_boolean {
+            cursor.allow_empty_scalar_return();
+        }
         #[cfg(feature = "internal-checker")]
         if restricted_local_writes { cursor.restrict_returning_writes_to_direct_locals(); }
         if first_activation {
@@ -2201,6 +2233,8 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             })
             && supported_integer_continuation_shape_for(body, expected, Observer::ORDINARY_INTEGER_LOCALS)
             && body.assignments.is_empty())
+            || (module_bool_initializer && self.exact_boolean_narrow_profile(expected, collection.is_some())
+                && Self::exact_boolean_narrow_body_has_supported_shape(body))
             || self.exact_integer_narrow_shape(body, expected, collection.is_some())
             || self.exact_integer_local_write_shape(body, expected, collection.is_some())
         {
@@ -15325,6 +15359,36 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
                     assert!(receipt.directives[0].witness.intervals_at(0, 1).unwrap().eq([(&three, &three)]));
                 }
             }
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn actual_boolean_narrow_prunes_bound_continuations_but_not_hypothetical_rules() {
+        let output = |code| OUTPUT.replace(".code = 1", &format!(".code = {code}"));
+        let helper = format!("bool(bool) gate = fn(flag) {{ core.narrow(flag, {}); flag }};", output(115));
+        let tail = format!("if (selected) {{ core.require(false, {}); }} else {{ core.require(false, {}); }};",
+            output(116), output(117));
+        let module = format!("%%start\n{helper}\nbool selected = gate(false);\n{tail}\n%%end");
+        let real_local = format!("%%start\n{helper}\nunit() startup = fn {{ bool selected = gate(false); {tail} }};\nstartup();\n%%end");
+        let hypothetical = format!("%%start\n{helper}\nunit() startup = fn {{ core.require(gate(true), {}); }};\nstartup();\n%%end", output(118));
+        let nested = real_local.replace("unit() startup", "bool(bool) forward = fn(flag) { bool value = gate(flag); value };\nunit() startup")
+            .replace("bool selected = gate(false);", "bool selected = forward(false);");
+        let app = source("src/main.w", "real-boolean-narrow-prunes");
+        for scope in [ScalarCheckerScope::MainFlowOnly, ScalarCheckerScope::CurrentPackage] {
+            for (program, code) in [(&module, 115), (&real_local, 115), (&nested, 115),
+                (&module.replace("gate(false)", "gate(true)"), 116), (&nested.replace("forward(false)", "forward(true)"), 116)] {
+                let prepared = prepare_proof_target(&app, program).unwrap();
+                let receipt = run_closed_without_named_proofs(&prepared, scope, 1).unwrap();
+                let [only] = receipt.directives.as_slice() else { panic!("only the reached prestate or live branch"); };
+                assert_eq!(only.code(), &BigInt::from(code));
+                if code == 115 {
+                    let zero = BigInt::from(0);
+                    assert!(only.witness.intervals_at(0, 0).unwrap().eq([(&zero, &zero)]));
+                }
+            }
+            let prepared = prepare_proof_target(&app, &hypothetical).unwrap();
+            assert!(matches!(run_closed_without_named_proofs(&prepared, scope, 1), Err(ProjectCheck::Unsupported)));
         }
     }
 
