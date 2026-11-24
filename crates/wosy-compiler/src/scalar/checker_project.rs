@@ -5273,6 +5273,116 @@ struct MainFlowProofCase<'a> {
 }
 
 #[cfg(feature = "internal-checker")]
+fn flat_rewrite_arguments(item: &ScalarBlockItem) -> Option<(&ScalarExpression, &ScalarExpression)> {
+    let ScalarBlockItem::Expression(ScalarExpression::Call {
+        receiver: Some(core), name, arguments, type_arguments, ..
+    }) = item else { return None; };
+    if core != "core" || name != "rewrite" || !type_arguments.is_empty() { return None; }
+    let [equality, context] = arguments.as_slice() else { return None; };
+    Some((equality, context))
+}
+
+#[cfg(feature = "internal-checker")]
+#[derive(Clone, Eq, PartialEq)]
+enum FlatRewriteTerm<'a> {
+    Output,
+    Literal(Cow<'a, BigInt>),
+}
+
+#[cfg(feature = "internal-checker")]
+fn prepare_flat_rewrite_shows<'a>(
+    plan: &'a PlannedModuleProof<'a>, original: &BigInt,
+) -> Result<MainFlowAuthoredShows<'a>, ProjectCheck> {
+    let TypedProofGoal::Literal { operator, bound, .. } = &plan.typed.goal else {
+        return Err(ProjectCheck::Unsupported);
+    };
+    let items = &plan.steps.items;
+    if items.len() != plan.steps.terminated_items.len() || plan.typed.measure.is_some()
+    {
+        return Err(ProjectCheck::Unsupported);
+    }
+    let count = items.len();
+    let depth = (usize::BITS - count.leading_zeros()) as usize;
+    let cost = count.checked_mul(depth.checked_add(5).ok_or(ProjectCheck::Unsupported)?)
+        .ok_or(ProjectCheck::Unsupported)?;
+    super::checker_flow::charge_call_work(&mut 0, cost).ok_or(ProjectCheck::Unsupported)?;
+    if !plan.steps.terminated_items.iter().all(|terminated| *terminated) {
+        return Err(ProjectCheck::Unsupported);
+    }
+    let equality_relation = IntegerRelation::from_operator(&BinaryOperator::Equal)
+        .ok_or(ProjectCheck::Unsupported)?;
+    let term = |expression: &'a ScalarExpression| {
+        if matches!(expression, ScalarExpression::Name { name, .. } if name == &plan.typed.output) {
+            Some(FlatRewriteTerm::Output)
+        } else {
+            let literal = concrete_integer_literal(expression)?;
+            integer_literal_fits_type(literal.as_ref(), plan.typed.result_type)
+                .then_some(FlatRewriteTerm::Literal(literal))
+        }
+    };
+    let hole = |expression: &ScalarExpression| matches!(expression, ScalarExpression::Name { name, .. } if name == "_");
+    let mut current = [FlatRewriteTerm::Output, FlatRewriteTerm::Literal(Cow::Borrowed(bound))];
+    let mut preceding_equalities = HashSet::new();
+    let mut shows = Vec::new();
+    for item in items {
+        if let Some((equality, context)) = flat_rewrite_arguments(item) {
+            let ScalarExpression::Binary { operator: BinaryOperator::Equal, left, right, .. } = equality else {
+                return Err(ProjectCheck::InvalidProof);
+            };
+            let before = term(left).ok_or(ProjectCheck::Unsupported)?;
+            let after = term(right).ok_or(ProjectCheck::Unsupported)?;
+            let literal = match (&before, &after) {
+                (FlatRewriteTerm::Output, FlatRewriteTerm::Literal(value))
+                    | (FlatRewriteTerm::Literal(value), FlatRewriteTerm::Output) => value,
+                _ => return Err(ProjectCheck::Unsupported),
+            };
+            if !preceding_equalities.contains(literal.as_ref()) { return Err(ProjectCheck::InvalidProof); }
+            let ScalarExpression::Binary { operator: context_operator, left, right, .. } = context else {
+                return Err(ProjectCheck::InvalidProof);
+            };
+            if context_operator != operator { return Err(ProjectCheck::InvalidProof); }
+            let (slot, other) = match (hole(left), hole(right)) {
+                (true, false) => (0, term(right)),
+                (false, true) => (1, term(left)),
+                _ => return Err(ProjectCheck::InvalidProof),
+            };
+            if other.as_ref() != Some(&current[1 - slot]) { return Err(ProjectCheck::InvalidProof); }
+            current[slot] = match (current[slot] == before, current[slot] == after) {
+                (true, false) => after,
+                (false, true) => before,
+                _ => return Err(ProjectCheck::InvalidProof),
+            };
+        } else {
+            let claim = proof_show_expression(item, true)?;
+            let comparison = IntegerComparison::from_expression(claim).ok_or(ProjectCheck::Unsupported)?;
+            let (_, relation, bound) = checked_literal_output_goal_borrowed(
+                comparison, &plan.typed.output, &plan.typed.input_names, plan.typed.result_type,
+            )?;
+            let ScalarBlockItem::Expression(expression) = item else { return Err(ProjectCheck::Unsupported); };
+            if relation == equality_relation { preceding_equalities.insert(bound.clone()); }
+            let same_bound = original == bound.as_ref();
+            shows.push(MainFlowLiteralShow {
+                span: super::typecheck::expression_span(expression), relation, bound, same_bound,
+            });
+        }
+    }
+    if shows.is_empty() { return Err(ProjectCheck::InvalidProof); }
+    // These shows independently establish every substitution premise, in
+    // source order, before checking the terminal obligation. Under them the
+    // original and fully rewritten goals are equivalent, so the existing
+    // exact terminal verifier can check the original without a replay.
+    if supported_calling_proof_body(plan.typed.body, plan.typed.result_type) {
+        Ok(MainFlowAuthoredShows::CallingSequence { steps: shows, concrete_groups: std::cell::OnceCell::new() })
+    } else {
+        let first_span = shows[0].span;
+        let mut groups = shows.into_iter().map(|show| MainFlowShowBound::from_literal(show.span, show.relation, show.bound))
+            .collect();
+        index_main_flow_show_bounds(&mut groups);
+        Ok(MainFlowAuthoredShows::Multiple { first_span, groups })
+    }
+}
+
+#[cfg(feature = "internal-checker")]
 impl<'a> MainFlowProofCase<'a> {
     fn prepare(plan: &'a PlannedModuleProof<'a>, root: &SourceIdentity) -> Result<MainFlowProofPlan<'a>, ProjectCheck> {
         Self::prepare_with_citation(plan, root, None)
@@ -5333,6 +5443,10 @@ impl<'a> MainFlowProofCase<'a> {
             Some(MainFlowAuthoredShows::CallingCitation {
                 peer: wosy_syntax::byte_span(peer.proof).start, show,
             })
+        } else if super::checker_flow::charge_call_work(&mut 0, plan.steps.items.len()).is_some()
+            && plan.steps.items.iter().any(|item| flat_rewrite_arguments(item).is_some())
+        {
+            Some(prepare_flat_rewrite_shows(plan, bound.literal().ok_or(ProjectCheck::Unsupported)?)?)
         } else if rectangular && !plan.steps.items.is_empty() {
             let steps = &plan.steps.items;
             if steps.len() != plan.steps.terminated_items.len() {
@@ -14196,6 +14310,60 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
         assert!(matches!(run(&unsupported_tail, ScalarCheckerScope::CurrentPackage), Err(ProjectCheck::Unsupported)));
         let restricted = proof_only.replace("ensures", "where (entry >= 1 && entry <= 2) ensures");
         assert!(matches!(run(&restricted, ScalarCheckerScope::CurrentPackage), Err(ProjectCheck::Unsupported)));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordered_proof_rewrite_uses_only_preceding_verified_equalities_and_current_goal() {
+        let app = source("src/main.w", "ordered-proof-rewrite");
+        let run = |text: &str, scope| {
+            let (_, proof) = crate::parse_proof_source(app.clone(), text.to_owned(), &[])
+                .unwrap_or_else(|_| panic!("valid rewrite proof grammar"));
+            check_loaded_ordered_proof_diagnostics(
+                Vec::new(), vec![(proof, Vec::new())], vec![app.clone()], inputs(), scope,
+            )
+        };
+        let proof = r#"%%start
+            u8(u8) constant = fn(value) { if (value == 0) {}; 7 };
+            proof substituted for constant(entry) -> (out) ensures (out < 8) {
+                core.show(out == 7);
+                core.rewrite(out == 7, _ < 8);
+                core.rewrite(7 == out, _ < 8);
+                core.show(out == 7);
+            }
+        %%end"#;
+        let checked = run(proof, ScalarCheckerScope::CurrentPackage).unwrap();
+        assert!(checked.active && checked.diagnostics.is_empty() && checked.symbolic_diagnostic.is_none());
+        let refuted = proof.replace("{}; 7", "{}; 8");
+        let rejected = run(&refuted, ScalarCheckerScope::CurrentPackage).unwrap().symbolic_diagnostic.unwrap();
+        assert_eq!(rejected.returned, BigInt::from(8));
+        let span = rejected.failed_step.unwrap().range;
+        assert_eq!(&refuted[span.start as usize..span.end as usize], "core.show(out == 7)");
+        let terminal = proof.replace("out < 8", "out < 7").replace("_ < 8", "_ < 7");
+        let failure = run(&terminal, ScalarCheckerScope::CurrentPackage).unwrap().symbolic_diagnostic.unwrap();
+        assert!(failure.failed_step.is_none());
+        assert_eq!(failure.returned, BigInt::from(7));
+        let actual = proof.replace("%%end", "u8 reached = constant(0); %%end");
+        let checked = run(&actual, ScalarCheckerScope::MainFlowOnly).unwrap();
+        assert!(checked.active && checked.diagnostics.is_empty() && checked.symbolic_diagnostic.is_none());
+        let actual_refuted = actual.replace("{}; 7", "{}; 8");
+        let observed = run(&actual_refuted, ScalarCheckerScope::MainFlowOnly).unwrap();
+        let [failure] = observed.diagnostics.as_slice() else { panic!("one actual proof failure"); };
+        assert_eq!(failure.invocation.returned, BigInt::from(8));
+        let span = failure.failed_step.as_ref().unwrap().range;
+        assert_eq!(&actual_refuted[span.start as usize..span.end as usize], "core.show(out == 7)");
+        for invalid in [
+            proof.replace("core.show(out == 7);", "").replace("core.rewrite(7 == out, _ < 8);",
+                "core.show(out == 7); core.rewrite(7 == out, _ < 8);"),
+            proof.replacen("_ < 8", "_ < 9", 1),
+            proof.replacen("_ < 8", "_ < _", 1),
+            proof.replace("core.show(out == 7);", "core.show(out <= 7);"),
+            proof.replace("core.show(out == 7);", "").replace("proof substituted",
+                "proof sibling for constant(entry) -> (out) ensures (out == 7) { core.show(out == 7); } proof substituted"),
+        ] {
+            assert!(matches!(run(&invalid, ScalarCheckerScope::CurrentPackage), Err(ProjectCheck::InvalidProof)),
+                "must refuse: {invalid}");
+        }
     }
 
     #[cfg(feature = "internal-checker")]
