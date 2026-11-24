@@ -933,7 +933,7 @@ fn check_unused_module<const COLLECT: bool, const ENTRY_EVIDENCE: bool, Proof: S
             if !Proof::ENABLED && body.structure.checker_has_bool_contextual_declaration {
                 cursor.allow_symbolic_contextual_bool();
             }
-            symbolic.run_call_cursor::<false>(body, &module.source, cursor, None, Some(collection))?;
+            symbolic.run_call_cursor::<false>(body, &module.source, cursor, None, Some(collection), None)?;
             active |= symbolic.had_obligations;
             continue;
         }
@@ -1608,12 +1608,26 @@ enum ActualProjectedArguments<'a> {
     SymbolicAxis(ProjectedIntegerArgument<'a>),
 }
 
+#[cfg(feature = "internal-checker")]
+enum NamedExactWatch {
+    Observe { nested_work: usize },
+    Citation,
+}
+
+#[cfg(feature = "internal-checker")]
+struct NamedStackSite<'a> {
+    call: ByteSpan,
+    observed_entry: Option<(&'a [ScalarType], BigInt, usize)>,
+}
+
 struct ExactCallActivation<'a> {
     body: &'a FunctionCallSites,
     source: &'a SourceIdentity,
     cursor: ExactCallCursor<'a>,
     entry: Option<BigInt>,
     followed_self_edge: bool,
+    #[cfg(feature = "internal-checker")]
+    named_site: Option<NamedStackSite<'a>>,
     target: Option<((usize, usize), bool, ExactCallEffect<'a>, Option<usize>)>,
 }
 
@@ -1638,6 +1652,7 @@ struct InitializerProofSite<'a> {
 enum InitializerProofOrigin<'a> {
     Direct { topology: &'a ModuleInitializationTopology, occurrence: OccurrenceOrdinal, directive_position: usize },
     Nested { outer: OrderedInitializerCall<'a>, caller: &'a FunctionCallSites, inner: OccurrenceOrdinal, directive_position: usize },
+    Stacked { outer: ByteSpan, intermediate: Vec<ByteSpan>, inner: ByteSpan, directive_position: usize },
 }
 
 trait ActualIntegerObserver {
@@ -1685,10 +1700,10 @@ trait ActualIntegerObserver {
     const CONTEXTUAL: bool = false;
 
     #[cfg(feature = "internal-checker")]
-    fn charge_named_exact_call(&mut self, _body: &FunctionCallSites) -> Option<()> { None }
+    fn charge_named_exact_work(&mut self, _cost: usize) -> Option<()> { None }
 
     #[cfg(feature = "internal-checker")]
-    fn named_exact_watch(&self, _target: PreparedCallable) -> Option<bool> { None }
+    fn named_exact_watch(&self, _target: PreparedCallable) -> Option<NamedExactWatch> { None }
 
     #[cfg(feature = "internal-checker")]
     fn permits_named_pure_affine_return(&self, _target: PreparedCallable, _arguments: &[&BigInt]) -> bool {
@@ -2065,6 +2080,7 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
     fn run_exact_calls<const NAMED: bool>(
         &mut self, body: &'project FunctionCallSites, source: &'project SourceIdentity,
         exact: &[&BigInt], expected: &ScalarType, collection: Option<OrderedCallCollection<'_, '_>>,
+        named_outer: Option<ByteSpan>,
     ) -> Result<ActualCallResult, ProjectCheck> {
         #[allow(unused_mut)]
         let mut cursor = ExactCallCursor::new(body, exact, expected).ok_or(ProjectCheck::Unsupported)?;
@@ -2096,19 +2112,24 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
         if self.exact_integer_local_write_shape(body, expected, collection.is_some()) {
             cursor.restrict_returning_writes_to_direct_locals();
         }
-        self.run_call_cursor::<NAMED>(body, source, cursor, self.exact_self_entry(Some(exact)).cloned(), collection)
+        self.run_call_cursor::<NAMED>(body, source, cursor, self.exact_self_entry(Some(exact)).cloned(), collection, named_outer)
     }
 
     fn run_call_cursor<const NAMED: bool>(
         &mut self, body: &'project FunctionCallSites, source: &'project SourceIdentity,
         cursor: ExactCallCursor<'project>, entry: Option<BigInt>, collection: Option<OrderedCallCollection<'_, '_>>,
+        named_outer: Option<ByteSpan>,
     ) -> Result<ActualCallResult, ProjectCheck> {
         #[cfg(feature = "internal-checker")]
         if NAMED {
-            self.observer.charge_named_exact_call(body).ok_or(ProjectCheck::Unsupported)?;
+            let cost = body.occurrences.len().checked_add(1).ok_or(ProjectCheck::Unsupported)?;
+            self.observer.charge_named_exact_work(cost).ok_or(ProjectCheck::Unsupported)?;
         }
-        let mut frames = vec![ExactCallActivation { body, source, cursor, entry, followed_self_edge: false, target: None }];
-        let result = self.drive_exact_calls::<NAMED>(&mut frames, collection);
+        let mut frames = vec![ExactCallActivation { body, source, cursor, entry, followed_self_edge: false,
+            #[cfg(feature = "internal-checker")]
+            named_site: None,
+            target: None }];
+        let result = self.drive_exact_calls::<NAMED>(&mut frames, collection, named_outer);
         for frame in frames.into_iter().rev() {
             if let Some((target, first_activation, _, _)) = frame.target {
                 self.active_depth -= 1;
@@ -2121,6 +2142,7 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
     fn drive_exact_calls<const NAMED: bool>(
         &mut self, frames: &mut Vec<ExactCallActivation<'project>>,
         collection: Option<OrderedCallCollection<'_, '_>>,
+        #[cfg_attr(not(feature = "internal-checker"), allow(unused_variables))] named_outer: Option<ByteSpan>,
     ) -> Result<ActualCallResult, ProjectCheck> {
         loop {
             #[cfg(feature = "internal-checker")]
@@ -2171,6 +2193,25 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                     if !hypothetical { self.reached.insert(target); }
                     self.active_depth -= 1;
                     if first_activation { self.active.remove(&target); }
+                    #[cfg(feature = "internal-checker")]
+                    if NAMED {
+                        let site = completed.named_site.ok_or(ProjectCheck::Unsupported)?;
+                        if let Some((parameters, entry, proof_work)) = site.observed_entry {
+                            let ActualCallResult::Integer(value) = &result else { return Err(ProjectCheck::Unsupported); };
+                            let ordered = collection.ok_or(ProjectCheck::Unsupported)?;
+                            let outer = named_outer.ok_or(ProjectCheck::Unsupported)?;
+                            let cost = frames.len().checked_add(proof_work).ok_or(ProjectCheck::Unsupported)?;
+                            self.observer.charge_named_exact_work(cost).ok_or(ProjectCheck::Unsupported)?;
+                            let intermediate = frames.iter().skip(1)
+                                .map(|frame| frame.named_site.as_ref().map(|site| site.call))
+                                .collect::<Option<Vec<_>>>().ok_or(ProjectCheck::Unsupported)?;
+                            let directive_position = ordered.failures.borrow().records.len();
+                            self.observer.observe_initializer(target, Some(InitializerProofSite {
+                                source: completed.source,
+                                call: InitializerProofOrigin::Stacked { outer, intermediate, inner: site.call, directive_position },
+                            }), parameters, &[&entry], value);
+                        }
+                    }
                     frames.last_mut().ok_or(ProjectCheck::Unsupported)?.cursor.resume(effect, caller_axis, result)
                         .ok_or(ProjectCheck::Unsupported)?;
                 }
@@ -2219,7 +2260,9 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             (target, owner, body, signature)
         };
         #[cfg(feature = "internal-checker")]
-        if NAMED && (parent.source != &owner.source || self.observer.named_exact_watch(target).is_some()
+        let watched = if NAMED { self.observer.named_exact_watch(target) } else { None };
+        #[cfg(feature = "internal-checker")]
+        if NAMED && (parent.source != &owner.source || matches!(&watched, Some(NamedExactWatch::Citation))
             || !citation_safe_calling_body(body) || self.active.contains(&target)
             || !matches!(effect, ExactCallEffect::Scalar { binding: Some(_), .. })
             || !matches!(signature.parameters.as_slice(), [ty] if is_integer_type(ty))
@@ -2229,7 +2272,8 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
         }
         #[cfg(feature = "internal-checker")]
         if NAMED {
-            self.observer.charge_named_exact_call(body).ok_or(ProjectCheck::Unsupported)?;
+            let cost = body.occurrences.len().checked_add(1).ok_or(ProjectCheck::Unsupported)?;
+            self.observer.charge_named_exact_work(cost).ok_or(ProjectCheck::Unsupported)?;
         }
         #[cfg(feature = "internal-checker")]
         if self.observer.citation_only() && (parent.source != &owner.source || !citation_safe_calling_body(body)) {
@@ -2352,6 +2396,8 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             self.active_depth += 1;
             return Ok(ExactCallActivation {
                 body, source: &owner.source, cursor, entry: None, followed_self_edge: false,
+                #[cfg(feature = "internal-checker")]
+                named_site: None,
                 target: Some((target, true, effect, Some(projection.caller_axis))),
             });
         }
@@ -2393,6 +2439,17 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             }
             _ => return Err(ProjectCheck::Unsupported),
         };
+        #[cfg(feature = "internal-checker")]
+        let named_site = if NAMED {
+            let occurrence = caller.occurrences.get(call.0).ok_or(ProjectCheck::MissingRootOccurrences)?;
+            let observed_entry = if let Some(NamedExactWatch::Observe { nested_work }) = watched {
+                let [value] = exact else { return Err(ProjectCheck::Unsupported); };
+                Some((signature.parameters.as_slice(), (*value).clone(), nested_work))
+            } else {
+                None
+            };
+            Some(NamedStackSite { call: occurrence.span, observed_entry })
+        } else { None };
         let first_activation = !self.active.contains(&target);
         if !first_activation && !matches!(
             (parent.entry.as_ref(), exact),
@@ -2435,7 +2492,10 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
         self.active_depth += 1;
         Ok(ExactCallActivation {
             body, source: &owner.source, cursor, entry: self.exact_self_entry(Some(exact)).cloned(),
-            followed_self_edge: false, target: Some((target, first_activation, effect, None)),
+            followed_self_edge: false,
+            #[cfg(feature = "internal-checker")]
+            named_site,
+            target: Some((target, first_activation, effect, None)),
         })
     }
 
@@ -2460,14 +2520,18 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             return Err(ProjectCheck::Unsupported);
         }
         #[cfg(feature = "internal-checker")]
-        let named_reached = ACTUAL_STARTUP && self.observer.named_exact_watch(target) == Some(true)
-            && collection.is_some_and(|(source, _)| source == &owner.source)
-            && proof_site.as_ref().is_some_and(|site| site.source == &owner.source
-                && matches!(site.call, InitializerProofOrigin::Direct { .. }))
+        let named_outer = proof_site.as_ref().and_then(|site| match &site.call {
+            InitializerProofOrigin::Direct { topology, occurrence, .. } if site.source == &owner.source =>
+                topology.occurrences.get(occurrence.0).map(|node| node.span),
+            _ => None,
+        });
+        #[cfg(feature = "internal-checker")]
+        let named_reached = ACTUAL_STARTUP && matches!(self.observer.named_exact_watch(target), Some(NamedExactWatch::Observe { .. }))
+            && collection.is_some_and(|(source, _)| source == &owner.source) && named_outer.is_some()
             && matches!(signature.parameters.as_slice(), [ty] if is_integer_type(ty))
             && supported_calling_proof_body(body, expected) && citation_safe_calling_body(body);
         #[cfg(not(feature = "internal-checker"))]
-        let named_reached = false;
+        let (named_reached, named_outer) = (false, None);
         let target_module = target.0;
         if !ACTUAL_STARTUP && (*expected != ScalarType::Unit
             || (collection.is_none() && target_module != self.symbolic_module))
@@ -2555,10 +2619,10 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
         }
         self.active_depth += 1;
         let result = if named_reached {
-            self.run_exact_calls::<true>(body, &owner.source, exact, expected, collection)
+            self.run_exact_calls::<true>(body, &owner.source, exact, expected, collection, named_outer)
         } else if *expected == ScalarType::Unit {
             if ACTUAL_STARTUP && !Observer::ENABLED && !Observer::CONTEXTUAL {
-                let result = self.run_exact_calls::<false>(body, &owner.source, exact, expected, collection);
+                let result = self.run_exact_calls::<false>(body, &owner.source, exact, expected, collection, None);
                 self.active_depth -= 1;
                 self.active.remove(&target);
                 if result.is_ok() { self.reached.insert(target); }
@@ -2586,7 +2650,7 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             || self.exact_integer_narrow_shape(body, expected, collection.is_some())
             || self.exact_integer_local_write_shape(body, expected, collection.is_some())
         {
-            self.run_exact_calls::<false>(body, &owner.source, exact, expected, collection)
+            self.run_exact_calls::<false>(body, &owner.source, exact, expected, collection, None)
         } else if is_integer_type(expected)
             && body.structure.checker_directives.is_empty()
             && body.call_occurrences.is_empty()
@@ -3679,6 +3743,7 @@ pub struct MainFlowProofDiagnostic {
 #[doc(hidden)]
 pub struct MainFlowProofInvocation {
     pub outer_call: Option<wosy_syntax::SourceSpan>,
+    pub intermediate_calls: Vec<wosy_syntax::SourceSpan>,
     pub call: wosy_syntax::SourceSpan,
     pub directive_position: usize,
     pub arguments: Vec<(ScalarType, BigInt)>,
@@ -3872,7 +3937,7 @@ fn capture_named_calling_partitions<'a>(
     };
     let sink = RefCell::new(effects);
     let collection = OrderedCallCollection { failures: &sink, visits: runtime.visits, outer: None };
-    let value = evaluator.run_call_cursor::<false>(body, source, cursor, None, Some(collection))?;
+    let value = evaluator.run_call_cursor::<false>(body, source, cursor, None, Some(collection), None)?;
     Ok((value, evaluator.had_obligations, evaluator.reached))
 }
 
@@ -4701,6 +4766,7 @@ impl<'a> SymbolicEqualityIssuer<'a> {
 #[cfg(feature = "internal-checker")]
 struct MainFlowProofTarget<'a> {
     permits_exact_calling: bool,
+    nested_observation_work: usize,
     cases: MainFlowProofCases<'a>,
     issuer: Option<SymbolicEqualityIssuer<'a>>,
     seen: bool,
@@ -4708,14 +4774,43 @@ struct MainFlowProofTarget<'a> {
 
 #[cfg(feature = "internal-checker")]
 impl<'a> MainFlowProofTarget<'a> {
+    fn nested_case_work(proof: &MainFlowProofCase<'_>, step: Option<&MainFlowAuthoredShows<'_>>) -> usize {
+        // A case can issue at most one diagnostic, even when using a show
+        // index. Charge that worst case, its guard, and indexed work.
+        let guard = proof.guard.comparisons.len().saturating_add(
+            proof.guard.domain.map_or(0, |(_, values)| values.interval_count()),
+        );
+        let depth = |len: usize| (usize::BITS - len.leading_zeros()) as usize;
+        let step_work = match step {
+            Some(MainFlowAuthoredShows::Multiple { groups, .. }) => depth(groups.len()).saturating_add(4),
+            Some(MainFlowAuthoredShows::CallingSequence { steps, .. }) => {
+                // The concrete observer may lazily materialize its index.
+                let depth = depth(steps.len());
+                steps.len().saturating_mul(depth.saturating_mul(2).saturating_add(4))
+                    .saturating_add(depth)
+            }
+            _ => 2,
+        };
+        4usize.saturating_add(guard).saturating_add(step_work)
+    }
+
+    fn exact_watch(&self) -> NamedExactWatch {
+        if self.permits_exact_calling {
+            NamedExactWatch::Observe { nested_work: self.nested_observation_work }
+        } else {
+            NamedExactWatch::Citation
+        }
+    }
+
     fn new((first, step): MainFlowProofPlan<'a>) -> Self {
         let permits_exact_calling = !matches!(&step, Some(MainFlowAuthoredShows::CallingCitation { .. }));
+        let nested_observation_work = Self::nested_case_work(&first, step.as_ref());
         let cases = if let Some(step) = step {
             MainFlowProofCases::Authored(vec![(first, Some(step))])
         } else {
             MainFlowProofCases::Bare { first, rest: Vec::new() }
         };
-        Self { permits_exact_calling, cases, issuer: None, seen: false }
+        Self { permits_exact_calling, nested_observation_work, cases, issuer: None, seen: false }
     }
 }
 
@@ -4776,9 +4871,11 @@ impl<'a> MainFlowProofObserver<'a> {
             self.pure_affine_target = None;
         }
         let permits_exact_calling = !matches!(&proof.1, Some(MainFlowAuthoredShows::CallingCitation { .. }));
+        let nested_case_work = MainFlowProofTarget::nested_case_work(&proof.0, proof.1.as_ref());
         if self.first.0 == target {
             self.first.1.issuer = None;
             self.first.1.permits_exact_calling &= permits_exact_calling;
+            self.first.1.nested_observation_work = self.first.1.nested_observation_work.saturating_add(nested_case_work);
             self.first.1.cases.push(proof);
             return;
         }
@@ -4787,6 +4884,7 @@ impl<'a> MainFlowProofObserver<'a> {
                 let group = entry.get_mut();
                 group.issuer = None;
                 group.permits_exact_calling &= permits_exact_calling;
+                group.nested_observation_work = group.nested_observation_work.saturating_add(nested_case_work);
                 group.cases.push(proof);
             }
             std::collections::hash_map::Entry::Vacant(entry) => {
@@ -4810,9 +4908,9 @@ impl ActualIntegerObserver for MainFlowProofObserver<'_> {
 
     fn observe(&mut self, _: (usize, usize), _: &[&BigInt], _: &BigInt) {}
 
-    fn named_exact_watch(&self, target: PreparedCallable) -> Option<bool> {
-        if self.first.0 == target { Some(self.first.1.permits_exact_calling) }
-        else { self.other.get(&target).map(|group| group.permits_exact_calling) }
+    fn named_exact_watch(&self, target: PreparedCallable) -> Option<NamedExactWatch> {
+        if self.first.0 == target { Some(self.first.1.exact_watch()) }
+        else { self.other.get(&target).map(MainFlowProofTarget::exact_watch) }
     }
 
     fn permits_named_pure_affine_return(&self, target: PreparedCallable, arguments: &[&BigInt]) -> bool {
@@ -4845,19 +4943,25 @@ impl ActualIntegerObserver for MainFlowProofObserver<'_> {
             let invoked = if let Some(invoked) = &invocation {
                 Rc::clone(invoked)
             } else {
-                let (outer, inner, directive_position) = match &site.call {
+                let (outer, intermediate, inner, directive_position) = match &site.call {
                     InitializerProofOrigin::Direct { topology, occurrence, directive_position } => {
                         let Some(node) = topology.occurrences.get(occurrence.0) else { return false; };
-                        (None, node.span, *directive_position)
+                        (None, &[][..], node.span, *directive_position)
                     }
                     InitializerProofOrigin::Nested { outer, caller, inner, directive_position } => {
                         let Some(outer) = outer.topology.occurrences.get(outer.occurrence.0) else { return false; };
                         let Some(inner) = caller.occurrences.get(inner.0) else { return false; };
-                        (Some(outer.span), inner.span, *directive_position)
+                        (Some(outer.span), &[][..], inner.span, *directive_position)
+                    }
+                    InitializerProofOrigin::Stacked { outer, intermediate, inner, directive_position } => {
+                        (Some(*outer), intermediate.as_slice(), *inner, *directive_position)
                     }
                 };
                 let invoked = Rc::new(MainFlowProofInvocation {
                     outer_call: outer.map(|range| wosy_syntax::SourceSpan { source: site.source.clone(), range }),
+                    intermediate_calls: intermediate.iter().map(|&range| wosy_syntax::SourceSpan {
+                        source: site.source.clone(), range,
+                    }).collect(),
                     call: wosy_syntax::SourceSpan { source: site.source.clone(), range: inner },
                     directive_position,
                     arguments: parameters.iter().cloned().zip(arguments.iter().map(|value| (**value).clone())).collect(),
@@ -5002,11 +5106,11 @@ impl ActualIntegerObserver for NamedOrderedEvidence<'_> {
 
     fn observe(&mut self, _: PreparedCallable, _: &[&BigInt], _: &BigInt) {}
 
-    fn charge_named_exact_call(&mut self, body: &FunctionCallSites) -> Option<()> {
-        super::checker_flow::charge_call_work(&mut self.observed.named_exact_work, body.occurrences.len().checked_add(1)?)
+    fn charge_named_exact_work(&mut self, cost: usize) -> Option<()> {
+        super::checker_flow::charge_call_work(&mut self.observed.named_exact_work, cost)
     }
 
-    fn named_exact_watch(&self, target: PreparedCallable) -> Option<bool> {
+    fn named_exact_watch(&self, target: PreparedCallable) -> Option<NamedExactWatch> {
         self.observed.named_exact_watch(target)
     }
 
@@ -16313,9 +16417,56 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
             let also_watches_leaf = text.replace("i8 inactive =", &format!(
                 "proof leaf_checked for leaf(entry) -> (out) ensures (out <= 7) {{}}\n i8 seen = leaf(3); core.require(seen == 7, {OUTPUT});\n i8 inactive =",
             ));
-            assert!(matches!(run(&also_watches_leaf, scope), Err(ProjectCheck::Unsupported)),
-                "an actual direct site cannot stand in for an unobserved nested watched call");
+            let combined = run(&also_watches_leaf, scope).unwrap();
+            assert_eq!(combined.diagnostics.len(), 2);
+            assert!(combined.diagnostics.iter().all(|diagnostic| diagnostic.invocation.outer_call.is_none()));
         }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordered_named_stacked_proofs_preserve_distinct_intermediate_occurrences() {
+        let app = source("src/main.w", "ordered-stacked-proof-occurrence");
+        let text = format!(r#"%%start
+            i8(i8) leaf = fn(input) {{ if (input < 0) {{ -3 }} else {{ 7 }} }};
+            i8(i8) bridge = fn(input) {{ i8 result = leaf(input); result }};
+            i8(i8) producer = fn(input) {{
+                i8 first = bridge(input);
+                i8 second = bridge(input);
+                if (first == 7) {{ second }} else {{ first }}
+            }};
+            proof inner for leaf(entry) -> (out) where (entry >= 0) ensures (out <= 6) {{}}
+            proof outer for producer(entry) -> (out) ensures (out <= 7) {{}}
+            i8 saved = producer(3);
+            core.require(saved == 7, {OUTPUT});
+        %%end"#);
+        let run = |text: &str, scope| {
+            let (_, proof) = crate::parse_proof_source(app.clone(), text.to_owned(), &[]).ok().unwrap();
+            check_loaded_ordered_proof_diagnostics_in_scope::<true>(
+                Vec::new(), vec![(proof, Vec::new())], vec![app.clone()], inputs(), scope, Vec::new(),
+            )
+        };
+        let snippet = |span: ByteSpan| &text[span.start as usize..span.end as usize];
+        for scope in [ScalarCheckerScope::MainFlowOnly, ScalarCheckerScope::CurrentPackage] {
+            let report = run(&text, scope).unwrap();
+            let [first, second] = report.diagnostics.as_slice() else { panic!("both real nested sites must report"); };
+            assert!(report.symbolic_diagnostic.is_none() && report.directives.is_empty());
+            for failure in [first, second] {
+                let site = &failure.invocation;
+                assert_eq!(site.arguments, [(ScalarType::I8, BigInt::from(3))]);
+                assert_eq!(site.returned, BigInt::from(7));
+                assert_eq!(snippet(site.outer_call.as_ref().unwrap().range), "producer(3)");
+                assert_eq!(snippet(site.call.range), "leaf(input)");
+                let [bridge] = site.intermediate_calls.as_slice() else { panic!("ambiguous nested route"); };
+                assert_eq!(snippet(bridge.range), "bridge(input)");
+            }
+            assert!(first.invocation.intermediate_calls[0].range.start < second.invocation.intermediate_calls[0].range.start);
+        }
+        let cited_bridge = text.replace("proof outer", r#"proof bridge_base for bridge(entry) -> (out) ensures (out == 7) {}
+            proof bridge_citing for bridge(entry) -> (out) ensures (out <= 7) { core.use(bridge_base(entry)); }
+            proof outer"#);
+        assert!(matches!(run(&cited_bridge, ScalarCheckerScope::CurrentPackage), Err(ProjectCheck::Unsupported)),
+            "a symbolic-only citation must not borrow actual nested proof authority");
     }
 
     #[cfg(feature = "internal-checker")]

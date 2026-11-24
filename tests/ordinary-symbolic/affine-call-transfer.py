@@ -1620,10 +1620,22 @@ reached_named_calling_producer = f"""%%start
 cases.extend([
     ("exact-startup-named-calling-producer-refuted",reached_named_calling_producer,1,b"proof obligation failed"),
     ("exact-startup-named-calling-producer-proved",reached_named_calling_producer.replace("out <= 6","out <= 7"),0,b""),
-    ("exact-startup-named-calling-producer-refuses-nested-watch",reached_named_calling_producer.replace(
-        "i8 inactive =", "proof leaf_checked for leaf(entry) -> (out) ensures (out <= 7) {}\n    i8 inactive ="),
-        2,b"unsupported analysis"),
+    ("exact-startup-named-calling-producer-observes-nested-watch",reached_named_calling_producer.replace("out <= 6","out <= 7",1).replace(
+        "i8 inactive =", "proof leaf_checked for leaf(entry) -> (out) where (entry >= 0) ensures (out <= 6) {}\n    i8 inactive ="),
+        1,b"proof obligation failed"),
 ])
+
+stacked_named_calling_producer = f"""%%start
+    i8(i8) leaf = fn(input) {{ if (input < 0) {{ -3 }} else {{ 7 }} }};
+    i8(i8) bridge = fn(input) {{ i8 result = leaf(input); result }};
+    i8(i8) producer = fn(input) {{ i8 result = bridge(input); result }};
+    proof inner for leaf(entry) -> (out) where (entry >= 0) ensures (out <= 6) {{}}
+    proof outer for producer(entry) -> (out) ensures (out <= 7) {{}}
+    i8 saved = producer(3);
+    core.require(saved == 7, {report(39,"WRONG-STACKED-OUTPUT")});
+%%end"""
+cases.append(("exact-startup-named-stacked-calling-producer-refuted",stacked_named_calling_producer,
+    1,b"proof obligation failed"))
 
 ordered_calling_citation = """%%start
     i8(i8) execute = fn(input) { if (input < 0) { -3 } else { 7 } };
@@ -1711,6 +1723,8 @@ cases.extend([
         b"proof obligation failed"),
 ])
 proof_diagnostic_notes = {
+    "exact-startup-named-calling-producer-observes-nested-watch": b"reached from this call",
+    "exact-startup-named-stacked-calling-producer-refuted": b"through this call",
     "exact-startup-named-calling-producer-refuted": b"call returned 7",
     "ordered-calling-citation-then-show-refuted": b"symbolic call can return 7",
     "ordinary-named-calling-ordered-shows-earliest": b"symbolic call can return 7",

@@ -912,6 +912,11 @@ fn check_command(
                 message: "proof goal".to_owned(),
             });
         }
+        labels.extend(failure.invocation.intermediate_calls.iter().map(|span| DiagnosticLabel {
+            kind: DiagnosticLabelKind::Secondary,
+            span: span.clone(),
+            message: "through this call".to_owned(),
+        }));
         if let Some(outer) = &failure.invocation.outer_call {
             labels.push(DiagnosticLabel {
                 kind: DiagnosticLabelKind::Secondary,
