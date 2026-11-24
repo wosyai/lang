@@ -3982,7 +3982,7 @@ fn derive_type(node: &CstNode) -> ScalarType {
         };
     }
     for _ in node
-        .children()
+        .children_with_tokens()
         .filter(|child| child.kind() == SyntaxKind::ErasedArraySuffix)
     {
         ty = ScalarType::RuntimeArray {
@@ -3990,23 +3990,10 @@ fn derive_type(node: &CstNode) -> ScalarType {
             span: wosy_syntax::byte_span(node),
         };
     }
-    if !matches!(ty, ScalarType::Callable { .. }) {
-        let erased_suffixes = node.text().to_string().match_indices("[]").count();
-        for _ in runtime_array_depth(&ty)..erased_suffixes {
-            ty = ScalarType::RuntimeArray {
-                element: Box::new(ty),
-                span: wosy_syntax::byte_span(node),
-            };
-        }
-    }
+    // Suffixes belong to the current CST owner. A suffix inside a
+    // parenthesized pointee is applied by deriving that pointee, not again at
+    // the enclosing checked reference or callable parameter.
     ty
-}
-
-fn runtime_array_depth(ty: &ScalarType) -> usize {
-    match ty {
-        ScalarType::RuntimeArray { element, .. } => 1 + runtime_array_depth(element),
-        _ => 0,
-    }
 }
 
 fn derive_callable_array_type(node: &CstNode) -> ScalarType {

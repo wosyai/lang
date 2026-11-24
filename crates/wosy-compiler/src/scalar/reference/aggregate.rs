@@ -63,6 +63,8 @@ pub(super) struct AggregateFlowFacts {
     pub(super) array_return: Option<(CfgPointId, CfgPointId)>,
     pub(super) conditional_array_return: Option<ConditionalArrayReturn>,
     pub(super) array_installs: BTreeMap<CfgPointId, OccurrenceOrdinal>,
+    pub(super) borrowed_extent_observer: Option<(CfgPointId, OccurrenceOrdinal, ByteSpan)>,
+    pub(super) borrowed_extent_call: Option<(CfgPointId, OccurrenceOrdinal, ByteSpan)>,
     pub(super) array_formal_extent_borrows: BTreeSet<CfgPointId>,
     pub(super) neutral_array_calls: BTreeSet<CfgPointId>,
     pub(super) neutral_array_projections: BTreeMap<CfgPointId, CfgPointId>,
@@ -1252,6 +1254,8 @@ pub(super) struct AggregateFlowResult {
     pub(super) checked_producer_authoritative: bool,
     pub(super) array_invalid: bool,
     pub(super) array_neutral: bool,
+    pub(super) borrowed_extent_observer: Option<(CfgPointId, OccurrenceOrdinal, ByteSpan)>,
+    pub(super) borrowed_extent_call: Option<(CfgPointId, OccurrenceOrdinal, ByteSpan)>,
     pub(super) array_formal_extent_required: bool,
     array_conditional_forwarded: bool,
     pub(super) array_calls: BTreeMap<CfgPointId, (OccurrenceOrdinal, CfgPointId, ReferenceBindingId)>,
@@ -1486,7 +1490,8 @@ impl AggregateFlowResult {
     }
 
     pub(super) fn has_observations(&self) -> bool {
-        self.array_formal_extent_required || self.literal_array_index_required.is_some() || self.literal_array_extent_required.is_some() || self.proved_literal_array_route_ref().is_some()
+        self.borrowed_extent_observer.is_some() || self.borrowed_extent_call.is_some()
+            || self.array_formal_extent_required || self.literal_array_index_required.is_some() || self.literal_array_extent_required.is_some() || self.proved_literal_array_route_ref().is_some()
             || (self.checked_producer_authoritative && !self.checked_producer_backing.is_empty())
             || self.checked_backing_assignment.is_some() || self.checked_backing_forward.is_some()
             || self.scalar_descriptor_assignment.is_some() || self.fresh_recommit_leaf.is_some() || !self.array_returns.is_empty() || !self.array_rebinds.is_empty()
@@ -2948,6 +2953,8 @@ pub(crate) struct ClosedBody {
     pub(crate) literal_array: Option<ClosedLiteralArray>,
     pub(crate) replacement_extent_observation: Option<usize>,
     pub(crate) array_descriptor_return: bool,
+    pub(crate) borrowed_extent_observer: Option<(usize, ByteSpan)>,
+    pub(crate) borrowed_extent_call: Option<(usize, ByteSpan)>,
     pub(crate) array_descriptor_identity: bool,
     pub(crate) array_descriptor_observer: Option<ByteSpan>,
     pub(crate) array_descriptor_forward: Option<usize>,
@@ -5917,6 +5924,63 @@ fn seal_array_descriptor_identities(
     }
 }
 
+fn seal_borrowed_extent_observers(
+    ordinary: &OrdinaryCohorts,
+    observations: &BTreeMap<BodyKey, (OccurrenceOrdinal, ByteSpan)>,
+    callers: &[(BodyKey, &Body<'_>, (CfgPointId, OccurrenceOrdinal, ByteSpan))],
+    declarations: &HashMap<(&SourceIdentity, ByteSpan), (usize, usize)>,
+    result: &mut ClosedAggregates,
+    checked_access: bool,
+) {
+    if !checked_access || observations.is_empty() { return; }
+    let mut sites = HashMap::new();
+    for &(caller, body, (point, occurrence, declaration)) in callers {
+        if let Some(target) = target_body(declarations, body.cfg, point).filter(|target| observations.contains_key(target)) {
+            sites.insert((caller, occurrence.0), (target, declaration));
+        }
+    }
+    for (&target, &(observation, formal)) in observations {
+        let Some(uses) = ordinary.array_uses.get(&target).and_then(Option::as_ref).filter(|uses| !uses.is_empty())
+        else { continue };
+        if result.bodies.contains_key(&target)
+            || !uses.iter().all(|use_site| sites.get(use_site).is_some_and(|(key, _)| *key == target))
+        {
+            continue;
+        }
+        result.bodies.entry(target).or_default().borrowed_extent_observer = Some((observation.0, formal));
+        for &(caller, call) in uses {
+            result.bodies.entry(caller).or_default().borrowed_extent_call = Some((call, sites[&(caller, call)].1));
+        }
+    }
+}
+
+fn exact_borrowed_extent_observer(body: &Body<'_>, point: CfgPointId, call: OccurrenceOrdinal) -> bool {
+    let [formal] = body.sites.boundary.parameters.as_slice() else { return false };
+    body.is_monomorphic && body.cfg.initial_points.len() <= 9
+        && !body.sites.declared_unsafe_calls.contains(&call.0)
+        && (|| {
+            let points = &body.cfg.initial_points;
+            let CfgPointKind::Call { output: 0, target: ResolvedCallTarget::Core(CoreOperationId::ArrayLen),
+                argument_points, .. } = &points[point.0].kind else { return false };
+            let [borrow] = argument_points.as_slice() else { return false };
+            let [output] = points[point.0].successors.as_slice() else { return false };
+            let CfgPointKind::Borrow { place, loan } = &points[borrow.0].kind else { return false };
+            (loan.mode == ScalarReferenceMutability::Shared && loan.parent.is_some()
+                && place.binding.declaration_span == formal.span
+                && points[borrow.0].successors.as_slice() == [point]
+                && matches!(points[output.0].kind, CfgPointKind::ReturnOutput { output: 0, value_point, checked: false }
+                    if value_point == point))
+                && points.iter().all(|current| match &current.kind {
+                    CfgPointKind::Entry | CfgPointKind::ScopeEnter | CfgPointKind::ScopeExit | CfgPointKind::Return => true,
+                    CfgPointKind::Read { binding } => binding == &place.binding,
+                    CfgPointKind::Bind { binding } => binding == &place.binding
+                        && points[0].successors.as_slice() == [current.id]
+                        && current.scope == ReferenceScopeId(0),
+                    _ => [*borrow, point, *output].contains(&current.id),
+                })
+        })()
+}
+
 fn install_literal_array_plans(
     callers: &[(BodyKey, &Body<'_>, &LiteralArrayRoute)],
     bodies: &BTreeMap<BodyKey, Body<'_>>,
@@ -6365,6 +6429,7 @@ fn closed_aggregates<'a>(
     let mut declarations = HashMap::new();
     let mut storage_uses = HashMap::<&SourceSpan, usize>::new();
     let mut array_descriptor_identities = BTreeMap::new();
+    let mut borrowed_extent_observers = BTreeMap::new();
     for (&key @ (module, item, arm), &is_monomorphic) in &reservations.bodies {
         let input = module_at(module).ok_or_else(|| format!("missing emitted aggregate module {module}"))?;
         let Some(ScalarItem::Function(function)) = input.items.get(item) else {
@@ -6401,6 +6466,12 @@ fn closed_aggregates<'a>(
                 });
             let body = Body { facts, cfg, sites, source: input.source, is_monomorphic, supports_input_result };
             if arm.is_none() {
+                if let Some((_, observation, formal)) = facts.and_then(|facts| facts.borrowed_extent_observer)
+                    .filter(|(point, call, _)| exact_borrowed_extent_observer(&body, *point, *call))
+                {
+                    borrowed_extent_observers.insert(key, (observation, formal));
+                    ordinary.array_uses.entry(key).or_insert_with(|| Some(Vec::new()));
+                }
                 if let Some(route) = array_descriptor_route(&body) {
                     array_descriptor_identities.insert(key, route);
                     ordinary.array_uses.entry(key).or_insert_with(|| Some(Vec::new()));
@@ -6469,6 +6540,8 @@ fn closed_aggregates<'a>(
     let mut literal_array_callers = Vec::new();
     let mut returned_extent_requirements = Vec::new();
     let mut formal_extent_requirements = Vec::new();
+    let mut borrowed_extent_requirements = Vec::new();
+    let mut borrowed_extent_callers = Vec::new();
     let mut returned_index_requirements = Vec::new();
     let mut array_leaves = BTreeSet::new();
     let mut array_neighbors = BTreeMap::<BodyKey, BTreeSet<BodyKey>>::new();
@@ -6482,6 +6555,12 @@ fn closed_aggregates<'a>(
             }
             if facts.array_formal_extent_required {
                 formal_extent_requirements.push((key, body.source));
+            }
+            if facts.borrowed_extent_observer.is_some() {
+                borrowed_extent_requirements.push((key, body.source));
+            }
+            if let Some(call) = facts.borrowed_extent_call.filter(|_| body.is_monomorphic && key.2.is_none()) {
+                borrowed_extent_callers.push((key, body, call));
             }
             if let Some(occurrence) = facts.literal_array_extent_required {
                 returned_extent_requirements.push((key, body, occurrence));
@@ -6808,6 +6887,13 @@ fn closed_aggregates<'a>(
 
         seal_array_descriptor_identities(&ordinary, &returned_extent_requirements,
             &declarations, &array_descriptor_identities, &bodies, &mut result);
+        seal_borrowed_extent_observers(&ordinary, &borrowed_extent_observers, &borrowed_extent_callers,
+            &declarations, &mut result, reservations.checked_access);
+        for &(key, source) in &borrowed_extent_requirements {
+            if !result.bodies.get(&key).is_some_and(|plan| plan.borrowed_extent_observer.is_some()) {
+                return Err(format!("core.array_len requires a closed checked borrowed runtime extent in {source:?}"));
+            }
+        }
         for &(key, source) in &formal_extent_requirements {
             if !result.bodies.get(&key).is_some_and(|plan| plan.array_descriptor_observer.is_some()) {
                 return Err(format!("core.array_len requires a closed exact owning formal extent in {source:?}"));

@@ -461,9 +461,15 @@ pub(super) fn emit_array_len<'ctx>(
     if let crate::ScalarPlace::Dereference { pointer, .. } = place {
         // Observe the checked place normally: the existing null policy owns
         // validation before even a constant extent may be observed.
-        let (ScalarType::Array { length, .. }, _) = dereference_address(context, state, pointer, project)?
-        else { return Err("core.array_len lacks a checked fixed-array referent".into()) };
-        return Ok(EmitValue::Basic(context.i64_type().const_int(length, false).into()));
+        let (referent, _) = dereference_address(context, state, pointer, project)?;
+        let length = match referent {
+            ScalarType::Array { length, .. } => context.i64_type().const_int(length, false),
+            ScalarType::RuntimeArray { .. } if super::aggregate_transfer::borrowed_extent_at(state, expression, pointer) =>
+                state.aggregate.as_ref().and_then(|aggregate| aggregate.borrowed_extent)
+                    .ok_or("missing sealed borrowed array count")?,
+            _ => return Err("core.array_len lacks a checked array referent extent".into()),
+        };
+        return Ok(EmitValue::Basic(length.into()));
     }
     let crate::ScalarPlace::Name { name, .. } = place else {
         return Err("core.array_len lacks a prepared named array address".into());
@@ -480,7 +486,7 @@ pub(super) fn emit_array_len<'ctx>(
     Ok(EmitValue::Basic(length.into()))
 }
 
-fn capture_local_runtime_extent<'ctx>(
+pub(super) fn capture_local_runtime_extent<'ctx>(
     context: &'ctx Context,
     state: &EmitState<'ctx, '_>,
     base: &crate::ScalarPlace,

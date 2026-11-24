@@ -14348,3 +14348,33 @@ enum Late { one; }
     assert_eq!(declarations.enums.iter().map(|decl| (decl.name.as_str(), decl.id.index)).collect::<Vec<_>>(),
         [("Late", 0), ("Early", 1), ("Late", 2), ("Late", 3)]);
 }
+
+#[test]
+fn type_derivation_owns_erased_suffixes_at_their_cst_level() {
+    let parsed = parse_source(source(), "%%start
+unit(*(u8[]), *u8[], *(u8[])[], u8[][]) shapes = fn(view, refs, views, nested) {
+    view; refs; views; nested;
+};
+*(u8[])(*(u8[])) identity = fn(view) { view };
+%%end".into(), &[]);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let declarations = derive_scalar_declarations_from_cst(parsed.result.canonical_cst());
+    let signature = |name| declarations.items.iter().find_map(|item| match item {
+        ScalarItem::Function(function) if function.name == name => Some(&function.signature),
+        _ => None,
+    }).unwrap();
+    let ScalarType::Callable { parameters, .. } = signature("shapes") else { panic!() };
+    let [view, refs, views, nested] = parameters.as_slice() else { panic!("{parameters:?}") };
+    let is_u8_array = |ty: &ScalarType| matches!(ty, ScalarType::RuntimeArray { element, .. } if **element == ScalarType::U8);
+    let is_view = |ty: &ScalarType| matches!(ty, ScalarType::CheckedReference {
+        mutability: ScalarReferenceMutability::Shared, inner,
+    } if is_u8_array(inner));
+    assert!(is_view(view), "{view:?}");
+    assert!(matches!(refs, ScalarType::RuntimeArray { element, .. } if matches!(element.as_ref(),
+        ScalarType::CheckedReference { inner, .. } if **inner == ScalarType::U8)), "{refs:?}");
+    assert!(matches!(views, ScalarType::RuntimeArray { element, .. } if is_view(element)), "{views:?}");
+    assert!(matches!(nested, ScalarType::RuntimeArray { element, .. } if is_u8_array(element)), "{nested:?}");
+    let ScalarType::Callable { parameters, outputs } = signature("identity") else { panic!() };
+    assert!(matches!(parameters.as_slice(), [ty] if is_view(ty)), "{parameters:?}");
+    assert!(matches!(outputs.outputs.as_slice(), [output] if is_view(&output.ty)), "{outputs:?}");
+}

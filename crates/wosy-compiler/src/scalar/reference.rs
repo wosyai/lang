@@ -1920,6 +1920,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 let mut named_release_binding = None;
                 let mut argument_points = Vec::new();
                 let signature = calls.checked_call_signatures.get(&ordinal);
+                let mut borrowed_extent_formal = None;
                 let mut aggregate_arguments = BTreeMap::new();
                 let mut array_argument = None;
                 let mut raw_arguments = Vec::new();
@@ -1940,6 +1941,16 @@ impl<'a> ReferenceFlowBuilder<'a> {
                                 && signature.is_some_and(|signature| matches!(signature.parameters.as_slice(),
                                     [ScalarType::CheckedReference { mutability: ScalarReferenceMutability::Shared, inner }]
                                         if matches!(inner.as_ref(), ScalarType::Array { .. }))) => {}
+                            Some(ScalarType::CheckedReference { mutability: ScalarReferenceMutability::Shared, inner })
+                                if matches!(inner.as_ref(), ScalarType::RuntimeArray { .. })
+                                    && matches!(place.place, ScalarPlace::Dereference { .. })
+                                    && matches!(place.projections.as_slice(), [ReferencePlaceProjection::Dereference(_)])
+                                    && matches!(calls.boundary.parameters.as_slice(), [formal]
+                                        if formal.span == place.binding.declaration_span)
+                                    && matches!(calls.boundary.root_outputs.as_slice(), [output] if output.ty == ScalarType::U64) =>
+                            {
+                                borrowed_extent_formal = Some(place.binding.declaration_span);
+                            }
                             Some(ScalarType::Array { .. }) if place.projections.is_empty() => {}
                             Some(ScalarType::RuntimeArray { .. }) if place.projections.is_empty()
                                 && self.cfg.allocations.contains(&place.binding) => {
@@ -2294,6 +2305,9 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     })()
                 } else { None };
                 let id = self.point_with_origins(call, span, scope, cast_origins.clone());
+                if let Some(formal) = borrowed_extent_formal {
+                    self.aggregate_facts.borrowed_extent_observer = Some((id, ordinal, formal));
+                }
                 if let Some((moved, argument)) = exclusive_write {
                     self.proof_points.exclusive_scalar_write_moves.push((moved, argument, id));
                 }
@@ -4911,6 +4925,34 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     let value_point = self.cursor.expect("evaluated output expression");
                     self.move_value(expression, scope, ordinal)?;
                     if let BlockItemKind::FinalOutput(slot) = kind {
+                        if scope == ReferenceScopeId(0) && slot.output == 0
+                            && matches!(calls.boundary.root_outputs.as_slice(), [output] if output.ty == ScalarType::U64)
+                            && matches!(region.items.as_slice(), [
+                                BlockItem { kind: BlockItemKind::Binding(binding), .. },
+                                BlockItem { kind: BlockItemKind::FinalOutput(_), .. },
+                            ] if matches!(binding.initialization, BindingInitialization::Allocation { .. }))
+                            && !calls.declared_unsafe_calls.contains(&slot.expression.0)
+                            && calls.checked_call_signatures.get(&slot.expression).is_some_and(|signature|
+                                matches!(signature.parameters.as_slice(), [ScalarType::CheckedReference {
+                                    mutability: ScalarReferenceMutability::Shared, inner,
+                                }] if matches!(inner.as_ref(), ScalarType::RuntimeArray { .. })))
+                        {
+                            if let CfgPointKind::Call { output: 0, target: ResolvedCallTarget::ModuleCallable {
+                                concrete: ConcreteCallSelection::Declaration, ..
+                            }, argument_points, .. } = &self.cfg.points[value_point.0].kind {
+                                if let [argument] = argument_points.as_slice() {
+                                    if let CfgPointKind::Borrow { place, loan } = &self.cfg.points[argument.0].kind {
+                                        if loan.parent.is_none() && loan.mode == ScalarReferenceMutability::Shared
+                                            && place.projections.is_empty() && matches!(place.place, ScalarPlace::Name { .. })
+                                            && self.cfg.allocations.contains(&place.binding)
+                                        {
+                                            self.aggregate_facts.borrowed_extent_call =
+                                                Some((value_point, slot.expression, place.binding.declaration_span));
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         if scope == ReferenceScopeId(0) && slot.output == 0
                             && self.aggregate_facts.literal_array_unit.is_none()
                             && matches!(calls.boundary.root_outputs.as_slice(), [output] if output.ty == ScalarType::U64)
@@ -16453,6 +16495,8 @@ fn build_function_reference_cfg(
         aggregate.local_array_failure_arms.clear();
         aggregate.checked_producer_backing.clear();
     }
+    aggregate.borrowed_extent_observer = builder.aggregate_facts.borrowed_extent_observer;
+    aggregate.borrowed_extent_call = builder.aggregate_facts.borrowed_extent_call;
     aggregate.array_formal_extent_required = !builder.aggregate_facts.array_formal_extent_borrows.is_empty();
     aggregate.literal_array_extent_required = builder.aggregate_facts.literal_array_extent_output
         .map(|(_, occurrence)| occurrence);

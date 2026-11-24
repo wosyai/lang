@@ -88,6 +88,7 @@ struct LiteralArrayBranchOriginal<'ctx> {
 
 pub(super) struct AggregateEmitter<'ctx, 'plan> {
     plan: &'plan ClosedBody,
+    pub(super) borrowed_extent: Option<inkwell::values::IntValue<'ctx>>,
     destination: Option<PointerValue<'ctx>>,
     ordinary_destination: Option<PointerValue<'ctx>>,
     local_choice_destination: Option<PointerValue<'ctx>>,
@@ -225,6 +226,7 @@ impl<'ctx, 'plan> AggregateEmitter<'ctx, 'plan> {
         }).collect::<Result<Vec<_>, _>>()?;
         Ok(Some(Self {
             plan,
+            borrowed_extent: None,
             inputs,
             destination,
             ordinary_destination,
@@ -274,12 +276,86 @@ impl<'ctx, 'plan> AggregateEmitter<'ctx, 'plan> {
 
 pub(super) fn linkage(plan: Option<&ClosedBody>) -> Option<Linkage> {
     plan.filter(|body| body.returning.is_some() || !body.inputs.is_empty() || body.checked_backing_producer.is_some()
-        || body.checked_backing_wrapper.is_some() || body.ordinary_result || body.array_descriptor_return || body.array_descriptor_identity)
+        || body.checked_backing_wrapper.is_some() || body.ordinary_result || body.array_descriptor_return || body.array_descriptor_identity || body.borrowed_extent_observer.is_some())
         .map(|_| Linkage::Internal)
 }
 
 fn array_descriptor_type<'ctx>(context: &'ctx Context) -> inkwell::types::StructType<'ctx> {
     context.struct_type(&[context.ptr_type(AddressSpace::default()).into(), context.i64_type().into()], false)
+}
+
+fn borrowed_extent_type<'ctx>(context: &'ctx Context, layout: ScalarTargetLayout) -> inkwell::types::StructType<'ctx> {
+    let address = super::memory::pointer_integer_type(context, layout);
+    context.struct_type(&[address.into(), context.i64_type().into()], false)
+}
+
+pub(super) fn borrowed_extent_at(
+    state: &EmitState<'_, '_>,
+    expression: &ScalarExpression,
+    pointer: &ScalarExpression,
+) -> bool {
+    state.aggregate.as_ref().and_then(|aggregate| aggregate.plan.borrowed_extent_observer)
+        .is_some_and(|(occurrence, formal)| state.body_call_nodes.is_some_and(|nodes|
+            nodes.expression_ordinal(expression) == Some(occurrence)
+                && nodes.lexical_expression_declaration(pointer) == Some(formal)))
+}
+
+pub(super) fn tracks_borrowed_extent(state: &EmitState<'_, '_>, declaration: wosy_syntax::ByteSpan) -> bool {
+    state.aggregate.as_ref().and_then(|aggregate| aggregate.plan.borrowed_extent_call)
+        .is_some_and(|(_, expected)| expected == declaration)
+}
+
+pub(super) fn extract_borrowed_extent_formal<'ctx>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, '_>,
+    argument: BasicValueEnum<'ctx>,
+) -> Result<BasicValueEnum<'ctx>, String> {
+    let BasicValueEnum::StructValue(pair) = argument else {
+        return Err("missing sealed borrowed array extent formal".into());
+    };
+    if pair.get_type() != borrowed_extent_type(context, state.target_layout) {
+        return Err("invalid sealed borrowed array extent formal type".into());
+    }
+    let address = state.builder.build_extract_value(pair, 0, "borrowed_array_address").map_err(builder_error)?;
+    let count = state.builder.build_extract_value(pair, 1, "borrowed_array_extent").map_err(builder_error)?;
+    state.aggregate.as_mut().expect("sealed borrowed extent observer").borrowed_extent = Some(count.into_int_value());
+    Ok(address)
+}
+
+pub(super) fn emit_borrowed_extent_call<'ctx>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, '_>,
+    expression: &ScalarExpression,
+    symbol: &str,
+    arguments: &[ScalarExpression],
+    values: &[EmitValue<'ctx>],
+) -> Result<Option<EmitValue<'ctx>>, String> {
+    let Some((occurrence, declaration)) = state.aggregate.as_ref().and_then(|aggregate| aggregate.plan.borrowed_extent_call)
+    else { return Ok(None) };
+    let nodes = state.body_call_nodes.ok_or("missing sealed checked borrow nodes")?;
+    if nodes.expression_ordinal(expression) != Some(occurrence) { return Ok(None); }
+    let [ScalarExpression::CheckedAddress { place: place @ crate::ScalarPlace::Name { name, .. }, .. }] = arguments
+    else { return Err("missing sealed borrowed array address".into()) };
+    if nodes.lexical_place_declaration(place) != Some(declaration) {
+        return Err("sealed borrowed extent changed its lexical backing".into());
+    }
+    let [EmitValue::Basic(BasicValueEnum::IntValue(address))] = values
+    else { return Err("missing sealed borrowed array address value".into()) };
+    let (storage, _) = state.storage.get(name).ok_or("missing sealed borrowed array storage")?;
+    let count = super::memory::capture_local_runtime_extent(context, state, place, *storage, false)?
+        .ok_or("missing sealed borrowed array extent")?;
+    let function = *state.functions.get(symbol).ok_or("missing sealed borrowed array observer")?;
+    let descriptor = borrowed_extent_type(context, state.target_layout);
+    if function.get_linkage() != Linkage::Internal || function.get_type().get_param_types().as_slice() != [descriptor.into()]
+        || function.get_type().get_return_type() != Some(context.i64_type().into())
+    {
+        return Err("sealed borrowed array extent call ABI changed".into());
+    }
+    let pair = state.builder.build_insert_value(descriptor.get_undef(), *address, 0, "borrowed_array_argument_address").map_err(builder_error)?.into_struct_value();
+    let pair = state.builder.build_insert_value(pair, count, 1, "borrowed_array_argument").map_err(builder_error)?.into_struct_value();
+    let value = state.builder.build_call(function, &[pair.into()], "borrowed_extent").map_err(builder_error)?
+        .try_as_basic_value().basic().ok_or("missing observed borrowed array extent")?;
+    Ok(Some(EmitValue::Basic(value)))
 }
 
 pub(super) fn emit_array_descriptor_call<'ctx>(
@@ -340,6 +416,19 @@ pub(super) fn definition_type<'ctx>(
     layout: ScalarTargetLayout,
     plan: Option<&ClosedBody>,
 ) -> Result<FunctionType<'ctx>, String> {
+    if plan.is_some_and(|body| body.borrowed_extent_observer.is_some()) {
+        let ScalarType::Callable { parameters, outputs } = &function.signature else {
+            return Err("invalid checked borrowed extent declaration".into());
+        };
+        if !matches!(parameters.as_slice(), [ScalarType::CheckedReference {
+            mutability: crate::scalar::ScalarReferenceMutability::Shared, inner,
+        }] if matches!(inner.as_ref(), ScalarType::RuntimeArray { .. }))
+            || !matches!(outputs.outputs.as_slice(), [crate::ScalarOutput { ty: ScalarType::U64, .. }])
+        {
+            return Err("invalid checked borrowed extent signature".into());
+        }
+        return Ok(context.i64_type().fn_type(&[borrowed_extent_type(context, layout).into()], false));
+    }
     if plan.is_some_and(|body| body.array_descriptor_identity) {
         let ScalarType::Callable { parameters, outputs } = &function.signature else {
             return Err("invalid checked array identity declaration".into());

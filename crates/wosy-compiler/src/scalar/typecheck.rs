@@ -1549,10 +1549,11 @@ fn array_len_address<'a>(
         ScalarPlace::Name { .. } => Some(address),
         ScalarPlace::Dereference { pointer, .. } => {
             let ScalarExpression::Name { name, .. } = pointer.as_ref() else { return None };
-            // Fixed views derive their extent from the exact checked referent
-            // type, not the address. Runtime views do not yet carry a count.
+            // Runtime views must acquire an exact extent transport after normal
+            // checked reference analysis; a source pointer alone proves no count.
             matches!(scope.get(name), Some(ScalarType::CheckedReference { inner, .. })
-                if matches!(inner.as_ref(), ScalarType::Array { .. })).then_some(address)
+                if matches!(inner.as_ref(), ScalarType::Array { .. } | ScalarType::RuntimeArray { .. }))
+                .then_some(address)
         }
         _ => None,
     }

@@ -1939,8 +1939,9 @@ fn store_binding_outputs<'ctx, 'module>(
         let prepared = state.body_call_nodes.is_some_and(|nodes| nodes.binding_position(binding).is_some());
         let checked_extent = prepared && state.require_release_checked_access
             && state.indexed_runtime_allocations.contains(&declaration);
-        let tracked_extent = checked_extent || (prepared && state.observed_runtime_allocations.as_deref()
-            .is_some_and(|owners| owners.binary_search(&declaration).is_ok()));
+        let tracked_extent = checked_extent || aggregate_transfer::tracks_borrowed_extent(state, receiver.name_span)
+            || (prepared && state.observed_runtime_allocations.as_deref()
+                .is_some_and(|owners| owners.binary_search(&declaration).is_ok()));
         let slot = ownership::emit_runtime_array_allocation_with_domain(
             context, state, element, length, checked_extent,
         )?;
@@ -2449,7 +2450,9 @@ fn emit_function<'ctx, 'module>(
                 .build_alloca(storage, &function.parameters[index])
                 .map_err(builder_error)?;
             align_storage_alloca(slot, alignment)?;
-            let argument = if let Some(declaration) = array_descriptor_observer.filter(|_| index == 0) {
+            let argument = if index == 0 && aggregate_plan.is_some_and(|plan| plan.borrowed_extent_observer.is_some()) {
+                aggregate_transfer::extract_borrowed_extent_formal(context, &mut state, argument)?
+            } else if let Some(declaration) = array_descriptor_observer.filter(|_| index == 0) {
                 let (backing, extent) = aggregate_transfer::extract_observing_array_formal(
                     context, builder, argument,
                 )?;
@@ -2806,7 +2809,9 @@ fn emit_project_function<'ctx, 'module>(
                 .build_alloca(storage, &function.parameters[index])
                 .map_err(builder_error)?;
             align_storage_alloca(slot, alignment)?;
-            let argument = if let Some(declaration) = array_descriptor_observer.filter(|_| index == 0) {
+            let argument = if index == 0 && aggregate_plan.is_some_and(|plan| plan.borrowed_extent_observer.is_some()) {
+                aggregate_transfer::extract_borrowed_extent_formal(context, &mut state, argument)?
+            } else if let Some(declaration) = array_descriptor_observer.filter(|_| index == 0) {
                 let (backing, extent) = aggregate_transfer::extract_observing_array_formal(
                     context, builder, argument,
                 )?;
