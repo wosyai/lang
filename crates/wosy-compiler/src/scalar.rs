@@ -3102,7 +3102,8 @@ fn project_from_declarations(
 ) -> Result<ScalarProject, ScalarProjectPreparationRejection> {
     let mut modules = Vec::with_capacity(declarations.len());
     let mut diagnostics = Vec::new();
-    let mut contextual_types = HashMap::<String, (ScalarType, SourceSpan)>::new();
+    let mut contextual_types = HashMap::<String, (ScalarType, SourceSpan, bool)>::new();
+    let mut inherited = Vec::new();
     for (declarations, namespace_bindings) in declarations {
         let ScalarSourceDeclarations {
             source,
@@ -3114,8 +3115,9 @@ fn project_from_declarations(
         } = declarations;
         for index in contextual_places.first_declarations {
             let storage = &contextual_places.declarations[index];
-            match contextual_types.get(&storage.name) {
-                Some((ty, first_span)) if *ty != storage.ty => {
+            match contextual_types.get_mut(&storage.name) {
+                Some((ty, first_span, conflicted)) if *ty != storage.ty => {
+                    *conflicted = true;
                     let mut diagnostic = contextual::reported_error(
                         storage.declaration.clone(),
                         "contextual name must have one static type",
@@ -3131,11 +3133,20 @@ fn project_from_declarations(
                 None => {
                     contextual_types.insert(
                         storage.name.clone(),
-                        (storage.ty.clone(), storage.declaration.clone()),
+                        (storage.ty.clone(), storage.declaration.clone(), false),
                     );
                 }
             }
         }
+        for name in contextual_places.conflicted_types {
+            if let Some((_, _, conflicted)) = contextual_types.get_mut(&name) {
+                *conflicted = true;
+            }
+        }
+        let offset = diagnostics.len();
+        inherited.extend(contextual_places.inherited.into_iter().map(|occurrence| {
+            (offset + occurrence.diagnostic, occurrence.span, occurrence.name)
+        }));
         let mut module = ScalarModule::new(source, items, namespace_bindings);
         module.structs = structs;
         module.enums = enums;
@@ -3143,6 +3154,20 @@ fn project_from_declarations(
         module.layouts = ScalarTargetLayouts::new(inputs.target_layout);
         modules.push(module);
         diagnostics.extend(extraction_diagnostics);
+    }
+    // Final catalog authority is independent of the declaration's
+    // module order and never implies that its storage is active at a call.
+    for (index, occurrence_span, name) in inherited {
+        let Some((_, declaration, false)) = contextual_types.get(&name) else { continue; };
+        let Some(diagnostic) = diagnostics.get_mut(index) else { continue; };
+        if diagnostic.labels.first().is_none_or(|label| label.span.range != occurrence_span) {
+            continue;
+        }
+        diagnostic.labels.push(DiagnosticLabel {
+            kind: DiagnosticLabelKind::Secondary,
+            span: declaration.clone(),
+            message: "project contextual type declared here; call binding is not resolved".to_owned(),
+        });
     }
     let project = ScalarProject::new(modules, initialization_order);
     if !diagnostics.is_empty() {

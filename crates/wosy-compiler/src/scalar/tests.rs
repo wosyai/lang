@@ -189,6 +189,51 @@ fn project_contextual_type_authority_preserves_distinct_same_body_storage() {
 }
 
 #[test]
+fn rejected_contextual_project_resolves_type_evidence_but_not_storage() {
+    let consumer = module_source("src/consumer.w");
+    let provider = module_source("src/provider.w");
+    let other = module_source("src/other.w");
+    let declare = |source: &SourceIdentity, body: &str| {
+        let parsed = parse_source(source.clone(), format!("%%start\n{body}\n%%end"), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        derive_scalar_declarations_from_cst(parsed.result.canonical_cst())
+    };
+    let check = |extra: Option<&str>| {
+        let mut declarations = vec![
+            (declare(&consumer, "i8() consume = fn { core.context.credits }; i8() missing = fn { core.context.unknown };"), Vec::new()),
+            (declare(&provider, "i8() supply = fn { i8 core.context.credits = 1; if (core.context.credits == 1) { i8 core.context.credits = 2; }; core.context.credits };"), Vec::new()),
+        ];
+        if let Some(extra) = extra {
+            declarations.push((declare(&other, extra), Vec::new()));
+        }
+        let result = prepare_scalar_project(
+            declarations, vec![consumer.clone(), provider.clone(), other.clone()],
+            ScalarPreparationInputs { target_layout: ScalarTargetLayout::NATIVE64 },
+        );
+        let Err(rejection) = result else { panic!("a type catalog is not an implicit call ABI"); };
+        rejection.into_ordered_diagnostics()
+    };
+    let diagnostics = check(None);
+    let [typed, missing] = diagnostics.as_slice() else { panic!("{diagnostics:?}"); };
+    assert_eq!(typed.labels.len(), 2);
+    assert_eq!(typed.labels[0].span.source, consumer);
+    assert_eq!(typed.labels[1].span.source, provider);
+    assert!(typed.labels[1].message.contains("call binding is not resolved"));
+    assert_eq!(missing.labels.len(), 1);
+    for conflict in [
+        "i16() wrong = fn { i16 core.context.credits = 1; core.context.credits };",
+        "i8() wrong = fn { i8 core.context.credits = 1; if (core.context.credits == 1) { i16 core.context.credits = 2; }; core.context.credits };",
+    ] {
+        let diagnostics = check(Some(conflict));
+        assert!(diagnostics.iter().any(|diagnostic| diagnostic.message.contains("one static type")));
+        let inherited = diagnostics.iter().filter(|diagnostic| diagnostic.message.contains("inherited contextual")).collect::<Vec<_>>();
+        assert_eq!(inherited.len(), 2);
+        assert!(inherited.iter().all(|diagnostic| diagnostic.labels.len() == 1),
+            "ambiguous global type declarations must never be reported as evidence");
+    }
+}
+
+#[test]
 fn qualified_old_does_not_become_contextual_storage() {
     let text = "%%start\ni8(i8) identity = fn(value) { value };\nproof entry for identity(input) -> (out) ensures (out == core.old(input)) {}\n%%end";
     let parsed = parse_source(source(), text.to_owned(), &[]);

@@ -18,6 +18,7 @@ pub(super) struct ContextualPlaces {
     // In source order. A requirement is never entered in `resolved`: its
     // place identity belongs to a caller and no ABI currently supplies it.
     pub(super) inherited: Vec<InheritedContextualOccurrence>,
+    pub(super) conflicted_types: HashSet<String>,
 }
 
 impl ContextualPlaces {
@@ -34,6 +35,7 @@ pub(super) struct InheritedContextualOccurrence {
     pub(super) span: ByteSpan,
     pub(super) name: String,
     pub(super) role: ContextualRole,
+    pub(super) diagnostic: usize,
     // Same-source type evidence only, not caller storage or completion of
     // project-wide type unification. Unknown names remain unresolved.
     pub(super) local_type_declaration: Option<usize>,
@@ -74,9 +76,13 @@ pub(super) fn prepare(
     let mut functions = Vec::<(ByteSpan, usize)>::new();
     let mut pending = HashMap::<ByteSpan, Vec<(String, usize)>>::new();
     let mut declared_types = HashMap::<String, usize>::new();
-    let mut report = |span, message: &str| diagnostics.push(reported_error(
-        SourceSpan::new(canonical.source.clone(), span), message,
-    ));
+    let mut diagnostic_index = diagnostics.len();
+    let mut report = |span, message: &str| {
+        let index = diagnostic_index;
+        diagnostic_index += 1;
+        diagnostics.push(reported_error(SourceSpan::new(canonical.source.clone(), span), message));
+        index
+    };
     for event in roots.iter().flat_map(CstNode::preorder) {
         match event {
             WalkEvent::Enter(node) if node.kind() == SyntaxKind::FunctionDecl => {
@@ -149,6 +155,7 @@ pub(super) fn prepare(
                     if *known == id {
                         result.first_declarations.push(id);
                     } else if result.declarations[*known].ty != ty {
+                        result.conflicted_types.insert(name.text().to_owned());
                         report(span, "contextual name must have one static type");
                         continue;
                     }
@@ -193,12 +200,12 @@ pub(super) fn prepare(
                     if let Some(&storage) = scopes[floor..].iter().rev().find_map(|(_, active)| active.get(name.text())) {
                         result.resolved.insert(span, ContextualOccurrence { storage, role });
                     } else {
+                        let diagnostic = report(span, "inherited contextual bindings are not supported by scalar preparation yet");
                         if let Some(&(function, _)) = functions.last() {
                             result.inherited.push(InheritedContextualOccurrence {
-                                function, span, name: name.text().to_owned(), role, local_type_declaration: None,
+                                function, span, name: name.text().to_owned(), role, diagnostic, local_type_declaration: None,
                             });
                         }
-                        report(span, "inherited contextual bindings are not supported by scalar preparation yet");
                     }
                 }
             }
@@ -206,7 +213,8 @@ pub(super) fn prepare(
         }
     }
     for occurrence in &mut result.inherited {
-        occurrence.local_type_declaration = declared_types.get(&occurrence.name).copied();
+        occurrence.local_type_declaration = declared_types.get(&occurrence.name).copied()
+            .filter(|_| !result.conflicted_types.contains(&occurrence.name));
     }
     result
 }
