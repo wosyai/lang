@@ -2015,6 +2015,9 @@ fn emit_function<'ctx, 'module>(
         .ok_or_else(|| format!("unknown LLVM function {name}"))?;
     let entry = context.append_basic_block(value, "entry");
     builder.position_at_end(entry);
+    if aggregate_plan.is_some_and(|plan| plan.identity_relay) {
+        return aggregate_transfer::emit_identity_relay(builder, value);
+    }
     let (fresh_return_outputs, branch_return_outputs) =
         fresh_return_outputs(function, reference_cfg)?;
     let joined_bindings = joined_return_binding_types(function, &branch_return_outputs)?;
@@ -2335,6 +2338,9 @@ fn emit_project_function<'ctx, 'module>(
         .ok_or_else(|| format!("unknown LLVM function {name}"))?;
     let entry = context.append_basic_block(value, "entry");
     builder.position_at_end(entry);
+    if aggregate_plan.is_some_and(|plan| plan.identity_relay) {
+        return aggregate_transfer::emit_identity_relay(builder, value);
+    }
     let (fresh_return_outputs, branch_return_outputs) =
         fresh_return_outputs(function, reference_cfg)?;
     let joined_bindings = joined_return_binding_types(function, &branch_return_outputs)?;

@@ -2540,6 +2540,8 @@ pub(crate) struct ClosedBody {
     pub(crate) ordinary_result: bool,
     pub(crate) ordinary_calls: BTreeMap<usize, SourceSpan>,
     pub(crate) calls: BTreeMap<usize, ClosedCall>,
+    pub(crate) recommits: BTreeMap<usize, usize>,
+    pub(crate) identity_relay: bool,
     pub(crate) scope_exits: BTreeMap<usize, CfgPointId>,
     pub(crate) releases: BTreeMap<CfgPointId, Vec<ClosedOwnerRelease>>,
     pub(crate) conditional_inputs: BTreeMap<usize, ClosedConditionalInputs>,
@@ -2642,6 +2644,45 @@ impl Body<'_> {
 
     fn has_mixed_struct_result(&self) -> bool {
         self.mixed_result_lanes().is_some()
+    }
+
+    fn is_exact_identity_relay(&self) -> bool {
+        let Some(facts) = self.facts else { return false };
+        let ([parameter], [output]) = (
+            self.sites.boundary.parameters.as_slice(),
+            self.sites.boundary.root_outputs.as_slice(),
+        ) else { return false };
+        let Some(formal) = facts.formals.get(&0) else { return false };
+        if !self.is_monomorphic || parameter.ordinal != 0 || output.output != 0
+            || !matches!(parameter.ty, ScalarType::Struct(_)) || parameter.ty != output.ty
+            || !self.cfg.allocations.is_empty()
+            || !facts.unsupported.is_empty() || facts.raw_invalid.is_some()
+            || !self.return_owners().eq([Some(OwnerSource::Formal(0))])
+        {
+            return false;
+        }
+        let mut read = None;
+        let mut moved = false;
+        let mut returned = false;
+        for (i, point) in self.cfg.points.iter().enumerate() {
+            if self.cfg.points.get(i + 1).map_or(!point.successors.is_empty(), |next|
+                point.successors.as_slice() != [next.id])
+            {
+                return false;
+            }
+            match &point.kind {
+                CfgPointKind::Entry | CfgPointKind::ScopeEnter | CfgPointKind::ScopeExit | CfgPointKind::Return => {}
+                CfgPointKind::Bind { binding } if binding == formal => {}
+                CfgPointKind::Read { binding } if binding == formal && read.is_none() => read = Some(point.id),
+                CfgPointKind::Move { place, owner, ty } if read.is_some() && !moved
+                    && owner == formal && place.binding == *formal && place.projections.is_empty()
+                    && *ty == parameter.ty => moved = true,
+                CfgPointKind::ReturnOutput { output: 0, value_point, checked: false }
+                    if moved && !returned && read == Some(*value_point) => returned = true,
+                _ => return false,
+            }
+        }
+        returned
     }
 
     fn return_owners(&self) -> impl Iterator<Item = Option<OwnerSource>> + '_ {
@@ -3604,6 +3645,18 @@ fn closed_aggregates<'a>(
             bodies.insert(key, Body { facts, cfg, sites, source: input.source, is_monomorphic, supports_input_result });
         }
     }
+    let identity_relays: BTreeSet<_> = bodies.iter().filter_map(|(&key, body)|
+        (key.2.is_none() && body.is_exact_identity_relay()).then_some(key)
+    ).collect();
+    // Only observed whole-move origins can re-key backing in the owning
+    // caller. Direct identity relays themselves keep ordinary value ABI.
+    #[derive(Clone, Copy)]
+    struct RecommitOrigin {
+        previous: CfgPointId,
+        birth: CfgPointId,
+    }
+    let mut recommit_observers = BTreeMap::<(BodyKey, CfgPointId), BTreeSet<(BodyKey, usize)>>::new();
+    let mut recommit_edges = BTreeMap::<(BodyKey, CfgPointId), Vec<(CfgPointId, Option<CfgPointId>)>>::new();
     let mut outgoing = BTreeSet::new();
     let mut pending = Vec::new();
     let mut callers = BTreeMap::<BodyKey, Vec<BodyKey>>::new();
@@ -3664,8 +3717,19 @@ fn closed_aggregates<'a>(
                     for source in origins {
                         match *source {
                             Some(InputOrigin::Owner(OwnerSource::Call(producer)) | InputOrigin::Immediate(producer)) => {
-                                if let Some(origin) = target_body(&declarations, body.cfg, producer) {
-                                    seed_targets.entry(origin).or_default().insert(receiver);
+                                if identity_relays.contains(&target) {
+                                    let whole_move = match (*source, moved) {
+                                        (Some(InputOrigin::Owner(_)), ArgumentProvenance::WholeMove(moved))
+                                            if origins.len() == 1 && slot == 0 => Some(moved),
+                                        _ => None,
+                                    };
+                                    recommit_edges.entry((key, producer)).or_default().push((point, whole_move));
+                                } else if let Some(origin) = target_body(&declarations, body.cfg, producer) {
+                                    if identity_relays.contains(&origin) {
+                                        recommit_observers.entry((key, producer)).or_default().insert(receiver);
+                                    } else {
+                                        seed_targets.entry(origin).or_default().insert(receiver);
+                                    }
                                 }
                             }
                             Some(InputOrigin::Plain(_)) => mode.1 = true,
@@ -3707,6 +3771,48 @@ fn closed_aggregates<'a>(
                 if outgoing.insert(caller) {
                     pending.push(caller);
                 }
+            }
+        }
+    }
+
+    let mut recommitted = BTreeMap::<(BodyKey, CfgPointId), RecommitOrigin>::new();
+    let mut recommit_pending: Vec<_> = recommit_edges.keys().copied()
+        .filter(|&(caller, producer)| target_body(&declarations, bodies[&caller].cfg, producer)
+            .is_some_and(|target| outgoing.contains(&target)))
+        .collect();
+    while let Some(node @ (caller, producer)) = recommit_pending.pop() {
+        let Some(edges) = recommit_edges.remove(&node) else { continue };
+        let body = &bodies[&caller];
+        let facts = body.facts.expect("recommit input required caller facts");
+        let unsupported = || format!("aggregate recommit has no exact local whole-owner route in {:?}", body.source);
+        let [(consumer, Some(moved))] = edges.as_slice() else { return Err(unsupported()); };
+        let (consumer, moved) = (*consumer, *moved);
+        let points = &body.cfg.points;
+        let (original_bind, binding) = facts.direct_receipt_bindings.get(&producer).ok_or_else(unsupported)?;
+        let (result_bind, _) = facts.direct_receipt_bindings.get(&consumer).ok_or_else(unsupported)?;
+        let birth = recommitted.get(&node).map_or(producer, |origin| origin.birth);
+        let root = points[0].scope;
+        if !body.is_monomorphic || producer >= *original_bind || *original_bind >= moved || moved >= consumer
+            || consumer >= *result_bind
+            || [producer, *original_bind, moved, consumer, *result_bind].iter().any(|point| points[point.0].scope != root)
+            || !matches!(&points[moved.0].kind, CfgPointKind::Move { owner, place, .. }
+                if owner == binding && place.binding == *binding && place.projections.is_empty())
+            || facts.conditional_input_barriers.range(producer..=*result_bind).next().is_some()
+            || !facts.calls.contains_key(&producer) || !facts.calls.contains_key(&consumer)
+            || recommitted.insert((caller, consumer), RecommitOrigin { previous: producer, birth }).is_some()
+        {
+            return Err(unsupported());
+        }
+        // This relay must return the caller's descriptor, not the ordinary
+        // parameter copy in a callee-owned stack slot.
+        let relay = target_body(&declarations, body.cfg, consumer).filter(|relay| identity_relays.contains(relay))
+            .ok_or_else(unsupported)?;
+        result.bodies.entry(relay).or_default().identity_relay = true;
+        let recommitted_value = (caller, consumer);
+        recommit_pending.push(recommitted_value);
+        if let Some(observers) = recommit_observers.remove(&recommitted_value) {
+            for receiver in observers {
+                modes.get_mut(&receiver).expect("indexed recommit receiver").0 = true;
             }
         }
     }
@@ -3946,10 +4052,11 @@ fn closed_aggregates<'a>(
             Some(InputOrigin::Owner(OwnerSource::Call(producer)) | InputOrigin::Immediate(producer)) => producer,
             _ => return None,
         };
-        target_body(&declarations, bodies[&caller].cfg, producer)
-            .is_some_and(|target| outgoing.contains(&target)).then_some(producer)
+        (recommitted.contains_key(&(caller, producer))
+            || target_body(&declarations, bodies[&caller].cfg, producer)
+                .is_some_and(|target| outgoing.contains(&target))).then_some(producer)
     };
-    let mut demand = Vec::new();
+    let mut demand: Vec<_> = modes.iter().filter_map(|(&formal, mode)| mode.0.then_some(formal)).collect();
     for producer in &outgoing {
         if let Some(targets) = seed_targets.remove(producer) {
             for target in targets {
@@ -3973,6 +4080,11 @@ fn closed_aggregates<'a>(
     }
     // A body with a conditional formal may also close ordinary local receipts.
     // Hand off its already-owned certificate rather than walking its CFG again.
+    for (&(caller, _), origin) in &recommitted {
+        if discharged_by_inputs.insert((caller, origin.previous), [None; 2]).is_some() {
+            return Err(format!("aggregate recommit has competing ownership transfers in {:?}", bodies[&caller].source));
+        }
+    }
     let mut conditional_input_certificates = BTreeMap::new();
     let mut forward_predecessors = BTreeMap::<_, Vec<_>>::new();
     let mut terminal_formals = Vec::new();
@@ -4232,8 +4344,13 @@ fn closed_aggregates<'a>(
                 return Err(format!("mixed aggregate result requires a matching local binding in {:?}", body.source));
             }
         }
+        if body.return_owners().any(|owner| matches!(owner, Some(OwnerSource::Call(point))
+            if recommitted.contains_key(&(key, point))))
+        {
+            return Err(format!("recommitted aggregate result escapes its owning caller in {:?}", body.source));
+        }
         for (&call, &point) in &facts.unproved_receipt_loans {
-            if target_body(&declarations, body.cfg, call).is_some_and(|target| outgoing.contains(&target)) {
+            if recommitted.contains_key(&(key, call)) || target_body(&declarations, body.cfg, call).is_some_and(|target| outgoing.contains(&target)) {
                 return Err(format!("aggregate owning receipt has an unproved checked loan in {:?} at point {point:?}", body.source));
             }
         }
@@ -4322,8 +4439,24 @@ fn closed_aggregates<'a>(
             inputs.guards.iter().map(move |&(guard, arms)| ((expression, arms), guard))
         }).collect::<BTreeMap<_, _>>();
         let mut shared_transfer_coverage = BTreeMap::new();
+        let orders_by_birth = recommitted.range((key, CfgPointId(0))..=(key, CfgPointId(usize::MAX)))
+            .next().is_some();
+        let mut ranked_releases = BTreeMap::<CfgPointId, BTreeMap<CfgPointId, ClosedOwnerRelease>>::new();
+        let mut record_release = |plan: &mut ClosedBody, exit, birth, release| {
+            if orders_by_birth {
+                if ranked_releases.entry(exit).or_default().insert(birth, release).is_some() {
+                    return Err(format!("aggregate release has conflicting original receipts in {:?}", body.source));
+                }
+            } else {
+                plan.releases.entry(exit).or_default().push(release);
+            }
+            Ok(())
+        };
         for (&point, &call) in &facts.calls {
-            if !target_body(&declarations, body.cfg, point)
+            let previous = recommitted.get(&(key, point));
+            if let Some(origin) = previous {
+                plan.recommits.insert(call.0, facts.calls[&origin.previous].0);
+            } else if !target_body(&declarations, body.cfg, point)
                 .is_some_and(|target| outgoing.contains(&target))
             {
                 continue;
@@ -4434,7 +4567,8 @@ fn closed_aggregates<'a>(
                             if plan.scope_exits.insert(block, exit).is_some_and(|old| old != exit) {
                                 return Err(format!("aggregate release has conflicting scope exits in {:?}", body.source));
                             }
-                            plan.releases.entry(exit).or_default().push(ClosedOwnerRelease { receipt: call.0, guard: Some(guard) });
+                            let birth = previous.map_or(point, |origin| origin.birth);
+                            record_release(&mut plan, exit, birth, ClosedOwnerRelease { receipt: call.0, guard: Some(guard) })?;
                         }
                         (None, ReceiptGate::Transferred) => {
                             plan.conditional_inputs.entry(expression).or_default().consumed_on_both_arms.push(call.0);
@@ -4446,7 +4580,7 @@ fn closed_aggregates<'a>(
                     }
                     plan.deferred_call_inputs.insert(primary.ordinal, call.0);
                 }
-                plan.calls.insert(call.0, ClosedCall::Receive);
+                if previous.is_none() { plan.calls.insert(call.0, ClosedCall::Receive); }
                 continue;
             }
             let Some(((exit, block), always)) = endpoints.next() else {
@@ -4461,24 +4595,27 @@ fn closed_aggregates<'a>(
                     body.source
                 ));
             }
-            plan.calls.insert(call.0, ClosedCall::Receive);
+            if previous.is_none() { plan.calls.insert(call.0, ClosedCall::Receive); }
             if plan.scope_exits.insert(block, exit).is_some_and(|old| old != exit) {
                 return Err(format!("aggregate release has conflicting scope exits in {:?}", body.source));
             }
-            plan.releases.entry(exit).or_default().push(ClosedOwnerRelease { receipt: call.0, guard: None });
+            let birth = previous.map_or(point, |origin| origin.birth);
+            record_release(&mut plan, exit, birth, ClosedOwnerRelease { receipt: call.0, guard: None })?;
         }
-        if (returning || !plan.calls.is_empty() || plan.input.is_some() || !plan.input_calls.is_empty()) && !body.is_monomorphic {
+        plan.releases.extend(ranked_releases.into_iter().map(|(exit, releases)|
+            (exit, releases.into_values().collect())));
+        if (returning || !plan.calls.is_empty() || !plan.recommits.is_empty() || plan.input.is_some() || !plan.input_calls.is_empty()) && !body.is_monomorphic {
             return Err(format!("aggregate ownership in generic reservation {key:?} is not closed in {:?}", body.source));
         }
-        if (returning || !plan.calls.is_empty() || plan.input.is_some() || !plan.input_calls.is_empty()) && !facts.unsupported.is_empty() {
+        if (returning || !plan.calls.is_empty() || !plan.recommits.is_empty() || plan.input.is_some() || !plan.input_calls.is_empty()) && !facts.unsupported.is_empty() {
             return Err(format!(
                 "aggregate transfer has unsupported use in {:?} at point {:?}",
                 body.source,
                 facts.unsupported.first()
             ));
         }
-        if returning || !plan.calls.is_empty() || plan.input.is_some() || !plan.input_calls.is_empty()
-            || !plan.same_array_rebinds.is_empty() || !plan.fresh_array_recommits.is_empty() || plan.scalar_descriptor_assignment.is_some()
+        if returning || !plan.calls.is_empty() || !plan.recommits.is_empty() || plan.input.is_some() || !plan.input_calls.is_empty()
+            || plan.identity_relay || !plan.same_array_rebinds.is_empty() || !plan.fresh_array_recommits.is_empty() || plan.scalar_descriptor_assignment.is_some()
             || plan.checked_backing_wrapper.is_some()
         {
             result.bodies.insert(key, plan);

@@ -828,6 +828,21 @@ pub(super) fn emit_initializer_binding<'ctx, 'module>(
     Ok(true)
 }
 
+pub(super) fn emit_identity_relay<'ctx>(
+    builder: &inkwell::builder::Builder<'ctx>,
+    definition: FunctionValue<'ctx>,
+) -> Result<(), String> {
+    let parameter = definition.get_first_param()
+        .ok_or_else(|| "missing same-owner relay parameter".to_owned())?;
+    if definition.count_params() != 1 || !matches!(parameter, BasicValueEnum::PointerValue(_))
+        || !matches!(definition.get_type().get_return_type(), Some(inkwell::types::BasicTypeEnum::PointerType(_)))
+    {
+        return Err("same-owner relay changed its ordinary descriptor ABI".into());
+    }
+    builder.build_return(Some(&parameter)).map_err(builder_error)?;
+    Ok(())
+}
+
 pub(super) fn emit_call<'ctx, 'module>(
     context: &'ctx Context,
     state: &mut EmitState<'ctx, 'module>,
@@ -875,6 +890,28 @@ pub(super) fn emit_call<'ctx, 'module>(
             return Err("ordinary aggregate call occurrence emitted twice".into());
         }
         return emit_ordinary_result_call(context, state, expression, arguments, project).map(Some);
+    }
+    if let Some(&previous) = aggregate.plan.recommits.get(&ordinal) {
+        // The identity relay uses its unchanged ordinary value signature. Only
+        // the caller's compile-time receipt key changes after the call.
+        let symbol = state.direct_aggregate_symbol(expression, None)?;
+        let definition = state.functions.get(symbol).ok_or_else(|| "missing same-owner recommit definition".to_owned())?;
+        if definition.count_params() as usize != arguments.len()
+            || !matches!(definition.get_type().get_return_type(), Some(inkwell::types::BasicTypeEnum::PointerType(_)))
+        {
+            return Err("same-owner recommit changed its ordinary value ABI".into());
+        }
+        let value = emit_selected_call(context, state, expression, arguments, project, ordinal, None, None, None)?;
+        if !matches!(value, EmitValue::Basic(_)) {
+            return Err("same-owner recommit has no whole ordinary value".into());
+        }
+        let aggregate = state.aggregate.as_mut().expect("same-owner recommit context");
+        let base = aggregate.receipts.remove(&previous)
+            .ok_or_else(|| "same-owner recommit lost its original backing".to_owned())?;
+        if aggregate.receipts.insert(ordinal, base).is_some() {
+            return Err("duplicate same-owner recommit receipt".into());
+        }
+        return Ok(Some(value));
     }
     let action = aggregate.plan.calls.get(&ordinal).copied().map(CallDestination::Body);
     let input = aggregate.plan.input_calls.get(&ordinal).map(|&(_, input)| CallInput::Body(input));

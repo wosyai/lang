@@ -749,6 +749,85 @@ fn conditional_formal_transfer_uses_original_hidden_base_in_recursive_frames() {
 }
 
 #[test]
+fn aggregate_owner_recommit_preserves_the_original_base_across_ordinary_identity_calls() {
+    let app = source("workbench", "src/aggregate_owner_recommit.w");
+    let text = include_str!("fixtures/aggregate-owner-recommit.w");
+    for (target, target_layout) in [
+        ("native64", ScalarTargetLayout::NATIVE64),
+        ("wasm32", ScalarTargetLayout::WASM32),
+    ] {
+        let emit = |text: &str| {
+            let prepared = prepare_scalar_project(
+                vec![(declarations(&app, text), Vec::new())], vec![app.clone()],
+                ScalarPreparationInputs { target_layout },
+            ).unwrap_or_else(|error| panic!("{target}: {:?}", error.diagnostics));
+            let build = analyze_scalar_build(&prepared);
+            assert!(build.diagnostics().is_empty(), "{target}: {:?}", build.diagnostics());
+            emit_scalar_build_project_llvm(&build).map(|module| module.to_text())
+        };
+        let ir = emit(text).unwrap_or_else(|error| panic!("{target}: {error}"));
+        let context = Context::create();
+        let buffer = MemoryBuffer::create_from_memory_range_copy(ir.as_bytes(), target);
+        let module = context.create_module_from_ir(buffer).unwrap();
+        module.verify().unwrap();
+        let find = |name| module.get_function(&function_with_suffix(&module, name)).unwrap();
+        let (drive, producer, consumer) = (find("drive"), find("make_packet"), find("accept_packet"));
+        let (first, second) = (find("first_identity"), find("second_identity"));
+        let release = module.get_function("__wosy_core_free").unwrap();
+        for relay in [first, second] {
+            assert_eq!(relay.count_params(), 1, "{target}: {ir}");
+            assert!(matches!(relay.get_type().get_return_type(), Some(inkwell::types::BasicTypeEnum::PointerType(_))));
+            let rows: Vec<_> = relay.get_basic_blocks().into_iter()
+                .flat_map(|block| block.get_instructions()).collect();
+            let [return_row] = rows.as_slice() else { panic!("{target}: {ir}"); };
+            assert_eq!(return_row.get_opcode(), InstructionOpcode::Return);
+            assert_eq!(return_row.get_operand(0).unwrap().value(), relay.get_first_param());
+        }
+        let mut produced = Vec::new();
+        let mut passed = Vec::new();
+        let mut released = Vec::new();
+        let mut relays = Vec::new();
+        for row in drive.get_basic_blocks().into_iter().flat_map(|block| block.get_instructions()) {
+            if row.get_opcode() != InstructionOpcode::Call { continue; }
+            let call = CallSiteValue::try_from(row).unwrap();
+            let argument = |slot| row.get_operand(slot).unwrap().value().unwrap();
+            match call.get_called_fn_value() {
+                Some(callee) if callee == producer => produced.push(call.try_as_basic_value().basic().unwrap()),
+                Some(callee) if callee == consumer => passed.push(argument(call.count_arguments() - 1)),
+                Some(callee) if callee == release => released.push(argument(0)),
+                Some(callee) if callee == first || callee == second => {
+                    assert_eq!(call.count_arguments(), 1, "{target}: {ir}");
+                    relays.push(callee);
+                }
+                _ => {}
+            }
+        }
+        let [original, keeper, trailing] = produced.as_slice() else { panic!("{target}: {ir}"); };
+        assert_eq!(relays, [first, second]);
+        assert_eq!(passed, [*original]);
+        assert_eq!(released, [*trailing, *keeper, *original]);
+
+        if let Some(out) = std::env::var_os("WOSY_RECOMMIT_RECEIPT_IR_DIR") {
+            let mut witness = ir.replace("@main(", "@wosy_authored_main(");
+            for (wrapper, name) in [("retain", "retain_witness"), ("transfer", "transfer_witness")] {
+                let symbol = function_with_suffix(&module, name);
+                witness.push_str(&format!(
+                    "\ndefine i64 @wosy_{wrapper}() {{\nentry:\n  %result = call i64 @{symbol}()\n  ret i64 %result\n}}\n"
+                ));
+            }
+            std::fs::write(std::path::PathBuf::from(out).join(format!("{target}.ll")), witness).unwrap();
+        }
+
+        let replacement = text.replace(
+            "Packet(Packet) second_identity = fn(packet) { packet };",
+            "Packet(Packet) second_identity = fn(packet) { Packet different = { .data = null; .length = packet.length; }; different };",
+        );
+        let error = emit(&replacement).expect_err("a different output cannot recommit the old owner");
+        assert!(error.contains("aggregate owning input has no closed formal"), "{target}: {error}");
+    }
+}
+
+#[test]
 fn runtime_array_recommit_keeps_the_owner_until_its_real_end() {
     let recursive = r#"
 (u8[], u64)(u8[], u64, u64) carry = fn(bytes, depth, count) {
