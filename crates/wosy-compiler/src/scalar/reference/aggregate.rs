@@ -3652,7 +3652,7 @@ impl Body<'_> {
             .then_some((call, terminal.expression))
     }
 
-    fn exact_identity_relay_slot(&self) -> Option<usize> {
+    fn exact_identity_formal(&self) -> Option<(usize, &ParameterSlot, &ReferenceBindingId)> {
         let facts = self.facts?;
         let [output] = self.sites.boundary.root_outputs.as_slice() else { return None };
         let parameters = &self.sites.boundary.parameters;
@@ -3666,14 +3666,22 @@ impl Body<'_> {
             index != parameter.ordinal || (index != slot && !ordinary_value(&parameter.ty)))
             || !self.cfg.allocations.is_empty()
             || !facts.unsupported.is_empty() || facts.raw_invalid.is_some()
-            || !self.return_owners().eq([Some(OwnerSource::Formal(slot))])
         {
             return None;
         }
-        let is_companion = |binding: &ReferenceBindingId| binding.kind == ReferenceBindingKind::Declared
-            && binding.source == formal.source && binding.function_span == formal.function_span
-            && binding.block_span == formal.block_span && parameters.iter().enumerate().any(|(index, parameter)|
-                index != slot && parameter.span == binding.declaration_span);
+        Some((slot, parameter, formal))
+    }
+
+    fn is_identity_parameter(&self, binding: &ReferenceBindingId, formal: &ReferenceBindingId) -> bool {
+        binding.kind == ReferenceBindingKind::Declared && binding.source == formal.source
+            && binding.function_span == formal.function_span && binding.block_span == formal.block_span
+            && self.sites.boundary.parameters.iter().any(|parameter| parameter.span == binding.declaration_span)
+    }
+
+    fn exact_identity_relay_slot(&self) -> Option<usize> {
+        let (slot, parameter, formal) = self.exact_identity_formal()?;
+        if !self.return_owners().eq([Some(OwnerSource::Formal(slot))]) { return None; }
+        let is_companion = |binding: &ReferenceBindingId| binding != formal && self.is_identity_parameter(binding, formal);
         let mut read = None;
         let mut moved = false;
         let mut returned = false;
@@ -3698,6 +3706,51 @@ impl Body<'_> {
             }
         }
         returned.then_some(slot)
+    }
+
+    // A pure tail wrapper is only a *dependency*, never a proof leaf.
+    // It keeps the same nominal owner and makes one checked direct call.
+    fn exact_identity_relay_dependency(&self) -> Option<(usize, CfgPointId, usize)> {
+        let (slot, parameter, formal) = self.exact_identity_formal()?;
+        let facts = self.facts?;
+        let structure = &self.sites.structure;
+        let [item] = structure.blocks.get(structure.root.0)?.items.as_slice() else { return None };
+        let BlockItemKind::FinalOutput(output) = &item.kind else { return None };
+        let signature = self.sites.checked_call_signatures.get(&output.expression)?;
+        let [returned] = signature.outputs.outputs.as_slice() else { return None };
+        if output.output != 0 || returned.ty != parameter.ty
+            || structure.checked_types.expressions.get(&output.expression) != Some(&parameter.ty)
+        { return None; }
+        let points = &self.cfg.points;
+        let scope = points.first()?.scope;
+        let next = |id| points.get(linear_successor(points, id)?.0).filter(|point| point.scope == scope);
+        let mut first = points.first()?;
+        // Skip only function/scope prologue and the exact declared parameters.
+        // Cap the prefix independently of the body size.
+        for _ in 0..=MAX_OWNING_CALL_ARGUMENTS + 2 {
+            if !matches!(&first.kind, CfgPointKind::Entry | CfgPointKind::ScopeEnter)
+                && !matches!(&first.kind, CfgPointKind::Bind { binding } if self.is_identity_parameter(binding, formal))
+            { break; }
+            first = next(first.id)?;
+        }
+        let (call, target_slot, moved) = exact_owning_call_arguments(
+            points, first, scope, self.sites, output.expression, &signature.parameters, formal, &parameter.ty,
+        )?;
+        let returned = next(call.id)?;
+        let exit = next(returned.id)?;
+        let end = points.get(linear_successor(points, exit.id)?.0)?;
+        if call.scope != scope || facts.calls.len() != 1
+            || facts.calls.get(&call.id) != Some(&output.expression)
+            || call.source_span.range != self.sites.occurrences.get(output.expression.0)?.span
+            || !facts.inputs.get(&(call.id, output.expression.0, target_slot, ArgumentProvenance::WholeMove(moved)))?
+                .iter().copied().eq([Some(InputOrigin::ConditionalFormal(slot))])
+            || !self.return_owners().eq([Some(OwnerSource::Call(call.id))])
+            || !matches!(returned.kind, CfgPointKind::ReturnOutput { output: 0, value_point, checked: false }
+                if value_point == call.id)
+            || !matches!(exit.kind, CfgPointKind::ScopeExit)
+            || !matches!(end.kind, CfgPointKind::Return) || !end.successors.is_empty()
+        { return None; }
+        Some((slot, call.id, target_slot))
     }
 
     fn return_owners(&self) -> impl Iterator<Item = Option<OwnerSource>> + '_ {
@@ -4660,9 +4713,29 @@ fn closed_aggregates<'a>(
             bodies.insert(key, Body { facts, cfg, sites, source: input.source, is_monomorphic, supports_input_result });
         }
     }
-    let identity_relays: BTreeMap<_, _> = bodies.iter().filter_map(|(&key, body)|
-        key.2.is_none().then(|| body.exact_identity_relay_slot().map(|slot| (key, slot))).flatten()
-    ).collect();
+    let mut identity_relays = BTreeMap::<BodyKey, usize>::new();
+    let mut identity_waiters = BTreeMap::<(BodyKey, usize), Vec<(BodyKey, usize)>>::new();
+    let mut identity_pending = Vec::new();
+    for (&key, body) in &bodies {
+        if key.2.is_some() { continue; }
+        if let Some(slot) = body.exact_identity_relay_slot() {
+            identity_pending.push((key, slot));
+        } else if let Some((slot, point, target_slot)) = body.exact_identity_relay_dependency() {
+            if let Some(target) = target_body(&declarations, body.cfg, point) {
+                identity_waiters.entry((target, target_slot)).or_default().push((key, slot));
+            }
+        }
+    }
+    // Pure tail wrappers inherit the unchanged-formal promise only from a
+    // grounded leaf with the exact addressed formal slot. A cycle is not a
+    // proof, and a sealed pure chain uses the existing identity transport.
+    while let Some((key, slot)) = identity_pending.pop() {
+        if identity_relays.insert(key, slot).is_none() {
+            if let Some(waiters) = identity_waiters.remove(&(key, slot)) {
+                identity_pending.extend(waiters);
+            }
+        }
+    }
     // Only observed whole-move origins can re-key backing in the owning
     // caller. Direct identity relays themselves keep ordinary value ABI.
     #[derive(Clone, Copy)]

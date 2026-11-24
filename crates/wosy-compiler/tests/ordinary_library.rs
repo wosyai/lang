@@ -874,6 +874,16 @@ fn aggregate_owner_recommit_preserves_the_original_base_across_ordinary_identity
             "Packet(bool, u64, Packet) second_identity = fn(toggle, suffix, packet) { toggle; suffix; packet };")
         .replace("first_identity(original)", "first_identity(length, original, true)")
         .replace("second_identity(middle)", "second_identity(take, 7, middle)");
+    let wrappers = companions
+        .replace("Packet(u64, Packet, bool) first_identity = fn(prefix, packet, toggle) { prefix; toggle; packet };",
+            concat!(
+                "Packet(bool, u64, Packet) identity_leaf = fn(toggle, suffix, packet) { toggle; suffix; packet };\n",
+                "Packet(u64, Packet, bool) bridge = fn(prefix, packet, toggle) { identity_leaf(toggle, prefix, packet) };\n",
+                "Packet(u64, Packet, bool) first_identity = fn(prefix, packet, toggle) { bridge(prefix, packet, toggle) };",
+            ))
+        .replace("Packet(bool, u64, Packet) second_identity = fn(toggle, suffix, packet) { toggle; suffix; packet };",
+            "Packet(bool, u64, Packet) second_identity = fn(toggle, suffix, packet) { bridge(suffix, packet, toggle) };");
+    assert_ne!(companions, wrappers);
     for (target, target_layout) in [
         ("native64", ScalarTargetLayout::NATIVE64),
         ("wasm32", ScalarTargetLayout::WASM32),
@@ -890,8 +900,9 @@ fn aggregate_owner_recommit_preserves_the_original_base_across_ordinary_identity
         for (variant, text, slots, arities) in [
             ("unary", unary, [0, 0], [1, 1]),
             ("companions", companions.as_str(), [1, 2], [3, 3]),
+            ("wrappers", wrappers.as_str(), [1, 2], [3, 3]),
         ] {
-            let ir = emit(text).unwrap_or_else(|error| panic!("{target}: {error}"));
+            let ir = emit(text).unwrap_or_else(|error| panic!("{variant}/{target}: {error}"));
             let context = Context::create();
             let buffer = MemoryBuffer::create_from_memory_range_copy(ir.as_bytes(), target);
             let module = context.create_module_from_ir(buffer).unwrap();
