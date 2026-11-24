@@ -3293,44 +3293,84 @@ pub(super) fn verify_partitioned_call_return<'a>(
     let [binding] = producer.boundary.checker_parameter_bindings.as_deref()? else { return None; };
     let [parameter] = producer.boundary.parameters.as_slice() else { return None; };
     let mut applicable = false;
+    let mut can_elide = eligible_for_elision;
     let mut covered = Vec::new();
+    let mut relational_work = 0;
     for piece in pieces {
-        if let Some(work) = work.as_deref_mut() {
-            charge_call_work(work, 1usize.checked_add(piece.input.interval_count())?
-                .checked_add(domain.interval_count())?)?;
+        // Entry-equality does not admit affine pieces, including ones
+        // outside its guard. Do not make a contract gate hide a new operation.
+        if matches!((&goal, &piece.output), (PartitionedProofGoal::EntryEquality, IntegerPartitionOutput::InputAffine(_))) {
+            return None;
         }
-        let output = match (&goal, &piece.output) {
-            (_, IntegerPartitionOutput::InputAffine(_))
-            | (PartitionedProofGoal::Literal(..), IntegerPartitionOutput::InputAlias) => return None,
-            (_, IntegerPartitionOutput::InputAlias) => None,
-            (_, IntegerPartitionOutput::Singleton(output)) => Some(output.singleton_value()?),
-        };
+        let relational = !matches!(&piece.output, IntegerPartitionOutput::Singleton(_));
+        if relational { can_elide = false; }
+        let cost = 1usize.checked_add(piece.input.interval_count())?
+            .checked_add(domain.interval_count())?;
+        if let Some(work) = work.as_deref_mut() {
+            charge_call_work(work, cost)?;
+        } else if relational {
+            charge_call_work(&mut relational_work, cost)?;
+        }
         let input = match piece.input.intersection(domain) {
             IntegerIntersection::Unchanged => Rc::clone(&piece.input),
             IntegerIntersection::Empty => continue,
             IntegerIntersection::Changed(clipped) => Rc::new(clipped),
         };
         applicable = true;
-        let failure = match (&goal, output) {
-            (PartitionedProofGoal::Literal(relation, bound), Some(value)) if !relation.accepts(value.cmp(bound)) =>
-                Some((Rc::clone(&input), value)),
-            (PartitionedProofGoal::EntryEquality, Some(value)) if input.singleton_value() != Some(value) => {
-                let unequal = IntegerRelation::from_operator(&BinaryOperator::NotEqual)?;
-                Some((Rc::new(input.keep_relation(unequal, value)), value))
+        let failure = match (&goal, &piece.output) {
+            (PartitionedProofGoal::Literal(relation, bound), IntegerPartitionOutput::Singleton(output)) => {
+                let value = output.singleton_value()?;
+                (!relation.accepts(value.cmp(bound))).then(|| (Rc::clone(&input), Cow::Borrowed(value)))
             }
-            _ => None,
+            (PartitionedProofGoal::EntryEquality, IntegerPartitionOutput::Singleton(output)) => {
+                let value = output.singleton_value()?;
+                if input.singleton_value() == Some(value) { None } else {
+                    let unequal = IntegerRelation::from_operator(&BinaryOperator::NotEqual)?;
+                    Some((Rc::new(input.keep_relation(unequal, value)), Cow::Borrowed(value)))
+                }
+            }
+            (PartitionedProofGoal::EntryEquality, IntegerPartitionOutput::InputAlias) => None,
+            (PartitionedProofGoal::EntryEquality, IntegerPartitionOutput::InputAffine(_)) => return None,
+            (PartitionedProofGoal::Literal(relation, bound), output) => {
+                let meter = work.as_deref_mut().unwrap_or(&mut relational_work);
+                charge_call_work(meter, 1usize.checked_add(input.interval_count().checked_mul(2)?)?)?;
+                let rejected = relation.complement();
+                let violating = match output {
+                    IntegerPartitionOutput::InputAlias => input.keep_relation(rejected, bound),
+                    IntegerPartitionOutput::InputAffine(transform) => {
+                        let (cut, relation) = if transform.reflected {
+                            (&transform.offset - *bound, rejected.reversed())
+                        } else {
+                            (*bound - &transform.offset, rejected)
+                        };
+                        input.keep_relation(relation, &cut)
+                    }
+                    IntegerPartitionOutput::Singleton(_) => return None,
+                };
+                if let Some((example, _)) = violating.extremes() {
+                    let returned = match output {
+                        IntegerPartitionOutput::InputAlias => example.clone(),
+                        IntegerPartitionOutput::InputAffine(transform) if transform.reflected => &transform.offset - example,
+                        IntegerPartitionOutput::InputAffine(transform) => example + &transform.offset,
+                        IntegerPartitionOutput::Singleton(_) => return None,
+                    };
+                    Some((Rc::new(violating), Cow::Owned(returned)))
+                } else {
+                    None
+                }
+            }
         };
         if let Some((violating_inputs, value)) = failure {
             return Some(PartitionedCallProof { applicable: true, covers_guard: false, failure: Some(SymbolicLiteralFailure {
-                output: piece.span, returned: value.clone(), state: IntegerInputs::from_cells(vec![vec![violating_inputs]]),
+                output: piece.span, returned: value.into_owned(), state: IntegerInputs::from_cells(vec![vec![violating_inputs]]),
                 axes: vec![(binding, &parameter.ty)],
             }) });
         }
-        if eligible_for_elision {
+        if can_elide {
             covered.push(input);
         }
     }
-    let covers_guard = eligible_for_elision && applicable
+    let covers_guard = can_elide && applicable
         && domain.is_subset_of(&IntegerSet::union(covered.iter().map(Rc::as_ref)));
     Some(PartitionedCallProof { applicable, covers_guard, failure: None })
 }
@@ -5869,6 +5909,10 @@ pub(super) struct ExactCallCursor<'a> {
     allow_empty_scalar_return: bool,
     #[cfg(feature = "internal-checker")]
     tail_call_result: Option<ActualCallResult>,
+    #[cfg(feature = "internal-checker")]
+    named_affine_partition: bool,
+    #[cfg(feature = "internal-checker")]
+    named_pure_projection_leaf: bool,
     discarded_return: Option<bool>,
     returned: Vec<IntegerReturningPath<'a>>,
     computed_returns: Vec<(usize, ComputedIntegerReturn)>,
@@ -5958,6 +6002,21 @@ impl<'a> ExactCallCursor<'a> {
 
     pub(super) fn projected(calls: &'a FunctionCallSites, values: Rc<IntegerSet>, expected: &ScalarType) -> Option<Self> {
         Self::with_row(calls, expected, IntegerRow::new(vec![values]), Some(0))
+    }
+
+    #[cfg(feature = "internal-checker")]
+    pub(super) fn observes_named_affine_partitions(&self) -> bool {
+        self.named_affine_partition
+    }
+
+    #[cfg(feature = "internal-checker")]
+    pub(super) fn observe_named_affine_partitions(&mut self, pure_projection_leaf: bool) -> Option<()> {
+        if self.projected_slot != Some(0) || self.projected_pair.is_some() || !self.tail.is_some_and(is_integer_type) {
+            return None;
+        }
+        self.named_affine_partition = true;
+        self.named_pure_projection_leaf = pure_projection_leaf;
+        Some(())
     }
 
     pub(super) fn projected_arguments(
@@ -6060,6 +6119,10 @@ impl<'a> ExactCallCursor<'a> {
             allow_empty_scalar_return: false,
             #[cfg(feature = "internal-checker")]
             tail_call_result: None,
+            #[cfg(feature = "internal-checker")]
+            named_affine_partition: false,
+            #[cfg(feature = "internal-checker")]
+            named_pure_projection_leaf: false,
             discarded_return: None, returned: Vec::new(), computed_returns: Vec::new(), return_capture_work: 0, projected_slot, projected_pair })
     }
 
@@ -6362,6 +6425,13 @@ impl<'a> ExactCallCursor<'a> {
         };
         let mut imports: &mut [Option<ImportedLocal<'a>>] = &mut [];
         let returns = (self.tail.is_some() && self.discarded_return.is_none()).then_some(&mut self.returned);
+        #[cfg(feature = "internal-checker")]
+        let (allow_ordinary_computed_returns, serialize_affine) = (
+            allow_ordinary_computed_returns || self.named_pure_projection_leaf,
+            allow_ordinary_computed_returns || self.named_affine_partition,
+        );
+        #[cfg(not(feature = "internal-checker"))]
+        let serialize_affine = allow_ordinary_computed_returns;
         let control = drive_integer_block::<false, COLLECT, _, true>(
             calls, &mut self.roots, &mut self.block, self.tail, returns, &mut handle_call,
             &mut Some(&mut failures), &mut imports, (), suspend_integer,
@@ -6407,7 +6477,7 @@ impl<'a> ExactCallCursor<'a> {
                                 IntegerPairPartitionOutput::Singleton(Rc::clone(&row[axis]))
                             } else if let Some(slot) = (0..2).find(|slot| row.entry_alias(*slot, axis)) {
                                 IntegerPairPartitionOutput::InputAlias(slot)
-                            } else if allow_ordinary_computed_returns {
+                            } else if serialize_affine {
                                 let (slot, transform) = (0..2).find_map(|slot| {
                                     row.entry_affine(slot, axis).map(|transform| (slot, transform))
                                 })?;
@@ -6459,7 +6529,7 @@ impl<'a> ExactCallCursor<'a> {
                                 IntegerPartitionOutput::InputAlias
                             } else if row[axis].singleton_value().is_some() {
                                 IntegerPartitionOutput::Singleton(Rc::clone(&row[axis]))
-                            } else if allow_ordinary_computed_returns {
+                            } else if serialize_affine {
                                 IntegerPartitionOutput::InputAffine(row.entry_affine(slot, axis)?)
                             } else {
                                 return None;

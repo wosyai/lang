@@ -798,7 +798,7 @@ fn symbolic_obligation_roots(
 }
 
 #[cfg(feature = "internal-checker")]
-struct ProofFreeSymbolic<const ORDINARY_PROJECTIONS: bool = false> {
+struct ProofFreeSymbolic<const ORDINARY_PROJECTIONS: bool = false, const NAMED_PARTITIONS: bool = false> {
     ordinary_projected_effects: bool,
 }
 
@@ -809,13 +809,15 @@ impl SymbolicRootProof for ProofFreeSymbolic {
 }
 
 #[cfg(feature = "internal-checker")]
-impl<const ORDINARY_PROJECTIONS: bool> ActualIntegerObserver for ProofFreeSymbolic<ORDINARY_PROJECTIONS> {
+impl<const ORDINARY_PROJECTIONS: bool, const NAMED_PARTITIONS: bool> ActualIntegerObserver
+    for ProofFreeSymbolic<ORDINARY_PROJECTIONS, NAMED_PARTITIONS> {
     const ENABLED: bool = false;
     const EXACT_INTEGER_CALL_CONTINUATIONS: bool = true;
     const INTEGER_RETURN_PARTITIONS: bool = true;
 
     const PROJECTED_FORMAL_WRITES: bool = ORDINARY_PROJECTIONS;
     const ORDINARY_PROJECTED_PAIR: bool = ORDINARY_PROJECTIONS;
+    const NAMED_RELATIONAL_PARTITIONS: bool = NAMED_PARTITIONS;
     const ORDINARY_INTEGER_LOCALS: bool = ORDINARY_PROJECTIONS;
 
     fn permits_ordinary_projected_effects(&self) -> bool {
@@ -1665,6 +1667,8 @@ trait ActualIntegerObserver {
     const INTEGER_RETURN_PARTITIONS: bool = false;
     const PROJECTED_FORMAL_WRITES: bool = false;
     const ORDINARY_PROJECTED_PAIR: bool = false;
+    #[cfg(feature = "internal-checker")]
+    const NAMED_RELATIONAL_PARTITIONS: bool = false;
     const ORDINARY_INTEGER_LOCALS: bool = false;
 
     fn observe(&mut self, target: (usize, usize), arguments: &[&BigInt], value: &BigInt);
@@ -2255,6 +2259,9 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
         {
             return Err(ProjectCheck::Unsupported);
         }
+        #[cfg(feature = "internal-checker")]
+        let named_affine_partitions = !ACTUAL_STARTUP && Observer::NAMED_RELATIONAL_PARTITIONS
+            && parent.cursor.observes_named_affine_partitions();
         let arguments = parent.cursor.arguments(
             caller, call, signature.parameters.len(), collection.is_some(), Observer::INTEGER_RETURN_PARTITIONS,
             Observer::ORDINARY_PROJECTED_PAIR,
@@ -2282,6 +2289,23 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                 let values = projection.materialize_bounded().ok_or(ProjectCheck::Unsupported)?;
                 ExactCallCursor::projected_arguments(body, values, &projection, expected)
             }.ok_or(ProjectCheck::Unsupported)?;
+            #[cfg(feature = "internal-checker")]
+            if named_affine_partitions && is_integer_type(expected)
+                && matches!(projection.companion, ProjectedCompanion::Unary)
+            {
+                let pure_projection_leaf = parent.source == &owner.source
+                    && body.call_occurrences.is_empty() && body.allocation_length_calls.is_empty()
+                    && body.assignments.is_empty() && body.arms.is_empty()
+                    && body.structure.checker_directives.is_empty()
+                    && !body.structure.has_ordinary_contextual_places()
+                    && !body.structure.checker_has_bool_contextual_declaration
+                    && body.structure.checker_selected_snapshots.is_empty()
+                    && body.structure.blocks.get(body.structure.root.0).and_then(|block| block.items.last())
+                        .is_some_and(|item| matches!(&item.kind, BlockItemKind::FinalOutput(slot)
+                            if matches!(body.structure.checker_integer_final_operations.get(&slot.expression),
+                                Some((BinaryOperator::Add | BinaryOperator::Subtract, _)))));
+                cursor.observe_named_affine_partitions(pure_projection_leaf).ok_or(ProjectCheck::Unsupported)?;
+            }
             #[cfg(feature = "internal-checker")]
             if projected_narrow { cursor.allow_empty_projected_integer().ok_or(ProjectCheck::Unsupported)?; }
             #[cfg(feature = "internal-checker")]
@@ -3854,8 +3878,11 @@ impl SelectedSymbolicProof<'_, '_> {
                 plans.push((case, goal, applicable));
             }
         }
-        let cursor = ExactCallCursor::projected(body, Rc::new(domain), &output.ty).ok_or(ProjectCheck::Unsupported)?;
-        let mut evaluator = CheckedCalls::<ProofFreeSymbolic, false> {
+        let mut cursor = ExactCallCursor::projected(body, Rc::new(domain), &output.ty).ok_or(ProjectCheck::Unsupported)?;
+        if first.bound.literal().is_some() {
+            cursor.observe_named_affine_partitions(false).ok_or(ProjectCheck::Unsupported)?;
+        }
+        let mut evaluator = CheckedCalls::<ProofFreeSymbolic<false, true>, false> {
             project: runtime.project, calls: runtime.calls, active: HashSet::from([target]),
             active_depth: 1, reached: HashSet::new(), had_obligations: false,
             observer: ProofFreeSymbolic { ordinary_projected_effects: false }, symbolic_module: target.0,
@@ -12779,6 +12806,42 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
         assert!(run(&clean).unwrap().symbolic_diagnostic.is_none());
         let cyclic = text.replace("middle(n); produced", "producer(n); produced");
         assert!(matches!(run(&cyclic), Err(ProjectCheck::Unsupported)));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordered_named_calling_producer_observes_alias_and_reflected_preimages() {
+        let app = source("src/main.w", "named-call-return-preimages");
+        let text = r#"%%start
+            i8(i8) leaf = fn(n) { n };
+            i8(i8) producer = fn(n) { i8 observed = leaf(n); observed };
+            proof bounded for producer(entry) -> (out) where (entry >= 0) ensures (out == 7) {}
+        %%end"#;
+        let run = |text: &str| {
+            let (_, proof) = crate::parse_proof_source(app.clone(), text.to_owned(), &[]).ok().unwrap();
+            check_loaded_ordered_proof_diagnostics(
+                Vec::new(), vec![(proof, Vec::new())], vec![app.clone()], inputs(), ScalarCheckerScope::CurrentPackage,
+            )
+        };
+        let alias = run(text).unwrap().symbolic_diagnostic.unwrap();
+        assert_eq!(alias.returned, BigInt::from(0));
+        assert!(alias.witness.intervals_at(0, 0).unwrap().eq([
+            (&BigInt::from(0), &BigInt::from(6)), (&BigInt::from(8), &BigInt::from(127)),
+        ]));
+        let affine = text.replace("{ n }", "{ -1 - n }").replace("entry >= 0", "entry < 0");
+        let reflected = run(&affine).unwrap().symbolic_diagnostic.unwrap();
+        assert_eq!(reflected.returned, BigInt::from(127));
+        assert!(reflected.witness.intervals_at(0, 0).unwrap().eq([
+            (&BigInt::from(-128), &BigInt::from(-9)), (&BigInt::from(-7), &BigInt::from(-1)),
+        ]));
+        assert!(run(&affine.replace("entry < 0", "entry == -8")).unwrap().symbolic_diagnostic.is_none());
+        assert!(matches!(run(&affine.replace("out == 7", "out == core.old(entry)")), Err(ProjectCheck::Unsupported)));
+        let equality_outside_affine = affine.replace("entry < 0", "entry < -128")
+            .replace("out == 7", "out == core.old(entry)");
+        assert!(matches!(run(&equality_outside_affine), Err(ProjectCheck::Unsupported)),
+            "a vacuous entry-equality guard does not authorize affine computation");
+        assert!(matches!(run(&affine.replace("-1 - n", "1 - n")), Err(ProjectCheck::Unsupported)),
+            "the proof guard cannot make an overflowing actual computation defined");
     }
 
     #[cfg(feature = "internal-checker")]

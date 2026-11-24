@@ -1573,6 +1573,22 @@ cases.extend([
     ("ordinary-pure-affine-proof-shared-guard",grouped_affine_proof,0,b""),
     ("exact-startup-ordinary-pure-affine-proof-shared-guard",grouped_affine_proof_reached,0,b""),
 ])
+relational_named_calling_producer = """%%start
+    i8(i8) leaf = fn(n) { n };
+    i8(i8) producer = fn(n) { i8 observed = leaf(n); observed };
+    proof bounded for producer(entry) -> (out) where (entry >= 0) ensures (out == 7) {}
+%%end"""
+reflected_named_calling_producer = relational_named_calling_producer.replace("{ n }", "{ -1 - n }").replace("entry >= 0", "entry < 0")
+cases.extend([
+    ("ordinary-named-relational-alias-refuted",relational_named_calling_producer,1,b"proof obligation failed"),
+    ("ordinary-named-relational-affine-refuted",reflected_named_calling_producer,1,b"proof obligation failed"),
+    ("ordinary-named-relational-affine-proved",reflected_named_calling_producer.replace("entry < 0","entry == -8"),0,b""),
+    ("ordinary-named-relational-entry-equality-affine-outside-guard",
+        reflected_named_calling_producer.replace("entry < 0","entry < -128").replace("out == 7","out == core.old(entry)"),
+        2,b"unsupported analysis"),
+    ("ordinary-named-relational-affine-overflow",reflected_named_calling_producer.replace("-1 - n","1 - n"),2,b"unsupported analysis"),
+])
+
 batched_named_calling_producer = """%%start
     i8(i8) leaf = fn(n) { if (n < 0) { -3 } else { 7 } };
     i8(i8) producer = fn(n) { i8 produced = leaf(n); produced };
@@ -1609,6 +1625,8 @@ cases.extend([
         b"proof obligation failed"),
 ])
 proof_diagnostic_notes = {
+    "ordinary-named-relational-alias-refuted": b"symbolic call can return 0",
+    "ordinary-named-relational-affine-refuted": b"symbolic call can return 127",
     "ordinary-batched-named-calling-producer-refuted": b"symbolic call can return -3",
     "ordinary-pure-affine-proof-conditional-refuted": b"symbolic call can return 5",
     "exact-startup-ordinary-pure-affine-proof-conditional-refuted": b"call returned 5",
