@@ -6162,7 +6162,7 @@ pub(super) enum CheckerOrdinaryScalarLocalKind {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) enum CheckerSnapshotReadIndex {
     Leaf(usize),
-    ExactArrayIndex(OccurrenceOrdinal),
+    BoundedArrayIndex(OccurrenceOrdinal),
 }
 
 #[cfg(feature = "internal-checker")]
@@ -9243,7 +9243,7 @@ impl StructuralWalker<'_, '_> {
                     return None;
                 }
                 let (shape, ()) = self.structure.select_snapshot(key, |shape| array(&shape.root, length).map(|_| ()))?;
-                (shape, CheckerSnapshotReadIndex::ExactArrayIndex(index))
+                (shape, CheckerSnapshotReadIndex::BoundedArrayIndex(index))
             }
             _ => return None,
         };

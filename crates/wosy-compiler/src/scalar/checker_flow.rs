@@ -1497,6 +1497,57 @@ impl IntegerInputs {
         Some(())
     }
 
+    #[cfg(feature = "internal-checker")]
+    fn bounded_snapshot_index(
+        self, index_axis: usize, length: usize, mut field_axis: impl FnMut(usize) -> Option<usize>,
+        work: &mut usize,
+    ) -> Option<Self> {
+        if !(1..=64).contains(&length) { return None; }
+        let mut axes = [None; 64];
+        let mut axis_at = |index: usize| {
+            let slot = axes.get_mut(index)?;
+            if slot.is_none() { *slot = Some(field_axis(index)?); }
+            *slot
+        };
+        let mut result = Vec::new();
+        for mut row in self.0 {
+            charge_call_work(work, 1)?;
+            let indices = row.get(index_axis)?;
+            let (lower, upper) = indices.extremes()?;
+            let first = usize::try_from(lower).ok()?;
+            let last = usize::try_from(upper).ok()?;
+            // Do not intersect away invalid indices. This entire reached
+            // read is supported only if every input index is in bounds.
+            if last >= length || first > last { return None; }
+            if first == last {
+                let growth = if row.len() == row.cells.capacity() { row.len() } else { 0 };
+                charge_call_work(work, row.equal_axes().len().checked_add(growth)?.checked_add(2)?)?;
+                let field = axis_at(first)?;
+                row.append_alias(field, row.get(field)?.clone());
+                result.push(row);
+                continue;
+            }
+            for (lower, upper) in indices.intervals() {
+                charge_call_work(work, 1)?;
+                for index in usize::try_from(lower).ok()?..=usize::try_from(upper).ok()? {
+                    // Pay for cloning all coordinates, propagating the exact
+                    // index restriction through equal/affine columns, and
+                    // appending the selected alias before doing any of it.
+                    let aliases = row.equal_axes().len();
+                    let mut cost = row.len().checked_mul(2)?.checked_add(aliases.checked_mul(2)?)?.checked_add(5)?;
+                    row.charge_affine_replacement(index_axis, 1, &mut cost)?;
+                    charge_call_work(work, cost)?;
+                    let field = axis_at(index)?;
+                    let mut split = row.clone();
+                    split.replace_domain(index_axis, Rc::new(IntegerSet::singleton(&BigInt::from(index))));
+                    split.append_alias(field, split.get(field)?.clone());
+                    result.push(split);
+                }
+            }
+        }
+        Some(Self(result))
+    }
+
     // Only visited from actual copy/relational transfer sites, never from the
     // generic drive loop. Affine rows are already metered by that lane.
     #[cfg(feature = "internal-checker")]
@@ -5350,27 +5401,31 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                             super::reference::CheckerOrdinaryScalarLocalKind::SnapshotRead { shape, index } => {
                                 use super::{checker_directive::CheckerSnapshotNode, reference::CheckerSnapshotReadIndex};
                                 if !roots.allow_extended_scalar_locals { return None; }
-                                let leaf = match index {
-                                    CheckerSnapshotReadIndex::Leaf(leaf) => *leaf,
-                                    CheckerSnapshotReadIndex::ExactArrayIndex(index) => {
+                                match index {
+                                    CheckerSnapshotReadIndex::Leaf(leaf) => {
+                                        let field = shape.leaves.get(*leaf)?;
+                                        let (axis, ty) = roots.lookup(&field.capture)?;
+                                        if ty != &receiver.ty || field.ty != *ty { return None; }
+                                        path.append_ordinary_copy(axis, roots)?;
+                                    }
+                                    CheckerSnapshotReadIndex::BoundedArrayIndex(index) => {
                                         let PlainNameIdentity::Lexical(binding) = calls.prepared_plain_name(*index)?
                                             else { return None; };
                                         let (axis, ty) = roots.lookup(binding)?;
                                         if *ty != ScalarType::U64 { return None; }
-                                        let index = path.singleton_axis_with(axis,
-                                            || charge_call_work(roots.ordinary_local_work.get_or_insert(0), 1))?.0;
                                         let CheckerSnapshotNode::Array(elements) = &shape.root else { return None; };
-                                        let CheckerSnapshotNode::Leaf(leaf) = elements.get(usize::try_from(index).ok()?)?
-                                            else { return None; };
-                                        *leaf
+                                        let by_binding = &roots.by_binding;
+                                        let axes = &roots.axes;
+                                        let field_axis = |index: usize| {
+                                            let CheckerSnapshotNode::Leaf(leaf) = elements.get(index)? else { return None; };
+                                            let field = shape.leaves.get(*leaf)?;
+                                            let axis = *by_binding.get(&field.capture)?;
+                                            (axes.get(axis)?.1 == &receiver.ty && field.ty == receiver.ty).then_some(axis)
+                                        };
+                                        path = path.bounded_snapshot_index(axis, elements.len(), field_axis,
+                                            roots.ordinary_local_work.get_or_insert(0))?;
                                     }
-                                };
-                                let field = shape.leaves.get(leaf)?;
-                                let (axis, ty) = roots.lookup(&field.capture)?;
-                                if ty != &receiver.ty || field.ty != *ty { return None; }
-                                // A scalar read shares the exact captured
-                                // coordinate, including its row correlations.
-                                path.append_ordinary_copy(axis, roots)?;
+                                }
                             }
                             super::reference::CheckerOrdinaryScalarLocalKind::Conditional => {
                                 if !roots.allow_extended_scalar_locals { return None; }
@@ -6893,6 +6948,26 @@ fn simultaneous_parallel_rows_keep_old_origins_and_relations() {
     assert!(work > 0);
     let mut exhausted = MAX_PARTITION_TRANSFER_WORK;
     assert!(IntegerInputs(vec![row]).parallel_overwrite(&changes, &mut exhausted).is_none());
+}
+
+#[cfg(feature = "internal-checker")]
+#[test]
+fn bounded_snapshot_index_preserves_holes_and_affine_preimages_before_aliasing() {
+    let singleton = |value: i32| Rc::new(IntegerSet::singleton(&BigInt::from(value)));
+    let domain = Rc::new(IntegerSet::union([singleton(0).as_ref(), singleton(2).as_ref()]));
+    let mut row = IntegerRow::new(vec![domain, singleton(42), singleton(99)]);
+    assert!(row.test_append_affine(0, Rc::new(IntegerAffineTransform { reflected: true, offset: 6.into() })).is_some());
+    let fields = |index| [0, 1, 3].get(index).copied();
+    let mut work = 0;
+    let result = IntegerInputs(vec![row.clone()]).bounded_snapshot_index(0, 3, fields, &mut work).unwrap();
+    assert_eq!(result.row_count(), 2);
+    assert!(result.includes_signed(&[0, 42, 99, 6, 0]));
+    assert!(result.includes_signed(&[2, 42, 99, 4, 4]));
+    assert!(!result.includes_signed(&[0, 42, 99, 6, 4]));
+    assert!(!result.includes_signed(&[1, 42, 99, 5, 42]));
+    assert!(IntegerInputs(vec![row.clone()]).bounded_snapshot_index(0, 2, fields, &mut 0).is_none());
+    let mut almost_exhausted = MAX_PARTITION_TRANSFER_WORK - 1;
+    assert!(IntegerInputs(vec![row]).bounded_snapshot_index(0, 3, fields, &mut almost_exhausted).is_none());
 }
 
 #[test]

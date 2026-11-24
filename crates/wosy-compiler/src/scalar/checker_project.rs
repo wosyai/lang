@@ -10536,7 +10536,7 @@ mod tests {
 
     #[cfg(feature = "internal-checker")]
     #[test]
-    fn ordinary_fixed_array_read_requires_one_reached_index_and_preserves_capture() {
+    fn ordinary_fixed_array_read_partitions_only_in_bounds_index_preimages() {
         let app = source("src/main.w", "ordinary-array-read");
         let text = r#"%%start
             unit(u64, i8) inspect = fn(index, value) {
@@ -10549,6 +10549,7 @@ mod tests {
                     i8 fixed = copied[1];
                     core.require(fixed == 9, { .stdout = ""; .stderr = "wrong literal index"; .code = 59; .files = []; });
                     if (observed == 3) {
+                        core.require(index == 0, { .stdout = ""; .stderr = "wrong preimage"; .code = 60; .files = []; });
                         core.require(value != 7, { .stdout = ""; .stderr = ""; .code = 61;
                             .files = [{ .path = "observed.json"; .state = observed; }]; });
                     } else {
@@ -10572,9 +10573,17 @@ mod tests {
             assert!(failure.witness.axes().all(|(binding, _)| binding.kind == super::super::ReferenceBindingKind::Declared));
             assert_eq!(failure.files()[0].text.as_ref(), b"{\"type\":{\"kind\":\"i8\"},\"value\":3}\n");
         }
-        let variable = text.replace("index == 0", "index <= 1");
-        assert!(matches!(run(&variable, ScalarCheckerScope::CurrentPackage), Err(ProjectCheck::Unsupported)));
-        let beyond = actual.replace("index == 0", "index == 2").replace("inspect(0, 3)", "inspect(2, 3)");
+        let alternatives = text.replace("if (index == 0)", "if (index == 0 || index == 2)")
+            .replace("i8[2]", "i8[3]").replace("[value, 9]", "[value, 13, 9]").replace("copied[1]", "copied[2]")
+            .replace("observed == 1,", "observed == 1 || (index == 2 && observed == 9),");
+        let receipt = run(&alternatives, ScalarCheckerScope::CurrentPackage).unwrap();
+        let [failure] = receipt.directives.as_slice() else { panic!("only the authored index preimage fails"); };
+        assert_eq!(failure.code(), &BigInt::from(61));
+        let zero = BigInt::from(0);
+        assert!(failure.witness.intervals_at(0, 0).unwrap().eq([(&zero, &zero)]));
+        let invalid = alternatives.replace("index == 2)", "index == 3)");
+        assert!(matches!(run(&invalid, ScalarCheckerScope::CurrentPackage), Err(ProjectCheck::Unsupported)));
+        let beyond = actual.replace("if (index == 0)", "if (index == 2)").replace("inspect(0, 3)", "inspect(2, 3)");
         assert!(matches!(run(&beyond, ScalarCheckerScope::MainFlowOnly), Err(ProjectCheck::Unsupported)));
     }
 

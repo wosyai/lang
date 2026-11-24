@@ -1704,6 +1704,7 @@ ordinary_array_read = f"""%%start
             i8 fixed = copied[1];
             core.require(fixed == 9, {report(59,"WRONG-LITERAL-INDEX")});
             if (observed == 3) {{
+                core.require(index == 0, {report(60,"WRONG-PREIMAGE")});
                 core.require(value != 7, {state_report(61,"SELECTED-ELEMENT","observed")});
             }} else {{
                 core.require(observed == 1, {report(63,"LOST-CORRELATION")});
@@ -1712,12 +1713,17 @@ ordinary_array_read = f"""%%start
     }};
     %%end"""
 ordinary_array_read_actual = ordinary_array_read.replace("%%end","inspect(0, 3); %%end")
+ordinary_array_alternatives = ordinary_array_read.replace("if (index == 0)","if (index == 0 || index == 2)").replace(
+    "i8[2]","i8[3]").replace("[value, 9]","[value, 13, 9]").replace("copied[1]","copied[2]").replace(
+    "observed == 1,","observed == 1 || (index == 2 && observed == 9),")
 cases.extend([
     ("ordinary-array-read-control",ordinary_array_read,61,b"SELECTED-ELEMENT"),
     ("exact-startup-ordinary-array-read-control",ordinary_array_read_actual,61,b"SELECTED-ELEMENT"),
-    ("ordinary-array-read-rejects-nonsingleton",ordinary_array_read.replace("index == 0","index <= 1"),2,b"unsupported analysis"),
+    ("ordinary-array-read-partitions-holed-indices",ordinary_array_alternatives,61,b"SELECTED-ELEMENT"),
+    ("ordinary-array-read-refuses-mixed-invalid-indices",
+        ordinary_array_alternatives.replace("index == 2)","index == 3)"),2,b"unsupported analysis"),
     ("exact-startup-ordinary-array-read-rejects-out-of-bounds",ordinary_array_read_actual.replace(
-        "index == 0","index == 2").replace("inspect(0, 3)","inspect(2, 3)"),2,b"unsupported analysis"),
+        "if (index == 0)","if (index == 2)").replace("inspect(0, 3)","inspect(2, 3)"),2,b"unsupported analysis"),
 ])
 ordinary_nominal_read = f"""%%start
     struct copy Snapshot {{ i8 saved; bool enabled; }}
@@ -1888,6 +1894,7 @@ authored_files = {
     **{name: {"state.json": state_bytes(typed_state("i8", 3))} for name in (
         "ordinary-nominal-member-read-control", "exact-startup-ordinary-nominal-member-read-control",
         "ordinary-array-read-control", "exact-startup-ordinary-array-read-control",
+        "ordinary-array-read-partitions-holed-indices",
     )},
     "authored-state-array-projection-code-and-file": {"selected.json": state_bytes(copied_alternatives)},
     "authored-state-nominal-field-only": {
