@@ -991,6 +991,72 @@ fn structured_owner_factory_joins_grounded_recursive_results_in_caller_storage()
 }
 
 #[test]
+fn structured_named_terminal_moves_descriptor_and_keeps_original_backing() {
+    let app = source("workbench", "src/structured_named_factory.w");
+    let text = include_str!("fixtures/structured-named-factory.w");
+    for (target, target_layout) in [("native64", ScalarTargetLayout::NATIVE64), ("wasm32", ScalarTargetLayout::WASM32)] {
+        for project in [false, true] {
+            let emit = |text: &str| {
+                let prepared = prepare_scalar_project(vec![(declarations(&app, text), vec![])],
+                    vec![app.clone()], ScalarPreparationInputs { target_layout }).unwrap();
+                let build = analyze_scalar_build(&prepared);
+                assert!(build.diagnostics().is_empty(), "{target}: {:?}", build.diagnostics());
+                if project { emit_scalar_build_project_llvm(&build) }
+                else { wosy_compiler::emit_scalar_build_single_module_llvm(&build) }
+                    .map(|module| module.to_text())
+            };
+            let ir = emit(text).unwrap_or_else(|e| panic!("{target}/{project}: {e}"));
+            let context = Context::create();
+            let module = context.create_module_from_ir(MemoryBuffer::create_from_memory_range_copy(ir.as_bytes(), target)).unwrap();
+            module.verify().unwrap();
+            let symbol = |name: &str| if project { function_with_suffix(&module, name) } else { name.to_owned() };
+            let factory = module.get_function(&symbol("factory")).unwrap();
+            let alternate = module.get_function(&symbol("make_alt")).unwrap();
+            let dest = factory.get_last_param().unwrap();
+            let mut received = Vec::new();
+            let mut copied = 0;
+            let mut released = Vec::new();
+            let mut incoming = Vec::new();
+            for row in factory.get_basic_blocks().into_iter().flat_map(|b| b.get_instructions()) {
+                if row.get_opcode() == InstructionOpcode::Phi {
+                    incoming.extend((0..row.get_num_operands()).filter_map(|n| row.get_operand(n)?.value()));
+                }
+                if row.get_opcode() != InstructionOpcode::Call { continue; }
+                let call = CallSiteValue::try_from(row).unwrap();
+                let Some(callee) = call.get_called_fn_value() else { continue };
+                let arg = |slot| row.get_operand(slot).unwrap().value().unwrap();
+                let name = callee.get_name().to_str().unwrap();
+                if callee == factory || callee == alternate {
+                    assert_ne!(arg(call.count_arguments()-1), dest);
+                    received.push(call.try_as_basic_value().basic().unwrap());
+                } else if name.starts_with("llvm.memmove.") && arg(0) == dest {
+                    copied += 1;
+                } else if name == "__wosy_core_free" {
+                    released.push(arg(0));
+                }
+            }
+            assert_eq!((received.len(), copied, released.len()), (2, 2, 1), "{target}/{project}: {ir}");
+            for base in received {
+                assert!(incoming.contains(&base) && !released.contains(&base), "{target}/{project}: {ir}");
+            }
+            if let Some(out) = std::env::var_os("WOSY_NAMED_FACTORY_IR_DIR") {
+                let out = std::path::PathBuf::from(out).join(if project { "project" } else { "single" });
+                std::fs::create_dir_all(&out).unwrap();
+                let mut witness = ir.replace("@main(", "@wosy_authored_main(");
+                for name in ["case_zero", "case_two", "case_three"] {
+                    witness.push_str(&format!("\ndefine i64 @wosy_{name}() {{\nentry:\n  %v = call i64 @{}()\n  ret i64 %v\n}}\n", symbol(name)));
+                }
+                std::fs::write(out.join(format!("{target}.ll")), witness).unwrap();
+            }
+            let indirect = text.replace("Packet selected = make_alt(length); selected",
+                "Packet original = make_alt(length); Packet selected = original; selected");
+            assert!(emit(&indirect).expect_err("alias is not the direct produced descriptor")
+                .contains("structured aggregate return is not closed on every result path"));
+        }
+    }
+}
+
+#[test]
 fn d0024_recursive_ownership_preserves_live_holders_and_carried_owner() {
     let app = source("workbench", "src/d0024_recursive_ownership.w");
     let text = include_str!("fixtures/d0024-recursive-ownership.w");

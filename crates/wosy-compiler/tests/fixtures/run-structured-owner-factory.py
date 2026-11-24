@@ -53,6 +53,14 @@ int main(void) { return check(); }
 #endif
 """
 
+# The named variant deliberately puts a different length in the alternate
+# descriptor without changing its backing size or the allocation trace.
+if sys.argv[3:] == ["named"]:
+    runtime = runtime.replace("wosy_case_zero() != 2", "wosy_case_zero() != 12")
+    runtime = runtime.replace("wosy_case_three() != 2", "wosy_case_three() != 12")
+elif sys.argv[3:]:
+    raise SystemExit("optional third argument must be named")
+
 with tempfile.TemporaryDirectory(prefix="conditional-receipt-", dir=ir_dir) as tmp:
     work = Path(tmp)
     trace = work / "trace.c"

@@ -2540,6 +2540,7 @@ pub(crate) struct ClosedBody {
     pub(crate) checked_backing_optional: bool,
     pub(crate) returning: Option<ClosedReturn>,
     mixed_branch_return: Option<Box<MixedBranchReturn>>,
+    pub(crate) named_result_arms: BTreeMap<usize, (usize, usize)>, // block -> (output, producer)
     pub(crate) ordinary_result: bool,
     pub(crate) ordinary_calls: BTreeMap<usize, SourceSpan>,
     pub(crate) calls: BTreeMap<usize, ClosedCall>,
@@ -2630,6 +2631,7 @@ impl InstalledAggregateFacts {
 }
 
 struct StructuredOwnerReturn {
+    named: BTreeMap<CfgPointId, (BlockOrdinal, OccurrenceOrdinal)>,
     output: OccurrenceOrdinal,
     leaves: BTreeSet<CfgPointId>,
     complete: bool,
@@ -2669,26 +2671,62 @@ impl Body<'_> {
         if !matches!(self.sites.conditionals.get(&output), Some(ConditionalRegion::Value { .. })) {
             return None;
         }
-        let mut result = StructuredOwnerReturn { output, leaves: BTreeSet::new(), complete: true };
+        let mut result = StructuredOwnerReturn { named: BTreeMap::new(), output, leaves: BTreeSet::new(), complete: true };
         let calls: BTreeMap<_, _> = facts.calls.iter().map(|(&point, &ordinal)| (ordinal.0, point)).collect();
-        let mut pending = vec![(output, 0)];
-        while let Some((expression, depth)) = pending.pop() {
+        let mut pending = vec![(structure.root, output, 0)];
+        while let Some((block, expression, depth)) = pending.pop() {
             if depth > MAX_RECEIPT_FORK_DEPTH { result.complete = false; }
             if let Some(ConditionalRegion::Value { then_block, else_block, .. }) = self.sites.conditionals.get(&expression) {
                 for block in [*else_block, *then_block] {
                     if let Some(child) = output_at(block) {
-                        pending.push((child, depth + 1));
+                        pending.push((block, child, depth + 1));
                     } else {
                         result.complete = false;
                     }
                 }
             } else if let Some(&call) = calls.get(&expression.0) {
                 if !result.leaves.insert(call) { result.complete = false; }
+            } else if let Some(producer) = self.named_terminal_producer(block, expression, &calls, &ty.ty) {
+                if !result.leaves.insert(producer) { result.complete = false; }
+                result.named.insert(producer, (block, expression));
             } else {
                 result.complete = false;
             }
         }
         Some(result)
+    }
+
+    // The immediately preceding statement must install exactly the owning call
+    // whose unprojected lexical value this terminal consumes. A matching name or
+    // type alone is not evidence of backing identity.
+    fn named_terminal_producer(
+        &self, block: BlockOrdinal, terminal: OccurrenceOrdinal, calls: &BTreeMap<usize, CfgPointId>,
+        ty: &ScalarType,
+    ) -> Option<CfgPointId> {
+        let [.., prior, last] = self.sites.structure.blocks.get(block.0)?.items.as_slice() else { return None };
+        let BlockItemKind::FinalOutput(output) = &last.kind else { return None };
+        let BlockItemKind::Binding(bind) = &prior.kind else { return None };
+        let BindingInitialization::Outputs(init) = &bind.initialization else { return None };
+        let [receiver] = bind.receivers() else { return None };
+        let PlainNameIdentity::Lexical(identity) = self.sites.prepared_plain_name(terminal)? else { return None };
+        let producer = *calls.get(&init.primary.0)?;
+        let (bound, actual) = self.facts?.direct_receipt_bindings.get(&producer)?;
+        let points = &self.cfg.points;
+        let bind_point = points.get(bound.0)?;
+        let [read] = bind_point.successors.as_slice() else { return None };
+        let read = points.get(read.0)?;
+        let [moved] = read.successors.as_slice() else { return None };
+        let moved = points.get(moved.0)?;
+        let span = self.sites.occurrences.get(terminal.0)?.span;
+        (output.expression == terminal && init.secondary.is_empty() && &receiver.ty == ty
+            && actual == identity && identity.declaration_span == receiver.span
+            && points.get(producer.0)?.scope == bind_point.scope
+            && bind_point.scope == read.scope && read.scope == moved.scope
+            && read.source_span.range == span && moved.source_span.range == span
+            && matches!(&read.kind, CfgPointKind::Read { binding } if binding == identity)
+            && matches!(&moved.kind, CfgPointKind::Move { owner, place, ty: moved_ty }
+                if owner == identity && place.binding == *identity && place.projections.is_empty() && moved_ty == ty))
+            .then_some(producer)
     }
 
     fn recommitted_root_output(&self, producer: CfgPointId) -> Option<(OccurrenceOrdinal, OccurrenceOrdinal)> {
@@ -4581,7 +4619,12 @@ fn closed_aggregates<'a>(
                 if previous.is_some() || discharged_by_inputs.contains_key(&(key, point)) || endpoints.next().is_some() {
                     return Err(format!("structured aggregate result has competing owner routes in {:?}", body.source));
                 }
-                plan.calls.insert(call.0, ClosedCall::ResultArm);
+                if let Some(&(block, output)) = structured_returns[&key].named.get(&point) {
+                    plan.named_result_arms.insert(block.0, (output.0, call.0));
+                    plan.calls.insert(call.0, ClosedCall::Receive);
+                } else {
+                    plan.calls.insert(call.0, ClosedCall::ResultArm);
+                }
                 continue;
             }
 

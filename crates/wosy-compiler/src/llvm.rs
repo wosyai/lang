@@ -2958,6 +2958,7 @@ fn emit_block_at<'ctx, 'module>(
         EmitValue::Unit
     };
     let result = finish_block_return(context, state, block, result, emission)?;
+    let result = aggregate_transfer::commit_named_result_arm(context, state, block, result)?;
     let result = if let BlockEmission::TailArm(outputs) = emission {
         aggregate_transfer::commit_mixed_branch_arm(context, state, block, result, outputs)?
     } else {
@@ -3053,6 +3054,7 @@ fn emit_project_block_at<'ctx, 'module>(
         EmitValue::Unit
     };
     let result = finish_block_return(context, state, block, result, emission)?;
+    let result = aggregate_transfer::commit_named_result_arm(context, state, block, result)?;
     let result = if let BlockEmission::TailArm(outputs) = emission {
         aggregate_transfer::commit_mixed_branch_arm(context, state, block, result, outputs)?
     } else {

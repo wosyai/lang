@@ -1395,6 +1395,26 @@ fn mixed_allocation_pair<'ctx>(
         .map_err(builder_error)?.into_struct_value())
 }
 
+pub(super) fn commit_named_result_arm<'ctx>(
+    context: &'ctx Context, state: &mut EmitState<'ctx, '_>, block: &ScalarBlock, result: EmitValue<'ctx>,
+) -> Result<EmitValue<'ctx>, String> {
+    let Some(aggregate) = state.aggregate.as_mut() else { return Ok(result) };
+    if aggregate.plan.named_result_arms.is_empty() { return Ok(result) }
+    let nodes = state.body_call_nodes.ok_or("missing structured result occurrences")?;
+    let Some(&(output, producer)) = nodes.block_ordinal(block)
+        .and_then(|ordinal| aggregate.plan.named_result_arms.get(&ordinal)) else { return Ok(result) };
+    let Some((expression, _)) = block.final_expressions().next() else { return Err("missing named terminal".into()) };
+    let ScalarExpression::Name { name, .. } = expression else { return Err("invalid named terminal".into()) };
+    if nodes.expression_ordinal(expression) != Some(output) { return Err("changed named terminal".into()) }
+    let (_, ty) = state.storage.get(name).ok_or("missing named descriptor storage")?;
+    let ty = ty.clone();
+    let destination = aggregate.destination.ok_or("missing named result destination")?;
+    let base = aggregate.receipts.remove(&producer).ok_or("missing named result backing")?;
+    aggregate.structured_arms_visited += 1;
+    store_value(context, state, destination, &ty, result)?;
+    Ok(EmitValue::Basic(base.into()))
+}
+
 pub(super) fn commit_mixed_branch_arm<'ctx>(
     context: &'ctx Context, state: &mut EmitState<'ctx, '_>, block: &ScalarBlock,
     result: EmitValue<'ctx>, outputs: &crate::ScalarOutputSequence,
@@ -1478,7 +1498,7 @@ pub(super) fn commit_return<'ctx>(
         };
         if root != Some(output) || aggregate.committed
             || aggregate.structured_arms_visited != aggregate.plan.calls.values()
-                .filter(|&&action| action == ClosedCall::ResultArm).count()
+                .filter(|&&action| action == ClosedCall::ResultArm).count() + aggregate.plan.named_result_arms.len()
             || !matches!(outputs.outputs.as_slice(), [result] if matches!(result.ty, ScalarType::Struct(_)))
         {
             return Err("structured aggregate result changed its proved output tree".into());
