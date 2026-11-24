@@ -6347,7 +6347,7 @@ pub(super) struct OccurrenceStructure {
     #[cfg(feature = "internal-checker")]
     pub(super) checker_ordinary_call_integer_literals: HashMap<OccurrenceOrdinal, BigInt>,
     #[cfg(feature = "internal-checker")]
-    pub(super) checker_ordinary_bool_literals: HashMap<OccurrenceOrdinal, BigInt>,
+    pub(super) checker_ordinary_literal_atoms: HashMap<OccurrenceOrdinal, BigInt>,
     #[cfg(feature = "internal-checker")]
     pub(super) checker_snapshot_locals: HashMap<(BlockOrdinal, usize), std::rc::Rc<super::checker_directive::CheckerSnapshotShape>>,
     #[cfg(feature = "internal-checker")]
@@ -6543,7 +6543,7 @@ impl OccurrenceStructure {
             #[cfg(feature = "internal-checker")]
             checker_has_finite_scalar_local: false,
             #[cfg(feature = "internal-checker")]
-            checker_ordinary_bool_literals: HashMap::new(),
+            checker_ordinary_literal_atoms: HashMap::new(),
             #[cfg(feature = "internal-checker")]
             checker_ordinary_call_integer_literals: HashMap::new(),
             #[cfg(feature = "internal-checker")]
@@ -7024,11 +7024,11 @@ fn resolve_project_call_sites_impl(
                         (parameters.as_slice(), outputs.outputs.as_slice()),
                         ([input], [output]) if is_integer_type(input) && input == &output.ty))
             );
-            let boolean_candidate = matches!(&modules[declaration.0].items[declaration.1],
+            let literal_candidate = matches!(&modules[declaration.0].items[declaration.1],
                 ScalarItem::Function(function) if matches!(&function.signature,
                     ScalarType::Callable { parameters, outputs } if matches!(parameters.as_slice(), [] | [_])
-                        && matches!(outputs.outputs.as_slice(), [output] if output.ty == ScalarType::Bool)));
-            if same_package && (qualified || case_candidate || boolean_candidate) {
+                        && matches!(outputs.outputs.as_slice(), [output] if matches!(output.ty, ScalarType::Bool | ScalarType::Char))));
+            if same_package && (qualified || case_candidate || literal_candidate) {
                 declarations.nested_proof_watch.entry((source, declaration_span))
                     .or_insert(ProofTargetUse { declaration, nested: std::cell::Cell::new(false) });
             }
@@ -7900,10 +7900,22 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
         #[cfg(feature = "internal-checker")]
         if checker_enabled && matches!(edge, OccurrenceEdge::CallArgument(0 | 1) | OccurrenceEdge::FinalOutput { output: 0, .. }
                 | OccurrenceEdge::AssignmentRhs { .. })
-            && self.structure.checked_types.expressions.get(&ordinal) == Some(&ScalarType::Bool)
         {
-            if let ScalarExpression::Boolean { value, .. } = expression {
-                self.structure.checker_ordinary_bool_literals.insert(ordinal, BigInt::from(u8::from(*value)));
+            let atom = match expression {
+                ScalarExpression::Boolean { value, .. }
+                    if self.structure.checked_types.expressions.get(&ordinal) == Some(&ScalarType::Bool) =>
+                    Some(BigInt::from(u8::from(*value))),
+                ScalarExpression::Char { value, .. }
+                    if matches!(edge, OccurrenceEdge::FinalOutput { output: 0, .. })
+                        || initializer_literal_argument =>
+                {
+                    (self.structure.checked_types.expressions.get(&ordinal) == Some(&ScalarType::Char))
+                        .then(|| BigInt::from(u32::from(*value)))
+                }
+                _ => None,
+            };
+            if let Some(atom) = atom {
+                self.structure.checker_ordinary_literal_atoms.insert(ordinal, atom);
             }
         }
         #[cfg(any(test, feature = "internal-checker"))]
@@ -9278,7 +9290,7 @@ impl StructuralWalker<'_, '_> {
                             && self.structure.checked_types.expressions.get(&outputs.primary) == Some(&ScalarType::Bool)
                         {
                             if let ScalarExpression::Boolean { value, .. } = value {
-                                self.structure.checker_ordinary_bool_literals.insert(outputs.primary,
+                                self.structure.checker_ordinary_literal_atoms.insert(outputs.primary,
                                     BigInt::from(u8::from(*value)));
                             }
                         }

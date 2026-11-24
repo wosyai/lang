@@ -59,6 +59,10 @@ impl<Scalar: ScalarCatalogEvidence> ActualIntegerObserver for WithArrays<'_, '_,
         self.scalar.named_exact_watch(target)
     }
 
+    fn enables_character_initializers(&self) -> bool {
+        self.scalar.enables_character_initializers()
+    }
+
     fn permits_named_pure_affine_return(&self, target: PreparedCallable, arguments: &[&BigInt]) -> bool {
         self.scalar.permits_named_pure_affine_return(target, arguments)
     }
@@ -104,8 +108,8 @@ impl<Scalar: SymbolicRootProof, Array: SymbolicRootProof> SymbolicRootProof
         self.array.seed(roots, reached);
     }
 
-    fn watches_boolean_return(&self, target: PreparedCallable) -> bool {
-        self.scalar.watches_boolean_return(target)
+    fn watches_literal_leaf(&self, target: PreparedCallable) -> bool {
+        self.scalar.watches_literal_leaf(target)
     }
 
     fn try_collect(

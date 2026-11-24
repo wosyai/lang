@@ -2716,7 +2716,47 @@ cases.extend([
     ("ordinary-boolean-return-proof-refuses-unanalyzed-nested-call", boolean_proof_symbolic.replace(
         "%%end", "bool(bool) relay = fn(flag) { identity(flag) }; %%end"), 2, b"unsupported analysis"),
 ])
+character_proof_reached = """%%start
+    char(char) identity = fn(letter) { letter };
+    char() accent = fn { 'é' };
+    bool() ready = fn { true };
+    u8[1]() make = fn { [7] };
+    proof crab for identity(entry) -> (out) where (entry == '🦀') ensures (out == '🦀') {}
+    proof accented for accent() -> (out) ensures ('é' == out) {}
+    proof readiness for ready() -> (out) ensures (out) {}
+    proof cells for make() -> (items) forall (u64 i where i == 0) ensures (items[i] == 7) {}
+    char prepared = '🦀';
+    char first = identity(prepared);
+    char outside = identity('β');
+    char duplicate = identity(first);
+    char marked = accent();
+    bool yes = ready();
+    u8[1] data = make();
+%%end"""
+character_proof_symbolic = r"""%%start
+    char(char) identity = fn(letter) { letter };
+    char(i8) tone = fn(mark) { if (mark == 1) { 'β' } else { 'a' } };
+    proof valid for identity(entry) -> (out) where (entry != '\0') ensures (out != '\0')
+        { core.show('\0' != out); }
+    proof nonzero for identity(entry) -> (out) where (entry != '\0') ensures (out != '\0') {}
+    proof selected for tone(entry) -> (out) where (entry == 1) ensures (out == 'β') {}
+%%end"""
+cases.extend([
+    ("exact-startup-character-return-proof-proved", character_proof_reached, 0, b""),
+    ("exact-startup-character-return-proof-refuted", character_proof_reached.replace("out == '🦀'", "out != '🦀'"),
+        1, b"proof obligation failed"),
+    ("ordinary-character-return-proof-proved", character_proof_symbolic, 0, b""),
+    ("ordinary-character-return-proof-refuted", character_proof_symbolic
+        .replace(r"core.show('\0' != out)", "core.show('β' != out)")
+        .replace(r"proof nonzero for identity(entry) -> (out) where (entry != '\0') ensures (out != '\0')",
+            r"proof nonzero for identity(entry) -> (out) where (entry != '\0') ensures (out != 'β')"),
+        1, b"proof obligation failed"),
+    ("ordinary-character-return-proof-refuses-unanalyzed-nested-call", character_proof_symbolic.replace(
+        "%%end", "char(char) relay = fn(letter) { identity(letter) }; %%end"), 2, b"unsupported analysis"),
+])
 proof_diagnostic_notes = {
+    "exact-startup-character-return-proof-refuted": "call entry: argument 1 = '🦀'".encode(),
+    "ordinary-character-return-proof-refuted": "symbolic call entry: letter = 'β'".encode(),
     "exact-startup-boolean-return-proof-refuted": b"call returned true",
     "ordinary-boolean-return-proof-refuted": b"symbolic call entry: flag = true",
     "exact-startup-mixed-array-catalog-two-failures": b"call returned cell [0] = 3",
@@ -3536,6 +3576,19 @@ with tempfile.TemporaryDirectory(prefix="affine-calls-") as path:
                         assert b"COPY-PRIOR-UNPUBLISHED" not in res.stderr and b"COPY-FORMAL-UNPUBLISHED" not in res.stderr,res
                 elif included and name in proof_diagnostic_notes:
                     assert expected_stderr in res.stderr and proof_diagnostic_notes[name] in res.stderr,res
+                    if "-character-return-proof-" in name:
+                        failures = res.stderr.split(b"error: proof obligation failed")[1:]
+                        assert len(failures) == 2, res
+                        if name.startswith("exact-startup-"):
+                            assert b"symbolic call" not in res.stderr, res
+                            for failure, invocation in zip(failures, (b"identity(prepared)", b"identity(first)")):
+                                assert invocation in failure and "call returned '🦀'".encode() in failure, res
+                                assert "call entry: argument 1 = '🦀'".encode() in failure, res
+                        else:
+                            assert b"proof valid" in failures[0] and "core.show('β' != out)".encode() in failures[0], res
+                            assert b"proof nonzero" in failures[1], res
+                            assert all("symbolic call can return 'β'".encode() in failure
+                                and "symbolic call entry: letter = 'β'".encode() in failure for failure in failures), res
                     if "-boolean-return-proof-" in name:
                         failures = res.stderr.split(b"error: proof obligation failed")[1:]
                         assert len(failures) == 2, res

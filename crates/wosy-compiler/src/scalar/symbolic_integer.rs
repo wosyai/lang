@@ -411,6 +411,15 @@ impl IntegerSet {
         Self(vec![Interval { first: 0u8.into(), last: 1u8.into() }])
     }
 
+    #[cfg(feature = "internal-checker")]
+    pub(super) fn ordinary_character_domain() -> Self {
+        // Unicode scalar values exclude the surrogate range.
+        Self(vec![
+            Interval { first: 0u32.into(), last: 0xd7ffu32.into() },
+            Interval { first: 0xe000u32.into(), last: u32::from(char::MAX).into() },
+        ])
+    }
+
     pub(super) fn from_type(ty: &ScalarType) -> Option<Self> {
         let (first, last) = integer_bounds(ty)?;
         Some(Self(vec![Interval { first, last }]))

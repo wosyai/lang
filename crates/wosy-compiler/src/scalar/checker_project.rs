@@ -1142,7 +1142,7 @@ trait SymbolicRootProof {
 
     fn seed(&self, _: &mut HashMap<usize, HashSet<usize>>, _: &HashSet<PreparedCallable>) {}
 
-    fn watches_boolean_return(&self, _: PreparedCallable) -> bool { false }
+    fn watches_literal_leaf(&self, _: PreparedCallable) -> bool { false }
 
     fn try_collect(
         &mut self, _: PreparedCallable, _: &FunctionCallSites, _: &ScalarFunction, _: &SourceIdentity,
@@ -1184,8 +1184,9 @@ fn check_unused_module<const COLLECT: bool, const ENTRY_EVIDENCE: bool, Proof: S
         }
         if !matches!(body.boundary.results.as_slice(), [result]
             if result.ty == ScalarType::Unit || is_integer_type(&result.ty)
-                || (COLLECT && result.ty == ScalarType::Bool
-                    && (Proof::INTEGER_RETURN_PARTITIONS || proof.watches_boolean_return((ordinal, item))))
+                || (COLLECT && ((result.ty == ScalarType::Bool && Proof::INTEGER_RETURN_PARTITIONS)
+                    || (matches!(result.ty, ScalarType::Bool | ScalarType::Char)
+                        && proof.watches_literal_leaf((ordinal, item)))))
                 || (COLLECT && Proof::FIXED_ARRAY_RETURN && matches!(result.ty, ScalarType::Array { .. })))
         {
             return Err(ProjectCheck::Unsupported);
@@ -1456,6 +1457,10 @@ fn walk_package_initialization<const COLLECT: bool, const PRIVATE_NESTED_SCALAR:
             let value = match (&receiver.ty, &binding.value) {
                 (ScalarType::Bool, ScalarExpression::Boolean { value, .. }) => InitializerValue::Boolean(*value),
                 #[cfg(feature = "internal-checker")]
+                (ScalarType::Char, ScalarExpression::Char { value, .. })
+                    if COLLECT && actual.observer.enables_character_initializers() =>
+                    InitializerValue::Character(BigInt::from(u32::from(*value))),
+                #[cfg(feature = "internal-checker")]
                 (ty, expression @ ScalarExpression::If { .. }) if (*ty == ScalarType::Bool || is_integer_type(ty))
                     && COLLECT && actual.permits_authored_startup_scalars() =>
                 {
@@ -1491,9 +1496,8 @@ fn walk_package_initialization<const COLLECT: bool, const PRIVATE_NESTED_SCALAR:
                     InitializerValue::Integer { ty, value: Cow::Owned(value.clone()) }
                 }
                 (ty, expression) if is_integer_type(ty)
-                    || (*ty == ScalarType::Bool && matches!(expression, ScalarExpression::Call { .. })
-                        && (actual.real_module_boolean_initializer(ty, COLLECT)
-                            || actual.named_boolean_initializer(topology, outputs.primary, COLLECT))) =>
+                    || (COLLECT && matches!(ty, ScalarType::Bool | ScalarType::Char)
+                        && matches!(expression, ScalarExpression::Call { .. })) =>
                 {
                     let value = if let Some(value) = concrete_integer_literal(expression) {
                         value
@@ -1515,6 +1519,8 @@ fn walk_package_initialization<const COLLECT: bool, const PRIVATE_NESTED_SCALAR:
                             let lane = super::checker_flow::bool_result_lane(&value).ok_or(ProjectCheck::Unsupported)?;
                             InitializerValue::Boolean(lane == 1)
                         }
+                        #[cfg(feature = "internal-checker")]
+                        ScalarType::Char => InitializerValue::Character(value.into_owned()),
                         _ => InitializerValue::Integer { ty, value },
                     }
                 }
@@ -1828,11 +1834,16 @@ fn run_initializer_call<'a, Observer: ActualIntegerObserver>(
     let qualified_proof = false;
     let collection = collection.filter(|(source, _)|
         check_completed_scalar_namespace || qualified_proof || !is_integer_type(expected) || *source == &declaration.source);
-    let named_boolean = *expected == ScalarType::Bool
-        && actual.named_boolean_initializer(topology, occurrence, collection.is_some());
-    let module_bool_initializer = named_boolean || actual.real_module_boolean_initializer(expected, collection.is_some());
-    if *expected == ScalarType::Bool && !module_bool_initializer { return Err(ProjectCheck::Unsupported); }
-    let real_input = module_bool_initializer || actual.real_integer_input_profile(expected, collection.is_some());
+    let named_literal = matches!(expected, ScalarType::Bool | ScalarType::Char)
+        && actual.named_literal_initializer(topology, occurrence, expected, collection.is_some());
+    let named_character = *expected == ScalarType::Char && named_literal;
+    let module_bool_initializer = (*expected == ScalarType::Bool && named_literal)
+        || actual.real_module_boolean_initializer(expected, collection.is_some());
+    if (*expected == ScalarType::Bool && !module_bool_initializer)
+        || (*expected == ScalarType::Char && !named_character)
+    { return Err(ProjectCheck::Unsupported); }
+    let real_input = named_character || module_bool_initializer
+        || actual.real_integer_input_profile(expected, collection.is_some());
     #[cfg(feature = "internal-checker")]
     let named_bool_entry = collection.is_some() && is_integer_type(expected) && proof_site.is_some()
         && named_exact_mixed_pair(&signature.parameters, |ty| ty)
@@ -1840,7 +1851,7 @@ fn run_initializer_call<'a, Observer: ActualIntegerObserver>(
             actual.observer.named_exact_watch(target).is_some_and(|watch| !watch.citation));
     #[cfg(not(feature = "internal-checker"))]
     let named_bool_entry = false;
-    let allow_bool = named_boolean || named_bool_entry || ((real_input || *expected == ScalarType::Unit)
+    let allow_bool = named_literal || named_bool_entry || ((real_input || *expected == ScalarType::Unit)
         && collection.is_some() && Observer::ORDINARY_INTEGER_LOCALS);
     #[cfg(feature = "internal-checker")]
     let fixed_array = actual.can_initialize_fixed_arrays() && collection.is_some() && proof_site.is_some()
@@ -1858,6 +1869,13 @@ fn run_initializer_call<'a, Observer: ActualIntegerObserver>(
             .ok_or(ProjectCheck::Unsupported)?;
         ActualProjectedArguments::ExactPair(first, second)
     } else {
+        #[cfg(feature = "internal-checker")]
+        let argument = if named_character {
+            super::checker_flow::exact_named_character_argument_at(&topology.structure, occurrence, initialized_argument)
+        } else {
+            exact_typed_call_argument_at(&topology.structure, occurrence, 0, allow_bool, initialized_argument)
+        };
+        #[cfg(not(feature = "internal-checker"))]
         let argument = exact_typed_call_argument_at(&topology.structure, occurrence, 0, allow_bool, initialized_argument);
         if *expected != ScalarType::Unit && argument.is_none() {
             return Err(ProjectCheck::Unsupported);
@@ -1872,6 +1890,8 @@ fn run_initializer_call<'a, Observer: ActualIntegerObserver>(
 
 enum InitializerValue<'a> {
     Boolean(bool),
+    #[cfg(feature = "internal-checker")]
+    Character(BigInt),
     Integer { ty: &'a ScalarType, value: Cow<'a, BigInt> },
     #[cfg(feature = "internal-checker")]
     FixedArray { ty: &'a ScalarType, cells: Vec<BigInt> },
@@ -1931,6 +1951,13 @@ fn initialized_scalar_initializer_argument<'a>(
         static BOOL_VALUES: std::sync::LazyLock<[BigInt; 2]> =
             std::sync::LazyLock::new(|| [BigInt::from(0u8), BigInt::from(1u8)]);
         return BOOL_VALUES.get(usize::from(*value));
+    }
+    #[cfg(feature = "internal-checker")]
+    if *argument_type == ScalarType::Char {
+        let InitializationName::Storage(InitializationStorage::Module(span)) =
+            topology.identities.names.get(&argument)? else { return None; };
+        let InitializerValue::Character(value) = storage.get(span)? else { return None; };
+        return Some(value);
     }
     initialized_integer_argument(topology, storage, argument, argument_type)
 }
@@ -2029,7 +2056,7 @@ struct NamedExactWatch {
     citation: bool,
     case_citation: bool,
     qualified_leaf: bool,
-    boolean_leaf: bool,
+    literal_leaf: Option<ProofLiteralType>,
 }
 
 #[cfg(feature = "internal-checker")]
@@ -2137,6 +2164,9 @@ trait ActualIntegerObserver {
     fn watches_fixed_array(&self, _: PreparedCallable) -> bool { false }
 
     #[cfg(feature = "internal-checker")]
+    fn enables_character_initializers(&self) -> bool { false }
+
+    #[cfg(feature = "internal-checker")]
     fn observe_fixed_array_initializer(
         &mut self, _: PreparedCallable, _: &FunctionCallSites,
         _: &[&BigInt], _: wosy_syntax::SourceSpan,
@@ -2211,15 +2241,17 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
         ACTUAL_STARTUP && Observer::FIXED_ARRAY_INITIALIZERS
     }
 
-    fn named_boolean_initializer(&self, topology: &ModuleInitializationTopology, call: OccurrenceOrdinal, collecting: bool) -> bool {
+    fn named_literal_initializer(
+        &self, topology: &ModuleInitializationTopology, call: OccurrenceOrdinal, expected: &ScalarType, collecting: bool,
+    ) -> bool {
         #[cfg(feature = "internal-checker")]
         {
             ACTUAL_STARTUP && collecting && topology.structure.checker_direct_targets.get(&call)
                 .and_then(|&target| self.observer.named_exact_watch(target))
-                .is_some_and(|watch| watch.boolean_leaf)
+                .and_then(|watch| watch.literal_leaf).is_some_and(|leaf| leaf.ty() == expected)
         }
         #[cfg(not(feature = "internal-checker"))]
-        { let _ = (topology, call, collecting); false }
+        { let _ = (topology, call, expected, collecting); false }
     }
 
     fn nested(
@@ -3149,7 +3181,8 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
         #[cfg(feature = "internal-checker")]
         let named_watch = if ACTUAL_STARTUP { self.observer.named_exact_watch(target) } else { None };
         #[cfg(feature = "internal-checker")]
-        let named_boolean = if let Some(watch) = named_watch.filter(|watch| watch.boolean_leaf && *expected == ScalarType::Bool) {
+        let named_literal = if let Some((watch, leaf)) = named_watch.and_then(|watch| watch.literal_leaf
+            .filter(|leaf| leaf.ty() == expected).map(|leaf| (watch, leaf))) {
             let Some(InitializerProofSite {
                 source, call: InitializerProofOrigin::Direct { topology, occurrence, .. },
             }) = proof_site.as_ref() else { return Err(ProjectCheck::Unsupported); };
@@ -3161,10 +3194,8 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             let work = body.occurrences.len().checked_add(watch.nested_work)
                 .and_then(|work| work.checked_add(1)).ok_or(ProjectCheck::Unsupported)?;
             self.observer.charge_named_exact_work(work).ok_or(ProjectCheck::Unsupported)?;
-            true
-        } else { false };
-        #[cfg(not(feature = "internal-checker"))]
-        let named_boolean = false;
+            Some(leaf)
+        } else { None };
         #[cfg(feature = "internal-checker")]
         let named_reached = named_watch.is_some()
             && collection.is_some_and(|(source, _)| source == &owner.source) && named_outer.is_some()
@@ -3310,6 +3341,15 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             return Err(ProjectCheck::Unsupported);
         }
         self.active_depth += 1;
+        #[cfg(feature = "internal-checker")]
+        let exact_literal = named_literal.map(|leaf| {
+            let value = super::checker_flow::exact_named_literal_return_at_entry(body, expected, exact)
+                .ok_or(ProjectCheck::Unsupported)?;
+            leaf.from_atom(&value).ok_or(ProjectCheck::Unsupported)?;
+            Ok(ActualCallResult::Integer(value))
+        });
+        #[cfg(not(feature = "internal-checker"))]
+        let exact_literal = None;
         let result = if fixed_array {
             #[cfg(feature = "internal-checker")]
             {
@@ -3319,12 +3359,8 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             }
             #[cfg(not(feature = "internal-checker"))]
             unreachable!()
-        } else if named_boolean {
-            #[cfg(feature = "internal-checker")]
-            { super::checker_flow::exact_named_boolean_return_at_entry(body, exact)
-                .map(ActualCallResult::Integer).ok_or(ProjectCheck::Unsupported) }
-            #[cfg(not(feature = "internal-checker"))]
-            unreachable!()
+        } else if let Some(result) = exact_literal {
+            result
         } else if named_reached {
             self.run_exact_calls::<true>(body, &owner.source, exact, expected, collection, named_outer)
         } else if *expected == ScalarType::Unit {
@@ -4545,7 +4581,7 @@ pub struct MainFlowProofInvocation {
     pub directive_position: usize,
     pub arguments: Vec<(ScalarType, BigInt)>,
     pub returned: BigInt,
-    pub returned_boolean: Option<bool>,
+    pub returned_literal: Option<ScalarCheckerProofLiteral>,
 }
 
 #[cfg(feature = "internal-checker")]
@@ -4560,7 +4596,7 @@ pub struct SymbolicProofDiagnostic {
     pub directive_position: usize,
     pub witness: ScalarCheckerIntegerWitness,
     pub returned: BigInt,
-    pub returned_boolean: Option<bool>,
+    pub returned_literal: Option<ScalarCheckerProofLiteral>,
 }
 
 #[cfg(feature = "internal-checker")]
@@ -4822,8 +4858,8 @@ impl SelectedSymbolicProof<'_, '_> {
                 }).collect(),
                 state: failure.state,
             },
-            returned_boolean: proof.boolean_leaf.then(|| super::checker_flow::bool_result_lane(&failure.returned)).flatten()
-                .map(|lane| lane == 1),
+            returned_literal: proof.literal_leaf.map(|leaf| leaf.from_atom(&failure.returned)
+                .ok_or(ProjectCheck::Unsupported)).transpose()?,
             returned: failure.returned,
         };
         if hidden { diagnostic.witness.remove_snapshot_axes(&mut self.snapshot_work).ok_or(ProjectCheck::Unsupported)?; }
@@ -4838,7 +4874,7 @@ impl SelectedSymbolicProof<'_, '_> {
 
 #[cfg(feature = "internal-checker")]
 impl SelectedSymbolicProof<'_, '_> {
-    fn verify_boolean(
+    fn verify_literal_leaf(
         &mut self, group: &MainFlowProofTarget<'_>, calls: &FunctionCallSites, function: &ScalarFunction,
         source: &SourceIdentity, effects: &mut OrderedFailures,
     ) -> Result<Option<bool>, ProjectCheck> {
@@ -4867,7 +4903,7 @@ impl SelectedSymbolicProof<'_, '_> {
         let mut checks = Vec::with_capacity(count.checked_mul(2).ok_or(ProjectCheck::Unsupported)?);
         for &(proof, step) in &checked {
             // This profile does not synthesize a wider guard or issue a
-            // Boolean summary from unrelated return contexts.
+            // summary from unrelated return contexts.
             let guard_work = proof.filter.iter().chain(common).try_fold(0usize, |work, predicate| {
                 work.checked_add(match predicate {
                     CheckerPredicate::EntryDomain { values, .. } => values.interval_count().checked_add(1)?,
@@ -4883,7 +4919,8 @@ impl SelectedSymbolicProof<'_, '_> {
                 relation: proof.relation, bound: proof.bound.literal().ok_or(ProjectCheck::Unsupported)?, failure: None,
             });
         }
-        let applicable = collect_closed_literal_proofs(calls, &function.body, &ScalarType::Bool, common, &mut checks)
+        let leaf = group.literal_leaf.ok_or(ProjectCheck::Unsupported)?;
+        let applicable = collect_closed_literal_proofs(calls, &function.body, leaf.ty(), common, &mut checks)
             .ok_or(ProjectCheck::Unsupported)?;
         let mut returned = checks.into_iter();
         for (proof, step) in checked {
@@ -5492,10 +5529,10 @@ impl SymbolicRootProof for SelectedSymbolicProof<'_, '_> {
         }
     }
 
-    fn watches_boolean_return(&self, target: PreparedCallable) -> bool {
+    fn watches_literal_leaf(&self, target: PreparedCallable) -> bool {
         let group = if self.watched.first.0 == target { Some(&self.watched.first.1) }
             else { self.watched.other.get(&target) };
-        group.is_some_and(|group| group.boolean_leaf)
+        group.is_some_and(|group| group.literal_leaf.is_some())
     }
 
     fn try_collect(
@@ -5511,8 +5548,8 @@ impl SymbolicRootProof for SelectedSymbolicProof<'_, '_> {
         } else {
             return self.equalities.consume(target, calls, source, effects);
         };
-        if group.boolean_leaf {
-            return self.verify_boolean(group, calls, function, source, effects);
+        if group.literal_leaf.is_some() {
+            return self.verify_literal_leaf(group, calls, function, source, effects);
         }
         if let Some(cohort) = &group.case_citations {
             let MainFlowProofCases::Authored(cases) = &group.cases else { return Err(ProjectCheck::Unsupported); };
@@ -5966,7 +6003,7 @@ struct MainFlowProofCase<'a> {
     relation: IntegerRelation,
     bound: MainFlowProofBound<'a>,
     qualified_leaf: bool,
-    boolean_leaf: bool,
+    literal_leaf: Option<ProofLiteralType>,
 }
 
 #[cfg(feature = "internal-checker")]
@@ -6083,9 +6120,9 @@ impl<'a> MainFlowProofCase<'a> {
         catalog: Option<&PublicProofCatalog<'a>>,
     ) -> Result<MainFlowProofPlan<'a>, ProjectCheck> {
         let body = plan.typed.body;
-        let boolean_leaf = *plan.typed.result_type == ScalarType::Bool;
-        if boolean_leaf {
-            if citation.is_some() || !pure_boolean_proof_leaf(body) { return Err(ProjectCheck::Unsupported); }
+        let literal_leaf = ProofLiteralType::of(plan.typed.result_type);
+        if let Some(leaf) = literal_leaf {
+            if citation.is_some() || !pure_literal_proof_leaf(body, leaf) { return Err(ProjectCheck::Unsupported); }
             match (plan.steps.items.as_slice(), plan.steps.terminated_items.as_slice()) {
                 ([], []) => {}
                 ([step], [true]) => { proof_show_expression(step, true)?; }
@@ -6126,10 +6163,10 @@ impl<'a> MainFlowProofCase<'a> {
             Ok((super::typecheck::expression_span(expression), proof_show_expression(step, true)?))
         };
         let checked_literal = |claim: &'a ScalarExpression| {
-            if boolean_leaf {
-                let value = checked_boolean_claim(claim, &plan.typed.output).ok_or(ProjectCheck::Unsupported)?;
-                let equal = IntegerRelation::from_operator(&BinaryOperator::Equal).ok_or(ProjectCheck::Unsupported)?;
-                return Ok((equal, Cow::Owned(BigInt::from(u8::from(value)))));
+            if let Some(leaf) = literal_leaf {
+                let (operator, atom) = leaf.claim(claim, &plan.typed.output).ok_or(ProjectCheck::Unsupported)?;
+                let relation = IntegerRelation::from_operator(&operator).ok_or(ProjectCheck::Unsupported)?;
+                return Ok((relation, Cow::Owned(atom)));
             }
             let comparison = IntegerComparison::from_expression(claim).ok_or(ProjectCheck::Unsupported)?;
             let (_, shown, literal) = checked_literal_output_goal_borrowed(
@@ -6239,15 +6276,16 @@ impl<'a> MainFlowProofCase<'a> {
         let body = plan.typed.body;
         let named_mixed = named_exact_mixed_pair(&body.boundary.parameters, |entry| &entry.ty)
             && citation_safe_calling_body(body);
-        let guard = if boolean_leaf {
-            let bool_parameter = body.boundary.parameters.first().is_some_and(|parameter| parameter.ty == ScalarType::Bool);
-            checked_scalar_guard_slots::<true>(body, filter, bool_parameter, true)
+        let guard = if literal_leaf.is_some() {
+            let categorical_parameter = body.boundary.parameters.first()
+                .is_some_and(|parameter| matches!(parameter.ty, ScalarType::Bool | ScalarType::Char));
+            checked_scalar_guard_slots::<true>(body, filter, categorical_parameter, true)
         } else { checked_scalar_guard_slots::<false>(body, filter, named_mixed, false) }
             .ok_or(ProjectCheck::Unsupported)?;
         let goal = child(&child(plan.proof, SyntaxKind::ProofEnsures)?, SyntaxKind::Expression)?;
         Ok((Self {
             proof_source: plan.proof_source, proof: wosy_syntax::byte_span(plan.proof),
-            goal: wosy_syntax::byte_span(&goal), guard, filter, relation: *relation, bound, qualified_leaf, boolean_leaf,
+            goal: wosy_syntax::byte_span(&goal), guard, filter, relation: *relation, bound, qualified_leaf, literal_leaf,
         }, step))
     }
 }
@@ -6293,7 +6331,7 @@ impl<'a> SymbolicSummaryIssuer<'a> {
         (proof, authored): &MainFlowProofPlan<'a>,
     ) -> Option<Self> {
         if scope == ScalarCheckerScope::MainFlowOnly || authored.is_some() || proof.qualified_leaf
-            || proof.boolean_leaf || proof.guard.always_rejects
+            || proof.literal_leaf.is_some() || proof.guard.always_rejects
             || proof.guard.domain.is_some()
         {
             return None;
@@ -6393,7 +6431,7 @@ struct MainFlowProofTarget<'a> {
     cases: MainFlowProofCases<'a>,
     issuer: Option<SymbolicSummaryIssuer<'a>>,
     seen: bool,
-    boolean_leaf: bool,
+    literal_leaf: Option<ProofLiteralType>,
 }
 
 #[cfg(feature = "internal-checker")]
@@ -6431,7 +6469,7 @@ impl<'a> MainFlowProofTarget<'a> {
             citation: self.citation_output_type.is_some(),
             case_citation: self.has_case_citations,
             qualified_leaf: self.qualified_leaf,
-            boolean_leaf: self.boolean_leaf,
+            literal_leaf: self.literal_leaf,
         }
     }
 
@@ -6440,14 +6478,14 @@ impl<'a> MainFlowProofTarget<'a> {
         let has_case_citations = matches!(&step, Some(MainFlowAuthoredShows::Cases(steps)) if steps.has_citations());
         let nested_observation_work = Self::nested_case_work(&first, step.as_ref());
         let qualified_leaf = first.qualified_leaf;
-        let boolean_leaf = first.boolean_leaf;
+        let literal_leaf = first.literal_leaf;
         let cases = if let Some(step) = step {
             MainFlowProofCases::Authored(vec![(first, Some(step))])
         } else {
             MainFlowProofCases::Bare { first, rest: Vec::new() }
         };
         Self { citation_output_type, exact_citations: None, has_case_citations, case_citations: None,
-            qualified_leaf, boolean_leaf, nested_observation_work, cases, issuer: None, seen: false }
+            qualified_leaf, literal_leaf, nested_observation_work, cases, issuer: None, seen: false }
     }
 
     fn compile_exact_citations(&mut self, work: &mut usize) -> Result<(), ProjectCheck> {
@@ -6471,6 +6509,7 @@ struct MainFlowProofObserver<'a> {
     first: ((usize, usize), MainFlowProofTarget<'a>),
     other: HashMap<(usize, usize), MainFlowProofTarget<'a>>,
     pure_affine_target: Option<PreparedCallable>,
+    character_initializers: bool,
     named_exact_work: usize,
     active: bool,
     incomplete: bool,
@@ -6481,6 +6520,7 @@ struct MainFlowProofObserver<'a> {
 impl<'a> MainFlowProofObserver<'a> {
     fn new(target: (usize, usize), first: MainFlowProofPlan<'a>) -> Self {
         Self {
+            character_initializers: first.0.literal_leaf == Some(ProofLiteralType::Character),
             first: (target, MainFlowProofTarget::new(first)), other: HashMap::new(),
             pure_affine_target: None, named_exact_work: 0, active: false, incomplete: false, diagnostics: Vec::new(),
         }
@@ -6510,7 +6550,7 @@ impl<'a> MainFlowProofObserver<'a> {
     }
 
     fn eligible_pure_affine_case(plan: &PlannedModuleProof<'_>, proof: &MainFlowProofPlan<'_>) -> bool {
-        plan.steps.items.is_empty() && plan.typed.measure.is_none() && !proof.0.boolean_leaf
+        plan.steps.items.is_empty() && plan.typed.measure.is_none() && proof.0.literal_leaf.is_none()
             && ((matches!(&plan.typed.goal, TypedProofGoal::Literal { .. })
                 && matches!(proof.0.filter, [] | [CheckerPredicate::Boolean(true) | CheckerPredicate::Integer(_)]))
                 || (matches!(&plan.typed.goal, TypedProofGoal::EntryAffine { .. } | TypedProofGoal::EntryComparison { .. })
@@ -6519,6 +6559,7 @@ impl<'a> MainFlowProofObserver<'a> {
 
     fn insert(&mut self, scope: ScalarCheckerScope, allow_issuer: bool, plan: &PlannedModuleProof<'a>, proof: MainFlowProofPlan<'a>) {
         let target = plan.target;
+        self.character_initializers |= proof.0.literal_leaf == Some(ProofLiteralType::Character);
         if self.pure_affine_target != Some(target) || !Self::eligible_pure_affine_case(plan, &proof)
             || !matches!(&self.first.1.cases, MainFlowProofCases::Bare { first, .. } if first.filter == proof.0.filter)
         {
@@ -6570,7 +6611,7 @@ impl<'a> MainFlowProofObserver<'a> {
         // same-package nested edge to the exact proof declaration. An
         // unused-root proof cannot replace such a call context.
         if std::iter::once((&self.first.0, &self.first.1)).chain(&self.other)
-            .any(|(&target, group)| (group.qualified_leaf || group.has_case_citations || group.boolean_leaf) && calls.has_nested_proof_use(target))
+            .any(|(&target, group)| (group.qualified_leaf || group.has_case_citations || group.literal_leaf.is_some()) && calls.has_nested_proof_use(target))
         {
             return Err(ProjectCheck::Unsupported);
         }
@@ -6650,8 +6691,13 @@ impl ActualIntegerObserver for MainFlowProofObserver<'_> {
                     directive_position,
                     arguments: parameters.iter().cloned().zip(arguments.iter().map(|value| (**value).clone())).collect(),
                     returned: value.clone(),
-                    returned_boolean: proof.boolean_leaf.then(|| super::checker_flow::bool_result_lane(value)).flatten()
-                        .map(|lane| lane == 1),
+                    returned_literal: match proof.literal_leaf {
+                        Some(leaf) => {
+                            let Some(literal) = leaf.from_atom(value) else { return false; };
+                            Some(literal)
+                        }
+                        None => None,
+                    },
                 });
                 invocation = Some(Rc::clone(&invoked));
                 invoked
@@ -6927,6 +6973,10 @@ impl ActualIntegerObserver for NamedOrderedEvidence<'_> {
         self.observed.named_exact_watch(target)
     }
 
+    fn enables_character_initializers(&self) -> bool {
+        self.observed.character_initializers
+    }
+
     fn permits_named_pure_affine_return(&self, target: PreparedCallable, arguments: &[&BigInt]) -> bool {
         self.observed.permits_named_pure_affine_return(target, arguments)
     }
@@ -7083,7 +7133,7 @@ impl SymbolicRootProof for RankedOrderedSymbolic<'_, '_> {
                         state: IntegerInputs::entry_point(earlier.map(|(_, value)| value), &base.entry),
                     },
                     returned: base.returned.clone(),
-                    returned_boolean: None,
+                    returned_literal: None,
                 });
                 Ok(Some(true))
             }
@@ -7127,7 +7177,11 @@ impl ActualIntegerObserver for MixedOrderedEvidence<'_, '_> {
     fn observe(&mut self, _: PreparedCallable, _: &[&BigInt], _: &BigInt) {}
 
     fn named_exact_watch(&self, target: PreparedCallable) -> Option<NamedExactWatch> {
-        self.bare.as_ref()?.named_exact_watch(target).filter(|watch| watch.boolean_leaf)
+        self.bare.as_ref()?.named_exact_watch(target).filter(|watch| watch.literal_leaf.is_some())
+    }
+
+    fn enables_character_initializers(&self) -> bool {
+        self.bare.as_ref().is_some_and(ActualIntegerObserver::enables_character_initializers)
     }
 
     fn charge_named_exact_work(&mut self, cost: usize) -> Option<()> {
@@ -7202,8 +7256,8 @@ impl SymbolicRootProof for MixedOrderedSymbolic<'_, '_, '_> {
         }
     }
 
-    fn watches_boolean_return(&self, target: PreparedCallable) -> bool {
-        self.bare.as_ref().is_some_and(|bare| bare.watches_boolean_return(target))
+    fn watches_literal_leaf(&self, target: PreparedCallable) -> bool {
+        self.bare.as_ref().is_some_and(|bare| bare.watches_literal_leaf(target))
     }
 
     fn try_collect(
@@ -8520,7 +8574,7 @@ impl PreparedProofModule {
         let typed = typed_proof_postcondition::<ALLOW_INDUCTION, DEFER_OUTPUT_UNION>(
             proof.owner, function, proof.body, proof.node, &steps, !DEFER_OUTPUT_UNION,
         )?;
-        if *typed.result_type == ScalarType::Bool
+        if matches!(typed.result_type, ScalarType::Bool | ScalarType::Char)
             && proof.node.children().find(|node| node.kind() == SyntaxKind::ProofWhere)
                 .is_some_and(|clause| clause.descendants().take(MAX_ACTUAL_CALL_DEPTH + 1).count() > MAX_ACTUAL_CALL_DEPTH)
         {
@@ -8528,7 +8582,8 @@ impl PreparedProofModule {
         }
         let filter = prepare_proof_entry_filter_in_scope(
             proof.node, proof_source, typed.target.target_layout, &typed.input_names, typed.body,
-            *typed.result_type == ScalarType::Bool || typed.measure.is_some() || (ALLOW_DOMAIN && steps.items.is_empty()),
+            matches!(typed.result_type, ScalarType::Bool | ScalarType::Char)
+                || typed.measure.is_some() || (ALLOW_DOMAIN && steps.items.is_empty()),
         )?;
         Ok(PlannedModuleProof {
             proof_source, proof: proof.node, canonical_target: proof.target, target: (module, item),
@@ -10841,11 +10896,77 @@ fn checked_boolean_claim(expression: &ScalarExpression, name: &str) -> Option<bo
 }
 
 #[cfg(feature = "internal-checker")]
-fn pure_boolean_proof_leaf(body: &FunctionCallSites) -> bool {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[doc(hidden)]
+pub enum ScalarCheckerProofLiteral {
+    Boolean(bool),
+    Character(char),
+}
+
+#[cfg(feature = "internal-checker")]
+impl ScalarCheckerProofLiteral {
+    pub fn from_atom(ty: &ScalarType, atom: &BigInt) -> Option<Self> {
+        ProofLiteralType::of(ty)?.from_atom(atom)
+    }
+}
+
+#[cfg(feature = "internal-checker")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProofLiteralType {
+    Boolean,
+    Character,
+}
+
+#[cfg(feature = "internal-checker")]
+impl ProofLiteralType {
+    fn of(ty: &ScalarType) -> Option<Self> {
+        match ty {
+            ScalarType::Bool => Some(Self::Boolean),
+            ScalarType::Char => Some(Self::Character),
+            _ => None,
+        }
+    }
+
+    fn ty(self) -> &'static ScalarType {
+        match self {
+            Self::Boolean => &ScalarType::Bool,
+            Self::Character => &ScalarType::Char,
+        }
+    }
+
+    fn from_atom(self, value: &BigInt) -> Option<ScalarCheckerProofLiteral> {
+        Some(match self {
+            Self::Boolean => ScalarCheckerProofLiteral::Boolean(super::checker_flow::bool_result_lane(value)? == 1),
+            Self::Character => ScalarCheckerProofLiteral::Character(char::from_u32(u32::try_from(value).ok()?)?),
+        })
+    }
+
+    fn claim(self, expression: &ScalarExpression, name: &str) -> Option<(BinaryOperator, BigInt)> {
+        match self {
+            Self::Boolean => Some((BinaryOperator::Equal, BigInt::from(u8::from(checked_boolean_claim(expression, name)?)))),
+            Self::Character => {
+                if is_null_literal_name(name) { return None; }
+                let ScalarExpression::Binary { operator: operator @ (BinaryOperator::Equal | BinaryOperator::NotEqual), left, right, .. } =
+                    expression else { return None; };
+                let atom = match (left.as_ref(), right.as_ref()) {
+                    (ScalarExpression::Name { name: found, .. }, ScalarExpression::Char { value, .. })
+                    | (ScalarExpression::Char { value, .. }, ScalarExpression::Name { name: found, .. })
+                        if found == name => BigInt::from(u32::from(*value)),
+                    _ => return None,
+                };
+                Some((operator.clone(), atom))
+            }
+        }
+    }
+}
+
+#[cfg(feature = "internal-checker")]
+fn pure_literal_proof_leaf(body: &FunctionCallSites, leaf: ProofLiteralType) -> bool {
     let structure = &body.structure;
-    matches!(body.boundary.results.as_slice(), [result] if result.ty == ScalarType::Bool)
+    matches!(body.boundary.results.as_slice(), [result] if &result.ty == leaf.ty())
         && matches!(body.boundary.parameters.as_slice(), [] | [_])
-        && body.boundary.parameters.iter().all(|parameter| parameter.ty == ScalarType::Bool || is_integer_type(&parameter.ty))
+        && body.boundary.parameters.iter().all(|parameter| parameter.ty == ScalarType::Bool || is_integer_type(&parameter.ty)
+            || (leaf == ProofLiteralType::Character && parameter.ty == ScalarType::Char))
         && body.call_occurrences.is_empty() && structure.checker_direct_targets.is_empty()
         && body.assignments.is_empty() && body.allocation_length_calls.is_empty() && body.arms.is_empty()
         && structure.checker_directives.is_empty() && structure.checker_contextual_occurrences.is_empty()
@@ -10870,7 +10991,7 @@ fn typed_proof_postcondition<'a, const AUDIT_INDUCTION: bool, const DEFER_OUTPUT
     #[cfg_attr(not(feature = "internal-checker"), allow(unused_variables))] allow_named_entry_facts: bool,
 ) -> Result<TypedProofPostcondition<'a>, ProjectCheck> {
     let pattern = child(declaration, SyntaxKind::ProofTarget)?;
-    let input_names = if matches!(body.boundary.results.as_slice(), [result] if result.ty == ScalarType::Bool) {
+    let input_names = if matches!(body.boundary.results.as_slice(), [result] if matches!(result.ty, ScalarType::Bool | ScalarType::Char)) {
         proof_input_names(&pattern)?
     } else {
         identifiers(&child(&pattern, SyntaxKind::Parameters)?).collect::<Vec<_>>()
@@ -10898,11 +11019,11 @@ fn typed_proof_postcondition<'a, const AUDIT_INDUCTION: bool, const DEFER_OUTPUT
     let ([result], [output]) = (boundary.results.as_slice(), output_names.as_slice()) else {
         return Err(ProjectCheck::Unsupported);
     };
-    if !is_integer_type(&result.ty) && result.ty != ScalarType::Bool {
+    if !is_integer_type(&result.ty) && !matches!(result.ty, ScalarType::Bool | ScalarType::Char) {
         return Err(ProjectCheck::Unsupported);
     }
     let mut foralls = declaration.children().filter(|node| node.kind() == SyntaxKind::ProofForall);
-    let goal = if result.ty == ScalarType::Bool {
+    let goal = if matches!(result.ty, ScalarType::Bool | ScalarType::Char) {
         #[cfg(feature = "internal-checker")]
         {
             if !allow_named_entry_facts || measure.is_some() || exists.is_some() || foralls.next().is_some() {
@@ -10912,10 +11033,10 @@ fn typed_proof_postcondition<'a, const AUDIT_INDUCTION: bool, const DEFER_OUTPUT
             if expression.descendants().take(MAX_ACTUAL_CALL_DEPTH + 1).count() > MAX_ACTUAL_CALL_DEPTH {
                 return Err(ProjectCheck::Unsupported);
             }
-            let value = checked_boolean_claim(&derive_expression(&expression), output).ok_or(ProjectCheck::Unsupported)?;
-            let operator = BinaryOperator::Equal;
+            let (operator, bound) = ProofLiteralType::of(&result.ty)
+                .and_then(|leaf| leaf.claim(&derive_expression(&expression), output)).ok_or(ProjectCheck::Unsupported)?;
             let relation = IntegerRelation::from_operator(&operator).ok_or(ProjectCheck::Unsupported)?;
-            TypedProofGoal::Literal { operator, relation, bound: BigInt::from(u8::from(value)) }
+            TypedProofGoal::Literal { operator, relation, bound }
         }
         #[cfg(not(feature = "internal-checker"))]
         return Err(ProjectCheck::Unsupported);
@@ -11405,7 +11526,7 @@ fn proof_input_condition<const VERIFY_LITERAL_FIT: bool>(
     }
     #[cfg(feature = "internal-checker")]
     if !VERIFY_LITERAL_FIT && matches!(body.boundary.parameters.as_slice(), [parameter] if parameter.ty == ScalarType::Bool)
-        && matches!(body.boundary.results.as_slice(), [result] if result.ty == ScalarType::Bool)
+        && matches!(body.boundary.results.as_slice(), [result] if matches!(result.ty, ScalarType::Bool | ScalarType::Char))
     {
         if let [name] = inputs {
             if let Some(value) = checked_boolean_claim(expression, name) {
@@ -11413,6 +11534,22 @@ fn proof_input_condition<const VERIFY_LITERAL_FIT: bool>(
                     else { return Err(ProjectCheck::Unsupported); };
                 return Ok(CheckerPredicate::EntryDomain {
                     binding: binding.clone(), values: IntegerSet::singleton(&BigInt::from(u8::from(value != negated))),
+                });
+            }
+        }
+    }
+    #[cfg(feature = "internal-checker")]
+    if !VERIFY_LITERAL_FIT && matches!(body.boundary.parameters.as_slice(), [parameter] if parameter.ty == ScalarType::Char)
+        && matches!(body.boundary.results.as_slice(), [result] if result.ty == ScalarType::Char)
+    {
+        if let [name] = inputs {
+            if let Some((operator, atom)) = ProofLiteralType::Character.claim(expression, name) {
+                let [binding] = body.boundary.checker_parameter_bindings.as_deref().ok_or(ProjectCheck::Unsupported)?
+                    else { return Err(ProjectCheck::Unsupported); };
+                let relation = IntegerRelation::from_operator(&operator).ok_or(ProjectCheck::Unsupported)?;
+                let relation = if negated { relation.complement() } else { relation };
+                return Ok(CheckerPredicate::EntryDomain {
+                    binding: binding.clone(), values: IntegerSet::ordinary_character_domain().keep_relation(relation, &atom),
                 });
             }
         }
@@ -15001,7 +15138,7 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
             proof_source: &app, proof: span, goal: span, filter: &[],
             guard: CheckedIntegerGuardSlots { arity: 1, always_rejects: false, boolean: [None; 2], comparisons: Vec::new(), domain: None },
             relation: IntegerRelation::from_operator(&BinaryOperator::LessEqual).unwrap(), bound: MainFlowProofBound::Literal(&bound),
-            qualified_leaf: false, boolean_leaf: false,
+            qualified_leaf: false, literal_leaf: None,
         }, None));
         let effects = OrderedFailures::default();
         observer.observe_initializer(
@@ -17555,12 +17692,103 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
             assert!(failed.directives.is_empty() && failed.symbolic_diagnostic.is_none());
             assert!(first.invocation.call.range.start < duplicate.invocation.call.range.start);
             for failure in [first, duplicate] {
-                assert_eq!(failure.invocation.returned_boolean, Some(true));
+                assert_eq!(failure.invocation.returned_literal, Some(ScalarCheckerProofLiteral::Boolean(true)));
                 assert_eq!(failure.invocation.arguments, [(ScalarType::Bool, BigInt::from(1))]);
                 let span = failure.invocation.call.range;
                 assert_eq!(&broken[span.start as usize..span.end as usize], "identity(true)");
             }
         }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn character_return_proofs_use_exact_startup_values_in_a_mixed_catalog() {
+        use super::super::checker_flow::take_integer_observations;
+        let text = r#"%%start
+            char(char) identity = fn(letter) { letter };
+            char() accent = fn { 'é' };
+            bool() ready = fn { true };
+            u8[1]() make = fn { [7] };
+            proof crab for identity(entry) -> (out) where (entry == '🦀') ensures (out == '🦀') {}
+            proof accented for accent() -> (out) ensures ('é' == out) {}
+            proof readiness for ready() -> (out) ensures (out) {}
+            proof cells for make() -> (items) forall (u64 i where i == 0) ensures (items[i] == 7) {}
+            char prepared = '🦀';
+            char first = identity(prepared);
+            char outside = identity('β');
+            char duplicate = identity(first);
+            char marked = accent();
+            bool yes = ready();
+            u8[1] data = make();
+        %%end"#;
+        let bad = text.replace("out == '🦀'", "out != '🦀'");
+        let _ = take_integer_observations();
+        for scope in [ScalarCheckerScope::MainFlowOnly, ScalarCheckerScope::CurrentPackage] {
+            let result = check_array_proof_cohort(text, scope).unwrap();
+            assert_eq!(take_integer_observations(), (0, 5));
+            assert!(result.active && result.directives.is_empty() && result.diagnostics.is_empty());
+            assert!(result.aggregate_diagnostics.is_empty() && result.symbolic_diagnostic.is_none());
+
+            let result = check_array_proof_cohort(&bad, scope).unwrap();
+            assert_eq!(take_integer_observations(), (0, 5));
+            let [first, duplicate] = result.diagnostics.as_slice() else { panic!("two reached calls inside the proof guard"); };
+            assert!(result.aggregate_diagnostics.is_empty() && result.symbolic_diagnostic.is_none());
+            for (failure, call) in [(first, "identity(prepared)"), (duplicate, "identity(first)")] {
+                assert_eq!(failure.invocation.returned_literal, Some(ScalarCheckerProofLiteral::Character('🦀')));
+                assert_eq!(failure.invocation.arguments, [(ScalarType::Char, BigInt::from(u32::from('🦀')))]);
+                let span = failure.invocation.call.range;
+                assert_eq!(&bad[span.start as usize..span.end as usize], call);
+            }
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn character_return_proofs_retain_typed_symbolic_counterexamples_and_guard_scope() {
+        let text = r#"%%start
+            char(char) identity = fn(letter) { letter };
+            char(i8) tone = fn(mark) { if (mark == 1) { 'β' } else { 'a' } };
+            proof valid for identity(entry) -> (out) where (entry != '\0') ensures (out != '\0')
+                { core.show('\0' != out); }
+            proof nonzero for identity(entry) -> (out) where (entry != '\0') ensures (out != '\0') {}
+            proof selected for tone(entry) -> (out) where (entry == 1) ensures (out == 'β') {}
+        %%end"#;
+        let declared = ScalarCheckerScope::CurrentPackage;
+        let proved = check_array_proof_cohort(text, declared).unwrap();
+        assert!(proved.active && proved.symbolic_diagnostic.is_none());
+
+        let bad = text.replace(r"core.show('\0' != out)", "core.show('β' != out)")
+            .replace(r"proof nonzero for identity(entry) -> (out) where (entry != '\0') ensures (out != '\0')",
+                r"proof nonzero for identity(entry) -> (out) where (entry != '\0') ensures (out != 'β')");
+        let failed = check_array_proof_cohort(&bad, declared).unwrap();
+        let first = failed.symbolic_diagnostic.unwrap();
+        let [second] = failed.additional_symbolic_diagnostics.as_slice() else { panic!("one failure per proof"); };
+        assert!(first.failed_step.is_some() && second.failed_step.is_none());
+        let beta = BigInt::from(u32::from('β'));
+        for failure in [&first, second] {
+            assert_eq!(failure.returned_literal, Some(ScalarCheckerProofLiteral::Character('β')));
+            assert!(failure.witness.intervals_at(0, 0).unwrap().eq([(&beta, &beta)]));
+        }
+
+        let main = check_array_proof_cohort(&bad, ScalarCheckerScope::MainFlowOnly).unwrap();
+        assert!(!main.active && main.symbolic_diagnostic.is_none());
+        let nested = text.replace("%%end", "char(char) relay = fn(letter) { identity(letter) }; %%end");
+        assert!(matches!(check_array_proof_cohort(&nested, declared), Err(ScalarOrderedCheckerOutcome::Unsupported)));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn character_proof_domain_excludes_non_scalar_code_points() {
+        let values = IntegerSet::ordinary_character_domain();
+        for scalar in [0u32, 0xd7ff, 0xe000, 0x10ffff] {
+            assert!(values.contains(&BigInt::from(scalar)));
+        }
+        for absent in [0xd800u32, 0xdfff, 0x110000] {
+            assert!(!values.contains(&BigInt::from(absent)));
+        }
+        let expected = [(BigInt::from(0u32), BigInt::from(0xd7ffu32)),
+            (BigInt::from(0xe000u32), BigInt::from(0x10ffffu32))];
+        assert!(values.intervals().eq(expected.iter().map(|(first, last)| (first, last))));
     }
 
     #[cfg(feature = "internal-checker")]
@@ -17583,8 +17811,8 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
         let first = failed.symbolic_diagnostic.unwrap();
         let [second] = failed.additional_symbolic_diagnostics.as_slice() else { panic!("one witness per proof"); };
         assert!(first.failed_step.is_some() && second.failed_step.is_none());
-        assert_eq!(first.returned_boolean, Some(true));
-        assert_eq!(second.returned_boolean, Some(true));
+        assert_eq!(first.returned_literal, Some(ScalarCheckerProofLiteral::Boolean(true)));
+        assert_eq!(second.returned_literal, Some(ScalarCheckerProofLiteral::Boolean(true)));
         let one = BigInt::from(1);
         assert!(second.witness.intervals_at(0, 0).unwrap().eq([(&one, &one)]));
         let main = check_array_proof_cohort(&broken, ScalarCheckerScope::MainFlowOnly).unwrap();

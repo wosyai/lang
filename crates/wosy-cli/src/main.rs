@@ -1139,10 +1139,18 @@ fn check_command(
                 message: "reached from this call".to_owned(),
             });
         }
+        let mut notes = vec![format!("call returned {}", proof_scalar_text(&failure.invocation.returned, failure.invocation.returned_literal))];
+        if matches!(failure.invocation.returned_literal, Some(wosy_compiler::ScalarCheckerProofLiteral::Character(_)))
+            && !failure.invocation.arguments.is_empty()
+        {
+            let entries = failure.invocation.arguments.iter().enumerate().map(|(index, (ty, value))| {
+                format!("argument {} = {}", index + 1, proof_scalar_text(value, wosy_compiler::ScalarCheckerProofLiteral::from_atom(ty, value)))
+            }).collect::<Vec<_>>();
+            notes.push(format!("call entry: {}", entries.join(", ")));
+        }
         Diagnostic {
             code: String::new(), severity: DiagnosticSeverity::Error,
-            message: "proof obligation failed".to_owned(), labels,
-            notes: vec![format!("call returned {}", proof_scalar_text(&failure.invocation.returned, failure.invocation.returned_boolean))],
+            message: "proof obligation failed".to_owned(), labels, notes,
         }
     });
     let symbolic = report.symbolic_diagnostic.iter().chain(&report.additional_symbolic_diagnostics).map(|failure| {
@@ -1175,8 +1183,8 @@ fn check_command(
                 message: "proof goal".to_owned(),
             });
         }
-        let mut notes = vec![format!("symbolic call can return {}", proof_scalar_text(&failure.returned, failure.returned_boolean))];
-        if let Some(entry) = entry_point_note(&failure.witness, publication.texts, false, failure.returned_boolean.is_some()) {
+        let mut notes = vec![format!("symbolic call can return {}", proof_scalar_text(&failure.returned, failure.returned_literal))];
+        if let Some(entry) = entry_point_note(&failure.witness, publication.texts, false, failure.returned_literal.is_some()) {
             notes.push(entry);
         }
         Diagnostic {
@@ -1259,15 +1267,20 @@ fn check_command(
 }
 
 #[cfg(feature = "internal-checker")]
-fn proof_scalar_text(value: impl std::fmt::Display, boolean: Option<bool>) -> String {
-    boolean.map_or_else(|| value.to_string(), |value| value.to_string())
+fn proof_scalar_text(value: impl std::fmt::Display, literal: Option<wosy_compiler::ScalarCheckerProofLiteral>) -> String {
+    use wosy_compiler::ScalarCheckerProofLiteral::{Boolean, Character};
+    match literal {
+        Some(Boolean(value)) => value.to_string(),
+        Some(Character(value)) => format!("{value:?}"),
+        None => value.to_string(),
+    }
 }
 
 #[cfg(feature = "internal-checker")]
 fn entry_point_note(
     witness: &wosy_compiler::ScalarCheckerIntegerWitness,
     texts: &BTreeMap<ProjectSourceIdentity, String>,
-    actual: bool, boolean_proof: bool,
+    actual: bool, categorical: bool,
 ) -> Option<String> {
     if witness.row_count() != 1 || witness.axes().len() == 0 { return None; }
     let entries = witness.axes().enumerate().map(|(axis, (binding, ty))| {
@@ -1279,10 +1292,8 @@ fn entry_point_note(
             .and_then(|source| texts.get(&source))
             .and_then(|text| text.get(binding.declaration_span.start as usize..binding.declaration_span.end as usize));
         let name = name.map_or_else(|| format!("argument {}", axis + 1), str::to_owned);
-        Some(format!("{name} = {}", proof_scalar_text(first,
-            if boolean_proof && matches!(ty, wosy_compiler::ScalarType::Bool) {
-                u8::try_from(first).ok().filter(|&lane| lane <= 1).map(|lane| lane == 1)
-            } else { None })))
+        let literal = if categorical { wosy_compiler::ScalarCheckerProofLiteral::from_atom(ty, first) } else { None };
+        Some(format!("{name} = {}", proof_scalar_text(first, literal)))
     }).collect::<Option<Vec<_>>>()?;
     let origin = if actual { "call entry" } else { "symbolic call entry" };
     Some(format!("{origin}: {}", entries.join(", ")))

@@ -3286,7 +3286,7 @@ pub(super) fn collect_closed_literal_proofs<'a>(
     calls: &'a FunctionCallSites, body: &'a super::ScalarBlock, expected: &ScalarType,
     filter: &[CheckerPredicate], checks: &mut [SymbolicLiteralCheck<'_, 'a>],
 ) -> Option<bool> {
-    let tail = ordinary_tail_type(calls, *expected == ScalarType::Bool).filter(|tail| *tail == expected)?;
+    let tail = closed_literal_tail_type(calls, expected)?;
     let observed = std::cell::RefCell::new(BatchedLiteralEvidence { returned: false, work: 0, pending: checks.len(), checks });
     let mut sink = |_| {};
     let mut collected = IntegerFailureCollection {
@@ -3358,13 +3358,28 @@ pub(super) fn exact_typed_call_argument_at<'a>(
     structure: &'a OccurrenceStructure, call: OccurrenceOrdinal, slot: usize, allow_bool: bool,
     lexical: impl FnOnce(OccurrenceOrdinal, &ScalarType) -> Option<&'a BigInt>,
 ) -> Option<ExactIntegerArgument<'a>> {
-    let (argument, ty) = checked_scalar_call_argument_at(structure, call, slot, allow_bool)?;
+    exact_call_argument_in(structure, call, slot, allow_bool, false, lexical)
+}
+
+#[cfg(feature = "internal-checker")]
+pub(super) fn exact_named_character_argument_at<'a>(
+    structure: &'a OccurrenceStructure, call: OccurrenceOrdinal,
+    lexical: impl FnOnce(OccurrenceOrdinal, &ScalarType) -> Option<&'a BigInt>,
+) -> Option<ExactIntegerArgument<'a>> {
+    exact_call_argument_in(structure, call, 0, true, true, lexical)
+}
+
+fn exact_call_argument_in<'a>(
+    structure: &'a OccurrenceStructure, call: OccurrenceOrdinal, slot: usize, allow_bool: bool, allow_char: bool,
+    lexical: impl FnOnce(OccurrenceOrdinal, &ScalarType) -> Option<&'a BigInt>,
+) -> Option<ExactIntegerArgument<'a>> {
+    let (argument, ty) = checked_scalar_call_argument_at(structure, call, slot, allow_bool, allow_char)?;
     let value = scalar_call_literal(structure, argument, ty, allow_bool).or_else(|| lexical(argument, ty))?;
     Some((ty, value))
 }
 
 fn checked_scalar_call_argument_at(
-    structure: &OccurrenceStructure, call: OccurrenceOrdinal, slot: usize, allow_bool: bool,
+    structure: &OccurrenceStructure, call: OccurrenceOrdinal, slot: usize, allow_bool: bool, allow_char: bool,
 ) -> Option<(OccurrenceOrdinal, &ScalarType)> {
     let OccurrenceNode::Expression(argument) = structure.edges.get(&(
         OccurrenceParent::Expression(call), OccurrenceEdge::CallArgument(slot),
@@ -3372,15 +3387,16 @@ fn checked_scalar_call_argument_at(
         return None;
     };
     let ty = structure.checked_types.expressions.get(argument)?;
-    (is_integer_type(ty) || (allow_bool && *ty == ScalarType::Bool)).then_some((*argument, ty))
+    (is_integer_type(ty) || (allow_bool && *ty == ScalarType::Bool)
+        || (allow_char && *ty == ScalarType::Char)).then_some((*argument, ty))
 }
 
 fn scalar_call_literal<'a>(structure: &'a OccurrenceStructure, argument: OccurrenceOrdinal, ty: &ScalarType, ordinary: bool)
     -> Option<&'a BigInt>
 {
     #[cfg(feature = "internal-checker")]
-    if *ty == ScalarType::Bool {
-        return structure.checker_ordinary_bool_literals.get(&argument);
+    if matches!(*ty, ScalarType::Bool | ScalarType::Char) {
+        return structure.checker_ordinary_literal_atoms.get(&argument);
     }
     let common = structure.checker_integer_literals.get(&argument);
     #[cfg(feature = "internal-checker")]
@@ -3999,7 +4015,7 @@ fn nested_integer_operand<'a>(
     calls: &'a FunctionCallSites, expression: OccurrenceOrdinal, slot: usize,
     roots: &IntegerRoots<'_>, path: &'a IntegerInputs, allow_bool: bool, work: Option<&mut usize>,
 ) -> Option<NestedIntegerOperand<'a>> {
-    let (argument, ty) = checked_scalar_call_argument_at(&calls.structure, expression, slot, allow_bool)?;
+    let (argument, ty) = checked_scalar_call_argument_at(&calls.structure, expression, slot, allow_bool, false)?;
     if let Some(value) = scalar_call_literal(&calls.structure, argument, ty, allow_bool) {
         return Some(NestedIntegerOperand::Exact((ty, value)));
     }
@@ -5017,11 +5033,11 @@ pub(super) fn exact_named_pure_affine_return_at_entry(
 }
 
 #[cfg(feature = "internal-checker")]
-pub(super) fn exact_named_boolean_return_at_entry(calls: &FunctionCallSites, arguments: &[&BigInt]) -> Option<BigInt> {
-    let tail = ordinary_tail_type(calls, true).filter(|tail| **tail == ScalarType::Bool)?;
-    let value = exact_typed_leaf_return_at_entry(calls, tail, arguments, PureAffineReturn)?;
-    bool_result_lane(&value)?;
-    Some(value)
+pub(super) fn exact_named_literal_return_at_entry(
+    calls: &FunctionCallSites, expected: &ScalarType, arguments: &[&BigInt],
+) -> Option<BigInt> {
+    let tail = closed_literal_tail_type(calls, expected)?;
+    exact_typed_leaf_return_at_entry(calls, tail, arguments, PureAffineReturn)
 }
 
 fn exact_integer_return_at_entry_mode<'a, Authored: ScopedAuthoredReturn<'a>>(
@@ -5345,6 +5361,16 @@ fn ordinary_tail_type(calls: &FunctionCallSites, allow_bool: bool) -> Option<&Sc
 }
 
 
+#[cfg(feature = "internal-checker")]
+fn closed_literal_tail_type<'a>(calls: &'a FunctionCallSites, expected: &ScalarType) -> Option<&'a ScalarType> {
+    if *expected == ScalarType::Char {
+        let ([result], [output]) = (calls.boundary.results.as_slice(), calls.boundary.root_outputs.as_slice())
+            else { return None; };
+        return (result.ty == ScalarType::Char && output.ty == result.ty).then_some(&result.ty);
+    }
+    ordinary_tail_type(calls, *expected == ScalarType::Bool).filter(|tail| *tail == expected)
+}
+
 fn run_integer_callable<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, Authored: ScopedAuthoredReturn<'a>>(
     calls: &'a FunctionCallSites,
     tail: Option<&'a ScalarType>,
@@ -5414,7 +5440,13 @@ fn run_integer_callable<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool,
             #[cfg(not(feature = "internal-checker"))]
             let allow_bool = false;
             boundary.parameters.iter()
-                .map(|parameter| ordinary_parameter_set(&parameter.ty, allow_bool).map(Rc::new))
+                .map(|parameter| {
+                    #[cfg(feature = "internal-checker")]
+                    if tail == Some(&ScalarType::Char) && parameter.ty == ScalarType::Char {
+                        return Some(Rc::new(IntegerSet::ordinary_character_domain()));
+                    }
+                    ordinary_parameter_set(&parameter.ty, allow_bool).map(Rc::new)
+                })
                 .collect::<Option<IntegerRow>>()?
         };
         for filter in entry_filter.into_iter().flatten() {
