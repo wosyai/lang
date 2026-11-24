@@ -1921,7 +1921,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 }
                 if target == ResolvedCallTarget::Core(CoreOperationId::Free) {
                     if let Some(address_point) = checked_release_address {
-                        self.point(
+                        let release = self.point(
                             CfgPointKind::Release {
                                 target: ReleaseTarget::Checked {
                                     address_point,
@@ -1936,6 +1936,9 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             scope,
                             BTreeSet::new(),
                         );
+                        if self.joined_local_reborrow {
+                            self.proof_points.joined_checked_releases.push(release);
+                        }
                     } else if let [ScalarExpression::Name {
                         name: place_name,
                         span: argument_span,
@@ -7201,6 +7204,7 @@ struct ReferenceTransferCfg<'a> {
     joined_shared_aliases: &'a [(CfgPointId, CfgPointId)],
     shared_scalar_read_calls: &'a [(CfgPointId, CfgPointId)],
     joined_shared_return_calls: &'a [(CfgPointId, CfgPointId)],
+    joined_checked_releases: &'a [CfgPointId],
     checked_named_scalar_stores: &'a [CfgPointId],
     named_reborrow_parents: &'a [super::control::NamedReborrowParent],
 }
@@ -7233,6 +7237,7 @@ impl<'a> ReferenceTransferCfg<'a> {
             joined_shared_aliases: proof.map_or(&[], |proof| &proof.joined_shared_aliases),
             shared_scalar_read_calls: proof.map_or(&[], |proof| &proof.shared_scalar_read_calls),
             joined_shared_return_calls: proof.map_or(&[], |proof| &proof.joined_shared_return_calls),
+            joined_checked_releases: proof.map_or(&[], |proof| &proof.joined_checked_releases),
             checked_named_scalar_stores: proof.map_or(&[], |proof| &proof.checked_named_scalar_stores),
             named_reborrow_parents: proof.map_or(&[], |proof| &proof.named_reborrow_parents),
         }
@@ -7278,8 +7283,23 @@ fn joined_reborrow_calls_are_supported(
     source: &SourceIdentity, calls: &FunctionCallSites,
     effects: Option<&HashMap<ByteSpan, SharedScalarReadEffect>>,
 ) -> bool {
+    let mut checked_release = false;
     calls.call_occurrences.iter().all(|call| {
         let target = &calls.sites[call.site].target;
+        if *target == ResolvedCallTarget::Core(CoreOperationId::Free) {
+            if std::mem::replace(&mut checked_release, true) {
+                return false;
+            }
+            let Some(OccurrenceNode::Expression(argument)) = calls.structure.edges.get(&(
+                OccurrenceParent::Expression(call.ordinal), OccurrenceEdge::CallArgument(0),
+            )) else { return false };
+            return !calls.structure.edges.contains_key(&(
+                OccurrenceParent::Expression(call.ordinal), OccurrenceEdge::CallArgument(1),
+            )) && matches!(calls.prepared_plain_name(*argument), Some(PlainNameIdentity::Lexical(_)))
+                && matches!(calls.structure.checked_types.expressions.get(argument),
+                    Some(ScalarType::CheckedReference { mutability: ScalarReferenceMutability::Mutable, inner })
+                        if aggregate::ordinary_value(inner));
+        }
         if calls.declared_unsafe_calls.contains(&call.ordinal.0) {
             return false;
         }
@@ -7455,6 +7475,7 @@ fn joined_root_reborrow_binding<'a>(
     descendant_sites: &[CfgPointId],
     read_calls: &[(CfgPointId, CfgPointId)],
     return_calls: &[(CfgPointId, CfgPointId)],
+    checked_releases: &[CfgPointId],
     scalar_stores: &[CfgPointId],
     grouped_installs: &BTreeSet<CfgPointId>,
     exposures: &[(CfgPointId, Option<ReferenceBindingId>)],
@@ -7482,6 +7503,30 @@ fn joined_root_reborrow_binding<'a>(
         return None;
     }
     let mutable = *mode == ScalarReferenceMutability::Mutable;
+    let carrier_move = match checked_releases {
+        [] => None,
+        [release] if !mutable && *release > point.id => {
+            let release = points.get(release.0)?;
+            let CfgPointKind::Release { target: ReleaseTarget::Checked { address_point, address_span, .. } } =
+                &release.kind else { return None };
+            let address = points.get(address_point.0)?;
+            let [moved] = address.successors.as_slice() else { return None };
+            let moved = points.get(moved.0)?;
+            if address.id <= point.id || moved.id <= address.id || moved.id >= release.id
+                || address.scope != release.scope || moved.scope != release.scope
+                || &address.source_span != address_span || &moved.source_span != address_span
+                || moved.successors.as_slice() != [release.id]
+                || !contains_loan_site(binding, address) || !contains_loan_site(binding, release)
+                || !matches!(&address.kind, CfgPointKind::Read { binding: selected } if selected == binding)
+                || !matches!(&moved.kind, CfgPointKind::Move { owner, place,
+                    ty: ScalarType::CheckedReference { mutability: ScalarReferenceMutability::Mutable, inner } }
+                    if owner == binding && &place.binding == binding && place.projections.is_empty()
+                        && matches!(place.place, ScalarPlace::Name { .. }) && aggregate::ordinary_value(inner))
+            { return None; }
+            Some(moved.id)
+        }
+        _ => return None,
+    };
     let [bind] = point.successors.as_slice() else { return None };
     let child = points.get(bind.0)?;
     let CfgPointKind::Bind { binding: child_binding } = &child.kind else { return None };
@@ -7605,7 +7650,9 @@ fn joined_root_reborrow_binding<'a>(
             }
             CfgPointKind::Assign { target, .. } | CfgPointKind::Borrow { place: target, .. }
             | CfgPointKind::Move { place: target, .. } | CfgPointKind::DeferredMove { place: target, .. }
-                if holders.contains_key(&target.binding) => return None,
+                if holders.contains_key(&target.binding)
+                    || carrier_move.is_some_and(|moved| &target.binding == binding && moved != rest.id) =>
+                return None,
             _ => (),
         }
     }
@@ -7720,6 +7767,7 @@ fn checked_joined_reborrow_parents(
     pointer: CfgPointId,
     states: &[ReferenceEdgeState],
     binding: &ReferenceBindingId,
+    requires_owned: bool,
 ) -> Option<Vec<ReferenceOriginId>> {
     let minimum = if states.len() == 1 && matches!(&site.kind,
         CfgPointKind::ReborrowThrough { place: ScalarPlace::Index { base, .. }, .. }
@@ -7740,6 +7788,7 @@ fn checked_joined_reborrow_parents(
         let ReferenceOrigin::Fresh { loan, .. } = &facts[id.0] else { return None };
         let owner = &loan.origin_place;
         let allocated = allocations.contains(&owner.binding);
+        if requires_owned && !allocated { return None; }
         if owners.iter().any(|prior| {
             allocated != allocations.contains(&prior.binding)
                 || (allocated && prior.binding == owner.binding)
@@ -8734,7 +8783,8 @@ fn transfer_reference_facts(
             joined_root_reborrow_binding(
                 original_points, initial_point, cfg.checked_binding_initializers, cfg.checked_pointee_reads,
                 cfg.joined_shared_aliases, cfg.joined_reborrow_descendants, cfg.shared_scalar_read_calls,
-                cfg.joined_shared_return_calls, cfg.checked_named_scalar_stores, &grouped_installs, cfg.raw_address_exposures,
+                cfg.joined_shared_return_calls, cfg.joined_checked_releases,
+                cfg.checked_named_scalar_stores, &grouped_installs, cfg.raw_address_exposures,
             )
         } else {
             None
@@ -8743,7 +8793,7 @@ fn transfer_reference_facts(
             (CfgPointKind::ReborrowThrough { pointer_point, .. }, Some(shape)) =>
                 checked_joined_reborrow_parents(
                     original_points, initial_point, cfg.facts, cfg.allocations, *pointer_point,
-                    states.as_slice(), shape.parent,
+                    states.as_slice(), shape.parent, !cfg.joined_checked_releases.is_empty(),
                 ),
             _ => None,
         };
@@ -14580,6 +14630,7 @@ fn derive_function_specialized_copy_policies<'a>(
                     joined_shared_aliases: &template_result.proof_points.joined_shared_aliases,
                     shared_scalar_read_calls: &template_result.proof_points.shared_scalar_read_calls,
                     joined_shared_return_calls: &template_result.proof_points.joined_shared_return_calls,
+                    joined_checked_releases: &template_result.proof_points.joined_checked_releases,
                     checked_named_scalar_stores: &template_result.proof_points.checked_named_scalar_stores,
                     named_reborrow_parents: &template_result.proof_points.named_reborrow_parents,
                 },
