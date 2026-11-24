@@ -1443,6 +1443,25 @@ cases.extend([
     ("exact-startup-module-typed-narrow-prestate",module_authored_output.replace("core.require(status","core.narrow(status"),37,b"MODULE-STATE"),
     ("exact-startup-module-success-skips-state",module_authored_output.replace("core.require(status != 37","core.require(status == 37"),200,b"AFTER-MODULE-STATE"),
 ])
+startup_bool_binding = f"""%%start
+    i8(i8) identity = fn(value) {{ value }};
+    bool(bool) truth = fn(value) {{ value }};
+    i8 status = identity(37);
+    bool ready = truth(true);
+    bool eligible = (ready || truth(ready)) && status == 37;
+    bool saved = eligible;
+    bool answer = truth(saved);
+    core.narrow(!answer, {{
+        .stdout = ""; .stderr = "STARTUP-BOOL-BINDING"; .code = status;
+        .files = [{{ .path = "answer.json"; .state = answer; }}];
+    }});
+    core.require(false, {report(9,"UNREACHABLE")});
+    %%end"""
+cases.extend([
+    ("exact-startup-computed-bool-binding-true",startup_bool_binding,37,b"STARTUP-BOOL-BINDING"),
+    ("exact-startup-computed-bool-binding-false",startup_bool_binding.replace("status == 37","status == 38").replace("narrow(!answer","narrow(answer"),37,b"STARTUP-BOOL-BINDING"),
+    ("exact-startup-computed-bool-binding-live-unsupported",startup_bool_binding.replace("(ready || truth","(!ready || truth"),2,b"unsupported analysis"),
+])
 startup_logic = f"""%%start
     i8(i8) identity = fn(value) {{ value }};
     bool(bool) truth = fn(value) {{ value }};
@@ -1625,6 +1644,8 @@ nested_array_bytes = state_bytes({
     },
 })
 authored_files = {
+    "exact-startup-computed-bool-binding-true": {"answer.json": b'{"type":{"kind":"bool"},"value":true}\n'},
+    "exact-startup-computed-bool-binding-false": {"answer.json": b'{"type":{"kind":"bool"},"value":false}\n'},
     "exact-startup-composed-logic": {"startup-logic.json": b'{"type":{"kind":"bool"},"value":true}\n'},
     **{name: {
         "status.json": b'{"type":{"kind":"i8"},"value":37}\n',

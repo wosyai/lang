@@ -1099,6 +1099,15 @@ fn walk_package_initialization<const COLLECT: bool, const PRIVATE_NESTED_SCALAR:
             }
             let value = match (&receiver.ty, &binding.value) {
                 (ScalarType::Bool, ScalarExpression::Boolean { value, .. }) => InitializerValue::Boolean(*value),
+                #[cfg(feature = "internal-checker")]
+                (ScalarType::Bool, expression) if !matches!(expression, ScalarExpression::Call { .. })
+                    && COLLECT && actual.permits_authored_startup_scalars() =>
+                {
+                    let value = topology.initializer_predicates.get(&outputs.primary)
+                        .and_then(|predicate| evaluate_initializer_predicate(predicate, &storage, true))
+                        .ok_or(ProjectCheck::Unsupported)?;
+                    InitializerValue::Boolean(value)
+                }
                 (ty, expression) if is_integer_type(ty)
                     || (*ty == ScalarType::Bool && matches!(expression, ScalarExpression::Call { .. })
                         && actual.real_module_boolean_initializer(ty, COLLECT)) =>
@@ -1218,7 +1227,7 @@ fn check_initializer_expression<const COLLECT: bool, const PRIVATE_NESTED_SCALAR
             }
             _ => return Err(ProjectCheck::Unsupported),
         };
-        let value = topology.initializer_branches.get(condition)
+        let value = topology.initializer_predicates.get(condition)
             .and_then(|predicate| evaluate_initializer_predicate(predicate, storage, allow_logic))
             .ok_or(ProjectCheck::Unsupported)?;
         let selected = if value { Some(then_block) } else { else_block };
@@ -10022,6 +10031,41 @@ mod tests {
             &HashMap::new(), narrow, 0, &mut failures, &[InitializationVisit::Started]),
             Err(ProjectCheck::Unsupported)));
         assert!(effects.records.is_empty());
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn initialized_startup_boolean_preserves_exact_value_through_call_and_receipt() {
+        let app = source("src/main.w", "startup-bool-binding");
+        let program = r#"%%start
+            i8(i8) identity = fn(value) { value };
+            bool(bool) truth = fn(value) { value };
+            i8 status = identity(37);
+            bool ready = truth(true);
+            bool eligible = (ready || truth(ready)) && status == 37;
+            bool saved = eligible;
+            bool answer = truth(saved);
+            core.narrow(!answer, { .stdout = ""; .stderr = ""; .code = status;
+                .files = [{ .path = "answer.json"; .state = answer; }]; });
+            core.require(false, { .stdout = ""; .stderr = "unreachable"; .code = 9; .files = []; });
+        %%end"#;
+        for scope in [ScalarCheckerScope::MainFlowOnly, ScalarCheckerScope::CurrentPackage] {
+            let false_case = program.replace("status == 37", "status == 38").replace("narrow(!answer", "narrow(answer");
+            for (text, expected) in [
+                (program, b"{\"type\":{\"kind\":\"bool\"},\"value\":true}\n".as_slice()),
+                (false_case.as_str(), b"{\"type\":{\"kind\":\"bool\"},\"value\":false}\n".as_slice()),
+            ] {
+                let prepared = prepare_proof_target(&app, text).unwrap();
+                let receipt = run_closed_without_named_proofs(&prepared, scope, 1).unwrap();
+                let [failure] = receipt.directives.as_slice() else { panic!("one exact Narrow"); };
+                assert_eq!(failure.code(), &BigInt::from(37));
+                assert_eq!(failure.witness.axes().len(), 0);
+                assert_eq!(failure.files()[0].text.as_ref(), expected);
+            }
+            let live = program.replace("(ready || truth", "(!ready || truth");
+            let prepared = prepare_proof_target(&app, &live).unwrap();
+            assert!(matches!(run_closed_without_named_proofs(&prepared, scope, 1), Err(ProjectCheck::Unsupported)));
+        }
     }
 
     #[cfg(feature = "internal-checker")]

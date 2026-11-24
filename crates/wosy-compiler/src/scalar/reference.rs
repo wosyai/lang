@@ -6898,7 +6898,7 @@ struct StructuralWalker<'a, 'typing> {
     assignments: HashMap<(BlockOrdinal, usize), AssignmentGroup>,
     conditionals: HashMap<OccurrenceOrdinal, ConditionalRegion>,
     #[cfg(any(test, feature = "internal-checker"))]
-    initializer_branches: HashMap<OccurrenceOrdinal, super::checker_directive::InitializerPredicate>,
+    initializer_predicates: HashMap<OccurrenceOrdinal, super::checker_directive::InitializerPredicate>,
     short_circuits: HashMap<OccurrenceOrdinal, ShortCircuitRegion>,
 }
 
@@ -6947,7 +6947,7 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
             assignments: HashMap::new(),
             conditionals: HashMap::new(),
             #[cfg(any(test, feature = "internal-checker"))]
-            initializer_branches: HashMap::new(),
+            initializer_predicates: HashMap::new(),
             short_circuits: HashMap::new(),
         }
     }
@@ -7577,14 +7577,21 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
             );
             return Ok(ordinal);
         }
+        #[cfg(feature = "internal-checker")]
+        let prepare_initializer_bool_binding = matches!(self.mode, WalkMode::ModuleInitialization { .. })
+            && parent == OccurrenceParent::Block(self.structure.root)
+            && matches!(edge, OccurrenceEdge::BindingRoot { output: 0, .. })
+            && !matches!(expression, ScalarExpression::Boolean { .. } | ScalarExpression::Call { .. });
+        #[cfg(all(test, not(feature = "internal-checker")))]
+        let prepare_initializer_bool_binding = false;
         #[cfg(any(test, feature = "internal-checker"))]
         if self.occurrence_typing.checker_directives_enabled()
-            && matches!(edge, OccurrenceEdge::Condition)
+            && (matches!(edge, OccurrenceEdge::Condition) || prepare_initializer_bool_binding)
             && self.structure.checked_types.expressions.get(&ordinal) == Some(&ScalarType::Bool)
         {
             if matches!(self.mode, WalkMode::ModuleInitialization { .. }) {
                 if let Some(predicate) = self.checked_bool_initializer_predicate(expression, names) {
-                    self.initializer_branches.insert(ordinal, predicate);
+                    self.initializer_predicates.insert(ordinal, predicate);
                 }
             } else if let Some(predicate) = self.checker_branch_predicate(expression, names) {
                 self.structure.checker_branches.insert(ordinal, predicate);
@@ -9644,7 +9651,7 @@ fn walk_module_initialization(
         assignments: walker.assignments,
         conditionals: walker.conditionals,
         #[cfg(any(test, feature = "internal-checker"))]
-        initializer_branches: walker.initializer_branches,
+        initializer_predicates: walker.initializer_predicates,
         short_circuits: walker.short_circuits,
     })
 }
