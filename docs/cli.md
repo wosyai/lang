@@ -2,69 +2,27 @@
 
 The binary is named `wosy`. The target argument defaults to `[package] default_target`. Profiles default to `dev`.
 
-## Package command platforms
-
-Linux is the validated platform for package commands. Resolving or
-materializing Git packages requires Linux kernel 5.6 or newer, `/proc`,
-and Git on `PATH`. A local-only `dep add` does not use Git, but requires
-the Unix directory lock used for project metadata writes and is unavailable
-on non-Unix platforms. Reading local dependencies does not require Git or
-create package metadata. With no Git dependencies, `dep sync` only reads local
-declarations and does not write a manifest, lockfile, or checkout.
-
 ## `wosy init`
 
-Creates a base-language package in the current directory on Linux (kernel 5.6
-or newer and `/proc` available). The directory name must start with a
-lowercase ASCII letter and contain only lowercase ASCII letters, digits or
-underscores. All scaffold paths must be absent: `src/`, `scripts/`,
-`wosy.toml`, `wosy.lock`, `wosy.meta.json`, and `.gitignore`. Init does
-not overwrite files or links, invoke Git, build the program, or add
-dependencies. Other files in the directory are not modified. If publication
-fails after some files were created, unmodified scaffold entries are moved to a
-recovery directory shown in the diagnostic. External replacements and edits are
-not discarded.
-
-The scaffold has a starter `src/main.w`, an empty version 1 dependency lock,
-empty mechanical metadata, and project-local build and run scripts. It selects
-the native `dev` profile by default and provides a `wasm` profile for WASI
-Preview 1. Building needs Python 3 and Clang 18.1.x on `PATH`; the Wasm profile
-also needs `wasm-ld` from LLVM and Wasmtime to run. This base-language scaffold
-does not generate compiler references or configure high-language tooling.
+Creates a base-language package in the current directory. Requires Linux 5.6+, `/proc`, and a directory name matching `[a-z][a-z0-9_]*`. Existing scaffold paths block initialization; edits are preserved. The generated profiles are `dev` (native) and `wasm` (WASI Preview 1).
 
 ## `wosy dep add SOURCE [--path PACKAGE_PATH]`
 
-Adds a local project-relative package path or a Git origin, with an optional
-repository-relative package directory or `wosy.toml` path. Existing pins are
-preserved; newly reached Git packages are resolved to exact commits. The
-command validates the complete graph and updates the project manifest and lock
-without installing checkouts. Run `wosy dep sync` to install them.
+Adds a local path or Git origin. `--path` selects a directory or `wosy.toml` within the Git repository. Keeps existing pins and locks newly reached Git packages. Run `wosy dep sync` to install them.
 
 ## `wosy dep sync`
 
-Materializes the exact Git revisions already recorded in
-[`wosy.lock`](project.md#wosylock). Run it after cloning a project with Git
-dependencies. It never selects a revision or rewrites the lockfile. Local
-dependencies stay where they are. Sync reads their declarations to find
-transitive Git pins but does not load or check local source files. A verified,
-unmodified dependency works offline. Sync applies the project's patches in their
-recorded order; if there are unsnapshotted edits, it fails without overwriting
-them.
+Installs the locked Git revisions with the project's patches. Keeps the lock and local packages unchanged. Refuses to overwrite unsnapshotted edits. A verified checkout works offline.
 
 ## `wosy dep snapshot`
 
-Records unsnapshotted edits in reached Git dependencies as ordered project
-patches. It does not replace live source files or write the lock. A changed
-authored patch stack must be synced first. Snapshot may need to retrieve the
-exact locked Git revision to reconstruct the patch baseline.
+Saves edits to a Git dependency as project patches. Keeps the checkout and lock unchanged. Sync a changed patch stack before taking another snapshot.
 
 ## `wosy dep update`
 
-Advances reached Git dependencies to same-origin fast-forward revisions and
-replays their project patches. It will not follow a rewritten or unrelated tip,
-overwrite unsnapshotted edits, or publish a lock for a patch conflict. An update
-can resolve graph changes authored in dependency manifests. It removes clean,
-verified checkouts no longer needed, without altering project-owned patches.
+Advances Git pins by fast-forward and reapplies patches. Conflicts or unsnapshotted edits block replacement. Removes clean checkouts no longer in the graph and keeps their patches.
+
+Resolving or installing Git dependencies requires Linux 5.6+, `/proc`, and Git. Local-only add needs Unix but not Git.
 
 ## `wosy parse [TARGET]`
 

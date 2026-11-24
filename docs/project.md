@@ -8,6 +8,7 @@ The project root is the nearest ancestor directory containing `wosy.toml`.
 [package]
 name = "is_even"
 default_target = "app"
+source_root = "src"
 
 [dependencies.std]
 path = "stdlib"
@@ -42,12 +43,8 @@ main_artifact = "main"
 
 Rules:
 
-- `[package] name` and `default_target` are required for a buildable project.
-  `source_root` is a package-relative directory used by namespace paths.
-  For older root manifests without it, self-qualified namespace paths start
-  at the project root. Target entry paths are always relative to the project
-  root, regardless of `source_root`.
-- A local `[dependencies.<name>]` table contains only `path`, normally relative to the project root. Local packages stay in place. For Git dependencies, the table instead contains `git` (the repository origin) and optionally `path` (a directory within that repository, defaulting to `"."`). Both sources must supply a `wosy.toml` with a matching `package.name` and a package-relative `source_root` directory.
+- `[package]` needs `name` and `default_target`. `source_root` sets the base for namespace paths (the project root when omitted from the root manifest). Target entries stay relative to the project root.
+- `[dependencies.<name>]` uses local `path`, or `git` with an optional repository-relative `path` (default `"."`). A dependency manifest needs the matching package name and a `source_root`.
 - `[comments] categories` lists the `# CATEGORY:` comment categories accepted by `wosy parse` and `wosy build`.
 - Each builder needs `command` (argv, first element is the executable), optional `args`, and `toolchain_identity`. The same applies to runners.
 - Each target needs `root` (entry file relative to the project root), at least one artifact, one artifact profile, and one target profile naming its `main_artifact`.
@@ -65,106 +62,23 @@ The optional table maps portable external labels to concrete functions in the se
 
 Wasm builders must link `runtime.ll` with a linker that provides `__heap_base` after static storage and the reserved stack, as `wasm-ld` does. The generated LLVM IR enables Wasm bulk memory for functions that copy fixed-size aggregates. This per-function setting overrides Clang’s `-mno-bulk-memory` for those functions. Use a Wasm runner that supports `memory.copy`.
 
-The standard library itself is an ordinary package (`stdlib/wosy.toml`).
-Its manifest declares a directly selectable `smoke` target in addition to
-its source root:
-
-```toml
-[package]
-name = "std"
-source_root = "src"
-default_target = "smoke"
-```
-
 ## `wosy.lock`
 
-Commit `wosy.lock` with the project when it has Git dependencies and ignore
-`deps/`. Only direct declarations belong in the consuming `wosy.toml`:
+Commit the lock; ignore managed `deps/` checkouts. Version 1 records the origin, package path, exact commit, and original source hash of each reachable Git package. Local packages are not locked. Build and run use the installed graph without fetching.
 
-```toml
-[dependencies.math]
-git = "https://example.org/math.git"
-path = "packages/math"
-```
-
-The lock includes all reached Git packages, including transitive packages.
-Each `[packages.<name>]` entry under `version = 1` records the origin (`git`),
-package directory (`path`, `"."` for a repository root), exact Git `rev`, and
-`source_hash` of the original tracked package bytes. Relative Git origins
-are interpreted from the consuming project root. In a Git package, a `path`-only
-declaration is relative to that package's directory in its Git repository. It
-selects the same origin and exact revision as the declaring package, with its
-own lock entry and original source hash. For example, `../support` in
-`packages/math` selects `packages/support` in that commit. Paths that leave the
-repository are rejected; these declarations never fall back to host paths.
-An explicit Git declaration names its origin and repository path as usual.
-A local manifest's `path` declarations are relative to that local package;
-local packages stay in place and are not in the lock. In a wholly local graph,
-an unrelated file that is not a managed Wosy lock is left untouched. Reaching
-a Git dependency requires a valid lock, except when adding a new Git pin.
-A valid Wosy lock must not contain unreachable pins.
-
-The dependency graph allows one binding per package name. Multiple paths to
-the same binding share one package; conflicting bindings, cycles, missing
-pins, and pins outside the reached Git graph are errors. There is no automatic
-version fallback. Builds and runs use the locked graph and the effective
-source roots, and never fetch or resolve versions. Sources stay editable;
-changing a reachable file or its routing makes an existing artifact stale.
-`wosy parse` reads only the selected root source and does not need the package
-graph installed.
-
-Use `wosy dep add <local-path>` or
-`wosy dep add <git-origin> --path <package-path>` to add a direct dependency.
-For Git, the package path may name a directory or the `wosy.toml` inside it.
-Add preserves existing pins and records the exact selected Git commit for
-each newly reached package. It updates the manifest and lock after verifying
-the complete graph; it does not publish a checkout. Run `wosy dep sync` to
-materialize the locked packages. See the [package command platforms](cli.md#package-command-platforms) for the write and Git requirements.
-
-Sync validates the exact original bytes of a staged package before installing
-anything from the graph. The version 1 source hash is BLAKE3 of
-`wosy-package-source-v1` followed by a zero byte, then, for each tracked
-regular file in sorted UTF-8 path order: its package-relative path length in
-bytes (unsigned 64-bit little endian), its path bytes with `/` separators,
-and the 32 raw bytes of its file-content BLAKE3 hash. Symlinks and submodules are not supported inside Git checkouts.
-Sync does not overwrite an edited or unverified directory. Moving the same
-project with its checkouts preserves their provenance; copying them to a
-different project does not.
-
-## `wosy.meta.json`
-
-The package owns this file for mechanical metadata such as refactor mappings.
-`wosy init` starts it as an empty JSON object. The base-language build does
-not need metadata entries.
+A path-only dependency inside a Git package selects a sibling in the same repository and commit. For example, `../support` from `packages/math` selects `packages/support`. Paths cannot leave the repository.
 
 ## Dependency patches
 
-`wosy dep snapshot` records edits to reached Git dependencies, including
-transitive packages, in `patches/<package>/<uuid-v7>.patch`. The canonical
-filename uses lowercase hyphenated UUIDv7. Other files in that directory are
-not patch inputs. Each patch is a standard Git binary diff; renames, binary
-changes and executable modes are preserved. Snapshot leaves the checkout and
-lock untouched and writes no new patch when there is no new edit. Reconstructing
-an old baseline can require access to the exact locked revision. A manifest
-edit can be captured before its new dependency graph has a lock. Run
-`wosy dep update` to resolve newly reached or removed dependencies when ready.
+Store patches in `patches/<package>/<uuid-v7>.patch`. Wosy applies them in UUID order. Patches are Git binary diffs and do not change the original source hash.
 
-`wosy dep sync` applies the selected patch stack in UUID order. Changing a
-patch invalidates the previously applied stack until sync reconciles it.
-The original Git content hash remains unchanged by patches. Build and run
-continue to observe editable source bytes, and the applied patch stack is
-also part of their input identity. Local dependencies are not patch inputs.
+## `wosy.meta.json`
 
-`wosy dep update` selects same-origin fast-forward revisions and reapplies the
-same project-owned patch files. A divergent tip, unappliable patch or edited
-checkout that would be replaced leaves the old lock and worktree in place.
-A successful update removes verified, clean checkouts no longer in the
-resolved graph. It does not delete their authored patches; adding a package back
-reapplies its existing patches. An edited or unverified checkout blocks removal.
+Package-owned tool metadata. Base-language builds need no entries.
 
 ## Source graph
 
-The entry file plus every file named by a `namespace` declaration forms the source graph. A declaration such as `math = namespace app "src/math.w";` loads `src/math.w` from the `app` package. A declaration such as `std = namespace std "bootstrap.w";` resolves `bootstrap.w` relative to the `std` package `source_root`. Missing files fail with `M0001`; cycles fail with `M0003`.
+The entry file plus every file named by a `namespace` declaration forms the source graph. A declaration such as `math = namespace is_even "math.w";` loads `src/math.w` when `is_even` uses `source_root = "src"`. A declaration such as `std = namespace std "bootstrap.w";` resolves `bootstrap.w` relative to the `std` package `source_root`. Missing files fail with `M0001`; cycles fail with `M0003`.
 
 ## Build outputs
 

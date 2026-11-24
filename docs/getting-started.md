@@ -8,21 +8,14 @@
 
 ## Create a project
 
-On Linux, start a base-language project in a new directory:
+On Linux:
 
 ```sh
-mkdir my_app
-cd my_app
+mkdir my_app && cd my_app
 wosy init
 ```
 
-The generated `wosy.toml` declares a native `dev` profile and a WASI Preview 1
-`wasm` profile for `src/main.w`. Use `--profile wasm` on both build and run
-to select the latter. The starter needs no dependencies; add them explicitly
-when needed. See [CLI reference](cli.md#wosy-init) for the generated files and
-[Project layout](project.md) for the manifest schema.
-
-You can also create the manifest and entry file manually.
+Use `--profile wasm` on both build and run for WASI Preview 1.
 
 ## Write source
 
