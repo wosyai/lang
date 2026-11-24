@@ -10,6 +10,7 @@ enum Expected {
     NullParent,
     LiveConflict,
     LiveDescendantConflict,
+    LiveFamilyConflict,
     Declined,
 }
 
@@ -49,9 +50,13 @@ fn check_case(text: &str, expected: Expected, witness_dir: Option<&str>) {
                     }), "{target}/{route}: {diagnostics:?}");
                 }
                 Expected::Declined => assert!(diagnostics.iter().any(|item| item.code == "B0003"), "{target}/{route}: {diagnostics:?}"),
-                Expected::LiveConflict | Expected::LiveDescendantConflict => {
+                Expected::LiveConflict | Expected::LiveDescendantConflict | Expected::LiveFamilyConflict => {
                     let write = text.find("first = 3").expect("owner write") as u32;
-                    let loan = if matches!(expected, Expected::LiveDescendantConflict) { "&(*child)" } else { "&(*parent)" };
+                    let loan = match expected {
+                        Expected::LiveDescendantConflict => "&(*child)",
+                        Expected::LiveFamilyConflict => "&(*left)",
+                        _ => "&(*parent)",
+                    };
                     let child = text.find(loan).expect("child reborrow") as u32;
                     assert!(diagnostics.iter().any(|diagnostic| {
                         diagnostic.code == "B0003"
@@ -209,7 +214,36 @@ fn joined_shared_descendant_uses_the_selected_parent_until_its_last_read() {
     check(&alias, Expected::Valid);
     let third = program.replace("u8 again = *nested;", "*u8 third = &(*nested); u8 again = *third;");
     assert_ne!(third, program);
-    check(&third, Expected::Declined);
+    check(&third, Expected::Valid);
+}
+
+#[test]
+fn joined_loan_family_preserves_sibling_and_nested_alias_authority() {
+    let program = joined_with_pointer_read(
+        "*u8 left = &(*child); *u8 right = &(*child); *u8 deep = &(*left); *u8 alias = deep; \
+         u8 sibling = *right; u8 again = pointer(alias); first = 3;", "*value",
+    ).replace("    seen\n", "    if (again == seen && sibling == seen) { again } else { 0 }\n");
+    check_case(&program, Expected::Valid, Some("WOSY_REBORROW_FAMILY_IR_DIR"));
+    let live = program.replace("u8 again = pointer(alias); first = 3;", "first = 3; u8 again = pointer(alias);");
+    assert_ne!(live, program);
+    check(&live, Expected::LiveFamilyConflict);
+}
+
+#[test]
+fn joined_descendant_family_has_a_fixed_issuance_bound() {
+    for (size, expected) in [(4, Expected::Valid), (5, Expected::Declined)] {
+        let mut body = String::new();
+        let mut from = "child".to_owned();
+        for i in 0..size {
+            let name = format!("borrow_{i}");
+            body.push_str(&format!("*u8 {name} = &(*{from}); "));
+            from = name;
+        }
+        body.push_str(&format!("u8 again = *{from}; first = 3;"));
+        let program = joined("parent = &!second;", true, "", &body)
+            .replace("    seen\n", "    if (again == seen) { again } else { 0 }\n");
+        check(&program, expected);
+    }
 }
 
 fn joined_with_scalar_call(after_read: &str) -> String {
