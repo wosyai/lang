@@ -7257,18 +7257,24 @@ impl JoinedLoanFamily<'_> {
 }
 
 fn joined_direct_lexical_place(place: &ReferencePlaceId) -> bool {
-    match (&place.place, place.projections.as_slice()) {
-        (ScalarPlace::Name { .. }, []) => true,
-        (
-            ScalarPlace::Field { base, field: ScalarFieldReference::Resolved(written), .. },
-            [ReferencePlaceProjection::Field(ScalarFieldReference::Resolved(edge))],
-        ) => matches!(base.as_ref(), ScalarPlace::Name { .. }) && written == edge,
-        (
-            ScalarPlace::Index { base, index, .. },
-            [ReferencePlaceProjection::Index(edge @ ScalarExpression::Integer { .. })],
-        ) => matches!(base.as_ref(), ScalarPlace::Name { .. }) && index.as_ref() == edge,
-        _ => false,
+    // Match the resolved loan path to the exact written place from leaf to
+    // root. Do not infer a disjointness claim from an unresolved or dynamic
+    // projection, even if a later component is a known field.
+    let mut written = &place.place;
+    for edge in place.projections.iter().rev() {
+        written = match (written, edge) {
+            (
+                ScalarPlace::Field { base, field: ScalarFieldReference::Resolved(written), .. },
+                ReferencePlaceProjection::Field(ScalarFieldReference::Resolved(resolved)),
+            ) if written == resolved => base.as_ref(),
+            (
+                ScalarPlace::Index { base, index, .. },
+                ReferencePlaceProjection::Index(resolved @ ScalarExpression::Integer { .. }),
+            ) if index.as_ref() == resolved => base.as_ref(),
+            _ => return false,
+        };
     }
+    matches!(written, ScalarPlace::Name { .. })
 }
 
 fn checked_joined_reborrow_parent<'a>(
