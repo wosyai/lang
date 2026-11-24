@@ -1950,6 +1950,9 @@ fn store_binding_outputs<'ctx, 'module>(
     if aggregate_transfer::store_received_binding(context, state, binding, &value)? {
         return Ok(());
     }
+    if aggregate_transfer::install_widened_owning_receiver(context, state, binding, &value)? {
+        return Ok(());
+    }
     if store_widened_join(state, binding, &value)? {
         return Ok(());
     }

@@ -3836,6 +3836,27 @@ impl<'a> ReferenceFlowBuilder<'a> {
         Some([arm(then_branch, *then_block)?, arm(else_branch, *else_block)?])
     }
 
+    fn widened_owning_argument(
+        &self, value: &ScalarExpression, call: OccurrenceOrdinal, block: ByteSpan,
+    ) -> Option<&ReferenceBindingId> {
+        let owners = self.widened_arrays.as_ref()?;
+        let calls = self.call_sites;
+        let ScalarExpression::Call { arguments, .. } = value else { return None };
+        let [ScalarExpression::Name { span, .. }] = arguments.as_slice() else { return None };
+        if !self.generic_parameters.is_empty() || calls.declared_unsafe_calls.contains(&call.0)
+            || !matches!(self.call_target(value, call), Ok(ResolvedCallTarget::ModuleCallable {
+                concrete: ConcreteCallSelection::Declaration, ..
+            }))
+        { return None; }
+        let signature = calls.checked_call_signatures.get(&call)?;
+        if !aggregate::neutral_array_signature(&signature.parameters, &signature.outputs) { return None; }
+        let OccurrenceNode::Expression(argument) = calls.structure.edges.get(&(
+            OccurrenceParent::Expression(call), OccurrenceEdge::CallArgument(0)))? else { return None };
+        let PlainNameIdentity::Lexical(source) = self.prepared_name_identity(*argument, *span).ok().flatten()?
+        else { return None; };
+        (owners.contains(source) && source.block_span == block).then_some(source)
+    }
+
     fn exact_widened_binding_move(
         &self,
         binding: &ScalarBinding,
@@ -4836,8 +4857,20 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             true
                         });
                     let alias_owner = self.prepared_fallible_alias(binding, primary, primary_ordinal, scope, &receiver.ty);
+                    let widened_receiver_source = if !binding.is_allocation && binding.fallible_assignment.is_none()
+                        && binding_region.receivers().len() == 1 && outputs.secondary.is_empty()
+                        && binding.output_origin == ScalarBindingOutputOrigin::SingleExpression
+                        && !self.names.contains_key(&receiver.name)
+                    {
+                        self.widened_owning_argument(primary, primary_ordinal, block.span)
+                            .filter(|source| self.binding_types.get(source).is_some_and(|ty|
+                                aggregate::same_runtime_array_type(ty, &receiver.ty)))
+                            .map(|source| source.declaration_span)
+                    } else { None };
                     let before = self.cursor;
-                    let value = if alias_owner.is_some() {
+                    let value = if let Some(owner) = widened_receiver_source {
+                        self.expression_with_read_mode(primary, scope, primary_ordinal, ExpressionReadMode::WidenedOwningRoundtrip(owner))?
+                    } else if alias_owner.is_some() {
                         self.expression_with_read_mode(primary, scope, primary_ordinal, ExpressionReadMode::FallibleAliasInitializer)?
                     } else if raw_null {
                         self.point(
@@ -4932,7 +4965,15 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     if let Some(owner) = alias_owner {
                         self.proof_points.fallible_aliases.insert(id.clone(), owner);
                     }
-                    let widened = widened_join || widened_move || super::widened_local_literal(binding).is_some();
+                    if let Some(owner) = widened_receiver_source {
+                        let point = call_producer.filter(|point| self.aggregate_facts.array_calls.get(point)
+                            .is_some_and(|(actual, _, source)| *actual == primary_ordinal && source.declaration_span == owner))
+                            .ok_or_else(|| self.missing_context(expression_span(primary),
+                                ReferenceAnalysisErrorReason::UnprovedWidenedArrayTransfer))?;
+                        self.aggregate_result.widened_owning_receives.push((point, primary_ordinal, owner, receiver.span));
+                    }
+                    let widened = widened_join || widened_move || widened_receiver_source.is_some()
+                        || super::widened_local_literal(binding).is_some();
                     if widened {
                         self.widened_arrays.get_or_insert_with(HashSet::new).insert(id.clone());
                     }
@@ -5293,7 +5334,6 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             .then_some((destination, source.declaration_span, target.declaration_span))
                     })();
                     let widened_roundtrip = (|| {
-                        let owners = self.widened_arrays.as_ref()?;
                         if scope != ReferenceScopeId(0) || !self.generic_parameters.is_empty()
                             || item_index != 1 || region.items.len() != 3
                             || !matches!(calls.boundary.root_outputs.as_slice(), [output] if output.ty == ScalarType::U64)
@@ -5303,26 +5343,15 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         let [_, _, ScalarBlockItem::Expression(observation)] = block.items.as_slice() else { return None };
                         if !matches!(self.call_target(observation, observe.expression),
                             Ok(ResolvedCallTarget::Core(CoreOperationId::ArrayLen))) { return None; }
-                        let ([target], [value @ ScalarExpression::Call { arguments, .. }]) =
-                            (assignment.targets.as_slice(), assignment.values.as_slice()) else { return None };
+                        let ([target], [value]) = (assignment.targets.as_slice(), assignment.values.as_slice())
+                        else { return None; };
                         if !matches!(target.place, ScalarPlace::Name { .. }) { return None; }
-                        let [ScalarExpression::Name { span, .. }] = arguments.as_slice() else { return None };
                         let occurrence = group.rhs_evaluations().next()?.expression;
-                        if calls.declared_unsafe_calls.contains(&occurrence.0)
-                            || !matches!(self.call_target(value, occurrence),
-                                Ok(ResolvedCallTarget::ModuleCallable { concrete: ConcreteCallSelection::Declaration, .. }))
-                        { return None; }
-                        let signature = calls.checked_call_signatures.get(&occurrence)?;
-                        if !aggregate::neutral_array_signature(&signature.parameters, &signature.outputs) { return None; }
+                        let source = self.widened_owning_argument(value, occurrence, block.span)?;
                         let destination = group.destinations().next()?.destination;
                         let DirectDestinationIdentity::Existing(binding) = calls.prepared_direct_destination(destination)?
                         else { return None; };
-                        let OccurrenceNode::Expression(argument) = calls.structure.edges.get(&(
-                            OccurrenceParent::Expression(occurrence), OccurrenceEdge::CallArgument(0)))? else { return None };
-                        (owners.contains(binding) && binding.block_span == block.span
-                            && matches!(self.prepared_name_identity(*argument, *span),
-                                Ok(Some(PlainNameIdentity::Lexical(source))) if source == binding))
-                            .then_some((occurrence, destination, binding.declaration_span))
+                        (source == binding).then_some((occurrence, destination, binding.declaration_span))
                     })();
                     let mut values = Vec::new();
                     for evaluation in group.rhs_evaluations() {

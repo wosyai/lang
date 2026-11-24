@@ -12320,3 +12320,105 @@ if (three() != 3) { core.system_panic(); };
         }
     }
 }
+
+#[test]
+fn widened_owning_array_fresh_receivers_preserve_backing_and_scope() {
+    use inkwell::{memory_buffer::MemoryBuffer, values::{CallSiteValue, InstructionOpcode}};
+    let text = "%%start
+u8[](u8[]) identity = fn(values) { values };
+u8[](u8[]) relay = fn(values) { identity(values) };
+u64() two = fn() {
+    u8[] source = [11, 13];
+    u8[] received = relay(source);
+    u64 saved = core.array_len(&received);
+    u8[] final_owner = relay(received);
+    saved * 10 + core.array_len(&final_owner)
+};
+u64() three = fn() {
+    u8[] source = [3, 5, 7];
+    u8[] received = relay(source);
+    core.array_len(&received)
+};
+if (two() != 22) { core.system_panic(); };
+if (three() != 3) { core.system_panic(); };
+%%end";
+    let mixed = text.replace("if (two()", "unit(u64) ordinary = fn(count) { u8[count] array; array = relay(array); }; ordinary(1);\nif (two()");
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        for (closed, text) in [(true, text), (false, mixed.as_str())] {
+            let prepared = prepare_initializer_test(text, layout);
+            let checked = analyze_scalar_build(&prepared);
+            assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+            let source = &prepared.project().modules[0].source;
+            for (project, emitted) in [(false, emit_scalar_build_single_module_llvm(&checked)),
+                (true, emit_scalar_build_project_llvm(&checked))]
+            {
+                if !closed {
+                    assert!(matches!(emitted, Err(error) if error.contains("widened array move requires a closed exact owning receiver")));
+                    continue;
+                }
+                let llvm = emitted.unwrap().to_text();
+                let context = Context::create();
+                let buffer = MemoryBuffer::create_from_memory_range_copy(llvm.as_bytes(), "exact widened fresh owning receipts");
+                let module = context.create_module_from_ir(buffer).unwrap();
+                module.verify().unwrap();
+                let relay = module.get_function(&self_tail_test_symbol(source, project, "relay")).unwrap();
+                let alloc = module.get_function("__wosy_core_alloc").unwrap();
+                let free = module.get_function("__wosy_core_free").unwrap();
+                for (name, count, hops) in [("two", 2, 2), ("three", 3, 1)] {
+                    let function = module.get_function(&self_tail_test_symbol(source, project, name)).unwrap();
+                    let mut allocation = None;
+                    let mut calls = Vec::new();
+                    let mut cleanup = Vec::new();
+                    for block in function.get_basic_blocks() {
+                        for instruction in std::iter::successors(block.get_first_instruction(), |instruction| instruction.get_next_instruction()) {
+                            let Some(callee) = CallSiteValue::try_from(instruction).ok().and_then(|call| call.get_called_fn_value())
+                            else { continue };
+                            if callee == alloc {
+                                assert!(allocation.replace(instruction).is_none());
+                            } else if callee == relay {
+                                calls.push(instruction);
+                            } else if callee == free {
+                                cleanup.push(instruction);
+                            }
+                        }
+                    }
+                    let allocation = allocation.unwrap();
+                    assert_eq!(calls.len(), hops);
+                    let [cleanup] = cleanup.as_slice() else { panic!("one cleanup per returned owner: {llvm}") };
+                    let operand = |instruction, index| known_field_operand(instruction, index).unwrap();
+                    let mut previous = allocation;
+                    for call in calls {
+                        let length = operand(call, 0).as_instruction_value().unwrap();
+                        assert_eq!(length.get_opcode(), InstructionOpcode::InsertValue);
+                        assert_eq!(length.get_indices(), vec![1]);
+                        let backing = operand(length, 0).as_instruction_value().unwrap();
+                        assert_eq!(backing.get_opcode(), InstructionOpcode::InsertValue);
+                        assert_eq!(backing.get_indices(), vec![0]);
+                        let passed = operand(backing, 1).as_instruction_value().unwrap();
+                        if previous == allocation {
+                            assert_eq!(operand(length, 1).into_int_value().get_zero_extended_constant(), Some(count));
+                            assert_eq!(passed, allocation);
+                        } else {
+                            assert_eq!(passed.get_indices(), vec![0]);
+                            assert_eq!(operand(passed, 0).as_instruction_value(), Some(previous));
+                            let length = operand(length, 1).as_instruction_value().unwrap();
+                            assert_eq!(length.get_indices(), vec![1]);
+                            assert_eq!(operand(length, 0).as_instruction_value(), Some(previous));
+                        }
+                        previous = call;
+                    }
+                    let released = operand(*cleanup, 0).as_instruction_value().unwrap();
+                    assert_eq!(released.get_indices(), vec![0]);
+                    assert_eq!(operand(released, 0).as_instruction_value(), Some(previous));
+                }
+                if let Some(out) = std::env::var_os("WOSY_WIDENED_OWNING_RECEIVE_IR_DIR") {
+                    let target = if layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
+                    let route = if project { "project" } else { "standalone" };
+                    let controlled = llvm.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);
+                    assert_ne!(controlled, llvm);
+                    std::fs::write(std::path::PathBuf::from(out).join(format!("{target}-{route}-control.ll")), controlled).unwrap();
+                }
+            }
+        }
+    }
+}

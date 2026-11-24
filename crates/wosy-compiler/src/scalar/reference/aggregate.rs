@@ -1269,6 +1269,7 @@ pub(super) struct AggregateFlowResult {
     pub(super) borrowed_extent_forward: Option<(CfgPointId, OccurrenceOrdinal)>,
     pub(super) borrowed_extent_call: Option<(CfgPointId, OccurrenceOrdinal, ByteSpan, Option<ByteSpan>)>,
     pub(super) array_formal_extent_required: bool,
+    pub(super) widened_owning_receives: Vec<(CfgPointId, OccurrenceOrdinal, ByteSpan, ByteSpan)>,
     pub(super) widened_owning_roundtrip: Option<(OccurrenceOrdinal, CfgPointId, ByteSpan)>,
     pub(super) widened_borrowed_extent_calls: Vec<(CfgPointId, OccurrenceOrdinal, ByteSpan)>,
     array_conditional_forwarded: bool,
@@ -1504,7 +1505,7 @@ impl AggregateFlowResult {
     }
 
     pub(super) fn has_observations(&self) -> bool {
-        self.widened_literal_factory.is_some() || !self.widened_join_receivers.is_empty() || !self.widened_rebinds.is_empty() || self.borrowed_extent_observer.is_some() || self.borrowed_extent_call.is_some() || !self.widened_borrowed_extent_calls.is_empty() || self.borrowed_extent_forward.is_some()
+        !self.widened_owning_receives.is_empty() || self.widened_literal_factory.is_some() || !self.widened_join_receivers.is_empty() || !self.widened_rebinds.is_empty() || self.borrowed_extent_observer.is_some() || self.borrowed_extent_call.is_some() || !self.widened_borrowed_extent_calls.is_empty() || self.borrowed_extent_forward.is_some()
             || self.array_formal_extent_required || self.literal_array_index_required.is_some() || self.literal_array_extent_required.is_some() || self.proved_literal_array_route_ref().is_some()
             || (self.checked_producer_authoritative && !self.checked_producer_backing.is_empty())
             || self.checked_backing_assignment.is_some() || self.checked_backing_forward.is_some()
@@ -2987,6 +2988,7 @@ pub(crate) struct ClosedBody {
     pub(crate) array_descriptor_observer: Option<ByteSpan>,
     pub(crate) array_descriptor_forward: Option<usize>,
     // Call occurrence -> its sole exact lexical backing declaration and install.
+    pub(crate) widened_owning_receives: BTreeMap<usize, (ByteSpan, ByteSpan)>,
     pub(crate) widened_owning_roundtrip: Option<(usize, CfgPointId, ByteSpan)>,
     pub(crate) array_descriptor_rebinds: BTreeMap<usize, (ByteSpan, usize)>,
     pub(crate) replacement_index_observation: Option<usize>,
@@ -5838,9 +5840,16 @@ fn array_descriptor_route(body: &Body<'_>) -> Option<ArrayDescriptorRoute> {
         })).then_some(ArrayDescriptorRoute::Forward { call, point })
 }
 
+#[derive(Clone, Copy)]
+enum OwningDescriptorDestination {
+    Rebind { place: usize, observation: usize },
+    Fresh(ByteSpan),
+}
+
 fn seal_array_descriptor_identities(
     ordinary: &OrdinaryCohorts,
     requests: &[(BodyKey, &Body<'_>, OccurrenceOrdinal)],
+    widened_receives: &[(BodyKey, &Body<'_>, CfgPointId, OccurrenceOrdinal, ByteSpan, ByteSpan)],
     declarations: &HashMap<(&SourceIdentity, ByteSpan), (usize, usize)>,
     routes: &BTreeMap<BodyKey, ArrayDescriptorRoute>,
     bodies: &BTreeMap<BodyKey, Body<'_>>,
@@ -5867,7 +5876,14 @@ fn seal_array_descriptor_identities(
         {
             continue;
         }
-        candidates.insert((caller, ordinal.0), (target, binding.declaration_span, destination.0, observation.0));
+        candidates.insert((caller, ordinal.0), (target, binding.declaration_span,
+            OwningDescriptorDestination::Rebind { place: destination.0, observation: observation.0 }));
+    }
+    for &(caller, body, point, call, owner, receiver) in widened_receives {
+        if !body.is_monomorphic || caller.2.is_some() { continue; }
+        let Some(target) = target_body(declarations, body.cfg, point).filter(|target| routes.contains_key(target))
+        else { continue; };
+        candidates.insert((caller, call.0), (target, owner, OwningDescriptorDestination::Fresh(receiver)));
     }
     if candidates.is_empty() { return; }
     let sealed = closed_descriptor_routes(ordinary, declarations, routes, bodies, result, |route| match *route {
@@ -5883,12 +5899,19 @@ fn seal_array_descriptor_identities(
         }
         let uses = ordinary.array_uses[&key].as_ref().expect("complete descriptor call census");
         for &(caller, call) in uses {
-            if let Some(&(_, binding, destination, observation)) = candidates.get(&(caller, call)) {
+            if let Some(&(_, binding, destination)) = candidates.get(&(caller, call)) {
                 let plan = result.bodies.entry(caller).or_default();
-                plan.same_array_rebinds.insert(call, destination);
-                plan.array_descriptor_rebinds.insert(call, (binding, destination));
                 plan.array_descriptor_calls.insert(call);
-                plan.replacement_extent_observation = Some(observation);
+                match destination {
+                    OwningDescriptorDestination::Rebind { place, observation } => {
+                        plan.same_array_rebinds.insert(call, place);
+                        plan.array_descriptor_rebinds.insert(call, (binding, place));
+                        plan.replacement_extent_observation = Some(observation);
+                    }
+                    OwningDescriptorDestination::Fresh(receiver) => {
+                        plan.widened_owning_receives.insert(call, (binding, receiver));
+                    }
+                }
             }
         }
     }
@@ -6646,6 +6669,7 @@ fn closed_aggregates<'a>(
     let mut literal_array_callers = Vec::new();
     let mut widened_return_requirements = Vec::new();
     let mut widened_owning_roundtrips = Vec::new();
+    let mut widened_owning_receives = Vec::new();
     let mut returned_extent_requirements = Vec::new();
     let mut formal_extent_requirements = Vec::new();
     let mut borrowed_extent_requirements = Vec::new();
@@ -6659,6 +6683,8 @@ fn closed_aggregates<'a>(
         if let Some(facts) = body.facts {
             // Borrow only completed caller proofs during this existing pass.
             // BTreeMap order preserves enrollment precedence at finalization.
+            widened_owning_receives.extend(facts.widened_owning_receives.iter()
+                .map(|&(point, call, owner, receiver)| (key, body, point, call, owner, receiver)));
             if let Some((call, install, owner)) = facts.widened_owning_roundtrip {
                 widened_owning_roundtrips.push((key, body.source, call.0, install, owner));
             }
@@ -7023,7 +7049,14 @@ fn closed_aggregates<'a>(
         }
 
         seal_array_descriptor_identities(&ordinary, &returned_extent_requirements,
-            &declarations, &array_descriptor_identities, &bodies, &mut result);
+            &widened_owning_receives, &declarations, &array_descriptor_identities, &bodies, &mut result);
+        for &(key, body, _, call, source, receiver) in &widened_owning_receives {
+            if !result.bodies.get(&key).is_some_and(|plan|
+                plan.widened_owning_receives.get(&call.0) == Some(&(source, receiver)))
+            {
+                return Err(format!("widened array move requires a closed exact owning receiver in {:?}", body.source));
+            }
+        }
         for &(key, source, call, install, owner) in &widened_owning_roundtrips {
             let Some(plan) = result.bodies.get_mut(&key).filter(|plan|
                 plan.array_descriptor_rebinds.get(&call).is_some_and(|(actual, _)| *actual == owner))

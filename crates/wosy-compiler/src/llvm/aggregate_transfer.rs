@@ -418,8 +418,11 @@ pub(super) fn emit_array_descriptor_call<'ctx>(
         return Ok(None);
     }
     let function = *state.functions.get(symbol).ok_or("missing checked array descriptor producer")?;
-    let rebind = state.aggregate.as_ref().and_then(|aggregate| aggregate.plan.array_descriptor_rebinds.get(&ordinal)).copied();
-    let args = if let Some((declaration, _)) = rebind {
+    let plan = state.aggregate.as_ref().expect("sealed array descriptor call").plan;
+    let rebind = plan.array_descriptor_rebinds.get(&ordinal).map(|&(declaration, _)| declaration);
+    let fresh = plan.widened_owning_receives.get(&ordinal).map(|&(declaration, _)| declaration);
+    let owning = rebind.or(fresh);
+    let args = if let Some(declaration) = owning {
         let [argument @ ScalarExpression::Name { name, .. }] = arguments else {
             return Err("checked array rebind has no exact lexical argument".into());
         };
@@ -429,7 +432,7 @@ pub(super) fn emit_array_descriptor_call<'ctx>(
         let [EmitValue::Basic(BasicValueEnum::PointerValue(base))] = values else {
             return Err("checked array rebind requires one backing pointer".into());
         };
-        let length = if state.aggregate.as_ref().and_then(|aggregate| aggregate.plan.widened_owning_roundtrip)
+        let length = if fresh.is_some() || plan.widened_owning_roundtrip
             .is_some_and(|(call, _, owner)| call == ordinal && owner == declaration)
         {
             let Some(&(owner, LocalRuntimeExtent::WidenedLiteral(length), true)) = state.local_runtime_extents.get(base)
@@ -454,13 +457,54 @@ pub(super) fn emit_array_descriptor_call<'ctx>(
     }).collect::<Result<Vec<BasicMetadataValueEnum<'ctx>>, _>>()? };
     if function.get_linkage() != Linkage::Internal || function.count_params() as usize != args.len()
         || function.get_type().get_return_type() != Some(array_descriptor_type(context).into())
-        || (rebind.is_some() && function.get_type().get_param_types().as_slice() != [array_descriptor_type(context).into()])
+        || (owning.is_some() && function.get_type().get_param_types().as_slice() != [array_descriptor_type(context).into()])
     {
         return Err("checked array descriptor transport differs from prepared call".into());
     }
     let value = state.builder.build_call(function, &args, "array_descriptor").map_err(builder_error)?
         .try_as_basic_value().basic().ok_or("missing checked array descriptor result")?;
     Ok(Some(EmitValue::Basic(value)))
+}
+
+pub(super) fn install_widened_owning_receiver<'ctx>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, '_>,
+    binding: &ScalarBinding,
+    value: &EmitValue<'ctx>,
+) -> Result<bool, String> {
+    let Some(plan) = state.aggregate.as_ref().map(|aggregate| aggregate.plan)
+        .filter(|plan| !plan.widened_owning_receives.is_empty()) else { return Ok(false) };
+    let nodes = state.body_call_nodes.ok_or("missing checked owning array receiver nodes")?;
+    let Some((source, receiver)) = nodes.expression_ordinal(&binding.value)
+        .and_then(|call| plan.widened_owning_receives.get(&call)).copied()
+    else { return Ok(false) };
+    let ([receiver_slot], ScalarExpression::Call { arguments, .. }) =
+        (binding.receivers.as_slice(), &binding.value)
+    else { return Err("missing exact widened array receiving binding".into()); };
+    let [argument @ ScalarExpression::Name { name, .. }] = arguments.as_slice()
+    else { return Err("missing exact widened array source".into()); };
+    if receiver_slot.name_span != receiver || nodes.binding_position(binding).is_none()
+        || nodes.lexical_expression_declaration(argument) != Some(source) || name == &receiver_slot.name
+        || state.runtime_array_owners.get(name) != Some(&true)
+        || state.runtime_array_allocations.get(name) != Some(&true)
+    { return Err("widened owning receiver changed its exact lexical move".into()); }
+    let (previous, _) = state.storage.get(name).ok_or("missing original widened array backing")?;
+    if !matches!(state.local_runtime_extents.get(previous),
+        Some((declaration, LocalRuntimeExtent::WidenedLiteral(_), true)) if *declaration == source)
+    { return Err("widened owning receiver lost its active source extent".into()); }
+    let previous = *previous;
+    let EmitValue::Basic(BasicValueEnum::StructValue(pair)) = value
+    else { return Err("missing returned widened array descriptor".into()); };
+    if pair.get_type() != array_descriptor_type(context) {
+        return Err("invalid returned widened array descriptor".into());
+    }
+    let base = state.builder.build_extract_value(*pair, 0, "array_descriptor_backing").map_err(builder_error)?.into_pointer_value();
+    let count = state.builder.build_extract_value(*pair, 1, "array_descriptor_extent").map_err(builder_error)?.into_int_value();
+    install_runtime_array_binding_owner(state, &receiver_slot.name, true, true, Some(name));
+    state.storage.insert(receiver_slot.name.clone(), (base, receiver_slot.ty.clone()));
+    state.local_runtime_extents.remove(&previous);
+    state.local_runtime_extents.insert(base, (receiver, LocalRuntimeExtent::WidenedLiteral(count), true));
+    Ok(true)
 }
 
 pub(super) fn definition_type<'ctx>(
