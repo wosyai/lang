@@ -3987,6 +3987,25 @@ impl SymbolicRootProof for SelectedSymbolicProof<'_, '_> {
                 return Ok(Some(active || returned));
             }
         };
+        if watched.pure_affine_target == Some(target) && super::checker_flow::pure_affine_proof_body(calls) {
+            // Observed pure values do not issue summaries. A group shares
+            // one producer traversal, not each goal's diagnostic.
+            let count = rest.len().checked_add(1).ok_or(ProjectCheck::Unsupported)?;
+            super::checker_flow::charge_call_work(&mut 0, count).ok_or(ProjectCheck::Unsupported)?;
+            let proofs = std::iter::once(first).chain(rest);
+            let mut checks = proofs.clone().map(|proof| {
+                let bound = proof.bound.literal().ok_or(ProjectCheck::Unsupported)?;
+                Ok(super::checker_flow::SymbolicLiteralCheck { relation: proof.relation, bound, failure: None })
+            }).collect::<Result<Vec<_>, ProjectCheck>>()?;
+            let returned = super::checker_flow::collect_pure_affine_literal_proofs(calls, &function.body, first.filter, &mut checks)
+                .ok_or(ProjectCheck::Unsupported)?;
+            for (proof, check) in proofs.zip(checks) {
+                if let Some(failure) = check.failure {
+                    self.record(proof, function, source, effects.records.len(), failure, None)?;
+                }
+            }
+            return Ok(Some(returned));
+        }
         let predicate = match first.filter {
             [CheckerPredicate::Integer(predicate)] if rest.is_empty() => Some(predicate),
             _ if tautological(first) && rest.iter().all(tautological) => None,
@@ -4009,19 +4028,6 @@ impl SymbolicRootProof for SelectedSymbolicProof<'_, '_> {
                 return Ok(Some(active || returned));
             }
             let first_bound = first.bound.literal().ok_or(ProjectCheck::Unsupported)?;
-            if watched.pure_affine_target == Some(target) && super::checker_flow::pure_affine_proof_body(calls) {
-                // This lane checks an observed value, but does not issue a
-                // reusable summary or authorize imports from it.
-                let (active, directives, returned, failure) =
-                    super::checker_flow::collect_ordered_pure_affine_literal_proof(
-                        calls, &function.body, first.relation, first_bound, first.filter,
-                    ).ok_or(ProjectCheck::Unsupported)?;
-                debug_assert!(directives.is_empty());
-                if let Some(failure) = failure {
-                    self.record(first, function, source, effects.records.len(), failure, None)?;
-                }
-                return Ok(Some(active || returned));
-            }
             let candidate = group.issuer.as_ref().filter(|_| first.proof_source == source);
             let (active, directives, returned, failure) = if candidate.is_some() {
                 super::checker_flow::collect_ordered_root_literal_proof::<true>(
@@ -4416,18 +4422,26 @@ impl<'a> MainFlowProofObserver<'a> {
         } else {
             None
         };
-        let pure_affine = plan.steps.items.is_empty() && plan.typed.measure.is_none()
-            && matches!(&plan.typed.goal, TypedProofGoal::Literal { .. })
-            && matches!(proof.0.filter, [] | [CheckerPredicate::Boolean(true) | CheckerPredicate::Integer(_)]);
+        let pure_affine = Self::eligible_pure_affine_case(plan, &proof);
         let mut observer = Self::new(plan.target, proof);
         observer.pure_affine_target = pure_affine.then_some(plan.target);
         observer.first.1.issuer = issuer;
         Ok(observer)
     }
 
+    fn eligible_pure_affine_case(plan: &PlannedModuleProof<'_>, proof: &MainFlowProofPlan<'_>) -> bool {
+        plan.steps.items.is_empty() && plan.typed.measure.is_none()
+            && matches!(&plan.typed.goal, TypedProofGoal::Literal { .. })
+            && matches!(proof.0.filter, [] | [CheckerPredicate::Boolean(true) | CheckerPredicate::Integer(_)])
+    }
+
     fn insert(&mut self, scope: ScalarCheckerScope, allow_issuer: bool, plan: &PlannedModuleProof<'a>, proof: MainFlowProofPlan<'a>) {
-        self.pure_affine_target = None;
         let target = plan.target;
+        if self.pure_affine_target != Some(target) || !Self::eligible_pure_affine_case(plan, &proof)
+            || !matches!(&self.first.1.cases, MainFlowProofCases::Bare { first, .. } if first.filter == proof.0.filter)
+        {
+            self.pure_affine_target = None;
+        }
         if self.first.0 == target {
             self.first.1.issuer = None;
             self.first.1.cases.push(proof);
@@ -4462,8 +4476,8 @@ impl ActualIntegerObserver for MainFlowProofObserver<'_> {
 
     fn permits_named_pure_affine_return(&self, target: PreparedCallable, arguments: &[&BigInt]) -> bool {
         if self.pure_affine_target != Some(target) { return false; }
-        let MainFlowProofCases::Bare { first, rest } = &self.first.1.cases else { return false; };
-        rest.is_empty() && first.guard.accepts(arguments)
+        let MainFlowProofCases::Bare { first, .. } = &self.first.1.cases else { return false; };
+        first.guard.accepts(arguments)
     }
 
     fn observe_initializer(
@@ -11901,6 +11915,43 @@ mod tests {
         assert!(run(unused, ScalarCheckerScope::CurrentPackage).unwrap().symbolic_diagnostic.is_some());
         let invalid = unused.replace("ensures", "where (false) ensures").replace("out >= 7", "out >= 128");
         assert!(matches!(run(&invalid, ScalarCheckerScope::MainFlowOnly), Err(ProjectCheck::InvalidProof)));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordered_pure_affine_bare_goals_share_guard_and_keep_distinct_preimages() {
+        let app = source("src/main.w", "grouped-ordinary-affine-proof");
+        let symbolic = r#"%%start
+            i8(i8) advance = fn(value) { i8 shifted = value + 2; shifted };
+            proof first for advance(entry) -> (out) where (entry <= 100) ensures (out >= -125) {}
+            proof second for advance(entry) -> (out) where (entry <= 100) ensures (out <= 101) {}
+        %%end"#;
+        let run = |text: &str, scope| {
+            let (_, proof) = crate::parse_proof_source(app.clone(), text.to_owned(), &[]).unwrap_or_else(|_| panic!("valid grouped affine proof"));
+            check_loaded_ordered_proof_diagnostics(
+                Vec::new(), vec![(proof, Vec::new())], vec![app.clone()], inputs(), scope,
+            )
+        };
+        let receipt = run(symbolic, ScalarCheckerScope::CurrentPackage).unwrap();
+        let first = receipt.symbolic_diagnostic.unwrap();
+        let [second] = receipt.additional_symbolic_diagnostics.as_slice() else { panic!("separate conclusions"); };
+        for (failure, entry, output) in [(&first, -128, -126), (second, 100, 102)] {
+            assert_eq!(failure.returned, BigInt::from(output));
+            let entry = BigInt::from(entry);
+            assert!(failure.witness.intervals_at(0, 0).unwrap().eq([(&entry, &entry)]));
+        }
+        let actual = symbolic.replace("out >= -125", "out <= 100").replace("%%end", r#"
+            i8 result = advance(100);
+            core.require(result == 102, { .stdout = ""; .stderr = "wrong result"; .code = 9; .files = []; });
+        %%end"#);
+        let receipt = run(&actual, ScalarCheckerScope::MainFlowOnly).unwrap();
+        let [first, second] = receipt.diagnostics.as_slice() else { panic!("two goals, one call"); };
+        assert!(Rc::ptr_eq(&first.invocation, &second.invocation));
+        assert_eq!(first.invocation.returned, BigInt::from(102));
+        assert!(receipt.directives.is_empty());
+        let different = actual.replace("proof second for advance(entry) -> (out) where (entry <= 100)",
+            "proof second for advance(entry) -> (out) where (entry <= 99)");
+        assert!(matches!(run(&different, ScalarCheckerScope::MainFlowOnly), Err(ProjectCheck::Unsupported)));
     }
 
     #[cfg(feature = "internal-checker")]

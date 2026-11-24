@@ -1532,6 +1532,14 @@ ordinary_pure_affine_proof_reached = ordinary_pure_affine_proof.replace("%%end",
     core.require(first == 101, {report(57,"BAD-FIRST")});
     core.require(second == 102, {report(59,"BAD-SECOND")});
     %%end""")
+grouped_affine_proof = ordinary_pure_affine_proof.replace("%%end",
+    "proof lower for advance(entry) -> (out) where (entry <= 100) ensures (out >= -126) {} %%end")
+grouped_affine_proof_reached = ordinary_pure_affine_proof_reached.replace("%%end",
+    "proof lower for advance(entry) -> (out) where (entry <= 100) ensures (out >= -126) {} %%end")
+cases.extend([
+    ("ordinary-pure-affine-proof-shared-guard",grouped_affine_proof,0,b""),
+    ("exact-startup-ordinary-pure-affine-proof-shared-guard",grouped_affine_proof_reached,0,b""),
+])
 proof_diagnostic_notes = {
     "ordinary-pure-affine-proof-symbolic-refuted": b"symbolic call can return 102",
     "exact-startup-ordinary-pure-affine-proof-refuted": b"call returned 102",
