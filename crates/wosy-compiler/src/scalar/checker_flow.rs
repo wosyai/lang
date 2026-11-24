@@ -1447,6 +1447,8 @@ struct IntegerRoots<'a> {
     #[cfg(feature = "internal-checker")]
     allow_exact_contextual_bool: bool,
     #[cfg(feature = "internal-checker")]
+    allow_symbolic_contextual_bool: bool,
+    #[cfg(feature = "internal-checker")]
     allow_real_integer_tail_call: bool,
     #[cfg(feature = "internal-checker")]
     allow_extended_scalar_locals: bool,
@@ -3980,6 +3982,9 @@ fn run_integer_callable<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool,
         #[cfg(feature = "internal-checker")]
         allow_extended_scalar_locals: authored_return.allows_extended_scalar_locals(),
         #[cfg(feature = "internal-checker")]
+        allow_symbolic_contextual_bool: COLLECT && !USE_IMPORTED_BOUND
+            && authored_return.allows_extended_scalar_locals() && calls.structure.checker_has_bool_contextual_declaration,
+        #[cfg(feature = "internal-checker")]
         allow_ordinary_affine_overwrites: Authored::ALLOW_ORDINARY_INTEGER_LOCALS,
         #[cfg(feature = "internal-checker")]
         allow_ordinary_contextual_places: Authored::ALLOW_ORDINARY_INTEGER_LOCALS
@@ -4352,7 +4357,9 @@ impl IntegerInputs {
                 }
             }
             Boolean::Binding(binding) | Boolean::ContextualBinding(binding) => {
-                if matches!(condition, Boolean::ContextualBinding(_)) && !roots.allow_exact_contextual_bool {
+                if matches!(condition, Boolean::ContextualBinding(_))
+                    && !roots.allow_exact_contextual_bool && !roots.allow_symbolic_contextual_bool
+                {
                     return None;
                 }
                 let (axis, ty) = roots.lookup(binding)?;
@@ -5110,6 +5117,23 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
             }
             BlockItemKind::Assignment { group } => {
                 #[cfg(feature = "internal-checker")]
+                if roots.allow_symbolic_contextual_bool {
+                    if let Some((binding, ScalarType::Bool, rhs, destination)) = checked_scalar_assignment(calls, group) {
+                        if structure.checker_contextual_occurrences.contains(&destination) {
+                            let (axis, ty) = roots.lookup(binding)?;
+                            if *ty != ScalarType::Bool { return None; }
+                            let operand = contextual_boolean_source(calls, roots, rhs)?;
+                            let width = roots.axes.len();
+                            let work = roots.ordinary_local_work.get_or_insert(0);
+                            charge_call_work(work, width.checked_add(1)?)?;
+                            let mut changes = std::iter::repeat_with(|| None).take(width).collect::<Vec<_>>();
+                            changes[axis] = Some(operand);
+                            path = path.parallel_overwrite(&changes, work)?;
+                            continue;
+                        }
+                    }
+                }
+                #[cfg(feature = "internal-checker")]
                 if roots.allow_exact_contextual_bool {
                     if let Some((binding, ScalarType::Bool, rhs, destination)) = checked_scalar_assignment(calls, group) {
                         if structure.checker_contextual_occurrences.contains(&destination) {
@@ -5317,6 +5341,26 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                 }
                 if let [receiver] = binding.receivers() {
                     if let Some(identity) = &receiver.contextual_storage {
+                        #[cfg(feature = "internal-checker")]
+                        if receiver.ty == ScalarType::Bool && roots.allow_symbolic_contextual_bool {
+                            let BindingInitialization::Outputs(outputs) = &binding.initialization else { return None; };
+                            if !outputs.secondary.is_empty() || structure.checker_integer_locals.get(&(block, item.position))? != identity {
+                                return None;
+                            }
+                            match contextual_boolean_source(calls, roots, outputs.primary)? {
+                                ParallelScalarSource::Copy(axis) => path.append_ordinary_copy(axis, roots)?,
+                                ParallelScalarSource::Literal(value) => {
+                                    let work = roots.ordinary_local_work.get_or_insert(0);
+                                    for row in &path.0 {
+                                        let growth = if row.len() == row.cells.capacity() { row.len() } else { 0 };
+                                        charge_call_work(work, growth.checked_add(1)?)?;
+                                    }
+                                    path.append_shared_local(&value);
+                                }
+                            }
+                            roots.add(identity, &receiver.ty);
+                            continue;
+                        }
                         #[cfg(feature = "internal-checker")]
                         if receiver.ty == ScalarType::Bool && roots.allow_exact_contextual_bool {
                             let BindingInitialization::Outputs(outputs) = &binding.initialization else { return None; };
@@ -5752,6 +5796,12 @@ impl<'a> ExactCallCursor<'a> {
         debug_assert!(self.tail.is_some_and(is_integer_type)
             && self.projected_slot.is_none() && self.projected_pair.is_none());
         self.roots.allow_real_integer_tail_call = true;
+    }
+
+    #[cfg(feature = "internal-checker")]
+    pub(super) fn allow_symbolic_contextual_bool(&mut self) {
+        debug_assert!(self.projected_slot.is_none() && self.projected_pair.is_none());
+        self.roots.allow_symbolic_contextual_bool = true;
     }
 
     #[cfg(feature = "internal-checker")]
@@ -6818,20 +6868,31 @@ fn exact_returning_local_write_value(
 }
 
 #[cfg(feature = "internal-checker")]
-fn exact_contextual_boolean_value(
-    calls: &FunctionCallSites, roots: &IntegerRoots<'_>, row: &IntegerRow, rhs: OccurrenceOrdinal,
-) -> Option<Rc<IntegerSet>> {
+fn contextual_boolean_source(
+    calls: &FunctionCallSites, roots: &IntegerRoots<'_>, rhs: OccurrenceOrdinal,
+) -> Option<ParallelScalarSource> {
     if calls.structure.checked_types.expressions.get(&rhs)? != &ScalarType::Bool { return None; }
     if let Some(value) = scalar_call_literal(&calls.structure, rhs, &ScalarType::Bool, true) {
         bool_result_lane(value)?;
-        return Some(Rc::new(IntegerSet::singleton(value)));
+        return Some(ParallelScalarSource::Literal(Rc::new(IntegerSet::singleton(value))));
     }
     let PlainNameIdentity::Lexical(source) = calls.prepared_plain_name(rhs)? else { return None; };
     let (axis, ty) = roots.lookup(source)?;
-    if *ty != ScalarType::Bool { return None; }
-    let value = row.get(axis)?;
-    bool_result_lane(value.singleton_value()?)?;
-    Some(Rc::clone(value))
+    (*ty == ScalarType::Bool).then_some(ParallelScalarSource::Copy(axis))
+}
+
+#[cfg(feature = "internal-checker")]
+fn exact_contextual_boolean_value(
+    calls: &FunctionCallSites, roots: &IntegerRoots<'_>, row: &IntegerRow, rhs: OccurrenceOrdinal,
+) -> Option<Rc<IntegerSet>> {
+    match contextual_boolean_source(calls, roots, rhs)? {
+        ParallelScalarSource::Literal(value) => Some(value),
+        ParallelScalarSource::Copy(axis) => {
+            let value = row.get(axis)?;
+            bool_result_lane(value.singleton_value()?)?;
+            Some(Rc::clone(value))
+        }
+    }
 }
 
 fn integer_assignment(

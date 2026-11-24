@@ -914,6 +914,9 @@ fn check_unused_module<const COLLECT: bool, const ENTRY_EVIDENCE: bool, Proof: S
             if !Proof::ENABLED && body.structure.checker_has_extended_scalar_local {
                 cursor.allow_extended_scalar_locals();
             }
+            if !Proof::ENABLED && body.structure.checker_has_bool_contextual_declaration {
+                cursor.allow_symbolic_contextual_bool();
+            }
             symbolic.run_call_cursor(body, &module.source, cursor, None, Some(collection))?;
             active |= symbolic.had_obligations;
             continue;
@@ -14278,6 +14281,51 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
             assert!(matches!(result, Err(ProjectCheck::Unsupported)));
             assert!(output.records.is_empty());
             assert!(actual.active.is_empty());
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn symbolic_contextual_boolean_writes_preserve_old_aliases_and_restore_outer_scope() {
+        let app = source("src/main.w", "symbolic-contextual-bool");
+        let program = r#"%%start
+            unit(bool) inspect = fn(input) {
+                bool core.context.ready = input;
+                bool prior = core.context.ready;
+                if (prior) {
+                    bool core.context.ready = core.context.ready;
+                    core.context.ready = false;
+                    core.require(core.context.ready, { .stdout = ""; .stderr = ""; .code = 98;
+                        .files = [{ .path = "inner.json"; .state = core.context.ready; }]; });
+                    core.require(prior, { .stdout = ""; .stderr = "lost alias"; .code = 96; .files = []; });
+                    core.context.ready = prior;
+                    core.require(core.context.ready, { .stdout = ""; .stderr = "lost copied write"; .code = 97; .files = []; });
+                    core.context.ready = false;
+                } else {
+                    core.require(!core.context.ready, { .stdout = ""; .stderr = "wrong initial lane"; .code = 95; .files = []; });
+                };
+                core.require(!core.context.ready, { .stdout = ""; .stderr = ""; .code = 99;
+                    .files = [{ .path = "outer.json"; .state = core.context.ready; }]; });
+            };
+        %%end"#;
+        let actual = program.replace("%%end", "inspect(false); inspect(true); %%end");
+        for (text, scope) in [(program, ScalarCheckerScope::CurrentPackage),
+            (actual.as_str(), ScalarCheckerScope::MainFlowOnly), (actual.as_str(), ScalarCheckerScope::CurrentPackage)]
+        {
+            let prepared = prepare_proof_target(&app, text).unwrap();
+            let receipt = run_closed_without_named_proofs(&prepared, scope, 1).unwrap();
+            let [inner, outer] = receipt.directives.as_slice() else { panic!("inner and restored outer Boolean states"); };
+            assert_eq!((inner.code(), outer.code()), (&BigInt::from(98), &BigInt::from(99)));
+            let inner_axes = inner.witness.axes().collect::<Vec<_>>();
+            let outer_axes = outer.witness.axes().collect::<Vec<_>>();
+            assert_eq!((inner_axes.len(), outer_axes.len()), (4, 3));
+            assert_eq!(inner_axes[1], outer_axes[1]);
+            assert_ne!(inner_axes[3], outer_axes[1]);
+            let one = BigInt::from(1);
+            assert!(inner.witness.intervals_at(0, 0).unwrap().eq([(&one, &one)]));
+            assert!(outer.witness.intervals_at(0, 0).unwrap().eq([(&one, &one)]));
+            assert_eq!(inner.files()[0].text.as_ref(), b"{\"type\":{\"kind\":\"bool\"},\"value\":false}\n");
+            assert_eq!(outer.files()[0].text.as_ref(), b"{\"type\":{\"kind\":\"bool\"},\"value\":true}\n");
         }
     }
 

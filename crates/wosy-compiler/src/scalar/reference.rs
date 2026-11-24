@@ -6406,7 +6406,7 @@ impl OccurrenceStructure {
     #[cfg(feature = "internal-checker")]
     pub(super) fn has_ordinary_integer_operations(&self) -> bool {
         !self.checker_ordinary_scalar_locals.is_empty() || !self.checker_selected_snapshots.is_empty() || self.has_ordinary_predicates()
-            || self.has_ordinary_contextual_places()
+            || self.has_ordinary_contextual_places() || self.checker_has_bool_contextual_declaration
     }
 
     #[cfg(feature = "internal-checker")]

@@ -1025,9 +1025,29 @@ contextual_bool_scopes = f"""%%start
     }};
     startup();
     %%end"""
+symbolic_contextual_bool = f"""%%start
+    unit(bool) inspect = fn(input) {{
+        bool core.context.ready = input;
+        bool prior = core.context.ready;
+        if (prior) {{
+            bool core.context.ready = core.context.ready;
+            core.context.ready = false;
+            core.require(core.context.ready, {state_report(220,"INNER-FALSE","core.context.ready").replace("state.json","inner.json")});
+            core.require(prior, {report(223,"LOST-ALIAS")});
+            core.context.ready = prior;
+            core.require(core.context.ready, {report(224,"LOST-WRITE")});
+            core.context.ready = false;
+        }} else {{
+            core.require(!core.context.ready, {report(222,"WRONG-PREIMAGE")});
+        }};
+        core.require(!core.context.ready, {state_report(221,"OUTER-TRUE","core.context.ready").replace("state.json","outer.json")});
+    }};
+    %%end"""
 cases.extend([
     ("exact-startup-contextual-bool-restores-outer",contextual_bool_scopes,220,b"INNER-FALSEOUTER-TRUE"),
-    ("symbolic-contextual-bool-still-fails-closed",contextual_bool_scopes.replace("    startup();", ""),2,b"unsupported analysis"),
+    ("symbolic-contextual-bool-restores-outer",symbolic_contextual_bool,220,b"INNER-FALSEOUTER-TRUE"),
+    ("exact-startup-contextual-bool-restores-symbolic-shape",symbolic_contextual_bool.replace(
+        "%%end","inspect(false); inspect(true); %%end"),220,b"INNER-FALSEOUTER-TRUE"),
 ])
 namespace_scalar_key = "exact-startup-completed-namespace-scalar-return"
 namespace_scalar_main = f"""%%start
@@ -2027,10 +2047,12 @@ authored_files = {
     )},
     "authored-lexical-code-resolves-failure-witness": {"state.json": b'{"type":{"kind":"i8"},"value":37}\n'},
     "exact-startup-lexical-code-resolves-failed-narrow": {"state.json": b'{"type":{"kind":"i8"},"value":43}\n'},
-    "exact-startup-contextual-bool-restores-outer": {
+    **{key: {
         "inner.json": b'{"type":{"kind":"bool"},"value":false}\n',
         "outer.json": b'{"type":{"kind":"bool"},"value":true}\n',
-    },
+    } for key in ("exact-startup-contextual-bool-restores-outer",
+                   "symbolic-contextual-bool-restores-outer",
+                   "exact-startup-contextual-bool-restores-symbolic-shape")},
     "authored-state-fixed-array-precision": {"state.json": fixed_array_bytes, "copy.json": fixed_array_bytes},
     "authored-state-array-inside-nominal": {"state.json": nested_array_bytes},
     namespace_scalar_key: {
