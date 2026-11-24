@@ -236,10 +236,50 @@ if (inspect(true) != 7 || inspect(false) != 9) { core.system_panic(); };
     assert_ne!(absent, program);
     check(&absent, Expected::NullParent);
     let above_cap = program
+        .replace("u8(bool, bool) select_value = fn(outer, inner)",
+            "u8(bool, bool, bool) select_value = fn(outer, inner, extra)")
         .replace("u8 fourth = 10;", "u8 fourth = 10; u8 fifth = 11;")
-        .replace("parent = &!fourth;", "if (outer) { parent = &!fourth; } else { parent = &!fifth; };");
+        .replace("parent = &!fourth;", "if (extra) { parent = &!fourth; } else { parent = &!fifth; };")
+        .replace("select_value(true, true)", "select_value(true, true, false)")
+        .replace("select_value(true, false)", "select_value(true, false, false)")
+        .replace("select_value(false, true)", "select_value(false, true, false)")
+        .replace("select_value(false, false) == 10",
+            "select_value(false, false, true) == 10 && select_value(false, false, false) == 11");
     assert_ne!(above_cap, program);
     check(&above_cap, Expected::NullParent);
+}
+
+#[test]
+fn joined_predecessors_reuse_same_loan_across_independent_edges() {
+    let program = r#"%%start
+u8(bool, bool) select_value = fn(outer, inner) {
+    u8 first = 7;
+    u8 second = 9;
+    u8 third = 13;
+    u8 fourth = 15;
+    *!u8 parent = null;
+    *u8 side = null;
+    if (outer) { parent = &!first; } else { parent = &!second; };
+    if (inner) { side = &third; } else { side = &fourth; };
+    *u8 child = &(*parent);
+    u8 seen = *child;
+    u8 side_value = *side;
+    first = 3;
+    bool correct_side = if (inner) { side_value == 13 } else { side_value == 15 };
+    if (first == 3 && correct_side) { seen } else { 0 }
+};
+u8(bool) inspect = fn(choose) {
+    u8 left = select_value(choose, true);
+    u8 right = select_value(choose, false);
+    if (left == right) { left } else { 0 }
+};
+if (inspect(true) != 7 || inspect(false) != 9) { core.system_panic(); };
+%%end"#;
+    check_case(program, Expected::Valid, Some("WOSY_JOINED_DUPLICATE_EDGES_IR_DIR"));
+    let live = program.replace("u8 seen = *child;\n    u8 side_value = *side;\n    first = 3;",
+        "first = 3;\n    u8 seen = *child;\n    u8 side_value = *side;");
+    assert_ne!(live, program);
+    check(&live, Expected::LiveConflict);
 }
 
 #[test]

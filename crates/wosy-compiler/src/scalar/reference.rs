@@ -7305,6 +7305,11 @@ fn checked_joined_reborrow_parents(
     let mut owners: Vec<&ReferencePlaceId> = Vec::with_capacity(states.len());
     for state in states {
         let id = checked_joined_reborrow_parent(site, facts, allocations, pointer, state, binding)?;
+        // Unrelated branches may keep exactly the same issued loan. This is
+        // not equivalent to separate overlapping issuances from the same place.
+        if selected.contains(&id) {
+            continue;
+        }
         let ReferenceOrigin::Fresh { loan, .. } = &facts[id.0] else { return None };
         let owner = &loan.origin_place;
         if owners.iter().any(|prior| reference_places_overlap(prior, owner)) {
@@ -7312,6 +7317,9 @@ fn checked_joined_reborrow_parents(
         }
         selected.push(id);
         owners.push(owner);
+    }
+    if selected.len() < 2 {
+        return None;
     }
     // Check exact same-scope lexical declarations with one shared prefix pass,
     // even if several disjoint alternatives belong to the same aggregate.
