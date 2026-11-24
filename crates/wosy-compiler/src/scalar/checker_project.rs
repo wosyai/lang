@@ -4,6 +4,9 @@ use num_bigint::BigInt;
 #[cfg(feature = "internal-checker")]
 use std::hash::{Hash, Hasher};
 
+#[cfg(feature = "internal-checker")]
+mod array_quantifier;
+
 use super::{
     checker_directive::{CheckerCode, CheckedLiteralOutput, CheckerOperation, InitializerIntegerOperand, InitializerPredicate, PreparedCheckerDirective},
     checker_flow::{
@@ -419,6 +422,7 @@ enum OrderedReachPolicy {
 trait OrderedRunEvidence: ActualIntegerObserver {
     type Symbolic<'a>: SymbolicRootProof where Self: 'a;
     type SymbolicReport: Default;
+    const HAS_NAMED_ROOT: bool = false;
 
     fn complete_startup(&self, reached: &HashSet<PreparedCallable>) -> Result<bool, ProjectCheck>;
     fn symbolic(&self) -> Self::Symbolic<'_>;
@@ -499,7 +503,7 @@ fn run_prepared_ordered_check_with_effects<E: OrderedRunEvidence>(
         HashMap::new()
     } else {
         let (potential_obligations, authored_roots) = package_obligation_roots(prepared, scope, startup_count, root)?;
-        if !potential_obligations && !E::CONTEXTUAL && effects.contextual_proof.is_none() {
+        if !potential_obligations && !E::CONTEXTUAL && !E::HAS_NAMED_ROOT && effects.contextual_proof.is_none() {
             return Ok(PreparedOrderedRun { active: false, directives: effects.records, actual: evidence, symbolic: E::SymbolicReport::default(), entry_evidence: None,
                 contextual_proof: effects.contextual_proof });
         }
@@ -1126,6 +1130,7 @@ struct SymbolicProofRuntime<'a> {
 trait SymbolicRootProof {
     const ENABLED: bool;
     const INTEGER_RETURN_PARTITIONS: bool = false;
+    const FIXED_ARRAY_RETURN: bool = false;
 
     fn seed(&self, _: &mut HashMap<usize, HashSet<usize>>, _: &HashSet<PreparedCallable>) {}
 
@@ -1169,7 +1174,8 @@ fn check_unused_module<const COLLECT: bool, const ENTRY_EVIDENCE: bool, Proof: S
         }
         if !matches!(body.boundary.results.as_slice(), [result]
             if result.ty == ScalarType::Unit || is_integer_type(&result.ty)
-                || (COLLECT && Proof::INTEGER_RETURN_PARTITIONS && result.ty == ScalarType::Bool))
+                || (COLLECT && Proof::INTEGER_RETURN_PARTITIONS && result.ty == ScalarType::Bool)
+                || (COLLECT && Proof::FIXED_ARRAY_RETURN && matches!(result.ty, ScalarType::Array { .. })))
         {
             return Err(ProjectCheck::Unsupported);
         }
@@ -4247,9 +4253,21 @@ pub struct MainFlowProofReceipt {
     pub directives: Vec<ScalarOrderedCheckerFailure>,
     pub diagnostics: Vec<MainFlowProofDiagnostic>,
     pub contextual_diagnostic: Option<ContextualProofDiagnostic>,
+    pub aggregate_diagnostic: Option<AggregateProofDiagnostic>,
     pub symbolic_diagnostic: Option<SymbolicProofDiagnostic>,
     pub additional_symbolic_diagnostics: Vec<SymbolicProofDiagnostic>,
     pub entry_evidence: Option<Box<ScalarOrderedEntryEvidence>>,
+}
+
+#[cfg(feature = "internal-checker")]
+#[doc(hidden)]
+pub struct AggregateProofDiagnostic {
+    pub proof: wosy_syntax::SourceSpan,
+    pub goal: wosy_syntax::SourceSpan,
+    pub failed_step: Option<wosy_syntax::SourceSpan>,
+    pub output: wosy_syntax::SourceSpan,
+    pub index: BigInt,
+    pub value: BigInt,
 }
 
 #[cfg(feature = "internal-checker")]
@@ -6376,7 +6394,7 @@ fn run_closed_ranked_checks<'a, 'proof, const LOCAL_CATALOGS: bool>(
             &prepared.prepared, scope, startup_count, OrderedReachPolicy::Closed, ranked,
         )?;
         return Ok(MainFlowProofReceipt {
-            active: run.active, directives: run.directives, diagnostics: Vec::new(), contextual_diagnostic: None,
+            active: run.active, directives: run.directives, diagnostics: Vec::new(), contextual_diagnostic: None, aggregate_diagnostic: None,
             symbolic_diagnostic: run.symbolic, additional_symbolic_diagnostics: Vec::new(),
             entry_evidence: run.entry_evidence,
         });
@@ -6413,7 +6431,7 @@ fn run_closed_ranked_checks<'a, 'proof, const LOCAL_CATALOGS: bool>(
     let (symbolic_diagnostic, additional_symbolic_diagnostics) = run.symbolic;
     Ok(MainFlowProofReceipt {
         active: run.active, directives: run.directives,
-        diagnostics: run.actual.bare.map_or_else(Vec::new, |bare| bare.observed.diagnostics), contextual_diagnostic: None,
+        diagnostics: run.actual.bare.map_or_else(Vec::new, |bare| bare.observed.diagnostics), contextual_diagnostic: None, aggregate_diagnostic: None,
         symbolic_diagnostic, additional_symbolic_diagnostics, entry_evidence: run.entry_evidence,
     })
 }
@@ -6424,7 +6442,7 @@ fn run_closed_without_named_proofs(
 ) -> Result<MainFlowProofReceipt, ProjectCheck> {
     let run = run_prepared_ordered_check(prepared, scope, startup_count, OrderedReachPolicy::Closed, ProofFreeOrderedEvidence)?;
     Ok(MainFlowProofReceipt {
-        active: run.active, directives: run.directives, diagnostics: Vec::new(), contextual_diagnostic: None,
+        active: run.active, directives: run.directives, diagnostics: Vec::new(), contextual_diagnostic: None, aggregate_diagnostic: None,
         symbolic_diagnostic: None, additional_symbolic_diagnostics: Vec::new(),
         entry_evidence: run.entry_evidence,
     })
@@ -6519,7 +6537,7 @@ fn check_loaded_ordered_proof_diagnostics_in_scope<const LOCAL_CATALOGS: bool>(
             }
         };
         return Ok(MainFlowProofReceipt {
-            active, directives, diagnostics: Vec::new(), contextual_diagnostic,
+            active, directives, diagnostics: Vec::new(), contextual_diagnostic, aggregate_diagnostic: None,
             symbolic_diagnostic: None, additional_symbolic_diagnostics: Vec::new(), entry_evidence: None,
         });
     }
@@ -6570,9 +6588,27 @@ fn check_loaded_ordered_proof_diagnostics_in_scope<const LOCAL_CATALOGS: bool>(
     let Some((source, name, definition, query)) = first.as_ref() else {
         return run_closed_without_named_proofs(&prepared.prepared, scope, startup_count);
     };
-    let first_plan = prepared.plan_resolved_module_proof::<true, false, false>(
-        source, name.text(), prepared.resolve_selected_proof(definition, *query)?,
-    )?;
+    let selected = prepared.resolve_selected_proof(definition, *query)?;
+    if array_quantifier::is_array_target(&prepared, &selected) {
+        if !others.is_empty() { return Err(ProjectCheck::Unsupported); }
+        let proof = array_quantifier::ArrayProof::prepare(&prepared, source, selected)?;
+        let run = run_prepared_ordered_check(
+            &prepared.prepared, scope, startup_count, OrderedReachPolicy::Closed,
+            array_quantifier::Evidence { plan: proof },
+        )?;
+        let aggregate_diagnostic = match run.symbolic {
+            Some(ProofCoverage::Applicable(failure)) => failure,
+            Some(ProofCoverage::NoApplicableInputs) => None,
+            None if scope == ScalarCheckerScope::MainFlowOnly => None,
+            None => return Err(ProjectCheck::Unsupported),
+        };
+        return Ok(MainFlowProofReceipt {
+            active: run.active, directives: if aggregate_diagnostic.is_some() { Vec::new() } else { run.directives },
+            diagnostics: Vec::new(), contextual_diagnostic: None, aggregate_diagnostic,
+            symbolic_diagnostic: None, additional_symbolic_diagnostics: Vec::new(), entry_evidence: run.entry_evidence,
+        });
+    }
+    let first_plan = prepared.plan_resolved_module_proof::<true, false, false>(source, name.text(), selected)?;
     let plans = others.iter().map(|(source, name, definition, query)| {
         let selected = prepared.resolve_selected_proof(definition, *query)?;
         prepared.plan_resolved_module_proof::<true, false, false>(source, name.text(), selected)
@@ -6600,7 +6636,7 @@ fn check_loaded_ordered_proof_diagnostics_in_scope<const LOCAL_CATALOGS: bool>(
     )?;
     let (symbolic_diagnostic, additional_symbolic_diagnostics) = run.symbolic;
     Ok(MainFlowProofReceipt {
-        active: run.active, directives: run.directives, diagnostics: run.actual.observed.diagnostics, contextual_diagnostic: None,
+        active: run.active, directives: run.directives, diagnostics: run.actual.observed.diagnostics, contextual_diagnostic: None, aggregate_diagnostic: None,
         symbolic_diagnostic, additional_symbolic_diagnostics, entry_evidence: run.entry_evidence,
     })
 }
@@ -7501,6 +7537,31 @@ impl PreparedProofModule {
     }
 
     fn check_module_proof_selections(&self, selections: &[(&SourceIdentity, &str)]) -> Vec<ScalarModuleProofOutcome> {
+        let mut single = if let [(source, name)] = selections {
+            Some(self.proofs.get_key_value(source).ok_or(ProjectCheck::MissingRoot)
+                .and_then(|(source, _)| self.select_resolved(source, name).map(|resolved| (source, resolved))))
+        } else { None };
+        if single.as_ref().and_then(|checked| checked.as_ref().ok())
+            .is_some_and(|(_, resolved)| array_quantifier::is_array_target(self, resolved))
+        {
+            let checked = single.take().ok_or(ProjectCheck::Unsupported).and_then(|result| result)
+                .and_then(|(source, resolved)| array_quantifier::ArrayProof::prepare(self, source, resolved))
+                .and_then(|plan| {
+                    let startup_count = self.prepared.parts().0.initialization_order.len();
+                    let run = run_prepared_ordered_check(
+                        &self.prepared, ScalarCheckerScope::CurrentPackage, startup_count, OrderedReachPolicy::Closed,
+                        array_quantifier::Evidence { plan },
+                    )?;
+                    if !run.directives.is_empty() { return Err(ProjectCheck::Unsupported); }
+                    match run.symbolic {
+                        Some(ProofCoverage::Applicable(Some(_))) => Ok(ProjectCheck::Refuted),
+                        Some(ProofCoverage::Applicable(None)) => Ok(ProjectCheck::Proved),
+                        Some(ProofCoverage::NoApplicableInputs) => Ok(ProjectCheck::NoApplicableInputs),
+                        None => Err(ProjectCheck::Unsupported),
+                    }
+                });
+            return vec![module_proof_outcome(checked)];
+        }
         let mut outcomes = vec![ScalarModuleProofOutcome::Unsupported; selections.len()];
         let mut selected = RequestedProofs::default();
         let mut duplicate = Vec::new();
@@ -7518,7 +7579,9 @@ impl PreparedProofModule {
                 bucket.additional.insert(name, index);
             }
             selected.distinct += 1;
-            let planned = if bucket.additional.is_empty() {
+            let planned = if let Some(resolved) = single.take() {
+                resolved.and_then(|(source, proof)| self.plan_resolved_module_proof::<true, true, false>(source, name, proof))
+            } else if bucket.additional.is_empty() {
                 self.plan_module_proof_in_scope::<true, true, false>(proof_source, name)
             } else {
                 (|| {
@@ -15991,6 +16054,60 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
                     Err(ScalarOrderedCheckerOutcome::Unsupported)));
             }
         }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordered_fixed_array_quantified_proofs_check_typed_actual_cells_and_witnesses() {
+        let app = source("src/main.w", "public-ordered-array-quantifiers");
+        let parse = |text: &str| crate::parse_proof_source(app.clone(), text.to_owned(), &[]).ok().unwrap().1;
+        let ordered = |text: &str, scope| check_loaded_scalar_ordered_local_proof_contexts(
+            Vec::new(), [(parse(text), Vec::new())], vec![app.clone()], inputs(), scope, Vec::new(),
+        );
+        let selected = |text: &str| check_loaded_scalar_module_proofs(
+            &["cells"], Vec::new(), (parse(text), Vec::new()), vec![app.clone()], inputs(),
+        ).unwrap();
+        let universal = r#"%%start
+            u8[4]() make4 = fn { [0, 7, 0, 0] };
+            proof cells for make4() -> (items)
+                forall (u64 i where i == 0 || i >= 2 && i < 4)
+                ensures (items[i] == 0)
+            { core.show(items[i] == 0); }
+        %%end"#;
+        let existential = r#"%%start
+            u8[4]() make4 = fn { [0, 7, 0, 0] };
+            proof cells for make4() -> (items)
+                ensures (exists (u64 i where i < 4) { items[i] == 7 })
+            { core.witness(1); }
+        %%end"#;
+        for passing in [universal, existential] {
+            let report = ordered(passing, ScalarCheckerScope::CurrentPackage).unwrap();
+            assert!(report.active && report.aggregate_diagnostic.is_none());
+            assert_eq!(selected(passing), [ScalarModuleProofOutcome::Proved]);
+        }
+        for (refuted, index, value, step) in [
+            (universal.replace("i == 0", "i == 1"), 1, 7, "core.show(items[i] == 0)"),
+            (existential.replace("witness(1)", "witness(2)"), 2, 0, "core.witness(2)"),
+        ] {
+            let failure = ordered(&refuted, ScalarCheckerScope::CurrentPackage).unwrap().aggregate_diagnostic.unwrap();
+            assert_eq!((failure.index, failure.value), (BigInt::from(index), BigInt::from(value)));
+            assert_eq!(failure.output.source, app);
+            let snippet = |span: ByteSpan| &refuted[span.start as usize..span.end as usize];
+            assert_eq!(snippet(failure.output.range), value.to_string());
+            assert_eq!(snippet(failure.failed_step.unwrap().range), step);
+            assert_eq!(selected(&refuted), [ScalarModuleProofOutcome::Refuted]);
+            let main = ordered(&refuted, ScalarCheckerScope::MainFlowOnly).unwrap();
+            assert!(!main.active && main.aggregate_diagnostic.is_none());
+        }
+        let out_of_bounds = universal.replace("i < 4", "i < 5");
+        assert!(matches!(ordered(&out_of_bounds, ScalarCheckerScope::CurrentPackage),
+            Err(ScalarOrderedCheckerOutcome::Unsupported)));
+        let wrong_type = existential.replace("u64 i", "u8 i");
+        assert!(matches!(ordered(&wrong_type, ScalarCheckerScope::CurrentPackage),
+            Err(ScalarOrderedCheckerOutcome::Unsupported)));
+        let not_a_pure_constructor = universal.replace("fn { [", "fn { if (true) {}; [");
+        assert!(matches!(ordered(&not_a_pure_constructor, ScalarCheckerScope::CurrentPackage),
+            Err(ScalarOrderedCheckerOutcome::Unsupported)));
     }
 
     #[cfg(feature = "internal-checker")]

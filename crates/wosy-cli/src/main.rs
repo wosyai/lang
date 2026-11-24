@@ -1003,7 +1003,28 @@ fn check_command(
             notes: vec![format!("contextual value at entry: {}; at exit: {}", failure.entry, failure.exit)],
         }
     });
-    let diagnostics = actual.chain(symbolic).chain(contextual).collect::<Vec<_>>();
+    let aggregate = report.aggregate_diagnostic.iter().map(|failure| {
+        let mut labels = vec![
+            DiagnosticLabel {
+                kind: DiagnosticLabelKind::Primary,
+                span: failure.failed_step.as_ref().unwrap_or(&failure.goal).clone(),
+                message: "not satisfied by this returned array cell".to_owned(),
+            },
+            DiagnosticLabel { kind: DiagnosticLabelKind::Secondary, span: failure.proof.clone(),
+                message: "proof declaration".to_owned() },
+            DiagnosticLabel { kind: DiagnosticLabelKind::Secondary, span: failure.output.clone(),
+                message: "returned cell".to_owned() },
+        ];
+        if failure.failed_step.is_some() {
+            labels.push(DiagnosticLabel { kind: DiagnosticLabelKind::Secondary, span: failure.goal.clone(),
+                message: "proof goal".to_owned() });
+        }
+        Diagnostic {
+            code: String::new(), severity: DiagnosticSeverity::Error, message: "proof obligation failed".to_owned(),
+            labels, notes: vec![format!("symbolic call can return cell [{}] = {}", failure.index, failure.value)],
+        }
+    });
+    let diagnostics = actual.chain(symbolic).chain(contextual).chain(aggregate).collect::<Vec<_>>();
     let authored_status = authored.publish(&mut std::io::stdout().lock(), &mut std::io::stderr().lock())
         .map_err(|error| format!("check: could not complete authored output; earlier records may already be published: {error}"))?;
     render_project_diagnostics(&diagnostics, publication.texts);

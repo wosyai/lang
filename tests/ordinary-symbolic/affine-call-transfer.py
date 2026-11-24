@@ -2016,7 +2016,28 @@ cases.extend([
     ("exact-startup-ordinary-pure-affine-proof-conditional-refuted",branching_affine_reached.replace("out <= 5","out <= 4"),1,
         b"proof obligation failed"),
 ])
+quantified_array = """%%start
+    u8[4]() make4 = fn { [0, 7, 0, 0] };
+    proof cells for make4() -> (items)
+        forall (u64 i where i == 0 || i >= 2 && i < 4)
+        ensures (items[i] == 0)
+    { core.show(items[i] == 0); }
+%%end"""
+witnessed_array = """%%start
+    u8[4]() make4 = fn { [0, 7, 0, 0] };
+    proof cells for make4() -> (items)
+        ensures (exists (u64 i where i < 4) { items[i] == 7 })
+    { core.witness(1); }
+%%end"""
+cases.extend([
+    ("ordinary-fixed-array-forall-verified", quantified_array, 0, b""),
+    ("ordinary-fixed-array-forall-refuted", quantified_array.replace("i == 0", "i == 1"), 1, b"proof obligation failed"),
+    ("ordinary-fixed-array-witness-verified", witnessed_array, 0, b""),
+    ("ordinary-fixed-array-witness-refuted", witnessed_array.replace("witness(1)", "witness(2)"), 1, b"proof obligation failed"),
+])
 proof_diagnostic_notes = {
+    "ordinary-fixed-array-forall-refuted": b"symbolic call can return cell [1] = 7",
+    "ordinary-fixed-array-witness-refuted": b"symbolic call can return cell [2] = 0",
     "ordinary-unused-contextual-refuted": b"contextual value at entry: 11; at exit: 2",
     "exact-startup-public-namespace-contextual-refuted": b"contextual value at entry: 3; at exit: 3",
     "exact-startup-public-contextual-proof-refuted": b"contextual value at entry: 3; at exit: 3",
