@@ -6144,6 +6144,7 @@ pub(super) struct CheckerOrdinaryScalarLocal {
 pub(super) enum CheckerOrdinaryScalarLocalKind {
     Copy,
     BoolLiteral(bool),
+    BoolCall(OccurrenceOrdinal),
     Arithmetic { operator: BinaryOperator, operands: [CheckerOrdinaryIntegerOperand; 2] },
 }
 
@@ -6205,7 +6206,9 @@ pub(super) struct OccurrenceStructure {
     #[cfg(feature = "internal-checker")]
     pub(super) checker_ordinary_integer_comparisons: HashMap<OccurrenceOrdinal, CheckerOrdinaryIntegerComparison>,
     #[cfg(feature = "internal-checker")]
-    pub(super) checker_ordinary_bool_arguments: HashMap<OccurrenceOrdinal, BigInt>,
+    pub(super) checker_ordinary_call_integer_literals: HashMap<OccurrenceOrdinal, BigInt>,
+    #[cfg(feature = "internal-checker")]
+    pub(super) checker_ordinary_bool_literals: HashMap<OccurrenceOrdinal, BigInt>,
     #[cfg(feature = "internal-checker")]
     pub(super) checker_ordinary_scalar_locals: HashMap<(BlockOrdinal, usize), CheckerOrdinaryScalarLocal>,
     #[cfg(any(test, feature = "internal-checker"))]
@@ -6262,7 +6265,9 @@ impl OccurrenceStructure {
             #[cfg(feature = "internal-checker")]
             checker_ordinary_scalar_locals: HashMap::new(),
             #[cfg(feature = "internal-checker")]
-            checker_ordinary_bool_arguments: HashMap::new(),
+            checker_ordinary_bool_literals: HashMap::new(),
+            #[cfg(feature = "internal-checker")]
+            checker_ordinary_call_integer_literals: HashMap::new(),
             #[cfg(feature = "internal-checker")]
             checker_ordinary_integer_comparisons: HashMap::new(),
             #[cfg(feature = "internal-checker")]
@@ -7295,11 +7300,11 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
         #[cfg(any(test, feature = "internal-checker"))]
         let checker_enabled = self.occurrence_typing.checker_directives_enabled();
         #[cfg(feature = "internal-checker")]
-        if checker_enabled && matches!(edge, OccurrenceEdge::CallArgument(0 | 1))
+        if checker_enabled && matches!(edge, OccurrenceEdge::CallArgument(0 | 1) | OccurrenceEdge::FinalOutput { output: 0, .. })
             && self.structure.checked_types.expressions.get(&ordinal) == Some(&ScalarType::Bool)
         {
             if let ScalarExpression::Boolean { value, .. } = expression {
-                self.structure.checker_ordinary_bool_arguments.insert(ordinal, BigInt::from(u8::from(*value)));
+                self.structure.checker_ordinary_bool_literals.insert(ordinal, BigInt::from(u8::from(*value)));
             }
         }
         #[cfg(any(test, feature = "internal-checker"))]
@@ -7336,6 +7341,22 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
             };
             if let Some(value) = value {
                 self.structure.checker_integer_literals.insert(ordinal, value);
+            }
+        }
+        #[cfg(feature = "internal-checker")]
+        if checker_enabled && matches!(self.mode, WalkMode::Callable(_))
+            && matches!(edge, OccurrenceEdge::CallArgument(0 | 1))
+            && self.structure.checked_types.expressions.get(&ordinal).is_some_and(is_integer_type)
+            && !self.structure.checker_integer_literals.contains_key(&ordinal)
+            && matches!(parent, OccurrenceParent::Expression(call)
+                if self.checked_call_signatures.get(&call).is_some_and(|signature|
+                    signature.parameters.len() <= 2
+                    && (matches!(signature.outputs.outputs.as_slice(), [output] if output.ty == ScalarType::Bool)
+                        || (signature.parameters.contains(&ScalarType::Bool)
+                            && matches!(signature.outputs.outputs.as_slice(), [output] if output.ty == ScalarType::Unit)))))
+        {
+            if let Some(literal) = super::checker_flow::concrete_integer_literal(expression) {
+                self.structure.checker_ordinary_call_integer_literals.insert(ordinal, literal.into_owned());
             }
         }
         if matches!(&self.mode, WalkMode::ModuleInitialization { .. })
@@ -7590,8 +7611,19 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
         let lexical = |ordinal| matches!(names.get(&ordinal), Some(PlainNameIdentity::Lexical(_)));
         if lexical(source) { return Some(CheckerOrdinaryScalarLocalKind::Copy); }
         if *ty == ScalarType::Bool {
-            let ScalarExpression::Boolean { value, .. } = expression else { return None; };
-            return Some(CheckerOrdinaryScalarLocalKind::BoolLiteral(*value));
+            if let ScalarExpression::Boolean { value, .. } = expression {
+                return Some(CheckerOrdinaryScalarLocalKind::BoolLiteral(*value));
+            }
+            let ScalarExpression::Call { arguments, .. } = expression else { return None; };
+            let signature = self.checked_call_signatures.get(&source)?;
+            let [output] = signature.outputs.outputs.as_slice() else { return None; };
+            if output.ty != ScalarType::Bool || !self.structure.checker_direct_targets.contains_key(&source)
+                || signature.parameters.len() != arguments.len() || arguments.len() > 2
+                || !signature.parameters.iter().all(|ty| is_integer_type(ty) || *ty == ScalarType::Bool)
+            {
+                return None;
+            }
+            return Some(CheckerOrdinaryScalarLocalKind::BoolCall(source));
         }
         let (operator, [left, right]) = self.simple_integer_operation(source, expression)?;
         let typed = |(ordinal, literal): (_, Option<std::borrow::Cow<'_, BigInt>>)| {

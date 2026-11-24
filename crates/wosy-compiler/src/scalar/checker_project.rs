@@ -828,7 +828,8 @@ fn check_unused_module<const COLLECT: bool, const ENTRY_EVIDENCE: bool, Proof: S
             return Err(ProjectCheck::Unsupported);
         }
         if !matches!(body.boundary.results.as_slice(), [result]
-            if result.ty == ScalarType::Unit || is_integer_type(&result.ty))
+            if result.ty == ScalarType::Unit || is_integer_type(&result.ty)
+                || (COLLECT && Proof::INTEGER_RETURN_PARTITIONS && result.ty == ScalarType::Bool))
         {
             return Err(ProjectCheck::Unsupported);
         }
@@ -843,7 +844,7 @@ fn check_unused_module<const COLLECT: bool, const ENTRY_EVIDENCE: bool, Proof: S
         }
         #[cfg(feature = "internal-checker")]
         if COLLECT && Proof::INTEGER_RETURN_PARTITIONS
-            && matches!(body.boundary.results.as_slice(), [result] if result.ty == ScalarType::Unit)
+            && matches!(body.boundary.results.as_slice(), [result] if matches!(result.ty, ScalarType::Unit | ScalarType::Bool))
             && !body.structure.checker_direct_targets.is_empty()
             && (ordinary_local_callers.contains(&(ordinal, item))
                 || !body.structure.checker_integer_call_locals.is_empty()
@@ -859,7 +860,8 @@ fn check_unused_module<const COLLECT: bool, const ENTRY_EVIDENCE: bool, Proof: S
                 project, calls, active: HashSet::from([(ordinal, item)]), active_depth: 1, reached: HashSet::new(),
                 had_obligations: false, observer: ProofFreeSymbolic, symbolic_module: ordinal,
             };
-            let cursor = ExactCallCursor::arbitrary_unit(body).ok_or(ProjectCheck::Unsupported)?;
+            let cursor = ExactCallCursor::arbitrary_root(body, &body.boundary.results[0].ty)
+                .ok_or(ProjectCheck::Unsupported)?;
             symbolic.run_call_cursor(body, &module.source, cursor, None, Some(collection))?;
             active |= symbolic.had_obligations;
             continue;
@@ -1661,7 +1663,7 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             caller, call, signature.parameters.len(), collection.is_some(), Observer::INTEGER_RETURN_PARTITIONS,
             Observer::ORDINARY_PROJECTED_PAIR,
             Observer::ORDINARY_PROJECTED_PAIR,
-            Observer::ORDINARY_INTEGER_LOCALS && *expected == ScalarType::Unit,
+            Observer::ORDINARY_INTEGER_LOCALS && matches!(*expected, ScalarType::Unit | ScalarType::Bool),
         )
             .ok_or(ProjectCheck::Unsupported)?;
         if let NestedIntegerArgument::Projected(mut projection) = arguments {
@@ -1966,8 +1968,9 @@ fn supported_integer_continuation_shape(body: &FunctionCallSites, expected: &Sca
 fn supported_integer_continuation_shape_for(body: &FunctionCallSites, expected: &ScalarType, ordinary: bool) -> bool {
     if supported_integer_continuation_shape(body, expected) { return true; }
     #[cfg(feature = "internal-checker")]
-    if ordinary && is_integer_type(expected) && body.allocation_length_calls.is_empty()
-        && body.structure.has_ordinary_predicates()
+    if ordinary && (is_integer_type(expected) || *expected == ScalarType::Bool)
+        && body.allocation_length_calls.is_empty()
+        && (body.structure.has_ordinary_predicates() || *expected == ScalarType::Bool)
     {
         return body.structure.checker_directives.iter().all(|(occurrence, directive)| {
             directive.operation == CheckerOperation::Require
@@ -9186,6 +9189,34 @@ mod tests {
         assert!(!body.structure.checker_integer_locals.contains_key(&key(0)));
         assert!(!body.structure.checker_integer_call_locals.contains_key(&key(0)));
         assert!(root_local_import_requirement(body).is_none());
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn staged_bool_uses_an_ordinary_local_and_separate_literal_receipt() {
+        use super::super::reference::CheckerOrdinaryScalarLocalKind;
+        let app = source("src/main.w", "staged-bool-origin");
+        let program = format!(r#"%%start
+            bool(i8,i8) choose = fn(value, bound) {{ if (value < bound) {{ true }} else {{ false }} }};
+            unit(i8) check = fn(input) {{
+                bool decision = choose(input, -1);
+                bool other = choose(1, -1);
+                core.require(decision || other, {OUTPUT});
+            }};
+        %%end"#);
+        let prepared = prepare_checker_project(
+            vec![(declarations(&app, &program), Vec::new())], vec![app.clone()], inputs(),
+        ).unwrap();
+        let (project, calls) = prepared.parts();
+        let (module, item, _) = select_checked_root(project, &app, "check").unwrap();
+        let body = calls.function_body(module, item, None).unwrap();
+        let origin = &body.structure.checker_ordinary_scalar_locals[&(body.structure.root, 0)];
+        assert!(matches!(&origin.kind, CheckerOrdinaryScalarLocalKind::BoolCall(call) if *call == origin.source));
+        assert!(body.structure.checker_integer_call_locals.is_empty());
+        assert_eq!(body.structure.checker_integer_literals.len(), 1);
+        assert!(body.structure.checker_integer_literals.values().all(|literal| literal == &BigInt::from(1)));
+        assert_eq!(body.structure.checker_ordinary_call_integer_literals.len(), 2);
+        assert!(body.structure.checker_ordinary_call_integer_literals.values().all(|literal| literal == &BigInt::from(-1)));
     }
 
     #[cfg(feature = "internal-checker")]

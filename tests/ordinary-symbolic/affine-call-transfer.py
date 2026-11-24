@@ -638,6 +638,81 @@ for name,program,correct,incorrect,code,label in [
 ]:
     cases.extend([(name,program,0,b""),(name+"-witness",program.replace(correct,incorrect),code,label)])
 cases.append(("exact-startup-bool-argument",bool_startup,118,b"ACTUAL-TRUE"))
+bool_result = f"""%%start
+    bool(i8) allowed = fn(entry) {{ if (entry < 4) {{ true }} else {{ false }} }};
+    unit(i8) check = fn(entry) {{
+        bool result = allowed(entry);
+        if (result && entry >= 0) {{
+            core.require(entry <= 3, {report(126,"BOOL-TO-ENTRY")});
+        }};
+        if (entry >= 4) {{ core.require(!result, {report(127,"ENTRY-TO-BOOL")}); }};
+    }};
+    %%end"""
+bool_mixed_result = f"""%%start
+    bool(bool,i8) allowed = fn(enabled, number) {{
+        if (enabled) {{ if (number > 2) {{ true }} else {{ false }} }} else {{ false }}
+    }};
+    unit(bool,i8) check = fn(enabled, number) {{
+        bool result = allowed(enabled, number);
+        core.narrow(result, {report(128,"BOOL-RESULT-CUT")});
+        core.require(enabled && number > 2, {report(129,"PAIR-BOOL-RESULT")});
+    }};
+    %%end"""
+bool_alias_result = f"""%%start
+    bool(bool) echo = fn(enabled) {{ enabled }};
+    unit(bool) check = fn(enabled) {{
+        bool result = echo(enabled);
+        if (result) {{ core.require(enabled, {report(130,"BOOL-RESULT-ALIAS")}); }}
+        else {{ core.require(!enabled, {report(131,"BOOL-RESULT-ALIAS-NO")}); }};
+    }};
+    %%end"""
+bool_fixed_result = f"""%%start
+    bool(i8,i8) allowed = fn(entry, limit) {{ if (entry < limit) {{ true }} else {{ false }} }};
+    unit(i8) check = fn(entry) {{
+        bool result = allowed(entry, -1);
+        if (result) {{ core.require(entry <= -2, {report(132,"BOOL-RESULT-FIXED")}); }};
+    }};
+    %%end"""
+bool_exact_result = f"""%%start
+    bool() ready = fn {{ true }};
+    unit() check = fn {{
+        bool result = ready();
+        core.require(!result, {report(133,"EXACT-BOOL-RESULT")});
+    }};
+    check();
+    %%end"""
+bool_independent_root = f"""%%start
+    bool(i8) classified = fn(entry) {{
+        core.require(entry >= 0, {report(134,"UNUSED-BOOL-ROOT")});
+        if (entry < 4) {{ true }} else {{ false }}
+    }};
+    %%end"""
+for name,program,correct,incorrect,code,label in [
+    ("staged-bool-result-feeds-compound",bool_result,"entry <= 3","entry <= 2",126,b"BOOL-TO-ENTRY"),
+    ("staged-bool-result-mixed-pair",bool_mixed_result,"enabled && number > 2","enabled && number > 3",129,b"PAIR-BOOL-RESULT"),
+    ("staged-bool-result-keeps-input-alias",bool_alias_result,"require(enabled,","require(!enabled,",130,b"BOOL-RESULT-ALIAS"),
+    ("staged-bool-result-fixed-signed-argument",bool_fixed_result,"entry <= -2","entry <= -3",132,b"BOOL-RESULT-FIXED"),
+]:
+    cases.extend([(name,program,0,b""),(name+"-witness",program.replace(correct,incorrect),code,label)])
+cases.extend([
+    ("exact-startup-staged-bool-result",bool_exact_result,133,b"EXACT-BOOL-RESULT"),
+    ("unused-bool-return-root-keeps-requirement",bool_independent_root,134,b"UNUSED-BOOL-ROOT"),
+    ("direct-bool-call-in-guard-is-not-eagerly-evaluated",bool_result.replace(
+        "if (result && entry >= 0)", "if (allowed(entry) && entry >= 0)"),2,b"unsupported analysis"),
+])
+bool_staged_root = f"""%%start
+    bool(i8) selected = fn(entry) {{ if (entry < 4) {{ true }} else {{ false }} }};
+    bool(i8) check = fn(entry) {{
+        bool result = selected(entry);
+        if (result) {{ core.require(entry <= 3, {report(135,"BOOL-ROOT-CHILD")}); }};
+        result
+    }};
+    %%end"""
+cases.extend([
+    ("unused-bool-root-with-staged-return-needs-no-receipt",bool_staged_root,0,b""),
+    ("unused-bool-root-with-staged-return-still-reports-witness",
+     bool_staged_root.replace("entry <= 3","entry <= 2"),135,b"BOOL-ROOT-CHILD"),
+])
 with tempfile.TemporaryDirectory(prefix="affine-calls-") as path:
     root=Path(path)
     (root/"src").mkdir()
@@ -645,7 +720,7 @@ with tempfile.TemporaryDirectory(prefix="affine-calls-") as path:
         (root/"wosy.toml").write_text(manifest.format(output=target))
         for scope in ("--main-flow-only","--declared-package"):
             for name,text,expected,stderr in cases:
-                included = scope == "--declared-package" or name in ("exact-startup-lexical-copy", "exact-startup-inline-arithmetic", "exact-startup-lexical-comparison", "exact-startup-bool-argument")
+                included = scope == "--declared-package" or name in ("exact-startup-lexical-copy", "exact-startup-inline-arithmetic", "exact-startup-lexical-comparison", "exact-startup-bool-argument", "exact-startup-staged-bool-result")
                 code = expected if included else 0
                 expected_stderr = stderr if included else b""
                 (root/"src/main.w").write_text(text.strip()+"\n")

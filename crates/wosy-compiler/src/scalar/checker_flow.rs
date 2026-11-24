@@ -2716,7 +2716,8 @@ pub(super) fn collect_ordered_root_requirement_failures<'a>(
 ) -> Option<(bool, Vec<IntegerCheckFailure<'a>>)> {
     let mut failures = Vec::new();
     let mut sink = |failure| failures.push(failure);
-    let (active, _) = if allow_ordinary_integer_locals && calls.structure.has_ordinary_integer_operations() {
+    let (active, _) = if allow_ordinary_integer_locals && (calls.structure.has_ordinary_integer_operations()
+        || ordinary_tail_type(calls, true) == Some(&ScalarType::Bool)) {
         collect_integer_requirement_failures_in_scope(
             calls, IntegerRequirementEntry::Arbitrary, None, false, false, &mut sink, OrderedRootConditions::<true, true>(body),
         )
@@ -2851,8 +2852,12 @@ fn collect_integer_requirement_failures_in_scope<'a, Scoped: ScopedAuthoredRetur
     sink: &mut dyn FnMut(IntegerCheckFailure<'a>),
     scope: Scoped,
 ) -> Option<(bool, IntegerRequirementContinuation)> {
+    #[cfg(feature = "internal-checker")]
+    let ordinary = Scoped::ALLOW_ORDINARY_INTEGER_LOCALS;
+    #[cfg(not(feature = "internal-checker"))]
+    let ordinary = false;
     let (tail, exact, projected) = match entry {
-        IntegerRequirementEntry::Arbitrary => (integer_tail_type(calls), None, None),
+        IntegerRequirementEntry::Arbitrary => (ordinary_tail_type(calls, ordinary), None, None),
         IntegerRequirementEntry::Exact(arguments) => (None, Some(arguments), None),
         IntegerRequirementEntry::Projected { slot, values, fixed } => {
             let row = match (slot, fixed) {
@@ -2880,7 +2885,7 @@ pub(super) fn exact_typed_call_argument_at<'a>(
     lexical: impl FnOnce(OccurrenceOrdinal, &ScalarType) -> Option<&'a BigInt>,
 ) -> Option<ExactIntegerArgument<'a>> {
     let (argument, ty) = checked_scalar_call_argument_at(structure, call, slot, allow_bool)?;
-    let value = scalar_call_literal(structure, argument, ty).or_else(|| lexical(argument, ty))?;
+    let value = scalar_call_literal(structure, argument, ty, allow_bool).or_else(|| lexical(argument, ty))?;
     Some((ty, value))
 }
 
@@ -2896,16 +2901,21 @@ fn checked_scalar_call_argument_at(
     (is_integer_type(ty) || (allow_bool && *ty == ScalarType::Bool)).then_some((*argument, ty))
 }
 
-fn scalar_call_literal<'a>(structure: &'a OccurrenceStructure, argument: OccurrenceOrdinal, ty: &ScalarType)
+fn scalar_call_literal<'a>(structure: &'a OccurrenceStructure, argument: OccurrenceOrdinal, ty: &ScalarType, ordinary: bool)
     -> Option<&'a BigInt>
 {
     #[cfg(feature = "internal-checker")]
     if *ty == ScalarType::Bool {
-        return structure.checker_ordinary_bool_arguments.get(&argument);
+        return structure.checker_ordinary_bool_literals.get(&argument);
+    }
+    let common = structure.checker_integer_literals.get(&argument);
+    #[cfg(feature = "internal-checker")]
+    if ordinary && common.is_none() {
+        return structure.checker_ordinary_call_integer_literals.get(&argument);
     }
     #[cfg(not(feature = "internal-checker"))]
-    let _ = ty;
-    structure.checker_integer_literals.get(&argument)
+    let _ = (ty, ordinary);
+    common
 }
 
 fn ordinary_parameter_set(ty: &ScalarType, allow_bool: bool) -> Option<IntegerSet> {
@@ -3148,7 +3158,7 @@ fn nested_integer_operand<'a>(
     roots: &IntegerRoots<'_>, path: &'a IntegerInputs, allow_bool: bool, work: Option<&mut usize>,
 ) -> Option<NestedIntegerOperand<'a>> {
     let (argument, ty) = checked_scalar_call_argument_at(&calls.structure, expression, slot, allow_bool)?;
-    if let Some(value) = scalar_call_literal(&calls.structure, argument, ty) {
+    if let Some(value) = scalar_call_literal(&calls.structure, argument, ty, allow_bool) {
         return Some(NestedIntegerOperand::Exact((ty, value)));
     }
     let PlainNameIdentity::Lexical(binding) = calls.prepared_plain_name(argument)? else { return None; };
@@ -3675,6 +3685,20 @@ fn integer_tail_type(calls: &FunctionCallSites) -> Option<&ScalarType> {
     (is_integer_type(&result.ty) && result.ty == output.ty).then_some(&result.ty)
 }
 
+fn ordinary_tail_type(calls: &FunctionCallSites, allow_bool: bool) -> Option<&ScalarType> {
+    #[cfg(feature = "internal-checker")]
+    if allow_bool {
+        let results = &calls.boundary.results;
+        if let ([result], [output]) = (results.as_slice(), calls.boundary.root_outputs.as_slice()) {
+            if result.ty == ScalarType::Bool && output.ty == result.ty { return Some(&result.ty); }
+        }
+    }
+    #[cfg(not(feature = "internal-checker"))]
+    let _ = allow_bool;
+    integer_tail_type(calls)
+}
+
+
 fn run_integer_callable<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, Authored: ScopedAuthoredReturn<'a>>(
     calls: &'a FunctionCallSites,
     tail: Option<&'a ScalarType>,
@@ -4166,7 +4190,7 @@ fn walk_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, A
 ) -> Option<IntegerControl<'a>> {
     let mut cursor = IntegerBlockCursor::new(block, roots.axes.len(), path);
     drive_integer_block::<USE_IMPORTED_BOUND, COLLECT, _, false>(
-        calls, roots, &mut cursor, root_tail, returns, handle_call, failures, imports, authored_return, false, None, None,
+        calls, roots, &mut cursor, root_tail, returns, handle_call, failures, imports, authored_return, false, None, None, None,
     )
 }
 
@@ -4183,6 +4207,7 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
     suspend_integer: bool,
     mut return_capture_work: Option<&mut usize>,
     #[allow(unused_mut)] mut computed_returns: Option<&mut Vec<(usize, ComputedIntegerReturn)>>,
+    mut discarded_return: Option<&mut bool>,
 ) -> Option<IntegerControl<'a>> {
     let IntegerBlockCursor { mut block, mut next, mut depth, mut path, mut branches, mut terminal } =
         std::mem::replace(cursor, IntegerBlockCursor::new(calls.structure.root, 0, IntegerInputs::default()));
@@ -4218,6 +4243,7 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                 }
                 if returns.as_ref().is_some_and(|paths| !paths.is_empty())
                     || computed_returns.as_ref().is_some_and(|pieces| !pieces.is_empty())
+                    || discarded_return.as_deref().copied() == Some(true)
                 {
                     return Some(IntegerControl::Returned);
                 }
@@ -4556,7 +4582,7 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                         continue;
                     }
                 }
-                let value = if let Some(value) = structure.checker_integer_literals.get(&slot.expression) {
+                let value = if let Some(value) = scalar_call_literal(structure, slot.expression, ty, false) {
                     IntegerReturn::Const(value)
                 } else if let Some(PlainNameIdentity::Lexical(binding)) = calls.prepared_plain_name(slot.expression) {
                     let (_, binding_type) = roots.lookup(binding)?;
@@ -4570,6 +4596,7 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                     return None;
                 };
                 if tail.is_some() {
+                    if let Some(complete) = discarded_return.as_deref_mut() { *complete = true; }
                     #[cfg(feature = "internal-checker")]
                     if Authored::OBSERVE_RETURN {
                         authored_return.observe_return(slot, value, roots, &path)?;
@@ -4792,6 +4819,13 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                                     row.append_alias(axis, Rc::clone(&row[axis]));
                                 }
                             }
+                            super::reference::CheckerOrdinaryScalarLocalKind::BoolCall(call) => {
+                                if receiver.ty != ScalarType::Bool || !SUSPEND_CALL || !suspend_integer { return None; }
+                                *cursor = IntegerBlockCursor { block, next, depth, path, branches, terminal };
+                                return Some(IntegerControl::PendingCall(ExactCallEffect::Integer {
+                                    call: *call, binding: &origin.binding, ty: &receiver.ty,
+                                }));
+                            }
                             super::reference::CheckerOrdinaryScalarLocalKind::BoolLiteral(value) => {
                                 if receiver.ty != ScalarType::Bool { return None; }
                                 let work = roots.ordinary_local_work.get_or_insert(0);
@@ -4903,6 +4937,7 @@ pub(super) struct ExactCallCursor<'a> {
     roots: IntegerRoots<'a>,
     block: IntegerBlockCursor,
     tail: Option<&'a ScalarType>,
+    discarded_return: Option<bool>,
     returned: Vec<IntegerReturningPath<'a>>,
     computed_returns: Vec<(usize, ComputedIntegerReturn)>,
     return_capture_work: usize,
@@ -4915,11 +4950,14 @@ impl<'a> ExactCallCursor<'a> {
         Self::with_row(calls, expected, exact_integer_entry_row(exact), None)
     }
 
-    pub(super) fn arbitrary_unit(calls: &'a FunctionCallSites) -> Option<Self> {
+    pub(super) fn arbitrary_root(calls: &'a FunctionCallSites, expected: &ScalarType) -> Option<Self> {
+        if !matches!(*expected, ScalarType::Unit | ScalarType::Bool) { return None; }
         let row = calls.boundary.parameters.iter()
             .map(|parameter| ordinary_parameter_set(&parameter.ty, true).map(Rc::new))
             .collect::<Option<IntegerRow>>()?;
-        Self::with_row(calls, &ScalarType::Unit, row, None)
+        let mut cursor = Self::with_row(calls, expected, row, None)?;
+        if *expected == ScalarType::Bool { cursor.discarded_return = Some(false); }
+        Some(cursor)
     }
 
     pub(super) fn projected(calls: &'a FunctionCallSites, values: Rc<IntegerSet>, expected: &ScalarType) -> Option<Self> {
@@ -5005,7 +5043,7 @@ impl<'a> ExactCallCursor<'a> {
         projected_slot: Option<usize>, projected_pair: Option<[usize; 2]>,
     ) -> Option<Self> {
         let tail = if *expected == ScalarType::Unit { None } else {
-            Some(integer_tail_type(calls).filter(|tail| *tail == expected)?)
+            Some(ordinary_tail_type(calls, true).filter(|tail| *tail == expected)?)
         };
         let boundary = &calls.boundary;
         let bindings = boundary.checker_parameter_bindings.as_deref()?;
@@ -5021,7 +5059,7 @@ impl<'a> ExactCallCursor<'a> {
             roots.add(binding, &parameter.ty);
         }
         let block = IntegerBlockCursor::new(calls.structure.root, roots.axes.len(), rows);
-        Some(Self { roots, block, tail, returned: Vec::new(), computed_returns: Vec::new(), return_capture_work: 0, projected_slot, projected_pair })
+        Some(Self { roots, block, tail, discarded_return: None, returned: Vec::new(), computed_returns: Vec::new(), return_capture_work: 0, projected_slot, projected_pair })
     }
 
     pub(super) fn arguments<'borrow>(
@@ -5238,19 +5276,21 @@ impl<'a> ExactCallCursor<'a> {
         }
         #[cfg(not(feature = "internal-checker"))]
         let _ = allow_ordinary_integer_locals;
+        if self.tail == Some(&ScalarType::Bool) && !allow_ordinary_integer_locals { return None; }
         let mut failures = IntegerFailureCollection {
             continuation: IntegerRequirementContinuation::Empty,
             projected: None, allow_projected_calls: false, allow_contextual_local_transfers, sink,
         };
         let mut imports: &mut [Option<ImportedLocal<'a>>] = &mut [];
-        let returns = self.tail.is_some().then_some(&mut self.returned);
+        let returns = (self.tail.is_some() && self.discarded_return.is_none()).then_some(&mut self.returned);
         let control = drive_integer_block::<false, COLLECT, _, true>(
             calls, &mut self.roots, &mut self.block, self.tail, returns, &mut handle_call,
             &mut Some(&mut failures), &mut imports, (), suspend_integer,
             (self.projected_slot.is_some() || self.projected_pair.is_some()).then_some(&mut self.return_capture_work),
-            (allow_ordinary_computed_returns && suspend_integer && self.tail.is_some()
+            (allow_ordinary_computed_returns && suspend_integer && self.tail.is_some_and(is_integer_type)
                 && (self.projected_slot.is_some() || self.projected_pair.is_some()))
                 .then_some(&mut self.computed_returns),
+            self.discarded_return.as_mut(),
         )?;
         let result = match (self.tail, control) {
             (_, IntegerControl::PendingCall(effect)) => return Some(ExactCallProgress::Pending(effect)),
@@ -5261,6 +5301,10 @@ impl<'a> ExactCallCursor<'a> {
             (None, IntegerControl::Continue(path)) if self.projected_slot.is_some() =>
                 ActualCallResult::ProjectedUnit(path.project_entry(self.projected_slot?)?),
             (None, IntegerControl::Continue(_) | IntegerControl::Returned) => ActualCallResult::Unit,
+            (Some(_), IntegerControl::Returned) if self.discarded_return == Some(true) =>
+                ActualCallResult::Unit,
+            (Some(_), IntegerControl::Continue(path)) if self.discarded_return.is_some() && path.is_unreachable() =>
+                ActualCallResult::EmptyUnit,
             (Some(_), IntegerControl::Returned) if self.projected_pair.is_some() => {
                 let caller_axes = self.projected_pair?;
                 let piece_count = self.returned.iter().try_fold(self.computed_returns.len(), |count, path| count.checked_add(path.state.0.len()))?;
