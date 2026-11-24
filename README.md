@@ -42,23 +42,15 @@ std.utf8 line = { .data = content; .length = size; };
 
 ## Getting started
 
-Prerequisites: the `wosy` binary on `PATH`, LLVM 18.1.x reachable through the builder scripts, and Python 3 for the reference `scripts/build-*` / `scripts/run-*` helpers.
-
-```sh
-wosy build app --profile dev
-wosy run app --profile dev -- <program-args>
-```
-
-A project is a directory with `wosy.toml` and `src/main.w`. See [Project layout](.agents/skills/wosy/references/project.md) for the full schema.
+[Create, build, and run a Wosy package](.agents/skills/wosy/references/getting-started.md).
 
 ## Documentation
 
-- [Getting started](.agents/skills/wosy/references/getting-started.md) — install, create, build, and run.
 - [Syntax](.agents/skills/wosy/references/syntax.md) — files, comments, declarations, control flow.
 - [Types](.agents/skills/wosy/references/types.md) — scalars, structs, enums, arrays, pointers, callables.
 - [Core operations](.agents/skills/wosy/references/core.md) — conversions, allocation, `unsafe` rules.
 - [Standard library](.agents/skills/wosy/references/stdlib.md) — `bootstrap.w` and `wasi/preview1.w`.
-- [CLI reference](.agents/skills/wosy/references/cli.md).
+- [CLI reference](.agents/skills/wosy/references/cli.md) — commands and options.
 - [Diagnostics](.agents/skills/wosy/references/errors.md) — every code, what triggers it.
 
 ## Status

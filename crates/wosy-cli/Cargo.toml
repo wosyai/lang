@@ -30,3 +30,6 @@ path = "src/main.rs"
 name = "inspect-ordered-check"
 required-features = ["internal-checker"]
 test = false
+
+[dev-dependencies]
+toml_edit.workspace = true

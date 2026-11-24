@@ -43,6 +43,13 @@ struct Arguments {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Create a base-language project in the current directory
+    Init,
+    /// Manage project dependencies
+    Dep {
+        #[command(subcommand)]
+        command: DepCommand,
+    },
     Parse {
         target: Option<String>,
     },
@@ -72,9 +79,52 @@ enum Command {
     },
 }
 
+#[derive(Subcommand)]
+enum DepCommand {
+    /// Add a local package or resolve and lock a Git package
+    Add {
+        source: String,
+        #[arg(long)]
+        path: Option<String>,
+    },
+    /// Materialize the exact dependencies in wosy.lock
+    Sync,
+    /// Record live Git dependency edits as project patches
+    Snapshot,
+    /// Advance locked Git dependencies and replay their project patches
+    Update,
+}
+
 fn main() -> ExitCode {
     let arguments = Arguments::parse();
     match arguments.command {
+        Command::Init => match env::current_dir()
+            .map_err(|error| error.to_string())
+            .and_then(|root| wosy_project::packages::init_project(&root))
+        {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("wosy: {error}");
+                ExitCode::from(1)
+            }
+        },
+        Command::Dep { command } => {
+            let result = match command {
+                DepCommand::Add { source, path } => dep_command(|root| {
+                    wosy_project::packages::add_dependency(root, &source, path.as_deref())
+                }),
+                DepCommand::Sync => dep_command(wosy_project::packages::sync_dependencies),
+                DepCommand::Snapshot => dep_command(wosy_project::packages::snapshot_dependencies),
+                DepCommand::Update => dep_command(wosy_project::packages::update_dependencies),
+            };
+            match result {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("wosy: {error}");
+                    ExitCode::from(1)
+                }
+            }
+        }
         Command::Parse { target } => match parse_command(target.as_deref()) {
             Ok(valid) => {
                 if valid {
@@ -125,13 +175,16 @@ fn main() -> ExitCode {
     }
 }
 
+fn dep_command(action: impl FnOnce(&std::path::Path) -> Result<(), String>) -> Result<(), String> {
+    let current = env::current_dir().map_err(|error| error.to_string())?;
+    let root = discover_root(&current)?;
+    action(&root)
+}
+
 fn parse_command(target: Option<&str>) -> Result<bool, String> {
     let current = env::current_dir().map_err(|error| error.to_string())?;
     let root = discover_root(&current)?;
-    let (configuration, document) = ProjectConfiguration::load_with_manifest(&root)?;
-    let target_name = configuration.resolve_target(target)?;
-    let project = ProjectContext::from_manifest(&root, &target_name, document.as_table())?;
-    drop(document);
+    let project = ProjectContext::load_parse_target(&root, target)?;
     let source_path = project.source_path();
     let text = fs::read_to_string(&source_path)
         .map_err(|error| format!("failed to read {}: {error}", source_path.display()))?;
@@ -181,7 +234,7 @@ fn build_command(target: Option<&str>, profile: &str) -> Result<(), String> {
     let (_target_config, artifact, artifact_profile, target_profile) =
         configuration.artifact_profile(&target_name, profile)?;
     let target_layout = artifact_profile.target_layout().map(scalar_target_layout)?;
-    let configuration_identity = blake3::hash(document.raw().as_bytes()).to_hex().to_string();
+    let configuration_identity = project_configuration_identity(document.raw().as_bytes(), &configuration)?;
     drop(document);
     let (llvm, source_observations) = compile_project(
         &root,
@@ -276,6 +329,62 @@ fn write_llvm_partition(path: &std::path::Path, llvm: &LlvmPartition) -> Result<
     Ok(writer.get_ref().identity.finalize().to_hex().to_string())
 }
 
+fn project_configuration_identity(
+    manifest: &[u8],
+    configuration: &ProjectConfiguration,
+) -> Result<String, String> {
+    let manifest_identity = blake3::hash(manifest);
+    // A manifest that declared source_root used to route its own namespaces
+    // from the project root. Do not accept a pre-change artifact that observed
+    // those other files, even if they still exist with the original bytes.
+    let manifest_identity = if configuration.module_source_root.is_some() {
+        blake3::Hasher::new()
+            .update(b"wosy-selected-package-namespace-root-v1\0")
+            .update(manifest_identity.as_bytes())
+            .finalize()
+    } else {
+        manifest_identity
+    };
+    if configuration.resolved_packages.is_empty() {
+        return Ok(manifest_identity.to_hex().to_string());
+    }
+    fn field(hasher: &mut blake3::Hasher, bytes: &[u8]) {
+        hasher.update(&(bytes.len() as u64).to_le_bytes());
+        hasher.update(bytes);
+    }
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"wosy-package-closure-v2\0");
+    hasher.update(manifest_identity.as_bytes());
+    hasher.update(&(configuration.resolved_packages.len() as u64).to_le_bytes());
+    for (name, package) in &configuration.resolved_packages {
+        let source_root: std::path::PathBuf = package.identity.path.as_path().components()
+            .filter_map(|component| match component {
+                std::path::Component::Normal(name) => Some(name),
+                _ => None,
+            }).collect();
+        field(&mut hasher, name.as_bytes());
+        field(&mut hasher, source_root.as_os_str().as_encoded_bytes());
+        if let Some(pin) = &package.git_pin_identity {
+            field(&mut hasher, b"git");
+            field(&mut hasher, pin.as_bytes());
+            let patches = package.patch_stack_id
+                .ok_or_else(|| format!("Git dependency {name} has no verified patch stack"))?;
+            field(&mut hasher, patches.as_bytes());
+        } else {
+            field(&mut hasher, b"local");
+            let local = package.local_root_identity.as_ref()
+                .ok_or_else(|| format!("local dependency {name} has no canonical path"))?;
+            field(&mut hasher, local.as_os_str().as_encoded_bytes());
+        }
+        hasher.update(&(package.dependencies.len() as u64).to_le_bytes());
+        for dependency in &package.dependencies {
+            field(&mut hasher, dependency.as_bytes());
+        }
+    }
+    let identity = hasher.finalize();
+    Ok(identity.to_hex().to_string())
+}
+
 fn run_command(target: Option<&str>, profile: &str, arguments: &[String]) -> Result<u8, String> {
     let current = env::current_dir().map_err(|error| error.to_string())?;
     let root = discover_root(&current)?;
@@ -283,20 +392,35 @@ fn run_command(target: Option<&str>, profile: &str, arguments: &[String]) -> Res
     let target_name = configuration.resolve_target(target)?;
     let (_target_config, artifact, artifact_profile, target_profile) =
         configuration.artifact_profile(&target_name, profile)?;
-    let configuration_identity = blake3::hash(document.raw().as_bytes()).to_hex().to_string();
+    let configuration_identity = project_configuration_identity(document.raw().as_bytes(), &configuration)?;
     drop(document);
     let manifest_path =
         artifact_manifest_path(&root, &target_name, profile, &target_profile.main_artifact);
     let manifest = load_artifact_manifest(&manifest_path)
         .map_err(|error| format!("artifact manifest error: {error}"))?;
+    if manifest.identity.configuration_identity != configuration_identity {
+        return Err("artifact manifest is stale".to_owned());
+    }
     let current_observations = manifest
         .source_observations
         .iter()
         .map(|observation| {
-            let path = source_observation_path(observation);
+            let content_revision = if let Some((package, checkout)) =
+                configuration.git_package(&observation.source.package)?
+            {
+                if observation.source.project != package.identity.project {
+                    return Err("artifact manifest is stale".to_owned());
+                }
+                let relative = observation.source.path.as_path();
+                let file = checkout.source(relative)?
+                    .ok_or_else(|| "artifact manifest is stale".to_owned())?;
+                observe_open_source(file, relative)?
+            } else {
+                observe_source_revision(&source_observation_path(observation))?
+            };
             Ok(SourceObservation {
                 source: observation.source.clone(),
-                content_revision: observe_source_revision(&path)?,
+                content_revision,
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
@@ -310,7 +434,6 @@ fn run_command(target: Option<&str>, profile: &str, arguments: &[String]) -> Res
         .ok_or_else(|| format!("runner {} is missing", artifact_profile.run_runner))?;
     let identity = &manifest.identity;
     if identity.source_identity != wosy_project::source_identity(&current_observations)
-        || identity.configuration_identity != configuration_identity
         || identity.artifact_identity != format!("{target_name}:{profile}:{}", artifact.artifact)
         || identity.backend != artifact_profile.backend
         || identity.output != artifact_profile.output
@@ -346,6 +469,11 @@ fn source_observation_path(observation: &SourceObservation) -> std::path::PathBu
 fn observe_source_revision(path: &std::path::Path) -> Result<ContentRevision, String> {
     let read_error = |error| format!("failed to read {}: {error}", path.display());
     let file = fs::File::open(path).map_err(read_error)?;
+    observe_open_source(file, path)
+}
+
+fn observe_open_source(file: fs::File, path: &std::path::Path) -> Result<ContentRevision, String> {
+    let read_error = |error| format!("failed to read {}: {error}", path.display());
     let mut hasher = blake3::Hasher::new();
     hasher.update_reader(file).map_err(read_error)?;
     Ok(ContentRevision(hasher.finalize().to_hex().to_string()))
@@ -942,7 +1070,7 @@ fn check_command(
     }.map_err(|failure| match failure {
             LoadError::Canonical(failure) | LoadError::Dormant(failure) => failure.report("check"),
             LoadError::Root => "check: invalid project root".to_owned(),
-            LoadError::Manifest => "check: invalid manifest".to_owned(),
+            LoadError::Manifest(error) => format!("check: invalid manifest: {error}"),
             LoadError::Target => "check: invalid target".to_owned(),
             LoadError::Profile => "check: invalid target profile".to_owned(),
             LoadError::Layout => "check: unsupported target layout".to_owned(),
@@ -1362,6 +1490,7 @@ mod tests {
         };
         let configuration = ProjectConfiguration {
             default_target: "app".to_owned(),
+            module_source_root: None,
             builders: BTreeMap::new(),
             runners: BTreeMap::new(),
             targets: BTreeMap::new(),
@@ -2246,7 +2375,7 @@ run_runner = "never"
 main_artifact = "main"
 "#;
         let main = r#"%%start
-            imported = namespace app "src/live.w";
+            imported = namespace app "live.w";
             u8 actual = imported.run(7);
         %%end"#;
         let dormant = r#"%%start
@@ -2288,7 +2417,7 @@ source_root = "src"
         assert!(matches!(check_declared_package_target(&root, None, "dev"),
             Err(ConfiguredCheckLoadError::PackageSourceRoot(_))));
         write("wosy.toml", manifest);
-        write("src/main.w", &main.replace("src/live.w", "stray.w"));
+        write("src/main.w", &main.replace("live.w", "other_package/src/broken.w"));
         assert!(matches!(check_declared_package_target(&root, None, "dev"),
             Err(ConfiguredCheckLoadError::Canonical(CanonicalLoadFailure::Input(message)))
                 if message.contains("outside the declared package source tree")));
@@ -2393,6 +2522,11 @@ source_root = "src"
             project_root: dependency.clone(),
             source_root: dependency.clone(),
             identity: ProjectSourceIdentity::new(dependency.to_string_lossy().into_owned(), "vendor".into(), PackageRelativePath::new("src".into()).unwrap()),
+            git_checkout: None,
+            git_pin_identity: None,
+            patch_stack_id: None,
+            local_root_identity: Some(dependency),
+            dependencies: Vec::new(),
         });
         for invalid in ["main.w", "./main.w", "duplicate.w", "deps/other.w", "vendor/other.w"] {
             let (result, counts) = routing_observations::observe(|| check_loaded_project(

@@ -1,3 +1,33 @@
 [package]
 name = "std"
 source_root = "src"
+default_target = "smoke"
+
+[comments]
+categories = [
+    "INTENT", "WHY", "ASSUMPTION", "RISK", "SOURCE", "WORKAROUND", "TODO",
+    "CONSTRAINT", "SECURITY", "AUDIT", "OWNERSHIP", "TYPE", "REPLAY", "NOISE",
+]
+
+[builders.llvm_wasm]
+command = ["python3", "scripts/build-wasm"]
+toolchain_identity = "llvm-18.1.x"
+
+[runners.wasmtime]
+command = ["python3", "scripts/run-wasmtime"]
+
+[targets.smoke]
+root = "tests/smoke.w"
+default_profile = "dev"
+
+[targets.smoke.artifacts.main]
+artifact = "Main"
+
+[targets.smoke.artifacts.main.profiles.dev]
+backend = "llvm"
+output = "wasm-wasip1"
+builder = "llvm_wasm"
+run_runner = "wasmtime"
+
+[targets.smoke.profiles.dev]
+main_artifact = "main"

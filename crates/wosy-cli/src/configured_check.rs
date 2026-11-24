@@ -181,7 +181,7 @@ fn normalized_output_path(requested: &str) -> Option<PathBuf> {
 
 pub(crate) enum ConfiguredCheckLoadError {
     Root,
-    Manifest,
+    Manifest(String),
     Target,
     Profile,
     Layout,
@@ -220,7 +220,7 @@ fn configured_target(
     use ConfiguredCheckLoadError as LoadError;
     let root = root.canonicalize().map_err(|_| LoadError::Root)?;
     let (configuration, manifest) =
-        ProjectConfiguration::load_with_manifest(&root).map_err(|_| LoadError::Manifest)?;
+        ProjectConfiguration::load_with_manifest(&root).map_err(LoadError::Manifest)?;
     let target = configuration.resolve_target(target).map_err(|_| LoadError::Target)?;
     let project = ProjectContext::from_manifest(&root, &target, manifest.as_table())
         .map_err(|_| LoadError::Target)?;

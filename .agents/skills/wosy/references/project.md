@@ -43,8 +43,8 @@ main_artifact = "main"
 
 Rules:
 
-- `[package] name` and `default_target` are required.
-- Each `[dependencies.<name>]` table takes exactly one field: `path`, a non-empty relative path to the dependency root. The directory must contain its own `wosy.toml` with a matching `package.name` and a `source_root` directory.
+- `[package]` needs `name` and `default_target`. `source_root` sets the base for namespace paths (the project root when omitted from the root manifest). Target entries stay relative to the project root.
+- `[dependencies.<name>]` uses local `path`, or `git` with an optional repository-relative `path` (default `"."`). A dependency manifest needs the matching package name and a `source_root`.
 - `[comments] categories` lists the `# CATEGORY:` comment categories accepted by `wosy parse` and `wosy build`.
 - Each builder needs `command` (argv, first element is the executable), optional `args`, and `toolchain_identity`. The same applies to runners.
 - Each target needs `root` (entry file relative to the project root), at least one artifact, one artifact profile, and one target profile naming its `main_artifact`.
@@ -72,17 +72,23 @@ Each label names a concrete function with `i32`, `u32`, `i64`, `u64`, `f32`,
 or `f64` parameters and one such result or `unit`. The builder must still
 export the label, for example with `wasm-ld --export=demo_score`.
 
-The standard library itself is a dependency-style package (`stdlib/wosy.toml`):
+## `wosy.lock`
 
-```toml
-[package]
-name = "std"
-source_root = "src"
-```
+Commit the lock; ignore managed `deps/` checkouts. Version 1 records the origin, package path, exact commit, and original source hash of each reachable Git package. Local packages are not locked. Build and run use the installed graph without fetching.
+
+A path-only dependency inside a Git package selects a sibling in the same repository and commit. For example, `../support` from `packages/math` selects `packages/support`. Paths cannot leave the repository.
+
+## Dependency patches
+
+Store patches in `patches/<package>/<uuid-v7>.patch`. Wosy applies them in UUID order. Patches are Git binary diffs and do not change the original source hash.
+
+## `wosy.meta.json`
+
+Package-owned tool metadata. Base-language builds need no entries.
 
 ## Source graph
 
-The entry file plus every file named by a `namespace` declaration forms the source graph. A declaration such as `math = namespace app "src/math.w";` loads `src/math.w` from the `app` package. A declaration such as `std = namespace std "bootstrap.w";` resolves `bootstrap.w` relative to the `std` package `source_root`. Missing files fail with `M0001`; cycles fail with `M0003`.
+The entry file plus every file named by a `namespace` declaration forms the source graph. A declaration such as `math = namespace is_even "math.w";` loads `src/math.w` when `is_even` uses `source_root = "src"`. A declaration such as `std = namespace std "bootstrap.w";` resolves `bootstrap.w` relative to the `std` package `source_root`. Missing files fail with `M0001`; cycles fail with `M0003`.
 
 For checker source discovery, see [`wosy check`](cli.md#wosy-check).
 

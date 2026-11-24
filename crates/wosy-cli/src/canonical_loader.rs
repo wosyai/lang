@@ -1,9 +1,9 @@
-use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs;
+use std::io::Read;
 use wosy_compiler::{derive_scalar_declarations_from_cst, parse_source_with_snapshot, ScalarNamespaceBinding};
 use wosy_project::{
-    load_reachable_source_graph, ContentRevision, NamespaceEdgeInput, PackageRelativePath,
+    load_reachable_source_graph, ContentRevision, NamespaceEdgeInput, NamespacePackages, PackageRelativePath,
     ProjectConfiguration, ProjectContext, SourceIdentity as ProjectSourceIdentity, SourceNodeInput,
     SourceSpan as ProjectSourceSpan,
 };
@@ -286,17 +286,22 @@ pub(crate) fn load_canonical_project_inputs(
 ) -> Result<CanonicalProjectInputs, CanonicalLoadFailure> {
     let root_path = PackageRelativePath::new(project.source_root.clone())?;
     let root_project = root.to_string_lossy().into_owned();
+    let packages = NamespacePackages {
+        root_name: &project.package,
+        root_source: configuration.module_source_root.as_ref(),
+        dependencies: &configuration.resolved_packages,
+    };
     let mut discovered = HashMap::from([(
         project.package.as_str(),
         HashSet::from([root_path.clone()]),
     )]);
-    let mut pending = VecDeque::from([(project.package.as_str(), root_path)]);
+    let mut pending = VecDeque::from([(project.package.as_str(), root_path, None::<fs::File>)]);
     let mut root_node = None;
     let mut nodes = Vec::new();
     let mut declarations_by_path = BTreeMap::new();
     let mut texts = BTreeMap::new();
 
-    while let Some((package, path)) = pending.pop_front() {
+    while let Some((package, path, checked_git_source)) = pending.pop_front() {
         let (package_root, project_identity) = if package == project.package {
             (root, root_project.as_str())
         } else {
@@ -320,8 +325,16 @@ pub(crate) fn load_canonical_project_inputs(
                     path.as_path().display()).into());
             }
         }
-        let text = fs::read_to_string(&source_path)
-            .map_err(|error| format!("failed to read {}: {error}", source_path.display()))?;
+        let read_error = |error| format!("failed to read {}: {error}", source_path.display());
+        let text = if let Some(mut file) = checked_git_source {
+            // Read the same verified Git entry that was opened during
+            // namespace discovery, never reopen the displayed host path.
+            let mut text = String::new();
+            file.read_to_string(&mut text).map_err(read_error)?;
+            text
+        } else {
+            fs::read_to_string(&source_path).map_err(read_error)?
+        };
         let source = canonical_source_identity(project_identity.to_owned(), package, &path, &text);
         #[cfg(feature = "internal-checker")]
         let parse_proofs = match &purpose {
@@ -357,32 +370,27 @@ pub(crate) fn load_canonical_project_inputs(
             let module_path = serde_json::from_str::<String>(&namespace.path)
                 .map_err(|error| format!("invalid namespace path: {error}"))?;
             let module_path = PackageRelativePath::new(module_path.into())?;
-            let (target_package, target_root, target_path) = if namespace.package == project.package {
-                (project.package.as_str(), root, Cow::Borrowed(&module_path))
-            } else {
-                let (package, resolved) = configuration
-                    .resolved_packages
-                    .get_key_value(&namespace.package)
-                    .ok_or_else(|| format!("dependency package {} is missing", namespace.package))?;
-                let target_path = PackageRelativePath::new(
-                    resolved.identity.path.as_path().join(module_path.as_path()),
-                )?;
-                (
-                    package.as_str(),
-                    resolved.project_root.as_path(),
-                    Cow::Owned(target_path),
-                )
-            };
+            let module = packages.resolve(&namespace.package, &module_path)
+                .ok_or_else(|| format!("dependency package {} is missing", namespace.package))?;
+            let target_package = module.package;
             let already_discovered = discovered
                 .get(target_package)
-                .is_some_and(|paths| paths.contains(target_path.as_ref()));
-            if !already_discovered && target_root.join(target_path.as_path()).is_file() {
-                let target_path = target_path.into_owned();
-                discovered
-                    .entry(target_package)
-                    .or_default()
-                    .insert(target_path.clone());
-                pending.push_back((target_package, target_path));
+                .is_some_and(|paths| paths.contains(module.path.as_ref()));
+            if !already_discovered {
+                let available = if let Some((_, checkout)) = configuration.git_package(target_package)? {
+                    checkout.source(module.path.as_path())?.map(Some)
+                } else {
+                    let target_root = module.dependency.map_or(root, |resolved| resolved.project_root.as_path());
+                    target_root.join(module.path.as_path()).is_file().then_some(None)
+                };
+                if let Some(checked_git_source) = available {
+                    let target_path = module.path.into_owned();
+                    discovered
+                        .entry(target_package)
+                        .or_default()
+                        .insert(target_path.clone());
+                    pending.push_back((target_package, target_path, checked_git_source));
+                }
             }
             namespace_edges.push(NamespaceEdgeInput {
                 origin: namespace.package.clone(),
@@ -419,12 +427,7 @@ pub(crate) fn load_canonical_project_inputs(
     drop((discovered, pending));
 
     let root_node = root_node.ok_or_else(|| "project root source is missing".to_owned())?;
-    let graph = match load_reachable_source_graph(
-        &project.package,
-        root_node,
-        nodes,
-        &configuration.resolved_packages,
-    ) {
+    let graph = match load_reachable_source_graph(&packages, root_node, nodes) {
         Ok(graph) => graph,
         Err(error) => return Err(CanonicalLoadFailure::Graph { error, texts }),
     };
