@@ -1450,6 +1450,24 @@ pub(super) fn commit_return<'ctx>(
         aggregate.mixed_return = Some(*value);
         return Ok(());
     }
+    if let Some(ClosedReturn::Recommit { call, output }) = aggregate.plan.returning {
+        let returned = block.final_expressions().next().and_then(|(expression, _)|
+            state.body_call_nodes.and_then(|nodes| nodes.expression_ordinal(expression)));
+        let [descriptor] = outputs.outputs.as_slice() else {
+            return Err("recommitted aggregate return is not a single descriptor".into());
+        };
+        if returned != Some(output) || !matches!(descriptor.ty, ScalarType::Struct(_)) || aggregate.committed {
+            return Err("recommitted aggregate return changed its proved root output".into());
+        }
+        let destination = aggregate.destination.ok_or_else(|| "missing recommitted aggregate destination".to_owned())?;
+        let base = aggregate.receipts.remove(&call)
+            .ok_or_else(|| "missing original backing at recommitted aggregate return".to_owned())?;
+        store_value(context, state, destination, &descriptor.ty, result.clone())?;
+        let aggregate = state.aggregate.as_mut().expect("recommitted aggregate return frame");
+        aggregate.set_base(base)?;
+        aggregate.committed = true;
+        return Ok(());
+    }
     if !matches!(aggregate.plan.returning, Some(ClosedReturn::Allocation { .. })) {
         return Ok(());
     }
@@ -1524,7 +1542,7 @@ pub(super) fn finish_return<'ctx>(
     let Some(route) = aggregate.plan.returning else {
         return Ok(None);
     };
-    if matches!(route, ClosedReturn::Allocation { .. }) && !aggregate.committed {
+    if matches!(route, ClosedReturn::Allocation { .. } | ClosedReturn::Recommit { .. }) && !aggregate.committed {
         return Err("closed aggregate return did not commit ownership before cleanup".into());
     }
     if let Some(pair) = aggregate.mixed_return.take() {

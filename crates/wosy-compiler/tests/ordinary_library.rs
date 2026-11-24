@@ -828,6 +828,92 @@ fn aggregate_owner_recommit_preserves_the_original_base_across_ordinary_identity
 }
 
 #[test]
+fn recommitted_wrapper_return_preserves_one_base_across_two_owning_returns() {
+    let app = source("workbench", "src/recommitted_wrapper_return.w");
+    let text = include_str!("fixtures/recommitted-wrapper-return.w");
+    for (target, target_layout) in [
+        ("native64", ScalarTargetLayout::NATIVE64),
+        ("wasm32", ScalarTargetLayout::WASM32),
+    ] {
+        let emit = |text: &str| {
+            let prepared = prepare_scalar_project(
+                vec![(declarations(&app, text), Vec::new())], vec![app.clone()],
+                ScalarPreparationInputs { target_layout },
+            ).unwrap_or_else(|error| panic!("{target}: {:?}", error.diagnostics));
+            let build = analyze_scalar_build(&prepared);
+            assert!(build.diagnostics().is_empty(), "{target}: {:?}", build.diagnostics());
+            emit_scalar_build_project_llvm(&build).map(|module| module.to_text())
+        };
+        let ir = emit(text).unwrap_or_else(|error| panic!("{target}: {error}"));
+        let context = Context::create();
+        let buffer = MemoryBuffer::create_from_memory_range_copy(ir.as_bytes(), target);
+        let module = context.create_module_from_ir(buffer).unwrap();
+        module.verify().unwrap();
+        let find = |name| module.get_function(&function_with_suffix(&module, name)).unwrap();
+        let (make, inner, outer, drive) = (find("make_packet"), find("inner_owner"), find("outer_owner"), find("drive"));
+        let (first, second, sink) = (find("first_identity"), find("second_identity"), find("accept_packet"));
+        let free = module.get_function("__wosy_core_free").unwrap();
+        let verify_wrapper = |wrapper: inkwell::values::FunctionValue<'_>, source, relay: inkwell::values::FunctionValue<'_>, independent: bool| {
+            assert_eq!(wrapper.count_params(), 2, "{target}: {ir}");
+            assert_eq!(relay.count_params(), 1, "{target}: {ir}");
+            let mut produced = Vec::new();
+            let mut released = Vec::new();
+            let mut returned = None;
+            for row in wrapper.get_basic_blocks().into_iter().flat_map(|block| block.get_instructions()) {
+                if row.get_opcode() == InstructionOpcode::Return {
+                    assert!(returned.replace(row.get_operand(0).unwrap().value().unwrap()).is_none());
+                }
+                if row.get_opcode() != InstructionOpcode::Call { continue; }
+                let call = CallSiteValue::try_from(row).unwrap();
+                match call.get_called_fn_value() {
+                    Some(callee) if callee == source => produced.push(call.try_as_basic_value().basic().unwrap()),
+                    Some(callee) if callee == free => released.push(row.get_operand(0).unwrap().value().unwrap()),
+                    Some(callee) if callee == relay => assert_eq!(call.count_arguments(), 1),
+                    _ => {}
+                }
+            }
+            assert_eq!(produced.len(), if independent { 2 } else { 1 }, "{target}: {ir}");
+            assert_eq!(returned, Some(produced[0]), "{target}: {ir}");
+            assert_eq!(released, produced[1..], "{target}: {ir}");
+        };
+        verify_wrapper(inner, make, first, true);
+        verify_wrapper(outer, inner, second, false);
+        let mut owned = None;
+        let mut passed = None;
+        let mut releases = Vec::new();
+        for row in drive.get_basic_blocks().into_iter().flat_map(|block| block.get_instructions()) {
+            if row.get_opcode() != InstructionOpcode::Call { continue; }
+            let call = CallSiteValue::try_from(row).unwrap();
+            let argument = |slot| row.get_operand(slot).unwrap().value().unwrap();
+            match call.get_called_fn_value() {
+                Some(callee) if callee == outer => owned = call.try_as_basic_value().basic(),
+                Some(callee) if callee == sink => passed = Some(argument(call.count_arguments() - 1)),
+                Some(callee) if callee == free => releases.push(argument(0)),
+                _ => {}
+            }
+        }
+        assert!(owned.is_some(), "{target}: {ir}");
+        assert_eq!(passed, owned, "{target}: {ir}");
+        assert_eq!(releases.last().copied(), owned, "{target}: {ir}");
+
+        if let Some(out) = std::env::var_os("WOSY_RECOMMITTED_RETURN_IR_DIR") {
+            let mut witness = ir.replace("@main(", "@wosy_authored_main(");
+            for (wrapper, name) in [("retain", "retain_witness"), ("transfer", "transfer_witness")] {
+                let symbol = function_with_suffix(&module, name);
+                witness.push_str(&format!(
+                    "\ndefine i64 @wosy_{wrapper}() {{\nentry:\n  %result = call i64 @{symbol}()\n  ret i64 %result\n}}\n"
+                ));
+            }
+            std::fs::write(std::path::PathBuf::from(out).join(format!("{target}.ll")), witness).unwrap();
+        }
+
+        let indirect = text.replace("    outgoing\n", "    Packet rebound = outgoing;\n    rebound\n");
+        let error = emit(&indirect).expect_err("an indirect returned binding lacks a root handoff certificate");
+        assert!(error.contains("recommitted aggregate return has no exact root binding"), "{target}: {error}");
+    }
+}
+
+#[test]
 fn runtime_array_recommit_keeps_the_owner_until_its_real_end() {
     let recursive = r#"
 (u8[], u64)(u8[], u64, u64) carry = fn(bytes, depth, count) {

@@ -2427,6 +2427,7 @@ pub(crate) enum ClosedReturn {
     MixedBranch,
     Allocation { block: usize, item: usize },
     Forward { call: OccurrenceOrdinal },
+    Recommit { call: usize, output: usize },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2644,6 +2645,29 @@ impl Body<'_> {
 
     fn has_mixed_struct_result(&self) -> bool {
         self.mixed_result_lanes().is_some()
+    }
+
+    fn recommitted_root_output(&self, producer: CfgPointId) -> Option<(OccurrenceOrdinal, OccurrenceOrdinal)> {
+        let facts = self.facts?;
+        let [output] = self.sites.boundary.root_outputs.as_slice() else { return None };
+        if output.output != 0 || !matches!(output.ty, ScalarType::Struct(_)) || facts.returns.len() != 1 {
+            return None;
+        }
+        let (&returned, _) = facts.returns.first_key_value()?;
+        let (bound, binding) = facts.direct_receipt_bindings.get(&producer)?;
+        let root = self.cfg.points.first()?.scope;
+        let point = self.cfg.points.get(returned.0)?;
+        let CfgPointKind::ReturnOutput { output: 0, value_point, checked: false } = point.kind else { return None };
+        let value = self.cfg.points.get(value_point.0)?;
+        if point.scope != root || value.scope != root || *bound >= value_point || value_point >= returned
+            || !matches!(&value.kind, CfgPointKind::Read { binding: read } if read == binding)
+        {
+            return None;
+        }
+        let mut outputs = self.sites.structure.blocks[self.sites.structure.root.0].final_outputs();
+        let output = outputs.next()?;
+        if output.output != 0 || outputs.next().is_some() { return None; }
+        Some((*facts.calls.get(&producer)?, output.expression))
     }
 
     fn is_exact_identity_relay(&self) -> bool {
@@ -3657,6 +3681,7 @@ fn closed_aggregates<'a>(
     }
     let mut recommit_observers = BTreeMap::<(BodyKey, CfgPointId), BTreeSet<(BodyKey, usize)>>::new();
     let mut recommit_edges = BTreeMap::<(BodyKey, CfgPointId), Vec<(CfgPointId, Option<CfgPointId>)>>::new();
+    let mut recommit_returns = BTreeSet::new();
     let mut outgoing = BTreeSet::new();
     let mut pending = Vec::new();
     let mut callers = BTreeMap::<BodyKey, Vec<BodyKey>>::new();
@@ -3759,28 +3784,42 @@ fn closed_aggregates<'a>(
                 }
                 OwnerSource::Call(point) => {
                     if let Some(target) = target_body(&declarations, body.cfg, point) {
-                        callers.entry(target).or_default().push(key);
+                        if identity_relays.contains(&target) {
+                            recommit_returns.insert((key, point));
+                        } else {
+                            callers.entry(target).or_default().push(key);
+                        }
                     }
                 }
             }
         }
     }
-    while let Some(target) = pending.pop() {
-        if let Some(body_callers) = callers.remove(&target) {
-            for caller in body_callers {
-                if outgoing.insert(caller) {
-                    pending.push(caller);
-                }
-            }
+    let mut recommitted = BTreeMap::<(BodyKey, CfgPointId), RecommitOrigin>::new();
+    let mut recommit_waiting = BTreeMap::<BodyKey, Vec<_>>::new();
+    for &(caller, producer) in recommit_edges.keys() {
+        if let Some(target) = target_body(&declarations, bodies[&caller].cfg, producer) {
+            recommit_waiting.entry(target).or_default().push((caller, producer));
         }
     }
-
-    let mut recommitted = BTreeMap::<(BodyKey, CfgPointId), RecommitOrigin>::new();
-    let mut recommit_pending: Vec<_> = recommit_edges.keys().copied()
-        .filter(|&(caller, producer)| target_body(&declarations, bodies[&caller].cfg, producer)
-            .is_some_and(|target| outgoing.contains(&target)))
-        .collect();
-    while let Some(node @ (caller, producer)) = recommit_pending.pop() {
+    let mut recommit_pending = Vec::new();
+    // Only independently allocated owners seed the two worklists. A wrapper
+    // becomes an owning producer when its returned recommit has such a seed.
+    // Each observed call edge is consumed once, including through wrapper chains.
+    loop {
+        if let Some(target) = pending.pop() {
+            if let Some(body_callers) = callers.remove(&target) {
+                for caller in body_callers {
+                    if outgoing.insert(caller) {
+                        pending.push(caller);
+                    }
+                }
+            }
+            if let Some(sites) = recommit_waiting.remove(&target) {
+                recommit_pending.extend(sites);
+            }
+            continue;
+        }
+        let Some(node @ (caller, producer)) = recommit_pending.pop() else { break };
         let Some(edges) = recommit_edges.remove(&node) else { continue };
         let body = &bodies[&caller];
         let facts = body.facts.expect("recommit input required caller facts");
@@ -3809,6 +3848,9 @@ fn closed_aggregates<'a>(
             .ok_or_else(unsupported)?;
         result.bodies.entry(relay).or_default().identity_relay = true;
         let recommitted_value = (caller, consumer);
+        if recommit_returns.contains(&recommitted_value) && outgoing.insert(caller) {
+            pending.push(caller);
+        }
         recommit_pending.push(recommitted_value);
         if let Some(observers) = recommit_observers.remove(&recommitted_value) {
             for receiver in observers {
@@ -4344,11 +4386,6 @@ fn closed_aggregates<'a>(
                 return Err(format!("mixed aggregate result requires a matching local binding in {:?}", body.source));
             }
         }
-        if body.return_owners().any(|owner| matches!(owner, Some(OwnerSource::Call(point))
-            if recommitted.contains_key(&(key, point))))
-        {
-            return Err(format!("recommitted aggregate result escapes its owning caller in {:?}", body.source));
-        }
         for (&call, &point) in &facts.unproved_receipt_loans {
             if recommitted.contains_key(&(key, call)) || target_body(&declarations, body.cfg, call).is_some_and(|target| outgoing.contains(&target)) {
                 return Err(format!("aggregate owning receipt has an unproved checked loan in {:?} at point {point:?}", body.source));
@@ -4370,7 +4407,8 @@ fn closed_aggregates<'a>(
                 ));
             };
             let route = if values.any(|candidate| candidate != Some(owner)) {
-                if facts.mixed_branch_return.is_none() {
+                if facts.mixed_branch_return.is_none() || body.return_owners().any(|owner| matches!(owner,
+                    Some(OwnerSource::Call(point)) if recommitted.contains_key(&(key, point)))) {
                     return Err(format!("aggregate return owner has conflicting paths in {:?}", body.source));
                 }
                 ClosedReturn::MixedBranch
@@ -4384,6 +4422,12 @@ fn closed_aggregates<'a>(
                             format!("missing aggregate allocation binding in {:?}", body.source)
                         })?;
                         ClosedReturn::Allocation { block, item }
+                    }
+                    OwnerSource::Call(point) if recommitted.contains_key(&(key, point)) => {
+                        let (call, output) = body.recommitted_root_output(point).ok_or_else(|| {
+                            format!("recommitted aggregate return has no exact root binding in {:?}", body.source)
+                        })?;
+                        ClosedReturn::Recommit { call: call.0, output: output.0 }
                     }
                     OwnerSource::Call(point) => {
                         let target_mixed = target_body(&declarations, body.cfg, point)
@@ -4468,6 +4512,13 @@ fn closed_aggregates<'a>(
             }
             let owner = OwnerSource::Call(point);
             let mut endpoints = call_endpoints.get(&point).into_iter().flatten().copied();
+            if matches!(return_route, Some(ClosedReturn::Recommit { call: returned, .. }) if returned == call.0) {
+                if previous.is_none() || discharged_by_inputs.contains_key(&(key, point)) || endpoints.next().is_some() {
+                    return Err(format!("recommitted aggregate return has competing ownership routes in {:?}", body.source));
+                }
+                continue;
+            }
+
             if let Some(&[first, second]) = discharged_by_inputs.get(&(key, point)) {
                 let endpoint = endpoints.next();
                 if endpoint.is_some() || second.is_some() {
