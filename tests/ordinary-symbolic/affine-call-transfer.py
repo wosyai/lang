@@ -904,6 +904,36 @@ cases.extend([
     ("projected-narrowed-integer-return-prunes-parent",projected_scalar_narrow,192,b"SURVIVORS"),
     ("projected-empty-integer-return-keeps-sibling",projected_scalar_empty,193,b"REACHED-NARROWSIBLING"),
 ])
+conditional_local_write = f"""%%start
+    i8(i8) revise = fn(entry) {{
+        i8 current = 2;
+        i8 previous = current;
+        core.require(previous != 2, {report(196,"PRIOR")});
+        current = if (entry > 0) {{ entry }} else {{
+            core.require(false, {report(197,"ARM-EFFECT")});
+            4
+        }};
+        core.require(previous != 2, {state_report(198,"UNCHANGED-OLD","previous")});
+        current
+    }};
+    i8 saved = revise(7);
+    core.require(saved != 7, {report(199,"RETURNED-SELECTED")});
+    %%end"""
+conditional_local_write_bool = f"""%%start
+    i8(i8) revise = fn(entry) {{
+        bool choosing = false;
+        bool flag = true;
+        flag = if (choosing) {{ true }} else {{ false }};
+        if (flag) {{ 9 }} else {{ entry }}
+    }};
+    i8 saved = revise(7);
+    core.require(saved != 7, {report(199,"RETURNED-ELSE")});
+    %%end"""
+cases.extend([
+    ("exact-startup-conditional-local-write-ignores-unreached-arm",conditional_local_write,196,b"PRIORUNCHANGED-OLDRETURNED-SELECTED"),
+    ("exact-startup-conditional-local-write-rejects-reached-effect",conditional_local_write.replace("revise(7)","revise(0)"),2,b"unsupported analysis"),
+    ("exact-startup-conditional-local-write-selects-bool-else",conditional_local_write_bool,199,b"RETURNED-ELSE"),
+])
 scalar_local_write = f"""%%start
     i8(i8) revise = fn(entry) {{
         i8 current = 2;
@@ -1155,6 +1185,9 @@ cases.extend([
 ])
 holes_bytes = b'{"type":{"kind":"i8"},"value":{"kind":"alternatives","values":[1,3]}}\n'
 authored_files = {
+    "exact-startup-conditional-local-write-ignores-unreached-arm": {
+        "state.json": b'{"type":{"kind":"i8"},"value":2}\n',
+    },
     "projected-narrowed-integer-return-prunes-parent": {
         "state.json": b'{"type":{"kind":"i8"},"value":{"kind":"range","minimum":2,"maximum":127}}\n',
     },
@@ -1251,6 +1284,8 @@ with tempfile.TemporaryDirectory(prefix="affine-calls-") as path:
                         assert b"BASE" not in res.stderr and b"FRAME" not in res.stderr,res
                     if name.startswith("exact-startup-integer-return-"):
                         assert b"NEVER-SCALAR-WRITE" not in res.stderr,res
+                    if name == "exact-startup-conditional-local-write-rejects-reached-effect":
+                        assert b"PRIOR" not in res.stderr and b"ARM-EFFECT" not in res.stderr,res
                 else:
                     assert res.stderr==expected_stderr,res
                 files = authored_files.get(name, {}) if included else {}

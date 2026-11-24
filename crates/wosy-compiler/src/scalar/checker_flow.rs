@@ -6291,18 +6291,74 @@ fn exact_returning_local_write(
     row.get(axis)?.singleton_value()?;
     let work = roots.ordinary_local_work.get_or_insert(0);
     charge_call_work(work, 4usize.checked_add(row.equal_axes().len().checked_mul(3)?)?)?;
-    let value = if let Some(value) = scalar_call_literal(structure, rhs, ty, true) {
-        Rc::new(IntegerSet::singleton(value))
-    } else {
-        let PlainNameIdentity::Lexical(source) = calls.prepared_plain_name(rhs)? else { return None; };
-        let (source, source_ty) = roots.lookup(source)?;
-        if source_ty != ty { return None; }
-        let value = row.get(source)?;
-        value.singleton_value()?;
-        Rc::clone(value)
-    };
+    let value = exact_returning_local_write_value(calls, roots, row, rhs, ty)?;
     row.overwrite(axis, value, false);
     Some(path)
+}
+
+#[cfg(feature = "internal-checker")]
+fn exact_returning_local_write_value(
+    calls: &FunctionCallSites, roots: &mut IntegerRoots<'_>, row: &IntegerRow,
+    rhs: OccurrenceOrdinal, ty: &ScalarType,
+) -> Option<Rc<IntegerSet>> {
+    use super::reference::CheckerOrdinaryBoolean;
+    let structure = &calls.structure;
+    let selected = if let Some(ConditionalRegion::Value { condition, then_block, else_block, resume, .. }) =
+        calls.conditionals.get(&rhs)
+    {
+        charge_call_work(roots.ordinary_local_work.get_or_insert(0), 8)?;
+        if *resume != rhs || structure.checked_types.expressions.get(condition)? != &ScalarType::Bool
+            || structure.checker_contextual_occurrences.contains(condition)
+        {
+            return None;
+        }
+        let choose = match structure.checker_branches.get(condition) {
+            Some(CheckerPredicate::Boolean(value)) => *value,
+            Some(CheckerPredicate::Integer(predicate)) => {
+                for edge in [OccurrenceEdge::BinaryLeft, OccurrenceEdge::BinaryRight] {
+                    let OccurrenceNode::Expression(operand) = structure.edges.get(&(
+                        OccurrenceParent::Expression(*condition), edge,
+                    ))? else { return None; };
+                    if structure.checker_contextual_occurrences.contains(operand) { return None; }
+                }
+                let (axis, axis_ty) = roots.lookup(&predicate.binding)?;
+                if axis_ty != &predicate.ty { return None; }
+                let value = row.get(axis)?.singleton_value()?;
+                IntegerRelation::from_operator(&predicate.operator)?.accepts(value.cmp(&predicate.bound))
+            }
+            None => {
+                let CheckerOrdinaryBoolean::Binding(binding) = structure.checker_ordinary_booleans.get(condition)?
+                    else { return None; };
+                let (axis, axis_ty) = roots.lookup(binding)?;
+                if *axis_ty != ScalarType::Bool { return None; }
+                bool_result_lane(row.get(axis)?.singleton_value()?)? == 1
+            }
+            _ => return None,
+        };
+        let block = structure.blocks.get(if choose { then_block.0 } else { else_block.0 })?;
+        // The reached arm is a leaf expression, not a place to silently
+        // evaluate (or skip) its authored statements or helper calls.
+        let [item] = block.items.as_slice() else { return None; };
+        let BlockItemKind::FinalOutput(slot) = &item.kind else { return None; };
+        if slot.output != 0 || block.final_outputs().nth(1).is_some() { return None; }
+        slot.expression
+    } else {
+        rhs
+    };
+    if structure.checked_types.expressions.get(&selected)? != ty
+        || structure.checker_contextual_occurrences.contains(&selected)
+    {
+        return None;
+    }
+    if let Some(value) = scalar_call_literal(structure, selected, ty, true) {
+        return Some(Rc::new(IntegerSet::singleton(value)));
+    }
+    let PlainNameIdentity::Lexical(source) = calls.prepared_plain_name(selected)? else { return None; };
+    let (source, source_ty) = roots.lookup(source)?;
+    if source_ty != ty { return None; }
+    let value = row.get(source)?;
+    value.singleton_value()?;
+    Some(Rc::clone(value))
 }
 
 fn integer_assignment(
