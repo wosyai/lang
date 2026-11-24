@@ -2908,6 +2908,7 @@ impl Body<'_> {
             if current_producer.is_some_and(|previous| previous >= call.id)
                 || slot != relay_slot || call.scope != scope || installed.scope != scope
                 || facts.calls.get(&call.id) != Some(&step_init.primary)
+                || facts.unproved_receipt_loans.contains_key(&call.id)
                 || !origins.iter().copied().eq([current_producer.map(|point| InputOrigin::Owner(OwnerSource::Call(point)))])
                 || !facts.direct_receipt_bindings.get(&call.id).is_some_and(|(site, holder)|
                     *site == installed.id && holder == binding)
@@ -2920,12 +2921,19 @@ impl Body<'_> {
             recommits.push(LocalChoiceRecommit { relay, slot, point: call.id, ordinal: step_init.primary });
             before_consume = rest;
         }
-        // The original selected-loan proof covers the installed join binding,
-        // not a synthesized loan on a later recommit binding.
-        if !recommits.is_empty() && (alias.is_some() || !before_consume.is_empty()) { return None; }
+        // The original joined binding needs its prepared reader certificate.
+        // Once recommitted, additionally require the issued loan and exact
+        // current producer from ordinary receipt liveness, not the old key.
+        let certified_reader = |call, input, ordinal| {
+            facts.local_choice_reader_calls.get(&call) == Some(&(input, ordinal))
+                && current_producer.is_none_or(|producer|
+                    facts.immediate_receipt_reads.get(&call) == Some(&Some((ordinal, input, producer))))
+        };
+        if current_producer.is_some() && alias.is_some() { return None; }
         let before_consume = if let Some((BlockItem {
             kind: BlockItemKind::Assignment { group }, ..
         }, rest)) = before_consume.split_first() {
+            if current_producer.is_some() { return None; }
             // Only a direct resolved ordinary field of the exact selected
             // descriptor may be updated. This changes metadata, never backing.
             let group = self.sites.assignments.get(&(group.block, group.item))?;
@@ -2997,7 +3005,7 @@ impl Body<'_> {
                 || read.source_span.range != self.sites.occurrences.get(argument.0)?.span
                 || reader.source_span.range != self.sites.occurrences.get(observation.0)?.span
                 || reader.scope != scope || !exact_local_choice_shared_borrow(place, loan, holder, descriptor, &receiver.ty, inner)
-                || facts.local_choice_reader_calls.get(&reader.id) != Some(&(read.id, observation))
+                || !certified_reader(reader.id, read.id, observation)
                 || !matches!(&reader.kind, CfgPointKind::Call { output: 0, target: ResolvedCallTarget::ModuleCallable {
                     concrete: ConcreteCallSelection::Declaration, .. }, argument_points, .. }
                     if argument_points.as_slice() == [read.id])
@@ -3104,7 +3112,7 @@ impl Body<'_> {
             if let [parameter @ ScalarType::CheckedReference {
                 mutability: ScalarReferenceMutability::Shared, inner,
             }] = signature.parameters.as_slice() {
-                if current_producer.is_some() || self.sites.declared_unsafe_calls.contains(&scalar_call.0) { return None; }
+                if self.sites.declared_unsafe_calls.contains(&scalar_call.0) { return None; }
                 let OccurrenceNode::Expression(argument) = *structure.edges.get(&(
                     OccurrenceParent::Expression(scalar_call), OccurrenceEdge::CallArgument(0),
                 ))? else { return None };
@@ -3136,7 +3144,7 @@ impl Body<'_> {
                 };
                 let reader = next(input.id)?;
                 if read.source_span.range != self.sites.occurrences.get(borrow_expression.0)?.span
-                    || facts.local_choice_reader_calls.get(&reader.id) != Some(&(input.id, output.expression))
+                    || !certified_reader(reader.id, input.id, output.expression)
                     || !matches!(&reader.kind, CfgPointKind::Call { output: 0, target: ResolvedCallTarget::ModuleCallable {
                         concrete: ConcreteCallSelection::Declaration, .. }, argument_points, .. }
                         if argument_points.as_slice() == [input.id])

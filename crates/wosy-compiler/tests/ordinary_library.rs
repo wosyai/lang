@@ -1387,6 +1387,13 @@ fn lexical_conditional_owner_choice_releases_selected_original_after_read() {
         .replace("drive(2, true) }", "if (drive(2, true) == 4) { 2 } else { 0 } }")
         .replace("drive(3, true) }", "if (drive(3, true) == 24) { 12 } else { 0 } }");
     assert_ne!(saved_then_consumed, borrowed_then_consumed);
+    let read_recommitted_release = recommitted_release
+        .replace("u64(u64, bool) drive", "u64(*Packet) read_selected = fn(view) { (*view).length };\nu64(u64, bool) drive")
+        .replace("    returned.length", "    read_selected(&returned)");
+    let read_recommitted_consume = recommit(&saved_then_consumed, "u64 observed = read_selected(&chosen.length)")
+        .replace("consume(chosen) + observed", "consume(returned) + observed");
+    assert_ne!(read_recommitted_release, recommitted_release);
+    assert_ne!(read_recommitted_consume, saved_then_consumed);
     let forwarding = |consume: &str| saved_then_consumed.replace(
         "u64(Packet) consume = fn(packet) { packet.length };",
         &format!("u64(Packet) terminal = fn(packet) {{ packet.length }};\n\
@@ -1461,6 +1468,8 @@ fn lexical_conditional_owner_choice_releases_selected_original_after_read() {
         (temporary.as_str(), "consume-temporary"), (borrowed.as_str(), "borrow"),
         (recommitted_release.as_str(), "release-after-recommit"),
         (recommitted_consume.as_str(), "consume-after-recommit"),
+        (read_recommitted_release.as_str(), "release-after-read-recommit"),
+        (read_recommitted_consume.as_str(), "consume-after-read-recommit"),
         (borrowed_then_consumed.as_str(), "consume-after-borrow"),
         (saved_then_consumed.as_str(), "consume-after-saved-borrow"),
         (through_calls.as_str(), "consume-after-forwarded-borrow"),
@@ -1478,6 +1487,7 @@ fn lexical_conditional_owner_choice_releases_selected_original_after_read() {
         let base_use = use_site.strip_prefix("nested-").unwrap_or(use_site);
         let consuming = base_use.starts_with("consume");
         let recommitting = base_use.ends_with("-recommit");
+        let reading_recommit = base_use.ends_with("-read-recommit");
         let releases_saved = matches!(base_use, "release-after-saved-borrows" | "release-after-scalar-continuation");
         let multiple = releases_saved || base_use == "consume-after-multiple-borrows";
         let updates_metadata = base_use == "consume-after-metadata-write";
@@ -1485,7 +1495,7 @@ fn lexical_conditional_owner_choice_releases_selected_original_after_read() {
         let middle_slot = base_use == "consume-through-middle-slot";
         let nested_relays = base_use == "consume-through-exhaustive-relays";
         let forwarding = exhaustive || middle_slot || nested_relays || base_use == "consume-after-forwarded-borrow";
-        let borrowing = multiple || updates_metadata || forwarding
+        let borrowing = reading_recommit || multiple || updates_metadata || forwarding
             || matches!(base_use, "borrow" | "named-borrow" | "consume-after-borrow" | "consume-after-saved-borrow");
         for (target, target_layout) in [("native64", ScalarTargetLayout::NATIVE64), ("wasm32", ScalarTargetLayout::WASM32)] {
             for project in [false, true] {
@@ -1559,6 +1569,7 @@ fn lexical_conditional_owner_choice_releases_selected_original_after_read() {
                         }
                     } else if Some(callee) == reader || Some(callee) == whole_reader {
                         assert_eq!(expected_readers.next(), Some(callee), "every authored loan is observed in order");
+                        assert!(!recommitting || recommitted.len() == 2, "read only after both exact relay returns");
                         assert_eq!(call.count_arguments(), 1, "a reader never receives the owning sidecar");
                         assert_eq!(arg(0).into_int_value().get_type().get_bit_width(), target_layout.pointer_size as u32 * 8);
                         reader_seen = Some(callee) == reader;
@@ -1596,7 +1607,9 @@ fn lexical_conditional_owner_choice_releases_selected_original_after_read() {
                 if let Some(consumer) = consumer {
                     if borrowing {
                         assert!(reader_seen);
-                        assert!(reads.contains(&descriptor), "the read must borrow the descriptor handed to consumer");
+                        if !recommitting {
+                            assert!(reads.contains(&descriptor), "the read must borrow the descriptor handed to consumer");
+                        }
                     }
                     assert!(released.is_empty(), "the caller transferred rather than freed the receipt");
                     if recommitting {
