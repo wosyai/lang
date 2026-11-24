@@ -1164,7 +1164,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
             let address = self.expression_ordinal(parent, address_edge);
             let place = self.place_ordinal(OccurrenceParent::Expression(address), OccurrenceEdge::ExpressionPlace);
             if let Some(PreparedPlaceRoot::Lexical(binding)) = self.prepared_place_root(place, *place_span)? {
-                if fallible_bindings.get(binding).is_some_and(|(recorded_scope, _)| *recorded_scope == scope) {
+                if fallible_bindings.get(binding).is_some_and(|site| site.scope == scope) {
                     return Ok(Some((binding.clone(), present_on_then)));
                 }
             }
@@ -4536,7 +4536,14 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         && (is_integer_type(&receiver.ty) || matches!(receiver.ty, ScalarType::Struct(_)))
                     {
                         declares_fallible = true;
-                        self.proof_points.fallible_allocation_bindings.get_or_insert_with(HashMap::new).insert(id.clone(), (scope, receiver.ty.clone()));
+                        let whole_copy = matches!(&receiver.ty, ScalarType::Struct(_))
+                            && matches!(copy_policy(&receiver.ty, self.structs, self.enums, &self.generic_parameters),
+                                Ok(CopyPolicy::Copy));
+                        self.proof_points.fallible_allocation_bindings.get_or_insert_with(HashMap::new).insert(
+                            id.clone(), super::control::GuardedAllocationBinding {
+                                scope, ty: receiver.ty.clone(), whole_copy,
+                            },
+                        );
                         self.local_borrow = None;
                     }
                     let origins = match value {
@@ -7303,7 +7310,7 @@ struct ReferenceTransferCfg<'a> {
     allocations: &'a BTreeSet<ReferenceBindingId>,
     checked_join_values: &'a [(CfgPointId, [Option<CfgPointId>; 2])],
     checked_block_values: &'a [(CfgPointId, CfgPointId)],
-    fallible_allocation_bindings: Option<&'a HashMap<ReferenceBindingId, (ReferenceScopeId, ScalarType)>>,
+    fallible_allocation_bindings: Option<&'a HashMap<ReferenceBindingId, super::control::GuardedAllocationBinding>>,
     guarded_allocation_edges: &'a [(CfgPointId, super::control::GuardedAllocationEdge)],
     checked_binding_initializers: &'a [(CfgPointId, CfgPointId)],
     resolved_checked_call_outputs: &'a [CfgPointId],
@@ -8426,7 +8433,7 @@ fn linear_incoming_slot_preserves_gaps_and_distinct_ordered_states() {
 }
 
 fn require_available_fallible_read(
-    bindings: &HashMap<ReferenceBindingId, (ReferenceScopeId, ScalarType)>,
+    bindings: &HashMap<ReferenceBindingId, super::control::GuardedAllocationBinding>,
     state: &ReferenceEdgeState,
     binding: &ReferenceBindingId,
     point: &ReferenceFlowPoint,
@@ -8434,8 +8441,8 @@ fn require_available_fallible_read(
     errors: &mut Vec<ReferenceAnalysisError>,
 ) {
     let unavailable = state.uninitialized.contains(binding);
-    let Some((_, ty)) = (whole || unavailable).then(|| bindings.get(binding)).flatten() else { return };
-    let reason = if whole && matches!(ty, ScalarType::Struct(_)) {
+    let Some(site) = (whole || unavailable).then(|| bindings.get(binding)).flatten() else { return };
+    let reason = if whole && matches!(site.ty, ScalarType::Struct(_)) && !site.whole_copy {
         ReferenceAnalysisErrorReason::UnsupportedFallibleWholeAggregateRead
     } else if unavailable {
         ReferenceAnalysisErrorReason::UnavailableFallibleAllocation
@@ -8447,6 +8454,18 @@ fn require_available_fallible_read(
         binding_id: binding.clone(),
         reason,
     });
+}
+
+fn guarded_allocation_overwrite_error(
+    whole_copy: bool, whole_direct: bool, unavailable: bool,
+) -> Option<ReferenceAnalysisErrorReason> {
+    if !whole_copy || !whole_direct {
+        Some(ReferenceAnalysisErrorReason::UnsupportedFallibleAllocationAccess)
+    } else if unavailable {
+        Some(ReferenceAnalysisErrorReason::UnavailableFallibleAllocation)
+    } else {
+        None
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -10092,13 +10111,21 @@ fn transfer_reference_facts(
                     }
                 }
                 CfgPointKind::Assign { target, .. }
-                    if cfg.fallible_allocation_bindings.is_some_and(|bindings| bindings.contains_key(&target.binding)) =>
+                    if let Some(site) = cfg.fallible_allocation_bindings.and_then(|bindings| bindings.get(&target.binding)) =>
                 {
-                    errors.push(ReferenceAnalysisError::MissingOrigin {
-                        source_span: point.source_span.clone(),
-                        binding_id: target.binding.clone(),
-                        reason: ReferenceAnalysisErrorReason::UnsupportedFallibleAllocationAccess,
-                    });
+                    if let Some(reason) = guarded_allocation_overwrite_error(
+                        site.whole_copy,
+                        target.projections.is_empty() && matches!(target.place, ScalarPlace::Name { .. }),
+                        state.uninitialized.contains(&target.binding),
+                    ) {
+                        errors.push(ReferenceAnalysisError::MissingOrigin {
+                            source_span: point.source_span.clone(),
+                            binding_id: target.binding.clone(),
+                            reason,
+                        });
+                    }
+                    // An overwrite changes bytes, not the branch's proof of allocation
+                    // presence or the original backing's cleanup responsibility.
                     None
                 }
                 CfgPointKind::Assign {
@@ -15323,8 +15350,8 @@ fn seal_guarded_scalar_allocations(
             {
                 return None;
             }
-            let left = bindings.get(&left.binding)?.0;
-            let right = bindings.get(&right.binding)?.0;
+            let left = bindings.get(&left.binding)?.scope;
+            let right = bindings.get(&right.binding)?.scope;
             if left == right || ![first.scope, second.scope].contains(&left)
                 || ![first.scope, second.scope].contains(&right)
             {
@@ -15335,14 +15362,14 @@ fn seal_guarded_scalar_allocations(
     }
     edges.iter().map(|(branch, edge)| {
         let condition = conditions.iter().find_map(|(point, condition)| (*point == *branch).then_some(*condition))?;
-        let (scope, ty) = bindings.get(&edge.binding)?;
+        let site = bindings.get(&edge.binding)?;
         let point = cfg.points.get(branch.0)?;
         let then = point.successors.first()?;
-        if point.scope != *scope || !matches!(point.kind, CfgPointKind::Branch { .. }) {
+        if point.scope != site.scope || !matches!(point.kind, CfgPointKind::Branch { .. }) {
             return None;
         }
         Some(GuardedScalarAllocation {
-            binding: edge.binding.clone(), ty: ty.clone(), condition: condition.0,
+            binding: edge.binding.clone(), ty: site.ty.clone(), condition: condition.0,
             branch: *branch, present_on_then: *then == edge.present,
         })
     }).collect()

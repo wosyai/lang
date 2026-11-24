@@ -165,8 +165,8 @@ mod tests {
             ("result", "fallible allocation is not known to be available"),
             ("if (&result == null) { result } else { 7 }", "fallible allocation is not known to be available"),
             ("i32 observed = if (&result == null) { 7 } else { result };\n\tobserved;\n\tif (&result == null) { 9 } else { result }", "fallible allocation requires one proven null guard for its local binding"),
-            ("result = 19;\n\t7", "fallible allocation does not support aliasing or reassignment"),
-            ("*i32 alias = &result;\n\talias;\n\t7", "fallible allocation does not support aliasing or reassignment"),
+            ("result = 19;\n\t7", "fallible allocation access is not a supported whole Copy overwrite or direct guarded read"),
+            ("*i32 alias = &result;\n\talias;\n\t7", "fallible allocation access is not a supported whole Copy overwrite or direct guarded read"),
         ] {
             let text = format!("%%start\ni32() example = fn {{\n\ti32 result =? 3;\n\t{body}\n}};\n%%end");
             let parsed = parse_source(source.clone(), text, &[]);

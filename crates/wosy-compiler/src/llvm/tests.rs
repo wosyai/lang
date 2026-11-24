@@ -9858,9 +9858,9 @@ if (observed() != 30242) { core.system_panic(); };
         }
         for (replacement, diagnostic) in [
             ("held.amount", "fallible allocation is not known to be available"),
-            ("if (&held == null) { 7 } else { Record copied = held; copied.amount }", "fallible struct allocation currently supports only direct field reads"),
-            ("if (&held == null) { 7 } else { *i32 alias = &held.amount; *alias }", "fallible allocation does not support aliasing or reassignment"),
-            ("if (&held == null) { 7 } else { held.amount = 1; held.amount }", "fallible allocation does not support aliasing or reassignment"),
+            ("if (&held == null) { 7 } else { Record copied = held; copied.amount }", "whole fallible struct read requires a proven Copy type"),
+            ("if (&held == null) { 7 } else { *i32 alias = &held.amount; *alias }", "fallible allocation access is not a supported whole Copy overwrite or direct guarded read"),
+            ("if (&held == null) { 7 } else { held.amount = 1; held.amount }", "fallible allocation access is not a supported whole Copy overwrite or direct guarded read"),
         ] {
             let rejected = text.replace(
                 "if (&held == null) { 7 } else { core.int_extend<i32>(held.tag) + held.amount }",
@@ -10214,6 +10214,50 @@ if (inspect(1.25) != 1067450368) { core.system_panic(); };
             ));
             for diagnostics in [&single.diagnostics, &project.diagnostics] {
                 assert!(diagnostics.iter().any(|item| item.message.contains(diagnostic)), "{diagnostics:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn guarded_fallible_whole_copy_overwrites_one_original_backing() {
+    let source = SourceIdentity::new("project".into(), "package".into(), "src/main.w".into(), "r1".into());
+    let text = include_str!("../../tests/fixtures/guarded-fallible-whole-copy.w");
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let parsed = parse_source(source.clone(), text.into(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let single = crate::derive_scalar_program_with_layout(&parsed.result, layout);
+        assert!(single.diagnostics.is_empty(), "{:?}", single.diagnostics);
+        let project = validate_scalar_project(ScalarProject::new(
+            vec![ScalarModule::from_program(single.program.clone(), Vec::new())],
+            vec![source.clone()],
+        ));
+        assert!(project.diagnostics.is_empty(), "{:?}", project.diagnostics);
+        for (project_route, ir) in [
+            (false, emit_scalar_llvm(&single).unwrap().to_text()),
+            (true, emit_scalar_project_llvm(&project).unwrap().to_text()),
+        ] {
+            let symbol = self_tail_test_symbol(&source, project_route, "observed");
+            let body = self_tail_test_body(&ir, "i32", &symbol);
+            assert_eq!(body.matches("call ptr @__wosy_core_alloc(i64 8, i64 4)").count(), 1, "{body}");
+            assert_eq!(body.matches("call void @__wosy_core_free(ptr %allocation)").count(), 1, "{body}");
+            assert!(body.contains("br i1 %fallible.present, label %if.then, label %if.else"), "{body}");
+            assert!(body.contains("br i1 %fallible.present, label %fallible.release, label %fallible.released"), "{body}");
+            let (_, present) = body.split_once("\nif.then:").expect("present edge");
+            let (present, _) = present.split_once("\nif.else:").expect("absent edge");
+            let moves = present.lines().filter(|line| line.contains("call void @llvm.memmove")).collect::<Vec<_>>();
+            assert_eq!(moves.len(), body.matches("call void @llvm.memmove").count(), "{body}");
+            let reads = moves.iter().enumerate().filter(|(_, row)| row.contains(", ptr align 1 %allocation,"))
+                .map(|(index, _)| index).collect::<Vec<_>>();
+            let writes = moves.iter().enumerate().filter(|(_, row)| row.contains("(ptr align 1 %allocation,"))
+                .map(|(index, _)| index).collect::<Vec<_>>();
+            let [read_before, read_after] = reads.as_slice() else { panic!("two snapshots from original backing: {body}") };
+            let [overwrite] = writes.as_slice() else { panic!("one overwrite of original backing: {body}") };
+            assert!(read_before < overwrite && overwrite < read_after, "{body}");
+            if let Some(directory) = std::env::var_os("WOSY_FALLIBLE_WHOLE_COPY_IR_DIR") {
+                let target = if layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
+                let route = if project_route { "project" } else { "standalone" };
+                std::fs::write(std::path::PathBuf::from(directory).join(format!("{target}-{route}.ll")), &ir).unwrap();
             }
         }
     }

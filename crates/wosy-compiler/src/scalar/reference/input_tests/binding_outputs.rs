@@ -512,3 +512,13 @@ fn prepared_fallible_field_reads_require_the_exact_present_root() {
         assert!(errors.iter().all(|error| error.reason() == UnavailableFallibleAllocation), "{body}: {errors:?}");
     }
 }
+
+#[test]
+fn whole_fallible_copy_overwrite_preserves_the_presence_requirement() {
+    use ReferenceAnalysisErrorReason::{UnavailableFallibleAllocation as Unavailable, UnsupportedFallibleAllocationAccess as Unsupported};
+    for present in [true, false] {
+        assert_eq!(guarded_allocation_overwrite_error(true, true, !present), (!present).then_some(Unavailable));
+        assert_eq!(guarded_allocation_overwrite_error(true, false, !present), Some(Unsupported));
+        assert_eq!(guarded_allocation_overwrite_error(false, true, !present), Some(Unsupported));
+    }
+}

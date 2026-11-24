@@ -36,6 +36,12 @@ pub(super) struct GuardedAllocationScope {
     pub(super) exit: super::CfgPointId,
 }
 
+pub(super) struct GuardedAllocationBinding {
+    pub(super) scope: super::ReferenceScopeId,
+    pub(super) ty: ScalarType,
+    pub(super) whole_copy: bool,
+}
+
 #[derive(Default)]
 pub(crate) struct CallablePointFacts {
     pub(super) local_borrow: Option<Box<super::reference::local_borrow::Sealed>>,
@@ -51,7 +57,7 @@ pub(crate) struct CallablePointFacts {
     pub(super) raw_address_exposures: Vec<(super::CfgPointId, Option<super::ReferenceBindingId>)>,
     pub(super) checked_join_values: Vec<(super::CfgPointId, [Option<super::CfgPointId>; 2])>,
     pub(super) checked_block_values: Vec<(super::CfgPointId, super::CfgPointId)>,
-    pub(super) fallible_allocation_bindings: Option<HashMap<super::ReferenceBindingId, (super::ReferenceScopeId, ScalarType)>>,
+    pub(super) fallible_allocation_bindings: Option<HashMap<super::ReferenceBindingId, GuardedAllocationBinding>>,
     pub(super) guarded_scalar_conditions: Vec<(super::CfgPointId, OccurrenceOrdinal)>,
     pub(super) guarded_allocation_scopes: [Option<GuardedAllocationScope>; 2],
     pub(super) guarded_allocation_edges: Vec<(super::CfgPointId, GuardedAllocationEdge)>,
