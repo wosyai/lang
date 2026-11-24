@@ -362,6 +362,7 @@ enum ExpressionReadMode {
     GuardedStructInitializer,
 }
 
+const MAX_JOINED_REBORROW_PARENTS: usize = 4;
 const MAX_JOINED_REBORROW_DESCENDANTS: usize = 4;
 const MAX_JOINED_REBORROW_ALIASES: usize = 8;
 
@@ -7204,7 +7205,7 @@ fn joined_root_reborrow_binding<'a>(
 struct JoinedLoanFamily<'a> {
     shape: JoinedReborrowShape<'a>,
     first_issuance: CfgPointId,
-    selected_parents: [ReferenceOriginId; 2],
+    selected_parents: Vec<ReferenceOriginId>,
 }
 
 impl JoinedLoanFamily<'_> {
@@ -7263,15 +7264,14 @@ fn joined_direct_lexical_place(place: &ReferencePlaceId) -> bool {
     matches!(written, ScalarPlace::Name { .. })
 }
 
-fn checked_joined_reborrow_parent<'a>(
-    points: &[ReferenceFlowPoint],
+fn checked_joined_reborrow_parent(
     site: &ReferenceFlowPoint,
     facts: &[ReferenceOrigin],
     allocations: &BTreeSet<ReferenceBindingId>,
     pointer: CfgPointId,
     state: &ReferenceEdgeState,
-    binding: &'a ReferenceBindingId,
-) -> Option<(ReferenceOriginId, &'a ReferenceBindingId)> {
+    binding: &ReferenceBindingId,
+) -> Option<ReferenceOriginId> {
     let origins = state.point_values.get(pointer)?;
     let origin = *origins.first().filter(|_| origins.len() == 1)?;
     let ReferenceOrigin::Fresh { loan, .. } = facts.get(origin.0)? else { return None };
@@ -7280,16 +7280,54 @@ fn checked_joined_reborrow_parent<'a>(
         || !joined_direct_lexical_place(owner)
         || owner.binding == *binding || allocations.contains(&owner.binding)
         || !contains_loan_site(&owner.binding, site)
-        || !points.get(..pointer.0)?.iter().any(|point|
-            point.scope == site.scope && matches!(&point.kind,
-                CfgPointKind::Bind { binding } if *binding == owner.binding))
         || !exact_live_reborrow_holder(state, binding, origin)
         || state.released.contains(&owner.binding) || state.invalidated.contains(&owner.binding)
         || state.uninitialized.contains(&owner.binding) || unavailable_place(state, owner)
     {
         return None;
     }
-    Some((origin, binding))
+    Some(origin)
+}
+
+fn checked_joined_reborrow_parents(
+    points: &[ReferenceFlowPoint],
+    site: &ReferenceFlowPoint,
+    facts: &[ReferenceOrigin],
+    allocations: &BTreeSet<ReferenceBindingId>,
+    pointer: CfgPointId,
+    states: &[ReferenceEdgeState],
+    binding: &ReferenceBindingId,
+) -> Option<Vec<ReferenceOriginId>> {
+    if !(2..=MAX_JOINED_REBORROW_PARENTS).contains(&states.len()) {
+        return None;
+    }
+    let mut selected = Vec::with_capacity(states.len());
+    let mut owners: Vec<&ReferencePlaceId> = Vec::with_capacity(states.len());
+    for state in states {
+        let id = checked_joined_reborrow_parent(site, facts, allocations, pointer, state, binding)?;
+        let ReferenceOrigin::Fresh { loan, .. } = &facts[id.0] else { return None };
+        let owner = &loan.origin_place;
+        if owners.iter().any(|prior| reference_places_overlap(prior, owner)) {
+            return None;
+        }
+        selected.push(id);
+        owners.push(owner);
+    }
+    // Check exact same-scope lexical declarations with one shared prefix pass,
+    // even if several disjoint alternatives belong to the same aggregate.
+    let mut undeclared: BTreeSet<_> = owners.iter().map(|owner| &owner.binding).collect();
+    for point in points.get(..pointer.0)? {
+        if point.scope != site.scope {
+            continue;
+        }
+        if let CfgPointKind::Bind { binding } = &point.kind {
+            undeclared.remove(binding);
+            if undeclared.is_empty() {
+                return Some(selected);
+            }
+        }
+    }
+    None
 }
 
 fn direct_checked_field_base(place: &ScalarPlace) -> Option<(&ScalarExpression, &ScalarFieldReference)> {
@@ -8211,7 +8249,7 @@ fn transfer_reference_facts(
         let named_parent = || cfg.named_reborrow_parents
             .binary_search_by_key(&id, |parent| parent.borrow)
             .ok().map(|index| &cfg.named_reborrow_parents[index]);
-        let joined_reborrow_binding = if strictly_forward && incoming_count == 2
+        let joined_reborrow_binding = if strictly_forward && (2..=MAX_JOINED_REBORROW_PARENTS).contains(&incoming_count)
             && cfg.joined_reborrow_descendants.binary_search(&id).is_err()
             && matches!(initial_point.kind, CfgPointKind::ReborrowThrough { .. })
         {
@@ -8223,27 +8261,19 @@ fn transfer_reference_facts(
         } else {
             None
         };
-        let joined_reborrow_parents = match (&initial_point.kind, joined_reborrow_binding.as_ref(), states.as_slice()) {
-            (CfgPointKind::ReborrowThrough { pointer_point, .. }, Some(shape), [left, right]) => {
-                let exact = |state| checked_joined_reborrow_parent(
-                    original_points, initial_point, cfg.facts, cfg.allocations, *pointer_point, state, shape.parent,
-                );
-                match (exact(left), exact(right)) {
-                    (Some((left, _)), Some((right, _))) if
-                        matches!((&cfg.facts[left.0], &cfg.facts[right.0]),
-                            (ReferenceOrigin::Fresh { loan: first, .. }, ReferenceOrigin::Fresh { loan: second, .. })
-                                if !reference_places_overlap(&first.origin_place, &second.origin_place))
-                            => Some([left, right]),
-                    _ => None,
-                }
-            }
+        let joined_reborrow_parents = match (&initial_point.kind, joined_reborrow_binding.as_ref()) {
+            (CfgPointKind::ReborrowThrough { pointer_point, .. }, Some(shape)) =>
+                checked_joined_reborrow_parents(
+                    original_points, initial_point, cfg.facts, cfg.allocations, *pointer_point,
+                    states.as_slice(), shape.parent,
+                ),
             _ => None,
         };
-        if let (Some(shape), Some(parents)) = (joined_reborrow_binding, joined_reborrow_parents) {
+        if let (Some(shape), Some(parents)) = (joined_reborrow_binding, joined_reborrow_parents.as_ref()) {
             if !shape.descendants.is_empty()
                 || matches!(initial_point.kind, CfgPointKind::ReborrowThrough { mode: ScalarReferenceMutability::Shared, .. })
             {
-                joined_family = Some(JoinedLoanFamily { shape, first_issuance: id, selected_parents: parents });
+                joined_family = Some(JoinedLoanFamily { shape, first_issuance: id, selected_parents: parents.clone() });
             }
         }
         let joined_call = joined_family.as_ref().and_then(|family| {
@@ -9353,7 +9383,7 @@ fn transfer_reference_facts(
                     rhs
                 }
                 CfgPointKind::ReborrowThrough { mode, place, pointer_point } => 'reborrow: {
-                    let admitted = joined_reborrow_parents.and_then(|parents| {
+                    let admitted = joined_reborrow_parents.as_ref().and_then(|parents| {
                         let origins = state.point_values.get(*pointer_point)?;
                         origins.first().filter(|id| origins.len() == 1 && parents.contains(id)).copied()
                     });

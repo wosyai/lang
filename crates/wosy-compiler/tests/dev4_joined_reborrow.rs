@@ -201,6 +201,48 @@ fn joined_composite_places_preserve_index_and_field_disjointness() {
 }
 
 #[test]
+fn joined_nested_selection_resolves_four_exact_lexical_predecessors() {
+    let program = r#"%%start
+u8(bool, bool) select_value = fn(outer, inner) {
+    u8 first = 7;
+    u8 second = 8;
+    u8 third = 9;
+    u8 fourth = 10;
+    *!u8 parent = null;
+    if (outer) {
+        if (inner) { parent = &!first; } else { parent = &!second; };
+    } else {
+        if (inner) { parent = &!third; } else { parent = &!fourth; };
+    };
+    *u8 child = &(*parent);
+    u8 seen = *child;
+    first = 3;
+    if (first == 3) { seen } else { 0 }
+};
+u8(bool) inspect = fn(choose) {
+    if (choose) {
+        if (select_value(true, true) == 7 && select_value(true, false) == 8) { 7 } else { 0 }
+    } else {
+        if (select_value(false, true) == 9 && select_value(false, false) == 10) { 9 } else { 0 }
+    }
+};
+if (inspect(true) != 7 || inspect(false) != 9) { core.system_panic(); };
+%%end"#;
+    check_case(program, Expected::Valid, Some("WOSY_JOINED_FOUR_PARENTS_IR_DIR"));
+    let overlap = program.replace("parent = &!fourth;", "fourth; parent = &!first;");
+    assert_ne!(overlap, program);
+    check(&overlap, Expected::NullParent);
+    let absent = program.replace("parent = &!fourth;", "fourth;");
+    assert_ne!(absent, program);
+    check(&absent, Expected::NullParent);
+    let above_cap = program
+        .replace("u8 fourth = 10;", "u8 fourth = 10; u8 fifth = 11;")
+        .replace("parent = &!fourth;", "if (outer) { parent = &!fourth; } else { parent = &!fifth; };");
+    assert_ne!(above_cap, program);
+    check(&above_cap, Expected::NullParent);
+}
+
+#[test]
 fn child_blocks_selected_owner_write_until_its_last_use() {
     check(&joined("parent = &!second;", true, "first = 3;", ""), Expected::LiveConflict);
 }
