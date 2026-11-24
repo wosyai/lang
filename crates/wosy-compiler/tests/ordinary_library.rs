@@ -1216,6 +1216,74 @@ fn structured_named_terminal_moves_descriptor_and_keeps_original_backing() {
 }
 
 #[test]
+fn structured_recursive_base_can_transfer_its_branch_local_allocation() {
+    let app = source("workbench", "src/structured_local_base.w");
+    let original = include_str!("fixtures/structured-named-factory.w");
+    let (_, rest) = original.split_once("Packet(u64) make_alt = fn(length) {").unwrap();
+    let (local, _) = rest.split_once("\n};").unwrap();
+    let before = original.split_once("Packet(u64) make_alt = fn(length) {").unwrap().0;
+    let after = rest.split_once("\n};").unwrap().1;
+    let text = format!("{before}{after}").replace("Packet selected = make_alt(length); selected", local);
+    assert!(!text.contains("make_alt"));
+    for (target, target_layout) in [("native64", ScalarTargetLayout::NATIVE64), ("wasm32", ScalarTargetLayout::WASM32)] {
+        for project in [false, true] {
+            let emit = |text: &str| {
+                let prepared = prepare_scalar_project(vec![(declarations(&app, text), vec![])],
+                    vec![app.clone()], ScalarPreparationInputs { target_layout }).unwrap();
+                let build = analyze_scalar_build(&prepared);
+                assert!(build.diagnostics().is_empty(), "{target}: {:?}", build.diagnostics());
+                if project { emit_scalar_build_project_llvm(&build) }
+                else { wosy_compiler::emit_scalar_build_single_module_llvm(&build) }.map(|module| module.to_text())
+            };
+            let ir = emit(&text).unwrap_or_else(|error| panic!("{target}/{project}: {error}"));
+            let context = Context::create();
+            let module = context.create_module_from_ir(MemoryBuffer::create_from_memory_range_copy(ir.as_bytes(), target)).unwrap();
+            module.verify().unwrap();
+            let symbol = |name: &str| if project { function_with_suffix(&module, name) } else { name.to_owned() };
+            let factory = module.get_function(&symbol("factory")).unwrap();
+            let mut base = None;
+            let mut released = Vec::new();
+            let mut merged = Vec::new();
+            let mut committed = 0;
+            for row in factory.get_basic_blocks().into_iter().flat_map(|block| block.get_instructions()) {
+                let arg = |slot| row.get_operand(slot).unwrap().value().unwrap();
+                if row.get_opcode() == InstructionOpcode::Phi {
+                    merged.extend((0..row.get_num_operands()).filter_map(|n| row.get_operand(n)?.value()));
+                }
+                if row.get_opcode() != InstructionOpcode::Call { continue; }
+                let call = CallSiteValue::try_from(row).unwrap();
+                let Some(callee) = call.get_called_fn_value() else { continue };
+                match callee.get_name().to_str().unwrap() {
+                    "__wosy_core_alloc" => assert!(base.replace(call.try_as_basic_value().basic().unwrap()).is_none()),
+                    "__wosy_core_free" => released.push(arg(0)),
+                    name if name.starts_with("llvm.memmove.") && arg(0) == factory.get_last_param().unwrap() => committed += 1,
+                    _ => {}
+                }
+            }
+            let base = base.expect("branch-local allocation");
+            assert!(merged.contains(&base));
+            assert_eq!(released.len(), 1, "{target}/{project}: {ir}");
+            assert!(!released.contains(&base));
+            assert_eq!(committed, 2, "{target}/{project}: both local and named recursive arms write the destination");
+            if let Some(out) = std::env::var_os("WOSY_NAMED_FACTORY_IR_DIR") {
+                let out = std::path::PathBuf::from(out).join(if project { "local-project" } else { "local-single" });
+                std::fs::create_dir_all(&out).unwrap();
+                let mut witness = ir.replace("@main(", "@wosy_authored_main(");
+                for name in ["case_zero", "case_two", "case_three"] {
+                    witness.push_str(&format!("\ndefine i64 @wosy_{name}() {{\nentry:\n  %v = call i64 @{}()\n  ret i64 %v\n}}\n", symbol(name)));
+                }
+                std::fs::write(out.join(format!("{target}.ll")), witness).unwrap();
+            }
+            let plain = text.replace(local, &local.replace("    packet",
+                "    Packet plain = { .data = null; .length = packet.length; };\n    plain"));
+            assert_ne!(plain, text);
+            assert!(emit(&plain).expect_err("plain descriptor cannot claim the branch allocation")
+                .contains("structured aggregate return is not closed on every result path"));
+        }
+    }
+}
+
+#[test]
 fn d0024_recursive_ownership_preserves_live_holders_and_carried_owner() {
     let app = source("workbench", "src/d0024_recursive_ownership.w");
     let text = include_str!("fixtures/d0024-recursive-ownership.w");

@@ -23,6 +23,7 @@ pub(super) struct AggregateFlowFacts {
     pub(super) scalar_cells: BTreeSet<CfgPointId>,
     pub(super) raw_addresses: BTreeMap<CfgPointId, (ReferenceBindingId, bool)>,
     pub(super) opaque_container_inputs: BTreeMap<CfgPointId, Vec<CfgPointId>>,
+    pub(super) structured_local_candidates: BTreeMap<CfgPointId, OccurrenceOrdinal>,
     pub(super) receipt_loan_read_calls: BTreeMap<CfgPointId, (CfgPointId, OccurrenceOrdinal)>,
     pub(super) receipt_loan_sinks: BTreeMap<CfgPointId, Vec<CfgPointId>>,
     pub(super) receipt_loan_address_sinks: BTreeMap<CfgPointId, ReferenceBindingId>,
@@ -1170,6 +1171,7 @@ struct MixedBranchReturn {
 pub(super) struct AggregateFlowResult {
     pub(super) conditional_input_regions: BTreeMap<CfgPointId, ConditionalInputRegion>,
     pub(super) conditional_input_barriers: BTreeSet<CfgPointId>,
+    structured_local_backings: BTreeMap<usize, Option<(CfgPointId, CfgPointId)>>,
     direct_receipt_bindings: BTreeMap<CfgPointId, (CfgPointId, ReferenceBindingId)>,
     immediate_receipt_reads: BTreeMap<CfgPointId, Option<(OccurrenceOrdinal, CfgPointId, CfgPointId)>>,
     literal_array_route: Option<LiteralArrayRoute>,
@@ -2454,6 +2456,17 @@ impl AggregateFlowFacts {
                 }
             }
         }
+        if let Some(&ordinal) = self.structured_local_candidates.get(&id) {
+            let backing = match value {
+                Some(Value::Aggregate { backing: OwnerSource::Allocation(allocation), field: Some(_) })
+                    if !state.moved.contains(&OwnerSource::Allocation(allocation)) =>
+                    Some((id, allocation)),
+                _ => None,
+            };
+            result.structured_local_backings.entry(ordinal.0).and_modify(|known| {
+                if *known != backing { *known = None; }
+            }).or_insert(backing);
+        }
         state.record_value(id, value, value_deadlines);
     }
 }
@@ -2577,6 +2590,7 @@ pub(crate) struct ClosedBody {
     pub(crate) checked_backing_optional: bool,
     pub(crate) returning: Option<ClosedReturn>,
     mixed_branch_return: Option<Box<MixedBranchReturn>>,
+    pub(crate) local_result_arms: BTreeMap<usize, (usize, usize)>, // block -> (allocation item, output)
     pub(crate) named_result_arms: BTreeMap<usize, (usize, usize)>, // block -> (output, producer)
     pub(crate) ordinary_result: bool,
     pub(crate) ordinary_calls: BTreeMap<usize, SourceSpan>,
@@ -2669,6 +2683,7 @@ impl InstalledAggregateFacts {
 }
 
 struct StructuredOwnerReturn {
+    local: BTreeMap<usize, (usize, OccurrenceOrdinal)>,
     named: BTreeMap<CfgPointId, (BlockOrdinal, OccurrenceOrdinal)>,
     output: OccurrenceOrdinal,
     leaves: BTreeSet<CfgPointId>,
@@ -2709,7 +2724,7 @@ impl Body<'_> {
         if !matches!(self.sites.conditionals.get(&output), Some(ConditionalRegion::Value { .. })) {
             return None;
         }
-        let mut result = StructuredOwnerReturn { named: BTreeMap::new(), output, leaves: BTreeSet::new(), complete: true };
+        let mut result = StructuredOwnerReturn { local: BTreeMap::new(), named: BTreeMap::new(), output, leaves: BTreeSet::new(), complete: true };
         let calls: BTreeMap<_, _> = facts.calls.iter().map(|(&point, &ordinal)| (ordinal.0, point)).collect();
         let mut pending = vec![(structure.root, output, 0)];
         while let Some((block, expression, depth)) = pending.pop() {
@@ -2727,11 +2742,33 @@ impl Body<'_> {
             } else if let Some(producer) = self.named_terminal_producer(block, expression, &calls, &ty.ty) {
                 if !result.leaves.insert(producer) { result.complete = false; }
                 result.named.insert(producer, (block, expression));
+            } else if let Some(item) = self.structured_local_allocation(block, expression, &ty.ty) {
+                if result.local.insert(block.0, (item, expression)).is_some() { result.complete = false; }
             } else {
                 result.complete = false;
             }
         }
         Some(result)
+    }
+
+    fn structured_local_allocation(&self, block: BlockOrdinal, terminal: OccurrenceOrdinal, ty: &ScalarType) -> Option<usize> {
+        let facts = self.facts?;
+        let (read, allocation) = facts.structured_local_backings.get(&terminal.0).copied().flatten()?;
+        let &(birth_block, item) = facts.allocation_slots.get(&allocation)?;
+        if birth_block != block.0 || read <= allocation { return None }
+        let PlainNameIdentity::Lexical(identity) = self.sites.prepared_plain_name(terminal)? else { return None };
+        let points = &self.cfg.points;
+        let read = points.get(read.0)?;
+        let moved = points.get(linear_successor(points, read.id)?.0)?;
+        let exit = points.get(linear_successor(points, moved.id)?.0)?;
+        let span = self.sites.occurrences.get(terminal.0)?.span;
+        (read.scope == points.get(allocation.0)?.scope && read.scope == moved.scope && moved.scope == exit.scope
+            && read.scope != points.first()?.scope && read.source_span.range == span && moved.source_span.range == span
+            && matches!(exit.kind, CfgPointKind::ScopeExit)
+            && matches!(&read.kind, CfgPointKind::Read { binding } if binding == identity)
+            && matches!(&moved.kind, CfgPointKind::Move { owner, place, ty: moved_ty }
+                if owner == identity && place.binding == *identity && place.projections.is_empty() && moved_ty == ty))
+            .then_some(item)
     }
 
     // Single-receiver, same-scope whole moves preserve the original receipt.
@@ -3984,6 +4021,9 @@ fn closed_aggregates<'a>(
                     callers.entry(target).or_default().push(key);
                 }
             }
+            if !shape.local.is_empty() && outgoing.insert(key) {
+                pending.push(key);
+            }
             structured_returns.insert(key, shape);
         }
         for source in body.return_owners().flatten() {
@@ -4728,6 +4768,10 @@ fn closed_aggregates<'a>(
         };
         let mut plan = result.bodies.remove(&key).unwrap_or_default();
         plan.returning = return_route;
+        if matches!(return_route, Some(ClosedReturn::Structured { .. })) {
+            plan.local_result_arms.extend(structured_returns[&key].local.iter()
+                .map(|(block, (item, output))| (*block, (*item, output.0))));
+        }
         if return_route == Some(ClosedReturn::MixedBranch) {
             plan.mixed_branch_return = facts.mixed_branch_return.clone();
         }

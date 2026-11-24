@@ -4435,6 +4435,15 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         } else {
                             &block.final_output_values[slot.output].ty
                         };
+                        // A nested block's stored output annotation can be Error
+                        // even when the occurrence has a resolved nominal type.
+                        if scope != ReferenceScopeId(0) && slot.output == 0
+                            && matches!(calls.structure.checked_types.expressions.get(&slot.expression),
+                                Some(ScalarType::Struct(_)))
+                            && matches!(expression, ScalarExpression::Name { .. })
+                        {
+                            self.aggregate_facts.structured_local_candidates.insert(value_point, slot.expression);
+                        }
                         result.output_points.push(value_point);
                         if matches!(value, ReferenceValue::Checked(_)) {
                             result.scalar = Some(value);

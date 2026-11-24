@@ -619,6 +619,8 @@ pub(super) fn record_allocation<'ctx>(
     let binding_position = || state.body_call_nodes.and_then(|nodes| nodes.binding_position(binding));
     let registered = match aggregate.plan.returning {
         Some(ClosedReturn::Allocation { block, item }) => binding_position() == Some((block, item)),
+        Some(ClosedReturn::Structured { .. }) => binding_position().is_some_and(|(block, item)|
+            aggregate.plan.local_result_arms.get(&block).is_some_and(|&(expected, _)| expected == item)),
         Some(ClosedReturn::MixedBranch) => binding_position().is_some_and(|(block, item)| {
             aggregate.plan.mixed_branch_arm(block).is_some_and(|(_, expected)| item == expected)
         }),
@@ -1405,6 +1407,26 @@ pub(super) fn commit_named_result_arm<'ctx>(
     context: &'ctx Context, state: &mut EmitState<'ctx, '_>, block: &ScalarBlock, result: EmitValue<'ctx>,
 ) -> Result<EmitValue<'ctx>, String> {
     let Some(aggregate) = state.aggregate.as_mut() else { return Ok(result) };
+    if !aggregate.plan.local_result_arms.is_empty() {
+        let nodes = state.body_call_nodes.ok_or("missing structured local result occurrences")?;
+        if let Some(&(_, output)) = nodes.block_ordinal(block)
+            .and_then(|ordinal| aggregate.plan.local_result_arms.get(&ordinal))
+        {
+            let Some((expression, _)) = block.final_expressions().next() else { return Err("missing local result terminal".into()) };
+            let ScalarExpression::Name { name, .. } = expression else { return Err("invalid local result terminal".into()) };
+            if nodes.expression_ordinal(expression) != Some(output) { return Err("changed local result terminal".into()) }
+            let (_, ty) = state.storage.get(name).ok_or("missing local result descriptor storage")?;
+            let ty = ty.clone();
+            let destination = aggregate.destination.ok_or("missing structured local result destination")?;
+            let allocation = aggregate.registered_allocation.take().ok_or("missing structured local allocation")?;
+            let base = aggregate.base.take().filter(|_| state.runtime_array_owners.get(&allocation) == Some(&true))
+                .ok_or("missing live structured result backing")?;
+            state.runtime_array_owners.insert(allocation, false);
+            aggregate.structured_arms_visited += 1;
+            store_value(context, state, destination, &ty, result)?;
+            return Ok(EmitValue::Basic(base.into()));
+        }
+    }
     if aggregate.plan.named_result_arms.is_empty() { return Ok(result) }
     let nodes = state.body_call_nodes.ok_or("missing structured result occurrences")?;
     let Some(&(output, producer)) = nodes.block_ordinal(block)
@@ -1504,7 +1526,7 @@ pub(super) fn commit_return<'ctx>(
         };
         if root != Some(output) || aggregate.committed
             || aggregate.structured_arms_visited != aggregate.plan.calls.values()
-                .filter(|&&action| action == ClosedCall::ResultArm).count() + aggregate.plan.named_result_arms.len()
+                .filter(|&&action| action == ClosedCall::ResultArm).count() + aggregate.plan.named_result_arms.len() + aggregate.plan.local_result_arms.len()
             || !matches!(outputs.outputs.as_slice(), [result] if matches!(result.ty, ScalarType::Struct(_)))
         {
             return Err("structured aggregate result changed its proved output tree".into());
