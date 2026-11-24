@@ -10536,6 +10536,50 @@ mod tests {
 
     #[cfg(feature = "internal-checker")]
     #[test]
+    fn ordinary_fixed_array_read_requires_one_reached_index_and_preserves_capture() {
+        let app = source("src/main.w", "ordinary-array-read");
+        let text = r#"%%start
+            unit(u64, i8) inspect = fn(index, value) {
+                core.narrow(value == 1 || value == 3, { .stdout = ""; .stderr = ""; .code = 1; .files = []; });
+                i8[2] original = [value, 9];
+                i8[2] copied = original;
+                value = 7;
+                if (index == 0) {
+                    i8 observed = copied[index];
+                    i8 fixed = copied[1];
+                    core.require(fixed == 9, { .stdout = ""; .stderr = "wrong literal index"; .code = 59; .files = []; });
+                    if (observed == 3) {
+                        core.require(value != 7, { .stdout = ""; .stderr = ""; .code = 61;
+                            .files = [{ .path = "observed.json"; .state = observed; }]; });
+                    } else {
+                        core.require(observed == 1, { .stdout = ""; .stderr = "lost correlation"; .code = 63; .files = []; });
+                    };
+                };
+            };
+        %%end"#;
+        let actual = text.replace("%%end", "inspect(0, 3); %%end");
+        let run = |input: &str, scope| {
+            let prepared = prepare_proof_target(&app, input).unwrap();
+            run_closed_without_named_proofs(&prepared, scope, 1)
+        };
+        for (input, scope) in [(text, ScalarCheckerScope::CurrentPackage),
+            (actual.as_str(), ScalarCheckerScope::MainFlowOnly), (actual.as_str(), ScalarCheckerScope::CurrentPackage)]
+        {
+            let receipt = run(input, scope).unwrap();
+            let [failure] = receipt.directives.as_slice() else { panic!("only the preserved indexed read selects its branch"); };
+            assert_eq!(failure.code(), &BigInt::from(61));
+            assert_eq!(failure.witness.axes().len(), 4);
+            assert!(failure.witness.axes().all(|(binding, _)| binding.kind == super::super::ReferenceBindingKind::Declared));
+            assert_eq!(failure.files()[0].text.as_ref(), b"{\"type\":{\"kind\":\"i8\"},\"value\":3}\n");
+        }
+        let variable = text.replace("index == 0", "index <= 1");
+        assert!(matches!(run(&variable, ScalarCheckerScope::CurrentPackage), Err(ProjectCheck::Unsupported)));
+        let beyond = actual.replace("index == 0", "index == 2").replace("inspect(0, 3)", "inspect(2, 3)");
+        assert!(matches!(run(&beyond, ScalarCheckerScope::MainFlowOnly), Err(ProjectCheck::Unsupported)));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
     fn ordinary_immutable_member_read_preserves_captured_control_and_public_axes() {
         let app = source("src/main.w", "ordinary-nominal-member-read");
         let text = r#"%%start

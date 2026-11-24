@@ -5347,9 +5347,25 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                                 // Read the old binding before installing the new one.
                                 path.append_ordinary_copy(axis, roots)?;
                             }
-                            super::reference::CheckerOrdinaryScalarLocalKind::SnapshotRead { shape, leaf } => {
+                            super::reference::CheckerOrdinaryScalarLocalKind::SnapshotRead { shape, index } => {
+                                use super::{checker_directive::CheckerSnapshotNode, reference::CheckerSnapshotReadIndex};
                                 if !roots.allow_extended_scalar_locals { return None; }
-                                let field = shape.leaves.get(*leaf)?;
+                                let leaf = match index {
+                                    CheckerSnapshotReadIndex::Leaf(leaf) => *leaf,
+                                    CheckerSnapshotReadIndex::ExactArrayIndex(index) => {
+                                        let PlainNameIdentity::Lexical(binding) = calls.prepared_plain_name(*index)?
+                                            else { return None; };
+                                        let (axis, ty) = roots.lookup(binding)?;
+                                        if *ty != ScalarType::U64 { return None; }
+                                        let index = path.singleton_axis_with(axis,
+                                            || charge_call_work(roots.ordinary_local_work.get_or_insert(0), 1))?.0;
+                                        let CheckerSnapshotNode::Array(elements) = &shape.root else { return None; };
+                                        let CheckerSnapshotNode::Leaf(leaf) = elements.get(usize::try_from(index).ok()?)?
+                                            else { return None; };
+                                        *leaf
+                                    }
+                                };
+                                let field = shape.leaves.get(leaf)?;
                                 let (axis, ty) = roots.lookup(&field.capture)?;
                                 if ty != &receiver.ty || field.ty != *ty { return None; }
                                 // A scalar read shares the exact captured

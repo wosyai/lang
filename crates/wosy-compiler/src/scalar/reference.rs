@@ -6151,11 +6151,18 @@ pub(super) struct CheckerOrdinaryScalarLocal {
 #[derive(Clone, Debug, PartialEq)]
 pub(super) enum CheckerOrdinaryScalarLocalKind {
     Copy,
-    SnapshotRead { shape: std::rc::Rc<super::checker_directive::CheckerSnapshotShape>, leaf: usize },
+    SnapshotRead { shape: std::rc::Rc<super::checker_directive::CheckerSnapshotShape>, index: CheckerSnapshotReadIndex },
     Conditional,
     BoolLiteral(bool),
     BoolCall(OccurrenceOrdinal),
     Arithmetic { operator: BinaryOperator, operands: [CheckerOrdinaryIntegerOperand; 2] },
+}
+
+#[cfg(feature = "internal-checker")]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) enum CheckerSnapshotReadIndex {
+    Leaf(usize),
+    ExactArrayIndex(OccurrenceOrdinal),
 }
 
 #[cfg(feature = "internal-checker")]
@@ -9074,6 +9081,7 @@ impl StructuralWalker<'_, '_> {
                     && self.structure.checked_types.expressions.get(&outputs.primary) == Some(&receiver.ty) =>
             {
                 let ScalarBindingOutput::Evaluate(expression) = binding.output_source(0) else { unreachable!() };
+                let resolver = callable.target_resolver;
                 self.ordinary_integer_local(outputs.primary, expression, &receiver.ty, names)
                     .or_else(|| {
                         let MemberFacts::Prepared(members) = &self.members else { return None; };
@@ -9081,9 +9089,10 @@ impl StructuralWalker<'_, '_> {
                             else { return None; };
                         let key = *self.structure.checker_snapshot_bindings.get(&(binding.declaration_span, binding.block_span))?;
                         let (shape, leaf) = self.structure.select_nominal_snapshot_leaf(key, field.index, &receiver.ty)?;
-                        Some(CheckerOrdinaryScalarLocalKind::SnapshotRead { shape, leaf })
+                        Some(CheckerOrdinaryScalarLocalKind::SnapshotRead { shape, index: CheckerSnapshotReadIndex::Leaf(leaf) })
                     })
-                    .map(|kind| (outputs.primary, callable.target_resolver, kind))
+                    .or_else(|| self.ordinary_array_read(outputs.primary, expression, &receiver.ty))
+                    .map(|kind| (outputs.primary, resolver, kind))
             }
             _ => None,
         };
@@ -9190,6 +9199,55 @@ impl StructuralWalker<'_, '_> {
             }
         }
         Ok(BindingRegion::new(initialization, binding))
+    }
+
+    #[cfg(feature = "internal-checker")]
+    fn ordinary_array_read(
+        &mut self, expression: OccurrenceOrdinal, ast: &ScalarExpression, ty: &ScalarType,
+    ) -> Option<CheckerOrdinaryScalarLocalKind> {
+        use super::checker_directive::{direct_array_index, CheckerSnapshotNode};
+        let (_, index) = direct_array_index(ast)?;
+        let OccurrenceNode::Place(place) = *self.structure.edges.get(&(
+            OccurrenceParent::Expression(expression), OccurrenceEdge::ExpressionPlace,
+        ))? else { return None; };
+        let OccurrenceNode::Place(base) = *self.structure.edges.get(&(
+            OccurrenceParent::Place(place), OccurrenceEdge::PlaceBase,
+        ))? else { return None; };
+        let ScalarType::Array { element, length: length @ 1..=64, .. } =
+            self.structure.checked_types.places.get(&base)? else { return None; };
+        if element.as_ref() != ty { return None; }
+        let length = usize::try_from(*length).ok()?;
+        let NamedPlaceRootFacts::Prepared(roots) = &self.named_place_roots else { return None; };
+        let NamedPlaceRootIdentity::Lexical(binding) = roots.get(&base)? else { return None; };
+        let key = *self.structure.checker_snapshot_bindings.get(&(binding.declaration_span, binding.block_span))?;
+        fn array(root: &CheckerSnapshotNode, length: usize) -> Option<&[CheckerSnapshotNode]> {
+            match root {
+                CheckerSnapshotNode::Array(elements) if elements.len() == length => Some(elements),
+                _ => None,
+            }
+        }
+        let (shape, index) = match index {
+            ScalarExpression::Integer { value, .. } => {
+                let index = usize::try_from(value).ok()?;
+                let (shape, leaf) = self.structure.select_snapshot_leaf(key, ty, |root| array(root, length)?.get(index))?;
+                (shape, CheckerSnapshotReadIndex::Leaf(leaf))
+            }
+            ScalarExpression::Name { .. } => {
+                let OccurrenceNode::Expression(index) = *self.structure.edges.get(&(
+                    OccurrenceParent::Place(place), OccurrenceEdge::PlaceIndex,
+                ))? else { return None; };
+                let PlainNameFacts::Prepared(names) = &self.plain_names else { return None; };
+                if !matches!(names.get(&index), Some(PlainNameIdentity::Lexical(_)))
+                    || self.structure.checked_types.expressions.get(&index) != Some(&ScalarType::U64)
+                {
+                    return None;
+                }
+                let (shape, ()) = self.structure.select_snapshot(key, |shape| array(&shape.root, length).map(|_| ()))?;
+                (shape, CheckerSnapshotReadIndex::ExactArrayIndex(index))
+            }
+            _ => return None,
+        };
+        Some(CheckerOrdinaryScalarLocalKind::SnapshotRead { shape, index })
     }
 
     #[cfg(feature = "internal-checker")]

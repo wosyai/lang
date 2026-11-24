@@ -357,12 +357,19 @@ impl<'a> ScalarInferenceBuilder<'a> {
     }
 
     #[cfg(feature = "internal-checker")]
-    pub(super) fn note_ordinary_snapshot_read(&mut self, expression: &ScalarExpression) {
-        if !self.occurrences.checker_enabled || self.suppress_checked_occurrences
-            || !matches!(expression, ScalarExpression::Member { .. })
-        {
+    pub(super) fn note_ordinary_snapshot_read(
+        &mut self, expression: &ScalarExpression, scope: &BTreeMap<String, ScalarType>,
+    ) {
+        if !self.occurrences.checker_enabled || self.suppress_checked_occurrences { return; }
+        if let Some((name, index)) = super::checker_directive::direct_array_index(expression) {
+            if matches!(index, ScalarExpression::Integer { .. } | ScalarExpression::Name { .. })
+                && matches!(scope.get(name), Some(ScalarType::Array { length: 1..=64, .. }))
+            {
+                self.occurrences.snapshot_array_demand = true;
+            }
             return;
         }
+        if !matches!(expression, ScalarExpression::Member { .. }) { return; }
         let Some(CheckedMember::DirectField(field)) =
             self.occurrences.members.get(&std::ptr::from_ref(expression)) else { return; };
         if !self.occurrences.snapshot_types.contains(&field.structure) {

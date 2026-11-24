@@ -1250,7 +1250,7 @@ pub(super) fn block_item_type_in_module(
                 && actual == binding.declared_type
                 && (actual == ScalarType::Bool || is_integer_type(&actual))
             {
-                inference.note_ordinary_snapshot_read(&binding.value);
+                inference.note_ordinary_snapshot_read(&binding.value, scope);
             }
             validate_output_receivers_in_module(
                 &binding.value,
@@ -3377,11 +3377,9 @@ fn check_expression_type_in_module(
                     };
                     return Some((selection, CheckerStateType::Scalar(ty.clone())));
                 }
-                if let ScalarExpression::IndexedRead { place, .. } = expression {
-                    let ScalarPlace::Index { base, index, .. } = place else { return None; };
-                    let ScalarPlace::Name { name, .. } = base.as_ref() else { return None; };
+                if let Some((name, index)) = super::checker_directive::direct_array_index(expression) {
                     let ScalarType::Array { element, length, .. } = scope.get(name)? else { return None; };
-                    let ScalarExpression::Integer { value, .. } = index.as_ref() else { return None; };
+                    let ScalarExpression::Integer { value, .. } = index else { return None; };
                     let index = usize::try_from(value).ok()?;
                     if index >= 64 || u64::try_from(index).ok()? >= *length || *length > 64
                         || (element.as_ref() != &ScalarType::Bool && !is_integer_type(element))
@@ -3389,7 +3387,7 @@ fn check_expression_type_in_module(
                         return None;
                     }
                     let selection = CheckerStateSelection::LexicalProjection {
-                        receiver: name.as_str().into(),
+                        receiver: name.into(),
                         component: CheckerAggregateProjection::FixedArray { length: *length, index },
                     };
                     return Some((selection, CheckerStateType::Scalar(element.as_ref().clone())));

@@ -1693,6 +1693,32 @@ cases.extend([
     ("authored-state-nominal-move-not-copy",nominal_move,2,b"unsupported analysis"),
     ("authored-state-nominal-copy-mutation-unsupported",nominal_mutated_copy,2,b"unsupported analysis"),
 ])
+ordinary_array_read = f"""%%start
+    unit(u64, i8) inspect = fn(index, value) {{
+        core.narrow(value == 1 || value == 3, {report(1,"PRUNE")});
+        i8[2] original = [value, 9];
+        i8[2] copied = original;
+        value = 7;
+        if (index == 0) {{
+            i8 observed = copied[index];
+            i8 fixed = copied[1];
+            core.require(fixed == 9, {report(59,"WRONG-LITERAL-INDEX")});
+            if (observed == 3) {{
+                core.require(value != 7, {state_report(61,"SELECTED-ELEMENT","observed")});
+            }} else {{
+                core.require(observed == 1, {report(63,"LOST-CORRELATION")});
+            }};
+        }};
+    }};
+    %%end"""
+ordinary_array_read_actual = ordinary_array_read.replace("%%end","inspect(0, 3); %%end")
+cases.extend([
+    ("ordinary-array-read-control",ordinary_array_read,61,b"SELECTED-ELEMENT"),
+    ("exact-startup-ordinary-array-read-control",ordinary_array_read_actual,61,b"SELECTED-ELEMENT"),
+    ("ordinary-array-read-rejects-nonsingleton",ordinary_array_read.replace("index == 0","index <= 1"),2,b"unsupported analysis"),
+    ("exact-startup-ordinary-array-read-rejects-out-of-bounds",ordinary_array_read_actual.replace(
+        "index == 0","index == 2").replace("inspect(0, 3)","inspect(2, 3)"),2,b"unsupported analysis"),
+])
 ordinary_nominal_read = f"""%%start
     struct copy Snapshot {{ i8 saved; bool enabled; }}
     unit(i8) inspect = fn(value) {{
@@ -1861,6 +1887,7 @@ copied_array_bytes = state_bytes(array_state({"kind":"i8"}, [copied_alternatives
 authored_files = {
     **{name: {"state.json": state_bytes(typed_state("i8", 3))} for name in (
         "ordinary-nominal-member-read-control", "exact-startup-ordinary-nominal-member-read-control",
+        "ordinary-array-read-control", "exact-startup-ordinary-array-read-control",
     )},
     "authored-state-array-projection-code-and-file": {"selected.json": state_bytes(copied_alternatives)},
     "authored-state-nominal-field-only": {

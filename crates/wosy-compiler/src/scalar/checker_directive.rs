@@ -194,6 +194,15 @@ pub(super) enum CheckerStateType {
     FixedArray,
 }
 
+#[cfg(feature = "internal-checker")]
+pub(super) fn direct_array_index(expression: &ScalarExpression) -> Option<(&str, &ScalarExpression)> {
+    use super::ScalarPlace;
+    let ScalarExpression::IndexedRead { place: ScalarPlace::Index { base, index, .. }, .. } = expression
+        else { return None; };
+    let ScalarPlace::Name { name, .. } = base.as_ref() else { return None; };
+    Some((name, index))
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct CheckerStateFile {
     pub(super) position: usize,
