@@ -7675,6 +7675,17 @@ fn joined_direct_lexical_place(place: &ReferencePlaceId) -> bool {
     matches!(written, ScalarPlace::Name { .. })
 }
 
+fn joined_allocated_element_parent(site: &ReferenceFlowPoint, owner: &ReferencePlaceId) -> bool {
+    // Unlike a lexical scalar, the storage has an independent cleanup
+    // obligation. Only a direct shared reborrow of a distinct selected
+    // allocation's already-typed constant element enters this lane.
+    matches!(&site.kind, CfgPointKind::ReborrowThrough {
+        mode: ScalarReferenceMutability::Shared, place: ScalarPlace::Dereference { .. }, ..
+    }) && matches!(&owner.projections[..], [ReferencePlaceProjection::Index(
+        ScalarExpression::Integer { value, .. }
+    )] if value >= &0.into())
+}
+
 fn checked_joined_reborrow_parent(
     site: &ReferenceFlowPoint,
     facts: &[ReferenceOrigin],
@@ -7689,7 +7700,8 @@ fn checked_joined_reborrow_parent(
     let owner = &loan.origin_place;
     if loan.mode != ScalarReferenceMutability::Mutable || loan.parent.is_some()
         || !joined_direct_lexical_place(owner)
-        || owner.binding == *binding || allocations.contains(&owner.binding)
+        || owner.binding == *binding
+        || (allocations.contains(&owner.binding) && !joined_allocated_element_parent(site, owner))
         || !contains_loan_site(&owner.binding, site)
         || !exact_live_reborrow_holder(state, binding, origin)
         || state.released.contains(&owner.binding) || state.invalidated.contains(&owner.binding)
@@ -7727,7 +7739,12 @@ fn checked_joined_reborrow_parents(
         }
         let ReferenceOrigin::Fresh { loan, .. } = &facts[id.0] else { return None };
         let owner = &loan.origin_place;
-        if owners.iter().any(|prior| reference_places_overlap(prior, owner)) {
+        let allocated = allocations.contains(&owner.binding);
+        if owners.iter().any(|prior| {
+            allocated != allocations.contains(&prior.binding)
+                || (allocated && prior.binding == owner.binding)
+                || reference_places_overlap(prior, owner)
+        }) {
             return None;
         }
         selected.push(id);

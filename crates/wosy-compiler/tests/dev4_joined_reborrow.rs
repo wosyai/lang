@@ -209,6 +209,31 @@ if (inspect(true) != 7 || inspect(false) != 9) { core.system_panic(); };
 }
 
 #[test]
+fn selected_allocation_loan_ends_before_lexical_cleanup_after_reader_call() {
+    let program = r#"%%start
+u8(*u8) read_selected = fn(view) { *view };
+u8(u64, bool) observe = fn(count, choose) {
+    u8[count] first;
+    u8[count] second;
+    first[0] = 7;
+    second[0] = 9;
+    *!u8 parent = null;
+    if (choose) { parent = &!first[0]; } else { parent = &!second[0]; };
+    *u8 child = &(*parent);
+    read_selected(child)
+};
+u8(bool) inspect = fn(choose) { observe(2, choose) };
+if (inspect(true) != 7 || inspect(false) != 9) { core.system_panic(); };
+%%end"#;
+    check_case(program, Expected::Valid, Some("WOSY_ALLOCATED_JOINED_READER_IR_DIR"));
+
+    let duplicate_allocation = program.replace("&!second[0]", "&!first[1]")
+        .replace("    u8[count] second;\n", "").replace("second[0] = 9;", "first[1] = 9;");
+    assert_ne!(duplicate_allocation, program);
+    check(&duplicate_allocation, Expected::NullParent);
+}
+
+#[test]
 fn checked_release_tracks_selected_allocation_and_its_loan_cohort() {
     let program = r#"%%start
 u8(u64, bool) read_other = fn(count, choose) {
