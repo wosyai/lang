@@ -2383,7 +2383,8 @@ fn derive_scalar_declarations(
         }
     }
     let contextual_places = if contextual {
-        contextual::prepare(canonical, diagnostic_roots, &mut diagnostics, dormant_context && (!has_named_proofs || contextual_proof_runtime))
+        contextual::prepare(canonical, diagnostic_roots, &mut diagnostics,
+            dormant_context && (!has_named_proofs || contextual_proof_runtime), contextual_proof_runtime)
     } else {
         contextual::ContextualPlaces::default()
     };
@@ -2603,13 +2604,24 @@ fn typecheck_scalar_project_in_mode(
     project: ScalarProject,
     #[cfg(any(test, feature = "internal-checker"))] checker_directives: bool,
 ) -> (ScalarProjectValidation, Vec<PreparationOccurrenceTyping>) {
+    typecheck_scalar_project_with_formals(project, HashMap::new(),
+        #[cfg(any(test, feature = "internal-checker"))]
+        checker_directives,
+    )
+}
+
+fn typecheck_scalar_project_with_formals(
+    project: ScalarProject, contextual_formals: HashMap<ReferenceBindingId, ScalarType>,
+    #[cfg(any(test, feature = "internal-checker"))] checker_directives: bool,
+) -> (ScalarProjectValidation, Vec<PreparationOccurrenceTyping>) {
     let mut project = project;
     let mut diagnostics = Vec::new();
     for module in &mut project.modules {
         module.resolved_assignment_outputs = ScalarAssignmentTyping::default();
         module.layouts = ScalarTargetLayouts::new(module.target_layout);
     }
-    let declarations = declarations::resolve_project_types(&mut project.modules);
+    let mut declarations = declarations::resolve_project_types(&mut project.modules);
+    declarations.set_contextual_formal_types(contextual_formals);
     resolve_project_struct_layouts(&mut project, &mut diagnostics);
     let (struct_policies, enum_policies) = compute_copy_policies(
         &project
@@ -3114,8 +3126,22 @@ fn project_from_declarations(
     initialization_order: Vec<SourceIdentity>,
     inputs: ScalarPreparationInputs,
 ) -> Result<ScalarProject, ScalarProjectPreparationRejection> {
+    project_from_declarations_with_context_types(declarations, initialization_order, inputs, false)
+        .map(|(project, _)| project)
+}
+
+fn project_from_declarations_with_context_types(
+    declarations: Vec<(ScalarSourceDeclarations, Vec<ScalarNamespaceBinding>)>,
+    initialization_order: Vec<SourceIdentity>, inputs: ScalarPreparationInputs, allow_pending: bool,
+) -> Result<(ScalarProject, HashMap<ReferenceBindingId, ScalarType>), ScalarProjectPreparationRejection> {
     let mut modules = Vec::with_capacity(declarations.len());
     let mut diagnostics = Vec::new();
+    let mut pending_formals = Vec::new();
+    // The global entry preserves invariant type and its first diagnostic
+    // label. Pending formals separately need a provider in their own
+    // project/package, independent of which declaration was global first.
+    let mut package_providers = (allow_pending && declarations.iter().any(|(source, _)| source.contextual_places.has_pending_formals))
+        .then(HashMap::<String, HashMap<String, HashSet<String>>>::new);
     let mut contextual_types = HashMap::<String, (ScalarType, SourceSpan, bool)>::new();
     let mut inherited = Vec::new();
     for (declarations, namespace_bindings) in declarations {
@@ -3129,6 +3155,10 @@ fn project_from_declarations(
         } = declarations;
         for index in contextual_places.first_declarations {
             let storage = &contextual_places.declarations[index];
+            if let Some(providers) = &mut package_providers {
+                providers.entry(source.project.clone()).or_default()
+                    .entry(source.package.clone()).or_default().insert(storage.name.clone());
+            }
             match contextual_types.get_mut(&storage.name) {
                 Some((ty, first_span, conflicted)) if *ty != storage.ty => {
                     *conflicted = true;
@@ -3158,9 +3188,15 @@ fn project_from_declarations(
             }
         }
         let offset = diagnostics.len();
-        inherited.extend(contextual_places.inherited.into_iter().map(|occurrence| {
-            (offset + occurrence.diagnostic, occurrence.span, occurrence.name)
-        }));
+        if contextual_places.has_pending_formals {
+            pending_formals.extend(contextual_places.inherited.into_iter().map(|occurrence| {
+                (contextual::contextual_formal(&source, occurrence.function), occurrence.span, occurrence.name)
+            }));
+        } else {
+            inherited.extend(contextual_places.inherited.into_iter().map(|occurrence| {
+                (offset + occurrence.diagnostic, occurrence.span, occurrence.name)
+            }));
+        }
         let mut module = ScalarModule::new(source, items, namespace_bindings);
         module.structs = structs;
         module.enums = enums;
@@ -3183,6 +3219,24 @@ fn project_from_declarations(
             message: "project contextual type declared here; call binding is not resolved".to_owned(),
         });
     }
+    let mut resolved = HashMap::new();
+    for (formal, span, name) in pending_formals {
+        let ty = if allow_pending {
+            contextual_types.get(&name).and_then(|(ty, _, conflict)| {
+                let local = package_providers.as_ref()
+                    .and_then(|projects| projects.get(&formal.source.project))
+                    .and_then(|packages| packages.get(&formal.source.package))
+                    .is_some_and(|names| names.contains(&name));
+                (!*conflict && is_integer_type(ty) && local).then_some(ty)
+            })
+        } else { None };
+        if let Some(ty) = ty {
+            resolved.insert(formal, ty.clone());
+        } else {
+            diagnostics.push(contextual::reported_error(SourceSpan::new(formal.source, span),
+                "no unambiguous checked project type for inherited contextual binding"));
+        }
+    }
     let project = ScalarProject::new(modules, initialization_order);
     if !diagnostics.is_empty() {
         return Err(ScalarProjectPreparationRejection::extraction_or_typing(
@@ -3192,7 +3246,7 @@ fn project_from_declarations(
             },
         ));
     }
-    Ok(project)
+    Ok((project, resolved))
 }
 
 pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidation {

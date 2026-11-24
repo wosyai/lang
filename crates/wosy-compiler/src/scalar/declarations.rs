@@ -3,6 +3,7 @@ use super::*;
 pub(super) struct ScalarDeclarationEnvironment {
     modules: Vec<ScalarModuleDeclarations>,
     sources: HashMap<SourceIdentity, usize>,
+    contextual_formal_types: HashMap<ReferenceBindingId, ScalarType>,
 }
 
 struct ScalarModuleDeclarations {
@@ -37,7 +38,15 @@ impl ScalarDeclarationEnvironment {
                 header
             })
             .collect();
-        Self { modules, sources }
+        Self { modules, sources, contextual_formal_types: HashMap::new() }
+    }
+
+    pub(super) fn set_contextual_formal_types(&mut self, types: HashMap<ReferenceBindingId, ScalarType>) {
+        self.contextual_formal_types = types;
+    }
+
+    pub(super) fn contextual_formal_type(&self, binding: &ReferenceBindingId) -> Option<&ScalarType> {
+        self.contextual_formal_types.get(binding)
     }
 
     pub(super) fn local_types(&self, module: usize) -> &BTreeMap<String, ScalarType> {

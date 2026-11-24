@@ -21,6 +21,7 @@ pub(super) struct ContextualPlaces {
     pub(super) inherited: Vec<InheritedContextualOccurrence>,
     pub(super) conflicted_types: HashSet<String>,
     dormant_operands: HashMap<ByteSpan, (usize, ReferenceBindingId)>,
+    pub(super) has_pending_formals: bool,
 }
 
 impl ContextualPlaces {
@@ -31,7 +32,12 @@ impl ContextualPlaces {
         let (occurrence, binding) = self.dormant_operands.get(&span)?;
         let occurrence = self.inherited.get(*occurrence)?;
         (occurrence.role == role).then_some(())?;
-        Some((binding, &self.declarations.get(occurrence.local_type_declaration?)?.ty))
+        let ty = match occurrence.local_type_declaration {
+            Some(index) => &self.declarations.get(index)?.ty,
+            None if self.has_pending_formals => &ScalarType::Error,
+            None => return None,
+        };
+        Some((binding, ty))
     }
 
     pub(super) fn storage(&self, span: ByteSpan, role: ContextualRole) -> Option<&ContextualStorage> {
@@ -88,7 +94,8 @@ pub(super) fn contextual_formal(source: &SourceIdentity, function: ByteSpan) -> 
 }
 
 pub(super) fn prepare(
-    canonical: &CanonicalCstRoot, roots: &[CstNode], diagnostics: &mut Vec<Diagnostic>, dormant: bool,
+    canonical: &CanonicalCstRoot, roots: &[CstNode], diagnostics: &mut Vec<Diagnostic>,
+    dormant: bool, allow_project_type: bool,
 ) -> ContextualPlaces {
     let mut result = ContextualPlaces::default();
     let mut scopes = Vec::<(ByteSpan, HashMap<String, usize>)>::new();
@@ -236,16 +243,18 @@ pub(super) fn prepare(
         occurrence.local_type_declaration = declared_types.get(&occurrence.name).copied()
             .filter(|_| !result.conflicted_types.contains(&occurrence.name));
     }
-    if dormant && !result.inherited.is_empty() && result.conflicted_types.is_empty()
-        && result.first_declarations.len() == 1
-        && result.inherited.iter().all(|occurrence| {
-            occurrence.local_type_declaration == result.first_declarations.first().copied()
-        })
-    {
-        let first = result.first_declarations[0];
-        if typecheck::is_integer_type(&result.declarations[first].ty) {
-            // Formal identity is shared by the same function's reads and
-            // writes, but never uses another function's declaration as storage.
+    if dormant && !result.inherited.is_empty() && result.conflicted_types.is_empty() {
+        let local_integer = match result.first_declarations.as_slice() {
+            [first] if typecheck::is_integer_type(&result.declarations[*first].ty)
+                && result.inherited.iter().all(|occurrence| occurrence.local_type_declaration == Some(*first)) => true,
+            _ => false,
+        };
+        let pending_project_type = allow_project_type && result.first_declarations.is_empty()
+            && result.inherited.first().is_some_and(|first| result.inherited.iter().all(|use_| use_.name == first.name));
+        if local_integer || pending_project_type {
+            result.has_pending_formals = pending_project_type;
+            // Keep identity separate from its not-yet-resolved project
+            // type; no caller storage is made available during extraction.
             let mut suppressed = result.inherited.iter().map(|occurrence| occurrence.diagnostic).peekable();
             let mut ordinal = 0;
             diagnostics.retain(|_| {
@@ -371,10 +380,8 @@ pub(super) fn prepare_contextual_transport_from_source(
             .push((storage.active_after, storage.scope, storage.declaration.range));
     }
     let uses = std::mem::take(&mut places.inherited);
-    let project = project_from_declarations(vec![(source, Vec::new())], vec![canonical_source.clone()], inputs)
-        .map_err(|_| Unsupported)?;
-    let (project, mut calls) = super::static_calls::prepare_project_occurrences(
-        typecheck_scalar_project_in_mode(project, checker_directives), &[],
+    let (project, mut calls) = prepare_project_contextual_types(
+        vec![(source, Vec::new())], vec![canonical_source.clone()], inputs, checker_directives,
     ).map_err(|_| Unsupported)?;
     let [module] = project.modules.as_slice() else { return Err(Unsupported); };
     let mut by_body = HashMap::new();
@@ -515,6 +522,20 @@ pub(super) fn prepare_contextual_transport_from_source(
         verified.push(DormantContextEdge { occurrence: edge.occurrence, target: edge.target, supplied });
     }
     Ok((PreparedScalarProject::from_contextual_transport(project, calls), DormantContextReceipt { ty, name, edges: verified }))
+}
+
+/// Project-owned typed/canonical facts for pending contextual formals.
+/// Deliberately returns no prepared build or checker execution capability;
+/// cross-module transport must authenticate actual suppliers first.
+#[cfg(any(test, feature = "internal-checker"))]
+pub(super) fn prepare_project_contextual_types(
+    declarations: Vec<(ScalarSourceDeclarations, Vec<ScalarNamespaceBinding>)>,
+    initialization_order: Vec<SourceIdentity>, inputs: ScalarPreparationInputs, checker_directives: bool,
+) -> Result<(ScalarProject, super::reference::ProjectCallSiteResults), ScalarProjectPreparationRejection> {
+    let (project, types) = project_from_declarations_with_context_types(declarations, initialization_order, inputs, true)?;
+    super::static_calls::prepare_project_occurrences(
+        typecheck_scalar_project_with_formals(project, types, checker_directives), &[],
+    )
 }
 
 /// Admit just `current == core.old(current) +/- literal` from the

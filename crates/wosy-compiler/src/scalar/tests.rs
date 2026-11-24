@@ -296,6 +296,110 @@ fn dormant_contextual_call_receipt_authenticates_transitive_requirements_and_sha
     assert_eq!(contextual::prepare_dormant_context(parsed.canonical_cst(), inputs()).unwrap_err(), DormantContextRejection::Unsupported);
 }
 
+#[cfg(feature = "internal-checker")]
+#[test]
+fn project_contextual_formal_type_materializes_before_namespace_call_preparation() {
+    let app = module_source("src/main.w");
+    let leaf = module_source("src/leaf.w");
+    let other = module_source("src/other.w");
+    let app_text = r#"%%start
+        remote = namespace package "src/leaf.w";
+        unit() entry = fn {
+            u8 core.context.credit = 3;
+            remote.consume();
+        };
+        entry();
+    %%end"#;
+    let leaf_text = r#"%%start
+        unit() consume = fn { core.context.credit = core.context.credit - 1; };
+        proof debit for consume() -> (null)
+            ensures (core.context.credit == core.old(core.context.credit) - 1) {}
+    %%end"#;
+    let source = |identity: &SourceIdentity, text: &str, pending: bool| {
+        let parsed = parse_source(identity.clone(), text.to_owned(), &[]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        derive_scalar_declarations(parsed.result.canonical_cst(), pending, pending, None)
+    };
+    let bindings = || vec![ScalarNamespaceBinding {
+        binding: "remote".to_owned(), target: leaf.clone(), span: ByteSpan::new(0, 0),
+    }];
+    let inputs = || ScalarPreparationInputs { target_layout: ScalarTargetLayout::NATIVE64 };
+    let consumer = source(&leaf, leaf_text, true);
+    assert!(consumer.diagnostics.is_empty() && consumer.contextual_places.has_pending_formals);
+    assert!(consumer.contextual_places.declarations.is_empty());
+    assert!(prepare_scalar_project(
+        vec![(source(&app, app_text, false), bindings()), (source(&leaf, leaf_text, true), Vec::new())],
+        vec![app.clone(), leaf.clone()], inputs(),
+    ).is_err(), "ordinary build cannot own unresolved formal operands");
+    let (project, calls) = contextual::prepare_project_contextual_types(
+        vec![(consumer, Vec::new()), (source(&app, app_text, false), bindings())],
+        vec![app.clone(), leaf.clone()], inputs(), true,
+    ).expect("one checked type, from the actual project declaration");
+    let [ScalarItem::Function(function)] = project.modules[0].items.as_slice() else { panic!("one leaf"); };
+    let [ScalarBlockItem::Assignment(assignment)] = function.body.items.as_slice() else { panic!("one typed write"); };
+    let ScalarPlace::Contextual { binding: destination, ty: destination_ty, .. } = &assignment.targets[0].place
+        else { panic!("checked contextual destination"); };
+    let ScalarExpression::Binary { left, .. } = &assignment.values[0] else { panic!("checked subtraction"); };
+    let ScalarExpression::Contextual { binding: prior, ty: old_ty, .. } = left.as_ref()
+        else { panic!("checked contextual read"); };
+    assert_eq!((destination_ty, old_ty), (&ScalarType::U8, &ScalarType::U8));
+    assert_eq!(prior, destination);
+    assert_eq!(prior.source, leaf);
+    assert_eq!(prior.kind, ReferenceBindingKind::ContextualFormal);
+    let caller_item = project.modules[1].items.iter().position(|item| matches!(item,
+        ScalarItem::Function(function) if function.name == "entry")).unwrap();
+    let caller = calls.function_body(1, caller_item, None).unwrap();
+    let [call] = caller.call_occurrences.as_slice() else { panic!("one namespace call"); };
+    assert!(matches!(&caller.resolved_call_site(call.ordinal).unwrap().target,
+        ResolvedCallTarget::ModuleCallable { source, declaration_span, concrete: ConcreteCallSelection::Declaration }
+        if source == &leaf && *declaration_span == function.name_span));
+    assert!(calls.function_body(0, 0, None).unwrap().contextual_formal().is_none(),
+        "typed occurrence authority does not install call transport");
+
+    let foreign = SourceIdentity::new(app.project.clone(), "foreign".into(), "src/foreign.w".into(), "r1".into());
+    let foreign_text = "%%start unit() provider = fn { u8 core.context.credit = 1; }; %%end";
+    for foreign_first in [false, true] {
+        let provider = (source(&foreign, foreign_text, false), Vec::new());
+        let mut declarations = vec![(source(&leaf, leaf_text, true), Vec::new()),
+            (source(&app, app_text, false), bindings())];
+        if foreign_first { declarations.insert(0, provider); }
+        else { declarations.push(provider); }
+        let result = contextual::prepare_project_contextual_types(
+            declarations, vec![app.clone(), leaf.clone(), foreign.clone()], inputs(), true,
+        );
+        let (project, _) = result.unwrap_or_else(|error| panic!("same-type foreign declarations cannot hide a local provider (foreign first: {foreign_first}): {error:?}"));
+        let provider = project.modules.iter().find(|module| module.source == leaf).unwrap();
+        let [ScalarItem::Function(function)] = provider.items.as_slice() else { panic!("one leaf"); };
+        let [ScalarBlockItem::Assignment(assignment)] = function.body.items.as_slice() else { panic!("one typed write"); };
+        assert!(matches!(&assignment.targets[0].place, ScalarPlace::Contextual { binding, ty: ScalarType::U8, .. }
+            if binding.source == leaf && binding.kind == ReferenceBindingKind::ContextualFormal));
+    }
+    let foreign_only = contextual::prepare_project_contextual_types(
+        vec![(source(&foreign, foreign_text, false), Vec::new()),
+            (source(&leaf, leaf_text, true), Vec::new())],
+        vec![leaf.clone(), foreign.clone()], inputs(), true,
+    );
+    let Err(error) = foreign_only else { panic!("foreign type cannot substitute for a same-package provider"); };
+    assert!(error.diagnostics.iter().any(|item| item.message.contains("no unambiguous checked project type")));
+
+    let (_, catalog) = crate::parse_proof_source(leaf.clone(), leaf_text.to_owned(), &[]).ok().unwrap();
+    assert!(matches!(crate::check_loaded_scalar_ordered_local_proof_contexts(
+        vec![(source(&app, app_text, false), bindings())], [(catalog, Vec::new())], vec![app.clone(), leaf.clone()],
+        inputs(), ScalarCheckerScope::MainFlowOnly, Vec::new(),
+    ), Err(ScalarOrderedCheckerOutcome::Unsupported)));
+
+    for declarations in [
+        vec![(source(&app, &app_text.replace("u8 core.context.credit = 3;", ""), false), bindings()),
+            (source(&leaf, leaf_text, true), Vec::new())],
+        vec![(source(&app, app_text, false), bindings()), (source(&leaf, leaf_text, true), Vec::new()),
+            (source(&other, "%%start unit() shadow = fn { i8 core.context.credit = 1; }; %%end", false), Vec::new())],
+    ] {
+        let result = contextual::prepare_project_contextual_types(declarations, vec![app.clone(), leaf.clone()], inputs(), true);
+        let Err(error) = result else { panic!("missing or conflicting project type must refuse"); };
+        assert!(error.diagnostics.iter().any(|item| item.message.contains("no unambiguous checked project type")));
+    }
+}
+
 #[test]
 fn qualified_old_does_not_become_contextual_storage() {
     let text = "%%start\ni8(i8) identity = fn(value) { value };\nproof entry for identity(input) -> (out) ensures (out == core.old(input)) {}\n%%end";

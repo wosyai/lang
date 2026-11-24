@@ -1400,7 +1400,11 @@ fn resolve_expression_module_places(
     owners: &ScalarAssignmentOwners,
 ) {
     match expression {
-        ScalarExpression::Contextual { .. } => {},
+        ScalarExpression::Contextual { binding, ty, .. } => {
+            if *ty == ScalarType::Error && matches!(binding.kind, ReferenceBindingKind::ContextualFormal) {
+                if let Some(checked) = declarations.contextual_formal_type(binding) { *ty = checked.clone(); }
+            }
+        }
         ScalarExpression::RawAddress { place, .. }
         | ScalarExpression::CheckedAddress { place, .. }
         | ScalarExpression::Dereference { place, .. } => resolve_module_place(
@@ -1686,7 +1690,11 @@ fn resolve_module_place(
     owners: &ScalarAssignmentOwners,
 ) {
     match place {
-        ScalarPlace::Contextual { .. } => {},
+        ScalarPlace::Contextual { binding, ty, .. } => {
+            if *ty == ScalarType::Error && matches!(binding.kind, ReferenceBindingKind::ContextualFormal) {
+                if let Some(checked) = declarations.contextual_formal_type(binding) { *ty = checked.clone(); }
+            }
+        }
         ScalarPlace::Name { .. } => {}
         ScalarPlace::Dereference { pointer, .. } => resolve_expression_module_places(
             pointer,
