@@ -22,6 +22,7 @@ Packet(u64) outer_owner = fn(length) {
     Packet incoming = inner_owner(length);
     Packet outgoing = second_identity(incoming);
     Packet moved = outgoing;
+    moved.length;
     Packet returned = moved;
     returned
 };

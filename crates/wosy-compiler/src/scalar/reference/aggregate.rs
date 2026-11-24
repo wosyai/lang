@@ -2723,8 +2723,9 @@ impl Body<'_> {
         Some(result)
     }
 
-    // Only a contiguous, single-receiver chain of same-scope whole moves
-    // may carry an owning call's original receipt to a named terminal.
+    // Single-receiver, same-scope whole moves preserve the original receipt.
+    // A linear observation corridor may read ordinary scalar fields of the
+    // current holder without transferring, borrowing, or altering its receipt.
     fn named_terminal_producer(
         &self, block: BlockOrdinal, terminal: OccurrenceOrdinal, calls: &BTreeMap<usize, CfgPointId>,
         ty: &ScalarType,
@@ -2734,8 +2735,19 @@ impl Body<'_> {
         if output.expression != terminal { return None }
         let mut use_ordinal = terminal;
         let mut links = Vec::new();
+        let mut observations = Vec::new();
         let (producer, installed) = 'producer: {
             for item in statements.iter().rev() {
+                if let BlockItemKind::Evaluation { expression } = &item.kind {
+                    let (holder, field) = self.sites.prepared_lexical_member(*expression)?;
+                    if !self.sites.structure.checked_types.expressions.get(expression).is_some_and(ordinary_value)
+                        || !matches!(ty, ScalarType::Struct(descriptor) if *descriptor == field.structure)
+                    {
+                        return None;
+                    }
+                    observations.push((holder, field, self.sites.occurrences.get(expression.0)?.span));
+                    continue;
+                }
                 let BlockItemKind::Binding(bind) = &item.kind else { return None };
                 let BindingInitialization::Outputs(init) = &bind.initialization else { return None };
                 let [receiver] = bind.receivers() else { return None };
@@ -2743,7 +2755,8 @@ impl Body<'_> {
                 if &receiver.ty != ty || !init.secondary.is_empty() || receiver.span != identity.declaration_span {
                     return None;
                 }
-                links.push((identity, self.sites.occurrences.get(use_ordinal.0)?.span));
+                links.push((identity, self.sites.occurrences.get(use_ordinal.0)?.span,
+                    std::mem::take(&mut observations)));
                 if let Some(&producer) = calls.get(&init.primary.0) {
                     let (bound, original) = self.facts?.direct_receipt_bindings.get(&producer)?;
                     if original != identity { return None }
@@ -2761,8 +2774,25 @@ impl Body<'_> {
         };
         let mut bind = points.get(installed.0)?;
         let mut links = links.into_iter().rev().peekable();
-        while let Some((identity, span)) = links.next() {
-            let read = next(bind)?;
+        while let Some((identity, span, observations)) = links.next() {
+            let mut cursor = bind;
+            for (holder, field, observation_span) in observations.into_iter().rev() {
+                let observed = next(cursor)?;
+                let CfgPointKind::ReadPlace {
+                    place: ScalarPlace::Field { base, field: ScalarFieldReference::Resolved(written), .. },
+                    pointer_point: None, candidates, reads_origin: false,
+                } = &observed.kind else { return None };
+                let [candidate] = candidates.as_slice() else { return None };
+                if holder != identity || written != field || observed.source_span.range != observation_span
+                    || !matches!(base.as_ref(), ScalarPlace::Name { .. }) || candidate.binding != *identity
+                    || !matches!(candidate.projections.as_slice(),
+                        [ReferencePlaceProjection::Field(ScalarFieldReference::Resolved(field_id))] if field_id == field)
+                {
+                    return None;
+                }
+                cursor = observed;
+            }
+            let read = next(cursor)?;
             let moved = next(read)?;
             if bind.scope != scope || !matches!(&bind.kind, CfgPointKind::Bind { binding } if binding == identity)
                 || read.source_span.range != span || moved.source_span.range != span

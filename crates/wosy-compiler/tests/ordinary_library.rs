@@ -1022,7 +1022,7 @@ fn recommitted_wrapper_return_preserves_one_base_across_two_owning_returns() {
             std::fs::write(std::path::PathBuf::from(out).join(format!("{target}.ll")), witness).unwrap();
         }
 
-        let interrupted = text.replace("    Packet returned = moved;", "    moved.length;\n    Packet returned = moved;");
+        let interrupted = text.replace("    moved.length;", "    length;");
         let error = emit(&interrupted).expect_err("an interrupted chain lacks a root handoff certificate");
         assert!(error.contains("recommitted aggregate return has no exact root binding"), "{target}: {error}");
     }
@@ -1111,7 +1111,7 @@ fn structured_named_terminal_moves_descriptor_and_keeps_original_backing() {
     let text = include_str!("fixtures/structured-named-factory.w");
     let mutual = text.replace("Packet incoming = factory(depth - 1, length, !choose);",
         "Packet incoming = peer(depth - 1, length, !choose);")
-        .replace("u64(u64, bool) drive", "Packet(u64, u64, bool) peer = fn(depth, length, choose) {\n    Packet incoming = factory(depth, length, choose);\n    Packet intermediate = incoming;\n    Packet selected = intermediate;\n    selected\n};\nu64(u64, bool) drive");
+        .replace("u64(u64, bool) drive", "Packet(u64, u64, bool) peer = fn(depth, length, choose) {\n    Packet incoming = factory(depth, length, choose);\n    incoming.length;\n    Packet intermediate = incoming;\n    intermediate.length;\n    Packet selected = intermediate;\n    selected\n};\nu64(u64, bool) drive");
     for (text, mutual) in [(text, false), (mutual.as_str(), true)] {
         for (target, target_layout) in [("native64", ScalarTargetLayout::NATIVE64), ("wasm32", ScalarTargetLayout::WASM32)] {
             for project in [false, true] {
@@ -1197,14 +1197,14 @@ fn structured_named_terminal_moves_descriptor_and_keeps_original_backing() {
                     std::fs::write(out.join(format!("{target}.ll")), witness).unwrap();
                 }
                 if mutual {
-                    let indirect_root = text.replace("Packet intermediate = incoming;\n    Packet selected = intermediate;",
-                        "Packet intermediate = incoming;\n    intermediate.length;\n    Packet selected = intermediate;");
+                    let indirect_root = text.replace("Packet intermediate = incoming;\n    intermediate.length;",
+                        "Packet intermediate = incoming;\n    length;");
                     assert!(emit(&indirect_root).expect_err("alias is not the exact root binding")
                         .contains("aggregate forwarding has no exact root binding"));
                 }
-                let indirect = text.replace("Packet selected = make_alt(length); selected",
-                    "Packet original = make_alt(length); original.length; Packet selected = original; selected");
-                assert!(emit(&indirect).expect_err("alias is not the direct produced descriptor")
+                let unrelated = text.replace("        intermediate.length;", "        frame.length;");
+                assert_ne!(unrelated, text);
+                assert!(emit(&unrelated).expect_err("another live descriptor cannot certify this observation corridor")
                     .contains("structured aggregate return is not closed on every result path"));
             }
         }

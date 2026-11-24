@@ -24,7 +24,9 @@ Packet(u64, u64, bool) factory = fn(depth, length, choose) {
         Packet frame = make_packet(extent);
         frame.length;
         Packet incoming = factory(depth - 1, length, !choose);
+        incoming.length;
         Packet intermediate = incoming;
+        intermediate.length;
         Packet selected = intermediate;
         selected
     }
