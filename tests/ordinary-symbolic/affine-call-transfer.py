@@ -875,6 +875,32 @@ def state_report(code, label, selected, extra=""):
     return ('{ .stdout = ""; .stderr = "'+label+'"; .code = '+str(code)
             +'; .files = [{ .path = "state.json"; .state = '+selected+'; }'+extra+']; }')
 
+namespace_scalar_key = "exact-startup-completed-namespace-scalar-return"
+namespace_scalar_main = f"""%%start
+    core.require(false, {report(210,"ROOT")});
+    lib = namespace app "src/calc.w";
+    alias = namespace app "src/calc.w";
+    i8 saved = lib.choose(7);
+    core.require(saved != 42, {report(213,"RETURN")});
+    unit() startup = fn {{
+        i8 unavailable = alias.retain(1);
+        core.require(unavailable > 127, {report(215,"DEAD-CALLER")});
+    }};
+    startup();
+    core.require(false, {report(216,"DEAD-STARTUP")});
+    %%end"""
+namespace_scalar_child = f"""%%start
+    core.require(false, {report(211,"INIT")});
+    i8(i8) choose = fn(entry) {{
+        core.require(entry != 7, {state_report(212,"CALLEE","entry").replace("state.json","call.json")});
+        if (entry == 7) {{ 42 }} else {{ 9 }}
+    }};
+    i8(i8) retain = fn(entry) {{
+        core.narrow(entry >= 2, {state_report(214,"EMPTY","entry")});
+        entry
+    }};
+    %%end"""
+cases.append((namespace_scalar_key,namespace_scalar_main,210,b"ROOTINITCALLEERETURNEMPTY"))
 projected_conditional_write = f"""%%start
     i8(i8) transfer = fn(entry) {{
         i8 changed = entry;
@@ -1254,6 +1280,10 @@ cases.extend([
 ])
 holes_bytes = b'{"type":{"kind":"i8"},"value":{"kind":"alternatives","values":[1,3]}}\n'
 authored_files = {
+    namespace_scalar_key: {
+        "call.json": b'{"type":{"kind":"i8"},"value":7}\n',
+        "state.json": b'{"type":{"kind":"i8"},"value":1}\n',
+    },
     "projected-conditional-local-write-keeps-input-pieces": {
         "state.json": b'{"type":{"kind":"i8"},"value":0}\n',
         "preimage.json": b'{"type":{"kind":"i8"},"value":{"kind":"range","minimum":-128,"maximum":-1}}\n',
@@ -1352,6 +1382,8 @@ with tempfile.TemporaryDirectory(prefix="affine-calls-") as path:
                 code = expected if included else 0
                 expected_stderr = stderr if included else b""
                 (root/"src/main.w").write_text(text.strip()+"\n")
+                if name == namespace_scalar_key:
+                    (root/"src/calc.w").write_text(namespace_scalar_child.strip()+"\n")
                 res=subprocess.run([cli,"check",scope],cwd=root,capture_output=True,timeout=20)
                 print(target,scope,name,res.returncode,res.stdout,res.stderr,flush=True)
                 assert res.returncode==code,res
@@ -1375,6 +1407,8 @@ with tempfile.TemporaryDirectory(prefix="affine-calls-") as path:
                 files = authored_files.get(name, {}) if included else {}
                 check_outputs = Path(".wosy/outputs/check")
                 expected_paths = {"src", "src/main.w", "wosy.toml"}
+                if name == namespace_scalar_key:
+                    expected_paths.add("src/calc.w")
                 if files:
                     expected_paths.update(str(path) for path in (check_outputs, *check_outputs.parents) if path != Path("."))
                     expected_paths.update(str(check_outputs / filename) for filename in files)
@@ -1391,3 +1425,5 @@ with tempfile.TemporaryDirectory(prefix="affine-calls-") as path:
                     for path in (check_outputs, *check_outputs.parents):
                         if path != Path("."):
                             (root / path).rmdir()
+                if name == namespace_scalar_key:
+                    (root/"src/calc.w").unlink()

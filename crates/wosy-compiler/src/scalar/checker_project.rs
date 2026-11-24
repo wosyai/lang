@@ -445,6 +445,7 @@ impl ActualIntegerObserver for ProofFreeOrderedEvidence {
     const EXACT_INTEGER_CALL_CONTINUATIONS: bool = true;
     const EXACT_INTEGER_NARROW_CONTINUATIONS: bool = true;
     const EXACT_INTEGER_LOCAL_WRITES: bool = true;
+    const EXACT_COMPLETED_NAMESPACE_INTEGER_RETURNS: bool = true;
     const ORDINARY_INTEGER_LOCALS: bool = true;
 
     fn observe(&mut self, _: (usize, usize), _: &[&BigInt], _: &BigInt) {}
@@ -1095,7 +1096,7 @@ fn walk_package_initialization<const COLLECT: bool, const PRIVATE_NESTED_SCALAR:
                         let sink = failures.as_deref_mut().map(RefCell::new);
                         #[cfg(feature = "internal-checker")]
                         let collection = sink.as_ref().map(|failures| (source, OrderedCallCollection {
-                            failures, visits: None, outer: None,
+                            failures, visits: Some(visits), outer: None,
                         }));
                         #[cfg(not(feature = "internal-checker"))]
                         let collection = None;
@@ -1227,7 +1228,12 @@ fn run_initializer_call<'a, Observer: ActualIntegerObserver>(
         return Err(ProjectCheck::Unsupported);
     };
     let signature = topology.checked_call_signatures.get(&occurrence).ok_or(ProjectCheck::MissingRootOccurrences)?;
-    let collection = collection.filter(|(source, _)| !is_integer_type(expected) || *source == &declaration.source);
+    #[cfg(feature = "internal-checker")]
+    let check_completed_integer_namespace = Observer::EXACT_COMPLETED_NAMESPACE_INTEGER_RETURNS;
+    #[cfg(not(feature = "internal-checker"))]
+    let check_completed_integer_namespace = false;
+    let collection = collection.filter(|(source, _)|
+        check_completed_integer_namespace || !is_integer_type(expected) || *source == &declaration.source);
     let allow_bool = *expected == ScalarType::Unit && collection.is_some() && Observer::ORDINARY_INTEGER_LOCALS;
     let arguments = if signature.parameters.len() == 2
         && (is_integer_type(expected) || (*expected == ScalarType::Unit && collection.is_some()))
@@ -1364,6 +1370,8 @@ trait ActualIntegerObserver {
     const EXACT_INTEGER_NARROW_CONTINUATIONS: bool = false;
     #[cfg(feature = "internal-checker")]
     const EXACT_INTEGER_LOCAL_WRITES: bool = false;
+    #[cfg(feature = "internal-checker")]
+    const EXACT_COMPLETED_NAMESPACE_INTEGER_RETURNS: bool = false;
     const INTEGER_RETURN_PARTITIONS: bool = false;
     const PROJECTED_FORMAL_WRITES: bool = false;
     const ORDINARY_PROJECTED_PAIR: bool = false;
@@ -1632,6 +1640,32 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
         { let _ = (body, expected, collecting); false }
     }
 
+    fn completed_namespace_call(
+        &self, caller: &SourceIdentity, owner: &ScalarModule, target: usize, body: &FunctionCallSites,
+        signature: &CheckedCallSignature, expected: &ScalarType, visits: Option<&[InitializationVisit]>,
+    ) -> bool {
+        if caller.project != owner.source.project || caller.package != owner.source.package
+            || visits.and_then(|visits| visits.get(target)) != Some(&InitializationVisit::Completed)
+        {
+            return false;
+        }
+        if *expected == ScalarType::Unit { return true; }
+        #[cfg(feature = "internal-checker")]
+        {
+            // Only a real exact, proof-free startup call may cross into a
+            // completed sibling module for an integer result.
+            ACTUAL_STARTUP && Observer::EXACT_COMPLETED_NAMESPACE_INTEGER_RETURNS
+                && Observer::EXACT_INTEGER_CALL_CONTINUATIONS && is_integer_type(expected)
+                && matches!(signature.parameters.as_slice(), [parameter] if is_integer_type(parameter))
+                && body.call_occurrences.is_empty() && body.allocation_length_calls.is_empty()
+                && body.assignments.is_empty() && body.arms.is_empty()
+                && !body.structure.checker_has_nonsimple_directive
+                && body.structure.checker_contextual_occurrences.is_empty()
+        }
+        #[cfg(not(feature = "internal-checker"))]
+        { let _ = (body, signature); false }
+    }
+
     fn exact_self_entry<'entry>(&self, exact: Option<&[&'entry BigInt]>) -> Option<&'entry BigInt> {
         if ACTUAL_STARTUP && Observer::EXACT_SELF_REENTRY {
             if let Some([value]) = exact {
@@ -1795,8 +1829,7 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             (target, owner, body, signature)
         };
         if collection.is_some_and(|collection| parent.source != &owner.source
-            && (*expected != ScalarType::Unit || parent.source.project != owner.source.project || parent.source.package != owner.source.package
-                || collection.visits.and_then(|visits| visits.get(target.0)) != Some(&InitializationVisit::Completed)))
+            && !self.completed_namespace_call(parent.source, owner, target.0, body, signature, expected, collection.visits))
         {
             return Err(ProjectCheck::Unsupported);
         }
@@ -1939,9 +1972,8 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
         }
         let collection = if let Some((caller_source, collection)) = collection {
             if caller_source != &owner.source
-                && (*expected != ScalarType::Unit || matches!(&projected, ActualProjectedArguments::SymbolicAxis(..))
-                    || caller_source.project != owner.source.project || caller_source.package != owner.source.package
-                    || collection.visits.and_then(|visits| visits.get(target_module)) != Some(&InitializationVisit::Completed))
+                && (matches!(&projected, ActualProjectedArguments::SymbolicAxis(..))
+                    || !self.completed_namespace_call(caller_source, owner, target_module, body, signature, expected, collection.visits))
             {
                 return Err(ProjectCheck::Unsupported);
             }
@@ -13066,6 +13098,89 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
             );
             assert!(matches!(result, Err(ProjectCheck::Unsupported)));
             assert!(output.records.is_empty());
+            assert!(actual.active.is_empty());
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn completed_namespace_integer_return_preserves_origin_order_and_empty_narrow() {
+        let app = source("src/main.w", "completed-scalar-namespace-root");
+        let child = source("src/calc.w", "completed-scalar-namespace-child");
+        let output = |code| OUTPUT.replace(".code = 1", &format!(".code = {code}"));
+        let app_text = format!(r#"%%start
+            core.require(false, {});
+            lib = namespace demo "src/calc.w";
+            alias = namespace demo "src/calc.w";
+            i8 saved = lib.choose(7);
+            core.require(saved != 42, {});
+            unit() startup = fn {{
+                i8 unavailable = alias.retain(1);
+                core.require(unavailable > 127, {});
+            }};
+            startup();
+            core.require(false, {});
+        %%end"#, output(91), output(94), output(96), output(97));
+        let child_text = format!(r#"%%start
+            core.require(false, {});
+            i8(i8) choose = fn(entry) {{
+                core.require(entry != 7, {});
+                if (entry == 7) {{ 42 }} else {{ 9 }}
+            }};
+            i8(i8) retain = fn(entry) {{
+                core.narrow(entry >= 2, {});
+                entry
+            }};
+        %%end"#, output(92), output(93), output(95));
+        let namespace = |name: &str| {
+            let start = app_text.find(&format!("{name} =")).unwrap();
+            let end = start + app_text[start..].find(';').unwrap() + 1;
+            ScalarNamespaceBinding {
+                binding: name.into(), target: child.clone(), span: ByteSpan::new(start as u32, end as u32),
+            }
+        };
+        let prepared = prepare_checker_project(vec![
+            (declarations(&app, &app_text), vec![namespace("lib"), namespace("alias")]),
+            (declarations(&child, &child_text), Vec::new()),
+        ], vec![app.clone(), child.clone()], inputs()).unwrap();
+        for scope in [ScalarCheckerScope::MainFlowOnly, ScalarCheckerScope::CurrentPackage] {
+            let receipt = run_closed_without_named_proofs(&prepared, scope, 2).unwrap();
+            assert!(receipt.directives.iter().map(|failure| (&failure.source, failure.code().clone())).eq([
+                (&app, 91.into()), (&child, 92.into()), (&child, 93.into()), (&app, 94.into()), (&child, 95.into()),
+            ]));
+            for (failure, value) in [(&receipt.directives[2], 7), (&receipt.directives[4], 1)] {
+                let value = BigInt::from(value);
+                assert!(failure.witness.intervals_at(0, 0).unwrap().eq([(&value, &value)]));
+            }
+        }
+
+        let (project, calls) = prepared.parts();
+        let (_, ordinals) = package_initialization_order(project).unwrap();
+        let (root, target) = (ordinals[&app], ordinals[&child]);
+        let ModuleInitializationDetail::Occurrences(topology) = &calls.initialization_region(root).unwrap().detail
+            else { panic!("expected typed startup"); };
+        let occurrence = topology.structure.blocks[topology.structure.root.0].items.iter().find_map(|item| {
+            let BlockItemKind::Binding(binding) = &item.kind else { return None; };
+            let BindingInitialization::Outputs(outputs) = &binding.initialization else { return None; };
+            Some(outputs.primary)
+        }).unwrap();
+        let outside = SourceIdentity::new(app.project.clone(), "other".into(), app.path.clone(), app.revision.clone());
+        for (caller, visit) in [(&app, InitializationVisit::Unseen), (&app, InitializationVisit::Started),
+            (&outside, InitializationVisit::Completed)]
+        {
+            let mut visits = vec![InitializationVisit::Unseen; project.modules.len()];
+            visits[root] = InitializationVisit::Started;
+            visits[target] = visit;
+            let mut actual = CheckedCalls {
+                project, calls, active: HashSet::new(), active_depth: 0, reached: HashSet::new(),
+                had_obligations: false, observer: ProofFreeOrderedEvidence, symbolic_module: 0,
+            };
+            let mut failures = OrderedFailures::default();
+            let sink = RefCell::new(&mut failures);
+            let result = run_initializer_call(topology, &mut actual, occurrence, &ScalarType::I8, |_, _| None,
+                Some((caller, OrderedCallCollection { failures: &sink, visits: Some(&visits), outer: None })), None);
+            assert!(matches!(result, Err(ProjectCheck::Unsupported)));
+            assert!(sink.borrow().records.is_empty());
             assert!(actual.active.is_empty());
         }
     }
