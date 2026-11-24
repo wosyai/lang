@@ -7415,7 +7415,7 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
                 use super::checker_directive::{CheckerStateSelection, CheckerStateType};
                 for file in output.state_files.iter_mut() {
                     let CheckerStateSelection::Lexical(lexical) = &file.selection else { continue; };
-                    if matches!(&file.ty, CheckerStateType::Nominal(_)) {
+                    if matches!(&file.ty, CheckerStateType::Nominal(_) | CheckerStateType::FixedArray) {
                         // A snapshot is keyed by a declared lexical occurrence
                         // in this callable. Do not allocate a fresh source ID
                         // for each authored output path that names it.
@@ -7426,7 +7426,7 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
                                 declaration.declaration_span, declaration.block_span,
                             )) {
                                 self.structure.checker_selected_snapshots.insert(*key);
-                                file.selection = CheckerStateSelection::Nominal(self.structure.checker_snapshot_locals[key].clone());
+                                file.selection = CheckerStateSelection::Aggregate(self.structure.checker_snapshot_locals[key].clone());
                             }
                         }
                     } else if let Some(PlainNameIdentity::Lexical(binding)) = callable.target_resolver.plain_name(lexical, names) {
@@ -8840,17 +8840,15 @@ impl StructuralWalker<'_, '_> {
             if self.occurrence_typing.checker_directives_enabled() && outputs.secondary.is_empty()
                 && receiver.contextual_storage.is_none()
             {
-                let lexical = WalkBinding { declaration_span: receiver.name_span, block_span, introduced_by_assignment: false };
-                let identity = lexical.reference_id(callable.target_resolver.source, callable.target_resolver.function_span);
-                if let ScalarType::Struct(id) = &binding.declared_type {
-                    if self.occurrence_typing.checker_demands_snapshot(id) {
-                        if let Some(shape) = self.checker_snapshot_shape(binding, outputs.primary, &identity,
-                            callable.target_resolver.declarations)
-                        {
-                            let key = (position.block, position.item);
-                            self.structure.checker_snapshot_locals.insert(key, std::rc::Rc::new(shape));
-                            self.structure.checker_snapshot_bindings.insert((receiver.name_span, block_span), key);
-                        }
+                if self.occurrence_typing.checker_demands_snapshot(&binding.declared_type) {
+                    let lexical = WalkBinding { declaration_span: receiver.name_span, block_span, introduced_by_assignment: false };
+                    let identity = lexical.reference_id(callable.target_resolver.source, callable.target_resolver.function_span);
+                    if let Some(shape) = self.checker_snapshot_shape(binding, outputs.primary, &identity,
+                        callable.target_resolver.declarations)
+                    {
+                        let key = (position.block, position.item);
+                        self.structure.checker_snapshot_locals.insert(key, std::rc::Rc::new(shape));
+                        self.structure.checker_snapshot_bindings.insert((receiver.name_span, block_span), key);
                     }
                 }
             }
@@ -8935,8 +8933,30 @@ impl StructuralWalker<'_, '_> {
             fn node(
                 &mut self, expression: &ScalarExpression, root: OccurrenceOrdinal, ty: &ScalarType, depth: usize,
             ) -> Option<CheckerSnapshotNode> {
-                if depth > 8 || self.walker.structure.checked_types.expressions.get(&root)? != ty { return None; }
+                if depth > 8 { return None; }
                 self.remaining = self.remaining.checked_sub(1)?;
+                let actual = self.walker.structure.checked_types.expressions.get(&root)?;
+                if let ScalarType::Array { element, length, .. } = ty {
+                    let ScalarType::Array { length: actual_length, .. } = actual else { return None; };
+                    let ScalarExpression::ArrayLiteral { elements, .. } = expression else { return None; };
+                    if actual_length != length || u64::try_from(elements.len()).ok()? != *length
+                        || elements.is_empty() || elements.len() > self.remaining
+                    {
+                        return None;
+                    }
+                    // Validate element types recursively against their actual
+                    // typed occurrences. Avoid a second unbounded deep type
+                    // comparison before the shape depth/node checks.
+                    let mut nodes = Vec::with_capacity(elements.len());
+                    for (position, element_expr) in elements.iter().enumerate() {
+                        let OccurrenceNode::Expression(ordinal) = *self.walker.structure.edges.get(&(
+                            OccurrenceParent::Expression(root), OccurrenceEdge::AggregateElement(position),
+                        ))? else { return None; };
+                        nodes.push(self.node(element_expr, ordinal, element, depth + 1)?);
+                    }
+                    return Some(CheckerSnapshotNode::Array(nodes.into_boxed_slice()));
+                }
+                if actual != ty { return None; }
                 if let ScalarType::Struct(id) = ty {
                     let ScalarExpression::StructLiteral { fields, .. } = expression else { return None; };
                     let structure = *self.declarations.structs.get(id)?;

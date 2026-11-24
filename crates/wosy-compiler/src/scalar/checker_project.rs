@@ -2439,14 +2439,14 @@ fn render_authored_state(record: &ScalarOrderedCheckerFailure, work: &mut usize)
         if selected.peek().is_some_and(|file| file.position == position) {
             let file = selected.next()?;
             let bytes: &Box<[u8]> = match (&file.selection, &file.ty) {
-                (CheckerStateSelection::Nominal(shape), CheckerStateType::Nominal(_)) => {
+                (CheckerStateSelection::Aggregate(shape), CheckerStateType::Nominal(_) | CheckerStateType::FixedArray) => {
                     // Shape addresses are stable: the prepared directive owns
                     // every shape for this entire materialization.
                     match encoded_shapes.entry(Rc::as_ptr(shape)) {
                         std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
                         std::collections::hash_map::Entry::Vacant(entry) => {
                             let mut json = String::new();
-                            encode_nominal_state_node(&shape.root, shape, record, work, &mut json)?;
+                            encode_snapshot_node(&shape.root, shape, record, work, &mut json)?;
                             json.push('\n');
                             entry.insert(json.into_bytes().into_boxed_slice())
                         }
@@ -2491,7 +2491,7 @@ fn encode_authored_scalar(
 }
 
 #[cfg(feature = "internal-checker")]
-fn encode_nominal_state_node(
+fn encode_snapshot_node(
     node: &super::checker_directive::CheckerSnapshotNode,
     shape: &super::checker_directive::CheckerSnapshotShape,
     record: &ScalarOrderedCheckerFailure, work: &mut usize, json: &mut String,
@@ -2503,6 +2503,17 @@ fn encode_nominal_state_node(
             let node = encode_authored_scalar(record, &leaf.capture, &leaf.ty, work)?;
             json.push_str(node.strip_suffix('\n')?);
         }
+        CheckerSnapshotNode::Array(elements) => {
+            json.push_str(r#"{"type":"#);
+            encode_snapshot_type(node, shape, work, json)?;
+            json.push_str(r#","value":["#);
+            for (index, child) in elements.iter().enumerate() {
+                charge_call_work(work, 1)?;
+                if index != 0 { json.push(','); }
+                encode_snapshot_node(child, shape, record, work, json)?;
+            }
+            json.push_str("]}");
+        }
         CheckerSnapshotNode::Nominal { name, fields } => {
             charge_call_work(work, 1usize.checked_add(name.len().div_ceil(32).checked_mul(6)?)?)?;
             json.push_str(r#"{"type":{"kind":"struct","name":"#);
@@ -2513,7 +2524,7 @@ fn encode_nominal_state_node(
                 if index != 0 { json.push(','); }
                 json.push_str(&serde_json::to_string(name.as_ref()).ok()?);
                 json.push(':');
-                encode_nominal_state_node(child, shape, record, work, json)?;
+                encode_snapshot_node(child, shape, record, work, json)?;
             }
             json.push_str("}}");
         }
@@ -2522,17 +2533,50 @@ fn encode_nominal_state_node(
 }
 
 #[cfg(feature = "internal-checker")]
-fn serialize_scalar_analysis_state(ty: &ScalarType, values: &IntegerSet) -> Option<String> {
+fn encode_snapshot_type(
+    node: &super::checker_directive::CheckerSnapshotNode,
+    shape: &super::checker_directive::CheckerSnapshotShape, work: &mut usize, json: &mut String,
+) -> Option<()> {
     use std::fmt::Write as _;
-    let (min, max) = values.extremes()?;
-    let kind = match ty {
+    use super::{checker_directive::CheckerSnapshotNode, checker_flow::charge_call_work};
+    charge_call_work(work, 1)?;
+    match node {
+        CheckerSnapshotNode::Leaf(index) => {
+            let kind = analysis_scalar_kind(&shape.leaves.get(*index)?.ty)?;
+            write!(json, r#"{{"kind":"{kind}"}}"#).ok()?;
+        }
+        CheckerSnapshotNode::Nominal { name, .. } => {
+            charge_call_work(work, name.len().div_ceil(32).checked_mul(6)?)?;
+            json.push_str(r#"{"kind":"struct","name":"#);
+            json.push_str(&serde_json::to_string(name.as_ref()).ok()?);
+            json.push('}');
+        }
+        CheckerSnapshotNode::Array(elements) => {
+            write!(json, r#"{{"kind":"array","length":{},"element":"#, elements.len()).ok()?;
+            encode_snapshot_type(elements.first()?, shape, work, json)?;
+            json.push('}');
+        }
+    }
+    Some(())
+}
+
+#[cfg(feature = "internal-checker")]
+fn analysis_scalar_kind(ty: &ScalarType) -> Option<&'static str> {
+    Some(match ty {
         ScalarType::Bool => "bool",
         ScalarType::I8 => "i8", ScalarType::I16 => "i16", ScalarType::I32 => "i32",
         ScalarType::I64 => "i64", ScalarType::I128 => "i128",
         ScalarType::U8 => "u8", ScalarType::U16 => "u16", ScalarType::U32 => "u32",
         ScalarType::U64 => "u64", ScalarType::U128 => "u128",
         _ => return None,
-    };
+    })
+}
+
+#[cfg(feature = "internal-checker")]
+fn serialize_scalar_analysis_state(ty: &ScalarType, values: &IntegerSet) -> Option<String> {
+    use std::fmt::Write as _;
+    let (min, max) = values.extremes()?;
+    let kind = analysis_scalar_kind(ty)?;
     let mut result = format!(r#"{{"type":{{"kind":"{kind}"}},"value":"#);
     if *ty == ScalarType::Bool {
         let zero = BigInt::from(0u8);
@@ -9661,6 +9705,39 @@ mod tests {
             assert_eq!(body.structure.checker_contextual_read_locals.contains_key(&key), !allowed);
             assert_eq!(root_local_import_requirement(body).map(|(position, _)| position), allowed.then_some(2));
         }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn fixed_array_state_capture_preserves_types_order_and_prewrite_alternatives() {
+        let app = source("src/main.w", "fixed-array-state");
+        let program = r#"%%start
+            unit(i8) check = fn(value) {
+                core.narrow(value == 1 || value == 3, { .stdout = ""; .stderr = ""; .code = 1; .files = []; });
+                i8[2] snapshot = [value, 7];
+                value = 9;
+                core.require(value != 9, { .stdout = ""; .stderr = ""; .code = 1; .files = [
+                    { .path = "one.json"; .state = snapshot; },
+                    { .path = "two.json"; .state = snapshot; }
+                ]; });
+            };
+        %%end"#;
+        let receipt = check_loaded_scalar_ordered_local_proof_contexts(
+            vec![(declarations(&app, program), Vec::new())], Vec::new(), vec![app.clone()],
+            inputs(), ScalarCheckerScope::CurrentPackage, Vec::new(),
+        ).unwrap();
+        let [failure] = receipt.directives.as_slice() else { panic!("expected one array witness"); };
+        let [first, second] = failure.files() else { panic!("expected both serialized files"); };
+        assert_eq!(first.text, second.text);
+        assert_eq!(first.text.as_ref(), concat!(
+            r#"{"type":{"kind":"array","length":2,"element":{"kind":"i8"}},"value":["#,
+            r#"{"type":{"kind":"i8"},"value":{"kind":"alternatives","values":[1,3]}},"#,
+            r#"{"type":{"kind":"i8"},"value":7}]}"#,
+            "\n",
+        ).as_bytes());
+        assert_eq!(failure.witness.axes().len(), 1);
+        let nine = BigInt::from(9);
+        assert!(failure.witness.intervals_at(0, 0).unwrap().eq([(&nine, &nine)]));
     }
 
     #[cfg(feature = "internal-checker")]

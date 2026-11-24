@@ -1192,6 +1192,36 @@ state_holes = f"""%%start
         core.require(false, {state_report(168,"ALTERNATIVES","value")});
     }};
     %%end"""
+state_fixed_array = f"""%%start
+    unit(i8) check = fn(value) {{
+        core.narrow(value == 1 || value == 3, {report(167,"HOLES")});
+        i8[2] snapshot = [value, 7];
+        value = 9;
+        core.require(value != 9, {state_report(217,"FIXED-ARRAY","snapshot",', { .path = "copy.json"; .state = snapshot; }')});
+    }};
+    %%end"""
+state_nested_array = f"""%%start
+    struct Snapshot {{
+        i8[2][2] matrix;
+        bool[2] flags;
+    }}
+    unit(i8) check = fn(value) {{
+        Snapshot snapshot = {{ .flags = [true, false]; .matrix = [[1, value], [3, 4]]; }};
+        core.require(value != 2, {state_report(218,"NESTED-ARRAY","snapshot")});
+    }};
+    %%end"""
+state_array_too_wide = f"""%%start
+    unit() check = fn {{
+        i8[65] snapshot = [{', '.join(str(item) for item in range(65))}];
+        core.require(false, {state_report(219,"WIDE-ARRAY","snapshot")});
+    }};
+    %%end"""
+cases.extend([
+    ("authored-state-fixed-array-precision",state_fixed_array,217,b"FIXED-ARRAY"),
+    ("authored-state-array-inside-nominal",state_nested_array,218,b"NESTED-ARRAY"),
+    ("authored-state-array-unsupported-element",state_fixed_array.replace("[value, 7]","[value + 1, 7]"),2,b"unsupported analysis"),
+    ("authored-state-array-shape-cap",state_array_too_wide,2,b"unsupported analysis"),
+])
 state_nominal = f"""%%start
     struct Snapshot {{
         i8 saved;
@@ -1279,7 +1309,30 @@ cases.extend([
     ("authored-state-accepted-condition-writes-nothing",state_range.replace("value <= 3","value <= 127"),0,b""),
 ])
 holes_bytes = b'{"type":{"kind":"i8"},"value":{"kind":"alternatives","values":[1,3]}}\n'
+def typed_state(kind, value):
+    return {"type": {"kind": kind}, "value": value}
+def array_state(element_type, elements):
+    return {"type": {"kind": "array", "length": len(elements), "element": element_type}, "value": elements}
+def state_bytes(value):
+    import json
+    return (json.dumps(value, separators=(",", ":")) + "\n").encode()
+fixed_array_bytes = state_bytes(array_state({"kind": "i8"}, [
+    typed_state("i8", {"kind": "alternatives", "values": [1, 3]}), typed_state("i8", 7),
+]))
+snapshot_rows = [
+    array_state({"kind": "i8"}, [typed_state("i8", first), typed_state("i8", second)])
+    for first, second in [(1, 2), (3, 4)]
+]
+nested_array_bytes = state_bytes({
+    "type": {"kind": "struct", "name": "Snapshot"},
+    "value": {
+        "matrix": array_state(snapshot_rows[0]["type"], snapshot_rows),
+        "flags": array_state({"kind": "bool"}, [typed_state("bool", True), typed_state("bool", False)]),
+    },
+})
 authored_files = {
+    "authored-state-fixed-array-precision": {"state.json": fixed_array_bytes, "copy.json": fixed_array_bytes},
+    "authored-state-array-inside-nominal": {"state.json": nested_array_bytes},
     namespace_scalar_key: {
         "call.json": b'{"type":{"kind":"i8"},"value":7}\n',
         "state.json": b'{"type":{"kind":"i8"},"value":1}\n',

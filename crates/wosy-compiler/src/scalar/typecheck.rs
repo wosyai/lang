@@ -3360,6 +3360,8 @@ fn check_expression_type_in_module(
                 match ty {
                     ScalarType::Struct(id) if matches!(&selection, CheckerStateSelection::Lexical(_)) =>
                         Some((selection, CheckerStateType::Nominal(inference.shared_snapshot_type(id)))),
+                    ScalarType::Array { .. } if matches!(&selection, CheckerStateSelection::Lexical(_)) =>
+                        Some((selection, CheckerStateType::FixedArray)),
                     ty if ty == ScalarType::Bool || is_integer_type(&ty) =>
                         Some((selection, CheckerStateType::Scalar(ty))),
                     _ => None,

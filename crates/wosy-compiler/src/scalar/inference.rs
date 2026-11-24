@@ -93,6 +93,8 @@ pub(super) struct PreparationOccurrenceTyping {
     checker_enabled: bool,
     #[cfg(feature = "internal-checker")]
     snapshot_types: std::collections::BTreeSet<std::rc::Rc<super::ScalarStructId>>,
+    #[cfg(feature = "internal-checker")]
+    snapshot_array_demand: bool,
 }
 
 struct CheckedExpressionType {
@@ -114,8 +116,12 @@ impl PreparationOccurrenceTyping {
     }
 
     #[cfg(feature = "internal-checker")]
-    pub(super) fn checker_demands_snapshot(&self, id: &super::ScalarStructId) -> bool {
-        self.snapshot_types.contains(id)
+    pub(super) fn checker_demands_snapshot(&self, ty: &ScalarType) -> bool {
+        match ty {
+            ScalarType::Struct(id) => self.snapshot_types.contains(id),
+            ScalarType::Array { .. } => self.snapshot_array_demand,
+            _ => false,
+        }
     }
 
     #[cfg(any(test, feature = "internal-checker"))]
@@ -342,6 +348,8 @@ impl<'a> ScalarInferenceBuilder<'a> {
                     } else {
                         self.occurrences.snapshot_types.insert(id.clone());
                     }
+                } else if matches!(file.ty, super::checker_directive::CheckerStateType::FixedArray) {
+                    self.occurrences.snapshot_array_demand = true;
                 }
             }
             self.occurrences

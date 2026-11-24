@@ -67,7 +67,7 @@ pub(super) enum CheckerStateSelection {
     Lexical(std::rc::Rc<str>),
     Binding(ReferenceBindingId),
     #[cfg(feature = "internal-checker")]
-    Nominal(std::rc::Rc<CheckerSnapshotShape>),
+    Aggregate(std::rc::Rc<CheckerSnapshotShape>),
 }
 
 #[cfg(feature = "internal-checker")]
@@ -84,6 +84,7 @@ pub(super) enum CheckerSnapshotNode {
         name: Box<str>,
         fields: Box<[(Box<str>, CheckerSnapshotNode)]>,
     },
+    Array(Box<[CheckerSnapshotNode]>),
     Leaf(usize),
 }
 
@@ -107,6 +108,8 @@ pub(super) enum CheckerStateType {
     Scalar(ScalarType),
     #[cfg(feature = "internal-checker")]
     Nominal(std::rc::Rc<super::ScalarStructId>),
+    #[cfg(feature = "internal-checker")]
+    FixedArray,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
