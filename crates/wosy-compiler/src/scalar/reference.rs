@@ -14360,7 +14360,7 @@ fn build_function_reference_cfg(
     }
     aggregate.array_calls = builder.aggregate_facts.array_calls;
     aggregate.checked_result_origins = builder.checked_result_origins;
-    if builder.aggregate_facts.calls.len() == 2 {
+    if (2..=aggregate::MAX_LOCAL_CHOICE_LEAVES).contains(&builder.aggregate_facts.calls.len()) {
         let structure = &call_sites.structure;
         if matches!(structure.blocks[structure.root.0].items.first().map(|item| &item.kind),
             Some(BlockItemKind::Binding(binding))

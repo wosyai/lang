@@ -101,6 +101,7 @@ struct CertifiedInputFork {
 // 2 * depth - 1 merges (the enclosing root fork is shared). Sequential forks
 // start at depth one and do not spend one another's nesting budget.
 const MAX_RECEIPT_FORK_DEPTH: usize = 32;
+pub(super) const MAX_LOCAL_CHOICE_LEAVES: usize = 8;
 const MAX_MERGES_PER_RECEIPT: usize = 2 * MAX_RECEIPT_FORK_DEPTH - 1;
 
 struct ConditionalInputCertificate {
@@ -2614,6 +2615,7 @@ pub(crate) struct ClosedBody {
     pub(crate) checked_backing_optional: bool,
     pub(crate) returning: Option<ClosedReturn>,
     mixed_branch_return: Option<Box<MixedBranchReturn>>,
+    pub(crate) local_choice_arms: usize,
     pub(crate) local_choice_immediate: Option<(usize, usize)>, // consumer, conditional
     pub(crate) local_choice_binding: Option<(usize, usize, usize)>, // block, item, conditional
     pub(crate) structured_result_binding: Option<(usize, usize, usize)>, // block, item, conditional
@@ -2730,12 +2732,11 @@ enum LocalChoiceUse {
     Consume { point: CfgPointId, ordinal: OccurrenceOrdinal },
 }
 
-#[derive(Clone, Copy)]
 struct LocalReceiptChoice {
     block: BlockOrdinal,
     item: Option<usize>,
     conditional: OccurrenceOrdinal,
-    leaves: [CfgPointId; 2],
+    leaves: BTreeSet<CfgPointId>,
     use_site: LocalChoiceUse,
 }
 
@@ -2761,7 +2762,7 @@ impl Body<'_> {
 
     fn local_receipt_choice(&self) -> Option<LocalReceiptChoice> {
         let facts = self.facts?;
-        if !self.is_monomorphic || facts.calls.len() != 2 { return None; }
+        if !self.is_monomorphic || !(2..=MAX_LOCAL_CHOICE_LEAVES).contains(&facts.calls.len()) { return None; }
         let [output_ty] = self.sites.boundary.root_outputs.as_slice() else { return None };
         if !ordinary_value(&output_ty.ty) { return None; }
         let structure = &self.sites.structure;
@@ -2931,30 +2932,54 @@ impl Body<'_> {
         })
     }
 
-    fn local_choice_leaves(&self, conditional: OccurrenceOrdinal, ty: &ScalarType) -> Option<[CfgPointId; 2]> {
+    fn local_choice_leaves(&self, conditional: OccurrenceOrdinal, ty: &ScalarType) -> Option<BTreeSet<CfgPointId>> {
         let facts = self.facts?;
         let structure = &self.sites.structure;
-        let Some(ConditionalRegion::Value { then_block, else_block, .. }) = self.sites.conditionals.get(&conditional)
-            else { return None };
-        let region = facts.conditional_input_regions.values().find(|region| region.expression == conditional)?;
         let points = &self.cfg.points;
-        let join = points.get(region.join.0)?;
-        let scope = points.first()?.scope;
+        let root = points.first()?.scope;
         let next = |id| points.get(linear_successor(points, id)?.0);
-        let prove_arm = |block: BlockOrdinal, side: usize| {
-            let [item] = structure.blocks.get(block.0)?.items.as_slice() else { return None };
-            let BlockItemKind::FinalOutput(output) = &item.kind else { return None };
-            let (&id, _) = facts.calls.iter().find(|(_, ordinal)| **ordinal == output.expression)?;
-            let leaf = points.get(id.0)?;
-            let terminal = next(id)?;
-            (output.output == 0 && structure.checked_types.expressions.get(&output.expression) == Some(ty)
-                && leaf.scope != scope && leaf.scope == points.get(region.entries[side].0)?.scope
-                && terminal.scope == leaf.scope && terminal.id == region.terminals[side]
-                && matches!(terminal.kind, CfgPointKind::ScopeExit) && next(terminal.id)?.id == join.id)
-                .then_some(id)
+        let find_region = |expression| facts.conditional_input_regions.values()
+            .find(|region| region.expression == expression);
+        let typed_arms = |expression| match self.sites.conditionals.get(&expression)? {
+            ConditionalRegion::Value { then_block, else_block, .. } => Some([*then_block, *else_block]),
+            _ => None,
         };
-        let leaves = [prove_arm(*then_block, 0)?, prove_arm(*else_block, 1)?];
-        (leaves[0] != leaves[1]).then_some(leaves)
+        let mut pending = vec![(conditional, root)];
+        let mut seen = HashSet::new();
+        let mut leaves = BTreeSet::new();
+        while let Some((expression, scope)) = pending.pop() {
+            // In a full binary tree of at most N leaves there are fewer than N forks.
+            if seen.len() >= MAX_LOCAL_CHOICE_LEAVES - 1 || !seen.insert(expression) {
+                return None;
+            }
+            let region = find_region(expression)?;
+            let join = points.get(region.join.0)?;
+            if join.scope != scope || !matches!(join.kind, CfgPointKind::Join)
+                || join.source_span.range != self.sites.occurrences.get(expression.0)?.span
+            { return None; }
+            for (side, block) in typed_arms(expression)?.into_iter().enumerate() {
+                let [item] = structure.blocks.get(block.0)?.items.as_slice() else { return None };
+                let BlockItemKind::FinalOutput(output) = &item.kind else { return None };
+                let entry = points.get(region.entries[side].0)?;
+                let terminal = points.get(region.terminals[side].0)?;
+                if output.output != 0 || structure.checked_types.expressions.get(&output.expression) != Some(ty)
+                    || terminal.scope != entry.scope || entry.scope == scope
+                    || !matches!(terminal.kind, CfgPointKind::ScopeExit) || next(terminal.id)?.id != join.id
+                { return None; }
+                if let Some((&id, _)) = facts.calls.iter().find(|(_, ordinal)| **ordinal == output.expression) {
+                    if points.get(id.0)?.scope != entry.scope || next(id)?.id != terminal.id || !leaves.insert(id) {
+                        return None;
+                    }
+                } else {
+                    let child = find_region(output.expression)?;
+                    if points.get(child.join.0)?.scope != entry.scope || next(child.join)?.id != terminal.id {
+                        return None;
+                    }
+                    pending.push((output.expression, entry.scope));
+                }
+            }
+        }
+        (leaves.len() == facts.calls.len()).then_some(leaves)
     }
 
     fn structured_owner_return(&self) -> Option<StructuredOwnerReturn> {
@@ -4657,7 +4682,7 @@ fn closed_aggregates<'a>(
     for (&key, body) in &bodies {
         if outgoing.contains(&key) { continue; }
         let Some(choice) = body.local_receipt_choice() else { continue };
-        if !choice.leaves.into_iter().all(|leaf| target_body(&declarations, body.cfg, leaf)
+        if !choice.leaves.iter().all(|&leaf| target_body(&declarations, body.cfg, leaf)
             .is_some_and(|target| outgoing.contains(&target)
                 && bodies.get(&target).is_some_and(|callee| !callee.has_mixed_struct_result())))
         { continue; }
@@ -5165,6 +5190,7 @@ fn closed_aggregates<'a>(
         };
         let local_choice = local_choices.get(&key);
         if let Some(choice) = local_choice {
+            plan.local_choice_arms = choice.leaves.len();
             if plan.input.is_some() {
                 return Err(format!("local conditional owner overlaps an owning formal in {:?}", body.source));
             }

@@ -1363,12 +1363,26 @@ fn lexical_conditional_owner_choice_releases_selected_original_after_read() {
         .replace("    chosen.length", "    *Packet view = &chosen;\n    read_selected(view)");
     assert_ne!(borrowed, text);
     assert_ne!(named_borrow, text);
+    let nested = |source: &str| {
+        let (_, long) = source.split_once("Packet(u64) make_long = fn(length) {").unwrap();
+        let (body, _) = long.split_once("\n};").unwrap();
+        let additional = format!("Packet(u64) make_later = fn(length) {{{body}\n}};\nu64(u64, bool) drive");
+        let changed = source.replacen("u64(u64, bool) drive", &additional, 1).replacen(
+            "else { make_long(2) }", "else { if (depth == 0) { make_long(2) } else { make_later(2) } }", 1);
+        assert_eq!(changed.matches("make_later").count(), 2);
+        changed
+    };
+    let nested_temporary = nested(&temporary);
+    let nested_borrow = nested(&named_borrow);
     for (text, use_site) in [(text, "choice"), (consumed.as_str(), "consume"),
         (temporary.as_str(), "consume-temporary"), (borrowed.as_str(), "borrow"),
-        (named_borrow.as_str(), "named-borrow")]
+        (named_borrow.as_str(), "named-borrow"), (nested_temporary.as_str(), "nested-consume-temporary"),
+        (nested_borrow.as_str(), "nested-named-borrow")]
     {
-        let consuming = use_site.starts_with("consume");
-        let borrowing = matches!(use_site, "borrow" | "named-borrow");
+        let nested = use_site.starts_with("nested-");
+        let base_use = use_site.strip_prefix("nested-").unwrap_or(use_site);
+        let consuming = base_use.starts_with("consume");
+        let borrowing = matches!(base_use, "borrow" | "named-borrow");
         for (target, target_layout) in [("native64", ScalarTargetLayout::NATIVE64), ("wasm32", ScalarTargetLayout::WASM32)] {
             for project in [false, true] {
                 let emit = |text: &str| {
@@ -1387,7 +1401,8 @@ fn lexical_conditional_owner_choice_releases_selected_original_after_read() {
                 let find = |name| module.get_function(&symbol(name)).unwrap();
                 let drive = find("drive");
                 assert_eq!(drive.count_params(), 2, "lexical choice introduces no hidden result ABI");
-                let (short, long) = (find("make_short"), find("make_long"));
+                let mut producers = vec![find("make_short"), find("make_long")];
+                if nested { producers.push(find("make_later")); }
                 let consumer = consuming.then(|| find("consume"));
                 let reader = borrowing.then(|| find("read_selected"));
                 let mut reader_seen = false;
@@ -1408,7 +1423,7 @@ fn lexical_conditional_owner_choice_releases_selected_original_after_read() {
                     if row.get_opcode() != InstructionOpcode::Call { continue; }
                     let call = CallSiteValue::try_from(row).unwrap();
                     let Some(callee) = call.get_called_fn_value() else { continue };
-                    if [short, long].contains(&callee) {
+                    if producers.contains(&callee) {
                         writes.push((callee, arg(call.count_arguments() - 1), call.try_as_basic_value().basic().unwrap()));
                     } else if Some(callee) == consumer {
                         assert_eq!(call.count_arguments(), 2);
@@ -1423,17 +1438,32 @@ fn lexical_conditional_owner_choice_releases_selected_original_after_read() {
                         released.push(arg(0));
                     }
                 }
-                let [first, second] = writes.as_slice() else { panic!("one call per arm: {ir}") };
-                assert_ne!(first.0, second.0);
-                assert_eq!(first.1, second.1, "both arms must write one descriptor slot");
-
-                let [(selected, incoming)] = merges.as_slice() else { panic!("one backing join: {ir}") };
-                assert_ne!(*selected, first.1, "descriptor and backing must remain distinct");
-                assert_eq!(incoming.len(), 2);
-                assert!(incoming.contains(&first.2) && incoming.contains(&second.2));
+                assert_eq!(writes.len(), producers.len(), "one call per exact leaf");
+                let descriptor = writes[0].1;
+                assert!(writes.iter().all(|&(_, slot, _)| slot == descriptor), "all arms share descriptor storage");
+                assert!(producers.iter().all(|producer| writes.iter().any(|(callee, _, _)| callee == producer)));
+                let selected = if consuming { transfers.first().expect("owner transfer").1 }
+                    else { *released.first().expect("lexical release") };
+                assert_ne!(selected, descriptor, "descriptor and backing must remain distinct");
+                assert_eq!(merges.len(), producers.len() - 1);
+                let mut pending = vec![selected];
+                let mut leaf_bases = Vec::new();
+                let mut seen = Vec::new();
+                while let Some(value) = pending.pop() {
+                    assert!(!seen.contains(&value), "backing phi tree must be acyclic");
+                    seen.push(value);
+                    if let Some((_, incoming)) = merges.iter().find(|(phi, _)| *phi == value) {
+                        assert_eq!(incoming.len(), 2);
+                        pending.extend(incoming.iter().copied());
+                    } else {
+                        leaf_bases.push(value);
+                    }
+                }
+                assert_eq!(leaf_bases.len(), writes.len());
+                assert!(writes.iter().all(|&(_, _, base)| leaf_bases.contains(&base)));
                 if let Some(consumer) = consumer {
                     assert!(released.is_empty(), "the caller transferred rather than freed the receipt");
-                    assert_eq!(transfers, [(first.1, *selected)], "pass the descriptor and its independent backing");
+                    assert_eq!(transfers, [(descriptor, selected)], "pass the descriptor and its independent backing");
                     let frees = consumer.get_basic_blocks().into_iter().flat_map(|block| block.get_instructions())
                         .filter_map(|row| {
                             let call = CallSiteValue::try_from(row).ok()?;
@@ -1444,13 +1474,13 @@ fn lexical_conditional_owner_choice_releases_selected_original_after_read() {
                 } else {
                     if borrowing {
                         assert!(reader_seen);
-                        if use_site == "borrow" {
-                            assert!(reads.contains(&first.1), "field loan must borrow from the joined descriptor slot");
+                        if base_use == "borrow" {
+                            assert!(reads.contains(&descriptor), "field loan must borrow from the joined descriptor slot");
                         }
                     } else {
-                        assert!(reads.contains(&first.1), "final field observation must use that slot");
+                        assert!(reads.contains(&descriptor), "final field observation must use that slot");
                     }
-                    assert_eq!(&released, &[*selected], "free only the selected original backing");
+                    assert_eq!(&released, &[selected], "free only the selected original backing");
                 }
                 if let Some(out) = std::env::var_os("WOSY_NAMED_FACTORY_IR_DIR") {
                     let route = if project { "project" } else { "single" };
@@ -1478,6 +1508,17 @@ fn lexical_conditional_owner_choice_releases_selected_original_after_read() {
                     let extra = text.replace("    chosen.length\n", "    u64 observed = chosen.length;\n    observed\n");
                     assert_ne!(extra, text);
                     assert!(emit(&extra).expect_err("the extra binding is outside the exact observation-and-release corridor")
+                        .contains("aggregate owning call has no proved endpoint"));
+                    fn choice_tree(low: u64, high: u64) -> String {
+                        if high - low == 1 { return "make_long(2)".to_owned(); }
+                        let split = (low + high) / 2;
+                        let low = choice_tree(low, split);
+                        let high = choice_tree(split, high);
+                        format!("if (depth < {split}) {{ {low} }} else {{ {high} }}")
+                    }
+                    let many = text.replace("else { make_long(2) }", &format!("else {{ {} }}", choice_tree(0, 8)));
+                    assert_eq!(many.matches("make_long(2)").count(), 8);
+                    assert!(emit(&many).expect_err("nine owning leaves exceed the closed proof bound")
                         .contains("aggregate owning call has no proved endpoint"));
                 }
             }

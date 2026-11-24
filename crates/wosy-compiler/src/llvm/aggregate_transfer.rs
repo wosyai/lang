@@ -770,7 +770,9 @@ fn call_action(
 fn commit_local_choice<'ctx>(
     aggregate: &mut AggregateEmitter<'ctx, '_>, conditional: usize, base: PointerValue<'ctx>,
 ) -> Result<PointerValue<'ctx>, String> {
-    if aggregate.structured_arms_visited != 2 || aggregate.committed {
+    if aggregate.plan.local_choice_arms < 2 || aggregate.structured_arms_visited != aggregate.plan.local_choice_arms
+        || aggregate.committed
+    {
         return Err("invalid local conditional owner commit".into());
     }
     let descriptor = aggregate.local_choice_destination.take().ok_or("missing local conditional descriptor")?;
@@ -793,8 +795,8 @@ pub(super) fn store_received_binding<'ctx>(
             if nodes.binding_position(binding) == Some((block, item)) {
                 let [receiver] = binding.receivers.as_slice() else { return Err("invalid local conditional receiver".into()) };
                 let EmitValue::Basic(BasicValueEnum::PointerValue(base)) = value else { return Err("missing selected original backing".into()) };
-                if nodes.expression_ordinal(&binding.value) != Some(conditional) || aggregate.structured_arms_visited != 2
-                    || aggregate.committed || !matches!(receiver.ty, ScalarType::Struct(_))
+                if nodes.expression_ordinal(&binding.value) != Some(conditional)
+                    || !matches!(receiver.ty, ScalarType::Struct(_))
                 {
                     return Err("changed local conditional owner binding".into());
                 }
