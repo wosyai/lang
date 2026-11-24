@@ -11,6 +11,7 @@ enum Expected {
     LiveConflict,
     LiveDescendantConflict,
     LiveFamilyConflict,
+    LiveMutableConflict,
     Declined,
 }
 
@@ -50,11 +51,12 @@ fn check_case(text: &str, expected: Expected, witness_dir: Option<&str>) {
                     }), "{target}/{route}: {diagnostics:?}");
                 }
                 Expected::Declined => assert!(diagnostics.iter().any(|item| item.code == "B0003"), "{target}/{route}: {diagnostics:?}"),
-                Expected::LiveConflict | Expected::LiveDescendantConflict | Expected::LiveFamilyConflict => {
+                Expected::LiveConflict | Expected::LiveDescendantConflict | Expected::LiveFamilyConflict | Expected::LiveMutableConflict => {
                     let write = text.find("first = 3").expect("owner write") as u32;
                     let loan = match expected {
                         Expected::LiveDescendantConflict => "&(*child)",
                         Expected::LiveFamilyConflict => "&(*left)",
+                        Expected::LiveMutableConflict => "&!(*parent)",
                         _ => "&(*parent)",
                     };
                     let child = text.find(loan).expect("child reborrow") as u32;
@@ -244,6 +246,24 @@ fn joined_descendant_family_has_a_fixed_issuance_bound() {
             .replace("    seen\n", "    if (again == seen) { again } else { 0 }\n");
         check(&program, expected);
     }
+}
+
+#[test]
+fn joined_mutable_child_updates_only_its_selected_lexical_owner() {
+    let program = joined("parent = &!second;", true, "",
+        "*child = seen + 2; u8 changed = *child; u8 left = first; u8 right = second; first = 3;")
+        .replace("*u8 child = &(*parent);", "*!u8 child = &!(*parent);")
+        .replace("    seen\n", "    if (choose) { if (changed == 9 && left == 9 && right == 9) { seen } else { 0 } } else { if (changed == 11 && left == 7 && right == 11) { seen } else { 0 } }\n");
+    assert!(program.contains("*!u8 child = &!(*parent);"));
+    check_case(&program, Expected::Valid, Some("WOSY_JOINED_MUTABLE_IR_DIR"));
+    let live = program.replace("u8 changed = *child; u8 left = first; u8 right = second; first = 3;",
+        "first = 3; u8 changed = *child; u8 left = first; u8 right = second;");
+    assert_ne!(live, program);
+    check(&live, Expected::LiveMutableConflict);
+
+    let descendant = program.replace("u8 changed = *child;", "*u8 nested = &(*child); u8 changed = *nested;");
+    assert_ne!(descendant, program);
+    check(&descendant, Expected::Declined);
 }
 
 fn joined_with_scalar_call(after_read: &str) -> String {

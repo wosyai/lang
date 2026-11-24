@@ -542,6 +542,7 @@ pub enum CfgPointKind {
         loan: ReferenceLoanId,
     },
     ReborrowThrough {
+        mode: ScalarReferenceMutability,
         place: ScalarPlace,
         pointer_point: CfgPointId,
     },
