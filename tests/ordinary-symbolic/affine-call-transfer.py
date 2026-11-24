@@ -878,6 +878,28 @@ def state_report(code, label, selected, extra=""):
     return ('{ .stdout = ""; .stderr = "'+label+'"; .code = '+str(code)
             +'; .files = [{ .path = "state.json"; .state = '+selected+'; }'+extra+']; }')
 
+real_boolean_initializer = f"""%%start
+    bool(bool,i8) choose = fn(flag, entry) {{
+        core.require(entry != 3, {state_report(201,"BOOL-CALLEE","entry")});
+        flag
+    }};
+    bool initialized = false;
+    bool selected = choose(initialized, 3);
+    if (selected) {{ core.require(false, {report(202,"TRUE-STARTUP-ARM")}); }}
+    else {{ core.require(false, {report(203,"FALSE-STARTUP-ARM")}); }};
+    %%end"""
+real_boolean_initializer_nullary = f"""%%start
+    bool() pick = fn {{ true }};
+    bool selected = pick();
+    if (selected) {{ core.require(false, {report(204,"NULLARY-BOOL-TRUE")}); }};
+    %%end"""
+cases.extend([
+    ("exact-startup-bool-return-initializes-false-module-value",real_boolean_initializer,201,b"BOOL-CALLEEFALSE-STARTUP-ARM"),
+    ("exact-startup-bool-return-initializes-true-module-value",real_boolean_initializer.replace("initialized = false","initialized = true"),201,b"BOOL-CALLEETRUE-STARTUP-ARM"),
+    ("exact-startup-nullary-bool-return-selects-arm",real_boolean_initializer_nullary,204,b"NULLARY-BOOL-TRUE"),
+    ("exact-startup-bool-narrow-initializer-still-unsupported",
+     real_boolean_initializer.replace("core.require(entry != 3,","core.narrow(entry != 3,"),2,b"unsupported analysis"),
+])
 real_nullary_initializer = f"""%%start
     i8() pick = fn {{
         core.require(false, {report(234,"NULLARY-CALLEE")});
@@ -1525,6 +1547,10 @@ nested_array_bytes = state_bytes({
     },
 })
 authored_files = {
+    **{name: {"state.json": b'{"type":{"kind":"i8"},"value":3}\n'} for name in (
+        "exact-startup-bool-return-initializes-false-module-value",
+        "exact-startup-bool-return-initializes-true-module-value",
+    )},
     "inline-finite-multiplication-refines-integer-root": {"state.json": b'{"type":{"kind":"i8"},"value":2}\n'},
     "finite-ordinary-multiplication-has-exact-stride": {
         "state.json": b'{"type":{"kind":"i8"},"value":{"kind":"alternatives","values":[0,3,6,9]}}\n',

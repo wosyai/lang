@@ -452,6 +452,7 @@ impl ActualIntegerObserver for ProofFreeOrderedEvidence {
     const REAL_INTEGER_TAIL_CALLS: bool = true;
     const REAL_INTEGER_INPUT_SIGNATURES: bool = true;
     const REAL_EXTENDED_SCALAR_LOCALS: bool = true;
+    const REAL_MODULE_BOOLEAN_INITIALIZERS: bool = true;
     const ORDINARY_INTEGER_LOCALS: bool = true;
 
     fn observe(&mut self, _: (usize, usize), _: &[&BigInt], _: &BigInt) {}
@@ -1096,7 +1097,10 @@ fn walk_package_initialization<const COLLECT: bool, const PRIVATE_NESTED_SCALAR:
             }
             let value = match (&receiver.ty, &binding.value) {
                 (ScalarType::Bool, ScalarExpression::Boolean { value, .. }) => InitializerValue::Boolean(*value),
-                (ty, expression) if is_integer_type(ty) => {
+                (ty, expression) if is_integer_type(ty)
+                    || (*ty == ScalarType::Bool && matches!(expression, ScalarExpression::Call { .. })
+                        && actual.real_module_boolean_initializer(ty, COLLECT)) =>
+                {
                     let value = if let Some(value) = concrete_integer_literal(expression) {
                         value
                     } else if matches!(expression, ScalarExpression::Call { .. }) {
@@ -1125,7 +1129,14 @@ fn walk_package_initialization<const COLLECT: bool, const PRIVATE_NESTED_SCALAR:
                     } else {
                         return Err(ProjectCheck::Unsupported);
                     };
-                    InitializerValue::Integer { ty, value }
+                    match ty {
+                        #[cfg(feature = "internal-checker")]
+                        ScalarType::Bool => {
+                            let lane = super::checker_flow::bool_result_lane(&value).ok_or(ProjectCheck::Unsupported)?;
+                            InitializerValue::Boolean(lane == 1)
+                        }
+                        _ => InitializerValue::Integer { ty, value },
+                    }
                 }
                 _ => return Err(ProjectCheck::Unsupported),
             };
@@ -1244,13 +1255,15 @@ fn run_initializer_call<'a, Observer: ActualIntegerObserver>(
     let check_completed_integer_namespace = false;
     let collection = collection.filter(|(source, _)|
         check_completed_integer_namespace || !is_integer_type(expected) || *source == &declaration.source);
-    let real_integer_input = actual.real_integer_input_profile(expected, collection.is_some());
-    let allow_bool = (real_integer_input || *expected == ScalarType::Unit)
+    let module_bool_initializer = actual.real_module_boolean_initializer(expected, collection.is_some());
+    if *expected == ScalarType::Bool && !module_bool_initializer { return Err(ProjectCheck::Unsupported); }
+    let real_input = module_bool_initializer || actual.real_integer_input_profile(expected, collection.is_some());
+    let allow_bool = (real_input || *expected == ScalarType::Unit)
         && collection.is_some() && Observer::ORDINARY_INTEGER_LOCALS;
-    let arguments = if real_integer_input && signature.parameters.is_empty() {
+    let arguments = if real_input && signature.parameters.is_empty() {
         ActualProjectedArguments::Single(None)
     } else if signature.parameters.len() == 2
-        && (is_integer_type(expected) || (*expected == ScalarType::Unit && collection.is_some()))
+        && (module_bool_initializer || is_integer_type(expected) || (*expected == ScalarType::Unit && collection.is_some()))
     {
         let first = exact_typed_call_argument_at(&topology.structure, occurrence, 0, allow_bool, &initialized_argument)
             .ok_or(ProjectCheck::Unsupported)?;
@@ -1266,7 +1279,7 @@ fn run_initializer_call<'a, Observer: ActualIntegerObserver>(
     };
     actual.run(
         &topology.structure, occurrence, signature, arguments, &declaration.source, declaration.range,
-        expected, collection, #[cfg(feature = "internal-checker")] proof_site,
+        expected, module_bool_initializer, collection, #[cfg(feature = "internal-checker")] proof_site,
     )
 }
 
@@ -1416,6 +1429,8 @@ trait ActualIntegerObserver {
     const REAL_INTEGER_INPUT_SIGNATURES: bool = false;
     #[cfg(feature = "internal-checker")]
     const REAL_EXTENDED_SCALAR_LOCALS: bool = false;
+    #[cfg(feature = "internal-checker")]
+    const REAL_MODULE_BOOLEAN_INITIALIZERS: bool = false;
     const INTEGER_RETURN_PARTITIONS: bool = false;
     const PROJECTED_FORMAL_WRITES: bool = false;
     const ORDINARY_PROJECTED_PAIR: bool = false;
@@ -1536,7 +1551,7 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             NestedIntegerArgument::Projected(projection) => ActualProjectedArguments::SymbolicAxis(projection),
         };
         self.run(
-            &caller.structure, call, signature, projected, source, *declaration_span, expected, collection,
+            &caller.structure, call, signature, projected, source, *declaration_span, expected, false, collection,
             #[cfg(feature = "internal-checker")] proof_site,
         )
     }
@@ -1626,6 +1641,15 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             IntegerRequirementContinuation::Empty => ActualCallResult::EmptyUnit,
             IntegerRequirementContinuation::Projected(values) => ActualCallResult::ProjectedUnit(values),
         })
+    }
+
+    fn real_module_boolean_initializer(&self, expected: &ScalarType, collecting: bool) -> bool {
+        #[cfg(feature = "internal-checker")]
+        { ACTUAL_STARTUP && collecting && *expected == ScalarType::Bool
+            && Observer::REAL_MODULE_BOOLEAN_INITIALIZERS && Observer::ORDINARY_INTEGER_LOCALS
+            && Observer::EXACT_INTEGER_CALL_CONTINUATIONS }
+        #[cfg(not(feature = "internal-checker"))]
+        { let _ = (expected, collecting); false }
     }
 
     fn real_integer_input_profile(&self, expected: &ScalarType, collecting: bool) -> bool {
@@ -2061,6 +2085,7 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
         target_source: &SourceIdentity,
         target_span: ByteSpan,
         expected: &ScalarType,
+        module_bool_initializer: bool,
         collection: Option<(&SourceIdentity, OrderedCallCollection<'_, '_>)>,
         #[cfg(feature = "internal-checker")] proof_site: Option<InitializerProofSite<'_>>,
     ) -> Result<ActualCallResult, ProjectCheck> {
@@ -2135,7 +2160,7 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             }
             ([first, second], [first_slot, second_slot],
                 ActualProjectedArguments::ExactPair((first_ty, first_value), (second_ty, second_value)))
-                if (is_integer_type(expected) || (*expected == ScalarType::Unit && collection.is_some()))
+                if (module_bool_initializer || is_integer_type(expected) || (*expected == ScalarType::Unit && collection.is_some()))
                     && *first == first_slot.ty && first == first_ty
                     && *second == second_slot.ty && second == second_ty =>
             {
@@ -2168,7 +2193,7 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                 })
             }
         } else if (ACTUAL_STARTUP && Observer::EXACT_INTEGER_CALL_CONTINUATIONS && collection.is_some()
-            && (!body.call_occurrences.is_empty() || {
+            && (module_bool_initializer || !body.call_occurrences.is_empty() || {
                 #[cfg(feature = "internal-checker")]
                 { Observer::ORDINARY_INTEGER_LOCALS && body.structure.has_ordinary_integer_operations() }
                 #[cfg(not(feature = "internal-checker"))]
@@ -2282,13 +2307,7 @@ fn supported_integer_continuation_shape_for(body: &FunctionCallSites, expected: 
         && body.allocation_length_calls.is_empty()
         && (body.structure.has_ordinary_predicates() || *expected == ScalarType::Bool)
     {
-        return body.structure.checker_directives.iter().all(|(occurrence, directive)| {
-            directive.operation == CheckerOperation::Require
-                && (matches!(directive.predicate, Some(CheckerPredicate::Boolean(_) | CheckerPredicate::Integer(_)))
-                    || body.structure.checker_ordinary_integer_comparisons.contains_key(occurrence)
-                    || body.structure.checker_ordinary_booleans.contains_key(occurrence)
-                    || body.structure.checker_ordinary_directive_calls.contains_key(occurrence))
-        });
+        return !body.structure.checker_has_unsupported_ordinary_require;
     }
     #[cfg(not(feature = "internal-checker"))]
     let _ = ordinary;
@@ -15305,6 +15324,32 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
                     let three = BigInt::from(3);
                     assert!(receipt.directives[0].witness.intervals_at(0, 1).unwrap().eq([(&three, &three)]));
                 }
+            }
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn real_boolean_initializer_runs_actual_callee_then_only_selected_startup_arm() {
+        let code = |value| OUTPUT.replace(".code = 1", &format!(".code = {value}"));
+        let program = format!(r#"%%start
+            bool(bool,i8) choose = fn(flag, entry) {{
+                core.require(entry != 3, {});
+                flag
+            }};
+            bool initialized = false;
+            bool selected = choose(initialized, 3);
+            if (selected) {{ core.require(false, {}); }}
+            else {{ core.require(false, {}); }};
+        %%end"#, code(112), code(113), code(114));
+        let app = source("src/main.w", "real-module-boolean-initializer");
+        for scope in [ScalarCheckerScope::MainFlowOnly, ScalarCheckerScope::CurrentPackage] {
+            for (input, expected) in [("false", 114), ("true", 113)] {
+                let text = program.replace("bool initialized = false;", &format!("bool initialized = {input};"));
+                let prepared = prepare_proof_target(&app, &text).unwrap();
+                let receipt = run_closed_without_named_proofs(&prepared, scope, 1).unwrap();
+                assert!(receipt.directives.iter().map(|failure| failure.code().clone())
+                    .eq([112, expected].map(BigInt::from)));
             }
         }
     }

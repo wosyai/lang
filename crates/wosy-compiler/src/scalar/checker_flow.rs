@@ -5503,7 +5503,7 @@ enum ScalarOutputRows {
 }
 
 #[cfg(feature = "internal-checker")]
-fn bool_result_lane(value: &BigInt) -> Option<usize> {
+pub(super) fn bool_result_lane(value: &BigInt) -> Option<usize> {
     use num_bigint::Sign::{NoSign, Plus};
     match (value.sign(), value.bits()) {
         (NoSign, 0) => Some(0),

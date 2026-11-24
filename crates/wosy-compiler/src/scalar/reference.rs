@@ -6240,6 +6240,8 @@ pub(super) struct OccurrenceStructure {
     pub(super) checker_has_simple_narrow: bool,
     #[cfg(feature = "internal-checker")]
     pub(super) checker_has_nonsimple_directive: bool,
+    #[cfg(feature = "internal-checker")]
+    pub(super) checker_has_unsupported_ordinary_require: bool,
     #[cfg(any(test, feature = "internal-checker"))]
     pub(super) checker_branches: HashMap<OccurrenceOrdinal, super::checker_flow::CheckerPredicate>,
     #[cfg(any(test, feature = "internal-checker"))]
@@ -6329,6 +6331,8 @@ impl OccurrenceStructure {
             checker_has_simple_narrow: false,
             #[cfg(feature = "internal-checker")]
             checker_has_nonsimple_directive: false,
+            #[cfg(feature = "internal-checker")]
+            checker_has_unsupported_ordinary_require: false,
             #[cfg(any(test, feature = "internal-checker"))]
             checker_branches: HashMap::new(),
             #[cfg(any(test, feature = "internal-checker"))]
@@ -7421,26 +7425,38 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
                 (self.checked_callable_directive_predicate(condition, names), None)
             };
             #[cfg(feature = "internal-checker")]
-            {
+            let ordinary_predicate = {
                 use super::{checker_directive::CheckerOperation, checker_flow::CheckerPredicate};
-                if predicate.is_none() {
+                let ordinary = if predicate.is_none() {
                     if let Some(compound) = self.ordinary_compound(condition, names, None) {
                         self.structure.checker_ordinary_booleans.insert(ordinal, compound);
+                        true
                     } else if let Some(comparison) = self.ordinary_integer_comparison(condition, names, None) {
                         self.structure.checker_ordinary_integer_comparisons.insert(ordinal, comparison);
+                        true
+                    } else {
+                        false
                     }
-                }
+                } else {
+                    false
+                };
                 let simple = matches!(predicate, Some(CheckerPredicate::Boolean(_) | CheckerPredicate::Integer(_)));
                 self.structure.checker_has_simple_narrow |= marker.operation == CheckerOperation::Narrow && simple;
                 self.structure.checker_has_nonsimple_directive |= !simple;
                 self.structure.checker_has_nonexact_require |= marker.operation != CheckerOperation::Require || !simple;
-            }
+                simple || ordinary
+            };
             let call_signature = self.occurrence_typing.take_call(condition);
             #[cfg(feature = "internal-checker")]
-            if let Some(receipt) = call_signature.as_ref()
-                .and_then(|signature| self.ordinary_directive_call(condition, names, types, signature))
             {
-                self.structure.checker_ordinary_directive_calls.insert(ordinal, receipt);
+                let ordinary_call = call_signature.as_ref()
+                    .and_then(|signature| self.ordinary_directive_call(condition, names, types, signature));
+                self.structure.checker_has_unsupported_ordinary_require |=
+                    marker.operation != super::checker_directive::CheckerOperation::Require
+                        || (!ordinary_predicate && ordinary_call.is_none());
+                if let Some(receipt) = ordinary_call {
+                    self.structure.checker_ordinary_directive_calls.insert(ordinal, receipt);
+                }
             }
             #[allow(unused_mut)]
             let mut output = marker.output;
