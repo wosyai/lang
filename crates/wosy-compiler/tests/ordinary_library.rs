@@ -1372,6 +1372,98 @@ fn local_callable_replacement_selects_only_proved_ordinary_scalar_targets() {
 }
 
 #[test]
+fn checked_scalar_reader_keeps_received_owner_live() {
+    let app = source("workbench", "src/receipt_field_reader.w");
+    let text = include_str!("fixtures/receipt-field-reader.w");
+    for (target, target_layout) in [("native64", ScalarTargetLayout::NATIVE64), ("wasm32", ScalarTargetLayout::WASM32)] {
+        for project in [false, true] {
+            let emit = |text: &str| {
+                let prepared = prepare_scalar_project(vec![(declarations(&app, text), vec![])],
+                    vec![app.clone()], ScalarPreparationInputs { target_layout }).unwrap();
+                let build = analyze_scalar_build(&prepared);
+                assert!(build.diagnostics().is_empty(), "{target}: {:?}", build.diagnostics());
+                if project { emit_scalar_build_project_llvm(&build) }
+                else { wosy_compiler::emit_scalar_build_single_module_llvm(&build) }
+                    .map(|module| module.to_text())
+            };
+            let ir = emit(text).unwrap_or_else(|error| panic!("{target}/{project}: {error}"));
+            let context = Context::create();
+            let module = context.create_module_from_ir(MemoryBuffer::create_from_memory_range_copy(ir.as_bytes(), target)).unwrap();
+            module.verify().unwrap();
+            let symbol = |name: &str| if project { function_with_suffix(&module, name) } else { name.to_owned() };
+            let drive = module.get_function(&symbol("drive")).unwrap();
+            let mut seen = Vec::new();
+            let mut owner = None;
+            for row in drive.get_basic_blocks().into_iter().flat_map(|b| b.get_instructions()) {
+                if row.get_opcode() != InstructionOpcode::Call { continue; }
+                let call = CallSiteValue::try_from(row).unwrap();
+                let Some(callee) = call.get_called_fn_value() else { continue };
+                let name = callee.get_name().to_str().unwrap();
+                if name == symbol("make_packet") {
+                    owner = call.try_as_basic_value().basic();
+                    seen.push("allocate");
+                } else if name == symbol("read_length") {
+                    assert_eq!(call.count_arguments(), 1);
+                    seen.push("read");
+                } else if name == "__wosy_core_free" {
+                    assert!(owner.is_some());
+                    assert_eq!(row.get_operand(0).unwrap().value(), owner);
+                    seen.push("release");
+                }
+            }
+            assert_eq!(seen, ["allocate", "read", "release"], "{target}/{project}: {ir}");
+            if let Some(out) = std::env::var_os("WOSY_RECEIPT_FIELD_IR_DIR") {
+                let out = std::path::PathBuf::from(out).join(if project { "project" } else { "single" });
+                std::fs::create_dir_all(&out).unwrap();
+                let mut witness = ir.replace("@main(", "@wosy_authored_main(");
+                witness.push_str(&format!("\ndefine i64 @wosy_field_witness() {{\nentry:\n  %v = call i64 @{}()\n  ret i64 %v\n}}\n", symbol("field_witness")));
+                std::fs::write(out.join(format!("{target}.ll")), witness).unwrap();
+            }
+            for width in [8, 64] {
+                let unrelated: String = (0..width).map(|i| format!("    Packet other_{i} = make_packet(length);\n")).collect();
+                let reads: String = (0..width).map(|i| format!("    total = total + other_{i}.length;\n")).collect();
+                let wide = text.replace("    *u64 view = &packet.length;\n    read_length(view)", &format!(
+                    "{unrelated}    *u64 view = &packet.length;\n    u64 total = read_length(view);\n    *Packet whole = &packet;\n    total = total + (*whole).length;\n{reads}    total"));
+                assert_ne!(wide, text);
+                let wide = emit(&wide).unwrap_or_else(|error| panic!("{target}/{project}/{width}: {error}"));
+                let verified = context.create_module_from_ir(MemoryBuffer::create_from_memory_range_copy(wide.as_bytes(), target)).unwrap();
+                verified.verify().unwrap();
+                let drive = verified.get_function(&symbol("drive")).unwrap();
+                let (mut owned, mut released) = (Vec::new(), Vec::new());
+                let mut called = false;
+                let mut post_call_loads = 0;
+                for row in drive.get_basic_blocks().into_iter().flat_map(|b| b.get_instructions()) {
+                    if called && released.is_empty() && row.get_opcode() == InstructionOpcode::Load {
+                        post_call_loads += 1;
+                    }
+                    if row.get_opcode() != InstructionOpcode::Call { continue; }
+                    let call = CallSiteValue::try_from(row).unwrap();
+                    let Some(callee) = call.get_called_fn_value() else { continue };
+                    let name = callee.get_name().to_str().unwrap();
+                    if name == symbol("make_packet") {
+                        assert!(!called);
+                        owned.push(call.try_as_basic_value().basic().unwrap());
+                    } else if name == symbol("read_length") {
+                        assert!(!called);
+                        called = true;
+                    } else if name == "__wosy_core_free" {
+                        assert!(called);
+                        released.push(row.get_operand(0).unwrap().value().unwrap());
+                    }
+                }
+                assert_eq!(owned.len(), width + 1);
+                assert!(post_call_loads > width, "{target}/{project}/{width}: missing field observations after reader");
+                owned.reverse();
+                assert_eq!(released, owned, "{target}/{project}/{width}: released wrong backing");
+            }
+            let uncertified = text.replace("{ *view + 1 }", "{ u64 observed = *view; observed + 1 }");
+            assert!(emit(&uncertified).expect_err("signature alone cannot certify a checked reader")
+                .contains("aggregate owning receipt has an unproved checked loan"));
+        }
+    }
+}
+
+#[test]
 fn local_checked_reader_preserves_the_selected_loan_through_recursion() {
     let app = source("workbench", "src/local_checked_reader.w");
     let text = include_str!("fixtures/local-checked-reader.w");

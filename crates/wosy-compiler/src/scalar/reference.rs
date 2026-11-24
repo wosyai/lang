@@ -2026,8 +2026,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         | ResolvedCallTarget::CallableField { .. }, ..
                 }) && matches!(signature.and_then(|signature| signature.outputs.outputs.first()),
                     Some(ScalarOutput { ty: ScalarType::CheckedReference { .. }, .. }));
-                let read_effect_argument = if self.joined_local_reborrow
-                    && !calls.declared_unsafe_calls.contains(&ordinal.0)
+                let read_effect_argument = if !calls.declared_unsafe_calls.contains(&ordinal.0)
                 {
                     (|| {
                         let CfgPointKind::Call { target, argument_points, .. } = &call else { return None };
@@ -2052,7 +2051,10 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 } else { None };
                 let id = self.point_with_origins(call, span, scope, cast_origins.clone());
                 if let Some(argument) = read_effect_argument {
-                    self.proof_points.shared_scalar_read_calls.push((id, argument));
+                    self.aggregate_facts.receipt_loan_read_calls.insert(id, argument);
+                    if self.joined_local_reborrow {
+                        self.proof_points.shared_scalar_read_calls.push((id, argument));
+                    }
                 }
                 if checked_call_output {
                     self.proof_points.resolved_checked_call_outputs.push(id);
@@ -7994,7 +7996,7 @@ fn transfer_reference_facts(
                 if let (Some((facts, mode, sites, result)), Some(flow)) =
                     (&mut aggregate, &mut state.aggregate)
                 {
-                    facts.visit(*mode, initial_point, flow, result, sites, aggregate_deadlines.as_deref());
+                    facts.visit(*mode, initial_point, original_points, flow, result, sites, aggregate_deadlines.as_deref());
                 }
             }
             let mut move_alternatives = Vec::new();
