@@ -13,6 +13,7 @@ enum Expected {
     LiveConflict,
     LiveSelectedFieldConflict,
     LiveNestedFieldConflict,
+    LiveJoinedProjectionConflict,
     LiveSelectedIndexConflict,
     LiveDescendantConflict,
     LiveFamilyConflict,
@@ -58,11 +59,12 @@ fn check_case(text: &str, expected: Expected, witness_dir: Option<&str>) {
                     }), "{target}/{route}: {diagnostics:?}");
                 }
                 Expected::Declined => assert!(diagnostics.iter().any(|item| item.code == "B0003"), "{target}/{route}: {diagnostics:?}"),
-                Expected::LiveConflict | Expected::LiveSelectedFieldConflict | Expected::LiveNestedFieldConflict | Expected::LiveSelectedIndexConflict | Expected::LiveDescendantConflict | Expected::LiveFamilyConflict | Expected::LiveMutableConflict | Expected::FrozenMutableConflict | Expected::LiveExclusiveConflict => {
+                Expected::LiveConflict | Expected::LiveSelectedFieldConflict | Expected::LiveNestedFieldConflict | Expected::LiveJoinedProjectionConflict | Expected::LiveSelectedIndexConflict | Expected::LiveDescendantConflict | Expected::LiveFamilyConflict | Expected::LiveMutableConflict | Expected::FrozenMutableConflict | Expected::LiveExclusiveConflict => {
                     let write = match expected {
                         Expected::FrozenMutableConflict | Expected::LiveExclusiveConflict => "*child = seen + 4",
                         Expected::LiveSelectedFieldConflict => "owner.left = 3",
                         Expected::LiveNestedFieldConflict => "owner.values[0] = 3",
+                        Expected::LiveJoinedProjectionConflict => "first.value = 3",
                         Expected::LiveSelectedIndexConflict => "bytes[0] = 3",
                         _ => "first = 3",
                     };
@@ -73,6 +75,7 @@ fn check_case(text: &str, expected: Expected, witness_dir: Option<&str>) {
                         Expected::FrozenMutableConflict | Expected::LiveExclusiveConflict => Some((1, "child".len())),
                         Expected::LiveSelectedFieldConflict => Some(("owner.".len(), "left".len())),
                         Expected::LiveNestedFieldConflict => Some(("owner.".len(), "values".len())),
+                        Expected::LiveJoinedProjectionConflict => Some(("first.".len(), "value".len())),
                         Expected::LiveSelectedIndexConflict => Some((0, "bytes".len())),
                         _ => None,
                     };
@@ -83,6 +86,7 @@ fn check_case(text: &str, expected: Expected, witness_dir: Option<&str>) {
                         Expected::LiveMutableConflict => "&!(*parent)",
                         Expected::FrozenMutableConflict => "&(*child)",
                         Expected::LiveExclusiveConflict => "&!(*child)",
+                        Expected::LiveJoinedProjectionConflict => "&(*parent).value",
                         _ => "&(*parent)",
                     };
                     let child = text.find(loan).expect("child reborrow") as u32;
@@ -280,6 +284,23 @@ if (inspect(true) != 7 || inspect(false) != 9) { core.system_panic(); };
         "first = 3;\n    u8 seen = *child;\n    u8 side_value = *side;");
     assert_ne!(live, program);
     check(&live, Expected::LiveConflict);
+}
+
+#[test]
+fn joined_struct_parent_reborrows_one_exact_scalar_field() {
+    let program = joined("parent = &!second;", true, "", "first.value = 3;")
+        .replace("%%start\n", "%%start\nstruct copy Pair { u8 value; u8 other; }\n")
+        .replace("u8 first = 7;\n    u8 second = 9;",
+            "Pair first = { .value = 7; .other = 1; }; Pair second = { .value = 9; .other = 2; };")
+        .replace("*!u8 parent = null;", "*!Pair parent = null;")
+        .replace("&(*parent)", "&(*parent).value")
+        .replace("    seen\n", "    if (first.value == 3 && second.value == 9) { seen } else { 0 }\n");
+    check_case(&program, Expected::Valid, Some("WOSY_JOINED_STRUCT_PROJECTION_IR_DIR"));
+
+    let live = program.replace("u8 seen = *child;\n    first.value = 3;",
+        "first.value = 3;\n    u8 seen = *child;");
+    assert_ne!(live, program);
+    check(&live, Expected::LiveJoinedProjectionConflict);
 }
 
 #[test]

@@ -2677,13 +2677,32 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             } else {
                                 None
                             };
+                            let joined_source = self.binding_types.get(&binding).is_some_and(|ty| {
+                                let ScalarType::CheckedReference { mutability: parent_mode, inner } = ty else { return false };
+                                if Some(*parent_mode) != joined_mode { return false; }
+                                if matches!(place, ScalarPlace::Dereference { .. }) {
+                                    return aggregate::ordinary_value(inner);
+                                }
+                                if self.has_joined_root_reborrow || *mutability != ScalarReferenceMutability::Shared
+                                    || !matches!(direct_checked_field_base(place),
+                                        Some((written, ScalarFieldReference::Resolved(field)))
+                                            if written == pointer.as_ref()
+                                                && matches!(inner.as_ref(), ScalarType::Struct(id) if id == &field.structure))
+                                {
+                                    return false;
+                                }
+                                let Some(field_type) = self.call_sites.structure.checked_types.places.get(&place_ordinal)
+                                    .filter(|ty| aggregate::ordinary_value(ty)) else { return false; };
+                                matches!(self.call_sites.prepared_plain_name(pointer_ordinal),
+                                    Some(PlainNameIdentity::Lexical(expected)) if expected == &binding)
+                                    && self.call_sites.structure.checked_types.expressions.get(&pointer_ordinal) == Some(ty)
+                                    && matches!(self.call_sites.structure.checked_types.expressions.get(&ordinal),
+                                        Some(ScalarType::CheckedReference { mutability: ScalarReferenceMutability::Shared, inner })
+                                            if inner.as_ref() == field_type)
+                            });
                             if (*mutability == ScalarReferenceMutability::Shared || !self.has_joined_root_reborrow
                                 || self.joined_mutable_child.as_ref() == Some(&binding))
-                                && matches!(place, ScalarPlace::Dereference { .. })
-                                && matches!(self.binding_types.get(&binding),
-                                    Some(ScalarType::CheckedReference { mutability, inner })
-                                        if Some(*mutability) == joined_mode && aggregate::ordinary_value(inner))
-                                && self.joined_local_reborrow
+                                && joined_source && self.joined_local_reborrow
                                 && matches!(binding.kind, ReferenceBindingKind::Declared)
                                 && *self.joined_reborrow_call_admission.get_or_insert_with(|| {
                                     joined_reborrow_calls_are_supported(
@@ -7100,10 +7119,17 @@ fn joined_root_reborrow_binding<'a>(
     grouped_installs: &BTreeSet<CfgPointId>,
     exposures: &[(CfgPointId, Option<ReferenceBindingId>)],
 ) -> Option<JoinedReborrowShape<'a>> {
-    let CfgPointKind::ReborrowThrough { mode, place: ScalarPlace::Dereference { pointer, .. }, pointer_point } =
-        &point.kind else { return None };
+    let CfgPointKind::ReborrowThrough { mode, place, pointer_point } = &point.kind else { return None };
+    let pointer = match place {
+        ScalarPlace::Dereference { pointer, .. } => pointer.as_ref(),
+        _ if *mode == ScalarReferenceMutability::Shared => match direct_checked_field_base(place)? {
+            (pointer, ScalarFieldReference::Resolved(_)) => pointer,
+            _ => return None,
+        },
+        _ => return None,
+    };
     let CfgPointKind::Read { binding } = &points.get(pointer_point.0)?.kind else { return None };
-    let ScalarExpression::Name { span, .. } = pointer.as_ref() else { return None };
+    let ScalarExpression::Name { span, .. } = pointer else { return None };
     if !exact_pending_reborrow_read(&points[pointer_point.0], point, binding)
         || points[pointer_point.0].source_span.range != *span
         || point.scope != ReferenceScopeId(0) || !exposures.is_empty()
