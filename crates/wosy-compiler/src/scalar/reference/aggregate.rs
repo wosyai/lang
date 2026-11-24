@@ -2428,12 +2428,14 @@ pub(crate) enum ClosedReturn {
     Allocation { block: usize, item: usize },
     Forward { call: OccurrenceOrdinal },
     Recommit { call: usize, output: usize },
+    Structured { output: usize },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ClosedCall {
     Receive,
     Forward,
+    ResultArm,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2627,6 +2629,12 @@ impl InstalledAggregateFacts {
     }
 }
 
+struct StructuredOwnerReturn {
+    output: OccurrenceOrdinal,
+    leaves: BTreeSet<CfgPointId>,
+    complete: bool,
+}
+
 struct Body<'a> {
     facts: Option<&'a AggregateFlowResult>,
     cfg: &'a ScalarReferenceCfg,
@@ -2645,6 +2653,42 @@ impl Body<'_> {
 
     fn has_mixed_struct_result(&self) -> bool {
         self.mixed_result_lanes().is_some()
+    }
+
+    fn structured_owner_return(&self) -> Option<StructuredOwnerReturn> {
+        let facts = self.facts?;
+        let [ty] = self.sites.boundary.root_outputs.as_slice() else { return None };
+        if !matches!(ty.ty, ScalarType::Struct(_)) { return None; }
+        let structure = &self.sites.structure;
+        let output_at = |block: BlockOrdinal| {
+            let mut outputs = structure.blocks[block.0].final_outputs();
+            let output = outputs.next()?;
+            (output.output == 0 && outputs.next().is_none()).then_some(output.expression)
+        };
+        let output = output_at(structure.root)?;
+        if !matches!(self.sites.conditionals.get(&output), Some(ConditionalRegion::Value { .. })) {
+            return None;
+        }
+        let mut result = StructuredOwnerReturn { output, leaves: BTreeSet::new(), complete: true };
+        let calls: BTreeMap<_, _> = facts.calls.iter().map(|(&point, &ordinal)| (ordinal.0, point)).collect();
+        let mut pending = vec![(output, 0)];
+        while let Some((expression, depth)) = pending.pop() {
+            if depth > MAX_RECEIPT_FORK_DEPTH { result.complete = false; }
+            if let Some(ConditionalRegion::Value { then_block, else_block, .. }) = self.sites.conditionals.get(&expression) {
+                for block in [*else_block, *then_block] {
+                    if let Some(child) = output_at(block) {
+                        pending.push((child, depth + 1));
+                    } else {
+                        result.complete = false;
+                    }
+                }
+            } else if let Some(&call) = calls.get(&expression.0) {
+                if !result.leaves.insert(call) { result.complete = false; }
+            } else {
+                result.complete = false;
+            }
+        }
+        Some(result)
     }
 
     fn recommitted_root_output(&self, producer: CfgPointId) -> Option<(OccurrenceOrdinal, OccurrenceOrdinal)> {
@@ -3681,6 +3725,7 @@ fn closed_aggregates<'a>(
     }
     let mut recommit_observers = BTreeMap::<(BodyKey, CfgPointId), BTreeSet<(BodyKey, usize)>>::new();
     let mut recommit_edges = BTreeMap::<(BodyKey, CfgPointId), Vec<(CfgPointId, Option<CfgPointId>)>>::new();
+    let mut structured_returns = BTreeMap::new();
     let mut recommit_returns = BTreeSet::new();
     let mut outgoing = BTreeSet::new();
     let mut pending = Vec::new();
@@ -3773,6 +3818,14 @@ fn closed_aggregates<'a>(
                     }
                 }
             }
+        }
+        if let Some(shape) = body.structured_owner_return().filter(|shape| !shape.leaves.is_empty()) {
+            for &leaf in &shape.leaves {
+                if let Some(target) = target_body(&declarations, body.cfg, leaf) {
+                    callers.entry(target).or_default().push(key);
+                }
+            }
+            structured_returns.insert(key, shape);
         }
         for source in body.return_owners().flatten() {
             match source {
@@ -4399,51 +4452,61 @@ fn closed_aggregates<'a>(
                     body.source
                 ));
             }
-            let mut values = body.return_owners();
-            let Some(Some(owner)) = values.next() else {
-                return Err(format!(
-                    "aggregate return owner is not established in {:?}",
-                    body.source
-                ));
-            };
-            let route = if values.any(|candidate| candidate != Some(owner)) {
-                if facts.mixed_branch_return.is_none() || body.return_owners().any(|owner| matches!(owner,
-                    Some(OwnerSource::Call(point)) if recommitted.contains_key(&(key, point)))) {
-                    return Err(format!("aggregate return owner has conflicting paths in {:?}", body.source));
+            let route = if let Some(shape) = structured_returns.get(&key) {
+                if !shape.complete || shape.leaves.is_empty() || shape.leaves.iter().any(|&leaf| {
+                    target_body(&declarations, body.cfg, leaf).is_none_or(|target|
+                        !outgoing.contains(&target) || bodies.get(&target).is_none_or(Body::has_mixed_struct_result))
+                }) {
+                    return Err(format!("structured aggregate return is not closed on every result path in {:?}", body.source));
                 }
-                ClosedReturn::MixedBranch
+                ClosedReturn::Structured { output: shape.output.0 }
             } else {
-                match owner {
-                    OwnerSource::Formal(_) => {
-                        return Err(format!("return of moved formal is not closed in {:?}", body.source));
+                let mut values = body.return_owners();
+                let Some(Some(owner)) = values.next() else {
+                    return Err(format!(
+                        "aggregate return owner is not established in {:?}",
+                        body.source
+                    ));
+                };
+                if values.any(|candidate| candidate != Some(owner)) {
+                    if facts.mixed_branch_return.is_none() || body.return_owners().any(|owner| matches!(owner,
+                        Some(OwnerSource::Call(point)) if recommitted.contains_key(&(key, point)))) {
+                        return Err(format!("aggregate return owner has conflicting paths in {:?}", body.source));
                     }
-                    OwnerSource::Allocation(point) => {
-                        let &(block, item) = facts.allocation_slots.get(&point).ok_or_else(|| {
-                            format!("missing aggregate allocation binding in {:?}", body.source)
-                        })?;
-                        ClosedReturn::Allocation { block, item }
-                    }
-                    OwnerSource::Call(point) if recommitted.contains_key(&(key, point)) => {
-                        let (call, output) = body.recommitted_root_output(point).ok_or_else(|| {
-                            format!("recommitted aggregate return has no exact root binding in {:?}", body.source)
-                        })?;
-                        ClosedReturn::Recommit { call: call.0, output: output.0 }
-                    }
-                    OwnerSource::Call(point) => {
-                        let target_mixed = target_body(&declarations, body.cfg, point)
-                            .and_then(|target| bodies.get(&target)).is_some_and(Body::has_mixed_struct_result);
-                        if (body.has_mixed_struct_result() || target_mixed)
-                            && !(target_mixed && body.has_mixed_struct_result() && facts.mixed_forward == Some(point))
-                        {
-                            return Err(format!("forwarding a mixed aggregate result is not closed in {:?}", body.source));
+                    ClosedReturn::MixedBranch
+                } else {
+                    match owner {
+                        OwnerSource::Formal(_) => {
+                            return Err(format!("return of moved formal is not closed in {:?}", body.source));
                         }
-                        let call = *facts.calls.get(&point).ok_or_else(|| {
-                            format!(
-                                "missing aggregate forwarding occurrence in {:?}",
-                                body.source
-                            )
-                        })?;
-                        ClosedReturn::Forward { call }
+                        OwnerSource::Allocation(point) => {
+                            let &(block, item) = facts.allocation_slots.get(&point).ok_or_else(|| {
+                                format!("missing aggregate allocation binding in {:?}", body.source)
+                            })?;
+                            ClosedReturn::Allocation { block, item }
+                        }
+                        OwnerSource::Call(point) if recommitted.contains_key(&(key, point)) => {
+                            let (call, output) = body.recommitted_root_output(point).ok_or_else(|| {
+                                format!("recommitted aggregate return has no exact root binding in {:?}", body.source)
+                            })?;
+                            ClosedReturn::Recommit { call: call.0, output: output.0 }
+                        }
+                        OwnerSource::Call(point) => {
+                            let target_mixed = target_body(&declarations, body.cfg, point)
+                                .and_then(|target| bodies.get(&target)).is_some_and(Body::has_mixed_struct_result);
+                            if (body.has_mixed_struct_result() || target_mixed)
+                                && !(target_mixed && body.has_mixed_struct_result() && facts.mixed_forward == Some(point))
+                            {
+                                return Err(format!("forwarding a mixed aggregate result is not closed in {:?}", body.source));
+                            }
+                            let call = *facts.calls.get(&point).ok_or_else(|| {
+                                format!(
+                                    "missing aggregate forwarding occurrence in {:?}",
+                                    body.source
+                                )
+                            })?;
+                            ClosedReturn::Forward { call }
+                        }
                     }
                 }
             };
@@ -4512,6 +4575,16 @@ fn closed_aggregates<'a>(
             }
             let owner = OwnerSource::Call(point);
             let mut endpoints = call_endpoints.get(&point).into_iter().flatten().copied();
+            if matches!(return_route, Some(ClosedReturn::Structured { .. }))
+                && structured_returns[&key].leaves.contains(&point)
+            {
+                if previous.is_some() || discharged_by_inputs.contains_key(&(key, point)) || endpoints.next().is_some() {
+                    return Err(format!("structured aggregate result has competing owner routes in {:?}", body.source));
+                }
+                plan.calls.insert(call.0, ClosedCall::ResultArm);
+                continue;
+            }
+
             if matches!(return_route, Some(ClosedReturn::Recommit { call: returned, .. }) if returned == call.0) {
                 if previous.is_none() || discharged_by_inputs.contains_key(&(key, point)) || endpoints.next().is_some() {
                     return Err(format!("recommitted aggregate return has competing ownership routes in {:?}", body.source));

@@ -94,6 +94,7 @@ pub(super) struct AggregateEmitter<'ctx, 'plan> {
     registered_allocation: Option<String>,
     mixed_return: Option<inkwell::values::StructValue<'ctx>>,
     mixed_branch_arms: u8,
+    structured_arms_visited: usize,
     failure_site: Option<ClosedLocalArrayRelease>,
     failure_allocation: Option<PendingLocalArrayRelease<'ctx>>,
     failure_arm_visited: bool,
@@ -205,6 +206,7 @@ impl<'ctx, 'plan> AggregateEmitter<'ctx, 'plan> {
             registered_allocation: None,
             mixed_return: None,
             mixed_branch_arms: 0,
+            structured_arms_visited: 0,
             failure_site,
             failure_allocation: None,
             failure_arm_visited: false,
@@ -828,6 +830,11 @@ pub(super) fn emit_initializer_binding<'ctx, 'module>(
     Ok(true)
 }
 
+pub(super) fn requires_scoped_function_emission(plan: Option<&ClosedBody>) -> bool {
+    plan.is_some_and(|plan| plan.input.is_some() || plan.ordinary_result || !plan.ordinary_calls.is_empty()
+        || matches!(plan.returning, Some(ClosedReturn::Structured { .. })))
+}
+
 pub(super) fn emit_identity_relay<'ctx>(
     builder: &inkwell::builder::Builder<'ctx>,
     definition: FunctionValue<'ctx>,
@@ -1115,7 +1122,7 @@ fn emit_selected_call<'ctx, 'module>(
                 "aggregate_destination",
             )?)
         }
-        Some(CallDestination::Body(ClosedCall::Forward)) => Some(state.aggregate.as_ref().and_then(|aggregate| aggregate.destination)
+        Some(CallDestination::Body(ClosedCall::Forward | ClosedCall::ResultArm)) => Some(state.aggregate.as_ref().and_then(|aggregate| aggregate.destination)
             .ok_or_else(|| "missing closed aggregate forwarding destination".to_owned())?),
         Some(CallDestination::Initializer(global)) => Some(global),
         None => None,
@@ -1208,6 +1215,18 @@ fn emit_selected_call<'ctx, 'module>(
         }
         return Ok(EmitValue::Unit);
     }
+    if matches!(action, Some(CallDestination::Body(ClosedCall::ResultArm))) {
+        let aggregate = state.aggregate.as_mut().expect("structured aggregate arm frame");
+        if !matches!(aggregate.plan.returning, Some(ClosedReturn::Structured { .. }))
+            || mixed.is_some() || !matches!(transport, BasicValueEnum::PointerValue(_))
+        {
+            return Err("structured aggregate result arm changed its ownership ABI".into());
+        }
+        aggregate.structured_arms_visited += 1;
+        // Only the typed final-result tree sees this SSA value. The callee
+        // has already written the ordinary descriptor at the shared destination.
+        return Ok(EmitValue::Basic(transport));
+    }
     let (base, pair) = if let Some(lanes) = mixed {
         let pair = transport.into_struct_value();
         let base = state.builder.build_extract_value(pair, lanes.owner as u32, "aggregate_base")
@@ -1221,6 +1240,7 @@ fn emit_selected_call<'ctx, 'module>(
             let aggregate = state.aggregate.as_mut().expect("closed aggregate call context");
             match action {
                 ClosedCall::Forward => aggregate.set_base(base)?,
+                ClosedCall::ResultArm => unreachable!("structured arms return their base to the result join"),
                 ClosedCall::Receive => {
                     if aggregate.receipts.insert(ordinal, base).is_some() {
                         return Err("duplicate closed aggregate receipt".into());
@@ -1450,6 +1470,23 @@ pub(super) fn commit_return<'ctx>(
         aggregate.mixed_return = Some(*value);
         return Ok(());
     }
+    if let Some(ClosedReturn::Structured { output }) = aggregate.plan.returning {
+        let root = block.final_expressions().next().and_then(|(expression, _)|
+            state.body_call_nodes.and_then(|nodes| nodes.expression_ordinal(expression)));
+        let EmitValue::Basic(BasicValueEnum::PointerValue(base)) = result else {
+            return Err("structured aggregate result has no joined backing value".into());
+        };
+        if root != Some(output) || aggregate.committed
+            || aggregate.structured_arms_visited != aggregate.plan.calls.values()
+                .filter(|&&action| action == ClosedCall::ResultArm).count()
+            || !matches!(outputs.outputs.as_slice(), [result] if matches!(result.ty, ScalarType::Struct(_)))
+        {
+            return Err("structured aggregate result changed its proved output tree".into());
+        }
+        aggregate.set_base(*base)?;
+        aggregate.committed = true;
+        return Ok(());
+    }
     if let Some(ClosedReturn::Recommit { call, output }) = aggregate.plan.returning {
         let returned = block.final_expressions().next().and_then(|(expression, _)|
             state.body_call_nodes.and_then(|nodes| nodes.expression_ordinal(expression)));
@@ -1542,7 +1579,7 @@ pub(super) fn finish_return<'ctx>(
     let Some(route) = aggregate.plan.returning else {
         return Ok(None);
     };
-    if matches!(route, ClosedReturn::Allocation { .. } | ClosedReturn::Recommit { .. }) && !aggregate.committed {
+    if matches!(route, ClosedReturn::Allocation { .. } | ClosedReturn::Recommit { .. } | ClosedReturn::Structured { .. }) && !aggregate.committed {
         return Err("closed aggregate return did not commit ownership before cleanup".into());
     }
     if let Some(pair) = aggregate.mixed_return.take() {

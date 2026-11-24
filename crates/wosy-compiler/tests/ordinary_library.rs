@@ -914,6 +914,83 @@ fn recommitted_wrapper_return_preserves_one_base_across_two_owning_returns() {
 }
 
 #[test]
+fn structured_owner_factory_joins_grounded_recursive_results_in_caller_storage() {
+    let app = source("workbench", "src/structured_owner_factory.w");
+    let text = include_str!("fixtures/structured-owner-factory.w");
+    for (target, target_layout) in [
+        ("native64", ScalarTargetLayout::NATIVE64),
+        ("wasm32", ScalarTargetLayout::WASM32),
+    ] {
+        let emit = |text: &str| {
+            let prepared = prepare_scalar_project(
+                vec![(declarations(&app, text), Vec::new())], vec![app.clone()],
+                ScalarPreparationInputs { target_layout },
+            ).unwrap_or_else(|error| panic!("{target}: {:?}", error.diagnostics));
+            let build = analyze_scalar_build(&prepared);
+            assert!(build.diagnostics().is_empty(), "{target}: {:?}", build.diagnostics());
+            emit_scalar_build_project_llvm(&build).map(|module| module.to_text())
+        };
+        let ir = emit(text).unwrap_or_else(|error| panic!("{target}: {error}"));
+        let context = Context::create();
+        let buffer = MemoryBuffer::create_from_memory_range_copy(ir.as_bytes(), target);
+        let module = context.create_module_from_ir(buffer).unwrap();
+        module.verify().unwrap();
+
+        let find = |name| module.get_function(&function_with_suffix(&module, name)).unwrap();
+        let (factory, make, alternate) = (find("factory"), find("make_packet"), find("make_alt"));
+        let free = module.get_function("__wosy_core_free").unwrap();
+        assert_eq!(factory.count_params(), 4, "{target}: {ir}");
+        let dest = factory.get_last_param().unwrap();
+        let mut arms = Vec::new();
+        let mut frame = None;
+        let mut released = None;
+        let mut result_phis = 0;
+        for row in factory.get_basic_blocks().into_iter().flat_map(|block| block.get_instructions()) {
+            if row.get_opcode() == InstructionOpcode::Phi && row.to_string().contains(" = phi ptr ") {
+                result_phis += 1;
+            }
+            if row.get_opcode() != InstructionOpcode::Call { continue; }
+            let call = CallSiteValue::try_from(row).unwrap();
+            let argument = |slot| row.get_operand(slot).unwrap().value().unwrap();
+            match call.get_called_fn_value() {
+                Some(callee) if [factory, make, alternate].contains(&callee) => {
+                    if argument(call.count_arguments() - 1) == dest {
+                        arms.push(callee);
+                    } else {
+                        assert_eq!(callee, make, "{target}: {ir}");
+                        assert!(frame.replace(call.try_as_basic_value().basic().unwrap()).is_none());
+                    }
+                }
+                Some(callee) if callee == free => assert!(released.replace(argument(0)).is_none()),
+                _ => {}
+            }
+        }
+        assert_eq!(arms.len(), 3, "{target}: {ir}");
+        assert!([factory, make, alternate].into_iter().all(|callee| arms.contains(&callee)));
+        assert_eq!(result_phis, 2, "{target}: {ir}");
+        assert!(frame.is_some());
+        assert_eq!(frame, released, "{target}: {ir}");
+
+        if let Some(out) = std::env::var_os("WOSY_STRUCTURED_FACTORY_IR_DIR") {
+            let mut witness = ir.replace("@main(", "@wosy_authored_main(");
+            for name in ["case_zero", "case_two", "case_three"] {
+                let symbol = function_with_suffix(&module, name);
+                witness.push_str(&format!(
+                    "\ndefine i64 @wosy_{name}() {{\nentry:\n  %result = call i64 @{symbol}()\n  ret i64 %result\n}}\n"
+                ));
+            }
+            std::fs::write(std::path::PathBuf::from(out).join(format!("{target}.ll")), witness).unwrap();
+        }
+
+        let ungrounded = text.replace("Packet(u64, u64, bool) factory",
+            "Packet(u64) no_seed = fn(length) { no_seed(length) };\nPacket(u64, u64, bool) factory")
+            .replace("else { make_alt(length) }", "else { no_seed(length) }");
+        let error = emit(&ungrounded).expect_err("an ungrounded leaf cannot discharge a total owner result");
+        assert!(error.contains("structured aggregate return is not closed on every result path"), "{target}: {error}");
+    }
+}
+
+#[test]
 fn runtime_array_recommit_keeps_the_owner_until_its_real_end() {
     let recursive = r#"
 (u8[], u64)(u8[], u64, u64) carry = fn(bytes, depth, count) {

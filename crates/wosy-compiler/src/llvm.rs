@@ -2127,7 +2127,7 @@ fn emit_function<'ctx, 'module>(
         ScalarType::Callable { outputs, .. } => outputs,
         _ => return Err("function has no callable signature".into()),
     };
-    if state.guarded_scalar.is_none() && !aggregate_plan.is_some_and(|plan| plan.input.is_some() || plan.ordinary_result || !plan.ordinary_calls.is_empty()) && self_tail::eligible(context, &state, value, function, reference_cfg) {
+    if state.guarded_scalar.is_none() && !aggregate_transfer::requires_scoped_function_emission(aggregate_plan) && self_tail::eligible(context, &state, value, function, reference_cfg) {
         return self_tail::emit(context, &mut state, value, function, None);
     }
     let single_output = if function.body.items.len() == 1 {
@@ -2137,7 +2137,7 @@ fn emit_function<'ctx, 'module>(
     };
     let result = match single_output {
         Some((expression, _))
-            if !aggregate_plan.is_some_and(|plan| plan.input.is_some() || plan.ordinary_result || !plan.ordinary_calls.is_empty()) && canonical_tail_if(&function.body, BlockEmission::Return(outputs)).is_none() =>
+            if !aggregate_transfer::requires_scoped_function_emission(aggregate_plan) && canonical_tail_if(&function.body, BlockEmission::Return(outputs)).is_none() =>
         {
             if outputs.outputs.len() == 1 {
                 emit_typed_expression(context, &mut state, expression, &outputs.outputs[0].ty)?
@@ -2450,7 +2450,7 @@ fn emit_project_function<'ctx, 'module>(
         ScalarType::Callable { outputs, .. } => outputs,
         _ => return Err("function has no callable signature".into()),
     };
-    if state.guarded_scalar.is_none() && !aggregate_plan.is_some_and(|plan| plan.input.is_some() || plan.ordinary_result || !plan.ordinary_calls.is_empty()) && self_tail::eligible(context, &state, value, function, reference_cfg) {
+    if state.guarded_scalar.is_none() && !aggregate_transfer::requires_scoped_function_emission(aggregate_plan) && self_tail::eligible(context, &state, value, function, reference_cfg) {
         return self_tail::emit(
             context,
             &mut state,
@@ -2469,7 +2469,7 @@ fn emit_project_function<'ctx, 'module>(
     };
     let result = match single_output {
         Some((expression, _))
-            if !aggregate_plan.is_some_and(|plan| plan.input.is_some() || plan.ordinary_result || !plan.ordinary_calls.is_empty()) && canonical_tail_if(&function.body, BlockEmission::Return(outputs)).is_none() =>
+            if !aggregate_transfer::requires_scoped_function_emission(aggregate_plan) && canonical_tail_if(&function.body, BlockEmission::Return(outputs)).is_none() =>
         {
             if outputs.outputs.len() == 1 {
                 emit_project_typed_expression(
