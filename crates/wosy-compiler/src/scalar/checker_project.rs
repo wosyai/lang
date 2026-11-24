@@ -446,7 +446,7 @@ impl ActualIntegerObserver for ProofFreeOrderedEvidence {
     const EXACT_INTEGER_CALL_CONTINUATIONS: bool = true;
     const EXACT_INTEGER_NARROW_CONTINUATIONS: bool = true;
     const EXACT_INTEGER_LOCAL_WRITES: bool = true;
-    const EXACT_COMPLETED_NAMESPACE_INTEGER_RETURNS: bool = true;
+    const EXACT_COMPLETED_NAMESPACE_SCALAR_RETURNS: bool = true;
     const EXACT_CONTEXTUAL_BOOLEAN_UNIT: bool = true;
     const AUTHORED_SINGLETON_CODE: bool = true;
     const REAL_INTEGER_TAIL_CALLS: bool = true;
@@ -1425,11 +1425,11 @@ fn run_initializer_call<'a, Observer: ActualIntegerObserver>(
     };
     let signature = topology.checked_call_signatures.get(&occurrence).ok_or(ProjectCheck::MissingRootOccurrences)?;
     #[cfg(feature = "internal-checker")]
-    let check_completed_integer_namespace = Observer::EXACT_COMPLETED_NAMESPACE_INTEGER_RETURNS;
+    let check_completed_scalar_namespace = Observer::EXACT_COMPLETED_NAMESPACE_SCALAR_RETURNS;
     #[cfg(not(feature = "internal-checker"))]
-    let check_completed_integer_namespace = false;
+    let check_completed_scalar_namespace = false;
     let collection = collection.filter(|(source, _)|
-        check_completed_integer_namespace || !is_integer_type(expected) || *source == &declaration.source);
+        check_completed_scalar_namespace || !is_integer_type(expected) || *source == &declaration.source);
     let module_bool_initializer = actual.real_module_boolean_initializer(expected, collection.is_some());
     if *expected == ScalarType::Bool && !module_bool_initializer { return Err(ProjectCheck::Unsupported); }
     let real_input = module_bool_initializer || actual.real_integer_input_profile(expected, collection.is_some());
@@ -1612,7 +1612,7 @@ trait ActualIntegerObserver {
     #[cfg(feature = "internal-checker")]
     const EXACT_INTEGER_LOCAL_WRITES: bool = false;
     #[cfg(feature = "internal-checker")]
-    const EXACT_COMPLETED_NAMESPACE_INTEGER_RETURNS: bool = false;
+    const EXACT_COMPLETED_NAMESPACE_SCALAR_RETURNS: bool = false;
     #[cfg(feature = "internal-checker")]
     const EXACT_CONTEXTUAL_BOOLEAN_UNIT: bool = false;
     #[cfg(feature = "internal-checker")]
@@ -1949,14 +1949,26 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
         if *expected == ScalarType::Unit { return true; }
         #[cfg(feature = "internal-checker")]
         {
-            // Only a real exact, proof-free startup call may cross into a
-            // completed sibling module for an integer result.
-            ACTUAL_STARTUP && Observer::EXACT_COMPLETED_NAMESPACE_INTEGER_RETURNS
-                && Observer::EXACT_INTEGER_CALL_CONTINUATIONS && is_integer_type(expected)
-                && matches!(signature.parameters.as_slice(), [parameter] if is_integer_type(parameter))
+            // Only a real exact, proof-free startup call may cross into
+            // a completed sibling module for a scalar result. The admitted
+            // leaf stays closed to contextual effects and helper calls.
+            let scalar_leaf = if *expected == ScalarType::Bool {
+                self.real_module_boolean_initializer(expected, true)
+                    && matches!(signature.parameters.as_slice(), [parameter]
+                        if *parameter == ScalarType::Bool || is_integer_type(parameter))
+                    && !body.structure.checker_has_unsupported_boolean_narrow_body
+                    && body.structure.checker_ordinary_directive_calls.is_empty()
+                    && !body.structure.has_ordinary_contextual_places()
+                    && !body.structure.checker_has_bool_contextual_declaration
+            } else {
+                is_integer_type(expected)
+                    && matches!(signature.parameters.as_slice(), [parameter] if is_integer_type(parameter))
+                    && !body.structure.checker_has_nonsimple_directive
+            };
+            ACTUAL_STARTUP && Observer::EXACT_COMPLETED_NAMESPACE_SCALAR_RETURNS
+                && Observer::EXACT_INTEGER_CALL_CONTINUATIONS && scalar_leaf
                 && body.call_occurrences.is_empty() && body.allocation_length_calls.is_empty()
                 && body.assignments.is_empty() && body.arms.is_empty()
-                && !body.structure.checker_has_nonsimple_directive
                 && body.structure.checker_contextual_occurrences.is_empty()
         }
         #[cfg(not(feature = "internal-checker"))]
@@ -13873,6 +13885,108 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
             let one = BigInt::from(1);
             assert!(inner.witness.intervals_at(0, 2).unwrap().eq([(&zero, &zero)]));
             assert!(outer.witness.intervals_at(0, 1).unwrap().eq([(&one, &one)]));
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn completed_namespace_boolean_return_preserves_receipts_and_empty_lanes() {
+        let app = source("src/main.w", "completed-bool-namespace-root");
+        let child = source("src/calc.w", "completed-bool-namespace-child");
+        let app_text = r#"%%start
+            lib = namespace demo "src/calc.w";
+            alias = namespace demo "src/calc.w";
+            if (lib.choose(true)) {
+                core.require(false, { .stdout = ""; .stderr = "branch"; .code = 53; .files = []; });
+            };
+            bool unavailable = alias.retain(false);
+            core.require(unavailable, { .stdout = ""; .stderr = "unreachable"; .code = 59; .files = []; });
+        %%end"#;
+        let child_text = r#"%%start
+            core.require(false, { .stdout = ""; .stderr = "init"; .code = 47; .files = []; });
+            bool(bool) choose = fn(entry) {
+                core.require(false, { .stdout = ""; .stderr = "choose"; .code = 51;
+                    .files = [{ .path = "chosen.json"; .state = entry; }]; });
+                entry
+            };
+            bool(bool) retain = fn(entry) {
+                core.narrow(entry, { .stdout = ""; .stderr = "pruned"; .code = 57;
+                    .files = [{ .path = "rejected.json"; .state = entry; }]; });
+                entry
+            };
+        %%end"#;
+        let namespace = |name: &str| {
+            let start = app_text.find(&format!("{name} =")).unwrap();
+            let end = start + app_text[start..].find(';').unwrap() + 1;
+            ScalarNamespaceBinding {
+                binding: name.into(), target: child.clone(), span: ByteSpan::new(start as u32, end as u32),
+            }
+        };
+        let prepare = |child_text: &str| prepare_checker_project(vec![
+            (declarations(&app, app_text), vec![namespace("lib"), namespace("alias")]),
+            (declarations(&child, child_text), Vec::new()),
+        ], vec![app.clone(), child.clone()], inputs()).unwrap();
+        let context_variants = [
+            ("i8 core.context.count = 7;", "core.context.count", false),
+            ("bool core.context.ready = entry;", "core.context.ready", true),
+        ].map(|(declaration, context_name, is_bool)| {
+            let text = child_text.replace("bool(bool) choose = fn(entry) {",
+                &format!("bool(bool) choose = fn(entry) {{ {declaration}"))
+                .replace(r#".path = "chosen.json"; .state = entry"#,
+                    &format!(r#".path = "chosen.json"; .state = {context_name}"#));
+            assert!(text.contains(&format!(".state = {context_name}")));
+            let prepared = prepare(&text);
+            let (project, calls) = prepared.parts();
+            let (module, item, _) = select_checked_root(project, &child, "choose").unwrap();
+            let structure = &calls.function_body(module, item, None).unwrap().structure;
+            assert!(structure.checker_contextual_occurrences.is_empty());
+            assert!(structure.checker_contextual_read_locals.is_empty());
+            assert_eq!(structure.checker_has_bool_contextual_declaration, is_bool);
+            assert_eq!(structure.checker_contextual_declarations.is_empty(), is_bool);
+            assert_eq!(structure.has_ordinary_contextual_places(), !is_bool);
+            prepared
+        });
+        let prepared = prepare(child_text);
+        for scope in [ScalarCheckerScope::MainFlowOnly, ScalarCheckerScope::CurrentPackage] {
+            for contextual in &context_variants {
+                assert!(matches!(run_closed_without_named_proofs(contextual, scope, 2), Err(ProjectCheck::Unsupported)));
+            }
+            let receipt = run_closed_without_named_proofs(&prepared, scope, 2).unwrap();
+            assert!(receipt.directives.iter().map(|failure| (&failure.source, failure.code().clone())).eq([
+                (&child, 47.into()), (&child, 51.into()), (&app, 53.into()), (&child, 57.into()),
+            ]));
+            assert_eq!(receipt.directives[1].files()[0].text.as_ref(),
+                b"{\"type\":{\"kind\":\"bool\"},\"value\":true}\n");
+            assert_eq!(receipt.directives[3].files()[0].text.as_ref(),
+                b"{\"type\":{\"kind\":\"bool\"},\"value\":false}\n");
+        }
+        let (project, calls) = prepared.parts();
+        let (_, ordinals) = package_initialization_order(project).unwrap();
+        let (root, target) = (ordinals[&app], ordinals[&child]);
+        let ModuleInitializationDetail::Occurrences(topology) = &calls.initialization_region(root).unwrap().detail
+            else { panic!("expected typed startup"); };
+        let occurrence = topology.structure.blocks[topology.structure.root.0].items.iter().find_map(|item| {
+            let BlockItemKind::Binding(binding) = &item.kind else { return None; };
+            let BindingInitialization::Outputs(outputs) = &binding.initialization else { return None; };
+            Some(outputs.primary)
+        }).unwrap();
+        let outside = SourceIdentity::new(app.project.clone(), "other".into(), app.path.clone(), app.revision.clone());
+        for (caller, visit) in [(&app, InitializationVisit::Unseen), (&app, InitializationVisit::Started),
+            (&outside, InitializationVisit::Completed)]
+        {
+            let mut visits = vec![InitializationVisit::Unseen; project.modules.len()];
+            visits[root] = InitializationVisit::Started;
+            visits[target] = visit;
+            let mut actual = CheckedCalls {
+                project, calls, active: HashSet::new(), active_depth: 0, reached: HashSet::new(),
+                had_obligations: false, observer: ProofFreeOrderedEvidence, symbolic_module: 0,
+            };
+            let mut failures = OrderedFailures::default();
+            let sink = RefCell::new(&mut failures);
+            let result = run_initializer_call(topology, &mut actual, occurrence, &ScalarType::Bool, |_, _| None,
+                Some((caller, OrderedCallCollection { failures: &sink, visits: Some(&visits), outer: None })), None);
+            assert!(matches!(result, Err(ProjectCheck::Unsupported)));
+            assert!(sink.borrow().records.is_empty());
         }
     }
 

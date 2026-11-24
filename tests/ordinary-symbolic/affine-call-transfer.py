@@ -1055,6 +1055,45 @@ namespace_scalar_child = f"""%%start
     }};
     %%end"""
 cases.append((namespace_scalar_key,namespace_scalar_main,210,b"ROOTINITCALLEERETURNEMPTY"))
+namespace_bool_key = "exact-startup-completed-namespace-bool-return"
+namespace_bool_main = f"""%%start
+    lib = namespace app "src/calc.w";
+    alias = namespace app "src/calc.w";
+    if (lib.choose(true)) {{
+        core.require(false, {report(53,"BOOL-BRANCH")});
+    }};
+    bool unavailable = alias.retain(false);
+    core.require(unavailable, {report(59,"BOOL-UNREACHABLE")});
+    %%end"""
+namespace_bool_child = f"""%%start
+    core.require(false, {report(47,"BOOL-INIT")});
+    bool(bool) choose = fn(entry) {{
+        core.require(false, {state_report(51,"BOOL-CHOOSE","entry").replace("state.json","chosen.json")});
+        entry
+    }};
+    bool(bool) retain = fn(entry) {{
+        core.narrow(entry, {state_report(57,"BOOL-PRUNED","entry").replace("state.json","rejected.json")});
+        entry
+    }};
+    %%end"""
+def namespace_bool_context_child(declaration, name):
+    return namespace_bool_child.replace("choose = fn(entry) {",
+        "choose = fn(entry) { " + declaration).replace(
+        state_report(51,"BOOL-CHOOSE","entry").replace("state.json","chosen.json"),
+        state_report(51,"BOOL-CHOOSE",name).replace("state.json","chosen.json"))
+namespace_bool_context_children = {
+    "exact-startup-completed-namespace-bool-rejects-context-i8":
+        namespace_bool_context_child("i8 core.context.count = 7;", "core.context.count"),
+    "exact-startup-completed-namespace-bool-rejects-context-bool":
+        namespace_bool_context_child("bool core.context.ready = entry;", "core.context.ready"),
+}
+namespace_children = {
+    namespace_scalar_key: namespace_scalar_child,
+    namespace_bool_key: namespace_bool_child,
+    **namespace_bool_context_children,
+}
+cases.append((namespace_bool_key,namespace_bool_main,47,b"BOOL-INITBOOL-CHOOSEBOOL-BRANCHBOOL-PRUNED"))
+cases.extend((name,namespace_bool_main,2,b"unsupported analysis") for name in namespace_bool_context_children)
 finite_scalar_stride = f"""%%start
     unit(i8) check = fn(entry) {{
         core.narrow(entry >= 0, {report(245,"FINITE-CUT")});
@@ -1698,6 +1737,10 @@ nested_array_bytes = state_bytes({
     },
 })
 authored_files = {
+    namespace_bool_key: {
+        "chosen.json": b'{"type":{"kind":"bool"},"value":true}\n',
+        "rejected.json": b'{"type":{"kind":"bool"},"value":false}\n',
+    },
     "exact-startup-conditional-scalar-binding": {"status.json": b'{"type":{"kind":"i8"},"value":37}\n'},
     "exact-startup-unit-mixed-storage-empty": {"gate.json": b'{"type":{"kind":"bool"},"value":false}\n'},
     "exact-startup-bool-condition-call-empty": {"state.json": b'{"type":{"kind":"bool"},"value":false}\n'},
@@ -1849,8 +1892,8 @@ with tempfile.TemporaryDirectory(prefix="affine-calls-") as path:
                 code = expected if included else 0
                 expected_stderr = stderr if included else b""
                 (root/"src/main.w").write_text(text.strip()+"\n")
-                if name == namespace_scalar_key:
-                    (root/"src/calc.w").write_text(namespace_scalar_child.strip()+"\n")
+                if name in namespace_children:
+                    (root/"src/calc.w").write_text(namespace_children[name].strip()+"\n")
                 res=subprocess.run([cli,"check",scope],cwd=root,capture_output=True,timeout=20)
                 print(target,scope,name,res.returncode,res.stdout,res.stderr,flush=True)
                 assert res.returncode==code,res
@@ -1871,6 +1914,8 @@ with tempfile.TemporaryDirectory(prefix="affine-calls-") as path:
                         assert b"PRIOR" not in res.stderr and b"ARM-EFFECT" not in res.stderr,res
                     if name.startswith("exact-startup-finite-ordinary-"):
                         assert b"FINITE-PRIOR-UNPUBLISHED" not in res.stderr,res
+                    if name in namespace_bool_context_children:
+                        assert all(label not in res.stderr for label in (b"BOOL-INIT", b"BOOL-CHOOSE", b"BOOL-BRANCH")),res
                     if name == "conditional-scalar-binding-refuses-reached-operand":
                         assert b"BIND-PRIOR-UNPUBLISHED" not in res.stderr,res
                     if name == "projected-conditional-local-write-rejects-reached-operand":
@@ -1882,7 +1927,7 @@ with tempfile.TemporaryDirectory(prefix="affine-calls-") as path:
                 files = authored_files.get(name, {}) if included else {}
                 check_outputs = Path(".wosy/outputs/check")
                 expected_paths = {"src", "src/main.w", "wosy.toml"}
-                if name == namespace_scalar_key:
+                if name in namespace_children:
                     expected_paths.add("src/calc.w")
                 if files:
                     expected_paths.update(str(path) for path in (check_outputs, *check_outputs.parents) if path != Path("."))
@@ -1900,5 +1945,5 @@ with tempfile.TemporaryDirectory(prefix="affine-calls-") as path:
                     for path in (check_outputs, *check_outputs.parents):
                         if path != Path("."):
                             (root / path).rmdir()
-                if name == namespace_scalar_key:
+                if name in namespace_children:
                     (root/"src/calc.w").unlink()
