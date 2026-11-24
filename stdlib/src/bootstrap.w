@@ -166,10 +166,9 @@ i32(*!u8) _read_line_discard_step = fn(view) {
 	}
 };
 
-i32(*!u8, i32) _read_line_discard_continue = fn(view, outcome) {
+i32(i32, *!u8) _read_line_discard_continue = fn(outcome, view) {
 	if (outcome == 0) {
-		i32 next_outcome = _read_line_discard_step(&!(*view));
-		_read_line_discard_continue(view, next_outcome)
+		_read_line_discard_continue(_read_line_discard_step(&!(*view)), view)
 	} else { outcome }
 };
 
@@ -190,7 +189,7 @@ ReadLineStatus(u8) _read_line_zero_capacity = fn(first) {
 	};
 	if (discard) {
 		i32 first_outcome = _read_line_discard_step(&!scratch[0]);
-		i32 outcome = _read_line_discard_continue(&!scratch[0], first_outcome);
+		i32 outcome = _read_line_discard_continue(first_outcome, &!scratch[0]);
 		if (outcome == 2) { status = ReadLineStatus::io_error; };
 	};
 	status
@@ -263,7 +262,7 @@ ReadLineStatus(u8) _read_line_zero_capacity = fn(first) {
 	bytes, length, pending_cr, reading, status = _read_line_allocated_range(bytes, &!scratch[0], max_bytes, max_bytes + two, length, pending_cr, reading, status);
 	if (status == ReadLineStatus::limit_exceeded) {
 		i32 first_outcome = _read_line_discard_step(&!scratch[0]);
-		i32 outcome = _read_line_discard_continue(&!scratch[0], first_outcome);
+		i32 outcome = _read_line_discard_continue(first_outcome, &!scratch[0]);
 		if (outcome == 2) { status = ReadLineStatus::io_error; };
 	};
 	if (status == ReadLineStatus::line && pending_cr) {

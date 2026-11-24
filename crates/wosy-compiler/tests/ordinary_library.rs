@@ -3103,6 +3103,42 @@ fn runtime_array_read_line_graph_emits_the_actual_stdlib_ranges() {
         let read = lookup("read_line");
         let allocated = lookup("_read_line_allocated");
         let discard = lookup("_read_line_discard_continue");
+        let step = lookup("_read_line_discard_step");
+        // The one panic is the existing null check for the checked reborrow,
+        // not an extra call on the ordinary recurring path.
+        assert_eq!(
+            direct_calls(&module, &discard),
+            vec!["__wosy_core_system_panic".to_owned(), step.clone()]
+        );
+        let blocks = module.get_function(&discard).unwrap().get_basic_blocks();
+        let named_block = |name: &[u8]| {
+            blocks
+                .iter()
+                .copied()
+                .find(|block| block.get_name().to_bytes() == name)
+                .unwrap_or_else(|| panic!("{target_layout:?}: missing block {name:?}"))
+        };
+        let header = named_block(b"self_tail.header");
+        let failure = named_block(b"deref_null_panic");
+        let continuation = named_block(b"deref_null_continue");
+        let block_calls = |block: inkwell::basic_block::BasicBlock<'_>| {
+            block.get_instructions()
+                .filter(|instruction| instruction.get_opcode() == InstructionOpcode::Call)
+                .map(|instruction| {
+                    CallSiteValue::try_from(instruction).unwrap().get_called_fn_value()
+                        .expect("ordinary direct call").get_name().to_str().unwrap().to_owned()
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(block_calls(failure), vec!["__wosy_core_system_panic"]);
+        assert_eq!(block_calls(continuation), vec![step]);
+        assert_eq!(
+            failure.get_terminator().unwrap().get_opcode(),
+            InstructionOpcode::Unreachable
+        );
+        let backedge = continuation.get_terminator().unwrap();
+        assert_eq!(backedge.get_opcode(), InstructionOpcode::Br);
+        assert_eq!(backedge.get_operand(0).unwrap().block(), Some(header));
         let calls = direct_calls(&module, &allocated);
         assert!(direct_calls(&module, "main").contains(&read));
         assert!(direct_calls(&module, &read).contains(&allocated));

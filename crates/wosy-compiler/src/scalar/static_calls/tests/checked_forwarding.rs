@@ -132,3 +132,46 @@ fn detached_checked_forwarding_rejects_missing_or_inconsistent_build_evidence() 
         assert_eq!(prove(&broken), None);
     }
 }
+
+
+#[test]
+fn detached_checked_forwarding_requires_the_mutable_child_before_the_single_move() {
+    let source = parsed(
+        "%%start
+i32(*!u8) step = fn(view) { if (*view == 10) { 1 } else { 0 } };
+i32(i32, *!u8) drive = fn(outcome, view) {
+    if (outcome == 0) { drive(step(&!(*view)), view) } else { outcome }
+};
+%%end",
+    );
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let prepared = prepare_extracted(&source, layout);
+        let build = analyze_scalar_build(&prepared);
+        assert!(build.diagnostics().is_empty(), "{:?}", build.diagnostics());
+        let module = &prepared.project().modules[0];
+        let ScalarItem::Function(function) = &module.items[1] else { panic!("driver") };
+        let calls = prepared.function_calls(0, 1);
+        let cfg = build.reference_cfg(0, 1, None).unwrap();
+        let proof = build.checked_self_tail_forwarding(0, 1).unwrap();
+        let [recursive, step] = proof.primitive_outputs(cfg).unwrap();
+        let CfgPointKind::Call { argument_points, .. } = &cfg.points[recursive.0].kind else {
+            panic!("recursive call")
+        };
+        let [step_result, carrier] = argument_points.as_slice() else { panic!("arguments") };
+        assert_eq!(*step_result, step);
+        let [movement] = cfg.points[carrier.0].successors.as_slice() else { panic!("move") };
+        assert!(matches!(cfg.points[movement.0].kind, CfgPointKind::Move { .. }));
+        let prove = |changed| reference::self_tail::checked::prove(&module.source, function, calls, changed);
+        let mut broken = cfg.clone();
+        for graph in [&mut broken.points, &mut broken.initial_points] {
+            graph[step.0].successors = vec![*movement];
+        }
+        assert_eq!(prove(&broken), None, "cannot omit the exact carrier read");
+        let mut broken = cfg.clone();
+        let ReferenceOrigin::BorrowedFrom { loan, .. } = &mut broken.facts[1] else {
+            panic!("child origin")
+        };
+        loan.parent = None;
+        assert_eq!(prove(&broken), None, "cannot fabricate a parentless child");
+    }
+}
