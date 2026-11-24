@@ -5795,6 +5795,14 @@ struct CallDeclarationIndex<'a> {
     structs: BTreeMap<&'a ScalarStructId, &'a ScalarStruct>,
     #[cfg(feature = "internal-checker")]
     checker_proof_targets: HashSet<(&'a SourceIdentity, ByteSpan)>,
+    #[cfg(feature = "internal-checker")]
+    checker_qualified_proof_targets: HashMap<(&'a SourceIdentity, ByteSpan), QualifiedProofTargetUse>,
+}
+
+#[cfg(feature = "internal-checker")]
+struct QualifiedProofTargetUse {
+    declaration: (usize, usize),
+    nested: std::cell::Cell<bool>,
 }
 
 #[derive(Default)]
@@ -5913,6 +5921,17 @@ impl<'a> CallDeclarationIndex<'a> {
             }
         }
         index
+    }
+
+    #[cfg(feature = "internal-checker")]
+    fn record_nested_qualified_proof_use(&self, caller: &SourceIdentity, target: &ResolvedCallTarget) {
+        if self.checker_qualified_proof_targets.is_empty() { return; }
+        let ResolvedCallTarget::ModuleCallable { source, declaration_span, concrete: ConcreteCallSelection::Declaration } =
+            target else { return; };
+        if caller.project != source.project || caller.package != source.package { return; }
+        if let Some(watched) = self.checker_qualified_proof_targets.get(&(source, *declaration_span)) {
+            watched.nested.set(true);
+        }
     }
 
     fn callable(
@@ -6805,6 +6824,8 @@ pub(super) struct ProjectCallSiteResults {
     modules: Vec<Result<ModuleCallSites, ReferenceAnalysisError>>,
     #[cfg(any(test, feature = "internal-checker"))]
     pub(super) checker_targets: Vec<Option<ResolvedCheckerTarget>>,
+    #[cfg(feature = "internal-checker")]
+    nested_qualified_proof_targets: HashSet<(usize, usize)>,
 }
 
 #[cfg(test)]
@@ -6815,6 +6836,11 @@ impl ProjectCallSiteResults {
 }
 
 impl ProjectCallSiteResults {
+    #[cfg(feature = "internal-checker")]
+    pub(super) fn has_nested_qualified_proof_use(&self, target: (usize, usize)) -> bool {
+        self.nested_qualified_proof_targets.contains(&target)
+    }
+
     pub(super) fn lookup_errors(&self) -> impl Iterator<Item = &ReferenceAnalysisError> {
         self.modules
             .iter()
@@ -6985,7 +7011,15 @@ fn resolve_project_call_sites_impl(
             return None;
         };
         #[cfg(feature = "internal-checker")]
-        declarations.checker_proof_targets.insert((source, declaration_span));
+        {
+            declarations.checker_proof_targets.insert((source, declaration_span));
+            if query.receiver.is_some() && query.source != source
+                && query.source.project == source.project && query.source.package == source.package
+            {
+                declarations.checker_qualified_proof_targets.entry((source, declaration_span))
+                    .or_insert(QualifiedProofTargetUse { declaration, nested: std::cell::Cell::new(false) });
+            }
+        }
         Some(ResolvedCheckerTarget {
             target: ResolvedCallTarget::ModuleCallable {
                 source: source.clone(),
@@ -6995,33 +7029,37 @@ fn resolve_project_call_sites_impl(
             declaration,
         })
     }).collect::<Vec<_>>();
+    let modules = modules
+        .iter()
+        .map(|module| {
+            let (select_executable_calls, occurrence_typing) = match &mut occurrence_inputs {
+                OccurrenceTypingInputs::Typed(occurrences) => (
+                    true,
+                    occurrences.next().expect("one typing table per module"),
+                ),
+                #[cfg(test)]
+                OccurrenceTypingInputs::StructuralOnly => {
+                    (false, PreparationOccurrenceTyping::default())
+                }
+            };
+            resolve_module_call_sites(
+                &module.source,
+                &module.items,
+                &module.namespace_bindings,
+                &declarations,
+                module.resolved_assignment_outputs.as_map(),
+                select_executable_calls,
+                occurrence_typing,
+            )
+        })
+        .collect();
     ProjectCallSiteResults {
         #[cfg(any(test, feature = "internal-checker"))]
         checker_targets,
-        modules: modules
-            .iter()
-            .map(|module| {
-                let (select_executable_calls, occurrence_typing) = match &mut occurrence_inputs {
-                    OccurrenceTypingInputs::Typed(occurrences) => (
-                        true,
-                        occurrences.next().expect("one typing table per module"),
-                    ),
-                    #[cfg(test)]
-                    OccurrenceTypingInputs::StructuralOnly => {
-                        (false, PreparationOccurrenceTyping::default())
-                    }
-                };
-                resolve_module_call_sites(
-                    &module.source,
-                    &module.items,
-                    &module.namespace_bindings,
-                    &declarations,
-                    module.resolved_assignment_outputs.as_map(),
-                    select_executable_calls,
-                    occurrence_typing,
-                )
-            })
-            .collect(),
+        modules,
+        #[cfg(feature = "internal-checker")]
+        nested_qualified_proof_targets: declarations.checker_qualified_proof_targets.values()
+            .filter_map(|target| target.nested.get().then_some(target.declaration)).collect(),
     }
 }
 
@@ -8389,6 +8427,8 @@ impl CallableWalk<'_> {
         let (target, declared_unsafe) = self
             .target_resolver
             .resolve(expression, names, types, signature, #[cfg(any(test, feature = "internal-checker"))] ordinary_origin)?;
+        #[cfg(feature = "internal-checker")]
+        self.target_resolver.declarations.record_nested_qualified_proof_use(self.target_resolver.source, &target);
         if declared_unsafe {
             self.declared_unsafe_calls.insert(ordinal.0);
         }
@@ -8583,6 +8623,8 @@ impl StructuralWalker<'_, '_> {
                             #[cfg(any(test, feature = "internal-checker"))]
                             None,
                         )?;
+                        #[cfg(feature = "internal-checker")]
+                        resolver.declarations.record_nested_qualified_proof_use(resolver.source, &target);
                         self.structural_calls.push(ordinal);
                         assert!(self
                             .allocation_length_call_targets

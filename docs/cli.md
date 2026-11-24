@@ -40,6 +40,12 @@ the cited proof against that same return. It does not evaluate a second call
 or substitute a symbolic summary for the reached result. Unused functions
 are checked only in the declared-package scope.
 
+A bare literal comparison can also target a qualified, pure unary integer
+function in the same package. The checker observes direct startup calls after
+the imported module has initialized, or an unused symbolic root in the
+declared-package scope. This profile does not support nested calls through the
+qualified target or publish an ordinary call summary for it.
+
 Check diagnostics and stream output work on native CLI hosts. Authored file
 output currently requires a Linux CLI host and a flat filename under
 `.wosy/outputs/check/`; other file requests are refused before authored output

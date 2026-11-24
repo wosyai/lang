@@ -2214,7 +2214,40 @@ correlated_array_witness = """%%start
     {}
 %%end"""
 cases.append(("ordinary-fixed-array-symbolic-cells-correlated", correlated_array_witness, 1, b"proof obligation failed"))
+qualified_scalar_library = """%%start
+    i8(i8) value = fn(x) { if (x < 0) { -3 } else { 7 } };
+%%end"""
+qualified_scalar_proof = """%%start
+    imported = namespace app "src/calc.w";
+    i8(i8) value = fn(local_input) { local_input };
+    proof qualified for imported.value(entry) -> (out) where (entry >= 0) ensures (out == 7) {}
+%%end"""
+qualified_scalar_reached = qualified_scalar_proof.replace("%%end", f"""
+    i8 selected = imported.value(3);
+    i8 outside = imported.value(-2);
+    i8 decoy = value(3);
+    core.require(selected == 7, {report(39,"WRONG-QUALIFIED-RESULT")});
+    core.require(outside == -3, {report(40,"WRONG-OUTSIDE-GUARD")});
+    core.require(decoy == 3, {report(41,"WRONG-LOCAL-DECOY")});
+%%end""")
+for name, text, child, code, why in [
+    ("exact-startup-qualified-scalar-proof-proved", qualified_scalar_reached, qualified_scalar_library, 0, b""),
+    ("exact-startup-qualified-scalar-proof-refuted", qualified_scalar_reached.replace("out == 7", "out == 6"),
+        qualified_scalar_library, 1, b"proof obligation failed"),
+    ("exact-startup-qualified-scalar-proof-require", qualified_scalar_reached.replace("selected == 7", "selected == 6"),
+        qualified_scalar_library, 39, b"WRONG-QUALIFIED-RESULT"),
+    ("exact-startup-qualified-scalar-proof-effect-refused", qualified_scalar_reached,
+        qualified_scalar_library.replace("if (x < 0)", f"core.require(false, {report(46,'UNPUBLISHED-LEAF')}); if (x < 0)"),
+        2, b"unsupported analysis"),
+    ("ordinary-qualified-scalar-proof-unused-refuted", qualified_scalar_proof.replace("out == 7", "out == 6"),
+        qualified_scalar_library, 1, b"proof obligation failed"),
+]:
+    namespace_children[name] = child
+    cases.append((name, text, code, why))
+
 proof_diagnostic_notes = {
+    "exact-startup-qualified-scalar-proof-refuted": b"call returned 7",
+    "ordinary-qualified-scalar-proof-unused-refuted": b"symbolic call can return 7",
     "ordered-calling-citation-pair-show-refuted": b"symbolic call can return 7",
     "exact-startup-rectangular-citation-refuted-premise": b"call returned 7",
     "exact-startup-rectangular-citation-refuted-show": b"core.show(out > 7)",
@@ -2969,6 +3002,8 @@ with tempfile.TemporaryDirectory(prefix="affine-calls-") as path:
                 assert not res.stdout,res
                 if code==2:
                     assert expected_stderr in res.stderr,res
+                    if name == "exact-startup-qualified-scalar-proof-effect-refused":
+                        assert b"UNPUBLISHED-LEAF" not in res.stderr.splitlines(), res
                     if name == "exact-startup-real-integer-tail-rejects-reentry":
                         assert b"BEFORE-TAIL" not in res.stderr and b"AFTER-TAIL" not in res.stderr,res
                     if name == "authored-lexical-code-nonsingleton-fails-atomically":
@@ -2997,6 +3032,12 @@ with tempfile.TemporaryDirectory(prefix="affine-calls-") as path:
                         assert b"COPY-PRIOR-UNPUBLISHED" not in res.stderr and b"COPY-FORMAL-UNPUBLISHED" not in res.stderr,res
                 elif included and name in proof_diagnostic_notes:
                     assert expected_stderr in res.stderr and proof_diagnostic_notes[name] in res.stderr,res
+                    if name == "exact-startup-qualified-scalar-proof-refuted":
+                        assert res.stderr.count(b"proof obligation failed") == 1, res
+                        assert b"src/main.w" in res.stderr and b"imported.value(3)" in res.stderr, res
+                    if name == "ordinary-qualified-scalar-proof-unused-refuted":
+                        assert b"src/main.w" in res.stderr and b"src/calc.w" in res.stderr, res
+                        assert b"symbolic call entry: x = 0" in res.stderr, res
                     if name == "exact-startup-rectangular-citation-refuted-premise":
                         assert res.stderr.count(b"proof obligation failed") == 1, res
                         assert b"proof issued" in res.stderr and b"producer(3,7)" in res.stderr, res
