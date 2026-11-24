@@ -4452,6 +4452,33 @@ fn check_expression_type_in_module_expected(
     if expected.is_some_and(is_error_type) {
         return ScalarType::Error;
     }
+    if let Some(entry) = inference.proof_entry_scope {
+        match expression {
+            ScalarExpression::Name { name, span } if name == "_" => {
+                if let Some((ty, first, multiple)) = &mut inference.proof_rewrite_hole {
+                    if let Some(first) = first {
+                        *multiple |= first != span;
+                    } else {
+                        *first = Some(*span);
+                    }
+                    return (*ty).clone();
+                }
+            }
+            ScalarExpression::Call { receiver: Some(receiver), name, type_arguments, arguments, span, .. }
+                if receiver == "core" && name == "old" => {
+                if let [argument] = arguments.as_slice() {
+                    if type_arguments.is_empty() {
+                        let visible = entry.keys().cloned().collect::<BTreeSet<_>>();
+                        return expression_type_in_module_expected(argument, expected, entry, &visible, folded_names,
+                            module, modules, diagnostics, unsafe_context, overloads, inference);
+                    }
+                }
+                diagnostics.push(module_diagnostic(module, "B0004", "core.old requires one proof entry expression", *span));
+                return ScalarType::Error;
+            }
+            _ => {}
+        }
+    }
     if let ScalarExpression::Call {
         receiver,
         name,

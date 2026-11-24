@@ -13,7 +13,7 @@ pub use llvm::{
     LlvmValueType,
 };
 pub use scalar::{
-    analyze_scalar_build, derive_scalar_declarations_from_cst, derive_scalar_diagnostics_from_cst,
+    analyze_scalar_build, derive_scalar_build_declarations_from_cst, derive_scalar_declarations_from_cst, derive_scalar_diagnostics_from_cst,
     derive_scalar_program, derive_scalar_program_from_cst,
     derive_scalar_program_from_cst_with_layout, derive_scalar_program_with_layout,
     prepare_scalar_project, validate_scalar_project, BinaryOperator, PreparedScalarProject,

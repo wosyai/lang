@@ -16,6 +16,7 @@ impl PreparedProgram {
                 enums: program.enums.clone(),
                 diagnostics: Vec::new(),
                 contextual_places: contextual::ContextualPlaces::default(),
+                build_proofs: Vec::new(),
             },
             program.target_layout,
         )
@@ -224,10 +225,15 @@ impl PreparedScalarProject {
     }
 
     pub(crate) fn new(project: ScalarProject) -> Result<Self, ScalarProjectPreparationRejection> {
+        Self::from_canonical_typing(typecheck_scalar_project_with_occurrences(project))
+    }
+
+    pub(super) fn from_canonical_typing(
+        result: (ScalarProjectValidation, Vec<PreparationOccurrenceTyping>),
+    ) -> Result<Self, ScalarProjectPreparationRejection> {
         let (project, calls) = prepare_project_occurrences(
-            typecheck_scalar_project_with_occurrences(project),
-            #[cfg(any(test, feature = "internal-checker"))]
-            &[],
+            result,
+            #[cfg(any(test, feature = "internal-checker"))] &[],
         )?;
         Ok(Self { project, calls })
     }

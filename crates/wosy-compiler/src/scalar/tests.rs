@@ -318,7 +318,7 @@ fn project_contextual_formal_type_materializes_before_namespace_call_preparation
     let source = |identity: &SourceIdentity, text: &str, pending: bool| {
         let parsed = parse_source(identity.clone(), text.to_owned(), &[]);
         assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
-        derive_scalar_declarations(parsed.result.canonical_cst(), pending, pending, None)
+        derive_scalar_declarations(parsed.result.canonical_cst(), pending, pending, false, None)
     };
     let bindings = || vec![ScalarNamespaceBinding {
         binding: "remote".to_owned(), target: leaf.clone(), span: ByteSpan::new(0, 0),

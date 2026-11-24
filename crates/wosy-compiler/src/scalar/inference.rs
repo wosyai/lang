@@ -247,6 +247,9 @@ pub(super) struct ScalarInferenceBuilder<'a> {
     float_literal_shapes: HashMap<*const ScalarExpression, bool>,
     in_module_initialization: bool,
     suppress_checked_occurrences: bool,
+    // Only populated by Build proof typing. These never affect runtime preparation.
+    pub(super) proof_entry_scope: Option<&'a BTreeMap<String, ScalarType>>,
+    pub(super) proof_rewrite_hole: Option<(&'a ScalarType, Option<ByteSpan>, bool)>,
 }
 
 impl<'a> ScalarInferenceBuilder<'a> {
@@ -258,6 +261,8 @@ impl<'a> ScalarInferenceBuilder<'a> {
             float_literal_shapes: HashMap::new(),
             in_module_initialization: false,
             suppress_checked_occurrences: true,
+            proof_entry_scope: None,
+            proof_rewrite_hole: None,
         }
     }
 

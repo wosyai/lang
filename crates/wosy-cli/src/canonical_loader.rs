@@ -9,7 +9,7 @@ use wosy_project::{
 };
 use wosy_syntax::SourceIdentity;
 
-type PersistCst = fn(&std::path::Path, &wosy_compiler::ParseOutput) -> Result<(), String>;
+pub(crate) type PersistCst = fn(&std::path::Path, &wosy_compiler::ParseOutput) -> Result<(), String>;
 
 pub(crate) struct CanonicalProjectInputs {
     pub(crate) declarations: Vec<(wosy_compiler::ScalarSourceDeclarations, Vec<ScalarNamespaceBinding>)>,
@@ -21,7 +21,7 @@ pub(crate) struct CanonicalProjectInputs {
 }
 
 pub(crate) enum CanonicalLoadPurpose {
-    Build(PersistCst),
+    Build(Option<PersistCst>),
     #[cfg(feature = "internal-checker")]
     Check,
     #[cfg(feature = "internal-checker")]
@@ -99,6 +99,7 @@ pub(crate) fn parse_canonical_ordinary_source(
     source: SourceIdentity,
     text: String,
     comment_categories: &[String],
+    build_typing: bool,
     persist_in: Option<(&std::path::Path, PersistCst)>,
 ) -> Result<(String, wosy_compiler::ScalarSourceDeclarations), CanonicalLoadFailure> {
     let output = parse_source(source, text, comment_categories);
@@ -108,7 +109,11 @@ pub(crate) fn parse_canonical_ordinary_source(
     if let Some((root, persist_cst)) = persist_in {
         persist_cst(root, &output)?;
     }
-    let declarations = derive_scalar_declarations_from_cst(output.result.canonical_cst());
+    let declarations = if build_typing {
+        wosy_compiler::derive_scalar_build_declarations_from_cst(output.result.canonical_cst())
+    } else {
+        derive_scalar_declarations_from_cst(output.result.canonical_cst())
+    };
     Ok((output.result.text, declarations))
 }
 
@@ -330,8 +335,9 @@ pub(crate) fn load_canonical_project_inputs(
             _ => {
                 let (text, declarations) = parse_canonical_ordinary_source(
                     source, text, &project.comment_categories,
+                    matches!(&purpose, CanonicalLoadPurpose::Build(_)),
                     match &purpose {
-                        CanonicalLoadPurpose::Build(persist) => Some((root, *persist)),
+                        CanonicalLoadPurpose::Build(persist) => persist.map(|persist| (root, persist)),
                         #[cfg(feature = "internal-checker")]
                         CanonicalLoadPurpose::Check | CanonicalLoadPurpose::Proof(_) | CanonicalLoadPurpose::LocalProofs
                             | CanonicalLoadPurpose::PackageProofs(_) => None,

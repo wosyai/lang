@@ -3835,7 +3835,7 @@ pub(crate) fn derive_scalar_proof_declarations_from_cst(canonical: &CanonicalCst
     let contextual = contextual_proof.is_some();
     #[cfg(not(feature = "internal-checker"))]
     let contextual = false;
-    let declarations = super::derive_scalar_declarations(canonical, contextual, contextual, Some(&mut definitions));
+    let declarations = super::derive_scalar_declarations(canonical, contextual, contextual, false, Some(&mut definitions));
     ScalarProofDeclarations { declarations, definitions,
         #[cfg(feature = "internal-checker")]
         contextual_proof,

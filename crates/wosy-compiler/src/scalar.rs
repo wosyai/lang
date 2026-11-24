@@ -2290,6 +2290,7 @@ pub struct ScalarSourceDeclarations {
     diagnostics: Vec<super::Diagnostic>,
     #[allow(dead_code)]
     contextual_places: contextual::ContextualPlaces,
+    build_proofs: Vec<CstNode>,
 }
 
 impl ScalarSourceDeclarations {
@@ -2335,18 +2336,28 @@ pub fn derive_scalar_declarations_from_cst(
         canonical,
         false,
         false,
+        false,
         #[cfg(any(test, feature = "internal-checker"))]
         None,
     )
+}
+
+/// Retains proof declarations solely for the canonical Build static typing pass.
+#[doc(hidden)]
+pub fn derive_scalar_build_declarations_from_cst(canonical: &CanonicalCstRoot) -> ScalarSourceDeclarations {
+    derive_scalar_declarations(canonical, false, false, true,
+        #[cfg(any(test, feature = "internal-checker"))] None)
 }
 
 fn derive_scalar_declarations(
     canonical: &CanonicalCstRoot,
     dormant_context: bool,
     contextual_proof_runtime: bool,
+    retain_build_proofs: bool,
     #[cfg(any(test, feature = "internal-checker"))] mut proofs: Option<&mut Vec<CstNode>>,
 ) -> ScalarSourceDeclarations {
     let mut items = Vec::new();
+    let mut build_proofs = Vec::new();
     let source_root = canonical
         .root
         .children()
@@ -2399,6 +2410,7 @@ fn derive_scalar_declarations(
     for node in source_root.children().filter(|_| derive_items) {
         match node.kind() {
             SyntaxKind::ProofDecl => {
+                if retain_build_proofs { build_proofs.push(node.clone()); }
                 #[cfg(any(test, feature = "internal-checker"))]
                 if let Some(proofs) = proofs.as_deref_mut() {
                     proofs.push(node);
@@ -2462,6 +2474,7 @@ fn derive_scalar_declarations(
         enums,
         diagnostics,
         contextual_places,
+        build_proofs,
     }
 }
 
@@ -2536,6 +2549,7 @@ pub fn derive_scalar_program_from_cst_with_layout(
 
 mod contextual;
 mod declarations;
+mod proof_typing;
 use declarations::ScalarDeclarationEnvironment;
 mod inference;
 use inference::{PreparationOccurrenceTyping, ScalarAssignmentOwners, ScalarInferenceBuilder};
@@ -2614,14 +2628,23 @@ fn typecheck_scalar_project_with_formals(
     project: ScalarProject, contextual_formals: HashMap<ReferenceBindingId, ScalarType>,
     #[cfg(any(test, feature = "internal-checker"))] checker_directives: bool,
 ) -> (ScalarProjectValidation, Vec<PreparationOccurrenceTyping>) {
+    typecheck_scalar_project_with_build_proofs(project, contextual_formals, &HashMap::new(),
+        #[cfg(any(test, feature = "internal-checker"))] checker_directives)
+}
+
+fn typecheck_scalar_project_with_build_proofs(
+    project: ScalarProject, contextual_formals: HashMap<ReferenceBindingId, ScalarType>,
+    build_proofs: &HashMap<SourceIdentity, Vec<CstNode>>,
+    #[cfg(any(test, feature = "internal-checker"))] checker_directives: bool,
+) -> (ScalarProjectValidation, Vec<PreparationOccurrenceTyping>) {
     let mut project = project;
     let mut diagnostics = Vec::new();
     for module in &mut project.modules {
         module.resolved_assignment_outputs = ScalarAssignmentTyping::default();
         module.layouts = ScalarTargetLayouts::new(module.target_layout);
     }
-    let mut declarations = declarations::resolve_project_types(&mut project.modules);
-    declarations.set_contextual_formal_types(contextual_formals);
+    let mut project_declarations = declarations::resolve_project_types(&mut project.modules);
+    project_declarations.set_contextual_formal_types(contextual_formals);
     resolve_project_struct_layouts(&mut project, &mut diagnostics);
     let (struct_policies, enum_policies) = compute_copy_policies(
         &project
@@ -2665,13 +2688,14 @@ fn typecheck_scalar_project_with_formals(
             items,
             &modules[ordinal],
             &modules,
-            &declarations,
+            &project_declarations,
             ordinal,
             &overloads.typing(ordinal),
             &owners[ordinal],
         );
     }
-    drop(declarations);
+    let mut proof_runtime_scopes = (!build_proofs.is_empty()).then(Vec::new);
+    let proof_declarations = proof_runtime_scopes.as_ref().map(|_| project_declarations);
     let mut inferences = Vec::with_capacity(modules.len());
     for (ordinal, module) in modules.iter().enumerate() {
         let items: &[ScalarItem] = module_items[ordinal];
@@ -2789,6 +2813,7 @@ fn typecheck_scalar_project_with_formals(
                 validate_extern(&module.source, extern_decl, &mut diagnostics);
             }
         }
+        let mut proof_inferred_scope = proof_runtime_scopes.as_ref().map(|_| BTreeMap::new());
         for item in items {
             inference.set_validation_root(item);
             match item {
@@ -3058,6 +3083,22 @@ fn typecheck_scalar_project_with_formals(
                         &overloads,
                         &mut inference,
                     );
+                    // Ordinary inference records actual output types in this
+                    // initialization scope; carry only inferred declaration
+                    // destinations, never raw assignment spelling as authority.
+                    if let (Some(inferred), ScalarBlockItem::Assignment(assignment)) =
+                        (&mut proof_inferred_scope, executable)
+                    {
+                        for target in &assignment.targets {
+                            if let ScalarPlace::Name { name, .. } = &target.place {
+                                if !declarations.contains_key(name) {
+                                    if let Some(actual) = scope.get(name) {
+                                        inferred.entry(name.clone()).or_insert_with(|| actual.clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -3070,6 +3111,15 @@ fn typecheck_scalar_project_with_formals(
             ));
         }
         inferences.push(inference);
+        if let (Some(scopes), Some(inferred)) = (&mut proof_runtime_scopes, proof_inferred_scope) {
+            declarations.extend(inferred);
+            scopes.push(declarations);
+        }
+    }
+    if let (Some(scopes), Some(declarations)) = (proof_runtime_scopes, proof_declarations) {
+        if diagnostics.is_empty() {
+            proof_typing::validate_build_proofs(build_proofs, &modules, &scopes, &declarations, &overloads, &mut diagnostics);
+        }
     }
     drop(module_items);
     drop(modules);
@@ -3110,15 +3160,22 @@ pub(crate) fn prepare_internal_contextual_runtime(
 }
 
 pub fn prepare_scalar_project(
-    declarations: Vec<(ScalarSourceDeclarations, Vec<ScalarNamespaceBinding>)>,
+    mut declarations: Vec<(ScalarSourceDeclarations, Vec<ScalarNamespaceBinding>)>,
     initialization_order: Vec<SourceIdentity>,
     inputs: ScalarPreparationInputs,
 ) -> Result<PreparedScalarProject, ScalarProjectPreparationRejection> {
-    PreparedScalarProject::new(project_from_declarations(
-        declarations,
-        initialization_order,
-        inputs,
-    )?)
+    let build_proofs = declarations.iter_mut().filter_map(|(module, _)| {
+        (!module.build_proofs.is_empty()).then(|| (module.source.clone(), std::mem::take(&mut module.build_proofs)))
+    }).collect::<HashMap<_, _>>();
+    let project = project_from_declarations(declarations, initialization_order, inputs)?;
+    if build_proofs.is_empty() {
+        PreparedScalarProject::new(project)
+    } else {
+        PreparedScalarProject::from_canonical_typing(typecheck_scalar_project_with_build_proofs(
+            project, HashMap::new(), &build_proofs,
+            #[cfg(any(test, feature = "internal-checker"))] false,
+        ))
+    }
 }
 
 fn project_from_declarations(
@@ -3152,6 +3209,7 @@ fn project_from_declarations_with_context_types(
             enums,
             diagnostics: extraction_diagnostics,
             contextual_places,
+            ..
         } = declarations;
         for index in contextual_places.first_declarations {
             let storage = &contextual_places.declarations[index];

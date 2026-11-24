@@ -406,7 +406,7 @@ fn prepare_explicit_dormant_sources(
     sources.into_iter().map(|DormantSourceInput { identity, text }| {
         let source = canonical_source_identity(identity.project.clone(), &identity.package, &identity.path, &text);
         let (text, declarations) = parse_canonical_ordinary_source(
-            source, text, &project.comment_categories, None,
+            source, text, &project.comment_categories, false, None,
         )?;
         #[cfg(test)]
         routing_observations::record(|counts| counts.extractions += 1);
@@ -590,13 +590,23 @@ fn compile_project(
     configuration: &ProjectConfiguration,
     target_layout: ScalarTargetLayout,
 ) -> Result<(String, Vec<SourceObservation>), String> {
+    compile_project_with_persistence(root, project, configuration, target_layout, Some(persist_cst))
+}
+
+fn compile_project_with_persistence(
+    root: &std::path::Path,
+    project: &ProjectContext,
+    configuration: &ProjectConfiguration,
+    target_layout: ScalarTargetLayout,
+    persist: Option<canonical_loader::PersistCst>,
+) -> Result<(String, Vec<SourceObservation>), String> {
     let CanonicalProjectInputs {
         declarations,
         initialization_order,
         graph,
         texts,
         ..
-    } = load_canonical_project_inputs(root, project, configuration, CanonicalLoadPurpose::Build(persist_cst))
+    } = load_canonical_project_inputs(root, project, configuration, CanonicalLoadPurpose::Build(persist))
         .map_err(|failure| failure.report("build"))?;
     #[cfg(test)]
     routing_observations::record(|counts| counts.preparations += 1);
@@ -1393,6 +1403,79 @@ mod tests {
             Err(CanonicalLoadFailure::Input(error)) if error.contains("caller source unreachable.w"),
         ));
         assert!(!project.root.join(".wosy").exists());
+    }
+
+    #[test]
+    fn canonical_build_statically_types_then_erases_proofs_without_verifying_them() {
+        let erased = r#"%%start
+            u8(u8) identity = fn(input) { input };
+            unit() noop = fn {};
+            (u8, bool)(bool) pair = fn(flag) { u8 value = 1; value, flag };
+            generic T;
+            T(T) generic_identity = fn(value) { value };
+            single = overload { u8(u8) => fn(value) { value }; };
+            choose = overload { u8(u8) => fn(value) { value }; bool(bool) => fn(value) { value }; };
+        %%end"#;
+        let (project, configuration) = routing_test_project("build-statically-types-proofs", &[("main.w", erased)]);
+        for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let build_without_persistence = || compile_project_with_persistence(
+                &project.root, &project, &configuration, layout, None,
+            );
+            let build = || compile_project(&project.root, &project, &configuration, layout);
+            std::fs::write(project.root.join("main.w"), erased).unwrap();
+            let (baseline, _) = build().expect("runtime-only baseline");
+            let with_proof = |proof: &str| erased.replace("%%end", &format!("{proof}\n%%end"));
+            let false_proof = "proof impossible for identity(input) -> (out) ensures (out == core.old(input) && out != input) { core.show(false); }";
+            let nullary = "proof empty for noop() -> () ensures (false) {}";
+            let pair = "proof two for pair(input) -> (amount, flag) ensures (amount == 7 && flag == input) {}";
+            let single = "proof arm for single(input) -> (out) ensures (out == input) {}";
+            std::fs::write(project.root.join("main.w"),
+                with_proof(&format!("{false_proof}\n{nullary}\n{pair}\n{single}"))).unwrap();
+            let (result, counts) = routing_observations::observe(build);
+            let (proved_erased, _) = result.expect("well-typed refuted proof still builds");
+            assert_eq!(proved_erased.as_bytes(), baseline.as_bytes());
+            assert_eq!(build_without_persistence().unwrap().0.as_bytes(), baseline.as_bytes());
+            assert_eq!(counts, routing_observations::Counts {
+                extractions: 1, preparations: 1, builds: 1, single_module_emissions: 1, ..Default::default()
+            });
+            for invalid in [
+                false_proof.replace("core.old(input)", "unknown_name"),
+                false_proof.replace("out == core.old(input) && out != input", "input"),
+                false_proof.replace("core.show(false)", "core.show(unknown_step_name)"),
+                false_proof.replace("for identity(input)", "for unknown_target(input)"),
+                false_proof.replace("for identity(input)", "for generic_identity(input)"),
+                false_proof.replace("for identity(input)", "for choose(input)"),
+                pair.replace("(amount, flag)", "(amount)"),
+                nullary.replace("noop()", "noop(arg)"),
+            ] {
+                std::fs::write(project.root.join("main.w"), with_proof(&invalid)).unwrap();
+                let (rejected, counts) = routing_observations::observe(build);
+                assert_eq!(rejected.unwrap_err(), "build rejected by semantic diagnostics", "{invalid}");
+                assert_eq!(build_without_persistence().unwrap_err(), "build rejected by semantic diagnostics", "{invalid}");
+                assert_eq!(counts, routing_observations::Counts { extractions: 1, preparations: 1, ..Default::default() });
+            }
+        }
+    }
+
+    #[test]
+    fn canonical_build_prepares_proof_against_inferred_callable_binding() {
+        let text = r#"%%start
+            u8(u8) identity = fn(input) { input };
+            operation = identity;
+            proof inferred for operation(input) -> (out) ensures (out == input) {}
+        %%end"#;
+        let (project, configuration) = routing_test_project("build-inferred-proof-target", &[("main.w", text)]);
+        let load = || load_canonical_project_inputs(&project.root, &project, &configuration, CanonicalLoadPurpose::Build(None)).unwrap();
+        let CanonicalProjectInputs { declarations, initialization_order, .. } = load();
+        prepare_scalar_project(declarations, initialization_order,
+            ScalarPreparationInputs { target_layout: ScalarTargetLayout::NATIVE64 })
+            .unwrap_or_else(|rejected| panic!("canonical inferred callable target: {:?}", rejected.into_ordered_diagnostics()));
+        std::fs::write(project.root.join("main.w"), text.replace("out == input", "out == false")).unwrap();
+        let CanonicalProjectInputs { declarations, initialization_order, .. } = load();
+        let rejected = prepare_scalar_project(declarations, initialization_order,
+            ScalarPreparationInputs { target_layout: ScalarTargetLayout::NATIVE64 });
+        let Err(rejected) = rejected else { panic!("inferred callable result must be typed"); };
+        assert!(rejected.into_ordered_diagnostics().iter().any(|diagnostic| diagnostic.code == "B0003"));
     }
 
     #[cfg(feature = "internal-checker")]

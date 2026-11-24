@@ -344,7 +344,7 @@ pub(super) fn prepare_dormant_context(
 pub(super) fn prepare_contextual_transport(
     canonical: &CanonicalCstRoot, inputs: ScalarPreparationInputs, checker_directives: bool, contextual_proof: bool,
 ) -> Result<(PreparedScalarProject, DormantContextReceipt), DormantContextRejection> {
-    let source = derive_scalar_declarations(canonical, true, contextual_proof && checker_directives, None);
+    let source = derive_scalar_declarations(canonical, true, contextual_proof && checker_directives, false, None);
     prepare_contextual_transport_from_source(source, inputs, checker_directives)
 }
 

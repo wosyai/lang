@@ -1021,7 +1021,7 @@ fn resolve_expression_types_project(
     }
 }
 
-fn resolve_type_in_project(
+pub(super) fn resolve_type_in_project(
     ty: &ScalarType,
     declarations: &ScalarDeclarationEnvironment,
     current_module: usize,
