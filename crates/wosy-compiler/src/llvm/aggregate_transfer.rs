@@ -432,7 +432,19 @@ pub(super) fn emit_array_descriptor_call<'ctx>(
         let [EmitValue::Basic(BasicValueEnum::PointerValue(base))] = values else {
             return Err("checked array rebind requires one backing pointer".into());
         };
-        let length = if fresh.is_some() || plan.widened_owning_roundtrip
+        let (base, length) = if let Some(&count) = plan.fixed_copy_owning_arguments.get(&ordinal) {
+            let (source, ty) = state.storage.get(name).cloned().ok_or("missing fixed Copy owning argument")?;
+            let ScalarType::Array { element, length, .. } = &ty else {
+                return Err("owning fixed Copy argument has no fixed storage".into());
+            };
+            if source != *base || *length != count || fresh.is_none() {
+                return Err("owning fixed Copy argument changed the exact prepared source".into());
+            }
+            let count = context.i64_type().const_int(count, false);
+            let backing = ownership::emit_runtime_array_allocation_with_domain(context, state, element, count, true)?;
+            memory::copy_fixed_aggregate(context, state, backing, source, &ty)?;
+            (backing, count.into())
+        } else if fresh.is_some() || plan.widened_owning_roundtrip
             .is_some_and(|(call, _, owner)| call == ordinal && owner == declaration)
         {
             let Some(&(owner, LocalRuntimeExtent::WidenedLiteral(length), true)) = state.local_runtime_extents.get(base)
@@ -441,12 +453,12 @@ pub(super) fn emit_array_descriptor_call<'ctx>(
                 || state.runtime_array_owners.get(name) != Some(&true)
                 || state.runtime_array_allocations.get(name) != Some(&true)
             { return Err("widened roundtrip argument changed its exact live owner".into()); }
-            length.into()
+            (*base, length.into())
         } else {
             let length_slot = *state.runtime_array_lengths.get(name).ok_or("missing checked array rebind extent slot")?;
-            state.builder.build_load(context.i64_type(), length_slot, "array_argument_extent").map_err(builder_error)?
+            (*base, state.builder.build_load(context.i64_type(), length_slot, "array_argument_extent").map_err(builder_error)?)
         };
-        let pair = state.builder.build_insert_value(array_descriptor_type(context).get_undef(), *base,
+        let pair = state.builder.build_insert_value(array_descriptor_type(context).get_undef(), base,
             0, "array_argument_backing").map_err(builder_error)?.into_struct_value();
         let pair = state.builder.build_insert_value(pair, length, 1, "array_argument").map_err(builder_error)?
             .into_struct_value();
@@ -475,9 +487,8 @@ pub(super) fn install_widened_owning_receiver<'ctx>(
     let Some(plan) = state.aggregate.as_ref().map(|aggregate| aggregate.plan)
         .filter(|plan| !plan.widened_owning_receives.is_empty()) else { return Ok(false) };
     let nodes = state.body_call_nodes.ok_or("missing checked owning array receiver nodes")?;
-    let Some((source, receiver, None)) = nodes.expression_ordinal(&binding.value)
-        .and_then(|call| plan.widened_owning_receives.get(&call)).copied()
-    else { return Ok(false) };
+    let Some(call) = nodes.expression_ordinal(&binding.value) else { return Ok(false); };
+    let Some(&(source, receiver, None)) = plan.widened_owning_receives.get(&call) else { return Ok(false); };
     let ([receiver_slot], ScalarExpression::Call { arguments, .. }) =
         (binding.receivers.as_slice(), &binding.value)
     else { return Err("missing exact widened array receiving binding".into()); };
@@ -486,8 +497,15 @@ pub(super) fn install_widened_owning_receiver<'ctx>(
     if receiver_slot.name_span != receiver || nodes.binding_position(binding).is_none()
         || nodes.lexical_expression_declaration(argument) != Some(source)
     { return Err("widened owning receiver changed its exact lexical move".into()); }
-    install_widened_owning_local(context, state, (name, source), (&receiver_slot.name, receiver, &receiver_slot.ty),
-        false, value)?;
+    if plan.fixed_copy_owning_arguments.contains_key(&call) {
+        let (base, count) = unpack_widened_owning_descriptor(context, state, value)?;
+        install_runtime_array_binding_owner(state, &receiver_slot.name, true, true, None);
+        state.storage.insert(receiver_slot.name.clone(), (base, receiver_slot.ty.clone()));
+        state.local_runtime_extents.insert(base, (receiver, LocalRuntimeExtent::WidenedLiteral(count), true));
+    } else {
+        install_widened_owning_local(context, state, (name, source), (&receiver_slot.name, receiver, &receiver_slot.ty),
+            false, value)?;
+    }
     Ok(true)
 }
 
@@ -510,13 +528,7 @@ pub(super) fn install_widened_owning_local<'ctx>(
         Some((declaration, LocalRuntimeExtent::WidenedLiteral(_), true)) if *declaration == source)
     { return Err("widened owning receiver lost its active source extent".into()); }
     let previous = *previous;
-    let EmitValue::Basic(BasicValueEnum::StructValue(pair)) = value
-    else { return Err("missing returned widened array descriptor".into()); };
-    if pair.get_type() != array_descriptor_type(context) {
-        return Err("invalid returned widened array descriptor".into());
-    }
-    let base = state.builder.build_extract_value(*pair, 0, "array_descriptor_backing").map_err(builder_error)?.into_pointer_value();
-    let count = state.builder.build_extract_value(*pair, 1, "array_descriptor_extent").map_err(builder_error)?.into_int_value();
+    let (base, count) = unpack_widened_owning_descriptor(context, state, value)?;
     if replace {
         let (target, _) = state.storage.get(target_name).ok_or("missing widened predecessor")?;
         if *target == previous || state.runtime_array_owners.get(target_name) != Some(&true)
@@ -534,6 +546,22 @@ pub(super) fn install_widened_owning_local<'ctx>(
     state.local_runtime_extents.remove(&previous);
     state.local_runtime_extents.insert(base, (receiver, LocalRuntimeExtent::WidenedLiteral(count), true));
     Ok(())
+}
+
+fn unpack_widened_owning_descriptor<'ctx>(
+    context: &'ctx Context,
+    state: &EmitState<'ctx, '_>,
+    value: &EmitValue<'ctx>,
+) -> Result<(PointerValue<'ctx>, inkwell::values::IntValue<'ctx>), String> {
+    let EmitValue::Basic(BasicValueEnum::StructValue(pair)) = value else {
+        return Err("missing returned widened array descriptor".into());
+    };
+    if pair.get_type() != array_descriptor_type(context) {
+        return Err("invalid returned widened array descriptor".into());
+    }
+    let base = state.builder.build_extract_value(*pair, 0, "array_descriptor_backing").map_err(builder_error)?.into_pointer_value();
+    let count = state.builder.build_extract_value(*pair, 1, "array_descriptor_extent").map_err(builder_error)?.into_int_value();
+    Ok((base, count))
 }
 
 pub(super) fn definition_type<'ctx>(

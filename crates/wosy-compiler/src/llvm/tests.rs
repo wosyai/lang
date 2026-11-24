@@ -12569,3 +12569,90 @@ if (two(1) != 2 || three(1) != 3) { core.system_panic(); };
         }
     }
 }
+
+#[test]
+fn fixed_copy_owning_argument_enters_sealed_runtime_formal_and_returns_one_owner() {
+    use inkwell::{memory_buffer::MemoryBuffer, values::{CallSiteValue, InstructionOpcode}};
+    let text = "%%start
+u8[](u8[]) identity = fn(values) { values };
+u8[](u8[]) relay = fn(values) { identity(values) };
+u64() two = fn() {
+    u8[2] fixed = [11, 13];
+    u8[] output = relay(fixed);
+    fixed[1] = 19;
+    if (fixed[1] != 19) { core.system_panic(); };
+    core.array_len(&output)
+};
+u64() three = fn() {
+    u8[3] fixed = [3, 5, 7];
+    u8[] output = relay(fixed);
+    fixed[1] = 21;
+    if (fixed[1] != 21) { core.system_panic(); };
+    core.array_len(&output)
+};
+if (two() != 2 || three() != 3) { core.system_panic(); };
+%%end";
+    let mixed = text.replace("if (two()", "unit(u64) ordinary = fn(count) { u8[count] array; array = relay(array); }; ordinary(1);\nif (two()");
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        for (closed, text) in [(true, text), (false, mixed.as_str())] {
+            let prepared = prepare_initializer_test(text, layout);
+            let checked = analyze_scalar_build(&prepared);
+            assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+            let source = &prepared.project().modules[0].source;
+            for (project, emitted) in [(false, emit_scalar_build_single_module_llvm(&checked)),
+                (true, emit_scalar_build_project_llvm(&checked))]
+            {
+                if !closed {
+                    assert!(matches!(emitted, Err(error) if error.contains("widened array move requires a closed exact owning receiver")));
+                    continue;
+                }
+                let llvm = emitted.unwrap().to_text();
+                let context = Context::create();
+                let buffer = MemoryBuffer::create_from_memory_range_copy(llvm.as_bytes(), "fixed argument runtime formal");
+                let module = context.create_module_from_ir(buffer).unwrap();
+                module.verify().unwrap();
+                let relay = module.get_function(&self_tail_test_symbol(source, project, "relay")).unwrap();
+                let alloc = module.get_function("__wosy_core_alloc").unwrap();
+                let free = module.get_function("__wosy_core_free").unwrap();
+                for (name, count) in [("two", 2), ("three", 3)] {
+                    let function = module.get_function(&self_tail_test_symbol(source, project, name)).unwrap();
+                    let instructions = function.get_basic_blocks().into_iter().flat_map(|block|
+                        std::iter::successors(block.get_first_instruction(), |instruction| instruction.get_next_instruction()))
+                        .collect::<Vec<_>>();
+                    let calls_to = |callee| instructions.iter().enumerate().filter_map(|(position, &instruction)|
+                        CallSiteValue::try_from(instruction).ok().filter(|call| call.get_called_fn_value() == Some(callee))
+                            .map(|_| (position, instruction))).collect::<Vec<_>>();
+                    let [(born, allocation)] = calls_to(alloc)[..] else { panic!("{llvm}") };
+                    let [(sent, send)] = calls_to(relay)[..] else { panic!("{llvm}") };
+                    let [(released, release)] = calls_to(free)[..] else { panic!("{llvm}") };
+                    let operand = |inst, index| known_field_operand(inst, index).unwrap();
+                    let copies = instructions.iter().enumerate().filter_map(|(position, &inst)| {
+                        let callee = CallSiteValue::try_from(inst).ok()?.get_called_fn_value()?;
+                        (callee.get_name().to_bytes().starts_with(b"llvm.memmove.")
+                            && operand(inst, 0).as_instruction_value() == Some(allocation)).then_some((position, inst))
+                    }).collect::<Vec<_>>();
+                    let [(copied, copy)] = copies[..] else { panic!("{llvm}") };
+                    assert_eq!(operand(copy, 1).as_instruction_value().unwrap().get_opcode(), InstructionOpcode::Alloca);
+                    assert_eq!(operand(copy, 2).into_int_value().get_zero_extended_constant(), Some(count));
+                    let extent = operand(send, 0).as_instruction_value().unwrap();
+                    assert_eq!(extent.get_indices(), vec![1]);
+                    assert_eq!(operand(extent, 1).into_int_value().get_zero_extended_constant(), Some(count));
+                    let backing = operand(extent, 0).as_instruction_value().unwrap();
+                    assert_eq!(backing.get_indices(), vec![0]);
+                    assert_eq!(operand(backing, 1).as_instruction_value(), Some(allocation));
+                    let returned = operand(release, 0).as_instruction_value().unwrap();
+                    assert_eq!(returned.get_indices(), vec![0]);
+                    assert_eq!(operand(returned, 0).as_instruction_value(), Some(send));
+                    assert!(born < copied && copied < sent && sent < released, "{llvm}");
+                }
+                if let Some(out) = std::env::var_os("WOSY_FIXED_OWNING_ARGUMENT_IR_DIR") {
+                    let target = if layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
+                    let route = if project { "project" } else { "standalone" };
+                    let controlled = llvm.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);
+                    assert_ne!(controlled, llvm);
+                    std::fs::write(std::path::PathBuf::from(out).join(format!("{target}-{route}-control.ll")), controlled).unwrap();
+                }
+            }
+        }
+    }
+}

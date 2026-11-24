@@ -376,6 +376,7 @@ enum ExpressionReadMode {
     ArrayLengthArgument,
     WidenedBorrowAddress(ByteSpan),
     WidenedOwningRoundtrip(ByteSpan),
+    FixedCopyOwningArgument(ByteSpan, u64),
 }
 
 const MAX_JOINED_REBORROW_PARENTS: usize = 4;
@@ -1964,6 +1965,24 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         )?;
                     } else {
                         self.expression(argument, scope, ordinal)?;
+                    }
+                    let fixed_copy = if let (ScalarExpression::Name { .. }, Some(parameter @ ScalarType::RuntimeArray { .. })) =
+                        (argument, signature.and_then(|signature| signature.parameters.get(position)))
+                    {
+                        calls.structure.checked_types.expressions.get(&ordinal)
+                            .and_then(|actual| super::fixed_copy_to_runtime(parameter, actual))
+                    } else { None };
+                    if let Some((_, count)) = fixed_copy
+                    {
+                        let point = self.cursor.expect("fixed Copy argument");
+                        if !matches!(read_mode, ExpressionReadMode::FixedCopyOwningArgument(owner, actual)
+                            if position == 0 && actual == count
+                                && matches!(&self.cfg.points[point.0].kind, CfgPointKind::Read { binding }
+                                    if binding.declaration_span == owner))
+                        {
+                            return Err(self.missing_context(expression_span(argument),
+                                ReferenceAnalysisErrorReason::UnprovedWidenedArrayTransfer));
+                        }
                     }
                     argument_points.push(self.cursor.expect("evaluated call argument"));
                     if array_length {
@@ -4867,8 +4886,33 @@ impl<'a> ReferenceFlowBuilder<'a> {
                                 aggregate::same_runtime_array_type(ty, &receiver.ty)))
                             .map(|source| source.declaration_span)
                     } else { None };
+                    let fixed_copy_receiver = (|| {
+                        if binding.is_allocation || binding.fallible_assignment.is_some()
+                            || binding_region.receivers().len() != 1 || !outputs.secondary.is_empty()
+                            || binding.output_origin != ScalarBindingOutputOrigin::SingleExpression
+                            || !self.generic_parameters.is_empty() || self.names.contains_key(&receiver.name)
+                            || calls.declared_unsafe_calls.contains(&primary_ordinal.0)
+                        { return None; }
+                        let ScalarExpression::Call { arguments, .. } = primary else { return None; };
+                        let [ScalarExpression::Name { span, .. }] = arguments.as_slice() else { return None; };
+                        let signature = calls.checked_call_signatures.get(&primary_ordinal)?;
+                        if !aggregate::neutral_array_signature(&signature.parameters, &signature.outputs)
+                            || !aggregate::same_runtime_array_type(&signature.parameters[0], &receiver.ty)
+                            || !matches!(self.call_target(primary, primary_ordinal),
+                                Ok(ResolvedCallTarget::ModuleCallable { concrete: ConcreteCallSelection::Declaration, .. }))
+                        { return None; }
+                        let OccurrenceNode::Expression(argument) = calls.structure.edges.get(&(
+                            OccurrenceParent::Expression(primary_ordinal), OccurrenceEdge::CallArgument(0)))? else { return None; };
+                        let PlainNameIdentity::Lexical(source) = self.prepared_name_identity(*argument, *span).ok().flatten()?
+                        else { return None; };
+                        let (_, count) = self.binding_types.get(source).and_then(|ty|
+                            super::fixed_copy_to_runtime(&signature.parameters[0], ty))?;
+                        Some((source.declaration_span, count))
+                    })();
                     let before = self.cursor;
-                    let value = if let Some(owner) = widened_receiver_source {
+                    let value = if let Some((owner, count)) = fixed_copy_receiver {
+                        self.expression_with_read_mode(primary, scope, primary_ordinal, ExpressionReadMode::FixedCopyOwningArgument(owner, count))?
+                    } else if let Some(owner) = widened_receiver_source {
                         self.expression_with_read_mode(primary, scope, primary_ordinal, ExpressionReadMode::WidenedOwningRoundtrip(owner))?
                     } else if alias_owner.is_some() {
                         self.expression_with_read_mode(primary, scope, primary_ordinal, ExpressionReadMode::FallibleAliasInitializer)?
@@ -4989,7 +5033,19 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             (source.declaration_span, count));
                         true
                     } else { false };
-                    let widened = widened_join || widened_move || widened_receiver_source.is_some() || widened_fixed_copy
+                    if let Some((owner, count)) = fixed_copy_receiver {
+                        let point = call_producer.ok_or_else(|| self.missing_context(expression_span(primary),
+                            ReferenceAnalysisErrorReason::UnprovedWidenedArrayTransfer))?;
+                        let CfgPointKind::Call { argument_points, .. } = &self.cfg.points[point.0].kind
+                        else { return Err(self.missing_context(expression_span(primary), ReferenceAnalysisErrorReason::UnprovedWidenedArrayTransfer)); };
+                        if !matches!(argument_points.as_slice(), [argument]
+                            if matches!(&self.cfg.points[argument.0].kind, CfgPointKind::Read { binding } if binding.declaration_span == owner))
+                        { return Err(self.missing_context(expression_span(primary), ReferenceAnalysisErrorReason::UnprovedWidenedArrayTransfer)); }
+                        self.aggregate_result.fixed_copy_owning_arguments.insert(primary_ordinal.0, count);
+                        self.aggregate_result.widened_owning_receives.push((point, primary_ordinal, owner, receiver.span, None));
+                    }
+                    let widened = widened_join || widened_move || widened_receiver_source.is_some()
+                        || fixed_copy_receiver.is_some() || widened_fixed_copy
                         || super::widened_local_literal(binding).is_some();
                     if widened {
                         self.widened_arrays.get_or_insert_with(HashSet::new).insert(id.clone());

@@ -885,7 +885,7 @@ pub(super) fn array_neutral_scalar(ty: &ScalarType) -> bool {
     ordinary_value(ty) || matches!(ty, ScalarType::Enum(_))
 }
 
-pub(super) fn neutral_array_signature(parameters: &[ScalarType], outputs: &ScalarOutputSequence) -> bool {
+pub(in crate::scalar) fn neutral_array_signature(parameters: &[ScalarType], outputs: &ScalarOutputSequence) -> bool {
     array_roundtrip_signature(parameters, outputs)
         && matches!(parameters.first(), Some(ScalarType::RuntimeArray { element, .. }) if ordinary_value(element))
         && parameters[1..].iter().all(array_neutral_scalar)
@@ -1270,6 +1270,7 @@ pub(super) struct AggregateFlowResult {
     pub(super) borrowed_extent_forward: Option<(CfgPointId, OccurrenceOrdinal)>,
     pub(super) borrowed_extent_call: Option<(CfgPointId, OccurrenceOrdinal, ByteSpan, Option<ByteSpan>)>,
     pub(super) array_formal_extent_required: bool,
+    pub(super) fixed_copy_owning_arguments: BTreeMap<usize, u64>,
     pub(super) widened_owning_receives: Vec<(CfgPointId, OccurrenceOrdinal, ByteSpan, ByteSpan, Option<(CfgPointId, usize)>)>,
     pub(super) widened_owning_roundtrip: Option<(OccurrenceOrdinal, CfgPointId, ByteSpan)>,
     pub(super) widened_borrowed_extent_calls: Vec<(CfgPointId, OccurrenceOrdinal, ByteSpan)>,
@@ -2990,6 +2991,7 @@ pub(crate) struct ClosedBody {
     pub(crate) array_descriptor_observer: Option<ByteSpan>,
     pub(crate) array_descriptor_forward: Option<usize>,
     // Call occurrence -> its sole exact lexical backing declaration and install.
+    pub(crate) fixed_copy_owning_arguments: BTreeMap<usize, u64>,
     pub(crate) widened_owning_receives: BTreeMap<usize, (ByteSpan, ByteSpan, Option<(CfgPointId, usize)>)>,
     pub(crate) widened_owning_roundtrip: Option<(usize, CfgPointId, ByteSpan)>,
     pub(crate) array_descriptor_rebinds: BTreeMap<usize, (ByteSpan, usize)>,
@@ -7056,10 +7058,13 @@ fn closed_aggregates<'a>(
         seal_array_descriptor_identities(&ordinary, &returned_extent_requirements,
             &widened_owning_receives, &declarations, &array_descriptor_identities, &bodies, &mut result);
         for &(key, body, _, call, source, receiver, replace) in &widened_owning_receives {
-            if !result.bodies.get(&key).is_some_and(|plan|
+            let Some(plan) = result.bodies.get_mut(&key).filter(|plan|
                 plan.widened_owning_receives.get(&call.0) == Some(&(source, receiver, replace)))
-            {
+            else {
                 return Err(format!("widened array move requires a closed exact owning receiver in {:?}", body.source));
+            };
+            if let Some(&count) = body.facts.and_then(|facts| facts.fixed_copy_owning_arguments.get(&call.0)) {
+                plan.fixed_copy_owning_arguments.insert(call.0, count);
             }
         }
         for &(key, source, call, install, owner) in &widened_owning_roundtrips {

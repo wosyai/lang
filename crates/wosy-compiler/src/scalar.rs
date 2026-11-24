@@ -3853,14 +3853,22 @@ pub(crate) fn widened_local_literal(binding: &ScalarBinding) -> Option<(&ScalarT
         .then_some((element, elements, *span))
 }
 
-pub(crate) fn widened_fixed_copy<'a>(binding: &ScalarBinding, actual: &'a ScalarType) -> Option<(&'a ScalarType, u64)> {
-    let ScalarType::RuntimeArray { element: target, .. } = &binding.declared_type else { return None };
+fn fixed_copy_owning_signature(parameters: &[ScalarType], outputs: &ScalarOutputSequence) -> bool {
+    reference::aggregate::neutral_array_signature(parameters, outputs)
+}
+
+pub(crate) fn fixed_copy_to_runtime<'a>(target: &ScalarType, actual: &'a ScalarType) -> Option<(&'a ScalarType, u64)> {
+    let ScalarType::RuntimeArray { element: target, .. } = target else { return None };
     let ScalarType::Array { element, length, .. } = actual else { return None };
-    (!binding.is_allocation && binding.fallible_assignment.is_none()
-        && binding.receivers.len() == 1 && binding.output_origin == ScalarBindingOutputOrigin::SingleExpression
-        && matches!(binding.value, ScalarExpression::Name { .. })
-        && element == target && reference::aggregate::ordinary_value(element))
-        .then_some((element.as_ref(), *length))
+    (element == target && reference::aggregate::ordinary_value(element)).then_some((element.as_ref(), *length))
+}
+
+pub(crate) fn widened_fixed_copy<'a>(binding: &ScalarBinding, actual: &'a ScalarType) -> Option<(&'a ScalarType, u64)> {
+    if binding.is_allocation || binding.fallible_assignment.is_some()
+        || binding.receivers.len() != 1 || binding.output_origin != ScalarBindingOutputOrigin::SingleExpression
+        || !matches!(binding.value, ScalarExpression::Name { .. })
+    { return None; }
+    fixed_copy_to_runtime(&binding.declared_type, actual)
 }
 
 fn derive_type(node: &CstNode) -> ScalarType {

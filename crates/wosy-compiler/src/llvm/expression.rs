@@ -815,8 +815,24 @@ fn emit_prepared_call<'ctx, 'module>(
     if let Some(value) = aggregate_transfer::emit_array_descriptor_call(context, state, expression, target, arguments, &values)? {
         return Ok(value);
     }
+    reject_unpaired_fixed_copy_argument(state, arguments, parameters)?;
     aggregate_transfer::capture_checked_array_argument_extent(state, expression, arguments, &values)?;
     emit_call_values(context, state, target, values)
+}
+
+fn reject_unpaired_fixed_copy_argument(
+    state: &EmitState<'_, '_>,
+    arguments: &[ScalarExpression],
+    parameters: &[ScalarType],
+) -> Result<(), String> {
+    if let ([ScalarExpression::Name { name, .. }], [parameter @ ScalarType::RuntimeArray { .. }]) = (arguments, parameters) {
+        let ty = state.storage.get(name).map(|(_, ty)| ty)
+            .or_else(|| state.globals.get(name).map(|(_, ty)| ty));
+        if ty.is_some_and(|ty| crate::scalar::fixed_copy_to_runtime(parameter, ty).is_some()) {
+            return Err("fixed Copy owning argument requires a sealed owning receiver".into());
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn emit_contextual_arguments<'ctx, 'module>(
@@ -862,6 +878,7 @@ fn emit_call<'ctx, 'module>(
             "LLVM callable {qualified} has no callable signature"
         ));
     };
+    reject_unpaired_fixed_copy_argument(state, arguments, parameters)?;
     let values = arguments
         .iter()
         .zip(parameters)

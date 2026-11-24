@@ -4247,7 +4247,13 @@ fn check_expression_type_in_module(
                     overloads,
                     inference,
                 );
-                expect_module_type(target, parameter, &actual, *span, diagnostics);
+                let fixed_copy = !unsafe_callable && parameters.len() == 1 && type_arguments.is_empty()
+                    && matches!(argument, ScalarExpression::Name { .. })
+                    && super::fixed_copy_owning_signature(&parameters, &outputs)
+                    && super::fixed_copy_to_runtime(parameter, &actual).is_some();
+                if !fixed_copy {
+                    expect_module_type(target, parameter, &actual, *span, diagnostics);
+                }
                 error_argument |= is_error_type(&actual);
             }
             if unsafe_callable && !unsafe_context {
@@ -8938,7 +8944,13 @@ fn check_expression_type(
                     overloads,
                     inference,
                 );
-                expect_type(program, parameter, &actual, *span, diagnostics);
+                let fixed_copy = !unsafe_callable && parameters.len() == 1 && type_arguments.is_empty()
+                    && matches!(argument, ScalarExpression::Name { .. })
+                    && super::fixed_copy_owning_signature(&parameters, &outputs)
+                    && super::fixed_copy_to_runtime(parameter, &actual).is_some();
+                if !fixed_copy {
+                    expect_type(program, parameter, &actual, *span, diagnostics);
+                }
                 error_argument |= is_error_type(&actual);
             }
             if unsafe_callable && !unsafe_context {
