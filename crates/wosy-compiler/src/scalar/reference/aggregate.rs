@@ -2742,10 +2742,65 @@ impl StructuredOwnerReturn {
     }
 }
 
+// Exact source-ordered scalar companions around a unique whole owner move.
+// Used by both local receipt seeding and prepared owning-formal hops.
+pub(super) fn exact_owning_call_arguments<'a>(
+    points: &'a [ReferenceFlowPoint], first: &'a ReferenceFlowPoint, scope: ReferenceScopeId,
+    sites: &FunctionCallSites, ordinal: OccurrenceOrdinal, parameters: &[ScalarType],
+    holder: &ReferenceBindingId, holder_type: &ScalarType,
+) -> Option<(&'a ReferenceFlowPoint, usize, CfgPointId)> {
+    let structure = &sites.structure;
+    let next = |id| linear_successor(points, id).and_then(|next| points.get(next.0));
+    const MAX_OWNING_CALL_ARGUMENTS: usize = 4;
+    if parameters.len() > MAX_OWNING_CALL_ARGUMENTS || sites.declared_unsafe_calls.contains(&ordinal.0) {
+        return None;
+    }
+    let mut argument_points = [CfgPointId(0); MAX_OWNING_CALL_ARGUMENTS];
+    let mut owned = None;
+    let mut consumer = first;
+    for (slot, parameter) in parameters.iter().enumerate() {
+        let OccurrenceNode::Expression(argument) = *structure.edges.get(&(
+            OccurrenceParent::Expression(ordinal), OccurrenceEdge::CallArgument(slot),
+        ))? else { return None };
+        let span = sites.occurrences.get(argument.0)?.span;
+        if consumer.scope != scope || consumer.source_span.range != span
+            || structure.checked_types.expressions.get(&argument) != Some(parameter)
+        { return None; }
+        argument_points[slot] = consumer.id;
+        let plain = sites.prepared_plain_name(argument);
+        if parameter == holder_type {
+            let moved = next(consumer.id)?;
+            if owned.is_some() || moved.scope != scope || moved.source_span.range != span
+                || !matches!(plain, Some(PlainNameIdentity::Lexical(binding)) if binding == holder)
+                || !matches!(&consumer.kind, CfgPointKind::Read { binding } if binding == holder)
+                || !matches!(&moved.kind, CfgPointKind::Move { owner, place, ty }
+                    if owner == holder && &place.binding == holder && place.projections.is_empty() && ty == parameter)
+            { return None; }
+            owned = Some((slot, moved.id));
+            consumer = next(moved.id)?;
+        } else {
+            if !ordinary_value(parameter) || !match (&consumer.kind, plain) {
+                (CfgPointKind::Read { binding }, Some(PlainNameIdentity::Lexical(expected))) =>
+                    binding == expected && binding != holder,
+                (CfgPointKind::Evaluate(ScalarExpression::Boolean { .. } | ScalarExpression::Char { .. }
+                    | ScalarExpression::Integer { .. } | ScalarExpression::Float { .. }), None) => true,
+                _ => false,
+            } { return None; }
+            consumer = next(consumer.id)?;
+        }
+    }
+    let (owned_slot, moved) = owned?;
+    if !matches!(&consumer.kind, CfgPointKind::Call { output: 0, target: ResolvedCallTarget::ModuleCallable {
+        concrete: ConcreteCallSelection::Declaration, .. }, argument_points: actual, .. }
+        if actual.as_slice() == &argument_points[..parameters.len()])
+    { return None; }
+    Some((consumer, owned_slot, moved))
+}
+
 #[derive(Clone, Copy)]
 enum LocalChoiceUse {
     Observe(CfgPointId),
-    Consume { point: CfgPointId, ordinal: OccurrenceOrdinal },
+    Consume { point: CfgPointId, ordinal: OccurrenceOrdinal, slot: usize },
 }
 
 struct LocalReceiptChoice {
@@ -2991,16 +3046,16 @@ impl Body<'_> {
             LocalChoiceUse::Observe(end_use(read)?)
         } else {
             let signature = self.sites.checked_call_signatures.get(&scalar_call)?;
-            let [parameter] = signature.parameters.as_slice() else { return None };
             let [scalar] = signature.outputs.outputs.as_slice() else { return None };
-            if scalar.ty != output_ty.ty
-                || self.sites.declared_unsafe_calls.contains(&scalar_call.0)
-            { return None; }
-            let OccurrenceNode::Expression(argument) = *structure.edges.get(&(
-                OccurrenceParent::Expression(scalar_call), OccurrenceEdge::CallArgument(0),
-            ))? else { return None };
-            let argument_span = self.sites.occurrences.get(argument.0)?.span;
-            if let ScalarType::CheckedReference { mutability: ScalarReferenceMutability::Shared, inner } = parameter {
+            if scalar.ty != output_ty.ty { return None; }
+            if let [parameter @ ScalarType::CheckedReference {
+                mutability: ScalarReferenceMutability::Shared, inner,
+            }] = signature.parameters.as_slice() {
+                if self.sites.declared_unsafe_calls.contains(&scalar_call.0) { return None; }
+                let OccurrenceNode::Expression(argument) = *structure.edges.get(&(
+                    OccurrenceParent::Expression(scalar_call), OccurrenceEdge::CallArgument(0),
+                ))? else { return None };
+                let argument_span = self.sites.occurrences.get(argument.0)?.span;
                 let CfgPointKind::Borrow { place, loan } = &read.kind else { return None };
                 if !before_consume.is_empty()
                     || structure.checked_types.expressions.get(&argument) != Some(parameter)
@@ -3035,19 +3090,11 @@ impl Body<'_> {
                 { return None; }
                 LocalChoiceUse::Observe(end_use(reader)?)
             } else {
-                if alias.is_some() || parameter != &receiver.ty { return None; }
-                let moved = next(read.id)?;
-                let consumer = next(moved.id)?;
-                if moved.scope != scope || read.source_span.range != argument_span || moved.source_span.range != argument_span
-                    || !matches!(self.sites.prepared_plain_name(argument), Some(PlainNameIdentity::Lexical(binding)) if binding == holder)
-                    || !matches!(&read.kind, CfgPointKind::Read { binding } if binding == holder)
-                    || !matches!(&moved.kind, CfgPointKind::Move { owner, place, ty }
-                        if owner == holder && &place.binding == holder && place.projections.is_empty() && ty == parameter)
-                    || !matches!(&consumer.kind, CfgPointKind::Call { output: 0, target: ResolvedCallTarget::ModuleCallable {
-                        concrete: ConcreteCallSelection::Declaration, .. }, argument_points, .. }
-                        if argument_points.as_slice() == [read.id])
-                { return None; }
-                let origins = facts.inputs.get(&(consumer.id, scalar_call.0, 0, ArgumentProvenance::WholeMove(moved.id)))?;
+                if alias.is_some() { return None; }
+                let (consumer, owned_slot, moved) = exact_owning_call_arguments(
+                    points, read, scope, self.sites, scalar_call, &signature.parameters, holder, &receiver.ty,
+                )?;
+                let origins = facts.inputs.get(&(consumer.id, scalar_call.0, owned_slot, ArgumentProvenance::WholeMove(moved)))?;
                 if origins.len() != 1 || !origins.contains(&None) { return None; }
                 if let Some(binding) = saved_observation {
                     let OccurrenceNode::Expression(right) = *structure.edges.get(&(
@@ -3067,7 +3114,7 @@ impl Body<'_> {
                 } else {
                     end_use(consumer)?;
                 }
-                LocalChoiceUse::Consume { point: consumer.id, ordinal: scalar_call }
+                LocalChoiceUse::Consume { point: consumer.id, ordinal: scalar_call, slot: owned_slot }
             }
         };
         Some(LocalReceiptChoice {
@@ -3115,7 +3162,7 @@ impl Body<'_> {
         Some(LocalReceiptChoice {
             block: structure.root, item: None, conditional,
             leaves: self.local_choice_leaves(conditional, parameter)?,
-            use_site: LocalChoiceUse::Consume { point: consumer.id, ordinal: output.expression },
+            use_site: LocalChoiceUse::Consume { point: consumer.id, ordinal: output.expression, slot: 0 },
         })
     }
 
@@ -4873,11 +4920,11 @@ fn closed_aggregates<'a>(
             .is_some_and(|target| outgoing.contains(&target)
                 && bodies.get(&target).is_some_and(|callee| !callee.has_mixed_struct_result())))
         { continue; }
-        if let LocalChoiceUse::Consume { point, ordinal } = choice.use_site {
+        if let LocalChoiceUse::Consume { point, ordinal, slot } = choice.use_site {
             let callee = target_body(&declarations, body.cfg, point).ok_or("missing local conditional owner consumer")?;
-            let mode = modes.get_mut(&(callee, 0)).ok_or("missing local conditional owner input")?;
+            let mode = modes.get_mut(&(callee, slot)).ok_or("missing local conditional owner input")?;
             mode.0 = true;
-            local_choice_consumers.insert((key, point, ordinal.0), choice.conditional.0);
+            local_choice_consumers.insert((key, point, ordinal.0), (slot, choice.conditional.0));
         }
         local_choices.insert(key, choice);
     }
@@ -5051,8 +5098,8 @@ fn closed_aggregates<'a>(
             if origins.is_empty() && !initializer_owned_formals.contains(&(callee, slot)) {
                 continue;
             }
-            let action = if let Some(&receipt) = local_choice_consumers.get(&(caller, consumer, ordinal)) {
-                if slot != 0 || mixed {
+            let action = if let Some(&(owned_slot, receipt)) = local_choice_consumers.get(&(caller, consumer, ordinal)) {
+                if slot != owned_slot || mixed {
                     return Err(format!("local conditional owner requires an exact owning formal in {:?}", bodies[&caller].source));
                 }
                 // This binding transfers its single selected backing to the

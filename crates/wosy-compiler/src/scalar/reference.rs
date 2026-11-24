@@ -721,7 +721,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     Some((Some(id), None)),
                 CfgPointKind::Call { output: 0, target: ResolvedCallTarget::ModuleCallable { .. },
                     argument_points, .. }
-                    if moved.is_some() && call.is_none() && argument_points.len() == 1 =>
+                    if moved.is_some() && call.is_none() && (1..=4).contains(&argument_points.len()) =>
                     Some((moved, Some(id))),
                 CfgPointKind::ReturnOutput { output: 0, value_point, checked: true }
                     if self.independent_checked_query && call == Some(*value_point) =>
@@ -15200,9 +15200,27 @@ fn build_function_reference_cfg(
         builder.cfg.initial_points = builder.cfg.points.clone();
         if let Some((Some(moved), Some(call))) = builder.formal_forward_shape {
             let terminal = builder.cfg.points.last().map(|point| &point.kind);
-            if matches!(terminal, Some(CfgPointKind::Return))
+            let exact_args = match &builder.cfg.points[call.0].kind {
+                CfgPointKind::Call { argument_points, .. } if argument_points.len() == 1 => true,
+                CfgPointKind::Call { argument_points, .. } => (|| {
+                    let points = &builder.cfg.points;
+                    let first = points.get(argument_points.first()?.0)?;
+                    let (&formal, holder) = builder.aggregate_facts.formals.iter().next()?;
+                    let ty = &call_sites.boundary.parameters.get(formal)?.ty;
+                    let (ordinal, moves) = builder.aggregate_facts.input_moves.get(&call)?;
+                    let signature = call_sites.checked_call_signatures.get(ordinal)?;
+                    let (prepared, slot, exact_move) = aggregate::exact_owning_call_arguments(
+                        points, first, points[call.0].scope, call_sites, *ordinal,
+                        &signature.parameters, holder, ty,
+                    )?;
+                    Some(moves.len() == 1 && prepared.id == call && exact_move == moved
+                        && moves.get(&slot) == Some(&aggregate::ArgumentProvenance::WholeMove(moved)))
+                })().unwrap_or(false),
+                _ => false,
+            };
+            if exact_args && (matches!(terminal, Some(CfgPointKind::Return))
                 || (call_sites.boundary.root_outputs.is_empty()
-                    && matches!(terminal, Some(CfgPointKind::ScopeExit)))
+                    && matches!(terminal, Some(CfgPointKind::ScopeExit))))
             {
                 builder.aggregate_facts.formal_forward_shape = Some((moved, call));
             }

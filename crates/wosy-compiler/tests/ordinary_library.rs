@@ -1374,6 +1374,14 @@ fn lexical_conditional_owner_choice_releases_selected_original_after_read() {
     let through_arms = forwarding("if (packet.length == 2) { terminal(packet) } else { forward(packet) }");
     assert_ne!(through_calls, saved_then_consumed);
     assert_ne!(through_arms, saved_then_consumed);
+    let middle_slot = saved_then_consumed.replace(
+        "u64(Packet) consume = fn(packet) { packet.length };",
+        "u64(u64, Packet, u64) terminal = fn(left, packet, right) { packet.length + left + right };\n\
+         u64(u64, Packet, u64) forward = fn(left, packet, right) { terminal(left, packet, right) };\n\
+         u64(u64, Packet, u64) consume = fn(left, packet, right) { forward(left, packet, right) };",
+    ).replace("consume(chosen) + observed", "consume(1, chosen, 2) + observed")
+        .replace("== 24", "== 27").replace("== 4) { 2", "== 7) { 2");
+    assert_ne!(middle_slot, saved_then_consumed);
     let multiple_then_consumed = saved_then_consumed
         .replace("u64(*u64) read_selected", "u64(*Packet) read_whole = fn(view) { (*view).length };\nu64(*u64) read_selected")
         .replace("    u64 observed = read_selected", "    read_whole(&chosen);\n    u64 observed = read_selected");
@@ -1422,6 +1430,7 @@ fn lexical_conditional_owner_choice_releases_selected_original_after_read() {
         (saved_then_consumed.as_str(), "consume-after-saved-borrow"),
         (through_calls.as_str(), "consume-after-forwarded-borrow"),
         (through_arms.as_str(), "consume-after-exhaustive-borrow"),
+        (middle_slot.as_str(), "consume-through-middle-slot"),
         (multiple_then_consumed.as_str(), "consume-after-multiple-borrows"),
         (saved_then_released.as_str(), "release-after-saved-borrows"),
         (computed_then_released.as_str(), "release-after-scalar-continuation"),
@@ -1436,7 +1445,8 @@ fn lexical_conditional_owner_choice_releases_selected_original_after_read() {
         let multiple = releases_saved || base_use == "consume-after-multiple-borrows";
         let updates_metadata = base_use == "consume-after-metadata-write";
         let exhaustive = base_use == "consume-after-exhaustive-borrow";
-        let forwarding = exhaustive || base_use == "consume-after-forwarded-borrow";
+        let middle_slot = base_use == "consume-through-middle-slot";
+        let forwarding = exhaustive || middle_slot || base_use == "consume-after-forwarded-borrow";
         let borrowing = multiple || updates_metadata || forwarding
             || matches!(base_use, "borrow" | "named-borrow" | "consume-after-borrow" | "consume-after-saved-borrow");
         for (target, target_layout) in [("native64", ScalarTargetLayout::NATIVE64), ("wasm32", ScalarTargetLayout::WASM32)] {
@@ -1485,8 +1495,15 @@ fn lexical_conditional_owner_choice_releases_selected_original_after_read() {
                         writes.push((callee, arg(call.count_arguments() - 1), call.try_as_basic_value().basic().unwrap()));
                     } else if Some(callee) == consumer {
                         assert!(!borrowing || reader_seen, "the certified read precedes sole owner transfer");
-                        assert_eq!(call.count_arguments(), 2);
-                        transfers.push((arg(0), arg(1)));
+                        if middle_slot {
+                            assert_eq!(call.count_arguments(), 4);
+                            assert_eq!(arg(0).into_int_value().get_zero_extended_constant(), Some(1));
+                            assert_eq!(arg(2).into_int_value().get_zero_extended_constant(), Some(2));
+                            transfers.push((arg(1), arg(3)));
+                        } else {
+                            assert_eq!(call.count_arguments(), 2);
+                            transfers.push((arg(0), arg(1)));
+                        }
                     } else if Some(callee) == reader || Some(callee) == whole_reader {
                         assert_eq!(expected_readers.next(), Some(callee), "every authored loan is observed in order");
                         assert_eq!(call.count_arguments(), 1, "a reader never receives the owning sidecar");
@@ -1546,8 +1563,9 @@ fn lexical_conditional_owner_choice_releases_selected_original_after_read() {
                                 let call = CallSiteValue::try_from(row).unwrap();
                                 let target = call.get_called_fn_value().unwrap();
                                 if target == middle || target == terminal {
-                                    assert_eq!(call.count_arguments(), 2);
-                                    assert_eq!(row.get_operand(1).unwrap().value().unwrap(), function.get_last_param().unwrap());
+                                    assert_eq!(call.count_arguments(), if middle_slot { 4 } else { 2 });
+                                    assert_eq!(row.get_operand(call.count_arguments() - 1).unwrap().value().unwrap(),
+                                        function.get_last_param().unwrap());
                                     targets.push(if target == middle { "forward" } else { "terminal" });
                                 } else {
                                     assert!(matches!(target.get_name().to_str().unwrap(),
@@ -1590,6 +1608,14 @@ fn lexical_conditional_owner_choice_releases_selected_original_after_read() {
                         let uncertified = text.replace("{ *view }", "{ u64 observed = *view; observed }");
                         assert_ne!(uncertified, text);
                         assert!(emit(&uncertified).expect_err("the pre-transfer loan needs exact nonescape authority")
+                            .contains("aggregate owning call has no proved endpoint"));
+                    }
+                    if middle_slot {
+                        let opaque = text.replace("u64(u64, Packet, u64) terminal",
+                            "u64(u64) companion = fn(value) { value };\nu64(u64, Packet, u64) terminal")
+                            .replace("consume(1, chosen, 2)", "consume(companion(1), chosen, 2)");
+                        assert_ne!(opaque, text);
+                        assert!(emit(&opaque).expect_err("nontrivial companion effects are outside the transfer corridor")
                             .contains("aggregate owning call has no proved endpoint"));
                     }
                     if updates_metadata {
