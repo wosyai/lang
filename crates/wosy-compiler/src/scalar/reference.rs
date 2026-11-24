@@ -7250,6 +7250,10 @@ fn joined_direct_lexical_place(place: &ReferencePlaceId) -> bool {
             ScalarPlace::Field { base, field: ScalarFieldReference::Resolved(written), .. },
             [ReferencePlaceProjection::Field(ScalarFieldReference::Resolved(edge))],
         ) => matches!(base.as_ref(), ScalarPlace::Name { .. }) && written == edge,
+        (
+            ScalarPlace::Index { base, index, .. },
+            [ReferencePlaceProjection::Index(edge @ ScalarExpression::Integer { .. })],
+        ) => matches!(base.as_ref(), ScalarPlace::Name { .. }) && index.as_ref() == edge,
         _ => false,
     }
 }

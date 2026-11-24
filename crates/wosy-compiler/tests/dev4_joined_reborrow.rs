@@ -12,6 +12,7 @@ enum Expected {
     NullParent,
     LiveConflict,
     LiveSelectedFieldConflict,
+    LiveSelectedIndexConflict,
     LiveDescendantConflict,
     LiveFamilyConflict,
     LiveMutableConflict,
@@ -55,10 +56,11 @@ fn check_case(text: &str, expected: Expected, witness_dir: Option<&str>) {
                     }), "{target}/{route}: {diagnostics:?}");
                 }
                 Expected::Declined => assert!(diagnostics.iter().any(|item| item.code == "B0003"), "{target}/{route}: {diagnostics:?}"),
-                Expected::LiveConflict | Expected::LiveSelectedFieldConflict | Expected::LiveDescendantConflict | Expected::LiveFamilyConflict | Expected::LiveMutableConflict | Expected::FrozenMutableConflict => {
+                Expected::LiveConflict | Expected::LiveSelectedFieldConflict | Expected::LiveSelectedIndexConflict | Expected::LiveDescendantConflict | Expected::LiveFamilyConflict | Expected::LiveMutableConflict | Expected::FrozenMutableConflict => {
                     let write = match expected {
                         Expected::FrozenMutableConflict => "*child = seen + 4",
                         Expected::LiveSelectedFieldConflict => "owner.left = 3",
+                        Expected::LiveSelectedIndexConflict => "bytes[0] = 3",
                         _ => "first = 3",
                     };
                     let write = text.find(write).expect("conflicting write") as u32;
@@ -67,6 +69,7 @@ fn check_case(text: &str, expected: Expected, witness_dir: Option<&str>) {
                         // projected store is diagnosed at its resolved field token.
                         Expected::FrozenMutableConflict => Some((1, "child".len())),
                         Expected::LiveSelectedFieldConflict => Some(("owner.".len(), "left".len())),
+                        Expected::LiveSelectedIndexConflict => Some((0, "bytes".len())),
                         _ => None,
                     };
                     let write = write + exact_operand.map_or(0, |(shift, _)| shift as u32);
@@ -151,6 +154,24 @@ fn joined_sibling_scalar_fields_keep_disjoint_place_authority() {
     let overlapping = program.replace("&!owner.right", "&!owner.left");
     assert_ne!(overlapping, program);
     check(&overlapping, Expected::NullParent);
+}
+
+#[test]
+fn joined_constant_array_elements_keep_disjoint_place_authority() {
+    let program = joined("parent = &!bytes[1];", true, "", "bytes[2] = 4; u8 observed = *child;")
+        .replace("u8 first = 7;\n    u8 second = 9;", "u8[3] bytes = [7, 9, 0];")
+        .replace("&!first", "&!bytes[0]")
+        .replace("    seen\n", "    if (observed == seen && bytes[2] == 4) { observed } else { 0 }\n");
+    check_case(&program, Expected::Valid, Some("WOSY_JOINED_ARRAY_ELEMENTS_IR_DIR"));
+    let live = program.replace("bytes[2] = 4;", "bytes[0] = 3; bytes[2] = 4;");
+    assert_ne!(live, program);
+    check(&live, Expected::LiveSelectedIndexConflict);
+    let overlapping = program.replace("&!bytes[1]", "&!bytes[0]");
+    assert_ne!(overlapping, program);
+    check(&overlapping, Expected::NullParent);
+    let dynamic = program.replace("parent = &!bytes[1];", "u64 slot = 1; parent = &!bytes[slot];");
+    assert_ne!(dynamic, program);
+    check(&dynamic, Expected::NullParent);
 }
 
 #[test]
