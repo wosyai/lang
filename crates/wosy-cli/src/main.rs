@@ -18,7 +18,7 @@ use std::process::ExitCode;
 use std::sync::atomic::{AtomicU64, Ordering};
 use wosy_compiler::{
     analyze_scalar_build, derive_scalar_declarations_from_cst, emit_scalar_build_project_llvm_text,
-    emit_scalar_build_single_module_llvm_text, parse_source_with_snapshot, prepare_scalar_project,
+    emit_scalar_build_single_module_llvm_text, parse_source_with_snapshot, prepare_scalar_project_with_access,
     publication,
     serialize_publication, ScalarNamespaceBinding, ScalarPreparationInputs, ScalarTargetLayout,
 };
@@ -284,17 +284,30 @@ fn compile_project(
     configuration: &ProjectConfiguration,
     target_layout: ScalarTargetLayout,
 ) -> Result<(String, Vec<SourceObservation>), String> {
-    // Actual access-site selection is a separate lowering change. Merely
-    // compiling a user's project must not pull in an unrelated module.
-    compile_project_with_component(root, project, configuration, target_layout, None)
+    compile_project_with_access_policy(
+        root, project, configuration, target_layout,
+        Some(checked_access_component::CheckedAccessComponent::linked()), true,
+    )
 }
 
+#[cfg(test)]
 fn compile_project_with_component(
     root: &std::path::Path,
     project: &ProjectContext,
     configuration: &ProjectConfiguration,
     target_layout: ScalarTargetLayout,
     component: Option<checked_access_component::CheckedAccessComponent>,
+) -> Result<(String, Vec<SourceObservation>), String> {
+    compile_project_with_access_policy(root, project, configuration, target_layout, component, false)
+}
+
+fn compile_project_with_access_policy(
+    root: &std::path::Path,
+    project: &ProjectContext,
+    configuration: &ProjectConfiguration,
+    target_layout: ScalarTargetLayout,
+    component: Option<checked_access_component::CheckedAccessComponent>,
+    demand_only: bool,
 ) -> Result<(String, Vec<SourceObservation>), String> {
     let root_path = PackageRelativePath::new(project.source_root.clone())?;
     let root_project = root.to_string_lossy().into_owned();
@@ -416,13 +429,20 @@ fn compile_project_with_component(
         render_graph_diagnostics(&error, &texts);
         format_graph_error(error)
     })?;
+    let mut demanded_component = None;
     if let Some(component) = component {
-        let (node, declarations, text) = component.into_preparation()?;
-        #[cfg(test)]
-        routing_observations::record(|counts| counts.extractions += 1);
-        declarations_by_path.insert(node.source.clone(), declarations);
-        texts.insert(node.source.clone(), text);
-        graph.append_independent_leaf(node)?;
+        if demand_only {
+            let (node, access) = component.into_source();
+            texts.insert(node.source.clone(), access.text().to_owned());
+            demanded_component = Some((node, access));
+        } else {
+            let (node, declarations, text) = component.into_preparation()?;
+            #[cfg(test)]
+            routing_observations::record(|counts| counts.extractions += 1);
+            declarations_by_path.insert(node.source.clone(), declarations);
+            texts.insert(node.source.clone(), text);
+            graph.append_independent_leaf(node)?;
+        }
     }
     let mut project_declarations = Vec::new();
     let sources: Vec<_> = graph.nodes.iter().map(|node| {
@@ -473,15 +493,28 @@ fn compile_project_with_component(
     drop(declarations_by_path);
     #[cfg(test)]
     routing_observations::record(|counts| counts.preparations += 1);
-    let prepared = prepare_scalar_project(
+    let (node, access) = match demanded_component {
+        Some((node, access)) => (Some(node), Some(access)),
+        None => (None, None),
+    };
+    let prepared = prepare_scalar_project_with_access(
         project_declarations,
         initialization_order,
         ScalarPreparationInputs { target_layout },
+        access,
     )
     .map_err(|rejected| {
         render_project_diagnostics(&rejected.into_ordered_diagnostics(), &texts);
         "build rejected by semantic diagnostics".to_owned()
     })?;
+    if let (Some(node), Some(source)) = (node, prepared.checked_access_source()) {
+        if compiler_source_identity(&node.source, &node.content_revision) != *source {
+            return Err("release checked-access source identity changed during preparation".to_owned());
+        }
+        #[cfg(test)]
+        routing_observations::record(|counts| counts.extractions += 1);
+        graph.append_independent_leaf(node)?;
+    }
     #[cfg(test)]
     routing_observations::record(|counts| counts.builds += 1);
     let validation = analyze_scalar_build(&prepared);
@@ -758,7 +791,7 @@ fn artifact_identity(
 }
 
 fn compiler_identity() -> String {
-    wosy_compiler::COMPILER_IDENTITY.to_owned()
+    format!("{}+checked-access-fixed-v1", wosy_compiler::COMPILER_IDENTITY)
 }
 
 fn llvm_identity() -> String {
@@ -950,6 +983,107 @@ mod tests {
     }
 
     #[test]
+    fn default_build_wires_release_checked_access_without_a_user_std_import() {
+        let text = r#"%%start
+struct copy Entry { u8 value; }
+struct RawBytes { u8[3] values; }
+Entry[2] entries = [{ .value = 1; }, { .value = 2; }];
+u64(u64) select_index = fn(index) { index };
+u8(u8) replacement = fn(value) { value };
+unit(u64, u8) aggregate_update = fn(index, value) {
+    entries[select_index(index)] = { .value = replacement(value); };
+};
+u8(u64, u8) scalar_index = fn(index, value) {
+    u8[3] cells = [7, 8, 9];
+    cells[index] = value;
+    cells[index]
+};
+u8(*u8) read_checked = fn(value) { *value };
+u8() witness = fn {
+    u8 byte = 42;
+    read_checked(&byte)
+};
+u8(u64) read_explicit_raw = fn(index) {
+    RawBytes record = { .values = [4, 5, 6]; };
+    unsafe {
+        *?RawBytes raw = &?record;
+        *?u8 element = &?(*raw).values[index];
+        core.load<u8>(element)
+    }
+};
+aggregate_update(1, 12);
+if (scalar_index(2, 23) != 23 || witness() != 42 || read_explicit_raw(1) != 5) { core.system_panic(); };
+%%end"#;
+        let (project, configuration) = routing_test_project("default-release-access", &[("main.w", text)]);
+        let hex = |name: &str| name.bytes().map(|byte| format!("{byte:02x}")).collect::<String>();
+        for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let (llvm, observations) = compile_project(&project.root, &project, &configuration, layout).unwrap();
+            let [_, access] = observations.as_slice() else { panic!("expect one release component") };
+            assert_eq!(current_source_observation(access).unwrap(), *access);
+            let release = hex(&access.content_revision.0);
+            let bounds = format!("__{release}__{}", hex("check_index_in_extent"));
+            let non_null = format!("__{release}__{}", hex("check_non_null_address"));
+            let body = |name: &str| {
+                let suffix = format!("__{}(", hex(name));
+                let (_, rest) = llvm.lines().find(|line| line.starts_with("define ") && line.contains(&suffix))
+                    .and_then(|line| llvm.split_once(line)).expect("ordinary function definition");
+                rest.split_once("\n}").unwrap().0
+            };
+            let aggregate = body("aggregate_update");
+            let stage_rhs = aggregate.find(&format!("__{}(", hex("replacement"))).unwrap();
+            let selector = format!("__{}(", hex("select_index"));
+            let stage_index = aggregate.find(&selector).unwrap();
+            let check = aggregate.find(&bounds).unwrap();
+            let address = aggregate[check..].find("getelementptr inbounds").unwrap() + check;
+            assert!(stage_rhs < stage_index && stage_index < check && check < address);
+            assert_eq!(aggregate.matches(&selector).count(), 1);
+            assert_eq!(aggregate.matches(&bounds).count(), 1);
+            assert!(!aggregate.contains("assignment_index_out_of_bounds"));
+            let call = aggregate.lines().find(|line| line.contains(&bounds)).unwrap();
+            let (index, extent) = call.split_once("(i64 ").unwrap().1.split_once(", i64 ").unwrap();
+            assert_eq!(extent, "2)");
+            assert!(aggregate[address..].lines().next().unwrap().ends_with(&format!(", i64 {index}")));
+
+            let scalar = body("scalar_index");
+            let mut checks = 0;
+            let mut outstanding = None;
+            for line in scalar.lines() {
+                if line.contains(&bounds) {
+                    assert!(outstanding.is_none(), "index guard was not consumed by an address");
+                    let arguments = line.split_once("(i64 ").unwrap().1;
+                    let (index, length) = arguments.split_once(", i64 ").unwrap();
+                    assert_eq!(length, "3)");
+                    outstanding = Some(index);
+                    checks += 1;
+                }
+                if line.contains("getelementptr inbounds [3 x i8]") {
+                    let Some((_, index)) = line.rsplit_once(", i64 ") else { continue };
+                    if index.starts_with('%') {
+                        assert_eq!(outstanding.take(), Some(index), "GEP must use its already-guarded U64 index");
+                    }
+                }
+            }
+            assert_eq!(checks, 2);
+            assert!(outstanding.is_none());
+
+            let dereference = body("read_checked");
+            assert_eq!(dereference.matches(&non_null).count(), 1);
+            let check = dereference.lines().find(|line| line.contains(&non_null)).unwrap();
+            let width = layout.pointer_size * 8;
+            let argument = check.split_once(&format!("(i{width} ")).unwrap().1.trim_end_matches(')');
+            assert!(!argument.is_empty());
+            assert!(dereference.find(&non_null).unwrap()
+                < dereference.find(&format!("inttoptr i{width} {argument} to ptr")).unwrap());
+            assert!(!dereference.contains("deref_is_null"));
+            assert!(!dereference.contains("__wosy_core_system_panic"));
+            let raw = body("read_explicit_raw");
+            assert!(raw.contains("getelementptr inbounds [3 x i8]"));
+            assert!(!raw.contains(&non_null) && !raw.contains(&bounds), "{raw}");
+        }
+        fs::remove_dir_all(&project.root).unwrap();
+    }
+
+    #[test]
     fn release_checked_access_component_is_an_ordinary_independent_graph_leaf() {
         let user = "%%start\nu64() value = fn { 42 };\nvalue();\n%%end";
         let (project, configuration) = routing_test_project("release-access", &[("main.w", user)]);
@@ -979,7 +1113,7 @@ mod tests {
     fn lookalike_user_namespace_cannot_supply_the_release_checked_access_source() {
         let (mut project, configuration) = routing_test_project(
             "release-access-lookalike",
-            &[("main.w", "%%start\nuser = namespace wosy_toolchain_stdlib \"src/checked_access.w\";\nuser.check_index_in_extent(2, 3);\n%%end")],
+            &[("main.w", "%%start\nuser = namespace wosy_toolchain_stdlib \"src/checked_access.w\";\nuser.check_index_in_extent(2, 3);\nu8(u64) read = fn(index) { u8[3] values = [7, 8, 9]; values[index] };\nread(2);\n%%end")],
         );
         // Even the same package and relative path are not the same qualified
         // source. Ordinary user resolution continues to call its own function.
@@ -1009,6 +1143,17 @@ mod tests {
             && line.contains(symbol_suffix)).collect::<Vec<_>>();
         let [called] = calls.as_slice() else { panic!("{calls:?}") };
         assert!(called.contains(&user_revision), "{called}");
+        let (migrated, migrated_sources) = compile_project(
+            &project.root, &project, &configuration, ScalarTargetLayout::NATIVE64,
+        ).unwrap();
+        assert_eq!(migrated_sources, observations);
+        let release_revision = release.content_revision.0.bytes()
+            .map(|byte| format!("{byte:02x}")).collect::<String>();
+        let migrated_calls = migrated.lines().filter(|line| line.contains("call void @")
+            && line.contains(symbol_suffix)).collect::<Vec<_>>();
+        assert_eq!(migrated_calls.len(), 2);
+        assert_eq!(migrated_calls.iter().filter(|call| call.contains(&user_revision)).count(), 1);
+        assert_eq!(migrated_calls.iter().filter(|call| call.contains(&release_revision)).count(), 1);
         fs::remove_dir_all(&project.root).unwrap();
     }
 

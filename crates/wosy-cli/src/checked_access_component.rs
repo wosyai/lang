@@ -1,42 +1,39 @@
 //! Selection and freshness for the release-owned ordinary Wosy access source.
 //! This root is deliberately not exposed as a user namespace or package alias.
 
-use wosy_compiler::{derive_scalar_declarations_from_cst, parse_source, ScalarSourceDeclarations};
+use wosy_compiler::{derive_scalar_declarations_from_cst, parse_source_with_snapshot, ScalarSourceDeclarations};
 use wosy_project::{
     ContentRevision, PackageRelativePath, SourceIdentity, SourceNodeInput, SourceObservation,
 };
-use wosy_stdlib_source::{
-    CHECKED_ACCESS_CONTRACT, CHECKED_ACCESS_SOURCE, PACKAGE_VERSION,
-};
-
-const RELEASE_ORIGIN: &str = "wosy-release://stdlib";
-const INTERNAL_PACKAGE: &str = "wosy_toolchain_stdlib";
-const MODULE_PATH: &str = "src/checked_access.w";
+use wosy_stdlib_source::CheckedAccessComponent as ReleaseAccess;
 
 pub(super) struct CheckedAccessComponent {
     observation: SourceObservation,
+    release: ReleaseAccess,
 }
 
 impl CheckedAccessComponent {
-    // The next tranche will invoke this only for projects whose prepared
-    // language operations request this capability. Do not infer that request
-    // from a user-supplied module, namespace, or function spelling.
     pub(super) fn linked() -> Self {
-        let mut hash = blake3::Hasher::new();
-        for field in [CHECKED_ACCESS_CONTRACT, PACKAGE_VERSION, CHECKED_ACCESS_SOURCE] {
-            hash.update(&(field.len() as u64).to_le_bytes());
-            hash.update(field.as_bytes());
-        }
+        let release = ReleaseAccess::linked();
         Self {
             observation: SourceObservation {
                 source: SourceIdentity::new(
-                    RELEASE_ORIGIN.to_owned(),
-                    INTERNAL_PACKAGE.to_owned(),
-                    PackageRelativePath::new(MODULE_PATH.into()).expect("fixed relative module"),
+                    release.project().to_owned(),
+                    release.package().to_owned(),
+                    PackageRelativePath::new(release.path().into()).expect("fixed relative module"),
                 ),
-                content_revision: ContentRevision(hash.finalize().to_hex().to_string()),
+                content_revision: ContentRevision(release.revision().to_owned()),
             },
+            release,
         }
+    }
+
+    pub(super) fn into_source(self) -> (SourceNodeInput, ReleaseAccess) {
+        let SourceObservation { source, content_revision } = self.observation;
+        (
+            SourceNodeInput { source, content_revision, namespace_edges: Vec::new() },
+            self.release,
+        )
     }
 
     pub(super) fn into_preparation(
@@ -44,24 +41,25 @@ impl CheckedAccessComponent {
     ) -> Result<(SourceNodeInput, ScalarSourceDeclarations, String), String> {
         let SourceObservation { source, content_revision } = self.observation;
         let compiler_identity = super::compiler_source_identity(&source, &content_revision);
-        let parsed = parse_source(compiler_identity, CHECKED_ACCESS_SOURCE.to_owned(), &[]);
-        if !parsed.diagnostics.is_empty() {
+        let (fresh, diagnostics) =
+            parse_source_with_snapshot(compiler_identity, self.release.text().to_owned(), &[]);
+        if !diagnostics.is_empty() {
             return Err("toolchain checked-access source has syntax diagnostics".to_owned());
         }
-        let declarations = derive_scalar_declarations_from_cst(parsed.result.canonical_cst());
+        let declarations = derive_scalar_declarations_from_cst(fresh.result().canonical_cst());
         if !declarations.diagnostics().is_empty() || declarations.namespaces().next().is_some() {
             return Err("toolchain checked-access source is not an independent module".to_owned());
         }
         Ok((
             SourceNodeInput { source, content_revision, namespace_edges: Vec::new() },
             declarations,
-            parsed.result.text,
+            fresh.into_result().text,
         ))
     }
 }
 
 pub(super) fn refresh_observation(source: &SourceIdentity) -> Result<Option<SourceObservation>, String> {
-    if source.project != RELEASE_ORIGIN {
+    if source.project != ReleaseAccess::linked().project() {
         return Ok(None);
     }
     let current = CheckedAccessComponent::linked().observation;

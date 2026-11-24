@@ -3109,6 +3109,17 @@ pub fn prepare_scalar_project(
     initialization_order: Vec<SourceIdentity>,
     inputs: ScalarPreparationInputs,
 ) -> Result<PreparedScalarProject, ScalarProjectPreparationRejection> {
+    prepare_scalar_project_with_access(declarations, initialization_order, inputs, None)
+}
+
+/// Prepare ordinary user sources once. A source supplied by the build host
+/// may satisfy the checked-access capability; it is not a user import.
+pub fn prepare_scalar_project_with_access(
+    declarations: Vec<(ScalarSourceDeclarations, Vec<ScalarNamespaceBinding>)>,
+    initialization_order: Vec<SourceIdentity>,
+    inputs: ScalarPreparationInputs,
+    checked_access: Option<wosy_stdlib_source::CheckedAccessComponent>,
+) -> Result<PreparedScalarProject, ScalarProjectPreparationRejection> {
     let mut modules = Vec::with_capacity(declarations.len());
     let mut diagnostics = Vec::new();
     for (declarations, namespace_bindings) in declarations {
@@ -3136,7 +3147,7 @@ pub fn prepare_scalar_project(
             },
         ));
     }
-    PreparedScalarProject::new(project)
+    PreparedScalarProject::new_with_access(project, checked_access.map(|source| (source, inputs.target_layout)))
 }
 
 pub fn validate_scalar_project(project: ScalarProject) -> ScalarProjectValidation {

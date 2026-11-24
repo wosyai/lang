@@ -106,9 +106,18 @@ struct MemberName<'module> {
     unsigned: bool,
 }
 
+struct CheckedAccessSymbols {
+    non_null: String,
+    in_extent: String,
+}
+
 struct ProjectNames<'ctx, 'module> {
     scopes: Vec<ModuleNames<'ctx, 'module>>,
     positions: HashMap<&'module wosy_syntax::SourceIdentity, usize>,
+    checked_access: Option<CheckedAccessSymbols>,
+
+    require_release_checked_access: bool,
+
 }
 
 impl<'ctx, 'module> ProjectNames<'ctx, 'module> {
@@ -119,6 +128,8 @@ impl<'ctx, 'module> ProjectNames<'ctx, 'module> {
 
 struct EmitState<'ctx, 'module> {
     prepared_render: bool,
+    require_release_checked_access: bool,
+
     aggregate: Option<aggregate_transfer::AggregateEmitter<'ctx, 'module>>,
     initializer_aggregate: Option<aggregate_transfer::InitializerEmitter<'ctx, 'module>>,
     initializer_nodes: Option<&'module InitializerCallNodes<'module>>,
@@ -653,6 +664,7 @@ fn emit_single_module_llvm<'a>(
         let nodes = generic_input.bind_body(0, item, arm, &function.body)?;
         emit_function(
             prepared_render,
+            generic_input.requires_release_checked_access(),
             aggregates.body(0, item, arm),
             &context,
             &builder,
@@ -676,6 +688,7 @@ fn emit_single_module_llvm<'a>(
     }
     emit_main(
         prepared_render,
+        generic_input.requires_release_checked_access(),
         aggregates.initializer(source),
         &context,
         &builder,
@@ -1133,6 +1146,13 @@ fn emit_project_llvm<'a>(
     let names = ProjectNames {
         scopes,
         positions: module_positions,
+        require_release_checked_access: generic_input.requires_release_checked_access(),
+        checked_access: project_build.and_then(|build| build.prepared().checked_access()).map(|access| {
+            CheckedAccessSymbols {
+                non_null: project_function_name(&access.source, &access.non_null),
+                in_extent: project_function_name(&access.source, &access.in_extent),
+            }
+        }),
     };
     for (ordinal, source_module, function, cfg, name, item, arm, original) in definitions
         .iter()
@@ -2005,6 +2025,7 @@ fn emit_project_binding_value<'ctx, 'module>(
 
 fn emit_function<'ctx, 'module>(
     prepared_render: bool,
+    require_release_checked_access: bool,
     aggregate_plan: Option<&'module crate::scalar::ClosedBody>,
     context: &'ctx Context,
     builder: &'ctx Builder<'ctx>,
@@ -2040,6 +2061,7 @@ fn emit_function<'ctx, 'module>(
         joined_assignment_owners(function.span, reference_cfg, &joined_bindings)?;
     let mut state = EmitState {
         prepared_render,
+        require_release_checked_access,
         aggregate: aggregate_transfer::AggregateEmitter::new(
             aggregate_plan,
             value,
@@ -2198,6 +2220,7 @@ fn emit_function<'ctx, 'module>(
 
 fn emit_main<'ctx, 'module>(
     prepared_render: bool,
+    require_release_checked_access: bool,
     initializer_plan: Option<&'module crate::scalar::ClosedInitializer>,
     context: &'ctx Context,
     builder: &'ctx Builder<'ctx>,
@@ -2224,6 +2247,7 @@ fn emit_main<'ctx, 'module>(
     builder.position_at_end(entry);
     let mut state = EmitState {
         prepared_render,
+        require_release_checked_access,
         aggregate: None,
         initializer_aggregate: initializer_plan.map(aggregate_transfer::InitializerEmitter::new),
         initializer_nodes,
@@ -2365,6 +2389,7 @@ fn emit_project_function<'ctx, 'module>(
         joined_assignment_owners(function.span, reference_cfg, &joined_bindings)?;
     let mut state = EmitState {
         prepared_render,
+        require_release_checked_access: project_names.require_release_checked_access,
         aggregate: aggregate_transfer::AggregateEmitter::new(
             aggregate_plan,
             value,
@@ -2575,6 +2600,7 @@ fn emit_project_main<'ctx, 'module>(
     let empty_unit_values = BTreeSet::new();
     let mut state = EmitState {
         prepared_render,
+        require_release_checked_access: names.require_release_checked_access,
         aggregate: None,
         initializer_aggregate: None,
         initializer_nodes: None,
@@ -3700,7 +3726,7 @@ fn retain_assignment_destination<'ctx>(
             ))
         }
         place => Ok(AssignmentDestination::Existing(place_pointer(
-            context, state, place, None,
+            context, state, place, project,
         )?)),
     }
 }
@@ -4350,6 +4376,12 @@ fn emit_checked_dereference_guard<'ctx, 'module>(
     state: &mut EmitState<'ctx, 'module>,
     address: inkwell::values::IntValue<'ctx>,
 ) -> Result<(), String> {
+    if let Some(access) = state.project_names.and_then(|names| names.checked_access.as_ref()) {
+        return emit_checked_access_call(state, &access.non_null, &[address.into()]);
+    }
+    if state.require_release_checked_access {
+        return Err("checked dereference lacks its prepared release helper".to_owned());
+    }
     let is_null = state
         .builder
         .build_int_compare(
@@ -4360,6 +4392,28 @@ fn emit_checked_dereference_guard<'ctx, 'module>(
         )
         .map_err(builder_error)?;
     emit_checked_place_guard(context, state, is_null, "deref_null_panic", "deref_null_continue")
+}
+
+fn emit_checked_access_call<'ctx>(
+    state: &EmitState<'ctx, '_>,
+    symbol: &str,
+    arguments: &[BasicMetadataValueEnum<'ctx>],
+) -> Result<(), String> {
+    let function = state.functions.get(symbol).copied()
+        .ok_or_else(|| "missing sealed release checked-access function".to_owned())?;
+    let ty = function.get_type();
+    let parameters = ty.get_param_types();
+    if ty.get_return_type().is_some() || parameters.len() != arguments.len()
+        || !parameters.iter().zip(arguments).all(|(expected, value)| {
+            matches!((expected, value),
+                (BasicMetadataTypeEnum::IntType(expected), BasicMetadataValueEnum::IntValue(value))
+                    if *expected == value.get_type())
+        })
+    {
+        return Err("invalid release checked-access function ABI".to_owned());
+    }
+    state.builder.build_call(function, arguments, "").map_err(builder_error)?;
+    Ok(())
 }
 
 fn emit_checked_place_guard<'ctx>(
@@ -4825,6 +4879,10 @@ enum GenericInitializerInput<'a> {
 }
 
 impl GenericInitializerInput<'_> {
+    fn requires_release_checked_access(&self) -> bool {
+        matches!(self, Self::PreparedRows(prepared) if prepared.requires_release_checked_access())
+    }
+
     fn prepared_render(self) -> bool {
         matches!(self, Self::PreparedRows(_))
     }

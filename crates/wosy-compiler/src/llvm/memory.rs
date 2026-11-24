@@ -418,7 +418,32 @@ pub(super) fn place_pointer<'ctx, 'module>(
                 }
                 .map_err(builder_error);
             }
-            fixed_array_element_pointer(context, state, &base_type, base_pointer, index)
+            let ScalarType::Array { length, .. } = base_type else { unreachable!("fixed array") };
+            let checked = !fixed_index_has_raw_root(state, base);
+            if checked {
+                check_fixed_index(context, state, index, length, false)?;
+            }
+            fixed_array_element_pointer(context, state, &base_type, base_pointer, index, checked)
+        }
+    }
+}
+
+fn fixed_index_has_raw_root(state: &EmitState<'_, '_>, mut place: &crate::ScalarPlace) -> bool {
+    loop {
+        match place {
+            crate::ScalarPlace::Field { base, .. } | crate::ScalarPlace::Index { base, .. } => place = base,
+            crate::ScalarPlace::Name { .. } => return false,
+            crate::ScalarPlace::Dereference { pointer, .. } => return match pointer.as_ref() {
+                ScalarExpression::Name { name, .. } => state.storage.get(name).map(|(_, ty)| ty)
+                    .or_else(|| state.globals.get(name).map(|(_, ty)| ty))
+                    .is_some_and(|ty| matches!(ty, ScalarType::RawPointer(_))),
+                ScalarExpression::Call { .. } => match state.prepared_call_output(pointer) {
+                    Ok(Some(ty)) => matches!(ty, ScalarType::RawPointer(_)),
+                    _ => false,
+                },
+                ScalarExpression::RawAddress { .. } => true,
+                _ => false,
+            },
         }
     }
 }
@@ -443,7 +468,19 @@ fn fixed_array_element_pointer<'ctx>(
     ty: &ScalarType,
     base: PointerValue<'ctx>,
     index: inkwell::values::IntValue<'ctx>,
+    checked: bool,
 ) -> Result<PointerValue<'ctx>, String> {
+    if checked && state.require_release_checked_access {
+        let (bytes, _) = allocation_layout(ty, state.layouts, state.target_layout)?;
+        let max_offset = match state.target_layout.pointer_size {
+            4 => i32::MAX as u64,
+            8 => i64::MAX as u64,
+            _ => return Err("unsupported fixed-array pointer index width".to_owned()),
+        };
+        if bytes > max_offset {
+            return Err("fixed array exceeds the target's addressable index domain".to_owned());
+        }
+    }
     let array = storage_type(context, ty, state.layouts, state.target_layout)?;
     unsafe {
         state.builder.build_in_bounds_gep(
@@ -468,16 +505,36 @@ pub(super) fn checked_fixed_assignment_element_pointer<'ctx>(
     };
     let pointer = place_pointer(context, state, base, project)?;
     let index = emit_place_index(context, state, index, project)?;
-    if !index.get_zero_extended_constant().is_some_and(|index| index < length) {
+    check_fixed_index(context, state, index, length, true)?;
+    fixed_array_element_pointer(context, state, &ty, pointer, index, true)
+}
+
+fn check_fixed_index<'ctx>(
+    context: &'ctx Context,
+    state: &mut EmitState<'ctx, '_>,
+    index: inkwell::values::IntValue<'ctx>,
+    length: u64,
+    legacy_named_aggregate_assignment: bool,
+) -> Result<(), String> {
+    if index.get_zero_extended_constant().is_some_and(|index| index < length) {
+        return Ok(());
+    }
+    let count = context.i64_type().const_int(length, false);
+    if let Some(access) = state.project_names.and_then(|names| names.checked_access.as_ref()) {
+        return emit_checked_access_call(state, &access.in_extent, &[index.into(), count.into()]);
+    }
+    if state.require_release_checked_access {
+        return Err("fixed-array index lacks its prepared release helper".to_owned());
+    }
+    if legacy_named_aggregate_assignment {
         let invalid = state.builder.build_int_compare(
-            IntPredicate::UGE, index, context.i64_type().const_int(length, false),
-            "assignment_index_out_of_bounds",
+            IntPredicate::UGE, index, count, "assignment_index_out_of_bounds",
         ).map_err(builder_error)?;
         emit_checked_place_guard(
             context, state, invalid, "assignment_index_panic", "assignment_index_continue",
         )?;
     }
-    fixed_array_element_pointer(context, state, &ty, pointer, index)
+    Ok(())
 }
 
 fn byte_layout_field_pointer<'ctx>(

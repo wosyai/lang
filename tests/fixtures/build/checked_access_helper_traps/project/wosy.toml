@@ -1,0 +1,57 @@
+[package]
+name = "checked_access_helper_traps"
+default_target = "host"
+
+[dependencies.std]
+path = "stdlib"
+
+[comments]
+categories = []
+
+[builders.native]
+command = ["python", "scripts/build-native"]
+args = []
+toolchain_identity = "llvm-18.1.4"
+
+[runners.native]
+command = ["python", "scripts/run-native"]
+args = []
+
+[targets.host]
+root = "src/main.w"
+
+[targets.host.artifacts.main]
+artifact = "Main"
+
+[targets.host.artifacts.main.profiles.dev]
+backend = "llvm"
+output = "native"
+builder = "native"
+run_runner = "native"
+
+[targets.host.profiles.dev]
+main_artifact = "main"
+
+[builders.wasm]
+command = ["python", "scripts/build-wasm"]
+args = []
+toolchain_identity = "llvm-18.1.4"
+
+[runners.wasm]
+command = ["python", "scripts/run-wasmtime"]
+args = []
+
+[targets.wasi]
+root = "src/main.w"
+
+[targets.wasi.artifacts.main]
+artifact = "Main"
+
+[targets.wasi.artifacts.main.profiles.dev]
+backend = "llvm"
+output = "wasm-wasip1"
+builder = "wasm"
+run_runner = "wasm"
+
+[targets.wasi.profiles.dev]
+main_artifact = "main"

@@ -633,6 +633,7 @@ dependencies = [
  "rowan",
  "serde",
  "serde_json",
+ "wosy-stdlib-source",
  "wosy-syntax",
 ]
 
@@ -656,6 +657,9 @@ version = "0.1.0"
 [[package]]
 name = "wosy-stdlib-source"
 version = "0.1.0"
+dependencies = [
+ "blake3",
+]
 
 [[package]]
 name = "wosy-syntax"

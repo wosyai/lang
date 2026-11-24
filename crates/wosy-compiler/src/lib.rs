@@ -16,7 +16,7 @@ pub use scalar::{
     analyze_scalar_build, derive_scalar_declarations_from_cst, derive_scalar_diagnostics_from_cst,
     derive_scalar_program, derive_scalar_program_from_cst,
     derive_scalar_program_from_cst_with_layout, derive_scalar_program_with_layout,
-    prepare_scalar_project, validate_scalar_project, BinaryOperator, PreparedScalarProject,
+    prepare_scalar_project, prepare_scalar_project_with_access, validate_scalar_project, BinaryOperator, PreparedScalarProject,
     ResolvedAssignmentOutputId, ScalarAllocationIdentity, ScalarAssignment, ScalarAssignmentTyping,
     ScalarAutomaticReturnResult, ScalarAutomaticReturnResultState, ScalarBinding, ScalarBlock,
     ScalarBlockItem, ScalarBuildValidation, ScalarEnum, ScalarEnumId, ScalarEnumVariant,

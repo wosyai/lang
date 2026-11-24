@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+wosy-stdlib-source.workspace = true
 codespan-reporting.workspace = true
 inkwell.workspace = true
 num-bigint.workspace = true

@@ -16,16 +16,16 @@ attributes #5 = { "wasm-import-module"="wasi_snapshot_preview1" "wasm-import-nam
 
 define void @wosy_fn__706f696e7465722d636173742d726177__7372632f6d61696e2e77__66666637306432326135346365616161303661656666326632666637636634316635633333636234663761653938643433353161363033373136343463386663__72756e() {
 entry:
-  %utf8_literal34 = alloca [16 x i8], align 8
-  %aggregate_destination30 = alloca [16 x i8], align 8
+  %utf8_literal31 = alloca [16 x i8], align 8
+  %aggregate_destination27 = alloca [16 x i8], align 8
   %utf8_literal = alloca [16 x i8], align 8
   %aggregate_destination = alloca [16 x i8], align 8
   %fifth = alloca i8, align 1
   %first = alloca i8, align 1
   %back = alloca i32, align 4
-  %assignment_value19 = alloca i32, align 4
-  %viewed = alloca i32, align 4
   %assignment_value16 = alloca i32, align 4
+  %viewed = alloca i32, align 4
+  %assignment_value13 = alloca i32, align 4
   %assignment_value8 = alloca i8, align 1
   %w4 = alloca i32, align 4
   %at4 = alloca i32, align 4
@@ -41,14 +41,7 @@ entry:
   store i8 7, ptr %assignment_value, align 1
   %assignment_value2 = load i8, ptr %assignment_value, align 1
   %w03 = load i32, ptr %w0, align 4
-  %deref_is_null = icmp eq i32 %w03, 0
-  br i1 %deref_is_null, label %deref_null_panic, label %deref_null_continue
-
-deref_null_panic:                                 ; preds = %entry
-  call void @__wosy_core_system_panic()
-  unreachable
-
-deref_null_continue:                              ; preds = %entry
+  call void @wosy_fn__776f73795f746f6f6c636861696e5f7374646c6962__7372632f636865636b65645f6163636573732e77__63653365383964333063396136386163353161623932346661383031343530373334343832666265613561643433353061353761613335303632633933366336__636865636b5f6e6f6e5f6e756c6c5f61646472657373(i32 %w03)
   %deref = inttoptr i32 %w03 to ptr
   store i8 %assignment_value2, ptr %deref, align 1
   %storage4 = load i32, ptr %storage, align 4
@@ -63,53 +56,46 @@ deref_null_continue:                              ; preds = %entry
   store i8 42, ptr %assignment_value8, align 1
   %assignment_value9 = load i8, ptr %assignment_value8, align 1
   %w410 = load i32, ptr %w4, align 4
-  %deref_is_null11 = icmp eq i32 %w410, 0
-  br i1 %deref_is_null11, label %deref_null_panic12, label %deref_null_continue13
-
-deref_null_panic12:                               ; preds = %deref_null_continue
-  call void @__wosy_core_system_panic()
-  unreachable
-
-deref_null_continue13:                            ; preds = %deref_null_continue
-  %deref14 = inttoptr i32 %w410 to ptr
-  store i8 %assignment_value9, ptr %deref14, align 1
-  %storage15 = load i32, ptr %storage, align 4
-  store i32 %storage15, ptr %assignment_value16, align 4
+  call void @wosy_fn__776f73795f746f6f6c636861696e5f7374646c6962__7372632f636865636b65645f6163636573732e77__63653365383964333063396136386163353161623932346661383031343530373334343832666265613561643433353061353761613335303632633933366336__636865636b5f6e6f6e5f6e756c6c5f61646472657373(i32 %w410)
+  %deref11 = inttoptr i32 %w410 to ptr
+  store i8 %assignment_value9, ptr %deref11, align 1
+  %storage12 = load i32, ptr %storage, align 4
+  store i32 %storage12, ptr %assignment_value13, align 4
+  %assignment_value14 = load i32, ptr %assignment_value13, align 4
+  store i32 %assignment_value14, ptr %viewed, align 4
+  %viewed15 = load i32, ptr %viewed, align 4
+  store i32 %viewed15, ptr %assignment_value16, align 4
   %assignment_value17 = load i32, ptr %assignment_value16, align 4
-  store i32 %assignment_value17, ptr %viewed, align 4
-  %viewed18 = load i32, ptr %viewed, align 4
-  store i32 %viewed18, ptr %assignment_value19, align 4
-  %assignment_value20 = load i32, ptr %assignment_value19, align 4
-  store i32 %assignment_value20, ptr %back, align 4
-  %back21 = load i32, ptr %back, align 4
-  %load_base = inttoptr i32 %back21 to ptr
+  store i32 %assignment_value17, ptr %back, align 4
+  %back18 = load i32, ptr %back, align 4
+  %load_base = inttoptr i32 %back18 to ptr
   %load = load i8, ptr %load_base, align 1
   store i8 %load, ptr %first, align 1
-  %back22 = load i32, ptr %back, align 4
-  %offset_base23 = inttoptr i32 %back22 to ptr
-  %offset24 = getelementptr inbounds i8, ptr %offset_base23, i64 4
-  %offset_address25 = ptrtoint ptr %offset24 to i32
-  %load_base26 = inttoptr i32 %offset_address25 to ptr
-  %load27 = load i8, ptr %load_base26, align 1
-  store i8 %load27, ptr %fifth, align 1
-  %first28 = load i8, ptr %first, align 1
-  %aggregate_original_base = call ptr @wosy_generic__776f73795f6f7665726c6f61645f5f373736663733373935663636366535663566333733333337333433363334356635663337333333373332333633333332363633363332333636363336363633373334333733333337333433373332333633313337333033323635333733373566356633333335333633343333333333333331333333303336333133363336333333383333333933333330333333353333333933363333333333333333333333333332333333333336333633333339333333373333333233363334333333353333333133333335333633313336333333333334333633363333333233333331333333363336333633333331333333393336333433333331333333373333333633333337333333343333333133333330333333343336333533333337333333373336333533333336333633333333333633363333333333393333333133333336333633363336333233333332333633353333333233333330333333363336333533363334356635663336333633363636333733323336363433363331333733345f5f3337__(i8 %first28, ptr %aggregate_destination)
+  %back19 = load i32, ptr %back, align 4
+  %offset_base20 = inttoptr i32 %back19 to ptr
+  %offset21 = getelementptr inbounds i8, ptr %offset_base20, i64 4
+  %offset_address22 = ptrtoint ptr %offset21 to i32
+  %load_base23 = inttoptr i32 %offset_address22 to ptr
+  %load24 = load i8, ptr %load_base23, align 1
+  store i8 %load24, ptr %fifth, align 1
+  %first25 = load i8, ptr %first, align 1
+  %aggregate_original_base = call ptr @wosy_generic__776f73795f6f7665726c6f61645f5f373736663733373935663636366535663566333733333337333433363334356635663337333333373332333633333332363633363332333636363336363633373334333733333337333433373332333633313337333033323635333733373566356633333335333633343333333333333331333333303336333133363336333333383333333933333330333333353333333933363333333333333333333333333332333333333336333633333339333333373333333233363334333333353333333133333335333633313336333333333334333633363333333233333331333333363336333633333331333333393336333433333331333333373333333633333337333333343333333133333330333333343336333533333337333333373336333533333336333633333333333633363333333333393333333133333336333633363336333233333332333633353333333233333330333333363336333533363334356635663336333633363636333733323336363433363331333733345f5f3337__(i8 %first25, ptr %aggregate_destination)
   %aggregate_input_call = call { i64, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__35643331306166383930353963333332336639373264353135616334663231366631396431373637343130346537376536633663393136666232653230366564__7072696e74(ptr %aggregate_destination, ptr %aggregate_original_base)
   %data = getelementptr inbounds i8, ptr %utf8_literal, i8 0
   store i32 ptrtoint (ptr @wosy_utf8_literal_0 to i32), ptr %data, align 4
   %length = getelementptr inbounds i8, ptr %utf8_literal, i8 8
   store i64 1, ptr %length, align 4
-  %aggregate_input_call29 = call { i64, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__35643331306166383930353963333332336639373264353135616334663231366631396431373637343130346537376536633663393136666232653230366564__7072696e74(ptr %utf8_literal, ptr null)
-  %fifth31 = load i8, ptr %fifth, align 1
-  %aggregate_original_base32 = call ptr @wosy_generic__776f73795f6f7665726c6f61645f5f373736663733373935663636366535663566333733333337333433363334356635663337333333373332333633333332363633363332333636363336363633373334333733333337333433373332333633313337333033323635333733373566356633333335333633343333333333333331333333303336333133363336333333383333333933333330333333353333333933363333333333333333333333333332333333333336333633333339333333373333333233363334333333353333333133333335333633313336333333333334333633363333333233333331333333363336333633333331333333393336333433333331333333373333333633333337333333343333333133333330333333343336333533333337333333373336333533333336333633333333333633363333333333393333333133333336333633363336333233333332333633353333333233333330333333363336333533363334356635663336333633363636333733323336363433363331333733345f5f3337__(i8 %fifth31, ptr %aggregate_destination30)
-  %aggregate_input_call33 = call { i64, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__35643331306166383930353963333332336639373264353135616334663231366631396431373637343130346537376536633663393136666232653230366564__7072696e74(ptr %aggregate_destination30, ptr %aggregate_original_base32)
-  %data35 = getelementptr inbounds i8, ptr %utf8_literal34, i8 0
-  store i32 ptrtoint (ptr @wosy_utf8_literal_1 to i32), ptr %data35, align 4
-  %length36 = getelementptr inbounds i8, ptr %utf8_literal34, i8 8
-  store i64 1, ptr %length36, align 4
-  %aggregate_input_call37 = call { i64, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__35643331306166383930353963333332336639373264353135616334663231366631396431373637343130346537376536633663393136666232653230366564__7072696e74(ptr %utf8_literal34, ptr null)
-  %storage38 = load i32, ptr %storage, align 4
-  %free_pointer = inttoptr i32 %storage38 to ptr
+  %aggregate_input_call26 = call { i64, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__35643331306166383930353963333332336639373264353135616334663231366631396431373637343130346537376536633663393136666232653230366564__7072696e74(ptr %utf8_literal, ptr null)
+  %fifth28 = load i8, ptr %fifth, align 1
+  %aggregate_original_base29 = call ptr @wosy_generic__776f73795f6f7665726c6f61645f5f373736663733373935663636366535663566333733333337333433363334356635663337333333373332333633333332363633363332333636363336363633373334333733333337333433373332333633313337333033323635333733373566356633333335333633343333333333333331333333303336333133363336333333383333333933333330333333353333333933363333333333333333333333333332333333333336333633333339333333373333333233363334333333353333333133333335333633313336333333333334333633363333333233333331333333363336333633333331333333393336333433333331333333373333333633333337333333343333333133333330333333343336333533333337333333373336333533333336333633333333333633363333333333393333333133333336333633363336333233333332333633353333333233333330333333363336333533363334356635663336333633363636333733323336363433363331333733345f5f3337__(i8 %fifth28, ptr %aggregate_destination27)
+  %aggregate_input_call30 = call { i64, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__35643331306166383930353963333332336639373264353135616334663231366631396431373637343130346537376536633663393136666232653230366564__7072696e74(ptr %aggregate_destination27, ptr %aggregate_original_base29)
+  %data32 = getelementptr inbounds i8, ptr %utf8_literal31, i8 0
+  store i32 ptrtoint (ptr @wosy_utf8_literal_1 to i32), ptr %data32, align 4
+  %length33 = getelementptr inbounds i8, ptr %utf8_literal31, i8 8
+  store i64 1, ptr %length33, align 4
+  %aggregate_input_call34 = call { i64, i1 } @wosy_fn__737464__7372632f626f6f7473747261702e77__35643331306166383930353963333332336639373264353135616334663231366631396431373637343130346537376536633663393136666232653230366564__7072696e74(ptr %utf8_literal31, ptr null)
+  %storage35 = load i32, ptr %storage, align 4
+  %free_pointer = inttoptr i32 %storage35 to ptr
   call void @__wosy_core_free(ptr %free_pointer)
   ret void
 }
@@ -921,14 +907,7 @@ entry:
   store i64 %zero2, ptr %count, align 4
   store i1 false, ptr %complete, align 1
   %view3 = load i32, ptr %view1, align 4
-  %deref_is_null = icmp eq i32 %view3, 0
-  br i1 %deref_is_null, label %deref_null_panic, label %deref_null_continue
-
-deref_null_panic:                                 ; preds = %entry
-  call void @__wosy_core_system_panic()
-  unreachable
-
-deref_null_continue:                              ; preds = %entry
+  call void @wosy_fn__776f73795f746f6f6c636861696e5f7374646c6962__7372632f636865636b65645f6163636573732e77__63653365383964333063396136386163353161623932346661383031343530373334343832666265613561643433353061353761613335303632633933366336__636865636b5f6e6f6e5f6e756c6c5f61646472657373(i32 %view3)
   %deref = inttoptr i32 %view3 to ptr
   %address = ptrtoint ptr %deref to i32
   %one4 = load i64, ptr %one, align 4
@@ -945,49 +924,42 @@ deref_null_continue:                              ; preds = %entry
   %not = xor i1 %complete9, true
   br i1 %not, label %if.then, label %if.else
 
-if.then:                                          ; preds = %deref_null_continue
+if.then:                                          ; preds = %entry
   br label %if.merge
 
-if.else:                                          ; preds = %deref_null_continue
+if.else:                                          ; preds = %entry
   %count10 = load i64, ptr %count, align 4
   %zero11 = load i64, ptr %zero, align 4
   %eq = icmp eq i64 %count10, %zero11
   br i1 %eq, label %if.then12, label %if.else13
 
 if.merge:                                         ; preds = %if.merge14, %if.then
-  %if25 = phi i32 [ 2, %if.then ], [ %if24, %if.merge14 ]
-  ret i32 %if25
+  %if22 = phi i32 [ 2, %if.then ], [ %if21, %if.merge14 ]
+  ret i32 %if22
 
 if.then12:                                        ; preds = %if.else
   br label %if.merge14
 
 if.else13:                                        ; preds = %if.else
   %view15 = load i32, ptr %view1, align 4
-  %deref_is_null16 = icmp eq i32 %view15, 0
-  br i1 %deref_is_null16, label %deref_null_panic17, label %deref_null_continue18
+  call void @wosy_fn__776f73795f746f6f6c636861696e5f7374646c6962__7372632f636865636b65645f6163636573732e77__63653365383964333063396136386163353161623932346661383031343530373334343832666265613561643433353061353761613335303632633933366336__636865636b5f6e6f6e5f6e756c6c5f61646472657373(i32 %view15)
+  %deref16 = inttoptr i32 %view15 to ptr
+  %place = load i8, ptr %deref16, align 1
+  %eq17 = icmp eq i8 %place, 10
+  br i1 %eq17, label %if.then18, label %if.else19
 
-if.merge14:                                       ; preds = %if.merge23, %if.then12
-  %if24 = phi i32 [ 1, %if.then12 ], [ %if, %if.merge23 ]
+if.merge14:                                       ; preds = %if.merge20, %if.then12
+  %if21 = phi i32 [ 1, %if.then12 ], [ %if, %if.merge20 ]
   br label %if.merge
 
-deref_null_panic17:                               ; preds = %if.else13
-  call void @__wosy_core_system_panic()
-  unreachable
+if.then18:                                        ; preds = %if.else13
+  br label %if.merge20
 
-deref_null_continue18:                            ; preds = %if.else13
-  %deref19 = inttoptr i32 %view15 to ptr
-  %place = load i8, ptr %deref19, align 1
-  %eq20 = icmp eq i8 %place, 10
-  br i1 %eq20, label %if.then21, label %if.else22
+if.else19:                                        ; preds = %if.else13
+  br label %if.merge20
 
-if.then21:                                        ; preds = %deref_null_continue18
-  br label %if.merge23
-
-if.else22:                                        ; preds = %deref_null_continue18
-  br label %if.merge23
-
-if.merge23:                                       ; preds = %if.else22, %if.then21
-  %if = phi i32 [ 1, %if.then21 ], [ 0, %if.else22 ]
+if.merge20:                                       ; preds = %if.else19, %if.then18
+  %if = phi i32 [ 1, %if.then18 ], [ 0, %if.else19 ]
   br label %if.merge14
 }
 
@@ -999,25 +971,14 @@ entry:
   store i32 %view, ptr %view2, align 4
   br label %self_tail.header
 
-self_tail.header:                                 ; preds = %deref_null_continue, %entry
+self_tail.header:                                 ; preds = %self_tail.then, %entry
   %outcome3 = load i32, ptr %outcome1, align 4
   %eq = icmp eq i32 %outcome3, 0
   br i1 %eq, label %self_tail.then, label %self_tail.else
 
 self_tail.then:                                   ; preds = %self_tail.header
   %view4 = load i32, ptr %view2, align 4
-  %deref_is_null = icmp eq i32 %view4, 0
-  br i1 %deref_is_null, label %deref_null_panic, label %deref_null_continue
-
-self_tail.else:                                   ; preds = %self_tail.header
-  %outcome6 = load i32, ptr %outcome1, align 4
-  ret i32 %outcome6
-
-deref_null_panic:                                 ; preds = %self_tail.then
-  call void @__wosy_core_system_panic()
-  unreachable
-
-deref_null_continue:                              ; preds = %self_tail.then
+  call void @wosy_fn__776f73795f746f6f6c636861696e5f7374646c6962__7372632f636865636b65645f6163636573732e77__63653365383964333063396136386163353161623932346661383031343530373334343832666265613561643433353061353761613335303632633933366336__636865636b5f6e6f6e5f6e756c6c5f61646472657373(i32 %view4)
   %deref = inttoptr i32 %view4 to ptr
   %address = ptrtoint ptr %deref to i32
   %call = call i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__35643331306166383930353963333332336639373264353135616334663231366631396431373637343130346537376536633663393136666232653230366564__5f726561645f6c696e655f646973636172645f73746570(i32 %address)
@@ -1025,15 +986,19 @@ deref_null_continue:                              ; preds = %self_tail.then
   store i32 %call, ptr %outcome1, align 4
   store i32 %view5, ptr %view2, align 4
   br label %self_tail.header
+
+self_tail.else:                                   ; preds = %self_tail.header
+  %outcome6 = load i32, ptr %outcome1, align 4
+  ret i32 %outcome6
 }
 
 define i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__35643331306166383930353963333332336639373264353135616334663231366631396431373637343130346537376536633663393136666232653230366564__5f726561645f6c696e655f7a65726f5f6361706163697479(i8 %first) #0 {
 entry:
-  %assignment_value62 = alloca i32, align 4
+  %assignment_value59 = alloca i32, align 4
   %outcome = alloca i32, align 4
   %first_outcome = alloca i32, align 4
-  %assignment_value46 = alloca i1, align 1
-  %assignment_value44 = alloca i32, align 4
+  %assignment_value43 = alloca i1, align 1
+  %assignment_value41 = alloca i32, align 4
   %assignment_value25 = alloca i1, align 1
   %assignment_value17 = alloca i1, align 1
   %assignment_value15 = alloca i32, align 4
@@ -1069,18 +1034,7 @@ if.then:                                          ; preds = %entry
   store i64 %zero4, ptr %count, align 4
   store i1 false, ptr %complete, align 1
   %view5 = load i32, ptr %view, align 4
-  %deref_is_null = icmp eq i32 %view5, 0
-  br i1 %deref_is_null, label %deref_null_panic, label %deref_null_continue
-
-if.merge:                                         ; preds = %if.merge43, %entry
-  %discard48 = load i1, ptr %discard, align 1
-  br i1 %discard48, label %if.then49, label %if.merge50
-
-deref_null_panic:                                 ; preds = %if.then
-  call void @__wosy_core_system_panic()
-  unreachable
-
-deref_null_continue:                              ; preds = %if.then
+  call void @wosy_fn__776f73795f746f6f6c636861696e5f7374646c6962__7372632f636865636b65645f6163636573732e77__63653365383964333063396136386163353161623932346661383031343530373334343832666265613561643433353061353761613335303632633933366336__636865636b5f6e6f6e5f6e756c6c5f61646472657373(i32 %view5)
   %deref = inttoptr i32 %view5 to ptr
   %address6 = ptrtoint ptr %deref to i32
   %one7 = load i64, ptr %one, align 4
@@ -1097,7 +1051,11 @@ deref_null_continue:                              ; preds = %if.then
   %not = xor i1 %complete12, true
   br i1 %not, label %if.then13, label %if.merge14
 
-if.then13:                                        ; preds = %deref_null_continue
+if.merge:                                         ; preds = %if.merge40, %entry
+  %discard45 = load i1, ptr %discard, align 1
+  br i1 %discard45, label %if.then46, label %if.merge47
+
+if.then13:                                        ; preds = %if.then
   store i32 2, ptr %assignment_value15, align 4
   %assignment_value16 = load i32, ptr %assignment_value15, align 4
   store i32 %assignment_value16, ptr %status, align 4
@@ -1106,7 +1064,7 @@ if.then13:                                        ; preds = %deref_null_continue
   store i1 %assignment_value18, ptr %discard, align 1
   br label %if.merge14
 
-if.merge14:                                       ; preds = %if.then13, %deref_null_continue
+if.merge14:                                       ; preds = %if.then13, %if.then
   %complete19 = load i1, ptr %complete, align 1
   br i1 %complete19, label %short_circuit.rhs, label %short_circuit.merge
 
@@ -1142,75 +1100,68 @@ short_circuit.merge29:                            ; preds = %short_circuit.rhs28
 
 short_circuit.rhs33:                              ; preds = %short_circuit.merge29
   %view35 = load i32, ptr %view, align 4
-  %deref_is_null36 = icmp eq i32 %view35, 0
-  br i1 %deref_is_null36, label %deref_null_panic37, label %deref_null_continue38
-
-short_circuit.merge34:                            ; preds = %deref_null_continue38, %short_circuit.merge29
-  %short_circuit41 = phi i1 [ false, %short_circuit.merge29 ], [ %eq40, %deref_null_continue38 ]
-  br i1 %short_circuit41, label %if.then42, label %if.merge43
-
-deref_null_panic37:                               ; preds = %short_circuit.rhs33
-  call void @__wosy_core_system_panic()
-  unreachable
-
-deref_null_continue38:                            ; preds = %short_circuit.rhs33
-  %deref39 = inttoptr i32 %view35 to ptr
-  %place = load i8, ptr %deref39, align 1
-  %eq40 = icmp eq i8 %place, 10
+  call void @wosy_fn__776f73795f746f6f6c636861696e5f7374646c6962__7372632f636865636b65645f6163636573732e77__63653365383964333063396136386163353161623932346661383031343530373334343832666265613561643433353061353761613335303632633933366336__636865636b5f6e6f6e5f6e756c6c5f61646472657373(i32 %view35)
+  %deref36 = inttoptr i32 %view35 to ptr
+  %place = load i8, ptr %deref36, align 1
+  %eq37 = icmp eq i8 %place, 10
   br label %short_circuit.merge34
 
-if.then42:                                        ; preds = %short_circuit.merge34
-  store i32 0, ptr %assignment_value44, align 4
-  %assignment_value45 = load i32, ptr %assignment_value44, align 4
-  store i32 %assignment_value45, ptr %status, align 4
-  store i1 false, ptr %assignment_value46, align 1
-  %assignment_value47 = load i1, ptr %assignment_value46, align 1
-  store i1 %assignment_value47, ptr %discard, align 1
-  br label %if.merge43
+short_circuit.merge34:                            ; preds = %short_circuit.rhs33, %short_circuit.merge29
+  %short_circuit38 = phi i1 [ false, %short_circuit.merge29 ], [ %eq37, %short_circuit.rhs33 ]
+  br i1 %short_circuit38, label %if.then39, label %if.merge40
 
-if.merge43:                                       ; preds = %if.then42, %short_circuit.merge34
+if.then39:                                        ; preds = %short_circuit.merge34
+  store i32 0, ptr %assignment_value41, align 4
+  %assignment_value42 = load i32, ptr %assignment_value41, align 4
+  store i32 %assignment_value42, ptr %status, align 4
+  store i1 false, ptr %assignment_value43, align 1
+  %assignment_value44 = load i1, ptr %assignment_value43, align 1
+  store i1 %assignment_value44, ptr %discard, align 1
+  br label %if.merge40
+
+if.merge40:                                       ; preds = %if.then39, %short_circuit.merge34
   br label %if.merge
 
-if.then49:                                        ; preds = %if.merge
-  %array_element51 = getelementptr inbounds [1 x i8], ptr %scratch, i32 0, i64 0
-  %address52 = ptrtoint ptr %array_element51 to i32
-  %call53 = call i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__35643331306166383930353963333332336639373264353135616334663231366631396431373637343130346537376536633663393136666232653230366564__5f726561645f6c696e655f646973636172645f73746570(i32 %address52)
-  store i32 %call53, ptr %first_outcome, align 4
-  %first_outcome54 = load i32, ptr %first_outcome, align 4
-  %array_element55 = getelementptr inbounds [1 x i8], ptr %scratch, i32 0, i64 0
-  %address56 = ptrtoint ptr %array_element55 to i32
-  %call57 = call i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__35643331306166383930353963333332336639373264353135616334663231366631396431373637343130346537376536633663393136666232653230366564__5f726561645f6c696e655f646973636172645f636f6e74696e7565(i32 %first_outcome54, i32 %address56)
-  store i32 %call57, ptr %outcome, align 4
-  %outcome58 = load i32, ptr %outcome, align 4
-  %eq59 = icmp eq i32 %outcome58, 2
-  br i1 %eq59, label %if.then60, label %if.merge61
+if.then46:                                        ; preds = %if.merge
+  %array_element48 = getelementptr inbounds [1 x i8], ptr %scratch, i32 0, i64 0
+  %address49 = ptrtoint ptr %array_element48 to i32
+  %call50 = call i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__35643331306166383930353963333332336639373264353135616334663231366631396431373637343130346537376536633663393136666232653230366564__5f726561645f6c696e655f646973636172645f73746570(i32 %address49)
+  store i32 %call50, ptr %first_outcome, align 4
+  %first_outcome51 = load i32, ptr %first_outcome, align 4
+  %array_element52 = getelementptr inbounds [1 x i8], ptr %scratch, i32 0, i64 0
+  %address53 = ptrtoint ptr %array_element52 to i32
+  %call54 = call i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__35643331306166383930353963333332336639373264353135616334663231366631396431373637343130346537376536633663393136666232653230366564__5f726561645f6c696e655f646973636172645f636f6e74696e7565(i32 %first_outcome51, i32 %address53)
+  store i32 %call54, ptr %outcome, align 4
+  %outcome55 = load i32, ptr %outcome, align 4
+  %eq56 = icmp eq i32 %outcome55, 2
+  br i1 %eq56, label %if.then57, label %if.merge58
 
-if.merge50:                                       ; preds = %if.merge61, %if.merge
-  %status64 = load i32, ptr %status, align 4
-  ret i32 %status64
+if.merge47:                                       ; preds = %if.merge58, %if.merge
+  %status61 = load i32, ptr %status, align 4
+  ret i32 %status61
 
-if.then60:                                        ; preds = %if.then49
-  store i32 2, ptr %assignment_value62, align 4
-  %assignment_value63 = load i32, ptr %assignment_value62, align 4
-  store i32 %assignment_value63, ptr %status, align 4
-  br label %if.merge61
+if.then57:                                        ; preds = %if.then46
+  store i32 2, ptr %assignment_value59, align 4
+  %assignment_value60 = load i32, ptr %assignment_value59, align 4
+  store i32 %assignment_value60, ptr %status, align 4
+  br label %if.merge58
 
-if.merge61:                                       ; preds = %if.then60, %if.then49
-  br label %if.merge50
+if.merge58:                                       ; preds = %if.then57, %if.then46
+  br label %if.merge47
 }
 
 define { ptr, i64, i1, i1, i32 } @wosy_fn__737464__7372632f626f6f7473747261702e77__35643331306166383930353963333332336639373264353135616334663231366631396431373637343130346537376536633663393136666232653230366564__5f726561645f6c696e655f616c6c6f63617465645f73746570(ptr %bytes, i32 %view, i64 %max_bytes, i64 %length, i1 %pending_cr, i1 %reading, i32 %status) {
 entry:
-  %assignment_value99 = alloca i1, align 1
-  %assignment_value93 = alloca i64, align 8
-  %assignment_value85 = alloca i8, align 1
-  %assignment_value77 = alloca i32, align 4
-  %assignment_value67 = alloca i1, align 1
-  %assignment_value62 = alloca i64, align 8
-  %assignment_value56 = alloca i8, align 1
-  %assignment_value49 = alloca i32, align 4
-  %assignment_value40 = alloca i1, align 1
-  %assignment_value38 = alloca i1, align 1
+  %assignment_value96 = alloca i1, align 1
+  %assignment_value90 = alloca i64, align 8
+  %assignment_value82 = alloca i8, align 1
+  %assignment_value74 = alloca i32, align 4
+  %assignment_value64 = alloca i1, align 1
+  %assignment_value59 = alloca i64, align 8
+  %assignment_value53 = alloca i8, align 1
+  %assignment_value46 = alloca i32, align 4
+  %assignment_value37 = alloca i1, align 1
+  %assignment_value35 = alloca i1, align 1
   %byte = alloca i8, align 1
   %assignment_value25 = alloca i1, align 1
   %assignment_value18 = alloca i1, align 1
@@ -1245,14 +1196,7 @@ entry:
   store i64 %zero8, ptr %count, align 4
   store i1 false, ptr %complete, align 1
   %view9 = load i32, ptr %view2, align 4
-  %deref_is_null = icmp eq i32 %view9, 0
-  br i1 %deref_is_null, label %deref_null_panic, label %deref_null_continue
-
-deref_null_panic:                                 ; preds = %entry
-  call void @__wosy_core_system_panic()
-  unreachable
-
-deref_null_continue:                              ; preds = %entry
+  call void @wosy_fn__776f73795f746f6f6c636861696e5f7374646c6962__7372632f636865636b65645f6163636573732e77__63653365383964333063396136386163353161623932346661383031343530373334343832666265613561643433353061353761613335303632633933366336__636865636b5f6e6f6e5f6e756c6c5f61646472657373(i32 %view9)
   %deref = inttoptr i32 %view9 to ptr
   %address = ptrtoint ptr %deref to i32
   %one10 = load i64, ptr %one, align 4
@@ -1269,7 +1213,7 @@ deref_null_continue:                              ; preds = %entry
   %not = xor i1 %complete15, true
   br i1 %not, label %if.then, label %if.else
 
-if.then:                                          ; preds = %deref_null_continue
+if.then:                                          ; preds = %entry
   store i32 2, ptr %assignment_value16, align 4
   %assignment_value17 = load i32, ptr %assignment_value16, align 4
   store i32 %assignment_value17, ptr %status7, align 4
@@ -1278,16 +1222,16 @@ if.then:                                          ; preds = %deref_null_continue
   store i1 %assignment_value19, ptr %reading6, align 1
   br label %if.merge
 
-if.else:                                          ; preds = %deref_null_continue
+if.else:                                          ; preds = %entry
   %count20 = load i64, ptr %count, align 4
   %zero21 = load i64, ptr %zero, align 4
   %eq = icmp eq i64 %count20, %zero21
   br i1 %eq, label %if.then22, label %if.else23
 
 if.merge:                                         ; preds = %if.merge24, %if.then
-  %status95 = load i32, ptr %status7, align 4
-  %eq96 = icmp eq i32 %status95, 4
-  br i1 %eq96, label %if.then97, label %if.merge98
+  %status92 = load i32, ptr %status7, align 4
+  %eq93 = icmp eq i32 %status92, 4
+  br i1 %eq93, label %if.then94, label %if.merge95
 
 if.then22:                                        ; preds = %if.else
   store i1 false, ptr %assignment_value25, align 1
@@ -1297,137 +1241,130 @@ if.then22:                                        ; preds = %if.else
 
 if.else23:                                        ; preds = %if.else
   %view27 = load i32, ptr %view2, align 4
-  %deref_is_null28 = icmp eq i32 %view27, 0
-  br i1 %deref_is_null28, label %deref_null_panic29, label %deref_null_continue30
+  call void @wosy_fn__776f73795f746f6f6c636861696e5f7374646c6962__7372632f636865636b65645f6163636573732e77__63653365383964333063396136386163353161623932346661383031343530373334343832666265613561643433353061353761613335303632633933366336__636865636b5f6e6f6e5f6e756c6c5f61646472657373(i32 %view27)
+  %deref28 = inttoptr i32 %view27 to ptr
+  %place = load i8, ptr %deref28, align 1
+  store i8 %place, ptr %byte, align 1
+  %byte29 = load i8, ptr %byte, align 1
+  %lf30 = load i8, ptr %lf, align 1
+  %eq31 = icmp eq i8 %byte29, %lf30
+  br i1 %eq31, label %if.then32, label %if.else33
 
-if.merge24:                                       ; preds = %if.merge37, %if.then22
+if.merge24:                                       ; preds = %if.merge34, %if.then22
   br label %if.merge
 
-deref_null_panic29:                               ; preds = %if.else23
-  call void @__wosy_core_system_panic()
-  unreachable
+if.then32:                                        ; preds = %if.else23
+  store i1 false, ptr %assignment_value35, align 1
+  %assignment_value36 = load i1, ptr %assignment_value35, align 1
+  store i1 %assignment_value36, ptr %pending_cr5, align 1
+  store i1 false, ptr %assignment_value37, align 1
+  %assignment_value38 = load i1, ptr %assignment_value37, align 1
+  store i1 %assignment_value38, ptr %reading6, align 1
+  br label %if.merge34
 
-deref_null_continue30:                            ; preds = %if.else23
-  %deref31 = inttoptr i32 %view27 to ptr
-  %place = load i8, ptr %deref31, align 1
-  store i8 %place, ptr %byte, align 1
-  %byte32 = load i8, ptr %byte, align 1
-  %lf33 = load i8, ptr %lf, align 1
-  %eq34 = icmp eq i8 %byte32, %lf33
-  br i1 %eq34, label %if.then35, label %if.else36
+if.else33:                                        ; preds = %if.else23
+  %pending_cr39 = load i1, ptr %pending_cr5, align 1
+  br i1 %pending_cr39, label %if.then40, label %if.merge41
 
-if.then35:                                        ; preds = %deref_null_continue30
-  store i1 false, ptr %assignment_value38, align 1
-  %assignment_value39 = load i1, ptr %assignment_value38, align 1
-  store i1 %assignment_value39, ptr %pending_cr5, align 1
-  store i1 false, ptr %assignment_value40, align 1
-  %assignment_value41 = load i1, ptr %assignment_value40, align 1
-  store i1 %assignment_value41, ptr %reading6, align 1
-  br label %if.merge37
-
-if.else36:                                        ; preds = %deref_null_continue30
-  %pending_cr42 = load i1, ptr %pending_cr5, align 1
-  br i1 %pending_cr42, label %if.then43, label %if.merge44
-
-if.merge37:                                       ; preds = %if.merge72, %if.then35
+if.merge34:                                       ; preds = %if.merge69, %if.then32
   br label %if.merge24
 
-if.then43:                                        ; preds = %if.else36
-  %length45 = load i64, ptr %length4, align 4
-  %max_bytes46 = load i64, ptr %max_bytes3, align 4
-  %status47 = load i32, ptr %status7, align 4
-  %call48 = call i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__35643331306166383930353963333332336639373264353135616334663231366631396431373637343130346537376536633663393136666232653230366564__5f726561645f6c696e655f63617061636974795f737461747573(i64 %length45, i64 %max_bytes46, i32 %status47)
-  store i32 %call48, ptr %assignment_value49, align 4
-  %assignment_value50 = load i32, ptr %assignment_value49, align 4
-  store i32 %assignment_value50, ptr %status7, align 4
-  %length51 = load i64, ptr %length4, align 4
-  %max_bytes52 = load i64, ptr %max_bytes3, align 4
-  %lt = icmp ult i64 %length51, %max_bytes52
-  br i1 %lt, label %if.then53, label %if.merge54
+if.then40:                                        ; preds = %if.else33
+  %length42 = load i64, ptr %length4, align 4
+  %max_bytes43 = load i64, ptr %max_bytes3, align 4
+  %status44 = load i32, ptr %status7, align 4
+  %call45 = call i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__35643331306166383930353963333332336639373264353135616334663231366631396431373637343130346537376536633663393136666232653230366564__5f726561645f6c696e655f63617061636974795f737461747573(i64 %length42, i64 %max_bytes43, i32 %status44)
+  store i32 %call45, ptr %assignment_value46, align 4
+  %assignment_value47 = load i32, ptr %assignment_value46, align 4
+  store i32 %assignment_value47, ptr %status7, align 4
+  %length48 = load i64, ptr %length4, align 4
+  %max_bytes49 = load i64, ptr %max_bytes3, align 4
+  %lt = icmp ult i64 %length48, %max_bytes49
+  br i1 %lt, label %if.then50, label %if.merge51
 
-if.merge44:                                       ; preds = %if.merge54, %if.else36
-  %byte64 = load i8, ptr %byte, align 1
-  %cr65 = load i8, ptr %cr, align 1
-  %eq66 = icmp eq i8 %byte64, %cr65
-  store i1 %eq66, ptr %assignment_value67, align 1
-  %assignment_value68 = load i1, ptr %assignment_value67, align 1
-  store i1 %assignment_value68, ptr %pending_cr5, align 1
-  %pending_cr69 = load i1, ptr %pending_cr5, align 1
-  %not70 = xor i1 %pending_cr69, true
-  br i1 %not70, label %if.then71, label %if.merge72
+if.merge41:                                       ; preds = %if.merge51, %if.else33
+  %byte61 = load i8, ptr %byte, align 1
+  %cr62 = load i8, ptr %cr, align 1
+  %eq63 = icmp eq i8 %byte61, %cr62
+  store i1 %eq63, ptr %assignment_value64, align 1
+  %assignment_value65 = load i1, ptr %assignment_value64, align 1
+  store i1 %assignment_value65, ptr %pending_cr5, align 1
+  %pending_cr66 = load i1, ptr %pending_cr5, align 1
+  %not67 = xor i1 %pending_cr66, true
+  br i1 %not67, label %if.then68, label %if.merge69
 
-if.then53:                                        ; preds = %if.then43
-  %cr55 = load i8, ptr %cr, align 1
-  store i8 %cr55, ptr %assignment_value56, align 1
-  %assignment_value57 = load i8, ptr %assignment_value56, align 1
-  %bytes58 = load ptr, ptr %bytes1, align 8
-  %length59 = load i64, ptr %length4, align 4
-  %array_element = getelementptr inbounds i8, ptr %bytes58, i64 %length59
-  store i8 %assignment_value57, ptr %array_element, align 1
-  %length60 = load i64, ptr %length4, align 4
-  %one61 = load i64, ptr %one, align 4
-  %add = add i64 %length60, %one61
-  store i64 %add, ptr %assignment_value62, align 4
-  %assignment_value63 = load i64, ptr %assignment_value62, align 4
-  store i64 %assignment_value63, ptr %length4, align 4
-  br label %if.merge54
+if.then50:                                        ; preds = %if.then40
+  %cr52 = load i8, ptr %cr, align 1
+  store i8 %cr52, ptr %assignment_value53, align 1
+  %assignment_value54 = load i8, ptr %assignment_value53, align 1
+  %bytes55 = load ptr, ptr %bytes1, align 8
+  %length56 = load i64, ptr %length4, align 4
+  %array_element = getelementptr inbounds i8, ptr %bytes55, i64 %length56
+  store i8 %assignment_value54, ptr %array_element, align 1
+  %length57 = load i64, ptr %length4, align 4
+  %one58 = load i64, ptr %one, align 4
+  %add = add i64 %length57, %one58
+  store i64 %add, ptr %assignment_value59, align 4
+  %assignment_value60 = load i64, ptr %assignment_value59, align 4
+  store i64 %assignment_value60, ptr %length4, align 4
+  br label %if.merge51
 
-if.merge54:                                       ; preds = %if.then53, %if.then43
-  br label %if.merge44
+if.merge51:                                       ; preds = %if.then50, %if.then40
+  br label %if.merge41
 
-if.then71:                                        ; preds = %if.merge44
-  %length73 = load i64, ptr %length4, align 4
-  %max_bytes74 = load i64, ptr %max_bytes3, align 4
-  %status75 = load i32, ptr %status7, align 4
-  %call76 = call i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__35643331306166383930353963333332336639373264353135616334663231366631396431373637343130346537376536633663393136666232653230366564__5f726561645f6c696e655f63617061636974795f737461747573(i64 %length73, i64 %max_bytes74, i32 %status75)
-  store i32 %call76, ptr %assignment_value77, align 4
-  %assignment_value78 = load i32, ptr %assignment_value77, align 4
-  store i32 %assignment_value78, ptr %status7, align 4
-  %length79 = load i64, ptr %length4, align 4
-  %max_bytes80 = load i64, ptr %max_bytes3, align 4
-  %lt81 = icmp ult i64 %length79, %max_bytes80
-  br i1 %lt81, label %if.then82, label %if.merge83
+if.then68:                                        ; preds = %if.merge41
+  %length70 = load i64, ptr %length4, align 4
+  %max_bytes71 = load i64, ptr %max_bytes3, align 4
+  %status72 = load i32, ptr %status7, align 4
+  %call73 = call i32 @wosy_fn__737464__7372632f626f6f7473747261702e77__35643331306166383930353963333332336639373264353135616334663231366631396431373637343130346537376536633663393136666232653230366564__5f726561645f6c696e655f63617061636974795f737461747573(i64 %length70, i64 %max_bytes71, i32 %status72)
+  store i32 %call73, ptr %assignment_value74, align 4
+  %assignment_value75 = load i32, ptr %assignment_value74, align 4
+  store i32 %assignment_value75, ptr %status7, align 4
+  %length76 = load i64, ptr %length4, align 4
+  %max_bytes77 = load i64, ptr %max_bytes3, align 4
+  %lt78 = icmp ult i64 %length76, %max_bytes77
+  br i1 %lt78, label %if.then79, label %if.merge80
 
-if.merge72:                                       ; preds = %if.merge83, %if.merge44
-  br label %if.merge37
+if.merge69:                                       ; preds = %if.merge80, %if.merge41
+  br label %if.merge34
 
-if.then82:                                        ; preds = %if.then71
-  %byte84 = load i8, ptr %byte, align 1
-  store i8 %byte84, ptr %assignment_value85, align 1
-  %assignment_value86 = load i8, ptr %assignment_value85, align 1
-  %bytes87 = load ptr, ptr %bytes1, align 8
-  %length88 = load i64, ptr %length4, align 4
-  %array_element89 = getelementptr inbounds i8, ptr %bytes87, i64 %length88
-  store i8 %assignment_value86, ptr %array_element89, align 1
-  %length90 = load i64, ptr %length4, align 4
-  %one91 = load i64, ptr %one, align 4
-  %add92 = add i64 %length90, %one91
-  store i64 %add92, ptr %assignment_value93, align 4
-  %assignment_value94 = load i64, ptr %assignment_value93, align 4
-  store i64 %assignment_value94, ptr %length4, align 4
-  br label %if.merge83
+if.then79:                                        ; preds = %if.then68
+  %byte81 = load i8, ptr %byte, align 1
+  store i8 %byte81, ptr %assignment_value82, align 1
+  %assignment_value83 = load i8, ptr %assignment_value82, align 1
+  %bytes84 = load ptr, ptr %bytes1, align 8
+  %length85 = load i64, ptr %length4, align 4
+  %array_element86 = getelementptr inbounds i8, ptr %bytes84, i64 %length85
+  store i8 %assignment_value83, ptr %array_element86, align 1
+  %length87 = load i64, ptr %length4, align 4
+  %one88 = load i64, ptr %one, align 4
+  %add89 = add i64 %length87, %one88
+  store i64 %add89, ptr %assignment_value90, align 4
+  %assignment_value91 = load i64, ptr %assignment_value90, align 4
+  store i64 %assignment_value91, ptr %length4, align 4
+  br label %if.merge80
 
-if.merge83:                                       ; preds = %if.then82, %if.then71
-  br label %if.merge72
+if.merge80:                                       ; preds = %if.then79, %if.then68
+  br label %if.merge69
 
-if.then97:                                        ; preds = %if.merge
-  store i1 false, ptr %assignment_value99, align 1
-  %assignment_value100 = load i1, ptr %assignment_value99, align 1
-  store i1 %assignment_value100, ptr %reading6, align 1
-  br label %if.merge98
+if.then94:                                        ; preds = %if.merge
+  store i1 false, ptr %assignment_value96, align 1
+  %assignment_value97 = load i1, ptr %assignment_value96, align 1
+  store i1 %assignment_value97, ptr %reading6, align 1
+  br label %if.merge95
 
-if.merge98:                                       ; preds = %if.then97, %if.merge
-  %bytes101 = load ptr, ptr %bytes1, align 8
-  %length102 = load i64, ptr %length4, align 4
-  %pending_cr103 = load i1, ptr %pending_cr5, align 1
-  %reading104 = load i1, ptr %reading6, align 1
-  %status105 = load i32, ptr %status7, align 4
-  %output106 = insertvalue { ptr, i64, i1, i1, i32 } zeroinitializer, ptr %bytes101, 0
-  %output107 = insertvalue { ptr, i64, i1, i1, i32 } %output106, i64 %length102, 1
-  %output108 = insertvalue { ptr, i64, i1, i1, i32 } %output107, i1 %pending_cr103, 2
-  %output109 = insertvalue { ptr, i64, i1, i1, i32 } %output108, i1 %reading104, 3
-  %output110 = insertvalue { ptr, i64, i1, i1, i32 } %output109, i32 %status105, 4
-  ret { ptr, i64, i1, i1, i32 } %output110
+if.merge95:                                       ; preds = %if.then94, %if.merge
+  %bytes98 = load ptr, ptr %bytes1, align 8
+  %length99 = load i64, ptr %length4, align 4
+  %pending_cr100 = load i1, ptr %pending_cr5, align 1
+  %reading101 = load i1, ptr %reading6, align 1
+  %status102 = load i32, ptr %status7, align 4
+  %output103 = insertvalue { ptr, i64, i1, i1, i32 } zeroinitializer, ptr %bytes98, 0
+  %output104 = insertvalue { ptr, i64, i1, i1, i32 } %output103, i64 %length99, 1
+  %output105 = insertvalue { ptr, i64, i1, i1, i32 } %output104, i1 %pending_cr100, 2
+  %output106 = insertvalue { ptr, i64, i1, i1, i32 } %output105, i1 %reading101, 3
+  %output107 = insertvalue { ptr, i64, i1, i1, i32 } %output106, i32 %status102, 4
+  ret { ptr, i64, i1, i1, i32 } %output107
 }
 
 define { ptr, i64, i1, i1, i32 } @wosy_fn__737464__7372632f626f6f7473747261702e77__35643331306166383930353963333332336639373264353135616334663231366631396431373637343130346537376536633663393136666232653230366564__5f726561645f6c696e655f616c6c6f63617465645f72616e6765(ptr %bytes, i32 %view, i64 %max_bytes, i64 %budget, i64 %length, i1 %pending_cr, i1 %reading, i32 %status) {
@@ -1540,17 +1477,7 @@ if.else:                                          ; preds = %if.then
   store i64 %div, ptr %left, align 4
   %bytes38 = load ptr, ptr %bytes1, align 8
   %view39 = load i32, ptr %view2, align 4
-  %deref_is_null = icmp eq i32 %view39, 0
-  br i1 %deref_is_null, label %deref_null_panic, label %deref_null_continue
-
-if.merge15:                                       ; preds = %if.merge64, %if.then14
-  br label %if.merge
-
-deref_null_panic:                                 ; preds = %if.else
-  call void @__wosy_core_system_panic()
-  unreachable
-
-deref_null_continue:                              ; preds = %if.else
+  call void @wosy_fn__776f73795f746f6f6c636861696e5f7374646c6962__7372632f636865636b65645f6163636573732e77__63653365383964333063396136386163353161623932346661383031343530373334343832666265613561643433353061353761613335303632633933366336__636865636b5f6e6f6e5f6e756c6c5f61646472657373(i32 %view39)
   %deref = inttoptr i32 %view39 to ptr
   %address = ptrtoint ptr %deref to i32
   %max_bytes40 = load i64, ptr %max_bytes3, align 4
@@ -1583,7 +1510,10 @@ deref_null_continue:                              ; preds = %if.else
   %reading62 = load i1, ptr %reading7, align 1
   br i1 %reading62, label %if.then63, label %if.merge64
 
-if.then63:                                        ; preds = %deref_null_continue
+if.merge15:                                       ; preds = %if.merge64, %if.then14
+  br label %if.merge
+
+if.then63:                                        ; preds = %if.else
   %bytes65 = load ptr, ptr %bytes1, align 8
   %view66 = load i32, ptr %view2, align 4
   %max_bytes67 = load i64, ptr %max_bytes3, align 4
@@ -1617,7 +1547,7 @@ if.then63:                                        ; preds = %deref_null_continue
   store i32 %assignment_value89, ptr %status8, align 4
   br label %if.merge64
 
-if.merge64:                                       ; preds = %if.then63, %deref_null_continue
+if.merge64:                                       ; preds = %if.then63, %if.else
   br label %if.merge15
 }
 
@@ -12163,6 +12093,41 @@ entry:
   ret void
 }
 
+define void @wosy_fn__776f73795f746f6f6c636861696e5f7374646c6962__7372632f636865636b65645f6163636573732e77__63653365383964333063396136386163353161623932346661383031343530373334343832666265613561643433353061353761613335303632633933366336__636865636b5f6e6f6e5f6e756c6c5f61646472657373(i32 %address) {
+entry:
+  %address1 = alloca i32, align 4
+  store i32 %address, ptr %address1, align 4
+  %address2 = load i32, ptr %address1, align 4
+  %eq = icmp eq i32 %address2, 0
+  br i1 %eq, label %if.then, label %if.merge
+
+if.then:                                          ; preds = %entry
+  call void @__wosy_core_system_panic()
+  br label %if.merge
+
+if.merge:                                         ; preds = %if.then, %entry
+  ret void
+}
+
+define void @wosy_fn__776f73795f746f6f6c636861696e5f7374646c6962__7372632f636865636b65645f6163636573732e77__63653365383964333063396136386163353161623932346661383031343530373334343832666265613561643433353061353761613335303632633933366336__636865636b5f696e6465785f696e5f657874656e74(i64 %index, i64 %count) {
+entry:
+  %index1 = alloca i64, align 8
+  store i64 %index, ptr %index1, align 4
+  %count2 = alloca i64, align 8
+  store i64 %count, ptr %count2, align 4
+  %index3 = load i64, ptr %index1, align 4
+  %count4 = load i64, ptr %count2, align 4
+  %ge = icmp uge i64 %index3, %count4
+  br i1 %ge, label %if.then, label %if.merge
+
+if.then:                                          ; preds = %entry
+  call void @__wosy_core_system_panic()
+  br label %if.merge
+
+if.merge:                                         ; preds = %if.then, %entry
+  ret void
+}
+
 define internal ptr @wosy_generic__776f73795f6f7665726c6f61645f5f373736663733373935663636366535663566333733333337333433363334356635663337333333373332333633333332363633363332333636363336363633373334333733333337333433373332333633313337333033323635333733373566356633333335333633343333333333333331333333303336333133363336333333383333333933333330333333353333333933363333333333333333333333333332333333333336333633333339333333373333333233363334333333353333333133333335333633313336333333333334333633363333333233333331333333363336333633333331333333393336333433333331333333373333333633333337333333343333333133333330333333343336333533333337333333373336333533333336333633333333333633363333333333393333333133333336333633363336333233333332333633353333333233333330333333363336333533363334356635663336333633363636333733323336363433363331333733345f5f3330__(i1 %value, ptr %0) {
 entry:
   %value1 = alloca i1, align 1
@@ -12403,6 +12368,9 @@ declare void @__wosy_core_free.2(ptr)
 
 declare void @__wosy_core_system_panic.3()
 
+; Function Attrs: nocallback nofree nounwind willreturn memory(argmem: readwrite)
+declare void @llvm.memmove.p0.p0.i32(ptr nocapture writeonly, ptr nocapture readonly, i32, i1 immarg) #1
+
 declare ptr @__wosy_core_alloc.4(i64, i64)
 
 declare void @__wosy_core_free.5(ptr)
@@ -12414,9 +12382,6 @@ declare ptr @__wosy_core_alloc.7(i64, i64)
 declare void @__wosy_core_free.8(ptr)
 
 declare void @__wosy_core_system_panic.9()
-
-; Function Attrs: nocallback nofree nounwind willreturn memory(argmem: readwrite)
-declare void @llvm.memmove.p0.p0.i32(ptr nocapture writeonly, ptr nocapture readonly, i32, i1 immarg) #1
 
 declare ptr @__wosy_core_alloc.10(i64, i64)
 
@@ -12615,54 +12580,6 @@ declare ptr @__wosy_core_alloc.106(i64, i64)
 declare void @__wosy_core_free.107(ptr)
 
 declare void @__wosy_core_system_panic.108()
-
-declare ptr @__wosy_core_alloc.109(i64, i64)
-
-declare void @__wosy_core_free.110(ptr)
-
-declare void @__wosy_core_system_panic.111()
-
-declare ptr @__wosy_core_alloc.112(i64, i64)
-
-declare void @__wosy_core_free.113(ptr)
-
-declare void @__wosy_core_system_panic.114()
-
-declare ptr @__wosy_core_alloc.115(i64, i64)
-
-declare void @__wosy_core_free.116(ptr)
-
-declare void @__wosy_core_system_panic.117()
-
-declare ptr @__wosy_core_alloc.118(i64, i64)
-
-declare void @__wosy_core_free.119(ptr)
-
-declare void @__wosy_core_system_panic.120()
-
-declare ptr @__wosy_core_alloc.121(i64, i64)
-
-declare void @__wosy_core_free.122(ptr)
-
-declare void @__wosy_core_system_panic.123()
-
-declare ptr @__wosy_core_alloc.124(i64, i64)
-
-declare void @__wosy_core_free.125(ptr)
-
-declare void @__wosy_core_system_panic.126()
-
-declare ptr @__wosy_core_alloc.127(i64, i64)
-
-declare void @__wosy_core_free.128(ptr)
-
-declare void @__wosy_core_system_panic.129()
-
-declare ptr @__wosy_core_alloc.130(i64, i64)
-
-declare void @__wosy_core_free.131(ptr)
-
-declare void @__wosy_core_system_panic.132()
 
 attributes #0 = { "target-features"="+bulk-memory" }
 attributes #1 = { nocallback nofree nounwind willreturn memory(argmem: readwrite) }

@@ -85,6 +85,7 @@ pub(super) struct PreparationOccurrenceTyping {
     members: HashMap<*const ScalarExpression, CheckedMember>,
     literal_fields: HashMap<*const ScalarExpression, ScalarStructFieldId>,
     folded_expressions: HashMap<*const ScalarExpression, FoldedOccurrence>,
+    needs_checked_access: bool,
     places: HashMap<*const ScalarPlace, ScalarType>,
     resolved_namespace_places: HashMap<*const ScalarPlace, SourceIdentity>,
 }
@@ -153,6 +154,10 @@ impl PreparationOccurrenceTyping {
     ) -> Option<FoldedOccurrence> {
         self.folded_expressions
             .remove(&std::ptr::from_ref(expression))
+    }
+
+    pub(super) fn needs_checked_access(&self) -> bool {
+        self.needs_checked_access
     }
 
     pub(super) fn take_place_type(&mut self, place: &ScalarPlace) -> Option<ScalarType> {
@@ -323,8 +328,37 @@ impl<'a> ScalarInferenceBuilder<'a> {
         }
     }
 
+    fn index_root_is_raw(&self, mut place: &ScalarPlace) -> bool {
+        loop {
+            match place {
+                ScalarPlace::Field { base, .. } | ScalarPlace::Index { base, .. } => place = base,
+                ScalarPlace::Dereference { pointer, .. } => return self.occurrences.expressions
+                    .get(&std::ptr::from_ref(pointer.as_ref()))
+                    .is_some_and(|entry| matches!(entry.ty, ScalarType::RawPointer(_))),
+                ScalarPlace::Name { .. } => return false,
+            }
+        }
+    }
+
     pub(super) fn record_place_type(&mut self, place: &ScalarPlace, ty: &ScalarType) {
         if !self.suppress_checked_occurrences && !contains_error_type(ty) {
+            if !self.occurrences.needs_checked_access {
+                self.occurrences.needs_checked_access = match place {
+                    ScalarPlace::Index { base, index, .. } => match self.occurrences
+                        .places.get(&std::ptr::from_ref(base.as_ref()))
+                    {
+                        Some(ScalarType::Array { length, .. }) =>
+                            !self.index_root_is_raw(base)
+                                && !matches!(index.as_ref(), ScalarExpression::Integer { value, .. }
+                                    if value >= &0.into() && value < &(*length).into()),
+                        _ => false,
+                    },
+                    ScalarPlace::Dereference { pointer, .. } => self.occurrences.expressions
+                        .get(&std::ptr::from_ref(pointer.as_ref()))
+                        .is_some_and(|entry| matches!(entry.ty, ScalarType::CheckedReference { .. })),
+                    _ => false,
+                };
+            }
             self.occurrences
                 .places
                 .insert(std::ptr::from_ref(place), ty.clone());

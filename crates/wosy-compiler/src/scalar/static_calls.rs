@@ -111,7 +111,42 @@ impl PreparedProgram {
 pub struct PreparedScalarProject {
     project: ScalarProject,
     calls: reference::ProjectCallSiteResults,
+    checked_access: Option<CheckedAccessDeclarations>,
+
+    require_release_checked_access: bool,
 }
+
+pub(crate) struct CheckedAccessDeclarations {
+    pub(crate) source: SourceIdentity,
+    pub(crate) non_null: String,
+    pub(crate) in_extent: String,
+}
+
+impl CheckedAccessDeclarations {
+    fn seal(module: &ScalarModule) -> Option<Self> {
+        use ScalarType::{Callable, RawPointer, U8, U64, Unit};
+        if !module.structs.is_empty() || !module.enums.is_empty() {
+            return None;
+        }
+        let [ScalarItem::Function(non_null), ScalarItem::Function(in_extent)] =
+            module.items.as_slice() else { return None };
+        for (function, parameters) in [(non_null, vec![RawPointer(Box::new(U8))]), (in_extent, vec![U64, U64])] {
+            let Callable { parameters: actual, outputs } = &function.signature else { return None };
+            if *actual != parameters || outputs.outputs.len() != 1 || outputs.outputs[0].ty != Unit
+                || !function.generic_parameters.is_empty() || !function.overload_arms.is_empty()
+                || function.body.unsafe_context
+            {
+                return None;
+            }
+        }
+        Some(Self {
+            source: module.source.clone(),
+            non_null: non_null.name.clone(),
+            in_extent: in_extent.name.clone(),
+        })
+    }
+}
+
 
 /// Rejected preparation with read-only `project` and `diagnostics` inspection.
 pub struct ScalarProjectPreparationRejection {
@@ -191,11 +226,66 @@ impl PreparedScalarProject {
     }
 
     pub(crate) fn new(project: ScalarProject) -> Result<Self, ScalarProjectPreparationRejection> {
-        let (validation, occurrence_typing) = typecheck_scalar_project_with_occurrences(project);
+        Self::new_with_access(project, None)
+    }
+
+    pub(super) fn new_with_access(
+        project: ScalarProject,
+        access: Option<(wosy_stdlib_source::CheckedAccessComponent, ScalarTargetLayout)>,
+    ) -> Result<Self, ScalarProjectPreparationRejection> {
+        let (mut validation, mut occurrence_typing) = typecheck_scalar_project_with_occurrences(project);
         if !validation.diagnostics.is_empty() {
-            return Err(ScalarProjectPreparationRejection::extraction_or_typing(
-                validation,
-            ));
+            return Err(ScalarProjectPreparationRejection::extraction_or_typing(validation));
+        }
+        let require_release_checked_access = access.is_some();
+        let mut checked_access = None;
+        if let Some((input, target_layout)) = access
+            .filter(|_| occurrence_typing.iter().any(PreparationOccurrenceTyping::needs_checked_access))
+        {
+            let source = SourceIdentity::new(
+                input.project().to_owned(),
+                input.package().to_owned(),
+                input.path().to_owned(),
+                input.revision().to_owned(),
+            );
+            if validation.project.modules.iter().any(|module| module.source == source) {
+                validation.diagnostics.push(Self::access_diagnostic());
+                return Err(ScalarProjectPreparationRejection::extraction_or_typing(validation));
+            }
+            let (fresh, diagnostics) =
+                crate::parse_source_with_snapshot(source.clone(), input.text().to_owned(), &[]);
+            if !diagnostics.is_empty() {
+                validation.diagnostics = diagnostics;
+                return Err(ScalarProjectPreparationRejection::extraction_or_typing(validation));
+            }
+            let ScalarSourceDeclarations { source, items, structs, enums, diagnostics } =
+                derive_scalar_declarations_from_cst(fresh.result().canonical_cst());
+            if !diagnostics.is_empty() {
+                validation.diagnostics = diagnostics;
+                return Err(ScalarProjectPreparationRejection::extraction_or_typing(validation));
+            }
+            let mut module = ScalarModule::new(source.clone(), items, Vec::new());
+            module.structs = structs;
+            module.enums = enums;
+            module.target_layout = target_layout;
+            module.layouts = ScalarTargetLayouts::new(target_layout);
+            // This release component is independent: type only the tiny leaf,
+            // never replay user declaration/type analysis. Append its typed
+            // rows before one shared project call-site resolution and build.
+            let (helper, typed) = typecheck_scalar_project_with_occurrences(
+                ScalarProject::new(vec![module], vec![source.clone()]),
+            );
+            if !helper.diagnostics.is_empty() {
+                return Err(ScalarProjectPreparationRejection::extraction_or_typing(helper));
+            }
+            checked_access = helper.project.modules.first().and_then(CheckedAccessDeclarations::seal);
+            if checked_access.is_none() {
+                validation.diagnostics.push(Self::access_diagnostic());
+                return Err(ScalarProjectPreparationRejection::extraction_or_typing(validation));
+            }
+            validation.project.modules.extend(helper.project.modules);
+            validation.project.initialization_order.push(source);
+            occurrence_typing.extend(typed);
         }
         let project = validation.project;
         let calls = reference::resolve_project_call_sites_with_occurrences(
@@ -215,7 +305,29 @@ impl PreparedScalarProject {
                 kind: ProjectPreparationRejectionKind::StaticLookup(calls),
             });
         }
-        Ok(Self { project, calls })
+        Ok(Self { project, calls, checked_access, require_release_checked_access })
+    }
+
+    fn access_diagnostic() -> crate::Diagnostic {
+        crate::Diagnostic {
+            code: "B0003".to_owned(),
+            severity: crate::DiagnosticSeverity::Error,
+            message: "invalid release checked-access component".to_owned(),
+            labels: Vec::new(),
+            notes: Vec::new(),
+        }
+    }
+
+    pub(crate) fn requires_release_checked_access(&self) -> bool {
+        self.require_release_checked_access
+    }
+
+    pub fn checked_access_source(&self) -> Option<&SourceIdentity> {
+        self.checked_access.as_ref().map(|access| &access.source)
+    }
+
+    pub(crate) fn checked_access(&self) -> Option<&CheckedAccessDeclarations> {
+        self.checked_access.as_ref()
     }
 
     pub fn project(&self) -> &ScalarProject {

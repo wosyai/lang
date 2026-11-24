@@ -8,3 +8,6 @@ include = ["Cargo.toml", "src/release_component.rs", "src/checked_access.w", "wo
 
 [lib]
 path = "src/release_component.rs"
+
+[dependencies]
+blake3.workspace = true
