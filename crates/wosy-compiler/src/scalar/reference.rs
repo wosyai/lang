@@ -7507,7 +7507,7 @@ fn joined_root_reborrow_binding<'a>(
     let mutable = *mode == ScalarReferenceMutability::Mutable;
     let carrier_move = match checked_releases {
         [] => None,
-        [release] if !mutable && *release > point.id => {
+        [release] if *release > point.id => {
             let release = points.get(release.0)?;
             let CfgPointKind::Release { target: ReleaseTarget::Checked { address_point, address_span, .. } } =
                 &release.kind else { return None };
@@ -7735,10 +7735,11 @@ fn joined_direct_lexical_place(place: &ReferencePlaceId) -> bool {
 
 fn joined_allocated_element_parent(site: &ReferenceFlowPoint, owner: &ReferencePlaceId) -> bool {
     // Unlike a lexical scalar, the storage has an independent cleanup
-    // obligation. Only a direct shared reborrow of a distinct selected
-    // allocation's already-typed constant element enters this lane.
+    // obligation. Only a direct reborrow of a distinct selected
+    // allocation's already-typed constant scalar element enters this lane.
+    // The family separately validates every mode, write and live descendant.
     matches!(&site.kind, CfgPointKind::ReborrowThrough {
-        mode: ScalarReferenceMutability::Shared, place: ScalarPlace::Dereference { .. }, ..
+        place: ScalarPlace::Dereference { .. }, ..
     }) && matches!(&owner.projections[..], [ReferencePlaceProjection::Index(
         ScalarExpression::Integer { value, .. }
     )] if value >= &0.into())
