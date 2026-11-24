@@ -1625,6 +1625,20 @@ cases.extend([
         1,b"proof obligation failed"),
 ])
 
+symbolic_named_exact_pair = """%%start
+    i16(i8, i16) leaf = fn(tag, value) { if (tag < 0) { 300 } else { value } };
+    i16(i8, i16) producer = fn(tag, value) { i16 result = leaf(tag, value); result };
+    proof bounded for producer(selector, before) -> (out)
+        where (selector >= 0 && before >= 10) ensures (out <= 11) {}
+%%end"""
+cases.extend([
+    ("ordinary-named-symbolic-pair-alias-refuted",symbolic_named_exact_pair,1,b"proof obligation failed"),
+    ("ordinary-named-symbolic-pair-alias-proved",symbolic_named_exact_pair.replace("before >= 10","before == 10"),
+        0,b""),
+    ("ordinary-named-symbolic-pair-constant-refuted",symbolic_named_exact_pair.replace("selector >= 0","selector < 0"),
+        1,b"proof obligation failed"),
+])
+
 stacked_named_exact_pair = f"""%%start
     i16(i8, i16) leaf = fn(tag, value) {{ if (tag > 0) {{ 42 }} else {{ if (value == 300) {{ 9 }} else {{ value }} }} }};
     i16(i8, i16) producer = fn(tag, value) {{ i16 result = leaf(tag, value); result }};
@@ -1741,6 +1755,8 @@ cases.extend([
         b"proof obligation failed"),
 ])
 proof_diagnostic_notes = {
+    "ordinary-named-symbolic-pair-alias-refuted": b"symbolic call can return 12",
+    "ordinary-named-symbolic-pair-constant-refuted": b"symbolic call can return 300",
     "exact-startup-named-stacked-pair-old-second-refuted": b"call returned 42",
     "exact-startup-named-calling-producer-observes-nested-watch": b"reached from this call",
     "exact-startup-named-stacked-calling-producer-refuted": b"through this call",

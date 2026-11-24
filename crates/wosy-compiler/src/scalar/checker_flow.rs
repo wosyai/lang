@@ -3264,6 +3264,8 @@ pub(super) struct ProjectedIntegerPair {
 }
 
 struct IntegerPairReturnPartition {
+    #[cfg(feature = "internal-checker")]
+    span: super::ByteSpan,
     anchor: u16,
     inputs: [Rc<IntegerSet>; 2],
     output: IntegerPairPartitionOutput,
@@ -3307,6 +3309,123 @@ pub(super) struct PartitionedCallProof<'a> {
 pub(super) enum PartitionedProofGoal<'a> {
     Literal(IntegerRelation, &'a BigInt),
     EntryEquality,
+}
+
+#[cfg(feature = "internal-checker")]
+pub(super) fn covers_all_named_pair_inputs(
+    returned: &ActualCallResult, full: &[IntegerSet; 2], work: &mut usize,
+) -> Option<bool> {
+    let ActualCallResult::PartitionedIntegerPair(pair) = returned else { return None; };
+    if pair.caller_axes != [0, 1] { return None; }
+    let (minimum, maximum) = full[0].extremes()?;
+    charge_call_work(work, pair.pieces.len())?;
+    let mut cost = [0usize; 2];
+    for piece in &pair.pieces {
+        if piece.anchor != 0 { return None; }
+        for (total, axis) in cost.iter_mut().zip(&piece.inputs) {
+            *total = total.checked_add(axis.interval_count())?;
+        }
+    }
+    let sort_work = |count: usize| {
+        let depth = (usize::BITS - count.leading_zeros()) as usize;
+        count.checked_mul(depth.checked_mul(2)?.checked_add(4)?)
+    };
+    let cuts = cost[0].checked_mul(2)?.checked_add(2)?;
+    charge_call_work(work, sort_work(cuts)?.checked_add(cost[0])?.checked_add(cost[1])?)?;
+    let mut starts = Vec::with_capacity(cuts);
+    starts.push(minimum.clone());
+    starts.push(maximum + 1);
+    for piece in &pair.pieces {
+        if !piece.inputs[0].is_subset_of(&full[0]) || !piece.inputs[1].is_subset_of(&full[1]) { return None; }
+        for (lower, upper) in piece.inputs[0].intervals() {
+            starts.push(lower.clone());
+            starts.push(upper + 1);
+        }
+    }
+    starts.sort_unstable();
+    starts.dedup();
+    // Between consecutive first-axis boundaries, coverage by a rectangle
+    // cannot change. Check its actual second-axis union in each slab.
+    let mut active = Vec::new();
+    for slab in starts.windows(2) {
+        charge_call_work(work, pair.pieces.len().checked_add(cost[0])?.checked_add(sort_work(cost[1])?)?)?;
+        active.clear();
+        let first = &slab[0];
+        let last = &slab[1] - 1;
+        for piece in &pair.pieces {
+            if piece.inputs[0].covers_closed(first, &last) { active.push(piece.inputs[1].as_ref()); }
+        }
+        if !full[1].is_subset_of(&IntegerSet::union(active.iter().copied())) { return Some(false); }
+    }
+    Some(true)
+}
+
+#[cfg(all(test, feature = "internal-checker"))]
+#[test]
+fn named_pair_coverage_does_not_confuse_marginals_with_rectangular_coverage() {
+    let zero = BigInt::from(0);
+    let one = BigInt::from(1);
+    let full = [IntegerSet::ordinary_bool_domain(), IntegerSet::ordinary_bool_domain()];
+    let piece = |x, y| IntegerPairReturnPartition {
+        span: super::ByteSpan { start: 0, end: 0 }, anchor: 0,
+        inputs: [Rc::new(IntegerSet::singleton(x)), Rc::new(IntegerSet::singleton(y))],
+        output: IntegerPairPartitionOutput::InputAlias(1),
+    };
+    let coverage = |pieces| covers_all_named_pair_inputs(
+        &ActualCallResult::PartitionedIntegerPair(ProjectedIntegerPair { caller_axes: [0, 1], pieces }),
+        &full, &mut 0,
+    );
+    assert_eq!(coverage(vec![piece(&zero, &zero), piece(&one, &one)]), Some(false));
+    assert_eq!(coverage(vec![piece(&zero, &zero), piece(&zero, &one), piece(&one, &zero), piece(&one, &one)]), Some(true));
+}
+
+#[cfg(feature = "internal-checker")]
+pub(super) fn verify_named_pair_literal_return<'a>(
+    producer: &'a FunctionCallSites, returned: &ActualCallResult, guards: &[IntegerSet; 2],
+    relation: IntegerRelation, bound: &BigInt, work: &mut usize,
+) -> Option<PartitionedCallProof<'a>> {
+    let ActualCallResult::PartitionedIntegerPair(pair) = returned else { return None; };
+    if pair.caller_axes != [0, 1] { return None; }
+    let [first, second] = producer.boundary.checker_parameter_bindings.as_deref()? else { return None; };
+    let [left, right] = producer.boundary.parameters.as_slice() else { return None; };
+    let mut applicable = false;
+    'pieces: for piece in &pair.pieces {
+        if piece.anchor != 0 { return None; }
+        let mut cells = [Rc::clone(&piece.inputs[0]), Rc::clone(&piece.inputs[1])];
+        let cost = |axis: usize| cells[axis].interval_count().checked_add(guards[axis].interval_count());
+        charge_call_work(work, 4usize.checked_add(cost(0)?)?.checked_add(cost(1)?)?)?;
+        for (cell, guard) in cells.iter_mut().zip(guards) {
+            match cell.intersection(guard) {
+                IntegerIntersection::Changed(clipped) => *cell = Rc::new(clipped),
+                IntegerIntersection::Empty => continue 'pieces,
+                IntegerIntersection::Unchanged => continue,
+            }
+        }
+        applicable = true;
+        let returned = match &piece.output {
+            IntegerPairPartitionOutput::Singleton(values) => {
+                let singleton = values.singleton_value()?;
+                if relation.accepts(singleton.cmp(bound)) { continue; }
+                singleton.clone()
+            }
+            IntegerPairPartitionOutput::InputAlias(slot) => {
+                let selected = cells.get_mut(*slot)?;
+                charge_call_work(work, selected.interval_count().checked_mul(2)?.checked_add(1)?)?;
+                let rejected = selected.keep_relation(relation.complement(), bound);
+                let Some((example, _)) = rejected.extremes() else { continue; };
+                let returned = example.clone();
+                *selected = Rc::new(rejected);
+                returned
+            }
+            IntegerPairPartitionOutput::InputAffine(..) => return None,
+        };
+        return Some(PartitionedCallProof { applicable, covers_guard: false, failure: Some(SymbolicLiteralFailure {
+            output: piece.span, returned,
+            state: IntegerInputs::from_cells(vec![Vec::from(cells)]),
+            axes: vec![(first, &left.ty), (second, &right.ty)],
+        }) });
+    }
+    Some(PartitionedCallProof { applicable, covers_guard: false, failure: None })
 }
 
 #[cfg(feature = "internal-checker")]
@@ -5254,6 +5373,7 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                                 })
                             } else {
                                 ComputedIntegerReturn::Pair(IntegerPairReturnPartition {
+                                    span: slot.span,
                                     anchor: row.projected_from,
                                     inputs: [Rc::clone(&row[0]), Rc::clone(&row[1])],
                                     output: match value {
@@ -5966,6 +6086,8 @@ pub(super) struct ExactCallCursor<'a> {
     computed_returns: Vec<(usize, ComputedIntegerReturn)>,
     return_capture_work: usize,
     projected_slot: Option<usize>,
+    #[cfg(feature = "internal-checker")]
+    named_pair_rectangles: bool,
     projected_pair: Option<[usize; 2]>,
 }
 
@@ -6064,6 +6186,23 @@ impl<'a> ExactCallCursor<'a> {
         }
         self.named_affine_partition = true;
         self.named_pure_projection_leaf = pure_projection_leaf;
+        Some(())
+    }
+
+    #[cfg(feature = "internal-checker")]
+    pub(super) fn named_pair_root(calls: &'a FunctionCallSites, expected: &ScalarType, inputs: [IntegerSet; 2]) -> Option<Self> {
+        let row = IntegerRow::new(Vec::from(inputs.map(Rc::new)));
+        let mut cursor = Self::with_rows(calls, expected, IntegerInputs(vec![row]), None, Some([0, 1]))?;
+        cursor.require_named_pair_rectangles()?;
+        Some(cursor)
+    }
+
+    #[cfg(feature = "internal-checker")]
+    pub(super) fn require_named_pair_rectangles(&mut self) -> Option<()> {
+        if self.projected_pair.is_none() || self.projected_slot.is_some() || !self.tail.is_some_and(is_integer_type) {
+            return None;
+        }
+        self.named_pair_rectangles = true;
         Some(())
     }
 
@@ -6171,6 +6310,8 @@ impl<'a> ExactCallCursor<'a> {
             named_affine_partition: false,
             #[cfg(feature = "internal-checker")]
             named_pure_projection_leaf: false,
+            #[cfg(feature = "internal-checker")]
+            named_pair_rectangles: false,
             discarded_return: None, returned: Vec::new(), computed_returns: Vec::new(), return_capture_work: 0, projected_slot, projected_pair })
     }
 
@@ -6520,6 +6661,12 @@ impl<'a> ExactCallCursor<'a> {
                         IntegerReturn::Alias(binding) => (Some(path.axes.iter().position(|axis| *axis == binding)?), None),
                     };
                     for row in &path.state.0 {
+                        #[cfg(feature = "internal-checker")]
+                        if self.named_pair_rectangles && (row.entry.is_some() || row.affine.is_some()
+                            || row.canonical_axis(0) == row.canonical_axis(1))
+                        {
+                            return None;
+                        }
                         let output = if let Some(axis) = alias {
                             if row[axis].singleton_value().is_some() {
                                 IntegerPairPartitionOutput::Singleton(Rc::clone(&row[axis]))
@@ -6537,6 +6684,8 @@ impl<'a> ExactCallCursor<'a> {
                             IntegerPairPartitionOutput::Singleton(Rc::clone(constant.as_ref()?))
                         };
                         pieces.push(IntegerPairReturnPartition {
+                            #[cfg(feature = "internal-checker")]
+                            span: path.span,
                             anchor: row.projected_from,
                             inputs: [Rc::clone(&row[0]), Rc::clone(&row[1])],
                             output,
