@@ -1443,6 +1443,26 @@ cases.extend([
     ("exact-startup-module-typed-narrow-prestate",module_authored_output.replace("core.require(status","core.narrow(status"),37,b"MODULE-STATE"),
     ("exact-startup-module-success-skips-state",module_authored_output.replace("core.require(status != 37","core.require(status == 37"),200,b"AFTER-MODULE-STATE"),
 ])
+startup_logic = f"""%%start
+    i8(i8) identity = fn(value) {{ value }};
+    bool(bool) truth = fn(value) {{ value }};
+    i8 status = identity(37);
+    bool ready = truth(true);
+    if (ready && !(status != 37) && (ready || truth(ready))) {{
+        core.require(!ready || status == 37, {report(11,"WRONG-REQUIRE")});
+        core.narrow(!ready && truth(ready), {{
+            .stdout = ""; .stderr = "STARTUP-LOGIC"; .code = status;
+            .files = [{{ .path = "startup-logic.json"; .state = ready; }}];
+        }});
+    }} else {{
+        core.require(false, {report(13,"WRONG-BRANCH")});
+    }};
+    core.require(false, {report(17,"UNREACHABLE")});
+    %%end"""
+cases.extend([
+    ("exact-startup-composed-logic",startup_logic,37,b"STARTUP-LOGIC"),
+    ("exact-startup-composed-logic-live-unsupported",startup_logic.replace("(ready || truth(ready)","(!ready || truth(ready)"),2,b"unsupported analysis"),
+])
 lexical_code_report = state_report(0,"LEXICAL-CODE","status").replace(".code = 0",".code = status")
 lexical_code = f"""%%start
     unit(i8) check = fn(status) {{
@@ -1605,6 +1625,7 @@ nested_array_bytes = state_bytes({
     },
 })
 authored_files = {
+    "exact-startup-composed-logic": {"startup-logic.json": b'{"type":{"kind":"bool"},"value":true}\n'},
     **{name: {
         "status.json": b'{"type":{"kind":"i8"},"value":37}\n',
         "status-copy.json": b'{"type":{"kind":"i8"},"value":37}\n',

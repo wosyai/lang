@@ -34,6 +34,14 @@ pub(super) struct PreparedCheckerDirective {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum InitializerPredicate {
+    #[cfg(feature = "internal-checker")]
+    Opaque,
+    #[cfg(feature = "internal-checker")]
+    And(Box<[Self; 2]>),
+    #[cfg(feature = "internal-checker")]
+    Or(Box<[Self; 2]>),
+    #[cfg(feature = "internal-checker")]
+    Not(Box<Self>),
     Boolean(bool),
     BooleanStorage(ByteSpan),
     IntegerComparison {

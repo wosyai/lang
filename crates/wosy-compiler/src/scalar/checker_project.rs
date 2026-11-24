@@ -1168,9 +1168,13 @@ fn check_initializer_expression<const COLLECT: bool, const PRIVATE_NESTED_SCALAR
     visits: &[InitializationVisit],
 ) -> Result<StartupLane, ProjectCheck> {
     let structure = &topology.structure;
+    #[cfg(feature = "internal-checker")]
+    let allow_logic = COLLECT && actual.permits_authored_startup_scalars();
+    #[cfg(not(feature = "internal-checker"))]
+    let allow_logic = false;
     if let Some(directive) = structure.checker_directives.get(&expression) {
         let predicate = directive.initializer_predicate.as_ref().ok_or(ProjectCheck::Unsupported)?;
-        let value = evaluate_initializer_predicate(predicate, storage).ok_or(ProjectCheck::Unsupported)?;
+        let value = evaluate_initializer_predicate(predicate, storage, allow_logic).ok_or(ProjectCheck::Unsupported)?;
         actual.had_obligations = true;
         if directive.operation.rejects(value, !value) {
             let span = topology.occurrences.get(expression.0).ok_or(ProjectCheck::MissingRootOccurrences)?.span;
@@ -1215,7 +1219,7 @@ fn check_initializer_expression<const COLLECT: bool, const PRIVATE_NESTED_SCALAR
             _ => return Err(ProjectCheck::Unsupported),
         };
         let value = topology.initializer_branches.get(condition)
-            .and_then(|predicate| evaluate_initializer_predicate(predicate, storage))
+            .and_then(|predicate| evaluate_initializer_predicate(predicate, storage, allow_logic))
             .ok_or(ProjectCheck::Unsupported)?;
         let selected = if value { Some(then_block) } else { else_block };
         if let Some(selected) = selected {
@@ -1348,8 +1352,27 @@ fn initialized_integer_argument<'a>(
 fn evaluate_initializer_predicate(
     predicate: &InitializerPredicate,
     storage: &HashMap<ByteSpan, InitializerValue<'_>>,
+    #[cfg_attr(not(feature = "internal-checker"), allow(unused_variables))] allow_logic: bool,
 ) -> Option<bool> {
     match predicate {
+        #[cfg(feature = "internal-checker")]
+        InitializerPredicate::And(operands) if allow_logic => {
+            let [left, right] = operands.as_ref();
+            Some(evaluate_initializer_predicate(left, storage, true)?
+                && evaluate_initializer_predicate(right, storage, true)?)
+        }
+        #[cfg(feature = "internal-checker")]
+        InitializerPredicate::Or(operands) if allow_logic => {
+            let [left, right] = operands.as_ref();
+            Some(evaluate_initializer_predicate(left, storage, true)?
+                || evaluate_initializer_predicate(right, storage, true)?)
+        }
+        #[cfg(feature = "internal-checker")]
+        InitializerPredicate::Not(operand) if allow_logic =>
+            Some(!evaluate_initializer_predicate(operand, storage, true)?),
+        #[cfg(feature = "internal-checker")]
+        InitializerPredicate::And(_) | InitializerPredicate::Or(_) | InitializerPredicate::Not(_)
+            | InitializerPredicate::Opaque => None,
         InitializerPredicate::Boolean(value) => Some(*value),
         InitializerPredicate::BooleanStorage(span) => match storage.get(span)? {
             InitializerValue::Boolean(value) => Some(*value),
@@ -9999,6 +10022,38 @@ mod tests {
             &HashMap::new(), narrow, 0, &mut failures, &[InitializationVisit::Started]),
             Err(ProjectCheck::Unsupported)));
         assert!(effects.records.is_empty());
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn reached_startup_logic_short_circuits_and_narrows_with_authored_state() {
+        let app = source("src/main.w", "startup-short-circuit");
+        let program = r#"%%start
+            i8(i8) identity = fn(value) { value };
+            bool(bool) truth = fn(value) { value };
+            i8 status = identity(37);
+            bool ready = truth(true);
+            if (ready && !(status != 37) && (ready || truth(ready))) {
+                core.require(!ready || status == 37, { .stdout = ""; .stderr = "unexpected"; .code = 11; .files = []; });
+                core.narrow(!ready && truth(ready), { .stdout = ""; .stderr = "selected"; .code = status;
+                    .files = [{ .path = "state.json"; .state = ready; }]; });
+            } else {
+                core.require(false, { .stdout = ""; .stderr = "wrong branch"; .code = 13; .files = []; });
+            };
+            core.require(false, { .stdout = ""; .stderr = "unreachable"; .code = 17; .files = []; });
+        %%end"#;
+        for scope in [ScalarCheckerScope::MainFlowOnly, ScalarCheckerScope::CurrentPackage] {
+            let prepared = prepare_proof_target(&app, program).unwrap();
+            let receipt = run_closed_without_named_proofs(&prepared, scope, 1).unwrap();
+            let [failure] = receipt.directives.as_slice() else { panic!("only selected Narrow may report"); };
+            assert_eq!(failure.code(), &BigInt::from(37));
+            assert_eq!(failure.witness.axes().len(), 0);
+            assert_eq!(failure.files()[0].text.as_ref(), b"{\"type\":{\"kind\":\"bool\"},\"value\":true}\n");
+
+            let live = program.replace("(ready || truth(ready)", "(!ready || truth(ready)");
+            let prepared = prepare_proof_target(&app, &live).unwrap();
+            assert!(matches!(run_closed_without_named_proofs(&prepared, scope, 1), Err(ProjectCheck::Unsupported)));
+        }
     }
 
     #[cfg(feature = "internal-checker")]

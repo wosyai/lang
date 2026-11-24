@@ -7357,6 +7357,47 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
         expression: &ScalarExpression,
         names: &BTreeMap<String, WalkBinding>,
     ) -> Option<super::checker_directive::InitializerPredicate> {
+        #[cfg(feature = "internal-checker")]
+        if matches!(expression,
+            ScalarExpression::Binary { operator: BinaryOperator::And | BinaryOperator::Or, .. }
+                | ScalarExpression::Unary { operator: super::UnaryOperator::LogicalNot, .. })
+        {
+            // Startup evaluates a source initializer only once. Bound both
+            // preparation and runtime work for each logical expression.
+            return Some(self.prepare_initializer_logic(expression, names, &mut 32));
+        }
+        self.checked_initializer_predicate_atom(expression, names)
+    }
+
+    #[cfg(feature = "internal-checker")]
+    fn prepare_initializer_logic(
+        &self,
+        expression: &ScalarExpression,
+        names: &BTreeMap<String, WalkBinding>,
+        remaining: &mut usize,
+    ) -> super::checker_directive::InitializerPredicate {
+        use super::checker_directive::InitializerPredicate as Predicate;
+        if *remaining == 0 { return Predicate::Opaque; }
+        *remaining -= 1;
+        match expression {
+            ScalarExpression::Binary { operator: operator @ (BinaryOperator::And | BinaryOperator::Or), left, right, .. } => {
+                let left = self.prepare_initializer_logic(left, names, remaining);
+                let right = self.prepare_initializer_logic(right, names, remaining);
+                let operands = Box::new([left, right]);
+                if *operator == BinaryOperator::And { Predicate::And(operands) } else { Predicate::Or(operands) }
+            }
+            ScalarExpression::Unary { operator: super::UnaryOperator::LogicalNot, operand, .. } =>
+                Predicate::Not(Box::new(self.prepare_initializer_logic(operand, names, remaining))),
+            _ => self.checked_initializer_predicate_atom(expression, names).unwrap_or(Predicate::Opaque),
+        }
+    }
+
+    #[cfg(any(test, feature = "internal-checker"))]
+    fn checked_initializer_predicate_atom(
+        &self,
+        expression: &ScalarExpression,
+        names: &BTreeMap<String, WalkBinding>,
+    ) -> Option<super::checker_directive::InitializerPredicate> {
         use super::{checker_directive::{InitializerIntegerOperand, InitializerPredicate}, checker_flow::concrete_integer_literal};
         let WalkMode::ModuleInitialization { source, declarations } = &self.mode else {
             return None;
