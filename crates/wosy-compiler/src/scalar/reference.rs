@@ -6168,6 +6168,7 @@ pub(super) struct CheckerOrdinaryIntegerComparison {
 pub(super) enum CheckerOrdinaryBoolean {
     Constant(bool),
     Binding(ReferenceBindingId),
+    Call(OccurrenceOrdinal),
     Integer(super::checker_flow::IntegerPredicate),
     Lexical(CheckerOrdinaryIntegerComparison),
     And(Box<[Self; 2]>),
@@ -6175,6 +6176,22 @@ pub(super) enum CheckerOrdinaryBoolean {
     Not(Box<Self>),
     // A well-typed but unsupported expression is harmless if short-circuited.
     Opaque,
+}
+
+#[cfg(feature = "internal-checker")]
+impl CheckerOrdinaryBoolean {
+    fn call_guard_shape(&self) -> (bool, usize) {
+        match self {
+            Self::Call(_) => (true, 1),
+            Self::Not(child) => { let (calls, nodes) = child.call_guard_shape(); (calls, nodes + 1) }
+            Self::And(children) | Self::Or(children) => {
+                let (left, lhs) = children[0].call_guard_shape();
+                let (right, rhs) = children[1].call_guard_shape();
+                (left || right, lhs + rhs + 1)
+            }
+            _ => (false, 1),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -6201,6 +6218,8 @@ pub(super) struct OccurrenceStructure {
     pub(super) checker_direct_targets: HashMap<OccurrenceOrdinal, (usize, usize)>,
     #[cfg(any(test, feature = "internal-checker"))]
     pub(super) checker_integer_locals: HashMap<(BlockOrdinal, usize), ReferenceBindingId>,
+    #[cfg(feature = "internal-checker")]
+    pub(super) checker_ordinary_call_guards: HashMap<OccurrenceOrdinal, usize>,
     #[cfg(feature = "internal-checker")]
     pub(super) checker_ordinary_booleans: HashMap<OccurrenceOrdinal, CheckerOrdinaryBoolean>,
     #[cfg(feature = "internal-checker")]
@@ -6272,6 +6291,8 @@ impl OccurrenceStructure {
             checker_ordinary_integer_comparisons: HashMap::new(),
             #[cfg(feature = "internal-checker")]
             checker_ordinary_booleans: HashMap::new(),
+            #[cfg(feature = "internal-checker")]
+            checker_ordinary_call_guards: HashMap::new(),
             #[cfg(any(test, feature = "internal-checker"))]
             checker_contextual_read_locals: HashMap::new(),
             #[cfg(any(test, feature = "internal-checker"))]
@@ -7098,11 +7119,25 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
     }
 
     #[cfg(feature = "internal-checker")]
+    fn ordinary_bool_call(&self, expression: &ScalarExpression, call: OccurrenceOrdinal) -> Option<OccurrenceOrdinal> {
+        let ScalarExpression::Call { arguments, .. } = expression else { return None; };
+        let signature = self.checked_call_signatures.get(&call)?;
+        let [output] = signature.outputs.outputs.as_slice() else { return None; };
+        (output.ty == ScalarType::Bool && self.structure.checker_direct_targets.contains_key(&call)
+            && signature.parameters.len() == arguments.len() && arguments.len() <= 2
+            && signature.parameters.iter().all(|ty| is_integer_type(ty) || *ty == ScalarType::Bool))
+            .then_some(call)
+    }
+
+    #[cfg(feature = "internal-checker")]
     fn ordinary_compound(
         &self, expression: &ScalarExpression, names: &BTreeMap<String, WalkBinding>, occurrence: Option<OccurrenceOrdinal>,
     ) -> Option<CheckerOrdinaryBoolean> {
         if let Some(binding) = self.ordinary_bool_binding(expression, names, occurrence) {
             return Some(CheckerOrdinaryBoolean::Binding(binding));
+        }
+        if let Some(call) = occurrence.and_then(|call| self.ordinary_bool_call(expression, call)) {
+            return Some(CheckerOrdinaryBoolean::Call(call));
         }
         if !matches!(self.mode, WalkMode::Callable(_)) || !matches!(expression,
             ScalarExpression::Binary { operator: BinaryOperator::And | BinaryOperator::Or, .. }
@@ -7144,6 +7179,8 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
             _ => {
                 if let Some(binding) = self.ordinary_bool_binding(expression, names, occurrence) {
                     Boolean::Binding(binding)
+                } else if let Some(call) = occurrence.and_then(|call| self.ordinary_bool_call(expression, call)) {
+                    Boolean::Call(call)
                 } else if let Some(comparison) = self.ordinary_integer_comparison(expression, names, occurrence) {
                     Boolean::Lexical(comparison)
                 } else if let Some(predicate) = self.ordinary_literal_predicate(expression, names, occurrence) {
@@ -7541,6 +7578,8 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
         #[cfg(feature = "internal-checker")]
         if checker_enabled && matches!(edge, OccurrenceEdge::Condition) {
             if let Some(compound) = self.ordinary_compound(expression, names, Some(ordinal)) {
+                let (has_call, nodes) = compound.call_guard_shape();
+                if has_call { self.structure.checker_ordinary_call_guards.insert(ordinal, nodes); }
                 self.structure.checker_ordinary_booleans.insert(ordinal, compound);
             } else if let Some(comparison) = self.ordinary_integer_comparison(expression, names, Some(ordinal)) {
                 self.structure.checker_ordinary_integer_comparisons.insert(ordinal, comparison);
@@ -7614,16 +7653,7 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
             if let ScalarExpression::Boolean { value, .. } = expression {
                 return Some(CheckerOrdinaryScalarLocalKind::BoolLiteral(*value));
             }
-            let ScalarExpression::Call { arguments, .. } = expression else { return None; };
-            let signature = self.checked_call_signatures.get(&source)?;
-            let [output] = signature.outputs.outputs.as_slice() else { return None; };
-            if output.ty != ScalarType::Bool || !self.structure.checker_direct_targets.contains_key(&source)
-                || signature.parameters.len() != arguments.len() || arguments.len() > 2
-                || !signature.parameters.iter().all(|ty| is_integer_type(ty) || *ty == ScalarType::Bool)
-            {
-                return None;
-            }
-            return Some(CheckerOrdinaryScalarLocalKind::BoolCall(source));
+            return self.ordinary_bool_call(expression, source).map(CheckerOrdinaryScalarLocalKind::BoolCall);
         }
         let (operator, [left, right]) = self.simple_integer_operation(source, expression)?;
         let typed = |(ordinal, literal): (_, Option<std::borrow::Cow<'_, BigInt>>)| {

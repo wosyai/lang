@@ -697,8 +697,10 @@ for name,program,correct,incorrect,code,label in [
 cases.extend([
     ("exact-startup-staged-bool-result",bool_exact_result,133,b"EXACT-BOOL-RESULT"),
     ("unused-bool-return-root-keeps-requirement",bool_independent_root,134,b"UNUSED-BOOL-ROOT"),
-    ("direct-bool-call-in-guard-is-not-eagerly-evaluated",bool_result.replace(
-        "if (result && entry >= 0)", "if (allowed(entry) && entry >= 0)"),2,b"unsupported analysis"),
+    ("direct-bool-call-feeds-compound-guard",bool_result.replace(
+        "if (result && entry >= 0)", "if (allowed(entry) && entry >= 0)"),0,b""),
+    ("elided-directive-bool-call-remains-unsupported",bool_result.replace(
+        "core.require(!result,", "core.require(!result && allowed(entry),"),2,b"unsupported analysis"),
 ])
 bool_staged_root = f"""%%start
     bool(i8) selected = fn(entry) {{ if (entry < 4) {{ true }} else {{ false }} }};
@@ -713,6 +715,69 @@ cases.extend([
     ("unused-bool-root-with-staged-return-still-reports-witness",
      bool_staged_root.replace("entry <= 3","entry <= 2"),135,b"BOOL-ROOT-CHILD"),
 ])
+guard_dead = f"""%%start
+    bool(i8) observed = fn(entry) {{
+        core.require(entry == 0, {report(136,"REACHED-CALLEE")});
+        true
+    }};
+    unit() startup = fn {{
+        bool result = observed(0);
+        core.require(result, {report(137,"STARTUP-CALLEE")});
+    }};
+    unit(i8) check = fn(entry) {{
+        {bounds("entry",0,4)}
+        if (entry > 4 && observed(entry)) {{ core.require(entry <= 4, {report(138,"GUARD-AND")}); }};
+        if (entry <= 4 || observed(entry)) {{ core.require(entry <= 4, {report(139,"GUARD-OR")}); }};
+    }};
+    startup();
+    %%end"""
+guard_mixed = f"""%%start
+    bool(bool,i8) allowed = fn(enabled, number) {{
+        if (enabled) {{ if (number > 2) {{ true }} else {{ false }} }} else {{ false }}
+    }};
+    unit(bool,i8) check = fn(enabled, number) {{
+        if (allowed(enabled, number)) {{
+            core.require(enabled && number > 2, {report(140,"DIRECT-PAIR")});
+        }} else {{
+            if (enabled) {{ core.require(number <= 2, {report(141,"DIRECT-PAIR-FALSE")}); }};
+        }};
+    }};
+    %%end"""
+guard_terminal = f"""%%start
+    bool(i8) first = fn(entry) {{ if (entry < 4) {{ true }} else {{ false }} }};
+    bool(i8) second = fn(entry) {{ if (entry < 2) {{ true }} else {{ false }} }};
+    bool(i8) selected = fn(entry) {{
+        if (first(entry) && !second(entry)) {{ true }} else {{ false }}
+    }};
+    unit(i8) check = fn(entry) {{
+        bool result = selected(entry);
+        if (result) {{ core.require(entry >= 2 && entry <= 3, {report(142,"TERMINAL-GUARD")}); }};
+    }};
+    %%end"""
+guard_alias = f"""%%start
+    bool(bool) echo = fn(flag) {{ flag }};
+    unit(bool) check = fn(flag) {{
+        if (echo(flag)) {{ core.require(flag, {report(143,"TRUE-ALIAS")}); }}
+        else {{ core.require(!flag, {report(144,"FALSE-ALIAS")}); }};
+    }};
+    %%end"""
+for name,program,correct,incorrect,code,label in [
+    ("direct-bool-call-retains-pair-anchors",guard_mixed,"enabled && number > 2","enabled && number > 3",140,b"DIRECT-PAIR"),
+    ("direct-bool-call-terminal-compound",guard_terminal,"entry >= 2 && entry <= 3","entry >= 3 && entry <= 3",142,b"TERMINAL-GUARD"),
+    ("direct-bool-call-raw-alias-does-not-escape",guard_alias,"require(flag,","require(!flag,",143,b"TRUE-ALIAS"),
+]:
+    cases.extend([(name,program,0,b""),(name+"-witness",program.replace(correct,incorrect),code,label)])
+cases.extend([
+    ("direct-bool-call-dead-rhs-never-activates",guard_dead,0,b""),
+    ("direct-bool-call-reached-rhs-propagates-callee-failure",guard_dead.replace("entry > 4 &&","entry >= 4 &&"),
+     136,b"REACHED-CALLEE"),
+])
+guard_actual = guard_dead.replace("startup();", "startup();\n    check(4);")
+cases.extend([
+    ("exact-startup-direct-guard-skips-dead-call",guard_actual,0,b""),
+    ("exact-startup-direct-guard-reached-call-reports",
+     guard_actual.replace("entry > 4 &&","entry >= 4 &&"),136,b"REACHED-CALLEE"),
+])
 with tempfile.TemporaryDirectory(prefix="affine-calls-") as path:
     root=Path(path)
     (root/"src").mkdir()
@@ -720,7 +785,7 @@ with tempfile.TemporaryDirectory(prefix="affine-calls-") as path:
         (root/"wosy.toml").write_text(manifest.format(output=target))
         for scope in ("--main-flow-only","--declared-package"):
             for name,text,expected,stderr in cases:
-                included = scope == "--declared-package" or name in ("exact-startup-lexical-copy", "exact-startup-inline-arithmetic", "exact-startup-lexical-comparison", "exact-startup-bool-argument", "exact-startup-staged-bool-result")
+                included = scope == "--declared-package" or name in ("exact-startup-lexical-copy", "exact-startup-inline-arithmetic", "exact-startup-lexical-comparison", "exact-startup-bool-argument", "exact-startup-staged-bool-result", "exact-startup-direct-guard-skips-dead-call", "exact-startup-direct-guard-reached-call-reports")
                 code = expected if included else 0
                 expected_stderr = stderr if included else b""
                 (root/"src/main.w").write_text(text.strip()+"\n")

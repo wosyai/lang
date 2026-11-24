@@ -4078,7 +4078,7 @@ impl IntegerInputs {
         if self.is_unreachable() { return Some(output); }
         charge_call_work(work, 1)?;
         match condition {
-            Boolean::Opaque => return None,
+            Boolean::Opaque | Boolean::Call(_) => return None,
             Boolean::Constant(value) => {
                 let lane = *value as usize;
                 if selected[lane] {
@@ -4161,6 +4161,102 @@ struct UnitBranchFrame {
     first: Option<IntegerInputs>,
 }
 
+#[cfg(feature = "internal-checker")]
+enum GuardFrame {
+    Negate,
+    EvaluateRight { continuing: usize, right: super::reference::CheckerOrdinaryBoolean },
+    Merge { stop: usize, short: IntegerInputs },
+}
+
+#[cfg(feature = "internal-checker")]
+enum GuardProgress {
+    Call(OccurrenceOrdinal),
+    Done([IntegerInputs; 2]),
+}
+
+#[cfg(feature = "internal-checker")]
+struct OrdinaryGuard {
+    condition: OccurrenceOrdinal,
+    next: Option<super::reference::CheckerOrdinaryBoolean>,
+    frames: Vec<GuardFrame>,
+    returned: Option<[IntegerInputs; 2]>,
+}
+
+#[cfg(feature = "internal-checker")]
+impl OrdinaryGuard {
+    fn advance(&mut self, path: &mut IntegerInputs, roots: &mut IntegerRoots<'_>) -> Option<GuardProgress> {
+        use super::reference::CheckerOrdinaryBoolean as Boolean;
+        let mut work = roots.ordinary_comparison_work?;
+        loop {
+            charge_call_work(&mut work, 1)?;
+            if let Some(node) = self.next.take() {
+                if path.is_unreachable() {
+                    self.returned = Some([IntegerInputs::default(), IntegerInputs::default()]);
+                } else {
+                    match node {
+                        Boolean::Call(call) => {
+                            roots.ordinary_comparison_work = Some(work);
+                            return Some(GuardProgress::Call(call));
+                        }
+                        Boolean::Not(value) => {
+                            self.frames.push(GuardFrame::Negate);
+                            self.next = Some(*value);
+                        }
+                        Boolean::And(operands) => {
+                            let [left, right] = *operands;
+                            self.frames.push(GuardFrame::EvaluateRight { continuing: 1, right });
+                            self.next = Some(left);
+                        }
+                        Boolean::Or(operands) => {
+                            let [left, right] = *operands;
+                            self.frames.push(GuardFrame::EvaluateRight { continuing: 0, right });
+                            self.next = Some(left);
+                        }
+                        leaf => {
+                            self.returned = Some(path.ordinary_boolean(&leaf, roots, [true, true], &mut work)?);
+                            *path = IntegerInputs::default();
+                        }
+                    }
+                }
+                continue;
+            }
+            let mut rows = self.returned.take()?;
+            match self.frames.pop() {
+                Some(GuardFrame::Negate) => {
+                    rows.swap(0, 1);
+                    self.returned = Some(rows);
+                }
+                Some(GuardFrame::EvaluateRight { continuing, right }) => {
+                    *path = std::mem::take(&mut rows[continuing]);
+                    // Do not resolve or activate any leaf in a dead RHS.
+                    if path.is_unreachable() {
+                        self.returned = Some(rows);
+                    } else {
+                        let stop = 1 - continuing;
+                        self.frames.push(GuardFrame::Merge { stop, short: std::mem::take(&mut rows[stop]) });
+                        self.next = Some(right);
+                    }
+                }
+                Some(GuardFrame::Merge { stop, mut short }) => {
+                    let pushed = rows[stop].0.len();
+                    if pushed != 0 {
+                        let total = short.0.len().checked_add(pushed)?;
+                        let relocated = if total > short.0.capacity() { short.0.len() } else { 0 };
+                        charge_call_work(&mut work, pushed.checked_add(relocated)?)?;
+                        short.0.append(&mut rows[stop].0);
+                    }
+                    rows[stop] = short;
+                    self.returned = Some(rows);
+                }
+                None => {
+                    roots.ordinary_comparison_work = Some(work);
+                    return Some(GuardProgress::Done(rows));
+                }
+            }
+        }
+    }
+}
+
 struct IntegerBlockCursor {
     block: BlockOrdinal,
     next: usize,
@@ -4168,11 +4264,16 @@ struct IntegerBlockCursor {
     path: IntegerInputs,
     branches: Vec<UnitBranchFrame>,
     terminal: Vec<(BlockOrdinal, IntegerInputs, usize)>,
+    #[cfg(feature = "internal-checker")]
+    guard: Option<OrdinaryGuard>,
 }
 
 impl IntegerBlockCursor {
     fn new(block: BlockOrdinal, depth: usize, path: IntegerInputs) -> Self {
-        Self { block, next: 0, depth, path, branches: Vec::new(), terminal: Vec::new() }
+        Self { block, next: 0, depth, path, branches: Vec::new(), terminal: Vec::new(),
+            #[cfg(feature = "internal-checker")]
+            guard: None,
+        }
     }
 }
 
@@ -4209,7 +4310,10 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
     #[allow(unused_mut)] mut computed_returns: Option<&mut Vec<(usize, ComputedIntegerReturn)>>,
     mut discarded_return: Option<&mut bool>,
 ) -> Option<IntegerControl<'a>> {
-    let IntegerBlockCursor { mut block, mut next, mut depth, mut path, mut branches, mut terminal } =
+    let IntegerBlockCursor { mut block, mut next, mut depth, mut path, mut branches, mut terminal,
+        #[cfg(feature = "internal-checker")]
+        mut guard,
+    } =
         std::mem::replace(cursor, IntegerBlockCursor::new(calls.structure.root, 0, IntegerInputs::default()));
     let structure = &calls.structure;
     loop {
@@ -4232,7 +4336,11 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
             }
         }
         let items = &structure.blocks.get(block.0)?.items;
-        let Some(item) = items.get(next).filter(|_| !path.is_unreachable()) else {
+        #[cfg(feature = "internal-checker")]
+        let guard_pending = guard.is_some();
+        #[cfg(not(feature = "internal-checker"))]
+        let guard_pending = false;
+        let Some(item) = items.get(next).filter(|_| !path.is_unreachable() || guard_pending) else {
             if SUSPEND_CALL && root_tail.is_some() && branches.is_empty() && path.is_unreachable() {
                 if let Some((arm, incoming, arm_depth)) = terminal.pop() {
                     roots.truncate(arm_depth);
@@ -4295,6 +4403,55 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
         };
         next += 1;
         let tail = if branches.is_empty() { root_tail } else { None };
+        #[cfg(feature = "internal-checker")]
+        let evaluated_guard = {
+            let mut result = None;
+            if SUSPEND_CALL && suspend_integer && roots.ordinary_comparison_work.is_some()
+                && !structure.checker_ordinary_call_guards.is_empty()
+            {
+                let condition = match &item.kind {
+                    BlockItemKind::Evaluation { expression } => match calls.conditionals.get(expression) {
+                        Some(ConditionalRegion::Unit { condition, .. }) => Some(*condition),
+                        Some(ConditionalRegion::Value { condition, .. })
+                            if structure.checked_types.expressions.get(expression) == Some(&ScalarType::Unit) =>
+                        {
+                            Some(*condition)
+                        }
+                        _ => None,
+                    },
+                    BlockItemKind::FinalOutput(slot) if tail.is_some() => match calls.conditionals.get(&slot.expression) {
+                        Some(ConditionalRegion::Value { condition, .. }) => Some(*condition),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                if let Some((condition, nodes)) = condition.and_then(|condition|
+                    structure.checker_ordinary_call_guards.get(&condition).map(|nodes| (condition, *nodes)))
+                {
+                    if guard.is_none() {
+                        charge_call_work(roots.ordinary_comparison_work.as_mut()?, nodes)?;
+                        let boolean = structure.checker_ordinary_booleans.get(&condition)?.clone();
+                        guard = Some(OrdinaryGuard {
+                            condition, next: Some(boolean), frames: Vec::new(), returned: None,
+                        });
+                    }
+                    let active = guard.as_mut()?;
+                    if active.condition != condition { return None; }
+                    match active.advance(&mut path, roots)? {
+                        GuardProgress::Call(call) => {
+                            *cursor = IntegerBlockCursor {
+                                block, next: next.checked_sub(1)?, depth, path, branches, terminal, guard,
+                            };
+                            return Some(IntegerControl::PendingCall(ExactCallEffect::Scalar {
+                                call, binding: None, ty: &ScalarType::Bool,
+                            }));
+                        }
+                        GuardProgress::Done(rows) => { result = Some(rows); guard = None; }
+                    }
+                } else if guard.is_some() { return None; }
+            }
+            result
+        };
         match item.kind {
             BlockItemKind::Evaluation { expression } => {
                 if let Some(directive) = structure.checker_directives.get(&expression) {
@@ -4372,7 +4529,7 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                     path = passing;
                 } else if structure.checker_direct_targets.contains_key(&expression) {
                     if SUSPEND_CALL {
-                        *cursor = IntegerBlockCursor { block, next, depth, path, branches, terminal };
+                        *cursor = IntegerBlockCursor { block, next, depth, path, branches, terminal, #[cfg(feature = "internal-checker")] guard };
                         return Some(IntegerControl::PendingCall(ExactCallEffect::Unit(expression)));
                     }
                     let handle = handle_call.as_mut()?;
@@ -4406,7 +4563,9 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                     };
                     #[cfg(feature = "internal-checker")]
                     let ordinary = {
-                        let comparison = if authored_return.prefer_legacy_root_compound(calls, block, *condition, roots) {
+                        let comparison = if evaluated_guard.is_some() {
+                            evaluated_guard
+                        } else if authored_return.prefer_legacy_root_compound(calls, block, *condition, roots) {
                             None
                         } else {
                             path.ordinary_predicate_at(structure, *condition, roots, [true, true])?
@@ -4466,7 +4625,9 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                     let expected = tail?;
                     #[cfg(feature = "internal-checker")]
                     let ordinary = {
-                        let comparison = if authored_return.prefer_legacy_root_compound(calls, block, *condition, roots) {
+                        let comparison = if evaluated_guard.is_some() {
+                            evaluated_guard
+                        } else if authored_return.prefer_legacy_root_compound(calls, block, *condition, roots) {
                             None
                         } else {
                             path.ordinary_predicate_at(structure, *condition, roots, [true, true])?
@@ -4728,9 +4889,9 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                 if let Some(origin) = structure.checker_integer_call_locals.get(&(block, item.position)) {
                     let [receiver] = binding.receivers() else { return None; };
                     if SUSPEND_CALL && suspend_integer && !matches!(origin.arguments.as_slice(), [(_, CheckerIntegerCallArgument::ContextualValue)]) {
-                        *cursor = IntegerBlockCursor { block, next, depth, path, branches, terminal };
-                        return Some(IntegerControl::PendingCall(ExactCallEffect::Integer {
-                            call: origin.call, binding: &origin.binding, ty: &receiver.ty,
+                        *cursor = IntegerBlockCursor { block, next, depth, path, branches, terminal, #[cfg(feature = "internal-checker")] guard };
+                        return Some(IntegerControl::PendingCall(ExactCallEffect::Scalar {
+                            call: origin.call, binding: Some(&origin.binding), ty: &receiver.ty,
                         }));
                     }
                     let handle = handle_call.as_mut()?;
@@ -4821,9 +4982,9 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                             }
                             super::reference::CheckerOrdinaryScalarLocalKind::BoolCall(call) => {
                                 if receiver.ty != ScalarType::Bool || !SUSPEND_CALL || !suspend_integer { return None; }
-                                *cursor = IntegerBlockCursor { block, next, depth, path, branches, terminal };
-                                return Some(IntegerControl::PendingCall(ExactCallEffect::Integer {
-                                    call: *call, binding: &origin.binding, ty: &receiver.ty,
+                                *cursor = IntegerBlockCursor { block, next, depth, path, branches, terminal, #[cfg(feature = "internal-checker")] guard };
+                                return Some(IntegerControl::PendingCall(ExactCallEffect::Scalar {
+                                    call: *call, binding: Some(&origin.binding), ty: &receiver.ty,
                                 }));
                             }
                             super::reference::CheckerOrdinaryScalarLocalKind::BoolLiteral(value) => {
@@ -4874,20 +5035,20 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
 #[derive(Clone, Copy)]
 pub(super) enum ExactCallEffect<'a> {
     Unit(OccurrenceOrdinal),
-    Integer { call: OccurrenceOrdinal, binding: &'a ReferenceBindingId, ty: &'a ScalarType },
+    Scalar { call: OccurrenceOrdinal, binding: Option<&'a ReferenceBindingId>, ty: &'a ScalarType },
 }
 
 impl ExactCallEffect<'_> {
     pub(super) fn occurrence(self) -> OccurrenceOrdinal {
         match self {
-            Self::Unit(call) | Self::Integer { call, .. } => call,
+            Self::Unit(call) | Self::Scalar { call, .. } => call,
         }
     }
 
     pub(super) fn expected(&self) -> &ScalarType {
         match self {
             Self::Unit(_) => &ScalarType::Unit,
-            Self::Integer { ty, .. } => ty,
+            Self::Scalar { ty, .. } => ty,
         }
     }
 }
@@ -4931,6 +5092,76 @@ fn symbolic_return_capture_charges_retained_rows_before_committing() {
     assert_eq!(retained, first * 2);
     assert_eq!(charge_partition_capture(&mut retained, &large, row.len()), None);
     assert_eq!(retained, first * 2);
+}
+
+enum ScalarOutputRows {
+    Bound(IntegerInputs),
+    #[cfg(feature = "internal-checker")]
+    Guard { lanes: [IntegerInputs; 2], work: usize },
+}
+
+#[cfg(feature = "internal-checker")]
+fn bool_result_lane(value: &BigInt) -> Option<usize> {
+    use num_bigint::Sign::{NoSign, Plus};
+    match (value.sign(), value.bits()) {
+        (NoSign, 0) => Some(0),
+        (Plus, 1) => Some(1),
+        _ => None,
+    }
+}
+
+impl ScalarOutputRows {
+    fn push_singleton(&mut self, mut row: IntegerRow, output: Rc<IntegerSet>) -> Option<()> {
+        match self {
+            Self::Bound(rows) => { row.push(output); rows.0.push(row); }
+            #[cfg(feature = "internal-checker")]
+            Self::Guard { lanes, work } => {
+                charge_call_work(work, 1)?;
+                let lane = bool_result_lane(output.singleton_value()?)?;
+                lanes[lane].0.push(row);
+            }
+        }
+        Some(())
+    }
+
+    fn push_alias(&mut self, mut row: IntegerRow, axis: usize) -> Option<()> {
+        match self {
+            Self::Bound(rows) => {
+                row.append_alias(axis, Rc::clone(&row[axis]));
+                rows.0.push(row);
+            }
+            #[cfg(feature = "internal-checker")]
+            Self::Guard { lanes, work } => {
+                charge_call_work(work, 1)?;
+                if let Some(exact) = row[axis].singleton_value() {
+                    lanes[bool_result_lane(exact)?].0.push(row);
+                    return Some(());
+                }
+                let (low, high) = row[axis].extremes()?;
+                if (bool_result_lane(low)?, bool_result_lane(high)?) != (0, 1) || row.affine_touches(axis) {
+                    return None;
+                }
+                // Only a truly broad Boolean alias needs two rows. Restrict
+                // its existing typed axis so aliases of that input refine.
+                let cost = row.len().checked_add(2usize.checked_mul(row.equal_axes().len())?)?.checked_add(4)?;
+                charge_call_work(work, cost)?;
+                let mut no = row.clone();
+                no.replace_domain(axis, Rc::new(IntegerSet::singleton(&0u8.into())));
+                row.replace_domain(axis, Rc::new(IntegerSet::singleton(&1u8.into())));
+                lanes[0].0.push(no);
+                lanes[1].0.push(row);
+            }
+        }
+        Some(())
+    }
+
+    fn push_affine(&mut self, mut row: IntegerRow, plan: AffineAppend) -> Option<()> {
+        match self {
+            Self::Bound(rows) => { row.append_affine(plan); rows.0.push(row); Some(()) }
+            #[cfg(feature = "internal-checker")]
+            Self::Guard { .. } => None,
+        }
+    }
 }
 
 pub(super) struct ExactCallCursor<'a> {
@@ -5088,13 +5319,60 @@ impl<'a> ExactCallCursor<'a> {
         Some(argument)
     }
 
+    fn scalar_output_rows(&self, binding: Option<&'a ReferenceBindingId>, ty: &ScalarType) -> Option<ScalarOutputRows> {
+        if binding.is_some() { return Some(ScalarOutputRows::Bound(IntegerInputs::default())); }
+        #[cfg(feature = "internal-checker")]
+        {
+            let guard = self.block.guard.as_ref()?;
+            if *ty != ScalarType::Bool || guard.next.is_some() || guard.returned.is_some() { return None; }
+            Some(ScalarOutputRows::Guard {
+                lanes: [IntegerInputs::default(), IntegerInputs::default()],
+                work: self.roots.ordinary_comparison_work?,
+            })
+        }
+        #[cfg(not(feature = "internal-checker"))]
+        { let _ = ty; None }
+    }
+
+    fn finish_scalar_rows(
+        &mut self, joined: ScalarOutputRows, binding: Option<&'a ReferenceBindingId>, ty: &'a ScalarType,
+    ) -> Option<()> {
+        match joined {
+            ScalarOutputRows::Bound(rows) => {
+                self.roots.add(binding?, ty);
+                self.block.path = rows;
+            }
+            #[cfg(feature = "internal-checker")]
+            ScalarOutputRows::Guard { lanes, work } => {
+                self.block.path = IntegerInputs::default();
+                self.block.guard.as_mut()?.returned = Some(lanes);
+                self.roots.ordinary_comparison_work = Some(work);
+            }
+        }
+        Some(())
+    }
+
     pub(super) fn resume(&mut self, effect: ExactCallEffect<'a>, caller_axis: Option<usize>, result: ActualCallResult) -> Option<()> {
         match (effect, result) {
             (ExactCallEffect::Unit(_), ActualCallResult::Unit) => {}
             (ExactCallEffect::Unit(_), ActualCallResult::EmptyUnit) => self.block.path = IntegerInputs::default(),
-            (ExactCallEffect::Integer { binding, ty, .. }, ActualCallResult::Integer(value)) => {
-                self.roots.add(binding, ty);
-                self.block.path.append_local(IntegerSet::singleton(&value));
+            (ExactCallEffect::Scalar { binding, ty, .. }, ActualCallResult::Integer(value)) => {
+                if let Some(binding) = binding {
+                    self.roots.add(binding, ty);
+                    self.block.path.append_local(IntegerSet::singleton(&value));
+                } else {
+                    #[cfg(feature = "internal-checker")]
+                    {
+                        let ScalarOutputRows::Guard { mut lanes, mut work } = self.scalar_output_rows(binding, ty)?
+                            else { return None; };
+                        let lane = bool_result_lane(&value)?;
+                        charge_call_work(&mut work, 1)?;
+                        lanes[lane] = std::mem::take(&mut self.block.path);
+                        self.finish_scalar_rows(ScalarOutputRows::Guard { lanes, work }, binding, ty)?;
+                    }
+                    #[cfg(not(feature = "internal-checker"))]
+                    return None;
+                }
             }
             (ExactCallEffect::Unit(_), ActualCallResult::ProjectedUnit(survivors)) => {
                 let axis = caller_axis?;
@@ -5132,11 +5410,11 @@ impl<'a> ExactCallCursor<'a> {
                     Some(row)
                 }).collect::<Option<Vec<_>>>()?;
             }
-            (ExactCallEffect::Integer { binding, ty, .. }, ActualCallResult::PartitionedIntegerPair(projected)) => {
+            (ExactCallEffect::Scalar { binding, ty, .. }, ActualCallResult::PartitionedIntegerPair(projected)) => {
                 let original = &self.block.path.0;
                 let mut work = self.roots.affine_work.unwrap_or(0);
                 let mut uses_affine = self.roots.affine_work.is_some();
-                let mut joined = Vec::new();
+                let mut joined = self.scalar_output_rows(binding, ty)?;
                 for piece in projected.pieces {
                     let index = usize::from(piece.anchor).checked_sub(1)?;
                     let row = original.get(index)?;
@@ -5167,20 +5445,15 @@ impl<'a> ExactCallCursor<'a> {
                     let mut row = row.clone();
                     row.replace_pair(projected.caller_axes, piece.inputs)?;
                     match piece.output {
-                        IntegerPairPartitionOutput::Singleton(output) => row.push(output),
-                        IntegerPairPartitionOutput::InputAlias(slot) => {
-                            let axis = projected.caller_axes[slot];
-                            row.append_alias(axis, Rc::clone(&row[axis]));
-                        }
-                        IntegerPairPartitionOutput::InputAffine(..) => row.append_affine(plan?),
+                        IntegerPairPartitionOutput::Singleton(output) => joined.push_singleton(row, output)?,
+                        IntegerPairPartitionOutput::InputAlias(slot) => joined.push_alias(row, projected.caller_axes[slot])?,
+                        IntegerPairPartitionOutput::InputAffine(..) => joined.push_affine(row, plan?)?,
                     }
-                    joined.push(row);
                 }
-                self.block.path.0 = joined;
                 if uses_affine { self.roots.affine_work = Some(work); }
-                self.roots.add(binding, ty);
+                self.finish_scalar_rows(joined, binding, ty)?;
             }
-            (ExactCallEffect::Integer { binding, ty, .. }, ActualCallResult::PartitionedInteger(pieces)) => {
+            (ExactCallEffect::Scalar { binding, ty, .. }, ActualCallResult::PartitionedInteger(pieces)) => {
                 let axis = caller_axis?;
                 let (piece_intervals, depends_on_input, affine) = pieces.iter().try_fold(
                     (0usize, false, false), |(sum, depends, affine), piece| Some((
@@ -5209,7 +5482,7 @@ impl<'a> ExactCallCursor<'a> {
                     }
                 }
                 let original = std::mem::take(&mut self.block.path.0);
-                let mut joined = Vec::new();
+                let mut joined = self.scalar_output_rows(binding, ty)?;
                 for row in &original {
                     for piece in &pieces {
                         let narrowed = match row[axis].intersection(&piece.input) {
@@ -5240,16 +5513,14 @@ impl<'a> ExactCallCursor<'a> {
                             next.replace_domain(axis, Rc::new(values));
                         }
                         match &piece.output {
-                            IntegerPartitionOutput::Singleton(output) => next.push(Rc::clone(output)),
-                            IntegerPartitionOutput::InputAlias => next.append_alias(axis, Rc::clone(&next[axis])),
-                            IntegerPartitionOutput::InputAffine(_) => next.append_affine(plan?),
+                            IntegerPartitionOutput::Singleton(output) => joined.push_singleton(next, Rc::clone(output))?,
+                            IntegerPartitionOutput::InputAlias => joined.push_alias(next, axis)?,
+                            IntegerPartitionOutput::InputAffine(_) => joined.push_affine(next, plan?)?,
                         }
-                        joined.push(next);
                     }
                 }
-                self.roots.add(binding, ty);
-                self.block.path = IntegerInputs(joined);
                 self.roots.affine_work = retained;
+                self.finish_scalar_rows(joined, binding, ty)?;
             }
             _ => return None,
         }
@@ -5762,6 +6033,53 @@ fn independent_domain_cardinality_short_circuits_at_the_admission_cap() {
     assert_eq!(comparison_domain_size(&safe, MAX_INDEPENDENT_COMPARISON_POINTS, &mut work), Some(Some(16)));
     assert_eq!(comparison_domain_size(&oversized, MAX_INDEPENDENT_COMPARISON_POINTS, &mut work), Some(None));
     assert_eq!(comparison_domain_size(&broad, MAX_INDEPENDENT_COMPARISON_POINTS, &mut work), Some(None));
+}
+
+#[cfg(feature = "internal-checker")]
+#[test]
+fn direct_guard_receipts_restrict_existing_bool_axes_without_a_temp_cell() {
+    let broad = Rc::new(IntegerSet::ordinary_bool_domain());
+    let mut row = IntegerRow::new(vec![Rc::clone(&broad)]);
+    row.append_alias(0, broad);
+    let mut output = ScalarOutputRows::Guard { lanes: [IntegerInputs::default(), IntegerInputs::default()], work: 0 };
+    output.push_alias(row, 1).unwrap();
+    let singleton = Rc::new(IntegerSet::singleton(&BigInt::from(1u8)));
+    output.push_alias(IntegerRow::new(vec![Rc::clone(&singleton)]), 0).unwrap();
+    let ScalarOutputRows::Guard { lanes: [no, yes], .. } = output else { unreachable!() };
+    assert!(no.includes(&[0, 0]) && yes.includes(&[1, 1]));
+    assert!(!no.includes(&[0, 1]) && !yes.includes(&[1, 0]));
+    assert_eq!(yes.0[1].len(), 1);
+    assert!(Rc::ptr_eq(&yes.0[1][0], &singleton));
+}
+
+#[cfg(feature = "internal-checker")]
+#[test]
+fn direct_guard_cursor_requests_only_reached_ordinary_calls() {
+    use super::reference::CheckerOrdinaryBoolean as Boolean;
+    let name = OccurrenceOrdinal(3);
+    let call = OccurrenceOrdinal(7);
+    let guard = |enabled| OrdinaryGuard {
+        condition: name,
+        next: Some(Boolean::And(Box::new([Boolean::Constant(enabled), Boolean::Call(call)]))),
+        frames: Vec::new(),
+        returned: None,
+    };
+    let mut roots = IntegerRoots { ordinary_comparison_work: Some(0), ..IntegerRoots::default() };
+    let mut path = IntegerInputs::closed();
+    let Some(GuardProgress::Done([no, yes])) = guard(false).advance(&mut path, &mut roots) else {
+        panic!("dead call arm must finish without suspension");
+    };
+    assert!(!no.is_unreachable() && yes.is_unreachable());
+
+    let mut path = IntegerInputs::closed();
+    let mut reached = guard(true);
+    assert!(matches!(reached.advance(&mut path, &mut roots), Some(GuardProgress::Call(actual)) if actual == call));
+    assert!(!path.is_unreachable());
+    reached.returned = Some([IntegerInputs::default(), std::mem::take(&mut path)]);
+    let Some(GuardProgress::Done([no, yes])) = reached.advance(&mut path, &mut roots) else {
+        panic!("returned truth rows must complete the saved compound");
+    };
+    assert!(no.is_unreachable() && !yes.is_unreachable());
 }
 
 #[cfg(feature = "internal-checker")]
