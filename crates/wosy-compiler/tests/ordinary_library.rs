@@ -907,8 +907,8 @@ fn recommitted_wrapper_return_preserves_one_base_across_two_owning_returns() {
             std::fs::write(std::path::PathBuf::from(out).join(format!("{target}.ll")), witness).unwrap();
         }
 
-        let indirect = text.replace("    outgoing\n", "    Packet rebound = outgoing;\n    rebound\n");
-        let error = emit(&indirect).expect_err("an indirect returned binding lacks a root handoff certificate");
+        let interrupted = text.replace("    Packet returned = moved;", "    moved.length;\n    Packet returned = moved;");
+        let error = emit(&interrupted).expect_err("an interrupted chain lacks a root handoff certificate");
         assert!(error.contains("recommitted aggregate return has no exact root binding"), "{target}: {error}");
     }
 }

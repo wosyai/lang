@@ -21,7 +21,9 @@ Packet(u64) inner_owner = fn(length) {
 Packet(u64) outer_owner = fn(length) {
     Packet incoming = inner_owner(length);
     Packet outgoing = second_identity(incoming);
-    outgoing
+    Packet moved = outgoing;
+    Packet returned = moved;
+    returned
 };
 u64(u64, bool) drive = fn(length, take) {
     Packet received = outer_owner(length);

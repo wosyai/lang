@@ -2765,15 +2765,18 @@ impl Body<'_> {
         let point = self.cfg.points.get(returned.0)?;
         let CfgPointKind::ReturnOutput { output: 0, value_point, checked: false } = point.kind else { return None };
         let value = self.cfg.points.get(value_point.0)?;
-        if point.scope != root || value.scope != root || *bound >= value_point || value_point >= returned
-            || !matches!(&value.kind, CfgPointKind::Read { binding: read } if read == binding)
-        {
+        if point.scope != root || value.scope != root || *bound >= value_point || value_point >= returned {
             return None;
         }
-        let mut outputs = self.sites.structure.blocks[self.sites.structure.root.0].final_outputs();
-        let output = outputs.next()?;
-        if output.output != 0 || outputs.next().is_some() { return None; }
-        Some((*facts.calls.get(&producer)?, output.expression))
+        let root_block = self.sites.structure.root;
+        let mut outputs = self.sites.structure.blocks[root_block.0].final_outputs();
+        let terminal = outputs.next()?;
+        if terminal.output != 0 || outputs.next().is_some() { return None; }
+        let call = *facts.calls.get(&producer)?;
+        let direct = matches!(&value.kind, CfgPointKind::Read { binding: read } if read == binding);
+        (direct || self.named_terminal_producer(root_block, terminal.expression,
+            &BTreeMap::from([(call.0, producer)]), &output.ty) == Some(producer))
+            .then_some((call, terminal.expression))
     }
 
     fn is_exact_identity_relay(&self) -> bool {
