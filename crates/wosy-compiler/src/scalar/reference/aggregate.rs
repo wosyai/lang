@@ -2614,6 +2614,7 @@ pub(crate) struct ClosedBody {
     pub(crate) checked_backing_optional: bool,
     pub(crate) returning: Option<ClosedReturn>,
     mixed_branch_return: Option<Box<MixedBranchReturn>>,
+    pub(crate) local_choice_immediate: Option<(usize, usize)>, // consumer, conditional
     pub(crate) local_choice_binding: Option<(usize, usize, usize)>, // block, item, conditional
     pub(crate) structured_result_binding: Option<(usize, usize, usize)>, // block, item, conditional
     pub(crate) local_result_arms: BTreeMap<usize, (usize, usize)>, // block -> (allocation item, output)
@@ -2732,7 +2733,7 @@ enum LocalChoiceUse {
 #[derive(Clone, Copy)]
 struct LocalReceiptChoice {
     block: BlockOrdinal,
-    item: usize,
+    item: Option<usize>,
     conditional: OccurrenceOrdinal,
     leaves: [CfgPointId; 2],
     use_site: LocalChoiceUse,
@@ -2766,6 +2767,7 @@ impl Body<'_> {
         let structure = &self.sites.structure;
         let root = structure.root;
         let (bind, alias, result) = match structure.blocks.get(root.0)?.items.as_slice() {
+            [result] => return self.immediate_receipt_choice(result, output_ty),
             [bind, result] => (bind, None, result),
             [bind, alias, result] => (bind, Some(alias), result),
             _ => return None,
@@ -2779,8 +2781,6 @@ impl Body<'_> {
             || structure.checked_types.expressions.get(&init.primary) != Some(&receiver.ty)
             || structure.checked_types.expressions.get(&output.expression) != Some(&output_ty.ty)
         { return None; }
-        let Some(ConditionalRegion::Value { then_block, else_block, .. }) = self.sites.conditionals.get(&init.primary)
-            else { return None };
         let region = facts.conditional_input_regions.values().find(|region| region.expression == init.primary)?;
         let points = &self.cfg.points;
         let join = points.get(region.join.0)?;
@@ -2882,22 +2882,79 @@ impl Body<'_> {
                 LocalChoiceUse::Consume { point: consumer.id, ordinal: output.expression }
             }
         };
+        Some(LocalReceiptChoice {
+            block: root, item: Some(bind.position), conditional: init.primary,
+            leaves: self.local_choice_leaves(init.primary, &receiver.ty)?, use_site,
+        })
+    }
+
+    fn immediate_receipt_choice(&self, result: &BlockItem, output_ty: &RootOutputType) -> Option<LocalReceiptChoice> {
+        let facts = self.facts?;
+        let BlockItemKind::FinalOutput(output) = &result.kind else { return None };
+        let checked = self.sites.checked_call_signatures.get(&output.expression)?;
+        let [parameter @ ScalarType::Struct(_)] = checked.parameters.as_slice() else { return None };
+        let [scalar] = checked.outputs.outputs.as_slice() else { return None };
+        let structure = &self.sites.structure;
+        let OccurrenceNode::Expression(conditional) = *structure.edges.get(&(
+            OccurrenceParent::Expression(output.expression), OccurrenceEdge::CallArgument(0),
+        ))? else { return None };
+        if output.output != 0 || scalar.ty != output_ty.ty
+            || structure.checked_types.expressions.get(&output.expression) != Some(&scalar.ty)
+            || structure.checked_types.expressions.get(&conditional) != Some(parameter)
+            || self.sites.declared_unsafe_calls.contains(&output.expression.0)
+        { return None; }
+        let points = &self.cfg.points;
+        let scope = points.first()?.scope;
+        let region = facts.conditional_input_regions.values().find(|region| region.expression == conditional)?;
+        let join = points.get(region.join.0)?;
+        let next = |id| points.get(linear_successor(points, id)?.0);
+        let consumer = next(join.id)?;
+        let returned = next(consumer.id)?;
+        let exit = next(returned.id)?;
+        if [join, consumer, returned, exit].into_iter().any(|point| point.scope != scope)
+            || !matches!(join.kind, CfgPointKind::Join)
+            || join.source_span.range != self.sites.occurrences.get(conditional.0)?.span
+            || consumer.source_span.range != self.sites.occurrences.get(output.expression.0)?.span
+            || !matches!(&consumer.kind, CfgPointKind::Call { output: 0, target: ResolvedCallTarget::ModuleCallable {
+                concrete: ConcreteCallSelection::Declaration, .. }, argument_points, .. }
+                if argument_points.as_slice() == [join.id])
+            || !matches!(returned.kind, CfgPointKind::ReturnOutput { output: 0, value_point, checked: false }
+                if value_point == consumer.id)
+            || !matches!(exit.kind, CfgPointKind::ScopeExit)
+        { return None; }
+        let origins = facts.inputs.get(&(consumer.id, output.expression.0, 0, ArgumentProvenance::Unmoved))?;
+        if origins.len() != 1 || !origins.contains(&None) { return None; }
+        Some(LocalReceiptChoice {
+            block: structure.root, item: None, conditional,
+            leaves: self.local_choice_leaves(conditional, parameter)?,
+            use_site: LocalChoiceUse::Consume { point: consumer.id, ordinal: output.expression },
+        })
+    }
+
+    fn local_choice_leaves(&self, conditional: OccurrenceOrdinal, ty: &ScalarType) -> Option<[CfgPointId; 2]> {
+        let facts = self.facts?;
+        let structure = &self.sites.structure;
+        let Some(ConditionalRegion::Value { then_block, else_block, .. }) = self.sites.conditionals.get(&conditional)
+            else { return None };
+        let region = facts.conditional_input_regions.values().find(|region| region.expression == conditional)?;
+        let points = &self.cfg.points;
+        let join = points.get(region.join.0)?;
+        let scope = points.first()?.scope;
+        let next = |id| points.get(linear_successor(points, id)?.0);
         let prove_arm = |block: BlockOrdinal, side: usize| {
             let [item] = structure.blocks.get(block.0)?.items.as_slice() else { return None };
             let BlockItemKind::FinalOutput(output) = &item.kind else { return None };
             let (&id, _) = facts.calls.iter().find(|(_, ordinal)| **ordinal == output.expression)?;
             let leaf = points.get(id.0)?;
             let terminal = next(id)?;
-            (output.output == 0 && structure.checked_types.expressions.get(&output.expression) == Some(&receiver.ty)
+            (output.output == 0 && structure.checked_types.expressions.get(&output.expression) == Some(ty)
                 && leaf.scope != scope && leaf.scope == points.get(region.entries[side].0)?.scope
                 && terminal.scope == leaf.scope && terminal.id == region.terminals[side]
                 && matches!(terminal.kind, CfgPointKind::ScopeExit) && next(terminal.id)?.id == join.id)
                 .then_some(id)
         };
         let leaves = [prove_arm(*then_block, 0)?, prove_arm(*else_block, 1)?];
-        (leaves[0] != leaves[1]).then_some(LocalReceiptChoice {
-            block: root, item: bind.position, conditional: init.primary, leaves, use_site,
-        })
+        (leaves[0] != leaves[1]).then_some(leaves)
     }
 
     fn structured_owner_return(&self) -> Option<StructuredOwnerReturn> {
@@ -5111,7 +5168,13 @@ fn closed_aggregates<'a>(
             if plan.input.is_some() {
                 return Err(format!("local conditional owner overlaps an owning formal in {:?}", body.source));
             }
-            plan.local_choice_binding = Some((choice.block.0, choice.item, choice.conditional.0));
+            if let Some(item) = choice.item {
+                plan.local_choice_binding = Some((choice.block.0, item, choice.conditional.0));
+            } else if let LocalChoiceUse::Consume { ordinal, .. } = choice.use_site {
+                plan.local_choice_immediate = Some((ordinal.0, choice.conditional.0));
+            } else {
+                return Err("local conditional temporary has no consumer".into());
+            }
             if let LocalChoiceUse::Observe(exit) = choice.use_site {
                 plan.scope_exits.insert(choice.block.0, exit);
                 record_release(&mut plan, exit, exit, ClosedOwnerRelease { receipt: choice.conditional.0, guard: None })?;

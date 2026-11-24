@@ -1353,6 +1353,10 @@ fn lexical_conditional_owner_choice_releases_selected_original_after_read() {
     let consumed = text.replace("u64(u64, bool) drive", "u64(Packet) consume = fn(packet) { packet.length };\nu64(u64, bool) drive")
         .replace("    chosen.length", "    consume(chosen)");
     assert_ne!(consumed, text);
+    let temporary = consumed.replace("    Packet chosen = if", "    consume(if")
+        .replace("else { make_long(2) };\n    consume(chosen)", "else { make_long(2) })");
+    assert_ne!(temporary, consumed);
+    assert!(!temporary.contains("chosen"));
     let borrowed = text.replace("u64(u64, bool) drive", "u64(*u64) read_selected = fn(view) { *view };\nu64(u64, bool) drive")
         .replace("    chosen.length", "    read_selected(&chosen.length)");
     let named_borrow = text.replace("u64(u64, bool) drive", "u64(*Packet) read_selected = fn(view) { (*view).length };\nu64(u64, bool) drive")
@@ -1360,9 +1364,10 @@ fn lexical_conditional_owner_choice_releases_selected_original_after_read() {
     assert_ne!(borrowed, text);
     assert_ne!(named_borrow, text);
     for (text, use_site) in [(text, "choice"), (consumed.as_str(), "consume"),
-        (borrowed.as_str(), "borrow"), (named_borrow.as_str(), "named-borrow")]
+        (temporary.as_str(), "consume-temporary"), (borrowed.as_str(), "borrow"),
+        (named_borrow.as_str(), "named-borrow")]
     {
-        let consuming = use_site == "consume";
+        let consuming = use_site.starts_with("consume");
         let borrowing = matches!(use_site, "borrow" | "named-borrow");
         for (target, target_layout) in [("native64", ScalarTargetLayout::NATIVE64), ("wasm32", ScalarTargetLayout::WASM32)] {
             for project in [false, true] {

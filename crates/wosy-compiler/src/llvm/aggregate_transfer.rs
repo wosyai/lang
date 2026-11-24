@@ -767,6 +767,20 @@ fn call_action(
         .map(|action| (ordinal, action))
 }
 
+fn commit_local_choice<'ctx>(
+    aggregate: &mut AggregateEmitter<'ctx, '_>, conditional: usize, base: PointerValue<'ctx>,
+) -> Result<PointerValue<'ctx>, String> {
+    if aggregate.structured_arms_visited != 2 || aggregate.committed {
+        return Err("invalid local conditional owner commit".into());
+    }
+    let descriptor = aggregate.local_choice_destination.take().ok_or("missing local conditional descriptor")?;
+    if aggregate.receipts.insert(conditional, base).is_some() {
+        return Err("duplicate local conditional owner receipt".into());
+    }
+    aggregate.committed = true;
+    Ok(descriptor)
+}
+
 pub(super) fn store_received_binding<'ctx>(
     context: &'ctx Context,
     state: &mut EmitState<'ctx, '_>,
@@ -784,11 +798,7 @@ pub(super) fn store_received_binding<'ctx>(
                 {
                     return Err("changed local conditional owner binding".into());
                 }
-                let descriptor = aggregate.local_choice_destination.take().ok_or("missing local conditional descriptor")?;
-                if aggregate.receipts.insert(conditional, *base).is_some() {
-                    return Err("duplicate local conditional owner receipt".into());
-                }
-                aggregate.committed = true;
+                let descriptor = commit_local_choice(aggregate, conditional, *base)?;
                 state.storage.insert(receiver.name.clone(), (descriptor, receiver.ty.clone()));
                 return Ok(true);
             }
@@ -1196,6 +1206,17 @@ fn emit_selected_call<'ctx, 'module>(
         }
         frame.immediate_consumer = Some(ordinal);
     }
+    let local_temporary = state.aggregate.as_ref().and_then(|aggregate| aggregate.plan.local_choice_immediate)
+        .and_then(|(consumer, conditional)| (consumer == ordinal).then_some(conditional));
+    if let Some(conditional) = local_temporary {
+        let [argument] = arguments else { return Err("invalid local conditional temporary arguments".into()) };
+        if !matches!(parameters.as_slice(), [ScalarType::Struct(_)])
+            || state.body_call_nodes.and_then(|nodes| nodes.expression_ordinal(argument)) != Some(conditional)
+            || !matches!(input, Some(CallInput::Body(ClosedInput::Transfer(receipt))) if receipt == conditional)
+        {
+            return Err("changed local conditional temporary consumer".into());
+        }
+    }
     let mut operands = Vec::new();
     for (argument, parameter) in arguments.iter().zip(parameters) {
         let emitted = match project {
@@ -1204,7 +1225,15 @@ fn emit_selected_call<'ctx, 'module>(
             }
             None => emit_typed_expression(context, state, argument, parameter)?,
         };
-        operands.push(BasicMetadataValueEnum::from(take_basic(emitted)?));
+        let operand = take_basic(emitted)?;
+        let operand = if let Some(conditional) = local_temporary {
+            let BasicValueEnum::PointerValue(base) = operand else { return Err("missing local temporary backing".into()) };
+            let aggregate = state.aggregate.as_mut().expect("local conditional temporary frame");
+            commit_local_choice(aggregate, conditional, base)?.into()
+        } else {
+            operand
+        };
+        operands.push(BasicMetadataValueEnum::from(operand));
     }
     if immediate {
         state.initializer_aggregate.as_mut().expect("closed initializer immediate context").immediate_consumer = None;
@@ -1278,7 +1307,7 @@ fn emit_selected_call<'ctx, 'module>(
     }
     if matches!(action, Some(CallDestination::Body(ClosedCall::LocalChoiceArm))) {
         let aggregate = state.aggregate.as_mut().expect("local conditional owner frame");
-        if aggregate.plan.local_choice_binding.is_none() || mixed.is_some()
+        if (aggregate.plan.local_choice_binding.is_none() && aggregate.plan.local_choice_immediate.is_none()) || mixed.is_some()
             || !matches!(transport, BasicValueEnum::PointerValue(_))
         {
             return Err("invalid local conditional owner transfer".into());
@@ -1680,7 +1709,8 @@ pub(super) fn finish_return<'ctx>(
     if aggregate.plan.scalar_descriptor_assignment.is_some() && !aggregate.scalar_descriptor_enrolled {
         return Err("descriptor assignment did not commit ownership".into());
     }
-    if aggregate.plan.local_choice_binding.is_some() && (!aggregate.committed || aggregate.local_choice_destination.is_some()) {
+    if (aggregate.plan.local_choice_binding.is_some() || aggregate.plan.local_choice_immediate.is_some())
+        && (!aggregate.committed || aggregate.local_choice_destination.is_some()) {
         return Err("local conditional owner was not committed to lexical storage".into());
     }
     if !aggregate.receipts.is_empty() || aggregate.receipt_guards.len() != aggregate.plan.conditional_guard_count || aggregate.input.is_some() {
