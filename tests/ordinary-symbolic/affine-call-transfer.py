@@ -1227,6 +1227,19 @@ cases.extend([
     ("conditional-scalar-binding-skips-unreached-operand",conditional_binding_narrowed,244,b"BIND-ONLY-REACHED"),
     ("conditional-scalar-binding-refuses-reached-operand",conditional_binding_narrowed.replace("core.narrow","core.require"),2,b"unsupported analysis"),
 ])
+integer_symbolic_root_call = f"""%%start
+    i8(i8) transfer = fn(entry) {{
+        if (entry < 0) {{ 13 }} else {{ entry }}
+    }};
+    i8(i8) check = fn(input) {{
+        i8 output = transfer(input);
+        if (output == 0) {{ core.require(input == 0, {report(31,"ROOT-PREIMAGE-WIDENED")}); }};
+        if (output == 13) {{ core.require(input >= 0, {state_report(32,"ROOT-NEGATIVE-INPUT","input")}); }};
+        output
+    }};
+    %%end"""
+cases.append(("integer-symbolic-root-call-preimages",integer_symbolic_root_call,32,b"ROOT-NEGATIVE-INPUT"))
+
 projected_conditional_write = f"""%%start
     i8(i8) transfer = fn(entry) {{
         i8 changed = entry;
@@ -2160,6 +2173,9 @@ authored_files = {
     namespace_scalar_key: {
         "call.json": b'{"type":{"kind":"i8"},"value":7}\n',
         "state.json": b'{"type":{"kind":"i8"},"value":1}\n',
+    },
+    "integer-symbolic-root-call-preimages": {
+        "state.json": b'{"type":{"kind":"i8"},"value":{"kind":"range","minimum":-128,"maximum":-1}}\n',
     },
     "projected-conditional-local-write-keeps-input-pieces": {
         "state.json": b'{"type":{"kind":"i8"},"value":0}\n',

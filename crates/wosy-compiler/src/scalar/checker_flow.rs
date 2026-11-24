@@ -5932,12 +5932,14 @@ impl<'a> ExactCallCursor<'a> {
     }
 
     pub(super) fn arbitrary_root(calls: &'a FunctionCallSites, expected: &ScalarType) -> Option<Self> {
-        if !matches!(*expected, ScalarType::Unit | ScalarType::Bool) { return None; }
+        if !matches!(*expected, ScalarType::Unit | ScalarType::Bool) && !is_integer_type(expected) { return None; }
         let row = calls.boundary.parameters.iter()
             .map(|parameter| ordinary_parameter_set(&parameter.ty, true).map(Rc::new))
             .collect::<Option<IntegerRow>>()?;
         let mut cursor = Self::with_row(calls, expected, row, None)?;
-        if *expected == ScalarType::Bool { cursor.discarded_return = Some(false); }
+        // Check typed output on all reached paths, but an uncalled root
+        // has no caller to receive its value or an issued summary.
+        if *expected != ScalarType::Unit { cursor.discarded_return = Some(false); }
         Some(cursor)
     }
 

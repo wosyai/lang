@@ -893,7 +893,12 @@ fn check_unused_module<const COLLECT: bool, const ENTRY_EVIDENCE: bool, Proof: S
         }
         #[cfg(feature = "internal-checker")]
         if COLLECT && Proof::INTEGER_RETURN_PARTITIONS
-            && matches!(body.boundary.results.as_slice(), [result] if matches!(result.ty, ScalarType::Unit | ScalarType::Bool))
+            && matches!(body.boundary.results.as_slice(), [result]
+                if matches!(result.ty, ScalarType::Unit | ScalarType::Bool)
+                    || (!Proof::ENABLED && is_integer_type(&result.ty)
+                        && body.assignments.is_empty()
+                        && !body.structure.has_ordinary_contextual_places()
+                        && !body.structure.checker_has_bool_contextual_declaration))
             && (!body.structure.checker_direct_targets.is_empty() || !body.structure.checker_ordinary_directive_calls.is_empty())
             && (ordinary_local_callers.contains(&(ordinal, item))
                 || !body.structure.checker_integer_call_locals.is_empty()
@@ -16512,6 +16517,31 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
         assert!(identity.witness.intervals_at(0, 0).unwrap().eq([(&zero, &zero)]));
         assert_eq!(identity.witness.row_equal_axes(0), Some(&[(1, 0)][..]));
         assert!(constant.witness.intervals_at(0, 0).unwrap().eq([(&min, &negative)]));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn integer_symbolic_root_transfers_conditional_call_preimages_before_return() {
+        let wrong = OUTPUT.replace(".code = 1", ".code = 89");
+        let exact = OUTPUT.replace(".code = 1", ".code = 90");
+        let program = format!(r#"%%start
+            i8(i8) transfer = fn(entry) {{
+                if (entry < 0) {{ 13 }} else {{ entry }}
+            }};
+            i8(i8) check = fn(input) {{
+                i8 output = transfer(input);
+                if (output == 0) {{ core.require(input == 0, {wrong}); }};
+                if (output == 13) {{ core.require(input >= 0, {exact}); }};
+                output
+            }};
+        %%end"#);
+        let root = source("src/main.w", "integer-symbolic-root-call-preimages");
+        let prepared = prepare_proof_target(&root, &program).unwrap();
+        let receipt = run_closed_without_named_proofs(&prepared, ScalarCheckerScope::CurrentPackage, 1).unwrap();
+        let [failure] = receipt.directives.as_slice() else { panic!("only the negative input range may fail"); };
+        assert_eq!(failure.code(), &BigInt::from(90));
+        let (min, max) = (BigInt::from(-128), BigInt::from(-1));
+        assert!(failure.witness.intervals_at(0, 0).unwrap().eq([(&min, &max)]));
     }
 
     #[cfg(feature = "internal-checker")]
