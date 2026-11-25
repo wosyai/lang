@@ -2306,6 +2306,11 @@ trait ActualIntegerObserver {
     ) -> Option<BigInt> { None }
 
     #[cfg(feature = "internal-checker")]
+    fn proved_qualified_nested_return(
+        &mut self, _: PreparedCallable, _: &FunctionCallSites, _: &[&BigInt], _: &ScalarType,
+    ) -> Option<BigInt> { None }
+
+    #[cfg(feature = "internal-checker")]
     fn proved_recursive_return(
         &mut self, _target: (usize, usize), _arguments: &[&BigInt], _expected: &ScalarType,
     ) -> Option<BigInt> {
@@ -2377,6 +2382,17 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             return Err(ProjectCheck::Unsupported);
         };
         #[cfg(feature = "internal-checker")]
+        if ACTUAL_STARTUP && Observer::ENABLED && is_integer_type(expected) {
+            if let Some((caller_source, ordered)) = collection {
+                if let Some(outer) = ordered.outer.filter(|_| caller_source != source && !ordered.meter_named_legacy_unit) {
+                    return self.qualified_nested_ranked_return(
+                        caller, call, signature, argument, expected, caller_source, source, *declaration_span,
+                        outer, ordered.visits,
+                    );
+                }
+            }
+        }
+        #[cfg(feature = "internal-checker")]
         let contextual_value = matches!(&argument, NestedIntegerArgument::ContextualValue(_));
         #[cfg(feature = "internal-checker")]
         if contextual_value && (!ACTUAL_STARTUP || Observer::ENABLED || Observer::CONTEXTUAL) {
@@ -2437,6 +2453,72 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             &caller.structure, call, signature, projected, source, *declaration_span, expected, None, false, collection,
             #[cfg(feature = "internal-checker")] proof_site,
         )
+    }
+
+    #[cfg(feature = "internal-checker")]
+    fn qualified_nested_ranked_return(
+        &mut self, caller: &FunctionCallSites, call: OccurrenceOrdinal, signature: &CheckedCallSignature,
+        argument: NestedIntegerArgument<'_>, expected: &ScalarType, caller_source: &SourceIdentity,
+        source: &SourceIdentity, declaration: ByteSpan, outer: OrderedInitializerCall<'_>,
+        visits: Option<&[InitializationVisit]>,
+    ) -> Result<ActualCallResult, ProjectCheck> {
+        use super::reference::CheckerIntegerCallArgument;
+        let Some(ModuleInitializationCallTarget::Direct {
+            declaration: activation, concrete: ConcreteCallSelection::Declaration,
+        }) = outer.topology.call_targets.get(&outer.occurrence) else { return Err(ProjectCheck::Unsupported); };
+        let (active, _, _, active_body) = self.validated_direct_body(
+            &outer.topology.structure, outer.occurrence, &activation.source, activation.range,
+        )?;
+        if activation.source != *caller_source || !self.active.contains(&active)
+            || !std::ptr::eq(active_body, caller) || !caller.checker_returns_unit()
+        {
+            return Err(ProjectCheck::Unsupported);
+        }
+        let locals = &caller.structure.checker_integer_call_locals;
+        let origin = locals.values().next().filter(|_| locals.len() == 1).ok_or(ProjectCheck::Unsupported)?;
+        if origin.call != call || origin.binding.source != *caller_source
+            || !caller.checked_call_signatures.get(&call).is_some_and(|actual| std::ptr::eq(actual, signature))
+            || !matches!(signature.outputs.outputs.as_slice(), [result] if &result.ty == expected)
+            || origin.arguments.as_slice().len() != signature.parameters.len()
+            || origin.arguments.as_slice().iter().any(|(_, argument)|
+                !matches!(argument, CheckerIntegerCallArgument::Literal(_) | CheckerIntegerCallArgument::PlainName))
+        {
+            return Err(ProjectCheck::Unsupported);
+        }
+        let (target, owner, function, body) = self.validated_direct_body(&caller.structure, call, source, declaration)?;
+        if !completed_namespace_owner(caller_source, &owner.source, target.0, visits)
+            || self.active.contains(&target) || self.active_depth == MAX_ACTUAL_CALL_DEPTH
+            || !function.generic_parameters.is_empty() || !function.overload_arms.is_empty()
+            || body.contextual_formal().is_some() || !body.assignments.is_empty()
+            || !body.structure.checker_directives.is_empty() || !body.allocation_length_calls.is_empty()
+            || !matches!(body.boundary.results.as_slice(), [result] if &result.ty == expected)
+        {
+            return Err(ProjectCheck::Unsupported);
+        }
+        let single;
+        let pair;
+        let actual: &[(&ScalarType, &BigInt)] = match argument {
+            NestedIntegerArgument::Single(Some(one)) | NestedIntegerArgument::RootLexical(one) => {
+                single = [one]; &single
+            }
+            NestedIntegerArgument::Pair(left, right) => { pair = [left, right]; &pair }
+            _ => return Err(ProjectCheck::Unsupported),
+        };
+        if actual.len() != signature.parameters.len() || actual.len() != body.boundary.parameters.len()
+            || !actual.iter().zip(signature.parameters.iter().zip(&body.boundary.parameters)).enumerate()
+                .all(|(i, ((ty, value), (parameter, slot)))| slot.ordinal == i && *ty == parameter
+                    && parameter == &slot.ty && is_integer_type(ty) && integer_literal_fits_type(value, ty))
+        {
+            return Err(ProjectCheck::Unsupported);
+        }
+        let arguments = actual.iter().map(|(_, value)| *value).collect::<Vec<_>>();
+        // The independently verified pure provider supplies only this
+        // result, to the existing enclosing local-binding continuation.
+        let value = self.observer.proved_qualified_nested_return(target, body, &arguments, expected)
+            .ok_or(ProjectCheck::Unsupported)?;
+        self.reached.insert(target);
+        self.had_obligations = true;
+        Ok(ActualCallResult::Integer(value))
     }
 
     #[cfg(feature = "internal-checker")]
@@ -7757,6 +7839,7 @@ struct RankedOrderedEvidence<'a, 'proof> {
     allow_reached: bool,
     allow_wide_initializer: bool,
     allow_qualified_wide_initializer: bool,
+    allow_qualified_nested_return: bool,
     allow_symbolic_summary: bool,
     reached_return: Option<Option<VerifiedInductionExactReturn<'proof>>>,
 }
@@ -7780,6 +7863,17 @@ impl ActualIntegerObserver for RankedOrderedEvidence<'_, '_> {
         let (plan, rank) = (self.plan, self.rank);
         self.reached_return.get_or_insert_with(|| VerifiedInductionExactReturn::verify_with_arity(
             plan, rank, MAX_RANKED_INTEGER_AXES).1).as_mut()?.consume(target, arguments, expected)
+    }
+
+    fn proved_qualified_nested_return(
+        &mut self, target: PreparedCallable, body: &FunctionCallSites, arguments: &[&BigInt], expected: &ScalarType,
+    ) -> Option<BigInt> {
+        if !self.allow_qualified_nested_return || target != self.plan.target || !std::ptr::eq(body, self.plan.typed.body) {
+            return None;
+        }
+        // Both successful and declined verification remain local to the
+        // original proof/callable graph; no stale token crosses a run.
+        self.proved_recursive_return(target, arguments, expected)
     }
 
     fn proved_recursive_return(
@@ -8025,6 +8119,12 @@ impl ActualIntegerObserver for MixedOrderedEvidence<'_, '_> {
         self.ranked.get_mut(&target)?.proved_wide_initializer_return(target, body, arguments, expected, cross_source)
     }
 
+    fn proved_qualified_nested_return(
+        &mut self, target: PreparedCallable, body: &FunctionCallSites, arguments: &[&BigInt], expected: &ScalarType,
+    ) -> Option<BigInt> {
+        self.ranked.get_mut(&target)?.proved_qualified_nested_return(target, body, arguments, expected)
+    }
+
     fn proved_recursive_return(
         &mut self, target: PreparedCallable, arguments: &[&BigInt], expected: &ScalarType,
     ) -> Option<BigInt> {
@@ -8145,6 +8245,9 @@ fn closed_ranked_evidence<'a, 'proof, const LOCAL_CATALOGS: bool>(
         allow_qualified_wide_initializer: integer_rank && !existing_transfer_arity && LOCAL_CATALOGS && plan.target.0 < startup_count
             && plan.proof_source != root_source && plan.proof_source.project == root_source.project
             && plan.proof_source.package == root_source.package,
+        allow_qualified_nested_return: integer_rank && existing_transfer_arity && LOCAL_CATALOGS
+            && plan.target.0 < startup_count && plan.proof_source != root_source
+            && plan.proof_source.project == root_source.project && plan.proof_source.package == root_source.package,
         allow_symbolic_summary: integer_rank && plan.proof_source == root_source,
         reached_return: None,
     })
@@ -24482,6 +24585,59 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
         assert_eq!(only.witness.row_count(), 1);
         assert!(only.witness.intervals_at(0, 0).unwrap().eq([(&input, &input)]));
         assert!(only.witness.intervals_at(0, 1).unwrap().eq([(&output, &output)]));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn ordered_qualified_nested_ranked_summary_reaches_ordinary_local_requirement() {
+        let app = source("src/main.w", "qualified-nested-ranked-app");
+        let owner = source("src/lib.w", "qualified-nested-ranked-owner");
+        let main = r#"%%start
+            lib = namespace demo "src/lib.w";
+            unit(u8) wrapper = fn(input) {
+                u8 result = lib.descend(input);
+                core.require(result == 4, { .stdout = "wrong result"; .stderr = ""; .code = 20; .files = []; });
+                core.require(result == 5, { .stdout = "ordinary nested result"; .stderr = ""; .code = 21; .files = []; });
+            };
+            wrapper(8);
+            wrapper(8);
+        %%end"#;
+        let provider = r#"%%start
+            u8(u8) descend = fn(value) { if (value < 3) { 4 } else { descend(value - 3) } };
+            proof rank for descend(entry) -> (out) where (entry <= 8) ensures (out == 4) decreases (entry) {
+                if (entry < 3) { core.show(out == 4); } else { core.use(rank(entry - 3)); }
+            }
+            core.require(false, { .stdout = "provider once"; .stderr = ""; .code = 17; .files = []; });
+        %%end"#;
+        let run = |main: &str, provider: &str, owner: &SourceIdentity, scope| {
+            let (_, library) = crate::parse_proof_source(owner.clone(), provider.to_owned(), &[]).ok().unwrap();
+            let namespace = ScalarNamespaceBinding {
+                binding: "lib".into(), target: owner.clone(), span: ByteSpan::new(0, 0),
+            };
+            check_loaded_scalar_ordered_local_proof_contexts(
+                vec![(declarations(&app, main), vec![namespace])], [(library, Vec::new())],
+                vec![app.clone(), owner.clone()], inputs(), scope, Vec::new(),
+            )
+        };
+        for scope in [ScalarCheckerScope::MainFlowOnly, ScalarCheckerScope::CurrentPackage] {
+            let checked = run(main, provider, &owner, scope).unwrap();
+            let [initialization, first, second] = checked.directives.as_slice()
+                else { panic!("provider once, actual nested requirement twice"); };
+            assert!(checked.active && checked.diagnostics.is_empty() && checked.symbolic_diagnostic.is_none());
+            assert_eq!((&initialization.source, initialization.stdout()), (&owner, b"provider once".as_slice()));
+            for failure in [first, second] {
+                assert_eq!((&failure.source, failure.stdout()), (&app, b"ordinary nested result".as_slice()));
+                let value = BigInt::from(4);
+                assert!(failure.witness.intervals_at(0, 1).unwrap().eq([(&value, &value)]));
+            }
+            let stale_proof = provider.replace("if (value < 3) { 4 }", "if (value < 3) { 5 }");
+            let edited_owner = SourceIdentity { revision: "provider-edited".into(), ..owner.clone() };
+            assert!(matches!(run(main, &stale_proof, &edited_owner, scope), Err(ScalarOrderedCheckerOutcome::Unsupported)));
+            assert!(matches!(run(&main.replace("wrapper(8)", "wrapper(9)"), provider, &owner, scope),
+                Err(ScalarOrderedCheckerOutcome::Unsupported)));
+            let foreign = SourceIdentity { project: "another-project".into(), ..owner.clone() };
+            assert!(matches!(run(main, provider, &foreign, scope), Err(ScalarOrderedCheckerOutcome::Unsupported)));
+        }
     }
 
     fn source(path: &str, revision: &str) -> SourceIdentity {
