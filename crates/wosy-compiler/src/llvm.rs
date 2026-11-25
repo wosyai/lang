@@ -3501,7 +3501,9 @@ fn emit_final_outputs<'ctx, 'module>(
         let output = &block.final_output_values[0];
         let expression = final_output_expression(block, 0);
         if matches!(expression, ScalarExpression::Call { .. }) {
-            transfer_runtime_array_return(state, block, expression, &output.ty);
+            if !inline {
+                transfer_runtime_array_return(state, block, expression, &output.ty);
+            }
             transfer_automatic_return_result(state, expression);
             let value = emit_expression(context, state, expression)?;
             if !state
@@ -3535,7 +3537,11 @@ fn emit_final_outputs<'ctx, 'module>(
         {
             record_forwarded_return_owner(context, state, expression, output.position)?;
         }
-        transfer_runtime_array_return(state, block, expression, &output.ty);
+        // The authenticated inline result captures bytes, not a backing owner.
+        // Keep local array cleanup live until finish_block_return takes the value.
+        if !inline {
+            transfer_runtime_array_return(state, block, expression, &output.ty);
+        }
         transfer_automatic_return_result(state, expression);
         return Ok(value);
     }
@@ -3624,7 +3630,9 @@ fn emit_project_final_outputs<'ctx, 'module>(
         let output = &block.final_output_values[0];
         let expression = final_output_expression(block, 0);
         if matches!(expression, ScalarExpression::Call { .. }) {
-            transfer_runtime_array_return(state, block, expression, &output.ty);
+            if !inline {
+                transfer_runtime_array_return(state, block, expression, &output.ty);
+            }
             transfer_automatic_return_result(state, expression);
             let value = emit_project_expression(context, state, expression, module, modules)?;
             if !state
@@ -3655,7 +3663,11 @@ fn emit_project_final_outputs<'ctx, 'module>(
         {
             record_forwarded_return_owner(context, state, expression, output.position)?;
         }
-        transfer_runtime_array_return(state, block, expression, &output.ty);
+        // The authenticated inline result captures bytes, not a backing owner.
+        // Keep local array cleanup live until finish_block_return takes the value.
+        if !inline {
+            transfer_runtime_array_return(state, block, expression, &output.ty);
+        }
         transfer_automatic_return_result(state, expression);
         return Ok(value);
     }

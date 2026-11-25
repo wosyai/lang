@@ -9661,6 +9661,38 @@ shapes.Measure(u64) second = fn(position) { second_values[position] };
 }
 
 #[test]
+fn inline_copy_result_keeps_local_backing_release_after_value_capture() {
+    let text = "%%start
+struct copy Sample { u8 byte; }
+Sample(u64) read_sample = fn(length) {
+    u8[length] bytes;
+    bytes[0] = 7;
+    { .byte = bytes[0]; }
+};
+%%end";
+    for layout in [ScalarTargetLayout::WASM32, ScalarTargetLayout::NATIVE64] {
+        let prepared = prepare_initializer_test(text, layout);
+        let checked = analyze_scalar_build(&prepared);
+        assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+        let source = &prepared.project().modules[0].source;
+        for (symbol, module) in [
+            ("read_sample".to_owned(), emit_scalar_build_single_module_llvm(&checked).unwrap()),
+            (project_function_name(source, "read_sample"), emit_scalar_build_project_llvm(&checked).unwrap()),
+        ] {
+            let llvm = module.to_text();
+            let body = llvm.split_once(&format!("define [1 x i8] @{symbol}("))
+                .expect("authenticated value-returning definition").1.split_once("\n}").unwrap().0;
+            let field = body.find("load i8, ptr").expect("read the copied field");
+            let capture = body.find("load [1 x i8], ptr").expect("capture the result bytes");
+            let release = body.find("call void @__wosy_core_free").expect("release the local backing");
+            let ret = body.find("ret [1 x i8]").expect("return captured bytes");
+            assert!(field < capture && capture < release && release < ret, "{body}");
+            assert_eq!(body.matches("call void @__wosy_core_free").count(), 1, "{body}");
+        }
+    }
+}
+
+#[test]
 fn inline_copy_results_contain_values_not_callee_addresses() {
     let text = "%%start
 struct copy Leaf { u8 tag; u32 number; }
