@@ -69,6 +69,8 @@ enum Command {
         main_flow_only: bool,
         #[arg(long, help = "Check the current package (the default scope)")]
         declared_package: bool,
+        #[arg(long, help = "Also check each resolved dependency's independent primary target")]
+        dependencies: bool,
     },
     Run {
         target: Option<String>,
@@ -146,14 +148,14 @@ fn main() -> ExitCode {
             }
         },
         #[cfg(feature = "internal-checker")]
-        Command::Check { target, profile, main_flow_only, .. } => {
+        Command::Check { target, profile, main_flow_only, dependencies, .. } => {
             // Clap rejects both scope flags. An omitted scope is exactly the explicit package scope.
             let scope = if main_flow_only {
                 ScalarCheckerScope::MainFlowOnly
             } else {
                 ScalarCheckerScope::CurrentPackage
             };
-            match check_command(target.as_deref(), &profile, scope) {
+            match check_command(target.as_deref(), &profile, scope, dependencies) {
                 Ok(code) => ExitCode::from(code),
                 Err(error) => {
                     eprintln!("wosy: {error}");
@@ -1013,6 +1015,12 @@ fn render_project_diagnostics(
     diagnostics: &[wosy_compiler::Diagnostic],
     texts: &BTreeMap<ProjectSourceIdentity, String>,
 ) {
+    render_project_diagnostics_with_packages(diagnostics, texts, false);
+}
+
+fn render_project_diagnostics_with_packages(
+    diagnostics: &[wosy_compiler::Diagnostic], texts: &BTreeMap<ProjectSourceIdentity, String>, packages: bool,
+) {
     for diagnostic in diagnostics {
         let mut files = SimpleFiles::new();
         let labels = diagnostic
@@ -1025,7 +1033,9 @@ fn render_project_diagnostics(
                     PackageRelativePath::new(label.span.source.path.clone().into()).ok()?,
                 );
                 let text = texts.get(&source)?;
-                let file_id = files.add(&label.span.source.path, text.as_str());
+                let name = if packages { std::borrow::Cow::Owned(format!("{}::{}", label.span.source.package, label.span.source.path)) }
+                    else { std::borrow::Cow::Borrowed(label.span.source.path.as_str()) };
+                let file_id = files.add(name, text.as_str());
                 let range = label.span.range.start as usize..label.span.range.end as usize;
                 Some(
                     match label.kind {
@@ -1056,17 +1066,20 @@ fn render_project_diagnostics(
 
 #[cfg(feature = "internal-checker")]
 fn check_command(
-    target: Option<&str>, profile: &str, scope: ScalarCheckerScope,
+    target: Option<&str>, profile: &str, scope: ScalarCheckerScope, dependencies: bool,
 ) -> Result<u8, String> {
     use configured_check::{CheckPublicationError, CheckPublicationPreflightError, ConfiguredCheckLoadError as LoadError};
-    use wosy_compiler::{Diagnostic, DiagnosticLabel, DiagnosticLabelKind, DiagnosticSeverity,
-        ScalarOrderedCheckerOutcome};
+    use wosy_compiler::ScalarOrderedCheckerOutcome;
 
     let current = env::current_dir().map_err(|error| error.to_string())?;
     let root = discover_root(&current)?;
-    let receipt = match scope {
-        ScalarCheckerScope::MainFlowOnly => configured_check::check_target(&root, target, profile, scope, Vec::new()),
-        ScalarCheckerScope::CurrentPackage => configured_check::check_declared_package_target(&root, target, profile),
+    let receipts = if dependencies {
+        configured_check::check_target_with_dependencies(&root, target, profile, scope)
+    } else {
+        match scope {
+            ScalarCheckerScope::MainFlowOnly => configured_check::check_target(&root, target, profile, scope, Vec::new()),
+            ScalarCheckerScope::CurrentPackage => configured_check::check_declared_package_target(&root, target, profile),
+        }.map(|receipt| vec![receipt])
     }.map_err(|failure| match failure {
             LoadError::Canonical(failure) | LoadError::Dormant(failure) => failure.report("check"),
             LoadError::Root => "check: invalid project root".to_owned(),
@@ -1079,29 +1092,57 @@ fn check_command(
             LoadError::DormantPath => "check: invalid declared source path".to_owned(),
         })?;
     let unsupported_output = || "check: result requires unsupported output; no result published".to_owned();
-    let publication = match receipt.plan_publication() {
-        Ok(publication) => publication,
-        Err(CheckPublicationError::Incomplete(ScalarOrderedCheckerOutcome::Invalid(diagnostics))) => {
-            render_project_diagnostics(diagnostics, &receipt.texts);
-            return Ok(2);
+    let primary = receipts.first().ok_or_else(unsupported_output)?;
+    let mut checked = Vec::with_capacity(receipts.len());
+    for receipt in &receipts {
+        match &receipt.outcome {
+            Ok(report) => checked.push(report),
+            Err(ScalarOrderedCheckerOutcome::Invalid(diagnostics)) => {
+                render_project_diagnostics_with_packages(diagnostics, &receipt.texts, dependencies);
+                return Ok(2);
+            }
+            Err(_) => return Err("check: unsupported analysis; no result published".to_owned()),
         }
-        Err(CheckPublicationError::Incomplete(_)) => return Err("check: unsupported analysis; no result published".to_owned()),
-        Err(CheckPublicationError::InvalidPath { .. } | CheckPublicationError::ConflictingPath { .. }) =>
-            return Err(unsupported_output()),
-    };
-    let report = publication.report;
+    }
+    let publication = if receipts.len() == 1 {
+        primary.plan_publication()
+    } else {
+        configured_check::plan_publication_for(checked[0], &primary.texts, checked.iter().copied())
+    }.map_err(|error| match error {
+        CheckPublicationError::Incomplete(_) => "check: unsupported analysis; no result published".to_owned(),
+        CheckPublicationError::InvalidPath { .. } | CheckPublicationError::ConflictingPath { .. } => unsupported_output(),
+    })?;
     if scope == ScalarCheckerScope::MainFlowOnly
-        && (report.symbolic_diagnostic.is_some() || !report.additional_symbolic_diagnostics.is_empty())
+        && (publication.report.symbolic_diagnostic.is_some() || !publication.report.additional_symbolic_diagnostics.is_empty())
     {
         return Err(unsupported_output());
     }
-    let authored = publication.prepare(&receipt.root).map_err(|error| match error {
+    let diagnostics = checked.iter().zip(&receipts)
+        .map(|(report, receipt)| ordered_check_diagnostics(report, &receipt.texts))
+        .collect::<Result<Vec<_>, _>>()?;
+    let authored = publication.prepare(&primary.root).map_err(|error| match error {
         CheckPublicationPreflightError::UnsupportedFilePublication => unsupported_output(),
         CheckPublicationPreflightError::File(error) =>
             format!("check: could not prepare authored files; no result published: {error}"),
         CheckPublicationPreflightError::ExitStatusOutsideByteRange =>
             "check: selected exit code is outside 0..=255; no result published".to_owned(),
     })?;
+    let authored_status = authored.publish(&mut std::io::stdout().lock(), &mut std::io::stderr().lock())
+        .map_err(|error| format!("check: could not complete authored output; earlier records may already be published: {error}"))?;
+    let mut has_failure = false;
+    for (diagnostics, receipt) in diagnostics.iter().zip(&receipts) {
+        has_failure |= !diagnostics.is_empty();
+        render_project_diagnostics_with_packages(diagnostics, &receipt.texts, dependencies);
+    }
+    Ok(if authored_status != 0 { authored_status } else { u8::from(has_failure) })
+}
+
+#[cfg(feature = "internal-checker")]
+fn ordered_check_diagnostics(
+    report: &wosy_compiler::MainFlowProofReceipt,
+    texts: &BTreeMap<ProjectSourceIdentity, String>,
+) -> Result<Vec<wosy_compiler::Diagnostic>, String> {
+    use wosy_compiler::{Diagnostic, DiagnosticLabel, DiagnosticLabelKind, DiagnosticSeverity};
     let actual = report.diagnostics.iter().map(|failure| {
         let mut labels = vec![
             DiagnosticLabel {
@@ -1216,14 +1257,14 @@ fn check_command(
             notes.push(format!("quantified witness input: {name} = {value}"));
         }
         if let Some(ieee) = &failure.ieee_entry {
-            let name = entry_binding_name(&ieee.binding.source, ieee.binding.range, publication.texts).unwrap_or("argument 1");
+            let name = entry_binding_name(&ieee.binding.source, ieee.binding.range, texts).unwrap_or("argument 1");
             use wosy_compiler::ScalarCheckerIeeeValue;
             let detail = match ieee.value {
                 ScalarCheckerIeeeValue::F32(bits) => format!("{:?} (f32 bits 0x{bits:08x})", f32::from_bits(bits)),
                 ScalarCheckerIeeeValue::F64(bits) => format!("{:?} (f64 bits 0x{bits:016x})", f64::from_bits(bits)),
             };
             notes.push(format!("symbolic call entry: {name} = {detail}"));
-        } else if let Some(entry) = entry_point_note(&failure.witness, publication.texts, false, failure.returned_literal.is_some()) {
+        } else if let Some(entry) = entry_point_note(&failure.witness, texts, false, failure.returned_literal.is_some()) {
             notes.push(entry);
         }
         Diagnostic {
@@ -1297,7 +1338,7 @@ fn check_command(
         if let Some((name, value)) = failure.cell.as_ref().and_then(|cell| cell.universal.as_ref()) {
             notes.push(format!("quantified witness input: {name} = {value}"));
         }
-        if let Some(entry) = entry_point_note(&failure.witness, publication.texts, actual, false) {
+        if let Some(entry) = entry_point_note(&failure.witness, texts, actual, false) {
             notes.push(entry);
         }
         Diagnostic {
@@ -1344,10 +1385,7 @@ fn check_command(
     }
     diagnostics.extend(aggregate);
     diagnostics.extend(pointer_effect);
-    let authored_status = authored.publish(&mut std::io::stdout().lock(), &mut std::io::stderr().lock())
-        .map_err(|error| format!("check: could not complete authored output; earlier records may already be published: {error}"))?;
-    render_project_diagnostics(&diagnostics, publication.texts);
-    Ok(if authored_status != 0 { authored_status } else { u8::from(!diagnostics.is_empty()) })
+    Ok(diagnostics)
 }
 
 #[cfg(feature = "internal-checker")]
@@ -2235,6 +2273,93 @@ unit(u8) unused = fn(value) {{ core.require(value < 1, {{ .stdout = \"unused dep
 
     #[cfg(feature = "internal-checker")]
     #[test]
+    fn configured_dependency_check_uses_one_graph_and_one_ordered_publication() {
+        use configured_check::{check_target_with_dependencies, plan_publication_for, CheckPublicationError, ConfiguredCheckLoadError};
+        let options = Arguments::try_parse_from(["wosy", "check", "--main-flow-only", "--dependencies"]).unwrap();
+        assert!(matches!(options.command, Command::Check { main_flow_only: true, dependencies: true, .. }));
+        let (scratch, _) = routing_test_project("configured-dependency-batch", &[]);
+        let root = &scratch.root;
+        let manifest = |package: &str, target: &str, profile: &str, output: &str| format!(r#"
+[package]
+name = "{package}"
+default_target = "{target}"
+source_root = "src"
+[comments]
+categories = []
+[builders]
+[runners]
+[targets.{target}]
+root = "src/primary.w"
+default_profile = "{profile}"
+[targets.{target}.artifacts.main]
+artifact = "RuntimeStdio"
+[targets.{target}.artifacts.main.profiles.{profile}]
+backend = "llvm"
+output = "{output}"
+builder = "never"
+run_runner = "never"
+[targets.{target}.profiles.{profile}]
+main_artifact = "main"
+"#);
+        let app = manifest("app", "main", "dev", "native") + "\n[dependencies.a]\npath = \"a\"\n[dependencies.b]\npath = \"b\"\n";
+        let body = |mark: &str, code: u8| format!(r#"%%start
+core.require(false, {{ .stdout = "{mark}"; .stderr = ""; .code = {code}; .files = []; }});
+%%end"#);
+        for (package, content, code) in [
+            ("", app.clone(), 3),
+            ("a", manifest("a", "own_a", "checked", "wasm-wasip1") + "\n[dependencies.leaf]\npath = \"../leaf\"\n", 4),
+            ("b", manifest("b", "own_b", "nativecheck", "native") + "\n[dependencies.leaf]\npath = \"../leaf\"\n", 5),
+            ("leaf", manifest("leaf", "own_leaf", "leafcheck", "wasm-wasip1"), 6),
+        ] {
+            let directory = root.join(package);
+            fs::create_dir_all(directory.join("src")).unwrap();
+            fs::write(directory.join("wosy.toml"), content).unwrap();
+            fs::write(directory.join("src/primary.w"), body(if package.is_empty() { "app" } else { package }, code)).unwrap();
+        }
+        fs::write(root.join("leaf/src/dormant.w"), r#"%%start
+unit(u8) unseen = fn(value) {
+    core.require(value < 1, { .stdout = "dormant"; .stderr = ""; .code = 7; .files = []; });
+};
+%%end"#).unwrap();
+        let (_, _, targets) = ProjectConfiguration::load_with_dependency_check_targets(root).unwrap();
+        assert_eq!(targets.iter().map(|child| (child.project.package.as_str(), child.layout.pointer_size)).collect::<Vec<_>>(),
+            [("a", 4), ("b", 8), ("leaf", 4)]);
+        assert_eq!(targets[0].configuration.resolved_packages.keys().map(String::as_str).collect::<Vec<_>>(), ["leaf"]);
+        assert!(targets[2].configuration.resolved_packages.is_empty());
+        for scope in [ScalarCheckerScope::CurrentPackage, ScalarCheckerScope::MainFlowOnly] {
+            let receipts = check_target_with_dependencies(root, None, "dev", scope).ok().unwrap();
+            assert_eq!(receipts.len(), 4);
+            let reports = receipts.iter().map(|receipt| receipt.outcome.as_ref().ok().unwrap()).collect::<Vec<_>>();
+            let checked = plan_publication_for(reports[0], &receipts[0].texts, reports.iter().copied()).unwrap();
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            assert_eq!(checked.prepare(root).ok().unwrap().publish(&mut stdout, &mut stderr).unwrap(), 3);
+            assert_eq!(stdout, b"appableafdormant");
+            assert!(stderr.is_empty());
+            assert!(!root.join(".wosy").exists());
+        }
+
+        let sponsored_file = |packet: &str| format!(r#"%%start
+core.require(false, {{ .stdout = "{packet}"; .stderr = ""; .code = 1;
+    .files = [{{ .path = "same.txt"; .text = "{packet}"; }}]; }});
+%%end"#);
+        fs::write(root.join("src/primary.w"), sponsored_file("root")).unwrap();
+        fs::write(root.join("leaf/src/primary.w"), sponsored_file("leaf")).unwrap();
+        let receipts = check_target_with_dependencies(root, None, "dev", ScalarCheckerScope::CurrentPackage).ok().unwrap();
+        let reports = receipts.iter().map(|receipt| receipt.outcome.as_ref().ok().unwrap()).collect::<Vec<_>>();
+        assert!(matches!(plan_publication_for(reports[0], &receipts[0].texts, reports.iter().copied()),
+            Err(CheckPublicationError::ConflictingPath { source, .. }) if source.package == "leaf"));
+        assert!(!root.join(".wosy").exists());
+
+        fs::write(root.join("wosy.toml"), app + "\n[dependencies.remote]\ngit = \"https://example.invalid/pkg\"\n").unwrap();
+        assert!(matches!(check_target_with_dependencies(root, None, "dev", ScalarCheckerScope::CurrentPackage),
+            Err(ConfiguredCheckLoadError::Dependency(error)) if error.contains("independent checking of managed Git dependency remote is unsupported")));
+        assert!(!root.join(".wosy").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
     fn internal_ordered_checker_selects_exact_typed_status_and_keeps_every_report() {
         use wosy_compiler::{ScalarCheckerScope, ScalarOrderedCheckerOutcome};
         for (second, third) in [
@@ -2470,7 +2595,7 @@ unit(u8) unused = fn(value) {{ core.require(value < 1, {{ .stdout = \"unused dep
         assert!(!project.root.join(".wosy").exists());
         let selected = Arguments::try_parse_from(["wosy", "check", "app", "--main-flow-only"]).unwrap();
         assert!(matches!(selected.command, Command::Check {
-            target: Some(target), profile, main_flow_only: true, declared_package: false,
+            target: Some(target), profile, main_flow_only: true, declared_package: false, dependencies: false,
         } if target == "app" && profile == "dev"));
     }
 

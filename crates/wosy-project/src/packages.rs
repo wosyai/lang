@@ -193,14 +193,14 @@ pub(super) fn resolve_installed(
     root: &Path,
     package: &str,
     dependencies: &BTreeMap<String, DependencyDeclaration>,
-    selected: Option<&str>,
-) -> Result<(BTreeMap<String, ResolvedPackage>, Option<SelectedLocalManifest>), String> {
+    selected: Option<&str>, capture_all_local: bool,
+) -> Result<(BTreeMap<String, ResolvedPackage>, BTreeMap<String, SelectedLocalManifest>), String> {
     let mut git = None;
-    let mut captured = None;
+    let mut captured = BTreeMap::new();
     let resolution = graph::resolve(root, package, dependencies, |binding, parent, declaration| {
         let name = declaration.name.as_str();
         match binding {
-            graph::Binding::Local(actual) if Some(name) == selected => {
+            graph::Binding::Local(actual) if capture_all_local || Some(name) == selected => {
                 if !std::fs::symlink_metadata(actual.join("wosy.toml")).is_ok_and(|metadata| metadata.is_file()) {
                     return Err(format!("dependency {name} manifest is not a regular non-aliased file"));
                 }
@@ -208,13 +208,16 @@ pub(super) fn resolve_installed(
                 let document = dependency_document(actual, declaration, None, None).map_err(diagnostic)?;
                 let (package, dependencies) =
                     load_dependency_from_document(actual.clone(), declaration, None, &document).map_err(diagnostic)?;
-                captured = Some(SelectedLocalManifest {
+                captured.insert(name.to_owned(), SelectedLocalManifest {
                     root: actual.clone(), document, dependencies: dependencies.clone(),
                 });
                 Ok((package, dependencies).into())
             }
             graph::Binding::Local(_) => load_local(parent, declaration, None),
             graph::Binding::Git(requirement) => {
+                if capture_all_local {
+                    return Err(format!("independent checking of managed Git dependency {name} is unsupported"));
+                }
                 if selected.is_some() {
                     return Err("direct dependency checking in a Git dependency graph is unsupported".to_owned());
                 }

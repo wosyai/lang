@@ -7,7 +7,7 @@ license.workspace = true
 [features]
 # The standard CLI exposes `check`. The opt-out keeps a build-only developer configuration.
 default = ["internal-checker"]
-internal-checker = ["wosy-compiler/internal-checker", "wosy-project/internal-checker", "dep:rustix"]
+internal-checker = ["wosy-compiler/internal-checker", "wosy-project/internal-checker", "dep:rustix", "dep:toml_edit"]
 
 [dependencies]
 blake3.workspace = true
@@ -15,6 +15,7 @@ clap.workspace = true
 codespan-reporting.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+toml_edit = { workspace = true, optional = true }
 wosy-compiler.workspace = true
 wosy-project.workspace = true
 wosy-syntax.workspace = true

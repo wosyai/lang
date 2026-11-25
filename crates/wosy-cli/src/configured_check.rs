@@ -51,9 +51,19 @@ pub(crate) enum CheckPublicationError<'a> {
 impl ConfiguredCheckReceipt {
     pub(crate) fn plan_publication(&self) -> Result<PlannedCheckPublication<'_>, CheckPublicationError<'_>> {
         let report = self.outcome.as_ref().map_err(CheckPublicationError::Incomplete)?;
-        let mut effects = Vec::new();
-        let mut seen = CheckedOutputTargets::default();
-        let status = OrderedCheckEffects::new(&report.directives).visit_with_origin(|origin, effect| {
+        plan_publication_for(report, &self.texts, std::iter::once(report))
+    }
+}
+
+pub(crate) fn plan_publication_for<'a>(
+    first: &'a MainFlowProofReceipt, texts: &'a BTreeMap<SourceIdentity, String>,
+    reports: impl IntoIterator<Item = &'a MainFlowProofReceipt>,
+) -> Result<PlannedCheckPublication<'a>, CheckPublicationError<'a>> {
+    let mut effects = Vec::new();
+    let mut seen = CheckedOutputTargets::default();
+    let mut status = InternalCheckStatus::Zero;
+    for report in reports {
+        let next = OrderedCheckEffects::new(&report.directives).visit_with_origin(|origin, effect| {
             let planned = match effect {
                 InternalCheckEffect::Stdout(bytes) => PlannedCheckEffect::Stdout(bytes),
                 InternalCheckEffect::Stderr(bytes) => PlannedCheckEffect::Stderr(bytes),
@@ -70,8 +80,9 @@ impl ConfiguredCheckReceipt {
             effects.push(planned);
             Ok(())
         })?;
-        Ok(PlannedCheckPublication { report, texts: &self.texts, status, effects })
+        if matches!(status, InternalCheckStatus::Zero) { status = next; }
     }
+    Ok(PlannedCheckPublication { report: first, texts, status, effects })
 }
 
 pub(crate) enum CheckPublicationPreflightError {
@@ -221,8 +232,16 @@ fn configured_target(
     let root = root.canonicalize().map_err(|_| LoadError::Root)?;
     let (configuration, manifest) =
         ProjectConfiguration::load_with_manifest(&root).map_err(LoadError::Manifest)?;
+    configured_target_from_manifest(&root, &configuration, &manifest, target, profile, scope, dormant_paths)
+}
+
+fn configured_target_from_manifest(
+    root: &Path, configuration: &ProjectConfiguration, manifest: &toml_edit::ImDocument<String>,
+    target: Option<&str>, profile: &str, scope: ScalarCheckerScope, dormant_paths: Option<Vec<&OsStr>>,
+) -> Result<ConfiguredCheckReceipt, ConfiguredCheckLoadError> {
+    use ConfiguredCheckLoadError as LoadError;
     let target = configuration.resolve_target(target).map_err(|_| LoadError::Target)?;
-    let project = ProjectContext::from_manifest(&root, &target, manifest.as_table())
+    let project = ProjectContext::from_manifest(root, &target, manifest.as_table())
         .map_err(|_| LoadError::Target)?;
     let (_, _, artifact, _) = configuration.artifact_profile(&target, profile)
         .map_err(|_| LoadError::Profile)?;
@@ -233,7 +252,23 @@ fn configured_target(
             ProjectContext::declared_package_source_root(manifest.as_table()).map_err(LoadError::PackageSourceRoot)?,
         ),
     };
-    check_configured_proof_scope(&project, &configuration, layout, scope, selection)
+    check_configured_proof_scope(&project, configuration, layout, scope, selection)
+}
+
+pub(crate) fn check_target_with_dependencies(
+    root: &Path, target: Option<&str>, profile: &str, scope: ScalarCheckerScope,
+) -> Result<Vec<ConfiguredCheckReceipt>, ConfiguredCheckLoadError> {
+    use ConfiguredCheckLoadError as LoadError;
+    let root = root.canonicalize().map_err(|_| LoadError::Root)?;
+    let (configuration, manifest, dependencies) = ProjectConfiguration::load_with_dependency_check_targets(&root)
+        .map_err(LoadError::Dependency)?;
+    let mut receipts = Vec::with_capacity(1 + dependencies.len());
+    receipts.push(configured_target_from_manifest(&root, &configuration, &manifest, target, profile, scope,
+        (scope == ScalarCheckerScope::MainFlowOnly).then(Vec::new))?);
+    for dependency in dependencies {
+        receipts.push(check_resolved_dependency_primary(&dependency)?);
+    }
+    Ok(receipts)
 }
 
 pub(crate) fn check_direct_dependency_primary(
@@ -243,9 +278,15 @@ pub(crate) fn check_direct_dependency_primary(
     let root = root.canonicalize().map_err(|_| LoadError::Root)?;
     let (_, _, selection) = ProjectConfiguration::load_with_direct_dependency_check_target(&root, dependency, None, None)
         .map_err(LoadError::Dependency)?;
+    check_resolved_dependency_primary(&selection)
+}
+
+fn check_resolved_dependency_primary(
+    selection: &wosy_project::DirectDependencyCheckTarget,
+) -> Result<ConfiguredCheckReceipt, ConfiguredCheckLoadError> {
     check_configured_proof_scope(
         &selection.project, &selection.configuration, selection.layout, ScalarCheckerScope::CurrentPackage,
-        DormantSelection::DeclaredPackage(selection.source_directory),
+        DormantSelection::DeclaredPackage(selection.source_directory.clone()),
     )
 }
 

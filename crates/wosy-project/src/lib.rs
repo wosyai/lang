@@ -531,13 +531,13 @@ impl ProjectConfiguration {
     }
 
     pub fn load_with_manifest(root: &Path) -> Result<(Self, toml_edit::ImDocument<String>), String> {
-        let (configuration, document, _) = Self::load_snapshot(root, None)?;
+        let (configuration, document, _) = Self::load_snapshot(root, None, false)?;
         Ok((configuration, document))
     }
 
     fn load_snapshot(
-        root: &Path, selected: Option<&str>,
-    ) -> Result<(Self, toml_edit::ImDocument<String>, Option<packages::SelectedLocalManifest>), String> {
+        root: &Path, selected: Option<&str>, capture_all_local: bool,
+    ) -> Result<(Self, toml_edit::ImDocument<String>, BTreeMap<String, packages::SelectedLocalManifest>), String> {
         let snapshot = packages::ProjectSnapshot::reader(root)?;
         let document =
             toml_edit::ImDocument::parse(snapshot.manifest()?).map_err(|error| error.to_string())?;
@@ -565,7 +565,7 @@ impl ProjectConfiguration {
             }
         }
         let (resolved_packages, selected) =
-            packages::resolve_installed(&snapshot, root, &package_name, &dependencies, selected)?;
+            packages::resolve_installed(&snapshot, root, &package_name, &dependencies, selected, capture_all_local)?;
         let configuration = Self::configure(&document, module_source_root, dependencies, resolved_packages)?;
         Ok((configuration, document, selected))
     }
@@ -629,18 +629,46 @@ impl ProjectConfiguration {
     pub fn load_with_direct_dependency_check_target(
         root: &Path, dependency: &str, target: Option<&str>, profile: Option<&str>,
     ) -> Result<(Self, toml_edit::ImDocument<String>, DirectDependencyCheckTarget), String> {
-        let (configuration, document, captured) = Self::load_snapshot(root, Some(dependency))?;
-        let packages::SelectedLocalManifest { root: child_root, document: child, dependencies } =
-            captured.ok_or_else(|| format!("dependency {dependency} is not a resolved local package"))?;
-        let resolved = configuration.resolved_packages.get(dependency)
+        let (configuration, document, mut captured) = Self::load_snapshot(root, Some(dependency), false)?;
+        let captured = captured.remove(dependency)
+            .ok_or_else(|| format!("dependency {dependency} is not a resolved local package"))?;
+        let selection = configuration.select_resolved_dependency(dependency, captured, target, profile)?;
+        Ok((configuration, document, selection))
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[doc(hidden)]
+    pub fn load_with_dependency_check_targets(
+        root: &Path,
+    ) -> Result<(Self, toml_edit::ImDocument<String>, Vec<DirectDependencyCheckTarget>), String> {
+        let (configuration, document, mut captured) = Self::load_snapshot(root, None, true)?;
+        let mut selections = Vec::with_capacity(configuration.resolved_packages.len());
+        // Stable package order, exactly one independent selection per
+        // authenticated installation even when several parents reach it.
+        for dependency in configuration.resolved_packages.keys() {
+            let child = captured.remove(dependency)
+                .ok_or_else(|| format!("resolved dependency {dependency} has no captured manifest"))?;
+            selections.push(configuration.select_resolved_dependency(dependency, child, None, None)
+                .map_err(|error| format!("dependency {dependency}: {error}"))?);
+        }
+        if !captured.is_empty() { return Err("dependency manifest selection does not match resolved graph".to_owned()); }
+        Ok((configuration, document, selections))
+    }
+
+    #[cfg(feature = "internal-checker")]
+    fn select_resolved_dependency(
+        &self, dependency: &str, captured: packages::SelectedLocalManifest, target: Option<&str>, profile: Option<&str>,
+    ) -> Result<DirectDependencyCheckTarget, String> {
+        let packages::SelectedLocalManifest { root: child_root, document: child, dependencies } = captured;
+        let resolved = self.resolved_packages.get(dependency)
             .ok_or_else(|| format!("direct dependency {dependency} is missing"))?;
         let source_directory = resolved.identity.path.clone();
         let mut resolved_packages = BTreeMap::new();
         let mut reached: Vec<_> = dependencies.keys().collect();
         while let Some(name) = reached.pop() {
             if let std::collections::btree_map::Entry::Vacant(binding) = resolved_packages.entry(name.clone()) {
-                let package = configuration.resolved_packages.get(name)
-                    .expect("reachable package resolved in installed graph");
+                let package = self.resolved_packages.get(name)
+                    .ok_or_else(|| format!("reachable dependency {name} is missing"))?;
                 reached.extend(&package.dependencies);
                 binding.insert(package.clone());
             }
@@ -652,8 +680,7 @@ impl ProjectConfiguration {
             .ok_or_else(|| format!("target {target} has no declared default_profile"))?;
         let (_, _, artifact, _) = child_configuration.artifact_profile(&target, profile)?;
         let layout = artifact.target_layout()?;
-        let selection = DirectDependencyCheckTarget { source_directory, project, configuration: child_configuration, layout };
-        Ok((configuration, document, selection))
+        Ok(DirectDependencyCheckTarget { source_directory, project, configuration: child_configuration, layout })
     }
 
     pub fn git_package(&self, name: &str) -> Result<Option<(&ResolvedPackage, &packages::GitDirectory)>, String> {
