@@ -609,6 +609,7 @@ struct OrderedRootLiteralProof<'a, 'observation, const TOTAL: bool> {
     bound: &'observation BigInt,
     guard: Option<&'observation LiteralGuardAtReturn<'observation>>,
     imported_binding: Option<&'a ReferenceBindingId>,
+    imported_relation_work: Option<&'observation std::cell::RefCell<usize>>,
     observed: &'observation std::cell::RefCell<(bool, Option<SymbolicLiteralFailure<'a>>)>,
 }
 
@@ -673,8 +674,14 @@ impl<'a, const TOTAL: bool> ScopedAuthoredReturn<'a> for OrderedRootLiteralProof
             let returned = match (value, axis) {
                 (IntegerReturn::Const(value), _) => rejected.accepts(value.cmp(self.bound)).then_some(value),
                 (IntegerReturn::Alias(_), Some(axis)) if axis >= roots.parameters => {
-                    let returned = row.get(axis)?.singleton_value()?;
-                    rejected.accepts(returned.cmp(self.bound)).then_some(returned)
+                    let result_domain = row.get(axis)?;
+                    if let Some(work) = self.imported_relation_work {
+                        charge_call_work(&mut work.borrow_mut(), result_domain.interval_count().checked_add(1)?)?;
+                        result_domain.first_comparison_point(rejected, self.bound)
+                    } else {
+                        let returned = result_domain.singleton_value()?;
+                        rejected.accepts(returned.cmp(self.bound)).then_some(returned)
+                    }
                 }
                 (IntegerReturn::Alias(_), Some(axis)) => row.get(axis)?.first_comparison_point(rejected, self.bound),
                 _ => return None,
@@ -692,7 +699,11 @@ impl<'a, const TOTAL: bool> ScopedAuthoredReturn<'a> for OrderedRootLiteralProof
             // The return is reported separately; the diagnostic state still
             // contains only the callable's entry coordinates.
             let entry_axis = axis.filter(|&axis| axis < roots.parameters);
-            observed.1 = Some(SymbolicLiteralFailure::from_row(slot, roots, row, entry_axis, returned, entry));
+            observed.1 = Some(match (self.imported_relation_work, axis) {
+                (Some(work), Some(local)) if local >= roots.parameters =>
+                    SymbolicLiteralFailure::from_local(slot, roots, row, local, returned, &mut work.borrow_mut())?,
+                _ => SymbolicLiteralFailure::from_row(slot, roots, row, entry_axis, returned, entry),
+            });
         }
         Some(())
     }
@@ -3278,19 +3289,23 @@ fn collect_ordered_root_literal_proof_with_imports<'a, const TOTAL: bool>(
     } else {
         None
     };
-    let imported_binding = if imports.is_empty() {
-        None
+    let (imported_binding, imported_relation_work) = if imports.is_empty() {
+        (None, None)
     } else {
         if imports.len() > 4 || imports.iter().any(Option::is_none) { return None; }
         let last = imports.last()?.as_ref()?;
-        Some(&calls.structure.checker_integer_call_locals
-            .get(&(calls.structure.root, last.position))?.binding)
+        let relational = matches!(last.values, ImportedIntegerValues::Shared {
+            result: ImportedVerifiedReturn::EntryAlias(_) | ImportedVerifiedReturn::EntryAffine { .. }, ..
+        });
+        let binding = &calls.structure.checker_integer_call_locals.get(&(calls.structure.root, last.position))?.binding;
+        (Some(binding), relational.then(|| std::cell::RefCell::new(0)))
     };
     let observed = std::cell::RefCell::new((false, None));
     let mut failures = Vec::new();
     let mut sink = |failure| failures.push(failure);
     let scope = OrderedRootLiteralProof::<TOTAL> {
-        conditions: OrderedRootConditions(body, false), relation, bound, guard: guard.as_ref(), imported_binding, observed: &observed,
+        conditions: OrderedRootConditions(body, false), relation, bound, guard: guard.as_ref(), imported_binding,
+        imported_relation_work: imported_relation_work.as_ref(), observed: &observed,
     };
     let active = if TOTAL {
         let mut collected = IntegerFailureCollection {

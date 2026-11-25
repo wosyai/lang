@@ -5123,7 +5123,10 @@ impl<'a> VerifiedSymbolicSummary<'a> {
             let eligible = matches!(&self.guards, VerifiedSymbolicGuards::Ranked(guard) if scalar_return || guard.arity > 2)
                 || ((scalar_return || qualified_layout.is_some()) && matches!(&self.guards, VerifiedSymbolicGuards::Derived(_))
                     && origin.arguments.as_slice().len() == 1);
-            if !eligible || !matches!(result, ImportedVerifiedReturn::Constant { .. })
+            let scalar_result = matches!(result, ImportedVerifiedReturn::Constant { .. })
+                || (qualified_layout.is_some() && matches!(&self.guards, VerifiedSymbolicGuards::Derived(_))
+                    && matches!(result, ImportedVerifiedReturn::EntryAlias(0) | ImportedVerifiedReturn::EntryAffine { slot: 0, .. }));
+            if !eligible || !scalar_result
             {
                 return Ok(None);
             }
@@ -5959,6 +5962,26 @@ impl<'a> SelectedSymbolicProof<'a, '_> {
         source: &SourceIdentity, effects: &mut OrderedFailures, runtime: SymbolicProofRuntime<'_>,
         group: &MainFlowProofTarget<'a>, case: &MainFlowProofCase<'a>,
     ) -> Result<Option<bool>, ProjectCheck> {
+        let Some((summary, failure)) = Self::prove_unary_entry_relationship(target, body, source, runtime, case, &mut 0)? else {
+            return Ok(Some(false));
+        };
+        if let Some(failure) = failure {
+            self.record(case, function, source, effects.records.len(), failure, None)?;
+        } else if let Some(issuer) = group.issuer.as_ref().filter(|issuer| std::ptr::eq(issuer.body, body)) {
+            self.equalities.insert(VerifiedSymbolicSummary {
+                target, canonical_target: issuer.canonical_target, layout: issuer.layout, body: issuer.body,
+                result: summary, guards: VerifiedSymbolicGuards::Partitioned {
+                    guards: case.guard.comparisons.clone(), _dependency_definitions: HashSet::new(),
+                },
+            });
+        }
+        Ok(Some(true))
+    }
+
+    fn prove_unary_entry_relationship<'local>(
+        target: PreparedCallable, body: &'local FunctionCallSites, source: &'local SourceIdentity,
+        runtime: SymbolicProofRuntime<'local>, case: &MainFlowProofCase<'a>, work: &mut usize,
+    ) -> Result<Option<(VerifiedSymbolicResult<'a>, Option<super::checker_flow::SymbolicLiteralFailure<'local>>)>, ProjectCheck> {
         use super::checker_flow::{charge_call_work, covers_all_partitioned_call_inputs, verify_partitioned_call_return,
             PartitionedProofGoal};
         let [input] = body.boundary.parameters.as_slice() else { return Err(ProjectCheck::Unsupported); };
@@ -5973,17 +5996,16 @@ impl<'a> SelectedSymbolicProof<'a, '_> {
                  VerifiedSymbolicResult::EntryAffine { slot: 0, transform: Rc::clone(transform) }),
             _ => return Err(ProjectCheck::Unsupported),
         };
-        if case.guard.always_rejects { return Ok(Some(false)); }
-        let mut work = 0;
-        charge_call_work(&mut work, body.occurrences.len().checked_add(case.guard.comparisons.len())
+        if case.guard.always_rejects { return Ok(None); }
+        charge_call_work(work, body.occurrences.len().checked_add(case.guard.comparisons.len())
             .ok_or(ProjectCheck::Unsupported)?).ok_or(ProjectCheck::Unsupported)?;
         let mut domain = IntegerSet::from_type(&input.ty).ok_or(ProjectCheck::Unsupported)?;
         for guard in &case.guard.comparisons {
             if guard.slot != 0 { return Err(ProjectCheck::Unsupported); }
-            charge_call_work(&mut work, domain.interval_count()).ok_or(ProjectCheck::Unsupported)?;
+            charge_call_work(work, domain.interval_count()).ok_or(ProjectCheck::Unsupported)?;
             domain = domain.keep_relation(guard.relation, guard.bound);
         }
-        if domain.is_empty() { return Ok(Some(false)); }
+        if domain.is_empty() { return Ok(None); }
         // Keep the guarded entry axis live all the way to partition
         // serialization. The ordinary-local driver below already models
         // immutable add/subtract and aliases on that axis. Exact-only extended
@@ -5995,24 +6017,14 @@ impl<'a> SelectedSymbolicProof<'a, '_> {
             target, body, source, cursor, &mut isolated, runtime, true, false, false,
         )?;
         if active || !isolated.records.is_empty() || !dependencies.is_empty()
-            || covers_all_partitioned_call_inputs(&returned, &domain, &mut work) != Some(true)
+            || covers_all_partitioned_call_inputs(&returned, &domain, work) != Some(true)
         {
             return Err(ProjectCheck::Unsupported);
         }
-        let checked = verify_partitioned_call_return(body, &returned, &domain, false, goal, Some(&mut work))
+        let checked = verify_partitioned_call_return(body, &returned, &domain, false, goal, Some(work))
             .ok_or(ProjectCheck::Unsupported)?;
         if !checked.applicable { return Err(ProjectCheck::Unsupported); }
-        if let Some(failure) = checked.failure {
-            self.record(case, function, source, effects.records.len(), failure, None)?;
-        } else if let Some(issuer) = group.issuer.as_ref().filter(|issuer| std::ptr::eq(issuer.body, body)) {
-            self.equalities.insert(VerifiedSymbolicSummary {
-                target, canonical_target: issuer.canonical_target, layout: issuer.layout, body: issuer.body,
-                result: summary, guards: VerifiedSymbolicGuards::Partitioned {
-                    guards: case.guard.comparisons.clone(), _dependency_definitions: dependencies,
-                },
-            });
-        }
-        Ok(Some(true))
+        Ok(Some((summary, checked.failure)))
     }
 
     fn verify_calling_producer(
@@ -7421,7 +7433,8 @@ impl<'a> MainFlowProofObserver<'a> {
         if scope != ScalarCheckerScope::CurrentPackage { return Ok(()); }
         self.qualified_catalog = true;
         if plan.target.0 >= startup_count || plan.proof_source != &plan.typed.target.source
-            || !matches!(&plan.typed.goal, TypedProofGoal::Literal { operator: BinaryOperator::Equal, .. })
+            || !matches!(&plan.typed.goal, TypedProofGoal::Literal { operator: BinaryOperator::Equal, .. }
+                | TypedProofGoal::EntryComparison { slot: 0, .. } | TypedProofGoal::EntryAffine { slot: 0, .. })
         {
             return Ok(());
         }
