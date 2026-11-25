@@ -114,6 +114,7 @@ pub struct PreparedScalarProject {
     checked_access: Option<CheckedAccessDeclarations>,
 
     require_release_checked_access: bool,
+    inline_arms: BTreeMap<super::anonymous_callable::PreparedInlineOwner, super::anonymous_callable::PreparedAnonymousCallable>,
 }
 
 pub(crate) struct CheckedAccessDeclarations {
@@ -309,6 +310,7 @@ impl PreparedScalarProject {
             validation.project.initialization_order.push(source);
             occurrence_typing.extend(typed);
         }
+        let inline_count = occurrence_typing.iter().map(PreparationOccurrenceTyping::anonymous_element_count).sum::<usize>();
         let project = validation.project;
         let calls = reference::resolve_project_call_sites_with_occurrences_for(
             &project.modules,
@@ -328,7 +330,37 @@ impl PreparedScalarProject {
                 kind: ProjectPreparationRejectionKind::StaticLookup(calls),
             });
         }
-        Ok(Self { project, calls, checked_access, require_release_checked_access })
+        let mut prepared = Self { project, calls, checked_access, require_release_checked_access, inline_arms: BTreeMap::new() };
+        if inline_count != 0 {
+            if isolated_anonymous_arm.is_some() {
+                return Err(ScalarProjectPreparationRejection::extraction_or_typing(ScalarProjectValidation {
+                    project: prepared.project,
+                    diagnostics: vec![Diagnostic { code: "B0003".into(), severity: crate::DiagnosticSeverity::Error,
+                        message: "nested inline callable lies outside the closed scalar pool".into(), labels: Vec::new(), notes: Vec::new() }],
+                }));
+            }
+            let arms = match super::anonymous_callable::collect_prepared_inline_arms(&prepared) {
+                Ok(arms) if arms.len() == inline_count => arms,
+                result => {
+                    let diagnostics = result.err().unwrap_or_else(|| vec![Diagnostic {
+                        code: "B0003".into(), severity: crate::DiagnosticSeverity::Error,
+                        message: "inline callable is outside its admitted direct lexical fixed array owner".into(),
+                        labels: Vec::new(), notes: Vec::new(),
+                    }]);
+                    return Err(ScalarProjectPreparationRejection::extraction_or_typing(ScalarProjectValidation {
+                        project: prepared.project, diagnostics,
+                    }));
+                }
+            };
+            prepared.inline_arms = arms;
+        }
+        Ok(prepared)
+    }
+
+    pub(crate) fn inline_arms(&self) -> impl Iterator<Item = (
+        super::anonymous_callable::PreparedInlineOwner, &super::anonymous_callable::PreparedAnonymousCallable
+    )> {
+        self.inline_arms.iter().map(|(owner, arm)| (*owner, arm))
     }
 
     fn access_diagnostic() -> crate::Diagnostic {

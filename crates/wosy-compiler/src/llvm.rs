@@ -1630,6 +1630,40 @@ fn emit_project_llvm<'a>(
             ));
         }
     }
+    let mut anonymous_definitions = Vec::new();
+    if let Some(build) = project_build {
+        let prepared = build.prepared();
+        let mut reachable = None;
+        let mut bound_owner: Option<((usize, usize), CallableBodyCallNodes<'_>)> = None;
+        for (owner, arm) in prepared.inline_arms() {
+            let reachable = reachable.get_or_insert_with(|| ordered_modules.iter().map(|&(module, _)| module)
+                .collect::<std::collections::HashSet<_>>());
+            if !reachable.contains(&owner.module) {
+                continue;
+            }
+            let owner_key = (owner.module, owner.item);
+            if bound_owner.as_ref().is_none_or(|(key, _)| *key != owner_key) {
+                let ScalarItem::Function(function) = &project.modules[owner.module].items[owner.item] else {
+                    return Err("private inline callable owner changed".into());
+                };
+                bound_owner = Some((owner_key, prepared.bind_callable_body_call_nodes(
+                    owner.module, owner.item, None, &function.body,
+                )?));
+            }
+            let nodes = &bound_owner.as_ref().expect("bound owner").1;
+            let value = crate::scalar::anonymous_callable::actual_inline_element(prepared, owner, nodes)?;
+            let name = format!("__wosy_private_inline_array_{}_{}_{}_{}_{}",
+                owner.module, owner.item, owner.block, owner.binding, owner.ordinal);
+            if functions.contains_key(&name) || module.get_function(&name).is_some()
+                || initializer_symbols.inline_array_arms.insert(std::ptr::from_ref(value), name.clone()).is_some()
+            { return Err("duplicate private inline callable".into()); }
+            let signature = &arm.function().signature;
+            let function = module.add_function(&name, function_type(&context, signature, target_layout)?, Some(Linkage::Private));
+            signatures.insert(name.clone(), signature.clone());
+            functions.insert(name.clone(), function);
+            anonymous_definitions.push((owner.module, name, arm));
+        }
+    }
     functions.insert(
         "main".into(),
         module.add_function("main", context.i32_type().fn_type(&[], false), None),
@@ -1679,6 +1713,15 @@ fn emit_project_llvm<'a>(
             }
         }),
     };
+    for (ordinal, name, arm) in &anonymous_definitions {
+        let nodes = arm.typed_nodes()?;
+        emit_function(
+            true, false, None, &context, &builder, &functions, &call_targets, &signatures,
+            &runtime_array_results, &dynamic_owner_outputs, &globals, arm.function(), arm.cfg(),
+            Some(&nodes), &initializer_symbols, name, &names.scopes[ordered_positions[*ordinal]],
+            &module, &all_structs, &layouts, target_layout,
+        )?;
+    }
     for (ordinal, source_module, function, cfg, name, item, arm, original) in definitions
         .iter()
         .map(|(ordinal, module, function, cfg, name, item, arm)| {

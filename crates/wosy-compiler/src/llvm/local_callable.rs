@@ -140,6 +140,13 @@ fn target<'ctx>(
     let symbol = (if allow_reader { state.closed_local_callable_symbol(expression) }
         else { state.closed_local_scalar_callable_symbol(expression) })
         .ok_or_else(|| "local callable slot requires a proved direct scalar target".to_owned())?;
+    target_pointer(state, symbol, parameters, outputs)
+}
+
+fn target_pointer<'ctx>(
+    state: &EmitState<'ctx, '_>, symbol: &str,
+    parameters: &[ScalarType], outputs: &crate::ScalarOutputSequence,
+) -> Result<PointerValue<'ctx>, String> {
     let definition = state.functions.get(symbol).ok_or_else(|| state.missing_prepared_signature(symbol))?;
     let (actual_parameters, actual_outputs) = state.signatures.get(symbol).and_then(signature)
         .ok_or_else(|| state.missing_prepared_signature(symbol))?;
@@ -166,8 +173,15 @@ pub(super) fn binding_value<'ctx, 'module>(
             return Err("fixed callable array literal count differs from its extent".into());
         }
         let (parameters, outputs) = scalar_only_signature(element).ok_or("invalid fixed callable array signature")?;
-        let resolved = elements.iter().map(|expression| target(state, expression, parameters, outputs, false))
-            .collect::<Result<Vec<_>, _>>()?;
+        let resolved = elements.iter().map(|expression| {
+            if matches!(expression, ScalarExpression::AnonymousCallable { .. }) {
+                let symbol = state.inline_array_arm_symbol(expression)
+                    .ok_or("unprepared inline callable array element")?;
+                target_pointer(state, symbol, parameters, outputs)
+            } else {
+                target(state, expression, parameters, outputs, false)
+            }
+        }).collect::<Result<Vec<_>, _>>()?;
         let array = context.ptr_type(AddressSpace::default()).const_array(&resolved);
         return Ok(Some(EmitValue::Basic(array.into())));
     }

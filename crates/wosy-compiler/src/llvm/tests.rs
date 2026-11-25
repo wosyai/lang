@@ -18649,3 +18649,75 @@ u8(u64) observe = fn(index) {
         assert_eq!(emit_scalar_build_project_llvm(&checked).unwrap().to_text(), ir);
     }
 }
+
+#[test]
+fn inline_fixed_callable_arrays_use_private_checked_selected_targets() {
+    let text = "%%start
+u8() named = fn { 7 };
+u8(u64) observe = fn(index) {
+    u8()[2] ops = [fn() { 11 }, fn() { 33 }];
+    u8() saved = ops[index];
+    ops[index] = named;
+    u8 original = saved();
+    u8() after = ops[index];
+    original + after()
+};
+u8(u64) mixed = fn(index) {
+    u8()[2] ops = [named, fn() { 44 }];
+    u8() selected = ops[index];
+    selected()
+};
+if (observe(0) != 18 || observe(1) != 40 || mixed(0) != 7 || mixed(1) != 44) {
+    core.system_panic();
+};
+%%end";
+    for target in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let source = SourceIdentity::new("project".into(), "package".into(), "src/inline-array.w".into(), "r1".into());
+        let parse = |text: &str| {
+            let parsed = parse_source(source.clone(), text.to_owned(), &[]);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            crate::prepare_scalar_project_with_access(
+                vec![(derive_scalar_declarations_from_cst(parsed.result.canonical_cst()), Vec::new())],
+                vec![source.clone()], ScalarPreparationInputs { target_layout: target },
+                Some(wosy_stdlib_source::CheckedAccessComponent::linked()),
+            )
+        };
+        let prepared = parse(text).unwrap_or_else(|e| panic!("{:?}", e.diagnostics));
+        let checked = analyze_scalar_build(&prepared);
+        assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+        let ir = emit_scalar_build_project_llvm(&checked).unwrap().to_text();
+        let private = "define private i8 @__wosy_private_inline_array_";
+        let bodies = ir.split(private).skip(1).map(|body| body.split_once("\n}").unwrap().0).collect::<Vec<_>>();
+        assert_eq!(bodies.len(), 3, "{ir}");
+        for value in [11, 33, 44] {
+            assert_eq!(bodies.iter().filter(|body| body.contains(&format!("ret i8 {value}"))).count(), 1, "{ir}");
+        }
+        let helpers = prepared.checked_access().unwrap();
+        let bounds = format!("call void @{}(", project_function_name(&helpers.source, &helpers.in_extent));
+        for (name, count) in [("observe", 3), ("mixed", 1)] {
+            let body = self_tail_test_body(&ir, "i8", &project_function_name(&source, name));
+            assert_eq!(body.matches(&bounds).count(), count, "{body}");
+            assert_eq!(body.matches("getelementptr inbounds [2 x ptr]").count(), count, "{body}");
+            for (prefix, gep) in body.split("getelementptr inbounds [2 x ptr]").zip(body.split("getelementptr inbounds [2 x ptr]").skip(1)) {
+                assert_eq!(prefix.matches(&bounds).count(), 1, "{prefix}");
+                let check = prefix.split_once(&bounds).unwrap().1.lines().next().unwrap();
+                let selector = check.strip_prefix("i64 ").unwrap().strip_suffix(", i64 2)").unwrap();
+                let index = if target == ScalarTargetLayout::WASM32 {
+                    let trunc = format!(" = trunc i64 {selector} to i32");
+                    assert!(!prefix.split_once(&bounds).unwrap().0.contains(&trunc), "{prefix}");
+                    format!("i32 {}", prefix.lines().find_map(|line| line.trim().strip_suffix(&trunc)).unwrap())
+                } else { format!("i64 {selector}") };
+                assert!(gep.lines().next().unwrap().ends_with(&index), "{gep}");
+            }
+        }
+        let captures = text.replace("    u8()[2] ops = [fn() { 11 }", "    u8()[2] ops = [fn() { index }");
+        let error = parse(&captures).err().expect("capture cannot create a private arm");
+        assert!(error.diagnostics.iter().any(|diagnostic| diagnostic.code == "B0001"), "{:?}", error.diagnostics);
+        if let Some(out) = std::env::var_os("WOSY_DEV4_INLINE_CALLABLE_IR_DIR") {
+            let target = if target == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
+            let controlled = ir.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);
+            assert_ne!(controlled, ir);
+            std::fs::write(std::path::PathBuf::from(out).join(format!("{target}-inline-callable.ll")), controlled).unwrap();
+        }
+    }
+}

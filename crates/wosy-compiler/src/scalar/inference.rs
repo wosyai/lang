@@ -88,6 +88,7 @@ pub(super) struct PreparationOccurrenceTyping {
     value_fields: HashMap<*const ScalarExpression, ScalarStructFieldId>,
     folded_expressions: HashMap<*const ScalarExpression, FoldedOccurrence>,
     needs_checked_access: bool,
+    anonymous_element_count: usize,
     places: HashMap<*const ScalarPlace, ScalarType>,
     resolved_namespace_places: HashMap<*const ScalarPlace, SourceIdentity>,
 }
@@ -105,6 +106,10 @@ pub(super) enum CheckedMember {
 }
 
 impl PreparationOccurrenceTyping {
+    pub(super) fn anonymous_element_count(&self) -> usize {
+        self.anonymous_element_count
+    }
+
     pub(super) fn take_copy_struct_literal(&mut self, value: &ScalarExpression) -> bool {
         self.copy_struct_literals.remove(&std::ptr::from_ref(value))
     }
@@ -258,6 +263,7 @@ impl<'a> ScalarInferenceBuilder<'a> {
         self.anonymous_element_sites.extend(elements.iter()
             .filter(|item| matches!(item, ScalarExpression::AnonymousCallable { .. }))
             .map(std::ptr::from_ref));
+        self.occurrences.anonymous_element_count = self.anonymous_element_sites.len();
     }
 
     pub(super) fn is_nominated_inline_element(&self, expression: &ScalarExpression) -> bool {

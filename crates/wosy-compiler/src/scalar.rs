@@ -2614,19 +2614,13 @@ pub fn derive_scalar_program_from_cst(canonical: &CanonicalCstRoot) -> ScalarVal
 pub fn derive_scalar_declarations_from_cst(
     canonical: &CanonicalCstRoot,
 ) -> ScalarSourceDeclarations {
-    derive_scalar_declarations_with_inline_analysis(canonical, false)
-}
-
-fn derive_scalar_declarations_with_inline_analysis(
-    canonical: &CanonicalCstRoot, inspect_inline: bool,
-) -> ScalarSourceDeclarations {
     let mut items = Vec::new();
     let source_root = canonical.root.children().find(|node| node.kind() == SyntaxKind::Root);
     let mut struct_prefix = Vec::new();
     let mut enum_prefix = Vec::new();
     let mut struct_descendants = Vec::new();
     let mut enum_descendants = Vec::new();
-    let (diagnostics, invalid_projection) = collect_scalar_diagnostics(canonical, inspect_inline, |node| {
+    let (diagnostics, invalid_projection) = collect_scalar_diagnostics(canonical, |node| {
         let Some(root) = source_root.as_ref() else { return };
         let (prefix, descendants) = match node.kind() {
             SyntaxKind::StructDecl => (&mut struct_prefix, &mut struct_descendants),
@@ -2786,7 +2780,7 @@ pub fn derive_scalar_program_from_cst_with_layout(
     }
 }
 
-mod anonymous_callable;
+pub(crate) mod anonymous_callable;
 mod declarations;
 use declarations::ScalarDeclarationEnvironment;
 mod inference;
@@ -2816,12 +2810,11 @@ use typecheck::{
 };
 use typecheck::{split_module_typing, ScalarModuleTyping, ScalarProgramTyping};
 pub fn derive_scalar_diagnostics_from_cst(canonical: &CanonicalCstRoot) -> Vec<super::Diagnostic> {
-    collect_scalar_diagnostics(canonical, false, |_| {}).0
+    collect_scalar_diagnostics(canonical, |_| {}).0
 }
 
 fn collect_scalar_diagnostics(
     canonical: &CanonicalCstRoot,
-    inspect_inline: bool,
     mut record_declaration: impl FnMut(CstNode),
 ) -> (Vec<Diagnostic>, bool) {
     let [mut strings, mut chars, mut integers, mut floats, mut lengths, mut projections] =
@@ -2883,14 +2876,12 @@ fn collect_scalar_diagnostics(
             }
             NodeOrToken::Node(node)
                 if node.kind() == SyntaxKind::InvalidTemporaryPlace
-                    || (!inspect_inline && node.kind() == SyntaxKind::CallableLiteral)
                     || (node.kind() == SyntaxKind::ValueField
                         && node.children().any(|child| child.kind() == SyntaxKind::IndexSuffix)) =>
             {
                 let message = if node.kind() == SyntaxKind::InvalidTemporaryPlace {
                     "a field of a temporary is not an assignable or borrowable place"
-                } else if node.kind() == SyntaxKind::CallableLiteral {
-                    "inline callable array elements are not available for Build yet"
+
                 } else {
                     "an indexed call result field is not supported"
                 };

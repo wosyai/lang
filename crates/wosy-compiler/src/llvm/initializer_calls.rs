@@ -14,6 +14,7 @@ pub(super) struct InitializerSymbols<'input> {
     functions: HashMap<SourceIdentity, HashMap<ByteSpan, FunctionSymbol<'input>>>,
     externs: HashMap<SourceSpan, String>,
     callable_bindings: std::collections::HashSet<SourceSpan>,
+    pub(super) inline_array_arms: HashMap<*const ScalarExpression, String>,
 }
 
 impl<'input> InitializerSymbols<'input> {
@@ -350,6 +351,10 @@ impl<'ctx, 'module> EmitState<'ctx, 'module> {
                 .map(String::as_str)
                 .ok_or_else(|| format!("missing closed aggregate selected definition {base}")),
         }
+    }
+
+    pub(super) fn inline_array_arm_symbol(&self, expression: &ScalarExpression) -> Option<&str> {
+        self.symbols().inline_array_arms.get(&std::ptr::from_ref(expression)).map(String::as_str)
     }
 
     pub(super) fn closed_local_callable_symbol(&self, expression: &ScalarExpression) -> Option<&str> {

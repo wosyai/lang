@@ -1,4 +1,4 @@
-//! Private semantic prerequisite. No ordinary Build path consumes the pool.
+//! Closed inline callable bodies for direct prepared fixed-array owners.
 #![allow(dead_code)]
 
 use super::*;
@@ -18,23 +18,23 @@ struct AnonymousCallablePool {
     arms: HashMap<AnonymousCallableSite, PreparedAnonymousCallable>,
 }
 
-struct PreparedAnonymousCallable {
+pub(crate) struct PreparedAnonymousCallable {
     prepared: PreparedScalarProject,
     results: reference::ProjectReferenceResults,
 }
 
 impl PreparedAnonymousCallable {
-    fn function(&self) -> &ScalarFunction {
+    pub(crate) fn function(&self) -> &ScalarFunction {
         let ScalarItem::Function(function) = &self.prepared.project().modules[0].items[0]
             else { unreachable!("isolated callable row") };
         function
     }
 
-    fn cfg(&self) -> &ScalarReferenceCfg {
+    pub(crate) fn cfg(&self) -> &ScalarReferenceCfg {
         self.results.reference_cfg(0, 0, None).expect("isolated callable CFG")
     }
 
-    fn typed_nodes(&self) -> Result<control::CallableBodyCallNodes<'_>, String> {
+    pub(crate) fn typed_nodes(&self) -> Result<control::CallableBodyCallNodes<'_>, String> {
         self.prepared.bind_callable_body_call_nodes(0, 0, None, &self.function().body)
     }
 }
@@ -61,20 +61,20 @@ pub(super) fn candidate_fixed_elements(binding: &ScalarBinding) -> Option<&[Scal
     Some(elements)
 }
 
-#[derive(Debug, Eq, Hash, PartialEq)]
-struct PreparedInlineOwner {
-    module: usize,
-    item: usize,
-    block: usize,
-    binding: usize,
-    ordinal: usize,
-    rank: usize,
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) struct PreparedInlineOwner {
+    pub(crate) module: usize,
+    pub(crate) item: usize,
+    pub(crate) block: usize,
+    pub(crate) binding: usize,
+    pub(crate) ordinal: usize,
+    pub(crate) rank: usize,
 }
 
 struct OwnerTiedAnonymousPool {
     outer: PreparedScalarProject,
     outer_references: reference::ProjectReferenceResults,
-    arms: HashMap<PreparedInlineOwner, PreparedAnonymousCallable>,
+    arms: BTreeMap<PreparedInlineOwner, PreparedAnonymousCallable>,
 }
 
 impl OwnerTiedAnonymousPool {
@@ -94,7 +94,7 @@ impl OwnerTiedAnonymousPool {
 fn prepare_owner_tied_pool(
     canonical: &CanonicalCstRoot, target: ScalarTargetLayout,
 ) -> Result<OwnerTiedAnonymousPool, Vec<Diagnostic>> {
-    let declarations = derive_scalar_declarations_with_inline_analysis(canonical, true);
+    let declarations = derive_scalar_declarations_from_cst(canonical);
     if !declarations.diagnostics.is_empty() { return Err(declarations.diagnostics); }
     let source = declarations.source;
     let mut module = ScalarModule::new(source.clone(), declarations.items, Vec::new());
@@ -106,41 +106,71 @@ fn prepare_owner_tied_pool(
     let checked = analyze_scalar_build(&outer);
     if !checked.diagnostics().is_empty() { return Err(checked.diagnostics().to_vec()); }
     let outer_references = checked.into_reference_results();
-    let mut arms = HashMap::new();
-    for (module, actual) in outer.project().modules.iter().enumerate() {
-        for (item, value) in actual.items.iter().enumerate() {
-            let ScalarItem::Function(fun) = value else { continue; };
-            let candidates = fun.body.items.iter().filter_map(|item| match item {
-                ScalarBlockItem::LocalBinding(binding) => candidate_fixed_elements(binding).map(|elements| (binding, elements)),
-                _ => None,
-            }).collect::<Vec<_>>();
-            if candidates.is_empty() { continue; }
-            let nodes = outer.bind_callable_body_call_nodes(module, item, None, &fun.body)
-                .map_err(|_| vec![arm_diagnostic(&source, fun.span, "missing prepared inline callable owner")])?;
-            for (binding, values) in candidates {
-                let (block, position) = nodes.binding_position(binding)
-                    .ok_or_else(|| vec![arm_diagnostic(&source, binding.span, "missing prepared inline callable binding")])?;
-                let ScalarType::Array { element, .. } = &binding.declared_type else { unreachable!("typed fixed array"); };
-                for (rank, value) in values.iter().enumerate() {
-                    if !matches!(value, ScalarExpression::AnonymousCallable { .. }) { continue; }
-                    let ordinal = nodes.expression_ordinal(value)
-                        .filter(|_| nodes.checked_expression_type(value) == Some(element.as_ref()))
-                        .ok_or_else(|| vec![arm_diagnostic(&source, expression_span(value), "missing actual typed inline callable element")])?;
-                    let key = PreparedInlineOwner { module, item, block, binding: position, ordinal, rank };
-                    let arm = check_isolated_arm(&source, value.clone(), element.as_ref().clone(), target)?;
-                    if arms.insert(key, arm).is_some() {
-                        return Err(vec![arm_diagnostic(&source, expression_span(value), "duplicate prepared inline callable element")]);
-                    }
-                }
-            }
-        }
-    }
+    let arms = collect_prepared_inline_arms(&outer)?;
     // The analysis-only entry is not a general collector or a Build mode.
     let authored_count = canonical.root.descendants().filter(|node| node.kind() == SyntaxKind::CallableLiteral).count();
     if arms.len() != authored_count {
         return Err(vec![diagnostic(&source, &canonical.root, "inline callable is outside the admitted direct lexical array owner")]);
     }
     Ok(OwnerTiedAnonymousPool { outer, outer_references, arms })
+}
+
+pub(crate) fn actual_inline_element<'a>(
+    outer: &'a PreparedScalarProject,
+    owner: PreparedInlineOwner,
+    nodes: &control::CallableBodyCallNodes<'a>,
+) -> Result<&'a ScalarExpression, String> {
+    let ScalarItem::Function(fun) = &outer.project().modules[owner.module].items[owner.item]
+        else { return Err("inline owner changed its function".into()); };
+    let ScalarBlockItem::LocalBinding(binding) = fun.body.items.get(owner.binding)
+        .ok_or("inline owner lost its binding")? else { return Err("inline owner changed its binding kind".into()); };
+    let value = candidate_fixed_elements(binding).and_then(|values| values.get(owner.rank))
+        .ok_or("inline owner lost its element rank")?;
+    if nodes.binding_position(binding) != Some((owner.block, owner.binding))
+        || nodes.expression_ordinal(value) != Some(owner.ordinal)
+        || !matches!(value, ScalarExpression::AnonymousCallable { .. })
+    {
+        return Err("inline callable no longer belongs to its exact prepared owner".into());
+    }
+    Ok(value)
+}
+
+pub(super) fn collect_prepared_inline_arms(
+    outer: &PreparedScalarProject,
+) -> Result<BTreeMap<PreparedInlineOwner, PreparedAnonymousCallable>, Vec<Diagnostic>> {
+    let mut arms = BTreeMap::new();
+    for (module, actual) in outer.project().modules.iter().enumerate() {
+        for (item, value) in actual.items.iter().enumerate() {
+            let ScalarItem::Function(fun) = value else { continue; };
+            if !fun.generic_parameters.is_empty() || !fun.overload_arms.is_empty() { continue; }
+            let source = &actual.source;
+            let target = actual.target_layout;
+            let candidates = fun.body.items.iter().filter_map(|item| match item {
+                ScalarBlockItem::LocalBinding(binding) => candidate_fixed_elements(binding).map(|elements| (binding, elements)),
+                _ => None,
+            }).collect::<Vec<_>>();
+            if candidates.is_empty() { continue; }
+            let nodes = outer.bind_callable_body_call_nodes(module, item, None, &fun.body)
+                .map_err(|_| vec![arm_diagnostic(source, fun.span, "missing prepared inline callable owner")])?;
+            for (binding, values) in candidates {
+                let (block, position) = nodes.binding_position(binding)
+                    .ok_or_else(|| vec![arm_diagnostic(source, binding.span, "missing prepared inline callable binding")])?;
+                let ScalarType::Array { element, .. } = &binding.declared_type else { unreachable!("typed fixed array"); };
+                for (rank, value) in values.iter().enumerate() {
+                    if !matches!(value, ScalarExpression::AnonymousCallable { .. }) { continue; }
+                    let ordinal = nodes.expression_ordinal(value)
+                        .filter(|_| nodes.checked_expression_type(value) == Some(element.as_ref()))
+                        .ok_or_else(|| vec![arm_diagnostic(source, expression_span(value), "missing actual typed inline callable element")])?;
+                    let key = PreparedInlineOwner { module, item, block, binding: position, ordinal, rank };
+                    let arm = check_isolated_arm(source, value.clone(), element.as_ref().clone(), target)?;
+                    if arms.insert(key, arm).is_some() {
+                        return Err(vec![arm_diagnostic(source, expression_span(value), "duplicate prepared inline callable element")]);
+                    }
+                }
+            }
+        }
+    }
+    Ok(arms)
 }
 
 fn diagnostic(source: &SourceIdentity, at: &CstNode, message: &str) -> Diagnostic {
@@ -264,8 +294,7 @@ fn anonymous_fixed_list_is_prepared_without_inheriting_authored_scope() {
         let parsed = crate::parse_source(source, text.into(), &[]);
         assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
         let canonical = parsed.result.canonical_cst();
-        assert!(derive_scalar_declarations_from_cst(canonical).diagnostics.iter().any(|diagnostic|
-            diagnostic.message == "inline callable array elements are not available for Build yet"));
+        assert!(derive_scalar_declarations_from_cst(canonical).diagnostics.is_empty());
         prepare_anonymous_pool(canonical, layout)
     }
     let ordinary = "%%start
@@ -345,7 +374,7 @@ unit() owner = fn {
         assert!(pool.arm_for(0, 0, first, 0).is_none()); // other function
         assert!(pool.arm_for(0, 1, &first.clone(), 0).is_none()); // same source metadata, wrong actual node
         assert!(pool.arm_for(0, 1, first, 2).is_none()); // wrong rank
-        let diagnostics = derive_scalar_declarations_from_cst(canonical).diagnostics;
-        assert_eq!(diagnostics.iter().filter(|d| d.message == "inline callable array elements are not available for Build yet").count(), 3);
+        assert!(derive_scalar_declarations_from_cst(canonical).diagnostics.is_empty());
+        assert_eq!(pool.outer.inline_arms().count(), 3);
     }
 }
