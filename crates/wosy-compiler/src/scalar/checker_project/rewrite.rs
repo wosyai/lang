@@ -34,6 +34,22 @@ impl<'a> Goal<'a> {
         Self { operator, terms: [Term::Output, Term::Literal(Cow::Borrowed(bound))] }
     }
 
+    /// Evaluate a normalized one-hole goal when the actual output is known
+    /// and no entry-dependent term was admitted by the caller.
+    pub(super) fn accepts_literal_output(&self, output: &BigInt) -> Result<bool, ProjectCheck> {
+        fn value<'term>(term: &'term Term<'_>, output: &'term BigInt) -> Option<&'term BigInt> {
+            match term {
+                Term::Output => Some(output),
+                Term::Literal(value) => Some(value.as_ref()),
+                Term::Entry { .. } => None,
+            }
+        }
+        let left = value(&self.terms[0], output).ok_or(ProjectCheck::Unsupported)?;
+        let right = value(&self.terms[1], output).ok_or(ProjectCheck::Unsupported)?;
+        let relation = IntegerRelation::from_operator(self.operator).ok_or(ProjectCheck::Unsupported)?;
+        Ok(relation.accepts(left.cmp(right)))
+    }
+
     pub(super) fn apply(
         &mut self, equality: &'a ScalarExpression, context: &'a ScalarExpression,
         output: &str, ty: &ScalarType, unary_entry: Option<&str>,

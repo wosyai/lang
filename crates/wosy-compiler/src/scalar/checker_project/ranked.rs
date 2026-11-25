@@ -400,21 +400,49 @@ pub(super) fn verify<'a>(
             has_base = true;
             charge(&mut work, proof.items.len())?;
             let mut rejected = None;
+            let mut rewritten = None;
+            let mut literal_equality_shown = false;
+            let equality = IntegerRelation::from_operator(&BinaryOperator::Equal).ok_or(ProjectCheck::Unsupported)?;
             for (item, &terminated) in proof.items.iter().zip(&proof.terminated_items) {
+                if let Some((premise, context)) = rewrite::arguments(item) {
+                    // A matcher visits only the two typed terms and the single
+                    // hole in a bounded binary equality/comparison.
+                    charge(&mut work, 6)?;
+                    if !terminated { return Err(ProjectCheck::Unsupported); }
+                    // A prior refutation is already the first failed step.
+                    // It is not a premise and we must not derive past it.
+                    if rejected.is_some() && path.reachable() { break; }
+                    let TypedProofGoal::Literal { operator, bound, .. } = &typed.goal else {
+                        return Err(ProjectCheck::Unsupported);
+                    };
+                    let goal = rewritten.get_or_insert_with(|| rewrite::Goal::new(operator, bound));
+                    goal.apply(premise, context, &typed.output, typed.result_type, None, |premise| {
+                        Ok(matches!(premise, rewrite::Premise::Literal(shown) if literal_equality_shown && shown == value))
+                    })?;
+                    continue;
+                }
                 let claim = IntegerComparison::from_expression(proof_show_expression(item, terminated)?)
                     .ok_or(ProjectCheck::Unsupported)?;
                 let (_, relation, bound) = checked_literal_output_goal_borrowed(
                     claim, &typed.output, &typed.input_names, typed.result_type,
                 )?;
-                if rejected.is_none() && !relation.accepts(value.cmp(&bound)) {
+                if relation.accepts(value.cmp(&bound)) {
+                    literal_equality_shown |= relation == equality;
+                } else if rejected.is_none() {
                     let ScalarBlockItem::Expression(show) = item else { return Err(ProjectCheck::Unsupported); };
                     rejected = Some(RankedBaseRejection::AuthoredShow(expression_span(show)));
                 }
             }
             if failure.is_none() && path.reachable() {
-                if rejected.is_none() && !relation.accepts(value.cmp(bound)) {
-                    let goal = child(&child(plan.proof, SyntaxKind::ProofEnsures)?, SyntaxKind::Expression)?;
-                    rejected = Some(RankedBaseRejection::Goal(wosy_syntax::byte_span(&goal)));
+                if rejected.is_none() {
+                    let accepted = match rewritten {
+                        Some(goal) => goal.accepts_literal_output(value)?,
+                        None => relation.accepts(value.cmp(bound)),
+                    };
+                    if !accepted {
+                        let goal = child(&child(plan.proof, SyntaxKind::ProofEnsures)?, SyntaxKind::Expression)?;
+                        rejected = Some(RankedBaseRejection::Goal(wosy_syntax::byte_span(&goal)));
+                    }
                 }
                 let Some(rejected) = rejected else { continue; };
                 let entry = match path {

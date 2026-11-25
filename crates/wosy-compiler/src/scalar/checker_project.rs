@@ -17959,6 +17959,73 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
 
     #[cfg(feature = "internal-checker")]
     #[test]
+    fn ordered_ranked_base_rewrites_require_prior_real_equalities() {
+        let app = source("src/main.w", "ordered-ranked-base-rewrites");
+        let program = r#"%%start
+            u8(ENTRY) descend = fn(value) { if (value <= BASE) { 4 } else { descend(value - STEP) } };
+            proof rank for descend(entry) -> (out)
+                where (entry >= ZERO && entry <= LIMIT) ensures (out < 5) decreases (entry) {
+                if (entry <= BASE) {
+                    core.show(out == 4);
+                    core.rewrite(out == 4, _ < 5);
+                } else {
+                    core.use(rank(entry - STEP));
+                }
+            }
+        %%end"#;
+        let run = |text: &str, scope| {
+            let (_, proof) = crate::parse_proof_source(app.clone(), text.to_owned(), &[]).ok().unwrap();
+            check_loaded_scalar_ordered_local_proof_contexts(
+                Vec::new(), [(proof, Vec::new())], vec![app.clone()], inputs(), scope, Vec::new(),
+            )
+        };
+        let package = ScalarCheckerScope::CurrentPackage;
+        for (ty, zero, base, step, limit) in [
+            ("u8", "0", "0", "1", "8"),
+            ("f32", "0.0", "1.0", "1.0", "1024.0"),
+            ("f64", "0.0", "1.0", "1.0", "1024.0"),
+        ] {
+            let text = program.replace("ENTRY", ty).replace("ZERO", zero).replace("BASE", base)
+                .replace("STEP", step).replace("LIMIT", limit);
+            let rewrite = "core.rewrite(out == 4, _ < 5);";
+            let checked = run(&text, package).unwrap();
+            assert!(checked.active && checked.directives.is_empty() && checked.symbolic_diagnostic.is_none());
+            let reversed = text.replace(rewrite, "core.rewrite(4 == out, _ < 5); core.rewrite(out == 4, _ < 5);");
+            assert!(run(&reversed, package).unwrap().symbolic_diagnostic.is_none());
+
+            let false_goal = text.replace("out < 5", "out < 4").replace("_ < 5", "_ < 4");
+            let rejected = run(&false_goal, package).unwrap().symbolic_diagnostic.unwrap();
+            assert_eq!(rejected.returned, BigInt::from(4));
+            assert!(rejected.failed_step.is_none());
+            assert_eq!(&false_goal[rejected.goal.range.start as usize..rejected.goal.range.end as usize], "out < 4");
+            match (ty, rejected.ieee_entry) {
+                ("u8", None) => {}
+                ("f32", Some(entry)) => assert_eq!(entry.value, ScalarCheckerIeeeValue::F32((-0.0f32).to_bits())),
+                ("f64", Some(entry)) => assert_eq!(entry.value, ScalarCheckerIeeeValue::F64((-0.0f64).to_bits())),
+                _ => panic!("typed IEEE witness"),
+            }
+            let false_show = text.replace("core.show(out == 4);", "core.show(out == 5);");
+            let rejected = run(&false_show, package).unwrap().symbolic_diagnostic.unwrap();
+            let first = rejected.failed_step.unwrap();
+            assert_eq!(first.source, app);
+            assert_eq!(&false_show[first.range.start as usize..first.range.end as usize], "core.show(out == 5)");
+            let idle = run(&false_goal, ScalarCheckerScope::MainFlowOnly).unwrap();
+            assert!(!idle.active && idle.symbolic_diagnostic.is_none());
+            for invalid in [
+                text.replace("core.show(out == 4);", "core.show(out <= 4);"),
+                text.replace("core.show(out == 4);", "").replace(rewrite, &format!("{rewrite} core.show(out == 4);")),
+                text.replace("_ < 5", "_ < _"),
+                text.replace("_ < 5", "_ < 6"),
+                text.replace("out == 4, _ < 5", "out == 5, _ < 5"),
+                text.replace(rewrite, "").replace("core.use(rank", &format!("{rewrite} core.use(rank")),
+            ] {
+                assert!(run(&invalid, package).is_err(), "must refuse {invalid}");
+            }
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
     fn ordered_ranked_leaves_check_each_authored_step_without_assuming_the_result() {
         let app = source("src/main.w", "ordered-ranked-leaf-steps");
         let program = r#"%%start
