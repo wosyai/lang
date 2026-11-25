@@ -141,6 +141,34 @@ mod tests {
     }
 
     #[test]
+    fn standard_allocator_checks_portable_bounds_before_backing_requests() {
+        for output in ["native", "wasm-wasip1", "wasm-wasip2", "wasm-web"] {
+            let runtime = core_runtime("llvm", output).unwrap();
+            let (_, allocator) = runtime.split_once("define ptr @__wosy_core_alloc(i64 %size, i64 %alignment) {")
+                .expect("standard allocator");
+            let (allocator, _) = allocator.split_once("\n}").expect("allocator end");
+            let (entry, rest) = allocator.split_once(if output == "native" { "\nsize_padding:" } else { "\nprepare:" })
+                .expect("allocation validation before backing");
+            for guard in [
+                "%size_fits = icmp ule i64 %size, 4294967295",
+                "%alignment_fits = icmp ule i64 %alignment, 2147483648",
+                "%range_valid = and i1 %size_fits, %alignment_fits",
+                "%valid = and i1 %range_valid, %alignment_valid",
+            ] {
+                assert!(entry.contains(guard), "{output}: {entry}");
+            }
+            assert!(entry.contains(if output == "native" {
+                "br i1 %valid, label %size_padding, label %failure"
+            } else {
+                "br i1 %valid, label %prepare, label %failure"
+            }));
+            assert!(!entry.contains("call "), "{output}: {entry}");
+            assert!(rest.contains("failure:\n  ret ptr null"));
+            assert!(rest.contains(if output == "native" { "call ptr @malloc" } else { "call i32 @llvm.wasm.memory.grow.i32" }));
+        }
+    }
+
+    #[test]
     fn reports_unsupported_runtime_target() {
         assert_eq!(
             core_runtime("custom", "artifact"),

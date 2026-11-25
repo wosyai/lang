@@ -5,13 +5,18 @@ declare { i64, i1 } @llvm.uadd.with.overflow.i64(i64, i64)
 
 define ptr @__wosy_core_alloc(i64 %size, i64 %alignment) {
 entry:
+  %size_fits = icmp ule i64 %size, 4294967295
+  %alignment_fits = icmp ule i64 %alignment, 2147483648
+  %range_valid = and i1 %size_fits, %alignment_fits
   %alignment_is_zero = icmp eq i64 %alignment, 0
   %alignment_minus_one = sub i64 %alignment, 1
   %alignment_power_mask = and i64 %alignment, %alignment_minus_one
   %alignment_is_power_of_two = icmp eq i64 %alignment_power_mask, 0
   %alignment_is_not_power_of_two = xor i1 %alignment_is_power_of_two, true
   %alignment_is_invalid = or i1 %alignment_is_zero, %alignment_is_not_power_of_two
-  br i1 %alignment_is_invalid, label %failure, label %size_padding
+  %alignment_valid = xor i1 %alignment_is_invalid, true
+  %valid = and i1 %range_valid, %alignment_valid
+  br i1 %valid, label %size_padding, label %failure
 
 size_padding:
   %size_with_alignment = call { i64, i1 } @llvm.uadd.with.overflow.i64(i64 %size, i64 %alignment_minus_one)
