@@ -1384,10 +1384,24 @@ pub(super) fn bind_guarded_scalar<'ctx>(
             .map_err(builder_error)?.into_pointer_value();
         let extent = state.builder.build_extract_value(result, 1, "guarded_array_extent")
             .map_err(builder_error)?.into_int_value();
+        let signed = (|| {
+            let Some((target, producer_element)) = state.aggregate.as_ref().and_then(|aggregate|
+                state.body_call_nodes.and_then(|nodes| nodes.expression_ordinal(&binding.value))
+                    .and_then(|ordinal| aggregate.plan().signed_array_descriptor_calls.get(&ordinal)))
+            else { return Ok(None); };
+            let ScalarType::RuntimeArray { element, .. } = &receiver.ty else {
+                return Err("signed private descriptor receiver is not a runtime array");
+            };
+            if *target != state.target_layout || producer_element != element.as_ref() {
+                return Err("signed private descriptor differs from its source element or target");
+            }
+            memory::SignedRuntimeAddressDomain::for_construction(*target, producer_element)
+                .map(Some).map_err(|_| "invalid source-established private descriptor address domain")
+        })()?;
         let present = state.builder.build_is_not_null(backing, "fallible.present").map_err(builder_error)?;
         state.storage.insert(receiver.name.clone(), (backing, receiver.ty.clone()));
         return enroll_guarded_owner(context, state, index, GuardedScalarOwner {
-            backing, present, runtime_extent: Some(extent), signed: None, live_slot: None,
+            backing, present, runtime_extent: Some(extent), signed, live_slot: None,
         });
     }
     let runtime_layout = match (&receiver.ty, sites.sites[index].runtime_literal_length) {

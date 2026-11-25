@@ -3073,6 +3073,8 @@ pub(crate) struct ClosedBody {
     pub(crate) guarded_array_descriptor_forward: Option<usize>,
     pub(crate) guarded_array_descriptor_producer_choice: Option<usize>,
     pub(crate) guarded_array_descriptor_choices: BTreeSet<usize>,
+    pub(crate) signed_array_descriptor_result: Option<(ScalarTargetLayout, ScalarType)>,
+    pub(crate) signed_array_descriptor_calls: HashMap<usize, (ScalarTargetLayout, ScalarType)>,
     pub(crate) widened_join_arms: BTreeMap<usize, ByteSpan>,
     pub(crate) widened_fixed_copies: BTreeMap<(u32, u32), (ByteSpan, u64)>,
     pub(crate) widened_join_replacements: BTreeMap<usize, (usize, CfgPointId, ByteSpan)>,
@@ -7375,7 +7377,18 @@ fn closed_aggregates<'a>(
                 receipt: OriginalArrayReceipt { origin: allocation.bind, allocation: (allocation.position.block.0, allocation.position.item) },
                 length_occurrence: allocation.length_occurrence.0, extent: allocation.extent, output: occurrence.0,
             };
-            return (allocation.extent == FreshArrayExtent::Formal).then_some((GuardedArrayRoute::Fresh(route), Vec::new(), &output.ty));
+            let signed = (|| {
+                if allocation.position.block != sites.structure.root { return None; }
+                let ScalarBlockItem::LocalBinding(binding) = function.body.items.get(allocation.position.item)? else { return None; };
+                let [receiver] = binding.receivers.as_slice() else { return None; };
+                let CfgPointKind::Bind { binding: identity } = &cfg.points.get(allocation.bind.0)?.kind else { return None; };
+                if !binding.is_allocation || receiver.name_span != identity.declaration_span
+                    || !same_runtime_array_type(&receiver.ty, &output.ty) { return None; }
+                let ScalarType::RuntimeArray { element, .. } = &receiver.ty else { return None; };
+                ordinary_value(element).then_some(element.as_ref())
+            })();
+            return (allocation.extent == FreshArrayExtent::Formal)
+                .then_some((GuardedArrayRoute::Fresh(route), Vec::new(), &output.ty, signed));
         }
         let root = sites.structure.blocks.get(sites.structure.root.0)?;
         let [item] = root.items.as_slice() else { return None; };
@@ -7390,7 +7403,7 @@ fn closed_aggregates<'a>(
             let dependencies = paths.iter().map(|&(point, occurrence)|
                 Some((target_body(&declarations, cfg, point)?, occurrence)))
                 .collect::<Option<Vec<_>>>()?;
-            return Some((GuardedArrayRoute::Choice(*choice), dependencies, &output.ty));
+            return Some((GuardedArrayRoute::Choice(*choice), dependencies, &output.ty, None));
         }
         let [call] = sites.call_occurrences.as_slice() else { return None; };
         if final_value.expression != call.ordinal { return None; }
@@ -7422,10 +7435,12 @@ fn closed_aggregates<'a>(
                     }
             })
         { return None; }
-        Some((GuardedArrayRoute::Forward(call.ordinal), vec![(target_body(&declarations, cfg, point.id)?, call.ordinal)], &output.ty))
+        Some((GuardedArrayRoute::Forward(call.ordinal), vec![(target_body(&declarations, cfg, point.id)?, call.ordinal)], &output.ty, None))
     };
     let invalid = || "guarded owned array call requires an exact private fresh dynamic producer or sealed forwarding path".to_owned();
     let mut guarded_array_cohorts = BTreeMap::<BodyKey, (GuardedArrayRoute, &ScalarType, BTreeSet<(BodyKey, usize)>)>::new();
+    let mut signed_descriptor_sources = HashMap::<BodyKey, &ScalarType>::new();
+    let mut unsigned_descriptor_parents = HashSet::<BodyKey>::new();
     let mut waiting = BTreeMap::<BodyKey, Vec<BodyKey>>::new();
     let mut unresolved = BTreeMap::<BodyKey, usize>::new();
     let mut ready = Vec::new();
@@ -7461,7 +7476,7 @@ fn closed_aggregates<'a>(
             sites.insert(incoming);
             continue;
         }
-        let (route, dependencies, ty) = guarded_array_cohort(target).ok_or_else(invalid)?;
+        let (route, dependencies, ty, signed) = guarded_array_cohort(target).ok_or_else(invalid)?;
         if expected.is_some_and(|expected| !same_runtime_array_type(expected, ty)) { return Err(invalid()); }
         // Once any arm selects the private descriptor ABI, the receiver is an
         // atomic cohort: enroll every mutually exclusive arm before the use
@@ -7476,6 +7491,9 @@ fn closed_aggregates<'a>(
         guarded_array_cohorts.insert(target, (route, ty, BTreeSet::from([incoming])));
         if dependencies.is_empty() {
             if !matches!(route, GuardedArrayRoute::Fresh(_)) { return Err(invalid()); }
+            if let Some(element) = signed {
+                signed_descriptor_sources.insert(target, element);
+            }
             ready.push(target);
         } else {
             unresolved.insert(target, dependencies.len());
@@ -7488,11 +7506,21 @@ fn closed_aggregates<'a>(
     // Only fresh leaves seed completion. A relay/selection is authorized
     // after every alternative drains; an ungrounded cycle cannot do so.
     while let Some(grounded) = ready.pop() {
+        let signed = signed_descriptor_sources.get(&grounded).copied();
         for parent in waiting.remove(&grounded).into_iter().flatten() {
+            if signed.is_none() {
+                unsigned_descriptor_parents.insert(parent);
+            }
             let remaining = unresolved.get_mut(&parent).ok_or_else(invalid)?;
             *remaining -= 1;
             if *remaining == 0 {
                 unresolved.remove(&parent);
+                // Existing closure requires exact type equality on every
+                // dependency. Reuse the evidenced kind from a child, not
+                // an inferred property of the caller/return declaration.
+                if !unsigned_descriptor_parents.remove(&parent) {
+                    signed_descriptor_sources.insert(parent, signed.ok_or_else(invalid)?);
+                }
                 ready.push(parent);
             }
         }
@@ -7903,7 +7931,10 @@ fn closed_aggregates<'a>(
         }
         install_literal_array_plans(&literal_array_callers, &bodies, &declarations, &mut result);
         for (&target, (route, _, callers)) in &guarded_array_cohorts {
+            let signed = reservations.target_layout.zip(signed_descriptor_sources.get(&target))
+                .map(|(layout, element)| (layout, (*element).clone()));
             let target = result.bodies.entry(target).or_default();
+            target.signed_array_descriptor_result = signed.clone();
             if target.array_descriptor_identity {
                 return Err("conflicting guarded owned array producer plan".into());
             }
@@ -7926,7 +7957,11 @@ fn closed_aggregates<'a>(
             }
             target.array_descriptor_return = true;
             for &(body, call) in callers {
-                result.bodies.entry(body).or_default().array_descriptor_calls.insert(call);
+                let caller = result.bodies.entry(body).or_default();
+                caller.array_descriptor_calls.insert(call);
+                if let Some(receipt) = &signed {
+                    caller.signed_array_descriptor_calls.insert(call, receipt.clone());
+                }
             }
         }
         for (&(key, root), &receiver) in &ordinary_array_receivers {

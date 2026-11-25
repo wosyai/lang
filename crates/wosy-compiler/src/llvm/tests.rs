@@ -16331,3 +16331,69 @@ if (observed(1) != 2 || observed(1) != 3) { core.system_panic(); };
         }
     }
 }
+
+#[test]
+fn checked_private_descriptor_carries_signed_domain_from_all_producer_arms() {
+    let text = "%%start
+u64[](u64) _first = fn(count) { u64[count] fresh; fresh };
+u64[](u64) _second = fn(count) { u64[count] fresh; fresh };
+u64[](u64) _relay = fn(count) { _first(count) };
+u64[](u64) _choose = fn(count) { if (count == 2) { _relay(count) } else { _second(count) } };
+u64(u64,u64) observed = fn(count,index) {
+    u64[] held =? _choose(count);
+    if (&held == null) { 99 } else { held[index] = 7; core.array_len(&held) }
+};
+if (observed(2, 1) != 99 || observed(2, 1) != 2 || observed(3, 2) != 3) { core.system_panic(); };
+%%end";
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let prepared = prepare_initializer_test(text, layout);
+        let checked = analyze_scalar_build(&prepared);
+        assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+        let module = &prepared.project().modules[0];
+        let mut reservations = crate::scalar::AggregateReservations {
+            modules: vec![0], target_layout: Some(layout), ..Default::default()
+        };
+        reservations.bodies.extend(module.items.iter().enumerate().filter_map(|(item, declaration)|
+            matches!(declaration, ScalarItem::Function(_)).then_some(((0, item, None), true))));
+        let plans = checked.aggregate(&reservations).unwrap();
+        let signed = (layout, ScalarType::U64);
+        for (ordinal, item) in module.items.iter().enumerate() {
+            let ScalarItem::Function(function) = item else { continue; };
+            let body = plans.body(0, ordinal, None).unwrap();
+            let (result, expected_children) = match function.name.as_str() {
+                "_first" | "_second" => (Some(&signed), 0),
+                "_relay" => (Some(&signed), 1),
+                "_choose" => (Some(&signed), 2),
+                "observed" => (None, 1),
+                _ => unreachable!(),
+            };
+            assert_eq!(body.signed_array_descriptor_result.as_ref(), result);
+            assert_eq!(body.signed_array_descriptor_calls.len(), expected_children);
+            assert!(body.signed_array_descriptor_calls.values().all(|receipt| *receipt == signed));
+        }
+        let parsed = parse_source(module.source.clone(), text.into(), &[]);
+        let release = crate::prepare_scalar_project_with_access(
+            vec![(derive_scalar_declarations_from_cst(parsed.result.canonical_cst()), Vec::new())],
+            vec![module.source.clone()], ScalarPreparationInputs { target_layout: layout },
+            Some(wosy_stdlib_source::CheckedAccessComponent::linked()),
+        ).unwrap_or_else(|error| panic!("{:?}", error.diagnostics));
+        let release_checked = analyze_scalar_build(&release);
+        assert!(release_checked.diagnostics().is_empty(), "{:?}", release_checked.diagnostics());
+        for (route, artifact) in [
+            ("standalone", emit_scalar_build_single_module_llvm(&checked)),
+            ("project", emit_scalar_build_project_llvm(&checked)),
+            ("release-project", emit_scalar_build_project_llvm(&release_checked)),
+        ] {
+            let llvm = artifact.unwrap_or_else(|error| panic!("{route}: {error}")).to_text();
+            let context = Context::create();
+            let buffer = inkwell::memory_buffer::MemoryBuffer::create_from_memory_range_copy(llvm.as_bytes(), "closed producer domain");
+            context.create_module_from_ir(buffer).unwrap().verify().unwrap();
+            if let Some(out) = std::env::var_os("WOSY_SIGNED_PRIVATE_DESCRIPTOR_IR_DIR") {
+                let target = if layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
+                let controlled = llvm.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);
+                assert_ne!(controlled, llvm);
+                std::fs::write(std::path::PathBuf::from(out).join(format!("{target}-{route}-control.ll")), controlled).unwrap();
+            }
+        }
+    }
+}

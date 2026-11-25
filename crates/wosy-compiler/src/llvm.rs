@@ -2154,6 +2154,16 @@ fn store_runtime_allocation<'ctx, 'module>(
         context, state, element, length, checked_extent, relay_unwind,
     )?;
     let slot = allocation.backing;
+    if let Some((target, producer_element)) = state.aggregate.as_ref()
+        .filter(|aggregate| aggregate.plan().guarded_array_descriptor_leaf)
+        .and_then(|aggregate| aggregate.plan().signed_array_descriptor_result.as_ref())
+    {
+        if *target != state.target_layout || producer_element != element
+            || !allocation.signed.is_some_and(|domain| domain.matches_consumer(*target, producer_element))
+        {
+            return Err("private array descriptor lost producer address-domain authority".into());
+        }
+    }
     initialize(state, slot)?;
     aggregate_transfer::record_allocation(state, binding, &receiver.name, slot)?;
     if !mutable {
