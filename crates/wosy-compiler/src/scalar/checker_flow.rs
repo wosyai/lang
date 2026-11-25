@@ -7674,7 +7674,7 @@ fn drive_integer_block<'a, const USE_IMPORTED_BOUND: bool, const COLLECT: bool, 
                             }
                             super::reference::CheckerOrdinaryScalarLocalKind::EnumMatch(transfer) => {
                                 if !roots.allow_extended_scalar_locals { return None; }
-                                bind_exact_enum_match_value(roots, &mut path, transfer, &receiver.ty)?;
+                                path = bind_enum_match_value(roots, path, transfer, &receiver.ty)?;
                             }
                             super::reference::CheckerOrdinaryScalarLocalKind::Conditional => {
                                 if !roots.allow_extended_scalar_locals { return None; }
@@ -9257,35 +9257,63 @@ fn ordinary_scalar_conditional_lanes(
 }
 
 #[cfg(feature = "internal-checker")]
-fn bind_exact_enum_match_value(
-    roots: &mut IntegerRoots<'_>, path: &mut IntegerInputs,
+fn bind_enum_match_value(
+    roots: &mut IntegerRoots<'_>, path: IntegerInputs,
     transfer: &super::runtime_enum_match::MatchTransfer<ReferenceBindingId>, ty: &ScalarType,
-) -> Option<()> {
+) -> Option<IntegerInputs> {
     use super::runtime_enum_match::{MatchTransfer, MatchValue};
-    let [row] = path.0.as_slice() else { return None; };
-    if row.affine.is_some() || row.entry.is_some() || !is_integer_type(ty) { return None; }
-    charge_call_work(roots.ordinary_local_work.get_or_insert(0), row.len().checked_add(3)?)?;
-    let output = match transfer {
-        MatchTransfer::Value(value) => value,
+    if !is_integer_type(ty) { return None; }
+    charge_call_work(roots.ordinary_local_work.get_or_insert(0), path.0.len().checked_add(1)?)?;
+    if path.0.iter().any(|row| row.affine.is_some() || row.entry.is_some()) { return None; }
+
+    let install = |roots: &mut IntegerRoots<'_>, mut lane: IntegerInputs, value: &MatchValue<ReferenceBindingId>| {
+        if lane.is_unreachable() { return Some(lane); }
+        charge_ordinary_scalar_append(roots, &lane)?;
+        match value {
+            MatchValue::Literal(value) => lane.append_local(IntegerSet::singleton(value)),
+            MatchValue::Copy(binding) => {
+                let (axis, source_ty) = roots.lookup(binding)?;
+                if source_ty != ty { return None; }
+                lane.append_ordinary_copy(axis, roots)?;
+            }
+        }
+        Some(lane)
+    };
+    match transfer {
+        MatchTransfer::Value(value) => install(roots, path, value),
         MatchTransfer::Select { condition, yes, no } => {
             let (axis, condition_ty) = roots.lookup(condition)?;
             if condition_ty != &ScalarType::Bool { return None; }
-            let flag = row.get(axis)?.singleton_value()?;
-            if flag == &BigInt::from(1) { yes }
-            else if flag == &BigInt::from(0) { no }
-            else { return None; }
-        }
-    };
-    match output {
-        MatchValue::Literal(value) => {
-            path.append_local(IntegerSet::singleton(value));
-        }
-        MatchValue::Copy(binding) => {
-            let (axis, source_ty) = roots.lookup(binding)?;
-            if source_ty != ty || row.get(axis)?.singleton_value().is_none() { return None; }
-            path.append_ordinary_copy(axis, roots)?;
+            // The ordinary Bool domain is exactly {0,1}. Keep the
+            // selector coordinate and its equalities on every cut row.
+            let [no_path, yes_path] = path.ordinary_atom(
+                OrdinaryIntegerAtom::Literal(axis, IntegerRelation::from_operator(&BinaryOperator::Equal)?, &BigInt::from(1)),
+                [true, true], roots.ordinary_local_work.get_or_insert(0),
+            )?;
+            let mut joined = install(roots, yes_path, yes)?;
+            let mut no_path = install(roots, no_path, no)?;
+            append_ordinary_scalar_lane(roots, &mut joined, &mut no_path)?;
+            Some(joined)
         }
     }
+}
+
+#[cfg(feature = "internal-checker")]
+fn charge_ordinary_scalar_append(roots: &mut IntegerRoots<'_>, path: &IntegerInputs) -> Option<()> {
+    // Appending fresh storage can grow the entire row cell vector.
+    let work = roots.ordinary_local_work.get_or_insert(0);
+    for row in &path.0 { charge_call_work(work, row.len().checked_add(1)?)?; }
+    Some(())
+}
+
+#[cfg(feature = "internal-checker")]
+fn append_ordinary_scalar_lane(
+    roots: &mut IntegerRoots<'_>, joined: &mut IntegerInputs, lane: &mut IntegerInputs,
+) -> Option<()> {
+    let total = joined.0.len().checked_add(lane.0.len())?;
+    let relocated = if total > joined.0.capacity() { joined.0.len() } else { 0 };
+    charge_call_work(roots.ordinary_local_work.get_or_insert(0), lane.0.len().checked_add(relocated)?)?;
+    joined.0.append(&mut lane.0);
     Some(())
 }
 
@@ -9304,10 +9332,7 @@ fn bind_conditional_scalar_local(
         {
             return None;
         }
-        // Appending fresh storage may grow a row's cell vector. Bill
-        // the complete width before copying a domain or equality class.
-        let work = roots.ordinary_local_work.get_or_insert(0);
-        for row in &arm.0 { charge_call_work(work, row.len().checked_add(1)?)?; }
+        charge_ordinary_scalar_append(roots, &arm)?;
         if let Some(value) = scalar_call_literal(structure, leaf, ty, true) {
             arm.append_local(IntegerSet::singleton(value));
         } else {
@@ -9316,10 +9341,7 @@ fn bind_conditional_scalar_local(
             if source_ty != ty { return None; }
             arm.append_ordinary_copy(axis, roots)?;
         }
-        let total = joined.0.len().checked_add(arm.0.len())?;
-        let relocated = if total > joined.0.capacity() { joined.0.len() } else { 0 };
-        charge_call_work(roots.ordinary_local_work.get_or_insert(0), arm.0.len().checked_add(relocated)?)?;
-        joined.0.append(&mut arm.0);
+        append_ordinary_scalar_lane(roots, &mut joined, &mut arm)?;
     }
     Some(joined)
 }

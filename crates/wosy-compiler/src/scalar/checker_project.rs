@@ -24304,9 +24304,50 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
         let dormant = text.replace("inspect(true, 256);", "").replace("inspect(false, 256);", "");
         let idle = run(&dormant, ScalarCheckerScope::MainFlowOnly).unwrap();
         assert!(!idle.active && idle.directives.is_empty());
-        assert!(matches!(run(&dormant, ScalarCheckerScope::CurrentPackage), Err(ScalarOrderedCheckerOutcome::Unsupported)));
+        let symbolic = run(&dormant, ScalarCheckerScope::CurrentPackage).unwrap();
+        assert!(symbolic.active && !symbolic.directives.is_empty());
         let unsupported = text.replace("left(narrow, wide) { wide }", "left(narrow, wide) { wide ^ 1 }");
         assert!(matches!(run(&unsupported, ScalarCheckerScope::MainFlowOnly), Err(ScalarOrderedCheckerOutcome::Invalid(_))));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn symbolic_ordinary_enum_match_preserves_selector_and_payload_correlation() {
+        let text = format!(r#"%%start
+            enum copy Region {{ left(u8, u16); right(u16, u8); }}
+            unit(bool, u16) inspect = fn(flag, entry) {{
+                u16 actual = match (if (flag) {{ Region.left(3, entry) }} else {{ Region.right(513, 7) }}) {{
+                    right(wide, narrow) {{ wide }}
+                    left(narrow, wide) {{ wide }}
+                }};
+                core.require(!flag || actual == entry, {OUTPUT});
+                core.require(flag || actual == 513, {OUTPUT});
+            }};
+        %%end"#);
+        let app = source("src/main.w", "symbolic-runtime-enum-match");
+        let run = |text: &str, scope| {
+            let parsed = parse_source(app.clone(), text.to_owned(), &[]);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let declarations = super::super::derive_scalar_check_declarations_from_cst(parsed.result.canonical_cst());
+            check_loaded_scalar_ordered_local_proof_contexts(
+                vec![(declarations, Vec::new())], Vec::new(), vec![app.clone()], inputs(), scope, Vec::new(),
+            ).unwrap()
+        };
+        let main = run(&text, ScalarCheckerScope::MainFlowOnly);
+        assert!(!main.active && main.directives.is_empty());
+        let passed = run(&text, ScalarCheckerScope::CurrentPackage);
+        assert!(passed.active && passed.directives.is_empty());
+        let refuted = text.replace("actual == 513", "actual == 512");
+        let failed = run(&refuted, ScalarCheckerScope::CurrentPackage);
+        let [only] = failed.directives.as_slice() else { panic!("exactly one symbolic obligation fails"); };
+        assert_eq!(&refuted[only.condition.start as usize..only.condition.end as usize], "flag || actual == 512");
+        assert_eq!(only.witness.row_count(), 1);
+        let zero = BigInt::from(0);
+        let max = BigInt::from(u16::MAX);
+        let selected = BigInt::from(513);
+        assert!(only.witness.intervals_at(0, 0).unwrap().eq([(&zero, &zero)]));
+        assert!(only.witness.intervals_at(0, 1).unwrap().eq([(&zero, &max)]));
+        assert!(only.witness.intervals_at(0, 2).unwrap().eq([(&selected, &selected)]));
     }
 
     fn source(path: &str, revision: &str) -> SourceIdentity {
