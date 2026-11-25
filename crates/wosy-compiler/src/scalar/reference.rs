@@ -5059,7 +5059,19 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         Some((source.declaration_span, count))
                     })();
                     let before = self.cursor;
-                    let walk_fallible_expression = binding.fallible_assignment.is_some()
+                    let ordinary_prologue = scope == ReferenceScopeId(0) && position.block == calls.structure.root
+                        && position.item == 0
+                        && calls.structure.edges.get(&(
+                            OccurrenceParent::Block(calls.structure.root),
+                            OccurrenceEdge::BindingRoot { item: 0, output: 0 },
+                        )) == Some(&OccurrenceNode::Expression(primary_ordinal))
+                        && !block.unsafe_context && !binding.is_allocation
+                        && calls.boundary.parameters.iter().all(|slot| aggregate::ordinary_value(&slot.ty))
+                        && calls.boundary.root_outputs.iter().all(|slot| aggregate::ordinary_value(&slot.ty))
+                        && self.generic_parameters.is_empty() && matches!(receiver.ty, ScalarType::U64 | ScalarType::I32)
+                        && binding_region.receivers().len() == 1 && outputs.secondary.is_empty()
+                        && binding.output_origin == ScalarBindingOutputOrigin::SingleExpression;
+                    let walk_fallible_expression = (binding.fallible_assignment.is_some() || ordinary_prologue)
                         && (matches!(primary, ScalarExpression::If { .. } | ScalarExpression::Binary { .. })
                             || matches!(primary, ScalarExpression::Call { arguments, .. }
                                 if arguments.iter().any(|argument| matches!(argument, ScalarExpression::Call { .. }))));
@@ -5096,14 +5108,16 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         self.expression(primary, scope, primary_ordinal)?
                     };
                     if walk_fallible_expression {
-                        let Some(expression) = self.guarded_numeric_expression(primary, primary_ordinal, &receiver.ty).filter(|_|
+                        let expression = self.guarded_numeric_expression(primary, primary_ordinal, &receiver.ty).filter(|_|
                             self.generic_parameters.is_empty() && binding_region.receivers().len() == 1
-                            && outputs.secondary.is_empty())
-                        else {
-                            return Err(self.missing_context(expression_span(primary),
-                                ReferenceAnalysisErrorReason::UnprovedFallibleCallInitializer));
-                        };
-                        self.aggregate_result.fallible_call_expressions.push(expression);
+                            && outputs.secondary.is_empty());
+                        match (binding.fallible_assignment, expression) {
+                            (Some(_), Some(proof)) => self.aggregate_result.fallible_call_expressions.push(proof),
+                            (None, Some(proof)) => self.aggregate_result.ordinary_fallible_expressions.push(proof),
+                            (Some(_), None) => return Err(self.missing_context(expression_span(primary),
+                                ReferenceAnalysisErrorReason::UnprovedFallibleCallInitializer)),
+                            (None, None) => {}
+                        }
                     }
                     let call_producer = if binding.output_origin
                         == ScalarBindingOutputOrigin::SingleExpression
@@ -5116,17 +5130,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     if let (None, ScalarExpression::Call { arguments, type_arguments, .. }, Some(point)) =
                         (binding.fallible_assignment, primary, call_producer)
                     {
-                        if scope == ReferenceScopeId(0) && position.block == calls.structure.root
-                            && position.item == 0
-                            && calls.structure.edges.get(&(
-                                OccurrenceParent::Block(calls.structure.root),
-                                OccurrenceEdge::BindingRoot { item: 0, output: 0 },
-                            )) == Some(&OccurrenceNode::Expression(primary_ordinal))
-                            && !block.unsafe_context && !binding.is_allocation
-                            && calls.boundary.parameters.iter().all(|slot| aggregate::ordinary_value(&slot.ty))
-                            && calls.boundary.root_outputs.iter().all(|slot| aggregate::ordinary_value(&slot.ty))
-                            && self.generic_parameters.is_empty() && matches!(receiver.ty, ScalarType::U64 | ScalarType::I32)
-                            && binding_region.receivers().len() == 1 && outputs.secondary.is_empty()
+                        if ordinary_prologue
                             && type_arguments.is_empty() && !calls.declared_unsafe_calls.contains(&primary_ordinal.0)
                             && matches!(arguments.as_slice(), [argument]
                                 if matches!(argument, ScalarExpression::Name { .. }) || aggregate::pure_widened_element(argument))
@@ -16532,7 +16536,10 @@ impl FunctionReferenceResult {
         }
         function.reference_cfg = self.cfg;
         if let Some(facts) = facts {
-            if self.aggregate.has_observations() || !self.aggregate.ordinary_fallible_call_candidates.is_empty() {
+            if self.aggregate.has_observations()
+                || !self.aggregate.ordinary_fallible_call_candidates.is_empty()
+                || !self.aggregate.ordinary_fallible_expressions.is_empty()
+            {
                 facts.insert((item, arm), self.aggregate);
             }
         }

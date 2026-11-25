@@ -12900,7 +12900,8 @@ u64(u64) observed = fn(count) {
 };
 if (observed(7) != 0 || observed(7) != 0 || observed(7) != 0 || observed(7) != 0 || observed(7) != 0 || observed(7) != 8 || observed(0) != 1) { core.system_panic(); };
 %%end";
-    let mixed = text.replace("u64 result =?", "u64 ordinary = _middle(count) + 1; ordinary; u64 result =?");
+    let mixed = text.replace("u64 result =?",
+        "u8[count] prior; core.array_len(&prior); u64 ordinary = _middle(count) + 1; ordinary; u64 result =?");
     for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
         for (closed, text) in [(true, text), (false, mixed.as_str())] {
             let prepared = prepare_initializer_test(text, layout);
@@ -13612,6 +13613,72 @@ if (allocating(7) != 99 || allocating(7) != 99 || allocating(7) != 99 || allocat
                 let controlled = llvm.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);
                 assert_ne!(controlled, llvm);
                 std::fs::write(std::path::PathBuf::from(out).join(format!("{target}-{route}-control.ll")), controlled).unwrap();
+            }
+        }
+    }
+}
+
+#[test]
+fn ordinary_fallible_expression_has_one_cold_panic_and_plain_result() {
+    use inkwell::{memory_buffer::MemoryBuffer, values::CallSiteValue};
+    let template = "%%start
+u64(u64) _inner = fn(count) { u16[count] scratch; core.array_len(&scratch) };
+u64(u64) _outer = fn(count) { u8[count] scratch; core.array_len(&scratch) };
+u64(u64) guarded = fn(count) {
+    u64 result =? _outer(_inner(count));
+    if (&result == null) { 99 } else { result }
+};
+u64(bool, u64) ordinary = fn(select, count) {
+    u64 result = if (select) { _outer(_inner(count)) ^ 0 } else { 0 };
+    result
+};
+if (guarded(0) != 0 || ordinary(false, 7) != 0 || ordinary(true, 0) != 0
+    || ordinary(true, 7) != 7 || ordinary(true, COUNT) != 0) { core.system_panic(); };
+%%end";
+    for (witness, count) in [("inner", "11"), ("outer", "13")] {
+        let text = template.replace("COUNT", count);
+        for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let prepared = prepare_initializer_test(&text, layout);
+            let checked = analyze_scalar_build(&prepared);
+            assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+            let source = &prepared.project().modules[0].source;
+            for (project, output) in [(false, emit_scalar_build_single_module_llvm(&checked)),
+                (true, emit_scalar_build_project_llvm(&checked))]
+            {
+                let llvm = output.unwrap().to_text();
+                let context = Context::create();
+                let buffer = MemoryBuffer::create_from_memory_range_copy(llvm.as_bytes(), "ordinary fallible expression");
+                let module = context.create_module_from_ir(buffer).unwrap();
+                module.verify().unwrap();
+                let authored = |name: &str| module.get_function(&self_tail_test_symbol(source, project, name)).unwrap();
+                let ordinary = authored("ordinary");
+                assert_eq!(ordinary.get_type().get_return_type(), Some(context.i64_type().into()));
+                let blocks = ordinary.get_basic_blocks();
+                let calls_to = |callee| blocks.iter().flat_map(|block| std::iter::successors(
+                    block.get_first_instruction(), |instruction| instruction.get_next_instruction()))
+                    .filter(|&instruction| CallSiteValue::try_from(instruction).ok()
+                        .is_some_and(|call| call.get_called_fn_value() == Some(callee))).collect::<Vec<_>>();
+                let [panic] = calls_to(module.get_function("__wosy_core_system_panic").unwrap())[..] else { panic!("{llvm}") };
+                let failure = panic.get_parent().unwrap();
+                assert_eq!(failure.get_first_instruction(), Some(panic));
+                assert_eq!(failure.get_terminator().unwrap().get_opcode(), InstructionOpcode::Unreachable);
+                assert!(calls_to(module.get_function("__wosy_core_alloc").unwrap()).is_empty());
+                assert!(calls_to(module.get_function("__wosy_core_free").unwrap()).is_empty());
+                let [inner] = calls_to(authored("_inner"))[..] else { panic!("{llvm}") };
+                let [outer] = calls_to(authored("_outer"))[..] else { panic!("{llvm}") };
+                for instruction in [inner, outer] {
+                    let branch = instruction.get_parent().unwrap().get_terminator().unwrap();
+                    assert!(branch.get_operands().any(|operand| operand.and_then(|operand| operand.block()) == Some(failure)));
+                }
+                assert!(inner.get_parent().unwrap().get_terminator().unwrap().get_operands()
+                    .any(|operand| operand.and_then(|operand| operand.block()) == outer.get_parent()));
+                if let Some(out) = std::env::var_os("WOSY_ORDINARY_FALLIBLE_EXPRESSION_IR_DIR") {
+                    let target = if layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
+                    let route = if project { "project" } else { "standalone" };
+                    let controlled = llvm.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);
+                    assert_ne!(controlled, llvm);
+                    std::fs::write(std::path::PathBuf::from(out).join(witness).join(format!("{target}-{route}-control.ll")), controlled).unwrap();
+                }
             }
         }
     }

@@ -343,7 +343,8 @@ pub(super) fn emit_project_typed_expression<'ctx, 'module>(
     modules: &[&ScalarModule],
 ) -> Result<EmitValue<'ctx>, String> {
     if matches!(expression, ScalarExpression::Call { .. })
-        && aggregate_transfer::fallible_allocation_expression_at(state, expression)
+        && (aggregate_transfer::fallible_allocation_expression_at(state, expression)
+            || aggregate_transfer::ordinary_fallible_allocation_expression_at(state, expression))
     {
         return emit_contextual_numeric(context, state, expression, expected, ExpressionPath::Project { module, modules });
     }
@@ -2553,7 +2554,7 @@ fn checked_float_type<'a>(
 
 fn emit_fallible_numeric<'ctx>(
     context: &'ctx Context, state: &mut EmitState<'ctx, '_>,
-    expression: &ScalarExpression, payload: &ScalarType, path: ExpressionPath<'_>,
+    expression: &ScalarExpression, payload: &ScalarType, path: ExpressionPath<'_>, ordinary: bool,
 ) -> Result<EmitValue<'ctx>, String> {
     use inkwell::basic_block::BasicBlock;
     enum Step<'ctx, 'ast> {
@@ -2566,7 +2567,7 @@ fn emit_fallible_numeric<'ctx>(
     let pair = aggregate_transfer::fallible_allocation_result_type(context, payload)?;
     let function = state.builder.get_insert_block().and_then(|block| block.get_parent())
         .ok_or("missing fallible expression function")?;
-    let merge = context.append_basic_block(function, "fallible.binary_merge");
+    let merge = context.append_basic_block(function, if ordinary { "ordinary.allocation_absent" } else { "fallible.binary_merge" });
     let mut absent = Vec::new();
     let take_present = |state: &mut EmitState<'ctx, '_>, tagged: inkwell::values::StructValue<'ctx>,
         absent: &mut Vec<BasicBlock<'ctx>>| -> Result<EmitValue<'ctx>, String> {
@@ -2679,6 +2680,14 @@ fn emit_fallible_numeric<'ctx>(
     }
     if values.len() != 1 || absent.is_empty() { return Err("invalid sealed fallible expression result".into()); }
     let value = take_basic(values.pop().expect("one sealed fallible expression output"))?;
+    if ordinary {
+        let success = state.builder.get_insert_block().ok_or("missing ordinary expression success block")?;
+        state.builder.position_at_end(merge);
+        emit_core_system_panic(context, state, &[])?;
+        state.builder.build_unreachable().map_err(builder_error)?;
+        state.builder.position_at_end(success);
+        return Ok(EmitValue::Basic(value));
+    }
     let computed = aggregate_transfer::present_fallible_allocation_result(context, state, value, payload)?;
     let computed_end = state.builder.get_insert_block().ok_or("missing fallible expression present block")?;
     state.builder.build_unconditional_branch(merge).map_err(builder_error)?;
@@ -2697,8 +2706,9 @@ pub(super) fn emit_contextual_numeric<'ctx, 'module>(
     expected: &ScalarType,
     path: ExpressionPath<'_>,
 ) -> Result<EmitValue<'ctx>, String> {
-    if aggregate_transfer::fallible_allocation_expression_at(state, expression) {
-        return emit_fallible_numeric(context, state, expression, expected, path);
+    let ordinary = aggregate_transfer::ordinary_fallible_allocation_expression_at(state, expression);
+    if ordinary || aggregate_transfer::fallible_allocation_expression_at(state, expression) {
+        return emit_fallible_numeric(context, state, expression, expected, path, ordinary);
     }
     let float = matches!(expected, ScalarType::F32 | ScalarType::F64);
     let integer = !float && integer_width(expected).is_some();

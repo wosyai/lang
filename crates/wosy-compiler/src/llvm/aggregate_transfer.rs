@@ -592,6 +592,14 @@ pub(super) fn fallible_allocation_expression_at(state: &EmitState<'_, '_>, expre
     })
 }
 
+pub(super) fn ordinary_fallible_allocation_expression_at(state: &EmitState<'_, '_>, expression: &ScalarExpression) -> bool {
+    state.aggregate.as_ref().is_some_and(|aggregate| {
+        let choices = &aggregate.plan().ordinary_fallible_allocating_expressions;
+        !choices.is_empty() && state.body_call_nodes.and_then(|nodes| nodes.expression_ordinal(expression))
+            .is_some_and(|ordinal| choices.contains(&ordinal))
+    })
+}
+
 fn fallible_allocation_integer_type<'ctx>(
     context: &'ctx Context, payload: &ScalarType,
 ) -> Result<inkwell::types::IntType<'ctx>, String> {
