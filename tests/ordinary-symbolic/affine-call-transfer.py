@@ -2684,7 +2684,27 @@ reached_fixed_array_witness = """%%start
     u8[2] picked = make();
     u8 observed = picked[0];
 %%end"""
+reached_fixed_array_dependent = """%%start
+    i8[3](i8) make = fn(value) { [value, -1, value] };
+    proof every for make(entry) -> (items) where (entry >= 0)
+        forall (u64 i where i == 0 || i == 2)
+        ensures (exists (u64 j where j < 3) { items[j] >= 0 })
+    { core.witness(i); }
+    i8[3] first = make(3);
+    i8[3] second = make(3);
+    i8 first_cell = first[0];
+    i8 second_cell = second[2];
+%%end"""
 cases.extend([
+    ("exact-startup-fixed-array-dependent-proved", reached_fixed_array_dependent, 0, b""),
+    ("exact-startup-fixed-array-dependent-refuted", reached_fixed_array_dependent.replace(
+        "[value, -1, value]", "[value, -1, -2]"), 1, b"proof obligation failed"),
+    ("exact-startup-fixed-array-dependent-refuses-nonidentity", reached_fixed_array_dependent.replace(
+        "core.witness(i)", "core.witness(0)"), 2, b"unsupported analysis"),
+    ("exact-startup-fixed-array-dependent-refuses-excluded-witness", reached_fixed_array_dependent.replace(
+        "j < 3", "j < 2"), 2, b"unsupported analysis"),
+    ("exact-startup-fixed-array-dependent-refuses-unbounded-index", reached_fixed_array_dependent.replace(
+        "i == 2", "i == 3").replace("j < 3", "j <= 3"), 2, b"unsupported analysis"),
     ("exact-startup-fixed-array-exists-proved", reached_fixed_array_exists, 0, b""),
     ("exact-startup-fixed-array-exists-refuted", reached_fixed_array_exists.replace("items[i] >= 0", "items[i] > 3"),
         1, b"proof obligation failed"),
@@ -3032,6 +3052,7 @@ proof_diagnostic_notes = {
     "ordinary-array-proof-cohort-distinct-rectangle-refuted": b"symbolic call entry: tag = 2, value = 1",
     "ordinary-array-proof-cohort-union-refuted": b"symbolic call entry: value = 0",
     "exact-startup-array-proof-cohort-refuted": b"call entry: tag = 1, value = 3",
+    "exact-startup-fixed-array-dependent-refuted": b"call returned cell [2] = -2",
     "exact-startup-fixed-array-exists-refuted": b"call returned an array with no matching index",
     "exact-startup-fixed-array-pair-refuted": b"call returned cell [0] = 3",
     "exact-startup-fixed-array-nullary-witness-refuted": b"call returned cell [1] = 8",
@@ -3980,6 +4001,11 @@ with tempfile.TemporaryDirectory(prefix="affine-calls-") as path:
                         assert b"proof issued" in res.stderr and b"producer(3,7)" in res.stderr, res
                     if name == "ordinary-verified-unary-entry-refuted":
                         assert b"symbolic call entry: value = 1" in res.stderr,res
+                    if name == "exact-startup-fixed-array-dependent-refuted":
+                        failures = res.stderr.split(b"error: proof obligation failed")[1:]
+                        assert len(failures) == 2 and failures[0] != failures[1], res
+                        assert all(b"core.witness(i)" in failure and b"call entry: value = 3" in failure
+                            and b"call returned cell [2] = -2" in failure for failure in failures), res
                     if name == "exact-startup-fixed-array-exists-refuted":
                         assert res.stderr.count(b"error: proof obligation failed") == 2, res
                         assert res.stderr.count(b"applicable call") == 2 and res.stderr.count(b"call entry: value = 3") == 2, res

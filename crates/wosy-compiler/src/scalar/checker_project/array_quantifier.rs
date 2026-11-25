@@ -63,21 +63,40 @@ impl<'a> ArrayProof<'a> {
         let ensures = child(proof, SyntaxKind::ProofEnsures)?;
         let exists = ensures.children().find(|node| node.kind() == SyntaxKind::ProofExists);
         let mut foralls = proof.children().filter(|node| node.kind() == SyntaxKind::ProofForall);
-        let quantifier = match (exists, foralls.next(), foralls.next()) {
-            (Some(exists), None, None) => (exists, true),
-            (None, Some(forall), None) => (forall, false),
+        let (quantifier, existential, dependency) = match (exists, foralls.next(), foralls.next()) {
+            (Some(exists), None, None) => (exists, true, None),
+            (Some(exists), Some(forall), None) => (exists, true, Some(forall)),
+            (None, Some(forall), None) => (forall, false, None),
             _ => return Err(ProjectCheck::Unsupported),
         };
-        let (quantifier, existential) = quantifier;
-        let index_ty = super::super::derive_type(&child(&quantifier, SyntaxKind::TypeSpec)?);
-        let mut names = identifiers(&quantifier);
-        let binder = names.next().ok_or(ProjectCheck::InvalidProof)?;
-        if index_ty != ScalarType::U64 || binder == binding || names.next().is_some()
-            || is_null_literal_name(&binder) || is_null_literal_name(&binding)
-        {
-            return Err(ProjectCheck::InvalidProof);
-        }
-        let domain = typed_quantifier_domain(&quantifier, &binder, &inputs, &index_ty)?;
+        let index_binder = |clause: &CstNode| -> Result<String, ProjectCheck> {
+            let index_ty = super::super::derive_type(&child(clause, SyntaxKind::TypeSpec)?);
+            let mut names = identifiers(clause);
+            let binder = names.next().ok_or(ProjectCheck::InvalidProof)?;
+            if index_ty != ScalarType::U64 || unique.contains(binder.as_str())
+                || names.next().is_some() || is_null_literal_name(&binder)
+            {
+                return Err(ProjectCheck::InvalidProof);
+            }
+            Ok(binder)
+        };
+        let index_ty = ScalarType::U64;
+        let binder = index_binder(&quantifier)?;
+        let target_domain = typed_quantifier_domain(&quantifier, &binder, &inputs, &index_ty)?;
+        let (domain, witness_binder) = if let Some(forall) = dependency {
+            let universal = index_binder(&forall)?;
+            if universal == binder { return Err(ProjectCheck::InvalidProof); }
+            let active = typed_quantifier_domain(&forall, &universal, &inputs, &index_ty)?;
+            // Identity substitution is valid only across the full universal
+            // domain. The existing scanner will check the predicate once per
+            // admitted cell, not search one existential per universal value.
+            if !active.is_subset_of(&target_domain) {
+                return Err(ProjectCheck::Unsupported);
+            }
+            (active, Some(universal))
+        } else {
+            (target_domain, None)
+        };
         if proof.children().find(|node| node.kind() == SyntaxKind::ProofWhere).is_some_and(|clause|
             clause.descendants().take(MAX_ACTUAL_CALL_DEPTH + 1).count() > MAX_ACTUAL_CALL_DEPTH)
         {
@@ -117,7 +136,16 @@ impl<'a> ArrayProof<'a> {
         }
         let steps = derive_block(&block);
         let mut failed_step = None;
-        let quantifier_kind = if existential && steps.items.is_empty() {
+        let quantifier_kind = if let Some(universal) = witness_binder {
+            if !matches!(authored_witness_argument(&steps)?, ScalarExpression::Name { name, .. } if *name == universal) {
+                return Err(ProjectCheck::Unsupported);
+            }
+            let [ScalarBlockItem::Expression(expression)] = steps.items.as_slice() else {
+                return Err(ProjectCheck::Unsupported);
+            };
+            failed_step = Some(super::super::typecheck::expression_span(expression));
+            FixedArrayQuantifier::All
+        } else if existential && steps.items.is_empty() {
             FixedArrayQuantifier::FindWitness
         } else if existential {
             let value = concrete_integer_literal(authored_witness_argument(&steps)?)
