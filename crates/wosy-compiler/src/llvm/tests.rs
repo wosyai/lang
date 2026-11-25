@@ -15425,3 +15425,91 @@ ordinary(FIRST, SECOND);
         }
     }
 }
+
+#[test]
+fn fallible_private_scalar_tails_share_leaf_grounded_ordered_cohort() {
+    use inkwell::{memory_buffer::MemoryBuffer, values::CallSiteValue};
+    let text = "%%start
+u64(u64) _left = fn(count) { u16[count] scratch; core.array_len(&scratch) };
+u64(u64) _right = fn(count) { u8[count] scratch; core.array_len(&scratch) };
+u64(u64) _compose = fn(count) { _left(count) ^ _right(5) };
+bool(u64, u64) _first = fn(count, expected) { count == expected };
+u64(u64) _choose = fn(count) { if (_first(count, 4)) { _left(4) } else { _right(9) } };
+u64(u64) composed = fn(count) {
+    u64 value =? _compose(count);
+    if (&value == null) { 99 } else { value }
+};
+u64(u64) selected = fn(count) {
+    u64 value =? _choose(count);
+    if (&value == null) { 99 } else { value }
+};
+if (composed(2) != 99 || composed(3) != 99 || composed(5) != 0
+    || composed(7) != 2 || selected(4) != 4 || selected(8) != 99
+    || selected(8) != 9) { core.system_panic(); };
+%%end";
+    let arithmetic = text.replace("_left(count) ^ _right(5)", "_left(count) + _right(5)");
+    let other_abi = "%%start
+u64(u64) _leaf = fn(count) { u8[count] scratch; core.array_len(&scratch) };
+u64(bool) _choose = fn(first) { if (first) { _leaf(4) } else { _leaf(9) } };
+u64(bool) selected = fn(first) {
+    u64 value =? _choose(first);
+    if (&value == null) { 99 } else { value }
+};
+selected(true);
+%%end";
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let refused = prepare_initializer_test(other_abi, layout);
+        let refused = analyze_scalar_build(&refused);
+        assert!(refused.diagnostics().is_empty(), "{:?}", refused.diagnostics());
+        assert!(matches!(emit_scalar_build_project_llvm(&refused), Err(error)
+            if error.contains("fallible call initializer requires a checked allocation-free scalar callable")
+                && !error.contains("invalid sealed fallible allocation signature")));
+        let negative = prepare_initializer_test(&arithmetic, layout);
+        let negative = analyze_scalar_build(&negative);
+        assert!(negative.diagnostics().is_empty(), "{:?}", negative.diagnostics());
+        assert!(matches!(emit_scalar_build_project_llvm(&negative), Err(error)
+            if error.contains("does not preserve the sealed result bound")));
+        let prepared = prepare_initializer_test(text, layout);
+        let source = &prepared.project().modules[0].source;
+        let checked = analyze_scalar_build(&prepared);
+        assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+        for (route, project, output) in [
+            ("standalone", false, emit_scalar_build_single_module_llvm(&checked)),
+            ("project", true, emit_scalar_build_project_llvm(&checked)),
+        ] {
+            let llvm = output.unwrap().to_text();
+            let context = Context::create();
+            let buffer = MemoryBuffer::create_from_memory_range_copy(llvm.as_bytes(), "fallible private scalar tail");
+            let module = context.create_module_from_ir(buffer).unwrap();
+            module.verify().unwrap();
+            let authored = |name: &str| module.get_function(&self_tail_test_symbol(source, project, name)).unwrap();
+            let left = authored("_left");
+            let right = authored("_right");
+            assert_eq!(authored("_first").get_type().get_return_type(), Some(context.bool_type().into()));
+            assert_eq!(authored("_first").count_params(), 2);
+            let xor = authored("_compose");
+            let select = authored("_choose");
+            for function in [left, right, xor, select] {
+                assert_eq!(function.get_linkage(), inkwell::module::Linkage::Internal);
+                assert_eq!(function.get_type().get_return_type(), left.get_type().get_return_type());
+            }
+            for function in [xor, select] {
+                let blocks = function.get_basic_blocks();
+                let calls = |callee| blocks.iter().flat_map(|block|
+                    std::iter::successors(block.get_first_instruction(), |i| i.get_next_instruction()))
+                    .filter(|&i| CallSiteValue::try_from(i).ok().is_some_and(|call| call.get_called_fn_value() == Some(callee)))
+                    .collect::<Vec<_>>();
+                assert_eq!(calls(left).len(), 1);
+                assert_eq!(calls(right).len(), 1);
+                assert!(calls(module.get_function("__wosy_core_alloc").unwrap()).is_empty());
+                assert!(calls(module.get_function("__wosy_core_system_panic").unwrap()).is_empty());
+            }
+            if let Some(out) = std::env::var_os("WOSY_FALLIBLE_SCALAR_TAIL_IR_DIR") {
+                let target = if layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
+                let controlled = llvm.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);
+                assert_ne!(controlled, llvm);
+                std::fs::write(std::path::PathBuf::from(out).join(format!("{target}-{route}-control.ll")), controlled).unwrap();
+            }
+        }
+    }
+}

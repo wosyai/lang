@@ -1255,6 +1255,10 @@ pub(super) enum GuardedNumericNode {
 
 impl GuardedNumericExpression {
     fn proves_ordinary_arithmetic(&self, allocated: impl Fn(OccurrenceOrdinal) -> bool) -> bool {
+        self.ordinary_arithmetic_bound(allocated).is_some()
+    }
+
+    fn ordinary_arithmetic_bound(&self, allocated: impl Fn(OccurrenceOrdinal) -> bool) -> Option<u64> {
         // A materialized U64 result in this graph is a checked extent of
         // a nonzero-sized scalar array, including across sealed relays.
         let mut bounds = Vec::<u64>::new();
@@ -1262,21 +1266,21 @@ impl GuardedNumericExpression {
             let bound = match *node {
                 GuardedNumericNode::Atom(bound) => bound,
                 GuardedNumericNode::Call(site, staged_arguments) => {
-                    let Some(keep) = bounds.len().checked_sub(staged_arguments) else { return false; };
+                    let Some(keep) = bounds.len().checked_sub(staged_arguments) else { return None; };
                     bounds.truncate(keep);
                     if allocated(site) { u64::from(u32::MAX) } else { u64::MAX }
                 }
                 GuardedNumericNode::Add | GuardedNumericNode::And | GuardedNumericNode::OrXor | GuardedNumericNode::Logical | GuardedNumericNode::Select => {
-                    let (Some(right), Some(left)) = (bounds.pop(), bounds.pop()) else { return false; };
+                    let (Some(right), Some(left)) = (bounds.pop(), bounds.pop()) else { return None; };
                     match node {
                         GuardedNumericNode::Add => {
-                            let Some(sum) = left.checked_add(right) else { return false; };
+                            let Some(sum) = left.checked_add(right) else { return None; };
                             sum
                         }
                         GuardedNumericNode::And => left.min(right),
                         GuardedNumericNode::Logical => 1,
                         GuardedNumericNode::Select => {
-                            if bounds.pop().is_none() { return false; }
+                            if bounds.pop().is_none() { return None; }
                             left.max(right)
                         },
                         GuardedNumericNode::OrXor => {
@@ -1289,7 +1293,8 @@ impl GuardedNumericExpression {
             };
             bounds.push(bound);
         }
-        bounds.len() == 1
+        let [bound] = bounds.as_slice() else { return None; };
+        Some(*bound)
     }
 }
 
@@ -7155,60 +7160,102 @@ fn closed_aggregates<'a>(
                 spans, payload.ty.clone()))
         };
         let mut memo = HashMap::new();
+        let scalar_tail = |key: BodyKey| {
+            if key.2.is_some() || reservations.bodies.get(&key) != Some(&true) { return None; }
+            let input = module_at(key.0)?;
+            let ScalarItem::Function(function) = input.items.get(key.1)? else { return None; };
+            if !crate::scalar::typecheck::is_module_private_name(&function.name)
+                || !function.generic_parameters.is_empty() || !function.overload_arms.is_empty()
+            { return None; }
+            let sites = input.calls.function_body(key.1, None)?;
+            let (_, cfg) = result_at(key, function)?;
+            let [payload] = sites.boundary.root_outputs.as_slice() else { return None; };
+            let [ScalarBlockItem::Expression(value @ (ScalarExpression::Binary { .. } | ScalarExpression::If { .. }))] =
+                function.body.items.as_slice() else { return None; };
+            let root = sites.structure.blocks.get(sites.structure.root.0)?;
+            let [BlockItem { kind: BlockItemKind::FinalOutput(output), .. }] = root.items.as_slice() else { return None; };
+            if output.output != 0 || function.body.unsafe_context
+                || !cfg.allocations.is_empty() || !cfg.guarded_scalar_allocations().is_empty()
+                || sites.call_occurrences.is_empty()
+                || !matches!(sites.boundary.parameters.as_slice(), [formal] if formal.ty == ScalarType::U64)
+            { return None; }
+            let proof = ReferenceFlowBuilder::prove_guarded_numeric_expression(sites, cfg, value, output.expression, &payload.ty)?;
+            if proof.calls.len() != sites.call_occurrences.len() { return None; }
+            let dependencies = proof.calls.iter().map(|&(point, ordinal)| {
+                let [output] = sites.checked_call_signatures.get(&ordinal)?.outputs.outputs.as_slice()
+                    else { return None; };
+                Some((target_body(&declarations, cfg, point)?, ordinal, output.ty.clone()))
+            }).collect::<Option<Vec<_>>>()?;
+            Some((proof, dependencies, payload.ty.clone()))
+        };
         let mut complete_suffixes = BTreeSet::new();
         let mut allocated_sites = BTreeSet::new();
+        let mut active = BTreeSet::new();
+        enum Visit {
+            Enter(BodyKey, (BodyKey, usize), Option<ScalarType>),
+            Exit(BodyKey),
+        }
         for (caller, source, cfg, call, ordinal, choice) in fallible_call_requests {
-            let target = target_body(&declarations, cfg, call)
-                .ok_or_else(|| format!("fallible call initializer requires a checked allocation-free scalar callable in {source:?}"))?;
+            let unsupported = || format!("fallible call initializer requires a checked allocation-free scalar callable in {source:?}");
+            let target = target_body(&declarations, cfg, call).ok_or_else(unsupported)?;
             if allocation_free_integer_graph(target, &mut memo, dependencies) { continue; }
             allocated_sites.insert((caller, ordinal.0));
             if let Some(choice) = choice {
                 fallible_choices.insert((caller, choice.0));
             }
-            let mut visited = BTreeSet::new();
-            let mut current = target;
-            let mut payload = None;
-            let mut incoming = (caller, ordinal.0);
-            loop {
+            let mut work = vec![Visit::Enter(target, (caller, ordinal.0), None)];
+            while let Some(task) = work.pop() {
+                let (current, incoming, expected) = match task {
+                    Visit::Enter(body, incoming, expected) => (body, incoming, expected),
+                    Visit::Exit(body) => {
+                        active.remove(&body);
+                        complete_suffixes.insert(body);
+                        continue;
+                    }
+                };
                 ordinary.transport_uses.entry(current).or_insert_with(|| Some(Vec::new()));
                 fallible_allocating_targets.entry(current).or_default().insert(incoming);
-                // Reusing a proven suffix still records its new incoming use.
-                // Every downstream edge has already been recorded once.
                 let check_payload = |actual: &ScalarType| {
-                    if payload.as_ref().is_some_and(|expected| expected != actual) {
+                    if expected.as_ref().is_some_and(|expected| expected != actual) {
                         Err("sealed fallible allocation relay changes the result payload type".to_owned())
                     } else { Ok(()) }
                 };
                 if complete_suffixes.contains(&current) {
                     check_payload(fallible_payloads.get(&current).ok_or("missing completed fallible allocation payload")?)?;
-                    break;
+                    continue;
                 }
-                if !visited.insert(current) {
+                if !active.insert(current) {
                     return Err("fallible allocating callable relay cycle requires an allocation leaf".into());
                 }
+                work.push(Visit::Exit(current));
                 if let Some((actual, allocations)) = allocation_leaf(current) {
                     check_payload(&actual)?;
                     fallible_payloads.insert(current, actual);
-                    // A sole terminal allocation still uses the original
-                    // branch. Multi-allocation terminals take shared unwind.
                     if allocations.len() > 1 { fallible_prefixes.insert(current, allocations); }
-                    break;
+                } else if let Some((next, ordinal, allocation, actual)) = relay(current) {
+                    check_payload(&actual)?;
+                    work.push(Visit::Enter(next, (current, ordinal.0), Some(actual.clone())));
+                    fallible_payloads.insert(current, actual);
+                    fallible_allocation_relays.insert(current);
+                    fallible_prefixes.insert(current, allocation);
+                } else {
+                    let (proof, mut callees, actual) = scalar_tail(current).ok_or_else(unsupported)?;
+                    check_payload(&actual)?;
+                    callees.retain(|(target, _, _)| !allocation_free_integer_graph(*target, &mut memo, dependencies));
+                    let sealed = callees.iter().map(|(_, ordinal, _)| *ordinal).collect::<HashSet<_>>();
+                    let bound = proof.ordinary_arithmetic_bound(|ordinal| sealed.contains(&ordinal));
+                    if sealed.is_empty() || bound.is_none()
+                        || (actual == ScalarType::U64 && bound.is_some_and(|bound| bound > u64::from(u32::MAX)))
+                    {
+                        return Err("fallible scalar tail does not preserve the sealed result bound".into());
+                    }
+                    fallible_payloads.insert(current, actual);
+                    fallible_allocation_relays.insert(current);
+                    fallible_choices.insert((current, proof.expression.0));
+                    work.extend(callees.into_iter().rev().map(|(callee, ordinal, payload)|
+                        Visit::Enter(callee, (current, ordinal.0), Some(payload))));
                 }
-                let Some((next, ordinal, allocation, actual)) = relay(current) else {
-                    return Err(format!("fallible call initializer requires a checked allocation-free scalar callable in {source:?}"));
-                };
-                check_payload(&actual)?;
-                payload = Some(actual.clone());
-                fallible_payloads.insert(current, actual);
-                fallible_allocation_relays.insert(current);
-                fallible_prefixes.insert(current, allocation);
-                incoming = (current, ordinal.0);
-                current = next;
             }
-            // Publish only paths that reached an authenticated allocation
-            // leaf (directly or through a previously completed suffix).
-            // The all-use check below still applies globally to every node.
-            complete_suffixes.extend(visited);
         }
         for (caller, proof) in fallible_expressions {
             if !proof.proves_ordinary_arithmetic(|occurrence| allocated_sites.contains(&(caller, occurrence.0))) {

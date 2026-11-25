@@ -406,6 +406,8 @@ const MAX_JOINED_REBORROW_ALIASES: usize = 8;
 
 pub(super) struct ReferenceFlowBuilder<'a> {
     capture_call_points: bool,
+    capture_private_scalar_tail: bool,
+    private_scalar_tail_active: bool,
     root_return_points: std::ops::Range<usize>,
     mixed_owners: Option<&'a MixedReceiptAuthority>,
     shared_scalar_read_effects: Option<&'a HashMap<ByteSpan, SharedScalarReadEffect>>,
@@ -547,6 +549,13 @@ impl<'a> ReferenceFlowBuilder<'a> {
             && call_sites.boundary.parameters.iter().all(|slot| aggregate::ordinary_value(&slot.ty));
         Self {
             capture_call_points: false,
+            // Store only exact CFG call ordinals during the traversal already
+            // required for this body. The typed proof is built on demand.
+            capture_private_scalar_tail: super::typecheck::is_module_private_name(&function.name)
+                && function.generic_parameters.is_empty() && function.overload_arms.is_empty()
+                && matches!(&call_sites.plain_names, PlainNameFacts::Prepared(_))
+                && !call_sites.call_occurrences.is_empty(),
+            private_scalar_tail_active: false,
             widened_arrays: None,
             root_return_points: 0..0,
             mixed_owners: None,
@@ -2516,7 +2525,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 if let Some(read_call) = read_call {
                     self.aggregate_facts.read_calls.insert(id, read_call);
                 }
-                if self.capture_call_points {
+                if self.capture_call_points || self.private_scalar_tail_active {
                     let previous = self.cfg.primary_call_points.insert(ordinal, id);
                     assert!(previous.is_none(), "duplicate CFG call for {ordinal:?}");
                 }
@@ -3995,12 +4004,18 @@ impl<'a> ReferenceFlowBuilder<'a> {
     fn guarded_numeric_expression(
         &self, value: &ScalarExpression, ordinal: OccurrenceOrdinal, payload: &ScalarType,
     ) -> Option<aggregate::GuardedNumericExpression> {
+        Self::prove_guarded_numeric_expression(self.call_sites, &self.cfg, value, ordinal, payload)
+    }
+
+    fn prove_guarded_numeric_expression(
+        sites: &FunctionCallSites, cfg: &ScalarReferenceCfg,
+        value: &ScalarExpression, ordinal: OccurrenceOrdinal, payload: &ScalarType,
+    ) -> Option<aggregate::GuardedNumericExpression> {
         if !matches!(payload, ScalarType::U64 | ScalarType::I32 | ScalarType::Bool) { return None; }
         let mut proof = aggregate::GuardedNumericExpression {
             expression: ordinal, calls: Vec::new(), operations: Vec::new(),
         };
         use aggregate::GuardedNumericNode as Node;
-        let sites = self.call_sites;
         let mut stack = vec![(value, ordinal, payload, false)];
         while let Some((value, occurrence, payload, children_proved)) = stack.pop() {
             if sites.structure.checked_types.expressions.get(&occurrence) != Some(payload) {
@@ -4024,10 +4039,10 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         continue;
                     }
                     let signature = sites.checked_call_signatures.get(&occurrence)?;
-                    let point = *self.cfg.primary_call_points.get(&occurrence)?;
+                    let point = *cfg.primary_call_points.get(&occurrence)?;
                     let CfgPointKind::Call { output: 0, argument_points,
                         target: ResolvedCallTarget::ModuleCallable { concrete: ConcreteCallSelection::Declaration, .. }, .. } =
-                        &self.cfg.points.get(point.0)?.kind else { return None; };
+                        &cfg.points.get(point.0)?.kind else { return None; };
                     if !type_arguments.is_empty() || sites.declared_unsafe_calls.contains(&occurrence.0)
                         || !signature.parameters.iter().all(aggregate::ordinary_value)
                         || !matches!(signature.outputs.outputs.as_slice(), [output] if &output.ty == payload)
@@ -4046,7 +4061,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             match argument {
                                 ScalarExpression::Call { .. }
                                     if sites.structure.checked_types.expressions.get(child) == Some(&ScalarType::U64)
-                                        && self.cfg.primary_call_points.get(child) == Some(&argument_points[position]) => {}
+                                        && cfg.primary_call_points.get(child) == Some(&argument_points[position]) => {}
                                 ScalarExpression::Name { .. } | ScalarExpression::Integer { .. } => {}
                                 _ => return None,
                             }
@@ -5861,10 +5876,21 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         && matches!(calls.boundary.root_outputs.as_slice(), [output]
                             if matches!(&output.ty, ScalarType::RuntimeArray { element, .. } if aggregate::ordinary_value(element)))
                         && super::typecheck::guarded_runtime_rhs(expression);
+                    let scalar_tail = self.capture_private_scalar_tail && !block.unsafe_context
+                        && scope == ReferenceScopeId(0)
+                        && matches!(calls.boundary.parameters.as_slice(), [formal] if formal.ty == ScalarType::U64)
+                        && matches!(region.items.as_slice(), [BlockItem { kind: BlockItemKind::FinalOutput(row), .. }]
+                            if row.output == 0 && row.expression == ordinal)
+                        && matches!(expression, ScalarExpression::Binary { .. } | ScalarExpression::If { .. })
+                        && matches!(calls.boundary.root_outputs.as_slice(),
+                            [output] if matches!(output.ty, ScalarType::U64 | ScalarType::I32 | ScalarType::Bool));
                     let previous = self.capture_call_points;
                     self.capture_call_points |= guarded_owner_choice;
+                    let tail_active = self.private_scalar_tail_active;
+                    self.private_scalar_tail_active |= scalar_tail;
                     let value = self.expression_with_read_mode(expression, scope, ordinal, mode);
                     self.capture_call_points = previous;
+                    self.private_scalar_tail_active = tail_active;
                     let value = value?;
                     if guarded_owner_choice {
                         let ty = &calls.boundary.root_outputs[0].ty;
