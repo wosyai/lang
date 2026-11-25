@@ -34,8 +34,8 @@ impl<'a> Goal<'a> {
         Self { operator, terms: [Term::Output, Term::Literal(Cow::Borrowed(bound))] }
     }
 
-    /// Evaluate a normalized one-hole goal when the actual output is known
-    /// and no entry-dependent term was admitted by the caller.
+    /// Evaluate a normalized one-hole goal under an independently established
+    /// literal output. The caller owns that fact and its exact proof context.
     pub(super) fn accepts_literal_output(&self, output: &BigInt) -> Result<bool, ProjectCheck> {
         fn value<'term>(term: &'term Term<'_>, output: &'term BigInt) -> Option<&'term BigInt> {
             match term {

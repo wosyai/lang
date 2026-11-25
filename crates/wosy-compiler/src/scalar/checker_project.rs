@@ -17959,6 +17959,66 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
 
     #[cfg(feature = "internal-checker")]
     #[test]
+    fn ordered_ranked_recursive_rewrites_require_authenticated_smaller_equality() {
+        let app = source("src/main.w", "ordered-ranked-recursive-rewrites");
+        let program = r#"%%start
+            u8(ENTRY) descend = fn(value) { if (value <= BASE) { 4 } else { descend(value - STEP) } };
+            proof rank for descend(entry) -> (out)
+                where (entry >= ZERO && entry <= LIMIT) ensures (out == 4) decreases (entry) {
+                if (entry <= BASE) {
+                    core.show(out == 4);
+                } else {
+                    core.show(entry > BASE);
+                    core.use(rank(entry - STEP));
+                    core.rewrite(out == 4, _ == 4);
+                }
+            }
+        %%end"#;
+        let run = |text: &str, scope| {
+            let (_, proof) = crate::parse_proof_source(app.clone(), text.to_owned(), &[]).ok().unwrap();
+            check_loaded_scalar_ordered_local_proof_contexts(
+                Vec::new(), [(proof, Vec::new())], vec![app.clone()], inputs(), scope, Vec::new(),
+            )
+        };
+        let package = ScalarCheckerScope::CurrentPackage;
+        for (ty, zero, base, step, limit, guarded, stuck) in [
+            ("u8", "0", "0", "1", "8", "1", "0"),
+            ("f32", "0.0", "1.0", "1.0", "1024.0", "1.0", "0.0000000001"),
+            ("f64", "0.0", "1.0", "1.0", "1024.0", "1.0", "0.00000000000000000001"),
+        ] {
+            let text = program.replace("ENTRY", ty).replace("ZERO", zero).replace("BASE", base)
+                .replace("STEP", step).replace("LIMIT", limit);
+            let use_step = format!("core.use(rank(entry - {step}));");
+            let rewrite_step = "core.rewrite(out == 4, _ == 4);";
+            let checked = run(&text, package).unwrap();
+            assert!(checked.active && checked.directives.is_empty() && checked.symbolic_diagnostic.is_none());
+            let reversed = text.replace(rewrite_step, "core.rewrite(4 == out, out == _);");
+            assert!(run(&reversed, package).unwrap().symbolic_diagnostic.is_none());
+            let failed_base = text.replace("core.show(out == 4);", "core.show(out == 5);");
+            let failure = run(&failed_base, package).unwrap().symbolic_diagnostic.unwrap();
+            let span = failure.failed_step.unwrap();
+            assert_eq!(&failed_base[span.range.start as usize..span.range.end as usize], "core.show(out == 5)");
+            assert_eq!(failure.returned, BigInt::from(4));
+            let idle = run(&failed_base, ScalarCheckerScope::MainFlowOnly).unwrap();
+            assert!(!idle.active && idle.symbolic_diagnostic.is_none());
+            for invalid in [
+                text.replace(rewrite_step, "").replace(&use_step, &format!("{rewrite_step} {use_step}")),
+                text.replace(&use_step, ""),
+                text.replace("out == 4, _ == 4", "out == 5, _ == 4"),
+                text.replace("_ == 4", "_ == _"),
+                text.replace("_ == 4", "_ == 5"),
+                text.replace("ensures (out == 4)", "ensures (out <= 4)"),
+                text.replace(&format!("entry >= {zero}"), &format!("entry >= {guarded}")),
+                text.replace(&format!(" - {step}"), &format!(" - {stuck}")),
+                text.replace(&use_step, "core.use(rank(entry));"),
+            ] {
+                assert!(run(&invalid, package).is_err(), "must refuse {invalid}");
+            }
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
     fn ordered_ranked_base_rewrites_require_prior_real_equalities() {
         let app = source("src/main.w", "ordered-ranked-base-rewrites");
         let program = r#"%%start

@@ -463,19 +463,43 @@ pub(super) fn verify<'a>(
             }
         } else {
             charge(&mut work, proof.items.len())?;
-            let (last, before) = proof.items.split_last().ok_or(ProjectCheck::Unsupported)?;
-            let (&terminated, earlier) = proof.terminated_items.split_last().ok_or(ProjectCheck::Unsupported)?;
-            for (show, &terminated) in before.iter().zip(earlier) {
+            let (mut steps, mut terminations) = (proof.items.as_slice(), proof.terminated_items.as_slice());
+            let (last, before) = steps.split_last().ok_or(ProjectCheck::Unsupported)?;
+            let (&terminated, earlier) = terminations.split_last().ok_or(ProjectCheck::Unsupported)?;
+            let rewrite = rewrite::arguments(last);
+            if rewrite.is_some() {
+                charge(&mut work, 6)?;
+                if !terminated { return Err(ProjectCheck::Unsupported); }
+                steps = before;
+                terminations = earlier;
+            }
+            let (self_step, prefix) = steps.split_last().ok_or(ProjectCheck::Unsupported)?;
+            let (&self_terminated, prefix_terminations) = terminations.split_last().ok_or(ProjectCheck::Unsupported)?;
+            for (show, &terminated) in prefix.iter().zip(prefix_terminations) {
                 let claim = proof_show_expression(show, terminated)?;
                 if !path.proves_entry_show(claim, typed, rank, &mut work)? {
                     // No actual returned value is known at this recursive leaf.
                     return Err(ProjectCheck::Unsupported);
                 }
             }
-            let args = self_use(plan.name, last, terminated, typed, rank)?;
+            let args = self_use(plan.name, self_step, self_terminated, typed, rank)?;
             check_tail(plan, rank, output, runtime, &args)?;
             matched_calls += 1;
-            match path.transition(&entry, rank, &args, &mut work)? {
+            let next = path.transition(&entry, rank, &args, &mut work)?;
+            if let Some((equation, context)) = rewrite {
+                let TypedProofGoal::Literal { operator: operator @ BinaryOperator::Equal, bound, .. } = &typed.goal
+                    else { return Err(ProjectCheck::Unsupported); };
+                if !matches!(next, InductionPremise::Established) { return Err(ProjectCheck::Unsupported); }
+                // This output is the exact authenticated smaller call's return.
+                // Only its original induction equality is available here; no
+                // actual value is produced, cached or reported by this step.
+                let mut goal = rewrite::Goal::new(operator, bound);
+                goal.apply(equation, context, &typed.output, typed.result_type, None, |premise| {
+                    Ok(matches!(premise, rewrite::Premise::Literal(value) if value == bound))
+                })?;
+                if !goal.accepts_literal_output(bound)? { return Err(ProjectCheck::InvalidProof); }
+            }
+            match next {
                 InductionPremise::Unreachable => {}
                 next if matches!(premise, InductionPremise::Unreachable | InductionPremise::Established) => premise = next,
                 _ => {}
