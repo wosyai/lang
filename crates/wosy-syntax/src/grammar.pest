@@ -91,7 +91,8 @@ struct_literal = { "{" ~ struct_literal_field* ~ "}" }
 struct_literal_field = { "." ~ identifier ~ "=" ~ expression ~ ";" }
 array_literal = { "[" ~ (expression ~ ("," ~ expression)*)? ~ "]" }
 raw_address = { "&?" ~ place_target }
-checked_address = { "&" ~ checked_address_mutability? ~ (place_target | indexed_dereference_place | parenthesized_dereference_place) }
+checked_address = { "&" ~ checked_address_mutability? ~ (checked_indexed_field_place | place_target | indexed_dereference_place | parenthesized_dereference_place) }
+checked_indexed_field_place = { identifier ~ index_suffix ~ index_field_suffix }
 checked_address_mutability = { "!" }
 parenthesized_dereference_place = { "(" ~ dereference ~ ")" }
 indexed_dereference_place = { parenthesized_dereference_place ~ index_suffix+ }

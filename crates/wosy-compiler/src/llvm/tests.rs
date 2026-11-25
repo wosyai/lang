@@ -18372,3 +18372,70 @@ if (inspect(2,0,1) != 303) { core.system_panic(); };
         }
     }
 }
+
+#[test]
+fn runtime_copy_field_borrow_uses_original_extent_and_reborrows_saved_address() {
+    let text = "%%start
+struct copy Cell { u8 tag; bool ready; u64 value; }
+u64(u64,u64) observe = fn(count,index) {
+    Cell[count] cells;
+    cells[index].tag = 7;
+    cells[index].value = 101;
+    *u8 tag = &cells[index].tag;
+    *!u64 parent = &!cells[index].value;
+    *!u64 child = &!(*parent);
+    *child = 202;
+    u64 discovered = *parent;
+    if (*tag == 7) { discovered } else { 0 }
+};
+if (observe(2,1) != 202) { core.system_panic(); };
+%%end";
+    for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let source = SourceIdentity::new("project".into(), "package".into(), "src/main.w".into(), "r1".into());
+        let prepare = |text: &str| {
+            let parsed = parse_source(source.clone(), text.to_owned(), &[]);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            crate::prepare_scalar_project_with_access(
+                vec![(derive_scalar_declarations_from_cst(parsed.result.canonical_cst()), Vec::new())],
+                vec![source.clone()], ScalarPreparationInputs { target_layout },
+                Some(wosy_stdlib_source::CheckedAccessComponent::linked()))
+        };
+        let prepared = prepare(text).unwrap_or_else(|error| panic!("{:?}", error.diagnostics));
+        let checked = analyze_scalar_build(&prepared);
+        assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+        let ir = emit_scalar_build_project_llvm(&checked).unwrap().to_text();
+        let body = self_tail_test_body(&ir, "i64", &project_function_name(&source, "observe"));
+        let bounds = format!("call void @{}(", project_function_name(prepared.checked_access_source().unwrap(), "check_index_in_extent"));
+        let extent = loaded_runtime_extent_parameter(body, "count");
+        let stride = "getelementptr inbounds [16 x i8], ptr ";
+        assert_eq!(body.matches(&bounds).count(), 4, "{body}");
+        assert_eq!(body.matches(stride).count(), 4, "{body}");
+        for (checked, address) in body.split(stride).zip(body.split(stride).skip(1)) {
+            assert_eq!(checked.matches(&bounds).count(), 1, "{checked}");
+            let arguments = checked.split_once(&bounds).unwrap().1.lines().next().unwrap();
+            let (selector, count) = arguments.strip_prefix("i64 ").unwrap().split_once(", i64 ").unwrap();
+            assert_eq!(count, format!("{extent})"), "{checked}");
+            let row = address.lines().next().unwrap();
+            assert!(row.ends_with(&format!(" {selector}")), "{row}");
+        }
+        assert_eq!(body.matches("call void @__wosy_core_free").count(), 1, "{body}");
+        let conflict = text.replace("    *child = 202;", "    *parent = 300;\n    *child = 202;");
+        let diagnostics = match prepare(&conflict) {
+            Ok(prepared) => analyze_scalar_build(&prepared).diagnostics().to_vec(),
+            Err(error) => error.diagnostics.clone(),
+        };
+        let write = conflict.find("*parent = 300").unwrap() as u32 + 1;
+        let creation = conflict.find("&!(*parent)").unwrap() as u32;
+        assert!(diagnostics.iter().any(|diagnostic| diagnostic.code == "B0003"
+            && diagnostic.message == "read or move of unavailable place"
+            && diagnostic.labels.first().is_some_and(|label| label.span.range == ByteSpan::new(write, write + 6))
+            && diagnostic.labels.iter().any(|label| label.span.range == ByteSpan::new(creation, creation + 11)
+                && label.message == "origin of conflicting place or loan")), "{diagnostics:?}");
+        if let Some(out) = std::env::var_os("WOSY_DEV4_FIELD_LOAN_IR_DIR") {
+            let target = if target_layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
+            let controlled = ir.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);
+            assert_ne!(controlled, ir);
+            std::fs::write(std::path::PathBuf::from(out).join(format!("{target}-field-loan.ll")), controlled).unwrap();
+        }
+    }
+}

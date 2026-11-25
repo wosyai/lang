@@ -5408,6 +5408,23 @@ fn checked_address_type_in_module(
         }
         return ScalarType::Error;
     }
+    if let ScalarPlace::Field { base, field: ScalarFieldReference::Resolved(field), .. } = place {
+        if matches!(base.as_ref(), ScalarPlace::Index { base, .. }
+            if matches!(base.as_ref(), ScalarPlace::Name { name, .. }
+                if matches!(scope.get(name), Some(ScalarType::RuntimeArray { element, .. })
+                    if matches!(element.as_ref(), ScalarType::Struct(id) if id == &field.structure))))
+        {
+            let inner = place_type_in_module(place, scope, module, modules, diagnostics, overloads, inference);
+            if super::reference::aggregate::ordinary_value(&inner) {
+                return ScalarType::CheckedReference { mutability, inner: Box::new(inner) };
+            }
+            if inner != ScalarType::Error {
+                diagnostics.push(module_diagnostic(module, "B0003",
+                    "checked runtime field borrow requires an ordinary Copy field", span));
+            }
+            return ScalarType::Error;
+        }
+    }
     if !is_supported_checked_address_place(place) {
         diagnostics.push(module_diagnostic(
             module,

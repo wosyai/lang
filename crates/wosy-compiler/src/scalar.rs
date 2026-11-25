@@ -687,6 +687,7 @@ pub(crate) struct RuntimeArrayFieldSite {
     pub(crate) leaf: usize,
     pub(crate) prefix: usize,
     pub(crate) selector: usize,
+    pub(crate) borrow: Option<(ScalarReferenceMutability, ReferenceOriginId)>,
 }
 
 #[cfg_attr(not(test), derive(Clone))]
@@ -788,12 +789,23 @@ impl ScalarReferenceCfg {
         &self, point: CfgPointId, site: &RuntimeArrayFieldSite,
     ) -> bool {
         let Some(point) = self.points.get(point.0) else { return false; };
-        let place = match &point.kind {
-            CfgPointKind::ReadPlace { pointer_point: None, candidates, reads_origin: false, .. } => {
+        let place = match (&point.kind, site.borrow) {
+            (CfgPointKind::ReadPlace { pointer_point: None, candidates, reads_origin: false, .. }, None) => {
                 let [place] = candidates.as_slice() else { return false; };
                 place
             }
-            CfgPointKind::Assign { target, .. } => target,
+            (CfgPointKind::Assign { target, .. }, None) => target,
+            (CfgPointKind::Borrow { place, loan }, Some((mode, origin))) => {
+                let Some(ReferenceOrigin::Fresh { allocation, loan: issued }) = self.facts.get(origin.0)
+                    else { return false; };
+                if loan.mode != mode || loan.parent.is_some() || &loan.origin_place != place || issued != loan
+                    || allocation.source != point.source_span.source || allocation.function_span != place.function_span
+                    || allocation.declaration_span != site.owner.declaration_span
+                    || allocation.creation_span != loan.creation_span || loan.creation_span != point.source_span.range
+                    || !point.possible_origins.as_ref().is_some_and(|ids| ids.len() == 1 && ids.contains(&origin))
+                { return false; }
+                place
+            }
             _ => return false,
         };
         if place.binding != site.owner || place.declaration_span != site.owner.declaration_span

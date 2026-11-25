@@ -97,6 +97,7 @@ pub(crate) struct CallablePointFacts {
     pub(super) joined_shared_return_calls: Vec<(super::CfgPointId, super::CfgPointId)>,
     pub(super) joined_checked_releases: Vec<super::CfgPointId>,
     pub(super) named_reborrow_parents: Vec<NamedReborrowParent>,
+    pub(super) runtime_field_borrows: HashMap<ByteSpan, (super::CfgPointId, super::ReferenceOriginId)>,
     pub(super) formals: HashMap<usize, super::ReferenceBindingId>,
     pub(super) scalar_descriptor_install: ScalarDescriptorCandidates,
     pub(super) backing_descriptor_install: ScalarDescriptorCandidates,
