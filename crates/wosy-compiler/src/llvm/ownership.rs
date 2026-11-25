@@ -1380,7 +1380,7 @@ pub(super) fn emit_runtime_array_allocation_with_absence<'ctx, 'module>(
     element: &ScalarType,
     length: inkwell::values::IntValue<'ctx>,
     checked_extent: bool,
-    relay_prefix: Option<&[PointerValue<'ctx>]>,
+    relay_unwind: Option<inkwell::basic_block::BasicBlock<'ctx>>,
 ) -> Result<PointerValue<'ctx>, String> {
     declare_core_runtime(context, state.module);
     let (element_size, alignment) = allocation_layout(element, state.layouts, state.target_layout)?;
@@ -1389,7 +1389,7 @@ pub(super) fn emit_runtime_array_allocation_with_absence<'ctx, 'module>(
         .get_insert_block()
         .and_then(|block| block.get_parent())
         .ok_or_else(|| "runtime allocation has no containing function".to_owned())?;
-    let recover = relay_prefix.is_some() || state.aggregate.as_ref().is_some_and(|aggregate| aggregate.plan().fallible_allocation_leaf);
+    let recover = state.aggregate.as_ref().is_some_and(|aggregate| aggregate.plan().fallible_allocation_leaf);
     let integer = context.i64_type();
     // The checked extent also guarantees the target's signed LLVM pointer
     // index domain. Reuse the constructor's existing size-overflow branch
@@ -1405,7 +1405,7 @@ pub(super) fn emit_runtime_array_allocation_with_absence<'ctx, 'module>(
     };
     let limit = (element_size != 0).then(|| max_bytes / element_size).filter(|&limit|
         limit != u64::MAX && !length.get_zero_extended_constant().is_some_and(|constant| constant <= limit));
-    let panic_block = (!recover || limit.is_some()).then(|| context.append_basic_block(function, "allocation_panic"));
+    let panic_block = ((!recover && relay_unwind.is_none()) || limit.is_some()).then(|| context.append_basic_block(function, "allocation_panic"));
     if let Some(limit) = limit {
         let overflow = state.builder.build_int_compare(
             IntPredicate::UGT, length, integer.const_int(limit, false), "allocation_size_overflow",
@@ -1423,7 +1423,9 @@ pub(super) fn emit_runtime_array_allocation_with_absence<'ctx, 'module>(
         ).map_err(builder_error)?,
     };
     let continue_block = context.append_basic_block(function, "allocation_continue");
-    let allocation_failure = if recover {
+    let allocation_failure = if let Some(unwind) = relay_unwind {
+        unwind
+    } else if recover {
         context.append_basic_block(function, "allocation_absent")
     } else {
         panic_block.expect("ordinary allocation panic block")
@@ -1433,11 +1435,6 @@ pub(super) fn emit_runtime_array_allocation_with_absence<'ctx, 'module>(
     )?;
     if recover {
         state.builder.position_at_end(allocation_failure);
-        for pointer in relay_prefix.unwrap_or_default().iter().rev() {
-            consume_runtime_array_release(context, state, RuntimeArrayRelease {
-                pointer: (*pointer).into(), live: None,
-            })?;
-        }
         let absent = super::aggregate_transfer::fallible_allocation_result_type(context).const_zero();
         state.builder.build_return(Some(&absent)).map_err(builder_error)?;
     }
@@ -1450,6 +1447,37 @@ pub(super) fn emit_runtime_array_allocation_with_absence<'ctx, 'module>(
     }
     state.builder.position_at_end(continue_block);
     Ok(allocation)
+}
+
+fn relay_failure_block<'ctx>(
+    context: &'ctx Context, state: &EmitState<'ctx, '_>, name: &str,
+) -> Result<(inkwell::basic_block::BasicBlock<'ctx>, inkwell::basic_block::BasicBlock<'ctx>), String> {
+    let continuation = state.builder.get_insert_block().ok_or("missing sealed relay continuation")?;
+    let function = continuation.get_parent().ok_or("missing sealed relay function")?;
+    Ok((continuation, context.append_basic_block(function, name)))
+}
+
+pub(super) fn emit_relay_absence<'ctx>(
+    context: &'ctx Context, state: &mut EmitState<'ctx, '_>,
+) -> Result<inkwell::basic_block::BasicBlock<'ctx>, String> {
+    let (continuation, absent) = relay_failure_block(context, state, "allocation_absent")?;
+    state.builder.position_at_end(absent);
+    let value = super::aggregate_transfer::fallible_allocation_result_type(context).const_zero();
+    state.builder.build_return(Some(&value)).map_err(builder_error)?;
+    state.builder.position_at_end(continuation);
+    Ok(absent)
+}
+
+pub(super) fn emit_relay_unwind<'ctx>(
+    context: &'ctx Context, state: &mut EmitState<'ctx, '_>, pointer: PointerValue<'ctx>,
+    prior: inkwell::basic_block::BasicBlock<'ctx>,
+) -> Result<inkwell::basic_block::BasicBlock<'ctx>, String> {
+    let (continuation, unwind) = relay_failure_block(context, state, "allocation_unwind")?;
+    state.builder.position_at_end(unwind);
+    consume_runtime_array_release(context, state, RuntimeArrayRelease { pointer: pointer.into(), live: None })?;
+    state.builder.build_unconditional_branch(prior).map_err(builder_error)?;
+    state.builder.position_at_end(continuation);
+    Ok(unwind)
 }
 
 pub(super) fn binding_receivers(binding: &crate::ScalarBinding) -> Vec<(String, ScalarType)> {

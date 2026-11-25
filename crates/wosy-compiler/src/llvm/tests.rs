@@ -12892,13 +12892,13 @@ fn guarded_fallible_allocating_call_skips_outer_materialization_on_absence() {
     use inkwell::{memory_buffer::MemoryBuffer, values::{CallSiteValue, InstructionOpcode}};
     let text = "%%start
 u64(u64) _measure = fn(count) { u8[count] scratch; core.array_len(&scratch) };
-u64(u64) _middle = fn(count) { u8[count] first; core.array_len(&first); u8[count] second; core.array_len(&second); _measure(count) };
+u64(u64) _middle = fn(count) { u8[count] first; core.array_len(&first); u8[count] second; core.array_len(&second); u8[count] third; core.array_len(&third); _measure(count) };
 u64(u64) _entry = fn(count) { _middle(count) };
 u64(u64) observed = fn(count) {
     u64 result =? _entry(count);
     if (&result == null) { 0 } else { result + 1 }
 };
-if (observed(7) != 0 || observed(7) != 0 || observed(7) != 0 || observed(7) != 0 || observed(7) != 8 || observed(0) != 1) { core.system_panic(); };
+if (observed(7) != 0 || observed(7) != 0 || observed(7) != 0 || observed(7) != 0 || observed(7) != 0 || observed(7) != 8 || observed(0) != 1) { core.system_panic(); };
 %%end";
     let mixed = text.replace("u64 result =?", "u64 ordinary = _middle(count); ordinary; u64 result =?");
     for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
@@ -12951,41 +12951,41 @@ if (observed(7) != 0 || observed(7) != 0 || observed(7) != 0 || observed(7) != 0
                             && known_field_operand(*instruction, 0).and_then(|operand| operand.as_instruction_value()) == Some(forwarded))
                         .unwrap();
                     if name == "_middle" {
-                        let [first, second] = calls_to(relay, alloc)[..] else { panic!("{llvm}") };
+                        let [first, second, third] = calls_to(relay, alloc)[..] else { panic!("{llvm}") };
                         let releases = calls_to(relay, free);
-                        assert_eq!(releases.len(), 3);
+                        assert_eq!(releases.len(), 5);
                         let pointer = |instruction| known_field_operand(instruction, 0).unwrap().as_instruction_value();
-                        // Function block-list insertion order is not execution order.
-                        let release_first = forwarded.get_next_instruction().unwrap();
-                        let release_second = release_first.get_next_instruction().unwrap();
-                        assert!(releases.contains(&release_first) && releases.contains(&release_second));
-                        assert_eq!(pointer(release_first), Some(first));
-                        assert_eq!(pointer(release_second), Some(second));
-                        assert_eq!(release_second.get_next_instruction(), Some(returned_forward));
-                        let prefix_release = releases.into_iter()
-                            .find(|release| *release != release_first && *release != release_second).unwrap();
-                        assert_eq!(pointer(prefix_release), Some(first));
-                        let absent = relay.get_basic_blocks().into_iter()
-                            .filter(|block| block.get_name().to_bytes().starts_with(b"allocation_absent"))
-                            .collect::<Vec<_>>();
-                        assert_eq!(absent.len(), 2);
-                        let first_absent = absent.iter().find(|block| block.get_name().to_bytes() == b"allocation_absent").unwrap();
-                        let second_absent = absent.iter().find(|block| **block != *first_absent).unwrap();
-                        for (allocation, absent) in [(first, *first_absent), (second, *second_absent)] {
-                            let null_check = allocation.get_next_instruction().unwrap();
-                            assert_eq!(null_check.get_opcode(), InstructionOpcode::ICmp);
-                            assert_eq!(known_field_operand(null_check, 0).unwrap().as_instruction_value(), Some(allocation));
-                            assert!(known_field_operand(null_check, 1).unwrap().into_pointer_value().is_null());
-                            let branch = null_check.get_next_instruction().unwrap();
-                            assert_eq!(branch.get_opcode(), InstructionOpcode::Br);
-                            assert_eq!(known_field_operand(branch, 0).unwrap().as_instruction_value(), Some(null_check));
-                            assert!(branch.get_operands().any(|operand| operand.and_then(|operand| operand.block()) == Some(absent)));
+                        let mut cursor = forwarded;
+                        for expected in [first, second, third] {
+                            cursor = cursor.get_next_instruction().unwrap();
+                            assert!(releases.contains(&cursor));
+                            assert_eq!(pointer(cursor), Some(expected));
                         }
-                        assert_eq!(prefix_release.get_parent(), Some(*second_absent));
-                        assert_eq!(prefix_release.get_next_instruction(), second_absent.get_terminator());
-                        assert!(absent.iter().all(|block| block.get_terminator()
-                            .is_some_and(|instruction| instruction.get_opcode() == InstructionOpcode::Return)));
-                        assert_eq!(first_absent.get_first_instruction(), first_absent.get_terminator());
+                        assert_eq!(cursor.get_next_instruction(), Some(returned_forward));
+                        let blocks = relay.get_basic_blocks();
+                        let absent = *blocks.iter().find(|block| block.get_name().to_bytes() == b"allocation_absent").unwrap();
+                        let unwind = blocks.iter().copied().filter(|block|
+                            block.get_name().to_bytes().starts_with(b"allocation_unwind")).collect::<Vec<_>>();
+                        assert_eq!(unwind.len(), 2);
+                        let mut prior = absent;
+                        for expected in [first, second] {
+                            let release = *releases.iter().find(|&&release| pointer(release) == Some(expected)
+                                && release.get_parent().is_some_and(|block| unwind.contains(&block))).unwrap();
+                            let block = release.get_parent().unwrap();
+                            assert_eq!(block.get_first_instruction(), Some(release));
+                            let jump = release.get_next_instruction().unwrap();
+                            assert_eq!(jump.get_opcode(), InstructionOpcode::Br);
+                            assert_eq!(jump.get_num_operands(), 1);
+                            assert!(jump.get_operands().any(|operand| operand.and_then(|operand| operand.block()) == Some(prior)));
+                            let next_allocation = if expected == first { second } else { third };
+                            let branch = next_allocation.get_parent().unwrap().get_terminator().unwrap();
+                            assert!(branch.get_operands().any(|operand| operand.and_then(|operand| operand.block()) == Some(block)));
+                            prior = block;
+                        }
+                        let first_branch = first.get_parent().unwrap().get_terminator().unwrap();
+                        assert!(first_branch.get_operands().any(|operand| operand.and_then(|operand| operand.block()) == Some(absent)));
+                        assert_eq!(absent.get_first_instruction(), absent.get_terminator());
+                        assert_eq!(absent.get_terminator().unwrap().get_opcode(), InstructionOpcode::Return);
                     } else {
                         assert!(calls_to(relay, alloc).is_empty() && calls_to(relay, free).is_empty());
                         assert!(relay.get_basic_blocks().into_iter().all(|block|
@@ -13004,7 +13004,7 @@ if (observed(7) != 0 || observed(7) != 0 || observed(7) != 0 || observed(7) != 0
                 let branch = flag.get_next_instruction().unwrap();
                 assert_eq!(branch.get_opcode(), InstructionOpcode::Br);
                 assert_eq!(known_field_operand(branch, 0).unwrap().as_instruction_value(), Some(flag));
-                if let Some(out) = std::env::var_os("WOSY_FALLIBLE_TWO_OWNING_RELAY_IR_DIR") {
+                if let Some(out) = std::env::var_os("WOSY_FALLIBLE_LINEAR_OWNING_RELAY_IR_DIR") {
                     let target = if layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
                     let route = if in_project { "project" } else { "standalone" };
                     let controlled = llvm.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);

@@ -6809,7 +6809,7 @@ fn closed_aggregates<'a>(
             { return None; }
             let (last, prefix) = function.body.items.split_last()?;
             if !matches!(last, ScalarBlockItem::Expression(ScalarExpression::Call { .. }))
-                || !matches!(prefix.len(), 0 | 2 | 4)
+                || prefix.len() % 2 != 0
             { return None; }
             let sites = input.calls.function_body(key.1, None)?;
             let [formal] = sites.boundary.parameters.as_slice() else { return None; };
@@ -6832,6 +6832,9 @@ fn closed_aggregates<'a>(
             if !cfg.guarded_scalar_allocations().is_empty() { return None; }
             let formal = parameter_binding_identity(input.source, function.span, root.span, formal);
             if cfg.allocations.len() != observers.len() { return None; }
+            let mut owner_by_span = cfg.allocations.iter().map(|owner| (owner.declaration_span, owner))
+                .collect::<HashMap<_, _>>();
+            if owner_by_span.len() != cfg.allocations.len() { return None; }
             let mut owners = Vec::new();
             let mut allocations = Vec::new();
             for (index, (items, observer)) in prefix.chunks_exact(2).zip(observers).enumerate() {
@@ -6845,8 +6848,7 @@ fn closed_aggregates<'a>(
                         if *expression == observer.ordinal)
                     || sites.sites.get(observer.site)?.target != ResolvedCallTarget::Core(CoreOperationId::ArrayLen)
                 { return None; }
-                let owner = cfg.allocations.iter().find(|owner| owner.declaration_span == receiver.name_span)?;
-                if owners.contains(&owner) { return None; }
+                let owner = owner_by_span.remove(&receiver.name_span)?;
                 let BlockItemKind::Binding(region) = &root.items.get(index * 2)?.kind else { return None; };
                 let BindingInitialization::Allocation { lengths } = &region.initialization else { return None; };
                 let [length] = lengths.as_slice() else { return None; };
@@ -6873,13 +6875,24 @@ fn closed_aggregates<'a>(
             let ([read], [output]) = (argument_points.as_slice(), point.successors.as_slice()) else { return None; };
             let read = points.get(read.0)?;
             let output = points.get(output.0)?;
-            let mut permitted = BTreeSet::new();
+            let mut predecessor = vec![None; points.len()];
+            for (index, candidate) in points.iter().enumerate() {
+                if candidate.id.0 != index { return None; }
+                match candidate.successors.as_slice() {
+                    [] => {},
+                    [next] if next.0 > index => {
+                        if predecessor.get_mut(next.0)?.replace(candidate).is_some() { return None; }
+                    }
+                    _ => return None,
+                }
+            }
+            let prior = |id: CfgPointId| predecessor.get(id.0).copied().flatten();
+            let mut permitted = vec![false; points.len()];
             // Every earlier observing loan is confined to its own adjacent call.
             // Each prefix segment must run on the same fallthrough path.
             let mut next = read.id;
             for (&owner, allocation) in owners.iter().zip(allocations).rev() {
-                let observed = points.iter().find(|candidate| candidate.successors.as_slice() == [next]
-                    && matches!(candidate.kind, CfgPointKind::Call {
+                let observed = prior(next).filter(|candidate| matches!(candidate.kind, CfgPointKind::Call {
                         target: ResolvedCallTarget::Core(CoreOperationId::ArrayLen), output: 0, ..
                     }))?;
                 let CfgPointKind::Call { argument_points, .. } = &observed.kind else { return None; };
@@ -6890,18 +6903,18 @@ fn closed_aggregates<'a>(
                         if &place.binding == owner && place.projections.is_empty()
                             && loan.mode == ScalarReferenceMutability::Shared)
                 { return None; }
-                let bind = points.iter().find(|candidate| candidate.successors.as_slice() == [borrow.id]
-                    && matches!(&candidate.kind, CfgPointKind::Bind { binding } if binding == owner))?;
-                let zero = points.iter().find(|candidate| candidate.successors.as_slice() == [bind.id]
-                    && matches!(&candidate.kind, CfgPointKind::Evaluate(value) if value == &allocation.value))?;
-                permitted.extend([zero.id, bind.id, borrow.id, observed.id]);
+                let bind = prior(borrow.id).filter(|candidate|
+                    matches!(&candidate.kind, CfgPointKind::Bind { binding } if binding == owner))?;
+                let zero = prior(bind.id).filter(|candidate|
+                    matches!(&candidate.kind, CfgPointKind::Evaluate(value) if value == &allocation.value))?;
+                for id in [zero.id, bind.id, borrow.id, observed.id] { permitted[id.0] = true; }
                 next = zero.id;
                 // Some prepared routes record the allocation's exact length
                 // read as a separate point immediately before its placeholder.
-                if let Some(length) = points.iter().find(|candidate| candidate.successors.as_slice() == [next]
-                    && matches!(&candidate.kind, CfgPointKind::Read { binding } if binding == &formal))
+                if let Some(length) = prior(next).filter(|candidate|
+                    matches!(&candidate.kind, CfgPointKind::Read { binding } if binding == &formal))
                 {
-                    permitted.insert(length.id);
+                    permitted[length.id.0] = true;
                     next = length.id;
                 }
             }
@@ -6911,7 +6924,7 @@ fn closed_aggregates<'a>(
                 || !points.iter().all(|candidate| match &candidate.kind {
                     CfgPointKind::Entry | CfgPointKind::ScopeEnter | CfgPointKind::ScopeExit | CfgPointKind::Return => true,
                     CfgPointKind::Bind { binding } if binding == &formal => true,
-                    _ => [read.id, point.id, output.id].contains(&candidate.id) || permitted.contains(&candidate.id),
+                    _ => [read.id, point.id, output.id].contains(&candidate.id) || permitted[candidate.id.0],
                 })
             { return None; }
             Some((target_body(&declarations, cfg, point.id)?, occurrence.ordinal,

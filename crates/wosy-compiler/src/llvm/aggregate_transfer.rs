@@ -88,6 +88,8 @@ struct LiteralArrayBranchOriginal<'ctx> {
 
 pub(super) struct AggregateEmitter<'ctx, 'plan> {
     plan: &'plan ClosedBody,
+    pub(super) fallible_relay_next: usize,
+    pub(super) fallible_relay_unwind: Option<inkwell::basic_block::BasicBlock<'ctx>>,
     pub(super) borrowed_extent: Option<inkwell::values::IntValue<'ctx>>,
     destination: Option<PointerValue<'ctx>>,
     ordinary_destination: Option<PointerValue<'ctx>>,
@@ -230,6 +232,8 @@ impl<'ctx, 'plan> AggregateEmitter<'ctx, 'plan> {
         }).collect::<Result<Vec<_>, _>>()?;
         Ok(Some(Self {
             plan,
+            fallible_relay_next: 0,
+            fallible_relay_unwind: None,
             borrowed_extent: None,
             inputs,
             destination,

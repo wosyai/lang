@@ -2126,24 +2126,23 @@ fn store_runtime_allocation<'ctx, 'module>(
     let tracked_extent = checked_extent || (prepared && state.observed_runtime_allocations.as_deref()
         .is_some_and(|owners| owners.binary_search(&declaration).is_ok()));
     aggregate_transfer::capture_borrowed_extent(state, receiver.name_span, length)?;
-    let relay_allocations = state.aggregate.as_ref().and_then(|aggregate| {
+    let relay_site = state.aggregate.as_ref().and_then(|aggregate| {
         let owners = &aggregate.plan().fallible_relay_allocations;
-        owners.iter().position(|span| *span == receiver.name_span).map(|i| &owners[..i])
+        (!owners.is_empty()).then_some((owners.get(aggregate.fallible_relay_next).copied(),
+            aggregate.fallible_relay_next + 1 < owners.len(), aggregate.fallible_relay_unwind))
     });
-    if relay_allocations.is_some() && (!prepared || mutable || widened || !tracked_extent) {
+    if relay_site.is_some_and(|(expected, _, _)|
+        expected != Some(receiver.name_span) || !prepared || mutable || widened || !tracked_extent)
+    {
         return Err("invalid sealed fallible allocation relay backing".into());
     }
-    let failure_prefix = relay_allocations.map(|prefix| {
-        prefix.iter().map(|span| {
-            let mut backing = state.local_runtime_extents.iter().filter_map(|(pointer, (owner, extent, _))|
-                (*owner == *span && matches!(extent, LocalRuntimeExtent::Construction(_))).then_some(*pointer));
-            let pointer = backing.next().ok_or("missing installed sealed fallible relay prefix backing")?;
-            if backing.next().is_some() { return Err("ambiguous installed sealed fallible relay prefix backing"); }
-            Ok(pointer)
-        }).collect::<Result<Vec<_>, _>>()
-    }).transpose()?;
+    let relay_unwind = match relay_site {
+        None => None,
+        Some((_, _, Some(unwind))) => Some(unwind),
+        Some((_, _, None)) => Some(ownership::emit_relay_absence(context, state)?),
+    };
     let slot = ownership::emit_runtime_array_allocation_with_absence(
-        context, state, element, length, checked_extent, failure_prefix.as_deref(),
+        context, state, element, length, checked_extent, relay_unwind,
     )?;
     initialize(state, slot)?;
     aggregate_transfer::record_allocation(state, binding, &receiver.name, slot)?;
@@ -2164,6 +2163,16 @@ fn store_runtime_allocation<'ctx, 'module>(
         state
             .runtime_array_allocations
             .insert(receiver.name.clone(), true);
+        if let (Some((_, has_next, _)), Some(unwind)) = (relay_site, relay_unwind) {
+            let unwind = if has_next {
+                ownership::emit_relay_unwind(context, state, slot, unwind)?
+            } else {
+                unwind
+            };
+            let aggregate = state.aggregate.as_mut().ok_or("missing sealed fallible relay plan")?;
+            aggregate.fallible_relay_next += 1;
+            aggregate.fallible_relay_unwind = Some(unwind);
+        }
         return Ok(());
     }
     let backing = entry_alloca(

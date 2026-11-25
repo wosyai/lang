@@ -180,7 +180,10 @@ pub(super) fn emit_return<'ctx, 'module>(
     value: EmitValue<'ctx>,
     outputs: &crate::ScalarOutputSequence,
 ) -> Result<(), String> {
-    if state.aggregate.as_ref().is_some_and(|aggregate| aggregate.plan().fallible_allocation_relay) {
+    if let Some(aggregate) = state.aggregate.as_ref().filter(|aggregate| aggregate.plan().fallible_allocation_relay) {
+        if aggregate.fallible_relay_next != aggregate.plan().fallible_relay_allocations.len() {
+            return Err("incomplete sealed fallible allocation relay backing".into());
+        }
         let value = take_basic(value)?;
         if !matches!(value, BasicValueEnum::StructValue(pair)
             if pair.get_type() == super::aggregate_transfer::fallible_allocation_result_type(context))
