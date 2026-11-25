@@ -6986,15 +6986,15 @@ impl<'a> MainFlowProofCase<'a> {
             TypedProofGoal::Existential { relation, witness, witness_in_domain } => Some((
                 Quantified::Comparison(None, *relation, witness), Some(!*witness_in_domain),
             )),
-            TypedProofGoal::EntryWitness { slot: 0, relation, domain, offset } if body.boundary.parameters.len() == 1 =>
-                Some((Quantified::EntryWitness { relation: *relation, domain, bounds: None,
+            TypedProofGoal::EntryWitness { slot, relation, domain, offset } if matches!(body.boundary.parameters.len(), 1 | 2) =>
+                Some((Quantified::EntryWitness { slot: *slot, relation: *relation, domain, bounds: None,
                     translation: offset.as_ref().map(|offset| (offset, plan.typed.result_type)) }, Some(false))),
             TypedProofGoal::ConjunctiveExistential(goal) => match &goal.witness {
                 ConjunctiveWitness::Literal(candidate, _) =>
                     Some((Quantified::Comparison(Some(&goal.output), goal.relation, candidate),
                         Some(goal.domain.first_intersection_point(candidate, candidate).is_none()))),
-                ConjunctiveWitness::Formal { slot: 0, offset } if body.boundary.parameters.len() == 1 =>
-                    Some((Quantified::EntryWitness { relation: goal.relation, domain: &goal.domain, bounds: Some(&goal.output),
+                ConjunctiveWitness::Formal { slot, offset } if matches!(body.boundary.parameters.len(), 1 | 2) =>
+                    Some((Quantified::EntryWitness { slot: *slot, relation: goal.relation, domain: &goal.domain, bounds: Some(&goal.output),
                         translation: offset.as_ref().map(|offset| (offset, plan.typed.result_type)) }, Some(false))),
                 ConjunctiveWitness::Formal { .. } => return Err(ProjectCheck::Unsupported),
             },
@@ -7016,7 +7016,11 @@ impl<'a> MainFlowProofCase<'a> {
                 return Err(ProjectCheck::Unsupported);
             }
             let filter = plan.filter.as_deref().unwrap_or_default();
-            let guard = checked_scalar_guard_slots::<false>(body, filter, false, false).ok_or(ProjectCheck::Unsupported)?;
+            let guard = if configured_paired_formal_witness(body, &plan.typed.goal) {
+                checked_scalar_guard_slots::<true>(body, filter, false, false)
+            } else {
+                checked_scalar_guard_slots::<false>(body, filter, false, false)
+            }.ok_or(ProjectCheck::Unsupported)?;
             let ensures = child(plan.proof, SyntaxKind::ProofEnsures)?;
             let (claim, goal, failed_step) = if let Some(witness_outside) = witness {
                 authored_witness_argument(&plan.steps)?;
@@ -9908,6 +9912,11 @@ impl PreparedProofModule {
         {
             return Err(ProjectCheck::Unsupported);
         }
+        #[cfg(feature = "internal-checker")]
+        let paired_formal_domain = allow_qualified_entry && proof_source == &proof.owner.source
+            && configured_paired_formal_witness(typed.body, &typed.goal);
+        #[cfg(not(feature = "internal-checker"))]
+        let paired_formal_domain = false;
         let filter = if typed.measure.and_then(TypedInductionRank::float_entry).is_some() {
             // The ranked verifier checks the typed, finite float guard. It
             // must not be represented as an integer-path precondition.
@@ -9916,7 +9925,8 @@ impl PreparedProofModule {
             prepare_proof_entry_filter_in_scope(
             proof.node, proof_source, typed.target.target_layout, &typed.input_names, typed.body,
             matches!(typed.result_type, ScalarType::Bool | ScalarType::Char) || typed.is_result_pair()
-                || typed.measure.is_some() || (ALLOW_DOMAIN && variant_match.is_none() && steps.items.is_empty()),
+                || typed.measure.is_some() || paired_formal_domain
+                || (ALLOW_DOMAIN && variant_match.is_none() && steps.items.is_empty()),
             )?
         };
         Ok(PlannedModuleProof {
@@ -10863,6 +10873,15 @@ fn checked_integer_guard_slots<'a, const ALLOW_DOMAIN: bool>(
     filter: &'a [CheckerPredicate],
 ) -> Option<CheckedIntegerGuardSlots<'a>> {
     checked_scalar_guard_slots::<ALLOW_DOMAIN>(body, filter, false, false)
+}
+
+#[cfg(feature = "internal-checker")]
+fn configured_paired_formal_witness(body: &FunctionCallSites, goal: &TypedProofGoal) -> bool {
+    body.boundary.parameters.len() == 2 && match goal {
+        TypedProofGoal::EntryWitness { .. } => true,
+        TypedProofGoal::ConjunctiveExistential(claim) => matches!(claim.witness, ConjunctiveWitness::Formal { .. }),
+        _ => false,
+    }
 }
 
 #[cfg(feature = "internal-checker")]
@@ -21540,6 +21559,58 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
         assert!(first.failed_step.is_some() && second.failed_step.is_some());
         assert!(first.invocation.returned == 4.into() && second.invocation.returned == 4.into());
         assert_eq!(take_array_return_observations(), (0, 1));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn configured_paired_formal_witness_retains_a_real_return_and_entry_pair() {
+        let source = r#"%%start
+            u8(u8, u8) pick = fn(seed_value, returned) {
+                if (seed_value >= 4) { returned } else { returned }
+            };
+            proof relation for pick(seed, value) -> (out)
+                where (seed >= 4 && seed <= 6 && (value == 4 || value == 6))
+                ensures (exists (u8 candidate where candidate >= 5 && candidate <= 7) { out != candidate })
+                { core.witness(seed + 1); }
+        %%end"#;
+        let package = ScalarCheckerScope::CurrentPackage;
+        let main = ScalarCheckerScope::MainFlowOnly;
+        let actual = |text: &str| text.replace("%%end", "u8 reached = pick(5, 6); %%end");
+        let good = source.replace("out != candidate", "out <= candidate").replace("value == 4 || value == 6", "value == 4");
+        let symbolic = check_array_proof_cohort(&good, package).unwrap();
+        assert!(symbolic.active && symbolic.symbolic_diagnostic.is_none());
+        let reached = check_array_proof_cohort(&actual(&good).replace("pick(5, 6)", "pick(5, 4)"), main).unwrap();
+        assert!(reached.active && reached.diagnostics.is_empty());
+        let rejected = check_array_proof_cohort(source, package).unwrap().symbolic_diagnostic.unwrap();
+        assert_eq!(rejected.returned, BigInt::from(6));
+        assert!(rejected.failed_step.is_none());
+        for (axis, point) in [5, 6].into_iter().enumerate() {
+            let mut intervals = rejected.witness.intervals_at(0, axis).unwrap();
+            let point = BigInt::from(point);
+            assert_eq!(intervals.next(), Some((&point, &point)));
+            assert!(intervals.next().is_none());
+        }
+        let sparse_seed = source.replace("seed >= 4 && seed <= 6", "(seed == 4 || seed == 6)")
+            .replace("(value == 4 || value == 6)", "value == 6");
+        let disjoint = check_array_proof_cohort(&sparse_seed, package).unwrap();
+        assert!(disjoint.active && disjoint.symbolic_diagnostic.is_none());
+        let rejected = source.replace("seed >= 4 && seed <= 6", "(seed == 4 || seed == 6)");
+        assert!(matches!(check_array_proof_cohort(&rejected, package), Err(ScalarOrderedCheckerOutcome::Unsupported)));
+        let bad = actual(source);
+        let report = check_array_proof_cohort(&bad, main).unwrap();
+        let [failure] = report.diagnostics.as_slice() else { panic!("one exact independently projected pair"); };
+        assert_eq!(failure.invocation.arguments.iter().map(|(_, n)| n.clone()).collect::<Vec<_>>(), [BigInt::from(5), BigInt::from(6)]);
+        assert_eq!(failure.invocation.returned, BigInt::from(6));
+        assert!(failure.failed_step.is_none());
+        let hole = source.replace("candidate >= 5 && candidate <= 7", "candidate == 5 || candidate == 7")
+            .replace("out != candidate", "out <= candidate").replace("value == 4 || value == 6", "value == 4");
+        let rejected = check_array_proof_cohort(&hole, package).unwrap().symbolic_diagnostic.unwrap();
+        assert_eq!(rejected.returned, BigInt::from(4));
+        assert!(rejected.failed_step.is_some());
+        let same_axis = source.replace("if (seed_value >= 4) { returned } else { returned }",
+            "if (returned <= 8) { seed_value } else { seed_value }").replace("out != candidate", "out < candidate");
+        let same_axis = check_array_proof_cohort(&same_axis, package).unwrap();
+        assert!(same_axis.active && same_axis.symbolic_diagnostic.is_none());
     }
 
     #[cfg(feature = "internal-checker")]

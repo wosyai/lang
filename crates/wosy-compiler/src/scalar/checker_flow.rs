@@ -619,7 +619,7 @@ pub(super) enum QuantifiedIntegerReturn<'a> {
     Comparison(Option<&'a IntegerShowConstraints<'static>>, IntegerRelation, &'a BigInt),
     Avoiding(Option<&'a IntegerShowConstraints<'static>>, &'a IntegerSet),
     EntryWitness {
-        relation: IntegerRelation, domain: &'a IntegerSet, bounds: Option<&'a IntegerShowConstraints<'static>>,
+        slot: usize, relation: IntegerRelation, domain: &'a IntegerSet, bounds: Option<&'a IntegerShowConstraints<'static>>,
         translation: Option<(&'a BigInt, &'a ScalarType)>,
     },
 }
@@ -640,8 +640,9 @@ impl QuantifiedIntegerReturn<'_> {
     pub(super) fn rejected_at_call(self, returned: &BigInt, arguments: &[&BigInt], work: &mut usize)
         -> Option<Option<bool>>
     {
-        if let Self::EntryWitness { relation, domain, bounds, translation } = self {
-            let [entry] = arguments else { return None; };
+        if let Self::EntryWitness { slot, relation, domain, bounds, translation } = self {
+            if !matches!(arguments.len(), 1 | 2) { return None; }
+            let entry = arguments.get(slot)?;
             let depth = (usize::BITS - domain.interval_count().leading_zeros()) as usize + 1;
             charge_call_work(work, depth.checked_add(1)?)?;
             let witness = Self::witness_value(entry, translation, work)?;
@@ -680,6 +681,56 @@ impl QuantifiedIntegerReturn<'_> {
             }
         };
         Some(failure)
+    }
+}
+
+#[cfg(feature = "internal-checker")]
+fn rejected_independent_witness_pair<'a>(
+    result: &'a IntegerSet, witness: (&'a BigInt, &'a BigInt),
+    relation: IntegerRelation, work: &mut usize,
+) -> Option<Option<(&'a BigInt, &'a BigInt)>> {
+    use std::cmp::Ordering::{Equal, Greater, Less};
+    let (low, high) = result.extremes()?;
+    charge_call_work(work, 3)?;
+    if !relation.accepts(Less) && low < witness.1 { return Some(Some((low, witness.1))); }
+    if !relation.accepts(Greater) && high > witness.0 { return Some(Some((high, witness.0))); }
+    if !relation.accepts(Equal) {
+        let depth = (usize::BITS - result.interval_count().leading_zeros()) as usize + 1;
+        charge_call_work(work, depth)?;
+        return Some(result.first_intersection_point(witness.0, witness.1).map(|point| (point, point)));
+    }
+    Some(None)
+}
+
+#[cfg(all(test, feature = "internal-checker"))]
+#[test]
+fn paired_witness_extrema_and_sparse_collision_match_small_point_oracle() {
+    let relation = |operator| IntegerRelation::from_operator(&operator).unwrap();
+    let never = relation(BinaryOperator::Equal).intersection(relation(BinaryOperator::NotEqual));
+    let relations = [
+        never, never.complement(), relation(BinaryOperator::Equal), relation(BinaryOperator::NotEqual),
+        relation(BinaryOperator::Less), relation(BinaryOperator::LessEqual),
+        relation(BinaryOperator::Greater), relation(BinaryOperator::GreaterEqual),
+    ];
+    for mask in 1u8..32 {
+        let points = (-2..=2).zip(0..5).filter(|(_, bit)| mask & (1 << bit) != 0)
+            .map(|(value, _)| BigInt::from(value)).collect::<Vec<_>>();
+        let result = points.iter().fold(IntegerSet::default(), |set, point| set.join(IntegerSet::singleton(point)));
+        for lower in -2..=2 {
+            for upper in lower..=2 {
+                let (low, high) = (BigInt::from(lower), BigInt::from(upper));
+                for relation in relations {
+                    let expected = points.iter().any(|point| (lower..=upper).any(|candidate|
+                        !relation.accepts(point.cmp(&BigInt::from(candidate)))));
+                    let actual = rejected_independent_witness_pair(&result, (&low, &high), relation, &mut 0).unwrap();
+                    assert_eq!(actual.is_some(), expected);
+                    if let Some((returned, candidate)) = actual {
+                        assert!(points.contains(returned) && &low <= candidate && candidate <= &high);
+                        assert!(!relation.accepts(returned.cmp(candidate)));
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -770,10 +821,27 @@ impl<'a, const TOTAL: bool> ScopedAuthoredReturn<'a> for OrderedRootLiteralProof
             let work = &mut *self.imported_relation_work?.borrow_mut();
             for row in &path.0 {
                 observed.0 = true;
-                if let QuantifiedIntegerReturn::EntryWitness { relation, domain, bounds, translation } = claim {
-                    if roots.parameters != 1 || axis.is_some_and(|axis| axis != 0) { return None; }
-                    if matches!(value, IntegerReturn::Alias(_)) && !row.entry_alias(0, 0) { return None; }
-                    let entry = row.entry_domain(0);
+                if let QuantifiedIntegerReturn::EntryWitness { slot: witness_slot, relation, domain, bounds, translation } = claim {
+                    if !matches!(roots.parameters, 1 | 2) || witness_slot >= roots.parameters { return None; }
+                    if roots.parameters == 2 && (row.entry.is_some() || row.affine.is_some() || row.projected_from != 0
+                        || !row.equal_axes().is_empty())
+                    {
+                        // Do not Cartesian-project a relational/imported row.
+                        return None;
+                    }
+                    let independent = axis.filter(|&axis| !row.entry_alias(witness_slot, axis));
+                    if independent.is_some() && roots.parameters != 2 { return None; }
+                    let independent_result = match independent { Some(axis) => Some(row.get(axis)?), None => None };
+                    let entry = row.entry_domain(witness_slot);
+                    let bounds_violation = if let (Some(result), Some(bounds)) = (independent_result, bounds) {
+                        let mut bad = None;
+                        for (low, high) in result.intervals() {
+                            charge_call_work(work, bounds.interval_lookup_work())?;
+                            bad = bounds.first_violation_in_interval(low, high);
+                            if bad.is_some() { break; }
+                        }
+                        bad
+                    } else { None };
                     let depth = (usize::BITS - domain.interval_count().leading_zeros()) as usize + 1;
                     for (low, high) in entry.intervals() {
                         charge_call_work(work, depth.checked_add(1)?)?;
@@ -782,6 +850,27 @@ impl<'a, const TOTAL: bool> ScopedAuthoredReturn<'a> for OrderedRootLiteralProof
                         let outside = domain.first_uncovered_in_interval(witness_low.as_ref(), witness_high.as_ref());
                         if translation.is_some() { charge_call_work(work, 1)?; }
                         let inversion = |witness: &BigInt| translation.map_or_else(|| witness.clone(), |(offset, _)| witness - offset);
+                        if let Some(result) = independent_result {
+                            let rejected = if let Some(point) = &outside {
+                                Some((result.extremes()?.0, point))
+                            } else if let Some(returned) = bounds_violation {
+                                Some((returned, witness_low.as_ref()))
+                            } else {
+                                rejected_independent_witness_pair(result, (witness_low.as_ref(), witness_high.as_ref()),
+                                    relation, work)?
+                            };
+                            if let Some((returned, witness)) = rejected {
+                                charge_call_work(work, roots.parameters.checked_add(1)?)?;
+                                let point = inversion(witness);
+                                let mut failure = SymbolicLiteralFailure::from_row(
+                                    slot, roots, row, independent, Cow::Borrowed(returned), Some((witness_slot, &point)),
+                                );
+                                failure.witness_outside_domain = outside.is_some();
+                                observed.1 = Some(failure);
+                                break;
+                            }
+                            continue;
+                        }
                         let point = if let Some(point) = &outside {
                             Some(Cow::Owned(inversion(point)))
                         } else {
@@ -809,7 +898,7 @@ impl<'a, const TOTAL: bool> ScopedAuthoredReturn<'a> for OrderedRootLiteralProof
                         if let Some(point) = point {
                             charge_call_work(work, roots.parameters.checked_add(1)?)?;
                             let returned = match value { IntegerReturn::Const(returned) => returned, IntegerReturn::Alias(_) => point.as_ref() };
-                            let mut failure = SymbolicLiteralFailure::from_row(slot, roots, row, None, Cow::Borrowed(returned), Some((0, point.as_ref())));
+                            let mut failure = SymbolicLiteralFailure::from_row(slot, roots, row, None, Cow::Borrowed(returned), Some((witness_slot, point.as_ref())));
                             failure.witness_outside_domain = outside.is_some();
                             observed.1 = Some(failure);
                             break;
