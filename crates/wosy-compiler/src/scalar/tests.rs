@@ -8060,6 +8060,47 @@ fn build_checks_unsupported_projection_in_an_admitted_proof_before_lowering() {
 }
 
 #[test]
+fn build_types_authored_match_arms_without_proving_or_lowering_them() {
+    let valid = r#"%%start
+        enum Path { first; second; never; }
+        enum Unrelated { first; second; never; }
+        u8(u8) identity = fn(x) { x };
+        proof choose for identity(arg) -> (out) ensures (out == 0) {
+            match (if (arg == 0) { Path.first } else { Path.second }) {
+                first { core.show(out == 0); }
+                second { core.show(out == 0); }
+                never { core.show(out == 100); }
+            }
+        }
+        u8 result = identity(5);
+    %%end"#;
+    for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let prepare = |text: &str| {
+            let parsed = parse_source(source(), text.to_owned(), &[]);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let declarations = derive_scalar_build_declarations_from_cst(parsed.result.canonical_cst());
+            prepare_scalar_project(vec![(declarations, Vec::new())], vec![source()], ScalarPreparationInputs { target_layout })
+        };
+        // False theorem and false shows are well typed; Build never proves them.
+        assert!(prepare(valid).is_ok());
+        for (invalid, expected) in [
+            (valid.replace("never { core.show(out == 100); }", ""), Some("must cover every enum variant")),
+            (valid.replace("never {", "first {"), Some("duplicate or unknown enum variant")),
+            (valid.replace("Path.second", "Unrelated.second"), Some("mixes enum declarations")),
+            (valid.replace("arg == 0", "arg"), None),
+            (valid.replace("out == 100", "missing_name == 100"), None),
+        ] {
+            let Err(rejected) = prepare(&invalid) else { panic!("invalid authored match accepted"); };
+            let diagnostics = rejected.into_ordered_diagnostics();
+            assert!(!diagnostics.is_empty());
+            if let Some(expected) = expected {
+                assert!(diagnostics.iter().any(|diagnostic| diagnostic.code == "B0003" && diagnostic.message.contains(expected)), "{diagnostics:?}");
+            }
+        }
+    }
+}
+
+#[test]
 fn cst_literal_diagnostics_keep_category_order_and_exact_spans() {
     let text = r#"%%start
 struct Bounds { i32[-3] first; i32[0b2] second; }

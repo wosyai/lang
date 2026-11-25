@@ -2584,6 +2584,8 @@ pub fn derive_scalar_program_from_cst_with_layout(
 mod contextual;
 mod declarations;
 mod proof_typing;
+mod proof_match;
+mod analysis_budget;
 use declarations::ScalarDeclarationEnvironment;
 mod inference;
 use inference::{PreparationOccurrenceTyping, ScalarAssignmentOwners, ScalarInferenceBuilder};

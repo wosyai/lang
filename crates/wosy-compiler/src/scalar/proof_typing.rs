@@ -2,6 +2,7 @@
 //! contributes occurrences, effects, or values to the runtime project.
 use super::{
     declarations::ScalarDeclarationEnvironment, overload::ScalarOverloadEnvironment,
+    proof_match::{AuthoredMatch, Selector},
     typecheck::{expression_span, expression_type_in_module_expected, expect_module_type, is_integer_type,
         module_diagnostic, validate_module_type, ScalarModuleTyping},
     *,
@@ -123,7 +124,7 @@ pub(super) fn validate_build_proofs(
             if let Some(body) = optional_node(proof, SyntaxKind::Block) {
                 check.steps(&derive_block(&body), &scope, witness_type.as_ref());
             } else if let Some(matching) = optional_node(proof, SyntaxKind::ProofMatchBlock) {
-                check.error(&matching, "authored match is not yet supported by Build proof typing");
+                check.check_match(&matching, &scope, witness_type.as_ref());
             } else {
                 check.error(proof, "missing proof body");
             }
@@ -188,6 +189,37 @@ impl ProofTyping<'_, '_> {
             expect_module_type(self.module, expected, &actual, expression_span(expression), self.diagnostics);
         }
         (actual, matches!(inference.proof_rewrite_hole, Some((_, Some(_), false))))
+    }
+
+    fn check_match(&mut self, matching: &CstNode, scope: &BTreeMap<String, ScalarType>, witness: Option<&ScalarType>) {
+        let Some(matching) = optional_node(matching, SyntaxKind::ProofMatch) else {
+            self.error(matching, "missing authored match");
+            return;
+        };
+        let source = self.module.source;
+        let enums = self.module.enums;
+        let checked = AuthoredMatch::prepare(&matching);
+        let checked = checked.as_ref().map_err(|error| (error.span, error.message)).and_then(|matching| {
+            matching.resolve(source, enums, &mut 0).map_err(|error| (error.span, error.message))
+        });
+        match checked {
+            Ok(matching) => {
+                let inputs = self.entry_scope.clone();
+                self.check_match_selector(&matching.selector, &inputs);
+                for (_, arm) in matching.arms {
+                    self.steps(arm, scope, witness);
+                }
+            }
+            Err((span, message)) => self.diagnostics.push(module_diagnostic(self.module, "B0003", message, span)),
+        }
+    }
+
+    fn check_match_selector(&mut self, selector: &Selector<'_>, scope: &BTreeMap<String, ScalarType>) {
+        if let Selector::If { condition, then_branch, else_branch } = selector {
+            self.check(condition, Some(&ScalarType::Bool), scope);
+            self.check_match_selector(then_branch, scope);
+            self.check_match_selector(else_branch, scope);
+        }
     }
 
     fn steps(&mut self, block: &ScalarBlock, scope: &BTreeMap<String, ScalarType>, witness: Option<&ScalarType>) {

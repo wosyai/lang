@@ -3555,8 +3555,7 @@ enum IntegerPairPartitionOutput {
     InputAffine(usize, Rc<IntegerAffineTransform>),
 }
 
-pub(super) const MAX_ACTUAL_CALL_DEPTH: usize = 64;
-pub(super) const MAX_PARTITION_TRANSFER_WORK: usize = MAX_ACTUAL_CALL_DEPTH * MAX_ACTUAL_CALL_DEPTH;
+pub(super) use super::analysis_budget::{charge_call_work, MAX_ACTUAL_CALL_DEPTH, MAX_PARTITION_TRANSFER_WORK};
 
 pub(super) struct IntegerReturnPartition {
     span: super::ByteSpan,
@@ -4094,13 +4093,6 @@ pub(super) enum NestedIntegerArgument<'a> {
 enum NestedIntegerOperand<'a> {
     Exact(ExactIntegerArgument<'a>),
     Axis(&'a ScalarType, usize),
-}
-
-// Hold a sticky exhausted value so argument discovery can distinguish a
-// missing operand from a refused scan even on the unary fallback route.
-pub(super) fn charge_call_work(work: &mut usize, cost: usize) -> Option<()> {
-    *work = work.saturating_add(cost);
-    (*work <= MAX_PARTITION_TRANSFER_WORK).then_some(())
 }
 
 fn nested_integer_operand<'a>(

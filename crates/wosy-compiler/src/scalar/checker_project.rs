@@ -6602,7 +6602,7 @@ fn authored_shape(steps: &ScalarBlock) -> Option<AuthoredShape> {
 struct PreparedOrderedProofSteps {
     steps: ScalarBlock,
     shape: Option<AuthoredShape>,
-    variant_match: Option<case_splits::AuthoredMatch>,
+    variant_match: Option<super::proof_match::AuthoredMatch>,
 }
 
 #[cfg(feature = "internal-checker")]
@@ -6616,7 +6616,8 @@ impl PreparedOrderedProofSteps {
             return Ok(None);
         }
         if let Some(block) = declaration.children().find(|node| node.kind() == SyntaxKind::ProofMatchBlock) {
-            let variant_match = case_splits::AuthoredMatch::prepare(&child(&block, SyntaxKind::ProofMatch)?)?;
+            let variant_match = super::proof_match::AuthoredMatch::prepare(&child(&block, SyntaxKind::ProofMatch)?)
+                .map_err(case_splits::match_error)?;
             // This wrapper has no ordinary statements. The separate typed
             // match remains authored at every downstream authority gate.
             let steps = derive_block(&block);
@@ -8703,7 +8704,7 @@ struct PlannedModuleProof<'a> {
     typed: TypedProofPostcondition<'a>,
     steps: Cow<'a, ScalarBlock>,
     ordered_shape: Option<Option<AuthoredShape>>,
-    variant_match: Option<&'a case_splits::AuthoredMatch>,
+    variant_match: Option<&'a super::proof_match::AuthoredMatch>,
     filter: Option<Vec<CheckerPredicate>>,
 }
 
