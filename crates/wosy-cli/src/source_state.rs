@@ -10,6 +10,9 @@ use wosy_protocol::{source_preparation_parts, Delta, FileEntry, FileKey, Kind, N
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
+mod pins;
+pub use pins::{LocalSourcePin, PinnedSourceReplay};
+
 pub struct SqliteSourceState {
     project: PathBuf,
     db: Connection,
@@ -109,7 +112,7 @@ impl SqliteSourceState {
                  PRAGMA main.user_version = 1;
                  PRAGMA cst.user_version = 1;",
             )?,
-            (1 | 2, 1) => {}
+            (1 | 2 | 3, 1) => {}
             _ => return Err("incompatible local source state schema".into()),
         }
         if version < 2 {
@@ -118,6 +121,9 @@ impl SqliteSourceState {
                  STRICT, WITHOUT ROWID;
                  PRAGMA main.user_version = 2;",
             )?;
+        }
+        if version < 3 {
+            pins::initialize(&tx)?;
         }
         tx.commit()?;
         Ok(Self { project, db, limits })
@@ -200,12 +206,7 @@ impl SqliteSourceState {
             ReplaySource::Selected => (state.selected, None),
             ReplaySource::Pending => (state.pending.map(SourceAttempt::root), state.pending),
         };
-        root.map(|root| {
-            let mut read = StoredNodes::new(&self.db)?;
-            self.header(&mut read, target, root)?;
-            let (delta, usage) = read.closure(root, self.limits)?;
-            Ok(SourceReplay { source: PreparedSources { root, delta, parsed: 0, reused: 0 }, usage, attempt })
-        }).transpose()
+        root.map(|root| self.load_root(target, root, attempt)).transpose()
     }
 
     /// The caller passes the exact root acknowledged by the source store, not
@@ -225,6 +226,13 @@ impl SqliteSourceState {
             "UPDATE source_targets SET pending = NULL WHERE target = ?1 AND pending = ?2 AND generation = ?3",
             params![target, attempt.root.0, attempt.generation],
         )? == 1)
+    }
+
+    fn load_root(&self, target: &str, root: NodeId, attempt: Option<SourceAttempt>) -> Result<SourceReplay> {
+        let mut read = StoredNodes::new(&self.db)?;
+        self.header(&mut read, target, root)?;
+        let (delta, usage) = read.closure(root, self.limits)?;
+        Ok(SourceReplay { source: PreparedSources { root, delta, parsed: 0, reused: 0 }, usage, attempt })
     }
 
     fn header(&self, read: &mut StoredNodes<'_>, target: &str, root: NodeId) -> Result<(SourceConfig, Vec<NodeId>)> {
