@@ -3822,50 +3822,34 @@ impl<'a> ReferenceFlowBuilder<'a> {
             .then(|| u64::try_from(elements.len()).ok()).flatten()
     }
 
-    // Each complete edge transfers a freshly created arm-local owner.
-    fn guarded_call_choice(
+    fn guarded_numeric_expression(
         &self, value: &ScalarExpression, ordinal: OccurrenceOrdinal, payload: &ScalarType,
-    ) -> Option<[(CfgPointId, OccurrenceOrdinal); 2]> {
-        let ScalarExpression::If { then_branch, else_branch, .. } = value else { return None; };
-        let sites = self.call_sites;
-        let ConditionalRegion::Value { condition, then_block, else_block, .. } = sites.conditionals.get(&ordinal)?
-            else { return None; };
-        if sites.structure.checked_types.expressions.get(condition) != Some(&ScalarType::Bool)
-            || !matches!(sites.prepared_plain_name(*condition), Some(PlainNameIdentity::Lexical(_)))
-        { return None; }
-        let arm = |branch: &ScalarBlock, region: BlockOrdinal| {
-            let [ScalarBlockItem::Expression(ScalarExpression::Call { arguments, type_arguments, .. })] =
-                branch.items.as_slice() else { return None; };
-            if branch.unsafe_context || !type_arguments.is_empty()
-                || !arguments.iter().all(|argument| matches!(argument, ScalarExpression::Name { .. })
-                    || aggregate::pure_widened_element(argument))
-            { return None; }
-            let [BlockItem { kind: BlockItemKind::FinalOutput(output), .. }] =
-                sites.structure.blocks.get(region.0)?.items.as_slice() else { return None; };
-            let call = output.expression;
-            let signature = sites.checked_call_signatures.get(&call)?;
-            let point = *self.cfg.primary_call_points.get(&call)?;
-            if output.output != 0 || sites.declared_unsafe_calls.contains(&call.0)
-                || !signature.parameters.iter().all(aggregate::ordinary_value)
-                || !matches!(signature.outputs.outputs.as_slice(), [output] if &output.ty == payload)
-                || !matches!(&self.cfg.points.get(point.0)?.kind, CfgPointKind::Call { output: 0,
-                    target: ResolvedCallTarget::ModuleCallable { concrete: ConcreteCallSelection::Declaration, .. }, .. })
-            { return None; }
-            Some((point, call))
-        };
-        let arms = [arm(then_branch, *then_block)?, arm(else_branch, *else_block)?];
-        (arms[0] != arms[1] && arms[0].0 != arms[1].0 && arms[0].1 != arms[1].1).then_some(arms)
-    }
-
-    fn guarded_call_binary(
-        &self, value: &ScalarExpression, ordinal: OccurrenceOrdinal, payload: &ScalarType,
-    ) -> Option<aggregate::GuardedBinaryExpression> {
+    ) -> Option<aggregate::GuardedNumericExpression> {
         if !matches!(payload, ScalarType::U64 | ScalarType::I32) { return None; }
-        let mut proof = aggregate::GuardedBinaryExpression {
+        let mut proof = aggregate::GuardedNumericExpression {
             expression: ordinal, calls: Vec::new(), operations: Vec::new(),
         };
-        use aggregate::GuardedBinaryNode as Node;
+        use aggregate::GuardedNumericNode as Node;
         let sites = self.call_sites;
+        let ordinary_condition = |value: &ScalarExpression, occurrence: OccurrenceOrdinal| {
+            let mut pending = vec![(value, occurrence)];
+            while let Some((value, occurrence)) = pending.pop() {
+                if sites.structure.checked_types.expressions.get(&occurrence) != Some(&ScalarType::Bool) {
+                    return None;
+                }
+                match value {
+                    ScalarExpression::Name { .. } if matches!(sites.prepared_plain_name(occurrence),
+                        Some(PlainNameIdentity::Lexical(_))) => {}
+                    ScalarExpression::Binary { operator: BinaryOperator::And | BinaryOperator::Or, left, right, .. } => {
+                        let region = sites.short_circuits.get(&occurrence)?;
+                        pending.push((right.as_ref(), region.right));
+                        pending.push((left.as_ref(), region.left));
+                    }
+                    _ => return None,
+                }
+            }
+            Some(())
+        };
         let mut stack = vec![(value, ordinal, false)];
         while let Some((value, occurrence, children_proved)) = stack.pop() {
             if sites.structure.checked_types.expressions.get(&occurrence) != Some(payload) {
@@ -3910,6 +3894,26 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         stack.push((value, occurrence, true));
                         stack.push((right, child(OccurrenceEdge::BinaryRight)?, false));
                         stack.push((left, child(OccurrenceEdge::BinaryLeft)?, false));
+                    }
+                }
+                ScalarExpression::If { condition, then_branch, else_branch, .. } => {
+                    if children_proved {
+                        proof.operations.push(Node::Select);
+                    } else {
+                        let ConditionalRegion::Value { condition: predicate, then_block, else_block, .. } =
+                            sites.conditionals.get(&occurrence)? else { return None; };
+                        ordinary_condition(condition, *predicate)?;
+                        let arm = |block: &ScalarBlock, region: BlockOrdinal| {
+                            let [ScalarBlockItem::Expression(_)] = block.items.as_slice() else { return None; };
+                            let [BlockItem { kind: BlockItemKind::FinalOutput(row), .. }] =
+                                sites.structure.blocks.get(region.0)?.items.as_slice() else { return None; };
+                            (!block.unsafe_context && row.output == 0).then_some(row.expression)
+                        };
+                        let [ScalarBlockItem::Expression(left)] = then_branch.items.as_slice() else { return None; };
+                        let [ScalarBlockItem::Expression(right)] = else_branch.items.as_slice() else { return None; };
+                        stack.push((value, occurrence, true));
+                        stack.push((right, arm(else_branch, *else_block)?, false));
+                        stack.push((left, arm(then_branch, *then_block)?, false));
                     }
                 }
                 _ => return None,
@@ -5061,25 +5065,17 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     } else {
                         self.expression(primary, scope, primary_ordinal)?
                     };
-                    if binding.fallible_assignment.is_some() && matches!(primary, ScalarExpression::If { .. }) {
-                        let Some(arms) = self.guarded_call_choice(primary, primary_ordinal, &receiver.ty).filter(|_|
-                            self.generic_parameters.is_empty() && matches!(receiver.ty, ScalarType::U64 | ScalarType::I32)
-                            && binding_region.receivers().len() == 1 && outputs.secondary.is_empty())
-                        else {
-                            return Err(self.missing_context(expression_span(primary),
-                                ReferenceAnalysisErrorReason::UnprovedFallibleCallInitializer));
-                        };
-                        self.aggregate_result.fallible_call_choices.push((primary_ordinal, arms));
-                    }
-                    if binding.fallible_assignment.is_some() && matches!(primary, ScalarExpression::Binary { .. }) {
-                        let Some(operation) = self.guarded_call_binary(primary, primary_ordinal, &receiver.ty).filter(|_|
+                    if binding.fallible_assignment.is_some()
+                        && matches!(primary, ScalarExpression::If { .. } | ScalarExpression::Binary { .. })
+                    {
+                        let Some(expression) = self.guarded_numeric_expression(primary, primary_ordinal, &receiver.ty).filter(|_|
                             self.generic_parameters.is_empty() && binding_region.receivers().len() == 1
                             && outputs.secondary.is_empty())
                         else {
                             return Err(self.missing_context(expression_span(primary),
                                 ReferenceAnalysisErrorReason::UnprovedFallibleCallInitializer));
                         };
-                        self.aggregate_result.fallible_call_operations.push(operation);
+                        self.aggregate_result.fallible_call_expressions.push(expression);
                     }
                     let call_producer = if binding.output_origin
                         == ScalarBindingOutputOrigin::SingleExpression

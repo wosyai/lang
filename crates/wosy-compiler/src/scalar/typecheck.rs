@@ -6646,9 +6646,9 @@ fn is_guarded_struct_field_type(ty: &ScalarType) -> bool {
     matches!(ty, ScalarType::Bool | ScalarType::Char) || is_integer_type(ty) || is_float_type(ty)
 }
 
-fn guarded_binary_rhs(ty: &ScalarType, expression: &ScalarExpression) -> bool {
+fn guarded_numeric_rhs(ty: &ScalarType, expression: &ScalarExpression) -> bool {
     if !matches!(ty, ScalarType::U64 | ScalarType::I32)
-        || !matches!(expression, ScalarExpression::Binary { .. })
+        || !matches!(expression, ScalarExpression::Binary { .. } | ScalarExpression::If { .. })
     { return false; }
     let mut stack = vec![expression];
     let mut calls = false;
@@ -6662,6 +6662,16 @@ fn guarded_binary_rhs(ty: &ScalarType, expression: &ScalarExpression) -> bool {
             {
                 stack.push(right);
                 stack.push(left);
+            }
+            ScalarExpression::If { condition, then_branch, else_branch, .. } => {
+                if !matches!(condition.as_ref(), ScalarExpression::Name { .. } |
+                    ScalarExpression::Binary { operator: BinaryOperator::And | BinaryOperator::Or, .. })
+                { return false; }
+                for arm in [else_branch, then_branch] {
+                    let [ScalarBlockItem::Expression(value)] = arm.items.as_slice() else { return false; };
+                    if arm.unsafe_context { return false; }
+                    stack.push(value);
+                }
             }
             _ => return false,
         }
@@ -6681,14 +6691,8 @@ fn pending_fallible_operator(
             if is_integer_type(ty) => None,
         (ty, ScalarExpression::Call { type_arguments, .. })
             if is_integer_type(ty) && type_arguments.is_empty() => None,
-        (ScalarType::U64 | ScalarType::I32, ScalarExpression::If { condition, then_branch, else_branch, .. })
-            if matches!(condition.as_ref(), ScalarExpression::Name { name, .. }
-                if scope.get(name) == Some(&ScalarType::Bool))
-                && [then_branch, else_branch].into_iter().all(|branch|
-                    !branch.unsafe_context && matches!(branch.items.as_slice(),
-                        [ScalarBlockItem::Expression(ScalarExpression::Call { type_arguments, .. })]
-                            if type_arguments.is_empty())) => None,
-        (ty, expression @ ScalarExpression::Binary { .. }) if guarded_binary_rhs(ty, expression) => None,
+        (ty, expression @ (ScalarExpression::Binary { .. } | ScalarExpression::If { .. }))
+            if guarded_numeric_rhs(ty, expression) => None,
         (ScalarType::Struct(id), ScalarExpression::StructLiteral { fields, .. })
             if !fields.is_empty()
                 && fields.iter().all(|field| match &field.value {

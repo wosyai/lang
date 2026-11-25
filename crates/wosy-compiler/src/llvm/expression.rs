@@ -2539,35 +2539,82 @@ fn checked_float_type<'a>(
         })
 }
 
-fn emit_fallible_binary<'ctx>(
+fn emit_fallible_numeric<'ctx>(
     context: &'ctx Context, state: &mut EmitState<'ctx, '_>,
     expression: &ScalarExpression, payload: &ScalarType, path: ExpressionPath<'_>,
 ) -> Result<EmitValue<'ctx>, String> {
+    use inkwell::basic_block::BasicBlock;
+    enum Step<'ctx, 'ast> {
+        Emit(&'ast ScalarExpression),
+        Binary(&'ast BinaryOperator),
+        BeginElse { value: &'ast ScalarExpression, block: BasicBlock<'ctx>, join: BasicBlock<'ctx> },
+        EndElse { then_value: BasicValueEnum<'ctx>, then_end: BasicBlock<'ctx>, join: BasicBlock<'ctx> },
+    }
     let pair = aggregate_transfer::fallible_allocation_result_type(context, payload)?;
     let function = state.builder.get_insert_block().and_then(|block| block.get_parent())
         .ok_or("missing fallible expression function")?;
     let merge = context.append_basic_block(function, "fallible.binary_merge");
     let mut absent = Vec::new();
     let mut values = Vec::new();
-    let mut stack = vec![(expression, false)];
-    while let Some((node, operands_emitted)) = stack.pop() {
+    let mut stack = vec![Step::Emit(expression)];
+    while let Some(step) = stack.pop() {
+        let node = match step {
+            Step::Emit(node) => node,
+            Step::Binary(operator) => {
+                let right = values.pop().ok_or("missing fallible binary right operand")?;
+                let left = values.pop().ok_or("missing fallible binary left operand")?;
+                values.push(emit_binary_values(state, operator, left, right, *payload == ScalarType::U64)?);
+                continue;
+            }
+            Step::BeginElse { value, block, join } => {
+                let then_value = take_basic(values.pop().ok_or("missing fallible then value")?)?;
+                let then_end = state.builder.get_insert_block().ok_or("missing fallible then block")?;
+                state.builder.build_unconditional_branch(join).map_err(builder_error)?;
+                state.builder.position_at_end(block);
+                stack.push(Step::EndElse { then_value, then_end, join });
+                stack.push(Step::Emit(value));
+                continue;
+            }
+            Step::EndElse { then_value, then_end, join } => {
+                let else_value = take_basic(values.pop().ok_or("missing fallible else value")?)?;
+                let else_end = state.builder.get_insert_block().ok_or("missing fallible else block")?;
+                state.builder.build_unconditional_branch(join).map_err(builder_error)?;
+                state.builder.position_at_end(join);
+                if then_value.get_type() != else_value.get_type() {
+                    return Err("sealed fallible conditional has divergent payload types".into());
+                }
+                let phi = state.builder.build_phi(then_value.get_type(), "fallible.selected_payload")
+                    .map_err(builder_error)?;
+                phi.add_incoming(&[(&then_value, then_end), (&else_value, else_end)]);
+                values.push(EmitValue::Basic(phi.as_basic_value()));
+                continue;
+            }
+        };
         match node {
             ScalarExpression::Binary { operator, left, right, .. } => {
-                if operands_emitted {
-                    let right = values.pop().ok_or("missing fallible binary right operand")?;
-                    let left = values.pop().ok_or("missing fallible binary left operand")?;
-                    values.push(emit_binary_values(state, operator, left, right, *payload == ScalarType::U64)?);
-                } else {
-                    stack.push((node, true));
-                    stack.push((right, false));
-                    stack.push((left, false));
-                }
+                stack.push(Step::Binary(operator));
+                stack.push(Step::Emit(right));
+                stack.push(Step::Emit(left));
+            }
+            ScalarExpression::If { condition, then_branch, else_branch, .. } => {
+                let [ScalarBlockItem::Expression(then_value)] = then_branch.items.as_slice()
+                    else { return Err("missing sealed fallible then expression".into()); };
+                let [ScalarBlockItem::Expression(else_value)] = else_branch.items.as_slice()
+                    else { return Err("missing sealed fallible else expression".into()); };
+                let condition = take_basic(path.emit(context, state, condition)?)?.into_int_value();
+                let then_block = context.append_basic_block(function, "if.then");
+                let else_block = context.append_basic_block(function, "if.else");
+                let join = context.append_basic_block(function, "if.merge");
+                state.builder.build_conditional_branch(condition, then_block, else_block).map_err(builder_error)?;
+                state.builder.position_at_end(then_block);
+                stack.push(Step::BeginElse { value: else_value, block: else_block, join });
+                stack.push(Step::Emit(then_value));
             }
             ScalarExpression::Call { .. } if aggregate_transfer::fallible_allocation_call_at(state, node) => {
                 let BasicValueEnum::StructValue(result) = take_basic(path.emit(context, state, node)?)? else {
                     return Err("missing sealed fallible operand result".into());
                 };
-                if result.get_type() != pair { return Err("invalid sealed fallible binary payload".into()); }
+                if result.get_type() != pair { return Err("invalid sealed fallible numeric payload".into()); }
                 let test = state.builder.get_insert_block().ok_or("missing fallible operand test block")?;
                 let present = context.append_basic_block(function, "fallible.binary_present");
                 let succeeded = state.builder.build_extract_value(result, 0, "fallible.operand_succeeded")
@@ -2604,6 +2651,9 @@ pub(super) fn emit_contextual_numeric<'ctx, 'module>(
     expected: &ScalarType,
     path: ExpressionPath<'_>,
 ) -> Result<EmitValue<'ctx>, String> {
+    if aggregate_transfer::fallible_allocation_expression_at(state, expression) {
+        return emit_fallible_numeric(context, state, expression, expected, path);
+    }
     let float = matches!(expected, ScalarType::F32 | ScalarType::F64);
     let integer = !float && integer_width(expected).is_some();
     match expression {
@@ -2626,9 +2676,6 @@ pub(super) fn emit_contextual_numeric<'ctx, 'module>(
                 || integer && matches!(operator, BinaryOperator::BitAnd | BinaryOperator::BitOr
                     | BinaryOperator::BitXor | BinaryOperator::ShiftLeft | BinaryOperator::ShiftRight) =>
         {
-            if aggregate_transfer::fallible_allocation_expression_at(state, expression) {
-                return emit_fallible_binary(context, state, expression, expected, path);
-            }
             let left = emit_contextual_numeric(context, state, left, expected, path)?;
             let right = emit_contextual_numeric(context, state, right, expected, path)?;
             let unsigned = matches!(expected, ScalarType::U8 | ScalarType::U16 | ScalarType::U32
@@ -2636,29 +2683,9 @@ pub(super) fn emit_contextual_numeric<'ctx, 'module>(
             emit_binary_values(state, operator, left, right, unsigned)
         }
         ScalarExpression::If { condition, then_branch, else_branch, .. } => {
-            let choice = aggregate_transfer::fallible_allocation_expression_at(state, expression);
-            if choice && !matches!(expected, ScalarType::U64 | ScalarType::I32) {
-                return Err("invalid sealed fallible conditional payload type".into());
-            }
             let condition = take_basic(path.emit(context, state, condition)?)?.into_int_value();
             emit_if_value(context, state, condition, then_branch, else_branch, expression, |state, block| {
-                let value = path.emit_block(context, state, block, BlockEmission::ContextualNumeric(expected))?;
-                if !choice { return Ok(value); }
-                let [ScalarBlockItem::Expression(call @ ScalarExpression::Call { .. })] = block.items.as_slice()
-                    else { return Err("missing sealed fallible conditional arm".into()); };
-                let value = take_basic(value)?;
-                if aggregate_transfer::fallible_allocation_call_at(state, call) {
-                    let BasicValueEnum::StructValue(pair) = value else {
-                        return Err("missing sealed fallible conditional arm result".into());
-                    };
-                    if pair.get_type() != aggregate_transfer::fallible_allocation_result_type(context, expected)? {
-                        return Err("invalid sealed fallible conditional arm result".into());
-                    }
-                    Ok(EmitValue::Basic(pair.into()))
-                } else {
-                    let pair = aggregate_transfer::present_fallible_allocation_result(context, state, value, expected)?;
-                    Ok(EmitValue::Basic(pair.into()))
-                }
+                path.emit_block(context, state, block, BlockEmission::ContextualNumeric(expected))
             })
         }
         ScalarExpression::Block(block) => {

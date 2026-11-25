@@ -1236,39 +1236,41 @@ impl SealedMixedOwner {
 }
 
 #[derive(Debug)]
-pub(super) struct GuardedBinaryExpression {
+pub(super) struct GuardedNumericExpression {
     pub(super) expression: OccurrenceOrdinal,
     pub(super) calls: Vec<(CfgPointId, OccurrenceOrdinal)>,
-    pub(super) operations: Vec<GuardedBinaryNode>,
+    pub(super) operations: Vec<GuardedNumericNode>,
 }
 
 #[derive(Debug)]
-pub(super) enum GuardedBinaryNode {
+pub(super) enum GuardedNumericNode {
     Atom(u64),
     Call(OccurrenceOrdinal),
     Add,
     And,
     OrXor,
+    Select,
 }
 
-impl GuardedBinaryExpression {
+impl GuardedNumericExpression {
     fn proves_ordinary_arithmetic(&self, allocated: impl Fn(OccurrenceOrdinal) -> bool) -> bool {
         // A materialized U64 result in this graph is a checked extent of
         // a nonzero-sized scalar array, including across sealed relays.
         let mut bounds = Vec::<u64>::new();
         for node in &self.operations {
             let bound = match *node {
-                GuardedBinaryNode::Atom(bound) => bound,
-                GuardedBinaryNode::Call(site) => if allocated(site) { u64::from(u32::MAX) } else { u64::MAX },
-                GuardedBinaryNode::Add | GuardedBinaryNode::And | GuardedBinaryNode::OrXor => {
+                GuardedNumericNode::Atom(bound) => bound,
+                GuardedNumericNode::Call(site) => if allocated(site) { u64::from(u32::MAX) } else { u64::MAX },
+                GuardedNumericNode::Add | GuardedNumericNode::And | GuardedNumericNode::OrXor | GuardedNumericNode::Select => {
                     let (Some(right), Some(left)) = (bounds.pop(), bounds.pop()) else { return false; };
                     match node {
-                        GuardedBinaryNode::Add => {
+                        GuardedNumericNode::Add => {
                             let Some(sum) = left.checked_add(right) else { return false; };
                             sum
                         }
-                        GuardedBinaryNode::And => left.min(right),
-                        GuardedBinaryNode::OrXor => {
+                        GuardedNumericNode::And => left.min(right),
+                        GuardedNumericNode::Select => left.max(right),
+                        GuardedNumericNode::OrXor => {
                             // Most-significant possible set bit bounds both.
                             u64::MAX.checked_shr((left | right).leading_zeros()).unwrap_or(0)
                         }
@@ -1321,8 +1323,7 @@ pub(super) struct AggregateFlowResult {
     pub(super) fixed_copy_owning_arguments: BTreeMap<usize, u64>,
     pub(super) ordinary_fallible_call_candidates: Vec<OccurrenceOrdinal>,
     pub(super) fallible_call_initializers: Vec<(CfgPointId, OccurrenceOrdinal)>,
-    pub(super) fallible_call_operations: Vec<GuardedBinaryExpression>,
-    pub(super) fallible_call_choices: Vec<(OccurrenceOrdinal, [(CfgPointId, OccurrenceOrdinal); 2])>,
+    pub(super) fallible_call_expressions: Vec<GuardedNumericExpression>,
     pub(super) widened_owning_receives: Vec<(CfgPointId, OccurrenceOrdinal, ByteSpan, ByteSpan, Option<(CfgPointId, usize)>)>,
     pub(super) widened_owning_roundtrip: Option<(OccurrenceOrdinal, CfgPointId, ByteSpan)>,
     pub(super) widened_borrowed_extent_calls: Vec<(CfgPointId, OccurrenceOrdinal, ByteSpan)>,
@@ -1559,7 +1560,7 @@ impl AggregateFlowResult {
     }
 
     pub(super) fn has_observations(&self) -> bool {
-        !self.fallible_call_initializers.is_empty() || !self.fallible_call_operations.is_empty() || !self.fallible_call_choices.is_empty() || !self.widened_fixed_copies.is_empty() || !self.widened_owning_receives.is_empty() || self.widened_literal_factory.is_some() || !self.widened_join_receivers.is_empty() || !self.widened_join_replacements.is_empty() || !self.widened_rebinds.is_empty() || self.borrowed_extent_observer.is_some() || self.borrowed_extent_call.is_some() || !self.widened_borrowed_extent_calls.is_empty() || self.borrowed_extent_forward.is_some()
+        !self.fallible_call_initializers.is_empty() || !self.fallible_call_expressions.is_empty() || !self.widened_fixed_copies.is_empty() || !self.widened_owning_receives.is_empty() || self.widened_literal_factory.is_some() || !self.widened_join_receivers.is_empty() || !self.widened_join_replacements.is_empty() || !self.widened_rebinds.is_empty() || self.borrowed_extent_observer.is_some() || self.borrowed_extent_call.is_some() || !self.widened_borrowed_extent_calls.is_empty() || self.borrowed_extent_forward.is_some()
             || self.array_formal_extent_required || self.literal_array_index_required.is_some() || self.literal_array_extent_required.is_some() || self.proved_literal_array_route_ref().is_some()
             || (self.checked_producer_authoritative && !self.checked_producer_backing.is_empty())
             || self.checked_backing_assignment.is_some() || self.checked_backing_forward.is_some()
@@ -6649,7 +6650,7 @@ fn closed_aggregates<'a>(
     let mut array_descriptor_identities = BTreeMap::new();
     let mut borrowed_extent_observers = BTreeMap::new();
     let mut fallible_call_requests = Vec::new();
-    let mut fallible_operations = Vec::new();
+    let mut fallible_expressions = Vec::new();
     let mut ordinary_fallible_candidates = BTreeSet::new();
     for (&key @ (module, item, arm), &is_monomorphic) in &reservations.bodies {
         let input = module_at(module).ok_or_else(|| format!("missing emitted aggregate module {module}"))?;
@@ -6670,14 +6671,10 @@ fn closed_aggregates<'a>(
                 ordinary_fallible_candidates.extend(facts.ordinary_fallible_call_candidates.iter()
                     .map(|ordinal| (key, ordinal.0)));
             }
-            for &(choice, arms) in &facts.fallible_call_choices {
-                fallible_call_requests.extend(arms.into_iter()
-                    .map(|(call, ordinal)| (key, input.source, cfg, call, ordinal, Some(choice))));
-            }
-            for operation in &facts.fallible_call_operations {
+            for operation in &facts.fallible_call_expressions {
                 fallible_call_requests.extend(operation.calls.iter().map(|&(call, ordinal)|
                     (key, input.source, cfg, call, ordinal, Some(operation.expression))));
-                fallible_operations.push((key, operation));
+                fallible_expressions.push((key, operation));
             }
 
         }
@@ -7129,7 +7126,7 @@ fn closed_aggregates<'a>(
             // The all-use check below still applies globally to every node.
             complete_suffixes.extend(visited);
         }
-        for (caller, proof) in fallible_operations {
+        for (caller, proof) in fallible_expressions {
             if !proof.proves_ordinary_arithmetic(|occurrence| allocated_sites.contains(&(caller, occurrence.0))) {
                 return Err("fallible checked addition has no proved in-range result".into());
             }
