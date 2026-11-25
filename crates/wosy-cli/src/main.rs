@@ -1254,8 +1254,9 @@ fn check_command(
             ]);
         }
         let mut notes = vec![format!("contextual value at entry: {}; at exit: {}", failure.entry, failure.exit)];
-        if let Some((name, value)) = &failure.explicit_symbolic_entry {
-            notes.push(format!("explicit symbolic entry: {name} = {value}"));
+        if let Some((name, value)) = &failure.explicit_entry {
+            let origin = if failure.symbolic { "symbolic" } else { "call" };
+            notes.push(format!("explicit {origin} entry: {name} = {value}"));
         }
         Diagnostic {
             code: String::new(), severity: DiagnosticSeverity::Error,

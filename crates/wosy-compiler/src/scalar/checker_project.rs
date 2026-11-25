@@ -724,8 +724,14 @@ impl ReachedContextualProof {
         &mut self, body: &FunctionCallSites, (formal, formal_type): (&ReferenceBindingId, &ScalarType),
         binding: &ReferenceBindingId, ty: &ScalarType, supplying_call: ByteSpan,
         site @ (call_source, occurrence_id, call): (&SourceIdentity, OccurrenceOrdinal, ByteSpan),
-        entry: &BigInt, exit: &BigInt, reused: bool,
+        entry: &BigInt, exit: &BigInt, explicit: Option<&BigInt>, reused: bool,
     ) -> Result<(), ProjectCheck> {
+        let explicit = match (self.explicit.as_ref(), explicit, body.boundary.parameters.as_slice()) {
+            (None, None, []) => None,
+            (Some(name), Some(value), [parameter]) if !reused && parameter.ordinal == 0
+                && integer_literal_fits_type(value, &parameter.ty) => Some((name, value)),
+            _ => return Err(ProjectCheck::Unsupported),
+        };
         if formal != &self.formal || formal_type != &self.ty || ty != &self.ty
             || !matches!(binding.kind, super::ReferenceBindingKind::Declared)
             || binding.source.project != formal.source.project || binding.source.package != formal.source.package
@@ -745,11 +751,11 @@ impl ReachedContextualProof {
         if self.refutation.is_none() {
             let occurrence = || ContextualProofOccurrence {
                 binding: binding.clone(), supplying_call, call, call_source: call_source.clone(), symbolic: false,
-                entry: entry.clone(), exit: exit.clone(), explicit: None, reused,
+                entry: entry.clone(), exit: exit.clone(), explicit: explicit.map(|(name, value)| (name.clone(), value.clone())), reused,
             };
             if proved {
                 self.saw_proved_occurrence = true;
-                if !reused && self.verified.is_none() && call_source == &formal.source
+                if explicit.is_none() && !reused && self.verified.is_none() && call_source == &formal.source
                     && self.reusable_body == Some(std::ptr::from_ref(body))
                 {
                     self.verified = Some(VerifiedContextualOutcome {
@@ -2326,6 +2332,8 @@ struct ExactCallActivation<'a> {
     #[cfg(feature = "internal-checker")]
     contextual_origin: Option<(&'a ReferenceBindingId, ByteSpan)>,
     #[cfg(feature = "internal-checker")]
+    contextual_explicit: Option<BigInt>,
+    #[cfg(feature = "internal-checker")]
     verified_contextual_result: Option<(BigInt, BigInt)>,
     target: Option<((usize, usize), bool, ExactCallEffect<'a>, Option<usize>)>,
 }
@@ -3047,6 +3055,8 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             #[cfg(feature = "internal-checker")]
             contextual_origin: None,
             #[cfg(feature = "internal-checker")]
+            contextual_explicit: None,
+            #[cfg(feature = "internal-checker")]
             verified_contextual_result: None,
             target: None }];
         let result = self.drive_exact_calls::<NAMED>(&mut frames, collection, named_root);
@@ -3226,7 +3236,7 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                                     .ok_or(ProjectCheck::Unsupported)?;
                                 let previously_refuted = proof.refutation.is_some();
                                 proof.observe(completed.body, formal, original_binding, ty, supplying_call,
-                                    (parent.source, effect.occurrence(), span), &entry, &exit, reused)?;
+                                    (parent.source, effect.occurrence(), span), &entry, &exit, completed.contextual_explicit.as_ref(), reused)?;
                                 if !previously_refuted && proof.refutation.is_some() {
                                     effects.contextual_proofs.refutations.push(target);
                                     if let Some(tap) = &mut effects.mixed_startup {
@@ -3288,6 +3298,16 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             (target, owner, body, signature)
         };
         #[cfg(feature = "internal-checker")]
+        let unary_context = ACTUAL_STARTUP && !NAMED && Observer::PROOF_FREE_CONTEXTUAL_LOCAL_TRANSFERS
+            && matches!(signature.parameters.as_slice(), [ty] if is_integer_type(ty))
+            && matches!(body.boundary.parameters.as_slice(), [slot] if slot.ordinal == 0 && Some(&slot.ty) == signature.parameters.first())
+            && body.call_occurrences.is_empty() && body.allocation_length_calls.is_empty()
+            && collection.is_some_and(|ordered| {
+                let effects = ordered.failures.borrow();
+                effects.contextual_proofs.entries.get(&target).is_some_and(|proof|
+                    proof.explicit.is_some() && body.contextual_formal() == Some((&proof.formal, &proof.ty)))
+            });
+        #[cfg(feature = "internal-checker")]
         let contextual_entry = match (caller.contextual_argument(call), body.contextual_formal()) {
             (None, None) => None,
             (Some((binding, ty)), Some((formal, formal_ty)))
@@ -3295,8 +3315,9 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                     && collection.is_some_and(|ordered| parent.source == &owner.source
                         || self.completed_namespace_call(parent.source, owner, target.0, body, signature, expected, ordered.visits))
                     && ty == formal_ty
-                    && matches!(effect, ExactCallEffect::Unit(_)) && signature.parameters.is_empty()
-                    && body.boundary.parameters.is_empty() && !self.active.contains(&target)
+                    && matches!(effect, ExactCallEffect::Unit(_))
+                    && ((signature.parameters.is_empty() && body.boundary.parameters.is_empty()) || unary_context)
+                    && !self.active.contains(&target)
                     && matches!(signature.outputs.outputs.as_slice(), [out] if out.ty == ScalarType::Unit) =>
             {
                 let ordered = collection.ok_or(ProjectCheck::Unsupported)?;
@@ -3464,6 +3485,8 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
         )
             .ok_or(ProjectCheck::Unsupported)?;
         if let NestedIntegerArgument::Projected(mut projection) = arguments {
+            #[cfg(feature = "internal-checker")]
+            if contextual_entry.is_some() { return Err(ProjectCheck::Unsupported); }
             if !Observer::INTEGER_RETURN_PARTITIONS
                 || (!Observer::PROJECTED_FORMAL_WRITES && !body.assignments.is_empty())
                 || self.active.contains(&target)
@@ -3523,6 +3546,8 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                 named_nested_scalars: false,
                 #[cfg(feature = "internal-checker")]
                 contextual_origin: None,
+                #[cfg(feature = "internal-checker")]
+                contextual_explicit: None,
                 #[cfg(feature = "internal-checker")]
                 verified_contextual_result: None,
                 target: Some((target, true, effect, Some(projection.caller_axis))),
@@ -3592,9 +3617,14 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
         #[allow(unused_mut)]
         let mut cursor = ExactCallCursor::new(body, exact, expected).ok_or(ProjectCheck::Unsupported)?;
         #[cfg(feature = "internal-checker")]
-        let (contextual_origin, verified_contextual_result) = if let Some((formal, ty, value, origin)) = contextual_entry {
+        let (contextual_origin, contextual_explicit, verified_contextual_result) = if let Some((formal, ty, value, origin)) = contextual_entry {
             let span = caller.occurrences.get(call.0).ok_or(ProjectCheck::Unsupported)?.span;
-            let verified_exit = collection.and_then(|ordered| {
+            let explicit = match exact {
+                [] if !unary_context => None,
+                [value] if unary_context => Some((*value).clone()),
+                _ => return Err(ProjectCheck::Unsupported),
+            };
+            let verified_exit = explicit.is_none().then_some(collection).flatten().and_then(|ordered| {
                 let effects = ordered.failures.borrow();
                 effects.contextual_proofs.entries.get(&target)?.reusable_exit(target, body, origin.0, ty, (parent.source, call, span), &value).cloned()
             });
@@ -3604,8 +3634,8 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                 cursor.enter_contextual_unit(formal, ty, value).ok_or(ProjectCheck::Unsupported)?;
                 None
             };
-            (Some(origin), verified_result)
-        } else { (None, None) };
+            (Some(origin), explicit, verified_result)
+        } else { (None, None, None) };
         #[cfg(feature = "internal-checker")]
         if (NAMED && !ordinary_named) || named_mixed_pair {
             cursor.allow_named_exact_bool_parameters().ok_or(ProjectCheck::Unsupported)?;
@@ -3649,6 +3679,8 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             named_nested_scalars: ordinary_named,
             #[cfg(feature = "internal-checker")]
             contextual_origin,
+            #[cfg(feature = "internal-checker")]
+            contextual_explicit,
             #[cfg(feature = "internal-checker")]
             verified_contextual_result,
             target: Some((target, first_activation, effect, None)),
@@ -5369,7 +5401,7 @@ pub struct ContextualProofDiagnostic {
     pub binding: wosy_syntax::SourceSpan,
     pub entry: BigInt,
     pub exit: BigInt,
-    pub explicit_symbolic_entry: Option<(String, BigInt)>,
+    pub explicit_entry: Option<(String, BigInt)>,
 }
 
 #[cfg(feature = "internal-checker")]
@@ -9127,7 +9159,7 @@ fn ordered_contextual_diagnostics(mut contextual: ContextualProofCohort) -> Resu
             supplying_call: wosy_syntax::SourceSpan::new(occurrence.binding.source.clone(), occurrence.supplying_call),
             call: wosy_syntax::SourceSpan::new(occurrence.call_source, occurrence.call),
             binding: wosy_syntax::SourceSpan::new(occurrence.binding.source, occurrence.binding.declaration_span),
-            entry: occurrence.entry, exit: occurrence.exit, explicit_symbolic_entry: occurrence.explicit,
+            entry: occurrence.entry, exit: occurrence.exit, explicit_entry: occurrence.explicit,
         });
     }
     Ok(ordered)
@@ -24466,16 +24498,70 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
             let failure = package.contextual_diagnostic.unwrap();
             assert!(failure.symbolic && package.directives.is_empty());
             assert_eq!((&failure.entry, &failure.exit), (&11.into(), &2.into()));
-            assert_eq!(failure.explicit_symbolic_entry, Some(("choice".into(), 7.into())));
+            assert_eq!(failure.explicit_entry, Some(("choice".into(), 7.into())));
             assert_eq!(failure.goal.source, app);
             assert_eq!(&bad[failure.goal.range.start as usize..failure.goal.range.end as usize],
                 "core.context.credit == core.old(core.context.credit) + 0");
             let main = check(&bad, ScalarCheckerScope::MainFlowOnly).unwrap();
             assert!(!main.active && main.contextual_diagnostic.is_none());
-            let reached = program.replace("if (core.context.credit == 3) {};", "examine(7);")
-                .replace("%%end", "type_provider(); %%end");
-            assert!(matches!(check(&reached, ScalarCheckerScope::CurrentPackage),
-                Err(ScalarOrderedCheckerOutcome::Unsupported)));
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn reached_contextual_proof_uses_each_exact_explicit_integer_and_resumes_caller() {
+        let app = source("src/main.w", "reached-context-explicit-root");
+        let lib = source("src/credit.w", "reached-context-explicit-provider");
+        let root = r#"%%start
+            accounting = namespace app "src/credit.w";
+            unit() entry = fn {
+                u8 core.context.credit = 3;
+                accounting.spend(1);
+                core.require(core.context.credit == 2, OUTPUT);
+                u8 next = 2;
+                accounting.spend(next);
+                core.require(core.context.credit == 1, OUTPUT);
+            };
+            entry();
+        %%end"#.replace("OUTPUT", OUTPUT);
+        let provider = r#"%%start
+            unit(u8) spend = fn(selector) {
+                if (selector == 2) { core.context.credit = core.context.credit - 1; }
+                else { core.context.credit = core.context.credit - 1; };
+            };
+            proof debit for spend(choice) -> (null)
+                ensures (core.context.credit == core.old(core.context.credit) - 1) {}
+        %%end"#;
+        for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let run = |root: &str, provider: &str, scope| {
+                let (_, root_proof) = crate::parse_configured_root_proof_source(app.clone(), root.to_owned(), &[]).ok().unwrap();
+                let (_, lib_proof) = crate::parse_configured_proof_source(lib.clone(), provider.to_owned(), &[]).ok().unwrap();
+                let import = ScalarNamespaceBinding { binding: "accounting".into(), target: lib.clone(), span: ByteSpan::new(0, 0) };
+                check_loaded_scalar_ordered_local_proof_contexts(Vec::new(), [(lib_proof, Vec::new()), (root_proof, vec![import])],
+                    vec![app.clone(), lib.clone()], ScalarPreparationInputs { target_layout }, scope, Vec::new())
+            };
+            for scope in [ScalarCheckerScope::CurrentPackage, ScalarCheckerScope::MainFlowOnly] {
+                let pass = run(&root, provider, scope).unwrap();
+                assert!(pass.active && pass.directives.is_empty() && pass.contextual_diagnostic.is_none());
+                let bad = provider.replace("if (selector == 2) { core.context.credit = core.context.credit - 1;",
+                    "if (selector == 2) { core.context.credit = core.context.credit - 0;");
+                let fail = run(&root, &bad, scope).unwrap();
+                let actual = fail.contextual_diagnostic.unwrap();
+                assert!(!actual.symbolic && fail.additional_contextual_diagnostics.is_empty());
+                assert_eq!((actual.entry, actual.exit), (2.into(), 2.into()));
+                assert_eq!(actual.explicit_entry, Some(("choice".into(), 2.into())));
+                assert_eq!((actual.goal.source, actual.call.source), (lib.clone(), app.clone()));
+                assert_eq!(&root[actual.call.range.start as usize..actual.call.range.end as usize], "accounting.spend(next)");
+                assert!(fail.directives.is_empty()); // Authored contextual refutation has priority.
+                let stale = root.replace("core.context.credit == 1", "core.context.credit == 3");
+                let downstream = run(&stale, provider, scope).unwrap();
+                assert!(downstream.contextual_diagnostic.is_none());
+                let [bad_requirement] = downstream.directives.as_slice() else { panic!("second contextual exit reached the original caller"); };
+                let after = bad_requirement.condition;
+                assert_eq!(&stale[after.start as usize..after.end as usize], "core.context.credit == 3");
+                let unmatched = provider.split_once("proof debit").unwrap().0.to_owned() + "%%end";
+                assert!(matches!(run(&root, &unmatched, scope), Err(ScalarOrderedCheckerOutcome::Unsupported | ScalarOrderedCheckerOutcome::Invalid(_))));
+            }
         }
     }
 

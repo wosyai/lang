@@ -8914,18 +8914,20 @@ impl<'a> ExactCallCursor<'a> {
     pub(super) fn enter_contextual_unit(
         &mut self, binding: &'a ReferenceBindingId, ty: &'a ScalarType, entry: BigInt,
     ) -> Option<()> {
-        if !self.roots.axes.is_empty() || self.tail.is_some() || self.contextual_entry.is_some()
+        let axis = self.roots.axes.len();
+        if axis > 1 || axis != self.roots.parameters || self.tail.is_some() || self.contextual_entry.is_some()
             || self.projected_slot.is_some() || self.projected_pair.is_some() || !is_integer_type(ty)
             || !super::typecheck::integer_literal_fits_type(&entry, ty)
         {
             return None;
         }
         let [row] = self.block.path.0.as_slice() else { return None; };
-        if !row.is_empty() { return None; }
+        if row.len() != axis || row.affine.is_some() || row.entry.is_some()
+            || (axis == 1 && row.get(0)?.singleton_value().is_none()) { return None; }
         self.block.path.append_local(IntegerSet::singleton(&entry));
         self.roots.add(binding, ty);
         self.block.depth = self.roots.axes.len();
-        self.contextual_entry = Some((0, entry));
+        self.contextual_entry = Some((axis, entry));
         Some(())
     }
 
