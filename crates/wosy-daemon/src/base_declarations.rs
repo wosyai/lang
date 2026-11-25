@@ -132,7 +132,10 @@ impl SourceStore {
         let Some(file) = view.files.get(key) else { return Ok(None); };
         let module = view.modules[key];
         let file = file.clone();
-        drop(view);
+        // Materialization can start another transaction or restore a CAS
+        // file. Retain the root even after releasing the admission read.
+        let super::SourceView { tx, read: _read, .. } = view;
+        drop(tx);
         self.authored_base_declarations(&file, module, None).await.map(Some)
     }
 
@@ -246,7 +249,7 @@ impl SourceStore {
         let data = match decode_payload(&node.data)? {
             Payload::Inline(body) => body,
             Payload::Blob(digest) => {
-                match fs::read(self.blobs.join(digest.to_hex().as_str())) {
+                match fs::read(self.blob_path(NodeId(*digest.as_bytes()))) {
                     Ok(bytes) if blake3::hash(&bytes) == digest => blob = bytes,
                     Ok(_) => return Ok(None),
                     Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -272,7 +275,7 @@ impl SourceStore {
         }
         let digest = blake3::hash(&bytes);
         fs::create_dir_all(&self.blobs)?;
-        let destination = self.blobs.join(digest.to_hex().as_str());
+        let destination = self.blob_path(NodeId(*digest.as_bytes()));
         write_blob(&self.blobs, &destination, &bytes)?;
         let mut payload = vec![BLOB];
         payload.extend_from_slice(digest.as_bytes());

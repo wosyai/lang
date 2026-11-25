@@ -190,7 +190,8 @@ async fn main() -> Result<()> {
         return retention::publish_and_pin(&store, &project, &name).await;
     }
     if let Some(package) = args.next() {
-        if matches!(package.as_str(), "--source-pin" | "--source-unpin" | "--source-pins" | "--source-plan") {
+        if matches!(package.as_str(), "--source-pin" | "--source-unpin" | "--source-pins"
+            | "--source-plan" | "--source-plan-readers") {
             let scope = prior.ok_or("source pin operation needs a root")?;
             retention::run(&store, scope, &package, &mut args).await?;
             return store.close().await;

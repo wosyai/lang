@@ -188,3 +188,53 @@ with tempfile.TemporaryDirectory() as work:
            "after_other_owner_cas_refs": protected["candidate_only_cas_references"],
            "elapsed_ms": before["query_ms"], "process_wall_ms": before_wall,
            "peak_child_kib": before_rss}, flush=True)
+
+
+with tempfile.TemporaryDirectory() as work:
+    fixture = Path(work)
+    root, store = fixture / "app", fixture / "store"
+    text = (
+        "%%start\n# WHY: authored source ☕\nu32 value = 17;\n"
+        + "".join(f"u32 body{i} = {i};\n" for i in range(180)) + "%%end\n"
+    )
+    leaf = project(root, text)
+    old = run(root, store)[0]["snapshot"]["source_root"]
+    old_query = run(root, store, old, "--project-declarations")[0]
+    old_blob, = (store / "cas").iterdir()
+    leaf.write_text(text.replace("value = 17;", "value = 19;"))
+    latest = run(root, store, old)[0]["snapshot"]["source_root"]
+    run(root, store, latest, "--project-declarations")
+    assert len(list((store / "cas").iterdir())) == 2
+
+    # Simulate ordinary absence without deleting any file: temporarily move
+    # this generated, recomputable fixture payload out of the disposable CAS.
+    withheld = fixture / "withheld"
+    old_blob.rename(withheld)
+    assert not old_blob.exists()
+    measured, wall, rss = run(root, store, latest, "--source-plan-readers", old)
+    before, after = measured["before"], measured["released"]
+    assert before["plan"]["active_read_roots"] == after["plan"]["active_read_roots"] == 0
+    assert before["plan"]["candidate_roots"] == after["plan"]["candidate_roots"] == 1
+    assert before["plan"]["protection_epoch"] == after["plan"]["protection_epoch"]
+    assert before["candidate_only"] == {"referenced": 1, "missing": 1}
+    assert after["candidate_only"] == {"referenced": 1, "missing": 0}
+    assert before["protected"] == after["protected"] == {"referenced": 1, "missing": 0}
+    for phase in ("twice", "graph_only", "reopened", "in_flight"):
+        held = measured[phase]
+        assert held["plan"]["active_read_roots"] == 1
+        assert held["plan"]["candidate_only_nodes"] == held["plan"]["candidate_roots"] == 0
+        assert held["plan"]["protection_epoch"] == measured["twice"]["plan"]["protection_epoch"]
+        assert held["plan"]["protection_epoch"] != before["plan"]["protection_epoch"]
+        assert held["candidate_only"] == {"referenced": 0, "missing": 0}
+        assert held["protected"] == {"referenced": 2, "missing": int(phase in ("twice", "graph_only"))}
+    assert measured["body_disposition"] == "Derived"
+    assert measured["body_id"] == old_query["modules"][1]["body"]
+    assert old_blob.read_bytes() == withheld.read_bytes()
+    assert listed(root, store, latest) == []
+    assert run(root, store, old, "std", "src/values.w")[0]["text"] == text
+    assert run(root, store, old, "std", "src/values.w", "--declarations")[0]["disposition"] == "Reused"
+    print("live direct/ordered/typed readers; ordinary optional CAS restoration; scoped cancellation:",
+          {"inventory_ms": [round(measured[phase]["plan"]["query_ms"], 3) for phase in
+                            ("before", "twice", "graph_only", "reopened", "in_flight", "released")],
+           "process_wall_ms": wall, "peak_child_kib": rss,
+           "optional_cas_bytes": old_blob.stat().st_size}, flush=True)

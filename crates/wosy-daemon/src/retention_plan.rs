@@ -1,10 +1,12 @@
-//! Read-only reclamation census for explicit, fixture-owned source revisions.
+//! Direct reader retention and read-only census of published source roots.
 use super::{
-    authority_key, base_declarations, pins, project_declarations, published_source, read_node,
+    authority_key, base_declarations, key, pins, project_declarations, published_source, read_node,
     source_top, supported_top, Result, SourceStore, FILE_AUTHORITY, SNAPSHOT_ROOTS,
 };
 use std::collections::hash_map::Entry;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::io;
+use std::sync::{Arc, Mutex};
 use surrealkv::{LSMIterator, Mode, Transaction};
 use wosy_protocol::{Kind, NodeId};
 
@@ -12,12 +14,32 @@ const PROTECTED: u8 = 1;
 const CANDIDATE: u8 = 2;
 const SHARED: u8 = PROTECTED | CANDIDATE;
 
+/// Live handles within this store process. These are not renewable client
+/// leases, durable pins, or a registry for transport/scheduler work.
+#[derive(Default)]
+pub(super) struct SourceReads(Arc<Mutex<BTreeMap<NodeId, usize>>>);
+
+pub(super) struct SourceRead {
+    reads: Arc<Mutex<BTreeMap<NodeId, usize>>>,
+    root: NodeId,
+}
+
+impl Drop for SourceRead {
+    fn drop(&mut self) {
+        let mut reads = self.reads.lock().expect("source reader registry");
+        let count = reads.get_mut(&self.root).expect("admitted source reader");
+        *count -= 1;
+        if *count == 0 { reads.remove(&self.root); }
+    }
+}
+
 pub struct SourceRetentionPlan {
     /// Exact logical protection inputs observed in a single MVCC transaction.
     /// This is not an authorization or token for a subsequent sweep.
     pub protection_epoch: NodeId,
     pub nominated_roots: usize,
     pub protected_roots: usize,
+    pub active_read_roots: usize,
     pub candidate_roots: usize,
     pub nodes_visited: usize,
     pub shared_nodes: usize,
@@ -27,6 +49,22 @@ pub struct SourceRetentionPlan {
     /// Optional payload identities referenced only by candidate closures.
     /// Actual files and sizes are not part of this MVCC census.
     pub candidate_only_cas_references: usize,
+}
+
+#[derive(Default)]
+pub struct SourceCasInventory {
+    pub referenced: usize,
+    /// Files absent at inspection time. Availability is not a checksum or
+    /// durability check; another query can restore a recomputable file.
+    pub missing: usize,
+}
+
+pub struct SourceRetentionInventory {
+    pub plan: SourceRetentionPlan,
+    /// Includes CAS references shared with nominated roots.
+    pub protected: SourceCasInventory,
+    /// References that no protected root currently uses.
+    pub candidate_only: SourceCasInventory,
 }
 
 struct Mark {
@@ -107,13 +145,57 @@ fn framed_hash(hash: &mut blake3::Hasher, bytes: &[u8]) {
 }
 
 impl SourceStore {
+    pub(super) fn begin_source_read(&self, root: NodeId) -> Result<Option<(Transaction, SourceRead)>> {
+        let mut reads = self.source_reads.0.lock().expect("source reader registry");
+        let tx = self.tree.begin_with_mode(Mode::ReadOnly)?;
+        if tx.get(&key(SNAPSHOT_ROOTS, root))?.is_none() { return Ok(None); }
+        *reads.entry(root).or_default() += 1;
+        Ok(Some((tx, SourceRead { reads: Arc::clone(&self.source_reads.0), root })))
+    }
+
     /// Conservative, direct fixture inspection. All other published roots are
     /// protected by default. The supplied keep list adds fixture read roots;
-    /// this is not a substitute for production leases or a retention policy.
+    /// real in-process readers are protected automatically. This is not a
+    /// substitute for production leases or a retention policy.
     pub fn plan_source_retention(
         &self, scope: NodeId, nominated: &[NodeId], keep: &[NodeId], limit: usize,
     ) -> Result<SourceRetentionPlan> {
-        let tx = self.tree.begin_with_mode(Mode::ReadOnly)?;
+        Ok(self.source_census(scope, nominated, keep, limit)?.0)
+    }
+
+    /// Check filesystem presence once per optional payload in the same
+    /// marked closure. Does not derive, restore, remove, or validate a blob.
+    /// The plan is MVCC-consistent; file presence is observed after the cut.
+    pub fn inspect_source_retention(
+        &self, scope: NodeId, nominated: &[NodeId], keep: &[NodeId], limit: usize,
+    ) -> Result<SourceRetentionInventory> {
+        let (plan, cas) = self.source_census(scope, nominated, keep, limit)?;
+        let mut protected = SourceCasInventory::default();
+        let mut candidate_only = SourceCasInventory::default();
+        for (digest, classes) in cas {
+            let group = if classes & PROTECTED != 0 { &mut protected } else { &mut candidate_only };
+            group.referenced += 1;
+            match std::fs::metadata(self.blob_path(digest)) {
+                Ok(metadata) if metadata.is_file() => {}
+                Ok(_) => return Err("source CAS payload path is not a file".into()),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => group.missing += 1,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(SourceRetentionInventory { plan, protected, candidate_only })
+    }
+
+    fn source_census(
+        &self, scope: NodeId, nominated: &[NodeId], keep: &[NodeId], limit: usize,
+    ) -> Result<(SourceRetentionPlan, HashMap<NodeId, u8>)> {
+        // Lease admission and the census cut share one short gate. Reads and
+        // filesystem inspection never hold it during graph traversal.
+        let (tx, active) = {
+            let reads = self.source_reads.0.lock().expect("source reader registry");
+            if reads.len() > limit { return Err("source retention plan exceeded reader root budget".into()); }
+            let tx = self.tree.begin_with_mode(Mode::ReadOnly)?;
+            (tx, reads.keys().copied().collect::<BTreeSet<_>>())
+        };
         let scope_top = published_source(&tx, scope)?.ok_or("unknown source retention scope")?;
         let owner = pins::workspace_of_config(&tx, scope_top.children[0])?;
         if nominated.len().max(keep.len()) > limit {
@@ -122,9 +204,9 @@ impl SourceStore {
         let nominated: BTreeSet<_> = nominated.iter().copied().collect();
         let keep: BTreeSet<_> = keep.iter().copied().chain([scope]).collect();
 
-        let mut epoch = blake3::Hasher::new_derive_key("wosy source protection census v1");
+        let mut epoch = blake3::Hasher::new_derive_key("wosy source protection census v2");
         epoch.update(&scope.0);
-        for selection in [&nominated, &keep] {
+        for selection in [&nominated, &keep, &active] {
             epoch.update(&(selection.len() as u64).to_be_bytes());
             for id in selection { epoch.update(&id.0); }
         }
@@ -162,7 +244,7 @@ impl SourceStore {
             if pins::workspace_of_config(&tx, top.children[0])? != owner {
                 return Err("retention candidate belongs to another workspace".into());
             }
-            if !keep.contains(&root) && !pinned.contains(&root) {
+            if !keep.contains(&root) && !pinned.contains(&root) && !active.contains(&root) {
                 candidates.insert(root);
             }
         }
@@ -175,6 +257,7 @@ impl SourceStore {
             protection_epoch: NodeId(*epoch.finalize().as_bytes()),
             nominated_roots: nominated.len(),
             protected_roots: published.len() - candidates.len(),
+            active_read_roots: active.len(),
             candidate_roots: candidates.len(),
             nodes_visited: marks.nodes.len(),
             shared_nodes: 0,
@@ -192,6 +275,6 @@ impl SourceStore {
                 _ => {}
             }
         }
-        Ok(report)
+        Ok((report, marks.cas))
     }
 }

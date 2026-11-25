@@ -50,6 +50,7 @@ pub struct ProjectDeclarationsView<'a> {
     pub entry_projection: NodeId,
     pub report: ProjectDeclarationReport,
     modules: Vec<ProjectDeclarationModule>,
+    _read: super::retention_plan::SourceRead,
 }
 
 impl ProjectDeclarationsView<'_> {
@@ -81,9 +82,10 @@ struct RootedOrder {
 }
 
 impl RootedOrder {
-    fn from_snapshot(view: SourceView, entry: &FileKey) -> Self {
+    fn from_snapshot(view: SourceView, entry: &FileKey) -> (Self, super::retention_plan::SourceRead) {
         let entry = view.modules[entry];
-        let SourceView { modules, mut files, mut module_edges, .. } = view;
+        let SourceView { tx, modules, mut files, mut module_edges, read, .. } = view;
+        drop(tx);
         let mut locations: HashMap<_, _> = modules.into_iter().map(|(key, id)| (id, key)).collect();
         let mut order = Vec::with_capacity(files.len());
         let mut postorder = Vec::with_capacity(files.len());
@@ -112,7 +114,7 @@ impl RootedOrder {
         let modules = order.into_iter().map(|(id, key, file, imports)| ModuleInput {
             id, key, file, imports: imports.into_iter().map(|id| visited[&id]).collect(),
         }).collect();
-        Self { modules, postorder }
+        (Self { modules, postorder }, read)
     }
 }
 
@@ -149,7 +151,8 @@ impl SourceStore {
         &self, snapshot: ConfiguredSourceView,
     ) -> Result<ProjectDeclarationsView<'_>> {
         let root = snapshot.source.root;
-        let RootedOrder { modules, postorder } = RootedOrder::from_snapshot(snapshot.source, &snapshot.config.entry);
+        let (RootedOrder { modules, postorder }, source_read) =
+            RootedOrder::from_snapshot(snapshot.source, &snapshot.config.entry);
         let read = self.tree.begin_with_mode(Mode::ReadOnly)?;
         let cached: Vec<_> = modules.iter().map(|module| read_projection(&read, module))
             .collect::<Result<_>>()?;
@@ -185,7 +188,9 @@ impl SourceStore {
                 body: projection.body, imports, file: module.file,
             })
         }).collect::<Result<_>>()?;
-        Ok(ProjectDeclarationsView { store: self, snapshot: root, entry_projection, report, modules })
+        Ok(ProjectDeclarationsView {
+            store: self, snapshot: root, entry_projection, report, modules, _read: source_read,
+        })
     }
 
     async fn publish_projections(

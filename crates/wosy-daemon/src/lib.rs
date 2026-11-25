@@ -2,7 +2,7 @@
 use rowan::GreenNodeBuilder;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
-use surrealkv::{Durability, Mode, Transaction, Tree, TreeBuilder};
+use surrealkv::{Durability, Transaction, Tree, TreeBuilder};
 use wosy_project::{namespace_module_path, PackageRelativePath};
 use wosy_protocol::{
     imports_from_cst, source_preparation_schema, Delta, FileEntry, FileKey, Import, Kind, Node,
@@ -51,7 +51,7 @@ pub use project_declarations::{
     ProjectDeclarationImport, ProjectDeclarationModule, ProjectDeclarationReport, ProjectDeclarationsView,
 };
 pub use prepared_project::{BuildAnalysisPhase, ProjectPreparationReport, RootedBuildAnalysis, RootedPreparedProject};
-pub use retention_plan::SourceRetentionPlan;
+pub use retention_plan::{SourceCasInventory, SourceRetentionInventory, SourceRetentionPlan};
 
 pub struct SourceStore {
     tree: Tree,
@@ -59,6 +59,7 @@ pub struct SourceStore {
     base_flights: base_declarations::Flights,
     project_commit: tokio::sync::Mutex<()>,
     prepared_projects: prepared_project::PreparationCache,
+    source_reads: retention_plan::SourceReads,
 }
 
 #[derive(Default)]
@@ -79,7 +80,7 @@ impl SourceStore {
         Ok(Self {
             tree, blobs: dir.join("cas"), base_flights: Default::default(),
             project_commit: Default::default(),
-            prepared_projects: Default::default(),
+            prepared_projects: Default::default(), source_reads: Default::default(),
         })
     }
 
@@ -108,8 +109,8 @@ impl SourceStore {
     }
 
     pub fn snapshot(&self, root: NodeId) -> Result<Option<SourceView>> {
-        let tx = self.tree.begin_with_mode(Mode::ReadOnly)?;
-        let Some(top) = published_source(&tx, root)? else { return Ok(None); };
+        let Some((tx, read)) = self.begin_source_read(root)? else { return Ok(None); };
+        let Some(top) = source_top(&tx, root)? else { return Ok(None); };
         let index = read_index(&tx, top)?;
         Ok(Some(SourceView {
             tx,
@@ -120,7 +121,12 @@ impl SourceStore {
             modules: index.modules,
             module_edges: index.module_edges,
             files: index.files,
+            read,
         }))
+    }
+
+    fn blob_path(&self, digest: NodeId) -> PathBuf {
+        self.blobs.join(digest.hex())
     }
 }
 
@@ -576,6 +582,7 @@ pub struct SourceView {
     pub modules: BTreeMap<FileKey, NodeId>,
     module_edges: BTreeMap<FileKey, Vec<NodeId>>,
     pub files: BTreeMap<FileKey, FileEntry>,
+    read: retention_plan::SourceRead,
 }
 
 struct ConfiguredSourceView {
