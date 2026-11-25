@@ -3718,11 +3718,16 @@ fn emits_recursive_fixed_array_index_reads_and_addresses_for_both_targets() {
 }
 
 fn length_loaded_for_runtime_array(llvm: &str) -> &str {
+    loaded_runtime_extent_parameter(llvm, "length")
+}
+
+fn loaded_runtime_extent_parameter<'a>(llvm: &'a str, name: &str) -> &'a str {
+    let prefix = format!("store i64 %{name}, ptr ");
     let slot = llvm
         .lines()
         .find_map(|line| {
             line.trim_start()
-                .strip_prefix("store i64 %length, ptr ")
+                .strip_prefix(&prefix)
                 .map(|rest| rest.split(',').next().unwrap())
         })
         .expect("length parameter storage");
@@ -17493,6 +17498,118 @@ if (portable(3,5,1) != 117 || signed_only(3,5,1) != 117) {{ core.system_panic();
         assert!(!relay.contains("getelementptr") && !relay.contains("extractvalue"), "{relay}");
         if let Some(out) = std::env::var_os("WOSY_PORTABLE_PRIVATE_RUNTIME_PAIRS_IR_DIR") {
             let target = if wasm { "wasm32" } else { "native64" };
+            let controlled = ir.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);
+            assert_ne!(controlled, ir);
+            std::fs::write(std::path::PathBuf::from(out).join(format!("{target}-release-project-control.ll")), controlled).unwrap();
+        }
+    }
+}
+
+#[test]
+fn runtime_element_reborrows_keep_original_extent_and_parent_loan() {
+    let text = "%%start
+u16(u64,u64) read_shared = fn(count,index) {
+    u16[count] cells;
+    cells[index] = 11;
+    *(u16[]) reader = &cells;
+    *u16 cell = &(*reader)[index];
+    *cell
+};
+u16(u64,u64) read_exclusive = fn(count,index) {
+    u16[count] cells;
+    cells[index] = 29;
+    *!(u16[]) writer = &!cells;
+    *u16 preview = &(*writer)[index];
+    u16 old = *preview;
+    *!u16 edit = &!(*writer)[index];
+    *edit = 41;
+    old + *edit
+};
+u16(u64,u64,u64) update = fn(count,index,second_index) {
+    u16[count] cells;
+    *!(u16[]) writer = &!cells;
+    *!u16 left = &!(*writer)[index];
+    *left = 37;
+    u16 previous = *left;
+    *!u16 right = &!(*writer)[second_index];
+    *right = 71;
+    previous + *right
+};
+if (read_shared(3,1) != 11 || read_exclusive(4,1) != 70 || update(5,1,2) != 108) {
+    core.system_panic();
+};
+%%end";
+    let shared_to_exclusive = text.replace("*u16 cell = &(*reader)", "*!u16 cell = &!(*reader)");
+    let overlap = text.replace("    u16 previous = *left;\n", "")
+        .replace("    previous + *right", "    *left + *right");
+    let rebound = text.replace("    *u16 cell = &(*reader)", "    reader = &cells;\n    *u16 cell = &(*reader)");
+    let mixed = text.replace("    *(u16[]) reader = &cells;",
+            "    u16[count] other;\n    *(u16[]) reader = if (index == 0) { &cells } else { &other };");
+    let escape = text.replace("u16(u64,u64) read_shared", "*u16(u64,u64) read_shared")
+        .replace("    *cell\n", "    cell\n").replace("read_shared(3,1) != 11 || ", "");
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        let source = SourceIdentity::new("project".into(), "package".into(), "src/main.w".into(), "r1".into());
+        let prepare = |authored: &str| {
+            let parsed = parse_source(source.clone(), authored.into(), &[]);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            crate::prepare_scalar_project_with_access(
+                vec![(derive_scalar_declarations_from_cst(parsed.result.canonical_cst()), Vec::new())],
+                vec![source.clone()], ScalarPreparationInputs { target_layout: layout },
+                Some(wosy_stdlib_source::CheckedAccessComponent::linked()))
+        };
+        let prepared = prepare(text).unwrap_or_else(|error| panic!("{:?}", error.diagnostics));
+        let checked = analyze_scalar_build(&prepared);
+        assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+        let ir = emit_scalar_build_project_llvm(&checked).unwrap().to_text();
+        let helpers = prepared.checked_access_source().unwrap();
+        let null = format!("call void @{}(", project_function_name(helpers, "check_non_null_address"));
+        let bounds = format!("call void @{}(", project_function_name(helpers, "check_index_in_extent"));
+        for (name, expected) in [("read_shared", 1), ("read_exclusive", 2), ("update", 2)] {
+            let body = self_tail_test_body(&ir, "i16", &project_function_name(&source, name));
+            let mut count = 0;
+            for (position, _) in body.match_indices("getelementptr inbounds i16, ptr %deref") {
+                count += 1;
+                let before = &body[..position];
+                let null_at = before.rfind(&null).unwrap();
+                let guard_at = before.rfind(&bounds).unwrap();
+                let guard = before[guard_at..].lines().next().unwrap();
+                let checked_selector = guard.rsplit_once(", i64 ").unwrap().0.split("i64 ").last().unwrap();
+                let checked_extent = guard.rsplit_once(", i64 ").unwrap().1.strip_suffix(')').unwrap();
+                assert_eq!(checked_extent, loaded_runtime_extent_parameter(body, "count"), "{body}");
+                let between = &before[null_at..guard_at];
+                assert_eq!(between.matches("load i64, ptr %").count(), 1, "one selector: {between}");
+                assert!(between.contains("inttoptr"), "{between}");
+                if layout == ScalarTargetLayout::WASM32 {
+                    assert!(before[guard_at..].contains(&format!("trunc i64 {checked_selector} to i32")), "{body}");
+                } else {
+                    assert!(body[position..].lines().next().unwrap().ends_with(checked_selector), "{body}");
+                }
+            }
+            assert_eq!(count, expected, "{body}");
+            assert_eq!(body.matches("call ptr @__wosy_core_alloc").count(), 1, "{body}");
+            assert_eq!(body.matches("call void @__wosy_core_free").count(), 1, "{body}");
+        }
+        for (authored, must_have_conflict) in [
+            (&shared_to_exclusive, false), (&overlap, true), (&rebound, false),
+            (&mixed, false), (&escape, false),
+        ] {
+            let diagnostics = match prepare(authored) {
+                Ok(prepared) => analyze_scalar_build(&prepared).diagnostics().to_vec(),
+                Err(error) => error.diagnostics.clone(),
+            };
+            if must_have_conflict {
+                let issuance = authored.find("&!(*writer)[second_index]").unwrap() as u32;
+                let prior = (authored.find("*!u16 left = ").unwrap() + "*!u16 left = ".len()) as u32;
+                assert!(diagnostics.iter().any(|diagnostic| diagnostic.code == "B0003"
+                    && diagnostic.labels.first().is_some_and(|label| label.span.range.start == issuance)
+                    && diagnostic.labels.iter().any(|label| label.span.range.start == prior
+                        && label.message == "origin of conflicting place or loan")), "{diagnostics:?}");
+            } else {
+                assert!(diagnostics.iter().any(|diagnostic| diagnostic.code == "B0003"), "{diagnostics:?}");
+            }
+        }
+        if let Some(out) = std::env::var_os("WOSY_RUNTIME_ELEMENT_REBORROW_IR_DIR") {
+            let target = if layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
             let controlled = ir.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);
             assert_ne!(controlled, ir);
             std::fs::write(std::path::PathBuf::from(out).join(format!("{target}-release-project-control.ll")), controlled).unwrap();

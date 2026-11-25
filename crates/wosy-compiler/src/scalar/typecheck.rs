@@ -5215,6 +5215,21 @@ fn named_checked_fixed_projection_index<'a>(
     (direct || permits_named_checked_field_borrow(base, mode, scope)).then_some((base, index))
 }
 
+fn named_checked_runtime_projection_index<'a>(
+    place: &'a ScalarPlace,
+    mode: ScalarReferenceMutability,
+    scope: &BTreeMap<String, ScalarType>,
+) -> Option<(&'a ScalarPlace, &'a ScalarExpression)> {
+    let ScalarPlace::Index { base, index, .. } = place else { return None; };
+    let ScalarPlace::Dereference { pointer, .. } = base.as_ref() else { return None; };
+    let ScalarExpression::Name { name, .. } = pointer.as_ref() else { return None; };
+    let ScalarType::CheckedReference { mutability, inner } = scope.get(name)? else { return None; };
+    ((mode == ScalarReferenceMutability::Shared || *mutability == ScalarReferenceMutability::Mutable)
+        && matches!(inner.as_ref(), ScalarType::RuntimeArray { element, .. }
+            if super::reference::aggregate::ordinary_value(element)))
+        .then_some((base, index))
+}
+
 fn checked_projected_element(
     place: &ScalarPlace,
     index: &ScalarExpression,
@@ -5359,6 +5374,21 @@ fn checked_address_type_in_module(
     overloads: &ScalarTypingView<'_>,
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
+    if let Some((base, index)) = named_checked_runtime_projection_index(place, mutability, scope) {
+        let array = checked_dereference_type_in_module(base, span, scope, module, modules,
+            diagnostics, false, overloads, inference);
+        let selector = expression_type_in_module_expected(index, Some(&ScalarType::U64), scope,
+            &BTreeSet::new(), &BTreeMap::new(), module, modules, diagnostics, false, overloads, inference);
+        if let ScalarType::RuntimeArray { element, .. } = array {
+            if selector == ScalarType::U64 && matches!(index, ScalarExpression::Name { .. }) {
+                inference.record_place_type(place, &element);
+                return ScalarType::CheckedReference { mutability, inner: element };
+            }
+        }
+        diagnostics.push(module_diagnostic(module, "B0003",
+            "checked runtime element borrow requires an exact lexical u64 selector", span));
+        return ScalarType::Error;
+    }
     if let Some((base, index)) = named_checked_fixed_projection_index(place, mutability, scope) {
         let array = checked_dereference_type_in_module(base, span, scope, module, modules,
             diagnostics, false, overloads, inference);

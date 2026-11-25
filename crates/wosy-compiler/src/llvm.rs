@@ -491,6 +491,15 @@ fn runtime_allocation_access<'ctx>(
             borrowed.sites.insert(site.occurrence, (declaration, site.handle));
             borrowed.owners.entry(declaration).or_insert(None);
         }
+        for site in &reference_cfg.runtime_array_child_sites {
+            let Some(owner) = reference_cfg.runtime_array_child_origin(site) else { continue; };
+            let declaration = owner.declaration_span;
+            if mutable.contains(&key(declaration)) { continue; }
+            indexed.insert(key(declaration));
+            not_portable.insert(key(declaration));
+            borrowed.sites.insert(site.occurrence, (declaration, Some(site.handle)));
+            borrowed.owners.entry(declaration).or_insert(None);
+        }
     }
     let portable = if portable_body {
         indexed.iter().copied().filter(|key| !mutable.contains(key) && !not_portable.contains(key)).collect()

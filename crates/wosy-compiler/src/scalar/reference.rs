@@ -613,6 +613,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
             cfg: ScalarReferenceCfg {
                 primary_call_points: HashMap::new(),
                 runtime_array_read_sites: HashMap::new(),
+                runtime_array_child_sites: Vec::new(),
                 observed_runtime_allocations: None,
                 guarded_scalar_allocation: None,
                 facts: Vec::new(),
@@ -3098,7 +3099,39 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     self.reject_fallible_address(place, place_ordinal, span)?;
                 }
                 let proof_place = self.proof_place(place, place_ordinal);
-                if direct_checked_index_base(place).is_some_and(|(_, index)| !matches!(index, ScalarExpression::Integer { .. })) {
+                let indexed_child = direct_checked_index_base(place);
+                let runtime_child = (|| {
+                    let (pointer, selector) = indexed_child?;
+                    let pointer_ordinal = self.expression_ordinal(
+                        OccurrenceParent::Place(root.ordinal), OccurrenceEdge::DereferencePointer,
+                    );
+                    let ScalarType::CheckedReference { mutability: parent_mode, inner } =
+                        self.call_sites.structure.checked_types.expressions.get(&pointer_ordinal)?
+                        else { return None; };
+                    let ScalarType::RuntimeArray { element, .. } = inner.as_ref() else { return None; };
+                    Some((pointer_ordinal, pointer, selector, parent_mode, element.as_ref()))
+                })();
+                let runtime_child = if let Some((pointer_ordinal, pointer, selector, parent_mode, element)) = runtime_child {
+                    let selector_ordinal = self.expression_ordinal(
+                        OccurrenceParent::Place(place_ordinal), OccurrenceEdge::PlaceIndex,
+                    );
+                    let Some(PlainNameIdentity::Lexical(holder)) = self.call_sites.prepared_plain_name(pointer_ordinal)
+                        .filter(|_| self.capture_private_runtime_reads
+                            && matches!(pointer, ScalarExpression::Name { .. })
+                            && matches!(selector, ScalarExpression::Name { .. })
+                            && (*mutability == ScalarReferenceMutability::Shared || *parent_mode == ScalarReferenceMutability::Mutable)
+                            && aggregate::ordinary_value(element)
+                            && matches!(self.call_sites.prepared_plain_name(selector_ordinal), Some(PlainNameIdentity::Lexical(_)))
+                            && self.call_sites.structure.checked_types.expressions.get(&selector_ordinal) == Some(&ScalarType::U64)
+                            && matches!(self.call_sites.structure.checked_types.expressions.get(&ordinal),
+                                Some(ScalarType::CheckedReference { mutability: mode, inner })
+                                    if mode == mutability && inner.as_ref() == element))
+                        else { return Err(self.missing_context(span, ReferenceAnalysisErrorReason::MissingDereferencedArrayExtent)); };
+                    Some(holder.declaration_span)
+                } else { None };
+                if runtime_child.is_none()
+                    && indexed_child.is_some_and(|(_, index)| !matches!(index, ScalarExpression::Integer { .. }))
+                {
                     return Err(self.missing_context(span, ReferenceAnalysisErrorReason::UnprovedCheckedArrayIndex));
                 }
                 if let ScalarPlace::Index { base, index, .. } = proof_place.as_ref() {
@@ -3130,6 +3163,9 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             _ => None,
                         };
                         let Some(origins) = ordinary_origins else {
+                            if runtime_child.is_some() {
+                                return Err(self.missing_context(span, ReferenceAnalysisErrorReason::MissingDereferencedArrayExtent));
+                            }
                             let binding = match pointer.as_ref() {
                                 ScalarExpression::Name { name, span } => {
                                     self.named_expression_binding(name, *span, pointer_ordinal)?
@@ -3277,6 +3313,10 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     _ => None,
                 };
                 self.place_indices(place, scope, place_ordinal)?;
+                let runtime_selector = runtime_child.and_then(|_| self.cursor);
+                if runtime_child.is_some() && (runtime_selector.is_none() || named_parent_point.is_none()) {
+                    return Err(self.missing_context(span, ReferenceAnalysisErrorReason::MissingDereferencedArrayExtent));
+                }
                 let parent_ids = match &parents {
                     Some(ids) => ids.iter().copied().map(Some).collect::<Vec<_>>(),
                     None => vec![None],
@@ -3284,6 +3324,17 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 let mut origins = BTreeSet::new();
                 for parent_id in parent_ids {
                     let parent = parent_id.map(|id| self.cfg.facts[id.0].clone());
+                    if runtime_child.is_some() && !matches!(&parent,
+                        Some(ReferenceOrigin::Fresh { loan, .. })
+                            if loan.parent.is_none() && loan.origin_place.projections.is_empty()
+                                && matches!(loan.origin_place.place, ScalarPlace::Name { .. })
+                                && self.cfg.allocations.contains(&loan.origin_place.binding)
+                                && !self.proof_points.fallible_allocation_bindings.as_ref()
+                                    .is_some_and(|owners| owners.contains_key(&loan.origin_place.binding))
+                                && !self.proof_points.guarded_runtime_receivers.contains(&loan.origin_place.binding))
+                    {
+                        return Err(self.missing_context(span, ReferenceAnalysisErrorReason::MissingDereferencedArrayExtent));
+                    }
                     if let Some(
                         ReferenceOrigin::Null { span: origin_span }
                         | ReferenceOrigin::Invalid { origin_span, .. },
@@ -3416,7 +3467,14 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             borrow,
                             pointer,
                             origin,
+                            runtime_selector,
                         });
+                        if let Some(handle) = runtime_child {
+                            self.cfg.runtime_array_child_sites.push(RuntimeArrayChildSite {
+                                borrow, occurrence: place_ordinal.0, handle, pointer, parent: origin,
+                                mutable_representation: false,
+                            });
+                        }
                     }
                 }
                 if let (Some(operand), Some(value)) = (reborrow, self.cursor) {
@@ -9191,6 +9249,7 @@ struct ReferenceTransferCfg<'a> {
     provisional_origin_index: Option<&'a mut ReferenceOriginIndex>,
     allocations: &'a BTreeSet<ReferenceBindingId>,
     runtime_array_read_sites: Option<&'a mut HashMap<CfgPointId, RuntimeArrayReadSite>>,
+    runtime_array_children: &'a mut [RuntimeArrayChildSite],
     checked_join_values: &'a [(CfgPointId, [Option<CfgPointId>; 2])],
     checked_block_values: &'a [(CfgPointId, CfgPointId)],
     array_length_owners: Option<&'a HashSet<ReferenceBindingId>>,
@@ -9233,6 +9292,7 @@ impl<'a> ReferenceTransferCfg<'a> {
             provisional_origin_index: None,
             allocations: &cfg.allocations,
             runtime_array_read_sites: (!cfg.runtime_array_read_sites.is_empty()).then_some(&mut cfg.runtime_array_read_sites),
+            runtime_array_children: &mut cfg.runtime_array_child_sites,
             checked_join_values: proof.map_or(&[], |proof| &proof.checked_join_values),
             checked_block_values: proof.map_or(&[], |proof| &proof.checked_block_values),
             pending_returned_extent: proof.and_then(|proof| proof.pending_returned_extent),
@@ -9933,6 +9993,7 @@ struct CheckedProjectedReborrowRead<'a> {
     binding: &'a ReferenceBindingId,
     span: ByteSpan,
     origin: ReferenceOriginId,
+    runtime: bool,
 }
 
 fn checked_projected_reborrow_read<'a>(
@@ -9945,12 +10006,17 @@ fn checked_projected_reborrow_read<'a>(
     }
     let read = points.get(authority.pointer.0)?;
     let CfgPointKind::Borrow { place, .. } = &borrow.kind else { return None; };
-    let binding = if let Some((_, index @ ScalarExpression::Integer { .. })) = direct_checked_index_base(&place.place) {
+    let binding = if let Some((_, index)) = direct_checked_index_base(&place.place) {
         let [selector] = read.successors.as_slice() else { return None; };
         let selector = points.get(selector.0)?;
         if read.id >= selector.id || selector.id >= borrow.id || read.scope != borrow.scope
             || selector.scope != borrow.scope || selector.successors.as_slice() != [borrow.id]
-            || !matches!(&selector.kind, CfgPointKind::Evaluate(actual) if actual == index)
+            || match authority.runtime_selector {
+                Some(exact) => selector.id != exact || !matches!(index, ScalarExpression::Name { .. })
+                    || !matches!(selector.kind, CfgPointKind::Read { .. }),
+                None => !matches!(index, ScalarExpression::Integer { .. })
+                    || !matches!(&selector.kind, CfgPointKind::Evaluate(actual) if actual == index),
+            }
             || selector.source_span.range != expression_span(index)
         { return None; }
         let CfgPointKind::Read { binding } = &read.kind else { return None; };
@@ -9963,6 +10029,7 @@ fn checked_projected_reborrow_read<'a>(
         binding,
         span: read.source_span.range,
         origin: authority.origin,
+        runtime: authority.runtime_selector.is_some(),
     })
 }
 
@@ -9994,11 +10061,13 @@ fn checked_projected_reborrow_parent_on_edge(
         if field != projected { return false; }
         (span, parent)
     } else if let (
-        Some((ScalarExpression::Name { span, .. }, index @ ScalarExpression::Integer { .. })),
+        Some((ScalarExpression::Name { span, .. }, index)),
         [ReferencePlaceProjection::Dereference(parent), ReferencePlaceProjection::Index(projected)],
     ) = (direct_checked_index_base(&loan.origin_place.place), projections)
     {
-        if index != projected { return false; }
+        if index != projected || if authority.runtime {
+            !matches!(index, ScalarExpression::Name { .. })
+        } else { !matches!(index, ScalarExpression::Integer { .. }) } { return false; }
         (span, parent)
     } else {
         return false;
@@ -10410,6 +10479,34 @@ enum CallOriginTransfer<'a> {
     WholeFormal(usize),
 }
 
+fn runtime_child_protected_bindings<'a>(
+    site: &RuntimeArrayChildSite, points: &'a [ReferenceFlowPoint], facts: &'a [ReferenceOrigin],
+) -> Option<[&'a ReferenceBindingId; 2]> {
+    let CfgPointKind::Read { binding: holder } = &points.get(site.pointer.0)?.kind else { return None; };
+    let ReferenceOrigin::Fresh { loan, .. } = facts.get(site.parent.0)? else { return None; };
+    Some([holder, &loan.origin_place.binding])
+}
+
+fn record_runtime_child_representation_mutation(
+    changes: &mut HashMap<ReferenceBindingId, bool>, kind: &CfgPointKind, original: bool,
+) {
+    let mut mark = |binding: &ReferenceBindingId| {
+        if let Some(value) = changes.get_mut(binding) { *value = true; }
+    };
+    match kind {
+        CfgPointKind::Assign { target, .. } | CfgPointKind::Move { place: target, .. }
+            if original && target.projections.is_empty() => mark(&target.binding),
+        CfgPointKind::AssignThrough { candidates, .. } | CfgPointKind::MoveThrough { candidates, .. } =>
+            for candidate in candidates {
+                if candidate.place.projections.is_empty() { mark(&candidate.place.binding); }
+            },
+        CfgPointKind::Release { target: ReleaseTarget::Checked { candidates, .. } }
+        | CfgPointKind::Invalidate { candidates, .. } =>
+            for candidate in candidates { mark(&candidate.place.binding); },
+        _ => {}
+    }
+}
+
 fn transfer_reference_facts(
     mut cfg: ReferenceTransferCfg<'_>,
     deferred_policies: &BTreeMap<usize, CopyPolicy>,
@@ -10431,6 +10528,13 @@ fn transfer_reference_facts(
         }
     }
     let original_points = cfg.initial_points;
+    // Actual runtime child issuance is sparse. Index its exact owner and
+    // holder identities; fold representation mutations into the graph's
+    // existing topology and resolved-point staging.
+    let mut runtime_child_changes = (!cfg.runtime_array_children.is_empty()).then(|| {
+        cfg.runtime_array_children.iter().filter_map(|site| runtime_child_protected_bindings(site, original_points, cfg.facts))
+            .flatten().map(|binding| (binding.clone(), false)).collect::<HashMap<_, _>>()
+    });
     let grouped_installs = grouped_assignment_installs(original_points, cfg.has_grouped_assignment_capture);
     let mut last_use = (0..cfg.points.len()).collect::<Vec<_>>();
     let mut strictly_forward = true;
@@ -10503,6 +10607,9 @@ fn transfer_reference_facts(
     let mut dependency_pair = [CfgPointId(0); 2];
     let mut local_fork_index = 0;
     for (index, point) in original_points.iter().enumerate() {
+        if let Some(changes) = &mut runtime_child_changes {
+            record_runtime_child_representation_mutation(changes, &point.kind, true);
+        }
         if let Some(binding) = indexed_holders.and_then(|holders| holders.disabled_by(point)) {
             disabled_indexed_bindings.insert(binding);
         }
@@ -12659,6 +12766,9 @@ fn transfer_reference_facts(
             } else if let Some(snapshot) = snapshot.as_deref_mut() {
                 *snapshot = Some(point.clone());
             }
+            if let Some(changes) = &mut runtime_child_changes {
+                record_runtime_child_representation_mutation(changes, &point.kind, false);
+            }
             if let (Some(cutoff), Some(last_use), Some(flow)) =
                 (common_aggregate_cutoff, &aggregate_deadlines, &mut state.aggregate)
             {
@@ -12759,6 +12869,12 @@ fn transfer_reference_facts(
             kind => kind,
         };
         *point = observed;
+    }
+    if let Some(changes) = runtime_child_changes {
+        for site in cfg.runtime_array_children {
+            site.mutable_representation |= runtime_child_protected_bindings(site, original_points, cfg.facts)
+                .is_none_or(|bindings| bindings.into_iter().any(|binding| changes.get(binding) != Some(&false)));
+        }
     }
     let mut unique = Vec::new();
     for error in errors {
@@ -17413,6 +17529,7 @@ fn derive_function_specialized_copy_policies<'a>(
                     provisional_origin_index: None,
                     allocations: &template_cfg.allocations,
                     runtime_array_read_sites: None,
+                    runtime_array_children: &mut [],
                     checked_join_values: &template_result.proof_points.checked_join_values,
                     checked_block_values: &template_result.proof_points.checked_block_values,
                     pending_returned_extent: template_result.proof_points.pending_returned_extent,
@@ -18311,6 +18428,32 @@ fn build_function_reference_cfg(
                             errors.push(error.clone());
                         }
                     }
+                }
+            }
+        }
+        if !builder.cfg.runtime_array_child_sites.is_empty() {
+            let exact_sources: HashSet<_> = builder.cfg.runtime_array_child_sites.iter()
+                .map(|site| &builder.cfg.points[site.borrow.0].source_span).collect();
+            let mut conflicts: HashSet<_> = errors.iter().filter_map(|error| match error {
+                ReferenceAnalysisError::ConflictingPlace { source_span, .. } if exact_sources.contains(source_span) =>
+                    Some(source_span.clone()),
+                _ => None,
+            }).collect();
+            // Retain the real same-issuance loan conflict before deciding
+            // whether a fallback extent diagnostic is necessary.
+            for error in &provisional {
+                if let ReferenceAnalysisError::ConflictingPlace { source_span, .. } = error {
+                    if exact_sources.contains(source_span) && conflicts.insert(source_span.clone()) {
+                        errors.push(error.clone());
+                    }
+                }
+            }
+            for site in &builder.cfg.runtime_array_child_sites {
+                let source_span = &builder.cfg.points[site.borrow.0].source_span;
+                if builder.cfg.runtime_array_child_origin(site).is_none() && !conflicts.contains(source_span) {
+                    errors.push(ReferenceAnalysisError::MissingContext {
+                        source_span: source_span.clone(), reason: ReferenceAnalysisErrorReason::MissingDereferencedArrayExtent,
+                    });
                 }
             }
         }

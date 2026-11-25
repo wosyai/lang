@@ -417,6 +417,7 @@ unit(Pair) inspect = fn(owner) {
         span,
     };
     let authority = super::super::control::NamedReborrowParent {
+                runtime_selector: None,
         pointer: read.id,
         borrow: borrow.id,
         origin,
@@ -464,6 +465,7 @@ unit(Pair) inspect = fn(owner) {
         proof.checked_pointee_reads.push(child_read.id);
         if proven {
             proof.named_reborrow_parents.push(super::super::control::NamedReborrowParent {
+                runtime_selector: None,
                 borrow: borrow.id,
                 pointer: read.id,
                 origin,

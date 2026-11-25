@@ -204,6 +204,7 @@ pub(super) struct NamedReborrowParent {
     pub(super) borrow: super::CfgPointId,
     pub(super) pointer: super::CfgPointId,
     pub(super) origin: super::ReferenceOriginId,
+    pub(super) runtime_selector: Option<super::CfgPointId>,
 }
 
 #[derive(Default)]
