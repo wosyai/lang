@@ -775,6 +775,8 @@ pub(super) fn definition_type<'ctx>(
     function: &ScalarFunction,
     cfg: &ScalarReferenceCfg,
     layout: ScalarTargetLayout,
+    inline_results: &InlineResultShapes<'_>,
+    layouts: &crate::scalar::layout::ScalarLayoutIndex<'_>,
     plan: Option<&ClosedBody>,
 ) -> Result<FunctionType<'ctx>, String> {
     if plan.is_some_and(|body| body.fallible_allocation_leaf || body.fallible_allocation_relay) {
@@ -859,7 +861,7 @@ pub(super) fn definition_type<'ctx>(
         {
             return Err("invalid ordinary aggregate result signature".into());
         }
-        let original = definition_function_type(context, function, cfg, layout)?;
+        let original = legacy_definition_function_type(context, function, cfg, layout)?;
         if original.count_param_types() as usize != parameters.len() {
             return Err("unexpected ordinary aggregate return sidecar".into());
         }
@@ -870,11 +872,11 @@ pub(super) fn definition_type<'ctx>(
         return Ok(context.void_type().fn_type(&arguments, false));
     }
     if plan.and_then(|body| body.returning).is_none() {
-        let original = definition_function_type(context, function, cfg, layout)?;
         if !plan.is_some_and(|body| !body.inputs.is_empty() || body.checked_backing_producer.is_some()
             || body.checked_backing_wrapper.is_some()) {
-            return Ok(original);
+            return definition_function_type(context, function, cfg, layout, inline_results, layouts);
         }
+        let original = legacy_definition_function_type(context, function, cfg, layout)?;
         let mut parameters = original.get_param_types().into_iter().map(Into::into)
             .collect::<Vec<BasicMetadataTypeEnum<'ctx>>>();
         let sidecars = plan.map_or(0, |body| body.inputs.len())
@@ -1982,6 +1984,7 @@ pub(super) fn emit_value_field_receiver<'ctx, 'module>(
     context: &'ctx Context,
     state: &mut EmitState<'ctx, 'module>,
     receiver: &ScalarExpression,
+    owner: &crate::scalar::ScalarStructId,
     project: Option<(&ScalarModule, &[&ScalarModule])>,
 ) -> Result<PointerValue<'ctx>, String> {
     let ScalarExpression::Call { arguments, .. } = receiver else {
@@ -1989,8 +1992,29 @@ pub(super) fn emit_value_field_receiver<'ctx, 'module>(
     };
     let ordinal = state.body_call_nodes.and_then(|nodes| nodes.expression_ordinal(receiver))
         .ok_or_else(|| "call result has no proven caller-owned storage for field projection".to_owned())?;
-    let value = try_emit_witnessed_ordinary_call(context, state, receiver, arguments, project, ordinal)?
-        .ok_or_else(|| "call result has no proven caller-owned storage for field projection".to_owned())?;
+    let value = if let Some(value) = try_emit_witnessed_ordinary_call(context, state, receiver, arguments, project, ordinal)? {
+        value
+    } else {
+        let resolved = state.prepared_call(receiver)?
+            .ok_or_else(|| "field projection requires a prepared fixed copy callable".to_owned())?;
+        let symbol = resolved.symbol()
+            .ok_or_else(|| "field projection requires a direct fixed copy callable".to_owned())?;
+        let target = state.functions.get(symbol)
+            .ok_or_else(|| "missing fixed copy callable for field projection".to_owned())?;
+        let matches_owner = matches!(state.signatures.get(symbol),
+            Some(ScalarType::Callable { outputs, .. })
+                if matches!(outputs.outputs.as_slice(), [output]
+                    if matches!(&output.ty, ScalarType::Struct(id) if id == owner)));
+        if !matches_owner || target.get_linkage() == Linkage::Internal
+            || state.dynamic_owner_outputs.get(symbol).is_some_and(|owners| !owners.is_empty())
+            || !target.get_type().get_return_type().is_some_and(|ty| ty.is_array_type()) {
+            return Err("call result has no proven caller-owned storage for field projection".to_owned());
+        }
+        match project {
+            Some((module, modules)) => emit_project_expression(context, state, receiver, module, modules)?,
+            None => emit_expression(context, state, receiver)?,
+        }
+    };
     match take_basic(value)? {
         BasicValueEnum::PointerValue(pointer) => Ok(pointer),
         _ => Err("proven field receiver did not yield caller-owned storage".to_owned()),
