@@ -148,11 +148,22 @@ fn framed_hash(hash: &mut blake3::Hasher, bytes: &[u8]) {
 
 impl SourceStore {
     pub(super) fn begin_source_read(&self, root: NodeId) -> Result<Option<(Transaction, SourceRead)>> {
+        Ok(self.begin_source_reads([root])?.map(|(tx, [read])| (tx, read)))
+    }
+
+    pub(super) fn begin_source_reads<const N: usize>(
+        &self, roots: [NodeId; N],
+    ) -> Result<Option<(Transaction, [SourceRead; N])>> {
         let mut reads = self.source_reads.0.lock().expect("source reader registry");
         let tx = self.tree.begin_with_mode(Mode::ReadOnly)?;
-        if tx.get(&key(SNAPSHOT_ROOTS, root))?.is_none() { return Ok(None); }
-        *reads.entry(root).or_default() += 1;
-        Ok(Some((tx, SourceRead { reads: Arc::clone(&self.source_reads.0), root })))
+        for root in roots {
+            if tx.get(&key(SNAPSHOT_ROOTS, root))?.is_none() { return Ok(None); }
+        }
+        let admitted = roots.map(|root| {
+            *reads.entry(root).or_default() += 1;
+            SourceRead { reads: Arc::clone(&self.source_reads.0), root }
+        });
+        Ok(Some((tx, admitted)))
     }
 
     /// Conservative, direct fixture inspection. All other published roots are

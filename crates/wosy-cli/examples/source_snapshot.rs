@@ -4,7 +4,7 @@ use std::time::Instant;
 use wosy_cli::source_preparation::prepare;
 use rowan::{GreenNodeBuilder, NodeOrToken, WalkEvent};
 use wosy_compiler::{ScalarExpression, ScalarItem, ScalarSourceDeclarations};
-use wosy_daemon::{BaseDeclarationsView, ProjectDeclarationsView, QueryDisposition, SourceStore};
+use wosy_daemon::{BaseDeclarationsView, ProjectDeclarationsView, QueryDisposition, SourceImpactLimits, SourceStore};
 use wosy_syntax::{CanonicalCstRoot, CstNode, SyntaxKind};
 use wosy_project::{PackageRelativePath, ProjectConfiguration, ProjectContext, SourceNodeId};
 use wosy_protocol::{FileKey, NodeId};
@@ -229,6 +229,32 @@ async fn main() -> Result<()> {
         return retention::publish_and_pin(&store, &project, &name).await;
     }
     if let Some(package) = args.next() {
+        if package == "--source-impact" {
+            let before = prior.ok_or("source impact needs an old root")?;
+            let after = NodeId::parse_hex(&args.next().ok_or("source impact needs a new root")?)?;
+            let root_files = args.next().map(|text| text.parse()).transpose()?.unwrap_or(10_000);
+            let adjacency_rows = args.next().map(|text| text.parse()).transpose()?.unwrap_or(100_000);
+            let start = Instant::now();
+            let impact = store.source_impact(before, after, SourceImpactLimits { root_files, adjacency_rows })?;
+            let query_ms = milliseconds(start);
+            println!("{}", serde_json::json!(impact.map(|report| {
+                let files: Vec<_> = report.files.into_iter().map(|diff| serde_json::json!({
+                    "file": diff.file, "before": diff.before.map(NodeId::hex), "after": diff.after.map(NodeId::hex),
+                    "executable_changed": diff.executable_changed, "annotation_changed": diff.annotation_changed,
+                    "source_owner_changed": diff.source_owner_changed,
+                    "imports_changed": diff.imports_changed,
+                })).collect();
+                serde_json::json!({
+                    "configuration_changed": report.configuration_changed,
+                    "executable_tree_changed": report.executable_tree_changed,
+                    "annotation_tree_changed": report.annotation_tree_changed,
+                    "files": files, "before": report.before_candidates, "after": report.after_candidates,
+                    "forward_occurrences": report.forward_occurrences,
+                    "selected_reverse_rows": report.selected_reverse_rows, "query_ms": query_ms,
+                })
+            })));
+            return store.close().await;
+        }
         if package == "--installed-git" {
             let root = prior.ok_or("Git selection query needs a root")?;
             let view = store.snapshot(root)?.ok_or("unknown rooted Git selection")?;

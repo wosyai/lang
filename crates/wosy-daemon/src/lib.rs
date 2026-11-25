@@ -45,6 +45,7 @@ mod pins;
 mod project_declarations;
 mod prepared_project;
 mod retention_plan;
+mod source_impact;
 mod storage_worker;
 pub use base_declarations::{BaseDeclarationsView, QueryDisposition};
 pub use pins::SourcePin;
@@ -55,6 +56,7 @@ pub use prepared_project::{
     BuildAnalysisKey, BuildAnalysisPhase, ProjectPreparationReport, RootedBuildAnalysis, RootedPreparedProject,
 };
 pub use retention_plan::{SourceCasInventory, SourceRetentionInventory, SourceRetentionPlan};
+pub use source_impact::{SourceFileChange, SourceImpact, SourceImpactLimits};
 pub use storage_worker::{RetentionRead, RetentionReadJob, SourceStorageWorker, StorageAdmissionError};
 
 pub struct SourceStore {
@@ -385,6 +387,12 @@ fn read_paths(tx: &Transaction, root: NodeId) -> Result<BTreeMap<FileKey, (NodeI
 }
 
 fn read_index(tx: &Transaction, top: Node) -> Result<Index> {
+    read_index_charged(tx, top, |_| Ok(()))
+}
+
+fn read_index_charged(
+    tx: &Transaction, top: Node, mut charge_imports: impl FnMut(usize) -> Result<()>,
+) -> Result<Index> {
     let parts = source_preparation_parts(&top).ok_or("incomplete source preparation")?;
     let mut entries = BTreeMap::new();
     for &id in parts.files {
@@ -401,6 +409,7 @@ fn read_index(tx: &Transaction, top: Node) -> Result<Index> {
         let [local, imports @ ..] = node.children.as_slice() else {
             return Err("missing local module executable".into());
         };
+        charge_imports(imports.len())?;
         let key = *by_projection.get(local).ok_or("module outside executable paths")?;
         unique(&mut modules, key.clone(), id)?;
         module_edges.insert(key.clone(), imports.to_vec());
