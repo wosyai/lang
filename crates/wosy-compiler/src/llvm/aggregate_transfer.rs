@@ -1622,6 +1622,7 @@ pub(super) fn extract_observing_array_formal<'ctx>(
 pub(super) enum ArrayDescriptorForward {
     Owned,
     Borrowed,
+    PrivateSharedIndex,
     GuardedProducer,
 }
 
@@ -1646,6 +1647,15 @@ pub(super) fn emit_array_descriptor_forward<'ctx>(
     let (argument, result): (BasicTypeEnum<'ctx>, BasicTypeEnum<'ctx>) = match transport {
         ArrayDescriptorForward::Owned => (owned.into(), owned.into()),
         ArrayDescriptorForward::Borrowed => (borrowed_extent_type(context, state.target_layout).into(), context.i64_type().into()),
+        ArrayDescriptorForward::PrivateSharedIndex => {
+            let ScalarType::Callable { parameters, outputs } = &function.signature else {
+                return Err("private shared relay is not a callable".into());
+            };
+            if !crate::scalar::private_runtime_read_signature(parameters, &outputs.outputs) {
+                return Err("private shared relay changed its exact signature".into());
+            }
+            (borrowed_extent_type(context, state.target_layout).into(), basic_type(context, &outputs.outputs[0].ty, state.target_layout)?)
+        }
         ArrayDescriptorForward::GuardedProducer => {
             if !state.aggregate.as_ref().is_some_and(|aggregate| aggregate.plan.array_descriptor_calls.contains(&call)) {
                 return Err("guarded producer forwarding lost its descriptor call receipt".into());
@@ -1654,13 +1664,27 @@ pub(super) fn emit_array_descriptor_forward<'ctx>(
         }
     };
     let parameter = definition.get_first_param().ok_or("missing checked array forwarding parameter")?;
+    let private_index = matches!(transport, ArrayDescriptorForward::PrivateSharedIndex);
+    let target_type = target.get_type();
+    let exact_parameters = if private_index {
+        target_type.get_param_types().as_slice() == [argument.into(), context.i64_type().into()]
+    } else { target_type.get_param_types().as_slice() == [argument.into()] };
     if parameter.get_type() != argument || target.get_linkage() != Linkage::Internal
-        || target.get_type().get_param_types().as_slice() != [argument.into()]
-        || target.get_type().get_return_type() != Some(result)
+        || !exact_parameters || target_type.get_return_type() != Some(result)
     {
         return Err("checked array forwarding types differ from the paired plan".into());
     }
-    let pair = state.builder.build_call(target, &[parameter.into()], "array_forward")
+    let singleton = [parameter.into()];
+    let indexed;
+    let arguments = if private_index {
+        let selector = definition.get_nth_param(1).ok_or("private shared relay lacks its original selector")?;
+        if selector.get_type() != context.i64_type().into() {
+            return Err("private shared relay changed its full-width selector".into());
+        }
+        indexed = [parameter.into(), selector.into()];
+        indexed.as_slice()
+    } else { singleton.as_slice() };
+    let pair = state.builder.build_call(target, arguments, "array_forward")
         .map_err(builder_error)?.try_as_basic_value().basic().ok_or("missing checked forwarded array result")?;
     state.builder.build_return(Some(&pair)).map_err(builder_error)?;
     Ok(())

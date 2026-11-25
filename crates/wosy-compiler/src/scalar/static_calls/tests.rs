@@ -404,3 +404,47 @@ fn static_rejection_returns_original_validation_with_zero_lookup_or_ownership_en
         assert_eq!(scope.counts(), Counts::default());
     }
 }
+
+
+#[test]
+fn configured_check_finalizes_private_runtime_formal_relay_without_global_call_capture() {
+    let text = "%%start
+u8(*(u8[]),u64) _read = fn(view,index) { (*view)[index] };
+u8(*(u8[]),u64) _relay = fn(view,index) { _read(view,index) };
+u64(u64) ordinary = fn(index) { index };
+u8(u64,u64) observe = fn(count,index) {
+    u8[count] cells;
+    _relay(&cells,ordinary(index))
+};
+%%end";
+    let open = text.replace("_relay", "relay");
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        for (accepted, authored) in [(true, text), (false, open.as_str())] {
+            let result = parsed(authored);
+            let declarations = derive_scalar_declarations_from_cst(result.canonical_cst());
+            let source = declarations.source.clone();
+            let prepared = crate::prepare_scalar_project_with_access(vec![(declarations, Vec::new())],
+                vec![source], ScalarPreparationInputs { target_layout: layout },
+                Some(wosy_stdlib_source::CheckedAccessComponent::linked()))
+                .unwrap_or_else(|error| panic!("{:?}", error.diagnostics));
+            let checked = prepared.finish();
+            if !accepted {
+                assert_eq!(checked.diagnostics.len(), 1, "{:?}", checked.diagnostics);
+                assert!(format!("{:?}", checked.diagnostics[0]).contains("requires the extent of the dereferenced backing"));
+                continue;
+            }
+            assert!(checked.diagnostics.is_empty(), "{:?}", checked.diagnostics);
+            let owner = checked.project.modules[0].items.iter().find_map(|item| match item {
+                ScalarItem::Function(function) if function.name == "observe" => Some(function),
+                _ => None,
+            }).expect("ordinary runtime array caller");
+            let points = &owner.reference_cfg.primary_call_points;
+            assert_eq!(points.len(), 1, "only the exact borrow invocation should be captured");
+            let point = &owner.reference_cfg.points[points.values().next().unwrap().0];
+            assert!(matches!(&point.kind, CfgPointKind::Call {
+                target: ResolvedCallTarget::ModuleCallable { declaration_span, .. }, ..
+            } if checked.project.modules[0].items.iter().any(|item| matches!(item,
+                ScalarItem::Function(function) if function.name == "_relay" && function.name_span == *declaration_span))));
+        }
+    }
+}

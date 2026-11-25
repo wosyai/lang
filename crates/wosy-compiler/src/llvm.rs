@@ -2842,6 +2842,9 @@ fn emit_function<'ctx, 'module>(
     if let Some(call) = array_descriptor_forward {
         return aggregate_transfer::emit_array_descriptor_forward(context, &state, value, function, call, ArrayDescriptorForward::Owned);
     }
+    if let Some(call) = aggregate_plan.and_then(|plan| plan.private_runtime_read_forward) {
+        return aggregate_transfer::emit_array_descriptor_forward(context, &state, value, function, call, ArrayDescriptorForward::PrivateSharedIndex);
+    }
     if let Some(call) = aggregate_plan.and_then(|plan| plan.borrowed_extent_forward) {
         return aggregate_transfer::emit_array_descriptor_forward(context, &state, value, function, call, ArrayDescriptorForward::Borrowed);
     }
@@ -3210,6 +3213,9 @@ fn emit_project_function<'ctx, 'module>(
     use aggregate_transfer::ArrayDescriptorForward;
     if let Some(call) = array_descriptor_forward {
         return aggregate_transfer::emit_array_descriptor_forward(context, &state, value, function, call, ArrayDescriptorForward::Owned);
+    }
+    if let Some(call) = aggregate_plan.and_then(|plan| plan.private_runtime_read_forward) {
+        return aggregate_transfer::emit_array_descriptor_forward(context, &state, value, function, call, ArrayDescriptorForward::PrivateSharedIndex);
     }
     if let Some(call) = aggregate_plan.and_then(|plan| plan.borrowed_extent_forward) {
         return aggregate_transfer::emit_array_descriptor_forward(context, &state, value, function, call, ArrayDescriptorForward::Borrowed);

@@ -3113,6 +3113,7 @@ pub(crate) struct ClosedBody {
     pub(crate) widened_join_receivers: BTreeSet<(u32, u32)>,
     pub(crate) widened_rebinds: BTreeMap<usize, ClosedWidenedRebind>,
     pub(crate) private_runtime_read_formal: Option<ByteSpan>,
+    pub(crate) private_runtime_read_forward: Option<usize>,
     pub(crate) private_runtime_reads: HashSet<usize>,
     pub(crate) private_runtime_read_calls: HashMap<usize, ByteSpan>,
     pub(crate) private_runtime_read_owners: HashSet<ByteSpan>,
@@ -6039,9 +6040,9 @@ fn seal_array_descriptor_identities(
         candidates.insert((caller, call.0), (target, owner, OwningDescriptorDestination::Local { declaration: receiver, replace }));
     }
     if candidates.is_empty() { return; }
-    let sealed = closed_descriptor_routes(ordinary, declarations, routes, bodies, result, |route| match *route {
+    let sealed = closed_descriptor_routes(ordinary, routes, |key| !result.bodies.contains_key(&key), |key, route| match *route {
         ArrayDescriptorRoute::Identity(_) => None,
-        ArrayDescriptorRoute::Forward { call, point } => Some((call, point)),
+        ArrayDescriptorRoute::Forward { call, point } => Some((call, target_body(declarations, bodies[&key].cfg, point))),
     }, |caller, call| candidates.get(&(caller, call)).map(|(target, ..)| *target));
     for key in sealed {
         let definition = result.bodies.entry(key).or_default();
@@ -6072,11 +6073,9 @@ fn seal_array_descriptor_identities(
 
 fn closed_descriptor_routes<Route>(
     ordinary: &OrdinaryCohorts,
-    declarations: &HashMap<(&SourceIdentity, ByteSpan), (usize, usize)>,
     routes: &BTreeMap<BodyKey, Route>,
-    bodies: &BTreeMap<BodyKey, Body<'_>>,
-    result: &ClosedAggregates,
-    forward: impl Fn(&Route) -> Option<(OccurrenceOrdinal, CfgPointId)>,
+    can_seal: impl Fn(BodyKey) -> bool,
+    forward: impl Fn(BodyKey, &Route) -> Option<(OccurrenceOrdinal, Option<BodyKey>)>,
     caller_target: impl Fn(BodyKey, usize) -> Option<BodyKey>,
 ) -> Vec<BodyKey> {
     // Each wrapper has at most one outgoing edge. A connected component
@@ -6086,9 +6085,8 @@ fn closed_descriptor_routes<Route>(
     let mut edges = HashMap::new();
     let mut neighbors = HashMap::<_, Vec<_>>::new();
     for (&key, route) in routes {
-        if let Some((call, point)) = forward(route) {
-            if let Some(target) = target_body(declarations, bodies[&key].cfg, point)
-                .filter(|target| routes.contains_key(target))
+        if let Some((call, target)) = forward(key, route) {
+            if let Some(target) = target.filter(|target| routes.contains_key(target))
             {
                 edges.insert(key, (target, call.0));
                 neighbors.entry(target).or_default().push(key);
@@ -6108,8 +6106,8 @@ fn closed_descriptor_routes<Route>(
         let mut admitted_forwards = HashSet::new();
         while let Some(key) = pending.pop() {
             component.push(key);
-            closed &= !result.bodies.contains_key(&key);
-            match forward(&routes[&key]) {
+            closed &= can_seal(key);
+            match forward(key, &routes[&key]) {
                 None => grounded = true,
                 Some(_) => {
                     if let Some(&(target, _)) = edges.get(&key) {
@@ -6176,9 +6174,9 @@ fn seal_borrowed_extent_observers(
         }
     }
     if sites.is_empty() { return; }
-    let sealed = closed_descriptor_routes(ordinary, declarations, observations, bodies, result, |route| match *route {
+    let sealed = closed_descriptor_routes(ordinary, observations, |key| !result.bodies.contains_key(&key), |key, route| match *route {
         BorrowedExtentRoute::Observer(..) => None,
-        BorrowedExtentRoute::Forward(call, point) => Some((call, point)),
+        BorrowedExtentRoute::Forward(call, point) => Some((call, target_body(declarations, bodies[&key].cfg, point))),
     }, |caller, call| sites.get(&(caller, call)).map(|(target, ..)| *target));
     for target in sealed {
         let definition = result.bodies.entry(target).or_default();
@@ -9343,6 +9341,7 @@ pub(in crate::scalar) struct PrivateRuntimeReadPlans {
 #[derive(Default)]
 struct PrivateRuntimeReadPlan {
     formal: Option<ByteSpan>,
+    forward: Option<usize>,
     accesses: HashSet<usize>,
     calls: HashMap<usize, ByteSpan>,
     owners: HashSet<ByteSpan>,
@@ -9366,6 +9365,7 @@ impl ClosedAggregates {
                 return Err("private runtime array access has a competing callable protocol".into());
             }
             body.private_runtime_read_formal = plan.formal;
+            body.private_runtime_read_forward = plan.forward;
             body.private_runtime_reads.clone_from(&plan.accesses);
             body.private_runtime_read_calls.clone_from(&plan.calls);
             body.private_runtime_read_owners.clone_from(&plan.owners);
@@ -9387,6 +9387,77 @@ pub(super) fn private_runtime_read_declaration(function: &ScalarFunction) -> boo
         && crate::scalar::typecheck::is_module_private_name(&function.name)
         && matches!(&function.signature, ScalarType::Callable { parameters, outputs }
             if private_runtime_read_signature(parameters, &outputs.outputs))
+}
+
+#[derive(Clone, Copy)]
+enum PrivateSharedIndexRoute {
+    Read(ByteSpan),
+    Forward { formal: ByteSpan, call: OccurrenceOrdinal, target: Option<BodyKey> },
+}
+
+fn private_shared_index_forward(
+    cfg: &ScalarReferenceCfg, sites: &FunctionCallSites, function: &ScalarFunction,
+) -> Option<(ByteSpan, OccurrenceOrdinal, CfgPointId)> {
+    let [view, index] = sites.boundary.parameters.as_slice() else { return None; };
+    let [item] = sites.structure.blocks.get(sites.structure.root.0)?.items.as_slice() else { return None; };
+    let BlockItemKind::FinalOutput(slot) = &item.kind else { return None; };
+    let call = slot.expression;
+    let signature = sites.checked_call_signatures.get(&call)?;
+    let ScalarType::Callable { outputs, .. } = &function.signature else { return None; };
+    let ScalarType::CheckedReference { inner: formal, .. } = &view.ty else { return None; };
+    let [ScalarType::CheckedReference { inner: actual, .. }, _] = signature.parameters.as_slice() else { return None; };
+    if slot.output != 0 || sites.declared_unsafe_calls.contains(&call.0)
+        || !private_runtime_read_signature(&signature.parameters, &signature.outputs.outputs)
+        || !same_runtime_array_type(formal, actual)
+        || signature.outputs.outputs[0].ty != outputs.outputs[0].ty
+    {
+        return None;
+    }
+    // A relay is a return of the very same two formal SSA values, not
+    // a general fallthrough body or inference of a second lifetime.
+    let points = &cfg.initial_points;
+    if points.len() > 10 { return None; }
+    let (call_site, args) = points.iter().find_map(|point| match &point.kind {
+        CfgPointKind::Call { output: 0, target: ResolvedCallTarget::ModuleCallable {
+            concrete: ConcreteCallSelection::Declaration, .. }, argument_points, .. } =>
+            Some((point, argument_points.as_slice())),
+        _ => None,
+    })?;
+    let [first, second] = args else { return None; };
+    if sites.occurrences.get(call.0)?.span != call_site.source_span.range { return None; }
+    let [output] = call_site.successors.as_slice() else { return None; };
+    for (read, formal, next) in [(*first, view, *second), (*second, index, call_site.id)] {
+        let point = points.get(read.0)?;
+        let CfgPointKind::Read { binding } = &point.kind else { return None; };
+        let OccurrenceNode::Expression(actual) = *sites.structure.edges.get(&(
+            OccurrenceParent::Expression(call), OccurrenceEdge::CallArgument(formal.ordinal),
+        ))? else { return None; };
+        // Runtime-array annotations carry their authored spans. Exact type
+        // identity is invariant across the two declarations; provenance is
+        // separately authenticated against the argument occurrence and loan.
+        let actual_type = sites.structure.checked_types.expressions.get(&actual)?;
+        let parameter_type = signature.parameters.get(formal.ordinal)?;
+        if binding.declaration_span != formal.span || point.successors.as_slice() != [next]
+            || point.scope != call_site.scope || point.source_span.range != sites.occurrences.get(actual.0)?.span
+            || scalar_type_identity(actual_type) != scalar_type_identity(parameter_type)
+            || !matches!(sites.prepared_plain_name(actual), Some(PlainNameIdentity::Lexical(exact)) if exact == binding)
+        {
+            return None;
+        }
+    }
+    if !matches!(points.get(output.0)?.kind, CfgPointKind::ReturnOutput { output: 0, value_point, checked: false }
+        if value_point == call_site.id)
+        || !points.iter().all(|point| match &point.kind {
+            CfgPointKind::Entry | CfgPointKind::ScopeEnter | CfgPointKind::ScopeExit | CfgPointKind::Return => true,
+            CfgPointKind::Bind { binding } => binding.declaration_span == view.span
+                && point.scope == ReferenceScopeId(0)
+                && points.first().is_some_and(|entry| entry.successors.as_slice() == [point.id]),
+            _ => [*first, *second, call_site.id, *output].contains(&point.id),
+        })
+    {
+        return None;
+    }
+    Some((view.span, call, call_site.id))
 }
 
 impl ProjectReferenceResults {
@@ -9412,6 +9483,8 @@ impl ProjectReferenceResults {
         let mut census = OrdinaryCohorts::default();
         let mut reservations = AggregateReservations::default();
         let mut declarations = HashMap::new();
+        let mut routes = BTreeMap::new();
+        let mut possible_relays = Vec::new();
         let function = |module: usize, item: usize| match project.modules.get(module)?.items.get(item)? {
             ScalarItem::Function(function) => Some(function),
             _ => None,
@@ -9424,7 +9497,17 @@ impl ProjectReferenceResults {
                 for (item, entry) in row.items.iter().enumerate() {
                     let ScalarItem::Function(function) = entry else { continue };
                     declarations.insert((&row.source, function.name_span), (module, item));
-                    reservations.bodies.insert((module, item, None), normal(function));
+                    let key = (module, item, None);
+                    reservations.bodies.insert(key, normal(function));
+                    if !pending.contains_key(&key) && private_runtime_read_declaration(function) {
+                        let relay = (|| {
+                            let cfg = self.reference_cfg(module, item, None)?;
+                            let sites = module_at(module)?.calls.function_body(item, None)?;
+                            let (formal, call, point) = private_shared_index_forward(cfg, sites, function)?;
+                            Some((key, cfg, formal, call, point))
+                        })();
+                        possible_relays.extend(relay);
+                    }
                     for arm in 0..function.overload_arms.len() {
                         reservations.bodies.insert((module, item, Some(arm)), false);
                     }
@@ -9452,14 +9535,38 @@ impl ProjectReferenceResults {
                         _ => true,
                     }) {
                         census.transport_uses.insert(key, Some(Vec::new()));
+                        routes.insert(key, PrivateSharedIndexRoute::Read(formal));
                     }
                 }
             }
-            census.census(&reservations, &module_at, &declarations);
+            if !routes.is_empty() {
+                for (key, cfg, formal, call, point) in possible_relays {
+                    let target = target_body(&declarations, cfg, point).filter(|&(module, item, arm)| {
+                        let parameters_and_output = |function: &ScalarFunction| match &function.signature {
+                            ScalarType::Callable { parameters, outputs } => {
+                                match parameters.as_slice() {
+                                    [ScalarType::CheckedReference { inner, .. }, ScalarType::U64] =>
+                                        Some((scalar_type_identity(inner), outputs.outputs.first()?.ty.clone())),
+                                    _ => None,
+                                }
+                            }
+                            _ => None,
+                        };
+                        arm.is_none()
+                            && function(module, item).is_some_and(|callee| private_runtime_read_declaration(callee)
+                                && function(key.0, key.1).and_then(parameters_and_output)
+                                    == parameters_and_output(callee))
+                    });
+                    routes.insert(key, PrivateSharedIndexRoute::Forward { formal, call, target });
+                    census.transport_uses.insert(key, Some(Vec::new()));
+                }
+                census.census(&reservations, &module_at, &declarations);
+            }
         }
         let mut immutable_owners = HashMap::<BodyKey, HashSet<ReferenceBindingId>>::new();
-        for (target, uses) in census.transport_uses {
-            let Some(uses) = uses.filter(|uses| !uses.is_empty()) else { continue };
+        let mut local_sites = HashMap::new();
+        for (&target, uses) in &census.transport_uses {
+            let Some(uses) = uses.as_ref().filter(|uses| !uses.is_empty()) else { continue };
             let Some(ScalarType::Callable { parameters: target_parameters, outputs: target_outputs }) =
                 function(target.0, target.1).map(|function| &function.signature) else { continue };
             let classify = |caller: BodyKey, occurrence: usize, owners: &mut HashMap<BodyKey, HashSet<ReferenceBindingId>>| {
@@ -9511,17 +9618,34 @@ impl ProjectReferenceResults {
                 });
                 immutable.contains(&place.binding).then_some(place.binding.declaration_span)
             };
-            let Some(accepted) = uses.into_iter().map(|(caller, occurrence)|
-                classify(caller, occurrence, &mut immutable_owners).map(|owner| (caller, occurrence, owner))
-            ).collect::<Option<Vec<_>>>() else { continue };
+            for &(caller, occurrence) in uses {
+                if let Some(owner) = classify(caller, occurrence, &mut immutable_owners) {
+                    local_sites.insert((caller, occurrence), (target, owner));
+                }
+            }
+        }
+        let sealed = closed_descriptor_routes(&census, &routes, |_| true, |_, route| match *route {
+            PrivateSharedIndexRoute::Read(_) => None,
+            PrivateSharedIndexRoute::Forward { call, target, .. } => Some((call, target)),
+        }, |caller, call| local_sites.get(&(caller, call)).map(|(target, _)| *target));
+        for target in sealed {
             let plan = plans.bodies.entry(target).or_default();
-            let reads = &pending[&target];
-            plan.formal = Some(reads[0].3);
-            plan.accesses.extend(reads.iter().map(|(_, access, _, _)| *access));
-            for (caller, occurrence, owner) in accepted {
-                let caller = plans.bodies.entry(caller).or_default();
-                caller.calls.insert(occurrence, owner);
-                caller.owners.insert(owner);
+            match routes[&target] {
+                PrivateSharedIndexRoute::Read(formal) => {
+                    plan.formal = Some(formal);
+                    plan.accesses.extend(pending[&target].iter().map(|(_, access, _, _)| *access));
+                }
+                PrivateSharedIndexRoute::Forward { formal, call, .. } => {
+                    plan.formal = Some(formal);
+                    plan.forward = Some(call.0);
+                }
+            }
+            for &(caller, occurrence) in census.transport_uses[&target].as_ref().expect("complete private read census") {
+                if let Some(&(_, owner)) = local_sites.get(&(caller, occurrence)) {
+                    let caller = plans.bodies.entry(caller).or_default();
+                    caller.calls.insert(occurrence, owner);
+                    caller.owners.insert(owner);
+                }
             }
         }
         let mut errors = Vec::new();

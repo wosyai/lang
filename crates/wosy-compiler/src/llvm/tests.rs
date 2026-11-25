@@ -17231,6 +17231,94 @@ if (observe(3, 5, 1) != 117) { core.system_panic(); };
 }
 
 #[test]
+fn private_runtime_formal_relay_passes_current_pair_and_full_selector_unchanged() {
+    let text = "%%start
+u64(u64) select = fn(index) { index };
+u16(*(u16[]),u64) _read = fn(view,index) { (*view)[select(index)] };
+u16(*(u16[]),u64) _relay = fn(view,index) { _read(view,index) };
+u16(*(u16[]),u64) _forward = fn(view,index) { _relay(view,index) };
+u16(u64,u64,u64) observe = fn(length,other_length,index) {
+    u16[length] cells;
+    cells[0] = 9;
+    cells[index] = 37;
+    u16[other_length] other;
+    other[index] = 71;
+    u16 first = _forward(&cells,0);
+    u16 second = _relay(&other,index);
+    u16 replay = _read(&cells,index);
+    if (first != 9 || second != 71 || replay != 37) { core.system_panic(); };
+    first + second + replay
+};
+if (observe(3,5,1) != 117) { core.system_panic(); };
+%%end";
+    let selector = "u64(u64) select = fn(index) { index };";
+    let project = text.replace(selector, "helpers = namespace package \"src/helpers.w\";")
+        .replace("(*view)[select(index)]", "(*view)[helpers.select(index)]");
+    let open = text.replace("_forward", "forward");
+    for layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+        for (route, authored, accepted) in [
+            ("release-standalone", text, true),
+            ("release-project", project.as_str(), true),
+            ("release-open", open.as_str(), false),
+        ] {
+            let source = SourceIdentity::new("project".into(), "package".into(), "src/main.w".into(), "r1".into());
+            let helpers = SourceIdentity::new("project".into(), "package".into(), "src/helpers.w".into(), "r1".into());
+            let declarations = |identity: &SourceIdentity, text: &str| {
+                let parsed = parse_source(identity.clone(), text.into(), &[]);
+                assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+                derive_scalar_declarations_from_cst(parsed.result.canonical_cst())
+            };
+            let mut modules = vec![(declarations(&source, authored), Vec::new())];
+            let mut order = vec![source.clone()];
+            if route == "release-project" {
+                let namespace = modules[0].0.namespaces().find(|namespace| namespace.binding == "helpers").unwrap();
+                let binding = ScalarNamespaceBinding { binding: namespace.binding.clone(),
+                    target: helpers.clone(), span: namespace.span };
+                modules[0].1.push(binding);
+                modules.push((declarations(&helpers, &format!("%%start\n{selector}\n%%end")), Vec::new()));
+                // Match reachable-project discovery: the selected root
+                // initializes dependencies at its namespace declarations.
+                order.push(helpers);
+            }
+            let prepared = crate::prepare_scalar_project_with_access(modules, order,
+                ScalarPreparationInputs { target_layout: layout },
+                Some(wosy_stdlib_source::CheckedAccessComponent::linked()),
+            ).unwrap_or_else(|error| panic!("{:?}", error.diagnostics));
+            let checked = analyze_scalar_build(&prepared);
+            if !accepted {
+                assert_eq!(checked.diagnostics().len(), 1, "{:?}", checked.diagnostics());
+                assert!(format!("{:?}", checked.diagnostics()[0]).contains("requires the extent of the dereferenced backing"));
+                continue;
+            }
+            assert!(checked.diagnostics().is_empty(), "{:?}", checked.diagnostics());
+            let ir = emit_scalar_build_project_llvm(&checked).unwrap().to_text();
+            let observe = project_function_name(&source, "observe");
+            let entry = self_tail_test_body(&ir, "i32", "main");
+            assert_eq!(entry.matches(&format!("call i16 @{observe}(i64 3, i64 5, i64 1)")).count(), 1, "{entry}");
+            let address = if layout == ScalarTargetLayout::WASM32 { "i32" } else { "i64" };
+            for (caller, target) in [("_forward", "_relay"), ("_relay", "_read")] {
+                let caller = project_function_name(&source, caller);
+                let target = project_function_name(&source, target);
+                let body = self_tail_test_body(&ir, "internal i16", &caller);
+                let (formals, _) = body.split_once(')').unwrap();
+                let call = format!("call i16 @{target}({formals})");
+                assert!(body.contains(&call), "{call}: {body}");
+                for omitted in ["extractvalue", "insertvalue", "check_non_null_address", "check_index_in_extent", "getelementptr"] {
+                    assert!(!body.contains(omitted), "{body}");
+                }
+                assert!(formals.starts_with(&format!("{{ {address}, i64 }} ")), "{body}");
+            }
+            if let Some(out) = std::env::var_os("WOSY_PRIVATE_RUNTIME_RELAY_IR_DIR") {
+                let target = if layout == ScalarTargetLayout::WASM32 { "wasm32" } else { "native64" };
+                let controlled = ir.replacen("define i32 @main(", "define i32 @wosy_authored_main(", 1);
+                assert_ne!(controlled, ir);
+                std::fs::write(std::path::PathBuf::from(out).join(format!("{target}-{route}-control.ll")), controlled).unwrap();
+            }
+        }
+    }
+}
+
+#[test]
 fn release_runtime_index_has_no_unpaired_checked_address_fallback() {
     for (body, output) in [
         ("values[index]", "u8"),
