@@ -1,3 +1,4 @@
+use crate::ScalarEnum;
 use super::*;
 use super::super::checker_flow::{charge_call_work, verify_partitioned_call_return, PartitionedProofGoal, SymbolicLiteralFailure};
 
@@ -11,6 +12,7 @@ enum Step<'a> {
     Show(ByteSpan, Claim<'a>),
     Use { declaration: u32, equality: &'a BigInt },
     Split(Condition, Vec<Step<'a>>, Vec<Step<'a>>),
+    Match(Vec<(IntegerSet, Vec<Step<'a>>)>),
 }
 
 pub(super) enum Verdict<F> {
@@ -83,7 +85,12 @@ impl<'a> CaseShows<'a> {
         let [entry] = typed.body.boundary.checker_parameter_bindings.as_deref()
             .ok_or(ProjectCheck::Unsupported)? else { return Err(ProjectCheck::Unsupported); };
         let mut work = CompileWork::default();
-        let steps = compile(&plan.steps, plan, entry, catalog, rewrite::Goal::new(operator, bound), None, 0, &mut work)?;
+        let goal = rewrite::Goal::new(operator, bound);
+        let steps = if let Some(matching) = plan.variant_match {
+            vec![matching.compile(plan, entry, catalog, goal, &mut work)?]
+        } else {
+            compile(&plan.steps, plan, entry, catalog, goal, None, 0, &mut work)?
+        };
         Ok(Self { steps, work: work.observation, has_citations: work.has_citations })
     }
 
@@ -105,6 +112,11 @@ impl<'a> CaseShows<'a> {
                     }
                     Step::Split(condition, yes, no) => {
                         let branch = if condition.holds(input) { yes } else { no };
+                        let verdict = check(branch, input, returned, cite)?;
+                        if !matches!(verdict, Verdict::Established) { return Some(verdict); }
+                    }
+                    Step::Match(arms) => {
+                        let (_, branch) = arms.iter().find(|(domain, _)| domain.contains(input))?;
                         let verdict = check(branch, input, returned, cite)?;
                         if !matches!(verdict, Verdict::Established) { return Some(verdict); }
                     }
@@ -141,7 +153,7 @@ impl VisibleShows<'_, '_> {
                 if match step {
                     Step::Show(_, claim) => claim.supplies(&premise),
                     Step::Use { equality, .. } => matches!(&premise, rewrite::Premise::Literal(value) if value == equality),
-                    Step::Split(..) => false,
+                    Step::Split(..) | Step::Match(..) => false,
                 } { return Ok(true); }
             }
             visible = scope.outer;
@@ -155,6 +167,149 @@ struct CompileWork {
     preparation: usize,
     observation: usize,
     has_citations: bool,
+}
+
+pub(super) struct AuthoredMatch {
+    selector: ScalarExpression,
+    arms: Vec<(String, ScalarBlock)>,
+}
+
+impl AuthoredMatch {
+    pub(super) fn prepare(node: &CstNode) -> Result<Self, ProjectCheck> {
+        // Before recursively lowering expressions or arm blocks, bound the
+        // full source syntax. No work is driven by the enum tag's numeric size.
+        let mut work = 0;
+        charge_call_work(&mut work, u32::from(node.text_range().len()) as usize / 32 + 1)
+            .ok_or(ProjectCheck::Unsupported)?;
+        let mut pending = vec![(node.clone(), 1)];
+        while let Some((node, depth)) = pending.pop() {
+            if depth > MAX_ACTUAL_CALL_DEPTH { return Err(ProjectCheck::Unsupported); }
+            for child in node.children() {
+                charge_call_work(&mut work, 1).ok_or(ProjectCheck::Unsupported)?;
+                pending.push((child, depth + 1));
+            }
+        }
+        let selector = derive_expression(&child(node, SyntaxKind::Expression)?);
+        let mut arms = Vec::new();
+        for node in node.children().filter(|node| node.kind() == SyntaxKind::ProofMatchArm) {
+            if node.children().any(|node| node.kind() == SyntaxKind::Parameters) {
+                // Currently only payload-free tags have canonical value layout.
+                return Err(ProjectCheck::Unsupported);
+            }
+            let mut names = identifiers(&node);
+            let variant = names.next().ok_or(ProjectCheck::InvalidProof)?;
+            if names.next().is_some() { return Err(ProjectCheck::InvalidProof); }
+            let arm = derive_block(&child(&node, SyntaxKind::Block)?);
+            arms.push((variant, arm));
+        }
+        Ok(Self { selector, arms })
+    }
+
+    fn compile<'a>(
+        &'a self, plan: &'a PlannedModuleProof<'a>, entry: &ReferenceBindingId,
+        catalog: Option<&PublicProofCatalog<'a>>, goal: rewrite::Goal<'a>, work: &mut CompileWork,
+    ) -> Result<Step<'a>, ProjectCheck> {
+        let owner = plan.typed.target;
+        if &owner.source != plan.proof_source { return Err(ProjectCheck::Unsupported); }
+        let [parameter] = plan.typed.body.boundary.parameters.as_slice() else { return Err(ProjectCheck::Unsupported); };
+        let universe = IntegerSet::from_type(&parameter.ty).ok_or(ProjectCheck::Unsupported)?;
+        let mut selector = SelectorCompiler { owner, plan, entry, enumeration: None, domains: HashMap::new(), work };
+        selector.visit(&self.selector, universe, 0)?;
+        let enumeration = selector.enumeration.ok_or(ProjectCheck::Unsupported)?;
+        let mut domains = selector.domains;
+        charge_call_work(&mut work.preparation, enumeration.variants.len()).ok_or(ProjectCheck::Unsupported)?;
+        if self.arms.len() != enumeration.variants.len() { return Err(ProjectCheck::InvalidProof); }
+        let mut tags = enumeration.variants.iter().map(|variant| (variant.name.as_str(), variant.tag))
+            .collect::<HashMap<_, _>>();
+        if tags.len() != enumeration.variants.len() { return Err(ProjectCheck::InvalidProof); }
+        let mut arms = Vec::with_capacity(self.arms.len());
+        for (name, arm) in &self.arms {
+            let tag = tags.remove(name.as_str()).ok_or(ProjectCheck::InvalidProof)?;
+            let domain = domains.remove(&tag).unwrap_or_default();
+            charge_call_work(&mut work.observation, domain.interval_count().checked_add(1)
+                .ok_or(ProjectCheck::Unsupported)?).ok_or(ProjectCheck::Unsupported)?;
+            arms.push((domain, compile(arm, plan, entry, catalog, goal.clone(), None, 1, work)?));
+        }
+        if !tags.is_empty() || !domains.is_empty() { return Err(ProjectCheck::InvalidProof); }
+        Ok(Step::Match(arms))
+    }
+}
+
+// Resolve a single enum declaration, then partition the authenticated unary
+// input by the selected canonical variant tag. Tags never stand for proof
+// integers and are not transferred into the ordinary evaluator.
+struct SelectorCompiler<'a, 'w> {
+    owner: &'a ScalarModule,
+    plan: &'a PlannedModuleProof<'a>,
+    entry: &'a ReferenceBindingId,
+    enumeration: Option<&'a ScalarEnum>,
+    domains: HashMap<u32, IntegerSet>,
+    work: &'w mut CompileWork,
+}
+
+impl SelectorCompiler<'_, '_> {
+    fn visit(&mut self, expression: &ScalarExpression, domain: IntegerSet, depth: usize) -> Result<(), ProjectCheck> {
+        if depth == MAX_ACTUAL_CALL_DEPTH { return Err(ProjectCheck::Unsupported); }
+        charge_call_work(&mut self.work.preparation, 1).ok_or(ProjectCheck::Unsupported)?;
+        match expression {
+            ScalarExpression::Member { receiver, name, .. } => {
+                let enumeration = match self.enumeration {
+                    Some(enumeration) if enumeration.name == *receiver => enumeration,
+                    Some(_) => return Err(ProjectCheck::InvalidProof),
+                    None => {
+                        charge_call_work(&mut self.work.preparation, self.owner.enums.len())
+                            .ok_or(ProjectCheck::Unsupported)?;
+                        let mut declarations = self.owner.enums.iter().filter(|enumeration| enumeration.name == *receiver);
+                        let enumeration = declarations.next().ok_or(ProjectCheck::Unsupported)?;
+                        if declarations.next().is_some() || enumeration.id.source != self.owner.source {
+                            return Err(ProjectCheck::InvalidProof);
+                        }
+                        self.enumeration = Some(enumeration);
+                        enumeration
+                    }
+                };
+                charge_call_work(&mut self.work.preparation, enumeration.variants.len()).ok_or(ProjectCheck::Unsupported)?;
+                let mut variants = enumeration.variants.iter().filter(|variant| variant.name == *name);
+                let selected = variants.next().ok_or(ProjectCheck::InvalidProof)?;
+                if variants.next().is_some() { return Err(ProjectCheck::InvalidProof); }
+                let previous = self.domains.entry(selected.tag).or_default();
+                let cost = previous.interval_count().checked_add(domain.interval_count()).ok_or(ProjectCheck::Unsupported)?;
+                charge_call_work(&mut self.work.preparation, cost).ok_or(ProjectCheck::Unsupported)?;
+                *previous = std::mem::take(previous).join(domain);
+                Ok(())
+            }
+            ScalarExpression::If { condition, then_branch, else_branch, .. } => {
+                fn output(block: &ScalarBlock) -> Result<&ScalarExpression, ProjectCheck> {
+                    let ([ScalarBlockItem::Expression(value)], [false], [returned]) = (
+                        block.items.as_slice(), block.terminated_items.as_slice(), block.final_output_values.as_slice()
+                    ) else { return Err(ProjectCheck::Unsupported); };
+                    if value != &returned.value { return Err(ProjectCheck::Unsupported); }
+                    Ok(value)
+                }
+                let guard = compile_condition(condition, self.plan, self.entry, self.work)?;
+                let (yes, no) = match guard {
+                    Condition::Boolean(true) => (domain, IntegerSet::default()),
+                    Condition::Boolean(false) => (IntegerSet::default(), domain),
+                    Condition::Integer { relation, bound, .. } => {
+                        charge_call_work(&mut self.work.preparation, domain.interval_count()).ok_or(ProjectCheck::Unsupported)?;
+                        domain.split_relation(relation, &bound)
+                    }
+                    Condition::Partition { yes, no } => {
+                        let cost = domain.interval_count().checked_mul(2)
+                            .and_then(|cost| cost.checked_add(yes.interval_count()))
+                            .and_then(|cost| cost.checked_add(no.interval_count())).ok_or(ProjectCheck::Unsupported)?;
+                        charge_call_work(&mut self.work.preparation, cost).ok_or(ProjectCheck::Unsupported)?;
+                        (intersect(&domain, &yes), intersect(&domain, &no))
+                    }
+                };
+                // All selectors must resolve to the same declaration even
+                // when an arm of the selector is statically unreachable.
+                self.visit(output(then_branch)?, yes, depth + 1)?;
+                self.visit(output(else_branch)?, no, depth + 1)
+            }
+            _ => Err(ProjectCheck::Unsupported),
+        }
+    }
 }
 
 fn compile_condition(
@@ -268,7 +423,7 @@ fn compile<'a>(
                 let peer = catalog.and_then(|catalog| catalog.resolve(plan.proof_source, name))
                     .ok_or(ProjectCheck::Unsupported)?;
                 let (relation, equality) = peer.peer_literal_goal().ok_or(ProjectCheck::Unsupported)?;
-                if !peer.steps.items.is_empty() || !plan.same_peer_target(peer)
+                if !peer.has_no_authored_steps() || !plan.same_peer_target(peer)
                     || Some(relation) != IntegerRelation::from_operator(&BinaryOperator::Equal)
                 {
                     return Err(ProjectCheck::Unsupported);
@@ -320,6 +475,16 @@ fn check_partitions<'body>(
                 .failure.map_or(Verdict::Established, |failure| Verdict::Refuted((failure, *span))),
             Step::Use { declaration, .. } => {
                 if cite(*declaration, domain, work)? { Verdict::Established } else { Verdict::Blocked }
+            }
+            Step::Match(arms) => {
+                for (arm, steps) in arms {
+                    let cost = domain.interval_count().checked_add(arm.interval_count())?.checked_add(1)?;
+                    charge_call_work(work, cost)?;
+                    let active = intersect(domain, arm);
+                    let verdict = check_partitions(steps, producer, returned, &active, work, cite)?;
+                    if !matches!(verdict, Verdict::Established) { return Some(verdict); }
+                }
+                Verdict::Established
             }
             Step::Split(Condition::Boolean(guard), yes, no) =>
                 check_partitions(if *guard { yes } else { no }, producer, returned, domain, work, cite)?,

@@ -105,6 +105,9 @@ pub enum SyntaxKind {
     ContextualPlace = 92,
     ValueField = 93,
     InvalidTemporaryPlace = 94,
+    ProofMatchBlock = 95,
+    ProofMatch = 96,
+    ProofMatchArm = 97,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -209,6 +212,9 @@ impl Language for WosyLanguage {
             92 => SyntaxKind::ContextualPlace,
             93 => SyntaxKind::ValueField,
             94 => SyntaxKind::InvalidTemporaryPlace,
+            95 => SyntaxKind::ProofMatchBlock,
+            96 => SyntaxKind::ProofMatch,
+            97 => SyntaxKind::ProofMatchArm,
             _ => panic!("invalid syntax kind: {}", raw.0),
         }
     }
@@ -944,6 +950,9 @@ fn kind(rule: Rule) -> SyntaxKind {
         Rule::proof_forall => SyntaxKind::ProofForall,
         Rule::proof_quantifier_guard => SyntaxKind::ProofQuantifierGuard,
         Rule::proof_exists => SyntaxKind::ProofExists,
+        Rule::proof_match_block => SyntaxKind::ProofMatchBlock,
+        Rule::proof_match => SyntaxKind::ProofMatch,
+        Rule::proof_match_arm => SyntaxKind::ProofMatchArm,
         Rule::boundary_start => SyntaxKind::BoundaryStart,
         Rule::boundary_end => SyntaxKind::BoundaryEnd,
         Rule::extern_decl => SyntaxKind::ExternDecl,
@@ -2976,6 +2985,27 @@ mod proof_fragment_tests {
         assert!(entry.children().any(|node| node.kind() == SyntaxKind::Expression && node.text() == "x <= 10"));
         assert!(goal.children().any(|node| node.kind() == SyntaxKind::Expression && node.text() == "out <= 10"));
         assert!(body.descendants().any(|node| node.kind() == SyntaxKind::Call && node.text() == "core.show(out == x)"));
+    }
+
+    #[test]
+    fn proof_only_match_keeps_canonical_selector_and_arm_spans() {
+        let matching = "match (if (x == 0) { Region.left } else { Region.right }) { left { core.show(out == 0); } right {} }";
+        let text = format!("proof split for classify(x) -> (out) ensures (out <= 1) {{ {matching} }}");
+        let parsed = parse_proof_fragment(source(), text.clone(), &[]);
+        let result = parsed.as_result();
+        let declaration = proof(result);
+        assert_eq!(result.reconstruct(), text);
+        let matching_node = declaration.descendants().find(|node| node.kind() == SyntaxKind::ProofMatch).unwrap();
+        let span = byte_span(&matching_node);
+        assert_eq!(&text[span.start as usize..span.end as usize], matching);
+        let arms = matching_node.children().filter(|node| node.kind() == SyntaxKind::ProofMatchArm).collect::<Vec<_>>();
+        assert_eq!(arms.len(), 2);
+        assert_eq!(arms[0].text(), "left { core.show(out == 0); }");
+        assert_eq!(arms[1].text(), "right {}");
+        let runtime = format!("%%start u8(u8) classify = fn(x) {{ {matching} }}; %%end");
+        let ordinary = parse(source(), runtime, &[]);
+        assert!(!ordinary.is_valid());
+        assert!(!ordinary.root.descendants().any(|node| node.kind() == SyntaxKind::ProofMatch));
     }
 
     #[test]

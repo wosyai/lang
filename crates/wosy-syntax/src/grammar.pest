@@ -8,7 +8,10 @@ comment_scan = ${ SOI ~ (string | comment | (!("\"" | "#") ~ ANY))* ~ EOI }
 
 source = { SOI ~ boundary_start ~ (proof_decl | item | error_item)+ ~ boundary_end ~ EOI }
 proof_fragment = { SOI ~ proof_decl ~ EOI }
-proof_decl = { proof_keyword ~ identifier ~ proof_for_keyword ~ proof_target ~ "->" ~ proof_outputs ~ proof_where? ~ proof_forall* ~ proof_ensures ~ proof_decreases? ~ block }
+proof_decl = { proof_keyword ~ identifier ~ proof_for_keyword ~ proof_target ~ "->" ~ proof_outputs ~ proof_where? ~ proof_forall* ~ proof_ensures ~ proof_decreases? ~ (proof_match_block | block) }
+proof_match_block = { "{" ~ proof_match ~ "}" }
+proof_match = { "match" ~ "(" ~ expression ~ ")" ~ "{" ~ proof_match_arm+ ~ "}" }
+proof_match_arm = { identifier ~ parameters? ~ block }
 proof_target = { qualified_call ~ parameters }
 proof_outputs = { parameters }
 proof_where = { proof_where_keyword ~ "(" ~ expression ~ ")" }

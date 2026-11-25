@@ -4466,6 +4466,14 @@ struct ModuleProofs {
     first_query: usize,
 }
 
+enum OrderedProofPreparation {
+    None,
+    #[cfg(feature = "internal-checker")]
+    MatchOnly,
+    #[cfg(feature = "internal-checker")]
+    All,
+}
+
 struct PreparedProofModule {
     source: SourceIdentity,
     proofs: HashMap<SourceIdentity, ModuleProofs>,
@@ -4529,7 +4537,7 @@ impl PreparedProofModule {
             }
             declarations.push((module_declarations, module.namespaces));
         }
-        Self::prepare_declarations(source, declarations, proofs, initialization_order, inputs, Vec::new(), false)
+        Self::prepare_declarations(source, declarations, proofs, initialization_order, inputs, Vec::new(), OrderedProofPreparation::None)
     }
 
     fn prepare_declarations(
@@ -4539,7 +4547,7 @@ impl PreparedProofModule {
         initialization_order: Vec<SourceIdentity>,
         inputs: ScalarPreparationInputs,
         dormant: Vec<ScalarProofDeclarations>,
-        #[cfg_attr(not(feature = "internal-checker"), allow(unused_variables))] public_ordered: bool,
+        #[cfg_attr(not(feature = "internal-checker"), allow(unused_variables))] ordered: OrderedProofPreparation,
     ) -> Result<Self, ProjectCheck> {
         let mut graph_sources: HashMap<_, _> = initialization_order.iter().map(|source| (source, false)).collect();
         if graph_sources.len() != initialization_order.len() {
@@ -4593,8 +4601,13 @@ impl PreparedProofModule {
             for definition in &proofs.definitions {
                 let (receiver, name) = proof_target_tokens(definition)?;
                 #[cfg(feature = "internal-checker")]
-                if public_ordered {
-                    ordered_steps.push(PreparedOrderedProofSteps::prepare(definition)?);
+                match ordered {
+                    OrderedProofPreparation::None => {}
+                    OrderedProofPreparation::All => ordered_steps.push(PreparedOrderedProofSteps::prepare(definition)?),
+                    OrderedProofPreparation::MatchOnly => {
+                        let is_match = definition.children().any(|node| node.kind() == SyntaxKind::ProofMatchBlock);
+                        ordered_steps.push(if is_match { PreparedOrderedProofSteps::prepare(definition)? } else { None });
+                    }
                 }
                 targets.push((source, receiver, name));
             }
@@ -4795,7 +4808,7 @@ pub fn check_loaded_scalar_module_proof_selections(
     if selections.is_empty() {
         return Ok(Vec::new());
     }
-    let prepared = prepare_loaded_proof_project(declarations, proofs, initialization_order, inputs, Vec::new(), false)
+    let prepared = prepare_loaded_proof_project(declarations, proofs, initialization_order, inputs, Vec::new(), OrderedProofPreparation::None)
         .map_err(|error| module_proof_outcome(Err(error)))?;
     Ok(prepared.check_module_proof_selections(selections))
 }
@@ -4806,7 +4819,7 @@ fn prepare_loaded_proof_project(
     proofs: Vec<(ScalarProofDeclarations, Vec<ScalarNamespaceBinding>)>,
     initialization_order: Vec<SourceIdentity>,
     inputs: ScalarPreparationInputs,
-    dormant: Vec<ScalarProofDeclarations>, public_ordered: bool,
+    dormant: Vec<ScalarProofDeclarations>, ordered: OrderedProofPreparation,
 ) -> Result<PreparedProofModule, ProjectCheck> {
     let mut catalogs = Vec::with_capacity(proofs.len());
     declarations.reserve(proofs.len());
@@ -4817,7 +4830,7 @@ fn prepare_loaded_proof_project(
         declarations.push((proof_declarations, namespaces));
     }
     let root = initialization_order.first().cloned().ok_or(ProjectCheck::MissingRoot)?;
-    PreparedProofModule::prepare_declarations(root, declarations, catalogs, initialization_order, inputs, dormant, public_ordered)
+    PreparedProofModule::prepare_declarations(root, declarations, catalogs, initialization_order, inputs, dormant, ordered)
 }
 
 #[cfg(feature = "internal-checker")]
@@ -6589,6 +6602,7 @@ fn authored_shape(steps: &ScalarBlock) -> Option<AuthoredShape> {
 struct PreparedOrderedProofSteps {
     steps: ScalarBlock,
     shape: Option<AuthoredShape>,
+    variant_match: Option<case_splits::AuthoredMatch>,
 }
 
 #[cfg(feature = "internal-checker")]
@@ -6601,9 +6615,16 @@ impl PreparedOrderedProofSteps {
         {
             return Ok(None);
         }
+        if let Some(block) = declaration.children().find(|node| node.kind() == SyntaxKind::ProofMatchBlock) {
+            let variant_match = case_splits::AuthoredMatch::prepare(&child(&block, SyntaxKind::ProofMatch)?)?;
+            // This wrapper has no ordinary statements. The separate typed
+            // match remains authored at every downstream authority gate.
+            let steps = derive_block(&block);
+            return Ok(Some(Self { steps, shape: Some(AuthoredShape::Cases), variant_match: Some(variant_match) }));
+        }
         let steps = derive_block(&child(declaration, SyntaxKind::Block)?);
         let shape = authored_shape(&steps);
-        Ok(Some(Self { steps, shape }))
+        Ok(Some(Self { steps, shape, variant_match: None }))
     }
 }
 
@@ -6711,14 +6732,14 @@ impl<'a> MainFlowProofCase<'a> {
             && supports_rectangular_calling_proof(body);
         let (relation, bound) = match &plan.typed.goal {
             TypedProofGoal::Literal { relation, bound, .. } => (relation, MainFlowProofBound::Literal(bound)),
-            TypedProofGoal::Universal { relation, bound } if plan.steps.items.is_empty() => (relation, MainFlowProofBound::Literal(bound)),
-            TypedProofGoal::EntryComparison { slot, relation } if plan.steps.items.is_empty() || rectangular =>
+            TypedProofGoal::Universal { relation, bound } if plan.has_no_authored_steps() => (relation, MainFlowProofBound::Literal(bound)),
+            TypedProofGoal::EntryComparison { slot, relation } if plan.has_no_authored_steps() || rectangular =>
                 (relation, MainFlowProofBound::Entry(*slot)),
-            TypedProofGoal::EntryAffine { slot, relation, transform } if plan.steps.items.is_empty() || rectangular =>
+            TypedProofGoal::EntryAffine { slot, relation, transform } if plan.has_no_authored_steps() || rectangular =>
                 (relation, MainFlowProofBound::EntryAffine { slot: *slot, transform }),
             _ => return Err(ProjectCheck::Unsupported),
         };
-        if qualified_leaf && literal_leaf.is_none() && !(plan.steps.items.is_empty()
+        if qualified_leaf && literal_leaf.is_none() && !(plan.has_no_authored_steps()
             && matches!(plan.typed.goal, TypedProofGoal::Literal { .. })
             && qualified_integer_proof_leaf(body, plan.typed.result_type))
         {
@@ -6752,7 +6773,7 @@ impl<'a> MainFlowProofCase<'a> {
             plan.ordered_shape.unwrap_or_else(|| authored_shape(&plan.steps))
         } else { None };
         let step = if let Some((peer, show)) = citation {
-            if peer.peer_literal_goal().is_none() || (!peer.steps.items.is_empty() && peer.direct_peer_use().is_none())
+            if peer.peer_literal_goal().is_none() || (!peer.has_no_authored_steps() && peer.direct_peer_use().is_none())
                 || !plan.same_peer_target(peer) || plan.peer_literal_goal().is_none()
                 || !(supported_calling_proof_body(body, plan.typed.result_type) || supports_rectangular_calling_proof(body))
             {
@@ -6770,7 +6791,7 @@ impl<'a> MainFlowProofCase<'a> {
             Some(MainFlowAuthoredShows::Cases(case_splits::CaseShows::prepare(plan, catalog)?))
         } else if matches!(shape, Some(AuthoredShape::Rewrite)) {
             Some(prepare_flat_rewrite_shows(plan, bound.literal().ok_or(ProjectCheck::Unsupported)?)?)
-        } else if rectangular && !plan.steps.items.is_empty() {
+        } else if rectangular && !plan.has_no_authored_steps() {
             let steps = &plan.steps.items;
             if steps.len() != plan.steps.terminated_items.len() {
                 return Err(ProjectCheck::Unsupported);
@@ -7141,7 +7162,7 @@ impl<'a> MainFlowProofObserver<'a> {
     }
 
     fn eligible_pure_affine_case(plan: &PlannedModuleProof<'_>, proof: &MainFlowProofPlan<'_>) -> bool {
-        plan.steps.items.is_empty() && plan.typed.measure.is_none() && proof.0.literal_leaf.is_none() && proof.0.result_pair().is_none()
+        plan.has_no_authored_steps() && plan.typed.measure.is_none() && proof.0.literal_leaf.is_none() && proof.0.result_pair().is_none()
             && ((matches!(&plan.typed.goal, TypedProofGoal::Literal { .. })
                 && matches!(proof.0.filter, [] | [CheckerPredicate::Boolean(true) | CheckerPredicate::Integer(_)]))
                 || (matches!(&plan.typed.goal, TypedProofGoal::EntryAffine { .. } | TypedProofGoal::EntryComparison { .. })
@@ -8154,7 +8175,7 @@ fn run_closed_ranked_checks<'a, 'proof, const LOCAL_CATALOGS: bool>(
     }
     let mut observed: Option<MainFlowProofObserver<'_>> = None;
     for plan in plans().filter(|plan| plan.typed.measure.is_none()) {
-        if !plan.steps.items.is_empty() || ranked.contains_key(&plan.target) {
+        if !plan.has_no_authored_steps() || ranked.contains_key(&plan.target) {
             return Err(ProjectCheck::Unsupported);
         }
         if let Some(observer) = &mut observed {
@@ -8292,8 +8313,12 @@ fn check_loaded_ordered_proof_diagnostics_in_scope<const LOCAL_CATALOGS: bool>(
             symbolic_diagnostic: None, additional_symbolic_diagnostics: Vec::new(), entry_evidence: None,
         });
     }
-    let prepared = prepare_loaded_proof_project(declarations, proofs, initialization_order, inputs, dormant,
-        LOCAL_CATALOGS && scope == ScalarCheckerScope::CurrentPackage)?;
+    let ordered = match (LOCAL_CATALOGS, scope) {
+        (true, ScalarCheckerScope::CurrentPackage) => OrderedProofPreparation::All,
+        (true, ScalarCheckerScope::MainFlowOnly) => OrderedProofPreparation::MatchOnly,
+        (false, _) => OrderedProofPreparation::None,
+    };
+    let prepared = prepare_loaded_proof_project(declarations, proofs, initialization_order, inputs, dormant, ordered)?;
     let project = prepared.prepared.parts().0;
     let sources = if LOCAL_CATALOGS {
         project.initialization_order.as_slice()
@@ -8438,7 +8463,7 @@ pub fn check_loaded_scalar_module_proof_call(
     initialization_order: Vec<SourceIdentity>,
     inputs: ScalarPreparationInputs,
 ) -> ScalarProofCallOutcome {
-    let result = prepare_loaded_proof_project(declarations, vec![catalog], initialization_order, inputs, Vec::new(), false)
+    let result = prepare_loaded_proof_project(declarations, vec![catalog], initialization_order, inputs, Vec::new(), OrderedProofPreparation::None)
         .ok()
         .and_then(|prepared| production_bound_reuse::apply(&prepared, proof, caller));
     result.unwrap_or(ScalarProofCallOutcome::Unavailable)
@@ -8516,7 +8541,7 @@ mod production_bound_reuse {
         }
         if let Some((slot, domain)) = guard.domain {
             if plan.proof_source != root || &plan.typed.target.source != root || caller_source != root
-                || plan.typed.measure.is_some() || !plan.steps.items.is_empty() || !valid_arbitrary_proof_body(producer)
+                || plan.typed.measure.is_some() || !plan.has_no_authored_steps() || !valid_arbitrary_proof_body(producer)
             {
                 return None;
             }
@@ -8553,7 +8578,7 @@ mod production_bound_reuse {
                 }
                 IntegerSet::singleton(bound)
             } else {
-                if !plan.steps.items.is_empty() || !valid_arbitrary_proof_body(body) {
+                if !plan.has_no_authored_steps() || !valid_arbitrary_proof_body(body) {
                     return None;
                 }
                 proved_arbitrary_values(plan, output)?
@@ -8678,6 +8703,7 @@ struct PlannedModuleProof<'a> {
     typed: TypedProofPostcondition<'a>,
     steps: Cow<'a, ScalarBlock>,
     ordered_shape: Option<Option<AuthoredShape>>,
+    variant_match: Option<&'a case_splits::AuthoredMatch>,
     filter: Option<Vec<CheckerPredicate>>,
 }
 
@@ -9032,7 +9058,7 @@ impl<'a> LocalPeerGraph<'a> {
             let request = (|| {
                 let plan = self.nodes[index].plan()?;
                 plan.peer_literal_goal()?;
-                if plan.steps.items.is_empty() {
+                if plan.has_no_authored_steps() {
                     return None;
                 }
                 let catalog = selected.catalog(plan.proof_source)?;
@@ -9046,7 +9072,7 @@ impl<'a> LocalPeerGraph<'a> {
                     self.activate(next);
                 }
             } else if self.nodes[index].plan().is_some_and(|plan|
-                plan.peer_literal_goal().is_some() && (plan.steps.items.is_empty() || plan.has_flat_show_steps()))
+                plan.peer_literal_goal().is_some() && (plan.has_no_authored_steps() || plan.has_flat_show_steps()))
             {
                 self.nodes[index].state = LocalPeerState::Terminal(index);
             } else {
@@ -9402,9 +9428,13 @@ impl PreparedProofModule {
             None => Cow::Owned(derive_block(&child(proof.node, SyntaxKind::Block)?)),
         };
         let ordered_shape = proof.ordered_steps.map(|prepared| prepared.shape);
+        let variant_match = proof.ordered_steps.and_then(|prepared| prepared.variant_match.as_ref());
         let typed = typed_proof_postcondition::<ALLOW_INDUCTION, DEFER_OUTPUT_UNION>(
             proof.owner, function, proof.body, proof.node, &steps, !DEFER_OUTPUT_UNION,
         )?;
+        if variant_match.is_some() && !matches!(typed.goal, TypedProofGoal::Literal { .. }) {
+            return Err(ProjectCheck::Unsupported);
+        }
         if (matches!(typed.result_type, ScalarType::Bool | ScalarType::Char) || typed.is_result_pair())
             && proof.node.children().find(|node| node.kind() == SyntaxKind::ProofWhere)
                 .is_some_and(|clause| clause.descendants().take(MAX_ACTUAL_CALL_DEPTH + 1).count() > MAX_ACTUAL_CALL_DEPTH)
@@ -9419,12 +9449,12 @@ impl PreparedProofModule {
             prepare_proof_entry_filter_in_scope(
             proof.node, proof_source, typed.target.target_layout, &typed.input_names, typed.body,
             matches!(typed.result_type, ScalarType::Bool | ScalarType::Char) || typed.is_result_pair()
-                || typed.measure.is_some() || (ALLOW_DOMAIN && steps.items.is_empty()),
+                || typed.measure.is_some() || (ALLOW_DOMAIN && variant_match.is_none() && steps.items.is_empty()),
             )?
         };
         Ok(PlannedModuleProof {
             proof_source, proof: proof.node, canonical_target: proof.target, target: (module, item),
-            function, name: proof_name, typed, steps, ordered_shape, filter,
+            function, name: proof_name, typed, steps, ordered_shape, variant_match, filter,
         })
     }
 
@@ -9653,7 +9683,7 @@ impl PreparedProofModule {
                 }
                 let strict_entry = if ExactGuardGroup(plan.filter.as_deref()) == ExactGuardGroup(immediate.filter.as_deref()) {
                     None
-                } else if immediate.steps.items.is_empty() {
+                } else if immediate.has_no_authored_steps() {
                     let Some(entry) = plan.closed_entry_admitted_by_peer(immediate) else { continue; };
                     Some(entry)
                 } else {
@@ -9662,7 +9692,7 @@ impl PreparedProofModule {
                 // A calling citation has one independently verified bare
                 // terminal, not a composed, strict-entry or mixed citation.
                 if supported_calling_proof_body(plan.typed.body, plan.typed.result_type)
-                    && (!immediate.steps.items.is_empty() || strict_entry.is_some() || claim.is_some())
+                    && (!immediate.has_no_authored_steps() || strict_entry.is_some() || claim.is_some())
                 {
                     continue;
                 }
@@ -9680,7 +9710,7 @@ impl PreparedProofModule {
                 }
                 let direct = |index: usize| {
                     let peer = graph.nodes[index].plan()?;
-                    if !peer.steps.items.is_empty() || !plan.same_peer_context(peer) {
+                    if !peer.has_no_authored_steps() || !plan.same_peer_context(peer) {
                         return None;
                     }
                     peer.peer_literal_goal()
@@ -9701,7 +9731,7 @@ impl PreparedProofModule {
             for (index, plan, requested, strict_entry, claim) in admitted_roots {
                 let Some(leaf) = graph.terminal(requested) else { continue; };
                 let Some((relation, bound)) = leaf.peer_literal_goal() else { continue; };
-                if !leaf.steps.items.is_empty() {
+                if !leaf.has_no_authored_steps() {
                     if strict_entry.is_some() || claim.is_some() {
                         continue;
                     }
@@ -10035,6 +10065,10 @@ impl PreparedProofModule {
 
 #[cfg(feature = "internal-checker")]
 impl PlannedModuleProof<'_> {
+    fn has_no_authored_steps(&self) -> bool {
+        self.variant_match.is_none() && self.steps.items.is_empty()
+    }
+
     fn verify_induction_return_witness(
         &self, measure: TypedInductionRank<'_>,
     ) -> Result<RankedInductionOutcome<'_>, ProjectCheck> {
@@ -10053,7 +10087,7 @@ impl PlannedModuleProof<'_> {
     }
 
     fn uses_direct_goal(&self) -> bool {
-        self.steps.items.is_empty() || matches!(self.typed.goal, TypedProofGoal::Existential { .. } | TypedProofGoal::EntryWitness { .. } | TypedProofGoal::ConjunctiveExistential(_) | TypedProofGoal::DependentWitness(_))
+        self.has_no_authored_steps() || matches!(self.typed.goal, TypedProofGoal::Existential { .. } | TypedProofGoal::EntryWitness { .. } | TypedProofGoal::ConjunctiveExistential(_) | TypedProofGoal::DependentWitness(_))
     }
 
     fn observer(&self) -> SelectedProofObserver<'_> {
@@ -10238,7 +10272,7 @@ impl PlannedModuleProof<'_> {
     }
 
     fn has_flat_show_steps(&self) -> bool {
-        self.steps.items.len() == self.steps.terminated_items.len()
+        self.variant_match.is_none() && self.steps.items.len() == self.steps.terminated_items.len()
             && self.steps.items.iter().zip(&self.steps.terminated_items).all(|(item, &terminated)|
                 proof_show_expression(item, terminated).is_ok())
     }
@@ -15823,6 +15857,69 @@ mod tests {
 
     #[cfg(feature = "internal-checker")]
     #[test]
+    fn ordered_authored_enum_match_specializes_actual_and_symbolic_arms() {
+        let app = source("src/main.w", "ordered-authored-enum-match");
+        let program = r#"%%start
+            enum Region { outer; middle; reserved; }
+            enum Other { outer; middle; reserved; }
+            u8(u8) classify = fn(value) {
+                if (value == 0) { 1 } else { if (value >= 10) { 1 } else { 2 } }
+            };
+            proof partitioned for classify(x) -> (out) ensures (out <= 2) {
+                match (if (!(x >= 1 && x < 10)) { Region.outer } else { Region.middle }) {
+                    middle { core.show(out == 2); }
+                    reserved { core.show(out == 255); }
+                    outer { core.show(out == 1); }
+                }
+            }
+        %%end"#;
+        let run = |text: &str, scope| {
+            let (_, parsed) = crate::parse_proof_source(app.clone(), text.to_owned(), &[]).ok().unwrap();
+            check_loaded_ordered_proof_diagnostics_in_scope::<true>(
+                Vec::new(), vec![(parsed, Vec::new())], vec![app.clone()], inputs(), scope, Vec::new(),
+            )
+        };
+        let checked = run(program, ScalarCheckerScope::CurrentPackage).unwrap();
+        assert!(checked.active && checked.symbolic_diagnostic.is_none());
+        assert!(!run(program, ScalarCheckerScope::MainFlowOnly).unwrap().active);
+        let wrong = program.replace("x < 10", "x <= 10");
+        let symbolic = run(&wrong, ScalarCheckerScope::CurrentPackage).unwrap().symbolic_diagnostic.unwrap();
+        let span = symbolic.failed_step.unwrap().range;
+        assert_eq!(&wrong[span.start as usize..span.end as usize], "core.show(out == 2)");
+        let ten = BigInt::from(10);
+        assert_eq!(symbolic.returned, BigInt::from(1));
+        assert!(symbolic.witness.intervals_at(0, 0).unwrap().eq([(&ten, &ten)]));
+        let reach = |text: &str| text.replace("%%end",
+            "u8 low = classify(0); u8 mid = classify(5); u8 edge = classify(10);
+             u8 high = classify(255); %%end");
+        for scope in [ScalarCheckerScope::CurrentPackage, ScalarCheckerScope::MainFlowOnly] {
+            let valid = run(&reach(program), scope).unwrap();
+            assert!(valid.active && valid.diagnostics.is_empty() && valid.symbolic_diagnostic.is_none());
+            let actual = reach(&wrong);
+            let failure = run(&actual, scope).unwrap();
+            let [diagnostic] = failure.diagnostics.as_slice() else { panic!("only one actual input fails"); };
+            let snippet = |span: ByteSpan| &actual[span.start as usize..span.end as usize];
+            assert_eq!(snippet(diagnostic.failed_step.as_ref().unwrap().range), "core.show(out == 2)");
+            assert_eq!(snippet(diagnostic.invocation.call.range), "classify(10)");
+            assert_eq!(diagnostic.invocation.arguments, [(ScalarType::U8, ten.clone())]);
+        }
+        for invalid in [
+            program.replace("reserved { core.show(out == 255); }", ""),
+            program.replace("reserved {", "middle {"),
+            program.replace("reserved {", "absent {"),
+            program.replace("Region.middle", "Other.middle"),
+            program.replace("Region.middle", "Region.absent"),
+        ] {
+            assert!(matches!(run(&invalid, ScalarCheckerScope::CurrentPackage), Err(ProjectCheck::InvalidProof)), "{invalid}");
+        }
+        let payload = program.replace("middle { core.show", "middle(data) { core.show");
+        assert!(matches!(run(&payload, ScalarCheckerScope::CurrentPackage), Err(ProjectCheck::Unsupported)));
+        let non_enum = program.replace("Region.outer", "x");
+        assert!(matches!(run(&non_enum, ScalarCheckerScope::CurrentPackage), Err(ProjectCheck::Unsupported)));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
     fn ordered_pure_affine_proof_observes_typed_conditional_joins_and_returns() {
         let app = source("src/main.w", "ordinary-branching-pure-proof");
         let text = r#"%%start
@@ -16416,7 +16513,7 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
         let watches_nested = |text: &str, proof_name| {
             let (_, catalog) = crate::parse_proof_source(app.clone(), text.to_owned(), &[]).ok().unwrap();
             let project = prepare_loaded_proof_project(Vec::new(), vec![(catalog, Vec::new())],
-                vec![app.clone()], inputs(), Vec::new(), true).unwrap();
+                vec![app.clone()], inputs(), Vec::new(), OrderedProofPreparation::All).unwrap();
             let (module, item, _) = project.select_resolved(&app, proof_name).unwrap().function;
             project.prepared.parts().1.has_nested_proof_use((module, item))
         };
@@ -18656,7 +18753,7 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
         %%end"#);
         let (_, catalog) = crate::parse_proof_source(app.clone(), text, &[]).ok().unwrap();
         let prepared = prepare_loaded_proof_project(Vec::new(), vec![(catalog, Vec::new())],
-            vec![app.clone()], inputs(), Vec::new(), true).unwrap();
+            vec![app.clone()], inputs(), Vec::new(), OrderedProofPreparation::All).unwrap();
         let scope = ScalarCheckerScope::MainFlowOnly;
         let plan = prepared.plan_module_proof_in_scope::<true, false, false>(&app, "scoped").unwrap();
         let (project, calls) = prepared.prepared.parts();
@@ -18757,7 +18854,7 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
         }
         let (_, catalog) = crate::parse_proof_source(app.clone(), unrelated, &[]).ok().unwrap();
         let prepared = prepare_loaded_proof_project(Vec::new(), vec![(catalog, Vec::new())],
-            vec![app.clone()], inputs(), Vec::new(), true).unwrap();
+            vec![app.clone()], inputs(), Vec::new(), OrderedProofPreparation::All).unwrap();
         let (module, item, _) = prepared.select_resolved(&app, "scoped").unwrap().function;
         let (project, calls) = prepared.prepared.parts();
         let routes = calls.close_nested_scalar_routes(vec![(module, item)], &mut 0).unwrap();
@@ -19071,7 +19168,7 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
         // rather than manufacturing an impossible source order.
         let (_, catalog) = crate::parse_proof_source(owner.clone(), library.to_owned(), &[]).ok().unwrap();
         let prepared = prepare_loaded_proof_project(vec![(declarations(&app, main), vec![portal(&owner)])],
-            vec![(catalog, Vec::new())], vec![app.clone(), owner.clone()], inputs(), Vec::new(), true).unwrap();
+            vec![(catalog, Vec::new())], vec![app.clone(), owner.clone()], inputs(), Vec::new(), OrderedProofPreparation::All).unwrap();
         let plan = prepared.plan_module_proof_in_scope::<true, false, false>(&owner, "rank").unwrap();
         let (project, calls) = prepared.prepared.parts();
         let caller = project.modules.iter().position(|module| module.source == app).unwrap();
