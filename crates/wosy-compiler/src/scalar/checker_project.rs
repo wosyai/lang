@@ -4687,6 +4687,8 @@ pub struct ScalarProofDeclarations {
     definitions: Vec<CstNode>,
     #[cfg(feature = "internal-checker")]
     contextual_proofs: Vec<ContextualProofHeader>,
+    #[cfg(feature = "internal-checker")]
+    configured_mixed_catalog: bool,
 }
 
 #[cfg(feature = "internal-checker")]
@@ -4697,9 +4699,15 @@ impl ScalarProofDeclarations {
 }
 
 pub(crate) fn derive_scalar_proof_declarations_from_cst(canonical: &CanonicalCstRoot) -> ScalarProofDeclarations {
+    derive_scalar_proof_declarations_using_headers(canonical,
+        #[cfg(feature = "internal-checker")] contextual_proof_headers(canonical).unwrap_or_default())
+}
+
+fn derive_scalar_proof_declarations_using_headers(
+    canonical: &CanonicalCstRoot,
+    #[cfg(feature = "internal-checker")] contextual_proofs: Vec<ContextualProofHeader>,
+) -> ScalarProofDeclarations {
     let mut definitions = Vec::new();
-    #[cfg(feature = "internal-checker")]
-    let contextual_proofs = contextual_proof_headers(canonical).unwrap_or_default();
     #[cfg(feature = "internal-checker")]
     let contextual = !contextual_proofs.is_empty();
     #[cfg(not(feature = "internal-checker"))]
@@ -4709,7 +4717,46 @@ pub(crate) fn derive_scalar_proof_declarations_from_cst(canonical: &CanonicalCst
     ScalarProofDeclarations { declarations, definitions,
         #[cfg(feature = "internal-checker")]
         contextual_proofs,
+        #[cfg(feature = "internal-checker")]
+        configured_mixed_catalog: false,
     }
+}
+
+#[cfg(feature = "internal-checker")]
+pub(crate) fn derive_configured_scalar_proof_declarations_from_cst(canonical: &CanonicalCstRoot) -> ScalarProofDeclarations {
+    let root = child(&canonical.root, SyntaxKind::Root).expect("canonical source root");
+    let mut contextual_proofs = Vec::new();
+    let mut ordinary_count = 0;
+    let mut names = HashSet::new();
+    let mut duplicate = None;
+    for node in root.children().filter(|node| node.kind() == SyntaxKind::ProofDecl) {
+        if contextual_proofs.len() + ordinary_count == 2 * MAX_CONTEXTUAL_PROOFS {
+            return derive_scalar_proof_declarations_using_headers(canonical, Vec::new());
+        }
+        if let Some(name) = module_proof_name(&node) {
+            if !names.insert(name.text().to_owned()) { duplicate = Some(wosy_syntax::byte_span(&node)); }
+        }
+        match contextual_proof_header(&node) {
+            Ok(header) => contextual_proofs.push(header),
+            Err(_) => ordinary_count += 1,
+        }
+    }
+    if contextual_proofs.is_empty() || ordinary_count == 0 {
+        if contextual_proofs.len() > MAX_CONTEXTUAL_PROOFS || duplicate.is_some() {
+            contextual_proofs.clear();
+        }
+        return derive_scalar_proof_declarations_using_headers(canonical, contextual_proofs);
+    }
+    // Extract the exact two catalogs from the same canonical CST and type
+    // the declarations once. No unrecognized proof goes unselected.
+    let mut definitions = Vec::new();
+    let mut declarations = super::derive_scalar_declarations(canonical, true, true, false, Some(&mut definitions), true);
+    if let Some(span) = duplicate {
+        declarations.diagnostics.push(super::contextual::reported_error(
+            wosy_syntax::SourceSpan::new(declarations.source().clone(), span), "duplicate proof name in the configured source"));
+    }
+    definitions.retain(|node| !contextual_proofs.iter().any(|header| header.proof == wosy_syntax::byte_span(node)));
+    ScalarProofDeclarations { declarations, definitions, contextual_proofs, configured_mixed_catalog: true }
 }
 
 struct ModuleProofCatalog {
@@ -8942,8 +8989,10 @@ fn check_mixed_scalar_contextual(
     let [catalog] = ordinary.as_slice() else { return Err(ProjectCheck::Unsupported); };
     let [root, ..] = initialization_order.as_slice() else { return Err(ProjectCheck::MissingRoot); };
     let [(context_owner, _), ..] = headers.as_slice() else { return Err(ProjectCheck::Unsupported); };
-    if initialization_order.len() != 3 || catalog.definitions.len() > MAX_CONTEXTUAL_PROOFS
-        || &catalog.source == root || context_owner == root || context_owner == &catalog.source
+    let startup_count = initialization_order.len();
+    if startup_count != if context_owner == &catalog.source { 2 } else { 3 }
+        || catalog.definitions.len() > MAX_CONTEXTUAL_PROOFS
+        || &catalog.source == root || context_owner == root
         || headers.iter().any(|(owner, _)| owner != context_owner)
     {
         return Err(ProjectCheck::Unsupported);
@@ -8984,13 +9033,13 @@ fn check_mixed_scalar_contextual(
     }
     observed.finish_plans(&prepared.prepared, scope)?;
     let context = prepared.context.as_ref().ok_or(ProjectCheck::Unsupported)?;
-    let mut effects = prepare_contextual_effects(&prepared.prepared, context, headers, 3, false)?;
+    let mut effects = prepare_contextual_effects(&prepared.prepared, context, headers, startup_count, false)?;
     effects.mixed_startup = Some(MixedStartupTap {
         captured: plans.iter().map(|plan| (plan.target, 0)).collect(),
         events: Vec::new(), work: 0,
     });
     let mut report = run_prepared_ordered_check_profiles::<_, true>(
-        &prepared.prepared, scope, 3, OrderedReachPolicy::Closed, NamedOrderedEvidence { observed }, effects,
+        &prepared.prepared, scope, startup_count, OrderedReachPolicy::Closed, NamedOrderedEvidence { observed }, effects,
     )?;
     complete_contextual_effects(&mut report, scope, false)?;
     let mut contextual = ordered_contextual_diagnostics(report.contextual_proofs)?.into_iter();
@@ -9030,7 +9079,7 @@ fn check_loaded_ordered_proof_diagnostics_in_scope<const LOCAL_CATALOGS: bool>(
         let mut headers = Vec::new();
         let mut ordinary = Vec::new();
         for (proof, namespaces) in proofs {
-            if proof.contextual_proofs.is_empty() && !proof.definitions.is_empty() {
+            if (proof.contextual_proofs.is_empty() || proof.configured_mixed_catalog) && !proof.definitions.is_empty() {
                 ordinary.push(ModuleProofCatalog { source: proof.declarations.source().clone(), definitions: proof.definitions });
             }
             if headers.len().checked_add(proof.contextual_proofs.len()).ok_or(ProjectCheck::Unsupported)? > MAX_CONTEXTUAL_PROOFS {
@@ -23736,6 +23785,77 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
                     }
                 }
 
+            }
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn configured_same_owner_partitions_contextual_and_scalar_theorems() {
+        let app = source("src/main.w", "configured-same-owner-root");
+        let library = source("src/accounting.w", "configured-same-owner-provider");
+        let root = r#"%%start
+            accounting = namespace app "src/accounting.w";
+            unit() entry = fn {
+                u8 core.context.credit = 3;
+                accounting.spend();
+                core.require(core.context.credit == 2,
+                    { .stdout = ""; .stderr = "wrong credit"; .code = 78; .files = []; });
+            };
+            entry();
+        %%end"#;
+        let provider = r#"%%start
+            unit() consume = fn { core.context.credit = core.context.credit - 1; };
+            unit() spend = fn { consume(); };
+            proof debit for consume() -> (null)
+                ensures (core.context.credit == core.old(core.context.credit) - 1) {}
+            u8(u8) score = fn(value) { value };
+            proof scalar_value for score(entry) -> (out) where (entry == 4) ensures (out == 4) {}
+        %%end"#;
+        let direct = r#"u8 observed = accounting.score(4);
+            core.require(observed == 4, { .stdout = ""; .stderr = "wrong score"; .code = 79; .files = []; });"#;
+        let bad = provider.replace("core.old(core.context.credit) - 1", "core.old(core.context.credit) - 0")
+            .replace("out == 4", "out == 3");
+        let duplicate = provider.replace("proof scalar_value", "proof debit");
+        let malformed = provider.replace("%%end", "proof wrong for consume() -> (null) where (true) ensures (core.context.credit == core.old(core.context.credit) - 1) {} %%end");
+        let default = crate::parse_proof_source(library.clone(), provider.to_owned(), &[]).ok().unwrap().1;
+        assert!(!default.configured_mixed_catalog && default.contextual_proofs.is_empty());
+        let parse = |text: &str| crate::parse_configured_proof_source(library.clone(), text.to_owned(), &[]).ok().unwrap().1;
+        let partition = parse(provider);
+        assert!(partition.configured_mixed_catalog && partition.contextual_proofs.len() == 1 && partition.definitions.len() == 1);
+        let unmatched = parse(&malformed);
+        assert_eq!(unmatched.definitions.iter().map(|node| module_proof_name(node).unwrap().text().to_owned()).collect::<Vec<_>>(),
+            ["scalar_value", "wrong"]);
+        assert!(!parse(&duplicate).declarations.diagnostics.is_empty());
+        for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let run = |text: &str, provider: &str, scope| {
+                let app_proofs = crate::parse_proof_source(app.clone(), text.to_owned(), &[]).ok().unwrap().1;
+                let edge = ScalarNamespaceBinding { binding: "accounting".into(), target: library.clone(), span: ByteSpan::new(0, 0) };
+                check_loaded_scalar_ordered_local_proof_contexts(
+                    Vec::new(), [(parse(provider), Vec::new()), (app_proofs, vec![edge])],
+                    vec![app.clone(), library.clone()], ScalarPreparationInputs { target_layout }, scope, Vec::new(),
+                )
+            };
+            for scope in [ScalarCheckerScope::MainFlowOnly, ScalarCheckerScope::CurrentPackage] {
+                for (program, contextual_after) in [(format!("{direct} entry();"), 1), (format!("entry(); {direct}"), 0)] {
+                    let text = root.replace("entry();", &program);
+                    let pass = run(&text, provider, scope).unwrap();
+                    assert!(pass.active && pass.directives.is_empty() && pass.diagnostics.is_empty());
+                    let fail = run(&text, &bad, scope).unwrap();
+                    assert_eq!(fail.mixed_context_after_actual.as_deref(), Some(&[contextual_after][..]));
+                    let scalar = &fail.diagnostics[0];
+                    assert_eq!(scalar.proof.source, library);
+                    assert_eq!(scalar.invocation.call.source, app);
+                    assert_eq!(scalar.invocation.returned, BigInt::from(4));
+                    let context = fail.contextual_diagnostic.unwrap();
+                    assert!(context.proof.source == library && context.call.source == library && context.supplying_call.source == app);
+                    assert_eq!((context.entry, context.exit), (BigInt::from(3), BigInt::from(2)));
+                    assert!(run(&text, &duplicate, scope).is_err());
+                    assert!(run(&text, &malformed, scope).is_err());
+                }
+                let dormant = run(root, &bad, scope).unwrap();
+                assert!(dormant.contextual_diagnostic.is_some());
+                assert_eq!(dormant.symbolic_diagnostic.is_some(), scope == ScalarCheckerScope::CurrentPackage);
             }
         }
     }

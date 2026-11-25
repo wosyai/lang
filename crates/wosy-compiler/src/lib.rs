@@ -403,11 +403,27 @@ pub fn parse_proof_source(
     text: String,
     configured_comments: &[String],
 ) -> Result<(String, ScalarProofDeclarations), ParseOutput> {
+    parse_proof_source_for(source, text, configured_comments, scalar::derive_scalar_proof_declarations_from_cst)
+}
+
+#[cfg(feature = "internal-checker")]
+#[doc(hidden)]
+pub fn parse_configured_proof_source(
+    source: SourceIdentity, text: String, configured_comments: &[String],
+) -> Result<(String, ScalarProofDeclarations), ParseOutput> {
+    parse_proof_source_for(source, text, configured_comments, scalar::derive_configured_scalar_proof_declarations_from_cst)
+}
+
+#[cfg(feature = "internal-checker")]
+fn parse_proof_source_for(
+    source: SourceIdentity, text: String, configured_comments: &[String],
+    derive: impl FnOnce(&wosy_syntax::CanonicalCstRoot) -> ScalarProofDeclarations,
+) -> Result<(String, ScalarProofDeclarations), ParseOutput> {
     let output = parsed_source_output(wosy_syntax::parse_proof_module(source, text, configured_comments));
     if !output.result.is_valid() {
         return Err(output);
     }
-    let proof = scalar::derive_scalar_proof_declarations_from_cst(output.result.canonical_cst());
+    let proof = derive(output.result.canonical_cst());
     Ok((output.result.text, proof))
 }
 

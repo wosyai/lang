@@ -4215,6 +4215,8 @@ pub use checker_directive::{CheckedOutputTargets, ScalarCheckerTextFile};
 pub use checker_project::{check_loaded_scalar_module_proof_call, check_loaded_scalar_ordered_proof_contexts, check_loaded_scalar_ordered_local_proof_contexts, MainFlowProofReceipt, ContextualProofDiagnostic, MainFlowProofDiagnostic, MainFlowProofInvocation, ScalarCheckerProofLiteral, SymbolicProofDiagnostic, ScalarCheckerIeeeEntry, ScalarCheckerIeeeValue, ScalarOrderedEntryEvidence, check_loaded_scalar_module_proof_selections, check_loaded_scalar_module_proofs, check_scalar_module_proof, check_scalar_module_proofs, ScalarProofDeclarations, ScalarProofCallOutcome, check_scalar_package, check_scalar_package_with_dormant_sources, check_scalar_package_ordered_with_dormant_sources, ScalarOrderedCheckerOutcome, ScalarOrderedCheckerFailure, ScalarProofModuleInput, ScalarModuleProofOutcome, ScalarCheckerFailure, ScalarCheckerIntegerWitness, ScalarCheckerOperation, ScalarCheckerOutcome, ScalarCheckerScope};
 #[cfg(feature = "internal-checker")]
 pub(crate) use checker_project::derive_scalar_proof_declarations_from_cst;
+#[cfg(feature = "internal-checker")]
+pub(crate) use checker_project::derive_configured_scalar_proof_declarations_from_cst;
 pub(crate) use reference::aggregate::{AggregateReservations, ClosedAggregates, ClosedBody, ClosedCall, ClosedInitializer, ClosedInitializerInput, ClosedInput, ClosedReturn};
 pub(crate) use static_calls::PreparedProgram;
 pub use static_calls::{
