@@ -110,6 +110,7 @@ pub enum SyntaxKind {
     ProofMatchArm = 97,
     EnumVariantPayload = 98,
     RuntimeMatchBody = 99,
+    RuntimeMatchExpr = 100,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -219,6 +220,7 @@ impl Language for WosyLanguage {
             97 => SyntaxKind::ProofMatchArm,
             98 => SyntaxKind::EnumVariantPayload,
             99 => SyntaxKind::RuntimeMatchBody,
+            100 => SyntaxKind::RuntimeMatchExpr,
             _ => panic!("invalid syntax kind: {}", raw.0),
         }
     }
@@ -960,6 +962,9 @@ fn kind(rule: Rule) -> SyntaxKind {
         Rule::proof_forall => SyntaxKind::ProofForall,
         Rule::proof_quantifier_guard => SyntaxKind::ProofQuantifierGuard,
         Rule::proof_exists => SyntaxKind::ProofExists,
+        Rule::binding_output_list => SyntaxKind::OutputList,
+        Rule::runtime_match_input => SyntaxKind::Expression,
+        Rule::runtime_match_expr => SyntaxKind::RuntimeMatchExpr,
         Rule::proof_match_block => SyntaxKind::ProofMatchBlock,
         Rule::proof_match => SyntaxKind::ProofMatch,
         Rule::proof_match_arm => SyntaxKind::ProofMatchArm,

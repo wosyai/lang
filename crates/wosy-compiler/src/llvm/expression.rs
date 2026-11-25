@@ -90,6 +90,7 @@ pub(super) fn emit_expression<'ctx, 'module>(
     expression: &ScalarExpression,
 ) -> Result<EmitValue<'ctx>, String> {
     match expression {
+        ScalarExpression::RuntimeMatch(site) => super::runtime_enum_match::emit_initializer(context, state, site),
         ScalarExpression::Contextual { binding, ty, .. } => {
             let (slot, stored) = state.contextual_storage.get(binding)
                 .ok_or_else(|| "missing prepared LLVM contextual storage".to_owned())?;
@@ -394,6 +395,7 @@ pub(super) fn emit_project_expression<'ctx, 'module>(
     modules: &[&ScalarModule],
 ) -> Result<EmitValue<'ctx>, String> {
     match expression {
+        ScalarExpression::RuntimeMatch(site) => super::runtime_enum_match::emit_initializer(context, state, site),
         ScalarExpression::Member {
             receiver,
             name,

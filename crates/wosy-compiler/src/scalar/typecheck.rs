@@ -399,6 +399,7 @@ fn scalar_call_result_in_module(outputs: &ScalarOutputSequence) -> ScalarType {
 
 pub(super) fn expression_span(expression: &ScalarExpression) -> ByteSpan {
     match expression {
+        ScalarExpression::RuntimeMatch(site) => site.span(),
         ScalarExpression::Name { span, .. }
         | ScalarExpression::Contextual { span, .. }
         | ScalarExpression::Integer { span, .. }
@@ -3507,6 +3508,7 @@ fn check_expression_type_in_module(
         }
     }
     match expression {
+        ScalarExpression::RuntimeMatch(site) => site.ty().clone(),
         ScalarExpression::ValueField { receiver, name, name_span, span } => {
             if !matches!(receiver.as_ref(), ScalarExpression::Call { .. }) {
                 diagnostics.push(module_diagnostic(module, "B0003", "field value receiver must be a call result", *span));
@@ -6938,6 +6940,7 @@ fn validate_unit_if_position(
     diagnostics: &mut Vec<super::Diagnostic>,
 ) {
     match expression {
+        ScalarExpression::RuntimeMatch(_) => {},
         ScalarExpression::Contextual { .. } => {},
         ScalarExpression::UnitIf {
             condition,
@@ -7559,6 +7562,7 @@ impl<'tree> StaticUseAnalyzer<'tree> {
 
     fn expression(&mut self, expression: &'tree ScalarExpression) {
         match expression {
+            ScalarExpression::RuntimeMatch(site) => site.for_each_input_name(|name| self.use_name(name)),
             ScalarExpression::Contextual { .. } => {},
             ScalarExpression::Name { name, .. } => self.use_name(name),
             ScalarExpression::Member { receiver, .. } => self.use_name(receiver),
@@ -8219,6 +8223,7 @@ fn check_expression_type(
     inference: &mut ScalarInferenceBuilder<'_>,
 ) -> ScalarType {
     match expression {
+        ScalarExpression::RuntimeMatch(site) => site.ty().clone(),
         ScalarExpression::ValueField { receiver, name, name_span, span } => {
             if !matches!(receiver.as_ref(), ScalarExpression::Call { .. }) {
                 diagnostics.push(diagnostic(program, "B0003", "field value receiver must be a call result", *span));

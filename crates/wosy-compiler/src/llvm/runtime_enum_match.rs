@@ -14,6 +14,28 @@ pub(super) fn emit_values<'ctx>(
     }
     let layout = source.layouts.enum_payload(&plan.enumeration)
         .filter(|layout| layout.target == target).ok_or("missing freshly prepared runtime enum layout")?;
+    emit_region(context, builder, function, layout, plan)
+}
+
+pub(super) fn emit_initializer<'ctx>(
+    context: &'ctx Context, state: &mut EmitState<'ctx, '_>,
+    site: &crate::scalar::runtime_enum_match::Occurrence,
+) -> Result<EmitValue<'ctx>, String> {
+    let (authored, layout) = state.runtime_enum_initializer
+        .filter(|(authored, layout)| state.prepared_render && std::sync::Arc::ptr_eq(&authored.0, &site.0)
+            && layout.target == state.target_layout)
+        .ok_or("runtime match is not the exact prepared scalar initializer")?;
+    let function = state.builder.get_insert_block().and_then(|block| block.get_parent())
+        .ok_or("missing ordinary runtime match function")?;
+    let outputs = emit_region(context, state.builder, function, layout, &authored.0)?;
+    let [value] = outputs.as_slice() else { return Err("runtime match initializer is not scalar".into()); };
+    Ok(EmitValue::Basic(*value))
+}
+
+fn emit_region<'ctx>(
+    context: &'ctx Context, builder: &Builder<'ctx>, function: FunctionValue<'ctx>,
+    layout: &ScalarEnumPayloadLayout, plan: &Plan,
+) -> Result<Vec<BasicValueEnum<'ctx>>, String> {
     let size = u32::try_from(layout.layout.size).map_err(|_| "runtime enum storage exceeds LLVM array limit")?;
     let alignment = u32::try_from(layout.layout.alignment).ok().filter(|value| value.is_power_of_two())
         .ok_or("invalid runtime enum storage alignment")?;
@@ -26,7 +48,7 @@ pub(super) fn emit_values<'ctx>(
     let storage = builder.build_alloca(context.i8_type().array_type(size), storage_name).map_err(builder_error)?;
     storage.as_instruction_value().ok_or("missing runtime enum storage instruction")?
         .set_alignment(alignment).map_err(|error| format!("{error:?}"))?;
-    let arguments = callable.parameter_spans.iter().map(|span| (span.start, span.end)).zip(function.get_param_iter())
+    let arguments = plan.input_spans().map(|span| (span.start, span.end)).zip(function.get_param_iter())
         .collect::<BTreeMap<_, _>>();
     let join = context.append_basic_block(function, "enum.match.dispatch");
     let lowering = Lowering { context, builder, function, storage, layout, arguments };

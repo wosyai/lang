@@ -438,6 +438,7 @@ fn record_expression_overload_selection(
     overloads: &BTreeMap<String, &ScalarOverloadHeader>,
 ) {
     match expression {
+        ScalarExpression::RuntimeMatch(_) => {},
         ScalarExpression::Contextual { .. } => {},
         ScalarExpression::Call {
             receiver,

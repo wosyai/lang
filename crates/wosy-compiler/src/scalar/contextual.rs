@@ -13,6 +13,7 @@ pub(super) struct ContextualStorage {
 
 #[derive(Debug, Default)]
 pub(super) struct ContextualPlaces {
+    pub(super) runtime_matches: HashMap<ByteSpan, runtime_enum_match::Occurrence>,
     pub(super) declarations: Vec<ContextualStorage>,
     pub(super) first_declarations: Vec<usize>,
     pub(super) resolved: HashMap<ByteSpan, ContextualOccurrence>,

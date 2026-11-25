@@ -168,6 +168,8 @@ impl<'ctx> StorageBindings<'ctx> {
 
 struct EmitState<'ctx, 'module> {
     prepared_render: bool,
+    runtime_enum_initializer: Option<(&'module crate::scalar::runtime_enum_match::Occurrence,
+        &'module crate::ScalarEnumPayloadLayout)>,
     aggregate: Option<aggregate_transfer::AggregateEmitter<'ctx, 'module>>,
     initializer_aggregate: Option<aggregate_transfer::InitializerEmitter<'ctx, 'module>>,
     initializer_nodes: Option<&'module InitializerCallNodes<'module>>,
@@ -868,6 +870,11 @@ fn emit_single_module_llvm<'a>(
         }
         emit_function(
             prepared_render,
+            match (project_build, nodes.as_ref()) {
+                (Some(build), Some(nodes)) if arm.is_none() =>
+                    build.bind_runtime_enum_initializer(0, item, function, nodes)?,
+                _ => None,
+            },
             aggregates.body(0, item, arm),
             &context,
             &builder,
@@ -1414,6 +1421,11 @@ fn emit_project_llvm<'a>(
         }
         emit_project_function(
             prepared_render,
+            match (project_build, nodes.as_ref()) {
+                (Some(build), Some(nodes)) if original && arm.is_none() =>
+                    build.bind_runtime_enum_initializer(ordinal, item, function, nodes)?,
+                _ => None,
+            },
             aggregates.body(ordinal, item, arm),
             generic_input.contextual_formal(ordinal, item, arm),
             &context,
@@ -2266,6 +2278,8 @@ fn emit_project_binding_value<'ctx, 'module>(
 
 fn emit_function<'ctx, 'module>(
     prepared_render: bool,
+    runtime_enum_initializer: Option<(&'module crate::scalar::runtime_enum_match::Occurrence,
+        &'module crate::ScalarEnumPayloadLayout)>,
     aggregate_plan: Option<&'module crate::scalar::ClosedBody>,
     context: &'ctx Context,
     builder: &'ctx Builder<'ctx>,
@@ -2298,6 +2312,7 @@ fn emit_function<'ctx, 'module>(
         joined_assignment_owners(function.span, reference_cfg, &joined_bindings)?;
     let mut state = EmitState {
         prepared_render,
+        runtime_enum_initializer,
         aggregate: aggregate_transfer::AggregateEmitter::new(
             aggregate_plan,
             value,
@@ -2481,6 +2496,7 @@ fn emit_main<'ctx, 'module>(
     builder.position_at_end(entry);
     let mut state = EmitState {
         prepared_render,
+        runtime_enum_initializer: None,
         aggregate: None,
         initializer_aggregate: initializer_plan.map(aggregate_transfer::InitializerEmitter::new),
         initializer_nodes,
@@ -2583,6 +2599,8 @@ fn emit_main<'ctx, 'module>(
 
 fn emit_project_function<'ctx, 'module>(
     prepared_render: bool,
+    runtime_enum_initializer: Option<(&'module crate::scalar::runtime_enum_match::Occurrence,
+        &'module crate::ScalarEnumPayloadLayout)>,
     aggregate_plan: Option<&'module crate::scalar::ClosedBody>,
     contextual_formal: Option<(&crate::scalar::ReferenceBindingId, &ScalarType)>,
     context: &'ctx Context,
@@ -2619,6 +2637,7 @@ fn emit_project_function<'ctx, 'module>(
         joined_assignment_owners(function.span, reference_cfg, &joined_bindings)?;
     let mut state = EmitState {
         prepared_render,
+        runtime_enum_initializer,
         aggregate: aggregate_transfer::AggregateEmitter::new(
             aggregate_plan,
             value,
@@ -2841,6 +2860,7 @@ fn emit_project_main<'ctx, 'module>(
     let empty_unit_values = BTreeSet::new();
     let mut state = EmitState {
         prepared_render,
+        runtime_enum_initializer: None,
         aggregate: None,
         initializer_aggregate: None,
         initializer_nodes: None,

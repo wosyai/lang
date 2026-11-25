@@ -830,6 +830,13 @@ impl<'a> CallableBodyCallNodes<'a> {
             .chain(self.checked_self_tail.map(|(node, _)| node))
     }
 
+    /// Look up the checked type of an exact expression in the bound body.
+    /// Unlike the self-tail cache, this does not require a tail candidate.
+    pub(crate) fn canonical_expression_type(&self, expression: &ScalarExpression) -> Option<&'a ScalarType> {
+        let ordinal = self.proof_nodes.expressions.get(&std::ptr::from_ref(expression))?;
+        self.proof_nodes.calls?.structure.checked_types.expressions.get(ordinal)
+    }
+
     pub(crate) fn expression_type(&self, expression: &ScalarExpression) -> Option<&'a ScalarType> {
         self.expression_types
             .get(&std::ptr::from_ref(expression))
@@ -1073,6 +1080,7 @@ impl<'a> Binder<'a, '_> {
         }
         let parent = Parent::Expression(ordinal);
         match expression {
+            ScalarExpression::RuntimeMatch(_) => {},
             ScalarExpression::Contextual { .. } => {}
             ScalarExpression::Call { arguments, .. } => {
                 (self.bind_call)(ordinal, expression)?;

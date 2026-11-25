@@ -852,6 +852,7 @@ fn extend_return_bindings_from_expression(
     expression: &ScalarExpression,
 ) {
     match expression {
+        ScalarExpression::RuntimeMatch(_) => {},
         ScalarExpression::Contextual { .. } => {},
         ScalarExpression::Block(block) => bindings.extend(return_bindings(block)),
         ScalarExpression::If {
@@ -893,6 +894,7 @@ fn escaped_runtime_array_owners(
     visited: &mut BTreeSet<String>,
 ) -> BTreeSet<String> {
     match expression {
+        ScalarExpression::RuntimeMatch(_) => BTreeSet::new(),
         ScalarExpression::Contextual { .. } => BTreeSet::new(),
         ScalarExpression::Name { name, .. } => {
             if !visited.insert(name.clone()) {

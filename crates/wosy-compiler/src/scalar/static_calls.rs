@@ -442,6 +442,26 @@ impl<'a> ScalarBuildValidation<'a> {
             .bind_body_with_proof(module, item, None, &function.body, proof)
     }
 
+    pub(crate) fn bind_runtime_enum_initializer<'b>(&'b self, module: usize, item: usize,
+        function: &'b ScalarFunction, nodes: &control::CallableBodyCallNodes<'_>,
+    ) -> Result<Option<(&'b runtime_enum_match::Occurrence, &'b ScalarEnumPayloadLayout)>, String> {
+        let Some(ScalarBlockItem::LocalBinding(binding)) = function.body.items.first() else { return Ok(None); };
+        let ScalarExpression::RuntimeMatch(site) = &binding.value else { return Ok(None); };
+        let owner = self.prepared.project.modules.get(module).ok_or("missing runtime enum initializer module")?;
+        let Some(ScalarItem::Function(original)) = owner.items.get(item) else {
+            return Err("missing original runtime enum initializer callable".to_owned());
+        };
+        if !std::ptr::eq(original, function) || self.reference_cfg(module, item, None).is_none()
+            || !site.0.authenticates_initializer(&owner.source, function, binding)
+            || nodes.canonical_expression_type(&binding.value) != Some(site.ty())
+        {
+            return Err("runtime enum initializer requires its checked original lexical binding".to_owned());
+        }
+        let layout = owner.layouts.enum_payload(&site.0.enumeration)
+            .ok_or("missing freshly prepared runtime enum initializer layout")?;
+        Ok(Some((site, layout)))
+    }
+
     pub(crate) fn bind_runtime_enum_match<'b>(&'b self, module: usize, item: usize,
         function: &'b ScalarFunction,
     ) -> Result<&'b runtime_enum_match::Plan, String> {

@@ -954,6 +954,7 @@ enum ScalarFieldIdentity {
 
 #[derive(Clone, Debug, PartialEq)]
 enum ScalarExpressionIdentity {
+    RuntimeMatch(runtime_enum_match::Occurrence),
     Name(String),
     Contextual(ReferenceBindingId),
     Member(String, String),
@@ -1076,6 +1077,7 @@ fn scalar_place_target_span(place: &ScalarPlace) -> ByteSpan {
 
 fn scalar_expression_identity(expression: &ScalarExpression) -> ScalarExpressionIdentity {
     match expression {
+        ScalarExpression::RuntimeMatch(site) => ScalarExpressionIdentity::RuntimeMatch(site.clone()),
         ScalarExpression::Name { name, .. } => ScalarExpressionIdentity::Name(name.clone()),
         ScalarExpression::Contextual { binding, .. } => ScalarExpressionIdentity::Contextual(binding.clone()),
         ScalarExpression::Member { receiver, name, .. } => {
@@ -1837,6 +1839,8 @@ pub enum UnaryOperator {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ScalarExpression {
+    #[serde(skip)]
+    RuntimeMatch(runtime_enum_match::Occurrence),
     Name {
         name: String,
         span: ByteSpan,
@@ -2449,7 +2453,7 @@ fn derive_scalar_declarations(
                 enums.push(derive_enum(node, id));
             }
             SyntaxKind::ContextualPlace => contextual = true,
-            SyntaxKind::RuntimeMatchBody => pending_runtime_matches.push(node),
+            SyntaxKind::RuntimeMatchBody | SyntaxKind::RuntimeMatchExpr => pending_runtime_matches.push(node),
             _ => {}
         }
     });
@@ -2493,7 +2497,7 @@ fn derive_scalar_declarations(
             runtime_enum_matches,
         };
     }
-    let contextual_places = if contextual {
+    let mut contextual_places = if contextual {
         contextual::prepare(canonical, diagnostic_roots, &mut diagnostics,
             dormant_context && (!has_named_proofs || contextual_proof_runtime), contextual_proof_runtime)
     } else {
@@ -2505,7 +2509,14 @@ fn derive_scalar_declarations(
             "contextual storage with named proofs is not supported by this checker boundary",
         ));
     }
-    let mut executable_matches = runtime_enum_matches.into_iter().map(|plan| (plan.owner.start, plan)).collect::<HashMap<_, _>>();
+    let mut executable_matches = HashMap::new();
+    for plan in runtime_enum_matches {
+        if plan.is_initializer() {
+            contextual_places.runtime_matches.insert(plan.span, runtime_enum_match::Occurrence(std::sync::Arc::new(plan)));
+        } else {
+            executable_matches.insert(plan.owner.start, plan);
+        }
+    }
     let mut function_from_source = |node: &CstNode, places: &contextual::ContextualPlaces| {
         let plan = executable_matches.remove(&wosy_syntax::byte_span(node).start);
         derive_function_with_runtime_match(node, places, plan)
@@ -2697,7 +2708,7 @@ pub fn derive_scalar_diagnostics_from_cst(canonical: &CanonicalCstRoot) -> Vec<s
     let roots = pruned.as_deref().unwrap_or_else(|| std::slice::from_ref(&canonical.root));
     let mut runtime = Vec::new();
     let (mut diagnostics, _) = collect_scalar_diagnostics(canonical, roots, |node| {
-        if node.kind() == SyntaxKind::RuntimeMatchBody {
+        if matches!(node.kind(), SyntaxKind::RuntimeMatchBody | SyntaxKind::RuntimeMatchExpr) {
             runtime.push(runtime_enum_match::diagnostic(&canonical.source, wosy_syntax::byte_span(&node),
                 "runtime enum match is not yet eligible for lowering"));
         }
@@ -2773,7 +2784,7 @@ fn collect_scalar_diagnostics(
                 lengths.extend(fixed_array_length_diagnostic(&canonical.source, &node));
             }
             NodeOrToken::Node(node)
-                if matches!(node.kind(), SyntaxKind::StructDecl | SyntaxKind::EnumDecl | SyntaxKind::ContextualPlace | SyntaxKind::RuntimeMatchBody) =>
+                if matches!(node.kind(), SyntaxKind::StructDecl | SyntaxKind::EnumDecl | SyntaxKind::ContextualPlace | SyntaxKind::RuntimeMatchBody | SyntaxKind::RuntimeMatchExpr) =>
                 record_declaration(node),
             NodeOrToken::Node(node) => projections.extend(invalid_projection_diagnostic(&canonical.source, &node)),
         }
@@ -4757,6 +4768,11 @@ fn derive_expression_with_places(node: &CstNode, places: &contextual::Contextual
         node.clone()
     };
     match actual.kind() {
+        SyntaxKind::RuntimeMatchExpr => {
+            let span = wosy_syntax::byte_span(&actual);
+            places.runtime_matches.get(&span).cloned().map(ScalarExpression::RuntimeMatch)
+                .unwrap_or(ScalarExpression::InvalidInteger { span, error_span: Some(span) })
+        }
         SyntaxKind::IfExpr => {
             let children = direct_nodes(&actual);
             ScalarExpression::If {
@@ -5355,6 +5371,7 @@ fn token_span(token: &CstToken) -> ByteSpan {
 
 fn span_of(expression: &ScalarExpression) -> ByteSpan {
     match expression {
+        ScalarExpression::RuntimeMatch(site) => site.span(),
         ScalarExpression::Name { span, .. }
         | ScalarExpression::Contextual { span, .. }
         | ScalarExpression::Member { span, .. }

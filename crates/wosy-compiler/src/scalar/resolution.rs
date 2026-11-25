@@ -507,6 +507,7 @@ fn resolve_expression_places(
     owners: &ScalarAssignmentOwners,
 ) {
     match expression {
+        ScalarExpression::RuntimeMatch(_) => {},
         ScalarExpression::Contextual { .. } => {},
         ScalarExpression::RawAddress { place, .. }
         | ScalarExpression::CheckedAddress { place, .. }
@@ -1400,6 +1401,7 @@ fn resolve_expression_module_places(
     owners: &ScalarAssignmentOwners,
 ) {
     match expression {
+        ScalarExpression::RuntimeMatch(_) => {},
         ScalarExpression::Contextual { binding, ty, .. } => {
             if *ty == ScalarType::Error && matches!(binding.kind, ReferenceBindingKind::ContextualFormal) {
                 if let Some(checked) = declarations.contextual_formal_type(binding) { *ty = checked.clone(); }
