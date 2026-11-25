@@ -818,7 +818,13 @@ fn emit_prepared_call<'ctx, 'module>(
             return Err("invalid sealed fallible allocation call argument".into());
         };
         let callee = state.functions.get(target).ok_or("missing sealed fallible allocation callable")?;
-        let pair = aggregate_transfer::fallible_allocation_result_type(context);
+        let Some(ScalarType::Callable { outputs, .. }) = state.signatures.get(target) else {
+            return Err("missing sealed fallible allocation callable signature".into());
+        };
+        let [output] = outputs.outputs.as_slice() else {
+            return Err("invalid sealed fallible allocation output signature".into());
+        };
+        let pair = aggregate_transfer::fallible_allocation_result_type(context, &output.ty)?;
         if callee.get_linkage() != Linkage::Internal
             || callee.get_type() != pair.fn_type(&[context.i64_type().into()], false)
         {
@@ -2570,7 +2576,7 @@ pub(super) fn emit_contextual_numeric<'ctx, 'module>(
         }
         ScalarExpression::If { condition, then_branch, else_branch, .. } => {
             let choice = aggregate_transfer::fallible_allocation_choice_at(state, expression);
-            if choice && *expected != ScalarType::U64 {
+            if choice && !matches!(expected, ScalarType::U64 | ScalarType::I32) {
                 return Err("invalid sealed fallible conditional payload type".into());
             }
             let condition = take_basic(path.emit(context, state, condition)?)?.into_int_value();
@@ -2584,12 +2590,12 @@ pub(super) fn emit_contextual_numeric<'ctx, 'module>(
                     let BasicValueEnum::StructValue(pair) = value else {
                         return Err("missing sealed fallible conditional arm result".into());
                     };
-                    if pair.get_type() != aggregate_transfer::fallible_allocation_result_type(context) {
+                    if pair.get_type() != aggregate_transfer::fallible_allocation_result_type(context, expected)? {
                         return Err("invalid sealed fallible conditional arm result".into());
                     }
                     Ok(EmitValue::Basic(pair.into()))
                 } else {
-                    let pair = aggregate_transfer::present_fallible_allocation_result(context, state, value)?;
+                    let pair = aggregate_transfer::present_fallible_allocation_result(context, state, value, expected)?;
                     Ok(EmitValue::Basic(pair.into()))
                 }
             })

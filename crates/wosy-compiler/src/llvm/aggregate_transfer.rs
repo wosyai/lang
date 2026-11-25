@@ -592,23 +592,38 @@ pub(super) fn fallible_allocation_choice_at(state: &EmitState<'_, '_>, expressio
     })
 }
 
-pub(super) fn fallible_allocation_result_type(context: &Context) -> inkwell::types::StructType<'_> {
-    context.struct_type(&[context.bool_type().into(), context.i64_type().into()], false)
+fn fallible_allocation_integer_type<'ctx>(
+    context: &'ctx Context, payload: &ScalarType,
+) -> Result<inkwell::types::IntType<'ctx>, String> {
+    match payload {
+        ScalarType::U64 => Ok(context.i64_type()),
+        ScalarType::I32 => Ok(context.i32_type()),
+        _ => Err("invalid sealed fallible allocation payload type".into()),
+    }
+}
+
+pub(super) fn fallible_allocation_result_type<'ctx>(
+    context: &'ctx Context, payload: &ScalarType,
+) -> Result<inkwell::types::StructType<'ctx>, String> {
+    let integer = fallible_allocation_integer_type(context, payload)?;
+    Ok(context.struct_type(&[context.bool_type().into(), integer.into()], false))
 }
 
 pub(super) fn present_fallible_allocation_result<'ctx>(
     context: &'ctx Context,
     state: &EmitState<'ctx, '_>,
-    payload: BasicValueEnum<'ctx>,
+    value: BasicValueEnum<'ctx>,
+    payload: &ScalarType,
 ) -> Result<inkwell::values::StructValue<'ctx>, String> {
-    if !matches!(payload, BasicValueEnum::IntValue(integer) if integer.get_type() == context.i64_type()) {
+    let integer = fallible_allocation_integer_type(context, payload)?;
+    if !matches!(value, BasicValueEnum::IntValue(value) if value.get_type() == integer) {
         return Err("invalid sealed fallible allocation result payload".into());
     }
-    let pair = fallible_allocation_result_type(context);
+    let pair = fallible_allocation_result_type(context, payload)?;
     let tagged = pair.const_named_struct(&[
-        context.bool_type().const_all_ones().into(), context.i64_type().const_zero().into()
+        context.bool_type().const_all_ones().into(), integer.const_zero().into()
     ]);
-    state.builder.build_insert_value(tagged, payload, 1, "fallible.payload")
+    state.builder.build_insert_value(tagged, value, 1, "fallible.payload")
         .map_err(builder_error).map(|value| value.into_struct_value())
 }
 
@@ -620,7 +635,17 @@ pub(super) fn definition_type<'ctx>(
     plan: Option<&ClosedBody>,
 ) -> Result<FunctionType<'ctx>, String> {
     if plan.is_some_and(|body| body.fallible_allocation_leaf || body.fallible_allocation_relay) {
-        return Ok(fallible_allocation_result_type(context).fn_type(&[context.i64_type().into()], false));
+        let payload = plan.and_then(|body| body.fallible_allocation_payload.as_ref())
+            .ok_or("missing sealed fallible allocation payload type")?;
+        let ScalarType::Callable { parameters, outputs } = &function.signature else {
+            return Err("invalid sealed fallible allocation signature".into());
+        };
+        if parameters.as_slice() != [ScalarType::U64]
+            || !matches!(outputs.outputs.as_slice(), [output] if &output.ty == payload)
+        {
+            return Err("invalid sealed fallible allocation signature".into());
+        }
+        return Ok(fallible_allocation_result_type(context, payload)?.fn_type(&[context.i64_type().into()], false));
     }
     if plan.is_some_and(|body| body.borrowed_extent_observer.is_some() || body.borrowed_extent_forward.is_some()) {
         let ScalarType::Callable { parameters, outputs } = &function.signature else {

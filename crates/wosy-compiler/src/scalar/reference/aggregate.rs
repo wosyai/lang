@@ -2946,6 +2946,7 @@ pub(crate) struct ClosedWidenedRebind {
 #[derive(Debug, Default)]
 pub(crate) struct ClosedBody {
     pub(crate) fallible_allocation_leaf: bool,
+    pub(crate) fallible_allocation_payload: Option<ScalarType>,
     pub(crate) fallible_allocation_relay: bool,
     pub(crate) fallible_relay_allocations: Vec<ByteSpan>,
     pub(crate) ordinary_fallible_allocating_calls: BTreeSet<usize>,
@@ -6715,10 +6716,11 @@ fn closed_aggregates<'a>(
     let mut structured_returns = BTreeMap::new();
     let mut recommit_returns = BTreeSet::new();
     let mut fallible_choices = BTreeSet::<(BodyKey, usize)>::new();
+    let mut fallible_payloads = BTreeMap::new();
     let mut fallible_allocation_relays = BTreeMap::new();
     let mut fallible_allocating_targets = BTreeMap::<BodyKey, BTreeSet<(BodyKey, usize)>>::new();
     if !fallible_call_requests.is_empty() {
-        let allocation_leaf = |key: BodyKey| -> Option<()> {
+        let allocation_leaf = |key: BodyKey| -> Option<ScalarType> {
             if key.2.is_some() || reservations.bodies.get(&key) != Some(&true) { return None; }
             let input = module_at(key.0)?;
             let ScalarItem::Function(function) = input.items.get(key.1)? else { return None; };
@@ -6727,11 +6729,12 @@ fn closed_aggregates<'a>(
                 || function.body.unsafe_context
             { return None; }
             let sites = input.calls.function_body(key.1, None)?;
+            let [output] = sites.boundary.root_outputs.as_slice() else { return None; };
             if !sites.declared_unsafe_calls.is_empty()
                 || !matches!(sites.boundary.parameters.as_slice(), [parameter] if parameter.ty == ScalarType::U64)
-                || !matches!(sites.boundary.root_outputs.as_slice(), [output] if output.ty == ScalarType::U64)
+                || !matches!(output.ty, ScalarType::U64 | ScalarType::I32)
             { return None; }
-            let [ScalarBlockItem::LocalBinding(allocation), ScalarBlockItem::Expression(_)] =
+            let [ScalarBlockItem::LocalBinding(allocation), ScalarBlockItem::Expression(result)] =
                 function.body.items.as_slice() else { return None; };
             let [receiver] = allocation.receivers.as_slice() else { return None; };
             if !allocation.is_allocation || allocation.fallible_assignment.is_some()
@@ -6756,7 +6759,31 @@ fn closed_aggregates<'a>(
                 || !matches!(sites.prepared_plain_name(length.expression)?,
                     PlainNameIdentity::Lexical(binding) if binding == &formal)
             { return None; }
+            // The signed corridor is ordinary subtraction of an authored
+            // contextual integer and an exact truncation of the observed
+            // extent. It never changes allocation size or dereferences data.
+            let signed = if output.ty == ScalarType::I32 {
+                let ScalarExpression::Binary { operator: BinaryOperator::Subtract, left, right, .. } = result else { return None; };
+                if !matches!(left.as_ref(), ScalarExpression::Integer { value, .. } if i32::try_from(value.clone()).is_ok()) {
+                    return None;
+                }
+                let ScalarExpression::Call { arguments, .. } = right.as_ref() else { return None; };
+                let [argument] = arguments.as_slice() else { return None; };
+                if !matches!(argument, ScalarExpression::Call { .. }) { return None; }
+                let [_, BlockItem { kind: BlockItemKind::FinalOutput(slot), .. }] = root.items.as_slice()
+                    else { return None; };
+                let OccurrenceNode::Expression(truncate) = sites.structure.edges.get(&(
+                    OccurrenceParent::Expression(slot.expression), OccurrenceEdge::BinaryRight,
+                ))? else { return None; };
+                if sites.structure.checked_types.expressions.get(truncate) != Some(&ScalarType::I32) {
+                    return None;
+                }
+                Some((left.as_ref(), right.as_ref()))
+            } else { None };
             let mut extent = None;
+            let mut literal = false;
+            let mut truncate = None;
+            let mut signed_result = None;
             let mut returned = false;
             let mut placeholder = false;
             for point in &cfg.initial_points {
@@ -6774,12 +6801,22 @@ fn closed_aggregates<'a>(
                         argument_points, .. } if extent.is_none() && matches!(argument_points.as_slice(), [borrow]
                             if matches!(&cfg.initial_points[borrow.0].kind, CfgPointKind::Borrow { place, .. }
                                 if place.binding == *owner)) => extent = Some(point.id),
+                    CfgPointKind::Evaluate(value) if !literal && signed.is_some_and(|(left, _)| value == left) =>
+                        literal = true,
+                    CfgPointKind::Call { output: 0, target: ResolvedCallTarget::Core(CoreOperationId::IntTrunc),
+                        expression, argument_points }
+                        if truncate.is_none() && signed.is_some_and(|(_, trunc)| expression == trunc)
+                            && matches!(argument_points.as_slice(), [point] if Some(*point) == extent) =>
+                        truncate = Some(point.id),
+                    CfgPointKind::Evaluate(value) if truncate.is_some() && signed_result.is_none() && value == result =>
+                        signed_result = Some(point.id),
                     CfgPointKind::ReturnOutput { output: 0, checked: false, value_point, .. }
-                        if !returned && extent == Some(*value_point) => returned = true,
+                        if !returned && (if signed.is_some() { signed_result } else { extent }) == Some(*value_point) =>
+                        returned = true,
                     _ => return None,
                 }
             }
-            (returned && placeholder).then_some(())
+            (returned && placeholder && (signed.is_none() || literal)).then(|| output.ty.clone())
         };
         let dependencies = |key: BodyKey| -> Option<Vec<BodyKey>> {
             if key.2.is_some() || reservations.bodies.get(&key) != Some(&true) { return None; }
@@ -6813,7 +6850,7 @@ fn closed_aggregates<'a>(
             }
             has_output.then_some(callees)
         };
-        let relay = |key: BodyKey| -> Option<(BodyKey, OccurrenceOrdinal, Vec<ByteSpan>)> {
+        let relay = |key: BodyKey| -> Option<(BodyKey, OccurrenceOrdinal, Vec<ByteSpan>, ScalarType)> {
             if key.2.is_some() || reservations.bodies.get(&key) != Some(&true) { return None; }
             let input = module_at(key.0)?;
             let ScalarItem::Function(function) = input.items.get(key.1)? else { return None; };
@@ -6836,10 +6873,11 @@ fn closed_aggregates<'a>(
                 return None;
             }
             let signature = sites.checked_call_signatures.get(&occurrence.ordinal)?;
+            let [payload] = sites.boundary.root_outputs.as_slice() else { return None; };
             if formal.ty != ScalarType::U64
-                || !matches!(sites.boundary.root_outputs.as_slice(), [output] if output.ty == ScalarType::U64)
+                || !matches!(payload.ty, ScalarType::U64 | ScalarType::I32)
                 || signature.parameters.as_slice() != [ScalarType::U64]
-                || !matches!(signature.outputs.outputs.as_slice(), [output] if output.ty == ScalarType::U64)
+                || !matches!(signature.outputs.outputs.as_slice(), [output] if output.ty == payload.ty)
                 || !sites.declared_unsafe_calls.is_empty()
             { return None; }
             let (_, cfg) = result_at(key, function)?;
@@ -6942,7 +6980,7 @@ fn closed_aggregates<'a>(
                 })
             { return None; }
             Some((target_body(&declarations, cfg, point.id)?, occurrence.ordinal,
-                spans))
+                spans, payload.ty.clone()))
         };
         let mut memo = HashMap::new();
         let mut complete_suffixes = BTreeSet::new();
@@ -6955,24 +6993,36 @@ fn closed_aggregates<'a>(
             }
             let mut visited = BTreeSet::new();
             let mut current = target;
+            let mut payload = None;
             let mut incoming = (caller, ordinal.0);
             loop {
                 ordinary.transport_uses.entry(current).or_insert_with(|| Some(Vec::new()));
                 fallible_allocating_targets.entry(current).or_default().insert(incoming);
                 // Reusing a proven suffix still records its new incoming use.
                 // Every downstream edge has already been recorded once.
+                let check_payload = |actual: &ScalarType| {
+                    if payload.as_ref().is_some_and(|expected| expected != actual) {
+                        Err("sealed fallible allocation relay changes the result payload type".to_owned())
+                    } else { Ok(()) }
+                };
                 if complete_suffixes.contains(&current) {
+                    check_payload(fallible_payloads.get(&current).ok_or("missing completed fallible allocation payload")?)?;
                     break;
                 }
                 if !visited.insert(current) {
                     return Err("fallible allocating callable relay cycle requires an allocation leaf".into());
                 }
-                if allocation_leaf(current).is_some() {
+                if let Some(actual) = allocation_leaf(current) {
+                    check_payload(&actual)?;
+                    fallible_payloads.insert(current, actual);
                     break;
                 }
-                let Some((next, ordinal, allocation)) = relay(current) else {
+                let Some((next, ordinal, allocation, actual)) = relay(current) else {
                     return Err(format!("fallible call initializer requires a checked allocation-free scalar callable in {source:?}"));
                 };
+                check_payload(&actual)?;
+                payload = Some(actual.clone());
+                fallible_payloads.insert(current, actual);
                 fallible_allocation_relays.insert(current, allocation);
                 incoming = (current, ordinal.0);
                 current = next;
@@ -7360,6 +7410,7 @@ fn closed_aggregates<'a>(
             body.fallible_allocation_relay = fallible_allocation_relays.contains_key(&target);
             body.fallible_relay_allocations = fallible_allocation_relays.get(&target).cloned().unwrap_or_default();
             body.fallible_allocation_leaf = !body.fallible_allocation_relay;
+            body.fallible_allocation_payload = fallible_payloads.get(&target).cloned();
             for &(caller, ordinal) in sites {
                 result.bodies.entry(caller).or_default().fallible_allocating_calls.insert(ordinal);
             }

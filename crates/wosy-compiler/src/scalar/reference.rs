@@ -3824,7 +3824,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
 
     // Each complete edge transfers a freshly created arm-local owner.
     fn guarded_call_choice(
-        &self, value: &ScalarExpression, ordinal: OccurrenceOrdinal,
+        &self, value: &ScalarExpression, ordinal: OccurrenceOrdinal, payload: &ScalarType,
     ) -> Option<[(CfgPointId, OccurrenceOrdinal); 2]> {
         let ScalarExpression::If { then_branch, else_branch, .. } = value else { return None; };
         let sites = self.call_sites;
@@ -3847,7 +3847,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
             let point = *self.cfg.primary_call_points.get(&call)?;
             if output.output != 0 || sites.declared_unsafe_calls.contains(&call.0)
                 || !signature.parameters.iter().all(aggregate::ordinary_value)
-                || !matches!(signature.outputs.outputs.as_slice(), [output] if output.ty == ScalarType::U64)
+                || !matches!(signature.outputs.outputs.as_slice(), [output] if &output.ty == payload)
                 || !matches!(&self.cfg.points.get(point.0)?.kind, CfgPointKind::Call { output: 0,
                     target: ResolvedCallTarget::ModuleCallable { concrete: ConcreteCallSelection::Declaration, .. }, .. })
             { return None; }
@@ -4999,8 +4999,8 @@ impl<'a> ReferenceFlowBuilder<'a> {
                         self.expression(primary, scope, primary_ordinal)?
                     };
                     if binding.fallible_assignment.is_some() && matches!(primary, ScalarExpression::If { .. }) {
-                        let Some(arms) = self.guarded_call_choice(primary, primary_ordinal).filter(|_|
-                            self.generic_parameters.is_empty() && receiver.ty == ScalarType::U64
+                        let Some(arms) = self.guarded_call_choice(primary, primary_ordinal, &receiver.ty).filter(|_|
+                            self.generic_parameters.is_empty() && matches!(receiver.ty, ScalarType::U64 | ScalarType::I32)
                             && binding_region.receivers().len() == 1 && outputs.secondary.is_empty())
                         else {
                             return Err(self.missing_context(expression_span(primary),
@@ -5028,14 +5028,14 @@ impl<'a> ReferenceFlowBuilder<'a> {
                             && !block.unsafe_context && !binding.is_allocation
                             && calls.boundary.parameters.iter().all(|slot| aggregate::ordinary_value(&slot.ty))
                             && calls.boundary.root_outputs.iter().all(|slot| aggregate::ordinary_value(&slot.ty))
-                            && self.generic_parameters.is_empty() && receiver.ty == ScalarType::U64
+                            && self.generic_parameters.is_empty() && matches!(receiver.ty, ScalarType::U64 | ScalarType::I32)
                             && binding_region.receivers().len() == 1 && outputs.secondary.is_empty()
                             && type_arguments.is_empty() && !calls.declared_unsafe_calls.contains(&primary_ordinal.0)
                             && matches!(arguments.as_slice(), [argument]
                                 if matches!(argument, ScalarExpression::Name { .. }) || aggregate::pure_widened_element(argument))
                             && calls.checked_call_signatures.get(&primary_ordinal).is_some_and(|signature|
                                 signature.parameters.as_slice() == [ScalarType::U64]
-                                    && matches!(signature.outputs.outputs.as_slice(), [output] if output.ty == ScalarType::U64))
+                                    && matches!(signature.outputs.outputs.as_slice(), [output] if output.ty == receiver.ty))
                             && matches!(&self.cfg.points[point.0].kind, CfgPointKind::Call { output: 0,
                                 target: ResolvedCallTarget::ModuleCallable { concrete: ConcreteCallSelection::Declaration, .. }, .. })
                         {

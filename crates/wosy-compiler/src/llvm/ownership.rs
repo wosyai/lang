@@ -1229,7 +1229,7 @@ pub(super) fn bind_guarded_scalar<'ctx>(
         let Some(BasicValueEnum::StructValue(pair)) = value else {
             return Err("missing sealed fallible RHS result".into());
         };
-        if receiver.ty != ScalarType::U64 || pair.get_type() != super::aggregate_transfer::fallible_allocation_result_type(context) {
+        if pair.get_type() != super::aggregate_transfer::fallible_allocation_result_type(context, &receiver.ty)? {
             return Err("invalid sealed fallible RHS result".into());
         }
         Some(pair)
@@ -1437,7 +1437,7 @@ pub(super) fn emit_runtime_array_allocation_with_absence<'ctx, 'module>(
     )?;
     if recover {
         state.builder.position_at_end(allocation_failure);
-        let absent = super::aggregate_transfer::fallible_allocation_result_type(context).const_zero();
+        let absent = sealed_absence_value(context, state)?;
         state.builder.build_return(Some(&absent)).map_err(builder_error)?;
     }
     if let Some(panic_block) = panic_block {
@@ -1459,12 +1459,20 @@ fn relay_failure_block<'ctx>(
     Ok((continuation, context.append_basic_block(function, name)))
 }
 
+fn sealed_absence_value<'ctx>(
+    context: &'ctx Context, state: &EmitState<'ctx, '_>,
+) -> Result<inkwell::values::StructValue<'ctx>, String> {
+    let payload = state.aggregate.as_ref().and_then(|aggregate| aggregate.plan().fallible_allocation_payload.as_ref())
+        .ok_or("missing sealed fallible allocation absence payload")?;
+    Ok(super::aggregate_transfer::fallible_allocation_result_type(context, payload)?.const_zero())
+}
+
 pub(super) fn emit_relay_absence<'ctx>(
     context: &'ctx Context, state: &mut EmitState<'ctx, '_>,
 ) -> Result<inkwell::basic_block::BasicBlock<'ctx>, String> {
     let (continuation, absent) = relay_failure_block(context, state, "allocation_absent")?;
     state.builder.position_at_end(absent);
-    let value = super::aggregate_transfer::fallible_allocation_result_type(context).const_zero();
+    let value = sealed_absence_value(context, state)?;
     state.builder.build_return(Some(&value)).map_err(builder_error)?;
     state.builder.position_at_end(continuation);
     Ok(absent)
